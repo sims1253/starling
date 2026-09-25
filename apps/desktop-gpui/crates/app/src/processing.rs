@@ -311,14 +311,19 @@ pub(crate) fn disclosure(mode_id: &str, settings: &ProcessingSettings) -> String
                 fields_text(&context_fields),
                 S1_ATTRIBUTION,
             ),
-            Locality::Remote => format!(
-                "Sends the transcript text to {} (model {}, key from ${}). Context sent: {}. \
+            Locality::Remote => {
+                let key = match settings.api_key_env.trim() {
+                    "" => "no key".to_string(),
+                    name => format!("key from ${name}"),
+                };
+                format!(
+                    "Sends the transcript text to {} (model {}, {key}). Context sent: {}. \
                      Nothing else leaves this computer for processing.",
-                settings.api_endpoint.trim(),
-                decl.model,
-                settings.api_key_env.trim(),
-                fields_text(&context_fields),
-            ),
+                    settings.api_endpoint.trim(),
+                    decl.model,
+                    fields_text(&context_fields),
+                )
+            }
         },
         ProcessingRoute::Blocked(block) => blocked_text(block, mode, &problems),
     }
@@ -608,7 +613,19 @@ impl StarlingApp {
         let stopped_at: Option<Instant> = self.stop_instants.remove(&id);
         let (decl, provider, fields): (ProviderDecl, Option<Arc<dyn Provider>>, Vec<ContextField>) =
             match pipeline::plan(mode, &self.providers.registry) {
-                Plan::Nothing => return,
+                Plan::Nothing => {
+                    // The mode no longer processes: a job still running for
+                    // the take must not land a proposal afterwards.
+                    if let Some((request_id, cancel)) = self.processing_jobs.remove(&id) {
+                        cancel.cancel();
+                        if let Some(draft) = self.drafts.get_mut(&id) {
+                            draft.cancel(&request_id);
+                        }
+                        self.set_processing(&id, String::new(), ProcessingState::Idle);
+                        cx.notify();
+                    }
+                    return;
+                }
                 Plan::Blocked(block) => {
                     // A job still running for the take (settings changed
                     // under it) must not land over what the user is told.
@@ -727,7 +744,7 @@ impl StarlingApp {
                             deadline_ms: DEADLINE_MS,
                             // Cleanup shortens text; four times the input is
                             // far past any honest answer.
-                            max_output_chars: (input_chars * 4).max(2_000),
+                            max_output_chars: input_chars.saturating_mul(4).max(2_000),
                         },
                     );
                     app.drafts.insert(id.clone(), draft);

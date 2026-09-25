@@ -498,6 +498,15 @@ impl Store {
         if store.get_capture(id).map_err(v2_err)?.is_none() {
             return Err(storage::StorageError::NotFound(id.to_string()));
         }
+        // A head chosen for an earlier transcript lands nowhere: a
+        // re-transcription rebuilt the document on a new raw attempt.
+        let current = store
+            .get_document(id)
+            .map_err(v2_err)?
+            .and_then(|document| ProcessingDoc::from_row(id, document));
+        if current.is_none_or(|doc| doc.raw_attempt_id != attempt_id) {
+            return Err(storage::StorageError::NotFound(id.to_string()));
+        }
         let request_id = accepted.map(|proposal| proposal.request_id.as_str());
         // The head and the proposal it accepted land together or not at
         // all, so a crash cannot leave an accepted head next to a live
