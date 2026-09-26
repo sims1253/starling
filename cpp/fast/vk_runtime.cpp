@@ -325,6 +325,7 @@ bool Context::init(std::string& err) {
                 (void)n;
                 std::fclose(f);
             }
+            std::lock_guard<std::mutex> lk(wedge_mu_);
             wedged_ = true;
             wedged_why_ = std::string("fast engine: a previous process observed GPU driver "
                                       "failure (") + (why[0] ? why : "unknown") +
@@ -383,15 +384,9 @@ Context::~Context() {
         }
     }
     staging_.release();
-    // A clean exit clears the marker ONLY if this process wrote it: another
-    // (wedged) process may have refreshed it while we ran, and a wedged
-    // process unwinds through this destructor too — deleting a fresh marker
-    // would hide the failure from the next process.
-    if (!wrote_marker_ || wedged_) {
-        // never wrote it, or wedged: leave the file for its 15-min TTL
-    } else if (!wedge_path_.empty()) {
-        std::remove(wedge_path_.c_str());
-    }
+    // The wedge marker is never removed by a process: init()'s 15-minute
+    // freshness check is its only expiry. Deleting it on exit would hide a
+    // failure another (wedged) process recorded while this one ran.
     for (auto& kv : pipes_) fn_.vkDestroyPipeline(dev_, kv.second->pipe, nullptr);
     for (auto& kv : layouts_) {
         fn_.vkDestroyPipelineLayout(dev_, kv.second.second, nullptr);
@@ -408,10 +403,10 @@ Context::~Context() {
 }
 
 void Context::mark_wedged(const std::string& why) {
+    std::lock_guard<std::mutex> lk(wedge_mu_);
     if (wedged_) return;
-    wedged_ = true;
-    wrote_marker_ = true;   // only the writer may clear the marker on exit
     wedged_why_ = why;
+    wedged_ = true;
     if (!wedge_path_.empty())
         if (FILE* f = std::fopen(wedge_path_.c_str(), "w")) {
             std::fprintf(f, "%s", why.c_str());
@@ -419,11 +414,43 @@ void Context::mark_wedged(const std::string& why) {
         }
 }
 
+std::string Context::wedged_why() const {
+    std::lock_guard<std::mutex> lk(wedge_mu_);
+    return wedged_why_;
+}
+
+bool Context::wait_fence(VkFence fence, const char* what, std::string& err) {
+    // Bounded wait: a lost or hung device must surface as an error, not a
+    // hang. Callers hold queue_mu_.
+    const VkResult r = fn_.vkWaitForFences(dev_, 1, &fence, VK_TRUE, 120ull * 1000 * 1000 * 1000);
+    if (r == VK_SUCCESS) {
+        fn_.vkResetFences(dev_, 1, &fence);
+        return true;
+    }
+    // The fence may still be pending (timeout): drain the queue before it
+    // is reset or the submitted buffers are freed.
+    fn_.vkDeviceWaitIdle(dev_);
+    fn_.vkResetFences(dev_, 1, &fence);
+    err = vk_err(what, r);
+    if (r == VK_ERROR_OUT_OF_DEVICE_MEMORY || r == VK_ERROR_DEVICE_LOST || r == VK_TIMEOUT) {
+        err += r == VK_ERROR_OUT_OF_DEVICE_MEMORY
+             ? " (out of device memory: the GPU driver is likely wedged; a device restart"
+               " clears it — do not keep retrying)"
+             : r == VK_ERROR_DEVICE_LOST
+             ? " (device lost: the GPU driver has failed; a device restart is required)"
+             : " (GPU work did not finish in 120 s; the driver may be wedged)";
+        // #325: record the wedge so this process fails fast from now on and
+        // the next one (within 15 min) refuses to join the retry storm.
+        mark_wedged(err);
+    }
+    return false;
+}
+
 bool Context::check_memory_budget(uint64_t need, std::string& err) {
     // #325 preflight: with VK_EXT_memory_budget, refuse a load cleanly when
     // the device-local heaps cannot fit `need` (+64 MiB margin). A no-op on
     // drivers without the extension (PowerVR: the wedge marker covers it).
-    if (wedged_) { err = wedged_why_; return false; }
+    if (wedged_) { err = wedged_why(); return false; }
     if (!mem_budget_) return true;
     VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
@@ -571,8 +598,7 @@ bool Context::upload(Buffer& dst, VkDeviceSize off, const void* src, size_t byte
         si.pCommandBuffers = &xfer_cb_;
         VkResult r = fn_.vkQueueSubmit(queue_, 1, &si, xfer_fence_);
         if (r != VK_SUCCESS) { err = vk_err("vkQueueSubmit(upload)", r); return false; }
-        fn_.vkWaitForFences(dev_, 1, &xfer_fence_, VK_TRUE, UINT64_MAX);
-        fn_.vkResetFences(dev_, 1, &xfer_fence_);
+        if (!wait_fence(xfer_fence_, "vkWaitForFences(upload)", err)) return false;
         done += n;
     }
     return true;
@@ -607,8 +633,7 @@ bool Context::download(const Buffer& src, VkDeviceSize off, void* dst, size_t by
         si.pCommandBuffers = &xfer_cb_;
         VkResult r = fn_.vkQueueSubmit(queue_, 1, &si, xfer_fence_);
         if (r != VK_SUCCESS) { err = vk_err("vkQueueSubmit(download)", r); return false; }
-        fn_.vkWaitForFences(dev_, 1, &xfer_fence_, VK_TRUE, UINT64_MAX);
-        fn_.vkResetFences(dev_, 1, &xfer_fence_);
+        if (!wait_fence(xfer_fence_, "vkWaitForFences(download)", err)) return false;
         if (!staging_.coherent) {
             VkMappedMemoryRange mr{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
             mr.memory = staging_.mem; mr.offset = 0; mr.size = VK_WHOLE_SIZE;
@@ -885,30 +910,7 @@ bool Recording::submit_and_wait(std::string& err) {
             return false;
         }
     }
-    // Bounded wait: a lost device must surface as an error, not a hang.
-    r = f.vkWaitForFences(ctx_.dev_, 1, &fence_, VK_TRUE, 120ull * 1000 * 1000 * 1000);
-    if (r != VK_SUCCESS) {
-        // The fence may still be pending (timeout): drain the queue before
-        // it is reset or the recording's buffers are freed.
-        f.vkDeviceWaitIdle(ctx_.dev_);
-        f.vkResetFences(ctx_.dev_, 1, &fence_);
-        err = vk_err("vkWaitForFences", r);
-        if (r == VK_ERROR_OUT_OF_DEVICE_MEMORY || r == VK_ERROR_DEVICE_LOST || r == VK_TIMEOUT) {
-            err += r == VK_ERROR_OUT_OF_DEVICE_MEMORY
-                 ? " (out of device memory: the GPU driver is likely wedged; a device restart"
-                   " clears it — do not keep retrying)"
-                 : r == VK_ERROR_DEVICE_LOST
-                 ? " (device lost: the GPU driver has failed; a device restart is required)"
-                 : " (GPU work did not finish in 120 s; the driver may be wedged)";
-            // #325: record the wedge so this process fails fast from now on
-            // and the next one (within 15 min) refuses to join the retry
-            // storm.
-            ctx_.mark_wedged(err);
-        }
-        return false;
-    }
-    f.vkResetFences(ctx_.dev_, 1, &fence_);
-    return true;
+    return ctx_.wait_fence(fence_, "vkWaitForFences", err);
 }
 
 void Recording::report_profile(const char* title) const {

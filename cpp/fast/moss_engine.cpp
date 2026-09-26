@@ -874,7 +874,9 @@ bool MossEngine::generate(const float* pcm, size_t n, std::vector<int32_t>& out_
     eos = !out_ids.empty() && out_ids.back() == I.cfg.eos_token_id;
     // Debug dump of the greedy token stream (#311 draft-acceptance studies):
     // STARLING_FAST_DUMP_TOKENS=path writes the generated ids (comma
-    // separated); a path used repeatedly gets .1, .2 ... suffixes.
+    // separated); a path used repeatedly gets .1, .2 ... suffixes. The
+    // suffix counter is per process: separate processes (one bench per
+    // clip) writing the same path overwrite each other — give each its own.
     if (const char* dp = std::getenv("STARLING_FAST_DUMP_TOKENS")) {
         static std::mutex mu;              // engine use is single-threaded
         static std::map<std::string, int> seq;   // today; guarded regardless

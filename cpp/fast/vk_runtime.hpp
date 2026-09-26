@@ -275,7 +275,7 @@ public:
     // VK_EXT_memory_budget, refuse a load cleanly when the device-local
     // heaps cannot fit `need` (+ margin).
     bool wedged() const { return wedged_; }
-    const std::string& wedged_why() const { return wedged_why_; }
+    std::string wedged_why() const;
     void mark_wedged(const std::string& why);
     bool check_memory_budget(uint64_t need, std::string& err);
 
@@ -315,10 +315,13 @@ private:
     VkCommandBuffer xfer_cb_ = VK_NULL_HANDLE;
     VkFence xfer_fence_ = VK_NULL_HANDLE;
     std::string pcache_path_;
+    // Bounded fence wait shared by submits and staged transfers; a failure
+    // that signals a degraded driver marks the wedge. Caller holds queue_mu_.
+    bool wait_fence(VkFence fence, const char* what, std::string& err);
+
     std::string wedge_path_;
-    std::atomic<bool> wedged_{false};   // written under queue_mu_, read anywhere
-    bool wrote_marker_ = false;
-    mutable std::mutex wedge_mu_;       // marker write vs destructor remove
+    std::atomic<bool> wedged_{false};   // set once (init / mark_wedged), read anywhere
+    mutable std::mutex wedge_mu_;       // guards wedged_why_ and the marker write
     std::string wedged_why_;
     bool mem_budget_ = false;
 

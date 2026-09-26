@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# measure.sh — A/B the current Android build against the base binary on the
+# phone_gates.sh — A/B the current Android build against the base binary on the
 # Pixel, one thermal window, MOSS short fixture. Prints METRIC lines:
 #   moss_decode / moss_decode_base / moss_decode_delta (ms/token, median)
 #   pk_medium_base / pk_medium_cand   (Parakeet medium total ms, G5 canary)
@@ -12,24 +12,21 @@
 # and decode times swing 2x (measured; screen-off reproduces the historical
 # +/-2% band).
 #
-# Env: ROUNDS (default 3), RUNS (timed runs per invocation, default 3),
-# EXTRA_ENV_CAND / EXTRA_ENV_BASE (STARLING_* for that side, default empty),
-# SKIP_G1=1, G1_FULL=1 (also medium/long transcripts), DO_PK=1 (Parakeet G5
-# canary — off by default; every model load costs GPU-driver health).
+# Env: ROUNDS (default 3), RUNS (timed runs per invocation, default 4),
+# EXTRA_ENV_CAND / EXTRA_ENV_BASE (space-separated VAR=value tokens for that
+# side, no quoting or spaces inside values — they are spliced into the adb
+# shell command; default empty), REFRESH_BASE=1 (push this build as the new
+# base, e.g. after keeping a candidate), SKIP_G1=1, G1_FULL=1 (also
+# medium/long transcripts), DO_PK=1 (Parakeet G5 canary — off by default;
+# every model load costs GPU-driver health).
 set -euo pipefail
-ROOT=$(cd "$(dirname "$0")/.." && pwd)
+ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+. "$(dirname "$0")/phone_common.sh"
 DEV=/data/local/tmp/starling
 ROUNDS=${ROUNDS:-3}
 RUNS=${RUNS:-4}
-
-screen_off() {
-  if [ "$(adb shell "dumpsys power | grep -m1 mWakefulness=" | tr -d '\r')" = "  mWakefulness=Awake" ]; then
-    adb shell "input keyevent KEYCODE_POWER" >/dev/null
-    sleep 2
-  fi
-}
-EXTRA_ENV_BASE=${EXTRA_ENV_BASE:-$(cat "$(dirname "$0")/base_env" 2>/dev/null || true)}
-EXTRA_ENV_CAND=${EXTRA_ENV_CAND:-$(cat "$(dirname "$0")/cand_env" 2>/dev/null || true)}
+EXTRA_ENV_BASE=${EXTRA_ENV_BASE:-}
+EXTRA_ENV_CAND=${EXTRA_ENV_CAND:-}
 MOSS_GGUF=${MOSS_GGUF:-moss-transcribe-preview-2b-q4e8-fullimx.gguf}
 PK_GGUF=${PK_GGUF:-parakeet-tdt-0.6b-v3-q4_k_m-shrink16.gguf}
 
@@ -42,35 +39,31 @@ BIN_SHA=$(sha256sum "$ROOT/build-android/starling-bench" | cut -d' ' -f1)
 BASE_SHA_FILE="$DEV/starling-bench-base.sha256"
 if ! adb shell "test -f $DEV/starling-bench-base" >/dev/null 2>&1 \
    || [ "$(adb shell "cat $BASE_SHA_FILE 2>/dev/null" | tr -d '\r')" != "$BIN_SHA" ] \
-   || [ -f "$ROOT/.auto/base_dirty" ]; then
+   || [ -n "${REFRESH_BASE:-}" ]; then
   adb push "$ROOT/build-android/starling-bench" "$DEV/starling-bench-base" >/dev/null
   adb shell "echo $BIN_SHA > $BASE_SHA_FILE"
-  rm -f "$ROOT/.auto/base_dirty"
 fi
-if [ "$(adb shell "sha256sum $DEV/starling-bench-base" 2>/dev/null | cut -d' ' -f1 | tr -d '\r')" = "$BIN_SHA" ]; then
-  echo "WARNING: base and cand are the same binary — delta is an A/A noise measurement, not a comparison" >&2
+# Same binary on both sides is only a real comparison when the env differs
+# (env-gated A/B on one build).
+if [ "$(adb shell "sha256sum $DEV/starling-bench-base" 2>/dev/null | cut -d' ' -f1 | tr -d '\r')" = "$BIN_SHA" ] &&
+   [ "$EXTRA_ENV_BASE" = "$EXTRA_ENV_CAND" ]; then
+  echo "WARNING: base and cand are the same binary with the same env — delta is an A/A noise measurement, not a comparison" >&2
 fi
 
-# Session cleanup: a locally-timed-out adb shell leaves the remote bench
-# running (its output pipe is gone; it can hang in poll forever) and every
-# later pidof-wait would block on it.
-adb shell 'for p in $(pidof starling-bench-base starling-bench-cand starling-bench); do kill -9 $p; done' >/dev/null 2>&1 || true
+kill_benches
 
 median() { sort -n | awk '{a[NR]=$1} END {print (NR % 2) ? a[(NR+1)/2] : (a[NR/2]+a[NR/2+1])/2}'; }
 
 # bench <binary> <model> <gguf> <wav> <extra> -> raw output of one invocation.
-# Back-to-back model loads (1.6 GB each) need the previous process gone; wait
-# for it, then run with a generous timeout.
 bench() {
-  timeout 120 adb shell 'while pidof starling-bench starling-bench-base starling-bench-cand >/dev/null 2>&1; do sleep 1; done' >/dev/null 2>&1 || \
-    adb shell 'for p in $(pidof starling-bench-base starling-bench-cand starling-bench); do kill -9 $p; done' >/dev/null 2>&1 || true
+  wait_benches
   adb shell "cd $DEV && timeout 600 env LD_LIBRARY_PATH=. STARLING_ENGINE=fast STARLING_GGML_THREADS=6 \
     STARLING_FAST_CACHE_DIR=$DEV STARLING_FAST_TIMING=1 $5 \
     ./$1 --model $2 --gguf $DEV/$3 --warmup --runs $RUNS $DEV/$4" 2>&1
 }
 
 # decode ms/token values from a bench output (one per timed run)
-decode_mspt() { sed -n 's/.*decode=\([0-9.]*\)ms (\([0-9]*\) tokens.*/\1 \2/p' "$1" | awk '{print $1 / $2}'; }
+decode_mspt() { sed -n 's/.*decode=\([0-9.]*\)ms (\([0-9]*\) tokens.*/\1 \2/p' "$1" | awk '$2 > 0 {print $1 / $2}'; }
 total_ms() { sed -n 's/.*time=\([0-9.]*\)ms.*/\1/p' "$1"; }
 
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
@@ -138,11 +131,14 @@ if [ -z "${SKIP_G1:-}" ]; then
   if [ -n "${G1_FULL:-}" ]; then
     RUNS_SAVED=$RUNS; RUNS=1
     for w in medium long; do
-      bench starling-bench-base moss "$MOSS_GGUF" "$w.wav" "$EXTRA_ENV_BASE" \
-        | sed -n 's/^  //p' > "$TMP/ta"
-      bench starling-bench-cand moss "$MOSS_GGUF" "$w.wav" "$EXTRA_ENV_CAND" \
-        | sed -n 's/^  //p' > "$TMP/tb"
-      cmp -s "$TMP/ta" "$TMP/tb" || MATCH=0
+      bench starling-bench-base moss "$MOSS_GGUF" "$w.wav" "$EXTRA_ENV_BASE" > "$TMP/fa" ||
+        { echo "G1 base bench failed ($w):" >&2; tail -5 "$TMP/fa" >&2; MATCH=0; continue; }
+      bench starling-bench-cand moss "$MOSS_GGUF" "$w.wav" "$EXTRA_ENV_CAND" > "$TMP/fb" ||
+        { echo "G1 cand bench failed ($w):" >&2; tail -5 "$TMP/fb" >&2; MATCH=0; continue; }
+      sed -n 's/^  //p' "$TMP/fa" > "$TMP/ta"
+      sed -n 's/^  //p' "$TMP/fb" > "$TMP/tb"
+      # Empty transcripts on both sides would compare equal: inconclusive.
+      if [ ! -s "$TMP/ta" ] || ! cmp -s "$TMP/ta" "$TMP/tb"; then MATCH=0; fi
     done
     RUNS=$RUNS_SAVED
   fi
@@ -151,6 +147,7 @@ fi
 for v in "$base" "$cand"; do
   case "$v" in ''|*[!0-9.]*) echo "ERROR: non-numeric decode metric (base=$base cand=$cand) — bench output unparsed" >&2; exit 1;; esac
 done
+awk "BEGIN {exit !($base > 0)}" || { echo "ERROR: base decode metric is zero" >&2; exit 1; }
 delta=$(awk "BEGIN {printf \"%.2f\", ($cand - $base) / $base * 100}")
 echo "METRIC moss_decode=$cand"
 echo "METRIC moss_decode_base=$base"

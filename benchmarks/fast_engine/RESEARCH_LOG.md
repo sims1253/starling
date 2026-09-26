@@ -166,14 +166,15 @@ measured harmful (~+2 pt); group sizes >32 trade ~1 pt for ≤6 % bytes and
 no speed. The decode-speed lever is not the layout: it is token batching
 (M-token GEMV, #311).
 
+Phase 1, continued:
+
+| # | Hypothesis | Result |
+| --- | --- | --- |
 | P1-5 | W4U GEMV plateau comes from the second (scale) load stream | speed-only `W4_NOSCALE` probe: saturated lm_head shape unchanged (25.7 vs 26.5 GB/s) — the scale stream is free at saturation; small N=6144 +28% (unsaturated = load-latency dominated). Scale-interleave layout (#5) not supported. discard |
 | P1-6 | **M-token GEMV**: share the weight unpacks across M tokens — per 32 weights at M=2, ~12 ops/token vs 20 at M=1 | **confirmed, kept (`bb7db62`)**: `gemv_w4um` (GEMV_M) processes two x-vectors per weight pass. Phone per-token rate **1.76–2.11× M=1** (N=151936: 69.7 vs 34.0 G w/s; N=6144: 34.2 vs 16.2; N=12288: 48.7 vs 27.7), second token nearly free. **Correction (review round)**: the original probe validated token-0 only; the token-1 reference check added in the review round exposed a missing token-1 store in the shader (the P1-6 edit that added it had silently no-op'd) — fixed and **both tokens now check rel err ≤ 3e-3**, timing unchanged. End-to-end unchanged (+0.25 %, noise) with identical transcripts. Desktop: second token literally free (bandwidth-bound). This is the enabling kernel for #311 batch verification; at acceptance ≥ 0.5 the GEMV time per output token halves. **keep** |
-
 | P1-7 | A deployable drafter makes the M-token GEMV exploitable for standalone MOSS decode (online n-gram, or copy-draft from Parakeet) | **both dead** (12 FLEURS clips, greedy id streams — the stream encodes every argmax, so acceptance is simulable offline): online n-gram (n=2..4) **1.000 tokens/pass** (no exploitable repeats in ~30-token ASR streams); Parakeet copy-draft **1.03 (K=2) / 1.05 (K=3)** — Parakeet and standalone-MOSS transcripts diverge constantly at the BPE level without prompt conditioning; casing normalization changes nothing. Also proven by construction: single-draft self-lookahead gains zero (the pass re-derives the pending token — identical context, identical logits — and advances exactly one token; K≥2 real drafts are required). Speculative decoding for the standalone metric needs a **learned drafter** (#292's gated EAGLE-3-class follow-up) or the product cleanup flow (Parakeet text in the MOSS prompt), which is a different measurement. `gemv_w4um` stays as the verify primitive; `STARLING_FAST_DUMP_TOKENS` lands as the study hook. discard |
-
 | P1-8 | Dispatch fixed costs + the adaptive GEMV rows heuristic leave decode time on the table: every WG re-reads the whole x vector, so rows=8 on the small-N shapes pays x traffic comparable to the weights | dispatch+barrier priced at **0.024–0.043 ms** (empty-work probes: 1-WG GEMV / 1-row norm ×200) → 144 dispatches ≈ 4–6 ms/token — fusion is a dead end (per-layer 5 dispatches is the dependency floor). Rows sweep (new `STARLING_FAST_MICRO=s,bits,N,K,reps` mode, one load per shape) at the five real decode shapes: **rows=16 best-or-tied everywhere** (qkv +15 %, o +31 %, down +8 % vs rows=8; gateup/lm_head ≥ rows=32). First A/B (+0.19 %) exposed the shrink-to-256-WGs rule silently reverting N=2048 to rows=8; pinning PowerVR to rows=16 (no growth, no shrink): **69.21 vs 70.54 ms/token (−1.88 %, all 3 rounds separated, transcripts identical)**; verification rerun 21+21 runs: **71.13 → 69.70 (−2.0 %)**. In-context gain ≈ 35 % of the isolated micro delta (the micro's barrier-per-rep pattern overstates small-N costs — extrapolate with that factor). **keep (`0c10a1a`)** |
-
-| P1-9 | lm_head embed at F16 (opt-in `STARLING_FAST_LM_F16`): isolated micro 45.0 vs 34.4 G w/s (rows=48 vs 16) promised −2.1 ms/token | **REJECTED: +9.4 %** (76.4 vs 69.8 ms/token, cleanly separated). F16 doubles the table bytes per token (622 vs 350 MB) and **in-context bandwidth for this access pattern is ~43 GB/s, not the micro's 90** — predicted +6.4 ms matches the measured +6.6 exactly. Calibration rule: isolated-kernel rates do not transfer for changes that alter the bytes moved; model in-context GEMV traffic at ~43 GB/s. (G2 had passed: 7.83 vs 7.87 % — the W8→F16 requant is quality-neutral; the 6-chunk `dequant_row` refactor that a 5-chunk F16 table needed works and reverted as dead infrastructure.) Also closed: W8 rows re-check at N=151936 confirms rows=16 (34.4 vs 32.0 at 32) — P1-8's pin had no W8 collateral. With this, the lm_head is at its floor in every format (W4: op-bound ~7.6–9 ms; W8: bandwidth-bound ~8.1 ms; F16: bandwidth-bound ~14.5 ms) and the decode GEMV budget is structurally accounted: linears op-bound ~41 ms + lm_head ~8 ms + dispatch ~5 ms + attention ~4 ms ≈ 58 ms of kernel-sum, plus ~11 ms attributed by P1-10 (pipeline switches, DRAM-cold effects) ≈ the measured 69–70 ms/token. discard |
+| P1-9 | lm_head embed at F16 (opt-in `STARLING_FAST_LM_F16`): isolated micro 45.0 vs 34.4 G w/s (rows=48 vs 16) promised −2.1 ms/token | **REJECTED: +9.4 %** (76.4 vs 69.8 ms/token, cleanly separated). F16 doubles the table bytes per token (622 vs 350 MB) and **in-context bandwidth for this access pattern is ~43 GB/s, not the micro's 90** — predicted +6.4 ms matches the measured +6.6 exactly. Calibration rule: isolated-kernel rates do not transfer for changes that alter the bytes moved; model in-context GEMV traffic at ~43 GB/s. (G2 had passed: 7.83 vs 7.87 % — the W8→F16 requant is quality-neutral; the 6-chunk `dequant_row` refactor that a 5-chunk F16 table needed works and reverted as dead infrastructure.) Also closed: W8 rows re-check at N=151936 confirms rows=16 (34.4 vs 32.0 at 32) — P1-8's pin had no W8 collateral. With this, the lm_head is at its floor in every format (W4: op-bound ~7.6–9 ms; W8: bandwidth-bound ~8.1 ms; F16: bandwidth-bound ~14.5 ms) and the decode GEMV budget is structurally accounted: linears op-bound ~41 ms + lm_head ~8 ms + dispatch ~5 ms + attention ~4 ms ≈ 58 ms of kernel-sum, plus ~11 ms attributed by P1-10 (the addendum below: pipeline switches, DRAM-cold effects) ≈ the measured 69–70 ms/token. discard |
 
 ## #317 loop closed (2026-09-26)
 
@@ -198,11 +199,11 @@ Session outcome (this branch, on top of #323):
   transfer at all (model in-context GEMV traffic at ~43 GB/s).
 - Decode budget structurally accounted: linears op-bound ~41 ms + lm_head
   ~8 ms + dispatch ~5 ms + attention ~4 ms ≈ 58 ms of kernel-sum, plus
-  ~11 ms attributed by P1-10 (pipeline switches, DRAM-cold vs L2-warm
+  ~11 ms attributed by P1-10 (the addendum below: pipeline switches, DRAM-cold vs L2-warm
   micros) ≈ 69–70 ms/token. The next decode win is
   #311's learned drafter on top of `gemv_w4um`, not another layout.
 
-## #317 addendum: the 10 ms micro-vs-context gap attributed (2026-09-26)
+## P1-10 (#317 addendum): the 10 ms micro-vs-context gap attributed (2026-09-26)
 
 The final accounting left ~10 ms/token between the isolated-kernel sum
 (59 ms) and in-context decode (69.7). New alternation probe
@@ -238,10 +239,11 @@ cross-check.
 
 ## #317 deliverable: energy per transcription (2026-09-26)
 
-Final open deliverable, measured with `.auto/energy.sh` (12 transcriptions
-per engine, screen off, battery discharging, battery-charge-counter gauge
-idle-subtracted over an equal-duration control — **a fuel-gauge estimate,
-not a rail measurement**):
+Final open deliverable, measured with the harness now at
+`benchmarks/fast_engine/phone_energy.sh` (12 transcriptions per engine,
+screen off, battery discharging, battery-charge-counter gauge minus a
+screen-off idle control — **a fuel-gauge estimate, not a rail
+measurement**):
 
 | engine | mWh / transcription (MOSS short) | median wall |
 | --- | --- | --- |
@@ -257,6 +259,18 @@ over-subtracted idle drain from ggml's shorter window — the error
 understated ggml energy, so the conclusion only strengthens). Honest
 statement: fast ≈ 2.4 mWh, ggml ≈ 5.2 (power model) to 21.9 (duration-scaled
 gauge), i.e. **fast uses 2.2–9× less energy**; latency 5.4 vs 7.8 s.
+
+Raw gauge points (µAh drained, window seconds): fast 40000 / 302, idle
+32500 / 302, ggml 80000 / 113 (idle rate 107.6 µAh/s). They reproduce the
+figures above exactly (fast (40000 − 32500)·3.87/12 = 2.42; ggml raw
+15.32, duration-scaled 21.9 mWh). Two caveats the headline must carry:
+the counter moved in **2500 µAh steps** on this device, and the fast window
+was idle-dominated (302 s of wall time for ~100 s of load + transcription),
+so the fast net drain is a small difference of large readings — worst-case
+±5000 µAh, i.e. **2.42 ± 1.6 mWh/transcription**. Its agreement with #12's
+2.2 is consistent, not a precision claim; the ggml figure (net 47500–67800
+µAh) is quantized to ±10 %. A tighter number needs a longer window (more
+runs) or rail instrumentation.
 
 ## #317 final certification (2026-09-26, tree `f4d49f8`)
 
@@ -288,8 +302,10 @@ quantized from the bf16-exact source with **IQ4_KT + our imatrix**
 | affine w4g128sym (+imx search) | 4.13 | 0.1092 |
 | affine w4g32sym-a (+imx search) | 4.50 | 0.094 |
 
-At matched ~4 bpw the trellis is **3–7 % better in rel-rms** than
-imatrix-searched affine — nowhere near a format-changing margin, and it
+Against the neighbouring imatrix-searched affine candidates the trellis is
+**0.8 % (w4g64sym, 4.25 bpw) to 6.0 % (w4g128sym, 4.13 bpw) better in
+rel-rms** while using fewer bits (affine w4g32sym-a at 4.50 bpw beats it by
+9 %) — nowhere near a format-changing margin, and it
 costs trellis decode ALU that the PowerVR op-issue ceiling charges at par
 (P1-1..P1-3). Conclusion for #316: at 4 bpw the cheap affine format stands;
 trellis only matters below 3 bpw (per EXL3's own 2–3 bpw focus), which is a

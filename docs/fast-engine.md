@@ -114,6 +114,12 @@ words); the packed-f16 variants additionally need `shaderFloat16`.
 * `benchmarks/fast_engine/pixel_measure.sh`: the tuning campaign's phone
   metric (Parakeet medium + MOSS short) with a fixture-transcript gate;
   `phone_ab.sh` interleaves several binaries in one thermal window.
+* `benchmarks/fast_engine/phone_gates.sh`: A/B of the current Android build
+  against a sha256-pinned base binary (alternating rounds, screen off) with
+  the G1 transcript gate and the optional Parakeet canary; prints `METRIC`
+  lines. `phone_energy.sh` measures energy per MOSS-short transcription
+  from the battery charge counter with a duration-scaled idle control (an
+  estimate, not a rail measurement).
 
 The fast engines are **not** byte-exact with ggml: activations enter the
 matrix products as f16 (ggml's CPU path quantizes them to 8 bits), so

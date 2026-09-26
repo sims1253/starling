@@ -1,95 +1,126 @@
 #!/usr/bin/env bash
-# energy.sh — energy per MOSS-short transcription on the phone (#317's last
-# deliverable: "report energy per transcription next to it and say how it was
-# measured: the batterystats power model is an estimate, not a rail
+# phone_energy.sh — energy per MOSS-short transcription on the phone (#317's
+# last deliverable: "report energy per transcription next to it and say how
+# it was measured: the batterystats power model is an estimate, not a rail
 # measurement").
 #
 # Method: the battery gauge's charge counter (dumpsys battery, a coulomb
 # counter) is PRIMARY; the batterystats power model is reported alongside as
-# an explicitly-estimated cross-check. An equal-duration screen-off idle
-# control subtracts the baseline drain. One bench invocation per engine
-# (--runs N, a single model load each — the phone's GPU health budget).
+# an explicitly-estimated cross-check. A screen-off idle control gives the
+# baseline drain rate, which is scaled to each window's duration and
+# subtracted. One bench invocation per engine (--runs N, a single model load
+# each — the phone's GPU health budget). The phone must be on battery.
 #
-# Env: RUNS (timed transcriptions per engine, default 12)
+# Env: RUNS (timed transcriptions per engine, default 12), MOSS_GGUF,
+# OUT (directory for the raw points and bench logs, default a fresh mktemp).
 set -euo pipefail
+. "$(dirname "$0")/phone_common.sh"
 DEV=/data/local/tmp/starling
 RUNS=${RUNS:-12}
 MOSS_GGUF=${MOSS_GGUF:-moss-transcribe-preview-2b-q4e8-fullimx.gguf}
 V_NOM=3.87   # nominal Li-ion voltage for µAh -> µWh; the gauge integrates
              # current, so this is an approximation of energy, stated as such
+OUT=${OUT:-$(mktemp -d)}
+POINTS="$OUT/energy_points.txt"
 
 command -v adb >/dev/null || { echo "adb missing" >&2; exit 1; }
 adb get-state >/dev/null 2>&1 || { echo "phone not connected" >&2; exit 1; }
 
-counter() {  # µAh (validated: a failed read aborts before any bench runs)
+battery_field() {  # battery_field "status" -> value from dumpsys battery
+  adb shell "dumpsys battery" | tr -d '\r' | sed -n "s/^ *$1: *//p" | head -1
+}
+# Charging makes the counter rise: every delta would be meaningless.
+# BatteryManager status: 2 charging, 3 discharging, 4 not charging, 5 full.
+on_battery() {
+  local st
+  st=$(battery_field status)
+  [ "$st" = 3 ] || [ "$st" = 4 ] ||
+    { echo "ERROR: battery status $st — unplug the phone (need 3 discharging / 4 not charging)" >&2; return 1; }
+}
+
+counter() {  # µAh; exits on a failed read
   local v
-  v=$(adb shell "dumpsys battery | grep -m1 'Charge counter'" | grep -oE '[0-9]+' | head -1)
+  v=$(battery_field "Charge counter")
   [[ "$v" =~ ^[0-9]+$ ]] || { echo "charge counter read failed (got: '$v')" >&2; exit 1; }
   echo "$v"
 }
 
-screen_off() {
-  if [ "$(adb shell "dumpsys power | grep -m1 mWakefulness=" | tr -d '\r')" = "  mWakefulness=Awake" ]; then
-    adb shell "input keyevent KEYCODE_POWER" >/dev/null
-    sleep 2
-  fi
-}
-
-echo "== environment =="
+echo "== environment (raw points and logs: $OUT) =="
 adb shell "dumpsys battery | grep -E 'status|level|Charge counter' | head -3; dumpsys thermalservice | grep -m1 Severity" || true
-adb shell 'for p in $(pidof starling-bench-base starling-bench-cand starling-bench); do kill -9 $p; done' >/dev/null 2>&1 || true
-screen_off
+on_battery
+kill_benches
+wait_benches
 
-bench() {  # engine runs (exported: measure() invokes it through bash -c)
-  local engine=$1
-  adb shell "cd $DEV && timeout 900 env LD_LIBRARY_PATH=. STARLING_ENGINE=$engine STARLING_GGML_THREADS=6 \
+bench() {  # bench <engine>
+  adb shell "cd $DEV && timeout 900 env LD_LIBRARY_PATH=. STARLING_ENGINE=$1 STARLING_GGML_THREADS=6 \
     STARLING_FAST_CACHE_DIR=$DEV ./starling-bench-cand --model moss --gguf $DEV/$MOSS_GGUF \
     --warmup --runs $RUNS $DEV/short.wav" 2>&1
 }
-export -f bench
-export DEV RUNS MOSS_GGUF
 
-measure() {  # label command
-  local label=$1
-  local t0=$(date +%s)
-  local c0=$(counter)
-  bash -c "${@:2}" > /tmp/energy_$label.log 2>&1
-  local c1=$(counter)
-  local t1=$(date +%s)
-  local duah=$((c0 - c1))
-  echo "$label $duah $((t1 - t0))" >> /tmp/energy_points.txt
-  echo "$label: ${duah} µAh over $((t1 - t0)) s"
+# measure <label> <command...>: one gauge window. A failed command or a
+# non-positive drain aborts with the log tail; the raw point is appended to
+# $POINTS as "<label> <µAh> <seconds>".
+measure() {
+  local label=$1 t0 t1 c0 c1 rc=0
+  shift
+  screen_off
+  on_battery
+  t0=$(date +%s)
+  c0=$(counter)
+  "$@" > "$OUT/energy_$label.log" 2>&1 || rc=$?
+  c1=$(counter)
+  t1=$(date +%s)
+  if [ "$rc" -ne 0 ]; then
+    echo "ERROR: $label window failed (exit $rc):" >&2
+    tail -5 "$OUT/energy_$label.log" >&2
+    exit 1
+  fi
+  if [ $((c0 - c1)) -le 0 ]; then
+    echo "ERROR: $label drain $((c0 - c1)) µAh is not positive (charging or gauge reset?)" >&2
+    exit 1
+  fi
+  echo "$label $((c0 - c1)) $((t1 - t0))" >> "$POINTS"
+  echo "$label: $((c0 - c1)) µAh over $((t1 - t0)) s"
 }
 
-rm -f /tmp/energy_points.txt
+: > "$POINTS"
 echo "== fast engine ($RUNS transcriptions) =="
-measure fast "bench fast"
-echo "== idle control (same duration, screen off) =="
-DUR=$(awk '$1=="fast"{print $3}' /tmp/energy_points.txt)
-[[ "$DUR" =~ ^[0-9]+$ ]] && [ "$DUR" -gt 0 ] || { echo "idle duration invalid (DUR='$DUR') — fast measurement failed?" >&2; exit 1; }
-measure idle "sleep $DUR"
+measure fast bench fast
+DUR=$(awk '$1=="fast"{print $3}' "$POINTS")
+echo "== idle control (${DUR} s, screen off) =="
+measure idle sleep "$DUR"
 echo "== ggml engine ($RUNS transcriptions) =="
-measure ggml "bench ggml"
+wait_benches
+measure ggml bench ggml
 
-python3 - "$RUNS" "$V_NOM" <<'EOF'
+echo "== raw points (label µAh seconds) =="
+cat "$POINTS"
+python3 - "$RUNS" "$V_NOM" "$POINTS" <<'EOF'
 import sys
-runs, v = int(sys.argv[1]), float(sys.argv[2])
-pts = {l.split()[0]: (int(l.split()[1]), int(l.split()[2])) for l in open("/tmp/energy_points.txt")}
-fast, idle, ggml = pts["fast"][0], pts["idle"][0], pts["ggml"][0]
-# The idle control is duration-matched to the fast window only; scale its
-# drain to each window's duration before subtracting (raw subtraction
-# over-subtracts from any longer-or-shorter window).
-idle_rate = idle / max(pts["idle"][1], 1)          # µAh per second
-idle_at = lambda label: idle_rate * pts[label][1]  # expected idle drain over that window
-mwh = lambda uah: uah * v / 1000.0
-if idle:
-    fi, gi = idle_at("fast"), idle_at("ggml")
-    print(f"gauge deltas (uAh): fast={fast} idle={idle} ({pts['idle'][1]}s) ggml={ggml}; idle scaled per window: fast {fi:.0f} ggml {gi:.0f}")
-    print(f"fast:  {mwh(fast - fi):.2f} mWh / {runs} = {(fast-fi)*v/1000/runs:.3f} mWh/transcription (idle-subtracted, duration-scaled)")
-    print(f"ggml:  {mwh(ggml - gi):.2f} mWh / {runs} = {(ggml-gi)*v/1000/runs:.3f} mWh/transcription (idle-subtracted, duration-scaled)")
-    print(f"ratio fast/ggml: {(fast-fi)/max(ggml-gi,1):.2f}x")
-print("method: battery charge counter (coulomb gauge), idle-subtracted, nominal voltage")
-print("assumes idle drain ~ constant; not a rail measurement")
+runs, v, path = int(sys.argv[1]), float(sys.argv[2]), sys.argv[3]
+pts = {}
+for line in open(path):
+    label, uah, sec = line.split()
+    pts[label] = (int(uah), int(sec))
+missing = [k for k in ("fast", "idle", "ggml") if k not in pts]
+if missing:
+    sys.exit(f"missing points: {missing}")
+# Idle drain is a rate: scale it to each window's duration before
+# subtracting (the engines' windows differ in length).
+idle_rate = pts["idle"][0] / max(pts["idle"][1], 1)   # µAh per second
+print(f"idle rate {idle_rate:.2f} µAh/s")
+net = {}
+for label in ("fast", "ggml"):
+    uah, sec = pts[label]
+    net[label] = uah - idle_rate * sec
+    per = net[label] * v / 1000 / runs
+    flag = "" if net[label] > 0 else "  <- NOT POSITIVE: idle control unreliable"
+    print(f"{label}: raw {uah} µAh over {sec} s, idle-subtracted {net[label]:.0f} µAh "
+          f"= {per:.3f} mWh/transcription{flag}")
+if net["fast"] > 0 and net["ggml"] > 0:
+    print(f"ratio ggml/fast: {net['ggml'] / net['fast']:.2f}x")
+print("method: battery charge counter (coulomb gauge), duration-scaled idle subtraction, "
+      "nominal voltage; assumes constant idle drain; not a rail measurement")
 EOF
 echo "== batterystats power-model cross-check (an estimate, not rails) =="
 adb shell "dumpsys batterystats | grep -iE 'sh=|u0a|Estimated power' | head -6" || true
