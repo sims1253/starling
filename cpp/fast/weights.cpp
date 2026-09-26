@@ -109,6 +109,7 @@ bool pack_gpu_matrix_raw(int type, const void* data, uint32_t N, uint32_t K,
     const size_t G = K / 32;
     auto alloc = [&](GpuFmt f) {
         m.fmt = f;
+        if (f == GpuFmt::W8) m.layout = LayoutDesc{8, 16, true};   // w8g16sym
         if (f == GpuFmt::W4) { m.q.assign((size_t)N * G * 4, 0); m.s.assign((size_t)N * G, 0); }
         if (f == GpuFmt::W8) { m.q.assign((size_t)N * G * 8, 0); m.s.assign((size_t)N * G, 0); }
         if (f == GpuFmt::F16) { m.q.assign(((size_t)N * K + 1) / 2, 0); m.s.clear(); }
@@ -257,21 +258,36 @@ bool pack_gpu_matrix(const ggml_tensor* t, HostMatrix& out, std::string& err) {
 }
 
 void permute_rows(HostMatrix& m, const std::vector<uint32_t>& src) {
-    const size_t qw = m.q.size() / m.N, sw = m.N ? m.s.size() / m.N : 0;
-    std::vector<uint32_t> q(m.q.size()), s(m.s.size());
+    const size_t qw = m.q.size() / m.N, sw = m.N ? m.s.size() / m.N : 0,
+                 xw = m.N ? m.x.size() / m.N : 0;
+    std::vector<uint32_t> q(m.q.size()), s(m.s.size()), x(m.x.size());
     for (size_t r = 0; r < src.size(); ++r) {
         std::copy_n(m.q.begin() + src[r] * qw, qw, q.begin() + r * qw);
         if (sw) std::copy_n(m.s.begin() + src[r] * sw, sw, s.begin() + r * sw);
+        if (xw) std::copy_n(m.x.begin() + src[r] * xw, xw, x.begin() + r * xw);
     }
     m.q.swap(q);
     m.s.swap(s);
+    m.x.swap(x);
 }
 
 bool concat_rows(HostMatrix& a, const HostMatrix& b, std::string& err) {
     if (a.fmt != b.fmt || a.K != b.K) { err = "concat_rows: format/K mismatch"; return false; }
     if (a.fmt == GpuFmt::F16 && ((size_t)a.N * a.K) % 2) { err = "concat_rows: odd f16 size"; return false; }
+    if (a.x.empty() != b.x.empty()) { err = "concat_rows: super-scale mismatch"; return false; }
+    // Legacy W4/W8 bytes are kernel-identical whatever spec produced them
+    // (w4g32asym vs w4g32sym-a); any other descriptor must match exactly.
+    auto legacy = [](const HostMatrix& m) {
+        return m.fmt == GpuFmt::F16 || m.layout.is_legacy_w4() || m.layout.is_legacy_w8();
+    };
+    if (!(legacy(a) && legacy(b)) && layout_to_string(a.layout) != layout_to_string(b.layout)) {
+        err = "concat_rows: layout mismatch (" + layout_to_string(a.layout) + " vs " +
+              layout_to_string(b.layout) + ")";
+        return false;
+    }
     a.q.insert(a.q.end(), b.q.begin(), b.q.end());
     a.s.insert(a.s.end(), b.s.begin(), b.s.end());
+    a.x.insert(a.x.end(), b.x.begin(), b.x.end());
     a.N += b.N;
     a.lossless = a.lossless && b.lossless;
     return true;

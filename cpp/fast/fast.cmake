@@ -28,6 +28,29 @@ if(NOT STARLING_GLSLC)
   message(FATAL_ERROR "STARLING_FAST=ON needs glslc (Vulkan SDK / shaderc, or the Android NDK's shader-tools)")
 endif()
 
+# Capability probe (#317): GL_EXT_integer_dot_product (OpSDot / dot4 for the
+# int8-activation GEMV kernels). The NDK r27 shader-tools glslc (shaderc
+# 2022.3) lacks the extension; every Vulkan-SDK / standalone shaderc from
+# 2023 on has it — including /usr/bin/glslc on current distros, which the
+# Android cross-build picks first (host glslc, SPIR-V is target-independent).
+# Shaders that require it stay in the optional list (compiled when the probe
+# passes, reported as skipped otherwise); this message names the capability
+# so a missing int-dot variant is diagnosable from the build log.
+set(_idot_src ${CMAKE_CURRENT_BINARY_DIR}/fast_idot_probe.comp)
+file(WRITE ${_idot_src} "#version 450\n#extension GL_EXT_integer_dot_product : require\nlayout(local_size_x=1) in;\nlayout(std430, binding=0) buffer B { int x[]; };\nvoid main() { x[0] = dotPacked4x8EXT(1, 2); }\n")
+execute_process(
+  COMMAND ${STARLING_GLSLC} --target-env=vulkan1.1 -c ${_idot_src}
+          -o ${CMAKE_CURRENT_BINARY_DIR}/fast_idot_probe.spv
+  RESULT_VARIABLE _idot_rc OUTPUT_QUIET ERROR_QUIET)
+if(_idot_rc EQUAL 0)
+  set(STARLING_GLSLC_IDOT ON)
+  message(STATUS "fast engine: ${STARLING_GLSLC} has GL_EXT_integer_dot_product")
+else()
+  set(STARLING_GLSLC_IDOT OFF)
+  message(STATUS "fast engine: ${STARLING_GLSLC} lacks GL_EXT_integer_dot_product "
+                 "(int-dot shaders will be skipped; install a Vulkan-SDK / 2023+ shaderc)")
+endif()
+
 if(NOT ANDROID)
   find_path(STARLING_FAST_VK_INCLUDE vulkan/vulkan.h
             HINTS "$ENV{VULKAN_SDK}/include")

@@ -3,6 +3,7 @@
 #include "moss_engine.hpp"
 
 #include "kernels.hpp"
+#include "packed_file.hpp"
 #include "vk_runtime.hpp"
 #include "weights.hpp"
 
@@ -56,13 +57,15 @@ struct ChunkedMat {
 // Split `m` into chunks of at most `rows` rows.
 std::vector<HostMatrix> split_rows(HostMatrix&& m, uint32_t rows) {
     std::vector<HostMatrix> out;
-    const size_t qw = m.q.size() / m.N, sw = m.s.empty() ? 0 : m.s.size() / m.N;
+    const size_t qw = m.q.size() / m.N, sw = m.s.empty() ? 0 : m.s.size() / m.N,
+                 xw = m.x.empty() ? 0 : m.x.size() / m.N;
     for (uint32_t r0 = 0; r0 < m.N; r0 += rows) {
         const uint32_t n = std::min(rows, m.N - r0);
         HostMatrix c;
-        c.fmt = m.fmt; c.N = n; c.K = m.K; c.lossless = m.lossless;
+        c.fmt = m.fmt; c.N = n; c.K = m.K; c.lossless = m.lossless; c.layout = m.layout;
         c.q.assign(m.q.begin() + (size_t)r0 * qw, m.q.begin() + (size_t)(r0 + n) * qw);
         if (sw) c.s.assign(m.s.begin() + (size_t)r0 * sw, m.s.begin() + (size_t)(r0 + n) * sw);
+        if (xw) c.x.assign(m.x.begin() + (size_t)r0 * xw, m.x.begin() + (size_t)(r0 + n) * xw);
         out.push_back(std::move(c));
     }
     return out;
@@ -180,10 +183,39 @@ bool MossEngine::Impl::load(const ms::MossModel& m, std::string& err) {
         return t && pack_gpu_matrix(t, hm, err);
     };
     PackJobs jobs;   // matrices repack in parallel before the upload
+    // STARLING_FAST_PACKED=path overrides GGUF repacking for the tensors the
+    // file contains (#319): source-quantized weights load straight into the
+    // arena. Shapes are validated against the GGUF so a file built for a
+    // different model fails loudly instead of misreading memory.
+    std::unique_ptr<PackedWeights> packed;
+    if (const char* pp = std::getenv("STARLING_FAST_PACKED")) {
+        packed = PackedWeights::load(pp, err);
+        if (!packed) return false;
+        std::fprintf(stderr,
+                     "[fast] packed override: %zu tensors, %.1f MB, rounding=%s source=%s\n",
+                     packed->size(), packed->bytes() / 1e6, packed->rounding().c_str(),
+                     packed->source_hash().c_str());
+    }
+    auto pack_one = [&](const std::string& n, const ggml_tensor* t, HostMatrix& hm,
+                         std::string& e) {
+        if (packed && packed->has(n)) {
+            if (!packed->matrix(n, hm, e)) return false;
+            const uint32_t want_n = (uint32_t)(ggml_nelements(t) / t->ne[0]);
+            if (hm.K != (uint32_t)t->ne[0] || hm.N != want_n) {
+                e = n + ": packed shape " + std::to_string(hm.N) + "x" + std::to_string(hm.K) +
+                    " != GGUF " + std::to_string(want_n) + "x" + std::to_string(t->ne[0]);
+                return false;
+            }
+            return true;
+        }
+        return pack_gpu_matrix(t, hm, e);
+    };
     auto mat = [&](const std::string& n, GMat& g) {
         const ggml_tensor* t = T(n);
         if (!t) return false;
-        jobs.add(&g, [t](HostMatrix& hm, std::string& e) { return pack_gpu_matrix(t, hm, e); });
+        jobs.add(&g, [&, t, n](HostMatrix& hm, std::string& e) {
+            return pack_one(n, t, hm, e);
+        });
         return true;
     };
     // Rows of `b` interleaved with rows of `a` (a0 b0 a1 b1 ...): the paired
@@ -192,9 +224,9 @@ bool MossEngine::Impl::load(const ms::MossModel& m, std::string& err) {
         const ggml_tensor* ta = T(a);
         const ggml_tensor* tb = T(b);
         if (!ta || !tb) return false;
-        jobs.add(&g, [ta, tb](HostMatrix& ha, std::string& e) {
+        jobs.add(&g, [&, ta, tb, a, b](HostMatrix& ha, std::string& e) {
             HostMatrix hb;
-            if (!pack_gpu_matrix(ta, ha, e) || !pack_gpu_matrix(tb, hb, e)) return false;
+            if (!pack_one(a, ta, ha, e) || !pack_one(b, tb, hb, e)) return false;
             const uint32_t n = ha.N;
             if (!concat_rows(ha, hb, e)) return false;
             std::vector<uint32_t> order(2 * n);
@@ -286,9 +318,11 @@ bool MossEngine::Impl::load(const ms::MossModel& m, std::string& err) {
         const ggml_tensor* tk = T(p + "attn.k.weight");
         const ggml_tensor* tv = T(p + "attn.v.weight");
         if (!tq || !tk || !tv) return false;
-        jobs.add(&Y.qkv, [tq, tk, tv](HostMatrix& q, std::string& e) {
+        jobs.add(&Y.qkv, [&, tq, tk, tv, p](HostMatrix& q, std::string& e) {
             HostMatrix k, v;
-            return pack_gpu_matrix(tq, q, e) && pack_gpu_matrix(tk, k, e) && pack_gpu_matrix(tv, v, e) &&
+            return pack_one(p + "attn.q.weight", tq, q, e) &&
+                   pack_one(p + "attn.k.weight", tk, k, e) &&
+                   pack_one(p + "attn.v.weight", tv, v, e) &&
                    concat_rows(q, k, e) && concat_rows(q, v, e);
         });
         if (!mat(p + "attn.o.weight", Y.o) ||
@@ -308,13 +342,25 @@ bool MossEngine::Impl::load(const ms::MossModel& m, std::string& err) {
         if (!te) return false;
         const uint32_t N = (uint32_t)te->ne[1], Kc = (uint32_t)te->ne[0];
         if (N == 0 || Kc != HD) { err = "fast moss: embedding table shape mismatch"; return false; }
-        const size_t rb = ggml_row_size(te->type, Kc);
-        emb_blocks.resize((N + emb_block - 1) / emb_block);
-        for (size_t b = 0; b < emb_blocks.size(); ++b) {
-            const uint32_t r0 = (uint32_t)b * emb_block, n = std::min(emb_block, N - r0);
-            jobs.add_host(&emb_blocks[b], [te, r0, n, Kc, rb](HostMatrix& hm, std::string& e) {
-                return pack_gpu_matrix_raw((int)te->type, (const uint8_t*)te->data + (size_t)r0 * rb, n, Kc, hm, e);
-            });
+        if (packed && packed->has("llm.embed.weight")) {
+            HostMatrix whole;
+            if (!packed->matrix("llm.embed.weight", whole, err)) return false;
+            if (whole.K != Kc || whole.N != N) {
+                err = "llm.embed.weight: packed shape " + std::to_string(whole.N) + "x" +
+                      std::to_string(whole.K) + " != GGUF " + std::to_string(N) + "x" + std::to_string(Kc);
+                return false;
+            }
+            // Same 8192-row blocks the GGUF path repacks in.
+            emb_blocks = split_rows(std::move(whole), emb_block);
+        } else {
+            const size_t rb = ggml_row_size(te->type, Kc);
+            emb_blocks.resize((N + emb_block - 1) / emb_block);
+            for (size_t b = 0; b < emb_blocks.size(); ++b) {
+                const uint32_t r0 = (uint32_t)b * emb_block, n = std::min(emb_block, N - r0);
+                jobs.add_host(&emb_blocks[b], [te, r0, n, Kc, rb](HostMatrix& hm, std::string& e) {
+                    return pack_gpu_matrix_raw((int)te->type, (const uint8_t*)te->data + (size_t)r0 * rb, n, Kc, hm, e);
+                });
+            }
         }
     }
     if (!jobs.run(ar, err)) return false;

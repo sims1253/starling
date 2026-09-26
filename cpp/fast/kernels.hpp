@@ -40,8 +40,9 @@ private:
 struct GMat {
     GpuFmt fmt = GpuFmt::F16;
     uint32_t N = 0, K = 0;
-    Arena::Id q = 0, s = 0;
-    bool has_s = false;
+    Arena::Id q = 0, s = 0, x = 0;   // x: per-row super scales (u8super layouts)
+    bool has_s = false, has_x = false;
+    LayoutDesc layout;               // packed-file descriptor (Phase 1 dispatch)
 };
 GMat arena_matrix(Arena& a, HostMatrix&& m);
 
