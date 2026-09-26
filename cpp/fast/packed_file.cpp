@@ -126,7 +126,11 @@ std::unique_ptr<PackedWeights> PackedWeights::load(const std::string& path, std:
             for (uint32_t r = 0; r < pt.N; ++r)
                 pt.super[r] = (uint16_t)(raw[4 * r] | (raw[4 * r + 1] << 8));
         }
-        out->tensors_.emplace(pt.name, std::move(pt));
+        const std::string name = pt.name;
+        if (!out->tensors_.emplace(name, std::move(pt)).second) {
+            err = "packed file: duplicate tensor " + name;
+            return nullptr;
+        }
     }
     return out;
 }

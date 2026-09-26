@@ -130,7 +130,7 @@ float layout_dequant(const LayoutDesc& d, const uint8_t* codes, const uint8_t* s
 // scales are rounded to f16 before codes are chosen so the dequant the GPU
 // computes is the one that was optimized. Returns the plain relative RMS
 // error of the row (||w-deq|| / ||w||), for reporting, or -1 when K is not
-// a multiple of d.group (nothing is written then).
+// a multiple of d.group or d is not valid() (nothing is written then).
 double layout_quant_row(const LayoutDesc& d, const float* w, uint32_t K, const float* im,
                         uint8_t* codes, uint8_t* scale_bytes, uint16_t* super, uint8_t* u8s);
 

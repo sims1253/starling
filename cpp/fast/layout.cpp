@@ -294,7 +294,7 @@ float layout_dequant(const LayoutDesc& d, const uint8_t* codes, const uint8_t* s
 
 double layout_quant_row(const LayoutDesc& d, const float* w, uint32_t K, const float* im,
                         uint8_t* codes, uint8_t* scale_bytes, uint16_t* super, uint8_t* u8s) {
-    if (d.group == 0 || K % d.group != 0) return -1.0;
+    if (!d.valid() || K % d.group != 0) return -1.0;   // valid() bounds group <= 1024
     const uint32_t groups = K / d.group;
     std::vector<float> s_v(groups), o_v(groups);
     std::vector<int16_t> q_all(K);
