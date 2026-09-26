@@ -352,18 +352,7 @@ bool MossEngine::Impl::load(const ms::MossModel& m, std::string& err) {
                 return false;
             }
             // Same 8192-row blocks the GGUF path repacks in.
-            emb_blocks.resize((N + emb_block - 1) / emb_block);
-            for (size_t b = 0; b < emb_blocks.size(); ++b) {
-                const uint32_t r0 = (uint32_t)b * emb_block, n = std::min(emb_block, N - r0);
-                const size_t qw = whole.q.size() / N, sw = whole.s.empty() ? 0 : whole.s.size() / N,
-                             xw = whole.x.empty() ? 0 : whole.x.size() / N;
-                HostMatrix& hm = emb_blocks[b];
-                hm.fmt = whole.fmt; hm.N = n; hm.K = Kc; hm.lossless = whole.lossless;
-                hm.layout = whole.layout;
-                hm.q.assign(whole.q.begin() + (size_t)r0 * qw, whole.q.begin() + (size_t)(r0 + n) * qw);
-                if (sw) hm.s.assign(whole.s.begin() + (size_t)r0 * sw, whole.s.begin() + (size_t)(r0 + n) * sw);
-                if (xw) hm.x.assign(whole.x.begin() + (size_t)r0 * xw, whole.x.begin() + (size_t)(r0 + n) * xw);
-            }
+            emb_blocks = split_rows(std::move(whole), emb_block);
         } else {
             const size_t rb = ggml_row_size(te->type, Kc);
             emb_blocks.resize((N + emb_block - 1) / emb_block);

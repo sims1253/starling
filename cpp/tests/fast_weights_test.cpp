@@ -247,34 +247,18 @@ int check_layout_roundtrip(const starling::fast::LayoutDesc& d) {
             float s;
             if (sup) {
                 // super * u8 in exactly this order (see layout.hpp)
-                uint16_t h = super[0];
-                uint32_t bits = ((uint32_t)(h & 0x8000) << 16) |
-                               (((uint32_t)((h >> 10) & 31) + 112) << 23) | ((uint32_t)(h & 0x3ff) << 13);
-                float sf;
-                std::memcpy(&sf, &bits, 4);
-                s = sf * (float)scales[g];
+                s = ggml_fp16_to_fp32(super[0]) * (float)scales[g];
             } else {
                 const bool pair = !d.symmetric || d.store_pair;
                 const size_t sbyte = pair ? (size_t)g * 4 : (size_t)g * 2;
-                const uint16_t h = (uint16_t)(scales[sbyte] | (scales[sbyte + 1] << 8));
-                const uint32_t sign = (uint32_t)(h & 0x8000) << 16;
-                const uint32_t e = (h >> 10) & 31, m = h & 0x3ff;
-                uint32_t bits = e ? (sign | ((e + 112) << 23) | (m << 13)) : sign;
-                float sf;
-                std::memcpy(&sf, &bits, 4);
-                s = sf;
+                s = ggml_fp16_to_fp32((uint16_t)(scales[sbyte] | (scales[sbyte + 1] << 8)));
             }
-            float want = d.symmetric ? (d.bits == 4 ? s * ((float)q - 8.0f) : s * (float)q) : 0.0f;
+            float want = d.bits == 4 ? s * ((float)q - 8.0f) : s * (float)q;   // symmetric
             if (!d.symmetric || d.store_pair) {
                 // offset from the second half of the group's word (asym rows,
                 // and sym rows stored in the legacy pair, where it is -8s)
                 const size_t i = ((size_t)g * 2 + 1) * 2;
-                const uint16_t ho = (uint16_t)(scales[i] | (scales[i + 1] << 8));
-                const uint32_t sign = (uint32_t)(ho & 0x8000) << 16;
-                const uint32_t e = (ho >> 10) & 31, m = ho & 0x3ff;
-                uint32_t bits = e ? (sign | ((e + 112) << 23) | (m << 13)) : sign;
-                float of;
-                std::memcpy(&of, &bits, 4);
+                const float of = ggml_fp16_to_fp32((uint16_t)(scales[i] | (scales[i + 1] << 8)));
                 want = s * (float)q + of;
             }
             if (std::memcmp(&got, &want, 4) != 0) {
@@ -444,7 +428,7 @@ int main() {
         using namespace starling::fast;
         const char* specs[] = {"w4g32asym", "w4g32sym",  "w4g64sym",  "w4g128sym",
                                "w4g128symu8s", "w8g16sym",  "w8g32sym",
-                               "w4g64sym-p1", "w4g32sym-a", "w4g64sym-a"};
+                               "w4g64sym-p1", "w4g32sym-a", "w4g64sym-a", "w8g32asym"};
         for (const char* s : specs) {
             LayoutDesc d;
             std::string err;
@@ -454,6 +438,42 @@ int main() {
                 continue;
             }
             fails += check_layout_roundtrip(d);
+        }
+        // Malformed or unsupported specs must be refused, not half-parsed.
+        const char* bad[] = {"w",          "w4gxsym",     "w4g32sym-p-u8s", "w4g32sym-p",
+                             "w8g128symu8s", "w8g16sym-a", "w4g32symjunk",  "w4g24sym"};
+        for (const char* s : bad) {
+            LayoutDesc d;
+            std::string err;
+            if (layout_from_string(s, &d, &err)) {
+                std::printf("FAIL spec %s accepted as %s\n", s, layout_to_string(d).c_str());
+                ++fails;
+            }
+        }
+        // u8super with all-zero groups: zero scales, zero values, no NaN.
+        {
+            LayoutDesc d;
+            std::string err;
+            layout_from_string("w4g128symu8s", &d, &err);
+            const uint32_t K = 256;
+            for (int nonzero = 0; nonzero < 2; ++nonzero) {
+                std::vector<float> w(K, 0.0f);
+                if (nonzero)
+                    for (uint32_t k = 128; k < K; ++k) w[k] = 0.01f * (float)((int)(k % 7) - 3);
+                std::vector<uint8_t> codes(layout_code_bytes(d, K)), sc(layout_scale_bytes(d, K));
+                uint16_t super = 0;
+                const double rel = layout_quant_row(d, w.data(), K, nullptr, codes.data(),
+                                                    sc.data(), &super, sc.data());
+                bool ok = std::isfinite(rel);
+                for (uint32_t k = 0; k < K && ok; ++k) {
+                    const float v = layout_dequant(d, codes.data(), sc.data(), &super, sc.data(), k);
+                    ok = std::isfinite(v) && (k >= 128 || v == 0.0f);   // group 0 is all zero
+                }
+                if (!ok) {
+                    std::printf("FAIL w4g128symu8s zero groups (nonzero=%d)\n", nonzero);
+                    ++fails;
+                }
+            }
         }
         // Round-trip of the spec string itself.
         const char* round[] = {"w4g32asym", "w8g16sym", "w4g64sym", "w4g128symu8s", "w4g32sym-p1",

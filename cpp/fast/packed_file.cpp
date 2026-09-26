@@ -11,15 +11,21 @@ namespace starling::fast {
 
 namespace {
 
+// Explicit little-endian reads (the format is LE whatever the host is).
 uint32_t rd_u32(const uint8_t* p) {
-    uint32_t v;
-    std::memcpy(&v, p, 4);
-    return v;
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
+           ((uint32_t)p[3] << 24);
 }
 uint64_t rd_u64(const uint8_t* p) {
-    uint64_t v;
-    std::memcpy(&v, p, 8);
-    return v;
+    return (uint64_t)rd_u32(p) | ((uint64_t)rd_u32(p + 4) << 32);
+}
+
+// NUL-terminated string inside a fixed-width header field.
+bool rd_field(const uint8_t* p, size_t width, std::string& out) {
+    const void* nul = std::memchr(p, 0, width);
+    if (!nul) return false;
+    out.assign((const char*)p, (size_t)((const uint8_t*)nul - p));
+    return true;
 }
 
 } // namespace
@@ -48,25 +54,27 @@ std::unique_ptr<PackedWeights> PackedWeights::load(const std::string& path, std:
         return nullptr;
     }
     auto out = std::make_unique<PackedWeights>();
-    out->source_.assign((const char*)buf.data() + off, 64);
-    out->source_ = out->source_.c_str();  // cut at the NUL
-    off += 65;
-    out->rounding_.assign((const char*)buf.data() + off, 15);
-    out->rounding_ = out->rounding_.c_str();
-    off += 16;
+    if (!rd_field(buf.data() + off, 65, out->source_) ||
+        !rd_field(buf.data() + off + 65, 16, out->rounding_)) {
+        err = "packed file: unterminated header string";
+        return nullptr;
+    }
+    off += 65 + 16;
     const uint32_t n_tensors = rd_u32(buf.data() + off);
     off += 4;
+    // Invariant: off <= buf.size(); `have` compares without overflow.
+    auto have = [&](uint64_t n) { return n <= (uint64_t)(buf.size() - off); };
     for (uint32_t t = 0; t < n_tensors; ++t) {
-        if (off + 4 > buf.size()) { err = "packed file: truncated (tensor header)"; return nullptr; }
+        if (!have(4)) { err = "packed file: truncated (tensor header)"; return nullptr; }
         const uint32_t name_len = rd_u32(buf.data() + off);
         off += 4;
-        if (off + name_len + 4 > buf.size()) { err = "packed file: truncated (name)"; return nullptr; }
+        if (!have((uint64_t)name_len + 4)) { err = "packed file: truncated (name)"; return nullptr; }
         PackedTensor pt;
         pt.name.assign((const char*)buf.data() + off, name_len);
         off += name_len;
         const uint32_t spec_len = rd_u32(buf.data() + off);
         off += 4;
-        if (off + spec_len + 8 > buf.size()) { err = "packed file: truncated (spec)"; return nullptr; }
+        if (!have((uint64_t)spec_len + 8)) { err = "packed file: truncated (spec)"; return nullptr; }
         std::string spec((const char*)buf.data() + off, spec_len);
         off += spec_len;
         if (!layout_from_string(spec, &pt.desc, &err)) {
@@ -82,7 +90,7 @@ std::unique_ptr<PackedWeights> PackedWeights::load(const std::string& path, std:
             return nullptr;
         }
         struct { uint64_t code, scale, super; } sz;
-        if (off + 24 > buf.size()) { err = "packed file: truncated (sizes)"; return nullptr; }
+        if (!have(24)) { err = "packed file: truncated (sizes)"; return nullptr; }
         sz.code = rd_u64(buf.data() + off);
         sz.scale = rd_u64(buf.data() + off + 8);
         sz.super = rd_u64(buf.data() + off + 16);
@@ -99,13 +107,14 @@ std::unique_ptr<PackedWeights> PackedWeights::load(const std::string& path, std:
                   std::to_string(want_scale) + "/" + std::to_string(want_super) + ")";
             return nullptr;
         }
+        auto padded = [](uint64_t bytes) { return (bytes + 3) & ~(uint64_t)3; };
         auto take = [&](uint64_t bytes) {
             std::vector<uint8_t> v(buf.begin() + off, buf.begin() + off + bytes);
-            off += bytes;
-            off += (size_t)((4 - (bytes & 3)) & 3);   // stored padded (EOF may cut it)
+            off += (size_t)padded(bytes);
             return v;
         };
-        if (off + sz.code + sz.scale + sz.super > buf.size()) {
+        // Every blob is written padded to 4 bytes (starling_layout_quant wblob).
+        if (!have(padded(sz.code) + padded(sz.scale) + padded(sz.super))) {
             err = "packed file: truncated (blobs of " + pt.name + ")";
             return nullptr;
         }
@@ -152,6 +161,9 @@ bool PackedWeights::matrix(const std::string& name, HostMatrix& out, std::string
     std::memcpy(m.s.data(), pt.scales.data(), pt.scales.size());
     if (pt.scales.size() % 4)
         std::memset((uint8_t*)m.s.data() + pt.scales.size(), 0, 4 - pt.scales.size() % 4);
+    // Per-row super scales (u8super layouts; unreachable until a kernel
+    // accepts one, but carried so the descriptor and data never disagree).
+    for (uint16_t h : pt.super) m.x.push_back(h);
     m.lossless = false;  // quantized from source, not repacked from GGUF
     out = m;
     return true;

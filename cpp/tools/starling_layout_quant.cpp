@@ -31,13 +31,17 @@
 #include "layout.hpp"
 #include "packed_file.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <mutex>
+#include <functional>
+#include <memory>
 #include <regex>
 #include <string>
 #include <thread>
@@ -49,7 +53,7 @@ namespace {
 using starling::fast::LayoutDesc;
 
 // ---------------------------------------------------------------------------
-// sha256 (FIPS 180-4), streamed, with a sidecar cache
+// sha256 (FIPS 180-4), streamed
 // ---------------------------------------------------------------------------
 
 struct Sha256 {
@@ -108,15 +112,12 @@ struct Sha256 {
         tmp.update(&one, 1);
         const uint8_t zero = 0;
         while (tmp.fill != 56) tmp.update(&zero, 1);
-        // length in bits of the *message* (before this padding)
+        // Big-endian bit length of the *message* (before this padding)
+        // fills bytes 56..63 and completes the final block.
         uint8_t l[8];
         const uint64_t bits = data_bits;
         for (int i = 0; i < 8; ++i) l[i] = (uint8_t)(bits >> (56 - 8 * i));
-        // Pad to a full 56-byte prefix (the old code hashed a 64-byte
-        // block from an 8-byte buffer — 56 bytes of stack garbage).
-        uint8_t tail[64] = {0};
-        std::memcpy(tail, l, 8);
-        tmp.update(tail, 56);
+        tmp.update(l, 8);
         char out[65];
         for (int i = 0; i < 8; ++i) std::snprintf(out + i * 8, 9, "%08x", tmp.h[i]);
         out[64] = 0;
@@ -384,8 +385,13 @@ bool read_safetensors(const std::string& path, std::vector<SrcTensor>* out, std:
                     uint64_t v[4] = {0, 0, 0, 0};
                     int i = 0;
                     while (p < end && *p != ']') {
-                        if (std::isdigit((unsigned char)*p)) v[i < 4 ? i++ : 3] = std::strtoull(p, (char**)&p, 10);
-                        else ++p;
+                        if (std::isdigit((unsigned char)*p)) {
+                            char* e = nullptr;
+                            v[i < 4 ? i++ : 3] = std::strtoull(p, &e, 10);
+                            p = e;
+                        } else {
+                            ++p;
+                        }
                     }
                     ++p;
                     if (field == "shape") {
@@ -432,6 +438,43 @@ struct Args {
     uint32_t verify_rows = 8;
 };
 
+// A positive count argument (--threads, --rows); exits on anything else.
+uint32_t count(const std::string& v) {
+    char* end = nullptr;
+    const unsigned long n = std::strtoul(v.c_str(), &end, 10);
+    if (v.empty() || *end || v[0] == '-' || n < 1 || n > 1u << 20) {
+        std::fprintf(stderr, "error: expected a positive count, got '%s'\n", v.c_str());
+        std::exit(1);
+    }
+    return (uint32_t)n;
+}
+
+// std::regex from user input, with the pattern named on error.
+bool make_regex(const std::string& pat, std::regex* out) {
+    try {
+        *out = std::regex(pat);
+        return true;
+    } catch (const std::regex_error& e) {
+        std::fprintf(stderr, "error: bad regex '%s': %s\n", pat.c_str(), e.what());
+        return false;
+    }
+}
+
+struct FileCloser { void operator()(FILE* f) const { if (f) std::fclose(f); } };
+struct GgufFree { void operator()(gguf_context* c) const { if (c) gguf_free(c); } };
+struct GgmlFree { void operator()(ggml_context* c) const { if (c) ggml_free(c); } };
+using FilePtr = std::unique_ptr<FILE, FileCloser>;
+using GgufPtr = std::unique_ptr<gguf_context, GgufFree>;
+using GgmlPtr = std::unique_ptr<ggml_context, GgmlFree>;
+
+// Deletes a partially written output unless commit() is reached.
+struct OutputGuard {
+    std::string path;
+    bool done = false;
+    ~OutputGuard() { if (!done && !path.empty()) std::remove(path.c_str()); }
+    void commit() { done = true; }
+};
+
 Args parse_args(int argc, char** argv) {
     Args a;
     for (int i = 2; i < argc; ++i) {
@@ -449,8 +492,8 @@ Args parse_args(int argc, char** argv) {
         else if (s == "--pack") a.pack = next();
         else if (s == "--gguf-in") a.gguf_in = next();
         else if (s == "--gguf-out") a.gguf_out = next();
-        else if (s == "--threads") a.threads = (uint32_t)std::atoi(next().c_str());
-        else if (s == "--rows") a.verify_rows = (uint32_t)std::atoi(next().c_str());
+        else if (s == "--threads") a.threads = count(next());
+        else if (s == "--rows") a.verify_rows = count(next());
         else if (s == "--dtype") a.dtype = next();
         else if (s == "--tensor") a.tensor = next();
         else if (s == "--ggml-type") a.ggml_type = next();
@@ -484,10 +527,10 @@ int cmd_pack(const Args& a) {
     }
     std::vector<std::pair<std::regex, LayoutDesc>> rules;
     if (!a.rules.empty()) {
-        FILE* f = std::fopen(a.rules.c_str(), "r");
+        FilePtr f(std::fopen(a.rules.c_str(), "r"));
         if (!f) { std::fprintf(stderr, "error: cannot open rules %s\n", a.rules.c_str()); return 1; }
         char line[512];
-        while (std::fgets(line, sizeof line, f)) {
+        while (std::fgets(line, sizeof line, f.get())) {
             std::string s(line);
             while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
             const auto first = s.find_first_not_of(" \t");
@@ -504,25 +547,32 @@ int cmd_pack(const Args& a) {
                 std::fprintf(stderr, "error: rule %s: %s\n", pat.c_str(), err.c_str());
                 return 1;
             }
-            if (pat == "default") def = d;
-            else rules.emplace_back(std::regex(pat), d);
+            if (pat == "default") {
+                def = d;
+            } else {
+                std::regex re;
+                if (!make_regex(pat, &re)) return 1;
+                rules.emplace_back(std::move(re), d);
+            }
         }
-        std::fclose(f);
     }
-    const std::regex include_re(a.include.empty() ? ".*" : a.include);
+    std::regex include_re;
+    if (!make_regex(a.include.empty() ? ".*" : a.include, &include_re)) return 1;
 
     std::vector<SrcTensor> srcs;
     std::string st_path;
-    ggml_context* gguf_ctx = nullptr;
-    gguf_context* gguf_in = nullptr;
+    GgmlPtr gguf_ctx;
+    GgufPtr gguf_in;
     if (a.source.size() > 5 && a.source.substr(a.source.size() - 5) == ".gguf") {
-        gguf_init_params ip = {/*.no_alloc =*/ false, /*.ctx =*/ &gguf_ctx};
-        gguf_in = gguf_init_from_file(a.source.c_str(), ip);
+        ggml_context* ctx_raw = nullptr;
+        gguf_init_params ip = {/*.no_alloc =*/ false, /*.ctx =*/ &ctx_raw};
+        gguf_in.reset(gguf_init_from_file(a.source.c_str(), ip));
+        gguf_ctx.reset(ctx_raw);
         if (!gguf_in) { std::fprintf(stderr, "error: cannot open %s\n", a.source.c_str()); return 1; }
-        const int64_t n = gguf_get_n_tensors(gguf_in);
+        const int64_t n = gguf_get_n_tensors(gguf_in.get());
         for (int64_t id = 0; id < n; ++id) {
-            const char* name = gguf_get_tensor_name(gguf_in, id);
-            ggml_tensor* t = name ? ggml_get_tensor(gguf_ctx, name) : nullptr;
+            const char* name = gguf_get_tensor_name(gguf_in.get(), id);
+            ggml_tensor* t = name ? ggml_get_tensor(gguf_ctx.get(), name) : nullptr;
             if (!t || ggml_n_dims(t) != 2) continue;
             SrcTensor st;
             st.name = name;
@@ -563,14 +613,18 @@ int cmd_pack(const Args& a) {
     if (sha.empty()) { std::fprintf(stderr, "error: cannot hash %s\n", a.source.c_str()); return 1; }
     std::fprintf(stderr, "source %s sha256 %s\n", a.source.c_str(), sha.c_str());
 
-    FILE* out = std::fopen(a.out.c_str(), "wb");
-    if (!out) { std::fprintf(stderr, "error: cannot write %s\n", a.out.c_str()); return 1; }
     std::vector<SrcTensor> want;
     for (const SrcTensor& t : srcs)
         if (!t.name.empty() && engine_matrix_tensor(t.name) && std::regex_search(t.name, include_re))
             want.push_back(t);
     if (want.empty()) { std::fprintf(stderr, "error: no tensors matched\n"); return 1; }
 
+    OutputGuard guard{a.out};
+    FilePtr out_f(std::fopen(a.out.c_str(), "wb"));
+    if (!out_f) { std::fprintf(stderr, "error: cannot write %s\n", a.out.c_str()); return 1; }
+    FILE* out = out_f.get();
+    // Write errors are sticky in the FILE; checked once via ferror() below.
+    // Integers are little-endian on every supported host (the format is LE).
     auto w32 = [&](uint32_t v) { std::fwrite(&v, 4, 1, out); };
     auto w64 = [&](uint64_t v) { std::fwrite(&v, 8, 1, out); };
     auto wblob = [&](const std::vector<uint8_t>& v) {
@@ -578,19 +632,19 @@ int cmd_pack(const Args& a) {
         static const uint8_t pad[3] = {0, 0, 0};
         std::fwrite(pad, 1, (4 - (v.size() & 3)) & 3, out);
     };
-    std::fprintf(stderr, "magic+header\n");
     std::fwrite("SFPK", 1, 4, out);
     w32(1);
     std::vector<char> src_field(65, 0);
     std::memcpy(src_field.data(), sha.c_str(), std::min<size_t>(sha.size(), 64));
     std::fwrite(src_field.data(), 1, 65, out);
     std::vector<char> rnd_field(16, 0);
-    std::memcpy(rnd_field.data(), (a.imatrix.empty() ? "rtn" : "imatrix"), 15);
+    const char* rounding = a.imatrix.empty() ? "rtn" : "imatrix";
+    std::memcpy(rnd_field.data(), rounding, std::strlen(rounding));
     std::fwrite(rnd_field.data(), 1, 16, out);
     w32((uint32_t)want.size());
 
     RowReader reader(st_path);
-    double t0 = (double)clock() / CLOCKS_PER_SEC;
+    const auto t0 = std::chrono::steady_clock::now();
     uint64_t total_in = 0, total_out = 0;
     for (const SrcTensor& t : want) {
         LayoutDesc d = def;
@@ -608,28 +662,32 @@ int cmd_pack(const Args& a) {
 
         const float* im = nullptr;
         auto it = imap.find(t.name);
-        if (it != imap.end() && it->second.values.size() == (size_t)t.K)
+        if (it != imap.end()) {
+            // The header records rounding="imatrix"; never fall back silently.
+            if (it->second.values.size() != (size_t)t.K) {
+                std::fprintf(stderr, "error: %s: imatrix has %zu values, K=%u\n", t.name.c_str(),
+                             it->second.values.size(), t.K);
+                return 1;
+            }
             im = it->second.values.data();
+        }
 
         std::vector<uint8_t> codes((size_t)cb * t.N), scales((size_t)sb * t.N);
         std::vector<uint16_t> supers(has_super ? t.N : 0);
         std::vector<double> rel_errs;
-        std::mutex io_mu;
-        std::string first_err;
 
+        // Rows are read on this thread, then quantized in parallel.
         const uint32_t block_rows = 4096;
         for (uint32_t r0 = 0; r0 < t.N; r0 += block_rows) {
             const uint32_t n = std::min(block_rows, t.N - r0);
             std::vector<float> block;
-            {
-                std::lock_guard<std::mutex> lk(io_mu);
-                if (!first_err.empty()) break;
-                if (!reader.read(t, r0, n, &block, &err)) { first_err = err; break; }
+            if (!reader.read(t, r0, n, &block, &err)) {
+                std::fprintf(stderr, "error: %s\n", err.c_str());
+                return 1;
             }
             rel_errs.resize(rel_errs.size() + n);
             double* errs = rel_errs.data() + rel_errs.size() - n;
             parallel_for(n, a.threads, [&](uint32_t i) {
-                if (!first_err.empty()) return;
                 const uint32_t r = r0 + i;
                 uint8_t* cs = codes.data() + (size_t)r * cb;
                 uint8_t* sc = scales.data() + (size_t)r * sb;
@@ -639,7 +697,6 @@ int cmd_pack(const Args& a) {
                                                            t.K, im, cs, sc, sp, u8);
             });
         }
-        if (!first_err.empty()) { std::fprintf(stderr, "error: %s\n", first_err.c_str()); return 1; }
         double rel_err_sum = 0;
         for (double e : rel_errs) rel_err_sum += e;
 
@@ -666,9 +723,13 @@ int cmd_pack(const Args& a) {
         std::fprintf(stderr, "  %-44s %6ux%-5u %-14s rel-rms %.5f\n", t.name.c_str(), t.N, t.K,
                      spec.c_str(), rel_err_sum / t.N);
     }
-    std::fclose(out);
-    if (gguf_in) { gguf_free(gguf_in); ggml_free(gguf_ctx); }
-    const double dt = (double)clock() / CLOCKS_PER_SEC - t0;
+    if (std::ferror(out) || std::fclose(out_f.release()) != 0) {
+        std::fprintf(stderr, "error: write to %s failed\n", a.out.c_str());
+        return 1;
+    }
+    guard.commit();
+    const double dt =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     std::printf("%s: %zu tensors, %.2f GB f32 -> %.2f GB packed (%.2f%%), %.1f s\n",
                 a.out.c_str(), want.size(), total_in / 1e9, total_out / 1e9,
                 100.0 * total_out / std::max<uint64_t>(total_in, 1), dt);
@@ -703,18 +764,29 @@ int cmd_eval(const Args& a) {
         usage("starling-layout-quant");
         return 1;
     }
+    if (a.dtype != "auto" && a.dtype != "bf16" && a.dtype != "f16" && a.dtype != "f32") {
+        std::fprintf(stderr, "error: --dtype must be auto, bf16, f16 or f32 (got %s)\n",
+                     a.dtype.c_str());
+        return 1;
+    }
     std::string err;
     auto packed = starling::fast::PackedWeights::load(a.pack, err);
     if (!packed) { std::fprintf(stderr, "error: %s\n", err.c_str()); return 1; }
 
-    ggml_context* ctx_in = nullptr;
-    gguf_init_params ip = {/*.no_alloc =*/ false, /*.ctx =*/ &ctx_in};
-    gguf_context* in = gguf_init_from_file(a.gguf_in.c_str(), ip);
-    if (!in) { std::fprintf(stderr, "error: cannot open %s\n", a.gguf_in.c_str()); return 1; }
+    ggml_context* ctx_in_raw = nullptr;
+    gguf_init_params ip = {/*.no_alloc =*/ false, /*.ctx =*/ &ctx_in_raw};
+    GgufPtr in_p(gguf_init_from_file(a.gguf_in.c_str(), ip));
+    GgmlPtr ctx_in_p(ctx_in_raw);
+    if (!in_p) { std::fprintf(stderr, "error: cannot open %s\n", a.gguf_in.c_str()); return 1; }
+    gguf_context* in = in_p.get();
+    ggml_context* ctx_in = ctx_in_p.get();
     const int64_t n_tensors = gguf_get_n_tensors(in);
-    ggml_context* ctx_out = ggml_init({ggml_tensor_overhead() * (size_t)(n_tensors + 16), nullptr, true});
+    GgmlPtr ctx_out_p(
+        ggml_init({ggml_tensor_overhead() * (size_t)(n_tensors + 16), nullptr, true}));
+    ggml_context* ctx_out = ctx_out_p.get();
     std::vector<std::unique_ptr<char[]>> owned;
-    gguf_context* gout = gguf_init_empty();
+    GgufPtr gout_p(gguf_init_empty());
+    gguf_context* gout = gout_p.get();
     gguf_set_kv(gout, in);
     gguf_set_val_str(gout, "starling.quant.tool", "starling-layout-quant");
     gguf_set_val_str(gout, "starling.quant.level", ("layout-eval-" + a.dtype).c_str());
@@ -746,8 +818,9 @@ int cmd_eval(const Args& a) {
             if (native != GGML_TYPE_COUNT && pt->K % 32) {
                 // load() already rejects K % group != 0 for group-32 layouts;
                 // this guards the native block writer for any future mapping.
-                err = name + ": native eval blocks need K % 32 == 0";
-                return false;
+                std::fprintf(stderr, "error: %s: native eval blocks need K %% 32 == 0\n",
+                             name.c_str());
+                return 1;
             }
             size_t dst_bytes = 0;
             if (native != GGML_TYPE_COUNT) {
@@ -800,26 +873,25 @@ int cmd_eval(const Args& a) {
                     }
                 });
             } else {
-            dst = ggml_new_tensor(ctx_out, eval_type, nd, t->ne);
-            const size_t dst_bytes_f = ggml_nbytes(dst);
-            dst_bytes = dst_bytes_f;
-            owned.emplace_back(new char[dst_bytes]);
-            uint16_t* h16 = (uint16_t*)owned.back().get();
-            parallel_for(pt->N, a.threads, [&](size_t r) {
-                const uint8_t* codes = pt->codes.data() + r * cb;
-                const uint8_t* scales = pt->scales.data() + r * sb;
-                const uint16_t* sup = pt->super.empty() ? nullptr : &pt->super[r];
-                const uint8_t* u8s = pt->desc.scale_dtype == starling::fast::ScaleDtype::U8Super ? scales : nullptr;
-                for (uint32_t k = 0; k < pt->K; ++k) {
-                    const float v = starling::fast::layout_dequant(pt->desc, codes, scales, sup, u8s, k);
-                    if (eval_type == GGML_TYPE_F32)
-                        ((float*)h16)[(size_t)r * pt->K + k] = v;
-                    else
-                        h16[(size_t)r * pt->K + k] =
-                            eval_type == GGML_TYPE_F16 ? (uint16_t)ggml_fp32_to_fp16(v)
-                                                       : ggml_fp32_to_bf16(v).bits;
-                }
-            });
+                dst = ggml_new_tensor(ctx_out, eval_type, nd, t->ne);
+                dst_bytes = ggml_nbytes(dst);
+                owned.emplace_back(new char[dst_bytes]);
+                uint16_t* h16 = (uint16_t*)owned.back().get();
+                parallel_for(pt->N, a.threads, [&](size_t r) {
+                    const uint8_t* codes = pt->codes.data() + r * cb;
+                    const uint8_t* scales = pt->scales.data() + r * sb;
+                    const uint16_t* sup = pt->super.empty() ? nullptr : &pt->super[r];
+                    const uint8_t* u8s = pt->desc.scale_dtype == starling::fast::ScaleDtype::U8Super ? scales : nullptr;
+                    for (uint32_t k = 0; k < pt->K; ++k) {
+                        const float v = starling::fast::layout_dequant(pt->desc, codes, scales, sup, u8s, k);
+                        if (eval_type == GGML_TYPE_F32)
+                            ((float*)h16)[(size_t)r * pt->K + k] = v;
+                        else
+                            h16[(size_t)r * pt->K + k] =
+                                eval_type == GGML_TYPE_F16 ? (uint16_t)ggml_fp32_to_fp16(v)
+                                                           : ggml_fp32_to_bf16(v).bits;
+                    }
+                });
             }
             ++replaced;
             bytes_out += dst_bytes;
@@ -837,14 +909,11 @@ int cmd_eval(const Args& a) {
     if (replaced) gguf_set_val_str(gout, "starling.numeric_profile", "quantized");
     if (!gguf_write_to_file(gout, a.gguf_out.c_str(), /*only_meta=*/false)) {
         std::fprintf(stderr, "error: failed to write %s\n", a.gguf_out.c_str());
+        std::remove(a.gguf_out.c_str());
         return 1;
     }
     std::printf("%s: %zu/%lld tensors dequantized to %s, %.2f GB\n", a.gguf_out.c_str(),
                 replaced, (long long)n_tensors, a.dtype.c_str(), bytes_out / 1e9);
-    gguf_free(gout);
-    ggml_free(ctx_out);
-    gguf_free(in);
-    ggml_free(ctx_in);
     return 0;
 }
 
@@ -872,6 +941,11 @@ int cmd_verify(const Args& a) {
     }
     st_path = a.source;
     if (!read_safetensors(a.source, &srcs, &err)) { std::fprintf(stderr, "error: %s\n", err.c_str()); return 1; }
+    const std::string sha = file_sha256(a.source);
+    if (sha != packed->source_hash())
+        std::printf("WARN source sha256 %s != pack's %s (a different source, or a pack "
+                    "written before the sha256 fix)\n",
+                    sha.c_str(), packed->source_hash().c_str());
     std::unordered_map<std::string, const SrcTensor*> by_name;
     for (const SrcTensor& t : srcs) {
         bool ok = false;
@@ -892,7 +966,8 @@ int cmd_verify(const Args& a) {
             std::printf("FAIL %s: shape %ux%u vs source %ux%u\n", pt.name.c_str(), pt.N, pt.K, t.N, t.K);
             ++bad;
             return;
-        }        const uint32_t rows = std::min(a.verify_rows, pt.N);
+        }
+        const uint32_t rows = std::min(a.verify_rows, pt.N);
         std::vector<float> src;
         if (!reader.read(t, 0, rows, &src, &err)) {
             std::printf("FAIL %s: %s\n", pt.name.c_str(), err.c_str());
@@ -920,7 +995,8 @@ int cmd_verify(const Args& a) {
                     pt.name.c_str(), starling::fast::layout_to_string(pt.desc).c_str(), rows, max_rel);
         if (max_rel >= 0.2) ++bad;
     });
-    std::printf(bad ? "verify: %d FAILED\n" : "verify: all OK\n", bad);
+    if (bad) std::printf("verify: %d FAILED\n", bad);
+    else std::printf("verify: all OK\n");
     return bad ? 1 : 0;
 }
 
@@ -961,11 +1037,15 @@ int cmd_cmp(const Args& a) {
         std::fprintf(stderr, "error: %s\n", err.c_str());
         return 1;
     }
-    ggml_type gt = GGML_TYPE_Q4_0;
+    ggml_type gt = GGML_TYPE_COUNT;
     { struct N { const char* n; ggml_type t; }; static const N tab[] = {
         {"q4_0", GGML_TYPE_Q4_0}, {"q4_1", GGML_TYPE_Q4_1}, {"q8_0", GGML_TYPE_Q8_0},
         {"q6_k", GGML_TYPE_Q6_K}, {"q4_k", GGML_TYPE_Q4_K}, {"q5_k", GGML_TYPE_Q5_K}};
       for (const auto& e : tab) if (a.ggml_type == e.n) gt = e.t; }
+    if (gt == GGML_TYPE_COUNT) {
+        std::fprintf(stderr, "error: --ggml-type must be q4_0, q4_1, q8_0, q6_k, q4_k or q5_k\n");
+        return 1;
+    }
 
     auto report = [&](const std::vector<float>& dq, const char* name) {
         double we = 0, ue = 0, w2 = 0, mx = 0;

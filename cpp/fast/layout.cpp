@@ -3,6 +3,7 @@
 #include "layout.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -26,27 +27,9 @@ uint16_t f2h(float f) {
     if (exp32 == 0xffu) return (uint16_t)(sign | 0x7c00u);  // inf/nan
     if (exp32 == 0) {
         if (mant == 0) return (uint16_t)sign;                // +-0
-        // Subnormal f32: renormalize into a normalized f16 candidate.
-        int e = -1;
-        while (!(mant & 0x800000u)) { mant <<= 1; --e; }
-        // Renormalized subnormal: value = m * 2^(e-148) with m in
-        // [2^23, 2^24), i.e. (1+frac) * 2^(e-125); f16 field = e - 110.
-        const int f16e = e - 110;
-        mant &= 0x7fffffu;
-        if (f16e > 0) {
-            uint32_t out = ((uint32_t)f16e << 10) | (mant >> 13);
-            const uint32_t rem = mant & 0x1fffu;
-            if (rem > 0x1000u || (rem == 0x1000u && (out & 1))) ++out;
-            return (uint16_t)(sign | out);
-        }
-        // f16 subnormal: value = (1.mant) * 2^(e-127) = mant' * 2^(f16e-24)
-        const uint32_t sub = mant | 0x800000u;
-        const int shift = 1 - f16e + 13;
-        uint32_t out = sub >> shift;
-        const uint32_t rem = sub & ((1u << shift) - 1);
-        const uint32_t half = 1u << (shift - 1);
-        if (rem > half || (rem == half && (out & 1))) ++out;
-        return (uint16_t)(sign | out);
+        // Subnormal f32 (< 2^-126) is far below f16's smallest subnormal
+        // (2^-24), so RNE always yields signed zero.
+        return (uint16_t)sign;
     }
     const int f16e = (int)exp32 - 127 + 15;
     if (f16e >= 31) return (uint16_t)(sign | 0x7c00u);       // overflow -> inf
@@ -103,7 +86,6 @@ struct ScoreCtx {
     const float* w;
     const float* im;   // null -> weight 1
     uint32_t n;        // group size
-    double norm = 0.0; // Σ im (or n) — for tie-breaking irrelevant, unused
 };
 
 int clamp_code(int bits, long q) {
@@ -164,23 +146,32 @@ bool layout_from_string(const std::string& spec, LayoutDesc* out, std::string* e
         if (err) *err = spec + ": " + why;
         return false;
     };
-    auto num = [&](const char* q) -> long {
+    // Parses a non-negative decimal at p into *v and advances p.
+    auto num = [&](uint32_t* v) {
+        if (!std::isdigit((unsigned char)*p)) return false;
         char* end = nullptr;
-        const long v = std::strtol(q, &end, 10);
-        if (end == q) { fail("expected a number"); p = q; return -1; }
+        const unsigned long x = std::strtoul(p, &end, 10);
+        if (x > 0xffffffffUL) return false;
+        *v = (uint32_t)x;
         p = end;
-        return v;
+        return true;
     };
     if (*p++ != 'w') return fail("must start with 'w'");
-    d.bits = (uint32_t)num(p);
-    if (*p == 'g') { ++p; d.group = (uint32_t)num(p); }
+    if (!num(&d.bits)) return fail("expected a number after 'w'");
+    if (*p == 'g') {
+        ++p;
+        if (!num(&d.group)) return fail("expected a number after 'g'");
+    }
     if (std::strncmp(p, "sym", 3) == 0) { d.symmetric = true; p += 3; }
     else if (std::strncmp(p, "asym", 4) == 0) { p += 4; }
     else return fail("need 'sym' or 'asym'");
     while (*p) {
         if (std::strncmp(p, "u8s", 3) == 0) { d.scale_dtype = ScaleDtype::U8Super; p += 3; }
         else if (*p == '-' && p[1] == 'a') { d.store_pair = true; p += 2; }
-        else if (*p == '-' && p[1] == 'p') { p += 2; d.order = (uint32_t)num(p); }
+        else if (*p == '-' && p[1] == 'p') {
+            p += 2;
+            if (!num(&d.order)) return fail("expected a number after '-p'");
+        }
         else { if (err) *err = spec + ": trailing junk at '" + p + "'"; return false; }
     }
     if (!d.valid()) return fail("invalid combination (see layout.hpp)");
@@ -303,9 +294,10 @@ float layout_dequant(const LayoutDesc& d, const uint8_t* codes, const uint8_t* s
 
 double layout_quant_row(const LayoutDesc& d, const float* w, uint32_t K, const float* im,
                         uint8_t* codes, uint8_t* scale_bytes, uint16_t* super, uint8_t* u8s) {
+    if (d.group == 0 || K % d.group != 0) return -1.0;
     const uint32_t groups = K / d.group;
     std::vector<float> s_v(groups), o_v(groups);
-    int16_t* q_all = new int16_t[K];
+    std::vector<int16_t> q_all(K);
     double sum_w2 = 0, sum_e2 = 0;
 
     // Search grid: multiplicative scale factors around the absmax-derived
@@ -348,13 +340,18 @@ double layout_quant_row(const LayoutDesc& d, const float* w, uint32_t K, const f
                 for (float a : kAlpha) try_cand(b * a, 0.0f);
             if (amax == 0.0f) try_cand(0.0f, 0.0f);
         } else {
-            // Asymmetric: offset at min, and the centered variant.
+            // Asymmetric: lowest code at min, and the centered variant. The
+            // code range is 0..15 for 4-bit and signed -128..127 for 8-bit,
+            // so the offset is shifted by the lowest code.
             const float span = hi - lo;
-            const float base = span / (d.bits == 4 ? 15.0f : 255.0f);
+            const float levels = d.bits == 4 ? 15.0f : 255.0f;
+            const float qmin = d.bits == 4 ? 0.0f : -128.0f;
+            const float base = span / levels;
             for (float a : kAlpha) {
                 const float s = base * a;
-                try_cand(s, lo);
-                try_cand(s, lo + 0.5f * (span - (d.bits == 4 ? 15.0f : 255.0f) * s));
+                const float o = lo - qmin * s;
+                try_cand(s, o);
+                try_cand(s, o + 0.5f * (span - levels * s));
             }
             if (span == 0.0f) try_cand(0.0f, lo);
         }
@@ -371,22 +368,23 @@ double layout_quant_row(const LayoutDesc& d, const float* w, uint32_t K, const f
         const float sup = h2f_(f2h(smax / 255.0f));
         super[0] = f2h(sup);
         for (uint32_t g = 0; g < groups; ++g) {
-            int u = (int)std::lround(s_v[g] / sup);
-            u = std::min(255, std::max(1, u));
-            if (s_v[g] == 0.0f) u = 0;
+            int u = 0;
+            if (s_v[g] > 0.0f && sup > 0.0f)
+                u = std::min(255, std::max(1, (int)std::lround(s_v[g] / sup)));
             u8s[g] = (uint8_t)u;
-            // Recompute codes against the effective (coarser) scale.
+            // Recompute codes against the effective (coarser) scale; a zero
+            // scale dequantizes to 0 whatever the code, so store the zero code.
             const float s = sup * (float)u;
             const float* wg = w + (size_t)g * d.group;
             for (uint32_t i = 0; i < d.group; ++i) {
-                long q = (long)std::lround(wg[i] / s) + 8;
+                const long q = s > 0.0f ? (long)std::lround(wg[i] / s) + 8 : 8;
                 q_all[(size_t)g * d.group + i] = (int16_t)clamp_code(4, q);
             }
         }
     } else {
         layout_store_scales(d, s_v.data(), o_v.data(), K, scale_bytes);
     }
-    layout_encode_row(d, q_all, K, codes);
+    layout_encode_row(d, q_all.data(), K, codes);
 
     // Report error against the exact reference dequant.
     for (uint32_t k = 0; k < K; ++k) {
@@ -394,7 +392,6 @@ double layout_quant_row(const LayoutDesc& d, const float* w, uint32_t K, const f
         sum_w2 += (double)w[k] * w[k];
         sum_e2 += (double)(w[k] - dq) * (w[k] - dq);
     }
-    delete[] q_all;
     return sum_w2 > 0 ? std::sqrt(sum_e2 / sum_w2) : 0.0;
 }
 

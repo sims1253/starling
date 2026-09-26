@@ -41,8 +41,8 @@ struct HostMatrix {
     std::vector<uint32_t> q;   // W4: N*K/8 words; W8: N*K/4 words; F16: N*K/2 words
     std::vector<uint32_t> s;   // W4/W8: N*K/32 words (two f16); F16: empty
     std::vector<uint32_t> x;   // packed-file layouts: per-row super scales (words)
-    LayoutDesc layout;         // descriptor for packed-file matrices; legacy
-                               // repacks leave the zero-initialized descriptor
+    LayoutDesc layout;         // packed-file descriptor; GGUF repacks carry the
+                               // legacy one (w4g32asym / w8g16sym; F16 unused)
     bool lossless = true;
     size_t bytes() const { return (q.size() + s.size() + x.size()) * 4; }
 };
