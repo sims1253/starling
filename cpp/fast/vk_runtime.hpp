@@ -23,6 +23,7 @@
 #include <vulkan/vulkan.h>
 
 #include <cstddef>
+#include <atomic>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -41,6 +42,7 @@ namespace starling::fast::vk {
     X(vkGetPhysicalDeviceFeatures2)            \
     X(vkGetPhysicalDeviceQueueFamilyProperties)\
     X(vkGetPhysicalDeviceMemoryProperties)     \
+    X(vkGetPhysicalDeviceMemoryProperties2)    \
     X(vkEnumerateDeviceExtensionProperties)    \
     X(vkCreateDevice)                          \
     X(vkGetDeviceProcAddr)
@@ -265,6 +267,18 @@ public:
     const Pipeline* pipeline(const char* shader, const std::vector<uint32_t>& spec,
                              std::string& err);
 
+    // #325 driver-degradation guards. wedged(): a previous GPU operation
+    // failed in a way that indicates the driver is in a bad state (OOM at a
+    // fence, device lost, timeout); everything after fails fast with `why`.
+    // A fresh (< 15 min) wedge marker from a previous process also counts,
+    // so a restart loop cannot deepen the wedge. check_memory_budget(): with
+    // VK_EXT_memory_budget, refuse a load cleanly when the device-local
+    // heaps cannot fit `need` (+ margin).
+    bool wedged() const { return wedged_; }
+    std::string wedged_why() const;
+    void mark_wedged(const std::string& why);
+    bool check_memory_budget(uint64_t need, std::string& err);
+
     std::mutex& queue_mutex() { return queue_mu_; }
     VkQueue queue() const { return queue_; }
     uint32_t queue_family() const { return qfam_; }
@@ -301,6 +315,15 @@ private:
     VkCommandBuffer xfer_cb_ = VK_NULL_HANDLE;
     VkFence xfer_fence_ = VK_NULL_HANDLE;
     std::string pcache_path_;
+    // Bounded fence wait shared by submits and staged transfers; a failure
+    // that signals a degraded driver marks the wedge. Caller holds queue_mu_.
+    bool wait_fence(VkFence fence, const char* what, std::string& err);
+
+    std::string wedge_path_;
+    std::atomic<bool> wedged_{false};   // set once (init / mark_wedged), read anywhere
+    mutable std::mutex wedge_mu_;       // guards wedged_why_ and the marker write
+    std::string wedged_why_;
+    bool mem_budget_ = false;
 
     friend struct Buffer;
     friend class Recording;

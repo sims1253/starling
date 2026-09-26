@@ -75,6 +75,7 @@ set(STARLING_FAST_SHADERS
   "alu_probe|alu_probe.comp||1"
   "gemv_w4|gemv.comp|W_W4|7"
   "gemv_w4u|gemv.comp|W_W4,W4_UNPACK|7"
+  "gemv_w4um|gemv.comp|W_W4,W4_UNPACK,GEMV_M|7"
   "gemv_w8|gemv.comp|W_W8|7"
   "gemv_f16|gemv.comp|W_F16|7"
   "attn_decode|attn_decode.comp||8"
@@ -95,6 +96,7 @@ set(STARLING_FAST_SHADERS
 # "unknown fast-engine shader" at run time).
 set(STARLING_FAST_OPTIONAL_SHADERS
   "idot_probe|idot_probe.comp||2"
+  "f16dot_probe|f16dot_probe.comp||1"
 )
 foreach(_entry IN LISTS STARLING_FAST_OPTIONAL_SHADERS)
   string(REPLACE "|" ";" _parts "${_entry}")

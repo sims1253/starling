@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <ctime>
+#include <sys/stat.h>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -211,6 +213,12 @@ bool Context::init(std::string& err) {
             for (auto& e : ep) if (std::strcmp(e.extensionName, n) == 0) return true;
             return false;
         };
+        // Memory budget (free-headroom query) where the driver exposes it
+        // (#325): RADV and most desktop drivers do; the PowerVR driver on
+        // the Pixel 10 Pro does not, so the wedged-driver marker below is
+        // the protection there.
+        mem_budget_ = has_ext(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+        if (mem_budget_) exts.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
         const bool core12 = props.apiVersion >= VK_API_VERSION_1_2;
         if (core12 || has_ext(VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME)) {
             VkPhysicalDeviceShaderFloat16Int8Features f16{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES};
@@ -302,6 +310,27 @@ bool Context::init(std::string& err) {
         pcache_path_ = std::string(d) + tag;
         std::ifstream in(pcache_path_, std::ios::binary);
         if (in) cache_blob.assign(std::istreambuf_iterator<char>(in), {});
+        // #325: a fresh (< 15 min) wedge marker from a previous process
+        // means the GPU driver is in a degraded state that only a device
+        // restart clears. Fail fast instead of joining the retry storm —
+        // every retry into a wedged driver prolongs it and risks a
+        // watchdog restart.
+        wedge_path_ = std::string(d) + "/starling-fast-gpu-wedged";
+        struct stat wst;
+        if (stat(wedge_path_.c_str(), &wst) == 0 &&
+            std::difftime(std::time(nullptr), wst.st_mtime) < 900.0) {
+            char why[192] = {0};
+            if (FILE* f = std::fopen(wedge_path_.c_str(), "r")) {
+                size_t n = std::fread(why, 1, sizeof(why) - 1, f);
+                (void)n;
+                std::fclose(f);
+            }
+            std::lock_guard<std::mutex> lk(wedge_mu_);
+            wedged_ = true;
+            wedged_why_ = std::string("fast engine: a previous process observed GPU driver "
+                                      "failure (") + (why[0] ? why : "unknown") +
+                          ") less than 15 minutes ago; restart the app/device before retrying";
+        }
     }
     VkPipelineCacheCreateInfo pci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
     pci.initialDataSize = cache_blob.size();
@@ -355,6 +384,9 @@ Context::~Context() {
         }
     }
     staging_.release();
+    // The wedge marker is never removed by a process: init()'s 15-minute
+    // freshness check is its only expiry. Deleting it on exit would hide a
+    // failure another (wedged) process recorded while this one ran.
     for (auto& kv : pipes_) fn_.vkDestroyPipeline(dev_, kv.second->pipe, nullptr);
     for (auto& kv : layouts_) {
         fn_.vkDestroyPipelineLayout(dev_, kv.second.second, nullptr);
@@ -368,6 +400,84 @@ Context::~Context() {
     if (inst_) fn_.vkDestroyInstance(inst_, nullptr);
     // The loader library stays mapped: other Vulkan users in the process
     // (e.g. ggml's backend) may share it.
+}
+
+void Context::mark_wedged(const std::string& why) {
+    std::lock_guard<std::mutex> lk(wedge_mu_);
+    if (wedged_) return;
+    wedged_why_ = why;
+    wedged_ = true;
+    if (!wedge_path_.empty()) {
+        if (FILE* f = std::fopen(wedge_path_.c_str(), "w")) {
+            std::fprintf(f, "%s", why.c_str());
+            std::fclose(f);
+        } else {
+            // The in-process guard still holds; later processes are unprotected.
+            std::fprintf(stderr, "[fast] cannot write the GPU wedge marker %s\n",
+                         wedge_path_.c_str());
+        }
+    }
+}
+
+std::string Context::wedged_why() const {
+    std::lock_guard<std::mutex> lk(wedge_mu_);
+    return wedged_why_;
+}
+
+bool Context::wait_fence(VkFence fence, const char* what, std::string& err) {
+    // Bounded wait: a lost or hung device must surface as an error, not a
+    // hang. Callers hold queue_mu_.
+    const VkResult r = fn_.vkWaitForFences(dev_, 1, &fence, VK_TRUE, 120ull * 1000 * 1000 * 1000);
+    if (r == VK_SUCCESS) {
+        fn_.vkResetFences(dev_, 1, &fence);
+        return true;
+    }
+    // The fence may still be pending (timeout): drain the queue before it
+    // is reset or the submitted buffers are freed.
+    fn_.vkDeviceWaitIdle(dev_);
+    fn_.vkResetFences(dev_, 1, &fence);
+    err = vk_err(what, r);
+    if (r == VK_ERROR_OUT_OF_DEVICE_MEMORY || r == VK_ERROR_DEVICE_LOST || r == VK_TIMEOUT) {
+        err += r == VK_ERROR_OUT_OF_DEVICE_MEMORY
+             ? " (out of device memory: the GPU driver is likely wedged; a device restart"
+               " clears it — do not keep retrying)"
+             : r == VK_ERROR_DEVICE_LOST
+             ? " (device lost: the GPU driver has failed; a device restart is required)"
+             : " (GPU work did not finish in 120 s; the driver may be wedged)";
+        // #325: record the wedge so this process fails fast from now on and
+        // the next one (within 15 min) refuses to join the retry storm.
+        mark_wedged(err);
+    }
+    return false;
+}
+
+bool Context::check_memory_budget(uint64_t need, std::string& err) {
+    // #325 preflight: with VK_EXT_memory_budget, refuse a load cleanly when
+    // the device-local heaps cannot fit `need` (+64 MiB margin). A no-op on
+    // drivers without the extension (PowerVR: the wedge marker covers it).
+    if (wedged_) { err = wedged_why(); return false; }
+    if (!mem_budget_) return true;
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+    VkPhysicalDeviceMemoryProperties2 props2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
+    props2.pNext = &budget;
+    fn_.vkGetPhysicalDeviceMemoryProperties2(phys_, &props2);
+    uint64_t avail = 0, budget_total = 0;
+    for (uint32_t h = 0; h < props2.memoryProperties.memoryHeapCount; ++h) {
+        if (!(props2.memoryProperties.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)) continue;
+        budget_total += budget.heapBudget[h];
+        const uint64_t heap_free = budget.heapBudget[h] > budget.heapUsage[h]
+                                  ? budget.heapBudget[h] - budget.heapUsage[h] : 0;
+        avail += heap_free;
+    }
+    if (!budget_total) return true;   // driver reports no budgets: cannot check
+    if (need + (64ull << 20) > avail) {
+        err = "fast engine: GPU memory preflight failed: need " + std::to_string(need >> 20) +
+              " MiB, " + std::to_string(avail >> 20) + " MiB available - the GPU driver may be " +
+              "degraded; restarting the app/device clears it";
+        return false;
+    }
+    return true;
 }
 
 int Context::find_memory(uint32_t type_bits, VkMemoryPropertyFlags want,
@@ -431,6 +541,12 @@ bool Context::create_buffer(Buffer& out, VkDeviceSize bytes, Mem kind, std::stri
     r = fn_.vkAllocateMemory(dev_, &mai, nullptr, &out.mem);
     if (r != VK_SUCCESS) {
         err = vk_err("vkAllocateMemory", r) + " (" + std::to_string(req.size >> 20) + " MiB)";
+        err += " — the model may not fit, or the GPU driver is degraded; a device"
+               " restart clears the latter (do not keep retrying)";
+        // Allocation OOM alone must NOT wedge: a model that simply does not
+        // fit would otherwise poison later loads via the 15-min marker.
+        // Device-lost is an unambiguous driver failure.
+        if (r == VK_ERROR_DEVICE_LOST) mark_wedged(err);
         out.release();
         return false;
     }
@@ -487,8 +603,7 @@ bool Context::upload(Buffer& dst, VkDeviceSize off, const void* src, size_t byte
         si.pCommandBuffers = &xfer_cb_;
         VkResult r = fn_.vkQueueSubmit(queue_, 1, &si, xfer_fence_);
         if (r != VK_SUCCESS) { err = vk_err("vkQueueSubmit(upload)", r); return false; }
-        fn_.vkWaitForFences(dev_, 1, &xfer_fence_, VK_TRUE, UINT64_MAX);
-        fn_.vkResetFences(dev_, 1, &xfer_fence_);
+        if (!wait_fence(xfer_fence_, "vkWaitForFences(upload)", err)) return false;
         done += n;
     }
     return true;
@@ -523,8 +638,7 @@ bool Context::download(const Buffer& src, VkDeviceSize off, void* dst, size_t by
         si.pCommandBuffers = &xfer_cb_;
         VkResult r = fn_.vkQueueSubmit(queue_, 1, &si, xfer_fence_);
         if (r != VK_SUCCESS) { err = vk_err("vkQueueSubmit(download)", r); return false; }
-        fn_.vkWaitForFences(dev_, 1, &xfer_fence_, VK_TRUE, UINT64_MAX);
-        fn_.vkResetFences(dev_, 1, &xfer_fence_);
+        if (!wait_fence(xfer_fence_, "vkWaitForFences(download)", err)) return false;
         if (!staging_.coherent) {
             VkMappedMemoryRange mr{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
             mr.memory = staging_.mem; mr.offset = 0; mr.size = VK_WHOLE_SIZE;
@@ -801,18 +915,7 @@ bool Recording::submit_and_wait(std::string& err) {
             return false;
         }
     }
-    // Bounded wait: a lost device must surface as an error, not a hang.
-    r = f.vkWaitForFences(ctx_.dev_, 1, &fence_, VK_TRUE, 120ull * 1000 * 1000 * 1000);
-    if (r != VK_SUCCESS) {
-        // The fence may still be pending (timeout): drain the queue before
-        // it is reset or the recording's buffers are freed.
-        f.vkDeviceWaitIdle(ctx_.dev_);
-        f.vkResetFences(ctx_.dev_, 1, &fence_);
-        err = vk_err("vkWaitForFences", r);
-        return false;
-    }
-    f.vkResetFences(ctx_.dev_, 1, &fence_);
-    return true;
+    return ctx_.wait_fence(fence_, "vkWaitForFences", err);
 }
 
 void Recording::report_profile(const char* title) const {

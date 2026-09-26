@@ -106,3 +106,231 @@ Findings:
   block types); the eval GGUF must inherit the q4e8 model's F32 1-D tensors
   (graph-fusion parity — measured no WER effect, kept anyway); a bf16 store
   costs ~0.4 % per weight, material for W8 candidates only.
+
+## #317 Phase 1 loop: int8/OpSDot is dead on PowerVR; the GEMV plateau is structural (2026-09-26)
+
+Branch `autoresearch/pixel-layout-2026-09-25`. Phone protocol learned the
+hard way: screen OFF (the compositor shares the GPU: ±100 % swings), order-
+balanced A/B rounds (the second side of a round runs +3-8 % warm), ±2.5 %
+same-window noise floor on identical binaries, absolute numbers drift per
+boot (68-77 ms/token) — only same-window deltas count. GPU driver health
+degrades after ~8 model loads per boot (vkWaitForFences VkResult 2, then
+startup hangs); reboot between sessions.
+
+| # | Hypothesis | Result |
+| --- | --- | --- |
+| P1-1 | int8 activations × W8 lm_head GEMV via `dotPacked4x8EXT` cut the issue-bound op count ~2x | correct (micro rel err 1e-3, transcripts identical) but NO speed change: 42.5 vs 43.4 GB/s isolated at the real lm_head shape; end-to-end +0.65 % (noise). **Root cause: `OpSDot` costs ~2 issue slots on DXT — the same slot budget as the f32 `dot(vec4)` it replaces.** The #30 probe's "2x headroom" was MACs, not slots. |
+| P1-2 | packSnorm4x8 x-quant (1 op per 4 values) + 4-chain ILP unlock it | v2 flat (39.0 vs 38.7 GB/s), v3 (4 chains) WORSE (34.1). Idea stopped after three variants: **dead**. |
+| P1-3 | skinny-GEMM pricing for #311 | tiled GEMM W4 6144x2048: flat 7.1-7.3 ms at M=1,2,4,8,16 — the M rows are free, but M=1 already costs 6.8x a GEMV pass (1.04 ms). Batch verification must use a **dedicated M-token GEMV kernel** (weights unpacked once, M x-vectors: ~1.6-1.8x fewer ops/token at M=4-8, and the unpacks amortize exactly where the plateau hurts). That kernel is #311's enabling work. |
+| P1-4 | f16 `dot(f16vec4)` rate | 377 G f16-MAC/s = 4 MAC/issue-slot (2.6x the f32 FMA's MAC/slot) — the same per-slot efficiency as OpSDot. F16-layout GEMV measured 46.5 G w/s / 93 GB/s: memory has ≥2x headroom over the W4/W8 rates. No f16-dot GEMV rewrite either: the surrounding ops, not the dots, set the ~40 G w/s plateau all GEMV variants share (latency/occupancy class limit). |
+
+Baseline this boot: MOSS decode 73-77 ms/token (matches the #33-era
+per-operand mix; the historical 76.8 sits inside the boot-to-boot band).
+
+Conclusion for the layout question (#317): within affine weight layouts
+(W4/W8/F16 × group sizes × scale dtypes × nibble orders) the decode GEMV on
+this GPU is at a structural plateau — layout changes move quality and
+bytes, not decode speed. The speed lever that survives measurement is
+**token batching in a GEMV-shaped kernel** (M-token GEMV for speculative
+decoding, #311): the M rows are provably ~free at the op level, unlike the
+tiled GEMM. Quality side (Phase 0 table): symmetric-only W4, rebuild-from-
+source ≥ GGUF draw, g64 costs ~1 pt.
+
+### #317 acceptance table (every layout tried)
+
+Quality = desktop weight-only eval (ggml engine, FLEURS 100/lang; q4e8 GGUF
+raw baseline = en 7.50 / de 106.04 / ta 155.82). Bytes = per linear weight.
+Decode cost = phone GEMV weight rate; every quantized layout lands on the
+same ~37-46 G w/s plateau — on this GPU the layout moves quality and bytes,
+not decode speed.
+
+| layout | en | de | ta | bits/w | decode |
+| --- | --- | --- | --- | --- | --- |
+| w4g32asym (free offset, imx search) | 9.95 | 101.4* | 146* | 4.5 | plateau |
+| w4g32sym-a (Q4_0-shaped, imx search) | **7.31** | 105.91 | 174.73 | 4.5 | plateau (= today's W4 bytes) |
+| w4g32sym lean store (+ -p1 nibble perm) | = sym (decode-transparent, tested) | — | — | 4.25 | kernel variant unwarranted |
+| w4g64sym | 8.49 | 104.63 | 129.33 | 4.25 | plateau |
+| w4g128symu8s | 8.30 | 102.55 | 153.52 | 4.125 | plateau |
+| w8g32sym (Q8_0-shaped) | 7.78 | 101.83 | 146.12 | 8.25 | plateau |
+| w8g16sym embed (= today) | 7.31 (with w4g32sym-a linears) | — | — | 8.5 | plateau |
+| F16 (probe only) | — | — | — | 16 | 46.5 G w/s (+26 %, 2.6x bytes) |
+
+\* bf16-stored eval (pre-protocol-fix), same direction.
+
+**Recommendation for #316 (recipes) and #318 (layout ABI to cache):** keep
+today's byte layouts — linears W4-as-Q4_0-shape (`w4g32sym-a`), embed W8
+scale-per-16 (`w8g16sym`) — but quantize from source with the symmetric
+scheme + imatrix search: it measured strictly better than the GGUF/Q4_0 draw
+(7.31 vs 7.50 en) with identical kernel bytes. Free-offset asymmetric W4 is
+measured harmful (~+2 pt); group sizes >32 trade ~1 pt for ≤6 % bytes and
+no speed. The decode-speed lever is not the layout: it is token batching
+(M-token GEMV, #311).
+
+Phase 1, continued:
+
+| # | Hypothesis | Result |
+| --- | --- | --- |
+| P1-5 | W4U GEMV plateau comes from the second (scale) load stream | speed-only `W4_NOSCALE` probe: saturated lm_head shape unchanged (25.7 vs 26.5 GB/s) — the scale stream is free at saturation; small N=6144 +28% (unsaturated = load-latency dominated). Scale-interleave layout (#5) not supported. discard |
+| P1-6 | **M-token GEMV**: share the weight unpacks across M tokens — per 32 weights at M=2, ~12 ops/token vs 20 at M=1 | **confirmed, kept (`bb7db62`)**: `gemv_w4um` (GEMV_M) processes two x-vectors per weight pass. Phone per-token rate **1.76–2.11× M=1** (N=151936: 69.7 vs 34.0 G w/s; N=6144: 34.2 vs 16.2; N=12288: 48.7 vs 27.7), second token nearly free. **Correction (review round)**: the original probe validated token-0 only; the token-1 reference check added in the review round exposed a missing token-1 store in the shader (the P1-6 edit that added it had silently no-op'd) — fixed and **both tokens now check rel err ≤ 3e-3**, timing unchanged. End-to-end unchanged (+0.25 %, noise) with identical transcripts. Desktop: second token literally free (bandwidth-bound). This is the enabling kernel for #311 batch verification; at acceptance ≥ 0.5 the GEMV time per output token halves. **keep** |
+| P1-7 | A deployable drafter makes the M-token GEMV exploitable for standalone MOSS decode (online n-gram, or copy-draft from Parakeet) | **both dead** (12 FLEURS clips, greedy id streams — the stream encodes every argmax, so acceptance is simulable offline): online n-gram (n=2..4) **1.000 tokens/pass** (no exploitable repeats in ~30-token ASR streams); Parakeet copy-draft **1.03 (K=2) / 1.05 (K=3)** — Parakeet and standalone-MOSS transcripts diverge constantly at the BPE level without prompt conditioning; casing normalization changes nothing. Also proven by construction: single-draft self-lookahead gains zero (the pass re-derives the pending token — identical context, identical logits — and advances exactly one token; K≥2 real drafts are required). Speculative decoding for the standalone metric needs a **learned drafter** (#292's gated EAGLE-3-class follow-up) or the product cleanup flow (Parakeet text in the MOSS prompt), which is a different measurement. `gemv_w4um` stays as the verify primitive; `STARLING_FAST_DUMP_TOKENS` lands as the study hook. discard |
+| P1-8 | Dispatch fixed costs + the adaptive GEMV rows heuristic leave decode time on the table: every WG re-reads the whole x vector, so rows=8 on the small-N shapes pays x traffic comparable to the weights | dispatch+barrier priced at **0.024–0.043 ms** (empty-work probes: 1-WG GEMV / 1-row norm ×200) → 144 dispatches ≈ 4–6 ms/token — fusion is a dead end (per-layer 5 dispatches is the dependency floor). Rows sweep (new `STARLING_FAST_MICRO=s,bits,N,K,reps` mode, one load per shape) at the five real decode shapes: **rows=16 best-or-tied everywhere** (qkv +15 %, o +31 %, down +8 % vs rows=8; gateup/lm_head ≥ rows=32). First A/B (+0.19 %) exposed the shrink-to-256-WGs rule silently reverting N=2048 to rows=8; pinning PowerVR to rows=16 (no growth, no shrink): **69.21 vs 70.54 ms/token (−1.88 %, all 3 rounds separated, transcripts identical)**; verification rerun 21+21 runs: **71.13 → 69.70 (−2.0 %)**. In-context gain ≈ 35 % of the isolated micro delta (the micro's barrier-per-rep pattern overstates small-N costs — extrapolate with that factor). **keep (`0c10a1a`)** |
+| P1-9 | lm_head embed at F16 (opt-in `STARLING_FAST_LM_F16`): isolated micro 45.0 vs 34.4 G w/s (rows=48 vs 16) promised −2.1 ms/token | **REJECTED: +9.4 %** (76.4 vs 69.8 ms/token, cleanly separated). F16 doubles the table bytes per token (622 vs 350 MB) and **in-context bandwidth for this access pattern is ~43 GB/s, not the micro's 90** — predicted +6.4 ms matches the measured +6.6 exactly. Calibration rule: isolated-kernel rates do not transfer for changes that alter the bytes moved; model in-context GEMV traffic at ~43 GB/s. (G2 had passed: 7.83 vs 7.87 % — the W8→F16 requant is quality-neutral; the 6-chunk `dequant_row` refactor that a 5-chunk F16 table needed works and reverted as dead infrastructure.) Also closed: W8 rows re-check at N=151936 confirms rows=16 (34.4 vs 32.0 at 32) — P1-8's pin had no W8 collateral. With this, the lm_head is at its floor in every format (W4: op-bound ~7.6–9 ms; W8: bandwidth-bound ~8.1 ms; F16: bandwidth-bound ~14.5 ms) and the decode GEMV budget is structurally accounted: linears op-bound ~41 ms + lm_head ~8 ms + dispatch ~5 ms + attention ~4 ms ≈ 58 ms of kernel-sum, plus ~11 ms attributed by P1-10 (the addendum below: pipeline switches, DRAM-cold effects) ≈ the measured 69–70 ms/token. discard |
+
+## #317 loop closed (2026-09-26)
+
+Final verification (identical binaries, all gates): **69.64 vs 69.51 ms/token**
+(±0.3 % window noise), transcripts identical, `fast_weights_test` + both build
+configurations green, Parakeet 2064–2195 ms (historical band 1957–2184).
+
+Session outcome (this branch, on top of #323):
+
+- **Kept**: `gemv_w4um` (two-token GEMV, 1.76–2.11× per-token weight rate —
+  the verify primitive for #311's learned drafter); PowerVR decode GEMV rows
+  pinned to 16 (−1.9 % verified, twice); the micro probes (skinny-GEMM,
+  f16-dot, rows-sweep, M2), `STARLING_FAST_DUMP_TOKENS`.
+- **Closed by measurement**: OpSDot/int8 activations (slot-cost equal), f16
+  dots for GEMV (surrounding ops dominate), scale-interleave (free at
+  saturation), F16 lm_head (+9.4 % — in-context bandwidth ~43 GB/s), online
+  n-gram and copy drafters (1.000 / 1.03 tokens/pass), single-draft
+  self-lookahead (zero by construction), dispatch fusion (0.024–0.043 ms ×
+  144, dependency floor), W4 lm_head (quality math, #24).
+- **Micro→context transfer rules** (both directions measured): op-side
+  changes land at ~35 % of the isolated delta; byte-doubling changes don't
+  transfer at all (model in-context GEMV traffic at ~43 GB/s).
+- Decode budget structurally accounted: linears op-bound ~41 ms + lm_head
+  ~8 ms + dispatch ~5 ms + attention ~4 ms ≈ 58 ms of kernel-sum, plus
+  ~11 ms attributed by P1-10 (the addendum below: pipeline switches, DRAM-cold vs L2-warm
+  micros) ≈ 69–70 ms/token. The next decode win is
+  #311's learned drafter on top of `gemv_w4um`, not another layout.
+
+## P1-10 (#317 addendum): the 10 ms micro-vs-context gap attributed (2026-09-26)
+
+The final accounting left ~10 ms/token between the isolated-kernel sum
+(59 ms) and in-context decode (69.7). New alternation probe
+(`STARLING_FAST_MICRO=alt/altx`, one dispatch per rep alternating two
+pipelines) on a clean boot: **spec-constant switch +7 %, shader switch
++13–35 % per iteration** (N 2048–4096 shapes). Per layer the decode does 2
+unavoidable gemv↔attn shader switches + down-proj's lanes=192 spec
+divergence → ~1.6–5 ms/token of switch cost (structural: the gemv↔attn
+sandwich cannot share a pipeline); the remaining ~5–8 ms is DRAM-cold
+weights in context vs L2-warm small-matrix micros (physics). **No
+actionable lever ≥1 % remains** — the loop's closure stands with the
+accounting complete. Also fixed: plain GEMV micro runs crashed after the
+rows-sweep refactor (dangling `rec_out`) — latent since P1-8, caught by
+this probe.
+
+## #317 addendum 2: G4 verified; phone offline (2026-09-26)
+
+G4 (desktop RADV ≤ 10 % regression), the last acceptance item not formally
+logged this session — verified against a **fresh clean-master build**
+(4276631 + pinned ggml): MOSS short 1666 vs 1634 ms (+1.9 %), Parakeet
+medium 482.7 vs 479.7 ms (+0.6 %). Note: the main checkout's
+`build-bench-vk` binary is **not** a valid baseline — its build directory
+carries experimental artifacts (e.g. `coop_probe.spv`, not in master's
+shader list) and measured 1864 ms for the same workload.
+
+The energy-per-transcription deliverable remains blocked: the phone left
+the network (no `_adb-tls-connect` mDNS, no ICMP) and stayed offline
+through this iteration. Protocol queued in the session log — reconnect,
+then one bench invocation per side (`--runs N`, one model load each) with
+`dumpsys battery` charge-counter deltas plus an equal-duration idle
+control, reporting the gauge number with the batterystats model only as a
+cross-check.
+
+## #317 deliverable: energy per transcription (2026-09-26)
+
+Final open deliverable, measured with the harness now at
+`benchmarks/fast_engine/phone_energy.sh` (12 transcriptions per engine,
+screen off, battery discharging, battery-charge-counter gauge minus a
+screen-off idle control — **a fuel-gauge estimate, not a rail
+measurement**):
+
+| engine | mWh / transcription (MOSS short) | median wall |
+| --- | --- | --- |
+| fast (this branch, rows=16) | **2.42** | 5.41 s |
+| ggml (6 threads) | 15.32 (gauge today) / 5.2 (batterystats model, #12) | 7.78 s |
+
+The fast-engine number matches the original campaign's 2.2 mWh (#12,
+batterystats model) — two independent methods agreeing on ~2.2–2.4 mWh is
+the trustworthy part. **Correction (review round)**: the idle control is
+duration-matched to the fast window only; scaling it per window revises
+ggml from 15.3 to **21.9 mWh/transcription** (the raw subtraction had
+over-subtracted idle drain from ggml's shorter window — the error
+understated ggml energy, so the conclusion only strengthens). Honest
+statement: fast ≈ 2.4 mWh, ggml ≈ 5.2 (power model) to 21.9 (duration-scaled
+gauge), i.e. **fast uses 2.2–9× less energy**; latency 5.4 vs 7.8 s.
+
+Raw gauge points (µAh drained, window seconds): fast 40000 / 302, idle
+32500 / 302, ggml 80000 / 113 (idle rate 107.6 µAh/s). They reproduce the
+figures above exactly (fast (40000 − 32500)·3.87/12 = 2.42; ggml raw
+15.32, duration-scaled 21.9 mWh). Two caveats the headline must carry:
+the counter moved in **2500 µAh steps** on this device, and the fast window
+was idle-dominated (302 s of wall time for ~100 s of load + transcription),
+so the fast net drain is a small difference of large readings — worst-case
+±5000 µAh, i.e. **2.42 ± 1.6 mWh/transcription**. Its agreement with #12's
+2.2 is consistent, not a precision claim; the ggml figure (net 47500–67800
+µAh) is quantized to ±10 %. A tighter number needs a longer window (more
+runs) or rail instrumentation.
+
+## #317 final certification (2026-09-26, tree `f4d49f8`)
+
+Scaffolding audit: everything from discarded experiments (W4_NOSCALE probe,
+F16 lm_head path, chunk refactor) confirmed reverted; kept-by-design
+diagnostics documented (`gemv_w4um` + its m2 micro, rows sweep, alt probe,
+token-dump hook, energy script). Final-binary phone check: fixture transcript
+identical (the decode-time gate on this run is thermal-band only — the phone
+ended the day hot at 45 % battery; 113 ms/token in this state vs the
+cool-window verified 69.2–69.7 ms/token, consistent with the documented
+thermal sensitivity). Certified deliverables: decode −1.9 % (rows=16,
+verified twice in cool windows), quality 7.31 % en (GGUF and packed paths
+alike) vs 7.87 % baseline, energy 2.42 mWh/transcription, all five gates green,
+layout table + #311/#316/#318 notes delivered, #325 wedge guards landed
+from the driver investigation this session also produced.
+
+## #317 deliverable: the IQ*_KT trellis quality datapoint (2026-09-26)
+
+The brief's item 7 ("one data point: quality per resident byte of IQ*_KT vs
+the best affine candidate"). Method: ik_llama.cpp @ HEAD built CPU-only; 24
+MOSS tensors (ffn.gate + ffn.down, the largest decode-relevant matrices)
+quantized from the bf16-exact source with **IQ4_KT + our imatrix**
+(converted to llama.cpp format); weight-space rel-rms vs bf16.
+
+| format | bpw | rel-rms (24 tensors) |
+| --- | --- | --- |
+| **IQ4_KT (trellis + imx)** | 4.01 | **0.1027** |
+| affine w4g64sym (+imx search) | 4.25 | 0.1035 |
+| affine w4g128sym (+imx search) | 4.13 | 0.1092 |
+| affine w4g32sym-a (+imx search) | 4.50 | 0.094 |
+
+Against the neighbouring imatrix-searched affine candidates the trellis is
+**0.8 % (w4g64sym, 4.25 bpw) to 6.0 % (w4g128sym, 4.13 bpw) better in
+rel-rms** while using fewer bits (affine w4g32sym-a at 4.50 bpw beats it by
+9 %) — nowhere near a format-changing margin, and it
+costs trellis decode ALU that the PowerVR op-issue ceiling charges at par
+(P1-1..P1-3). Conclusion for #316: at 4 bpw the cheap affine format stands;
+trellis only matters below 3 bpw (per EXL3's own 2–3 bpw focus), which is a
+memory play (#316's concern), not a speed one.
+
+Method note for anyone touching KT formats standalone: the KT rows carry
+one leading f32 row-scale each, so a bulk `to_float` over N rows misframes
+everything after row 1 — dequant must be per row (cost an hour to find;
+the failure mode is rel-rms ≈ 1.4, i.e. looks like a broken quantizer, not
+a framing bug). IQ4_KT also needs the imatrix or the trellis clustering
+degenerates ("cluster N has no points").
+
+Addendum (brief item 7, second half): the *integer-trellis GEMV pricing
+probe* on PowerVR is closed without running it — it is analytically
+superseded by the op-issue-parity measurements (P1-1..P1-3: integer dots
+cost the same issue slots as f32 dots) combined with the quality datapoint
+above (trellis codes cost more decode work per weight than affine at any
+bpw). A trellis GEMV on this GPU pays MORE issue slots than the affine
+kernel for the ≤6 % rel-rms edge at 4 bpw — strictly worse on the measured
+bottleneck; the probe could only confirm the sign, and the device is
+#325-blocked regardless. Item closed.
+
+Addendum (#325, measurement status): a supervised single-load attempt after
+~1 h 47 m idle made partial progress — one transcription at 145 ms/token
+(degraded band) then a mid-run hang, killed cleanly. Idle does not reliably
+heal the fault; the final-head A/A remains composition-argued (P1-8's
+twice-verified 69.2–69.7 ms/token + measured-harmless push-constant delta +
+guards off the decode path), which stands as the certified result.
