@@ -71,7 +71,9 @@ struct LayoutDesc {
         if (group == 0 || group % 16 != 0 || group > 1024) return false;
         if (order > 1 || (order == 1 && bits != 4)) return false;
         if (scale_dtype == ScaleDtype::U8Super && !symmetric) return false;  // no offset storage
-        if (store_pair && (!symmetric || scale_dtype != ScaleDtype::F16)) return false;
+        if (scale_dtype == ScaleDtype::U8Super && bits != 4) return false;   // sym4 codes only
+        if (store_pair && (!symmetric || bits != 4 || scale_dtype != ScaleDtype::F16))
+            return false;   // the legacy (s, -8s) W4 pair; meaningless at 8 bits
         return true;
     }
 
@@ -115,7 +117,7 @@ float layout_offset_at(const LayoutDesc& d, const uint8_t* scale_bytes, uint32_t
 
 // Reference dequant of element k of one row. Mirrors the shader arithmetic:
 // scales/offsets/super are converted to f32 first, then
-//   asym:  fma(s, (float)q, o)
+//   asym:  s * (float)q + o   (separate mul and add, never fused)
 //   sym4:  s * ((float)q - 8)
 //   sym8:  s * (float)q
 //   u8s:   t = super * (float)u8 ; w = t * ((float)q - 8)
@@ -127,7 +129,8 @@ float layout_dequant(const LayoutDesc& d, const uint8_t* codes, const uint8_t* s
 // offset) search minimizes the importance-weighted squared error; candidate
 // scales are rounded to f16 before codes are chosen so the dequant the GPU
 // computes is the one that was optimized. Returns the plain relative RMS
-// error of the row (||w-deq|| / ||w||), for reporting.
+// error of the row (||w-deq|| / ||w||), for reporting, or -1 when K is not
+// a multiple of d.group (nothing is written then).
 double layout_quant_row(const LayoutDesc& d, const float* w, uint32_t K, const float* im,
                         uint8_t* codes, uint8_t* scale_bytes, uint16_t* super, uint8_t* u8s);
 
