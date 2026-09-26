@@ -21,7 +21,7 @@
 //   w8g16sym     8-bit, f16 scale per 16 — exactly today's GPU W8 (the
 //                Q8_0/Q6_K shape; symmetric: w = s*q)
 //   w4g64sym     4-bit symmetric, w = s*(q-8), one f16 scale per 64
-//   w4g128u8s    4-bit symmetric, u8 group scales under an f16 per-row
+//   w4g128symu8s 4-bit symmetric, u8 group scales under an f16 per-row
 //                super-scale, group 128
 //   w8g32sym     8-bit symmetric, one f16 scale per 32
 //

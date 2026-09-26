@@ -454,7 +454,10 @@ int main() {
         {
             LayoutDesc d;
             std::string err;
-            layout_from_string("w4g128symu8s", &d, &err);
+            if (!layout_from_string("w4g128symu8s", &d, &err)) {
+                std::printf("FAIL parse w4g128symu8s: %s\n", err.c_str());
+                return 1;
+            }
             const uint32_t K = 256;
             for (int nonzero = 0; nonzero < 2; ++nonzero) {
                 std::vector<float> w(K, 0.0f);

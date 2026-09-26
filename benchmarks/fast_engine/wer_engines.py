@@ -73,6 +73,9 @@ def main() -> int:
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--show-diffs", action="store_true")
     a = ap.parse_args()
+    if "fast-packed" in a.variants and not VARIANTS["fast-packed"]["STARLING_FAST_PACKED"]:
+        raise SystemExit("fast-packed needs STARLING_FAST_PACKED=<file.pack> in the environment "
+                         "(without it the variant is a plain fast run)")
 
     refs = json.load(open(os.path.join(a.clips, "refs.json")))
     names = sorted(refs)[: a.limit or None]
