@@ -27,7 +27,9 @@ command -v adb >/dev/null || { echo "adb missing" >&2; exit 1; }
 adb get-state >/dev/null 2>&1 || { echo "phone not connected" >&2; exit 1; }
 
 battery_field() {  # battery_field "status" -> value from dumpsys battery
-  adb shell "dumpsys battery" | tr -d '\r' | sed -n "s/^ *$1: *//p" | head -1
+  local out
+  out=$(adb shell "dumpsys battery" | tr -d '\r')
+  sed -n "s/^ *$1: *//p" <<<"$out" | sed -n 1p
 }
 # Charging makes the counter rise: every delta would be meaningless.
 # BatteryManager status: 2 charging, 3 discharging, 4 not charging, 5 full.
@@ -50,6 +52,7 @@ adb shell "dumpsys battery | grep -E 'status|level|Charge counter' | head -3; du
 on_battery
 kill_benches
 wait_benches
+trap kill_benches EXIT   # an abort must not leave a bench running on the phone
 
 bench() {  # bench <engine>
   adb shell "cd $DEV && timeout 900 env LD_LIBRARY_PATH=. STARLING_ENGINE=$1 STARLING_GGML_THREADS=6 \

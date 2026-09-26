@@ -433,7 +433,8 @@ bool Kernels::micro(const char* mi, std::string& err) {
         // at M = 1,2,4,8,16 over a real decode shape.
         // STARLING_FAST_MICRO=gemm[,K[,N[,reps]]]  (defaults 2048, 6144, 8)
         uint32_t Kd = 2048, Nd = 6144, reps = 8;
-        if (std::sscanf(mi, "gemm,%u,%u,%u", &Kd, &Nd, &reps) < 1 || Kd == 0 || Kd % 32 ||
+        // Bare "gemm" keeps the defaults; sscanf then matches nothing (EOF).
+        if ((mi[4] && std::sscanf(mi, "gemm,%u,%u,%u", &Kd, &Nd, &reps) < 1) || Kd == 0 || Kd % 32 ||
             Nd == 0 || reps == 0) {
             err = "STARLING_FAST_MICRO=gemm[,K[,N[,reps]]] (K % 32 == 0, N and reps > 0)";
             return false;
@@ -499,7 +500,8 @@ bool Kernels::micro(const char* mi, std::string& err) {
         // the i8 SDot (idot probe); needs shaderFloat16.
         if (!ctx_->info().f16) { err = "f16dot probe: no shaderFloat16"; return false; }
         uint32_t groups = 48, iters = 4096;
-        if (std::sscanf(mi, "f16dot,%u,%u", &groups, &iters) < 1) {
+        if ((mi[6] && std::sscanf(mi, "f16dot,%u,%u", &groups, &iters) < 1) || groups == 0 ||
+            iters == 0) {
             err = "STARLING_FAST_MICRO=f16dot[,groups[,iters]]";
             return false;
         }
@@ -517,8 +519,8 @@ bool Kernels::micro(const char* mi, std::string& err) {
         rec.end();
         const double ms = time_ms(rec, err);
         if (ms < 0) return false;
-        // 32 chains x 1 dot (4 MACs) per iter per thread; each chain's
-        // accumulate is the dot's own add, not counted separately.
+        // 32 chains x 1 dot (4 MACs) per iter per thread, 128 threads per
+        // group — keep in sync with shaders/f16dot_probe.comp.
         const double macs = (double)groups * 128 * iters * 32 * 4;
         std::fprintf(stderr, "[fast-micro] f16dot: %.1f G f16-MAC/s (%.3f ms)\n",
                      macs / (ms * 1e-3) / 1e9, ms);

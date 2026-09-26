@@ -30,6 +30,7 @@ EXTRA_ENV_CAND=${EXTRA_ENV_CAND:-}
 MOSS_GGUF=${MOSS_GGUF:-moss-transcribe-preview-2b-q4e8-fullimx.gguf}
 PK_GGUF=${PK_GGUF:-parakeet-tdt-0.6b-v3-q4_k_m-shrink16.gguf}
 
+adb get-state >/dev/null 2>&1 || { echo "phone not connected" >&2; exit 1; }
 cmake --build "$ROOT/build-android" --target starling-bench -j >/dev/null
 adb push "$ROOT/build-android/starling-bench" "$DEV/starling-bench-cand" >/dev/null
 
@@ -66,7 +67,7 @@ bench() {
 decode_mspt() { sed -n 's/.*decode=\([0-9.]*\)ms (\([0-9]*\) tokens.*/\1 \2/p' "$1" | awk '$2 > 0 {print $1 / $2}'; }
 total_ms() { sed -n 's/.*time=\([0-9.]*\)ms.*/\1/p' "$1"; }
 
-TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
+TMP=$(mktemp -d); trap 'rm -rf "$TMP"; kill_benches' EXIT
 
 declare -a base_vals cand_vals
 screen_off
@@ -110,9 +111,8 @@ if [ -n "${DO_PK:-}" ]; then
     echo "warning: cand parakeet bench failed — PK gate unavailable" >&2
     PK_CAND=0
   fi
-  for v in "$PK_BASE" "$PK_CAND"; do
-    case "$v" in ''|*[!0-9.]*) PK_BASE=0; PK_CAND=0;; esac
-  done
+  case "$PK_BASE" in ''|*[!0-9.]*) PK_BASE=0;; esac
+  case "$PK_CAND" in ''|*[!0-9.]*) PK_CAND=0;; esac
 fi
 
 # G1 (short fixture): the A/B invocations already transcribe short.wav —
@@ -120,6 +120,7 @@ fi
 # medium/long (2 more loads per side; milestones only: every load on this
 # phone costs GPU-driver health, ~8 loads per boot session is the budget).
 MATCH=1
+[ -n "${SKIP_G1:-}" ] && [ -n "${G1_FULL:-}" ] && echo "warning: SKIP_G1 also skips G1_FULL" >&2
 if [ -z "${SKIP_G1:-}" ]; then
   last_tr() { sed -n 's/^  //p' "$1" | tail -1; }
   ta=$(last_tr "$TMP/b$ROUNDS"); tb=$(last_tr "$TMP/c$ROUNDS")

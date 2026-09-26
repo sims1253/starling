@@ -407,11 +407,16 @@ void Context::mark_wedged(const std::string& why) {
     if (wedged_) return;
     wedged_why_ = why;
     wedged_ = true;
-    if (!wedge_path_.empty())
+    if (!wedge_path_.empty()) {
         if (FILE* f = std::fopen(wedge_path_.c_str(), "w")) {
             std::fprintf(f, "%s", why.c_str());
             std::fclose(f);
+        } else {
+            // The in-process guard still holds; later processes are unprotected.
+            std::fprintf(stderr, "[fast] cannot write the GPU wedge marker %s\n",
+                         wedge_path_.c_str());
         }
+    }
 }
 
 std::string Context::wedged_why() const {

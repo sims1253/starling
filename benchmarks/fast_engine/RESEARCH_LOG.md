@@ -324,7 +324,7 @@ superseded by the op-issue-parity measurements (P1-1..P1-3: integer dots
 cost the same issue slots as f32 dots) combined with the quality datapoint
 above (trellis codes cost more decode work per weight than affine at any
 bpw). A trellis GEMV on this GPU pays MORE issue slots than the affine
-kernel for the 3–7 % rel-rms edge at 4 bpw — strictly worse on the measured
+kernel for the ≤6 % rel-rms edge at 4 bpw — strictly worse on the measured
 bottleneck; the probe could only confirm the sign, and the device is
 #325-blocked regardless. Item closed.
 

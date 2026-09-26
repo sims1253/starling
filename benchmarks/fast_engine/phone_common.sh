@@ -4,8 +4,8 @@
 BENCH_BINS="starling-bench starling-bench-base starling-bench-cand"
 
 # Current display state, e.g. "mWakefulness=Asleep" ("" when unreadable).
-wakefulness() {
-  adb shell "dumpsys power | grep -m1 -o 'mWakefulness=[A-Za-z]*'" 2>/dev/null | tr -d '\r'
+wakefulness() {   # never fails: an unreadable state prints ""
+  { adb shell "dumpsys power | grep -m1 -o 'mWakefulness=[A-Za-z]*'" 2>/dev/null || true; } | tr -d '\r'
 }
 
 # Put the display to sleep and verify it: with the screen awake the
@@ -22,7 +22,7 @@ screen_off() {
   case "$state" in
     mWakefulness=Awake) echo "ERROR: display still awake after KEYCODE_POWER" >&2; return 1 ;;
     mWakefulness=*) return 0 ;;
-    *) echo "WARNING: could not read the display state (got '$state')" >&2; return 0 ;;
+    *) echo "ERROR: could not read the display state (got '$state')" >&2; return 1 ;;
   esac
 }
 
