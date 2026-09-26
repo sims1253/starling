@@ -136,8 +136,9 @@ std::string file_sha256(const std::string& path) {
     std::vector<char> buf(1 << 20);
     size_t n;
     while ((n = std::fread(buf.data(), 1, buf.size(), f)) > 0) s.update(buf.data(), n);
+    const bool bad = std::ferror(f) != 0;
     std::fclose(f);
-    return s.hex();
+    return bad ? "" : s.hex();   // a partial read must never become provenance
 }
 
 // ---------------------------------------------------------------------------
@@ -442,7 +443,7 @@ struct Args {
 uint32_t count(const std::string& v) {
     char* end = nullptr;
     const unsigned long n = std::strtoul(v.c_str(), &end, 10);
-    if (v.empty() || *end || v[0] == '-' || n < 1 || n > 1u << 20) {
+    if (v.empty() || *end || v[0] == '-' || n < 1 || n > 4096) {
         std::fprintf(stderr, "error: expected a positive count, got '%s'\n", v.c_str());
         std::exit(1);
     }
@@ -532,7 +533,7 @@ int cmd_pack(const Args& a) {
         char line[512];
         while (std::fgets(line, sizeof line, f.get())) {
             std::string s(line);
-            while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
+            while (!s.empty() && std::isspace((unsigned char)s.back())) s.pop_back();
             const auto first = s.find_first_not_of(" \t");
             if (first == std::string::npos || s[first] == '#') continue;
             const auto last = s.find_last_of(" \t");
@@ -662,7 +663,10 @@ int cmd_pack(const Args& a) {
 
         const float* im = nullptr;
         auto it = imap.find(t.name);
-        if (it != imap.end()) {
+        if (it == imap.end() && !imap.empty()) {
+            std::fprintf(stderr, "warning: %s: no imatrix entry, quantized with plain RTN\n",
+                         t.name.c_str());
+        } else if (it != imap.end()) {
             // The header records rounding="imatrix"; never fall back silently.
             if (it->second.values.size() != (size_t)t.K) {
                 std::fprintf(stderr, "error: %s: imatrix has %zu values, K=%u\n", t.name.c_str(),
@@ -723,7 +727,8 @@ int cmd_pack(const Args& a) {
         std::fprintf(stderr, "  %-44s %6ux%-5u %-14s rel-rms %.5f\n", t.name.c_str(), t.N, t.K,
                      spec.c_str(), rel_err_sum / t.N);
     }
-    if (std::ferror(out) || std::fclose(out_f.release()) != 0) {
+    const bool write_err = std::ferror(out) != 0;
+    if (std::fclose(out_f.release()) != 0 || write_err) {
         std::fprintf(stderr, "error: write to %s failed\n", a.out.c_str());
         return 1;
     }
@@ -1058,7 +1063,7 @@ int cmd_cmp(const Args& a) {
                 mx = std::max(mx, std::fabs(dd));
             }
         std::printf("%-10s weighted-MSE %.6e unweighted %.6e rel-rms %.5f max|err| %.5f\n",
-                    name, we, ue, std::sqrt(ue / w2), mx);
+                    name, we, ue, std::sqrt(ue / (w2 + 1e-30)), mx);
     };
 
     // ggml reference quantization

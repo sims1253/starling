@@ -106,18 +106,23 @@ def run_wer(lib: str, gguf: str, clips_dir: str) -> tuple[float, int]:
     ctx = libc.starling_ggml_load(2, gguf.encode())
     if not ctx:
         raise SystemExit(f"load failed: {libc.starling_ggml_last_error(None).decode()}")
-    try:
-        # warm-up (pipeline compilation) outside the WER pass
+    def transcribe(name: str, pcm: np.ndarray) -> str:
         p = libc.starling_ggml_transcribe_pcm(
-            ctx, clips[0][1].ctypes.data_as(ctypes.POINTER(ctypes.c_float)), len(clips[0][1]),
-            16000)
+            ctx, pcm.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), len(pcm), 16000)
+        if not p:
+            # A failed transcription must not score as a 100 %-WER data point.
+            msg = libc.starling_ggml_last_error(ctx)
+            raise SystemExit(f"{name}: transcription failed: "
+                             f"{msg.decode() if msg else 'unknown error'}")
+        hyp = ctypes.cast(p, ctypes.c_char_p).value.decode("utf-8", "replace")
         libc.starling_ggml_free_string(p)
+        return hyp
+
+    try:
+        transcribe(*clips[0])   # warm-up (pipeline compilation) outside the WER pass
         errs = words = 0
         for name, pcm in clips:
-            p = libc.starling_ggml_transcribe_pcm(
-                ctx, pcm.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), len(pcm), 16000)
-            hyp = ctypes.cast(p, ctypes.c_char_p).value.decode("utf-8", "replace") if p else ""
-            libc.starling_ggml_free_string(p)
+            hyp = transcribe(name, pcm)
             r, h = normalize(refs[name]).split(), normalize(hyp).split()
             errs += edit_distance(r, h)
             words += len(r)
@@ -170,6 +175,8 @@ def main() -> int:
                                    os.path.abspath(a.imatrix) if a.imatrix else ""]
                                   ).encode()).hexdigest()[:12]
     pack = os.path.join(a.work, f"{a.name}-{tag}.pack")
+    # The eval GGUF also depends on the reference GGUF it is built onto.
+    eval_tag = hashlib.sha256((tag + "|" + os.path.abspath(a.gguf_ref)).encode()).hexdigest()[:12]
     if not os.path.exists(pack):
         cmd = [a.tool, "pack", "--source", a.source, "--out", pack, "--rules", a.rules,
                "--threads", str(os.cpu_count() or 8)]
@@ -194,7 +201,7 @@ def main() -> int:
         print(f"[layout-eval] cached: {json.dumps(row['wer'])}")
         return 0
 
-    eval_gguf = os.path.join(a.work, f"{a.name}-{tag}-eval.gguf")
+    eval_gguf = os.path.join(a.work, f"{a.name}-{eval_tag}-eval.gguf")
     if not os.path.exists(eval_gguf):
         print(f"[layout-eval] building eval GGUF ...", flush=True)
         r = subprocess.run([a.tool, "eval", "--pack", pack, "--gguf-in", a.gguf_ref,

@@ -181,7 +181,7 @@ bool layout_from_string(const std::string& spec, LayoutDesc* out, std::string* e
 
 uint64_t layout_hash(const LayoutDesc& d) {
     const std::string s = layout_to_string(d);
-    uint64_t h = 1469598103934665603ull;
+    uint64_t h = 14695981039346656037ull;   // FNV-1a 64-bit offset basis
     for (char c : s) { h ^= (uint8_t)c; h *= 1099511628211ull; }
     return h;
 }
