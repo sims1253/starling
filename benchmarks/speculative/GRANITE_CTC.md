@@ -8,8 +8,9 @@ pre-feedback middle-layer grapheme logits and final hidden state as one graph
 output, pools four frames using `1 - blank_probability`, applies `out_llm`,
 then collapses repeat and blank labels to tokenizer IDs. This follows
 [`CTCBPEDraft`](../../src/starling/granite/speculative.py), including the
-BF16 rounding of pooled activations and head logits. The model-specific C
-probe exposes IDs to the parity runner; ordinary greedy decode is unchanged.
+BF16 rounding of pooled activations and head logits, then FP32 softmax before
+argmax. The model-specific C probe exposes IDs to the parity runner; ordinary
+greedy decode is unchanged.
 
 Build with the repository's native CMake configuration, then convert the
 pinned source snapshot with the opt-in flag:
@@ -36,6 +37,9 @@ from the model repository. The full CTC-inclusive GGUF has 942 tensors and
 is 205,723,776 bytes larger than the local pre-existing base GGUF; the
 optional head's source file is 205,723,810 bytes. These are exact token-ID
 comparisons, not just transcript similarity.
+After the FP32 softmax argmax correction, both CPU comparisons still match
+exactly (26/26 and 86/86) with native library SHA-256
+`4a911dffc5a81e3a230d8eaf0aeb7c7d980372c2371b03db52660a28fd2b89cf`.
 
 Each reference also pins the SHA-256 of the CTC-inclusive GGUF used for the
 reported comparison (`cec47a4fb872ace2713447409f01e0f9ef0d2a7f217db8bb9c33ea0ef96c916a`).
@@ -51,11 +55,10 @@ but that call performs a full encoder and head pass. Callers that know the
 audio duration should allocate a conservative token buffer before the first
 call to avoid running the encoder twice.
 
-Native argmax now chooses the first label on exact BF16 ties, as the Python
-reference does. Its equality mask uses the sign of the difference from each
-frame's maximum, so it also distinguishes the smallest BF16 subnormal from
-zero. The dedicated five-frame regression covers ordinary, all-label,
-near-zero and subnormal ties and non-ties and runs in CPU CI.
+Native argmax now chooses the first label when FP32 softmax probabilities tie,
+as the Python reference does. Distinct BF16 logits can become equal after
+softmax, including at the smallest BF16 subnormal. The CPU CI regression
+covers five small-vocabulary frames and a 100353-label frame.
 
 This is an extraction/parity milestone. The generic #311 batched verifier is
 still needed to consume the draft, prove output equality to target-only

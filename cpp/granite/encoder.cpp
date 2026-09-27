@@ -504,19 +504,15 @@ bool encode_audio_and_project(const GraniteModel& model, const MelFeatures& mel,
 ggml_tensor* ctc_argmax_first(ggml_context* c, ggml_tensor* logits,
                               const std::vector<float>& iota, const float& one) {
     const int64_t vocab = logits->ne[0], frames = logits->ne[1];
-    // The head has already rounded to BF16. ggml_argmax can select the last
-    // tied index on CPU (and a warp-dependent index on GPU), whereas torch
-    // chooses the first. Read the winning VALUE per frame, form an exact
-    // equality mask, then use descending index weights to make the first
-    // maximum unique. sign(x - max) is exactly -1 for every distinct smaller
-    // BF16 value, including the smallest subnormal; adding one makes an exact
-    // 0/1 equality mask without a magnitude-dependent threshold.
-    ggml_tensor* rounded = f32(c, logits);
-    ggml_tensor* any = ggml_reshape_2d(c, ggml_argmax(c, rounded), 1, frames);
-    ggml_tensor* rows = ggml_reshape_3d(c, rounded, 1, vocab, frames);
+    // Python selects from softmax(bf16_logits.float()), not directly from the
+    // rounded logits. Softmax can round distinct logits to equal F32
+    // probabilities. Resolve those ties by the first label, as torch does.
+    ggml_tensor* probs = ggml_soft_max_ext(c, f32(c, logits), nullptr, 1.0f, 0.0f);
+    ggml_tensor* any = ggml_reshape_2d(c, ggml_argmax(c, probs), 1, frames);
+    ggml_tensor* rows = ggml_reshape_3d(c, probs, 1, vocab, frames);
     ggml_tensor* maximum = ggml_get_rows(c, rows, any);  // [1, 1, frames]
     maximum = ggml_reshape_2d(c, maximum, 1, frames);
-    ggml_tensor* difference = ggml_sub(c, rounded, maximum);
+    ggml_tensor* difference = ggml_sub(c, probs, maximum);
     int64_t one_ne[1] = {1};
     ggml_tensor* one_t = graph_input_tensor(c, GGML_TYPE_F32, 1, one_ne,
                                            &one, sizeof(one));
