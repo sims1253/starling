@@ -508,18 +508,20 @@ ggml_tensor* ctc_argmax_first(ggml_context* c, ggml_tensor* logits,
     // tied index on CPU (and a warp-dependent index on GPU), whereas torch
     // chooses the first. Read the winning VALUE per frame, form an exact
     // equality mask, then use descending index weights to make the first
-    // maximum unique. Values below the max by at least one BF16 step become
-    // zero after the scaled difference is clamped.
+    // maximum unique. sign(x - max) is exactly -1 for every distinct smaller
+    // BF16 value, including the smallest subnormal; adding one makes an exact
+    // 0/1 equality mask without a magnitude-dependent threshold.
     ggml_tensor* rounded = f32(c, logits);
     ggml_tensor* any = ggml_reshape_2d(c, ggml_argmax(c, rounded), 1, frames);
     ggml_tensor* rows = ggml_reshape_3d(c, rounded, 1, vocab, frames);
     ggml_tensor* maximum = ggml_get_rows(c, rows, any);  // [1, 1, frames]
     maximum = ggml_reshape_2d(c, maximum, 1, frames);
-    ggml_tensor* difference = ggml_scale(c, ggml_sub(c, rounded, maximum), 1048576.0f);
+    ggml_tensor* difference = ggml_sub(c, rounded, maximum);
     int64_t one_ne[1] = {1};
     ggml_tensor* one_t = graph_input_tensor(c, GGML_TYPE_F32, 1, one_ne,
                                            &one, sizeof(one));
-    ggml_tensor* equal = ggml_clamp(c, ggml_add(c, difference, one_t), 0.0f, 1.0f);
+    ggml_tensor* equal = ggml_clamp(c, ggml_add(c, ggml_sgn(c, difference), one_t),
+                                   0.0f, 1.0f);
     int64_t iota_ne[2] = {vocab, 1};
     ggml_tensor* iota_t = graph_input_tensor(c, GGML_TYPE_F32, 2, iota_ne,
                                             iota.data(), iota.size() * sizeof(float));
@@ -613,6 +615,11 @@ bool extract_ctc_draft(const GraniteModel& model, const MelFeatures& mel,
     }
     int32_t previous = -1;
     for (float value : labels) {
+        if (!std::isfinite(value) || value < 0 || value >= (float)vocab) {
+            err = "GRANITE CTC head produced an out-of-range label";
+            token_ids.clear();
+            return false;
+        }
         const int32_t label = (int32_t)value;
         if (label != previous && label > kCtcBlankLabel)
             token_ids.push_back(label - 1);

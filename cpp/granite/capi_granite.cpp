@@ -26,6 +26,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <climits>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -168,6 +169,11 @@ bool starling_ggml_granite_ctc_draft(void* handle, const float* pcm, int64_t n,
         }
         std::vector<int32_t> ids;
         if (!extract_ctc_draft(*c->model, mel, ids, c->err)) {
+            report(err_out, c->err);
+            return false;
+        }
+        if (ids.size() > (size_t)INT32_MAX) {
+            c->err = "GRANITE CTC draft token count exceeds INT32_MAX";
             report(err_out, c->err);
             return false;
         }

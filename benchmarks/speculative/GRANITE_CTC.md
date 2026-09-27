@@ -52,8 +52,10 @@ audio duration should allocate a conservative token buffer before the first
 call to avoid running the encoder twice.
 
 Native argmax now chooses the first label on exact BF16 ties, as the Python
-reference does; the dedicated two-frame regression covers a nonzero top tie
-and an all-label tie.
+reference does. Its equality mask uses the sign of the difference from each
+frame's maximum, so it also distinguishes the smallest BF16 subnormal from
+zero. The dedicated five-frame regression covers ordinary, all-label,
+near-zero and subnormal ties and non-ties and runs in CPU CI.
 
 This is an extraction/parity milestone. The generic #311 batched verifier is
 still needed to consume the draft, prove output equality to target-only

@@ -121,8 +121,10 @@ char * starling_ggml_transcribe_pcm(starling_ggml_ctx * ctx,
 
 // Research-only Granite CTC draft probe. `handle` is returned by the
 // model-specific starling_ggml_granite_load symbol. A successful call writes
-// token IDs and count; a too-small buffer writes the required count and
-// returns false. Invalid arguments clear count when it is non-null.
+// token IDs and count. On a too-small buffer it writes the required capacity
+// to count, leaves token_ids untouched, and returns false: count does not
+// describe valid output on failure. Invalid arguments clear count when it is
+// non-null. A zero-capacity sizing call runs the full encoder and head.
 bool starling_ggml_granite_ctc_draft(void * handle, const float * pcm, int64_t n,
                                     int32_t * token_ids, int32_t capacity,
                                     int32_t * count, const char ** err_out);
