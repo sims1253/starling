@@ -806,10 +806,6 @@ fn write_download_exclusive(
 impl StarlingApp {
     pub fn new(started: Instant, diagnostics: bool, cx: &mut Context<Self>) -> Self {
         let settings = Settings::load_or_default();
-        let endpoint = settings.endpoint.clone();
-        let model = settings.model.clone();
-        let terms_input = settings.expected_terms_input();
-
         // D14: storage v2 is THE store, opened unconditionally. An open
         // failure is a hard, honest startup error — there is no other
         // backend to fall back to and no flag to clear; the cause must be
@@ -826,7 +822,30 @@ impl StarlingApp {
             ),
         };
 
-        let player = Player::new().ok();
+        Self::with_dependencies(
+            started,
+            diagnostics,
+            settings,
+            store,
+            store_error,
+            Player::new().ok(),
+            cx,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn with_dependencies(
+        started: Instant,
+        diagnostics: bool,
+        settings: Settings,
+        store: Option<Store>,
+        store_error: Option<String>,
+        player: Option<Player>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let endpoint = settings.endpoint.clone();
+        let model = settings.model.clone();
+        let terms_input = settings.expected_terms_input();
         let draft_endpoint = cx.new(|cx| TextField::new("http://127.0.0.1:8181", &endpoint, cx));
         let draft_model = cx.new(|cx| TextField::new("parakeet", &model, cx));
         let draft_terms = cx.new(|cx| TextField::new("auth, Starling, GGUF", &terms_input, cx));
@@ -912,6 +931,19 @@ impl StarlingApp {
             elapsed_ms: 0.0,
             diagnostics: diagnostics.then_some((started, false)),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(store: Option<Store>, cx: &mut Context<Self>) -> Self {
+        Self::with_dependencies(
+            Instant::now(),
+            false,
+            Settings::default_settings(),
+            store,
+            None,
+            None,
+            cx,
+        )
     }
 
     pub fn init(&mut self, cx: &mut Context<Self>) {
@@ -1279,6 +1311,7 @@ impl StarlingApp {
             self.selection_moved();
         }
         self.selected_id = Some(id.clone());
+        self.restore_unsaved_staging(&id, cx);
         self.load_processing(id, cx);
         cx.notify();
     }
@@ -1907,6 +1940,8 @@ impl Render for StarlingApp {
         if std::mem::take(&mut self.focus_staging_pending) {
             if let Some(staging) = self.staging.as_ref() {
                 window.focus(&staging.editor.focus_handle(cx));
+            } else {
+                window.focus(&self.root_focus);
             }
         }
         if std::mem::take(&mut self.focus_root_pending) {

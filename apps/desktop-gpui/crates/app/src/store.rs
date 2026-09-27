@@ -206,6 +206,11 @@ pub(crate) fn lock_v2(handle: &Arc<Mutex<StoreV2>>) -> MutexGuard<'_, StoreV2> {
 pub(crate) struct Store(Arc<Mutex<StoreV2>>);
 
 impl Store {
+    #[cfg(test)]
+    pub(crate) fn at_test_root(root: &std::path::Path) -> Self {
+        Self(Arc::new(Mutex::new(StoreV2::open(root).unwrap())))
+    }
+
     /// Open the store at its default data root. This is the app's only
     /// store-opening path (D14): a failure is a startup error for the
     /// caller to surface — there is no fallback backend.

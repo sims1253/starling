@@ -69,7 +69,10 @@ pub fn render_staging_panel(
     let staging = app.staging.as_ref()?;
     let phase = staging.phase;
     let editor = staging.editor.clone();
-    let notice = staging.notice.clone();
+    let notice = staging
+        .save_error
+        .clone()
+        .or_else(|| staging.notice.clone());
     let copied = staging.copied;
     let (text, raw) = app
         .visible_staging_draft()
@@ -83,6 +86,8 @@ pub fn render_staging_panel(
             "Live. Grey words may still change; anything you type stays yours."
         }
         StagingPhase::Finishing => "Finishing the transcript…",
+        StagingPhase::Ready if staging.save_error.is_some() => "Edits not saved.",
+        StagingPhase::Ready if app.staging_has_unsaved_edits() => "Saving edits…",
         StagingPhase::Ready if text == raw => "Saved with the take, as recognized.",
         StagingPhase::Ready => "Saved with the take. Copy and Export use this text.",
         StagingPhase::Failed => "Not saved.",
@@ -292,9 +297,9 @@ pub fn render_staging_panel(
             }),
         );
     let hints = if cfg!(target_os = "macos") {
-        "⌥⌫ word · ⌘⇧K line · ⌥←/→ jump · ⌘Z undo · ⌘↩ done · Esc leave"
+        "⌥⌫ word · ⌘⇧K visual line · ⌥←/→ jump · ⌘Z undo · ⌘↩ done · Esc leave"
     } else {
-        "Ctrl+⌫ word · Ctrl+Shift+K line · Ctrl+←/→ jump · Ctrl+Z undo · Ctrl+Enter done · Esc leave"
+        "Ctrl+⌫ word · Ctrl+Shift+K visual line · Ctrl+←/→ jump · Ctrl+Z undo · Ctrl+Enter done · Esc leave"
     };
     panel = panel.child(
         div()

@@ -16,7 +16,9 @@
 //! undo/redo, all scoped to the `StagingEditor` key context so they never
 //! shadow the app's dictation shortcut.
 
-use std::ops::Range;
+use std::cell::{Cell, RefCell};
+use std::ops::{Deref, Range};
+use std::rc::Rc;
 
 use gpui::{
     App, Bounds, ClipboardItem, Context, CursorStyle, Element, ElementId, ElementInputHandler,
@@ -405,6 +407,7 @@ impl EditBuffer {
         };
         let (start, end) = (map(self.selected.start), map(self.selected.end));
         self.selected = start.min(end)..start.max(end);
+        // Mapping is monotone, so the existing anchor/head direction stays valid.
         let touches = |start: usize, len: usize| {
             if len == 0 {
                 prefix < start && start < old_end
@@ -426,7 +429,7 @@ impl EditBuffer {
         remap(&mut self.undo, |entry| entry.inserted.len());
         remap(&mut self.redo, |entry| entry.removed.len());
         if undoable {
-            self.undo.push(UndoEntry {
+            self.push_undo(UndoEntry {
                 start: prefix,
                 removed: old[prefix..old_end].to_string(),
                 inserted: new[prefix..new_end].to_string(),
@@ -443,11 +446,108 @@ impl EditBuffer {
 // ----------------------------------------------------------------------
 
 struct EditorLayout {
-    /// One shaped paragraph per `\n`-separated line, with its first byte
-    /// and its top edge (relative to the element).
-    lines: Vec<(usize, Pixels, WrappedLine)>,
+    shaped: Rc<ShapedText>,
     bounds: Bounds<Pixels>,
+}
+
+impl Deref for EditorLayout {
+    type Target = ShapedText;
+    fn deref(&self) -> &Self::Target {
+        &self.shaped
+    }
+}
+
+struct ShapedText {
+    /// Paragraph byte offset, top, shaped text, and cached wrap starts.
+    lines: Vec<(usize, Pixels, WrappedLine, Vec<usize>)>,
+    rows: Vec<Range<usize>>,
     line_height: Pixels,
+    height: Pixels,
+}
+
+/// Immutable text/style snapshot. Measurement and painting use exactly
+/// the same shaping result, including the fallback on a shaping error.
+struct ShapeInput {
+    text: SharedString,
+    empty: bool,
+    kinds: Vec<(Range<usize>, RegionKind)>,
+    marked: Option<Range<usize>>,
+    style: gpui::TextStyle,
+    font_size: Pixels,
+    line_height: Pixels,
+    layouts: RefCell<Vec<(Option<Pixels>, Rc<ShapedText>)>>,
+    reported_error: Cell<bool>,
+}
+
+impl ShapeInput {
+    fn shape(&self, width: Option<Pixels>, window: &mut Window) -> Rc<ShapedText> {
+        if let Some((_, layout)) = self
+            .layouts
+            .borrow()
+            .iter()
+            .find(|(known, _)| *known == width)
+        {
+            return layout.clone();
+        }
+        let mut lines = Vec::new();
+        let mut rows = Vec::new();
+        let mut base = 0;
+        let mut top = px(0.);
+        for text in self.text.split('\n') {
+            let end = base + text.len();
+            let runs = if self.empty {
+                vec![TextRun {
+                    len: text.len(),
+                    font: self.style.font(),
+                    color: theme::DIM.into(),
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                }]
+            } else {
+                runs_for(base, end, &self.kinds, self.marked.as_ref(), &self.style)
+            };
+            let shaped = match window.text_system().shape_text(
+                SharedString::from(text.to_string()),
+                self.font_size,
+                &runs,
+                width,
+                None,
+            ) {
+                Ok(lines) => lines.into_iter().next().unwrap_or_default(),
+                Err(err) => {
+                    if !self.reported_error.replace(true) {
+                        eprintln!("Could not lay out staging text: {err}");
+                    }
+                    WrappedLine::default()
+                }
+            };
+            let starts = EditorLayout::row_starts(&shaped);
+            for (index, start) in starts.iter().enumerate() {
+                rows.push(
+                    base + start..base + starts.get(index + 1).copied().unwrap_or(shaped.len()),
+                );
+            }
+            let count = starts.len();
+            lines.push((base, top, shaped, starts));
+            top += self.line_height * count as f32;
+            base = end + 1;
+        }
+        let shaped = Rc::new(ShapedText {
+            lines,
+            rows,
+            line_height: self.line_height,
+            height: top,
+        });
+        // Layout may probe an unconstrained width before the final width.
+        // Retain a small number of probes rather than grow during resizing.
+        let mut layouts = self.layouts.borrow_mut();
+        if layouts.len() == 3 {
+            layouts.remove(0);
+        }
+        layouts.push((width, shaped.clone()));
+        shaped
+    }
 }
 
 impl EditorLayout {
@@ -464,7 +564,9 @@ impl EditorLayout {
 
     /// The line holding byte `offset`.
     fn line_at(&self, offset: usize) -> Option<usize> {
-        self.lines.iter().rposition(|(base, _, _)| *base <= offset)
+        self.lines
+            .iter()
+            .rposition(|(base, _, _, _)| *base <= offset)
     }
 
     /// The caret position for byte `offset`, relative to the element.
@@ -472,9 +574,8 @@ impl EditorLayout {
         let Some(index) = self.line_at(offset) else {
             return point(px(0.), px(0.));
         };
-        let (base, top, line) = &self.lines[index];
+        let (base, top, line, starts) = &self.lines[index];
         let local = (offset - base).min(line.len());
-        let starts = Self::row_starts(line);
         let row = starts
             .iter()
             .rposition(|start| *start <= local)
@@ -489,12 +590,12 @@ impl EditorLayout {
         let Some(index) = self
             .lines
             .iter()
-            .rposition(|(_, top, _)| *top <= position.y)
+            .rposition(|(_, top, _, _)| *top <= position.y)
             .or((!self.lines.is_empty()).then_some(0))
         else {
             return 0;
         };
-        let (base, top, line) = &self.lines[index];
+        let (base, top, line, _) = &self.lines[index];
         let local = point(position.x.max(px(0.)), (position.y - *top).max(px(0.)));
         let found = match line.closest_index_for_position(local, self.line_height) {
             Ok(found) | Err(found) => found,
@@ -502,17 +603,9 @@ impl EditorLayout {
         base + found.min(line.len())
     }
 
-    /// Every visual row as a byte range.
-    fn rows(&self) -> Vec<Range<usize>> {
-        let mut rows = Vec::new();
-        for (base, _, line) in &self.lines {
-            let starts = Self::row_starts(line);
-            for (index, start) in starts.iter().enumerate() {
-                let end = starts.get(index + 1).copied().unwrap_or(line.len());
-                rows.push(base + start..base + end);
-            }
-        }
-        rows
+    /// Every visual row, computed once per shaped layout.
+    fn rows(&self) -> &[Range<usize>] {
+        &self.shaped.rows
     }
 
     /// The x of `offset` on the row starting at `row_start`, and that
@@ -521,8 +614,7 @@ impl EditorLayout {
         let Some(index) = self.line_at(row_start) else {
             return (px(0.), px(0.));
         };
-        let (base, top, line) = &self.lines[index];
-        let starts = Self::row_starts(line);
+        let (base, top, line, starts) = &self.lines[index];
         let local_start = row_start - base;
         let row = starts
             .iter()
@@ -549,11 +641,7 @@ impl EditorLayout {
     }
 
     fn height(&self) -> Pixels {
-        self.lines
-            .last()
-            .map_or(self.line_height, |(_, top, line)| {
-                *top + self.line_height * (line.wrap_boundaries().len() + 1) as f32
-            })
+        self.shaped.height
     }
 }
 
@@ -569,6 +657,7 @@ pub(crate) struct StagingEditor {
     marked_range: Option<Range<usize>>,
     placeholder: SharedString,
     layout: Option<EditorLayout>,
+    shape_input: RefCell<Option<Rc<ShapeInput>>>,
     is_selecting: bool,
     pub(crate) scroll: ScrollHandle,
     autoscroll: bool,
@@ -587,6 +676,7 @@ impl StagingEditor {
             marked_range: None,
             placeholder: SharedString::from(placeholder.to_string()),
             layout: None,
+            shape_input: RefCell::new(None),
             is_selecting: false,
             scroll: ScrollHandle::new(),
             autoscroll: true,
@@ -594,7 +684,46 @@ impl StagingEditor {
         }
     }
 
+    fn shape_input(&self, window: &Window) -> Rc<ShapeInput> {
+        let empty = self.buffer.text.is_empty();
+        let text: &str = if empty {
+            &self.placeholder
+        } else {
+            &self.buffer.text
+        };
+        let style = window.text_style();
+        let font_size = style.font_size.to_pixels(window.rem_size());
+        let line_height = window.line_height();
+        let mut cached = self.shape_input.borrow_mut();
+        if let Some(input) = cached.as_ref() {
+            if input.text.as_ref() == text
+                && input.empty == empty
+                && input.kinds == self.kinds
+                && input.marked == self.marked_range
+                && input.style == style
+                && input.font_size == font_size
+                && input.line_height == line_height
+            {
+                return input.clone();
+            }
+        }
+        let input = Rc::new(ShapeInput {
+            text: SharedString::from(text.to_string()),
+            empty,
+            kinds: self.kinds.clone(),
+            marked: self.marked_range.clone(),
+            style,
+            font_size,
+            line_height,
+            layouts: RefCell::new(Vec::new()),
+            reported_error: Cell::new(false),
+        });
+        *cached = Some(input.clone());
+        input
+    }
+
     /// Adopts the draft's text and region kinds (`kinds` in code points).
+    /// Ranges come from the draft snapshot in sorted, non-overlapping order.
     pub(crate) fn set_content(
         &mut self,
         text: &str,
@@ -619,6 +748,7 @@ impl StagingEditor {
         let mut chars = 0;
         let mut iter = self.buffer.text.char_indices();
         let mut to_byte = |target: usize| {
+            debug_assert!(target >= chars, "draft kind ranges must be ordered");
             while chars < target {
                 match iter.next() {
                     Some((index, c)) => {
@@ -685,6 +815,8 @@ impl StagingEditor {
         if y >= layout.height() {
             return self.buffer.text.len();
         }
+        // Probe the center of the destination row. `height()` is the
+        // exclusive lower edge; equality is already below the last row.
         layout.index_for(point(x, y))
     }
 
@@ -754,7 +886,7 @@ impl StagingEditor {
     fn utf16_to_byte(&self, offset: usize) -> usize {
         let mut utf16 = 0;
         for (index, c) in self.buffer.text.char_indices() {
-            if utf16 >= offset {
+            if utf16 + c.len_utf16() > offset {
                 return index;
             }
             utf16 += c.len_utf16();
@@ -919,7 +1051,7 @@ impl Render for StagingEditor {
             }))
             .on_action(cx.listener(|this, _: &DeleteLine, _, cx| {
                 let row = this.current_row();
-                // A whole logical line takes its newline with it.
+                // A visual row ending at a logical line boundary takes its newline with it.
                 let end = if this.buffer.text[row.end..].starts_with('\n') {
                     row.end + 1
                 } else {
@@ -1173,23 +1305,7 @@ impl Element for EditorElement {
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
-        let editor = self.editor.read(cx);
-        let text = if editor.buffer.text.is_empty() {
-            editor.placeholder.to_string()
-        } else {
-            editor.buffer.text.clone()
-        };
-        let style = window.text_style();
-        let font_size = style.font_size.to_pixels(window.rem_size());
-        let line_height = window.line_height();
-        let run = TextRun {
-            len: 0,
-            font: style.font(),
-            color: style.color,
-            background_color: None,
-            underline: None,
-            strikethrough: None,
-        };
+        let input = self.editor.read(cx).shape_input(window);
         let mut layout_style = Style::default();
         layout_style.size.width = relative(1.).into();
         let id =
@@ -1198,28 +1314,8 @@ impl Element for EditorElement {
                     gpui::AvailableSpace::Definite(width) => Some(width),
                     _ => None,
                 });
-                let rows: usize = text
-                    .split('\n')
-                    .map(|line| {
-                        let run = TextRun {
-                            len: line.len(),
-                            ..run.clone()
-                        };
-                        window
-                            .text_system()
-                            .shape_text(
-                                SharedString::from(line.to_string()),
-                                font_size,
-                                &[run],
-                                width,
-                                None,
-                            )
-                            .ok()
-                            .and_then(|lines| lines.into_iter().next())
-                            .map_or(1, |line| line.wrap_boundaries().len() + 1)
-                    })
-                    .sum();
-                size(width.unwrap_or(px(0.)), line_height * rows.max(1) as f32)
+                let shaped = input.shape(width, window);
+                size(width.unwrap_or(px(0.)), shaped.height)
             });
         (id, ())
     }
@@ -1234,61 +1330,13 @@ impl Element for EditorElement {
         cx: &mut App,
     ) -> Self::PrepaintState {
         let editor = self.editor.read(cx);
-        let style = window.text_style();
-        let font_size = style.font_size.to_pixels(window.rem_size());
-        let line_height = window.line_height();
         let empty = editor.buffer.text.is_empty();
-        let text = if empty {
-            editor.placeholder.to_string()
-        } else {
-            editor.buffer.text.clone()
-        };
-
-        let mut lines = Vec::new();
-        let mut base = 0;
-        let mut top = px(0.);
-        for line_text in text.split('\n') {
-            let end = base + line_text.len();
-            let runs = if empty {
-                vec![TextRun {
-                    len: line_text.len(),
-                    font: style.font(),
-                    color: theme::DIM.into(),
-                    background_color: None,
-                    underline: None,
-                    strikethrough: None,
-                }]
-            } else {
-                runs_for(
-                    base,
-                    end,
-                    &editor.kinds,
-                    editor.marked_range.as_ref(),
-                    &style,
-                )
-            };
-            let shaped = window
-                .text_system()
-                .shape_text(
-                    SharedString::from(line_text.to_string()),
-                    font_size,
-                    &runs,
-                    Some(bounds.size.width),
-                    None,
-                )
-                .ok()
-                .and_then(|lines| lines.into_iter().next())
-                .unwrap_or_default();
-            let rows = shaped.wrap_boundaries().len() + 1;
-            lines.push((base, top, shaped));
-            top += line_height * rows as f32;
-            base = end + 1;
-        }
+        let input = editor.shape_input(window);
         let layout = EditorLayout {
-            lines,
+            shaped: input.shape(Some(bounds.size.width), window),
             bounds,
-            line_height,
         };
+        let line_height = layout.line_height;
 
         let selected = editor.buffer.selected.clone();
         let mut selections = Vec::new();
@@ -1350,7 +1398,7 @@ impl Element for EditorElement {
         let Some(layout) = prepaint.layout.take() else {
             return;
         };
-        for (_, top, line) in &layout.lines {
+        for (_, top, line, _) in &layout.lines {
             line.paint(
                 bounds.origin + point(px(0.), *top),
                 layout.line_height,
@@ -1414,6 +1462,85 @@ mod tests {
             let at = buffer.cursor();
             buffer.replace(at..at, &c.to_string(), Record::Typing);
         }
+    }
+
+    #[gpui::test]
+    fn layout_reuses_shaping_and_caches_visual_rows(cx: &mut gpui::TestAppContext) {
+        let window = cx.add_window(|_, cx| StagingEditor::new("", cx));
+        window
+            .update(cx, |editor, window, cx| {
+                let text = "one two three four five six seven eight nine ten\nlast line";
+                editor.set_content(text, &[(0..text.len(), RegionKind::Partial)], false, cx);
+                let input = editor.shape_input(window);
+                let measured = input.shape(Some(px(90.)), window);
+                let painted = editor.shape_input(window).shape(Some(px(90.)), window);
+                assert!(
+                    Rc::ptr_eq(&measured, &painted),
+                    "measurement and paint must share shaping"
+                );
+                assert!(measured.rows.len() > 2, "the first paragraph must wrap");
+                let layout = EditorLayout {
+                    shaped: painted,
+                    bounds: Bounds::new(point(px(0.), px(0.)), size(px(90.), measured.height)),
+                };
+                assert_eq!(layout.rows().last().unwrap().end, text.len());
+                editor.layout = Some(layout);
+                editor.buffer.move_to(0);
+                assert_eq!(editor.vertical(-1.), 0);
+                editor.buffer.move_to(text.len());
+                assert_eq!(editor.vertical(1.), text.len());
+                editor.buffer.move_to(0);
+                let row = editor.current_row();
+                assert!(
+                    row.end < text.find('\n').unwrap(),
+                    "delete-line targets one visual row"
+                );
+                assert!(
+                    Rc::ptr_eq(&input, &editor.shape_input(window)),
+                    "caret movement must reuse the snapshot"
+                );
+                assert!(!Rc::ptr_eq(&measured, &input.shape(Some(px(180.)), window)));
+                editor.set_content("different", &[], false, cx);
+                assert!(!Rc::ptr_eq(&input, &editor.shape_input(window)));
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn external_undo_entries_respect_the_limit() {
+        let mut buffer = buffer("");
+        for _ in 0..UNDO_LIMIT + 20 {
+            let next = format!("{}x", buffer.text);
+            buffer.sync(&next, true);
+        }
+        assert_eq!(buffer.undo.len(), UNDO_LIMIT);
+        for _ in 0..UNDO_LIMIT {
+            buffer.undo().unwrap();
+        }
+        assert_eq!(buffer.text, "x".repeat(20));
+    }
+
+    #[test]
+    fn external_text_preserves_a_reversed_selection() {
+        let mut buffer = buffer("abc def");
+        buffer.move_to(7);
+        buffer.select_to(4);
+        buffer.sync("123 abc def", false);
+        assert!(buffer.reversed);
+        assert_eq!(buffer.cursor(), 8);
+        buffer.select_to(9);
+        assert_eq!(buffer.selected, 9..11);
+    }
+
+    #[gpui::test]
+    fn ime_offsets_inside_surrogates_clamp_to_the_character(cx: &mut gpui::TestAppContext) {
+        let editor = cx.new(|cx| StagingEditor::new("", cx));
+        editor.update(cx, |editor, _| {
+            editor.buffer = buffer("a😀b");
+            assert_eq!(editor.utf16_to_byte(2), 1);
+            assert_eq!(editor.utf16_to_byte(3), 5);
+            assert_eq!(editor.utf16_to_byte(99), 6);
+        });
     }
 
     #[test]

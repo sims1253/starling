@@ -19,6 +19,7 @@
 //! its own. Edits made while recording live in memory until the rebase;
 //! the audio itself is journaled as always.
 
+use std::collections::BTreeSet;
 use std::ops::Range;
 use std::time::Duration;
 
@@ -31,7 +32,7 @@ use crate::app::StarlingApp;
 use crate::editor::{EditorEvent, StagingEditor, TextEdit};
 use crate::live_stream::Partial;
 use crate::processing::{ProcessingState, TakeProcessing, draft_from_doc};
-use crate::store::ProcessingDoc;
+use crate::store::{ProcessingDoc, ProposalRow};
 
 /// Edits are written this long after the last keystroke.
 const PERSIST_DELAY: Duration = Duration::from_millis(800);
@@ -58,6 +59,12 @@ pub(crate) struct Staging {
     pub take_id: Option<String>,
     pub notice: Option<String>,
     pub copied: bool,
+    copy_generation: u64,
+    pub save_error: Option<String>,
+    writes_in_flight: BTreeSet<u64>,
+    pending_accept: Option<(u64, ProposalRow)>,
+    failed_revision: Option<u64>,
+    close_when_saved: bool,
     persist_generation: u64,
     persisted_revision: u64,
     _subscription: Subscription,
@@ -188,6 +195,12 @@ impl StarlingApp {
             take_id: None,
             notice: None,
             copied: false,
+            copy_generation: 0,
+            save_error: None,
+            writes_in_flight: BTreeSet::new(),
+            pending_accept: None,
+            failed_revision: None,
+            close_when_saved: false,
             persist_generation: 0,
             persisted_revision: 0,
             _subscription: subscription,
@@ -206,8 +219,7 @@ impl StarlingApp {
                 let token = staging.token;
                 self.background_stagings.push(staging);
                 self.persist_staging_now(token, cx);
-                self.background_stagings
-                    .retain(|staging| staging.token != token);
+                self.release_saved_staging(token, cx);
             }
             StagingPhase::Recording | StagingPhase::Finishing => {
                 self.background_stagings.push(staging);
@@ -233,11 +245,14 @@ impl StarlingApp {
     /// not stop cleanly is saved as interrupted).
     pub(crate) fn staging_interrupted(&mut self, cx: &mut Context<Self>) {
         if let Some(staging) = self.staging.as_mut() {
-            if staging.phase == StagingPhase::Recording {
+            if matches!(
+                staging.phase,
+                StagingPhase::Recording | StagingPhase::Finishing
+            ) {
                 staging.phase = StagingPhase::Failed;
                 staging.notice = Some(
-                    "The recording was interrupted and saved to history untranscribed. The text \
-                     here is not saved; copy it if you need it."
+                    "The recording ended without a transcript. The text \
+                     here is not saved; copy it before closing the panel."
                         .to_string(),
                 );
                 cx.notify();
@@ -256,6 +271,9 @@ impl StarlingApp {
         staging
             .segmenter
             .partial(draft, &partial.text, partial.stable_words);
+        if staging.segmenter.diverged() {
+            staging.notice = Some("The live transcript changed earlier words or an edit boundary. Your edits are kept; check their placement.".into());
+        }
         let token = staging.token;
         self.sync_staging_editor(token, false, cx);
     }
@@ -390,7 +408,8 @@ impl StarlingApp {
             return false;
         };
         let Some(store) = self.store.clone() else {
-            return false;
+            self.staging_rebase_failed(token, "The recording store is unavailable.", cx);
+            return true;
         };
         let final_text = self
             .sessions
@@ -415,14 +434,16 @@ impl StarlingApp {
         staging.phase = StagingPhase::Finishing;
         staging.notice = None;
         let Some(draft) = staging.live.as_mut() else {
-            return false;
+            self.staging_rebase_failed(token, "The live draft is unavailable.", cx);
+            return true;
         };
         let Some(final_text) = final_text else {
-            return false;
+            self.staging_rebase_failed(token, "No final transcript was received.", cx);
+            return true;
         };
         if !staging.segmenter.finish(draft, &final_text) {
             staging.notice = Some(
-                "The final transcript differs from the live one. Your text is kept; \
+                "The transcript changed earlier words or an edit boundary. Your text is kept; \
                  \"Back to raw\" shows the final transcript."
                     .to_string(),
             );
@@ -470,6 +491,26 @@ impl StarlingApp {
         })
         .detach();
         true
+    }
+
+    fn staging_rebase_failed(&mut self, token: u64, reason: &str, cx: &mut Context<Self>) {
+        if let Some(staging) = self.staging_mut(token) {
+            staging.phase = StagingPhase::Failed;
+            staging.notice = Some(format!(
+                "{reason} The text here is not saved; copy it before closing the panel."
+            ));
+        }
+        if let Some(staging) = self
+            .background_stagings
+            .iter()
+            .find(|staging| staging.token == token)
+        {
+            self.error = Some(format!(
+                "{reason} Select take {} in history to recover its retained draft.",
+                staging.take_id.as_deref().unwrap_or("unknown")
+            ));
+        }
+        cx.notify();
     }
 
     fn finish_rebase(
@@ -556,8 +597,7 @@ impl StarlingApp {
                     .is_some_and(|staging| staging.persist_generation == generation);
                 if current {
                     app.persist_staging_now(token, cx);
-                    app.background_stagings
-                        .retain(|staging| staging.token != token);
+                    app.release_saved_staging(token, cx);
                 }
             })
             .ok();
@@ -569,6 +609,13 @@ impl StarlingApp {
     /// last write.
     pub(crate) fn persist_staging_now(&mut self, token: u64, cx: &mut Context<Self>) {
         let Some(store) = self.store.clone() else {
+            if let Some(staging) = self.staging_mut(token) {
+                staging.save_error = Some(
+                    "The recording store is unavailable. Copy your edits before closing.".into(),
+                );
+                staging.close_when_saved = false;
+            }
+            cx.notify();
             return;
         };
         let Some(staging) = self.staging_mut(token) else {
@@ -578,13 +625,15 @@ impl StarlingApp {
             return;
         }
         let persisted = staging.persisted_revision;
+        let in_flight = staging.writes_in_flight.clone();
+        let accepted = staging.pending_accept.as_ref().map(|(_, row)| row.clone());
         let Some(id) = staging.take_id.clone() else {
             return;
         };
         let Some(draft) = self.drafts.get(&id) else {
             return;
         };
-        if draft.revision() == persisted {
+        if draft.revision() <= persisted || in_flight.contains(&draft.revision()) {
             return;
         }
         let revision = draft.revision();
@@ -595,13 +644,184 @@ impl StarlingApp {
             .first()
             .map(|attempt| attempt.attempt_id.clone())
             .unwrap_or_default();
-        if let Some(staging) = self.staging_mut(token) {
-            staging.persisted_revision = revision;
-        }
         if let Some(take) = self.processing.get_mut(&id) {
             take.processed_head = (!is_raw).then(|| text.clone());
         }
-        self.persist_head(store, id, revision, text, is_raw, attempt_id, None, cx);
+        self.persist_head(store, id, revision, text, is_raw, attempt_id, accepted, cx);
+    }
+
+    /// Called by every head write, including accept/revert, before spawning it.
+    pub(crate) fn staging_head_started(
+        &mut self,
+        id: &str,
+        revision: u64,
+        accepted: Option<ProposalRow>,
+    ) -> Option<ProposalRow> {
+        let Some(token) = self.staging_token_for(id) else {
+            return accepted;
+        };
+        let staging = self.staging_mut(token).unwrap();
+        staging.writes_in_flight.insert(revision);
+        if let Some(accepted) = accepted {
+            staging.pending_accept = Some((revision, accepted));
+        }
+        // An edit or revert can overtake a failed acceptance write. Carry
+        // its proposal disposition forward with the newer durable head.
+        staging.pending_accept.as_ref().map(|(_, row)| row.clone())
+    }
+
+    /// A storage completion is the only acknowledgement of durability.
+    pub(crate) fn staging_head_finished(
+        &mut self,
+        id: &str,
+        attempt_id: &str,
+        revision: u64,
+        saved: &Result<(), starling_dictation::storage::StorageError>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(token) = self.staging_token_for(id) else {
+            return false;
+        };
+        // A completion for a superseded transcript must not acknowledge its replacement.
+        if !self.drafts.get(id).is_some_and(|draft| {
+            draft
+                .attempts()
+                .first()
+                .is_some_and(|attempt| attempt.attempt_id == attempt_id)
+        }) {
+            return false;
+        }
+        let staging = self.staging_mut(token).unwrap();
+        staging.writes_in_flight.remove(&revision);
+        match saved {
+            Ok(()) => {
+                staging.persisted_revision = staging.persisted_revision.max(revision);
+                if staging
+                    .failed_revision
+                    .is_none_or(|failed| failed <= revision)
+                {
+                    staging.save_error = None;
+                    staging.failed_revision = None;
+                }
+                if staging
+                    .pending_accept
+                    .as_ref()
+                    .is_some_and(|(pending, _)| *pending <= revision)
+                {
+                    staging.pending_accept = None;
+                }
+            }
+            Err(err) if revision > staging.persisted_revision => {
+                staging.failed_revision = Some(staging.failed_revision.unwrap_or(0).max(revision));
+                staging.save_error = Some(format!(
+                    "Could not save your edits ({err}). They remain here; press Done to retry, or Copy to keep them."
+                ));
+                staging.close_when_saved = false;
+                // Background drafts remain retained as well; make their failure visible.
+                if self
+                    .staging
+                    .as_ref()
+                    .is_none_or(|staging| staging.token != token)
+                {
+                    self.error = Some(format!(
+                        "Could not save edits for take {id}: {err}. Select that take in history to retry or copy its retained draft."
+                    ));
+                    if self.staging.is_none() {
+                        if let Some(index) = self
+                            .background_stagings
+                            .iter()
+                            .position(|staging| staging.token == token)
+                        {
+                            self.staging = Some(self.background_stagings.remove(index));
+                            self.focus_staging_pending = true;
+                        }
+                    }
+                }
+                cx.notify();
+                return true;
+            }
+            Err(_) => {} // A newer revision is already durable.
+        }
+        let flush = self
+            .staging_mut(token)
+            .is_some_and(|staging| staging.close_when_saved)
+            || self
+                .background_stagings
+                .iter()
+                .any(|staging| staging.token == token);
+        if flush {
+            self.persist_staging_now(token, cx);
+        }
+        self.release_saved_staging(token, cx);
+        cx.notify();
+        true
+    }
+
+    fn release_saved_staging(&mut self, token: u64, cx: &mut Context<Self>) {
+        let Some(staging) = self.staging_mut(token) else {
+            return;
+        };
+        if staging.phase != StagingPhase::Ready
+            || !staging.writes_in_flight.is_empty()
+            || staging.save_error.is_some()
+        {
+            return;
+        }
+        let revision = staging.persisted_revision;
+        let close = staging.close_when_saved;
+        let id = staging.take_id.clone();
+        if !id
+            .as_ref()
+            .and_then(|id| self.drafts.get(id))
+            .is_some_and(|draft| draft.revision() <= revision)
+        {
+            return;
+        }
+        self.background_stagings
+            .retain(|staging| staging.token != token);
+        if close
+            && self
+                .staging
+                .as_ref()
+                .is_some_and(|staging| staging.token == token)
+        {
+            self.staging = None;
+            self.focus_root_pending = true;
+            cx.notify();
+        }
+    }
+
+    /// Recover a failed background save when its take is selected in history.
+    pub(crate) fn restore_unsaved_staging(&mut self, id: &str, cx: &mut Context<Self>) {
+        // A recording owns the panel until it stops.
+        if self
+            .staging
+            .as_ref()
+            .is_some_and(|staging| staging.phase == StagingPhase::Recording)
+        {
+            return;
+        }
+        let Some(index) = self.background_stagings.iter().position(|staging| {
+            staging.take_id.as_deref() == Some(id)
+                && (staging.save_error.is_some() || staging.phase == StagingPhase::Failed)
+        }) else {
+            return;
+        };
+        let staging = self.background_stagings.remove(index);
+        self.retire_staging(cx);
+        self.staging = Some(staging);
+        self.focus_staging_pending = true;
+        cx.notify();
+    }
+
+    pub(crate) fn staging_has_unsaved_edits(&self) -> bool {
+        self.staging.as_ref().is_some_and(|staging| {
+            staging.save_error.is_some()
+                || !staging.writes_in_flight.is_empty()
+                || self
+                    .visible_staging_draft()
+                    .is_some_and(|draft| draft.revision() > staging.persisted_revision)
+        })
     }
 
     /// "Done" (or Secondary+Enter): the draft is written and the panel
@@ -613,6 +833,15 @@ impl StarlingApp {
             .is_some_and(|staging| staging.phase == StagingPhase::Recording)
         {
             return;
+        }
+        if let Some(staging) = self.staging.as_mut() {
+            if staging.phase == StagingPhase::Ready {
+                staging.close_when_saved = true;
+                let token = staging.token;
+                self.persist_staging_now(token, cx);
+                self.release_saved_staging(token, cx);
+                return;
+            }
         }
         self.retire_staging(cx);
     }
@@ -632,9 +861,25 @@ impl StarlingApp {
         // copy happens either way.
         let _: Outcome = draft.deliver(&delivery, "clipboard");
         cx.write_to_clipboard(ClipboardItem::new_string(text));
-        if let Some(staging) = self.staging.as_mut() {
-            staging.copied = true;
-        }
+        let Some(staging) = self.staging_mut(token) else {
+            return;
+        };
+        staging.copied = true;
+        staging.copy_generation += 1;
+        let generation = staging.copy_generation;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_secs(2)).await;
+            this.update(cx, |app, cx| {
+                if let Some(staging) = app.staging_mut(token) {
+                    if staging.copy_generation == generation {
+                        staging.copied = false;
+                        cx.notify();
+                    }
+                }
+            })
+            .ok();
+        })
+        .detach();
         cx.notify();
     }
 
@@ -647,7 +892,8 @@ impl StarlingApp {
             return;
         }
         let (token, id) = (staging.token, staging.take_id.clone());
-        // The job reads the stored head; write pending edits first.
+        // Start durability work. Processing itself uses the newer in-memory
+        // draft while this asynchronous write is pending (see process_take).
         self.persist_staging_now(token, cx);
         if let Some(id) = id {
             self.process_take(id, cx);
@@ -680,11 +926,10 @@ impl StarlingApp {
             .flatten()
     }
 
-    /// Accept and revert wrote the head themselves; the panel follows.
-    fn after_head_change(&mut self, token: u64, id: &str, cx: &mut Context<Self>) {
-        let revision = self.drafts.get(id).map(Draft::revision);
-        if let (Some(staging), Some(revision)) = (self.staging_mut(token), revision) {
-            staging.persisted_revision = revision;
+    /// Accept and revert queued their writes; the panel follows the draft.
+    /// Their asynchronous completions acknowledge persistence separately.
+    fn after_head_change(&mut self, token: u64, _id: &str, cx: &mut Context<Self>) {
+        if let Some(staging) = self.staging_mut(token) {
             staging.copied = false;
         }
         self.sync_staging_editor(token, true, cx);
@@ -713,6 +958,262 @@ impl StarlingApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn interrupted_stop_fails_the_panel_instead_of_leaking_it(cx: &mut gpui::TestAppContext) {
+        let app = cx.new(|cx| StarlingApp::for_test(None, cx));
+        app.update(cx, |app, cx| {
+            app.begin_staging(cx);
+            app.stop_staging();
+            app.staging_interrupted(cx);
+            assert_eq!(app.staging.as_ref().unwrap().phase, StagingPhase::Failed);
+            app.finish_staging(cx);
+            assert!(app.background_stagings.is_empty());
+        });
+    }
+
+    #[gpui::test]
+    fn failed_head_write_is_not_persisted_or_discarded_on_done(cx: &mut gpui::TestAppContext) {
+        let root = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::at_test_root(root.path());
+        let app = cx.new(|cx| StarlingApp::for_test(Some(store), cx));
+        app.update(cx, |app, cx| {
+            app.begin_staging(cx);
+            let staging = app.staging.as_mut().unwrap();
+            staging.phase = StagingPhase::Ready;
+            staging.take_id = Some("missing-take".into());
+            staging.live = None;
+            let token = staging.token;
+            let mut draft = draft("raw");
+            draft.insert(3, " edited");
+            app.drafts.insert("missing-take".into(), draft);
+            app.persist_staging_now(token, cx);
+        });
+        cx.run_until_parked();
+        app.update(cx, |app, cx| {
+            let staging = app.staging.as_ref().unwrap();
+            assert_eq!(
+                staging.persisted_revision, 0,
+                "a failed write is not durable"
+            );
+            assert!(
+                staging.save_error.is_some(),
+                "the panel must report unsaved edits"
+            );
+            app.finish_staging(cx);
+        });
+        cx.run_until_parked();
+        app.update(cx, |app, _| {
+            assert!(
+                app.staging.is_some(),
+                "a failed Done must retain the editable panel"
+            );
+            assert_eq!(app.visible_staging_draft().unwrap().text(), "raw edited");
+        });
+    }
+
+    #[gpui::test]
+    fn unavailable_rebase_keeps_the_live_text_and_reports_failure(cx: &mut gpui::TestAppContext) {
+        let root = tempfile::tempdir().unwrap();
+        for store in [None, Some(crate::store::Store::at_test_root(root.path()))] {
+            let app = cx.new(|cx| StarlingApp::for_test(store, cx));
+            app.update(cx, |app, cx| {
+                app.begin_staging(cx);
+                let token = app.staging.as_ref().unwrap().token;
+                app.apply_staging_edit(
+                    token,
+                    &TextEdit {
+                        start: 0,
+                        end: 0,
+                        text: "keep my note".into(),
+                    },
+                    cx,
+                );
+                app.stop_staging();
+                app.bind_staging(token, "take");
+                // No store, or a store but no final transcript in the listing.
+                app.after_transcription("take".into(), cx);
+                assert_eq!(app.staging.as_ref().unwrap().phase, StagingPhase::Failed);
+                assert!(app.staging.as_ref().unwrap().notice.is_some());
+                assert_eq!(app.visible_staging_draft().unwrap().text(), "keep my note");
+            });
+        }
+    }
+
+    fn saved_take(store: &crate::store::Store) -> (String, String) {
+        use starling_dictation::{audio, storage::TranscriptionResult};
+        let wav = audio::encode_wav_16k(&audio::PcmAudio {
+            samples: vec![0.; 160],
+            sample_rate: 16_000,
+            channels: 1,
+        })
+        .unwrap();
+        let id = store
+            .save_capture(std::sync::Arc::new(wav), None)
+            .unwrap()
+            .id;
+        store.mark_attempt(&id, "test").unwrap();
+        store
+            .save_transcript(
+                &id,
+                TranscriptionResult {
+                    text: "raw".into(),
+                    segments: vec![],
+                    duration_seconds: None,
+                    request_id: None,
+                },
+            )
+            .unwrap();
+        let (attempt, _) = store.latest_raw(&id).unwrap().unwrap();
+        (id, attempt)
+    }
+
+    #[gpui::test]
+    fn done_retries_a_failed_write_and_closes_only_after_storage_confirms(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::at_test_root(root.path());
+        let (id, attempt) = saved_take(&store);
+        let app = cx.new(|cx| StarlingApp::for_test(Some(store.clone()), cx));
+        app.update(cx, |app, cx| {
+            app.begin_staging(cx);
+            let staging = app.staging.as_mut().unwrap();
+            staging.phase = StagingPhase::Ready;
+            staging.take_id = Some(id.clone());
+            staging.live = None;
+            let mut draft = Draft::new(&id, &id);
+            draft.final_attempt(0, &attempt, "raw");
+            draft.insert(3, " edited");
+            app.drafts.insert(id.clone(), draft);
+            // No processing document yet: the actual store write fails.
+            app.finish_staging(cx);
+            assert!(app.staging.is_some(), "Done must wait for the async write");
+        });
+        cx.run_until_parked();
+        app.update(cx, |app, _| {
+            assert!(app.staging.as_ref().unwrap().save_error.is_some());
+            assert_eq!(app.visible_staging_draft().unwrap().text(), "raw edited");
+        });
+        store.start_processing_doc(&id, &attempt, "raw").unwrap();
+        app.update(cx, |app, cx| app.finish_staging(cx));
+        cx.run_until_parked();
+        assert_eq!(
+            store.processing_doc(&id).unwrap().unwrap().head_text,
+            "raw edited"
+        );
+        app.update(cx, |app, _| {
+            assert!(app.staging.is_none());
+            assert!(app.background_stagings.is_empty());
+        });
+    }
+
+    #[gpui::test]
+    fn an_old_completion_does_not_clear_a_newer_save_failure(cx: &mut gpui::TestAppContext) {
+        let app = cx.new(|cx| StarlingApp::for_test(None, cx));
+        app.update(cx, |app, cx| {
+            app.begin_staging(cx);
+            app.staging.as_mut().unwrap().take_id = Some("t".into());
+            app.drafts.insert("t".into(), draft("raw"));
+            let _ = app.staging_head_started("t", 2, None);
+            let _ = app.staging_head_started("t", 3, None);
+            let error = Err(starling_dictation::storage::StorageError::NotFound(
+                "t".into(),
+            ));
+            app.staging_head_finished("t", "a", 3, &error, cx);
+            app.staging_head_finished("t", "a", 2, &Ok(()), cx);
+            assert!(app.staging.as_ref().unwrap().save_error.is_some());
+            app.staging_head_finished("t", "a", 3, &Ok(()), cx);
+            assert!(app.staging.as_ref().unwrap().save_error.is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn a_failed_background_save_can_be_reopened_from_history(cx: &mut gpui::TestAppContext) {
+        let root = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::at_test_root(root.path());
+        let app = cx.new(|cx| StarlingApp::for_test(Some(store), cx));
+        app.update(cx, |app, cx| {
+            app.begin_staging(cx);
+            let staging = app.staging.as_mut().unwrap();
+            staging.phase = StagingPhase::Ready;
+            staging.take_id = Some("missing".into());
+            staging.live = None;
+            app.drafts.insert("missing".into(), draft("keep this"));
+            app.begin_staging(cx);
+        });
+        cx.run_until_parked();
+        app.update(cx, |app, cx| {
+            assert_eq!(app.background_stagings.len(), 1);
+            assert!(app.background_stagings[0].save_error.is_some());
+            // Finish the new take, then select the old one in history.
+            app.stop_staging();
+            app.staging_interrupted(cx);
+            app.finish_staging(cx);
+            app.select_session("missing".into(), cx);
+            assert_eq!(app.visible_staging_draft().unwrap().text(), "keep this");
+            assert!(app.staging.as_ref().unwrap().save_error.is_some());
+            assert!(app.background_stagings.is_empty());
+        });
+    }
+
+    #[gpui::test]
+    fn done_flushes_edits_made_while_the_first_write_is_pending(cx: &mut gpui::TestAppContext) {
+        let root = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::at_test_root(root.path());
+        let (id, attempt) = saved_take(&store);
+        let doc = store.start_processing_doc(&id, &attempt, "raw").unwrap();
+        let app = cx.new(|cx| StarlingApp::for_test(Some(store.clone()), cx));
+        app.update(cx, |app, cx| {
+            app.begin_staging(cx);
+            let staging = app.staging.as_mut().unwrap();
+            staging.phase = StagingPhase::Ready;
+            staging.take_id = Some(id.clone());
+            staging.live = None;
+            staging.persisted_revision = doc.head_revision;
+            let token = staging.token;
+            app.drafts.insert(id.clone(), draft_from_doc(&id, &doc));
+            app.apply_staging_edit(
+                token,
+                &TextEdit {
+                    start: 3,
+                    end: 3,
+                    text: " first".into(),
+                },
+                cx,
+            );
+            app.finish_staging(cx);
+            app.apply_staging_edit(
+                token,
+                &TextEdit {
+                    start: 9,
+                    end: 9,
+                    text: " second".into(),
+                },
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            store.processing_doc(&id).unwrap().unwrap().head_text,
+            "raw first second"
+        );
+        app.update(cx, |app, _| assert!(app.staging.is_none()));
+    }
+
+    #[gpui::test]
+    fn copy_feedback_expires_without_an_edit(cx: &mut gpui::TestAppContext) {
+        let app = cx.new(|cx| StarlingApp::for_test(None, cx));
+        app.update(cx, |app, cx| {
+            app.begin_staging(cx);
+            app.copy_staging(cx);
+            assert!(app.staging.as_ref().unwrap().copied);
+        });
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_secs(3));
+        cx.run_until_parked();
+        app.update(cx, |app, _| assert!(!app.staging.as_ref().unwrap().copied));
+    }
 
     fn draft(raw: &str) -> Draft {
         let mut draft = Draft::new("d", "c");

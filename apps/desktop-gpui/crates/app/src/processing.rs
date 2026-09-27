@@ -1071,28 +1071,34 @@ impl StarlingApp {
         accepted: Option<ProposalRow>,
         cx: &mut Context<Self>,
     ) {
+        let accepted = self.staging_head_started(&id, revision, accepted);
         cx.spawn(async move |this, cx| {
+            let write_id = id.clone();
+            let write_attempt = attempt_id.clone();
             let saved = cx
                 .background_spawn(async move {
                     store.commit_processing_head(
-                        &id,
+                        &write_id,
                         revision,
                         &text,
                         is_raw,
-                        &attempt_id,
+                        &write_attempt,
                         accepted.as_ref(),
                     )
                 })
                 .await;
-            if let Err(err) = saved {
-                if !matches!(err, storage::StorageError::NotFound(_)) {
-                    this.update(cx, |app, cx| {
+            this.update(cx, |app, cx| {
+                if app.staging_head_finished(&id, &attempt_id, revision, &saved, cx) {
+                    return;
+                }
+                if let Err(err) = saved {
+                    if !matches!(err, storage::StorageError::NotFound(_)) {
                         app.error = Some(format!("Could not store the change: {err}"));
                         cx.notify();
-                    })
-                    .ok();
+                    }
                 }
-            }
+            })
+            .ok();
         })
         .detach();
     }
@@ -1143,21 +1149,30 @@ mod tests {
     fn an_unknown_saved_mode_is_announced() {
         assert!(unknown_mode_note("verbatim").is_none());
         let note = unknown_mode_note("retired-mode").expect("a note");
-        assert!(note.contains("retired-mode") && note.contains("verbatim"), "{note}");
+        assert!(
+            note.contains("retired-mode") && note.contains("verbatim"),
+            "{note}"
+        );
     }
 
     #[test]
     fn a_bad_key_variable_name_is_a_problem_not_a_missing_key() {
         assert_eq!(api_key(""), Ok(None));
         assert_eq!(api_key("STARLING_TEST_SURELY_UNSET_KEY"), Ok(None));
-        assert!(api_key("sk-live-abc").is_err(), "a pasted key is not a name");
+        assert!(
+            api_key("sk-live-abc").is_err(),
+            "a pasted key is not a name"
+        );
         assert!(api_key("1KEY").is_err());
         let problems = build_providers(&ProcessingSettings {
             api_key_env: "not a name".to_string(),
             ..settings()
         })
         .problems;
-        assert!(problems[API_ROUTE].contains("environment variable"), "{problems:?}");
+        assert!(
+            problems[API_ROUTE].contains("environment variable"),
+            "{problems:?}"
+        );
     }
 
     #[test]

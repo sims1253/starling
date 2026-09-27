@@ -22,6 +22,11 @@
 //!
 //! Segment texts carry their own leading space, so the draft's text reads
 //! like the transcript: the words joined by single spaces.
+//!
+//! Word indices follow the server contract: ASCII whitespace separates
+//! words, not language-specific tokenization. Unspaced CJK/Thai text is
+//! therefore one live segment until stable or final. Editing inside it
+//! still pins the entire segment; the editor does not guess subword cuts.
 
 use crate::staging::Draft;
 
@@ -74,19 +79,36 @@ fn ends_with_tail(words: &[&str], start: usize, end: usize, tail: &str) -> bool 
             .is_some_and(|word| !norm(word).is_empty())
 }
 
-/// Where a closed segment ends in `words`: the end of its `tail` closest to
-/// `expected`, or `expected` when the tail is gone.
-fn realign(words: &[&str], tail: &str, start: usize, expected: usize) -> usize {
+/// Finds the nearest surviving anchor, searching nearby first. A large
+/// server revision may move the anchor beyond the usual overlap window.
+fn realign(words: &[&str], tail: &str, start: usize, expected: usize) -> Option<usize> {
+    let start = start.min(words.len());
     let expected = expected.clamp(start, words.len());
     if tail.is_empty() {
-        return expected;
+        return Some(expected);
     }
     let low = (start + 1).max(expected.saturating_sub(ANCHOR_REACH));
-    let high = words.len().min(expected + ANCHOR_REACH);
-    (low..=high)
-        .filter(|&end| ends_with_tail(words, start, end, tail))
-        .min_by_key(|&end| end.abs_diff(expected))
-        .unwrap_or(expected)
+    let high = words.len().min(expected.saturating_add(ANCHOR_REACH));
+    let nearest = |range: std::ops::RangeInclusive<usize>| {
+        range
+            .filter(|&end| ends_with_tail(words, start, end, tail))
+            .min_by_key(|&end| end.abs_diff(expected))
+    };
+    nearest(low..=high).or_else(|| nearest(start + 1..=words.len()))
+}
+
+/// An exact deletion can erase a closed segment's entire anchor. Map its
+/// old boundary through that deletion instead of consuming later speech.
+fn deleted_boundary(old: &[String], new: &[&str], boundary: usize) -> Option<usize> {
+    let prefix = old.iter().zip(new).take_while(|(a, b)| a == b).count();
+    let suffix = old[prefix..]
+        .iter()
+        .rev()
+        .zip(new[prefix..].iter().rev())
+        .take_while(|(a, b)| a == b)
+        .count();
+    (prefix + suffix == new.len() && (prefix..=old.len() - suffix).contains(&boundary))
+        .then_some(prefix)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -106,11 +128,11 @@ pub struct LiveSegmenter {
 
 /// The draft text of words `[start, end)`: joined by single spaces, with a
 /// leading space unless the span starts the take.
-fn span_text(words: &[&str], start: usize, end: usize) -> String {
+fn span_text(words: &[&str], start: usize, end: usize, segment: u32) -> String {
     let start = start.min(words.len());
     let end = end.clamp(start, words.len());
     let joined = words[start..end].join(" ");
-    if start > 0 && !joined.is_empty() {
+    if (start > 0 || segment > 0) && !joined.is_empty() {
         format!(" {joined}")
     } else {
         joined
@@ -166,13 +188,32 @@ impl LiveSegmenter {
     /// Re-finds every closed segment's end in `words`, oldest first; a
     /// move shifts the expectation for the ones after it.
     fn realign_closed(&mut self, words: &[&str]) {
-        let mut start = self.finalized.len();
+        let mut start = self.finalized.len().min(words.len());
         let mut shift: isize = 0;
         for span in &mut self.closed {
             let old_end = span.end.unwrap_or(start);
             let expected = old_end.saturating_add_signed(shift);
-            let end = realign(words, &span.tail, start, expected);
-            shift += end as isize - old_end as isize;
+            let end = deleted_boundary(&self.heard, words, old_end)
+                .filter(|end| *end >= start)
+                .or_else(|| realign(words, &span.tail, start, expected))
+                .or_else(|| {
+                    // A revision may change the first anchor word while
+                    // its final two words still identify the boundary.
+                    let old: Vec<&str> = self.heard.iter().map(String::as_str).collect();
+                    let end = old_end.min(old.len());
+                    let from = end.saturating_sub(2).max(span.start.min(end));
+                    let tail = tail_of(&old, from, end);
+                    (!tail.is_empty())
+                        .then(|| realign(words, &tail, start, expected))
+                        .flatten()
+                })
+                .unwrap_or_else(|| {
+                    // A replacement erased the anchor: retain the best
+                    // boundary, but report that its placement is uncertain.
+                    self.diverged = true;
+                    expected.clamp(start, words.len())
+                });
+            shift = end as isize - old_end as isize;
             span.start = start;
             span.end = Some(end);
             span.tail = tail_of(words, start, end);
@@ -194,7 +235,7 @@ impl LiveSegmenter {
 
     /// Finalizes the segment `span` as words `[span.start, end)`.
     fn finalize(&mut self, draft: &mut Draft, words: &[&str], span: Span, end: usize) {
-        let text = span_text(words, span.start, end);
+        let text = span_text(words, span.start, end, span.segment);
         draft.final_attempt(span.segment, &attempt_id(span.segment), &text);
         let end = end.min(words.len());
         let from = self.finalized.len().min(end);
@@ -208,22 +249,28 @@ impl LiveSegmenter {
         if self.finished {
             return;
         }
-        let words: Vec<&str> = text.split_whitespace().collect();
+        let words: Vec<&str> = text.split_ascii_whitespace().collect();
         self.check_prefix(&words);
-        self.heard = words.iter().map(|word| word.to_string()).collect();
         let stable = stable_words.min(words.len());
         self.realign_closed(&words);
+        self.heard = words.iter().map(|word| word.to_string()).collect();
 
         // Closed segments, oldest first: final once stable covers them.
         let mut still_closed = Vec::with_capacity(self.closed.len());
         for span in std::mem::take(&mut self.closed) {
             let end = span.end.unwrap_or(words.len());
+            if end == span.start {
+                // An exactly deleted segment has no words left to stabilize.
+                // Close it without freezing any earlier, still-live words.
+                draft.final_attempt(span.segment, &attempt_id(span.segment), "");
+                continue;
+            }
             if still_closed.is_empty() && stable >= end {
                 self.finalize(draft, &words, span, end);
             } else {
                 // An empty update would drop the region; a later partial
                 // would then re-create it at the end, out of place.
-                let text = span_text(&words, span.start, end);
+                let text = span_text(&words, span.start, end, span.segment);
                 if !text.is_empty() {
                     draft.partial(span.segment, &text);
                 }
@@ -244,10 +291,13 @@ impl LiveSegmenter {
         }
         if words.len() > self.open_start() {
             let span = self.open_span();
-            let text = span_text(&words, span.start, words.len());
+            let text = span_text(&words, span.start, words.len(), span.segment);
             if !text.is_empty() {
                 draft.partial(span.segment, &text);
             }
+        } else if let Some(span) = self.open.as_ref() {
+            // The entire unedited tail disappeared from this partial.
+            draft.partial(span.segment, "");
         }
     }
 
@@ -279,7 +329,7 @@ impl LiveSegmenter {
         if self.finished {
             return !self.diverged;
         }
-        let words: Vec<&str> = text.split_whitespace().collect();
+        let words: Vec<&str> = text.split_ascii_whitespace().collect();
         self.check_prefix(&words);
         self.realign_closed(&words);
         if self.open.is_some() {
@@ -323,6 +373,92 @@ mod tests {
     }
 
     #[test]
+    fn native_stable_word_counts_do_not_split_non_ascii_spaces() {
+        let mut draft = Draft::new("d", "c");
+        let mut live = LiveSegmenter::new();
+        live.partial(&mut draft, "hello\u{a0}world next", 1);
+        assert_eq!(draft.raw_text(), "hello\u{a0}world");
+        assert_eq!(draft.text(), "hello\u{a0}world next");
+    }
+
+    #[test]
+    fn a_deleted_segment_after_an_unstable_segment_disappears_immediately() {
+        let mut draft = Draft::new("d", "c");
+        let mut live = LiveSegmenter::new();
+        live.partial(&mut draft, "first words", 0);
+        live.cut();
+        draft.insert(draft.text().chars().count(), " [one]");
+        live.partial(&mut draft, "first words mistaken words", 0);
+        live.cut();
+        draft.insert(draft.text().chars().count(), " [two]");
+        live.partial(&mut draft, "first words mistaken words later speech", 0);
+        live.partial(&mut draft, "first words later speech", 0);
+        assert_eq!(draft.text(), "first words [one] [two] later speech");
+        assert_eq!(draft.raw_text(), "");
+    }
+
+    #[test]
+    fn a_disappearing_open_tail_clears_its_partial() {
+        let mut draft = Draft::new("d", "c");
+        let mut live = LiveSegmenter::new();
+        live.partial(&mut draft, "mistake", 0);
+        live.partial(&mut draft, "", 0);
+        assert_eq!(draft.text(), "");
+        live.partial(&mut draft, "correct", 0);
+        assert_eq!(draft.text(), "correct");
+    }
+
+    #[test]
+    fn a_deleted_closed_segment_does_not_swallow_later_speech() {
+        let mut draft = Draft::new("d", "c");
+        let mut live = LiveSegmenter::new();
+        live.partial(&mut draft, "mistaken words", 0);
+        live.cut();
+        draft.insert(draft.text().chars().count(), " [note]");
+        live.partial(&mut draft, "mistaken words later speech", 0);
+        live.partial(&mut draft, "later speech", 0);
+        assert_eq!(draft.text(), " [note] later speech");
+        live.finish(&mut draft, "later speech");
+        assert_eq!(draft.text(), " [note] later speech");
+    }
+
+    #[test]
+    fn large_revisions_keep_the_anchor_before_the_edit() {
+        let mut draft = Draft::new("d", "c");
+        let mut live = LiveSegmenter::new();
+        live.partial(&mut draft, "the old anchor", 0);
+        live.cut();
+        draft.insert(draft.text().chars().count(), " [note]");
+        let prefix = "new ".repeat(20);
+        live.partial(&mut draft, &format!("{prefix}the old anchor later"), 0);
+        assert_eq!(draft.text(), format!("{prefix}the old anchor [note] later"));
+    }
+
+    #[test]
+    fn a_shorter_final_after_a_closed_segment_does_not_panic() {
+        let mut draft = Draft::new("d", "c");
+        let mut live = LiveSegmenter::new();
+        live.partial(&mut draft, "one two three four", 2);
+        live.cut();
+        draft.insert(draft.text().chars().count(), " [note]");
+        assert!(!live.finish(&mut draft, "one"));
+        assert!(draft.text().contains("[note]"));
+    }
+
+    #[test]
+    fn editing_an_unsegmented_script_still_pins_the_users_text() {
+        let mut draft = Draft::new("d", "c");
+        let mut live = LiveSegmenter::new();
+        live.partial(&mut draft, "你好世界", 0);
+        live.cut();
+        draft.delete(2, 4);
+        draft.insert(2, "朋友");
+        live.partial(&mut draft, "你好世界今天", 0);
+        live.finish(&mut draft, "你好世界今天");
+        assert_eq!(draft.text(), "你好朋友");
+    }
+
+    #[test]
     fn stable_words_become_final_while_the_tail_stays_live() {
         let mut draft = Draft::new("d", "c");
         let mut live = LiveSegmenter::new();
@@ -343,9 +479,11 @@ mod tests {
         assert!(live.finish(&mut draft, "one two three four five six"));
         assert_eq!(draft.text(), "one two three four five six");
         assert_eq!(draft.raw_text(), "one two three four five six");
-        assert!(kinds(&draft)
-            .iter()
-            .all(|(kind, _)| *kind == RegionKind::Raw));
+        assert!(
+            kinds(&draft)
+                .iter()
+                .all(|(kind, _)| *kind == RegionKind::Raw)
+        );
     }
 
     #[test]

@@ -189,7 +189,7 @@ fn parse_message(text: &str) -> Option<Event> {
                     stable_words: payload
                         .get("stable_words")
                         .and_then(Value::as_u64)
-                        .map_or(0, |count| count as usize),
+                        .map_or(0, |count| usize::try_from(count).unwrap_or(usize::MAX)),
                 })
             }),
         Some("error") => Some(Event::Error(
