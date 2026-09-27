@@ -10,7 +10,9 @@ can hide a component that appears in another utterance.
 
 For each head, held-out error is
 `sum((K - reconstructed_K)^2) / sum((K - training_mean)^2)` (and likewise for
-V). Values can exceed one after a distribution shift. Full width should have
+V). This ratio lies in [0, 1], apart from numerical roundoff, because PCA
+projects onto an orthonormal basis. A distribution shift can move it toward
+one. Full width should have
 near-zero reconstruction error; it acts as a numerical control. Model loading,
 projection hook locations, and audio preprocessing are in the
 [`bench_kv_spectral.py`](bench_kv_spectral.py) source.

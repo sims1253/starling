@@ -102,6 +102,8 @@ def _read_wav_mono(path: str) -> tuple[np.ndarray, int]:
     import soundfile as sf
 
     a, sr = sf.read(path)
+    if sr != 16000:
+        raise ValueError(f"calibration WAV {path} has sample rate {sr}; expected 16000 Hz")
     if a.ndim == 2:
         a = a.mean(axis=1)
     return np.ascontiguousarray(a, dtype=np.float32), int(sr)
@@ -279,8 +281,9 @@ def pca_layer(train: torch.Tensor, held_out: torch.Tensor,
               thresholds: tuple[float, ...]) -> dict[str, Any]:
     """Fit each head on training clips; measure relative squared error elsewhere.
 
-    Error is normalized by held-out energy around the training mean. It may
-    exceed one when the held-out distribution differs from the training clips.
+    Error is normalized by held-out energy around the training mean. The
+    orthogonal PCA projection makes this ratio lie in [0, 1], apart from
+    floating-point roundoff; a distribution shift can move it toward one.
     """
     device = "cuda" if torch.cuda.is_available() else "cpu"
     num_heads, head_dim = train.shape[1:]
@@ -330,6 +333,9 @@ def pca_layer(train: torch.Tensor, held_out: torch.Tensor,
 # =========================================================================== #
 @torch.inference_mode()
 def measure_granite(clips: list[tuple[np.ndarray, int, str]]) -> dict[str, Any]:
+    for _, sr, name in clips:
+        if sr != 16000:
+            raise ValueError(f"Granite clip {name} has sample rate {sr}; expected 16000 Hz")
     from starling.granite.audio import build_inputs
     from starling.granite.loader import get_components, load_model_and_processor
 
@@ -486,7 +492,10 @@ def main() -> int:
     models = [m.strip() for m in args.models.split(",") if m.strip()]
     if not models or set(models) - {"granite", "qwen3"}:
         ap.error("--models must contain granite and/or qwen3")
-    clips = gather_calibration_clips(args.clips, args.audio)
+    try:
+        clips = gather_calibration_clips(args.clips, args.audio)
+    except (OSError, ValueError) as exc:
+        ap.error(str(exc))
     print(f"calibration set: {len(clips)} clips", flush=True)
     for _, _, name in clips:
         print(f"  - {name}", flush=True)
