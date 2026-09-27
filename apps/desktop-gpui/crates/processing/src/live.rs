@@ -333,14 +333,13 @@ impl LiveSegmenter {
         let words: Vec<&str> = text.split_ascii_whitespace().collect();
         self.check_prefix(&words);
         self.realign_closed(&words);
-        if self.open.is_some() {
+        // Words past the last segment get one too: nothing live yet (a
+        // short take, or no partial arrived), or speech after the last cut
+        // that no partial carried.
+        if self.open.is_some() || words.len() > self.open_start() {
             self.open_span();
         }
         let mut spans = std::mem::take(&mut self.closed);
-        if spans.is_empty() && self.open.is_none() && words.len() > self.finalized.len() {
-            // Nothing live yet (a short take, or no partial arrived).
-            self.open_span();
-        }
         spans.extend(self.open.take());
         for span in spans {
             let end = span.end.unwrap_or(words.len());
@@ -371,6 +370,16 @@ mod tests {
                 (region.kind, text)
             })
             .collect()
+    }
+
+    #[test]
+    fn a_final_with_words_after_the_last_cut_keeps_them() {
+        let mut draft = Draft::new("d", "c");
+        let mut live = LiveSegmenter::new();
+        live.partial(&mut draft, "a b", 0);
+        live.cut();
+        assert!(live.finish(&mut draft, "a b c d"));
+        assert_eq!(draft.text(), "a b c d");
     }
 
     #[test]

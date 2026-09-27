@@ -662,11 +662,20 @@ impl StarlingApp {
         let revision = draft.revision();
         let text = draft.text();
         let is_raw = text == draft.raw_text();
-        let attempt_id = draft
+        // A rebased draft always has its transcript as the first attempt;
+        // a head written without it could never be acknowledged.
+        let Some(attempt_id) = draft
             .attempts()
             .first()
             .map(|attempt| attempt.attempt_id.clone())
-            .unwrap_or_default();
+        else {
+            if let Some(staging) = self.staging_mut(token) {
+                staging.save_error =
+                    Some("Could not save your edits: the take has no transcript.".to_string());
+            }
+            cx.notify();
+            return;
+        };
         if let Some(take) = self.processing.get_mut(&id) {
             take.processed_head = (!is_raw).then(|| text.clone());
         }
