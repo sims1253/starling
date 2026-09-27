@@ -138,7 +138,11 @@ def ws_short_commit(ws, audio: bytes, timeout_s: float, retry_s: float,
                         "first_commit_before_long_done": first_commit_before_long_done}
         return {"status": "timeout", "busy_responses": busy,
                 "first_commit_before_long_done": first_commit_before_long_done}
-    except (ConnectionClosed, TimeoutError) as exc:
+    except TimeoutError as exc:
+        return {"status": "timeout", "error": str(exc),
+                "busy_responses": busy, "partials": partials,
+                "first_commit_before_long_done": first_commit_before_long_done}
+    except ConnectionClosed as exc:
         return {"status": "connection_lost", "error": str(exc),
                 "busy_responses": busy, "partials": partials}
 
@@ -270,15 +274,27 @@ def main() -> int:
                     with connect(base_url.replace("http://", "ws://") + "/stream",
                                  ping_interval=None, proxy=None, max_size=4 * 1024 * 1024) as ws:
                         connect_ms = (time.perf_counter() - connect_start) * 1000
+                        # A transport handshake can finish while StreamSession
+                        # construction still waits on the model runtime lock.
+                        # Require application readiness before starting the
+                        # competing upload or the idle/mixed comparison may
+                        # include a new-session admission delay.
+                        ready_start = time.perf_counter()
+                        ws.send('{"type":"ping"}')
+                        ready_reply = json.loads(ws.recv(timeout=20))
+                        if ready_reply.get("type") != "pong":
+                            raise RuntimeError(f"WS application readiness failed: {ready_reply}")
+                        ready_ms = (time.perf_counter() - ready_start) * 1000
                         if scenario == "idle":
                             short = ws_short_commit(ws, short_audio,
                                                     spec["trial_timeout_seconds"],
                                                     spec["busy_retry_seconds"])
                             trial = {"scenario": scenario, "pair": index // 2,
-                                     "ws_connect_ms": connect_ms, "short": short}
+                                     "ws_connect_ms": connect_ms,
+                                     "ws_app_ready_ms": ready_ms, "short": short}
                         else:
                             request_id = f"pilot-long-{index // 2}"
-                            print(f"[mixed {index // 2}] WS connected; starting long HTTP", flush=True)
+                            print(f"[mixed {index // 2}] WS app ready; starting long HTTP", flush=True)
                             long_future = pool.submit(http_upload, base_url, long_audio,
                                                       request_id, spec["trial_timeout_seconds"])
                             wait_for_trace(log_path, request_id, "queue_wait", 30)
@@ -287,7 +303,9 @@ def main() -> int:
                                                     spec["busy_retry_seconds"], long_future)
                             long = long_future.result(timeout=spec["trial_timeout_seconds"])
                             trial = {"scenario": scenario, "pair": index // 2,
-                                     "ws_connect_ms": connect_ms, "short": short, "long": long}
+                                     "ws_connect_ms": connect_ms,
+                                     "ws_app_ready_ms": ready_ms,
+                                     "short": short, "long": long}
                     trial_events = trace_events(log_path, offset)
                     trial["short_trace"] = {
                         "service_ms": [e["dur_ms"] for e in trial_events
