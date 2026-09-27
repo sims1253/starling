@@ -25,7 +25,7 @@ The eight protected-span cases in `tests/fixtures/s1_quant_spans.json` were
 held out from calibration. On CPU, all eight candidate outputs matched the
 BF16 outputs byte for byte: no pre-existing or new protected-span violations.
 The fixture file SHA256 was
-`3042f4bb2818b94add656b232717eda4a46f92dda90c25d06227280b4844f500`.
+`ef9184b34e51f45ce179026afa675f38975eadae560af1e3a20c00f82cfdb4a5`.
 
 These eight English cases are a functional pilot, not a release quality gate.
 Issue #310's broader protected-span workload, Pixel latency/energy, and the
@@ -61,5 +61,7 @@ Run `benchmarks/s1/quant_spans.py run` once per model with `--source` set to
 the BF16 GGUF, `--library` set to the same native library, and distinct
 `--json` paths; then run `quant_spans.py compare --baseline ... --candidate
 ...`. The records include exact model, source, engine, and fixture hashes,
-backend identity, outputs, and protected-span results. The comparator checks
-the supplied fixture file and recomputes span results from each output.
+backend identity, outputs, and protected-span results. The runner checks that
+ctypes loaded the requested native library before inference and hashes that
+loaded file. The comparator checks the supplied fixture file and recomputes
+span results from each output.

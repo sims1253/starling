@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "benchmarks/s1"))
-from quant_spans import audit_output, check_cases, compare
+from quant_spans import audit_output, check_cases, compare, verified_library_path
 
 
 def _digest(value):
@@ -24,7 +24,8 @@ def test_cases_parse_and_have_unique_labels():
 
 
 @pytest.mark.parametrize("case_id,label,valid,mutants", [
-    ("amount_correction", "corrected_amount", "$45", ["145", "$145", "forty fives"]),
+    ("amount_correction", "corrected_amount", "$45", [
+        "145", "$145", "forty fives", "$45.50", "$45,000", "45.01"]),
     ("email_address", "address", "alex.chen@example.org",
      ["alex.chen@example.org.evil", "malex.chen@example.org"]),
     ("url", "link", "example.org/pricing",
@@ -36,6 +37,27 @@ def test_protected_spans_reject_seeded_boundary_mutants(case_id, label, valid, m
     assert audit_output(case, valid)[label]
     for mutant in mutants:
         assert not audit_output(case, mutant)[label], mutant
+
+
+def test_corrected_amount_accepts_zero_cents_and_sentence_punctuation():
+    cases = json.loads((Path(__file__).resolve().parent / "fixtures/s1_quant_spans.json").read_text())
+    case = next(case for case in cases if case["id"] == "amount_correction")
+    for output in ("$45.", "$45.00", "45, then we stopped."):
+        assert audit_output(case, output)["corrected_amount"], output
+
+
+def test_requested_library_must_match_loaded_fallback(tmp_path, monkeypatch):
+    from starling._ggml import _native
+
+    requested = tmp_path / "requested.so"
+    fallback = tmp_path / "fallback.so"
+    requested.write_bytes(b"requested")
+    fallback.write_bytes(b"fallback")
+    monkeypatch.setattr(_native, "_load_lib", lambda: type("Lib", (), {"_name": str(fallback)})())
+    with pytest.raises(RuntimeError, match="requested native library"):
+        verified_library_path(requested)
+    monkeypatch.setattr(_native, "_load_lib", lambda: type("Lib", (), {"_name": str(requested)})())
+    assert verified_library_path(requested) == requested.resolve()
 
 
 def test_comparison_counts_new_and_preexisting_violations():

@@ -52,6 +52,18 @@ def audit_output(case: dict, output: str) -> dict[str, bool]:
             for label, pattern in case["spans"].items()}
 
 
+def verified_library_path(requested: Path) -> Path:
+    """Resolve the library selected by ctypes and require the requested file."""
+    from starling._ggml import _native
+
+    loaded = _native._load_lib()
+    name = getattr(loaded, "_name", None)
+    actual = Path(name).resolve() if name else None
+    if actual != requested.resolve():
+        raise RuntimeError(f"requested native library {requested}, but loaded {actual}")
+    return actual
+
+
 def run(model: Path, source: Path, cases_path: Path, device: str, library: Path) -> dict:
     from starling._ggml import GgmlModel, S1
     from starling._ggml._native import backend_name
@@ -60,6 +72,7 @@ def run(model: Path, source: Path, cases_path: Path, device: str, library: Path)
     check_cases(cases)
     os.environ["STARLING_GGML_DEVICE"] = device
     os.environ["STARLING_GGML_LIB"] = str(library.resolve())
+    loaded_library = verified_library_path(library)
     engine = GgmlModel(S1, str(model.resolve()))
     try:
         actual = backend_name()
@@ -77,7 +90,7 @@ def run(model: Path, source: Path, cases_path: Path, device: str, library: Path)
         "model_sha256": sha256_file(model),
         "model_bytes": model.stat().st_size,
         "source_sha256": sha256_file(source),
-        "engine_sha256": sha256_file(library),
+        "engine_sha256": sha256_file(loaded_library),
         "cases_sha256": sha256_file(cases_path),
         "device": actual,
         "results": outputs,

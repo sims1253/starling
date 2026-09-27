@@ -11,7 +11,7 @@
     "id": "amount_correction",
     "transcript": "the total is forty two dollars no wait forty five dollars",
     "spans": {
-      "corrected_amount": "(?:(?<![\\w$])\\$?45(?!\\w)|\\bforty[- ]five\\b)"
+      "corrected_amount": "(?:(?<![\\w$])\\$?45(?:\\.0+)?(?!\\w|\\.\\d|,\\d)|\\bforty[- ]five\\b)"
     }
   },
   {
