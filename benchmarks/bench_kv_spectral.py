@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -60,7 +61,7 @@ def gather_calibration_clips(max_clips: int,
     if audio_paths:
         for path in audio_paths[:max_clips]:
             a, sr = _read_wav_mono(str(path))
-            clips.append((a, sr, str(path)))
+            clips.append((a, sr, path.name))
         return clips
     corpus_dir = REPO_ROOT / "tests" / "fixtures" / "leaderboard_corpus"
     if corpus_dir.exists():
@@ -332,7 +333,8 @@ def pca_layer(train: torch.Tensor, held_out: torch.Tensor,
 # Per-model measurement
 # =========================================================================== #
 @torch.inference_mode()
-def measure_granite(clips: list[tuple[np.ndarray, int, str]]) -> dict[str, Any]:
+def measure_granite(clips: list[tuple[np.ndarray, int, str]],
+                    snapshot: Path | None = None) -> dict[str, Any]:
     for _, sr, name in clips:
         if sr != 16000:
             raise ValueError(f"Granite clip {name} has sample rate {sr}; expected 16000 Hz")
@@ -341,7 +343,14 @@ def measure_granite(clips: list[tuple[np.ndarray, int, str]]) -> dict[str, Any]:
 
     print("\n=== GRANITE encoder ===", flush=True)
     print("loading granite model ...", flush=True)
-    model, processor = load_model_and_processor()
+    if snapshot is None:
+        model, processor = load_model_and_processor()
+    else:
+        from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
+        model = AutoModelForSpeechSeq2Seq.from_pretrained(
+            snapshot, device_map="cuda", dtype=torch.bfloat16,
+            attn_implementation="eager").eval()
+        processor = AutoProcessor.from_pretrained(snapshot)
     comps = get_components(model)
     encoder = comps["encoder"]
     dtype = model.dtype
@@ -389,6 +398,7 @@ def measure_granite(clips: list[tuple[np.ndarray, int, str]]) -> dict[str, Any]:
 
     summary = _summarise(layers_out, head_dim, thresholds)
     summary["model"] = "granite-speech-4.1-2b"
+    summary["source_snapshot"] = snapshot.name if snapshot is not None else "default HF revision"
     summary["num_layers"] = len(layers_out)
     summary["num_heads"] = num_heads
     summary["head_dim"] = head_dim
@@ -487,6 +497,8 @@ def main() -> int:
                     help="comma list: granite,qwen3 (default both)")
     ap.add_argument("--audio", type=Path, nargs="+",
                     help="explicit local WAV files; at least two clips are required")
+    ap.add_argument("--granite-snapshot", type=Path,
+                    help="pinned local Granite HF snapshot directory for reproducible loading")
     args = ap.parse_args()
 
     models = [m.strip() for m in args.models.split(",") if m.strip()]
@@ -502,6 +514,10 @@ def main() -> int:
     if len(clips) < 2:
         print("ERROR: at least two clips are needed for held-out evaluation", file=sys.stderr)
         return 1
+    if args.granite_snapshot is not None and not args.granite_snapshot.is_dir():
+        ap.error("--granite-snapshot must be an existing directory")
+    if args.audio and len({p.name for p in args.audio[:len(clips)]}) != len(clips):
+        ap.error("--audio filenames must be distinct for portable result hashes")
 
     thresholds = (0.95, 0.99, 0.999)
     results: dict[str, Any] = {
@@ -511,9 +527,14 @@ def main() -> int:
         "train_clip_names": [clips[i][2] for i in range(0, len(clips), 2)],
         "held_out_clip_names": [clips[i][2] for i in range(1, len(clips), 2)],
     }
+    if args.audio:
+        results["audio_sha256"] = {
+            path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in args.audio[:len(clips)]
+        }
 
     if "granite" in models:
-        results["granite"] = measure_granite(clips)
+        results["granite"] = measure_granite(clips, args.granite_snapshot)
     if "qwen3" in models:
         results["qwen3"] = measure_qwen3(clips)
 
