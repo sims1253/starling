@@ -180,10 +180,12 @@ def main() -> int:
     parser.add_argument("--long-wav", type=Path, required=True)
     parser.add_argument("--out-dir", type=Path, default=ROOT / "outputs" / "contention-pilot")
     parser.add_argument("--cpu-list", default="16-23", help="taskset CPU list for the server")
+    parser.add_argument("--spec", type=Path, default=SPEC_PATH,
+                        help="committed per-run spec with exact binary/model/audio hashes")
     parser.add_argument("--diagnostics-only", action="store_true",
                         help="post-pilot serial long control and new-session admission probe")
     args = parser.parse_args()
-    spec = json.loads(SPEC_PATH.read_text())
+    spec = json.loads(args.spec.read_text())
     for name, path, key in (
         ("server", args.binary, "server_binary_sha256"),
         ("model", args.gguf, "model_sha256"),
@@ -203,7 +205,7 @@ def main() -> int:
     command = ["taskset", "-c", args.cpu_list, str(args.binary), "--model", "granite",
                "--gguf", str(args.gguf), "--port", str(port)]
     summary = {
-        "schema_version": 1, "spec_sha256": sha256_file(SPEC_PATH),
+        "schema_version": 1, "spec_sha256": sha256_file(args.spec),
         "run_utc": datetime.now(timezone.utc).isoformat(), "cpu_affinity": args.cpu_list,
         "host_load_before": os.getloadavg(), "binary": str(args.binary),
         "model": str(args.gguf), "server_command": command, "trials": [],
