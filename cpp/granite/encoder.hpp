@@ -24,6 +24,14 @@ struct AudioEmbeds {
 bool encode_audio_and_project(const GraniteModel& model, const MelFeatures& mel,
                               AudioEmbeds& out, std::string& err);
 
+// Offline/native parity path for the optional BPE CTC head. Returns tokenizer
+// IDs (CTC label 0 is blank; all other labels are mapped to label - 1).
+// This does not change greedy transcription or its graph cache. A one-shot
+// encoder graph returns the pre-feedback mid CTC logits and final hidden
+// state, then projects the importance-weighted 4-frame pools.
+bool extract_ctc_draft(const GraniteModel& model, const MelFeatures& mel,
+                       std::vector<int32_t>& token_ids, std::string& err);
+
 // Current number of cached fused encoder graphs (diagnostic). Zero on CPU /
 // before first GPU encode.
 size_t encoder_replay_cache_size(const GraniteModel& model);

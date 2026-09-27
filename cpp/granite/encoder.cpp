@@ -288,7 +288,7 @@ ggml_tensor* conv_module(ggml_context* c, const GraniteModel& m, int li,
 // One conformer block + the mid-CTC hook.
 ggml_tensor* conformer_block(ggml_context* c, const GraniteModel& m, int li,
                              ggml_tensor* x, const EncScratch& s,
-                             StageStop* stop) {
+                             StageStop* stop, ggml_tensor** ctc_mid) {
     const auto& ec = m.config.encoder;
     const ModelLoader& ml = m.loader;
     const std::string p = "enc.blk." + std::to_string(li) + ".";
@@ -322,6 +322,7 @@ ggml_tensor* conformer_block(ggml_context* c, const GraniteModel& m, int li,
     if ((int) li + 1 == (int) ec.mid_layer) {
         // Self-conditioned mid CTC: x += out_mid(softmax(out(x))).
         ggml_tensor* mid = lib::linear_bf16(c, ml, x, "enc.out", true);   // [348, T]
+        if (ctc_mid) *ctc_mid = mid;
         ggml_tensor* pr = bf16(c, ggml_soft_max_ext(c, f32(c, mid), nullptr, 1.0f, 0.0f));
         ggml_tensor* fb = lib::linear_bf16(c, ml, pr, "enc.out_mid", true);
         x = lib::addb(c, x, fb);
@@ -339,9 +340,18 @@ ggml_tensor* build_fused(ggml_context* c, const GraniteModel& m, ggml_tensor* me
     ggml_tensor* x = lib::linear_bf16(c, m.loader, mel_in, "enc.input_linear", true);
     if (stage_wants(stop->name, "melin")) { stop->hit = true; return f32(c, mel_in); }
     if (stage_wants(stop->name, "in")) { stop->hit = true; return f32(c, x); }
+    ggml_tensor* ctc_mid = nullptr;
     for (uint32_t li = 0; li < ec.n_layers; ++li) {
-        x = conformer_block(c, m, (int) li, x, s, stop);
+        x = conformer_block(c, m, (int) li, x, s, stop,
+                            stage_wants(stop->name, "ctc_bundle") ? &ctc_mid : nullptr);
         if (stop->hit) return f32(c, x);
+    }
+    if (stage_wants(stop->name, "ctc_bundle")) {
+        // The graph's real output includes both required tensors. No side-node
+        // readback is used, and the encoder runs only once for a draft.
+        if (!ctc_mid) return f32(c, x);  // invalid mid-layer metadata -> caller error
+        stop->hit = true;
+        return ggml_concat(c, f32(c, ctc_mid), f32(c, x), 0);
     }
     if (enc_capture) capture_graph_output(f32(c, x), enc_capture);
     return f32(c, build_projector(c, m, x, s));
@@ -487,6 +497,91 @@ bool encode_audio_and_project(const GraniteModel& model, const MelFeatures& mel,
     out.data = std::move(tmp);
     out.n_tokens = N;
     out.width = pc.output_dim;
+    return true;
+}
+
+bool extract_ctc_draft(const GraniteModel& model, const MelFeatures& mel,
+                       std::vector<int32_t>& token_ids, std::string& err) {
+    token_ids.clear();
+    const auto& ec = model.config.encoder;
+    if (!model.loader.tensor("ctc.out_llm.weight") ||
+        !model.loader.tensor("ctc.out_llm.bias")) {
+        err = "GRANITE GGUF has no optional CTC draft head";
+        return false;
+    }
+    if (mel.n_mels != (int64_t)ec.input_dim || mel.n_frames <= 0 ||
+        mel.data.size() != (size_t)mel.n_mels * mel.n_frames) {
+        err = "invalid GRANITE mel shape/data for CTC draft";
+        return false;
+    }
+    ensure_weights_realized(model.loader);
+    const int64_t T = mel.n_frames;
+    EncScratch scratch = make_scratch(model.config, T);
+    // Both required tensors become a single graph output. Capturing a side
+    // node is not a numeric oracle on every backend, and this one-shot graph
+    // cannot poison the normal fused encoder replay cache.
+    StageStop stop{"ctc_bundle"};
+    std::vector<float> bundle;
+    const bool stage_ok = run_graph([&](ggml_context* c) -> ggml_tensor* {
+        int64_t mne[2] = {ec.input_dim, T};
+        ggml_tensor* mel_in = graph_input_tensor(c, GGML_TYPE_BF16, 2, mne,
+            mel.data.data(), mel.data.size() * sizeof(mel.data[0]));
+        return build_fused(c, model, mel_in, scratch, nullptr, &stop);
+    }, bundle);
+    const size_t stride = (size_t)ec.output_dim + ec.hidden;
+    if (!stage_ok || !stop.hit || bundle.size() != stride * (size_t)T) {
+        err = "GRANITE CTC encoder bundle graph failed or returned the wrong shape";
+        return false;
+    }
+
+    constexpr int64_t window = 4;
+    const int64_t P = (T + window - 1) / window;
+    std::vector<float> importance((size_t)T);
+    for (int64_t t = 0; t < T; ++t) {
+        const float* logits = bundle.data() + (size_t)t * stride;
+        float maximum = *std::max_element(logits, logits + ec.output_dim);
+        double denom = 0.0;
+        for (uint32_t j = 0; j < ec.output_dim; ++j)
+            denom += std::exp((double)logits[j] - maximum);
+        importance[(size_t)t] = 1.0f -
+            (float)(std::exp((double)logits[0] - maximum) / denom);
+    }
+    std::vector<ggml_bf16_t> pooled((size_t)P * ec.hidden);
+    for (int64_t p = 0; p < P; ++p) {
+        float denom = 1e-8f;
+        for (int64_t j = 0; j < window && p * window + j < T; ++j)
+            denom += importance[(size_t)(p * window + j)];
+        for (uint32_t d = 0; d < ec.hidden; ++d) {
+            float sum = 0.0f;
+            for (int64_t j = 0; j < window && p * window + j < T; ++j) {
+                const int64_t t = p * window + j;
+                sum += bundle[(size_t)t * stride + ec.output_dim + d] *
+                    (importance[(size_t)t] / denom);
+            }
+            pooled[(size_t)p * ec.hidden + d] = ggml_fp32_to_bf16(sum);
+        }
+    }
+
+    std::vector<float> labels;
+    const bool ok = run_graph([&](ggml_context* c) -> ggml_tensor* {
+        int64_t pne[2] = {ec.hidden, P};
+        ggml_tensor* in = graph_input_tensor(c, GGML_TYPE_BF16, 2, pne,
+            pooled.data(), pooled.size() * sizeof(pooled[0]));
+        ggml_tensor* logits = lib::linear_bf16(c, model.loader, in,
+                                                "ctc.out_llm", true);
+        return f32(c, ggml_argmax(c, f32(c, logits)));
+    }, labels);
+    if (!ok || labels.size() != (size_t)P) {
+        err = "GRANITE CTC BPE head graph failed or returned the wrong shape";
+        return false;
+    }
+    int32_t previous = -1;
+    for (float value : labels) {
+        const int32_t label = (int32_t)value;
+        if (label != previous && label > 0)
+            token_ids.push_back(label - 1);
+        previous = label;
+    }
     return true;
 }
 
