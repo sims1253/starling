@@ -12,8 +12,17 @@ enum Command {
     Commit,
 }
 
+/// One partial: the whole running transcript and how many of its leading
+/// words the server will never change (0 from a server that predates the
+/// field, which makes the whole text one live segment).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Partial {
+    pub text: String,
+    pub stable_words: usize,
+}
+
 pub(crate) enum Event {
-    Partial(String),
+    Partial(Partial),
     Final(TranscriptionResult),
     Error(String),
 }
@@ -135,7 +144,7 @@ impl LiveStream {
         self.commands.try_send(Command::Commit).is_ok()
     }
 
-    pub(crate) fn poll_partial(&self) -> Result<Option<String>, String> {
+    pub(crate) fn poll_partial(&self) -> Result<Option<Partial>, String> {
         let mut latest = None;
         while let Ok(event) = self.events.try_recv() {
             match event {
@@ -174,7 +183,15 @@ fn parse_message(text: &str) -> Option<Event> {
         Some("partial") => payload
             .get("text")
             .and_then(Value::as_str)
-            .map(|text| Event::Partial(text.to_string())),
+            .map(|text| {
+                Event::Partial(Partial {
+                    text: text.to_string(),
+                    stable_words: payload
+                        .get("stable_words")
+                        .and_then(Value::as_u64)
+                        .map_or(0, |count| count as usize),
+                })
+            }),
         Some("error") => Some(Event::Error(
             payload
                 .get("message")
@@ -239,6 +256,20 @@ mod tests {
         match parse_message(r#"{"type":"final","text":"hello","segments":[],"duration_s":1.5}"#) {
             Some(Event::Final(result)) => assert_eq!(result.text, "hello"),
             _ => panic!("expected final"),
+        }
+        match parse_message(r#"{"type":"partial","text":"a b c","stable_words":2}"#) {
+            Some(Event::Partial(partial)) => assert_eq!(
+                partial,
+                Partial {
+                    text: "a b c".into(),
+                    stable_words: 2
+                }
+            ),
+            _ => panic!("expected partial"),
+        }
+        match parse_message(r#"{"type":"partial","text":"a b"}"#) {
+            Some(Event::Partial(partial)) => assert_eq!(partial.stable_words, 0),
+            _ => panic!("expected partial"),
         }
         assert_eq!(exact_input_quantum(44_100), 441);
         assert_eq!(exact_input_quantum(48_000), 3);

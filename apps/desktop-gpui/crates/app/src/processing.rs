@@ -357,7 +357,7 @@ pub(crate) struct TakeProcessing {
 }
 
 impl TakeProcessing {
-    fn from_doc(doc: &ProcessingDoc) -> TakeProcessing {
+    pub(crate) fn from_doc(doc: &ProcessingDoc) -> TakeProcessing {
         let latest = doc
             .proposals
             .iter()
@@ -382,7 +382,7 @@ impl TakeProcessing {
 }
 
 /// Resumes the take's draft from its processing document.
-fn draft_from_doc(id: &str, doc: &ProcessingDoc) -> Draft {
+pub(crate) fn draft_from_doc(id: &str, doc: &ProcessingDoc) -> Draft {
     let proposals = doc
         .proposals
         .iter()
@@ -544,6 +544,10 @@ impl StarlingApp {
     /// (a re-transcription) no longer applies, whether or not the mode
     /// processes the new one.
     pub(crate) fn after_transcription(&mut self, id: String, cx: &mut Context<Self>) {
+        // A staged take rebases its draft instead (#297).
+        if self.staged_transcript(&id, cx) {
+            return;
+        }
         self.processing.remove(&id);
         self.drafts.remove(&id);
         self.processing_loading.remove(&id);
@@ -707,9 +711,11 @@ impl StarlingApp {
                     }
                     // Keep the live draft when it is still this document
                     // (it knows the requests in flight); otherwise resume.
+                    // A draft ahead of the stored head is the staging
+                    // editor's, with edits not yet written (#297).
                     let mut draft = match app.drafts.remove(&id) {
                         Some(draft)
-                            if draft.revision() == doc.head_revision
+                            if draft.revision() >= doc.head_revision
                                 && draft.attempts().first().map(|a| a.attempt_id.as_str())
                                     == Some(doc.raw_attempt_id.as_str()) =>
                         {
@@ -883,6 +889,7 @@ impl StarlingApp {
     /// Forgets a take's processing (it is being deleted): the job is
     /// cancelled and its draft deleted, so a late result is discarded.
     pub(crate) fn drop_processing(&mut self, id: &str) {
+        self.drop_staging_for(id);
         if let Some((_, cancel)) = self.processing_jobs.remove(id) {
             cancel.cancel();
         }
@@ -1053,7 +1060,7 @@ impl StarlingApp {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn persist_head(
+    pub(crate) fn persist_head(
         &mut self,
         store: crate::store::Store,
         id: String,

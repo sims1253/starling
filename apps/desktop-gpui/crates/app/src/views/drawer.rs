@@ -322,6 +322,10 @@ fn processing_block(
     scale: gpui::Pixels,
     cx: &mut Context<StarlingApp>,
 ) -> Option<gpui::Stateful<Div>> {
+    // The staging panel shows this take's processing next to its text.
+    if app.staging_shows(id) {
+        return None;
+    }
     let take = app.processing.get(id).cloned();
     let processes = app.mode_processes();
     if take.is_none() && !processes {
@@ -444,7 +448,7 @@ fn processing_block(
         if !matches!(take.as_ref().map(|t| &t.state), Some(ProcessingState::Proposal { .. })) {
             block = block
                 .child(note(
-                    "Copy and Export use this processed text.".to_string(),
+                    "Copy and Export use this text, not the raw transcript.".to_string(),
                     theme::PAPER_SUBTLE,
                 ))
                 .child(

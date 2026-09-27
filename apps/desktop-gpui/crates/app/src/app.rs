@@ -10,8 +10,8 @@ use std::{
 };
 
 use gpui::{
-    AppContext, ClipboardItem, Context, Entity, FocusHandle, Pixels, Render, Timer, Window,
-    actions, div, prelude::*,
+    AppContext, ClipboardItem, Context, Entity, FocusHandle, Focusable, Pixels, Render, Timer,
+    Window, actions, div, prelude::*,
 };
 use starling_dictation::{
     client::{self, StarlingClient},
@@ -430,7 +430,16 @@ pub struct StarlingApp {
 
     pub recorder: Option<RecorderHandle>,
     pub(crate) live_stream: Option<LiveStream>,
+    /// The live line a direct-mode take shows while recording.
     pub(crate) live_partial: String,
+    /// The staging panel (#297) and stagings whose transcript is still
+    /// pending after the panel moved on.
+    pub(crate) staging: Option<crate::staging::Staging>,
+    pub(crate) background_stagings: Vec<crate::staging::Staging>,
+    pub(crate) next_staging_token: u64,
+    /// Focus changes asked for outside a render (which has the window).
+    pub(crate) focus_staging_pending: bool,
+    pub(crate) focus_root_pending: bool,
     pub(crate) streamed_samples: Vec<f32>,
     pub(crate) stream_sent_samples: usize,
     /// Set when live streaming died mid-recording: the partial view going
@@ -891,6 +900,11 @@ impl StarlingApp {
             recorder: None,
             live_stream: None,
             live_partial: String::new(),
+            staging: None,
+            background_stagings: Vec::new(),
+            next_staging_token: 0,
+            focus_staging_pending: false,
+            focus_root_pending: false,
             streamed_samples: Vec::new(),
             stream_sent_samples: 0,
             stream_degradation: None,
@@ -1813,6 +1827,7 @@ impl Render for StarlingApp {
             }
         }
 
+        let mut staged_partial = None;
         if let Some(handle) = self.recorder.as_mut() {
             if let Some(stream) = self.live_stream.as_ref() {
                 let mut stream_failed = false;
@@ -1862,7 +1877,10 @@ impl Render for StarlingApp {
                     }
                 }
                 match stream.poll_partial() {
-                    Ok(Some(text)) => self.live_partial = text,
+                    Ok(Some(partial)) if self.staging.is_some() => {
+                        staged_partial = Some(partial);
+                    }
+                    Ok(Some(partial)) => self.live_partial = partial.text,
                     Err(reason) => {
                         self.stream_degradation = Some(format!(
                             "Live transcription stopped mid-recording ({reason}). The full \
@@ -1881,6 +1899,18 @@ impl Render for StarlingApp {
             self.levels = fft::waveform_levels(&magnitudes, 52);
             self.elapsed_ms = handle.elapsed().as_secs_f64() * 1000.0;
             window.request_animation_frame();
+        }
+        if let Some(partial) = staged_partial {
+            self.staging_partial(partial, cx);
+        }
+
+        if std::mem::take(&mut self.focus_staging_pending) {
+            if let Some(staging) = self.staging.as_ref() {
+                window.focus(&staging.editor.focus_handle(cx));
+            }
+        }
+        if std::mem::take(&mut self.focus_root_pending) {
+            window.focus(&self.root_focus);
         }
 
         let has_transcript = self.selected().is_some();

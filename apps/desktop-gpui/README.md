@@ -69,6 +69,29 @@ build-cpu/starling-serve --model ark \
 The model list supplies the topbar's model name. Batch transcription returns
 `{text}` and echoes a request ID in the response header.
 
+## Staging panel
+
+In a staged mode (every built-in mode), the take's transcript appears in an
+editable draft under the recorder while you speak (#297). Grey italic words
+are the live tail and may still change; the server marks older words stable
+(`stable_words` on `/stream` partials) and they become final. Anything you
+type or delete is yours: live updates never overwrite it, and later speech
+lands after your edit. Once the take is saved, the edited text is its head
+(what Copy and Export use) and is written shortly after you stop typing; the
+raw transcript stays in history and "Back to raw" restores it. A processing
+result shows up next to the draft as a proposal with its time, never inside
+it; "Use processed" is one undo step.
+
+Keys inside the draft: Ctrl+Backspace deletes a word, Ctrl+Shift+K a visual
+line, Ctrl+Left/Right jump by word, Home/End/Up/Down move by visual line,
+Ctrl+Z / Ctrl+Shift+Z undo and redo, Ctrl+Enter is Done, Escape leaves the
+draft (Cmd instead of Ctrl for the Secondary keys on macOS). The recording
+shortcut keeps working while the draft has focus.
+
+Edits made while recording live in memory until the take is saved (the
+audio is journaled as always). Inserting into another app is #221; for now
+the draft's delivery is Copy.
+
 ## Hotkeys
 
 `Cmd/Ctrl+Shift+Space` toggles recording — focused (in-app action) and
