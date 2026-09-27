@@ -46,10 +46,12 @@ python benchmarks/s1/collect_imatrix.py \
   --output models/s1-mini-calibration.imx \
   --library build-cpu/libstarling_ggml.so
 python -m quants.starling_quants plan s1-mini-q4-k-m \
+  --binary build-cpu/starling-quantize \
   --input models/s1-mini-bf16-exact.gguf \
   --output models/s1-mini-q4-k-m.gguf \
   --imatrix models/s1-mini-calibration.imx
 python -m quants.starling_quants build s1-mini-q4-k-m \
+  --binary build-cpu/starling-quantize \
   --input models/s1-mini-bf16-exact.gguf \
   --output models/s1-mini-q4-k-m.gguf \
   --imatrix models/s1-mini-calibration.imx
