@@ -190,7 +190,12 @@ Cancels a queued or in-flight request by request ID.
 Real-time streaming dictation. Send binary frames (raw PCM16 or WAV) and
 receive JSON messages:
 
-- `{"type":"partial","text":"...","start_s":0.0,"end_s":12.5}`: growing partial
+- `{"type":"partial","text":"...","start_s":0.0,"end_s":12.5,"stable_words":40}`: growing partial.
+  The first `stable_words` whitespace-separated words of `text` are fixed:
+  every later partial and the final start with exactly those words, so a
+  client may treat them as final while the take is still being spoken (the
+  desktop staging editor does). The count only grows, and it is 0 in the
+  whole-buffer mode (`--stream-chunk-seconds 0`).
 - `{"type":"final","text":"...","segments":[...],"duration_s":12.5}`: on commit
 - `{"type":"error","message":"..."}`: on error
 - `{"type":"pong"}`: in response to `{"type":"ping"}`

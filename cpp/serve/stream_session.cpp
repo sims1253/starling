@@ -307,6 +307,24 @@ ChunkStreamer::ChunkStreamer(int sample_rate, double chunk_seconds,
     max_overlap_words_ = std::max(8, static_cast<int>(overlap_seconds * 6) + 6);
 }
 
+std::vector<std::string> ChunkStreamer::stitched(
+    const std::vector<std::string>& new_words) const {
+    // Stitch against the unfrozen tail only: the frozen prefix was already
+    // reported stable, so no alignment may cut into it.
+    std::vector<std::string> tail(committed_.begin() + frozen_, committed_.end());
+    tail = stitch_words(tail, new_words, max_overlap_words_);
+    std::vector<std::string> result(committed_.begin(), committed_.begin() + frozen_);
+    result.insert(result.end(), tail.begin(), tail.end());
+    return result;
+}
+
+void ChunkStreamer::commit(const std::vector<std::string>& new_words) {
+    committed_ = stitched(new_words);
+    const int64_t reachable =
+        static_cast<int64_t>(committed_.size()) - max_overlap_words_;
+    frozen_ = std::max(frozen_, reachable);
+}
+
 bool ChunkStreamer::finalize_full_windows(
     const std::vector<float>& samples, const TranscribeFn& tx) {
     bool did = false;
@@ -315,8 +333,7 @@ bool ChunkStreamer::finalize_full_windows(
         int64_t len = chunk_;
         auto text = tx(samples.data() + start, len);
         if (!text.has_value()) break;  // busy → stop, boundary unchanged
-        committed_ = stitch_words(committed_, split_words(*text),
-                                  max_overlap_words_);
+        commit(split_words(*text));
         boundary_ += advance_;
         did = true;
     }
@@ -345,8 +362,7 @@ std::optional<std::string> ChunkStreamer::step(
             return finalized ? std::optional<std::string>(join_words(committed_))
                              : std::nullopt;
         }
-        return join_words(stitch_words(committed_, split_words(*text),
-                                       max_overlap_words_));
+        return join_words(stitched(split_words(*text)));
     }
     return finalized ? std::optional<std::string>(join_words(committed_))
                      : std::nullopt;
@@ -365,8 +381,7 @@ std::optional<std::string> ChunkStreamer::flush(
         if (tail_len > 0 && tail_len < chunk_) {
             auto text = tx(samples.data() + boundary_, tail_len);
             if (text.has_value()) {
-                committed_ = stitch_words(committed_, split_words(*text),
-                                          max_overlap_words_);
+                commit(split_words(*text));
                 boundary_ = static_cast<int64_t>(samples.size());
                 return join_words(committed_);
             }
@@ -379,6 +394,7 @@ std::optional<std::string> ChunkStreamer::flush(
 
 void ChunkStreamer::reset() {
     committed_.clear();
+    frozen_ = 0;
     boundary_ = 0;
     last_emit_ = 0.0;
 }

@@ -266,6 +266,52 @@ static void test_chunk_streamer_unicode_boundary() {
     CHECK(cs.boundary() == 8000);
 }
 
+// ---- ChunkStreamer::stable_words -------------------------------------------
+// The stable prefix is a promise to streaming clients (#297): the first
+// stable_words() words of every later partial and of the final never change.
+static void test_chunk_streamer_stable_prefix_never_changes() {
+    // chunk 1 s, overlap 0.25 s: max_overlap_words = 8.
+    ChunkStreamer cs(16000, 1.0, 0.25, 0.5, 0.0);
+    int call = 0;
+    // Window 1 commits twelve words (a0..a3 frozen). Window 2 re-hears the
+    // two words right after the frozen prefix and little else, so the
+    // stitch keeps only up to them and the text shrinks to seven words.
+    // Window 3 then aligns on "a1 a2": a plain stitch over the last eight
+    // words would keep a0..a2 and drop the frozen "a3".
+    TranscribeFn tx = [&](const float*, int64_t) -> std::optional<std::string> {
+        ++call;
+        switch (call) {
+            case 1: return std::string("a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11");
+            case 2: return std::string("a4 a5 b0");
+            case 3: return std::string("a1 a2 c0 c1");
+            default: return std::string("d0 d1 d2 d3 d4 d5 d6 d7 d8 d9");
+        }
+    };
+    std::vector<std::string> prefix;
+    int64_t stable = 0;
+    std::vector<float> samples;
+    auto check = [&](const std::optional<std::string>& text) {
+        CHECK(cs.stable_words() >= stable);
+        if (!text) return;
+        auto words = split_words(*text);
+        CHECK(static_cast<int64_t>(words.size()) >= cs.stable_words());
+        for (size_t i = 0; i < prefix.size() && i < words.size(); ++i) {
+            CHECK(words[i] == prefix[i]);
+        }
+        stable = cs.stable_words();
+        prefix.assign(words.begin(), words.begin() + stable);
+    };
+    for (int step = 1; step <= 5; ++step) {
+        samples.resize(static_cast<size_t>(12000 * step + 4000), 0.0f);
+        check(cs.step(samples, static_cast<double>(step), tx));
+    }
+    check(cs.flush(samples, tx));
+    CHECK(stable >= 4);
+    CHECK(prefix.size() >= 4 && prefix[3] == "a3");
+    cs.reset();
+    CHECK(cs.stable_words() == 0);
+}
+
 // ---- model slug mapping tests ---------------------------------------------
 static void test_model_mapping() {
     CHECK(slug_to_model("parakeet") == STARLING_GGML_PARAKEET_TDT);
@@ -1289,6 +1335,7 @@ int main() {
     test_chunk_streamer_flush();
     test_chunk_streamer_unicode_boundary();
     test_chunk_streamer_rebase();
+    test_chunk_streamer_stable_prefix_never_changes();
     test_stream_session_buffer_trim();
     test_stream_session_busy_retry();
     test_stream_session_append_rejection();

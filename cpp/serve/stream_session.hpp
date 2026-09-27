@@ -105,6 +105,14 @@ public:
     // The sample index up to which audio is fully finalized (for buffer trimming).
     int64_t boundary() const { return boundary_; }
 
+    // How many leading words of every text this streamer returns from now
+    // on are fixed: no later window, tail or flush can change them. Only
+    // the last `max_overlap_words` committed words take part in stitching,
+    // and stitching never reaches below this count, so a client may treat
+    // these words as final while the take is still being spoken. Grows
+    // monotonically; 0 after reset().
+    int64_t stable_words() const { return frozen_; }
+
     // Adjust the boundary after samples are dropped from the front of the buffer.
     // Called by StreamSession::maybe_trim_samples to keep the chunker aligned
     // with the shifted samples_ buffer.
@@ -114,6 +122,10 @@ public:
 
 private:
     bool finalize_full_windows(const std::vector<float>& samples, const TranscribeFn& tx);
+    // committed_ with `new_words` stitched onto its unfrozen tail.
+    std::vector<std::string> stitched(const std::vector<std::string>& new_words) const;
+    // Stitches `new_words` into committed_ and advances frozen_.
+    void commit(const std::vector<std::string>& new_words);
 
     int sr_;
     int chunk_;           // chunk size in samples
@@ -124,6 +136,7 @@ private:
     int max_overlap_words_;
 
     std::vector<std::string> committed_;
+    int64_t frozen_ = 0;    // leading committed_ words stitching never touches
     int64_t boundary_ = 0;  // sample index; audio before this is finalized
     double last_emit_ = 0.0;
 };
@@ -171,6 +184,10 @@ public:
 
     // Advance the chunked stream; returns text to emit as a partial, or nullopt.
     std::optional<std::string> stream_step(double now);
+
+    // The chunker's stable word count (ChunkStreamer::stable_words); 0 in
+    // the legacy whole-buffer mode, where every partial is a fresh guess.
+    int64_t stable_words() const { return chunker_ ? chunker_->stable_words() : 0; }
 
     // Finalize all buffered audio, or nullopt if busy; retain audio for retry.
     std::optional<std::string> stream_flush();
