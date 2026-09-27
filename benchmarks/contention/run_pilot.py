@@ -180,6 +180,8 @@ def main() -> int:
     parser.add_argument("--long-wav", type=Path, required=True)
     parser.add_argument("--out-dir", type=Path, default=ROOT / "outputs" / "contention-pilot")
     parser.add_argument("--cpu-list", default="16-23", help="taskset CPU list for the server")
+    parser.add_argument("--diagnostics-only", action="store_true",
+                        help="post-pilot serial long control and new-session admission probe")
     args = parser.parse_args()
     spec = json.loads(SPEC_PATH.read_text())
     for name, path, key in (
@@ -217,6 +219,47 @@ def main() -> int:
             if warmup.get("status") != 200 or warmup.get("text_sha256") is None:
                 raise RuntimeError(f"warmup failed: {warmup}")
             summary["warmup"] = warmup
+            if args.diagnostics_only:
+                offset = log_path.stat().st_size
+                control = http_upload(base_url, long_audio, "pilot-serial-long",
+                                      spec["trial_timeout_seconds"])
+                events = trace_events(log_path, offset)
+                long_trace = {
+                    "service_ms": [e["dur_ms"] for e in events
+                                   if e.get("ev") == "request" and e.get("req") == "pilot-serial-long"],
+                    "queue_wait_ms": [e["dur_ms"] for e in events
+                                      if e.get("ev") == "queue_wait" and e.get("req") == "pilot-serial-long"],
+                    "chunks": len([e for e in events if e.get("ev") == "chunk"
+                                   and e.get("req") == "pilot-serial-long"]),
+                }
+                summary["serial_long_control"] = {"http": control, "trace": long_trace}
+                print(f"[serial long] {control} trace={long_trace}", flush=True)
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                    future = pool.submit(http_upload, base_url, short_audio,
+                                         "pilot-admission-http", spec["trial_timeout_seconds"])
+                    wait_for_trace(log_path, "pilot-admission-http", "queue_wait", 30)
+                    connect_start = time.perf_counter()
+                    admission = {"http_active_at_connect_start": not future.done()}
+                    try:
+                        with connect(base_url.replace("http://", "ws://") + "/stream",
+                                     ping_interval=None, proxy=None, open_timeout=20) as ws:
+                            admission["connect_ms"] = (time.perf_counter() - connect_start) * 1000
+                            admission["http_active_at_connect_end"] = not future.done()
+                            ws.send('{"type":"ping"}')
+                            pong_start = time.perf_counter()
+                            reply = json.loads(ws.recv(timeout=30))
+                            admission["ping_reply"] = reply.get("type")
+                            admission["ping_ms"] = (time.perf_counter() - pong_start) * 1000
+                            admission["http_active_at_pong"] = not future.done()
+                    except (OSError, ConnectionClosed, TimeoutError, ValueError) as exc:
+                        admission["error"] = str(exc)
+                    admission["http"] = future.result(timeout=spec["trial_timeout_seconds"])
+                    summary["new_session_probe"] = admission
+                    print(f"[new session] {admission}", flush=True)
+                summary["host_load_after"] = os.getloadavg()
+                summary["verdict"] = {"status": "diagnostics_only"}
+                (args.out_dir / "result.json").write_text(json.dumps(summary, indent=2) + "\n")
+                return 0 if control.get("status") == 200 and control.get("text_sha256") else 1
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                 for index, scenario in enumerate(spec["sequence"]):
                     log.flush()
