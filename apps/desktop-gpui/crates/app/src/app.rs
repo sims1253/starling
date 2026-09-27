@@ -437,9 +437,10 @@ pub struct StarlingApp {
     pub(crate) staging: Option<crate::staging::Staging>,
     pub(crate) background_stagings: Vec<crate::staging::Staging>,
     pub(crate) next_staging_token: u64,
-    /// Focus changes asked for outside a render (which has the window).
-    pub(crate) focus_staging_pending: bool,
-    pub(crate) focus_root_pending: bool,
+    /// A focus change asked for outside a render (which has the window).
+    /// The latest request wins: retiring a panel asks for the root, and
+    /// the panel that replaces it in the same frame asks for its editor.
+    pub(crate) pending_focus: Option<PendingFocus>,
     pub(crate) streamed_samples: Vec<f32>,
     pub(crate) stream_sent_samples: usize,
     /// Set when live streaming died mid-recording: the partial view going
@@ -450,6 +451,14 @@ pub struct StarlingApp {
     pub elapsed_ms: f64,
 
     pub diagnostics: Option<(Instant, bool)>,
+}
+
+/// Where the next render moves keyboard focus.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PendingFocus {
+    /// The visible staging panel's editor (the root when there is none).
+    Staging,
+    Root,
 }
 
 /// What a playback poll-watcher does after one tick (G04).
@@ -922,8 +931,7 @@ impl StarlingApp {
             staging: None,
             background_stagings: Vec::new(),
             next_staging_token: 0,
-            focus_staging_pending: false,
-            focus_root_pending: false,
+            pending_focus: None,
             streamed_samples: Vec::new(),
             stream_sent_samples: 0,
             stream_degradation: None,
@@ -1937,15 +1945,13 @@ impl Render for StarlingApp {
             self.staging_partial(partial, cx);
         }
 
-        if std::mem::take(&mut self.focus_staging_pending) {
-            if let Some(staging) = self.staging.as_ref() {
-                window.focus(&staging.editor.focus_handle(cx));
-            } else {
-                window.focus(&self.root_focus);
-            }
-        }
-        if std::mem::take(&mut self.focus_root_pending) {
-            window.focus(&self.root_focus);
+        match self.pending_focus.take() {
+            Some(PendingFocus::Staging) => match self.staging.as_ref() {
+                Some(staging) => window.focus(&staging.editor.focus_handle(cx)),
+                None => window.focus(&self.root_focus),
+            },
+            Some(PendingFocus::Root) => window.focus(&self.root_focus),
+            None => {}
         }
 
         let has_transcript = self.selected().is_some();

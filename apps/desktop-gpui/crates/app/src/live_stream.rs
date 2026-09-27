@@ -18,6 +18,8 @@ enum Command {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Partial {
     pub text: String,
+    /// Not clamped here (an out-of-range count saturates); the segmenter
+    /// clamps it to the text's word count.
     pub stable_words: usize,
 }
 

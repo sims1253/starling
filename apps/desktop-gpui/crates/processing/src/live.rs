@@ -45,8 +45,8 @@ const ANCHOR_WORDS: usize = 3;
 /// How far (in words) a revision may move an anchor.
 const ANCHOR_REACH: usize = 12;
 
-/// A word as anchors compare it: lowercase letters and digits only, so a
-/// revised comma or capital does not lose the anchor.
+/// A word as anchors compare it: its letters and digits (any script),
+/// lowercased, so a revised comma or capital does not lose the anchor.
 fn norm(word: &str) -> String {
     word.chars()
         .filter(|c| c.is_alphanumeric())
@@ -324,7 +324,8 @@ impl LiveSegmenter {
 
     /// The final transcript: every segment still open or closed gets its
     /// final attempt. Returns false when the final contradicts words that
-    /// were already final (see [`Self::diverged`]).
+    /// were already final (see [`Self::diverged`]). Applies once; later
+    /// calls change nothing.
     pub fn finish(&mut self, draft: &mut Draft, text: &str) -> bool {
         if self.finished {
             return !self.diverged;

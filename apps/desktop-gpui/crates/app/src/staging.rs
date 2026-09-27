@@ -28,7 +28,7 @@ use starling_processing::contract::ProcessingDelivery;
 use starling_processing::live::LiveSegmenter;
 use starling_processing::staging::{Attempt, Draft, Outcome, RegionKind};
 
-use crate::app::StarlingApp;
+use crate::app::{PendingFocus, StarlingApp};
 use crate::editor::{EditorEvent, StagingEditor, TextEdit};
 use crate::live_stream::Partial;
 use crate::processing::{ProcessingState, TakeProcessing, draft_from_doc};
@@ -205,11 +205,13 @@ impl StarlingApp {
             persisted_revision: 0,
             _subscription: subscription,
         });
-        self.focus_staging_pending = true;
+        self.pending_focus = Some(PendingFocus::Staging);
     }
 
     /// The visible staging leaves the screen: written now when it is
-    /// ready, kept in the background while its transcript is pending.
+    /// ready, kept in the background while its transcript is pending. A
+    /// failed staging bound to a take stays recoverable from history
+    /// (Done discards it; see `finish_staging`).
     pub(crate) fn retire_staging(&mut self, cx: &mut Context<Self>) {
         let Some(staging) = self.staging.take() else {
             return;
@@ -224,9 +226,17 @@ impl StarlingApp {
             StagingPhase::Recording | StagingPhase::Finishing => {
                 self.background_stagings.push(staging);
             }
-            StagingPhase::Failed => {}
+            StagingPhase::Failed => {
+                if let Some(id) = staging.take_id.clone() {
+                    self.error = Some(format!(
+                        "The unsaved draft of take {id} was kept. Select that take in history to \
+                         recover it."
+                    ));
+                    self.background_stagings.push(staging);
+                }
+            }
         }
-        self.focus_root_pending = true;
+        self.pending_focus = Some(PendingFocus::Root);
         cx.notify();
     }
 
@@ -318,7 +328,7 @@ impl StarlingApp {
                 }
             }
             EditorEvent::Leave => {
-                self.focus_root_pending = true;
+                self.pending_focus = Some(PendingFocus::Root);
                 cx.notify();
             }
         }
@@ -365,8 +375,7 @@ impl StarlingApp {
                     .to_string(),
             );
         }
-        self.background_stagings
-            .retain(|staging| staging.phase != StagingPhase::Failed);
+        self.settle_failed_staging(token);
         cx.notify();
     }
 
@@ -386,8 +395,7 @@ impl StarlingApp {
                     .to_string(),
             );
         }
-        self.background_stagings
-            .retain(|staging| staging.phase != StagingPhase::Failed);
+        self.settle_failed_staging(token);
         cx.notify();
     }
 
@@ -395,7 +403,7 @@ impl StarlingApp {
     pub(crate) fn drop_staging_for(&mut self, id: &str) {
         if self.staging_shows(id) {
             self.staging = None;
-            self.focus_root_pending = true;
+            self.pending_focus = Some(PendingFocus::Root);
         }
         self.background_stagings
             .retain(|staging| staging.take_id.as_deref() != Some(id));
@@ -500,17 +508,33 @@ impl StarlingApp {
                 "{reason} The text here is not saved; copy it before closing the panel."
             ));
         }
-        if let Some(staging) = self
+        self.settle_failed_staging(token);
+        cx.notify();
+    }
+
+    /// A staging that failed off-screen: one bound to a take is kept and
+    /// named in the error banner (selecting the take in history reopens
+    /// it, and a transcription retry rebases it); one without a take has
+    /// nowhere to be recovered from and is dropped.
+    fn settle_failed_staging(&mut self, token: u64) {
+        let Some(index) = self
             .background_stagings
             .iter()
-            .find(|staging| staging.token == token)
-        {
-            self.error = Some(format!(
-                "{reason} Select take {} in history to recover its retained draft.",
-                staging.take_id.as_deref().unwrap_or("unknown")
-            ));
+            .position(|staging| staging.token == token)
+        else {
+            return;
+        };
+        match self.background_stagings[index].take_id.clone() {
+            Some(id) => {
+                self.error = Some(format!(
+                    "The draft of take {id} could not be saved. Select that take in history to \
+                     recover it."
+                ));
+            }
+            None => {
+                self.background_stagings.remove(index);
+            }
         }
-        cx.notify();
     }
 
     fn finish_rebase(
@@ -531,8 +555,7 @@ impl StarlingApp {
                          saved; copy it if you need it."
                     ));
                 }
-                self.background_stagings
-                    .retain(|staging| staging.phase != StagingPhase::Failed);
+                self.settle_failed_staging(token);
                 cx.notify();
                 return;
             }
@@ -660,7 +683,9 @@ impl StarlingApp {
         let Some(token) = self.staging_token_for(id) else {
             return accepted;
         };
-        let staging = self.staging_mut(token).unwrap();
+        let Some(staging) = self.staging_mut(token) else {
+            return accepted;
+        };
         staging.writes_in_flight.insert(revision);
         if let Some(accepted) = accepted {
             staging.pending_accept = Some((revision, accepted));
@@ -691,7 +716,9 @@ impl StarlingApp {
         }) {
             return false;
         }
-        let staging = self.staging_mut(token).unwrap();
+        let Some(staging) = self.staging_mut(token) else {
+            return false;
+        };
         staging.writes_in_flight.remove(&revision);
         match saved {
             Ok(()) => {
@@ -733,7 +760,7 @@ impl StarlingApp {
                             .position(|staging| staging.token == token)
                         {
                             self.staging = Some(self.background_stagings.remove(index));
-                            self.focus_staging_pending = true;
+                            self.pending_focus = Some(PendingFocus::Staging);
                         }
                     }
                 }
@@ -770,10 +797,10 @@ impl StarlingApp {
         let revision = staging.persisted_revision;
         let close = staging.close_when_saved;
         let id = staging.take_id.clone();
-        if !id
+        if id
             .as_ref()
             .and_then(|id| self.drafts.get(id))
-            .is_some_and(|draft| draft.revision() <= revision)
+            .is_none_or(|draft| draft.revision() > revision)
         {
             return;
         }
@@ -786,7 +813,7 @@ impl StarlingApp {
                 .is_some_and(|staging| staging.token == token)
         {
             self.staging = None;
-            self.focus_root_pending = true;
+            self.pending_focus = Some(PendingFocus::Root);
             cx.notify();
         }
     }
@@ -810,7 +837,7 @@ impl StarlingApp {
         let staging = self.background_stagings.remove(index);
         self.retire_staging(cx);
         self.staging = Some(staging);
-        self.focus_staging_pending = true;
+        self.pending_focus = Some(PendingFocus::Staging);
         cx.notify();
     }
 
@@ -840,6 +867,13 @@ impl StarlingApp {
                 let token = staging.token;
                 self.persist_staging_now(token, cx);
                 self.release_saved_staging(token, cx);
+                return;
+            }
+            if staging.phase == StagingPhase::Failed {
+                // The user was told to copy the text; Done lets it go.
+                self.staging = None;
+                self.pending_focus = Some(PendingFocus::Root);
+                cx.notify();
                 return;
             }
         }
@@ -968,6 +1002,44 @@ mod tests {
             app.staging_interrupted(cx);
             assert_eq!(app.staging.as_ref().unwrap().phase, StagingPhase::Failed);
             app.finish_staging(cx);
+            assert!(app.background_stagings.is_empty());
+        });
+    }
+
+    #[gpui::test]
+    fn a_new_take_keeps_a_failed_draft_recoverable_but_done_discards_it(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let app = cx.new(|cx| StarlingApp::for_test(None, cx));
+        app.update(cx, |app, cx| {
+            app.begin_staging(cx);
+            let token = app.staging.as_ref().unwrap().token;
+            app.apply_staging_edit(
+                token,
+                &TextEdit {
+                    start: 0,
+                    end: 0,
+                    text: "keep my note".into(),
+                },
+                cx,
+            );
+            app.stop_staging();
+            app.bind_staging(token, "take");
+            app.after_transcription("take".into(), cx);
+            assert_eq!(app.staging.as_ref().unwrap().phase, StagingPhase::Failed);
+            // Starting the next take must not destroy the unsaved text.
+            app.begin_staging(cx);
+            assert_eq!(app.pending_focus, Some(PendingFocus::Staging));
+            assert_eq!(app.background_stagings.len(), 1);
+            app.stop_staging();
+            app.staging_interrupted(cx);
+            app.finish_staging(cx);
+            app.restore_unsaved_staging("take", cx);
+            assert_eq!(app.pending_focus, Some(PendingFocus::Staging));
+            assert_eq!(app.visible_staging_draft().unwrap().text(), "keep my note");
+            // Done after the copy-it notice lets it go.
+            app.finish_staging(cx);
+            assert!(app.staging.is_none());
             assert!(app.background_stagings.is_empty());
         });
     }
