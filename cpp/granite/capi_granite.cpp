@@ -12,6 +12,7 @@
 // each decoded with budget max(1, min(budget(dur), max_cache_len - prompt_len
 // - 1)), and the per-chunk texts joined with whitespace collapsed.
 #include "loader.hpp"
+#include "starling_ggml.h"
 #include "lib/capi_helpers.hpp"
 #include "mel.hpp"
 #include "encoder.hpp"
@@ -153,6 +154,7 @@ bool starling_ggml_granite_ctc_draft(void* handle, const float* pcm, int64_t n,
     auto* c = static_cast<GraniteCtx*>(handle);
     if (!c || !count || n <= 0 || !pcm || capacity < 0 ||
         (capacity > 0 && !token_ids)) {
+        if (count) *count = 0;
         if (err_out) *err_out = "invalid GRANITE CTC draft arguments";
         return false;
     }

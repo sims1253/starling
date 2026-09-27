@@ -16,6 +16,7 @@
 #define STARLING_GGML_H
 
 #include <stdint.h>
+#include <stdbool.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -117,6 +118,14 @@ const char * starling_ggml_last_error(starling_ggml_ctx * ctx);
 char * starling_ggml_transcribe_pcm(starling_ggml_ctx * ctx,
                                     const float * samples, int64_t n,
                                     int sample_rate);
+
+// Research-only Granite CTC draft probe. `handle` is returned by the
+// model-specific starling_ggml_granite_load symbol. A successful call writes
+// token IDs and count; a too-small buffer writes the required count and
+// returns false. Invalid arguments clear count when it is non-null.
+bool starling_ggml_granite_ctc_draft(void * handle, const float * pcm, int64_t n,
+                                    int32_t * token_ids, int32_t capacity,
+                                    int32_t * count, const char ** err_out);
 
 // Free a string returned by starling_ggml_transcribe_pcm or
 // starling_ggml_normalize_text (no-op on NULL).

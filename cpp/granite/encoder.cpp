@@ -341,12 +341,13 @@ ggml_tensor* build_fused(ggml_context* c, const GraniteModel& m, ggml_tensor* me
     if (stage_wants(stop->name, "melin")) { stop->hit = true; return f32(c, mel_in); }
     if (stage_wants(stop->name, "in")) { stop->hit = true; return f32(c, x); }
     ggml_tensor* ctc_mid = nullptr;
+    const bool want_ctc_bundle = stage_wants(stop->name, "ctc_bundle");
     for (uint32_t li = 0; li < ec.n_layers; ++li) {
         x = conformer_block(c, m, (int) li, x, s, stop,
-                            stage_wants(stop->name, "ctc_bundle") ? &ctc_mid : nullptr);
+                            want_ctc_bundle ? &ctc_mid : nullptr);
         if (stop->hit) return f32(c, x);
     }
-    if (stage_wants(stop->name, "ctc_bundle")) {
+    if (want_ctc_bundle) {
         // The graph's real output includes both required tensors. No side-node
         // readback is used, and the encoder runs only once for a draft.
         if (!ctc_mid) return f32(c, x);  // invalid mid-layer metadata -> caller error
@@ -500,6 +501,31 @@ bool encode_audio_and_project(const GraniteModel& model, const MelFeatures& mel,
     return true;
 }
 
+ggml_tensor* ctc_argmax_first(ggml_context* c, ggml_tensor* logits,
+                              const std::vector<float>& iota, const float& one) {
+    const int64_t vocab = logits->ne[0], frames = logits->ne[1];
+    // The head has already rounded to BF16. ggml_argmax can select the last
+    // tied index on CPU (and a warp-dependent index on GPU), whereas torch
+    // chooses the first. Read the winning VALUE per frame, form an exact
+    // equality mask, then use descending index weights to make the first
+    // maximum unique. Values below the max by at least one BF16 step become
+    // zero after the scaled difference is clamped.
+    ggml_tensor* rounded = f32(c, logits);
+    ggml_tensor* any = ggml_reshape_2d(c, ggml_argmax(c, rounded), 1, frames);
+    ggml_tensor* rows = ggml_reshape_3d(c, rounded, 1, vocab, frames);
+    ggml_tensor* maximum = ggml_get_rows(c, rows, any);  // [1, 1, frames]
+    maximum = ggml_reshape_2d(c, maximum, 1, frames);
+    ggml_tensor* difference = ggml_scale(c, ggml_sub(c, rounded, maximum), 1048576.0f);
+    int64_t one_ne[1] = {1};
+    ggml_tensor* one_t = graph_input_tensor(c, GGML_TYPE_F32, 1, one_ne,
+                                           &one, sizeof(one));
+    ggml_tensor* equal = ggml_clamp(c, ggml_add(c, difference, one_t), 0.0f, 1.0f);
+    int64_t iota_ne[2] = {vocab, 1};
+    ggml_tensor* iota_t = graph_input_tensor(c, GGML_TYPE_F32, 2, iota_ne,
+                                            iota.data(), iota.size() * sizeof(float));
+    return ggml_argmax(c, ggml_mul(c, equal, iota_t));
+}
+
 bool extract_ctc_draft(const GraniteModel& model, const MelFeatures& mel,
                        std::vector<int32_t>& token_ids, std::string& err) {
     token_ids.clear();
@@ -512,6 +538,10 @@ bool extract_ctc_draft(const GraniteModel& model, const MelFeatures& mel,
     if (mel.n_mels != (int64_t)ec.input_dim || mel.n_frames <= 0 ||
         mel.data.size() != (size_t)mel.n_mels * mel.n_frames) {
         err = "invalid GRANITE mel shape/data for CTC draft";
+        return false;
+    }
+    if (ec.mid_layer == 0 || ec.mid_layer > ec.n_layers) {
+        err = "GRANITE CTC encoder.mid_layer is outside the encoder layers";
         return false;
     }
     ensure_weights_realized(model.loader);
@@ -534,7 +564,9 @@ bool extract_ctc_draft(const GraniteModel& model, const MelFeatures& mel,
         return false;
     }
 
-    constexpr int64_t window = 4;
+    constexpr int64_t kCtcPoolWindow = 4;
+    constexpr int64_t kCtcBlankLabel = 0;
+    const int64_t window = kCtcPoolWindow;
     const int64_t P = (T + window - 1) / window;
     std::vector<float> importance((size_t)T);
     for (int64_t t = 0; t < T; ++t) {
@@ -544,7 +576,7 @@ bool extract_ctc_draft(const GraniteModel& model, const MelFeatures& mel,
         for (uint32_t j = 0; j < ec.output_dim; ++j)
             denom += std::exp((double)logits[j] - maximum);
         importance[(size_t)t] = 1.0f -
-            (float)(std::exp((double)logits[0] - maximum) / denom);
+            (float)(std::exp((double)logits[kCtcBlankLabel] - maximum) / denom);
     }
     std::vector<ggml_bf16_t> pooled((size_t)P * ec.hidden);
     for (int64_t p = 0; p < P; ++p) {
@@ -563,13 +595,17 @@ bool extract_ctc_draft(const GraniteModel& model, const MelFeatures& mel,
     }
 
     std::vector<float> labels;
+    const int64_t vocab = model.loader.tensor("ctc.out_llm.weight")->ne[1];
+    std::vector<float> iota((size_t)vocab);
+    for (int64_t i = 0; i < vocab; ++i) iota[(size_t)i] = (float)(vocab - i);
+    const float one = 1.0f;
     const bool ok = run_graph([&](ggml_context* c) -> ggml_tensor* {
         int64_t pne[2] = {ec.hidden, P};
         ggml_tensor* in = graph_input_tensor(c, GGML_TYPE_BF16, 2, pne,
             pooled.data(), pooled.size() * sizeof(pooled[0]));
         ggml_tensor* logits = lib::linear_bf16(c, model.loader, in,
                                                 "ctc.out_llm", true);
-        return f32(c, ggml_argmax(c, f32(c, logits)));
+        return f32(c, ctc_argmax_first(c, logits, iota, one));
     }, labels);
     if (!ok || labels.size() != (size_t)P) {
         err = "GRANITE CTC BPE head graph failed or returned the wrong shape";
@@ -578,7 +614,7 @@ bool extract_ctc_draft(const GraniteModel& model, const MelFeatures& mel,
     int32_t previous = -1;
     for (float value : labels) {
         const int32_t label = (int32_t)value;
-        if (label != previous && label > 0)
+        if (label != previous && label > kCtcBlankLabel)
             token_ids.push_back(label - 1);
         previous = label;
     }

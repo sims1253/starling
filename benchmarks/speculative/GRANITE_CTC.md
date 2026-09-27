@@ -15,12 +15,12 @@ Build with the repository's native CMake configuration, then convert the
 pinned source snapshot with the opt-in flag:
 
 ```sh
-python scripts/convert_granite_gguf.py \
+uv run --with gguf python scripts/convert_granite_gguf.py \
   --snapshot /path/to/de575db64086f84fdc79da4932d1076e965bc546 \
   --include-ctc-head --output /tmp/granite-with-ctc.gguf
 cmake -S backends/native -B /tmp/granite-build -DSTARLING_GGML_SHARED=ON
 cmake --build /tmp/granite-build --target starling_ggml
-STARLING_GGML_DEVICE=cpu python benchmarks/speculative/eval_granite_ctc.py \
+STARLING_GGML_DEVICE=cpu uv run python benchmarks/speculative/eval_granite_ctc.py \
   --library /tmp/granite-build/libstarling_ggml.so \
   --gguf /tmp/granite-with-ctc.gguf \
   --wav tests/fixtures/2086-149220-0033.wav \
@@ -45,6 +45,15 @@ The parity runner rejects a different GGUF before loading it and prints the
 actual GGUF hash, library hash, and selected native backend with the ID result.
 Thus the result is tied to the supplied binary and artifact, while a newly
 converted GGUF needs its own pinned reference if its bytes differ.
+
+The C probe accepts a zero-capacity call to report the required token count,
+but that call performs a full encoder and head pass. Callers that know the
+audio duration should allocate a conservative token buffer before the first
+call to avoid running the encoder twice.
+
+Native argmax now chooses the first label on exact BF16 ties, as the Python
+reference does; the dedicated two-frame regression covers a nonzero top tie
+and an all-label tie.
 
 This is an extraction/parity milestone. The generic #311 batched verifier is
 still needed to consume the draft, prove output equality to target-only

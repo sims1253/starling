@@ -6,6 +6,9 @@
 #include <string>
 #include <vector>
 
+struct ggml_context;
+struct ggml_tensor;
+
 namespace starling::ggml::granite {
 
 // The fused encoder + projector output: [output_dim, N] f32 (the Granite
@@ -31,6 +34,11 @@ bool encode_audio_and_project(const GraniteModel& model, const MelFeatures& mel,
 // state, then projects the importance-weighted 4-frame pools.
 bool extract_ctc_draft(const GraniteModel& model, const MelFeatures& mel,
                        std::vector<int32_t>& token_ids, std::string& err);
+
+// Row-wise argmax with torch's first-index behavior on exact ties. `iota`
+// holds vocab-index as descending f32 values and must outlive graph execution.
+ggml_tensor* ctc_argmax_first(ggml_context* c, ggml_tensor* logits,
+                              const std::vector<float>& iota, const float& one);
 
 // Current number of cached fused encoder graphs (diagnostic). Zero on CPU /
 // before first GPU encode.
