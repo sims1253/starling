@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "purpose": "Decision threshold fixed before any #178 real-model candidate timing",
+  "baseline_spec": "benchmarks/contention/serial_ready_spec.json",
+  "candidate_spec": "benchmarks/contention/fair_ready_spec.json",
+  "pairing": "Both arms run the same six idle,mixed alternating trials with application ping/pong readiness before HTTP; pair by index 0,1,2 on reserved CPU16-23, OMP_NUM_THREADS=8.",
+  "baseline_gate": "All 3 pairs must reproduce #174 material contention after app readiness: matching successful short finals, each mixed delay >=2s and >=2x idle, >=1 busy response, overlapping successful long with >=2 chunks.",
+  "candidate_rule": {
+    "short_latency_max_ratio_to_serial_mixed": 0.75,
+    "short_latency_min_saved_ms": 20000,
+    "long_wall_max_ratio_to_serial_mixed": 1.35,
+    "candidate_busy_responses_max": 0,
+    "long_chunks": 3,
+    "short_hash": "exact same in idle/mixed/across arms",
+    "long_hash": "exact same across arms",
+    "status": "short final and long HTTP 200 in every trial, first short commit before long completion"
+  },
+  "scope": "CPU pilot only; three matched trials, no p95/p99 or default enablement. Failure or missing trace is inconclusive/no-go, never silently excluded."
+}
