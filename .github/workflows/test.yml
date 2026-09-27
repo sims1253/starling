@@ -76,7 +76,7 @@ jobs:
           tests/test_server_routing.py tests/test_server_robustness.py
           tests/test_server_lifecycle.py tests/test_server_websocket.py
           tests/test_server_client.py tests/test_stream_chunk.py
-          tests/test_native_parity_contract.py
+          tests/test_native_parity_contract.py tests/test_copy_draft.py
 
       # tests/test_native_parity_contract.py (issue #167): the executable
       # numerical-correctness contract — manifest schema, test-selection
