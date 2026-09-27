@@ -13,6 +13,8 @@
 //! - [`pipeline`]: plan → request → run, one [`contract::TransformResult`]
 //!   per job with its timing; [`insight`] turns it into the
 //!   `processing_recorded` event.
+//! - [`live`]: a `/stream` take (running text + stable word count) as
+//!   draft operations, for the live staging editor (#297).
 //!
 //! The contract data lives in `packages/contracts/mode-routing/`; the
 //! conformance tests here read those fixtures in place, so the Rust port
@@ -21,6 +23,7 @@
 pub mod contract;
 pub mod http;
 pub mod insight;
+pub mod live;
 pub mod pipeline;
 pub mod prompt;
 pub mod providers;

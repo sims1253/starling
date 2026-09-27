@@ -32,7 +32,10 @@ pub fn render_capture(
     cx: &mut Context<StarlingApp>,
 ) -> impl IntoElement {
     let recording = app.recorder.is_some();
-    let has_transcript = app.selected().is_some();
+    // The staging panel needs the room a transcript would: the recorder
+    // and headline go compact either way.
+    let has_transcript = app.selected().is_some() || app.staging.is_some();
+    let staging_panel = crate::views::staging::render_staging_panel(app, window, cx);
     let viewport = window.viewport_size();
     let pad_top = if has_transcript {
         px(18.)
@@ -104,7 +107,8 @@ pub fn render_capture(
                 ),
         )
         .child(render_recorder(app, cx, recording, has_transcript))
-        .when(recording && !app.live_partial.is_empty(), |pane| {
+        .children(staging_panel)
+        .when(recording && app.staging.is_none() && !app.live_partial.is_empty(), |pane| {
             pane.child(
                 div()
                     .max_w(px(620.))

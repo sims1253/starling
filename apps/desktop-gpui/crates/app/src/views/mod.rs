@@ -6,6 +6,7 @@ mod capture;
 mod drawer;
 mod history;
 mod settings;
+pub(crate) mod staging;
 mod topbar;
 
 pub use capture::render_capture;

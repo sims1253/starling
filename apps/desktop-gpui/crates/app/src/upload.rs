@@ -198,6 +198,8 @@ impl StarlingApp {
             }
             // Stop-to-processed latency (#295) starts here.
             let stopped_at = Instant::now();
+            // The staging panel keeps its draft while the take is saved.
+            let staging = self.stop_staging();
             match handle.stop() {
                 Ok(mut take) => {
                     // `sent_samples` indexes device-rate samples of the
@@ -263,6 +265,7 @@ impl StarlingApp {
                                         journal_report,
                                         stream,
                                         Some(stopped_at),
+                                        staging,
                                         cx,
                                     );
                                 })
@@ -271,6 +274,9 @@ impl StarlingApp {
                             (Err(err), _) => {
                                 this.update(cx, |app, cx| {
                                     app.error = Some(err.to_string());
+                                    if let Some(token) = staging {
+                                        app.staging_save_failed(token, cx);
+                                    }
                                     cx.notify();
                                 })
                                 .ok();
@@ -292,6 +298,7 @@ impl StarlingApp {
                     // is recorded in the session note.
                     let journal_report = journal.clone();
                     let note = quiesce_salvage_note(acknowledged_samples, audio.sample_rate);
+                    self.staging_interrupted(cx);
                     self.levels = vec![0.06; 52];
                     self.capture_warning = recorder::clipping_warning(source_clip_ratio);
                     self.error = Some(format!(
@@ -331,6 +338,7 @@ impl StarlingApp {
                 }
                 Err(err) => {
                     self.error = Some(err.to_string());
+                    self.staging_interrupted(cx);
                     cx.notify();
                 }
             }
@@ -341,6 +349,11 @@ impl StarlingApp {
             match recorder::start_recording_with_journal(&journal::default_journals_root()) {
                 Ok(handle) => {
                     self.live_partial.clear();
+                    if self.staged_mode() {
+                        self.begin_staging(cx);
+                    } else {
+                        self.retire_staging(cx);
+                    }
                     self.streamed_samples.clear();
                     self.stream_sent_samples = 0;
                     self.stream_degradation = None;
@@ -376,6 +389,7 @@ impl StarlingApp {
         journal: Option<recorder::JournalReport>,
         stream: Option<LiveStream>,
         stopped_at: Option<Instant>,
+        staging: Option<u64>,
         cx: &mut Context<Self>,
     ) {
         // Deliberately no `self.error = None` here: every caller clears the
@@ -391,6 +405,9 @@ impl StarlingApp {
             self.stash_unsaved(wav, &format!(
                 "Local storage failed: {reason} Keep this window open and download the unsaved WAV to recover it."
             ));
+            if let Some(token) = staging {
+                self.staging_save_failed(token, cx);
+            }
             cx.notify();
             return;
         };
@@ -413,6 +430,9 @@ impl StarlingApp {
                         if let Some(stopped_at) = stopped_at {
                             app.stop_instants.insert(saved.id.clone(), stopped_at);
                         }
+                        if let Some(token) = staging {
+                            app.bind_staging(token, &saved.id);
+                        }
                         app.transcribe_with_stream(saved.id, saved.wav, stream, cx);
                     })
                     .ok();
@@ -422,6 +442,9 @@ impl StarlingApp {
                         app.stash_unsaved(wav, &format!(
                             "Local storage failed: {err} Keep this window open and download the unsaved WAV to recover it."
                         ));
+                        if let Some(token) = staging {
+                            app.staging_save_failed(token, cx);
+                        }
                         cx.notify();
                     })
                     .ok();
@@ -753,6 +776,7 @@ impl StarlingApp {
                 if !transcribed {
                     // No processing will run for this take.
                     app.stop_instants.remove(&id);
+                    app.staging_transcription_failed(&id, cx);
                 }
                 cx.notify();
             })
@@ -791,7 +815,7 @@ impl StarlingApp {
                     match prepared {
                         Ok(prepared) => {
                             this.update(cx, |app, cx| {
-                                app.save_and_transcribe(Arc::new(prepared.wav), None, None, None, cx);
+                                app.save_and_transcribe(Arc::new(prepared.wav), None, None, None, None, cx);
                             })
                             .ok();
                         }

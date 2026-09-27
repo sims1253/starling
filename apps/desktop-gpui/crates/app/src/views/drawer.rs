@@ -209,6 +209,9 @@ pub fn render_drawer(
                     .line_height(transcript_scale * 1.4)
                     .text_color(theme::PAPER_INK)
                     .min_h(transcript_scale * 1.4)
+                    // The scrolling body is a flex column: without this the
+                    // text shrinks to one line and paints over what follows.
+                    .flex_shrink_0()
                     .child(transcript.text),
             );
         }
@@ -322,6 +325,10 @@ fn processing_block(
     scale: gpui::Pixels,
     cx: &mut Context<StarlingApp>,
 ) -> Option<gpui::Stateful<Div>> {
+    // The staging panel shows this take's processing next to its text.
+    if app.staging_shows(id) {
+        return None;
+    }
     let take = app.processing.get(id).cloned();
     let processes = app.mode_processes();
     if take.is_none() && !processes {
@@ -341,6 +348,7 @@ fn processing_block(
     };
     let mut block = div()
         .id("processing-block")
+        .flex_shrink_0()
         .flex()
         .flex_col()
         .gap(px(8.))
@@ -444,7 +452,7 @@ fn processing_block(
         if !matches!(take.as_ref().map(|t| &t.state), Some(ProcessingState::Proposal { .. })) {
             block = block
                 .child(note(
-                    "Copy and Export use this processed text.".to_string(),
+                    "Copy and Export use this text, not the raw transcript.".to_string(),
                     theme::PAPER_SUBTLE,
                 ))
                 .child(

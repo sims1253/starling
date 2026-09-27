@@ -71,7 +71,8 @@
             "text": "<growing partial transcript>",
             "segments": [{ "text": "<growing partial transcript>", "start_s": 0.0, "end_s": 6.0 }],
             "start_s": 0.0,
-            "end_s": 6.0
+            "end_s": 6.0,
+            "stable_words": 0
           },
           {
             "type": "final",

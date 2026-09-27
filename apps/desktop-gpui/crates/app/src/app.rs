@@ -10,8 +10,8 @@ use std::{
 };
 
 use gpui::{
-    AppContext, ClipboardItem, Context, Entity, FocusHandle, Pixels, Render, Timer, Window,
-    actions, div, prelude::*,
+    AppContext, ClipboardItem, Context, Entity, FocusHandle, Focusable, Pixels, Render, Timer,
+    Window, actions, div, prelude::*,
 };
 use starling_dictation::{
     client::{self, StarlingClient},
@@ -430,7 +430,17 @@ pub struct StarlingApp {
 
     pub recorder: Option<RecorderHandle>,
     pub(crate) live_stream: Option<LiveStream>,
+    /// The live line a direct-mode take shows while recording.
     pub(crate) live_partial: String,
+    /// The staging panel (#297) and stagings whose transcript is still
+    /// pending after the panel moved on.
+    pub(crate) staging: Option<crate::staging::Staging>,
+    pub(crate) background_stagings: Vec<crate::staging::Staging>,
+    pub(crate) next_staging_token: u64,
+    /// A focus change asked for outside a render (which has the window).
+    /// The latest request wins: retiring a panel asks for the root, and
+    /// the panel that replaces it in the same frame asks for its editor.
+    pub(crate) pending_focus: Option<PendingFocus>,
     pub(crate) streamed_samples: Vec<f32>,
     pub(crate) stream_sent_samples: usize,
     /// Set when live streaming died mid-recording: the partial view going
@@ -441,6 +451,14 @@ pub struct StarlingApp {
     pub elapsed_ms: f64,
 
     pub diagnostics: Option<(Instant, bool)>,
+}
+
+/// Where the next render moves keyboard focus.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PendingFocus {
+    /// The visible staging panel's editor (the root when there is none).
+    Staging,
+    Root,
 }
 
 /// What a playback poll-watcher does after one tick (G04).
@@ -797,10 +815,6 @@ fn write_download_exclusive(
 impl StarlingApp {
     pub fn new(started: Instant, diagnostics: bool, cx: &mut Context<Self>) -> Self {
         let settings = Settings::load_or_default();
-        let endpoint = settings.endpoint.clone();
-        let model = settings.model.clone();
-        let terms_input = settings.expected_terms_input();
-
         // D14: storage v2 is THE store, opened unconditionally. An open
         // failure is a hard, honest startup error — there is no other
         // backend to fall back to and no flag to clear; the cause must be
@@ -817,7 +831,30 @@ impl StarlingApp {
             ),
         };
 
-        let player = Player::new().ok();
+        Self::with_dependencies(
+            started,
+            diagnostics,
+            settings,
+            store,
+            store_error,
+            Player::new().ok(),
+            cx,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn with_dependencies(
+        started: Instant,
+        diagnostics: bool,
+        settings: Settings,
+        store: Option<Store>,
+        store_error: Option<String>,
+        player: Option<Player>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let endpoint = settings.endpoint.clone();
+        let model = settings.model.clone();
+        let terms_input = settings.expected_terms_input();
         let draft_endpoint = cx.new(|cx| TextField::new("http://127.0.0.1:8181", &endpoint, cx));
         let draft_model = cx.new(|cx| TextField::new("parakeet", &model, cx));
         let draft_terms = cx.new(|cx| TextField::new("auth, Starling, GGUF", &terms_input, cx));
@@ -891,6 +928,10 @@ impl StarlingApp {
             recorder: None,
             live_stream: None,
             live_partial: String::new(),
+            staging: None,
+            background_stagings: Vec::new(),
+            next_staging_token: 0,
+            pending_focus: None,
             streamed_samples: Vec::new(),
             stream_sent_samples: 0,
             stream_degradation: None,
@@ -898,6 +939,19 @@ impl StarlingApp {
             elapsed_ms: 0.0,
             diagnostics: diagnostics.then_some((started, false)),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(store: Option<Store>, cx: &mut Context<Self>) -> Self {
+        Self::with_dependencies(
+            Instant::now(),
+            false,
+            Settings::default_settings(),
+            store,
+            None,
+            None,
+            cx,
+        )
     }
 
     pub fn init(&mut self, cx: &mut Context<Self>) {
@@ -1265,6 +1319,7 @@ impl StarlingApp {
             self.selection_moved();
         }
         self.selected_id = Some(id.clone());
+        self.restore_unsaved_staging(&id, cx);
         self.load_processing(id, cx);
         cx.notify();
     }
@@ -1813,6 +1868,7 @@ impl Render for StarlingApp {
             }
         }
 
+        let mut staged_partial = None;
         if let Some(handle) = self.recorder.as_mut() {
             if let Some(stream) = self.live_stream.as_ref() {
                 let mut stream_failed = false;
@@ -1862,7 +1918,10 @@ impl Render for StarlingApp {
                     }
                 }
                 match stream.poll_partial() {
-                    Ok(Some(text)) => self.live_partial = text,
+                    Ok(Some(partial)) if self.staging.is_some() => {
+                        staged_partial = Some(partial);
+                    }
+                    Ok(Some(partial)) => self.live_partial = partial.text,
                     Err(reason) => {
                         self.stream_degradation = Some(format!(
                             "Live transcription stopped mid-recording ({reason}). The full \
@@ -1881,6 +1940,18 @@ impl Render for StarlingApp {
             self.levels = fft::waveform_levels(&magnitudes, 52);
             self.elapsed_ms = handle.elapsed().as_secs_f64() * 1000.0;
             window.request_animation_frame();
+        }
+        if let Some(partial) = staged_partial {
+            self.staging_partial(partial, cx);
+        }
+
+        match self.pending_focus.take() {
+            Some(PendingFocus::Staging) => match self.staging.as_ref() {
+                Some(staging) => window.focus(&staging.editor.focus_handle(cx)),
+                None => window.focus(&self.root_focus),
+            },
+            Some(PendingFocus::Root) => window.focus(&self.root_focus),
+            None => {}
         }
 
         let has_transcript = self.selected().is_some();

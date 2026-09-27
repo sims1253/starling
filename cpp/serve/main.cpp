@@ -1019,7 +1019,8 @@ int main(int argc, char** argv) {
                         ss << "{\"type\":\"partial\",\"text\":\""
                            << safe_text << "\",\"segments\":[{\"text\":\""
                            << safe_text << "\",\"start_s\":0.0,\"end_s\":"
-                           << dur << "}],\"start_s\":0.0,\"end_s\":" << dur << "}";
+                           << dur << "}],\"start_s\":0.0,\"end_s\":" << dur
+                           << ",\"stable_words\":" << session.stable_words() << "}";
                         ws.send(ss.str());
                     }
                 }

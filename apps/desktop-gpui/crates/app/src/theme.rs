@@ -65,6 +65,10 @@ pub const ERROR_SUBTLE: Rgba = rgb(0xAD8279);
 pub const RECOVERY_TEXT: Rgba = rgb(0xFFE3DC);
 pub const RECOVERY_LINE: Rgba = rgba(0xFFE3DC59); // rgba(255,227,220,0.35)
 
+// Staging editor
+pub const STAGING_BG: Rgba = rgba(0x1E1F1ACC); // rgba(30,31,26,0.8)
+pub const STAGING_SELECTION: Rgba = rgba(0xD9FF6A33); // lime at 0.2
+
 // Transcript drawer (paper)
 pub const PAPER_INK: Rgba = rgb(0x24251E);
 pub const PAPER_SUBTLE: Rgba = rgb(0x7D7D71);

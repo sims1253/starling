@@ -2,9 +2,11 @@
 
 mod app;
 mod assets;
+mod editor;
 mod input;
 mod live_stream;
 mod processing;
+mod staging;
 mod store;
 mod theme;
 mod upload;
@@ -36,6 +38,7 @@ fn main() {
                 None,
             )]);
             input::bind_keys(cx);
+            editor::bind_keys(cx);
 
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
