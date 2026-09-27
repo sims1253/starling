@@ -184,6 +184,8 @@ def main() -> int:
     parser.add_argument("--long-wav", type=Path, required=True)
     parser.add_argument("--out-dir", type=Path, default=ROOT / "outputs" / "contention-pilot")
     parser.add_argument("--cpu-list", default="16-23", help="taskset CPU list for the server")
+    parser.add_argument("--server-arg", action="append", default=[],
+                        help="additional server argument (repeatable; recorded in result)")
     parser.add_argument("--spec", type=Path, default=SPEC_PATH,
                         help="committed per-run spec with exact binary/model/audio hashes")
     parser.add_argument("--diagnostics-only", action="store_true",
@@ -207,7 +209,7 @@ def main() -> int:
     env["STARLING_TRACE"] = "1"
     env["OMP_NUM_THREADS"] = "8"
     command = ["taskset", "-c", args.cpu_list, str(args.binary), "--model", "granite",
-               "--gguf", str(args.gguf), "--port", str(port)]
+               "--gguf", str(args.gguf), "--port", str(port), *args.server_arg]
     summary = {
         "schema_version": 1, "spec_sha256": sha256_file(args.spec),
         "run_utc": datetime.now(timezone.utc).isoformat(), "cpu_affinity": args.cpu_list,
