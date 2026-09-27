@@ -209,6 +209,9 @@ pub fn render_drawer(
                     .line_height(transcript_scale * 1.4)
                     .text_color(theme::PAPER_INK)
                     .min_h(transcript_scale * 1.4)
+                    // The scrolling body is a flex column: without this the
+                    // text shrinks to one line and paints over what follows.
+                    .flex_shrink_0()
                     .child(transcript.text),
             );
         }
@@ -345,6 +348,7 @@ fn processing_block(
     };
     let mut block = div()
         .id("processing-block")
+        .flex_shrink_0()
         .flex()
         .flex_col()
         .gap(px(8.))

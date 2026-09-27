@@ -14,8 +14,10 @@
 //!   ([`LiveSegmenter::cut`]). Those words keep updating in place until
 //!   they are final (or the user pins them by editing inside), and later
 //!   speech starts a new segment that the draft appends after whatever
-//!   the user typed. Words the user already saw never jump past their
-//!   edit.
+//!   the user typed. A closed segment remembers its last words and each
+//!   partial finds them again, so when the server revises earlier words
+//!   (and their count), the words the user saw before the edit stay
+//!   before it.
 //! - The final transcript closes every segment ([`LiveSegmenter::finish`]).
 //!
 //! Segment texts carry their own leading space, so the draft's text reads
@@ -23,12 +25,68 @@
 
 use crate::staging::Draft;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Span {
     segment: u32,
     start: usize,
     /// `None` for the open segment: it takes every word after `start`.
     end: Option<usize>,
+    /// A closed segment's last words (see [`tail_of`]), to find its end again.
+    tail: String,
+}
+
+/// How many trailing words anchor a closed segment's end.
+const ANCHOR_WORDS: usize = 3;
+/// How far (in words) a revision may move an anchor.
+const ANCHOR_REACH: usize = 12;
+
+/// A word as anchors compare it: lowercase letters and digits only, so a
+/// revised comma or capital does not lose the anchor.
+fn norm(word: &str) -> String {
+    word.chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// A closed segment's anchor: its last words as one run of letters, so a
+/// revision that splits or merges them ("anymore" → "any more") still
+/// matches.
+fn tail_of(words: &[&str], start: usize, end: usize) -> String {
+    let end = end.min(words.len());
+    let from = end.saturating_sub(ANCHOR_WORDS).max(start.min(end));
+    words[from..end].iter().map(|word| norm(word)).collect()
+}
+
+/// Whether the words of `words[start..end]` end with the letters `tail`
+/// (the match must end exactly at `end`).
+fn ends_with_tail(words: &[&str], start: usize, end: usize, tail: &str) -> bool {
+    let mut letters = String::new();
+    for word in words[start..end].iter().rev() {
+        letters.insert_str(0, &norm(word));
+        if letters.len() >= tail.len() {
+            break;
+        }
+    }
+    letters.ends_with(tail)
+        && words[..end]
+            .last()
+            .is_some_and(|word| !norm(word).is_empty())
+}
+
+/// Where a closed segment ends in `words`: the end of its `tail` closest to
+/// `expected`, or `expected` when the tail is gone.
+fn realign(words: &[&str], tail: &str, start: usize, expected: usize) -> usize {
+    let expected = expected.clamp(start, words.len());
+    if tail.is_empty() {
+        return expected;
+    }
+    let low = (start + 1).max(expected.saturating_sub(ANCHOR_REACH));
+    let high = words.len().min(expected + ANCHOR_REACH);
+    (low..=high)
+        .filter(|&end| ends_with_tail(words, start, end, tail))
+        .min_by_key(|&end| end.abs_diff(expected))
+        .unwrap_or(expected)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -39,8 +97,8 @@ pub struct LiveSegmenter {
     next_segment: u32,
     /// The words already final, as they were when finalized.
     finalized: Vec<String>,
-    /// How many words the latest partial had.
-    heard: usize,
+    /// The latest partial's words.
+    heard: Vec<String>,
     /// A partial or the final disagreed with words already final.
     diverged: bool,
     finished: bool,
@@ -82,24 +140,44 @@ impl LiveSegmenter {
     /// Where the open segment starts: after the last closed segment, or
     /// after the final words.
     fn open_start(&self) -> usize {
-        match (self.open, self.closed.last()) {
-            (Some(span), _) => span.start,
-            (None, Some(Span { end: Some(end), .. })) => *end,
+        match self.closed.last() {
+            Some(Span { end: Some(end), .. }) => *end,
             _ => self.finalized.len(),
         }
     }
 
     fn open_span(&mut self) -> Span {
         let start = self.open_start();
-        *self.open.get_or_insert_with(|| {
+        let span = self.open.get_or_insert_with(|| {
             let span = Span {
                 segment: self.next_segment,
                 start,
                 end: None,
+                tail: String::new(),
             };
             self.next_segment += 1;
             span
-        })
+        });
+        // Follows the closed segment before it, which may have moved.
+        span.start = start;
+        span.clone()
+    }
+
+    /// Re-finds every closed segment's end in `words`, oldest first; a
+    /// move shifts the expectation for the ones after it.
+    fn realign_closed(&mut self, words: &[&str]) {
+        let mut start = self.finalized.len();
+        let mut shift: isize = 0;
+        for span in &mut self.closed {
+            let old_end = span.end.unwrap_or(start);
+            let expected = old_end.saturating_add_signed(shift);
+            let end = realign(words, &span.tail, start, expected);
+            shift += end as isize - old_end as isize;
+            span.start = start;
+            span.end = Some(end);
+            span.tail = tail_of(words, start, end);
+            start = end;
+        }
     }
 
     fn check_prefix(&mut self, words: &[&str]) {
@@ -132,8 +210,9 @@ impl LiveSegmenter {
         }
         let words: Vec<&str> = text.split_whitespace().collect();
         self.check_prefix(&words);
-        self.heard = words.len();
+        self.heard = words.iter().map(|word| word.to_string()).collect();
         let stable = stable_words.min(words.len());
+        self.realign_closed(&words);
 
         // Closed segments, oldest first: final once stable covers them.
         let mut still_closed = Vec::with_capacity(self.closed.len());
@@ -178,13 +257,17 @@ impl LiveSegmenter {
         if self.finished {
             return;
         }
-        if let Some(span) = self.open {
-            if self.heard > span.start {
+        if let Some(span) = self.open.take() {
+            let heard = self.heard.len();
+            if heard > span.start {
+                let words: Vec<&str> = self.heard.iter().map(String::as_str).collect();
                 self.closed.push(Span {
-                    end: Some(self.heard),
+                    end: Some(heard),
+                    tail: tail_of(&words, span.start, heard),
                     ..span
                 });
-                self.open = None;
+            } else {
+                self.open = Some(span);
             }
         }
     }
@@ -198,6 +281,10 @@ impl LiveSegmenter {
         }
         let words: Vec<&str> = text.split_whitespace().collect();
         self.check_prefix(&words);
+        self.realign_closed(&words);
+        if self.open.is_some() {
+            self.open_span();
+        }
         let mut spans = std::mem::take(&mut self.closed);
         if spans.is_empty() && self.open.is_none() && words.len() > self.finalized.len() {
             // Nothing live yet (a short take, or no partial arrived).
@@ -337,6 +424,49 @@ mod tests {
         assert!(live.finish(&mut draft, "short take"));
         assert_eq!(draft.text(), "short take");
         assert_eq!(draft.raw_text(), "short take");
+    }
+
+    #[test]
+    fn words_seen_before_an_edit_stay_before_it_when_the_server_revises() {
+        let mut draft = Draft::new("d", "c");
+        let mut live = LiveSegmenter::new();
+        live.partial(&mut draft, "a b c d e f", 0);
+        let end = draft.text().chars().count();
+        live.cut();
+        draft.insert(end, " [NOTE]");
+        // The server inserts two words early on and adds new speech; by
+        // index the cut would now fall before "e f".
+        live.partial(&mut draft, "a x y b c d e f g h", 0);
+        assert_eq!(draft.text(), "a x y b c d e f [NOTE] g h");
+        // Or drops a word: the cut must not swallow "g".
+        live.partial(&mut draft, "a b c d e f g h i", 0);
+        assert_eq!(draft.text(), "a b c d e f [NOTE] g h i");
+        // Or merges two of the words the user saw: by index the cut would
+        // now take "g" too.
+        live.partial(&mut draft, "a b c de f g h i", 0);
+        assert_eq!(draft.text(), "a b c de f [NOTE] g h i");
+        assert!(live.finish(&mut draft, "a b c de f g h i j"));
+        assert_eq!(draft.text(), "a b c de f [NOTE] g h i j");
+        assert_eq!(draft.raw_text(), "a b c de f g h i j");
+    }
+
+    #[test]
+    fn a_word_split_by_a_revision_stays_before_the_edit() {
+        let mut draft = Draft::new("d", "c");
+        let mut live = LiveSegmenter::new();
+        live.partial(&mut draft, "well I do not wish to see it anymore.", 0);
+        let end = draft.text().chars().count();
+        live.cut();
+        draft.insert(end, " [NOTE]");
+        live.partial(
+            &mut draft,
+            "well I do not wish to see it any more, observed Phoebe",
+            0,
+        );
+        assert_eq!(
+            draft.text(),
+            "well I do not wish to see it any more, [NOTE] observed Phoebe"
+        );
     }
 
     #[test]
