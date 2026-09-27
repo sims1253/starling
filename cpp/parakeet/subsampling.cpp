@@ -16,6 +16,7 @@
 #include "subsampling.hpp"
 
 #include "runtime/backend.hpp"  // clone_weight, graph_input_tensor
+#include "runtime/graph.hpp"    // global_backend
 
 #include "ggml.h"
 
@@ -69,6 +70,12 @@ ggml_tensor* Subsampling::build_graph(ggml_context* ctx,
         // ggml_conv_2d_dw_direct expects a:[KW,KH,1,C], b:[W,H,C,N].
         ggml_tensor* dww = clone_weight(ctx, ml, s.dw_w);
         ggml_tensor* dwb = clone_weight(ctx, ml, s.dw_b);
+        // ggml-cuda's depthwise kernel accepts F32 weights only. Compact
+        // GGUFs store these kernels as F16; widening the exact F16 values
+        // before the convolution keeps the compact file loadable on CUDA.
+        if (std::strncmp(global_backend().device_name(), "CUDA", 4) == 0 &&
+            dww->type == GGML_TYPE_F16)
+            dww = ggml_cast(ctx, dww, GGML_TYPE_F32);
         x = ggml_conv_2d_dw_direct(ctx, dww, x,
                                    /*s0*/2, /*s1*/2, /*p0*/1, /*p1*/1,
                                    /*d0*/1, /*d1*/1);
