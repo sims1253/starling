@@ -1,0 +1,38 @@
+"""Acceptance behavior of the offline copy proposer."""
+
+import importlib.util
+from pathlib import Path
+
+
+def _module():
+    path = Path(__file__).resolve().parents[1] / "benchmarks/speculative/copy_draft.py"
+    spec = importlib.util.spec_from_file_location("copy_draft", path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    import sys
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_deletions_realign_and_accept_multiple_tokens():
+    m = _module()
+    # Source's fillers are skipped when a later target token matches.
+    result = m.simulate([10, 99, 11, 12, 13], [10, 11, 12, 13], max_k=2)
+    assert result.output_tokens == 4
+    assert result.verify_passes < result.output_tokens
+    assert result.accepted_tokens >= 2
+
+
+def test_rejected_edits_still_reproduce_greedy_stream():
+    m = _module()
+    result = m.simulate([10, 11, 12], [20, 21, 22], max_k=2)
+    assert result.accepted_tokens == 0
+    assert result.verify_passes == result.output_tokens
+
+
+def test_lookup_only_uses_emitted_prefix():
+    m = _module()
+    drafter = m.CopyDrafter([])
+    assert drafter.propose([4, 5, 4], 2) == [5, 4]
+    assert drafter.propose([4, 5, 4, 5], 2) == [4, 5]
