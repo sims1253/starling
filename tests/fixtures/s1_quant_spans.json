@@ -11,14 +11,14 @@
     "id": "amount_correction",
     "transcript": "the total is forty two dollars no wait forty five dollars",
     "spans": {
-      "corrected_amount": "(?:\\$?45\\b|forty[- ]five)"
+      "corrected_amount": "(?:(?<![\\w$])\\$?45(?!\\w)|\\bforty[- ]five\\b)"
     }
   },
   {
     "id": "email_address",
     "transcript": "please email alex dot chen at example dot org by thursday",
     "spans": {
-      "address": "(?:alex\\.chen@example\\.org|alex dot chen at example dot org)",
+      "address": "(?:(?<![\\w.+-])alex\\.chen@example\\.org(?![\\w-]|\\.[\\w-])|\\balex dot chen at example dot org\\b)",
       "deadline": "\\bthursday\\b"
     }
   },
@@ -26,7 +26,7 @@
     "id": "url",
     "transcript": "the link is example dot org slash pricing",
     "spans": {
-      "link": "(?:example\\.org/pricing|example dot org slash pricing)"
+      "link": "(?:(?<![\\w@.-])example\\.org/pricing(?![/\\w-]|\\.[\\w-])|\\bexample dot org slash pricing\\b)"
     }
   },
   {

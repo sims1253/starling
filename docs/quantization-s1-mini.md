@@ -25,7 +25,7 @@ The eight protected-span cases in `tests/fixtures/s1_quant_spans.json` were
 held out from calibration. On CPU, all eight candidate outputs matched the
 BF16 outputs byte for byte: no pre-existing or new protected-span violations.
 The fixture file SHA256 was
-`47320bc8e1b045082aff3cd3a646b501ed43a6561f984badb8513f5dc30708d5`.
+`3042f4bb2818b94add656b232717eda4a46f92dda90c25d06227280b4844f500`.
 
 These eight English cases are a functional pilot, not a release quality gate.
 Issue #310's broader protected-span workload, Pixel latency/energy, and the

@@ -116,7 +116,7 @@ jobs:
             audio_parser_test loader_guard_test higgs_dtype_guard_test \
             audex_loader_guard_test granite_stage_test model_lifetime_test \
             starling-quantize \
-            parakeet_compact_engine_test \
+            parakeet_compact_engine_test s1_quant_loader_test \
             voxtral_encoder_test voxtral_engine_test voxtral_loader_guard_test \
             trace_schema_test trace_off_test granite_trace_test serve_trace_test \
             replay_graph_support_test cpu_repack_test \
@@ -151,6 +151,7 @@ jobs:
       - name: C++ loader/dtype guard tests
         run: |
           ./build/loader_guard_test
+          ./build/s1_quant_loader_test
           ./build/higgs_dtype_guard_test
           ./build/audex_loader_guard_test
           ./build/granite_stage_test

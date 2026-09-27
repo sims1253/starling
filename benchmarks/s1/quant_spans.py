@@ -90,6 +90,17 @@ def compare(baseline: dict, candidate: dict, cases_path: Path | None = None) -> 
     for key in ("source_sha256", "engine_sha256", "cases_sha256", "device"):
         if not baseline.get(key) or baseline[key] != candidate.get(key):
             raise ValueError(f"{key} differs between arms")
+    for arm, record in (("baseline", baseline), ("candidate", candidate)):
+        model_hash = record.get("model_sha256")
+        if not isinstance(model_hash, str) or re.fullmatch(r"[0-9a-f]{64}", model_hash) is None:
+            raise ValueError(f"{arm}: invalid model_sha256")
+        size = record.get("model_bytes")
+        if type(size) is not int or size <= 0:
+            raise ValueError(f"{arm}: invalid model_bytes")
+    if baseline["model_sha256"] != baseline["source_sha256"]:
+        raise ValueError("baseline model_sha256 must match source_sha256")
+    if candidate["model_sha256"] == baseline["model_sha256"]:
+        raise ValueError("candidate model_sha256 must differ from baseline")
     b = {row["id"]: row for row in baseline["results"]}
     c = {row["id"]: row for row in candidate["results"]}
     if len(b) != len(baseline["results"]) or len(c) != len(candidate["results"]) or set(b) != set(c):
@@ -121,6 +132,9 @@ def compare(baseline: dict, candidate: dict, cases_path: Path | None = None) -> 
             if before and not after:
                 new_violations.append(f"{case_id}:{label}")
     return {"schema": "s1-quant-span-comparison-v1", "cases": len(b),
+            "source_sha256": baseline["source_sha256"],
+            "baseline_model_sha256": baseline["model_sha256"],
+            "candidate_model_sha256": candidate["model_sha256"],
             "changed_outputs": changed_outputs,
             "baseline_violations": baseline_violations,
             "new_violations": new_violations,
