@@ -1,0 +1,63 @@
+[
+  {
+    "id": "negation_and_name",
+    "transcript": "do not send this to claire yet send it to maya",
+    "spans": {
+      "negation": "\\b(?:do not|don't)\\b",
+      "recipient": "\\bmaya\\b"
+    }
+  },
+  {
+    "id": "amount_correction",
+    "transcript": "the total is forty two dollars no wait forty five dollars",
+    "spans": {
+      "corrected_amount": "(?:\\$?45\\b|forty[- ]five)"
+    }
+  },
+  {
+    "id": "email_address",
+    "transcript": "please email alex dot chen at example dot org by thursday",
+    "spans": {
+      "address": "(?:alex\\.chen@example\\.org|alex dot chen at example dot org)",
+      "deadline": "\\bthursday\\b"
+    }
+  },
+  {
+    "id": "url",
+    "transcript": "the link is example dot org slash pricing",
+    "spans": {
+      "link": "(?:example\\.org/pricing|example dot org slash pricing)"
+    }
+  },
+  {
+    "id": "identifier",
+    "transcript": "ticket id is a b seven nine c two",
+    "spans": {
+      "ticket": "(?:\\bAB79C2\\b|a b seven nine c two)"
+    }
+  },
+  {
+    "id": "person_name",
+    "transcript": "i spoke with naomi tanaka and she will call tomorrow",
+    "spans": {
+      "person": "\\bnaomi tanaka\\b"
+    }
+  },
+  {
+    "id": "negated_deadline",
+    "transcript": "we cannot ship before june second",
+    "spans": {
+      "negation": "\\b(?:cannot|can't)\\b",
+      "date": "(?:\\bjune 2(?:nd)?\\b|\\bjune second\\b)"
+    }
+  },
+  {
+    "id": "two_port_numbers",
+    "transcript": "use port eight zero eight zero not eight zero zero eight",
+    "spans": {
+      "new_port": "(?:\\b8080\\b|eight zero eight zero)",
+      "old_port": "(?:\\b8008\\b|eight zero zero eight)",
+      "negation": "\\bnot\\b"
+    }
+  }
+]
