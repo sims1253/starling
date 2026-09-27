@@ -212,7 +212,7 @@ torch::Tensor residual_add(torch::Tensor x, torch::Tensor y, c10::optional<doubl
     int N = x.size(-1);
     int M = x.numel() / N;
     auto z = torch::empty_like(x);
-    float a = (alpha && *alpha) ? (float)*alpha : 1.0f;
+    float a = alpha ? (float)*alpha : 1.0f;
     int B = pick_block(N);
     auto stream = at::cuda::getCurrentCUDAStream();
     residual_add_kernel<<<M, B, 0, stream>>>(

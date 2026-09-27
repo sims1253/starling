@@ -9,15 +9,82 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import re
 import shutil
 import subprocess
 import sys
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
 
 TOOLS = ("memcheck", "initcheck", "racecheck", "synccheck")
 ROOT = Path(__file__).resolve().parent.parent
 TEST = ROOT / "tests" / "test_cuda_kernel_boundaries.py"
+EXPECTED_TESTS = 47
+
+
+def _report_result(report: Path, expected_tests: int) -> tuple[int, str | None]:
+    if not report.exists():
+        return 0, "pytest did not write a JUnit report"
+    try:
+        cases = ET.parse(report).findall(".//testcase")
+    except ET.ParseError:
+        return 0, "pytest wrote an invalid JUnit report"
+    if len(cases) != expected_tests:
+        return len(cases), f"expected {expected_tests} executed tests, found {len(cases)}"
+    for case in cases:
+        if any(case.find(tag) is not None for tag in ("skipped", "failure", "error")):
+            return len(cases), "JUnit report contains skipped or failed tests"
+    return len(cases), None
+
+
+def _sanitizer_result(log: Path, tool: str) -> str | None:
+    output = log.read_text(errors="replace")
+    if tool == "racecheck":
+        if re.search(r"RACECHECK SUMMARY:\s*0 hazards displayed \(0 errors, 0 warnings\)", output):
+            return None
+    elif re.search(r"ERROR SUMMARY:\s*0 errors", output):
+        return None
+    return f"missing clean {tool} summary"
+
+
+def run_tool(
+    sanitizer: str, tool: str, output_dir: Path, timeout_seconds: int,
+    *, test: Path = TEST, expected_tests: int = EXPECTED_TESTS, cwd: Path = ROOT,
+) -> dict[str, object]:
+    """Require both executed pytest cases and a clean sanitizer summary."""
+    log = output_dir / f"{tool}.log"
+    report = output_dir / f"{tool}.junit.xml"
+    report.unlink(missing_ok=True)  # a previous run must never certify this one
+    command = [
+        sanitizer, "--tool", tool, "--error-exitcode", "86", "--check-exit-code", "yes",
+        sys.executable, "-m", "pytest", "-o", "addopts=", "-q",
+        "--junitxml", str(report), str(test),
+    ]
+    env = os.environ.copy()
+    env.pop("PYTEST_ADDOPTS", None)
+    env.pop("PYTEST_PLUGINS", None)
+    env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
+    try:
+        with log.open("w") as output:
+            process = subprocess.run(
+                command, cwd=cwd, env=env, stdout=output, stderr=subprocess.STDOUT,
+                timeout=timeout_seconds, check=False,
+            )
+    except subprocess.TimeoutExpired:
+        return {"status": "timeout", "log": str(log), "report": str(report)}
+
+    executed, report_error = _report_result(report, expected_tests)
+    sanitizer_error = _sanitizer_result(log, tool)
+    errors = [error for error in (report_error, sanitizer_error) if error]
+    if process.returncode:
+        errors.insert(0, f"process exit code {process.returncode}")
+    return {
+        "status": "fail" if errors else "pass", "exit_code": process.returncode,
+        "executed_tests": executed, "log": str(log), "report": str(report),
+        "reason": "; ".join(errors) if errors else None,
+    }
 
 
 def main() -> int:
@@ -55,24 +122,8 @@ def main() -> int:
 
     for tool in args.tools:
         log = args.output_dir / f"{tool}.log"
-        command = [
-            sanitizer,
-            "--tool", tool,
-            "--error-exitcode", "86",
-            "--check-exit-code", "yes",
-            sys.executable, "-m", "pytest", "-q", str(TEST),
-        ]
         print(f"[{tool}] running {TEST.name}; log: {log}", flush=True)
-        try:
-            with log.open("w") as output:
-                process = subprocess.run(
-                    command, cwd=ROOT, stdout=output, stderr=subprocess.STDOUT,
-                    timeout=args.timeout_seconds, check=False,
-                )
-            status = "pass" if process.returncode == 0 else "fail"
-            result["tools"][tool] = {"status": status, "exit_code": process.returncode, "log": str(log)}
-        except subprocess.TimeoutExpired:
-            result["tools"][tool] = {"status": "timeout", "log": str(log)}
+        result["tools"][tool] = run_tool(sanitizer, tool, args.output_dir, args.timeout_seconds)
         print(f"[{tool}] {result['tools'][tool]['status']}", flush=True)
         (args.output_dir / "summary.json").write_text(json.dumps(result, indent=2) + "\n")
 

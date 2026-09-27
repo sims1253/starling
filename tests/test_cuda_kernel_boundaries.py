@@ -45,7 +45,7 @@ def test_silu_and_residual_boundary(n: int) -> None:
     actual = cuda_backend.fused_silu_mul(gate, up)
     expected = torch_backend.fused_silu_mul(gate, up)
     torch.testing.assert_close(actual, expected, atol=0.0005, rtol=0.01)
-    for alpha in (1.0, 0.22):
+    for alpha in (0.0, 1.0, 0.22):
         actual = cuda_backend.residual_add(gate, up, alpha)
         expected = torch_backend.residual_add(gate, up, alpha)
         torch.testing.assert_close(actual, expected, atol=0, rtol=0)
