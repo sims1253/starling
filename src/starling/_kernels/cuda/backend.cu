@@ -246,7 +246,7 @@ torch::Tensor fp8_linear(torch::Tensor x, torch::Tensor w_fp8, torch::Tensor w_s
 //   q_out = q * cos + rotate_half(q) * sin ; k_out likewise.
 //   rotate_half(x)[i] = -x[i+hd/2] for i<hd/2 ; x[i-hd/2] for i>=hd/2.
 //   Grid: one block per head across BOTH Q and K (grid = n_q + n_kv).
-//   Block: HEAD_DIM threads (one per element; head_dim is always 128 here).
+//   Block: HEAD_DIM threads (one per element; supported head dims are 64/128).
 //   Load-bearing detail: each product is fp32->bf16-truncated BEFORE the bf16
 //   add, matching Triton's (x*cos).to(bf16) + (x_rot*sin).to(bf16).
 // =========================================================================== //
@@ -297,14 +297,21 @@ std::vector<torch::Tensor> fused_rope(
     auto k_out = torch::empty_like(k_flat);
     int total_heads = n_q + n_kv;
     auto stream = at::cuda::getCurrentCUDAStream();
-    rope_kernel<128><<<total_heads, 128, 0, stream>>>(
-        (const __nv_bfloat16*)q_flat.data_ptr(),
-        (const __nv_bfloat16*)k_flat.data_ptr(),
-        (__nv_bfloat16*)q_out.data_ptr(),
-        (__nv_bfloat16*)k_out.data_ptr(),
-        cos_flat.data_ptr<float>(),
-        sin_flat.data_ptr<float>(),
-        n_q);
+    if (hd == 64) {
+        rope_kernel<64><<<total_heads, 64, 0, stream>>>(
+            (const __nv_bfloat16*)q_flat.data_ptr(),
+            (const __nv_bfloat16*)k_flat.data_ptr(),
+            (__nv_bfloat16*)q_out.data_ptr(),
+            (__nv_bfloat16*)k_out.data_ptr(),
+            cos_flat.data_ptr<float>(), sin_flat.data_ptr<float>(), n_q);
+    } else {
+        rope_kernel<128><<<total_heads, 128, 0, stream>>>(
+            (const __nv_bfloat16*)q_flat.data_ptr(),
+            (const __nv_bfloat16*)k_flat.data_ptr(),
+            (__nv_bfloat16*)q_out.data_ptr(),
+            (__nv_bfloat16*)k_out.data_ptr(),
+            cos_flat.data_ptr<float>(), sin_flat.data_ptr<float>(), n_q);
+    }
     return {q_out, k_out};
 }
 

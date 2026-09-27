@@ -51,16 +51,19 @@ def test_silu_and_residual_boundary(n: int) -> None:
         torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
-@pytest.mark.parametrize("batch,n_q,n_kv", [(1, 1, 1), (1, 3, 2), (1, 17, 9), (2, 3, 2)])
+@pytest.mark.parametrize("batch,n_q,n_kv,hd", [
+    (1, 1, 1, 128), (1, 3, 2, 128), (1, 17, 9, 128), (2, 3, 2, 128),
+    (1, 14, 2, 64), (2, 3, 2, 64),
+])
 @torch.inference_mode()
-def test_rope_head_boundary(batch: int, n_q: int, n_kv: int) -> None:
+def test_rope_head_boundary(batch: int, n_q: int, n_kv: int, hd: int) -> None:
     from starling._kernels import cuda_backend, torch_backend
 
     torch.manual_seed(n_q)
-    q = _rand(batch, n_q, 1, 128)
-    k = _rand(batch, n_kv, 1, 128)
-    cos = torch.randn((1, 1, 1, 128), device=_DEVICE)
-    sin = torch.randn((1, 1, 1, 128), device=_DEVICE)
+    q = _rand(batch, n_q, 1, hd)
+    k = _rand(batch, n_kv, 1, hd)
+    cos = torch.randn((1, 1, 1, hd), device=_DEVICE)
+    sin = torch.randn((1, 1, 1, hd), device=_DEVICE)
     actual = cuda_backend.fused_rope(q, k, cos, sin)
     expected = torch_backend.fused_rope(q, k, cos, sin)
     for output, reference in zip(actual, expected):
@@ -146,8 +149,8 @@ def test_empty_dimensions_rejected_before_launch() -> None:
 def test_rope_rejects_unsupported_head_dim() -> None:
     from starling._kernels import cuda_backend
 
-    q = _rand(1, 1, 1, 64)
-    with pytest.raises(ValueError, match="head_dim=128"):
+    q = _rand(1, 1, 1, 32)
+    with pytest.raises(ValueError, match="head_dim=64 or 128"):
         cuda_backend.fused_rope(q, q, q, q)
 
 

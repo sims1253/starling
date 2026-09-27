@@ -12,6 +12,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
@@ -21,7 +22,7 @@ from pathlib import Path
 TOOLS = ("memcheck", "initcheck", "racecheck", "synccheck")
 ROOT = Path(__file__).resolve().parent.parent
 TEST = ROOT / "tests" / "test_cuda_kernel_boundaries.py"
-EXPECTED_TESTS = 47
+EXPECTED_TESTS = 49  # update when the parameterized CUDA corpus changes
 
 
 def _report_result(report: Path, expected_tests: int) -> tuple[int, str | None]:
@@ -68,20 +69,39 @@ def run_tool(
     env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
     try:
         with log.open("w") as output:
-            process = subprocess.run(
+            process = subprocess.Popen(
                 command, cwd=cwd, env=env, stdout=output, stderr=subprocess.STDOUT,
-                timeout=timeout_seconds, check=False,
+                start_new_session=os.name == "posix",
             )
-    except subprocess.TimeoutExpired:
-        return {"status": "timeout", "log": str(log), "report": str(report)}
+            try:
+                exit_code = process.wait(timeout=timeout_seconds)
+            except subprocess.TimeoutExpired:
+                if os.name == "posix":
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                else:
+                    process.kill()
+                process.wait()
+                return {
+                    "status": "timeout", "exit_code": None, "executed_tests": 0,
+                    "log": str(log), "report": str(report),
+                    "reason": f"timed out after {timeout_seconds} seconds",
+                }
+    except OSError as exc:
+        return {
+            "status": "fail", "exit_code": None, "executed_tests": 0,
+            "log": str(log), "report": str(report), "reason": f"launch failed: {exc}",
+        }
 
     executed, report_error = _report_result(report, expected_tests)
     sanitizer_error = _sanitizer_result(log, tool)
     errors = [error for error in (report_error, sanitizer_error) if error]
-    if process.returncode:
-        errors.insert(0, f"process exit code {process.returncode}")
+    if exit_code:
+        errors.insert(0, f"process exit code {exit_code}")
     return {
-        "status": "fail" if errors else "pass", "exit_code": process.returncode,
+        "status": "fail" if errors else "pass", "exit_code": exit_code,
         "executed_tests": executed, "log": str(log), "report": str(report),
         "reason": "; ".join(errors) if errors else None,
     }

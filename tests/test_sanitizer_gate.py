@@ -51,6 +51,7 @@ def test_no_tests_and_stale_report_fail(tmp_path: Path, monkeypatch) -> None:
     stale = tmp_path / "memcheck.junit.xml"
     stale.write_text('<testsuite><testcase name="stale"/></testsuite>')
     result = _run(tmp_path, monkeypatch, "# no tests\n", mode="no_child")
+    assert not stale.exists()
     assert result["status"] == "fail"
     assert result["executed_tests"] == 0
     assert "did not write" in str(result["reason"])
@@ -65,6 +66,8 @@ def test_skipped_test_fails(tmp_path: Path, monkeypatch) -> None:
 def test_timeout_fails(tmp_path: Path, monkeypatch) -> None:
     result = _run(tmp_path, monkeypatch, "def test_runs(): assert True\n", mode="timeout", timeout=1)
     assert result["status"] == "timeout"
+    assert result["exit_code"] is None
+    assert "timed out" in str(result["reason"])
 
 
 def test_sanitizer_finding_fails(tmp_path: Path, monkeypatch) -> None:
