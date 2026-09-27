@@ -83,9 +83,11 @@ identities and uses 10,000 paired bootstrap resamples.
 
 The English interval reaches beyond the +0.2 pp margin used in #50, so this
 one-tensor candidate is inconclusive on that quality rule. German satisfies
-that margin, but the interval includes zero. The file saves **zero bytes**, so
-it necessarily fails #50's separate 15 MB storage gate. The local layer gain
-did not establish a whole-model WER improvement. Tail languages and Pixel
+that margin, but the interval includes zero. The file saves **zero bytes**,
+as expected when replacing one tensor within the same fixed-size IQ2_XXS
+format. This is not a rejection of #49's quality objective; it only fails
+#50's separate 15 MB storage gate. The local layer gain did not establish a
+whole-model WER improvement. Tail languages and Pixel
 latency/energy remain unmeasured. This candidate is an experimental artifact,
 not a replacement model.
 
