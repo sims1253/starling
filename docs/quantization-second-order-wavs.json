@@ -1,0 +1,74 @@
+{
+  "schema": "starling-second-order-wavs-v1",
+  "dataset": "google/fleurs",
+  "split_clips": {
+    "calibration": [
+      {
+        "file": "de_de_train_0.wav",
+        "sha256": "daa215131077447905c1d8f37507f8e43f1dc2b3a763889c1a81fd7911f670fd"
+      },
+      {
+        "file": "de_de_train_1.wav",
+        "sha256": "6d674344ce528d00becb8d209e7d9a45458ebea6331b7e83f4336439b155657b"
+      },
+      {
+        "file": "de_de_train_2.wav",
+        "sha256": "4e3b913db0537a00bd2874d0b851e744c708e8734964235501d533a911da2339"
+      },
+      {
+        "file": "de_de_train_3.wav",
+        "sha256": "0e0a3aab90f51b6e8586053268b301b1e36909e2b9cec09347cf9042ab486e0c"
+      },
+      {
+        "file": "en_us_train_0.wav",
+        "sha256": "8442e40b2507d86d4359fb76afdda4e13272919a26b0c25b7fb5294f5fb8dfe1"
+      },
+      {
+        "file": "en_us_train_1.wav",
+        "sha256": "c6cf99d27a964cb31503e383e851a0960a850c282512225213e52258963f6231"
+      },
+      {
+        "file": "en_us_train_2.wav",
+        "sha256": "84345e55d09c0b7d3e581c3163dee7ad0c70238413f71b396cb5308eb0112ea0"
+      },
+      {
+        "file": "en_us_train_3.wav",
+        "sha256": "a417ec006fef9a07cf4fda50bc197b983f01e517629339fb5ea6bb864be0fa48"
+      }
+    ],
+    "validation": [
+      {
+        "file": "de_de_validation_0.wav",
+        "sha256": "55c0173541f40d6b340585ab78190859df1c1f8ce481895ad8da0a31b531bf86"
+      },
+      {
+        "file": "de_de_validation_1.wav",
+        "sha256": "0e64c6e7aeb554cefd8c6fa58c4b08a266c89d339d759819997961236d3a49e2"
+      },
+      {
+        "file": "de_de_validation_2.wav",
+        "sha256": "d2956b814c07b683ef7dda749b6eea77af673c36089e7d71115b4d6bb04f144f"
+      },
+      {
+        "file": "de_de_validation_3.wav",
+        "sha256": "6e0bac4f086b73297b5570f5befc3bcc62157a182e250329d7d7c249786bab23"
+      },
+      {
+        "file": "en_us_validation_0.wav",
+        "sha256": "c4120b0b7d6729f4e66e63c96f1c847d425762ca4f69807febe8477e62e68fbd"
+      },
+      {
+        "file": "en_us_validation_1.wav",
+        "sha256": "2f4509716928e9220a78a32860b79b2981f946dd51c3030e38bf4ccd8b2a4ced"
+      },
+      {
+        "file": "en_us_validation_2.wav",
+        "sha256": "12669b3d0de83ba0d9b27da321633a0e73e21944f2c80f35466f51db60d4c7a5"
+      },
+      {
+        "file": "en_us_validation_3.wav",
+        "sha256": "73d521d3d6fde8c88691c6ccfa9650fdec03e5ff70e1ab1b5fa2b5d8eab7685d"
+      }
+    ]
+  }
+}

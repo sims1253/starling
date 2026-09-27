@@ -19,6 +19,10 @@
 // The map is flushed at process exit (std::atexit) and after an explicit
 // starling_ggml_imatrix_flush() C-API call; writing touches no ggml state so
 // it is safe in any teardown order.
+// For a bounded second-order study, STARLING_IMATRIX_TRACE_TENSOR=<name> and
+// STARLING_IMATRIX_TRACE_PATH=<path> also retain at most 4096 input columns
+// for that tensor. The binary trace contains STLGACT1, u32 K, u64 N, then
+// N contiguous F32 activation vectors of width K. Both variables are required.
 
 #pragma once
 
@@ -59,6 +63,11 @@ private:
     std::mutex mu_;                 // guards entries_ (eval callback context)
     std::unordered_map<std::string, Entry> entries_;
     std::string path_;
+    std::string trace_tensor_;
+    std::string trace_path_;
+    std::vector<float> trace_values_;
+    uint32_t trace_k_ = 0;
+    uint64_t trace_n_ = 0;
     bool flushed_ = false;
 };
 
