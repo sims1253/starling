@@ -1,6 +1,6 @@
 # Personal adapter readiness: issues #306 and #307
 
-Assessment on 2026-09-28 against `master@6b95f3477f04aef2d0ee99a95132f311fb45de61`. Both proposals are experiments whose acceptance depends on a user's reviewed, opt-in data and held-out sessions. No such dataset was supplied for this investigation. A repo search of `src`, `apps`, `cpp`, `benchmarks`, and `tests` found no implemented `asr_fix`/consent-version/adapter-lineage export; the recording and review system in [#304](https://github.com/sims1253/starling/issues/304) is still open. No Pixel was connected for latency, memory, artifact and rollback measurements. These are evidence gates, not claims that the adapters cannot work.
+Assessment on 2026-09-28 against `master@6b95f3477f04aef2d0ee99a95132f311fb45de61`. Both proposals are experiments whose acceptance depends on a user's reviewed, opt-in data and held-out sessions. The user confirmed that no reviewed personal dataset exists yet. A repo search of `src`, `apps`, `cpp`, `benchmarks`, and `tests` found no implemented `asr_fix`/consent-version/adapter-lineage export; the recording and review system in [#304](https://github.com/sims1253/starling/issues/304) is still open. No Pixel was connected for latency, memory, artifact and rollback measurements. These are evidence gates, not claims that the adapters cannot work.
 
 ## #306: style LoRA
 
@@ -10,9 +10,9 @@ The next valid experiment needs accepted raw-to-final pairs with consent and del
 
 ## #307: ASR adapter
 
-[#307](https://github.com/sims1253/starling/issues/307) targets acoustic errors, so style edits or model proposals are not faithful ASR labels. It depends on [#304](https://github.com/sims1253/starling/issues/304) and [#310](https://github.com/sims1253/starling/issues/310), both open. Only user-reviewed `asr_fix` spans with their audio and consent may train or score the adapter. No such examples were supplied, so a Parakeet fine-tune or public-only proxy would not measure a personal voice benefit. This is currently **not enough personal data to evaluate**, the no-go outcome explicitly allowed by the issue.
+[#307](https://github.com/sims1253/starling/issues/307) targets acoustic errors, so style edits or model proposals are not faithful ASR labels. It depends on [#304](https://github.com/sims1253/starling/issues/304) and [#310](https://github.com/sims1253/starling/issues/310), both open. Only user-reviewed `asr_fix` spans with their audio and consent may train or score the adapter. The user confirmed there are no such examples yet, so a Parakeet fine-tune or public-only proxy would not measure a personal voice benefit. This is currently **not enough personal data to evaluate**, the no-go outcome explicitly allowed by the issue.
 
-When examples exist, split by session, measure the 10/30/60/120-minute learning curve, held-out personal WER/CER and critical-term accuracy, and general FLEURS WER per language against the +0.2 percentage-point absolute regression gate. A candidate then needs merged-weight GGUF/repack identity, Pixel latency within measurement noise, and a demonstrated base-model rollback. Keep the general model selectable throughout.
+When examples exist, split by session, measure the 10/30/60/120-minute learning curve, held-out personal WER/CER and critical-term accuracy, and general FLEURS WER per language against the +0.2 percentage-point absolute regression gate. A candidate then needs merged-weight GGUF/repack identity, Pixel latency within measurement noise, and a demonstrated base-model rollback. Keep the general model selectable throughout. The planned Pixel 10 Pro is not connected yet; the available `adb` device is an offline emulator.
 
 ## Decision boundary
 
