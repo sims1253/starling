@@ -44,13 +44,24 @@ def _ext():
     return _module()
 
 
+def _require_nonempty(*tensors: torch.Tensor) -> None:
+    """Reject empty launches before C++ divides by a dimension or launches grid 0."""
+    if any(t.numel() == 0 for t in tensors):
+        raise ValueError("CUDA fused kernels require non-empty tensors")
+
+
 # ---------------------------------------------------------------------------
 # Public fused ops (same signatures as triton_backend / torch_backend)
 # ---------------------------------------------------------------------------
 
 def fused_rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     """RMSNorm over the last dim, fp32 internally, bf16 in/out (CUDA fused)."""
+    _require_nonempty(x, weight)
     N = weight.numel()
+    if x.shape[-1] != N or weight.ndim != 1:
+        raise ValueError("CUDA fused_rmsnorm requires x.shape[-1] == weight.numel() and 1D weight")
+    if not weight.is_contiguous():
+        raise ValueError("CUDA fused_rmsnorm requires contiguous weight")
     M = x.numel() // N
     x2 = x.reshape(M, N)
     if not x2.is_contiguous():
@@ -61,6 +72,9 @@ def fused_rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Te
 
 def fused_silu_mul(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
     """SiLU(gate) * up fused into one kernel, fp32 internally (CUDA fused)."""
+    _require_nonempty(gate, up)
+    if gate.shape != up.shape:
+        raise ValueError("CUDA fused_silu_mul requires gate and up to have the same shape")
     N = gate.shape[-1]
     M = gate.numel() // N
     g2 = gate.reshape(M, N)
@@ -75,6 +89,9 @@ def fused_silu_mul(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
 
 def residual_add(x: torch.Tensor, y: torch.Tensor, alpha: float = 1.0) -> torch.Tensor:
     """x + alpha*y fused (CUDA). alpha=1.0 fast path is plain x+y."""
+    _require_nonempty(x, y)
+    if x.shape != y.shape:
+        raise ValueError("CUDA residual_add requires x and y to have the same shape")
     N = x.shape[-1]
     M = x.numel() // N
     x2 = x.reshape(M, N)
@@ -97,6 +114,11 @@ def quantize_weight_e4m3(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tens
 
 def fp8_linear(x: torch.Tensor, w_fp8: torch.Tensor, w_scale: torch.Tensor) -> torch.Tensor:
     """x @ W^T with an fp8 weight via the fused dequant-GEMV (CUDA)."""
+    _require_nonempty(x, w_fp8, w_scale)
+    if w_fp8.ndim != 2 or x.numel() < w_fp8.shape[1] or w_scale.numel() < w_fp8.shape[0]:
+        raise ValueError("CUDA fp8_linear requires x length >= K and one scale per output row")
+    if not w_fp8.is_contiguous() or not w_scale.is_contiguous():
+        raise ValueError("CUDA fp8_linear requires contiguous weights and scales")
     return _ext().fp8_linear(x, w_fp8, w_scale)
 
 
@@ -108,7 +130,14 @@ def fused_rope(
     Mirrors the triton/torch launchers: flatten q/k to (B*heads, hd), take the
     single seq=1 position from cos/sin, and require fp32 cos/sin for the kernel.
     """
+    _require_nonempty(q, k, cos, sin)
+    if q.ndim != 4 or k.ndim != 4:
+        raise ValueError("CUDA fused_rope requires four-dimensional q and k")
     B, n_q, _, hd = q.shape
+    if hd != 128 or k.shape[-1] != hd or cos.shape[-1] != hd or sin.shape[-1] != hd:
+        raise ValueError("CUDA fused_rope requires head_dim=128 for q, k, cos and sin")
+    if q.shape[0] != k.shape[0] or q.shape[2] != 1 or k.shape[2] != 1:
+        raise ValueError("CUDA fused_rope requires matching batch sizes and one decode position")
     n_kv = k.shape[1]
     q_flat = q.reshape(B * n_q, hd).contiguous()
     k_flat = k.reshape(B * n_kv, hd).contiguous()
@@ -120,6 +149,9 @@ def fused_rope(
 
 def compute_rstd(x: torch.Tensor, eps: float) -> torch.Tensor:
     """Scalar rstd = rsqrt(mean(x^2)+eps) as a (1,) fp32 tensor (CUDA)."""
+    _require_nonempty(x)
+    if x.numel() != x.shape[-1]:
+        raise ValueError("CUDA compute_rstd requires one row")
     return _ext().compute_rstd(x, float(eps))
 
 
@@ -127,6 +159,11 @@ def fused_gemv_normscale(
     x: torch.Tensor, w_scaled: torch.Tensor, rstd: torch.Tensor
 ) -> torch.Tensor:
     """GEMV (M=1) of x @ w_scaled^T with rstd folded into the epilogue (CUDA)."""
+    _require_nonempty(x, w_scaled, rstd)
+    if w_scaled.ndim != 2 or x.numel() < w_scaled.shape[1] or rstd.numel() != 1:
+        raise ValueError("CUDA fused_gemv_normscale requires x length >= K and scalar rstd")
+    if not w_scaled.is_contiguous():
+        raise ValueError("CUDA fused_gemv_normscale requires contiguous weights")
     return _ext().fused_gemv_normscale(x, w_scaled, rstd)
 
 
@@ -134,6 +171,13 @@ def fp4_gemv_fused(
     x: torch.Tensor, codes: torch.Tensor, scales: torch.Tensor
 ) -> torch.Tensor:
     """Fused NVFP4 dequant-GEMV (M=1): streams nibble-packed codes + fp8 scales (CUDA)."""
+    _require_nonempty(x, codes, scales)
+    if codes.ndim != 2 or codes.shape[1] % 8 or x.numel() < codes.shape[1] * 2:
+        raise ValueError("CUDA fp4_gemv_fused requires K divisible by 16 and x length >= K")
+    if scales.shape != (codes.shape[0], codes.shape[1] // 8):
+        raise ValueError("CUDA fp4_gemv_fused requires one scale per 16 values")
+    if not codes.is_contiguous() or not scales.is_contiguous():
+        raise ValueError("CUDA fp4_gemv_fused requires contiguous codes and scales")
     return _ext().fp4_gemv_fused(x, codes, scales)
 
 
