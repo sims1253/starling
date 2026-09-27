@@ -20,7 +20,7 @@ python scripts/convert_granite_gguf.py \
   --include-ctc-head --output /tmp/granite-with-ctc.gguf
 cmake -S backends/native -B /tmp/granite-build -DSTARLING_GGML_SHARED=ON
 cmake --build /tmp/granite-build --target starling_ggml
-python benchmarks/speculative/eval_granite_ctc.py \
+STARLING_GGML_DEVICE=cpu python benchmarks/speculative/eval_granite_ctc.py \
   --library /tmp/granite-build/libstarling_ggml.so \
   --gguf /tmp/granite-with-ctc.gguf \
   --wav tests/fixtures/2086-149220-0033.wav \
@@ -36,6 +36,15 @@ from the model repository. The full CTC-inclusive GGUF has 942 tensors and
 is 205,723,776 bytes larger than the local pre-existing base GGUF; the
 optional head's source file is 205,723,810 bytes. These are exact token-ID
 comparisons, not just transcript similarity.
+
+Each reference also pins the SHA-256 of the CTC-inclusive GGUF used for the
+reported comparison (`cec47a4fb872ace2713447409f01e0f9ef0d2a7f217db8bb9c33ea0ef96c916a`).
+The source `out_llm.safetensors` at the pinned revision has SHA-256
+`6cc10d68fe05aec359aceffd597617c875b23f27211ee6dcdb7510d9e90fc64e`.
+The parity runner rejects a different GGUF before loading it and prints the
+actual GGUF hash, library hash, and selected native backend with the ID result.
+Thus the result is tied to the supplied binary and artifact, while a newly
+converted GGUF needs its own pinned reference if its bytes differ.
 
 This is an extraction/parity milestone. The generic #311 batched verifier is
 still needed to consume the draft, prove output equality to target-only

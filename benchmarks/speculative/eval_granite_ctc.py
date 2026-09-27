@@ -18,6 +18,14 @@ import numpy as np
 import soundfile as sf
 
 
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(4 * 1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--library", type=Path, required=True)
@@ -27,7 +35,10 @@ def main() -> int:
     args = parser.parse_args()
 
     reference = json.loads(args.reference.read_text())
-    audio_hash = hashlib.sha256(args.wav.read_bytes()).hexdigest()
+    gguf_hash = sha256_file(args.gguf)
+    if gguf_hash != reference["gguf_sha256"]:
+        parser.error(f"GGUF hash differs from reference: {gguf_hash}")
+    audio_hash = sha256_file(args.wav)
     if audio_hash != reference["audio_sha256"]:
         parser.error(f"audio hash differs from reference: {audio_hash}")
     audio, sample_rate = sf.read(args.wav, dtype="float32")
@@ -51,6 +62,9 @@ def main() -> int:
     if not handle:
         raise RuntimeError((err.value or b"model load failed").decode())
     try:
+        lib.starling_ggml_backend_name.argtypes = []
+        lib.starling_ggml_backend_name.restype = ctypes.c_char_p
+        backend = lib.starling_ggml_backend_name().decode()
         capacity = max(1, len(audio) // 160 + 1)
         ids = (ctypes.c_int32 * capacity)()
         count = ctypes.c_int32()
@@ -70,6 +84,9 @@ def main() -> int:
         first_difference = min(len(native), len(expected))
     print(json.dumps({
         "model_revision": reference["model_revision"],
+        "gguf_sha256": gguf_hash,
+        "library_sha256": sha256_file(args.library),
+        "backend": backend,
         "audio_sha256": audio_hash,
         "native_count": len(native),
         "python_count": len(expected),
