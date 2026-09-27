@@ -1009,6 +1009,57 @@ bool forward_decode(const QwenDecodeCtx& m, int32_t prev_token, int64_t past,
     return true;
 }
 
+// One causal S-row pass over [prev_token, draft_0, ..., draft_{S-2}].
+// The cache writes all S input rows, but each query can see only its own and
+// earlier positions. The caller rewinds state.length after a rejection; stale
+// rows beyond that logical length are masked and overwritten by the next pass.
+bool forward_verify(const QwenDecodeCtx& m, const std::vector<int32_t>& tokens,
+                    LlmState& state, std::vector<float>& logits, std::string& e) {
+    const auto& lc = m.dims;
+    DeviceCache* dc = get_device_cache(m, e);
+    if (!dc) return false;
+    const int64_t past = state.length;
+    const int64_t S = (int64_t)tokens.size();
+    if (S < 2 || past < 0 || past + S > (int64_t)lc.max_cache) {
+        e = std::string(m.spec.label) + " verify exceeds cache";
+        return false;
+    }
+    std::vector<int32_t> positions((size_t)S);
+    std::vector<float> mask((size_t)lc.max_cache * (size_t)S);
+    const float neg = -3.3895313892515355e38f;
+    for (int64_t row = 0; row < S; ++row) {
+        positions[(size_t)row] = (int32_t)(past + row);
+        for (int64_t key = 0; key < (int64_t)lc.max_cache; ++key)
+            mask[(size_t)row * lc.max_cache + (size_t)key] =
+                key <= past + row ? 0.0f : neg;
+    }
+    const bool F = use_f32_acts(m);
+    bool ok = run_graph([&](ggml_context* c) -> ggml_tensor* {
+        int64_t sne[1] = {S};
+        ggml_tensor* ids = graph_input_tensor(c, GGML_TYPE_I32, 1, sne,
+                                              tokens.data(), tokens.size() * sizeof(int32_t));
+        ggml_tensor* x = ggml_get_rows(c, clone_weight(c, m.loader, "llm.embed.weight"), ids);
+        x = apply_embed_mul(c, m.spec, x);
+        ggml_tensor* pos = graph_input_tensor(c, GGML_TYPE_I32, 1, sne,
+                                              positions.data(), positions.size() * sizeof(int32_t));
+        ggml_tensor* cs = ggml_get_rows(c, dc->rope_cos, pos);
+        ggml_tensor* sn = ggml_get_rows(c, dc->rope_sin, pos);
+        int64_t mne[2] = {(int64_t)lc.max_cache, S};
+        ggml_tensor* mt = graph_input_tensor(c, GGML_TYPE_F32, 2, mne,
+                                             mask.data(), mask.size() * sizeof(float));
+        for (int li = 0; li < (int)lc.n_layers; ++li)
+            x = append_layer_new(c, m, li, x, S, past, dc->k[li], dc->v[li],
+                                 cs, sn, mt, /*kv_mode=*/2, pos, nullptr);
+        ggml_tensor* n = F ? rmsf(c, m.loader, x, "llm.final_norm.weight", lc.rms_norm_eps)
+                           : spec_rms(c, m.spec, m.loader, x, "llm.final_norm.weight", lc.rms_norm_eps);
+        ggml_tensor* lg = lm_head_gemm(c, m.loader, m.spec, n);
+        return ff(c, apply_logits_scaling(c, m.spec, lg));
+    }, logits);
+    if (!ok) { e = std::string(m.spec.label) + " verify graph failed"; return false; }
+    state.length = past + S;
+    return true;
+}
+
 // ===========================================================================
 // Greedy pick under the bf16-tie mode: round the logits to bf16 (the
 // reference reads the lm_head output stored as bf16) and keep the FIRST
@@ -1529,6 +1580,125 @@ bool greedy_generate(const QwenDecodeCtx& m, const InputsEmbeds& i,
         if (FILE* f = std::fopen(fp, "wb")) {
             std::fwrite(o.ids.data(), sizeof(int32_t), o.ids.size(), f);
             std::fclose(f);
+        }
+    }
+    return true;
+}
+
+bool speculative_generate(const QwenDecodeCtx& m, const InputsEmbeds& i,
+                          const GenerateParams& op, int max_k,
+                          const DraftProposer& proposer, const CancelCheck& cancelled,
+                          GenerateResult& o, SpeculativeStats& stats, std::string& e) {
+    o = GenerateResult{};
+    stats = SpeculativeStats{};
+    if (!proposer || max_k < 1 || max_k > 16 || op.max_new_tokens < 1 ||
+        op.max_cache_len > (int32_t)m.dims.max_cache ||
+        i.n_tokens + op.max_new_tokens > op.max_cache_len ||
+        m.spec.decode_add || debug_probe_active(m.spec)) {
+        e = std::string(m.spec.label) + " invalid speculative generation configuration";
+        return false;
+    }
+    if (cancelled && cancelled()) {
+        o.stop_reason = GenStopReason::kCancelled;
+        return true;
+    }
+    PrefillResult prefill;
+    if (!llm_prefill(m, i, op.max_cache_len, prefill, e)) return false;
+    o.prefill_logits = std::move(prefill.logits);
+    LlmState state = std::move(prefill.state);
+    o.ids.push_back(prefill.first_token);
+    if (generation_stops_on(prefill.first_token, op)) {
+        o.stop_reason = GenStopReason::kEos;
+        return true;
+    }
+    const ggml_tensor* head = m.loader.tensor(lm_head_name(m.spec));
+    const ggml_tensor* embed = m.loader.tensor("llm.embed.weight");
+    if (!head || !embed) {
+        e = std::string(m.spec.label) + " missing speculative head/embedding";
+        return false;
+    }
+    const int64_t vocab = head->ne[1];
+    while ((int)o.ids.size() < op.max_new_tokens) {
+        if (cancelled && cancelled()) {
+            o.stop_reason = GenStopReason::kCancelled;
+            return true;
+        }
+        const int remaining = op.max_new_tokens - (int)o.ids.size();
+        const int room = (int)((int64_t)op.max_cache_len - state.length);
+        const int cap = std::min({max_k, remaining - 1, room - 1});
+        std::vector<int32_t> draft;
+        if (cap > 0) draft = proposer(o.ids, cap);
+        if ((int)draft.size() > cap ||
+            std::any_of(draft.begin(), draft.end(), [&](int32_t id) {
+                return id < 0 || id >= embed->ne[1];
+            })) {
+            e = std::string(m.spec.label) + " proposer returned invalid draft";
+            return false;
+        }
+        if (draft.empty()) {
+            if (room < 1) {
+                e = std::string(m.spec.label) + " decode exceeds cache";
+                return false;
+            }
+            std::vector<float> logits;
+            if (!forward_decode(m, o.ids.back(), state.length, state, logits, e))
+                return false;
+            const int32_t token = spec_argmax_impl(m.spec, logits);
+            o.ids.push_back(token);
+            ++stats.fallback_steps;
+            if (generation_stops_on(token, op)) {
+                o.stop_reason = GenStopReason::kEos;
+                return true;
+            }
+            continue;
+        }
+        const int64_t past = state.length;
+        std::vector<int32_t> input;
+        input.reserve(draft.size() + 1);
+        input.push_back(o.ids.back());
+        input.insert(input.end(), draft.begin(), draft.end());
+        std::vector<float> logits;
+        if (!forward_verify(m, input, state, logits, e)) return false;
+        ++stats.verify_calls;
+        stats.proposed += (int32_t)draft.size();
+        if (logits.size() != input.size() * (size_t)vocab) {
+            e = std::string(m.spec.label) + " verify logits have wrong shape";
+            return false;
+        }
+        // A cancellation after graph execution discards all tentative draft
+        // output. The previous verified prefix remains available in o.ids.
+        if (cancelled && cancelled()) {
+            state.length = past;
+            o.stop_reason = GenStopReason::kCancelled;
+            return true;
+        }
+        bool rejected = false;
+        for (size_t j = 0; j < draft.size(); ++j) {
+            std::vector<float> row(logits.begin() + (ptrdiff_t)(j * vocab),
+                                   logits.begin() + (ptrdiff_t)((j + 1) * vocab));
+            const int32_t target = spec_argmax_impl(m.spec, row);
+            if (target == draft[j]) ++stats.accepted;
+            else rejected = true;
+            o.ids.push_back(target);
+            if (generation_stops_on(target, op)) {
+                state.length = past + (int64_t)j + 1;
+                o.stop_reason = GenStopReason::kEos;
+                return true;
+            }
+            if (rejected) {
+                state.length = past + (int64_t)j + 1;
+                break;
+            }
+        }
+        if (rejected) continue;
+        // Every draft token matched. Row K predicts the free bonus token.
+        std::vector<float> bonus_row(logits.begin() + (ptrdiff_t)(draft.size() * vocab),
+                                     logits.end());
+        const int32_t bonus = spec_argmax_impl(m.spec, bonus_row);
+        o.ids.push_back(bonus);
+        if (generation_stops_on(bonus, op)) {
+            o.stop_reason = GenStopReason::kEos;
+            return true;
         }
     }
     return true;
