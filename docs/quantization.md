@@ -306,8 +306,8 @@ Run each arm in a fresh process with the same original F32 GGUF, imatrix,
 native library, and device. The scorer, model, source, imatrix, engine, device,
 and protocol hashes are recorded with the clip IDs, decoded-audio hashes,
 references, hypotheses, and unrounded WER. The comparison refuses mismatched
-inputs, missing clips, duplicate IDs, changed scoring code, or a protocol
-edited after evaluation.
+inputs, missing clips, duplicate IDs, changed scoring code, a native-library
+fallback from `STARLING_GGML_LIB`, or a protocol edited after evaluation.
 
 ```bash
 uv run --extra bench python benchmarks/fleurs_download.py \

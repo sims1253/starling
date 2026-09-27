@@ -68,6 +68,14 @@ def _active_device() -> str:
     return backend_name()
 
 
+def _loaded_engine_path() -> Path | None:
+    """Resolve the library ctypes actually selected after its fallback search."""
+    from starling._ggml import _native
+    lib = _native._load_lib()
+    name = getattr(lib, "_name", None)
+    return Path(name).resolve() if name else None
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--models", nargs="+", required=True,
@@ -123,7 +131,6 @@ def main() -> int:
     if args.protocol and (lib_path is None or not lib_path.is_file()):
         ap.error("--protocol requires STARLING_GGML_LIB pointing to the native library")
     protocol_hash = _sha256_file(args.protocol) if args.protocol else None
-    engine_hash = _sha256_file(lib_path) if lib_path and lib_path.is_file() else None
     scorer_hash = _sha256_file(REPO_ROOT / "benchmarks" / "wer.py")
 
     tiers = [t.strip() for t in args.tiers.split(",") if t.strip()]
@@ -228,7 +235,7 @@ def main() -> int:
                 "model_bytes": p.stat().st_size,
                 "source_sha256": _sha256_file(args.source_model) if args.source_model else None,
                 "imatrix_sha256": _sha256_file(args.imatrix) if args.imatrix else None,
-                "engine_sha256": engine_hash,
+                "engine_sha256": None,
                 "scorer_sha256": scorer_hash,
                 "protocol_sha256": protocol_hash,
                 "device": args.device,
@@ -255,12 +262,20 @@ def main() -> int:
         try:
             eng.load()
             if args.include_clips or args.protocol:
+                loaded_path = _loaded_engine_path()
+                if args.protocol and (loaded_path is None or
+                                      loaded_path != lib_path.resolve()):
+                    ap.error(f"requested native library {lib_path!s}, but loaded "
+                             f"{loaded_path!s}")
                 actual_device = _active_device()
                 if args.protocol and actual_device.lower() != args.device.lower():
                     ap.error(f"requested device {args.device!r}, but engine loaded "
                              f"on {actual_device!r}")
                 if args.include_clips:
                     row["provenance"]["device"] = actual_device
+                    row["provenance"]["engine_sha256"] = (
+                        _sha256_file(loaded_path) if loaded_path and loaded_path.is_file()
+                        else None)
             for tier in tiers:
                 hyp = eng.transcribe(fixtures[tier])[0]
                 ref = REFERENCE_TRANSCRIPTS[tier]
