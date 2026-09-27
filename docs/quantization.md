@@ -290,9 +290,88 @@ and references, then sampled 300 per-clip WER differences with replacement
 input/output hashes, corpus-manifest construction, counts, timings, and the
 incremental combined-minus-embedding comparison; raw transcripts stay local.
 
+### Held-out compact-recipe promotion gate
+
+The first 300 EN/DE **test** clips above were used to inspect the recipes, so
+the next decision uses 300 EN/DE **validation** clips. The fixed acceptance
+protocol is [`quants/protocols/parakeet-compact-validation-v1.json`](../quants/protocols/parakeet-compact-validation-v1.json):
+each language must have exactly 300 paired clips, the candidate must save at
+least 15,000,000 stored bytes, and the upper 95% paired-bootstrap bound on
+candidate-minus-baseline mean per-clip WER must be **below +0.2 percentage
+points** for both languages. The same rule applies to the embedding-only and
+combined candidates. Passing is evidence for this sample and backend; a
+release default still needs the intended accelerator and workload checks.
+
+Run each arm in a fresh process with the same original F32 GGUF, imatrix,
+native library, and device. The scorer, model, source, imatrix, engine, device,
+and protocol hashes are recorded with the clip IDs, decoded-audio hashes,
+references, hypotheses, and unrounded WER. The comparison refuses mismatched
+inputs, missing clips, duplicate IDs, changed scoring code, or a protocol
+edited after evaluation.
+
+```bash
+uv run --extra bench python benchmarks/fleurs_download.py \
+  --out models/fleurs_validation_ende --split validation \
+  --fleurs en_us:300 --fleurs de_de:300
+export STARLING_GGML_LIB="$PWD/build-cpu/libstarling_ggml.so"
+uv run --extra bench python benchmarks/wer_quant.py --tiers '' \
+  --device cpu --corpus models/fleurs_validation_ende \
+  --models baseline=models/parakeet-iq2-baseline.gguf \
+  --source-model models/parakeet-tdt-0.6b-v3-f32.gguf \
+  --imatrix models/parakeet.imx.bin \
+  --protocol quants/protocols/parakeet-compact-validation-v1.json \
+  --include-clips --json /tmp/compact-baseline.json
+uv run --extra bench python benchmarks/wer_quant.py --tiers '' \
+  --device cpu --corpus models/fleurs_validation_ende \
+  --models embedding=models/parakeet-iq2-embedding-q8.gguf \
+  --source-model models/parakeet-tdt-0.6b-v3-f32.gguf \
+  --imatrix models/parakeet.imx.bin \
+  --protocol quants/protocols/parakeet-compact-validation-v1.json \
+  --include-clips --json /tmp/compact-embedding.json
+uv run --extra bench python benchmarks/compare_quant_wer.py \
+  --protocol quants/protocols/parakeet-compact-validation-v1.json \
+  --baseline /tmp/compact-baseline.json \
+  --candidate /tmp/compact-embedding.json \
+  --json /tmp/compact-embedding-verdict.json
+```
+
+Evaluate the combined candidate with the same protocol and a separate
+`wer_quant.py` process, then compare it with the baseline. The comparator
+reports `pass`, `fail`, or `inconclusive`; a CI touching the margin remains
+inconclusive. Keep opt-in recipes when a gate is inconclusive. For CUDA or
+Vulkan runs, build the corresponding native library and set `--device CUDA0`
+or `--device Vulkan0` in **both** arms; the result is specific to that backend.
+
+The fresh CPU study used the public Parakeet checkpoint at revision
+`541d1f99c6b0c3cd0b11a95167540bb8edefd82b`, converted once to F32
+(2,356,818,944 bytes; SHA256 `f3337ef2cd24b458942e05f420a0f8fbf6466d25a07e9b97f7db7e2775845ffa`).
+The imatrix (SHA256 `de9f635dc79a149d3389d41d7e8f460c4362427d68c2b0199697baefe97c69e8`)
+used six fixture repetitions and 84 FLEURS **train** clips across eight
+languages. The held-out corpus used 300 validation clips each from `en_us`
+and `de_de`. Its decoded WAV/TXT manifest SHA256 was
+`50d9b85b633a536ec8b97d97c8f6aa602ec23d1b37c36ad33ab437704ac0e1aa`;
+the dataset repository revision observed was
+`70bb2e84b976b7e960aa89f1c648e09c59f894dd`, although the downloader's
+`hf://` URL was not revision-pinned. The exact clip and decoded-audio hashes
+are in the local per-arm JSON records. All three arms used the same CPU native
+library (SHA256 `c13894a1e1972fc1e3afd5151f108764bd0ee6a3af1524d23f6bcbc4c60c728a`).
+
+| CPU arm | Stored bytes | EN WER | DE WER | Paired EN delta [95% CI], pp | Paired DE delta [95% CI], pp | Gate |
+|---------|-------------:|-------:|-------:|------------------------------:|------------------------------:|------|
+| IQ2_XXS baseline | 325,124,224 | 8.12% | 10.23% | — | — | reference |
+| Q8 embedding | 309,721,472 | 8.12% | 10.23% | 0.000 [0.000, 0.000] | 0.000 [0.000, 0.000] | pass |
+| Q8 embedding + IQ4_NL linears | 303,616,512 | 8.45% | 10.79% | +0.328 [-0.090, +0.722] | +0.563 [+0.060, +1.100] | inconclusive |
+
+The embedding-only arm saved 15,402,752 bytes and produced identical
+hypotheses on these 600 CPU clips. That is a sample-specific result, not a
+losslessness guarantee. The combined arm saved 21,507,712 bytes, but its
+paired intervals cross the declared +0.2-point margin. Neither recipe is
+promoted to a default by this CPU study; accelerator validation remains
+necessary for the intended deployment path.
+
 ## Results (parakeet-tdt-0.6b-v3, LibriSpeech fixtures)
 
-All numbers from `benchmarks/wer_quant.py` use the CPU path. The dated Vulkan
+The historical numbers below use the CPU path. The dated Vulkan
 retest below records the failures in that build; GPU corpus parity remains
 unvalidated. The fixtures repeat one utterance, so read the deltas against the
 f32 row, not as leaderboard WERs. The imatrix was collected over the same three fixtures (single speaker,

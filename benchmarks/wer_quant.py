@@ -55,6 +55,19 @@ def _bootstrap_ci(values: list[float], n: int = 1000, seed: int = 0):
     return round(float(lo), 2), round(float(hi), 2)
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _active_device() -> str:
+    from starling._ggml._native import backend_name
+    return backend_name()
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--models", nargs="+", required=True,
@@ -79,7 +92,39 @@ def main() -> int:
     ap.add_argument("--include-clips", action="store_true",
                     help="include ordered references, hypotheses, and per-clip "
                          "WER in JSON for paired corpus comparisons")
+    ap.add_argument("--device", default=os.environ.get("STARLING_GGML_DEVICE", "cpu"),
+                    help="native backend: cpu, CUDA0, Vulkan0, etc. (default: cpu)")
+    ap.add_argument("--protocol", type=Path,
+                    help="predeclared paired-WER protocol; its SHA256 is sealed in "
+                         "each per-clip JSON record")
+    ap.add_argument("--source-model", type=Path,
+                    help="floating-point GGUF used to derive this quantized model")
+    ap.add_argument("--imatrix", type=Path,
+                    help="importance matrix used to quantize this model")
     args = ap.parse_args()
+
+    if args.protocol and (not args.include_clips or not args.json):
+        ap.error("--protocol requires --include-clips and --json")
+    if args.protocol and len(args.models) != 1:
+        ap.error("--protocol requires exactly one model per process")
+    if args.protocol and not args.protocol.is_file():
+        ap.error(f"protocol does not exist: {args.protocol}")
+    if args.protocol and (not args.source_model or not args.source_model.is_file()):
+        ap.error("--protocol requires --source-model pointing to the original GGUF")
+    if args.protocol and (not args.imatrix or not args.imatrix.is_file()):
+        ap.error("--protocol requires --imatrix pointing to the quantization matrix")
+    os.environ["STARLING_GGML_DEVICE"] = args.device
+
+    # A comparison requires exact engine/scorer identity, not merely a device
+    # label. The native wrapper can discover a library implicitly, but an
+    # explicit path is needed to record which binary produced the hypotheses.
+    lib_path = Path(os.environ["STARLING_GGML_LIB"]).expanduser() if os.environ.get(
+        "STARLING_GGML_LIB") else None
+    if args.protocol and (lib_path is None or not lib_path.is_file()):
+        ap.error("--protocol requires STARLING_GGML_LIB pointing to the native library")
+    protocol_hash = _sha256_file(args.protocol) if args.protocol else None
+    engine_hash = _sha256_file(lib_path) if lib_path and lib_path.is_file() else None
+    scorer_hash = _sha256_file(REPO_ROOT / "benchmarks" / "wer.py")
 
     tiers = [t.strip() for t in args.tiers.split(",") if t.strip()]
     if not (tiers or args.corpus or args.fleurs_eval or args.mls_de):
@@ -178,6 +223,16 @@ def main() -> int:
         per_clip: dict[str, list[float]] = {}
         if args.include_clips:
             row["clips"] = {}
+            row["provenance"] = {
+                "model_sha256": _sha256_file(p),
+                "model_bytes": p.stat().st_size,
+                "source_sha256": _sha256_file(args.source_model) if args.source_model else None,
+                "imatrix_sha256": _sha256_file(args.imatrix) if args.imatrix else None,
+                "engine_sha256": engine_hash,
+                "scorer_sha256": scorer_hash,
+                "protocol_sha256": protocol_hash,
+                "device": args.device,
+            }
 
         def evaluate_clips(column, clips):
             wers = []
@@ -199,6 +254,12 @@ def main() -> int:
 
         try:
             eng.load()
+            if args.protocol:
+                actual_device = _active_device()
+                if actual_device.lower() != args.device.lower():
+                    ap.error(f"requested device {args.device!r}, but engine loaded "
+                             f"on {actual_device!r}")
+                row["provenance"]["device"] = actual_device
             for tier in tiers:
                 hyp = eng.transcribe(fixtures[tier])[0]
                 ref = REFERENCE_TRANSCRIPTS[tier]
