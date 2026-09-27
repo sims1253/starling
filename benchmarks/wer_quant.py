@@ -254,12 +254,13 @@ def main() -> int:
 
         try:
             eng.load()
-            if args.protocol:
+            if args.include_clips or args.protocol:
                 actual_device = _active_device()
-                if actual_device.lower() != args.device.lower():
+                if args.protocol and actual_device.lower() != args.device.lower():
                     ap.error(f"requested device {args.device!r}, but engine loaded "
                              f"on {actual_device!r}")
-                row["provenance"]["device"] = actual_device
+                if args.include_clips:
+                    row["provenance"]["device"] = actual_device
             for tier in tiers:
                 hyp = eng.transcribe(fixtures[tier])[0]
                 ref = REFERENCE_TRANSCRIPTS[tier]

@@ -365,14 +365,31 @@ library (SHA256 `c13894a1e1972fc1e3afd5151f108764bd0ee6a3af1524d23f6bcbc4c60c728
 The embedding-only arm saved 15,402,752 bytes and produced identical
 hypotheses on these 600 CPU clips. That is a sample-specific result, not a
 losslessness guarantee. The combined arm saved 21,507,712 bytes, but its
-paired intervals cross the declared +0.2-point margin. Neither recipe is
-promoted to a default by this CPU study; accelerator validation remains
-necessary for the intended deployment path.
+paired intervals cross the declared +0.2-point margin.
+
+The same baseline and embedding-only files were also evaluated in fresh
+CUDA0 processes on the same 600 validation clips. Both runs used the CUDA
+native library (SHA256
+`bb51327172bd90d05a474946bfe1a8e63e79acc7dff23962831dacbfb68a6528`)
+with the depthwise convolution compatibility fix from #331. The model, source,
+imatrix, corpus, scorer, and protocol hashes matched the CPU study; the
+comparator verified CUDA0 as the actual backend in both runs.
+
+| CUDA0 arm | Stored bytes | EN WER | DE WER | Paired EN delta [95% CI], pp | Paired DE delta [95% CI], pp | Gate |
+|-----------|-------------:|-------:|-------:|------------------------------:|------------------------------:|------|
+| IQ2_XXS baseline | 325,124,224 | 8.30% | 9.99% | — | — | reference |
+| Q8 embedding | 309,721,472 | 8.28% | 9.99% | -0.018 [-0.053, 0.000] | 0.000 [0.000, 0.000] | pass |
+
+CUDA0 Q8 embedding saved 15,402,752 bytes and passed the same predeclared
+gate. The CPU and CUDA WER values differ, so the paired comparison is made
+within each backend. The combined arm has no CUDA verdict. Both recipes stay
+opt-in pending broader deployment and workload evidence, including Vulkan and
+resident-memory/latency measurements.
 
 ## Results (parakeet-tdt-0.6b-v3, LibriSpeech fixtures)
 
 The historical numbers below use the CPU path. The dated Vulkan
-retest below records the failures in that build; GPU corpus parity remains
+retest below records the failures in that build; Vulkan corpus parity remains
 unvalidated. The fixtures repeat one utterance, so read the deltas against the
 f32 row, not as leaderboard WERs. The imatrix was collected over the same three fixtures (single speaker,
 ~1.5 min audio — deliberately minimal; real calibration would use an hour of

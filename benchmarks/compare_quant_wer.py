@@ -80,17 +80,17 @@ def compare(protocol_path: Path, baseline_path: Path, candidate_path: Path) -> d
     cohorts = protocol.get("cohorts")
     _check(isinstance(cohorts, dict) and cohorts,
            "protocol needs a nonempty map of cohorts to exact clip counts")
-    _check(all(isinstance(k, str) and isinstance(v, int) and v >= 5
+    _check(all(isinstance(k, str) and type(v) is int and v >= 5
                for k, v in cohorts.items()), "each cohort needs at least five clips")
     margin = protocol.get("max_wer_delta_pp")
     saving = protocol.get("min_bytes_saved")
     draws = protocol.get("bootstrap_resamples")
     seed = protocol.get("bootstrap_seed")
-    _check(isinstance(margin, (int, float)) and 0 <= margin < 100,
+    _check(type(margin) in (int, float) and math.isfinite(margin) and 0 <= margin < 100,
            "max_wer_delta_pp must be a nonnegative percentage-point margin")
-    _check(isinstance(saving, int) and saving > 0, "min_bytes_saved must be positive")
-    _check(isinstance(draws, int) and draws >= 1000, "bootstrap_resamples must be >= 1000")
-    _check(isinstance(seed, int), "bootstrap_seed must be an integer")
+    _check(type(saving) is int and saving > 0, "min_bytes_saved must be positive")
+    _check(type(draws) is int and draws >= 1000, "bootstrap_resamples must be >= 1000")
+    _check(type(seed) is int, "bootstrap_seed must be an integer")
 
     baseline, candidate = _load_run(baseline_path), _load_run(candidate_path)
     seal = _sha256_file(protocol_path)

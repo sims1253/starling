@@ -27,6 +27,7 @@ def test_corpus_json_retains_ordered_clips_for_paired_comparisons(monkeypatch, t
         sf.write(wav, np.zeros(1600, dtype=np.float32), 16000)
         wav.with_suffix(".txt").write_text(reference)
     hypotheses = iter(("one", "three four", "one two", "three"))
+    monkeypatch.setattr(wer_quant, "_active_device", lambda: "CPU")
     monkeypatch.setattr(wer_quant, "StarlingGgmlParakeet", lambda: SimpleNamespace(
         available=True, load=lambda: None, close=lambda: None,
         transcribe=lambda audio: [next(hypotheses)]))
@@ -49,6 +50,24 @@ def test_corpus_json_retains_ordered_clips_for_paired_comparisons(monkeypatch, t
     assert [(c["id"], c["audio_sha256"], c["reference"]) for c in first_clips] == [
         (c["id"], c["audio_sha256"], c["reference"]) for c in second_clips]
     assert [c["wer"] for c in second_clips] == [0.0, 50.0]
+
+
+def test_include_clips_records_selected_backend_without_protocol(monkeypatch, tmp_path):
+    import json
+
+    model = tmp_path / "model.gguf"
+    model.write_bytes(b"model")
+    monkeypatch.setattr(wer_quant.mkfx, "load_fixtures", lambda: {"short": np.zeros(1600)})
+    monkeypatch.setattr(wer_quant, "_active_device", lambda: "CPU")
+    monkeypatch.setattr(wer_quant, "StarlingGgmlParakeet", lambda: SimpleNamespace(
+        available=True, load=lambda: None, close=lambda: None,
+        transcribe=lambda audio: [wer_quant.REFERENCE_TRANSCRIPTS["short"]]))
+    output = tmp_path / "result.json"
+    monkeypatch.setattr(sys, "argv", ["wer_quant", "--models", str(model),
+                                      "--tiers", "short", "--device", "CUDA0",
+                                      "--include-clips", "--json", str(output)])
+    assert wer_quant.main() == 0
+    assert json.loads(output.read_text())[0]["provenance"]["device"] == "CPU"
 
 
 def test_protocol_seals_model_engine_scorer_and_device(monkeypatch, tmp_path):

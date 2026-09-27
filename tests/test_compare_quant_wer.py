@@ -104,3 +104,19 @@ def test_protocol_change_after_runs_is_rejected(tmp_path):
     spec.write_text(json.dumps(data))
     with pytest.raises(InvalidComparison, match="protocol seal differs"):
         compare(spec, bp, cp)
+
+
+@pytest.mark.parametrize("field,value,message", [
+    ("cohorts", {"en_us_validation": True}, "at least five clips"),
+    ("max_wer_delta_pp", False, "percentage-point margin"),
+    ("min_bytes_saved", True, "must be positive"),
+    ("bootstrap_resamples", True, "bootstrap_resamples"),
+    ("bootstrap_seed", True, "bootstrap_seed"),
+])
+def test_protocol_rejects_boolean_numeric_fields(tmp_path, field, value, message):
+    spec, bp, cp, *_ = _inputs(tmp_path)
+    protocol = json.loads(spec.read_text())
+    protocol[field] = value
+    spec.write_text(json.dumps(protocol))
+    with pytest.raises(InvalidComparison, match=message):
+        compare(spec, bp, cp)
