@@ -72,5 +72,5 @@ K and V as graph intermediates for block-local attention; it has no persistent
 encoder K/V cache to shrink. A follow-up must measure actual peak memory,
 latency, and WER for a changed encoder against the unchanged one before a
 runtime flag or benchmark ablation row is added. The low-rank draft-head
-question is separate: it also needs CTC token acceptance and complete
-decoder latency, not projection time alone.
+question was measured separately with CTC token acceptance and complete
+Python decoder latency in [`ctc_draft_rank.md`](ctc_draft_rank.md).
