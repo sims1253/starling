@@ -420,7 +420,7 @@ StreamSession::StreamSession(StarlingServer* server) : server_(server) {
     // on the native streaming path (nothing extra to key on); a hypothetical
     // reload/re-config goes through set_engine_identity(), which invalidates.
     engine_id_ = cfg.model_slug + "|" + cfg.gguf_path + "|"
-               + starling_ggml_backend_name() + "|chunk="
+               + server_->backend_identity() + "|chunk="
                + std::to_string(cfg.stream_chunk_seconds)
                + "|overlap=" + std::to_string(cfg.stream_overlap_seconds)
                + "|min=" + std::to_string(cfg.min_chunk_seconds)
@@ -431,11 +431,13 @@ TranscribeFn StreamSession::make_transcribe_fn(RequestContext* ctx) {
     return [this, ctx](const float* samples, int64_t n)
                -> std::optional<std::string> {
         std::string err;
-        // Streaming chunks never wait behind queued requests: if the serial
-        // queue is occupied, report busy and let the chunker retry later
-        // (matching the Python StreamSession._tx behavior).
+        // In Granite fairness mode, a stream takes a FIFO ticket so an upload
+        // yields after its current chunk. The default retry-on-busy contract
+        // is unchanged for every other serving mode.
+        const QueuePolicy policy = server_->config().granite_chunk_fairness
+            ? QueuePolicy::Block : QueuePolicy::SkipIfBusy;
         auto result = server_->transcribe_pcm(samples, n, ctx, &err,
-                                              QueuePolicy::SkipIfBusy);
+                                              policy);
         if (!err.empty()) {
             // "server busy" or "cancelled" → return nullopt (retry without
             // advancing state, matching the Python StreamSession._tx behavior).

@@ -65,6 +65,8 @@ static void usage(const char* prog) {
         "  --request-timeout-seconds <s> Fail queued requests after N s waiting for\n"
         "                     the engine (0 = never, default 600; same flag as the\n"
         "                     Python server)\n"
+        "  --granite-chunk-fairness  Yield the serial turn after each Granite\n"
+        "                     upload chunk (opt-in; default is serial)\n"
         "\n"
         "Streaming:\n"
         "  --stream-chunk-seconds <s>    Fixed stream window (default 12.0)\n"
@@ -91,6 +93,7 @@ struct Args {
     int port = 8181;
     bool warmup = false;
     bool eager_load = true;
+    bool granite_chunk_fairness = false;
     double idle_timeout = 0.0;
     double request_timeout = 600.0;
     double max_stream_seconds = 60.0;
@@ -148,6 +151,7 @@ static Args parse_args(int argc, char** argv) {
         else if (arg == "--port")      a.port = next_int("--port");
         else if (arg == "--warmup")    a.warmup = true;
         else if (arg == "--no-eager-load") a.eager_load = false;
+        else if (arg == "--granite-chunk-fairness") a.granite_chunk_fairness = true;
         else if (arg == "--idle-timeout")  a.idle_timeout = next_double("--idle-timeout");
         else if (arg == "--request-timeout-seconds") a.request_timeout = next_double("--request-timeout-seconds");
         else if (arg == "--max-stream-seconds") a.max_stream_seconds = next_double("--max-stream-seconds");
@@ -478,6 +482,11 @@ int main(int argc, char** argv) {
             "error: --warmup requires eager loading (incompatible with --no-eager-load)\n");
         return 1;
     }
+    if (args.granite_chunk_fairness && args.model != "granite") {
+        std::fprintf(stderr,
+            "error: --granite-chunk-fairness requires --model granite\n");
+        return 1;
+    }
 
     // Build config.
     serve::ServerConfig cfg;
@@ -487,6 +496,7 @@ int main(int argc, char** argv) {
     cfg.port = args.port;
     cfg.warmup = args.warmup;
     cfg.eager_load = args.eager_load;
+    cfg.granite_chunk_fairness = args.granite_chunk_fairness;
     cfg.stream_chunk_seconds = args.stream_chunk;
     cfg.stream_overlap_seconds = args.stream_overlap;
     cfg.min_chunk_seconds = args.min_chunk;

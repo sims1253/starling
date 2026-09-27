@@ -70,6 +70,7 @@ struct ServerConfig {
     int  port        = 8181;
     bool warmup      = false;
     bool eager_load  = true;
+    bool granite_chunk_fairness = false; // opt-in: yield FIFO turn after each chunk
     double max_chunk_seconds       = kDefaultMaxChunk;
     double min_chunk_seconds       = kDefaultMinChunk;
     double partial_interval        = kDefaultPartialInt;
@@ -159,9 +160,13 @@ public:
     void finish_request(RequestContext* ctx);
 
     const ServerConfig& config() const { return cfg_; }
+    const std::string& backend_identity() const { return backend_identity_; }
 
 private:
     ServerConfig cfg_;
+    // Stable for this one-model server; cached before any inference so WS
+    // admission never waits on the C API runtime mutex just to build a key.
+    const std::string backend_identity_;
     starling_ggml_ctx* model_ = nullptr;
 
     mutable std::mutex mutex_;       // protects queue state + request registry
@@ -201,7 +206,8 @@ private:
     bool run_with_turn(RequestContext* ctx, QueuePolicy policy,
                        const std::function<char*()>& engine_call,
                        std::string* out_text, std::string* err,
-                       std::string* effective_req_id = nullptr);
+                       std::string* effective_req_id = nullptr,
+                       bool complete_request = true);
 };
 
 } // namespace starling::serve
