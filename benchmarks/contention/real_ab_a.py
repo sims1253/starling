@@ -127,36 +127,46 @@ def run_arm(binary: Path, model: Path, audio_a: bytes, audio_b: bytes,
             if arm["warmup"]["status"] != 200:
                 raise RuntimeError(f"warmup failed: {arm['warmup']}")
             if fair:
+                futures: dict[str, concurrent.futures.Future] = {}
                 with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
-                    a1 = pool.submit(upload, url, audio_a, "aba-a1")
-                    wait_event(log_path, "aba-a1", "queue_wait", process)
-                    # A new WS session must become application-ready while A1
-                    # still holds the first chunk. The old server's identity
-                    # lookup waited on the global model lock at this point.
-                    connect_start = time.perf_counter()
-                    with connect(url.replace("http://", "ws://") + "/stream",
-                                 ping_interval=None, proxy=None, open_timeout=10) as ws:
-                        connect_ms = (time.perf_counter() - connect_start) * 1000
-                        ping_start = time.perf_counter()
-                        ws.send('{"type":"ping"}')
-                        reply = json.loads(ws.recv(timeout=5))
-                        ping_ms = (time.perf_counter() - ping_start) * 1000
-                    arm["new_session"] = {"connect_ms": connect_ms,
-                                          "ping_ms": ping_ms,
-                                          "reply": reply.get("type")}
-                    b = pool.submit(upload, url, audio_b, "aba-b")
-                    wait_event(log_path, "aba-b", "queue_enter", process)
-                    a2 = pool.submit(upload, url, audio_a, "aba-a2")
-                    wait_event(log_path, "aba-a2", "queue_enter", process)
-                    if any(e.get("req") == "aba-a1" and e.get("ev") == "chunk"
-                           for e in events(log_path)):
-                        raise RuntimeError("A1 completed its first chunk before B/A2 queued")
-                    arm["a1"] = a1.result(timeout=600)
-                    arm["b"] = b.result(timeout=600)
-                    arm["a2"] = a2.result(timeout=600)
+                    try:
+                        futures["a1"] = pool.submit(upload, url, audio_a, "aba-a1")
+                        wait_event(log_path, "aba-a1", "queue_wait", process)
+                        # Probe a new session during A1's active first chunk.
+                        connect_start = time.perf_counter()
+                        with connect(url.replace("http://", "ws://") + "/stream",
+                                     ping_interval=None, proxy=None, open_timeout=10) as ws:
+                            connect_ms = (time.perf_counter() - connect_start) * 1000
+                            ping_start = time.perf_counter()
+                            ws.send('{"type":"ping"}')
+                            reply = json.loads(ws.recv(timeout=5))
+                            ping_ms = (time.perf_counter() - ping_start) * 1000
+                        arm["new_session"] = {"connect_ms": connect_ms,
+                                              "ping_ms": ping_ms,
+                                              "reply": reply.get("type")}
+                        futures["b"] = pool.submit(upload, url, audio_b, "aba-b")
+                        wait_event(log_path, "aba-b", "queue_enter", process)
+                        futures["a2"] = pool.submit(upload, url, audio_a, "aba-a2")
+                        wait_event(log_path, "aba-a2", "queue_enter", process)
+                        if any(e.get("req") == "aba-a1" and e.get("ev") == "chunk"
+                               for e in events(log_path)):
+                            raise RuntimeError("A1 completed its first chunk before B/A2 queued")
+                    except Exception as exc:
+                        arm["error"] = f"{type(exc).__name__}: {exc}"
+                    finally:
+                        # Preserve every submitted request outcome even when
+                        # admission or ordering fails before normal collection.
+                        for name, future in futures.items():
+                            try:
+                                arm[name] = future.result(timeout=600)
+                            except Exception as exc:
+                                arm[name] = {"status": "client_error",
+                                             "error": f"{type(exc).__name__}: {exc}"}
             else:
                 arm["a1"] = upload(url, audio_a, "aba-serial-a")
                 arm["b"] = upload(url, audio_b, "aba-serial-b")
+        except Exception as exc:
+            arm["error"] = f"{type(exc).__name__}: {exc}"
         finally:
             if process.poll() is None:
                 os.killpg(process.pid, signal.SIGTERM)
@@ -208,14 +218,15 @@ def main() -> int:
                              args.out_dir, args.cpu_list, True)
     result["host_load_after"] = os.getloadavg()
     serial, fair = result["serial"], result["fair"]
-    status_ok = all(x.get("status") == 200 and x.get("text_sha256")
-                    for x in (serial["a1"], serial["b"], fair["a1"], fair["b"], fair["a2"]))
-    hashes_ok = (serial["a1"].get("text_sha256") == fair["a1"].get("text_sha256")
-                 == fair["a2"].get("text_sha256") and
-                 serial["b"].get("text_sha256") == fair["b"].get("text_sha256") and
-                 serial["a1"].get("text_sha256") != serial["b"].get("text_sha256"))
-    chunks_ok = all(x["chunks"] == [1, 2, 3]
-                    for x in (serial["a1"], serial["b"], fair["a1"], fair["b"], fair["a2"]))
+    sa, sb = serial.get("a1", {}), serial.get("b", {})
+    fa, fb, fa2 = fair.get("a1", {}), fair.get("b", {}), fair.get("a2", {})
+    requests = (sa, sb, fa, fb, fa2)
+    status_ok = all(x.get("status") == 200 and x.get("text_sha256") for x in requests)
+    hashes_ok = (status_ok and
+                 sa["text_sha256"] == fa["text_sha256"] == fa2["text_sha256"] and
+                 sb["text_sha256"] == fb["text_sha256"] and
+                 sa["text_sha256"] != sb["text_sha256"])
+    chunks_ok = all(x.get("chunks") == [1, 2, 3] for x in requests)
     order = fair["chunk_order"]
     a1_first = next((i for i, e in enumerate(order) if e == ("aba-a1", 1)), -1)
     a1_second = next((i for i, e in enumerate(order) if e == ("aba-a1", 2)), -1)
@@ -224,7 +235,8 @@ def main() -> int:
     interleaved = a1_first >= 0 and a1_first < b_first < a1_second and a1_first < a2_first < a1_second
     admission = fair.get("new_session", {})
     admission_ok = admission.get("reply") == "pong" and admission.get("ping_ms", 1e9) < 2000
-    result["verdict"] = {"status": "pass" if all((status_ok, hashes_ok, chunks_ok, interleaved, admission_ok))
+    result["verdict"] = {"status": "pass" if all((status_ok, hashes_ok, chunks_ok, interleaved, admission_ok,
+                                                    not serial.get("error"), not fair.get("error")))
                          else "no_go_or_inconclusive", "status_ok": status_ok,
                          "hashes_ok": hashes_ok, "chunks_ok": chunks_ok,
                          "interleaved": interleaved, "admission_ok": admission_ok}

@@ -160,17 +160,17 @@ public:
     void finish_request(RequestContext* ctx);
 
     const ServerConfig& config() const { return cfg_; }
-    const std::string& backend_identity() const { return backend_identity_; }
+    std::string backend_identity() const;
 
 private:
     ServerConfig cfg_;
-    // Stable for this one-model server; cached before any inference so WS
-    // admission never waits on the C API runtime mutex just to build a key.
-    const std::string backend_identity_;
+    // Refreshed after model load latches the selected runtime device. WS
+    // admission reads this cache without taking the C API runtime mutex.
+    std::string backend_identity_;
     starling_ggml_ctx* model_ = nullptr;
 
     mutable std::mutex mutex_;       // protects queue state + request registry
-    std::mutex load_mutex_;           // serializes model loading (long operation)
+    mutable std::mutex load_mutex_;   // serializes loading and identity updates
     std::condition_variable queue_cv_;
 
     // Serial inference queue: requests wait in arrival order. Anonymous

@@ -101,6 +101,11 @@ std::string supported_models_str() {
 StarlingServer::StarlingServer(ServerConfig cfg)
     : cfg_(std::move(cfg)), backend_identity_(starling_ggml_backend_name()) {}
 
+std::string StarlingServer::backend_identity() const {
+    std::lock_guard<std::mutex> lk(load_mutex_);
+    return backend_identity_;
+}
+
 StarlingServer::~StarlingServer() {
     if (model_) {
         starling_ggml_free(model_);
@@ -128,6 +133,10 @@ void StarlingServer::load() {
         return;  // loaded_ stays false
     }
 
+    // Loading selects the actual device. Capture its name before publishing
+    // loaded_: later WS sessions can build their cache key without waiting on
+    // the C API runtime mutex during an active inference chunk.
+    backend_identity_ = starling_ggml_backend_name();
     loaded_.store(true);
     auto dt = std::chrono::duration<double>(
                   std::chrono::steady_clock::now() - t0).count();

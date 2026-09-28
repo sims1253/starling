@@ -6,8 +6,9 @@
 #include <string>
 
 // Internal serving seam. A job borrows the PCM buffer and model: the caller
-// must keep both alive until free_granite_job, and must step it serially.
-// Each step executes exactly one Granite chunk under the C API runtime lock.
+// must keep both alive until free_granite_job. A job's create, last-chunk,
+// step and free calls belong to one request thread; never access the same job
+// concurrently. Each step executes one chunk under the C API runtime lock.
 namespace starling::ggml::lib {
 struct GraniteChunkJob;
 

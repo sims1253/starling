@@ -173,7 +173,7 @@ struct GraniteChunkJob {
         const float* piece = pcm;
         int64_t piece_n = n;
         int64_t len = n;
-        int32_t budget = decode_budget(cfg, (double) n / kSampleRate);
+        int32_t budget = multi ? 0 : decode_budget(cfg, (double) n / kSampleRate);
         if (multi) {
             len = std::min(chunk_samples, n - offset);
             std::memcpy(padded.data(), pcm + offset, (size_t) len * sizeof(float));
@@ -203,7 +203,12 @@ struct GraniteChunkJob {
             starling::ggml::trace::chunk_event(stages.chunks + 1,
                 std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - t0).count());
-        if (!ok) { report(err, ctx->err); return -1; }
+        if (!ok) {
+            finished = true;  // A failed job cannot be resumed safely.
+            texts.clear();
+            report(err, ctx->err);
+            return -1;
+        }
         texts.push_back(std::move(text));
         stages.add_chunk(piece_ms);
         if (timing)
@@ -252,6 +257,8 @@ int granite_job_step_impl(GraniteChunkJob* job, std::string* text,
     try { return job->step(text, err); }
     catch (const std::exception& e) { job->ctx->err = e.what(); }
     catch (...) { job->ctx->err = "unknown exception stepping GRANITE job"; }
+    job->finished = true;
+    job->texts.clear();
     report(err, job->ctx->err);
     return -1;
 }

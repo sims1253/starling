@@ -414,8 +414,9 @@ StreamSession::StreamSession(StarlingServer* server) : server_(server) {
     // Engine identity for exact-tail reuse (S11): everything about the request
     // that can change a raw window result. The native server fixes the model
     // slug + gguf artifact (which encodes the quantization) per process and
-    // the backend at link time; the window/overlap policy shapes the very
-    // windows being keyed. std::to_string(double) is fixed-point, so the
+    // selected backend after load (compile-time family before a lazy load);
+    // the window/overlap policy shapes the very windows being keyed.
+    // std::to_string(double) is fixed-point, so the
     // string is deterministic. There is no language/normalization parameter
     // on the native streaming path (nothing extra to key on); a hypothetical
     // reload/re-config goes through set_engine_identity(), which invalidates.

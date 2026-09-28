@@ -109,12 +109,17 @@ GraniteChunkJob* create_granite_job(starling_ggml_ctx* ctx,
     // Job creation only snapshots immutable model policy and borrows PCM. It
     // must not wait on runtime_mutex before taking a serving queue ticket:
     // otherwise a short WS call arriving during a long chunk could miss the
-    // next FIFO turn. The server owns the loaded model for the whole call.
+    // next FIFO turn. The server owns the loaded context for the whole call;
+    // as with every C API call, concurrent free(ctx) is outside that contract.
     if (!ctx || ctx->kind != STARLING_GGML_GRANITE || !ctx->model ||
         starling::ggml::shutting_down()) {
         return api_call(ctx, [&]() -> GraniteChunkJob* {
             require_running();
-            set_global_error("Granite job requires a loaded Granite model");
+            // Re-read the immutable context under the lock when reporting a
+            // rejected creation, rather than trusting the unlocked fast path.
+            set_global_error(ctx && ctx->kind == STARLING_GGML_GRANITE && ctx->model
+                                 ? "Granite job admission changed during validation"
+                                 : "Granite job requires a loaded Granite model");
             if (ctx) ctx->last_error = g_last_error;
             return nullptr;
         });

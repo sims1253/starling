@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -13,6 +14,11 @@ SPEC = Path(__file__).with_name("fairness_comparison_spec.json")
 
 def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def nonnegative_number(value: object) -> bool:
+    return (type(value) in (int, float) and math.isfinite(value)
+            and value >= 0)
 
 
 def main() -> int:
@@ -62,6 +68,7 @@ def main() -> int:
                 continue
             if len(set(hashes)) != 1:
                 reasons.append(f"{tag}: short final hashes differ")
+                continue
             if s_long.get("status") != 200 or f_long.get("status") != 200:
                 reasons.append(f"{tag}: long HTTP final missing")
                 continue
@@ -69,34 +76,48 @@ def main() -> int:
                 s_long.get("text_sha256") != f_long.get("text_sha256")
             ):
                 reasons.append(f"{tag}: long final hashes differ")
+                continue
             st = sm.get("long_trace", {})
             ft = fm.get("long_trace", {})
-            if st.get("chunks", 0) < 2 or len(st.get("service_ms", [])) != 1:
+            if (not isinstance(st.get("chunks"), int) or st["chunks"] < 2
+                    or not isinstance(st.get("service_ms"), list)
+                    or len(st["service_ms"]) != 1):
                 reasons.append(f"{tag}: serial long trace is incomplete")
-            if ft.get("chunks") != rule["long_chunks"] or len(
-                ft.get("service_ms", [])
-            ) != rule["long_chunks"]:
+                continue
+            if (ft.get("chunks") != rule["long_chunks"]
+                    or not isinstance(ft.get("service_ms"), list)
+                    or len(ft["service_ms"]) != rule["long_chunks"]):
                 reasons.append(f"{tag}: fair long trace is incomplete")
+                continue
             if not s_mix.get("first_commit_before_long_done") or not f_mix.get(
                 "first_commit_before_long_done"
             ):
                 reasons.append(f"{tag}: short did not overlap long work")
-            idle_ms = s_idle["stop_to_final_ms"]
-            serial_ms = s_mix["stop_to_final_ms"]
-            fair_ms = f_mix["stop_to_final_ms"]
-            if serial_ms - idle_ms < 2000 or serial_ms < 2 * idle_ms or s_mix.get(
-                "busy_responses", 0
-            ) < 1:
+                continue
+            idle_ms = s_idle.get("stop_to_final_ms")
+            serial_ms = s_mix.get("stop_to_final_ms")
+            fair_ms = f_mix.get("stop_to_final_ms")
+            serial_wall_ms = s_long.get("wall_ms")
+            fair_wall_ms = f_long.get("wall_ms")
+            values = (idle_ms, serial_ms, fair_ms, serial_wall_ms, fair_wall_ms)
+            if not all(nonnegative_number(value) for value in values):
+                reasons.append(f"{tag}: missing or invalid timing")
+                continue
+            serial_busy = s_mix.get("busy_responses")
+            fair_busy = f_mix.get("busy_responses")
+            if not all(type(value) is int and value >= 0
+                       for value in (serial_busy, fair_busy)):
+                reasons.append(f"{tag}: missing or invalid busy-response count")
+                continue
+            if serial_ms - idle_ms < 2000 or serial_ms < 2 * idle_ms or serial_busy < 1:
                 reasons.append(f"{tag}: app-ready serial arm did not reproduce contention")
             if fair_ms > rule["short_latency_max_ratio_to_serial_mixed"] * serial_ms:
                 reasons.append(f"{tag}: fair short ratio missed")
             if serial_ms - fair_ms < rule["short_latency_min_saved_ms"]:
                 reasons.append(f"{tag}: fair short absolute saving missed")
-            if f_mix.get("busy_responses", 0) > rule["candidate_busy_responses_max"]:
+            if fair_busy > rule["candidate_busy_responses_max"]:
                 reasons.append(f"{tag}: fair stream still received busy responses")
-            if f_long["wall_ms"] > rule["long_wall_max_ratio_to_serial_mixed"] * s_long[
-                "wall_ms"
-            ]:
+            if fair_wall_ms > rule["long_wall_max_ratio_to_serial_mixed"] * serial_wall_ms:
                 reasons.append(f"{tag}: fair long throughput bound missed")
     result = {"status": "pilot_pass" if not reasons else "no_go_or_inconclusive",
               "reasons": reasons, "rule": spec["candidate_rule"]}

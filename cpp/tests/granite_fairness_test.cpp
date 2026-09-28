@@ -13,7 +13,6 @@
 #include <vector>
 
 using namespace starling::serve;
-using Clock = std::chrono::steady_clock;
 
 static int failures = 0;
 static void check(bool ok, const char* what) {
@@ -84,25 +83,23 @@ int main() {
     server.load();
     check(server.loaded(), "opt-in Granite server loaded");
     if (!server.loaded()) return 1;
+    check(server.backend_identity() == starling_ggml_backend_name(),
+          "server caches the selected device identity after load");
     auto* ca = server.register_request("long-a");
     auto* cb = server.register_request("long-b");
     auto* cs = server.register_request("short");
     std::string ea, eb, es, ra, rb, rs;
-    Clock::time_point done_a, done_b, done_s;
     const std::string log = capture_stderr([&] {
         std::thread ta([&] {
             ra = server.transcribe_pcm(a.data(), (int64_t)a.size(), ca, &ea).text;
-            done_a = Clock::now();
         });
         check(wait_until([&] { return ca->running.load(); }), "long A entered engine");
         std::thread tb([&] {
             rb = server.transcribe_pcm(b.data(), (int64_t)b.size(), cb, &eb).text;
-            done_b = Clock::now();
         });
         std::thread ts([&] {
             rs = server.transcribe_pcm(short_pcm.data(),
                 (int64_t)short_pcm.size(), cs, &es, QueuePolicy::Block).text;
-            done_s = Clock::now();
         });
         ta.join(); tb.join(); ts.join();
     });
@@ -112,11 +109,9 @@ int main() {
     check(ea.empty() && eb.empty() && es.empty(), "all three jobs succeeded");
     check(ra == base_a && rb == base_b && rs == base_short,
           "interleaved outputs equal serial baselines, including padded tails");
-    check(done_s < done_a && done_s < done_b,
-          "interactive short request completed before both uploads");
-
     int active = 0, max_active = 0, chunk_a = 0, chunk_b = 0, chunk_s = 0;
     int yielded_a = 0, yielded_b = 0;
+    int next_chunk = 0, short_chunk = -1, last_a = -1, last_b = -1;
     size_t pos = 0;
     while (pos < log.size()) {
         size_t end = log.find('\n', pos);
@@ -134,16 +129,19 @@ int main() {
             }
         }
         if (ev == "chunk") {
-            if (req == "long-a") ++chunk_a;
-            if (req == "long-b") ++chunk_b;
-            if (req == "short") ++chunk_s;
+            if (req == "long-a") { ++chunk_a; last_a = next_chunk; }
+            if (req == "long-b") { ++chunk_b; last_b = next_chunk; }
+            if (req == "short") { ++chunk_s; short_chunk = next_chunk; }
+            ++next_chunk;
         }
     }
     check(active == 0 && max_active == 1,
-          "at most one engine chunk active, with balanced turns");
+          "at most one engine chunk active and all turns exited");
     check(chunk_a > 1 && chunk_b > 1 && chunk_s == 1 &&
           yielded_a == chunk_a-1 && yielded_b == chunk_b-1,
           "each long chunk yields once; short runs once");
+    check(short_chunk >= 0 && short_chunk < last_a && short_chunk < last_b,
+          "short engine chunk ran before both long final chunks");
 
     // Cancellation after the first A chunk while B holds the next turn.
     auto* xa = server.register_request("cancel-between-a");

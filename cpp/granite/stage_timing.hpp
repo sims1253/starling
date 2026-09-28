@@ -63,7 +63,7 @@ struct StageTiming {
         return sum;
     }
 
-// Active whole-request service time minus the summed stages: the loop/join/
+    // Active whole-request service time minus the summed stages: the loop/join/
     // detokenize bookkeeping around the stage clocks. Never negative beyond
     // rendering rounding.
     double bookkeeping_ms(double request_total_ms) const {
