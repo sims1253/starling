@@ -64,7 +64,8 @@ def main() -> int:
     try:
         lib.starling_ggml_backend_name.argtypes = []
         lib.starling_ggml_backend_name.restype = ctypes.c_char_p
-        backend = lib.starling_ggml_backend_name().decode()
+        backend = lib.starling_ggml_backend_name()
+        backend = backend.decode() if backend else "unknown"
         capacity = max(1, len(audio) // 160 + 1)
         ids = (ctypes.c_int32 * capacity)()
         count = ctypes.c_int32()
