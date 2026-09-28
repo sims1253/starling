@@ -63,7 +63,7 @@ public:
             last_draft_ = lookup(prefix, count);
         else
             last_draft_.clear();
-        if (last_draft_.empty()) {
+        if (last_draft_.empty() && misses_ < 3) {
             const size_t end = std::min(source_.size(), position_ + count);
             last_draft_.assign(source_.begin() + ptrdiff_t(position_),
                                source_.begin() + ptrdiff_t(end));
@@ -88,7 +88,8 @@ private:
                                        size_t k) {
         if (prefix.size() < 2) return {};
         for (size_t n = std::min<size_t>(4, prefix.size() - 1); n > 0; --n) {
-            for (size_t i = prefix.size() - n; i-- > 0;) {
+            const size_t earliest = prefix.size() > 512 ? prefix.size() - 512 : 0;
+            for (size_t i = prefix.size() - n; i-- > earliest;) {
                 if (std::equal(prefix.begin() + ptrdiff_t(i),
                                prefix.begin() + ptrdiff_t(i + n),
                                prefix.end() - ptrdiff_t(n))) {

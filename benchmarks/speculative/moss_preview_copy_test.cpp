@@ -30,4 +30,6 @@ int main() {
     PreviewCopyDrafter repeated({1, 2, 3}, 4);
     if (repeated.propose({10, 11, 10, 11}, 2) !=
         std::vector<int32_t>{10, 11}) return 10;
+    PreviewCopyDrafter divergent({1, 2, 3}, 4);
+    if (!divergent.propose({8, 9, 10}, 2).empty()) return 11;
 }
