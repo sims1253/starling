@@ -42,16 +42,21 @@ def _report_result(report: Path, expected_tests: int) -> tuple[int, str | None]:
 
 def _sanitizer_result(log: Path, tool: str) -> str | None:
     output = log.read_text(errors="replace")
-    if tool == "racecheck":
-        summaries = re.findall(
-            r"RACECHECK SUMMARY:\s*(\d+) hazards displayed \((\d+) errors, (\d+) warnings\)",
-            output,
-        )
-        if summaries and all(count == "0" for summary in summaries for count in summary):
-            return None
-    else:
-        summaries = re.findall(r"ERROR SUMMARY:\s*(\d+) errors", output)
-        if summaries and all(count == "0" for count in summaries):
+    lines = [line for line in output.splitlines()
+             if "ERROR SUMMARY:" in line or "RACECHECK SUMMARY:" in line]
+    expected = "RACECHECK SUMMARY:" if tool == "racecheck" else "ERROR SUMMARY:"
+    if lines and any(expected in line for line in lines):
+        for line in lines:
+            if "RACECHECK SUMMARY:" in line:
+                match = re.search(
+                    r"RACECHECK SUMMARY:\s*(\d+) hazards? displayed "
+                    r"\((\d+) errors?, (\d+) warnings?\)", line,
+                )
+            else:
+                match = re.search(r"ERROR SUMMARY:\s*(\d+) errors?\b", line)
+            if not match or any(count != "0" for count in match.groups()):
+                break
+        else:
             return None
     return f"missing clean {tool} summary"
 

@@ -78,10 +78,10 @@ def test_sanitizer_finding_fails(tmp_path: Path, monkeypatch) -> None:
 
 def test_any_nonzero_summary_fails_even_after_a_clean_summary(tmp_path: Path) -> None:
     log = tmp_path / "multi.log"
-    log.write_text("ERROR SUMMARY: 0 errors\nERROR SUMMARY: 1 errors\n")
+    log.write_text("ERROR SUMMARY: 0 errors\nERROR SUMMARY: 1 error\n")
     assert _sanitizer_result(log, "memcheck") is not None
     log.write_text(
         "RACECHECK SUMMARY: 0 hazards displayed (0 errors, 0 warnings)\n"
-        "RACECHECK SUMMARY: 1 hazards displayed (1 errors, 0 warnings)\n"
+        "RACECHECK SUMMARY: 1 hazard displayed (1 error, 0 warnings)\n"
     )
     assert _sanitizer_result(log, "racecheck") is not None
