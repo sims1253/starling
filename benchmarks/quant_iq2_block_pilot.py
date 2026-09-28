@@ -50,18 +50,28 @@ def rel_rms(weights: np.ndarray, quantized: np.ndarray, inputs: np.ndarray) -> f
 
 
 def imatrix_values(path: Path, tensor: str) -> np.ndarray:
+    def read_exact(stream, size: int, field: str) -> bytes:
+        data = stream.read(size)
+        if len(data) != size:
+            raise ValueError(f"{path}: truncated imatrix {field}")
+        return data
+
     with path.open("rb") as stream:
         if stream.read(8) != b"STLGIMX1":
-            raise ValueError("invalid imatrix magic")
-        version, entries = struct.unpack("<II", stream.read(8))
+            raise ValueError(f"{path}: invalid imatrix magic")
+        version, entries = struct.unpack("<II", read_exact(stream, 8, "header"))
         if version != 1:
-            raise ValueError("unsupported imatrix version")
+            raise ValueError(f"{path}: unsupported imatrix version")
         for _ in range(entries):
-            name_len = struct.unpack("<I", stream.read(4))[0]
-            name = stream.read(name_len).decode()
-            width = struct.unpack("<I", stream.read(4))[0]
-            stream.read(8)  # observation count
-            values = np.frombuffer(stream.read(width * 4), dtype="<f4").copy()
+            name_len = struct.unpack("<I", read_exact(stream, 4, "name length"))[0]
+            if not (0 < name_len <= 4096):
+                raise ValueError(f"{path}: invalid imatrix name length {name_len}")
+            name = read_exact(stream, name_len, "name").decode()
+            width = struct.unpack("<I", read_exact(stream, 4, "width"))[0]
+            if not (0 < width <= 1_000_000):
+                raise ValueError(f"{path}: invalid imatrix width {width}")
+            read_exact(stream, 8, "observation count")
+            values = np.frombuffer(read_exact(stream, width * 4, f"entry {name}"), dtype="<f4").copy()
             if name == tensor:
                 return values
     raise ValueError(f"{tensor}: no imatrix entry")
@@ -116,7 +126,12 @@ def compensated(weights: np.ndarray, x: np.ndarray, importance: np.ndarray,
     """
     covariance = x.T @ x / len(x)
     covariance.flat[::len(covariance) + 1] += damping * np.mean(np.diag(covariance))
-    inverse = np.linalg.inv(covariance)
+    try:
+        inverse = np.linalg.inv(covariance)
+    except np.linalg.LinAlgError as exc:
+        raise ValueError(
+            f"calibration covariance is singular ({len(x)} vectors, width {x.shape[1]})"
+        ) from exc
     current = weights.copy()
     decoded = np.empty_like(weights)
     packed_parts = []

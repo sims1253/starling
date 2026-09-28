@@ -106,10 +106,7 @@ void ImatrixCollector::flush() {
         total_obs += e.n_obs;
         map.emplace(kv.first, std::move(e));
     }
-    if (!imatrix_write(path_, map)) {
-        std::fprintf(stderr, "[imatrix] ERROR: failed to write %s\n", path_.c_str());
-        return;
-    }
+    const bool wrote_imatrix = imatrix_write(path_, map);
     if (!trace_path_.empty() && trace_n_ > 0) {
         std::ofstream trace(trace_path_, std::ios::binary | std::ios::trunc);
         static constexpr char magic[8] = {'S', 'T', 'L', 'G', 'A', 'C', 'T', '1'};
@@ -123,9 +120,13 @@ void ImatrixCollector::flush() {
         else std::fprintf(stderr, "[imatrix] wrote %s: %llu x %u activations\n",
                           trace_path_.c_str(), (unsigned long long)trace_n_, trace_k_);
     }
-    std::fprintf(stderr,
-                 "[imatrix] wrote %s: %zu tensors, %llu mul_mat observations\n",
-                 path_.c_str(), map.size(), (unsigned long long)total_obs);
+    if (!wrote_imatrix) {
+        std::fprintf(stderr, "[imatrix] ERROR: failed to write %s\n", path_.c_str());
+    } else {
+        std::fprintf(stderr,
+                     "[imatrix] wrote %s: %zu tensors, %llu mul_mat observations\n",
+                     path_.c_str(), map.size(), (unsigned long long)total_obs);
+    }
 }
 
 } // namespace starling::ggml
