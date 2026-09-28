@@ -5,8 +5,13 @@ plugins {
 // Release builds (the release-android workflow) pass the tag-derived version
 // as Gradle properties; local builds keep the defaults below.
 val starlingVersionName = providers.gradleProperty("starlingVersionName").orElse("0.1.0").get()
-val starlingExperimental = providers.gradleProperty("starlingExperimental").orElse("false").get().toBooleanStrict()
-val starlingArm64Only = providers.gradleProperty("starlingArm64Only").orElse("false").get().toBooleanStrict()
+fun gradleFlag(name: String): Boolean {
+    val raw = providers.gradleProperty(name).orElse("false").get()
+    return raw.toBooleanStrictOrNull()
+        ?: throw GradleException("$name must be 'true' or 'false': $raw")
+}
+val starlingExperimental = gradleFlag("starlingExperimental")
+val starlingArm64Only = gradleFlag("starlingArm64Only")
 val starlingVersionCode = providers.gradleProperty("starlingVersionCode").orElse("1").get().let { raw ->
     raw.toIntOrNull()?.takeIf { it > 0 }
         ?: throw GradleException("starlingVersionCode must be an integer in 1..${Int.MAX_VALUE}: $raw")
@@ -107,6 +112,13 @@ android {
         }
     }
 
+    // Experimental builds overlay the user-visible names. A release-source-set
+    // overlay outranks src/main, whereas resValue would collide with the same
+    // names in src/main/res/values/strings.xml.
+    if (starlingExperimental) {
+        sourceSets.getByName("release").res.srcDir("src/experimental/res")
+    }
+
     buildTypes {
         // Installs beside a release build, so device tests never need to
         // uninstall (and wipe) the app someone actually uses.
@@ -116,10 +128,6 @@ android {
         release {
             if (starlingExperimental) {
                 applicationIdSuffix = ".experimental"
-                resValue("string", "app_name", "Starling Experimental")
-                resValue("string", "screen_title", "Starling Experimental")
-                resValue("string", "keyboard_name", "Starling Experimental Voice Input")
-                resValue("string", "recognition_service_name", "Starling Experimental Voice Recognition")
             }
             if (releaseSigning != null) signingConfig = signingConfigs.getByName("release")
             isMinifyEnabled = false
@@ -132,7 +140,6 @@ android {
 
     buildFeatures {
         buildConfig = true
-        resValues = true
     }
 
     compileOptions {

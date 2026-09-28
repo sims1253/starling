@@ -55,11 +55,15 @@ env:
   # Runtime documentation is checked by scripts/release-runtime/check-contract.py.
   CUDA_VERSION: '13.3.0'
   CMAKE_BUILD_PARALLEL_LEVEL: 4
+  # Experimental builds replace the arch list with sm_120 only (RTX 50xx
+  # dogfooding); tag releases keep sm_75..sm_120.
   CUDA_ARCHITECTURES: ${{ inputs.experimental && '120' || '75;80;86;89;90;120' }}
   RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
   runtime-contract:
+    permissions:
+      contents: read
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -75,6 +79,8 @@ jobs:
   # Linux Vulkan (cross-vendor GPU path; x86_64 executable)
   # ---------------------------------------------------------------------------
   linux-vulkan:
+    permissions:
+      contents: read
     needs: runtime-contract
     runs-on: ubuntu-22.04
     steps:
@@ -134,6 +140,8 @@ jobs:
   # Linux CPU (no GPU required; x86_64 executable)
   # ---------------------------------------------------------------------------
   linux-cpu:
+    permissions:
+      contents: read
     needs: runtime-contract
     runs-on: ubuntu-22.04
     steps:
@@ -189,6 +197,8 @@ jobs:
   # Linux CUDA (NVIDIA path)
   # ---------------------------------------------------------------------------
   linux-cuda:
+    permissions:
+      contents: read
     needs: runtime-contract
     runs-on: ubuntu-22.04
     steps:
@@ -258,6 +268,8 @@ jobs:
   # Linux ROCm / HIP (AMD Radeon & Instinct path)
   # ---------------------------------------------------------------------------
   linux-rocm:
+    permissions:
+      contents: read
     if: ${{ !inputs.experimental }}
     needs: runtime-contract
     runs-on: ubuntu-22.04
@@ -319,6 +331,8 @@ jobs:
   # Windows Vulkan (MSVC + Vulkan, static CRT)
   # ---------------------------------------------------------------------------
   windows-vulkan:
+    permissions:
+      contents: read
     needs: runtime-contract
     runs-on: windows-2025-vs2026
     steps:
@@ -380,6 +394,8 @@ jobs:
   # Windows CUDA (MSVC + CUDA, static CRT)
   # ---------------------------------------------------------------------------
   windows-cuda:
+    permissions:
+      contents: read
     needs: runtime-contract
     runs-on: windows-2025-vs2026
     steps:
@@ -442,6 +458,8 @@ jobs:
   # Windows CPU (MSVC, CPU only, static CRT)
   # ---------------------------------------------------------------------------
   windows-cpu:
+    permissions:
+      contents: read
     needs: runtime-contract
     runs-on: windows-2025-vs2026
     steps:
@@ -496,6 +514,8 @@ jobs:
   # macOS Metal (Apple Silicon)
   # ---------------------------------------------------------------------------
   macos-metal:
+    permissions:
+      contents: read
     if: ${{ !inputs.experimental }}
     needs: runtime-contract
     # The standard macos-14 label is an Apple Silicon runner.
@@ -543,6 +563,8 @@ jobs:
   # macOS CPU (Apple Silicon, CPU only)
   # ---------------------------------------------------------------------------
   macos-cpu:
+    permissions:
+      contents: read
     if: ${{ !inputs.experimental }}
     needs: runtime-contract
     # The standard macos-14 label is an Apple Silicon runner.

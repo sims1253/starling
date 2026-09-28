@@ -8,6 +8,12 @@ on:
 permissions:
   contents: read
 
+# One build at a time; a burst of merges keeps only the newest pending run.
+# Running builds are never cancelled mid-publish.
+concurrency:
+  group: experimental-release-master
+  cancel-in-progress: false
+
 # Each master push has its own tag and artifacts. Runs can finish in any order;
 # none moves a shared tag or replaces another run's downloads.
 jobs:
