@@ -29,9 +29,19 @@ the 2026-09-28 run at max K=2:
 | long | 257 | 281 | 188 | 0.495 | 1.495 |
 
 The target stream is reproduced by the oracle replay, which is a simulator
-property; it does **not** establish numerical parity for a native batched
-verifier. Verify-pass reduction is not a speedup measurement. Before enabling
-drafting, #311 must price verification on the target device, and #310 must
-supply the broader dictation workload and latency/energy protocol. This probe
-can also take a previous processed output as its `source` for a revision
-study, once paired revised-output goldens exist.
+property; this replay alone establishes neither native numerical parity nor a
+speedup. The [native verifier in #338](https://github.com/sims1253/starling/pull/338)
+and [S1 copy pilot in #345](https://github.com/sims1253/starling/pull/345)
+now provide that next, separate step. With the corrected CPU verifier, the
+native pilot matched greedy and stock IDs/text on all three goldens and
+preserved both spans of a synthetic protected fixture. Two warmed paired CPU
+repeats per case favored copy at K=2 on the stock goldens and K=4 on the
+protected fixture; the measured copy/greedy ratios were 0.58–0.94×. The
+earlier full-capacity CPU verifier had both a real Granite token-parity
+counterexample and slower S1 copy timings; #345 keeps those historical
+results separate from the corrected-verifier pilot.
+
+Runtime default enablement still needs the representative #310 dictation
+workload, Pixel and fast-engine parity/cost, and target-device latency and
+energy gates. This offline probe can also take a previous processed output as
+its `source` for a revision study once paired revised-output goldens exist.
