@@ -58,9 +58,25 @@ def trace_events(log: Path, offset: int = 0) -> list[dict]:
 
 def wait_for_trace(log: Path, request_id: str, event: str, timeout_s: float) -> None:
     deadline = time.monotonic() + timeout_s
+    offset = 0
+    pending = b""
     while time.monotonic() < deadline:
-        if any(e.get("req") == request_id and e.get("ev") == event for e in trace_events(log)):
-            return
+        with log.open("rb") as src:
+            src.seek(offset)
+            data = src.read()
+            offset = src.tell()
+        if data:
+            lines = (pending + data).split(b"\n")
+            pending = lines.pop()
+            for line in lines:
+                if not line.startswith(b"[trace] "):
+                    continue
+                try:
+                    record = json.loads(line[8:])
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    continue
+                if record.get("req") == request_id and record.get("ev") == event:
+                    return
         time.sleep(0.05)
     raise TimeoutError(f"missing trace {event} for {request_id}")
 
@@ -103,6 +119,9 @@ def http_upload(base_url: str, audio: bytes, request_id: str, timeout_s: float) 
     except urllib.error.HTTPError as exc:
         return {"status": exc.code, "wall_ms": (time.perf_counter() - start) * 1000,
                 "error": exc.read(400).decode("utf-8", "replace")}
+    except (OSError, TimeoutError, ValueError) as exc:
+        return {"status": "client_error", "wall_ms": (time.perf_counter() - start) * 1000,
+                "error": f"{type(exc).__name__}: {exc}"}
 
 
 def ws_short_commit(ws, audio: bytes, timeout_s: float, retry_s: float,
@@ -145,6 +164,9 @@ def ws_short_commit(ws, audio: bytes, timeout_s: float, retry_s: float,
     except ConnectionClosed as exc:
         return {"status": "connection_lost", "error": str(exc),
                 "busy_responses": busy, "partials": partials}
+    except ValueError as exc:
+        return {"status": "invalid_message", "error": str(exc),
+                "busy_responses": busy, "partials": partials}
 
 
 def verdict(trials: list[dict]) -> dict:
@@ -153,6 +175,8 @@ def verdict(trials: list[dict]) -> dict:
     checks = []
     for pair in range(3):
         idle, mixed = trials[2 * pair:2 * pair + 2]
+        if idle.get("scenario") != "idle" or mixed.get("scenario") != "mixed":
+            return {"status": "inconclusive", "reason": f"pair {pair} has invalid trial order"}
         a, b = idle["short"], mixed["short"]
         long = mixed["long"]
         trace = mixed["long_trace"]
@@ -164,10 +188,11 @@ def verdict(trials: list[dict]) -> dict:
         )
         if not complete:
             return {"status": "inconclusive", "reason": f"pair {pair} lacked a matching successful final or trace"}
-        latency_pass = (
-            b["stop_to_final_ms"] - a["stop_to_final_ms"] >= 2000
-            and b["stop_to_final_ms"] >= 2 * a["stop_to_final_ms"]
-        )
+        idle_ms, mixed_ms = a.get("stop_to_final_ms"), b.get("stop_to_final_ms")
+        if not all(type(value) in (int, float) and value >= 0
+                   for value in (idle_ms, mixed_ms)):
+            return {"status": "inconclusive", "reason": f"pair {pair} lacks valid timing"}
+        latency_pass = mixed_ms - idle_ms >= 2000 and mixed_ms >= 2 * idle_ms
         checks.append({"pair": pair, "latency_pass": latency_pass,
                        "busy_pass": b["busy_responses"] >= 1,
                        "overlap_pass": b["first_commit_before_long_done"]})
@@ -313,7 +338,8 @@ def main() -> int:
                         "service_ms": [e["dur_ms"] for e in trial_events
                                        if e.get("ev") == "request" and str(e.get("req", "")).startswith("#anon-")],
                         "busy_exits": len([e for e in trial_events if e.get("ev") == "queue_exit"
-                                           and e.get("reason") == "server_busy"]),
+                                           and e.get("reason") == "server_busy"
+                                           and str(e.get("req", "")).startswith("#anon-")]),
                     }
                     if scenario == "mixed":
                         trial["long_request_id"] = request_id
@@ -325,7 +351,8 @@ def main() -> int:
                             "chunks": len([e for e in trial_events if e.get("ev") == "chunk"
                                            and e.get("req") == request_id]),
                             "ws_busy_exits": len([e for e in trial_events if e.get("ev") == "queue_exit"
-                                                  and e.get("reason") == "server_busy"]),
+                                                  and e.get("reason") == "server_busy"
+                                                  and str(e.get("req", "")).startswith("#anon-")]),
                         }
                     summary["trials"].append(trial)
                     (args.out_dir / "result.json").write_text(json.dumps(summary, indent=2) + "\n")
@@ -334,6 +361,11 @@ def main() -> int:
             summary["verdict"] = verdict(summary["trials"])
             (args.out_dir / "result.json").write_text(json.dumps(summary, indent=2) + "\n")
             return 0
+        except Exception as exc:
+            summary["error"] = f"{type(exc).__name__}: {exc}"
+            summary["verdict"] = {"status": "inconclusive", "reason": summary["error"]}
+            (args.out_dir / "result.json").write_text(json.dumps(summary, indent=2) + "\n")
+            return 1
         finally:
             if process.poll() is None:
                 os.killpg(process.pid, signal.SIGTERM)
