@@ -19,6 +19,18 @@
 name: Release starling-serve binaries
 
 on:
+  workflow_call:
+    inputs:
+      tag:
+        required: true
+        type: string
+      source-ref:
+        required: true
+        type: string
+      experimental:
+        description: Build the dogfooding subset as artifacts; the caller publishes it
+        type: boolean
+        default: false
   push:
     tags:
       - 'v*'
@@ -30,7 +42,7 @@ on:
         default: 'v0.1.0-test'
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.inputs.tag || github.ref_name }}
+  group: release-serve-${{ inputs.tag || github.ref_name }}
   cancel-in-progress: true
 
 # Build jobs only need to read the repository. The release job elevates this
@@ -43,6 +55,7 @@ env:
   # Runtime documentation is checked by scripts/release-runtime/check-contract.py.
   CUDA_VERSION: '13.3.0'
   CMAKE_BUILD_PARALLEL_LEVEL: 4
+  CUDA_ARCHITECTURES: ${{ inputs.experimental && '120' || '75;80;86;89;90;120' }}
   RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
@@ -51,7 +64,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: ${{ inputs.tag || github.ref_name }}
+          ref: ${{ inputs.source-ref || inputs.tag || github.ref_name }}
           persist-credentials: false
       - name: Check runtime version guidance
         run: >-
@@ -67,7 +80,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: ${{ inputs.tag || github.ref_name }}
+          ref: ${{ inputs.source-ref || inputs.tag || github.ref_name }}
           submodules: recursive
           persist-credentials: false
 
@@ -113,6 +126,7 @@ jobs:
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
+          retention-days: ${{ inputs.experimental && 3 || 90 }}
           name: starling-serve-linux-vulkan
           path: starling-serve-linux-vulkan.tar.gz
 
@@ -125,7 +139,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: ${{ inputs.tag || github.ref_name }}
+          ref: ${{ inputs.source-ref || inputs.tag || github.ref_name }}
           submodules: recursive
           persist-credentials: false
 
@@ -167,6 +181,7 @@ jobs:
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
+          retention-days: ${{ inputs.experimental && 3 || 90 }}
           name: starling-serve-linux-cpu
           path: starling-serve-linux-cpu.tar.gz
 
@@ -179,7 +194,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: ${{ inputs.tag || github.ref_name }}
+          ref: ${{ inputs.source-ref || inputs.tag || github.ref_name }}
           submodules: recursive
           persist-credentials: false
 
@@ -200,7 +215,7 @@ jobs:
             -DSTARLING_SERVE_VERSION="${RELEASE_TAG#v}" \
             -DSTARLING_GGML_CUDA=ON \
             -DSTARLING_GGML_TESTS=OFF -DBUILD_SHARED_LIBS=OFF \
-            -DCMAKE_CUDA_ARCHITECTURES="75;80;86;89;90;120" \
+            -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCHITECTURES" \
             -DGGML_NATIVE=OFF -DGGML_LLAMAFILE=OFF
           cmake --build build -j --target starling-serve
 
@@ -235,6 +250,7 @@ jobs:
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
+          retention-days: ${{ inputs.experimental && 3 || 90 }}
           name: starling-serve-linux-cuda
           path: starling-serve-linux-cuda.tar.gz
 
@@ -242,12 +258,13 @@ jobs:
   # Linux ROCm / HIP (AMD Radeon & Instinct path)
   # ---------------------------------------------------------------------------
   linux-rocm:
+    if: ${{ !inputs.experimental }}
     needs: runtime-contract
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: ${{ inputs.tag || github.ref_name }}
+          ref: ${{ inputs.source-ref || inputs.tag || github.ref_name }}
           submodules: recursive
           persist-credentials: false
 
@@ -294,6 +311,7 @@ jobs:
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
+          retention-days: ${{ inputs.experimental && 3 || 90 }}
           name: starling-serve-linux-rocm
           path: starling-serve-linux-rocm.tar.gz
 
@@ -306,7 +324,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: ${{ inputs.tag || github.ref_name }}
+          ref: ${{ inputs.source-ref || inputs.tag || github.ref_name }}
           submodules: recursive
           persist-credentials: false
 
@@ -354,6 +372,7 @@ jobs:
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
+          retention-days: ${{ inputs.experimental && 3 || 90 }}
           name: starling-serve-windows-vulkan
           path: starling-serve-windows-vulkan.zip
 
@@ -366,7 +385,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: ${{ inputs.tag || github.ref_name }}
+          ref: ${{ inputs.source-ref || inputs.tag || github.ref_name }}
           submodules: recursive
           persist-credentials: false
 
@@ -390,7 +409,7 @@ jobs:
             "-DSTARLING_SERVE_VERSION=$version" `
             -DSTARLING_GGML_CUDA=ON `
             -DSTARLING_GGML_TESTS=OFF -DBUILD_SHARED_LIBS=OFF `
-            "-DCMAKE_CUDA_ARCHITECTURES=75;80;86;89;90;120" `
+            "-DCMAKE_CUDA_ARCHITECTURES=$env:CUDA_ARCHITECTURES" `
             -DGGML_NATIVE=OFF -DGGML_LLAMAFILE=OFF `
             -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
           cmake --build build --config Release --target starling-serve
@@ -415,6 +434,7 @@ jobs:
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
+          retention-days: ${{ inputs.experimental && 3 || 90 }}
           name: starling-serve-windows-cuda
           path: starling-serve-windows-cuda.zip
 
@@ -427,7 +447,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: ${{ inputs.tag || github.ref_name }}
+          ref: ${{ inputs.source-ref || inputs.tag || github.ref_name }}
           submodules: recursive
           persist-credentials: false
 
@@ -468,6 +488,7 @@ jobs:
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
+          retention-days: ${{ inputs.experimental && 3 || 90 }}
           name: starling-serve-windows-cpu
           path: starling-serve-windows-cpu.zip
 
@@ -475,13 +496,14 @@ jobs:
   # macOS Metal (Apple Silicon)
   # ---------------------------------------------------------------------------
   macos-metal:
+    if: ${{ !inputs.experimental }}
     needs: runtime-contract
     # The standard macos-14 label is an Apple Silicon runner.
     runs-on: macos-14
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: ${{ inputs.tag || github.ref_name }}
+          ref: ${{ inputs.source-ref || inputs.tag || github.ref_name }}
           submodules: recursive
           persist-credentials: false
 
@@ -513,6 +535,7 @@ jobs:
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
+          retention-days: ${{ inputs.experimental && 3 || 90 }}
           name: starling-serve-macos-metal
           path: starling-serve-macos-metal.tar.gz
 
@@ -520,13 +543,14 @@ jobs:
   # macOS CPU (Apple Silicon, CPU only)
   # ---------------------------------------------------------------------------
   macos-cpu:
+    if: ${{ !inputs.experimental }}
     needs: runtime-contract
     # The standard macos-14 label is an Apple Silicon runner.
     runs-on: macos-14
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: ${{ inputs.tag || github.ref_name }}
+          ref: ${{ inputs.source-ref || inputs.tag || github.ref_name }}
           submodules: recursive
           persist-credentials: false
 
@@ -556,6 +580,7 @@ jobs:
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
+          retention-days: ${{ inputs.experimental && 3 || 90 }}
           name: starling-serve-macos-cpu
           path: starling-serve-macos-cpu.tar.gz
 
@@ -563,6 +588,7 @@ jobs:
   # Release: upload all artifacts
   # ---------------------------------------------------------------------------
   release:
+    if: ${{ !inputs.experimental }}
     needs: [linux-vulkan, linux-cuda, linux-rocm, linux-cpu, windows-vulkan, windows-cuda, windows-cpu, macos-metal, macos-cpu]
     runs-on: ubuntu-22.04
     permissions:

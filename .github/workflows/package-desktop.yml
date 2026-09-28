@@ -1,0 +1,94 @@
+name: Package desktop apps
+
+on:
+  workflow_call:
+    inputs:
+      platforms:
+        description: JSON array of linux and/or windows
+        type: string
+        default: '["linux", "windows"]'
+      source-ref:
+        type: string
+        default: ''
+      retention-days:
+        type: number
+        default: 14
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: ${{ fromJSON(inputs.platforms) }}
+    runs-on: ${{ matrix.platform == 'linux' && 'ubuntu-24.04' || 'windows-2025' }}
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ inputs.source-ref || github.sha }}
+          persist-credentials: false
+      - name: Install Linux libraries
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libasound2-dev \
+            libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libvulkan1 libfontconfig1-dev
+      - name: Ensure the stable toolchain
+        id: rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          echo "version=$(rustc --version | sha256sum | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            apps/desktop-gpui/target
+          key: desktop-${{ runner.os }}-${{ steps.rust.outputs.version }}-${{ hashFiles('apps/desktop-gpui/Cargo.lock') }}
+      - name: Test the workspace
+        if: matrix.platform == 'linux'
+        working-directory: apps/desktop-gpui
+        run: cargo test --locked --workspace
+      - name: Build the app
+        working-directory: apps/desktop-gpui
+        run: cargo build --locked --release -p starling-gpui
+      - name: Package Linux app
+        if: matrix.platform == 'linux'
+        run: |
+          mkdir -p dist
+          ldd apps/desktop-gpui/target/release/starling-gpui > "$RUNNER_TEMP/desktop-libraries.txt"
+          cat "$RUNNER_TEMP/desktop-libraries.txt"
+          if grep -q 'not found' "$RUNNER_TEMP/desktop-libraries.txt"; then
+            echo '::error::Desktop app has unresolved shared libraries'
+            exit 1
+          fi
+          strip apps/desktop-gpui/target/release/starling-gpui
+          cp apps/desktop-gpui/target/release/starling-gpui dist/
+          cp docs/experimental-releases.md dist/README.md
+          git rev-parse HEAD > dist/COMMIT.txt
+          tar -C dist -czf starling-gpui-linux-x64.tar.gz starling-gpui README.md COMMIT.txt
+      - name: Package Windows app
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item apps/desktop-gpui/target/release/starling-gpui.exe dist/
+          Copy-Item docs/experimental-releases.md dist/README.md
+          git rev-parse HEAD | Set-Content dist/COMMIT.txt
+          Compress-Archive -Path dist/* -DestinationPath starling-gpui-windows-x64.zip
+      - name: Upload desktop archive
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: starling-gpui-${{ matrix.platform }}-x64
+          path: starling-gpui-${{ matrix.platform }}-x64.*
+          if-no-files-found: error
+          retention-days: ${{ inputs.retention-days }}

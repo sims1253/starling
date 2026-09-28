@@ -5,6 +5,8 @@ plugins {
 // Release builds (the release-android workflow) pass the tag-derived version
 // as Gradle properties; local builds keep the defaults below.
 val starlingVersionName = providers.gradleProperty("starlingVersionName").orElse("0.1.0").get()
+val starlingExperimental = providers.gradleProperty("starlingExperimental").orElse("false").get().toBooleanStrict()
+val starlingArm64Only = providers.gradleProperty("starlingArm64Only").orElse("false").get().toBooleanStrict()
 val starlingVersionCode = providers.gradleProperty("starlingVersionCode").orElse("1").get().let { raw ->
     raw.toIntOrNull()?.takeIf { it > 0 }
         ?: throw GradleException("starlingVersionCode must be an integer in 1..${Int.MAX_VALUE}: $raw")
@@ -81,7 +83,7 @@ android {
         }
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         ndk {
-            abiFilters += listOf("arm64-v8a", "x86_64")
+            abiFilters += if (starlingArm64Only) listOf("arm64-v8a") else listOf("arm64-v8a", "x86_64")
         }
     }
 
@@ -112,6 +114,13 @@ android {
             applicationIdSuffix = ".debug"
         }
         release {
+            if (starlingExperimental) {
+                applicationIdSuffix = ".experimental"
+                resValue("string", "app_name", "Starling Experimental")
+                resValue("string", "screen_title", "Starling Experimental")
+                resValue("string", "keyboard_name", "Starling Experimental Voice Input")
+                resValue("string", "recognition_service_name", "Starling Experimental Voice Recognition")
+            }
             if (releaseSigning != null) signingConfig = signingConfigs.getByName("release")
             isMinifyEnabled = false
             proguardFiles(
@@ -123,6 +132,7 @@ android {
 
     buildFeatures {
         buildConfig = true
+        resValues = true
     }
 
     compileOptions {
