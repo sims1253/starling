@@ -1628,6 +1628,12 @@ bool speculative_generate(const QwenDecodeCtx& m, const InputsEmbeds& i,
     const bool prefill_ok = llm_prefill(m, i, op.max_cache_len, prefill, e);
     stats.prefill_ms += elapsed_ms(phase_start, Clock::now());
     if (!prefill_ok) return false;
+    // Prefill has already run a graph and found the first token. Cancellation
+    // still discards that token, including for a one-token budget or EOS.
+    if (cancelled && cancelled()) {
+        o.stop_reason = GenStopReason::kCancelled;
+        return true;
+    }
     o.prefill_logits = std::move(prefill.logits);
     LlmState state = std::move(prefill.state);
     o.ids.push_back(prefill.first_token);

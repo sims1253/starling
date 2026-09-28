@@ -156,6 +156,28 @@ int main(int argc, char** argv) {
     check(greedy.ids == std::vector<int32_t>({0, 1, 2, 3, 4, 0, 1, 2, 3, 4}),
           "token-chain fixture yields changing greedy tokens", ids_string(greedy.ids));
 
+    // The second cancellation check runs after prefill. Neither a one-token
+    // budget nor first-token EOS may commit the in-flight prefill result.
+    for (int eos : {-1, 0}) {
+        GenerateOptions first_op = op;
+        first_op.max_new_tokens = 1;
+        first_op.eos_token_id = eos;
+        GenerateResult prefill_cancelled;
+        SpeculativeStats prefill_cancel_stats;
+        int prefill_checks = 0;
+        err.clear();
+        const bool prefill_cancel_ok = speculative_generate(model, input,
+            first_op, 4,
+            [](const std::vector<int32_t>&, int) { return std::vector<int32_t>{}; },
+            [&] { return ++prefill_checks == 2; },
+            prefill_cancelled, prefill_cancel_stats, err);
+        check(prefill_cancel_ok && prefill_checks == 2 &&
+                  prefill_cancelled.stop_reason == GenStopReason::kCancelled &&
+                  prefill_cancelled.ids.empty(),
+              eos < 0 ? "cancel after one-token prefill hides output"
+                      : "cancel after first-token EOS prefill hides output", err);
+    }
+
     // A perfect proposer verifies multiple candidates per target pass.
     auto perfect = [&](const std::vector<int32_t>& prefix, int cap) {
         const size_t offset = std::min(prefix.size(), greedy.ids.size());
@@ -199,7 +221,7 @@ int main(int argc, char** argv) {
     err.clear();
     const bool fallback_cancel_ok = speculative_generate(model, input, op, 4,
         [](const std::vector<int32_t>&, int) { return std::vector<int32_t>{}; },
-        [&] { return ++fallback_checks == 3; },
+        [&] { return ++fallback_checks == 4; },
         fallback_cancelled, fallback_cancel_stats, err);
     check(fallback_cancel_ok &&
               fallback_cancelled.stop_reason == GenStopReason::kCancelled &&
@@ -246,14 +268,14 @@ int main(int argc, char** argv) {
               eos_spec.stop_reason == GenStopReason::kEos && eos_stats.accepted == 2,
           "EOS inside draft stops at verified token", err);
 
-    // The third cancellation check runs after the verify graph. Tentative
+    // The fourth cancellation check runs after the verify graph. Tentative
     // tokens must stay invisible; a fresh run must still match greedy.
     int checks = 0;
     GenerateResult cancelled;
     SpeculativeStats cancel_stats;
     err.clear();
     const bool cancel_ok = speculative_generate(model, input, op, 4, perfect,
-        [&] { return ++checks == 3; }, cancelled, cancel_stats, err);
+        [&] { return ++checks == 4; }, cancelled, cancel_stats, err);
     check(cancel_ok && cancelled.stop_reason == GenStopReason::kCancelled &&
               cancelled.ids == std::vector<int32_t>{0},
           "cancel after verification hides tentative output", err);
