@@ -195,9 +195,9 @@ int main(int argc, char** argv) {
         return 2;
     }
     std::printf("{\"backend\":\"%s\",\"repeats\":%d,"
-                "\"row_attention\":%s,\"diagnostic_k\":%d}\n",
+                "\"batch_attention_opt_out\":%s,\"diagnostic_k\":%d}\n",
                 starling_ggml_backend_name(), repeats,
-                std::getenv("STARLING_MOSS_VERIFY_ROW_ATTN") ? "true" : "false",
+                std::getenv("STARLING_MOSS_VERIFY_BATCH_ATTN") ? "true" : "false",
                 diagnostic_k);
     std::fflush(stdout);
 

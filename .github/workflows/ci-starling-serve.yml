@@ -121,7 +121,7 @@ jobs:
             trace_schema_test trace_off_test granite_trace_test serve_trace_test \
             replay_graph_support_test cpu_repack_test \
             device_cache_clear_test greedy_termination_test tdt_graph_budget_test \
-            speculative_verifier_test
+            speculative_verifier_test moss-preview-copy-test
 
       - name: Quantizer storage and recipe regressions
         env:
@@ -135,6 +135,7 @@ jobs:
           ./build/stream_session_test
           ./build/audio_parser_test
           ./build/replay_graph_support_test
+          ./build/moss-preview-copy-test
 
       # Engine contracts from the optimization program: on-device KV cache
       # clearing (S01), EOS/budget termination (S03), and batched speculative

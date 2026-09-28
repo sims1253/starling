@@ -70,3 +70,10 @@ scoring is
 The first failure remains part of the result rather than being erased by this
 amendment. Passing the two fixtures would be bounded evidence for this fix,
 not a proof that all CPU models or future inputs are identical.
+
+After scoring, #338 adopted the same row-attention graph as the CPU default in
+`419723df29f2990f2a22efb58e256d8b848bee24`. The historical result and
+binary hash above refer to the opt-in experiment, not a fresh timing of that
+later default commit. The final default can be reproduced without the old
+opt-in flag; `STARLING_MOSS_VERIFY_BATCH_ATTN=1` selects the earlier batch
+attention for diagnosis.
