@@ -28,6 +28,12 @@ the 2026-09-28 run at max K=2:
 | medium | 77 | 79 | 53 | 0.491 | 1.491 |
 | long | 257 | 281 | 188 | 0.495 | 1.495 |
 
+After the stalled-source fallback fix in `cc12c1d`, a tokenizer-only replay
+of the same cached goldens reproduced these verify-pass and accepted-token
+counts exactly (8/53/188 passes; 3/26/93 accepted). The three golden hashes
+remained `f77e234b`, `b65f89c1`, and `22d880e3` (short/medium/long). The
+fix changes drafted-token and empty-pass counts, which this table does not show.
+
 The target stream is reproduced by the oracle replay, which is a simulator
 property; this replay alone establishes neither native numerical parity nor a
 speedup. The [native verifier in #338](https://github.com/sims1253/starling/pull/338)
