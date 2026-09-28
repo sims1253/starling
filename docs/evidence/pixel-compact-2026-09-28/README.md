@@ -17,7 +17,9 @@ The [baseline](baseline-pixel-official.json) and
 decoded-audio SHA256s, references, hypotheses, and unrounded per-clip WERs.
 The [verdict](embedding-pixel-verdict.json) was calculated by
 `benchmarks/compare_quant_wer.py` with 10,000 paired bootstrap samples per
-language, NumPy `default_rng(0)`, and a 2.5th–97.5th percentile interval.
+language, Python `random.Random` seeded with the sealed protocol's `20260928`
+plus the cohort index (EN `20260928`, DE `20260929`), and a linearly
+interpolated 2.5th–97.5th percentile interval.
 The upper bounds are 0.000 pp EN and +0.150 pp DE, both below the strict
 +0.2 pp margin. The candidate saved 15,402,752 stored bytes. The
 [hypothesis differences](changed-hypotheses.json) list all 13 changed clips;
@@ -47,3 +49,32 @@ graphics allocation, and `dumpsys meminfo` total PSS includes graphics
 mtrack; do not add them together. The battery gauge reversed as the phone
 began charging; thermal state rose and the display woke. Latency and energy
 comparisons from these sweeps are invalid. Their WER pairs remain valid.
+
+The [memory-only protocol](matched-memory-protocol.json) (SHA256
+`bc4bf72540753d417d7e507b7d6bdea75d11c5d0c09bad32cdff0a8baf22bc7c`)
+was saved before a new baseline/candidate pair. The exact [runner](run_memory.py)
+used one fresh fast-engine process per arm, the same `short.wav` warmup, then
+eight timed short and eight medium runs; it sampled memory after the first
+measured short result while the process remained alive. The raw stdout and
+stderr logs and [baseline](baseline-a-matched.json) and
+[candidate](embedding-a-matched.json) snapshots are included. Both snapshots
+had the display off, AC charging, battery temperature 38.8°C, and thermal
+status 1. This pair used two GPU loads after the seven prior health/quality
+loads; a third bracket load was omitted because phone activity already
+prevented a controlled latency estimate.
+
+| Warmed short-fixture snapshot | Baseline | Q8 embedding |
+|---|---:|---:|
+| `dumpsys meminfo` GL mtrack | 783,232 kB | 783,232 kB |
+| `dumpsys meminfo` total PSS | 838,895 kB | 839,229 kB |
+| `/proc` smaps PSS | 55,714 kB | 56,052 kB |
+| `/proc` smaps RSS | 69,208 kB | 68,684 kB |
+| Fast Vulkan weights, load log | 718.6 MiB | 718.6 MiB |
+
+The candidate's total PSS was 334 kB higher in this pair. This small
+difference gives no evidence of a resident-memory saving, but one pair cannot
+estimate a distribution or a peak. The graphics allocation and fast-engine
+weights were identical. No co-residency budget exists for this comparison.
+Raw warm timings are retained in the `*-matched.stdout` files for inspection;
+they are not a latency verdict. Charging and unrelated phone activity also
+exclude an idle-subtracted energy estimate.

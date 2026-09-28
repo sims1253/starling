@@ -1,0 +1,35 @@
+{
+  "arm": "baseline",
+  "tag": "baseline-a",
+  "pid": 17291,
+  "prior_state": {
+    "ac_powered": "true",
+    "battery_status": 2,
+    "battery_temp_deci_c": 389,
+    "thermal_status": 1,
+    "wakefulness": "Dozing",
+    "screen_state": "OFF"
+  },
+  "start_state": {
+    "ac_powered": "true",
+    "battery_status": 2,
+    "battery_temp_deci_c": 389,
+    "thermal_status": 1,
+    "wakefulness": "Dozing",
+    "screen_state": "OFF"
+  },
+  "smaps_rss_kb": 69208,
+  "smaps_pss_kb": 55714,
+  "graphics_kb": 783232,
+  "total_pss_kb": 838895,
+  "battery_temp_deci_c": 388,
+  "thermal_status": 1,
+  "end_state": {
+    "ac_powered": "true",
+    "battery_status": 2,
+    "battery_temp_deci_c": 388,
+    "thermal_status": 1,
+    "wakefulness": "Dozing",
+    "screen_state": "OFF"
+  }
+}

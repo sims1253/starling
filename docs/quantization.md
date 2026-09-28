@@ -416,13 +416,17 @@ The [13 exact changes](evidence/pixel-compact-2026-09-28/changed-hypotheses.json
 and raw benchmark logs make the result auditable.
 
 The fast engine repacked both IQ2 files into the same 718.6 MiB Vulkan weight
-allocation. Stored-byte savings therefore did **not** reduce that allocation
-in this build. Process PSS and graphics allocations require matched probes
-before a resident-memory delta can be claimed. The corpus ran across rising
-thermal status, screen wakeups, and a charge counter that reversed direction
-as the phone began charging. Its timings and energy samples do not establish
-a controlled latency or energy result. The paired WER gate compares quality
-only. This phone result does not promote the recipe to a release default.
+allocation. A matched, sequential baseline/candidate probe after the same
+short-WAV warmup found identical GL mtrack (783,232 kB) and total process PSS
+of 838,895 versus 839,229 kB. The 334 kB difference is too small to support
+a resident-memory benefit; this is a warmed short-fixture snapshot, not a
+peak or co-residency budget. Stored-byte savings therefore did **not** reduce
+the observed Vulkan weight or graphics allocation in this build. The corpus
+ran across rising thermal status, screen wakeups, and a charge counter that
+reversed direction as the phone began charging. Its timings and energy samples
+do not establish a controlled latency or energy result. The paired WER gate
+compares quality only. This phone result does not promote the recipe to a
+release default.
 
 ## Results (parakeet-tdt-0.6b-v3, LibriSpeech fixtures)
 
