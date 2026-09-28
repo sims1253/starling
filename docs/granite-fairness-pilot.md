@@ -1,6 +1,6 @@
 # Granite chunk fairness CPU pilot (#178)
 
-This report evaluates the opt-in `--granite-chunk-fairness` scheduler in [#178](https://github.com/sims1253/starling/issues/178). The prerequisite is a real-model mixed-request delay on the current serial server. The earlier [#174 pilot](serving-contention-pilot.md) found one, but its scored WebSocket sessions had completed only the transport handshake. The corrected runs here require an application `ping`/`pong` before each long upload, so the measured short-request delay begins with a ready session. This is a three-pair CPU pilot, not a p95/p99 estimate or a recommendation to change the default. The first candidate iteration passed; review fixes to backend identity and terminal queue timeouts changed the executable, so final-binary replication is pending. The PR remains draft until that replication finishes.
+This report evaluates the opt-in `--granite-chunk-fairness` scheduler in [#178](https://github.com/sims1253/starling/issues/178). The prerequisite is a real-model mixed-request delay on the current serial server. The earlier [#174 pilot](serving-contention-pilot.md) found one, but its scored WebSocket sessions had completed only the transport handshake. The corrected runs here require an application `ping`/`pong` before each long upload, so the measured short-request delay begins with a ready session. The final reviewed binary passed the preregistered three-pair CPU comparison and a distinct-audio A/B/A output-isolation check. This is not a p95/p99 estimate or a recommendation to change the default.
 
 ## Method and decision rule
 
@@ -14,6 +14,20 @@ Run `benchmarks/contention/run_pilot.py` with `--spec benchmarks/contention/seri
 
 An attempted post-review fair rerun from `ad383d6` was interrupted when its worker-owned PTY ended. It completed only idle pair 0, so it has no decision verdict and is not counted in the table below. Its [partial result](../benchmarks/contention/results/interrupted-fair-partial-2026-09-28.json) and [interruption record](../benchmarks/contention/results/interrupted-final-attempt-2026-09-28.json) are preserved. The final replication uses the same thresholds, with its candidate binary and specs amended and committed before launch: `fair_ready_spec.json` SHA-256 `99962f7d61d451d95fda6bc8d9547f0c80e4b565f4478b3cb45b70477389cef4`, `real_ab_a_spec.json` SHA-256 `01f8be9e431c8550bba0594045a55aa2a297187e8be9ff4b9029b9c08a925d15`.
 
+## Final-binary replication (2026-09-28 UTC)
+
+The final candidate binary (`57c54ab3638211b36720a97615af175e950bce6d7e5f5a59a98364d16435f713`) ran six fresh app-ready trials against the saved serial baseline. The candidate's own `run_pilot.py` verdict is `inconclusive` because that baseline-only verdict requires busy retries and a single long service record, which the fair scheduler intentionally removes. The predeclared paired decision is instead `evaluate_fairness.py`; it returned `pilot_pass` with no failed rule using the current pinned candidate spec. Every trial returned the same short final hash and each mixed long request returned HTTP 200, the same long final hash, and three traced chunks.
+
+| Pair | Serial mixed short | Final fair idle short | Final fair mixed short | Saving / mixed ratio | Busy replies | Long wall serial → fair |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 130.81 s | 6.54 s | 47.78 s | 83.03 s / 0.365× | 98 → 0 | 117.05 → 131.31 s |
+| 1 | 129.86 s | 14.63 s | 56.36 s | 73.49 s / 0.434× | 98 → 0 | 117.43 → 119.50 s |
+| 2 | 141.00 s | 10.67 s | 45.57 s | 95.44 s / 0.323× | 107 → 0 | 128.37 → 132.49 s |
+
+The long wall ratios were 1.122, 1.018 and 1.032, all below the preregistered 1.35 cap. The application ping/pong readiness barriers in the three fair mixed trials took 45.97, 44.90 and 45.81 ms before each long HTTP request. The [unmodified final trial summary](../benchmarks/contention/results/fair-final-app-ready-cpu-2026-09-28.json) and [saved serial baseline](../benchmarks/contention/results/serial-app-ready-cpu-2026-09-27.json) reproduce the paired verdict with the default current spec. The measurement host's raw logs remain under `/tmp/starling-178-fair-final/`.
+
+The same final binary also passed the preregistered distinct-audio A/B/A test. Serial A matched fair A1 and A2 at SHA-256 `8bd0f0a220db9523f2cdf545de2281e9c4e1ec6bddebe6f8ad4bb133d54745dd`; serial B matched fair B at the different SHA-256 `693595171fcf8fa1dc621ddeec55db226e46f62318ca66224660083dfb191dc4`. All five requests returned HTTP 200 with chunks `[1,2,3]`. The fair trace order was A1, B, A2 in each of the three chunk rounds, and a fresh WS session answered an application ping in 41.64 ms during A1's first chunk. The [unmodified final A/B/A summary](../benchmarks/contention/results/real-aba-final-cpu-2026-09-28.json) records the hashes, order and `pass` verdict. This is output-isolation evidence for two public inputs, not a broad throughput measurement.
+
 ## Initial application-ready paired result
 
 | Pair | Serial idle short | Serial mixed short | Fair idle short | Fair mixed short | Fair saving / mixed ratio | Busy replies serial → fair | Long HTTP wall serial → fair |
@@ -24,7 +38,7 @@ An attempted post-review fair rerun from `ad383d6` was interrupted when its work
 
 All twelve short trials ended in a `final` with SHA-256 `41f9e18f92ad8dfa94861d37ccb1262f07a1660c7b42f50bf51252cf5b5d0383`. All six mixed long uploads returned HTTP 200 after three traced Granite chunks with final-text SHA-256 `8bd0f0a220db9523f2cdf545de2281e9c4e1ec6bddebe6f8ad4bb133d54745dd`. Each short first commit preceded its long upload's completion. The fair long trace showed one service turn per chunk; its second turn waited 10.60, 11.92 and 10.64 s behind the short work. The corrected serial baseline met the material-contention gate in every pair, and `evaluate_fairness.py` returned `pilot_pass` for the candidate with no failed rule. Long wall ratios were 1.014, 1.010 and 0.891, below the 1.35 cap. The result is a bounded improvement for this workload and host, not a general throughput claim.
 
-## Distinct-audio state-isolation check
+## Initial distinct-audio state-isolation check
 
 The separate A/B/A rule was pinned in [`benchmarks/contention/real_ab_a_spec_initial.json`](../benchmarks/contention/real_ab_a_spec_initial.json) (SHA-256 `71f5a8eaff15c37d4d3980ca90eb92babb3585bfc35703f834cba015f578789e`) before its first run. Input A was the same 74.35 s public repeated LibriSpeech fixture used above. Input B came from a [different public LibriSpeech clip](https://huggingface.co/datasets/argmaxinc/librispeech/resolve/main/1089-134686-0000.flac) (FLAC SHA-256 `30885601173f96b0d8ddd020dc959b055c6c1582b85a33e3fcab8c4b08ed94c2`), decoded to mono 16 kHz PCM16 WAV with FFmpeg 4.4.2 and repeated seven times at the PCM-frame level. The resulting 73.045 s B WAV (SHA-256 `16503e95c0a78cc4fbd2db3789d385297bc31ad52e63ef79e8bbe5040fb01be4`) also ends with a partial third chunk. These inputs differ in source speech and in final-text hash; neither contains personal audio.
 

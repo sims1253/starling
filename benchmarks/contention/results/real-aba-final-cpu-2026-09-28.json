@@ -1,0 +1,198 @@
+{
+  "run_utc": "2026-09-28T00:50:45.234900+00:00",
+  "spec_sha256": "01f8be9e431c8550bba0594045a55aa2a297187e8be9ff4b9029b9c08a925d15",
+  "cpu_affinity": "16-23",
+  "host_load_before": [
+    9.59716796875,
+    6.693359375,
+    4.4140625
+  ],
+  "serial": {
+    "command": [
+      "taskset",
+      "-c",
+      "16-23",
+      "/home/m0hawk/.t3/worktrees/starling/issue-174-contention-pilot/build-contention/starling-serve",
+      "--model",
+      "granite",
+      "--gguf",
+      "/home/m0hawk/Documents/starling-granite/models/granite-speech-4.1-2b-bf16-exact.gguf",
+      "--port",
+      "47269"
+    ],
+    "binary_sha256": "a91847c520596042e798e5acd17e14c3ada78a7b3699f317b4402d5459cf6d49",
+    "warmup": {
+      "status": 200,
+      "wall_ms": 7739.216823014431,
+      "text_sha256": "41f9e18f92ad8dfa94861d37ccb1262f07a1660c7b42f50bf51252cf5b5d0383",
+      "text_length": 122
+    },
+    "a1": {
+      "status": 200,
+      "wall_ms": 114467.59810601361,
+      "text_sha256": "8bd0f0a220db9523f2cdf545de2281e9c4e1ec6bddebe6f8ad4bb133d54745dd",
+      "text_length": 1012,
+      "chunks": [
+        1,
+        2,
+        3
+      ]
+    },
+    "b": {
+      "status": 200,
+      "wall_ms": 178467.66834997106,
+      "text_sha256": "693595171fcf8fa1dc621ddeec55db226e46f62318ca66224660083dfb191dc4",
+      "text_length": 987,
+      "chunks": [
+        1,
+        2,
+        3
+      ]
+    },
+    "chunk_order": [
+      [
+        "aba-warmup",
+        1
+      ],
+      [
+        "aba-serial-a",
+        1
+      ],
+      [
+        "aba-serial-a",
+        2
+      ],
+      [
+        "aba-serial-a",
+        3
+      ],
+      [
+        "aba-serial-b",
+        1
+      ],
+      [
+        "aba-serial-b",
+        2
+      ],
+      [
+        "aba-serial-b",
+        3
+      ]
+    ]
+  },
+  "fair": {
+    "command": [
+      "taskset",
+      "-c",
+      "16-23",
+      "/home/m0hawk/.t3/worktrees/starling/issue-178-granite-fairness/build-178/starling-serve",
+      "--model",
+      "granite",
+      "--gguf",
+      "/home/m0hawk/Documents/starling-granite/models/granite-speech-4.1-2b-bf16-exact.gguf",
+      "--port",
+      "48111",
+      "--granite-chunk-fairness"
+    ],
+    "binary_sha256": "57c54ab3638211b36720a97615af175e950bce6d7e5f5a59a98364d16435f713",
+    "warmup": {
+      "status": 200,
+      "wall_ms": 8859.697705018334,
+      "text_sha256": "41f9e18f92ad8dfa94861d37ccb1262f07a1660c7b42f50bf51252cf5b5d0383",
+      "text_length": 122
+    },
+    "new_session": {
+      "connect_ms": 2.683257916942239,
+      "ping_ms": 41.639315080828965,
+      "reply": "pong"
+    },
+    "a1": {
+      "status": 200,
+      "wall_ms": 292793.94476197194,
+      "text_sha256": "8bd0f0a220db9523f2cdf545de2281e9c4e1ec6bddebe6f8ad4bb133d54745dd",
+      "text_length": 1012,
+      "chunks": [
+        1,
+        2,
+        3
+      ]
+    },
+    "b": {
+      "status": 200,
+      "wall_ms": 324203.8524360396,
+      "text_sha256": "693595171fcf8fa1dc621ddeec55db226e46f62318ca66224660083dfb191dc4",
+      "text_length": 987,
+      "chunks": [
+        1,
+        2,
+        3
+      ]
+    },
+    "a2": {
+      "status": 200,
+      "wall_ms": 361973.92761404626,
+      "text_sha256": "8bd0f0a220db9523f2cdf545de2281e9c4e1ec6bddebe6f8ad4bb133d54745dd",
+      "text_length": 1012,
+      "chunks": [
+        1,
+        2,
+        3
+      ]
+    },
+    "chunk_order": [
+      [
+        "aba-warmup",
+        1
+      ],
+      [
+        "aba-a1",
+        1
+      ],
+      [
+        "aba-b",
+        1
+      ],
+      [
+        "aba-a2",
+        1
+      ],
+      [
+        "aba-a1",
+        2
+      ],
+      [
+        "aba-b",
+        2
+      ],
+      [
+        "aba-a2",
+        2
+      ],
+      [
+        "aba-a1",
+        3
+      ],
+      [
+        "aba-b",
+        3
+      ],
+      [
+        "aba-a2",
+        3
+      ]
+    ]
+  },
+  "host_load_after": [
+    10.3974609375,
+    10.73583984375,
+    8.39208984375
+  ],
+  "verdict": {
+    "status": "pass",
+    "status_ok": true,
+    "hashes_ok": true,
+    "chunks_ok": true,
+    "interleaved": true,
+    "admission_ok": true
+  }
+}
