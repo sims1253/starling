@@ -14,8 +14,8 @@ import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-PROTOCOL = ROOT / "protocol-draft.json"
-FIXTURES = Path("/home/m0hawk/.t3/quant-exp-50/pixel-s1-copy-kit-18cf0d7/fixtures.json")
+PROTOCOL = ROOT / "protocol.json"
+FIXTURES = ROOT / "fixtures.json"
 ADB = "/home/m0hawk/android-sdk/platform-tools/adb"
 SERIAL = "192.168.178.59:34113"
 DEVICE = "/data/local/tmp/starling-issue-batch"

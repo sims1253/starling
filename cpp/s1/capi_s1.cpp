@@ -235,7 +235,7 @@ char* starling_ggml_s1_normalize(void* handle, const char* transcript,
                 report(err_out, c->err);
                 return nullptr;
             }
-            CopyDrafter drafter(std::move(source_ids), max_k);
+            starling::ggml::s1::CopyDrafter drafter(std::move(source_ids), max_k);
             generated = speculative_generate(*c->model, in, op, max_k,
                 [&](const std::vector<int32_t>& prefix, int cap) {
                     return drafter.propose(prefix, cap);
@@ -246,24 +246,6 @@ char* starling_ggml_s1_normalize(void* handle, const char* transcript,
         if (!generated) {
             report(err_out, c->err);
             return nullptr;
-        }
-
-        // Greedy generation already writes this diagnostic in the shared
-        // decoder. Write it here for copy mode so each arm incurs one dump.
-        // The proposer never reads the file; only verified IDs reach it.
-        if (const char* path = copy_enabled ? std::getenv("STARLING_S1_DUMP_IDS") : nullptr) {
-            FILE* file = std::fopen(path, "wb");
-            bool written = file != nullptr;
-            if (file) {
-                written = std::fwrite(res.ids.data(), sizeof(int32_t),
-                                      res.ids.size(), file) == res.ids.size();
-                if (std::fclose(file) != 0) written = false;
-            }
-            if (!written) {
-                c->err = "S1 cannot write generated ID diagnostic";
-                report(err_out, c->err);
-                return nullptr;
-            }
         }
 
         // (5) detokenize (skip specials: drops the stop token).

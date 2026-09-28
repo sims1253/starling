@@ -26,9 +26,13 @@ int main() {
           "full acceptance expands draft length to three");
 
     CopyDrafter partial({1, 2, 3, 4, 5}, 4);
-    check(partial.propose({1}, 4) == std::vector<int32_t>({2, 3}) &&
-              partial.propose({1, 2, 9}, 4) == std::vector<int32_t>({3}),
+    check(partial.propose({1}, 4) == std::vector<int32_t>({2, 3}),
+          "partial draft starts with two tokens");
+    check(partial.propose({1, 2, 9}, 4) == std::vector<int32_t>({3}),
           "partial acceptance keeps only verified prefix and shrinks K");
+    check(partial.propose({1}, 4).empty(), "rollback discards stale alignment");
+    check(partial.propose({1, 2}, 4) == std::vector<int32_t>({3, 4}),
+          "next prefix realigns after rollback");
 
     CopyDrafter repeated({}, 4);
     check(repeated.propose({4, 5, 4}, 4) == std::vector<int32_t>({5, 4}),
@@ -36,5 +40,8 @@ int main() {
     CopyDrafter unmatched({}, 4);
     check(unmatched.propose({7}, 4).empty(),
           "unmatched prefix has no fabricated future draft");
+    CopyDrafter divergent({1, 2, 3, 4}, 4);
+    check(divergent.propose({8, 9, 10}, 4).empty(),
+          "three source misses do not reuse stale source tokens");
     return failed ? 1 : 0;
 }

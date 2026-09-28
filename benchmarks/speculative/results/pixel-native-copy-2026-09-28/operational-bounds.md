@@ -2,7 +2,7 @@
 
 Declared before any native-copy phone process at 2026-09-28 12:41 UTC. This
 operational note does not change the locked workload, parity gate, or comparison
-rule in `protocol-draft.json` (SHA-256
+rule in `protocol.json` (SHA-256
 `2e497202a1dd49e1bd49282f3e918b7b04b98de40056728bfa75719045e440b9`).
 
 The protocol's 13-minute estimate was optimistic given the earlier Pixel BF16

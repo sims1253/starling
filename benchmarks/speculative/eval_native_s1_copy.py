@@ -45,10 +45,13 @@ def main() -> int:
     if any(k < 1 or k > 16 for k in args.ks) or args.repeats < 1:
         parser.error("K must be 1..16 and repeats must be positive")
 
-    import torch
-
     transcripts = runpy.run_path(str(ROOT / "tests/fixtures/s1_transcripts.py"))["LENGTH_TIERS"]
     transcripts["protected"] = PROTECTED_TRANSCRIPT
+    unknown_cases = [case for case in args.cases if case not in transcripts]
+    if unknown_cases:
+        parser.error(f"unknown cases: {', '.join(unknown_cases)}")
+
+    import torch
     os.environ["STARLING_GGML_DEVICE"] = "cpu"
     os.environ["STARLING_S1_TIMING"] = "1"
     lib = ctypes.CDLL(str(args.lib.resolve()))
@@ -95,6 +98,8 @@ def main() -> int:
                     text = ctypes.string_at(output).decode("utf-8")
                 finally:
                     lib.starling_ggml_free_string(output)
+                if not dump.exists():
+                    raise RuntimeError("native library did not create the S1 ID dump")
                 data = dump.read_bytes()
                 if len(data) % 4:
                     raise ValueError("incomplete S1 ID dump")
@@ -102,8 +107,6 @@ def main() -> int:
                 return ids, text, elapsed, hashlib.sha256(data).hexdigest()
 
             for case in args.cases:
-                if case not in transcripts:
-                    parser.error(f"unknown case {case}")
                 transcript = transcripts[case]
                 expected_ids = expected_text = golden_hash = None
                 if case != "protected":
@@ -130,7 +133,9 @@ def main() -> int:
                             "source_sha256": hashlib.sha256(transcript.encode()).hexdigest(),
                             "baseline_ms": round(baseline_ms, 2),
                             "copy_ms": round(elapsed, 2),
-                            "ratio_copy_over_greedy": round(elapsed / baseline_ms, 3),
+                            "ratio_copy_over_greedy": (
+                                round(elapsed / baseline_ms, 3) if baseline_ms > 0 else None
+                            ),
                             "output_tokens": len(ids),
                             "greedy_ids_sha256": baseline_hash,
                             "copy_ids_sha256": output_hash,
@@ -170,6 +175,8 @@ def main() -> int:
         and row["greedy_text_matches_stock"] is not False
         and (row["copy_protected_spans"] is None
              or all(row["copy_protected_spans"].values()))
+        and (row["greedy_protected_spans"] is None
+             or all(row["greedy_protected_spans"].values()))
         for row in rows
     )
     return 0 if passed else 1
