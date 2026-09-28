@@ -52,3 +52,8 @@ def test_stalled_source_without_lookup_uses_target_only_pass():
     assert drafter.propose([9], 2) == []
     result = m.simulate([1, 2, 3], [9, 8, 7, 6], max_k=2)
     assert result.passes_without_draft >= 1
+
+
+def test_truncated_final_draft_counts_as_full_accept():
+    # The last pass verifies only the remaining target token; a match is full.
+    assert _module().simulate([1, 2], [1], max_k=2).full_accept_passes == 1
