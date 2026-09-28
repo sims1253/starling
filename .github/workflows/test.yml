@@ -77,6 +77,7 @@ jobs:
           tests/test_server_lifecycle.py tests/test_server_websocket.py
           tests/test_server_client.py tests/test_stream_chunk.py
           tests/test_native_parity_contract.py
+          benchmarks/speculative/results/pixel-native-copy-2026-09-28/test_run_copy.py
 
       # tests/test_native_parity_contract.py (issue #167): the executable
       # numerical-correctness contract — manifest schema, test-selection
