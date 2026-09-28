@@ -17,7 +17,6 @@
 #include "depthwise_weight.hpp"
 
 #include "runtime/backend.hpp"  // clone_weight, graph_input_tensor
-#include "runtime/graph.hpp"    // global_backend
 
 #include "ggml.h"
 
