@@ -43,9 +43,7 @@ class CopyDrafter:
         if k < 1:
             raise ValueError("k must be positive")
         if self.misses >= 3 or self.position >= len(self.source):
-            lookup = self._lookup(prefix, k)
-            if lookup:
-                return lookup
+            return self._lookup(prefix, k)
         return self.source[self.position:self.position + k]
 
 
@@ -102,5 +100,9 @@ def simulate(source: Sequence[int], target: Sequence[int], *, max_k: int = 2,
         for token in target[len(output):len(output) + count]:
             output.append(token)
             drafter.observe(token)
-    assert output == list(target)
+    if output != list(target):
+        for index, (got, want) in enumerate(zip(output, target)):
+            if got != want:
+                raise ValueError(f"replay diverged at index {index}: got {got}, want {want}")
+        raise ValueError(f"replay length mismatch: got {len(output)}, want {len(target)}")
     return Result(len(output), passes, drafted, accepted_total, full, empty)

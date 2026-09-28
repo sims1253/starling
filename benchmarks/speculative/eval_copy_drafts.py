@@ -15,7 +15,10 @@ import json
 import runpy
 from pathlib import Path
 
-from copy_draft import simulate
+if __package__:
+    from .copy_draft import simulate
+else:
+    from copy_draft import simulate
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -24,8 +27,8 @@ def evaluate(golden_dir: Path, max_k: int) -> dict:
     import torch
     from transformers import AutoTokenizer
 
-    from_model = "superwhisper/s1-mini"
-    tokenizer = AutoTokenizer.from_pretrained(from_model, local_files_only=True)
+    config = runpy.run_path(str(ROOT / "src/starling/s1/config.py"))
+    tokenizer = AutoTokenizer.from_pretrained(config["MODEL_ID"], local_files_only=True)
     fixtures = runpy.run_path(str(ROOT / "tests/fixtures/s1_transcripts.py"))["LENGTH_TIERS"]
     cases = []
     for tier, transcript in fixtures.items():
@@ -50,7 +53,8 @@ def evaluate(golden_dir: Path, max_k: int) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--golden-dir", type=Path, default=ROOT / "golden/s1")
+    config = runpy.run_path(str(ROOT / "src/starling/s1/config.py"))
+    parser.add_argument("--golden-dir", type=Path, default=config["GOLDEN_DIR"])
     parser.add_argument("--max-k", type=int, default=2)
     args = parser.parse_args()
     print(json.dumps(evaluate(args.golden_dir, args.max_k), indent=2))

@@ -85,6 +85,8 @@ jobs:
       # Stdlib + pytest only, no models, no downloads; the required-target
       # accounting reports gitignored-asset coverage as UNAVAILABLE (distinct,
       # non-failing) so the contract is executable on every CPU runner.
+      # tests/test_copy_draft.py probes the offline acceptance contract with
+      # stdlib and pytest only; it needs no model or golden files.
 
       - name: Test native Python bindings with CPU-only PyTorch
         run: >-
