@@ -94,7 +94,8 @@ int main() {
     std::string ea, eb, es, ra, rb, rs;
     const std::string log = capture_stderr([&] {
         std::thread ta([&] {
-            ra = server.transcribe_pcm(a.data(), (int64_t)a.size(), ca, &ea).text;
+            ra = server.transcribe_pcm(a.data(), (int64_t)a.size(), ca, &ea,
+                                       QueuePolicy::SkipIfBusy).text;
         });
         check(wait_until([&] { return ca->running.load(); }), "long A entered engine");
         std::thread tb([&] {
@@ -114,6 +115,7 @@ int main() {
           "interleaved outputs equal serial baselines, including padded tails");
     int active = 0, max_active = 0, chunk_a = 0, chunk_b = 0, chunk_s = 0;
     int yielded_a = 0, yielded_b = 0;
+    int first_a_skip = 0, continuation_a_block = 0;
     int next_chunk = 0, short_chunk = -1, last_a = -1, last_b = -1;
     size_t pos = 0;
     while (pos < log.size()) {
@@ -123,6 +125,10 @@ int main() {
         if (line.rfind("[trace] ", 0) != 0) continue;
         const std::string ev = field(line, "ev"), req = field(line, "req");
         if (req != "long-a" && req != "long-b" && req != "short") continue;
+        if (ev == "queue_enter" && req == "long-a") {
+            if (field(line, "policy") == "skip_if_busy") ++first_a_skip;
+            if (field(line, "policy") == "block") ++continuation_a_block;
+        }
         if (ev == "queue_wait") max_active = std::max(max_active, ++active);
         if (ev == "queue_exit") {
             --active;
@@ -143,6 +149,8 @@ int main() {
     check(chunk_a > 1 && chunk_b > 1 && chunk_s == 1 &&
           yielded_a == chunk_a-1 && yielded_b == chunk_b-1,
           "each long chunk yields once; short runs once");
+    check(first_a_skip == 1 && continuation_a_block == chunk_a - 1,
+          "SkipIfBusy first chunk continues with blocking reserved turns");
     check(short_chunk >= 0 && short_chunk < last_a && short_chunk < last_b,
           "short engine chunk ran before both long final chunks");
 
