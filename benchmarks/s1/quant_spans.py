@@ -44,7 +44,10 @@ def check_cases(cases: list[dict]) -> None:
         for label, pattern in spans.items():
             if not isinstance(label, str) or not isinstance(pattern, str) or not pattern:
                 raise ValueError(f"{case['id']}: invalid span")
-            re.compile(pattern)
+            try:
+                re.compile(pattern)
+            except re.error as error:
+                raise ValueError(f"{case['id']}: invalid span regex for {label}: {error}") from error
 
 
 def audit_output(case: dict, output: str) -> dict[str, bool]:
@@ -114,8 +117,19 @@ def compare(baseline: dict, candidate: dict, cases_path: Path | None = None) -> 
         raise ValueError("baseline model_sha256 must match source_sha256")
     if candidate["model_sha256"] == baseline["model_sha256"]:
         raise ValueError("candidate model_sha256 must differ from baseline")
-    b = {row["id"]: row for row in baseline["results"]}
-    c = {row["id"]: row for row in candidate["results"]}
+    def result_map(record: dict, arm: str) -> dict[str, dict]:
+        rows = record.get("results")
+        if not isinstance(rows, list):
+            raise ValueError(f"{arm}: results must be a list")
+        for row in rows:
+            if (not isinstance(row, dict) or not isinstance(row.get("id"), str)
+                    or not isinstance(row.get("output"), str)
+                    or not isinstance(row.get("spans_present"), dict)):
+                raise ValueError(f"{arm}: invalid result row")
+        return {row["id"]: row for row in rows}
+
+    b = result_map(baseline, "baseline")
+    c = result_map(candidate, "candidate")
     if len(b) != len(baseline["results"]) or len(c) != len(candidate["results"]) or set(b) != set(c):
         raise ValueError("case IDs are missing, duplicated, or changed")
     if cases_path is not None:

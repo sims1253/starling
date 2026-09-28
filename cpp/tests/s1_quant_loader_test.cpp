@@ -25,16 +25,18 @@ static bool write_profile(const char* path, const char* profile) {
 
 int main(int argc, char** argv) {
     const char* path = "/tmp/s1_quant_loader_test.gguf";
-    for (const char* profile : {"bf16_exact", "quantized", "f16", "garbage"}) {
+    const char* profiles[] = {"bf16_exact", "quantized", "f16", "garbage", nullptr};
+    for (const char* profile : profiles) {
         if (!write_profile(path, profile)) { check(false, "write metadata GGUF"); continue; }
         starling::ggml::s1::S1Model model;
         std::string err;
         const bool loaded = model.load(path, err);
-        const bool accepted = std::string(profile) == "bf16_exact" ||
-                              std::string(profile) == "quantized";
+        const bool accepted = profile && (std::string(profile) == "bf16_exact" ||
+                                          std::string(profile) == "quantized");
         check(!loaded && (accepted ? err.find("contains no tensors") != std::string::npos
                                    : err.find("numeric profile") != std::string::npos),
-              std::string("profile '") + profile + (accepted ? "' accepted" : "' rejected"), err);
+              std::string("profile '") + (profile ? profile : "<missing>") +
+                  (accepted ? "' accepted" : "' rejected"), err);
     }
     std::remove(path);
 

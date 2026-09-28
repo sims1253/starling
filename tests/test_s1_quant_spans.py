@@ -23,6 +23,11 @@ def test_cases_parse_and_have_unique_labels():
         "negation": True, "recipient": True}
 
 
+def test_invalid_span_regex_has_case_context():
+    with pytest.raises(ValueError, match="sample: invalid span regex"):
+        check_cases([{"id": "sample", "transcript": "hello", "spans": {"x": "["}}])
+
+
 @pytest.mark.parametrize("case_id,label,valid,mutants", [
     ("amount_correction", "corrected_amount", "$45", [
         "145", "$145", "forty fives", "$45.50", "$45,000", "45.01"]),
@@ -133,4 +138,16 @@ def test_comparison_rejects_wrong_baseline_and_identical_candidate_model():
     baseline["model_sha256"] = source
     candidate["model_sha256"] = source
     with pytest.raises(ValueError, match="candidate model_sha256"):
+        compare(baseline, candidate)
+
+
+def test_comparison_rejects_malformed_result_rows():
+    source = _digest("source")
+    baseline = {"schema": "s1-quant-spans-v1", "source_sha256": source,
+                "model_sha256": source, "model_bytes": 100,
+                "engine_sha256": "e", "cases_sha256": "c", "device": "CPU",
+                "results": [{"id": "a", "output": "ok", "spans_present": {"span": True}}]}
+    candidate = {**baseline, "model_sha256": _digest("candidate"),
+                 "model_bytes": 80, "results": [{"id": "a"}]}
+    with pytest.raises(ValueError, match="candidate: invalid result row"):
         compare(baseline, candidate)

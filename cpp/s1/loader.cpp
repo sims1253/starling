@@ -100,6 +100,11 @@ bool S1Model::load(const char* path, std::string& err) {
         for (auto v : a) c.prompt_suffix.push_back((int32_t) v);
 
     // --- Validate untrusted GGUF metadata (mirror qwen3/loader.cpp). ---
+    std::string profile;
+    if (!m.kv_str("starling.numeric_profile", profile)) {
+        err = "S1 GGUF missing starling.numeric_profile";
+        return false;
+    }
     if (!lib::check_gguf_header(m, "s1", "S1", {"bf16_exact", "quantized"}, err))
         return false;
 #define POS(v, name) do { if (!(v)) { err = "S1 GGUF " name " must be positive"; return false; } } while (0)
@@ -139,8 +144,6 @@ bool S1Model::load(const char* path, std::string& err) {
     // Require every expected tensor so a structural change fails loudly:
     // embed/final norm + 11 tensors per Qwen3 layer (same layout as the
     // qwen3-ASR trunk).
-    std::string profile;
-    m.kv_str("starling.numeric_profile", profile);
     const bool quantized = profile == "quantized";
     for (const char* n : {"llm.embed.weight", "llm.final_norm.weight"})
         if (!lib::require(m, n, "S1", err)) return false;
@@ -163,10 +166,10 @@ bool S1Model::load(const char* path, std::string& err) {
             if (!lib::require(m, n, "S1", err)) return false;
             if (quantized) {
                 const ggml_type type = m.tensor(n)->type;
-                const bool linear = std::string(tail).find(".weight") != std::string::npos &&
-                                    std::string(tail).find("norm.weight") == std::string::npos;
+                const bool linear = std::string(tail).find("norm.weight") == std::string::npos;
                 if (!(linear ? supported_linear_type(type) : supported_norm_type(type))) {
-                    err = std::string("S1 quantized profile has unsupported tensor type at ") + n;
+                    err = std::string("S1 quantized profile has unsupported tensor type ") +
+                          ggml_type_name(type) + " at " + n;
                     return false;
                 }
             }

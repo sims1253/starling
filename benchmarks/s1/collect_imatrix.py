@@ -34,12 +34,19 @@ def main() -> int:
 
     spec = importlib.util.spec_from_file_location(
         "s1_transcripts", ROOT / "tests/fixtures/s1_transcripts.py")
+    if spec is None or spec.loader is None:
+        raise RuntimeError("cannot load tests/fixtures/s1_transcripts.py")
     fixture = importlib.util.module_from_spec(spec)
-    assert spec and spec.loader
     spec.loader.exec_module(fixture)
 
     from starling._ggml import GgmlModel, S1
     from starling._ggml._native import _load_lib, backend_name
+    lib = _load_lib()
+    flush = getattr(lib, "starling_ggml_imatrix_flush_pub", None) if lib else None
+    if flush is None:
+        raise RuntimeError("native library lacks imatrix flush; rebuild with imatrix support")
+    flush.argtypes = []
+    flush.restype = None
     model = GgmlModel(S1, str(args.model.resolve()))
     try:
         if backend_name().lower() != "cpu":
@@ -51,10 +58,6 @@ def main() -> int:
         for index, (transcript, styling, structure, context) in enumerate(inputs, 1):
             model.normalize_text(transcript, styling, structure, context)
             print(f"[{index}/{len(inputs)}] {len(transcript)} input chars", flush=True)
-        lib = _load_lib()
-        flush = getattr(lib, "starling_ggml_imatrix_flush_pub")
-        flush.argtypes = []
-        flush.restype = None
         flush()
     finally:
         model.close()
