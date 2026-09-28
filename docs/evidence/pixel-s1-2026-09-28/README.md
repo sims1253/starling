@@ -41,3 +41,10 @@ A later unplugged, screen-off, CPU-only [ABBA pilot](controlled/README.md)
 records fresh BF16–Q4–Q4–BF16 processes, their protected outputs, host HTTP
 latencies, and battery-counter samples. Its energy result remains
 inconclusive because gauge update latency was not established.
+
+A separate unplugged, screen-off [CPU residency snapshot](cpu-co-residency/README.md)
+kept the baseline Parakeet ASR server resident while loading optional Q4 S1.
+The sampled process PSS sum was 1.43 GiB with both servers ready, and Android
+`MemAvailable` ranged from 2.75 to 3.26 GiB across the joint samples. This
+is a shell CPU observation; it does not establish the mobile app's process
+allowance, a joint peak, or foreground responsiveness.

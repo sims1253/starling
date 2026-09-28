@@ -1,0 +1,106 @@
+{
+  "schema": "pixel-cpu-residency-summary-v1",
+  "protocol_sha256": "2fe9df844f1b866a8dee64bdc32cee20990997ebee2168988cf5a7ec95383f73",
+  "server_ready_ms": {
+    "asr": 8279.270873,
+    "s1": 14206.121582
+  },
+  "stages": {
+    "idle": {
+      "samples": 3,
+      "mem_available_kb": {
+        "min": 4878760,
+        "max": 4901588
+      },
+      "combined_process_pss_kb": {
+        "min": 0,
+        "max": 0
+      },
+      "combined_process_rss_kb": {
+        "min": 0,
+        "max": 0
+      },
+      "process_pss_kb": {},
+      "process_vmhwm_kb": {}
+    },
+    "asr_only": {
+      "samples": 3,
+      "mem_available_kb": {
+        "min": 4444480,
+        "max": 4478188
+      },
+      "combined_process_pss_kb": {
+        "min": 385807,
+        "max": 385807
+      },
+      "combined_process_rss_kb": {
+        "min": 388652,
+        "max": 388652
+      },
+      "process_pss_kb": {
+        "asr": {
+          "min": 385807,
+          "max": 385807
+        }
+      },
+      "process_vmhwm_kb": {
+        "asr": {
+          "min": 390344,
+          "max": 390344
+        }
+      }
+    },
+    "asr_plus_optional_s1": {
+      "samples": 3,
+      "mem_available_kb": {
+        "min": 2878396,
+        "max": 3420704
+      },
+      "combined_process_pss_kb": {
+        "min": 1497164,
+        "max": 1497166
+      },
+      "combined_process_rss_kb": {
+        "min": 1505732,
+        "max": 1505748
+      },
+      "process_pss_kb": {
+        "asr": {
+          "min": 384376,
+          "max": 384377
+        },
+        "s1": {
+          "min": 1112788,
+          "max": 1112789
+        }
+      },
+      "process_vmhwm_kb": {
+        "asr": {
+          "min": 390344,
+          "max": 390344
+        },
+        "s1": {
+          "min": 1120516,
+          "max": 1120516
+        }
+      }
+    },
+    "recovery": {
+      "samples": 3,
+      "mem_available_kb": {
+        "min": 4311364,
+        "max": 4513872
+      },
+      "combined_process_pss_kb": {
+        "min": 0,
+        "max": 0
+      },
+      "combined_process_rss_kb": {
+        "min": 0,
+        "max": 0
+      },
+      "process_pss_kb": {},
+      "process_vmhwm_kb": {}
+    }
+  }
+}

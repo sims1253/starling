@@ -1,0 +1,22 @@
+{
+  "schema": "pixel-cpu-asr-optional-s1-residency-v1",
+  "registered_utc": "2026-09-28T12:54:53Z",
+  "phone": "Pixel 10 Pro Android 17, serial 192.168.178.59:34113",
+  "purpose": "Descriptive CPU shell-process fallback for issue 316 ASR-only versus ASR plus optional S1 Q4; no fast/Vulkan or mobile APK claim",
+  "artifacts": {
+    "source_commit": "2a3bda4",
+    "starling_serve_sha256": "e9d65265def7129b0505cea08a1b7749d17e7b1e79645bf880ae84c289bbb224",
+    "parakeet_iq2_baseline_sha256": "bfee29b2b3419b387c8bc1b28a1772b506dd57aa9cfd879b2530bc287d93b0d3",
+    "s1_q4_k_m_sha256": "4b12084f0cbbfcfe7c88ed45e8aac28fa20e813faf77f24b9c8d46bc7f9f5834"
+  },
+  "environment": "Discharging unplugged, screen OFF, thermal<2, battery<42C; no app or settings changes. Abort on violation or missing required telemetry.",
+  "sequence": [
+    "idle with no owned Starling process",
+    "ASR-only: launch baseline IQ2 Parakeet CPU server, eager load and built-in silent-clip warmup, wait /health ready",
+    "ASR plus optional S1: retain ASR process, launch Q4_K_M S1 CPU server, eager load and built-in probe-text warmup, wait /health ready",
+    "stop both owned servers; recovery snapshot"
+  ],
+  "sampling": "At each stage take three /proc/meminfo and per-owned-PID smaps_rollup/status samples about five seconds apart. Preserve raw samples, selected CPU backend logs, process PIDs and launch-to-ready times. No long user transcript or inference campaign.",
+  "bounds": "ASR readiness <=180 s, S1 readiness <=180 s, whole run <=9 min; stop owned servers on timeout/failure and verify absence. Do not retry or change phone settings.",
+  "analysis": "Report observed per-process PSS/RSS and VmHWM; global MemAvailable range at idle, ASR-only, and co-resident stages. No additive GPU claim; these servers explicitly request ggml CPU. The 2 GiB target and 2-3 GiB available headroom are provisional soft engineering preferences, not pass/fail acceptance. Shell processes are not the mobile app's process limit or proof of foreground user-app behavior. Do not attribute all global memory movement to Starling."
+}
