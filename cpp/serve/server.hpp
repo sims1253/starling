@@ -207,6 +207,8 @@ private:
     // effective_req_id (optional) receives the request id actually used for
     // the queue ticket (the caller's ctx id, or the synthesized "#anon-N" —
     // the trace correlates follow-up records like response emission with it).
+    // A successful nonterminal turn reserves one admission slot; its next
+    // call must set continuing=true to transfer that slot to a new ticket.
     bool run_with_turn(RequestContext* ctx, QueuePolicy policy,
                        const std::function<char*()>& engine_call,
                        std::string* out_text, std::string* err,

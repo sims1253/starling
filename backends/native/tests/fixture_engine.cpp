@@ -2,6 +2,7 @@
 #include "dr_wav.h"
 // Contract-test engine only. This file is never linked into starling-serve.
 #include "starling_ggml.h"
+#include "lib/granite_job_internal.hpp"
 #include "lib/model_registry.hpp"
 #include <cstdlib>
 #include <cstring>
@@ -32,6 +33,16 @@ char* starling_ggml_normalize_text(starling_ggml_ctx*, const char* transcript, c
 }
 }
 namespace starling::ggml::lib {
+// The contract fixture has no Granite model. Keep the server's internal
+// chunk-job references linkable without pretending that it can run one.
+GraniteChunkJob* create_granite_job(starling_ggml_ctx*, const float*, int64_t) {
+    return nullptr;
+}
+int step_granite_job(starling_ggml_ctx*, GraniteChunkJob*, std::string*) {
+    return -1;
+}
+bool granite_job_last_chunk(const GraniteChunkJob*) { return false; }
+void free_granite_job(GraniteChunkJob*) {}
 // s1 registers a normalize entry point so the fixture can serve /normalize.
 char* fixture_normalize(void*, const char* transcript, const char*, const char*, const char*, const char**) {
     return echo(transcript);
