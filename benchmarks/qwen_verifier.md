@@ -60,20 +60,29 @@ snapshot `de575db64086f84fdc79da4932d1076e965bc546` and has SHA-256
 The optional-CTC-head GGUF used in that check has SHA-256
 `cec47a4fb872ace2713447409f01e0f9ef0d2a7f217db8bb9c33ea0ef96c916a`.
 
-The CPU verifier now copies the S candidate KV rows and bounds the batched
-attention tensor to `past + S` keys, the extent of its final row. Earlier rows
-causally mask later keys but still reduce over that batch width, whereas
-greedy uses a separately sized attention tensor at each token. This change
-fixed the observed Granite case: K=1, 2, and 4 each produced the same 98 IDs
-and stop result as greedy on that clip. `STARLING_GRANITE_FULLCAP=1` retains
-the full-capacity verifier
-when the greedy path explicitly selects full-capacity attention; the GPU
-verifier also keeps its existing graph. The real check uses the
+The CPU verifier first copied the S candidate KV rows and bounded its
+attention tensor to `past + S` keys, the extent of the final row. That fixed
+the observed Granite case: K=1, 2, and 4 each produced the same 98 IDs and
+stop result as greedy on that clip. Earlier rows still reduced over the batch
+width with future keys masked, whereas greedy used a separately sized tensor
+at each token. The medium MOSS/LibriSpeech case exposed the remaining gap:
+greedy stopped after 89 IDs, while a K=2 Parakeet-text copy draft produced
+91 IDs, first differing at zero-based index 21.
+
+The CPU verifier now reduces each query row over only `past + row + 1` keys
+by default, while keeping batched projections and KV writes. On that public
+MOSS pilot, two warmed alternating pairs each at K=2 and K=4 for both short
+and medium fixtures matched every greedy ID, EOS, and saved text (eight pairs
+total). The measured full MOSS calls were 21.7–26.0% faster with the draft;
+the saved final Parakeet transcript was assumed already available, so live
+preview accuracy and any new Parakeet inference cost are outside that pilot.
+`STARLING_MOSS_VERIFY_BATCH_ATTN=1` restores the earlier bounded-batch
+reduction only for diagnosis. `STARLING_GRANITE_FULLCAP=1` retains the
+full-capacity verifier when greedy explicitly selects full-capacity
+attention; the GPU verifier also keeps its existing graph. The real Granite
+check uses the
 `granite_ctc_verify_test` harness from the stacked #313 work, which adds a
 CTC draft source and is not part of the generic verifier. The self-synthesized
-`speculative_verifier_test` also passed after the correction. This one clip
-confirms the fixed mismatch, not universal greedy parity. A separate medium
-BF16 MOSS/LibriSpeech CPU case still diverges: greedy stops after 89 IDs,
-while a K=2 Parakeet-text copy draft produces 91 IDs. Its first mismatch is
-at zero-based output index 21. The cause remains under diagnosis; no MOSS
-runtime enablement follows from the short MOSS or Granite passes.
+`speculative_verifier_test` also passed after the per-row change. These sampled
+cases do not prove greedy parity for every model, audio input, or device;
+runtime enablement remains gated on the intended workload and hardware.
