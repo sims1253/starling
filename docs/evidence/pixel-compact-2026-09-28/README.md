@@ -52,7 +52,11 @@ comparisons from these sweeps are invalid. Their WER pairs remain valid.
 
 The [memory-only protocol](matched-memory-protocol.json) (SHA256
 `bc4bf72540753d417d7e507b7d6bdea75d11c5d0c09bad32cdff0a8baf22bc7c`)
-was saved before a new baseline/candidate pair. The exact [runner](run_memory.py)
+was saved before a new baseline/candidate pair. The original runner at
+`acc6b84` was used for this evidence; the current [runner](run_memory.py)
+uses `STARLING_ADB_SERIAL` (and optional `STARLING_ADB` /
+`STARLING_DEVICE_DIR`) and a unique process marker for PID attribution. It
+also keeps partial stdout on failure. The measured run
 used one fresh fast-engine process per arm, the same `short.wav` warmup, then
 eight timed short and eight medium runs; it sampled memory after the first
 measured short result while the process remained alive. The raw stdout and
