@@ -771,10 +771,12 @@ ggml_tensor* append_layer_new(ggml_context* c, const QwenDecodeCtx& m, int li,
         // In F mode q was rounded after rope (one tiny cast) and joined
         // feeds linf, whose f32() is exact.
         ggml_tensor* co = nullptr;
-        if (kv_mode == 3 && env(m.spec, "_VERIFY_ROW_ATTN")) {
-            // #313 diagnosis only: each batched verifier query sees the
-            // exact prefix that a greedy single-token decode sees. Batched
-            // projections and KV writes remain unchanged to isolate width.
+        if (kv_mode == 3 && !env(m.spec, "_VERIFY_BATCH_ATTN")) {
+            // CPU verifier default: each query reduces over the populated
+            // prefix of its own row. Batched projections and KV writes remain;
+            // numerical parity still needs a real-model check per workload.
+            // _VERIFY_BATCH_ATTN restores the earlier bounded-batch reduction
+            // for diagnosis, not for runtime enablement.
             for (int64_t row = 0; row < S; ++row) {
                 const int64_t width = past + row + 1;
                 ggml_tensor* qr = ggml_view_3d(c, q, D, 1, H,
@@ -1053,9 +1055,9 @@ bool forward_verify(const QwenDecodeCtx& m, const std::vector<int32_t>& tokens,
         return false;
     }
     // CPU greedy uses a populated-prefix attention width on each step. Bound
-    // this batch by its final populated prefix; earlier rows still reduce
-    // over the batch width with future keys masked, so ID parity needs tests.
-    // Full-capacity reductions flipped a near-tie in one Granite case.
+    // this batch by its final populated prefix, then let mode 3 reduce each
+    // query over its own prefix. Full-capacity reductions flipped a near-tie
+    // in one Granite case; bounded-batch reductions diverged on a MOSS case.
     // GPU keeps its captured/full-capacity verifier graph.
     const bool exact_width = !global_backend().is_gpu() &&
                              env(m.spec, "_FULLCAP") == nullptr;
