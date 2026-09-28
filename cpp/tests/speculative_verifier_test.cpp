@@ -254,7 +254,8 @@ int main(int argc, char** argv) {
         auto proposer = [&](const std::vector<int32_t>& prefix, int cap) {
             if (proposals++) return std::vector<int32_t>{};
             auto draft = perfect(prefix, cap);
-            draft[(size_t)reject_at] = (draft[(size_t)reject_at] + 1) % 16;
+            draft[(size_t)reject_at] =
+                (draft[(size_t)reject_at] + 1) % (int32_t)model.config.llm.vocab;
             return draft;
         };
         GenerateResult got;
@@ -279,7 +280,7 @@ int main(int argc, char** argv) {
         speculative_generate(model, input, eos_op, 4,
             [](const std::vector<int32_t>&, int cap) {
                 std::vector<int32_t> draft{1, 2, 3, 4};
-                draft.resize((size_t)cap);
+                draft.resize(std::min(draft.size(), (size_t)cap));
                 return draft;
             }, {}, eos_spec, eos_stats, err);
     check(eos_ok && same_output(eos_spec, eos_greedy) &&
