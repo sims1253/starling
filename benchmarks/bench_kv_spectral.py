@@ -59,7 +59,12 @@ def gather_calibration_clips(max_clips: int,
     """
     clips: list[tuple[np.ndarray, int, str]] = []
     if audio_paths:
-        for path in audio_paths[:max_clips]:
+        if len(audio_paths) > max_clips:
+            raise ValueError(
+                f"--audio has {len(audio_paths)} clips, exceeding --clips {max_clips}; "
+                "increase --clips to include every explicit file"
+            )
+        for path in audio_paths:
             a, sr = _read_wav_mono(str(path))
             clips.append((a, sr, path.name))
         return clips
@@ -307,10 +312,12 @@ def pca_layer(train: torch.Tensor, held_out: torch.Tensor,
             per_head_deff[t][h] = deff[t]
         yc = y - mean
         energy = float(yc.square().sum())
+        if energy <= 1e-12:
+            raise ValueError(f"held-out head {h} has near-zero energy; relative error is undefined")
+        coeffs = yc @ vh.T
         def relative_error(rank: int) -> float:
-            basis = vh[:rank]
-            residual = yc - (yc @ basis.T) @ basis
-            return float(residual.square().sum()) / energy if energy else 0.0
+            residual = yc - coeffs[:, :rank] @ vh[:rank]
+            return float(residual.square().sum()) / energy
         for r in ranks:
             errors[r].append(relative_error(r))
         for t in thresholds:
@@ -398,7 +405,7 @@ def measure_granite(clips: list[tuple[np.ndarray, int, str]],
 
     summary = _summarise(layers_out, head_dim, thresholds)
     summary["model"] = "granite-speech-4.1-2b"
-    summary["source_snapshot"] = snapshot.name if snapshot is not None else "default HF revision"
+    summary["source_snapshot"] = str(snapshot.resolve()) if snapshot is not None else "default HF revision"
     summary["num_layers"] = len(layers_out)
     summary["num_heads"] = num_heads
     summary["head_dim"] = head_dim
@@ -506,7 +513,7 @@ def main() -> int:
         ap.error("--models must contain granite and/or qwen3")
     try:
         clips = gather_calibration_clips(args.clips, args.audio)
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, RuntimeError) as exc:
         ap.error(str(exc))
     print(f"calibration set: {len(clips)} clips", flush=True)
     for _, _, name in clips:
@@ -528,10 +535,13 @@ def main() -> int:
         "held_out_clip_names": [clips[i][2] for i in range(1, len(clips), 2)],
     }
     if args.audio:
-        results["audio_sha256"] = {
-            path.name: hashlib.sha256(path.read_bytes()).hexdigest()
-            for path in args.audio[:len(clips)]
-        }
+        try:
+            results["audio_sha256"] = {
+                path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+                for path in args.audio
+            }
+        except OSError as exc:
+            ap.error(f"could not hash --audio file: {exc}")
 
     if "granite" in models:
         results["granite"] = measure_granite(clips, args.granite_snapshot)

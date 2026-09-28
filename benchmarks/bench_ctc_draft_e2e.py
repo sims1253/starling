@@ -137,8 +137,8 @@ def main() -> None:
         audio = torch.from_numpy(samples).unsqueeze(0)
         # Exclude first-use graph capture/initialization from timed trials.
         if ix == 0:
-            trial(audio, "target")
-            trial(audio, "full")
+            for method in methods:
+                trial(audio, method)
         rows: dict[str, list[dict]] = {method: [] for method in methods}
         for rep in range(args.repeats):
             order = methods if (ix + rep) % 2 == 0 else list(reversed(methods))
