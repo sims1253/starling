@@ -6,6 +6,7 @@ import datetime as dt
 import hashlib
 import json
 import re
+import shutil
 import statistics
 import subprocess
 import time
@@ -17,8 +18,8 @@ ROOT = Path(__file__).resolve().parent
 OUTPUT_ROOT = ROOT
 PROTOCOL = ROOT / "protocol.json"
 FIXTURES = ROOT / "fixtures.json"
-ADB = "/home/m0hawk/android-sdk/platform-tools/adb"
-SERIAL = "192.168.178.59:34113"
+ADB = "adb"
+SERIAL = json.loads(PROTOCOL.read_text())["serial"]
 DEVICE = "/data/local/tmp/starling-issue-batch"
 EXE = f"{DEVICE}/native-copy"
 PORT = 18182
@@ -32,6 +33,16 @@ TIMING = re.compile(
 
 def sha(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def configure_device(adb_executable, serial):
+    global ADB, SERIAL
+    resolved = shutil.which(adb_executable)
+    if resolved is None:
+        raise ValueError(f"ADB executable not found: {adb_executable}")
+    if not serial:
+        raise ValueError("ADB device serial is empty")
+    ADB, SERIAL = resolved, serial
 
 
 def adb(*args, timeout=35):
@@ -52,25 +63,68 @@ def remote_server_pids():
     return raw.split()
 
 
-def state():
-    from sys import path
-    old = list(path)
-    try:
-        path.insert(0, str(ROOT.parent / "controlled-20260928"))
-        from run_controlled import sample_state, bad_state
-        s = sample_state(full=True)
-        reason = bad_state(s)
-        if reason:
-            raise RuntimeError(reason)
-        return s
-    finally:
-        path[:] = old
+def extract(pattern, raw):
+    match = re.search(pattern, raw, re.MULTILINE)
+    return match.group(1) if match else None
+
+
+def sample_state():
+    """Collect the bounded phone state required by this pilot's protocol."""
+    start_ns = time.monotonic_ns()
+    battery = adb("shell", "dumpsys battery")
+    thermal = adb("shell", "dumpsys thermalservice")
+    display = adb("shell", "dumpsys display")
+    power = adb("shell", "dumpsys power")
+    state = {
+        "charge_uah": extract(r"^\s*Charge counter:\s*(-?\d+)", battery),
+        "voltage_mv": extract(r"^\s*voltage:\s*(\d+)", battery),
+        "battery_status": extract(r"^\s*status:\s*(\d+)", battery),
+        "battery_percent": extract(r"^\s*level:\s*(\d+)", battery),
+        "battery_temp_deci_c": extract(r"^\s*temperature:\s*(\d+)", battery),
+        "ac_powered": extract(r"^\s*AC powered:\s*(true|false)", battery),
+        "usb_powered": extract(r"^\s*USB powered:\s*(true|false)", battery),
+        "wireless_powered": extract(r"^\s*Wireless powered:\s*(true|false)", battery),
+        "thermal_status": extract(r"^Thermal Status:\s*(\d+)", thermal),
+        "screen_state": extract(r"^\s*mScreenState=(\w+)", display),
+        "wakefulness": extract(r"^\s*mWakefulness=(\w+)", power),
+    }
+    for key in ("charge_uah", "voltage_mv", "battery_status", "battery_percent",
+                "battery_temp_deci_c", "thermal_status"):
+        if state[key] is not None:
+            state[key] = int(state[key])
+    end_ns = time.monotonic_ns()
+    state.update({"mono_start_ns": start_ns, "mono_end_ns": end_ns,
+                  "mono_mid_ns": (start_ns + end_ns) // 2,
+                  "utc": dt.datetime.now(dt.timezone.utc).isoformat()})
+    return state
+
+
+def bad_state(state):
+    required = ("charge_uah", "voltage_mv", "battery_status", "battery_percent",
+                "battery_temp_deci_c", "ac_powered", "usb_powered",
+                "wireless_powered", "thermal_status", "screen_state", "wakefulness")
+    missing = [key for key in required if state.get(key) is None]
+    if missing:
+        return f"missing phone state: {', '.join(missing)}"
+    if state["battery_status"] != 3 or any(state[key] != "false" for key in
+            ("ac_powered", "usb_powered", "wireless_powered")):
+        return "phone is not discharging unplugged"
+    if state["battery_temp_deci_c"] >= 420:
+        return "battery temperature >=42C"
+    if state["thermal_status"] >= 2:
+        return "thermal status >=2"
+    if state["screen_state"] != "OFF":
+        return "screen turned on"
+    return None
 
 
 def checked_state(out, label):
-    s = state()
+    s = sample_state()
     with (out / "states.jsonl").open("a") as file:
         file.write(json.dumps({"label": label, **s}) + "\n")
+    reason = bad_state(s)
+    if reason:
+        raise RuntimeError(f"{label}: {reason}")
     return s
 
 
@@ -95,6 +149,7 @@ def run_process(stage, index, arm, fixtures, deadline, reference=None):
     out.mkdir(exist_ok=False)
     cfg = json.loads(PROTOCOL.read_text())
     record = {"stage": stage, "index": index, "arm": arm,
+              "device_serial": SERIAL, "adb_executable": ADB,
               "protocol_sha256": sha(PROTOCOL), "fixture_sha256": sha(FIXTURES),
               "binary_sha256": cfg["binary_sha256"], "rows": [],
               "completed": False}
@@ -246,9 +301,15 @@ def main():
     global OUTPUT_ROOT
     parser = argparse.ArgumentParser()
     parser.add_argument("stage", choices=("preflight", "performance"))
+    parser.add_argument("--adb", default="adb", help="ADB executable or path (default: adb on PATH)")
+    parser.add_argument("--serial", help="ADB device serial (default: sealed protocol serial)")
     parser.add_argument("--output-dir", type=Path, default=ROOT,
                         help="fresh directory for this preflight/performance run")
     args = parser.parse_args()
+    try:
+        configure_device(args.adb, args.serial or json.loads(PROTOCOL.read_text())["serial"])
+    except ValueError as error:
+        parser.error(str(error))
     OUTPUT_ROOT = args.output_dir.resolve()
     OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
     if sha(FIXTURES) != json.loads(PROTOCOL.read_text())["fixture_sha256"]:
