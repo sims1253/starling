@@ -63,7 +63,8 @@ def main() -> int:
             "--param", "ptr:y", "--param", "ptr:z", "--param", "ptr:out",
             "--check-array", "out", "--no-profile",
         )
-        if re.search(r"\bNOT EQUIVALENT\b", verdict) or not re.search(r"(?<!NOT )\bEQUIVALENT\b", verdict):
+        negated = r"\bNOT\s+EQUIVALENT\b"
+        if re.search(negated, verdict) or not re.search(r"\bEQUIVALENT\b", re.sub(negated, "", verdict)):
             raise RuntimeError(f"Volta did not reproduce the expected result:\n{verdict}")
         print(gpu_result)
         print(verdict.strip())
