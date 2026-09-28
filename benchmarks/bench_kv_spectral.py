@@ -370,7 +370,7 @@ def measure_granite(clips: list[tuple[np.ndarray, int, str]],
         for i, (wav, sr, name) in enumerate(clips):
             wav_t = torch.from_numpy(wav).unsqueeze(0)
             inputs = build_inputs(processor, wav_t)
-            feats = inputs["input_features"].to(dtype).cuda()
+            feats = inputs["input_features"].to(device=model.device, dtype=dtype)
             T = int(feats.shape[1])
             cap.record_seq_len(T)
             _ = encoder(feats, return_dict=True)

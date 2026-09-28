@@ -88,6 +88,7 @@ def main() -> None:
     state = load_file(str(head_path), device="cpu")
     weight = state["weight"].to(device="cuda", dtype=torch.float32)
     weight_bf16 = weight.to(torch.bfloat16)
+    head_vocab, head_hidden = weight.shape
     bias = state["bias"].to(device="cuda", dtype=torch.bfloat16)
     # Best Frobenius low-rank approximation of the weight. The 1024x1024 Gram
     # avoids materializing a 100353x100353 covariance matrix.
@@ -157,7 +158,8 @@ def main() -> None:
             offset += length
         ranks[str(rank)] = {
             "projection_ms_median": measured_ms,
-            "head_weight_fraction": (rank * (1024 + 100353)) / (1024 * 100353),
+            # Above hidden * vocab / (hidden + vocab) the factors exceed the full head.
+            "head_weight_fraction": (rank * (head_hidden + head_vocab)) / (head_hidden * head_vocab),
             "frame_match": float((predicted == baseline_labels).float().mean().item()),
             "audio": per_audio,
         }
