@@ -1,5 +1,6 @@
 // CPU-only Granite chunk-fairness contract over a tiny synthesized GGUF.
 #include "server.hpp"
+#include "stream_session.hpp"
 #include "tiny_granite_fixture.hpp"
 #include "trace_test_support.hpp"
 
@@ -167,6 +168,10 @@ int main() {
 
     ServerConfig timeout_cfg = cfg;
     timeout_cfg.request_timeout_seconds = 0.005;
+    timeout_cfg.stream_chunk_seconds = 1.0;
+    timeout_cfg.stream_overlap_seconds = 0.25;
+    timeout_cfg.min_chunk_seconds = 0.5;
+    timeout_cfg.partial_interval = 0.0;
     StarlingServer timeout_server(timeout_cfg);
     timeout_server.load();
     auto* hold = timeout_server.register_request("timeout-hold");
@@ -182,6 +187,43 @@ int main() {
     holder.join();
     timeout_server.finish_request(hold); timeout_server.finish_request(queued);
     check(queued_err == "request timed out", "queued request meets deadline");
+
+    // A timed-out blocking WS flush is terminal for this take. It must not
+    // enter five fresh queue waits through ChunkStreamer::flush's busy retry.
+    StreamSession timeout_session(&timeout_server);
+    check(timeout_session.append_pcm(std::string(12000 * 2, '\0')) ==
+              AppendOutcome::Accepted, "timeout test audio accepted");
+    auto* hold2 = timeout_server.register_request("timeout-stream-hold");
+    std::thread holder2([&] {
+        (void)timeout_server.transcribe_pcm(a.data(), (int64_t)a.size(), hold2, nullptr);
+    });
+    check(wait_until([&] { return hold2->running.load(); }),
+          "stream timeout holder entered");
+    std::optional<std::string> timed_out_final;
+    const std::string timeout_log = capture_stderr([&] {
+        timed_out_final = timeout_session.stream_flush();
+        (void)timeout_session.stream_flush();  // must not queue again
+    });
+    timeout_server.cancel_request("timeout-stream-hold");
+    holder2.join();
+    timeout_server.finish_request(hold2);
+    int stream_queue_entries = 0;
+    for (size_t at = 0; at < timeout_log.size();) {
+        size_t end = timeout_log.find('\n', at);
+        std::string line = timeout_log.substr(at,
+            end == std::string::npos ? end : end - at);
+        at = end == std::string::npos ? timeout_log.size() : end + 1;
+        if (line.find("\"ev\":\"queue_enter\"") != std::string::npos &&
+            line.find("\"req\":\"#anon-") != std::string::npos)
+            ++stream_queue_entries;
+    }
+    check(!timed_out_final && timeout_session.terminal_error() == "request timed out",
+          "stream flush reports a terminal queue timeout");
+    check(timeout_session.take_invalid() && stream_queue_entries == 1,
+          "timed-out stream take requires reset and gets only one queue ticket");
+    timeout_session.reset();
+    check(timeout_session.terminal_error().empty() && !timeout_session.take_invalid(),
+          "reset clears terminal stream timeout");
 
     std::printf("%s\n", failures ? "GRANITE FAIRNESS FAILED" : "GRANITE FAIRNESS OK");
     return failures ? 1 : 0;

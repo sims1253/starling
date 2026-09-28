@@ -203,6 +203,11 @@ if(STARLING_GGML_TESTS)
       find_package(Threads REQUIRED)
       target_link_libraries(${test_name} PRIVATE Threads::Threads)
     endif()
+    if(test_name STREQUAL "granite_fairness_test")
+      target_sources(${test_name} PRIVATE
+          ${STARLING_REPO_ROOT}/cpp/serve/stream_session.cpp
+          ${STARLING_REPO_ROOT}/cpp/serve/audio.cpp)
+    endif()
 
     set_target_properties(${test_name} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
   endforeach()

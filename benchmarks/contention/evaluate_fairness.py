@@ -25,10 +25,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--serial", type=Path, required=True)
     parser.add_argument("--fair", type=Path, required=True)
+    parser.add_argument("--candidate-spec", type=Path,
+                        help="candidate spec used for this run; defaults to the current final gate")
     args = parser.parse_args()
     spec = json.loads(SPEC.read_text())
     serial_spec = ROOT / spec["baseline_spec"]
-    fair_spec = ROOT / spec["candidate_spec"]
+    fair_spec = args.candidate_spec or ROOT / spec["candidate_spec"]
     serial = json.loads(args.serial.read_text())
     fair = json.loads(args.fair.read_text())
     reasons: list[str] = []

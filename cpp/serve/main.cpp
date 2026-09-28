@@ -948,7 +948,9 @@ int main(int argc, char** argv) {
                         if (dur > 0.0) {
                             auto final = session.stream_flush();
                             if (!final.has_value()) {
-                                ws.send("{\"type\":\"error\",\"message\":\"server busy\"}");
+                                ws.send(session.terminal_error().empty()
+                                    ? "{\"type\":\"error\",\"message\":\"server busy\"}"
+                                    : "{\"type\":\"error\",\"message\":\"request timed out\"}");
                                 continue;
                             }
                             text = *final;
@@ -1022,6 +1024,13 @@ int main(int argc, char** argv) {
                     // buffer are answered by the session's exact-tail reuse
                     // instead of re-running the engine.
                     auto text_opt = session.stream_step(now);
+                    if (!session.terminal_error().empty()) {
+                        if (!reject_error_sent) {
+                            reject_error_sent = true;
+                            ws.send("{\"type\":\"error\",\"message\":\"request timed out\"}");
+                        }
+                        continue;
+                    }
                     if (text_opt.has_value()) {
                         std::string safe_text = json_escape(*text_opt);
                         double dur = session.buffered_seconds();
