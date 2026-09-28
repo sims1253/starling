@@ -201,6 +201,7 @@ struct SpeculativeStats {
     double fallback_ms = 0.0;
     double total_ms = 0.0;
 };
+// max_k must be in [1, 16]; invalid configuration returns false with an error.
 bool speculative_generate(const QwenDecodeCtx& m, const InputsEmbeds& i,
                           const GenerateParams& op, int max_k,
                           const DraftProposer& proposer, const CancelCheck& cancelled,

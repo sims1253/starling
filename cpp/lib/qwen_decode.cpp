@@ -616,7 +616,7 @@ DeviceCache* get_device_cache(const QwenDecodeCtx& m, std::string& e) {
 //   kv_mode 2 = decode full-capacity (set_rows slot `past`, attend [0, max_cache))
 //   kv_mode 3 = batched decode bounded-width (copy S slots, attend [0, past+S),
 //               causally mask later keys for each earlier query row)
-// idx_past is the runtime i32[1] write index used only by mode 2.
+// idx_past is the runtime i32[S] write-index vector used only by mode 2.
 // cs/sn are [D, S] bf16 (RoPE rows). mask is f32 [K, S] (K = past+S for modes
 // 0/1/3, max_cache for mode 2).
 ggml_tensor* append_layer_new(ggml_context* c, const QwenDecodeCtx& m, int li,
@@ -682,7 +682,7 @@ ggml_tensor* append_layer_new(ggml_context* c, const QwenDecodeCtx& m, int li,
     // split across halves, exactly this formula with F32 trig) replaces the
     // whole view/scale/concat/mul/add subgraph: 1 dispatch per rope instead
     // of ~8. It reads [D,H,S] heads-major, so it runs before the permute;
-    // idx_past ([1] int32) is the position vector it needs. Its F32 output is
+    // idx_past ([S] int32) is the position vector it needs. Its F32 output is
     // rounded for the BF16 attention core (one tiny contiguous cast); k needs
     // no round (it reaches attention only via the BF16 cache).
     if (F) {
@@ -1050,7 +1050,11 @@ bool forward_verify(const QwenDecodeCtx& m, const std::vector<int32_t>& tokens,
     if (!dc) return false;
     const int64_t past = state.length;
     const int64_t S = (int64_t)tokens.size();
-    if (S < 2 || past < 0 || past + S > (int64_t)lc.max_cache) {
+    if (S < 2 || past < 0) {
+        e = std::string(m.spec.label) + " invalid verify positions";
+        return false;
+    }
+    if (past + S > (int64_t)lc.max_cache) {
         e = std::string(m.spec.label) + " verify exceeds cache";
         return false;
     }
@@ -1485,6 +1489,15 @@ bool llm_prefill(const QwenDecodeCtx& m, const InputsEmbeds& i, int32_t maxc,
     return true;
 }
 
+void dump_generated_ids(const QwenDecodeSpec& spec, const GenerateResult& output) {
+    if (const char* fp = env(spec, "_DUMP_IDS")) {
+        if (FILE* f = std::fopen(fp, "wb")) {
+            std::fwrite(output.ids.data(), sizeof(int32_t), output.ids.size(), f);
+            std::fclose(f);
+        }
+    }
+}
+
 bool greedy_generate(const QwenDecodeCtx& m, const InputsEmbeds& i,
                      const GenerateParams& op, GenerateResult& o, std::string& e) {
     if (i.n_tokens + op.max_new_tokens > op.max_cache_len) {
@@ -1624,12 +1637,7 @@ bool greedy_generate(const QwenDecodeCtx& m, const InputsEmbeds& i,
         }
     }
     // <env>_DUMP_IDS=<file> dumps generated ids (i32).
-    if (const char* fp = env(m.spec, "_DUMP_IDS")) {
-        if (FILE* f = std::fopen(fp, "wb")) {
-            std::fwrite(o.ids.data(), sizeof(int32_t), o.ids.size(), f);
-            std::fclose(f);
-        }
-    }
+    dump_generated_ids(m.spec, o);
     return true;
 }
 
@@ -1639,6 +1647,10 @@ bool speculative_generate(const QwenDecodeCtx& m, const InputsEmbeds& i,
                           GenerateResult& o, SpeculativeStats& stats, std::string& e) {
     o = GenerateResult{};
     stats = SpeculativeStats{};
+    const auto finish = [&] {
+        dump_generated_ids(m.spec, o);
+        return true;
+    };
     using Clock = std::chrono::steady_clock;
     const auto elapsed_ms = [](Clock::time_point a, Clock::time_point b) {
         return std::chrono::duration<double, std::milli>(b - a).count();
@@ -1660,7 +1672,7 @@ bool speculative_generate(const QwenDecodeCtx& m, const InputsEmbeds& i,
     }
     if (cancelled && cancelled()) {
         o.stop_reason = GenStopReason::kCancelled;
-        return true;
+        return finish();
     }
     PrefillResult prefill;
     auto phase_start = Clock::now();
@@ -1671,26 +1683,26 @@ bool speculative_generate(const QwenDecodeCtx& m, const InputsEmbeds& i,
     // still discards that token, including for a one-token budget or EOS.
     if (cancelled && cancelled()) {
         o.stop_reason = GenStopReason::kCancelled;
-        return true;
+        return finish();
     }
     o.prefill_logits = std::move(prefill.logits);
     LlmState state = std::move(prefill.state);
     o.ids.push_back(prefill.first_token);
     if (generation_stops_on(prefill.first_token, op)) {
         o.stop_reason = GenStopReason::kEos;
-        return true;
+        return finish();
     }
     const ggml_tensor* head = m.loader.tensor(lm_head_name(m.spec));
     const ggml_tensor* embed = m.loader.tensor("llm.embed.weight");
-    if (!head || !embed) {
-        e = std::string(m.spec.label) + " missing speculative head/embedding";
+    if (!head || !embed || head->ne[1] != embed->ne[1]) {
+        e = std::string(m.spec.label) + " speculative head/embedding vocabulary mismatch";
         return false;
     }
     const int64_t vocab = head->ne[1];
     while ((int)o.ids.size() < op.max_new_tokens) {
         if (cancelled && cancelled()) {
             o.stop_reason = GenStopReason::kCancelled;
-            return true;
+            return finish();
         }
         const int remaining = op.max_new_tokens - (int)o.ids.size();
         const int room = (int)((int64_t)op.max_cache_len - state.length);
@@ -1700,6 +1712,10 @@ bool speculative_generate(const QwenDecodeCtx& m, const InputsEmbeds& i,
             phase_start = Clock::now();
             draft = proposer(o.ids, cap);
             stats.proposal_ms += elapsed_ms(phase_start, Clock::now());
+            if (cancelled && cancelled()) {
+                o.stop_reason = GenStopReason::kCancelled;
+                return finish();
+            }
         }
         if ((int)draft.size() > cap ||
             std::any_of(draft.begin(), draft.end(), [&](int32_t id) {
@@ -1723,14 +1739,14 @@ bool speculative_generate(const QwenDecodeCtx& m, const InputsEmbeds& i,
             // predicted token is still tentative until this check passes.
             if (cancelled && cancelled()) {
                 o.stop_reason = GenStopReason::kCancelled;
-                return true;
+                return finish();
             }
             const int32_t token = spec_argmax_impl(m.spec, logits);
             o.ids.push_back(token);
             ++stats.fallback_steps;
             if (generation_stops_on(token, op)) {
                 o.stop_reason = GenStopReason::kEos;
-                return true;
+                return finish();
             }
             continue;
         }
@@ -1754,7 +1770,7 @@ bool speculative_generate(const QwenDecodeCtx& m, const InputsEmbeds& i,
         // output. The previous verified prefix remains available in o.ids.
         if (cancelled && cancelled()) {
             o.stop_reason = GenStopReason::kCancelled;
-            return true;
+            return finish();
         }
         bool rejected = false;
         for (size_t j = 0; j < draft.size(); ++j) {
@@ -1765,7 +1781,7 @@ bool speculative_generate(const QwenDecodeCtx& m, const InputsEmbeds& i,
             o.ids.push_back(target);
             if (generation_stops_on(target, op)) {
                 o.stop_reason = GenStopReason::kEos;
-                return true;
+                return finish();
             }
             if (rejected) {
                 state.length = past + (int64_t)j + 1;
@@ -1779,10 +1795,10 @@ bool speculative_generate(const QwenDecodeCtx& m, const InputsEmbeds& i,
         o.ids.push_back(bonus);
         if (generation_stops_on(bonus, op)) {
             o.stop_reason = GenStopReason::kEos;
-            return true;
+            return finish();
         }
     }
-    return true;
+    return finish();
 }
 
 } // namespace starling::ggml::lib

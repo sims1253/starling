@@ -213,6 +213,25 @@ int main(int argc, char** argv) {
               empty_stats.verify_calls == 0 && empty_stats.fallback_steps == 9,
           "empty draft falls back to greedy steps", err);
 
+    // Cancellation during a proposer must discard its tentative draft before
+    // building a verification graph.
+    bool stop_after_propose = false;
+    GenerateResult proposal_cancelled;
+    SpeculativeStats proposal_cancel_stats;
+    err.clear();
+    const bool proposal_cancel_ok = speculative_generate(model, input, op, 4,
+        [&](const std::vector<int32_t>& prefix, int cap) {
+            auto draft = perfect(prefix, cap);
+            stop_after_propose = true;
+            return draft;
+        }, [&] { return stop_after_propose; },
+        proposal_cancelled, proposal_cancel_stats, err);
+    check(proposal_cancel_ok &&
+              proposal_cancelled.stop_reason == GenStopReason::kCancelled &&
+              proposal_cancelled.ids == std::vector<int32_t>{0} &&
+              proposal_cancel_stats.verify_calls == 0,
+          "cancel after proposal skips verification", err);
+
     // A cancellation triggered by the fallback graph must not emit its
     // tentative token, just as with a multi-row verify graph.
     int fallback_checks = 0;
@@ -221,7 +240,7 @@ int main(int argc, char** argv) {
     err.clear();
     const bool fallback_cancel_ok = speculative_generate(model, input, op, 4,
         [](const std::vector<int32_t>&, int) { return std::vector<int32_t>{}; },
-        [&] { return ++fallback_checks == 4; },
+        [&] { return ++fallback_checks == 5; },
         fallback_cancelled, fallback_cancel_stats, err);
     check(fallback_cancel_ok &&
               fallback_cancelled.stop_reason == GenStopReason::kCancelled &&
@@ -268,14 +287,14 @@ int main(int argc, char** argv) {
               eos_spec.stop_reason == GenStopReason::kEos && eos_stats.accepted == 2,
           "EOS inside draft stops at verified token", err);
 
-    // The fourth cancellation check runs after the verify graph. Tentative
+    // The fifth cancellation check runs after the verify graph. Tentative
     // tokens must stay invisible; a fresh run must still match greedy.
     int checks = 0;
     GenerateResult cancelled;
     SpeculativeStats cancel_stats;
     err.clear();
     const bool cancel_ok = speculative_generate(model, input, op, 4, perfect,
-        [&] { return ++checks == 4; }, cancelled, cancel_stats, err);
+        [&] { return ++checks == 5; }, cancelled, cancel_stats, err);
     check(cancel_ok && cancelled.stop_reason == GenStopReason::kCancelled &&
               cancelled.ids == std::vector<int32_t>{0},
           "cancel after verification hides tentative output", err);
