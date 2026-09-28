@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Capture matched memory and warm timing in a three-process B–E–B bracket.
+"""Capture one arm's warmed memory; invoke once per arm for the B–E pair.
 
-The snapshot follows short run 0. The predeclared timing analysis excludes
-short runs 0–2 because that snapshot may delay them, then uses short runs 3–7
-and all eight medium runs. Every file also gets one unreported warmup pass.
+The snapshot follows measured short run 0. Each fixture gets one separate
+warmup pass and eight measured runs. Raw timings are retained but are not
+used for a latency verdict; see matched-memory-protocol.json.
 """
 
 import argparse
