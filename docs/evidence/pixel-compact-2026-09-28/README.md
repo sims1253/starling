@@ -91,8 +91,18 @@ running it. The planned fast-engine order was baseline, Q8 embedding, Q8
 embedding, baseline, with 72 short and 72 medium requests in each fresh
 process. Its SHA256 is
 `c66f7614fa44c34884059f80b64794905b96167cada6f102d2972756b6b0e708`.
-The [exact runner](controlled-fast-attempt/run_controlled_v1.py) has SHA256
+The [exact historical runner](controlled-fast-attempt/run_controlled_v1.py) has SHA256
 `0c773a6351bc70b59e02cfa70810000dc5aaa87a816d28e268900ceb805f210c`.
+For a new attempt, use the [v2 runner](controlled-fast-attempt/run_controlled_v2.py)
+with `STARLING_ADB_SERIAL` set to the intended phone, optional `STARLING_ADB`,
+`STARLING_DEVICE_DIR`, and a new `--output-dir`
+outside this evidence directory. It records the actual device connection,
+hardware serial, model, build ID, runner hash, and a per-launch marker; cleanup only
+terminates a process carrying that marker. The protocol's saved network
+address and ADB path describe the original attempt, not a required endpoint
+for a later rerun. For the S1 family, also set `STARLING_S1_CASES` to the
+pinned fixture from PR #333 if that fixture is not in the checkout; the runner
+checks its protocol hash. V2 did not produce any of the measurements below.
 
 The first baseline block never completed. Its [stdout](controlled-fast-attempt/bench.stdout)
 contains only short-fixture runs 0–8, with the same transcript in every
