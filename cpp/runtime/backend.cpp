@@ -180,10 +180,13 @@ static void maybe_export_graph(ggml_cgraph* graph, ggml_tensor* output,
         ("graph-" + std::to_string(stamp) + "-" +
          std::to_string(pid) + "-" + std::to_string(number) + ".json");
     std::filesystem::create_directories(path.parent_path());
+    // Serialize first so a serializer failure cannot leave a .tmp behind.
+    const std::string json =
+        graph_snapshot_json(graph, output, device, captures, side_effect_roots);
     const std::filesystem::path incomplete = path.string() + ".tmp";
     std::ofstream file(incomplete, std::ios::binary | std::ios::trunc);
     if (!file) throw std::runtime_error("cannot open graph snapshot: " + incomplete.string());
-    file << graph_snapshot_json(graph, output, device, captures, side_effect_roots);
+    file << json;
     file.close();
     if (!file) {
         std::error_code ignored;

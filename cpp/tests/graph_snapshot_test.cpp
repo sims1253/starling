@@ -9,7 +9,10 @@ int main() {
     ggml_init_params params{ggml_tensor_overhead() * 8 + ggml_graph_overhead(),
                             nullptr, true};
     ggml_context* ctx = ggml_init(params);
-    if (!ctx) return 1;
+    if (!ctx) {
+        std::printf("graph snapshot UTF-8: FAIL (ggml_init failed)\n");
+        return 1;
+    }
     ggml_tensor* input = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4);
     ggml_set_name(input, "r\xc3\xa9play_input");
     ggml_tensor* output = ggml_add(ctx, input, input);
