@@ -46,7 +46,7 @@ jobs:
   servers:
     needs: prepare
     # The reusable workflow contains a tag-release publisher (skipped in this
-    # mode). Its build jobs explicitly reduce this permission to read.
+    # mode), so this call still needs the release workflow's permission contract.
     permissions:
       contents: write
     uses: ./.github/workflows/release-starling-serve.yml

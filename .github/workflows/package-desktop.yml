@@ -26,12 +26,20 @@ jobs:
       fail-fast: false
       matrix:
         platform: ${{ fromJSON(inputs.platforms) }}
-    runs-on: ${{ matrix.platform == 'linux' && 'ubuntu-24.04' || 'windows-2025' }}
+    runs-on: ${{ matrix.platform == 'windows' && 'windows-2025' || 'ubuntu-24.04' }}
     timeout-minutes: 90
     defaults:
       run:
         shell: bash
     steps:
+      - name: Validate platform
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          case "$PLATFORM" in
+            linux|windows) ;;
+            *) echo "::error::Unsupported desktop platform: $PLATFORM"; exit 1 ;;
+          esac
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ inputs.source-ref || github.sha }}
