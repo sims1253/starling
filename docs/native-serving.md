@@ -105,7 +105,9 @@ With `--granite-chunk-fairness`, a long Granite upload releases its engine
 turn after each existing policy-defined chunk and re-enters the FIFO queue.
 An already waiting stream is served before that upload's next chunk. Streaming
 calls wait for their turn in this mode, up to the existing queue deadline;
-the queue still admits at most eight tickets. FIFO age prevents an upload from
+the queue still admits at most eight tickets or reserved continuations in
+total. A yielded upload keeps its admission slot until it requeues, so a new
+arrival cannot evict an already accepted job. FIFO age prevents an upload from
 starving under a stream of new arrivals. A stream can wait behind at most seven
 older tickets (including an active chunk); this is a chunk-count bound, not a
 wall-clock latency promise or preemption inside a chunk. One final response is

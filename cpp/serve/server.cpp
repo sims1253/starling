@@ -225,6 +225,7 @@ TranscribeResult StarlingServer::do_transcribe(
             if (err) *err = emsg ? emsg : "Granite job creation failed";
             return {};
         }
+        bool continuing = false;
         for (;;) {
             const bool final_chunk = granite_job_last_chunk(job.get());
             // The job owns partial text until its final step. This one-byte
@@ -248,9 +249,10 @@ TranscribeResult StarlingServer::do_transcribe(
                     std::memcpy(out, emitted.data(), emitted.size());
                     out[emitted.size()] = '\0';
                     return out;
-                }, &text, err, &req_id, final_chunk))
+                }, &text, err, &req_id, final_chunk, continuing))
                 return {};
             if (final_chunk) break;
+            continuing = true;
         }
     } else {
         if (!run_with_turn(ctx, policy, [&] {
@@ -280,14 +282,23 @@ bool StarlingServer::run_with_turn(RequestContext* ctx, QueuePolicy policy,
                                    const std::function<char*()>& engine_call,
                                    std::string* out_text, std::string* err,
                                    std::string* effective_req_id,
-                                   bool complete_request) {
+                                   bool complete_request,
+                                   bool continuing) {
     // Acquire the serial queue position. Every caller gets a ticket —
     // anonymous ones (warmup, WS streaming) get a synthesized id so they
     // queue like everyone else instead of racing the engine.
     std::string req_id = ctx ? ctx->id : "";
     {
         std::unique_lock<std::mutex> lk(mutex_);
-        if (n_waiters_ >= kMaxWaiters) {
+        if (continuing) {
+            // The preceding chunk reserved this request's admission slot.
+            // Transfer the reservation to its new FIFO ticket atomically.
+            if (reserved_continuations_ <= 0) {
+                if (err) *err = "Granite continuation lost its queue reservation";
+                return false;
+            }
+            --reserved_continuations_;
+        } else if (n_waiters_ + reserved_continuations_ >= kMaxWaiters) {
             if (err) *err = "server busy";
             return false;
         }
@@ -413,6 +424,8 @@ bool StarlingServer::run_with_turn(RequestContext* ctx, QueuePolicy policy,
             ctx->done = complete_request || !result_text;
             cancel_won = ctx->cancelled.load();
         }
+        if (!complete_request && result_text && !cancel_won)
+            ++reserved_continuations_;
         queue_cv_.notify_all();
         if (tr_on) trace::queue_exit_event(req_id, n_waiters_,
             !result_text ? "failed" : (complete_request ? "completed" : "yielded"));

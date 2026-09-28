@@ -180,6 +180,10 @@ private:
     std::deque<std::string> request_order_;
     std::unordered_map<std::string, std::unique_ptr<RequestContext>> requests_;
     int n_waiters_ = 0;
+    // A yielded Granite job retains one admission slot until its next ticket.
+    // Capacity checks count these reservations so a newly arrived request
+    // cannot displace an already accepted upload between chunks.
+    int reserved_continuations_ = 0;
     uint64_t next_anon_id_ = 0;
 
     // Lifecycle phase.
@@ -207,7 +211,8 @@ private:
                        const std::function<char*()>& engine_call,
                        std::string* out_text, std::string* err,
                        std::string* effective_req_id = nullptr,
-                       bool complete_request = true);
+                       bool complete_request = true,
+                       bool continuing = false);
 };
 
 } // namespace starling::serve

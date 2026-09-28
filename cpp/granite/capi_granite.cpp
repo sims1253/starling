@@ -138,6 +138,7 @@ namespace starling::ggml::lib {
 // alive and steps only while holding the global runtime lock.
 struct GraniteChunkJob {
     GraniteCtx* ctx;
+    const granite::Config policy;
     const float* pcm;
     int64_t n;
     int64_t chunk_samples;
@@ -151,13 +152,12 @@ struct GraniteChunkJob {
     double active_ms = 0.0;
 
     GraniteChunkJob(GraniteCtx* c, const float* p, int64_t count)
-        : ctx(c), pcm(p), n(count),
+        : ctx(c), policy(c->model->config), pcm(p), n(count),
           chunk_samples([&] {
-              const auto& cfg = c->model->config;
               const double limit = std::max(
-                  0.1, ((double) (int) cfg.max_new_tokens - 32.0) / 5.0);
+                  0.1, ((double) (int) policy.max_new_tokens - 32.0) / 5.0);
               return (int64_t) std::llround(
-                  std::min(cfg.chunk_seconds, limit) * kSampleRate);
+                  std::min(policy.chunk_seconds, limit) * kSampleRate);
           }()),
           multi(chunk_samples > 0 && count > chunk_samples),
           timing(std::getenv("STARLING_GRANITE_TIMING") != nullptr) {
@@ -169,7 +169,7 @@ struct GraniteChunkJob {
     int step(std::string* final_text, const char** err) {
         if (finished) { ctx->err = "GRANITE job already completed"; report(err, ctx->err); return -1; }
         const auto step_start = std::chrono::steady_clock::now();
-        const auto& cfg = ctx->model->config;
+        const auto& cfg = policy;
         const float* piece = pcm;
         int64_t piece_n = n;
         int64_t len = n;
@@ -230,13 +230,19 @@ struct GraniteChunkJob {
 
 GraniteChunkJob* granite_job_create_impl(void* model, const float* pcm,
                                           int64_t n, const char** err) {
+    static thread_local char create_error[2048];
     auto* ctx = static_cast<GraniteCtx*>(model);
     if (!ctx) { report(err, "null GRANITE handle"); return nullptr; }
     if (n < 0 || (n > 0 && !pcm)) { report(err, "invalid GRANITE PCM buffer"); return nullptr; }
     try { return new GraniteChunkJob(ctx, pcm, n); }
-    catch (const std::exception& e) { ctx->err = e.what(); }
-    catch (...) { ctx->err = "unknown exception creating GRANITE job"; }
-    report(err, ctx->err);
+    catch (const std::exception& e) {
+        std::snprintf(create_error, sizeof(create_error), "%s", e.what());
+    }
+    catch (...) {
+        std::snprintf(create_error, sizeof(create_error), "%s",
+                      "unknown exception creating GRANITE job");
+    }
+    report(err, create_error);
     return nullptr;
 }
 

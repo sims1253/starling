@@ -434,7 +434,8 @@ TranscribeFn StreamSession::make_transcribe_fn(RequestContext* ctx) {
         // In Granite fairness mode, a stream takes a FIFO ticket so an upload
         // yields after its current chunk. The default retry-on-busy contract
         // is unchanged for every other serving mode.
-        const QueuePolicy policy = server_->config().granite_chunk_fairness
+        const QueuePolicy policy = (server_->config().granite_chunk_fairness &&
+                                    server_->config().model_slug == "granite")
             ? QueuePolicy::Block : QueuePolicy::SkipIfBusy;
         auto result = server_->transcribe_pcm(samples, n, ctx, &err,
                                               policy);

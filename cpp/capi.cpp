@@ -106,21 +106,29 @@ namespace starling::ggml::lib {
 
 GraniteChunkJob* create_granite_job(starling_ggml_ctx* ctx,
                                     const float* pcm, int64_t n) {
-    return api_call(ctx, [&]() -> GraniteChunkJob* {
-        require_running();
-        if (!ctx || ctx->kind != STARLING_GGML_GRANITE || !ctx->model) {
+    // Job creation only snapshots immutable model policy and borrows PCM. It
+    // must not wait on runtime_mutex before taking a serving queue ticket:
+    // otherwise a short WS call arriving during a long chunk could miss the
+    // next FIFO turn. The server owns the loaded model for the whole call.
+    if (!ctx || ctx->kind != STARLING_GGML_GRANITE || !ctx->model ||
+        starling::ggml::shutting_down()) {
+        return api_call(ctx, [&]() -> GraniteChunkJob* {
+            require_running();
             set_global_error("Granite job requires a loaded Granite model");
             if (ctx) ctx->last_error = g_last_error;
             return nullptr;
-        }
-        const char* err = nullptr;
-        auto* job = granite_job_create_impl(ctx->model, pcm, n, &err);
-        if (!job) {
+        });
+    }
+    const char* err = nullptr;
+    auto* job = granite_job_create_impl(ctx->model, pcm, n, &err);
+    if (!job) {
+        return api_call(ctx, [&]() -> GraniteChunkJob* {
             ctx->last_error = err ? err : "Granite job creation failed";
             set_global_error(ctx->last_error);
-        }
-        return job;
-    });
+            return nullptr;
+        });
+    }
+    return job;
 }
 
 int step_granite_job(starling_ggml_ctx* ctx, GraniteChunkJob* job,
