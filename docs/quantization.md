@@ -386,6 +386,44 @@ within each backend. The combined arm has no CUDA verdict. Both recipes stay
 opt-in pending broader deployment and workload evidence, including Vulkan and
 resident-memory/latency measurements.
 
+### Pixel 10 Pro fast-Vulkan validation (2026-09-28)
+
+The same two IQ2_XXS files passed the fixed validation gate on a Pixel 10 Pro
+(Android 17, build `CP3A.260905.009`). Each arm decoded the same 300 EN and
+300 DE validation clips through the fast Vulkan engine on the PowerVR D-Series
+DXT-48-1536 MC1. The source F32 and imatrix hashes above, the
+[`protocol`](../quants/protocols/parakeet-compact-validation-v1.json), and the
+decoded audio/reference hashes matched the CPU and CUDA studies. The Android
+`starling-bench` binary SHA256 was
+`e1a6b3b0f7ff04b3e5a03a62aa5c55deeb2bf0d8bbd4ab4ee80b202755044e4a`
+from commit `2a3bda4`. Its generic `backend=cpu` header describes the GGML
+backend, while the fast engine reports its selected Vulkan device separately.
+The [phone scorer](../benchmarks/fast_engine/score_phone_quant.py) requires
+that actual fast-engine device log for every process.
+
+| Fast-Vulkan arm | Stored bytes | EN WER | DE WER | Paired EN delta [95% CI], pp | Paired DE delta [95% CI], pp | Gate |
+|-----------------|-------------:|-------:|-------:|------------------------------:|------------------------------:|------|
+| IQ2_XXS baseline | 325,124,224 | 8.48% | 9.93% | — | — | reference |
+| Q8 embedding | 309,721,472 | 8.48% | 9.98% | 0.000 [0.000, 0.000] | +0.050 [0.000, +0.150] | pass |
+
+The candidate saved 15,402,752 stored bytes. Its upper paired-bootstrap
+bounds were below +0.2 percentage points in both languages. Thirteen of the
+600 hypotheses changed (five EN, eight DE). EN has the **same mean WER**, not
+identical transcripts or lossless conversion; one DE clip increased by 15
+per-clip percentage points, yielding the +0.050-point mean DE difference.
+The [13 exact changes](evidence/pixel-compact-2026-09-28/changed-hypotheses.json),
+[per-clip records and verdict](evidence/pixel-compact-2026-09-28/README.md),
+and raw benchmark logs make the result auditable.
+
+The fast engine repacked both IQ2 files into the same 718.6 MiB Vulkan weight
+allocation. Stored-byte savings therefore did **not** reduce that allocation
+in this build. Process PSS and graphics allocations require matched probes
+before a resident-memory delta can be claimed. The corpus ran across rising
+thermal status, screen wakeups, and a charge counter that reversed direction
+as the phone began charging. Its timings and energy samples do not establish
+a controlled latency or energy result. The paired WER gate compares quality
+only. This phone result does not promote the recipe to a release default.
+
 ## Results (parakeet-tdt-0.6b-v3, LibriSpeech fixtures)
 
 The historical numbers below use the CPU path. The dated Vulkan

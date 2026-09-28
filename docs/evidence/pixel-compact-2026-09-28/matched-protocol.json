@@ -1,0 +1,16 @@
+{
+  "schema": "pixel-compact-matched-v1",
+  "device": "PowerVR D-Series DXT-48-1536 MC1",
+  "engine": "fast/vulkan",
+  "binary_sha256": "e1a6b3b0f7ff04b3e5a03a62aa5c55deeb2bf0d8bbd4ab4ee80b202755044e4a",
+  "order": ["baseline-a", "embedding", "baseline-b"],
+  "file_order": ["short.wav", "medium.wav"],
+  "warmup_per_file": 1,
+  "timed_runs_per_file": 8,
+  "short_timing_runs_used": [3, 4, 5, 6, 7],
+  "medium_timing_runs_used": [0, 1, 2, 3, 4, 5, 6, 7],
+  "timing_statistic": "median of included runs; candidate compared with arithmetic mean of the two surrounding baseline medians",
+  "memory_point": "dumpsys meminfo and /proc/pid/smaps_rollup after short timed run 0; compare candidate with both baseline snapshots, do not sum GL mtrack and total PSS",
+  "validity": "Only claim controlled latency if the screen remains off and thermal status is stable across all three processes; report raw observations otherwise",
+  "energy": "not estimated while AC charging"
+}
