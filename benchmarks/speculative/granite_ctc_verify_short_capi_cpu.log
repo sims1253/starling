@@ -1,0 +1,26 @@
+{"kind": "artifact", "gguf_sha256": "cec47a4fb872ace2713447409f01e0f9ef0d2a7f217db8bb9c33ea0ef96c916a", "library_sha256": "c9f65e6cfa702f36fc62ebcd61bc42070fd9037cfdcb0bec16e1b81b54ee5687", "wav_sha256": "5fceacff0315d49cb59fcc505bcecf1ed5f2f35c2897b1e65a59f30e5d922150", "wav_samples": 118960, "device_env": "cpu", "threads_env": "4", "max_k": 4, "repeats": 2}
+{"kind": "backend", "name": "CPU"}
+GRANITE_TIMING prefill=1806.5ms decode_tokens=31 avg=135.82ms/tok (kstep=0)
+GRANITE_STAGE chunk=1 mel+enc+proj=2334.6ms prompt+embeds=1.0ms gen=6019.5ms piece=8355.1ms
+GRANITE_STAGE request chunks=1 audio=7.43s mel+enc+proj=2334.6ms prompt+embeds=1.0ms gen=6019.5ms stages=8355.1ms bookkeeping=0.1ms total=8355.2ms
+{"kind": "run", "mode": "greedy", "phase": "warm", "repeat": 0, "full_ms": 8355.251, "text_sha256": "41f9e18f92ad8dfa94861d37ccb1262f07a1660c7b42f50bf51252cf5b5d0383", "text_chars": 122}
+GRANITE_CTC chunk=1 k=4 draft=26 accepted=14 proposed=25 verify_calls=16 fallback_steps=1 mel=4.387ms enc_proj=2313.635ms ctc_head=236.381ms embed=0.766ms proposal=0.019ms prefill=1767.181ms verify=2364.936ms fallback=129.356ms piece=6818.288ms
+GRANITE_STAGE chunk=1 mel+enc+proj=2554.4ms prompt+embeds=0.8ms gen=4263.1ms piece=6818.2ms
+GRANITE_STAGE request chunks=1 audio=7.43s mel+enc+proj=2554.4ms prompt+embeds=0.8ms gen=4263.1ms stages=6818.2ms bookkeeping=0.1ms total=6818.3ms
+{"kind": "run", "mode": "ctc", "phase": "warm", "repeat": 0, "full_ms": 6818.38, "text_sha256": "41f9e18f92ad8dfa94861d37ccb1262f07a1660c7b42f50bf51252cf5b5d0383", "text_chars": 122}
+GRANITE_TIMING prefill=1763.1ms decode_tokens=31 avg=129.11ms/tok (kstep=0)
+GRANITE_STAGE chunk=1 mel+enc+proj=2356.4ms prompt+embeds=0.8ms gen=5765.7ms piece=8122.8ms
+GRANITE_STAGE request chunks=1 audio=7.43s mel+enc+proj=2356.4ms prompt+embeds=0.8ms gen=5765.7ms stages=8122.8ms bookkeeping=0.0ms total=8122.9ms
+{"kind": "run", "mode": "greedy", "phase": "paired", "repeat": 1, "full_ms": 8122.906, "text_sha256": "41f9e18f92ad8dfa94861d37ccb1262f07a1660c7b42f50bf51252cf5b5d0383", "text_chars": 122}
+GRANITE_CTC chunk=1 k=4 draft=26 accepted=14 proposed=25 verify_calls=16 fallback_steps=1 mel=4.245ms enc_proj=2284.648ms ctc_head=248.415ms embed=1.467ms proposal=0.020ms prefill=1776.568ms verify=2365.445ms fallback=134.215ms piece=6816.710ms
+GRANITE_STAGE chunk=1 mel+enc+proj=2537.3ms prompt+embeds=1.5ms gen=4277.9ms piece=6816.7ms
+GRANITE_STAGE request chunks=1 audio=7.43s mel+enc+proj=2537.3ms prompt+embeds=1.5ms gen=4277.9ms stages=6816.7ms bookkeeping=0.1ms total=6816.8ms
+{"kind": "run", "mode": "ctc", "phase": "paired", "repeat": 1, "full_ms": 6816.804, "text_sha256": "41f9e18f92ad8dfa94861d37ccb1262f07a1660c7b42f50bf51252cf5b5d0383", "text_chars": 122}
+GRANITE_CTC chunk=1 k=4 draft=26 accepted=14 proposed=25 verify_calls=16 fallback_steps=1 mel=4.081ms enc_proj=2365.452ms ctc_head=223.713ms embed=0.944ms proposal=0.019ms prefill=1776.466ms verify=2004.695ms fallback=122.229ms piece=6498.987ms
+GRANITE_STAGE chunk=1 mel+enc+proj=2593.2ms prompt+embeds=0.9ms gen=3904.8ms piece=6499.0ms
+GRANITE_STAGE request chunks=1 audio=7.43s mel+enc+proj=2593.2ms prompt+embeds=0.9ms gen=3904.8ms stages=6499.0ms bookkeeping=0.1ms total=6499.1ms
+{"kind": "run", "mode": "ctc", "phase": "paired", "repeat": 2, "full_ms": 6499.122, "text_sha256": "41f9e18f92ad8dfa94861d37ccb1262f07a1660c7b42f50bf51252cf5b5d0383", "text_chars": 122}
+GRANITE_TIMING prefill=1822.3ms decode_tokens=31 avg=131.90ms/tok (kstep=0)
+GRANITE_STAGE chunk=1 mel+enc+proj=2298.2ms prompt+embeds=0.9ms gen=5911.3ms piece=8210.5ms
+GRANITE_STAGE request chunks=1 audio=7.43s mel+enc+proj=2298.2ms prompt+embeds=0.9ms gen=5911.3ms stages=8210.5ms bookkeeping=0.0ms total=8210.5ms
+{"kind": "run", "mode": "greedy", "phase": "paired", "repeat": 2, "full_ms": 8210.542, "text_sha256": "41f9e18f92ad8dfa94861d37ccb1262f07a1660c7b42f50bf51252cf5b5d0383", "text_chars": 122}

@@ -18,6 +18,7 @@
 #include "encoder.hpp"
 #include "prompt.hpp"
 #include "llm.hpp"
+#include "speculative.hpp"
 #include "stage_timing.hpp"
 #include "tokenizer.hpp"
 #include "runtime/graph.hpp"
@@ -51,17 +52,60 @@ int32_t decode_budget(const starling::ggml::granite::Config& c, double duration_
     return (int32_t) std::min(cap, estimated);
 }
 
-// One chunk through mel -> encoder+projector -> prompt -> greedy -> text.
+// One chunk through mel -> encoder/projector -> prompt -> decode -> text.
 // stage_ms (optional) receives THIS chunk's three stage durations — the
 // caller accumulates them across chunks via StageTiming (stage_timing.hpp).
 bool transcribe_piece(GraniteCtx& ctx, const float* pcm, int64_t n, int32_t budget,
-                      std::string& text, double* stage_ms = nullptr) {
+                      std::string& text, double* stage_ms = nullptr,
+                      int ctc_max_k = 0, int chunk_index = 0) {
     using namespace starling::ggml::granite;
     const GraniteModel& m = *ctx.model;
     auto t0 = std::chrono::steady_clock::now();
     MelFeatures mel;
     if (!compute_log_mel(m.config, m.loader, pcm, (size_t) n, mel, ctx.err))
         return false;
+    auto t_mel = std::chrono::steady_clock::now();
+    GenerateOptions options;
+    options.max_new_tokens = budget;
+    options.max_cache_len = (int32_t) m.config.llm.max_cache;
+    options.eos_token_id = m.config.eos_token_id;
+    GenerateResult generated;
+    if (ctc_max_k > 0) {
+        CtcSpeculativeStats spec;
+        if (!ctc_speculative_generate(m, mel, n, options, ctc_max_k, {},
+                                      generated, spec, ctx.err)) return false;
+        const auto t3 = std::chrono::steady_clock::now();
+        text = ctx.tokenizer.decode(generated.ids, true);
+        const auto ms = [](auto a, auto b) {
+            return std::chrono::duration<double, std::milli>(b - a).count();
+        };
+        const double mel_ms = ms(t0, t_mel);
+        const double enc_ctc_ms = spec.encoder_project_ms + spec.ctc_head_ms;
+        if (stage_ms) {
+            stage_ms[0] = mel_ms + enc_ctc_ms;
+            stage_ms[1] = spec.embed_ms;
+            stage_ms[2] = spec.verifier.total_ms;
+        }
+        if (std::getenv("STARLING_GRANITE_TIMING")) {
+            std::fprintf(stderr,
+                "GRANITE_CTC chunk=%d k=%d draft=%zu accepted=%d proposed=%d "
+                "verify_calls=%d fallback_steps=%d mel=%.3fms enc_proj=%.3fms "
+                "ctc_head=%.3fms embed=%.3fms proposal=%.3fms prefill=%.3fms "
+                "verify=%.3fms fallback=%.3fms piece=%.3fms\n",
+                chunk_index, ctc_max_k, spec.draft_count, spec.verifier.accepted,
+                spec.verifier.proposed, spec.verifier.verify_calls,
+                spec.verifier.fallback_steps, mel_ms, spec.encoder_project_ms,
+                spec.ctc_head_ms, spec.embed_ms, spec.verifier.proposal_ms,
+                spec.verifier.prefill_ms, spec.verifier.verify_ms,
+                spec.verifier.fallback_ms, ms(t0, t3));
+        }
+        if (starling::ggml::trace::on()) {
+            starling::ggml::trace::stage_event("mel_enc_proj_ctc", mel_ms + enc_ctc_ms);
+            starling::ggml::trace::stage_event("prompt_embeds", spec.embed_ms);
+            starling::ggml::trace::stage_event("generate", spec.verifier.total_ms);
+        }
+        return true;
+    }
     AudioEmbeds audio;
     if (!encode_audio_and_project(m, mel, audio, ctx.err))
         return false;
@@ -71,11 +115,6 @@ bool transcribe_piece(GraniteCtx& ctx, const float* pcm, int64_t n, int32_t budg
     if (!build_inputs_embeds(m, prompt, audio, inputs, ctx.err))
         return false;
     auto t2 = std::chrono::steady_clock::now();
-    GenerateOptions options;
-    options.max_new_tokens = budget;
-    options.max_cache_len = (int32_t) m.config.llm.max_cache;
-    options.eos_token_id = m.config.eos_token_id;
-    GenerateResult generated;
     if (!greedy_generate(m, inputs, options, generated, ctx.err))
         return false;
     auto t3 = std::chrono::steady_clock::now();
@@ -202,8 +241,8 @@ bool starling_ggml_granite_ctc_draft(void* handle, const float* pcm, int64_t n,
     return false;
 }
 
-char* starling_ggml_granite_decode(void* handle, const float* pcm, int64_t n,
-                                   const char** err_out) {
+static char* granite_decode_impl(void* handle, const float* pcm, int64_t n,
+                                 int ctc_max_k, const char** err_out) {
     auto* c = static_cast<GraniteCtx*>(handle);
     if (!c) { if (err_out) *err_out = "null GRANITE handle"; return nullptr; }
     if (n < 0 || (n > 0 && !pcm)) {
@@ -242,7 +281,8 @@ char* starling_ggml_granite_decode(void* handle, const float* pcm, int64_t n,
             bool ok;
             {
                 starling::ggml::trace::ChunkScope chunk_scope(stages.chunks + 1);
-                ok = transcribe_piece(*c, pcm_piece, piece_n, budget, text, piece_ms);
+                ok = transcribe_piece(*c, pcm_piece, piece_n, budget, text,
+                                      piece_ms, ctc_max_k, stages.chunks + 1);
             }
             if (tr_on && ok) {
                 starling::ggml::trace::chunk_event(stages.chunks + 1,
@@ -322,6 +362,20 @@ char* starling_ggml_granite_decode(void* handle, const float* pcm, int64_t n,
         report(err_out, c->err);
     }
     return nullptr;
+}
+
+char* starling_ggml_granite_decode(void* handle, const float* pcm, int64_t n,
+                                   const char** err_out) {
+    return granite_decode_impl(handle, pcm, n, 0, err_out);
+}
+
+char* starling_ggml_granite_decode_ctc(void* handle, const float* pcm, int64_t n,
+                                       int32_t max_k, const char** err_out) {
+    if (max_k < 1 || max_k > 16) {
+        if (err_out) *err_out = "GRANITE CTC maximum proposal length must be 1..16";
+        return nullptr;
+    }
+    return granite_decode_impl(handle, pcm, n, max_k, err_out);
 }
 
 } // extern "C"

@@ -35,6 +35,17 @@ bool encode_audio_and_project(const GraniteModel& model, const MelFeatures& mel,
 bool extract_ctc_draft(const GraniteModel& model, const MelFeatures& mel,
                        std::vector<int32_t>& token_ids, std::string& err);
 
+// Opt-in shared-encoder path for speculative transcription. One explicit
+// graph output contains the CTC intermediate/final bundle and projected
+// audio embeddings. The optional head then produces draft IDs. This avoids
+// rerunning the 16-layer encoder; the ordinary greedy graph stays unchanged.
+bool encode_audio_project_and_extract_ctc(const GraniteModel& model,
+                                          const MelFeatures& mel,
+                                          AudioEmbeds& audio,
+                                          std::vector<int32_t>& token_ids,
+                                          std::string& err,
+                                          double* stage_ms = nullptr);
+
 // Row-wise argmax with torch's first-index behavior on exact ties. `iota`
 // holds vocab-index as descending f32 values (vocab <= 2^24). `iota` and `one`
 // back graph inputs by address, so both must outlive graph execution.

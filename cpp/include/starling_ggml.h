@@ -129,8 +129,17 @@ bool starling_ggml_granite_ctc_draft(void * handle, const float * pcm, int64_t n
                                     int32_t * token_ids, int32_t capacity,
                                     int32_t * count, const char ** err_out);
 
-// Free a string returned by starling_ggml_transcribe_pcm or
-// starling_ggml_normalize_text (no-op on NULL).
+// Research-only opt-in Granite transcription with native CTC drafts and the
+// greedy batched verifier. `handle` is returned by the model-specific
+// starling_ggml_granite_load symbol; max_k must be 1..16. Uses the same
+// padded chunk/budget policy as ordinary Granite decode. The returned string
+// is malloc'd and freed with starling_ggml_free_string. Default transcription
+// continues through the ordinary greedy entry point.
+char * starling_ggml_granite_decode_ctc(void * handle, const float * pcm, int64_t n,
+                                       int32_t max_k, const char ** err_out);
+
+// Free a malloc'd string returned by a Starling transcription or
+// normalization entry point (no-op on NULL).
 void starling_ggml_free_string(char * s);
 
 // Normalize one raw ASR transcript with a text model (s1). Returns a
