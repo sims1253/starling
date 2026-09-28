@@ -101,7 +101,7 @@ def main() -> int:
                 if not dump.exists():
                     raise RuntimeError("native library did not create the S1 ID dump")
                 data = dump.read_bytes()
-                if len(data) % 4:
+                if not data or len(data) % 4:
                     raise ValueError("incomplete S1 ID dump")
                 ids = [value[0] for value in struct.iter_unpack("=i", data)]
                 return ids, text, elapsed, hashlib.sha256(data).hexdigest()

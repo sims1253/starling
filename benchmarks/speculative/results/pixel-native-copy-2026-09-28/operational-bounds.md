@@ -15,6 +15,9 @@ raw records and forbids a directional latency claim. A 30-second gap separates
 processes. A temperature 37–41.9°C after up to 180 seconds of cooling permits
 only descriptive observations; >=42°C or thermal status >=2 aborts.
 
+For a retry, pass a fresh `--output-dir` to `run_copy.py` for both preflight and
+performance. The runner leaves an existing process directory untouched.
+
 The user-paused Spotify session and phone settings remain untouched. The same
 phone, model, six CPU threads, fixture hashes, ID capture, and native timing
 fields apply to both arms. Charge counter readings are descriptive only; the

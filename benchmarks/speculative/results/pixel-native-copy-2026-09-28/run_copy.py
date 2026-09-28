@@ -14,6 +14,7 @@ import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
+OUTPUT_ROOT = ROOT
 PROTOCOL = ROOT / "protocol.json"
 FIXTURES = ROOT / "fixtures.json"
 ADB = "/home/m0hawk/android-sdk/platform-tools/adb"
@@ -90,7 +91,7 @@ def post(case, transcript, deadline):
 
 
 def run_process(stage, index, arm, fixtures, deadline, reference=None):
-    out = ROOT / f"{stage}-{index}-{arm}"
+    out = OUTPUT_ROOT / f"{stage}-{index}-{arm}"
     out.mkdir(exist_ok=False)
     cfg = json.loads(PROTOCOL.read_text())
     record = {"stage": stage, "index": index, "arm": arm,
@@ -242,13 +243,18 @@ def run_process(stage, index, arm, fixtures, deadline, reference=None):
 
 
 def main():
+    global OUTPUT_ROOT
     parser = argparse.ArgumentParser()
     parser.add_argument("stage", choices=("preflight", "performance"))
+    parser.add_argument("--output-dir", type=Path, default=ROOT,
+                        help="fresh directory for this preflight/performance run")
     args = parser.parse_args()
+    OUTPUT_ROOT = args.output_dir.resolve()
+    OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
     if sha(FIXTURES) != json.loads(PROTOCOL.read_text())["fixture_sha256"]:
         raise RuntimeError("fixture hash changed")
     fixtures = json.loads(FIXTURES.read_text())
-    preflight_file = ROOT / "preflight-reference.json"
+    preflight_file = OUTPUT_ROOT / "preflight-reference.json"
     if args.stage == "preflight":
         if preflight_file.exists():
             raise RuntimeError("preflight already exists")
@@ -274,7 +280,7 @@ def main():
             if index > 1:
                 time.sleep(30)
             records.append(run_process("performance", index, arm, fixtures, deadline, ref))
-        (ROOT / "performance-raw-summary.json").write_text(json.dumps(records, indent=2,
+        (OUTPUT_ROOT / "performance-raw-summary.json").write_text(json.dumps(records, indent=2,
                                                                      ensure_ascii=False) + "\n")
         print("PERFORMANCE BLOCKS COMPLETE", flush=True)
 
