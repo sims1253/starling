@@ -96,11 +96,13 @@ int main(int argc, char** argv) {
         const auto elapsed = [](auto a, auto b) {
             return std::chrono::duration<double, std::milli>(b - a).count();
         };
+        // Greedy includes mel from t0. CTC reuses that same mel after t1;
+        // these diagnostic clocks are not a paired full-request comparison.
         std::printf("CHUNK index=%d real_samples=%lld padded_samples=%lld "
                     "budget=%d parity=%d tokens=%zu stop=%d draft=%zu "
-                    "accepted=%d proposed=%d greedy_full_ms=%.3f "
+                    "accepted=%d proposed=%d greedy_from_pcm_ms=%.3f "
                     "ctc_enc_project_ms=%.3f ctc_head_ms=%.3f "
-                    "ctc_verify_ms=%.3f ctc_full_ms=%.3f\n",
+                    "ctc_verify_ms=%.3f ctc_from_reused_mel_ms=%.3f\n",
                     chunk, (long long)len, (long long)chunk_samples, budget,
                     equal, greedy.ids.size(), (int)greedy.stop_reason,
                     stats.draft_count, stats.verifier.accepted,

@@ -2,6 +2,7 @@
 #include "granite/speculative.hpp"
 
 #include <cstdio>
+#include <string>
 #include <vector>
 
 int main() {

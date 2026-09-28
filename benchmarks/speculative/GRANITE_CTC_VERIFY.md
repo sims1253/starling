@@ -16,7 +16,11 @@ not a common `starling_ggml_ctx`. The caller frees its returned string with
 `starling_ggml_granite_free`. It shares the ordinary C entry point's padded
 chunk and token-budget loop. A GGUF without the optional CTC head returns a
 clear error; it does not change the default decoder. This model-specific C
-symbol has no cancellation argument. The C++ function accepts `CancelCheck`
+symbol has no cancellation argument. The raw Granite handle has no whole-call
+runtime lock: callers must serialize all raw-handle load, draft, decode, and
+free calls across handles, avoid overlapping them with common-API model calls
+or global shutdown, and free raw handles before `starling_ggml_shutdown`.
+Read error strings before the next call or free. The C++ function accepts `CancelCheck`
 and discards output when cancelled before or after draft extraction; the
 generic verifier also checks cancellation after each graph.
 
@@ -27,11 +31,14 @@ embeddings together as one explicit output. The old separate path remains an
 independent parity oracle; the shared path has bitwise-equal projector values
 and exact CTC IDs on both public clips below.
 
-On CPU, the generic verifier must use an exact-width S-row cache append. Its
-original masked full-capacity attention changed two generated comma IDs on
-the 24.94 s sample at every K, although repeated default greedy runs were
-stable. The CPU exact-width graph removes those differences. GPU retains the
-existing full-capacity graph; CPU evidence does not establish GPU parity.
+On CPU, the generic verifier uses a `past+S` attention width for its batched
+S-row cache append. The earlier full-capacity masked graph changed two
+generated comma IDs on the 24.94 s sample at every K, although repeated
+default greedy runs were stable; the narrower CPU graph restored parity on
+this sample. Each batched row still uses `past+S`, whereas greedy row `j`
+uses `past+j+1`, so this is an observed result rather than a universal
+numerical-parity guarantee. GPU retains the full-capacity graph; CPU evidence
+does not establish GPU parity.
 
 The real model is the optional-head GGUF pinned by
 [`granite_ctc_librispeech_reference.json`](granite_ctc_librispeech_reference.json)
@@ -104,12 +111,18 @@ For long-audio policy, a 32.375 s WAV formed by concatenating the two pinned
 public WAVs (SHA-256
 `835681d10d7ad06169e2b5fe176c227faf99ace387ff1066b9edf014c60a67bf`)
 split into a 30 s chunk and a 2.375 s tail padded to 30 s. At K=4, chunk 1
-matched all 121 greedy IDs; chunk 2 matched all 12. The manual ID test's full
-chunk costs were greedy 33.486 s versus CTC 21.834 s on chunk 1, then greedy
-14.795 s versus CTC 16.292 s on the padded tail. The tail loses because its
-full padded encoder/head cost buys few draftable output tokens. Through the
-public C entry points on the same concatenated WAV, the complete request took
-40.648 s greedy and 36.944 s CTC, with identical UTF-8 transcript SHA-256
+matched all 121 greedy IDs; chunk 2 matched all 12. The manual ID test's
+historical raw log labels `greedy_full_ms` and `ctc_full_ms` are asymmetric:
+the greedy clock includes mel extraction, but the CTC clock starts after
+greedy and reuses its mel. The source now labels them `greedy_from_pcm_ms`
+and `ctc_from_reused_mel_ms`; those manual clocks establish parity and stage
+costs, not a full-cost speed comparison. The raw-WAV C entry points each
+recompute mel and cover the whole chunk loop. Their first chunks took
+25.518 s greedy and 21.545 s CTC; their padded tails took 15.128 s greedy
+and 15.398 s CTC. On this single run the tail was 0.270 s slower with CTC:
+its full padded encoder/head cost bought few draftable output tokens. The
+complete request took 40.648 s greedy and 36.944 s CTC, with identical
+UTF-8 transcript SHA-256
 `71bea620ec405ca1b0bf8d0a1e36000ebc6bb8a7bebeaf255ef388dfea374089`.
 That C request has one run per mode, so it is a parity check and provisional
 timing, not a repeated long-audio speed estimate.
@@ -129,7 +142,9 @@ the longer model-sample ID benchmark binary (built before the opt-in C entry
 point was added, with the same shared encoder and CPU verifier code) was
 `33d611385dd1a120315d27adb48befe9430eb872a81acc8761f2703f2cc97a40`.
 
-The CPU pilot is not a runtime enablement gate. It uses one LibriSpeech clip
+The two asset-free CTC proposer/entry tests run in native CI; tests requiring
+the optional-head GGUF and public WAVs remain manual. The CPU pilot is not a
+runtime enablement gate. It uses one LibriSpeech clip
 and one supplied model-repository clip, with four ggml threads pinned to four
 physical cores (logical CPUs 8–15). Vulkan, Pixel stop-to-final latency,
 energy, and the #310 dictation set remain unmeasured. Parakeet-to-MOSS drafts
