@@ -8,6 +8,10 @@ if existing=$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft 2>&1);
     echo "Release $RELEASE_TAG is already published; keeping its original assets."
     exit 0
   fi
+  if [ "$existing" != true ]; then
+    echo "Unexpected isDraft value for $RELEASE_TAG: '$existing'" >&2
+    exit 1
+  fi
 else
   case "$existing" in
     *"release not found"*|*"Release not found"*|*"HTTP 404"*)
