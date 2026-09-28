@@ -63,7 +63,7 @@ def main() -> int:
             "--param", "ptr:y", "--param", "ptr:z", "--param", "ptr:out",
             "--check-array", "out", "--no-profile",
         )
-        if "EQUIVALENT" not in verdict or "NOT EQUIVALENT" in verdict:
+        if re.search(r"\bNOT EQUIVALENT\b", verdict) or not re.search(r"\bEQUIVALENT\b", verdict):
             raise RuntimeError(f"Volta did not reproduce the expected result:\n{verdict}")
         print(gpu_result)
         print(verdict.strip())
