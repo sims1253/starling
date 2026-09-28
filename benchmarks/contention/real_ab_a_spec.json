@@ -2,7 +2,7 @@
   "schema_version": 1,
   "purpose": "Preregistered real-model Granite state-isolation check before enabling opt-in interleaving",
   "serial_binary_sha256": "a91847c520596042e798e5acd17e14c3ada78a7b3699f317b4402d5459cf6d49",
-  "fair_binary_sha256": "588ca5c145454ccb02a2f2d58db7d8fce4114bd98731f95b990c4f9dfb960cf7",
+  "fair_binary_sha256": "57c54ab3638211b36720a97615af175e950bce6d7e5f5a59a98364d16435f713",
   "model_sha256": "b72a01687daa1825894bd5ea3e4c53f6be657a9ba31c5cd65c5114c5b6b961e2",
   "a_wav_sha256": "4f97080176d3623eebc9663af07dd258894ed31f74d5d229d39e77c5ab5b0925",
   "b_wav_sha256": "16503e95c0a78cc4fbd2db3789d385297bc31ad52e63ef79e8bbe5040fb01be4",
@@ -15,6 +15,7 @@
   "pass_rule": "All five HTTP requests return 200 with nonempty final hashes; serial A hash equals both fair A1 and fair A2, serial B hash equals fair B, and A hash differs from B. Each request traces exactly chunks 1,2,3. Fair B chunk 1 and fair A2 chunk 1 must occur between fair A1 chunks 1 and 2. No missing result or failed attempt is excluded. This is output-isolation evidence, not a latency distribution or proof for all audio.",
   "new_session_rule": "While fair A1 first chunk is active and before B/A2 are queued, open a fresh WS and send application ping. Require pong in <2.0 seconds and B/A2 to enter queue before A1 first chunk completes. This tests the cached backend-identity admission fix separately from output parity.",
   "amendment_1": "Before any real A/B/A run, add the fresh-session ping/pong probe during A1 chunk 1. It does not change the pinned inputs, output-equivalence rule or A/B/A chunk-order rule.",
-  "runner_revision": "bce8e389fd584ace2f345c8a3bc2270f134fb45b",
-  "amendment_2": "After the initial A/B/A pass, source commit bce8e389fd584ace2f345c8a3bc2270f134fb45b fixed the pre-load backend-identity cache and made failed/partial request outcomes persistent. The final-binary run uses the same A/B/A audio, chunk order, admission and hash rules. Initial results and their original spec remain committed; no attempt is discarded."
+  "runner_revision": "a3fd82279cd17262cb2c8398cf21fb0aff70ded6",
+  "amendment_2": "After the initial A/B/A pass, source commit bce8e389fd584ace2f345c8a3bc2270f134fb45b fixed the pre-load backend-identity cache and made failed/partial request outcomes persistent. The final-binary run uses the same A/B/A audio, chunk order, admission and hash rules. Initial results and their original spec remain committed; no attempt is discarded.",
+  "amendment_3": "Source commit a3fd82279cd17262cb2c8398cf21fb0aff70ded6 propagates blocked streaming queue timeouts and adds historical-spec handling to the paired evaluator. This final-binary A/B/A replication keeps all pinned audio, chunk-order, hash and admission rules unchanged. The preceding fair-arm attempt was interrupted after one idle trial; its partial evidence is preserved and is not a scored result."
 }

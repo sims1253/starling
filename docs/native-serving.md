@@ -296,6 +296,9 @@ during busy retries. Successful windows advance the committed boundary;
 incomplete commits preserve the remaining audio for a later retry. Transcript
 stitching uses matching words rather than timestamps, so disagreements between
 neighboring windows can still omit or duplicate words.
+With opt-in Granite chunk fairness, a blocking queue timeout ends the current
+take with `request timed out`; it is not retried as `server busy`. Reset the
+stream before sending more audio.
 
 ## Timing trace
 
