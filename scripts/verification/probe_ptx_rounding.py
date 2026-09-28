@@ -26,7 +26,10 @@ def run(*argv: str) -> str:
 
 def normalize_pointer_annotations(ptx: str) -> str:
     """Remove syntax Volta cannot parse; this does not preserve a proof claim."""
-    return re.sub(r"\.ptr\s+\.align\s+1\s+", "", ptx)
+    normalized, count = re.subn(r"\.ptr\s+\.align\s+\d+\s+", "", ptx)
+    if count == 0:
+        raise RuntimeError("nvcc PTX has no expected .ptr .align annotation to normalize")
+    return normalized
 
 
 def main() -> int:

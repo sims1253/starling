@@ -17,6 +17,8 @@ once to bf16. With `x = 1` and `y = z = 1/256`, both compute the real sum
 `1 + 1/128`. The first bf16 addition in `staged_sum` is a tie and rounds to
 `1`; its second addition is the same tie. Its output is `0x3f80`. The single
 final rounding in `direct_sum` produces `0x3f81`.
+The ties round to `1` because bf16 `add.rn` uses round-to-nearest-even and
+`1.0` has an even low mantissa bit.
 
 The [probe](../../scripts/verification/probe_ptx_rounding.py) compiles both
 kernels to PTX with nvcc, executes them on the GPU, and compares the generated
