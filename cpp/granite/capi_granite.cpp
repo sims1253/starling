@@ -12,6 +12,7 @@
 // each decoded with budget max(1, min(budget(dur), max_cache_len - prompt_len
 // - 1)), and the per-chunk texts joined with whitespace collapsed.
 #include "loader.hpp"
+#include "starling_ggml.h"
 #include "lib/capi_helpers.hpp"
 #include "mel.hpp"
 #include "encoder.hpp"
@@ -25,6 +26,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <climits>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -142,6 +144,62 @@ void starling_ggml_granite_free(void* handle) {
     } catch (...) {
         // C ABI: never allow an exception to escape.
     }
+}
+
+// Opt-in parity probe, separate from the ordinary greedy decode entry point.
+// Caller supplies a token buffer; count receives the required length when it
+// is too small. This C symbol is intentionally model-specific research API.
+bool starling_ggml_granite_ctc_draft(void* handle, const float* pcm, int64_t n,
+                                    int32_t* token_ids, int32_t capacity,
+                                    int32_t* count, const char** err_out) {
+    auto* c = static_cast<GraniteCtx*>(handle);
+    if (!c || !count || n <= 0 || !pcm || capacity < 0 ||
+        (capacity > 0 && !token_ids)) {
+        if (count) *count = 0;
+        if (c) {
+            c->err = "invalid GRANITE CTC draft arguments";
+            report(err_out, c->err);
+        } else if (err_out) {
+            *err_out = "invalid GRANITE CTC draft arguments";
+        }
+        return false;
+    }
+    *count = 0;
+    try {
+        using namespace starling::ggml::granite;
+        MelFeatures mel;
+        if (!compute_log_mel(c->model->config, c->model->loader, pcm,
+                             (size_t)n, mel, c->err)) {
+            report(err_out, c->err);
+            return false;
+        }
+        std::vector<int32_t> ids;
+        if (!extract_ctc_draft(*c->model, mel, ids, c->err)) {
+            report(err_out, c->err);
+            return false;
+        }
+        if (ids.size() > (size_t)INT32_MAX) {
+            c->err = "GRANITE CTC draft token count exceeds INT32_MAX";
+            report(err_out, c->err);
+            return false;
+        }
+        *count = (int32_t)ids.size();
+        if ((size_t)capacity < ids.size()) {
+            c->err = "GRANITE CTC draft token buffer is too small";
+            report(err_out, c->err);
+            return false;
+        }
+        std::copy(ids.begin(), ids.end(), token_ids);
+        if (err_out) *err_out = nullptr;
+        return true;
+    } catch (const std::exception& e) {
+        c->err = e.what();
+        report(err_out, c->err);
+    } catch (...) {
+        c->err = "unknown GRANITE CTC draft failure";
+        report(err_out, c->err);
+    }
+    return false;
 }
 
 char* starling_ggml_granite_decode(void* handle, const float* pcm, int64_t n,
