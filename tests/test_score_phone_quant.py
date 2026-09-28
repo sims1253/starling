@@ -45,6 +45,12 @@ def test_rejects_reorder_duplicate_or_gap(tmp_path, groups):
         parse_logs(logs, engine_logs, ["a.wav", "b.wav"], DEVICE, "short.wav")
 
 
+def test_rejects_swapped_engine_logs(tmp_path):
+    logs, engine_logs = _logs(tmp_path, [["a.wav"], ["b.wav"]])
+    with pytest.raises(ValueError, match="unpaired logs"):
+        parse_logs(logs, engine_logs[::-1], ["a.wav", "b.wav"], DEVICE, "short.wav")
+
+
 def test_rejects_generic_header_without_real_fast_identity(tmp_path):
     logs, engine_logs = _logs(tmp_path, [["a.wav"]])
     engine_logs[0].write_text("[fast] parakeet falls back to ggml: unavailable\n")

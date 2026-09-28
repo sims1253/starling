@@ -40,6 +40,9 @@ def parse_logs(logs: list[Path], engine_logs: list[Path], names: list[str],
     parsed: dict[str, dict] = {}
     seen_order: list[str] = []
     for log, engine_log in zip(logs, engine_logs):
+        # A run's stdout and stderr share a stem (run.stdout / run.stderr).
+        if log.stem != engine_log.stem:
+            raise ValueError(f"unpaired logs: {log.name} vs {engine_log.name}")
         engine_text = engine_log.read_text()
         if f"[fast] device '{fast_device}'" not in engine_text or \
                 f"parakeet engine: fast/vulkan '{fast_device}'" not in engine_text:
