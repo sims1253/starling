@@ -22,7 +22,34 @@ void json_string(std::ostringstream& out, const char* value, size_t max_length =
             char escaped[7];
             std::snprintf(escaped, sizeof(escaped), "\\u%04x", byte);
             out << escaped;
-        } else out << static_cast<char>(byte);
+        } else if (byte < 0x80) {
+            out << static_cast<char>(byte);
+        } else {
+            // Keep valid UTF-8 names intact. ggml names are byte buffers, so
+            // escape malformed bytes instead of emitting invalid JSON text.
+            size_t width = byte >= 0xc2 && byte <= 0xdf ? 2 :
+                           byte >= 0xe0 && byte <= 0xef ? 3 :
+                           byte >= 0xf0 && byte <= 0xf4 ? 4 : 0;
+            bool valid = width != 0 && width <= max_length - i;
+            if (valid) {
+                for (size_t j = 1; j < width; ++j)
+                    valid = valid && bytes[i + j] >= 0x80 && bytes[i + j] <= 0xbf;
+            }
+            if (valid && width == 3)
+                valid = !(byte == 0xe0 && bytes[i + 1] < 0xa0) &&
+                        !(byte == 0xed && bytes[i + 1] > 0x9f);
+            if (valid && width == 4)
+                valid = !(byte == 0xf0 && bytes[i + 1] < 0x90) &&
+                        !(byte == 0xf4 && bytes[i + 1] > 0x8f);
+            if (valid) {
+                out.write(reinterpret_cast<const char*>(bytes + i), width);
+                i += width - 1;
+            } else {
+                char escaped[7];
+                std::snprintf(escaped, sizeof(escaped), "\\u%04x", byte);
+                out << escaped;
+            }
+        }
     }
     out << '"';
 }

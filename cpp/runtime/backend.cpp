@@ -41,6 +41,7 @@
 #include <memory>
 #include <mutex>
 #include <stdexcept>
+#include <system_error>
 #include <thread>
 #include <vector>
 
@@ -181,11 +182,21 @@ static void maybe_export_graph(ggml_cgraph* graph, ggml_tensor* output,
     std::filesystem::create_directories(path.parent_path());
     const std::filesystem::path incomplete = path.string() + ".tmp";
     std::ofstream file(incomplete, std::ios::binary | std::ios::trunc);
-    if (!file) throw std::runtime_error("cannot open graph snapshot: " + path.string());
+    if (!file) throw std::runtime_error("cannot open graph snapshot: " + incomplete.string());
     file << graph_snapshot_json(graph, output, device, captures, side_effect_roots);
     file.close();
-    if (!file) throw std::runtime_error("cannot write graph snapshot: " + path.string());
-    std::filesystem::rename(incomplete, path);
+    if (!file) {
+        std::error_code ignored;
+        std::filesystem::remove(incomplete, ignored);
+        throw std::runtime_error("cannot write graph snapshot: " + incomplete.string());
+    }
+    try {
+        std::filesystem::rename(incomplete, path);
+    } catch (...) {
+        std::error_code ignored;
+        std::filesystem::remove(incomplete, ignored);
+        throw;
+    }
 }
 
 // --------------------------------------------------------------------------- //

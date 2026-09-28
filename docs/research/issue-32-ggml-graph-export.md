@@ -9,6 +9,10 @@ operation names, dimensions, byte strides, all source slots, view source and
 offset, raw operation parameters, flags, output, captures, and side-effect
 roots. It records the selected device and ggml commit. It never reads model
 weights or input tensor values.
+The full 64-byte operation-parameter field and all source slots are stable
+for the pinned ggml revision because `ggml_new_tensor_impl` initializes the
+whole tensor, including those arrays, to zero before an op fills them. Recheck
+that behavior when updating the submodule.
 
 Use a fresh directory for an engine run, then inspect the result:
 
