@@ -156,9 +156,15 @@ bool starling_ggml_granite_ctc_draft(void* handle, const float* pcm, int64_t n,
     if (!c || !count || n <= 0 || !pcm || capacity < 0 ||
         (capacity > 0 && !token_ids)) {
         if (count) *count = 0;
-        if (err_out) *err_out = "invalid GRANITE CTC draft arguments";
+        if (c) {
+            c->err = "invalid GRANITE CTC draft arguments";
+            report(err_out, c->err);
+        } else if (err_out) {
+            *err_out = "invalid GRANITE CTC draft arguments";
+        }
         return false;
     }
+    *count = 0;
     try {
         using namespace starling::ggml::granite;
         MelFeatures mel;

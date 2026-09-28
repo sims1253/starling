@@ -16,7 +16,10 @@ int main() {
     // Raw ggml CPU argmax picks the last tie. The last three frames also
     // catch the case where distinct BF16 logits become equal after softmax.
     const float tiny = std::ldexp(1.0f, -133);  // smallest BF16 subnormal
-    if (ggml_bf16_to_fp32(ggml_fp32_to_bf16(tiny)) != tiny) return 2;
+    if (ggml_bf16_to_fp32(ggml_fp32_to_bf16(tiny)) != tiny) {
+        std::fprintf(stderr, "smallest BF16 subnormal did not round-trip\n");
+        return 2;
+    }
     const std::vector<float> values = {
         1, 2, 2, 0, -1,         // nonzero top tie -> 1
         0, 0, 0, 0, 0,          // all-label tie -> 0

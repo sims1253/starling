@@ -195,6 +195,11 @@ bool GraniteModel::load(const char* path, std::string& err) {
         err = "GRANITE CTC draft head shape does not match encoder/vocabulary";
         return false;
     }
+    if (ctc_w && (c.encoder.mid_layer == 0 ||
+                  c.encoder.mid_layer > c.encoder.n_layers)) {
+        err = "GRANITE CTC encoder.mid_layer is outside the encoder layers";
+        return false;
+    }
     // Encoder layers: 32 tensors each (ff halves, Shaw attn incl. the baked
     // rel-pos bias, conv module with BatchNorm stats, post_norm).
     for (uint32_t i = 0; i < c.encoder.n_layers; ++i) {
