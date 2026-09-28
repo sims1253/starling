@@ -614,8 +614,9 @@ DeviceCache* get_device_cache(const QwenDecodeCtx& m, std::string& e) {
 //   kv_mode 0 = prefill exact (cpy slots [0,S), attend to new k/v)
 //   kv_mode 1 = decode exact-width (cpy slot `past`, attend [0, past+S))
 //   kv_mode 2 = decode full-capacity (set_rows slot `past`, attend [0, max_cache))
-//   kv_mode 3 = batched decode bounded-width (copy S slots, attend [0, past+S),
-//               causally mask later keys for each earlier query row)
+//   kv_mode 3 = batched verify (copy S slots; by default each query row reduces
+//               over its own [0, past+row+1) prefix; <label>_VERIFY_BATCH_ATTN
+//               uses one [0, past+S) reduction with a causal mask)
 // idx_past is the runtime i32[S] write-index vector used only by mode 2.
 // cs/sn are [D, S] bf16 (RoPE rows). mask is f32 [K, S] (K = past+S for modes
 // 0/1/3, max_cache for mode 2).
@@ -1111,6 +1112,7 @@ bool forward_verify(const QwenDecodeCtx& m, const std::vector<int32_t>& tokens,
 // they are skipped in the scan (the K-step graph applies the equivalent
 // additive penalty row before its in-graph argmax).
 int32_t spec_argmax_impl(const QwenDecodeSpec& s, const float* x, size_t n) {
+    GGML_ASSERT(x && n > 0);
     if (!s.argmax_low_ties && s.n_banned == 0) {
         int32_t best = 0;
         for (int32_t i = 1; i < (int32_t)n; ++i)
@@ -1663,7 +1665,7 @@ bool speculative_generate(const QwenDecodeCtx& m, const InputsEmbeds& i,
                 Clock::now() - start).count();
         }
     } total_timer{stats, Clock::now()};
-    if (!proposer || max_k < 1 || max_k > 16 || op.max_new_tokens < 1 ||
+    if (!proposer || max_k < 1 || max_k > kMaxSpeculativeK || op.max_new_tokens < 1 ||
         op.max_cache_len > (int32_t)m.dims.max_cache ||
         i.n_tokens + op.max_new_tokens > op.max_cache_len ||
         m.spec.decode_add || debug_probe_active(m.spec)) {
@@ -1779,14 +1781,14 @@ bool speculative_generate(const QwenDecodeCtx& m, const InputsEmbeds& i,
             if (target == draft[j]) ++stats.accepted;
             else rejected = true;
             o.ids.push_back(target);
-            if (generation_stops_on(target, op)) {
+            const bool stop = generation_stops_on(target, op);
+            // Keep the KV length equal to the verified tokens on every exit.
+            if (rejected || stop) state.length = past + (int64_t)j + 1;
+            if (stop) {
                 o.stop_reason = GenStopReason::kEos;
                 return finish();
             }
-            if (rejected) {
-                state.length = past + (int64_t)j + 1;
-                break;
-            }
+            if (rejected) break;
         }
         if (rejected) continue;
         // Every draft token matched. Row K predicts the free bonus token.
