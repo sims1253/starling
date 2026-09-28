@@ -107,8 +107,11 @@ def compare(protocol_path: Path, baseline_path: Path, candidate_path: Path) -> d
                f"{arm}: protocol seal differs from the supplied protocol")
         for key in ("model_sha256", "source_sha256", "imatrix_sha256",
                     "engine_sha256", "scorer_sha256", "device"):
+            hint = {"source_sha256": "pass --source-model",
+                    "imatrix_sha256": "pass --imatrix",
+                    "engine_sha256": "set STARLING_GGML_LIB"}.get(key, "re-run with --protocol")
             _check(isinstance(provenance.get(key), str) and provenance[key],
-                   f"{arm}: missing {key}; supply STARLING_GGML_LIB when evaluating")
+                   f"{arm}: missing {key}; {hint} when evaluating")
         _check(isinstance(provenance.get("model_bytes"), int)
                and provenance["model_bytes"] > 0,
                f"{arm}: missing exact model byte count")
@@ -148,9 +151,11 @@ def compare(protocol_path: Path, baseline_path: Path, candidate_path: Path) -> d
                    (c[clip_id]["audio_sha256"], c[clip_id]["reference"]),
                    f"{cohort} {clip_id}: audio or reference differs between arms")
             differences.append(float(c[clip_id]["wer"]) - float(b[clip_id]["wer"]))
-        low, high = _paired_interval(differences, draws, seed + index)
+        cohort_seed = seed + index  # protocol cohort order is sealed
+        low, high = _paired_interval(differences, draws, cohort_seed)
         result["cohorts"][cohort] = {
             "clips": len(differences),
+            "bootstrap_seed": cohort_seed,
             "delta_wer_pp": sum(differences) / len(differences),
             "paired_95_ci_pp": [low, high],
             "noninferior": high < margin,

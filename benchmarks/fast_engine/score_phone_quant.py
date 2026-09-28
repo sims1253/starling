@@ -158,7 +158,7 @@ def main() -> int:
             if not path.is_file():
                 raise ValueError(f"missing input: {path}")
         row = score(args)
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, RuntimeError) as exc:  # includes LibsndfileError
         ap.error(str(exc))
     args.json.write_text(json.dumps([row], indent=2, ensure_ascii=False) + "\n")
     print(json.dumps({"wer": row["wer"], "clips": {k: len(v) for k, v in row["clips"].items()}},
