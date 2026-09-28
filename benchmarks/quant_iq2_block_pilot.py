@@ -66,7 +66,10 @@ def imatrix_values(path: Path, tensor: str) -> np.ndarray:
             name_len = struct.unpack("<I", read_exact(stream, 4, "name length"))[0]
             if not (0 < name_len <= 4096):
                 raise ValueError(f"{path}: invalid imatrix name length {name_len}")
-            name = read_exact(stream, name_len, "name").decode()
+            try:
+                name = read_exact(stream, name_len, "name").decode()
+            except UnicodeDecodeError as exc:
+                raise ValueError(f"{path}: invalid UTF-8 imatrix name") from exc
             width = struct.unpack("<I", read_exact(stream, 4, "width"))[0]
             if not (0 < width <= 1_000_000):
                 raise ValueError(f"{path}: invalid imatrix width {width}")
