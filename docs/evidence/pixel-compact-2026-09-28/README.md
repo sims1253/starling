@@ -78,3 +78,28 @@ weights were identical. No co-residency budget exists for this comparison.
 Raw warm timings are retained in the `*-matched.stdout` files for inspection;
 they are not a latency verdict. Charging and unrelated phone activity also
 exclude an idle-subtracted energy estimate.
+
+## Controlled latency and energy attempt
+
+After the user paused Spotify and left the unplugged phone idle, we saved a
+[four-block paired protocol](controlled-fast-attempt/protocol.json) before
+running it. The planned fast-engine order was baseline, Q8 embedding, Q8
+embedding, baseline, with 72 short and 72 medium requests in each fresh
+process. Its SHA256 is
+`c66f7614fa44c34884059f80b64794905b96167cada6f102d2972756b6b0e708`.
+The [exact runner](controlled-fast-attempt/run_controlled_v1.py) has SHA256
+`0c773a6351bc70b59e02cfa70810000dc5aaa87a816d28e268900ceb805f210c`.
+
+The first baseline block never completed. Its [stdout](controlled-fast-attempt/bench.stdout)
+contains only short-fixture runs 0–8, with the same transcript in every
+completed run; the next result did not appear after more than two minutes.
+The fast/Vulkan PowerVR engine and 718.6 MiB weight allocation are confirmed
+in [stderr](controlled-fast-attempt/bench.stderr). The owned benchmark process
+was then terminated without rebooting or changing phone apps. The
+[result](controlled-fast-attempt/result.json) marks the block incomplete
+(`bench exit 143`). The [battery and environment samples](controlled-fast-attempt/battery-state.jsonl)
+show discharging, display off, and thermal status 0 at the sampled points.
+The exact cause of the stall is undetermined; it recurred despite idle,
+unplugged conditions. No candidate block ran, so this attempt yields **no
+paired latency or energy estimate**. The earlier 600-clip WER verdict and
+matched memory observations above do not depend on this incomplete run.
