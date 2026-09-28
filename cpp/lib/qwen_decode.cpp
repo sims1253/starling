@@ -1067,8 +1067,13 @@ bool forward_verify(const QwenDecodeCtx& m, const std::vector<int32_t>& tokens,
 // Suppression (spec.n_banned > 0): banned ids never win, at any step, so
 // they are skipped in the scan (the K-step graph applies the equivalent
 // additive penalty row before its in-graph argmax).
-int32_t spec_argmax_impl(const QwenDecodeSpec& s, const std::vector<float>& x) {
-    if (!s.argmax_low_ties && s.n_banned == 0) return argmax_low(x);
+int32_t spec_argmax_impl(const QwenDecodeSpec& s, const float* x, size_t n) {
+    if (!s.argmax_low_ties && s.n_banned == 0) {
+        int32_t best = 0;
+        for (int32_t i = 1; i < (int32_t)n; ++i)
+            if (x[i] > x[best]) best = i;
+        return best;
+    }
     auto is_banned = [&s](int32_t i) {
         return s.n_banned > 0 &&
                std::binary_search(s.banned_ids, s.banned_ids + s.n_banned, i);
@@ -1079,12 +1084,16 @@ int32_t spec_argmax_impl(const QwenDecodeSpec& s, const std::vector<float>& x) {
     int32_t best = 0;
     float bv = s.argmax_low_ties ? bf(x[0]) : x[0];
     if (is_banned(0)) { best = -1; bv = 0.0f; }
-    for (int32_t i = 1; i < (int32_t) x.size(); ++i) {
+    for (int32_t i = 1; i < (int32_t)n; ++i) {
         if (is_banned(i)) continue;
         const float v = s.argmax_low_ties ? bf(x[i]) : x[i];
         if (best < 0 || v > bv) { bv = v; best = i; }
     }
     return best;
+}
+
+int32_t spec_argmax_impl(const QwenDecodeSpec& s, const std::vector<float>& x) {
+    return spec_argmax_impl(s, x.data(), x.size());
 }
 
 // K-step multistep decode (captured ReplayGraph).
@@ -1591,6 +1600,18 @@ bool speculative_generate(const QwenDecodeCtx& m, const InputsEmbeds& i,
                           GenerateResult& o, SpeculativeStats& stats, std::string& e) {
     o = GenerateResult{};
     stats = SpeculativeStats{};
+    using Clock = std::chrono::steady_clock;
+    const auto elapsed_ms = [](Clock::time_point a, Clock::time_point b) {
+        return std::chrono::duration<double, std::milli>(b - a).count();
+    };
+    struct TotalTimer {
+        SpeculativeStats& stats;
+        Clock::time_point start;
+        ~TotalTimer() {
+            stats.total_ms = std::chrono::duration<double, std::milli>(
+                Clock::now() - start).count();
+        }
+    } total_timer{stats, Clock::now()};
     if (!proposer || max_k < 1 || max_k > 16 || op.max_new_tokens < 1 ||
         op.max_cache_len > (int32_t)m.dims.max_cache ||
         i.n_tokens + op.max_new_tokens > op.max_cache_len ||
@@ -1603,7 +1624,10 @@ bool speculative_generate(const QwenDecodeCtx& m, const InputsEmbeds& i,
         return true;
     }
     PrefillResult prefill;
-    if (!llm_prefill(m, i, op.max_cache_len, prefill, e)) return false;
+    auto phase_start = Clock::now();
+    const bool prefill_ok = llm_prefill(m, i, op.max_cache_len, prefill, e);
+    stats.prefill_ms += elapsed_ms(phase_start, Clock::now());
+    if (!prefill_ok) return false;
     o.prefill_logits = std::move(prefill.logits);
     LlmState state = std::move(prefill.state);
     o.ids.push_back(prefill.first_token);
@@ -1627,7 +1651,11 @@ bool speculative_generate(const QwenDecodeCtx& m, const InputsEmbeds& i,
         const int room = (int)((int64_t)op.max_cache_len - state.length);
         const int cap = std::min({max_k, remaining - 1, room - 1});
         std::vector<int32_t> draft;
-        if (cap > 0) draft = proposer(o.ids, cap);
+        if (cap > 0) {
+            phase_start = Clock::now();
+            draft = proposer(o.ids, cap);
+            stats.proposal_ms += elapsed_ms(phase_start, Clock::now());
+        }
         if ((int)draft.size() > cap ||
             std::any_of(draft.begin(), draft.end(), [&](int32_t id) {
                 return id < 0 || id >= embed->ne[1];
@@ -1641,8 +1669,11 @@ bool speculative_generate(const QwenDecodeCtx& m, const InputsEmbeds& i,
                 return false;
             }
             std::vector<float> logits;
-            if (!forward_decode(m, o.ids.back(), state.length, state, logits, e))
-                return false;
+            phase_start = Clock::now();
+            const bool decode_ok = forward_decode(m, o.ids.back(), state.length,
+                                                  state, logits, e);
+            stats.fallback_ms += elapsed_ms(phase_start, Clock::now());
+            if (!decode_ok) return false;
             const int32_t token = spec_argmax_impl(m.spec, logits);
             o.ids.push_back(token);
             ++stats.fallback_steps;
@@ -1658,7 +1689,10 @@ bool speculative_generate(const QwenDecodeCtx& m, const InputsEmbeds& i,
         input.push_back(o.ids.back());
         input.insert(input.end(), draft.begin(), draft.end());
         std::vector<float> logits;
-        if (!forward_verify(m, input, state, logits, e)) return false;
+        phase_start = Clock::now();
+        const bool verify_ok = forward_verify(m, input, state, logits, e);
+        stats.verify_ms += elapsed_ms(phase_start, Clock::now());
+        if (!verify_ok) return false;
         ++stats.verify_calls;
         stats.proposed += (int32_t)draft.size();
         if (logits.size() != input.size() * (size_t)vocab) {
@@ -1674,9 +1708,8 @@ bool speculative_generate(const QwenDecodeCtx& m, const InputsEmbeds& i,
         }
         bool rejected = false;
         for (size_t j = 0; j < draft.size(); ++j) {
-            std::vector<float> row(logits.begin() + (ptrdiff_t)(j * vocab),
-                                   logits.begin() + (ptrdiff_t)((j + 1) * vocab));
-            const int32_t target = spec_argmax_impl(m.spec, row);
+            const int32_t target = spec_argmax_impl(m.spec,
+                logits.data() + j * (size_t)vocab, (size_t)vocab);
             if (target == draft[j]) ++stats.accepted;
             else rejected = true;
             o.ids.push_back(target);
@@ -1692,9 +1725,8 @@ bool speculative_generate(const QwenDecodeCtx& m, const InputsEmbeds& i,
         }
         if (rejected) continue;
         // Every draft token matched. Row K predicts the free bonus token.
-        std::vector<float> bonus_row(logits.begin() + (ptrdiff_t)(draft.size() * vocab),
-                                     logits.end());
-        const int32_t bonus = spec_argmax_impl(m.spec, bonus_row);
+        const int32_t bonus = spec_argmax_impl(m.spec,
+            logits.data() + draft.size() * (size_t)vocab, (size_t)vocab);
         o.ids.push_back(bonus);
         if (generation_stops_on(bonus, op)) {
             o.stop_reason = GenStopReason::kEos;

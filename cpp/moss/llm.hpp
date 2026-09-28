@@ -13,6 +13,9 @@ using GenerateResult = lib::GenerateResult;
 struct GenerateOptions { int32_t max_new_tokens=200,max_cache_len=2048,eos_token_id=151645; };
 bool llm_prefill(const MossModel&,const InputsEmbeds&,int32_t max_cache_len,PrefillResult&,std::string&);
 bool greedy_generate(const MossModel&,const InputsEmbeds&,const GenerateOptions&,GenerateResult&,std::string&);
+bool speculative_generate(const MossModel&, const InputsEmbeds&, const GenerateOptions&,
+                          int max_k, const lib::DraftProposer&, const lib::CancelCheck&,
+                          GenerateResult&, lib::SpeculativeStats&, std::string&);
 // Current number of cached per-S prefill graphs (diagnostic + the
 // bounded-LRU regression-test hook). Zero on CPU / before first GPU prefill.
 size_t prefill_replay_cache_size(const MossModel& model);

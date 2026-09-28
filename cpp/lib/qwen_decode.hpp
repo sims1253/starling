@@ -193,6 +193,13 @@ struct SpeculativeStats {
     int32_t accepted = 0;
     int32_t verify_calls = 0;
     int32_t fallback_steps = 0;
+    // Wall times include the real proposer callback and graph readback.
+    // total_ms also includes host acceptance, allocation, and cancellation.
+    double prefill_ms = 0.0;
+    double proposal_ms = 0.0;
+    double verify_ms = 0.0;
+    double fallback_ms = 0.0;
+    double total_ms = 0.0;
 };
 bool speculative_generate(const QwenDecodeCtx& m, const InputsEmbeds& i,
                           const GenerateParams& op, int max_k,
