@@ -33,8 +33,11 @@ int main(int argc, char** argv) {
         const bool loaded = model.load(path, err);
         const bool accepted = profile && (std::string(profile) == "bf16_exact" ||
                                           std::string(profile) == "quantized");
-        check(!loaded && (accepted ? err.find("contains no tensors") != std::string::npos
-                                   : err.find("numeric profile") != std::string::npos),
+        const bool expected_error = accepted
+            ? err.find("contains no tensors") != std::string::npos
+            : profile ? err.find("numeric profile") != std::string::npos
+                      : err == "S1 GGUF missing starling.numeric_profile";
+        check(!loaded && expected_error,
               std::string("profile '") + (profile ? profile : "<missing>") +
                   (accepted ? "' accepted" : "' rejected"), err);
     }
