@@ -20,6 +20,8 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
+from websockets.sync.client import connect
+
 
 def sha256(path: Path) -> str:
     h = hashlib.sha256()
@@ -128,6 +130,20 @@ def run_arm(binary: Path, model: Path, audio_a: bytes, audio_b: bytes,
                 with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
                     a1 = pool.submit(upload, url, audio_a, "aba-a1")
                     wait_event(log_path, "aba-a1", "queue_wait", process)
+                    # A new WS session must become application-ready while A1
+                    # still holds the first chunk. The old server's identity
+                    # lookup waited on the global model lock at this point.
+                    connect_start = time.perf_counter()
+                    with connect(url.replace("http://", "ws://") + "/stream",
+                                 ping_interval=None, proxy=None, open_timeout=10) as ws:
+                        connect_ms = (time.perf_counter() - connect_start) * 1000
+                        ping_start = time.perf_counter()
+                        ws.send('{"type":"ping"}')
+                        reply = json.loads(ws.recv(timeout=5))
+                        ping_ms = (time.perf_counter() - ping_start) * 1000
+                    arm["new_session"] = {"connect_ms": connect_ms,
+                                          "ping_ms": ping_ms,
+                                          "reply": reply.get("type")}
                     b = pool.submit(upload, url, audio_b, "aba-b")
                     wait_event(log_path, "aba-b", "queue_enter", process)
                     a2 = pool.submit(upload, url, audio_a, "aba-a2")
@@ -206,10 +222,12 @@ def main() -> int:
     b_first = next((i for i, e in enumerate(order) if e == ("aba-b", 1)), -1)
     a2_first = next((i for i, e in enumerate(order) if e == ("aba-a2", 1)), -1)
     interleaved = a1_first >= 0 and a1_first < b_first < a1_second and a1_first < a2_first < a1_second
-    result["verdict"] = {"status": "pass" if all((status_ok, hashes_ok, chunks_ok, interleaved))
+    admission = fair.get("new_session", {})
+    admission_ok = admission.get("reply") == "pong" and admission.get("ping_ms", 1e9) < 2000
+    result["verdict"] = {"status": "pass" if all((status_ok, hashes_ok, chunks_ok, interleaved, admission_ok))
                          else "no_go_or_inconclusive", "status_ok": status_ok,
                          "hashes_ok": hashes_ok, "chunks_ok": chunks_ok,
-                         "interleaved": interleaved}
+                         "interleaved": interleaved, "admission_ok": admission_ok}
     (args.out_dir / "result.json").write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(result["verdict"], indent=2), flush=True)
     return 0 if result["verdict"]["status"] == "pass" else 1
