@@ -1,0 +1,70 @@
+{
+  "model_sha256": "c4fc61df01df19655d796e085d29aa41647d33cfd090824778ecadd76a2bb11c",
+  "lib_sha256": "fa4098f4fb7ff33ef70591c569c7f67680ac0fcff8fe8824d77dcd87844ab521",
+  "model_load_ms": 690.96,
+  "device": "CPU",
+  "warmup": "one unmeasured greedy and one unmeasured copy C API call per case/K",
+  "timing_scope": "C API call including tokenization, embedding, generation, detokenization, and same ID dump write",
+  "rows": [
+    {
+      "case": "protected",
+      "k": 4,
+      "repeat": 1,
+      "order": [
+        "greedy",
+        "copy"
+      ],
+      "source_sha256": "23ebf0fce659f72663040be0939485f46bd8af612fd1c4535f2012cbb8d1a8b6",
+      "baseline_ms": 1995.96,
+      "copy_ms": 2362.74,
+      "ratio_copy_over_greedy": 1.184,
+      "output_tokens": 26,
+      "greedy_ids_sha256": "c2de6338964e32c4961a26c89adde9c88cb2fa3289277fbbeb1573ec767c67e5",
+      "copy_ids_sha256": "c2de6338964e32c4961a26c89adde9c88cb2fa3289277fbbeb1573ec767c67e5",
+      "ids_match_greedy": true,
+      "text_matches_greedy": true,
+      "greedy_ids_match_stock": null,
+      "copy_ids_match_stock": null,
+      "greedy_text_matches_stock": null,
+      "greedy_protected_spans": {
+        "ZX-1042": true,
+        "https://example.org/manual": true
+      },
+      "copy_protected_spans": {
+        "ZX-1042": true,
+        "https://example.org/manual": true
+      },
+      "golden_sha256": null
+    },
+    {
+      "case": "protected",
+      "k": 4,
+      "repeat": 2,
+      "order": [
+        "copy",
+        "greedy"
+      ],
+      "source_sha256": "23ebf0fce659f72663040be0939485f46bd8af612fd1c4535f2012cbb8d1a8b6",
+      "baseline_ms": 1849.2,
+      "copy_ms": 2570.2,
+      "ratio_copy_over_greedy": 1.39,
+      "output_tokens": 26,
+      "greedy_ids_sha256": "c2de6338964e32c4961a26c89adde9c88cb2fa3289277fbbeb1573ec767c67e5",
+      "copy_ids_sha256": "c2de6338964e32c4961a26c89adde9c88cb2fa3289277fbbeb1573ec767c67e5",
+      "ids_match_greedy": true,
+      "text_matches_greedy": true,
+      "greedy_ids_match_stock": null,
+      "copy_ids_match_stock": null,
+      "greedy_text_matches_stock": null,
+      "greedy_protected_spans": {
+        "ZX-1042": true,
+        "https://example.org/manual": true
+      },
+      "copy_protected_spans": {
+        "ZX-1042": true,
+        "https://example.org/manual": true
+      },
+      "golden_sha256": null
+    }
+  ]
+}
