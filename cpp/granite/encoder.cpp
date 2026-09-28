@@ -576,9 +576,11 @@ bool extract_ctc_draft(const GraniteModel& model, const MelFeatures& mel,
         importance[(size_t)t] = 1.0f -
             (float)(std::exp((double)logits[kCtcBlankLabel] - maximum) / denom);
     }
+    // Guards all-blank windows; must match the Python reference for parity.
+    constexpr float kCtcPoolEpsilon = 1e-8f;
     std::vector<ggml_bf16_t> pooled((size_t)P * ec.hidden);
     for (int64_t p = 0; p < P; ++p) {
-        float denom = 1e-8f;
+        float denom = kCtcPoolEpsilon;
         for (int64_t j = 0; j < window && p * window + j < T; ++j)
             denom += importance[(size_t)(p * window + j)];
         for (uint32_t d = 0; d < ec.hidden; ++d) {
@@ -594,6 +596,12 @@ bool extract_ctc_draft(const GraniteModel& model, const MelFeatures& mel,
 
     std::vector<float> labels;
     const int64_t vocab = model.loader.tensor("ctc.out_llm.weight")->ne[1];
+    // Descending f32 labels must stay exact and distinct for the first-index
+    // tie-break.
+    if (vocab > ((int64_t)1 << 24)) {
+        err = "GRANITE CTC vocabulary exceeds the f32 tie-break range";
+        return false;
+    }
     std::vector<float> iota((size_t)vocab);
     for (int64_t i = 0; i < vocab; ++i) iota[(size_t)i] = (float)(vocab - i);
     const float one = 1.0f;

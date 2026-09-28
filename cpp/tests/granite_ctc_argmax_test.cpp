@@ -23,9 +23,11 @@ int main() {
     const std::vector<float> values = {
         1, 2, 2, 0, -1,         // nonzero top tie -> 1
         0, 0, 0, 0, 0,          // all-label tie -> 0
-        0, tiny, tiny, 0, 0,    // near-zero top tie -> 1
-        0, tiny, 2*tiny, 0, 0,  // distinct subnormal max -> 2
-        -tiny, 0, 0, -tiny, -tiny, // zero top tie -> 1
+        // The last three rows have distinct logit winners (1, 2, 1), but
+        // exp(+-2^-133) rounds to 1.0f, so every softmax probability ties -> 0.
+        0, tiny, tiny, 0, 0,
+        0, tiny, 2*tiny, 0, 0,
+        -tiny, 0, 0, -tiny, -tiny,
     };
     std::vector<ggml_bf16_t> logits;
     for (float v : values) logits.push_back(ggml_fp32_to_bf16(v));

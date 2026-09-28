@@ -36,7 +36,8 @@ bool extract_ctc_draft(const GraniteModel& model, const MelFeatures& mel,
                        std::vector<int32_t>& token_ids, std::string& err);
 
 // Row-wise argmax with torch's first-index behavior on exact ties. `iota`
-// holds vocab-index as descending f32 values and must outlive graph execution.
+// holds vocab-index as descending f32 values (vocab <= 2^24). `iota` and `one`
+// back graph inputs by address, so both must outlive graph execution.
 ggml_tensor* ctc_argmax_first(ggml_context* c, ggml_tensor* logits,
                               const std::vector<float>& iota, const float& one);
 
