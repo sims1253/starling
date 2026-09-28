@@ -38,7 +38,9 @@ behavior differs.
 A separate [native Parakeet-text to MOSS pilot #347](https://github.com/sims1253/starling/pull/347)
 used saved final Parakeet transcripts as already-available preview proxies.
 Its eight short/medium LibriSpeech-derived CPU pairs at K=2/4 matched greedy
-IDs/EOS and saved text, with 21.7–26.0% lower full MOSS-call time. This does
+IDs, EOS, and the saved MOSS golden text, with 21.7–26.0% lower full MOSS-call
+time. Those pairs use two related clips from one speaker: the medium clip
+tiles the short one, and each K setting was repeated twice. This does
 not measure actual live partial text, newly run Parakeet inference, Pixel, or
 the earlier 12-clip FLEURS distribution. The different free-draft outcomes
 make workload and source-availability stratification part of the gate.
