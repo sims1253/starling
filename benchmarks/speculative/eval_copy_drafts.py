@@ -33,6 +33,8 @@ def evaluate(golden_dir: Path, max_k: int) -> dict:
     cases = []
     for tier, transcript in fixtures.items():
         golden = golden_dir / f"greedy_ids_{tier}.pt"
+        if not golden.is_file():
+            raise FileNotFoundError(f"missing golden capture for tier {tier!r}: {golden}")
         ids = torch.load(golden, map_location="cpu", weights_only=True).reshape(-1).tolist()
         source = tokenizer.encode(transcript, add_special_tokens=False)
         result = simulate(source, ids, max_k=max_k)
