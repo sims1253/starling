@@ -65,7 +65,8 @@ attention tensor to `past + S` keys, the extent of the final row. That fixed
 the observed Granite case: K=1, 2, and 4 each produced the same 98 IDs and
 stop result as greedy on that clip. Earlier rows still reduced over the batch
 width with future keys masked, whereas greedy used a separately sized tensor
-at each token. The medium MOSS/LibriSpeech case exposed the remaining gap:
+at each token. The [medium MOSS/LibriSpeech pilot in #347](https://github.com/sims1253/starling/pull/347)
+exposed the remaining gap:
 greedy stopped after 89 IDs, while a K=2 Parakeet-text copy draft produced
 91 IDs, first differing at zero-based index 21.
 
