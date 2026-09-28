@@ -38,8 +38,9 @@ The speculative totals include prefill, the proposer callback, verification,
 host acceptance, and fallback. The perfect run spent 1163.5 ms in prefill,
 297.4 ms in verifier graphs, and 0.001 ms in the callback. The rejected run
 spent 1199.9 ms in prefill, 673.9 ms in verifier graphs, and 0.004 ms in the
-callback. The proposer reads the already computed greedy IDs, so these times
-are an upper bound for a cheap draft source. They exclude the cost of producing
-those oracle IDs. A copy or CTC proposer needs a separate full-cost benchmark
-before runtime enablement. One run does not establish stable throughput or
-energy savings. Vulkan and Pixel measurements remain open.
+callback. The proposer reads the already computed greedy IDs, so these are
+optimistic illustrative timings, not a bound on real draft-source latency.
+They exclude the cost of producing those oracle IDs. A copy or CTC proposer
+needs a separate full-cost benchmark before runtime enablement. One run does
+not establish stable throughput or energy savings. Vulkan and Pixel
+measurements remain open.
