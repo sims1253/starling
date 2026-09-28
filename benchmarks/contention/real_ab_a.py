@@ -131,6 +131,10 @@ def run_arm(binary: Path, model: Path, audio_a: bytes, audio_b: bytes,
                     b = pool.submit(upload, url, audio_b, "aba-b")
                     wait_event(log_path, "aba-b", "queue_enter", process)
                     a2 = pool.submit(upload, url, audio_a, "aba-a2")
+                    wait_event(log_path, "aba-a2", "queue_enter", process)
+                    if any(e.get("req") == "aba-a1" and e.get("ev") == "chunk"
+                           for e in events(log_path)):
+                        raise RuntimeError("A1 completed its first chunk before B/A2 queued")
                     arm["a1"] = a1.result(timeout=600)
                     arm["b"] = b.result(timeout=600)
                     arm["a2"] = a2.result(timeout=600)
