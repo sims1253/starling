@@ -13,6 +13,7 @@
 //   - FFN biases are absent for parakeet-tdt-0.6b-v3 (clone_weight_opt + skip)
 
 #include "conformer.hpp"
+#include "depthwise_weight.hpp"
 
 #include "runtime/backend.hpp"  // clone_weight, clone_weight_opt, graph_input_tensor, weight_to_host_f32
 
@@ -235,8 +236,7 @@ ggml_tensor* build_conv_module(ggml_context* ctx, const ModelLoader& ml,
     // ggml-cuda's depthwise kernel accepts F32 only, so widen these exact
     // cached values before the layout-only reshape/permute. Other backends
     // retain their existing F16 path.
-    if (std::strncmp(global_backend().device_name(), "CUDA", 4) == 0)
-        dww_t = ggml_cast(ctx, dww_t, GGML_TYPE_F32);
+    dww_t = depthwise_weight_for_backend(ctx, dww_t);
     // ggml_permute(ctx, a, ax0..ax3): ne[ax_i] = a->ne[i] (ax_i = where
     // source dim i LANDS). Kernel [D,K,1,1] -> [K,1,1,D]: D->3, K->0.
     ggml_tensor* knl = ggml_permute(ctx, ggml_reshape_4d(ctx, dww_t, D, K, 1, 1),

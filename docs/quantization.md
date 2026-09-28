@@ -171,8 +171,8 @@ self_attn\.linear_k\.weight$   q5_k
 `--shrink-f16` additionally stores the kept CONV WEIGHTS (~300 MB for
 parakeet) as F16. The pointwise convolutions use F16 matmuls; the CUDA
 depthwise kernel requires F32, so the graph widens those stored F16 values
-before that operation. Everything else stays F32: 1-D biases/norms/BN statistics feed
-`ggml_add`/`ggml_mul` broadcasts which reject mixed dtypes.
+before that operation. Everything else stays F32: 1-D biases/norms/BN
+statistics feed `ggml_add`/`ggml_mul` broadcasts which reject mixed dtypes.
 
 ### Parakeet embedding and compact recipes
 
