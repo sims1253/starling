@@ -44,8 +44,9 @@ The amended, scored trial enabled that per-row attention path, kept every
 other condition and decision rule, and ran two warmed pairs per K and tier.
 Pair order reversed on the second repeat. Raw results are in
 [`moss_preview_copy_row_attention.jsonl`](moss_preview_copy_row_attention.jsonl).
-It used the opt-in experiment in commit `239b5308`;
-[the subsequent #338 CPU default](https://github.com/sims1253/starling/pull/338)
+The intermediate opt-in build is preserved by its executable SHA-256 in the
+preregistered amendment; its source commit is no longer reachable. The
+[subsequent #338 CPU default](https://github.com/sims1253/starling/pull/338)
 selects the same per-row graph without that flag. This report makes no
 fresh-run timing claim for the later default build.
 
@@ -85,9 +86,10 @@ STARLING_GGML_DEVICE=cpu STARLING_GGML_THREADS=4 \
 
 On the final #338 CPU code, per-row verifier attention is the default;
 `STARLING_MOSS_VERIFY_BATCH_ATTN=1` is a diagnostic opt-out and must stay
-unset for this reproduction. To reproduce the *historical scored executable*
-and its exact hash, use the preregistered intermediate commit and the
-`STARLING_MOSS_VERIFY_ROW_ATTN=1` flag recorded there.
+unset for this reproduction. The historical scored executable is identified
+by the SHA-256 and `STARLING_MOSS_VERIFY_ROW_ATTN=1` flag in the preregistered
+amendment. Its intermediate source revision is unavailable, so this branch
+can reproduce the final per-row behavior but cannot rebuild that exact binary.
 
 The code path remains research-only. The next evaluation needs real latest
 streaming partials, more varied speakers/languages and FLEURS quality, then

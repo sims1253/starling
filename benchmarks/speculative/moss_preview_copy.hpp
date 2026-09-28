@@ -36,7 +36,16 @@ public:
           k_(std::min(2, max_k_)), max_skip_(max_skip) {}
 
     std::vector<int32_t> propose(const std::vector<int32_t>& prefix, int cap) {
-        if (prefix.size() < observed_ || cap < 1) return {};
+        if (prefix.size() < observed_) {
+            // A new verified prefix must be aligned from its beginning.
+            position_ = 0;
+            observed_ = 0;
+            misses_ = 0;
+            k_ = std::min(2, max_k_);
+            last_draft_.clear();
+            return {};
+        }
+        if (cap < 1) return {};
         if (!last_draft_.empty() && prefix.size() > observed_) {
             const size_t emitted = prefix.size() - observed_;
             size_t accepted = 0;
@@ -77,8 +86,8 @@ private:
 
     static std::vector<int32_t> lookup(const std::vector<int32_t>& prefix,
                                        size_t k) {
-        for (size_t n = std::min<size_t>(4, prefix.size()); n > 0; --n) {
-            if (prefix.size() <= n) continue;
+        if (prefix.size() < 2) return {};
+        for (size_t n = std::min<size_t>(4, prefix.size() - 1); n > 0; --n) {
             for (size_t i = prefix.size() - n; i-- > 0;) {
                 if (std::equal(prefix.begin() + ptrdiff_t(i),
                                prefix.begin() + ptrdiff_t(i + n),

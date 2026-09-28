@@ -37,6 +37,15 @@ std::string read_file(const std::string& path) {
     return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
 }
 
+bool parse_int(const char* text, int low, int high, int& out) {
+    if (!text || !*text) return false;
+    char* end = nullptr;
+    const long value = std::strtol(text, &end, 10);
+    if (*end != '\0' || value < low || value > high) return false;
+    out = int(value);
+    return true;
+}
+
 std::string ids_fingerprint(const std::vector<int32_t>& ids) {
     uint64_t hash = 14695981039346656037ull;
     for (int32_t id : ids)
@@ -135,11 +144,14 @@ bool load_wav(const std::string& path, std::vector<float>& pcm) {
            sample_rate == 16000;
 }
 
+bool parity(const Run& greedy, const Run& draft) {
+    return greedy.output.ids == draft.output.ids &&
+           greedy.output.stop_reason == draft.output.stop_reason &&
+           greedy.text == draft.text;
+}
+
 void print_pair(const char* tier, int k, int repeat, const Run& greedy,
                 const Run& draft, bool golden_match) {
-    const bool parity = greedy.output.ids == draft.output.ids &&
-                        greedy.output.stop_reason == draft.output.stop_reason &&
-                        greedy.text == draft.text;
     std::printf("{\"case\":\"%s\",\"k\":%d,\"repeat\":%d,"
                 "\"order\":\"%s\",\"parity\":%s,\"golden_text\":%s,"
                 "\"stop\":\"%s\",\"tokens\":%zu,\"ids_fnv64\":\"%s\","
@@ -155,7 +167,8 @@ void print_pair(const char* tier, int k, int repeat, const Run& greedy,
                 "\"proposal_ms\":%.3f,\"verify_ms\":%.3f,\"prefill_ms\":%.3f}"
                 "\n",
                 tier, k, repeat, repeat % 2 == 0 ? "greedy-first" : "draft-first",
-                parity ? "true" : "false", golden_match ? "true" : "false",
+                parity(greedy, draft) ? "true" : "false",
+                golden_match ? "true" : "false",
                 stop_name(greedy.output.stop_reason), greedy.output.ids.size(),
                 ids_fingerprint(greedy.output.ids).c_str(),
                 stop_name(draft.output.stop_reason), draft.output.ids.size(),
@@ -176,12 +189,11 @@ int main(int argc, char** argv) {
             "usage: %s moss.gguf golden-dir short.wav medium.wav repeats\n", argv[0]);
         return 2;
     }
-    const int repeats = std::atoi(argv[5]);
-    if (repeats < 1 || repeats > 5) return 2;
+    int repeats = 0;
+    if (!parse_int(argv[5], 1, 5, repeats)) return 2;
     int diagnostic_k = 0;
     if (const char* value = std::getenv("MOSS_PREVIEW_DIAGNOSTIC_K")) {
-        diagnostic_k = std::atoi(value);
-        if (diagnostic_k < 1 || diagnostic_k > 4) return 2;
+        if (!parse_int(value, 1, 4, diagnostic_k)) return 2;
     }
     moss::MossModel model;
     std::string err;
@@ -211,7 +223,9 @@ int main(int argc, char** argv) {
         const std::string golden_text = read_file(root + "/moss_" + tier +
                                                   "_text.txt");
         std::vector<float> pcm;
-        if (preview.empty() || golden_text.empty() ||
+        const size_t golden_end = golden_text.find_last_not_of("\r\n");
+        if (preview.empty() ||
+            golden_text.find_first_not_of(" \t\r\n") == std::string::npos ||
             !load_wav(argv[case_i == 0 ? 3 : 4], pcm)) {
             std::fprintf(stderr, "%s: missing preview, golden or 16 kHz WAV\n", tier);
             return 2;
@@ -245,12 +259,9 @@ int main(int argc, char** argv) {
                     return 2;
                 }
             }
-            const bool golden_match = greedy.text ==
-                golden_text.substr(0, golden_text.find_last_not_of("\r\n") + 1);
+            const bool golden_match = greedy.text == golden_text.substr(0, golden_end + 1);
             print_pair(tier, k, rep, greedy, draft, golden_match);
-            if (greedy.output.ids != draft.output.ids ||
-                greedy.output.stop_reason != draft.output.stop_reason ||
-                greedy.text != draft.text ||
+            if (!parity(greedy, draft) ||
                 greedy.output.stop_reason !=
                     starling::ggml::lib::GenStopReason::kEos) {
                 size_t first = 0;
