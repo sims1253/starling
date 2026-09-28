@@ -30,7 +30,11 @@ PROTECTED_SPANS = ("ZX-1042", "https://example.org/manual")
 
 
 def sha256(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def main() -> int:
@@ -111,6 +115,9 @@ def main() -> int:
                 expected_ids = expected_text = golden_hash = None
                 if case != "protected":
                     golden = args.golden_dir / f"greedy_ids_{case}.pt"
+                    text_golden = args.golden_dir / f"greedy_text_{case}.txt"
+                    if not golden.is_file() or not text_golden.is_file():
+                        raise FileNotFoundError(f"missing golden files for case {case!r} in {args.golden_dir}")
                     expected_ids = torch.load(golden, map_location="cpu", weights_only=True).reshape(-1).tolist()
                     expected_text = (args.golden_dir / f"greedy_text_{case}.txt").read_text()
                     golden_hash = sha256(golden)

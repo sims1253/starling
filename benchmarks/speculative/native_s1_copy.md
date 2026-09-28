@@ -201,7 +201,9 @@ were 44.5 and 32.8 seconds. The medium-case warmup then reached the declared
 180-second HTTP timeout without a response. The owned server was terminated
 and verified absent; [the saved record](results/pixel-native-copy-2026-09-28/preflight-1-greedy/record.json)
 is incomplete. The raw log, two ID dumps, environment samples, exact fixtures,
-runner, and hashes are in the same evidence directory.
+runner, and hashes are in the same evidence directory. The runner and
+operational bounds were later repaired in place and `hashes.sha256` re-sealed
+over the repaired bytes; the as-run versions are at commit `f6080e6`.
 
 No Pixel copy arm ran. This attempt establishes **neither Pixel copy parity
 nor a Pixel latency or energy benefit**. The host CPU pilot above remains
