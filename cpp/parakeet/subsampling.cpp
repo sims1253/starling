@@ -14,6 +14,7 @@
 // xscaling is OFF for parakeet-tdt-0.6b-v3 — handled in the encoder, not here.
 
 #include "subsampling.hpp"
+#include "depthwise_weight.hpp"
 
 #include "runtime/backend.hpp"  // clone_weight, graph_input_tensor
 
@@ -69,6 +70,10 @@ ggml_tensor* Subsampling::build_graph(ggml_context* ctx,
         // ggml_conv_2d_dw_direct expects a:[KW,KH,1,C], b:[W,H,C,N].
         ggml_tensor* dww = clone_weight(ctx, ml, s.dw_w);
         ggml_tensor* dwb = clone_weight(ctx, ml, s.dw_b);
+        // ggml-cuda's depthwise kernel accepts F32 weights only. Compact
+        // GGUFs store these kernels as F16; widening the exact F16 values
+        // before the convolution keeps the compact file loadable on CUDA.
+        dww = depthwise_weight_for_backend(ctx, dww);
         x = ggml_conv_2d_dw_direct(ctx, dww, x,
                                    /*s0*/2, /*s1*/2, /*p0*/1, /*p1*/1,
                                    /*d0*/1, /*d1*/1);
