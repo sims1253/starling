@@ -205,7 +205,8 @@ jobs:
           ./build/model_lifetime_test
           ./build/replay_graph_support_test
           ./build/granite_trace_test
-          for t in device_cache_clear_test greedy_termination_test tdt_graph_budget_test; do
+          for t in device_cache_clear_test greedy_termination_test tdt_graph_budget_test \
+                   speculative_verifier_test; do
             "./build/$t"
           done
 

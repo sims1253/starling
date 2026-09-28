@@ -1674,6 +1674,12 @@ bool speculative_generate(const QwenDecodeCtx& m, const InputsEmbeds& i,
                                                   state, logits, e);
             stats.fallback_ms += elapsed_ms(phase_start, Clock::now());
             if (!decode_ok) return false;
+            // The decode graph may have completed after cancellation. Its
+            // predicted token is still tentative until this check passes.
+            if (cancelled && cancelled()) {
+                o.stop_reason = GenStopReason::kCancelled;
+                return true;
+            }
             const int32_t token = spec_argmax_impl(m.spec, logits);
             o.ids.push_back(token);
             ++stats.fallback_steps;
@@ -1702,7 +1708,6 @@ bool speculative_generate(const QwenDecodeCtx& m, const InputsEmbeds& i,
         // A cancellation after graph execution discards all tentative draft
         // output. The previous verified prefix remains available in o.ids.
         if (cancelled && cancelled()) {
-            state.length = past;
             o.stop_reason = GenStopReason::kCancelled;
             return true;
         }
@@ -1714,7 +1719,6 @@ bool speculative_generate(const QwenDecodeCtx& m, const InputsEmbeds& i,
             else rejected = true;
             o.ids.push_back(target);
             if (generation_stops_on(target, op)) {
-                state.length = past + (int64_t)j + 1;
                 o.stop_reason = GenStopReason::kEos;
                 return true;
             }

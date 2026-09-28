@@ -51,7 +51,11 @@ bool real_moss_checks(const char* gguf, const char* embeddings) {
         return false;
     }
     input.width = model.config.llm.hidden;
-    if (input.data.size() % (size_t)input.width != 0) return false;
+    if (input.width <= 0 || input.data.size() % (size_t)input.width != 0) {
+        std::fprintf(stderr, "real MOSS embeddings size %zu is invalid for width %lld\n",
+                     input.data.size(), (long long)input.width);
+        return false;
+    }
     input.n_tokens = (int64_t)(input.data.size() / (size_t)input.width);
     moss::GenerateOptions op;
     op.max_new_tokens = 12;
@@ -71,8 +75,10 @@ bool real_moss_checks(const char* gguf, const char* embeddings) {
     }
     auto t1 = now();
     auto perfect = [&](const std::vector<int32_t>& prefix, int cap) {
-        const auto begin = greedy.ids.begin() + (ptrdiff_t)prefix.size();
-        return std::vector<int32_t>(begin, begin + cap);
+        const size_t offset = std::min(prefix.size(), greedy.ids.size());
+        const size_t count = std::min((size_t)cap, greedy.ids.size() - offset);
+        const auto begin = greedy.ids.begin() + (ptrdiff_t)offset;
+        return std::vector<int32_t>(begin, begin + (ptrdiff_t)count);
     };
     if (!moss::speculative_generate(model, input, op, 4, perfect, {},
                                     perfect_out, perfect_stats, err)) {
@@ -83,7 +89,7 @@ bool real_moss_checks(const char* gguf, const char* embeddings) {
     int calls = 0;
     auto rejected = [&](const std::vector<int32_t>& prefix, int cap) {
         auto draft = perfect(prefix, cap);
-        if (calls++ == 0 && cap > 2)
+        if (calls++ == 0 && draft.size() > 2)
             draft[2] = (draft[2] + 1) % (int32_t)model.config.llm.vocab;
         return draft;
     };
@@ -152,8 +158,10 @@ int main(int argc, char** argv) {
 
     // A perfect proposer verifies multiple candidates per target pass.
     auto perfect = [&](const std::vector<int32_t>& prefix, int cap) {
-        const auto begin = greedy.ids.begin() + (ptrdiff_t)prefix.size();
-        return std::vector<int32_t>(begin, begin + cap);
+        const size_t offset = std::min(prefix.size(), greedy.ids.size());
+        const size_t count = std::min((size_t)cap, greedy.ids.size() - offset);
+        const auto begin = greedy.ids.begin() + (ptrdiff_t)offset;
+        return std::vector<int32_t>(begin, begin + (ptrdiff_t)count);
     };
     GenerateResult all;
     SpeculativeStats all_stats;
@@ -182,6 +190,21 @@ int main(int argc, char** argv) {
     check(empty_ok && same_output(empty_draft, greedy) &&
               empty_stats.verify_calls == 0 && empty_stats.fallback_steps == 9,
           "empty draft falls back to greedy steps", err);
+
+    // A cancellation triggered by the fallback graph must not emit its
+    // tentative token, just as with a multi-row verify graph.
+    int fallback_checks = 0;
+    GenerateResult fallback_cancelled;
+    SpeculativeStats fallback_cancel_stats;
+    err.clear();
+    const bool fallback_cancel_ok = speculative_generate(model, input, op, 4,
+        [](const std::vector<int32_t>&, int) { return std::vector<int32_t>{}; },
+        [&] { return ++fallback_checks == 3; },
+        fallback_cancelled, fallback_cancel_stats, err);
+    check(fallback_cancel_ok &&
+              fallback_cancelled.stop_reason == GenStopReason::kCancelled &&
+              fallback_cancelled.ids == std::vector<int32_t>{0},
+          "cancel after fallback hides tentative output", err);
 
     // Reject at each draft position. Later steps must ignore the stale KV
     // rows written for the rejected suffix and produce the greedy sequence.
@@ -242,8 +265,9 @@ int main(int argc, char** argv) {
     check(resumed_ok && same_output(resumed, greedy),
           "new run after cancellation matches greedy", err);
 
-    if (argc == 3 && !real_moss_checks(argv[1], argv[2])) return 2;
+    const bool moss_ok = argc != 3 || real_moss_checks(argv[1], argv[2]);
 
     shutdown_backend();
+    if (!moss_ok) return 2;
     return failures ? 1 : 0;
 }
