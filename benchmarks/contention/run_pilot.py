@@ -53,9 +53,11 @@ def cpu_count(cpu_list: str) -> int:
 
 def trace_events(log: Path, offset: int = 0) -> list[dict]:
     events = []
-    with log.open("r", errors="replace") as src:
+    # Callers pass byte offsets from stat(); text-mode seek needs tell() cookies.
+    with log.open("rb") as src:
         src.seek(offset)
-        for line in src:
+        for raw in src:
+            line = raw.decode("utf-8", "replace")
             if not line.startswith("[trace] "):
                 continue
             try:
@@ -137,6 +139,7 @@ def ws_short_commit(ws, audio: bytes, timeout_s: float, retry_s: float,
                     long_future: concurrent.futures.Future | None = None) -> dict:
     busy = 0
     partials = 0
+    first_commit_before_long_done = False
     try:
         ws.send(audio)
         start = time.perf_counter()  # stop/commit eligibility, after upload
@@ -174,10 +177,12 @@ def ws_short_commit(ws, audio: bytes, timeout_s: float, retry_s: float,
                 "first_commit_before_long_done": first_commit_before_long_done}
     except ConnectionClosed as exc:
         return {"status": "connection_lost", "error": str(exc),
-                "busy_responses": busy, "partials": partials}
+                "busy_responses": busy, "partials": partials,
+                "first_commit_before_long_done": first_commit_before_long_done}
     except ValueError as exc:
         return {"status": "invalid_message", "error": str(exc),
-                "busy_responses": busy, "partials": partials}
+                "busy_responses": busy, "partials": partials,
+                "first_commit_before_long_done": first_commit_before_long_done}
 
 
 def verdict(trials: list[dict]) -> dict:
