@@ -614,9 +614,10 @@ DeviceCache* get_device_cache(const QwenDecodeCtx& m, std::string& e) {
 //   kv_mode 0 = prefill exact (cpy slots [0,S), attend to new k/v)
 //   kv_mode 1 = decode exact-width (cpy slot `past`, attend [0, past+S))
 //   kv_mode 2 = decode full-capacity (set_rows slot `past`, attend [0, max_cache))
+//   kv_mode 3 = batched decode exact-width (copy S slots, attend [0, past+S))
 // idx_past is the runtime i32[1] write index used only by mode 2.
 // cs/sn are [D, S] bf16 (RoPE rows). mask is f32 [K, S] (K = past+S for modes
-// 0/1, max_cache for mode 2).
+// 0/1/3, max_cache for mode 2).
 ggml_tensor* append_layer_new(ggml_context* c, const QwenDecodeCtx& m, int li,
                               ggml_tensor* x_in, int64_t S, int64_t past,
                               ggml_tensor* cache_k, ggml_tensor* cache_v,
@@ -733,14 +734,14 @@ ggml_tensor* append_layer_new(ggml_context* c, const QwenDecodeCtx& m, int li,
         // we use directly as kall -> the set_rows executes before attention.
         kall = ggml_set_rows(c, cache_k, ff(c, k), idx_past);
         vall = ggml_set_rows(c, cache_v, ff(c, v), idx_past);
-    } else {                       // decode exact-width
-        ggml_tensor* kslot = ggml_view_3d(c, cache_k, D, 1, KV,
+    } else {                       // decode exact-width (S=1 or batched S)
+        ggml_tensor* kslot = ggml_view_3d(c, cache_k, D, S, KV,
                                           cache_k->nb[1], cache_k->nb[2],
                                           (size_t)past * cache_k->nb[1]);
-        ggml_tensor* vslot = ggml_view_3d(c, cache_v, D, 1, KV,
+        ggml_tensor* vslot = ggml_view_3d(c, cache_v, D, S, KV,
                                           cache_v->nb[1], cache_v->nb[2],
                                           (size_t)past * cache_v->nb[1]);
-        ggml_tensor* knew = ggml_cpy(c, k, kslot);  // writes slot `past`
+        ggml_tensor* knew = ggml_cpy(c, k, kslot);  // writes S slots from `past`
         ggml_tensor* vnew = ggml_cpy(c, v, vslot);
         ggml_tensor* kprev = ggml_view_3d(c, cache_k, D, past, KV,
                                           cache_k->nb[1], cache_k->nb[2], 0);
@@ -1024,13 +1025,19 @@ bool forward_verify(const QwenDecodeCtx& m, const std::vector<int32_t>& tokens,
         e = std::string(m.spec.label) + " verify exceeds cache";
         return false;
     }
+    // CPU greedy uses exact-width attention. Match that extent here; padded
+    // full-capacity reductions can flip a near-tie even with masked keys.
+    // GPU keeps its captured/full-capacity verifier graph.
+    const bool exact_width = !global_backend().is_gpu() &&
+                             env(m.spec, "_FULLCAP") == nullptr;
+    const int64_t mask_width = exact_width ? past + S : (int64_t)lc.max_cache;
     std::vector<int32_t> positions((size_t)S);
-    std::vector<float> mask((size_t)lc.max_cache * (size_t)S);
+    std::vector<float> mask((size_t)mask_width * (size_t)S);
     const float neg = -3.3895313892515355e38f;
     for (int64_t row = 0; row < S; ++row) {
         positions[(size_t)row] = (int32_t)(past + row);
-        for (int64_t key = 0; key < (int64_t)lc.max_cache; ++key)
-            mask[(size_t)row * lc.max_cache + (size_t)key] =
+        for (int64_t key = 0; key < mask_width; ++key)
+            mask[(size_t)row * (size_t)mask_width + (size_t)key] =
                 key <= past + row ? 0.0f : neg;
     }
     const bool F = use_f32_acts(m);
@@ -1044,12 +1051,13 @@ bool forward_verify(const QwenDecodeCtx& m, const std::vector<int32_t>& tokens,
                                               positions.data(), positions.size() * sizeof(int32_t));
         ggml_tensor* cs = ggml_get_rows(c, dc->rope_cos, pos);
         ggml_tensor* sn = ggml_get_rows(c, dc->rope_sin, pos);
-        int64_t mne[2] = {(int64_t)lc.max_cache, S};
+        int64_t mne[2] = {mask_width, S};
         ggml_tensor* mt = graph_input_tensor(c, GGML_TYPE_F32, 2, mne,
                                              mask.data(), mask.size() * sizeof(float));
         for (int li = 0; li < (int)lc.n_layers; ++li)
             x = append_layer_new(c, m, li, x, S, past, dc->k[li], dc->v[li],
-                                 cs, sn, mt, /*kv_mode=*/2, pos, nullptr);
+                                 cs, sn, mt, exact_width ? 3 : 2,
+                                 exact_width ? nullptr : pos, nullptr);
         ggml_tensor* n = F ? rmsf(c, m.loader, x, "llm.final_norm.weight", lc.rms_norm_eps)
                            : spec_rms(c, m.spec, m.loader, x, "llm.final_norm.weight", lc.rms_norm_eps);
         ggml_tensor* lg = lm_head_gemm(c, m.loader, m.spec, n);
