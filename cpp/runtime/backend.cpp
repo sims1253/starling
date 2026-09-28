@@ -31,6 +31,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -39,8 +40,15 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <thread>
 #include <vector>
+
+#ifdef _WIN32
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
 
 namespace {
 // F1 instrumentation gate. When on, ReplayGraph::compute prints a per-replay
@@ -146,15 +154,30 @@ static void maybe_export_graph(ggml_cgraph* graph, ggml_tensor* output,
     const char* directory = std::getenv("STARLING_GRAPH_EXPORT_DIR");
     if (!directory) return;
     if (!*directory) throw std::runtime_error("STARLING_GRAPH_EXPORT_DIR is empty");
+    // One-shot decoding can rebuild a graph for every token. Keep this
+    // diagnostic export bounded even when left enabled for a long session.
+    static constexpr unsigned long long kMaxSnapshots = 256;
+    static std::atomic<unsigned long long> sequence{0};
+    const auto number = sequence.fetch_add(1, std::memory_order_relaxed);
+    if (number >= kMaxSnapshots) {
+        if (number == kMaxSnapshots)
+            std::fprintf(stderr, "STARLING_GRAPH_EXPORT_DIR: reached %llu snapshots; export stopped\n",
+                         kMaxSnapshots);
+        return;
+    }
     std::vector<ggml_tensor*> captures;
     captures.reserve(pending_captures.size());
     for (const auto& capture : pending_captures) captures.push_back(capture.t);
-    static std::atomic<unsigned long long> sequence{0};
     const auto stamp = std::chrono::system_clock::now().time_since_epoch().count();
+#ifdef _WIN32
+    const auto pid = _getpid();
+#else
+    const auto pid = getpid();
+#endif
     const std::filesystem::path path =
         std::filesystem::path(directory) /
         ("graph-" + std::to_string(stamp) + "-" +
-         std::to_string(sequence.fetch_add(1, std::memory_order_relaxed)) + ".json");
+         std::to_string(pid) + "-" + std::to_string(number) + ".json");
     std::filesystem::create_directories(path.parent_path());
     const std::filesystem::path incomplete = path.string() + ".tmp";
     std::ofstream file(incomplete, std::ios::binary | std::ios::trunc);

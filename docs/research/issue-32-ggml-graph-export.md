@@ -32,9 +32,9 @@ it does not establish a result for a full Higgs or Hojo checkpoint.
 The exporter uses an iterative walk. A first recursive version crashed on
 the real one-shot graph chain; the test above now passes. Each snapshot is
 written to a temporary file and renamed only after a complete write. The
-switch creates one file for each graph build, so a long one-shot decode run
-can produce many files. With the switch absent, each graph build only checks
-the environment variable.
+switch creates one file for each graph build until the per-process cap, so a
+long one-shot decode run can produce many files. With the switch absent, each
+graph build only checks the environment variable.
 
 ## Why the verdict is still unknown
 
@@ -46,6 +46,13 @@ also depend on the selected backend and its numeric implementation. These
 facts block the proposed comparison of output expressions alone. The
 [inspector](../../scripts/verification/inspect_ggml_graphs.py) validates
 structure and always prints `equivalence=unknown`.
+
+Export errors from an explicitly enabled directory fail the graph build, so
+an incomplete snapshot cannot be mistaken for a successful verification run.
+At most 256 snapshots are written per process; the exporter warns once when
+the limit is reached. Run a shorter workload or a separate process if later
+graph shapes are needed. Snapshots from concurrent processes include their
+process IDs in filenames.
 
 The export follows the public ggml tensor fields and graph accessors:
 [`ggml_tensor` and `ggml_graph_node`](https://github.com/ggml-org/ggml/blob/e91ded11bdcd78c42f9c8d3978ff6686eb4c1226/include/ggml.h).

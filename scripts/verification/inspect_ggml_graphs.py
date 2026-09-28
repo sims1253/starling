@@ -19,7 +19,10 @@ HEX_PARAMS = re.compile(r"[0-9a-f]{128}\Z")
 def snapshot_paths(paths: list[Path]) -> list[Path]:
     found: list[Path] = []
     for path in paths:
-        found.extend(sorted(path.glob("*.json")) if path.is_dir() else [path])
+        matches = sorted(path.glob("*.json")) if path.is_dir() else [path]
+        if not matches:
+            raise ValueError(f"{path}: no graph snapshots found")
+        found.extend(matches)
     if not found:
         raise ValueError("no graph snapshots found")
     return found

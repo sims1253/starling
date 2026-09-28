@@ -18,7 +18,7 @@ void json_string(std::ostringstream& out, const char* value, size_t max_length =
     for (size_t i = 0; i < max_length && bytes[i]; ++i) {
         const unsigned char byte = bytes[i];
         if (byte == '"' || byte == '\\') out << '\\' << static_cast<char>(byte);
-        else if (byte < 0x20 || byte >= 0x80) {
+        else if (byte < 0x20) {
             char escaped[7];
             std::snprintf(escaped, sizeof(escaped), "\\u%04x", byte);
             out << escaped;

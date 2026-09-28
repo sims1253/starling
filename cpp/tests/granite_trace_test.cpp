@@ -202,6 +202,7 @@ static void replay_graph_checks() {
             ggml_tensor* x = starling::ggml::graph_input_tensor(
                 ctx, GGML_TYPE_F32, 1, (const int64_t[]){4}, in.data(),
                 in.size() * sizeof(float));
+            ggml_set_name(x, "r\u00e9play_input");
             return ggml_add(ctx, x, x);
         });
         std::vector<float> o;
