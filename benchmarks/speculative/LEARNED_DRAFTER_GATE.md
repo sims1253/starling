@@ -26,13 +26,22 @@ and long goldens. Those are exact-token oracle replays of only three fixtures,
 not device timing or a representative workload; see
 [the copy-draft study in PR #327](https://github.com/sims1253/starling/pull/327).
 The native S1 follow-up measured the entire CPU C API call, including source
-tokenization and proposal work, after #338 corrected the CPU verifier's
-attention width. At K=2, copy matched greedy and captured stock IDs/text on
+tokenization and proposal work, after #338 adopted per-row CPU verifier
+attention. At K=2, copy matched greedy and captured stock IDs/text on
 all three goldens; a K=4 synthetic protected fixture kept both protected
 spans. Across two warmed alternating pairs per case, copy/greedy latency was
-0.58–0.94×, with all eight pairs favoring copy. These are small CPU samples,
+0.66–0.92×, with all eight pairs favoring copy. These are small CPU samples,
 not Pixel, fast-engine, energy, or #310 results. #345 preserves the earlier
-full-capacity CPU run separately because it had different verifier behavior.
+full-capacity and bounded-batch CPU runs separately because their verifier
+behavior differs.
+
+A separate [native Parakeet-text to MOSS pilot #347](https://github.com/sims1253/starling/pull/347)
+used saved final Parakeet transcripts as already-available preview proxies.
+Its eight short/medium LibriSpeech-derived CPU pairs at K=2/4 matched greedy
+IDs/EOS and saved text, with 21.7–26.0% lower full MOSS-call time. This does
+not measure actual live partial text, newly run Parakeet inference, Pixel, or
+the earlier 12-clip FLEURS distribution. The different free-draft outcomes
+make workload and source-availability stratification part of the gate.
 
 For a fixed workload, let `A` be actual output tokens per verify pass,
 `V(K)` the measured full target verify-pass time, `D(K)` the full cost of
@@ -43,9 +52,11 @@ device and prompt distribution. It must also beat the *best free draft* with
 energy accounted per take. For S1 cleanup, even a zero-cost copy drafter at
 K=2 requires `V(2)/T1 < 1.375–1.495`; the replay alone cannot establish
 this, while the current native CPU call measurement does show a bounded
-S1-specific win. For standalone MOSS, a zero-cost Parakeet draft would
-require `V(2–3)/T1 < 1.03–1.05`. No target-device `V(K)`/`D(K)` curve or
-representative #310 result exists yet, so the CPU S1 result cannot justify a
+S1-specific win. For the earlier FLEURS standalone MOSS replay, a zero-cost
+Parakeet draft would require `V(2–3)/T1 < 1.03–1.05`; the LibriSpeech CPU
+pilot has different measured acceptance and cannot replace that bound. No
+target-device `V(K)`/`D(K)` curve or representative #310 result exists yet,
+so these CPU pilots cannot justify a
 learned-drafter speed, energy, or deployment claim.
 
 ## Candidate comparison
