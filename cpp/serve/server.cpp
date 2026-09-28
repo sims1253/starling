@@ -436,6 +436,10 @@ bool StarlingServer::run_with_turn(RequestContext* ctx, QueuePolicy policy,
             ctx->done = complete_request || !result_text;
             cancel_won = ctx->cancelled.load();
         }
+        // do_transcribe's next statement is run_with_turn(continuing=true),
+        // which consumes this reservation under this mutex on entry, before
+        // any wait, cancel or timeout exit. Failed or cancelled chunks never
+        // reserve, so no exit path can strand a slot.
         if (!complete_request && result_text && !cancel_won)
             ++reserved_continuations_;
         queue_cv_.notify_all();

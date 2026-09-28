@@ -114,12 +114,9 @@ GraniteChunkJob* create_granite_job(starling_ggml_ctx* ctx,
     if (!ctx || ctx->kind != STARLING_GGML_GRANITE || !ctx->model ||
         starling::ggml::shutting_down()) {
         return api_call(ctx, [&]() -> GraniteChunkJob* {
+            // A shutdown in progress is reported by require_running().
             require_running();
-            // Re-read the immutable context under the lock when reporting a
-            // rejected creation, rather than trusting the unlocked fast path.
-            set_global_error(ctx && ctx->kind == STARLING_GGML_GRANITE && ctx->model
-                                 ? "Granite job admission changed during validation"
-                                 : "Granite job requires a loaded Granite model");
+            set_global_error("Granite job requires a loaded Granite model");
             if (ctx) ctx->last_error = g_last_error;
             return nullptr;
         });

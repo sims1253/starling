@@ -29,8 +29,19 @@ def main() -> int:
                         help="candidate spec used for this run; defaults to the current final gate")
     args = parser.parse_args()
     spec = json.loads(SPEC.read_text())
-    serial_spec = ROOT / spec["baseline_spec"]
-    fair_spec = args.candidate_spec or ROOT / spec["candidate_spec"]
+    try:
+        serial_spec = ROOT / spec["baseline_spec"]
+        fair_spec = args.candidate_spec or ROOT / spec["candidate_spec"]
+        rule = spec["candidate_rule"]
+        for key in ("long_chunks", "short_latency_max_ratio_to_serial_mixed",
+                    "short_latency_min_saved_ms", "candidate_busy_responses_max",
+                    "long_wall_max_ratio_to_serial_mixed"):
+            rule[key]
+    except (KeyError, TypeError) as exc:
+        print(json.dumps({"status": "no_go_or_inconclusive",
+                          "reasons": [f"comparison spec invalid: {exc!r}"],
+                          "rule": None}, indent=2))
+        return 1
     serial = json.loads(args.serial.read_text())
     fair = json.loads(args.fair.read_text())
     reasons: list[str] = []
@@ -46,7 +57,6 @@ def main() -> int:
     if len(serial_trials) != 6 or len(fair_trials) != 6:
         reasons.append("both arms require all six scored trials")
     else:
-        rule = spec["candidate_rule"]
         for i in range(3):
             si, sm = serial_trials[2 * i:2 * i + 2]
             fi, fm = fair_trials[2 * i:2 * i + 2]
@@ -122,7 +132,7 @@ def main() -> int:
             if fair_wall_ms > rule["long_wall_max_ratio_to_serial_mixed"] * serial_wall_ms:
                 reasons.append(f"{tag}: fair long throughput bound missed")
     result = {"status": "pilot_pass" if not reasons else "no_go_or_inconclusive",
-              "reasons": reasons, "rule": spec["candidate_rule"]}
+              "reasons": reasons, "rule": rule}
     print(json.dumps(result, indent=2))
     return 0 if not reasons else 1
 

@@ -190,7 +190,7 @@ struct GraniteChunkJob {
             if ((int64_t) budget > headroom)
                 budget = (int32_t) std::max<int64_t>(1, headroom);
         }
-        double piece_ms[granite::kStageCount] = {0, 0, 0};
+        double piece_ms[granite::kStageCount] = {};
         std::string text;
         const bool tr_on = starling::ggml::trace::on();
         const auto t0 = std::chrono::steady_clock::now();
@@ -235,6 +235,9 @@ struct GraniteChunkJob {
 
 GraniteChunkJob* granite_job_create_impl(void* model, const float* pcm,
                                           int64_t n, const char** err) {
+    // Creation runs before the caller holds the runtime lock, so it must not
+    // write the shared ctx->err. The message stays valid on this thread until
+    // the next failed creation; callers copy it immediately.
     static thread_local char create_error[2048];
     auto* ctx = static_cast<GraniteCtx*>(model);
     if (!ctx) { report(err, "null GRANITE handle"); return nullptr; }
