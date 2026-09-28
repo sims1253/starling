@@ -42,6 +42,15 @@ def free_port() -> int:
         return sock.getsockname()[1]
 
 
+def cpu_count(cpu_list: str) -> int:
+    """Count CPUs in a taskset list such as ``16-23`` or ``0,2,4-7``."""
+    total = 0
+    for part in cpu_list.split(","):
+        first, _, last = part.partition("-")
+        total += int(last or first) - int(first) + 1
+    return total
+
+
 def trace_events(log: Path, offset: int = 0) -> list[dict]:
     events = []
     with log.open("r", errors="replace") as src:
@@ -150,12 +159,14 @@ def ws_short_commit(ws, audio: bytes, timeout_s: float, retry_s: float,
             elif kind == "error" and message.get("message") == "server busy":
                 busy += 1
                 time.sleep(min(retry_s, max(0, deadline - time.perf_counter())))
+                if time.perf_counter() >= deadline:
+                    break
                 ws.send('{"type":"commit"}')
             elif kind == "error":
                 return {"status": "error", "message": message.get("message"),
                         "busy_responses": busy, "partials": partials,
                         "first_commit_before_long_done": first_commit_before_long_done}
-        return {"status": "timeout", "busy_responses": busy,
+        return {"status": "timeout", "busy_responses": busy, "partials": partials,
                 "first_commit_before_long_done": first_commit_before_long_done}
     except TimeoutError as exc:
         return {"status": "timeout", "error": str(exc),
@@ -232,12 +243,13 @@ def main() -> int:
     base_url = f"http://127.0.0.1:{port}"
     env = os.environ.copy()
     env["STARLING_TRACE"] = "1"
-    env["OMP_NUM_THREADS"] = "8"
+    env["OMP_NUM_THREADS"] = str(cpu_count(args.cpu_list))
     command = ["taskset", "-c", args.cpu_list, str(args.binary), "--model", "granite",
                "--gguf", str(args.gguf), "--port", str(port), *args.server_arg]
     summary = {
         "schema_version": 1, "spec_sha256": sha256_file(args.spec),
         "run_utc": datetime.now(timezone.utc).isoformat(), "cpu_affinity": args.cpu_list,
+        "omp_num_threads": env["OMP_NUM_THREADS"],
         "host_load_before": os.getloadavg(), "binary": str(args.binary),
         "model": str(args.gguf), "server_command": command, "trials": [],
     }
