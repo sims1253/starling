@@ -44,6 +44,8 @@ They exclude the cost of producing those oracle IDs. A copy or CTC proposer
 needs a separate full-cost benchmark before runtime enablement. One run does
 not establish stable throughput or energy savings. Vulkan and Pixel
 measurements remain open.
+The 12-token MOSS timing predates the CPU verifier correction below and is
+historical oracle evidence, not a current performance measurement.
 
 ## CPU verifier attention-width correction
 
@@ -58,14 +60,20 @@ snapshot `de575db64086f84fdc79da4932d1076e965bc546` and has SHA-256
 The optional-CTC-head GGUF used in that check has SHA-256
 `cec47a4fb872ace2713447409f01e0f9ef0d2a7f217db8bb9c33ea0ef96c916a`.
 
-The CPU verifier now copies the S candidate KV rows and attends to exactly
-`past + S` keys, matching greedy CPU's attention extent. With that change,
-K=1, 2, and 4 each produced the same 98 IDs and stop result as greedy on
-this clip. `STARLING_GRANITE_FULLCAP=1` retains the full-capacity verifier
+The CPU verifier now copies the S candidate KV rows and bounds the batched
+attention tensor to `past + S` keys, the extent of its final row. Earlier rows
+causally mask later keys but still reduce over that batch width, whereas
+greedy uses a separately sized attention tensor at each token. This change
+fixed the observed Granite case: K=1, 2, and 4 each produced the same 98 IDs
+and stop result as greedy on that clip. `STARLING_GRANITE_FULLCAP=1` retains
+the full-capacity verifier
 when the greedy path explicitly selects full-capacity attention; the GPU
 verifier also keeps its existing graph. The real check uses the
 `granite_ctc_verify_test` harness from the stacked #313 work, which adds a
 CTC draft source and is not part of the generic verifier. The self-synthesized
 `speculative_verifier_test` also passed after the correction. This one clip
-confirms the fixed mismatch; other models and devices still need their own
-parity checks.
+confirms the fixed mismatch, not universal greedy parity. A separate medium
+BF16 MOSS/LibriSpeech CPU case still diverges: greedy stops after 89 IDs,
+while a K=2 Parakeet-text copy draft produces 91 IDs. Its first mismatch is
+at zero-based output index 21. The cause remains under diagnosis; no MOSS
+runtime enablement follows from the short MOSS or Granite passes.

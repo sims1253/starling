@@ -614,7 +614,8 @@ DeviceCache* get_device_cache(const QwenDecodeCtx& m, std::string& e) {
 //   kv_mode 0 = prefill exact (cpy slots [0,S), attend to new k/v)
 //   kv_mode 1 = decode exact-width (cpy slot `past`, attend [0, past+S))
 //   kv_mode 2 = decode full-capacity (set_rows slot `past`, attend [0, max_cache))
-//   kv_mode 3 = batched decode exact-width (copy S slots, attend [0, past+S))
+//   kv_mode 3 = batched decode bounded-width (copy S slots, attend [0, past+S),
+//               causally mask later keys for each earlier query row)
 // idx_past is the runtime i32[1] write index used only by mode 2.
 // cs/sn are [D, S] bf16 (RoPE rows). mask is f32 [K, S] (K = past+S for modes
 // 0/1/3, max_cache for mode 2).
@@ -734,7 +735,7 @@ ggml_tensor* append_layer_new(ggml_context* c, const QwenDecodeCtx& m, int li,
         // we use directly as kall -> the set_rows executes before attention.
         kall = ggml_set_rows(c, cache_k, ff(c, k), idx_past);
         vall = ggml_set_rows(c, cache_v, ff(c, v), idx_past);
-    } else {                       // decode exact-width (S=1 or batched S)
+    } else {                       // single-step prefix or bounded batched prefix
         ggml_tensor* kslot = ggml_view_3d(c, cache_k, D, S, KV,
                                           cache_k->nb[1], cache_k->nb[2],
                                           (size_t)past * cache_k->nb[1]);
@@ -1025,8 +1026,10 @@ bool forward_verify(const QwenDecodeCtx& m, const std::vector<int32_t>& tokens,
         e = std::string(m.spec.label) + " verify exceeds cache";
         return false;
     }
-    // CPU greedy uses exact-width attention. Match that extent here; padded
-    // full-capacity reductions can flip a near-tie even with masked keys.
+    // CPU greedy uses a populated-prefix attention width on each step. Bound
+    // this batch by its final populated prefix; earlier rows still reduce
+    // over the batch width with future keys masked, so ID parity needs tests.
+    // Full-capacity reductions flipped a near-tie in one Granite case.
     // GPU keeps its captured/full-capacity verifier graph.
     const bool exact_width = !global_backend().is_gpu() &&
                              env(m.spec, "_FULLCAP") == nullptr;
