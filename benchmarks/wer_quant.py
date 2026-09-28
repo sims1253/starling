@@ -71,9 +71,7 @@ def _active_device() -> str:
 def _loaded_engine_path() -> Path | None:
     """Resolve the library ctypes actually selected after its fallback search."""
     from starling._ggml import _native
-    lib = _native._load_lib()
-    name = getattr(lib, "_name", None)
-    return Path(name).resolve() if name else None
+    return _native.loaded_library_path()
 
 
 def main() -> int:
