@@ -113,8 +113,8 @@ def main() -> None:
         t4 = stamp()
         budget = min(args.max_new_tokens, pipeline.llm.max_cache_len - prompt.shape[1] + 1)
         if budget < 1:
-            ap.error(f"prompt {prompt.shape[1]} leaves no generation budget "
-                     f"(max_cache_len={pipeline.llm.max_cache_len})")
+            raise RuntimeError(f"prompt {prompt.shape[1]} leaves no generation budget "
+                               f"(max_cache_len={pipeline.llm.max_cache_len})")
         if method == "target":
             result = pipeline.llm.generate(prompt, max_new_tokens=budget,
                                            eos_token_id=LLM_EOS_TOKEN_ID)

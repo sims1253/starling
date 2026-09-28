@@ -355,7 +355,9 @@ def measure_granite(clips: list[tuple[np.ndarray, int, str]],
     else:
         from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
         model = AutoModelForSpeechSeq2Seq.from_pretrained(
-            snapshot, device_map="cuda", dtype=torch.bfloat16,
+            snapshot,
+            device_map="cuda" if torch.cuda.is_available() else "cpu",
+            dtype=torch.bfloat16,
             attn_implementation="eager").eval()
         processor = AutoProcessor.from_pretrained(snapshot)
     comps = get_components(model)
