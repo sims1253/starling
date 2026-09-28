@@ -61,6 +61,34 @@ def _sanitizer_result(log: Path, tool: str) -> str | None:
     return f"missing clean {tool} summary"
 
 
+def _terminate_tree(process: subprocess.Popen, platform: str | None = None) -> None:
+    """Stop the sanitizer and pytest descendants before the next GPU tool runs."""
+    platform = platform or os.name
+    if platform == "posix":
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    elif platform == "nt":
+        try:
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(process.pid)],
+                           check=False, capture_output=True, timeout=15)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        if process.poll() is None:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+    else:
+        process.kill()
+    try:
+        process.wait(timeout=15)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=15)
+
+
 def run_tool(
     sanitizer: str, tool: str, output_dir: Path, timeout_seconds: int,
     *, test: Path = TEST, expected_tests: int = EXPECTED_TESTS, cwd: Path = ROOT,
@@ -78,6 +106,7 @@ def run_tool(
     env.pop("PYTEST_ADDOPTS", None)
     env.pop("PYTEST_PLUGINS", None)
     env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
+    process = None
     try:
         with log.open("w") as output:
             process = subprocess.Popen(
@@ -87,23 +116,23 @@ def run_tool(
             try:
                 exit_code = process.wait(timeout=timeout_seconds)
             except subprocess.TimeoutExpired:
-                if os.name == "posix":
-                    try:
-                        os.killpg(process.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                else:
-                    process.kill()
-                process.wait()
+                _terminate_tree(process)
                 return {
                     "status": "timeout", "exit_code": None, "executed_tests": 0,
                     "log": str(log), "report": str(report),
                     "reason": f"timed out after {timeout_seconds} seconds",
                 }
     except OSError as exc:
+        cleanup_error = None
+        if process is not None:
+            try:
+                _terminate_tree(process)
+            except (OSError, subprocess.TimeoutExpired) as error:
+                cleanup_error = f"; cleanup failed: {error}"
         return {
             "status": "fail", "exit_code": None, "executed_tests": 0,
-            "log": str(log), "report": str(report), "reason": f"launch failed: {exc}",
+            "log": str(log), "report": str(report),
+            "reason": f"sanitizer process failed: {exc}{cleanup_error or ''}",
         }
 
     executed, report_error = _report_result(report, expected_tests)

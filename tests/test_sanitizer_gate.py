@@ -2,9 +2,17 @@
 
 from __future__ import annotations
 
+import importlib.util
 from pathlib import Path
+from unittest.mock import Mock
 
-from scripts.sanitizer_gate import _sanitizer_result, run_tool
+SPEC = importlib.util.spec_from_file_location(
+    "sanitizer_gate", Path(__file__).resolve().parents[1] / "scripts/sanitizer_gate.py"
+)
+sanitizer_gate = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(sanitizer_gate)
+_sanitizer_result = sanitizer_gate._sanitizer_result
+run_tool = sanitizer_gate.run_tool
 
 
 def _fake_sanitizer(tmp_path: Path) -> Path:
@@ -20,7 +28,7 @@ def _fake_sanitizer(tmp_path: Path) -> Path:
         '"$@"\n'
         "result=$?\n"
         "if [ \"$FAKE_SANITIZER_MODE\" = finding ]; then\n"
-        "  echo '========= ERROR SUMMARY: 1 errors'\n"
+        "  echo '========= ERROR SUMMARY: 1 error'\n"
         "  exit 86\n"
         "fi\n"
         "echo '========= ERROR SUMMARY: 0 errors'\n"
@@ -85,3 +93,27 @@ def test_any_nonzero_summary_fails_even_after_a_clean_summary(tmp_path: Path) ->
         "RACECHECK SUMMARY: 1 hazard displayed (1 error, 0 warnings)\n"
     )
     assert _sanitizer_result(log, "racecheck") is not None
+
+
+def test_windows_timeout_kills_the_sanitizer_tree(monkeypatch) -> None:
+    process = Mock(pid=1234)
+    process.poll.return_value = 0
+    monkeypatch.setattr(sanitizer_gate.subprocess, "run", Mock())
+    sanitizer_gate._terminate_tree(process, platform="nt")
+    sanitizer_gate.subprocess.run.assert_called_once_with(
+        ["taskkill", "/T", "/F", "/PID", "1234"],
+        check=False, capture_output=True, timeout=15,
+    )
+    process.wait.assert_called_once_with(timeout=15)
+
+
+def test_post_launch_oserror_reaps_the_process(tmp_path: Path, monkeypatch) -> None:
+    process = Mock(pid=4321)
+    process.wait.side_effect = [OSError("wait failed"), 0]
+    monkeypatch.setattr(sanitizer_gate.subprocess, "Popen", Mock(return_value=process))
+    cleanup = Mock()
+    monkeypatch.setattr(sanitizer_gate, "_terminate_tree", cleanup)
+    result = run_tool("compute-sanitizer", "memcheck", tmp_path, 30)
+    assert result["status"] == "fail"
+    assert "wait failed" in result["reason"]
+    cleanup.assert_called_once_with(process)
