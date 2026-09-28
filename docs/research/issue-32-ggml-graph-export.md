@@ -58,6 +58,11 @@ the limit is reached. Run a shorter workload or a separate process if later
 graph shapes are needed. Snapshots from concurrent processes include their
 process IDs in filenames.
 
+The fixed-width `op_params_hex` field and the full `src` slot walk are
+deterministic only because the pinned ggml's `ggml_new_tensor_impl`
+zero-initializes the whole tensor struct. Recheck that after any ggml bump: a
+change there would add noise to every snapshot diff rather than fail loudly.
+
 The export follows the public ggml tensor fields and graph accessors:
 [`ggml_tensor` and `ggml_graph_node`](https://github.com/ggml-org/ggml/blob/e91ded11bdcd78c42f9c8d3978ff6686eb4c1226/include/ggml.h).
 Starling's [one-shot build](../../cpp/runtime/backend.cpp) and replay build

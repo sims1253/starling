@@ -23,8 +23,6 @@ def snapshot_paths(paths: list[Path]) -> list[Path]:
         if not matches:
             raise ValueError(f"{path}: no graph snapshots found")
         found.extend(matches)
-    if not found:
-        raise ValueError("no graph snapshots found")
     return found
 
 

@@ -21,6 +21,8 @@ int main() {
     ggml_free(ctx);
     const bool valid_utf8_preserved = json.find("r\xc3\xa9play_input") != std::string::npos;
     const bool invalid_byte_escaped = json.find("bad-\\u00ff") != std::string::npos;
+    if (!valid_utf8_preserved) std::printf("valid UTF-8 name not preserved:\n%s\n", json.c_str());
+    if (!invalid_byte_escaped) std::printf("invalid byte not escaped:\n%s\n", json.c_str());
     std::printf("graph snapshot UTF-8: %s\n",
                 valid_utf8_preserved && invalid_byte_escaped ? "PASS" : "FAIL");
     return valid_utf8_preserved && invalid_byte_escaped ? 0 : 1;
