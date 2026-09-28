@@ -77,7 +77,7 @@ jobs:
           tests/test_server_lifecycle.py tests/test_server_websocket.py
           tests/test_server_client.py tests/test_stream_chunk.py
           tests/test_native_parity_contract.py
-          tests/test_s1_quant_spans.py
+          tests/test_s1_quant_spans.py tests/test_s1_pixel_runner.py
           docs/evidence/pixel-s1-2026-09-28/controlled/test_controlled.py
 
       - name: Validate Pixel CPU residency evidence
