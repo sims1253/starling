@@ -55,3 +55,5 @@ All five requests returned HTTP 200 and traced exactly three chunks. The fair ch
 ## Scope and limits
 
 The flag remains opt-in and the engine still executes at most one chunk at a time under the C API runtime lock. Cancellation and timeout discard partial transcripts. No user audio or personal data was used. Three matched CPU pairs cannot establish a latency distribution, GPU behavior, multi-session overload fairness, or correctness across every audio/model combination. The broader workload matrix remains in [#174](https://github.com/sims1253/starling/issues/174).
+
+This pilot uses FIFO turns; it does not implement #178's interactive priority with aging or weighted fairness. The measurements also do not bound starvation under sustained arrivals. Those scheduler and workload requirements remain follow-up gates before #178 can be considered complete or the flag can become a default. `pilot_pass` applies only to the paired CPU rule above.
