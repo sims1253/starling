@@ -770,12 +770,38 @@ ggml_tensor* append_layer_new(ggml_context* c, const QwenDecodeCtx& m, int li,
         // fp16-capable iGPU outruns the staging tax on these small GEMVs).
         // In F mode q was rounded after rope (one tiny cast) and joined
         // feeds linf, whose f32() is exact.
-        ggml_tensor* sc = ggml_mul_mat(c, kall, q);                 // [K, S, H]
-        sc = bf(c, ggml_scale(c, ff(c, sc), scale));
-        ggml_tensor* pr = bf(c, ggml_soft_max_ext(c, ff(c, sc), ff(c, mask), 1.0f, 0.0f));
-        // context = V^T @ probs: permute vall [D,K,KV] -> [K,D,KV], GQA broadcast.
-        ggml_tensor* vt = ggml_cont(c, ggml_permute(c, vall, 1, 0, 2, 3));  // [K, D, KV]
-        ggml_tensor* co = ggml_mul_mat(c, vt, pr);                 // [D, S, H]
+        ggml_tensor* co = nullptr;
+        if (kv_mode == 3 && env(m.spec, "_VERIFY_ROW_ATTN")) {
+            // #313 diagnosis only: each batched verifier query sees the
+            // exact prefix that a greedy single-token decode sees. Batched
+            // projections and KV writes remain unchanged to isolate width.
+            for (int64_t row = 0; row < S; ++row) {
+                const int64_t width = past + row + 1;
+                ggml_tensor* qr = ggml_view_3d(c, q, D, 1, H,
+                                                q->nb[1], q->nb[2],
+                                                (size_t)row * q->nb[1]);
+                ggml_tensor* kr = ggml_view_3d(c, kall, D, width, KV,
+                                                kall->nb[1], kall->nb[2], 0);
+                ggml_tensor* vr = ggml_view_3d(c, vall, D, width, KV,
+                                                vall->nb[1], vall->nb[2], 0);
+                ggml_tensor* mr = ggml_view_2d(c, mask, width, 1,
+                                                mask->nb[1],
+                                                (size_t)row * mask->nb[1]);
+                ggml_tensor* sc = ggml_mul_mat(c, kr, qr);
+                sc = bf(c, ggml_scale(c, ff(c, sc), scale));
+                ggml_tensor* pr = bf(c, ggml_soft_max_ext(c, ff(c, sc), ff(c, mr), 1.0f, 0.0f));
+                ggml_tensor* vt = ggml_cont(c, ggml_permute(c, vr, 1, 0, 2, 3));
+                ggml_tensor* one = ggml_mul_mat(c, vt, pr);
+                co = co ? ggml_concat(c, co, one, 1) : one;
+            }
+        } else {
+            ggml_tensor* sc = ggml_mul_mat(c, kall, q);             // [K, S, H]
+            sc = bf(c, ggml_scale(c, ff(c, sc), scale));
+            ggml_tensor* pr = bf(c, ggml_soft_max_ext(c, ff(c, sc), ff(c, mask), 1.0f, 0.0f));
+            // context = V^T @ probs: permute vall [D,K,KV] -> [K,D,KV], GQA broadcast.
+            ggml_tensor* vt = ggml_cont(c, ggml_permute(c, vall, 1, 0, 2, 3));
+            co = ggml_mul_mat(c, vt, pr);
+        }
         // heads -> features: [D,S,H] -> [D,H,S] -> [D*H, S]. Spelled
         // relationally: voxtral's q-width (D*H = 4096) is WIDER than its
         // hidden (3072); the o_proj weight (ne0 = D*H) takes it from here.
