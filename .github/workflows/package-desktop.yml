@@ -13,6 +13,9 @@ on:
       retention-days:
         type: number
         default: 14
+      run-tests:
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -54,7 +57,7 @@ jobs:
             apps/desktop-gpui/target
           key: desktop-${{ runner.os }}-${{ steps.rust.outputs.version }}-${{ hashFiles('apps/desktop-gpui/Cargo.lock') }}
       - name: Test the workspace
-        if: matrix.platform == 'linux'
+        if: matrix.platform == 'linux' && inputs.run-tests
         working-directory: apps/desktop-gpui
         run: cargo test --locked --workspace
       - name: Build the app

@@ -104,10 +104,16 @@ jobs:
             exit 1
           fi
           if [ "$EXPERIMENTAL" = true ]; then
-            # Separate application ID: its monotonic code cannot block stable updates.
-            test "$GITHUB_RUN_NUMBER" -gt 0 && test "$GITHUB_RUN_NUMBER" -lt 2147483647
+            # Independent of the workflow run counter, which resets if the
+            # caller workflow is recreated. Seconds since 2020 fit Android's
+            # versionCode limit through 2088.
+            code=$(( $(date -u +%s) - 1577836800 ))
+            if (( code <= 0 || code >= 2147483647 )); then
+              echo "::error::Experimental versionCode $code is outside Android's range"
+              exit 1
+            fi
             echo "name=$name" >> "$GITHUB_OUTPUT"
-            echo "code=$GITHUB_RUN_NUMBER" >> "$GITHUB_OUTPUT"
+            echo "code=$code" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           major=$((10#${BASH_REMATCH[1]})); minor=$((10#${BASH_REMATCH[2]})); patch=$((10#${BASH_REMATCH[3]}))

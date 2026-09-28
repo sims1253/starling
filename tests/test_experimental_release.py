@@ -95,9 +95,12 @@ with Path("calls").open("a") as log:
     log.write(json.dumps(args) + "\\n")
 command = args[1]
 if os.environ.get("FAIL_COMMAND") == command:
+    print("authentication failed", file=sys.stderr)
     sys.exit(1)
 if command == "view":
-    if not state.exists(): sys.exit(1)
+    if not state.exists():
+        print("release not found", file=sys.stderr)
+        sys.exit(1)
     print("true" if state.read_text() == "draft" else "false")
 elif command == "create":
     assert "--draft" in args and "--prerelease" in args and "--latest=false" in args
@@ -146,6 +149,13 @@ else:
     def test_failed_create_never_uploads(self):
         self.assertNotEqual(self.publish(fail="create").returncode, 0)
         self.assertFalse((self.root / "uploaded").exists())
+
+    def test_failed_lookup_never_creates_or_uploads(self):
+        result = self.publish(fail="view")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("authentication failed", result.stderr)
+        calls = [json.loads(line) for line in (self.root / "calls").read_text().splitlines()]
+        self.assertEqual([call[1] for call in calls], ["view"])
 
     def test_failed_publish_can_resume(self):
         self.assertNotEqual(self.publish(fail="edit").returncode, 0)

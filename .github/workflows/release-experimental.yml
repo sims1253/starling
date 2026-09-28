@@ -12,13 +12,17 @@ permissions:
 # none moves a shared tag or replaces another run's downloads.
 jobs:
   prepare:
-    if: github.ref == 'refs/heads/master'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
       tag: ${{ steps.version.outputs.tag }}
       version: ${{ steps.version.outputs.version }}
     steps:
+      - name: Require master
+        if: github.ref != 'refs/heads/master'
+        run: |
+          echo '::error::Experimental releases must run from master.'
+          exit 1
       - name: Check persistent Android signing configuration
         env:
           KEYSTORE: ${{ secrets.STARLING_ANDROID_KEYSTORE_BASE64 }}
@@ -72,6 +76,7 @@ jobs:
     with:
       source-ref: ${{ github.sha }}
       retention-days: 3
+      run-tests: false # desktop-gpui-rust already tests this commit on master
 
   publish:
     needs: [prepare, servers, android, desktop]

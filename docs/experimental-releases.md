@@ -121,8 +121,8 @@ startup; it does not prove GPU inference or microphone behavior on your hardware
 
 `.github/workflows/release-experimental.yml` calls the same server and Android
 build workflows used by tagged releases, plus the shared desktop packager.
-All checkouts use the triggering commit. The Android version code uses the
-experimental workflow's increasing run number, independent of stable versions.
+All checkouts use the triggering commit. The Android version code uses seconds
+since 2020 UTC, independent of workflow run numbers and stable versions.
 
 Each run owns an `experimental-<run-number>-<commit>` tag. There is no moving
 tag. The publisher checks for all nine packages, computes checksums, uploads
