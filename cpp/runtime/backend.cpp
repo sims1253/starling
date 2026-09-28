@@ -13,6 +13,7 @@
 #include "cpu_repack.hpp"
 
 #include "graph.hpp"
+#include "graph_snapshot.hpp"
 #include "imatrix.hpp"
 #include "lru_cache.hpp"
 #include "model_loader.hpp"
@@ -33,6 +34,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -135,6 +138,32 @@ bool imatrix_eval_cb(ggml_tensor* t, bool ask, void* /*user_data*/) {
 }
 
 } // namespace
+
+static void maybe_export_graph(ggml_cgraph* graph, ggml_tensor* output,
+                               const char* device,
+                               const std::vector<PendingCapture>& pending_captures,
+                               const std::vector<ggml_tensor*>& side_effect_roots) {
+    const char* directory = std::getenv("STARLING_GRAPH_EXPORT_DIR");
+    if (!directory) return;
+    if (!*directory) throw std::runtime_error("STARLING_GRAPH_EXPORT_DIR is empty");
+    std::vector<ggml_tensor*> captures;
+    captures.reserve(pending_captures.size());
+    for (const auto& capture : pending_captures) captures.push_back(capture.t);
+    static std::atomic<unsigned long long> sequence{0};
+    const auto stamp = std::chrono::system_clock::now().time_since_epoch().count();
+    const std::filesystem::path path =
+        std::filesystem::path(directory) /
+        ("graph-" + std::to_string(stamp) + "-" +
+         std::to_string(sequence.fetch_add(1, std::memory_order_relaxed)) + ".json");
+    std::filesystem::create_directories(path.parent_path());
+    const std::filesystem::path incomplete = path.string() + ".tmp";
+    std::ofstream file(incomplete, std::ios::binary | std::ios::trunc);
+    if (!file) throw std::runtime_error("cannot open graph snapshot: " + path.string());
+    file << graph_snapshot_json(graph, output, device, captures, side_effect_roots);
+    file.close();
+    if (!file) throw std::runtime_error("cannot write graph snapshot: " + path.string());
+    std::filesystem::rename(incomplete, path);
+}
 
 // --------------------------------------------------------------------------- //
 // Backend::Impl
@@ -386,6 +415,7 @@ bool Backend::compute(const std::function<ggml_tensor*(ggml_context*)>& build,
     for (const auto& c : pcap) ggml_build_forward_expand(gf, c.t);
     // Side-effect roots (decode-state write-backs): expand so they execute.
     for (ggml_tensor* r : roots) ggml_build_forward_expand(gf, r);
+    maybe_export_graph(gf, out_t, device_name(), pcap, roots);
 
     // CPU backend: opt weights this graph uses only as MUL_MAT src0 into
     // ggml's repacked kernels before anything is planned (cpu_repack.hpp).
@@ -636,6 +666,7 @@ ReplayGraph::ReplayGraph(Backend& backend,
             // Side-effect roots (Wave D decode-state write-backs into persistent
             // device buffers): expand so they execute each replay without readback.
             for (ggml_tensor* r : roots) ggml_build_forward_expand(gf_, r);
+            maybe_export_graph(gf_, out_, backend_.device_name(), pcap, roots);
             // Record inputs + captures in registration order (kept across calls).
             for (const auto& in : pin) {
                 inputs_.push_back(in.t);
