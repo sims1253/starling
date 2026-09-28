@@ -1,9 +1,9 @@
 {
   "schema_version": 1,
   "purpose": "Preregistered opt-in Granite chunk-fairness candidate, same app-ready six-trial #174 workload",
-  "source_revision": "98baa00",
+  "source_revision": "4121728",
   "ggml_revision": "e91ded11bdcd78c42f9c8d3978ff6686eb4c1226",
-  "server_binary_sha256": "ec275f605698cf2eeb1214757416d8dd5b7dd99784faf1462d89c8831bfb453d",
+  "server_binary_sha256": "42e90a5b75c69662542b1d7518791782cc29e7ec460a1000ace3d38e8c81b0dc",
   "model_sha256": "b72a01687daa1825894bd5ea3e4c53f6be657a9ba31c5cd65c5114c5b6b961e2",
   "model_slug": "granite",
   "short_wav_sha256": "5fceacff0315d49cb59fcc505bcecf1ed5f2f35c2897b1e65a59f30e5d922150",
@@ -25,5 +25,6 @@
   "comparison_spec": "benchmarks/contention/fairness_comparison_spec.json",
   "server_args": [
     "--granite-chunk-fairness"
-  ]
+  ],
+  "amendment_1": "After all app-ready serial baseline trials and before any fair-arm timing, candidate implementation fixed a continuation admission-slot race and removed an unnecessary runtime-mutex acquisition before short WS ticket entry. Candidate binary was rebuilt from commit 4121728 and rehashed. The six-trial sequence, audio, cores, readiness barrier and numerical comparison thresholds in fairness_comparison_spec.json are unchanged."
 }
