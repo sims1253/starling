@@ -82,6 +82,17 @@ class RunnerStateTests(unittest.TestCase):
             self.assertEqual(exit_code.exception.code, 2)
             self.assertFalse(output.exists())
 
+    def test_existing_process_output_is_never_overwritten(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "preflight-1-greedy"
+            output.mkdir()
+            marker = output / "record.json"
+            marker.write_text("sealed")
+            with patch.object(runner, "OUTPUT_ROOT", Path(directory)):
+                with self.assertRaises(FileExistsError):
+                    runner.run_process("preflight", 1, "greedy", {}, 0)
+            self.assertEqual(marker.read_text(), "sealed")
+
 
 if __name__ == "__main__":
     unittest.main()
