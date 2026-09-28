@@ -1,4 +1,4 @@
-# NVIDIA Model Optimizer: ideas Starling can use beyond CUDA
+# Model Optimizer and Unsloth: portable ideas for Starling
 
 Reviewed [NVIDIA Model Optimizer at `23355eda9`](https://github.com/NVIDIA/Model-Optimizer/tree/23355eda90a25c290f9b1fdfb928ad54caae7d10)
 against Starling's [quantization path](../quantization.md) and native ggml
@@ -49,3 +49,34 @@ with pinned ggml, check decoded values and metadata, and compare layer output
 error on held-out inputs against Starling's current imatrix recipe. Only after
 that parity check should a whole-model mixed-format search or QAD run be considered.
 No ModelOpt dependency, model rewrite, or runtime change is proposed here.
+
+## Unsloth: deployment and training paths
+
+Reviewed the [Unsloth documentation](https://unsloth.ai/docs) on 2026-09-28.
+Its [Dynamic 3.0 GGUF description](https://unsloth.ai/docs/basics/dynamic-3.0-ggufs)
+reports a more varied importance-matrix calibration corpus, improved layer
+selection, and post-training quantization (PTQ). It explicitly says Dynamic
+3.0 uses neither quantization-aware training (QAT) nor quantization-aware
+distillation (QAD). Its published Qwen3.8 results are vendor measurements on
+an LLM; they do not establish a gain for Starling's ASR models or Pixel
+runtime. The public imatrix makes a candidate calibration input available,
+but the cited page does not provide a complete recipe or implementation for
+reproducing its layer-selection decisions. The ordinary
+[`save_pretrained_gguf` export](https://unsloth.ai/docs/basics/inference-and-deployment/saving-to-gguf)
+must not be assumed to reproduce Dynamic 3.0.
+
+| Unsloth technique | Relevance and boundary for Starling |
+| --- | --- |
+| Dynamic layer formats and imatrix calibration | Another candidate recipe for [#316](https://github.com/sims1253/starling/issues/316). Compare per-layer formats and calibration on the *same* model and held-out set, then measure resident bytes, Pixel latency, and WER. Dynamic 3.0's Qwen-oriented coding/chat corpus cannot substitute for representative ASR input. |
+| [Held-out 32-token divergence and KL divergence](https://unsloth.ai/docs/basics/dynamic-3.0-ggufs#divergence-300-32) | Useful secondary diagnostics for Starling's text decoder: a one-token agreement rate can conceal trajectory drift. Keep [#50](https://github.com/sims1253/starling/issues/50) WER/CER, critical spans, and protected text as the deployment gates. Separate calibration from evaluation, and retain the same prompt template and decoding rules for baseline and candidate. |
+| [GGUF export](https://unsloth.ai/docs/basics/inference-and-deployment/saving-to-gguf) | Could help [#306](https://github.com/sims1253/starling/issues/306) merge a text-side LoRA into source precision and export. Each actual artifact still needs a load/decode check against Starling's pinned ggml, tensor types and architecture support, tokenizer, chat template, BOS/EOS, and fast-engine repacking where applicable. A `.gguf` extension alone is insufficient. |
+| [TorchAO QAT](https://unsloth.ai/docs/blog/quantization-aware-training-qat) and [phone deployment](https://unsloth.ai/docs/basics/inference-and-deployment/deploy-llms-phone) | QAT is a possible offline quality-recovery experiment, but the documented `int8-int4` fake-quant recipe and `.pte` ExecuTorch/XNNPACK output target different formats and runtime from Starling's ggml IQ/Q_K path. `save_pretrained_torchao` is not a Starling GGUF export. Its Qwen3-0.6B Pixel 8 result is a separate model/runtime measurement. |
+| [LoRA fine-tuning](https://unsloth.ai/docs/get-started/fine-tuning-llms-guide) and [speech guide](https://unsloth.ai/docs/basics/text-to-speech-tts-fine-tuning) | Tooling could be evaluated for [#306](https://github.com/sims1253/starling/issues/306) once reviewed local pairs exist. The inspected docs do not demonstrate the Parakeet FastConformer adapter path needed by [#307](https://github.com/sims1253/starling/issues/307); its documented speech examples include Whisper and TTS models. Preserve #307's NeMo-first viability check and source-precision merge/export plan. No personal dataset was inspected or used for this assessment. |
+| [Two-model speculative decoding](https://unsloth.ai/docs/basics/inference-and-deployment/saving-to-gguf/speculative-decoding) | Documents a smaller draft model with the same tokenizer in llama.cpp. It gives [#314](https://github.com/sims1253/starling/issues/314) an ordinary draft baseline, not a trained EAGLE/DFlash head or evidence that a second resident model beats Starling's free drafts on a phone. |
+
+The first joint experiment remains **codec and export compatibility before
+quality claims**: cross-decode a ModelOpt IQ block, then load one ordinary
+Unsloth-exported GGUF for an architecture Starling already supports. Pin the
+source model, export tool and ggml revisions, compare token IDs and metadata,
+and only then evaluate Starling's held-out workload. Dynamic 3.0's published
+numbers and the Unsloth QAT phone demo do not replace these checks.
