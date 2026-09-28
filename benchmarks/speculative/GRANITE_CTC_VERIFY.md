@@ -31,14 +31,13 @@ embeddings together as one explicit output. The old separate path remains an
 independent parity oracle; the shared path has bitwise-equal projector values
 and exact CTC IDs on both public clips below.
 
-On CPU, the generic verifier uses a `past+S` attention width for its batched
-S-row cache append. The earlier full-capacity masked graph changed two
-generated comma IDs on the 24.94 s sample at every K, although repeated
-default greedy runs were stable; the narrower CPU graph restored parity on
-this sample. Each batched row still uses `past+S`, whereas greedy row `j`
-uses `past+j+1`, so this is an observed result rather than a universal
-numerical-parity guarantee. GPU retains the full-capacity graph; CPU evidence
-does not establish GPU parity.
+The first CPU correction bounded the batched verifier's attention to
+`past+S` keys. It restored parity on the 24.94 s sample after full-capacity
+masked attention inserted two comma IDs. A later MOSS case exposed the
+remaining width difference: earlier batch rows still reduced over `past+S`,
+while greedy row `j` reduced over `past+j+1`. The current CPU verifier reduces
+each row over its own populated prefix. The GPU graph is unchanged, and the
+sampled CPU results below do not prove universal numerical parity.
 
 The real model is the optional-head GGUF pinned by
 [`granite_ctc_librispeech_reference.json`](granite_ctc_librispeech_reference.json)
@@ -61,7 +60,9 @@ STARLING_GGML_DEVICE=cpu STARLING_GGML_THREADS=4 taskset -c 8-15 /tmp/granite-ct
 STARLING_GGML_DEVICE=cpu STARLING_GGML_THREADS=4 taskset -c 8-15 python benchmarks/speculative/eval_granite_ctc_verify.py --library /tmp/granite-ctc-verify/libstarling_ggml.so --gguf /path/to/ctc.gguf --wav tests/fixtures/2086-149220-0033.wav --max-k 4 --repeats 2
 ```
 
-The verifier test warms greedy and K=1/2/4 once, then measures two adjacent
+The following original CPU results used the bounded-batch verifier and are
+preserved as historical measurements. The verifier test warms greedy and
+K=1/2/4 once, then measures two adjacent
 pairs at K=2 and K=4. The first pair runs greedy then CTC; the second reverses
 the order. `full_ms` includes mel, the shared encoder/projector graph, CTC
 pool/head, prompt embeddings, and verification. The `RUN` records also expose
@@ -101,9 +102,10 @@ had the same 98 IDs and EOS as its neighboring greedy run:
 | 4 | greedy → CTC | 20.760 s | 16.633 s | 58/83 |
 | 4 | CTC → greedy | 21.075 s | 16.614 s | 58/83 |
 
-The CPU exact-width correction was necessary for this result. Before it, the
-same clip's greedy output was stable at 98 IDs while the full-capacity CPU
-verifier produced 100 IDs with two inserted token-11 commas at K=1, 2, and 4.
+The CPU bounded-width correction was necessary for this historical result.
+Before it, the same clip's greedy output was stable at 98 IDs while the
+full-capacity CPU verifier produced 100 IDs with two inserted token-11 commas
+at K=1, 2, and 4.
 After the correction, all three warm K runs matched 98/98 IDs. The input
 audio and draft IDs did not change.
 
@@ -134,13 +136,59 @@ and [`granite_ctc_verify_long_capi_cpu.log`](granite_ctc_verify_long_capi_cpu.lo
 The C benchmark prints the actual GGUF, library, and WAV SHA-256 hashes and
 backend. `STARLING_GRANITE_TIMING=1` prints one `GRANITE_CTC` stage line per
 chunk; its `ctc_head` field includes pooling and the optional BPE head.
-The measured C shared library's SHA-256 was
+The measured historical C shared library's SHA-256 was
 `c9f65e6cfa702f36fc62ebcd61bc42070fd9037cfdcb0bec16e1b81b54ee5687`.
 The short ID-level benchmark binary was
 `dc59043a28cb8560910d3bc510f727adc20e363e2af20e2b6e2ee4b34b1a82c3`;
 the longer model-sample ID benchmark binary (built before the opt-in C entry
 point was added, with the same shared encoder and CPU verifier code) was
 `33d611385dd1a120315d27adb48befe9430eb872a81acc8761f2703f2cc97a40`.
+
+## CPU per-row verifier revalidation
+
+The current CPU default reduces each verifier row over `past+row+1` keys,
+matching greedy's populated attention width for that row. Batched projection
+and cache operations still differ from greedy, so exact IDs on these fixtures
+are measured evidence, not a guarantee for other audio. This source is commit
+`5838bad` in this stack (the same default as #338 commit `419723d`); the
+measured shared library is SHA-256
+`bfa33b547b582afc1fa858416c9ef8f2e6117cb34a9d8a8472c8613f0378530b`
+and the ID benchmark binary is
+`e852b005a22ea1e72f7760cb3661e7667fee364b977b6de27aaca8c207faedeb`.
+The GGUF and WAV hashes remain those above. All runs selected backend CPU,
+used four ggml threads, and were pinned to logical CPUs 8–15. The test warmed
+greedy and K=1/2/4, then alternated execution order for two K=2 and two K=4
+pairs. Every CTC run matched greedy IDs and EOS: 32/32 on LibriSpeech and
+98/98 on the model-repository clip; draft IDs remained 26 and 86. Each
+`full_ms` below starts before mel and includes CTC extraction, proposal, and
+verification when applicable. Model load is outside the clock.
+
+| Clip | K | Order | Greedy full | CTC full | Direct accepts |
+|:---|---:|:---|---:|---:|---:|
+| 7.435 s | 2 | greedy → CTC | 6.548 s | 5.486 s | 14/23 |
+| 7.435 s | 2 | CTC → greedy | 6.283 s | 5.303 s | 14/23 |
+| 7.435 s | 4 | greedy → CTC | 6.099 s | 5.381 s | 14/25 |
+| 7.435 s | 4 | CTC → greedy | 6.353 s | 5.580 s | 14/25 |
+| 24.94 s | 2 | greedy → CTC | 20.492 s | 17.646 s | 51/73 |
+| 24.94 s | 2 | CTC → greedy | 20.190 s | 16.928 s | 51/73 |
+| 24.94 s | 4 | greedy → CTC | 20.412 s | 16.740 s | 58/83 |
+| 24.94 s | 4 | CTC → greedy | 20.774 s | 16.721 s | 58/83 |
+
+The complete new ID/stage records are
+[`granite_ctc_verify_short_cpu_perrow.log`](granite_ctc_verify_short_cpu_perrow.log)
+and [`granite_ctc_verify_model_sample_cpu_perrow.log`](granite_ctc_verify_model_sample_cpu_perrow.log).
+The same 32.375 s concatenated WAV again produced exact per-chunk target IDs
+at K=4: 121/121 on the 30 s first chunk and 12/12 on the padded tail. Its
+manual [ID log](granite_ctc_verify_long_ids_cpu_perrow.log) labels the CTC
+clock `ctc_from_reused_mel_ms`, so it is not a full-cost comparator.
+Through the raw-WAV C API, both modes returned the same transcript SHA-256
+`71bea620ec405ca1b0bf8d0a1e36000ebc6bb8a7bebeaf255ef388dfea374089`.
+This single whole-request run took 40.497 s greedy and 37.201 s CTC. The
+first chunk took 25.643 s versus 21.894 s; the padded tail took 14.854 s
+versus 15.306 s, respectively. These C timings include mel on both sides;
+the padded-tail difference is one observation, not a latency distribution.
+The [raw C API log](granite_ctc_verify_long_capi_cpu_perrow.log) pins the
+GGUF, library, and WAV hashes and reports the per-chunk stages.
 
 The two asset-free CTC proposer/entry tests run in native CI; tests requiring
 the optional-head GGUF and public WAVs remain manual. The CPU pilot is not a
