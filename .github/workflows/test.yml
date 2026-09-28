@@ -78,6 +78,7 @@ jobs:
           tests/test_server_client.py tests/test_stream_chunk.py
           tests/test_native_parity_contract.py
           tests/test_s1_quant_spans.py
+          docs/evidence/pixel-s1-2026-09-28/controlled/test_controlled.py
 
       # tests/test_native_parity_contract.py (issue #167): the executable
       # numerical-correctness contract — manifest schema, test-selection

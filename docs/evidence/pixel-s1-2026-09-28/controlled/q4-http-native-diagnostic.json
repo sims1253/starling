@@ -1,0 +1,29 @@
+{
+  "schema": "s1-q4-host-native-diagnostic-v1",
+  "utc": "2026-09-28T12:36:34.333939+00:00",
+  "case_id": "negation_and_name",
+  "warmup_native_ms": 4249.3,
+  "requests": [
+    {
+      "repeat": 0,
+      "id": "negation_and_name",
+      "output": "Do not send this to Claire. Yet, send it to Maya.",
+      "host_http_ms": 36925.590234,
+      "mono_start_ns": 796366375996277,
+      "mono_end_ns": 796403301586511,
+      "native_total_ms": 17499.4,
+      "host_minus_native_ms": 19426.190234
+    },
+    {
+      "repeat": 1,
+      "id": "negation_and_name",
+      "output": "Do not send this to Claire. Yet, send it to Maya.",
+      "host_http_ms": 7580.383768,
+      "mono_start_ns": 796403301863229,
+      "mono_end_ns": 796410882246997,
+      "native_total_ms": 4877.2,
+      "host_minus_native_ms": 2703.183768
+    }
+  ],
+  "scope": "Two extra calls outside predeclared quant ABBA; diagnostic only"
+}

@@ -61,11 +61,32 @@ was charging at thermal status 1, with unrelated user activity. These are
 observed samples, not a controlled latency or energy comparison. The server's
 internal “model loaded” timer (1.7 seconds BF16, 1.3 seconds Q4) ends before
 warmup and Q4 weight repacking, so it is not an end-to-end ready-to-serve
-load-cost comparison. No co-residency budget has been declared for #229/#295.
+load-cost comparison. The first pilot did not measure ASR+S1 co-residency.
+
+A later [controlled CPU ABBA pilot](evidence/pixel-s1-2026-09-28/controlled/README.md)
+used fresh BF16–Q4–Q4–BF16 processes with the phone unplugged, screen off,
+and thermal status 0. The four launch-to-ready times were 52.7, 17.8, 20.3,
+and 60.4 seconds; each block sent all eight cases once after server warmup.
+The corresponding host HTTP case medians were 44.03, 11.43, 2.47, and
+29.00 seconds. Same-arm results varied sharply, and one matched case was
+slower on Q4 in the first adjacent pair. A two-call diagnostic also found
+varying gaps between host HTTP and native total time. These are descriptive
+end-to-end observations, not a stable or native speedup estimate. All 32
+requests exactly reproduced their own arm's prior outputs and preserved all
+protected spans.
+
+Whole-device energy remains inconclusive: the charge counter was unchanged
+throughout both Q4 active windows, and its update latency was not established.
+The illustrative idle-correction arithmetic is not a valid energy bound or
+a zero-energy measurement. The prior 559.6 MiB warmed PSS saving stands as
+a single-process observation, not a combined ASR+S1 measurement. S1 is
+optional, and roughly 2 GiB combined residence is a soft optimization target,
+not a runtime ceiling. ASR-only baseline and optional ASR+S1 headroom still
+need direct measurement.
 
 These eight English cases are a functional pilot, not a release quality gate.
-Issue #310's broader protected-span workload, controlled Pixel latency/energy, and the
-co-residency budget from #229/#295 have not been measured. S1-mini remains
+Issue #310's broader protected-span workload, a decisive Pixel energy
+comparison, and optional ASR+S1 headroom have not been measured. S1-mini remains
 English-only. An instruction model is not in this catalog: #295 has a
 candidate architecture but has not selected or validated a specific
 checkpoint, tokenizer/template, and model for multilingual instructions.

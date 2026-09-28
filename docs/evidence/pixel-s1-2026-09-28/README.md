@@ -29,9 +29,15 @@ There was no GL mtrack allocation. The after-case snapshots were within
 444 kB of the corresponding before-case snapshots. Neither measurement is
 a loading peak or a co-residency budget.
 
-The phone was charging throughout (AC powered, battery status 2), with
-thermal status 1 and the display off; unrelated user activity was present.
+The phone was charging during this first functional pilot (AC powered,
+battery status 2), with thermal status 1 and the display off; unrelated user
+activity was present.
 The per-case response times in the JSON are exploratory. Charge-counter
 changes cannot give idle-subtracted energy during charging. The server's
 internal load message precedes Q4 warmup repacking and therefore does not
 measure end-to-end ready-to-serve time.
+
+A later unplugged, screen-off, CPU-only [ABBA pilot](controlled/README.md)
+records fresh BF16–Q4–Q4–BF16 processes, their protected outputs, host HTTP
+latencies, and battery-counter samples. Its energy result remains
+inconclusive because gauge update latency was not established.
