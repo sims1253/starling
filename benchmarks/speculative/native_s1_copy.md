@@ -175,6 +175,39 @@ in each sampled CPU pair, but these two repeats per case do not establish a
 stable latency distribution or general parity for other inputs. The feature
 remains opt-in.
 
+### Pixel 10 Pro bounded preflight (incomplete)
+
+On 2026-09-28, a fresh Android arm64 `starling-serve` built from this commit
+(`18cf0d7`, SHA256
+`33a513e6f1aae2f7a5d4f53b29d5c787d6472a060520d7de6bf788abc828d277`)
+was tested on a Pixel 10 Pro running Android 17. The BF16 GGUF and three
+runtime libraries were hash-verified on-device. The sealed
+[protocol](results/pixel-native-copy-2026-09-28/protocol.json) (SHA256
+`2e497202a1dd49e1bd49282f3e918b7b04b98de40056728bfa75719045e440b9`)
+required exact same-device greedy/copy text and raw int32-ID parity before a
+four-process alternating latency pilot. The
+[runner](results/pixel-native-copy-2026-09-28/run_copy.py) had a declared
+180-second HTTP request timeout; [operational bounds](results/pixel-native-copy-2026-09-28/operational-bounds.md)
+were recorded before the first process. The phone was unplugged, screen off,
+and thermal status 0 in the saved samples. Six ggml CPU threads and the same
+model/fixtures were specified for both arms.
+
+The first **greedy** process became ready in 54.8 seconds and its actual
+server log reported `backend=CPU`. Its short-case warmup and diagnostic
+returned identical text and generated-ID SHA256
+`c9e8019f15282db57411cf4ea0120e43eae1c0f51420cb7b0c8cf4efcb7a68ce`
+(11 IDs). Host HTTP durations were 87.5 and 62.7 seconds; native S1 totals
+were 44.5 and 32.8 seconds. The medium-case warmup then reached the declared
+180-second HTTP timeout without a response. The owned server was terminated
+and verified absent; [the saved record](results/pixel-native-copy-2026-09-28/preflight-1-greedy/record.json)
+is incomplete. The raw log, two ID dumps, environment samples, exact fixtures,
+runner, and hashes are in the same evidence directory.
+
+No Pixel copy arm ran. This attempt establishes **neither Pixel copy parity
+nor a Pixel latency or energy benefit**. The host CPU pilot above remains
+separate evidence, and the copy path remains opt-in. These screen-off shell
+measurements do not characterize foreground dictation responsiveness.
+
 The measured CPU pilot result does not establish Pixel
 latency, energy, or p50/p95 on the [#310](https://github.com/sims1253/starling/issues/310)
 workload. S1 fast-engine integration, an instruction-model rewrite/translate
