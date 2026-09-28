@@ -1,7 +1,9 @@
 // S1's quantized profile is opt-in; unrelated profiles remain rejected.
 #include "s1/loader.hpp"
 #include "gguf.h"
+#include <chrono>
 #include <cstdio>
+#include <filesystem>
 #include <string>
 
 static int failures = 0;
@@ -24,7 +26,11 @@ static bool write_profile(const char* path, const char* profile) {
 }
 
 int main(int argc, char** argv) {
-    const char* path = "/tmp/s1_quant_loader_test.gguf";
+    const std::string path_storage = (std::filesystem::temp_directory_path() /
+        ("s1_quant_loader_test." +
+         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) +
+         ".gguf")).string();
+    const char* path = path_storage.c_str();
     const char* profiles[] = {"bf16_exact", "quantized", "f16", "garbage", nullptr};
     for (const char* profile : profiles) {
         if (!write_profile(path, profile)) { check(false, "write metadata GGUF"); continue; }

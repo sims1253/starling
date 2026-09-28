@@ -148,7 +148,7 @@ bool S1Model::load(const char* path, std::string& err) {
     for (const char* n : {"llm.embed.weight", "llm.final_norm.weight"})
         if (!lib::require(m, n, "S1", err)) return false;
     if (quantized && m.tensor("llm.embed.weight")->type != GGML_TYPE_BF16) {
-        err = "S1 quantized profile requires BF16 tied embedding/lm_head";
+        err = "S1 quantized profile requires a BF16 embedding (it doubles as the tied lm_head)";
         return false;
     }
     if (quantized && !supported_norm_type(m.tensor("llm.final_norm.weight")->type)) {

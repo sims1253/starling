@@ -199,8 +199,8 @@ def main() -> int:
                              json.loads(args.candidate.read_text()), args.cases)
             if args.json:
                 args.json.write_text(json.dumps(result, indent=2) + "\n")
-    except (OSError, ValueError, RuntimeError) as error:
-        ap.error(str(error))
+    except (OSError, ValueError, RuntimeError, KeyError, TypeError) as error:
+        ap.error(f"{type(error).__name__}: {error}")
     print(json.dumps(result, indent=2))
     return 0
 
