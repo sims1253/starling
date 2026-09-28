@@ -89,7 +89,9 @@ def simulate(source: Sequence[int], target: Sequence[int], *, max_k: int = 2,
                 break
             accepted += 1
         accepted_total += accepted
-        if draft and accepted == len(draft):
+        # Only the verified part of a draft can be accepted on the last pass.
+        verified = len(draft[:remaining])
+        if draft and accepted == verified:
             full += 1
             k = min(max_k, k + 1)
         elif draft:
