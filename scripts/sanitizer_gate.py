@@ -43,10 +43,16 @@ def _report_result(report: Path, expected_tests: int) -> tuple[int, str | None]:
 def _sanitizer_result(log: Path, tool: str) -> str | None:
     output = log.read_text(errors="replace")
     if tool == "racecheck":
-        if re.search(r"RACECHECK SUMMARY:\s*0 hazards displayed \(0 errors, 0 warnings\)", output):
+        summaries = re.findall(
+            r"RACECHECK SUMMARY:\s*(\d+) hazards displayed \((\d+) errors, (\d+) warnings\)",
+            output,
+        )
+        if summaries and all(count == "0" for summary in summaries for count in summary):
             return None
-    elif re.search(r"ERROR SUMMARY:\s*0 errors", output):
-        return None
+    else:
+        summaries = re.findall(r"ERROR SUMMARY:\s*(\d+) errors", output)
+        if summaries and all(count == "0" for count in summaries):
+            return None
     return f"missing clean {tool} summary"
 
 
@@ -120,20 +126,30 @@ def main() -> int:
     if args.timeout_seconds <= 0:
         parser.error("--timeout-seconds must be positive")
 
-    import torch
+    try:
+        import torch
+    except (ImportError, OSError) as exc:
+        parser.error(f"PyTorch is required: {exc}")
 
     if not torch.cuda.is_available():
         parser.error("a CUDA device is required; skipped tests are not a passing gate")
+    try:
+        gpu_name = torch.cuda.get_device_name(0)
+    except (RuntimeError, AssertionError) as exc:
+        parser.error(f"cannot inspect CUDA device: {exc}")
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    commit = subprocess.run(
-        ["git", "rev-parse", "HEAD"], cwd=ROOT, check=True, capture_output=True, text=True
-    ).stdout.strip()
+    try:
+        commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=ROOT, check=True, capture_output=True, text=True
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError) as exc:
+        parser.error(f"cannot read Git commit: {exc}")
     result = {
         "schema_version": 1,
         "date_utc": datetime.now(timezone.utc).isoformat(),
         "commit": commit,
-        "gpu": torch.cuda.get_device_name(0),
+        "gpu": gpu_name,
         "cuda_runtime": torch.version.cuda,
         "torch": torch.__version__,
         "test": str(TEST.relative_to(ROOT)),

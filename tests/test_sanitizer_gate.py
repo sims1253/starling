@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from scripts.sanitizer_gate import run_tool
+from scripts.sanitizer_gate import _sanitizer_result, run_tool
 
 
 def _fake_sanitizer(tmp_path: Path) -> Path:
@@ -74,3 +74,14 @@ def test_sanitizer_finding_fails(tmp_path: Path, monkeypatch) -> None:
     result = _run(tmp_path, monkeypatch, "def test_runs(): assert True\n", mode="finding")
     assert result["status"] == "fail"
     assert "exit code 86" in str(result["reason"])
+
+
+def test_any_nonzero_summary_fails_even_after_a_clean_summary(tmp_path: Path) -> None:
+    log = tmp_path / "multi.log"
+    log.write_text("ERROR SUMMARY: 0 errors\nERROR SUMMARY: 1 errors\n")
+    assert _sanitizer_result(log, "memcheck") is not None
+    log.write_text(
+        "RACECHECK SUMMARY: 0 hazards displayed (0 errors, 0 warnings)\n"
+        "RACECHECK SUMMARY: 1 hazards displayed (1 errors, 0 warnings)\n"
+    )
+    assert _sanitizer_result(log, "racecheck") is not None

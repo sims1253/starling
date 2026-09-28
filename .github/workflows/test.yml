@@ -92,6 +92,8 @@ jobs:
           --index https://download.pytorch.org/whl/cpu
           python -m pytest -q tests/test_benchmark_ggml_adapters.py
           tests/test_cuda_kernel_validation.py tests/test_sanitizer_gate.py
+        env:
+          PYTHONPATH: src
 
       - name: Test ark06/voxtral Python pipelines with CPU-only PyTorch
         run: >-

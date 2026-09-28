@@ -33,6 +33,22 @@ def test_empty_and_short_inputs_fail_before_compiling_cuda() -> None:
             call()
 
 
+def test_scalar_inputs_fail_as_value_errors_before_cuda_compilation() -> None:
+    from starling._kernels import cuda_backend
+
+    scalar = torch.tensor(1, dtype=torch.bfloat16)
+    for call in (
+        lambda: cuda_backend.fused_rmsnorm(scalar, scalar.reshape(1), 1e-6),
+        lambda: cuda_backend.fused_silu_mul(scalar, scalar),
+        lambda: cuda_backend.residual_add(scalar, scalar),
+        lambda: cuda_backend.compute_rstd(scalar, 1e-6),
+        lambda: cuda_backend.fused_gemv_normscale(
+            scalar, scalar.reshape(1, 1), scalar.float().reshape(1)),
+    ):
+        with pytest.raises(ValueError):
+            call()
+
+
 def test_gemv_extra_rows_and_raw_pointer_dtype_mismatches_fail() -> None:
     from starling._kernels import cuda_backend
 
