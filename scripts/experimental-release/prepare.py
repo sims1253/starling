@@ -38,7 +38,9 @@ def prepare(args: argparse.Namespace) -> None:
             raise ValueError(f"Empty or invalid asset: {name}")
     apk = f"starling-mobile-{args.version}-i8mm.apk"
     android_sum = (root / "SHA256SUMS-android.txt").read_text().split()
-    if android_sum != [checksum(root / apk), apk]:
+    if len(android_sum) != 2 or android_sum[1] != apk:
+        raise ValueError(f"Malformed SHA256SUMS-android.txt: expected one digest for {apk}")
+    if android_sum[0] != checksum(root / apk):
         raise ValueError("Android checksum does not match the APK")
 
     info = {
