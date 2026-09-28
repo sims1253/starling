@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "purpose": "Preregistered real-model Granite state-isolation check before enabling opt-in interleaving",
+  "serial_binary_sha256": "a91847c520596042e798e5acd17e14c3ada78a7b3699f317b4402d5459cf6d49",
+  "fair_binary_sha256": "42e90a5b75c69662542b1d7518791782cc29e7ec460a1000ace3d38e8c81b0dc",
+  "model_sha256": "b72a01687daa1825894bd5ea3e4c53f6be657a9ba31c5cd65c5114c5b6b961e2",
+  "a_wav_sha256": "4f97080176d3623eebc9663af07dd258894ed31f74d5d229d39e77c5ab5b0925",
+  "b_wav_sha256": "16503e95c0a78cc4fbd2db3789d385297bc31ad52e63ef79e8bbe5040fb01be4",
+  "warmup_wav_sha256": "5fceacff0315d49cb59fcc505bcecf1ed5f2f35c2897b1e65a59f30e5d922150",
+  "a_source": "Committed LibriSpeech fixture tests/fixtures/2086-149220-0033.wav repeated 10x by tests/fixtures/make_fixtures.py; 74.35 seconds, 3 Granite chunks, padded tail",
+  "b_source_url": "https://huggingface.co/datasets/argmaxinc/librispeech/resolve/main/1089-134686-0000.flac",
+  "b_source_flac_sha256": "30885601173f96b0d8ddd020dc959b055c6c1582b85a33e3fcab8c4b08ed94c2",
+  "b_generation": "Decode public 16 kHz mono FLAC to PCM16 WAV with FFmpeg 4.4.2; repeat its 10.435 s PCM frame sequence exactly 7 times with Python wave, producing 73.045 s, 3 Granite chunks and a padded tail. The generated B WAV is a local ignored artifact, not committed.",
+  "workload": "On CPU cores 16-23, OMP_NUM_THREADS=8, warm each server on the same short public WAV. Serial baseline: A then B. Opt-in server: submit A1, then B after A1 queue_wait, then A2 after B queue_enter so chunks interleave. Every HTTP request has a distinct id and a 600 s timeout.",
+  "pass_rule": "All five HTTP requests return 200 with nonempty final hashes; serial A hash equals both fair A1 and fair A2, serial B hash equals fair B, and A hash differs from B. Each request traces exactly chunks 1,2,3. Fair B chunk 1 and fair A2 chunk 1 must occur between fair A1 chunks 1 and 2. No missing result or failed attempt is excluded. This is output-isolation evidence, not a latency distribution or proof for all audio."
+}
