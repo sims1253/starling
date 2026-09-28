@@ -405,7 +405,8 @@ def measure_granite(clips: list[tuple[np.ndarray, int, str]],
 
     summary = _summarise(layers_out, head_dim, thresholds)
     summary["model"] = "granite-speech-4.1-2b"
-    summary["source_snapshot"] = str(snapshot.resolve()) if snapshot is not None else "default HF revision"
+    summary["source_snapshot"] = snapshot.name if snapshot is not None else "default HF revision"
+    summary["source_snapshot_path"] = str(snapshot.resolve()) if snapshot is not None else None
     summary["num_layers"] = len(layers_out)
     summary["num_heads"] = num_heads
     summary["head_dim"] = head_dim
@@ -523,6 +524,8 @@ def main() -> int:
         return 1
     if args.granite_snapshot is not None and not args.granite_snapshot.is_dir():
         ap.error("--granite-snapshot must be an existing directory")
+    if args.granite_snapshot is not None and "granite" not in models:
+        ap.error("--granite-snapshot requires granite in --models")
     if args.audio and len({p.name for p in args.audio[:len(clips)]}) != len(clips):
         ap.error("--audio filenames must be distinct for portable result hashes")
 

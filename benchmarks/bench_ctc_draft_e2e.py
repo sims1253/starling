@@ -39,8 +39,10 @@ def main() -> None:
         ap.error("snapshot differs from rank study")
     if sha256(args.snapshot / "out_llm.safetensors") != study["source_out_llm_sha256"]:
         ap.error("CTC head hash differs from rank study")
-    if args.repeats < 1 or any(str(rank) not in study["ranks"] for rank in args.ranks):
-        ap.error("invalid repeats/ranks")
+    if (args.repeats < 1 or args.max_new_tokens < 1 or
+            len(set(args.ranks)) != len(args.ranks) or
+            any(str(rank) not in study["ranks"] for rank in args.ranks)):
+        ap.error("invalid repeats/ranks/max-new-tokens")
 
     from safetensors.torch import load_file
     from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
@@ -65,6 +67,18 @@ def main() -> None:
     torch.cuda.synchronize()
 
     methods = ["target", "full", *[str(r) for r in args.ranks]]
+    rank_slices = {
+        rank: (basis[:, :rank].contiguous(), factor[:, :rank].contiguous())
+        for rank in args.ranks
+    }
+    rank_audio = {
+        str(rank): {row["audio"]: row for row in study["ranks"][str(rank)]["audio"]}
+        for rank in args.ranks
+    }
+    for rank in args.ranks:
+        rows = study["ranks"][str(rank)]["audio"]
+        if len(rank_audio[str(rank)]) != len(rows):
+            ap.error(f"rank {rank} study contains duplicate audio names")
     def stamp() -> float:
         torch.cuda.synchronize()
         return time.perf_counter()
@@ -88,8 +102,7 @@ def main() -> None:
                 logits = torch.nn.functional.linear(pooled, full_weight, bias)
             else:
                 rank = int(method)
-                left = basis[:, :rank].contiguous()
-                right = factor[:, :rank].contiguous()
+                left, right = rank_slices[rank]
                 z = torch.nn.functional.linear(pooled, left.T)
                 logits = torch.nn.functional.linear(z, right, bias)
             draft_ids = collapse(logits.argmax(dim=-1)[0])
@@ -99,6 +112,9 @@ def main() -> None:
             inputs["input_ids"], embeds, inputs.get("input_features_mask"))
         t4 = stamp()
         budget = min(args.max_new_tokens, pipeline.llm.max_cache_len - prompt.shape[1] + 1)
+        if budget < 1:
+            ap.error(f"prompt {prompt.shape[1]} leaves no generation budget "
+                     f"(max_cache_len={pipeline.llm.max_cache_len})")
         if method == "target":
             result = pipeline.llm.generate(prompt, max_new_tokens=budget,
                                            eos_token_id=LLM_EOS_TOKEN_ID)
@@ -135,10 +151,9 @@ def main() -> None:
         if sr != 16000 or samples.ndim != 1:
             ap.error(f"expected mono 16 kHz WAV: {path}")
         audio = torch.from_numpy(samples).unsqueeze(0)
-        # Exclude first-use graph capture/initialization from timed trials.
-        if ix == 0:
-            for method in methods:
-                trial(audio, method)
+        # Exclude each input shape's first-use costs from timed trials.
+        for method in methods:
+            trial(audio, method)
         rows: dict[str, list[dict]] = {method: [] for method in methods}
         for rep in range(args.repeats):
             order = methods if (ix + rep) % 2 == 0 else list(reversed(methods))
@@ -151,8 +166,9 @@ def main() -> None:
                 if method == "full":
                     row["draft_matches_rank_study"] = row["draft_ids"] == record["baseline_ids"]
                 elif method != "target":
-                    candidate = next(v for v in study["ranks"][method]["audio"]
-                                     if v["audio"] == record["audio"])
+                    candidate = rank_audio[method].get(record["audio"])
+                    if candidate is None:
+                        ap.error(f"rank {method} study lacks audio {record['audio']}")
                     row["draft_matches_rank_study"] = row["draft_ids"] == candidate["draft_ids"]
                 row.pop("ids")
                 row.pop("draft_ids")

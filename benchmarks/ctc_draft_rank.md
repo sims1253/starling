@@ -33,9 +33,10 @@ emitted token; all 80 speculative trials produced the same greedy IDs as the
 target-only path. Complete per-trial stage times, draft counts and acceptance
 are in
 [`results/ctc_draft_e2e_granite_fleurs8.json`](results/ctc_draft_e2e_granite_fleurs8.json).
-The saved trials warmed only the target and full-head methods before timing;
-the current script also warms each rank projection. The saved stage times are
-historical measurements, so a fresh run is needed for fully warmed rank timings.
+The saved trials warmed only the target and full-head methods on the first
+clip before timing. The current script prepares rank slices once and warms all
+methods for each clip shape. The saved stage times are historical measurements,
+so a fresh run is needed for timing under the corrected method.
 
 | Method | Head weight / full | Head (ms) | LLM prefill + generation (ms) | Full wall (ms) | Accepted / proposed | Clips faster than direct full CTC |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
