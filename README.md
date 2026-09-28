@@ -102,4 +102,5 @@ serving work targets the native engine and the portable HTTP contract.
 [Packaging and the npm launcher](docs/packaging.md) ·
 [Quantization tools](quants/README.md) · [Quantization research](docs/quantization.md) ·
 [Benchmarks](docs/benchmarks.md) · [Engine development](docs/ggml-engine.md) ·
-[Fast Vulkan engines](docs/fast-engine.md)
+[Fast Vulkan engines](docs/fast-engine.md) ·
+[Model Optimizer and Unsloth research](docs/research/model-optimizer-unsloth-cross-backend.md)
