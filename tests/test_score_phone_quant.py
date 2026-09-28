@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from benchmarks.fast_engine.score_phone_quant import parse_logs
+from benchmarks.fast_engine.score_phone_quant import parse_logs, score
 
 
 DEVICE = "PowerVR D-Series DXT-48-1536 MC1"
@@ -50,3 +50,14 @@ def test_rejects_generic_header_without_real_fast_identity(tmp_path):
     engine_logs[0].write_text("[fast] parakeet falls back to ggml: unavailable\n")
     with pytest.raises(ValueError, match="actual fast Vulkan device"):
         parse_logs(logs, engine_logs, ["a.wav"], DEVICE, "short.wav")
+
+
+def test_rejects_malformed_protocol_before_scoring(tmp_path):
+    from argparse import Namespace
+
+    protocol = tmp_path / "protocol.json"
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    protocol.write_text('{"schema":"quant-wer-noninferiority-v1"}')
+    with pytest.raises(ValueError, match="protocol cohorts"):
+        score(Namespace(protocol=protocol, corpus=corpus))

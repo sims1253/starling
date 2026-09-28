@@ -77,16 +77,23 @@ def parse_logs(logs: list[Path], engine_logs: list[Path], names: list[str],
 
 def score(args: argparse.Namespace) -> dict:
     protocol = json.loads(args.protocol.read_text())
-    if protocol.get("schema") != "quant-wer-noninferiority-v1":
+    if not isinstance(protocol, dict) or protocol.get("schema") != "quant-wer-noninferiority-v1":
         raise ValueError("unsupported protocol")
+    required = protocol.get("cohorts")
+    if not isinstance(required, dict) or not required or not all(
+            isinstance(name, str) and type(count) is int and count > 0
+            for name, count in required.items()):
+        raise ValueError("protocol cohorts must map names to positive clip counts")
     names = sorted(wav.name for wav in args.corpus.glob("*.wav"))
     if not names:
         raise ValueError("empty corpus")
+    if args.warmup_name in names:
+        raise ValueError("warmup WAV name collides with a scored corpus clip")
     parsed = parse_logs(args.logs, args.engine_logs, names, args.fast_device,
                         args.warmup_name)
     row = {"model": args.label, "path": str(args.model),
            "mb": round(args.model.stat().st_size / 1e6, 1),
-           "wer": {}, "cer": {}, "wer_ci": {}, "clips": {},
+           "wer": {}, "clips": {},
            "provenance": {
                "model_sha256": file_sha256(args.model),
                "model_bytes": args.model.stat().st_size,
@@ -122,7 +129,6 @@ def score(args: argparse.Namespace) -> dict:
             "wer": wer_pct(reference, measured["hypothesis"]),
             "time_ms": measured["time_ms"],
         })
-    required = protocol["cohorts"]
     if {k: len(v) for k, v in row["clips"].items()} != required:
         raise ValueError("corpus cohorts do not match the sealed protocol")
     for cohort, clips in row["clips"].items():

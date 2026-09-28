@@ -106,6 +106,17 @@ def test_protocol_change_after_runs_is_rejected(tmp_path):
         compare(spec, bp, cp)
 
 
+def test_malformed_record_shapes_fail_with_comparison_error(tmp_path):
+    spec, bp, cp, baseline, _, save = _inputs(tmp_path)
+    baseline["clips"]["en_us_validation"] = {"not": "a list"}
+    save()
+    with pytest.raises(InvalidComparison, match="clips must be a list"):
+        compare(spec, bp, cp)
+    spec.write_text("[]")
+    with pytest.raises(InvalidComparison, match="protocol must be a JSON object"):
+        compare(spec, bp, cp)
+
+
 @pytest.mark.parametrize("field,value,message", [
     ("cohorts", {"en_us_validation": True}, "at least five clips"),
     ("max_wer_delta_pp", False, "percentage-point margin"),

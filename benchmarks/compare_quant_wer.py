@@ -28,7 +28,11 @@ def _check(condition: bool, message: str) -> None:
 
 
 def _sha256_file(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _load_run(path: Path) -> dict:
@@ -57,6 +61,7 @@ def _paired_interval(differences: list[float], draws: int, seed: int) -> tuple[f
 
 
 def _clip_map(clips: list[dict], cohort: str, arm: str) -> dict[str, dict]:
+    _check(isinstance(clips, list), f"{arm} {cohort}: clips must be a list")
     by_id = {}
     for clip in clips:
         _check(isinstance(clip, dict) and isinstance(clip.get("id"), str)
@@ -76,6 +81,7 @@ def _clip_map(clips: list[dict], cohort: str, arm: str) -> dict[str, dict]:
 
 def compare(protocol_path: Path, baseline_path: Path, candidate_path: Path) -> dict:
     protocol = json.loads(protocol_path.read_text())
+    _check(isinstance(protocol, dict), "protocol must be a JSON object")
     _check(protocol.get("schema") == "quant-wer-noninferiority-v1", "unsupported protocol schema")
     cohorts = protocol.get("cohorts")
     _check(isinstance(cohorts, dict) and cohorts,
