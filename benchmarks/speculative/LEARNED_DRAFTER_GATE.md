@@ -2,11 +2,13 @@
 
 This is a decision record, not a runtime benchmark. The current decision is
 **defer training and deployment**. Issue #314 permits at most one prototype
-after the free drafts and #311 verifier are priced. Neither a device-wide
-multi-token verify cost nor a representative #310 dictation workload is
-available yet. A learned model would add memory and draft work before we know
-whether verification can repay it. This decision can change when those gates
-produce measurements.
+after the free drafts and #311 verifier are priced on the target device and
+workload. The generic native verifier [#338](https://github.com/sims1253/starling/pull/338)
+and an S1 CPU copy-draft pilot [#345](https://github.com/sims1253/starling/pull/345)
+now exist. They do not provide a Pixel/fast-engine multi-token cost curve,
+per-take energy, or the representative #310 dictation workload. A learned
+model would add memory and draft work before those gates establish whether
+its cost can be repaid.
 
 ## Measured inputs and break-even test
 
@@ -23,6 +25,14 @@ K=2 gives 1.375, 1.491, and 1.495 output tokens/pass on the short, medium,
 and long goldens. Those are exact-token oracle replays of only three fixtures,
 not device timing or a representative workload; see
 [the copy-draft study in PR #327](https://github.com/sims1253/starling/pull/327).
+The native S1 follow-up measured the entire CPU C API call, including source
+tokenization and proposal work, after #338 corrected the CPU verifier's
+attention width. At K=2, copy matched greedy and captured stock IDs/text on
+all three goldens; a K=4 synthetic protected fixture kept both protected
+spans. Across two warmed alternating pairs per case, copy/greedy latency was
+0.58–0.94×, with all eight pairs favoring copy. These are small CPU samples,
+not Pixel, fast-engine, energy, or #310 results. #345 preserves the earlier
+full-capacity CPU run separately because it had different verifier behavior.
 
 For a fixed workload, let `A` be actual output tokens per verify pass,
 `V(K)` the measured full target verify-pass time, `D(K)` the full cost of
@@ -32,9 +42,11 @@ device and prompt distribution. It must also beat the *best free draft* with
 `(V_free + D_free) / A_free`, with prefill, residency, load cost, memory and
 energy accounted per take. For S1 cleanup, even a zero-cost copy drafter at
 K=2 requires `V(2)/T1 < 1.375–1.495`; the replay alone cannot establish
-this. For standalone MOSS, a zero-cost Parakeet draft would require
-`V(2–3)/T1 < 1.03–1.05`. No end-to-end `V(K)` or `D(K)` exists yet, so no
-numeric speedup, energy gain or viability claim follows from these ratios.
+this, while the current native CPU call measurement does show a bounded
+S1-specific win. For standalone MOSS, a zero-cost Parakeet draft would
+require `V(2–3)/T1 < 1.03–1.05`. No target-device `V(K)`/`D(K)` curve or
+representative #310 result exists yet, so the CPU S1 result cannot justify a
+learned-drafter speed, energy, or deployment claim.
 
 ## Candidate comparison
 
@@ -44,7 +56,7 @@ numeric speedup, energy gain or viability claim follows from these ratios.
 | EAGLE-3 | Target-feature-conditioned draft; its released method has trained weights and training code. | Target-specific feature capture, training, sequential draft steps, new export/runtime path. The official checkpoint table does not list Starling's MOSS, S1-mini or Granite revision. | Skip until a target-specific training set and verifier economics justify that cost. |
 | DFlash | Its block diffusion drafter proposes a block in one forward, which could reduce phone dispatch cost. | Target-feature capture, trained target-specific model, block runtime and export. Public code/checkpoints list other exact targets, not Starling's current revisions. | Skip until a measured fast-engine verify pass and draft memory/latency budget exist. |
 | DSpark | Semi-autoregressive drafting and confidence-scheduled verify length could reduce wasted wide passes. | Target-specific training and more runtime state/logic. SpecForge now has DSpark training recipes, so the issue body's “no public code found” is outdated. | Skip: neither a verify-width cost curve nor a trained compatible artifact exists here. Reuse scheduling only after a functioning drafter exists. |
-| MTP / Medusa heads | Parallel next-token guesses can avoid a separate decoder. | Trained heads tied to the target hidden state; Medusa's tree verify needs a different verifier shape. | Skip until a linear verifier and a candidate workload are measured. |
+| MTP / Medusa heads | Parallel next-token guesses can avoid a separate decoder. | Trained heads tied to the target hidden state; Medusa's tree verify needs a different verifier shape. | Skip until a fast-engine verifier and representative workload are measured. |
 | LayerSkip | Draft from earlier layers of one model. | Training with layer dropout and early-exit loss changes the target; not an add-on to the pinned target revision. | Reject for current fixed targets. |
 
 The 300 MB figure is arithmetic (`0.6e9 * 4 / 8`), not a measured model
@@ -55,9 +67,10 @@ measured acceptance/memory trade-off, not an assumption.
 
 ## Reopen gate and bounded experiment
 
-1. On one pinned Pixel and desktop build, measure complete `V(K)` for
-   K=1, 2, 4, 8, with target-only greedy parity and actual peak memory. Run
-   the #310 buckets and capture per-take energy by the declared protocol.
+1. Extend the narrow CPU S1 pilot to the #310 buckets, then on one pinned
+   Pixel and desktop fast-engine build measure complete `V(K)` for K=1, 2,
+   4, 8, with target-only greedy parity and actual peak memory. Capture
+   per-take energy by the declared protocol.
 2. Replay free drafts on the *same* emitted target IDs. For cleanup, include
    aligned copy and revision reuse; for ASR, distinguish live-preview Parakeet
    (already paid) from batch Parakeet (new cost). Select the best free baseline
