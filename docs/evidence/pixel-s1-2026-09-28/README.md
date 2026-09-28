@@ -8,6 +8,10 @@ The original runner is preserved in git history at `60ba885`. The current
 memory-snapshot, and hashing procedure without publishing the device address
 or host paths. A new run supplies `STARLING_ADB_SERIAL`, `--artifact-dir`,
 `--binary`, and `--engine-source-commit` explicitly.
+Before starting the server, the runner checks that the selected device reports
+Google Pixel 10 Pro and that the staged BF16 source, selected model, and server
+binary have the same SHA-256 hashes as the supplied local files. A mismatch
+stops the run before port forwarding or inference.
 The [BF16](s1-bf16-serve.log) and [Q4](s1-q4-k-m-serve.log) server logs
 record model loading, warmup, CPU backend selection, and Q4 repack messages.
 The comparison checks the fixture SHA256 and recomputes each protected-span

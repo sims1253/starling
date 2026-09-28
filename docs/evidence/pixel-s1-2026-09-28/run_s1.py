@@ -31,9 +31,9 @@ def adb_command(*args: str) -> list[str]:
     return [ADB, "-s", SERIAL, *args]
 
 
-def adb(*args: str) -> subprocess.CompletedProcess:
+def adb(*args: str, timeout: int = 30) -> subprocess.CompletedProcess:
     return subprocess.run(adb_command(*args), text=True,
-                          capture_output=True, timeout=30, check=True)
+                          capture_output=True, timeout=timeout, check=True)
 
 
 def digest(path: Path) -> str:
@@ -42,6 +42,38 @@ def digest(path: Path) -> str:
         for chunk in iter(lambda: f.read(1 << 20), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def verify_device() -> None:
+    manufacturer = adb("shell", "getprop", "ro.product.manufacturer").stdout.strip()
+    model = adb("shell", "getprop", "ro.product.model").stdout.strip()
+    if manufacturer.casefold() != "google" or model != "Pixel 10 Pro":
+        raise RuntimeError(f"expected Google Pixel 10 Pro, got {manufacturer!r} {model!r}")
+
+
+def staged_digest(name: str) -> str:
+    remote_path = f"{DEVICE}/{name}"
+    output = adb("shell", "sha256sum", remote_path, timeout=300).stdout.strip()
+    match = re.fullmatch(r"([0-9a-fA-F]{64})\s+\*?(.+)", output)
+    if not match or match.group(2) != remote_path:
+        raise RuntimeError(f"invalid remote SHA-256 output for {remote_path}: {output!r}")
+    return match.group(1).lower()
+
+
+def verify_staged_artifacts(arm: str, model: Path, source: Path,
+                            binary: Path) -> dict:
+    staged = {"s1-bf16.gguf": source, f"s1-{arm}.gguf": model,
+              "starling-serve": binary}
+    hashes = {}
+    for name, local_path in staged.items():
+        local_hash = digest(local_path)
+        if staged_digest(name) != local_hash:
+            raise RuntimeError(f"staged {name} differs from local input {local_path}")
+        hashes[name] = local_hash
+    return {"model_sha256": hashes[f"s1-{arm}.gguf"],
+            "model_bytes": model.stat().st_size,
+            "source_sha256": hashes["s1-bf16.gguf"],
+            "engine_sha256": hashes["starling-serve"]}
 
 
 def post(transcript: str, req_id: str) -> tuple[str, float]:
@@ -111,6 +143,8 @@ def main() -> int:
     log = ROOT / f"s1-{args.arm}-serve.log"
     if out.exists():
         ap.error("refusing to overwrite existing record")
+    verify_device()
+    verified_artifacts = verify_staged_artifacts(args.arm, model, source, binary)
     remote = (f"cd {DEVICE} && env LD_LIBRARY_PATH=. STARLING_ENGINE=ggml "
               f"STARLING_GGML_DEVICE=CPU STARLING_GGML_THREADS=6 "
               f"./starling-serve --model s1 --gguf {DEVICE}/s1-{args.arm}.gguf "
@@ -158,9 +192,8 @@ def main() -> int:
                              "spans_present": audit_output(case, text),
                              "times_ms": times, "median_ms": statistics.median(times)})
             after = snapshot(pid)
-            record = {"schema": "s1-quant-spans-v1", "model_sha256": digest(model),
-                      "model_bytes": model.stat().st_size, "source_sha256": digest(source),
-                      "engine_sha256": digest(binary), "cases_sha256": digest(cases_file),
+            record = {"schema": "s1-quant-spans-v1", **verified_artifacts,
+                      "cases_sha256": digest(cases_file),
                       "device": "CPU/Pixel10Pro", "results": rows,
                       "memory_before": before, "memory_after": after,
                       "engine_source_commit": args.engine_source_commit,
