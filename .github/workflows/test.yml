@@ -81,7 +81,10 @@ jobs:
           docs/evidence/pixel-s1-2026-09-28/controlled/test_controlled.py
 
       - name: Validate Pixel CPU residency evidence
-        run: python3 docs/evidence/pixel-s1-2026-09-28/cpu-co-residency/analyze.py
+        run: |
+          python3 docs/evidence/pixel-s1-2026-09-28/cpu-co-residency/analyze.py
+          cd docs/evidence/pixel-s1-2026-09-28/cpu-co-residency
+          sha256sum -c hashes.sha256
 
       # tests/test_native_parity_contract.py (issue #167): the executable
       # numerical-correctness contract — manifest schema, test-selection

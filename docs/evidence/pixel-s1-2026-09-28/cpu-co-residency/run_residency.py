@@ -4,29 +4,75 @@
 import datetime as dt
 import hashlib
 import json
+import os
 import re
 import subprocess
-import sys
 import time
 import urllib.error
 import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-sys.path.insert(0, str(ROOT.parent / "native-copy-controlled"))
-from run_copy import state, remote_server_pids  # noqa: E402
-
-ADB = "/home/m0hawk/android-sdk/platform-tools/adb"
-SERIAL = "192.168.178.59:34113"
+ADB = os.environ.get("STARLING_ADB", "adb")
+SERIAL = os.environ.get("STARLING_ADB_SERIAL", "")
 DEVICE = "/data/local/tmp/starling-issue-batch"
 PROTOCOL = ROOT / "protocol.json"
 RECORD = ROOT / "record.json"
 SAMPLES = ROOT / "samples.jsonl"
 
 
+def adb_command(*args):
+    if not SERIAL:
+        raise RuntimeError("set STARLING_ADB_SERIAL to the intended device")
+    return [ADB, "-s", SERIAL, *args]
+
+
 def adb(*args, timeout=30):
-    return subprocess.run([ADB, "-s", SERIAL, *args], check=True,
+    return subprocess.run(adb_command(*args), check=True,
                           capture_output=True, text=True, timeout=timeout).stdout
+
+
+def remote_server_pids():
+    result = subprocess.run(adb_command("shell", "pidof starling-serve"),
+                            capture_output=True, text=True, timeout=30)
+    if result.returncode not in (0, 1):
+        raise RuntimeError(f"pidof starling-serve failed: {result.stderr.strip()}")
+    pids = result.stdout.split()
+    if any(not pid.isdecimal() for pid in pids):
+        raise RuntimeError(f"invalid server PID list: {pids}")
+    return pids
+
+
+def state():
+    start = time.monotonic_ns()
+    battery = adb("shell", "dumpsys battery")
+    thermal = adb("shell", "dumpsys thermalservice")
+    power = adb("shell", "dumpsys power")
+    display = adb("shell", "dumpsys display")
+    end = time.monotonic_ns()
+
+    def field(pattern, source, name, cast=str):
+        match = re.search(pattern, source, re.MULTILINE)
+        if match is None:
+            raise RuntimeError(f"missing {name} in phone state")
+        return cast(match.group(1))
+
+    return {
+        "charge_uah": field(r"^\s*Charge counter:\s*(-?\d+)", battery, "charge counter", int),
+        "voltage_mv": field(r"^\s*voltage:\s*(\d+)", battery, "voltage", int),
+        "battery_status": field(r"^\s*status:\s*(\d+)", battery, "battery status", int),
+        "battery_percent": field(r"^\s*level:\s*(\d+)", battery, "battery level", int),
+        "battery_temp_deci_c": field(r"^\s*temperature:\s*(\d+)", battery, "temperature", int),
+        "ac_powered": field(r"^\s*AC powered:\s*(true|false)", battery, "AC power"),
+        "usb_powered": field(r"^\s*USB powered:\s*(true|false)", battery, "USB power"),
+        "wireless_powered": field(r"^\s*Wireless powered:\s*(true|false)", battery, "wireless power"),
+        "thermal_status": field(r"^Thermal Status:\s*(\d+)", thermal, "thermal status", int),
+        "screen_state": field(r"^\s*mScreenState=(\w+)", display, "screen state"),
+        "wakefulness": field(r"^\s*mWakefulness=(\w+)", power, "wakefulness"),
+        "mono_start_ns": start, "mono_end_ns": end,
+        "mono_mid_ns": (start + end) // 2,
+        "utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+    }
 
 
 def sha(path):
@@ -83,7 +129,7 @@ def launch(name, slug, gguf, device_port, host_port, before, deadline):
               f"--warmup --host 127.0.0.1 --port {device_port}")
     start = time.monotonic_ns()
     log = out.open("wb")
-    process = subprocess.Popen([ADB, "-s", SERIAL, "shell", remote],
+    process = subprocess.Popen(adb_command("shell", remote),
                                stdout=log, stderr=subprocess.STDOUT)
     try:
         ready_deadline = min(deadline, time.monotonic() + 180)
@@ -156,9 +202,8 @@ def main():
         record["failure"] = repr(error)
         raise
     finally:
-        # The first process may have started before readiness exposed its PID.
-        pids = remote_server_pids()
-        for pid in pids:
+        # Only terminate server PIDs this run identified as its own.
+        for pid in {item["pid"] for item in owned}:
             try:
                 adb("shell", f"kill -TERM {pid}")
             except Exception as error:
@@ -169,20 +214,28 @@ def main():
             except subprocess.TimeoutExpired:
                 item["process"].kill()
                 item["process"].wait()
-            item["log"].close()
+            except Exception as error:
+                record.setdefault("cleanup_errors", []).append(repr(error))
+            finally:
+                item["log"].close()
         for port in forwards + [18184, 18185]:
             try:
                 adb("forward", "--remove", f"tcp:{port}")
             except Exception:
                 pass
-        left = remote_server_pids()
-        record["remote_pids_after_cleanup"] = left
-        RECORD.write_text(json.dumps(record, indent=2) + "\n")
-        if left:
-            raise RuntimeError(f"owned server survived cleanup: {left}")
-        sample_stage("recovery", {})
+        try:
+            left = remote_server_pids()
+            record["remote_pids_after_cleanup"] = left
+            if left:
+                record.setdefault("cleanup_errors", []).append(f"server PIDs after cleanup: {left}")
+            else:
+                sample_stage("recovery", {})
+        except Exception as error:
+            record.setdefault("cleanup_errors", []).append(repr(error))
         record["completed"] = not record.get("failure") and not record.get("cleanup_errors")
         RECORD.write_text(json.dumps(record, indent=2) + "\n")
+        if record.get("cleanup_errors") and not record.get("failure"):
+            raise RuntimeError(f"residency cleanup failed: {record['cleanup_errors']}")
     print("RESIDENCY SNAPSHOT COMPLETE", flush=True)
 
 

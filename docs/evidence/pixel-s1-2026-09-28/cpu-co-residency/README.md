@@ -4,8 +4,12 @@ This descriptive issue #316 observation used one Pixel 10 Pro on 2026-09-28.
 It compares no owned Starling process, a warmed **Parakeet IQ2 baseline ASR**
 server alone, and that same ASR server with a separately warmed **S1 Q4_K_M**
 server resident. Both selected the GGML CPU backend with six threads. The
-[protocol](protocol.json) was saved before the run (SHA256
+original protocol was saved before the run (SHA256
 `2fe9df844f1b866a8dee64bdc32cee20990997ebee2168988cf5a7ec95383f73`).
+The [published copy](protocol.json) redacts the private device address and
+therefore has a different, byte-pinned hash checked by the analyzer. [The
+original hash](protocol.sha256) remains an opaque commitment in the raw record;
+the original bytes are not present in this published evidence directory.
 The ASR warmup used the server's five-second silent clip; S1 used its built-in
 probe text. No user transcript or extra workload was sent. Each stage has
 three [raw samples](samples.jsonl) about five seconds apart; the
@@ -38,10 +42,11 @@ shows both servers reached ready after their built-in warmups (8.3 s ASR;
 14.2 s S1) and neither survived cleanup. No mobile behavior or default was
 changed.
 
-The exact host-specific [runner](run_residency.py), [ASR log](asr.log),
+The original host-specific runner is preserved in git history at `60ba885`;
+the current [runner](run_residency.py) uses local ADB configuration. [ASR log](asr.log),
 [S1 log](s1.log), model/server hashes in the protocol, and
-[file hashes](hashes.sha256) preserve provenance. The runner imports phone
-state/PID helpers from the separate native-copy pilot workspace; replay on
-another host requires adapting its local paths and ADB serial. Run
+[file hashes](hashes.sha256) preserve provenance. The runner includes its
+phone state/PID helpers; a new run needs a connected device and a separately
+sealed protocol. Run
 `python3 analyze.py` here to validate and regenerate the summary without
 accessing the phone.

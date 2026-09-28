@@ -3,9 +3,11 @@
 The [BF16 record](s1-bf16-pixel.json), [Q4 record](s1-q4-k-m-pixel.json),
 and [comparison](s1-pixel-comparison.json) use the existing
 `s1-quant-spans-v1` schema and `benchmarks/s1/quant_spans.py compare`.
-The original [runner](run_s1.py) documents the ADB, HTTP `/normalize`,
-three-repeat, memory-snapshot, and hashing procedure. Its absolute paths
-identify this measurement workspace and must be changed on another host.
+The original runner is preserved in git history at `60ba885`. The current
+[runner](run_s1.py) documents the ADB, HTTP `/normalize`, three-repeat,
+memory-snapshot, and hashing procedure without publishing the device address
+or host paths. A new run supplies `STARLING_ADB_SERIAL`, `--artifact-dir`,
+`--binary`, and `--engine-source-commit` explicitly.
 The [BF16](s1-bf16-serve.log) and [Q4](s1-q4-k-m-serve.log) server logs
 record model loading, warmup, CPU backend selection, and Q4 repack messages.
 The comparison checks the fixture SHA256 and recomputes each protected-span

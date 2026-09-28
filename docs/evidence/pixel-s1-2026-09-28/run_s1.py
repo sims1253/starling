@@ -4,6 +4,7 @@
 import argparse
 import hashlib
 import json
+import os
 import re
 import statistics
 import subprocess
@@ -14,18 +15,24 @@ import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-PROJECT = Path("/home/m0hawk/.t3/worktrees/starling/s1-quant-recipe")
+PROJECT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(PROJECT / "benchmarks/s1"))
 from quant_spans import audit_output, check_cases  # noqa: E402
 
-ADB = "/home/m0hawk/android-sdk/platform-tools/adb"
-SERIAL = "192.168.178.59:34113"
+ADB = os.environ.get("STARLING_ADB", "adb")
+SERIAL = os.environ.get("STARLING_ADB_SERIAL", "")
 DEVICE = "/data/local/tmp/starling-issue-batch"
 PORT = 18181
 
 
+def adb_command(*args: str) -> list[str]:
+    if not SERIAL:
+        raise RuntimeError("set STARLING_ADB_SERIAL to the intended device")
+    return [ADB, "-s", SERIAL, *args]
+
+
 def adb(*args: str) -> subprocess.CompletedProcess:
-    return subprocess.run([ADB, "-s", SERIAL, *args], text=True,
+    return subprocess.run(adb_command(*args), text=True,
                           capture_output=True, timeout=30, check=True)
 
 
@@ -64,7 +71,7 @@ def snapshot(pid: str) -> dict:
     def value(pat: str, text: str):
         found = re.search(pat, text, re.MULTILINE)
         return found.group(1) if found else None
-    return {"charge_uah": number(r"^\s*Charge counter:\s*(\d+)", battery),
+    return {"charge_uah": number(r"^\s*Charge counter:\s*(-?\d+)", battery),
             "ac_powered": value(r"^\s*AC powered:\s*(true|false)", battery),
             "battery_status": number(r"^\s*status:\s*(\d+)", battery),
             "voltage_mv": number(r"^\s*voltage:\s*(\d+)", battery),
@@ -82,17 +89,28 @@ def snapshot(pid: str) -> dict:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("arm", choices=["bf16", "q4-k-m"])
+    ap.add_argument("--artifact-dir", required=True, type=Path,
+                    help="directory containing both S1 GGUF arms")
+    ap.add_argument("--binary", required=True, type=Path,
+                    help="local starling-serve binary used to stage the device")
+    ap.add_argument("--engine-source-commit", required=True,
+                    help="source commit used to build the staged binary")
     args = ap.parse_args()
+    if not SERIAL:
+        ap.error("set STARLING_ADB_SERIAL to the intended device")
     cases_file = PROJECT / "tests/fixtures/s1_quant_spans.json"
     cases = json.loads(cases_file.read_text())
     check_cases(cases)
-    model = Path(f"/home/m0hawk/.t3/quant-exp-50/s1-{args.arm}.gguf")
-    source = Path("/home/m0hawk/.t3/quant-exp-50/s1-bf16.gguf")
-    binary = Path("/home/m0hawk/.t3/quant-exp-50/build-android-pr333/starling-serve")
+    model = args.artifact_dir / f"s1-{args.arm}.gguf"
+    source = args.artifact_dir / "s1-bf16.gguf"
+    binary = args.binary
+    for path in (model, source, binary):
+        if not path.is_file():
+            ap.error(f"missing input: {path}")
     out = ROOT / f"s1-{args.arm}-pixel.json"
     log = ROOT / f"s1-{args.arm}-serve.log"
-    if out.exists() or log.exists():
-        ap.error("refusing to overwrite existing record or server log")
+    if out.exists():
+        ap.error("refusing to overwrite existing record")
     remote = (f"cd {DEVICE} && env LD_LIBRARY_PATH=. STARLING_ENGINE=ggml "
               f"STARLING_GGML_DEVICE=CPU STARLING_GGML_THREADS=6 "
               f"./starling-serve --model s1 --gguf {DEVICE}/s1-{args.arm}.gguf "
@@ -100,8 +118,15 @@ def main() -> int:
     adb("forward", f"tcp:{PORT}", "tcp:8181")
     pid = None
     with log.open("wb") as stream:
-        process = subprocess.Popen([ADB, "-s", SERIAL, "shell", remote],
-                                   stdout=stream, stderr=subprocess.STDOUT)
+        try:
+            process = subprocess.Popen(adb_command("shell", remote),
+                                       stdout=stream, stderr=subprocess.STDOUT)
+        except Exception:
+            try:
+                adb("forward", "--remove", f"tcp:{PORT}")
+            except (OSError, subprocess.SubprocessError):
+                pass
+            raise
         try:
             deadline = time.monotonic() + 180
             while time.monotonic() < deadline:
@@ -112,7 +137,7 @@ def main() -> int:
                         health = json.load(response)
                     if health.get("phase") == "ready":
                         break
-                except (urllib.error.URLError, TimeoutError, OSError):
+                except (urllib.error.URLError, TimeoutError, OSError, ValueError):
                     pass
                 time.sleep(1)
             else:
@@ -138,17 +163,33 @@ def main() -> int:
                       "engine_sha256": digest(binary), "cases_sha256": digest(cases_file),
                       "device": "CPU/Pixel10Pro", "results": rows,
                       "memory_before": before, "memory_after": after,
-                      "engine_source_commit": "2a3bda4", "server_log_sha256": None}
+                      "engine_source_commit": args.engine_source_commit,
+                      "server_log_sha256": None}
             # Close the server first; hash its final log below.
         finally:
+            cleanup_errors = []
             if pid:
-                adb("shell", f"kill -TERM {pid}")
+                try:
+                    adb("shell", f"kill -TERM {pid}")
+                except (OSError, subprocess.SubprocessError) as error:
+                    cleanup_errors.append(repr(error))
+            elif process.poll() is None:
+                process.terminate()
             try:
                 process.wait(timeout=15)
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait()
-            adb("forward", "--remove", f"tcp:{PORT}")
+            except OSError as error:
+                cleanup_errors.append(repr(error))
+            try:
+                adb("forward", "--remove", f"tcp:{PORT}")
+            except (OSError, subprocess.SubprocessError) as error:
+                cleanup_errors.append(repr(error))
+            if cleanup_errors:
+                if sys.exc_info()[0] is None:
+                    raise RuntimeError(f"server cleanup failed: {cleanup_errors}")
+                print(f"server cleanup also failed: {cleanup_errors}", file=sys.stderr)
     record["server_log_sha256"] = digest(log)
     out.write_text(json.dumps(record, indent=2, ensure_ascii=False) + "\n")
     print(out)

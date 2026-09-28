@@ -1,7 +1,7 @@
 {
   "schema": "pixel-cpu-asr-optional-s1-residency-v1",
   "registered_utc": "2026-09-28T12:54:53Z",
-  "phone": "Pixel 10 Pro Android 17, serial 192.168.178.59:34113",
+  "phone": "Pixel 10 Pro Android 17, serial [redacted]",
   "purpose": "Descriptive CPU shell-process fallback for issue 316 ASR-only versus ASR plus optional S1 Q4; no fast/Vulkan or mobile APK claim",
   "artifacts": {
     "source_commit": "2a3bda4",

@@ -8,6 +8,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 ORDER = ("idle", "asr_only", "asr_plus_optional_s1", "recovery")
 EXPECTED_PROCESSES = ((), ("asr",), ("asr", "s1"), ())
+PUBLIC_PROTOCOL_SHA256 = "03d204739f8faed3a5e53d67101628ba84802c16d750498b325c5b7815352827"
 
 
 def require(condition, message):
@@ -19,8 +20,17 @@ def main():
     protocol = HERE / "protocol.json"
     record = json.loads((HERE / "record.json").read_text())
     rows = [json.loads(line) for line in (HERE / "samples.jsonl").read_text().splitlines()]
-    require(record["protocol_sha256"] == hashlib.sha256(protocol.read_bytes()).hexdigest(),
-            "record/protocol hash mismatch")
+    # The record pins the original sealed protocol. The published copy removes
+    # the private device address, so its own hash differs by design.
+    original_hash = (HERE / "protocol.sha256").read_text().strip()
+    require(record["protocol_sha256"] == original_hash,
+            "record/original protocol hash mismatch")
+    require(hashlib.sha256(protocol.read_bytes()).hexdigest() == PUBLIC_PROTOCOL_SHA256,
+            "published protocol hash mismatch")
+    public_protocol = json.loads(protocol.read_text())
+    require(public_protocol.get("schema") == "pixel-cpu-asr-optional-s1-residency-v1"
+            and public_protocol.get("phone") == "Pixel 10 Pro Android 17, serial [redacted]",
+            "published protocol schema or redaction differs")
     require(record["completed"] is True, "run incomplete")
     require(record["remote_pids_after_cleanup"] == [], "server survived cleanup")
     require(len(rows) == 12, "wrong sample count")
