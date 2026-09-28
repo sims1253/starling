@@ -44,3 +44,28 @@ They exclude the cost of producing those oracle IDs. A copy or CTC proposer
 needs a separate full-cost benchmark before runtime enablement. One run does
 not establish stable throughput or energy savings. Vulkan and Pixel
 measurements remain open.
+
+## CPU verifier attention-width correction
+
+A later real Granite Speech 4.1 2B check exposed a token-parity failure in
+the original CPU verifier. Greedy CPU decoding attended only to its populated
+KV prefix, while the batched verifier attended to the full cache width with
+future keys masked. On the model-supplied 24.94-second `multilingual_sample.wav`
+clip, greedy emitted 98 IDs and the original verifier emitted 100 IDs at
+K=1, 2, and 4: it inserted token ID 11 twice. The clip came from model
+snapshot `de575db64086f84fdc79da4932d1076e965bc546` and has SHA-256
+`91d243650809c1274141ec20ff23045315eaf27567694002ea3ef390048b7058`.
+The optional-CTC-head GGUF used in that check has SHA-256
+`cec47a4fb872ace2713447409f01e0f9ef0d2a7f217db8bb9c33ea0ef96c916a`.
+
+The CPU verifier now copies the S candidate KV rows and attends to exactly
+`past + S` keys, matching greedy CPU's attention extent. With that change,
+K=1, 2, and 4 each produced the same 98 IDs and stop result as greedy on
+this clip. `STARLING_GRANITE_FULLCAP=1` retains the full-capacity verifier
+when the greedy path explicitly selects full-capacity attention; the GPU
+verifier also keeps its existing graph. The real check uses the
+`granite_ctc_verify_test` harness from the stacked #313 work, which adds a
+CTC draft source and is not part of the generic verifier. The self-synthesized
+`speculative_verifier_test` also passed after the correction. This one clip
+confirms the fixed mismatch; other models and devices still need their own
+parity checks.
