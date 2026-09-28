@@ -46,7 +46,9 @@ def cpu_count(cpu_list: str) -> int:
     """Count CPUs in a taskset list such as ``16-23`` or ``0,2,4-7``."""
     total = 0
     for part in cpu_list.split(","):
-        first, _, last = part.partition("-")
+        first, _, last = part.strip().partition("-")
+        if not first.isdigit() or (last and not last.isdigit()):
+            raise ValueError(f"malformed CPU list segment {part!r} in {cpu_list!r}")
         total += int(last or first) - int(first) + 1
     return total
 
@@ -239,6 +241,8 @@ def main() -> int:
         ("short WAV", args.short_wav, "short_wav_sha256"),
         ("long WAV", args.long_wav, "long_wav_sha256"),
     ):
+        if key not in spec:
+            parser.error(f"spec is missing required key: {key}")
         if not path.is_file() or sha256_file(path) != spec[key]:
             parser.error(f"{name} is missing or does not match the preregistered SHA-256: {path}")
 
@@ -248,7 +252,10 @@ def main() -> int:
     base_url = f"http://127.0.0.1:{port}"
     env = os.environ.copy()
     env["STARLING_TRACE"] = "1"
-    env["OMP_NUM_THREADS"] = str(cpu_count(args.cpu_list))
+    try:
+        env["OMP_NUM_THREADS"] = str(cpu_count(args.cpu_list))
+    except ValueError as exc:
+        parser.error(str(exc))
     command = ["taskset", "-c", args.cpu_list, str(args.binary), "--model", "granite",
                "--gguf", str(args.gguf), "--port", str(port), *args.server_arg]
     summary = {
@@ -384,13 +391,15 @@ def main() -> int:
             (args.out_dir / "result.json").write_text(json.dumps(summary, indent=2) + "\n")
             return 1
         finally:
-            if process.poll() is None:
+            try:
                 os.killpg(process.pid, signal.SIGTERM)
                 try:
                     process.wait(timeout=10)
                 except subprocess.TimeoutExpired:
                     os.killpg(process.pid, signal.SIGKILL)
                     process.wait()
+            except ProcessLookupError:
+                pass  # already exited; never mask the run's own outcome
 
 
 if __name__ == "__main__":
