@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <iomanip>
+#include <iterator>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -102,7 +103,11 @@ bool run(const moss::MossModel& model, const moss::Tokenizer& tokenizer,
         PreviewCopyDrafter drafter(std::move(source_ids), max_k);
         const auto ts = Clock::now();
         out.source_ms = elapsed_ms(t3, ts);
-        auto propose = [&drafter](const std::vector<int32_t>& prefix, int cap) {
+        const bool diagnostic_no_draft =
+            std::getenv("MOSS_PREVIEW_DIAGNOSTIC_NO_DRAFT") != nullptr;
+        auto propose = [&drafter, diagnostic_no_draft](
+                           const std::vector<int32_t>& prefix, int cap) {
+            if (diagnostic_no_draft) return std::vector<int32_t>{};
             return drafter.propose(prefix, cap);
         };
         if (!moss::speculative_generate(model, input, options, max_k, propose,
@@ -138,6 +143,8 @@ void print_pair(const char* tier, int k, int repeat, const Run& greedy,
     std::printf("{\"case\":\"%s\",\"k\":%d,\"repeat\":%d,"
                 "\"order\":\"%s\",\"parity\":%s,\"golden_text\":%s,"
                 "\"stop\":\"%s\",\"tokens\":%zu,\"ids_fnv64\":\"%s\","
+                "\"draft_stop\":\"%s\",\"draft_tokens\":%zu,"
+                "\"draft_ids_fnv64\":\"%s\","
                 "\"source_tokens\":%zu,\"greedy_ms\":%.3f,\"draft_ms\":%.3f,"
                 "\"greedy_mel_ms\":%.3f,\"greedy_audio_ms\":%.3f,"
                 "\"greedy_prompt_ms\":%.3f,\"greedy_gen_ms\":%.3f,"
@@ -150,7 +157,9 @@ void print_pair(const char* tier, int k, int repeat, const Run& greedy,
                 tier, k, repeat, repeat % 2 == 0 ? "greedy-first" : "draft-first",
                 parity ? "true" : "false", golden_match ? "true" : "false",
                 stop_name(greedy.output.stop_reason), greedy.output.ids.size(),
-                ids_fingerprint(greedy.output.ids).c_str(), draft.source_tokens,
+                ids_fingerprint(greedy.output.ids).c_str(),
+                stop_name(draft.output.stop_reason), draft.output.ids.size(),
+                ids_fingerprint(draft.output.ids).c_str(), draft.source_tokens,
                 greedy.total_ms, draft.total_ms,
                 greedy.mel_ms, greedy.audio_ms, greedy.prompt_ms, greedy.generate_ms,
                 draft.mel_ms, draft.audio_ms, draft.prompt_ms, draft.source_ms,
@@ -169,6 +178,11 @@ int main(int argc, char** argv) {
     }
     const int repeats = std::atoi(argv[5]);
     if (repeats < 1 || repeats > 5) return 2;
+    int diagnostic_k = 0;
+    if (const char* value = std::getenv("MOSS_PREVIEW_DIAGNOSTIC_K")) {
+        diagnostic_k = std::atoi(value);
+        if (diagnostic_k < 1 || diagnostic_k > 4) return 2;
+    }
     moss::MossModel model;
     std::string err;
     if (!model.load(argv[1], err)) {
@@ -180,12 +194,17 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "MOSS tokenizer load: %s\n", err.c_str());
         return 2;
     }
-    std::printf("{\"backend\":\"%s\",\"repeats\":%d}\n",
-                starling_ggml_backend_name(), repeats);
+    std::printf("{\"backend\":\"%s\",\"repeats\":%d,"
+                "\"row_attention\":%s,\"diagnostic_k\":%d}\n",
+                starling_ggml_backend_name(), repeats,
+                std::getenv("STARLING_MOSS_VERIFY_ROW_ATTN") ? "true" : "false",
+                diagnostic_k);
     std::fflush(stdout);
 
     for (int case_i = 0; case_i < 2; ++case_i) {
         const char* tier = case_i == 0 ? "short" : "medium";
+        const char* diagnostic_tier = std::getenv("MOSS_PREVIEW_DIAGNOSTIC_TIER");
+        if (diagnostic_tier && std::string(diagnostic_tier) != tier) continue;
         const std::string root = argv[2];
         const std::string preview = read_file(root + "/parakeet_tdt_" + tier +
                                               "_text.txt");
@@ -198,14 +217,18 @@ int main(int argc, char** argv) {
             return 2;
         }
         // Warm each arm after loading the model; exclude warmup from pairs.
-        for (int k : {0, 2, 4}) {
+        const std::vector<int> warm_ks = diagnostic_k
+            ? std::vector<int>{0, diagnostic_k} : std::vector<int>{0, 2, 4};
+        for (int k : warm_ks) {
             Run warm;
             if (!run(model, tokenizer, pcm, preview, k, warm, err)) {
                 std::fprintf(stderr, "%s warmup k=%d: %s\n", tier, k, err.c_str());
                 return 2;
             }
         }
-        for (int k : {2, 4}) for (int rep = 0; rep < repeats; ++rep) {
+        const std::vector<int> measured_ks = diagnostic_k
+            ? std::vector<int>{diagnostic_k} : std::vector<int>{2, 4};
+        for (int k : measured_ks) for (int rep = 0; rep < repeats; ++rep) {
             Run greedy, draft;
             if (rep % 2 == 0) {
                 if (!run(model, tokenizer, pcm, preview, 0, greedy, err) ||
@@ -229,7 +252,24 @@ int main(int argc, char** argv) {
                 greedy.output.stop_reason != draft.output.stop_reason ||
                 greedy.text != draft.text ||
                 greedy.output.stop_reason !=
-                    starling::ggml::lib::GenStopReason::kEos) return 1;
+                    starling::ggml::lib::GenStopReason::kEos) {
+                size_t first = 0;
+                while (first < greedy.output.ids.size() &&
+                       first < draft.output.ids.size() &&
+                       greedy.output.ids[first] == draft.output.ids[first]) ++first;
+                const int32_t greedy_id = first < greedy.output.ids.size()
+                    ? greedy.output.ids[first] : -1;
+                const int32_t draft_id = first < draft.output.ids.size()
+                    ? draft.output.ids[first] : -1;
+                std::fprintf(stderr,
+                    "%s k=%d rep=%d mismatch index=%zu greedy_id=%d draft_id=%d "
+                    "greedy_count=%zu draft_count=%zu greedy_stop=%s draft_stop=%s\n",
+                    tier, k, rep, first, greedy_id, draft_id,
+                    greedy.output.ids.size(), draft.output.ids.size(),
+                    stop_name(greedy.output.stop_reason),
+                    stop_name(draft.output.stop_reason));
+                return 1;
+            }
         }
     }
     return 0;

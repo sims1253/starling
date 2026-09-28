@@ -47,3 +47,26 @@ batch files remains unmeasured here.
 Run with `STARLING_GGML_DEVICE=cpu STARLING_GGML_THREADS=4` and
 `taskset -c 16-23` against `moss-preview-copy-pilot`, model path, golden root,
 short WAV, medium WAV, and `2` repeats, in that order.
+
+## Amendment after the first scored failure, before the opt-in paired trial
+
+The original binary exited at the first medium K=2 pair. Its saved record is
+`moss_preview_copy_initial_failed.jsonl`: short K=2/K=4 pairs (four total)
+matched, but medium K=2 diverged despite ending on EOS. A diagnostic build
+found first disagreement at zero-based output ID 21 (greedy 13, verifier 432):
+greedy 89 IDs versus speculative 91. K=1 reproduced that same first mismatch;
+an empty proposer that routes every token through the one-step fallback matched
+all 89 greedy IDs. These controls are not scored repetitions.
+
+An isolated, **opt-in** native verifier experiment now computes each batched
+attention row over `past + row + 1` keys, while retaining batched projections
+and cache writes. The default remains unchanged. One diagnostic medium K=1
+trial with `STARLING_MOSS_VERIFY_ROW_ATTN=1` matched all 89 IDs and EOS. The
+next scored trial keeps the same two fixtures, warmups, K=2/K=4, alternating
+two repeats, CPU affinity, parity rule and ≥5% full-call rule above; it adds
+only `STARLING_MOSS_VERIFY_ROW_ATTN=1`. Its rebuilt executable SHA-256 before
+scoring is
+`79efffb670aa22a1a777906bae42742ea09fa0ede3074f7dd4f5fc38c964b6ba`.
+The first failure remains part of the result rather than being erased by this
+amendment. Passing the two fixtures would be bounded evidence for this fix,
+not a proof that all CPU models or future inputs are identical.
