@@ -1,6 +1,7 @@
 // Optional real long-audio parity: apply the same padded chunk/budget policy
 // as capi_granite.cpp, then compare each fused CTC verification with greedy.
 #include "granite/speculative.hpp"
+#include "granite/chunk_policy.hpp"
 #include "granite/prompt.hpp"
 #include "runtime/audio_io.hpp"
 
@@ -33,9 +34,7 @@ int main(int argc, char** argv) {
         return 2;
     }
     const auto& cfg = model.config;
-    const double limited = std::max(0.1, ((double)(int)cfg.max_new_tokens - 32.0) / 5.0);
-    const int64_t chunk_samples = (int64_t)std::llround(
-        std::min(cfg.chunk_seconds, limited) * 16000.0);
+    const int64_t chunk_samples = effective_chunk_samples(cfg);
     if ((int64_t)pcm.size() <= chunk_samples) {
         std::fprintf(stderr, "audio must exceed one policy chunk (%lld samples)\n",
                      (long long)chunk_samples);
@@ -52,10 +51,7 @@ int main(int argc, char** argv) {
         const double seconds = (double)len / 16000.0;
         const int64_t prompt_len = (int64_t)cfg.prompt_prefix.size() +
             audio_token_count(chunk_samples, cfg) + (int64_t)cfg.prompt_suffix.size();
-        int32_t budget = std::min<int32_t>(cfg.max_new_tokens,
-                                          (int32_t)std::ceil(seconds * 5.0) + 32);
-        const int64_t headroom = (int64_t)cfg.llm.max_cache - prompt_len - 1;
-        budget = (int32_t)std::min<int64_t>(budget, std::max<int64_t>(1, headroom));
+        const int32_t budget = decode_budget(cfg, seconds, prompt_len);
         const auto t0 = Clock::now();
         MelFeatures mel;
         if (!compute_log_mel(cfg, model.loader, padded.data(), padded.size(), mel, err)) {

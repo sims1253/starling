@@ -3,6 +3,7 @@
 // Warm greedy and K=1,2,4 once, then pair K=2 and K=4 against greedy in
 // both orders (odd repetition greedy first; even repetition candidate first).
 #include "granite/speculative.hpp"
+#include "granite/chunk_policy.hpp"
 #include "granite/prompt.hpp"
 #include "runtime/audio_io.hpp"
 #include "runtime/backend.hpp"
@@ -35,8 +36,10 @@ bool execute(const GraniteModel& model, const std::vector<float>& pcm,
     if (!compute_log_mel(model.config, model.loader, pcm.data(), pcm.size(), mel, err)) return false;
     auto t1 = Clock::now();
     const double seconds = (double)pcm.size() / 16000.0;
-    const int32_t budget = std::min<int32_t>(model.config.max_new_tokens,
-                                            (int32_t)std::ceil(seconds * 5.0) + 32);
+    const int64_t prompt_len = (int64_t)model.config.prompt_prefix.size() +
+        audio_token_count((int64_t)pcm.size(), model.config) +
+        (int64_t)model.config.prompt_suffix.size();
+    const int32_t budget = decode_budget(model.config, seconds, prompt_len);
     GenerateOptions op;
     op.max_new_tokens = budget;
     op.max_cache_len = model.config.llm.max_cache;
@@ -89,8 +92,11 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "usage: %s ctc.gguf public.wav [paired_repeats=2]\n", argv[0]);
         return 2;
     }
-    const int repeats = argc == 4 ? std::atoi(argv[3]) : 2;
-    if (repeats < 0 || repeats > 10) return 2;
+    char* end = nullptr;
+    const long parsed = argc == 4 ? std::strtol(argv[3], &end, 10) : 2;
+    if (argc == 4 && (end == argv[3] || *end != '\0')) return 2;
+    if (parsed < 0 || parsed > 10) return 2;
+    const int repeats = (int)parsed;
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     GraniteModel model;
     std::string err;

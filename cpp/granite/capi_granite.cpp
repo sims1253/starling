@@ -12,6 +12,7 @@
 // each decoded with budget max(1, min(budget(dur), max_cache_len - prompt_len
 // - 1)), and the per-chunk texts joined with whitespace collapsed.
 #include "loader.hpp"
+#include "chunk_policy.hpp"
 #include "starling_ggml.h"
 #include "lib/capi_helpers.hpp"
 #include "mel.hpp"
@@ -42,15 +43,8 @@ namespace {
 using GraniteCtx = starling::ggml::lib::EngineContext<starling::ggml::granite::GraniteModel, starling::ggml::granite::Tokenizer>;
 using starling::ggml::lib::report;
 
-constexpr double kSampleRate = 16000.0;
-
-// Mirror ModelBackend._decode_budget: scale the decode cap to the clip length.
-int32_t decode_budget(const starling::ggml::granite::Config& c, double duration_s) {
-    int64_t estimated = (int64_t) std::ceil(duration_s * 5.0) + 32;
-    if (estimated < 1) estimated = 1;
-    int64_t cap = c.max_new_tokens > 0 ? c.max_new_tokens : 1;
-    return (int32_t) std::min(cap, estimated);
-}
+constexpr double kSampleRate = starling::ggml::granite::kChunkSampleRate;
+using starling::ggml::granite::decode_budget;
 
 // One chunk through mel -> encoder/projector -> prompt -> decode -> text.
 // stage_ms (optional) receives THIS chunk's three stage durations — the
@@ -258,11 +252,7 @@ static char* granite_decode_impl(void* handle, const float* pcm, int64_t n,
 
         // max_chunk = min(chunk_seconds, (max_new_tokens - 32) / 5) — the
         // server's _effective_chunk_seconds(DEFAULT_CHUNK_SECONDS).
-        const double token_limited =
-            std::max(0.1, ((double) (int) cfg.max_new_tokens - 32.0) / 5.0);
-        const double max_chunk_s = std::min(cfg.chunk_seconds, token_limited);
-        const int64_t chunk_samples =
-            (int64_t) std::llround(max_chunk_s * kSampleRate);
+        const int64_t chunk_samples = effective_chunk_samples(cfg);
         const double duration_s = (double) n / kSampleRate;
 
         std::vector<std::string> texts;
@@ -321,10 +311,7 @@ static char* granite_decode_impl(void* handle, const float* pcm, int64_t n,
                 const int64_t prompt_len = (int64_t) cfg.prompt_prefix.size() +
                                            audio_token_count(chunk_samples, cfg) +
                                            (int64_t) cfg.prompt_suffix.size();
-                int32_t budget = decode_budget(cfg, piece_s);
-                const int64_t headroom =
-                    (int64_t) cfg.llm.max_cache - prompt_len - 1;
-                if ((int64_t) budget > headroom) budget = (int32_t) std::max<int64_t>(1, headroom);
+                const int32_t budget = decode_budget(cfg, piece_s, prompt_len);
                 if (!run_piece(padded.data(), chunk_samples, budget))
                     return nullptr;
             }

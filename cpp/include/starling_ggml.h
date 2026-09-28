@@ -129,6 +129,10 @@ char * starling_ggml_transcribe_pcm(starling_ggml_ctx * ctx,
 // graph-level locking alone does not protect a raw handle's KV cache or error.
 // An error string returned through err_out belongs to the handle (or is a
 // static string); do not free it, and read it before the next call or free.
+void * starling_ggml_granite_load(const char * gguf_path, const char ** err_out);
+void starling_ggml_granite_free(void * handle);
+char * starling_ggml_granite_decode(void * handle, const float * pcm, int64_t n,
+                                   const char ** err_out);
 //
 // Research-only Granite CTC draft probe. `handle` is returned by the
 // model-specific starling_ggml_granite_load symbol. A successful call writes

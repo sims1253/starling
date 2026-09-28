@@ -9,12 +9,6 @@
 #include <string>
 #include <vector>
 
-extern "C" {
-void* starling_ggml_granite_load(const char*, const char**);
-void starling_ggml_granite_free(void*);
-char* starling_ggml_granite_decode(void*, const float*, int64_t, const char**);
-}
-
 int main() {
     int failures = 0;
     const auto check = [&](bool pass, const char* label) {
@@ -34,14 +28,14 @@ int main() {
     char* bad = starling_ggml_granite_decode_ctc(handle, pcm.data(), pcm.size(), 0, &err);
     check(!bad && err && std::string(err).find("1..16") != std::string::npos,
           "invalid K rejected before decoding");
-    std::free(bad);
+    starling_ggml_free_string(bad);
     err = nullptr;
     char* missing = starling_ggml_granite_decode_ctc(
         handle, pcm.data(), pcm.size(), 2, &err);
     check(!missing && err && std::string(err).find("no optional CTC draft head") !=
                           std::string::npos,
           "missing optional CTC head returns a clear error");
-    std::free(missing);
+    starling_ggml_free_string(missing);
     err = nullptr;
     char* greedy1 = starling_ggml_granite_decode(handle, pcm.data(), pcm.size(), &err);
     check(greedy1 != nullptr, "default greedy still decodes after failed CTC request");
@@ -49,8 +43,8 @@ int main() {
     char* greedy2 = starling_ggml_granite_decode(handle, pcm.data(), pcm.size(), &err);
     check(greedy1 && greedy2 && std::string(greedy1) == greedy2,
           "consecutive default greedy requests keep stable state");
-    std::free(greedy1);
-    std::free(greedy2);
+    starling_ggml_free_string(greedy1);
+    starling_ggml_free_string(greedy2);
     starling_ggml_granite_free(handle);
     return failures ? 1 : 0;
 }
