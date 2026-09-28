@@ -45,6 +45,12 @@ class FairnessDecisionTest(unittest.TestCase):
         code, result = self.evaluate(serial, fair, initial)
         self.assertEqual((code, result["status"]), (0, "pilot_pass"))
 
+        fair["trials"][1]["ws_app_ready_ms"] = True
+        code, result = self.evaluate(serial, fair, initial)
+        self.assertEqual((code, result["status"]), (1, "no_go_or_inconclusive"))
+        self.assertIn("pair 0: application readiness barrier missing", result["reasons"])
+        fair["trials"][1]["ws_app_ready_ms"] = 0
+
         del fair["trials"][1]["long"]["wall_ms"]
         code, result = self.evaluate(serial, fair, initial)
         self.assertEqual((code, result["status"]), (1, "no_go_or_inconclusive"))

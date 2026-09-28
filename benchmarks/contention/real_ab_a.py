@@ -53,11 +53,28 @@ def events(path: Path) -> list[dict]:
 
 def wait_event(path: Path, request_id: str, kind: str, process: subprocess.Popen) -> None:
     deadline = time.monotonic() + 90
+    offset = 0
+    pending = b""
     while time.monotonic() < deadline:
         if process.poll() is not None:
             raise RuntimeError(f"server exited with {process.returncode}")
-        if any(e.get("req") == request_id and e.get("ev") == kind for e in events(path)):
-            return
+        if path.exists():
+            with path.open("rb") as src:
+                src.seek(offset)
+                data = src.read()
+                offset = src.tell()
+            if data:
+                lines = (pending + data).split(b"\n")
+                pending = lines.pop()
+                for line in lines:
+                    if not line.startswith(b"[trace] "):
+                        continue
+                    try:
+                        event = json.loads(line[8:])
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        continue
+                    if event.get("req") == request_id and event.get("ev") == kind:
+                        return
         time.sleep(0.05)
     raise TimeoutError(f"missing {kind} for {request_id}")
 
@@ -184,7 +201,7 @@ def run_arm(binary: Path, model: Path, audio_a: bytes, audio_b: bytes,
                                   if e.get("req") == req and e.get("ev") == "chunk"]
     arm["chunk_order"] = [(e.get("req"), e.get("chunk")) for e in record
                           if e.get("ev") == "chunk" and
-                          str(e.get("req", "")).startswith("aba-")]
+                          e.get("req") in {"aba-a1", "aba-b", "aba-a2"}]
     return arm
 
 

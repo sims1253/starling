@@ -56,7 +56,7 @@ def main() -> int:
             ]:
                 reasons.append(f"{tag}: scenario order changed")
                 continue
-            if any(not isinstance(t.get("ws_app_ready_ms"), (int, float))
+            if any(not nonnegative_number(t.get("ws_app_ready_ms"))
                    for t in (si, sm, fi, fm)):
                 reasons.append(f"{tag}: application readiness barrier missing")
                 continue

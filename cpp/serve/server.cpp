@@ -302,6 +302,9 @@ bool StarlingServer::run_with_turn(RequestContext* ctx, QueuePolicy policy,
         if (continuing) {
             // The preceding chunk reserved this request's admission slot.
             // Transfer the reservation to its new FIFO ticket atomically.
+            // A continuation must wait for its turn even if the initial
+            // request used SkipIfBusy.
+            policy = QueuePolicy::Block;
             if (reserved_continuations_ <= 0) {
                 if (err) *err = "Granite continuation lost its queue reservation";
                 return false;
