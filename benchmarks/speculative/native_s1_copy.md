@@ -112,17 +112,18 @@ It was contention-affected and is excluded from the table; the historical
 paired runs used exclusive CPUs 0–7 and
 `STARLING_GGML_THREADS=4`.
 
-### Current paired runs after the #338 CPU width correction
+### Historical bounded-batch CPU run
 
-The S1 branch was rebased onto #338 head
+The S1 branch was then rebased onto #338 head
 `b967ef23c734c5e16f4a52865af96e61e86c8214` and its native library
-rebuilt. The new library SHA-256 is
+rebuilt. That library SHA-256 is
 `c74f9f1d74f6b5567bdb02c3ad5568389a16f04a5f1e9484e96e499f44014d0c`.
 The model, transcripts, golden files, harness, CPU set 0–7, four ggml
 threads, untimed warmups, alternating call order, and two repeats per case
-match the historical paired method. The [current stock
-results](results/native_s1_copy_cpu_stock.json) and [current protected
-results](results/native_s1_copy_cpu_protected.json) contain each trial's
+match the earlier paired method. The [bounded-batch stock
+results](results/native_s1_copy_cpu_stock_batch_width.json) and [bounded-batch
+protected results](results/native_s1_copy_cpu_protected_batch_width.json)
+contain each trial's
 timings, library/model/source hashes, backend name, and parity checks. The
 timed call includes BPE tokenization, embedding lookup, the complete target
 generation, detokenization, and one diagnostic ID write on each arm; model
@@ -135,15 +136,44 @@ load is reported separately.
 | Long | 2 | 19.37 / 27.81 s | 15.22 / 16.24 s | 0.79 / 0.58× |
 | Protected | 4 | 1.80 / 1.86 s | 1.15 / 1.14 s | 0.64 / 0.61× |
 
-All eight corrected-verifier pairs matched native greedy IDs and text. The
+All eight bounded-batch verifier pairs matched native greedy IDs and text. The
 short, medium, and long pairs also matched their captured stock IDs and text.
 The synthetic code `ZX-1042` and URL `https://example.org/manual` survived in
 both greedy and copy outputs on both protected repeats. The copy callback
 itself took at most 0.4 ms per call; measured acceptance was 3/10 short,
-26/70 medium, 93/246 long, and 17/19 protected. The corrected CPU verifier
-made copy faster in each of these pairs, including the proposer's full cost.
-These eight pairs are a small CPU pilot, not a stable latency distribution or
-a cross-device result. The feature remains opt-in.
+26/70 medium, 93/246 long, and 17/19 protected. That bounded-batch CPU
+verifier made copy faster in each of these pairs, including the proposer's
+full cost. It was later replaced by per-row attention after the [MOSS pilot
+#347](https://github.com/sims1253/starling/pull/347) found a parity
+counterexample. These results do not describe the current verifier.
+
+### Current per-row CPU verifier pilot
+
+The S1 branch was rebased onto the #338 per-row CPU verifier runtime commit
+`419723df29f2990f2a22efb58e256d8b848bee24`. Its rebuilt native library
+SHA-256 is
+`77eb84067a8de637f828633c9fb3f50bd1763afca81394f1545133f07d7e39fc`.
+The same BF16 GGUF, transcript and golden hashes, four ggml threads, CPU set
+0–7, one warmup per arm, and alternating paired repeats were used. The
+[current stock results](results/native_s1_copy_cpu_stock.json) and [current
+protected results](results/native_s1_copy_cpu_protected.json) include every
+trial's timings, backend, artifact hashes and parity flags. The timed C API
+call includes source tokenization, embedding lookup, complete target decode,
+detokenization and a symmetric diagnostic ID write; model load is separate.
+
+| Case | K | Greedy repeat 1 / 2 | Copy repeat 1 / 2 | Copy / greedy repeat 1 / 2 |
+| --- | ---: | ---: | ---: | ---: |
+| Short | 2 | 0.94 / 0.95 s | 0.83 / 0.84 s | 0.88 / 0.89× |
+| Medium | 2 | 4.26 / 4.45 s | 3.50 / 3.51 s | 0.82 / 0.79× |
+| Long | 2 | 18.01 / 17.51 s | 15.58 / 16.07 s | 0.87 / 0.92× |
+| Protected | 4 | 1.54 / 1.54 s | 1.02 / 1.04 s | 0.66 / 0.67× |
+
+All eight pairs matched native greedy IDs and text. The three stock tiers
+also matched their captured Transformers IDs and text. Both the code and URL
+survived in greedy and copy output on both protected repeats. Copy was faster
+in each sampled CPU pair, but these two repeats per case do not establish a
+stable latency distribution or general parity for other inputs. The feature
+remains opt-in.
 
 The measured CPU pilot result does not establish Pixel
 latency, energy, or p50/p95 on the [#310](https://github.com/sims1253/starling/issues/310)
