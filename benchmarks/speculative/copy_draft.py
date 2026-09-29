@@ -77,21 +77,20 @@ def simulate(source: Sequence[int], target: Sequence[int], *, max_k: int = 2,
     passes = drafted = accepted_total = full = empty = 0
     k = min(2, max_k)
     while len(output) < len(target):
-        draft = drafter.propose(output, k)
+        remaining = len(target) - len(output)
+        # Tokens past the end of the target can never be verified.
+        draft = drafter.propose(output, k)[:remaining]
         passes += 1
         drafted += len(draft)
         if not draft:
             empty += 1
         accepted = 0
-        remaining = len(target) - len(output)
-        for token in draft[:remaining]:
+        for token in draft:
             if token != target[len(output) + accepted]:
                 break
             accepted += 1
         accepted_total += accepted
-        # Only the verified part of a draft can be accepted on the last pass.
-        verified = len(draft[:remaining])
-        if draft and accepted == verified:
+        if draft and accepted == len(draft):
             full += 1
             k = min(max_k, k + 1)
         elif draft:
