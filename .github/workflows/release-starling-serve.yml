@@ -217,6 +217,9 @@ jobs:
           sudo apt-get update
           cuda_series="${CUDA_VERSION%.*}"
           sudo apt-get install -y "cuda-toolkit-${cuda_series//./-}"
+          # Drop the ~3 GB of cached .debs; the toolkit plus the build leaves
+          # little headroom on the runner disk otherwise.
+          sudo apt-get clean
           echo "/usr/local/cuda/bin" >> "$GITHUB_PATH"
 
       - name: Build starling-serve (CUDA)
@@ -227,7 +230,10 @@ jobs:
             -DSTARLING_GGML_TESTS=OFF -DBUILD_SHARED_LIBS=OFF \
             -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCHITECTURES" \
             -DGGML_NATIVE=OFF -DGGML_LLAMAFILE=OFF
-          cmake --build build -j --target starling-serve
+          # Unbounded -j ran 4 nvcc processes on the 16 GB runner and the job
+          # was killed by a runner shutdown three builds in a row, always
+          # mid-compile. Cap parallelism to bound peak compiler memory.
+          cmake --build build -j 2 --target starling-serve
 
       - name: Strip and package
         run: |
@@ -348,10 +354,25 @@ jobs:
         run: bash scripts/apply_ggml_patches.sh
 
       - name: Install Vulkan SDK
-        uses: humbletim/install-vulkan-sdk@30ba978f977e81b72d091fc8888feb1fb26f9aff # v1.2
-        with:
-          version: 1.4.357.0
-          cache: true
+        # humbletim/install-vulkan-sdk@v1.2 unpacks the Windows installer with a
+        # single 7z pass, but SDK installers >= 1.4.313.0 layer their payload,
+        # so that extracts only Bin/ and CMake fails with "Could NOT find Vulkan
+        # (missing: Vulkan_LIBRARY Vulkan_INCLUDE_DIR)" (action issue #25).
+        # Run the official installer silently instead, the same way upstream
+        # ggml's build-vulkan.yml windows job installs this exact SDK version.
+        shell: pwsh
+        env:
+          VULKAN_SDK_VERSION: 1.4.357.0
+        run: |
+          curl.exe -o "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" -L `
+            "https://sdk.lunarg.com/sdk/download/${env:VULKAN_SDK_VERSION}/windows/vulkansdk-windows-X64-${env:VULKAN_SDK_VERSION}.exe"
+          & "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" --accept-licenses --default-answer --confirm-command install
+          $sdk = "C:\VulkanSDK\${env:VULKAN_SDK_VERSION}"
+          foreach ($p in @("$sdk\Include\vulkan\vulkan.h", "$sdk\Lib\vulkan-1.lib")) {
+            if (-not (Test-Path $p)) { throw "unexpected SDK layout, missing $p" }
+          }
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=$sdk"
+          Add-Content $env:GITHUB_PATH "$sdk\bin"
 
       - name: Build starling-serve (Vulkan, static CRT)
         shell: pwsh
@@ -420,6 +441,12 @@ jobs:
         shell: pwsh
         run: |
           $version = $env:RELEASE_TAG -replace '^v', ''
+          # ggml-cuda links CUDA::cuda_driver, so the exe imports nvcuda.dll,
+          # which ships only with the NVIDIA driver. The GPU-less runner (and
+          # driverless user machines) has no driver, and the loader killed the
+          # exe before --version could print. Delay-load the import: the driver
+          # API is only touched once a CUDA device is actually initialized,
+          # after the metadata flags have already been handled.
           cmake -S . -B build -G "Visual Studio 18 2026" -A x64 `
             -DSTARLING_SERVE=ON `
             "-DSTARLING_SERVE_VERSION=$version" `
@@ -427,7 +454,8 @@ jobs:
             -DSTARLING_GGML_TESTS=OFF -DBUILD_SHARED_LIBS=OFF `
             "-DCMAKE_CUDA_ARCHITECTURES=$env:CUDA_ARCHITECTURES" `
             -DGGML_NATIVE=OFF -DGGML_LLAMAFILE=OFF `
-            -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
+            -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded `
+            "-DCMAKE_EXE_LINKER_OPTIONS=/DELAYLOAD:nvcuda.dll;delayimp.lib"
           cmake --build build --config Release --target starling-serve
 
       - name: Package
