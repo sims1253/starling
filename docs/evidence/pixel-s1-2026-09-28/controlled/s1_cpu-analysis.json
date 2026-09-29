@@ -1,0 +1,249 @@
+{
+  "schema": "pixel-controlled-quant-analysis-v2",
+  "family": "s1_cpu",
+  "protocol_sha256": "c66f7614fa44c34884059f80b64794905b96167cada6f102d2972756b6b0e708",
+  "gauge_step_uah": 5000,
+  "blocks": [
+    {
+      "block": "s1_cpu-1-bf16",
+      "arm": "bf16",
+      "energy": {
+        "active_boundary_duration_s": 372.92295638192445,
+        "launch_after_start_sample_s": 0.065664253,
+        "end_sample_after_exit_s": 9.7938e-05,
+        "observed_charge_drop_uah": 45000,
+        "pre_idle_rate_uah_per_s": 0.0,
+        "post_idle_rate_uah_per_s": 0.0,
+        "pre_idle_rate_interval_uah_per_s": [
+          -222.28269724799344,
+          222.28269724799344
+        ],
+        "post_idle_rate_interval_uah_per_s": [
+          -221.4211516767653,
+          221.4211516767653
+        ],
+        "mean_idle_rate_uah_per_s": 0.0,
+        "illustrative_idle_corrected_uah": 45000.0,
+        "illustrative_interval_uah": [
+          -47894.32061026998,
+          137894.32061026996
+        ],
+        "mean_active_voltage_mv": 3976.3333333333335,
+        "gauge_increases": [],
+        "valid_gauge_direction": true,
+        "max_active_counter_plateau_s": 280.89423607697245,
+        "gauge_freshness_confirmed": false,
+        "freshness_reason": "counter update latency was not independently bounded; arithmetic is diagnostic only",
+        "resolution_step_uah": 5000
+      },
+      "process_duration_ms": 372708.280495,
+      "cooling_rule_met": true,
+      "temperatures_deci_c": [
+        269,
+        277
+      ],
+      "thermal_statuses": [
+        0
+      ],
+      "launch_to_ready_ms": 52682.305641,
+      "latency_ms": {
+        "negation_and_name": 10364.538047,
+        "amount_correction": 6676.126595,
+        "email_address": 45476.072309,
+        "url": 49092.879496,
+        "identifier": 42585.765392,
+        "person_name": 54307.591978,
+        "negated_deadline": 41939.956576,
+        "two_port_numbers": 68436.990979
+      },
+      "case_median_ms": 44030.918850500006
+    },
+    {
+      "block": "s1_cpu-2-q4-k-m",
+      "arm": "q4-k-m",
+      "energy": {
+        "active_boundary_duration_s": 110.57870621501934,
+        "launch_after_start_sample_s": 0.066198693,
+        "end_sample_after_exit_s": 9.1493e-05,
+        "observed_charge_drop_uah": 0,
+        "pre_idle_rate_uah_per_s": 0.0,
+        "post_idle_rate_uah_per_s": 0.0,
+        "pre_idle_rate_interval_uah_per_s": [
+          -221.7766490666352,
+          221.7766490666352
+        ],
+        "post_idle_rate_interval_uah_per_s": [
+          -222.04009264672638,
+          222.04009264672638
+        ],
+        "mean_idle_rate_uah_per_s": 0.0,
+        "illustrative_idle_corrected_uah": 0.0,
+        "illustrative_interval_uah": [
+          -34552.90617273803,
+          34552.90617273803
+        ],
+        "mean_active_voltage_mv": 3948,
+        "gauge_increases": [],
+        "valid_gauge_direction": true,
+        "max_active_counter_plateau_s": 110.57870621501934,
+        "gauge_freshness_confirmed": false,
+        "freshness_reason": "counter update latency was not independently bounded; arithmetic is diagnostic only",
+        "resolution_step_uah": 5000
+      },
+      "process_duration_ms": 110364.577304,
+      "cooling_rule_met": true,
+      "temperatures_deci_c": [
+        277,
+        277
+      ],
+      "thermal_statuses": [
+        0
+      ],
+      "launch_to_ready_ms": 17771.8334,
+      "latency_ms": {
+        "negation_and_name": 23439.350631,
+        "amount_correction": 3056.243166,
+        "email_address": 7391.085587,
+        "url": 2971.03378,
+        "identifier": 11936.867056,
+        "person_name": 16722.342884,
+        "negated_deadline": 10930.234389,
+        "two_port_numbers": 15411.693079
+      },
+      "case_median_ms": 11433.5507225
+    },
+    {
+      "block": "s1_cpu-3-q4-k-m",
+      "arm": "q4-k-m",
+      "energy": {
+        "active_boundary_duration_s": 46.529690264957026,
+        "launch_after_start_sample_s": 0.066343006,
+        "end_sample_after_exit_s": 9.9909e-05,
+        "observed_charge_drop_uah": 0,
+        "pre_idle_rate_uah_per_s": 0.0,
+        "post_idle_rate_uah_per_s": 0.0,
+        "pre_idle_rate_interval_uah_per_s": [
+          -222.1185207855479,
+          222.1185207855479
+        ],
+        "post_idle_rate_interval_uah_per_s": [
+          -222.1989384593866,
+          222.1989384593866
+        ],
+        "mean_idle_rate_uah_per_s": 0.0,
+        "illustrative_idle_corrected_uah": 0.0,
+        "illustrative_interval_uah": [
+          -20338.847783717505,
+          20338.847783717505
+        ],
+        "mean_active_voltage_mv": 3948,
+        "gauge_increases": [],
+        "valid_gauge_direction": true,
+        "max_active_counter_plateau_s": 46.529690264957026,
+        "gauge_freshness_confirmed": false,
+        "freshness_reason": "counter update latency was not independently bounded; arithmetic is diagnostic only",
+        "resolution_step_uah": 5000
+      },
+      "process_duration_ms": 46330.914276,
+      "cooling_rule_met": true,
+      "temperatures_deci_c": [
+        277,
+        277
+      ],
+      "thermal_statuses": [
+        0
+      ],
+      "launch_to_ready_ms": 20277.752651,
+      "latency_ms": {
+        "negation_and_name": 7787.42916,
+        "amount_correction": 2506.70224,
+        "email_address": 4518.861409,
+        "url": 1716.827562,
+        "identifier": 1821.145329,
+        "person_name": 2741.569915,
+        "negated_deadline": 1762.569048,
+        "two_port_numbers": 2424.908417
+      },
+      "case_median_ms": 2465.8053285
+    },
+    {
+      "block": "s1_cpu-4-bf16",
+      "arm": "bf16",
+      "energy": {
+        "active_boundary_duration_s": 294.28496775694657,
+        "launch_after_start_sample_s": 0.056502838,
+        "end_sample_after_exit_s": 6.2912e-05,
+        "observed_charge_drop_uah": 42500,
+        "pre_idle_rate_uah_per_s": 0.0,
+        "post_idle_rate_uah_per_s": 0.0,
+        "pre_idle_rate_interval_uah_per_s": [
+          -222.11283193829962,
+          222.11283193829962
+        ],
+        "post_idle_rate_interval_uah_per_s": [
+          -222.09676086247475,
+          222.09676086247475
+        ],
+        "mean_idle_rate_uah_per_s": 0.0,
+        "illustrative_idle_corrected_uah": 42500.0,
+        "illustrative_interval_uah": [
+          -32864.4675853666,
+          117864.4675853666
+        ],
+        "mean_active_voltage_mv": 3940.981818181818,
+        "gauge_increases": [],
+        "valid_gauge_direction": true,
+        "max_active_counter_plateau_s": 181.20449520996772,
+        "gauge_freshness_confirmed": false,
+        "freshness_reason": "counter update latency was not independently bounded; arithmetic is diagnostic only",
+        "resolution_step_uah": 5000
+      },
+      "process_duration_ms": 294092.583303,
+      "cooling_rule_met": true,
+      "temperatures_deci_c": [
+        274,
+        277
+      ],
+      "thermal_statuses": [
+        0
+      ],
+      "launch_to_ready_ms": 60399.898669,
+      "latency_ms": {
+        "negation_and_name": 30763.218097,
+        "amount_correction": 20714.377322,
+        "email_address": 39715.151517,
+        "url": 10400.71536,
+        "identifier": 18714.931151,
+        "person_name": 27242.703224,
+        "negated_deadline": 37803.542141,
+        "two_port_numbers": 47586.440018
+      },
+      "case_median_ms": 29002.9606605
+    }
+  ],
+  "adjacent_pairs": [
+    {
+      "baseline_block": "s1_cpu-1-bf16",
+      "candidate_block": "s1_cpu-2-q4-k-m",
+      "illustrative_counter_contrast_uah": 45000.0,
+      "illustrative_interval_uah": [
+        -82447.22678300801,
+        172447.226783008
+      ],
+      "candidate_energy_win_resolved": false
+    },
+    {
+      "baseline_block": "s1_cpu-4-bf16",
+      "candidate_block": "s1_cpu-3-q4-k-m",
+      "illustrative_counter_contrast_uah": 42500.0,
+      "illustrative_interval_uah": [
+        -53203.3153690841,
+        138203.3153690841
+      ],
+      "candidate_energy_win_resolved": false
+    }
+  ],
+  "candidate_energy_win_resolved": false,
+  "energy_scope": "whole-device charge counter; no validated energy estimate or interval",
+  "energy_inconclusive_reason": "gauge update latency was not independently bounded"
+}

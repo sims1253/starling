@@ -22,8 +22,10 @@ void free_granite_job(GraniteChunkJob* job);
 
 // Engine implementations used only by the C API shell above. The shell
 // supplies the runtime lock and translates errors into its context storage.
+// ctc_max_k > 0 opts into CTC speculative decoding (research API only).
 GraniteChunkJob* granite_job_create_impl(void* model, const float* pcm,
-                                          int64_t n, const char** err);
+                                          int64_t n, const char** err,
+                                          int ctc_max_k = 0);
 int granite_job_step_impl(GraniteChunkJob* job, std::string* final_text,
                           const char** err);
 bool granite_job_last_chunk_impl(const GraniteChunkJob* job);

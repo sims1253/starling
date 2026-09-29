@@ -61,6 +61,12 @@ memory is refused with an explanation.
 
 ## Install a release build
 
+For the latest master build on Pixel 10 Pro, use the arm64/i8mm APK from
+[Experimental releases](https://github.com/sims1253/starling/releases?q=experimental&expanded=true).
+It installs as **Starling Experimental**, beside the regular app, and preserves
+its own data across experimental updates. See the
+[experimental installation guide](../../docs/experimental-releases.md).
+
 Tagged releases carry two signed APKs, built by
 `.github/workflows/release-android.yml`:
 

@@ -17,6 +17,9 @@ bool llm_prefill(const Qwen3Model&, const InputsEmbeds&, int32_t max_cache_len,
                  PrefillResult&, std::string&);
 bool greedy_generate(const Qwen3Model&, const InputsEmbeds&, const GenerateOptions&,
                      GenerateResult&, std::string&);
+bool speculative_generate(const Qwen3Model&, const InputsEmbeds&, const GenerateOptions&,
+                          int max_k, const lib::DraftProposer&, const lib::CancelCheck&,
+                          GenerateResult&, lib::SpeculativeStats&, std::string&);
 // Current number of cached per-S prefill graphs (diagnostic + the
 // bounded-LRU regression-test hook). Zero on CPU / before first GPU prefill.
 size_t prefill_replay_cache_size(const Qwen3Model& model);

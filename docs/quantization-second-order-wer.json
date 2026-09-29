@@ -1,0 +1,35 @@
+{
+  "protocol_sha256": "7de43a1f1f1f48ffb6606c19f8efe74850df2aafa5872f8e780104caea5630ea",
+  "device": "CPU",
+  "baseline_sha256": "bfee29b2b3419b387c8bc1b28a1772b506dd57aa9cfd879b2530bc287d93b0d3",
+  "candidate_sha256": "89d492571936a55f7610d34ec8fcf2371a0068a9c50f0aaf42e56d51691b0e89",
+  "source_sha256": "f3337ef2cd24b458942e05f420a0f8fbf6466d25a07e9b97f7db7e2775845ffa",
+  "imatrix_sha256": "de9f635dc79a149d3389d41d7e8f460c4362427d68c2b0199697baefe97c69e8",
+  "bytes_saved": 0,
+  "min_bytes_saved": 15000000,
+  "max_wer_delta_pp": 0.2,
+  "cohorts": {
+    "en_us_validation": {
+      "clips": 300,
+      "delta_wer_pp": 0.10183984296622829,
+      "paired_95_ci_pp": [
+        -0.08190563382469533,
+        0.2992607444803931
+      ],
+      "noninferior": false,
+      "regression_established": false
+    },
+    "de_de_validation": {
+      "clips": 300,
+      "delta_wer_pp": -0.11589659371390759,
+      "paired_95_ci_pp": [
+        -0.3456977541363242,
+        0.11348232956871668
+      ],
+      "noninferior": true,
+      "regression_established": false
+    }
+  },
+  "verdict": "fail",
+  "reason": "candidate did not meet the predeclared storage saving"
+}

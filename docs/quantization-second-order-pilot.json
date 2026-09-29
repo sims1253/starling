@@ -1,0 +1,38 @@
+{
+  "schema": "starling-iq2-block-pilot-v1",
+  "source_sha256": "f3337ef2cd24b458942e05f420a0f8fbf6466d25a07e9b97f7db7e2775845ffa",
+  "baseline_sha256": "bfee29b2b3419b387c8bc1b28a1772b506dd57aa9cfd879b2530bc287d93b0d3",
+  "imatrix_sha256": "de9f635dc79a149d3389d41d7e8f460c4362427d68c2b0199697baefe97c69e8",
+  "calibration_sha256": "279198fb5c0d7ab2c6eb4440ca31577f00b5475ff8ce8e5ab51445f620dba4f1",
+  "validation_sha256": "9a159197cddddf013b64fdc44f17527578052e2b7da849b7cd2417332e7d1305",
+  "ggml_base_sha256": "b1bb2d4096041dfd05f8f62af345bffed9f758260481dafffe8a5e4d922fc012",
+  "tensor": "encoder.layers.0.self_attn.linear_q.weight",
+  "weight_shape": [
+    1024,
+    1024
+  ],
+  "calibration_vectors": 1136,
+  "validation_vectors": 1012,
+  "iq2_block_bytes": 66,
+  "damping_fraction": 0.01,
+  "awq_alpha_selected_on_calibration": 0.5,
+  "direct_equals_baseline_bytes": true,
+  "changed_tensor_bytes": 141104,
+  "baseline_tensor_sha256": "aae5271fcd745bb7b7a10c86b66edd1a64c986cd60c4c0fea3fdeccfdb6cefaf",
+  "repaired_tensor_sha256": "b68592cc92495daa4bd9b3ad3c342866417b9fbbd4b2317fce1d3aa65167e701",
+  "candidate_gguf_sha256": "89d492571936a55f7610d34ec8fcf2371a0068a9c50f0aaf42e56d51691b0e89",
+  "relative_output_rms": {
+    "calibration": {
+      "baseline_file": 0.31420944424922587,
+      "direct_iq2": 0.31420944424922587,
+      "block_compensated_iq2": 0.19380246594776077,
+      "awq_scaled_iq2": 0.2924858182032973
+    },
+    "validation": {
+      "baseline_file": 0.31340996367444274,
+      "direct_iq2": 0.31340996367444274,
+      "block_compensated_iq2": 0.20856432077149084,
+      "awq_scaled_iq2": 0.29072431169748425
+    }
+  }
+}

@@ -21,6 +21,12 @@ bool llm_prefill(const S1Model& m, const lib::InputsEmbeds& i, int32_t maxc,
 bool greedy_generate(const S1Model& m, const lib::InputsEmbeds& i,
                      const GenerateOptions& op, lib::GenerateResult& o,
                      std::string& e);
+bool speculative_generate(const S1Model& m, const lib::InputsEmbeds& i,
+                          const GenerateOptions& op, int max_k,
+                          const lib::DraftProposer& proposer,
+                          const lib::CancelCheck& cancelled,
+                          lib::GenerateResult& o, lib::SpeculativeStats& stats,
+                          std::string& e);
 size_t prefill_replay_cache_size(const S1Model& model);
 
 } // namespace starling::ggml::s1

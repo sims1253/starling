@@ -16,6 +16,7 @@
 #define STARLING_GGML_H
 
 #include <stdint.h>
+#include <stdbool.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -70,8 +71,10 @@ typedef enum {
 
 // Lifecycle ------------------------------------------------------------------
 
-// Calls that load, free or run models are serialized inside the library.
-// The caller must keep each context alive until its pending calls finish.
+// Calls through the common starling_ggml_ctx API that load, free or run
+// models are serialized inside the library. Keep each context alive until
+// its pending calls finish. Model-specific raw handles have a separate
+// caller-serialization contract below.
 //
 // Load a model from a GGUF file. Returns a new context, or NULL on error
 // (call starling_ggml_last_error(NULL_or_ctx) for the message). `model` selects
@@ -118,8 +121,42 @@ char * starling_ggml_transcribe_pcm(starling_ggml_ctx * ctx,
                                     const float * samples, int64_t n,
                                     int sample_rate);
 
-// Free a string returned by starling_ggml_transcribe_pcm or
-// starling_ggml_normalize_text (no-op on NULL).
+// Raw Granite research handles (from starling_ggml_granite_load) do not use
+// the common API's whole-call lock. Callers must serialize raw load, decode,
+// draft and free operations across all raw handles, and must not overlap them
+// with common-API load, inference, free or starling_ggml_shutdown. Free all
+// raw handles before global shutdown. These calls share backend state;
+// graph-level locking alone does not protect a raw handle's KV cache or error.
+// An error string returned through err_out belongs to the handle (or is a
+// static string); do not free it, and read it before the next call or free.
+void * starling_ggml_granite_load(const char * gguf_path, const char ** err_out);
+void starling_ggml_granite_free(void * handle);
+char * starling_ggml_granite_decode(void * handle, const float * pcm, int64_t n,
+                                   const char ** err_out);
+//
+// Research-only Granite CTC draft probe. `handle` is returned by the
+// model-specific starling_ggml_granite_load symbol. A successful call writes
+// token IDs and count. On a too-small buffer it writes the required capacity
+// to count, leaves token_ids untouched, and returns false: count does not
+// describe valid output on failure. Invalid arguments clear count when it is
+// non-null. A zero-capacity sizing call runs the full encoder and head.
+bool starling_ggml_granite_ctc_draft(void * handle, const float * pcm, int64_t n,
+                                    int32_t * token_ids, int32_t capacity,
+                                    int32_t * count, const char ** err_out);
+
+// Research-only opt-in Granite transcription with native CTC drafts and the
+// greedy batched verifier. `handle` is returned by the model-specific
+// starling_ggml_granite_load symbol; max_k must be 1..16. Uses the same
+// padded chunk/budget policy as ordinary Granite decode. The returned string
+// is malloc'd and freed with starling_ggml_free_string. Default transcription
+// continues through the ordinary greedy entry point. On failure returns
+// NULL and sets *err_out when err_out is non-NULL. The raw-handle
+// serialization requirement above applies to this call.
+char * starling_ggml_granite_decode_ctc(void * handle, const float * pcm, int64_t n,
+                                        int32_t max_k, const char ** err_out);
+
+// Free a malloc'd string returned by a Starling transcription or
+// normalization entry point (no-op on NULL).
 void starling_ggml_free_string(char * s);
 
 // Normalize one raw ASR transcript with a text model (s1). Returns a

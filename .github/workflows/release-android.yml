@@ -28,6 +28,27 @@
 name: Release Android app
 
 on:
+  workflow_call:
+    inputs:
+      tag:
+        required: true
+        type: string
+      source-ref:
+        required: true
+        type: string
+      experimental:
+        description: Build one arm64 i8mm APK with a separate app ID; the caller publishes it
+        type: boolean
+        default: false
+    secrets:
+      STARLING_ANDROID_KEYSTORE_BASE64:
+        required: true
+      STARLING_ANDROID_KEYSTORE_PASSWORD:
+        required: true
+      STARLING_ANDROID_KEY_ALIAS:
+        required: true
+      STARLING_ANDROID_KEY_PASSWORD:
+        required: true
   push:
     tags:
       - 'v*'
@@ -42,17 +63,20 @@ on:
 # could leave the release with missing assets. A second run for the same tag
 # queues behind the first and re-uploads everything.
 concurrency:
-  group: ${{ github.workflow }}-${{ inputs.tag || github.ref_name }}
+  group: release-android-${{ inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 permissions:
   contents: read
 
 env:
+  EXPERIMENTAL: ${{ inputs.experimental || false }}
   RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
   apk:
+    permissions:
+      contents: read
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     outputs:
@@ -61,7 +85,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: ${{ inputs.tag || github.ref_name }}
+          ref: ${{ inputs.source-ref || inputs.tag || github.ref_name }}
           submodules: recursive
           persist-credentials: false
 
@@ -80,6 +104,19 @@ jobs:
           if ! [[ "$name" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)([-.][0-9A-Za-z.-]+)?$ ]]; then
             echo "::error::Tag $RELEASE_TAG does not carry a semantic version (vX.Y.Z or android-vX.Y.Z)"
             exit 1
+          fi
+          if [ "$EXPERIMENTAL" = true ]; then
+            # Independent of the workflow run counter, which resets if the
+            # caller workflow is recreated. Seconds since 2020 fit Android's
+            # versionCode limit through 2088.
+            code=$(( $(date -u +%s) - 1577836800 ))
+            if (( code <= 0 || code >= 2147483647 )); then
+              echo "::error::Experimental versionCode $code is outside Android's range"
+              exit 1
+            fi
+            echo "name=$name" >> "$GITHUB_OUTPUT"
+            echo "code=$code" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
           major=$((10#${BASH_REMATCH[1]})); minor=$((10#${BASH_REMATCH[2]})); patch=$((10#${BASH_REMATCH[3]}))
           # major*1e6 + minor*1e3 + patch stays below Android's 2^31-1 cap and
@@ -133,6 +170,10 @@ jobs:
               || { echo "::error::The signing secrets do not open the key (bad base64, store password, alias, or key password)"; exit 1; }
             echo "mode=release-key" >> "$GITHUB_OUTPUT"
           else
+            if [ "$EXPERIMENTAL" = true ]; then
+              echo "::error::Experimental APK updates require all four STARLING_ANDROID_* signing secrets"
+              exit 1
+            fi
             case "$RELEASE_TAG" in
               android-v*) ;;
               *) echo "::error::$RELEASE_TAG is a release tag but the STARLING_ANDROID_* signing secrets are not configured; a throwaway key is only allowed for android-v* test builds."
@@ -159,15 +200,21 @@ jobs:
           mkdir -p dist
           # suffix|arm64 target|expected smmla presence; each target rebuilds
           # the native engine.
-          for variant in "|armv8.2-a+dotprod+fp16|no" "-i8mm|armv8.2-a+dotprod+fp16+i8mm|yes"; do
+          variants=("|armv8.2-a+dotprod+fp16|no" "-i8mm|armv8.2-a+dotprod+fp16+i8mm|yes")
+          properties=()
+          if [ "$EXPERIMENTAL" = true ]; then
+            variants=("-i8mm|armv8.2-a+dotprod+fp16+i8mm|yes")
+            properties=(-PstarlingExperimental=true -PstarlingArm64Only=true)
+          fi
+          for variant in "${variants[@]}"; do
             IFS='|' read -r suffix arch want_smmla <<< "$variant"
             tests=()
-            if [ -z "$suffix" ]; then tests=(testDebugUnitTest); fi
+            if [ -z "$suffix" ] || [ "$EXPERIMENTAL" = true ]; then tests=(testDebugUnitTest); fi
             # A stale APK from the previous variant must never be relabelled.
             rm -f "$built"
             (cd apps/mobile && ./gradlew --no-daemon "${tests[@]}" assembleRelease \
               -PstarlingVersionName="$VERSION_NAME" -PstarlingVersionCode="$VERSION_CODE" \
-              -PstarlingArmArch="$arch")
+              -PstarlingArmArch="$arch" "${properties[@]}")
             test -f "$built" || { echo "::error::$built missing (unsigned builds are named app-release-unsigned.apk)"; exit 1; }
             "$apksigner" verify --verbose --print-certs "$built"
             # Prove the arm64 engine was built for this variant's target.
@@ -198,10 +245,12 @@ jobs:
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: starling-mobile-apk
+          retention-days: ${{ inputs.experimental && 3 || 90 }}
           path: dist/
           if-no-files-found: error
 
   release:
+    if: ${{ !inputs.experimental }}
     needs: apk
     runs-on: ubuntu-24.04
     timeout-minutes: 15

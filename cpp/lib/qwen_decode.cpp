@@ -614,9 +614,12 @@ DeviceCache* get_device_cache(const QwenDecodeCtx& m, std::string& e) {
 //   kv_mode 0 = prefill exact (cpy slots [0,S), attend to new k/v)
 //   kv_mode 1 = decode exact-width (cpy slot `past`, attend [0, past+S))
 //   kv_mode 2 = decode full-capacity (set_rows slot `past`, attend [0, max_cache))
-// idx_past is the runtime i32[1] write index used only by mode 2.
+//   kv_mode 3 = batched verify (copy S slots; by default each query row reduces
+//               over its own [0, past+row+1) prefix; <label>_VERIFY_BATCH_ATTN
+//               uses one [0, past+S) reduction with a causal mask)
+// idx_past is the runtime i32[S] write-index vector used only by mode 2.
 // cs/sn are [D, S] bf16 (RoPE rows). mask is f32 [K, S] (K = past+S for modes
-// 0/1, max_cache for mode 2).
+// 0/1/3, max_cache for mode 2).
 ggml_tensor* append_layer_new(ggml_context* c, const QwenDecodeCtx& m, int li,
                               ggml_tensor* x_in, int64_t S, int64_t past,
                               ggml_tensor* cache_k, ggml_tensor* cache_v,
@@ -680,7 +683,7 @@ ggml_tensor* append_layer_new(ggml_context* c, const QwenDecodeCtx& m, int li,
     // split across halves, exactly this formula with F32 trig) replaces the
     // whole view/scale/concat/mul/add subgraph: 1 dispatch per rope instead
     // of ~8. It reads [D,H,S] heads-major, so it runs before the permute;
-    // idx_past ([1] int32) is the position vector it needs. Its F32 output is
+    // idx_past ([S] int32) is the position vector it needs. Its F32 output is
     // rounded for the BF16 attention core (one tiny contiguous cast); k needs
     // no round (it reaches attention only via the BF16 cache).
     if (F) {
@@ -733,14 +736,14 @@ ggml_tensor* append_layer_new(ggml_context* c, const QwenDecodeCtx& m, int li,
         // we use directly as kall -> the set_rows executes before attention.
         kall = ggml_set_rows(c, cache_k, ff(c, k), idx_past);
         vall = ggml_set_rows(c, cache_v, ff(c, v), idx_past);
-    } else {                       // decode exact-width
-        ggml_tensor* kslot = ggml_view_3d(c, cache_k, D, 1, KV,
+    } else {                       // single-step prefix or bounded batched prefix
+        ggml_tensor* kslot = ggml_view_3d(c, cache_k, D, S, KV,
                                           cache_k->nb[1], cache_k->nb[2],
                                           (size_t)past * cache_k->nb[1]);
-        ggml_tensor* vslot = ggml_view_3d(c, cache_v, D, 1, KV,
+        ggml_tensor* vslot = ggml_view_3d(c, cache_v, D, S, KV,
                                           cache_v->nb[1], cache_v->nb[2],
                                           (size_t)past * cache_v->nb[1]);
-        ggml_tensor* knew = ggml_cpy(c, k, kslot);  // writes slot `past`
+        ggml_tensor* knew = ggml_cpy(c, k, kslot);  // writes S slots from `past`
         ggml_tensor* vnew = ggml_cpy(c, v, vslot);
         ggml_tensor* kprev = ggml_view_3d(c, cache_k, D, past, KV,
                                           cache_k->nb[1], cache_k->nb[2], 0);
@@ -768,12 +771,40 @@ ggml_tensor* append_layer_new(ggml_context* c, const QwenDecodeCtx& m, int li,
         // fp16-capable iGPU outruns the staging tax on these small GEMVs).
         // In F mode q was rounded after rope (one tiny cast) and joined
         // feeds linf, whose f32() is exact.
-        ggml_tensor* sc = ggml_mul_mat(c, kall, q);                 // [K, S, H]
-        sc = bf(c, ggml_scale(c, ff(c, sc), scale));
-        ggml_tensor* pr = bf(c, ggml_soft_max_ext(c, ff(c, sc), ff(c, mask), 1.0f, 0.0f));
-        // context = V^T @ probs: permute vall [D,K,KV] -> [K,D,KV], GQA broadcast.
-        ggml_tensor* vt = ggml_cont(c, ggml_permute(c, vall, 1, 0, 2, 3));  // [K, D, KV]
-        ggml_tensor* co = ggml_mul_mat(c, vt, pr);                 // [D, S, H]
+        ggml_tensor* co = nullptr;
+        if (kv_mode == 3 && !env(m.spec, "_VERIFY_BATCH_ATTN")) {
+            // CPU verifier default: each query reduces over the populated
+            // prefix of its own row. Batched projections and KV writes remain;
+            // numerical parity still needs a real-model check per workload.
+            // _VERIFY_BATCH_ATTN restores the earlier bounded-batch reduction
+            // for diagnosis, not for runtime enablement.
+            for (int64_t row = 0; row < S; ++row) {
+                const int64_t width = past + row + 1;
+                ggml_tensor* qr = ggml_view_3d(c, q, D, 1, H,
+                                                q->nb[1], q->nb[2],
+                                                (size_t)row * q->nb[1]);
+                ggml_tensor* kr = ggml_view_3d(c, kall, D, width, KV,
+                                                kall->nb[1], kall->nb[2], 0);
+                ggml_tensor* vr = ggml_view_3d(c, vall, D, width, KV,
+                                                vall->nb[1], vall->nb[2], 0);
+                ggml_tensor* mr = ggml_view_2d(c, mask, width, 1,
+                                                mask->nb[1],
+                                                (size_t)row * mask->nb[1]);
+                ggml_tensor* sc = ggml_mul_mat(c, kr, qr);
+                sc = bf(c, ggml_scale(c, ff(c, sc), scale));
+                ggml_tensor* pr = bf(c, ggml_soft_max_ext(c, ff(c, sc), ff(c, mr), 1.0f, 0.0f));
+                ggml_tensor* vt = ggml_cont(c, ggml_permute(c, vr, 1, 0, 2, 3));
+                ggml_tensor* one = ggml_mul_mat(c, vt, pr);
+                co = co ? ggml_concat(c, co, one, 1) : one;
+            }
+        } else {
+            ggml_tensor* sc = ggml_mul_mat(c, kall, q);             // [K, S, H]
+            sc = bf(c, ggml_scale(c, ff(c, sc), scale));
+            ggml_tensor* pr = bf(c, ggml_soft_max_ext(c, ff(c, sc), ff(c, mask), 1.0f, 0.0f));
+            // context = V^T @ probs: permute vall [D,K,KV] -> [K,D,KV], GQA broadcast.
+            ggml_tensor* vt = ggml_cont(c, ggml_permute(c, vall, 1, 0, 2, 3));
+            co = ggml_mul_mat(c, vt, pr);
+        }
         // heads -> features: [D,S,H] -> [D,H,S] -> [D*H, S]. Spelled
         // relationally: voxtral's q-width (D*H = 4096) is WIDER than its
         // hidden (3072); the o_proj weight (ne0 = D*H) takes it from here.
@@ -1009,6 +1040,70 @@ bool forward_decode(const QwenDecodeCtx& m, int32_t prev_token, int64_t past,
     return true;
 }
 
+// One causal S-row pass over [prev_token, draft_0, ..., draft_{S-2}].
+// The cache writes all S input rows, but each query can see only its own and
+// earlier positions. The caller rewinds state.length after a rejection; stale
+// rows beyond that logical length are masked and overwritten by the next pass.
+bool forward_verify(const QwenDecodeCtx& m, const std::vector<int32_t>& tokens,
+                    LlmState& state, std::vector<float>& logits, std::string& e) {
+    const auto& lc = m.dims;
+    DeviceCache* dc = get_device_cache(m, e);
+    if (!dc) return false;
+    const int64_t past = state.length;
+    const int64_t S = (int64_t)tokens.size();
+    if (S < 2 || past < 0) {
+        e = std::string(m.spec.label) + " invalid verify positions";
+        return false;
+    }
+    if (past + S > (int64_t)lc.max_cache) {
+        e = std::string(m.spec.label) + " verify exceeds cache";
+        return false;
+    }
+    // CPU greedy uses a populated-prefix attention width on each step. Bound
+    // this batch by its final populated prefix, then let mode 3 reduce each
+    // query over its own prefix. Full-capacity reductions flipped a near-tie
+    // in one Granite case; bounded-batch reductions diverged on a MOSS case.
+    // GPU keeps its captured/full-capacity verifier graph.
+    const bool exact_width = !global_backend().is_gpu() &&
+                             env(m.spec, "_FULLCAP") == nullptr;
+    const int64_t mask_width = exact_width ? past + S : (int64_t)lc.max_cache;
+    std::vector<int32_t> positions((size_t)S);
+    std::vector<float> mask((size_t)mask_width * (size_t)S);
+    const float neg = -3.3895313892515355e38f;
+    for (int64_t row = 0; row < S; ++row) {
+        positions[(size_t)row] = (int32_t)(past + row);
+        for (int64_t key = 0; key < mask_width; ++key)
+            mask[(size_t)row * (size_t)mask_width + (size_t)key] =
+                key <= past + row ? 0.0f : neg;
+    }
+    const bool F = use_f32_acts(m);
+    bool ok = run_graph([&](ggml_context* c) -> ggml_tensor* {
+        int64_t sne[1] = {S};
+        ggml_tensor* ids = graph_input_tensor(c, GGML_TYPE_I32, 1, sne,
+                                              tokens.data(), tokens.size() * sizeof(int32_t));
+        ggml_tensor* x = ggml_get_rows(c, clone_weight(c, m.loader, "llm.embed.weight"), ids);
+        x = apply_embed_mul(c, m.spec, x);
+        ggml_tensor* pos = graph_input_tensor(c, GGML_TYPE_I32, 1, sne,
+                                              positions.data(), positions.size() * sizeof(int32_t));
+        ggml_tensor* cs = ggml_get_rows(c, dc->rope_cos, pos);
+        ggml_tensor* sn = ggml_get_rows(c, dc->rope_sin, pos);
+        int64_t mne[2] = {mask_width, S};
+        ggml_tensor* mt = graph_input_tensor(c, GGML_TYPE_F32, 2, mne,
+                                             mask.data(), mask.size() * sizeof(float));
+        for (int li = 0; li < (int)lc.n_layers; ++li)
+            x = append_layer_new(c, m, li, x, S, past, dc->k[li], dc->v[li],
+                                 cs, sn, mt, exact_width ? 3 : 2,
+                                 exact_width ? nullptr : pos, nullptr);
+        ggml_tensor* n = F ? rmsf(c, m.loader, x, "llm.final_norm.weight", lc.rms_norm_eps)
+                           : spec_rms(c, m.spec, m.loader, x, "llm.final_norm.weight", lc.rms_norm_eps);
+        ggml_tensor* lg = lm_head_gemm(c, m.loader, m.spec, n);
+        return ff(c, apply_logits_scaling(c, m.spec, lg));
+    }, logits);
+    if (!ok) { e = std::string(m.spec.label) + " verify graph failed"; return false; }
+    state.length = past + S;
+    return true;
+}
+
 // ===========================================================================
 // Greedy pick under the bf16-tie mode: round the logits to bf16 (the
 // reference reads the lm_head output stored as bf16) and keep the FIRST
@@ -1016,8 +1111,14 @@ bool forward_decode(const QwenDecodeCtx& m, int32_t prev_token, int64_t past,
 // Suppression (spec.n_banned > 0): banned ids never win, at any step, so
 // they are skipped in the scan (the K-step graph applies the equivalent
 // additive penalty row before its in-graph argmax).
-int32_t spec_argmax_impl(const QwenDecodeSpec& s, const std::vector<float>& x) {
-    if (!s.argmax_low_ties && s.n_banned == 0) return argmax_low(x);
+int32_t spec_argmax_impl(const QwenDecodeSpec& s, const float* x, size_t n) {
+    GGML_ASSERT(x && n > 0);
+    if (!s.argmax_low_ties && s.n_banned == 0) {
+        int32_t best = 0;
+        for (int32_t i = 1; i < (int32_t)n; ++i)
+            if (x[i] > x[best]) best = i;
+        return best;
+    }
     auto is_banned = [&s](int32_t i) {
         return s.n_banned > 0 &&
                std::binary_search(s.banned_ids, s.banned_ids + s.n_banned, i);
@@ -1028,12 +1129,16 @@ int32_t spec_argmax_impl(const QwenDecodeSpec& s, const std::vector<float>& x) {
     int32_t best = 0;
     float bv = s.argmax_low_ties ? bf(x[0]) : x[0];
     if (is_banned(0)) { best = -1; bv = 0.0f; }
-    for (int32_t i = 1; i < (int32_t) x.size(); ++i) {
+    for (int32_t i = 1; i < (int32_t)n; ++i) {
         if (is_banned(i)) continue;
         const float v = s.argmax_low_ties ? bf(x[i]) : x[i];
         if (best < 0 || v > bv) { bv = v; best = i; }
     }
     return best;
+}
+
+int32_t spec_argmax_impl(const QwenDecodeSpec& s, const std::vector<float>& x) {
+    return spec_argmax_impl(s, x.data(), x.size());
 }
 
 // K-step multistep decode (captured ReplayGraph).
@@ -1386,6 +1491,15 @@ bool llm_prefill(const QwenDecodeCtx& m, const InputsEmbeds& i, int32_t maxc,
     return true;
 }
 
+void dump_generated_ids(const QwenDecodeSpec& spec, const GenerateResult& output) {
+    if (const char* fp = env(spec, "_DUMP_IDS")) {
+        if (FILE* f = std::fopen(fp, "wb")) {
+            std::fwrite(output.ids.data(), sizeof(int32_t), output.ids.size(), f);
+            std::fclose(f);
+        }
+    }
+}
+
 bool greedy_generate(const QwenDecodeCtx& m, const InputsEmbeds& i,
                      const GenerateParams& op, GenerateResult& o, std::string& e) {
     if (i.n_tokens + op.max_new_tokens > op.max_cache_len) {
@@ -1525,13 +1639,168 @@ bool greedy_generate(const QwenDecodeCtx& m, const InputsEmbeds& i,
         }
     }
     // <env>_DUMP_IDS=<file> dumps generated ids (i32).
-    if (const char* fp = env(m.spec, "_DUMP_IDS")) {
-        if (FILE* f = std::fopen(fp, "wb")) {
-            std::fwrite(o.ids.data(), sizeof(int32_t), o.ids.size(), f);
-            std::fclose(f);
+    dump_generated_ids(m.spec, o);
+    return true;
+}
+
+bool speculative_generate(const QwenDecodeCtx& m, const InputsEmbeds& i,
+                          const GenerateParams& op, int max_k,
+                          const DraftProposer& proposer, const CancelCheck& cancelled,
+                          GenerateResult& o, SpeculativeStats& stats, std::string& e) {
+    o = GenerateResult{};
+    stats = SpeculativeStats{};
+    const auto finish = [&] {
+        dump_generated_ids(m.spec, o);
+        return true;
+    };
+    using Clock = std::chrono::steady_clock;
+    const auto elapsed_ms = [](Clock::time_point a, Clock::time_point b) {
+        return std::chrono::duration<double, std::milli>(b - a).count();
+    };
+    struct TotalTimer {
+        SpeculativeStats& stats;
+        Clock::time_point start;
+        ~TotalTimer() {
+            stats.total_ms = std::chrono::duration<double, std::milli>(
+                Clock::now() - start).count();
+        }
+    } total_timer{stats, Clock::now()};
+    if (!proposer || max_k < 1 || max_k > kMaxSpeculativeK || op.max_new_tokens < 1 ||
+        op.max_cache_len > (int32_t)m.dims.max_cache ||
+        i.n_tokens + op.max_new_tokens > op.max_cache_len ||
+        m.spec.decode_add || debug_probe_active(m.spec)) {
+        e = std::string(m.spec.label) + " invalid speculative generation configuration";
+        return false;
+    }
+    if (cancelled && cancelled()) {
+        o.stop_reason = GenStopReason::kCancelled;
+        return finish();
+    }
+    PrefillResult prefill;
+    auto phase_start = Clock::now();
+    const bool prefill_ok = llm_prefill(m, i, op.max_cache_len, prefill, e);
+    stats.prefill_ms += elapsed_ms(phase_start, Clock::now());
+    if (!prefill_ok) return false;
+    // Prefill has already run a graph and found the first token. Cancellation
+    // still discards that token, including for a one-token budget or EOS.
+    if (cancelled && cancelled()) {
+        o.stop_reason = GenStopReason::kCancelled;
+        return finish();
+    }
+    o.prefill_logits = std::move(prefill.logits);
+    LlmState state = std::move(prefill.state);
+    o.ids.push_back(prefill.first_token);
+    if (generation_stops_on(prefill.first_token, op)) {
+        o.stop_reason = GenStopReason::kEos;
+        return finish();
+    }
+    const ggml_tensor* head = m.loader.tensor(lm_head_name(m.spec));
+    const ggml_tensor* embed = m.loader.tensor("llm.embed.weight");
+    if (!head || !embed || head->ne[1] != embed->ne[1]) {
+        e = std::string(m.spec.label) + " speculative head/embedding vocabulary mismatch";
+        return false;
+    }
+    const int64_t vocab = head->ne[1];
+    while ((int)o.ids.size() < op.max_new_tokens) {
+        if (cancelled && cancelled()) {
+            o.stop_reason = GenStopReason::kCancelled;
+            return finish();
+        }
+        const int remaining = op.max_new_tokens - (int)o.ids.size();
+        const int room = (int)((int64_t)op.max_cache_len - state.length);
+        const int cap = std::min({max_k, remaining - 1, room - 1});
+        std::vector<int32_t> draft;
+        if (cap > 0) {
+            phase_start = Clock::now();
+            draft = proposer(o.ids, cap);
+            stats.proposal_ms += elapsed_ms(phase_start, Clock::now());
+            if (cancelled && cancelled()) {
+                o.stop_reason = GenStopReason::kCancelled;
+                return finish();
+            }
+        }
+        if ((int)draft.size() > cap ||
+            std::any_of(draft.begin(), draft.end(), [&](int32_t id) {
+                return id < 0 || id >= embed->ne[1];
+            })) {
+            e = std::string(m.spec.label) + " proposer returned invalid draft";
+            return false;
+        }
+        if (draft.empty()) {
+            if (room < 1) {
+                e = std::string(m.spec.label) + " decode exceeds cache";
+                return false;
+            }
+            std::vector<float> logits;
+            phase_start = Clock::now();
+            const bool decode_ok = forward_decode(m, o.ids.back(), state.length,
+                                                  state, logits, e);
+            stats.fallback_ms += elapsed_ms(phase_start, Clock::now());
+            if (!decode_ok) return false;
+            // The decode graph may have completed after cancellation. Its
+            // predicted token is still tentative until this check passes.
+            if (cancelled && cancelled()) {
+                o.stop_reason = GenStopReason::kCancelled;
+                return finish();
+            }
+            const int32_t token = spec_argmax_impl(m.spec, logits);
+            o.ids.push_back(token);
+            ++stats.fallback_steps;
+            if (generation_stops_on(token, op)) {
+                o.stop_reason = GenStopReason::kEos;
+                return finish();
+            }
+            continue;
+        }
+        const int64_t past = state.length;
+        std::vector<int32_t> input;
+        input.reserve(draft.size() + 1);
+        input.push_back(o.ids.back());
+        input.insert(input.end(), draft.begin(), draft.end());
+        std::vector<float> logits;
+        phase_start = Clock::now();
+        const bool verify_ok = forward_verify(m, input, state, logits, e);
+        stats.verify_ms += elapsed_ms(phase_start, Clock::now());
+        if (!verify_ok) return false;
+        ++stats.verify_calls;
+        stats.proposed += (int32_t)draft.size();
+        if (logits.size() != input.size() * (size_t)vocab) {
+            e = std::string(m.spec.label) + " verify logits have wrong shape";
+            return false;
+        }
+        // A cancellation after graph execution discards all tentative draft
+        // output. The previous verified prefix remains available in o.ids.
+        if (cancelled && cancelled()) {
+            o.stop_reason = GenStopReason::kCancelled;
+            return finish();
+        }
+        bool rejected = false;
+        for (size_t j = 0; j < draft.size(); ++j) {
+            const int32_t target = spec_argmax_impl(m.spec,
+                logits.data() + j * (size_t)vocab, (size_t)vocab);
+            if (target == draft[j]) ++stats.accepted;
+            else rejected = true;
+            o.ids.push_back(target);
+            const bool stop = generation_stops_on(target, op);
+            // Keep the KV length equal to the verified tokens on every exit.
+            if (rejected || stop) state.length = past + (int64_t)j + 1;
+            if (stop) {
+                o.stop_reason = GenStopReason::kEos;
+                return finish();
+            }
+            if (rejected) break;
+        }
+        if (rejected) continue;
+        // Every draft token matched. Row K predicts the free bonus token.
+        const int32_t bonus = spec_argmax_impl(m.spec,
+            logits.data() + draft.size() * (size_t)vocab, (size_t)vocab);
+        o.ids.push_back(bonus);
+        if (generation_stops_on(bonus, op)) {
+            o.stop_reason = GenStopReason::kEos;
+            return finish();
         }
     }
-    return true;
+    return finish();
 }
 
 } // namespace starling::ggml::lib
