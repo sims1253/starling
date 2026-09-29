@@ -1,0 +1,2 @@
+CHUNK index=1 real_samples=480000 padded_samples=480000 budget=182 parity=1 tokens=121 stop=0 draft=104 accepted=59 proposed=105 greedy_from_pcm_ms=25101.749 ctc_enc_project_ms=8372.185 ctc_head_ms=829.564 ctc_verify_ms=12702.254 ctc_from_reused_mel_ms=21907.685
+CHUNK index=2 real_samples=38000 padded_samples=480000 budget=44 parity=1 tokens=12 stop=0 draft=10 accepted=4 proposed=9 greedy_from_pcm_ms=14838.275 ctc_enc_project_ms=8302.599 ctc_head_ms=708.823 ctc_verify_ms=6238.808 ctc_from_reused_mel_ms=15254.269

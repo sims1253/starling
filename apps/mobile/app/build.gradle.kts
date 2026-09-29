@@ -5,6 +5,13 @@ plugins {
 // Release builds (the release-android workflow) pass the tag-derived version
 // as Gradle properties; local builds keep the defaults below.
 val starlingVersionName = providers.gradleProperty("starlingVersionName").orElse("0.1.0").get()
+fun gradleFlag(name: String): Boolean {
+    val raw = providers.gradleProperty(name).orElse("false").get()
+    return raw.toBooleanStrictOrNull()
+        ?: throw GradleException("$name must be 'true' or 'false': $raw")
+}
+val starlingExperimental = gradleFlag("starlingExperimental")
+val starlingArm64Only = gradleFlag("starlingArm64Only")
 val starlingVersionCode = providers.gradleProperty("starlingVersionCode").orElse("1").get().let { raw ->
     raw.toIntOrNull()?.takeIf { it > 0 }
         ?: throw GradleException("starlingVersionCode must be an integer in 1..${Int.MAX_VALUE}: $raw")
@@ -81,7 +88,7 @@ android {
         }
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         ndk {
-            abiFilters += listOf("arm64-v8a", "x86_64")
+            abiFilters += if (starlingArm64Only) listOf("arm64-v8a") else listOf("arm64-v8a", "x86_64")
         }
     }
 
@@ -105,6 +112,13 @@ android {
         }
     }
 
+    // Experimental builds overlay the user-visible names. A release-source-set
+    // overlay outranks src/main, whereas resValue would collide with the same
+    // names in src/main/res/values/strings.xml.
+    if (starlingExperimental) {
+        sourceSets.getByName("release").res.srcDir("src/experimental/res")
+    }
+
     buildTypes {
         // Installs beside a release build, so device tests never need to
         // uninstall (and wipe) the app someone actually uses.
@@ -112,6 +126,9 @@ android {
             applicationIdSuffix = ".debug"
         }
         release {
+            if (starlingExperimental) {
+                applicationIdSuffix = ".experimental"
+            }
             if (releaseSigning != null) signingConfig = signingConfigs.getByName("release")
             isMinifyEnabled = false
             proguardFiles(

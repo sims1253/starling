@@ -1,0 +1,12 @@
+{
+  "schema": "quant-wer-noninferiority-v1",
+  "purpose": "Held-out Parakeet compact storage validation after the 300-clip test-split study",
+  "cohorts": {
+    "en_us_validation": 300,
+    "de_de_validation": 300
+  },
+  "max_wer_delta_pp": 0.2,
+  "min_bytes_saved": 15000000,
+  "bootstrap_resamples": 10000,
+  "bootstrap_seed": 20260928
+}

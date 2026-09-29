@@ -14,6 +14,14 @@ native device testing.
 
 <br clear="right">
 
+## Try the current master build
+
+[Experimental releases](https://github.com/sims1253/starling/releases?q=experimental&expanded=true)
+provide Linux and Windows desktop apps, CPU/Vulkan/CUDA servers, and an Android
+APK after each successful master build. See the
+[installation guide](docs/experimental-releases.md) for the right downloads
+and setup steps. No compiler is needed.
+
 ## Run the server
 
 Quickest path — Node.js 20+, no compiler and no GPU required:

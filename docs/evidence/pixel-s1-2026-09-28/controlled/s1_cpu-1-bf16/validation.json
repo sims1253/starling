@@ -1,0 +1,7 @@
+{
+  "family": "s1_cpu",
+  "arm": "bf16",
+  "index": 0,
+  "samples": 89,
+  "results": 8
+}

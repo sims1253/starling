@@ -58,6 +58,7 @@ def _candidate_lib_paths() -> list[Path]:
 
 
 _LIB = None  # cached ctypes.CDLL, or False once tried-and-failed
+_LIB_PATH: Path | None = None  # file the cached library was loaded from
 _CAPI_OK = None  # True once the symbols resolved and ABI matched
 
 
@@ -67,7 +68,7 @@ def _load_lib():
     Cached: the first call probes; subsequent calls return the cached result
     (the .so or None). Never raises — callers use :func:`available`.
     """
-    global _LIB, _CAPI_OK
+    global _LIB, _LIB_PATH, _CAPI_OK
     if _LIB is not None:
         return _LIB if (_LIB is not False and _CAPI_OK) else None
     # Probe candidates in order; load the first that exists + resolves symbols.
@@ -81,6 +82,7 @@ def _load_lib():
         if not _resolve_symbols(lib):
             continue
         _LIB = lib
+        _LIB_PATH = path
         _CAPI_OK = True
         return lib
     _LIB = False
@@ -121,6 +123,11 @@ def _resolve_symbols(lib: ctypes.CDLL) -> bool:
     # misalignment after an API bump the binding hasn't tracked).
     got = lib.starling_ggml_abi_version()
     return got == _EXPECTED_ABI_VERSION
+
+
+def loaded_library_path() -> Path | None:
+    """Path of the library selected by the candidate search, if one loaded."""
+    return _LIB_PATH.resolve() if _load_lib() is not None and _LIB_PATH else None
 
 
 def available() -> bool:

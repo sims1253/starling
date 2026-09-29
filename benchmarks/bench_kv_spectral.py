@@ -2,22 +2,17 @@
 
 Motivation
 ----------
-The wiki concept `/mnt/z/concepts/kv-cache-spectral-compression.md` measured
-that for LLMs only ~3-4% of head dimensions carry meaningful signal in the KEY
-vectors (effective dim ~4 out of 128), while VALUES are higher rank (~30-40%).
-If ASR *encoder* KV has similar low-rank structure, spectral compression is
-worth building; if not, we save the engineering effort.
+Issue #59 asks whether the ASR encoder's K/V projections are compressible.
+That must be tested on held-out audio before changing an encoder.
 
 This is a MEASUREMENT script only. No production code is modified.
 
 Method
 ------
-For each attention layer we register a ``forward_hook`` that captures the raw K
-and V tensors (per head, per position) on a calibration set of audio clips. We
-then run PCA per (layer, head) via ``torch.linalg.svd`` on the centered
-(N_positions, head_dim) matrix and report ``d_eff`` -- the number of principal
-components needed to capture 95 / 99 / 99.9% of the variance -- and the ratio
-``d_eff / head_dim``, averaged across heads per layer.
+For each attention layer we capture raw K and V tensors. We fit a PCA basis on
+even-indexed clips and report reconstruction error on odd-indexed clips, which
+were not used to fit the basis. In-sample explained variance alone cannot tell
+us whether a compressed cache preserves other utterances.
 
   * granite encoder: hook ``layer.attn.to_kv`` (fused K||V Linear, output split
     into K=first inner_dim, V=last inner_dim). 16 layers x 8 heads x hd=128,
@@ -25,17 +20,20 @@ components needed to capture 95 / 99 / 99.9% of the variance -- and the ratio
   * qwen3 encoder:  hook ``layer.self_attn.k_proj`` / ``.v_proj`` separately.
     24 layers x 16 heads x hd=64, windowed attention.
 
-Outputs ``outputs/kv_spectral.json`` and prints a per-layer table + verdict.
+Outputs ``outputs/kv_spectral.json`` and prints a per-layer table. The result
+is a screening measurement, not a latency, memory, or WER claim.
 
 Usage
 -----
     uv run python benchmarks/bench_kv_spectral.py [--clips N] [--models granite,qwen3]
+    uv run python benchmarks/bench_kv_spectral.py --audio clip1.wav clip2.wav ...
 """
 
 from __future__ import annotations
 
 import argparse
 import gc
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -49,21 +47,27 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 
 OUT_PATH = REPO_ROOT / "outputs" / "kv_spectral.json"
 
-# Wiki LLM reference numbers (K ~3%, V ~30-40%) for the verdict.
-WIKI_K_RATIO = 0.03
-WIKI_V_RATIO = 0.35
-
-
 # =========================================================================== #
 # Calibration audio set
 # =========================================================================== #
-def gather_calibration_clips(max_clips: int) -> list[tuple[np.ndarray, int, str]]:
+def gather_calibration_clips(max_clips: int,
+                             audio_paths: list[Path] | None = None) -> list[tuple[np.ndarray, int, str]]:
     """Return a diverse set of (audio_float32_mono, 16000, name) calibration clips.
 
     Prefers the leaderboard corpus (7 datasets, real ASR distribution) and
     supplements with the synthetic short/medium/long fixtures for variety.
     """
     clips: list[tuple[np.ndarray, int, str]] = []
+    if audio_paths:
+        if len(audio_paths) > max_clips:
+            raise ValueError(
+                f"--audio has {len(audio_paths)} clips, exceeding --clips {max_clips}; "
+                "increase --clips to include every explicit file"
+            )
+        for path in audio_paths:
+            a, sr = _read_wav_mono(str(path))
+            clips.append((a, sr, path.name))
+        return clips
     corpus_dir = REPO_ROOT / "tests" / "fixtures" / "leaderboard_corpus"
     if corpus_dir.exists():
         # One clip per (dataset, n8 bucket) spread across datasets.
@@ -104,6 +108,8 @@ def _read_wav_mono(path: str) -> tuple[np.ndarray, int]:
     import soundfile as sf
 
     a, sr = sf.read(path)
+    if sr != 16000:
+        raise ValueError(f"calibration WAV {path} has sample rate {sr}; expected 16000 Hz")
     if a.ndim == 2:
         a = a.mean(axis=1)
     return np.ascontiguousarray(a, dtype=np.float32), int(sr)
@@ -174,12 +180,12 @@ class GraniteKVCapture:
         """Tell the capture the true (unpadded) input seq length for this fwd."""
         self._cur_T = int(T)
 
-    def stacked(self) -> list[tuple[torch.Tensor, torch.Tensor]]:
-        """Per layer: (K (N, nh, hd), V (N, nh, hd)) concatenated over samples."""
+    def stacked(self, clip_indices: range) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        """Per layer: K and V concatenated over selected clips."""
         out = []
         for layer_kvs in self.kv_per_layer:
-            ks = torch.cat([k for k, _ in layer_kvs], dim=0)
-            vs = torch.cat([v for _, v in layer_kvs], dim=0)
+            ks = torch.cat([layer_kvs[i][0] for i in clip_indices], dim=0)
+            vs = torch.cat([layer_kvs[i][1] for i in clip_indices], dim=0)
             out.append((ks, vs))
         return out
 
@@ -241,11 +247,11 @@ class Qwen3KVCapture:
             h.remove()
         self.handles = []
 
-    def stacked(self) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    def stacked(self, clip_indices: range) -> list[tuple[torch.Tensor, torch.Tensor]]:
         out = []
         for k_list, v_list in zip(self._k_lists, self._v_lists):
-            ks = torch.cat(k_list, dim=0)
-            vs = torch.cat(v_list, dim=0)
+            ks = torch.cat([k_list[i] for i in clip_indices], dim=0)
+            vs = torch.cat([v_list[i] for i in clip_indices], dim=0)
             out.append((ks, vs))
         return out
 
@@ -271,43 +277,62 @@ def effective_dim(singular_values: torch.Tensor, thresholds: tuple[float, ...]) 
     out = {}
     for t in thresholds:
         # first index where cumulative >= t (1-based count)
-        idx = int(torch.searchsorted(cum, torch.tensor(float(t))).item())
+        idx = int(torch.searchsorted(cum, cum.new_tensor(float(t))).item())
         idx = min(max(idx + 1, 1), int(cum.numel()))
         out[t] = idx
     return out
 
 
-def pca_layer(mat: torch.Tensor, head_dim: int, thresholds: tuple[float, ...]) -> dict[str, Any]:
-    """Per-layer PCA across heads.
+def pca_layer(train: torch.Tensor, held_out: torch.Tensor,
+              thresholds: tuple[float, ...]) -> dict[str, Any]:
+    """Fit each head on training clips; measure relative squared error elsewhere.
 
-    mat: (N, num_heads, head_dim) fp32. Returns per-threshold mean d_eff,
-    mean d_eff/head_dim, and the head-level d_eff arrays.
+    Error is normalized by held-out energy around the training mean. The
+    orthogonal PCA projection makes this ratio lie in [0, 1], apart from
+    floating-point roundoff; a distribution shift can move it toward one.
     """
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    num_heads = mat.shape[1]
+    num_heads, head_dim = train.shape[1:]
+    if held_out.shape[1:] != train.shape[1:] or not len(train) or not len(held_out):
+        raise ValueError("train and held-out K/V must have matching nonempty heads")
     per_head_deff = {t: np.zeros(num_heads, dtype=np.int32) for t in thresholds}
-    sv_list: list[np.ndarray] = []
+    ranks = sorted({max(1, head_dim // 4), max(1, head_dim // 2), head_dim})
+    errors = {r: [] for r in ranks}
+    threshold_errors = {t: [] for t in thresholds}
     for h in range(num_heads):
-        x = mat[:, h, :].to(device=device, dtype=torch.float32)
-        # Center.
+        x = train[:, h, :].to(device=device, dtype=torch.float32)
+        y = held_out[:, h, :].to(device=device, dtype=torch.float32)
         mean = x.mean(dim=0, keepdim=True)
         xc = x - mean
-        # SVD on centered matrix: singular values are sqrt of eigenvalues of cov.
-        try:
-            sv = torch.linalg.svdvals(xc)
-        except RuntimeError:
-            # fallback to full svd if svdvals hits a driver issue
-            sv = torch.linalg.svd(xc, full_matrices=False)[1]
-        sv = sv.cpu()
-        sv_list.append(sv.double().numpy())
+        # Keep the small [head_dim, head_dim] basis. A full SVD on long audio
+        # would otherwise materialize an enormous [positions, positions] U.
+        _, sv, vh = torch.linalg.svd(xc, full_matrices=x.shape[0] < head_dim)
         deff = effective_dim(sv, thresholds)
         for t in thresholds:
             per_head_deff[t][h] = deff[t]
+        yc = y - mean
+        energy = float(yc.square().sum())
+        if energy <= 1e-12:
+            raise ValueError(f"held-out head {h} has near-zero energy; relative error is undefined")
+        coeffs = yc @ vh.T
+        def relative_error(rank: int) -> float:
+            residual = yc - coeffs[:, :rank] @ vh[:rank]
+            return float(residual.square().sum()) / energy
+        for r in ranks:
+            errors[r].append(relative_error(r))
+        for t in thresholds:
+            threshold_errors[t].append(relative_error(deff[t]))
     result: dict[str, Any] = {}
     for t in thresholds:
         result[f"d_eff@{t}"] = per_head_deff[t].tolist()
         result[f"d_eff_mean@{t}"] = float(per_head_deff[t].mean())
         result[f"d_eff_ratio_mean@{t}"] = float(per_head_deff[t].mean() / head_dim)
+        result[f"held_out_relative_mse@d_eff_{t}"] = threshold_errors[t]
+        result[f"held_out_relative_mse_mean@d_eff_{t}"] = float(np.mean(threshold_errors[t]))
+    result["held_out_relative_mse_by_rank"] = {str(r): v for r, v in errors.items()}
+    result["held_out_relative_mse_mean_by_rank"] = {
+        str(r): float(np.mean(v)) for r, v in errors.items()
+    }
     return result
 
 
@@ -315,13 +340,26 @@ def pca_layer(mat: torch.Tensor, head_dim: int, thresholds: tuple[float, ...]) -
 # Per-model measurement
 # =========================================================================== #
 @torch.inference_mode()
-def measure_granite(clips: list[tuple[np.ndarray, int, str]]) -> dict[str, Any]:
+def measure_granite(clips: list[tuple[np.ndarray, int, str]],
+                    snapshot: Path | None = None) -> dict[str, Any]:
+    for _, sr, name in clips:
+        if sr != 16000:
+            raise ValueError(f"Granite clip {name} has sample rate {sr}; expected 16000 Hz")
     from starling.granite.audio import build_inputs
     from starling.granite.loader import get_components, load_model_and_processor
 
     print("\n=== GRANITE encoder ===", flush=True)
     print("loading granite model ...", flush=True)
-    model, processor = load_model_and_processor()
+    if snapshot is None:
+        model, processor = load_model_and_processor()
+    else:
+        from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
+        model = AutoModelForSpeechSeq2Seq.from_pretrained(
+            snapshot,
+            device_map="cuda" if torch.cuda.is_available() else "cpu",
+            dtype=torch.bfloat16,
+            attn_implementation="eager").eval()
+        processor = AutoProcessor.from_pretrained(snapshot)
     comps = get_components(model)
     encoder = comps["encoder"]
     dtype = model.dtype
@@ -332,7 +370,7 @@ def measure_granite(clips: list[tuple[np.ndarray, int, str]]) -> dict[str, Any]:
         for i, (wav, sr, name) in enumerate(clips):
             wav_t = torch.from_numpy(wav).unsqueeze(0)
             inputs = build_inputs(processor, wav_t)
-            feats = inputs["input_features"].to(dtype).cuda()
+            feats = inputs["input_features"].to(device=model.device, dtype=dtype)
             T = int(feats.shape[1])
             cap.record_seq_len(T)
             _ = encoder(feats, return_dict=True)
@@ -340,21 +378,24 @@ def measure_granite(clips: list[tuple[np.ndarray, int, str]]) -> dict[str, Any]:
     finally:
         cap.detach()
 
-    stacked = cap.stacked()
+    train = cap.stacked(range(0, len(clips), 2))
+    held_out = cap.stacked(range(1, len(clips), 2))
     head_dim = cap.head_dim
     num_heads = cap.num_heads
     thresholds = (0.95, 0.99, 0.999)
     layers_out = []
-    for li, (k_mat, v_mat) in enumerate(stacked):
-        k_res = pca_layer(k_mat, head_dim, thresholds)
-        v_res = pca_layer(v_mat, head_dim, thresholds)
+    for li, ((k_mat, v_mat), (k_test, v_test)) in enumerate(zip(train, held_out)):
+        k_res = pca_layer(k_mat, k_test, thresholds)
+        v_res = pca_layer(v_mat, v_test, thresholds)
         print(f"  layer {li:2d}: K d_eff@0.99={k_res['d_eff_mean@0.99']:.2f} "
               f"({k_res['d_eff_ratio_mean@0.99']*100:.1f}% of {head_dim})  "
+              f"held-out error={k_res['held_out_relative_mse_mean@d_eff_0.99']:.3f}; "
               f"V d_eff@0.99={v_res['d_eff_mean@0.99']:.2f} "
-              f"({v_res['d_eff_ratio_mean@0.99']*100:.1f}%)", flush=True)
+              f"held-out error={v_res['held_out_relative_mse_mean@d_eff_0.99']:.3f}", flush=True)
         layers_out.append({
             "layer": li,
-            "n_positions": int(k_mat.shape[0]),
+            "n_train_positions": int(k_mat.shape[0]),
+            "n_held_out_positions": int(k_test.shape[0]),
             "K": k_res,
             "V": v_res,
         })
@@ -366,6 +407,8 @@ def measure_granite(clips: list[tuple[np.ndarray, int, str]]) -> dict[str, Any]:
 
     summary = _summarise(layers_out, head_dim, thresholds)
     summary["model"] = "granite-speech-4.1-2b"
+    summary["source_snapshot"] = snapshot.name if snapshot is not None else "default HF revision"
+    summary["source_snapshot_path"] = str(snapshot.resolve()) if snapshot is not None else None
     summary["num_layers"] = len(layers_out)
     summary["num_heads"] = num_heads
     summary["head_dim"] = head_dim
@@ -406,21 +449,24 @@ def measure_qwen3(clips: list[tuple[np.ndarray, int, str]]) -> dict[str, Any]:
     finally:
         cap.detach()
 
-    stacked = cap.stacked()
+    train = cap.stacked(range(0, len(clips), 2))
+    held_out = cap.stacked(range(1, len(clips), 2))
     head_dim = cap.head_dim
     num_heads = cap.num_heads
     thresholds = (0.95, 0.99, 0.999)
     layers_out = []
-    for li, (k_mat, v_mat) in enumerate(stacked):
-        k_res = pca_layer(k_mat, head_dim, thresholds)
-        v_res = pca_layer(v_mat, head_dim, thresholds)
+    for li, ((k_mat, v_mat), (k_test, v_test)) in enumerate(zip(train, held_out)):
+        k_res = pca_layer(k_mat, k_test, thresholds)
+        v_res = pca_layer(v_mat, v_test, thresholds)
         print(f"  layer {li:2d}: K d_eff@0.99={k_res['d_eff_mean@0.99']:.2f} "
               f"({k_res['d_eff_ratio_mean@0.99']*100:.1f}% of {head_dim})  "
+              f"held-out error={k_res['held_out_relative_mse_mean@d_eff_0.99']:.3f}; "
               f"V d_eff@0.99={v_res['d_eff_mean@0.99']:.2f} "
-              f"({v_res['d_eff_ratio_mean@0.99']*100:.1f}%)", flush=True)
+              f"held-out error={v_res['held_out_relative_mse_mean@d_eff_0.99']:.3f}", flush=True)
         layers_out.append({
             "layer": li,
-            "n_positions": int(k_mat.shape[0]),
+            "n_train_positions": int(k_mat.shape[0]),
+            "n_held_out_positions": int(k_test.shape[0]),
             "K": k_res,
             "V": v_res,
         })
@@ -453,80 +499,59 @@ def _summarise(layers_out: list[dict], head_dim: int, thresholds: tuple[float, .
     return s
 
 
-# =========================================================================== #
-# Verdict
-# =========================================================================== #
-def verdict_line(ratio: float, ref: float, kind: str) -> str:
-    """Compare a measured K/V ratio to the wiki LLM reference."""
-    if ratio <= ref * 1.5:
-        verdict = "LOW-RANK (compression viable)"
-    elif ratio <= ref * 4.0:
-        verdict = "BORDERLINE (marginal compression gain)"
-    else:
-        verdict = "HIGH-RANK (compression NOT viable)"
-    return f"{kind}: {ratio*100:.1f}% vs wiki {ref*100:.1f}% -> {verdict}"
-
-
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--clips", type=int, default=24,
                     help="number of calibration clips (default 24)")
     ap.add_argument("--models", type=str, default="granite,qwen3",
                     help="comma list: granite,qwen3 (default both)")
+    ap.add_argument("--audio", type=Path, nargs="+",
+                    help="explicit local WAV files; at least two clips are required")
+    ap.add_argument("--granite-snapshot", type=Path,
+                    help="pinned local Granite HF snapshot directory for reproducible loading")
     args = ap.parse_args()
 
     models = [m.strip() for m in args.models.split(",") if m.strip()]
-    clips = gather_calibration_clips(args.clips)
+    if not models or set(models) - {"granite", "qwen3"}:
+        ap.error("--models must contain granite and/or qwen3")
+    try:
+        clips = gather_calibration_clips(args.clips, args.audio)
+    except (OSError, ValueError, RuntimeError) as exc:
+        ap.error(str(exc))
     print(f"calibration set: {len(clips)} clips", flush=True)
     for _, _, name in clips:
         print(f"  - {name}", flush=True)
-    if not clips:
-        print("ERROR: no calibration clips found", file=sys.stderr)
+    if len(clips) < 2:
+        print("ERROR: at least two clips are needed for held-out evaluation", file=sys.stderr)
         return 1
+    if args.granite_snapshot is not None and not args.granite_snapshot.is_dir():
+        ap.error("--granite-snapshot must be an existing directory")
+    if args.granite_snapshot is not None and "granite" not in models:
+        ap.error("--granite-snapshot requires granite in --models")
+    if args.audio and len({p.name for p in args.audio[:len(clips)]}) != len(clips):
+        ap.error("--audio filenames must be distinct for portable result hashes")
 
     thresholds = (0.95, 0.99, 0.999)
     results: dict[str, Any] = {
-        "wiki_llm_reference": {"K_ratio": WIKI_K_RATIO, "V_ratio": WIKI_V_RATIO},
+        "method": "per-head PCA fitted on even-indexed clips; reconstruction evaluated on odd-indexed clips",
         "thresholds": list(thresholds),
         "n_clips": len(clips),
-        "clip_names": [name for _, _, name in clips],
+        "train_clip_names": [clips[i][2] for i in range(0, len(clips), 2)],
+        "held_out_clip_names": [clips[i][2] for i in range(1, len(clips), 2)],
     }
+    if args.audio:
+        try:
+            results["audio_sha256"] = {
+                path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+                for path in args.audio
+            }
+        except OSError as exc:
+            ap.error(f"could not hash --audio file: {exc}")
 
     if "granite" in models:
-        results["granite"] = measure_granite(clips)
+        results["granite"] = measure_granite(clips, args.granite_snapshot)
     if "qwen3" in models:
         results["qwen3"] = measure_qwen3(clips)
-
-    # ---- verdict ----
-    print("\n" + "=" * 72, flush=True)
-    print("VERDICT (d_eff/head_dim @ 99% variance, averaged across heads & layers)", flush=True)
-    print("-" * 72, flush=True)
-    print(f"wiki LLM reference: K={WIKI_K_RATIO*100:.1f}%  V={WIKI_V_RATIO*100:.1f}%", flush=True)
-    verdicts: dict[str, Any] = {}
-    for m in ("granite", "qwen3"):
-        if m not in results:
-            continue
-        kr = results[m]["K_ratio_overall_mean@0.99"]
-        vr = results[m]["V_ratio_overall_mean@0.99"]
-        print(f"\n[{m}] {results[m]['num_layers']} layers x "
-              f"{results[m]['num_heads']} heads x hd={results[m]['head_dim']}", flush=True)
-        print("  " + verdict_line(kr, WIKI_K_RATIO, "K"), flush=True)
-        print("  " + verdict_line(vr, WIKI_V_RATIO, "V"), flush=True)
-        # Overall build recommendation: K must be low-rank to be worth it.
-        if kr <= WIKI_K_RATIO * 1.5:
-            build = "BUILD (K is as low-rank as the LLM)"
-        elif kr <= WIKI_K_RATIO * 4.0:
-            build = "BORDERLINE -- only K compression, marginal; re-measure with more clips"
-        else:
-            build = "NO-BUILD (K is NOT low-rank; compression would lose signal)"
-        print(f"  recommendation: {build}", flush=True)
-        verdicts[m] = {
-            "K_ratio@0.99": kr,
-            "V_ratio@0.99": vr,
-            "build_recommendation": build,
-        }
-    results["verdict"] = verdicts
-    print("=" * 72, flush=True)
 
     OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
     OUT_PATH.write_text(json.dumps(results, indent=2))

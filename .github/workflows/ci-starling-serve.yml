@@ -22,6 +22,7 @@ on:
       - 'tests/test_native_serve.py'
       - 'tests/test_compact_quantization.py'
       - 'quants/recipes/**'
+      - 'benchmarks/speculative/**'
       - '.github/workflows/ci-starling-serve.yml'
   pull_request:
     paths:
@@ -34,6 +35,7 @@ on:
       - 'tests/test_native_serve.py'
       - 'tests/test_compact_quantization.py'
       - 'quants/recipes/**'
+      - 'benchmarks/speculative/**'
       - '.github/workflows/ci-starling-serve.yml'
   workflow_dispatch:
     inputs:
@@ -114,14 +116,16 @@ jobs:
           cmake -B build -DSTARLING_SERVE=ON -DBUILD_SHARED_LIBS=OFF -DGGML_NATIVE=OFF -DGGML_LLAMAFILE=OFF
           cmake --build build -j --target starling-serve stream_session_test \
             audio_parser_test loader_guard_test higgs_dtype_guard_test \
-            audex_loader_guard_test granite_stage_test granite_ctc_argmax_test model_lifetime_test \
+            audex_loader_guard_test granite_stage_test granite_ctc_argmax_test \
+            granite_ctc_proposer_test granite_ctc_entry_test model_lifetime_test \
             starling-quantize \
-            parakeet_compact_engine_test \
+            parakeet_compact_engine_test s1_quant_loader_test \
             voxtral_encoder_test voxtral_engine_test voxtral_loader_guard_test \
             trace_schema_test trace_off_test granite_trace_test serve_trace_test \
+            graph_snapshot_test \
             replay_graph_support_test cpu_repack_test \
             device_cache_clear_test greedy_termination_test tdt_graph_budget_test \
-            speculative_verifier_test s1_copy_draft_test
+            speculative_verifier_test moss-preview-copy-test s1_copy_draft_test
 
       - name: Quantizer storage and recipe regressions
         env:
@@ -135,14 +139,17 @@ jobs:
           ./build/stream_session_test
           ./build/audio_parser_test
           ./build/replay_graph_support_test
+          ./build/moss-preview-copy-test
 
       # Engine contracts from the optimization program: on-device KV cache
       # clearing (S01), EOS/budget termination (S03), and batched speculative
-      # verification. These use self-synthesized CPU fixtures.
-      - name: Engine contract tests (KV, termination, verifier)
+      # verification and Granite CTC proposal. These use self-synthesized
+      # CPU fixtures or no model assets.
+      - name: Engine contract tests (KV, termination, verifier, CTC)
         run: |
           for t in device_cache_clear_test greedy_termination_test tdt_graph_budget_test \
-                   speculative_verifier_test s1_copy_draft_test; do
+                   speculative_verifier_test granite_ctc_proposer_test \
+                   granite_ctc_entry_test s1_copy_draft_test; do
             "./build/$t"
           done
 
@@ -153,6 +160,7 @@ jobs:
       - name: C++ loader/dtype guard tests
         run: |
           ./build/loader_guard_test
+          ./build/s1_quant_loader_test
           ./build/higgs_dtype_guard_test
           ./build/audex_loader_guard_test
           ./build/granite_stage_test
@@ -169,6 +177,7 @@ jobs:
           ./build/trace_off_test
           ./build/granite_trace_test
           ./build/serve_trace_test
+          ./build/graph_snapshot_test
 
       # Voxtral engine suite: the tiny-GGUF fixture is generated in-workflow
       # (CPU torch wheel; numpy/gguf come with the quantizer step above), so
