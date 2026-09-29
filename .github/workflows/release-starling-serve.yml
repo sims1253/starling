@@ -363,10 +363,19 @@ jobs:
         shell: pwsh
         env:
           VULKAN_SDK_VERSION: 1.4.357.0
+          # SHA-256 of vulkansdk-windows-X64-1.4.357.0.exe; update together
+          # with VULKAN_SDK_VERSION. Pinned here (not fetched at runtime) so a
+          # compromised download cannot swap hash and installer together.
+          VULKAN_SDK_SHA256: 81F474711E9042F4CD22B31B2F7A8870DB2E428B21586FB43DD80150BE97310D
         run: |
-          curl.exe -o "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" -L `
+          $installer = "$env:RUNNER_TEMP\VulkanSDK-Installer.exe"
+          curl.exe -o "$installer" -L `
             "https://sdk.lunarg.com/sdk/download/${env:VULKAN_SDK_VERSION}/windows/vulkansdk-windows-X64-${env:VULKAN_SDK_VERSION}.exe"
-          & "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" --accept-licenses --default-answer --confirm-command install
+          if ($LASTEXITCODE -ne 0) { throw "Vulkan SDK download failed (exit $LASTEXITCODE)" }
+          $actual = (Get-FileHash "$installer" -Algorithm SHA256).Hash
+          if ($actual -ine $env:VULKAN_SDK_SHA256) { throw "Vulkan SDK checksum mismatch: $actual" }
+          & "$installer" --accept-licenses --default-answer --confirm-command install
+          if ($LASTEXITCODE -ne 0) { throw "Vulkan SDK install failed (exit $LASTEXITCODE)" }
           $sdk = "C:\VulkanSDK\${env:VULKAN_SDK_VERSION}"
           foreach ($p in @("$sdk\Include\vulkan\vulkan.h", "$sdk\Lib\vulkan-1.lib")) {
             if (-not (Test-Path $p)) { throw "unexpected SDK layout, missing $p" }
@@ -455,7 +464,7 @@ jobs:
             "-DCMAKE_CUDA_ARCHITECTURES=$env:CUDA_ARCHITECTURES" `
             -DGGML_NATIVE=OFF -DGGML_LLAMAFILE=OFF `
             -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded `
-            "-DCMAKE_EXE_LINKER_OPTIONS=/DELAYLOAD:nvcuda.dll;delayimp.lib"
+            "-DCMAKE_EXE_LINKER_FLAGS=/DELAYLOAD:nvcuda.dll delayimp.lib"
           cmake --build build --config Release --target starling-serve
 
       - name: Package
