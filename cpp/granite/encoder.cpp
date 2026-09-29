@@ -44,6 +44,9 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 
+#include <chrono>
+#include <cstddef>
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -341,18 +344,25 @@ ggml_tensor* build_fused(ggml_context* c, const GraniteModel& m, ggml_tensor* me
     if (stage_wants(stop->name, "melin")) { stop->hit = true; return f32(c, mel_in); }
     if (stage_wants(stop->name, "in")) { stop->hit = true; return f32(c, x); }
     ggml_tensor* ctc_mid = nullptr;
-    const bool want_ctc_bundle = stage_wants(stop->name, "ctc_bundle");
+    const bool want_ctc_bundle = stage_wants(stop->name, "ctc_bundle") ||
+                                 stage_wants(stop->name, "ctc_project_bundle");
     for (uint32_t li = 0; li < ec.n_layers; ++li) {
         x = conformer_block(c, m, (int) li, x, s, stop,
                             want_ctc_bundle ? &ctc_mid : nullptr);
         if (stop->hit) return f32(c, x);
     }
     if (want_ctc_bundle) {
-        // The graph's real output includes both required tensors. No side-node
-        // readback is used, and the encoder runs only once for a draft.
+        // Make every requested tensor part of the graph's real output. Side
+        // captures alone are not a reliable numeric oracle on all backends.
         if (!ctc_mid) return f32(c, x);  // invalid mid-layer metadata -> caller error
         stop->hit = true;
-        return ggml_concat(c, f32(c, ctc_mid), f32(c, x), 0);
+        ggml_tensor* ctc = ggml_concat(c, f32(c, ctc_mid), f32(c, x), 0);
+        if (stage_wants(stop->name, "ctc_project_bundle")) {
+            ggml_tensor* project = f32(c, build_projector(c, m, x, s));
+            return ggml_concat(c, ggml_reshape_1d(c, ctc, ggml_nelements(ctc)),
+                               ggml_reshape_1d(c, project, ggml_nelements(project)), 0);
+        }
+        return ctc;
     }
     if (enc_capture) capture_graph_output(f32(c, x), enc_capture);
     return f32(c, build_projector(c, m, x, s));
@@ -524,41 +534,14 @@ ggml_tensor* ctc_argmax_first(ggml_context* c, ggml_tensor* logits,
     return ggml_argmax(c, ggml_mul(c, equal, iota_t));
 }
 
-bool extract_ctc_draft(const GraniteModel& model, const MelFeatures& mel,
-                       std::vector<int32_t>& token_ids, std::string& err) {
+static bool ctc_ids_from_bundle(const GraniteModel& model,
+                                const std::vector<float>& bundle, int64_t T,
+                                std::vector<int32_t>& token_ids, std::string& err) {
     token_ids.clear();
     const auto& ec = model.config.encoder;
-    if (!model.loader.tensor("ctc.out_llm.weight") ||
-        !model.loader.tensor("ctc.out_llm.bias")) {
-        err = "GRANITE GGUF has no optional CTC draft head";
-        return false;
-    }
-    if (mel.n_mels != (int64_t)ec.input_dim || mel.n_frames <= 0 ||
-        mel.data.size() != (size_t)mel.n_mels * mel.n_frames) {
-        err = "invalid GRANITE mel shape/data for CTC draft";
-        return false;
-    }
-    if (ec.mid_layer == 0 || ec.mid_layer > ec.n_layers) {
-        err = "GRANITE CTC encoder.mid_layer is outside the encoder layers";
-        return false;
-    }
-    ensure_weights_realized(model.loader);
-    const int64_t T = mel.n_frames;
-    EncScratch scratch = make_scratch(model.config, T);
-    // Both required tensors become a single graph output. Capturing a side
-    // node is not a numeric oracle on every backend, and this one-shot graph
-    // cannot poison the normal fused encoder replay cache.
-    StageStop stop{"ctc_bundle"};
-    std::vector<float> bundle;
-    const bool stage_ok = run_graph([&](ggml_context* c) -> ggml_tensor* {
-        int64_t mne[2] = {ec.input_dim, T};
-        ggml_tensor* mel_in = graph_input_tensor(c, GGML_TYPE_BF16, 2, mne,
-            mel.data.data(), mel.data.size() * sizeof(mel.data[0]));
-        return build_fused(c, model, mel_in, scratch, nullptr, &stop);
-    }, bundle);
     const size_t stride = (size_t)ec.output_dim + ec.hidden;
-    if (!stage_ok || !stop.hit || bundle.size() != stride * (size_t)T) {
-        err = "GRANITE CTC encoder bundle graph failed or returned the wrong shape";
+    if (bundle.size() != stride * (size_t)T) {
+        err = "GRANITE CTC encoder bundle has the wrong shape";
         return false;
     }
 
@@ -630,6 +613,95 @@ bool extract_ctc_draft(const GraniteModel& model, const MelFeatures& mel,
         previous = label;
     }
     return true;
+}
+
+static bool validate_ctc_request(const GraniteModel& model, const MelFeatures& mel,
+                                 std::string& err) {
+    const auto& ec = model.config.encoder;
+    if (!model.loader.tensor("ctc.out_llm.weight") ||
+        !model.loader.tensor("ctc.out_llm.bias")) {
+        err = "GRANITE GGUF has no optional CTC draft head";
+        return false;
+    }
+    if (mel.n_mels != (int64_t)ec.input_dim || mel.n_frames <= 0 ||
+        mel.data.size() != (size_t)mel.n_mels * mel.n_frames) {
+        err = "invalid GRANITE mel shape/data for CTC draft";
+        return false;
+    }
+    if (ec.mid_layer == 0 || ec.mid_layer > ec.n_layers) {
+        err = "GRANITE CTC encoder.mid_layer is outside the encoder layers";
+        return false;
+    }
+    return true;
+}
+
+bool extract_ctc_draft(const GraniteModel& model, const MelFeatures& mel,
+                       std::vector<int32_t>& token_ids, std::string& err) {
+    token_ids.clear();
+    if (!validate_ctc_request(model, mel, err)) return false;
+    ensure_weights_realized(model.loader);
+    const auto& ec = model.config.encoder;
+    const int64_t T = mel.n_frames;
+    EncScratch scratch = make_scratch(model.config, T);
+    // This one-shot graph cannot poison the ordinary fused encoder replay
+    // cache. The mid logits and final hidden are its explicit output.
+    StageStop stop{"ctc_bundle"};
+    std::vector<float> bundle;
+    const bool stage_ok = run_graph([&](ggml_context* c) -> ggml_tensor* {
+        int64_t mne[2] = {ec.input_dim, T};
+        ggml_tensor* mel_in = graph_input_tensor(c, GGML_TYPE_BF16, 2, mne,
+            mel.data.data(), mel.data.size() * sizeof(mel.data[0]));
+        return build_fused(c, model, mel_in, scratch, nullptr, &stop);
+    }, bundle);
+    if (!stage_ok || !stop.hit) {
+        err = "GRANITE CTC encoder bundle graph failed";
+        return false;
+    }
+    return ctc_ids_from_bundle(model, bundle, T, token_ids, err);
+}
+
+bool encode_audio_project_and_extract_ctc(const GraniteModel& model,
+                                          const MelFeatures& mel,
+                                          AudioEmbeds& audio,
+                                          std::vector<int32_t>& token_ids,
+                                          std::string& err,
+                                          double* stage_ms) {
+    const auto t0 = std::chrono::steady_clock::now();
+    token_ids.clear();
+    audio = {};
+    if (!validate_ctc_request(model, mel, err)) return false;
+    ensure_weights_realized(model.loader);
+    const auto& ec = model.config.encoder;
+    const auto& pc = model.config.projector;
+    const int64_t T = mel.n_frames;
+    const int64_t N = ((T + pc.window_size - 1) / pc.window_size) * pc.num_queries;
+    EncScratch scratch = make_scratch(model.config, T);
+    StageStop stop{"ctc_project_bundle"};
+    std::vector<float> combined;
+    const bool ok = run_graph([&](ggml_context* c) -> ggml_tensor* {
+        int64_t mne[2] = {ec.input_dim, T};
+        ggml_tensor* mel_in = graph_input_tensor(c, GGML_TYPE_BF16, 2, mne,
+            mel.data.data(), mel.data.size() * sizeof(mel.data[0]));
+        return build_fused(c, model, mel_in, scratch, nullptr, &stop);
+    }, combined);
+    const size_t ctc_size = ((size_t)ec.output_dim + ec.hidden) * (size_t)T;
+    const size_t audio_size = (size_t)pc.output_dim * (size_t)N;
+    if (!ok || !stop.hit || combined.size() != ctc_size + audio_size) {
+        err = "GRANITE shared CTC/projector graph failed or returned the wrong shape";
+        return false;
+    }
+    const auto t1 = std::chrono::steady_clock::now();
+    std::vector<float> bundle(combined.begin(), combined.begin() + (ptrdiff_t)ctc_size);
+    audio.data.assign(combined.begin() + (ptrdiff_t)ctc_size, combined.end());
+    audio.n_tokens = N;
+    audio.width = pc.output_dim;
+    const bool draft_ok = ctc_ids_from_bundle(model, bundle, T, token_ids, err);
+    if (stage_ms) {
+        stage_ms[0] = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        stage_ms[1] = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t1).count();
+    }
+    return draft_ok;
 }
 
 } // namespace starling::ggml::granite

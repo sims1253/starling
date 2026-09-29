@@ -114,7 +114,8 @@ jobs:
           cmake -B build -DSTARLING_SERVE=ON -DBUILD_SHARED_LIBS=OFF -DGGML_NATIVE=OFF -DGGML_LLAMAFILE=OFF
           cmake --build build -j --target starling-serve stream_session_test \
             audio_parser_test loader_guard_test higgs_dtype_guard_test \
-            audex_loader_guard_test granite_stage_test granite_ctc_argmax_test model_lifetime_test \
+            audex_loader_guard_test granite_stage_test granite_ctc_argmax_test \
+            granite_ctc_proposer_test granite_ctc_entry_test model_lifetime_test \
             starling-quantize \
             parakeet_compact_engine_test s1_quant_loader_test \
             voxtral_encoder_test voxtral_engine_test voxtral_loader_guard_test \
@@ -139,11 +140,13 @@ jobs:
 
       # Engine contracts from the optimization program: on-device KV cache
       # clearing (S01), EOS/budget termination (S03), and batched speculative
-      # verification. These use self-synthesized CPU fixtures.
-      - name: Engine contract tests (KV, termination, verifier)
+      # verification and Granite CTC proposal. These use self-synthesized
+      # CPU fixtures or no model assets.
+      - name: Engine contract tests (KV, termination, verifier, CTC)
         run: |
           for t in device_cache_clear_test greedy_termination_test tdt_graph_budget_test \
-                   speculative_verifier_test; do
+                   speculative_verifier_test granite_ctc_proposer_test \
+                   granite_ctc_entry_test; do
             "./build/$t"
           done
 

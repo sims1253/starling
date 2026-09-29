@@ -1,0 +1,14 @@
+{"kind": "artifact", "gguf_sha256": "cec47a4fb872ace2713447409f01e0f9ef0d2a7f217db8bb9c33ea0ef96c916a", "library_sha256": "bfa33b547b582afc1fa858416c9ef8f2e6117cb34a9d8a8472c8613f0378530b", "wav_sha256": "835681d10d7ad06169e2b5fe176c227faf99ace387ff1066b9edf014c60a67bf", "wav_samples": 518000, "device_env": "cpu", "threads_env": "4", "max_k": 4, "repeats": 0}
+{"kind": "backend", "name": "CPU"}
+GRANITE_TIMING prefill=5677.3ms decode_tokens=120 avg=98.80ms/tok (kstep=0)
+GRANITE_STAGE chunk=1 mel+enc+proj=8106.2ms prompt+embeds=3.5ms gen=17533.3ms piece=25643.0ms
+GRANITE_TIMING prefill=5670.2ms decode_tokens=11 avg=91.59ms/tok (kstep=0)
+GRANITE_STAGE chunk=2 mel+enc+proj=8172.5ms prompt+embeds=3.3ms gen=6677.8ms piece=14853.6ms
+GRANITE_STAGE request chunks=2 audio=32.38s mel+enc+proj=16278.7ms prompt+embeds=6.8ms gen=24211.1ms stages=40496.5ms bookkeeping=0.4ms total=40497.0ms
+{"kind": "run", "mode": "greedy", "phase": "warm", "repeat": 0, "full_ms": 40496.999, "text_sha256": "71bea620ec405ca1b0bf8d0a1e36000ebc6bb8a7bebeaf255ef388dfea374089", "text_chars": 488}
+GRANITE_CTC chunk=1 k=4 draft=104 accepted=59 proposed=105 verify_calls=60 fallback_steps=1 mel=6.660ms enc_proj=8415.902ms ctc_head=845.324ms embed=4.151ms proposal=0.065ms prefill=5592.572ms verify=6928.371ms fallback=96.053ms piece=21895.106ms
+GRANITE_STAGE chunk=1 mel+enc+proj=9267.9ms prompt+embeds=4.2ms gen=12621.7ms piece=21893.7ms
+GRANITE_CTC chunk=2 k=4 draft=10 accepted=4 proposed=9 verify_calls=5 fallback_steps=2 mel=6.529ms enc_proj=8190.268ms ctc_head=745.346ms embed=2.499ms proposal=0.005ms prefill=5589.791ms verify=573.662ms fallback=197.044ms piece=15305.577ms
+GRANITE_STAGE chunk=2 mel+enc+proj=8942.1ms prompt+embeds=2.5ms gen=6360.9ms piece=15305.6ms
+GRANITE_STAGE request chunks=2 audio=32.38s mel+enc+proj=18210.0ms prompt+embeds=6.6ms gen=18982.6ms stages=37199.3ms bookkeeping=1.9ms total=37201.2ms
+{"kind": "run", "mode": "ctc", "phase": "warm", "repeat": 0, "full_ms": 37201.202, "text_sha256": "71bea620ec405ca1b0bf8d0a1e36000ebc6bb8a7bebeaf255ef388dfea374089", "text_chars": 488}
