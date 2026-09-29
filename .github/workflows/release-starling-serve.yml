@@ -201,6 +201,9 @@ jobs:
       contents: read
     needs: runtime-contract
     runs-on: ubuntu-22.04
+    # Multi-GB toolkit install plus the slowest build in the workflow; never
+    # let it burn the runner past 90 minutes (GitHub's default is 360).
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -384,9 +387,14 @@ jobs:
         run: |
           $installer = "$env:RUNNER_TEMP\VulkanSDK-Installer.exe"
           if (-not (Test-Path "$installer")) {
-            curl.exe --fail --retry 3 --retry-delay 10 -o "$installer" -L `
+            curl.exe --fail --retry 3 --retry-all-errors --retry-delay 10 -o "$installer" -L `
               "https://sdk.lunarg.com/sdk/download/${env:VULKAN_SDK_VERSION}/windows/vulkansdk-windows-X64-${env:VULKAN_SDK_VERSION}.exe"
-            if ($LASTEXITCODE -ne 0) { throw "Vulkan SDK download failed (exit $LASTEXITCODE)" }
+            if ($LASTEXITCODE -ne 0) {
+              # Drop a truncated download so nothing (cache save included)
+              # ever sees a partial installer.
+              Remove-Item "$installer" -ErrorAction SilentlyContinue
+              throw "Vulkan SDK download failed (exit $LASTEXITCODE)"
+            }
           }
           # Verify even on cache hits; the pinned hash is the integrity gate.
           $actual = (Get-FileHash "$installer" -Algorithm SHA256).Hash
@@ -445,6 +453,9 @@ jobs:
       contents: read
     needs: runtime-contract
     runs-on: windows-2025-vs2026
+    # Same rationale as linux-cuda: network-installed toolkit, slowest Windows
+    # build (measured ~38 min); cap well under GitHub's 360-minute default.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
