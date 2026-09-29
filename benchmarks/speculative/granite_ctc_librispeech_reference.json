@@ -1,0 +1,7 @@
+{
+  "model_revision": "de575db64086f84fdc79da4932d1076e965bc546",
+  "gguf_sha256": "cec47a4fb872ace2713447409f01e0f9ef0d2a7f217db8bb9c33ea0ef96c916a",
+  "audio_source": "tests/fixtures/2086-149220-0033.wav",
+  "audio_sha256": "5fceacff0315d49cb59fcc505bcecf1ed5f2f35c2897b1e65a59f30e5d922150",
+  "python_ctc_ids": [9336, 602, 1541, 956, 6562, 311, 1518, 433, 904, 810, 13468, 1343, 4748, 1395, 13353, 3201, 1077, 6548, 433, 374, 7995, 1633, 1093, 279, 2362, 34133]
+}

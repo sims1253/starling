@@ -1,0 +1,11 @@
+[starling-serve] loading model 'parakeet' from /data/local/tmp/starling-issue-batch/baseline.gguf ...
+[starling-serve] model loaded in 0.5s
+[starling-serve] warming up on 5.0s silent clip ...
+repack: repack tensor decoder.prediction.dec_rnn.lstm.weight_hh_l0 with q8_0_4x8
+repack: repack tensor decoder.prediction.dec_rnn.lstm.weight_hh_l1 with q8_0_4x8
+repack: repack tensor decoder.prediction.dec_rnn.lstm.weight_ih_l1 with q8_0_4x8
+repack: repack tensor decoder.prediction.dec_rnn.lstm.weight_ih_l0 with q8_0_4x8
+repack: repack tensor joint.pred.weight with q8_0_4x8
+[starling-serve] warmup complete
+[starling-serve] starting on 127.0.0.1:8184 (model=parakeet, backend=CPU, abi=8)
+Terminated 

@@ -1,0 +1,121 @@
+name: Experimental releases
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One build at a time; a burst of merges keeps only the newest pending run.
+# Running builds are never cancelled mid-publish.
+concurrency:
+  group: experimental-release-master
+  cancel-in-progress: false
+
+# Each master push has its own tag and artifacts. Runs can finish in any order;
+# none moves a shared tag or replaces another run's downloads.
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Require master
+        if: github.ref != 'refs/heads/master'
+        run: |
+          echo '::error::Experimental releases must run from master.'
+          exit 1
+      - name: Check persistent Android signing configuration
+        env:
+          KEYSTORE: ${{ secrets.STARLING_ANDROID_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.STARLING_ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.STARLING_ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.STARLING_ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          for value in "$KEYSTORE" "$STORE_PASSWORD" "$KEY_ALIAS" "$KEY_PASSWORD"; do
+            if [ -z "$value" ]; then
+              echo '::error::Configure all four STARLING_ANDROID_* signing secrets before building experimental releases.'
+              exit 1
+            fi
+          done
+      - name: Name this build
+        id: version
+        run: |
+          echo "tag=experimental-${GITHUB_RUN_NUMBER}-${GITHUB_SHA:0:12}" >> "$GITHUB_OUTPUT"
+          echo "version=0.0.0-experimental.${GITHUB_RUN_NUMBER}.g${GITHUB_SHA:0:12}" >> "$GITHUB_OUTPUT"
+
+  servers:
+    needs: prepare
+    # The reusable workflow contains a tag-release publisher (skipped in this
+    # mode), so this call still needs the release workflow's permission contract.
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release-starling-serve.yml
+    with:
+      tag: v${{ needs.prepare.outputs.version }}
+      source-ref: ${{ github.sha }}
+      experimental: true
+
+  android:
+    needs: prepare
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release-android.yml
+    with:
+      tag: v${{ needs.prepare.outputs.version }}
+      source-ref: ${{ github.sha }}
+      experimental: true
+    secrets:
+      STARLING_ANDROID_KEYSTORE_BASE64: ${{ secrets.STARLING_ANDROID_KEYSTORE_BASE64 }}
+      STARLING_ANDROID_KEYSTORE_PASSWORD: ${{ secrets.STARLING_ANDROID_KEYSTORE_PASSWORD }}
+      STARLING_ANDROID_KEY_ALIAS: ${{ secrets.STARLING_ANDROID_KEY_ALIAS }}
+      STARLING_ANDROID_KEY_PASSWORD: ${{ secrets.STARLING_ANDROID_KEY_PASSWORD }}
+
+  desktop:
+    needs: prepare
+    uses: ./.github/workflows/package-desktop.yml
+    with:
+      source-ref: ${{ github.sha }}
+      retention-days: 3
+      run-tests: false # desktop-gpui-rust already tests this commit on master
+
+  publish:
+    needs: [prepare, servers, android, desktop]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    # Re-running publication for the same build cannot race an existing upload.
+    concurrency:
+      group: experimental-publish-${{ github.run_id }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          pattern: starling-*
+          path: dist
+          merge-multiple: true
+      - name: Verify the asset set and write checksums and release notes
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          python3 scripts/experimental-release/prepare.py --artifacts dist \
+            --version "$VERSION" --tag "$RELEASE_TAG" --sha "$GITHUB_SHA" \
+            --repository "$GITHUB_REPOSITORY" --run-id "$GITHUB_RUN_ID" \
+            --run-number "$GITHUB_RUN_NUMBER" --notes "$RUNNER_TEMP/experimental-notes.md"
+      - name: Publish the complete prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+        run: bash scripts/experimental-release/publish.sh

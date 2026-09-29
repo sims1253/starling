@@ -9,6 +9,7 @@
     {"id":"moss-q4-calibrated","model":"moss","recipe":"moss-q4-fullimx.recipe","status":"experimental","requires_imatrix":true,"flags":["--f32-1d"]},
     {"id":"moss-q4e8","model":"moss","recipe":"moss-q4e8-fullimx.recipe","status":"experimental","requires_imatrix":true,"flags":["--f32-1d"]},
     {"id":"moss-q4e4","model":"moss","recipe":"moss-q4e4-fullimx.recipe","status":"experimental","requires_imatrix":true,"flags":["--f32-1d"]},
-    {"id":"moss-q2e4","model":"moss","recipe":"moss-q2e4-fullimx.recipe","status":"experimental","requires_imatrix":true,"flags":["--f32-1d"]}
+    {"id":"moss-q2e4","model":"moss","recipe":"moss-q2e4-fullimx.recipe","status":"experimental","requires_imatrix":true,"flags":["--f32-1d"]},
+    {"id":"s1-mini-q4-k-m","model":"s1-mini","recipe":"s1-mini-q4_k_m.recipe","status":"experimental","requires_imatrix":true,"flags":[]}
   ]
 }

@@ -24,8 +24,9 @@ the deterministic attention_dists table) and stored as a (200, 200, 128) bf16
 tensor per layer, so the C++ encoder never re-derives it. The chat-template
 prompt layout is baked as prefix/suffix token-id arrays (the single <|audio|>
 placeholder expands to N copies at runtime; tokenization is invariant to N --
-special tokens are hard BPE boundaries). `out_llm.safetensors` (the
-self-speculative CTC draft head) is out of scope and not converted.
+special tokens are hard BPE boundaries). Pass `--include-ctc-head` to include
+the separate `out_llm.safetensors` self-speculative draft head. Existing GGUFs
+without the head continue to load for ordinary greedy transcription.
 """
 from __future__ import annotations
 import argparse, json
@@ -387,6 +388,8 @@ def main() -> None:
         type=Path,
         default=Path("models/granite-speech-4.1-2b-bf16-exact.gguf"),
     )
+    ap.add_argument("--include-ctc-head", action="store_true",
+                    help="include the optional BPE CTC head from out_llm.safetensors")
     args = ap.parse_args()
 
     index = json.loads((args.snapshot / "model.safetensors.index.json").read_text())
@@ -452,6 +455,25 @@ def main() -> None:
                 w.add_tensor(
                     target, a, raw_shape=shape, raw_dtype=gguf.GGMLQuantizationType.BF16
                 )
+                learned += 1
+
+    if args.include_ctc_head:
+        head_path = args.snapshot / "out_llm.safetensors"
+        if not head_path.is_file():
+            raise FileNotFoundError(f"CTC draft head missing: {head_path}")
+        with safe_open(head_path, framework="pt", device="cpu") as f:
+            if set(f.keys()) != {"weight", "bias"}:
+                raise ValueError(f"unexpected CTC head tensors: {sorted(f.keys())}")
+            for source, shape in (("weight", (100353, 1024)),
+                                  ("bias", (100353,))):
+                t = f.get_tensor(source)
+                if tuple(t.shape) != shape or t.dtype is not torch.bfloat16:
+                    raise ValueError(f"out_llm.{source}: expected BF16 {shape}, "
+                                     f"found {t.dtype} {tuple(t.shape)}")
+                w.add_tensor(f"ctc.out_llm.{source}",
+                             np.ascontiguousarray(t.view(torch.uint16).numpy()),
+                             raw_shape=shape,
+                             raw_dtype=gguf.GGMLQuantizationType.BF16)
                 learned += 1
 
     mel, window = frontend(args.snapshot)

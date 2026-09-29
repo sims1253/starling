@@ -1,4 +1,5 @@
 #include "loader.hpp"
+#include "ggml.h"
 #include <cstdio>
 #include <vector>
 
@@ -180,6 +181,25 @@ bool GraniteModel::load(const char* path, std::string& err) {
                           "proj.out.weight", "proj.out.bias", "llm.embed.weight",
                           "llm.lm_head.weight", "llm.final_norm.weight"})
         if (!lib::require(m, n, "GRANITE", err)) return false;
+    // The CTC-BPE head is an opt-in export. Reject a partial or incompatible
+    // head rather than silently running a different vocabulary projection.
+    const ggml_tensor* ctc_w = m.tensor("ctc.out_llm.weight");
+    const ggml_tensor* ctc_b = m.tensor("ctc.out_llm.bias");
+    if ((ctc_w == nullptr) != (ctc_b == nullptr)) {
+        err = "GRANITE GGUF contains only part of the optional CTC draft head";
+        return false;
+    }
+    if (ctc_w && (ctc_w->ne[0] != (int64_t)c.encoder.hidden ||
+                  ctc_w->ne[1] != (int64_t)c.llm.vocab ||
+                  ctc_b->ne[0] != (int64_t)c.llm.vocab)) {
+        err = "GRANITE CTC draft head shape does not match encoder/vocabulary";
+        return false;
+    }
+    if (ctc_w && (c.encoder.mid_layer == 0 ||
+                  c.encoder.mid_layer > c.encoder.n_layers)) {
+        err = "GRANITE CTC encoder.mid_layer is outside the encoder layers";
+        return false;
+    }
     // Encoder layers: 32 tensors each (ff halves, Shaw attn incl. the baked
     // rel-pos bias, conv module with BatchNorm stats, post_norm).
     for (uint32_t i = 0; i < c.encoder.n_layers; ++i) {

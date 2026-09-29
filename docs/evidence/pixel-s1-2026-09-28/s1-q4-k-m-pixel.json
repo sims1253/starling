@@ -1,0 +1,152 @@
+{
+  "schema": "s1-quant-spans-v1",
+  "model_sha256": "4b12084f0cbbfcfe7c88ed45e8aac28fa20e813faf77f24b9c8d46bc7f9f5834",
+  "model_bytes": 610995040,
+  "source_sha256": "c4fc61df01df19655d796e085d29aa41647d33cfd090824778ecadd76a2bb11c",
+  "engine_sha256": "e9d65265def7129b0505cea08a1b7749d17e7b1e79645bf880ae84c289bbb224",
+  "cases_sha256": "ef9184b34e51f45ce179026afa675f38975eadae560af1e3a20c00f82cfdb4a5",
+  "device": "CPU/Pixel10Pro",
+  "results": [
+    {
+      "id": "negation_and_name",
+      "output": "Do not send this to Claire. Yet, send it to Maya.",
+      "spans_present": {
+        "negation": true,
+        "recipient": true
+      },
+      "times_ms": [
+        13600.410043960437,
+        17783.22531003505,
+        8200.301386998035
+      ],
+      "median_ms": 13600.410043960437
+    },
+    {
+      "id": "amount_correction",
+      "output": "The total is $45.",
+      "spans_present": {
+        "corrected_amount": true
+      },
+      "times_ms": [
+        8482.916172011755,
+        10936.236421926878,
+        7623.975505004637
+      ],
+      "median_ms": 8482.916172011755
+    },
+    {
+      "id": "email_address",
+      "output": "Please email alex.chen@example.org by Thursday.",
+      "spans_present": {
+        "address": true,
+        "deadline": true
+      },
+      "times_ms": [
+        4396.094111027196,
+        17748.54244396556,
+        13027.986699016765
+      ],
+      "median_ms": 13027.986699016765
+    },
+    {
+      "id": "url",
+      "output": "The link is example.org/pricing.",
+      "spans_present": {
+        "link": true
+      },
+      "times_ms": [
+        19337.201467016712,
+        8352.868531015702,
+        3140.0759438984096
+      ],
+      "median_ms": 8352.868531015702
+    },
+    {
+      "id": "identifier",
+      "output": "Ticket ID is AB79C2.",
+      "spans_present": {
+        "ticket": true
+      },
+      "times_ms": [
+        2348.128639976494,
+        2060.2032829774544,
+        10432.532024104148
+      ],
+      "median_ms": 2348.128639976494
+    },
+    {
+      "id": "person_name",
+      "output": "I spoke with Naomi Tanaka, and she will call tomorrow.",
+      "spans_present": {
+        "person": true
+      },
+      "times_ms": [
+        4473.726729978807,
+        15624.995316960849,
+        5928.586678928696
+      ],
+      "median_ms": 5928.586678928696
+    },
+    {
+      "id": "negated_deadline",
+      "output": "We cannot ship before June 2.",
+      "spans_present": {
+        "negation": true,
+        "date": true
+      },
+      "times_ms": [
+        2999.372010002844,
+        1908.9262980269268,
+        3933.893679990433
+      ],
+      "median_ms": 2999.372010002844
+    },
+    {
+      "id": "two_port_numbers",
+      "output": "Use PORT 8080, not 8008.",
+      "spans_present": {
+        "new_port": true,
+        "old_port": true,
+        "negation": true
+      },
+      "times_ms": [
+        4250.0540090259165,
+        6402.217727969401,
+        3593.4532480314374
+      ],
+      "median_ms": 4250.0540090259165
+    }
+  ],
+  "memory_before": {
+    "charge_uah": 2560000,
+    "ac_powered": "true",
+    "battery_status": 2,
+    "voltage_mv": 3992,
+    "battery_percent": 54,
+    "battery_temp_deci_c": 393,
+    "thermal_status": 1,
+    "wakefulness": "Dozing",
+    "screen_state": "OFF",
+    "smaps_rss_kb": 1117020,
+    "smaps_pss_kb": 1114109,
+    "graphics_kb": null,
+    "total_pss_kb": 1114104
+  },
+  "memory_after": {
+    "charge_uah": 2607500,
+    "ac_powered": "true",
+    "battery_status": 2,
+    "voltage_mv": 3999,
+    "battery_percent": 55,
+    "battery_temp_deci_c": 390,
+    "thermal_status": 1,
+    "wakefulness": "Dozing",
+    "screen_state": "OFF",
+    "smaps_rss_kb": 1117464,
+    "smaps_pss_kb": 1114553,
+    "graphics_kb": null,
+    "total_pss_kb": 1114548
+  },
+  "engine_source_commit": "2a3bda4",
+  "server_log_sha256": "87e11b34e103afd0454ad2847930a51054638e39f1b11ae0c6038f260c8d2f3a"
+}

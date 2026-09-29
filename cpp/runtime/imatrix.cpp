@@ -5,7 +5,9 @@
 
 #include "ggml.h"
 
+#include <algorithm>
 #include <cstdlib>
+#include <fstream>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -25,6 +27,12 @@ bool ImatrixCollector::enabled() {
 ImatrixCollector::ImatrixCollector() {
     const char* p = std::getenv("STARLING_IMATRIX");
     path_ = p ? p : "";
+    const char* trace_tensor = std::getenv("STARLING_IMATRIX_TRACE_TENSOR");
+    const char* trace_path = std::getenv("STARLING_IMATRIX_TRACE_PATH");
+    if (trace_tensor && trace_path) {
+        trace_tensor_ = trace_tensor;
+        trace_path_ = trace_path;
+    }
     if (!path_.empty()) {
         // Flush at normal process exit. The collector owns plain host memory
         // only (no ggml handles), so teardown order relative to the Backend
@@ -73,6 +81,13 @@ bool ImatrixCollector::observe(ggml_tensor* node, bool ask) {
         for (int64_t k = 0; k < K; ++k) e.sums[(size_t)k] += col[k] * col[k];
     }
     e.n_obs += 1;
+    if (w->name == trace_tensor_ && trace_n_ < 4096 &&
+        K <= 16384 && (trace_k_ == 0 || trace_k_ == (uint32_t)K)) {
+        trace_k_ = (uint32_t)K;
+        const size_t take = (size_t)std::min<int64_t>(N, 4096 - trace_n_);
+        trace_values_.insert(trace_values_.end(), xp, xp + take * (size_t)K);
+        trace_n_ += take;
+    }
     return true;
 }
 
@@ -91,13 +106,27 @@ void ImatrixCollector::flush() {
         total_obs += e.n_obs;
         map.emplace(kv.first, std::move(e));
     }
-    if (!imatrix_write(path_, map)) {
-        std::fprintf(stderr, "[imatrix] ERROR: failed to write %s\n", path_.c_str());
-        return;
+    const bool wrote_imatrix = imatrix_write(path_, map);
+    if (!trace_path_.empty() && trace_n_ > 0) {
+        std::ofstream trace(trace_path_, std::ios::binary | std::ios::trunc);
+        static constexpr char magic[8] = {'S', 'T', 'L', 'G', 'A', 'C', 'T', '1'};
+        trace.write(magic, sizeof(magic));
+        trace.write((const char*)&trace_k_, sizeof(trace_k_));
+        trace.write((const char*)&trace_n_, sizeof(trace_n_));
+        trace.write((const char*)trace_values_.data(),
+                    (std::streamsize)trace_values_.size() * sizeof(float));
+        if (!trace) std::fprintf(stderr, "[imatrix] ERROR: failed to write trace %s\n",
+                                 trace_path_.c_str());
+        else std::fprintf(stderr, "[imatrix] wrote %s: %llu x %u activations\n",
+                          trace_path_.c_str(), (unsigned long long)trace_n_, trace_k_);
     }
-    std::fprintf(stderr,
-                 "[imatrix] wrote %s: %zu tensors, %llu mul_mat observations\n",
-                 path_.c_str(), map.size(), (unsigned long long)total_obs);
+    if (!wrote_imatrix) {
+        std::fprintf(stderr, "[imatrix] ERROR: failed to write %s\n", path_.c_str());
+    } else {
+        std::fprintf(stderr,
+                     "[imatrix] wrote %s: %zu tensors, %llu mul_mat observations\n",
+                     path_.c_str(), map.size(), (unsigned long long)total_obs);
+    }
 }
 
 } // namespace starling::ggml
