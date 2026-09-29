@@ -17,6 +17,12 @@ on:
       run-tests:
         type: boolean
         default: true
+      # Bundle the CPU and Vulkan starling-serve engines inside the desktop
+      # archive (the app launches one as a supervised sidecar, #362). Requires
+      # the starling-serve server artifacts from the same workflow run.
+      bundle-engines:
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -29,6 +35,12 @@ jobs:
         platform: ${{ fromJSON(inputs.platforms) }}
     runs-on: ${{ matrix.platform == 'windows' && 'windows-2025' || 'ubuntu-24.04' }}
     timeout-minutes: 90
+    # Single source of truth for the engines bundled into the desktop archive,
+    # in preference order (the app tries the first entry first). Checked for
+    # agreement by scripts/release-runtime/check-contract.py.
+    env:
+      BUNDLED_ENGINES: "vulkan cpu"
+      BUNDLE_ENGINES: ${{ inputs.bundle-engines }}
     defaults:
       run:
         shell: bash
@@ -72,6 +84,53 @@ jobs:
       - name: Build the app
         working-directory: apps/desktop-gpui
         run: cargo build --locked --release -p starling-gpui
+      - name: Download the Vulkan engine artifact
+        if: inputs.bundle-engines
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: starling-serve-${{ matrix.platform }}-vulkan
+          path: engines-artifacts
+      - name: Download the CPU engine artifact
+        if: inputs.bundle-engines
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: starling-serve-${{ matrix.platform }}-cpu
+          path: engines-artifacts
+      - name: Install the Vulkan loader (Windows)
+        # The Windows Vulkan engine links vulkan-1.dll, which the hosted
+        # runner lacks; the assembly step runs its --version. Same pinned
+        # action and SDK as release-starling-serve.yml.
+        if: inputs.bundle-engines && matrix.platform == 'windows'
+        uses: humbletim/install-vulkan-sdk@30ba978f977e81b72d091fc8888feb1fb26f9aff # v1.2
+        with:
+          version: 1.4.357.0
+          cache: true
+      - name: Assemble the bundled engines
+        if: inputs.bundle-engines
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          # Extracts each server artifact, verifies its checksum, runs
+          # --version/--abi-version on every engine (requiring agreement),
+          # and writes engines.json + SHA256SUMS.txt + RUNTIME.md.
+          python=python3
+          command -v python3 >/dev/null 2>&1 || python=python
+          "$python" scripts/experimental-release/bundle-engines.py \
+            --platform "$PLATFORM" --artifacts engines-artifacts \
+            --out dist/engines --backends "$BUNDLED_ENGINES"
+      - name: Check bundled engine dependencies (Linux)
+        if: inputs.bundle-engines && matrix.platform == 'linux'
+        run: |
+          # libvulkan1 is installed above, so both engines must resolve every
+          # loader dependency on the runner.
+          for backend in $BUNDLED_ENGINES; do
+            report="$RUNNER_TEMP/ldd-starling-serve-$backend.txt"
+            ldd "dist/engines/starling-serve-$backend" | tee "$report"
+            if grep -q 'not found' "$report"; then
+              echo "::error::starling-serve-$backend has unresolved shared libraries"
+              exit 1
+            fi
+          done
       - name: Package Linux app
         if: matrix.platform == 'linux'
         run: |
@@ -86,7 +145,9 @@ jobs:
           cp apps/desktop-gpui/target/release/starling-gpui dist/
           cp docs/experimental-releases.md dist/README.md
           git rev-parse HEAD > dist/COMMIT.txt
-          tar -C dist -czf starling-gpui-linux-x64.tar.gz starling-gpui README.md COMMIT.txt
+          contents=(starling-gpui README.md COMMIT.txt)
+          if [ "$BUNDLE_ENGINES" = "true" ]; then contents+=(engines); fi
+          tar -C dist -czf starling-gpui-linux-x64.tar.gz "${contents[@]}"
       - name: Package Windows app
         if: matrix.platform == 'windows'
         shell: pwsh

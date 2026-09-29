@@ -6,8 +6,9 @@ import io
 import json
 import os
 from pathlib import Path
-import socket
+import re
 import subprocess
+import threading
 import time
 import unittest
 import urllib.error
@@ -17,6 +18,12 @@ import wave
 
 ROOT = Path(__file__).resolve().parents[3]
 RAW = "5. Keep auth.\n6. I'd prefer to never merge this.\n7. I like orange, err, yellow.\n8. A. Agreed. café 🎙"
+
+# The server prints exactly one line to stdout once its socket is bound
+# (before serving): STARLING_SERVE_LISTENING <host>:<port>. With --port 0 the
+# OS picks the port, so tests learn it from this line instead of pre-binding
+# a socket here, which races other binds between close() and listen().
+ANNOUNCE_RE = re.compile(r"^STARLING_SERVE_LISTENING (127\.0\.0\.1):(\d+)$")
 
 
 def wav(rate=16000):
@@ -29,29 +36,68 @@ def wav(rate=16000):
     return output.getvalue()
 
 
-def start_fixture(model):
-    """Spawn the contract fixture with `model` and wait for /health.
+def fixture_binary() -> Path:
+    """Path of the built contract fixture (STARLING_CONTRACT_BIN overrides)."""
+    return Path(os.environ.get("STARLING_CONTRACT_BIN", ROOT / "build/native-cpu/starling-serve-contract-fixture"))
 
-    Returns (base_url, process); the caller terminates the process.
+
+def read_announce(process, timeout=10.0):
+    """Read the first stdout line of a spawned server, bounded by timeout.
+
+    Returns the line without its trailing newline, or None when the deadline
+    passes (the reader thread is left to die with the process; the daemon
+    flag keeps it from blocking interpreter shutdown).
     """
-    binary = Path(os.environ.get("STARLING_CONTRACT_BIN", ROOT / "build/native-cpu/starling-serve-contract-fixture"))
-    if not binary.is_file():
-        raise RuntimeError(f"Build the contract fixture first: {binary}")
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        port = sock.getsockname()[1]
-    base = f"http://127.0.0.1:{port}"
-    process = subprocess.Popen([str(binary), "--model", model, "--gguf", __file__, "--port", str(port)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    deadline = time.monotonic() + 10
+    result = {"line": None}
+
+    def reader():
+        result["line"] = process.stdout.readline()
+
+    thread = threading.Thread(target=reader, daemon=True)
+    thread.start()
+    thread.join(timeout)
+    line = result["line"]
+    return line.rstrip("\n") if line else None
+
+
+def wait_healthy(base, process, timeout=10.0):
+    """Poll /health until it answers; returns True when it does."""
+    deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
             urllib.request.urlopen(base + "/health", timeout=1).close()
-            return base, process
+            return True
         except OSError:
+            if process.poll() is not None:
+                return False
             time.sleep(0.05)
-    process.terminate()
-    process.wait(timeout=5)
-    raise RuntimeError("Fixture server did not start")
+    return False
+
+
+def start_fixture(model, extra_args=()):
+    """Spawn the contract fixture with `model` on a free port (--port 0).
+
+    The bound address is learned from the STARLING_SERVE_LISTENING stdout
+    line, then /health is polled. Returns (base_url, process); the caller
+    terminates the process.
+    """
+    binary = fixture_binary()
+    if not binary.is_file():
+        raise RuntimeError(f"Build the contract fixture first: {binary}")
+    process = subprocess.Popen(
+        [str(binary), "--model", model, "--gguf", __file__, "--port", "0", *extra_args],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    announce = read_announce(process)
+    if announce is None or not ANNOUNCE_RE.match(announce):
+        process.terminate()
+        process.wait(timeout=5)
+        raise RuntimeError(f"Fixture server did not announce its port (got {announce!r})")
+    base = f"http://{ANNOUNCE_RE.match(announce).group(1)}:{ANNOUNCE_RE.match(announce).group(2)}"
+    if not wait_healthy(base, process):
+        process.terminate()
+        process.wait(timeout=5)
+        raise RuntimeError("Fixture server did not start")
+    return base, process
 
 
 class OpenAIContract(unittest.TestCase):
@@ -64,6 +110,7 @@ class OpenAIContract(unittest.TestCase):
     def stop(cls):
         cls.process.terminate()
         cls.process.wait(timeout=5)
+        cls.process.stdout.close()
 
     def request(self, fields=None, audio=None, path="/v1/audio/transcriptions", file_name="file"):
         boundary = uuid.uuid4().hex
@@ -162,6 +209,7 @@ class NormalizeContract(unittest.TestCase):
     def stop(cls):
         cls.process.terminate()
         cls.process.wait(timeout=5)
+        cls.process.stdout.close()
 
     def request(self, body):
         req = urllib.request.Request(self.base + "/normalize", data=body.encode(), headers={"Content-Type": "application/json"}, method="POST")

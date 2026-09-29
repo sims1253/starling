@@ -24,6 +24,50 @@ use std::path::{Path, PathBuf};
 #[error("could not resolve the user config directory; set XDG_CONFIG_HOME or HOME")]
 pub struct ConfigDirUnavailable;
 
+/// Which engine transcribes a take (#362, #363): the bundled sidecar
+/// the app supervises itself, or the user's own hand-run server. A fresh
+/// install is the self-contained experience (`builtin`); a settings file
+/// written before this key existed loads as `manual` — see
+/// [`Settings::load`] — because a working hand-run-server setup must
+/// never silently change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EngineMode {
+    /// The bundled engine, supervised by the app (`engine::EngineManager`).
+    Builtin,
+    /// The user's own starling-serve / OpenAI-compatible endpoint.
+    Manual,
+}
+
+/// The engine subsection of the settings file (#362): which engine runs,
+/// which catalog model it serves, and whether the user pinned the
+/// backend family. `active_model` is a catalog id (not the server slug):
+/// the manager resolves it to an endpoint and slug at startup.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EngineSettings {
+    pub mode: EngineMode,
+    /// The catalog id of the model the built-in engine serves. Written by
+    /// the app whenever the engine's active model changes (the engine is
+    /// the source of truth; the file only restores it at launch).
+    #[serde(default)]
+    pub active_model: Option<String>,
+    /// `"cpu"` when the user chose the CPU engine (skipping Vulkan
+    /// selection); `None` is automatic (Vulkan preferred, CPU fallback).
+    #[serde(default)]
+    pub backend_override: Option<String>,
+}
+
+impl Default for EngineSettings {
+    fn default() -> Self {
+        Self {
+            mode: EngineMode::Builtin,
+            active_model: None,
+            backend_override: None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Settings {
@@ -40,6 +84,10 @@ pub struct Settings {
     /// the key loads the defaults: raw transcripts, nothing sent anywhere.
     #[serde(default)]
     pub processing: ProcessingSettings,
+    /// The transcription engine (#362). A file without the key is a
+    /// legacy file and loads as `manual` — see [`Settings::load`].
+    #[serde(default)]
+    pub engine: EngineSettings,
 }
 
 /// Which processing mode runs after a take is transcribed, and where its
@@ -76,7 +124,9 @@ impl Default for ProcessingSettings {
 
 impl Settings {
     /// Defaults mirroring `App.tsx`: `DEFAULT_ENDPOINT`, the `parakeet`
-    /// model, and the "auth" expected-terms input.
+    /// model, and the "auth" expected-terms input. The engine defaults to
+    /// `builtin` with no model (#362): a fresh install is the
+    /// self-contained experience and picks its model on first run.
     pub fn default_settings() -> Self {
         Self {
             endpoint: "http://127.0.0.1:8181".to_string(),
@@ -84,6 +134,7 @@ impl Settings {
             expected_terms: vec!["auth".to_string()],
             user_set_model: false,
             processing: ProcessingSettings::default(),
+            engine: EngineSettings::default(),
         }
     }
 
@@ -107,11 +158,27 @@ impl Settings {
     }
 
     /// Missing or corrupt file always falls back to the defaults; never panics.
+    ///
+    /// A file that parses but carries no `engine` key is a legacy file
+    /// (#362): it loads with `engine.mode = manual`, because every such
+    /// file was written by a build whose only way to transcribe was a
+    /// hand-run server — silently switching those users to the bundled
+    /// engine would change where their audio goes. The key is detected on
+    /// the parsed `serde_json::Value`, not sniffed from the text.
     pub fn load(path: &Path) -> Self {
-        std::fs::read_to_string(path)
-            .ok()
-            .and_then(|text| serde_json::from_str(&text).ok())
-            .unwrap_or_else(Self::default_settings)
+        let Some(text) = std::fs::read_to_string(path).ok() else {
+            return Self::default_settings();
+        };
+        let Some(value) = serde_json::from_str::<serde_json::Value>(&text).ok() else {
+            return Self::default_settings();
+        };
+        let Ok(mut settings) = serde_json::from_value::<Settings>(value.clone()) else {
+            return Self::default_settings();
+        };
+        if value.get("engine").is_none() {
+            settings.engine.mode = EngineMode::Manual;
+        }
+        settings
     }
 
     /// Atomic write: serialize pretty JSON to a sibling `.tmp`, then rename.
@@ -193,6 +260,11 @@ mod tests {
                 api_model: "gpt-4.1-mini".to_string(),
                 ..ProcessingSettings::default()
             },
+            engine: EngineSettings {
+                mode: EngineMode::Builtin,
+                active_model: Some("parakeet-v3-q8".to_string()),
+                backend_override: Some("cpu".to_string()),
+            },
         };
 
         settings.save(&path).expect("save");
@@ -210,6 +282,58 @@ mod tests {
         assert_eq!(value["userSetModel"], true);
         assert_eq!(value["processing"]["mode"], "clean-local");
         assert_eq!(value["processing"]["apiKeyEnv"], "OPENAI_API_KEY");
+        // The engine subsection is camelCase like the rest of the file.
+        assert_eq!(value["engine"]["mode"], "builtin");
+        assert_eq!(value["engine"]["activeModel"], "parakeet-v3-q8");
+        assert_eq!(value["engine"]["backendOverride"], "cpu");
+    }
+
+    #[test]
+    fn fresh_defaults_use_the_builtin_engine_with_no_model() {
+        // #362: a fresh install is the self-contained experience — the
+        // bundled engine with no model picked yet (first run offers the
+        // recommended download).
+        let settings = Settings::default_settings();
+        assert_eq!(settings.engine.mode, EngineMode::Builtin);
+        assert_eq!(settings.engine.active_model, None);
+        assert_eq!(settings.engine.backend_override, None);
+    }
+
+    #[test]
+    fn a_legacy_file_without_the_engine_key_loads_as_manual() {
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("settings.json");
+        // The exact shape a pre-engine build wrote (including a backend
+        // choice this build ignores): the file still loads, and the engine
+        // mode is manual so a working hand-run server keeps serving.
+        std::fs::write(
+            &path,
+            r#"{"endpoint":"http://10.0.0.5:8181","model":"whisper-large-v3","expectedTerms":["auth"],"userSetModel":true,"storageBackend":"v1"}"#,
+        )
+        .expect("write legacy settings");
+        let settings = Settings::load(&path);
+        assert_eq!(settings.endpoint, "http://10.0.0.5:8181");
+        assert_eq!(settings.engine.mode, EngineMode::Manual);
+        assert_eq!(settings.engine.active_model, None);
+    }
+
+    #[test]
+    fn a_file_with_the_engine_key_roundtrips_its_mode() {
+        // Explicit manual must survive a roundtrip; only the ABSENCE of the
+        // key means legacy (manual), so a deliberate manual choice and a
+        // builtin choice both persist exactly.
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("settings.json");
+        let settings = Settings {
+            engine: EngineSettings {
+                mode: EngineMode::Manual,
+                active_model: None,
+                backend_override: None,
+            },
+            ..Settings::default_settings()
+        };
+        settings.save(&path).expect("save");
+        assert_eq!(Settings::load(&path).engine, settings.engine);
     }
 
     #[test]

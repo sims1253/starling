@@ -9,6 +9,79 @@ ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = ".github/workflows/release-starling-serve.yml"
 DOCS = ("docs/release-runtime.md", "docs/native-serving.md")
 DOCKERFILE = "scripts/release-runtime/Dockerfile.cuda"
+DESKTOP_WORKFLOW = ".github/workflows/package-desktop.yml"
+PREPARE = "scripts/experimental-release/prepare.py"
+ENGINE_SECTION = "## Desktop bundled engines"
+
+
+def bundled_engines_errors(desktop_workflow: str, prepare: str,
+                           release_runtime: str) -> list[str]:
+    """The bundled-engine backend list must agree everywhere it is stated.
+
+    Sources: the desktop packager's BUNDLED_ENGINES env (the single source of
+    truth the packaging steps use), prepare.py's build-info
+    desktop_bundled_engines, and the "Desktop bundled engines" section of the
+    runtime guide (which also must say CUDA is not bundled).
+    """
+    errors = []
+    found = re.findall(r"^\s+BUNDLED_ENGINES: [\"']([^\"']+)[\"']\s*$",
+                       desktop_workflow, re.M)
+    workflow_engines = None
+    if len(found) != 1:
+        errors.append(
+            f"{DESKTOP_WORKFLOW}: expected exactly one job-level "
+            "BUNDLED_ENGINES: \"<engines>\" env (the single source of truth "
+            "for the bundled desktop engines)")
+    else:
+        workflow_engines = found[0].split()
+
+    found = re.findall(r"[\"']desktop_bundled_engines[\"']\s*:\s*\[([^\]]*)\]",
+                       prepare)
+    prepare_engines = None
+    if len(found) != 1:
+        errors.append(
+            f"{PREPARE}: build-info must record desktop_bundled_engines: [...] "
+            "with the bundled backend list")
+    else:
+        prepare_engines = re.findall(r"[\"']([a-z0-9]+)[\"']", found[0])
+
+    section = re.search(re.escape(ENGINE_SECTION) + r"\n(.*?)(?=\n## |\Z)",
+                        release_runtime, re.S)
+    docs_engines = None
+    if not section:
+        errors.append(
+            f"{DOCS[0]}: expected a {ENGINE_SECTION!r} section stating the "
+            "bundled engines")
+    else:
+        body = section.group(1)
+        sentence = re.search(
+            r"desktop archives bundle exactly the "
+            r"((?:`[a-z0-9]+`(?:, | and )?)+)\s*engines", body)
+        if not sentence:
+            errors.append(
+                f"{DOCS[0]}: the Desktop bundled engines section must state "
+                "which engines ship inside the desktop archives "
+                "(\"bundle exactly the `x` and `y` engines\")")
+        else:
+            docs_engines = re.findall(r"`([a-z0-9]+)`", sentence.group(1))
+        if "CUDA is not bundled" not in body:
+            errors.append(
+                f"{DOCS[0]}: the Desktop bundled engines section must state "
+                "that CUDA is not bundled")
+
+    sources = [
+        (DESKTOP_WORKFLOW + " BUNDLED_ENGINES", workflow_engines),
+        (PREPARE + " desktop_bundled_engines", prepare_engines),
+        (DOCS[0] + " Desktop bundled engines section", docs_engines),
+    ]
+    if any(engines is None for _, engines in sources):
+        return errors
+    sets = [set(engines) for _, engines in sources]
+    if not sets[0] or any(engine_set != sets[0] for engine_set in sets[1:]):
+        errors.append(
+            "Bundled desktop engine lists disagree: "
+            + "; ".join(f"{name}={engines}" for name, engines in sources))
+    return errors
 
 
 def check(workflow: str, docs: dict[str, str], executing_cuda_version: str | None = None,
@@ -90,10 +163,15 @@ def main() -> int:
                    {name: (ROOT / name).read_text(encoding="utf-8") for name in DOCS},
                    args.executing_cuda_version,
                    (ROOT / DOCKERFILE).read_text(encoding="utf-8"))
+    errors += bundled_engines_errors(
+        (ROOT / DESKTOP_WORKFLOW).read_text(encoding="utf-8"),
+        (ROOT / PREPARE).read_text(encoding="utf-8"),
+        (ROOT / DOCS[0]).read_text(encoding="utf-8"))
     if errors:
         print("\n".join(errors), file=sys.stderr)
         return 1
-    print("CUDA and ROCm installers and runtime guidance agree")
+    print("CUDA and ROCm installers and runtime guidance agree; "
+          "bundled desktop engines agree")
     return 0
 
 

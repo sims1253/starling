@@ -52,6 +52,7 @@ def prepare(args: argparse.Namespace) -> None:
         "build_url": f"https://github.com/{args.repository}/actions/runs/{args.run_id}",
         "cuda_architectures": ["120"],
         "android_application_id": "dev.starling.mobile.experimental",
+        "desktop_bundled_engines": ["cpu", "vulkan"],
     }
     (root / "build-info.json").write_text(json.dumps(info, indent=2) + "\n")
     files = sorted(expected | {"build-info.json"})
@@ -63,14 +64,13 @@ def prepare(args: argparse.Namespace) -> None:
 
 | Device | Downloads |
 | --- | --- |
-| Linux notebook (AMD graphics) | `starling-gpui-linux-x64.tar.gz` + `starling-serve-linux-vulkan.tar.gz` |
-| Linux CPU testing | Linux app + `starling-serve-linux-cpu.tar.gz` |
-| RTX 5090 on Linux | Linux app + `starling-serve-linux-cuda.tar.gz` (or Vulkan for comparison) |
-| RTX 5090 on Windows | `starling-gpui-windows-x64.zip` + `starling-serve-windows-cuda.zip` (or Vulkan for comparison) |
-| Windows CPU testing | Windows app + `starling-serve-windows-cpu.zip` |
+| Linux desktop (CPU or Vulkan GPU) | `starling-gpui-linux-x64.tar.gz` |
+| Windows desktop (CPU or Vulkan GPU) | `starling-gpui-windows-x64.zip` |
+| NVIDIA RTX on Linux or Windows (CUDA) | Desktop archive + `starling-serve-<platform>-cuda` archive (Manual server mode) |
+| Headless or advanced server use | `starling-serve-<platform>-<backend>` archives (CPU, Vulkan, CUDA) |
 | Pixel 10 Pro | `{apk}` |
 
-Desktop: extract the app and one server archive. Install the prerequisites in the server's `RUNTIME.md`, then start the server with `--model parakeet --gguf /path/to/model.gguf --port 8181`. Open the app and connect to `http://127.0.0.1:8181`. Models and GPU runtimes are separate downloads. Linux desktop requires Ubuntu 24.04 or a compatible newer system; the server alone supports Ubuntu 22.04.
+Desktop: download the one desktop archive for your platform and open the app — pick a model in the app and it downloads and verifies it in-app. The CPU and Vulkan engines ship inside the desktop archive; the app picks Vulkan when a Vulkan driver is present and otherwise CPU, and shows which it uses. Standalone server archives remain the headless/advanced option: run one and point the app at it with Manual server mode in settings. CUDA stays a separate download and is not bundled. Linux desktop requires Ubuntu 24.04 or a compatible newer system; the server alone supports Ubuntu 22.04.
 
 Android: install **Starling Experimental**, select **This device**, and download the recommended model. It installs beside Starling Mobile and retains its own data between experimental updates. Its voice keyboard is **Starling Experimental Voice Input**.
 

@@ -28,6 +28,12 @@
 #include <thread>
 #include <vector>
 
+#ifndef _WIN32
+#include <cerrno>
+#include <signal.h>
+#include <unistd.h>
+#endif
+
 // cpp-httplib
 #include "httplib.h"
 
@@ -58,7 +64,11 @@ static void usage(const char* prog) {
         "\n"
         "Serving:\n"
         "  --host <addr>      Bind address (default 127.0.0.1)\n"
-        "  --port <n>         Bind port (default 8181)\n"
+        "  --port <n>         Bind port (default 8181; 0 = any free port)\n"
+        "                     The bound address is printed to stdout as\n"
+        "                     'STARLING_SERVE_LISTENING <host>:<port>' once\n"
+        "                     the socket is bound, before requests are served\n"
+        "  --parent-pid <pid> Exit when process <pid> exits (supervised sidecar)\n"
         "  --warmup           Warm up the model on startup\n"
         "  --no-eager-load    Defer model load to first request\n"
         "  --idle-timeout <s> Shut down after N seconds idle (0 = never, default 0)\n"
@@ -91,6 +101,7 @@ struct Args {
     std::string gguf;
     std::string host = "127.0.0.1";
     int port = 8181;
+    long parent_pid = 0;
     bool warmup = false;
     bool eager_load = true;
     bool granite_chunk_fairness = false;
@@ -149,6 +160,7 @@ static Args parse_args(int argc, char** argv) {
         else if (arg == "--gguf")      a.gguf = next("--gguf");
         else if (arg == "--host")      a.host = next("--host");
         else if (arg == "--port")      a.port = next_int("--port");
+        else if (arg == "--parent-pid") a.parent_pid = next_int("--parent-pid");
         else if (arg == "--warmup")    a.warmup = true;
         else if (arg == "--no-eager-load") a.eager_load = false;
         else if (arg == "--granite-chunk-fairness") a.granite_chunk_fairness = true;
@@ -400,6 +412,36 @@ static std::atomic<bool> g_should_exit{false};
 static std::atomic<time_t> g_last_activity{0};
 static std::atomic<bool> g_warmup_running{false};
 
+// ---- parent watchdog (--parent-pid) ---------------------------------------
+// A supervisor (the desktop app, #362) owns this process. If the supervisor
+// dies without stopping it -- a crash, SIGKILL, a debugger stop -- the server
+// must not live on as an orphan holding a model in memory. _Exit, not exit:
+// the HTTP threads are still running and must not race static destructors.
+static void parent_watch_thread(long pid) {
+#ifdef _WIN32
+    HANDLE parent = OpenProcess(SYNCHRONIZE, FALSE, static_cast<DWORD>(pid));
+    if (parent) {
+        WaitForSingleObject(parent, INFINITE);
+        CloseHandle(parent);
+    }
+#else
+    // A direct parent is watched through getppid(): reparenting on its death
+    // is immune to PID reuse. Any other pid is polled for existence.
+    const bool direct = getppid() == static_cast<pid_t>(pid);
+    while (true) {
+        if (direct ? getppid() != static_cast<pid_t>(pid)
+                   : (kill(static_cast<pid_t>(pid), 0) == -1 && errno == ESRCH)) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    }
+#endif
+    std::fprintf(stderr,
+        "[starling-serve] parent process %ld exited; shutting down\n", pid);
+    std::fflush(stderr);
+    std::_Exit(0);
+}
+
 static void idle_timeout_thread(serve::StarlingServer* server, double timeout_s) {
     if (timeout_s <= 0.0) return;
     while (!g_should_exit.load()) {
@@ -448,6 +490,14 @@ int main(int argc, char** argv) {
             args.min_chunk, args.partial_interval);
         !err.empty()) {
         std::fprintf(stderr, "error: %s\n", err.c_str());
+        return 1;
+    }
+    if (args.port < 0 || args.port > 65535) {
+        std::fprintf(stderr, "error: --port must be in 0..65535 (0 = any free port)\n");
+        return 1;
+    }
+    if (args.parent_pid < 0) {
+        std::fprintf(stderr, "error: --parent-pid must be a positive process id\n");
         return 1;
     }
     if (args.max_stream_seconds < 0.0) {
@@ -520,6 +570,10 @@ int main(int argc, char** argv) {
         }
     }
 
+    if (args.parent_pid > 0) {
+        std::thread(parent_watch_thread, args.parent_pid).detach();
+    }
+
     // Start idle-timeout monitor (only if timeout > 0).
     std::thread idle_thread;
     if (args.idle_timeout > 0.0) {
@@ -548,12 +602,17 @@ int main(int argc, char** argv) {
             g_last_activity.store(std::time(nullptr));
             // Fire warmup asynchronously (it's idempotent — deduped
             // internally). One worker at a time: a client spamming /warmup
-            // must not spawn unbounded threads.
+            // must not spawn unbounded threads. A model deferred by
+            // --no-eager-load is loaded first (a no-op when resident), so a
+            // supervisor can start the process fast and then load + warm it
+            // with one request; a failed load is reported as /health
+            // load_error and a later /warmup retries it.
             if (!g_warmup_running.exchange(true)) {
                 // Capture the shared_ptr by value: the detached worker must
                 // keep the server alive for the whole warmup() call even if
                 // main() returns and resets its own reference.
                 std::thread([server]() {
+                    server->load();
                     server->warmup();
                     g_warmup_running.store(false);
                 }).detach();
@@ -1064,9 +1123,25 @@ int main(int argc, char** argv) {
             cfg.host.c_str());
     }
 
-    if (!svr.listen(cfg.host.c_str(), cfg.port)) {
+    // Bind first, then announce, then serve: a supervisor that asked for
+    // --port 0 learns the real port from stdout, and a line on stdout always
+    // means the socket is already accepting connections.
+    int bound_port = cfg.port;
+    if (cfg.port == 0) {
+        bound_port = svr.bind_to_any_port(cfg.host);
+    } else if (!svr.bind_to_port(cfg.host, cfg.port)) {
+        bound_port = -1;
+    }
+    if (bound_port <= 0) {
         std::fprintf(stderr, "[starling-serve] failed to bind %s:%d\n",
                      cfg.host.c_str(), cfg.port);
+        return 1;
+    }
+    std::printf("STARLING_SERVE_LISTENING %s:%d\n", cfg.host.c_str(), bound_port);
+    std::fflush(stdout);
+    if (!svr.listen_after_bind()) {
+        std::fprintf(stderr, "[starling-serve] failed to serve %s:%d\n",
+                     cfg.host.c_str(), bound_port);
         return 1;
     }
 

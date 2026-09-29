@@ -17,6 +17,56 @@ def inputs():
             (ROOT / contract.DOCKERFILE).read_text(encoding="utf-8"))
 
 
+def engine_inputs():
+    return ((ROOT / contract.DESKTOP_WORKFLOW).read_text(encoding="utf-8"),
+            (ROOT / contract.PREPARE).read_text(encoding="utf-8"),
+            (ROOT / contract.DOCS[0]).read_text(encoding="utf-8"))
+
+
+def test_current_bundled_engines_contract():
+    workflow, prepare, release_runtime = engine_inputs()
+    assert contract.bundled_engines_errors(workflow, prepare, release_runtime) == []
+
+
+@pytest.mark.parametrize("path, old, new", [
+    (contract.DESKTOP_WORKFLOW, 'BUNDLED_ENGINES: "@ENGINES@"', 'BUNDLED_ENGINES: "@BAD_ENGINES@"'),
+    (contract.PREPARE, '"desktop_bundled_engines": [@LIST@]', '"desktop_bundled_engines": [@BAD_LIST@]'),
+    (contract.DOCS[0], 'bundle exactly the `vulkan` and `cpu`', 'bundle exactly the `vulkan` and `rocm`'),
+    (contract.DOCS[0], 'CUDA is not bundled', 'CUDA is an optional extra'),
+])
+def test_rejects_independent_bundled_engine_drift(path, old, new):
+    desktop_workflow, prepare, release_runtime = engine_inputs()
+    engines = re.search(r'BUNDLED_ENGINES: "([^"]+)"', desktop_workflow).group(1)
+    listed = re.search(r'"desktop_bundled_engines": \[([^\]]*)\]', prepare).group(1)
+    old = old.replace("@ENGINES@", engines).replace("@LIST@", listed)
+    dropped = engines.split()[1:]  # keep one backend, drop the rest
+    new = (new.replace("@BAD_ENGINES@", " ".join(dropped))
+              .replace("@BAD_LIST@", ", ".join(f'"{name}"' for name in reversed(dropped))))
+    texts = {contract.DESKTOP_WORKFLOW: desktop_workflow,
+             contract.PREPARE: prepare,
+             contract.DOCS[0]: release_runtime}
+    assert old in texts[path]
+    texts[path] = texts[path].replace(old, new)
+    errors = contract.bundled_engines_errors(
+        texts[contract.DESKTOP_WORKFLOW], texts[contract.PREPARE],
+        texts[contract.DOCS[0]])
+    assert errors, "the drifted source must be reported"
+
+
+def test_missing_bundled_engine_statement_fails():
+    desktop_workflow, prepare, release_runtime = engine_inputs()
+    without_section = re.sub(r"## Desktop bundled engines\n.*?(?=\n## |\Z)",
+                             "", release_runtime, flags=re.S)
+    assert without_section != release_runtime
+    assert contract.bundled_engines_errors(desktop_workflow, prepare, without_section)
+
+
+def test_release_preflight_checks_bundled_engines_too(monkeypatch, capsys):
+    monkeypatch.setattr("sys.argv", ["check-contract.py"])
+    assert contract.main() == 0
+    assert "bundled desktop engines agree" in capsys.readouterr().out
+
+
 def test_current_release_contract():
     workflow, docs, dockerfile = inputs()
     assert contract.check(workflow, docs, dockerfile=dockerfile) == []

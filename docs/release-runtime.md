@@ -48,6 +48,18 @@ clean-machine guarantee. The Linux CUDA archive has the same style of
 fresh-container startup check as Linux Vulkan/CPU (see below); like them, it
 does not verify GPU inference.
 
+## Desktop bundled engines
+
+The Linux and Windows desktop archives bundle exactly the `vulkan` and `cpu`
+engines (starling-serve binaries) inside an `engines/` directory; the
+bundle's preference order is `vulkan` first, so the app picks it when a
+Vulkan driver is present and falls back to `cpu`. Their runtime
+prerequisites are the rows above: `linux-vulkan` and `linux-cpu` for the
+Linux archive, `windows-vulkan` and `windows-cpu` for the Windows archive.
+Each archive carries the engines' `RUNTIME.md` and checksums; `engines.json`
+records the shared version and ABI. CUDA is not bundled; it stays a separate
+standalone server download for headless and advanced use.
+
 ## Linux Vulkan archive check
 
 From a checkout of the release tag, run:

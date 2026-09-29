@@ -69,6 +69,14 @@ fn main() {
                 })
             });
 
+            // #362: closing the window quits the app (a zero-window gpui
+            // app would otherwise keep running headless) — and quitting is
+            // what stops the engine sidecar cleanly (the app's own quit
+            // hook; the server's --parent-pid watchdog is the crash
+            // backstop). Process-lifetime hooks: forgotten on purpose,
+            // like the hotkey manager below.
+            std::mem::forget(cx.on_window_closed(|cx| cx.quit()));
+
             match window {
                 Ok(handle) => {
                     if let Err(err) = handle.update(cx, |app, window, _cx| {
@@ -76,14 +84,25 @@ fn main() {
                     }) {
                         eprintln!("Could not focus the Starling window: {err}");
                     }
-                    let window = handle.clone();
+                    // #362: the engine sidecar is ours, so it must not
+                    // outlive the app — quit waits for its stop.
+                    // (`WindowHandle` is `Copy`; the quit hook and the
+                    // hotkey loop below each take their own copy.)
+                    std::mem::forget(cx.on_app_quit(move |cx| {
+                        let _ = handle.update(cx, |app, _window, _cx| {
+                            if let Some(engine) = app.engine.take() {
+                                engine.shutdown();
+                            }
+                        });
+                        async {}
+                    }));
                     cx.spawn(async move |cx| {
                         loop {
                             gpui::Timer::after(Duration::from_millis(150)).await;
                             for event in GlobalHotKeyEvent::receiver().try_iter() {
                                 if event.state() == HotKeyState::Pressed {
                                     cx.update(|cx| {
-                                        let _ = window.update(cx, |app, window, cx| {
+                                        let _ = handle.update(cx, |app, window, cx| {
                                             window.activate_window();
                                             // Same guarded entry as the
                                             // in-app binding (#209, #214.1):

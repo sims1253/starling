@@ -6,6 +6,7 @@
 
 pub mod audio;
 pub mod client;
+pub mod engine;
 pub mod fft;
 pub mod fidelity;
 pub mod journal;

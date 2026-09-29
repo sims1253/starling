@@ -16,8 +16,10 @@ module map back to the removed TypeScript sources.
 include Linux and Windows desktop archives after each successful master build,
 alongside CPU, Vulkan, and CUDA server packages. See the
 [installation guide](../../docs/experimental-releases.md) for setup and runtime
-requirements. The desktop app connects to the server; choose the server package
-for the inference backend you want to test.
+requirements. The desktop app transcribes with its built-in engine: the
+archives bundle the server binaries (`engines/`, Vulkan preferred with a CPU
+fallback, shown in Settings), so a separate server package is only needed for
+the manual mode.
 
 `scripts/package-macos.sh` builds the universal (aarch64 + x86_64) binary,
 assembles `Starling.app`, and produces `target/package/Starling-macOS-universal.dmg`.
@@ -57,24 +59,53 @@ STARLING_DIAGNOSTICS=1 cargo run -p starling-gpui --release  # startup + RSS on 
 Linux needs a Wayland or X11 session, Vulkan loader, fontconfig, and a
 PipeWire/PulseAudio microphone source for recording.
 
-Data locations (both created on demand):
+### Built-in engine
 
-- sessions: `~/.local/share/starling-gpui/sessions/<uuid>/{manifest.json,recording.wav}`
+Transcription runs on the bundled engine by default (#362, #363): the app
+ships the native server binaries in an `engines/` directory next to the
+executable, supervises them as a loopback sidecar, and stops them on quit.
+Vulkan is the preferred backend when a GPU driver is present; the CPU engine
+is the fallback, and Settings shows which one runs (plus a "Use CPU engine"
+toggle to pin it). On first run the capture pane offers the recommended
+speech model; models are downloaded, verified, activated, and deleted from
+Settings, and a switch loads the new model without dropping an in-flight
+take. The engine log and state live under the engine state directory below.
+
+Data locations (all created on demand):
+
+- store (sqlite, audio journals, quarantine): `~/.local/share/starling-gpui/`
 - settings: `~/.config/starling-gpui/settings.json`
+- downloaded models: `~/.local/share/starling-gpui/models/`
+- engine state (registry, spawn lock): `~/.local/share/starling-gpui/engine/`
+- engine log: `~/.local/share/starling-gpui/engine/logs/engine.log`
 
-The app uses `GET /v1/models`, streams live recording chunks through
-`WS /stream`, and falls back to multipart `POST /v1/audio/transcriptions`
-if the stream fails. Start the
-native server from a checkout with built binaries (the Python serving path is
-deprecated):
+Development builds do not bundle `engines/`. Stage one from built server
+binaries and point the app at it:
+
+```bash
+scripts/stage-engines.sh --cpu build-cpu/starling-serve \
+  [--vulkan build-vulkan/starling-serve] --out /tmp/engines
+STARLING_ENGINE_DIR=/tmp/engines cargo run -p starling-gpui --release
+```
+
+### Manual server (advanced)
+
+Settings → Transcription engine → "My own server" switches transcription to
+your own starling-serve or OpenAI-compatible endpoint: endpoint and model
+fields plus Test connection, with the health-probe connection indicator.
+Without a staged engine, the built-in mode reports "no bundled engine" and
+this is the way to transcribe. Start the native server from a checkout with
+built binaries (the Python serving path is deprecated):
 
 ```bash
 build-cpu/starling-serve --model ark \
   --gguf models/ark-asr-0.6b-bf16-exact.gguf   # binds 127.0.0.1:8181
 ```
 
-The model list supplies the topbar's model name. Batch transcription returns
-`{text}` and echoes a request ID in the response header.
+The app uses `GET /v1/models`, streams live recording chunks through
+`WS /stream`, and falls back to multipart `POST /v1/audio/transcriptions`
+if the stream fails. The model list supplies the topbar's model name. Batch
+transcription returns `{text}` and echoes a request ID in the response header.
 
 ## Staging panel
 

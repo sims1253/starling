@@ -77,11 +77,14 @@ jobs:
       STARLING_ANDROID_KEY_PASSWORD: ${{ secrets.STARLING_ANDROID_KEY_PASSWORD }}
 
   desktop:
-    needs: prepare
+    needs: [prepare, servers]
     uses: ./.github/workflows/package-desktop.yml
     with:
       source-ref: ${{ github.sha }}
       retention-days: 3
+      # One self-contained desktop download: bundle the CPU and Vulkan
+      # engines produced by the `servers` job of this run inside the archive.
+      bundle-engines: true
       run-tests: false # desktop-gpui-rust already tests this commit on master
 
   publish:

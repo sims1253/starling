@@ -7,12 +7,14 @@
 //   spawn("starling-serve", ["--model", slug, "--gguf", path, "--port", "8181"])
 //
 // Endpoints:
-//   GET    /health          → { model, loaded, phase, queue_depth, busy }
+//   GET    /health          → { model, loaded, phase, queue_depth, busy,
+//                              backend, warm, load_error }
 //   GET    /v1/models       → the configured model
 //   POST   /v1/audio/transcriptions → multipart WAV + model → { text }
 //   POST   /normalize       → text models only (s1): { transcript, styling?,
 //                             structure?, context? } → { text, request_id }
-//   POST   /warmup          → idempotent warmup (silent clip / probe text)
+//   POST   /warmup          → idempotent warmup (silent clip / probe text);
+//                             loads a deferred (--no-eager-load) model first
 //   DELETE /v1/audio/transcriptions/<id> → cancel by X-Request-Id
 //   WS     /stream          → real-time streaming dictation
 //
@@ -161,6 +163,10 @@ public:
 
     const ServerConfig& config() const { return cfg_; }
     std::string backend_identity() const;
+    // The last load failure message, empty when the last load succeeded.
+    std::string load_error() const;
+    // True once warmup() has finished (successfully or with a logged error).
+    bool warm() const;
 
 private:
     ServerConfig cfg_;
@@ -190,8 +196,17 @@ private:
     std::atomic<Phase> phase_{Phase::Unloaded};
     std::atomic<bool> loaded_{false};
 
-    // Warmup dedup.
-    std::mutex warmup_mutex_;
+    // Why the most recent load failed; empty when it did not (or none ran).
+    // Reported by /health so a supervisor that deferred the load
+    // (--no-eager-load) can tell "failed" from "not yet".
+    std::string load_error_;
+    // Guards backend_identity_ and load_error_. Separate from load_mutex_,
+    // which is held for a whole model load: /health must answer while a
+    // load is running.
+    mutable std::mutex status_mutex_;
+
+    // Warmup dedup (mutable: health_json reports whether warmup finished).
+    mutable std::mutex warmup_mutex_;
     bool warmup_done_ = false;
     bool warmup_in_progress_ = false;
 

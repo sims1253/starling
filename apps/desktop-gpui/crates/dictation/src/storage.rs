@@ -81,6 +81,13 @@ pub struct SessionSummary {
     pub attempt_count: u32,
     pub transcript: Option<TranscriptionResult>,
     pub last_error: Option<String>,
+    /// The backend label of the attempt that produced the current
+    /// transcript (#363): `engine:<model_id>` for the built-in engine,
+    /// `openai:<model>` for a manual server. `None` when no attempt has
+    /// produced a transcript yet — and unchanged by later attempts that
+    /// did not succeed, so a retry on another backend never rewrites the
+    /// label of the transcript the take actually shows.
+    pub model_label: Option<String>,
     /// Always `None` on v2 rows (the capture id *is* the journal linkage);
     /// kept in the shape the UI consumes.
     pub journal_id: Option<String>,
@@ -97,6 +104,11 @@ pub struct DamagedRecord {
 }
 
 #[derive(Clone, Debug)]
+// #363: `model_label` on the summary pushed the `Session`/`Damaged`
+// variant size difference over clippy's 200-byte lint. The split is the
+// point — a damaged record carries only an id and a reason — so the
+// shapes are deliberate, not boxed to please the lint.
+#[allow(clippy::large_enum_variant)]
 pub enum ListedRecord {
     Session(SessionSummary),
     Damaged(DamagedRecord),

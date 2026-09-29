@@ -10,16 +10,17 @@ use std::{
 };
 
 use gpui::{
-    AppContext, ClipboardItem, Context, Entity, FocusHandle, Focusable, Pixels, Render, Timer,
-    Window, actions, div, prelude::*,
+    AppContext, ClipboardItem, Context, Entity, FocusHandle, Focusable, Pixels, Render, Subscription,
+    Timer, Window, actions, div, prelude::*,
 };
 use starling_dictation::{
     client::{self, StarlingClient},
+    engine::{Backend, EngineConfig, EngineManager},
     fft,
     fidelity::{self, TranscriptAnalysisOptions},
     player::Player,
     recorder::RecorderHandle,
-    settings::{ProcessingSettings, Settings},
+    settings::{EngineMode, EngineSettings, ProcessingSettings, Settings},
     storage::{DamagedRecord, ListedRecord, SessionSummary},
 };
 
@@ -334,6 +335,42 @@ pub struct StarlingApp {
     pub player: Option<Player>,
     pub root_focus: FocusHandle,
 
+    /// The bundled-engine supervisor (#362, #363): present exactly while
+    /// the engine mode is builtin and a manager could be constructed.
+    /// Everything it does is observable through `snapshot()`; the app
+    /// owns starting/stopping it with the mode and shutting it down at
+    /// quit.
+    pub engine: Option<EngineManager>,
+    /// Why no manager exists at all — the one failure `EngineManager`'s
+    /// snapshot cannot express (`default_paths` failed before a manager
+    /// could start). Surfaced like any engine failure.
+    pub(crate) engine_startup_error: Option<String>,
+    /// The committed engine settings: mode, the persisted active model,
+    /// and the backend override. `active_model` follows the engine
+    /// snapshot (the engine is the source of truth) and is persisted
+    /// through [`StarlingApp::persist_engine_settings`].
+    pub(crate) engine_settings: EngineSettings,
+    /// The backend override the running manager was started or toggled
+    /// with, so Save only restarts the engine when the override actually
+    /// changed — never on every save.
+    pub(crate) applied_backend_override: Option<String>,
+    /// Bumped on every manager start/stop so the notifier loop can tell
+    /// its manager from a replacement (a mode switch) and retire itself.
+    pub(crate) engine_instance: u64,
+    /// The settings dialog's engine drafts (#362): mode and backend
+    /// override are Save-saved like the other fields; every other engine
+    /// control (activate/download/...) is an immediate action on the
+    /// manager and never lives here.
+    pub(crate) draft_engine_mode: EngineMode,
+    pub(crate) draft_backend_override: Option<String>,
+    /// Keeps the quit hook (engine shutdown) registered for the entity's
+    /// lifetime — a dropped `Subscription` unsubscribes.
+    quit_hook: Option<Subscription>,
+    /// The current recording's endpoint/model binding (#363): resolved
+    /// when recording starts, taken when it stops, and carried with the
+    /// take so a model switch mid-take cannot move it.
+    pub(crate) active_take: Option<crate::upload::TakeTarget>,
+
     pub endpoint: String,
     pub model: String,
     pub expected_terms_input: String,
@@ -510,14 +547,51 @@ fn rss_bytes() -> u64 {
         .and_then(|status| {
             status.lines().find_map(|line| {
                 let rest = line.strip_prefix("VmRSS:")?;
-                rest.trim()
-                    .split_whitespace()
+                rest.split_whitespace()
                     .next()
                     .and_then(|kb| kb.parse::<u64>().ok())
                     .map(|kb| kb * 1024)
             })
         })
         .unwrap_or(0)
+}
+
+/// Manager identities for the notifier loop (#362): every start or stop
+/// of a manager bumps this, so a loop polling a replaced manager sees a
+/// mismatch and retires itself instead of notifying for a dead engine.
+fn next_engine_instance() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// The persisted backend override ("cpu"/"vulkan") as the engine's own
+/// backend family (#362). An unknown string is `None` (automatic), not a
+/// guess: settings this build no longer understands degrade to the safe
+/// default rather than pinning the wrong engine.
+pub(crate) fn backend_override_from_settings(value: &str) -> Option<Backend> {
+    Backend::parse(value)
+}
+
+/// Start the bundled-engine manager for the committed engine settings
+/// (#362): only in builtin mode, on the default data paths, with the
+/// persisted model and backend override. `EngineManager::start` itself
+/// never fails (problems surface in the snapshot); the one early error
+/// is `default_paths` (an unresolvable data dir), which the app reports
+/// through the engine status instead of pretending the engine exists.
+fn start_engine(settings: &EngineSettings) -> (Option<EngineManager>, Option<String>) {
+    if settings.mode != EngineMode::Builtin {
+        return (None, None);
+    }
+    let mut config = match EngineConfig::default_paths() {
+        Ok(config) => config,
+        Err(err) => return (None, Some(err.to_string())),
+    };
+    config.backend_override = settings
+        .backend_override
+        .as_deref()
+        .and_then(backend_override_from_settings);
+    (Some(EngineManager::start(config, settings.active_model.clone())), None)
 }
 
 /// Split a metadata-only listing (G02): readable summaries in listing
@@ -874,6 +948,17 @@ impl StarlingApp {
             TextField::new("OPENAI_API_KEY", &processing_settings.api_key_env, cx)
         });
 
+        // #362: the engine manager starts with the app in builtin mode —
+        // before the first render, off the UI-critical path (everything
+        // slow runs on its supervisor thread). A start failure is honest
+        // state, never a crash: the app still works in manual mode.
+        let engine_settings = settings.engine.clone();
+        let (engine, engine_startup_error) = start_engine(&engine_settings);
+        let engine_instance = engine.as_ref().map(|_| next_engine_instance()).unwrap_or(0);
+        let applied_backend_override = engine_settings.backend_override.clone();
+        let draft_engine_mode = engine_settings.mode;
+        let draft_backend_override = engine_settings.backend_override.clone();
+
         Self {
             error: match (store_error.clone(), mode_note) {
                 (Some(store), Some(mode)) => Some(format!("{store}\n{mode}")),
@@ -885,6 +970,15 @@ impl StarlingApp {
             store_error,
             player,
             root_focus: cx.focus_handle(),
+            engine,
+            engine_startup_error,
+            engine_settings,
+            applied_backend_override,
+            engine_instance,
+            draft_engine_mode,
+            draft_backend_override,
+            quit_hook: None,
+            active_take: None,
             endpoint,
             model,
             expected_terms_input: terms_input,
@@ -943,10 +1037,15 @@ impl StarlingApp {
 
     #[cfg(test)]
     pub(crate) fn for_test(store: Option<Store>, cx: &mut Context<Self>) -> Self {
+        // Manual engine mode: tests exercise the app, not the bundled
+        // engine — starting a manager here would probe the developer's
+        // real engine/data directories from every test.
+        let mut settings = Settings::default_settings();
+        settings.engine.mode = EngineMode::Manual;
         Self::with_dependencies(
             Instant::now(),
             false,
-            Settings::default_settings(),
+            settings,
             store,
             None,
             None,
@@ -991,11 +1090,275 @@ impl StarlingApp {
             })
             .detach();
         }
-        self.check_health(
-            HealthCheckPurpose::Live,
-            self.endpoint.clone(),
-            cx,
-        );
+        match self.engine_settings.mode {
+            // #362: in builtin mode the connection indicator derives from
+            // the engine snapshot (the notifier loop refreshes it); probing
+            // `self.endpoint` would report a server takes never use.
+            EngineMode::Builtin => {
+                if let Some(engine) = self.engine.clone() {
+                    let instance = self.engine_instance;
+                    self.watch_engine(engine, instance, cx);
+                }
+            }
+            // Manual keeps today's startup health probe (#207).
+            EngineMode::Manual => {
+                self.check_health(
+                    HealthCheckPurpose::Live,
+                    self.endpoint.clone(),
+                    cx,
+                );
+            }
+        }
+        self.register_quit_hook(cx);
+    }
+
+    /// The engine notifier loop (#362): polls the manager's generation
+    /// every 200 ms (the same shape as the global-hotkey loop in
+    /// `main`) and, on change, refreshes the connection indicator and
+    /// notifies. A changed active model is persisted immediately through
+    /// the same background save path as `save_settings` — the engine is
+    /// the source of truth, the file only restores it at launch. The
+    /// loop retires itself when its manager is replaced (a mode switch
+    /// bumped `engine_instance`) or the entity is released.
+    fn watch_engine(&mut self, engine: EngineManager, instance: u64, cx: &mut Context<Self>) {
+        let mut last_generation = engine.generation();
+        cx.spawn(async move |this, cx| {
+            loop {
+                Timer::after(Duration::from_millis(200)).await;
+                let keep_going = this
+                    .update(cx, |app, cx| {
+                        if app.engine_instance != instance {
+                            return false;
+                        }
+                        let generation = engine.generation();
+                        if generation == last_generation {
+                            return true;
+                        }
+                        last_generation = generation;
+                        let snapshot = engine.snapshot();
+                        app.connection = views::engine_status_view(&snapshot).connection;
+                        if let Some(active) = &snapshot.active {
+                            if app.engine_settings.active_model.as_deref()
+                                != Some(active.model_id.as_str())
+                            {
+                                app.engine_settings.active_model =
+                                    Some(active.model_id.clone());
+                                app.persist_engine_settings(cx);
+                            }
+                        }
+                        cx.notify();
+                        true
+                    })
+                    .unwrap_or(false);
+                if !keep_going {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Stop the engine when the app quits (#362): the sidecar is ours,
+    /// so it must not outlive the window. Blocking here is correct —
+    /// quit waits for the stop — and the server's `--parent-pid`
+    /// watchdog is the backstop if the app crashes first.
+    fn register_quit_hook(&mut self, cx: &mut Context<Self>) {
+        if self.quit_hook.is_some() {
+            return;
+        }
+        // `Context::on_app_quit` hands the entity itself; the returned
+        // Subscription is kept so the hook lives as long as the app.
+        self.quit_hook = Some(cx.on_app_quit(|app, _cx| {
+            if let Some(engine) = app.engine.take() {
+                engine.shutdown();
+            }
+            async {}
+        }));
+    }
+
+    /// The settings file's contents as of the app's current state: every
+    /// save path (the Save button, engine active-model persistence)
+    /// builds the same document, so the two writers cannot disagree
+    /// about fields the other one never touched.
+    fn committed_settings(&self) -> Settings {
+        let mut settings = Settings {
+            endpoint: self.endpoint.clone(),
+            model: self.model.clone(),
+            expected_terms: Vec::new(),
+            user_set_model: self.user_set_model,
+            processing: self.processing_settings.clone(),
+            engine: self.engine_settings.clone(),
+        };
+        settings.set_expected_terms_input(&self.expected_terms_input);
+        settings
+    }
+
+    /// Persist the committed settings in the background (the engine
+    /// active-model path of #363: the manager switched models, the file
+    /// follows). A failure surfaces through the error banner like any
+    /// other save.
+    fn persist_engine_settings(&self, cx: &mut Context<Self>) {
+        let settings = self.committed_settings();
+        let Ok(path) = Settings::default_path() else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let saved = cx
+                .background_spawn(async move { settings.save(&path) })
+                .await;
+            if let Err(err) = saved {
+                this.update(cx, |app, cx| {
+                    app.error = Some(format!("Could not save settings: {err}"));
+                    cx.notify();
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    /// Apply a committed engine mode change (#362): builtin→manual stops
+    /// the manager off the UI thread (shutdown can wait out a sidecar
+    /// stop), manual→builtin starts one and begins watching it. The
+    /// persisted model and backend override ride along on start.
+    fn apply_engine_mode_change(&mut self, cx: &mut Context<Self>) {
+        match self.engine_settings.mode {
+            EngineMode::Builtin => {
+                if self.engine.is_none() {
+                    let (engine, startup_error) = start_engine(&self.engine_settings);
+                    self.engine_startup_error = startup_error;
+                    if let Some(engine) = engine {
+                        self.applied_backend_override =
+                            self.engine_settings.backend_override.clone();
+                        self.engine_instance = next_engine_instance();
+                        let instance = self.engine_instance;
+                        self.connection = views::engine_status_view(&engine.snapshot()).connection;
+                        self.watch_engine(engine.clone(), instance, cx);
+                        self.engine = Some(engine);
+                    }
+                    cx.notify();
+                }
+            }
+            EngineMode::Manual => {
+                if let Some(engine) = self.engine.take() {
+                    self.engine_startup_error = None;
+                    self.engine_instance = next_engine_instance();
+                    // The notifier loop retires on the instance bump; the
+                    // connection indicator is the manual health probe's
+                    // to write again (the save triggers one).
+                    cx.background_spawn(async move { engine.shutdown(); }).detach();
+                    cx.notify();
+                }
+            }
+        }
+    }
+
+    /// The live engine snapshot for the views (None when no manager
+    /// runs — manual mode, or the startup failure in
+    /// `engine_startup_error`).
+    pub fn engine_snapshot(&self) -> Option<starling_dictation::engine::EngineSnapshot> {
+        self.engine.as_ref().map(|engine| engine.snapshot())
+    }
+
+    // ---- engine actions (#362, #363) ---------------------------------
+    // All of these are immediate: they command the manager and the
+    // notifier loop paints the result. None of them is part of Save.
+
+    /// Download (background) a model without activating it.
+    pub fn engine_download(&mut self, id: &str, cx: &mut Context<Self>) {
+        if let Some(engine) = &self.engine {
+            engine.download(id);
+        }
+        cx.notify();
+    }
+
+    /// Cancel a model's running download.
+    pub fn engine_cancel_download(&mut self, id: &str, cx: &mut Context<Self>) {
+        if let Some(engine) = &self.engine {
+            engine.cancel_download(id);
+        }
+        cx.notify();
+    }
+
+    /// Download-if-needed then switch to a model (#363).
+    pub fn engine_activate(&mut self, id: &str, cx: &mut Context<Self>) {
+        if let Some(engine) = &self.engine {
+            engine.activate(id);
+        }
+        cx.notify();
+    }
+
+    /// Delete a model's files; the manager refuses active/switching/
+    /// downloading models and the refusal is surfaced, not swallowed.
+    pub fn engine_delete_model(&mut self, id: &str, cx: &mut Context<Self>) {
+        if let Some(engine) = &self.engine {
+            if let Err(err) = engine.delete_model(id) {
+                self.error = Some(err.to_string());
+            }
+        }
+        cx.notify();
+    }
+
+    /// Clear a Failed/crash-loop state and retry the last model.
+    pub fn engine_retry(&mut self, cx: &mut Context<Self>) {
+        if let Some(engine) = &self.engine {
+            engine.retry();
+        }
+        cx.notify();
+    }
+
+    /// Answer a pending NeedsDrain decision: switch after the take.
+    pub fn engine_confirm_drain_swap(&mut self, cx: &mut Context<Self>) {
+        if let Some(engine) = &self.engine {
+            engine.confirm_drain_swap();
+        }
+        cx.notify();
+    }
+
+    /// Cancel a running switch; the current model keeps serving.
+    pub fn engine_cancel_switch(&mut self, cx: &mut Context<Self>) {
+        if let Some(engine) = &self.engine {
+            engine.cancel_switch();
+        }
+        cx.notify();
+    }
+
+    /// The "Use CPU engine" / "Use automatic engine" toggle (#362):
+    /// applies immediately (the manager re-selects the backend and moves
+    /// the engine, draining in-flight takes) and updates the dialog
+    /// draft so Save persists the choice.
+    pub fn engine_toggle_cpu(&mut self, cx: &mut Context<Self>) {
+        let pinned = self.draft_backend_override.as_deref() == Some("cpu");
+        let next = if pinned { None } else { Some("cpu".to_string()) };
+        if let Some(engine) = &self.engine {
+            engine.set_backend_override(
+                next.as_deref().and_then(backend_override_from_settings),
+            );
+            self.applied_backend_override = next.clone();
+        }
+        self.draft_backend_override = next;
+        cx.notify();
+    }
+
+    /// The failure action "Switch to my own server" (#362): an explicit
+    /// user decision, so unlike the radio it applies and persists
+    /// immediately rather than waiting for Save.
+    pub fn engine_switch_to_manual(&mut self, cx: &mut Context<Self>) {
+        self.draft_engine_mode = EngineMode::Manual;
+        self.engine_settings.mode = EngineMode::Manual;
+        self.apply_engine_mode_change(cx);
+        self.persist_engine_settings(cx);
+        // The manual indicator starts as a probe in flight, exactly like
+        // a startup in manual mode.
+        self.connection = Connection::Checking;
+        self.check_health(HealthCheckPurpose::Live, self.endpoint.clone(), cx);
+    }
+
+    /// The dialog's engine mode radio (#362): a draft like the other
+    /// fields — it commits (and starts/stops the manager) on Save.
+    pub(crate) fn pick_draft_engine_mode(&mut self, mode: EngineMode, cx: &mut Context<Self>) {
+        self.draft_engine_mode = mode;
+        cx.notify();
     }
 
     pub fn busy(&self) -> bool {
@@ -1111,6 +1474,11 @@ impl StarlingApp {
         let endpoint = self.endpoint.clone();
         let model = self.model.clone();
         let terms = self.expected_terms_input.clone();
+        // The engine drafts start from the committed values (#362):
+        // mode and backend override are Save-saved like these fields;
+        // everything else in the Engine section is live manager state.
+        self.draft_engine_mode = self.engine_settings.mode;
+        self.draft_backend_override = self.engine_settings.backend_override.clone();
         self.draft_endpoint.update(cx, |field, cx| {
             field.set_value(&endpoint, cx);
         });
@@ -1235,46 +1603,70 @@ impl StarlingApp {
     }
 
     pub fn save_settings(&mut self, cx: &mut Context<Self>) {
-        let draft = self.draft_endpoint.read(cx).value();
-        let clean = normalize_draft_endpoint(&draft);
-        if let Err(reason) = validated_draft_endpoint(&clean) {
-            // #213: a draft the client cannot use is refused before
-            // anything is applied or persisted — the dialog stays open
-            // with the reason in its callout, the in-modal twin of the
-            // Electron reference's `settingsIssue` refusal. The refusal
-            // settles under a freshly claimed token, so an in-flight
-            // probe cannot land afterwards and overwrite the reason
-            // (the same ownership rule as the empty-draft probe
-            // failure in `test_connection`).
-            let _ = self.probe_sequencer.begin();
-            self.probe = Some(ConnectionProbe::Done {
-                endpoint: clean,
-                outcome: ProbeOutcome::Failed { message: reason },
-            });
-            cx.notify();
-            return;
+        // #362: the engine mode commits with this save. The manual
+        // endpoint rules (#213) apply only in manual mode — a builtin
+        // install has no server to name, and refusing the save over an
+        // empty endpoint field the dialog does not even show would lock
+        // the user out of saving anything else.
+        let engine_mode = self.draft_engine_mode;
+        if engine_mode == EngineMode::Manual {
+            let draft = self.draft_endpoint.read(cx).value();
+            let clean = normalize_draft_endpoint(&draft);
+            if let Err(reason) = validated_draft_endpoint(&clean) {
+                // #213: a draft the client cannot use is refused before
+                // anything is applied or persisted — the dialog stays open
+                // with the reason in its callout, the in-modal twin of the
+                // Electron reference's `settingsIssue` refusal. The refusal
+                // settles under a freshly claimed token, so an in-flight
+                // probe cannot land afterwards and overwrite the reason
+                // (the same ownership rule as the empty-draft probe
+                // failure in `test_connection`).
+                let _ = self.probe_sequencer.begin();
+                self.probe = Some(ConnectionProbe::Done {
+                    endpoint: clean,
+                    outcome: ProbeOutcome::Failed { message: reason },
+                });
+                cx.notify();
+                return;
+            }
+            self.endpoint = clean;
+            // R02: only a save that changes the model marks it user-set, so an
+            // endpoint-only edit keeps the server's health auto-sync alive.
+            let draft_model = self.draft_model.read(cx).value();
+            self.user_set_model =
+                user_set_model_after_save(self.user_set_model, &self.model, &draft_model);
+            self.model = draft_model;
         }
-        self.endpoint = clean;
-        // R02: only a save that changes the model marks it user-set, so an
-        // endpoint-only edit keeps the server's health auto-sync alive.
-        let draft_model = self.draft_model.read(cx).value();
-        self.user_set_model =
-            user_set_model_after_save(self.user_set_model, &self.model, &draft_model);
-        self.model = draft_model;
         self.expected_terms_input = self.draft_terms.read(cx).value();
         // A new processing configuration takes effect for the next job;
         // jobs already running keep the provider they started with.
         self.processing_settings = self.draft_processing_settings(cx);
         self.providers = processing::build_providers(&self.processing_settings);
 
-        let mut settings = Settings {
-            endpoint: self.endpoint.clone(),
-            model: self.model.clone(),
-            expected_terms: Vec::new(),
-            user_set_model: self.user_set_model,
-            processing: self.processing_settings.clone(),
-        };
-        settings.set_expected_terms_input(&self.expected_terms_input);
+        // #362: mode and backend override commit here, like the other
+        // fields — and are applied now (the manager starts or stops with
+        // the mode; a changed override moves the engine once, never on
+        // an unchanged re-save).
+        let previous_mode = self.engine_settings.mode;
+        self.engine_settings.mode = engine_mode;
+        self.engine_settings.backend_override = self.draft_backend_override.clone();
+        if previous_mode != engine_mode {
+            self.apply_engine_mode_change(cx);
+        } else if engine_mode == EngineMode::Builtin
+            && self.engine_settings.backend_override != self.applied_backend_override
+        {
+            if let Some(engine) = &self.engine {
+                engine.set_backend_override(
+                    self.engine_settings
+                        .backend_override
+                        .as_deref()
+                        .and_then(backend_override_from_settings),
+                );
+                self.applied_backend_override = self.engine_settings.backend_override.clone();
+            }
+        }
+
+        let settings = self.committed_settings();
 
         // R11: an unresolvable config directory is surfaced, not swallowed —
         // settings must not silently land in the current working directory.
@@ -1306,12 +1698,15 @@ impl StarlingApp {
         // Re-check health from the saved configuration, as saves always
         // did — explicitly against the committed endpoint, and sequenced
         // so a check against an endpoint an earlier save committed is
-        // dropped when this one supersedes it (#207).
-        self.check_health(
-            HealthCheckPurpose::Live,
-            self.endpoint.clone(),
-            cx,
-        );
+        // dropped when this one supersedes it (#207). Builtin mode has
+        // no manual endpoint to probe: its indicator is the engine.
+        if self.engine_settings.mode == EngineMode::Manual {
+            self.check_health(
+                HealthCheckPurpose::Live,
+                self.endpoint.clone(),
+                cx,
+            );
+        }
     }
 
     pub fn select_session(&mut self, id: String, cx: &mut Context<Self>) {
@@ -1996,6 +2391,17 @@ mod tests {
     }
 
     #[test]
+    fn the_backend_override_parses_the_settings_keys_only() {
+        // #362: "cpu"/"vulkan" map to the engine families; anything else
+        // (a settings file from a future build) degrades to automatic
+        // instead of pinning the wrong engine family.
+        assert_eq!(backend_override_from_settings("cpu"), Some(Backend::Cpu));
+        assert_eq!(backend_override_from_settings("vulkan"), Some(Backend::Vulkan));
+        assert_eq!(backend_override_from_settings("cuda"), None);
+        assert_eq!(backend_override_from_settings(""), None);
+    }
+
+    #[test]
     fn candidate_names_suffix_before_the_extension() {
         assert_eq!(download_name_candidate("starling-a.txt", 1), "starling-a.txt");
         assert_eq!(
@@ -2224,6 +2630,7 @@ mod tests {
             attempt_count: 0,
             transcript: None,
             last_error: None,
+            model_label: None,
             journal_id: None,
         }
     }
@@ -2374,7 +2781,7 @@ mod tests {
         assert!(!listing_moves_selection(Some("next"), &sessions));
         assert!(!listing_moves_selection(
             Some("selected"),
-            &vec![summary("newest"), summary("selected")]
+            &[summary("newest"), summary("selected")]
         ));
         // Gaining a first selection runs the same reset as clicking that
         // row with nothing selected — exactly what `select_session` does.
