@@ -83,7 +83,7 @@ jobs:
           tests/test_server_routing.py tests/test_server_robustness.py
           tests/test_server_lifecycle.py tests/test_server_websocket.py
           tests/test_server_client.py tests/test_stream_chunk.py
-          tests/test_native_parity_contract.py
+          tests/test_native_parity_contract.py tests/test_copy_draft.py
           benchmarks/speculative/results/pixel-native-copy-2026-09-28/test_run_copy.py
           tests/test_s1_quant_spans.py tests/test_s1_pixel_runner.py
           docs/evidence/pixel-s1-2026-09-28/controlled/test_controlled.py
@@ -94,6 +94,9 @@ jobs:
           cd docs/evidence/pixel-s1-2026-09-28/cpu-co-residency
           sha256sum -c hashes.sha256
 
+      # tests/test_copy_draft.py (issue #312): offline copy-draft acceptance
+      # replay; stdlib + pytest only, loads benchmarks/speculative/copy_draft.py
+      # directly and needs no model or golden files.
       # tests/test_native_parity_contract.py (issue #167): the executable
       # numerical-correctness contract — manifest schema, test-selection
       # agreement, docs/manifest agreement, and the comparator negative tests
