@@ -220,6 +220,14 @@ jobs:
           sudo apt-get update
           cuda_series="${CUDA_VERSION%.*}"
           sudo apt-get install -y "cuda-toolkit-${cuda_series//./-}"
+          # Userspace driver library (libcuda.so.1) so the binary's loader
+          # dependencies resolve on this GPU-less runner — the same package the
+          # fresh-container runtime check installs (Dockerfile.cuda). Without
+          # it, ./starling-serve-linux-cuda --version dies with exit 127.
+          sudo apt-get install -y libnvidia-compute-610
+          # Toolkit runtime libs (libcudart.so, libcublas.so) for the same
+          # reason, in case the build rpath ever stops covering them.
+          echo "LD_LIBRARY_PATH=/usr/local/cuda/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
           # Drop the ~3 GB of cached .debs; the toolkit plus the build leaves
           # little headroom on the runner disk otherwise.
           sudo apt-get clean
@@ -478,12 +486,16 @@ jobs:
         shell: pwsh
         run: |
           $version = $env:RELEASE_TAG -replace '^v', ''
-          # ggml-cuda links CUDA::cuda_driver, so the exe imports nvcuda.dll,
-          # which ships only with the NVIDIA driver. The GPU-less runner (and
-          # driverless user machines) has no driver, and the loader killed the
-          # exe before --version could print. Delay-load the import: the driver
-          # API is only touched once a CUDA device is actually initialized,
-          # after the metadata flags have already been handled.
+          # The exe must start on the GPU-less runner for --version. A first
+          # attempt delay-loaded nvcuda.dll, but LNK4199 showed the exe has no
+          # direct nvcuda import — the silent loader failure comes from the
+          # toolkit DLLs' own load chain. Delay-load every CUDA DLL so none of
+          # them is in the startup path: metadata flags never touch CUDA, and
+          # on driver-equipped machines the delayed imports resolve at the
+          # first real CUDA call, after a device context exists.
+          $cudaMajor = $env:CUDA_VERSION.Split('.')[0]
+          $delayFlags = "/DELAYLOAD:cudart64_$cudaMajor.dll " +
+            "/DELAYLOAD:cublas64_$cudaMajor.dll /DELAYLOAD:cublasLt64_$cudaMajor.dll"
           cmake -S . -B build -G "Visual Studio 18 2026" -A x64 `
             -DSTARLING_SERVE=ON `
             "-DSTARLING_SERVE_VERSION=$version" `
@@ -492,7 +504,7 @@ jobs:
             "-DCMAKE_CUDA_ARCHITECTURES=$env:CUDA_ARCHITECTURES" `
             -DGGML_NATIVE=OFF -DGGML_LLAMAFILE=OFF `
             -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded `
-            "-DCMAKE_EXE_LINKER_FLAGS=/DELAYLOAD:nvcuda.dll delayimp.lib"
+            "-DCMAKE_EXE_LINKER_FLAGS=$delayFlags delayimp.lib"
           cmake --build build --config Release --target starling-serve
 
       - name: Package
@@ -507,6 +519,11 @@ jobs:
       - name: Verify binary metadata
         shell: pwsh
         run: |
+          # Ground truth for the loader: the exe's full import table, in the
+          # log, so a startup failure here never needs guessing again.
+          $dumpbin = (Get-ChildItem "C:\Program Files\Microsoft Visual Studio\*\*\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" |
+            Select-Object -First 1).FullName
+          & $dumpbin /dependents .\starling-serve-windows-cuda.exe
           $version = .\starling-serve-windows-cuda.exe --version
           $version
           $expected = "starling-serve $($env:RELEASE_TAG -replace '^v', '')"
