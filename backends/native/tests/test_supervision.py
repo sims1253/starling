@@ -21,6 +21,12 @@ import sys
 import time
 import unittest
 import urllib.request
+from pathlib import Path
+
+# The sibling import below needs the tests directory on sys.path when this
+# file is run directly (python test_supervision.py) instead of through
+# unittest discovery, which puts the directory there itself.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from test_openai_api import ANNOUNCE_RE, fixture_binary, read_announce, start_fixture, wait_healthy
 
@@ -54,14 +60,28 @@ class PortAnnouncement(unittest.TestCase):
         self.assertEqual(process.poll(), None)
 
     def test_fixed_port_announces_that_port(self):
-        with socket.socket() as sock:
-            sock.bind(("127.0.0.1", 0))
-            port = sock.getsockname()[1]
-        process = subprocess.Popen(
-            [str(fixture_binary()), "--model", "parakeet", "--gguf", __file__, "--port", str(port)],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        # The test must pass a FIXED port (that is the contract pinned
+        # here), but a port learned by bind-then-close hands the socket to
+        # the server with a race: another process can grab it between the
+        # close and the server's listen. On a startup failure (no announce
+        # line) retry with a fresh port instead — what is pinned is that
+        # the announce reports exactly the port that was passed.
+        announce = None
+        process = None
+        for _ in range(5):
+            with socket.socket() as sock:
+                sock.bind(("127.0.0.1", 0))
+                port = sock.getsockname()[1]
+            process = subprocess.Popen(
+                [str(fixture_binary()), "--model", "parakeet", "--gguf", __file__, "--port", str(port)],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+            announce = read_announce(process)
+            if announce is not None:
+                break
+            self.stop(process)
+        else:
+            self.fail("fixture never started on any fixed port")
         self.addCleanup(self.stop, process)
-        announce = read_announce(process)
         self.assertEqual(announce, f"STARLING_SERVE_LISTENING 127.0.0.1:{port}")
         self.assertTrue(wait_healthy(f"http://127.0.0.1:{port}", process))
 
@@ -132,6 +152,10 @@ class ParentWatchdog(unittest.TestCase):
         sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
         self.addCleanup(self.kill_sleeper, sleeper)
         base, process = start_fixture("parakeet", ["--parent-pid", str(sleeper.pid)])
+        # Close the stdout pipe however the assertions below turn out, not
+        # only on success (a failing assert would otherwise leak the pipe
+        # until garbage collection).
+        self.addCleanup(process.stdout.close)
         # The server is healthy while the parent lives.
         self.assertTrue(wait_healthy(base, process))
         self.assertEqual(process.poll(), None)
@@ -141,7 +165,6 @@ class ParentWatchdog(unittest.TestCase):
         while process.poll() is None and time.monotonic() < deadline:
             time.sleep(0.05)
         self.assertEqual(process.poll(), 0, "server must exit with code 0 within 5 s of the parent dying")
-        process.stdout.close()
 
     @staticmethod
     def kill_sleeper(sleeper):

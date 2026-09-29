@@ -149,3 +149,85 @@ fn rapid_switching_leaves_exactly_one_sidecar() {
     }
     assert!(!pid_alive(final_pid));
 }
+
+/// #363: "the next take uses the new model". A backend reload that is
+/// still starting when the user activates another model is cancelled by
+/// that activation; it must never cut over afterwards and bring the
+/// previous model back.
+#[cfg(unix)]
+#[test]
+fn a_slow_backend_reload_does_not_undo_a_later_activation() {
+    let Some(fixture) = fixture() else { return };
+    let root = tempfile::tempdir().expect("tempdir");
+    // The CPU reload of A starts slowly; B starts at normal speed.
+    let engine_dir = stage_delayed_engine_dir(root.path(), &fixture, "a.gguf", 3);
+    let (entry_a, entry_b) = two_model_setup(root.path());
+    let models_dir = root.path().join("models");
+    let state_dir = root.path().join("state");
+    let manager = starling_dictation::engine::EngineManager::start(
+        config(&engine_dir, &models_dir, &state_dir, vec![entry_a, entry_b]),
+        Some("model-a".to_string()),
+    );
+    // The initial start of A is slowed too.
+    wait_until(&manager, READY_TIMEOUT, |s| s.phase == EnginePhase::Ready).expect("Ready on A");
+
+    manager.set_backend_override(Some(starling_dictation::engine::Backend::Cpu));
+    wait_until(&manager, READY_TIMEOUT, |s| s.switch.is_some()).expect("the reload starts");
+    manager.activate("model-b");
+    wait_until(&manager, READY_TIMEOUT, |s| {
+        s.phase == EnginePhase::Ready
+            && s.active.as_ref().is_some_and(|active| active.model_id == "model-b")
+    })
+    .expect("B becomes active");
+    // Longer than the reload's delayed start.
+    std::thread::sleep(Duration::from_secs(4));
+    let final_state = manager.snapshot();
+    manager.shutdown();
+    assert_eq!(
+        final_state.active.map(|active| active.model_id).as_deref(),
+        Some("model-b"),
+        "the superseded reload must not reactivate A"
+    );
+}
+
+/// A crash of the old engine during a switch schedules a restart; the
+/// switch completing first must win, and the restart must not revert it.
+#[cfg(unix)]
+#[test]
+fn a_crash_restart_does_not_revert_a_completed_switch() {
+    let Some(fixture) = fixture() else { return };
+    let root = tempfile::tempdir().expect("tempdir");
+    let engine_dir = stage_delayed_engine_dir(root.path(), &fixture, "b.gguf", 2);
+    let (entry_a, entry_b) = two_model_setup(root.path());
+    let models_dir = root.path().join("models");
+    let state_dir = root.path().join("state");
+    let mut config = config(&engine_dir, &models_dir, &state_dir, vec![entry_a, entry_b]);
+    // Longer than B's delayed start, so B completes while the restart
+    // of A is still pending.
+    config.backoff_schedule = Some(vec![Duration::from_secs(4)]);
+    let manager =
+        starling_dictation::engine::EngineManager::start(config, Some("model-a".to_string()));
+    let ready =
+        wait_until(&manager, READY_TIMEOUT, |s| s.phase == EnginePhase::Ready).expect("Ready on A");
+    let old = ready.active.expect("active A");
+
+    manager.activate("model-b");
+    wait_until(&manager, READY_TIMEOUT, |s| s.switch.is_some()).expect("the switch starts");
+    unsafe {
+        assert_eq!(libc::kill(old.pid as i32, libc::SIGKILL), 0);
+    }
+    wait_until(&manager, READY_TIMEOUT, |s| {
+        s.phase == EnginePhase::Ready
+            && s.active.as_ref().is_some_and(|active| active.model_id == "model-b")
+    })
+    .expect("B becomes active");
+    // Past A's restart backoff.
+    std::thread::sleep(Duration::from_secs(5));
+    let final_state = manager.snapshot();
+    manager.shutdown();
+    assert_eq!(
+        final_state.active.map(|active| active.model_id).as_deref(),
+        Some("model-b"),
+        "the pending restart of A must not revert the switch to B"
+    );
+}

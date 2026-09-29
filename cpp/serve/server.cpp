@@ -532,6 +532,17 @@ int StarlingServer::queue_depth() const {
 }
 
 std::string StarlingServer::health_json() const {
+    // backend_identity and load_error are read together under one
+    // status_mutex_ acquisition: two separate reads could pair a load
+    // that just succeeded (new backend, error cleared) with the stale
+    // error, or vice versa, reporting a torn state (#366).
+    std::string backend;
+    std::string failure;
+    {
+        std::lock_guard<std::mutex> lk(status_mutex_);
+        backend = backend_identity_;
+        failure = load_error_;
+    }
     std::ostringstream ss;
     ss << "{"
        << "\"status\":\"ok\","
@@ -543,10 +554,9 @@ std::string StarlingServer::health_json() const {
        // Additive supervision fields (#362): the device the engine actually
        // runs on (the compile-time family until a load selects one), whether
        // warmup finished, and why the last load failed (null when it did not).
-       << "\"backend\":\"" << json_escape(backend_identity()) << "\","
+       << "\"backend\":\"" << json_escape(backend) << "\","
        << "\"warm\":" << (warm() ? "true" : "false") << ","
        << "\"load_error\":";
-    const std::string failure = load_error();
     if (failure.empty()) ss << "null";
     else ss << "\"" << json_escape(failure) << "\"";
     ss << "}";

@@ -30,8 +30,9 @@ use crate::engine::download::{
 use crate::engine::memory::{available_memory, estimate_resident, process_rss, swap_plan};
 use crate::engine::probe::{try_select_backend, BackendSelection};
 use crate::engine::registry::{
-    remove_registration, try_spawn_lock, write_registration, LockOutcome, SidecarRegistration,
-    SpawnLock, SPAWN_LOCK_FILE,
+    acquire_lease_marker, clear_engine_leases, foreign_leases, is_retired, remove_registration,
+    retire_engine, try_spawn_lock, unretire_engine, write_registration, EngineKey, LeaseMarker,
+    LockOutcome, MarkerOutcome, SidecarRegistration, SpawnLock,
 };
 use crate::engine::sidecar::{HealthSnapshot, LoopbackHttp, ReadyError, ReadyStage, Sidecar};
 use crate::engine::{Backend, EngineFailure, SwapPlan, SWAP_MARGIN_BYTES};
@@ -58,6 +59,9 @@ const ATTACH_POLL: Duration = Duration::from_secs(2);
 const ATTACH_FAILURES_BEFORE_TAKEOVER: u32 = 2;
 /// The peak-RSS sampler cadence during a switch (#363 step 4).
 const RSS_SAMPLE: Duration = Duration::from_millis(200);
+/// An unanswered "finish the current take, then switch?" question
+/// cancels the switch after this long.
+pub const DRAIN_DECISION_CAP: Duration = Duration::from_secs(5 * 60);
 
 /// Configuration for one [`EngineManager`]. Paths are injectable so
 /// tests (and alternative hosts) never touch the real user directories.
@@ -279,6 +283,9 @@ pub struct EngineLease {
     endpoint: String,
     slug: String,
     model_id: String,
+    /// On an attached engine: makes this take visible to the owning
+    /// instance, which will not stop the engine under it.
+    _marker: Option<LeaseMarker>,
 }
 
 impl EngineLease {
@@ -375,6 +382,22 @@ impl ActiveEngine {
             *slot = Some(device);
         }
     }
+
+    fn port(&self) -> u16 {
+        self.endpoint
+            .rsplit(':')
+            .next()
+            .and_then(|port| port.parse::<u16>().ok())
+            .unwrap_or(0)
+    }
+
+    /// The cross-instance identity used by lease markers.
+    fn key(&self) -> EngineKey {
+        EngineKey {
+            pid: self.pid,
+            port: self.port(),
+        }
+    }
 }
 
 /// Internal mutable state, always accessed through one mutex; mutations
@@ -408,6 +431,11 @@ pub(crate) struct SharedState {
     /// target after a crash loop.
     pub last_active_model: Option<String>,
     pub stopped: bool,
+    /// Set when the current user intent (activate, backend change,
+    /// retry) is replaced by a newer one, or at shutdown. Every worker
+    /// holds the flag of the intent it serves; a set flag means it must
+    /// not install its engine.
+    pub superseded: Arc<AtomicBool>,
 }
 
 impl SharedState {
@@ -432,7 +460,15 @@ impl SharedState {
             crashes: Vec::new(),
             last_active_model: None,
             stopped: false,
+            superseded: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Starts a new intent: workers of the previous one become stale.
+    fn supersede(&mut self) -> Arc<AtomicBool> {
+        self.superseded.store(true, Ordering::Release);
+        self.superseded = Arc::new(AtomicBool::new(false));
+        Arc::clone(&self.superseded)
     }
 
     fn bump(&mut self) {
@@ -597,31 +633,47 @@ impl EngineManager {
             .ok_or_else(|| EngineError::UnknownModel {
                 id: model_id.to_string(),
             })?;
-        {
-            let state = self.inner.lock();
-            if let Some(active) = &state.active {
-                if active.model_id == model_id {
-                    return Err(EngineError::ModelActive {
-                        id: model_id.to_string(),
-                    });
-                }
-            }
-            if state
-                .switch
-                .as_ref()
-                .is_some_and(|switch| switch.target == model_id)
-            {
-                return Err(EngineError::ModelSwitching {
-                    id: model_id.to_string(),
-                });
-            }
-            if state.downloads.contains_key(model_id) {
-                return Err(EngineError::ModelDownloading {
+        // The checks and the deletion happen under one lock: an activation
+        // cannot claim the model between them (switch workers register
+        // their target under this lock before touching the file).
+        let mut state = self.inner.lock();
+        if let Some(active) = &state.active {
+            if active.model_id == model_id {
+                return Err(EngineError::ModelActive {
                     id: model_id.to_string(),
                 });
             }
         }
-        delete_model_files(&self.inner.config.models_dir, &entry).map_err(EngineError::Io)
+        // A crashed model waiting for its restart is still the active
+        // model as far as the user is concerned.
+        if matches!(state.phase, EnginePhase::Restarting { .. })
+            && state.last_active_model.as_deref() == Some(model_id)
+        {
+            return Err(EngineError::ModelActive {
+                id: model_id.to_string(),
+            });
+        }
+        if state
+            .switch
+            .as_ref()
+            .is_some_and(|switch| switch.target == model_id)
+        {
+            return Err(EngineError::ModelSwitching {
+                id: model_id.to_string(),
+            });
+        }
+        if state.downloads.contains_key(model_id) {
+            return Err(EngineError::ModelDownloading {
+                id: model_id.to_string(),
+            });
+        }
+        let result =
+            delete_model_files(&self.inner.config.models_dir, &entry).map_err(EngineError::Io);
+        // Disk truth either way: a partial failure may have removed some
+        // files, and the settings row must not keep offering Activate.
+        let install = scan_install(&self.inner.config.models_dir, &entry);
+        state.set_install(model_id, install);
+        result
     }
 
     /// Download-if-needed, verify, then switch to `model_id` (see the
@@ -664,12 +716,24 @@ impl EngineManager {
             return None;
         }
         let engine = state.active.as_ref()?;
+        // A take on another instance's engine is announced to that
+        // owner; one that is retiring the engine gets no new takes.
+        let marker = if engine.owned {
+            None
+        } else {
+            match acquire_lease_marker(&self.inner.config.state_dir, engine.key()) {
+                MarkerOutcome::Held(marker) => Some(marker),
+                MarkerOutcome::Retired => return None,
+                MarkerOutcome::Unavailable => None,
+            }
+        };
         engine.leases.fetch_add(1, Ordering::Acquire);
         Some(EngineLease {
             engine: Arc::clone(engine),
             endpoint: engine.endpoint.clone(),
             slug: engine.slug.clone(),
             model_id: engine.model_id.clone(),
+            _marker: marker,
         })
     }
 
@@ -683,6 +747,7 @@ impl EngineManager {
         {
             let mut state = self.inner.lock();
             state.stopped = true;
+            state.superseded.store(true, Ordering::Release);
             if let Some(switch) = &state.switch {
                 switch.cancel.store(true, Ordering::Release);
             }
@@ -889,26 +954,7 @@ impl Supervisor {
                 if self.inner.shutdown.load(Ordering::Acquire) {
                     return;
                 }
-                self.cancel_current_switch();
-                self.switch_token += 1;
-                let token = self.switch_token;
-                let cancel = Arc::new(AtomicBool::new(false));
-                let confirm = Arc::new(AtomicBool::new(false));
-                {
-                    let mut state = self.inner.lock();
-                    state.pending_decision = None;
-                    state.last_error = None;
-                    state.switch = Some(SwitchState {
-                        token,
-                        target: model_id.clone(),
-                        stage: SwitchStage::Loading,
-                        started: Instant::now(),
-                        cancel: Arc::clone(&cancel),
-                        confirm: Arc::clone(&confirm),
-                    });
-                    state.bump();
-                }
-                self.spawn_switch_worker(token, model_id, cancel, confirm);
+                self.start_switch(model_id, SwitchKind::Activate);
             }
             Command::Download(model_id) => self.start_download(model_id),
             Command::CancelDownload(model_id) => {
@@ -939,6 +985,8 @@ impl Supervisor {
                 state.bump();
             }
             Command::Retry => {
+                self.inner.lock().supersede();
+                self.cancel_current_switch();
                 let model_id = {
                     let mut state = self.inner.lock();
                     state.crashes.clear();
@@ -964,16 +1012,76 @@ impl Supervisor {
                 }
             }
             Command::SetBackendOverride(backend) => {
+                self.inner.lock().supersede();
                 self.cancel_current_switch();
                 self.inner.lock().backend_override = backend;
-                self.spawn_reselect_worker(backend);
+                // Selection runs here, not on a worker: commands queue
+                // behind it, so a later activation always sees (and
+                // spawns from) the new backend, and no second worker can
+                // race the reload below.
+                match try_select_backend(
+                    self.config.engine_dir.as_deref(),
+                    backend,
+                    self.config.icd_dirs.as_deref(),
+                ) {
+                    Err(failure) => {
+                        // The old engine keeps serving; say why the toggle
+                        // did not take effect.
+                        self.inner.lock().set_last_error(failure.to_string());
+                    }
+                    Ok(selection) => {
+                        apply_selection(&self.inner, selection);
+                        // Restart the active model on the new engine; the
+                        // old one drains (leases are honored).
+                        let active = self
+                            .inner
+                            .lock()
+                            .active
+                            .as_ref()
+                            .map(|engine| engine.model_id.clone());
+                        if let Some(model_id) = active {
+                            self.start_switch(model_id, SwitchKind::Reload);
+                        }
+                    }
+                }
             }
         }
     }
 
+    /// Registers and spawns a switch worker for a new user intent; any
+    /// running switch is cancelled and its intent superseded first.
+    fn start_switch(&mut self, model_id: String, kind: SwitchKind) {
+        // Supersede first: a worker restoring the previous engine only
+        // listens to that flag, and must stop before the new switch runs.
+        self.inner.lock().supersede();
+        self.cancel_current_switch();
+        self.switch_token += 1;
+        let token = self.switch_token;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let confirm = Arc::new(AtomicBool::new(false));
+        let superseded = {
+            let mut state = self.inner.lock();
+            let superseded = state.supersede();
+            state.pending_decision = None;
+            state.last_error = None;
+            state.switch = Some(SwitchState {
+                token,
+                target: model_id.clone(),
+                stage: SwitchStage::Loading,
+                started: Instant::now(),
+                cancel: Arc::clone(&cancel),
+                confirm: Arc::clone(&confirm),
+            });
+            state.bump();
+            superseded
+        };
+        self.spawn_switch_worker(token, model_id, kind, cancel, confirm, superseded);
+    }
+
     /// Cancels the running switch (if any) and waits briefly for its
     /// worker to kill its incoming engine. A worker that outlives the
-    /// wait is harmless: its token no longer matches any state.
+    /// wait is harmless: `cut_over` checks its cancel flag under the
+    /// state lock, so it can no longer install its engine.
     fn cancel_current_switch(&mut self) {
         if let Some(handle) = self.switch.take() {
             handle.cancel.store(true, Ordering::Release);
@@ -981,9 +1089,14 @@ impl Supervisor {
             while !handle.thread.is_finished() && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(25));
             }
-            if handle.thread.is_finished() {
-                let _ = handle.thread.join();
+            if !handle.thread.is_finished() {
+                // Still winding down, e.g. restoring the previous engine
+                // after a cancelled drain swap: it clears its own entry
+                // when done, and stays reachable for a later cancel.
+                self.switch = Some(handle);
+                return;
             }
+            let _ = handle.thread.join();
             let mut state = self.inner.lock();
             if state
                 .switch
@@ -1012,15 +1125,26 @@ impl Supervisor {
             }
         }
 
-        // Due restarts.
+        // Due restarts. A running switch decides what serves next: the
+        // restart waits for it, and is dropped once the switch (or anyone
+        // else) installed an engine — it must never revert a completed
+        // switch.
         let due = self
             .pending_restart
             .as_ref()
             .filter(|restart| restart.at <= Instant::now())
             .map(|restart| restart.model_id.clone());
         if let Some(model_id) = due {
-            self.pending_restart = None;
-            self.launch_model(&model_id);
+            let (switching, has_active) = {
+                let state = self.inner.lock();
+                (state.switch.is_some(), state.active.is_some())
+            };
+            if has_active {
+                self.pending_restart = None;
+            } else if !switching {
+                self.pending_restart = None;
+                self.launch_model(&model_id);
+            }
         }
 
         // Join finished download threads (their state cleanup is done by
@@ -1074,22 +1198,28 @@ impl Supervisor {
     }
 
     fn poll_attached(&mut self, active: &Arc<ActiveEngine>) {
-        let healthy = self
-            .http
-            .get_text(&format!("{}/health", active.endpoint))
-            .ok()
-            .and_then(|body| HealthSnapshot::parse(&body).ok())
-            .is_some_and(|health| health.model == active.slug);
+        // The owner retiring the engine (it switched away) means no new
+        // take may start on it: move on right away. Takes already open
+        // hold their own lease and finish there.
+        let retired = is_retired(&self.config.state_dir, active.key());
+        let healthy = !retired
+            && self
+                .http
+                .get_text(&format!("{}/health", active.endpoint))
+                .ok()
+                .and_then(|body| HealthSnapshot::parse(&body).ok())
+                .is_some_and(|health| health.model == active.slug);
         if healthy {
             self.attach_failures = 0;
             return;
         }
         self.attach_failures += 1;
-        if self.attach_failures < ATTACH_FAILURES_BEFORE_TAKEOVER {
+        if !retired && self.attach_failures < ATTACH_FAILURES_BEFORE_TAKEOVER {
             return;
         }
         self.attach_failures = 0;
-        // The sidecar we attached to is gone: take over (spawn our own).
+        // The sidecar we attached to is gone: take over (spawn our own)
+        // through the restart path, which defers to a running switch.
         let model_id = active.model_id.clone();
         {
             let mut state = self.inner.lock();
@@ -1102,7 +1232,10 @@ impl Supervisor {
             }
             state.set_phase(EnginePhase::Starting);
         }
-        self.launch_model(&model_id);
+        self.pending_restart = Some(RestartState {
+            model_id,
+            at: Instant::now(),
+        });
     }
 
     /// Brings `model_id` up: attach to a matching shared sidecar when
@@ -1208,16 +1341,21 @@ impl Supervisor {
                                 endpoint,
                                 Some(device.clone()),
                             );
-                            let _ = write_registration(
-                                &self.config.state_dir,
-                                &registration_for(&engine, &engine_path, &gguf),
-                            );
-                            release_slot(lock);
                             {
                                 let mut state = self.inner.lock();
+                                if state.active.is_some() {
+                                    // A switch installed its engine while
+                                    // this one started: it wins.
+                                    drop(state);
+                                    engine.stop();
+                                    release_slot(lock);
+                                    return;
+                                }
                                 state.active = Some(Arc::clone(&engine));
                                 state.set_phase(EnginePhase::Ready);
                             }
+                            register_engine(&self.inner, &engine, &engine_path, &gguf);
+                            release_slot(lock);
                             update_device_views(&self.inner, device.clone());
                             check_runtime_device_truth(&self.inner, &device);
                             return;
@@ -1280,6 +1418,9 @@ impl Supervisor {
             attached.device,
         );
         let mut state = self.inner.lock();
+        if state.active.is_some() {
+            return;
+        }
         state.active = Some(engine);
         state.set_phase(EnginePhase::Ready);
     }
@@ -1289,6 +1430,14 @@ impl Supervisor {
     fn try_attach(&self, entry: &CatalogEntry) -> Option<Attached> {
         let registration = crate::engine::registry::read_registration(&self.config.state_dir)?;
         if registration.model_id != entry.id || registration.slug != entry.slug {
+            return None;
+        }
+        let key = EngineKey {
+            pid: registration.pid,
+            port: registration.port,
+        };
+        if is_retired(&self.config.state_dir, key) {
+            // Its owner is draining it; it takes no new work.
             return None;
         }
         let endpoint = format!("http://127.0.0.1:{}", registration.port);
@@ -1310,8 +1459,10 @@ impl Supervisor {
         match try_spawn_lock(&self.config.state_dir) {
             Ok(LockOutcome::Acquired(lock)) => Some(lock),
             Ok(LockOutcome::HeldElsewhere) => {
-                // Poll the registry for the other instance's sidecar; if
-                // it never appears, force the (stale or hopeless) lock.
+                // Poll the registry for the other instance's sidecar. If
+                // it never appears, try the lock once more: `try_spawn_lock`
+                // replaces it only when it is stale, never a live one, and
+                // a still-held lock means spawning without it.
                 let deadline = Instant::now() + Duration::from_secs(60);
                 while Instant::now() < deadline {
                     if self.inner.shutdown.load(Ordering::Acquire) {
@@ -1322,7 +1473,6 @@ impl Supervisor {
                     }
                     std::thread::sleep(Duration::from_millis(250));
                 }
-                let _ = std::fs::remove_file(self.config.state_dir.join(SPAWN_LOCK_FILE));
                 match try_spawn_lock(&self.config.state_dir) {
                     Ok(LockOutcome::Acquired(lock)) => Some(lock),
                     _ => None,
@@ -1363,14 +1513,18 @@ impl Supervisor {
         &mut self,
         token: u64,
         target: String,
+        kind: SwitchKind,
         cancel: Arc<AtomicBool>,
         confirm: Arc<AtomicBool>,
+        superseded: Arc<AtomicBool>,
     ) {
         let ctx = SwitchCtx {
             token,
             target,
+            kind,
             cancel: Arc::clone(&cancel),
             confirm,
+            superseded,
             inner: Arc::clone(&self.inner),
         };
         let thread = std::thread::Builder::new()
@@ -1382,15 +1536,6 @@ impl Supervisor {
             cancel,
             thread,
         });
-    }
-
-    fn spawn_reselect_worker(&mut self, backend: Option<Backend>) {
-        let inner = Arc::clone(&self.inner);
-        let config = self.config.clone();
-        std::thread::Builder::new()
-            .name("starling-engine-reselect".to_string())
-            .spawn(move || run_reselect(inner, config, backend))
-            .expect("reselect worker spawns");
     }
 
     fn cleanup(&mut self) {
@@ -1437,20 +1582,33 @@ fn map_ready_error(error: ReadyError) -> EngineFailure {
     }
 }
 
+/// Names `engine` in the shared registry. A failed write only costs
+/// sharing (a second window starts its own engine), so it is a notice.
+fn register_engine(
+    inner: &Arc<Inner>,
+    engine: &ActiveEngine,
+    engine_path: &std::path::Path,
+    gguf: &std::path::Path,
+) {
+    if let Err(error) = write_registration(
+        &inner.config.state_dir,
+        &registration_for(engine, engine_path, gguf),
+    ) {
+        inner.lock().add_notice(format!(
+            "Could not record the running engine for other Starling windows ({error}); \
+             each window will start its own engine."
+        ));
+    }
+}
+
 fn registration_for(
     engine: &ActiveEngine,
     engine_path: &std::path::Path,
     gguf: &std::path::Path,
 ) -> SidecarRegistration {
-    let port = engine
-        .endpoint
-        .rsplit(':')
-        .next()
-        .and_then(|port| port.parse::<u16>().ok())
-        .unwrap_or(0);
     SidecarRegistration {
         pid: engine.pid,
-        port,
+        port: engine.port(),
         slug: engine.slug.clone(),
         model_id: engine.model_id.clone(),
         gguf: gguf.display().to_string(),
@@ -1581,17 +1739,51 @@ fn report_download_progress(inner: &Arc<Inner>, id: &str, done: u64, total: u64)
 // Switch worker
 // ---------------------------------------------------------------------------
 
+/// What a switch worker was started for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SwitchKind {
+    /// The user picked a model.
+    Activate,
+    /// The backend changed: restart the active model on the new engine.
+    Reload,
+}
+
 struct SwitchCtx {
     token: u64,
     target: String,
+    kind: SwitchKind,
+    /// Set by the Cancel action, by a newer intent, and at shutdown.
     cancel: Arc<AtomicBool>,
     confirm: Arc<AtomicBool>,
+    /// Set only when a newer intent replaced this one (or at shutdown):
+    /// unlike `cancel`, a user's Cancel does not set it, so recovery
+    /// after a cancel (restoring the previous engine) keys off it.
+    superseded: Arc<AtomicBool>,
     inner: Arc<Inner>,
 }
 
 impl SwitchCtx {
     fn cancelled(&self) -> bool {
-        self.cancel.load(Ordering::Acquire) || self.inner.shutdown.load(Ordering::Acquire)
+        self.cancel.load(Ordering::Acquire) || self.superseded()
+    }
+
+    fn superseded(&self) -> bool {
+        self.superseded.load(Ordering::Acquire) || self.inner.shutdown.load(Ordering::Acquire)
+    }
+
+    /// The context for bringing the previous engine back: the user's
+    /// Cancel is what triggered it, so only a newer intent or shutdown
+    /// may stop it.
+    fn recovery(&self) -> SwitchCtx {
+        SwitchCtx {
+            token: self.token,
+            target: self.target.clone(),
+            kind: self.kind,
+            cancel: Arc::clone(&self.superseded),
+            confirm: Arc::clone(&self.confirm),
+            superseded: Arc::clone(&self.superseded),
+            inner: Arc::clone(&self.inner),
+        }
     }
 
     fn lock(&self) -> MutexGuard<'_, SharedState> {
@@ -1656,6 +1848,10 @@ fn run_switch(ctx: SwitchCtx) {
         ctx.end_switch();
         return;
     };
+    if ctx.kind == SwitchKind::Reload {
+        run_reload(&ctx, &entry);
+        return;
+    }
 
     // Already serving the target: nothing to do.
     {
@@ -1889,7 +2085,13 @@ fn spawn_incoming(
             }
         };
         let ready = sidecar.wait_ready(&entry.slug, Some(&ctx.cancel), &stage);
-        ctx.lock().incoming_pid = None;
+        {
+            // Another (newer) switch may already sample its own sidecar.
+            let mut state = ctx.lock();
+            if state.incoming_pid == Some(sidecar.pid()) {
+                state.incoming_pid = None;
+            }
+        }
         match ready {
             Ok(health) => {
                 let endpoint = sidecar
@@ -1959,6 +2161,28 @@ fn sleep_cancelable_ctx(duration: Duration, ctx: &SwitchCtx) -> bool {
     true
 }
 
+/// What a completed switch records in `last_switch`.
+struct CutoverReport {
+    mode: SwapMode,
+    started: Instant,
+    /// Overrides the report's origin (the drain path stopped the old
+    /// engine before the cutover, so there is nothing left to replace).
+    from: Option<String>,
+    peak_rss_bytes: Option<u64>,
+}
+
+impl CutoverReport {
+    fn new(mode: SwapMode, started: Instant, from: Option<String>, sampler: &RssSampler) -> Self {
+        stop_sampler(sampler);
+        CutoverReport {
+            mode,
+            started,
+            from,
+            peak_rss_bytes: sampler_peak(sampler),
+        }
+    }
+}
+
 /// The rolling path: spawn incoming while the old engine serves, cut
 /// over atomically, then drain the old one (#363). Without an old
 /// engine (first activation) incoming crashes are retried — that is the
@@ -1971,37 +2195,77 @@ fn run_rolling_swap(ctx: &SwitchCtx, entry: &CatalogEntry) {
     match spawn_incoming(ctx, entry, !has_old) {
         Ok(engine) => {
             ctx.set_stage(SwitchStage::CuttingOver);
-            cut_over(
-                ctx,
-                engine,
-                entry,
-                SwapMode::Rolling,
-                started,
-                sampler,
-                None,
-            );
+            let report = CutoverReport::new(SwapMode::Rolling, started, None, &sampler);
+            if !cut_over(ctx, engine, entry, Some(report)) {
+                // Cancelled at the last moment: the old engine (if any)
+                // never stopped serving.
+                recover_if_idle(ctx, None);
+            }
         }
         Err(SwitchSpawnError::Cancelled) => {
             stop_sampler(&sampler);
-            clear_incoming(ctx);
-            ctx.end_switch();
+            recover_if_idle(ctx, None);
         }
         Err(SwitchSpawnError::CrashLooped) => {
             stop_sampler(&sampler);
-            clear_incoming(ctx);
             // The phase is already Failed(CrashLoop) from the retry loop.
-            ctx.end_switch();
         }
         Err(SwitchSpawnError::Failed(message)) => {
             stop_sampler(&sampler);
-            clear_incoming(ctx);
-            // The old engine keeps serving; say why the switch stopped.
-            ctx.set_last_error(format!(
-                "the new engine did not start ({message}); the previous model keeps serving"
-            ));
-            ctx.end_switch();
+            if ctx.lock().active.is_some() {
+                // The old engine keeps serving; say why the switch stopped.
+                ctx.set_last_error(format!(
+                    "the new engine did not start ({message}); the previous model keeps serving"
+                ));
+            } else {
+                recover_if_idle(ctx, Some(&message));
+            }
         }
     }
+    ctx.end_switch();
+}
+
+/// After a rolling switch ended without installing its engine, nothing
+/// may be serving: a first activation, a crashed old engine, or an
+/// earlier drain swap that unloaded its engine before this switch
+/// superseded it. Bring the last model back, or say plainly why nothing
+/// is loaded. A superseded switch leaves this to the newer intent.
+fn recover_if_idle(ctx: &SwitchCtx, failure: Option<&str>) {
+    if ctx.superseded() {
+        return;
+    }
+    let last = {
+        let state = ctx.lock();
+        if state.active.is_some() {
+            return;
+        }
+        state.last_active_model.clone()
+    };
+    let previous = last.filter(|id| *id != ctx.target && model_installed(ctx, id));
+    match previous {
+        Some(previous) => restore_previous(ctx, &previous, failure),
+        None => {
+            let mut state = ctx.lock();
+            if state.active.is_none() {
+                match failure {
+                    Some(message) => {
+                        state.set_last_error(format!("the new engine did not start ({message})"));
+                        state.set_phase(EnginePhase::Failed(EngineFailure::LoadFailed(
+                            message.to_string(),
+                        )));
+                    }
+                    None => state.set_phase(EnginePhase::NoModel),
+                }
+            }
+        }
+    }
+}
+
+fn model_installed(ctx: &SwitchCtx, id: &str) -> bool {
+    matches!(
+        ctx.lock().install.get(id),
+        Some(InstallState::Installed) | Some(InstallState::NeedsVerification)
+    )
 }
 
 fn run_drain_swap(
@@ -2020,7 +2284,9 @@ fn run_drain_swap(
         });
         state.bump();
     }
-    // Wait for the user's answer (or cancellation).
+    // Wait for the user's answer (or cancellation). An unanswered
+    // question does not pin the switch forever.
+    let asked = Instant::now();
     loop {
         if ctx.cancelled() {
             ctx.end_switch();
@@ -2028,6 +2294,14 @@ fn run_drain_swap(
         }
         if ctx.confirm.load(Ordering::Acquire) {
             break;
+        }
+        if asked.elapsed() >= DRAIN_DECISION_CAP {
+            ctx.set_last_error(format!(
+                "the switch to {} was not confirmed and was cancelled; the current model keeps serving",
+                entry.label
+            ));
+            ctx.end_switch();
+            return;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -2041,6 +2315,19 @@ fn run_drain_swap(
         }
         state.bump();
     }
+    // Other app instances attached to this engine may hold takes too:
+    // retire it first (no new foreign take starts on it), then wait for
+    // both our leases and theirs.
+    let state_dir = ctx.inner.config.state_dir.clone();
+    let old_key = ctx
+        .lock()
+        .active
+        .as_ref()
+        .filter(|engine| engine.owned)
+        .map(|engine| engine.key());
+    if let Some(key) = old_key {
+        retire_engine(&state_dir, key);
+    }
     // Wait for the old engine's leases to drop (hard cap). The zero check
     // and taking the engine out of `active` happen under one lock: `lease()`
     // takes the same lock, so a take cannot start on the old engine between
@@ -2048,9 +2335,15 @@ fn run_drain_swap(
     let deadline = Instant::now() + DRAIN_HARD_CAP;
     let old = loop {
         if ctx.cancelled() {
+            if let Some(key) = old_key {
+                unretire_engine(&state_dir, key);
+            }
             ctx.end_switch();
             return;
         }
+        let foreign = old_key
+            .map(|key| foreign_leases(&state_dir, key))
+            .unwrap_or(0);
         {
             let mut state = ctx.lock();
             let leases = state
@@ -2058,7 +2351,7 @@ fn run_drain_swap(
                 .as_ref()
                 .map(|engine| engine.leases.load(Ordering::Acquire))
                 .unwrap_or(0);
-            if leases == 0 || Instant::now() >= deadline {
+            if (leases == 0 && foreign == 0) || Instant::now() >= deadline {
                 break state.active.take();
             }
         }
@@ -2069,116 +2362,161 @@ fn run_drain_swap(
     if let Some(old) = &old {
         old.stop();
     }
+    if let Some(key) = old_key {
+        clear_engine_leases(&state_dir, key);
+    }
     let previous_id = old.as_ref().map(|engine| engine.model_id.clone());
     drop(old);
     ctx.phase_when_no_active(EnginePhase::Starting);
 
     let sampler = start_rss_sampler(ctx);
     ctx.set_stage(SwitchStage::Loading);
-    match spawn_incoming(ctx, entry, false) {
+    let failure = match spawn_incoming(ctx, entry, false) {
         Ok(engine) => {
             ctx.set_stage(SwitchStage::CuttingOver);
-            cut_over(
-                ctx,
-                engine,
-                entry,
-                SwapMode::Drain,
-                started,
-                sampler,
-                previous_id.clone(),
-            );
+            let report =
+                CutoverReport::new(SwapMode::Drain, started, previous_id.clone(), &sampler);
+            if cut_over(ctx, engine, entry, Some(report)) {
+                return;
+            }
+            // Cancelled at the cutover: same as cancelled while loading.
+            None
         }
         Err(error) => {
             stop_sampler(&sampler);
-            clear_incoming(ctx);
-            let message = match &error {
-                SwitchSpawnError::Cancelled => {
-                    ctx.end_switch();
-                    return;
+            match error {
+                SwitchSpawnError::Cancelled => None,
+                SwitchSpawnError::CrashLooped => Some("the new engine kept crashing".to_string()),
+                SwitchSpawnError::Failed(message) => Some(message),
+            }
+        }
+    };
+    // The app is never left without an engine: whether the new one
+    // failed or the user cancelled after the old one stopped, restart the
+    // previous model. Only a newer intent (or shutdown) skips this — it
+    // decides what serves next.
+    if !ctx.superseded() {
+        match previous_id {
+            Some(previous_id) => restore_previous(ctx, &previous_id, failure.as_deref()),
+            None => recover_if_idle(ctx, failure.as_deref()),
+        }
+    }
+    ctx.end_switch();
+}
+
+/// Brings `previous_id` back up after a switch unloaded it (or it was
+/// lost) and the switch did not complete. Runs under the recovery
+/// context: the Cancel that led here must not cancel the recovery too.
+fn restore_previous(ctx: &SwitchCtx, previous_id: &str, failure: Option<&str>) {
+    let Some(entry) = ctx.inner.entry(previous_id) else {
+        return;
+    };
+    let recovery = ctx.recovery();
+    recovery.set_stage(SwitchStage::Loading);
+    match spawn_incoming(&recovery, &entry, false) {
+        Ok(engine) => {
+            // Not a switch: the report keeps describing the last real one.
+            if cut_over(&recovery, engine, &entry, None) {
+                if let Some(failure) = failure {
+                    ctx.set_last_error(format!(
+                        "the new engine failed ({failure}); the previous model was restarted"
+                    ));
                 }
-                SwitchSpawnError::CrashLooped => "the new engine kept crashing".to_string(),
-                SwitchSpawnError::Failed(message) => message.clone(),
-            };
-            // The app is never left without an engine: restart the
-            // previous model and report.
-            restart_previous(ctx, previous_id.as_deref(), &message);
+            }
+        }
+        Err(_) => {
+            if recovery.superseded() {
+                return;
+            }
+            let mut state = ctx.lock();
+            if state.active.is_none() {
+                let reason = match failure {
+                    Some(failure) => format!(
+                        "could not restart the previous model ({previous_id}) after the new engine failed ({failure})"
+                    ),
+                    None => format!(
+                        "could not restart the previous model ({previous_id}) after the switch was cancelled"
+                    ),
+                };
+                state.set_last_error(reason.clone());
+                state.set_phase(EnginePhase::Failed(EngineFailure::LoadFailed(reason)));
+            }
         }
     }
 }
 
-/// Drain-path failure recovery: bring the previous model back up.
-fn restart_previous(ctx: &SwitchCtx, previous_id: Option<&str>, failure: &str) {
-    ctx.set_last_error(format!(
-        "the new engine failed ({failure}); the previous model was restarted"
-    ));
-    let Some(previous_id) = previous_id else {
-        ctx.end_switch();
-        return;
-    };
-    let Some(entry) = ctx.inner.entry(previous_id) else {
-        ctx.end_switch();
-        return;
-    };
-    match spawn_incoming(ctx, &entry, false) {
+/// Restarts the active model on the newly selected backend (the CPU
+/// toggle). The old engine keeps serving until the cutover and then
+/// drains. A newer activation cancels this like any switch.
+fn run_reload(ctx: &SwitchCtx, entry: &CatalogEntry) {
+    let started = ctx.switch_started();
+    let sampler = start_rss_sampler(ctx);
+    ctx.set_stage(SwitchStage::Loading);
+    match spawn_incoming(ctx, entry, false) {
         Ok(engine) => {
-            let started = ctx.switch_started();
-            let sampler = start_rss_sampler(ctx);
-            cut_over(
-                ctx,
-                engine,
-                &entry,
-                SwapMode::Drain,
-                started,
-                sampler,
-                Some(previous_id.to_string()),
+            ctx.set_stage(SwitchStage::CuttingOver);
+            let report = CutoverReport::new(SwapMode::Rolling, started, None, &sampler);
+            cut_over(ctx, engine, entry, Some(report));
+        }
+        Err(SwitchSpawnError::Cancelled) => stop_sampler(&sampler),
+        Err(_) => {
+            stop_sampler(&sampler);
+            ctx.set_last_error(
+                "the engine could not restart on the new backend; the previous engine keeps serving"
+                    .to_string(),
             );
         }
-        Err(_) => {
-            clear_incoming(ctx);
-            let mut state = ctx.lock();
-            if state.active.is_none() {
-                state.set_phase(EnginePhase::Failed(EngineFailure::LoadFailed(format!(
-                    "could not restart the previous model ({previous_id}) after the new engine failed ({failure})"
-                ))));
-            }
-            drop(state);
-            ctx.end_switch();
-        }
     }
+    ctx.end_switch();
 }
 
 /// Makes `engine` the active one: new leases point at it, the registry
-/// names it, the previous engine (if any) drains. `from` overrides the
-/// report's origin (the drain path stopped the old engine before the
-/// cutover, so there is nothing left to replace).
+/// names it, the previous engine (if any) drains. Returns `false`, with
+/// `engine` stopped, when the switch was cancelled or superseded: the
+/// check runs under the state lock, and a newer intent marks this one
+/// superseded under the same lock, so a stale worker can never replace
+/// a newer engine.
 fn cut_over(
     ctx: &SwitchCtx,
     engine: Arc<ActiveEngine>,
     entry: &CatalogEntry,
-    mode: SwapMode,
-    started: Instant,
-    sampler: RssSampler,
-    from: Option<String>,
-) {
-    stop_sampler(&sampler);
+    report: Option<CutoverReport>,
+) -> bool {
     let engine_path = ctx.lock().selection.as_ref().map(|s| s.path.clone());
     let gguf = ctx.inner.config.models_dir.join(&entry.file_name);
     let old = {
         let mut state = ctx.lock();
+        if state
+            .switch_incoming
+            .as_ref()
+            .is_some_and(|incoming| Arc::ptr_eq(incoming, &engine))
+        {
+            state.switch_incoming = None;
+        }
+        if ctx.cancelled() {
+            state.bump();
+            drop(state);
+            engine.stop();
+            return false;
+        }
         let old = state.active.replace(Arc::clone(&engine));
         if let Some(old) = &old {
             state.draining.push(Arc::clone(old));
         }
-        state.switch_incoming = None;
+        state.last_active_model = Some(entry.id.clone());
         state.set_phase(EnginePhase::Ready);
-        let from = from.or_else(|| old.as_ref().map(|old| old.model_id.clone()));
-        state.last_switch = Some(SwitchReport {
-            from,
-            to: entry.id.clone(),
-            duration: started.elapsed(),
-            peak_rss_bytes: sampler_peak(&sampler),
-            mode,
-        });
+        if let Some(report) = report {
+            let from = report
+                .from
+                .or_else(|| old.as_ref().map(|old| old.model_id.clone()));
+            state.last_switch = Some(SwitchReport {
+                from,
+                to: entry.id.clone(),
+                duration: report.started.elapsed(),
+                peak_rss_bytes: report.peak_rss_bytes,
+                mode: report.mode,
+            });
+        }
         if state
             .switch
             .as_ref()
@@ -2190,10 +2528,7 @@ fn cut_over(
         old
     };
     if let Some(path) = engine_path {
-        let _ = write_registration(
-            &ctx.inner.config.state_dir,
-            &registration_for(&engine, &path, &gguf),
-        );
+        register_engine(&ctx.inner, &engine, &path, &gguf);
     }
     if let Some(old) = old {
         spawn_drain_watcher(Arc::clone(&ctx.inner), old);
@@ -2207,27 +2542,38 @@ fn cut_over(
         update_device_views(&ctx.inner, device.clone());
         check_runtime_device_truth(&ctx.inner, &device);
     }
+    true
 }
 
-fn clear_incoming(ctx: &SwitchCtx) {
-    let incoming = ctx.lock().switch_incoming.take();
-    if let Some(incoming) = incoming {
-        incoming.stop();
-    }
-}
-
-/// Watches a draining engine: stop it once its last lease drops, or at
-/// the hard cap. Runs on its own thread so the supervisor never blocks
-/// a drain on it.
+/// Watches a draining engine: stop it once its last lease drops (ours
+/// and those of other instances attached to it), or at the hard cap.
+/// Runs on its own thread so the supervisor never blocks a drain on it.
 fn spawn_drain_watcher(inner: Arc<Inner>, engine: Arc<ActiveEngine>) {
     std::thread::Builder::new()
         .name("starling-engine-drain".to_string())
         .spawn(move || {
+            let state_dir = inner.config.state_dir.clone();
+            // Only the owner stops the engine, so only the owner retires
+            // it and waits for other instances' takes.
+            let key = engine.owned.then(|| engine.key());
+            if let Some(key) = key {
+                retire_engine(&state_dir, key);
+            }
             let started = Instant::now();
-            while engine.leases.load(Ordering::Acquire) > 0 && started.elapsed() < DRAIN_HARD_CAP {
+            while started.elapsed() < DRAIN_HARD_CAP {
+                let local = engine.leases.load(Ordering::Acquire);
+                let foreign = key
+                    .map(|key| foreign_leases(&state_dir, key))
+                    .unwrap_or(0);
+                if local == 0 && foreign == 0 {
+                    break;
+                }
                 std::thread::sleep(Duration::from_millis(200));
             }
             engine.stop();
+            if let Some(key) = key {
+                clear_engine_leases(&state_dir, key);
+            }
             let mut state = inner.lock();
             state
                 .draining
@@ -2301,65 +2647,6 @@ fn stop_sampler(sampler: &RssSampler) {
 fn sampler_peak(sampler: &RssSampler) -> Option<u64> {
     let peak = sampler.max.load(Ordering::Relaxed);
     (peak > 0).then_some(peak)
-}
-
-// ---------------------------------------------------------------------------
-// Backend re-selection worker
-// ---------------------------------------------------------------------------
-
-fn run_reselect(inner: Arc<Inner>, config: EngineConfig, backend: Option<Backend>) {
-    match try_select_backend(
-        config.engine_dir.as_deref(),
-        backend,
-        config.icd_dirs.as_deref(),
-    ) {
-        Err(failure) => {
-            // The old engine keeps serving; surface why the toggle did
-            // not take effect.
-            inner.lock().set_last_error(failure.to_string());
-        }
-        Ok(selection) => {
-            apply_selection(&inner, selection);
-            // Restart the active model on the new engine, draining the
-            // old one (leases are honored).
-            let active = inner.lock().active.as_ref().map(Arc::clone);
-            if let Some(active) = active {
-                if let Some(entry) = inner.entry(&active.model_id) {
-                    // Token 0 matches no live switch entry, so this
-                    // worker never mutates a real switch's stage.
-                    let ctx = SwitchCtx {
-                        token: 0,
-                        target: entry.id.clone(),
-                        cancel: Arc::new(AtomicBool::new(false)),
-                        confirm: Arc::new(AtomicBool::new(false)),
-                        inner: Arc::clone(&inner),
-                    };
-                    match spawn_incoming(&ctx, &entry, false) {
-                        Ok(engine) => {
-                            let started = Instant::now();
-                            let sampler = start_rss_sampler(&ctx);
-                            cut_over(
-                                &ctx,
-                                engine,
-                                &entry,
-                                SwapMode::Rolling,
-                                started,
-                                sampler,
-                                None,
-                            );
-                        }
-                        Err(_) => {
-                            clear_incoming(&ctx);
-                            inner.lock().set_last_error(
-                                "the engine could not restart on the new backend; the previous engine keeps serving"
-                                    .to_string(),
-                            );
-                        }
-                    }
-                }
-            }
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2476,6 +2763,7 @@ mod tests {
             endpoint: engine.endpoint.clone(),
             slug: engine.slug.clone(),
             model_id: engine.model_id.clone(),
+            _marker: None,
         };
         assert_eq!(lease.endpoint(), "http://127.0.0.1:1234");
         assert_eq!(lease.slug(), "parakeet");

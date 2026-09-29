@@ -76,6 +76,13 @@ def bundled_engines_errors(desktop_workflow: str, prepare: str,
     ]
     if any(engines is None for _, engines in sources):
         return errors
+    # A duplicated entry inside one list would survive the set comparison
+    # below (sets deduplicate) while still being wrong — a bundle list must
+    # name each backend exactly once.
+    for name, engines in sources:
+        duplicates = sorted({engine for engine in engines if engines.count(engine) > 1})
+        if duplicates:
+            errors.append(f"{name}: duplicate engine entries: {duplicates}")
     sets = [set(engines) for _, engines in sources]
     if not sets[0] or any(engine_set != sets[0] for engine_set in sets[1:]):
         errors.append(

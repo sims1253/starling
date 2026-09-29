@@ -188,20 +188,23 @@ pub fn to_hex(bytes: &[u8]) -> String {
     out
 }
 
-/// Verifies an engine file against its expected hex digest. A missing
-/// file, unreadable file, or digest mismatch all yield
-/// [`EngineFailure::ChecksumMismatch`] — an unverifiable engine is never
-/// run (#362 acceptance: "Checksums cover the bundled engines").
+/// Verifies an engine file against its expected hex digest. A missing or
+/// unreadable file is a load failure carrying the io error text — it
+/// says what is wrong with the disk, not that the bundle is corrupt;
+/// only a genuine digest mismatch is a [`EngineFailure::ChecksumMismatch`]
+/// — an unverifiable engine is never run (#362 acceptance: "Checksums
+/// cover the bundled engines").
 pub fn verify_engine(path: &Path, expected_hex: &str) -> Result<(), EngineFailure> {
     let file = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.display().to_string());
-    let mismatch = || EngineFailure::ChecksumMismatch { file: file.clone() };
     match sha256_file(path) {
         Ok(actual) if actual.eq_ignore_ascii_case(expected_hex) => Ok(()),
-        Ok(_) => Err(mismatch()),
-        Err(_) => Err(mismatch()),
+        Ok(_) => Err(EngineFailure::ChecksumMismatch { file }),
+        Err(error) => Err(EngineFailure::LoadFailed(format!(
+            "could not read {file} to verify its checksum: {error}"
+        ))),
     }
 }
 
@@ -317,11 +320,15 @@ mod tests {
             }
             other => panic!("expected ChecksumMismatch, got {other:?}"),
         }
-        // Missing file: same failure class, never a run.
-        assert!(matches!(
-            verify_engine(&dir.path().join("absent"), &good),
-            Err(EngineFailure::ChecksumMismatch { .. })
-        ));
+        // An unreadable/missing file is a load failure naming the io
+        // error, not a checksum verdict about the bundle.
+        match verify_engine(&dir.path().join("absent"), &good) {
+            Err(EngineFailure::LoadFailed(message)) => {
+                assert!(message.contains("absent"), "got: {message}");
+                assert!(message.contains("could not read"), "got: {message}");
+            }
+            other => panic!("expected LoadFailed, got {other:?}"),
+        }
     }
 
     #[test]

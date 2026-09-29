@@ -347,7 +347,7 @@ impl Sidecar {
         // noise (the server keeps stdout for machine lines only).
         let (announce_tx, announce_rx) = mpsc::channel::<u16>();
         if let Some(stdout) = child.stdout.take() {
-            std::thread::Builder::new()
+            let reader = std::thread::Builder::new()
                 .name("starling-engine-stdout".into())
                 .spawn(move || {
                     let mut reader = BufReader::new(stdout);
@@ -357,29 +357,28 @@ impl Sidecar {
                         match reader.read_line(&mut line) {
                             Ok(0) | Err(_) => break,
                             Ok(_) => {
-                                if let Some(rest) =
-                                    line.trim().strip_prefix("STARLING_SERVE_LISTENING ")
-                                {
-                                    if let Some(port) = rest
-                                        .rsplit(':')
-                                        .next()
-                                        .and_then(|port| port.parse::<u16>().ok())
-                                    {
-                                        let _ = announce_tx.send(port);
-                                    }
+                                if let Some(port) = announce_port(&line) {
+                                    let _ = announce_tx.send(port);
                                 }
                             }
                         }
                     }
-                })
-                .map_err(|error| format!("could not start the announce reader: {error}"))?;
+                });
+            if let Err(error) = reader {
+                // The child is running with nobody left to watch it: kill
+                // and reap before failing, or a failed spawn would leak a
+                // server holding the model in memory.
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("could not start the announce reader: {error}"));
+            }
         }
 
         // Stderr reader: ring buffer + shared log file.
         let stderr_ring = Arc::new(Mutex::new(StderrRing::default()));
         if let Some(stderr) = child.stderr.take() {
             let ring = Arc::clone(&stderr_ring);
-            std::thread::Builder::new()
+            let reader = std::thread::Builder::new()
                 .name("starling-engine-stderr".into())
                 .spawn(move || {
                     let mut reader = BufReader::new(stderr);
@@ -398,8 +397,12 @@ impl Sidecar {
                             }
                         }
                     }
-                })
-                .map_err(|error| format!("could not start the stderr reader: {error}"))?;
+                });
+            if let Err(error) = reader {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("could not start the stderr reader: {error}"));
+            }
         }
 
         Ok(Sidecar {
@@ -624,12 +627,31 @@ impl Sidecar {
     /// Stops the process: SIGTERM, up to 1.5 s grace, then SIGKILL
     /// (Unix) / `kill()` (Windows); always reaps. Idempotent and safe to
     /// call from any thread.
+    ///
+    /// The raw-pid signals are sent only while this sidecar's `Child` is
+    /// un-reaped: once another thread reaps it ([`Sidecar::exited_status`]
+    /// empties the slot), the pid can be recycled to an unrelated process,
+    /// and signaling it would hit that process instead of the engine.
+    /// Taking the child out of the slot under the mutex makes this call
+    /// its only owner until the final `wait`, so no reap can interleave
+    /// between the liveness check and the kill.
     pub fn stop(&self) {
-        let Some(mut child) = self.child.lock().ok().and_then(|mut guard| guard.take()) else {
-            return;
-        };
         #[cfg(unix)]
         {
+            let Some(mut child) = self.child.lock().ok().and_then(|mut guard| guard.take())
+            else {
+                // Already reaped (or another stop owns it): never signal.
+                return;
+            };
+            match child.try_wait() {
+                Ok(Some(_)) | Err(_) => {
+                    // Already exited (or unwaitable): just reap. Signaling
+                    // a zombie — or worse, a recycled pid — helps nobody.
+                    let _ = child.wait();
+                    return;
+                }
+                Ok(None) => {}
+            }
             let pid = self.pid as i32;
             unsafe {
                 libc::kill(pid, libc::SIGTERM);
@@ -645,15 +667,20 @@ impl Sidecar {
                     Err(_) => break,
                 }
             }
+            // Still running after the grace period. The child is un-reaped
+            // and owned by this call, so the pid is still ours to signal.
             unsafe {
                 libc::kill(pid, libc::SIGKILL);
             }
+            let _ = child.wait();
         }
         #[cfg(not(unix))]
         {
-            let _ = child.kill();
+            if let Some(mut child) = self.child.lock().ok().and_then(|mut guard| guard.take()) {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
         }
-        let _ = child.wait();
     }
 
     fn kill(&self) {
@@ -676,6 +703,18 @@ impl Drop for Sidecar {
 
 fn cancelled(cancel: Option<&AtomicBool>) -> bool {
     cancel.is_some_and(|flag| flag.load(Ordering::Relaxed))
+}
+
+/// The port from a `STARLING_SERVE_LISTENING <host>:<port>` line, where
+/// `<host>` may be bracketed IPv6 (`[::1]:8181`): the port is everything
+/// after the last colon, so both forms parse the same way.
+fn announce_port(line: &str) -> Option<u16> {
+    line.trim()
+        .strip_prefix("STARLING_SERVE_LISTENING ")?
+        .rsplit(':')
+        .next()?
+        .parse::<u16>()
+        .ok()
 }
 
 /// `{object: "list", data: [{id: "<slug>"}]}` must name the served slug
@@ -767,5 +806,17 @@ mod tests {
         let tail = ring.tail();
         assert!(tail.contains(&format!("line {}", STDERR_RING_LINES + 9)));
         assert!(!tail.contains("line 0 |"));
+    }
+
+    #[test]
+    fn announce_port_parses_ipv4_and_bracketed_ipv6() {
+        assert_eq!(announce_port("STARLING_SERVE_LISTENING 127.0.0.1:8181"), Some(8181));
+        // The server brackets IPv6 hosts in the announce line; the port
+        // is still everything after the last colon.
+        assert_eq!(announce_port("STARLING_SERVE_LISTENING [::1]:8181"), Some(8181));
+        assert_eq!(announce_port("STARLING_SERVE_LISTENING garbage"), None);
+        assert_eq!(announce_port("STARLING_SERVE_LISTENING 127.0.0.1:notaport"), None);
+        assert_eq!(announce_port("unrelated line"), None);
+        assert_eq!(announce_port(""), None);
     }
 }

@@ -104,11 +104,7 @@ pub struct DamagedRecord {
 }
 
 #[derive(Clone, Debug)]
-// #363: `model_label` on the summary pushed the `Session`/`Damaged`
-// variant size difference over clippy's 200-byte lint. The split is the
-// point — a damaged record carries only an id and a reason — so the
-// shapes are deliberate, not boxed to please the lint.
-#[allow(clippy::large_enum_variant)]
+#[allow(clippy::large_enum_variant, reason = "#363: `model_label` on the summary pushed the variant size difference over clippy's 200-byte lint; the split is the point — a damaged record carries only an id and a reason, so the shapes are deliberate, not boxed to please the lint")]
 pub enum ListedRecord {
     Session(SessionSummary),
     Damaged(DamagedRecord),

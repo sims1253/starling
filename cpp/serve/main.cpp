@@ -22,13 +22,27 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
 
-#ifndef _WIN32
+#ifdef _WIN32
+// windows.h for the parent watchdog (OpenProcess / WaitForSingleObject /
+// GetLastError). WIN32_LEAN_AND_MEAN and NOMINMAX are defined before it so
+// the header cannot drag in winsock v1 (httplib's winsock2.h below is the
+// right one) or define min/max macros that break <algorithm>; httplib.h
+// guards NOMINMAX the same way, but only when it is included first.
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
 #include <cerrno>
 #include <signal.h>
 #include <unistd.h>
@@ -96,12 +110,32 @@ static void usage(const char* prog) {
 }
 
 // ---- simple arg parser ----------------------------------------------------
+// Strict long-long parse for --parent-pid (the same rule as
+// parse_int_strict, issue #146, widened): pids do not fit int on every
+// platform, and a truncating int parse would silently watch the wrong
+// process. Empty, partial ("3abc"), non-numeric, and out-of-range text
+// all fail.
+static std::optional<long long> parse_llong_strict(const std::string& text) {
+    try {
+        std::size_t pos = 0;
+        const long long value = std::stoll(text, &pos);
+        while (pos < text.size()
+               && std::isspace(static_cast<unsigned char>(text[pos]))) {
+            ++pos;
+        }
+        if (pos != text.size()) return std::nullopt;
+        return value;
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
 struct Args {
     std::string model;
     std::string gguf;
     std::string host = "127.0.0.1";
     int port = 8181;
-    long parent_pid = 0;
+    long long parent_pid = 0;
     bool warmup = false;
     bool eager_load = true;
     bool granite_chunk_fairness = false;
@@ -156,11 +190,25 @@ static Args parse_args(int argc, char** argv) {
             }
             return *parsed;
         };
+        auto next_pid = [&](const char* name) -> long long {
+            std::string v = next(name);
+            if (a.error) return 0LL;
+            // Not next_int: the pid is parsed through long long so pids
+            // that fit the platform's pid type but not int still parse
+            // exactly (#366).
+            auto parsed = parse_llong_strict(v);
+            if (!parsed.has_value()) {
+                std::fprintf(stderr, "error: %s requires an integer, got '%s'\n", name, v.c_str());
+                a.error = true;
+                return 0LL;
+            }
+            return *parsed;
+        };
         if (arg == "--model")          a.model = next("--model");
         else if (arg == "--gguf")      a.gguf = next("--gguf");
         else if (arg == "--host")      a.host = next("--host");
         else if (arg == "--port")      a.port = next_int("--port");
-        else if (arg == "--parent-pid") a.parent_pid = next_int("--parent-pid");
+        else if (arg == "--parent-pid") a.parent_pid = next_pid("--parent-pid");
         else if (arg == "--warmup")    a.warmup = true;
         else if (arg == "--no-eager-load") a.eager_load = false;
         else if (arg == "--granite-chunk-fairness") a.granite_chunk_fairness = true;
@@ -412,15 +460,42 @@ static std::atomic<bool> g_should_exit{false};
 static std::atomic<time_t> g_last_activity{0};
 static std::atomic<bool> g_warmup_running{false};
 
+// The highest pid --parent-pid accepts: the platform pid type's max, so a
+// value that would truncate into an unrelated process when cast to
+// pid_t/DWORD is refused instead (the strict parse above already
+// rejected non-numeric and overflowing-for-long-long text).
+#ifdef _WIN32
+constexpr long long kMaxParentPid = 0xffffffffLL;  // DWORD
+#else
+constexpr long long kMaxParentPid = std::numeric_limits<pid_t>::max();
+#endif
+
 // ---- parent watchdog (--parent-pid) ---------------------------------------
 // A supervisor (the desktop app, #362) owns this process. If the supervisor
 // dies without stopping it -- a crash, SIGKILL, a debugger stop -- the server
 // must not live on as an orphan holding a model in memory. _Exit, not exit:
 // the HTTP threads are still running and must not race static destructors.
-static void parent_watch_thread(long pid) {
+static void parent_watch_thread(long long pid) {
 #ifdef _WIN32
     HANDLE parent = OpenProcess(SYNCHRONIZE, FALSE, static_cast<DWORD>(pid));
-    if (parent) {
+    if (parent == NULL) {
+        const DWORD error = GetLastError();
+        if (error == ERROR_INVALID_PARAMETER) {
+            // The pid is already gone: the parent exited before a handle
+            // could be opened. Fall through and exit exactly as if we had
+            // watched it leave.
+        } else {
+            // e.g. ERROR_ACCESS_DENIED: we cannot watch this parent, but
+            // it has NOT exited — claiming it had would kill a healthy
+            // server. Disable the watchdog and say so.
+            std::fprintf(stderr,
+                "[starling-serve] cannot watch parent pid %lld (error %lu); "
+                "watchdog disabled\n",
+                pid, static_cast<unsigned long>(error));
+            std::fflush(stderr);
+            return;
+        }
+    } else {
         WaitForSingleObject(parent, INFINITE);
         CloseHandle(parent);
     }
@@ -437,7 +512,7 @@ static void parent_watch_thread(long pid) {
     }
 #endif
     std::fprintf(stderr,
-        "[starling-serve] parent process %ld exited; shutting down\n", pid);
+        "[starling-serve] parent process %lld exited; shutting down\n", pid);
     std::fflush(stderr);
     std::_Exit(0);
 }
@@ -496,8 +571,10 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "error: --port must be in 0..65535 (0 = any free port)\n");
         return 1;
     }
-    if (args.parent_pid < 0) {
-        std::fprintf(stderr, "error: --parent-pid must be a positive process id\n");
+    if (args.parent_pid < 0
+        || args.parent_pid > kMaxParentPid) {
+        std::fprintf(stderr,
+            "error: --parent-pid must be 0 (disabled) or a positive process id\n");
         return 1;
     }
     if (args.max_stream_seconds < 0.0) {
@@ -613,6 +690,14 @@ int main(int argc, char** argv) {
                 // main() returns and resets its own reference.
                 std::thread([server]() {
                     server->load();
+                    if (!server->loaded()) {
+                        // The deferred load failed: /health reports it as
+                        // load_error, and this line makes the failure
+                        // observable in the server log too (#366).
+                        std::fprintf(stderr,
+                            "[starling-serve] warmup load failed: %s\n",
+                            server->load_error().c_str());
+                    }
                     server->warmup();
                     g_warmup_running.store(false);
                 }).detach();
@@ -1133,11 +1218,22 @@ int main(int argc, char** argv) {
         bound_port = -1;
     }
     if (bound_port <= 0) {
-        std::fprintf(stderr, "[starling-serve] failed to bind %s:%d\n",
-                     cfg.host.c_str(), cfg.port);
+        if (cfg.port == 0) {
+            std::fprintf(stderr,
+                "[starling-serve] failed to bind %s to an ephemeral port\n",
+                cfg.host.c_str());
+        } else {
+            std::fprintf(stderr, "[starling-serve] failed to bind %s:%d\n",
+                         cfg.host.c_str(), cfg.port);
+        }
         return 1;
     }
-    std::printf("STARLING_SERVE_LISTENING %s:%d\n", cfg.host.c_str(), bound_port);
+    // Bracket IPv6 hosts in the announce line ([::1]:8181) so the
+    // host:port split stays unambiguous for any parser.
+    const bool ipv6_host = cfg.host.find(':') != std::string::npos;
+    std::printf("STARLING_SERVE_LISTENING %s%s%s:%d\n",
+                ipv6_host ? "[" : "", cfg.host.c_str(),
+                ipv6_host ? "]" : "", bound_port);
     std::fflush(stdout);
     if (!svr.listen_after_bind()) {
         std::fprintf(stderr, "[starling-serve] failed to serve %s:%d\n",

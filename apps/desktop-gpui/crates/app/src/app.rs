@@ -5,7 +5,10 @@ use std::{
     collections::{HashMap, HashSet},
     io::Write,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, Instant},
 };
 
@@ -564,6 +567,16 @@ fn next_engine_instance() -> u64 {
     static NEXT: AtomicU64 = AtomicU64::new(1);
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
+
+/// The settings-save coordinator (#366): the Save button and the engine
+/// active-model persistence both write the same settings file from
+/// background tasks. Each save claims a sequence number when its document
+/// is built; a writer holding the save mutex skips its write when a newer
+/// sequence has already been written — the newest document always wins,
+/// no matter which background task happens to run last.
+static SETTINGS_SAVE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static SETTINGS_SAVE_WRITTEN: AtomicU64 = AtomicU64::new(0);
+static SETTINGS_SAVE_MUTEX: Mutex<()> = Mutex::new(());
 
 /// The persisted backend override ("cpu"/"vulkan") as the engine's own
 /// backend family (#362). An unknown string is `None` (automatic), not a
@@ -1198,13 +1211,40 @@ impl StarlingApp {
     /// follows). A failure surfaces through the error banner like any
     /// other save.
     fn persist_engine_settings(&self, cx: &mut Context<Self>) {
-        let settings = self.committed_settings();
         let Ok(path) = Settings::default_path() else {
             return;
         };
+        self.spawn_settings_save(path, cx);
+    }
+
+    /// The shared background settings save: the Save button and the engine
+    /// active-model persistence both write this file from background
+    /// tasks, so the writers are serialized newest-wins — without this, an
+    /// older document (spawned first, written last) would overwrite a newer
+    /// one. Each save claims a sequence number when its document is built;
+    /// the writer, holding the process-wide save mutex, skips the write
+    /// when a newer sequence has already been written. A failure surfaces
+    /// through the error banner like any other save.
+    fn spawn_settings_save(&self, path: PathBuf, cx: &mut Context<Self>) {
+        let settings = self.committed_settings();
+        let sequence = SETTINGS_SAVE_SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
         cx.spawn(async move |this, cx| {
             let saved = cx
-                .background_spawn(async move { settings.save(&path) })
+                .background_spawn(async move {
+                    let _writer = SETTINGS_SAVE_MUTEX
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if sequence <= SETTINGS_SAVE_WRITTEN.load(Ordering::Relaxed) {
+                        // A newer document has already been written; this
+                        // older one must not land after it.
+                        return Ok(());
+                    }
+                    let saved = settings.save(&path);
+                    if saved.is_ok() {
+                        SETTINGS_SAVE_WRITTEN.store(sequence, Ordering::Relaxed);
+                    }
+                    saved
+                })
                 .await;
             if let Err(err) = saved {
                 this.update(cx, |app, cx| {
@@ -1224,6 +1264,13 @@ impl StarlingApp {
     fn apply_engine_mode_change(&mut self, cx: &mut Context<Self>) {
         match self.engine_settings.mode {
             EngineMode::Builtin => {
+                // Retire any in-flight manual health probe (the same
+                // latest-wins rule a saved endpoint uses, #207): switching
+                // to builtin hands the indicator to the engine snapshot,
+                // and a slow manual probe landing afterwards would
+                // overwrite it with Offline — and an error banner — for a
+                // server no longer in use.
+                let _ = self.health_sequencer.begin();
                 if self.engine.is_none() {
                     let (engine, startup_error) = start_engine(&self.engine_settings);
                     self.engine_startup_error = startup_error;
@@ -1666,8 +1713,6 @@ impl StarlingApp {
             }
         }
 
-        let settings = self.committed_settings();
-
         // R11: an unresolvable config directory is surfaced, not swallowed —
         // settings must not silently land in the current working directory.
         let path = match Settings::default_path() {
@@ -1678,19 +1723,7 @@ impl StarlingApp {
                 return;
             }
         };
-        cx.spawn(async move |this, cx| {
-            let saved = cx
-                .background_spawn(async move { settings.save(&path) })
-                .await;
-            if let Err(err) = saved {
-                this.update(cx, |app, cx| {
-                    app.error = Some(format!("Could not save settings: {err}"));
-                    cx.notify();
-                })
-                .ok();
-            }
-        })
-        .detach();
+        self.spawn_settings_save(path, cx);
 
         // Close through the same path as Cancel and the scrim: retire any
         // in-flight probe with the dialog it belonged to (#207).

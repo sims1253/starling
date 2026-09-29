@@ -29,43 +29,37 @@ pub struct ConfigDirUnavailable;
 /// install is the self-contained experience (`builtin`); a settings file
 /// written before this key existed loads as `manual` — see
 /// [`Settings::load`] — because a working hand-run-server setup must
-/// never silently change.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// never silently change. Deserialization is lossy by design: an
+/// unknown `mode` string (a file written by a newer build) resolves to
+/// `manual` instead of failing the whole file.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum EngineMode {
     /// The bundled engine, supervised by the app (`engine::EngineManager`).
+    #[default]
     Builtin,
     /// The user's own starling-serve / OpenAI-compatible endpoint.
+    #[serde(other)]
     Manual,
 }
 
 /// The engine subsection of the settings file (#362): which engine runs,
 /// which catalog model it serves, and whether the user pinned the
 /// backend family. `active_model` is a catalog id (not the server slug):
-/// the manager resolves it to an endpoint and slug at startup.
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
+/// the manager resolves it to an endpoint and slug at startup. A partial
+/// `engine` object loads with defaults for whatever it does not state —
+/// one new key must never cost the user their whole settings file.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
 pub struct EngineSettings {
     pub mode: EngineMode,
     /// The catalog id of the model the built-in engine serves. Written by
     /// the app whenever the engine's active model changes (the engine is
     /// the source of truth; the file only restores it at launch).
-    #[serde(default)]
     pub active_model: Option<String>,
     /// `"cpu"` when the user chose the CPU engine (skipping Vulkan
     /// selection); `None` is automatic (Vulkan preferred, CPU fallback).
-    #[serde(default)]
     pub backend_override: Option<String>,
-}
-
-impl Default for EngineSettings {
-    fn default() -> Self {
-        Self {
-            mode: EngineMode::Builtin,
-            active_model: None,
-            backend_override: None,
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -172,10 +166,13 @@ impl Settings {
         let Some(value) = serde_json::from_str::<serde_json::Value>(&text).ok() else {
             return Self::default_settings();
         };
-        let Ok(mut settings) = serde_json::from_value::<Settings>(value.clone()) else {
+        // Checked before `value` is moved into `from_value` (a deep clone
+        // of the whole document just to look at one key would be waste).
+        let legacy_file = value.get("engine").is_none();
+        let Ok(mut settings) = serde_json::from_value::<Settings>(value) else {
             return Self::default_settings();
         };
-        if value.get("engine").is_none() {
+        if legacy_file {
             settings.engine.mode = EngineMode::Manual;
         }
         settings
@@ -211,13 +208,23 @@ impl Settings {
     }
 }
 
-/// Write through a sibling `<file>.tmp`, then rename over the target.
+/// Counts `write_atomic` calls so concurrent writers stage through
+/// distinct temp files: a shared fixed name would let one writer truncate
+/// another's staging file mid-write.
+static WRITE_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Write through a sibling `<file>.<pid>.<sequence>.tmp`, then rename over
+/// the target. The temp name is unique per writer (process id plus a
+/// process-wide counter) so two concurrent saves cannot clobber each
+/// other's staging file; a failed write removes its temp again.
 fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let sequence =
+        WRITE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut file_name = path
         .file_name()
         .map(|name| name.to_os_string())
         .unwrap_or_default();
-    file_name.push(".tmp");
+    file_name.push(format!(".{}.{}.tmp", std::process::id(), sequence));
     let tmp = path.with_file_name(file_name);
 
     let result = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path));
@@ -334,6 +341,49 @@ mod tests {
         };
         settings.save(&path).expect("save");
         assert_eq!(Settings::load(&path).engine, settings.engine);
+    }
+
+    #[test]
+    fn an_unknown_engine_mode_loads_as_manual_keeping_the_rest() {
+        // A settings file written by a newer build may name an engine mode
+        // this build does not know. The file must still load — losing every
+        // setting over one new key would be far worse — and the unknown
+        // mode resolves to manual, the server this build can always talk
+        // to instead of guessing at a bundled engine it cannot select.
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"endpoint":"http://10.0.0.5:8181","model":"whisper-large-v3","expectedTerms":["auth"],"userSetModel":true,"engine":{"mode":"tensor-future","activeModel":"parakeet-v3-q8","backendOverride":"cpu"}}"#,
+        )
+        .expect("write settings");
+        let settings = Settings::load(&path);
+        assert_eq!(settings.endpoint, "http://10.0.0.5:8181");
+        assert_eq!(settings.model, "whisper-large-v3");
+        assert!(settings.user_set_model);
+        assert_eq!(settings.engine.mode, EngineMode::Manual);
+        assert_eq!(settings.engine.active_model, Some("parakeet-v3-q8".to_string()));
+        assert_eq!(settings.engine.backend_override, Some("cpu".to_string()));
+    }
+
+    #[test]
+    fn an_engine_object_without_mode_loads_the_default_mode() {
+        // An `engine` object that states no `mode` is not a legacy file
+        // (the key exists): it loads with the default mode, builtin, and
+        // the fields it does state are kept — not the whole-file defaults.
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"endpoint":"http://10.0.0.5:8181","model":"whisper-large-v3","expectedTerms":["auth"],"engine":{"activeModel":"parakeet-v3-q8"}}"#,
+        )
+        .expect("write settings");
+        let settings = Settings::load(&path);
+        assert_eq!(settings.endpoint, "http://10.0.0.5:8181");
+        assert_eq!(settings.model, "whisper-large-v3");
+        assert_eq!(settings.engine.mode, EngineMode::Builtin);
+        assert_eq!(settings.engine.active_model, Some("parakeet-v3-q8".to_string()));
+        assert_eq!(settings.engine.backend_override, None);
     }
 
     #[test]

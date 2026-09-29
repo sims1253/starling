@@ -79,12 +79,48 @@ def find_archive(artifacts: Path, platform: str, backend: str) -> Path:
     return matches[0]
 
 
+def _ensure_inside(archive: Path, dest: Path, member: str, link: str | None = None) -> None:
+    """Reject an archive member that would extract outside `dest`.
+
+    Covers absolute paths and `..` segments (via resolve) plus, for tar
+    links, a link target pointing outside the destination.
+    """
+    root = dest.resolve()
+    target = (dest / member).resolve()
+    if not target.is_relative_to(root):
+        raise BundleError(
+            f"{archive.name}: archive member escapes the destination: {member}")
+    if link is not None:
+        linked = (target.parent / link).resolve()
+        if not linked.is_relative_to(root):
+            raise BundleError(
+                f"{archive.name}: archive member {member} links outside "
+                f"the destination: {link}")
+
+
 def extract_archive(archive: Path, dest: Path) -> None:
     if archive.name.endswith(".tar.gz"):
         with tarfile.open(archive, "r:gz") as tar:
-            tar.extractall(dest)
+            try:
+                # PEP 706's data filter rejects absolute paths, "..", and
+                # links escaping the destination.
+                tar.extractall(dest, filter="data")
+            except TypeError:
+                # Python without the extraction filters (pre-backport
+                # 3.10/3.11): validate members and link targets by hand.
+                for member in tar.getmembers():
+                    _ensure_inside(
+                        archive, dest, member.name,
+                        member.linkname if member.issym() or member.islnk() else None)
+                tar.extractall(dest)
+            except tarfile.TarError as error:
+                # The data filter's rejections (absolute or escaping links,
+                # ".." members, ...) become the script's error type.
+                raise BundleError(f"{archive.name}: {error}") from error
     elif archive.name.endswith(".zip"):
         with zipfile.ZipFile(archive) as bundle:
+            for name in bundle.namelist():
+                _ensure_inside(archive, dest, name)
             bundle.extractall(dest)
     else:
         raise BundleError(f"unsupported archive type: {archive.name}")

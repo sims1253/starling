@@ -21,6 +21,30 @@
 
 set -euo pipefail
 
+usage() {
+  cat <<'EOF'
+Stage a development engines directory for the desktop app (#362).
+
+Usage:
+  scripts/stage-engines.sh --cpu <path> [--vulkan <path>] --out <dir>
+
+Copies the given server binaries under the bundled layout names
+(starling-serve-cpu[-vulkan][.exe]), checks each with --version and
+--abi-version (refusing to stage an engine that does not answer), and
+writes engines.json + SHA256SUMS.txt in the layout the app's engine
+discovery expects.
+
+Then run the app with:
+  STARLING_ENGINE_DIR=<dir> cargo run -p app
+
+The bundled layout (see crates/dictation/src/engine/bundle.rs):
+  <dir>/starling-serve-cpu[.exe]
+  <dir>/starling-serve-vulkan[.exe]
+  <dir>/SHA256SUMS.txt
+  <dir>/engines.json
+EOF
+}
+
 # The ABI this app expects; must equal STARLING_GGML_ABI_VERSION in
 # cpp/include/starling_ggml.h (the lockstep test in
 # crates/dictation/src/engine/mod.rs pins it).
@@ -40,7 +64,7 @@ while [ $# -gt 0 ]; do
     --vulkan) vulkan="${2:?--vulkan needs a path}"; shift 2 ;;
     --out) out="${2:?--out needs a directory}"; shift 2 ;;
     -h|--help)
-      sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+      usage
       exit 0
       ;;
     *)
@@ -54,9 +78,19 @@ if [ -z "$cpu" ] || [ -z "$out" ]; then
   echo "error: --cpu <path> and --out <dir> are required (--vulkan optional)" >&2
   exit 1
 fi
-for path in "$cpu" ${vulkan:+"$vulkan"}; do
+# Every engine binary to stage, as an array so paths with spaces stay
+# one word each.
+engines=("$cpu")
+if [ -n "$vulkan" ]; then
+  engines+=("$vulkan")
+fi
+for path in "${engines[@]}"; do
   if [ ! -f "$path" ]; then
     echo "error: engine binary not found: $path" >&2
+    exit 1
+  fi
+  if [ ! -x "$path" ]; then
+    echo "error: engine binary not executable: $path" >&2
     exit 1
   fi
 done
@@ -72,24 +106,34 @@ sha256_of() {
   fi
 }
 
+# The version of the engine last validated by check_engine (extracted
+# from the validated --version line).
+checked_version=""
+
 # Checks one staged engine: --version must report the server/version
 # block, --abi-version must equal the header's ABI.
 check_engine() {
   local path="$1" backend="$2"
-  local version_line abi
+  local version_line abi_output abi
   if ! version_line="$("$path" --version 2>/dev/null | head -n 1)"; then
     echo "error: $backend engine failed --version: $path" >&2
     exit 1
   fi
-  if [ "${version_line#starling-serve }" = "$version_line" ]; then
-    echo "error: $backend engine --version output unrecognized: '$version_line'" >&2
+  if [[ ! "$version_line" =~ ^starling-serve[[:space:]]+[^[:space:]]+ ]]; then
+    echo "error: $backend engine --version output unrecognized: '$version_line' (from $path)" >&2
     exit 1
   fi
-  abi="$("$path" --abi-version 2>/dev/null | tr -d '[:space:]')"
+  if ! abi_output="$("$path" --abi-version 2>&1)"; then
+    echo "error: $backend engine failed --abi-version: $abi_output" >&2
+    exit 1
+  fi
+  abi="$(printf '%s' "$abi_output" | tr -d '[:space:]')"
   if [ "$abi" != "$expected_abi" ]; then
     echo "error: $backend engine speaks ABI $abi, but the app expects $expected_abi; refusing to stage it" >&2
     exit 1
   fi
+  checked_version="${version_line#starling-serve }"
+  checked_version="${checked_version%%[[:space:]]*}"
   echo "$backend: $version_line (abi $abi)"
 }
 
@@ -103,18 +147,51 @@ layout_name() {
   esac
 }
 
+# The absolute path of a file (its directory resolved), for the
+# same-file guard below: cp refuses to copy a file onto itself.
+abs_path() {
+  printf '%s/%s\n' "$(cd -- "$(dirname -- "$1")" && pwd -P)" "$(basename -- "$1")"
+}
+
 mkdir -p "$out"
+# Remove the manifests and any stale layout name NOT staged in this run:
+# a vulkan engine staged once, then only cpu again must not linger as a
+# selectable engine with no checksum entry. The names this run stages are
+# left alone — the source may be that very file (re-staging from the
+# output dir).
+cpu_name="$(layout_name cpu "$cpu")"
+vulkan_name=""
+if [ -n "$vulkan" ]; then
+  vulkan_name="$(layout_name vulkan "$vulkan")"
+fi
 rm -f "$out/SHA256SUMS.txt" "$out/engines.json"
+for stale in starling-serve-cpu starling-serve-cpu.exe \
+             starling-serve-vulkan starling-serve-vulkan.exe; do
+  if [ "$stale" != "$cpu_name" ] && [ "$stale" != "$vulkan_name" ]; then
+    rm -f "$out/$stale"
+  fi
+done
 
 # Stage and verify; sums accumulate in preference order (vulkan first,
-# matching engines.json and the app's selection order).
+# matching engines.json and the app's selection order). The version each
+# engine reported is recorded so engines.json can refuse to mix versions.
 sums=""
 entries=""
+cpu_version=""
+vulkan_version=""
 stage_one() {
   local backend="$1" source="$2" name sha
   check_engine "$source" "$backend"
+  case "$backend" in
+    cpu) cpu_version="$checked_version" ;;
+    vulkan) vulkan_version="$checked_version" ;;
+  esac
   name="$(layout_name "$backend" "$source")"
-  cp "$source" "$out/$name"
+  # Re-staging from the output dir must be idempotent: skip the copy when
+  # source and destination are the same file.
+  if [ "$(abs_path "$source")" != "$(abs_path "$out/$name")" ]; then
+    cp "$source" "$out/$name"
+  fi
   chmod +x "$out/$name"
   sha="$(sha256_of "$out/$name")"
   sums="$sums$sha  $name
@@ -130,7 +207,19 @@ entries="${entries%,}"
 
 printf '%s' "$sums" > "$out/SHA256SUMS.txt"
 
-version="$("$cpu" --version 2>/dev/null | head -n 1 | awk '{print $2}')"
+# engines.json carries one version for the whole bundle: it comes from the
+# validated --version lines, must not be empty, and when both backends are
+# staged they must agree — a mixed bundle would look consistent to the
+# app's probe and still be wrong.
+if [ -z "$cpu_version" ]; then
+  echo "error: could not determine the engine version from --version output" >&2
+  exit 1
+fi
+if [ -n "$vulkan_version" ] && [ "$vulkan_version" != "$cpu_version" ]; then
+  echo "error: staged engines disagree on version: cpu reports $cpu_version, vulkan reports $vulkan_version; refusing to write engines.json" >&2
+  exit 1
+fi
+version="$cpu_version"
 cat > "$out/engines.json" <<EOF
 {
   "version": "$version",

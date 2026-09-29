@@ -63,6 +63,39 @@ pub fn stage_engine_dir(root: &Path, fixture: &Path) -> PathBuf {
     dir
 }
 
+/// Like [`stage_engine_dir`], but the staged engine is a shell wrapper
+/// that sleeps `delay_secs` before exec'ing the real fixture whenever its
+/// arguments mention `slow_arg` (e.g. one model's file name). The
+/// fixture still does all the work, under the wrapper's pid; only that
+/// one start is slowed, which opens the race windows the lifecycle tests
+/// need.
+#[cfg(unix)]
+pub fn stage_delayed_engine_dir(
+    root: &Path,
+    fixture: &Path,
+    slow_arg: &str,
+    delay_secs: u32,
+) -> PathBuf {
+    let dir = stage_engine_dir(root, fixture);
+    let engine = dir.join("starling-serve-cpu");
+    std::fs::write(
+        &engine,
+        format!(
+            "#!/bin/sh\ncase \"$*\" in *{slow_arg}*) sleep {delay_secs} ;; esac\nexec '{}' \"$@\"\n",
+            fixture.display()
+        ),
+    )
+    .expect("write delayed engine");
+    make_executable(&engine);
+    let sha = sha256_file(&engine).expect("hash staged engine");
+    std::fs::write(
+        dir.join("SHA256SUMS.txt"),
+        format!("{sha}  starling-serve-cpu\n"),
+    )
+    .expect("write sums");
+    dir
+}
+
 #[cfg(unix)]
 fn make_executable(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
@@ -204,7 +237,11 @@ fn read_request(stream: &mut TcpStream) -> Option<HttpRequest> {
         .unwrap_or_default()
         .to_string();
     let range_start = text.lines().find_map(|line| {
-        let value = line.strip_prefix("Range: ")?;
+        // Header names arrive lowercase from hyper; match either case.
+        let (name, value) = line.split_once(':')?;
+        if !name.trim().eq_ignore_ascii_case("range") {
+            return None;
+        }
         value
             .trim()
             .trim_start_matches("bytes=")

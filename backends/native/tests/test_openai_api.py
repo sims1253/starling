@@ -74,6 +74,21 @@ def wait_healthy(base, process, timeout=10.0):
     return False
 
 
+def stop_fixture(process, timeout=5):
+    """Terminate the fixture and wait for it, killing on timeout.
+
+    SIGTERM that goes unhandled (a wedged process) must not turn a clean
+    failure message into a `TimeoutExpired` traceback: kill, then wait.
+    """
+    process.terminate()
+    try:
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+    process.stdout.close()
+
+
 def start_fixture(model, extra_args=()):
     """Spawn the contract fixture with `model` on a free port (--port 0).
 
@@ -89,13 +104,11 @@ def start_fixture(model, extra_args=()):
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
     announce = read_announce(process)
     if announce is None or not ANNOUNCE_RE.match(announce):
-        process.terminate()
-        process.wait(timeout=5)
+        stop_fixture(process)
         raise RuntimeError(f"Fixture server did not announce its port (got {announce!r})")
     base = f"http://{ANNOUNCE_RE.match(announce).group(1)}:{ANNOUNCE_RE.match(announce).group(2)}"
     if not wait_healthy(base, process):
-        process.terminate()
-        process.wait(timeout=5)
+        stop_fixture(process)
         raise RuntimeError("Fixture server did not start")
     return base, process
 

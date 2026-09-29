@@ -175,3 +175,65 @@ fn refused_swap_changes_nothing() {
 
     manager.shutdown();
 }
+
+/// #363: "the app is never left without an engine". Cancelling a drain
+/// swap after the old engine was unloaded (the incoming one is still
+/// loading) restores the previous model instead of leaving nothing
+/// active.
+#[cfg(unix)]
+#[test]
+fn cancelling_after_the_old_engine_stopped_restores_it() {
+    let Some(fixture) = fixture() else { return };
+    let root = tempfile::tempdir().expect("tempdir");
+    // B's engine takes 3 s to start: the window to cancel in.
+    let engine_dir = stage_delayed_engine_dir(root.path(), &fixture, "b.gguf", 3);
+
+    let bytes_a = model_bytes(30, 120_000);
+    let bytes_b = model_bytes(31, 130_000);
+    let addr = spawn_model_server(vec![
+        ("a.gguf".to_string(), Arc::new(bytes_a.clone())),
+        ("b.gguf".to_string(), Arc::new(bytes_b.clone())),
+    ]);
+    let entry_a = entry("model-a", "a.gguf", addr, &bytes_a);
+    let entry_b = entry("model-b", "b.gguf", addr, &bytes_b);
+    let models_dir = root.path().join("models");
+    let state_dir = root.path().join("state");
+    install(&models_dir, &entry_a, &bytes_a);
+    install(&models_dir, &entry_b, &bytes_b);
+
+    let mut config = config(&engine_dir, &models_dir, &state_dir, vec![entry_a, entry_b]);
+    config.available_memory_override = Some(Some(600 * 1024 * 1024));
+    let manager =
+        starling_dictation::engine::EngineManager::start(config, Some("model-a".to_string()));
+    wait_until(&manager, READY_TIMEOUT, |s| s.phase == EnginePhase::Ready).expect("Ready on A");
+
+    manager.activate("model-b");
+    wait_until(&manager, SHORT_TIMEOUT, |s| {
+        matches!(s.pending_decision, Some(SwapDecision::NeedsDrain { .. }))
+    })
+    .expect("tight memory surfaces NeedsDrain");
+    manager.confirm_drain_swap();
+    wait_until(&manager, SHORT_TIMEOUT, |s| {
+        s.active.is_none() && s.switch.is_some()
+    })
+    .expect("A was unloaded while B loads");
+
+    manager.cancel_switch();
+    let restored = wait_until(&manager, READY_TIMEOUT, |s| {
+        s.switch.is_none()
+            && s.phase == EnginePhase::Ready
+            && s.active.as_ref().is_some_and(|active| active.model_id == "model-a")
+    });
+    let final_state = manager.snapshot();
+    manager.shutdown();
+    assert!(
+        restored.is_some(),
+        "cancelling after the unload must restore A; got {:?}, {:?}",
+        final_state.phase,
+        final_state.active
+    );
+    // B's delayed start must not land afterwards either.
+    assert!(final_state
+        .active
+        .is_some_and(|active| active.model_id == "model-a"));
+}

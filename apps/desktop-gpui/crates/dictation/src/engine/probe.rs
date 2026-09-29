@@ -93,6 +93,10 @@ pub fn probe_engine(
 }
 
 /// Spawns `--version`, enforces the timeout, and classifies the exit.
+/// Both pipes are drained on reader threads started right after spawn:
+/// a child that writes more than a pipe holds (~64 KiB) would block on
+/// the full pipe while the loop below only polls `try_wait`, and a
+/// healthy binary would hit the timeout (#366).
 fn run_version(path: &Path) -> Result<VersionOutput, ProbeFailure> {
     let mut command = Command::new(path);
     command.arg("--version");
@@ -110,6 +114,18 @@ fn run_version(path: &Path) -> Result<VersionOutput, ProbeFailure> {
         .map_err(|error| ProbeFailure::NotExecutable {
             reason: spawn_error_reason(&error),
         })?;
+    let (stdout_handle, stderr_handle) =
+        match (spawn_pipe_reader(child.stdout.take()), spawn_pipe_reader(child.stderr.take())) {
+            (Ok(stdout), Ok(stderr)) => (stdout, stderr),
+            _ => {
+                // A reader could not start: never leak the spawned child.
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(ProbeFailure::NotExecutable {
+                    reason: "could not start the --version pipe readers".to_string(),
+                });
+            }
+        };
     let deadline = Instant::now() + PROBE_TIMEOUT;
     let status = loop {
         match child.try_wait() {
@@ -129,16 +145,10 @@ fn run_version(path: &Path) -> Result<VersionOutput, ProbeFailure> {
             }
         }
     };
-    let mut stdout = String::new();
-    if let Some(mut pipe) = child.stdout.take() {
-        use std::io::Read;
-        let _ = pipe.read_to_string(&mut stdout);
-    }
-    let mut stderr = String::new();
-    if let Some(mut pipe) = child.stderr.take() {
-        use std::io::Read;
-        let _ = pipe.read_to_string(&mut stderr);
-    }
+    // The pipes hit EOF when the child exited or was killed above; the
+    // readers have everything by the time both are joined.
+    let stdout = stdout_handle.join().unwrap_or_default();
+    let stderr = stderr_handle.join().unwrap_or_default();
     let Some(status) = status else {
         return Err(ProbeFailure::Crashed {
             code: -1,
@@ -150,6 +160,22 @@ fn run_version(path: &Path) -> Result<VersionOutput, ProbeFailure> {
         return Err(classify_exit(code, &stderr, ExitFamily::host()));
     }
     Ok(VersionOutput { stdout, stderr })
+}
+
+/// Reads a piped child stream to a string on its own thread.
+fn spawn_pipe_reader<R>(pipe: Option<R>) -> std::io::Result<std::thread::JoinHandle<String>>
+where
+    R: std::io::Read + Send + 'static,
+{
+    std::thread::Builder::new()
+        .name("starling-probe-reader".into())
+        .spawn(move || {
+            let mut text = String::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_string(&mut text);
+            }
+            text
+        })
 }
 
 struct VersionOutput {
@@ -674,7 +700,12 @@ mod tests {
         )
         .expect("sums");
         let bundle = crate::engine::bundle::load_bundle(dir.path()).expect("bundle");
-        match select_backend(&bundle, None, None) {
+        // Pretend a driver manifest exists so the ICD pre-check passes on
+        // hosts without Vulkan (CI runners) and the probe itself runs.
+        let icd = dir.path().join("icd.d");
+        std::fs::create_dir_all(&icd).expect("create icd dir");
+        std::fs::write(icd.join("fake_icd.json"), "{}").expect("write icd");
+        match select_backend(&bundle, None, Some(std::slice::from_ref(&icd))) {
             Err(EngineFailure::MissingLibrary { backend, library }) => {
                 assert_eq!(backend, Backend::Vulkan);
                 assert_eq!(library, "libvulkan.so.1");

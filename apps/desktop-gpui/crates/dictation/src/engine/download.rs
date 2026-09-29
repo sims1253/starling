@@ -51,15 +51,17 @@ pub fn model_files(models_dir: &Path, entry: &CatalogEntry) -> ModelFiles {
 }
 
 /// Disk truth for one catalog entry. Installed requires file + size +
-/// marker match; a file without a matching marker is
-/// [`InstallState::NeedsVerification`] (activation hashes it first).
+/// marker match; a right-size file without a matching marker is
+/// [`InstallState::NeedsVerification`] (activation hashes it first). A
+/// wrong-size file can never verify, so it is `Failed` with the reason
+/// and the download action that replaces it.
 pub fn scan_install(models_dir: &Path, entry: &CatalogEntry) -> InstallState {
     let files = model_files(models_dir, entry);
     let Some(meta) = fs::metadata(&files.final_path).ok() else {
         return InstallState::NotInstalled;
     };
     if meta.len() != entry.size_bytes {
-        return InstallState::NeedsVerification;
+        return InstallState::Failed(wrong_size_message(&files.final_path, meta.len(), entry));
     }
     match fs::read_to_string(&files.marker_path) {
         Ok(marker) if marker.trim().eq_ignore_ascii_case(&entry.sha256) => InstallState::Installed,
@@ -81,6 +83,13 @@ pub fn write_marker(marker_path: &Path, sha256_hex: &str) -> std::io::Result<()>
 /// is the user's; the error says it does not match.
 pub fn verify_placed_file(models_dir: &Path, entry: &CatalogEntry) -> Result<(), String> {
     let files = model_files(models_dir, entry);
+    // Size first: it is cheap, and a wrong-size file would otherwise be
+    // reported as a checksum mismatch.
+    let meta = fs::metadata(&files.final_path)
+        .map_err(|error| format!("cannot stat {}: {error}", files.final_path.display()))?;
+    if meta.len() != entry.size_bytes {
+        return Err(wrong_size_message(&files.final_path, meta.len(), entry));
+    }
     let digest = crate::engine::bundle::sha256_file(&files.final_path)
         .map_err(|error| format!("cannot read {}: {error}", files.final_path.display()))?;
     if !digest.eq_ignore_ascii_case(&entry.sha256) {
@@ -91,21 +100,28 @@ pub fn verify_placed_file(models_dir: &Path, entry: &CatalogEntry) -> Result<(),
             entry.id
         ));
     }
-    let meta = fs::metadata(&files.final_path)
-        .map_err(|error| format!("cannot stat {}: {error}", files.final_path.display()))?;
-    if meta.len() != entry.size_bytes {
-        return Err(format!(
-            "the file {} has {} bytes, but the catalog expects {}; \
-             it was not changed — replace it or delete it and download again",
-            files.final_path.display(),
-            meta.len(),
-            entry.size_bytes
-        ));
-    }
     write_marker(&files.marker_path, &entry.sha256)
         .map_err(|error| format!("cannot write the verification marker: {error}"))?;
     Ok(())
 }
+
+fn wrong_size_message(path: &Path, size: u64, entry: &CatalogEntry) -> String {
+    format!(
+        "the file {} has {size} bytes, but the catalog expects {}; \
+         it was not changed — replace it or download again",
+        path.display(),
+        entry.size_bytes
+    )
+}
+
+/// How long connecting to the model host may take.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long the response may go without delivering a byte. A healthy
+/// download of a large model takes as long as it takes; only a stalled
+/// one fails.
+const READ_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(60);
+/// How often a stalled read re-checks the cancel flag.
+const CANCEL_POLL: Duration = Duration::from_millis(250);
 
 /// Why a download did not produce an installed model. Each carries a
 /// sentence; none of them touch the active model.
@@ -160,8 +176,12 @@ async fn download_async(
     progress: &dyn Fn(u64, u64),
     cancel: &AtomicBool,
 ) -> Result<(), DownloadError> {
+    // No total-request timeout: it would cover the whole body, and a
+    // 553 MB model on a slow link must not fail while bytes keep arriving.
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::limited(5))
+        .connect_timeout(CONNECT_TIMEOUT)
+        .read_timeout(READ_INACTIVITY_TIMEOUT)
         .build()
         .map_err(|error| DownloadError::Http(error.to_string()))?;
 
@@ -189,32 +209,55 @@ async fn download_async(
         }
     }
 
-    let request_timeout = Duration::from_secs(60);
-    let mut request = client.get(&entry.url).timeout(request_timeout);
-    if offset > 0 {
-        request = request.header("Range", format!("bytes={offset}-"));
-    }
-    let response = request
-        .send()
-        .await
-        .map_err(|error| DownloadError::Http(format!("cannot reach {}: {error}", entry.url)))?;
-    let status = response.status();
-    if !status.is_success() {
-        return Err(DownloadError::Http(format!(
-            "the server answered {} for {}",
-            status.as_u16(),
-            entry.url
-        )));
-    }
-    let resumed = status.as_u16() == 206;
+    let (response, resumed) = loop {
+        let mut request = client.get(&entry.url);
+        if offset > 0 {
+            request = request.header("Range", format!("bytes={offset}-"));
+        }
+        let response = request.send().await.map_err(|error| {
+            DownloadError::Http(format!("cannot reach {}: {error}", entry.url))
+        })?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(DownloadError::Http(format!(
+                "the server answered {} for {}",
+                status.as_u16(),
+                entry.url
+            )));
+        }
+        if status.as_u16() != 206 {
+            break (response, false);
+        }
+        // A 206 only resumes when it starts where the .part ends. One
+        // that starts elsewhere (a proxy answering from byte 0) cannot be
+        // appended: drop the .part and ask again for the whole file.
+        let start = response
+            .headers()
+            .get(reqwest::header::CONTENT_RANGE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(content_range_start);
+        if offset > 0 && start == Some(offset) {
+            break (response, true);
+        }
+        if offset == 0 {
+            return Err(DownloadError::Http(format!(
+                "the server answered a partial response for {} without being asked to resume",
+                entry.url
+            )));
+        }
+        drop(response);
+        let _ = fs::remove_file(&files.part_path);
+        offset = 0;
+        hasher = Sha256::new();
+    };
 
-    let mut file = if resumed && offset > 0 {
+    let mut file = if resumed {
         OpenOptions::new()
             .append(true)
             .open(&files.part_path)
             .map_err(io_error)?
     } else {
-        // 200 (or a resumed request answered from zero): restart clean.
+        // 200 (the server ignored the Range header): restart clean.
         offset = 0;
         hasher = Sha256::new();
         File::create(&files.part_path).map_err(io_error)?
@@ -223,13 +266,23 @@ async fn download_async(
     let mut done = offset;
     progress(done, entry.size_bytes);
     let mut response = response;
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|error| DownloadError::Http(error.to_string()))?
-    {
+    loop {
+        // Poll the cancel flag while a slow chunk is pending (the read
+        // inactivity timeout can be much longer than a user waits).
+        let chunk = loop {
+            if cancel.load(Ordering::Relaxed) {
+                // Keep .part for a later resume; drop the connection.
+                return Err(DownloadError::Cancelled);
+            }
+            match tokio::time::timeout(CANCEL_POLL, response.chunk()).await {
+                Ok(result) => break result,
+                Err(_elapsed) => continue,
+            }
+        };
+        let Some(chunk) = chunk.map_err(|error| DownloadError::Http(error.to_string()))? else {
+            break;
+        };
         if cancel.load(Ordering::Relaxed) {
-            // Keep .part for a later resume; drop the connection.
             return Err(DownloadError::Cancelled);
         }
         if done + chunk.len() as u64 > entry.size_bytes {
@@ -284,6 +337,18 @@ pub fn delete_model_files(models_dir: &Path, entry: &CatalogEntry) -> Result<(),
     Ok(())
 }
 
+/// The first byte of `Content-Range: bytes <start>-<end>/<total>`.
+fn content_range_start(value: &str) -> Option<u64> {
+    value
+        .trim()
+        .strip_prefix("bytes ")?
+        .split('-')
+        .next()?
+        .trim()
+        .parse()
+        .ok()
+}
+
 fn io_error(error: std::io::Error) -> DownloadError {
     DownloadError::Io(error.to_string())
 }
@@ -298,6 +363,15 @@ mod tests {
     /// `connection: close` per response) — the same double the
     /// integration tests use, kept here for unit-testing resume.
     fn spawn_file_server(bytes: Arc<Vec<u8>>) -> (String, std::thread::JoinHandle<()>) {
+        spawn_file_server_with(bytes, false)
+    }
+
+    /// `partial_from_zero`: answer every Range request with a 206 that
+    /// starts at byte 0 (a misbehaving proxy).
+    fn spawn_file_server_with(
+        bytes: Arc<Vec<u8>>,
+        partial_from_zero: bool,
+    ) -> (String, std::thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().expect("addr");
         let handle = std::thread::spawn(move || {
@@ -314,7 +388,10 @@ mod tests {
                 }
                 let text = String::from_utf8_lossy(&head).to_string();
                 let range = text.lines().find_map(|line| {
-                    let value = line.strip_prefix("Range: ")?;
+                    let (name, value) = line.split_once(':')?;
+                    if !name.trim().eq_ignore_ascii_case("range") {
+                        return None;
+                    }
                     let start: u64 = value
                         .trim()
                         .trim_start_matches("bytes=")
@@ -325,15 +402,26 @@ mod tests {
                     Some(start)
                 });
                 let (status, body_range) = match range {
+                    Some(_) if partial_from_zero => ("206 Partial Content", 0..bytes.len()),
                     Some(start) if start < bytes.len() as u64 => {
                         ("206 Partial Content", start as usize..bytes.len())
                     }
                     Some(_) => ("416 Range Not Satisfiable", 0..0),
                     None => ("200 OK", 0..bytes.len()),
                 };
+                let content_range = if status.starts_with("206") {
+                    format!(
+                        "content-range: bytes {}-{}/{}\r\n",
+                        body_range.start,
+                        body_range.end - 1,
+                        bytes.len()
+                    )
+                } else {
+                    String::new()
+                };
                 let body = &bytes[body_range];
                 let head = format!(
-                    "HTTP/1.1 {status}\r\ncontent-length: {}\r\naccept-ranges: bytes\r\nconnection: close\r\n\r\n",
+                    "HTTP/1.1 {status}\r\ncontent-length: {}\r\n{content_range}accept-ranges: bytes\r\nconnection: close\r\n\r\n",
                     body.len()
                 );
                 let _ = stream.write_all(head.as_bytes());
@@ -449,6 +537,52 @@ mod tests {
     }
 
     #[test]
+    fn resumes_from_the_part_when_the_range_matches() {
+        let served: Vec<u8> = (0..60_000u32).map(|i| (i % 241) as u8).collect();
+        let (url, server) = spawn_file_server(Arc::new(served.clone()));
+        let entry = entry_for(&url, &served);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let files = model_files(dir.path(), &entry);
+        fs::write(&files.part_path, &served[..25_000]).expect("write part");
+        let first_progress = std::sync::Mutex::new(None);
+        download_model(
+            dir.path(),
+            &entry,
+            &|done, _| {
+                first_progress.lock().unwrap().get_or_insert(done);
+            },
+            &AtomicBool::new(false),
+        )
+        .expect("resumed download succeeds");
+        assert_eq!(*first_progress.lock().unwrap(), Some(25_000));
+        assert_eq!(fs::read(&files.final_path).expect("final"), served);
+        drop(server);
+    }
+
+    #[test]
+    fn a_partial_answer_from_the_wrong_offset_restarts_clean() {
+        let served: Vec<u8> = (0..60_000u32).map(|i| (i % 239) as u8).collect();
+        let (url, server) = spawn_file_server_with(Arc::new(served.clone()), true);
+        let entry = entry_for(&url, &served);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let files = model_files(dir.path(), &entry);
+        fs::write(&files.part_path, &served[..25_000]).expect("write part");
+        // The retry without Range gets a 200 with the whole file.
+        download_all(dir.path(), &entry, &AtomicBool::new(false))
+            .expect("download restarts and succeeds");
+        assert_eq!(fs::read(&files.final_path).expect("final"), served);
+        drop(server);
+    }
+
+    #[test]
+    fn content_range_start_parses_the_first_byte() {
+        assert_eq!(content_range_start("bytes 100-199/200"), Some(100));
+        assert_eq!(content_range_start("bytes 0-9/*"), Some(0));
+        assert_eq!(content_range_start("items 1-2/3"), None);
+        assert_eq!(content_range_start("bytes */200"), None);
+    }
+
+    #[test]
     fn placed_file_needs_verification_then_verifies_or_refuses() {
         let served: Vec<u8> = vec![9u8; 4096];
         let entry = entry_for("http://127.0.0.1:9/never-hit.gguf", &served);
@@ -481,11 +615,15 @@ mod tests {
         fs::remove_file(&files.marker_path).expect("drop marker");
         assert!(verify_placed_file(dir.path(), &entry).is_err());
         assert!(files.final_path.exists(), "never delete a user-placed file");
-        // A wrong-size file necessarily has a wrong digest too, so it is
-        // refused the same way — and still never touched.
+        // A wrong-size file is refused by its size (it can never verify),
+        // shows as Failed with that reason, and is still never touched.
         fs::write(&files.final_path, vec![0u8; 10]).expect("place short file");
         let message = verify_placed_file(dir.path(), &entry).expect_err("short file refuses");
-        assert!(message.contains("does not match"), "got: {message}");
+        assert!(message.contains("has 10 bytes"), "got: {message}");
+        assert!(matches!(
+            scan_install(dir.path(), &entry),
+            InstallState::Failed(reason) if reason.contains("has 10 bytes")
+        ));
         assert!(files.final_path.exists());
     }
 
