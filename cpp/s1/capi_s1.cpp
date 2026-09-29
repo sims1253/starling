@@ -18,6 +18,7 @@
 // The greedy budget mirrors the model card + the Python pipeline:
 // min(1.3 * prompt_len + 32, max_cache_len - prompt_len - 1).
 #include "loader.hpp"
+#include "copy_draft.hpp"
 #include "lib/capi_helpers.hpp"
 #include "llm.hpp"
 #include "lib/bpe_tokenizer.hpp"
@@ -26,6 +27,7 @@
 #include "runtime/backend.hpp"
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -34,6 +36,7 @@
 #include <memory>
 #include <new>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -190,7 +193,7 @@ char* starling_ggml_s1_normalize(void* handle, const char* transcript,
             }
         }
 
-        // (4) greedy decode: budget 1.3*T + 32, capped by the static cache.
+        // (4) decode: budget 1.3*T + 32, capped by the static cache.
         int64_t budget = (int64_t) std::llround(
                              cfg.max_new_tokens_input_factor * (double) T) +
                          (int64_t) cfg.max_new_tokens_fixed;
@@ -207,7 +210,40 @@ char* starling_ggml_s1_normalize(void* handle, const char* transcript,
         op.eos_token_id = cfg.eos_token_id;
         op.eos2_token_id = cfg.eos2_token_id;
         starling::ggml::lib::GenerateResult res;
-        if (!greedy_generate(*c->model, in, op, res, c->err)) {
+        const bool copy_enabled = [] {
+            const char* value = std::getenv("STARLING_S1_COPY_DRAFT");
+            return value && std::strcmp(value, "1") == 0;
+        }();
+        starling::ggml::lib::SpeculativeStats spec_stats;
+        bool generated = false;
+        int max_k = 0;
+        if (copy_enabled) {
+            max_k = 2;
+            if (const char* raw = std::getenv("STARLING_S1_COPY_MAX_K")) {
+                char* end = nullptr;
+                errno = 0;
+                const long parsed = std::strtol(raw, &end, 10);
+                if (errno || end == raw || *end || parsed < 1 || parsed > 16) {
+                    c->err = "STARLING_S1_COPY_MAX_K must be an integer from 1 to 16";
+                    report(err_out, c->err);
+                    return nullptr;
+                }
+                max_k = (int)parsed;
+            }
+            std::vector<int32_t> source_ids;
+            if (!c->tokenizer.encode(transcript, source_ids, c->err)) {
+                report(err_out, c->err);
+                return nullptr;
+            }
+            starling::ggml::s1::CopyDrafter drafter(std::move(source_ids), max_k);
+            generated = speculative_generate(*c->model, in, op, max_k,
+                [&](const std::vector<int32_t>& prefix, int cap) {
+                    return drafter.propose(prefix, cap);
+                }, {}, res, spec_stats, c->err);
+        } else {
+            generated = greedy_generate(*c->model, in, op, res, c->err);
+        }
+        if (!generated) {
             report(err_out, c->err);
             return nullptr;
         }
@@ -217,9 +253,16 @@ char* starling_ggml_s1_normalize(void* handle, const char* transcript,
         if (timing) {
             auto t_end = std::chrono::steady_clock::now();
             std::fprintf(stderr,
-                         "S1_TIMING prompt=%lldtok gen=%zutok total=%.1fms\n",
+                         "S1_TIMING prompt=%lldtok gen=%zutok total=%.1fms "
+                         "copy=%d max_k=%d accepted=%d/%d verify_calls=%d "
+                         "fallback_steps=%d proposal=%.2fms verify=%.2fms "
+                         "fallback=%.2fms\n",
                          (long long) T, res.ids.size(),
-                         std::chrono::duration<double, std::milli>(t_end - t_start).count());
+                         std::chrono::duration<double, std::milli>(t_end - t_start).count(),
+                         (int)copy_enabled, max_k, spec_stats.accepted,
+                         spec_stats.proposed, spec_stats.verify_calls,
+                         spec_stats.fallback_steps, spec_stats.proposal_ms,
+                         spec_stats.verify_ms, spec_stats.fallback_ms);
         }
 
         char* out = static_cast<char*>(std::malloc(text.size() + 1));

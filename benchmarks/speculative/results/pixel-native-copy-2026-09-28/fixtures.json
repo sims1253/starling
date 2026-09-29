@@ -1,0 +1,44 @@
+{
+  "source": "tests/fixtures/s1_transcripts.py and benchmarks/speculative/eval_native_s1_copy.py",
+  "cases": [
+    {
+      "case": "short",
+      "transcript": "so um i need to like send the the report by uh friday no wait make that thursday",
+      "source_sha256": "944d04c8e175e3c2bebc065f14b363d96134194d2865d68ff38e0ef2dd09aeba",
+      "cpu_bf16_ids_sha256_informational": "c9e8019f15282db57411cf4ea0120e43eae1c0f51420cb7b0c8cf4efcb7a68ce",
+      "cpu_bf16_output_tokens_informational": 11,
+      "max_k": 2,
+      "protected_spans": []
+    },
+    {
+      "case": "medium",
+      "transcript": "okay so um the the call yesterday with with the vendor went pretty well i think they said the new contract starts on march third twenty twenty six which is like a week earlier than we expected um they also want uh forty five hundred dollars a month instead of four thousand no wait sorry its four thousand two hundred and theyll throw in support for free so yeah i i think we should take it",
+      "source_sha256": "81eb8472f7e24431a850b750926b3d852211153816862236ee6519528cd5b21a",
+      "cpu_bf16_ids_sha256_informational": "29d8b075d2930109d58c0ae480d0f9f5e1415b139e599d88581cc49b02593829",
+      "cpu_bf16_output_tokens_informational": 79,
+      "max_k": 2,
+      "protected_spans": []
+    },
+    {
+      "case": "long",
+      "transcript": "alright let me uh let me give you guys a quick update on on where the migration stands as of today so the the database side is basically done we finished moving all thirty two tables last thursday and the replication lag dropped to under fifty milliseconds which was the the big worry um the api side is about seventy percent done sarahs team finished the the auth endpoints and the billing ones but the the reporting endpoints are still in progress they think theyll be done by like friday next week um the the frontend is a bit behind honestly we we probably underestimated how much the the component rewrite would take were looking at maybe another three weeks there which pushes the the launch to august twenty second or or possibly the twenty ninth depending on qa one more thing the the infra costs came in lower than budgeted were at about two thousand three hundred dollars a month against a three thousand dollar budget so we have room for the the staging cluster mike asked for um if anyone has questions about the the migration plan the doc is is linked in the channel oh and and one last thing were still waiting on the security review they they promised it by the fifteenth but i i wouldnt be surprised if it slips to the eighteenth or so alright i think thats everything lets lets pick this up at the the next sync on monday",
+      "source_sha256": "775b24ecf63a1f7d75a2aa008c5f6bdfc7f04cbe74ac3630f785d81e00cdb019",
+      "cpu_bf16_ids_sha256_informational": "a65a69baf1ae6409179fe423f2196c185bd87e76643f95a2c6466e695a3523ee",
+      "cpu_bf16_output_tokens_informational": 281,
+      "max_k": 2,
+      "protected_spans": []
+    },
+    {
+      "case": "protected",
+      "transcript": "um please keep the literal tag ZX-1042 and the URL https://example.org/manual unchanged in the final note",
+      "source_sha256": "23ebf0fce659f72663040be0939485f46bd8af612fd1c4535f2012cbb8d1a8b6",
+      "cpu_bf16_ids_sha256_informational": "c2de6338964e32c4961a26c89adde9c88cb2fa3289277fbbeb1573ec767c67e5",
+      "cpu_bf16_output_tokens_informational": 26,
+      "max_k": 4,
+      "protected_spans": [
+        "ZX-1042",
+        "https://example.org/manual"
+      ]
+    }
+  ]
+}

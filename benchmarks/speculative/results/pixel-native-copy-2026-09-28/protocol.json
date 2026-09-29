@@ -1,0 +1,70 @@
+{
+  "schema": "pixel-s1-native-copy-bounded-v1",
+  "status": "LOCKED AFTER ASTRA SPEC PRE-RUN REVIEW; WAIT FOR QUANT CPU COMPLETION",
+  "drafted_utc": "2026-09-28T12:23:22.606579+00:00",
+  "serial": "192.168.178.59:34113",
+  "model": "/data/local/tmp/starling-issue-batch/s1-bf16.gguf",
+  "model_sha256": "c4fc61df01df19655d796e085d29aa41647d33cfd090824778ecadd76a2bb11c",
+  "binary_sha256": "33a513e6f1aae2f7a5d4f53b29d5c787d6472a060520d7de6bf788abc828d277",
+  "source_commit": "18cf0d7488ef30065eb020778530959971311196",
+  "fixture_sha256": "046d6579bea641d6f9485fc98a10534fd41b224fcfd39527ad50bbd614319f3a",
+  "environment": {
+    "server": "starling-serve --model s1 --warmup --host 127.0.0.1 --port 8182",
+    "cpu": "STARLING_ENGINE=ggml STARLING_GGML_DEVICE=CPU STARLING_GGML_THREADS=6",
+    "timing": "STARLING_S1_TIMING=1",
+    "ids": "STARLING_S1_DUMP_IDS unique writable path per process; pull raw little-endian int32 after every request before overwrite",
+    "copy": "STARLING_S1_COPY_DRAFT=1 STARLING_S1_COPY_MAX_K=2",
+    "greedy": "STARLING_S1_COPY_DRAFT unset",
+    "phone": "unplugged/discharging, display OFF, thermal<2, battery<42C, Spotify user-paused; no app/settings changes"
+  },
+  "cases": [
+    "short",
+    "medium"
+  ],
+  "fixtures_source": "fixtures.json from the pinned kit; input text exact and no styling/context",
+  "parity_preflight": {
+    "order": [
+      "greedy",
+      "copy"
+    ],
+    "processes": 2,
+    "per_case": "one untimed same-case warmup then one diagnostic request; save text and int32 ID bytes immediately",
+    "gate": "Each copy diagnostic output and raw int32 ID sequence must equal same-device greedy for the same case. Stop before measured latency blocks on any mismatch. No host hash parity gate."
+  },
+  "performance": {
+    "order": [
+      "greedy",
+      "copy",
+      "copy",
+      "greedy"
+    ],
+    "fresh_process_per_block": true,
+    "generic_startup_warmup": "--warmup before the untimed same-case warmups and all measured requests",
+    "same_case_warmup": "one short and one medium untimed request before measured requests, each ID dump saved",
+    "measured_requests_per_case_per_block": 2,
+    "measured_order": [
+      "short",
+      "medium",
+      "short",
+      "medium"
+    ],
+    "latency": "Host-monotonic POST /normalize wall from request send to complete response for measured requests only, excluding subsequent diagnostic ID pull. Pair each with its own S1_TIMING total from native stderr, copy counters, and token count; report transport/dispatch gap descriptively. Same ADB forwarding, model, threads, and inputs across arms.",
+    "load": "record process launch to health ready including generic startup warmup and internal model load stage separately; exclude both load and all warmups from measured request latency",
+    "parity_gate": "Every measured greedy AND copy output and raw int32 ID sequence must equal the same-device preflight greedy reference for that case; stop directional claims on any mismatch or missing dump. Every native S1_TIMING line must parse: greedy copy=0,max_k=0; copy copy=1,max_k=2. Record accepted/proposed/verify/fallback counters for each measured copy request; zero proposals are reported explicitly, not assumed useful.",
+    "request_scope": "One server per block; process launch to /health ready (including generic startup warmup) recorded separately. One untimed same-case warmup for short and medium before measured requests. Four measured requests in fixed short, medium, short, medium order; pull raw ID dump after each request before next, outside the timed request interval.",
+    "battery": "Charge counter has shown >110s stale plateaus in the preceding quant pilot. Record unplugged/screen/temperature/thermal state before and after each block for validity, but do not calculate or claim an energy contrast; no idle-bracket drain campaign.",
+    "cooldown": "At least 30s between processes. Thermal>=2, battery>=42C, screen ON, or charging abort the block. Before each block prefer thermal<2 and battery<37C; wait up to180s to cool. If still 37\u201341.9C with thermal<2, run only descriptively and disable directional latency claim.",
+    "directional_latency_rule": "For EACH fixture (short and medium) and EACH metric (host HTTP wall and native S1_TIMING total) separately, report the two within-block medians and both adjacent greedy-minus-copy contrasts (blocks1\u20132 and4\u20133). An exploratory positive direction for that fixture/metric requires exact ID/text parity in all blocks, valid native mode fields, no cooldown breach, and both adjacent contrasts >0. Do not infer native speedup from host sign, pool fixtures silently, or claim a confidence interval or release gate."
+  },
+  "protected_k4_smoke": {
+    "optional_after_performance": true,
+    "separate_processes": [
+      "greedy",
+      "copy_K4"
+    ],
+    "case": "protected",
+    "scope": "exact same-device text and int32 ID parity plus required ZX-1042 and https://example.org/manual spans; no performance or energy claim"
+  },
+  "maximum_processes": 8,
+  "estimated_minutes": 13
+}

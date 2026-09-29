@@ -1,0 +1,42 @@
+{
+  "stage": "preflight",
+  "index": 1,
+  "arm": "greedy",
+  "protocol_sha256": "2e497202a1dd49e1bd49282f3e918b7b04b98de40056728bfa75719045e440b9",
+  "fixture_sha256": "046d6579bea641d6f9485fc98a10534fd41b224fcfd39527ad50bbd614319f3a",
+  "binary_sha256": "33a513e6f1aae2f7a5d4f53b29d5c787d6472a060520d7de6bf788abc828d277",
+  "rows": [
+    {
+      "request_index": 0,
+      "case": "short",
+      "kind": "same_case_warmup",
+      "text": "So I need to send the report by Thursday.",
+      "host_http_ms": 87548.463939,
+      "ids_file": "ids-0-short-same_case_warmup.bin",
+      "ids_sha256": "c9e8019f15282db57411cf4ea0120e43eae1c0f51420cb7b0c8cf4efcb7a68ce",
+      "ids_bytes": 44
+    },
+    {
+      "request_index": 1,
+      "case": "short",
+      "kind": "diagnostic",
+      "text": "So I need to send the report by Thursday.",
+      "host_http_ms": 62720.897746,
+      "ids_file": "ids-1-short-diagnostic.bin",
+      "ids_sha256": "c9e8019f15282db57411cf4ea0120e43eae1c0f51420cb7b0c8cf4efcb7a68ce",
+      "ids_bytes": 44
+    }
+  ],
+  "completed": false,
+  "directional_latency_allowed": true,
+  "launch_to_ready_ms": 54774.589827,
+  "health": {
+    "status": "ok",
+    "model": "s1",
+    "loaded": true,
+    "busy": false,
+    "phase": "ready",
+    "queue_depth": 0
+  },
+  "failure": "TimeoutError('timed out')"
+}
