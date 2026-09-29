@@ -22,6 +22,7 @@ on:
       - 'tests/test_native_serve.py'
       - 'tests/test_compact_quantization.py'
       - 'quants/recipes/**'
+      - 'benchmarks/speculative/**'
       - '.github/workflows/ci-starling-serve.yml'
   pull_request:
     paths:
@@ -34,6 +35,7 @@ on:
       - 'tests/test_native_serve.py'
       - 'tests/test_compact_quantization.py'
       - 'quants/recipes/**'
+      - 'benchmarks/speculative/**'
       - '.github/workflows/ci-starling-serve.yml'
   workflow_dispatch:
     inputs:
@@ -123,7 +125,7 @@ jobs:
             graph_snapshot_test \
             replay_graph_support_test cpu_repack_test \
             device_cache_clear_test greedy_termination_test tdt_graph_budget_test \
-            speculative_verifier_test
+            speculative_verifier_test moss-preview-copy-test
 
       - name: Quantizer storage and recipe regressions
         env:
@@ -137,6 +139,7 @@ jobs:
           ./build/stream_session_test
           ./build/audio_parser_test
           ./build/replay_graph_support_test
+          ./build/moss-preview-copy-test
 
       # Engine contracts from the optimization program: on-device KV cache
       # clearing (S01), EOS/budget termination (S03), and batched speculative
