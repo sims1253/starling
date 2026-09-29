@@ -1,0 +1,17 @@
+{
+  "schema": "s1-quant-span-comparison-v1",
+  "cases": 8,
+  "source_sha256": "c4fc61df01df19655d796e085d29aa41647d33cfd090824778ecadd76a2bb11c",
+  "baseline_model_sha256": "c4fc61df01df19655d796e085d29aa41647d33cfd090824778ecadd76a2bb11c",
+  "candidate_model_sha256": "4b12084f0cbbfcfe7c88ed45e8aac28fa20e813faf77f24b9c8d46bc7f9f5834",
+  "changed_outputs": [
+    "negated_deadline",
+    "negation_and_name"
+  ],
+  "baseline_violations": [],
+  "new_violations": [],
+  "baseline_bytes": 1198656192,
+  "candidate_bytes": 610995040,
+  "bytes_saved": 587661152,
+  "device": "CPU/Pixel10Pro"
+}

@@ -1,0 +1,6 @@
+[starling-serve] loading model 's1' from /data/local/tmp/starling-issue-batch/s1-bf16.gguf ...
+[starling-serve] model loaded in 0.6s
+[starling-serve] warming up on probe text ...
+[starling-serve] warmup complete
+[starling-serve] starting on 127.0.0.1:8181 (model=s1, backend=CPU, abi=8)
+Terminated 

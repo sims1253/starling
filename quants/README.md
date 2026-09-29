@@ -55,6 +55,8 @@ models, generated quants, recordings, and calibration corpora stay out of Git.
 Run `python -m unittest discover -s quants/tests -v` for catalog, failure recovery,
 and provenance checks. Use the existing [quantization research](../docs/quantization.md)
 and [benchmark harnesses](../benchmarks/README.md) for real audio evaluation.
+The experimental S1-mini decoder profile and its protected-span pilot are
+documented in [S1-mini quantization](../docs/quantization-s1-mini.md).
 
 Include negation, uncommon vocabulary, resumed lists, spoken corrections,
 intentional filler, short answers, and long recordings in release evaluation.

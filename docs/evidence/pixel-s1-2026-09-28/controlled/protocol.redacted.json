@@ -1,0 +1,86 @@
+{
+  "schema": "pixel-controlled-quant-pilot-v1",
+  "registered_utc": "2026-09-28T12:02:40Z",
+  "device_serial": "[redacted: phone network address]",
+  "adb": "[redacted: host-specific path]",
+  "device_dir": "/data/local/tmp/starling-issue-batch",
+  "build_source_commit": "2a3bda4",
+  "environment": {
+    "screen": "OFF throughout samples",
+    "unrelated_app": "paused before work; no app access",
+    "charging": "AC/USB/wireless false and status=3 throughout",
+    "thermal_abort_status_at_least": 2,
+    "battery_temp_abort_deci_c_at_least": 420,
+    "no_app_state_changes": true,
+    "no_device_settings_changes": true
+  },
+  "sequence": [
+    {
+      "family": "parakeet_fast",
+      "arms": [
+        "baseline",
+        "embedding",
+        "embedding",
+        "baseline"
+      ],
+      "model_sha256": [
+        "bfee29b2b3419b387c8bc1b28a1772b506dd57aa9cfd879b2530bc287d93b0d3",
+        "7723f275a11dd191262e43afd3027a136785ace7af7e6762b0fbd8c5d24b0a55"
+      ],
+      "engine_sha256": "e1a6b3b0f7ff04b3e5a03a62aa5c55deeb2bf0d8bbd4ab4ee80b202755044e4a",
+      "force_engine": "STARLING_ENGINE=fast; actual fast/vulkan PowerVR device stderr required",
+      "fixtures": [
+        "short.wav",
+        "medium.wav"
+      ],
+      "timed_runs": [
+        72,
+        72
+      ],
+      "warmup": "one inference per fixture via --warmup",
+      "latency_exclude_first_timed_per_fixture": 3,
+      "expected_transcript": "require every run transcript equals first result for that fixture and same across all arms",
+      "active_energy_scope": "process launch through process exit, includes load/warmup/timed runs"
+    },
+    {
+      "family": "s1_cpu",
+      "arms": [
+        "bf16",
+        "q4-k-m",
+        "q4-k-m",
+        "bf16"
+      ],
+      "model_sha256": [
+        "c4fc61df01df19655d796e085d29aa41647d33cfd090824778ecadd76a2bb11c",
+        "4b12084f0cbbfcfe7c88ed45e8aac28fa20e813faf77f24b9c8d46bc7f9f5834"
+      ],
+      "engine_sha256": "e9d65265def7129b0505cea08a1b7749d17e7b1e79645bf880ae84c289bbb224",
+      "force_engine": "STARLING_ENGINE=ggml STARLING_GGML_DEVICE=CPU STARLING_GGML_THREADS=6; server actual backend CPU log required",
+      "cases_sha256": "ef9184b34e51f45ce179026afa675f38975eadae560af1e3a20c00f82cfdb4a5",
+      "case_order": "fixture file order, eight cases",
+      "repeats_per_case_per_block": 1,
+      "warmup": "server --warmup before /health ready; process launch to ready includes load and Q4 repack",
+      "latency": "host monotonic HTTP /normalize wall; same ADB forward and request path for both arms",
+      "active_energy_scope": "process launch through final response and graceful server termination"
+    }
+  ],
+  "block_schedule": {
+    "pre_idle_seconds": 45,
+    "post_idle_seconds": 45,
+    "idle_sample_period_seconds": 5,
+    "active_sample_period_seconds": 5,
+    "full_state_period_seconds": 15,
+    "extra_cooldown_max_seconds": 180,
+    "cooldown_rule": "Before each block wait up to 180s for thermal status <=1 and battery temperature <370 deciC; if not reached record descriptive drift and disable directional latency/energy win claims.",
+    "no_workload_overlap": true,
+    "fresh_process_per_block": true
+  },
+  "analysis": {
+    "latency": "Fast: median of timed runs after excluding first 3 per fixture per block, report per-block medians and ABBA adjacent differences. S1: host-monotonic post-startup-warmup HTTP /normalize latency, one request per case per block; generic warmup need not warm each case shape. Report per-case values and paired blocks, not native-only or steady-state per-case latency. If cooling rule is breached, only descriptive timings and no directional win.",
+    "energy": "Take timestamped charge-counter/voltage samples immediately before process launch and immediately after confirmed exit; active duration is the interval between these two sample timestamps. For each block, subtract idle discharge extrapolated across that duration using both pre and post idle slopes; compute a central estimate with their mean and an uncertainty interval from their minimum/maximum, widened by two empirical gauge steps per block. Convert uAh*mV/1e6 to mWh using mean active voltage. A directional win requires every adjacent baseline-minus-candidate energy contrast to remain strictly positive over this full uncertainty interval and exceed four gauge steps; if any interval reaches zero, charging, counter increase beyond one step, missing boundary, or temperature/cooling rule breach, report inconclusive. These are battery-side device estimates, not model-only joules.",
+    "load": "Fast internal load header and total process duration separately (stdout may be buffered); S1 process-launch-to-ready includes warmup/repack, with internal load-stage separately. Warm request excluded from latency.",
+    "memory": "Existing warmed PSS/GPU snapshots retained; during this pilot optionally sample process/global RAM outside timing path, do not sum dumpsys total PSS and graphics mtrack.",
+    "abort": "Preserve partial raw output and mark incomplete if phone becomes charging, thermal >=2, battery >=42C, script timeout, engine mismatch, or duplicate/missing result."
+  },
+  "time_budget_minutes": 40
+}

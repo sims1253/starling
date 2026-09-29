@@ -1,0 +1,7 @@
+{
+  "family": "s1_cpu",
+  "arm": "q4-k-m",
+  "index": 1,
+  "samples": 42,
+  "results": 8
+}
