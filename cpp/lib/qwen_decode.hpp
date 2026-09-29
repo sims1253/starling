@@ -13,6 +13,7 @@
 #include "ggml.h"
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -130,6 +131,7 @@ struct PrefillResult { std::vector<float> logits; int32_t first_token = -1; LlmS
 enum class GenStopReason {
     kEos,
     kBudgetExhausted,
+    kCancelled,
 };
 struct GenerateResult {
     std::vector<int32_t> ids;
@@ -177,6 +179,35 @@ bool llm_decode_step(const QwenDecodeCtx& m, int32_t prev_token,
 int32_t spec_argmax(const QwenDecodeSpec& s, const std::vector<float>& x);
 bool greedy_generate(const QwenDecodeCtx& m, const InputsEmbeds& i, const GenerateParams& op,
                      GenerateResult& o, std::string& e);
+
+// Opt-in greedy speculative generation. The proposer sees only verified output
+// tokens and may return at most max_k candidate IDs. An empty proposal falls
+// back to one ordinary decode step. The verifier checks all candidates in one
+// causal S-row graph and emits only the accepted prefix plus the target's
+// correction/bonus token. Cancellation is checked before and after a graph;
+// any in-flight tentative output is discarded on cancellation.
+using DraftProposer = std::function<std::vector<int32_t>(const std::vector<int32_t>&, int)>;
+using CancelCheck = std::function<bool()>;
+struct SpeculativeStats {
+    int32_t proposed = 0;
+    int32_t accepted = 0;
+    int32_t verify_calls = 0;
+    int32_t fallback_steps = 0;
+    // Wall times include the real proposer callback and graph readback.
+    // total_ms also includes host acceptance, allocation, and cancellation.
+    double prefill_ms = 0.0;
+    double proposal_ms = 0.0;
+    double verify_ms = 0.0;
+    double fallback_ms = 0.0;
+    double total_ms = 0.0;
+};
+// max_k must be in [1, kMaxSpeculativeK]; invalid configuration returns false
+// with an error rather than clamping.
+constexpr int kMaxSpeculativeK = 16;
+bool speculative_generate(const QwenDecodeCtx& m, const InputsEmbeds& i,
+                          const GenerateParams& op, int max_k,
+                          const DraftProposer& proposer, const CancelCheck& cancelled,
+                          GenerateResult& o, SpeculativeStats& stats, std::string& e);
 // Number of captured per-S prefill graphs for this model (diagnostic + the
 // bounded-LRU regression-test hook). Zero on CPU / before first GPU prefill.
 size_t prefill_replay_cache_size(const ModelLoader& loader);

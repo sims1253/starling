@@ -1,0 +1,119 @@
+"""CPU regressions for the sanitizer runner's fail-closed accounting."""
+
+from __future__ import annotations
+
+import importlib.util
+from pathlib import Path
+from unittest.mock import Mock
+
+SPEC = importlib.util.spec_from_file_location(
+    "sanitizer_gate", Path(__file__).resolve().parents[1] / "scripts/sanitizer_gate.py"
+)
+sanitizer_gate = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(sanitizer_gate)
+_sanitizer_result = sanitizer_gate._sanitizer_result
+run_tool = sanitizer_gate.run_tool
+
+
+def _fake_sanitizer(tmp_path: Path) -> Path:
+    executable = tmp_path / "compute-sanitizer"
+    executable.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$FAKE_SANITIZER_MODE\" = timeout ]; then sleep 2; fi\n"
+        "if [ \"$FAKE_SANITIZER_MODE\" = no_child ]; then\n"
+        "  echo '========= ERROR SUMMARY: 0 errors'\n"
+        "  exit 0\n"
+        "fi\n"
+        "shift 6\n"
+        '"$@"\n'
+        "result=$?\n"
+        "if [ \"$FAKE_SANITIZER_MODE\" = finding ]; then\n"
+        "  echo '========= ERROR SUMMARY: 1 error'\n"
+        "  exit 86\n"
+        "fi\n"
+        "echo '========= ERROR SUMMARY: 0 errors'\n"
+        'exit "$result"\n'
+    )
+    executable.chmod(0o755)
+    return executable
+
+
+def _run(tmp_path: Path, monkeypatch, source: str, mode: str = "", timeout: int = 30) -> dict[str, object]:
+    test = tmp_path / "test_probe.py"
+    test.write_text(source)
+    monkeypatch.setenv("FAKE_SANITIZER_MODE", mode)
+    return run_tool(
+        str(_fake_sanitizer(tmp_path)), "memcheck", tmp_path, timeout,
+        test=test, expected_tests=1, cwd=tmp_path,
+    )
+
+
+def test_inherited_collect_only_does_not_bypass_execution(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("PYTEST_ADDOPTS", "--collect-only -p no:cacheprovider")
+    result = _run(tmp_path, monkeypatch, "def test_runs(): assert True\n")
+    assert result["status"] == "pass"
+    assert result["executed_tests"] == 1
+
+
+def test_no_tests_and_stale_report_fail(tmp_path: Path, monkeypatch) -> None:
+    stale = tmp_path / "memcheck.junit.xml"
+    stale.write_text('<testsuite><testcase name="stale"/></testsuite>')
+    result = _run(tmp_path, monkeypatch, "# no tests\n", mode="no_child")
+    assert not stale.exists()
+    assert result["status"] == "fail"
+    assert result["executed_tests"] == 0
+    assert "did not write" in str(result["reason"])
+
+
+def test_skipped_test_fails(tmp_path: Path, monkeypatch) -> None:
+    result = _run(tmp_path, monkeypatch, "import pytest\ndef test_skip(): pytest.skip('no GPU')\n")
+    assert result["status"] == "fail"
+    assert "skipped" in str(result["reason"])
+
+
+def test_timeout_fails(tmp_path: Path, monkeypatch) -> None:
+    result = _run(tmp_path, monkeypatch, "def test_runs(): assert True\n", mode="timeout", timeout=1)
+    assert result["status"] == "timeout"
+    assert result["exit_code"] is None
+    assert "timed out" in str(result["reason"])
+
+
+def test_sanitizer_finding_fails(tmp_path: Path, monkeypatch) -> None:
+    result = _run(tmp_path, monkeypatch, "def test_runs(): assert True\n", mode="finding")
+    assert result["status"] == "fail"
+    assert "exit code 86" in str(result["reason"])
+
+
+def test_any_nonzero_summary_fails_even_after_a_clean_summary(tmp_path: Path) -> None:
+    log = tmp_path / "multi.log"
+    log.write_text("ERROR SUMMARY: 0 errors\nERROR SUMMARY: 1 error\n")
+    assert _sanitizer_result(log, "memcheck") is not None
+    log.write_text(
+        "RACECHECK SUMMARY: 0 hazards displayed (0 errors, 0 warnings)\n"
+        "RACECHECK SUMMARY: 1 hazard displayed (1 error, 0 warnings)\n"
+    )
+    assert _sanitizer_result(log, "racecheck") is not None
+
+
+def test_windows_timeout_kills_the_sanitizer_tree(monkeypatch) -> None:
+    process = Mock(pid=1234)
+    process.poll.return_value = 0
+    monkeypatch.setattr(sanitizer_gate.subprocess, "run", Mock())
+    sanitizer_gate._terminate_tree(process, platform="nt")
+    sanitizer_gate.subprocess.run.assert_called_once_with(
+        ["taskkill", "/T", "/F", "/PID", "1234"],
+        check=False, capture_output=True, timeout=15,
+    )
+    process.wait.assert_called_once_with(timeout=15)
+
+
+def test_post_launch_oserror_reaps_the_process(tmp_path: Path, monkeypatch) -> None:
+    process = Mock(pid=4321)
+    process.wait.side_effect = [OSError("wait failed"), 0]
+    monkeypatch.setattr(sanitizer_gate.subprocess, "Popen", Mock(return_value=process))
+    cleanup = Mock()
+    monkeypatch.setattr(sanitizer_gate, "_terminate_tree", cleanup)
+    result = run_tool("compute-sanitizer", "memcheck", tmp_path, 30)
+    assert result["status"] == "fail"
+    assert "wait failed" in result["reason"]
+    cleanup.assert_called_once_with(process)

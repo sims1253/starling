@@ -12,10 +12,17 @@ module map back to the removed TypeScript sources.
 
 ## Packaging
 
+[Experimental releases](https://github.com/sims1253/starling/releases?q=experimental&expanded=true)
+include Linux and Windows desktop archives after each successful master build,
+alongside CPU, Vulkan, and CUDA server packages. See the
+[installation guide](../../docs/experimental-releases.md) for setup and runtime
+requirements. The desktop app connects to the server; choose the server package
+for the inference backend you want to test.
+
 `scripts/package-macos.sh` builds the universal (aarch64 + x86_64) binary,
 assembles `Starling.app`, and produces `target/package/Starling-macOS-universal.dmg`.
-CI runs it on every push (`desktop-gpui-rust.yml` `build-macos`) and pairs it
-with a portable Windows zip (`build-windows`). Both artifacts are unsigned
+CI runs it on every push (`desktop-gpui-rust.yml` `build-macos`).
+`package-desktop.yml` builds the portable Linux and Windows archives. These artifacts are unsigned
 development builds; notarized installers are a separate release task.
 
 ## Layout

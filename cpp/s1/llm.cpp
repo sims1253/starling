@@ -56,6 +56,18 @@ bool greedy_generate(const S1Model& m, const lib::InputsEmbeds& i,
     return lib::greedy_generate(decode_ctx(m), i, p, o, e);
 }
 
+bool speculative_generate(const S1Model& m, const lib::InputsEmbeds& i,
+                          const GenerateOptions& op, int max_k,
+                          const lib::DraftProposer& proposer,
+                          const lib::CancelCheck& cancelled,
+                          lib::GenerateResult& o, lib::SpeculativeStats& stats,
+                          std::string& e) {
+    const lib::GenerateParams p{op.max_new_tokens, op.max_cache_len,
+                                op.eos_token_id, op.eos2_token_id};
+    return lib::speculative_generate(decode_ctx(m), i, p, max_k, proposer,
+                                     cancelled, o, stats, e);
+}
+
 size_t prefill_replay_cache_size(const S1Model& model) {
     return lib::prefill_replay_cache_size(model.loader);
 }

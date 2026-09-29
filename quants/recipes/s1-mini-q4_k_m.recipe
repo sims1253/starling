@@ -1,0 +1,13 @@
+# EXPERIMENTAL S1-mini GGUF recipe for the native ggml engine.
+# Only decoder linears are quantized; the tied token embedding/lm_head stays
+# BF16. Sensitive value/output attention and FFN down projections use Q6_K.
+# No protected-span or multilingual promotion claim follows from this file.
+#
+# build-cpu/starling-quantize \
+#   --input models/s1-mini-bf16-exact.gguf \
+#   --output models/s1-mini-q4_k_m.gguf \
+#   --recipe quants/recipes/s1-mini-q4_k_m.recipe \
+#   --imatrix models/s1-mini-calibration.imx
+default q4_k
+^llm\.blk\.[0-9]+\.attn\.(v|o)\.weight$ q6_k
+^llm\.blk\.[0-9]+\.ffn\.down\.weight$ q6_k

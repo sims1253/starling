@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Starling Experimental</string>
+    <string name="keyboard_name">Starling Experimental Voice Input</string>
+    <string name="recognition_service_name">Starling Experimental Voice Recognition</string>
+    <string name="screen_title">Starling Experimental</string>
+    <string name="keyboard_transcription_failed">Transcription failed. The recording remains available in Starling Experimental.</string>
+    <string name="keyboard_microphone_permission">Grant microphone permission in Starling Experimental first.</string>
+    <string name="recognize_failed">Transcription failed. The recording is kept in Starling Experimental for retry.</string>
+</resources>

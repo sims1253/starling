@@ -1,4 +1,5 @@
 #include "loader.hpp"
+#include "ggml.h"
 #include <cstdio>
 #include <vector>
 
@@ -8,6 +9,16 @@ namespace {
 using lib::f32;
 using lib::f64;
 using lib::str;
+
+bool supported_linear_type(ggml_type type) {
+    return type == GGML_TYPE_BF16 || type == GGML_TYPE_F32 ||
+           type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q4_K ||
+           type == GGML_TYPE_Q6_K;
+}
+
+bool supported_norm_type(ggml_type type) {
+    return type == GGML_TYPE_BF16 || type == GGML_TYPE_F32;
+}
 } // namespace
 
 bool S1Model::load(const char* path, std::string& err) {
@@ -89,7 +100,12 @@ bool S1Model::load(const char* path, std::string& err) {
         for (auto v : a) c.prompt_suffix.push_back((int32_t) v);
 
     // --- Validate untrusted GGUF metadata (mirror qwen3/loader.cpp). ---
-    if (!lib::check_gguf_header(m, "s1", "S1", {"bf16_exact"}, err))
+    std::string profile;
+    if (!m.kv_str("starling.numeric_profile", profile)) {
+        err = "S1 GGUF missing starling.numeric_profile";
+        return false;
+    }
+    if (!lib::check_gguf_header(m, "s1", "S1", {"bf16_exact", "quantized"}, err))
         return false;
 #define POS(v, name) do { if (!(v)) { err = "S1 GGUF " name " must be positive"; return false; } } while (0)
     POS(c.llm.n_layers, "llm.num_layers");
@@ -128,8 +144,17 @@ bool S1Model::load(const char* path, std::string& err) {
     // Require every expected tensor so a structural change fails loudly:
     // embed/final norm + 11 tensors per Qwen3 layer (same layout as the
     // qwen3-ASR trunk).
+    const bool quantized = profile == "quantized";
     for (const char* n : {"llm.embed.weight", "llm.final_norm.weight"})
         if (!lib::require(m, n, "S1", err)) return false;
+    if (quantized && m.tensor("llm.embed.weight")->type != GGML_TYPE_BF16) {
+        err = "S1 quantized profile requires a BF16 embedding (it doubles as the tied lm_head)";
+        return false;
+    }
+    if (quantized && !supported_norm_type(m.tensor("llm.final_norm.weight")->type)) {
+        err = "S1 quantized profile requires BF16/F32 final norm";
+        return false;
+    }
     for (uint32_t i = 0; i < c.llm.n_layers; ++i) {
         char n[128];
         for (const char* tail : {"attn_norm.weight", "attn.q.weight", "attn.k.weight",
@@ -139,6 +164,15 @@ bool S1Model::load(const char* path, std::string& err) {
                                  "ffn.up.weight", "ffn.down.weight"}) {
             std::snprintf(n, sizeof n, "llm.blk.%u.%s", i, tail);
             if (!lib::require(m, n, "S1", err)) return false;
+            if (quantized) {
+                const ggml_type type = m.tensor(n)->type;
+                const bool linear = std::string(tail).find("norm.weight") == std::string::npos;
+                if (!(linear ? supported_linear_type(type) : supported_norm_type(type))) {
+                    err = std::string("S1 quantized profile has unsupported tensor type ") +
+                          ggml_type_name(type) + " at " + n;
+                    return false;
+                }
+            }
         }
     }
     return true;

@@ -1,0 +1,19 @@
+[
+  {
+    "charge_uah": 2870000,
+    "voltage_mv": 3985,
+    "battery_status": 3,
+    "battery_percent": 62,
+    "battery_temp_deci_c": 299,
+    "ac_powered": "false",
+    "usb_powered": "false",
+    "wireless_powered": "false",
+    "thermal_status": 0,
+    "screen_state": "OFF",
+    "wakefulness": "Dozing",
+    "mono_start_ns": 794739660763217,
+    "mono_end_ns": 794740741047670,
+    "mono_mid_ns": 794740200905443,
+    "utc": "2026-09-28T12:07:08.853818+00:00"
+  }
+]

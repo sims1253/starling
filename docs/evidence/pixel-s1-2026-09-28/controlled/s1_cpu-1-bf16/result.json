@@ -1,0 +1,100 @@
+{
+  "family": "s1_cpu",
+  "arm": "bf16",
+  "index": 0,
+  "protocol_sha256": "c66f7614fa44c34884059f80b64794905b96167cada6f102d2972756b6b0e708",
+  "cooled_before_block": true,
+  "launch_to_ready_ms": 52682.305641,
+  "responses": [
+    {
+      "id": "negation_and_name",
+      "output": "Do not send this to Claire yet. Send it to Maya.",
+      "latency_ms": 10364.538047,
+      "mono_start_ns": 795160764739975,
+      "mono_end_ns": 795171129278022
+    },
+    {
+      "id": "amount_correction",
+      "output": "The total is $45.",
+      "latency_ms": 6676.126595,
+      "mono_start_ns": 795171129671164,
+      "mono_end_ns": 795177805797759
+    },
+    {
+      "id": "email_address",
+      "output": "Please email alex.chen@example.org by Thursday.",
+      "latency_ms": 45476.072309,
+      "mono_start_ns": 795177806141322,
+      "mono_end_ns": 795223282213631
+    },
+    {
+      "id": "url",
+      "output": "The link is example.org/pricing.",
+      "latency_ms": 49092.879496,
+      "mono_start_ns": 795223282975672,
+      "mono_end_ns": 795272375855168
+    },
+    {
+      "id": "identifier",
+      "output": "Ticket ID is AB79C2.",
+      "latency_ms": 42585.765392,
+      "mono_start_ns": 795272376268548,
+      "mono_end_ns": 795314962033940
+    },
+    {
+      "id": "person_name",
+      "output": "I spoke with Naomi Tanaka, and she will call tomorrow.",
+      "latency_ms": 54307.591978,
+      "mono_start_ns": 795314962350321,
+      "mono_end_ns": 795369269942299
+    },
+    {
+      "id": "negated_deadline",
+      "output": "We cannot ship before June 2nd.",
+      "latency_ms": 41939.956576,
+      "mono_start_ns": 795369270307810,
+      "mono_end_ns": 795411210264386
+    },
+    {
+      "id": "two_port_numbers",
+      "output": "Use PORT 8080, not 8008.",
+      "latency_ms": 68436.990979,
+      "mono_start_ns": 795411210595047,
+      "mono_end_ns": 795479647586026
+    }
+  ],
+  "active_boundary_start": {
+    "charge_uah": 2825000,
+    "voltage_mv": 3982,
+    "battery_status": 3,
+    "battery_percent": 61,
+    "battery_temp_deci_c": 269,
+    "ac_powered": "false",
+    "usb_powered": "false",
+    "wireless_powered": "false",
+    "mono_start_ns": 795107865111940,
+    "mono_end_ns": 795108016605098,
+    "mono_mid_ns": 795107940858519,
+    "utc": "2026-09-28T12:13:38.337535+00:00",
+    "phase": "active_boundary_before_launch"
+  },
+  "process_launch_ns": 795108082269351,
+  "process_exit_ns": 795480790549846,
+  "active_boundary_end": {
+    "charge_uah": 2780000,
+    "voltage_mv": 3948,
+    "battery_status": 3,
+    "battery_percent": 60,
+    "battery_temp_deci_c": 277,
+    "ac_powered": "false",
+    "usb_powered": "false",
+    "wireless_powered": "false",
+    "mono_start_ns": 795480790647784,
+    "mono_end_ns": 795480936982019,
+    "mono_mid_ns": 795480863814901,
+    "utc": "2026-09-28T12:20:11.222233+00:00",
+    "phase": "active_boundary_after_exit"
+  },
+  "process_duration_ms": 372708.280495,
+  "completed": true
+}

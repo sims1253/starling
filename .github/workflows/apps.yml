@@ -82,6 +82,22 @@ jobs:
       - name: Build and test Android
         working-directory: apps/mobile
         run: ./gradlew --no-daemon testDebugUnitTest lintDebug assembleDebug
+      - name: Check experimental release branding
+        # The experimental release overlays the user-visible names; this
+        # guards the overlay against colliding with src/main resources.
+        working-directory: apps/mobile
+        run: |
+          set -euo pipefail
+          ./gradlew --no-daemon -PstarlingExperimental=true :app:mergeReleaseResources
+          merged=$(find app/build/intermediates -path '*mergeReleaseResources*merged.dir*' -name values.xml)
+          if [ "$(printf '%s\n' "$merged" | grep -c .)" != 1 ]; then
+            echo "::error::Expected one merged release values.xml, found: $merged"
+            exit 1
+          fi
+          grep -q '<string name="app_name">Starling Experimental</string>' "$merged"
+          grep -q '<string name="screen_title">Starling Experimental</string>' "$merged"
+          grep -q '<string name="keyboard_name">Starling Experimental Voice Input</string>' "$merged"
+          grep -q '<string name="recognition_service_name">Starling Experimental Voice Recognition</string>' "$merged"
       - name: Upload the debug APK
         # Installable build of every push and same-repository PR for
         # on-device testing; fork PRs (unreviewed code) get no installable
