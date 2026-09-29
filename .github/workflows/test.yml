@@ -40,6 +40,7 @@ jobs:
   experiments-harness:
     name: Experiments harness (CPU)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -50,6 +51,8 @@ jobs:
         uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4
       - name: Unit and comparator tests (stub double, no models)
         run: uv run --no-project --python 3.12 python -m unittest discover -s benchmarks/experiments -p 'test_*.py'
+      - name: Contention pilot decision tests (saved result summaries)
+        run: uv run --no-project --python 3.12 python -m unittest discover -s benchmarks/contention -p 'test_*.py'
       - name: Paired CPU reproduction (contract fixture binary)
         run: >
           cmake -B build-exp -DSTARLING_SERVE=ON -DSTARLING_GGML_TESTS=ON

@@ -7,6 +7,7 @@
 #include "server.hpp"
 
 #include "lib/model_registry.hpp"
+#include "lib/granite_job_internal.hpp"
 #include "runtime/trace.hpp"
 
 #include <algorithm>
@@ -97,7 +98,13 @@ std::string supported_models_str() {
 }
 
 // ---- StarlingServer -------------------------------------------------------
-StarlingServer::StarlingServer(ServerConfig cfg) : cfg_(std::move(cfg)) {}
+StarlingServer::StarlingServer(ServerConfig cfg)
+    : cfg_(std::move(cfg)), backend_identity_(starling_ggml_backend_name()) {}
+
+std::string StarlingServer::backend_identity() const {
+    std::lock_guard<std::mutex> lk(load_mutex_);
+    return backend_identity_;
+}
 
 StarlingServer::~StarlingServer() {
     if (model_) {
@@ -126,6 +133,10 @@ void StarlingServer::load() {
         return;  // loaded_ stays false
     }
 
+    // Loading selects the actual device. Capture its name before publishing
+    // loaded_: later WS sessions can build their cache key without waiting on
+    // the C API runtime mutex during an active inference chunk.
+    backend_identity_ = starling_ggml_backend_name();
     loaded_.store(true);
     auto dt = std::chrono::duration<double>(
                   std::chrono::steady_clock::now() - t0).count();
@@ -214,10 +225,50 @@ TranscribeResult StarlingServer::do_transcribe(
     QueuePolicy policy) {
     std::string text;
     std::string req_id;
-    if (!run_with_turn(ctx, policy, [&] {
-            return starling_ggml_transcribe_pcm(model_, samples, n, kSampleRate);
-        }, &text, err, &req_id))
-        return {};
+    if (cfg_.granite_chunk_fairness && cfg_.model_slug == "granite") {
+        using namespace starling::ggml::lib;
+        std::unique_ptr<GraniteChunkJob, decltype(&free_granite_job)> job(
+            create_granite_job(model_, samples, n), &free_granite_job);
+        if (!job) {
+            const char* emsg = starling_ggml_last_error(model_);
+            if (err) *err = emsg ? emsg : "Granite job creation failed";
+            return {};
+        }
+        bool continuing = false;
+        for (;;) {
+            const bool final_chunk = granite_job_last_chunk(job.get());
+            // The job owns partial text until its final step. This one-byte
+            // success token satisfies run_with_turn's malloc-string contract
+            // without publishing a partial or false final to the transport.
+            if (!run_with_turn(ctx, policy, [&] {
+                    std::string final_text;
+                    const int status = step_granite_job(model_, job.get(), &final_text);
+                    if (status < 0) {
+                        const char* emsg = starling_ggml_last_error(model_);
+                        if (err) *err = emsg ? emsg : "Granite chunk failed";
+                        return static_cast<char*>(nullptr);
+                    }
+                    if ((status == 1) != final_chunk) {
+                        if (err) *err = "Granite job completion did not match chunk policy";
+                        return static_cast<char*>(nullptr);
+                    }
+                    const std::string& emitted = status == 1 ? final_text : std::string();
+                    char* out = static_cast<char*>(std::malloc(emitted.size() + 1));
+                    if (!out) { if (err) *err = "malloc failed"; return out; }
+                    std::memcpy(out, emitted.data(), emitted.size());
+                    out[emitted.size()] = '\0';
+                    return out;
+                }, &text, err, &req_id, final_chunk, continuing))
+                return {};
+            if (final_chunk) break;
+            continuing = true;
+        }
+    } else {
+        if (!run_with_turn(ctx, policy, [&] {
+                return starling_ggml_transcribe_pcm(model_, samples, n, kSampleRate);
+            }, &text, err, &req_id))
+            return {};
+    }
 
     // Response emission (result marshalling — the transport-level body build
     // and socket write stay outside the trace; see docs/native-serving.md).
@@ -239,14 +290,27 @@ TranscribeResult StarlingServer::do_transcribe(
 bool StarlingServer::run_with_turn(RequestContext* ctx, QueuePolicy policy,
                                    const std::function<char*()>& engine_call,
                                    std::string* out_text, std::string* err,
-                                   std::string* effective_req_id) {
+                                   std::string* effective_req_id,
+                                   bool complete_request,
+                                   bool continuing) {
     // Acquire the serial queue position. Every caller gets a ticket —
     // anonymous ones (warmup, WS streaming) get a synthesized id so they
     // queue like everyone else instead of racing the engine.
     std::string req_id = ctx ? ctx->id : "";
     {
         std::unique_lock<std::mutex> lk(mutex_);
-        if (n_waiters_ >= kMaxWaiters) {
+        if (continuing) {
+            // The preceding chunk reserved this request's admission slot.
+            // Transfer the reservation to its new FIFO ticket atomically.
+            // A continuation must wait for its turn even if the initial
+            // request used SkipIfBusy.
+            policy = QueuePolicy::Block;
+            if (reserved_continuations_ <= 0) {
+                if (err) *err = "Granite continuation lost its queue reservation";
+                return false;
+            }
+            --reserved_continuations_;
+        } else if (n_waiters_ + reserved_continuations_ >= kMaxWaiters) {
             if (err) *err = "server busy";
             return false;
         }
@@ -287,12 +351,26 @@ bool StarlingServer::run_with_turn(RequestContext* ctx, QueuePolicy policy,
             queue_cv_.notify_all();
         };
 
-        while (request_order_.front() != req_id) {
+        bool waited = false;
+        for (;;) {
             if (ctx && ctx->cancelled.load()) {
                 leave_queue("cancelled");
                 if (err) *err = "cancelled";
                 return false;
             }
+            // Check the deadline before accepting a newly freed turn. A
+            // notify at (or after) the deadline must not bypass the timeout.
+            // A caller already at the head never waited and has no queue
+            // deadline to enforce.
+            double timeout = cfg_.request_timeout_seconds;
+            double elapsed = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - wait_start).count();
+            if (waited && timeout > 0 && elapsed >= timeout) {
+                leave_queue("timed_out");
+                if (err) *err = "request timed out";
+                return false;
+            }
+            if (request_order_.front() == req_id) break;
             if (policy == QueuePolicy::SkipIfBusy) {
                 // Anonymous latency-sensitive caller (WS streaming chunk):
                 // don't park on the queue — report busy and retry later.
@@ -300,17 +378,9 @@ bool StarlingServer::run_with_turn(RequestContext* ctx, QueuePolicy policy,
                 if (err) *err = "server busy";
                 return false;
             }
-            double timeout = cfg_.request_timeout_seconds;
-            if (timeout > 0) {
-                auto elapsed = std::chrono::duration<double>(
-                    std::chrono::steady_clock::now() - wait_start).count();
-                if (elapsed >= timeout) {
-                    leave_queue("timed_out");
-                    if (err) *err = "request timed out";
-                    return false;
-                }
-            }
-            queue_cv_.wait_for(lk, std::chrono::milliseconds(100));
+            waited = true;
+            queue_cv_.wait_for(lk, std::chrono::duration<double>(
+                timeout > 0 ? std::max(0.0, std::min(0.1, timeout - elapsed)) : 0.1));
         }
         if (trace::on()) {
             // Host time blocked waiting for the turn (0 when immediately
@@ -363,11 +433,18 @@ bool StarlingServer::run_with_turn(RequestContext* ctx, QueuePolicy policy,
             // Claim completion under the same lock cancel_request uses: if
             // cancellation already won, discard the result; otherwise the
             // result stands and later cancels return false.
-            ctx->done = true;
+            ctx->done = complete_request || !result_text;
             cancel_won = ctx->cancelled.load();
         }
+        // do_transcribe's next statement is run_with_turn(continuing=true),
+        // which consumes this reservation under this mutex on entry, before
+        // any wait, cancel or timeout exit. Failed or cancelled chunks never
+        // reserve, so no exit path can strand a slot.
+        if (!complete_request && result_text && !cancel_won)
+            ++reserved_continuations_;
         queue_cv_.notify_all();
-        if (tr_on) trace::queue_exit_event(req_id, n_waiters_, "completed");
+        if (tr_on) trace::queue_exit_event(req_id, n_waiters_,
+            !result_text ? "failed" : (complete_request ? "completed" : "yielded"));
     }
 
     if (cancel_won) {
@@ -378,7 +455,7 @@ bool StarlingServer::run_with_turn(RequestContext* ctx, QueuePolicy policy,
 
     if (!result_text) {
         const char* emsg = starling_ggml_last_error(model_);
-        if (err) *err = emsg ? emsg : "engine call failed";
+        if (err && err->empty()) *err = emsg ? emsg : "engine call failed";
         return false;
     }
 

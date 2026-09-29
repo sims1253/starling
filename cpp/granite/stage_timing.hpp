@@ -15,8 +15,9 @@
 //                  gen=..ms stages=..ms bookkeeping=..ms total=..ms
 //
 // Reconciliation contract: `stages` sums the per-chunk stage durations over
-// ALL chunks, `total` is the whole-request wall time measured around the
-// chunk loop AND the final text join, and `bookkeeping = total - stages` is
+// ALL chunks, `total` sums active per-chunk service wall time including the
+// final text join (but excluding queue waits in opt-in fair serving), and
+// `bookkeeping = total - stages` is
 // the unattributed remainder (loop memcpy/padding, per-chunk detokenize, the
 // text join, and the timing prints themselves — the output-buffer malloc and
 // copy are response emission and stay outside the window). The three agree by
@@ -62,7 +63,7 @@ struct StageTiming {
         return sum;
     }
 
-    // Whole-request wall time minus the summed stages: the loop/join/
+    // Active whole-request service time minus the summed stages: the loop/join/
     // detokenize bookkeeping around the stage clocks. Never negative beyond
     // rendering rounding.
     double bookkeeping_ms(double request_total_ms) const {
@@ -83,8 +84,8 @@ inline std::string format_stage_chunk_line(const StageTiming& s, int64_t chunk_i
 }
 
 // The whole-request summary line. `request_total_ms` is the wall time around
-// the whole chunk loop plus the final text join (the caller's t_start..t_end
-// span; the output-buffer malloc/copy stay outside it).
+// all chunk steps plus the final text join; queue waits and output-buffer
+// malloc/copy stay outside it.
 inline std::string format_stage_request_line(const StageTiming& s, double audio_seconds,
                                              double request_total_ms) {
     char buf[320];

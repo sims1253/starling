@@ -15,6 +15,7 @@
 #include "chunk_policy.hpp"
 #include "starling_ggml.h"
 #include "lib/capi_helpers.hpp"
+#include "lib/granite_job_internal.hpp"
 #include "mel.hpp"
 #include "encoder.hpp"
 #include "prompt.hpp"
@@ -28,6 +29,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cctype>
 #include <climits>
 #include <cmath>
 #include <cstdio>
@@ -165,6 +167,145 @@ std::string join_texts(const std::vector<std::string>& texts) {
 
 } // namespace
 
+namespace starling::ggml::lib {
+
+// Borrows PCM and model for one synchronous request; the caller keeps both
+// alive and steps only while holding the global runtime lock.
+struct GraniteChunkJob {
+    GraniteCtx* ctx;
+    const granite::Config policy;
+    const float* pcm;
+    int64_t n;
+    int64_t chunk_samples;
+    int64_t offset = 0;
+    bool multi;
+    bool finished = false;
+    bool timing;
+    std::vector<float> padded;
+    std::vector<std::string> texts;
+    granite::StageTiming stages;
+    double active_ms = 0.0;
+
+    int ctc_max_k;  // 0 = greedy; 1..16 = opt-in CTC speculative decode
+
+    GraniteChunkJob(GraniteCtx* c, const float* p, int64_t count, int ctc_k = 0)
+        : ctx(c), policy(c->model->config), pcm(p), n(count),
+          chunk_samples(granite::effective_chunk_samples(policy)),
+          multi(chunk_samples > 0 && count > chunk_samples),
+          timing(std::getenv("STARLING_GRANITE_TIMING") != nullptr),
+          ctc_max_k(ctc_k) {
+        if (multi) padded.resize((size_t) chunk_samples);
+    }
+
+    bool last_chunk() const { return !multi || n - offset <= chunk_samples; }
+
+    int step(std::string* final_text, const char** err) {
+        if (finished) { ctx->err = "GRANITE job already completed"; report(err, ctx->err); return -1; }
+        const auto step_start = std::chrono::steady_clock::now();
+        const auto& cfg = policy;
+        const float* piece = pcm;
+        int64_t piece_n = n;
+        int64_t len = n;
+        int32_t budget = multi ? 0 : decode_budget(cfg, (double) n / kSampleRate);
+        if (multi) {
+            len = std::min(chunk_samples, n - offset);
+            std::memcpy(padded.data(), pcm + offset, (size_t) len * sizeof(float));
+            if (len < chunk_samples)
+                std::memset(padded.data() + len, 0,
+                            (size_t) (chunk_samples - len) * sizeof(float));
+            piece = padded.data();
+            piece_n = chunk_samples;
+            const int64_t prompt_len = (int64_t) cfg.prompt_prefix.size() +
+                granite::audio_token_count(chunk_samples, cfg) +
+                (int64_t) cfg.prompt_suffix.size();
+            budget = decode_budget(cfg, (double) len / kSampleRate, prompt_len);
+        }
+        double piece_ms[granite::kStageCount] = {};
+        std::string text;
+        const bool tr_on = starling::ggml::trace::on();
+        const auto t0 = std::chrono::steady_clock::now();
+        bool ok;
+        {
+            starling::ggml::trace::ChunkScope scope(stages.chunks + 1);
+            ok = transcribe_piece(*ctx, piece, piece_n, budget, text, piece_ms,
+                                  ctc_max_k, stages.chunks + 1);
+        }
+        if (tr_on && ok)
+            starling::ggml::trace::chunk_event(stages.chunks + 1,
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - t0).count());
+        if (!ok) {
+            finished = true;  // A failed job cannot be resumed safely.
+            texts.clear();
+            report(err, ctx->err);
+            return -1;
+        }
+        texts.push_back(std::move(text));
+        stages.add_chunk(piece_ms);
+        if (timing)
+            std::fprintf(stderr, "%s\n",
+                granite::format_stage_chunk_line(stages, stages.chunks).c_str());
+        offset += len;
+        if (multi && offset < n) {
+            active_ms += std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - step_start).count();
+            return 0;
+        }
+        finished = true;
+        if (final_text) *final_text = join_texts(texts);
+        active_ms += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - step_start).count();
+        if (timing)
+            std::fprintf(stderr, "%s\n",
+                granite::format_stage_request_line(stages, (double) n / kSampleRate,
+                    active_ms).c_str());
+        if (err) *err = nullptr;
+        return 1;
+    }
+};
+
+GraniteChunkJob* granite_job_create_impl(void* model, const float* pcm,
+                                          int64_t n, const char** err,
+                                          int ctc_max_k) {
+    // Creation runs before the caller holds the runtime lock, so it must not
+    // write the shared ctx->err. The message stays valid on this thread until
+    // the next failed creation; callers copy it immediately.
+    static thread_local char create_error[2048];
+    auto* ctx = static_cast<GraniteCtx*>(model);
+    if (!ctx) { report(err, "null GRANITE handle"); return nullptr; }
+    if (n < 0 || (n > 0 && !pcm)) { report(err, "invalid GRANITE PCM buffer"); return nullptr; }
+    try { return new GraniteChunkJob(ctx, pcm, n, ctc_max_k); }
+    catch (const std::exception& e) {
+        std::snprintf(create_error, sizeof(create_error), "%s", e.what());
+    }
+    catch (...) {
+        std::snprintf(create_error, sizeof(create_error), "%s",
+                      "unknown exception creating GRANITE job");
+    }
+    report(err, create_error);
+    return nullptr;
+}
+
+int granite_job_step_impl(GraniteChunkJob* job, std::string* text,
+                          const char** err) {
+    if (!job) { report(err, "null GRANITE job"); return -1; }
+    try { return job->step(text, err); }
+    catch (const std::exception& e) { job->ctx->err = e.what(); }
+    catch (...) { job->ctx->err = "unknown exception stepping GRANITE job"; }
+    job->finished = true;
+    job->texts.clear();
+    report(err, job->ctx->err);
+    return -1;
+}
+
+bool granite_job_last_chunk_impl(const GraniteChunkJob* job) {
+    return job && job->last_chunk();
+}
+
+void granite_job_free_impl(GraniteChunkJob* job) { delete job; }
+
+} // namespace starling::ggml::lib
+
 extern "C" {
 
 void* starling_ggml_granite_load(const char* gguf_path, const char** err_out) {
@@ -237,118 +378,23 @@ bool starling_ggml_granite_ctc_draft(void* handle, const float* pcm, int64_t n,
 
 static char* granite_decode_impl(void* handle, const float* pcm, int64_t n,
                                  int ctc_max_k, const char** err_out) {
-    auto* c = static_cast<GraniteCtx*>(handle);
-    if (!c) { if (err_out) *err_out = "null GRANITE handle"; return nullptr; }
-    if (n < 0 || (n > 0 && !pcm)) {
-        if (err_out) *err_out = "invalid GRANITE PCM buffer";
-        return nullptr;
-    }
-    try {
-        using namespace starling::ggml::granite;
-        const Config& cfg = c->model->config;
-        const bool timing = std::getenv("STARLING_GRANITE_TIMING") != nullptr;
-        auto now = [] { return std::chrono::steady_clock::now(); };
-        auto t_start = now();
-
-        // max_chunk = min(chunk_seconds, (max_new_tokens - 32) / 5) — the
-        // server's _effective_chunk_seconds(DEFAULT_CHUNK_SECONDS).
-        const int64_t chunk_samples = effective_chunk_samples(cfg);
-        const double duration_s = (double) n / kSampleRate;
-
-        std::vector<std::string> texts;
-        StageTiming stages;  // accumulates every chunk's stage durations
-        // One piece through the pipeline + timing bookkeeping. Fills `text`,
-        // accumulates the piece's stages, and emits the per-chunk summary
-        // line under the timing gate. ChunkScope numbers the runtime-layer
-        // trace records (graph replays, cache events) with this chunk's
-        // 1-based index; the chunk record itself closes the scope so its
-        // wall time covers exactly what the scope covered.
-        auto run_piece = [&](const float* pcm_piece, int64_t piece_n, int32_t budget) {
-            double piece_ms[kStageCount] = {0, 0, 0};
-            std::string text;
-            const bool tr_on = starling::ggml::trace::on();
-            const auto t_piece0 = std::chrono::steady_clock::now();
-            bool ok;
-            {
-                starling::ggml::trace::ChunkScope chunk_scope(stages.chunks + 1);
-                ok = transcribe_piece(*c, pcm_piece, piece_n, budget, text,
-                                      piece_ms, ctc_max_k, stages.chunks + 1);
-            }
-            if (tr_on && ok) {
-                starling::ggml::trace::chunk_event(stages.chunks + 1,
-                    std::chrono::duration<double, std::milli>(
-                        std::chrono::steady_clock::now() - t_piece0).count());
-            }
-            if (!ok) {
-                report(err_out, c->err);
-                return false;
-            }
-            texts.push_back(std::move(text));
-            stages.add_chunk(piece_ms);
-            if (timing)
-                std::fprintf(stderr, "%s\n",
-                    format_stage_chunk_line(stages, stages.chunks).c_str());
-            return true;
-        };
-        if (chunk_samples <= 0 || n <= chunk_samples) {
-            if (!run_piece(pcm, n, decode_budget(cfg, duration_s)))
-                return nullptr;
-        } else {
-            std::vector<float> padded((size_t) chunk_samples, 0.0f);
-            for (int64_t start = 0; start < n; start += chunk_samples) {
-                const int64_t len = std::min(chunk_samples, n - start);
-                // pad_last: the trailing chunk rides on a zero-padded full
-                // chunk buffer (identical mel shape; the reference's CUDA-graph
-                // encoder required it and the serve path kept it).
-                std::memcpy(padded.data(), pcm + start, (size_t) len * sizeof(float));
-                if (len < chunk_samples)
-                    std::memset(padded.data() + len, 0,
-                                (size_t) (chunk_samples - len) * sizeof(float));
-                const double piece_s = (double) len / kSampleRate;
-                // prompt_len reflects the PADDED chunk (the mel/projector see
-                // chunk_samples); the budget cap uses the unpadded duration —
-                // exactly the server's ids.shape[1] vs (end - start).
-                const int64_t prompt_len = (int64_t) cfg.prompt_prefix.size() +
-                                           audio_token_count(chunk_samples, cfg) +
-                                           (int64_t) cfg.prompt_suffix.size();
-                const int32_t budget = decode_budget(cfg, piece_s, prompt_len);
-                if (!run_piece(padded.data(), chunk_samples, budget))
-                    return nullptr;
-            }
-        }
-        // Whole-request wall time covers the chunk loop AND the final text
-        // join, so join_texts is attributed to bookkeeping, not silently
-        // dropped from the request summary (the output-buffer malloc/copy is
-        // response emission and stays outside).
-        const std::string text = join_texts(texts);
-        auto t_end = now();
-        if (timing) {
-            std::fprintf(stderr, "%s\n",
-                format_stage_request_line(
-                    stages, duration_s,
-                    std::chrono::duration<double, std::milli>(t_end - t_start).count())
-                    .c_str());
-        }
-
-        char* out = static_cast<char*>(std::malloc(text.size() + 1));
-        if (!out) { if (err_out) *err_out = "malloc failed"; return nullptr; }
-        std::memcpy(out, text.data(), text.size());
-        out[text.size()] = '\0';
-        if (err_out) *err_out = nullptr;
-        return out;
-    } catch (const std::exception& e) {
-        // Copy into the context's owned error string: e.what() dangles after
-        // the catch exits, and cpp/capi.cpp reads *err_out after we return.
-        c->err = e.what();
-        report(err_out, c->err);
-    } catch (...) {
-        // Same ownership rule as the std::exception branch: report() would
-        // hand *err_out a pointer into a temporary std::string that dies at
-        // the end of the statement, and capi.cpp reads it after we return.
-        c->err = "unknown exception transcribing GRANITE audio";
-        report(err_out, c->err);
-    }
-    return nullptr;
+    using namespace starling::ggml::lib;
+    std::unique_ptr<GraniteChunkJob, decltype(&granite_job_free_impl)> job(
+        granite_job_create_impl(handle, pcm, n, err_out, ctc_max_k),
+        &granite_job_free_impl);
+    if (!job) return nullptr;
+    std::string text;
+    int status;
+    do {
+        status = granite_job_step_impl(job.get(), &text, err_out);
+    } while (status == 0);
+    if (status < 0) return nullptr;
+    char* out = static_cast<char*>(std::malloc(text.size() + 1));
+    if (!out) { if (err_out) *err_out = "malloc failed"; return nullptr; }
+    std::memcpy(out, text.data(), text.size());
+    out[text.size()] = '\0';
+    if (err_out) *err_out = nullptr;
+    return out;
 }
 
 char* starling_ggml_granite_decode(void* handle, const float* pcm, int64_t n,

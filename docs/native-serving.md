@@ -92,6 +92,7 @@ flag runs a warmup at startup; omit the square brackets when using it.
 | `--no-eager-load` | off | Defer model load to first request |
 | `--idle-timeout <s>` | `0` (never) | Shut down after N seconds idle |
 | `--request-timeout-seconds <s>` | `600` | Fail queued requests after N s waiting for the engine (`504`); same flag as the Python server |
+| `--granite-chunk-fairness` | off | Opt in to one FIFO turn per Granite chunk; requires `--model granite` |
 | `--stream-chunk-seconds <s>` | `12.0` | Fixed WS stream window |
 | `--stream-overlap-seconds <s>` | `3.0` | Overlap between windows |
 | `--min-chunk-seconds <s>` | `5.0` | Min audio before first partial |
@@ -99,6 +100,21 @@ flag runs a warmup at startup; omit the square brackets when using it.
 | `--max-stream-seconds <s>` | `60.0` | Per-WS-connection LIVE buffer cap in s (0 = unlimited); see `WS /stream` |
 | `--version` | n/a | Print version + ABI + backend, exit |
 | `--abi-version` | n/a | Print ABI version integer, exit |
+
+With `--granite-chunk-fairness`, a long Granite upload releases its engine
+turn after each existing policy-defined chunk and re-enters the FIFO queue.
+An already waiting stream is served before that upload's next chunk. Streaming
+calls wait for their turn in this mode, up to the existing queue deadline;
+the queue still admits at most eight tickets or reserved continuations in
+total. A yielded upload keeps its admission slot until it requeues, so a new
+arrival cannot evict an already accepted job. FIFO age prevents an upload from
+starving under a stream of new arrivals. A stream can wait behind at most seven
+older tickets (including an active chunk); this is a chunk-count bound, not a
+wall-clock latency promise or preemption inside a chunk. One final response is
+emitted only after every upload chunk succeeds. A queued cancellation or
+timeout discards the job's partial text. The server retains the model and the
+caller's PCM until that synchronous request finishes. The default and every
+other model keep whole-request serial turns.
 
 ## Standard API compatibility
 
@@ -280,6 +296,9 @@ during busy retries. Successful windows advance the committed boundary;
 incomplete commits preserve the remaining audio for a later retry. Transcript
 stitching uses matching words rather than timestamps, so disagreements between
 neighboring windows can still omit or duplicate words.
+With opt-in Granite chunk fairness, a blocking queue timeout ends the current
+take with `request timed out`; it is not retried as `server busy`. Reset the
+stream before sending more audio.
 
 ## Timing trace
 
@@ -308,7 +327,7 @@ Record kinds and fields:
 | `queue_enter` | serving | `req`, `policy` (`block`/`skip_if_busy`), `depth` (waiters after enqueue) |
 | `queue_wait` | serving | `req`, `dur_ms` (host time blocked waiting for the serial-queue turn; emitted on turn acquisition AND on abandoned departures — skip refusal, timeout, cancellation) |
 | `request` | serving | `dur_ms` (engine-call wall time) |
-| `queue_exit` | serving | `req`, `reason` (`completed`/`cancelled`/`server_busy`/`timed_out`), `depth` (waiters after release). Terminal: every `queue_enter` balances exactly one `queue_exit` |
+| `queue_exit` | serving | `req`, `reason` (`completed`/`yielded`/`failed`/`cancelled`/`server_busy`/`timed_out`), `depth` (waiters after release). Terminal per ticket: every `queue_enter` balances exactly one `queue_exit` |
 | `response` | serving | `dur_ms` (result marshalling; the HTTP body build and socket write are outside the trace) |
 | `chunk` | engine | `chunk` (1-based), `dur_ms` |
 | `stage` | engine | `stage` (`mel_enc_proj`, `prompt_embeds`, `generate`), `dur_ms` |
@@ -334,12 +353,13 @@ Reading the numbers correctly (binding rules):
   the full compute — check `device` before interpreting.
 - **Wall times are clock-nested; never add a child into its parent.**
   Aggregate by summing sibling records of ONE kind: the three `stage` records
-  of a chunk sum to that chunk's engine work; the `chunk` records of a request
-  sum to its engine time inside `request`. `graph_replay` + `readback_sync`
+  of a chunk sum to that chunk's engine work. In Granite fairness mode each
+  `request` record covers one chunk turn, so sum those records across the
+  request id before comparing with its `chunk` records. `graph_replay` + `readback_sync`
   overlap the stage walls (they are leaves, not additional time).
 - **The queue ledger balances.** Every `queue_enter` has exactly one
   terminal `queue_exit` whose `reason` says how the ticket left
-  (`completed`, `server_busy`, `timed_out`, `cancelled`), and `queue_wait`
+  (`completed`, `yielded`, `failed`, `server_busy`, `timed_out`, `cancelled`), and `queue_wait`
   fires for abandoned waits too — the contention outcomes the trace exists
   to diagnose are never invisible.
 - **No contents.** Records carry ids, indices, shape dimensions, and cache

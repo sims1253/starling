@@ -122,6 +122,7 @@ jobs:
             parakeet_compact_engine_test s1_quant_loader_test \
             voxtral_encoder_test voxtral_engine_test voxtral_loader_guard_test \
             trace_schema_test trace_off_test granite_trace_test serve_trace_test \
+            granite_fairness_test \
             graph_snapshot_test \
             replay_graph_support_test cpu_repack_test \
             device_cache_clear_test greedy_termination_test tdt_graph_budget_test \
@@ -177,6 +178,7 @@ jobs:
           ./build/trace_off_test
           ./build/granite_trace_test
           ./build/serve_trace_test
+          ./build/granite_fairness_test
           ./build/graph_snapshot_test
 
       # Voxtral engine suite: the tiny-GGUF fixture is generated in-workflow

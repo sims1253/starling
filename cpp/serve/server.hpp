@@ -70,6 +70,7 @@ struct ServerConfig {
     int  port        = 8181;
     bool warmup      = false;
     bool eager_load  = true;
+    bool granite_chunk_fairness = false; // opt-in: yield FIFO turn after each chunk
     double max_chunk_seconds       = kDefaultMaxChunk;
     double min_chunk_seconds       = kDefaultMinChunk;
     double partial_interval        = kDefaultPartialInt;
@@ -159,13 +160,17 @@ public:
     void finish_request(RequestContext* ctx);
 
     const ServerConfig& config() const { return cfg_; }
+    std::string backend_identity() const;
 
 private:
     ServerConfig cfg_;
+    // Refreshed after model load latches the selected runtime device. WS
+    // admission reads this cache without taking the C API runtime mutex.
+    std::string backend_identity_;
     starling_ggml_ctx* model_ = nullptr;
 
     mutable std::mutex mutex_;       // protects queue state + request registry
-    std::mutex load_mutex_;           // serializes model loading (long operation)
+    mutable std::mutex load_mutex_;   // serializes loading and identity updates
     std::condition_variable queue_cv_;
 
     // Serial inference queue: requests wait in arrival order. Anonymous
@@ -175,6 +180,10 @@ private:
     std::deque<std::string> request_order_;
     std::unordered_map<std::string, std::unique_ptr<RequestContext>> requests_;
     int n_waiters_ = 0;
+    // A yielded Granite job retains one admission slot until its next ticket.
+    // Capacity checks count these reservations so a newly arrived request
+    // cannot displace an already accepted upload between chunks.
+    int reserved_continuations_ = 0;
     uint64_t next_anon_id_ = 0;
 
     // Lifecycle phase.
@@ -198,10 +207,14 @@ private:
     // effective_req_id (optional) receives the request id actually used for
     // the queue ticket (the caller's ctx id, or the synthesized "#anon-N" —
     // the trace correlates follow-up records like response emission with it).
+    // A successful nonterminal turn reserves one admission slot; its next
+    // call must set continuing=true to transfer that slot to a new ticket.
     bool run_with_turn(RequestContext* ctx, QueuePolicy policy,
                        const std::function<char*()>& engine_call,
                        std::string* out_text, std::string* err,
-                       std::string* effective_req_id = nullptr);
+                       std::string* effective_req_id = nullptr,
+                       bool complete_request = true,
+                       bool continuing = false);
 };
 
 } // namespace starling::serve
