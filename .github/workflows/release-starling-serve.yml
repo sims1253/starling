@@ -201,6 +201,9 @@ jobs:
       contents: read
     needs: runtime-contract
     runs-on: ubuntu-22.04
+    # Multi-GB toolkit install plus the slowest build in the workflow; never
+    # let it burn the runner past 90 minutes (GitHub's default is 360).
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -217,6 +220,9 @@ jobs:
           sudo apt-get update
           cuda_series="${CUDA_VERSION%.*}"
           sudo apt-get install -y "cuda-toolkit-${cuda_series//./-}"
+          # Drop the ~3 GB of cached .debs; the toolkit plus the build leaves
+          # little headroom on the runner disk otherwise.
+          sudo apt-get clean
           echo "/usr/local/cuda/bin" >> "$GITHUB_PATH"
 
       - name: Build starling-serve (CUDA)
@@ -227,7 +233,12 @@ jobs:
             -DSTARLING_GGML_TESTS=OFF -DBUILD_SHARED_LIBS=OFF \
             -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCHITECTURES" \
             -DGGML_NATIVE=OFF -DGGML_LLAMAFILE=OFF
-          cmake --build build -j --target starling-serve
+          # -j alone resolves to the workflow-level CMAKE_BUILD_PARALLEL_LEVEL
+          # (4), and 4 nvcc processes on the 16 GB runner got the job killed by
+          # a runner shutdown three builds in a row, always mid-compile. The
+          # explicit cap below overrides that env var to bound peak compiler
+          # memory.
+          cmake --build build -j 2 --target starling-serve
 
       - name: Strip and package
         run: |
@@ -335,6 +346,15 @@ jobs:
       contents: read
     needs: runtime-contract
     runs-on: windows-2025-vs2026
+    # The SDK download/install and the Vulkan shader build can both stall;
+    # none of these jobs should ever burn the runner indefinitely.
+    timeout-minutes: 90
+    env:
+      VULKAN_SDK_VERSION: 1.4.357.0
+      # SHA-256 of vulkansdk-windows-X64-1.4.357.0.exe; update together
+      # with VULKAN_SDK_VERSION. Pinned here (not fetched at runtime) so a
+      # compromised download cannot swap hash and installer together.
+      VULKAN_SDK_SHA256: 81F474711E9042F4CD22B31B2F7A8870DB2E428B21586FB43DD80150BE97310D
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -347,11 +367,46 @@ jobs:
         shell: bash
         run: bash scripts/apply_ggml_patches.sh
 
-      - name: Install Vulkan SDK
-        uses: humbletim/install-vulkan-sdk@30ba978f977e81b72d091fc8888feb1fb26f9aff # v1.2
+      - name: Restore Vulkan SDK installer cache
+        # The replaced humbletim action cached the installer; keep that so the
+        # ~300 MB download does not repeat on every master push. The key covers
+        # version and pinned hash, so a re-pinned SDK never restores stale bits.
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
-          version: 1.4.357.0
-          cache: true
+          path: ${{ runner.temp }}\VulkanSDK-Installer.exe
+          key: vulkan-sdk-installer-windows-${{ env.VULKAN_SDK_VERSION }}-${{ env.VULKAN_SDK_SHA256 }}
+
+      - name: Install Vulkan SDK
+        # humbletim/install-vulkan-sdk@v1.2 unpacks the Windows installer with a
+        # single 7z pass, but SDK installers >= 1.4.313.0 layer their payload,
+        # so that extracts only Bin/ and CMake fails with "Could NOT find Vulkan
+        # (missing: Vulkan_LIBRARY Vulkan_INCLUDE_DIR)" (action issue #25).
+        # Run the official installer silently instead, the same way upstream
+        # ggml's build-vulkan.yml windows job installs this exact SDK version.
+        shell: pwsh
+        run: |
+          $installer = "$env:RUNNER_TEMP\VulkanSDK-Installer.exe"
+          if (-not (Test-Path "$installer")) {
+            curl.exe --fail --retry 3 --retry-all-errors --retry-delay 10 -o "$installer" -L `
+              "https://sdk.lunarg.com/sdk/download/${env:VULKAN_SDK_VERSION}/windows/vulkansdk-windows-X64-${env:VULKAN_SDK_VERSION}.exe"
+            if ($LASTEXITCODE -ne 0) {
+              # Drop a truncated download so nothing (cache save included)
+              # ever sees a partial installer.
+              Remove-Item "$installer" -ErrorAction SilentlyContinue
+              throw "Vulkan SDK download failed (exit $LASTEXITCODE)"
+            }
+          }
+          # Verify even on cache hits; the pinned hash is the integrity gate.
+          $actual = (Get-FileHash "$installer" -Algorithm SHA256).Hash
+          if ($actual -ine $env:VULKAN_SDK_SHA256) { throw "Vulkan SDK checksum mismatch: $actual" }
+          & "$installer" --accept-licenses --default-answer --confirm-command install
+          if ($LASTEXITCODE -ne 0) { throw "Vulkan SDK install failed (exit $LASTEXITCODE)" }
+          $sdk = "C:\VulkanSDK\${env:VULKAN_SDK_VERSION}"
+          foreach ($p in @("$sdk\Include\vulkan\vulkan.h", "$sdk\Lib\vulkan-1.lib")) {
+            if (-not (Test-Path $p)) { throw "unexpected SDK layout, missing $p" }
+          }
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=$sdk"
+          Add-Content $env:GITHUB_PATH "$sdk\bin"
 
       - name: Build starling-serve (Vulkan, static CRT)
         shell: pwsh
@@ -398,6 +453,9 @@ jobs:
       contents: read
     needs: runtime-contract
     runs-on: windows-2025-vs2026
+    # Same rationale as linux-cuda: network-installed toolkit, slowest Windows
+    # build (measured ~38 min); cap well under GitHub's 360-minute default.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -420,6 +478,12 @@ jobs:
         shell: pwsh
         run: |
           $version = $env:RELEASE_TAG -replace '^v', ''
+          # ggml-cuda links CUDA::cuda_driver, so the exe imports nvcuda.dll,
+          # which ships only with the NVIDIA driver. The GPU-less runner (and
+          # driverless user machines) has no driver, and the loader killed the
+          # exe before --version could print. Delay-load the import: the driver
+          # API is only touched once a CUDA device is actually initialized,
+          # after the metadata flags have already been handled.
           cmake -S . -B build -G "Visual Studio 18 2026" -A x64 `
             -DSTARLING_SERVE=ON `
             "-DSTARLING_SERVE_VERSION=$version" `
@@ -427,7 +491,8 @@ jobs:
             -DSTARLING_GGML_TESTS=OFF -DBUILD_SHARED_LIBS=OFF `
             "-DCMAKE_CUDA_ARCHITECTURES=$env:CUDA_ARCHITECTURES" `
             -DGGML_NATIVE=OFF -DGGML_LLAMAFILE=OFF `
-            -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
+            -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded `
+            "-DCMAKE_EXE_LINKER_FLAGS=/DELAYLOAD:nvcuda.dll delayimp.lib"
           cmake --build build --config Release --target starling-serve
 
       - name: Package
