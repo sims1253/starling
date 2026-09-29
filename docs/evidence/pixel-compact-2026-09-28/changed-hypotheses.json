@@ -1,0 +1,119 @@
+[
+  {
+    "id": "de_de_validation_136.wav",
+    "reference": "sie können in der dunkelheit mit nachtsicht sehr gut sehen und sich unbemerkt bewegen ozelots jagen ihre beute indem sie sich ihrer umgebung optisch angleichen und sich dann auf ihre beute stürzen",
+    "baseline_hypothesis": "Sie können in der Dunkelheit mit Nachtsicht sehr gut sehen und sich unbemerkt bewegen. Ozulos jagen ihre Beute, indem sie sich ihre Umgebung optisch angleichen und sich dann auf ihre Beute stürzen.",
+    "candidate_hypothesis": "Sie können in der Dunkelheit mit Nachtsicht sehr gut sehen und sich unbemerkt bewegen, jagen ihre Beute, indem sie sich ihre Umgebung optisch angleichen und sich dann auf ihre Beute stürzen.",
+    "baseline_wer_pct": 6.25,
+    "candidate_wer_pct": 6.25,
+    "delta_wer_pp": 0.0
+  },
+  {
+    "id": "de_de_validation_157.wav",
+    "reference": "im prinzip ist der tibetische buddhismus sehr einfach er besteht aus kundalini yoga meditation und dem pfad der allumfassenden liebe",
+    "baseline_hypothesis": "Im Prinzip ist der tibetische Buddhismus sehr einfach, er besteht aus Gundalini, Yoga, Meditation und Pfad der allumfassenden Liebe.",
+    "candidate_hypothesis": "Im Prinzip ist der tibetische Buddhismus sehr einfach, er besteht aus Gundalini, Yoga, Meditation und empfart der all umfassenden Liebe.",
+    "baseline_wer_pct": 10.0,
+    "candidate_wer_pct": 25.0,
+    "delta_wer_pp": 15.0
+  },
+  {
+    "id": "de_de_validation_234.wav",
+    "reference": "die wichtigste religion in moldawien ist die christlich-orthodoxe",
+    "baseline_hypothesis": "Die wichtigste Religion in Moldavien ist die christlich orthodoxe.",
+    "candidate_hypothesis": "Die wichtigste Religion in Moldavien ist die christlich Orthodoxe.",
+    "baseline_wer_pct": 37.5,
+    "candidate_wer_pct": 37.5,
+    "delta_wer_pp": 0.0
+  },
+  {
+    "id": "de_de_validation_241.wav",
+    "reference": "salzwasserkrokodile leben nicht aktiv im meer ihr primärer lebensraum ist in flussmündungen nördlich von rockhampton",
+    "baseline_hypothesis": "Salzwasserkrokodile leben nicht aktiv im Meer, Ihr primäre Lebensraum ist in Flußmündungen, nördlich von Rohemphem.",
+    "candidate_hypothesis": "Salzwasserkrokodile leben nicht aktiv im Meer, ihr primäre Lebensraum ist in Flußmündungen, nördlich von Rohemphem.",
+    "baseline_wer_pct": 20.0,
+    "candidate_wer_pct": 20.0,
+    "delta_wer_pp": 0.0
+  },
+  {
+    "id": "de_de_validation_245.wav",
+    "reference": "bitte behandeln sie diese stätte mit der würde der ehrfurcht und dem respekt die ihr gebühren machen sie keine witze über den holocaust oder die nazis",
+    "baseline_hypothesis": "Bitte behandeln Sie diese Städte mit der Würde, der Furcht und dem Respekt, die Ihr Gebühren. Machen Sie keine Witze über den Holocaust oder die Nazis.",
+    "candidate_hypothesis": "Bitte behandeln Sie diese Städte mit der Würde, der Furcht und dem Respekt, die ihr gebühren. Machen Sie keine Witze über den Holocaust oder die Nazis.",
+    "baseline_wer_pct": 7.6923076923076925,
+    "candidate_wer_pct": 7.6923076923076925,
+    "delta_wer_pp": 0.0
+  },
+  {
+    "id": "de_de_validation_37.wav",
+    "reference": "wissenschaftler sagen dass das gefieder dieses tieres auf der oberseite kastanienbraun und auf der unterseite hell oder carotinoidfarben war",
+    "baseline_hypothesis": "Wissenschaftler sagen, dass das Gefieder dieses Tieres auf der Oberseite Kastanienbraun und auf der Unterseite hell oder Karotte farben war.",
+    "candidate_hypothesis": "Wissenschaftler sagen, dass das Gefieder dieses Tieres auf der Oberseite Kastanienbraun und auf der Unterseite hell oder Karotin farben war.",
+    "baseline_wer_pct": 10.526315789473683,
+    "candidate_wer_pct": 10.526315789473683,
+    "delta_wer_pp": 0.0
+  },
+  {
+    "id": "de_de_validation_69.wav",
+    "reference": "ägypter im antiken neuen reich bestaunten die monumente ihrer vorfahren die damals gut tausend jahre alt waren",
+    "baseline_hypothesis": "Egypte im antiken Neuen Reich bestaun die Monumente ihrer Vorfahren, die damals gut tausend Jahre alt waren.",
+    "candidate_hypothesis": "Egypte im antiken Neuen Reich bestaun die Monumente ihrer Vorfahren, die damals gut tausend Jahre alt waren?",
+    "baseline_wer_pct": 11.76470588235294,
+    "candidate_wer_pct": 11.76470588235294,
+    "delta_wer_pp": 0.0
+  },
+  {
+    "id": "de_de_validation_99.wav",
+    "reference": "zu beginn war die kleidung stark von der kultur byzanz' im osten geprägt",
+    "baseline_hypothesis": "Zu Beginn war die Kleidung stark von der Kultur bizangs im Osten geprägt.",
+    "candidate_hypothesis": "Zu Beginn war die Kleidung stark von der Kultur bizans im Osten geprägt.",
+    "baseline_wer_pct": 7.6923076923076925,
+    "candidate_wer_pct": 7.6923076923076925,
+    "delta_wer_pp": 0.0
+  },
+  {
+    "id": "en_us_validation_111.wav",
+    "reference": "new kingdom ancient egyptians marvelled at their predecessors monuments which were then well over a thousand year old",
+    "baseline_hypothesis": "New kingdom ancient Egyptians marbled at their predecessor monuments which were zen well over a thousand years old.",
+    "candidate_hypothesis": "New kingdom ancient Egyptians marveled at their predecessor monuments which were zen well over a thousand years old.",
+    "baseline_wer_pct": 22.22222222222222,
+    "candidate_wer_pct": 22.22222222222222,
+    "delta_wer_pp": 0.0
+  },
+  {
+    "id": "en_us_validation_113.wav",
+    "reference": "members of a subculture often signal their membership through a distinctive and symbolic use of style which includes fashions mannerisms and argot",
+    "baseline_hypothesis": "Members of a subculture often signal their membership through a distinctive and symbolic use of style, which includes fashions, mannerism, and argot.",
+    "candidate_hypothesis": "Members of a subculture often signal their membership through a distinctive and symbolic use of style, which includes fashions, mannerism and argot.",
+    "baseline_wer_pct": 4.545454545454546,
+    "candidate_wer_pct": 4.545454545454546,
+    "delta_wer_pp": 0.0
+  },
+  {
+    "id": "en_us_validation_22.wav",
+    "reference": "thousands of years ago a man called aristarchus said that the solar system moved around the sun",
+    "baseline_hypothesis": "Thousands of years ago, a man called Ares said the solar system moved around the sun.",
+    "candidate_hypothesis": "Thousands of years ago, a man called Eres said the solar system moved around the sun.",
+    "baseline_wer_pct": 11.76470588235294,
+    "candidate_wer_pct": 11.76470588235294,
+    "delta_wer_pp": 0.0
+  },
+  {
+    "id": "en_us_validation_268.wav",
+    "reference": "a satellite phone is not generally a replacement for a mobile phone as you have to be outdoors with clear line of sight to the satellite to make a phone call",
+    "baseline_hypothesis": "A satellite phone is not generally a replacement for a mobile phone, as you have to be outdoors with clear line of sight to the satellite, to make a phone call.",
+    "candidate_hypothesis": "A satellite phone is not generally a replacement for a mobile phone, as you have to be outdoors, with clear line of sight to the satellite, to make a phone call.",
+    "baseline_wer_pct": 0.0,
+    "candidate_wer_pct": 0.0,
+    "delta_wer_pp": 0.0
+  },
+  {
+    "id": "en_us_validation_66.wav",
+    "reference": "thousands of years ago a man called aristarchus said that the solar system moved around the sun",
+    "baseline_hypothesis": "Thousands of years ago, a man called Aristarus said that the solar system moved around the sun.",
+    "candidate_hypothesis": "Thousands of years ago, a man called Aristarkes said that the solar system moved around the sun.",
+    "baseline_wer_pct": 5.88235294117647,
+    "candidate_wer_pct": 5.88235294117647,
+    "delta_wer_pp": 0.0
+  }
+]

@@ -27,6 +27,8 @@ def test_corpus_json_retains_ordered_clips_for_paired_comparisons(monkeypatch, t
         sf.write(wav, np.zeros(1600, dtype=np.float32), 16000)
         wav.with_suffix(".txt").write_text(reference)
     hypotheses = iter(("one", "three four", "one two", "three"))
+    monkeypatch.setattr(wer_quant, "_active_device", lambda: "CPU")
+    monkeypatch.setattr(wer_quant, "_loaded_engine_path", lambda: None)
     monkeypatch.setattr(wer_quant, "StarlingGgmlParakeet", lambda: SimpleNamespace(
         available=True, load=lambda: None, close=lambda: None,
         transcribe=lambda audio: [next(hypotheses)]))
@@ -49,6 +51,80 @@ def test_corpus_json_retains_ordered_clips_for_paired_comparisons(monkeypatch, t
     assert [(c["id"], c["audio_sha256"], c["reference"]) for c in first_clips] == [
         (c["id"], c["audio_sha256"], c["reference"]) for c in second_clips]
     assert [c["wer"] for c in second_clips] == [0.0, 50.0]
+
+
+def test_include_clips_records_selected_backend_without_protocol(monkeypatch, tmp_path):
+    import json
+    import hashlib
+
+    model = tmp_path / "model.gguf"
+    model.write_bytes(b"model")
+    fallback_lib = tmp_path / "fallback.so"
+    fallback_lib.write_bytes(b"fallback engine")
+    requested_lib = tmp_path / "requested.so"
+    requested_lib.write_bytes(b"requested engine")
+    monkeypatch.setenv("STARLING_GGML_LIB", str(requested_lib))
+    monkeypatch.setattr(wer_quant.mkfx, "load_fixtures", lambda: {"short": np.zeros(1600)})
+    monkeypatch.setattr(wer_quant, "_active_device", lambda: "CPU")
+    monkeypatch.setattr(wer_quant, "_loaded_engine_path", lambda: fallback_lib.resolve())
+    monkeypatch.setattr(wer_quant, "StarlingGgmlParakeet", lambda: SimpleNamespace(
+        available=True, load=lambda: None, close=lambda: None,
+        transcribe=lambda audio: [wer_quant.REFERENCE_TRANSCRIPTS["short"]]))
+    output = tmp_path / "result.json"
+    monkeypatch.setattr(sys, "argv", ["wer_quant", "--models", str(model),
+                                      "--tiers", "short", "--device", "CUDA0",
+                                      "--include-clips", "--json", str(output)])
+    assert wer_quant.main() == 0
+    provenance = json.loads(output.read_text())[0]["provenance"]
+    assert provenance["device"] == "CPU"
+    assert provenance["engine_sha256"] == hashlib.sha256(b"fallback engine").hexdigest()
+
+
+def test_protocol_seals_model_engine_scorer_and_device(monkeypatch, tmp_path, capsys):
+    import hashlib
+    import json
+
+    model = tmp_path / "model.gguf"
+    model.write_bytes(b"model")
+    source = tmp_path / "source.gguf"
+    source.write_bytes(b"source")
+    imatrix = tmp_path / "model.imx"
+    imatrix.write_bytes(b"imatrix")
+    engine_lib = tmp_path / "libstarling_ggml.so"
+    engine_lib.write_bytes(b"engine")
+    protocol = tmp_path / "protocol.json"
+    protocol.write_text('{"schema":"quant-wer-noninferiority-v1"}')
+    monkeypatch.setenv("STARLING_GGML_LIB", str(engine_lib))
+    monkeypatch.setattr(wer_quant, "_active_device", lambda: "CUDA0")
+    monkeypatch.setattr(wer_quant, "_loaded_engine_path", lambda: engine_lib.resolve())
+    monkeypatch.setattr(wer_quant.mkfx, "load_fixtures", lambda: {"short": np.zeros(1600)})
+    monkeypatch.setattr(wer_quant, "StarlingGgmlParakeet", lambda: SimpleNamespace(
+        available=True, load=lambda: None, close=lambda: None,
+        transcribe=lambda audio: [wer_quant.REFERENCE_TRANSCRIPTS["short"]]))
+    output = tmp_path / "result.json"
+    monkeypatch.setattr(sys, "argv", ["wer_quant", "--models", str(model), "--tiers", "short",
+                                      "--device", "CUDA0", "--protocol", str(protocol),
+                                      "--source-model", str(source), "--imatrix", str(imatrix),
+                                      "--include-clips", "--json", str(output)])
+    assert wer_quant.main() == 0
+    provenance = json.loads(output.read_text())[0]["provenance"]
+    assert provenance["model_sha256"] == hashlib.sha256(b"model").hexdigest()
+    assert provenance["model_bytes"] == 5
+    assert provenance["source_sha256"] == hashlib.sha256(b"source").hexdigest()
+    assert provenance["imatrix_sha256"] == hashlib.sha256(b"imatrix").hexdigest()
+    assert provenance["engine_sha256"] == hashlib.sha256(b"engine").hexdigest()
+    assert provenance["protocol_sha256"] == hashlib.sha256(protocol.read_bytes()).hexdigest()
+    assert provenance["device"] == "CUDA0"
+    monkeypatch.setattr(wer_quant, "_active_device", lambda: "CPU")
+    with pytest.raises(SystemExit, match="2"):
+        wer_quant.main()
+    monkeypatch.setattr(wer_quant, "_active_device", lambda: "CUDA0")
+    fallback = tmp_path / "fallback.so"
+    fallback.write_bytes(b"fallback")
+    monkeypatch.setattr(wer_quant, "_loaded_engine_path", lambda: fallback.resolve())
+    with pytest.raises(SystemExit, match="2"):
+        wer_quant.main()
+    assert "requested native library" in capsys.readouterr().err
 
 
 def test_variants_receive_identical_noise_regardless_of_model_order(monkeypatch, tmp_path):

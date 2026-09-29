@@ -1,0 +1,35 @@
+{
+  "arm": "embedding",
+  "tag": "embedding-a",
+  "pid": 17855,
+  "prior_state": {
+    "ac_powered": "true",
+    "battery_status": 2,
+    "battery_temp_deci_c": 388,
+    "thermal_status": 1,
+    "wakefulness": "Dozing",
+    "screen_state": "OFF"
+  },
+  "start_state": {
+    "ac_powered": "true",
+    "battery_status": 2,
+    "battery_temp_deci_c": 388,
+    "thermal_status": 1,
+    "wakefulness": "Dozing",
+    "screen_state": "OFF"
+  },
+  "smaps_rss_kb": 68684,
+  "smaps_pss_kb": 56052,
+  "graphics_kb": 783232,
+  "total_pss_kb": 839229,
+  "battery_temp_deci_c": 388,
+  "thermal_status": 1,
+  "end_state": {
+    "ac_powered": "true",
+    "battery_status": 2,
+    "battery_temp_deci_c": 388,
+    "thermal_status": 1,
+    "wakefulness": "Dozing",
+    "screen_state": "OFF"
+  }
+}

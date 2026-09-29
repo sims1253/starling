@@ -1,0 +1,19 @@
+{
+  "schema": "pixel-fast-residency-v1",
+  "reason": "Quality-run PSS histories differ because baseline resumed in a new process; phone charging/activity invalidates latency and energy inference. Limit further GPU loads after two root health and five quality loads.",
+  "order": [
+    "baseline",
+    "embedding"
+  ],
+  "processes_per_arm": 1,
+  "engine": "STARLING_ENGINE=fast on PowerVR D-Series DXT-48-1536 MC1",
+  "model_source_commit": "2a3bda4",
+  "fixture_order": [
+    "short.wav",
+    "medium.wav"
+  ],
+  "benchmark": "starling-bench --warmup --runs 8",
+  "memory_snapshot": "After first measured short.wav run=0 and while same process is alive; capture dumpsys meminfo TOTAL PSS and GL mtrack plus smaps_rollup PSS/RSS. Interpret process PSS and graphics allocation without double counting. Same sequence both arms.",
+  "acceptance": "Descriptive only; no co-residency budget exists. Compare process PSS and GPU weight/scratch allocation. No latency or energy gate; all timings raw and exploratory.",
+  "stop_rule": "Stop after two model loads, or immediately if engine stalls, phone becomes hot, or selected fast engine fails."
+}

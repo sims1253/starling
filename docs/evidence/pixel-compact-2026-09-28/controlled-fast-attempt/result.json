@@ -1,0 +1,9 @@
+{
+  "family": "parakeet_fast",
+  "arm": "baseline",
+  "index": 0,
+  "protocol_sha256": "c66f7614fa44c34884059f80b64794905b96167cada6f102d2972756b6b0e708",
+  "cooled_before_block": true,
+  "completed": false,
+  "error": "bench exit 143"
+}

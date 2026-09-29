@@ -101,8 +101,11 @@ jobs:
       - name: Test native Python bindings with CPU-only PyTorch
         run: >-
           uv run --no-project --python 3.12 --with pytest --with numpy --with torch
+          --with soundfile --with jiwer
           --index https://download.pytorch.org/whl/cpu
           python -m pytest -q tests/test_benchmark_ggml_adapters.py
+          tests/test_compare_quant_wer.py tests/test_quantization_drivers.py
+          tests/test_score_phone_quant.py
           tests/test_cuda_kernel_validation.py tests/test_sanitizer_gate.py
         env:
           PYTHONPATH: src
