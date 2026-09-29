@@ -120,7 +120,8 @@ jobs:
             voxtral_encoder_test voxtral_engine_test voxtral_loader_guard_test \
             trace_schema_test trace_off_test granite_trace_test serve_trace_test \
             replay_graph_support_test cpu_repack_test \
-            device_cache_clear_test greedy_termination_test tdt_graph_budget_test
+            device_cache_clear_test greedy_termination_test tdt_graph_budget_test \
+            speculative_verifier_test
 
       - name: Quantizer storage and recipe regressions
         env:
@@ -136,11 +137,12 @@ jobs:
           ./build/replay_graph_support_test
 
       # Engine contracts from the optimization program: on-device KV cache
-      # clearing (S01) and EOS/budget termination semantics (S03). Both are
-      # CPU-backend tests with self-synthesized fixtures (no GGUFs needed).
-      - name: Engine contract tests (KV clearing, termination semantics)
+      # clearing (S01), EOS/budget termination (S03), and batched speculative
+      # verification. These use self-synthesized CPU fixtures.
+      - name: Engine contract tests (KV, termination, verifier)
         run: |
-          for t in device_cache_clear_test greedy_termination_test tdt_graph_budget_test; do
+          for t in device_cache_clear_test greedy_termination_test tdt_graph_budget_test \
+                   speculative_verifier_test; do
             "./build/$t"
           done
 
@@ -204,7 +206,8 @@ jobs:
           ./build/model_lifetime_test
           ./build/replay_graph_support_test
           ./build/granite_trace_test
-          for t in device_cache_clear_test greedy_termination_test tdt_graph_budget_test; do
+          for t in device_cache_clear_test greedy_termination_test tdt_graph_budget_test \
+                   speculative_verifier_test; do
             "./build/$t"
           done
 

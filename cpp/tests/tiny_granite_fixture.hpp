@@ -25,7 +25,9 @@ public:
     ggml_context* gctx_ = nullptr;
     gguf_context* gf_ = nullptr;
 
-    explicit TinyGraniteFixture(const std::filesystem::path& p) : path(p) {
+    explicit TinyGraniteFixture(const std::filesystem::path& p,
+                                bool token_chain = false)
+        : path(p), token_chain_(token_chain) {
         std::error_code ignored;
         std::filesystem::remove(path, ignored);
         gctx_ = ggml_init({64 << 20, nullptr, false});
@@ -45,6 +47,7 @@ public:
 
 private:
     bool wrote_ = false;
+    bool token_chain_ = false;
 
     void kv_u32(const char* key, uint32_t v) { gguf_set_val_u32(gf_, key, v); }
 
@@ -108,6 +111,18 @@ private:
             ggml_bf16_t* p = (ggml_bf16_t*) t->data;
             const ggml_bf16_t v = ggml_fp32_to_bf16(value);
             for (int64_t i = 0; i < ggml_nelements(t); ++i) p[i] = v;
+            // Optional decoder fixture: prefill's zero input picks 0, then
+            // embeddings 0..3 drive logits 1..4. All attention/MLP weights
+            // remain zero, so the sequence is deterministic but nonconstant.
+            if (token_chain_ && dims.size() == 2 && dims[0] == 8 &&
+                dims[1] == 16 &&
+                (std::strcmp(name, "llm.embed.weight") == 0 ||
+                 std::strcmp(name, "llm.lm_head.weight") == 0)) {
+                const bool embed = std::strcmp(name, "llm.embed.weight") == 0;
+                for (int64_t token = 0; token < 4; ++token)
+                    p[(size_t)(embed ? token : token + 1) * 8 + token + 1] =
+                        ggml_fp32_to_bf16(1.0f);
+            }
         }
         gguf_add_tensor(gf_, t);
     }
@@ -203,4 +218,3 @@ private:
         bf16("llm.blk.0.ffn.down.weight", {L, L});
     }
 };
-

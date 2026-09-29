@@ -63,6 +63,17 @@ bool greedy_generate(const MossModel& m, const InputsEmbeds& i,
     return lib::greedy_generate(decode_ctx(m), i, p, o, e);
 }
 
+bool speculative_generate(const MossModel& m, const InputsEmbeds& i,
+                          const GenerateOptions& op, int max_k,
+                          const lib::DraftProposer& proposer,
+                          const lib::CancelCheck& cancelled,
+                          GenerateResult& o, lib::SpeculativeStats& stats,
+                          std::string& e) {
+    const lib::GenerateParams p{op.max_new_tokens, op.max_cache_len, op.eos_token_id};
+    return lib::speculative_generate(decode_ctx(m), i, p, max_k, proposer,
+                                     cancelled, o, stats, e);
+}
+
 size_t prefill_replay_cache_size(const MossModel& model) {
     return lib::prefill_replay_cache_size(model.loader);
 }
