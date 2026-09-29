@@ -37,17 +37,18 @@ def main() -> int:
                     "short_latency_min_saved_ms", "candidate_busy_responses_max",
                     "long_wall_max_ratio_to_serial_mixed"):
             rule[key]
-    except (KeyError, TypeError) as exc:
+        serial_sha, fair_sha = sha256(serial_spec), sha256(fair_spec)
+        serial = json.loads(args.serial.read_text())
+        fair = json.loads(args.fair.read_text())
+    except (KeyError, TypeError, OSError, ValueError) as exc:
         print(json.dumps({"status": "no_go_or_inconclusive",
-                          "reasons": [f"comparison spec invalid: {exc!r}"],
+                          "reasons": [f"comparison inputs invalid: {exc!r}"],
                           "rule": None}, indent=2))
         return 1
-    serial = json.loads(args.serial.read_text())
-    fair = json.loads(args.fair.read_text())
     reasons: list[str] = []
-    if serial.get("spec_sha256") != sha256(serial_spec):
+    if serial.get("spec_sha256") != serial_sha:
         reasons.append("serial run does not match committed app-ready spec")
-    if fair.get("spec_sha256") != sha256(fair_spec):
+    if fair.get("spec_sha256") != fair_sha:
         reasons.append("fair run does not match committed app-ready spec")
     if serial.get("cpu_affinity") != fair.get("cpu_affinity"):
         reasons.append("CPU affinity differs between arms")

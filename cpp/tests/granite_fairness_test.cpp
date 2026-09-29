@@ -48,7 +48,7 @@ static std::string baseline(starling_ggml_ctx* model, const std::vector<float>& 
 
 int main() {
 #ifdef _WIN32
-    std::printf("[SKIP] POSIX trace-capture concurrency test\n");
+    std::printf("[SKIP] Granite chunk-fairness test needs POSIX trace capture\n");
     return 0;
 #else
     SETENV("STARLING_GGML_DEVICE", "cpu");

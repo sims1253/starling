@@ -57,5 +57,11 @@ class FairnessDecisionTest(unittest.TestCase):
         self.assertIn("pair 0: missing or invalid timing", result["reasons"])
 
 
+    def test_missing_candidate_spec_fails_closed(self) -> None:
+        code, result = self.evaluate({}, {}, HERE / "missing_spec.json")
+        self.assertEqual((code, result["status"]), (1, "no_go_or_inconclusive"))
+        self.assertIn("comparison inputs invalid", result["reasons"][0])
+
+
 if __name__ == "__main__":
     unittest.main()
