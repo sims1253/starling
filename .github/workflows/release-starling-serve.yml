@@ -230,9 +230,11 @@ jobs:
             -DSTARLING_GGML_TESTS=OFF -DBUILD_SHARED_LIBS=OFF \
             -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCHITECTURES" \
             -DGGML_NATIVE=OFF -DGGML_LLAMAFILE=OFF
-          # Unbounded -j ran 4 nvcc processes on the 16 GB runner and the job
-          # was killed by a runner shutdown three builds in a row, always
-          # mid-compile. Cap parallelism to bound peak compiler memory.
+          # -j alone resolves to the workflow-level CMAKE_BUILD_PARALLEL_LEVEL
+          # (4), and 4 nvcc processes on the 16 GB runner got the job killed by
+          # a runner shutdown three builds in a row, always mid-compile. The
+          # explicit cap below overrides that env var to bound peak compiler
+          # memory.
           cmake --build build -j 2 --target starling-serve
 
       - name: Strip and package
@@ -341,6 +343,15 @@ jobs:
       contents: read
     needs: runtime-contract
     runs-on: windows-2025-vs2026
+    # The SDK download/install and the Vulkan shader build can both stall;
+    # none of these jobs should ever burn the runner indefinitely.
+    timeout-minutes: 90
+    env:
+      VULKAN_SDK_VERSION: 1.4.357.0
+      # SHA-256 of vulkansdk-windows-X64-1.4.357.0.exe; update together
+      # with VULKAN_SDK_VERSION. Pinned here (not fetched at runtime) so a
+      # compromised download cannot swap hash and installer together.
+      VULKAN_SDK_SHA256: 81F474711E9042F4CD22B31B2F7A8870DB2E428B21586FB43DD80150BE97310D
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -353,6 +364,15 @@ jobs:
         shell: bash
         run: bash scripts/apply_ggml_patches.sh
 
+      - name: Restore Vulkan SDK installer cache
+        # The replaced humbletim action cached the installer; keep that so the
+        # ~300 MB download does not repeat on every master push. The key covers
+        # version and pinned hash, so a re-pinned SDK never restores stale bits.
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ runner.temp }}\VulkanSDK-Installer.exe
+          key: vulkan-sdk-installer-windows-${{ env.VULKAN_SDK_VERSION }}-${{ env.VULKAN_SDK_SHA256 }}
+
       - name: Install Vulkan SDK
         # humbletim/install-vulkan-sdk@v1.2 unpacks the Windows installer with a
         # single 7z pass, but SDK installers >= 1.4.313.0 layer their payload,
@@ -361,17 +381,14 @@ jobs:
         # Run the official installer silently instead, the same way upstream
         # ggml's build-vulkan.yml windows job installs this exact SDK version.
         shell: pwsh
-        env:
-          VULKAN_SDK_VERSION: 1.4.357.0
-          # SHA-256 of vulkansdk-windows-X64-1.4.357.0.exe; update together
-          # with VULKAN_SDK_VERSION. Pinned here (not fetched at runtime) so a
-          # compromised download cannot swap hash and installer together.
-          VULKAN_SDK_SHA256: 81F474711E9042F4CD22B31B2F7A8870DB2E428B21586FB43DD80150BE97310D
         run: |
           $installer = "$env:RUNNER_TEMP\VulkanSDK-Installer.exe"
-          curl.exe -o "$installer" -L `
-            "https://sdk.lunarg.com/sdk/download/${env:VULKAN_SDK_VERSION}/windows/vulkansdk-windows-X64-${env:VULKAN_SDK_VERSION}.exe"
-          if ($LASTEXITCODE -ne 0) { throw "Vulkan SDK download failed (exit $LASTEXITCODE)" }
+          if (-not (Test-Path "$installer")) {
+            curl.exe --fail --retry 3 --retry-delay 10 -o "$installer" -L `
+              "https://sdk.lunarg.com/sdk/download/${env:VULKAN_SDK_VERSION}/windows/vulkansdk-windows-X64-${env:VULKAN_SDK_VERSION}.exe"
+            if ($LASTEXITCODE -ne 0) { throw "Vulkan SDK download failed (exit $LASTEXITCODE)" }
+          }
+          # Verify even on cache hits; the pinned hash is the integrity gate.
           $actual = (Get-FileHash "$installer" -Algorithm SHA256).Hash
           if ($actual -ine $env:VULKAN_SDK_SHA256) { throw "Vulkan SDK checksum mismatch: $actual" }
           & "$installer" --accept-licenses --default-answer --confirm-command install
