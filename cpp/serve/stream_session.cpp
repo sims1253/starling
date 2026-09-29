@@ -17,6 +17,10 @@
 
 namespace starling::serve {
 
+namespace {
+struct StreamQueueTimeout {};
+}
+
 // ---- word helpers ---------------------------------------------------------
 
 std::string norm_word(const std::string& word) {
@@ -414,13 +418,14 @@ StreamSession::StreamSession(StarlingServer* server) : server_(server) {
     // Engine identity for exact-tail reuse (S11): everything about the request
     // that can change a raw window result. The native server fixes the model
     // slug + gguf artifact (which encodes the quantization) per process and
-    // the backend at link time; the window/overlap policy shapes the very
-    // windows being keyed. std::to_string(double) is fixed-point, so the
+    // selected backend after load (compile-time family before a lazy load);
+    // the window/overlap policy shapes the very windows being keyed.
+    // std::to_string(double) is fixed-point, so the
     // string is deterministic. There is no language/normalization parameter
     // on the native streaming path (nothing extra to key on); a hypothetical
     // reload/re-config goes through set_engine_identity(), which invalidates.
     engine_id_ = cfg.model_slug + "|" + cfg.gguf_path + "|"
-               + starling_ggml_backend_name() + "|chunk="
+               + server_->backend_identity() + "|chunk="
                + std::to_string(cfg.stream_chunk_seconds)
                + "|overlap=" + std::to_string(cfg.stream_overlap_seconds)
                + "|min=" + std::to_string(cfg.min_chunk_seconds)
@@ -431,12 +436,19 @@ TranscribeFn StreamSession::make_transcribe_fn(RequestContext* ctx) {
     return [this, ctx](const float* samples, int64_t n)
                -> std::optional<std::string> {
         std::string err;
-        // Streaming chunks never wait behind queued requests: if the serial
-        // queue is occupied, report busy and let the chunker retry later
-        // (matching the Python StreamSession._tx behavior).
+        // In Granite fairness mode, a stream takes a FIFO ticket so an upload
+        // yields after its current chunk. The default retry-on-busy contract
+        // is unchanged for every other serving mode.
+        const QueuePolicy policy = (server_->config().granite_chunk_fairness &&
+                                    server_->config().model_slug == "granite")
+            ? QueuePolicy::Block : QueuePolicy::SkipIfBusy;
         auto result = server_->transcribe_pcm(samples, n, ctx, &err,
-                                              QueuePolicy::SkipIfBusy);
+                                              policy);
         if (!err.empty()) {
+            // A blocking queue wait has already consumed its deadline. Do
+            // not let ChunkStreamer::flush retry it five times with fresh
+            // deadlines, or present it as a transient busy reply.
+            if (err == "request timed out") throw StreamQueueTimeout{};
             // "server busy" or "cancelled" → return nullopt (retry without
             // advancing state, matching the Python StreamSession._tx behavior).
             if (err == "server busy" || err == "cancelled") return std::nullopt;
@@ -648,14 +660,32 @@ void StreamSession::set_engine_identity(std::string id) {
 
 std::optional<std::string> StreamSession::stream_step(double now) {
     if (!chunker_) return std::nullopt;
+    if (!terminal_error_.empty()) return std::nullopt;
     TranscribeFn tx = active_tx();
-    return chunker_->step(samples_, now, tx);
+    try {
+        return chunker_->step(samples_, now, tx);
+    } catch (const StreamQueueTimeout&) {
+        terminal_error_ = "request timed out";
+        take_invalid_ = true;
+        invalid_reason_ = "request_timed_out";
+        invalidate_tail_result();
+        return std::nullopt;
+    }
 }
 
 std::optional<std::string> StreamSession::stream_flush() {
     if (!chunker_) return "";
+    if (!terminal_error_.empty()) return std::nullopt;
     TranscribeFn tx = active_tx();
-    return chunker_->flush(samples_, tx);
+    try {
+        return chunker_->flush(samples_, tx);
+    } catch (const StreamQueueTimeout&) {
+        terminal_error_ = "request timed out";
+        take_invalid_ = true;
+        invalid_reason_ = "request_timed_out";
+        invalidate_tail_result();
+        return std::nullopt;
+    }
 }
 
 void StreamSession::reset() {
@@ -665,6 +695,7 @@ void StreamSession::reset() {
     overflow_ = false;
     take_invalid_ = false;
     invalid_reason_.clear();
+    terminal_error_.clear();
     if (chunker_) chunker_->reset();
     // A new take must never inherit the previous take's retained result.
     // Dropping the entry (below) covers the normal path; bumping audio_rev_

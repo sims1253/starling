@@ -1,0 +1,12 @@
+[starling-serve] loading model 's1' from /data/local/tmp/starling-issue-batch/s1-bf16.gguf ...
+[starling-serve] model loaded in 1.0s
+[starling-serve] warming up on probe text ...
+S1_TIMING prefill=26026.6ms decode_tokens=14 avg=870.76ms/tok (kstep=0)
+S1_TIMING prompt=92tok gen=15tok total=38226.9ms copy=0 max_k=0 accepted=0/0 verify_calls=0 fallback_steps=0 proposal=0.00ms verify=0.00ms fallback=0.00ms
+[starling-serve] warmup complete
+[starling-serve] starting on 127.0.0.1:8182 (model=s1, backend=CPU, abi=8)
+S1_TIMING prefill=21195.7ms decode_tokens=10 avg=2329.64ms/tok (kstep=0)
+S1_TIMING prompt=97tok gen=11tok total=44520.3ms copy=0 max_k=0 accepted=0/0 verify_calls=0 fallback_steps=0 proposal=0.00ms verify=0.00ms fallback=0.00ms
+S1_TIMING prefill=10250.0ms decode_tokens=10 avg=2258.89ms/tok (kstep=0)
+S1_TIMING prompt=97tok gen=11tok total=32849.5ms copy=0 max_k=0 accepted=0/0 verify_calls=0 fallback_steps=0 proposal=0.00ms verify=0.00ms fallback=0.00ms
+Terminated 

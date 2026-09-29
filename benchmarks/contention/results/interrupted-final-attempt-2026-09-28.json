@@ -1,0 +1,5 @@
+{
+  "reason": "worker-owned foreground PTY ended; runner and child PIDs absent; no validation verdict",
+  "source_head": "ad383d6c3ea7e1ed0d27b50fdfe163af64a65790",
+  "preserved_at_utc": "2026-09-28T00:35:25.327437+00:00"
+}

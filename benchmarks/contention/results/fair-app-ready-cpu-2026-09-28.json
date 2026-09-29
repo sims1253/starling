@@ -1,0 +1,232 @@
+{
+  "schema_version": 1,
+  "spec_sha256": "974f97d79fc1f050b808a86dbce61f1caf4c5a526a17c8d1baad323a45ef2bcd",
+  "run_utc": "2026-09-28T00:05:23.534270+00:00",
+  "cpu_affinity": "16-23",
+  "host_load_before": [
+    4.17529296875,
+    4.90673828125,
+    4.2333984375
+  ],
+  "binary": "/home/m0hawk/.t3/worktrees/starling/issue-178-granite-fairness/build-178/starling-serve",
+  "model": "/home/m0hawk/Documents/starling-granite/models/granite-speech-4.1-2b-bf16-exact.gguf",
+  "server_command": [
+    "taskset",
+    "-c",
+    "16-23",
+    "/home/m0hawk/.t3/worktrees/starling/issue-178-granite-fairness/build-178/starling-serve",
+    "--model",
+    "granite",
+    "--gguf",
+    "/home/m0hawk/Documents/starling-granite/models/granite-speech-4.1-2b-bf16-exact.gguf",
+    "--port",
+    "46353",
+    "--granite-chunk-fairness"
+  ],
+  "trials": [
+    {
+      "scenario": "idle",
+      "pair": 0,
+      "ws_connect_ms": 3.848582971841097,
+      "ws_app_ready_ms": 45.10745999868959,
+      "short": {
+        "status": "final",
+        "stop_to_final_ms": 8866.159340017475,
+        "busy_responses": 0,
+        "partials": 1,
+        "first_commit_before_long_done": false,
+        "text_sha256": "41f9e18f92ad8dfa94861d37ccb1262f07a1660c7b42f50bf51252cf5b5d0383",
+        "text_length": 122
+      },
+      "short_trace": {
+        "service_ms": [
+          8820.3
+        ],
+        "busy_exits": 0
+      }
+    },
+    {
+      "scenario": "mixed",
+      "pair": 0,
+      "ws_connect_ms": 21.587183931842446,
+      "ws_app_ready_ms": 44.16368599049747,
+      "short": {
+        "status": "final",
+        "stop_to_final_ms": 50120.39133592043,
+        "busy_responses": 0,
+        "partials": 1,
+        "first_commit_before_long_done": true,
+        "text_sha256": "41f9e18f92ad8dfa94861d37ccb1262f07a1660c7b42f50bf51252cf5b5d0383",
+        "text_length": 122
+      },
+      "long": {
+        "status": 200,
+        "wall_ms": 118659.64243002236,
+        "text_sha256": "8bd0f0a220db9523f2cdf545de2281e9c4e1ec6bddebe6f8ad4bb133d54745dd",
+        "text_length": 1012
+      },
+      "short_trace": {
+        "service_ms": [
+          10603.087
+        ],
+        "busy_exits": 0
+      },
+      "long_request_id": "pilot-long-0",
+      "long_trace": {
+        "service_ms": [
+          39515.902,
+          38661.437,
+          29866.67
+        ],
+        "queue_wait_ms": [
+          0.0,
+          10603.142,
+          0.0
+        ],
+        "chunks": 3,
+        "ws_busy_exits": 0
+      }
+    },
+    {
+      "scenario": "idle",
+      "pair": 1,
+      "ws_connect_ms": 1.0273209773004055,
+      "ws_app_ready_ms": 45.83666496910155,
+      "short": {
+        "status": "final",
+        "stop_to_final_ms": 10963.412721990608,
+        "busy_responses": 0,
+        "partials": 1,
+        "first_commit_before_long_done": false,
+        "text_sha256": "41f9e18f92ad8dfa94861d37ccb1262f07a1660c7b42f50bf51252cf5b5d0383",
+        "text_length": 122
+      },
+      "short_trace": {
+        "service_ms": [
+          10921.104
+        ],
+        "busy_exits": 0
+      }
+    },
+    {
+      "scenario": "mixed",
+      "pair": 1,
+      "ws_connect_ms": 0.9815959492698312,
+      "ws_app_ready_ms": 45.92530301306397,
+      "short": {
+        "status": "final",
+        "stop_to_final_ms": 50791.849942994304,
+        "busy_responses": 0,
+        "partials": 1,
+        "first_commit_before_long_done": true,
+        "text_sha256": "41f9e18f92ad8dfa94861d37ccb1262f07a1660c7b42f50bf51252cf5b5d0383",
+        "text_length": 122
+      },
+      "long": {
+        "status": 200,
+        "wall_ms": 118623.25890001375,
+        "text_sha256": "8bd0f0a220db9523f2cdf545de2281e9c4e1ec6bddebe6f8ad4bb133d54745dd",
+        "text_length": 1012
+      },
+      "short_trace": {
+        "service_ms": [
+          11922.913
+        ],
+        "busy_exits": 0
+      },
+      "long_request_id": "pilot-long-1",
+      "long_trace": {
+        "service_ms": [
+          38867.136,
+          38138.894,
+          29681.146
+        ],
+        "queue_wait_ms": [
+          0.0,
+          11922.969,
+          0.0
+        ],
+        "chunks": 3,
+        "ws_busy_exits": 0
+      }
+    },
+    {
+      "scenario": "idle",
+      "pair": 2,
+      "ws_connect_ms": 1.2547839432954788,
+      "ws_app_ready_ms": 45.513391960412264,
+      "short": {
+        "status": "final",
+        "stop_to_final_ms": 11579.356654081494,
+        "busy_responses": 0,
+        "partials": 1,
+        "first_commit_before_long_done": false,
+        "text_sha256": "41f9e18f92ad8dfa94861d37ccb1262f07a1660c7b42f50bf51252cf5b5d0383",
+        "text_length": 122
+      },
+      "short_trace": {
+        "service_ms": [
+          11536.999
+        ],
+        "busy_exits": 0
+      }
+    },
+    {
+      "scenario": "mixed",
+      "pair": 2,
+      "ws_connect_ms": 0.9935470297932625,
+      "ws_app_ready_ms": 45.67034309729934,
+      "short": {
+        "status": "final",
+        "stop_to_final_ms": 47679.6688970644,
+        "busy_responses": 0,
+        "partials": 1,
+        "first_commit_before_long_done": true,
+        "text_sha256": "41f9e18f92ad8dfa94861d37ccb1262f07a1660c7b42f50bf51252cf5b5d0383",
+        "text_length": 122
+      },
+      "long": {
+        "status": 200,
+        "wall_ms": 114393.74674798455,
+        "text_sha256": "8bd0f0a220db9523f2cdf545de2281e9c4e1ec6bddebe6f8ad4bb133d54745dd",
+        "text_length": 1012
+      },
+      "short_trace": {
+        "service_ms": [
+          10637.273
+        ],
+        "busy_exits": 0
+      },
+      "long_request_id": "pilot-long-2",
+      "long_trace": {
+        "service_ms": [
+          37036.53,
+          37202.428,
+          29504.25
+        ],
+        "queue_wait_ms": [
+          0.0,
+          10637.342,
+          0.0
+        ],
+        "chunks": 3,
+        "ws_busy_exits": 0
+      }
+    }
+  ],
+  "warmup": {
+    "status": 200,
+    "wall_ms": 7591.3774479413405,
+    "text_sha256": "41f9e18f92ad8dfa94861d37ccb1262f07a1660c7b42f50bf51252cf5b5d0383",
+    "text_length": 122
+  },
+  "host_load_after": [
+    4.4482421875,
+    4.6533203125,
+    4.36962890625
+  ],
+  "verdict": {
+    "status": "inconclusive",
+    "reason": "pair 0 lacked a matching successful final or trace"
+  }
+}

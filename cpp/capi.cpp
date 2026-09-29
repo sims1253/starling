@@ -9,6 +9,7 @@
 #include "starling_ggml.h"
 
 #include "lib/model_registry.hpp"
+#include "lib/granite_job_internal.hpp"
 #include "runtime/graph.hpp"  // global_backend, shutdown_backend, shutting_down
 #include "runtime/imatrix.hpp"  // ImatrixCollector (imatrix_flush_pub)
 
@@ -18,6 +19,7 @@
 #include <mutex>
 #include <string>
 #include <memory>
+#include <optional>
 #include <type_traits>
 #include <stdexcept>
 
@@ -99,6 +101,65 @@ const char * backend_name_for_build() {
 }
 
 } // namespace
+
+namespace starling::ggml::lib {
+
+GraniteChunkJob* create_granite_job(starling_ggml_ctx* ctx,
+                                    const float* pcm, int64_t n) {
+    // Job creation only snapshots immutable model policy and borrows PCM. It
+    // must not wait on runtime_mutex before taking a serving queue ticket:
+    // otherwise a short WS call arriving during a long chunk could miss the
+    // next FIFO turn. The server owns the loaded context for the whole call;
+    // as with every C API call, concurrent free(ctx) is outside that contract.
+    if (!ctx || ctx->kind != STARLING_GGML_GRANITE || !ctx->model ||
+        starling::ggml::shutting_down()) {
+        return api_call(ctx, [&]() -> GraniteChunkJob* {
+            // A shutdown in progress is reported by require_running().
+            require_running();
+            set_global_error("Granite job requires a loaded Granite model");
+            if (ctx) ctx->last_error = g_last_error;
+            return nullptr;
+        });
+    }
+    const char* err = nullptr;
+    auto* job = granite_job_create_impl(ctx->model, pcm, n, &err);
+    if (!job) {
+        return api_call(ctx, [&]() -> GraniteChunkJob* {
+            ctx->last_error = err ? err : "Granite job creation failed";
+            set_global_error(ctx->last_error);
+            return nullptr;
+        });
+    }
+    return job;
+}
+
+int step_granite_job(starling_ggml_ctx* ctx, GraniteChunkJob* job,
+                     std::string* final_text) {
+    auto status = api_call(ctx, [&]() -> std::optional<int> {
+        require_running();
+        if (!ctx || ctx->kind != STARLING_GGML_GRANITE || !ctx->model || !job) {
+            set_global_error("invalid Granite job step");
+            if (ctx) ctx->last_error = g_last_error;
+            return -1;
+        }
+        const char* err = nullptr;
+        const int result = granite_job_step_impl(job, final_text, &err);
+        if (result < 0) {
+            ctx->last_error = err ? err : "Granite chunk failed";
+            set_global_error(ctx->last_error);
+        }
+        return result;
+    });
+    return status.value_or(-1);
+}
+
+bool granite_job_last_chunk(const GraniteChunkJob* job) {
+    return granite_job_last_chunk_impl(job);
+}
+
+void free_granite_job(GraniteChunkJob* job) { granite_job_free_impl(job); }
+
+} // namespace starling::ggml::lib
 
 extern "C" {
 

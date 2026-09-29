@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "spec_sha256": "b72332ffab35ee24bf1ab291d62797b35212fead5951db782fa00aa106e08990",
+  "run_utc": "2026-09-28T00:32:28.166095+00:00",
+  "cpu_affinity": "16-23",
+  "host_load_before": [
+    0.80712890625,
+    1.58642578125,
+    2.75439453125
+  ],
+  "binary": "/home/m0hawk/.t3/worktrees/starling/issue-178-granite-fairness/build-178/starling-serve",
+  "model": "/home/m0hawk/Documents/starling-granite/models/granite-speech-4.1-2b-bf16-exact.gguf",
+  "server_command": [
+    "taskset",
+    "-c",
+    "16-23",
+    "/home/m0hawk/.t3/worktrees/starling/issue-178-granite-fairness/build-178/starling-serve",
+    "--model",
+    "granite",
+    "--gguf",
+    "/home/m0hawk/Documents/starling-granite/models/granite-speech-4.1-2b-bf16-exact.gguf",
+    "--port",
+    "45761",
+    "--granite-chunk-fairness"
+  ],
+  "trials": [
+    {
+      "scenario": "idle",
+      "pair": 0,
+      "ws_connect_ms": 2.1056790137663484,
+      "ws_app_ready_ms": 40.99421005230397,
+      "short": {
+        "status": "final",
+        "stop_to_final_ms": 6571.254034992307,
+        "busy_responses": 0,
+        "partials": 1,
+        "first_commit_before_long_done": false,
+        "text_sha256": "41f9e18f92ad8dfa94861d37ccb1262f07a1660c7b42f50bf51252cf5b5d0383",
+        "text_length": 122
+      },
+      "short_trace": {
+        "service_ms": [
+          6526.466
+        ],
+        "busy_exits": 0
+      }
+    }
+  ],
+  "warmup": {
+    "status": 200,
+    "wall_ms": 6529.081718064845,
+    "text_sha256": "41f9e18f92ad8dfa94861d37ccb1262f07a1660c7b42f50bf51252cf5b5d0383",
+    "text_length": 122
+  }
+}

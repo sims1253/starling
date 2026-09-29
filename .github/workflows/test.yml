@@ -40,6 +40,7 @@ jobs:
   experiments-harness:
     name: Experiments harness (CPU)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -50,6 +51,8 @@ jobs:
         uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4
       - name: Unit and comparator tests (stub double, no models)
         run: uv run --no-project --python 3.12 python -m unittest discover -s benchmarks/experiments -p 'test_*.py'
+      - name: Contention pilot decision tests (saved result summaries)
+        run: uv run --no-project --python 3.12 python -m unittest discover -s benchmarks/contention -p 'test_*.py'
       - name: Paired CPU reproduction (contract fixture binary)
         run: >
           cmake -B build-exp -DSTARLING_SERVE=ON -DSTARLING_GGML_TESTS=ON
@@ -81,6 +84,7 @@ jobs:
           tests/test_server_lifecycle.py tests/test_server_websocket.py
           tests/test_server_client.py tests/test_stream_chunk.py
           tests/test_native_parity_contract.py tests/test_copy_draft.py
+          benchmarks/speculative/results/pixel-native-copy-2026-09-28/test_run_copy.py
           tests/test_s1_quant_spans.py tests/test_s1_pixel_runner.py
           docs/evidence/pixel-s1-2026-09-28/controlled/test_controlled.py
 

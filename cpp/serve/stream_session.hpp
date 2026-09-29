@@ -181,6 +181,9 @@ public:
     // take ("malformed_wav", "sample_rate_mismatch", "odd_pcm_length").
     // Empty unless take_invalid().
     const std::string& invalid_reason() const { return invalid_reason_; }
+    // A blocking server queue timeout is terminal for this take; reset() is
+    // required before more audio. Empty for transient busy responses.
+    const std::string& terminal_error() const { return terminal_error_; }
 
     // Advance the chunked stream; returns text to emit as a partial, or nullopt.
     std::optional<std::string> stream_step(double now);
@@ -189,7 +192,8 @@ public:
     // the legacy whole-buffer mode, where every partial is a fresh guess.
     int64_t stable_words() const { return chunker_ ? chunker_->stable_words() : 0; }
 
-    // Finalize all buffered audio, or nullopt if busy; retain audio for retry.
+    // Finalize all buffered audio, or nullopt if busy/terminal. A blocking
+    // queue timeout sets terminal_error(); transient busy retains audio.
     std::optional<std::string> stream_flush();
 
     void reset();
@@ -286,6 +290,7 @@ private:
     bool overflow_ = false;
     bool take_invalid_ = false;   // set by an append rejection (issue #145)
     std::string invalid_reason_;  // machine-readable code for the rejection
+    std::string terminal_error_;  // nonempty after a blocking queue timeout
     TranscribeFn custom_tx_;  // when set, used instead of the server callback
     TranscribeFn wrapped_tx_;  // cached active_tx() wrapper (see active_tx)
     std::unique_ptr<ChunkStreamer> chunker_;
