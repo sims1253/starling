@@ -24,7 +24,8 @@ int main(int argc, char** argv) {
     std::vector<float> pcm;
     int sample_rate = 0;
     if (!read_wav(argv[2], pcm, sample_rate, err) || sample_rate != 16000) {
-        std::fprintf(stderr, "wav: %s (sample rate=%d)\n", err.c_str(), sample_rate);
+        std::fprintf(stderr, "wav: %s\n", err.empty()
+            ? ("expected 16000 Hz, got " + std::to_string(sample_rate)).c_str() : err.c_str());
         return 2;
     }
     MelFeatures mel;

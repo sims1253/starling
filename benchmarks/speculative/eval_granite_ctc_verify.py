@@ -100,6 +100,8 @@ def main() -> int:
             return text
 
         reference = run("greedy", "warm", 0)
+        if not reference:
+            raise AssertionError("greedy produced an empty transcript")
         if run("ctc", "warm", 0) != reference:
             raise AssertionError("CTC warm transcript differs from greedy")
         for repeat in range(1, args.repeats + 1):

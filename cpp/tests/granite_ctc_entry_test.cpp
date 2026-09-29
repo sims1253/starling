@@ -38,7 +38,10 @@ int main() {
     starling_ggml_free_string(missing);
     err = nullptr;
     char* greedy1 = starling_ggml_granite_decode(handle, pcm.data(), pcm.size(), &err);
-    check(greedy1 != nullptr, "default greedy still decodes after failed CTC request");
+    const std::string greedy_label =
+        std::string("default greedy still decodes after failed CTC request") +
+        (greedy1 ? "" : std::string(": ") + (err ? err : "unknown error"));
+    check(greedy1 != nullptr, greedy_label.c_str());
     err = nullptr;
     char* greedy2 = starling_ggml_granite_decode(handle, pcm.data(), pcm.size(), &err);
     check(greedy1 && greedy2 && std::string(greedy1) == greedy2,
