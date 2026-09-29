@@ -54,6 +54,10 @@ env:
   # Windows pins this patch; Linux installs its major/minor metapackage.
   # Runtime documentation is checked by scripts/release-runtime/check-contract.py.
   CUDA_VERSION: '13.3.0'
+  # Userspace driver library (libcuda.so.1) for the GPU-less linux-cuda runner
+  # and the runtime-check container. Driver branches do not follow CUDA
+  # versions; the pin is kept in sync with Dockerfile.cuda by check-contract.py.
+  CUDA_DRIVER_PACKAGE: libnvidia-compute-610
   CMAKE_BUILD_PARALLEL_LEVEL: 4
   # Experimental builds replace the arch list with sm_120 only (RTX 50xx
   # dogfooding); tag releases keep sm_75..sm_120.
@@ -221,12 +225,15 @@ jobs:
           cuda_series="${CUDA_VERSION%.*}"
           sudo apt-get install -y "cuda-toolkit-${cuda_series//./-}"
           # Userspace driver library (libcuda.so.1) so the binary's loader
-          # dependencies resolve on this GPU-less runner — the same package the
-          # fresh-container runtime check installs (Dockerfile.cuda). Without
-          # it, ./starling-serve-linux-cuda --version dies with exit 127.
-          sudo apt-get install -y libnvidia-compute-610
-          # Toolkit runtime libs (libcudart.so, libcublas.so) for the same
-          # reason, in case the build rpath ever stops covering them.
+          # dependencies resolve on this GPU-less runner; without it,
+          # ./starling-serve-linux-cuda --version dies with exit 127. The pin
+          # is shared with the runtime-check image via CUDA_DRIVER_PACKAGE
+          # (checked by check-contract.py).
+          sudo apt-get install -y "$CUDA_DRIVER_PACKAGE"
+          # Toolkit runtime libs (libcudart.so, libcublas.so) are already
+          # installed with the toolkit; export their directory in case the
+          # build rpath ever stops covering them. (libcuda.so.1 from the driver
+          # package resolves via the default system loader paths.)
           echo "LD_LIBRARY_PATH=/usr/local/cuda/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
           # Drop the ~3 GB of cached .debs; the toolkit plus the build leaves
           # little headroom on the runner disk otherwise.
@@ -491,8 +498,10 @@ jobs:
           # direct nvcuda import — the silent loader failure comes from the
           # toolkit DLLs' own load chain. Delay-load every CUDA DLL so none of
           # them is in the startup path: metadata flags never touch CUDA, and
-          # on driver-equipped machines the delayed imports resolve at the
-          # first real CUDA call, after a device context exists.
+          # the delayed imports resolve at the first real CUDA call on machines
+          # matching the documented runtime contract (CUDA runtime + cuBLAS
+          # DLLs on PATH, see release-runtime.md); the toolkit DLLs do NOT
+          # ship with the NVIDIA driver.
           $cudaMajor = $env:CUDA_VERSION.Split('.')[0]
           $delayFlags = "/DELAYLOAD:cudart64_$cudaMajor.dll " +
             "/DELAYLOAD:cublas64_$cudaMajor.dll /DELAYLOAD:cublasLt64_$cudaMajor.dll"
@@ -520,10 +529,21 @@ jobs:
         shell: pwsh
         run: |
           # Ground truth for the loader: the exe's full import table, in the
-          # log, so a startup failure here never needs guessing again.
+          # log, so a startup failure here never needs guessing again. The
+          # eager section is also gated: if a CUDA bump renames a DLL, the
+          # stale /DELAYLOAD flag degrades to a LNK4199 warning and the DLL
+          # comes back as an eager import — fail here instead of shipping an
+          # exe that again cannot start.
           $dumpbin = (Get-ChildItem "C:\Program Files\Microsoft Visual Studio\*\*\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" |
             Select-Object -First 1).FullName
-          & $dumpbin /dependents .\starling-serve-windows-cuda.exe
+          if (-not $dumpbin) { throw "dumpbin.exe not found under the Visual Studio install" }
+          $deps = & $dumpbin /dependents .\starling-serve-windows-cuda.exe
+          $deps
+          $split = ($deps -join "`n") -split '(?im)^.*delay load.*$'
+          $eager = if ($split.Count -gt 1) { $split[0] } else { $deps -join "`n" }
+          if ($eager -match 'cudart64_|cublas64_|cublasLt64_') {
+            throw "CUDA DLLs are eager imports; the delay-load flags are not in effect"
+          }
           $version = .\starling-serve-windows-cuda.exe --version
           $version
           $expected = "starling-serve $($env:RELEASE_TAG -replace '^v', '')"
