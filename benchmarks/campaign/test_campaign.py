@@ -271,6 +271,9 @@ class SealAndTamperTests(ToyCampaignTest):
     def test_evaluator_tamper_stops_run_with_exit_4(self):
         out, _rc = self.start_campaign(run=False, max_attempts=3)
         victim = out / "trusted" / "evaluator" / "input.txt"
+        with self.assertRaises(PermissionError, msg="trusted files are read-only"):
+            victim.write_text("tampered corpus\n", encoding="utf-8")
+        victim.chmod(0o644)  # a determined tamperer: still detected by the hash
         victim.write_text("tampered corpus\n", encoding="utf-8")
         rc = campaign_mod.main(["run", "--campaign", str(out)])
         self.assertEqual(rc, 4)
@@ -290,8 +293,9 @@ class SealAndTamperTests(ToyCampaignTest):
         def run_attempt_then_tamper(camp, **kw):
             entry = real_run_attempt(camp, **kw)
             if entry["n"] == 1 and not box["tampered"]:
-                (camp.dir / "trusted" / "evaluator" / "input.txt").write_text(
-                    "tampered\n", encoding="utf-8")
+                victim = camp.dir / "trusted" / "evaluator" / "input.txt"
+                victim.chmod(0o644)
+                victim.write_text("tampered\n", encoding="utf-8")
                 box["tampered"] = True
             return entry
 

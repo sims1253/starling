@@ -368,7 +368,7 @@ def model_profiles() -> list[dict]:
 
 
 def fixture_profile() -> dict:
-    return profile(
+    p = profile(
         "fixture--notebook-cpu", "starling-serve contract fixture", None, None, "ready",
         "#176",
         "the real-repo CPU pilot: builds the contract fixture (no models, no GPU) "
@@ -420,6 +420,12 @@ def fixture_profile() -> dict:
                               "cooldown_max_s": 600.0}},
         device_expect=None,
     )
+    # The fixture engine ignores audio: its only workload is the generated
+    # clip; the interactive model workloads do not apply to it.
+    p["workloads"] = [{"id": "generated-silence", "status": "available",
+                       "description": "0.5 s generated 16 kHz clip; the fixture "
+                                      "engine returns a fixed transcript"}]
+    return p
 
 
 def main() -> int:

@@ -322,8 +322,8 @@ def _print_plan(profile: dict, task: dict, context: dict) -> None:
     print("allowed paths:")
     for p in task["allowed_paths"]:
         print(f"  {p}")
-    print("protected paths (implicit ALWAYS_PROTECTED added at runtime):")
-    for p in task.get("protected_paths", []):
+    print("protected paths (always-protected + task + profile evaluator paths):")
+    for p in spec.effective_protected(profile, task):
         print(f"  {p}")
     print(f"measurement_protocol fresh_process={task['measurement_protocol']['fresh_process']} "
           f"declared_deviations={task['measurement_protocol']['declared_deviations'] or 'none'}")
@@ -578,6 +578,11 @@ def extract_trusted(repo: Path, sha: str, configured_paths: list[str], dest: Pat
     rc = proc.wait()
     if rc != 0:
         raise CampaignError(f"git archive failed for baseline {sha} paths {used}")
+    # Read-only files: a gate that writes into the sealed evaluator fails
+    # loudly at the write instead of silently changing the evaluator hash.
+    for path in dest.rglob("*"):
+        if path.is_file() and not path.is_symlink():
+            path.chmod(path.stat().st_mode & ~0o222)
     files = sum(1 for p in dest.rglob("*") if p.is_file())
     return {"paths": used, "skipped": skipped, "files": files}
 

@@ -120,57 +120,9 @@
   "tracking_issue": "#176",
   "workloads": [
     {
-      "description": "tests/fixtures short/medium/long clips through the bench gate",
-      "id": "clips-short-medium-long",
+      "description": "0.5 s generated 16 kHz clip; the fixture engine returns a fixed transcript",
+      "id": "generated-silence",
       "status": "available"
-    },
-    {
-      "description": "warm dictation session",
-      "id": "warm-dictation",
-      "owner_issue": "#226",
-      "status": "unavailable"
-    },
-    {
-      "description": "5-10 minute paced sessions",
-      "id": "session-5-10min",
-      "owner_issue": "#226",
-      "status": "unavailable"
-    },
-    {
-      "description": "model preload before speech starts",
-      "id": "preload-before-speech",
-      "owner_issue": "#229",
-      "status": "unavailable"
-    },
-    {
-      "description": "speech arriving while the model loads",
-      "id": "speech-during-load",
-      "owner_issue": "#229",
-      "status": "unavailable"
-    },
-    {
-      "description": "activation-to-capture latency",
-      "id": "activation-to-capture",
-      "owner_issue": "#310",
-      "status": "unavailable"
-    },
-    {
-      "description": "first partial transcript delay",
-      "id": "first-partial",
-      "owner_issue": "#310",
-      "status": "unavailable"
-    },
-    {
-      "description": "catch-up of accumulated audio backlog",
-      "id": "catch-up-backlog",
-      "owner_issue": "#310",
-      "status": "unavailable"
-    },
-    {
-      "description": "stop-to-final latency; sustained backlog must not drop audio",
-      "id": "stop-to-final",
-      "owner_issue": "#310",
-      "status": "unavailable"
     }
   ]
 }

@@ -88,6 +88,10 @@ class EnvScrubbingTests(unittest.TestCase):
         "STARLING_HELDOUT_DIR": "/heldout", "GEMINI_API_KEY": "g",
     }
 
+    def test_gate_env_never_writes_bytecode_into_the_trusted_tree(self):
+        env, _removed = gates_mod.gate_env({"PATH": "/usr/bin"})
+        self.assertEqual(env["PYTHONDONTWRITEBYTECODE"], "1")
+
     def test_gate_env_loses_all_credentials_and_heldout(self):
         env, removed = gates_mod.gate_env(self.BASE, ["STARLING_HELDOUT_DIR"])
         self.assertNotIn("OPENAI_API_KEY", env)

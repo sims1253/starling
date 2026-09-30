@@ -132,7 +132,12 @@ def scrub_env(
 
 
 def gate_env(base_env: dict[str, str], heldout_vars: list[str] = ()) -> tuple[dict[str, str], list[str]]:
-    return scrub_env(base_env, GATE_ENV_DENY, heldout_vars)
+    env, removed = scrub_env(base_env, GATE_ENV_DENY, heldout_vars)
+    # Trusted gate code runs in place from the sealed evaluator tree: Python
+    # must not drop __pycache__ into it (that would change the tree's hash and
+    # read as evaluator tampering).
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    return env, removed
 
 
 def agent_env(base_env: dict[str, str], heldout_vars: list[str] = ()) -> tuple[dict[str, str], list[str]]:
