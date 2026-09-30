@@ -9,6 +9,7 @@
 // use --warmup to exclude it).
 
 #include "starling_ggml.h"
+#include "lib/model_registry.hpp"
 #include "runtime/audio_io.hpp"
 
 #include <algorithm>
@@ -28,15 +29,13 @@ void usage() {
 }
 
 starling_ggml_model model_kind(const std::string& s) {
-    if (s == "parakeet") return STARLING_GGML_PARAKEET_TDT;
-    if (s == "moss") return STARLING_GGML_MOSS;
-    if (s == "ark") return STARLING_GGML_ARK;
-    if (s == "higgs") return STARLING_GGML_HIGGS;
-    if (s == "hojo") return STARLING_GGML_HOJO;
-    if (s == "granite") return STARLING_GGML_GRANITE;
-    if (s == "qwen3") return STARLING_GGML_QWEN3;
-    if (s == "audex") return STARLING_GGML_AUDEX;
-    return (starling_ggml_model)0;
+    // Any registry slug resolves through the model table (model_registry.cpp),
+    // so every native model (parakeet, moss, ark, ark06, qwen3, granite,
+    // higgs, hojo, audex, s1, voxtral, ...) is benchable; the historical
+    // hardcoded names are registry slugs and keep working unchanged (#176).
+    const starling::ggml::lib::ModelDescriptor* d =
+        starling::ggml::lib::find_model_by_slug(s);
+    return d ? d->kind : (starling_ggml_model)0;
 }
 
 double now_ms() {
