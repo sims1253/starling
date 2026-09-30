@@ -10,7 +10,8 @@ interleaved, seeded) and `compare`, and prints:
     METRIC verdict=pass|fail|inconclusive|unavailable
     METRIC improvement_pct=…   METRIC ci_low_pct=…   METRIC ci_high_pct=…
 
-Acceptance is decided by the profile's rule (`verdict == pass`), never here.
+Acceptance is decided by the profile's rule (`verdict == pass`), never here;
+an inconclusive or unavailable comparison exits 3 (gate inconclusive).
 The adapter runs run_experiment.py as a subprocess, so the experiments
 advisory lock ($STARLING_EXPERIMENT_LOCK) is taken by the child only — the
 campaign lock is a different lock by design (no deadlock).
@@ -49,8 +50,8 @@ def make_wav(path: Path) -> None:
         w.writeframes(b"\x00\x00" * 8000)
 
 
-def build_spec(args, wav: Path) -> dict:
-    manifest = workload_manifest([wav])
+def build_spec(args, wavs: list[Path]) -> dict:
+    manifest = workload_manifest(wavs)
     return {
         "schema": "starling-experiment-spec/1",
         "experiment_id": f"campaign-ab-{args.label}",
@@ -65,7 +66,7 @@ def build_spec(args, wav: Path) -> dict:
             "candidate": {"binary": args.cand_bin, "model_slug": args.model,
                           "model": args.gguf, "env": {}},
         },
-        "workload": {"audio": str(wav.parent), "files": [wav.name],
+        "workload": {"audio": str(wavs[0].parent), "files": [w.name for w in wavs],
                      "sha256": manifest["sha256"]},
         "protocol": {
             "repeats": args.repeats,
@@ -90,6 +91,9 @@ def main() -> int:
     ap.add_argument("--cand-bin", required=True)
     ap.add_argument("--model", default="parakeet")
     ap.add_argument("--gguf", default=None)
+    ap.add_argument("--wav", action="append", default=None,
+                    help="workload clip (repeatable, one directory); default: "
+                         "0.5 s of generated silence (model-free fixture only)")
     ap.add_argument("--run-dir", required=True)
     ap.add_argument("--label", default="gate")
     ap.add_argument("--repeats", type=int, default=6)
@@ -102,10 +106,19 @@ def main() -> int:
 
     run_dir = Path(args.run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
-    wav = run_dir / "audio" / "silence.wav"
-    make_wav(wav)
+    if args.wav:
+        wavs = [Path(w).resolve() for w in args.wav]
+        missing = [str(w) for w in wavs if not w.is_file()]
+        if missing or len({w.parent for w in wavs}) != 1:
+            print("METRIC verdict=unavailable")
+            print("workload clips must exist and share one directory: "
+                  + (", ".join(missing) or "several directories given"), file=sys.stderr)
+            return 3
+    else:
+        wavs = [run_dir / "audio" / "silence.wav"]
+        make_wav(wavs[0])
 
-    spec = build_spec(args, wav)
+    spec = build_spec(args, wavs)
     problems = validate_spec(spec)
     if problems:
         print("METRIC verdict=unavailable")
@@ -142,7 +155,9 @@ def main() -> int:
             print(f"METRIC {key}={value:.3f}")
         else:
             print(f"METRIC {key}=unavailable")
-    return 0 if verdict in ("pass", "fail", "inconclusive") else 3
+    # pass/fail are decided by the gate's rules; an inconclusive comparison
+    # (CI spans the bar or is too wide) must stay inconclusive, not "fail".
+    return 0 if verdict in ("pass", "fail") else 3
 
 
 if __name__ == "__main__":

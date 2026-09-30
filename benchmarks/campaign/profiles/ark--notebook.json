@@ -96,7 +96,13 @@
         "--model",
         "ark",
         "--gguf",
-        "${STARLING_MODELS_DIR}/ark-asr-3b-q8_0.gguf"
+        "${STARLING_MODELS_DIR}/ark-asr-3b-q8_0.gguf",
+        "--wav",
+        "${STARLING_FIXTURES_DIR}/short.wav",
+        "--wav",
+        "${STARLING_FIXTURES_DIR}/medium.wav",
+        "--wav",
+        "${STARLING_FIXTURES_DIR}/long.wav"
       ],
       "name": "perf",
       "objective": true,

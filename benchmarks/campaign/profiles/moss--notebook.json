@@ -96,7 +96,13 @@
         "--model",
         "moss",
         "--gguf",
-        "${STARLING_MODELS_DIR}/moss-transcribe-preview-2b-q4e8-fullimx.gguf"
+        "${STARLING_MODELS_DIR}/moss-transcribe-preview-2b-q4e8-fullimx.gguf",
+        "--wav",
+        "${STARLING_FIXTURES_DIR}/short.wav",
+        "--wav",
+        "${STARLING_FIXTURES_DIR}/medium.wav",
+        "--wav",
+        "${STARLING_FIXTURES_DIR}/long.wav"
       ],
       "name": "perf",
       "objective": true,

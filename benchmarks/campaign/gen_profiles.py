@@ -145,6 +145,7 @@ def notebook_gates(slug: str, gguf: str) -> list[dict]:
                 "--cand-bin", "{candidate}/starling-serve",
                 "--run-dir", "{attempt_dir}/experiment",
                 "--model", slug, "--gguf", f"${{STARLING_MODELS_DIR}}/{gguf}",
+                *[a for w in FIXTURE_WAVS for a in ("--wav", f"${{STARLING_FIXTURES_DIR}}/{w}")],
             ],
             "rules": [{"metric": "verdict", "op": "==", "value": "pass"}],
             "required": True, "objective": True, "timeout_s": 1800.0,

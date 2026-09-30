@@ -96,7 +96,13 @@
         "--model",
         "parakeet",
         "--gguf",
-        "${STARLING_MODELS_DIR}/parakeet-tdt-0.6b-v3-q4_k_m-shrink16.gguf"
+        "${STARLING_MODELS_DIR}/parakeet-tdt-0.6b-v3-q4_k_m-shrink16.gguf",
+        "--wav",
+        "${STARLING_FIXTURES_DIR}/short.wav",
+        "--wav",
+        "${STARLING_FIXTURES_DIR}/medium.wav",
+        "--wav",
+        "${STARLING_FIXTURES_DIR}/long.wav"
       ],
       "name": "perf",
       "objective": true,
