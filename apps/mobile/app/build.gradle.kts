@@ -153,7 +153,7 @@ android {
 }
 
 dependencies {
-    implementation("androidx.core:core:1.19.0")
+    implementation("androidx.core:core:1.19.1")
     // WebSocket client for the /stream live-dictation protocol; the batch
     // upload path stays on HttpURLConnection. Keep OkHttp and MockWebServer
     // on the same version so tests exercise one implementation.
