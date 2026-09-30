@@ -188,6 +188,10 @@ jobs:
       # real-model GGUF, like loader_guard_test above.
       - name: Voxtral engine tests (tiny GGUF generated in-workflow)
         run: |
+          # The runner's system pip (< 25.2) crashes with an AssertionError in
+          # get_topological_weights when the torch index serves dependency
+          # metadata that forms a cycle; upgrade pip first.
+          pip install --quiet --upgrade pip
           pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
           pip install --quiet transformers
           python scripts/make_voxtral_tiny_gguf.py
