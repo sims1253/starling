@@ -53,6 +53,10 @@ jobs:
         run: uv run --no-project --python 3.12 python -m unittest discover -s benchmarks/experiments -p 'test_*.py'
       - name: Contention pilot decision tests (saved result summaries)
         run: uv run --no-project --python 3.12 python -m unittest discover -s benchmarks/contention -p 'test_*.py'
+      - name: Campaign runner tests (hermetic toy pilot, no models)
+        run: uv run --no-project --python 3.12 python -m unittest discover -s benchmarks/campaign -p 'test_*.py'
+      - name: Campaign toy pilot (bounded loop + negative controls)
+        run: uv run --no-project --python 3.12 python benchmarks/campaign/campaign.py pilot --out build-exp/campaign-pilot
       - name: Paired CPU reproduction (contract fixture binary)
         run: >
           cmake -B build-exp -DSTARLING_SERVE=ON -DSTARLING_GGML_TESTS=ON
