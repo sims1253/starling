@@ -236,6 +236,36 @@ class CliTests(ToyCampaignTest):
             self.assertIn("blocked on native-support", buf.getvalue())
         self.assertFalse((self.tmp / "o2").exists(), "start must not create anything")
 
+    def test_start_refuses_when_control_cannot_confirm_the_baseline(self):
+        real_profile = toy_mod.toy_profile
+
+        def undecidable(repo):
+            prof = real_profile(repo)
+            prof["gates"][0]["argv"] = [
+                "{python}", "-c",
+                "import sys; print('METRIC transcripts_match=unavailable'); sys.exit(3)"]
+            return prof
+
+        with mock.patch.object(toy_mod, "toy_profile", undecidable):
+            toy_repo = self.tmp / "toyrepo"
+            baseline = toy_mod.build_toy_repo(toy_repo)
+            profile = toy_mod.toy_profile(toy_repo)
+        profile_path = self.tmp / f"{profile['id']}.json"
+        profile_path.write_text(json.dumps(profile), encoding="utf-8")
+        task = toy_mod.toy_task(profile["id"], baseline,
+                                ["{python}", str(HERE / "toy_agent.py")])
+        task_path = self.tmp / "t.json"
+        task_path.write_text(json.dumps(task), encoding="utf-8")
+        out = self.tmp / "campaign"
+        rc = campaign_mod.main(["start", "--profile-file", str(profile_path),
+                                "--repo", str(toy_repo), "--baseline", baseline,
+                                "--out", str(out), "--task", str(task_path)])
+        self.assertEqual(rc, 2)
+        self.assertEqual(self.state(out)["status"], "control_failed")
+        for cmd in (["run"], ["resume"], ["attempt", "--hypothesis", "x"]):
+            self.assertEqual(campaign_mod.main([cmd[0], "--campaign", str(out), *cmd[1:]]), 2)
+        self.assertFalse((out / "attempts" / "001").exists(), "no attempt may run")
+
     def test_start_refuses_existing_nonempty_out(self):
         out, _rc = self.start_campaign(run=False)
         # a fresh start into the existing non-empty campaign dir must refuse

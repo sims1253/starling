@@ -128,8 +128,8 @@ def notebook_gates(slug: str, gguf: str) -> list[dict]:
             "name": "serve-contract", "stage": "correctness",
             "argv": [
                 "{python}", "{trusted}/benchmarks/campaign/gates/serve_contract_smoke.py",
-                "--binary", "{candidate}/starling-serve",
-                "--baseline-binary", "{baseline}/starling-serve",
+                "--binary", "{candidate}/build-campaign/starling-serve",
+                "--baseline-binary", "{baseline}/build-campaign/starling-serve",
                 "--model", slug, "--gguf", f"${{STARLING_MODELS_DIR}}/{gguf}",
                 *[a for w in FIXTURE_WAVS for a in ("--wav", f"${{STARLING_FIXTURES_DIR}}/{w}")],
             ],
@@ -141,8 +141,8 @@ def notebook_gates(slug: str, gguf: str) -> list[dict]:
             "name": "perf", "stage": "perf",
             "argv": [
                 "{python}", "{trusted}/benchmarks/campaign/gates/experiments_ab.py",
-                "--base-bin", "{best}/starling-serve",
-                "--cand-bin", "{candidate}/starling-serve",
+                "--base-bin", "{best}/build-campaign/starling-serve",
+                "--cand-bin", "{candidate}/build-campaign/starling-serve",
                 "--run-dir", "{attempt_dir}/experiment",
                 "--model", slug, "--gguf", f"${{STARLING_MODELS_DIR}}/{gguf}",
                 *[a for w in FIXTURE_WAVS for a in ("--wav", f"${{STARLING_FIXTURES_DIR}}/{w}")],
@@ -159,8 +159,8 @@ def pixel_gates(slug: str, gguf: str, engine: str, wav: str = "medium.wav") -> l
             "name": "phone-ab", "stage": "perf",
             "argv": [
                 "bash", "{trusted}/benchmarks/campaign/gates/phone_bench_ab.sh",
-                "--base-bin", "{best}/starling-bench",
-                "--cand-bin", "{candidate}/starling-bench",
+                "--base-bin", "{best}/build-campaign/starling-bench",
+                "--cand-bin", "{candidate}/build-campaign/starling-bench",
                 "--model", slug, "--gguf", f"${{STARLING_MODELS_DIR}}/{gguf}",
                 "--wav", "${STARLING_FIXTURES_DIR}/" + wav,
                 "--engine", engine,
@@ -182,7 +182,7 @@ ENERGY_GATE = {
     "name": "energy-per-transcription", "stage": "resource", "required": False,
     "phase": "finalize",
     "shell": (
-        "adb push {candidate}/starling-bench /data/local/tmp/starling/starling-bench-cand "
+        "adb push {candidate}/build-campaign/starling-bench /data/local/tmp/starling/starling-bench-cand "
         "&& OUT={attempt_dir} bash {trusted}/benchmarks/fast_engine/phone_energy.sh "
         "> {attempt_dir}/energy.stdout 2>&1; rc=$?; cat {attempt_dir}/energy.stdout; "
         "sed -n 's/^fast: .* = \\([0-9.]*\\) mWh\\/transcription.*/"
@@ -383,8 +383,8 @@ def fixture_profile() -> dict:
                 "argv": [
                     "{python}",
                     "{trusted}/benchmarks/campaign/gates/serve_contract_smoke.py",
-                    "--binary", "{candidate}/starling-serve-contract-fixture",
-                    "--baseline-binary", "{baseline}/starling-serve-contract-fixture",
+                    "--binary", "{candidate}/build-campaign/starling-serve-contract-fixture",
+                    "--baseline-binary", "{baseline}/build-campaign/starling-serve-contract-fixture",
                     "--model", "parakeet",
                 ],
                 "rules": [{"metric": "contract_ok", "op": "==", "value": 1},
@@ -396,8 +396,8 @@ def fixture_profile() -> dict:
                 "argv": [
                     "{python}",
                     "{trusted}/benchmarks/campaign/gates/experiments_ab.py",
-                    "--base-bin", "{best}/starling-serve-contract-fixture",
-                    "--cand-bin", "{candidate}/starling-serve-contract-fixture",
+                    "--base-bin", "{best}/build-campaign/starling-serve-contract-fixture",
+                    "--cand-bin", "{candidate}/build-campaign/starling-serve-contract-fixture",
                     "--run-dir", "{attempt_dir}/experiment",
                     "--model", "parakeet",
                 ],

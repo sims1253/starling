@@ -155,6 +155,17 @@ class GatePhaseTests(unittest.TestCase):
         self.assertTrue(spec.validate_gate(self.gate(phase="nightly")))
 
 
+class ArtifactReferenceTests(unittest.TestCase):
+    def test_gate_paths_must_be_declared_artifacts(self):
+        prof = {"build": {"artifacts_out": ["build-campaign/starling-serve"]},
+                "gates": [{"name": "g", "argv": ["{candidate}/starling-serve",
+                                                 "{best}/build-campaign/starling-serve",
+                                                 "{attempt_dir}/whatever"]}]}
+        problems = spec.artifact_reference_problems(prof)
+        self.assertEqual(len(problems), 1)
+        self.assertIn("{candidate}/starling-serve", problems[0])
+
+
 class SealTests(unittest.TestCase):
     def test_seal_changes_with_content_not_key_order(self):
         a = valid_task()

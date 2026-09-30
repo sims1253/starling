@@ -52,9 +52,9 @@
         "bash",
         "{trusted}/benchmarks/campaign/gates/phone_bench_ab.sh",
         "--base-bin",
-        "{best}/starling-bench",
+        "{best}/build-campaign/starling-bench",
         "--cand-bin",
-        "{candidate}/starling-bench",
+        "{candidate}/build-campaign/starling-bench",
         "--model",
         "moss",
         "--gguf",
@@ -103,7 +103,7 @@
       },
       "required": false,
       "rules": [],
-      "shell": "adb push {candidate}/starling-bench /data/local/tmp/starling/starling-bench-cand && OUT={attempt_dir} bash {trusted}/benchmarks/fast_engine/phone_energy.sh > {attempt_dir}/energy.stdout 2>&1; rc=$?; cat {attempt_dir}/energy.stdout; sed -n 's/^fast: .* = \\([0-9.]*\\) mWh\\/transcription.*/METRIC energy_mwh_per_transcription=\\1/p' {attempt_dir}/energy.stdout; if [ $rc -eq 0 ]; then exit 0; elif grep -qE \"unplug the phone|battery status\" {attempt_dir}/energy.stdout; then echo \"DIVERGENCE: energy inconclusive (charging)\" >&2; exit 3; else exit $rc; fi",
+      "shell": "adb push {candidate}/build-campaign/starling-bench /data/local/tmp/starling/starling-bench-cand && OUT={attempt_dir} bash {trusted}/benchmarks/fast_engine/phone_energy.sh > {attempt_dir}/energy.stdout 2>&1; rc=$?; cat {attempt_dir}/energy.stdout; sed -n 's/^fast: .* = \\([0-9.]*\\) mWh\\/transcription.*/METRIC energy_mwh_per_transcription=\\1/p' {attempt_dir}/energy.stdout; if [ $rc -eq 0 ]; then exit 0; elif grep -qE \"unplug the phone|battery status\" {attempt_dir}/energy.stdout; then echo \"DIVERGENCE: energy inconclusive (charging)\" >&2; exit 3; else exit $rc; fi",
       "stage": "resource",
       "timeout_s": 1800.0
     }

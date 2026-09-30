@@ -1362,6 +1362,26 @@ def cmd_start(args) -> int:
             "note": "control: baseline cannot beat itself; records baseline metrics",
         }
         camp.append_ledger(control_entry)
+        # Baseline vs baseline must PASS every required non-objective gate
+        # (correctness, quality, resource). If the evaluator cannot even judge
+        # the baseline against itself (binary path wrong, fixture missing,
+        # nondeterministic output), every attempt would come out a silent
+        # "inconclusive" — refuse to start instead of burning the budget.
+        undecided = [
+            f"{g['name']} ({g['verdict']}: {'; '.join(g.get('rule_details') or []) or 'see log'})"
+            for g in control_gates
+            if g.get("required", True) and not g.get("objective") and g["verdict"] != "pass"
+        ]
+        if undecided:
+            camp.checkpoint(status="control_failed", current_attempt=None,
+                            stop_reason="control_failed")
+            print("control attempt 0 failed: the evaluator cannot confirm the baseline "
+                  "against itself — fix the profile/environment before any attempt:",
+                  file=sys.stderr)
+            for line in undecided:
+                print(f"  - {line}", file=sys.stderr)
+            print(f"  logs: {control_dir}", file=sys.stderr)
+            return EXIT_USAGE
         camp.checkpoint(status="ready", current_attempt=None)
         print(f"campaign ready at {out}")
         print(f"  baseline {baseline_sha[:12]}…  evaluator {seals['evaluator'][:12]}… "
@@ -1384,6 +1404,18 @@ def _open_campaign(args) -> Campaign:
     return camp
 
 
+def _refuse_unusable(camp: Campaign) -> int | None:
+    """A campaign whose control failed (or never finished start) has no
+    trustworthy evaluator; no attempt may run on it."""
+    status = camp.state.get("status")
+    if status in ("control_failed", "starting", "building-baseline", "control"):
+        print(f"refusing: campaign status is {status!r} — start did not complete a "
+              "passing control attempt; fix the cause and start a fresh campaign",
+              file=sys.stderr)
+        return EXIT_USAGE
+    return None
+
+
 def _needs_recovery(camp: Campaign) -> bool:
     return camp.state.get("current_attempt") is not None and camp.state.get("status") in (
         "running", "interrupted"
@@ -1392,6 +1424,9 @@ def _needs_recovery(camp: Campaign) -> bool:
 
 def cmd_run(args) -> int:
     camp = _open_campaign(args)
+    refused = _refuse_unusable(camp)
+    if refused is not None:
+        return refused
     with campaign_locks(camp.profile, wait=args.wait_lock):
         # Recovery mutates the worktree: only under the campaign lock.
         if _needs_recovery(camp):
@@ -1423,6 +1458,9 @@ def _recover_interrupted(camp: Campaign) -> None:
 
 def cmd_resume(args) -> int:
     camp = _open_campaign(args)
+    refused = _refuse_unusable(camp)
+    if refused is not None:
+        return refused
     with campaign_locks(camp.profile, wait=args.wait_lock):
         if _needs_recovery(camp):
             _recover_interrupted(camp)
@@ -1444,6 +1482,9 @@ def cmd_resume(args) -> int:
 
 def cmd_attempt(args) -> int:
     camp = _open_campaign(args)
+    refused = _refuse_unusable(camp)
+    if refused is not None:
+        return refused
     budgets = camp.task["budgets"]
     if camp.state.get("attempts_used", 0) >= budgets.get("max_attempts", 1):
         print("attempt budget already exhausted; nothing to do")

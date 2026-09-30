@@ -377,6 +377,38 @@ def validate_profile(profile: Any) -> list[str]:
         else:
             for i, gate in enumerate(hg):
                 problems.extend(validate_gate(gate, f"heldout_gates[{i}]"))
+    problems.extend(artifact_reference_problems(profile))
+    return problems
+
+
+_ARTIFACT_REF_RE = re.compile(r"\{(candidate|best|baseline)\}/([^\s\"';]+)")
+
+
+def artifact_reference_problems(profile: dict) -> list[str]:
+    """Every `{candidate|best|baseline}/<path>` a gate references must be (or
+    lie inside) a declared build.artifacts_out entry: those three directories
+    hold ONLY the copied build artifacts, so any other path is a gate that can
+    never find its binary and would turn every attempt into a silent
+    "inconclusive"."""
+    build = profile.get("build")
+    outs = build.get("artifacts_out") if isinstance(build, dict) else None
+    if not isinstance(outs, list):
+        return []
+    outs = [o.rstrip("/") for o in outs if isinstance(o, str)]
+    problems = []
+    for key in ("gates", "heldout_gates"):
+        for gate in profile.get(key) or []:
+            if not isinstance(gate, dict):
+                continue
+            command = gate.get("argv") or gate.get("shell") or []
+            texts = [command] if isinstance(command, str) else [str(a) for a in command]
+            for text in texts:
+                for _dir, rel in _ARTIFACT_REF_RE.findall(text):
+                    rel = rel.rstrip("/")
+                    if not any(rel == o or rel.startswith(o + "/") for o in outs):
+                        problems.append(
+                            f"{key} {gate.get('name')!r} references {{{_dir}}}/{rel}, "
+                            f"which is not a build.artifacts_out entry {outs}")
     return problems
 
 
