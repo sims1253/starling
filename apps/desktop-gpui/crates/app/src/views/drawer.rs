@@ -14,22 +14,34 @@ use crate::processing::ProcessingState;
 use crate::theme;
 use crate::views::{icon, spinner};
 
+/// The built-in catalog, computed once and shared for the entity's
+/// lifetime (#366): `default_catalog()` builds fresh `String`s for every
+/// entry, and the drawer renders one label per row per frame.
+fn catalog_entries() -> &'static [starling_dictation::engine::CatalogEntry] {
+    static CATALOG: std::sync::OnceLock<Vec<starling_dictation::engine::CatalogEntry>> =
+        std::sync::OnceLock::new();
+    CATALOG.get_or_init(starling_dictation::engine::default_catalog)
+}
+
 /// How the drawer words a take's transcription provenance (#363):
 /// `engine:<id>` maps to the catalog label (falling back to the raw id
 /// when this build's catalog no longer knows it), `openai:<m>` names the
 /// model and that it came from a server, and any older label shape shows
-/// verbatim rather than being guessed at.
+/// verbatim rather than being guessed at. Parsing and rendering go
+/// through `BackendLabel`, the typed form of the persisted shape.
 pub(crate) fn provenance_label(label: &str) -> String {
-    if let Some(id) = label.strip_prefix("engine:") {
-        starling_dictation::engine::default_catalog()
-            .iter()
-            .find(|entry| entry.id == id)
-            .map(|entry| entry.label.clone())
-            .unwrap_or_else(|| id.to_string())
-    } else if let Some(model) = label.strip_prefix("openai:") {
-        format!("{model} (server)")
-    } else {
-        label.to_string()
+    match starling_dictation::storage::BackendLabel::parse(label) {
+        Some(starling_dictation::storage::BackendLabel::Engine { model_id }) => {
+            catalog_entries()
+                .iter()
+                .find(|entry| entry.id == model_id)
+                .map(|entry| entry.label.clone())
+                .unwrap_or(model_id)
+        }
+        Some(starling_dictation::storage::BackendLabel::OpenAi { model }) => {
+            format!("{model} (server)")
+        }
+        None => label.to_string(),
     }
 }
 

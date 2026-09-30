@@ -35,7 +35,7 @@ use crate::store::Store;
 pub(crate) struct TakeTarget {
     endpoint: String,
     model: String,
-    provenance: String,
+    provenance: storage::BackendLabel,
     lease: Option<EngineLease>,
     builtin: bool,
 }
@@ -44,7 +44,9 @@ impl TakeTarget {
     /// A manual-mode target: the committed endpoint and model, with the
     /// unchanged `openai:<model>` attempt label.
     fn manual(endpoint: String, model: String) -> TakeTarget {
-        let provenance = format!("openai:{model}");
+        let provenance = storage::BackendLabel::OpenAi {
+            model: model.clone(),
+        };
         TakeTarget {
             endpoint,
             model,
@@ -58,7 +60,9 @@ impl TakeTarget {
     fn from_lease(lease: EngineLease) -> TakeTarget {
         TakeTarget {
             model: lease.slug().to_string(),
-            provenance: lease.provenance(),
+            provenance: storage::BackendLabel::Engine {
+                model_id: lease.model_id().to_string(),
+            },
             endpoint: lease.endpoint().to_string(),
             lease: Some(lease),
             builtin: true,
@@ -72,7 +76,9 @@ impl TakeTarget {
         TakeTarget {
             endpoint: String::new(),
             model: String::new(),
-            provenance: "engine:none".to_string(),
+            provenance: storage::BackendLabel::Engine {
+                model_id: "none".to_string(),
+            },
             lease: None,
             builtin: true,
         }
@@ -88,8 +94,10 @@ impl TakeTarget {
 
     /// The attempt row's backend label (`engine:<model_id>` builtin,
     /// `openai:<model>` manual) — the provenance history shows per take.
-    fn provenance(&self) -> &str {
-        &self.provenance
+    /// Rendered through [`storage::BackendLabel`], the typed form of the
+    /// persisted string shape.
+    fn provenance(&self) -> String {
+        self.provenance.to_string()
     }
 
     /// Whether this is a builtin take whose engine was not ready — the
@@ -705,7 +713,7 @@ impl StarlingApp {
         // The attempt row's backend label (v2 keeps it on the recognition
         // attempt): the target's provenance — `engine:<model_id>` for a
         // built-in take, `openai:<model>` for a manual one.
-        let backend = target.provenance().to_string();
+        let backend = target.provenance();
         let builtin = target.is_builtin();
         let unready = target.needs_engine();
         let store_for_job = store.clone();

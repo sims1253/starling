@@ -106,15 +106,14 @@ sha256_of() {
   fi
 }
 
-# The version of the engine last validated by check_engine (extracted
-# from the validated --version line).
-checked_version=""
-
-# Checks one staged engine: --version must report the server/version
-# block, --abi-version must equal the header's ABI.
+# Checks one engine: --version must report the server/version block,
+# --abi-version must equal the header's ABI. Prints ONLY the validated
+# version on stdout (errors go to stderr, failures exit non-zero), so a
+# caller captures it via command substitution:
+#   if ! version="$(check_engine ...)"; then exit 1; fi
 check_engine() {
   local path="$1" backend="$2"
-  local version_line abi_output abi
+  local version_line abi_output abi version
   if ! version_line="$("$path" --version 2>/dev/null | head -n 1)"; then
     echo "error: $backend engine failed --version: $path" >&2
     exit 1
@@ -132,9 +131,10 @@ check_engine() {
     echo "error: $backend engine speaks ABI $abi, but the app expects $expected_abi; refusing to stage it" >&2
     exit 1
   fi
-  checked_version="${version_line#starling-serve }"
-  checked_version="${checked_version%%[[:space:]]*}"
-  echo "$backend: $version_line (abi $abi)"
+  # The version is the second whitespace-separated field of the validated
+  # line, whatever spacing separates the fields.
+  read -r _ version _ <<<"$version_line"
+  printf '%s\n' "$version"
 }
 
 # The staged file name keeps a Windows .exe suffix when the source has one.
@@ -164,6 +164,47 @@ vulkan_name=""
 if [ -n "$vulkan" ]; then
   vulkan_name="$(layout_name vulkan "$vulkan")"
 fi
+
+# Validate everything BEFORE touching the staged directory (#366): each
+# engine's --version/--abi-version, and the cpu/vulkan version agreement,
+# run before any manifest is removed or file copied — a validation failure
+# must neither leave a half-staged dir (binaries + sums but no engines.json)
+# nor destroy a previous good staging.
+cpu_version=""
+vulkan_version=""
+if [ -n "$vulkan" ]; then
+  if ! vulkan_version="$(check_engine "$vulkan" vulkan)"; then
+    exit 1
+  fi
+fi
+if ! cpu_version="$(check_engine "$cpu" cpu)"; then
+  exit 1
+fi
+if [ -z "$cpu_version" ]; then
+  echo "error: could not determine the engine version from --version output" >&2
+  exit 1
+fi
+if [ -n "$vulkan_version" ] && [ "$vulkan_version" != "$cpu_version" ]; then
+  echo "error: staged engines disagree on version: cpu reports $cpu_version, vulkan reports $vulkan_version; refusing to stage" >&2
+  exit 1
+fi
+
+# A failure from here on (copy or hashing I/O) must not leave the dir
+# half-staged either: remove the manifests and every layout file this run
+# copied (never a source that was re-staged from the output dir itself —
+# the same-file guard below skips, not copies, those).
+staged_files=()
+unstage_on_failure() {
+  local status=$?
+  if [ "$status" -ne 0 ]; then
+    rm -f "$out/SHA256SUMS.txt" "$out/engines.json"
+    if [ "${#staged_files[@]}" -gt 0 ]; then
+      rm -f "${staged_files[@]}"
+    fi
+  fi
+}
+trap unstage_on_failure EXIT
+
 rm -f "$out/SHA256SUMS.txt" "$out/engines.json"
 for stale in starling-serve-cpu starling-serve-cpu.exe \
              starling-serve-vulkan starling-serve-vulkan.exe; do
@@ -173,24 +214,21 @@ for stale in starling-serve-cpu starling-serve-cpu.exe \
 done
 
 # Stage and verify; sums accumulate in preference order (vulkan first,
-# matching engines.json and the app's selection order). The version each
-# engine reported is recorded so engines.json can refuse to mix versions.
+# matching engines.json and the app's selection order).
 sums=""
 entries=""
-cpu_version=""
-vulkan_version=""
 stage_one() {
   local backend="$1" source="$2" name sha
-  check_engine "$source" "$backend"
   case "$backend" in
-    cpu) cpu_version="$checked_version" ;;
-    vulkan) vulkan_version="$checked_version" ;;
+    cpu) echo "cpu: starling-serve $cpu_version (abi $expected_abi)" ;;
+    vulkan) echo "vulkan: starling-serve $vulkan_version (abi $expected_abi)" ;;
   esac
   name="$(layout_name "$backend" "$source")"
   # Re-staging from the output dir must be idempotent: skip the copy when
   # source and destination are the same file.
   if [ "$(abs_path "$source")" != "$(abs_path "$out/$name")" ]; then
     cp "$source" "$out/$name"
+    staged_files+=("$out/$name")
   fi
   chmod +x "$out/$name"
   sha="$(sha256_of "$out/$name")"
@@ -207,18 +245,8 @@ entries="${entries%,}"
 
 printf '%s' "$sums" > "$out/SHA256SUMS.txt"
 
-# engines.json carries one version for the whole bundle: it comes from the
-# validated --version lines, must not be empty, and when both backends are
-# staged they must agree — a mixed bundle would look consistent to the
-# app's probe and still be wrong.
-if [ -z "$cpu_version" ]; then
-  echo "error: could not determine the engine version from --version output" >&2
-  exit 1
-fi
-if [ -n "$vulkan_version" ] && [ "$vulkan_version" != "$cpu_version" ]; then
-  echo "error: staged engines disagree on version: cpu reports $cpu_version, vulkan reports $vulkan_version; refusing to write engines.json" >&2
-  exit 1
-fi
+# engines.json carries one version for the whole bundle: the validated
+# --version lines agreed above, so this is the version both engines report.
 version="$cpu_version"
 cat > "$out/engines.json" <<EOF
 {

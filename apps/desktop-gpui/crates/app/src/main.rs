@@ -70,11 +70,12 @@ fn main() {
             });
 
             // #362: closing the window quits the app (a zero-window gpui
-            // app would otherwise keep running headless) — and quitting is
-            // what stops the engine sidecar cleanly (the app's own quit
-            // hook; the server's --parent-pid watchdog is the crash
-            // backstop). Process-lifetime hooks: forgotten on purpose,
-            // like the hotkey manager below.
+            // app would otherwise keep running headless). Quitting is what
+            // stops the engine sidecar cleanly — through the app entity's
+            // own quit hook (app.rs `register_quit_hook`, the single owner
+            // of engine shutdown; the server's --parent-pid watchdog is
+            // the crash backstop). Process-lifetime hook: forgotten on
+            // purpose, like the hotkey manager below.
             std::mem::forget(cx.on_window_closed(|cx| cx.quit()));
 
             match window {
@@ -84,18 +85,10 @@ fn main() {
                     }) {
                         eprintln!("Could not focus the Starling window: {err}");
                     }
-                    // #362: the engine sidecar is ours, so it must not
-                    // outlive the app — quit waits for its stop.
-                    // (`WindowHandle` is `Copy`; the quit hook and the
-                    // hotkey loop below each take their own copy.)
-                    std::mem::forget(cx.on_app_quit(move |cx| {
-                        let _ = handle.update(cx, |app, _window, _cx| {
-                            if let Some(engine) = app.engine.take() {
-                                engine.shutdown();
-                            }
-                        });
-                        async {}
-                    }));
+                    // No engine shutdown here: the app entity's own quit
+                    // hook (app.rs `register_quit_hook`) owns it, so quit
+                    // stops the sidecar exactly once. (`WindowHandle` is
+                    // `Copy`; the hotkey loop below takes its own copy.)
                     cx.spawn(async move |cx| {
                         loop {
                             gpui::Timer::after(Duration::from_millis(150)).await;

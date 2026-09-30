@@ -7,7 +7,7 @@ use gpui::{
     Animation, AnimationExt, Context, Div, ElementId, FontWeight, Stateful, Window, div,
     ease_in_out, point, prelude::*, px, rgba,
 };
-use starling_dictation::engine::{EnginePhase, InstallState};
+use starling_dictation::engine::{EnginePhase, InstallState, SwitchStage};
 use starling_dictation::settings::EngineMode;
 
 use crate::app::StarlingApp;
@@ -25,6 +25,41 @@ pub(crate) fn first_run_card_visible(phase: &EnginePhase, has_active: bool) -> b
             phase,
             EnginePhase::NoModel | EnginePhase::Starting | EnginePhase::Loading | EnginePhase::Warming
         )
+}
+
+/// The first-run card's progress line (#363, #366): `None` (the button row
+/// offers the download) while nothing is in flight; a stage line while the
+/// recommended model downloads or verifies — including a hand-placed file
+/// being verified by an activation switch — and while the engine brings it
+/// up. Pure so the policy is testable.
+pub(crate) fn first_run_progress(
+    phase: &EnginePhase,
+    install: &InstallState,
+    switch: Option<&SwitchStage>,
+) -> Option<String> {
+    match install {
+        InstallState::Downloading { done, total } => Some(format!(
+            "Downloading {}% — you can record meanwhile; transcription starts once the model \
+             is ready.",
+            crate::views::settings::download_percent(*done, *total),
+        )),
+        // A finished download being verified is still installing: the
+        // button must not re-offer "Download and use" over it.
+        InstallState::Verifying => Some("Verifying the download…".to_string()),
+        // A NeedsVerification file only verifies through an activation
+        // switch; while that switch is verifying, the same rule holds.
+        InstallState::NeedsVerification
+            if matches!(switch, Some(SwitchStage::Verifying)) =>
+        {
+            Some("Verifying the download…".to_string())
+        }
+        _ => match phase {
+            EnginePhase::Starting => Some("Starting the engine…".to_string()),
+            EnginePhase::Loading => Some("Loading the model…".to_string()),
+            EnginePhase::Warming => Some("Warming up…".to_string()),
+            _ => None,
+        },
+    }
 }
 
 const BAR_COUNT: usize = 52;
@@ -339,20 +374,13 @@ fn render_engine_card(
     let recommended = snapshot.models.iter().find(|model| model.recommended)?;
     let id = recommended.id.clone();
 
-    // While downloading/loading the card shows the progress stage.
-    let progress = match &recommended.install {
-        InstallState::Downloading { done, total } => Some(format!(
-            "Downloading {}% — you can record meanwhile; transcription starts once the model \
-             is ready.",
-            crate::views::settings::download_percent(*done, *total),
-        )),
-        _ => match &snapshot.phase {
-            EnginePhase::Starting => Some("Starting the engine…".to_string()),
-            EnginePhase::Loading => Some("Loading the model…".to_string()),
-            EnginePhase::Warming => Some("Warming up…".to_string()),
-            _ => None,
-        },
-    };
+    // While downloading, verifying, or loading, the card shows the progress
+    // stage instead of the download button.
+    let progress = first_run_progress(
+        &snapshot.phase,
+        &recommended.install,
+        snapshot.switch.as_ref().map(|switch| &switch.stage),
+    );
     let installing = progress.is_some();
 
     Some(
@@ -742,6 +770,84 @@ mod tests {
             &EnginePhase::SelectingBackend,
             false
         ));
+    }
+
+    #[test]
+    fn a_verifying_model_is_treated_as_installing() {
+        // #366: a finished download being verified must not re-offer
+        // "Download and use" — the card shows the verifying line and no
+        // button, exactly like a download in flight.
+        let line = first_run_progress(
+            &EnginePhase::NoModel,
+            &InstallState::Verifying,
+            None,
+        );
+        assert_eq!(line.as_deref(), Some("Verifying the download…"));
+    }
+
+    #[test]
+    fn a_needs_verification_model_counts_only_while_a_switch_verifies_it() {
+        // A hand-placed file alone offers the button (activation verifies
+        // first); while an activation switch is verifying it, the card
+        // shows the verifying line instead.
+        let idle = first_run_progress(
+            &EnginePhase::NoModel,
+            &InstallState::NeedsVerification,
+            Some(&SwitchStage::Downloading { done: 1, total: 2 }),
+        );
+        assert_eq!(idle, None);
+        let verifying = first_run_progress(
+            &EnginePhase::NoModel,
+            &InstallState::NeedsVerification,
+            Some(&SwitchStage::Verifying),
+        );
+        assert_eq!(verifying.as_deref(), Some("Verifying the download…"));
+        // No switch at all: the plain download offer stands.
+        assert_eq!(
+            first_run_progress(
+                &EnginePhase::NoModel,
+                &InstallState::NeedsVerification,
+                None,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn an_install_failure_returns_to_the_download_offer() {
+        // A failed download is not installing: the button comes back so
+        // the user can retry.
+        assert_eq!(
+            first_run_progress(
+                &EnginePhase::NoModel,
+                &InstallState::Failed("disk full".to_string()),
+                None,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn the_engine_start_phases_show_their_lines_and_ready_shows_none() {
+        assert_eq!(
+            first_run_progress(&EnginePhase::Starting, &InstallState::NotInstalled, None)
+                .as_deref(),
+            Some("Starting the engine…")
+        );
+        assert_eq!(
+            first_run_progress(&EnginePhase::Loading, &InstallState::NotInstalled, None)
+                .as_deref(),
+            Some("Loading the model…")
+        );
+        assert_eq!(
+            first_run_progress(&EnginePhase::Warming, &InstallState::NotInstalled, None)
+                .as_deref(),
+            Some("Warming up…")
+        );
+        assert_eq!(
+            first_run_progress(&EnginePhase::NoModel, &InstallState::Installed, None),
+            None
+        );
     }
 
     #[test]

@@ -52,7 +52,10 @@ def prepare(args: argparse.Namespace) -> None:
         "build_url": f"https://github.com/{args.repository}/actions/runs/{args.run_id}",
         "cuda_architectures": ["120"],
         "android_application_id": "dev.starling.mobile.experimental",
-        "desktop_bundled_engines": ["cpu", "vulkan"],
+        # Preference order, matching BUNDLED_ENGINES in
+        # .github/workflows/package-desktop.yml (checked for ordered
+        # agreement by scripts/release-runtime/check-contract.py).
+        "desktop_bundled_engines": ["vulkan", "cpu"],
     }
     (root / "build-info.json").write_text(json.dumps(info, indent=2) + "\n")
     files = sorted(expected | {"build-info.json"})

@@ -5,9 +5,10 @@
 //! model). A manager that finds a live, warm, model-matching entry
 //! ATTACHES to it — it never stops a process it does not own — while the
 //! owner removes the file on shutdown only if the file still names it.
-//! A `<state_dir>/spawn.lock` (created with `create_new`, so exactly one
-//! winner) serializes two launching instances; the loser waits for the
-//! winner's registry entry instead of racing it.
+//! A per-model `<state_dir>/spawn-<model>.lock` (created with
+//! `create_new`, so exactly one winner, holding the winner's pid)
+//! serializes instances launching the same model; the loser waits for
+//! the winner's registry entry instead of racing it.
 //!
 //! `<state_dir>/leases/` carries takes across instances (#363): an
 //! attached instance's lease writes a marker naming the engine, and the
@@ -26,11 +27,27 @@ use serde::{Deserialize, Serialize};
 
 /// The registry file name inside the state dir.
 pub const REGISTRY_FILE: &str = "sidecar.json";
-/// The spawn-serialization lock file name.
-pub const SPAWN_LOCK_FILE: &str = "spawn.lock";
-/// A spawn lock older than this is stale (its creator crashed mid-spawn)
-/// and gets replaced.
-pub const SPAWN_LOCK_STALE_AFTER: Duration = Duration::from_secs(60);
+/// A spawn lock whose holder process is gone is stale at once; one older
+/// than this is stale even with a live holder (it wedged mid-spawn). Well
+/// above the slowest model load, so a slow but healthy spawn is never
+/// raced.
+pub const SPAWN_LOCK_STALE_AFTER: Duration = Duration::from_secs(10 * 60);
+
+/// `<state_dir>/spawn-<model>.lock`: one lock per model, so instances
+/// starting different models never wait for each other.
+pub fn spawn_lock_path(state_dir: &Path, model_id: &str) -> PathBuf {
+    let safe: String = model_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    state_dir.join(format!("spawn-{safe}.lock"))
+}
 
 /// The shared-sidecar description on disk.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -137,39 +154,62 @@ pub enum LockOutcome {
     HeldElsewhere,
 }
 
-/// Tries to create the spawn lock with `create_new` — exactly one
-/// concurrent instance wins. An existing lock older than
-/// [`SPAWN_LOCK_STALE_AFTER`] is stale (its creator died mid-spawn) and
-/// is replaced.
-pub fn try_spawn_lock(state_dir: &Path) -> io::Result<LockOutcome> {
+/// Tries to create `model_id`'s spawn lock with `create_new` — exactly
+/// one concurrent instance wins; the file records the winner's pid. An
+/// existing lock is stale, and replaced, when its holder process is gone
+/// or it is older than [`SPAWN_LOCK_STALE_AFTER`].
+pub fn try_spawn_lock(state_dir: &Path, model_id: &str) -> io::Result<LockOutcome> {
     let _ = fs::create_dir_all(state_dir);
-    let path = state_dir.join(SPAWN_LOCK_FILE);
-    match fs::File::options().write(true).create_new(true).open(&path) {
-        Ok(_) => Ok(LockOutcome::Acquired(SpawnLock {
+    let path = spawn_lock_path(state_dir, model_id);
+    match create_lock_file(&path) {
+        Ok(()) => Ok(LockOutcome::Acquired(SpawnLock {
             path,
             released: false,
         })),
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            if let Some(age) = lock_age(&path) {
-                if age >= SPAWN_LOCK_STALE_AFTER {
-                    // Stale: its creator cannot release it anymore.
-                    let _ = fs::remove_file(&path);
-                    return fs::File::options()
-                        .write(true)
-                        .create_new(true)
-                        .open(&path)
-                        .map(|_| {
-                            LockOutcome::Acquired(SpawnLock {
-                                path,
-                                released: false,
-                            })
-                        });
-                }
+            if lock_is_stale(&path) {
+                // Its creator cannot release it anymore. Another instance
+                // may race us to the replacement; `create_new` still has
+                // exactly one winner.
+                let _ = fs::remove_file(&path);
+                return match create_lock_file(&path) {
+                    Ok(()) => Ok(LockOutcome::Acquired(SpawnLock {
+                        path,
+                        released: false,
+                    })),
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                        Ok(LockOutcome::HeldElsewhere)
+                    }
+                    Err(error) => Err(error),
+                };
             }
             Ok(LockOutcome::HeldElsewhere)
         }
         Err(error) => Err(error),
     }
+}
+
+fn create_lock_file(path: &Path) -> io::Result<()> {
+    use std::io::Write;
+    let mut file = fs::File::options()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    // Best effort: a lock without a pid only goes stale by age.
+    let _ = write!(file, "{}", std::process::id());
+    Ok(())
+}
+
+/// Whether the lock at `path` can no longer be released by its holder.
+/// A lock that is still being written (no pid yet) is judged by age.
+fn lock_is_stale(path: &Path) -> bool {
+    let holder = fs::read_to_string(path)
+        .ok()
+        .and_then(|text| text.trim().parse::<u32>().ok());
+    if holder.is_some_and(|pid| !process_alive(pid)) {
+        return true;
+    }
+    lock_age(path).is_some_and(|age| age >= SPAWN_LOCK_STALE_AFTER)
 }
 
 /// The lease directory name inside the state dir.
@@ -417,21 +457,42 @@ mod tests {
     }
 
     #[test]
-    fn spawn_lock_has_exactly_one_winner() {
+    fn spawn_lock_has_exactly_one_winner_per_model() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let first = match try_spawn_lock(dir.path()).expect("first lock") {
+        let first = match try_spawn_lock(dir.path(), "model-a").expect("first lock") {
             LockOutcome::Acquired(lock) => lock,
             other => panic!("expected Acquired, got {other:?}"),
         };
+        // Our own live pid holds it: not stale.
         assert!(matches!(
-            try_spawn_lock(dir.path()).expect("second lock"),
+            try_spawn_lock(dir.path(), "model-a").expect("second lock"),
             LockOutcome::HeldElsewhere
         ));
+        // Another model does not wait for it.
+        assert!(matches!(
+            try_spawn_lock(dir.path(), "model-b").expect("other model"),
+            LockOutcome::Acquired(_)
+        ));
         first.release();
-        assert!(!dir.path().join(SPAWN_LOCK_FILE).exists());
+        assert!(!spawn_lock_path(dir.path(), "model-a").exists());
         // Released: the next taker wins again.
         assert!(matches!(
-            try_spawn_lock(dir.path()).expect("third lock"),
+            try_spawn_lock(dir.path(), "model-a").expect("third lock"),
+            LockOutcome::Acquired(_)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_lock_whose_holder_died_is_replaced_at_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            spawn_lock_path(dir.path(), "model-a"),
+            format!("{}", i32::MAX),
+        )
+        .expect("write dead holder's lock");
+        assert!(matches!(
+            try_spawn_lock(dir.path(), "model-a").expect("lock"),
             LockOutcome::Acquired(_)
         ));
     }
@@ -521,14 +582,14 @@ mod tests {
     #[test]
     fn stale_spawn_lock_is_replaced() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let lock = dir.path().join(SPAWN_LOCK_FILE);
+        let lock = spawn_lock_path(dir.path(), "model-a");
         fs::write(&lock, "stale").expect("write stale lock");
         // Backdate it beyond the stale threshold.
         let old = SystemTime::now() - SPAWN_LOCK_STALE_AFTER - Duration::from_secs(5);
         #[cfg(unix)]
         backdate(&lock, old);
         assert!(matches!(
-            try_spawn_lock(dir.path()).expect("lock"),
+            try_spawn_lock(dir.path(), "model-a").expect("lock"),
             LockOutcome::Acquired(_)
         ));
     }

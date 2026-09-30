@@ -9,7 +9,10 @@
 //! alternative) gets `NeedsVerification`: activation hashes it first and
 //! writes the marker on success — a mismatch refuses activation without
 //! deleting the user's file. A failed or cancelled download never
-//! touches the active model or any other file.
+//! touches the active model or any other file. One `<file>.lock` per
+//! model (holding the downloader's pid) keeps two app instances from
+//! writing the same `.part`: the second waits, then finds the model
+//! installed.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, Read, Write};
@@ -26,6 +29,8 @@ use crate::engine::manager::InstallState;
 pub const PART_SUFFIX: &str = "part";
 /// The suffix for the verification marker (content: the sha256 hex).
 pub const VERIFIED_SUFFIX: &str = "verified";
+/// The suffix for the per-model download lock (content: holder pid).
+pub const LOCK_SUFFIX: &str = "lock";
 
 /// The three file names a model resolves to inside the models dir.
 #[derive(Clone, Debug)]
@@ -36,17 +41,21 @@ pub struct ModelFiles {
     pub part_path: PathBuf,
     /// `<final>.verified`, containing the sha hex on success.
     pub marker_path: PathBuf,
+    /// `<final>.lock`, held by the one process downloading the model.
+    pub lock_path: PathBuf,
 }
 
 /// `<models_dir>/<file_name>` plus its `.part`/`.verified` siblings.
 pub fn model_files(models_dir: &Path, entry: &CatalogEntry) -> ModelFiles {
-    let final_path = models_dir.join(&entry.file_name);
+    // Suffixes are appended to the full file name: `with_extension`
+    // would replace the last extension ("a.gguf" -> "a.part"), so names
+    // differing only by extension would share sibling files.
+    let sibling = |suffix: &str| models_dir.join(format!("{}.{suffix}", entry.file_name));
     ModelFiles {
-        part_path: final_path.with_extension(PART_SUFFIX),
-        // with_extension would mangle "a.gguf" -> "a.verified"; build it
-        // from the file name instead.
-        marker_path: models_dir.join(format!("{}.{}", entry.file_name, VERIFIED_SUFFIX)),
-        final_path,
+        final_path: models_dir.join(&entry.file_name),
+        part_path: sibling(PART_SUFFIX),
+        marker_path: sibling(VERIFIED_SUFFIX),
+        lock_path: sibling(LOCK_SUFFIX),
     }
 }
 
@@ -122,6 +131,70 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const READ_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(60);
 /// How often a stalled read re-checks the cancel flag.
 const CANCEL_POLL: Duration = Duration::from_millis(250);
+/// How often a download waiting for another process's lock re-checks.
+const LOCK_POLL: Duration = Duration::from_millis(200);
+/// A lock file without a readable pid (its writer died between create
+/// and write) is stale after this long.
+const PIDLESS_LOCK_STALE_AFTER: Duration = Duration::from_secs(10);
+
+/// The held per-model download lock; dropping it removes the file.
+struct DownloadLock {
+    path: PathBuf,
+}
+
+impl Drop for DownloadLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+/// Takes `files.lock_path`, waiting while a live process holds it. A lock
+/// whose holder is gone (a crashed instance) is replaced; its `.part` is
+/// then simply resumed.
+fn acquire_download_lock(
+    files: &ModelFiles,
+    cancel: &AtomicBool,
+) -> Result<DownloadLock, DownloadError> {
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(DownloadError::Cancelled);
+        }
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&files.lock_path)
+        {
+            Ok(mut file) => {
+                let _ = write!(file, "{}", std::process::id());
+                return Ok(DownloadLock {
+                    path: files.lock_path.clone(),
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if download_lock_is_stale(&files.lock_path) {
+                    let _ = fs::remove_file(&files.lock_path);
+                    continue;
+                }
+                std::thread::sleep(LOCK_POLL);
+            }
+            Err(error) => return Err(io_error(error)),
+        }
+    }
+}
+
+fn download_lock_is_stale(path: &Path) -> bool {
+    let holder = fs::read_to_string(path)
+        .ok()
+        .and_then(|text| text.trim().parse::<u32>().ok());
+    match holder {
+        Some(pid) => !crate::engine::registry::process_alive(pid),
+        None => fs::metadata(path)
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|modified| std::time::SystemTime::now().duration_since(modified).ok())
+            .is_some_and(|age| age >= PIDLESS_LOCK_STALE_AFTER),
+    }
+}
 
 /// Why a download did not produce an installed model. Each carries a
 /// sentence; none of them touch the active model.
@@ -163,6 +236,14 @@ pub fn download_model(
 ) -> Result<(), DownloadError> {
     let files = model_files(models_dir, entry);
     fs::create_dir_all(models_dir).map_err(io_error)?;
+    // Held through verify, rename and marker: no other process may write
+    // the `.part` while (or after) this one installs it.
+    let _lock = acquire_download_lock(&files, cancel)?;
+    if matches!(scan_install(models_dir, entry), InstallState::Installed) {
+        // Another instance finished the download while we waited.
+        progress(entry.size_bytes, entry.size_bytes);
+        return Ok(());
+    }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -226,16 +307,38 @@ async fn download_async(
             )));
         }
         if status.as_u16() != 206 {
+            // A full answer of the wrong size can never install: fail
+            // before downloading it.
+            if let Some(length) = response.content_length() {
+                if length != entry.size_bytes {
+                    return Err(DownloadError::Http(format!(
+                        "the server's file {} has {length} bytes, but the catalog expects {}",
+                        entry.url, entry.size_bytes
+                    )));
+                }
+            }
             break (response, false);
         }
         // A 206 only resumes when it starts where the .part ends. One
         // that starts elsewhere (a proxy answering from byte 0) cannot be
         // appended: drop the .part and ask again for the whole file.
-        let start = response
+        let content_range = response
             .headers()
             .get(reqwest::header::CONTENT_RANGE)
             .and_then(|value| value.to_str().ok())
-            .and_then(content_range_start);
+            .map(str::to_string);
+        let start = content_range.as_deref().and_then(content_range_start);
+        let total = content_range.as_deref().and_then(content_range_total);
+        if let Some(total) = total.filter(|total| *total != entry.size_bytes) {
+            // The remote file changed under the pinned URL: the resume
+            // prefix belongs to a different file.
+            let _ = fs::remove_file(&files.part_path);
+            return Err(DownloadError::Http(format!(
+                "the server's file {} now has {total} bytes, but the catalog expects {}; \
+                 the partial download was removed",
+                entry.url, entry.size_bytes
+            )));
+        }
         if offset > 0 && start == Some(offset) {
             break (response, true);
         }
@@ -347,6 +450,12 @@ fn content_range_start(value: &str) -> Option<u64> {
         .trim()
         .parse()
         .ok()
+}
+
+/// The total of `Content-Range: bytes <start>-<end>/<total>`; `None`
+/// when absent or unknown (`*`).
+fn content_range_total(value: &str) -> Option<u64> {
+    value.trim().rsplit('/').next()?.trim().parse().ok()
 }
 
 fn io_error(error: std::io::Error) -> DownloadError {
@@ -580,6 +689,72 @@ mod tests {
         assert_eq!(content_range_start("bytes 0-9/*"), Some(0));
         assert_eq!(content_range_start("items 1-2/3"), None);
         assert_eq!(content_range_start("bytes */200"), None);
+        assert_eq!(content_range_total("bytes 100-199/200"), Some(200));
+        assert_eq!(content_range_total("bytes 0-9/*"), None);
+    }
+
+    #[test]
+    fn a_download_waits_for_another_processs_lock_then_finds_it_installed() {
+        let served: Vec<u8> = vec![5u8; 20_000];
+        let (url, server) = spawn_file_server(Arc::new(served.clone()));
+        let entry = entry_for(&url, &served);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let files = model_files(dir.path(), &entry);
+        // A live holder (this process) has the lock, as another instance
+        // mid-download would.
+        let held = acquire_download_lock(&files, &AtomicBool::new(false)).expect("lock");
+        let models_dir = dir.path().to_path_buf();
+        let waiting_entry = entry.clone();
+        let waiter = std::thread::spawn(move || {
+            download_model(&models_dir, &waiting_entry, &|_, _| {}, &AtomicBool::new(false))
+        });
+        std::thread::sleep(Duration::from_millis(600));
+        assert!(!waiter.is_finished(), "the second download waits for the lock");
+        assert!(!files.part_path.exists(), "and writes nothing meanwhile");
+        // The holder installs the model, then releases.
+        fs::write(&files.final_path, &served).expect("install");
+        write_marker(&files.marker_path, &entry.sha256).expect("marker");
+        drop(held);
+        waiter
+            .join()
+            .expect("waiter thread")
+            .expect("the waiter succeeds without downloading");
+        assert_eq!(fs::read(&files.final_path).expect("final"), served);
+        assert!(!files.part_path.exists());
+        assert!(!files.lock_path.exists());
+        drop(server);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dead_holders_download_lock_is_replaced() {
+        let served: Vec<u8> = vec![6u8; 8_000];
+        let (url, server) = spawn_file_server(Arc::new(served.clone()));
+        let entry = entry_for(&url, &served);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let files = model_files(dir.path(), &entry);
+        fs::write(&files.lock_path, format!("{}", i32::MAX)).expect("dead lock");
+        download_all(dir.path(), &entry, &AtomicBool::new(false)).expect("download");
+        assert_eq!(fs::read(&files.final_path).expect("final"), served);
+        assert!(!files.lock_path.exists());
+        drop(server);
+    }
+
+    #[test]
+    fn a_full_answer_of_the_wrong_size_fails_before_downloading() {
+        let served: Vec<u8> = vec![2u8; 3_000];
+        let (url, server) = spawn_file_server(Arc::new(served));
+        // The catalog expects a different size.
+        let entry = entry_for(&url, &vec![2u8; 4_000]);
+        let dir = tempfile::tempdir().expect("tempdir");
+        match download_all(dir.path(), &entry, &AtomicBool::new(false)) {
+            Err(DownloadError::Http(message)) => {
+                assert!(message.contains("3000 bytes"), "got: {message}")
+            }
+            other => panic!("expected an Http size error, got {other:?}"),
+        }
+        assert!(!model_files(dir.path(), &entry).part_path.exists());
+        drop(server);
     }
 
     #[test]
@@ -657,7 +832,8 @@ mod tests {
         );
         let files = model_files(Path::new("/models"), &entry);
         assert_eq!(files.final_path, Path::new("/models/model.gguf"));
-        assert_eq!(files.part_path, Path::new("/models/model.part"));
+        assert_eq!(files.part_path, Path::new("/models/model.gguf.part"));
         assert_eq!(files.marker_path, Path::new("/models/model.gguf.verified"));
+        assert_eq!(files.lock_path, Path::new("/models/model.gguf.lock"));
     }
 }

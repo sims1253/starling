@@ -153,24 +153,56 @@ impl Settings {
 
     /// Missing or corrupt file always falls back to the defaults; never panics.
     ///
-    /// A file that parses but carries no `engine` key is a legacy file
-    /// (#362): it loads with `engine.mode = manual`, because every such
-    /// file was written by a build whose only way to transcribe was a
-    /// hand-run server — silently switching those users to the bundled
-    /// engine would change where their audio goes. The key is detected on
-    /// the parsed `serde_json::Value`, not sniffed from the text.
+    /// A file that parses but carries no `engine` key — or an explicit
+    /// JSON `null` one — is a legacy file (#362): it loads with
+    /// `engine.mode = manual`, because every such file was written by a
+    /// build whose only way to transcribe was a hand-run server —
+    /// silently switching those users to the bundled engine would change
+    /// where their audio goes. The key is detected on the parsed
+    /// `serde_json::Value`, not sniffed from the text.
+    ///
+    /// A file that parses as JSON but fails typed deserialization keeps
+    /// its engine mode honest too: the fallback defaults to `manual`
+    /// unless the file's `engine.mode` says exactly `"builtin"`. A
+    /// partially unreadable file must never change where audio is sent,
+    /// so the fallback errs toward the hand-run server the user had.
     pub fn load(path: &Path) -> Self {
         let Some(text) = std::fs::read_to_string(path).ok() else {
             return Self::default_settings();
         };
-        let Some(value) = serde_json::from_str::<serde_json::Value>(&text).ok() else {
+        let Some(mut value) = serde_json::from_str::<serde_json::Value>(&text).ok() else {
             return Self::default_settings();
         };
         // Checked before `value` is moved into `from_value` (a deep clone
         // of the whole document just to look at one key would be waste).
+        // A JSON `null` engine key states no engine any more than an
+        // absent one: drop it so the rest of the file still loads, and
+        // the legacy rule below applies (#366).
+        if matches!(value.get("engine"), Some(serde_json::Value::Null)) {
+            if let Some(object) = value.as_object_mut() {
+                object.remove("engine");
+            }
+        }
         let legacy_file = value.get("engine").is_none();
+        // The engine mode a typed-deserialization failure falls back to
+        // (#366): manual unless the file's `engine.mode` says exactly
+        // `"builtin"` — a partially unreadable file must never change
+        // where audio is sent, so it errs toward the hand-run server.
+        // A legacy file (no engine key after the null drop above) has no
+        // mode to read at all and lands on manual too.
+        let safe_mode = if value
+            .get("engine")
+            .and_then(|engine| engine.get("mode"))
+            == Some(&serde_json::json!("builtin"))
+        {
+            EngineMode::Builtin
+        } else {
+            EngineMode::Manual
+        };
         let Ok(mut settings) = serde_json::from_value::<Settings>(value) else {
-            return Self::default_settings();
+            let mut fallback = Self::default_settings();
+            fallback.engine.mode = safe_mode;
+            return fallback;
         };
         if legacy_file {
             settings.engine.mode = EngineMode::Manual;
@@ -218,6 +250,7 @@ static WRITE_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU
 /// process-wide counter) so two concurrent saves cannot clobber each
 /// other's staging file; a failed write removes its temp again.
 fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    sweep_stale_tmp_siblings(path);
     let sequence =
         WRITE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut file_name = path
@@ -234,6 +267,40 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     }
 
     result
+}
+
+/// Best-effort sweep of orphaned staging files from crashed writers
+/// (#366): a completed write renames its `<name>.<pid>.<seq>.tmp` away, so
+/// any sibling still matching that pattern is a leftover from a process
+/// that died mid-write. Only files older than an hour are removed — a
+/// concurrent live writer's fresh temp must survive — and every error is
+/// ignored: the sweep may never break the save it accompanies.
+fn sweep_stale_tmp_siblings(path: &Path) {
+    const MAX_TMP_AGE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+    let Some(parent) = path.parent() else { return };
+    let Some(file_name) = path.file_name() else { return };
+    let mut prefix = file_name.to_os_string();
+    prefix.push(".");
+    let prefix = prefix.as_encoded_bytes();
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.as_encoded_bytes();
+        if !name.starts_with(prefix) || !name.ends_with(b".tmp") {
+            continue;
+        }
+        let orphaned = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age > MAX_TMP_AGE);
+        if orphaned {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -322,6 +389,62 @@ mod tests {
         assert_eq!(settings.endpoint, "http://10.0.0.5:8181");
         assert_eq!(settings.engine.mode, EngineMode::Manual);
         assert_eq!(settings.engine.active_model, None);
+    }
+
+    #[test]
+    fn a_null_engine_key_loads_as_manual_like_a_missing_one() {
+        // #366: JSON `null` is as legacy as an absent key — a file whose
+        // engine choice says nothing must not fall back to builtin and
+        // silently move audio to the bundled engine.
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"endpoint":"http://10.0.0.5:8181","model":"whisper-large-v3","expectedTerms":["auth"],"engine":null}"#,
+        )
+        .expect("write null-engine settings");
+        let settings = Settings::load(&path);
+        assert_eq!(settings.endpoint, "http://10.0.0.5:8181");
+        assert_eq!(settings.engine.mode, EngineMode::Manual);
+    }
+
+    #[test]
+    fn an_unreadable_file_falls_back_to_manual_unless_it_says_builtin_exactly(
+    ) {
+        // #366: the file parses as JSON but typed deserialization fails
+        // (here: `endpoint` is a number). The fallback must not silently
+        // flip a manual user to the bundled engine — only a file whose
+        // `engine.mode` says exactly "builtin" keeps builtin.
+        let temp = TempDir::new().expect("tempdir");
+        for (index, (engine_key, expected)) in [
+            (r#""engine":{"mode":"manual"}"#, EngineMode::Manual),
+            // No mode at all, or an unknown mode: not exactly "builtin".
+            (r#""engine":{}"#, EngineMode::Manual),
+            (r#""engine":{"mode":"tensor-future"}"#, EngineMode::Manual),
+            // No engine key: legacy, manual.
+            ("", EngineMode::Manual),
+            (r#""engine":null"#, EngineMode::Manual),
+            // An explicit builtin survives the fallback.
+            (r#""engine":{"mode":"builtin"}"#, EngineMode::Builtin),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let path = temp.path().join(format!("settings-{index}.json"));
+            let body = if engine_key.is_empty() {
+                r#""endpoint":42,"model":"parakeet","expectedTerms":["auth"]"#.to_string()
+            } else {
+                format!(
+                    r#""endpoint":42,"model":"parakeet","expectedTerms":["auth"],{engine_key}"#
+                )
+            };
+            std::fs::write(&path, format!("{{{body}}}"))
+                .expect("write unreadable settings");
+            let settings = Settings::load(&path);
+            assert_eq!(settings.engine.mode, expected, "for engine key {engine_key}");
+            // The rest of the fallback is the documented default shape.
+            assert_eq!(settings.model, "parakeet");
+        }
     }
 
     #[test]
@@ -457,13 +580,20 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let path = temp.path().join("settings.json");
 
+        // Not JSON at all: nothing is knowable, pure defaults.
         std::fs::write(&path, "{not json at all").expect("write corrupt settings");
         assert_eq!(Settings::load(&path), Settings::default_settings());
 
-        // Wrong field types are corrupt too, not a panic.
+        // Wrong field types are corrupt too, not a panic — but the file
+        // carries no engine key, so it is legacy (#366): the fallback
+        // keeps the manual engine mode instead of flipping a hand-run-
+        // server user to the bundled engine. Everything else stays the
+        // documented defaults.
         std::fs::write(&path, r#"{"endpoint":42}"#)
             .expect("write mistyped settings");
-        assert_eq!(Settings::load(&path), Settings::default_settings());
+        let mut expected = Settings::default_settings();
+        expected.engine.mode = EngineMode::Manual;
+        assert_eq!(Settings::load(&path), expected);
     }
 
     #[test]
@@ -481,5 +611,52 @@ mod tests {
         settings.set_expected_terms_input("   ");
         assert!(settings.expected_terms.is_empty());
         assert_eq!(settings.expected_terms_input(), "");
+    }
+
+    #[test]
+    fn write_atomic_sweeps_orphaned_tmp_files_from_crashed_writers() {
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("settings.json");
+        // An orphan from a writer that died mid-save hours ago, a fresh
+        // temp that could belong to a concurrent live writer, and files
+        // the pattern does not own.
+        let orphan = temp.path().join(format!(
+            "settings.json.{}.{}.tmp",
+            std::process::id(),
+            4_242
+        ));
+        std::fs::write(&orphan, b"partial").expect("write orphan");
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 60 * 60);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&orphan)
+            .expect("open orphan")
+            .set_modified(old)
+            .expect("age the orphan");
+        let fresh = temp.path().join("settings.json.999999.7.tmp");
+        std::fs::write(&fresh, b"partial").expect("write fresh temp");
+        let unrelated = temp.path().join("other.json.1.1.tmp");
+        std::fs::write(&unrelated, b"partial").expect("write unrelated");
+
+        write_atomic(&path, b"{}").expect("write settings");
+
+        assert!(!orphan.exists(), "the aged orphan is swept");
+        assert!(fresh.exists(), "a fresh temp may be a live writer's");
+        assert!(unrelated.exists(), "other files' temps are not ours");
+        assert_eq!(std::fs::read(&path).expect("read settings"), b"{}");
+    }
+
+    #[test]
+    fn write_atomic_leaves_a_failed_writes_own_tmp_behind_only_on_error() {
+        // The normal path stages and renames one temp; nothing matching
+        // the pattern survives a successful save.
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("settings.json");
+        write_atomic(&path, b"{}").expect("write settings");
+        let leftovers: Vec<_> = std::fs::read_dir(temp.path())
+            .expect("read dir")
+            .map(|entry| entry.expect("entry").file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(leftovers, vec!["settings.json".to_string()]);
     }
 }

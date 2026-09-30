@@ -563,7 +563,6 @@ fn rss_bytes() -> u64 {
 /// of a manager bumps this, so a loop polling a replaced manager sees a
 /// mismatch and retires itself instead of notifying for a dead engine.
 fn next_engine_instance() -> u64 {
-    use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(1);
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
@@ -571,12 +570,23 @@ fn next_engine_instance() -> u64 {
 /// The settings-save coordinator (#366): the Save button and the engine
 /// active-model persistence both write the same settings file from
 /// background tasks. Each save claims a sequence number when its document
-/// is built; a writer holding the save mutex skips its write when a newer
-/// sequence has already been written — the newest document always wins,
-/// no matter which background task happens to run last.
+/// is built; a writer holding the save mutex consults
+/// [`settings_save_should_write`] — the newest document always wins, no
+/// matter which background task happens to run last.
 static SETTINGS_SAVE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static SETTINGS_SAVE_WRITTEN: AtomicU64 = AtomicU64::new(0);
 static SETTINGS_SAVE_MUTEX: Mutex<()> = Mutex::new(());
+
+/// Whether a queued settings writer still needs to write (#366 review):
+/// skip only when a NEWER (or equal) sequence has already landed
+/// successfully. A newer write that FAILED keeps older documents eligible
+/// — the newest one did not reach the disk, so the older one must — which
+/// makes the final on-disk document the newest document that saved
+/// successfully, while a successfully-written newer document retires every
+/// older one (they may never land after it).
+pub(crate) fn settings_save_should_write(sequence: u64, newest_written: u64) -> bool {
+    sequence > newest_written
+}
 
 /// The persisted backend override ("cpu"/"vulkan") as the engine's own
 /// backend family (#362). An unknown string is `None` (automatic), not a
@@ -1172,7 +1182,9 @@ impl StarlingApp {
     }
 
     /// Stop the engine when the app quits (#362): the sidecar is ours,
-    /// so it must not outlive the window. Blocking here is correct —
+    /// so it must not outlive the window. This entity hook is the single
+    /// owner of engine shutdown — quit runs it (main.rs only quits, it
+    /// does not shut the engine down itself). Blocking here is correct —
     /// quit waits for the stop — and the server's `--parent-pid`
     /// watchdog is the backstop if the app crashes first.
     fn register_quit_hook(&mut self, cx: &mut Context<Self>) {
@@ -1181,7 +1193,11 @@ impl StarlingApp {
         }
         // `Context::on_app_quit` hands the entity itself; the returned
         // Subscription is kept so the hook lives as long as the app.
+        // Bumping the instance first retires the notifier loop (#366):
+        // while quit waits for the stop, the loop must not repaint
+        // `connection` from a dying engine or persist engine settings.
         self.quit_hook = Some(cx.on_app_quit(|app, _cx| {
+            app.engine_instance = next_engine_instance();
             if let Some(engine) = app.engine.take() {
                 engine.shutdown();
             }
@@ -1234,7 +1250,10 @@ impl StarlingApp {
                     let _writer = SETTINGS_SAVE_MUTEX
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    if sequence <= SETTINGS_SAVE_WRITTEN.load(Ordering::Relaxed) {
+                    if !settings_save_should_write(
+                        sequence,
+                        SETTINGS_SAVE_WRITTEN.load(Ordering::Relaxed),
+                    ) {
                         // A newer document has already been written; this
                         // older one must not land after it.
                         return Ok(());
@@ -1372,8 +1391,13 @@ impl StarlingApp {
 
     /// The "Use CPU engine" / "Use automatic engine" toggle (#362):
     /// applies immediately (the manager re-selects the backend and moves
-    /// the engine, draining in-flight takes) and updates the dialog
-    /// draft so Save persists the choice.
+    /// the engine, draining in-flight takes) AND persists immediately,
+    /// like `engine_switch_to_manual` does for the mode — an immediate
+    /// action must not wait behind Save, or a later Cancel would leave
+    /// the running engine diverged from the saved settings. The dialog
+    /// draft stays in sync, so an unchanged Save is a no-op and Cancel
+    /// keeps what was applied (the draft resets from the committed
+    /// value when the dialog reopens).
     pub fn engine_toggle_cpu(&mut self, cx: &mut Context<Self>) {
         let pinned = self.draft_backend_override.as_deref() == Some("cpu");
         let next = if pinned { None } else { Some("cpu".to_string()) };
@@ -1383,7 +1407,9 @@ impl StarlingApp {
             );
             self.applied_backend_override = next.clone();
         }
+        self.engine_settings.backend_override = next.clone();
         self.draft_backend_override = next;
+        self.persist_engine_settings(cx);
         cx.notify();
     }
 
@@ -2432,6 +2458,21 @@ mod tests {
         assert_eq!(backend_override_from_settings("vulkan"), Some(Backend::Vulkan));
         assert_eq!(backend_override_from_settings("cuda"), None);
         assert_eq!(backend_override_from_settings(""), None);
+    }
+
+    #[test]
+    fn an_older_settings_save_is_skipped_only_behind_a_successful_newer_one() {
+        // #366: the newest document that SAVED successfully must be the one
+        // on disk. A newer write that failed lands nothing, so an older
+        // writer that runs after it must still write; a newer successful
+        // write retires every older one.
+        assert!(settings_save_should_write(2, 0), "nothing written yet");
+        assert!(settings_save_should_write(2, 1),
+            "the newer write failed (written stayed at 1): the older one must still land");
+        assert!(!settings_save_should_write(1, 2),
+            "a newer document was written successfully: the older one must not land after it");
+        assert!(!settings_save_should_write(2, 2),
+            "this very sequence already landed");
     }
 
     #[test]

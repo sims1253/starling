@@ -113,16 +113,18 @@ static void usage(const char* prog) {
 // Strict long-long parse for --parent-pid (the same rule as
 // parse_int_strict, issue #146, widened): pids do not fit int on every
 // platform, and a truncating int parse would silently watch the wrong
-// process. Empty, partial ("3abc"), non-numeric, and out-of-range text
-// all fail.
+// process. Empty, partial ("3abc"), non-numeric, out-of-range, and
+// whitespace-padded text (" 42", "42 ") all fail: std::stoll skips
+// leading whitespace, so the padding is rejected explicitly here.
 static std::optional<long long> parse_llong_strict(const std::string& text) {
+    if (text.empty()
+        || std::isspace(static_cast<unsigned char>(text.front()))
+        || std::isspace(static_cast<unsigned char>(text.back()))) {
+        return std::nullopt;
+    }
     try {
         std::size_t pos = 0;
         const long long value = std::stoll(text, &pos);
-        while (pos < text.size()
-               && std::isspace(static_cast<unsigned char>(text[pos]))) {
-            ++pos;
-        }
         if (pos != text.size()) return std::nullopt;
         return value;
     } catch (...) {
@@ -689,17 +691,32 @@ int main(int argc, char** argv) {
                 // keep the server alive for the whole warmup() call even if
                 // main() returns and resets its own reference.
                 std::thread([server]() {
-                    server->load();
-                    if (!server->loaded()) {
-                        // The deferred load failed: /health reports it as
-                        // load_error, and this line makes the failure
-                        // observable in the server log too (#366).
+                    // Scope guard: whatever load()/warmup() throw, the flag
+                    // clears when the worker leaves — a stuck-true flag would
+                    // answer every later /warmup with a silent no-op worker.
+                    struct WarmupFlagGuard {
+                        ~WarmupFlagGuard() { g_warmup_running.store(false); }
+                    } flag_guard;
+                    try {
+                        server->load();
+                        if (!server->loaded()) {
+                            // The deferred load failed: /health reports it as
+                            // load_error, and this line makes the failure
+                            // observable in the server log too (#366).
+                            std::fprintf(stderr,
+                                "[starling-serve] warmup load failed: %s\n",
+                                server->load_error().c_str());
+                        }
+                        server->warmup();
+                    } catch (const std::exception& error) {
                         std::fprintf(stderr,
-                            "[starling-serve] warmup load failed: %s\n",
-                            server->load_error().c_str());
+                            "[starling-serve] warmup worker failed: %s\n",
+                            error.what());
+                    } catch (...) {
+                        std::fprintf(stderr,
+                            "[starling-serve] warmup worker failed: unknown "
+                            "exception\n");
                     }
-                    server->warmup();
-                    g_warmup_running.store(false);
                 }).detach();
             }
             std::ostringstream ss;
@@ -1210,7 +1227,12 @@ int main(int argc, char** argv) {
 
     // Bind first, then announce, then serve: a supervisor that asked for
     // --port 0 learns the real port from stdout, and a line on stdout always
-    // means the socket is already accepting connections.
+    // means the socket is already accepting connections. This does NOT wait
+    // for a later listen() call: cpp-httplib's bind_to_port and
+    // bind_to_any_port already call ::listen themselves (through
+    // create_server_socket, third_party/httplib.h ~l.12914), so connections
+    // queue in the kernel backlog from the bind on — before this line is
+    // printed and before listen_after_bind() runs.
     int bound_port = cfg.port;
     if (cfg.port == 0) {
         bound_port = svr.bind_to_any_port(cfg.host);

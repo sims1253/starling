@@ -164,4 +164,141 @@ mod tests {
         assert_eq!(url_file_name("https://host/a/b.gguf?x=1"), "b.gguf?x=1");
         assert_eq!(url_file_name("https://host/"), "https://host/");
     }
+
+    #[test]
+    fn default_catalog_urls_are_pinned_revisions() {
+        // A pin must name an exact revision under /resolve/, never a
+        // floating ref whose bytes can change under the pinned sha256.
+        for entry in default_catalog() {
+            let tail = entry
+                .url
+                .strip_prefix("https://huggingface.co/")
+                .unwrap_or(&entry.url);
+            let resolve_at = tail.find("/resolve/").expect("pinned revision");
+            let revision = tail[resolve_at + "/resolve/".len()..].split('/').next();
+            assert_eq!(
+                revision.map(str::len),
+                Some(40),
+                "{} must pin a 40-hex-char commit: {}",
+                entry.id,
+                entry.url
+            );
+        }
+    }
+
+    /// The default catalog's pins against the live upstream (#366).
+    ///
+    /// The pinned URL/size/sha256 of each entry are otherwise only ever
+    /// checked against themselves. This test asks Hugging Face directly,
+    /// one HTTP HEAD per entry:
+    ///
+    /// - the pinned `/resolve/` URL first WITHOUT following redirects:
+    ///   Hugging Face answers 302 whose headers carry the LFS metadata —
+    ///   `x-linked-size` (the file's true byte size) and `x-linked-etag`
+    ///   (the file's sha256) — which are compared against `size_bytes`
+    ///   and `sha256`;
+    /// - if that response carries no size, the HEAD is repeated with
+    ///   redirects followed and the final `Content-Length` is compared
+    ///   instead. The final hop's plain `ETag` is deliberately NOT
+    ///   compared: the CDN serves a xet CAS hash there, not the file's
+    ///   sha256.
+    ///
+    /// Opt-in because it needs the network; run it with:
+    ///
+    /// ```text
+    /// cargo test -p starling-dictation -- --ignored catalog_pins_match_upstream
+    /// ```
+    #[test]
+    #[ignore = "issues network requests to huggingface.co"]
+    fn catalog_pins_match_upstream() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread test runtime");
+        runtime.block_on(async {
+            // The downloader's client shapes: one that stops at the first
+            // hop (where Hugging Face's LFS metadata lives) and one that
+            // follows redirects to the CDN (like the real download).
+            let first_hop = reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .build()
+                .expect("first-hop test client");
+            let following = reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::limited(5))
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .build()
+                .expect("redirecting test client");
+            for entry in default_catalog() {
+                let response = first_hop.head(&entry.url).send().await.unwrap_or_else(|err| {
+                    panic!("{}: HEAD {} failed: {err}", entry.id, entry.url)
+                });
+                assert!(
+                    response.status().is_success()
+                        || response.status().is_redirection(),
+                    "{}: HEAD {} answered {}",
+                    entry.id,
+                    entry.url,
+                    response.status()
+                );
+                let header = |name: &str| {
+                    response
+                        .headers()
+                        .get(name)
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::trim)
+                };
+                // LFS-backed files report their true size via
+                // x-linked-size; anything else falls back to the final
+                // hop's Content-Length.
+                let size = match header("x-linked-size")
+                    .and_then(|value| value.parse::<u64>().ok())
+                {
+                    Some(size) => size,
+                    None => {
+                        let final_hop = following.head(&entry.url).send().await;
+                        let final_hop = final_hop.unwrap_or_else(|err| {
+                            panic!("{}: HEAD {} (redirects followed) failed: {err}",
+                                   entry.id, entry.url)
+                        });
+                        assert!(
+                            final_hop.status().is_success(),
+                            "{}: HEAD {} answered {} after redirects",
+                            entry.id,
+                            entry.url,
+                            final_hop.status()
+                        );
+                        final_hop
+                            .headers()
+                            .get(reqwest::header::CONTENT_LENGTH)
+                            .and_then(|value| value.to_str().ok())
+                            .and_then(|value| value.trim().parse::<u64>().ok())
+                            .unwrap_or_else(|| {
+                                panic!("{}: no size header for {}", entry.id, entry.url)
+                            })
+                    }
+                };
+                assert_eq!(
+                    size, entry.size_bytes,
+                    "{}: pinned size {} disagrees with upstream {}",
+                    entry.id, entry.size_bytes, size
+                );
+                // Hugging Face's x-linked-etag for LFS files is the file's
+                // sha256 (quoted); compare it only when it is one (a
+                // non-LFS response may carry a git-sha1 etag instead).
+                let etag = header("x-linked-etag")
+                    .map(|value| value.trim_start_matches("W/").trim_matches('"'));
+                if let Some(digest) = etag.filter(|value| {
+                    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+                }) {
+                    assert_eq!(
+                        digest.to_lowercase(),
+                        entry.sha256.to_lowercase(),
+                        "{}: pinned sha256 disagrees with upstream x-linked-etag",
+                        entry.id
+                    );
+                }
+            }
+        });
+    }
 }

@@ -36,10 +36,16 @@ jobs:
     runs-on: ${{ matrix.platform == 'windows' && 'windows-2025' || 'ubuntu-24.04' }}
     timeout-minutes: 90
     # Single source of truth for the engines bundled into the desktop archive,
-    # in preference order (the app tries the first entry first). Checked for
-    # agreement by scripts/release-runtime/check-contract.py.
+    # in preference order (the app tries the first entry first).
+    # scripts/release-runtime/check-contract.py verifies this order agrees
+    # with prepare.py and docs/release-runtime.md; it runs in the
+    # runtime-contract job of release-starling-serve.yml, and again below in
+    # this workflow whenever engines are bundled.
     env:
       BUNDLED_ENGINES: "vulkan cpu"
+      # The bundle-engines input serialized as "true"/"false" for the
+      # packaging scripts below (the step conditions above use the typed
+      # inputs.bundle-engines form).
       BUNDLE_ENGINES: ${{ inputs.bundle-engines }}
     defaults:
       run:
@@ -85,12 +91,19 @@ jobs:
         working-directory: apps/desktop-gpui
         run: cargo build --locked --release -p starling-gpui
       - name: Download the Vulkan engine artifact
+        # Depends on the starling-serve-<platform>-vulkan artifact uploaded
+        # by the servers job of this same run (the experimental release
+        # calls release-starling-serve.yml before this workflow); if that
+        # job was skipped or failed, download-artifact stops here with a
+        # generic "not found" error instead of packaging without engines.
         if: inputs.bundle-engines
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: starling-serve-${{ matrix.platform }}-vulkan
           path: engines-artifacts
       - name: Download the CPU engine artifact
+        # Same dependency as the Vulkan artifact above: the servers job of
+        # this run must have uploaded it.
         if: inputs.bundle-engines
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
@@ -103,8 +116,15 @@ jobs:
         if: inputs.bundle-engines && matrix.platform == 'windows'
         uses: humbletim/install-vulkan-sdk@30ba978f977e81b72d091fc8888feb1fb26f9aff # v1.2
         with:
-          version: 1.4.357.0
+          version: 1.4.357.0 # keep in sync with release-starling-serve.yml (checked by check-contract.py)
           cache: true
+      - name: Check the bundled-engine contract
+        # The same check release-starling-serve.yml's runtime-contract job
+        # runs at the start of a release: this workflow also mutates the
+        # bundled-engine list, so it verifies the agreement itself. Stdlib
+        # Python only; it needs nothing but the checkout.
+        if: inputs.bundle-engines
+        run: python3 scripts/release-runtime/check-contract.py
       - name: Assemble the bundled engines
         if: inputs.bundle-engines
         env:
@@ -121,8 +141,13 @@ jobs:
       - name: Check bundled engine dependencies (Linux)
         if: inputs.bundle-engines && matrix.platform == 'linux'
         run: |
-          # libvulkan1 is installed above, so both engines must resolve every
-          # loader dependency on the runner.
+          # The Vulkan engine dynamically links libvulkan.so.1: the
+          # "Install Linux libraries" step above installs libvulkan1, and
+          # the install here restates the dependency so the check stays
+          # correct even if that build-oriented list ever changes.
+          sudo apt-get install -y libvulkan1
+          # With the loader present, both engines must resolve every loader
+          # dependency on the runner.
           for backend in $BUNDLED_ENGINES; do
             report="$RUNNER_TEMP/ldd-starling-serve-$backend.txt"
             ldd "dist/engines/starling-serve-$backend" | tee "$report"
@@ -131,6 +156,15 @@ jobs:
               exit 1
             fi
           done
+      - name: Upload dependency reports
+        # The ldd reports above, for debugging an unresolved-library
+        # failure (they live in RUNNER_TEMP, outside the uploaded archive).
+        if: failure() && inputs.bundle-engines && matrix.platform == 'linux'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: ldd-reports-${{ matrix.platform }}
+          path: ${{ runner.temp }}/ldd-*.txt
+          retention-days: 7
       - name: Package Linux app
         if: matrix.platform == 'linux'
         run: |

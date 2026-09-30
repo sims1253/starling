@@ -82,11 +82,12 @@ pub struct SessionSummary {
     pub transcript: Option<TranscriptionResult>,
     pub last_error: Option<String>,
     /// The backend label of the attempt that produced the current
-    /// transcript (#363): `engine:<model_id>` for the built-in engine,
-    /// `openai:<model>` for a manual server. `None` when no attempt has
-    /// produced a transcript yet — and unchanged by later attempts that
-    /// did not succeed, so a retry on another backend never rewrites the
-    /// label of the transcript the take actually shows.
+    /// transcript (#363): the string form of [`BackendLabel`] —
+    /// `engine:<model_id>` for the built-in engine, `openai:<model>` for
+    /// a manual server. `None` when no attempt has produced a transcript
+    /// yet — and unchanged by later attempts that did not succeed, so a
+    /// retry on another backend never rewrites the label of the
+    /// transcript the take actually shows.
     pub model_label: Option<String>,
     /// Always `None` on v2 rows (the capture id *is* the journal linkage);
     /// kept in the shape the UI consumes.
@@ -101,6 +102,46 @@ pub struct SessionSummary {
 pub struct DamagedRecord {
     pub id: String,
     pub reason: String,
+}
+
+/// The typed form of a stored backend label (#363): the string shapes
+/// `engine:<model_id>` (built-in engine) and `openai:<model>` (manual
+/// OpenAI-compatible server) are a persistence contract shared by the
+/// writers (recognition attempts) and the reader (the drawer), so they
+/// are produced and parsed through this one type instead of re-spelled
+/// string prefixes. `Display` reproduces the persisted string exactly.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BackendLabel {
+    /// A take transcribed by the bundled engine (`engine:<model_id>`).
+    Engine { model_id: String },
+    /// A take transcribed by a manual OpenAI-compatible server
+    /// (`openai:<model>`).
+    OpenAi { model: String },
+}
+
+impl BackendLabel {
+    /// Parse a stored label; `None` for anything that matches neither
+    /// shape (older attempt rows keep their verbatim text at the reader).
+    pub fn parse(label: &str) -> Option<Self> {
+        if let Some(model_id) = label.strip_prefix("engine:") {
+            Some(Self::Engine {
+                model_id: model_id.to_string(),
+            })
+        } else {
+            label.strip_prefix("openai:").map(|model| Self::OpenAi {
+                model: model.to_string(),
+            })
+        }
+    }
+}
+
+impl std::fmt::Display for BackendLabel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Engine { model_id } => write!(f, "engine:{model_id}"),
+            Self::OpenAi { model } => write!(f, "openai:{model}"),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -194,5 +235,40 @@ mod tests {
         assert!(!is_safe_path_component("a\\b"), "windows separator");
         assert!(!is_safe_path_component("a\nb"), "newline");
         assert!(!is_safe_path_component("a\rb"), "carriage return");
+    }
+
+    #[test]
+    fn backend_labels_round_trip_the_persisted_string_shape() {
+        // #363: the string shape is the persistence contract — parse then
+        // Display must reproduce the stored text byte for byte.
+        for (text, label) in [
+            (
+                "engine:parakeet-v3-q4km-s16",
+                BackendLabel::Engine {
+                    model_id: "parakeet-v3-q4km-s16".to_string(),
+                },
+            ),
+            (
+                "openai:whisper-large-v3",
+                BackendLabel::OpenAi {
+                    model: "whisper-large-v3".to_string(),
+                },
+            ),
+        ] {
+            let parsed = BackendLabel::parse(text).expect(text);
+            assert_eq!(parsed, label);
+            assert_eq!(parsed.to_string(), text);
+        }
+    }
+
+    #[test]
+    fn backend_label_parsing_leaves_other_shapes_alone() {
+        // Older attempt shapes (e.g. `starling:parakeet`) and empty text
+        // are not this contract: they parse to None and the reader shows
+        // them verbatim rather than guessing.
+        assert_eq!(BackendLabel::parse("starling:parakeet"), None);
+        assert_eq!(BackendLabel::parse(""), None);
+        assert_eq!(BackendLabel::parse("engine"), None);
+        assert_eq!(BackendLabel::parse("openai"), None);
     }
 }

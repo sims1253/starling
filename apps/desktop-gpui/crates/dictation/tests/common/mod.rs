@@ -31,6 +31,15 @@ pub fn fixture() -> Option<PathBuf> {
     if default.is_file() {
         Some(default)
     } else {
+        // CI builds the fixture and sets this, so a broken build or path
+        // fails loudly instead of every lifecycle test passing vacuously.
+        if std::env::var_os("STARLING_REQUIRE_CONTRACT_FIXTURE").is_some() {
+            panic!(
+                "STARLING_REQUIRE_CONTRACT_FIXTURE is set but the contract fixture is missing \
+                 (STARLING_CONTRACT_BIN or {})",
+                default.display()
+            );
+        }
         println!(
             "skipping: contract fixture {} not found (build it with \
              cmake --build build/native-cpu --target starling-serve-contract-fixture)",
@@ -78,11 +87,12 @@ pub fn stage_delayed_engine_dir(
 ) -> PathBuf {
     let dir = stage_engine_dir(root, fixture);
     let engine = dir.join("starling-serve-cpu");
+    // Single-quoted for sh, with embedded quotes closed, escaped, reopened.
+    let quoted = format!("'{}'", fixture.display().to_string().replace('\'', r"'\''"));
     std::fs::write(
         &engine,
         format!(
-            "#!/bin/sh\ncase \"$*\" in *{slow_arg}*) sleep {delay_secs} ;; esac\nexec '{}' \"$@\"\n",
-            fixture.display()
+            "#!/bin/sh\ncase \"$*\" in *{slow_arg}*) sleep {delay_secs} ;; esac\nexec {quoted} \"$@\"\n"
         ),
     )
     .expect("write delayed engine");
@@ -221,9 +231,15 @@ struct HttpRequest {
 }
 
 fn read_request(stream: &mut TcpStream) -> Option<HttpRequest> {
+    // A connection that never finishes its head must not wedge the
+    // single-threaded server for every later request.
+    stream.set_read_timeout(Some(Duration::from_secs(10))).ok()?;
     let mut head = Vec::new();
     let mut byte = [0u8; 1];
     while !head.ends_with(b"\r\n\r\n") {
+        if head.len() > 16 * 1024 {
+            return None;
+        }
         match stream.read(&mut byte) {
             Ok(0) | Err(_) => return None,
             Ok(_) => head.push(byte[0]),

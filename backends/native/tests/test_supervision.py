@@ -28,7 +28,9 @@ from pathlib import Path
 # unittest discovery, which puts the directory there itself.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from test_openai_api import ANNOUNCE_RE, fixture_binary, read_announce, start_fixture, wait_healthy
+from test_openai_api import (
+    ANNOUNCE_RE, fixture_binary, read_announce, start_fixture, stop_fixture, wait_healthy,
+)
 
 
 class PortAnnouncement(unittest.TestCase):
@@ -37,7 +39,7 @@ class PortAnnouncement(unittest.TestCase):
         # announce line (ANNOUNCE_RE) before /health is polled, so reaching a
         # healthy server means a valid line was printed for a bound socket.
         base, process = start_fixture("parakeet")
-        self.addCleanup(self.stop, process)
+        self.addCleanup(stop_fixture, process)
         with urllib.request.urlopen(base + "/health", timeout=5) as response:
             health = json.load(response)
         self.assertEqual(health["status"], "ok")
@@ -47,7 +49,7 @@ class PortAnnouncement(unittest.TestCase):
         process = subprocess.Popen(
             [str(fixture_binary()), "--model", "parakeet", "--gguf", __file__, "--port", "0"],
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
-        self.addCleanup(self.stop, process)
+        self.addCleanup(stop_fixture, process)
         announce = read_announce(process)
         self.assertIsNotNone(announce)
         match = ANNOUNCE_RE.match(announce)
@@ -78,10 +80,10 @@ class PortAnnouncement(unittest.TestCase):
             announce = read_announce(process)
             if announce is not None:
                 break
-            self.stop(process)
+            stop_fixture(process)
         else:
             self.fail("fixture never started on any fixed port")
-        self.addCleanup(self.stop, process)
+        self.addCleanup(stop_fixture, process)
         self.assertEqual(announce, f"STARLING_SERVE_LISTENING 127.0.0.1:{port}")
         self.assertTrue(wait_healthy(f"http://127.0.0.1:{port}", process))
 
@@ -93,26 +95,22 @@ class PortAnnouncement(unittest.TestCase):
                     capture_output=True, text=True, timeout=10)
                 self.assertNotEqual(process.returncode, 0)
 
-    @staticmethod
-    def stop(process):
-        process.terminate()
-        process.wait(timeout=5)
-        process.stdout.close()
-
 
 class DeferredLoad(unittest.TestCase):
     """--no-eager-load + POST /warmup + the additive /health fields."""
 
     @classmethod
     def setUpClass(cls):
-        cls.base, cls.process = start_fixture("parakeet", ["--no-eager-load"])
-        cls.addClassCleanup(cls.stop)
-
-    @classmethod
-    def stop(cls):
-        cls.process.terminate()
-        cls.process.wait(timeout=5)
-        cls.process.stdout.close()
+        # start_fixture stops its own process on failure, but guard anyway:
+        # if it ever raises without cleaning up, nothing may leak.
+        cls.process = None
+        try:
+            cls.base, cls.process = start_fixture("parakeet", ["--no-eager-load"])
+        except Exception:
+            if cls.process is not None:
+                stop_fixture(cls.process)
+            raise
+        cls.addClassCleanup(stop_fixture, cls.process)
 
     def health(self):
         with urllib.request.urlopen(self.base + "/health", timeout=5) as response:

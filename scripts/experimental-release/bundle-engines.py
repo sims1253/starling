@@ -23,6 +23,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -135,18 +136,34 @@ def sha256_of(path: Path) -> str:
 
 
 def verify_checksum(binary: Path, sha_file: Path, label: str) -> None:
-    """Verify `binary` against the `<hex>  <name>` line inside `sha_file`."""
+    """Verify `binary` against the single `<hex>  <name>` line in `sha_file`.
+
+    The sidecar must carry exactly one non-empty line of that shape, and its
+    name field must equal the binary's file name (a leading `*` — the
+    sha256sum binary-mode marker — is accepted). A sidecar naming anything
+    else would verify the wrong pairing, not this binary.
+    """
     if not sha_file.is_file():
         raise BundleError(f"{label}: archive is missing {sha_file.name}")
-    tokens = sha_file.read_text().split()
-    if not tokens:
-        raise BundleError(f"{label}: {sha_file.name} is empty")
-    expected = tokens[0].lower()
+    lines = [line for line in sha_file.read_text().splitlines() if line.strip()]
+    if len(lines) != 1:
+        raise BundleError(
+            f"{label}: {sha_file.name} must contain exactly one non-empty "
+            f"'<sha256>  <name>' line; found {len(lines)}")
+    match = re.fullmatch(r"([0-9a-fA-F]{64})  \*?(.+)", lines[0])
+    if not match:
+        raise BundleError(
+            f"{label}: {sha_file.name} is not a '<sha256>  <name>' line: {lines[0]!r}")
+    expected, name = match.groups()
+    if name != binary.name:
+        raise BundleError(
+            f"{label}: {sha_file.name} names {name!r}, but the archive's "
+            f"binary is {binary.name!r}")
     actual = sha256_of(binary)
-    if actual != expected:
+    if actual != expected.lower():
         raise BundleError(
             f"{label}: checksum mismatch for {binary.name}: "
-            f"archive says {expected}, binary is {actual}"
+            f"archive says {expected.lower()}, binary is {actual}"
         )
 
 
@@ -197,6 +214,13 @@ def bundle(platform: str, artifacts: Path, out: Path, backends: list[str],
     if platform not in ("linux", "windows"):
         raise BundleError(f"unsupported platform: {platform!r} (linux or windows)")
     out.mkdir(parents=True, exist_ok=True)
+    # Remove stale engine binaries this run does not stage before copying:
+    # a rerun into an existing --out must never leave an engine without a
+    # checksum or manifest entry (the app would still discover it).
+    staged_names = {engine_file_name(platform, backend) for backend in backends}
+    for stale in out.glob("starling-serve-*"):
+        if stale.name not in staged_names and stale.is_file():
+            stale.unlink()
     suffix = ".exe" if platform == "windows" else ""
     version: str | None = None
     abi: int | None = None

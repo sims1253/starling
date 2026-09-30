@@ -58,7 +58,8 @@ class PrepareTests(unittest.TestCase):
             self.assertEqual(digest, hashlib.sha256((self.dist / name).read_bytes()).hexdigest())
         info = json.loads((self.dist / "build-info.json").read_text())
         self.assertEqual(info["commit"], self.args.sha)
-        self.assertEqual(info["desktop_bundled_engines"], ["cpu", "vulkan"])
+        # Preference order, like BUNDLED_ENGINES in package-desktop.yml.
+        self.assertEqual(info["desktop_bundled_engines"], ["vulkan", "cpu"])
         self.assertIn(self.args.sha, self.args.notes.read_text())
 
     def test_notes_describe_one_self_contained_desktop_download(self):
@@ -240,6 +241,29 @@ class BundleEnginesTests(unittest.TestCase):
     def bundle(self, platform="linux", backends=("vulkan", "cpu"), runtime_md=None):
         bundle_engines.bundle(platform, self.artifacts, self.out, list(backends), runtime_md)
 
+    def fake_sidecar_archive(self, artifacts: Path, platform: str, backend: str,
+                             sidecar: str) -> None:
+        """A server archive whose .sha256 sidecar is exactly `sidecar`."""
+        fake_server_archive(artifacts, platform, backend)
+        name = f"starling-serve-{platform}-{backend}"
+        root = artifacts / name
+        staging = root / "staging"
+        staging.mkdir()
+        binary = staging / f"{name}{'.exe' if platform == 'windows' else ''}"
+        fake_executable(binary, "0.0.0-test", 8)
+        (staging / f"{name}.sha256").write_text(sidecar)
+        (staging / "RUNTIME.md").write_text("# Runtime prerequisites\n")
+        archive = root / (name + (".zip" if platform == "windows" else ".tar.gz"))
+        if platform == "windows":
+            with zipfile.ZipFile(archive, "w") as bundle_zip:
+                for item in sorted(staging.iterdir()):
+                    bundle_zip.write(item, item.name)
+        else:
+            with tarfile.open(archive, "w:gz") as tar:
+                for item in sorted(staging.iterdir()):
+                    tar.add(item, arcname=item.name)
+        shutil.rmtree(staging)
+
     @unittest.skipIf(os.name != "posix", "fake executables need the POSIX exec bit")
     def test_bundle_produces_the_discovered_layout(self):
         fake_server_archive(self.artifacts, "linux", "vulkan")
@@ -295,6 +319,63 @@ class BundleEnginesTests(unittest.TestCase):
         with self.assertRaisesRegex(bundle_engines.BundleError, "checksum mismatch"):
             self.bundle()
         self.assertFalse(self.out.joinpath("engines.json").exists())
+
+    @unittest.skipIf(os.name != "posix", "fake executables need the POSIX exec bit")
+    def test_sidecar_must_name_exactly_the_binary_on_one_line(self):
+        # The .sha256 sidecar pairs one digest with ONE file name; a sidecar
+        # naming something else, carrying extra lines, or empty must be
+        # rejected instead of silently verifying the first token. (These
+        # rejections fire before the digest comparison, so a dummy digest
+        # is enough to pin the shape.)
+        dummy = "0" * 64
+        for sidecar, pattern in [
+            (f"{dummy}  starling-serve-linux-cpu\n{dummy}  other-file\n",
+             "exactly one"),
+            ("", "exactly one"),
+            (f"{dummy}  starling-serve-linux-vulkan\n", "names"),
+            (f"{dummy} starling-serve-linux-cpu\n", "not a '<sha256>  <name>'"),
+        ]:
+            with self.subTest(sidecar=sidecar):
+                shutil.rmtree(self.artifacts)
+                self.artifacts.mkdir()
+                self.fake_sidecar_archive(self.artifacts, "linux", "cpu", sidecar)
+                with self.assertRaisesRegex(bundle_engines.BundleError, pattern):
+                    self.bundle(backends=("cpu",))
+
+    @unittest.skipIf(os.name != "posix", "fake executables need the POSIX exec bit")
+    def test_sidecar_accepts_the_sha256sum_binary_mode_marker(self):
+        # `sha256sum -b` prefixes the name with `*`; that is still the same
+        # single pairing and must verify. The fake binary is deterministic,
+        # so a probe copy yields the archive binary's digest.
+        probe = self.root / "probe-binary"
+        fake_executable(probe, "0.0.0-test", 8)
+        digest = hashlib.sha256(probe.read_bytes()).hexdigest()
+        probe.unlink()
+        self.fake_sidecar_archive(
+            self.artifacts, "linux", "cpu", f"{digest}  *starling-serve-linux-cpu\n")
+        self.bundle(backends=("cpu",))
+        self.assertTrue((self.out / "engines.json").exists())
+
+    @unittest.skipIf(os.name != "posix", "fake executables need the POSIX exec bit")
+    def test_rerun_removes_stale_engines_this_run_does_not_stage(self):
+        # A rerun into an existing --out must not leave an engine without a
+        # checksum entry: the stale starling-serve-cuda from the previous
+        # run is gone, the ones staged now are exactly the manifest's.
+        fake_server_archive(self.artifacts, "linux", "vulkan")
+        fake_server_archive(self.artifacts, "linux", "cpu")
+        self.bundle()
+        stale = self.out / "starling-serve-cuda"
+        stale.write_text("left over from an earlier run")
+        self.bundle(backends=("cpu",))
+        self.assertFalse(stale.exists())
+        self.assertTrue((self.out / "starling-serve-cpu").exists())
+        self.assertFalse((self.out / "starling-serve-vulkan").exists())
+        manifest = json.loads((self.out / "engines.json").read_text())
+        self.assertEqual([engine["file"] for engine in manifest["engines"]],
+                         ["starling-serve-cpu"])
+        sums = (self.out / "SHA256SUMS.txt").read_text().splitlines()
+        self.assertEqual([line.split("  ", 1)[1] for line in sums],
+                         ["starling-serve-cpu"])
 
     @unittest.skipIf(os.name != "posix", "fake executables need the POSIX exec bit")
     def test_version_disagreement_blocks_bundling(self):

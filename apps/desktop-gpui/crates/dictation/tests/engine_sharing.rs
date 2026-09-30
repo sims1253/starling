@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::*;
-use starling_dictation::engine::{EngineManager, EnginePhase};
+use starling_dictation::engine::{EngineManager, EnginePhase, SwapDecision};
 
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
 const TAKEOVER_TIMEOUT: Duration = Duration::from_secs(20);
@@ -132,8 +132,14 @@ fn owner_switch_waits_for_an_attached_instances_take() {
             && s.active.as_ref().is_some_and(|active| active.model_id == "model-b")
     })
     .expect("the owner switches to B");
-    std::thread::sleep(Duration::from_millis(600));
-    let old_alive = pid_alive(old.pid);
+    // Watched continuously: the old engine must stay up the whole time
+    // the attached take is open, not just at one sampled instant.
+    let mut old_alive = true;
+    let watch_until = std::time::Instant::now() + Duration::from_secs(2);
+    while std::time::Instant::now() < watch_until {
+        old_alive &= pid_alive(old.pid);
+        std::thread::sleep(Duration::from_millis(100));
+    }
     let health = http_get(endpoint_port(held.endpoint()), "/health");
 
     // Once the take ends, the owner stops the old engine.
@@ -152,4 +158,118 @@ fn owner_switch_waits_for_an_attached_instances_take() {
         stopped.is_some() || !cfg!(target_os = "linux"),
         "the old engine stops after the attached take ends"
     );
+}
+
+/// Two models A and B, both installed, served by one model server.
+fn two_models(
+    root: &std::path::Path,
+) -> (
+    std::path::PathBuf,
+    starling_dictation::engine::CatalogEntry,
+    starling_dictation::engine::CatalogEntry,
+) {
+    let models_dir = root.join("models");
+    let bytes_a = model_bytes(30, 120_000);
+    let bytes_b = model_bytes(31, 130_000);
+    let addr = spawn_model_server(vec![
+        ("a.gguf".to_string(), Arc::new(bytes_a.clone())),
+        ("b.gguf".to_string(), Arc::new(bytes_b.clone())),
+    ]);
+    let entry_a = entry("model-a", "a.gguf", addr, &bytes_a);
+    let entry_b = entry("model-b", "b.gguf", addr, &bytes_b);
+    install(&models_dir, &entry_a, &bytes_a);
+    install(&models_dir, &entry_b, &bytes_b);
+    (models_dir, entry_a, entry_b)
+}
+
+/// #362 step 3: an instance that starts with no model and then
+/// activates the model another instance already serves attaches to that
+/// sidecar through the same protocol as a launch — no second process.
+#[test]
+fn first_activation_attaches_to_the_shared_sidecar() {
+    let Some(fixture) = fixture() else { return };
+    let root = tempfile::tempdir().expect("tempdir");
+    let engine_dir = stage_engine_dir(root.path(), &fixture);
+    let state_dir = root.path().join("state");
+    let (models_dir, entry_a, entry_b) = two_models(root.path());
+    let catalog = vec![entry_a, entry_b];
+
+    let first = EngineManager::start(
+        config(&engine_dir, &models_dir, &state_dir, catalog.clone()),
+        Some("model-a".to_string()),
+    );
+    let owner = wait_until(&first, READY_TIMEOUT, |s| s.phase == EnginePhase::Ready)
+        .expect("first instance Ready")
+        .active
+        .expect("owner engine");
+    let second = EngineManager::start(config(&engine_dir, &models_dir, &state_dir, catalog), None);
+    wait_until(&second, READY_TIMEOUT, |s| s.phase == EnginePhase::NoModel)
+        .expect("second instance starts without a model");
+
+    second.activate("model-a");
+    let attached = wait_until(&second, READY_TIMEOUT, |s| {
+        s.phase == EnginePhase::Ready && s.active.is_some()
+    })
+    .and_then(|s| s.active);
+    let count = count_engine_processes(engine_dir.to_str().unwrap());
+    second.shutdown();
+    first.shutdown();
+    let attached = attached.expect("the second instance becomes Ready on A");
+    assert!(!attached.owned, "first activation attaches instead of spawning");
+    assert_eq!(attached.pid, owner.pid);
+    if let Some(count) = count {
+        assert_eq!(count, 1, "still exactly one sidecar");
+    }
+}
+
+/// #363 memory policy: stopping an attached engine frees nothing (its
+/// owner keeps it running), so it must not be credited as unloadable. A
+/// reading that only fits the incoming model after an unload therefore
+/// refuses the switch instead of loading both models.
+#[test]
+fn an_attached_engine_is_not_counted_as_freeable_memory() {
+    let Some(fixture) = fixture() else { return };
+    let root = tempfile::tempdir().expect("tempdir");
+    let engine_dir = stage_engine_dir(root.path(), &fixture);
+    let state_dir = root.path().join("state");
+    let (models_dir, entry_a, entry_b) = two_models(root.path());
+    let catalog = vec![entry_a, entry_b];
+
+    let first = EngineManager::start(
+        config(&engine_dir, &models_dir, &state_dir, catalog.clone()),
+        Some("model-a".to_string()),
+    );
+    wait_until(&first, READY_TIMEOUT, |s| s.phase == EnginePhase::Ready)
+        .expect("first instance Ready");
+    let mut tight = config(&engine_dir, &models_dir, &state_dir, catalog);
+    // Fits B only if A's ~384 MiB were freed (see engine_drain.rs).
+    tight.available_memory_override = Some(Some(600 * 1024 * 1024));
+    let second = EngineManager::start(tight, Some("model-a".to_string()));
+    let attached = wait_until(&second, READY_TIMEOUT, |s| s.phase == EnginePhase::Ready)
+        .expect("second instance Ready")
+        .active
+        .expect("attached engine");
+    assert!(!attached.owned);
+
+    second.activate("model-b");
+    let decided = wait_until(&second, READY_TIMEOUT, |s| {
+        s.pending_decision.is_some() && s.switch.is_none()
+    });
+    let count = count_engine_processes(engine_dir.to_str().unwrap());
+    let still_attached = second
+        .snapshot()
+        .active
+        .is_some_and(|active| active.model_id == "model-a" && !active.owned);
+    second.shutdown();
+    first.shutdown();
+    let decided = decided.expect("the switch ends with a decision");
+    assert!(
+        matches!(decided.pending_decision, Some(SwapDecision::Refused { .. })),
+        "got {:?}",
+        decided.pending_decision
+    );
+    assert!(still_attached, "the attached engine keeps serving");
+    if let Some(count) = count {
+        assert_eq!(count, 1, "B was never loaded next to A");
+    }
 }

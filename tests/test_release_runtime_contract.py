@@ -28,6 +28,12 @@ def test_current_bundled_engines_contract():
     assert contract.bundled_engines_errors(workflow, prepare, release_runtime) == []
 
 
+def test_current_vulkan_sdk_contract():
+    desktop_workflow, _, _ = engine_inputs()
+    workflow, _, _ = inputs()
+    assert contract.vulkan_sdk_errors(desktop_workflow, workflow) == []
+
+
 @pytest.mark.parametrize("path, old, new", [
     (contract.DESKTOP_WORKFLOW, 'BUNDLED_ENGINES: "@ENGINES@"', 'BUNDLED_ENGINES: "@BAD_ENGINES@"'),
     (contract.PREPARE, '"desktop_bundled_engines": [@LIST@]', '"desktop_bundled_engines": [@BAD_LIST@]'),
@@ -59,6 +65,64 @@ def test_missing_bundled_engine_statement_fails():
                              "", release_runtime, flags=re.S)
     assert without_section != release_runtime
     assert contract.bundled_engines_errors(desktop_workflow, prepare, without_section)
+
+
+def test_reordered_bundled_engine_list_fails():
+    # The list order is the app's preference order, so a same-set reorder
+    # in any one source must be reported, not absorbed by a set comparison.
+    workflow, prepare, release_runtime = engine_inputs()
+
+    engines = re.search(r'BUNDLED_ENGINES: "([^"]+)"', workflow).group(1)
+    reordered = " ".join(reversed(engines.split()))
+    assert reordered != engines
+    assert contract.bundled_engines_errors(
+        workflow.replace(engines, reordered), prepare, release_runtime)
+
+    listed = re.search(r'"desktop_bundled_engines": \[([^\]]*)\]', prepare).group(1)
+    reordered_list = ", ".join(reversed(re.findall(r'"([^"]+)"', listed)))
+    assert contract.bundled_engines_errors(
+        workflow, prepare.replace(listed, reordered_list), release_runtime)
+
+    docs_listed = re.search(
+        r"bundle exactly the ((?:`[a-z0-9]+`(?:, | and )`[a-z0-9]+`)+)",
+        release_runtime).group(1)
+    first, second = re.findall(r"`([a-z0-9]+)`", docs_listed)
+    swapped_docs = release_runtime.replace(
+        docs_listed, f"`{second}` and `{first}`")
+    assert contract.bundled_engines_errors(workflow, prepare, swapped_docs)
+
+
+def test_missing_separator_in_bundled_engine_statement_fails():
+    # "`vulkan` `cpu`" (no comma or "and" between them) must not parse as
+    # a list: separators are required between repetitions.
+    workflow, prepare, release_runtime = engine_inputs()
+    listed = re.search(
+        r"bundle exactly the ((?:`[a-z0-9]+`(?:, | and )`[a-z0-9]+`)+)",
+        release_runtime).group(1)
+    unseparated = " ".join(re.findall(r"`([a-z0-9]+)`", listed))
+    assert contract.bundled_engines_errors(
+        workflow, prepare, release_runtime.replace(listed, unseparated))
+
+
+@pytest.mark.parametrize("path", [contract.DESKTOP_WORKFLOW, contract.WORKFLOW])
+def test_rejects_vulkan_sdk_pin_drift(path):
+    # Bump one workflow's install-vulkan-sdk version: the other workflow's
+    # pin no longer agrees, so the check must fail.
+    desktop_workflow, _, _ = engine_inputs()
+    workflow, _, _ = inputs()
+    sdk = re.search(r"install-vulkan-sdk@\S+[^\n]*\n(?:[^\n]*\n){0,5}?\s*version:\s*['\"]?(\d+(?:\.\d+)+)",
+                    desktop_workflow).group(1)
+    bad = f"{int(sdk.split('.')[0]) + 1}.0.0.0"
+    text = {contract.DESKTOP_WORKFLOW: desktop_workflow, contract.WORKFLOW: workflow}[path]
+    changed, count = re.subn(
+        r"(install-vulkan-sdk@\S+[^\n]*\n(?:[^\n]*\n){0,5}?\s*version:\s*['\"]?)\d+(?:\.\d+)+",
+        r"\g<1>" + bad, text, count=1)
+    assert count == 1
+    if path == contract.DESKTOP_WORKFLOW:
+        desktop_workflow = changed
+    else:
+        workflow = changed
+    assert contract.vulkan_sdk_errors(desktop_workflow, workflow)
 
 
 def test_release_preflight_checks_bundled_engines_too(monkeypatch, capsys):

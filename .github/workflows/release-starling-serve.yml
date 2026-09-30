@@ -350,7 +350,7 @@ jobs:
       - name: Install Vulkan SDK
         uses: humbletim/install-vulkan-sdk@30ba978f977e81b72d091fc8888feb1fb26f9aff # v1.2
         with:
-          version: 1.4.357.0
+          version: 1.4.357.0 # keep in sync with package-desktop.yml (checked by check-contract.py)
           cache: true
 
       - name: Build starling-serve (Vulkan, static CRT)
