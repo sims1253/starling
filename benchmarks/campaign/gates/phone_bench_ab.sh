@@ -39,6 +39,29 @@ EXTRA_ENV_CAND=${EXTRA_ENV_CAND:-}
 BASE_BIN=${BASE_BIN:-}
 CAND_BIN=${CAND_BIN:-}
 
+# Values interpolated into the remote `adb shell` command string must be
+# single safe tokens: anything with spaces or shell metacharacters would
+# split or execute on the device instead of failing loudly here.
+safe_token() { # non-empty, [A-Za-z0-9_=:./%+-] only
+  case "$1" in
+    ''|*[!A-Za-z0-9_=:./%+-]*) return 1 ;;
+  esac
+  return 0
+}
+positive_int() { case "$1" in ''|*[!0-9]*|0) return 1 ;; esac; return 0; }
+safe_env_list() { # "NAME=value [NAME=value ...]"; values must be safe tokens
+  [ -n "$1" ] || return 0
+  local w
+  for w in $1; do # shellcheck disable=SC2086 — word splitting is the point
+    case "$w" in
+      [A-Za-z_][A-Za-z0-9_]*=*) ;;
+      *) return 1 ;;
+    esac
+    safe_token "${w#*=}" || return 1
+  done
+  return 0
+}
+
 while [ $# -gt 0 ]; do
   case "$1" in
     --base-bin) BASE_BIN=$2; shift 2 ;;
@@ -68,6 +91,16 @@ command -v adb >/dev/null || { echo "adb missing" >&2; exit 2; }
 adb get-state >/dev/null 2>&1 || { echo "phone not connected" >&2; exit 1; }
 
 GGUF_NAME=$(basename "$GGUF"); WAV_NAME=$(basename "$WAV")
+for v in "$ROUNDS" "$RUNS" "$THREADS"; do
+  positive_int "$v" || { echo "rounds/runs/threads must be positive integers: $v" >&2; exit 2; }
+done
+for v in "$DEV" "$MODEL" "$ENGINE" "$GGUF_NAME" "$WAV_NAME"; do
+  safe_token "$v" || { echo "value has spaces/metacharacters (unsafe remotely): $v" >&2; exit 2; }
+done
+safe_env_list "$EXTRA_ENV_BASE" || {
+  echo "--extra-env-base must be NAME=value tokens without spaces/metacharacters" >&2; exit 2; }
+safe_env_list "$EXTRA_ENV_CAND" || {
+  echo "--extra-env-cand must be NAME=value tokens without spaces/metacharacters" >&2; exit 2; }
 adb shell "mkdir -p $DEV" >/dev/null 2>&1 || true
 adb push "$BASE_BIN" "$DEV/starling-bench-base" >/dev/null
 adb push "$CAND_BIN" "$DEV/starling-bench-cand" >/dev/null
@@ -101,18 +134,35 @@ sample_rss() { # <pid-var-file> -> echoes max kb seen so far (or nothing)
 
 bench_with_rss() { # <remote-binary> <extra-env> <out-file>
   bench "$1" "$2" "$3" &
-  local bpid=$! rss max=0 v
+  local bpid=$! rss max=0 v rc=0
   while kill -0 "$bpid" 2>/dev/null; do
     v=$(sample_rss || true)
     case "$v" in ''|*[!0-9]*) : ;; *) [ "$v" -gt "$max" ] && max=$v ;; esac
     sleep 0.3
   done
-  wait "$bpid"
+  # Propagate the bench's exit status. Writing the rss sample afterwards must
+  # not mask a failed bench: callers decide fail/inconclusive from this status
+  # (the `||` at the call sites keeps set -e off inside this function).
+  wait "$bpid"; rc=$?
   echo "$max" > "$3.rss"
+  return "$rc"
 }
 
 kill_benches
 screen_off
+# A bench that exited 0 must still have produced --runs timings: a truncated
+# run (hung run killed by the remote timeout, skipped transcription) would
+# otherwise yield a fast-biased median over the surviving subset and a wrong
+# pass. Fail loudly instead.
+require_complete() { # <out-file> <label>
+  local got
+  got=$(total_ms "$1" | awk 'END {print NR}')
+  if [ "$got" != "$RUNS" ]; then
+    echo "ERROR: $2 bench output truncated: $got/$RUNS time= lines" >&2
+    tail -5 "$1" >&2
+    exit 1
+  fi
+}
 declare -a base_vals cand_vals
 for r in $(seq 1 "$ROUNDS"); do
   screen_off
@@ -124,6 +174,8 @@ for r in $(seq 1 "$ROUNDS"); do
     bench_with_rss starling-bench-cand "$EXTRA_ENV_CAND" "$TMP/c$r" || { echo "cand bench failed (round $r)" >&2; tail -5 "$TMP/c$r" >&2; exit 1; }
     bench_with_rss starling-bench-base "$EXTRA_ENV_BASE" "$TMP/b$r" || { echo "base bench failed (round $r)" >&2; tail -5 "$TMP/b$r" >&2; exit 1; }
   fi
+  require_complete "$TMP/b$r" base
+  require_complete "$TMP/c$r" cand
   base_vals+=("$(total_ms "$TMP/b$r" | median)")
   cand_vals+=("$(total_ms "$TMP/c$r" | median)")
   sleep 5   # breathe between rounds
