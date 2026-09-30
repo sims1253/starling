@@ -400,6 +400,10 @@ def fixture_profile() -> dict:
                     "--cand-bin", "{candidate}/build-campaign/starling-serve-contract-fixture",
                     "--run-dir", "{attempt_dir}/experiment",
                     "--model", "parakeet",
+                    # Sub-millisecond fixture requests are noise-dominated: use the
+                    # #256 shared-runner calibration of the experiments demo (an
+                    # A/A control here measured a 2.4..9.2% CI clear of zero).
+                    "--repeats", "12", "--min-improvement", "12",
                 ],
                 "rules": [{"metric": "verdict", "op": "==", "value": "pass"}],
                 "required": True, "objective": True, "timeout_s": 1800.0,

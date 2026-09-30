@@ -63,7 +63,11 @@
         "--run-dir",
         "{attempt_dir}/experiment",
         "--model",
-        "parakeet"
+        "parakeet",
+        "--repeats",
+        "12",
+        "--min-improvement",
+        "12"
       ],
       "name": "perf",
       "objective": true,
