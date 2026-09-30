@@ -71,6 +71,10 @@ ALWAYS_PROTECTED = (
     "benchmarks/sonar/**",
     "tests/fixtures/**",
     ".github/**",
+    # Vendored code and its patch series (incl. the ggml gitlink itself):
+    # changing ggml is separate reviewable work, never a campaign candidate.
+    "third_party/**",
+    ".gitmodules",
 )
 
 DEFAULT_GATE_TIMEOUT_S = 600.0

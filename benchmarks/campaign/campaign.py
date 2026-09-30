@@ -635,13 +635,21 @@ class Evaluator:
         """Commit pending changes, then classify the diff. Never evaluates a
         change outside allowed_paths or inside protected_paths."""
         camp = self.camp
-        if camp.wt("status", "--porcelain").stdout.strip():
+        # Dirty submodule CONTENT is ignored: the build's configure step applies
+        # the ggml patch series inside third_party/ggml. A changed submodule
+        # commit still shows (and is rejected as a protected path).
+        status = ("status", "--porcelain", "--ignore-submodules=dirty")
+        if camp.wt(*status).stdout.strip():
             camp.wt("add", "-A")
             # Identity and hook policy ride on -c (never `git config`: linked
             # worktrees share the operator's repository config), and the
             # repository's hooks must not run with the evaluator's authority.
-            camp.wt(*EVALUATOR_COMMIT_ARGS, "commit", "-q", "--no-verify", "-m",
-                    "campaign attempt (auto-committed by evaluator)")
+            done = camp.wt(*EVALUATOR_COMMIT_ARGS, "commit", "-q", "--no-verify", "-m",
+                           "campaign attempt (auto-committed by evaluator)", check=False)
+            if camp.wt(*status).stdout.strip():
+                raise CampaignError(
+                    "cannot commit the candidate's changes in the campaign worktree: "
+                    + (done.stderr.strip() or done.stdout.strip()))
         head = camp.wt_sha()
         changed = camp.wt("diff", "--name-only", last_kept_sha + ".." + head).stdout.split()
         changed = sorted(set(c for c in changed if c.strip()))
@@ -1266,6 +1274,10 @@ def cmd_start(args) -> int:
             suffix += 1
             if suffix > 99:
                 raise CampaignError(f"cannot create a fresh campaign branch in {worktree}")
+        if (worktree / ".gitmodules").is_file():
+            # A linked worktree starts with empty submodules; every native
+            # build needs third_party/ggml at the baseline's pinned commit.
+            git(worktree, "submodule", "update", "--init", "--recursive", timeout=1800)
 
         extraction = extract_trusted(repo, baseline_sha, default_trusted_paths(profile),
                                      out / "trusted")
