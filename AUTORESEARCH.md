@@ -6,7 +6,8 @@ this file is the standing context every such loop inherits.** Nothing here
 is per-issue; issues stay short.
 
 For the Pixel fast-engine campaign there is a second, device-specific brief
-with measured baselines and hardware notes: `benchmarks/fast_engine/AUTORESEARCH.md`.
+with measured baselines, hardware notes and its own quality gates:
+`benchmarks/fast_engine/AUTORESEARCH.md`.
 When the two overlap, the constraints below win.
 
 ## What an optimization issue must state

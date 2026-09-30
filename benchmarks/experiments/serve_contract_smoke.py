@@ -19,7 +19,7 @@ Stdlib only; no models needed for the contract-fixture binary.
 
 Usage:
     python benchmarks/experiments/serve_contract_smoke.py \
-        --binary build-campaign/starling-serve \
+        --binary build-candidate/starling-serve \
         --baseline-binary build-baseline/starling-serve \
         --model parakeet [--gguf ${STARLING_MODELS_DIR}/model.gguf]
 """
