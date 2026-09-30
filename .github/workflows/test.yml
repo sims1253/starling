@@ -27,7 +27,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install uv
-        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7
       - name: Install isolated CPU dependencies
         run: uv sync --locked --project benchmarks/sonar --python 3.12
       - name: Harness regressions
@@ -48,7 +48,7 @@ jobs:
           submodules: recursive
           persist-credentials: false
       - name: Install uv
-        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7
       - name: Unit and comparator tests (stub double, no models)
         run: uv run --no-project --python 3.12 python -m unittest discover -s benchmarks/experiments -p 'test_*.py'
       - name: Contention pilot decision tests (saved result summaries)
@@ -71,7 +71,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7
       - name: Test portable guards without the deprecated CUDA environment
         run: >-
           uv run --no-project --python 3.12
@@ -146,7 +146,7 @@ jobs:
 
       - name: Install uv
         # astral-sh/setup-uv v10.0.1
-        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7
 
       - name: Set up Python ${{ matrix.python-version }}
         run: uv python install ${{ matrix.python-version }}
