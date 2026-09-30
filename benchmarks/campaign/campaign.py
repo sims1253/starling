@@ -54,6 +54,10 @@ EXIT_OK = 0
 EXIT_USAGE = 2
 EXIT_SAFETY = 3
 EXIT_TAMPER = 4
+# Control/finalize run with no attempt deadline (the campaign wall clock
+# bounds agent attempts, not the pre-registration control or the closing
+# re-validation).
+UNCAPPED_OFFSET_S = 1e12
 EXIT_INTERRUPT = 130
 
 SAFETY_STOPS = {
@@ -514,7 +518,16 @@ class Campaign:
         return self.campaign_deadline() - time.time()
 
     def remaining_attempt_s(self, attempt_deadline: float) -> float:
-        return min(attempt_deadline, self.campaign_deadline()) - time.monotonic()
+        # attempt_deadline is monotonic-based while the campaign deadline is
+        # wall-clock (it must survive process restarts). Compare both as
+        # REMAINING seconds — mixing the two clocks directly would make the
+        # campaign term dead code (epoch vs monotonic differ by ~1e9).
+        # The UNCAPPED sentinel marks the control/finalize passes: the wall
+        # clock bounds agent attempts, not the pre-registration measurement.
+        remaining = attempt_deadline - time.monotonic()
+        if remaining >= UNCAPPED_OFFSET_S / 2:
+            return remaining
+        return min(remaining, self.remaining_campaign_s())
 
     # -- probes ------------------------------------------------------------
     def safety_probe(self, last_gate_log: str | None = None) -> None:
@@ -640,6 +653,24 @@ class Evaluator:
         """Commit pending changes, then classify the diff. Never evaluates a
         change outside allowed_paths or inside protected_paths."""
         camp = self.camp
+        # Submodule CONTENT edits are invisible to the parent-repo diff below
+        # (--ignore-submodules=dirty) and can never be committed there, so an
+        # agent edit inside e.g. third_party/ggml would silently persist into
+        # every later build and finalize. Builds dirty the submodule too
+        # (configure applies the ggml patch series), but _restore_submodules
+        # cleans that up after every build — anything left here was written
+        # by the candidate. Reject it as a protected-path violation.
+        dirty = camp.wt("submodule", "foreach", "--quiet", "--recursive",
+                        "test -z \"$(git status --porcelain)\" || echo DIRTY",
+                        check=False)
+        if "DIRTY" in dirty.stdout:
+            return {
+                "verdict": "fail",
+                "reason": "submodule content modified (always protected): "
+                          "uncommitted changes inside a submodule working tree",
+                "changed_paths": [],
+                "candidate_sha": camp.wt_sha(),
+            }
         # Dirty submodule CONTENT is ignored: the build's configure step applies
         # the ggml patch series inside third_party/ggml. A changed submodule
         # commit still shows (and is rejected as a protected path).
@@ -878,7 +909,10 @@ def _write_task_md(camp: Campaign, attempt_dir: Path, n: int) -> None:
                 f"| {failed} | {str(div)[:40]} | {metrics[:60]} |"
             )
         lines.append("")
-    best_entry = next((e for e in ledger if e.get("kept")), None)
+    # The ledger is append-ordered and several attempts can be kept (each
+    # pass replaces the best): the CURRENT best is the LAST kept entry —
+    # scanning forward would brief the agent with a stale attempt.
+    best_entry = next((e for e in reversed(ledger) if e.get("kept")), None)
     if best_entry:
         metrics = " ".join(
             f"{k}={v}" for g in best_entry.get("gates", [])
@@ -1050,6 +1084,9 @@ def run_attempt(camp: Campaign, *, agent: bool = True, hypothesis: str | None = 
                     cand, check=False)
         camp.wt("reset", "--hard", best_sha)
         camp.wt("clean", "-fd")
+    # Both paths: the build dirtied third_party/ggml (configure applies the
+    # patch series); leave the worktree pristine for the next authority check.
+    _restore_submodules(camp)
 
     entry["wall_s"] = round(time.monotonic() - started, 1)
     camp.append_ledger(entry)
@@ -1077,6 +1114,16 @@ def _entry_tokens(entry: dict) -> int:
         if isinstance(v, (int, float)) and not isinstance(v, bool):
             total += int(v)
     return total
+
+
+def _restore_submodules(camp: Campaign) -> None:
+    """Reset submodule working trees to their pinned commits. Builds apply the
+    ggml patch series inside third_party/ggml, and parent-level `reset --hard`
+    + `clean -fd` never touch submodule content — without this, submodule dirt
+    persists across attempts (and into finalize's rebuild) and would blind the
+    authority check's dirty-submodule rejection."""
+    camp.wt("submodule", "foreach", "--quiet", "--recursive",
+            "git reset -q --hard && git clean -q -fd", check=False)
 
 
 def _skip_all(camp: Campaign, after_stage: str) -> list[dict]:
@@ -1118,7 +1165,7 @@ def _run_loop(camp: Campaign, wait_lock: bool) -> int:
 
     while True:
         if _interrupt_check():
-            return _interrupt_finish(camp, None)
+            return _interrupt_finish(camp)
         if camp.state.get("attempts_used", 0) >= max_attempts:
             return _stop(camp, "max_attempts", EXIT_OK)
         if camp.remaining_campaign_s() <= 0:
@@ -1137,7 +1184,7 @@ def _run_loop(camp: Campaign, wait_lock: bool) -> int:
             camp.safety_probe()
             entry = run_attempt(camp, agent=True)
         except Interrupted:
-            return _interrupt_finish(camp, None)
+            return _interrupt_finish(camp)
         except SafetyStop as e:
             return _stop(camp, e.reason, EXIT_SAFETY if e.reason in SAFETY_STOPS else EXIT_OK,
                          str(e))
@@ -1167,10 +1214,11 @@ def _stop(camp: Campaign, reason: str, exit_code: int, message: str = "") -> int
     return exit_code
 
 
-def _interrupt_finish(camp: Campaign, attempt_n) -> int:
+def _interrupt_finish(camp: Campaign) -> int:
     best_sha = camp.state.get("best_sha") or camp.campaign["baseline_revision"]
     camp.wt("reset", "--hard", best_sha, check=False)
     camp.wt("clean", "-fd", check=False)
+    _restore_submodules(camp)
     # current_attempt is KEPT so `resume` records the interrupted attempt
     # (it counts toward the budget) instead of silently re-running it.
     camp.checkpoint(status="interrupted", stop_reason="interrupted",
@@ -1255,7 +1303,10 @@ def cmd_start(args) -> int:
     if out.exists() and any(out.iterdir()):
         raise CampaignError(f"campaign dir {out} exists and is not empty")
 
-    with campaign_locks(profile, wait=args.wait_lock):
+    lock_profile = dict(profile)
+    if args.adb_serial:
+        lock_profile["adb_serial"] = args.adb_serial
+    with campaign_locks(lock_profile, wait=args.wait_lock):
         problems, context = preflight(profile, task, repo, out, adb_serial=args.adb_serial,
                                       assume_lock_held=True)
         if problems:
@@ -1335,10 +1386,13 @@ def cmd_start(args) -> int:
         # Build the baseline once, copy artifacts to baseline/ and best/.
         camp.checkpoint(status="building-baseline")
         evaluator = Evaluator(camp)
-        build_record = evaluator.build(camp.baseline_dir, time.monotonic() + 1e12)
+        build_record = evaluator.build(camp.baseline_dir, time.monotonic() + UNCAPPED_OFFSET_S)
         if build_record["verdict"] != "pass":
             print(f"baseline build failed:\n{build_record['rule_details']}", file=sys.stderr)
             return EXIT_USAGE
+        # The baseline build dirtied third_party/ggml (patch series); restore
+        # it so attempt 1's authority check starts from a pristine submodule.
+        _restore_submodules(camp)
         _copy_artifacts(camp.baseline_dir, camp.best_dir,
                         profile.get("build", {}).get("artifacts_out", []))
 
@@ -1350,7 +1404,7 @@ def cmd_start(args) -> int:
         try:
             camp.safety_probe()
             control_gates = evaluator.gates(control_dir, camp.baseline_dir,
-                                            time.monotonic() + 1e12, kind="control")
+                                            time.monotonic() + UNCAPPED_OFFSET_S, kind="control")
         except (SafetyStop, Interrupted) as e:
             print(f"control attempt could not run: {e}", file=sys.stderr)
             return EXIT_USAGE
@@ -1427,7 +1481,7 @@ def cmd_run(args) -> int:
     refused = _refuse_unusable(camp)
     if refused is not None:
         return refused
-    with campaign_locks(camp.profile, wait=args.wait_lock):
+    with campaign_locks(camp.profile_with_serial(), wait=args.wait_lock):
         # Recovery mutates the worktree: only under the campaign lock.
         if _needs_recovery(camp):
             _recover_interrupted(camp)
@@ -1461,7 +1515,7 @@ def cmd_resume(args) -> int:
     refused = _refuse_unusable(camp)
     if refused is not None:
         return refused
-    with campaign_locks(camp.profile, wait=args.wait_lock):
+    with campaign_locks(camp.profile_with_serial(), wait=args.wait_lock):
         if _needs_recovery(camp):
             _recover_interrupted(camp)
         if not camp.evaluator_ok():
@@ -1475,7 +1529,7 @@ def cmd_resume(args) -> int:
             return _stop(camp, e.reason,
                          EXIT_SAFETY if e.reason in SAFETY_STOPS else EXIT_OK)
         except Interrupted:
-            return _interrupt_finish(camp, None)
+            return _interrupt_finish(camp)
         camp.checkpoint(status="running", stop_reason=None, finished_at=None)
         return _run_loop(camp, wait_lock=args.wait_lock)
 
@@ -1486,12 +1540,14 @@ def cmd_attempt(args) -> int:
     if refused is not None:
         return refused
     budgets = camp.task["budgets"]
-    if camp.state.get("attempts_used", 0) >= budgets.get("max_attempts", 1):
-        print("attempt budget already exhausted; nothing to do")
-        return EXIT_OK
-    with campaign_locks(camp.profile, wait=args.wait_lock):
+    with campaign_locks(camp.profile_with_serial(), wait=args.wait_lock):
         if _needs_recovery(camp):
             _recover_interrupted(camp)
+        # AFTER recovery: the interrupted attempt now counts toward the
+        # budget, and this command must not start one past max_attempts.
+        if camp.state.get("attempts_used", 0) >= budgets.get("max_attempts", 1):
+            print("attempt budget already exhausted; nothing to do")
+            return EXIT_OK
         if not camp.evaluator_ok():
             return _stop(camp, "evaluator_tampered", EXIT_TAMPER)
         problems = camp.verify_seals()
@@ -1507,7 +1563,7 @@ def cmd_attempt(args) -> int:
             camp.safety_probe()
             entry = run_attempt(camp, agent=False, hypothesis=args.hypothesis)
         except Interrupted:
-            return _interrupt_finish(camp, None)
+            return _interrupt_finish(camp)
         except SafetyStop as e:
             return _stop(camp, e.reason, EXIT_SAFETY if e.reason in SAFETY_STOPS else EXIT_OK,
                          str(e))
@@ -1555,7 +1611,13 @@ def cmd_report(args) -> int:
 
 def cmd_finalize(args) -> int:
     camp = _open_campaign(args)
-    with campaign_locks(camp.profile, wait=args.wait_lock):
+    # The guard the other commands use: a campaign whose control failed has a
+    # proven-untrustworthy evaluator, and finalize is the most consequential
+    # step (promotion) — it must refuse too, not emit a finalize verdict.
+    refused = _refuse_unusable(camp)
+    if refused is not None:
+        return refused
+    with campaign_locks(camp.profile_with_serial(), wait=args.wait_lock):
         if not camp.evaluator_ok():
             return _stop(camp, "evaluator_tampered", EXIT_TAMPER)
         problems = camp.verify_seals()
@@ -1572,6 +1634,9 @@ def cmd_finalize(args) -> int:
         baseline_sha = camp.campaign["baseline_revision"]
         camp.wt("reset", "--hard", best_sha)
         camp.wt("clean", "-fd")
+        # Parent-level reset/clean never touch submodule content: restore it,
+        # or leftover submodule edits would leak into the best-commit rebuild.
+        _restore_submodules(camp)
         finalize_dir = camp.dir / "finalize"
         if finalize_dir.exists():
             shutil.rmtree(finalize_dir)
@@ -1579,7 +1644,7 @@ def cmd_finalize(args) -> int:
         evaluator = Evaluator(camp)
         try:
             camp.safety_probe()
-            build_record = evaluator.build(finalize_dir, time.monotonic() + 1e12)
+            build_record = evaluator.build(finalize_dir, time.monotonic() + UNCAPPED_OFFSET_S)
             if build_record["verdict"] != "pass":
                 print("cannot rebuild the best commit under the sealed build",
                       file=sys.stderr)
@@ -1590,7 +1655,7 @@ def cmd_finalize(args) -> int:
             finalize_values = camp.placeholder_values(finalize_dir, finalize_dir)
             finalize_values["best"] = str(camp.baseline_dir)
             gates_records = evaluator.gates(finalize_dir, finalize_dir,
-                                            time.monotonic() + 1e12, kind="finalize",
+                                            time.monotonic() + UNCAPPED_OFFSET_S, kind="finalize",
                                             values=finalize_values)
         except (SafetyStop, Interrupted) as e:
             print(f"finalize stopped: {e}", file=sys.stderr)
@@ -1747,7 +1812,6 @@ def _toy_baseline(toy_repo_dir: Path) -> str:
             shutil.rmtree(toy_repo_dir)
         else:
             raise CampaignError(f"{toy_repo_dir} exists and is not a pilot toy repo")
-    return toy_mod.build_toy_repo(toy_repo_dir)
     return toy_mod.build_toy_repo(toy_repo_dir)
 
 

@@ -29,7 +29,14 @@ def _tokens(entry: dict):
     usage = entry.get("usage") or {}
     if not usage:
         return UNAVAILABLE
-    return usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
+    # usage.json is agent-written (untrusted): guard like campaign._entry_tokens
+    # so a non-numeric value renders as 0 instead of crashing report/finalize.
+    total = 0
+    for key in ("input_tokens", "output_tokens"):
+        v = usage.get(key)
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            total += int(v)
+    return total
 
 
 def _fmt(v) -> str:

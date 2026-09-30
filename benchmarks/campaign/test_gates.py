@@ -69,6 +69,7 @@ class SubstituteTests(unittest.TestCase):
 
     def test_argv_expands_env_when_asked(self):
         os.environ["CAMP_TEST_VAR"] = "/models"
+        self.addCleanup(os.environ.pop, "CAMP_TEST_VAR", None)
         argv = gates_mod.substitute_command(
             ["{python}", "g.py", "${CAMP_TEST_VAR}/m.gguf"],
             {"python": "py"}, expand_vars=True)
@@ -210,8 +211,8 @@ class RunGateTests(unittest.TestCase):
                     break
                 time.sleep(0.05)
             self.assertTrue(gone, "grandchild survived the gate timeout")
-            with self.assertRaises((ProcessLookupError, PermissionError)):
-                os.kill(pid, 0)  # no surviving grandchild
+            # no separate PID re-check: the loop above already confirmed it is
+            # gone, and a re-check can flake if the OS recycled the PID.
 
 
 class VerdictTests(unittest.TestCase):

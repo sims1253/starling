@@ -4,6 +4,7 @@ safety stops, preview/list behavior. CPU-only, no network, no models."""
 
 from __future__ import annotations
 
+import copy
 import fcntl
 import json
 import os
@@ -188,8 +189,17 @@ class CliTests(ToyCampaignTest):
         self.assertEqual(before, after, "preview must mutate nothing")
 
     def test_preview_missing_prereqs_exits_2_without_mutating(self):
-        # parakeet--pixel needs adb + the GGUF: on a bench machine they are
-        # missing (this machine has neither); either way nothing is created.
+        # adb presence varies by machine, so force a prerequisite that cannot
+        # exist anywhere: a GGUF artifact under a nonexistent directory.
+        profile = copy.deepcopy(spec.load_profiles(HERE / "profiles")["parakeet--pixel"])
+        profile["artifacts"] = [
+            dict(a, path="/nonexistent-starling-test/model.gguf")
+            for a in profile.get("artifacts", [])
+        ]
+        profile_dir = self.tmp / "missing-prereq-profiles"
+        profile_dir.mkdir()
+        profile_path = profile_dir / f"{profile['id']}.json"
+        profile_path.write_text(json.dumps(profile), encoding="utf-8")
         out = self.tmp / "never"
         before = sorted(p.name for p in self.tmp.iterdir())
         import contextlib
@@ -201,10 +211,11 @@ class CliTests(ToyCampaignTest):
         with contextlib.redirect_stdout(buf), \
                 mock.patch.dict(os.environ, {"STARLING_CAMPAIGN_LOCK": lock_elsewhere}):
             rc = campaign_mod.main([
-                "preview", "--profile", "parakeet--pixel",
+                "preview", "--profile-file", str(profile_path),
                 "--baseline", "HEAD", "--out", str(out)])
         self.assertEqual(rc, 2)
         self.assertIn("prerequisites missing", buf.getvalue())
+        self.assertIn("artifact gguf missing", buf.getvalue())
         after = sorted(p.name for p in self.tmp.iterdir())
         self.assertEqual(before, after)
 
@@ -216,10 +227,18 @@ class CliTests(ToyCampaignTest):
                                          allowed=None, agent_cmd=None))
         task["baseline_revision"] = "a" * 40
         fake = _FakeProbeNoAdb()
-        problems, _ctx = campaign_mod.preflight(
-            profile, task, Path("."), self.tmp / "x", probe=fake)
+        # adb being installed on THIS machine must not silence the check:
+        # force the pixel tool requirement to fail deterministically.
+        real_which = shutil.which
+
+        def no_adb(cmd, path=None):
+            return None if cmd == "adb" else real_which(cmd, path=path)
+
+        with mock.patch.object(campaign_mod.shutil, "which", no_adb):
+            problems, _ctx = campaign_mod.preflight(
+                profile, task, Path("."), self.tmp / "x", probe=fake)
         joined = "\n".join(problems)
-        self.assertIn("adb", joined)
+        self.assertIn("required tool 'adb' not on PATH", joined)
         self.assertIn("artifact gguf missing", joined)
 
     def test_blocked_profile_refused_by_preview_and_start(self):
@@ -301,8 +320,10 @@ class SealAndTamperTests(ToyCampaignTest):
     def test_evaluator_tamper_stops_run_with_exit_4(self):
         out, _rc = self.start_campaign(run=False, max_attempts=3)
         victim = out / "trusted" / "evaluator" / "input.txt"
-        with self.assertRaises(PermissionError, msg="trusted files are read-only"):
-            victim.write_text("tampered corpus\n", encoding="utf-8")
+        if not (hasattr(os, "geteuid") and os.geteuid() == 0):
+            # root ignores permission bits, so the write succeeds there
+            with self.assertRaises(PermissionError, msg="trusted files are read-only"):
+                victim.write_text("tampered corpus\n", encoding="utf-8")
         victim.chmod(0o644)  # a determined tamperer: still detected by the hash
         victim.write_text("tampered corpus\n", encoding="utf-8")
         rc = campaign_mod.main(["run", "--campaign", str(out)])

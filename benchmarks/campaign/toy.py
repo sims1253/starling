@@ -275,7 +275,7 @@ def toy_profile(repo_dir: Path) -> dict:
                 "max_attempts": 5,
                 "campaign_wall_clock_s": 3600.0,
                 "attempt_wall_clock_s": 600.0,
-                "gate_timeout_s": 120.0,
+                "gate_timeout_s": 900.0,
                 "agent_timeout_s": 120.0,
                 "token_budget": None,
                 "cooldown_max_s": 60.0,
@@ -308,7 +308,10 @@ def toy_task(profile_id: str, baseline: str, agent_command, **overrides) -> dict
             "max_attempts": 5,
             "campaign_wall_clock_s": 3600.0,
             "attempt_wall_clock_s": 600.0,
-            "gate_timeout_s": 120.0,
+            # The toy gates run up to 6 subprocesses at 120 s each internally;
+            # the runner's whole-gate timeout must sit ABOVE that or it kills
+            # first and turns the gates' own exit-3 inconclusive into a timeout.
+            "gate_timeout_s": 900.0,
             "agent_timeout_s": 120.0,
             "token_budget": None,
             "cooldown_max_s": 60.0,

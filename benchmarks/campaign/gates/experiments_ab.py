@@ -145,7 +145,16 @@ def main() -> int:
         print("METRIC verdict=unavailable")
         print("no comparison.json written", file=sys.stderr)
         return 3
-    comparison = json.loads(comparison_path.read_text(encoding="utf-8"))
+    try:
+        comparison = json.loads(comparison_path.read_text(encoding="utf-8"))
+        if not isinstance(comparison, dict):
+            raise ValueError("not a JSON object")
+    except (OSError, ValueError) as e:
+        # A truncated/corrupt comparison must stay inconclusive with a
+        # parseable METRIC line, not die with a raw traceback (exit 1).
+        print("METRIC verdict=unavailable")
+        print(f"comparison.json unreadable: {e}", file=sys.stderr)
+        return 3
     verdict = comparison.get("verdict", "unavailable")
     effect = comparison.get("effect") or {}
     print(f"METRIC verdict={verdict}")

@@ -135,16 +135,16 @@ class PixelProbeTests(unittest.TestCase):
 
     def test_hot_battery_cools_down_and_continues(self):
         clock = FakeClock()
-        # battery reads report hot on the first probe, cool afterwards
-        battery = {"level_pct": 80, "status": 3, "temperature_c": 45.0}
-        probe = ScriptedProbe()
+        reads = {"n": 0}
 
         def cooling_battery():
-            temp = 45.0 if probe._battery_reads <= 1 else 40.0
+            # hot on the first probe, cool afterwards
+            reads["n"] += 1
+            temp = 45.0 if reads["n"] <= 1 else 40.0
             return {"level_pct": 80, "status": 3, "temperature_c": temp}
 
-        probe._battery = cooling_battery
-        result = monitors.wait_cooldown(pixel_profile(), 30, probe_obj=probe,
+        result = monitors.wait_cooldown(pixel_profile(), 30,
+                                        probe_obj=ScriptedProbe(battery=cooling_battery),
                                         sleep=clock.sleep, monotonic=clock.monotonic)
         self.assertEqual(result.status, "ok")
 

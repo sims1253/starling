@@ -313,7 +313,9 @@ def run_child(
         try:
             pid, status, ru = os.wait4(proc.pid, os.WNOHANG)
         except ChildProcessError:
-            pid, status, ru = proc.pid, 0, None
+            # Unreapable child: the true exit status is UNKNOWN — never
+            # fabricate a status (a wrong 0 would be a silent pass).
+            pid, status, ru = proc.pid, None, None
         if pid == proc.pid:
             break
         now = time.monotonic()
@@ -329,7 +331,9 @@ def run_child(
         elif grace_deadline is not None and now >= grace_deadline:
             _signal_pg(proc.pid, signal.SIGKILL)
         time.sleep(0.02)
-    proc.returncode = os.waitstatus_to_exitcode(status)  # reaped by wait4 above
+    # status None = never reaped (ChildProcessError above): leave exit_code
+    # None so the caller records inconclusive, not success.
+    proc.returncode = os.waitstatus_to_exitcode(status) if status is not None else None
     return {
         "exit_code": proc.returncode,
         "wall_s": time.monotonic() - start,
@@ -415,6 +419,9 @@ def run_gate(
     if result["timed_out"]:
         record["verdict"] = "fail"
         record["rule_details"] = [f"gate timed out after {timeout:.0f}s (process group killed)"]
+    elif result["exit_code"] is None:
+        record["verdict"] = "inconclusive"
+        record["rule_details"] = ["child exit status unknown (never reaped)"]
     elif result["exit_code"] == 3:
         record["verdict"] = "inconclusive"
         record["rule_details"] = ["exit code 3: ran but cannot decide"]

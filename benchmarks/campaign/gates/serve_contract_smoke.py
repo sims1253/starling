@@ -32,6 +32,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -97,8 +98,7 @@ def post_wav(base: str, wav: Path, model: str,
         with urllib.request.urlopen(req, timeout=timeout_s) as r:
             payload = json.loads(r.read())
             ms = (time.monotonic() - t0) * 1000
-            if r.status != 200:
-                return ms, f"HTTP {r.status}", None
+            # non-2xx arrives as HTTPError below; a 2xx response is open here
             if not isinstance(payload.get("text"), str):
                 return ms, "response JSON has no string 'text' field", None
             return ms, None, payload["text"]
@@ -192,6 +192,10 @@ def main() -> int:
             print("METRIC contract_ok=unavailable")
             print(f"binary missing: {b}", file=sys.stderr)
             return 3
+    # Gate-owned artifacts (generated wav, server logs) go to a scratch dir —
+    # never into the candidate's build tree, which must stay hashable and may
+    # be read-only.
+    scratch = Path(tempfile.mkdtemp(prefix="starling-smoke-"))
     if args.wav:
         wavs = [Path(w) for w in args.wav]
         missing = [str(w) for w in wavs if not w.is_file()]
@@ -200,17 +204,16 @@ def main() -> int:
             print(f"input wav(s) missing: {', '.join(missing)}", file=sys.stderr)
             return 3
     else:
-        wav = binary.parent / "smoke-input.wav"
-        if not wav.exists():
-            make_wav(wav)
+        wav = scratch / "smoke-input.wav"
+        make_wav(wav)
         wavs = [wav]
 
     try:
         expected = None
         if baseline is not None:
             expected, _ = transcribe_all(baseline, args, wavs,
-                                         binary.parent / "serve-baseline.log")
-        texts, times = transcribe_all(binary, args, wavs, binary.parent / "serve.log")
+                                         scratch / "serve-baseline.log")
+        texts, times = transcribe_all(binary, args, wavs, scratch / "serve.log")
     except Unavailable as e:
         print("METRIC contract_ok=unavailable")
         print(f"cannot decide: {e}", file=sys.stderr)

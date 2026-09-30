@@ -322,7 +322,7 @@ def validate_profile(profile: Any) -> list[str]:
     gate_names = {g.get("name") for g in gates if isinstance(g, dict)} if isinstance(gates, list) else set()
     if not isinstance(objectives, list) or (not objectives and status != "blocked"):
         problems.append("objectives must be a non-empty list"
-                        + ("" if status == "blocked" else ""))
+                        + (" (blocked profiles are exempt)" if status == "blocked" else ""))
     else:
         for i, o in enumerate(objectives):
             if not isinstance(o, dict):
