@@ -46,7 +46,7 @@ jobs:
           node-version: 24
           cache: true
           run-install: true
-      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7
       - name: Fail on pnpm lockfile drift
         # E16 gate: a manifest edit without a regenerated pnpm-lock.yaml
         # fails here (ERR_PNPM_OUTDATED_LOCKFILE) instead of re-resolving.
