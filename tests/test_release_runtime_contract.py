@@ -104,24 +104,28 @@ def test_missing_separator_in_bundled_engine_statement_fails():
         workflow, prepare, release_runtime.replace(listed, unseparated))
 
 
+@pytest.mark.parametrize("var", sorted(contract.VULKAN_SDK_PINS))
 @pytest.mark.parametrize("path", [contract.DESKTOP_WORKFLOW, contract.WORKFLOW])
-def test_rejects_vulkan_sdk_pin_drift(path):
-    # Bump one workflow's install-vulkan-sdk version: the other workflow's
-    # pin no longer agrees, so the check must fail.
+def test_rejects_vulkan_sdk_pin_drift(path, var):
+    # Change one workflow's pin: the other workflow's pin no longer agrees,
+    # so the check must fail.
     desktop_workflow, _, _ = engine_inputs()
     workflow, _, _ = inputs()
-    sdk = re.search(r"install-vulkan-sdk@\S+[^\n]*\n(?:[^\n]*\n){0,5}?\s*version:\s*['\"]?(\d+(?:\.\d+)+)",
-                    desktop_workflow).group(1)
-    bad = f"{int(sdk.split('.')[0]) + 1}.0.0.0"
+    bad = {"VULKAN_SDK_VERSION": "9.9.9.9", "VULKAN_SDK_SHA256": "0" * 64}[var]
     text = {contract.DESKTOP_WORKFLOW: desktop_workflow, contract.WORKFLOW: workflow}[path]
-    changed, count = re.subn(
-        r"(install-vulkan-sdk@\S+[^\n]*\n(?:[^\n]*\n){0,5}?\s*version:\s*['\"]?)\d+(?:\.\d+)+",
-        r"\g<1>" + bad, text, count=1)
+    changed, count = re.subn(rf"(^\s+{var}:\s*)\S+", rf"\g<1>{bad}", text, count=1, flags=re.M)
     assert count == 1
     if path == contract.DESKTOP_WORKFLOW:
         desktop_workflow = changed
     else:
         workflow = changed
+    assert any(var in error for error in contract.vulkan_sdk_errors(desktop_workflow, workflow))
+
+
+def test_rejects_humbletim_vulkan_action():
+    desktop_workflow, _, _ = engine_inputs()
+    workflow, _, _ = inputs()
+    desktop_workflow += "\n      - uses: humbletim/install-vulkan-sdk@v1.2\n"
     assert contract.vulkan_sdk_errors(desktop_workflow, workflow)
 
 

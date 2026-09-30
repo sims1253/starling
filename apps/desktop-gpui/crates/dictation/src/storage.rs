@@ -123,14 +123,18 @@ impl BackendLabel {
     /// Parse a stored label; `None` for anything that matches neither
     /// shape (older attempt rows keep their verbatim text at the reader).
     pub fn parse(label: &str) -> Option<Self> {
+        // An empty model is a degenerate label: keep it verbatim too.
         if let Some(model_id) = label.strip_prefix("engine:") {
-            Some(Self::Engine {
+            (!model_id.is_empty()).then(|| Self::Engine {
                 model_id: model_id.to_string(),
             })
         } else {
-            label.strip_prefix("openai:").map(|model| Self::OpenAi {
-                model: model.to_string(),
-            })
+            label
+                .strip_prefix("openai:")
+                .filter(|model| !model.is_empty())
+                .map(|model| Self::OpenAi {
+                    model: model.to_string(),
+                })
         }
     }
 }
@@ -270,5 +274,7 @@ mod tests {
         assert_eq!(BackendLabel::parse(""), None);
         assert_eq!(BackendLabel::parse("engine"), None);
         assert_eq!(BackendLabel::parse("openai"), None);
+        assert_eq!(BackendLabel::parse("engine:"), None);
+        assert_eq!(BackendLabel::parse("openai:"), None);
     }
 }

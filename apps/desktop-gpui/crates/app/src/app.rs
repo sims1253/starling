@@ -1365,10 +1365,16 @@ impl StarlingApp {
         cx.notify();
     }
 
-    /// Clear a Failed/crash-loop state and retry the last model.
+    /// Clear a Failed/crash-loop state and retry the last model. With no
+    /// manager at all (the startup failure in `engine_startup_error`),
+    /// retry starting one — the failure UI offers Retry for that too.
     pub fn engine_retry(&mut self, cx: &mut Context<Self>) {
-        if let Some(engine) = &self.engine {
-            engine.retry();
+        match &self.engine {
+            Some(engine) => engine.retry(),
+            None if self.engine_settings.mode == EngineMode::Builtin => {
+                self.apply_engine_mode_change(cx);
+            }
+            None => {}
         }
         cx.notify();
     }

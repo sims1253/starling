@@ -47,6 +47,12 @@ jobs:
       # packaging scripts below (the step conditions above use the typed
       # inputs.bundle-engines form).
       BUNDLE_ENGINES: ${{ inputs.bundle-engines }}
+      # The Windows Vulkan loader comes from this SDK. Keep both pins in sync
+      # with release-starling-serve.yml's windows-vulkan job (checked by
+      # check-contract.py), so the bundle is validated against the SDK the
+      # release built with.
+      VULKAN_SDK_VERSION: 1.4.357.0
+      VULKAN_SDK_SHA256: 81F474711E9042F4CD22B31B2F7A8870DB2E428B21586FB43DD80150BE97310D
     defaults:
       run:
         shell: bash
@@ -109,22 +115,51 @@ jobs:
         with:
           name: starling-serve-${{ matrix.platform }}-cpu
           path: engines-artifacts
+      - name: Restore Vulkan SDK installer cache (Windows)
+        if: inputs.bundle-engines && matrix.platform == 'windows'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}\VulkanSDK-Installer.exe
+          key: vulkan-sdk-installer-windows-${{ env.VULKAN_SDK_VERSION }}-${{ env.VULKAN_SDK_SHA256 }}
       - name: Install the Vulkan loader (Windows)
         # The Windows Vulkan engine links vulkan-1.dll, which the hosted
-        # runner lacks; the assembly step runs its --version. Same pinned
-        # action and SDK as release-starling-serve.yml.
+        # runner lacks; the assembly step runs its --version. Installed the
+        # same way as release-starling-serve.yml's windows-vulkan job (the
+        # humbletim action cannot unpack SDK installers >= 1.4.313.0).
         if: inputs.bundle-engines && matrix.platform == 'windows'
-        uses: humbletim/install-vulkan-sdk@30ba978f977e81b72d091fc8888feb1fb26f9aff # v1.2
-        with:
-          version: 1.4.357.0 # keep in sync with release-starling-serve.yml (checked by check-contract.py)
-          cache: true
+        shell: pwsh
+        run: |
+          $installer = "$env:RUNNER_TEMP\VulkanSDK-Installer.exe"
+          if (-not (Test-Path "$installer")) {
+            curl.exe --fail --retry 3 --retry-all-errors --retry-delay 10 -o "$installer" -L `
+              "https://sdk.lunarg.com/sdk/download/${env:VULKAN_SDK_VERSION}/windows/vulkansdk-windows-X64-${env:VULKAN_SDK_VERSION}.exe"
+            if ($LASTEXITCODE -ne 0) {
+              Remove-Item "$installer" -ErrorAction SilentlyContinue
+              throw "Vulkan SDK download failed (exit $LASTEXITCODE)"
+            }
+          }
+          $actual = (Get-FileHash "$installer" -Algorithm SHA256).Hash
+          if ($actual -ine $env:VULKAN_SDK_SHA256) { throw "Vulkan SDK checksum mismatch: $actual" }
+          & "$installer" --accept-licenses --default-answer --confirm-command install
+          if ($LASTEXITCODE -ne 0) { throw "Vulkan SDK install failed (exit $LASTEXITCODE)" }
+          $sdk = "C:\VulkanSDK\${env:VULKAN_SDK_VERSION}"
+          Add-Content $env:GITHUB_PATH "$sdk\bin"
+          # The engine needs the loader itself, not the headers: fail here,
+          # not in the assembly step, if the install did not provide it.
+          $loaders = @("$env:SystemRoot\System32\vulkan-1.dll", "$sdk\Bin\vulkan-1.dll") |
+            Where-Object { Test-Path $_ }
+          if (-not $loaders) { throw "Vulkan SDK install provided no vulkan-1.dll" }
+          $loaders
       - name: Check the bundled-engine contract
         # The same check release-starling-serve.yml's runtime-contract job
         # runs at the start of a release: this workflow also mutates the
         # bundled-engine list, so it verifies the agreement itself. Stdlib
         # Python only; it needs nothing but the checkout.
         if: inputs.bundle-engines
-        run: python3 scripts/release-runtime/check-contract.py
+        run: |
+          python=python3
+          command -v python3 >/dev/null 2>&1 || python=python
+          "$python" scripts/release-runtime/check-contract.py
       - name: Assemble the bundled engines
         if: inputs.bundle-engines
         env:

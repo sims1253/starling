@@ -199,9 +199,25 @@ impl Settings {
         } else {
             EngineMode::Manual
         };
+        // The fallback also keeps whichever engine fields are still
+        // readable: forgetting the served model would re-download it, the
+        // same silent state change the safe mode above avoids.
+        let engine_field = |key: &str| {
+            value
+                .get("engine")
+                .and_then(|engine| engine.get(key))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        };
+        let (active_model, backend_override) =
+            (engine_field("activeModel"), engine_field("backendOverride"));
         let Ok(mut settings) = serde_json::from_value::<Settings>(value) else {
             let mut fallback = Self::default_settings();
-            fallback.engine.mode = safe_mode;
+            fallback.engine = EngineSettings {
+                mode: safe_mode,
+                active_model,
+                backend_override,
+            };
             return fallback;
         };
         if legacy_file {
@@ -288,7 +304,20 @@ fn sweep_stale_tmp_siblings(path: &Path) {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name = name.as_encoded_bytes();
-        if !name.starts_with(prefix) || !name.ends_with(b".tmp") {
+        // Only the exact `<name>.<pid>.<seq>.tmp` shape write_atomic
+        // stages; anything else (say a backup tool's `<name>.bak.tmp`) is
+        // not ours to delete.
+        let Some(middle) = name
+            .strip_prefix(prefix)
+            .and_then(|rest| rest.strip_suffix(b".tmp"))
+        else {
+            continue;
+        };
+        let mut parts = middle.split(|&b| b == b'.');
+        let staged = parts.next().is_some_and(is_ascii_number)
+            && parts.next().is_some_and(is_ascii_number)
+            && parts.next().is_none();
+        if !staged {
             continue;
         }
         let orphaned = entry
@@ -301,6 +330,10 @@ fn sweep_stale_tmp_siblings(path: &Path) {
             let _ = std::fs::remove_file(entry.path());
         }
     }
+}
+
+fn is_ascii_number(bytes: &[u8]) -> bool {
+    !bytes.is_empty() && bytes.iter().all(u8::is_ascii_digit)
 }
 
 #[cfg(test)]
@@ -445,6 +478,25 @@ mod tests {
             // The rest of the fallback is the documented default shape.
             assert_eq!(settings.model, "parakeet");
         }
+    }
+
+    #[test]
+    fn an_unreadable_file_keeps_its_readable_engine_fields() {
+        // #366: a typed-deserialization failure elsewhere in the file must
+        // not make the engine forget which model it serves or the CPU pin.
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"endpoint":42,"model":"parakeet","expectedTerms":["auth"],"engine":{"mode":"builtin","activeModel":"parakeet-tdt-0.6b-v3","backendOverride":"cpu"}}"#,
+        )
+        .expect("write unreadable settings");
+
+        let settings = Settings::load(&path);
+
+        assert_eq!(settings.engine.mode, EngineMode::Builtin);
+        assert_eq!(settings.engine.active_model.as_deref(), Some("parakeet-tdt-0.6b-v3"));
+        assert_eq!(settings.engine.backend_override.as_deref(), Some("cpu"));
     }
 
     #[test]
@@ -637,12 +689,21 @@ mod tests {
         std::fs::write(&fresh, b"partial").expect("write fresh temp");
         let unrelated = temp.path().join("other.json.1.1.tmp");
         std::fs::write(&unrelated, b"partial").expect("write unrelated");
+        let foreign = temp.path().join("settings.json.backup.tmp");
+        std::fs::write(&foreign, b"backup").expect("write foreign temp");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&foreign)
+            .expect("open foreign temp")
+            .set_modified(old)
+            .expect("age the foreign temp");
 
         write_atomic(&path, b"{}").expect("write settings");
 
         assert!(!orphan.exists(), "the aged orphan is swept");
         assert!(fresh.exists(), "a fresh temp may be a live writer's");
         assert!(unrelated.exists(), "other files' temps are not ours");
+        assert!(foreign.exists(), "only the <pid>.<seq> staging shape is ours");
         assert_eq!(std::fs::read(&path).expect("read settings"), b"{}");
     }
 

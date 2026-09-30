@@ -12,13 +12,14 @@ DOCKERFILE = "scripts/release-runtime/Dockerfile.cuda"
 DESKTOP_WORKFLOW = ".github/workflows/package-desktop.yml"
 PREPARE = "scripts/experimental-release/prepare.py"
 ENGINE_SECTION = "## Desktop bundled engines"
-# The humbletim/install-vulkan-sdk version pin, with the `version:` input a
-# bounded number of lines below the `uses:` line (the `with:` block sits
-# between them in both workflows).
-VULKAN_SDK_PATTERN = re.compile(
-    r"uses:\s*humbletim/install-vulkan-sdk@\S+[^\n]*\n"
-    r"(?:[^\n]*\n){0,5}?"
-    r"\s*version:\s*['\"]?(\d+(?:\.\d+)+)['\"]?")
+# The Windows Vulkan SDK installer pins: the version and the installer's
+# SHA-256, each set once as an env var in both workflows that install it.
+VULKAN_SDK_PINS = {
+    "VULKAN_SDK_VERSION": re.compile(
+        r"^\s+VULKAN_SDK_VERSION:\s*['\"]?(\d+(?:\.\d+)+)['\"]?\s*$", re.M),
+    "VULKAN_SDK_SHA256": re.compile(
+        r"^\s+VULKAN_SDK_SHA256:\s*['\"]?([0-9A-Fa-f]{64})['\"]?\s*$", re.M),
+}
 
 
 def bundled_engines_errors(desktop_workflow: str, prepare: str,
@@ -106,7 +107,7 @@ def bundled_engines_errors(desktop_workflow: str, prepare: str,
 
 def vulkan_sdk_errors(desktop_workflow: str, release_workflow: str) -> list[str]:
     """Both workflows that install the Windows Vulkan SDK must pin one and
-    the same humbletim/install-vulkan-sdk version.
+    the same installer (VULKAN_SDK_VERSION and VULKAN_SDK_SHA256).
 
     Sources: the desktop packager's Vulkan loader install (its assembly step
     runs the Vulkan engine's --version, which needs vulkan-1.dll) and the
@@ -114,21 +115,23 @@ def vulkan_sdk_errors(desktop_workflow: str, release_workflow: str) -> list[str]
     the desktop bundle be validated against an SDK the release never used.
     """
     errors = []
-    versions = {}
     for name, text in ((DESKTOP_WORKFLOW, desktop_workflow), (WORKFLOW, release_workflow)):
-        found = VULKAN_SDK_PATTERN.findall(text)
-        if len(found) != 1:
+        if "humbletim/install-vulkan-sdk" in re.sub(r"#[^\n]*", "", text):
             errors.append(
-                f"{name}: expected exactly one humbletim/install-vulkan-sdk "
-                "step with a `version: <d.d.d.d>` input")
-        else:
-            versions[name] = found[0]
-    if len(versions) == 2 and len(set(versions.values())) != 1:
-        errors.append(
-            "install-vulkan-sdk versions disagree (keep the two workflows "
-            "in sync): "
-            + "; ".join(f"{name} pins {version}"
-                        for name, version in versions.items()))
+                f"{name}: humbletim/install-vulkan-sdk cannot unpack SDK "
+                "installers >= 1.4.313.0; run the pinned official installer")
+    for var, pattern in VULKAN_SDK_PINS.items():
+        pins = {}
+        for name, text in ((DESKTOP_WORKFLOW, desktop_workflow), (WORKFLOW, release_workflow)):
+            found = pattern.findall(text)
+            if len(found) != 1:
+                errors.append(f"{name}: expected exactly one {var} env pin")
+            else:
+                pins[name] = found[0].upper()
+        if len(pins) == 2 and len(set(pins.values())) != 1:
+            errors.append(
+                f"{var} pins disagree (keep the two workflows in sync): "
+                + "; ".join(f"{name} pins {pin}" for name, pin in pins.items()))
     return errors
 
 
