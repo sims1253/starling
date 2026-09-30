@@ -1,0 +1,215 @@
+{
+  "artifacts": [
+    {
+      "name": "gguf",
+      "path": "${STARLING_MODELS_DIR}/ark-asr-0.6b-q8_0.gguf",
+      "sha256": null
+    },
+    {
+      "name": "fixture-short",
+      "path": "${STARLING_FIXTURES_DIR}/short.wav",
+      "sha256": null
+    },
+    {
+      "name": "fixture-medium",
+      "path": "${STARLING_FIXTURES_DIR}/medium.wav",
+      "sha256": null
+    },
+    {
+      "name": "fixture-long",
+      "path": "${STARLING_FIXTURES_DIR}/long.wav",
+      "sha256": null
+    }
+  ],
+  "backend": "cpu",
+  "build": {
+    "artifacts_out": [
+      "build-campaign/starling-serve"
+    ],
+    "shell": "cmake -B build-campaign -DSTARLING_SERVE=ON -DBUILD_SHARED_LIBS=OFF -DGGML_NATIVE=OFF -DGGML_LLAMAFILE=OFF && cmake --build build-campaign --parallel ${STARLING_CAMPAIGN_BUILD_JOBS:-4} --target starling-serve"
+  },
+  "defaults": {
+    "allowed_paths": [
+      "cpp/ark/**",
+      "cpp/lib/**"
+    ],
+    "budgets": {
+      "agent_timeout_s": 1800.0,
+      "attempt_wall_clock_s": 3600.0,
+      "campaign_wall_clock_s": 28800.0,
+      "cooldown_max_s": 900.0,
+      "gate_timeout_s": 1800.0,
+      "max_attempts": 6,
+      "token_budget": null
+    }
+  },
+  "device": "notebook",
+  "device_expect": "Ryzen 5 PRO 5650U",
+  "engine": "ggml",
+  "gates": [
+    {
+      "argv": [
+        "{python}",
+        "{trusted}/benchmarks/campaign/gates/serve_contract_smoke.py",
+        "--binary",
+        "{candidate}/build-campaign/starling-serve",
+        "--baseline-binary",
+        "{baseline}/build-campaign/starling-serve",
+        "--model",
+        "ark06",
+        "--gguf",
+        "${STARLING_MODELS_DIR}/ark-asr-0.6b-q8_0.gguf",
+        "--wav",
+        "${STARLING_FIXTURES_DIR}/short.wav",
+        "--wav",
+        "${STARLING_FIXTURES_DIR}/medium.wav",
+        "--wav",
+        "${STARLING_FIXTURES_DIR}/long.wav"
+      ],
+      "name": "serve-contract",
+      "required": true,
+      "rules": [
+        {
+          "metric": "contract_ok",
+          "op": "==",
+          "value": 1
+        },
+        {
+          "metric": "transcripts_match",
+          "op": "==",
+          "value": 1
+        }
+      ],
+      "stage": "correctness",
+      "timeout_s": 900.0
+    },
+    {
+      "argv": [
+        "{python}",
+        "{trusted}/benchmarks/campaign/gates/experiments_ab.py",
+        "--base-bin",
+        "{best}/build-campaign/starling-serve",
+        "--cand-bin",
+        "{candidate}/build-campaign/starling-serve",
+        "--run-dir",
+        "{attempt_dir}/experiment",
+        "--model",
+        "ark06",
+        "--gguf",
+        "${STARLING_MODELS_DIR}/ark-asr-0.6b-q8_0.gguf",
+        "--wav",
+        "${STARLING_FIXTURES_DIR}/short.wav",
+        "--wav",
+        "${STARLING_FIXTURES_DIR}/medium.wav",
+        "--wav",
+        "${STARLING_FIXTURES_DIR}/long.wav"
+      ],
+      "name": "perf",
+      "objective": true,
+      "required": true,
+      "rules": [
+        {
+          "metric": "verdict",
+          "op": "==",
+          "value": "pass"
+        }
+      ],
+      "stage": "perf",
+      "timeout_s": 1800.0
+    }
+  ],
+  "heldout": {
+    "description": "FLEURS held-out slice (default corpus + languages beyond the 100-clip English smoke set); used ONLY by finalize, never per attempt",
+    "env": "STARLING_HELDOUT_DIR",
+    "sha256": null
+  },
+  "id": "ark06--notebook",
+  "model": {
+    "hf_id": "Audio8/ARK-ASR-0.6B",
+    "name": "ARK-ASR-0.6B"
+  },
+  "objectives": [
+    {
+      "direction": "higher",
+      "gate": "serve-contract",
+      "metric": "contract_ok",
+      "min_improvement": 0.0,
+      "name": "quality"
+    },
+    {
+      "direction": "higher",
+      "gate": "perf",
+      "metric": "verdict",
+      "min_improvement": 0.0,
+      "name": "end-to-end latency"
+    }
+  ],
+  "quality_policy": {
+    "notes": "same-model kernel changes: transcripts must match the baseline exactly. Quant-change campaigns switch to quant_wer_gate: +0.2 absolute WER points per language unless stricter, and no promotion from the 100-clip English smoke set alone.",
+    "policy": "exact_numerical_contract"
+  },
+  "readiness_notes": "ggml engine; parity pending GPU verification",
+  "schema": "starling-campaign-profile/1",
+  "slug": "ark06",
+  "status": "ready",
+  "thresholds": {
+    "max_temp_c": 85.0,
+    "min_mem_available_mb": 2048.0
+  },
+  "tracking_issue": "#354",
+  "workloads": [
+    {
+      "description": "tests/fixtures short/medium/long clips through the bench gate",
+      "id": "clips-short-medium-long",
+      "status": "available"
+    },
+    {
+      "description": "warm dictation session",
+      "id": "warm-dictation",
+      "owner_issue": "#226",
+      "status": "unavailable"
+    },
+    {
+      "description": "5-10 minute paced sessions",
+      "id": "session-5-10min",
+      "owner_issue": "#226",
+      "status": "unavailable"
+    },
+    {
+      "description": "model preload before speech starts",
+      "id": "preload-before-speech",
+      "owner_issue": "#229",
+      "status": "unavailable"
+    },
+    {
+      "description": "speech arriving while the model loads",
+      "id": "speech-during-load",
+      "owner_issue": "#229",
+      "status": "unavailable"
+    },
+    {
+      "description": "activation-to-capture latency",
+      "id": "activation-to-capture",
+      "owner_issue": "#310",
+      "status": "unavailable"
+    },
+    {
+      "description": "first partial transcript delay",
+      "id": "first-partial",
+      "owner_issue": "#310",
+      "status": "unavailable"
+    },
+    {
+      "description": "catch-up of accumulated audio backlog",
+      "id": "catch-up-backlog",
+      "owner_issue": "#310",
+      "status": "unavailable"
+    },
+    {
+      "description": "stop-to-final latency; sustained backlog must not drop audio",
+      "id": "stop-to-final",
+      "owner_issue": "#310",
+      "status": "unavailable"
+    }
+  ]
+}

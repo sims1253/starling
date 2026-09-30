@@ -1,0 +1,109 @@
+{
+  "artifacts": [],
+  "backend": "cpu",
+  "blocked_on": "native-port",
+  "blocked_reason": "Python-only port (CUDA graphs); no native ggml port",
+  "build": {
+    "artifacts_out": [
+      "build-campaign/starling-serve"
+    ],
+    "shell": "cmake -B build-campaign -DSTARLING_SERVE=ON -DBUILD_SHARED_LIBS=OFF -DGGML_NATIVE=OFF -DGGML_LLAMAFILE=OFF && cmake --build build-campaign --parallel ${STARLING_CAMPAIGN_BUILD_JOBS:-4} --target starling-serve"
+  },
+  "defaults": {
+    "allowed_paths": [
+      "cpp/parakeet/**"
+    ],
+    "budgets": {
+      "agent_timeout_s": 1800.0,
+      "attempt_wall_clock_s": 3600.0,
+      "campaign_wall_clock_s": 28800.0,
+      "cooldown_max_s": 900.0,
+      "gate_timeout_s": 1800.0,
+      "max_attempts": 6,
+      "token_budget": null
+    }
+  },
+  "device": "notebook",
+  "device_expect": "Ryzen 5 PRO 5650U",
+  "engine": "ggml",
+  "gates": [],
+  "heldout": {
+    "description": "FLEURS held-out slice (default corpus + languages beyond the 100-clip English smoke set); used ONLY by finalize, never per attempt",
+    "env": "STARLING_HELDOUT_DIR",
+    "sha256": null
+  },
+  "id": "parakeet-unified--notebook",
+  "model": {
+    "hf_id": "nvidia/parakeet-unified-en-0.6b",
+    "name": "Parakeet Unified EN 0.6B"
+  },
+  "objectives": [],
+  "quality_policy": {
+    "notes": "same-model kernel changes: transcripts must match the baseline exactly. Quant-change campaigns switch to quant_wer_gate: +0.2 absolute WER points per language unless stricter, and no promotion from the 100-clip English smoke set alone.",
+    "policy": "exact_numerical_contract"
+  },
+  "readiness_notes": "blocked until the native port (#358) lands",
+  "schema": "starling-campaign-profile/1",
+  "slug": null,
+  "status": "blocked",
+  "thresholds": {
+    "max_temp_c": 85.0,
+    "min_mem_available_mb": 2048.0
+  },
+  "tracking_issue": "#358",
+  "workloads": [
+    {
+      "description": "tests/fixtures short/medium/long clips through the bench gate",
+      "id": "clips-short-medium-long",
+      "status": "available"
+    },
+    {
+      "description": "warm dictation session",
+      "id": "warm-dictation",
+      "owner_issue": "#226",
+      "status": "unavailable"
+    },
+    {
+      "description": "5-10 minute paced sessions",
+      "id": "session-5-10min",
+      "owner_issue": "#226",
+      "status": "unavailable"
+    },
+    {
+      "description": "model preload before speech starts",
+      "id": "preload-before-speech",
+      "owner_issue": "#229",
+      "status": "unavailable"
+    },
+    {
+      "description": "speech arriving while the model loads",
+      "id": "speech-during-load",
+      "owner_issue": "#229",
+      "status": "unavailable"
+    },
+    {
+      "description": "activation-to-capture latency",
+      "id": "activation-to-capture",
+      "owner_issue": "#310",
+      "status": "unavailable"
+    },
+    {
+      "description": "first partial transcript delay",
+      "id": "first-partial",
+      "owner_issue": "#310",
+      "status": "unavailable"
+    },
+    {
+      "description": "catch-up of accumulated audio backlog",
+      "id": "catch-up-backlog",
+      "owner_issue": "#310",
+      "status": "unavailable"
+    },
+    {
+      "description": "stop-to-final latency; sustained backlog must not drop audio",
+      "id": "stop-to-final",
+      "owner_issue": "#310",
+      "status": "unavailable"
+    }
+  ]
+}

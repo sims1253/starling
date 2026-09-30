@@ -1,5 +1,9 @@
 # Autoresearch brief: make the fast engines fast on the Pixel 10 Pro
 
+For the bounded, audited version of this loop (sealed gates, per-attempt
+authority checks, automatic keep/revert, safety monitors), use the campaign
+runner: `benchmarks/campaign/` (issue #176).
+
 You are an autonomous performance engineer. Your job is to make Starling's
 model-specialized Vulkan engines (`cpp/fast/`, PR #287, branch
 `feat/fast-vulkan-engines`) as fast and power-efficient as possible **on a

@@ -180,6 +180,19 @@ def check(workflow: str, docs: dict[str, str], executing_cuda_version: str | Non
                     f"matching CUDA {series}"
                 )
 
+        # The linux-cuda runner (workflow env) and this image both install the
+        # userspace driver library by name so the binary's libcuda.so.1
+        # resolves on GPU-less machines. Driver branches do not follow CUDA
+        # versions, so the two pins cannot be derived — they must simply agree.
+        workflow_driver = re.findall(r"^  CUDA_DRIVER_PACKAGE: (libnvidia-compute-\d+)", workflow, re.M)
+        dockerfile_driver = re.findall(r"(libnvidia-compute-\d+)", dockerfile)
+        if len(workflow_driver) != 1 or dockerfile_driver != workflow_driver:
+            errors.append(
+                f"{WORKFLOW}: CUDA_DRIVER_PACKAGE must be pinned exactly once and "
+                f"match {DOCKERFILE}'s libnvidia-compute install; "
+                f"workflow={workflow_driver} dockerfile={dockerfile_driver}"
+            )
+
     # The ROCm release is an exact versioned apt repository, not a series:
     # the install URL is the single source of truth and the docs restate it.
     rocm_pins = re.findall(r"rocm/apt/(\d+\.\d+(?:\.\d+)?)", workflow)
