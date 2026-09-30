@@ -33,10 +33,9 @@ class ScriptedProbe(monitors.Probe):
     def __init__(self, *, adb_ok=True, battery=None, severity="NONE",
                  marker=False, meminfo=MEMINFO_OK, thermal_zones=None,
                  cpu="Fake CPU 5650U"):
-        self.calls = {"shell": [], "read": {}}
+        self.calls = {"shell": []}
         self._adb_ok = adb_ok
         self._battery = battery or {"level_pct": 80, "status": 3, "temperature_c": 35.0}
-        self._battery_reads = 0
         self._severity = severity
         self._marker = marker
         self._meminfo = meminfo
@@ -65,7 +64,6 @@ class ScriptedProbe(monitors.Probe):
             if shell_cmd.startswith("getprop"):
                 return 0, "Fake Pixel 10 Pro\n"
             if shell_cmd == "dumpsys battery":
-                self._battery_reads += 1
                 b = self._battery() if callable(self._battery) else self._battery
                 return 0, (f"  level: {b['level_pct']}\n  status: {b['status']}\n"
                            f"  temperature: {int(b['temperature_c'] * 10)}\n")

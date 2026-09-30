@@ -17,6 +17,22 @@ sys.path.insert(0, str(HERE))
 import gates as gates_mod  # noqa: E402
 
 
+def _child_gone(pid: int) -> bool:
+    """True when the pid is dead OR a zombie. On hosts whose PID 1 does not
+    reap adopted orphans (some containers), a killed grandchild stays in
+    state Z forever — os.kill(pid, 0) alone would never confirm its death."""
+    try:
+        os.kill(pid, 0)
+    except (ProcessLookupError, PermissionError):
+        return True
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as fh:
+            state = fh.read().rsplit(")", 1)[1].split()[0]
+        return state == "Z"
+    except (OSError, IndexError):
+        return True
+
+
 class ParseOutputTests(unittest.TestCase):
     def test_numbers_and_strings(self):
         metrics, div = gates_mod.parse_output(
@@ -201,13 +217,8 @@ class RunGateTests(unittest.TestCase):
             deadline = time.monotonic() + 10
             gone = False
             while time.monotonic() < deadline:
-                try:
-                    os.kill(pid, 0)
-                except ProcessLookupError:
+                if _child_gone(pid):
                     gone = True
-                    break
-                except PermissionError:
-                    gone = True  # reaped and recycled by another user: not ours anymore
                     break
                 time.sleep(0.05)
             self.assertTrue(gone, "grandchild survived the gate timeout")

@@ -170,7 +170,12 @@ def campaign_locks(profile: dict | None = None, wait: bool = False):
             if profile and profile.get("device") == "pixel":
                 serial = profile.get("adb_serial") or "default"
                 path = Path(tempfile.gettempdir()) / f"starling-campaign-adb-{serial}.lock"
-                fds.append(_flock(path, wait))
+                try:
+                    fds.append(_flock(path, wait))
+                except BaseException:
+                    for fd in fds:  # never leak the host-wide lock on contention
+                        _release(fd)
+                    raise
             yield
         finally:
             for fd in fds:
@@ -192,9 +197,12 @@ EVALUATOR_COMMIT_ARGS = (
 
 
 def git(repo: Path, *args: str, check: bool = True, timeout: int = 300) -> subprocess.CompletedProcess:
-    out = subprocess.run(
-        ["git", "-C", str(repo), *args], capture_output=True, text=True, timeout=timeout
-    )
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(repo), *args], capture_output=True, text=True, timeout=timeout
+        )
+    except subprocess.TimeoutExpired as e:
+        raise CampaignError(f"git {' '.join(args)} timed out after {timeout}s in {repo}") from e
     if check and out.returncode != 0:
         raise CampaignError(f"git {' '.join(args)} failed: {out.stderr.strip()}")
     return out
@@ -227,6 +235,8 @@ def _required_tools(profile: dict) -> list[str]:
     text = " ".join(build.get("argv") or []) + " " + (build.get("shell") or "")
     if "cmake" in text:
         tools.append("cmake")
+        if "-G Ninja" in text:
+            tools.append("ninja")
     if profile.get("device") == "pixel":
         tools.append("adb")
     tools.extend(profile.get("requires_tools") or [])
@@ -506,12 +516,14 @@ class Campaign:
     def campaign_deadline(self) -> float:
         started = self.campaign.get("started_at")
         budget = self.task["budgets"].get("campaign_wall_clock_s", 1e12)
+        # Wall clock on every path: remaining_campaign_s() subtracts
+        # time.time(); a monotonic fallback would look instantly expired.
         if not started:
-            return time.monotonic() + budget
+            return time.time() + budget
         try:
             t0 = _dt.datetime.fromisoformat(str(started)).timestamp()
         except ValueError:
-            return time.monotonic() + budget
+            return time.time() + budget
         return t0 + float(budget)
 
     def remaining_campaign_s(self) -> float:
@@ -587,7 +599,9 @@ def extract_trusted(repo: Path, sha: str, configured_paths: list[str], dest: Pat
         try:
             tf.extractall(dest, filter="data")
         except TypeError:  # Python < 3.12: no filter argument
-            tf.extractall(dest)
+            for member in tf:  # keep it hardened: regular files and dirs only
+                if member.isreg() or member.isdir():
+                    tf.extract(member, dest)
     rc = proc.wait()
     if rc != 0:
         raise CampaignError(f"git archive failed for baseline {sha} paths {used}")
@@ -687,7 +701,7 @@ class Evaluator:
                     "cannot commit the candidate's changes in the campaign worktree: "
                     + (done.stderr.strip() or done.stdout.strip()))
         head = camp.wt_sha()
-        changed = camp.wt("diff", "--name-only", last_kept_sha + ".." + head).stdout.split()
+        changed = camp.wt("diff", "--name-only", last_kept_sha + ".." + head).stdout.splitlines()
         changed = sorted(set(c for c in changed if c.strip()))
         if not changed:
             return {"verdict": "inconclusive", "reason": "no_change",
@@ -1505,6 +1519,10 @@ def _recover_interrupted(camp: Campaign) -> None:
         best_sha = camp.state.get("best_sha") or camp.campaign["baseline_revision"]
         camp.wt("reset", "--hard", best_sha, check=False)
         camp.wt("clean", "-fd", check=False)
+        # A hard kill can strike mid-build: the build's ggml patch series is
+        # still applied inside third_party/ggml, and the next attempt's
+        # authority check would blame the candidate for that dirt. Restore.
+        _restore_submodules(camp)
         camp.checkpoint(attempts_used=n, current_attempt=None, status="ready")
     else:
         camp.checkpoint(status="ready", current_attempt=None)
@@ -1658,8 +1676,10 @@ def cmd_finalize(args) -> int:
                                             time.monotonic() + UNCAPPED_OFFSET_S, kind="finalize",
                                             values=finalize_values)
         except (SafetyStop, Interrupted) as e:
+            _restore_submodules(camp)
             print(f"finalize stopped: {e}", file=sys.stderr)
             return EXIT_SAFETY if isinstance(e, SafetyStop) else EXIT_INTERRUPT
+        _restore_submodules(camp)
         verdict = gates_mod.attempt_verdict(gates_records)
 
         heldout_info = {"provided": False, "pin": None, "sha256": None, "verdict": None}

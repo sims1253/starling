@@ -124,9 +124,12 @@ total_ms() { sed -n 's/.*time=\([0-9.]*\)ms.*/\1/p' "$1"; }
 last_tr() { sed -n 's/^  //p' "$1" | tail -1; }
 
 # best-effort VmHWM sampling of the remote candidate process while it runs
-sample_rss() { # <pid-var-file> -> echoes max kb seen so far (or nothing)
+sample_rss() { # echoes max kb seen so far (or nothing)
   local pid out
-  pid=$(adb shell "pidof starling-bench-cand 2>/dev/null" 2>/dev/null | tr -d '\r' | awk '{print $1}')
+  # comm is truncated to 15 chars: "pidof starling-bench-cand" never matches.
+  # The truncated name covers both pushed binaries, but this only samples
+  # while the candidate alone runs (wait_benches ran beforehand).
+  pid=$(adb shell "pidof starling-bench- 2>/dev/null" 2>/dev/null | tr -d '\r' | awk '{print $1}')
   [ -n "$pid" ] || return 0
   out=$(adb shell "cat /proc/$pid/status 2>/dev/null" 2>/dev/null | tr -d '\r' | sed -n 's/^VmHWM:[[:space:]]*\([0-9]*\).*/\1/p')
   [ -n "$out" ] && echo "$out"
@@ -182,7 +185,11 @@ for r in $(seq 1 "$ROUNDS"); do
 done
 
 for v in "${base_vals[@]}" "${cand_vals[@]}"; do
-  case "$v" in ''|*[!0-9.]*) echo "ERROR: non-numeric total_ms metric — bench output unparsed" >&2; exit 1 ;; esac
+  # one decimal point at most: "1.2.3" passes a plain char-class check and
+  # then breaks the awk delta expression with a syntax error
+  if ! [[ "$v" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+    echo "ERROR: non-numeric total_ms metric — bench output unparsed: '$v'" >&2; exit 1
+  fi
 done
 base=$(printf '%s\n' "${base_vals[@]}" | median)
 cand=$(printf '%s\n' "${cand_vals[@]}" | median)

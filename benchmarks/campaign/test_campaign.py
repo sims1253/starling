@@ -19,6 +19,21 @@ from pathlib import Path
 from unittest import mock
 
 HERE = Path(__file__).resolve().parent
+
+def _child_gone(pid: int) -> bool:
+    """True when the pid is dead OR a zombie. On hosts whose PID 1 does not
+    reap adopted orphans (some containers), a killed grandchild stays in
+    state Z forever — os.kill(pid, 0) alone would never confirm its death."""
+    try:
+        os.kill(pid, 0)
+    except (ProcessLookupError, PermissionError):
+        return True
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as fh:
+            state = fh.read().rsplit(")", 1)[1].split()[0]
+        return state == "Z"
+    except (OSError, IndexError):
+        return True
 sys.path.insert(0, str(HERE))
 
 import campaign as campaign_mod  # noqa: E402
@@ -527,9 +542,7 @@ class InterruptTests(ToyCampaignTest):
         gone = False
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
-            try:
-                os.kill(grandchild, 0)
-            except (ProcessLookupError, PermissionError):
+            if _child_gone(grandchild):
                 gone = True
                 break
             time.sleep(0.05)
@@ -726,7 +739,6 @@ class FinalizeTests(ToyCampaignTest):
         gates = {g["name"]: g for g in self.state(out)["finalize"]["gates"]}
         self.assertEqual(gates["energy"]["metrics"].get("energy_mwh"), 1.5)
         self.assertEqual(self.state(out)["finalize"]["verdict"], "pass")
-        del toy_repo
 
     def test_finalize_refuses_wrong_heldout_pin(self):
         out, _rc = self.start_campaign(run=False, max_attempts=1)

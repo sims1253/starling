@@ -44,7 +44,15 @@ def main():
     if path:
         with open(path, encoding="utf-8") as fh:
             cfg = json.load(fh)
-    if not args or args[0] in ("get-state", "push"):
+    if not args:
+        return 0
+    if args[0] == "push":
+        log = os.environ.get("FAKE_ADB_PUSH_LOG")
+        if log:
+            with open(log, "a", encoding="utf-8") as fh:
+                fh.write(" ".join(args[1:]) + "\\n")
+        return 0
+    if args[0] == "get-state":
         return 0
     if args[0] == "shell":
         cmd = " ".join(args[1:])
@@ -52,6 +60,16 @@ def main():
             print("mWakefulness=Asleep")
             return 0
         if "input keyevent" in cmd:
+            return 0
+        if cmd.startswith("[ -f "):
+            # have(): is the model/wav already on the device?
+            name = cmd[len("[ -f "):].rstrip("]").rstrip().split("/")[-1]
+            return 0 if name in cfg.get("device_files", ["model.gguf", "in.wav"]) else 1
+        if "pidof starling-bench-" in cmd:
+            print("4242")
+            return 0
+        if "cat /proc/" in cmd:
+            print("Name:\\tstarling-bench-\\nVmHWM:\\t  4096 kB")
             return 0
         if "./starling-bench-base" in cmd or "./starling-bench-cand" in cmd:
             side = "base" if "./starling-bench-base" in cmd else "cand"
@@ -94,10 +112,13 @@ class PhoneBenchAbTest(unittest.TestCase):
 
     def run_gate(self, config, *extra_args):
         self.cfg_path.write_text(json.dumps(config), encoding="utf-8")
+        self.push_log = self.tmp / "push.log"
+        self.push_log.unlink(missing_ok=True)
         env = dict(os.environ)
         env["PATH"] = f"{self.tmp / 'bin'}:{env['PATH']}"
         env["TRUSTED"] = str(REPO)
         env["FAKE_ADB_CONFIG"] = str(self.cfg_path)
+        env["FAKE_ADB_PUSH_LOG"] = str(self.push_log)
         cmd = ["bash", str(GATE),
                "--base-bin", str(self.tmp / "base.bin"),
                "--cand-bin", str(self.tmp / "cand.bin"),
@@ -112,7 +133,7 @@ class PhoneBenchAbTest(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         for line in ("METRIC total_ms=", "METRIC total_ms_base=",
                      "METRIC total_ms_delta_pct=", "METRIC transcripts_match=1",
-                     "METRIC peak_rss_kb=unavailable"):
+                     "METRIC peak_rss_kb=4096"):
             self.assertIn(line, r.stdout, r.stderr)
 
     def test_cand_bench_crash_is_a_loud_fail(self):
@@ -154,6 +175,13 @@ class PhoneBenchAbTest(unittest.TestCase):
                           "--extra-env-cand", "FOO=bar baz")
         self.assertEqual(r.returncode, 2)
         self.assertIn("extra-env-cand", r.stderr)
+
+    def test_missing_device_files_are_pushed(self):
+        r = self.run_gate({"base": BASE_OK, "cand": CAND_OK, "device_files": []})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        pushes = self.push_log.read_text(encoding="utf-8")
+        self.assertIn("model.gguf", pushes)
+        self.assertIn("in.wav", pushes)
 
     def test_non_numeric_rounds_is_a_usage_error(self):
         r = self.run_gate({"base": BASE_OK, "cand": CAND_OK}, "--rounds", "zero")

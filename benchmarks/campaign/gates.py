@@ -237,9 +237,13 @@ def ordered_gates(gates: list[dict]) -> list[dict]:
 
 
 def attempt_verdict(results: list[dict]) -> str:
-    """pass iff no fail and every required (incl. objective) gate passed.
-    Skipped gates never ran (fail-fast) and do not count against pass."""
-    if any(r["verdict"] == "fail" for r in results):
+    """pass iff no deciding gate failed and every required (incl. objective)
+    gate passed. Optional measurement gates (required=False, e.g. the
+    finalize-only energy gate) never decide the verdict — their failures stay
+    in their gate records as diagnostics. Skipped gates never ran (fail-fast)
+    and do not count against pass."""
+    if any(r["verdict"] == "fail" and (r.get("required", True) or r.get("objective"))
+           for r in results):
         return "fail"
     if all(
         r["verdict"] == "pass"
@@ -412,11 +416,9 @@ def run_gate(
     if result.get("spawn_error"):
         record["verdict"] = "fail"
         record["rule_details"] = [f"cannot start gate: {result['spawn_error']}"]
-        return record
-    if result["interrupted"]:
+    elif result["interrupted"]:
         record["verdict"] = "interrupted"
-        return record
-    if result["timed_out"]:
+    elif result["timed_out"]:
         record["verdict"] = "fail"
         record["rule_details"] = [f"gate timed out after {timeout:.0f}s (process group killed)"]
     elif result["exit_code"] is None:
@@ -433,9 +435,12 @@ def run_gate(
         record["verdict"] = verdict
         record["rule_details"] = details
 
+    # Runs on EVERY finished path (spawn failure, interrupt, timeout, verdict)
+    # or an aborted phone gate leaves its remote benches alive.
     cleanup = gate.get("remote_cleanup")
     if cleanup:
-        _run_cleanup(cleanup, values, env, log_path, interrupt_check=interrupt_check)
+        _run_cleanup(cleanup, values, env, log_path,
+                     interrupt_check=None if result.get("interrupted") else interrupt_check)
     return record
 
 
