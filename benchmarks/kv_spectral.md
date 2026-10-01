@@ -231,3 +231,35 @@ none. The selective map has no unique domain fragility; it shares the
 accumulation-method sensitivity of the production repack default. The
 FLEURS draws remain the campaign's quality bar, and every recommended
 configuration is neutral there.
+
+---
+
+## Campaign final report — issue #59 on the notebook (2026-10-01)
+
+Executive summary of the full record above (23 paired experiments; baseline
+binary sha256 prefix 0a0f3e1c2c6e41f5, built from the branch point before
+any change; every delta alternating-A/B vs that binary, median of 3x3):
+
+1. **Calibration** (prior #328 + this campaign): granite K is partially
+   low-rank per LAYER AND per HEAD; granite V and all of Qwen3-ASR are
+   full-rank (V intrinsically, measured per layer).
+2. **Runtime experiment**: the only gate-passing compression is a
+   calibration-driven SELECTIVE map (8 of 16 K layers, runtime-fit bases)
+   + in-r-space scores: enc +1.55-1.68% across workloads, exact fixture
+   transcripts, FLEURS WER neutral. Uniform ranks, V, per-head packed and
+   per-head exact-routing variants all fail a gate or add nothing — full
+   tables above and in fast_engine/RESEARCH_LOG.md.
+3. **Mechanisms, measured not inferred**: the WER "improvements" on the
+   Q4_K model were quantization-noise removal by the speech-subspace
+   projection (bf16 control: +0.05); the earlier "cross-domain failure"
+   was an 8-clip boundary-word hair-trigger that the SHIPPED repack knob
+   reproduces identically (bf16 control: +0.00). No unique fragility.
+4. **The actionable discovery**: STARLING_GGML_CPU_REPACK=1 (existing
+   engine knob, x86-default-off) — enc +18.99-19.62% / wall +8.7-9.3%
+   on granite (three-session band, both workloads), transcripts identical
+   on granite/parakeet/moss/qwen3, WER neutral both draws, +4 MB RSS.
+   Stacked with the #59 map: enc +19.00-19.62%. The x86 default flip is a
+   one-line production decision left to humans with this dossier.
+Tooling committed: 3 factor exporters, the v3 format + STARLING_GRANITE_
+DUMP_K/V probes, STARLING_GRANITE_KVFACT/KVINR env paths (default off,
+default path verified neutral repeatedly; all CI granite tests pass).
