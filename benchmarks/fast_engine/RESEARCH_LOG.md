@@ -571,3 +571,31 @@ the watchdog silent. Forensics harness: `.auto/wedge-forensics.sh` (logcat,
 thermals, GPU devfreq, marker — timestamped). wedge-study.sh exited early
 after the decisive probe (script bug, noted for the next pass; the manual
 sequence completed the study).
+
+### P2-13 (2026-10-01, attended): kill storms alone do NOT hard-wedge; the cure is robust; the wedge needs its confluence
+
+Follow-up to P2-12 on the same attended session. 12 kills landing at varied
+phases (including exactly mid-decode) alternated probe states 118/63/138/63
+— because **every clean probe load is itself a cure cycle**; then 8
+back-to-back kills with NO clean load between (~20 kills total on the boot,
+no marker at any point), followed by one clean load: **healthy immediately
+(63.4 / 70.3 / 62.8 ms/token, clean teardown)**. Refined model:
+
+- Unclean VkDevice death CAN immediately+persistently degrade a fresh boot
+  (P2-12) — but after the first clean-teardown cure, this boot absorbed
+  kill storms without lasting damage. Persistence is conditional; the exact
+  condition (fresh-boot first-death? boot history? state at death?) is open.
+- **The hard wedge was never reproduced deliberately** (~20 kills, varied
+  phases, no clean loads between — no fence timeout, no marker). The 09:15
+  wedge required its confluence: kills of transport-hung processes under
+  concurrent system load (load-average 6-9, post-boot maintenance) after a
+  morning of heavy benchmarking. The L2 watchdog bounds that tail; the
+  recovery load (one clean lifecycle) is the standing remedy for every
+  degradation state observed.
+- Open for the unattended matrix (fixed wedge-study.sh): death-phase sweep
+  (load-upload / mel / prefill / decode), concurrent-load arm, thermal-soak
+  arm — mapping exactly when damage persists and when it wedges.
+
+Forensics of the post-storm healthy state captured (wedge-post-storm-*.txt,
+session dir). All artifacts: 62.9-63.4 ms/token baselines throughout, L1
+teardown lines on every clean exit, zero markers.
