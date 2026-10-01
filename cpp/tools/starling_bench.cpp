@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -21,6 +22,13 @@
 #include <vector>
 
 namespace {
+
+// SIGTERM/SIGINT → cooperative stop (#325 crash circumvention): the engine
+// finishes its current decode round, returns a valid prefix, and the process
+// exits through normal destructors — the VkDevice is destroyed instead of
+// abandoned for the driver to reap (a leading wedge correlate: neither
+// SIGKILL nor default SIGTERM runs C++ destructors).
+void on_terminate(int) { starling_ggml_request_stop(); }
 
 void usage() {
     std::fprintf(stderr,
@@ -63,6 +71,9 @@ int main(int argc, char** argv) {
     const starling_ggml_model kind = model_kind(model);
     if (!kind || gguf.empty() || wavs.empty()) { usage(); return 2; }
 
+    std::signal(SIGTERM, on_terminate);
+    std::signal(SIGINT, on_terminate);
+
     const double t0 = now_ms();
     starling_ggml_ctx* ctx = starling_ggml_load(kind, gguf.c_str());
     if (!ctx) {
@@ -73,6 +84,10 @@ int main(int argc, char** argv) {
 
     int rc = 0;
     for (const std::string& path : wavs) {
+        if (starling_ggml_stop_requested()) {
+            std::fprintf(stderr, "[stop] SIGTERM/SIGINT: exiting cleanly\n");
+            break;
+        }
         std::vector<float> pcm;
         int sr = 0;
         std::string err;
@@ -93,6 +108,10 @@ int main(int argc, char** argv) {
             starling_ggml_free_string(w);
         }
         for (int r = 0; r < runs; ++r) {
+            if (starling_ggml_stop_requested()) {
+                std::fprintf(stderr, "[stop] SIGTERM/SIGINT: exiting cleanly\n");
+                break;
+            }
             const double a = now_ms();
             char* text = starling_ggml_transcribe_pcm(ctx, pcm.data(), (int64_t)pcm.size(), 16000);
             const double ms = now_ms() - a;

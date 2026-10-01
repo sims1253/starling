@@ -372,6 +372,10 @@ Context::~Context() {
         if (inst_) fn_.vkDestroyInstance(inst_, nullptr);
         return;
     }
+    // Observability (#325): this line is how a harness verifies the VkDevice
+    // was destroyed by US (clean teardown) rather than abandoned to the
+    // driver's async reaping — the leading wedge correlate on the Pixel.
+    std::fprintf(stderr, "[fast] vk teardown: device destroyed cleanly\n");
     fn_.vkDeviceWaitIdle(dev_);
     if (pcache_ && !pcache_path_.empty()) {
         size_t n = 0;

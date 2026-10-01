@@ -489,3 +489,32 @@ transcribes MOSS short to the **exact golden at KSTEP 8, 16 (default), and
 64** — the one-command-buffer-per-round recording is correct across the
 round-granularity range, not just the measured value. A phone-side
 default-KSTEP transcript check joins the rested-phone queue as a formality.
+
+### P2-10 (2026-10-01): wedge circumvention L1 — cooperative stop so a killed process never abandons its VkDevice
+
+Root-cause framing for the wedges (#325, user-mandated work): the fence
+timeout is a firmware-level stall, and the strongest correlate in today's
+causal chain (P2-7) is processes dying with a **live ~1.6 GB VkDevice** —
+neither SIGKILL nor default SIGTERM runs C++ destructors, so the driver must
+asynchronously reap GPU state; today's wedge followed several transport-hung
+benches killed within the preceding 90 minutes, and the historical
+"~8 loads per boot" degradation was observed under harnesses that also
+kill. Landed (engine + bench + harness, validated on llvmpipe):
+
+- `starling_ggml_request_stop/stop_requested/clear_stop` (public C API):
+  cooperative stop flag.
+- `starling-bench` installs SIGTERM/SIGINT handlers that set the flag; the
+  wav and run loops check it; the MOSS decode round loop checks it between
+  rounds and returns the valid prefix — the process exits **through normal
+  destructors**, destroying the VkDevice (new observability line:
+  `[fast] vk teardown: device destroyed cleanly`).
+- `phone_common.sh kill_benches` (measurement-stack hygiene, maintainer
+  mandate): TERM first, wait ≤10 s for clean teardown, KILL only as
+  fallback; the `.auto/*` session scripts match.
+
+Validation (desktop, llvmpipe): normal runs still golden with the teardown
+line present; TERM mid-transcription exits cleanly after finishing the
+in-flight unit (~29 s on CPU-VK; ~1 s per decode round on the phone) with
+both teardown lines. Next (staged): the H1 (killed-death) vs H2 (clean-load
+leak) reproduction study on a dedicated phone day, and the degradation
+watchdog if the study shows pre-wedge times are actionable.

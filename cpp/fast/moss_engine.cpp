@@ -12,6 +12,7 @@
 #include "moss/mel.hpp"
 
 #include "ggml.h"
+#include "starling_ggml.h"   // starling_ggml_stop_requested (#325 coop stop)
 
 #include <algorithm>
 #include <chrono>
@@ -861,10 +862,15 @@ bool MossEngine::generate(const float* pcm, size_t n, std::vector<int32_t>& out_
 
     std::vector<uint32_t> st(16 + (size_t)I.cfg.max_new_tokens);
     int rounds = 0;
+    // Cooperative stop (#325): a SIGTERM'd process checks this between
+    // decode rounds and returns the valid prefix instead of dying with a
+    // live VkDevice (the driver's async reaping of ~1.6 GB of GPU state is
+    // the leading wedge-correlate; RESEARCH_LOG P2-7).
     // The device stops at EOS or the budget; the host bound only guards
     // against a state buffer that never reports either.
     const int max_rounds = (int)(I.cfg.max_new_tokens / steps) + 2;
     for (;;) {
+        if (starling_ggml_stop_requested()) break;
         if (!I.ctx->download(I.state, 0, st.data(), 16 * 4, err)) return false;
         if (st[2] != 0 || st[1] >= I.cfg.max_new_tokens) break;
         if (rounds >= max_rounds) { err = "fast moss: decode did not terminate"; return false; }

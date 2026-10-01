@@ -28,8 +28,14 @@ screen_off() {
 
 # SIGKILL any bench left running: a locally timed-out adb shell leaves the
 # remote bench alive (its output pipe is gone; it can hang in poll forever).
+# #325 hygiene: SIGTERM first and give the process up to 10 s to exit through
+# its destructors (SIGKILL abandons a live VkDevice to the driver's async
+# reaping — a leading wedge correlate, RESEARCH_LOG P2-7). KILL is the
+# fallback, not the default.
 kill_benches() {
-  adb shell "for p in \$(pidof $BENCH_BINS); do kill -9 \$p; done" >/dev/null 2>&1 || true
+  adb shell "for p in \$(pidof $BENCH_BINS); do kill -TERM \$p; done" >/dev/null 2>&1 || true
+  timeout 10 adb shell "while pidof $BENCH_BINS >/dev/null 2>&1; do sleep 1; done" \
+    >/dev/null 2>&1 || adb shell "for p in \$(pidof $BENCH_BINS); do kill -9 \$p; done" >/dev/null 2>&1 || true
 }
 
 # Back-to-back model loads (1.6 GB each) need the previous process gone:

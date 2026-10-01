@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cstdio>
+#include <atomic>
 #include <mutex>
 #include <string>
 #include <memory>
@@ -226,6 +227,15 @@ void starling_ggml_shutdown(void) {
         starling::ggml::shutdown_backend();
     });
 }
+
+// ---- cooperative stop (#325: let a SIGTERM'd process tear down its GPU) ----
+namespace {
+std::atomic<bool> g_coop_stop{false};
+}
+
+void starling_ggml_request_stop(void) { g_coop_stop.store(true, std::memory_order_relaxed); }
+int  starling_ggml_stop_requested(void) { return g_coop_stop.load(std::memory_order_relaxed) ? 1 : 0; }
+void starling_ggml_clear_stop(void) { g_coop_stop.store(false, std::memory_order_relaxed); }
 
 const char * starling_ggml_last_error(starling_ggml_ctx * ctx) {
     return api_call(ctx, [&]() -> const char * {
