@@ -195,3 +195,12 @@ enc **+1.67%** (+0.40pt over the map alone), transcripts identical, WER
 env; default off). Cumulative #59 result on granite: a calibration-driven
 selective K map with in-r scores wins +1.67% encoder / wall within noise
 of +0.5%, with exact fixture transcripts and neutral-to-positive WER.
+
+**Domain boundary (same campaign, final):** the passing map+in-r config is
+FLEURS-domain-validated only. On a LibriSpeech-style 8-clip set never used
+for calibration it costs +0.64 WER (gate 0.2); a mixed-domain basis refit
+does not repair this (real holdout +0.78, FLEURS draw1 -0.28). Read-speech
+K energy of the compressed layers is not captured by these rank-32 subspaces
+regardless of fit composition, on samples this small. The single-domain
+calibration was the weak link — the original study's own caveat ("one
+language and one dataset") applies to the runtime path too.

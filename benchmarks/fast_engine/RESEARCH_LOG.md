@@ -464,3 +464,20 @@ the campaign's certified final number for the granite encoder K path:
 SELECTIVE 8-layer rank map + in-r scores = enc +1.67-1.68% vs the frozen
 baseline, exact-transcript contract intact, FLEURS WER neutral-to-positive
 on two disjoint draws, runtime default unchanged (both knobs env-gated).
+
+Cross-domain validation (run 15): (a) long-workload A/B (74 s fixture, 10
+chunks, chunk-policy path): enc +1.65% — matches medium's +1.67/+1.68, no
+shape tuning. (b) DOMAIN PROBE: sel2+KVINR on the LibriSpeech-style
+real_corpus (8 clips, held from all calibration): base 4.49 -> cand 5.13 =
++0.64, OUTSIDE the 0.2 gate. The FLEURS-fit bases do not generalize across
+domain — the OOD mechanism the campaign documented, confirmed at quality
+level. (c) Mixed-domain refit (same map, bases refit on FLEURS 0-4 +
+real_corpus utts 0-3; utts 4-7 and FLEURS draws held out): FLEURS draw1
+-0.28 (violation, improvement side), draw2 -0.10 pass, real holdout +0.78
+FAIL — no better in-domain than the FLEURS fit on 4 clips / ~200 words.
+Conclusion: the selective map's WER neutrality is DOMAIN-CONDITIONED
+(FLEURS-like speech only); basis composition cannot satisfy both domains
+inside the +-0.2 band on these small sets. Deliverable claim downgraded:
+"WER neutral on the calibration domain; +0.6-0.8 observed on a small
+read-speech set" — the env-gated OFF default is the correct production
+posture; any enablement needs domain-matched re-gating.
