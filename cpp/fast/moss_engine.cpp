@@ -759,9 +759,10 @@ bool MossEngine::Impl::record_decode(uint32_t steps, std::string& err) {
     if (!ap) return false;
     for (uint32_t s = 0; s < steps; ++s) {
         // One command buffer per round, not per token: the per-step split
-        // only added a submit boundary per token (every segment is submitted
-        // back-to-back on the same queue and ordered by barriers anyway),
-        // and a submit boundary can flush the tiler.
+        // dates from the original MOSS WIP; every segment was submitted
+        // back-to-back on the same queue and ordered by barriers anyway.
+        // Measured neutral on the Pixel 10 Pro (P2-2); kept for simplicity —
+        // 16x fewer command-buffer allocations per round.
         for (uint32_t l = 0; l < NL; ++l) {
             const LlmLayer& Y = llm[l];
             Kernels::GemvArgs a;
