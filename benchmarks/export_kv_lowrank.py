@@ -50,7 +50,9 @@ def dequant_2d(t) -> np.ndarray:
     if qtype == gguf.GGMLQuantizationType.F32:
         return np.array(t.data, dtype=np.float32).reshape(ne1, ne0)
     if qtype == gguf.GGMLQuantizationType.BF16:
-        raw = np.ascontiguousarray(t.data, dtype=np.uint8).reshape(-1).view(np.uint16)
+        # Reinterpret the raw bytes (gguf-py exposes BF16 as uint8 today; a
+        # byte view stays exact if it ever exposes uint16 instead).
+        raw = np.ascontiguousarray(t.data).reshape(-1).view(np.uint16)
         return (raw.astype(np.uint32) << 16).view(np.float32).reshape(ne1, ne0)
     cls = getattr(gguf.quants, qtype.name, None)
     if cls is None:
@@ -60,6 +62,15 @@ def dequant_2d(t) -> np.ndarray:
     for i in range(ne1):
         out[i] = cls.dequantize_rows(data[i]).astype(np.float32)[:ne0]
     return out
+
+
+def attn_kv_weight(reader, layer: int):
+    """The encoder layer's fused attn_kv GGUF tensor; KeyError naming it if absent."""
+    name = f"enc.blk.{layer}.attn_kv.weight"
+    t = next((x for x in reader.tensors if x.name == name), None)
+    if t is None:
+        raise KeyError(f"tensor {name} not found in GGUF")
+    return t
 
 
 def check_rank(rank: int, head_dim: int, what: str = "rank") -> None:
@@ -173,10 +184,7 @@ def main() -> int:
     rel = {"k": [], "v": []}
     for li in range(n_layers):
         name = f"enc.blk.{li}.attn_kv.weight"
-        t = next((x for x in reader.tensors if x.name == name), None)
-        if t is None:
-            raise KeyError(f"tensor {name} not found in GGUF")
-        w = dequant_2d(t)                                   # [2*hidden, hidden]
+        w = dequant_2d(attn_kv_weight(reader, li))          # [2*hidden, hidden]
         if hidden is None:
             hidden = w.shape[1]
             if w.shape[0] != 2 * n_heads * (hidden // n_heads):

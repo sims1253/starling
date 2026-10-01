@@ -44,6 +44,7 @@ sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(REPO / "src"))
 
 from export_kv_lowrank import (  # noqa: E402
+    attn_kv_weight,
     check_dump_prefixes,
     dequant_2d,
     fit_pca_fold,
@@ -89,8 +90,7 @@ def main() -> int:
     for li, r in rank_map.items():
         K_fit = load_runtime_k(fit_prefixes, li, hidden, n_heads)
         K_held = load_runtime_k([held_prefix], li, hidden, n_heads)
-        t = next(x for x in reader.tensors if x.name == f"enc.blk.{li}.attn_kv.weight")
-        w = dequant_2d(t)
+        w = dequant_2d(attn_kv_weight(reader, li))
         wk = w[: w.shape[0] // 2]
         f1, f2, e = fit_pca_fold(K_fit, K_held, wk, n_heads, r)
         f1k[li], f2k[li] = f1, f2

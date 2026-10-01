@@ -6,7 +6,7 @@ reusing bench_kv_spectral.py's capture classes unmodified, then folded into
 the runtime weight:
 
     B_h = top-r right singular vectors of K_h activations  [128, r]
-    f1  = (W_h @ ... z = n @ (W_h^T B_h),  k_h ~= z @ B_h^T)
+    f1  = (W_h^T B_h)^T,  f2 = B_h   (z = n @ f1^T,  k_h ~= z @ B_h^T)
 
 Same v1 factor-file format as the weight-space exporter.
 
@@ -35,7 +35,7 @@ sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(REPO / "src"))
 
 import bench_kv_spectral as kvs  # noqa: E402  (capture classes, unmodified)
-from export_kv_lowrank import check_rank, dequant_2d, fit_pca_fold  # noqa: E402
+from export_kv_lowrank import attn_kv_weight, check_rank, dequant_2d, fit_pca_fold  # noqa: E402
 
 import gguf  # noqa: E402
 import torch  # noqa: E402
@@ -98,8 +98,7 @@ def main() -> int:
     for li in range(n_layers):
         K_fit = fit[li][0]          # [T, n_heads, head_dim] (K only)
         K_held = held[li][0]
-        t = next(x for x in reader.tensors if x.name == f"enc.blk.{li}.attn_kv.weight")
-        w = dequant_2d(t)           # [2*hidden, hidden] dequantized runtime weight
+        w = dequant_2d(attn_kv_weight(reader, li))  # [2*hidden, hidden] runtime weight
         if hidden is None:
             hidden = w.shape[1]
         wk = w[: w.shape[0] // 2]   # K half [hidden, hidden] (out, in)

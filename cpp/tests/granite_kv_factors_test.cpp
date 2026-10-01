@@ -200,13 +200,14 @@ void unit_checks() {
 #ifndef _WIN32
 // Tiny granite encoder: 1 layer, hidden 1024, 8 heads (head_dim 128).
 constexpr int kLayers = 1, kHidden = 1024, kHeads = 8;
+constexpr uint32_t kHeadDim = kHidden / kHeads;
 
 bool write_tiny_factors(const std::filesystem::path& path, uint32_t rk, uint32_t rv) {
     FactorFile ff;
     ff.magic("STLGKVF1");
     for (uint32_t v : {1u, (uint32_t) kLayers, (uint32_t) kHidden, (uint32_t) kHeads, rk, rv})
         ff.u32(v);
-    if (rk <= 128 && rv <= 128)
+    if (rk <= kHeadDim && rv <= kHeadDim)
         for (uint32_t r : {rk, rv})
             if (r) ff.block((size_t) 2 * kHeads * r * kHidden, 0.01f);
     return ff.write(path);
@@ -247,6 +248,20 @@ void e2e_checks() {
     const std::string factored = decode_once(gguf.c_str(), "K+V factors", false);
     SETENV("STARLING_GRANITE_KVINR", "1");
     const std::string in_r = decode_once(gguf.c_str(), "KVINR set before load", false);
+    UNSETENV("STARLING_GRANITE_KVINR");
+    // Single-half files: the other half is sliced out of the fused attn_kv
+    // weight (strided view), the one path the K+V files above never take.
+    const auto k_only_path = tmp("granite_kv_factors_test_k.bin");
+    const auto v_only_path = tmp("granite_kv_factors_test_v.bin");
+    check(write_tiny_factors(k_only_path, 16, 0) && write_tiny_factors(v_only_path, 0, 8),
+          "e2e: single-half factor files written");
+    SETENV("STARLING_GRANITE_KVFACT", k_only_path.string().c_str());
+    const std::string k_only = decode_once(gguf.c_str(), "K-only factors", false);
+    SETENV("STARLING_GRANITE_KVINR", "1");
+    const std::string k_only_in_r = decode_once(gguf.c_str(), "K-only factors + in-r", false);
+    UNSETENV("STARLING_GRANITE_KVINR");
+    SETENV("STARLING_GRANITE_KVFACT", v_only_path.string().c_str());
+    const std::string v_only = decode_once(gguf.c_str(), "V-only factors", false);
 
     UNSETENV("STARLING_GRANITE_KVFACT");
     UNSETENV("STARLING_GRANITE_KVINR");
@@ -255,6 +270,8 @@ void e2e_checks() {
           "e2e: factors leave the zero model's transcript unchanged");
     check(after == base, "e2e: KVINR set after load is ignored (no crash)");
     check(in_r == base, "e2e: in-r path decodes the zero model unchanged");
+    check(k_only == base && k_only_in_r == base && v_only == base,
+          "e2e: single-half factor files decode the zero model unchanged");
 
     check(write_tiny_factors(over_path, 129, 0), "e2e: over-rank factor file written");
     SETENV("STARLING_GRANITE_KVFACT", over_path.string().c_str());
@@ -270,6 +287,8 @@ void e2e_checks() {
     std::error_code ignored;
     std::filesystem::remove(kv_path, ignored);
     std::filesystem::remove(over_path, ignored);
+    std::filesystem::remove(k_only_path, ignored);
+    std::filesystem::remove(v_only_path, ignored);
 }
 #endif
 

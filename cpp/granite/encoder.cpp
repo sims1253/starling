@@ -263,8 +263,10 @@ ggml_tensor* shaw_attention(ggml_context* c, const GraniteModel& m, int li,
     auto to_blocks = [&](ggml_tensor* z) {
         return ggml_reshape_4d(c, z, D, H, CS, nblk);
     };
+    // Captures require materialized halves (in-r has no k; DUMP_K + KVINR is
+    // rejected before the graph is built).
     if (k_capture && k) capture_graph_output(f32(c, k), k_capture);
-    if (v_capture) capture_graph_output(f32(c, v), v_capture);
+    if (v_capture && v) capture_graph_output(f32(c, v), v_capture);
     ggml_tensor* v4 = to_blocks(v);
     ggml_tensor* q4 = to_blocks(q);   // full-width q: Shaw bias needs it
 
@@ -597,6 +599,10 @@ bool encode_audio_and_project(const GraniteModel& model, const MelFeatures& mel,
                     const auto& buf = suffix[0] == 'L' ? k_dump.k[li] : k_dump.v[li];
                     std::string path = std::string(kdump_env) + "." + suffix +
                                        std::to_string(li) + ".f32";
+                    if (buf.empty()) {  // an empty dump would fit silently wrong
+                        err = "GRANITE K/V dump: nothing captured for " + path;
+                        return false;
+                    }
                     FILE* f = std::fopen(path.c_str(), "wb");
                     bool wrote = f && std::fwrite(buf.data(), sizeof(float), buf.size(),
                                                   f) == buf.size();
