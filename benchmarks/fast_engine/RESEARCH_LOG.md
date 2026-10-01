@@ -610,3 +610,12 @@ a latent bug for same-binary env-only A/Bs (both arms landed in the base
 array); granite runs were unaffected (distinct binaries). Fixed before
 any per-model number was logged — the first parakeet outputs that hit
 the bug were discarded un-logged.
+
+Repack scope + workload matrix completion (run 27): (a) the CPU_REPACK
+mechanism covers quantized types only — on granite-speech bf16-exact ZERO
+tensors repack (enc unchanged at ~5.35 s), so an x86 default flip's blast
+radius is exactly the quantized model files; unquantized ones are
+untouched. (b) Short-fixture cell (single chunk, T~400, narrowest GEMMs):
+repack enc +21.65% / wall +8.77% — the workload matrix is now complete
+across short/medium/long (enc +21.65 / +18.99 / +19.00 repack-alone) and
+the effect does not degrade at small T.
