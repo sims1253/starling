@@ -420,3 +420,16 @@ Q4KxQ8 dot, materially moving transcripts (the same effect as the CTC
 study's rank-1024 control). Reverted; the kept final config remains the
 v3 8-layer map (sel2, enc +1.27%, WER -0.19/-0.14). Per-head granularity is
 real structure but not profitably exploitable within the quality gate.
+
+Per-head piece-wise exact routing (v5, same campaign): second variant of the
+per-head idea, fixing v4's mechanism (residual heads now sliced from the
+real attn_kv weight — exact Q4_K dot, no shipped dequantized weights).
+WER -0.19 / +0.05 on the two draws: BOTH PASS, confirming identity blocks
+were v4's gate violation and per-head compression itself is gate-safe. But
+enc +1.26% is identical to the kept sel2 (+1.27%): the multi-piece overhead
+(extra GEMM dispatches + concats per partial layer per transcription)
+cancels the theoretical +0.25% MAC gain. Equal latency at higher complexity
+=> discarded (v5 loader/encoder/exporter reverted; spec preserved here).
+Per-head idea closed after two variants: the structure is real and
+gate-compatible, but not profitably exploitable on this engine/CPU. Final
+config remains the v3 8-layer selective map.
