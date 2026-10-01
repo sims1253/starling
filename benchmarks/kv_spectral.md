@@ -263,3 +263,32 @@ any change; every delta alternating-A/B vs that binary, median of 3x3):
 Tooling committed: 3 factor exporters, the v3 format + STARLING_GRANITE_
 DUMP_K/V probes, STARLING_GRANITE_KVFACT/KVINR env paths (default off,
 default path verified neutral repeatedly; all CI granite tests pass).
+
+**Factor-artifact reproduction recipe** (both pinned artifacts verified
+byte-identical on this machine; see the SVD-sign caveat above for other
+builds):
+
+```sh
+# 1. Calibration clips: FLEURS en_us train rows 0..7 in parquet order.
+uv run python benchmarks/fast_engine/export_fleurs.py --cfg en_us \
+    --split train --n 8 --out .auto/fleurs_train8
+# 2. Runtime K/V dumps per clip (one process per clip, unique prefix;
+#    any starling-bench build with the dump probe; per model file):
+for i in 0 1 2 3 4 5 6 7; do
+  STARLING_GRANITE_DUMP_K=.auto/kdumps/clip$i ./build-59cand/starling-bench \
+    --model granite --gguf models/granite-2b-dynq4.imx.gguf --runs 1 --quiet \
+    .auto/fleurs_train8/en_us_000$i.wav
+done
+# 3. Export the selective map (fit clips 0-6; clip 7 held out for the
+#    printed sanity MSE):
+uv run python benchmarks/export_kv_lowrank_selective.py \
+  --gguf models/granite-2b-dynq4.imx.gguf \
+  --dumps .auto/kdumps/clip{0..6} \
+  --map 0:32,4:32,6:32,9:8,10:24,11:32,12:32,13:32 \
+  --out benchmarks/results/kvfactors_granite_sel2.bin
+```
+
+Expected sha256 prefixes: dynq4 sel2 `fb6fee5c930c3725`,
+bf16-exact refit `0fe8c49fdf889ddf` (same recipe, the bf16 GGUF and its
+own dumps). Runtime use: `STARLING_GRANITE_KVFACT=<file>` plus optional
+`STARLING_GRANITE_KVINR=1` (in-r scores).
