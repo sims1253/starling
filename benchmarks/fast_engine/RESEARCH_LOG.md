@@ -477,3 +477,15 @@ work and stands). Caveats on my side too: one window, 2500 µAh gauge quanta
 load-amortization spread (5.49–6.63). Rerun protocol for the rested phone:
 RUNS=24 (fast window ≈ 22 quanta, ±2 %), idle control ≈ 550 s (±5 %), ggml
 window ≈ 70 s, verify counter movement first, stayon held, discharging.
+
+### P2-9 (2026-10-01): default-KSTEP gap in the candidate validation, closed
+
+Audit finding: every candidate-binary validation this session ran at
+KSTEP=32 (the protocol-v2 pin in both measure.sh and checks.sh) — the
+shipped **default (16)** path of the changed `record_decode` had never been
+exercised by the candidate. Closed on the second driver (llvmpipe, throwaway
+CPUVK acceptance re-applied and reverted as in P2-5): the branch binary
+transcribes MOSS short to the **exact golden at KSTEP 8, 16 (default), and
+64** — the one-command-buffer-per-round recording is correct across the
+round-granularity range, not just the measured value. A phone-side
+default-KSTEP transcript check joins the rested-phone queue as a formality.
