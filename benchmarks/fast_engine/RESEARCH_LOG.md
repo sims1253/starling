@@ -720,3 +720,17 @@ policy (accept the ±0.4 wobble or keep repack off for them). The filed
 issue's dot-error harness is now predicted to show equal Q4_0/Q4_K
 distances; run it to close formally, but the empirical evidence points
 at decode margins.
+
+Repackable-type set + MOSS q8_0 closure (run 37): the planned dose-response
+test (moss-q8_0 + repack) is impossible — ZERO tensors repack on the
+q8_0-dominant file; the pinned build's CPU_REPACK path covers only
+{q4_K, q4_0} (granite's 173 repacked tensors are all q4_K_8x8; MOSS and
+parakeet's decoder showed q4_0_8x8). Consequences, all dossier-refining:
+(a) the flip's blast radius is the q4_K/q4_0 subset of quantized files —
+Q8_0/BF16 files are untouched (moss-q8_0 is trivially safe, no datum
+needed); (b) granite's Q5_K (1.09B elements, the FFN down/gate mass) and
+Q6_K (411M) never repack — the +19% enc win came from the Q4_K subset
+alone, so quantified headroom remains if upstream ggml ever repacks
+Q5_K/Q6_K (submodule is off-limits to this loop; noted as future-issue
+material); (c) the MOSS wobble question stays confined to its q4-fullimx
+file, consistent with the decode-margin explanation.
