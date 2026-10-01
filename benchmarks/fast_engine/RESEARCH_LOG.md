@@ -624,3 +624,25 @@ every degradation state observed**; hard wedges are a rare tail (never
 reproduced deliberately), bounded by the L2 watchdog. The remaining
 research (n>1 damage statistics, the exact confluence) belongs to the
 unattended long-run matrix with forensics on every anomaly.
+
+### P2-15 (2026-10-01, attended): the load-confluence cell — benign; attended wedge study closed
+
+Fresh boot (baseline 64.77), four CPU spinners (load 4.2, no GPU
+contention), first death mid-transcription under that load: probes
+67.82 / 67.51 (+4.4 %, mild elevation) decaying to 65.1 after a minute —
+**transient churn, not damage**. The P2-12 confluence recipe
+(first-death + mid-transcription + system load) does NOT reproduce the 2.2×
+degradation at n=1. (Measurement note: the loadkill adb session died at its
+own `pidof sh` kill — the spinner cleanup killed the session shell too; the
+bench kill preceded it, so the cell is valid.)
+
+**Attended study closed with honest statistics**: ~40 deliberate unclean
+deaths today across phases (upload/warmup/transcription/decode), boot
+histories (virgin/post-cure), and load levels — **one damaging event
+(P2-12), zero hard wedges**. The damage trigger is a rare tail whose exact
+condition remains unidentified (remaining suspects: heavier I/O-bound load
+like the 09:15 dexopt churn, thermal state, or genuine 1-in-N rarity).
+Everything actionable is already landed and validated: L1 (cooperative
+stop), L2 (watchdog), the recovery load (cures every degradation state
+observed), and forensics on every anomaly. Mapping the damage trigger to
+n>1 is unattended-matrix work (long runs, forensics per event).
