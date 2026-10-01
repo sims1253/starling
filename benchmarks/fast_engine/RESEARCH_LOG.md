@@ -406,3 +406,17 @@ wall +0.54%, transcripts identical, WER -0.19 / -0.14 on the two disjoint
 draws (both PASS). KEEP. The frontier boundary is now measured: remaining
 uncompressed K layers sit at r32 error 0.038-0.13, the regime where uniform
 compression failed the gate (+0.28) — further expansion is not pursued.
+
+Per-head packed map probe (v4, same campaign): per-head dump analysis shows
+compression structure is per-HEAD (L8's 0.038 layer mean = head 6 alone at
+0.162, other seven heads <= 0.0049; L14 has five clean heads). A v4 format
+(packed per-head widths; skipped heads as full-rank identity blocks) added
+L8(7 heads)+L14(5 heads): enc +1.35% — only +0.08% over the kept sel2 (the
+wide 544-column factor GEMMs eat the partial-layer gain; increment within
+cross-run drift) — and FAILED the two-sided WER neutrality gate on the
+improvement side: draw1 -0.28 (5.85->5.56) while draw2 -0.10. The identity
+blocks route untouched heads through f32-GEMM(dequant W) instead of the
+Q4KxQ8 dot, materially moving transcripts (the same effect as the CTC
+study's rank-1024 control). Reverted; the kept final config remains the
+v3 8-layer map (sel2, enc +1.27%, WER -0.19/-0.14). Per-head granularity is
+real structure but not profitably exploitable within the quality gate.
