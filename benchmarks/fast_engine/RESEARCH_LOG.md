@@ -375,3 +375,9 @@ factorization can beat it materially. Conclusion for #59 on granite:
 K-only rank-16 weight-space is a marginal, gate-edge latency win; V and
 basis approaches are measured no-gos. Runtime default unchanged (path is
 env-gated off); tooling committed (exporters + STARLING_GRANITE_DUMP_K).
+
+Margin stress test: k16 re-gated on a second disjoint FLEURS draw
+(clips 100-199): +0.29 FAIL (base 5.38 -> 5.67). Draw-1's +0.19 pass was
+clip-draw luck. Verdict amended to a clean no-go: no tested configuration
+reliably clears the 0.2-point WER gate; runtime default stays unchanged
+(factor path env-gated off).

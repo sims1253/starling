@@ -148,3 +148,15 @@ held-out K/V energy. The calibration-level answer for Qwen3-ASR is
 therefore **no-go**: there is no rank with both useful compression and
 small reconstruction error, so no native follow-up experiment is justified
 on this evidence.
+
+**Margin stress test (same day):** re-gating the draw-1 "passing" rank-16
+config on a second, disjoint 100-clip FLEURS draw (clips 100–199) moved the
+delta to **+0.29 (base 5.38 → 5.67) — FAIL**. The draw-1 pass was clip-draw
+luck; the real WER cost of K rank-16 compression straddles the 0.2-point
+gate. Final verdict for #59: **encoder KV compression is a no-go on granite
+in every tested configuration** (weight-space r16/r24, activation-basis r32,
+runtime-basis r32: 0.19–0.42 points across draws, none reliably within 0.2),
+on top of a structural latency ceiling (attention is 16.6% of encoder MACs,
+the K path 4.5%) and a memory regression. The env-gated factor path,
+exporters and K-dump probe remain committed as reproducible research
+tooling; no runtime default changes.
