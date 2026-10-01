@@ -74,3 +74,48 @@ latency, and WER for a changed encoder against the unchanged one before a
 runtime flag or benchmark ablation row is added. The low-rank draft-head
 question was measured separately with CTC token acceptance and complete
 Python decoder latency in [`ctc_draft_rank.md`](ctc_draft_rank.md).
+
+## Native follow-up: low-rank K/V in the engine (2026-10-01, issue #59)
+
+The follow-up the paragraph above demanded now exists. The granite encoder
+gained an opt-in factor path (`STARLING_GRANITE_KVFACT=<file>`,
+`cpp/granite/kv_factors.hpp`): per attention layer, per head, the K and/or
+V half of the fused `attn_kv` GEMM is replaced by two GEMMs through a rank-r
+factorization, with the original bf16 rounding boundaries. Three factor
+provenances were measured on the notebook (Ryzen 5650U, CPU backend,
+granite-2b-dynq4 GGUF, alternating A/B vs a frozen baseline binary,
+median of 3x3 on medium.wav; exact-transcript contract on all three
+fixtures; FLEURS en_us test 100-clip WER gate at 0.2 points):
+
+| Provenance | rank | enc | wall | transcripts | WER |
+| --- | ---: | ---: | ---: | --- | ---: |
+| weight-space SVD | 32 | +2.22% | +0.74% | identical | (not gated) |
+| weight-space SVD | 24 | +2.56% | +0.71% | identical | +0.28 FAIL |
+| weight-space SVD | 16 | +2.79% | +1.15% | identical | +0.19 pass |
+| weight-space SVD | 8 | — | — | differ | — |
+| K+V both r=32 | 32 | — | — | destroyed | — |
+| bf16-activation PCA | 32 | +2.20% | +0.82% | identical | +0.42 FAIL |
+| runtime-activation PCA | 32 | +2.12% | +1.14% | identical | +0.28 FAIL |
+
+Memory does not improve: the factor file is additional resident data
+(f32 r=16 factors ≈ 2x the Q4_K K-half bytes; peak RSS 1900 → 1929 MB).
+The encoder K/V are graph intermediates only — there is no persistent cache
+to shrink, so low-rank buys a small latency cut at a memory and WER cost.
+Counter to the calibration's promise (K held-out rel-MSE 0.002–0.035 at
+rank 32–64), activation-fitted bases transfer *worse* to WER than the
+weight-space SVD: both the bf16-reference fit and a fit on the engine's own
+K dumps (new `STARLING_GRANITE_DUMP_K` probe) show the same per-layer
+projection error and the same WER outcome, so provenance is not the cause;
+PCA-style bases zero out-of-basis directions that held-out test audio
+excites, while weight-space SVD spreads a uniform (larger) error over all
+directions. WER deltas are deterministic (greedy decode) but not monotone
+in rank — every useful rank costs 0.19–0.42 points and rank 16 passes the
+gate with roughly one flipped word of margin.
+
+Verdict for #59 on granite: **not worth enabling**. The speed ceiling is
+structural (the whole attention block is 16.6% of encoder MACs; the K path
+4.5%), the only gate-passing config sits on the WER gate edge, and memory
+regresses. The factor path stays env-gated OFF; the exporters
+(`benchmarks/export_kv_lowrank*.py`), the dump probe and the numbers above
+are the reproducible record. Qwen3-ASR spectral calibration remains
+unmeasured.

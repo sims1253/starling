@@ -334,3 +334,44 @@ Addendum (#325, measurement status): a supervised single-load attempt after
 heal the fault; the final-head A/A remains composition-argued (P1-8's
 twice-verified 69.2–69.7 ms/token + measured-harmless push-constant delta +
 guards off the decode path), which stands as the certified result.
+
+## #59 notebook campaign: granite encoder K/V low-rank follow-up (2026-10-01)
+
+Device: notebook (Ryzen 5 PRO 5650U, 12 threads, CPU backend, reduced power
+profile for part of the session). Target: `cpp/granite/encoder.cpp`
+attention K/V projections via the opt-in `STARLING_GRANITE_KVFACT` factor
+path (off by default). Baseline: frozen `starling-bench` built at branch
+point. A/B: alternating arms, median of 3 reps x 3 in-process runs,
+medium.wav (enc stage 5.62-5.65 s under the reduced profile). Contract:
+short/medium/long transcripts identical for every kept row. WER gate
+(FLEURS en_us test 100 clips, |delta| <= 0.2 vs baseline ggml):
+
+| Experiment | enc delta | wall delta | transcripts | WER delta | verdict |
+| --- | ---: | ---: | --- | ---: | --- |
+| weight-space SVD K r=32 (f32 factors) | +2.22% | +0.74% | identical | not gated | kept (tooling) |
+| same, Q8_0 factors | +0.99% | -0.62% | identical | - | discarded (slower: narrow quantized dots lose to f32 FMA) |
+| weight-space K r=16 | +2.79% | +1.15% | identical | +0.19 (5.85->6.03) PASS | only gate-clearing config |
+| weight-space K r=24 | +2.56% | +0.71% | identical | +0.28 FAIL | discarded |
+| weight-space K r=8 | - | - | DIFFER | - | rejected at probe |
+| K+V r=32 | - | - | destroyed | - | rejected at probe (V not compressible) |
+| activation basis r=32 (bf16 ref K) | +2.20% | +0.82% | identical | +0.42 FAIL | discarded |
+| runtime-fitted basis r=32 (engine K dumps) | +2.12% | +1.14% | identical | +0.28 FAIL | discarded |
+
+Memory: k16 factors raise peak RSS 1900->1929 MB (+1.5%) — with Q4_K
+production weights, low-rank factors cannot save memory (f32 r=16 factors
+are ~2x the original K-half bytes; even q8 factors exceed Q4_K below the
+quality cliff). This is a latency-only trade.
+
+Findings: (1) basis provenance does not explain the WER cost — bf16-fit and
+runtime-fit bases have identical per-layer projection error (~0.04 mean,
+layers 3/7 ~0.11) and both fail; PCA-style bases zero out-of-basis
+directions that OOD test audio excites, while weight-space SVD keeps
+uniform spectral error. (2) WER deltas are deterministic (greedy decode)
+but do not scale monotonically with rank — every rank 16-32 costs
+0.19-0.42 points; k16's pass has ~1 flipped word of margin. (3) The
+encoder attention path is 16.6% of encoder MACs (K path 4.5%); the measured
++2.2-2.8% enc / +0.7-1.15% wall ceiling matches the compute model — no
+factorization can beat it materially. Conclusion for #59 on granite:
+K-only rank-16 weight-space is a marginal, gate-edge latency win; V and
+basis approaches are measured no-gos. Runtime default unchanged (path is
+env-gated off); tooling committed (exporters + STARLING_GRANITE_DUMP_K).
