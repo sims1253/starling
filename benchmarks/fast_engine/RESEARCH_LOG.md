@@ -598,3 +598,15 @@ recommended config (repack+sel2+KVINR, short.wav, in-process medians):
 threads 4 / 6 / 8 / 12 -> enc stage 1849 / 1404 / 1439 / 1852 ms. The
 default (6 physical) is optimal on this device; the SMT penalty (~32% at
 12 threads) reconfirmed. No change warranted.
+
+Per-model rigorous repack A/Bs (run 26): the run-22 indicative numbers
+upgraded to the paired alternating protocol (3x3, same frozen binary both
+arms, env-only). Wall medians on medium.wav: parakeet-tdt q4 2119.7 ->
+1639.2 ms (-22.67%, spreads +-0.3%); MOSS q4 13712.3 -> 11859.6 ms
+(-13.51%); qwen3-1.7b dynq4 13404.8 -> 12585.6 ms (-6.11%). All three
+match the indicative sweep (-23/-14/-6). Transcript contracts were
+validated in run 22. Session-tooling note: measure.sh's arm dispatch had
+a latent bug for same-binary env-only A/Bs (both arms landed in the base
+array); granite runs were unaffected (distinct binaries). Fixed before
+any per-model number was logged — the first parakeet outputs that hit
+the bug were discarded un-logged.
