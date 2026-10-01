@@ -476,22 +476,22 @@ bool Context::wait_fence(VkFence fence, const char* what, std::string& err,
     }
     // The fence may still be pending: its work must finish before the fence
     // is reset or the submitted buffers are reused or freed.
-    if (r == VK_TIMEOUT) {
-        // vkDeviceWaitIdle has no timeout, so drain through the fence with a
-        // bounded grace. If the work never finishes, leave the fence pending
-        // and mark the context hung: submits fail fast and teardown skips
-        // the destruction that would block on (or free under) the hung work.
-        if (fn_.vkWaitForFences(dev_, 1, &fence, VK_TRUE, kDrainGraceMs * 1000000) != VK_SUCCESS) {
-            gpu_hung_ = true;
-            std::fprintf(stderr, "[fast] GPU work still pending %llu ms after the fence timeout; "
-                                 "the device will not be torn down\n",
-                         (unsigned long long)kDrainGraceMs);
-            return false;
-        }
-    } else {
-        // The wait itself failed (device lost, OOM): drain as before. A
-        // lost device returns from waits in finite time (Vulkan spec).
-        fn_.vkDeviceWaitIdle(dev_);
+    // vkDeviceWaitIdle has no timeout, and only a LOST device is guaranteed
+    // to return from waits in finite time (Vulkan spec, "Lost Device") — a
+    // device that is wedged but not lost (timeout, the OOM reading) is not.
+    // So drain through the fence with a bounded grace. If the work never
+    // finishes, leave the fence pending and mark the context hung: teardown
+    // then skips the destruction that would block on (or free under) it.
+    const VkResult d = fn_.vkWaitForFences(dev_, 1, &fence, VK_TRUE, kDrainGraceMs * 1000000);
+    if (d == VK_ERROR_DEVICE_LOST) {
+        fn_.vkDeviceWaitIdle(dev_);   // lost: returns in finite time; objects may be destroyed
+    } else if (d != VK_SUCCESS) {
+        mark_wedged(err);   // idempotent; covers results not classified above
+        gpu_hung_ = true;
+        std::fprintf(stderr, "[fast] GPU work still pending %llu ms after the fence failure; "
+                             "the device will not be torn down\n",
+                     (unsigned long long)kDrainGraceMs);
+        return false;
     }
     fn_.vkResetFences(dev_, 1, &fence);
     return false;
