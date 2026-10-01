@@ -334,3 +334,45 @@ Addendum (#325, measurement status): a supervised single-load attempt after
 heal the fault; the final-head A/A remains composition-argued (P1-8's
 twice-verified 69.2–69.7 ms/token + measured-harmless push-constant delta +
 guards off the decode path), which stands as the certified result.
+
+## #317 follow-up loop (2026-10-01, branch autoresearch/pixel-layout-2026-10-01)
+
+Phone reachable again over wifi adb; fresh-master baseline re-established,
+two experiments, both closure-grade. Protocol learnings below cost a reboot
+to acquire and matter for every future phone session on this host.
+
+| # | Hypothesis | Result |
+| --- | --- | --- |
+| P2-1 | Merge the qkv/o/gateup GEMV pipelines (they differ only by NORM/EPI spec constants; ~25 spec switches/token at P1-10's +7 % each) by moving NORM/EPI/DONE to push constants + skipping redundant vkCmdBindPipeline | **REJECTED +16.3 %** (81.25 vs 69.88 ms/token, 3/3 rounds, transcripts identical). The merged kernel itself is slower per shape — isolated micros: down N2048/K6144 +29 %, gateup N12288/K2048 +8 %, lm_head W8 +5 %. **P1-10's switch-cost pricing is closed: on DXT the driver's spec-constant dead-code elimination per specialization is worth far more than the pipeline switches it costs. Keep kernels specialized; do not merge pipelines to save binds.** |
+| P2-2 | The decode recording splits one command buffer per token (`if (s) rc.split()` since the original MOSS WIP); merging to one segment per round removes 15 submit boundaries/round | **NEUTRAL (−0.01 %)**, kept as simplification (62.56 vs 62.57, 16× fewer command-buffer allocations; transcripts identical, 5 fixtures × both models). The intra-round submit boundaries cost nothing — the per-ROUND fence+download cycle is the only host round-trip that matters, and on a healthy phone it is ~0 too (KSTEP 16/32/64 probe: ±1 % on short AND medium; the apparent 9 ms/token "KSTEP win" was boot-to-boot drift — the 68–77 ms/token band across boots still governs). |
+
+Fresh-boot decode under the hardened protocol: **62.5–64 ms/token** (below the
+historical 68–77 band; cool device, screen off, `svc power stayon true`).
+
+### Protocol addenda (this host, wifi adb + WSL2)
+
+- **A locked phone poisons in-context decode measurements**: after a reboot
+  with no unlock (secure keyguard, `deviceLocked=1`), decode reads 104–141
+  ms/token while ISOLATED kernel micros are unaffected (0.670 vs 0.768
+  ms/iter — even faster than the unlocked boot). The stall is a per-ROUND
+  host round-trip (~0.7 s each: submit/fence/64 B download) while the system
+  suspend-cycles; `svc power stayon true` + KSTEP=32 (or one unlock) restores
+  the clean number. Production implication: background transcription on a
+  locked phone pays ~0.7 s per decode round-trip — worth a product-side look
+  (wakelock or fewer round-trips), separate from engine kernels.
+- **Driver degradation after ~8–10 model loads per boot reproduces** as
+  bimodal in-context times (70 → 140 ms/token) with no wedge marker and
+  nominal thermals. Reboot, then measure early; batch transcript gates
+  (one load per model+binary, not per fixture).
+- **wifi-adb shell stalls** under sustained output (bench stderr): every
+  bench invocation must redirect to a device-side file (bounded by a
+  device-side `timeout`) with host-side timeouts on every adb call.
+- adb on this WSL2 host needs a manually spawned server first (mirrored-mode
+  firewall drops unlistened localhost ports, so the client never learns to
+  fork one): see `.auto/adb-env.sh`.
+- **Desktop RADV gate is not runnable on this host** (WSL2 exposes only
+  llvmpipe, which the engine rejects by design; no Vulkan SDK glslc/int-dot
+  either — vendored headers in ~/.local/vulkan-sdk + NDK shader-tools work
+  for builds). P2-2's RADV ≤10 % check must be run elsewhere before merge;
+  it is a pure host-side recording change (dispatch count identical, one
+  segment per round), so the risk is structural, not numerical.
