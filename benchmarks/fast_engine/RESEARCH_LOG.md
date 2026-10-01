@@ -432,3 +432,22 @@ No regression on either model; Parakeet sits in the historical 2.2–2.4 s
 tuned band. With this, every #317 acceptance gate runnable on this host
 carries explicit branch-state numbers; the remaining two (real-AMD RADV
 perf, refreshed coulomb energy) are environment-blocked as documented.
+
+### P2-7 (2026-10-01): the third #325 wedge — full causal chain recorded
+
+At 09:15 the phone's GPU driver wedged during an energy window on a heavily
+spent boot (the whole day's session; this boot had already shown the bimodal
+101–141 ms/token degradation band): `vkWaitForFences` VkResult 2, a 120 s
+hang. The wedge marker then correctly refused every subsequent fast-engine
+process for 15 minutes, and the two "10/12 runs" energy-window truncations
+are now attributed: the benches were killed by device-side timeouts at
+~25 s/run while the driver limped toward the hang. Reconstructed chain:
+sustained benchmarking across many boots → degradation (bimodal times) →
+fence-timeout wedge → marker + limping/killed processes. The anti-retry
+guard worked as designed; the session's phone work was stopped per the
+Pixel-safety rule (the one protocol violation — rebooting into the marker
+window under the earlier "degradation" misdiagnosis — failed safe because
+of that guard). Energy fast/idle points from the brief healthy window
+(27500 µAh/76 s fast, 7500 µAh/82 s idle, 12 runs, stayon) are recorded
+here for the next attempt; the full triple needs a rested phone off its
+charging pad.
