@@ -734,3 +734,15 @@ alone, so quantified headroom remains if upstream ggml ever repacks
 Q5_K/Q6_K (submodule is off-limits to this loop; noted as future-issue
 material); (c) the MOSS wobble question stays confined to its q4-fullimx
 file, consistent with the decode-margin explanation.
+
+MOSS dose-response, corrected lens (run 38): moss-q4e8f32 (finer scales)
+under repack still wobbles: -0.33 on draw 1 (vs q4-fullimx's -0.42/+0.38)
+— and its base WER is 7.92, essentially identical to q4-fullimx's 8.01.
+The wobble tracks the MODEL's decode margins (base WER), not the file's
+quant precision: every engine/file tested with base WER <= 6.5 (granite
+5.85, parakeet 5.75 and q4_0 5.51, qwen3 3.82) is stable under repack;
+both MOSS files at ~8.0 wobble ±0.3-0.4. Mechanism closed: repack's
+dot-method change is quality-neutral for models with comfortable decode
+margins and moves ~±11 words for models at ~8% WER regardless of scale
+precision. Flip policy: scope by model quality margin (or accept the
+wobble); no format or engine defect.
