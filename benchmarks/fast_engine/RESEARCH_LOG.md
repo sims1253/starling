@@ -455,3 +455,12 @@ transcripts identical, WER -0.19 / -0.05 on the two disjoint draws (draw1
 byte-identical to sel2's transcripts outcome). KEPT, env-gated behind
 STARLING_GRANITE_KVINR (default off = expand path). Final best config:
 sel2 + KVINR: enc +1.67%.
+
+Final verification (run 14): sel2+KVINR re-measured in a fresh session —
+enc +1.68% / wall +0.94% (run 13: +1.67% / +0.15%; the enc delta
+reproduces to 0.01pt, the wall delta wanders in a ~0.15-0.94% band as
+noted throughout). Transcripts identical; per-arm spreads ~±0.1%. This is
+the campaign's certified final number for the granite encoder K path:
+SELECTIVE 8-layer rank map + in-r scores = enc +1.67-1.68% vs the frozen
+baseline, exact-transcript contract intact, FLEURS WER neutral-to-positive
+on two disjoint draws, runtime default unchanged (both knobs env-gated).
