@@ -533,3 +533,23 @@ model files generally; transcript-contract risk is the dot-method change
 (same class as the full-rank control effect), so it needs its own gated
 campaign. Also re-filed: a starling-bench flag to exercise the (currently
 unconsumed) granite CTC speculative path under factors.
+
+STARLING_GGML_CPU_REPACK on the notebook (run 20): the engine's existing
+repack knob (cpp/runtime/cpu_repack, ggml CPU_REPACK interleaved kernels;
+default ON only on Android) was never measured in this campaign — the
+frozen baseline ran with it off. Env-only A/B on the SAME frozen binary
+(granite dynq4, medium): enc +18.99% (5746->4655 ms), wall +9.25%
+(13.97->12.67 s), transcripts identical, FLEURS WER -0.09 / +0.00 — every
+gate green, zero code change. Stacked with the #59 factor path
+(sel2+KVINR): enc +19.62%, wall +8.69% (wall within band), WER -0.14 /
++0.00 — gates green; the factor path keeps a ~+0.6pt edge on top of
+repack (its f32 GEMMs still beat repacked-Q4_K on the compressed K
+layers). This reframes the notebook recommendation: the big granite
+encoder win is the existing repack knob (12x the factor path), with the
+selective map adding a further ~0.6%. Whether x86 should default
+STARLING_GGML_CPU_REPACK on (platform_default in cpu_repack.cpp) is a
+one-line production decision for humans — this loop records the measured
+numbers, it does not change the default. Also note repack's
+transcript-exact behavior here contrasts with the bf16/dot-method concern
+that killed v4: ggml's repacked kernels preserve the fixtures and WER
+neutrality on both draws.

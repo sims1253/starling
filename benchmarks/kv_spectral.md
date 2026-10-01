@@ -213,3 +213,12 @@ quantization-noise removal, and its cross-domain +0.64 was a
 projection×quantization interaction, not truncation-OOD: the same
 truncation on exact weights is domain-robust. The domain caveat in the
 verdict above applies to the dynq4 (Q4_K) file only.
+
+**Repack context (same campaign, final):** the campaign's latency
+comparison ran with STARLING_GGML_CPU_REPACK off (x86 default). Enabling
+the engine's existing repack knob alone gives granite enc +18.99% /
+wall +9.25% with identical transcripts and neutral WER on both draws;
+stacked with the selective map+in-r scores the total is enc +19.62%.
+On x86 notebooks the repack knob — not low-rank K — is the dominant
+encoder lever; the selective map remains a small additional win and the
+research deliverable of #59.
