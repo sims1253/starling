@@ -689,3 +689,17 @@ default flip is gate-clean for granite/parakeet/qwen3 but must be scoped
 per-engine or investigated for MOSS first (its transcripts also matched
 on the three fixtures — the FLEURS gate, not fixture identity, caught
 this). This is precisely the two-sided gate doing its job.
+
+MOSS repack instability — root-cause seed (run 35): quant-type maps from
+the GGUFs. MOSS q4-fullimx: enc 0.65B elements = 97% Q4_0 (633M) + 2%
+BF16; llm 1.72B = 82% Q4_0; adapter 50M Q4_0. Granite dynq4: K-quants
+(Q6_K/Q5_K/Q4_K) + BF16. Parakeet's q4_0 is decoder-LSTM/joint only
+(tiny) and it passed the gate. Hypothesis for the filed MOSS issue: MOSS
+is the only engine whose ENCODER GEMMs are Q4_0-dominated, and the
+repacked q4_0_8x8 dot sits numerically further from its scalar dot than
+the K-quant repack paths do — compounded by MOSS's highest baseline WER
+(8.0-8.8% vs 3.8-5.9 for the others => most boundary words). Concrete
+next test for the investigation: unit-harness the repacked-vs-scalar dot
+error for Q4_0 vs Q4_K blocks, or repack K-quants only (skip Q4_0) and
+re-gate MOSS — the latter also yields a scoped mitigation (type-filtered
+repack) if it holds.
