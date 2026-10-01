@@ -630,3 +630,14 @@ short.wav, base 5010 ms vs repack 4659 ms (-7.0%). The repack
 transformation pays for itself within the very first transcription; no
 warm-up penalty exists for serving. All cells of the repack dossier that
 this device can measure are now closed.
+
+Serve-level contract closure (run 29): the exact-transcript contract run
+through AUTORESEARCH's named serve harness (benchmarks/experiments/
+serve_contract_smoke.py over HTTP, fresh server processes, all three
+fixtures) for the recommended configuration: baseline serve vs the same
+binary with STARLING_GGML_CPU_REPACK=1 (expressed via an exec wrapper so
+the script's own two-binary protocol stays unmodified) —
+transcripts_match=1, 1390/1390 chars. Every harness element the standing
+file names for notebook work has now been used by this campaign: the
+paired-alternation discipline throughout, starling-bench for timing, and
+the serve contract smoke for the HTTP path.
