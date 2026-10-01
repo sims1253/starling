@@ -703,3 +703,20 @@ next test for the investigation: unit-harness the repacked-vs-scalar dot
 error for Q4_0 vs Q4_K blocks, or repack K-quants only (skip Q4_0) and
 re-gate MOSS — the latter also yields a scoped mitigation (type-filtered
 repack) if it holds.
+
+MOSS root-cause — controlled format test (run 36): the repo ships an
+all-Q4_0 parakeet (parakeet-tdt-0.6b-v3-q4_0.gguf), giving a controlled
+test of run 35's format hypothesis: same engine, encoder AND decoder
+entirely Q4_0, vs the K-quant parakeet that passed (−0.05/−0.10). Result:
+Q4_0 parakeet under repack = −0.09 / +0.00 on both FLEURS draws — fully
+gate-clean. The format hypothesis is REFUTED: Q4_0-dominated repacked
+compute does not by itself move transcripts. Remaining explanation: a
+MODEL property — MOSS's decode has the most near-boundary decisions
+(highest base WER 8.0–8.8 vs 3.8–6.5 for every other engine/file tested),
+so any dot-method perturbation flips ~±11 words; exactly how granite's
+8-clip hair-trigger behaved at smaller scale. Implication for the flip
+decision: no engine/format bug; the choice for MOSS-class models is
+policy (accept the ±0.4 wobble or keep repack off for them). The filed
+issue's dot-error harness is now predicted to show equal Q4_0/Q4_K
+distances; run it to close formally, but the empirical evidence points
+at decode margins.
