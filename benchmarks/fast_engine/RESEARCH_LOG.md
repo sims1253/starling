@@ -746,3 +746,11 @@ dot-method change is quality-neutral for models with comfortable decode
 margins and moves ~±11 words for models at ~8% WER regardless of scale
 precision. Flip policy: scope by model quality margin (or accept the
 wobble); no format or engine defect.
+
+Terminal certification (run 39): final pass at the exact HEAD a reviewer
+sees (37 commits; engine code unchanged since run 24's certification —
+all later commits are documentation). Recommended config (repack +
+sel2 + KVINR) vs the frozen baseline (sha 0a0f3e1c...): enc +19.09%,
+wall +8.76%, transcripts identical — the four-session enc band now
+19.00-19.62. Session state at handoff: baseline binary 0a0f3e1c2c6e,
+candidate 7727491120e0, tree clean, CI granite tests green.
