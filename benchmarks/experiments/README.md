@@ -119,9 +119,5 @@ diagnostics attached (see below).
 - `test_experiment.py` — the acceptance suite (comparator negatives,
   verdict semantics, determinism, runner mechanics over the stub).
 
-`benchmarks/campaign/` (issue #176) is the consumer of this record format:
-its perf gate runs `run_experiment.py` as a sealed child over best-vs-
-candidate binaries.
-
 Tests: `python -m unittest discover -s benchmarks/experiments -p 'test_*.py'`
 (wired into `.github/workflows/test.yml`).

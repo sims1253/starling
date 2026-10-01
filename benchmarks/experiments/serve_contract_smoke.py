@@ -17,9 +17,10 @@ up, transport trouble).
 
 Stdlib only; no models needed for the contract-fixture binary.
 
-Usage (placeholders substituted by the campaign runner):
-    {python} {trusted}/benchmarks/campaign/gates/serve_contract_smoke.py \
-        --binary {candidate}/starling-serve-contract-fixture \
+Usage:
+    python benchmarks/experiments/serve_contract_smoke.py \
+        --binary build-candidate/starling-serve \
+        --baseline-binary build-baseline/starling-serve \
         --model parakeet [--gguf ${STARLING_MODELS_DIR}/model.gguf]
 """
 
