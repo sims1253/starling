@@ -652,3 +652,13 @@ conventions may differ across numpy builds — signs cancel in the subspace
 math but change file bytes, so other machines should verify against the
 recorded hashes rather than expect byte equality. The ctc study's
 "fixed exported weight file" lesson is thus satisfied and documented.
+
+Mel-threads knob closure (run 32): STARLING_MEL_THREADS sweep on the
+recommended config (enc stage, medium): threads=1 -> 4724.8 ms, default
+(=hw concurrency) -> 4690.1 ms. The mel front-end's entire parallelizable
+cost is ~35 ms (~0.7% of the stage; total mel share ~1-1.5%), and the
+default already sits at the fast end — the knob is closed with a number.
+Every engine tunable that touches the granite enc metric has now been
+measured: GGML threads (physical-core default optimal), CPU repack (the
++19-21.7% recommendation), MEL threads (sub-1%, default optimal), and the
+#59 factor knobs (+1.6% stacked).
