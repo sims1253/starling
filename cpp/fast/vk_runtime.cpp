@@ -419,8 +419,8 @@ Context::~Context() {
     // was destroyed by US (clean teardown) rather than abandoned to the
     // driver's async reaping — the leading wedge correlate on the Pixel.
     // Printed only once the device is gone, so a teardown that hangs or
-    // dies part-way leaves no false evidence. One line per Context (a
-    // process hosting several engines prints it once per engine).
+    // dies part-way leaves no false evidence. One line per process (the
+    // Vulkan context is a process-wide singleton shared by the engines).
     std::fprintf(stderr, "[fast] vk teardown: device destroyed cleanly\n");
     // The loader library stays mapped: other Vulkan users in the process
     // (e.g. ggml's backend) may share it.

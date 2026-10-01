@@ -705,7 +705,7 @@ no MOSS GGUF on that host):
   prefix includes the round that just finished; the engine logs the stop.
 - `starling-bench`: one-shot handler (a second TERM/INT kills), single
   `[stop]` line, stopped runs labelled `[stopped: may be truncated]`.
-  TERM mid-run on llvmpipe: in-flight call finishes, clean teardown, exit 0.
+  TERM mid-run on llvmpipe: in-flight call finishes, clean teardown.
 - `kill_benches`/`wait_benches`: every adb call host-bounded, wait loops
   bounded on the device too (no orphaned remote shells), post-KILL wait.
   adb-stub test: TERM-honouring bench → no KILL; TERM-ignoring → KILL at
@@ -715,3 +715,18 @@ no MOSS GGUF on that host):
   protocol with their evidence. `svc power stayon` is the
   plugged-in-only setting, so the P2-8 discharging windows' wake mechanism
   is unverified.
+
+Review rounds 2–3 (same day, `cce545b`, `6f6bf78`):
+- A wedged context fails fast **in-process** too: submits and staged
+  transfers gate on the wedge, so a timeout that drained still refuses the
+  next transcribe (verified on llvmpipe with a forced 1 ms probe). Teardown
+  skip stays keyed on the never-drained (hung) case only.
+- `starling-bench` stopped by a signal exits **128+signo** (143 for TERM),
+  so a stopped — possibly truncated — run never reads as a full result;
+  normal runs exit 0.
+- `kill_benches` **fails** (warning, non-zero) when a bench survives
+  SIGKILL or adb is unreachable; the phone scripts run under `set -e`, so a
+  session aborts instead of loading 1.6 GB on top of a live bench.
+- Every fence failure (not only timeouts) drains through the bounded 10 s
+  grace; only a lost device still gets `vkDeviceWaitIdle` (finite per spec)
+  and full teardown; work that never finishes marks wedged + hung.
