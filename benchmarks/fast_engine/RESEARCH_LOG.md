@@ -674,3 +674,44 @@ bounds). The product guidance is complete: cooperative stop everywhere
 (L1), watchdog (L2), recovery load after any dirty death, forensics on
 every anomaly. Remaining unknown (the exact 1-in-70 trigger) needs either
 much larger n or luck; it no longer blocks anything actionable.
+
+### P2-17 (2026-10-02): review fixes — the L2 watchdog was inert; corrections to P2-11–P2-16
+
+PR #379 review found the adaptive watchdog budget **1000× too large**:
+`ms_since()` already returns milliseconds and the budget multiplied by
+1000 again, so a ~1 s round got a ~6000 s budget — looser than the 120 s
+default it was meant to tighten. The P2-11 validation forced an absolute
+budget (`STARLING_FAST_STALL_BUDGET_MS`), which bypasses the arithmetic.
+**Correction:** every "the L2 watchdog bounds it" statement in P2-12–P2-16
+is void; the adaptive watchdog never fired in those sessions and was not
+capable of firing early. Their observations (deaths, cures, 30/30 matrix)
+stand; the watchdog's coverage needs a phone run of its own. Round 0 has
+no history and keeps the 120 s default (a fixed 20 s floor would misfire on
+slow drivers: llvmpipe rounds take ~29 s).
+
+Further fixes in the same pass (validated on llvmpipe with Parakeet;
+no MOSS GGUF on that host):
+- Fence timeout records the wedge marker **before** draining; the drain is
+  a bounded fence wait (10 s grace) instead of the unbounded
+  `vkDeviceWaitIdle`. If the work never finishes the context is marked
+  hung: submits fail fast and teardown skips destruction
+  (`[fast] vk teardown: skipped ...`) instead of hanging. Both paths
+  exercised with a throwaway 1 ms budget probe (not committed): clean
+  teardown when the late work drains, prompt exit when it does not, marker
+  written in both, next process refused.
+- `vk teardown: device destroyed cleanly` now prints after
+  `vkDestroyDevice`, not before the wait.
+- Cooperative stop is checked after the state refresh, so the returned
+  prefix includes the round that just finished; the engine logs the stop.
+- `starling-bench`: one-shot handler (a second TERM/INT kills), single
+  `[stop]` line, stopped runs labelled `[stopped: may be truncated]`.
+  TERM mid-run on llvmpipe: in-flight call finishes, clean teardown, exit 0.
+- `kill_benches`/`wait_benches`: every adb call host-bounded, wait loops
+  bounded on the device too (no orphaned remote shells), post-KILL wait.
+  adb-stub test: TERM-honouring bench → no KILL; TERM-ignoring → KILL at
+  ~12 s; fully hung adb → returns in bounded time.
+- AUTORESEARCH rule 3 reduced to the standing safety rule; device timings,
+  load budgets and wake/energy conditions moved to the device brief as
+  protocol with their evidence. `svc power stayon` is the
+  plugged-in-only setting, so the P2-8 discharging windows' wake mechanism
+  is unverified.

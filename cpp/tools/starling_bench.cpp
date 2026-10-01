@@ -24,11 +24,24 @@
 namespace {
 
 // SIGTERM/SIGINT → cooperative stop (#325 crash circumvention): the engine
-// finishes its current decode round, returns a valid prefix, and the process
-// exits through normal destructors — the VkDevice is destroyed instead of
-// abandoned for the driver to reap (a leading wedge correlate: neither
-// SIGKILL nor default SIGTERM runs C++ destructors).
-void on_terminate(int) { starling_ggml_request_stop(); }
+// finishes its current unit of work (a decode round for MOSS, the current
+// call otherwise) and the process exits through normal destructors — the
+// VkDevice is destroyed instead of abandoned for the driver to reap (a
+// leading wedge correlate: neither SIGKILL nor default SIGTERM runs C++
+// destructors). One-shot: the handler restores the default disposition, so
+// a second signal terminates a process that does not wind down.
+void on_terminate(int sig) {
+    starling_ggml_request_stop();      // lock-free atomic store
+    std::signal(sig, SIG_DFL);         // async-signal-safe (POSIX)
+}
+
+bool stop_now() {
+    if (!starling_ggml_stop_requested()) return false;
+    static bool said = false;
+    if (!said) std::fprintf(stderr, "[stop] SIGTERM/SIGINT: exiting cleanly\n");
+    said = true;
+    return true;
+}
 
 void usage() {
     std::fprintf(stderr,
@@ -71,8 +84,10 @@ int main(int argc, char** argv) {
     const starling_ggml_model kind = model_kind(model);
     if (!kind || gguf.empty() || wavs.empty()) { usage(); return 2; }
 
-    std::signal(SIGTERM, on_terminate);
-    std::signal(SIGINT, on_terminate);
+    for (int sig : {SIGTERM, SIGINT})
+        if (std::signal(sig, on_terminate) == SIG_ERR)
+            std::fprintf(stderr, "warning: cannot install the signal %d handler; "
+                                 "it will kill without teardown\n", sig);
 
     const double t0 = now_ms();
     starling_ggml_ctx* ctx = starling_ggml_load(kind, gguf.c_str());
@@ -84,10 +99,7 @@ int main(int argc, char** argv) {
 
     int rc = 0;
     for (const std::string& path : wavs) {
-        if (starling_ggml_stop_requested()) {
-            std::fprintf(stderr, "[stop] SIGTERM/SIGINT: exiting cleanly\n");
-            break;
-        }
+        if (stop_now()) break;
         std::vector<float> pcm;
         int sr = 0;
         std::string err;
@@ -108,10 +120,7 @@ int main(int argc, char** argv) {
             starling_ggml_free_string(w);
         }
         for (int r = 0; r < runs; ++r) {
-            if (starling_ggml_stop_requested()) {
-                std::fprintf(stderr, "[stop] SIGTERM/SIGINT: exiting cleanly\n");
-                break;
-            }
+            if (stop_now()) break;
             const double a = now_ms();
             char* text = starling_ggml_transcribe_pcm(ctx, pcm.data(), (int64_t)pcm.size(), 16000);
             const double ms = now_ms() - a;
@@ -120,8 +129,12 @@ int main(int argc, char** argv) {
                 rc = 1;
                 break;
             }
-            std::printf("%s run=%d audio=%.2fs time=%.1fms rtf=%.4f%s%s\n", path.c_str(), r, dur, ms,
-                        ms / 1000.0 / dur, quiet ? "" : "\n  ", quiet ? "" : text);
+            // A stop mid-call may have cut the transcript short (MOSS returns
+            // the prefix): label it so it is never read as a full result.
+            const bool cut = starling_ggml_stop_requested();
+            std::printf("%s run=%d audio=%.2fs time=%.1fms rtf=%.4f%s%s%s\n", path.c_str(), r, dur, ms,
+                        ms / 1000.0 / dur, cut ? " [stopped: may be truncated]" : "",
+                        quiet ? "" : "\n  ", quiet ? "" : text);
             std::fflush(stdout);
             starling_ggml_free_string(text);
         }

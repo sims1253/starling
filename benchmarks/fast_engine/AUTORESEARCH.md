@@ -69,6 +69,34 @@ times that. Both are far from the hardware: that is the opportunity.
   (`adb shell dumpsys batterystats` / on-device power rails) — energy per
   transcription matters as much as latency.
 
+### Phone measurement protocol (#325; evidence in RESEARCH_LOG P2-*)
+
+Working settings, not device limits — each states its evidence and its
+status:
+
+- **Settle, then verify.** Waiting ~5 min after boot is a heuristic. What
+  makes a window valid is stable thermals (`dumpsys thermalservice`) and
+  baseline timings back in the session's band — check those, don't trust
+  the timer.
+- **Model loads per boot.** "~8 loads, then the driver degrades" (the
+  Phase 1 loop header and the P2 protocol addenda) was observed under harnesses that
+  also SIGKILLed benches; P2-12–P2-16 later ran many more load/kill cycles
+  without persistent degradation once teardown was clean. A conservative
+  per-session load budget is a fine experiment setting; it is not an
+  established limit.
+- **Wake state.** A locked phone without any wake source stalls each decode
+  round-trip ~0.7 s through system suspend (P2-3/P2-4); measure unlocked,
+  or with a verified wake source. `svc power stayon true` only sets
+  Android's *stay awake while plugged in* option — it is **not** a wake lock
+  for an unplugged (discharging) energy run. The stall-free discharging
+  windows in P2-8 had stayon set, but which mechanism kept them awake is
+  **unverified**; establish one (and keep idle-control conditions identical
+  across arms) before trusting a new energy window.
+- **Energy runs** need a discharging battery: verify the charge counter
+  moves between two reads before opening a window.
+- **Wifi adb.** Stream bench output to device-side files; the TLS transport
+  stalls under sustained shell output.
+
 ## Experiment loop
 
 For each iteration:

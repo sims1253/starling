@@ -49,31 +49,18 @@ region the agent may touch. Everything else lives here.
    stack as a separate issue/PR.
 2. Record the baseline before the first attempt; every claim is relative to
    it.
-3. Pixel safety (#325): posture depends on whether the loop is attended.
-   **Attended** (the operator is around and says keep going): wedges are
-   **data, not session-enders** — on a wedge (hang, fence timeout, marker):
-   capture forensics (`.auto/wedge-forensics.sh`: logcat tail, thermals, GPU
-   devfreq state, marker content → timestamped host file), append the event
-   to `RESEARCH_LOG.md`, attempt recovery **without rebooting** (idle a few
-   minutes, probe one load; reboot is the fallback, not a defeat), and keep
-   working — the operator stops the loop when the phone is needed.
-   **Unattended** (overnight loops): after a wedge, capture forensics and
-   STOP phone work — post-wedge measurements are invalid anyway, and an
-   unsupervised loop must not keep feeding a wedged driver; resume on
-   operator intervention or a fresh day. In both modes: kill stray benches
-   (`phone_common.sh: kill_benches` — TERM first, KILL only as fallback)
-   before every new measurement, and record `dumpsys thermalservice` when
-   numbers drift. Measurement hygiene: budget **≤ 8 model loads per boot**
-   for *clean-window* measurements (the driver degrades beyond that; batch
-   transcript gates to one load per model+binary); **settle ≥ 5 min after
-   boot** before the first round; keep the phone **screen-off with an
-   awake-hold** (`svc power stayon true`) or unlocked — on a locked phone
-   without a hold, system suspend stalls each decode round-trip ~0.7 s and
-   the numbers are void; energy runs need a **discharging** battery —
-   verify the charge counter moves between two reads before opening a
-   window. On wifi adb, stream bench output to device-side files and bound
-   every adb call with a host timeout (the TLS transport stalls under
-   sustained shell output).
+3. Device safety (#325): on a GPU failure (hang, fence timeout, wedge
+   marker) **capture it** — forensics (`.auto/wedge-forensics.sh` or
+   equivalent: logcat tail, thermals, marker content) plus a
+   `RESEARCH_LOG.md` entry. **Unattended loops stop** device work after a
+   failure; an attended operator may attempt recovery. Either way, measure
+   again only after a **verified recovery**: one healthy load and a fresh
+   baseline that matches the session's earlier numbers. **Terminate
+   cleanly** (`phone_common.sh: kill_benches` — TERM first, KILL only as
+   fallback) and **bound every transport call** (adb) with a host timeout.
+   Device-specific timings, load budgets and wake/energy conditions are
+   measurement protocol, kept with their evidence in
+   `benchmarks/fast_engine/AUTORESEARCH.md` ("Phone measurement protocol").
 4. Failures are data: append every attempt — kept or reverted — to the
    relevant `RESEARCH_LOG.md` with its numbers. "No improvement" is a valid
    result; say so.

@@ -99,15 +99,19 @@ void starling_ggml_free(starling_ggml_ctx * ctx);
 // terminal: subsequent model loads and inference return an error.
 void starling_ggml_shutdown(void);
 
-// Cooperative stop (#325 crash circumvention): request_stop() asks any
-// in-flight transcribe call to finish its current unit of work and return
-// early (the result is a valid prefix), so a SIGTERM'd process can exit
-// through normal destructors — destroying the Vulkan device instead of
-// leaving ~1.6 GB of live GPU state for the driver to reap asynchronously.
-// Correlate: the Pixel wedges (#325, RESEARCH_LOG P2-7) follow processes
-// that die with a live VkDevice (SIGKILL/SIGTERM run no destructors).
-// stop_requested() is the polling side; it never clears except via
-// clear_stop() (new process / deliberate reuse).
+// Cooperative stop (#325 crash circumvention): request_stop() asks the
+// process to wind down so a SIGTERM'd process can exit through normal
+// destructors — destroying the Vulkan device instead of leaving ~1.6 GB of
+// live GPU state for the driver to reap asynchronously. Correlate: the Pixel
+// wedges (#325, RESEARCH_LOG P2-7) follow processes that die with a live
+// VkDevice (SIGKILL/SIGTERM run no destructors).
+// Granularity: the fast MOSS engine checks the flag between decode rounds
+// and returns the valid prefix decoded so far (logged to stderr; the result
+// is otherwise indistinguishable from a normal one). Other engines finish
+// the current transcribe call; the caller checks stop_requested() between
+// calls. Async-signal-safe (lock-free atomic). stop_requested() is the
+// polling side; the flag stays set until clear_stop() (deliberate reuse of
+// the process).
 void starling_ggml_request_stop(void);
 int  starling_ggml_stop_requested(void);
 void starling_ggml_clear_stop(void);

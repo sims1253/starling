@@ -230,6 +230,8 @@ void starling_ggml_shutdown(void) {
 
 // ---- cooperative stop (#325: let a SIGTERM'd process tear down its GPU) ----
 namespace {
+// Set from signal handlers: only async-signal-safe while lock-free.
+static_assert(std::atomic<bool>::is_always_lock_free, "cooperative stop flag must be lock-free");
 std::atomic<bool> g_coop_stop{false};
 }
 

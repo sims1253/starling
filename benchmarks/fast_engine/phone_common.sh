@@ -26,21 +26,27 @@ screen_off() {
   esac
 }
 
-# SIGKILL any bench left running: a locally timed-out adb shell leaves the
+# Stop any bench left running: a locally timed-out adb shell leaves the
 # remote bench alive (its output pipe is gone; it can hang in poll forever).
 # #325 hygiene: SIGTERM first and give the process up to 10 s to exit through
 # its destructors (SIGKILL abandons a live VkDevice to the driver's async
-# reaping — a leading wedge correlate, RESEARCH_LOG P2-7). KILL is the
-# fallback, not the default.
+# reaping — a leading wedge correlate, RESEARCH_LOG P2-7). MOSS stops at the
+# next decode round; other engines finish the current call (seconds) and
+# stop between calls. KILL is the fallback, not the default. Every adb call
+# is bounded on the host, and the wait loop is bounded on the device too, so
+# a host timeout never orphans a remote shell.
 kill_benches() {
-  adb shell "for p in \$(pidof $BENCH_BINS); do kill -TERM \$p; done" >/dev/null 2>&1 || true
-  timeout 10 adb shell "while pidof $BENCH_BINS >/dev/null 2>&1; do sleep 1; done" \
-    >/dev/null 2>&1 || adb shell "for p in \$(pidof $BENCH_BINS); do kill -9 \$p; done" >/dev/null 2>&1 || true
+  timeout 15 adb shell "for p in \$(pidof $BENCH_BINS); do kill -TERM \$p; done" >/dev/null 2>&1 || true
+  timeout 20 adb shell "i=0; while pidof $BENCH_BINS >/dev/null 2>&1 && [ \$i -lt 10 ]; do sleep 1; i=\$((i+1)); done; ! pidof $BENCH_BINS >/dev/null 2>&1" \
+    >/dev/null 2>&1 && return 0
+  timeout 15 adb shell "for p in \$(pidof $BENCH_BINS); do kill -9 \$p; done" >/dev/null 2>&1 || true
+  timeout 20 adb shell "i=0; while pidof $BENCH_BINS >/dev/null 2>&1 && [ \$i -lt 10 ]; do sleep 1; i=\$((i+1)); done" \
+    >/dev/null 2>&1 || true
 }
 
 # Back-to-back model loads (1.6 GB each) need the previous process gone:
-# wait up to 120 s for it, then kill it.
+# wait up to 120 s for it, then kill it (bounded on the device as well).
 wait_benches() {
-  timeout 120 adb shell "while pidof $BENCH_BINS >/dev/null 2>&1; do sleep 1; done" \
+  timeout 130 adb shell "i=0; while pidof $BENCH_BINS >/dev/null 2>&1 && [ \$i -lt 120 ]; do sleep 1; i=\$((i+1)); done; ! pidof $BENCH_BINS >/dev/null 2>&1" \
     >/dev/null 2>&1 || kill_benches
 }

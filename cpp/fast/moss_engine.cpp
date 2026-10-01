@@ -759,11 +759,15 @@ bool MossEngine::Impl::record_decode(uint32_t steps, std::string& err) {
     const vk::Pipeline* ap = ctx->pipeline("attn_decode", {HDIM, MAXPOS}, err);
     if (!ap) return false;
     for (uint32_t s = 0; s < steps; ++s) {
-        // One command buffer per round, not per token: the per-step split
-        // dates from the original MOSS WIP; every segment was submitted
-        // back-to-back on the same queue and ordered by barriers anyway.
-        // Measured neutral on the Pixel 10 Pro (P2-2); kept for simplicity —
-        // 16x fewer command-buffer allocations per round.
+        // No split() per token: the decode recording is one command buffer
+        // per round (one submit instead of `steps`). The per-step split
+        // dated from the original MOSS WIP; the segments were submitted
+        // back-to-back on one queue and ordered by barriers anyway, and
+        // measured neutral on the Pixel 10 Pro (P2-2). Trade-off: a round
+        // is now one command buffer of `steps` tokens (~1 s on the Pixel at
+        // K=16), longer than the per-token jobs split() keeps short for
+        // driver watchdogs. If a driver's watchdog trips on that, lower
+        // STARLING_FAST_KSTEP.
         for (uint32_t l = 0; l < NL; ++l) {
             const LlmLayer& Y = llm[l];
             Kernels::GemvArgs a;
@@ -862,39 +866,56 @@ bool MossEngine::generate(const float* pcm, size_t n, std::vector<int32_t>& out_
 
     std::vector<uint32_t> st(16 + (size_t)I.cfg.max_new_tokens);
     int rounds = 0;
-    // Cooperative stop (#325): a SIGTERM'd process checks this between
-    // decode rounds and returns the valid prefix instead of dying with a
-    // live VkDevice (the driver's async reaping of ~1.6 GB of GPU state is
-    // the leading wedge-correlate; RESEARCH_LOG P2-7).
     // The device stops at EOS or the budget; the host bound only guards
     // against a state buffer that never reports either.
     const int max_rounds = (int)(I.cfg.max_new_tokens / steps) + 2;
     // Degradation watchdog (#325): the wedge is preceded by rounds that
     // blow past the session's own median (the bimodal 101-141 ms/token
-    // band, P2-7). Bound each fence wait at ~6x the running round median
-    // (floor 20 s) so a stalling driver is caught with the same wedge-marker
-    // semantics long before the 120 s default — instead of feeding a dying
-    // driver until it hangs. STARLING_FAST_STALL_MULT tunes the multiplier
-    // (0 disables); STARLING_FAST_STALL_BUDGET_MS forces an absolute budget
-    // (validation hook).
+    // band, P2-7). From the second round on, each fence wait is bounded at
+    // ~6x the running round median (floor 20 s) so a stalling driver is
+    // caught with the same wedge-marker semantics long before the 120 s
+    // default — instead of feeding a dying driver until it hangs. The first
+    // round has no history and keeps the 120 s default: a fixed floor there
+    // would misfire on slow drivers (llvmpipe at a large KSTEP).
+    // STARLING_FAST_STALL_MULT tunes the multiplier (0 disables);
+    // STARLING_FAST_STALL_BUDGET_MS forces an absolute budget for every
+    // round (validation hook).
     double stall_mult = 6.0;
-    if (const char* e = std::getenv("STARLING_FAST_STALL_MULT")) stall_mult = std::atof(e);
+    if (const char* e = std::getenv("STARLING_FAST_STALL_MULT")) {
+        char* end = nullptr;
+        const double v = std::strtod(e, &end);
+        if (end != e && *end == '\0' && v >= 0) stall_mult = v;
+        else std::fprintf(stderr, "[fast-moss] ignoring STARLING_FAST_STALL_MULT='%s' (want a number >= 0)\n", e);
+    }
     uint64_t forced_budget_ms = 0;
-    if (const char* e = std::getenv("STARLING_FAST_STALL_BUDGET_MS"))
-        forced_budget_ms = (uint64_t)std::max(0, std::atoi(e));
+    if (const char* e = std::getenv("STARLING_FAST_STALL_BUDGET_MS")) {
+        char* end = nullptr;
+        const unsigned long long v = std::strtoull(e, &end, 10);
+        if (end != e && *end == '\0') forced_budget_ms = v;
+        else std::fprintf(stderr, "[fast-moss] ignoring STARLING_FAST_STALL_BUDGET_MS='%s'\n", e);
+    }
     std::vector<double> round_ms;
     for (;;) {
-        if (starling_ggml_stop_requested()) break;
         if (!I.ctx->download(I.state, 0, st.data(), 16 * 4, err)) return false;
         if (st[2] != 0 || st[1] >= I.cfg.max_new_tokens) break;
+        // Cooperative stop (#325): a SIGTERM'd process checks this between
+        // decode rounds and returns the valid prefix instead of dying with a
+        // live VkDevice (the driver's async reaping of ~1.6 GB of GPU state
+        // is the leading wedge correlate; RESEARCH_LOG P2-7). Checked after
+        // the state refresh so the prefix includes the round just finished.
+        if (starling_ggml_stop_requested()) {
+            std::fprintf(stderr, "[fast-moss] stop requested: returning a %u-token prefix\n",
+                         std::min<uint32_t>(st[1], I.cfg.max_new_tokens));
+            break;
+        }
         if (rounds >= max_rounds) { err = "fast moss: decode did not terminate"; return false; }
-        uint64_t budget_ms = 0;
+        uint64_t budget_ms = 0;   // 0 = the runtime's 120 s default
         if (forced_budget_ms) budget_ms = forced_budget_ms;
         else if (stall_mult > 0 && !round_ms.empty()) {
             std::vector<double> srt(round_ms);
-            std::sort(srt.begin(), srt.end());
-            const double med = srt[srt.size() / 2];
-            budget_ms = (uint64_t)std::max(20.0 * 1000.0, stall_mult * med * 1000.0);
+            std::nth_element(srt.begin(), srt.begin() + srt.size() / 2, srt.end());
+            const double med_ms = srt[srt.size() / 2];
+            budget_ms = (uint64_t)std::max(20.0 * 1000.0, stall_mult * med_ms);
         }
         const auto t_round = std::chrono::steady_clock::now();
         if (!I.dec_rec->submit_and_wait(err, budget_ms)) return false;
