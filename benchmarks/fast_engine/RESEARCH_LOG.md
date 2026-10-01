@@ -619,3 +619,14 @@ untouched. (b) Short-fixture cell (single chunk, T~400, narrowest GEMMs):
 repack enc +21.65% / wall +8.77% — the workload matrix is now complete
 across short/medium/long (enc +21.65 / +18.99 / +19.00 repack-alone) and
 the effect does not degrade at small T.
+
+Energy + cold-start closure (run 28): (a) energy per transcription is NOT
+measurable on this device — the AMD powercap interface exists but the
+RAPL energy counters read empty without root/kernel support; noted for any
+future energy campaign. (b) Cold-start cell (first request after process
+start, no warmup — includes the one-time lazy repack transformation of
+every touched weight): median of 3 alternating fresh-process runs on
+short.wav, base 5010 ms vs repack 4659 ms (-7.0%). The repack
+transformation pays for itself within the very first transcription; no
+warm-up penalty exists for serving. All cells of the repack dossier that
+this device can measure are now closed.
