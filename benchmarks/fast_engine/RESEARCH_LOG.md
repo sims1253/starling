@@ -451,3 +451,29 @@ of that guard). Energy fast/idle points from the brief healthy window
 (27500 µAh/76 s fast, 7500 µAh/82 s idle, 12 runs, stayon) are recorded
 here for the next attempt; the full triple needs a rested phone off its
 charging pad.
+
+### P2-8 (2026-10-01): the certified 2.42 mWh was likely measured in the stall regime — method correction for the rerun
+
+The one healthy energy window of this session (fast 27500 µAh/76 s, idle
+7500 µAh/82 s; stayon held, discharging, no stalls) is internally consistent
+and physically plausible, and it disagrees with the #317 certification:
+
+| window | average power | note |
+| --- | --- | --- |
+| this session, fast engine working | **1.40 W** | 12 runs + load, stayon, no stalls |
+| this session, idle (awake) | 0.35 W | stayon idle rate |
+| certified fast window (302 s) | **0.51 W** | barely above its own 0.42 W dozing idle — not plausible for active GPU work |
+| certified ggml window (113 s) | 2.74 W | plausible for 6 CPU threads |
+
+Attribution: the certified fast window pre-dates the awake-hold protocol, so
+its 302 s (for ~100 s of load) were dominated by the locked-phone suspend
+stalls characterized in P2-3/P2-4 — the window's average collapsed toward
+idle and the idle-subtracted net (2.42 mWh/transcription) is very likely an
+**underestimate**. The honest expectation from this session's partial data:
+fast ≈ 5.5–6.6 mWh per MOSS-short transcription, fast:ggml ratio ≈ 3.3–4×
+(the ggml figure, 21.9 mWh, is measured in a regime where stalls cannot hide
+work and stands). Caveats on my side too: one window, 2500 µAh gauge quanta
+(±9 % fast, ±33 % on the short idle point), no ggml arm (truncated), and
+load-amortization spread (5.49–6.63). Rerun protocol for the rested phone:
+RUNS=24 (fast window ≈ 22 quanta, ±2 %), idle control ≈ 550 s (±5 %), ggml
+window ≈ 70 s, verify counter movement first, stayon held, discharging.
