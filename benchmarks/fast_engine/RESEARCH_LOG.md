@@ -599,3 +599,28 @@ no marker at any point), followed by one clean load: **healthy immediately
 Forensics of the post-storm healthy state captured (wedge-post-storm-*.txt,
 session dir). All artifacts: 62.9-63.4 ms/token baselines throughout, L1
 teardown lines on every clean exit, zero markers.
+
+### P2-14 (2026-10-01, attended): death-phase map completed — the damage is rare, not phase-deterministic
+
+Fresh boot (baseline 64.51), first death mid-UPLOAD (kill at ~4 s, partial
+1.6 GB mapping): probes 64.40 / 63.76 — **no damage**. Second death
+mid-WARMUP (kill at ~8 s, GPU computing with full memory resident):
+63.53 / 64.36 — **no damage**. Combined with P2-12/P2-13 (~35 kills today
+across phases and boot histories, zero wedges):
+
+| death condition | damage |
+| --- | --- |
+| fresh boot, first death, mid-transcription (P2-12, n=1) | persistent 2.2× degradation |
+| fresh boot, first death, mid-upload (n=1) | none |
+| any death on a post-cure boot (storms, mid-decode, mid-warmup) | none |
+
+The damaging kill is **rare, not phase-deterministic** — one event in ~30
+kills, with an additional confluence still unidentified (system load at
+death time is the leading remaining suspect; the P2-12 event followed heavy
+morning benchmarking). Practical conclusions for the product stand
+unchanged and strengthened: unclean death is USUALLY harmless but
+occasionally leaves persistent damage; **a clean device lifecycle repairs
+every degradation state observed**; hard wedges are a rare tail (never
+reproduced deliberately), bounded by the L2 watchdog. The remaining
+research (n>1 damage statistics, the exact confluence) belongs to the
+unattended long-run matrix with forensics on every anomaly.
