@@ -590,3 +590,11 @@ absent from the repack list (their view-use marks them never-repack;
 everything else repacks). Recommendation due diligence complete:
 performance, quality, blast radius, and memory are all measured for the
 x86 repack decision.
+
+Thread-count characterization (run 25): the engine already defaults to
+physical cores (graph.cpp: "SMT siblings measured slower at every stage";
+STARLING_GGML_THREADS overrides). Sweep on this 6C/12T notebook with the
+recommended config (repack+sel2+KVINR, short.wav, in-process medians):
+threads 4 / 6 / 8 / 12 -> enc stage 1849 / 1404 / 1439 / 1852 ms. The
+default (6 physical) is optimal on this device; the SMT penalty (~32% at
+12 threads) reconfirmed. No change warranted.
