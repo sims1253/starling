@@ -204,3 +204,12 @@ K energy of the compressed layers is not captured by these rank-32 subspaces
 regardless of fit composition, on samples this small. The single-domain
 calibration was the weak link — the original study's own caveat ("one
 language and one dataset") applies to the runtime path too.
+
+**Mechanism test (same campaign):** refitting the identical map from the
+unquantized bf16-exact GGUF gives enc +1.61%, transcripts identical, and
+WER +0.05 in-domain / +0.00 cross-domain — every gate green on both
+domains. The FLEURS "improvements" seen on the Q4_K model were therefore
+quantization-noise removal, and its cross-domain +0.64 was a
+projection×quantization interaction, not truncation-OOD: the same
+truncation on exact weights is domain-robust. The domain caveat in the
+verdict above applies to the dynq4 (Q4_K) file only.

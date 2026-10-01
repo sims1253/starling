@@ -48,7 +48,7 @@ def dequant_2d(t) -> np.ndarray:
     if qtype == gguf.GGMLQuantizationType.F32:
         return np.array(t.data, dtype=np.float32).reshape(ne1, ne0)
     if qtype == gguf.GGMLQuantizationType.BF16:
-        raw = np.array(t.data, dtype=np.uint16).reshape(-1)
+        raw = np.ascontiguousarray(t.data, dtype=np.uint8).reshape(-1).view(np.uint16)
         return (raw.astype(np.uint32) << 16).view(np.float32).reshape(ne1, ne0)
     cls = getattr(gguf.quants, qtype.name, None)
     if cls is None:

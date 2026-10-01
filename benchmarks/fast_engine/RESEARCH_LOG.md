@@ -502,3 +502,21 @@ granite_fairness_test. (granite_ctc_chunk/fused_parity need external CTC
 GGUF fixtures and are not in CI.) The #59 research path changes
 (capi/encoder/loader/kv_factors) are regression-clean against the repo's
 own suite; no code change in this run.
+
+Mechanism test on the unquantized model (run 18): the same selective
+map+in-r config refit from granite-speech-4.1-2b-bf16-exact.gguf (K dumps
+re-taken; factors bit-exact vs HF verified after fixing a BF16 reinterp
+bug in dequant_2d). Results: enc +1.61% (same band as dynq4's
+1.55-1.68% — the win is structural, not quant-dependent); transcripts
+identical; FLEURS draw1 WER +0.05 (vs dynq4's -0.19) and the
+LibriSpeech-style domain probe +0.00 (vs dynq4's +0.64 FAIL).
+Mechanism conclusions, now measured rather than inferred: (a) the WER
+"improvements" on dynq4 were removal of Q4_K quantization noise by the
+speech-subspace projection (pure truncation costs only ~+0.05 in-domain);
+(b) the cross-domain failure on dynq4 is an interaction between the
+projection and weight quantization on OOD speech — on exact weights the
+same truncation costs ZERO cross-domain. Deliverable refinement: on the
+bf16-exact GGUF the config passes every gate on BOTH domains; the
+domain-conditional caveat is specific to the aggressively quantized
+dynq4 file. Side observation: the bf16 encoder is faster than dynq4's on
+this CPU (bf16 row-dots beat Q4_K block-dots for these shapes).
