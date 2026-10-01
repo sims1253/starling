@@ -51,8 +51,6 @@ if [ "$(adb shell "sha256sum $DEV/starling-bench-base" 2>/dev/null | cut -d' ' -
   echo "WARNING: base and cand are the same binary with the same env — delta is an A/A noise measurement, not a comparison" >&2
 fi
 
-kill_benches
-
 median() { sort -n | awk '{a[NR]=$1} END {print (NR % 2) ? a[(NR+1)/2] : (a[NR/2]+a[NR/2+1])/2}'; }
 
 # bench <binary> <model> <gguf> <wav> <extra> -> raw output of one invocation.
@@ -68,6 +66,7 @@ decode_mspt() { sed -n 's/.*decode=\([0-9.]*\)ms (\([0-9]*\) tokens.*/\1 \2/p' "
 total_ms() { sed -n 's/.*time=\([0-9.]*\)ms.*/\1/p' "$1"; }
 
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"; kill_benches || true' EXIT
+kill_benches
 
 declare -a base_vals cand_vals
 screen_off
