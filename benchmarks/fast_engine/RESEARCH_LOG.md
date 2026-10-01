@@ -376,3 +376,28 @@ historical 68–77 band; cool device, screen off, `svc power stayon true`).
   for builds). P2-2's RADV ≤10 % check must be run elsewhere before merge;
   it is a pure host-side recording change (dispatch count identical, one
   segment per round), so the risk is structural, not numerical.
+
+### P2-3/P2-4 (2026-10-01, same loop): the locked-phone stall attributed; engine-side fix rejected as artifact-chasing
+
+Follow-up to the locked-phone protocol note above. Probing for an
+engine-side fix (submit the next decode round before downloading the
+previous state, hiding the round-trip) required knowing whether the ~0.7–2 s
+stall is CPU-side (hideable) or the GPU itself stalling under system
+suspend. Findings:
+
+- With true idle between invocations (`stayon=0`), decode medians were
+  105–131 ms/token (3 fresh processes); **any concurrent shell activity
+  masks the stall** — an earlier probe that sampled GPU frequency every 2 s
+  measured a "clean" 69.2 ms/token run, but the sampling loop itself was
+  holding the system awake. Sampling probes on this phone perturb the state
+  they sample; treat single-run anecdotes accordingly.
+- GPU `cur_freq` reads 1094 MHz under load in every observable state — but
+  per the above, the observation is only valid while something keeps the
+  system awake, so it cannot discriminate the suspend mechanism.
+- Verdict: the stall is **system suspend during GPU work, an idle-entry
+  effect on fresh processes** (continuous activity — `svc power stayon`,
+  an in-use unlocked phone, or an app wakelock — prevents it entirely). A
+  real transcription app holds a wakelock while working, so an engine-side
+  round-trip optimization would tune the engine to a benchmark artifact;
+  **rejected without building it**. Honest measurement conditions:
+  stayon (protocol v2), one unlock after boot, or the app's own wakelock.
