@@ -569,3 +569,14 @@ reinterpretED: the factor path shares the dot-method sensitivity of the
 SHIPPED repack knob (Android default) and has no unique domain fragility.
 Long-workload seal for the recommended config (repack+sel2+KVINR, 74 s
 fixture): enc +19.00% / wall +8.84% — matches medium's +19.62/+8.69 band.
+
+Repack blast-radius sweep (run 22): STARLING_GGML_CPU_REPACK=1 on the
+frozen binary across the other ggml-engine models (transcript contract,
+short+medium fixtures): parakeet-tdt q4, MOSS q4, qwen3-1.7b dynq4 —
+transcripts IDENTICAL on every model (granite already validated in run
+20). Indicative single-run wall times on medium.wav (not the paired A/B
+protocol): parakeet 2128->1641 ms (-23%), moss 13564->11728 ms (-14%),
+qwen3 13327->12500 ms (-6%). The x86 repack recommendation is therefore
+engine-wide: every measured model benefits and every transcript contract
+holds. A rigorous per-model A/B (alternating, >=3 reps) belongs to the
+repack-default issue if humans take it.
