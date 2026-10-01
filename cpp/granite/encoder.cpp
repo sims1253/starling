@@ -36,6 +36,7 @@
 // STARLING_GRANITE_DUMP_ENC file and transcription stops with an error.
 #include "encoder.hpp"
 
+#include "kv_factors.hpp"
 #include "runtime/backend.hpp"
 #include "runtime/graph.hpp"
 #include "runtime/graph_builder.hpp"
@@ -149,7 +150,43 @@ ggml_tensor* shaw_attention(ggml_context* c, const GraniteModel& m, int li,
     ggml_tensor* n = lib::layer_norm_bf16(c, ml, x, p + "attn_norm",
                                           ec.layer_norm_eps);
     ggml_tensor* q = lib::linear_bf16(c, ml, n, p + "attn_q", false);   // [hidden, T]
-    ggml_tensor* kv = lib::linear_bf16(c, ml, n, p + "attn_kv", false); // [2*hidden, T]
+    // Issue #59 research path: per-head low-rank K and/or V projections
+    // (STARLING_GRANITE_KVFACT). k_h = (n @ C_h^T) @ B_h^T — two f32 GEMMs
+    // per head-batch with the same bf16 rounding boundaries as linear_bf16.
+    // A rank-0 half keeps the original fused rows (sliced out of the fused
+    // weight so the factored half's GEMM is not computed at all).
+    ggml_tensor* k = nullptr;
+    ggml_tensor* v = nullptr;
+    ggml_tensor* kv = nullptr;  // fused path only (no factors at all)
+    const KVFactors& kvf = m.kv_factors;
+    const bool k_lr = kvf.rank_k > 0, v_lr = kvf.rank_v > 0;
+    auto lr_expand = [&](const std::vector<float>& f1, const std::vector<float>& f2,
+                         int rank) -> ggml_tensor* {
+        const int64_t r_tot = (int64_t) kvf.n_heads * rank;
+        const int64_t ne1[2] = { kvf.hidden, r_tot };
+        const int64_t ne2[2] = { r_tot, kvf.hidden };
+        ggml_tensor* a = graph_input_tensor(c, GGML_TYPE_F32, 2, ne1,
+                                            f1.data(), f1.size() * sizeof(float));
+        ggml_tensor* b = graph_input_tensor(c, GGML_TYPE_F32, 2, ne2,
+                                            f2.data(), f2.size() * sizeof(float));
+        ggml_tensor* z = bf16(c, ggml_mul_mat(c, a, f32(c, n)));
+        return bf16(c, ggml_mul_mat(c, b, f32(c, z)));                  // [hidden, T]
+    };
+    if (k_lr || v_lr) {
+        if (k_lr != v_lr) {
+            // Keep the unfactored half on the original weight, sliced to its
+            // rows: per-row dots are identical to the fused GEMM's.
+            ggml_tensor* w = lib::weight(c, ml, p + "attn_kv.weight");
+            const size_t off = (k_lr ? (size_t) hidden : 0) * w->nb[1];
+            ggml_tensor* wh = ggml_view_2d(c, w, hidden, hidden, w->nb[1], off);
+            ggml_tensor* half = bf16(c, ggml_mul_mat(c, wh, lib::gemm_act(c, wh, n)));
+            if (k_lr) v = half; else k = half;
+        }
+        if (k_lr) k = lr_expand(kvf.f1k[(size_t) li], kvf.f2k[(size_t) li], kvf.rank_k);
+        if (v_lr) v = lr_expand(kvf.f1v[(size_t) li], kvf.f2v[(size_t) li], kvf.rank_v);
+    } else {
+        kv = lib::linear_bf16(c, ml, n, p + "attn_kv", false);          // [2*hidden, T]
+    }
     // Zero-pad to whole blocks (the projections are bias-free, so padding the
     // projected q/kv with zero rows equals the reference's pad-then-project).
     if (s.pad > 0) {
@@ -157,19 +194,29 @@ ggml_tensor* shaw_attention(ggml_context* c, const GraniteModel& m, int li,
         ggml_tensor* zq = graph_input_tensor(c, GGML_TYPE_F32, 2, qne,
                                              s.zeros_q.data(),
                                              s.zeros_q.size() * sizeof(float));
-        int64_t kvne[2] = {hidden * 2, s.pad};
-        ggml_tensor* zkv = graph_input_tensor(c, GGML_TYPE_F32, 2, kvne,
-                                              s.zeros_kv.data(),
-                                              s.zeros_kv.size() * sizeof(float));
-        q = bf16(c, ggml_concat(c, f32(c, q), zq, 1));
-        kv = bf16(c, ggml_concat(c, f32(c, kv), zkv, 1));
+        auto padz = [&](ggml_tensor* t) {
+            return bf16(c, ggml_concat(c, f32(c, t), zq, 1));
+        };
+        q = padz(q);
+        if (kv) {
+            int64_t kvne[2] = {hidden * 2, s.pad};
+            ggml_tensor* zkv = graph_input_tensor(c, GGML_TYPE_F32, 2, kvne,
+                                                  s.zeros_kv.data(),
+                                                  s.zeros_kv.size() * sizeof(float));
+            kv = bf16(c, ggml_concat(c, f32(c, kv), zkv, 1));
+        } else {
+            k = padz(k);
+            v = padz(v);
+        }
     }
-    // Split kv: k = rows [0, hidden), v = rows [hidden, 2*hidden). The strided
-    // half-views go through cont() (a value-exact copy) — reshape_4d below
-    // asserts contiguity.
-    ggml_tensor* k = ggml_cont(c, ggml_view_2d(c, kv, hidden, T_pad, kv->nb[1], 0));
-    ggml_tensor* v = ggml_cont(c, ggml_view_2d(c, kv, hidden, T_pad, kv->nb[1],
-                                               (size_t) hidden * kv->nb[0]));
+    if (kv) {
+        // Split kv: k = rows [0, hidden), v = rows [hidden, 2*hidden). The
+        // strided half-views go through cont() (a value-exact copy) —
+        // reshape_4d below asserts contiguity.
+        k = ggml_cont(c, ggml_view_2d(c, kv, hidden, T_pad, kv->nb[1], 0));
+        v = ggml_cont(c, ggml_view_2d(c, kv, hidden, T_pad, kv->nb[1],
+                                      (size_t) hidden * kv->nb[0]));
+    }
     // [hidden, T_pad] -> [D, H, CS, nblk].
     auto to_blocks = [&](ggml_tensor* z) {
         return ggml_reshape_4d(c, z, D, H, CS, nblk);
