@@ -580,3 +580,13 @@ qwen3 13327->12500 ms (-6%). The x86 repack recommendation is therefore
 engine-wide: every measured model benefits and every transcript contract
 holds. A rigorous per-model A/B (alternating, >=3 reps) belongs to the
 repack-default issue if humans take it.
+
+Memory posture (run 23): peak RSS on granite dynq4 short.wav — default
+1900 MB, repack-only 1904 MB (+4 MB: the q4_K_8x8 interleaved layout is
+size-neutral), repack+sel2+KVINR 1935 MB (+35 MB: factor file + f2tk +
+misc). The repack log also confirms the designed interaction: with factors
+on, the compressed layers' enc.blk.{0,4,6,9,10,11,12,13}.attn_kv are
+absent from the repack list (their view-use marks them never-repack;
+everything else repacks). Recommendation due diligence complete:
+performance, quality, blast radius, and memory are all measured for the
+x86 repack decision.
