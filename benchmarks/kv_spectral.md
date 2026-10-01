@@ -93,9 +93,25 @@ fixtures; FLEURS en_us test 100-clip WER gate at 0.2 points):
 | weight-space SVD | 24 | +2.56% | +0.71% | identical | +0.28 FAIL |
 | weight-space SVD | 16 | +2.79% | +1.15% | identical | +0.19 pass |
 | weight-space SVD | 8 | — | — | differ | — |
-| K+V both r=32 | 32 | — | — | destroyed | — |
+| K+V both r=32 | 32 | — | — | destroyed (invalid run, see note) | — |
 | bf16-activation PCA | 32 | +2.20% | +0.82% | identical | +0.42 FAIL |
 | runtime-activation PCA | 32 | +2.12% | +1.14% | identical | +0.28 FAIL |
+
+Note on the K+V row (post-review correction): that run is void. The
+engine loader then read every layer's K payload before any V payload, while
+the exporter writes each layer's K and V together, so in a K+V file only
+layer 0's K landed in place; every other K and V slot held another layer's
+or the other half's factors.
+The destroyed transcripts measured that misassignment, not V compression.
+The loader now reads the layer-major order and the unit test
+`cpp/tests/granite_kv_factors_test.cpp` pins it; the run has not been
+repeated (it needs the notebook's model and fixtures). The V verdict rests
+on the V calibration instead: V is full-rank in every layer (held-out
+rel-MSE 0.12-0.51 at r=32, below), and that PCA basis is already the best
+rank-32 subspace for the fit activations, so a weight-space basis is not
+expected to do better.
+K-only and v3 selective files (every kept result) were unaffected: their
+payload order is identical under both readings.
 
 Memory does not improve: the factor file is additional resident data
 (f32 r=16 factors ≈ 2x the Q4_K K-half bytes; peak RSS 1900 → 1929 MB).
@@ -260,7 +276,17 @@ any change; every delta alternating-A/B vs that binary, median of 3x3):
    on granite/parakeet/moss/qwen3, WER neutral both draws, +4 MB RSS.
    Stacked with the #59 map: enc +19.00-19.62%. The x86 default flip is a
    one-line production decision left to humans with this dossier.
-Tooling committed: 3 factor exporters, the v3 format + STARLING_GRANITE_
+
+**Evidence caveat (post-review):** every delta above is an alternating
+A/B median from `starling-bench` with per-arm spreads, not the paired
+comparator (`benchmarks/experiments/run_experiment.py`) and its confidence
+interval that AUTORESEARCH.md asks for on CPU work. For the repack result
+(+19%, against ~±0.1% per-arm spreads and a 19.00-19.62 four-session band)
+that does not change the conclusion. For the selective map + in-r
+(+1.55-1.68% enc, wall +0.15-0.94% across sessions) it does: treat that gain
+as indicative until a comparator run with a CI confirms it. The factor path
+stays env-gated off either way.
+Tooling committed: 4 factor exporters, the v3 format + STARLING_GRANITE_
 DUMP_K/V probes, STARLING_GRANITE_KVFACT/KVINR env paths (default off,
 default path verified neutral repeatedly; all CI granite tests pass).
 
@@ -273,14 +299,22 @@ builds):
 uv run python benchmarks/fast_engine/export_fleurs.py --cfg en_us \
     --split train --n 8 --out .auto/fleurs_train8
 # 2. Runtime K/V dumps per clip (one process per clip, unique prefix;
-#    any starling-bench build with the dump probe; per model file):
+#    any starling-bench build with the dump probe; per model file; the
+#    probe does not create directories):
+mkdir -p .auto/kdumps
 for i in 0 1 2 3 4 5 6 7; do
   STARLING_GRANITE_DUMP_K=.auto/kdumps/clip$i ./build-59cand/starling-bench \
     --model granite --gguf models/granite-2b-dynq4.imx.gguf --runs 1 --quiet \
     .auto/fleurs_train8/en_us_000$i.wav
 done
-# 3. Export the selective map (fit clips 0-6; clip 7 held out for the
-#    printed sanity MSE):
+# 3. Export the selective map. The exporter holds out the LAST prefix, so
+#    this fits clips 0-5 and holds out clip 6 for the printed sanity MSE;
+#    clip 7 is dumped but unused here. The pinned hashes below were
+#    recorded as byte-verified against this recipe (ce90c55, run 30), so
+#    the command, not the earlier "fit 0-6, hold out 7" prose, is taken as
+#    authoritative; passing clip 7 too yields a different artifact. If
+#    these exact inputs do not reproduce the hash on the notebook, the
+#    measured artifact was fitted on another split.
 uv run python benchmarks/export_kv_lowrank_selective.py \
   --gguf models/granite-2b-dynq4.imx.gguf \
   --dumps .auto/kdumps/clip{0..6} \

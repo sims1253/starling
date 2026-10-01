@@ -249,13 +249,17 @@ bool GraniteModel::load(const char* path, std::string& err) {
     }
     // Issue #59 research path: optional low-rank K/V attention factors.
     // Opt-in via STARLING_GRANITE_KVFACT=<factor file>; numerics-changing.
+    // STARLING_GRANITE_KVINR is read here, once, alongside it: the encoder
+    // follows kv_factors.in_r, never the live environment.
     if (const char* kvf = std::getenv("STARLING_GRANITE_KVFACT")) {
+        const bool want_in_r = std::getenv("STARLING_GRANITE_KVINR") != nullptr;
         if (!kv_factors.load(kvf, (int) c.encoder.n_layers, (int) c.encoder.hidden,
-                             (int) c.encoder.n_heads, err))
+                             (int) c.encoder.n_heads, want_in_r, err))
             return false;
         std::fprintf(stderr, "GRANITE: low-rank K/V factors enabled "
-                    "(rank_k=%d, rank_v=%d, from %s)\n",
-                    kv_factors.rank_k, kv_factors.rank_v, kvf);
+                    "(%s rank_k=%d, rank_v=%d, in_r=%d, from %s)\n",
+                    kv_factors.rank_k_l.empty() ? "uniform" : "per-layer max",
+                    kv_factors.rank_k, kv_factors.rank_v, kv_factors.in_r ? 1 : 0, kvf);
     }
     return true;
 }

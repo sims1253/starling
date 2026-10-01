@@ -353,7 +353,7 @@ short/medium/long transcripts identical for every kept row. WER gate
 | weight-space K r=16 | +2.79% | +1.15% | identical | +0.19 (5.85->6.03) PASS | only gate-clearing config |
 | weight-space K r=24 | +2.56% | +0.71% | identical | +0.28 FAIL | discarded |
 | weight-space K r=8 | - | - | DIFFER | - | rejected at probe |
-| K+V r=32 | - | - | destroyed | - | rejected at probe (V not compressible) |
+| K+V r=32 | - | - | destroyed | - | VOID: loader misassigned K+V factors (see post-review note); V verdict rests on calibration |
 | activation basis r=32 (bf16 ref K) | +2.20% | +0.82% | identical | +0.42 FAIL | discarded |
 | runtime-fitted basis r=32 (engine K dumps) | +2.12% | +1.14% | identical | +0.28 FAIL | discarded |
 
@@ -694,7 +694,8 @@ MOSS repack instability — root-cause seed (run 35): quant-type maps from
 the GGUFs. MOSS q4-fullimx: enc 0.65B elements = 97% Q4_0 (633M) + 2%
 BF16; llm 1.72B = 82% Q4_0; adapter 50M Q4_0. Granite dynq4: K-quants
 (Q6_K/Q5_K/Q4_K) + BF16. Parakeet's q4_0 is decoder-LSTM/joint only
-(tiny) and it passed the gate. Hypothesis for the filed MOSS issue: MOSS
+(tiny) and it passed the gate. Hypothesis for the MOSS follow-up (recorded
+here; no GitHub issue filed yet): MOSS
 is the only engine whose ENCODER GEMMs are Q4_0-dominated, and the
 repacked q4_0_8x8 dot sits numerically further from its scalar dot than
 the K-quant repack paths do — compounded by MOSS's highest baseline WER
@@ -716,8 +717,8 @@ MODEL property — MOSS's decode has the most near-boundary decisions
 so any dot-method perturbation flips ~±11 words; exactly how granite's
 8-clip hair-trigger behaved at smaller scale. Implication for the flip
 decision: no engine/format bug; the choice for MOSS-class models is
-policy (accept the ±0.4 wobble or keep repack off for them). The filed
-issue's dot-error harness is now predicted to show equal Q4_0/Q4_K
+policy (accept the ±0.4 wobble or keep repack off for them). The follow-
+up's dot-error harness is now predicted to show equal Q4_0/Q4_K
 distances; run it to close formally, but the empirical evidence points
 at decode margins.
 
@@ -754,3 +755,27 @@ sel2 + KVINR) vs the frozen baseline (sha 0a0f3e1c...): enc +19.09%,
 wall +8.76%, transcripts identical — the four-session enc band now
 19.00-19.62. Session state at handoff: baseline binary 0a0f3e1c2c6e,
 candidate 7727491120e0, tree clean, CI granite tests green.
+
+Post-review fixes (PR #381 review, after run 39; desktop, no notebook
+re-measurement). Four defects in the env-gated factor path, all
+reproduced by the new `cpp/tests/granite_kv_factors_test.cpp` against the
+run-39 code and fixed:
+(1) the loader read all K payloads before all V payloads while every
+exporter writes them layer by layer (K then V), so v1 K+V files loaded
+with layers swapped — the "K+V r=32 destroyed" row above is void. K-only
+and v3 K-only files (every kept result, incl. sel2) parse identically
+under both orders, so no kept number changes.
+(2) STARLING_GRANITE_KVINR was latched twice — at load (f2tk) and at the
+first encoder call (in-r branch); setting it in between dereferenced an
+empty f2tk (segfault). It is now read once at load (KVFactors::in_r).
+(3) ranks were never bounded: rank > head_dim loaded and then aborted in a
+ggml view assert. The loader now rejects ranks outside [0, head_dim],
+truncated payloads and trailing bytes.
+(4) the kv_spectral.md recipe's prose said "fit 0-6, hold out 7" but the
+command fits 0-5 and holds out 6. The hashes were recorded as verified
+against the command (ce90c55, run 30), so the prose was corrected, not the
+command; re-checking the hash on the notebook would settle it for good.
+Also: K/V dumps check their writes, DUMP_K + KVINR is rejected (in-r has
+no K tensor to dump), factor runs take the one-shot encoder path on GPU,
+and the activation/runtime/selective exporters share one PCA-fold helper
+(byte-identical outputs on a synthetic GGUF + dumps).

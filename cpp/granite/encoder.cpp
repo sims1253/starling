@@ -167,14 +167,14 @@ ggml_tensor* shaw_attention(ggml_context* c, const GraniteModel& m, int li,
     // rank basis (z) and fold the expand basis into q (qtilde = f2T @ q), so
     // content scores contract over rank instead of head_dim. Same v3 factor
     // file; numerically the SAME truncation with the intermediate bf16 round
-    // moved from the K side to the Q side.
-    static const bool inr_env = std::getenv("STARLING_GRANITE_KVINR") != nullptr;
+    // moved from the K side to the Q side. Decided at model load (kvf.in_r),
+    // which is also what materializes f2tk.
     ggml_tensor* z_lr = nullptr;      // [n_heads*rank, T] when in-r is active
     ggml_tensor* qtilde = nullptr;    // [n_heads*rank, T]
     const KVFactors& kvf = m.kv_factors;
     const int rk = kvf.rank_layer_k(li), rv = kvf.rank_layer_v(li);
     const bool k_lr = rk > 0, v_lr = rv > 0;
-    const bool inr = inr_env && k_lr;
+    const bool inr = kvf.in_r && k_lr;
     auto lr_expand = [&](const std::vector<float>& f1, const std::vector<float>& f2,
                          int rank) -> ggml_tensor* {
         const int64_t r_tot = (int64_t) kvf.n_heads * rank;
@@ -240,8 +240,10 @@ ggml_tensor* shaw_attention(ggml_context* c, const GraniteModel& m, int li,
             v = padz(v);
             if (inr) {
                 // Rank-space operands: zeros view of width r_tot (rows of the
-                // shared [hidden, pad] zero buffer; r_tot <= hidden always).
+                // shared [hidden, pad] zero buffer; KVFactors::load bounds
+                // every rank by head_dim, so r_tot <= hidden).
                 const int64_t rt = z_lr->ne[0];
+                GGML_ASSERT(rt <= zq->ne[0]);
                 ggml_tensor* zr = ggml_cont(c, ggml_view_2d(c, zq, rt, s.pad,
                                                             zq->nb[1], 0));
                 z_lr = bf16(c, ggml_concat(c, f32(c, z_lr), zr, 1));
@@ -554,14 +556,24 @@ bool encode_audio_and_project(const GraniteModel& model, const MelFeatures& mel,
     // this path — a truncated probe graph must never enter the ReplayGraph
     // LRU, where it would poison later normal transcriptions at the same
     // mel length (pullfrog review).
+    // The #59 research paths (K/V dumps, low-rank factors) are one-shot only
+    // too: factor matrices are host-side graph inputs that a replay would
+    // re-upload on every call.
     if (!global_backend().is_gpu() || lib::debug_enabled("STARLING_GRANITE_DEBUG") ||
         std::getenv("STARLING_GRANITE_ONLY") ||
-        std::getenv("STARLING_GRANITE_DUMP_K")) {
+        std::getenv("STARLING_GRANITE_DUMP_K") || model.kv_factors.enabled()) {
         EncScratch s = make_scratch(model.config, T);
         std::vector<float> enc_out;
         StageStop stop{std::getenv("STARLING_GRANITE_ONLY")};
         // #59 runtime-K/V probe: per-layer padded K/V [hidden, T_pad] f32 dumps.
         const char* kdump_env = std::getenv("STARLING_GRANITE_DUMP_K");
+        if (kdump_env && model.kv_factors.in_r) {
+            // In-r mode never materializes K (scores contract over the rank
+            // basis), so there is nothing [hidden, T_pad]-shaped to dump.
+            err = "GRANITE K/V dump: STARLING_GRANITE_DUMP_K cannot be combined "
+                  "with STARLING_GRANITE_KVINR";
+            return false;
+        }
         EncKVDump k_dump;
         if (kdump_env) {
             k_dump.k.resize((size_t) ec.n_layers);
@@ -585,10 +597,11 @@ bool encode_audio_and_project(const GraniteModel& model, const MelFeatures& mel,
                     const auto& buf = suffix[0] == 'L' ? k_dump.k[li] : k_dump.v[li];
                     std::string path = std::string(kdump_env) + "." + suffix +
                                        std::to_string(li) + ".f32";
-                    if (FILE* f = std::fopen(path.c_str(), "wb")) {
-                        std::fwrite(buf.data(), sizeof(float), buf.size(), f);
-                        std::fclose(f);
-                    } else {
+                    FILE* f = std::fopen(path.c_str(), "wb");
+                    bool wrote = f && std::fwrite(buf.data(), sizeof(float), buf.size(),
+                                                  f) == buf.size();
+                    if (f) wrote = std::fclose(f) == 0 && wrote;
+                    if (!wrote) {
                         err = "GRANITE K/V dump: cannot write " + path;
                         return false;
                     }

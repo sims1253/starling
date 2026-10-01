@@ -30,14 +30,12 @@ import argparse
 import sys
 from pathlib import Path
 
-import numpy as np
-
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(REPO / "src"))
 
 import bench_kv_spectral as kvs  # noqa: E402  (capture classes, unmodified)
-from export_kv_lowrank import dequant_2d  # noqa: E402
+from export_kv_lowrank import check_rank, dequant_2d, fit_pca_fold  # noqa: E402
 
 import gguf  # noqa: E402
 import torch  # noqa: E402
@@ -52,9 +50,12 @@ def main() -> int:
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
+    if len(args.audio) < 2:
+        raise ValueError("need at least 2 --audio clips (even = fit, odd = held-out)")
     clips = kvs.gather_calibration_clips(len(args.audio),
                                          [Path(a) for a in args.audio])
-    assert len(clips) == len(args.audio), "clip gathering mismatch"
+    if len(clips) != len(args.audio):
+        raise RuntimeError(f"clip gathering mismatch: {len(clips)} of {len(args.audio)}")
 
     # --- capture K per layer over the calibration clips (torch, bf16 oracle)
     from starling.config import DEFAULT_TASK_PROMPT
@@ -83,6 +84,7 @@ def main() -> int:
 
     n_layers = cap.num_layers
     n_heads, head_dim = cap.num_heads, cap.head_dim
+    check_rank(args.rank_k, head_dim, "--rank-k")
     hidden = None
 
     # Fit: even clips. Held-out check: odd clips.
@@ -101,29 +103,12 @@ def main() -> int:
         if hidden is None:
             hidden = w.shape[1]
         wk = w[: w.shape[0] // 2]   # K half [hidden, hidden] (out, in)
-        f1 = np.zeros((n_heads * args.rank_k, hidden), dtype=np.float32)
-        f2 = np.zeros((hidden, n_heads * args.rank_k), dtype=np.float32)
-        err_fit = err_held = en_fit = en_held = 0.0
-        for h in range(n_heads):
-            X = K_fit[:, h, :].numpy().astype(np.float64)   # [T, 128]
-            # top-r RIGHT singular vectors of X = directions in K-space
-            _, _, Vt = np.linalg.svd(X, full_matrices=False)
-            B = Vt[: args.rank_k].T                           # [128, r]
-            Xh = K_held[:, h, :].numpy().astype(np.float64)
-            err_held += float((((Xh @ B) @ B.T - Xh) ** 2).sum())
-            en_held += float((Xh ** 2).sum())
-            err_fit += float((((X @ B) @ B.T - X) ** 2).sum())
-            en_fit += float((X ** 2).sum())
-            W_h = wk[h * head_dim:(h + 1) * head_dim].astype(np.float64)
-            # W ~= B @ (B^T W)  ->  z = n @ (W^T B),  k ~= z @ B^T
-            M = W_h.T @ B                                    # [in=hidden, r]
-            f1[h * args.rank_k:(h + 1) * args.rank_k, :] = M.T.astype(np.float32)
-            f2[h * head_dim:(h + 1) * head_dim,
-               h * args.rank_k:(h + 1) * args.rank_k] = B.astype(np.float32)
+        f1, f2, e = fit_pca_fold(K_fit.numpy(), K_held.numpy(), wk, n_heads, args.rank_k)
         f1k_l.append(f1)
         f2k_l.append(f2)
-        print(f"  layer {li:2d}: uncentered K proj rel-MSE fit={err_fit / en_fit:.4f} "
-              f"held-out={err_held / en_held:.4f}", flush=True)
+        print(f"  layer {li:2d}: uncentered K proj rel-MSE "
+              f"fit={e['err_fit'] / e['en_fit']:.4f} "
+              f"held-out={e['err_held'] / e['en_held']:.4f}", flush=True)
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
