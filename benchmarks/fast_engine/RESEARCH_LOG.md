@@ -481,3 +481,15 @@ inside the +-0.2 band on these small sets. Deliverable claim downgraded:
 "WER neutral on the calibration domain; +0.6-0.8 observed on a small
 read-speech set" — the env-gated OFF default is the correct production
 posture; any enablement needs domain-matched re-gating.
+
+Functional-surface survey + hygiene (run 16): the granite CTC speculative
+path (ctc_max_k > 0, extract_ctc_draft -> shaw_attention with factors)
+has NO live consumer today (serve/stream/tools never pass it; only the
+deprecated Python research backend used it) — exercising the factor path
+there would require a starling-bench flag, i.e. a measurement-stack change
+(out of loop scope per AUTORESEARCH hard constraint 1; noted as future
+issue material if the spec path is ever wired up). Hygiene: f2tk (the
+in-r transpose, ~15 MB) is now materialized only when
+STARLING_GRANITE_KVINR is set. Confirmation A/B after the change: enc
++1.55% — within the config's four-session band (1.55/1.65/1.67/1.68,
+mean ~1.64); transcripts identical; default path unchanged.

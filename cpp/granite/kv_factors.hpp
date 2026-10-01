@@ -27,6 +27,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <algorithm>
 #include <string>
 #include <vector>
@@ -132,8 +133,10 @@ inline bool KVFactors::load(const char* path, int exp_layers, int exp_hidden,
     if (ok && rank_v > 0) ok = read_half(rank_v_l, rank_v, f1v, f2v);
     std::fclose(f);
     if (!ok) return false;
-    // Materialize f2tk = f2k^T for the K half (in-r-space score path).
-    if (rank_k > 0) {
+    // Materialize f2tk = f2k^T for the K half — only when the in-r-space
+    // score path is active (STARLING_GRANITE_KVINR); otherwise the ~15 MB
+    // transpose would sit unused in memory.
+    if (rank_k > 0 && std::getenv("STARLING_GRANITE_KVINR")) {
         f2tk.resize(f2k.size());
         for (size_t i = 0; i < f2k.size(); ++i) {
             if (f2k[i].empty()) continue;
