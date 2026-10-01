@@ -676,3 +676,16 @@ threads-sweep delta was run-to-run noise, not mel parallelism; the knob
 verdict (default optimal, negligible) stands with a better number. The
 audit itself is the completeness proof: no unmeasured enc-relevant
 tunable exists in the engine.
+
+Per-engine repack WER gates (run 34) — a decision-changing caveat found:
+the repack WER gate (FLEURS 100 clips, both disjoint draws, frozen binary
+env-only) was previously run for granite only. Full matrix:
+granite -0.09/+0.00 PASS; parakeet -0.05/-0.10 PASS; qwen3 +0.00/+0.10
+PASS; MOSS -0.42 / +0.38 FAIL BOTH — and the SIGN FLIPS across draws
+(~11 words each way). Repack's dot-method change materially moves MOSS
+transcripts in both directions: its -13.5% wall win is NOT quality-neutral
+on this evidence. Recommendation amended: an x86 STARLING_GGML_CPU_REPACK
+default flip is gate-clean for granite/parakeet/qwen3 but must be scoped
+per-engine or investigated for MOSS first (its transcripts also matched
+on the three fixtures — the FLEURS gate, not fixture identity, caught
+this). This is precisely the two-sided gate doing its job.

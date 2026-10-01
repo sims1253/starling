@@ -292,3 +292,10 @@ Expected sha256 prefixes: dynq4 sel2 `fb6fee5c930c3725`,
 bf16-exact refit `0fe8c49fdf889ddf` (same recipe, the bf16 GGUF and its
 own dumps). Runtime use: `STARLING_GRANITE_KVFACT=<file>` plus optional
 `STARLING_GRANITE_KVINR=1` (in-r scores).
+
+**Per-engine repack WER addendum (final):** the FLEURS WER gate for the
+repack knob across all four engines (both disjoint draws): granite
+-0.09/+0.00, parakeet -0.05/-0.10, qwen3 +0.00/+0.10 — all PASS; MOSS
+-0.42/+0.38 — FAILS BOTH with a sign flip. The x86 default-flip
+recommendation is therefore per-engine: clean for granite/parakeet/qwen3;
+MOSS needs its own investigation before enabling.
