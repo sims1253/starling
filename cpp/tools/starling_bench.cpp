@@ -30,7 +30,10 @@ namespace {
 // leading wedge correlate: neither SIGKILL nor default SIGTERM runs C++
 // destructors). One-shot: the handler restores the default disposition, so
 // a second signal terminates a process that does not wind down.
+volatile std::sig_atomic_t g_stop_sig = 0;
+
 void on_terminate(int sig) {
+    g_stop_sig = sig;
     starling_ggml_request_stop();      // lock-free atomic store
     std::signal(sig, SIG_DFL);         // async-signal-safe (POSIX)
 }
@@ -141,5 +144,8 @@ int main(int argc, char** argv) {
     }
     starling_ggml_free(ctx);
     starling_ggml_shutdown();
+    // Stopped by a signal: exit like one (128 + signo) so callers never read
+    // a stopped — possibly truncated or incomplete — bench as a full result.
+    if (g_stop_sig) return 128 + (int)g_stop_sig;
     return rc;
 }

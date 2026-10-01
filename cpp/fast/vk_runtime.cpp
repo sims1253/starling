@@ -419,7 +419,8 @@ Context::~Context() {
     // was destroyed by US (clean teardown) rather than abandoned to the
     // driver's async reaping — the leading wedge correlate on the Pixel.
     // Printed only once the device is gone, so a teardown that hangs or
-    // dies part-way leaves no false evidence. One line per process.
+    // dies part-way leaves no false evidence. One line per Context (a
+    // process hosting several engines prints it once per engine).
     std::fprintf(stderr, "[fast] vk teardown: device destroyed cleanly\n");
     // The loader library stays mapped: other Vulkan users in the process
     // (e.g. ggml's backend) may share it.
@@ -626,7 +627,7 @@ bool Context::upload(Buffer& dst, VkDeviceSize off, const void* src, size_t byte
         return true;
     }
     std::lock_guard<std::mutex> lk(queue_mu_);
-    if (gpu_hung_) { err = wedged_why(); return false; }   // queue still busy with hung work
+    if (wedged_) { err = wedged_why(); return false; }   // #325: fail fast once wedged
     const VkDeviceSize chunk = 64ull << 20;
     if (!ensure_staging(std::min<VkDeviceSize>(bytes, chunk), err)) return false;
     size_t done = 0;
@@ -668,7 +669,7 @@ bool Context::download(const Buffer& src, VkDeviceSize off, void* dst, size_t by
         return true;
     }
     std::lock_guard<std::mutex> lk(queue_mu_);
-    if (gpu_hung_) { err = wedged_why(); return false; }   // queue still busy with hung work
+    if (wedged_) { err = wedged_why(); return false; }   // #325: fail fast once wedged
     const VkDeviceSize chunk = 64ull << 20;
     if (!ensure_staging(std::min<VkDeviceSize>(bytes, chunk), err)) return false;
     size_t done = 0;
@@ -950,7 +951,7 @@ bool Recording::submit_and_wait(std::string& err, uint64_t stall_budget_ms) {
     if (!fail_.empty()) { err = "recording failed: " + fail_; return false; }
     if (segs_.empty()) { err = "recording is empty (begin() not called)"; return false; }
     std::lock_guard<std::mutex> lk(ctx_.queue_mu_);
-    if (ctx_.gpu_hung_) { err = ctx_.wedged_why(); return false; }   // fence_ may still be pending
+    if (ctx_.wedged_) { err = ctx_.wedged_why(); return false; }   // #325: fail fast once wedged
     VkResult r = VK_SUCCESS;
     for (size_t i = 0; i < segs_.size(); ++i) {
         VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};

@@ -891,8 +891,8 @@ bool MossEngine::generate(const float* pcm, size_t n, std::vector<int32_t>& out_
     if (const char* e = std::getenv("STARLING_FAST_STALL_BUDGET_MS")) {
         char* end = nullptr;
         const unsigned long long v = std::strtoull(e, &end, 10);
-        if (end != e && *end == '\0') forced_budget_ms = v;
-        else std::fprintf(stderr, "[fast-moss] ignoring STARLING_FAST_STALL_BUDGET_MS='%s'\n", e);
+        if (end != e && *end == '\0' && v > 0) forced_budget_ms = v;
+        else std::fprintf(stderr, "[fast-moss] ignoring STARLING_FAST_STALL_BUDGET_MS='%s' (want ms > 0)\n", e);
     }
     std::vector<double> round_ms;
     for (;;) {

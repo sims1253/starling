@@ -281,8 +281,8 @@ public:
     // heaps cannot fit `need` (+ margin).
     bool wedged() const { return wedged_; }
     // A timed-out submission never drained: its fence and buffers are still
-    // in use, so submits fail fast and teardown leaves the device to the
-    // driver rather than block on (or free under) the hung work.
+    // in use, so teardown leaves the device to the driver rather than block
+    // on (or free under) the hung work. (Submits already fail fast: wedged.)
     bool gpu_hung() const { return gpu_hung_; }
     std::string wedged_why() const;
     void mark_wedged(const std::string& why);
