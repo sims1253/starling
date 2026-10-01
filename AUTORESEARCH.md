@@ -49,11 +49,24 @@ region the agent may touch. Everything else lives here.
    stack as a separate issue/PR.
 2. Record the baseline before the first attempt; every claim is relative to
    it.
-3. Pixel safety (#325): if the GPU wedges (hang, spontaneous restart, wedge
-   marker), STOP — never reboot-and-retry into a wedge. Kill stray benches
-   (`phone_common.sh: kill_benches`) before every new measurement, let the
-   phone cool between long runs, and record `dumpsys thermalservice` when
-   numbers drift.
+3. Pixel safety (#325): **check the wedge marker
+   (`starling-fast-gpu-wedged` in `STARLING_FAST_CACHE_DIR`) before the
+   first run of a session and after any anomaly** — if it exists, STOP;
+   never reboot-and-retry into a wedge, and one wedge ends phone work for
+   the day (the driver also degrades without a marker: watch for bimodal
+   times). Kill stray benches (`phone_common.sh: kill_benches`) before
+   every new measurement, let the phone cool between long runs, and record
+   `dumpsys thermalservice` when numbers drift. Measurement hygiene:
+   budget **≤ 8 model loads per boot** (batch transcript gates to one load
+   per model+binary); **settle ≥ 5 min after boot** before the first
+   round; keep the phone **screen-off with an awake-hold** (`svc power
+   stayon true`) or unlocked — on a locked phone without a hold, system
+   suspend stalls each decode round-trip ~0.7 s and the numbers are void;
+   prefer few reboots (each costs a settle window); energy runs need a
+   **discharging** battery — verify the charge counter moves between two
+   reads before opening a window. On wifi adb, stream bench output to
+   device-side files and bound every adb call with a host timeout (the
+   TLS transport stalls under sustained shell output).
 4. Failures are data: append every attempt — kept or reverted — to the
    relevant `RESEARCH_LOG.md` with its numbers. "No improvement" is a valid
    result; say so.
