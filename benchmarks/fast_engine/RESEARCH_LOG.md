@@ -493,3 +493,12 @@ in-r transpose, ~15 MB) is now materialized only when
 STARLING_GRANITE_KVINR is set. Confirmation A/B after the change: enc
 +1.55% — within the config's four-session band (1.55/1.65/1.67/1.68,
 mean ~1.64); transcripts identical; default path unchanged.
+
+Repo-test backpressure (run 17): fresh clean configure+build of the
+committed branch with STARLING_GGML_TESTS=ON; all CI-relevant granite
+tests PASS — granite_stage_test, granite_trace_test, granite_ctc_argmax_
+test, granite_ctc_proposer_test, granite_ctc_entry_test,
+granite_fairness_test. (granite_ctc_chunk/fused_parity need external CTC
+GGUF fixtures and are not in CI.) The #59 research path changes
+(capi/encoder/loader/kv_factors) are regression-clean against the repo's
+own suite; no code change in this run.
