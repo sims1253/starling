@@ -758,7 +758,10 @@ bool MossEngine::Impl::record_decode(uint32_t steps, std::string& err) {
     const vk::Pipeline* ap = ctx->pipeline("attn_decode", {HDIM, MAXPOS}, err);
     if (!ap) return false;
     for (uint32_t s = 0; s < steps; ++s) {
-        if (s) rc.split();
+        // One command buffer per round, not per token: the per-step split
+        // only added a submit boundary per token (every segment is submitted
+        // back-to-back on the same queue and ordered by barriers anyway),
+        // and a submit boundary can flush the tiler.
         for (uint32_t l = 0; l < NL; ++l) {
             const LlmLayer& Y = llm[l];
             Kernels::GemvArgs a;
