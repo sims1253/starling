@@ -433,3 +433,12 @@ cancels the theoretical +0.25% MAC gain. Equal latency at higher complexity
 Per-head idea closed after two variants: the structure is real and
 gate-compatible, but not profitably exploitable on this engine/CPU. Final
 config remains the v3 8-layer selective map.
+
+Post-discard audit note: the v5 variant additionally carried a latent
+DEFAULT-PATH segfault (has_pieces() treated pieces_k.size()==n_layers==0 as
+"v5 loaded" and indexed pieces_k[li] out of bounds with no factor file set).
+It never affected run 12's measurements (every gate ran with the factor file
+present) and the code was reverted by the discard before it could reach any
+commit; the rebuilt clean binary re-verified transcript-identical on the
+default path. Any future factor-format work must gate on an explicit
+"loaded" flag, not size==n_layers.
