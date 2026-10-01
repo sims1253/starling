@@ -41,6 +41,9 @@ struct KVFactors {
     // Per layer, row-major float32 (layouts in the header comment above).
     // A layer with per-layer rank 0 stores EMPTY vectors (no payload).
     std::vector<std::vector<float>> f1k, f2k, f1v, f2v;
+    // f2k transposed ([n_heads*rank, hidden], row-major) for the optional
+    // in-r-space score path (STARLING_GRANITE_KVINR): qtilde = f2T @ q.
+    std::vector<std::vector<float>> f2tk;
 
     bool enabled() const { return rank_k > 0 || rank_v > 0; }
     int rank_layer_k(int li) const {
@@ -128,7 +131,20 @@ inline bool KVFactors::load(const char* path, int exp_layers, int exp_hidden,
     if (rank_k > 0) ok = read_half(rank_k_l, rank_k, f1k, f2k);
     if (ok && rank_v > 0) ok = read_half(rank_v_l, rank_v, f1v, f2v);
     std::fclose(f);
-    return ok;
+    if (!ok) return false;
+    // Materialize f2tk = f2k^T for the K half (in-r-space score path).
+    if (rank_k > 0) {
+        f2tk.resize(f2k.size());
+        for (size_t i = 0; i < f2k.size(); ++i) {
+            if (f2k[i].empty()) continue;
+            const size_t cols = f2k[i].size() / (size_t) hidden;  // n_heads*rank
+            f2tk[i].resize(f2k[i].size());
+            for (size_t d = 0; d < (size_t) hidden; ++d)
+                for (size_t j = 0; j < cols; ++j)
+                    f2tk[i][j * (size_t) hidden + d] = f2k[i][d * cols + j];
+        }
+    }
+    return true;
 }
 
 }  // namespace starling::ggml::granite

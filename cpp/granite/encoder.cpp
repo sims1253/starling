@@ -163,9 +163,18 @@ ggml_tensor* shaw_attention(ggml_context* c, const GraniteModel& m, int li,
     ggml_tensor* k = nullptr;
     ggml_tensor* v = nullptr;
     ggml_tensor* kv = nullptr;  // fused path only (no factors at all)
+    // Optional in-r-space score path (STARLING_GRANITE_KVINR): keep K in the
+    // rank basis (z) and fold the expand basis into q (qtilde = f2T @ q), so
+    // content scores contract over rank instead of head_dim. Same v3 factor
+    // file; numerically the SAME truncation with the intermediate bf16 round
+    // moved from the K side to the Q side.
+    static const bool inr_env = std::getenv("STARLING_GRANITE_KVINR") != nullptr;
+    ggml_tensor* z_lr = nullptr;      // [n_heads*rank, T] when in-r is active
+    ggml_tensor* qtilde = nullptr;    // [n_heads*rank, T]
     const KVFactors& kvf = m.kv_factors;
     const int rk = kvf.rank_layer_k(li), rv = kvf.rank_layer_v(li);
     const bool k_lr = rk > 0, v_lr = rv > 0;
+    const bool inr = inr_env && k_lr;
     auto lr_expand = [&](const std::vector<float>& f1, const std::vector<float>& f2,
                          int rank) -> ggml_tensor* {
         const int64_t r_tot = (int64_t) kvf.n_heads * rank;
@@ -188,7 +197,23 @@ ggml_tensor* shaw_attention(ggml_context* c, const GraniteModel& m, int li,
             ggml_tensor* half = bf16(c, ggml_mul_mat(c, wh, lib::gemm_act(c, wh, n)));
             if (k_lr) v = half; else k = half;
         }
-        if (k_lr) k = lr_expand(kvf.f1k[(size_t) li], kvf.f2k[(size_t) li], rk);
+        if (k_lr && inr) {
+            // z = n @ f1^T stays in the r basis; qtilde = f2T @ q replaces the
+            // expand GEMM (equal MACs, different operand).
+            const int64_t r_tot = (int64_t) kvf.n_heads * rk;
+            const int64_t ne1[2] = { kvf.hidden, r_tot };
+            const int64_t ne2[2] = { kvf.hidden, r_tot };  // f2T: [hidden, r_tot] weight
+            ggml_tensor* a = graph_input_tensor(c, GGML_TYPE_F32, 2, ne1,
+                kvf.f1k[(size_t) li].data(),
+                kvf.f1k[(size_t) li].size() * sizeof(float));
+            ggml_tensor* ft = graph_input_tensor(c, GGML_TYPE_F32, 2, ne2,
+                kvf.f2tk[(size_t) li].data(),
+                kvf.f2tk[(size_t) li].size() * sizeof(float));
+            z_lr = bf16(c, ggml_mul_mat(c, a, f32(c, n)));            // [r_tot, T]
+            qtilde = bf16(c, ggml_mul_mat(c, ft, f32(c, q)));         // [r_tot, T]
+        } else if (k_lr) {
+            k = lr_expand(kvf.f1k[(size_t) li], kvf.f2k[(size_t) li], rk);
+        }
         if (v_lr) v = lr_expand(kvf.f1v[(size_t) li], kvf.f2v[(size_t) li], rv);
     } else {
         kv = lib::linear_bf16(c, ml, n, p + "attn_kv", false);          // [2*hidden, T]
@@ -211,8 +236,17 @@ ggml_tensor* shaw_attention(ggml_context* c, const GraniteModel& m, int li,
                                                   s.zeros_kv.size() * sizeof(float));
             kv = bf16(c, ggml_concat(c, f32(c, kv), zkv, 1));
         } else {
-            k = padz(k);
+            if (k) k = padz(k);
             v = padz(v);
+            if (inr) {
+                // Rank-space operands: zeros view of width r_tot (rows of the
+                // shared [hidden, pad] zero buffer; r_tot <= hidden always).
+                const int64_t rt = z_lr->ne[0];
+                ggml_tensor* zr = ggml_cont(c, ggml_view_2d(c, zq, rt, s.pad,
+                                                            zq->nb[1], 0));
+                z_lr = bf16(c, ggml_concat(c, f32(c, z_lr), zr, 1));
+                qtilde = bf16(c, ggml_concat(c, f32(c, qtilde), zr, 1));
+            }
         }
     }
     if (kv) {
@@ -227,14 +261,27 @@ ggml_tensor* shaw_attention(ggml_context* c, const GraniteModel& m, int li,
     auto to_blocks = [&](ggml_tensor* z) {
         return ggml_reshape_4d(c, z, D, H, CS, nblk);
     };
-    if (k_capture) capture_graph_output(f32(c, k), k_capture);
+    if (k_capture && k) capture_graph_output(f32(c, k), k_capture);
     if (v_capture) capture_graph_output(f32(c, v), v_capture);
-    ggml_tensor* q4 = to_blocks(q), * k4 = to_blocks(k), * v4 = to_blocks(v);
+    ggml_tensor* v4 = to_blocks(v);
+    ggml_tensor* q4 = to_blocks(q);   // full-width q: Shaw bias needs it
 
     // Content scores: [D, r, H, nblk] x [D, c, H, nblk] -> [r, c, H, nblk].
-    ggml_tensor* k_ = ggml_cont(c, ggml_permute(c, k4, 0, 2, 1, 3));
-    ggml_tensor* q_ = ggml_cont(c, ggml_permute(c, q4, 0, 2, 1, 3));
-    ggml_tensor* sc = bf16(c, ggml_mul_mat(c, k_, q_));
+    // In-r mode contracts over the per-head rank instead (z x qtilde).
+    ggml_tensor* sc;
+    if (inr) {
+        const int64_t rr = z_lr->ne[0] / H;
+        ggml_tensor* z4 = ggml_reshape_4d(c, z_lr, rr, H, CS, nblk);
+        ggml_tensor* qt4 = ggml_reshape_4d(c, qtilde, rr, H, CS, nblk);
+        ggml_tensor* z_ = ggml_cont(c, ggml_permute(c, z4, 0, 2, 1, 3));
+        ggml_tensor* qt_ = ggml_cont(c, ggml_permute(c, qt4, 0, 2, 1, 3));
+        sc = bf16(c, ggml_mul_mat(c, z_, qt_));
+    } else {
+        ggml_tensor* k4 = to_blocks(k);
+        ggml_tensor* k_ = ggml_cont(c, ggml_permute(c, k4, 0, 2, 1, 3));
+        ggml_tensor* q_ = ggml_cont(c, ggml_permute(c, q4, 0, 2, 1, 3));
+        sc = bf16(c, ggml_mul_mat(c, k_, q_));
+    }
     sc = bf16(c, ggml_scale(c, f32(c, sc), scale));
 
     // Shaw bias in one batched matmul: q as [D, H*nblk, c] against the baked

@@ -442,3 +442,16 @@ present) and the code was reverted by the discard before it could reach any
 commit; the rebuilt clean binary re-verified transcript-identical on the
 default path. Any future factor-format work must gate on an explicit
 "loaded" flag, not size==n_layers.
+
+In-r-space score folding (run 13): the old "blocked by WER" rollback reason
+died with sel2's gate pass, so the idea was retried with that assumption
+changed. K stays in the rank basis (z) and the expand basis folds into q
+(qtilde = f2T @ q, an equal-MAC swap for the dropped expand GEMM); content
+scores then contract over rank instead of head_dim for the 8 compressed
+layers. Same v3 factor file (f2T is a load-time transpose); the intermediate
+bf16 round moves from the K side to the Q side. Measured on top of sel2:
+enc +1.67% (a +0.40pt increment over sel2's +1.27; predicted +0.35),
+transcripts identical, WER -0.19 / -0.05 on the two disjoint draws (draw1
+byte-identical to sel2's transcripts outcome). KEPT, env-gated behind
+STARLING_GRANITE_KVINR (default off = expand path). Final best config:
+sel2 + KVINR: enc +1.67%.

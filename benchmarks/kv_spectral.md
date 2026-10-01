@@ -184,3 +184,14 @@ enc **+1.27%**, wall +0.54%, transcripts identical, WER −0.19 / −0.14 on
 the two disjoint draws — both PASS. The remaining uncompressed K layers
 (rank-32 error 0.038–0.13) sit in the regime where uniform compression
 failed the gate, so this is the practical frontier of the approach.
+
+**In-r-space scores (same campaign):** with the selective map passing the
+gates, the score-folding idea became viable: keep K in the rank basis and
+fold the expand basis into q, so content scores contract over rank instead
+of head_dim (the expand GEMM is replaced by an equal-MAC q̃ GEMM; the
+intermediate bf16 round moves from K to Q). On top of the 8-layer map:
+enc **+1.67%** (+0.40pt over the map alone), transcripts identical, WER
+−0.19/−0.05 on both draws. Kept behind STARLING_GRANITE_KVINR (research
+env; default off). Cumulative #59 result on granite: a calibration-driven
+selective K map with in-r scores wins +1.67% encoder / wall within noise
+of +0.5%, with exact fixture transcripts and neutral-to-positive WER.
