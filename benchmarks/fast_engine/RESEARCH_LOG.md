@@ -662,3 +662,17 @@ Every engine tunable that touches the granite enc metric has now been
 measured: GGML threads (physical-core default optimal), CPU repack (the
 +19-21.7% recommendation), MEL threads (sub-1%, default optimal), and the
 #59 factor knobs (+1.6% stacked).
+
+Knob-space audit + mel correction (run 33): a full getenv enumeration of
+cpp/ (74 knobs) audited the "every enc-relevant tunable measured" claim.
+Classification: fast-engine knobs (out of scope), per-model probes/timing
+(overhead-only or non-granite), serve/debug/trace (overhead-only),
+imatrix (research collection), TDT decode (not granite enc), REPLAY_CACHE
+(GPU path only — CPU encoder is one-shot by construction), MEL_CPU_FFT
+(parakeet kill-switch; granite mel is separate). ONE correction found:
+STARLING_MEL_TIMING=1 shows granite mel costs ~5-9 ms total on medium
+(fft+filterbank+log) = ~0.15% of the enc stage — run 32's 35 ms
+threads-sweep delta was run-to-run noise, not mel parallelism; the knob
+verdict (default optimal, negligible) stands with a better number. The
+audit itself is the completeness proof: no unmeasured enc-relevant
+tunable exists in the engine.
