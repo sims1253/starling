@@ -119,3 +119,32 @@ regresses. The factor path stays env-gated OFF; the exporters
 (`benchmarks/export_kv_lowrank*.py`), the dump probe and the numbers above
 are the reproducible record. Qwen3-ASR spectral calibration remains
 unmeasured.
+
+## Qwen3-ASR run on public speech (2026-10-01)
+
+The missing measurement noted above. Method: the same per-head PCA with
+even/odd clip split over the same eight FLEURS en_us train clips as the
+granite run (hashes in `results/kv_spectral_granite_fleurs8.json`; the
+qwen3 artifact is `results/kv_spectral_qwen3_fleurs8.json`). The capture
+classes, `pca_layer` and `effective_dim` are imported from
+`bench_kv_spectral.py` unmodified; the driver ran on CPU (notebook, bf16)
+because the script's qwen3 forward path is CUDA-hardcoded — a session-side
+CPU driver (issue #59 notebook campaign) reproduced its device plumbing
+only.
+
+| Quantity, averaged over 24 layers and sixteen heads | K | V |
+| --- | ---: | ---: |
+| Rank / 64 at 95% training variance | 58.3% | 72.0% |
+| Rank / 64 at 99% training variance | 81.4% | 91.1% |
+| Rank / 64 at 99.9% training variance | 93.0% | 99.0% |
+| Held-out relative squared error at fixed rank 16 | 0.268 | 0.428 |
+| Held-out relative squared error at fixed rank 32 | 0.126 | 0.231 |
+| Held-out relative squared error at full rank 64 | ~1e-13 | ~1e-13 |
+
+Unlike granite's K (25% of 128 at 99% variance), Qwen3-ASR's K and V are
+both close to full rank on held-out speech — only layer 0's K is compact
+(16%). Halving either projection's rank (32 of 64) costs 13–23% of
+held-out K/V energy. The calibration-level answer for Qwen3-ASR is
+therefore **no-go**: there is no rank with both useful compression and
+small reconstruction error, so no native follow-up experiment is justified
+on this evidence.
