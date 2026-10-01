@@ -173,3 +173,14 @@ gate at every useful rank, but a calibration-driven selective map —
 roughly a third of the K path's compute — passes every gate with a small
 latency win and neutral-to-positive WER. Tooling: v3 format
 (`cpp/granite/kv_factors.hpp`), `benchmarks/export_kv_lowrank_selective.py`.
+
+**Boundary probes (same campaign):** (1) per-layer V dumps answer the
+V question at per-layer granularity: V is full-rank in every layer
+(held-out 0.12–0.51 at rank 32; even layer 0's V is incompressible while
+its K is near rank-8) — the K/V asymmetry is intrinsic per layer, not an
+averaging artifact. (2) The passing selective map expands to 8 of 16
+layers (adding layers 4 and 12 at rank 32, calibration errors 0.016/0.011):
+enc **+1.27%**, wall +0.54%, transcripts identical, WER −0.19 / −0.14 on
+the two disjoint draws — both PASS. The remaining uncompressed K layers
+(rank-32 error 0.038–0.13) sit in the regime where uniform compression
+failed the gate, so this is the practical frontier of the approach.

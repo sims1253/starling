@@ -395,3 +395,14 @@ KEEP: v3 per-layer-rank factor format (STLGKVF3) + selective exporter.
 Verdict nuance: uniform ranks fail the WER gate; selective per-layer maps
 pass it — encoder KV "compression" on granite is viable only in this
 selective form (+0.83% enc ceiling for K).
+
+Selective-map boundary probe (same campaign): V-side per-layer dumps show V
+is full-rank in EVERY layer (held-out rel-MSE 0.12-0.51 at r=32, 0.05-0.39
+at r=48; even layer 0, whose K is near rank-8, has V err 0.40 at r=8) —
+the K/V asymmetry is per-layer-intrinsic, closing the V question at zero
+WER risk. K-map expanded with the next-best calibration layers
+{4:r32 err 0.016, 12:r32 err 0.011} -> 8-of-16-layer map: enc +1.27%,
+wall +0.54%, transcripts identical, WER -0.19 / -0.14 on the two disjoint
+draws (both PASS). KEEP. The frontier boundary is now measured: remaining
+uncompressed K layers sit at r32 error 0.038-0.13, the regime where uniform
+compression failed the gate (+0.28) — further expansion is not pursued.

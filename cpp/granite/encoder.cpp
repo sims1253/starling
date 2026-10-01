@@ -135,12 +135,13 @@ ggml_tensor* conformer_ff(ggml_context* c, const ModelLoader& ml,
 }
 
 // Block-local Shaw relative-position attention (pre-norm inside).
-// `k_capture` (issue #59 research probe STARLING_GRANITE_DUMP_K) additionally
-// reads back this layer's padded K [hidden, T_pad] as f32 — value-exact side
-// capture; it changes nothing numerically.
+// `k_capture`/`v_capture` (issue #59 research probe STARLING_GRANITE_DUMP_K)
+// additionally read back this layer's padded K/V [hidden, T_pad] as f32 —
+// value-exact side captures; they change nothing numerically.
 ggml_tensor* shaw_attention(ggml_context* c, const GraniteModel& m, int li,
                             ggml_tensor* x, const EncScratch& s,
-                            std::vector<float>* k_capture = nullptr) {
+                            std::vector<float>* k_capture = nullptr,
+                            std::vector<float>* v_capture = nullptr) {
     const auto& ec = m.config.encoder;
     const ModelLoader& ml = m.loader;
     const int64_t D = ec.head_dim, H = ec.n_heads, CS = ec.context_size;
@@ -227,6 +228,7 @@ ggml_tensor* shaw_attention(ggml_context* c, const GraniteModel& m, int li,
         return ggml_reshape_4d(c, z, D, H, CS, nblk);
     };
     if (k_capture) capture_graph_output(f32(c, k), k_capture);
+    if (v_capture) capture_graph_output(f32(c, v), v_capture);
     ggml_tensor* q4 = to_blocks(q), * k4 = to_blocks(k), * v4 = to_blocks(v);
 
     // Content scores: [D, r, H, nblk] x [D, c, H, nblk] -> [r, c, H, nblk].
@@ -345,7 +347,8 @@ ggml_tensor* conv_module(ggml_context* c, const GraniteModel& m, int li,
 ggml_tensor* conformer_block(ggml_context* c, const GraniteModel& m, int li,
                              ggml_tensor* x, const EncScratch& s,
                              StageStop* stop, ggml_tensor** ctc_mid,
-                             std::vector<float>* k_capture = nullptr) {
+                             std::vector<float>* k_capture = nullptr,
+                             std::vector<float>* v_capture = nullptr) {
     const auto& ec = m.config.encoder;
     const ModelLoader& ml = m.loader;
     const std::string p = "enc.blk." + std::to_string(li) + ".";
@@ -360,7 +363,7 @@ ggml_tensor* conformer_block(ggml_context* c, const GraniteModel& m, int li,
     if (stop->hit) return x;
     if (stage_wants(stop->name, "ff1")) { stop->hit = true; return x; }
     {
-        ggml_tensor* a = shaw_attention(c, m, li, x, s, k_capture);
+        ggml_tensor* a = shaw_attention(c, m, li, x, s, k_capture, v_capture);
         if (stage_wants(stop->name, "attnm")) { stop->hit = true; return a; }
         x = lib::addb(c, x, a);
     }
@@ -391,11 +394,14 @@ ggml_tensor* conformer_block(ggml_context* c, const GraniteModel& m, int li,
 // [160, T] bf16; returns [output_dim, N] f32. When `enc_capture` is non-null
 // the encoder's last hidden state is additionally read back (divergence dump).
 // `k_dump` (STARLING_GRANITE_DUMP_K, one-shot/CPU path only) captures every
-// layer's padded K [hidden, T_pad] f32 for the #59 runtime-basis fit.
+// layer's padded K/V [hidden, T_pad] f32 for the #59 runtime-basis fits.
+struct EncKVDump {
+    std::vector<std::vector<float>> k, v;   // per layer
+};
 ggml_tensor* build_fused(ggml_context* c, const GraniteModel& m, ggml_tensor* mel_in,
                          const EncScratch& s, std::vector<float>* enc_capture,
                          StageStop* stop,
-                         std::vector<std::vector<float>>* k_dump = nullptr) {
+                         EncKVDump* kv_dump = nullptr) {
     const auto& ec = m.config.encoder;
     ggml_tensor* x = lib::linear_bf16(c, m.loader, mel_in, "enc.input_linear", true);
     if (stage_wants(stop->name, "melin")) { stop->hit = true; return f32(c, mel_in); }
@@ -406,7 +412,8 @@ ggml_tensor* build_fused(ggml_context* c, const GraniteModel& m, ggml_tensor* me
     for (uint32_t li = 0; li < ec.n_layers; ++li) {
         x = conformer_block(c, m, (int) li, x, s, stop,
                             want_ctc_bundle ? &ctc_mid : nullptr,
-                            k_dump ? &(*k_dump)[li] : nullptr);
+                            kv_dump ? &kv_dump->k[(size_t) li] : nullptr,
+                            kv_dump ? &kv_dump->v[(size_t) li] : nullptr);
         if (stop->hit) return f32(c, x);
     }
     if (want_ctc_bundle) {
@@ -506,10 +513,13 @@ bool encode_audio_and_project(const GraniteModel& model, const MelFeatures& mel,
         EncScratch s = make_scratch(model.config, T);
         std::vector<float> enc_out;
         StageStop stop{std::getenv("STARLING_GRANITE_ONLY")};
-        // #59 runtime-K probe: per-layer padded K [hidden, T_pad] f32 dumps.
+        // #59 runtime-K/V probe: per-layer padded K/V [hidden, T_pad] f32 dumps.
         const char* kdump_env = std::getenv("STARLING_GRANITE_DUMP_K");
-        std::vector<std::vector<float>> k_dump(
-            kdump_env ? (size_t) ec.n_layers : 0);
+        EncKVDump k_dump;
+        if (kdump_env) {
+            k_dump.k.resize((size_t) ec.n_layers);
+            k_dump.v.resize((size_t) ec.n_layers);
+        }
         bool ok = run_graph([&](ggml_context* c) -> ggml_tensor* {
             int64_t mne[2] = {ec.input_dim, T};
             ggml_tensor* mel_in = graph_input_tensor(c, GGML_TYPE_BF16, 2, mne,
@@ -521,17 +531,20 @@ bool encode_audio_and_project(const GraniteModel& model, const MelFeatures& mel,
         if (!ok) { err = "GRANITE encoder graph execution failed"; return false; }
         write_stage_dump(enc_out);
         if (kdump_env) {
-            // One file per layer: <prefix>.L<layer>.f32, row-major [hidden, T_pad].
-            for (size_t li = 0; li < k_dump.size(); ++li) {
-                std::string path = std::string(kdump_env) + ".L" +
-                                   std::to_string(li) + ".f32";
-                if (FILE* f = std::fopen(path.c_str(), "wb")) {
-                    std::fwrite(k_dump[li].data(), sizeof(float),
-                                k_dump[li].size(), f);
-                    std::fclose(f);
-                } else {
-                    err = "GRANITE K dump: cannot write " + path;
-                    return false;
+            // Per layer: <prefix>.L<layer>.f32 (K, historical name) and
+            // <prefix>.V<layer>.f32 (V), row-major [hidden, T_pad].
+            for (size_t li = 0; li < k_dump.k.size(); ++li) {
+                for (const char* suffix : {"L", "V"}) {
+                    const auto& buf = suffix[0] == 'L' ? k_dump.k[li] : k_dump.v[li];
+                    std::string path = std::string(kdump_env) + "." + suffix +
+                                       std::to_string(li) + ".f32";
+                    if (FILE* f = std::fopen(path.c_str(), "wb")) {
+                        std::fwrite(buf.data(), sizeof(float), buf.size(), f);
+                        std::fclose(f);
+                    } else {
+                        err = "GRANITE K/V dump: cannot write " + path;
+                        return false;
+                    }
                 }
             }
         }
