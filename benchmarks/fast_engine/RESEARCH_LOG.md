@@ -401,3 +401,17 @@ suspend. Findings:
   round-trip optimization would tune the engine to a benchmark artifact;
   **rejected without building it**. Honest measurement conditions:
   stayon (protocol v2), one unlock after boot, or the app's own wakelock.
+
+### P2-5 (2026-10-01, same loop): second-driver robustness gate for P2-2 via llvmpipe
+
+The desktop RADV ≤10 % gate cannot run on this host (WSL2 exposes only
+llvmpipe, rejected by the engine's device picker by design). As substitute
+evidence for P2-2 (the one change that touches recording/submission
+granularity), the branch binary was run on **Mesa llvmpipe** — a completely
+independent Vulkan implementation — with a throwaway, env-gated patch to
+accept CPU-type devices (reverted after; never committed). MOSS
+short+medium transcribe to **exactly the golden texts** (52.3 s / 139.2 s
+wall at ~7x RTF on CPU-Vulkan, transcripts byte-identical to the phone's
+PowerVR output). Cross-driver, cross-precision identical output strongly
+suggests the recording change carries no driver-dependent hazard; the
+formal RADV performance gate still needs a real AMD run before merge.
