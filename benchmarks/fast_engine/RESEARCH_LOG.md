@@ -641,3 +641,14 @@ transcripts_match=1, 1390/1390 chars. Every harness element the standing
 file names for notebook work has now been used by this campaign: the
 paired-alternation discipline throughout, starling-bench for timing, and
 the serve contract smoke for the HTTP path.
+
+Artifact reproducibility (run 30): regenerating the pinned sel2 factor
+file from the documented command (export_kv_lowrank_selective + the
+granite dynq4 GGUF + the kdumps) byte-reproduces the pinned artifact
+(sha256 prefix fb6fee5c930c3725 both). The chain GGUF -> K dumps ->
+factors is bit-deterministic on this machine (greedy engine, fixed
+inputs). Caveat for cross-machine reproduction: LAPACK SVD sign
+conventions may differ across numpy builds — signs cancel in the subspace
+math but change file bytes, so other machines should verify against the
+recorded hashes rather than expect byte equality. The ctc study's
+"fixed exported weight file" lesson is thus satisfied and documented.
