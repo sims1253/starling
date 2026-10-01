@@ -337,6 +337,10 @@ guards off the decode path), which stands as the certified result.
 
 ## #59 notebook campaign: granite encoder K/V low-rank follow-up (2026-10-01)
 
+Code location: the factor path, exporters, dump probe and tests named below
+were not merged; they live at the tag `research/issue59-kv-factors` (commit 1c37794). Master
+carries only this record and benchmarks/kv_spectral.md.
+
 Device: notebook (Ryzen 5 PRO 5650U, 12 threads, CPU backend, reduced power
 profile for part of the session). Target: `cpp/granite/encoder.cpp`
 attention K/V projections via the opt-in `STARLING_GRANITE_KVFACT` factor
@@ -757,9 +761,9 @@ wall +8.76%, transcripts identical — the four-session enc band now
 candidate 7727491120e0, tree clean, CI granite tests green.
 
 Post-review fixes (PR #381 review, after run 39; desktop, no notebook
-re-measurement). Four defects in the env-gated factor path, all
-reproduced by the new `cpp/tests/granite_kv_factors_test.cpp` against the
-run-39 code and fixed:
+re-measurement; code at `research/issue59-kv-factors`). Four defects in the env-gated factor
+path, all reproduced by the new `cpp/tests/granite_kv_factors_test.cpp`
+against the run-39 code and fixed:
 (1) the loader read all K payloads before all V payloads while every
 exporter writes them layer by layer (K then V), so v1 K+V files loaded
 with layers swapped — the "K+V r=32 destroyed" row above is void. K-only
@@ -779,3 +783,8 @@ Also: K/V dumps check their writes, DUMP_K + KVINR is rejected (in-r has
 no K tensor to dump), factor runs take the one-shot encoder path on GPU,
 and the activation/runtime/selective exporters share one PCA-fold helper
 (byte-identical outputs on a synthetic GGUF + dumps).
+
+Merge scope (PR #381): only this record and kv_spectral.md went to master.
+The factor path, exporters, dump probes, test and raw Qwen3 calibration
+JSON stay at `research/issue59-kv-factors`. Repack, the one actionable
+result, is an existing knob that needs none of that code.

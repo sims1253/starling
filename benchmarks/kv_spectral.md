@@ -77,6 +77,15 @@ Python decoder latency in [`ctc_draft_rank.md`](ctc_draft_rank.md).
 
 ## Native follow-up: low-rank K/V in the engine (2026-10-01, issue #59)
 
+> **Code location:** the research code for this section was not merged to
+> master. That covers the factor path (`cpp/granite/kv_factors.hpp` and the
+> `STARLING_GRANITE_KVFACT` / `KVINR` / `DUMP_K` env paths in
+> `cpp/granite/encoder.cpp`), the four `benchmarks/export_kv_lowrank*.py`
+> exporters, `cpp/tests/granite_kv_factors_test.cpp` and the raw
+> `results/kv_spectral_qwen3_fleurs8.json`. All of it lives at the tag
+> `research/issue59-kv-factors` (commit 1c37794). Paths and env vars below refer to that tag. The
+> one actionable result, CPU repack, needs none of it.
+
 The follow-up the paragraph above demanded now exists. The granite encoder
 gained an opt-in factor path (`STARLING_GRANITE_KVFACT=<file>`,
 `cpp/granite/kv_factors.hpp`): per attention layer, per head, the K and/or
@@ -131,9 +140,9 @@ gate with roughly one flipped word of margin.
 Verdict for #59 on granite: **not worth enabling**. The speed ceiling is
 structural (the whole attention block is 16.6% of encoder MACs; the K path
 4.5%), the only gate-passing config sits on the WER gate edge, and memory
-regresses. The factor path stays env-gated OFF; the exporters
-(`benchmarks/export_kv_lowrank*.py`), the dump probe and the numbers above
-are the reproducible record. Qwen3-ASR spectral calibration remains
+regresses. The factor path, the exporters
+(`benchmarks/export_kv_lowrank*.py`) and the dump probe live at `research/issue59-kv-factors`;
+together with the numbers above they are the reproducible record. Qwen3-ASR spectral calibration remains
 unmeasured.
 
 ## Qwen3-ASR run on public speech (2026-10-01)
@@ -141,7 +150,7 @@ unmeasured.
 The missing measurement noted above. Method: the same per-head PCA with
 even/odd clip split over the same eight FLEURS en_us train clips as the
 granite run (hashes in `results/kv_spectral_granite_fleurs8.json`; the
-qwen3 artifact is `results/kv_spectral_qwen3_fleurs8.json`). The capture
+qwen3 artifact `results/kv_spectral_qwen3_fleurs8.json` is at `research/issue59-kv-factors`). The capture
 classes, `pca_layer` and `effective_dim` are imported from
 `bench_kv_spectral.py` unmodified; the driver ran on CPU (notebook, bf16)
 because the script's qwen3 forward path is CUDA-hardcoded — a session-side
@@ -174,7 +183,7 @@ in every tested configuration** (weight-space r16/r24, activation-basis r32,
 runtime-basis r32: 0.19–0.42 points across draws, none reliably within 0.2),
 on top of a structural latency ceiling (attention is 16.6% of encoder MACs,
 the K path 4.5%) and a memory regression. The env-gated factor path,
-exporters and K-dump probe remain committed as reproducible research
+exporters and K-dump probe are kept at `research/issue59-kv-factors` as reproducible research
 tooling; no runtime default changes.
 
 **Selective map follow-up (same campaign):** compressing only the six
@@ -187,7 +196,7 @@ lies orthogonal to the speech subspace on near-exactly-low-rank layers.
 So the final, nuanced verdict: uniform-rank K/V compression fails the WER
 gate at every useful rank, but a calibration-driven selective map —
 roughly a third of the K path's compute — passes every gate with a small
-latency win and neutral-to-positive WER. Tooling: v3 format
+latency win and neutral-to-positive WER. Tooling (at `research/issue59-kv-factors`): v3 format
 (`cpp/granite/kv_factors.hpp`), `benchmarks/export_kv_lowrank_selective.py`.
 
 **Boundary probes (same campaign):** (1) per-layer V dumps answer the
@@ -284,13 +293,13 @@ interval that AUTORESEARCH.md asks for on CPU work. For the repack result
 (+19%, against ~±0.1% per-arm spreads and a 19.00-19.62 four-session band)
 that does not change the conclusion. For the selective map + in-r
 (+1.55-1.68% enc, wall +0.15-0.94% across sessions) it does: treat that gain
-as indicative until a comparator run with a CI confirms it. The factor path
-stays env-gated off either way.
-Tooling committed: 4 factor exporters, the v3 format + STARLING_GRANITE_
-DUMP_K/V probes, STARLING_GRANITE_KVFACT/KVINR env paths (default off,
-default path verified neutral repeatedly; all CI granite tests pass).
+as indicative until a comparator run with a CI confirms it.
+Tooling, kept at `research/issue59-kv-factors` and not merged: 4 factor exporters, the v3 format,
+the STARLING_GRANITE_DUMP_K/V probes and the STARLING_GRANITE_KVFACT/KVINR
+env paths (all default off; default path verified neutral).
 
-**Factor-artifact reproduction recipe** (both pinned artifacts verified
+**Factor-artifact reproduction recipe** (run from a checkout of `research/issue59-kv-factors`;
+both pinned artifacts verified
 byte-identical on this machine; see the SVD-sign caveat above for other
 builds):
 

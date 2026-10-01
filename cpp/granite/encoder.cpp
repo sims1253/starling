@@ -36,7 +36,6 @@
 // STARLING_GRANITE_DUMP_ENC file and transcription stops with an error.
 #include "encoder.hpp"
 
-#include "kv_factors.hpp"
 #include "runtime/backend.hpp"
 #include "runtime/graph.hpp"
 #include "runtime/graph_builder.hpp"
@@ -135,13 +134,8 @@ ggml_tensor* conformer_ff(ggml_context* c, const ModelLoader& ml,
 }
 
 // Block-local Shaw relative-position attention (pre-norm inside).
-// `k_capture`/`v_capture` (issue #59 research probe STARLING_GRANITE_DUMP_K)
-// additionally read back this layer's padded K/V [hidden, T_pad] as f32 —
-// value-exact side captures; they change nothing numerically.
 ggml_tensor* shaw_attention(ggml_context* c, const GraniteModel& m, int li,
-                            ggml_tensor* x, const EncScratch& s,
-                            std::vector<float>* k_capture = nullptr,
-                            std::vector<float>* v_capture = nullptr) {
+                            ggml_tensor* x, const EncScratch& s) {
     const auto& ec = m.config.encoder;
     const ModelLoader& ml = m.loader;
     const int64_t D = ec.head_dim, H = ec.n_heads, CS = ec.context_size;
@@ -155,69 +149,7 @@ ggml_tensor* shaw_attention(ggml_context* c, const GraniteModel& m, int li,
     ggml_tensor* n = lib::layer_norm_bf16(c, ml, x, p + "attn_norm",
                                           ec.layer_norm_eps);
     ggml_tensor* q = lib::linear_bf16(c, ml, n, p + "attn_q", false);   // [hidden, T]
-    // Issue #59 research path: per-head low-rank K and/or V projections
-    // (STARLING_GRANITE_KVFACT). k_h = (n @ C_h^T) @ B_h^T — two f32 GEMMs
-    // per head-batch with the same bf16 rounding boundaries as linear_bf16.
-    // A rank-0 half keeps the original fused rows (sliced out of the fused
-    // weight so the factored half's GEMM is not computed at all).
-    ggml_tensor* k = nullptr;
-    ggml_tensor* v = nullptr;
-    ggml_tensor* kv = nullptr;  // fused path only (no factors at all)
-    // Optional in-r-space score path (STARLING_GRANITE_KVINR): keep K in the
-    // rank basis (z) and fold the expand basis into q (qtilde = f2T @ q), so
-    // content scores contract over rank instead of head_dim. Same v3 factor
-    // file; numerically the SAME truncation with the intermediate bf16 round
-    // moved from the K side to the Q side. Decided at model load (kvf.in_r),
-    // which is also what materializes f2tk.
-    ggml_tensor* z_lr = nullptr;      // [n_heads*rank, T] when in-r is active
-    ggml_tensor* qtilde = nullptr;    // [n_heads*rank, T]
-    const KVFactors& kvf = m.kv_factors;
-    const int rk = kvf.rank_layer_k(li), rv = kvf.rank_layer_v(li);
-    const bool k_lr = rk > 0, v_lr = rv > 0;
-    const bool inr = kvf.in_r && k_lr;
-    auto lr_expand = [&](const std::vector<float>& f1, const std::vector<float>& f2,
-                         int rank) -> ggml_tensor* {
-        const int64_t r_tot = (int64_t) kvf.n_heads * rank;
-        const int64_t ne1[2] = { kvf.hidden, r_tot };
-        const int64_t ne2[2] = { r_tot, kvf.hidden };
-        ggml_tensor* a = graph_input_tensor(c, GGML_TYPE_F32, 2, ne1,
-                                            f1.data(), f1.size() * sizeof(float));
-        ggml_tensor* b = graph_input_tensor(c, GGML_TYPE_F32, 2, ne2,
-                                            f2.data(), f2.size() * sizeof(float));
-        ggml_tensor* z = bf16(c, ggml_mul_mat(c, a, f32(c, n)));
-        return bf16(c, ggml_mul_mat(c, b, f32(c, z)));                  // [hidden, T]
-    };
-    if (k_lr || v_lr) {
-        if (k_lr != v_lr) {
-            // Keep the unfactored half on the original weight, sliced to its
-            // rows: per-row dots are identical to the fused GEMM's.
-            ggml_tensor* w = lib::weight(c, ml, p + "attn_kv.weight");
-            const size_t off = (k_lr ? (size_t) hidden : 0) * w->nb[1];
-            ggml_tensor* wh = ggml_view_2d(c, w, hidden, hidden, w->nb[1], off);
-            ggml_tensor* half = bf16(c, ggml_mul_mat(c, wh, lib::gemm_act(c, wh, n)));
-            if (k_lr) v = half; else k = half;
-        }
-        if (k_lr && inr) {
-            // z = n @ f1^T stays in the r basis; qtilde = f2T @ q replaces the
-            // expand GEMM (equal MACs, different operand).
-            const int64_t r_tot = (int64_t) kvf.n_heads * rk;
-            const int64_t ne1[2] = { kvf.hidden, r_tot };
-            const int64_t ne2[2] = { kvf.hidden, r_tot };  // f2T: [hidden, r_tot] weight
-            ggml_tensor* a = graph_input_tensor(c, GGML_TYPE_F32, 2, ne1,
-                kvf.f1k[(size_t) li].data(),
-                kvf.f1k[(size_t) li].size() * sizeof(float));
-            ggml_tensor* ft = graph_input_tensor(c, GGML_TYPE_F32, 2, ne2,
-                kvf.f2tk[(size_t) li].data(),
-                kvf.f2tk[(size_t) li].size() * sizeof(float));
-            z_lr = bf16(c, ggml_mul_mat(c, a, f32(c, n)));            // [r_tot, T]
-            qtilde = bf16(c, ggml_mul_mat(c, ft, f32(c, q)));         // [r_tot, T]
-        } else if (k_lr) {
-            k = lr_expand(kvf.f1k[(size_t) li], kvf.f2k[(size_t) li], rk);
-        }
-        if (v_lr) v = lr_expand(kvf.f1v[(size_t) li], kvf.f2v[(size_t) li], rv);
-    } else {
-        kv = lib::linear_bf16(c, ml, n, p + "attn_kv", false);          // [2*hidden, T]
-    }
+    ggml_tensor* kv = lib::linear_bf16(c, ml, n, p + "attn_kv", false); // [2*hidden, T]
     // Zero-pad to whole blocks (the projections are bias-free, so padding the
     // projected q/kv with zero rows equals the reference's pad-then-project).
     if (s.pad > 0) {
@@ -225,67 +157,29 @@ ggml_tensor* shaw_attention(ggml_context* c, const GraniteModel& m, int li,
         ggml_tensor* zq = graph_input_tensor(c, GGML_TYPE_F32, 2, qne,
                                              s.zeros_q.data(),
                                              s.zeros_q.size() * sizeof(float));
-        auto padz = [&](ggml_tensor* t) {
-            return bf16(c, ggml_concat(c, f32(c, t), zq, 1));
-        };
-        q = padz(q);
-        if (kv) {
-            int64_t kvne[2] = {hidden * 2, s.pad};
-            ggml_tensor* zkv = graph_input_tensor(c, GGML_TYPE_F32, 2, kvne,
-                                                  s.zeros_kv.data(),
-                                                  s.zeros_kv.size() * sizeof(float));
-            kv = bf16(c, ggml_concat(c, f32(c, kv), zkv, 1));
-        } else {
-            if (k) k = padz(k);
-            v = padz(v);
-            if (inr) {
-                // Rank-space operands: zeros view of width r_tot (rows of the
-                // shared [hidden, pad] zero buffer; KVFactors::load bounds
-                // every rank by head_dim, so r_tot <= hidden).
-                const int64_t rt = z_lr->ne[0];
-                GGML_ASSERT(rt <= zq->ne[0]);
-                ggml_tensor* zr = ggml_cont(c, ggml_view_2d(c, zq, rt, s.pad,
-                                                            zq->nb[1], 0));
-                z_lr = bf16(c, ggml_concat(c, f32(c, z_lr), zr, 1));
-                qtilde = bf16(c, ggml_concat(c, f32(c, qtilde), zr, 1));
-            }
-        }
+        int64_t kvne[2] = {hidden * 2, s.pad};
+        ggml_tensor* zkv = graph_input_tensor(c, GGML_TYPE_F32, 2, kvne,
+                                              s.zeros_kv.data(),
+                                              s.zeros_kv.size() * sizeof(float));
+        q = bf16(c, ggml_concat(c, f32(c, q), zq, 1));
+        kv = bf16(c, ggml_concat(c, f32(c, kv), zkv, 1));
     }
-    if (kv) {
-        // Split kv: k = rows [0, hidden), v = rows [hidden, 2*hidden). The
-        // strided half-views go through cont() (a value-exact copy) —
-        // reshape_4d below asserts contiguity.
-        k = ggml_cont(c, ggml_view_2d(c, kv, hidden, T_pad, kv->nb[1], 0));
-        v = ggml_cont(c, ggml_view_2d(c, kv, hidden, T_pad, kv->nb[1],
-                                      (size_t) hidden * kv->nb[0]));
-    }
+    // Split kv: k = rows [0, hidden), v = rows [hidden, 2*hidden). The strided
+    // half-views go through cont() (a value-exact copy) — reshape_4d below
+    // asserts contiguity.
+    ggml_tensor* k = ggml_cont(c, ggml_view_2d(c, kv, hidden, T_pad, kv->nb[1], 0));
+    ggml_tensor* v = ggml_cont(c, ggml_view_2d(c, kv, hidden, T_pad, kv->nb[1],
+                                               (size_t) hidden * kv->nb[0]));
     // [hidden, T_pad] -> [D, H, CS, nblk].
     auto to_blocks = [&](ggml_tensor* z) {
         return ggml_reshape_4d(c, z, D, H, CS, nblk);
     };
-    // Captures require materialized halves (in-r has no k; DUMP_K + KVINR is
-    // rejected before the graph is built).
-    if (k_capture && k) capture_graph_output(f32(c, k), k_capture);
-    if (v_capture && v) capture_graph_output(f32(c, v), v_capture);
-    ggml_tensor* v4 = to_blocks(v);
-    ggml_tensor* q4 = to_blocks(q);   // full-width q: Shaw bias needs it
+    ggml_tensor* q4 = to_blocks(q), * k4 = to_blocks(k), * v4 = to_blocks(v);
 
     // Content scores: [D, r, H, nblk] x [D, c, H, nblk] -> [r, c, H, nblk].
-    // In-r mode contracts over the per-head rank instead (z x qtilde).
-    ggml_tensor* sc;
-    if (inr) {
-        const int64_t rr = z_lr->ne[0] / H;
-        ggml_tensor* z4 = ggml_reshape_4d(c, z_lr, rr, H, CS, nblk);
-        ggml_tensor* qt4 = ggml_reshape_4d(c, qtilde, rr, H, CS, nblk);
-        ggml_tensor* z_ = ggml_cont(c, ggml_permute(c, z4, 0, 2, 1, 3));
-        ggml_tensor* qt_ = ggml_cont(c, ggml_permute(c, qt4, 0, 2, 1, 3));
-        sc = bf16(c, ggml_mul_mat(c, z_, qt_));
-    } else {
-        ggml_tensor* k4 = to_blocks(k);
-        ggml_tensor* k_ = ggml_cont(c, ggml_permute(c, k4, 0, 2, 1, 3));
-        ggml_tensor* q_ = ggml_cont(c, ggml_permute(c, q4, 0, 2, 1, 3));
-        sc = bf16(c, ggml_mul_mat(c, k_, q_));
-    }
+    ggml_tensor* k_ = ggml_cont(c, ggml_permute(c, k4, 0, 2, 1, 3));
+    ggml_tensor* q_ = ggml_cont(c, ggml_permute(c, q4, 0, 2, 1, 3));
+    ggml_tensor* sc = bf16(c, ggml_mul_mat(c, k_, q_));
     sc = bf16(c, ggml_scale(c, f32(c, sc), scale));
 
     // Shaw bias in one batched matmul: q as [D, H*nblk, c] against the baked
@@ -397,9 +291,7 @@ ggml_tensor* conv_module(ggml_context* c, const GraniteModel& m, int li,
 // One conformer block + the mid-CTC hook.
 ggml_tensor* conformer_block(ggml_context* c, const GraniteModel& m, int li,
                              ggml_tensor* x, const EncScratch& s,
-                             StageStop* stop, ggml_tensor** ctc_mid,
-                             std::vector<float>* k_capture = nullptr,
-                             std::vector<float>* v_capture = nullptr) {
+                             StageStop* stop, ggml_tensor** ctc_mid) {
     const auto& ec = m.config.encoder;
     const ModelLoader& ml = m.loader;
     const std::string p = "enc.blk." + std::to_string(li) + ".";
@@ -414,7 +306,7 @@ ggml_tensor* conformer_block(ggml_context* c, const GraniteModel& m, int li,
     if (stop->hit) return x;
     if (stage_wants(stop->name, "ff1")) { stop->hit = true; return x; }
     {
-        ggml_tensor* a = shaw_attention(c, m, li, x, s, k_capture, v_capture);
+        ggml_tensor* a = shaw_attention(c, m, li, x, s);
         if (stage_wants(stop->name, "attnm")) { stop->hit = true; return a; }
         x = lib::addb(c, x, a);
     }
@@ -444,15 +336,9 @@ ggml_tensor* conformer_block(ggml_context* c, const GraniteModel& m, int li,
 // The full fused body: input linear -> 16 blocks -> projector. `mel_in` is
 // [160, T] bf16; returns [output_dim, N] f32. When `enc_capture` is non-null
 // the encoder's last hidden state is additionally read back (divergence dump).
-// `k_dump` (STARLING_GRANITE_DUMP_K, one-shot/CPU path only) captures every
-// layer's padded K/V [hidden, T_pad] f32 for the #59 runtime-basis fits.
-struct EncKVDump {
-    std::vector<std::vector<float>> k, v;   // per layer
-};
 ggml_tensor* build_fused(ggml_context* c, const GraniteModel& m, ggml_tensor* mel_in,
                          const EncScratch& s, std::vector<float>* enc_capture,
-                         StageStop* stop,
-                         EncKVDump* kv_dump = nullptr) {
+                         StageStop* stop) {
     const auto& ec = m.config.encoder;
     ggml_tensor* x = lib::linear_bf16(c, m.loader, mel_in, "enc.input_linear", true);
     if (stage_wants(stop->name, "melin")) { stop->hit = true; return f32(c, mel_in); }
@@ -462,9 +348,7 @@ ggml_tensor* build_fused(ggml_context* c, const GraniteModel& m, ggml_tensor* me
                                  stage_wants(stop->name, "ctc_project_bundle");
     for (uint32_t li = 0; li < ec.n_layers; ++li) {
         x = conformer_block(c, m, (int) li, x, s, stop,
-                            want_ctc_bundle ? &ctc_mid : nullptr,
-                            kv_dump ? &kv_dump->k[(size_t) li] : nullptr,
-                            kv_dump ? &kv_dump->v[(size_t) li] : nullptr);
+                            want_ctc_bundle ? &ctc_mid : nullptr);
         if (stop->hit) return f32(c, x);
     }
     if (want_ctc_bundle) {
@@ -558,62 +442,20 @@ bool encode_audio_and_project(const GraniteModel& model, const MelFeatures& mel,
     // this path — a truncated probe graph must never enter the ReplayGraph
     // LRU, where it would poison later normal transcriptions at the same
     // mel length (pullfrog review).
-    // The #59 research paths (K/V dumps, low-rank factors) are one-shot only
-    // too: factor matrices are host-side graph inputs that a replay would
-    // re-upload on every call.
     if (!global_backend().is_gpu() || lib::debug_enabled("STARLING_GRANITE_DEBUG") ||
-        std::getenv("STARLING_GRANITE_ONLY") ||
-        std::getenv("STARLING_GRANITE_DUMP_K") || model.kv_factors.enabled()) {
+        std::getenv("STARLING_GRANITE_ONLY")) {
         EncScratch s = make_scratch(model.config, T);
         std::vector<float> enc_out;
         StageStop stop{std::getenv("STARLING_GRANITE_ONLY")};
-        // #59 runtime-K/V probe: per-layer padded K/V [hidden, T_pad] f32 dumps.
-        const char* kdump_env = std::getenv("STARLING_GRANITE_DUMP_K");
-        if (kdump_env && model.kv_factors.in_r) {
-            // In-r mode never materializes K (scores contract over the rank
-            // basis), so there is nothing [hidden, T_pad]-shaped to dump.
-            err = "GRANITE K/V dump: STARLING_GRANITE_DUMP_K cannot be combined "
-                  "with STARLING_GRANITE_KVINR";
-            return false;
-        }
-        EncKVDump k_dump;
-        if (kdump_env) {
-            k_dump.k.resize((size_t) ec.n_layers);
-            k_dump.v.resize((size_t) ec.n_layers);
-        }
         bool ok = run_graph([&](ggml_context* c) -> ggml_tensor* {
             int64_t mne[2] = {ec.input_dim, T};
             ggml_tensor* mel_in = graph_input_tensor(c, GGML_TYPE_BF16, 2, mne,
                                                      mel.data.data(),
                                                      mel.data.size() * sizeof(mel.data[0]));
-            return build_fused(c, model, mel_in, s, dump_env ? &enc_out : nullptr,
-                               &stop, kdump_env ? &k_dump : nullptr);
+            return build_fused(c, model, mel_in, s, dump_env ? &enc_out : nullptr, &stop);
         }, out.data);
         if (!ok) { err = "GRANITE encoder graph execution failed"; return false; }
         write_stage_dump(enc_out);
-        if (kdump_env) {
-            // Per layer: <prefix>.L<layer>.f32 (K, historical name) and
-            // <prefix>.V<layer>.f32 (V), row-major [hidden, T_pad].
-            for (size_t li = 0; li < k_dump.k.size(); ++li) {
-                for (const char* suffix : {"L", "V"}) {
-                    const auto& buf = suffix[0] == 'L' ? k_dump.k[li] : k_dump.v[li];
-                    std::string path = std::string(kdump_env) + "." + suffix +
-                                       std::to_string(li) + ".f32";
-                    if (buf.empty()) {  // an empty dump would fit silently wrong
-                        err = "GRANITE K/V dump: nothing captured for " + path;
-                        return false;
-                    }
-                    FILE* f = std::fopen(path.c_str(), "wb");
-                    bool wrote = f && std::fwrite(buf.data(), sizeof(float), buf.size(),
-                                                  f) == buf.size();
-                    if (f) wrote = std::fclose(f) == 0 && wrote;
-                    if (!wrote) {
-                        err = "GRANITE K/V dump: cannot write " + path;
-                        return false;
-                    }
-                }
-            }
-        }
         if (stop.hit) {
             // Stage-only probe: the graph output IS the probed stage; dump it
             // host-side and stop the transcription here.

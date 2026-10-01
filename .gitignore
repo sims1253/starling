@@ -105,6 +105,3 @@ apps/mobile/app/.cxx/
 benchmarks/fast_engine/.layout_eval_cache/
 # autoresearch loop scratch state (local only)
 .auto/
-
-# issue #59 KV factor binaries: regenerate with benchmarks/export_kv_lowrank.py
-benchmarks/results/kvfactors_*.bin
