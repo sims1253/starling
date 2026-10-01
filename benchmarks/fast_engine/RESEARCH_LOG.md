@@ -534,3 +534,40 @@ Normal runs are untouched (golden, watchdog silent, no marker). With L1
 wedge: dying cleanly and dying early. The remaining root-cause work is the
 H1/H2 reproduction study (phone-day) and, if H2 (vendor bug) confirms, the
 plain-Vulkan reproducer bug report.
+
+### P2-12 (2026-10-01, attended session per maintainer): the wedge root cause identified — unclean VkDevice death; clean teardown is CURATIVE
+
+Maintainer directive: wedges are data, attended sessions keep working (rule 3
+v3). Fresh-boot death-mode study on the Pixel 10 Pro (baseline 62.93 ms/token,
+healthy band):
+
+| event | next clean probe (ms/token) |
+| --- | --- |
+| **1× SIGKILL of a live bench (unclean VkDevice death)** | **144.9, then 138.6 — immediate, persistent degradation** |
+| 1× cooperative TERM death (L1: clean exit, device destroyed) on the damaged boot | **62.99 — RECOVERED to baseline** |
+| 5 more SIGKILL cycles | no hard wedge; probes bounce 76–146 (limping band, no marker) |
+| one clean natural-exit load after the multi-kill state | healthy again by its 2nd run (73.2), full teardown |
+
+**Conclusions (H1 confirmed, mechanism refined):**
+1. **The fast-degradation mechanism is unclean VkDevice death**: one SIGKILL
+   of a process holding a live ~1.6 GB VkDevice immediately and persistently
+   degrades the driver (2.3× decode). Every historical "degradation after ~8
+   loads" observation happened under harnesses that kill.
+2. **A clean device teardown REPAIRS the damage** — L1 (cooperative stop) is
+   curative, not just preventive. Recovery without rebooting: after any
+   unclean death, one clean full load restores baseline throughput.
+3. **Kill-count alone does not produce the hard wedge** (6 kills: limping,
+   no fence timeout) — the 09:15 wedge needed a confluence (kills during
+   transport hangs + concurrent system load). The wedge remains the tail of
+   this distribution; the L2 watchdog bounds it either way.
+4. Product implication: the app must never let the engine be SIGKILLed with
+   a live device (cooperative stop on any termination), and a recovery load
+   after a dirty death is the no-reboot remedy.
+
+On-device L1 validation also landed this session: TERM mid-run →
+`[stop] SIGTERM/SIGINT: exiting cleanly` + `[fast] vk teardown: device
+destroyed cleanly` on the phone; healthy runs at the 62.5–64 plateau with
+the watchdog silent. Forensics harness: `.auto/wedge-forensics.sh` (logcat,
+thermals, GPU devfreq, marker — timestamped). wedge-study.sh exited early
+after the decisive probe (script bug, noted for the next pass; the manual
+sequence completed the study).
