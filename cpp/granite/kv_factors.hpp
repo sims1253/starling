@@ -27,6 +27,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -35,10 +36,19 @@ namespace starling::ggml::granite {
 struct KVFactors {
     int n_layers = 0, hidden = 0, n_heads = 0;
     int rank_k = 0, rank_v = 0;  // per-head ranks; 0 = unchanged path
+    // Per-layer ranks (v3 "selective" files; empty for uniform v1 files).
+    std::vector<int> rank_k_l, rank_v_l;
     // Per layer, row-major float32 (layouts in the header comment above).
+    // A layer with per-layer rank 0 stores EMPTY vectors (no payload).
     std::vector<std::vector<float>> f1k, f2k, f1v, f2v;
 
     bool enabled() const { return rank_k > 0 || rank_v > 0; }
+    int rank_layer_k(int li) const {
+        return rank_k_l.empty() ? rank_k : rank_k_l[(size_t) li];
+    }
+    int rank_layer_v(int li) const {
+        return rank_v_l.empty() ? rank_v : rank_v_l[(size_t) li];
+    }
 
     // `path` is read fully into host memory; buffers must outlive every graph
     // that references them (they live in GraniteModel, which does).
@@ -54,35 +64,69 @@ inline bool KVFactors::load(const char* path, int exp_layers, int exp_hidden,
         return std::fread(dst, 1, n, f) == n;
     };
     char magic[8];
-    unsigned int hdr[6];
-    if (!rd(magic, 8) || !rd(hdr, sizeof(hdr))) {
+    if (!rd(magic, 8)) {
         err = "KV factor file: truncated header"; std::fclose(f); return false;
     }
-    if (std::string(magic, 8) != "STLGKVF1" || hdr[0] != 1) {
-        err = "KV factor file: bad magic/version"; std::fclose(f); return false;
+    const bool v3 = std::string(magic, 8) == "STLGKVF3";
+    if (!v3 && std::string(magic, 8) != "STLGKVF1") {
+        err = "KV factor file: bad magic"; std::fclose(f); return false;
     }
-    n_layers = (int) hdr[1]; hidden = (int) hdr[2]; n_heads = (int) hdr[3];
-    rank_k = (int) hdr[4]; rank_v = (int) hdr[5];
+    unsigned int common[4];
+    if (!rd(common, sizeof(common))) {
+        err = "KV factor file: truncated header"; std::fclose(f); return false;
+    }
+    n_layers = (int) common[1]; hidden = (int) common[2]; n_heads = (int) common[3];
+    if (v3) {
+        if (common[0] != 3) {
+            err = "KV factor file: bad version"; std::fclose(f); return false;
+        }
+        // v3: [ver, n_layers, hidden, n_heads] + per-layer rank tables.
+        rank_k_l.resize(n_layers); rank_v_l.resize(n_layers);
+        if (!rd(rank_k_l.data(), sizeof(int) * (size_t) n_layers) ||
+            !rd(rank_v_l.data(), sizeof(int) * (size_t) n_layers)) {
+            err = "KV factor file: truncated rank tables"; std::fclose(f); return false;
+        }
+        rank_k = rank_v = 0;
+        for (int i = 0; i < n_layers; ++i) {
+            rank_k = std::max(rank_k, rank_k_l[(size_t) i]);
+            rank_v = std::max(rank_v, rank_v_l[(size_t) i]);
+        }
+    } else {
+        if (common[0] != 1) {
+            err = "KV factor file: bad version"; std::fclose(f); return false;
+        }
+        // v1: [ver, n_layers, hidden, n_heads, rank_k, rank_v].
+        unsigned int rk_rv[2];
+        if (!rd(rk_rv, sizeof(rk_rv))) {
+            err = "KV factor file: truncated header"; std::fclose(f); return false;
+        }
+        rank_k = (int) rk_rv[0]; rank_v = (int) rk_rv[1];
+    }
     if (n_layers != exp_layers || hidden != exp_hidden || n_heads != exp_heads) {
         err = "KV factor file: model dims mismatch"; std::fclose(f); return false;
     }
-    auto read_half = [&](int rank, std::vector<std::vector<float>>& f1s,
+    // `ranks` is empty for uniform files (fall back to the global rank of
+    // the half being read, identified by which f1s vector was passed).
+    auto read_half = [&](const std::vector<int>& ranks, int uniform_rank,
+                         std::vector<std::vector<float>>& f1s,
                          std::vector<std::vector<float>>& f2s) -> bool {
-        const size_t r_tot = (size_t) n_heads * rank;
         f1s.resize(n_layers); f2s.resize(n_layers);
         for (int i = 0; i < n_layers; ++i) {
-            f1s[i].resize(r_tot * hidden);
-            f2s[i].resize((size_t) hidden * r_tot);
-            if (!rd(f1s[i].data(), f1s[i].size() * sizeof(float)) ||
-                !rd(f2s[i].data(), f2s[i].size() * sizeof(float))) {
+            const int r_eff = ranks.empty() ? uniform_rank : ranks[(size_t) i];
+            if (r_eff <= 0) continue;  // layer keeps the original fused rows
+            const size_t r_tot = (size_t) n_heads * r_eff;
+            f1s[(size_t) i].resize(r_tot * hidden);
+            f2s[(size_t) i].resize((size_t) hidden * r_tot);
+            if (!rd(f1s[(size_t) i].data(), f1s[(size_t) i].size() * sizeof(float)) ||
+                !rd(f2s[(size_t) i].data(), f2s[(size_t) i].size() * sizeof(float))) {
                 err = "KV factor file: truncated payload"; return false;
             }
         }
         return true;
     };
     bool ok = true;
-    if (rank_k > 0) ok = read_half(rank_k, f1k, f2k);
-    if (ok && rank_v > 0) ok = read_half(rank_v, f1v, f2v);
+    if (rank_k > 0) ok = read_half(rank_k_l, rank_k, f1k, f2k);
+    if (ok && rank_v > 0) ok = read_half(rank_v_l, rank_v, f1v, f2v);
     std::fclose(f);
     return ok;
 }

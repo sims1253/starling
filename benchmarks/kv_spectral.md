@@ -160,3 +160,16 @@ on top of a structural latency ceiling (attention is 16.6% of encoder MACs,
 the K path 4.5%) and a memory regression. The env-gated factor path,
 exporters and K-dump probe remain committed as reproducible research
 tooling; no runtime default changes.
+
+**Selective map follow-up (same campaign):** compressing only the six
+runtime-low-rank layers (per-layer held-out error <= 0.0045, others full
+rank; v3 factor format) keeps transcripts identical, wins enc +0.83% /
+wall +0.50%, and moves WER by **-0.19 on both disjoint draws** (5.85→5.66,
+5.38→5.19) — deterministic and inside the gate with margin. The sign is
+consistent with the rank projection denoising the Q4_K weight error that
+lies orthogonal to the speech subspace on near-exactly-low-rank layers.
+So the final, nuanced verdict: uniform-rank K/V compression fails the WER
+gate at every useful rank, but a calibration-driven selective map —
+roughly a third of the K path's compute — passes every gate with a small
+latency win and neutral-to-positive WER. Tooling: v3 format
+(`cpp/granite/kv_factors.hpp`), `benchmarks/export_kv_lowrank_selective.py`.

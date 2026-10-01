@@ -381,3 +381,17 @@ Margin stress test: k16 re-gated on a second disjoint FLEURS draw
 clip-draw luck. Verdict amended to a clean no-go: no tested configuration
 reliably clears the 0.2-point WER gate; runtime default stays unchanged
 (factor path env-gated off).
+
+Selective per-layer map (idea backlog → measured): compress ONLY the six
+layers whose runtime-K is genuinely low-rank (map {0:r32, 6:r32, 9:r8,
+10:r24, 11:r32, 13:r32}, chosen from calibration dumps — per-layer held-out
+projection error <= 0.0045; all other layers full rank). Latency enc
++0.83% / wall +0.50% (matches the MAC model 0.83%). WER: -0.19 on draw 1
+(5.85->5.66) AND -0.19 on draw 2 (5.38->5.19) — deterministic, passes the
+gate on both disjoint draws with margin to spare; consistent with the
+projection denoising Q4_K error orthogonal to the speech subspace on
+near-exactly-low-rank layers. Transcripts identical on all fixtures.
+KEEP: v3 per-layer-rank factor format (STLGKVF3) + selective exporter.
+Verdict nuance: uniform ranks fail the WER gate; selective per-layer maps
+pass it — encoder KV "compression" on granite is viable only in this
+selective form (+0.83% enc ceiling for K).

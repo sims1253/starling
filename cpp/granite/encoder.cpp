@@ -163,7 +163,8 @@ ggml_tensor* shaw_attention(ggml_context* c, const GraniteModel& m, int li,
     ggml_tensor* v = nullptr;
     ggml_tensor* kv = nullptr;  // fused path only (no factors at all)
     const KVFactors& kvf = m.kv_factors;
-    const bool k_lr = kvf.rank_k > 0, v_lr = kvf.rank_v > 0;
+    const int rk = kvf.rank_layer_k(li), rv = kvf.rank_layer_v(li);
+    const bool k_lr = rk > 0, v_lr = rv > 0;
     auto lr_expand = [&](const std::vector<float>& f1, const std::vector<float>& f2,
                          int rank) -> ggml_tensor* {
         const int64_t r_tot = (int64_t) kvf.n_heads * rank;
@@ -186,8 +187,8 @@ ggml_tensor* shaw_attention(ggml_context* c, const GraniteModel& m, int li,
             ggml_tensor* half = bf16(c, ggml_mul_mat(c, wh, lib::gemm_act(c, wh, n)));
             if (k_lr) v = half; else k = half;
         }
-        if (k_lr) k = lr_expand(kvf.f1k[(size_t) li], kvf.f2k[(size_t) li], kvf.rank_k);
-        if (v_lr) v = lr_expand(kvf.f1v[(size_t) li], kvf.f2v[(size_t) li], kvf.rank_v);
+        if (k_lr) k = lr_expand(kvf.f1k[(size_t) li], kvf.f2k[(size_t) li], rk);
+        if (v_lr) v = lr_expand(kvf.f1v[(size_t) li], kvf.f2v[(size_t) li], rv);
     } else {
         kv = lib::linear_bf16(c, ml, n, p + "attn_kv", false);          // [2*hidden, T]
     }
