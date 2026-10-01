@@ -22,6 +22,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
+          # ggml, for the contract fixture below.
+          submodules: recursive
       - name: Install system libs for cpal and gpui's X11/Wayland link
         run: |
           sudo apt-get update
@@ -31,8 +33,20 @@ jobs:
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Build the engine contract fixture
+        # The engine lifecycle tests (crates/dictation/tests/engine_*.rs)
+        # drive real sidecars through this deterministic server; the same
+        # target apps.yml builds for the Python contract tests.
+        run: |
+          cmake --preset native-cpu
+          cmake --build build/native-cpu --target starling-serve-contract-fixture -j2
       - name: Check and test the desktop-gpui workspace
         working-directory: apps/desktop-gpui
+        env:
+          STARLING_CONTRACT_BIN: ${{ github.workspace }}/build/native-cpu/starling-serve-contract-fixture
+          # A missing fixture fails the lifecycle tests instead of letting
+          # them skip and pass vacuously.
+          STARLING_REQUIRE_CONTRACT_FIXTURE: "1"
         run: |
           cargo check --workspace
           cargo test --workspace

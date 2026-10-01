@@ -69,6 +69,15 @@ fn main() {
                 })
             });
 
+            // #362: closing the window quits the app (a zero-window gpui
+            // app would otherwise keep running headless). Quitting is what
+            // stops the engine sidecar cleanly — through the app entity's
+            // own quit hook (app.rs `register_quit_hook`, the single owner
+            // of engine shutdown; the server's --parent-pid watchdog is
+            // the crash backstop). Process-lifetime hook: forgotten on
+            // purpose, like the hotkey manager below.
+            std::mem::forget(cx.on_window_closed(|cx| cx.quit()));
+
             match window {
                 Ok(handle) => {
                     if let Err(err) = handle.update(cx, |app, window, _cx| {
@@ -76,14 +85,17 @@ fn main() {
                     }) {
                         eprintln!("Could not focus the Starling window: {err}");
                     }
-                    let window = handle.clone();
+                    // No engine shutdown here: the app entity's own quit
+                    // hook (app.rs `register_quit_hook`) owns it, so quit
+                    // stops the sidecar exactly once. (`WindowHandle` is
+                    // `Copy`; the hotkey loop below takes its own copy.)
                     cx.spawn(async move |cx| {
                         loop {
                             gpui::Timer::after(Duration::from_millis(150)).await;
                             for event in GlobalHotKeyEvent::receiver().try_iter() {
                                 if event.state() == HotKeyState::Pressed {
                                     cx.update(|cx| {
-                                        let _ = window.update(cx, |app, window, cx| {
+                                        let _ = handle.update(cx, |app, window, cx| {
                                             window.activate_window();
                                             // Same guarded entry as the
                                             // in-app binding (#209, #214.1):

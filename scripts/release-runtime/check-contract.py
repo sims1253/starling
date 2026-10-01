@@ -9,6 +9,130 @@ ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = ".github/workflows/release-starling-serve.yml"
 DOCS = ("docs/release-runtime.md", "docs/native-serving.md")
 DOCKERFILE = "scripts/release-runtime/Dockerfile.cuda"
+DESKTOP_WORKFLOW = ".github/workflows/package-desktop.yml"
+PREPARE = "scripts/experimental-release/prepare.py"
+ENGINE_SECTION = "## Desktop bundled engines"
+# The Windows Vulkan SDK installer pins: the version and the installer's
+# SHA-256, each set once as an env var in both workflows that install it.
+VULKAN_SDK_PINS = {
+    "VULKAN_SDK_VERSION": re.compile(
+        r"^\s+VULKAN_SDK_VERSION:\s*['\"]?(\d+(?:\.\d+)+)['\"]?\s*$", re.M),
+    "VULKAN_SDK_SHA256": re.compile(
+        r"^\s+VULKAN_SDK_SHA256:\s*['\"]?([0-9A-Fa-f]{64})['\"]?\s*$", re.M),
+}
+
+
+def bundled_engines_errors(desktop_workflow: str, prepare: str,
+                           release_runtime: str) -> list[str]:
+    """The bundled-engine backend list must agree everywhere it is stated.
+
+    Sources: the desktop packager's BUNDLED_ENGINES env (the single source of
+    truth the packaging steps use), prepare.py's build-info
+    desktop_bundled_engines, and the "Desktop bundled engines" section of the
+    runtime guide (which also must say CUDA is not bundled).
+    """
+    errors = []
+    found = re.findall(r"^\s+BUNDLED_ENGINES: [\"']([^\"']+)[\"']\s*$",
+                       desktop_workflow, re.M)
+    workflow_engines = None
+    if len(found) != 1:
+        errors.append(
+            f"{DESKTOP_WORKFLOW}: expected exactly one job-level "
+            "BUNDLED_ENGINES: \"<engines>\" env (the single source of truth "
+            "for the bundled desktop engines)")
+    else:
+        workflow_engines = found[0].split()
+
+    found = re.findall(r"[\"']desktop_bundled_engines[\"']\s*:\s*\[([^\]]*)\]",
+                       prepare)
+    prepare_engines = None
+    if len(found) != 1:
+        errors.append(
+            f"{PREPARE}: build-info must record desktop_bundled_engines: [...] "
+            "with the bundled backend list")
+    else:
+        prepare_engines = re.findall(r"[\"']([a-z0-9]+)[\"']", found[0])
+
+    section = re.search(re.escape(ENGINE_SECTION) + r"\n(.*?)(?=\n## |\Z)",
+                        release_runtime, re.S)
+    docs_engines = None
+    if not section:
+        errors.append(
+            f"{DOCS[0]}: expected a {ENGINE_SECTION!r} section stating the "
+            "bundled engines")
+    else:
+        body = section.group(1)
+        # Each subsequent engine needs a ", " or " and " separator, so a
+        # list with a missing separator fails instead of parsing loosely.
+        sentence = re.search(
+            r"desktop archives bundle exactly the "
+            r"(`[a-z0-9]+`(?:(?:, | and )`[a-z0-9]+`)*)\s*engines", body)
+        if not sentence:
+            errors.append(
+                f"{DOCS[0]}: the Desktop bundled engines section must state "
+                "which engines ship inside the desktop archives "
+                "(\"bundle exactly the `x` and `y` engines\")")
+        else:
+            docs_engines = re.findall(r"`([a-z0-9]+)`", sentence.group(1))
+        if "CUDA is not bundled" not in body:
+            errors.append(
+                f"{DOCS[0]}: the Desktop bundled engines section must state "
+                "that CUDA is not bundled")
+
+    sources = [
+        (DESKTOP_WORKFLOW + " BUNDLED_ENGINES", workflow_engines),
+        (PREPARE + " desktop_bundled_engines", prepare_engines),
+        (DOCS[0] + " Desktop bundled engines section", docs_engines),
+    ]
+    if any(engines is None for _, engines in sources):
+        return errors
+    # A duplicated entry inside one list would survive the ordered
+    # comparison below while still being wrong — a bundle list must
+    # name each backend exactly once.
+    for name, engines in sources:
+        duplicates = sorted({engine for engine in engines if engines.count(engine) > 1})
+        if duplicates:
+            errors.append(f"{name}: duplicate engine entries: {duplicates}")
+    # Ordered, not set-wise: the list order is the app's preference order
+    # (it tries the first entry first), so the sources must agree
+    # element-for-element in the same order.
+    ordered = [engines for _, engines in sources]
+    if not ordered[0] or any(engines != ordered[0] for engines in ordered[1:]):
+        errors.append(
+            "Bundled desktop engine lists disagree (order matters, it is "
+            "the preference order): "
+            + "; ".join(f"{name}={engines}" for name, engines in sources))
+    return errors
+
+
+def vulkan_sdk_errors(desktop_workflow: str, release_workflow: str) -> list[str]:
+    """Both workflows that install the Windows Vulkan SDK must pin one and
+    the same installer (VULKAN_SDK_VERSION and VULKAN_SDK_SHA256).
+
+    Sources: the desktop packager's Vulkan loader install (its assembly step
+    runs the Vulkan engine's --version, which needs vulkan-1.dll) and the
+    release workflow's windows-vulkan build. A silent divergence would let
+    the desktop bundle be validated against an SDK the release never used.
+    """
+    errors = []
+    for name, text in ((DESKTOP_WORKFLOW, desktop_workflow), (WORKFLOW, release_workflow)):
+        if "humbletim/install-vulkan-sdk" in re.sub(r"#[^\n]*", "", text):
+            errors.append(
+                f"{name}: humbletim/install-vulkan-sdk cannot unpack SDK "
+                "installers >= 1.4.313.0; run the pinned official installer")
+    for var, pattern in VULKAN_SDK_PINS.items():
+        pins = {}
+        for name, text in ((DESKTOP_WORKFLOW, desktop_workflow), (WORKFLOW, release_workflow)):
+            found = pattern.findall(text)
+            if len(found) != 1:
+                errors.append(f"{name}: expected exactly one {var} env pin")
+            else:
+                pins[name] = found[0].upper()
+        if len(pins) == 2 and len(set(pins.values())) != 1:
+            errors.append(
+                f"{var} pins disagree (keep the two workflows in sync): "
+                + "; ".join(f"{name} pins {pin}" for name, pin in pins.items()))
+    return errors
 
 
 def check(workflow: str, docs: dict[str, str], executing_cuda_version: str | None = None,
@@ -99,14 +223,22 @@ def main() -> int:
                         help="CUDA_VERSION from the executing release workflow; "
                              "must match the checked-out release tag")
     args = parser.parse_args()
-    errors = check((ROOT / WORKFLOW).read_text(encoding="utf-8"),
+    workflow_text = (ROOT / WORKFLOW).read_text(encoding="utf-8")
+    desktop_workflow_text = (ROOT / DESKTOP_WORKFLOW).read_text(encoding="utf-8")
+    errors = check(workflow_text,
                    {name: (ROOT / name).read_text(encoding="utf-8") for name in DOCS},
                    args.executing_cuda_version,
                    (ROOT / DOCKERFILE).read_text(encoding="utf-8"))
+    errors += bundled_engines_errors(
+        desktop_workflow_text,
+        (ROOT / PREPARE).read_text(encoding="utf-8"),
+        (ROOT / DOCS[0]).read_text(encoding="utf-8"))
+    errors += vulkan_sdk_errors(desktop_workflow_text, workflow_text)
     if errors:
         print("\n".join(errors), file=sys.stderr)
         return 1
-    print("CUDA and ROCm installers and runtime guidance agree")
+    print("CUDA and ROCm installers and runtime guidance agree; "
+          "bundled desktop engines agree; Vulkan SDK pins agree")
     return 0
 
 

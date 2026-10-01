@@ -95,7 +95,7 @@ impl LiveStream {
                         tokio::select! {
                             command = command_rx.recv() => {
                                 let message = match command {
-                                    Some(Command::Audio(bytes)) => Message::Binary(bytes.into()),
+                                    Some(Command::Audio(bytes)) => Message::Binary(bytes),
                                     Some(Command::Commit) => Message::Text(r#"{"type":"commit"}"#.into()),
                                     None => break,
                                 };

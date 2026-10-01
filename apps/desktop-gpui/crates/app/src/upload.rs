@@ -8,14 +8,148 @@ use gpui::{AppContext, AsyncApp, Context, PathPromptOptions, WeakEntity};
 use starling_dictation::{
     audio,
     client::{ClientError, StarlingClient},
+    engine::EngineLease,
     journal,
     recorder,
+    settings::EngineMode,
     storage,
 };
 
 use crate::app::{HealthCheckPurpose, StarlingApp, UnsavedWav};
 use crate::live_stream::LiveStream;
 use crate::store::Store;
+
+/// A take's endpoint/model binding (#363), resolved once at the moment
+/// the take starts and carried with it to the end of its transcription
+/// job. The lease (builtin mode) pins the engine: a model switch
+/// mid-take spawns the new engine, but this take keeps talking to the
+/// endpoint it started on, and the draining engine waits for the lease
+/// to drop — which happens exactly when the job finishes (success,
+/// failure, or session gone) because the target moves into the job and
+/// is dropped with it.
+///
+/// Manual mode binds the committed `endpoint`/`model` at start instead,
+/// so even a settings save mid-take cannot move a take that already
+/// began. Retries, re-transcribes, and file imports resolve a fresh
+/// target at the moment they start — they are new jobs, not continuations.
+pub(crate) struct TakeTarget {
+    endpoint: String,
+    model: String,
+    provenance: storage::BackendLabel,
+    lease: Option<EngineLease>,
+    builtin: bool,
+}
+
+impl TakeTarget {
+    /// A manual-mode target: the committed endpoint and model, with the
+    /// unchanged `openai:<model>` attempt label.
+    fn manual(endpoint: String, model: String) -> TakeTarget {
+        let provenance = storage::BackendLabel::OpenAi {
+            model: model.clone(),
+        };
+        TakeTarget {
+            endpoint,
+            model,
+            provenance,
+            lease: None,
+            builtin: false,
+        }
+    }
+
+    /// A builtin-mode target holding its engine lease.
+    fn from_lease(lease: EngineLease) -> TakeTarget {
+        TakeTarget {
+            model: lease.slug().to_string(),
+            provenance: storage::BackendLabel::Engine {
+                model_id: lease.model_id().to_string(),
+            },
+            endpoint: lease.endpoint().to_string(),
+            lease: Some(lease),
+            builtin: true,
+        }
+    }
+
+    /// A builtin-mode target with no engine to talk to (the engine was
+    /// not ready when the take started): the take still records — audio
+    /// is journaled — and transcription is retried once the engine is.
+    fn builtin_unready() -> TakeTarget {
+        TakeTarget {
+            endpoint: String::new(),
+            model: String::new(),
+            provenance: storage::BackendLabel::Engine {
+                model_id: "none".to_string(),
+            },
+            lease: None,
+            builtin: true,
+        }
+    }
+
+    fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    fn model(&self) -> &str {
+        &self.model
+    }
+
+    /// The attempt row's backend label (`engine:<model_id>` builtin,
+    /// `openai:<model>` manual) — the provenance history shows per take.
+    /// Rendered through [`storage::BackendLabel`], the typed form of the
+    /// persisted string shape.
+    fn provenance(&self) -> String {
+        self.provenance.to_string()
+    }
+
+    /// Whether this is a builtin take whose engine was not ready — the
+    /// job may re-resolve once before failing honestly.
+    fn needs_engine(&self) -> bool {
+        self.builtin && self.lease.is_none()
+    }
+
+    /// Whether failures of this take belong to the built-in engine —
+    /// they must never be routed into the manual-endpoint health prober.
+    fn is_builtin(&self) -> bool {
+        self.builtin
+    }
+}
+
+impl StarlingApp {
+    /// Resolve the target for a take starting now (#363): the engine's
+    /// lease in builtin mode (recording proceeds even without one — the
+    /// audio is journaled and transcription retries later), the
+    /// committed endpoint/model in manual mode.
+    pub(crate) fn resolve_take_target(&self) -> TakeTarget {
+        match self.engine_settings.mode {
+            EngineMode::Builtin => match self.engine.as_ref().and_then(|engine| engine.lease()) {
+                Some(lease) => TakeTarget::from_lease(lease),
+                None => TakeTarget::builtin_unready(),
+            },
+            EngineMode::Manual => TakeTarget::manual(self.endpoint.clone(), self.model.clone()),
+        }
+    }
+}
+
+/// What a transport-class failure against the built-in engine's own
+/// endpoint says (#363): the sidecar went away, the audio is safe, and
+/// the manual-endpoint prober has nothing to do with it. Other failure
+/// classes (the server answered and objected) keep their own message.
+pub(crate) fn builtin_take_failure_message(builtin: bool, class: FailureClass, err: &ClientError) -> String {
+    if builtin && class == FailureClass::Transport {
+        "The built-in engine stopped while transcribing; the recording is saved — retry when \
+         the engine is ready."
+            .to_string()
+    } else {
+        err.to_string()
+    }
+}
+
+/// What a take says when the built-in engine never became ready (#363
+/// first run): the audio is saved and retry works once a model serves.
+pub(crate) fn engine_not_ready_message() -> String {
+    "The built-in engine is not ready; the recording is saved — pick a model in Settings, or \
+     retry once the engine is ready."
+        .to_string()
+}
 
 /// What a failed job says about retrying it (R13).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -90,9 +224,7 @@ pub(crate) fn save_race_decision(
     }
     match write_error {
         None => SaveRaceDecision::Written,
-        Some(err) if matches!(err, storage::StorageError::NotFound(_)) => {
-            SaveRaceDecision::SessionDeleted
-        }
+        Some(storage::StorageError::NotFound(_)) => SaveRaceDecision::SessionDeleted,
         Some(err) => SaveRaceDecision::Failed(err.to_string()),
     }
 }
@@ -181,6 +313,13 @@ impl StarlingApp {
         self.error = None;
         if let Some(handle) = self.recorder.take() {
             let mut stream = self.live_stream.take();
+            // The binding resolved at START leaves with the take (#363);
+            // a stop without one (not a normal path) resolves fresh
+            // rather than transcribing against nothing.
+            let target = self
+                .active_take
+                .take()
+                .unwrap_or_else(|| self.resolve_take_target());
             self.live_partial.clear();
             let streamed_samples = std::mem::take(&mut self.streamed_samples);
             let sent_samples = std::mem::take(&mut self.stream_sent_samples);
@@ -266,6 +405,7 @@ impl StarlingApp {
                                         stream,
                                         Some(stopped_at),
                                         staging,
+                                        target,
                                         cx,
                                     );
                                 })
@@ -357,18 +497,34 @@ impl StarlingApp {
                     self.streamed_samples.clear();
                     self.stream_sent_samples = 0;
                     self.stream_degradation = None;
-                    // A URL-shape failure is deterministic, so it gets the
-                    // same visible degradation note as a mid-recording
-                    // death instead of a silent `.ok()` downgrade.
-                    match LiveStream::start(&self.endpoint) {
-                        Ok(stream) => self.live_stream = Some(stream),
-                        Err(reason) => {
-                            self.stream_degradation = Some(format!(
-                                "Live transcription is unavailable ({reason}); the recording \
-                                 will be uploaded in full after you stop."
-                            ));
+                    // #363: the take's endpoint/model binding resolves at
+                    // START and travels with the take — a model switch or
+                    // settings save mid-take cannot move it.
+                    let target = self.resolve_take_target();
+                    if target.endpoint().is_empty() {
+                        // Builtin mode with no ready engine: recording
+                        // proceeds (the audio is journaled either way);
+                        // the note says transcription will need a retry.
+                        self.stream_degradation = Some(
+                            "The built-in engine is not ready; the recording is still saved, \
+                             and transcription will need a retry once the engine is ready."
+                                .to_string(),
+                        );
+                    } else {
+                        // A URL-shape failure is deterministic, so it gets the
+                        // same visible degradation note as a mid-recording
+                        // death instead of a silent `.ok()` downgrade.
+                        match LiveStream::start(target.endpoint()) {
+                            Ok(stream) => self.live_stream = Some(stream),
+                            Err(reason) => {
+                                self.stream_degradation = Some(format!(
+                                    "Live transcription is unavailable ({reason}); the recording \
+                                     will be uploaded in full after you stop."
+                                ));
+                            }
                         }
                     }
+                    self.active_take = Some(target);
                     self.recorder = Some(handle);
                     self.elapsed_ms = 0.0;
                     self.levels = vec![0.06; 52];
@@ -383,6 +539,9 @@ impl StarlingApp {
         }
     }
 
+    /// The target travels with the take through here (#363); the lease it
+    /// may hold is dropped when the transcription job finishes.
+    #[allow(clippy::too_many_arguments)]
     pub fn save_and_transcribe(
         &mut self,
         wav: Arc<Vec<u8>>,
@@ -390,6 +549,7 @@ impl StarlingApp {
         stream: Option<LiveStream>,
         stopped_at: Option<Instant>,
         staging: Option<u64>,
+        target: TakeTarget,
         cx: &mut Context<Self>,
     ) {
         // Deliberately no `self.error = None` here: every caller clears the
@@ -433,7 +593,7 @@ impl StarlingApp {
                         if let Some(token) = staging {
                             app.bind_staging(token, &saved.id);
                         }
-                        app.transcribe_with_stream(saved.id, saved.wav, stream, cx);
+                        app.transcribe_with_stream(saved.id, saved.wav, stream, target, cx);
                     })
                     .ok();
                 }
@@ -516,7 +676,11 @@ impl StarlingApp {
     }
 
     pub fn transcribe(&mut self, id: String, wav: Arc<Vec<u8>>, cx: &mut Context<Self>) {
-        self.transcribe_with_stream(id, wav, None, cx);
+        // A retry is a new job: it resolves a fresh target at the moment
+        // it starts (#363) — the engine may serve a different model now,
+        // or the user may have switched to their own server.
+        let target = self.resolve_take_target();
+        self.transcribe_with_stream(id, wav, None, target, cx);
     }
 
     fn transcribe_with_stream(
@@ -524,6 +688,7 @@ impl StarlingApp {
         id: String,
         wav: Arc<Vec<u8>>,
         stream: Option<LiveStream>,
+        mut target: TakeTarget,
         cx: &mut Context<Self>,
     ) {
         if self.active_ids.contains(&id) {
@@ -537,14 +702,32 @@ impl StarlingApp {
         self.error = None;
         cx.notify();
 
-        let endpoint = self.endpoint.clone();
-        let model = self.model.clone();
+        // #363: a take that started before the engine was ready gets one
+        // fresh resolution here — the engine may have come up while it
+        // recorded. Still no engine and the job fails honestly below.
+        if target.needs_engine() {
+            target = self.resolve_take_target();
+        }
+        let endpoint = target.endpoint().to_string();
+        let model = target.model().to_string();
         // The attempt row's backend label (v2 keeps it on the recognition
-        // attempt; v1 ignores it).
-        let backend = format!("openai:{model}");
+        // attempt): the target's provenance — `engine:<model_id>` for a
+        // built-in take, `openai:<model>` for a manual one.
+        let backend = target.provenance();
+        let builtin = target.is_builtin();
+        let unready = target.needs_engine();
         let store_for_job = store.clone();
 
         cx.spawn(async move |this, cx| {
+            // The take's engine hold (#363): nothing reads the target
+            // anymore — endpoint/model/provenance were copied out above —
+            // but owning it here means the lease is dropped only when
+            // this job finishes (success, failure, or session gone),
+            // releasing a draining engine exactly then. (If it were left
+            // behind in this function's scope, a model switch mid-take
+            // could stop the old engine while this take still transcribes
+            // against it.)
+            let _take_target = target;
             enum Outcome {
                 Success,
                 Failure { message: String, class: FailureClass },
@@ -569,7 +752,15 @@ impl StarlingApp {
                         let wav = wav.clone();
                         let id = id.clone();
                         cx.background_spawn(async move {
-                            let client = StarlingClient::new(&endpoint, &model)?;
+                            // #363: no engine to talk to (builtin, never
+                            // became ready): fail the request with the
+                            // honest sentence — Local class, so nothing
+                            // prompts a probe.
+                            let client = if unready {
+                                Err(ClientError::Input(engine_not_ready_message()))
+                            } else {
+                                StarlingClient::new(&endpoint, &model)
+                            }?;
                             // The stream failure reason is kept (and logged
                             // when the batch fallback also fails): silently
                             // re-uploading after a dead stream made
@@ -665,10 +856,14 @@ impl StarlingApp {
                         Err(err) => {
                             // R13: the client error is classified while it
                             // is still typed — string matching later would
-                            // be fragile.
+                            // be fragile. #363: a transport failure on a
+                            // built-in take means the sidecar went away;
+                            // the message says so instead of naming a
+                            // socket error.
+                            let class = failure_class(&err);
                             outcome = Outcome::Failure {
-                                message: err.to_string(),
-                                class: failure_class(&err),
+                                message: builtin_take_failure_message(builtin, class, &err),
+                                class,
                             };
                         }
                     }
@@ -734,8 +929,10 @@ impl StarlingApp {
                         // failure whose probe succeeds shows the server
                         // recovered) but never touches `app.error`, so
                         // the explanation for the missing transcript is
-                        // not wiped ~5 s after it appeared.
-                        if class == FailureClass::Transport {
+                        // not wiped ~5 s after it appeared. #363: a
+                        // built-in take's endpoint is the engine's own —
+                        // its failures never probe the manual endpoint.
+                        if class == FailureClass::Transport && !builtin {
                             app.check_health(
                                 HealthCheckPurpose::Diagnostic,
                                 app.endpoint.clone(),
@@ -815,7 +1012,19 @@ impl StarlingApp {
                     match prepared {
                         Ok(prepared) => {
                             this.update(cx, |app, cx| {
-                                app.save_and_transcribe(Arc::new(prepared.wav), None, None, None, None, cx);
+                                // A file import is a new job: it resolves a
+                                // fresh target at the moment it starts
+                                // (#363) — whatever the engine serves now.
+                                let target = app.resolve_take_target();
+                                app.save_and_transcribe(
+                                    Arc::new(prepared.wav),
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    target,
+                                    cx,
+                                );
                             })
                             .ok();
                         }
@@ -901,6 +1110,74 @@ pub(crate) async fn refresh_sessions(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_manual_target_keeps_the_openai_provenance_label() {
+        // #363: manual takes bind endpoint+model at start and label
+        // their attempts exactly as before — `openai:<model>`.
+        let target = TakeTarget::manual(
+            "http://10.0.0.5:8181".to_string(),
+            "whisper-large-v3".to_string(),
+        );
+        assert_eq!(target.endpoint(), "http://10.0.0.5:8181");
+        assert_eq!(target.model(), "whisper-large-v3");
+        assert_eq!(target.provenance(), "openai:whisper-large-v3");
+        assert!(!target.is_builtin());
+        assert!(!target.needs_engine());
+    }
+
+    #[test]
+    fn an_unready_builtin_target_has_no_endpoint_and_needs_an_engine() {
+        // Recording started with no ready engine: the take proceeds, but
+        // the target carries nothing to send to — the job may re-resolve
+        // once, then fails honestly.
+        let target = TakeTarget::builtin_unready();
+        assert!(target.is_builtin());
+        assert!(target.needs_engine());
+        assert_eq!(target.endpoint(), "");
+        assert_eq!(target.provenance(), "engine:none");
+    }
+
+    #[test]
+    fn a_transport_failure_on_a_builtin_take_names_the_stopped_engine() {
+        // #363: connection-refused against the engine's own endpoint is
+        // the sidecar going away, not a flaky network — and the sentence
+        // says the recording is saved and retry is the path.
+        let refused = ClientError::Transport(
+            "error sending request for url (http://127.0.0.1:51309/v1/audio/transcriptions): \
+             Connection refused (os error 111)"
+                .to_string(),
+        );
+        let message = builtin_take_failure_message(true, FailureClass::Transport, &refused);
+        assert_eq!(
+            message,
+            "The built-in engine stopped while transcribing; the recording is saved — retry \
+             when the engine is ready."
+        );
+        // The same error on a manual take keeps the client's message (the
+        // manual prober owns that story), and non-transport builtin
+        // failures keep theirs — the server answered, the engine lives.
+        assert_eq!(
+            builtin_take_failure_message(false, FailureClass::Transport, &refused),
+            refused.to_string()
+        );
+        let http = ClientError::Http {
+            status: 500,
+            message: "model is loading".to_string(),
+        };
+        assert_eq!(
+            builtin_take_failure_message(true, FailureClass::Local, &http),
+            http.to_string()
+        );
+    }
+
+    #[test]
+    fn the_engine_not_ready_message_points_at_retry() {
+        let message = engine_not_ready_message();
+        assert!(message.contains("not ready"), "{message}");
+        assert!(message.contains("recording is saved"), "{message}");
+        assert!(message.contains("retry"), "{message}");
+    }
 
     #[test]
     fn a_local_storage_failure_surfaces_as_an_error_not_a_connection_change() {

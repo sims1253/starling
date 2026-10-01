@@ -17,6 +17,124 @@ def inputs():
             (ROOT / contract.DOCKERFILE).read_text(encoding="utf-8"))
 
 
+def engine_inputs():
+    return ((ROOT / contract.DESKTOP_WORKFLOW).read_text(encoding="utf-8"),
+            (ROOT / contract.PREPARE).read_text(encoding="utf-8"),
+            (ROOT / contract.DOCS[0]).read_text(encoding="utf-8"))
+
+
+def test_current_bundled_engines_contract():
+    workflow, prepare, release_runtime = engine_inputs()
+    assert contract.bundled_engines_errors(workflow, prepare, release_runtime) == []
+
+
+def test_current_vulkan_sdk_contract():
+    desktop_workflow, _, _ = engine_inputs()
+    workflow, _, _ = inputs()
+    assert contract.vulkan_sdk_errors(desktop_workflow, workflow) == []
+
+
+@pytest.mark.parametrize("path, old, new", [
+    (contract.DESKTOP_WORKFLOW, 'BUNDLED_ENGINES: "@ENGINES@"', 'BUNDLED_ENGINES: "@BAD_ENGINES@"'),
+    (contract.PREPARE, '"desktop_bundled_engines": [@LIST@]', '"desktop_bundled_engines": [@BAD_LIST@]'),
+    (contract.DOCS[0], 'bundle exactly the `vulkan` and `cpu`', 'bundle exactly the `vulkan` and `rocm`'),
+    (contract.DOCS[0], 'CUDA is not bundled', 'CUDA is an optional extra'),
+])
+def test_rejects_independent_bundled_engine_drift(path, old, new):
+    desktop_workflow, prepare, release_runtime = engine_inputs()
+    engines = re.search(r'BUNDLED_ENGINES: "([^"]+)"', desktop_workflow).group(1)
+    listed = re.search(r'"desktop_bundled_engines": \[([^\]]*)\]', prepare).group(1)
+    old = old.replace("@ENGINES@", engines).replace("@LIST@", listed)
+    dropped = engines.split()[1:]  # keep one backend, drop the rest
+    new = (new.replace("@BAD_ENGINES@", " ".join(dropped))
+              .replace("@BAD_LIST@", ", ".join(f'"{name}"' for name in reversed(dropped))))
+    texts = {contract.DESKTOP_WORKFLOW: desktop_workflow,
+             contract.PREPARE: prepare,
+             contract.DOCS[0]: release_runtime}
+    assert old in texts[path]
+    texts[path] = texts[path].replace(old, new)
+    errors = contract.bundled_engines_errors(
+        texts[contract.DESKTOP_WORKFLOW], texts[contract.PREPARE],
+        texts[contract.DOCS[0]])
+    assert errors, "the drifted source must be reported"
+
+
+def test_missing_bundled_engine_statement_fails():
+    desktop_workflow, prepare, release_runtime = engine_inputs()
+    without_section = re.sub(r"## Desktop bundled engines\n.*?(?=\n## |\Z)",
+                             "", release_runtime, flags=re.S)
+    assert without_section != release_runtime
+    assert contract.bundled_engines_errors(desktop_workflow, prepare, without_section)
+
+
+def test_reordered_bundled_engine_list_fails():
+    # The list order is the app's preference order, so a same-set reorder
+    # in any one source must be reported, not absorbed by a set comparison.
+    workflow, prepare, release_runtime = engine_inputs()
+
+    engines = re.search(r'BUNDLED_ENGINES: "([^"]+)"', workflow).group(1)
+    reordered = " ".join(reversed(engines.split()))
+    assert reordered != engines
+    assert contract.bundled_engines_errors(
+        workflow.replace(engines, reordered), prepare, release_runtime)
+
+    listed = re.search(r'"desktop_bundled_engines": \[([^\]]*)\]', prepare).group(1)
+    reordered_list = ", ".join(reversed(re.findall(r'"([^"]+)"', listed)))
+    assert contract.bundled_engines_errors(
+        workflow, prepare.replace(listed, reordered_list), release_runtime)
+
+    docs_listed = re.search(
+        r"bundle exactly the ((?:`[a-z0-9]+`(?:, | and )`[a-z0-9]+`)+)",
+        release_runtime).group(1)
+    first, second = re.findall(r"`([a-z0-9]+)`", docs_listed)
+    swapped_docs = release_runtime.replace(
+        docs_listed, f"`{second}` and `{first}`")
+    assert contract.bundled_engines_errors(workflow, prepare, swapped_docs)
+
+
+def test_missing_separator_in_bundled_engine_statement_fails():
+    # "`vulkan` `cpu`" (no comma or "and" between them) must not parse as
+    # a list: separators are required between repetitions.
+    workflow, prepare, release_runtime = engine_inputs()
+    listed = re.search(
+        r"bundle exactly the ((?:`[a-z0-9]+`(?:, | and )`[a-z0-9]+`)+)",
+        release_runtime).group(1)
+    unseparated = " ".join(re.findall(r"`([a-z0-9]+)`", listed))
+    assert contract.bundled_engines_errors(
+        workflow, prepare, release_runtime.replace(listed, unseparated))
+
+
+@pytest.mark.parametrize("var", sorted(contract.VULKAN_SDK_PINS))
+@pytest.mark.parametrize("path", [contract.DESKTOP_WORKFLOW, contract.WORKFLOW])
+def test_rejects_vulkan_sdk_pin_drift(path, var):
+    # Change one workflow's pin: the other workflow's pin no longer agrees,
+    # so the check must fail.
+    desktop_workflow, _, _ = engine_inputs()
+    workflow, _, _ = inputs()
+    bad = {"VULKAN_SDK_VERSION": "9.9.9.9", "VULKAN_SDK_SHA256": "0" * 64}[var]
+    text = {contract.DESKTOP_WORKFLOW: desktop_workflow, contract.WORKFLOW: workflow}[path]
+    changed, count = re.subn(rf"(^\s+{var}:\s*)\S+", rf"\g<1>{bad}", text, count=1, flags=re.M)
+    assert count == 1
+    if path == contract.DESKTOP_WORKFLOW:
+        desktop_workflow = changed
+    else:
+        workflow = changed
+    assert any(var in error for error in contract.vulkan_sdk_errors(desktop_workflow, workflow))
+
+
+def test_rejects_humbletim_vulkan_action():
+    desktop_workflow, _, _ = engine_inputs()
+    workflow, _, _ = inputs()
+    desktop_workflow += "\n      - uses: humbletim/install-vulkan-sdk@v1.2\n"
+    assert contract.vulkan_sdk_errors(desktop_workflow, workflow)
+
+
+def test_release_preflight_checks_bundled_engines_too(monkeypatch, capsys):
+    monkeypatch.setattr("sys.argv", ["check-contract.py"])
+    assert contract.main() == 0
+    assert "bundled desktop engines agree" in capsys.readouterr().out
+
+
 def test_current_release_contract():
     workflow, docs, dockerfile = inputs()
     assert contract.check(workflow, docs, dockerfile=dockerfile) == []

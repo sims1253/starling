@@ -17,6 +17,12 @@ on:
       run-tests:
         type: boolean
         default: true
+      # Bundle the CPU and Vulkan starling-serve engines inside the desktop
+      # archive (the app launches one as a supervised sidecar, #362). Requires
+      # the starling-serve server artifacts from the same workflow run.
+      bundle-engines:
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -29,6 +35,24 @@ jobs:
         platform: ${{ fromJSON(inputs.platforms) }}
     runs-on: ${{ matrix.platform == 'windows' && 'windows-2025' || 'ubuntu-24.04' }}
     timeout-minutes: 90
+    # Single source of truth for the engines bundled into the desktop archive,
+    # in preference order (the app tries the first entry first).
+    # scripts/release-runtime/check-contract.py verifies this order agrees
+    # with prepare.py and docs/release-runtime.md; it runs in the
+    # runtime-contract job of release-starling-serve.yml, and again below in
+    # this workflow whenever engines are bundled.
+    env:
+      BUNDLED_ENGINES: "vulkan cpu"
+      # The bundle-engines input serialized as "true"/"false" for the
+      # packaging scripts below (the step conditions above use the typed
+      # inputs.bundle-engines form).
+      BUNDLE_ENGINES: ${{ inputs.bundle-engines }}
+      # The Windows Vulkan loader comes from this SDK. Keep both pins in sync
+      # with release-starling-serve.yml's windows-vulkan job (checked by
+      # check-contract.py), so the bundle is validated against the SDK the
+      # release built with.
+      VULKAN_SDK_VERSION: 1.4.357.0
+      VULKAN_SDK_SHA256: 81F474711E9042F4CD22B31B2F7A8870DB2E428B21586FB43DD80150BE97310D
     defaults:
       run:
         shell: bash
@@ -72,6 +96,110 @@ jobs:
       - name: Build the app
         working-directory: apps/desktop-gpui
         run: cargo build --locked --release -p starling-gpui
+      - name: Download the Vulkan engine artifact
+        # Depends on the starling-serve-<platform>-vulkan artifact uploaded
+        # by the servers job of this same run (the experimental release
+        # calls release-starling-serve.yml before this workflow); if that
+        # job was skipped or failed, download-artifact stops here with a
+        # generic "not found" error instead of packaging without engines.
+        if: inputs.bundle-engines
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: starling-serve-${{ matrix.platform }}-vulkan
+          path: engines-artifacts
+      - name: Download the CPU engine artifact
+        # Same dependency as the Vulkan artifact above: the servers job of
+        # this run must have uploaded it.
+        if: inputs.bundle-engines
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: starling-serve-${{ matrix.platform }}-cpu
+          path: engines-artifacts
+      - name: Restore Vulkan SDK installer cache (Windows)
+        if: inputs.bundle-engines && matrix.platform == 'windows'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}\VulkanSDK-Installer.exe
+          key: vulkan-sdk-installer-windows-${{ env.VULKAN_SDK_VERSION }}-${{ env.VULKAN_SDK_SHA256 }}
+      - name: Install the Vulkan loader (Windows)
+        # The Windows Vulkan engine links vulkan-1.dll, which the hosted
+        # runner lacks; the assembly step runs its --version. Installed the
+        # same way as release-starling-serve.yml's windows-vulkan job (the
+        # humbletim action cannot unpack SDK installers >= 1.4.313.0).
+        if: inputs.bundle-engines && matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          $installer = "$env:RUNNER_TEMP\VulkanSDK-Installer.exe"
+          if (-not (Test-Path "$installer")) {
+            curl.exe --fail --retry 3 --retry-all-errors --retry-delay 10 -o "$installer" -L `
+              "https://sdk.lunarg.com/sdk/download/${env:VULKAN_SDK_VERSION}/windows/vulkansdk-windows-X64-${env:VULKAN_SDK_VERSION}.exe"
+            if ($LASTEXITCODE -ne 0) {
+              Remove-Item "$installer" -ErrorAction SilentlyContinue
+              throw "Vulkan SDK download failed (exit $LASTEXITCODE)"
+            }
+          }
+          $actual = (Get-FileHash "$installer" -Algorithm SHA256).Hash
+          if ($actual -ine $env:VULKAN_SDK_SHA256) { throw "Vulkan SDK checksum mismatch: $actual" }
+          & "$installer" --accept-licenses --default-answer --confirm-command install
+          if ($LASTEXITCODE -ne 0) { throw "Vulkan SDK install failed (exit $LASTEXITCODE)" }
+          $sdk = "C:\VulkanSDK\${env:VULKAN_SDK_VERSION}"
+          Add-Content $env:GITHUB_PATH "$sdk\bin"
+          # The engine needs the loader itself, not the headers: fail here,
+          # not in the assembly step, if the install did not provide it.
+          $loaders = @("$env:SystemRoot\System32\vulkan-1.dll", "$sdk\Bin\vulkan-1.dll") |
+            Where-Object { Test-Path $_ }
+          if (-not $loaders) { throw "Vulkan SDK install provided no vulkan-1.dll" }
+          $loaders
+      - name: Check the bundled-engine contract
+        # The same check release-starling-serve.yml's runtime-contract job
+        # runs at the start of a release: this workflow also mutates the
+        # bundled-engine list, so it verifies the agreement itself. Stdlib
+        # Python only; it needs nothing but the checkout.
+        if: inputs.bundle-engines
+        run: |
+          python=python3
+          command -v python3 >/dev/null 2>&1 || python=python
+          "$python" scripts/release-runtime/check-contract.py
+      - name: Assemble the bundled engines
+        if: inputs.bundle-engines
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          # Extracts each server artifact, verifies its checksum, runs
+          # --version/--abi-version on every engine (requiring agreement),
+          # and writes engines.json + SHA256SUMS.txt + RUNTIME.md.
+          python=python3
+          command -v python3 >/dev/null 2>&1 || python=python
+          "$python" scripts/experimental-release/bundle-engines.py \
+            --platform "$PLATFORM" --artifacts engines-artifacts \
+            --out dist/engines --backends "$BUNDLED_ENGINES"
+      - name: Check bundled engine dependencies (Linux)
+        if: inputs.bundle-engines && matrix.platform == 'linux'
+        run: |
+          # The Vulkan engine dynamically links libvulkan.so.1: the
+          # "Install Linux libraries" step above installs libvulkan1, and
+          # the install here restates the dependency so the check stays
+          # correct even if that build-oriented list ever changes.
+          sudo apt-get install -y libvulkan1
+          # With the loader present, both engines must resolve every loader
+          # dependency on the runner.
+          for backend in $BUNDLED_ENGINES; do
+            report="$RUNNER_TEMP/ldd-starling-serve-$backend.txt"
+            ldd "dist/engines/starling-serve-$backend" | tee "$report"
+            if grep -q 'not found' "$report"; then
+              echo "::error::starling-serve-$backend has unresolved shared libraries"
+              exit 1
+            fi
+          done
+      - name: Upload dependency reports
+        # The ldd reports above, for debugging an unresolved-library
+        # failure (they live in RUNNER_TEMP, outside the uploaded archive).
+        if: failure() && inputs.bundle-engines && matrix.platform == 'linux'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: ldd-reports-${{ matrix.platform }}
+          path: ${{ runner.temp }}/ldd-*.txt
+          retention-days: 7
       - name: Package Linux app
         if: matrix.platform == 'linux'
         run: |
@@ -86,7 +214,9 @@ jobs:
           cp apps/desktop-gpui/target/release/starling-gpui dist/
           cp docs/experimental-releases.md dist/README.md
           git rev-parse HEAD > dist/COMMIT.txt
-          tar -C dist -czf starling-gpui-linux-x64.tar.gz starling-gpui README.md COMMIT.txt
+          contents=(starling-gpui README.md COMMIT.txt)
+          if [ "$BUNDLE_ENGINES" = "true" ]; then contents+=(engines); fi
+          tar -C dist -czf starling-gpui-linux-x64.tar.gz "${contents[@]}"
       - name: Package Windows app
         if: matrix.platform == 'windows'
         shell: pwsh

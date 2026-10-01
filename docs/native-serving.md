@@ -87,7 +87,8 @@ flag runs a warmup at startup; omit the square brackets when using it.
 | `--model <slug>` | (required) | Model slug: parakeet, moss, ark, ark06, higgs, hojo, granite, qwen3, s1, audex, voxtral |
 | `--gguf <path>` | (required) | Path to the GGUF model file |
 | `--host <addr>` | `127.0.0.1` | Bind address |
-| `--port <n>` | `8181` | Bind port |
+| `--port <n>` | `8181` | Bind port (`0` = any free port; see [port announcement](#port-announcement-and-parent-watchdog)) |
+| `--parent-pid <pid>` | (none) | Exit cleanly when that process exits (supervised sidecar) |
 | `--warmup` | off | Capture CUDA graphs on startup |
 | `--no-eager-load` | off | Defer model load to first request |
 | `--idle-timeout <s>` | `0` (never) | Shut down after N seconds idle |
@@ -115,6 +116,27 @@ emitted only after every upload chunk succeeds. A queued cancellation or
 timeout discards the job's partial text. The server retains the model and the
 caller's PCM until that synchronous request finishes. The default and every
 other model keep whole-request serial turns.
+
+### Port announcement and parent watchdog
+
+Supervisors (the desktop app, issue #362) launch `starling-serve` as a sidecar
+and need two process-level guarantees:
+
+- **Port announcement**: in all cases (fixed port or `--port 0` for any free
+  port), once the socket is bound the server prints exactly one line to
+  **stdout** — `STARLING_SERVE_LISTENING <host>:<port>` — flushes it, and only
+  then serves requests, so a line on stdout always means the socket is already
+  accepting connections. `--port` values outside 0..65535 are rejected with
+  exit code 1.
+- **Parent watchdog**: `--parent-pid <pid>` starts a watchdog thread that
+  exits the process with `_Exit(0)` (after logging
+  `[starling-serve] parent process <pid> exited; shutting down` to stderr)
+  when that process disappears, so a crashed supervisor cannot leave an
+  orphaned server holding a model in memory. POSIX watches a direct parent
+  through `getppid()` (immune to PID reuse) and any other pid via
+  `kill(pid,0)` polling every 500 ms; Windows waits on an `OpenProcess`
+  handle.
+
 
 ## Standard API compatibility
 
@@ -146,10 +168,16 @@ for these differences:
 ### `GET /health`
 
 ```json
-{"status":"ok","model":"parakeet","loaded":true,"busy":false,"phase":"ready","queue_depth":0}
+{"status":"ok","model":"parakeet","loaded":true,"busy":false,"phase":"ready","queue_depth":0,"backend":"CUDA0","warm":true,"load_error":null}
 ```
 
-Phase drives the UI: `unloaded → loading → ready → busy`.
+Phase drives the UI: `unloaded → loading → ready → busy`. Three additive
+supervision fields (issue #362): `backend` (the runtime ggml device name once
+a model is loaded; the compile-time backend family before that), `warm`
+(whether a warmup has finished), and `load_error` (`null`, or the last load
+failure message — a supervisor can show it and retry with `POST /warmup`).
+`/health` never blocks during a load: the status fields are guarded by their
+own mutex.
 
 ### `POST /v1/audio/transcriptions`
 
@@ -174,7 +202,12 @@ model not loaded, `504` queue timeout, `500` other engine failures.
 ### `POST /warmup`
 
 Idempotent warmup (CUDA graph capture): a silent clip for audio models, a
-probe transcript for text models (s1). Returns `202`.
+probe transcript for text models (s1). A model deferred by `--no-eager-load`
+is loaded first (a no-op when resident), so a supervisor can start the process
+fast and then load and warm it with one request; a failed load surfaces as
+`/health`'s `load_error` and a later `/warmup` retries it. Still asynchronous:
+returns `202` `{"status":"warmup started","phase":...}` — poll `/health`
+(`loaded` + `warm`) for completion.
 
 ### `POST /normalize` (s1 only)
 

@@ -740,11 +740,16 @@ pub(crate) fn v2_summary(
 
     // The latest completed final is the current transcript (earlier ones
     // stay in the attempt rows as history).
-    let transcript = attempts
+    let current = attempts
         .iter()
         .rev()
-        .find(|attempt| attempt.is_final_transcript())
-        .map(attempt_transcript);
+        .find(|attempt| attempt.is_final_transcript());
+    let transcript = current.map(attempt_transcript);
+    // #363: the label names the attempt that produced that transcript —
+    // not the latest attempt. A later retry that failed (or is in
+    // flight) on another backend must not rewrite the label of the
+    // transcript the take still shows.
+    let model_label = current.map(|attempt| attempt.backend.clone());
 
     let mut last_error = attempts
         .last()
@@ -790,6 +795,7 @@ pub(crate) fn v2_summary(
         attempt_count: attempts.len() as u32,
         transcript,
         last_error,
+        model_label,
         // The capture id *is* the journal linkage in v2; there is no
         // separate v1 journal to point at.
         journal_id: None,
@@ -941,7 +947,7 @@ mod tests {
         let summary = v2_summary(
             &record(CaptureStatus::Complete, None),
             &[],
-            &[plain_attempt("completed", Some("hello v2"), Some(&extra))],
+            &[plain_attempt("completed", Some("hello v2"), Some(extra))],
         );
         assert_eq!(summary.status, SessionStatus::Transcribed);
         assert_eq!(summary.transcript.as_ref().unwrap().text, "hello v2");
@@ -952,7 +958,7 @@ mod tests {
         let summary = v2_summary(
             &record(CaptureStatus::Complete, None),
             &[],
-            &[plain_attempt("completed", Some("hello v2"), Some(&extra)), failed],
+            &[plain_attempt("completed", Some("hello v2"), Some(extra)), failed],
         );
         assert_eq!(summary.status, SessionStatus::Failed);
         assert_eq!(summary.transcript.as_ref().unwrap().text, "hello v2");
@@ -1022,6 +1028,54 @@ mod tests {
         assert!(summary.last_error.as_deref().unwrap().contains("missing"));
     }
 
+    #[test]
+    fn the_label_names_the_attempt_that_produced_the_transcript() {
+        // #363: provenance is per take. A transcript produced by the
+        // built-in engine keeps its `engine:` label even when a later
+        // retry — here on the manual server — fails over it: the label
+        // describes the transcript the take shows, not the last try.
+        let extra = r#"{"text":"hello v2","segments":[]}"#;
+        let mut on_engine = plain_attempt("completed", Some("hello v2"), Some(extra));
+        on_engine.backend = "engine:parakeet-v3-q4km-s16".to_string();
+        let mut failed_retry = plain_attempt("failed", None, Some(r#"{"error":"offline"}"#));
+        failed_retry.backend = "openai:whisper-large-v3".to_string();
+        let summary = v2_summary(
+            &record(CaptureStatus::Complete, None),
+            &[],
+            &[on_engine, failed_retry.clone()],
+        );
+        assert_eq!(summary.model_label.as_deref(), Some("engine:parakeet-v3-q4km-s16"));
+
+        // No transcript yet: no label, never the failed attempt's backend.
+        let summary = v2_summary(
+            &record(CaptureStatus::Complete, None),
+            &[],
+            &[failed_retry],
+        );
+        assert_eq!(summary.model_label, None);
+    }
+
+    #[test]
+    fn each_take_shows_its_own_transcription_label() {
+        // Two takes, two backends: the labels never bleed across takes
+        // (the summary query is per capture).
+        let extra = r#"{"text":"hi","segments":[]}"#;
+        let mut on_engine = plain_attempt("completed", Some("hi"), Some(extra));
+        on_engine.backend = "engine:parakeet-v3-q8".to_string();
+        let first = v2_summary(&record(CaptureStatus::Complete, None), &[], &[on_engine]);
+        let mut on_server = plain_attempt("completed", Some("hi"), Some(extra));
+        on_server.backend = "openai:whisper-large-v3".to_string();
+        let second = v2_summary(&record(CaptureStatus::Complete, None), &[], &[on_server]);
+        assert_eq!(
+            first.model_label.as_deref(),
+            Some("engine:parakeet-v3-q8")
+        );
+        assert_eq!(
+            second.model_label.as_deref(),
+            Some("openai:whisper-large-v3")
+        );
+    }
+
     // ---- the facade over a real v2 store (daily path) ------------------
 
     fn transcribed(store: &Store, text: &str) -> String {
@@ -1029,6 +1083,39 @@ mod tests {
         store.mark_attempt(&id, "starling:parakeet").expect("begin");
         store.save_transcript(&id, transcript(text)).expect("transcript");
         id
+    }
+
+    /// `transcribed` with an explicit backend label (#363): the label the
+    /// summary must hand back unchanged.
+    fn transcribed_on(store: &Store, text: &str, backend: &str) -> String {
+        let id = store.save_capture(tiny_wav(160), None).expect("save").id;
+        store.mark_attempt(&id, backend).expect("begin");
+        store.save_transcript(&id, transcript(text)).expect("transcript");
+        id
+    }
+
+    #[test]
+    fn summaries_carry_the_backend_that_produced_each_transcript() {
+        // End to end over the real store: one take on the built-in
+        // engine, one on a manual server — and a failed retry on the
+        // first take with a third backend, which must not rewrite the
+        // label of the transcript that take still shows.
+        let store = v2_store("labels");
+        let on_engine = transcribed_on(&store, "engine take", "engine:parakeet-v3-q4km-s16");
+        let on_server = transcribed_on(&store, "server take", "openai:whisper-large-v3");
+        store.mark_attempt(&on_engine, "engine:moss-2b-q4e8").expect("retry");
+        store
+            .save_failure(&on_engine, "The built-in engine stopped while transcribing.")
+            .expect("fail");
+
+        assert_eq!(
+            summary_of(&store, &on_engine).model_label.as_deref(),
+            Some("engine:parakeet-v3-q4km-s16")
+        );
+        assert_eq!(
+            summary_of(&store, &on_server).model_label.as_deref(),
+            Some("openai:whisper-large-v3")
+        );
     }
 
     fn proposal(request_id: &str, base: u64, text: &str) -> ProposalRow {
@@ -1513,7 +1600,7 @@ mod tests {
         listed
             .iter()
             .find_map(|record| match record {
-                ListedRecord::Session(summary) if &summary.id == id => Some(summary.clone()),
+                ListedRecord::Session(summary) if summary.id == id => Some(summary.clone()),
                 _ => None,
             })
             .unwrap_or_else(|| panic!("record {id} missing from listing"))
@@ -1524,7 +1611,7 @@ mod tests {
         listed
             .iter()
             .find_map(|record| match record {
-                ListedRecord::Session(summary) if &summary.id == id => {
+                ListedRecord::Session(summary) if summary.id == id => {
                     summary.transcript.as_ref().map(|t| t.text.clone())
                 }
                 _ => None,

@@ -14,6 +14,37 @@ use crate::processing::ProcessingState;
 use crate::theme;
 use crate::views::{icon, spinner};
 
+/// The built-in catalog, computed once and shared for the entity's
+/// lifetime (#366): `default_catalog()` builds fresh `String`s for every
+/// entry, and the drawer renders one label per row per frame.
+fn catalog_entries() -> &'static [starling_dictation::engine::CatalogEntry] {
+    static CATALOG: std::sync::OnceLock<Vec<starling_dictation::engine::CatalogEntry>> =
+        std::sync::OnceLock::new();
+    CATALOG.get_or_init(starling_dictation::engine::default_catalog)
+}
+
+/// How the drawer words a take's transcription provenance (#363):
+/// `engine:<id>` maps to the catalog label (falling back to the raw id
+/// when this build's catalog no longer knows it), `openai:<m>` names the
+/// model and that it came from a server, and any older label shape shows
+/// verbatim rather than being guessed at. Parsing and rendering go
+/// through `BackendLabel`, the typed form of the persisted shape.
+pub(crate) fn provenance_label(label: &str) -> String {
+    match starling_dictation::storage::BackendLabel::parse(label) {
+        Some(starling_dictation::storage::BackendLabel::Engine { model_id }) => {
+            catalog_entries()
+                .iter()
+                .find(|entry| entry.id == model_id)
+                .map(|entry| entry.label.clone())
+                .unwrap_or(model_id)
+        }
+        Some(starling_dictation::storage::BackendLabel::OpenAi { model }) => {
+            format!("{model} (server)")
+        }
+        None => label.to_string(),
+    }
+}
+
 pub fn render_drawer(
     app: &mut StarlingApp,
     window: &mut Window,
@@ -277,7 +308,22 @@ pub fn render_drawer(
                                 .text_size(px(10.))
                                 .text_color(theme::PAPER_SUBTLE)
                                 .child("No cleanup or silent rewriting"),
-                        ),
+                        )
+                        // #363: which engine produced this transcript —
+                        // per take, so a take transcribed by the built-in
+                        // engine keeps its label even after a later take
+                        // used the manual server.
+                        .when_some(session.model_label.clone(), |column, label| {
+                            column.child(
+                                div()
+                                    .text_size(px(10.))
+                                    .text_color(theme::PAPER_SUBTLE)
+                                    .child(format!(
+                                        "Transcribed with {}",
+                                        provenance_label(&label)
+                                    )),
+                            )
+                        }),
                 )
                 .child(actions),
         )
@@ -519,4 +565,36 @@ fn action_button(
                 on_click(event, window, cx);
             }
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn engine_labels_map_to_the_catalog_and_fall_back_to_the_id() {
+        // #363: the catalog label is what the user chose in Settings, so
+        // that is what history shows; an id this build no longer ships
+        // still names itself.
+        assert_eq!(
+            provenance_label("engine:parakeet-v3-q4km-s16"),
+            "Parakeet TDT 0.6B v3 (q4_k_m)"
+        );
+        assert_eq!(provenance_label("engine:some-future-model"), "some-future-model");
+    }
+
+    #[test]
+    fn openai_labels_name_the_model_and_the_server() {
+        assert_eq!(
+            provenance_label("openai:whisper-large-v3"),
+            "whisper-large-v3 (server)"
+        );
+    }
+
+    #[test]
+    fn other_labels_show_verbatim() {
+        // Older attempt shapes (e.g. `starling:parakeet`) are history's
+        // truth; guessing at them would be worse than showing them.
+        assert_eq!(provenance_label("starling:parakeet"), "starling:parakeet");
+    }
 }

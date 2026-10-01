@@ -22,11 +22,31 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
+
+#ifdef _WIN32
+// windows.h for the parent watchdog (OpenProcess / WaitForSingleObject /
+// GetLastError). WIN32_LEAN_AND_MEAN and NOMINMAX are defined before it so
+// the header cannot drag in winsock v1 (httplib's winsock2.h below is the
+// right one) or define min/max macros that break <algorithm>; httplib.h
+// guards NOMINMAX the same way, but only when it is included first.
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <cerrno>
+#include <signal.h>
+#include <unistd.h>
+#endif
 
 // cpp-httplib
 #include "httplib.h"
@@ -58,7 +78,11 @@ static void usage(const char* prog) {
         "\n"
         "Serving:\n"
         "  --host <addr>      Bind address (default 127.0.0.1)\n"
-        "  --port <n>         Bind port (default 8181)\n"
+        "  --port <n>         Bind port (default 8181; 0 = any free port)\n"
+        "                     The bound address is printed to stdout as\n"
+        "                     'STARLING_SERVE_LISTENING <host>:<port>' once\n"
+        "                     the socket is bound, before requests are served\n"
+        "  --parent-pid <pid> Exit when process <pid> exits (supervised sidecar)\n"
         "  --warmup           Warm up the model on startup\n"
         "  --no-eager-load    Defer model load to first request\n"
         "  --idle-timeout <s> Shut down after N seconds idle (0 = never, default 0)\n"
@@ -86,11 +110,34 @@ static void usage(const char* prog) {
 }
 
 // ---- simple arg parser ----------------------------------------------------
+// Strict long-long parse for --parent-pid (the same rule as
+// parse_int_strict, issue #146, widened): pids do not fit int on every
+// platform, and a truncating int parse would silently watch the wrong
+// process. Empty, partial ("3abc"), non-numeric, out-of-range, and
+// whitespace-padded text (" 42", "42 ") all fail: std::stoll skips
+// leading whitespace, so the padding is rejected explicitly here.
+static std::optional<long long> parse_llong_strict(const std::string& text) {
+    if (text.empty()
+        || std::isspace(static_cast<unsigned char>(text.front()))
+        || std::isspace(static_cast<unsigned char>(text.back()))) {
+        return std::nullopt;
+    }
+    try {
+        std::size_t pos = 0;
+        const long long value = std::stoll(text, &pos);
+        if (pos != text.size()) return std::nullopt;
+        return value;
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
 struct Args {
     std::string model;
     std::string gguf;
     std::string host = "127.0.0.1";
     int port = 8181;
+    long long parent_pid = 0;
     bool warmup = false;
     bool eager_load = true;
     bool granite_chunk_fairness = false;
@@ -145,10 +192,25 @@ static Args parse_args(int argc, char** argv) {
             }
             return *parsed;
         };
+        auto next_pid = [&](const char* name) -> long long {
+            std::string v = next(name);
+            if (a.error) return 0LL;
+            // Not next_int: the pid is parsed through long long so pids
+            // that fit the platform's pid type but not int still parse
+            // exactly (#366).
+            auto parsed = parse_llong_strict(v);
+            if (!parsed.has_value()) {
+                std::fprintf(stderr, "error: %s requires an integer, got '%s'\n", name, v.c_str());
+                a.error = true;
+                return 0LL;
+            }
+            return *parsed;
+        };
         if (arg == "--model")          a.model = next("--model");
         else if (arg == "--gguf")      a.gguf = next("--gguf");
         else if (arg == "--host")      a.host = next("--host");
         else if (arg == "--port")      a.port = next_int("--port");
+        else if (arg == "--parent-pid") a.parent_pid = next_pid("--parent-pid");
         else if (arg == "--warmup")    a.warmup = true;
         else if (arg == "--no-eager-load") a.eager_load = false;
         else if (arg == "--granite-chunk-fairness") a.granite_chunk_fairness = true;
@@ -400,6 +462,63 @@ static std::atomic<bool> g_should_exit{false};
 static std::atomic<time_t> g_last_activity{0};
 static std::atomic<bool> g_warmup_running{false};
 
+// The highest pid --parent-pid accepts: the platform pid type's max, so a
+// value that would truncate into an unrelated process when cast to
+// pid_t/DWORD is refused instead (the strict parse above already
+// rejected non-numeric and overflowing-for-long-long text).
+#ifdef _WIN32
+constexpr long long kMaxParentPid = 0xffffffffLL;  // DWORD
+#else
+constexpr long long kMaxParentPid = std::numeric_limits<pid_t>::max();
+#endif
+
+// ---- parent watchdog (--parent-pid) ---------------------------------------
+// A supervisor (the desktop app, #362) owns this process. If the supervisor
+// dies without stopping it -- a crash, SIGKILL, a debugger stop -- the server
+// must not live on as an orphan holding a model in memory. _Exit, not exit:
+// the HTTP threads are still running and must not race static destructors.
+static void parent_watch_thread(long long pid) {
+#ifdef _WIN32
+    HANDLE parent = OpenProcess(SYNCHRONIZE, FALSE, static_cast<DWORD>(pid));
+    if (parent == NULL) {
+        const DWORD error = GetLastError();
+        if (error == ERROR_INVALID_PARAMETER) {
+            // The pid is already gone: the parent exited before a handle
+            // could be opened. Fall through and exit exactly as if we had
+            // watched it leave.
+        } else {
+            // e.g. ERROR_ACCESS_DENIED: we cannot watch this parent, but
+            // it has NOT exited — claiming it had would kill a healthy
+            // server. Disable the watchdog and say so.
+            std::fprintf(stderr,
+                "[starling-serve] cannot watch parent pid %lld (error %lu); "
+                "watchdog disabled\n",
+                pid, static_cast<unsigned long>(error));
+            std::fflush(stderr);
+            return;
+        }
+    } else {
+        WaitForSingleObject(parent, INFINITE);
+        CloseHandle(parent);
+    }
+#else
+    // A direct parent is watched through getppid(): reparenting on its death
+    // is immune to PID reuse. Any other pid is polled for existence.
+    const bool direct = getppid() == static_cast<pid_t>(pid);
+    while (true) {
+        if (direct ? getppid() != static_cast<pid_t>(pid)
+                   : (kill(static_cast<pid_t>(pid), 0) == -1 && errno == ESRCH)) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    }
+#endif
+    std::fprintf(stderr,
+        "[starling-serve] parent process %lld exited; shutting down\n", pid);
+    std::fflush(stderr);
+    std::_Exit(0);
+}
+
 static void idle_timeout_thread(serve::StarlingServer* server, double timeout_s) {
     if (timeout_s <= 0.0) return;
     while (!g_should_exit.load()) {
@@ -448,6 +567,16 @@ int main(int argc, char** argv) {
             args.min_chunk, args.partial_interval);
         !err.empty()) {
         std::fprintf(stderr, "error: %s\n", err.c_str());
+        return 1;
+    }
+    if (args.port < 0 || args.port > 65535) {
+        std::fprintf(stderr, "error: --port must be in 0..65535 (0 = any free port)\n");
+        return 1;
+    }
+    if (args.parent_pid < 0
+        || args.parent_pid > kMaxParentPid) {
+        std::fprintf(stderr,
+            "error: --parent-pid must be 0 (disabled) or a positive process id\n");
         return 1;
     }
     if (args.max_stream_seconds < 0.0) {
@@ -520,6 +649,10 @@ int main(int argc, char** argv) {
         }
     }
 
+    if (args.parent_pid > 0) {
+        std::thread(parent_watch_thread, args.parent_pid).detach();
+    }
+
     // Start idle-timeout monitor (only if timeout > 0).
     std::thread idle_thread;
     if (args.idle_timeout > 0.0) {
@@ -548,14 +681,42 @@ int main(int argc, char** argv) {
             g_last_activity.store(std::time(nullptr));
             // Fire warmup asynchronously (it's idempotent — deduped
             // internally). One worker at a time: a client spamming /warmup
-            // must not spawn unbounded threads.
+            // must not spawn unbounded threads. A model deferred by
+            // --no-eager-load is loaded first (a no-op when resident), so a
+            // supervisor can start the process fast and then load + warm it
+            // with one request; a failed load is reported as /health
+            // load_error and a later /warmup retries it.
             if (!g_warmup_running.exchange(true)) {
                 // Capture the shared_ptr by value: the detached worker must
                 // keep the server alive for the whole warmup() call even if
                 // main() returns and resets its own reference.
                 std::thread([server]() {
-                    server->warmup();
-                    g_warmup_running.store(false);
+                    // Scope guard: whatever load()/warmup() throw, the flag
+                    // clears when the worker leaves — a stuck-true flag would
+                    // answer every later /warmup with a silent no-op worker.
+                    struct WarmupFlagGuard {
+                        ~WarmupFlagGuard() { g_warmup_running.store(false); }
+                    } flag_guard;
+                    try {
+                        server->load();
+                        if (!server->loaded()) {
+                            // The deferred load failed: /health reports it as
+                            // load_error, and this line makes the failure
+                            // observable in the server log too (#366).
+                            std::fprintf(stderr,
+                                "[starling-serve] warmup load failed: %s\n",
+                                server->load_error().c_str());
+                        }
+                        server->warmup();
+                    } catch (const std::exception& error) {
+                        std::fprintf(stderr,
+                            "[starling-serve] warmup worker failed: %s\n",
+                            error.what());
+                    } catch (...) {
+                        std::fprintf(stderr,
+                            "[starling-serve] warmup worker failed: unknown "
+                            "exception\n");
+                    }
                 }).detach();
             }
             std::ostringstream ss;
@@ -1064,9 +1225,41 @@ int main(int argc, char** argv) {
             cfg.host.c_str());
     }
 
-    if (!svr.listen(cfg.host.c_str(), cfg.port)) {
-        std::fprintf(stderr, "[starling-serve] failed to bind %s:%d\n",
-                     cfg.host.c_str(), cfg.port);
+    // Bind first, then announce, then serve: a supervisor that asked for
+    // --port 0 learns the real port from stdout, and a line on stdout always
+    // means the socket is already accepting connections. This does NOT wait
+    // for a later listen() call: cpp-httplib's bind_to_port and
+    // bind_to_any_port already call ::listen themselves (through
+    // create_server_socket, third_party/httplib.h ~l.12914), so connections
+    // queue in the kernel backlog from the bind on — before this line is
+    // printed and before listen_after_bind() runs.
+    int bound_port = cfg.port;
+    if (cfg.port == 0) {
+        bound_port = svr.bind_to_any_port(cfg.host);
+    } else if (!svr.bind_to_port(cfg.host, cfg.port)) {
+        bound_port = -1;
+    }
+    if (bound_port <= 0) {
+        if (cfg.port == 0) {
+            std::fprintf(stderr,
+                "[starling-serve] failed to bind %s to an ephemeral port\n",
+                cfg.host.c_str());
+        } else {
+            std::fprintf(stderr, "[starling-serve] failed to bind %s:%d\n",
+                         cfg.host.c_str(), cfg.port);
+        }
+        return 1;
+    }
+    // Bracket IPv6 hosts in the announce line ([::1]:8181) so the
+    // host:port split stays unambiguous for any parser.
+    const bool ipv6_host = cfg.host.find(':') != std::string::npos;
+    std::printf("STARLING_SERVE_LISTENING %s%s%s:%d\n",
+                ipv6_host ? "[" : "", cfg.host.c_str(),
+                ipv6_host ? "]" : "", bound_port);
+    std::fflush(stdout);
+    if (!svr.listen_after_bind()) {
+        std::fprintf(stderr, "[starling-serve] failed to serve %s:%d\n",
+                     cfg.host.c_str(), bound_port);
         return 1;
     }
 

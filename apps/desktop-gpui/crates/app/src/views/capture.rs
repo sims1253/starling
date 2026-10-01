@@ -7,10 +7,60 @@ use gpui::{
     Animation, AnimationExt, Context, Div, ElementId, FontWeight, Stateful, Window, div,
     ease_in_out, point, prelude::*, px, rgba,
 };
+use starling_dictation::engine::{EnginePhase, InstallState, SwitchStage};
+use starling_dictation::settings::EngineMode;
 
 use crate::app::StarlingApp;
 use crate::theme;
-use crate::views::icon;
+use crate::views::{icon, spinner};
+
+/// Whether the first-run model card shows (#363): builtin mode, no model
+/// serving yet, and the engine itself usable — the states where picking
+/// a model is THE next step. A failed engine (or a manual server) never
+/// offers a download as the way forward; recording stays possible in
+/// every one of these states either way. Pure so the policy is testable.
+pub(crate) fn first_run_card_visible(phase: &EnginePhase, has_active: bool) -> bool {
+    !has_active
+        && matches!(
+            phase,
+            EnginePhase::NoModel | EnginePhase::Starting | EnginePhase::Loading | EnginePhase::Warming
+        )
+}
+
+/// The first-run card's progress line (#363, #366): `None` (the button row
+/// offers the download) while nothing is in flight; a stage line while the
+/// recommended model downloads or verifies — including a hand-placed file
+/// being verified by an activation switch — and while the engine brings it
+/// up. Pure so the policy is testable.
+pub(crate) fn first_run_progress(
+    phase: &EnginePhase,
+    install: &InstallState,
+    switch: Option<&SwitchStage>,
+) -> Option<String> {
+    match install {
+        InstallState::Downloading { done, total } => Some(format!(
+            "Downloading {}% — you can record meanwhile; transcription starts once the model \
+             is ready.",
+            crate::views::settings::download_percent(*done, *total),
+        )),
+        // A finished download being verified is still installing: the
+        // button must not re-offer "Download and use" over it.
+        InstallState::Verifying => Some("Verifying the download…".to_string()),
+        // A NeedsVerification file only verifies through an activation
+        // switch; while that switch is verifying, the same rule holds.
+        InstallState::NeedsVerification
+            if matches!(switch, Some(SwitchStage::Verifying)) =>
+        {
+            Some("Verifying the download…".to_string())
+        }
+        _ => match phase {
+            EnginePhase::Starting => Some("Starting the engine…".to_string()),
+            EnginePhase::Loading => Some("Loading the model…".to_string()),
+            EnginePhase::Warming => Some("Warming up…".to_string()),
+            _ => None,
+        },
+    }
+}
 
 const BAR_COUNT: usize = 52;
 const BAR_STRIDE: f32 = 7.0; // 2px bar + 5px gap
@@ -107,6 +157,7 @@ pub fn render_capture(
                 ),
         )
         .child(render_recorder(app, cx, recording, has_transcript))
+        .children(render_engine_card(app, cx))
         .children(staging_panel)
         .when(recording && app.staging.is_none() && !app.live_partial.is_empty(), |pane| {
             pane.child(
@@ -301,6 +352,125 @@ fn render_recorder(
                     )
                 }),
         )
+}
+
+/// The first-run model card (#363): builtin mode with no model serving
+/// offers the recommended catalog entry — its label, size, and one
+/// "Download and use" button — plus "More models" for the full list in
+/// Settings. While the recommended model downloads (or the engine loads
+/// it) the card shows the progress stage instead of the button row going
+/// silent. Recording is never blocked by this card.
+fn render_engine_card(
+    app: &mut StarlingApp,
+    cx: &mut Context<StarlingApp>,
+) -> Option<impl IntoElement> {
+    if app.engine_settings.mode != EngineMode::Builtin {
+        return None;
+    }
+    let snapshot = app.engine_snapshot()?;
+    if !first_run_card_visible(&snapshot.phase, snapshot.active.is_some()) {
+        return None;
+    }
+    let recommended = snapshot.models.iter().find(|model| model.recommended)?;
+    let id = recommended.id.clone();
+
+    // While downloading, verifying, or loading, the card shows the progress
+    // stage instead of the download button.
+    let progress = first_run_progress(
+        &snapshot.phase,
+        &recommended.install,
+        snapshot.switch.as_ref().map(|switch| &switch.stage),
+    );
+    let installing = progress.is_some();
+
+    Some(
+        div()
+            .id("engine-first-run")
+            .w_full()
+            .max_w(px(570.))
+            .flex()
+            .flex_col()
+            .gap(px(8.))
+            .mb(px(18.))
+            .p(px(16.))
+            .bg(theme::PANEL_SOFT)
+            .border_1()
+            .border_color(theme::LINE)
+            .rounded(px(7.))
+            .child(
+                div()
+                    .font(theme::serif_font())
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_size(px(16.))
+                    .text_color(theme::INK)
+                    .child("Choose a speech model to start dictating offline"),
+            )
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .line_height(px(11. * 1.6))
+                    .text_color(theme::MUTED)
+                    .child(format!(
+                        "{} · {} — {}",
+                        recommended.label,
+                        crate::views::settings::fmt_size(recommended.size_bytes),
+                        recommended.note
+                    )),
+            )
+            .children(progress.map(|line| {
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.))
+                    .text_size(px(11.))
+                    .text_color(theme::MUTED)
+                    .child(spinner("engine-first-run-spinner", 13., theme::MUTED))
+                    .child(line)
+            }))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.))
+                    .when(!installing, |row| {
+                        row.child(
+                            div()
+                                .id("engine-first-run-download")
+                                .px(px(13.))
+                                .py(px(8.))
+                                .rounded(px(4.))
+                                .bg(theme::LIME)
+                                .text_size(px(11.))
+                                .text_color(theme::MIC_FG)
+                                .cursor_pointer()
+                                .hover(|style| style.opacity(0.9))
+                                .on_click(cx.listener(move |this, _, _window, cx| {
+                                    this.engine_activate(&id, cx);
+                                }))
+                                .child("Download and use"),
+                        )
+                    })
+                    .child(
+                        div()
+                            .id("engine-first-run-more")
+                            .px(px(13.))
+                            .py(px(8.))
+                            .rounded(px(4.))
+                            .border_1()
+                            .border_color(theme::LINE)
+                            .text_size(px(11.))
+                            .text_color(theme::INK)
+                            .cursor_pointer()
+                            .hover(|style| style.bg(theme::GEAR_HOVER_BG))
+                            .on_click(cx.listener(|this, _, _window, cx| {
+                                this.open_settings(cx);
+                            }))
+                            .child("More models"),
+                    ),
+            ),
+    )
 }
 
 fn render_import_button(cx: &mut Context<StarlingApp>) -> impl IntoElement {
@@ -556,6 +726,129 @@ fn quality_banner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use starling_dictation::engine::EngineFailure;
+    use std::time::Duration;
+
+    #[test]
+    fn the_first_run_card_shows_only_while_no_model_serves() {
+        // #363: the card is the "pick a model" nudge — it shows while a
+        // model is absent or being brought up (including the
+        // download-then-load of "Download and use"), never once one
+        // serves.
+        for phase in [
+            EnginePhase::NoModel,
+            EnginePhase::Starting,
+            EnginePhase::Loading,
+            EnginePhase::Warming,
+        ] {
+            assert!(
+                first_run_card_visible(&phase, false),
+                "no model serving: the card shows ({phase:?})"
+            );
+        }
+        assert!(!first_run_card_visible(&EnginePhase::Ready, true));
+    }
+
+    #[test]
+    fn the_first_run_card_never_shows_for_failures_or_a_serving_engine() {
+        // A failed engine must not advertise a download as the fix, and
+        // once a model serves the card is gone — including the restart
+        // backoff, which keeps the take-protecting engine story in the
+        // topbar instead.
+        assert!(!first_run_card_visible(
+            &EnginePhase::Failed(EngineFailure::NoBundledEngine),
+            false
+        ));
+        assert!(!first_run_card_visible(
+            &EnginePhase::Restarting {
+                attempt: 1,
+                retry_in: Duration::from_secs(2),
+            },
+            true
+        ));
+        assert!(!first_run_card_visible(
+            &EnginePhase::SelectingBackend,
+            false
+        ));
+    }
+
+    #[test]
+    fn a_verifying_model_is_treated_as_installing() {
+        // #366: a finished download being verified must not re-offer
+        // "Download and use" — the card shows the verifying line and no
+        // button, exactly like a download in flight.
+        let line = first_run_progress(
+            &EnginePhase::NoModel,
+            &InstallState::Verifying,
+            None,
+        );
+        assert_eq!(line.as_deref(), Some("Verifying the download…"));
+    }
+
+    #[test]
+    fn a_needs_verification_model_counts_only_while_a_switch_verifies_it() {
+        // A hand-placed file alone offers the button (activation verifies
+        // first); while an activation switch is verifying it, the card
+        // shows the verifying line instead.
+        let idle = first_run_progress(
+            &EnginePhase::NoModel,
+            &InstallState::NeedsVerification,
+            Some(&SwitchStage::Downloading { done: 1, total: 2 }),
+        );
+        assert_eq!(idle, None);
+        let verifying = first_run_progress(
+            &EnginePhase::NoModel,
+            &InstallState::NeedsVerification,
+            Some(&SwitchStage::Verifying),
+        );
+        assert_eq!(verifying.as_deref(), Some("Verifying the download…"));
+        // No switch at all: the plain download offer stands.
+        assert_eq!(
+            first_run_progress(
+                &EnginePhase::NoModel,
+                &InstallState::NeedsVerification,
+                None,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn an_install_failure_returns_to_the_download_offer() {
+        // A failed download is not installing: the button comes back so
+        // the user can retry.
+        assert_eq!(
+            first_run_progress(
+                &EnginePhase::NoModel,
+                &InstallState::Failed("disk full".to_string()),
+                None,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn the_engine_start_phases_show_their_lines_and_ready_shows_none() {
+        assert_eq!(
+            first_run_progress(&EnginePhase::Starting, &InstallState::NotInstalled, None)
+                .as_deref(),
+            Some("Starting the engine…")
+        );
+        assert_eq!(
+            first_run_progress(&EnginePhase::Loading, &InstallState::NotInstalled, None)
+                .as_deref(),
+            Some("Loading the model…")
+        );
+        assert_eq!(
+            first_run_progress(&EnginePhase::Warming, &InstallState::NotInstalled, None)
+                .as_deref(),
+            Some("Warming up…")
+        );
+        assert_eq!(
+            first_run_progress(&EnginePhase::NoModel, &InstallState::Installed, None),
+            None
+        );
+    }
 
     #[test]
     fn an_error_only_banner_shows_no_footer_and_is_dismissible() {
