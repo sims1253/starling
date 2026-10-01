@@ -520,3 +520,16 @@ bf16-exact GGUF the config passes every gate on BOTH domains; the
 domain-conditional caveat is specific to the aggressively quantized
 dynq4 file. Side observation: the bf16 encoder is faster than dynq4's on
 this CPU (bf16 row-dots beat Q4_K block-dots for these shapes).
+
+bf16 workload generalization (run 19): the run-18 bf16-exact result
+generalizes — long fixture (74 s, 10 chunks): enc +1.56% (medium was
++1.61%; dynq4 long was +1.65%), transcripts identical on short/medium/
+long under bf16+factors (the long fixture gap from run 18 closed).
+Follow-up filed for a future issue (NOT this loop's scope): on this CPU
+the bf16-exact encoder is ~6% FASTER than the Q4_K one (bf16 row-dots
+beat Q4_K block-dots for these shapes) — an engine-level load-time
+repack of quantized GEMM rows to f32/bf16 could recover that for quantized
+model files generally; transcript-contract risk is the dot-method change
+(same class as the full-rank control effect), so it needs its own gated
+campaign. Also re-filed: a starling-bench flag to exercise the (currently
+unconsumed) granite CTC speculative path under factors.
