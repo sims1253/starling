@@ -415,3 +415,20 @@ wall at ~7x RTF on CPU-Vulkan, transcripts byte-identical to the phone's
 PowerVR output). Cross-driver, cross-precision identical output strongly
 suggests the recording change carries no driver-dependent hazard; the
 formal RADV performance gate still needs a real AMD run before merge.
+
+### P2-6 (2026-10-01, same loop): encoder/prefill gate numbers for the branch
+
+The issue's "no regression beyond noise in the encoder/prefill GEMMs" gate
+had been satisfied only by construction for P2-2 (record_decode is the only
+touched function). Explicit paired numbers, one window, medians of 3
+in-process runs, KSTEP=32 both sides:
+
+| phase | base | cand | delta |
+| --- | --- | --- | --- |
+| MOSS short enc+prefill | 3080.9 ms | 3062.9 ms | −0.6 % (noise) |
+| Parakeet medium wall (enc ≈ 90 %) | 2342.1 ms | 2267.1 ms | −3.2 % (cand ran first, i.e. against the documented +3–8 % warm-order bias) |
+
+No regression on either model; Parakeet sits in the historical 2.2–2.4 s
+tuned band. With this, every #317 acceptance gate runnable on this host
+carries explicit branch-state numbers; the remaining two (real-AMD RADV
+perf, refreshed coulomb energy) are environment-blocked as documented.
