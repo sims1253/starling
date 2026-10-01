@@ -428,10 +428,15 @@ std::string Context::wedged_why() const {
     return wedged_why_;
 }
 
-bool Context::wait_fence(VkFence fence, const char* what, std::string& err) {
+bool Context::wait_fence(VkFence fence, const char* what, std::string& err,
+                         uint64_t budget_ms) {
     // Bounded wait: a lost or hung device must surface as an error, not a
     // hang. Callers hold queue_mu_.
-    const VkResult r = fn_.vkWaitForFences(dev_, 1, &fence, VK_TRUE, 120ull * 1000 * 1000 * 1000);
+    // Bounded wait: a lost or hung device must surface as an error, not a
+    // hang. Callers hold queue_mu_. `budget_ms` comes from the caller (120 s
+    // default); the decode loop passes the #325 degradation-watchdog budget
+    // (~6x the running round median, floor 20 s).
+    const VkResult r = fn_.vkWaitForFences(dev_, 1, &fence, VK_TRUE, budget_ms * 1000 * 1000);
     if (r == VK_SUCCESS) {
         fn_.vkResetFences(dev_, 1, &fence);
         return true;
@@ -447,7 +452,8 @@ bool Context::wait_fence(VkFence fence, const char* what, std::string& err) {
                " clears it — do not keep retrying)"
              : r == VK_ERROR_DEVICE_LOST
              ? " (device lost: the GPU driver has failed; a device restart is required)"
-             : " (GPU work did not finish in 120 s; the driver may be wedged)";
+             : std::string(" (GPU work did not finish within ") + std::to_string(budget_ms) +
+               " ms; the driver may be wedged)";
         // #325: record the wedge so this process fails fast from now on and
         // the next one (within 15 min) refuses to join the retry storm.
         mark_wedged(err);
@@ -901,7 +907,7 @@ void Recording::fill(const Buffer& dst, VkDeviceSize off, VkDeviceSize bytes, ui
     ctx_.fn_.vkCmdFillBuffer(cb_, dst.buf, off, bytes, value);
 }
 
-bool Recording::submit_and_wait(std::string& err) {
+bool Recording::submit_and_wait(std::string& err, uint64_t stall_budget_ms) {
     const Fns& f = ctx_.fn_;
     if (!fail_.empty()) { err = "recording failed: " + fail_; return false; }
     if (segs_.empty()) { err = "recording is empty (begin() not called)"; return false; }
@@ -919,7 +925,8 @@ bool Recording::submit_and_wait(std::string& err) {
             return false;
         }
     }
-    return ctx_.wait_fence(fence_, "vkWaitForFences", err);
+    return ctx_.wait_fence(fence_, "vkWaitForFences", err,
+                           stall_budget_ms ? stall_budget_ms : 120000);
 }
 
 void Recording::report_profile(const char* title) const {

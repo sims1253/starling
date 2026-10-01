@@ -518,3 +518,19 @@ in-flight unit (~29 s on CPU-VK; ~1 s per decode round on the phone) with
 both teardown lines. Next (staged): the H1 (killed-death) vs H2 (clean-load
 leak) reproduction study on a dedicated phone day, and the degradation
 watchdog if the study shows pre-wedge times are actionable.
+
+### P2-11 (2026-10-01): wedge circumvention L2 — degradation watchdog
+
+The wedge is preceded by a degradation band (bimodal round times, P2-7);
+today that state fed the driver until a 120 s fence hang. L2 bounds each
+decode-round fence wait at ~6× the running round median (floor 20 s,
+`STARLING_FAST_STALL_MULT`, 0 disables; absolute override
+`STARLING_FAST_STALL_BUDGET_MS` for validation): a stalling driver now
+fails fast with the same wedge-marker semantics (retry-storm guard) and —
+validated on llvmpipe — the process still exits through full destructors
+(`[fast] vk teardown: device destroyed cleanly` on the abort path too).
+Normal runs are untouched (golden, watchdog silent, no marker). With L1
+(cooperative stop) this closes both app-side failure modes around the
+wedge: dying cleanly and dying early. The remaining root-cause work is the
+H1/H2 reproduction study (phone-day) and, if H2 (vendor bug) confirms, the
+plain-Vulkan reproducer bug report.

@@ -869,12 +869,36 @@ bool MossEngine::generate(const float* pcm, size_t n, std::vector<int32_t>& out_
     // The device stops at EOS or the budget; the host bound only guards
     // against a state buffer that never reports either.
     const int max_rounds = (int)(I.cfg.max_new_tokens / steps) + 2;
+    // Degradation watchdog (#325): the wedge is preceded by rounds that
+    // blow past the session's own median (the bimodal 101-141 ms/token
+    // band, P2-7). Bound each fence wait at ~6x the running round median
+    // (floor 20 s) so a stalling driver is caught with the same wedge-marker
+    // semantics long before the 120 s default — instead of feeding a dying
+    // driver until it hangs. STARLING_FAST_STALL_MULT tunes the multiplier
+    // (0 disables); STARLING_FAST_STALL_BUDGET_MS forces an absolute budget
+    // (validation hook).
+    double stall_mult = 6.0;
+    if (const char* e = std::getenv("STARLING_FAST_STALL_MULT")) stall_mult = std::atof(e);
+    uint64_t forced_budget_ms = 0;
+    if (const char* e = std::getenv("STARLING_FAST_STALL_BUDGET_MS"))
+        forced_budget_ms = (uint64_t)std::max(0, std::atoi(e));
+    std::vector<double> round_ms;
     for (;;) {
         if (starling_ggml_stop_requested()) break;
         if (!I.ctx->download(I.state, 0, st.data(), 16 * 4, err)) return false;
         if (st[2] != 0 || st[1] >= I.cfg.max_new_tokens) break;
         if (rounds >= max_rounds) { err = "fast moss: decode did not terminate"; return false; }
-        if (!I.dec_rec->submit_and_wait(err)) return false;
+        uint64_t budget_ms = 0;
+        if (forced_budget_ms) budget_ms = forced_budget_ms;
+        else if (stall_mult > 0 && !round_ms.empty()) {
+            std::vector<double> srt(round_ms);
+            std::sort(srt.begin(), srt.end());
+            const double med = srt[srt.size() / 2];
+            budget_ms = (uint64_t)std::max(20.0 * 1000.0, stall_mult * med * 1000.0);
+        }
+        const auto t_round = std::chrono::steady_clock::now();
+        if (!I.dec_rec->submit_and_wait(err, budget_ms)) return false;
+        round_ms.push_back(ms_since(t_round));
         if (rounds == 0) I.dec_rec->report_profile("moss decode (K steps)");
         ++rounds;
     }

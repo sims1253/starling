@@ -219,8 +219,9 @@ public:
               VkDeviceSize doff, VkDeviceSize bytes);
     void fill(const Buffer& dst, VkDeviceSize off, VkDeviceSize bytes, uint32_t value);
 
-    // Submit and block until the GPU finishes.
-    bool submit_and_wait(std::string& err);
+    // Submit and block until the GPU finishes. `stall_budget_ms` bounds the
+    // fence wait (degradation watchdog, #325); 0 = the 120 s default.
+    bool submit_and_wait(std::string& err, uint64_t stall_budget_ms = 0);
 
     size_t n_dispatches() const { return n_dispatch_; }
     // Per-label GPU time of the last submission (profiling builds only;
@@ -317,7 +318,8 @@ private:
     std::string pcache_path_;
     // Bounded fence wait shared by submits and staged transfers; a failure
     // that signals a degraded driver marks the wedge. Caller holds queue_mu_.
-    bool wait_fence(VkFence fence, const char* what, std::string& err);
+    bool wait_fence(VkFence fence, const char* what, std::string& err,
+                    uint64_t budget_ms = 120000);
 
     std::string wedge_path_;
     std::atomic<bool> wedged_{false};   // set once (init / mark_wedged), read anywhere
