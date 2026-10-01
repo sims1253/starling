@@ -553,3 +553,19 @@ numbers, it does not change the default. Also note repack's
 transcript-exact behavior here contrasts with the bf16/dot-method concern
 that killed v4: ggml's repacked kernels preserve the fixtures and WER
 neutrality on both draws.
+
+Domain-probe reinterpretation + long-workload seal (run 21): the 8-clip
+LibriSpeech-style set is a boundary-word hair-trigger, not a domain gate.
+Repack-ONLY (factors off) produces the SAME +0.64 (4.49->5.13) the factor
+path produced in run 15, and the stacked config lands on the same
+transcript set (one punctuation-level difference in clip 8) — the same ~3
+near-boundary words flip under ANY Q8-dot -> f32-class accumulation change.
+The bf16 model (+0.00, run 18) is the control: its baseline already uses
+f32-class dots. Unified mechanism: the flips are an accumulation-method
+phenomenon visible only on this tiny set; on the campaign's actual quality
+bar (FLEURS draws, 100 clips) repack, factors and stacked are all neutral
+(-0.19..+0.05). Run 15's "domain-conditional caveat" is therefore
+reinterpretED: the factor path shares the dot-method sensitivity of the
+SHIPPED repack knob (Android default) and has no unique domain fragility.
+Long-workload seal for the recommended config (repack+sel2+KVINR, 74 s
+fixture): enc +19.00% / wall +8.84% — matches medium's +19.62/+8.69 band.

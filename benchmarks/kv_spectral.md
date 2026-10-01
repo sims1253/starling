@@ -222,3 +222,12 @@ stacked with the selective map+in-r scores the total is enc +19.62%.
 On x86 notebooks the repack knob — not low-rank K — is the dominant
 encoder lever; the selective map remains a small additional win and the
 research deliverable of #59.
+
+**Hair-trigger correction (same campaign):** the run-15 cross-domain
+failure is reinterpreted: the 8-clip set flips the same ~3 boundary words
+(+0.64) under ANY dot-method change — the shipped repack knob alone
+reproduces it exactly, and the bf16 model (f32-class baseline dots) shows
+none. The selective map has no unique domain fragility; it shares the
+accumulation-method sensitivity of the production repack default. The
+FLEURS draws remain the campaign's quality bar, and every recommended
+configuration is neutral there.
