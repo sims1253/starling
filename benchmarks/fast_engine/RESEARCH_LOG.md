@@ -646,3 +646,31 @@ Everything actionable is already landed and validated: L1 (cooperative
 stop), L2 (watchdog), the recovery load (cures every degradation state
 observed), and forensics on every anomaly. Mapping the damage trigger to
 n>1 is unattended-matrix work (long runs, forensics per event).
+
+### P2-16 (2026-10-01/02, unattended): the overnight death matrix — 30/30 clean; the day's n≈70 statistics
+
+The unattended matrix (rule 3 v3 posture) ran to completion on the
+charging phone: 30 random-phase SIGKILL cycles (upload/warmup/decode) each
+followed by a clean-load probe — **30/30 probes ok, zero anomalies**
+(range 63.19–66.59 ms/token, running median ~64.4, ±3 %), zero wedge
+markers, forensics never triggered.
+
+Combined with the attended study (P2-12..15), the day's totals over ~70
+deliberate unclean VkDevice deaths across every phase, boot history, and
+load level:
+
+| statistic | value |
+| --- | --- |
+| unclean deaths | ~70 |
+| damaging events | **1** (~1.4 %/death; P2-12, fresh-boot mid-transcription) |
+| damage repaired by one clean lifecycle | **100 %** (every state ever observed) |
+| hard wedges | **0** (never reproduced deliberately) |
+| healthy-band return after cure | every probe, every time |
+
+Conclusions: unclean VkDevice death is *usually* harmless and *rarely*
+(≈1-in-70) leaves persistent damage that a single clean device lifecycle
+repairs; the hard wedge is rarer still (a confluence tail the L2 watchdog
+bounds). The product guidance is complete: cooperative stop everywhere
+(L1), watchdog (L2), recovery load after any dirty death, forensics on
+every anomaly. Remaining unknown (the exact 1-in-70 trigger) needs either
+much larger n or luck; it no longer blocks anything actionable.
