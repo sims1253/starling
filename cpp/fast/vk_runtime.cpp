@@ -78,7 +78,9 @@ Buffer& Buffer::operator=(Buffer&& o) noexcept {
 
 void Buffer::release() {
     if (!ctx) return;
-    if (ctx->gpu_hung()) {   // hung work may still use it: leave it to the driver
+    if (ctx->gpu_hung()) {
+        // By design: hung work may still use the buffer, so it is neither
+        // unmapped nor freed — leaked to the driver at process exit.
         buf = VK_NULL_HANDLE; mem = VK_NULL_HANDLE; host = nullptr; size = 0; ctx = nullptr;
         return;
     }
@@ -479,9 +481,12 @@ bool Context::wait_fence(VkFence fence, const char* what, std::string& err,
     // vkDeviceWaitIdle has no timeout, and only a LOST device is guaranteed
     // to return from waits in finite time (Vulkan spec, "Lost Device") — a
     // device that is wedged but not lost (timeout, the OOM reading) is not.
-    // So drain through the fence with a bounded grace. If the work never
-    // finishes, leave the fence pending and mark the context hung: teardown
-    // then skips the destruction that would block on (or free under) it.
+    // So drain through the fence with a bounded grace (worst case the
+    // caller, and anyone queued on queue_mu_, waits budget + grace). Late
+    // work that does finish still leaves the wedge marked: the budget
+    // already judged it a stall. If the work never finishes, leave the
+    // fence pending and mark the context hung: teardown then skips the
+    // destruction that would block on (or free under) it.
     const VkResult d = fn_.vkWaitForFences(dev_, 1, &fence, VK_TRUE, kDrainGraceMs * 1000000);
     if (d == VK_ERROR_DEVICE_LOST) {
         fn_.vkDeviceWaitIdle(dev_);   // lost: returns in finite time; objects may be destroyed
@@ -615,6 +620,7 @@ bool Context::ensure_staging(VkDeviceSize bytes, std::string& err) {
 }
 
 bool Context::upload(Buffer& dst, VkDeviceSize off, const void* src, size_t bytes, std::string& err) {
+    if (wedged_) { err = wedged_why(); return false; }   // #325: fail fast once wedged
     if (bytes == 0) return true;
     if (off + bytes > dst.size) { err = "upload out of range"; return false; }
     if (dst.host) {
@@ -627,7 +633,6 @@ bool Context::upload(Buffer& dst, VkDeviceSize off, const void* src, size_t byte
         return true;
     }
     std::lock_guard<std::mutex> lk(queue_mu_);
-    if (wedged_) { err = wedged_why(); return false; }   // #325: fail fast once wedged
     const VkDeviceSize chunk = 64ull << 20;
     if (!ensure_staging(std::min<VkDeviceSize>(bytes, chunk), err)) return false;
     size_t done = 0;
@@ -657,6 +662,7 @@ bool Context::upload(Buffer& dst, VkDeviceSize off, const void* src, size_t byte
 }
 
 bool Context::download(const Buffer& src, VkDeviceSize off, void* dst, size_t bytes, std::string& err) {
+    if (wedged_) { err = wedged_why(); return false; }   // #325: fail fast once wedged
     if (bytes == 0) return true;
     if (off + bytes > src.size) { err = "download out of range"; return false; }
     if (src.host) {
@@ -669,7 +675,6 @@ bool Context::download(const Buffer& src, VkDeviceSize off, void* dst, size_t by
         return true;
     }
     std::lock_guard<std::mutex> lk(queue_mu_);
-    if (wedged_) { err = wedged_why(); return false; }   // #325: fail fast once wedged
     const VkDeviceSize chunk = 64ull << 20;
     if (!ensure_staging(std::min<VkDeviceSize>(bytes, chunk), err)) return false;
     size_t done = 0;

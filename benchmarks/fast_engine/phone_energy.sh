@@ -52,7 +52,7 @@ adb shell "dumpsys battery | grep -E 'status|level|Charge counter' | head -3; du
 on_battery
 kill_benches
 wait_benches
-trap kill_benches EXIT   # an abort must not leave a bench running on the phone
+trap 'kill_benches || true' EXIT   # an abort must not leave a bench running on the phone
 
 bench() {  # bench <engine>
   adb shell "cd $DEV && timeout 900 env LD_LIBRARY_PATH=. STARLING_ENGINE=$1 STARLING_GGML_THREADS=6 \

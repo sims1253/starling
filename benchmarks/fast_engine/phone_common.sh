@@ -42,7 +42,8 @@ benches_gone() {
 # stop between calls. KILL is the fallback, not the default. Every adb call
 # is bounded on the host, and the wait loop on the device too, so a host
 # timeout never orphans a remote shell. Fails if a bench survives KILL (the
-# next 1.6 GB load must not collide with it).
+# next 1.6 GB load must not collide with it); in EXIT traps call it as
+# `kill_benches || true` so cleanup cannot mask the script's own status.
 kill_benches() {
   timeout 15 adb shell "for p in \$(pidof $BENCH_BINS); do kill -TERM \$p; done" >/dev/null 2>&1 || true
   benches_gone 10 && return 0

@@ -880,20 +880,30 @@ bool MossEngine::generate(const float* pcm, size_t n, std::vector<int32_t>& out_
     // STARLING_FAST_STALL_MULT tunes the multiplier (0 disables);
     // STARLING_FAST_STALL_BUDGET_MS forces an absolute budget for every
     // round (validation hook).
-    double stall_mult = 6.0;
-    if (const char* e = std::getenv("STARLING_FAST_STALL_MULT")) {
-        char* end = nullptr;
-        const double v = std::strtod(e, &end);
-        if (end != e && *end == '\0' && v >= 0) stall_mult = v;
-        else std::fprintf(stderr, "[fast-moss] ignoring STARLING_FAST_STALL_MULT='%s' (want a number >= 0)\n", e);
-    }
-    uint64_t forced_budget_ms = 0;
-    if (const char* e = std::getenv("STARLING_FAST_STALL_BUDGET_MS")) {
-        char* end = nullptr;
-        const unsigned long long v = std::strtoull(e, &end, 10);
-        if (end != e && *end == '\0' && v > 0) forced_budget_ms = v;
-        else std::fprintf(stderr, "[fast-moss] ignoring STARLING_FAST_STALL_BUDGET_MS='%s' (want ms > 0)\n", e);
-    }
+    // Parsed once per process: the env does not change, and a bad value
+    // should warn once, not on every transcription.
+    static const double stall_mult = [] {
+        double m = 6.0;
+        if (const char* e = std::getenv("STARLING_FAST_STALL_MULT")) {
+            char* end = nullptr;
+            const double v = std::strtod(e, &end);
+            if (end != e && *end == '\0' && std::isfinite(v) && v >= 0 && v <= 1000) m = v;
+            else std::fprintf(stderr, "[fast-moss] ignoring STARLING_FAST_STALL_MULT='%s' (want 0..1000)\n", e);
+        }
+        return m;
+    }();
+    static const uint64_t forced_budget_ms = [] {
+        uint64_t b = 0;
+        if (const char* e = std::getenv("STARLING_FAST_STALL_BUDGET_MS")) {
+            char* end = nullptr;
+            const unsigned long long v = std::strtoull(e, &end, 10);
+            if (end != e && *end == '\0' && v > 0) b = v;
+            else std::fprintf(stderr, "[fast-moss] ignoring STARLING_FAST_STALL_BUDGET_MS='%s' (want ms > 0)\n", e);
+        }
+        return b;
+    }();
+    constexpr double kStallFloorMs = 20000.0;    // the watchdog never fires sooner
+    constexpr double kStallCeilMs = 3600000.0;   // keeps the double->uint64 cast defined
     std::vector<double> round_ms;
     for (;;) {
         if (!I.ctx->download(I.state, 0, st.data(), 16 * 4, err)) return false;
@@ -915,7 +925,7 @@ bool MossEngine::generate(const float* pcm, size_t n, std::vector<int32_t>& out_
             std::vector<double> srt(round_ms);
             std::nth_element(srt.begin(), srt.begin() + srt.size() / 2, srt.end());
             const double med_ms = srt[srt.size() / 2];
-            budget_ms = (uint64_t)std::max(20.0 * 1000.0, stall_mult * med_ms);
+            budget_ms = (uint64_t)std::min(kStallCeilMs, std::max(kStallFloorMs, stall_mult * med_ms));
         }
         const auto t_round = std::chrono::steady_clock::now();
         if (!I.dec_rec->submit_and_wait(err, budget_ms)) return false;
