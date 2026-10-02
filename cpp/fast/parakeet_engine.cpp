@@ -53,6 +53,10 @@ struct Layer {
 } // namespace
 
 struct ParakeetEngine::Impl {
+    // Keeps the shared Vulkan context alive while this engine exists.
+    // Declared first, so it is released last — after every buffer and
+    // recording below; the last engine's release destroys the device.
+    std::shared_ptr<vk::Context> ctx_hold;
     vk::Context* ctx = nullptr;
     Kernels K;
     Arena ar;
@@ -109,9 +113,11 @@ ParakeetEngine::~ParakeetEngine() {
 }
 
 std::unique_ptr<ParakeetEngine> ParakeetEngine::create(const pk::ParakeetModel& m, std::string& err) {
-    vk::Context* ctx = vk::Context::get(err);
-    if (!ctx) return nullptr;
+    std::shared_ptr<vk::Context> hold = vk::Context::acquire(err);
+    if (!hold) return nullptr;
+    vk::Context* ctx = hold.get();
     std::unique_ptr<ParakeetEngine> e(new ParakeetEngine());
+    e->impl_->ctx_hold = std::move(hold);
     e->impl_->ctx = ctx;
     if (!e->impl_->K.init(*ctx, err)) return nullptr;
     if (!e->impl_->load(m, err)) return nullptr;

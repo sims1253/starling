@@ -76,6 +76,10 @@ std::vector<HostMatrix> split_rows(HostMatrix&& m, uint32_t rows) {
 } // namespace
 
 struct MossEngine::Impl {
+    // Keeps the shared Vulkan context alive while this engine exists.
+    // Declared first, so it is released last — after every buffer and
+    // recording below; the last engine's release destroys the device.
+    std::shared_ptr<vk::Context> ctx_hold;
     vk::Context* ctx = nullptr;
     Kernels K;
     Arena ar;
@@ -137,9 +141,11 @@ MossEngine::~MossEngine() {
 }
 
 std::unique_ptr<MossEngine> MossEngine::create(const ms::MossModel& m, std::string& err) {
-    vk::Context* ctx = vk::Context::get(err);
-    if (!ctx) return nullptr;
+    std::shared_ptr<vk::Context> hold = vk::Context::acquire(err);
+    if (!hold) return nullptr;
+    vk::Context* ctx = hold.get();
     std::unique_ptr<MossEngine> e(new MossEngine());
+    e->impl_->ctx_hold = std::move(hold);
     e->impl_->ctx = ctx;
     if (!e->impl_->K.init(*ctx, err) || !e->impl_->load(m, err) || !e->impl_->alloc_static(err))
         return nullptr;

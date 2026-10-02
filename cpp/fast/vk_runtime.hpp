@@ -252,10 +252,15 @@ private:
 
 class Context {
 public:
-    // The process-wide context, created on first use. Returns nullptr (with
-    // `err`) when no usable Vulkan device exists. STARLING_FAST_DEVICE=<n>
-    // selects a physical device by index.
-    static Context* get(std::string& err);
+    // The shared context: created on the first acquire, destroyed — a clean
+    // vkDestroyDevice — when the last holder (an engine) releases it. #325:
+    // a process holds a live device only while an engine is loaded, so the
+    // SIGKILL that ends most Android processes finds none to abandon. A hung
+    // context is never destroyed (see ~Context) and is handed out again; a
+    // new context inherits a wedge this process saw in the last 15 min.
+    // Returns nullptr (with `err`) when no usable Vulkan device exists.
+    // STARLING_FAST_DEVICE=<n> selects a physical device by index.
+    static std::shared_ptr<Context> acquire(std::string& err);
     ~Context();
 
     const DeviceInfo& info() const { return info_; }
