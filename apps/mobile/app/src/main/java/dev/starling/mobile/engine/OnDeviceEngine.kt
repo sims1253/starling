@@ -12,6 +12,10 @@ import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
 import java.util.UUID
+import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledExecutorService
+import java.util.concurrent.ScheduledFuture
+import java.util.concurrent.TimeUnit
 
 /**
  * Owns the on-device Parakeet engine: the installed GGUFs, which one is
@@ -19,9 +23,16 @@ import java.util.UUID
  * [modelDir] is an installed model (imports keep their file name, downloads
  * their catalog name); the active one is named in [ACTIVE_FILE_NAME], and
  * falls back to the first installed model when that file is missing or
- * names a deleted model. The model loads lazily on first use and then
- * stays resident (hundreds of MB for a 0.6B q4 model) until
- * [releaseWhenIdle] drops it under memory pressure; the next use reloads it.
+ * names a deleted model. The model loads lazily on first use and stays
+ * resident (hundreds of MB for a 0.6B q4 model) until [idleReleaseMs]
+ * pass without a use, or [releaseWhenIdle] drops it under memory pressure;
+ * the next use reloads it (~2 s on a Pixel 10 Pro).
+ *
+ * The idle release matters beyond memory (#325): freeing the last model
+ * also destroys the GPU device cleanly. Android ends processes with
+ * SIGKILL, and a process killed while holding a live Vulkan device is the
+ * leading correlate of the GPU driver damage behind the phone's wedges and
+ * restarts, so the device should exist only while it is in use.
  * All calls are serialized; the engine additionally mutexes inside the C API.
  *
  * [memoryGate] is consulted before each load with the model's size and
@@ -34,6 +45,7 @@ class OnDeviceEngine(
     private val modelDir: File,
     private val memoryGate: (modelBytes: Long) -> String? = { null },
     private val nativeSupport: () -> String? = NativeSupport::unsupportedReason,
+    private val idleReleaseMs: Long = IDLE_RELEASE_MS,
 ) : OnDeviceStreamSession.LiveEngine {
     /** Where in [importModel] a rejection happened; import failures report their stage. */
     enum class ImportStage { OPEN, COPY, VALIDATE, PROMOTE }
@@ -72,6 +84,16 @@ class OnDeviceEngine(
     // release that waits for them to end.
     private var liveSessions = 0
     private var releasePending = false
+
+    // Guarded by [lock]: the pending idle release and its generation (a
+    // release that fired while a use held the lock must not undo that use).
+    private val idleScheduler: ScheduledExecutorService by lazy {
+        Executors.newSingleThreadScheduledExecutor { runnable ->
+            Thread(runnable, "starling-idle-release").apply { isDaemon = true }
+        }
+    }
+    private var idleRelease: ScheduledFuture<*>? = null
+    private var idleGeneration = 0L
 
     fun hasModel(): Boolean = activeModelFile() != null
 
@@ -134,6 +156,17 @@ class OnDeviceEngine(
     /** Frees the resident model now, or when the last live session ends. Caller holds [lock]. */
     private fun releaseLocked() {
         if (liveSessions > 0) releasePending = true else unload()
+    }
+
+    /** Re-arms the idle release after a use of the loaded model. Caller holds [lock]. */
+    private fun scheduleIdleReleaseLocked() {
+        val generation = ++idleGeneration
+        idleRelease?.cancel(false)
+        idleRelease = null
+        if (handle == 0L || idleReleaseMs <= 0) return
+        idleRelease = idleScheduler.schedule({
+            synchronized(lock) { if (generation == idleGeneration) releaseLocked() }
+        }, idleReleaseMs, TimeUnit.MILLISECONDS)
     }
 
     private fun installedFiles(): List<File> =
@@ -470,16 +503,32 @@ class OnDeviceEngine(
     }
 
     /** Loads the model ahead of a live session; null when ready. Blocking. */
-    override fun prepare(): String? = synchronized(lock) { ensureLoadedLocked() }
+    override fun prepare(): String? = synchronized(lock) {
+        ensureLoadedLocked().also { scheduleIdleReleaseLocked() }
+    }
 
     /** One live-stream window of 16 kHz mono samples. Blocking. */
     override fun transcribeWindow(samples: FloatArray): OnDeviceStreamSession.WindowResult = synchronized(lock) {
-        ensureLoadedLocked()?.let { return OnDeviceStreamSession.WindowResult.Failed(it) }
-        val text = StarlingNative.transcribe(handle, samples, ChunkStreamer.SAMPLE_RATE)
-            ?: return OnDeviceStreamSession.WindowResult.Failed(
-                "the on-device engine returned an error: ${StarlingNative.lastError(handle) ?: "unknown error"}",
-            )
-        OnDeviceStreamSession.WindowResult.Text(text)
+        try {
+            ensureLoadedLocked()?.let { return OnDeviceStreamSession.WindowResult.Failed(it) }
+            val text = StarlingNative.transcribe(handle, samples, ChunkStreamer.SAMPLE_RATE)
+            if (text == null) {
+                val error = StarlingNative.lastError(handle)
+                // A failed GPU refuses the rest of this session; the release
+                // (deferred to the session's end) makes the next one reload,
+                // which falls back to the CPU engine.
+                if (GpuFailure.matches(error)) {
+                    Log.w(TAG, "GPU failure in a live session; the model reloads after it: $error")
+                    releaseLocked()
+                }
+                return OnDeviceStreamSession.WindowResult.Failed(
+                    "the on-device engine returned an error: ${error ?: "unknown error"}",
+                )
+            }
+            OnDeviceStreamSession.WindowResult.Text(text)
+        } finally {
+            scheduleIdleReleaseLocked()
+        }
     }
 
     /**
@@ -506,19 +555,43 @@ class OnDeviceEngine(
                 releasePending = false
                 unload()
             }
+            scheduleIdleReleaseLocked()
         }
     }
 
-    /** Blocking transcription of a finalized WAV recording. */
+    /**
+     * Blocking transcription of a finalized WAV recording. A GPU-driver
+     * failure ([GpuFailure]) frees the model and retries once: the reload
+     * falls back to the CPU engine, so the recording still transcribes.
+     */
     fun transcribe(audioFile: File): InferenceResult = synchronized(lock) {
-        ensureLoadedLocked()?.let { return InferenceResult.Failure(it, false) }
+        try {
+            val first = transcribeLocked(audioFile)
+            if (first !is GpuFailed) return first.result
+            Log.w(TAG, "GPU failure; reloading the model (CPU fallback) and retrying once: ${first.error}")
+            unload()
+            transcribeLocked(audioFile).result
+        } finally {
+            scheduleIdleReleaseLocked()
+        }
+    }
+
+    private sealed interface Attempt { val result: InferenceResult }
+    private class Done(override val result: InferenceResult) : Attempt
+    private class GpuFailed(override val result: InferenceResult, val error: String?) : Attempt
+
+    /** One transcription attempt. Caller holds [lock]. */
+    private fun transcribeLocked(audioFile: File): Attempt {
+        ensureLoadedLocked()?.let { return Done(InferenceResult.Failure(it, false)) }
 
         val decoded = WavPcm.decodeMonoFloat(audioFile)
-            ?: return InferenceResult.Failure("The recording audio could not be decoded.", false)
+            ?: return Done(InferenceResult.Failure("The recording audio could not be decoded.", false))
         if (decoded.sampleRate != WavWriterContract.SAMPLE_RATE) {
-            return InferenceResult.Failure(
-                "The recording sample rate (${decoded.sampleRate} Hz) is not supported.",
-                false,
+            return Done(
+                InferenceResult.Failure(
+                    "The recording sample rate (${decoded.sampleRate} Hz) is not supported.",
+                    false,
+                ),
             )
         }
         // Bound each engine call like the serving layer (30 s step, 2 s
@@ -533,17 +606,19 @@ class OnDeviceEngine(
                 decoded.samples.copyOfRange(window.start, window.endExclusive)
             }
             val text = StarlingNative.transcribe(handle, samples, decoded.sampleRate)
-                ?: return InferenceResult.Failure(
-                    "The on-device engine returned an error: ${
-                        StarlingNative.lastError(handle) ?: "unknown error"
-                    }",
+            if (text == null) {
+                val error = StarlingNative.lastError(handle)
+                val failure = InferenceResult.Failure(
+                    "The on-device engine returned an error: ${error ?: "unknown error"}",
                     false,
                 )
+                return if (GpuFailure.matches(error)) GpuFailed(failure, error) else Done(failure)
+            }
             texts.add(text)
         }
         // A single window is the direct path; joining would only normalize.
         val text = if (texts.size == 1) texts[0] else ChunkedTranscription.joinTexts(texts)
-        InferenceResult.Success(text)
+        return Done(InferenceResult.Success(text))
     }
 
     private fun unload() {
@@ -557,6 +632,13 @@ class OnDeviceEngine(
 
     companion object {
         private const val TAG = "OnDeviceEngine"
+
+        /**
+         * Idle time after which the model (and with it the GPU device) is
+         * freed. Short on purpose (#325, see the class doc): a reload costs
+         * ~2 s, a process killed with a live device risks the GPU driver.
+         */
+        const val IDLE_RELEASE_MS = 60_000L
 
         /** Name for a model imported without a usable file name. */
         const val DEFAULT_MODEL_NAME = "parakeet.gguf"
