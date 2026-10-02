@@ -128,7 +128,10 @@ struct MossEngine::Impl {
 
 MossEngine::MossEngine() : impl_(new Impl) {}
 MossEngine::~MossEngine() {
-    if (impl_ && impl_->ctx) impl_->ctx->fn().vkDeviceWaitIdle(impl_->ctx->device());
+    // Skipped on a hung GPU: vkDeviceWaitIdle has no timeout (#325); the
+    // runtime then leaks this engine's objects to the driver instead.
+    if (impl_ && impl_->ctx && !impl_->ctx->gpu_hung())
+        impl_->ctx->fn().vkDeviceWaitIdle(impl_->ctx->device());
 }
 
 std::unique_ptr<MossEngine> MossEngine::create(const ms::MossModel& m, std::string& err) {
