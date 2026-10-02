@@ -693,11 +693,16 @@ class OnDeviceEngine(
         }
     }
 
-    /** Blocking transcription of a finalized WAV recording. */
-    fun transcribe(audioFile: File): InferenceResult = synchronized(lock) { usingLocked { transcribeLocked(audioFile) } }
+    /**
+     * Blocking transcription of a finalized WAV recording. A GPU driver
+     * failure frees the wedged model and retries once: the reload falls back
+     * to the CPU engine, so the recording still transcribes.
+     */
+    fun transcribe(audioFile: File): InferenceResult =
+        synchronized(lock) { usingLocked { transcribeLocked(audioFile, retryDriverFailure = true) } }
 
     /** Caller holds [lock] inside [usingLocked]. */
-    private fun transcribeLocked(audioFile: File): InferenceResult {
+    private fun transcribeLocked(audioFile: File, retryDriverFailure: Boolean): InferenceResult {
         ensureLoadedLocked()?.let { return InferenceResult.Failure(it, false) }
 
         val decoded = WavPcm.decodeMonoFloat(audioFile)
@@ -725,6 +730,7 @@ class OnDeviceEngine(
                 error?.let(observer::engineFailed)
                 if (error != null && ModelLifetime.isDriverFailure(error)) {
                     releaseDriverFailureLocked(error)
+                    if (retryDriverFailure) return transcribeLocked(audioFile, retryDriverFailure = false)
                 }
                 return InferenceResult.Failure("The on-device engine returned an error: ${error ?: "unknown error"}", false)
             }
@@ -741,9 +747,9 @@ class OnDeviceEngine(
      * protect a working model from a mid-take reload; a wedged one serves
      * nobody, and keeping it until the pins drop would let the batch
      * fallback of the failed take (which can win the lock before that take
-     * unpins) run into the same broken handle. Propagate, not retry: this
-     * request still returns its failure, the next request reloads (the
-     * native engine falls back to the CPU there), and speculative preloads
+     * unpins) run into the same broken handle. The next load falls back to
+     * the CPU engine: a live window still returns its failure and the next
+     * one reloads, [transcribe] retries at once, and speculative preloads
      * stay off through ModelLifetime's DriverFailed. Caller holds [lock].
      */
     private fun releaseDriverFailureLocked(error: String) {
