@@ -3,6 +3,7 @@
 #include "vk_runtime.hpp"
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdio>
 #include <ctime>
 #include <sys/stat.h>
@@ -20,6 +21,10 @@
 namespace starling::fast::vk {
 
 namespace {
+
+// After a fence timeout, how long the drain waits for the late work before
+// declaring the GPU hung (see Context::wait_fence).
+constexpr uint64_t kDrainGraceMs = 10000;
 
 void* open_vulkan_library() {
 #if defined(_WIN32)
@@ -73,6 +78,12 @@ Buffer& Buffer::operator=(Buffer&& o) noexcept {
 
 void Buffer::release() {
     if (!ctx) return;
+    if (ctx->gpu_hung()) {
+        // By design: hung work may still use the buffer, so it is neither
+        // unmapped nor freed — leaked to the driver at process exit.
+        buf = VK_NULL_HANDLE; mem = VK_NULL_HANDLE; host = nullptr; size = 0; ctx = nullptr;
+        return;
+    }
     const Fns& f = ctx->fn_;
     if (host) f.vkUnmapMemory(ctx->dev_, mem);
     if (buf) f.vkDestroyBuffer(ctx->dev_, buf, nullptr);
@@ -372,6 +383,14 @@ Context::~Context() {
         if (inst_) fn_.vkDestroyInstance(inst_, nullptr);
         return;
     }
+    if (gpu_hung_) {
+        // A submission never drained: vkDeviceWaitIdle would block forever
+        // and destroying in-use objects is invalid. Leave the device to the
+        // driver — the process is failing anyway, and hanging is worse.
+        std::fprintf(stderr, "[fast] vk teardown: skipped (GPU work never finished; "
+                             "device left to the driver)\n");
+        return;
+    }
     fn_.vkDeviceWaitIdle(dev_);
     if (pcache_ && !pcache_path_.empty()) {
         size_t n = 0;
@@ -398,6 +417,13 @@ Context::~Context() {
     if (xfer_pool_) fn_.vkDestroyCommandPool(dev_, xfer_pool_, nullptr);
     fn_.vkDestroyDevice(dev_, nullptr);
     if (inst_) fn_.vkDestroyInstance(inst_, nullptr);
+    // Observability (#325): this line is how a harness verifies the VkDevice
+    // was destroyed by US (clean teardown) rather than abandoned to the
+    // driver's async reaping — the leading wedge correlate on the Pixel.
+    // Printed only once the device is gone, so a teardown that hangs or
+    // dies part-way leaves no false evidence. One line per process (the
+    // Vulkan context is a process-wide singleton shared by the engines).
+    std::fprintf(stderr, "[fast] vk teardown: device destroyed cleanly\n");
     // The loader library stays mapped: other Vulkan users in the process
     // (e.g. ggml's backend) may share it.
 }
@@ -424,18 +450,18 @@ std::string Context::wedged_why() const {
     return wedged_why_;
 }
 
-bool Context::wait_fence(VkFence fence, const char* what, std::string& err) {
+bool Context::wait_fence(VkFence fence, const char* what, std::string& err,
+                         uint64_t budget_ms) {
     // Bounded wait: a lost or hung device must surface as an error, not a
-    // hang. Callers hold queue_mu_.
-    const VkResult r = fn_.vkWaitForFences(dev_, 1, &fence, VK_TRUE, 120ull * 1000 * 1000 * 1000);
+    // hang. Callers hold queue_mu_. The decode loop passes the #325
+    // degradation-watchdog budget; everything else gets the default.
+    if (budget_ms == 0) budget_ms = kDefaultFenceBudgetMs;
+    budget_ms = std::min<uint64_t>(budget_ms, UINT64_MAX / 1000000);   // ns must not wrap
+    const VkResult r = fn_.vkWaitForFences(dev_, 1, &fence, VK_TRUE, budget_ms * 1000000);
     if (r == VK_SUCCESS) {
         fn_.vkResetFences(dev_, 1, &fence);
         return true;
     }
-    // The fence may still be pending (timeout): drain the queue before it
-    // is reset or the submitted buffers are freed.
-    fn_.vkDeviceWaitIdle(dev_);
-    fn_.vkResetFences(dev_, 1, &fence);
     err = vk_err(what, r);
     if (r == VK_ERROR_OUT_OF_DEVICE_MEMORY || r == VK_ERROR_DEVICE_LOST || r == VK_TIMEOUT) {
         err += r == VK_ERROR_OUT_OF_DEVICE_MEMORY
@@ -443,11 +469,36 @@ bool Context::wait_fence(VkFence fence, const char* what, std::string& err) {
                " clears it — do not keep retrying)"
              : r == VK_ERROR_DEVICE_LOST
              ? " (device lost: the GPU driver has failed; a device restart is required)"
-             : " (GPU work did not finish in 120 s; the driver may be wedged)";
+             : std::string(" (GPU work did not finish within ") + std::to_string(budget_ms) +
+               " ms; the driver may be wedged)";
         // #325: record the wedge so this process fails fast from now on and
         // the next one (within 15 min) refuses to join the retry storm.
+        // Before the drain below, which may itself block on a hung GPU.
         mark_wedged(err);
     }
+    // The fence may still be pending: its work must finish before the fence
+    // is reset or the submitted buffers are reused or freed.
+    // vkDeviceWaitIdle has no timeout, and only a LOST device is guaranteed
+    // to return from waits in finite time (Vulkan spec, "Lost Device") — a
+    // device that is wedged but not lost (timeout, the OOM reading) is not.
+    // So drain through the fence with a bounded grace (worst case the
+    // caller, and anyone queued on queue_mu_, waits budget + grace). Late
+    // work that does finish still leaves the wedge marked: the budget
+    // already judged it a stall. If the work never finishes, leave the
+    // fence pending and mark the context hung: teardown then skips the
+    // destruction that would block on (or free under) it.
+    const VkResult d = fn_.vkWaitForFences(dev_, 1, &fence, VK_TRUE, kDrainGraceMs * 1000000);
+    if (d == VK_ERROR_DEVICE_LOST) {
+        fn_.vkDeviceWaitIdle(dev_);   // lost: returns in finite time; objects may be destroyed
+    } else if (d != VK_SUCCESS) {
+        mark_wedged(err);   // idempotent; covers results not classified above
+        gpu_hung_ = true;
+        std::fprintf(stderr, "[fast] GPU work still pending %llu ms after the fence failure; "
+                             "the device will not be torn down\n",
+                     (unsigned long long)kDrainGraceMs);
+        return false;
+    }
+    fn_.vkResetFences(dev_, 1, &fence);
     return false;
 }
 
@@ -569,6 +620,7 @@ bool Context::ensure_staging(VkDeviceSize bytes, std::string& err) {
 }
 
 bool Context::upload(Buffer& dst, VkDeviceSize off, const void* src, size_t bytes, std::string& err) {
+    if (wedged_) { err = wedged_why(); return false; }   // #325: fail fast once wedged
     if (bytes == 0) return true;
     if (off + bytes > dst.size) { err = "upload out of range"; return false; }
     if (dst.host) {
@@ -610,6 +662,7 @@ bool Context::upload(Buffer& dst, VkDeviceSize off, const void* src, size_t byte
 }
 
 bool Context::download(const Buffer& src, VkDeviceSize off, void* dst, size_t bytes, std::string& err) {
+    if (wedged_) { err = wedged_why(); return false; }   // #325: fail fast once wedged
     if (bytes == 0) return true;
     if (off + bytes > src.size) { err = "download out of range"; return false; }
     if (src.host) {
@@ -739,6 +792,7 @@ Recording::Recording(Context& ctx) : ctx_(ctx) {
 }
 
 Recording::~Recording() {
+    if (ctx_.gpu_hung()) return;   // the hung work may still use the pool/fence
     const Fns& f = ctx_.fn_;
     for (VkDescriptorPool p : dpools_) f.vkDestroyDescriptorPool(ctx_.dev_, p, nullptr);
     if (qpool_) f.vkDestroyQueryPool(ctx_.dev_, qpool_, nullptr);
@@ -897,11 +951,12 @@ void Recording::fill(const Buffer& dst, VkDeviceSize off, VkDeviceSize bytes, ui
     ctx_.fn_.vkCmdFillBuffer(cb_, dst.buf, off, bytes, value);
 }
 
-bool Recording::submit_and_wait(std::string& err) {
+bool Recording::submit_and_wait(std::string& err, uint64_t stall_budget_ms) {
     const Fns& f = ctx_.fn_;
     if (!fail_.empty()) { err = "recording failed: " + fail_; return false; }
     if (segs_.empty()) { err = "recording is empty (begin() not called)"; return false; }
     std::lock_guard<std::mutex> lk(ctx_.queue_mu_);
+    if (ctx_.wedged_) { err = ctx_.wedged_why(); return false; }   // #325: fail fast once wedged
     VkResult r = VK_SUCCESS;
     for (size_t i = 0; i < segs_.size(); ++i) {
         VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
@@ -915,7 +970,7 @@ bool Recording::submit_and_wait(std::string& err) {
             return false;
         }
     }
-    return ctx_.wait_fence(fence_, "vkWaitForFences", err);
+    return ctx_.wait_fence(fence_, "vkWaitForFences", err, stall_budget_ms);
 }
 
 void Recording::report_profile(const char* title) const {

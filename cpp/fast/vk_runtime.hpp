@@ -189,6 +189,10 @@ struct Pipeline {
 
 constexpr uint32_t kPushBytes = 128;
 
+// Default bound on a fence wait (submits and staged transfers): a lost or
+// hung device surfaces as an error instead of a hang.
+constexpr uint64_t kDefaultFenceBudgetMs = 120000;
+
 // A recorded command buffer that can be submitted repeatedly. Descriptor
 // sets are allocated from the recording's own pool, so a recording stays
 // valid (and replayable) until it is destroyed.
@@ -219,8 +223,9 @@ public:
               VkDeviceSize doff, VkDeviceSize bytes);
     void fill(const Buffer& dst, VkDeviceSize off, VkDeviceSize bytes, uint32_t value);
 
-    // Submit and block until the GPU finishes.
-    bool submit_and_wait(std::string& err);
+    // Submit and block until the GPU finishes. `stall_budget_ms` bounds the
+    // fence wait (degradation watchdog, #325); 0 = kDefaultFenceBudgetMs.
+    bool submit_and_wait(std::string& err, uint64_t stall_budget_ms = 0);
 
     size_t n_dispatches() const { return n_dispatch_; }
     // Per-label GPU time of the last submission (profiling builds only;
@@ -275,6 +280,10 @@ public:
     // VK_EXT_memory_budget, refuse a load cleanly when the device-local
     // heaps cannot fit `need` (+ margin).
     bool wedged() const { return wedged_; }
+    // A timed-out submission never drained: its fence and buffers are still
+    // in use, so teardown leaves the device to the driver rather than block
+    // on (or free under) the hung work. (Submits already fail fast: wedged.)
+    bool gpu_hung() const { return gpu_hung_; }
     std::string wedged_why() const;
     void mark_wedged(const std::string& why);
     bool check_memory_budget(uint64_t need, std::string& err);
@@ -317,10 +326,13 @@ private:
     std::string pcache_path_;
     // Bounded fence wait shared by submits and staged transfers; a failure
     // that signals a degraded driver marks the wedge. Caller holds queue_mu_.
-    bool wait_fence(VkFence fence, const char* what, std::string& err);
+    // `budget_ms` 0 = kDefaultFenceBudgetMs.
+    bool wait_fence(VkFence fence, const char* what, std::string& err,
+                    uint64_t budget_ms = 0);
 
     std::string wedge_path_;
     std::atomic<bool> wedged_{false};   // set once (init / mark_wedged), read anywhere
+    std::atomic<bool> gpu_hung_{false}; // set once (wait_fence), read anywhere
     mutable std::mutex wedge_mu_;       // guards wedged_why_ and the marker write
     std::string wedged_why_;
     bool mem_budget_ = false;

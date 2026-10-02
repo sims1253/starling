@@ -182,6 +182,19 @@ processes refuse with a restart hint instead of joining a retry storm, and
 checks `VK_EXT_memory_budget` before the big allocations where the driver
 exposes it.
 
+The #317 follow-up loop (2026-10-01, RESEARCH_LOG P2-*) landed one more
+simplification — decode records one command buffer per round instead of
+per token (neutral, 16× fewer allocations) — and pinned down how strongly
+the decode number depends on the measurement protocol: cool fresh boots
+with an awake-hold measure **62.5–64 ms/token**; the historical 68–77
+band spans boots without the hold; and a locked phone without any hold
+reads 105–141 ms/token because system suspend stalls each decode
+round-trip by ~0.7 s (apps hold a wakelock during real transcription; the
+bench protocol measures unlocked or with `svc power stayon`, which only
+holds the phone awake while plugged in — see the phone measurement
+protocol in `benchmarks/fast_engine/AUTORESEARCH.md`). MOSS short wall ≈ 5.25 s
+median in a 12-run window; Parakeet medium 2.27–2.34 s (in band).
+
 | Model / audio | ggml CPU | fast (start of tuning) | fast (tuned) |
 | --- | --- | --- | --- |
 | Parakeet, 22.3 s | 7.2 s (enc 1.30 s, dec 5.9 s) | 2.79 s (enc 2.56 s, dec 0.20 s) | **2.22 s** (enc 1.98 s, dec 0.14–0.20 s) |

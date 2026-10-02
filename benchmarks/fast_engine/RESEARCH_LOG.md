@@ -334,3 +334,399 @@ Addendum (#325, measurement status): a supervised single-load attempt after
 heal the fault; the final-head A/A remains composition-argued (P1-8's
 twice-verified 69.2–69.7 ms/token + measured-harmless push-constant delta +
 guards off the decode path), which stands as the certified result.
+
+## #317 follow-up loop (2026-10-01, branch autoresearch/pixel-layout-2026-10-01)
+
+Phone reachable again over wifi adb; fresh-master baseline re-established,
+two experiments, both closure-grade. Protocol learnings below cost a reboot
+to acquire and matter for every future phone session on this host.
+
+| # | Hypothesis | Result |
+| --- | --- | --- |
+| P2-1 | Merge the qkv/o/gateup GEMV pipelines (they differ only by NORM/EPI spec constants; ~25 spec switches/token at P1-10's +7 % each) by moving NORM/EPI/DONE to push constants + skipping redundant vkCmdBindPipeline | **REJECTED +16.3 %** (81.25 vs 69.88 ms/token, 3/3 rounds, transcripts identical). The merged kernel itself is slower per shape — isolated micros: down N2048/K6144 +29 %, gateup N12288/K2048 +8 %, lm_head W8 +5 %. **P1-10's switch-cost pricing is closed: on DXT the driver's spec-constant dead-code elimination per specialization is worth far more than the pipeline switches it costs. Keep kernels specialized; do not merge pipelines to save binds.** |
+| P2-2 | The decode recording splits one command buffer per token (`if (s) rc.split()` since the original MOSS WIP); merging to one segment per round removes 15 submit boundaries/round | **NEUTRAL (−0.01 %)**, kept as simplification (62.56 vs 62.57, 16× fewer command-buffer allocations; transcripts identical, 5 fixtures × both models). The intra-round submit boundaries cost nothing — the per-ROUND fence+download cycle is the only host round-trip that matters, and on a healthy phone it is ~0 too (KSTEP 16/32/64 probe: ±1 % on short AND medium; the apparent 9 ms/token "KSTEP win" was boot-to-boot drift — the 68–77 ms/token band across boots still governs). |
+
+Fresh-boot decode under the hardened protocol: **62.5–64 ms/token** (below the
+historical 68–77 band; cool device, screen off, `svc power stayon true`).
+
+### Protocol addenda (this host, wifi adb + WSL2)
+
+- **A locked phone poisons in-context decode measurements**: after a reboot
+  with no unlock (secure keyguard, `deviceLocked=1`), decode reads 104–141
+  ms/token while ISOLATED kernel micros are unaffected (0.670 vs 0.768
+  ms/iter — even faster than the unlocked boot). The stall is a per-ROUND
+  host round-trip (~0.7 s each: submit/fence/64 B download) while the system
+  suspend-cycles; `svc power stayon true` + KSTEP=32 (or one unlock) restores
+  the clean number. Production implication: background transcription on a
+  locked phone pays ~0.7 s per decode round-trip — worth a product-side look
+  (wakelock or fewer round-trips), separate from engine kernels.
+- **Driver degradation after ~8–10 model loads per boot reproduces** as
+  bimodal in-context times (70 → 140 ms/token) with no wedge marker and
+  nominal thermals. Reboot, then measure early; batch transcript gates
+  (one load per model+binary, not per fixture).
+- **wifi-adb shell stalls** under sustained output (bench stderr): every
+  bench invocation must redirect to a device-side file (bounded by a
+  device-side `timeout`) with host-side timeouts on every adb call.
+- adb on this WSL2 host needs a manually spawned server first (mirrored-mode
+  firewall drops unlistened localhost ports, so the client never learns to
+  fork one): see `.auto/adb-env.sh`.
+- **Desktop RADV gate is not runnable on this host** (WSL2 exposes only
+  llvmpipe, which the engine rejects by design; no Vulkan SDK glslc/int-dot
+  either — vendored headers in ~/.local/vulkan-sdk + NDK shader-tools work
+  for builds). P2-2's RADV ≤10 % check must be run elsewhere before merge;
+  it is a pure host-side recording change (dispatch count identical, one
+  segment per round), so the risk is structural, not numerical.
+
+### P2-3/P2-4 (2026-10-01, same loop): the locked-phone stall attributed; engine-side fix rejected as artifact-chasing
+
+Follow-up to the locked-phone protocol note above. Probing for an
+engine-side fix (submit the next decode round before downloading the
+previous state, hiding the round-trip) required knowing whether the ~0.7–2 s
+stall is CPU-side (hideable) or the GPU itself stalling under system
+suspend. Findings:
+
+- With true idle between invocations (`stayon=0`), decode medians were
+  105–131 ms/token (3 fresh processes); **any concurrent shell activity
+  masks the stall** — an earlier probe that sampled GPU frequency every 2 s
+  measured a "clean" 69.2 ms/token run, but the sampling loop itself was
+  holding the system awake. Sampling probes on this phone perturb the state
+  they sample; treat single-run anecdotes accordingly.
+- GPU `cur_freq` reads 1094 MHz under load in every observable state — but
+  per the above, the observation is only valid while something keeps the
+  system awake, so it cannot discriminate the suspend mechanism.
+- Verdict: the stall is **system suspend during GPU work, an idle-entry
+  effect on fresh processes** (continuous activity — `svc power stayon`,
+  an in-use unlocked phone, or an app wakelock — prevents it entirely). A
+  real transcription app holds a wakelock while working, so an engine-side
+  round-trip optimization would tune the engine to a benchmark artifact;
+  **rejected without building it**. Honest measurement conditions:
+  stayon (protocol v2), one unlock after boot, or the app's own wakelock.
+
+### P2-5 (2026-10-01, same loop): second-driver robustness gate for P2-2 via llvmpipe
+
+The desktop RADV ≤10 % gate cannot run on this host (WSL2 exposes only
+llvmpipe, rejected by the engine's device picker by design). As substitute
+evidence for P2-2 (the one change that touches recording/submission
+granularity), the branch binary was run on **Mesa llvmpipe** — a completely
+independent Vulkan implementation — with a throwaway, env-gated patch to
+accept CPU-type devices (reverted after; never committed). MOSS
+short+medium transcribe to **exactly the golden texts** (52.3 s / 139.2 s
+wall at ~7x RTF on CPU-Vulkan, transcripts byte-identical to the phone's
+PowerVR output). Cross-driver, cross-precision identical output strongly
+suggests the recording change carries no driver-dependent hazard; the
+formal RADV performance gate still needs a real AMD run before merge.
+
+### P2-6 (2026-10-01, same loop): encoder/prefill gate numbers for the branch
+
+The issue's "no regression beyond noise in the encoder/prefill GEMMs" gate
+had been satisfied only by construction for P2-2 (record_decode is the only
+touched function). Explicit paired numbers, one window, medians of 3
+in-process runs, KSTEP=32 both sides:
+
+| phase | base | cand | delta |
+| --- | --- | --- | --- |
+| MOSS short enc+prefill | 3080.9 ms | 3062.9 ms | −0.6 % (noise) |
+| Parakeet medium wall (enc ≈ 90 %) | 2342.1 ms | 2267.1 ms | −3.2 % (cand ran first, i.e. against the documented +3–8 % warm-order bias) |
+
+No regression on either model; Parakeet sits in the historical 2.2–2.4 s
+tuned band. With this, every #317 acceptance gate runnable on this host
+carries explicit branch-state numbers; the remaining two (real-AMD RADV
+perf, refreshed coulomb energy) are environment-blocked as documented.
+
+### P2-7 (2026-10-01): the third #325 wedge — full causal chain recorded
+
+At 09:15 the phone's GPU driver wedged during an energy window on a heavily
+spent boot (the whole day's session; this boot had already shown the bimodal
+101–141 ms/token degradation band): `vkWaitForFences` VkResult 2, a 120 s
+hang. The wedge marker then correctly refused every subsequent fast-engine
+process for 15 minutes, and the two "10/12 runs" energy-window truncations
+are now attributed: the benches were killed by device-side timeouts at
+~25 s/run while the driver limped toward the hang. Reconstructed chain:
+sustained benchmarking across many boots → degradation (bimodal times) →
+fence-timeout wedge → marker + limping/killed processes. The anti-retry
+guard worked as designed; the session's phone work was stopped per the
+Pixel-safety rule (the one protocol violation — rebooting into the marker
+window under the earlier "degradation" misdiagnosis — failed safe because
+of that guard). Energy fast/idle points from the brief healthy window
+(27500 µAh/76 s fast, 7500 µAh/82 s idle, 12 runs, stayon) are recorded
+here for the next attempt; the full triple needs a rested phone off its
+charging pad.
+
+### P2-8 (2026-10-01): the certified 2.42 mWh was likely measured in the stall regime — method correction for the rerun
+
+The one healthy energy window of this session (fast 27500 µAh/76 s, idle
+7500 µAh/82 s; stayon held, discharging, no stalls) is internally consistent
+and physically plausible, and it disagrees with the #317 certification:
+
+| window | average power | note |
+| --- | --- | --- |
+| this session, fast engine working | **1.40 W** | 12 runs + load, stayon, no stalls |
+| this session, idle (awake) | 0.35 W | stayon idle rate |
+| certified fast window (302 s) | **0.51 W** | barely above its own 0.42 W dozing idle — not plausible for active GPU work |
+| certified ggml window (113 s) | 2.74 W | plausible for 6 CPU threads |
+
+Attribution: the certified fast window pre-dates the awake-hold protocol, so
+its 302 s (for ~100 s of load) were dominated by the locked-phone suspend
+stalls characterized in P2-3/P2-4 — the window's average collapsed toward
+idle and the idle-subtracted net (2.42 mWh/transcription) is very likely an
+**underestimate**. The honest expectation from this session's partial data:
+fast ≈ 5.5–6.6 mWh per MOSS-short transcription, fast:ggml ratio ≈ 3.3–4×
+(the ggml figure, 21.9 mWh, is measured in a regime where stalls cannot hide
+work and stands). Caveats on my side too: one window, 2500 µAh gauge quanta
+(±9 % fast, ±33 % on the short idle point), no ggml arm (truncated), and
+load-amortization spread (5.49–6.63). Rerun protocol for the rested phone:
+RUNS=24 (fast window ≈ 22 quanta, ±2 %), idle control ≈ 550 s (±5 %), ggml
+window ≈ 70 s, verify counter movement first, stayon held, discharging.
+
+### P2-9 (2026-10-01): default-KSTEP gap in the candidate validation, closed
+
+Audit finding: every candidate-binary validation this session ran at
+KSTEP=32 (the protocol-v2 pin in both measure.sh and checks.sh) — the
+shipped **default (16)** path of the changed `record_decode` had never been
+exercised by the candidate. Closed on the second driver (llvmpipe, throwaway
+CPUVK acceptance re-applied and reverted as in P2-5): the branch binary
+transcribes MOSS short to the **exact golden at KSTEP 8, 16 (default), and
+64** — the one-command-buffer-per-round recording is correct across the
+round-granularity range, not just the measured value. A phone-side
+default-KSTEP transcript check joins the rested-phone queue as a formality.
+
+### P2-10 (2026-10-01): wedge circumvention L1 — cooperative stop so a killed process never abandons its VkDevice
+
+Root-cause framing for the wedges (#325, user-mandated work): the fence
+timeout is a firmware-level stall, and the strongest correlate in today's
+causal chain (P2-7) is processes dying with a **live ~1.6 GB VkDevice** —
+neither SIGKILL nor default SIGTERM runs C++ destructors, so the driver must
+asynchronously reap GPU state; today's wedge followed several transport-hung
+benches killed within the preceding 90 minutes, and the historical
+"~8 loads per boot" degradation was observed under harnesses that also
+kill. Landed (engine + bench + harness, validated on llvmpipe):
+
+- `starling_ggml_request_stop/stop_requested/clear_stop` (public C API):
+  cooperative stop flag.
+- `starling-bench` installs SIGTERM/SIGINT handlers that set the flag; the
+  wav and run loops check it; the MOSS decode round loop checks it between
+  rounds and returns the valid prefix — the process exits **through normal
+  destructors**, destroying the VkDevice (new observability line:
+  `[fast] vk teardown: device destroyed cleanly`).
+- `phone_common.sh kill_benches` (measurement-stack hygiene, maintainer
+  mandate): TERM first, wait ≤10 s for clean teardown, KILL only as
+  fallback; the `.auto/*` session scripts match.
+
+Validation (desktop, llvmpipe): normal runs still golden with the teardown
+line present; TERM mid-transcription exits cleanly after finishing the
+in-flight unit (~29 s on CPU-VK; ~1 s per decode round on the phone) with
+both teardown lines. Next (staged): the H1 (killed-death) vs H2 (clean-load
+leak) reproduction study on a dedicated phone day, and the degradation
+watchdog if the study shows pre-wedge times are actionable.
+
+### P2-11 (2026-10-01): wedge circumvention L2 — degradation watchdog
+
+The wedge is preceded by a degradation band (bimodal round times, P2-7);
+today that state fed the driver until a 120 s fence hang. L2 bounds each
+decode-round fence wait at ~6× the running round median (floor 20 s,
+`STARLING_FAST_STALL_MULT`, 0 disables; absolute override
+`STARLING_FAST_STALL_BUDGET_MS` for validation): a stalling driver now
+fails fast with the same wedge-marker semantics (retry-storm guard) and —
+validated on llvmpipe — the process still exits through full destructors
+(`[fast] vk teardown: device destroyed cleanly` on the abort path too).
+Normal runs are untouched (golden, watchdog silent, no marker). With L1
+(cooperative stop) this closes both app-side failure modes around the
+wedge: dying cleanly and dying early. The remaining root-cause work is the
+H1/H2 reproduction study (phone-day) and, if H2 (vendor bug) confirms, the
+plain-Vulkan reproducer bug report.
+
+### P2-12 (2026-10-01, attended session per maintainer): the wedge root cause identified — unclean VkDevice death; clean teardown is CURATIVE
+
+Maintainer directive: wedges are data, attended sessions keep working (rule 3
+v3). Fresh-boot death-mode study on the Pixel 10 Pro (baseline 62.93 ms/token,
+healthy band):
+
+| event | next clean probe (ms/token) |
+| --- | --- |
+| **1× SIGKILL of a live bench (unclean VkDevice death)** | **144.9, then 138.6 — immediate, persistent degradation** |
+| 1× cooperative TERM death (L1: clean exit, device destroyed) on the damaged boot | **62.99 — RECOVERED to baseline** |
+| 5 more SIGKILL cycles | no hard wedge; probes bounce 76–146 (limping band, no marker) |
+| one clean natural-exit load after the multi-kill state | healthy again by its 2nd run (73.2), full teardown |
+
+**Conclusions (H1 confirmed, mechanism refined):**
+1. **The fast-degradation mechanism is unclean VkDevice death**: one SIGKILL
+   of a process holding a live ~1.6 GB VkDevice immediately and persistently
+   degrades the driver (2.3× decode). Every historical "degradation after ~8
+   loads" observation happened under harnesses that kill.
+2. **A clean device teardown REPAIRS the damage** — L1 (cooperative stop) is
+   curative, not just preventive. Recovery without rebooting: after any
+   unclean death, one clean full load restores baseline throughput.
+3. **Kill-count alone does not produce the hard wedge** (6 kills: limping,
+   no fence timeout) — the 09:15 wedge needed a confluence (kills during
+   transport hangs + concurrent system load). The wedge remains the tail of
+   this distribution; the L2 watchdog bounds it either way.
+4. Product implication: the app must never let the engine be SIGKILLed with
+   a live device (cooperative stop on any termination), and a recovery load
+   after a dirty death is the no-reboot remedy.
+
+On-device L1 validation also landed this session: TERM mid-run →
+`[stop] SIGTERM/SIGINT: exiting cleanly` + `[fast] vk teardown: device
+destroyed cleanly` on the phone; healthy runs at the 62.5–64 plateau with
+the watchdog silent. Forensics harness: `.auto/wedge-forensics.sh` (logcat,
+thermals, GPU devfreq, marker — timestamped). wedge-study.sh exited early
+after the decisive probe (script bug, noted for the next pass; the manual
+sequence completed the study).
+
+### P2-13 (2026-10-01, attended): kill storms alone do NOT hard-wedge; the cure is robust; the wedge needs its confluence
+
+Follow-up to P2-12 on the same attended session. 12 kills landing at varied
+phases (including exactly mid-decode) alternated probe states 118/63/138/63
+— because **every clean probe load is itself a cure cycle**; then 8
+back-to-back kills with NO clean load between (~20 kills total on the boot,
+no marker at any point), followed by one clean load: **healthy immediately
+(63.4 / 70.3 / 62.8 ms/token, clean teardown)**. Refined model:
+
+- Unclean VkDevice death CAN immediately+persistently degrade a fresh boot
+  (P2-12) — but after the first clean-teardown cure, this boot absorbed
+  kill storms without lasting damage. Persistence is conditional; the exact
+  condition (fresh-boot first-death? boot history? state at death?) is open.
+- **The hard wedge was never reproduced deliberately** (~20 kills, varied
+  phases, no clean loads between — no fence timeout, no marker). The 09:15
+  wedge required its confluence: kills of transport-hung processes under
+  concurrent system load (load-average 6-9, post-boot maintenance) after a
+  morning of heavy benchmarking. The L2 watchdog bounds that tail; the
+  recovery load (one clean lifecycle) is the standing remedy for every
+  degradation state observed.
+- Open for the unattended matrix (fixed wedge-study.sh): death-phase sweep
+  (load-upload / mel / prefill / decode), concurrent-load arm, thermal-soak
+  arm — mapping exactly when damage persists and when it wedges.
+
+Forensics of the post-storm healthy state captured (wedge-post-storm-*.txt,
+session dir). All artifacts: 62.9-63.4 ms/token baselines throughout, L1
+teardown lines on every clean exit, zero markers.
+
+### P2-14 (2026-10-01, attended): death-phase map completed — the damage is rare, not phase-deterministic
+
+Fresh boot (baseline 64.51), first death mid-UPLOAD (kill at ~4 s, partial
+1.6 GB mapping): probes 64.40 / 63.76 — **no damage**. Second death
+mid-WARMUP (kill at ~8 s, GPU computing with full memory resident):
+63.53 / 64.36 — **no damage**. Combined with P2-12/P2-13 (~35 kills today
+across phases and boot histories, zero wedges):
+
+| death condition | damage |
+| --- | --- |
+| fresh boot, first death, mid-transcription (P2-12, n=1) | persistent 2.2× degradation |
+| fresh boot, first death, mid-upload (n=1) | none |
+| any death on a post-cure boot (storms, mid-decode, mid-warmup) | none |
+
+The damaging kill is **rare, not phase-deterministic** — one event in ~30
+kills, with an additional confluence still unidentified (system load at
+death time is the leading remaining suspect; the P2-12 event followed heavy
+morning benchmarking). Practical conclusions for the product stand
+unchanged and strengthened: unclean death is USUALLY harmless but
+occasionally leaves persistent damage; **a clean device lifecycle repairs
+every degradation state observed**; hard wedges are a rare tail (never
+reproduced deliberately), bounded by the L2 watchdog. The remaining
+research (n>1 damage statistics, the exact confluence) belongs to the
+unattended long-run matrix with forensics on every anomaly.
+
+### P2-15 (2026-10-01, attended): the load-confluence cell — benign; attended wedge study closed
+
+Fresh boot (baseline 64.77), four CPU spinners (load 4.2, no GPU
+contention), first death mid-transcription under that load: probes
+67.82 / 67.51 (+4.4 %, mild elevation) decaying to 65.1 after a minute —
+**transient churn, not damage**. The P2-12 confluence recipe
+(first-death + mid-transcription + system load) does NOT reproduce the 2.2×
+degradation at n=1. (Measurement note: the loadkill adb session died at its
+own `pidof sh` kill — the spinner cleanup killed the session shell too; the
+bench kill preceded it, so the cell is valid.)
+
+**Attended study closed with honest statistics**: ~40 deliberate unclean
+deaths today across phases (upload/warmup/transcription/decode), boot
+histories (virgin/post-cure), and load levels — **one damaging event
+(P2-12), zero hard wedges**. The damage trigger is a rare tail whose exact
+condition remains unidentified (remaining suspects: heavier I/O-bound load
+like the 09:15 dexopt churn, thermal state, or genuine 1-in-N rarity).
+Everything actionable is already landed and validated: L1 (cooperative
+stop), L2 (watchdog), the recovery load (cures every degradation state
+observed), and forensics on every anomaly. Mapping the damage trigger to
+n>1 is unattended-matrix work (long runs, forensics per event).
+
+### P2-16 (2026-10-01/02, unattended): the overnight death matrix — 30/30 clean; the day's n≈70 statistics
+
+The unattended matrix (rule 3 v3 posture) ran to completion on the
+charging phone: 30 random-phase SIGKILL cycles (upload/warmup/decode) each
+followed by a clean-load probe — **30/30 probes ok, zero anomalies**
+(range 63.19–66.59 ms/token, running median ~64.4, ±3 %), zero wedge
+markers, forensics never triggered.
+
+Combined with the attended study (P2-12..15), the day's totals over ~70
+deliberate unclean VkDevice deaths across every phase, boot history, and
+load level:
+
+| statistic | value |
+| --- | --- |
+| unclean deaths | ~70 |
+| damaging events | **1** (~1.4 %/death; P2-12, fresh-boot mid-transcription) |
+| damage repaired by one clean lifecycle | **100 %** (every state ever observed) |
+| hard wedges | **0** (never reproduced deliberately) |
+| healthy-band return after cure | every probe, every time |
+
+Conclusions: unclean VkDevice death is *usually* harmless and *rarely*
+(≈1-in-70) leaves persistent damage that a single clean device lifecycle
+repairs; the hard wedge is rarer still (a confluence tail the L2 watchdog
+bounds). The product guidance is complete: cooperative stop everywhere
+(L1), watchdog (L2), recovery load after any dirty death, forensics on
+every anomaly. Remaining unknown (the exact 1-in-70 trigger) needs either
+much larger n or luck; it no longer blocks anything actionable.
+
+### P2-17 (2026-10-02): review fixes — the L2 watchdog was inert; corrections to P2-11–P2-16
+
+PR #379 review found the adaptive watchdog budget **1000× too large**:
+`ms_since()` already returns milliseconds and the budget multiplied by
+1000 again, so a ~1 s round got a ~6000 s budget — looser than the 120 s
+default it was meant to tighten. The P2-11 validation forced an absolute
+budget (`STARLING_FAST_STALL_BUDGET_MS`), which bypasses the arithmetic.
+**Correction:** every "the L2 watchdog bounds it" statement in P2-12–P2-16
+is void; the adaptive watchdog never fired in those sessions and was not
+capable of firing early. Their observations (deaths, cures, 30/30 matrix)
+stand; the watchdog's coverage needs a phone run of its own. Round 0 has
+no history and keeps the 120 s default (a fixed 20 s floor would misfire on
+slow drivers: llvmpipe rounds take ~29 s).
+
+Further fixes in the same pass (validated on llvmpipe with Parakeet;
+no MOSS GGUF on that host):
+- Fence timeout records the wedge marker **before** draining; the drain is
+  a bounded fence wait (10 s grace) instead of the unbounded
+  `vkDeviceWaitIdle`. If the work never finishes the context is marked
+  hung: submits fail fast and teardown skips destruction
+  (`[fast] vk teardown: skipped ...`) instead of hanging. Both paths
+  exercised with a throwaway 1 ms budget probe (not committed): clean
+  teardown when the late work drains, prompt exit when it does not, marker
+  written in both, next process refused.
+- `vk teardown: device destroyed cleanly` now prints after
+  `vkDestroyDevice`, not before the wait.
+- Cooperative stop is checked after the state refresh, so the returned
+  prefix includes the round that just finished; the engine logs the stop.
+- `starling-bench`: one-shot handler (a second TERM/INT kills), single
+  `[stop]` line, stopped runs labelled `[stopped: may be truncated]`.
+  TERM mid-run on llvmpipe: in-flight call finishes, clean teardown.
+- `kill_benches`/`wait_benches`: every adb call host-bounded, wait loops
+  bounded on the device too (no orphaned remote shells), post-KILL wait.
+  adb-stub test: TERM-honouring bench → no KILL; TERM-ignoring → KILL at
+  ~12 s; fully hung adb → returns in bounded time.
+- AUTORESEARCH rule 3 reduced to the standing safety rule; device timings,
+  load budgets and wake/energy conditions moved to the device brief as
+  protocol with their evidence. `svc power stayon` is the
+  plugged-in-only setting, so the P2-8 discharging windows' wake mechanism
+  is unverified.
+
+Review rounds 2–3 (same day, `cce545b`, `6f6bf78`):
+- A wedged context fails fast **in-process** too: submits and staged
+  transfers gate on the wedge, so a timeout that drained still refuses the
+  next transcribe (verified on llvmpipe with a forced 1 ms probe). Teardown
+  skip stays keyed on the never-drained (hung) case only.
+- `starling-bench` stopped by a signal exits **128+signo** (143 for TERM),
+  so a stopped — possibly truncated — run never reads as a full result;
+  normal runs exit 0.
+- `kill_benches` **fails** (warning, non-zero) when a bench survives
+  SIGKILL or adb is unreachable; the phone scripts run under `set -e`, so a
+  session aborts instead of loading 1.6 GB on top of a live bench.
+- Every fence failure (not only timeouts) drains through the bounded 10 s
+  grace; only a lost device still gets `vkDeviceWaitIdle` (finite per spec)
+  and full teardown; work that never finishes marks wedged + hung.

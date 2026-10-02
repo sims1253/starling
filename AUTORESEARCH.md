@@ -49,11 +49,18 @@ region the agent may touch. Everything else lives here.
    stack as a separate issue/PR.
 2. Record the baseline before the first attempt; every claim is relative to
    it.
-3. Pixel safety (#325): if the GPU wedges (hang, spontaneous restart, wedge
-   marker), STOP — never reboot-and-retry into a wedge. Kill stray benches
-   (`phone_common.sh: kill_benches`) before every new measurement, let the
-   phone cool between long runs, and record `dumpsys thermalservice` when
-   numbers drift.
+3. Device safety (#325): on a GPU failure (hang, fence timeout, wedge
+   marker) **capture it** — forensics (`.auto/wedge-forensics.sh` or
+   equivalent: logcat tail, thermals, marker content) plus a
+   `RESEARCH_LOG.md` entry. **Unattended loops stop** device work after a
+   failure; an attended operator may attempt recovery. Either way, measure
+   again only after a **verified recovery**: one healthy load and a fresh
+   baseline that matches the session's earlier numbers. **Terminate
+   cleanly** (`phone_common.sh: kill_benches` — TERM first, KILL only as
+   fallback) and **bound every transport call** (adb) with a host timeout.
+   Device-specific timings, load budgets and wake/energy conditions are
+   measurement protocol, kept with their evidence in
+   `benchmarks/fast_engine/AUTORESEARCH.md` ("Phone measurement protocol").
 4. Failures are data: append every attempt — kept or reverted — to the
    relevant `RESEARCH_LOG.md` with its numbers. "No improvement" is a valid
    result; say so.

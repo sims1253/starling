@@ -102,7 +102,10 @@ struct ParakeetEngine::Impl {
 
 ParakeetEngine::ParakeetEngine() : impl_(new Impl) {}
 ParakeetEngine::~ParakeetEngine() {
-    if (impl_ && impl_->ctx) impl_->ctx->fn().vkDeviceWaitIdle(impl_->ctx->device());
+    // Skipped on a hung GPU: vkDeviceWaitIdle has no timeout (#325); the
+    // runtime then leaks this engine's objects to the driver instead.
+    if (impl_ && impl_->ctx && !impl_->ctx->gpu_hung())
+        impl_->ctx->fn().vkDeviceWaitIdle(impl_->ctx->device());
 }
 
 std::unique_ptr<ParakeetEngine> ParakeetEngine::create(const pk::ParakeetModel& m, std::string& err) {
