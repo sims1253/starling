@@ -1,0 +1,157 @@
+#version 450
+// attn_decode_split.comp — flash-decode variant of attn_decode: the cached
+// key/value range is split into S chunks; one workgroup per (query head,
+// chunk) computes the chunk's scores, its local softmax (max, exp-sum) and a
+// partial value mix. attn_split_combine.comp merges the S partials into the
+// head output. Why: attn_decode runs one 128-thread workgroup per query head
+// (16 WGs on MOSS) — far too little parallelism to hide cache-load latency on
+// an iGPU; the split multiplies the in-flight workgroups by S and cuts each
+// serial accumulation chain by S.
+//
+// Numerics contract (issue #350): per-position score dots, the new-key path
+// and the global max are bit-identical to attn_decode; the exp/sum/value
+// accumulation is chunk-partitioned and rescaled, a ulp-level difference —
+// gated by the exact-transcript contract and the FLEURS WER gate.
+// STARLING_FAST_ATTN_SPLIT selects this kernel (see moss_engine.cpp).
+
+#include "common.glsl"
+
+layout(constant_id = 0) const uint D = 128;      // head dim == workgroup size
+layout(constant_id = 1) const uint MAXPOS = 2048;
+layout(constant_id = 2) const uint SC = 512;     // score slots >= MAXPOS/S
+layout(local_size_x_id = 0) in;
+
+layout(std430, binding = 0) readonly buffer QKV { float qkv[]; };
+layout(std430, binding = 1) buffer KC { uint kc[]; };
+layout(std430, binding = 2) buffer VC { uint vc[]; };
+layout(std430, binding = 3) buffer PA { float pa[]; };   // [H][S][2+D]
+layout(std430, binding = 4) readonly buffer QN { float qn_w[]; };
+layout(std430, binding = 5) readonly buffer KN { float kn_w[]; };
+layout(std430, binding = 6) readonly buffer RT { float rope[]; };   // cos then sin
+layout(std430, binding = 7) readonly buffer ST { uint state[]; };
+
+layout(push_constant) uniform PC {
+    uint H, KVH;
+    uint cache_off;   // element offset of this layer's cache (f16 elements)
+    float eps;
+    float scale;
+    uint S;
+} p;
+
+shared float qs[D];
+shared float ks[D];
+shared float vs[D];
+shared float red[D];
+shared float sc[SC];
+
+float block_sum(float v) {
+    const uint tid = gl_LocalInvocationID.x;
+    red[tid] = v;
+    barrier();
+    for (uint s = D / 2; s > 0; s >>= 1) {
+        if (tid < s) red[tid] += red[tid + s];
+        barrier();
+    }
+    const float r = red[0];
+    barrier();
+    return r;
+}
+float block_max(float v) {
+    const uint tid = gl_LocalInvocationID.x;
+    red[tid] = v;
+    barrier();
+    for (uint s = D / 2; s > 0; s >>= 1) {
+        if (tid < s) red[tid] = max(red[tid], red[tid + s]);
+        barrier();
+    }
+    const float r = red[0];
+    barrier();
+    return r;
+}
+
+// RMSNorm(x)·w then NEOX rotation; x is this thread's element, result for d.
+float norm_rope(float x, const uint d, const bool is_q, uint pos) {
+    const float rs = inversesqrt(block_sum(x * x) / float(D) + p.eps);
+    const float xn = x * rs * (is_q ? qn_w[d] : kn_w[d]);
+    red[d] = xn;
+    barrier();
+    const uint half_d = D / 2;
+    const uint i = d % half_d;
+    const float c = rope[pos * half_d + i], s = rope[MAXPOS * half_d + pos * half_d + i];
+    const float partner = red[d < half_d ? d + half_d : d - half_d];
+    barrier();
+    return d < half_d ? xn * c - partner * s : partner * s + xn * c;
+}
+
+void main() {
+    if (state[2] != 0u) return;
+    const uint d = gl_LocalInvocationID.x;
+    const uint h = gl_WorkGroupID.x;
+    const uint c = gl_WorkGroupID.y;
+    const uint g = h / (p.H / p.KVH);
+    const uint pos = state[0];
+    const uint HD = p.H * D;
+    const uint ob = (h * p.S + c) * (2u + D);
+
+    // Chunk [c0, c1) of the n = pos+1 scores. Empty chunks publish a neutral
+    // partial (combine reads every slot).
+    const uint n = pos + 1u;
+    const uint clen = (n + p.S - 1u) / p.S;
+    const uint c0 = c * clen;
+    const uint c1 = min(c0 + clen, n);
+    if (c0 >= c1) {
+        if (d == 0u) { pa[ob] = -3.0e38; pa[ob + 1u] = 0.0; }
+        pa[ob + 2u + d] = 0.0;
+        return;
+    }
+
+    qs[d] = norm_rope(qkv[h * D + d], d, true, pos);
+    ks[d] = norm_rope(qkv[HD + g * D + d], d, false, pos);
+    vs[d] = qkv[HD + p.KVH * D + g * D + d];
+    barrier();
+
+    const uint base = p.cache_off + g * MAXPOS * D;   // f16 elements
+    // Append the new key/value (chunk 0 of each KV group's first head).
+    if (c == 0u && h % (p.H / p.KVH) == 0u && d < D / 2) {
+        kc[(base + pos * D) / 2 + d] = packHalf2x16(vec2(ks[2 * d], ks[2 * d + 1]));
+        vc[(base + pos * D) / 2 + d] = packHalf2x16(vec2(vs[2 * d], vs[2 * d + 1]));
+    }
+
+    // Scores over this chunk's cached keys; the position == pos element uses
+    // the shared new key (the cache slot is written in this same dispatch).
+    float mx = -3.0e38;
+    for (uint j = c0 + d; j < c1; j += D) {
+        float s = 0.0;
+        if (j < pos) {
+            const uint kb = (base + j * D) / 2;
+            for (uint w = 0; w < D / 2; ++w) {
+                const vec2 kv = unpackHalf2x16(kc[kb + w]);
+                s += qs[2 * w] * kv.x + qs[2 * w + 1] * kv.y;
+            }
+        } else {
+            for (uint w = 0; w < D; ++w) s += qs[w] * ks[w];
+        }
+        s *= p.scale;
+        sc[j - c0] = s;
+        mx = max(mx, s);
+    }
+    mx = block_max(mx);
+    float sum = 0.0;
+    for (uint j = c0 + d; j < c1; j += D) {
+        const float e = exp(sc[j - c0] - mx);
+        sc[j - c0] = e;
+        sum += e;
+    }
+    const float l = block_sum(sum);   // block_sum's barriers publish sc[]
+
+    // Partial value mix over the chunk: thread d owns output dim d.
+    float acc = 0.0;
+    const uint vb = base / 2 + d / 2;
+    const uint hi = d & 1u;
+    for (uint j = c0; j < c1; ++j) {
+        if (j == pos) { acc += sc[j - c0] * vs[d]; continue; }
+        acc += sc[j - c0] * unpackHalf2x16(vc[vb + j * (D / 2)])[hi];
+    }
+    if (d == 0u) { pa[ob] = mx; pa[ob + 1u] = l; }
+    pa[ob + 2u + d] = acc;
+}
