@@ -730,3 +730,182 @@ Review rounds 2–3 (same day, `cce545b`, `6f6bf78`):
 - Every fence failure (not only timeouts) drains through the bounded 10 s
   grace; only a lost device still gets `vkDeviceWaitIdle` (finite per spec)
   and full teardown; work that never finishes marks wedged + hung.
+
+
+## #350 notebook (RADV) loop: MOSS-preview-2B per-device optimization (2026-10-01)
+
+Target: the production notebook path — `STARLING_ENGINE=auto` → fast Vulkan
+MOSS engine on RADV RENOIR (Ryzen 5 PRO 5650U iGPU), artifact
+`moss-transcribe-preview-2b-q4e8-fullimx.gguf` (the desktop catalog's
+`moss-2b-q4e8`). Frozen baseline binary built from `e92bdc04` (campaign
+branch point). Primary metric: whole-transcription wall on
+`tests/fixtures/medium.wav` (22.3 s audio, 89 output tokens), alternating
+A/B, 3 reps × 3 in-process runs, medians. Session tooling: `.auto/measure.sh`
++ `.auto/checks.sh` (exact transcripts short/medium/long) + `.auto/wer_gate.sh`
+(FLEURS-en 100 clips, |Δ| ≤ 0.2). Baseline split: mel ~10 ms, enc+prefill
+~1149 ms, decode ~3419 ms — decode 75 % of wall. Same-binary A/A noise:
+±0.02–0.06 % (the sustained-load thermal state shifts absolute levels by
+3–5 %; paired deltas and cand/base ratios stay valid).
+
+The key asymmetry vs the phone campaign: the app sets no
+`STARLING_FAST_CACHE_DIR`, so RADV never runs the synthetic tuner — it was
+shipping built-in defaults (tile 64,128,4,8; adaptive GEMV rows 8–32), while
+PowerVR had measured pins. This loop closes that gap.
+
+| # | Hypothesis | Result |
+| --- | --- | --- |
+| 1 | A/A noise floor | wall +0.02 % — sub-0.1 % deltas resolvable |
+| 2 | `STARLING_FAST_GEMV_ROWS=16`: big-N decode GEMVs (gateup 12288, lm_head 151936) prefer 16 over the heuristic's 32 | **dec −6.57 %, wall −4.92 %** (cool state); transcripts identical. The shrink rule (small-N qkv/o/down → 8) was already right. |
+| 3 | rows=8 bracket | dec −5.24 % — worse than 16: big-N wants 16, not 8/32. |
+| 4 | rows=32 pin ≡ default | −0.02 % (pin only disables a no-op growth) — confirms default big-N ran 32. |
+| 5 | all-16 (no shrink) via vendor-0x1002 code pin incl. `gemv_min_wgs=0` | dec −2.15 % only — small-N shapes regress at 16; the shrink floor stays. |
+| 6 | **KEEP** vendor 0x1002 pin: rows cap 16, growth off, shrink kept | dec −6.51 %, wall −4.98 % as a default (reproduces run 2 exactly). Commit `39b4b1e7`. |
+| 7 | TILE 32,128,4,8 (PowerVR's) for prefill | prefill +12.9 % — PowerVR's tile is RADV-wrong. |
+| 8 | TILE 128,128,8,8 | prefill +14 % — discard. |
+| 9 | TILE 64,64,4,4 | prefill +18 % — discard; default 64,128,4,8 confirmed RADV-best (later 100,128,4,8 also +17 %). |
+| 10 | KSTEP=32 (halve rounds/fences) | dec −6.66 % ≈ KSTEP=16's −6.51 % (draw): per-round submit/fence overhead negligible on RADV; default 16 stays. |
+| 11 | `STARLING_FAST_W4U=1` (unpackUnorm4x8 W4 GEMV) — isolated micro had said RADV-slower (38→31 GB/s) | **dec −8.35 % stacked** (cool state); transcripts identical; FLEURS 7.92 vs 7.92 (+0.00). Isolated↛context transfer failure №2 (after #28). |
+| 12–14 | W4U default flip verification + same-state isolation | hot state: stacked −5.29/−6.82 % vs rows-only −6.40 % → W4U marginal +0.2…+1.8 pt decode (never negative). **KEEP** commit `99d53e1e`. |
+| 15 | F16=0 (f32 products, PowerVR's preference) | prefill +47.7 % AND transcript mismatch on long (repetition-loop regime flips punctuation/casing) — checks failed. f16 products confirmed for RADV (faster and the established numerics). |
+| 16 | **Flash-decode attention split** (S=4): single-pass attn_decode ran 16 WGs of 128 threads — ~9.6 GB/s effective vs 43 GB/s GEMV rate; split KV into S chunks × per-(head,chunk) partials + combine kernel (ulp-level numerics difference) | **dec −14.42 %, wall −10.70 % stacked** (2886 vs 3373 ms); transcripts identical on all fixtures; FLEURS 7.92 vs 7.92 (+0.00). attn 72.8→39.9 ms/round (incl. 3.0 ms combine). Commit `6fc7d53c`. Decode now ≈ 45 GB/s effective — at the iGPU's practical bandwidth floor; every GEMV 35–41 GB/s. |
+| 17 | ATTN_SPLIT=8 | dec ratio (cand/base) 0.875 vs S=4's 0.856 — slightly worse. |
+| 18 | ATTN_SPLIT=2 | ratio 0.901 — worst. S=4 optimal (curve: 2 < 8 < 4). |
+| 19 | TILE 100,128,4,8 (exact M=300 fit) | prefill +17 % — tile space fully closed. |
+| 20 | Blast radius: parakeet q4_0 fast engine on RADV with all commits | wall −1.30 % (noise-class; ≤10 % guard PASS), transcripts identical. Engine-wide pins safe. |
+
+Terminal accounting (medium.wav, cool state): wall 4573 → ~4045 ms (−11.5 %);
+decode 3419 → 2883 ms of which GEMVs ≈ 92 % at 35–41 GB/s (bandwidth floor
+for this artifact's bytes: linears W4 + embed W8 ≈ 1.16 GB/step) and lm_head
+328 MB/token at 40.7 GB/s. The remaining decode lever is the artifact recipe
+(W4 lm_head would halve lm_head bytes — a #316-class quality question, not an
+engine change). Prefill (1150 ms, 28 %) is compute-bound f16 GEMM at ~40 % of
+RENOIR peak; the tile space is exhausted (5 alternatives all +13–18 %), so
+further prefill gains need shader-ISA-level work (filed below).
+
+Filed for future issues (`.auto/ideas.md`): W4/W8g8 lm_head recipe
+(−3 ms/step potential, quality-gated); prefill GEMM F16MATH issue-efficiency
+work; disk cache of the repacked arena (SFPK) for load time (repack 837–
+1379 ms per load; phone research predicted NVMe/desktop attractive);
+attn score-phase coalescing (attn still 18.7 GB/s inside the split); per-S
+micro-sweep S=6; other-AMD-device validation (pins are vendor-wide but were
+measured on RENOIR only).
+
+### #350 addendum: workload matrix, memory, certification, serve path
+
+| # | What | Result |
+| --- | --- | --- |
+| 21 | short.wav (7.4 s) A/B | wall −7.97 %, dec −11.18 % — no small-T degradation. |
+| 22 | long.wav (~64 s) A/B | wall −15.76 % (11039 vs 13105 ms), dec −22.09 % — the attention-split win SCALES with KV length (latency hiding matters more as pos grows). |
+| 23 | Certification at HEAD (`879d643e`, warm-ish state) | wall −9.44 %, dec −14.01 %; consistent with run 16's cool-state −10.70/−14.42. |
+| 24 | ATTN_SPLIT=6 (same state as 23) | dec −14.56 % (−0.7 % vs S=4), wall draw — not worth a numerics re-gate; S=4 ships. Curve: 2 (0.901) < 8 (0.875) ≈ 6 < 4 (0.856). |
+| 25 | serve_contract_smoke.py over HTTP, baseline-serve (e92bdc04 worktree) vs candidate-serve (HEAD), moss q4e8 | contract_ok=1, transcripts_match=1 (1222/1222 chars, all fixtures, fresh processes) — the desktop-app production path verified. |
+
+Memory posture (issue deliverable): GPU weights 1612 MiB identical on both
+binaries; peak host RSS 3744 vs 3720 MB (candidate not larger; the split
+adds a 66 KB partials buffer). Energy per take: not measurable on this
+device without root (AMD powercap empty — same finding as the #59 notebook
+session). Cold load: repack 837–1379 ms + upload 442–529 ms of every start;
+the disk-cache idea is filed in `.auto/ideas.md`.
+
+Deliverable summary: MOSS notebook (RADV) transcription wall −9.4…−10.7 %
+(medium), −8.0 % (short), −15.8 % (long) at identical transcripts and
+FLEURS-en 7.92 = 7.92; decode is now at the artifact's bandwidth floor.
+| 27 | ATTN_SPLIT=6 on long.wav (same thermal state as run 22) | wall −16.99 % vs S=4's −15.76 % (dec −2.6 % more, 6794 vs 6972 ms) — S=6 is the long-form-better setting; medium primary is a draw (4178.4 vs 4178.5 ms) so S=4 ships. Transcripts identical. |
+
+### #350 addendum 2: GQA-pair fusion refuted (runs 28–29)
+
+| # | Hypothesis | Result |
+| --- | --- | --- |
+| 28 | **GQA-pair fusion** (`attn_decode_split2`): one WG serves both query heads of a KV group (MOSS GQA=2), sharing every cached K/V load — half the KV traffic, two FMA chains per load, bit-exact per head (same thread owns the same positions/dims in the same order) | First build had a read/reuse race in the packed q-norm reduction (caller read `red[0]` then overwrote `red[d]` with no barrier — corrupted norms, 200-token degeneration; fixed with out-params + trailing barrier). Measured: dec −12.46 % vs the committed per-head split's −14.4 % — **~2 pt regression**. Transcripts identical (bit-exactness held). **Mechanism: halving the WG count (64→32) costs more than halving the KV traffic saves — the attention phase is latency-bound, not bandwidth-bound, on this 8-CU iGPU.** |
+| 29 | Fusion + S=8 (restores 64 WGs, keeps shared loads) | dec −13.23 % — recovers part but still trails per-head S=4. Fusion closed in both configs; reverted (per-head split ships). On higher-CU RADV (discrete RDNA) the occupancy/traffic balance may flip — re-derive from this row before retrying. |
+
+CPU-fallback characterization (issue dossier): MOSS q4e8 through the ggml
+CPU engine on this notebook = 12047–12117 ms wall on medium (RTF 0.54) vs
+the fast engine's optimized 4021–4122 ms — the Vulkan path is ~3× faster
+than the fallback, and none of this campaign's changes touch the CPU path
+(kernels.cpp / moss_engine.cpp are fast-engine only).
+
+### #350 addendum 3: BK64 GEMM tiles refuted — prefill tile space closed (run 30)
+
+| # | Hypothesis | Result |
+| --- | --- | --- |
+| 30 | Prefill GEMM is barrier-bound (2 barriers × 64 K-tiles per output tile): 64-deep K tiles (`gemm_*_h64`, f16→f32 flush kept at every 32 k → bit-exact; W4/W8 B-loads generalized to per-32k groups with zero-pad tails; `STARLING_FAST_BK64` knob) halve the barrier rounds | **prefill +13.3 %** (1312.6 vs 1158.2 ms), wall 4294 vs the certified ~4180. Transcripts identical (bit-exact held). **The cost is not barriers: doubling the shared-tile footprint (12→24 KiB for 64×128) costs more in occupancy/latency-hiding than halving barriers saves.** With runs 7–9/19 (smaller/other tiles +13–18 %), the prefill GEMM configuration 64×128×BK32 is now a measured local optimum in both directions; further prefill gains need a fundamentally different kernel strategy (e.g. cooperative-matrix class), not parameter changes. |
+
+Re-verification after revert: decode 2884.5 ms, wall 4020.6 ms — the
+certified state is intact.
+
+### #350 addendum 4: deep-shrink GEMV rows — decode's last measured win (runs 31–34)
+
+| # | Hypothesis | Result |
+| --- | --- | --- |
+| 31 | Small-N decode GEMVs are latency-hiding-limited: o/down (N=2048) ran rows=8 = 8 serial row-dots per thread at 30–35 GB/s (vs lm_head's 40.7 at 9.5k WGs); 4-row workgroups halve the chains and double the WG count (x re-reads stay cached; per-row math unchanged → bit-exact) | **KEEP (`c96ea3dc`)**: AMD pin `gemv_min_wgs` 256→512 + a deep-shrink floor of rows=4 — o/down 8→4 (512 WGs), qkv 16→8; gateup/lm_head unchanged. Wall 4005.7 vs 4541.6 (−11.80 %), dec −15.89 % — ~1.5 pt decode beyond the previous certified stack. Transcripts identical. |
+| 32 | Next shrink step (min_wgs 1024: gateup 16→8, qkv 8→4) continues the trend | Decode +4.3 % (2962 vs 2841 smoke-paired) — over-shrink: per-WG reduction overhead and shorter weight runs overtake the latency-hiding gain. Frontier measured: o/down 4, qkv 8, gateup 16, lm_head 16. |
+| 33 | Workload generality | long: wall −16.83 %, dec −24.39 % (6768.5 ms — the best long decode of the campaign, beating even the S=6 alternative); short: wall −4.80 % (hot-window prefill wobble), dec −10.45 %. Transcripts identical. |
+| 34 | Certification at HEAD | medium wall −9.40 % in a hotter window (cool-state −11.80 %); all gates green. |
+
+Decode GEMV row map now fully measured per shape on RENOIR; with the
+attention split (run 16) the decode stack is at its floor for this artifact.
+
+| 35 | Final-stack blast radius + serve path: parakeet q4_0 with all four keeps (the deep-shrink rows postdate run 20's check); serve rebuilt at final HEAD | parakeet wall −0.59 % (noise; guard PASS), transcripts identical — expected, its decode is CPU avx2 and the GPU GEMV policy barely touches it. HTTP contract_ok=1 on all fixtures at the final serve artifact (candidate-vs-baseline HTTP equality proven at run 25; every change since is bit-exact). |
+
+| 36–37 | S=6 re-measured with the final rows stack: long-form edge persists, medium still a draw | long: wall −19.31 %, dec −26.88 % (6542.1 ms — another −3.3 % decode vs S=4's 6768.5 at matched base); medium: ratio-normalized dec 0.8560 vs 0.8581, wall 0.9054 vs 0.9060 (noise). S=4 ships by the primary-metric rule; **S=6 is a one-WER-run default flip if long-form dictation matters** (env knob `STARLING_FAST_ATTN_SPLIT=6`). |
+
+Final campaign state (37 runs, 8 keeps, HEAD `14366dff`): MOSS notebook wall
+vs the frozen baseline −11.8 % (medium, cool) / −9.4 % (hot windows),
+−19.3 % (long, S=6) to −16.8 % (long, default), −4.8…−8 % (short); decode at
+its measured per-shape floor; FLEURS-en 7.92 = 7.92; HTTP serve contract,
+parakeet blast radius and memory posture all green.
+
+| 38 | Terminal A/A at the shipping state | 0.38 % wall / −0.11 % dec same-binary spread; wall 4022.7/4038.0 matches the certified best. The residual down/qkv/o GEMV gap (~2 ms/step vs the 42 GB/s floor) is deliberately left: closing it would need shape-class decomposition against a 0.9 % noise floor — tuning generic rules toward MOSS's exact shapes is benchmark overfit, not device tuning. |
+
+## #350 notebook loop CLOSED (38 runs, 8 keeps)
+
+Deliverable: MOSS-preview-2B notebook transcription on RADV — wall −11.8 %
+(medium, cool windows; −9.4 % hot), −16.8 % (long) / −19.3 % (long with the
+documented S=6 knob), −4.8…−8 % (short), at identical transcripts
+throughout; FLEURS-en 7.92 = 7.92; HTTP serve contract, parakeet blast
+radius and memory posture green; CPU-fallback path characterized (~3×
+slower, untouched). Kept: AMD GEMV rows pin (`39b4b1e7`), W4U unpack
+(`99d53e1e`), flash-decode attention split (`6fc7d53c`), deep-shrink GEMV
+rows (`c96ea3dc`). Every direction closed by measurement, both wins and
+refusals (GQA fusion, BK64 tiles, 6 tile shapes, F16=0, KSTEP, S variants).
+No auto-merge — commits carry the numbers for human review.
+
+| 39 | Isolated qkv probe: does the run-31 mechanism extend from N=2048 to N=4096? Operand-size-class deep-shrink (N ≤ 8×min_wgs → 2×min_wgs WG target) moved only qkv (8→4 rows) | **Refuted**: dec 2889.6 vs 2841.0 (+1.7 %), wall +1.2 % in a matched window (base 4541.3 vs run 31's 4541.6). At N=4096/rows=8 there are already 512 WGs — latency-hiding is sufficient; 4-row groups only add per-WG reduction overhead. **The per-shape frontier (o/down 4, qkv 8, gateup 16, lm_head 16) is now isolation-verified** — run 32's bundle regression decomposed. |
+
+| 40 | Small-N BN=64 tile class (N ∈ (64, 2048]: enc/llm down-projs and attention out-projs under-occupy at 50–80 WGs; BN=64 doubles workgroups, bit-exact) | **Refuted by decisive smoke**: prefill +8 % (1224/1237 vs the 1130–1150 frontier), decode unchanged (bit-exactness confirmed). Sixth consistent tile measurement: on RENOIR, per-workgroup efficiency (barrier rounds per output, B-slab amortization) beats workgroup-count occupancy gains at every N class. Prefill tile space closed at the per-class level. |
+
+| 42 | End-of-session apparatus control: frozen baseline vs itself | −0.09 % wall / +0.08 % dec. A/A bracket across the campaign: +0.02 % (start) / 0.90 % (hottest window) / −0.09 % (end) — the reference binary never drifted; every relative claim is apparatus-clean. Campaign closed at 39/40 budgeted runs; the last run reserved (no honest hypothesis remains). |
+
+| 43 | Cross-artifact generalization (final budget run): full stack on `q4-fullimx` — a different quantization draw of the same model | wall −10.12 % (4591.3 vs 5108.3), dec −12.96 %, transcripts identical. The pinned policies transfer across artifacts: the tuning is RENOIR-device-level, not fitted to the catalog's q4e8 bytes. **Budget complete at 40/40.** |
+
+## #350 notebook loop FINAL (43 logged measurements, 40 budgeted runs, 8 keeps)
+
+Terminal deliverable: MOSS-preview-2B on RADV — wall −11.6…−11.8 % (medium,
+cool) / −9.4 % (hot), −16.8 % (long; −19.3 % via the documented S=6 knob),
+−4.8…−8 % (short), −10.1 % (q4-fullimx cross-draw); decode −15.9 % (medium)
+to −26.9 % (long). Apparatus bracket: A/A +0.02 % start / 0.90 % hottest /
+−0.09 % end. All gates green: exact transcripts on every fixture and
+artifact, FLEURS-en 7.92 = 7.92 (×2, at each numerics change), HTTP serve
+contract, parakeet ≤10 % guard, memory posture. Every optimization line
+terminates in a gated keep or an isolation-verified refutation. No
+auto-merge; commits `39b4b1e7`…`ff83f45e` carry the numbers for human review.
+
+## #350 handoff-safety closure (post-budget, no experiments)
+
+- **Vendor gate** (`1efe9978`): the attention split had shipped as the
+  default for every vendor — including PowerVR, the Pixel's MOSS path, whose
+  campaign numbers and gates predate it. It now defaults on only for AMD
+  (measured + gated here); `STARLING_FAST_ATTN_SPLIT` opts other devices in,
+  `=0` forces the legacy kernel. RADV behavior verified unchanged (split
+  active, transcripts identical; `=0` restores legacy).
+- **CI-parity tests** (tests-enabled build at HEAD): `fast_weights_test` all
+  passed; `moss_mel_test` and `moss_encoder_test` PASS against the golden
+  fixtures; `moss_llm_test` fails identically on the frozen **baseline**
+  binary (same maxabs 0.8838425) — a pre-existing stale-golden mismatch,
+  exonerating this campaign's changes (which never touch the ggml LLM path).
+  The granite_ctc "failures" are usage errors (need model/fixture args).
+- **Phone follow-up filed**: the Pixel campaign should A/B
+  `STARLING_FAST_ATTN_SPLIT=4` under its own gates — the latency-starvation
+  argument (16 WGs for a whole layer-step) very likely applies to the DXT
+  too; the kernel is now one env var away.
