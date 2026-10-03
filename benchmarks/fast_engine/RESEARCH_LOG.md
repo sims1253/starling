@@ -868,3 +868,19 @@ suspend between rounds) and the night-time, unplugged wedges of #325. The
 app held **no** wake lock at all (the old note in `docs/fast-engine.md`
 was wrong); it now holds a partial wake lock around on-device GPU work.
 
+### P3-2: in-process re-creation is clean when the phone is awake — doze is the suspect
+
+Same binary and command as P3-1, after the marker expired (02:11), phone
+held awake (`input keyevent KEYCODE_WAKEUP` re-sent every ~10 s; still
+unplugged): **3/3 and then 5/5 cycles clean** — every free printed
+`device destroyed cleanly`, loads 1.2–2.6 s, Parakeet medium 2.26–3.17 s
+(in band). With the previous boot's 3/3, that is 11/11 awake in-process
+device re-creations against 1/1 wedged while dozing. In-process
+re-creation is not the trigger on this evidence; screen-off doze/suspend
+during GPU work is (n=1 on the failing side — a deliberate dozing repro is
+the next experiment, and risks a phone restart).
+
+Consequences landed: the app holds a partial wake lock for loads,
+transcriptions and the idle release (device teardown); bench sessions on
+an unplugged phone must keep it awake (see the protocol).
+
