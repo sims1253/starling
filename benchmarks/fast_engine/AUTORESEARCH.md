@@ -92,10 +92,68 @@ status:
   windows in P2-8 had stayon set, but which mechanism kept them awake is
   **unverified**; establish one (and keep idle-control conditions identical
   across arms) before trusting a new energy window.
+- **Never run GPU work on a dozing phone.** A screen-off, unplugged phone
+  dozes; P3-1 wedged there (fence hung with the GPU rail at ~0 mW) while
+  11/11 identical awake runs were clean (P3-2). Plugged in: `svc power
+  stayon true`. Unplugged: keep the screen awake for the run (re-send
+  `input keyevent KEYCODE_WAKEUP` every ~10 s) and check
+  `dumpsys power | grep mWakefulness=` reads `Awake` before each window.
+- **Run `wedge_forensics.sh watch start` at the start of every phone
+  session**, so an incident's minutes are still on the device.
 - **Energy runs** need a discharging battery: verify the charge counter
   moves between two reads before opening a window.
 - **Wifi adb.** Stream bench output to device-side files; the TLS transport
   stalls under sustained shell output.
+
+### GPU failures and phone restarts (#325) — what to do
+
+The root cause of the Pixel's GPU wedges and spontaneous restarts is still
+open. Every incident is a datapoint only if its evidence is captured before
+it rotates away, so this procedure outranks the experiment in progress.
+
+**Recognize it.** Any of: a fence timeout (`vkWaitForFences failed
+(VkResult 2)`), `device lost`, a wedge marker refusing a load, a bench hung
+past its timeout, decode times jumping to the degraded band (~2× the
+session's own median, bimodal), or the phone rebooting on its own (uptime
+reset you did not cause; boot reason not `reboot,shell` /
+`reboot,userrequested`).
+
+**1. Capture, first.**
+- Phone still up: `benchmarks/fast_engine/wedge_forensics.sh event <label>`.
+  The kernel log is a ring buffer — GPU driver lines rotate out within
+  hours — so do this before any retry, recovery load or reboot.
+- Phone restarted: as soon as adb is back,
+  `wedge_forensics.sh post-reboot <label> --bugreport` (the bugreport holds
+  the previous boot's kernel log; the live kernel log is already the new
+  boot's).
+
+**2. Record it** in `RESEARCH_LOG.md`: the forensics directory, the boot
+reason, and the context the forensics cannot see — binary and commit,
+model, `STARLING_FAST_KSTEP`, loads and dirty deaths (SIGKILL/timeouts)
+this boot, uptime, battery level, charging or not, what ran in the minutes
+before. Unknown is fine; write "unknown".
+
+**3. Then** follow rule 3 of the root `AUTORESEARCH.md`: unattended loops
+stop device work; attended sessions may attempt recovery (one clean load
+after idling; reboot as the fallback), and measure again only after a
+healthy load plus a baseline back in band. Never delete a wedge marker to
+get past it — wait out its 15 minutes or reboot.
+
+**What the evidence decides.** Each open hypothesis and the data that
+settles it:
+
+| hypothesis | look for |
+| --- | --- |
+| unclean device death (process killed with a live VkDevice; P2-12) | dirty deaths this boot before the incident; clean `vk teardown` lines on the clean ones |
+| GPU job too long → failed hardware recovery | `pvr`/`rogue`/`HWR`/`lockup` lines in `gpu-lines.txt` before the hang; KSTEP of the run |
+| thermal | thermal status and temperatures in `summary.txt` |
+| low battery / power management (all early wedges at ≤ 44 %) | battery level and charging state |
+| memory pressure | `lowmemorykiller`/`lmkd` kills, `MemAvailable` |
+| driver/firmware | build fingerprint; the boot-time `RGXValidateFWHeaderVersion2: KM and FW version mismatch` line seen on this unit (2026-10) |
+
+A spontaneous restart with a boot reason such as `kernel_panic` or
+`watchdog` plus driver lines before it is the report Imagination/Google
+need: attach the forensics directory and the bugreport.
 
 ## Experiment loop
 

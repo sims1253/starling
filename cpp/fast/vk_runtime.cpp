@@ -3,6 +3,7 @@
 #include "vk_runtime.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <ctime>
@@ -95,19 +96,63 @@ void Buffer::release() {
 // Context
 // ---------------------------------------------------------------------------
 
-Context* Context::get(std::string& err) {
-    static std::mutex mu;
-    static std::unique_ptr<Context> ctx;
-    static bool tried = false;
-    static std::string init_err;
-    std::lock_guard<std::mutex> lk(mu);
-    if (!tried) {
-        tried = true;
-        std::unique_ptr<Context> c(new Context());
-        if (c->init(init_err)) ctx = std::move(c);
+namespace {
+
+// A recorded wedge stays in force this long — in the marker file across
+// processes, and in memory for later contexts of this process.
+constexpr double kWedgeTtlSec = 900.0;
+
+// Leaked on purpose (never destroyed): an engine may be freed during static
+// destruction, after function-local statics would already be gone.
+struct ContextRegistry {
+    std::mutex mu;                       // guards live/hung/unavailable/init_err
+    std::weak_ptr<Context> live;         // the context engines currently share
+    Context* hung = nullptr;             // a hung context: never destroyed
+    bool unavailable = false;            // init failed: no usable device
+    std::string init_err;
+    std::mutex wedge_mu;                 // guards the wedge record (taken after mu)
+    std::string wedge_why;               // last wedge this process observed
+    std::chrono::steady_clock::time_point wedge_at;
+};
+ContextRegistry& registry() {
+    static ContextRegistry* r = new ContextRegistry;
+    return *r;
+}
+
+} // namespace
+
+std::shared_ptr<Context> Context::acquire(std::string& err) {
+    ContextRegistry& reg = registry();
+    std::lock_guard<std::mutex> lk(reg.mu);
+    if (reg.hung) return std::shared_ptr<Context>(reg.hung, [](Context*) {});
+    if (std::shared_ptr<Context> c = reg.live.lock()) return c;
+    if (reg.unavailable) { err = reg.init_err.empty() ? "Vulkan unavailable" : reg.init_err; return nullptr; }
+    std::unique_ptr<Context> fresh(new Context());
+    if (!fresh->init(reg.init_err)) {
+        reg.unavailable = true;
+        err = reg.init_err.empty() ? "Vulkan unavailable" : reg.init_err;
+        return nullptr;
     }
-    if (!ctx) err = init_err.empty() ? "Vulkan unavailable" : init_err;
-    return ctx.get();
+    // A wedge this process observed recently outlives the context that saw
+    // it, even when no marker file could be written.
+    {
+        std::lock_guard<std::mutex> rw(reg.wedge_mu);
+        if (!reg.wedge_why.empty() && !fresh->wedged_ &&
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - reg.wedge_at).count() < kWedgeTtlSec) {
+            std::lock_guard<std::mutex> wk(fresh->wedge_mu_);
+            fresh->wedged_ = true;
+            fresh->wedged_why_ = "fast engine: GPU driver failure earlier in this process (" +
+                                 reg.wedge_why + "); restart the app/device before retrying";
+        }
+    }
+    std::shared_ptr<Context> c(fresh.release(), [](Context* p) {
+        ContextRegistry& r = registry();
+        std::lock_guard<std::mutex> rk(r.mu);
+        if (p->gpu_hung()) { r.hung = p; return; }   // its work never finished
+        delete p;
+    });
+    reg.live = c;
+    return c;
 }
 
 bool Context::init(std::string& err) {
@@ -329,7 +374,7 @@ bool Context::init(std::string& err) {
         wedge_path_ = std::string(d) + "/starling-fast-gpu-wedged";
         struct stat wst;
         if (stat(wedge_path_.c_str(), &wst) == 0 &&
-            std::difftime(std::time(nullptr), wst.st_mtime) < 900.0) {
+            std::difftime(std::time(nullptr), wst.st_mtime) < kWedgeTtlSec) {
             char why[192] = {0};
             if (FILE* f = std::fopen(wedge_path_.c_str(), "r")) {
                 size_t n = std::fread(why, 1, sizeof(why) - 1, f);
@@ -421,14 +466,20 @@ Context::~Context() {
     // was destroyed by US (clean teardown) rather than abandoned to the
     // driver's async reaping — the leading wedge correlate on the Pixel.
     // Printed only once the device is gone, so a teardown that hangs or
-    // dies part-way leaves no false evidence. One line per process (the
-    // Vulkan context is a process-wide singleton shared by the engines).
+    // dies part-way leaves no false evidence. One line per device lifetime:
+    // the device is destroyed when the last engine using it is freed.
     std::fprintf(stderr, "[fast] vk teardown: device destroyed cleanly\n");
     // The loader library stays mapped: other Vulkan users in the process
     // (e.g. ggml's backend) may share it.
 }
 
 void Context::mark_wedged(const std::string& why) {
+    {   // Remembered for later contexts of this process (see acquire()).
+        ContextRegistry& reg = registry();
+        std::lock_guard<std::mutex> rk(reg.wedge_mu);
+        reg.wedge_why = why;
+        reg.wedge_at = std::chrono::steady_clock::now();
+    }
     std::lock_guard<std::mutex> lk(wedge_mu_);
     if (wedged_) return;
     wedged_why_ = why;
