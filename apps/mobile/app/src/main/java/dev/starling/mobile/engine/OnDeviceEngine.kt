@@ -35,11 +35,15 @@ import java.util.concurrent.atomic.AtomicLong
  * cannot fit fails with an explanation instead of the process being killed.
  * [nativeSupport] decides whether this CPU can run the native library at all
  * (see [NativeSupport]); it is checked before the library is first loaded.
+ * [keepAwake] holds the CPU awake (a partial wake lock in the app) around
+ * every use and every free of the model: kernel suspend with GPU work
+ * outstanding wedges the Pixel's GPU driver.
  */
 class OnDeviceEngine(
     private val modelDir: File,
     private val memoryGate: (modelBytes: Long) -> String? = { null },
     private val nativeSupport: () -> String? = NativeSupport::unsupportedReason,
+    private val keepAwake: () -> AutoCloseable = { AutoCloseable {} },
 ) : OnDeviceStreamSession.LiveEngine {
     /** Where in [importModel] a rejection happened; import failures report their stage. */
     enum class ImportStage { OPEN, COPY, VALIDATE, PROMOTE }
@@ -563,7 +567,7 @@ class OnDeviceEngine(
     private inline fun <T> usingLocked(block: () -> T): T {
         useGeneration.incrementAndGet()
         try {
-            return block()
+            return keepAwake().use { block() }
         } finally {
             reportIdleLocked()
         }
@@ -759,7 +763,8 @@ class OnDeviceEngine(
 
     private fun unload() {
         if (handle != 0L) {
-            StarlingNative.free(handle)
+            // Destroys the GPU device with the last engine: awake, like all GPU work.
+            keepAwake().use { StarlingNative.free(handle) }
             handle = 0L
             loadedFile = null
             loadError = null
