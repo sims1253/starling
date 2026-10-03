@@ -827,3 +827,44 @@ still 18.7 GB/s inside the split); the S=6 default flip for long-form;
 validating the AMD pins on other AMD GPUs (measured on RENOIR only); and a
 Pixel A/B of `STARLING_FAST_ATTN_SPLIT=4` under the phone gates — the
 16-workgroup latency argument likely applies to the DXT too.
+
+## #325 prevention work (2026-10-03, branch `fix/325-device-lifetime`)
+
+### P3-1: a wedge on in-process device re-creation — GPU rail ~0 mW while the fence hung
+
+Run: `starling-bench --cycles 3 --runs 2` (Parakeet q4_k_m-shrink16,
+medium.wav, `STARLING_ENGINE=fast`, KSTEP default) — the new refcounted
+context destroys the VkDevice when the engine is freed and creates a fresh
+one on the next load, all in one process. Phone: uptime 15 h (user reboot
+the morning before), battery 49 %, **discharging** (no stay-awake hold is
+possible unplugged), 30 °C skin, ~01:53 at night; the same test had passed
+3/3 cycles on the previous boot.
+
+- Cycle 1: load 2.07 s, runs 2.60 / 2.30 s, `vk teardown: device destroyed
+  cleanly`.
+- Cycle 2: load 3.18 s (slow), first transcribe: fence timeout at the
+  120 s default, drain grace (10 s) expired → context marked hung; the
+  process still exited by itself (cycle 3 refused by the wedge; no stuck
+  process) — the #379 bounded-teardown paths held on real hardware.
+- Forensics (`wedge_forensics.sh event`, `~/starling-forensics/
+  20261003-015557-event-cycles-reload-wedge`): **no kernel log line at all**
+  between 01:41 and the capture — the PowerVR driver reported no hardware
+  recovery, lockup or fault for a 120 s hang. pixel-thermal's per-minute
+  power rails during the hang: **`S2S_VDD_GPU` 0.80 / 0.73 mW** (GPU idle,
+  effectively power-gated) with the CPU rails at 50–67 mW: the GPU was not
+  busy with a long job — the submitted work never completed while the GPU
+  sat idle (lost submission or lost completion). Power state at capture:
+  `mWakefulness=Dozing`, deep-idle `IDLE`, `mStayOn=false`, no suspend
+  blockers held. The main logcat buffer had already rotated past the hang
+  (pixel-thermal floods it in < 1 min) → `wedge_forensics.sh watch start`
+  added: a rotating device-side logcat for the whole session.
+- Boot log of this unit (any boot): `gpu-secure-trusty:
+  RGXValidateFWHeaderVersion2: KM and FW version mismatch (expected: 24.2,
+  found: 25.3)` — recorded for the upstream report; meaning unknown.
+
+Open: in-process re-creation vs. doze/suspend as the trigger (P3-2). The
+GPU-idle signature fits the earlier locked-phone stalls (P2-3/P2-4: system
+suspend between rounds) and the night-time, unplugged wedges of #325. The
+app held **no** wake lock at all (the old note in `docs/fast-engine.md`
+was wrong); it now holds a partial wake lock around on-device GPU work.
+
