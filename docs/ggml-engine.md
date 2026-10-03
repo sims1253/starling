@@ -399,7 +399,9 @@ decoder sits close to the decision boundary on many words); the S1 q4_k_m
 normalizer likewise flips an occasional token. On x86 AVX2 only Q4_0, Q4_K and
 IQ4_NL tensors have repacked kernels; arm64 also repacks Q5_K, Q6_K and Q8_0.
 Repacking adds no persistent memory; the cost is a one-time rewrite on a
-weight's first graph use, repaid within the first request.
+weight's first graph use, repaid within the first request. ggml's per-tensor
+`repack tensor ...` debug lines are filtered out of the log;
+`STARLING_GGML_CPU_REPACK_DEBUG=1` shows them again.
 
 ### Apple Metal
 

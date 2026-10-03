@@ -74,7 +74,10 @@ bool env_enabled() {
 // <name> with <layout>"), and its default logger prints all levels: with
 // repacking on by default that is one stderr line per weight on every model
 // load. Drop exactly those lines and forward everything else to whatever
-// callback was installed before.
+// callback was installed before. STARLING_GGML_CPU_REPACK_DEBUG=1 skips the
+// filter so the per-tensor decisions are visible again. An embedder that calls
+// ggml_log_set after the first attach replaces the filter (ggml has a single
+// global logger); its own callback then sees these lines.
 struct LogChain {
     ggml_log_callback prev = nullptr;
     void* prev_user = nullptr;
@@ -89,6 +92,8 @@ void filtered_log(enum ggml_log_level level, const char* text, void* user) {
 void install_log_filter() {
     static std::once_flag once;
     std::call_once(once, [] {
+        const char* debug = std::getenv("STARLING_GGML_CPU_REPACK_DEBUG");
+        if (debug && std::strcmp(debug, "1") == 0) return;
         static LogChain chain;
         ggml_log_get(&chain.prev, &chain.prev_user);
         ggml_log_set(filtered_log, &chain);
