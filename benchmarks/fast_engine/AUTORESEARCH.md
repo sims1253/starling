@@ -92,6 +92,14 @@ status:
   windows in P2-8 had stayon set, but which mechanism kept them awake is
   **unverified**; establish one (and keep idle-control conditions identical
   across arms) before trusting a new energy window.
+- **Never run GPU work on a dozing phone.** A screen-off, unplugged phone
+  dozes; P3-1 wedged there (fence hung with the GPU rail at ~0 mW) while
+  11/11 identical awake runs were clean (P3-2). Plugged in: `svc power
+  stayon true`. Unplugged: keep the screen awake for the run (re-send
+  `input keyevent KEYCODE_WAKEUP` every ~10 s) and check
+  `dumpsys power | grep mWakefulness=` reads `Awake` before each window.
+- **Run `wedge_forensics.sh watch start` at the start of every phone
+  session**, so an incident's minutes are still on the device.
 - **Energy runs** need a discharging battery: verify the charge counter
   moves between two reads before opening a window.
 - **Wifi adb.** Stream bench output to device-side files; the TLS transport

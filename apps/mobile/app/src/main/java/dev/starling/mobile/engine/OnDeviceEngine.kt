@@ -168,7 +168,8 @@ class OnDeviceEngine(
         idleRelease = null
         if (handle == 0L || idleReleaseMs <= 0) return
         idleRelease = idleScheduler.schedule({
-            synchronized(lock) { if (generation == idleGeneration) releaseLocked() }
+            // Freeing the model tears the GPU device down: awake, like all GPU work.
+            synchronized(lock) { if (generation == idleGeneration) awake { releaseLocked() } }
         }, idleReleaseMs, TimeUnit.MILLISECONDS)
     }
 
