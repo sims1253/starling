@@ -50,12 +50,11 @@ State& state() {
     return *s;
 }
 
+// On for every CPU. Measured on x86 AVX2 (#59: granite encoder -19%,
+// parakeet -23%, MOSS -14%, qwen3 -6% wall, transcripts identical) and long
+// the Android default; arm64 desktops follow the Pixel (#382).
 bool platform_default() {
-#if defined(__ANDROID__)
     return true;
-#else
-    return false;
-#endif
 }
 
 bool env_enabled() {
@@ -69,6 +68,31 @@ bool env_enabled() {
     std::fprintf(stderr, "[starling] STARLING_GGML_CPU_REPACK=%s not understood (use 1/true/on/yes or 0/false/off/no); keeping the default (%s)\n",
                  v, platform_default() ? "on" : "off");
     return platform_default();
+}
+
+// ggml logs every repacked tensor at DEBUG level ("repack: repack tensor
+// <name> with <layout>"), and its default logger prints all levels: with
+// repacking on by default that is one stderr line per weight on every model
+// load. Drop exactly those lines and forward everything else to whatever
+// callback was installed before.
+struct LogChain {
+    ggml_log_callback prev = nullptr;
+    void* prev_user = nullptr;
+};
+
+void filtered_log(enum ggml_log_level level, const char* text, void* user) {
+    if (level == GGML_LOG_LEVEL_DEBUG && text && std::strstr(text, "repack tensor ")) return;
+    const auto* chain = static_cast<const LogChain*>(user);
+    if (chain->prev) chain->prev(level, text, chain->prev_user);
+}
+
+void install_log_filter() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        static LogChain chain;
+        ggml_log_get(&chain.prev, &chain.prev_user);
+        ggml_log_set(filtered_log, &chain);
+    });
 }
 
 // A repacked weight cannot be read back as plain rows. ggml's own
@@ -208,6 +232,7 @@ bool enabled() {
 
 void attach(ggml_backend_buffer* buffer) {
     if (!enabled() || !buffer) return;
+    install_log_filter();
     State& s = state();
     std::lock_guard<std::mutex> lk(s.mu);
     // Idempotent per buffer: a second attach without a detach in between
