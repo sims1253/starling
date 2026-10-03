@@ -827,3 +827,9 @@ driver/firmware code we cannot fix. Prevention is to never let the phone
 suspend with GPU work outstanding: the app's partial wake lock (b340ad8)
 and the bench protocol's awake rule. `doze_repro.sh` is the upstream
 reproducer.
+
+Open: the A arm kept the screen on; the app's guard is a screen-off partial
+wake lock, which blocks kernel suspend but is ignored by Doze for apps that
+are not exempt. Untested whether it prevents the wedge — the next arm is
+screen off + Doze + a held partial wake lock (needs the app, since shell
+cannot take a kernel wake lock on a user build).
