@@ -884,3 +884,43 @@ Consequences landed: the app holds a partial wake lock for loads,
 transcriptions and the idle release (device teardown); bench sessions on
 an unplugged phone must keep it awake (see the protocol).
 
+
+### P3-3: deliberate doze repro — 3/3 dozing trials wedged, 2/2 awake clean
+
+`doze_repro.sh` (02:35–03:22): alternating trials of the P3-1 workload
+(one process, `--cycles 3 --runs 2`, Parakeet q4_k_m-shrink16, medium.wav),
+phone unplugged, battery 47 → 43 %, rotating logcat throughout. D = screen
+off + `dumpsys deviceidle force-idle`, no wake signals; A = Doze lifted,
+screen woken every poll. Planned D A D A D A; stopped after trial 5 on the
+3-wedge rule. Results: `~/starling-forensics/doze-repro-20261003-023500`.
+
+| trial | arm | outcome |
+|---|---|---|
+| 1 | D | wedge on cycle 3's first transcription (2 clean cycles before) |
+| 2 | A | clean, runs 2.33–4.03 s |
+| 3 | D | wedge on cycle 1's first transcription |
+| 4 | A | clean, runs 2.23–2.46 s |
+| 5 | D | cycle 1 run 0 stalled 48.0 s then recovered (the P2-3 suspend-stall pattern); wedge on cycle 2 run 1 |
+
+- Every wedge has the P3-1 signature: `S2S_VDD_GPU` 133–174 mW while
+  transcribing, then 0.6–0.8 mW for the whole 120 s fence wait (GPU idle
+  with work outstanding); no PowerVR kernel line; `mWakefulness=Dozing`,
+  no suspend blockers held. The #379 bounded teardown held each time (no
+  stuck process; marker written; later cycles refused).
+- No restart: device uptime ran on (15:56 → 16:38 h across the wedges; 1 d
+  54 min the next morning), boot reasons unchanged. Three wedges in an hour
+  did not escalate.
+- The wedge point varies (first transcription of a fresh device in 1 and 3,
+  second run on a device in 5): not tied to device re-creation.
+- Deep-idle `mState` read IDLE in trial 2 and ACTIVE in trial 4, both clean:
+  the variable that separates the arms is wakefulness (Dozing vs. Awake —
+  whether the kernel may suspend), not the deviceidle state itself.
+
+Tally with P3-1/P3-2: **dozing 4/4 wedged, awake 0/13** (Fisher exact,
+one-sided p = 1/C(17,4) ≈ 4·10⁻⁴). Trigger confirmed: GPU work submitted
+while the phone is allowed to suspend. The likely mechanism is a suspend/
+resume of the PowerVR stack losing an in-flight job or its completion —
+driver/firmware code we cannot fix. Prevention is to never let the phone
+suspend with GPU work outstanding: the app's partial wake lock (b340ad8)
+and the bench protocol's awake rule. `doze_repro.sh` is the upstream
+reproducer.
