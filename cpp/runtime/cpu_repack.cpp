@@ -57,17 +57,21 @@ bool platform_default() {
     return true;
 }
 
-bool env_enabled() {
-    const char* v = std::getenv("STARLING_GGML_CPU_REPACK");
-    if (!v || !*v) return platform_default();
+bool env_flag(const char* name, bool fallback) {
+    const char* v = std::getenv(name);
+    if (!v || !*v) return fallback;
     std::string value(v);
     for (char& c : value) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     if (value == "1" || value == "true" || value == "on" || value == "yes") return true;
     if (value == "0" || value == "false" || value == "off" || value == "no") return false;
-    // The gate latches on first use; a typo would otherwise be invisible.
-    std::fprintf(stderr, "[starling] STARLING_GGML_CPU_REPACK=%s not understood (use 1/true/on/yes or 0/false/off/no); keeping the default (%s)\n",
-                 v, platform_default() ? "on" : "off");
-    return platform_default();
+    // Both flags latch on first use; a typo would otherwise be invisible.
+    std::fprintf(stderr, "[starling] %s=%s not understood (use 1/true/on/yes or 0/false/off/no); keeping the default (%s)\n",
+                 name, v, fallback ? "on" : "off");
+    return fallback;
+}
+
+bool env_enabled() {
+    return env_flag("STARLING_GGML_CPU_REPACK", platform_default());
 }
 
 // ggml logs every repacked tensor at DEBUG level ("repack: repack tensor
@@ -84,7 +88,7 @@ struct LogChain {
 };
 
 void filtered_log(enum ggml_log_level level, const char* text, void* user) {
-    if (level == GGML_LOG_LEVEL_DEBUG && text && std::strstr(text, "repack tensor ")) return;
+    if (level == GGML_LOG_LEVEL_DEBUG && text && std::strstr(text, "repack: repack tensor ")) return;
     const auto* chain = static_cast<const LogChain*>(user);
     if (chain->prev) chain->prev(level, text, chain->prev_user);
 }
@@ -92,8 +96,7 @@ void filtered_log(enum ggml_log_level level, const char* text, void* user) {
 void install_log_filter() {
     static std::once_flag once;
     std::call_once(once, [] {
-        const char* debug = std::getenv("STARLING_GGML_CPU_REPACK_DEBUG");
-        if (debug && std::strcmp(debug, "1") == 0) return;
+        if (env_flag("STARLING_GGML_CPU_REPACK_DEBUG", false)) return;
         static LogChain chain;
         ggml_log_get(&chain.prev, &chain.prev_user);
         ggml_log_set(filtered_log, &chain);
