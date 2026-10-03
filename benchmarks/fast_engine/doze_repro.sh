@@ -34,13 +34,26 @@ state() { sh_ 15 "dumpsys power | grep -m1 -o 'mWakefulness=[A-Za-z]*'; dumpsys 
 restore() { sh_ 15 "dumpsys deviceidle unforce; input keyevent KEYCODE_WAKEUP" >/dev/null; }
 trap restore EXIT
 
-reachable() { timeout 15 adb shell true >/dev/null 2>&1; }
+# Wifi adb drops while the phone dozes and comes back on a new port: on a
+# failed probe, rediscover the phone over mDNS and reconnect (wireless
+# debugging serials only; a USB serial is left alone).
+reachable() {
+  timeout 15 adb shell true >/dev/null 2>&1 && return 0
+  case "${ANDROID_SERIAL:-}" in *:*|*_adb-tls-connect*) ;; *) return 1 ;; esac
+  local ep
+  ep=$(timeout 20 adb mdns services 2>/dev/null | awk '/_adb-tls-connect/ {print $NF; exit}')
+  [ -n "$ep" ] || return 1
+  timeout 25 adb connect "$ep" >/dev/null 2>&1 || return 1
+  export ANDROID_SERIAL=$ep
+  timeout 15 adb shell true >/dev/null 2>&1
+}
 boot_id() { sh_ 15 "cat /proc/sys/kernel/random/boot_id"; }
 marker_fresh() {   # the engine refuses for 15 min after a wedge
   local m; m=$(sh_ 15 "stat -c %Y $DEV/starling-fast-gpu-wedged 2>/dev/null")
   [ -n "$m" ] && [ $(( $(sh_ 15 'date +%s') - m )) -lt 930 ]
 }
 
+reachable || { echo "phone not reachable" >&2; exit 1; }
 sh_ 15 "dumpsys battery" | grep -qE "(AC|USB|Wireless) powered: true" &&
   { echo "phone is on power: Doze never engages — unplug it first" >&2; exit 1; }
 "$HERE/wedge_forensics.sh" watch start >/dev/null
@@ -49,7 +62,8 @@ boot=$(boot_id)
 wedges=0 n=0
 for arm in $arms; do
   n=$((n + 1))
-  while marker_fresh; do sleep 30; done
+  until reachable; do sleep 20; done
+  while marker_fresh; do sleep 30; reachable >/dev/null; done
   sh_ 15 "pidof starling-bench >/dev/null && echo busy" | grep -q busy && { log "trial $n: a bench is still running — stop"; break; }
   if [ "$arm" = D ]; then
     sh_ 15 "input keyevent KEYCODE_SLEEP" >/dev/null; sleep 5
