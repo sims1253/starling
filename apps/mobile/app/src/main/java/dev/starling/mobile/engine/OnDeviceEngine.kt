@@ -40,12 +40,15 @@ import java.util.concurrent.TimeUnit
  * cannot fit fails with an explanation instead of the process being killed.
  * [nativeSupport] decides whether this CPU can run the native library at all
  * (see [NativeSupport]); it is checked before the library is first loaded.
+ * [keepAwake] runs a block of GPU work (load, transcription) with the system
+ * held awake — a wake lock in the app (#325).
  */
 class OnDeviceEngine(
     private val modelDir: File,
     private val memoryGate: (modelBytes: Long) -> String? = { null },
     private val nativeSupport: () -> String? = NativeSupport::unsupportedReason,
     private val idleReleaseMs: Long = IDLE_RELEASE_MS,
+    private val keepAwake: (() -> Unit) -> Unit = { it() },
 ) : OnDeviceStreamSession.LiveEngine {
     /** Where in [importModel] a rejection happened; import failures report their stage. */
     enum class ImportStage { OPEN, COPY, VALIDATE, PROMOTE }
@@ -504,14 +507,21 @@ class OnDeviceEngine(
 
     /** Loads the model ahead of a live session; null when ready. Blocking. */
     override fun prepare(): String? = synchronized(lock) {
-        ensureLoadedLocked().also { scheduleIdleReleaseLocked() }
+        awake { ensureLoadedLocked() }.also { scheduleIdleReleaseLocked() }
+    }
+
+    /** Runs [work] under [keepAwake] and returns its result. */
+    private fun <T> awake(work: () -> T): T {
+        var result: Result<T>? = null
+        keepAwake { result = runCatching(work) }
+        return result!!.getOrThrow()
     }
 
     /** One live-stream window of 16 kHz mono samples. Blocking. */
     override fun transcribeWindow(samples: FloatArray): OnDeviceStreamSession.WindowResult = synchronized(lock) {
         try {
-            ensureLoadedLocked()?.let { return OnDeviceStreamSession.WindowResult.Failed(it) }
-            val text = StarlingNative.transcribe(handle, samples, ChunkStreamer.SAMPLE_RATE)
+            awake { ensureLoadedLocked() }?.let { return OnDeviceStreamSession.WindowResult.Failed(it) }
+            val text = awake { StarlingNative.transcribe(handle, samples, ChunkStreamer.SAMPLE_RATE) }
             if (text == null) {
                 val error = StarlingNative.lastError(handle)
                 // A failed GPU refuses the rest of this session; the release
@@ -566,11 +576,11 @@ class OnDeviceEngine(
      */
     fun transcribe(audioFile: File): InferenceResult = synchronized(lock) {
         try {
-            val first = transcribeLocked(audioFile)
+            val first = awake { transcribeLocked(audioFile) }
             if (first !is GpuFailed) return first.result
             Log.w(TAG, "GPU failure; reloading the model (CPU fallback) and retrying once: ${first.error}")
             unload()
-            transcribeLocked(audioFile).result
+            awake { transcribeLocked(audioFile) }.result
         } finally {
             scheduleIdleReleaseLocked()
         }

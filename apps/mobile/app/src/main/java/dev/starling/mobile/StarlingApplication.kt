@@ -4,6 +4,7 @@ import android.app.ActivityManager
 import android.app.Application
 import android.content.ComponentCallbacks2
 import android.content.Context
+import android.os.PowerManager
 import dev.starling.mobile.engine.OnDeviceBackend
 import dev.starling.mobile.engine.OnDeviceEngine
 import dev.starling.mobile.network.BackendSettings
@@ -35,7 +36,11 @@ class StarlingApplication : Application() {
         super.onCreate()
         recordings = RecordingStore(this)
         backendSettings = BackendSettings(this)
-        onDeviceEngine = OnDeviceEngine(File(filesDir, "models"), memoryGate = ::memoryGate)
+        onDeviceEngine = OnDeviceEngine(
+            File(filesDir, "models"),
+            memoryGate = ::memoryGate,
+            keepAwake = partialWakeLock(),
+        )
         modelDownloads = ModelDownloadController(onDeviceEngine)
         transcription = TranscriptionCoordinator(
             recordings,
@@ -94,7 +99,32 @@ class StarlingApplication : Application() {
     private companion object {
         /** Activations and graph buffers on top of the weights. */
         const val MODEL_WORKING_SET_BYTES = 128L * 1024 * 1024
+
+        /** Upper bound on one wake-lock hold: a long recording's chunked pass, with margin. */
+        const val WAKE_LOCK_TIMEOUT_MS = 10L * 60 * 1000
     }
+
+    /**
+     * A partial wake lock for on-device GPU work (#325): with the screen off
+     * the system may suspend or doze between GPU submissions, and the Pixel's
+     * driver has been seen to lose work in that state (the fence never
+     * signals while the GPU rail reads ~0 mW). Reference-counted, so nested
+     * holds are fine; the timeout only guards against a leaked hold.
+     */
+    private fun partialWakeLock(): (() -> Unit) -> Unit {
+        val lock = getSystemService(PowerManager::class.java)
+            .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "starling:on-device-transcription")
+            .apply { setReferenceCounted(true) }
+        return { work ->
+            lock.acquire(WAKE_LOCK_TIMEOUT_MS)
+            try {
+                work()
+            } finally {
+                if (lock.isHeld) lock.release()
+            }
+        }
+    }
+
 }
 
 fun Context.starlingApplication(): StarlingApplication =
