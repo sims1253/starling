@@ -10,6 +10,10 @@
 //      computing garbage.
 //   4. detach/attach (loader release + re-realize) keeps repacked weights
 //      working; forget drops the bookkeeping.
+//   5. ggml's per-tensor repack DEBUG lines (they name the weight) never
+//      reach a logger installed before the first attach, so a ggml wording
+//      change that slips past the filter fails here. With
+//      STARLING_GGML_CPU_REPACK_DEBUG=1 they must arrive instead.
 //
 // Whether a type repacks depends on the CPU's kernels (x86 AVX2: q4_0,
 // q4_K, iq4_nl; arm64 dotprod/i8mm: q4_0, q4_K, q5_K, q6_K, q8_0,
@@ -42,6 +46,17 @@ namespace repack = starling::ggml::cpu_repack;
 namespace {
 
 int g_failures = 0;
+int g_repacked_types = 0;
+std::vector<std::string> g_debug_lines;
+
+void capture_log(enum ggml_log_level level, const char* text, void*) {
+    if (!text) return;
+    if (level == GGML_LOG_LEVEL_DEBUG) {
+        g_debug_lines.emplace_back(text);
+    } else {
+        std::fputs(text, stderr);
+    }
+}
 
 void check(bool ok, const std::string& what) {
     std::printf("%s %s\n", ok ? "PASS" : "FAIL", what.c_str());
@@ -186,6 +201,7 @@ void test_type(ggml_backend_t backend, ggml_type type) {
     const bool repacked = repack::stats().tensors > before;
     const auto got_single = mul_mat(backend, w.w, x_single, K, 1);
 
+    if (repacked) ++g_repacked_types;
     std::printf("  %s: %s\n", tag.c_str(), repacked ? "repacked" : "no repacked kernel on this CPU (plain path)");
     check(max_rel_diff(ref_batch, got_batch) < 2e-3, tag + " GEMM matches the plain layout");
     check(max_rel_diff(ref_single, got_single) < 2e-3, tag + " GEMV matches the plain layout");
@@ -290,6 +306,8 @@ int main() {
     setenv("STARLING_GGML_CPU_REPACK", "1", 1);
 #endif
     check(repack::enabled(), "STARLING_GGML_CPU_REPACK=1 enables repacking");
+    // A host logger installed before the first attach; the filter chains to it.
+    ggml_log_set(capture_log, nullptr);
     ggml_backend_t backend = ggml_backend_cpu_init();
     if (!backend) {
         std::printf("FAIL ggml_backend_cpu_init returned null\n");
@@ -306,6 +324,18 @@ int main() {
         ++g_failures;
     }
     check(repack::stats().tensors == 0 && repack::stats().bytes == 0, "forget() drops all bookkeeping");
+    if (g_repacked_types > 0) {
+        int per_tensor = 0;
+        for (const std::string& line : g_debug_lines) {
+            if (line.find(" w_") != std::string::npos) ++per_tensor;
+        }
+        const char* debug = std::getenv("STARLING_GGML_CPU_REPACK_DEBUG");
+        if (debug && std::strcmp(debug, "1") == 0) {
+            check(per_tensor > 0, "STARLING_GGML_CPU_REPACK_DEBUG=1 keeps ggml's per-tensor repack lines");
+        } else {
+            check(per_tensor == 0, "ggml's per-tensor repack lines are filtered out of the log");
+        }
+    }
     ggml_backend_free(backend);
     std::printf("%s: %d failure(s)\n", g_failures ? "FAILED" : "OK", g_failures);
     return g_failures ? 1 : 0;
