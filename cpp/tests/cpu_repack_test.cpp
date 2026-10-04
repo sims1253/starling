@@ -28,6 +28,7 @@
 #include "ggml-cpu.h"
 #include "ggml.h"
 
+#include <cctype>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -329,12 +330,16 @@ int main() {
         for (const std::string& line : g_debug_lines) {
             if (line.find(" w_") != std::string::npos) ++per_tensor;
         }
-        const char* debug = std::getenv("STARLING_GGML_CPU_REPACK_DEBUG");
-        if (debug && std::strcmp(debug, "1") == 0) {
+        // Same truthy set as the runtime's env_flag.
+        std::string debug = std::getenv("STARLING_GGML_CPU_REPACK_DEBUG") ? std::getenv("STARLING_GGML_CPU_REPACK_DEBUG") : "";
+        for (char& c : debug) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (debug == "1" || debug == "true" || debug == "on" || debug == "yes") {
             check(per_tensor > 0, "STARLING_GGML_CPU_REPACK_DEBUG=1 keeps ggml's per-tensor repack lines");
         } else {
             check(per_tensor == 0, "ggml's per-tensor repack lines are filtered out of the log");
         }
+    } else {
+        std::printf("SKIP log filter checks: nothing repacked on this CPU\n");
     }
     ggml_backend_free(backend);
     std::printf("%s: %d failure(s)\n", g_failures ? "FAILED" : "OK", g_failures);

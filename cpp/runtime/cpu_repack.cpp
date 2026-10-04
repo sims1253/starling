@@ -64,7 +64,8 @@ bool env_flag(const char* name, bool fallback) {
     for (char& c : value) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     if (value == "1" || value == "true" || value == "on" || value == "yes") return true;
     if (value == "0" || value == "false" || value == "off" || value == "no") return false;
-    // Both flags latch on first use; a typo would otherwise be invisible.
+    // Both callers latch (enabled() caches, the log filter installs once),
+    // so a typo would otherwise be invisible.
     std::fprintf(stderr, "[starling] %s=%s not understood (use 1/true/on/yes or 0/false/off/no); keeping the default (%s)\n",
                  name, v, fallback ? "on" : "off");
     return fallback;
