@@ -49,9 +49,13 @@ counter() {  # µAh; exits on a failed read
 
 echo "== environment (raw points and logs: $OUT) =="
 adb shell "dumpsys battery | grep -E 'status|level|Charge counter' | head -3; dumpsys thermalservice | grep -m1 Severity" || true
-trap 'kill_benches || true' EXIT   # an abort must not leave a bench running on the phone
+trap 'kill_benches || true; wake_release || true' EXIT   # an abort must not leave a bench running on the phone
 on_battery
 kill_benches
+# Screen off and discharging is the #325 wedge setup unless the phone is held
+# out of suspend; held for every window, idle control included, so the
+# subtracted baseline carries the same wake state.
+wake_hold
 wait_benches
 
 bench() {  # bench <engine>
@@ -68,6 +72,7 @@ measure() {
   shift
   screen_off
   on_battery
+  wake_held || { echo "ERROR: the wake lock was lost before the $label window" >&2; exit 1; }
   t0=$(date +%s)
   c0=$(counter)
   "$@" > "$OUT/energy_$label.log" 2>&1 || rc=$?

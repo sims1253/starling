@@ -5,7 +5,9 @@
 #
 # Alternates trials of the same workload with the phone in deep Doze (D:
 # screen off + `dumpsys deviceidle force-idle`, no wake signals) and held
-# awake (A: Doze lifted, screen woken every poll). Each trial is one bench
+# awake (A: Doze lifted, screen woken every poll), or dozing under the
+# benches' shell wake lock (W: as D, plus phone_common.sh `wake_hold`; does
+# the lock alone prevent the wedge?). Each trial is one bench
 # process: load / run / free the model 3 times (`--cycles 3 --runs 2`).
 # After a wedge it captures forensics (wedge_forensics.sh event) and waits
 # out the 15-minute wedge marker before the next trial. Stops after 3
@@ -24,6 +26,7 @@ DEV=/data/local/tmp/starling
 GGUF=${GGUF:-parakeet-tdt-0.6b-v3-q4_k_m-shrink16.gguf}
 WAV=${WAV:-medium.wav}
 HERE=$(cd "$(dirname "$0")" && pwd)
+. "$HERE/phone_common.sh"
 OUT=${STARLING_FORENSICS_DIR:-$HOME/starling-forensics}/doze-repro-$(date +%Y%m%d-%H%M%S)
 mkdir -p "$OUT"
 export STARLING_FORENSICS_DIR=$OUT
@@ -31,7 +34,7 @@ export STARLING_FORENSICS_DIR=$OUT
 sh_() { timeout "$1" adb shell "$2" 2>/dev/null | tr -d '\r'; }
 log() { echo "$(date +%H:%M:%S) $*" | tee -a "$OUT/trials.txt"; }
 state() { sh_ 15 "dumpsys power | grep -m1 -o 'mWakefulness=[A-Za-z]*'; dumpsys deviceidle | grep -m1 -o 'mState=[A-Z_]*'; dumpsys battery | grep -E '^  (level|USB powered|AC powered):' | tr -d ' ' | tr '\n' ' '" | tr '\n' ' '; }
-restore() { sh_ 15 "dumpsys deviceidle unforce; input keyevent KEYCODE_WAKEUP" >/dev/null; }
+restore() { wake_release || true; sh_ 15 "dumpsys deviceidle unforce; input keyevent KEYCODE_WAKEUP" >/dev/null; }
 trap restore EXIT
 
 # Wifi adb drops while the phone dozes and comes back on a new port: on a
@@ -65,7 +68,11 @@ for arm in $arms; do
   until reachable; do sleep 20; done
   while marker_fresh; do sleep 30; reachable >/dev/null; done
   sh_ 15 "pidof starling-bench >/dev/null && echo busy" | grep -q busy && { log "trial $n: a bench is still running — stop"; break; }
-  if [ "$arm" = D ]; then
+  wake_release || true
+  if [ "$arm" = W ]; then
+    wake_hold 1800 || { log "trial $n [W]: could not take the wake lock — stop"; break; }
+  fi
+  if [ "$arm" = D ] || [ "$arm" = W ]; then
     sh_ 15 "input keyevent KEYCODE_SLEEP" >/dev/null; sleep 5
     sh_ 15 "dumpsys deviceidle force-idle" >/dev/null; sleep 5
   else
@@ -87,6 +94,12 @@ for arm in $arms; do
     [ $(( $(date +%s) - t0 )) -gt 3600 ] && { res="host gave up after 1 h"; break; }
     sleep 10
   done
+  if [ "$arm" = W ]; then
+    wake_held && res="$res
+wakelock=held-at-end" || res="$res
+wakelock=LOST"
+    wake_release || true
+  fi
   echo "$res" > "$OUT/trial-$n-$arm.txt"
   if [ $restarted = 1 ]; then
     log "trial $n [$arm] PHONE RESTARTED (before: $before)"

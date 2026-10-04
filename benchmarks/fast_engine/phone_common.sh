@@ -26,6 +26,38 @@ screen_off() {
   esac
 }
 
+# #325: GPU work on a phone that may suspend wedges the PowerVR driver
+# (RESEARCH_LOG P3-3), and these scripts measure with the screen off. Hold a
+# shell-uid partial wake lock for the whole session (wakehold/WakeHold.java;
+# Doze does not disable wake locks of non-app uids): `wake_hold` before the
+# first bench, `wake_release || true` in the EXIT trap. The holder bounds
+# itself (default 2 h), and killing it releases the lock.
+WAKEHOLD_DEX=/data/local/tmp/starling/wakehold.dex
+WAKEHOLD_TAG=starling-bench
+wake_held() {
+  timeout 15 adb shell "dumpsys power" 2>/dev/null | tr -d '\r' |
+    grep "PARTIAL_WAKE_LOCK.*'$WAKEHOLD_TAG'" | grep -qv DISABLED
+}
+wake_release() {
+  timeout 15 adb shell "p=\$(cat $WAKEHOLD_DEX.pid 2>/dev/null) && grep -q WakeHold /proc/\$p/cmdline 2>/dev/null && kill \$p; rm -f $WAKEHOLD_DEX.pid" >/dev/null 2>&1
+}
+wake_hold() {   # wake_hold [max_seconds]
+  local dex
+  dex="$(dirname "${BASH_SOURCE[0]}")/wakehold/wakehold.dex"
+  [ -f "$dex" ] || "$(dirname "$dex")/build.sh" >/dev/null ||
+    { echo "ERROR: cannot build $dex" >&2; return 1; }
+  wake_release || true
+  timeout 30 adb push "$dex" "$WAKEHOLD_DEX" >/dev/null 2>&1 ||
+    { echo "ERROR: could not push wakehold.dex" >&2; return 1; }
+  timeout 15 adb shell "CLASSPATH=$WAKEHOLD_DEX nohup app_process / WakeHold $WAKEHOLD_TAG ${1:-7200} >/dev/null 2>&1 & echo \$! > $WAKEHOLD_DEX.pid" >/dev/null 2>&1
+  for _ in 1 2 3 4 5; do
+    sleep 1
+    wake_held && return 0
+  done
+  echo "ERROR: the $WAKEHOLD_TAG wake lock is not held (dumpsys power)" >&2
+  return 1
+}
+
 # Wait up to $1 s (bounded on the device and on the host) for every bench
 # to exit; succeeds only if none is left.
 benches_gone() {
