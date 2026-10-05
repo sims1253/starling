@@ -88,6 +88,22 @@ pub struct Settings {
     /// rest of the subsection, and never the rest of the file.
     #[serde(default, deserialize_with = "lenient_dictation")]
     pub dictation: DictationSettings,
+    /// The microphone choice (#222). A file without the key follows the
+    /// system default, which is what every earlier build recorded from.
+    #[serde(default)]
+    pub microphone: MicrophoneSettings,
+}
+
+/// Which microphone takes record from (#222). Only the user changes this:
+/// a preferred device that is unplugged, or a device listing that fails,
+/// makes a take fall back to the system default *for that take* (see
+/// `crate::microphone`), and the preference stays as it was.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct MicrophoneSettings {
+    /// The preferred input device by name; `None` follows the system
+    /// default input.
+    pub preferred_device: Option<String>,
 }
 
 /// How the recording shortcut starts and stops a take (#221).
@@ -235,6 +251,7 @@ impl Settings {
             processing: ProcessingSettings::default(),
             engine: EngineSettings::default(),
             dictation: DictationSettings::default(),
+            microphone: MicrophoneSettings::default(),
         }
     }
 
@@ -335,6 +352,13 @@ impl Settings {
         // relies on the field-level `lenient_dictation` alone, instead of
         // parsing (and logging) the subsection twice.
         let dictation_subtree = value.get("dictation").cloned();
+        // Likewise the preferred microphone (#222): an unreadable field
+        // elsewhere must not silently move recording to another device.
+        let preferred_device = value
+            .get("microphone")
+            .and_then(|microphone| microphone.get("preferredDevice"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
         let Ok(mut settings) = serde_json::from_value::<Settings>(value) else {
             // The same field-wise leniency as the `dictation` attribute:
             // an unreadable sibling key must not cost the user their
@@ -349,6 +373,7 @@ impl Settings {
                 active_model,
                 backend_override,
             };
+            fallback.microphone = MicrophoneSettings { preferred_device };
             fallback.dictation = dictation;
             return Some(fallback);
         };
@@ -509,10 +534,15 @@ mod tests {
                 activation: ActivationMode::Hold,
                 double_tap_hands_free: true,
             },
+            microphone: MicrophoneSettings {
+                preferred_device: Some("USB Mic".to_string()),
+            },
         };
 
         settings.save(&path).expect("save");
         assert_eq!(Settings::load(&path), settings);
+        let raw = std::fs::read_to_string(&path).expect("read settings file");
+        assert!(raw.contains("\"preferredDevice\": \"USB Mic\""), "{raw}");
 
         // camelCase keys on disk.
         let raw = std::fs::read_to_string(&path).expect("read settings file");
@@ -733,6 +763,35 @@ mod tests {
         assert_eq!(settings.engine.mode, EngineMode::Builtin);
         assert_eq!(settings.engine.active_model, Some("parakeet-v3-q8".to_string()));
         assert_eq!(settings.engine.backend_override, None);
+    }
+
+    #[test]
+    fn a_file_without_a_microphone_key_follows_the_system_default() {
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"endpoint":"http://127.0.0.1:8181","model":"parakeet","expectedTerms":["auth"],"engine":{"mode":"builtin"}}"#,
+        )
+        .expect("write settings");
+        assert_eq!(Settings::load(&path).microphone.preferred_device, None);
+    }
+
+    #[test]
+    fn an_unreadable_file_keeps_the_preferred_microphone() {
+        // #222: a typed-deserialization failure elsewhere must not erase
+        // the microphone choice — recording would silently move devices.
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"endpoint":42,"model":"parakeet","expectedTerms":["auth"],"engine":{"mode":"builtin"},"microphone":{"preferredDevice":"USB Mic"}}"#,
+        )
+        .expect("write unreadable settings");
+        assert_eq!(
+            Settings::load(&path).microphone.preferred_device.as_deref(),
+            Some("USB Mic")
+        );
     }
 
     #[test]
