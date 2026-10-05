@@ -86,7 +86,6 @@ try {
         if (Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue) {
             throw "Port $Port is already in use; pass a free -Port"
         }
-        $env:STARLING_SCHED_DEBUG = '1'
         $log = Join-Path $work 'server.log'
         $err = Join-Path $work 'server.err.log'
         # PS 5.1's Start-Process joins -ArgumentList elements with spaces
@@ -98,12 +97,22 @@ try {
         # accepts a caller-supplied trailing separator instead of letting
         # Resolve-Path reject it, and the output TrimEnd is belt-and-braces.
         $ggufPath = (Resolve-Path $Gguf.TrimEnd('\')).Path.TrimEnd('\')
-        $proc = Start-Process -FilePath $exe -PassThru -NoNewWindow `
-            -RedirectStandardOutput $log -RedirectStandardError $err `
-            -ArgumentList @('--model', 'parakeet', '--gguf', "`"$ggufPath`"",
-                            '--host', '127.0.0.1', '--port', "$Port")
         $base = "http://127.0.0.1:$Port"
+        # The server child inherits STARLING_SCHED_DEBUG from this process
+        # at Start-Process. Capture the caller's value and set ours right
+        # before the try, so every failure from here on (Start-Process
+        # included) restores it in the finally instead of leaking scheduler
+        # debug into a session that ran this script in-process.
+        $schedDebugBefore = $env:STARLING_SCHED_DEBUG
+        $env:STARLING_SCHED_DEBUG = '1'
+        # Null before the try: a dot-sourced rerun must never stop a $proc
+        # left over from an earlier run.
+        $proc = $null
         try {
+            $proc = Start-Process -FilePath $exe -PassThru -NoNewWindow `
+                -RedirectStandardOutput $log -RedirectStandardError $err `
+                -ArgumentList @('--model', 'parakeet', '--gguf', "`"$ggufPath`"",
+                                '--host', '127.0.0.1', '--port', "$Port")
             $health = $null
             for ($i = 0; $i -lt 600; $i++) {
                 if ($proc.HasExited) { break }
@@ -128,7 +137,11 @@ try {
                 -F "file=@$((Resolve-Path $Audio).Path);type=audio/wav" "$base/v1/audio/transcriptions"
             if ($LASTEXITCODE -ne 0) { throw "curl.exe failed with exit code $LASTEXITCODE" }
             $status = $response[-1]
-            $body = ($response[0..($response.Count - 2)] -join "`n")
+            # 0..-1 would duplicate the status line if there were no body
+            # lines; curl's -w newline makes that unreachable today (an empty
+            # body still yields two lines), but the guard keeps the slice
+            # honest.
+            $body = if ($response.Count -gt 1) { $response[0..($response.Count - 2)] -join "`n" } else { '' }
             "HTTP $status $body"
             if ($status -ne '200') { throw "Transcription failed with HTTP $status" }
             $text = ($body | ConvertFrom-Json).text
@@ -175,7 +188,18 @@ try {
                 }
             }
         } finally {
-            if (-not $proc.HasExited) { Stop-Process -Id $proc.Id -Force; $proc.WaitForExit() }
+            # Restore the environment FIRST (it cannot throw): a Stop-Process
+            # race — the server exiting between the HasExited check and the
+            # stop — must not skip the restore or mask the original error.
+            if ($null -eq $schedDebugBefore) {
+                Remove-Item Env:STARLING_SCHED_DEBUG -ErrorAction SilentlyContinue
+            } else {
+                $env:STARLING_SCHED_DEBUG = $schedDebugBefore
+            }
+            if ($proc -and -not $proc.HasExited) {
+                Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+                $proc.WaitForExit()
+            }
         }
         if (Select-String -Path $log, $err -SimpleMatch '[sched-dbg]' -Quiet) {
             Select-String -Path $log, $err -SimpleMatch '[sched-dbg]'

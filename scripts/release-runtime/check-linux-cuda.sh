@@ -142,8 +142,11 @@ http() {
     fi
     if [[ $# -gt 2 ]]; then
         printf '%s %s HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: %s\r\nContent-Length: %s\r\nConnection: close\r\n\r\n' \
-            "$1" "$2" "$4" "$(stat -c %s "$3")" >&3
-        cat "$3" >&3
+            "$1" "$2" "$4" "$(stat -c %s "$3")" >&3 || return 1
+        # http() runs in a fresh bash without set -e, so nothing else would
+        # catch a failed or truncated body write; failing here keeps it from
+        # surfacing later as a bogus "Transcript mismatch".
+        cat "$3" >&3 || return 1
     else
         printf '%s %s HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n' "$1" "$2" >&3
     fi
@@ -203,6 +206,15 @@ grep -Fq "\"text\":\"$escaped\"" response.txt || {
     exit 1
 }
 kill -0 "$server" || { cat server.log >&2; echo 'Server died during transcription' >&2; exit 1; }
+# Stop the server before scanning its log, like the Windows checker, so the
+# log is final when grep reads it. [sched-dbg] is written to unbuffered
+# stderr (backend.cpp fprintf(stderr)), so every line is already on disk;
+# stopping does NOT flush stdio buffers (the server installs no SIGTERM
+# handler), so this scan relies on that logging staying on stderr. The trap
+# is cleared because the server is already stopped here; every earlier exit
+# path still cleans up.
+stop_server
+trap - EXIT
 if grep -F '[sched-dbg]' server.log; then
     echo 'The CUDA backend rejected graph nodes (#184)' >&2
     exit 1

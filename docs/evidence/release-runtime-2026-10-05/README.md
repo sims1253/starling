@@ -120,6 +120,17 @@ no release was published and no workflow dispatched.
 | E25 `linux-cuda` | `check-linux-cuda.sh --with-gpu --infer` (port free) | `CUDA0` | pass: exact transcript |
 | E25 `linux-cuda`, leftover server on 18187 | a modified copy of the checker that starts a leftover server in the container before the probe (a fresh `--rm --network none` container cannot otherwise have one) | — | **fail (intended)**: `port 18187 is already in use; free it before running --infer` |
 
+A third pass of the checkers (slice-named failure messages and a
+static_asserted misalignment precondition in `tdt_slice_argmax_test`; the
+Linux checker stopping the server before its `[sched-dbg]` scan and failing
+a truncated request write; the Windows checker restoring the caller's
+`STARLING_SCHED_DEBUG` after inference and guarding the response slice)
+re-ran E26 `windows-cpu` inference twice in one PowerShell process — once
+with `STARLING_SCHED_DEBUG` preset (restored) and once unset (cleared) — and
+the E25 `linux-cuda` `--with-gpu --infer`; all passed with exact transcripts.
+A run with a nonexistent `-Gguf` path then failed cleanly with the caller's
+`STARLING_SCHED_DEBUG` still intact.
+
 ## Not covered
 
 - `linux-rocm`, `macos-metal`, `macos-cpu`: no hardware.

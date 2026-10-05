@@ -51,6 +51,12 @@ void check(bool cond, const std::string& what) {
 constexpr int kTokenCount = 8193;  // parakeet-tdt-0.6b-v3: vocab 8192 + blank
 constexpr int kNumDur = 5;         // tdt_durations {0, 1, 2, 3, 4}
 constexpr size_t kMaxVulkanOffsetAlignment = 256;
+// The #57 reproduction needs the duration slice to START misaligned to the
+// spec's alignment upper bound (8193 * 4 = 32772 ≡ 4 mod 256); if a constant
+// change ever aligns it, the layout check below can no longer catch a
+// removed-ggml_cont regression, so fail the build instead.
+static_assert((kTokenCount * sizeof(float)) % kMaxVulkanOffsetAlignment != 0,
+              "test constants no longer reproduce the #57 misaligned offset");
 
 void run_case(const char* name, const std::vector<float>& logits,
               int want_tok, int want_dur) {
@@ -63,8 +69,11 @@ void run_case(const char* name, const std::vector<float>& logits,
             const parakeet::TdtSliceArgmax amax =
                 parakeet::tdt_slice_argmax(c, y, kTokenCount, kNumDur);
             for (const ggml_tensor* t : { amax.tok, amax.dur }) {
+                // Name the slice so a failure says which of the two tripped.
+                const std::string slice = std::string(name) +
+                    (t == amax.tok ? ": token" : ": duration");
                 check(t->op == GGML_OP_ARGMAX && t->type == GGML_TYPE_I32,
-                      std::string(name) + ": split must end in i32 ARGMAX nodes");
+                      slice + " split must end in i32 ARGMAX nodes");
                 // A view's data sits view_offs bytes into its parent buffer;
                 // a non-view tensor's data is allocator-aligned (well under
                 // the Vulkan spec's 256-byte bound). #57's failure mode is
@@ -74,7 +83,7 @@ void run_case(const char* name, const std::vector<float>& logits,
                 const ggml_tensor* src = t->src[0];
                 check(!src->view_src ||
                           src->view_offs % kMaxVulkanOffsetAlignment == 0,
-                      std::string(name) + ": ARGMAX source is a view at byte "
+                      slice + " ARGMAX source is a view at byte "
                       "offset " + std::to_string(src->view_offs)
                       + ", not 256-byte aligned (ggml-vulkan asserts; copy the "
                         "slice into an aligned tensor first)");
