@@ -29,6 +29,7 @@ import dev.starling.mobile.data.Recording
 import dev.starling.mobile.data.RecordingStatus
 import dev.starling.mobile.data.TranscriptionProvenance
 import dev.starling.mobile.engine.ModelCatalog
+import dev.starling.mobile.engine.ModelLifetime
 import dev.starling.mobile.engine.OnDeviceEngine
 import dev.starling.mobile.network.BackendConfig
 import dev.starling.mobile.network.EndpointPolicy
@@ -141,6 +142,8 @@ class MainActivity : Activity() {
         // keyboard, recognition service, a transcription that finished while
         // backgrounded), so the list is refreshed on every resume.
         refreshRecordings()
+        // The recorder is a voice entry point: warm the selected local model.
+        application.preloadOnDeviceModel()
     }
 
     override fun onStart() {
@@ -455,14 +458,15 @@ class MainActivity : Activity() {
         // does not support streaming, and the recording proceeds as before.
         val config = application.backendSettings.load()
         var session: StreamSession? = null
-        session = application.transcription.beginStreaming(config, application.recordings.partialFile(recording)) { event ->
+        val savedAudio = application.recordings.partialFile(recording)
+        session = application.transcription.beginStreaming(config, savedAudio) { event ->
             // Events from a superseded session must not rewrite the views of
             // the recording that replaced it.
             if (streamSession === session) onStreamEvent(event)
         }
         val error = capture.start(
             this,
-            application.recordings.partialFile(recording),
+            savedAudio,
             onChunk = session?.let { streaming -> AudioChunkListener { bytes, count -> streaming.onAudio(bytes, count) } },
         )
         if (error != null) {
@@ -478,7 +482,12 @@ class MainActivity : Activity() {
         liveTranscript.visibility = View.GONE
         liveTranscript.text = null
         recordingMessage.setText(
-            if (session == null) R.string.recording_now else R.string.streaming_connecting,
+            when {
+                session == null -> R.string.recording_now
+                config.engine == TranscriptionEngine.ON_DEVICE &&
+                    application.modelLifetime.state() !is ModelLifetime.State.Ready -> R.string.streaming_loading
+                else -> R.string.streaming_connecting
+            },
         )
     }
 

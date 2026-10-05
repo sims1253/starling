@@ -6,8 +6,12 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.io.ByteArrayOutputStream
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import kotlin.math.roundToInt
 
 /**
  * The on-device live session against a fake engine: partials while audio
@@ -156,5 +160,165 @@ class OnDeviceStreamSessionTest {
 
         assertTrue(session.finish() is CommitOutcome.Fallback)
         assertFalse(session.acceptsAudio())
+    }
+
+    /**
+     * An engine whose words name the absolute second of the audio they came
+     * from (each second of test audio carries its index as the sample value),
+     * so the final text proves order, completeness and no duplication.
+     * [loaded] gates prepare(), like a cold model load.
+     */
+    private class SecondsEngine(private val loaded: CountDownLatch = CountDownLatch(0)) :
+        OnDeviceStreamSession.LiveEngine {
+        override fun prepare(): String? {
+            loaded.await(10, TimeUnit.SECONDS)
+            return null
+        }
+
+        override fun transcribeWindow(samples: FloatArray): OnDeviceStreamSession.WindowResult {
+            val words = (samples.indices step ChunkStreamer.SAMPLE_RATE).map { i ->
+                "w" + (samples[i] * 32768f / SECOND_STEP).roundToInt()
+            }
+            return OnDeviceStreamSession.WindowResult.Text(words.joinToString(" "))
+        }
+    }
+
+    /** The capture's saved WAV payload, as SavedAudioBacklog would read it. */
+    private class SavedAudio : OnDeviceStreamSession.Backlog {
+        val bytes = ByteArrayOutputStream()
+        var opened = 0
+        var failReads = false
+
+        override fun read(from: Long, into: FloatArray, offset: Int, count: Int): Int {
+            if (failReads) throw java.io.IOException("gone")
+            val data = synchronized(bytes) { bytes.toByteArray() }
+            var n = 0
+            while (n < count && 2 * (from + n) + 1 < data.size) {
+                val at = (2 * (from + n)).toInt()
+                into[offset + n] = ((data[at + 1].toInt() shl 8) or (data[at].toInt() and 0xff)).toShort() / 32768f
+                n++
+            }
+            return n
+        }
+
+        override fun close() = Unit
+    }
+
+    /** One second of PCM16 whose every sample is [second]'s marker value. */
+    private fun second(second: Int): ByteArray {
+        val value = second * SECOND_STEP
+        return ByteArray(ChunkStreamer.SAMPLE_RATE * 2) { i -> if (i % 2 == 0) value.toByte() else (value shr 8).toByte() }
+    }
+
+    /** Writes like AudioCapture: the WAV first, then the live session. */
+    private fun capture(session: OnDeviceStreamSession, saved: SavedAudio?, seconds: IntRange) {
+        for (s in seconds) {
+            val chunk = second(s)
+            saved?.let { synchronized(it.bytes) { it.bytes.write(chunk) } }
+            session.onAudio(chunk, chunk.size)
+        }
+    }
+
+    private fun expected(seconds: Int) = (0 until seconds).joinToString(" ") { "w$it" }
+
+    @Test
+    fun audioCapturedWhileTheModelLoadsIsTranscribedInOrder() {
+        val loaded = CountDownLatch(1)
+        val session = session(SecondsEngine(loaded))
+        // The first seconds arrive before the model is ready.
+        capture(session, null, 0 until 5)
+        loaded.countDown()
+        awaitEvent { it == StreamEvent.Live }
+        capture(session, null, 5 until 8)
+
+        assertEquals(CommitOutcome.Final(expected(8)), session.finish())
+        assertFalse(events.any { it is StreamEvent.Interrupted })
+    }
+
+    @Test
+    fun stopBeforeTheModelFinishedLoadingStillYieldsTheCompleteFinal() {
+        val loaded = CountDownLatch(1)
+        val session = session(SecondsEngine(loaded))
+        capture(session, null, 0 until 3)
+        Thread { Thread.sleep(200); loaded.countDown() }.start()
+
+        assertEquals(CommitOutcome.Final(expected(3)), session.finish())
+    }
+
+    @Test
+    fun aLoadLongerThanTheLiveBufferReadsTheBacklogBackFromTheSavedAudio() {
+        val loaded = CountDownLatch(1)
+        val saved = SavedAudio()
+        val session = OnDeviceStreamSession(
+            engine = SecondsEngine(loaded),
+            events = { events += it },
+            streamer = ChunkStreamer(minSeconds = 1.0, partialIntervalSeconds = 0.0),
+            // Two seconds of memory; the 30 s captured during the load spill.
+            maxLiveSamples = 2 * ChunkStreamer.SAMPLE_RATE,
+            backlog = { saved.also { it.opened++ } },
+        ).start()
+        capture(session, saved, 0 until 30)
+        loaded.countDown()
+        awaitEvent { it == StreamEvent.Live }
+        // Recording goes on while the worker catches up.
+        capture(session, saved, 30 until 40)
+
+        assertEquals(CommitOutcome.Final(expected(40)), session.finish())
+        assertEquals(1, saved.opened)
+        assertFalse(events.any { it is StreamEvent.Interrupted })
+    }
+
+    @Test
+    fun stopDuringASpilledLoadCatchesUpBeforeFinalizing() {
+        val loaded = CountDownLatch(1)
+        val saved = SavedAudio()
+        val session = OnDeviceStreamSession(
+            engine = SecondsEngine(loaded),
+            events = { events += it },
+            streamer = ChunkStreamer(minSeconds = 1.0, partialIntervalSeconds = 0.0),
+            maxLiveSamples = ChunkStreamer.SAMPLE_RATE,
+            backlog = { saved },
+        ).start()
+        capture(session, saved, 0 until 25)
+        Thread { Thread.sleep(200); loaded.countDown() }.start()
+
+        assertEquals(CommitOutcome.Final(expected(25)), session.finish())
+    }
+
+    @Test
+    fun anUnreadableBacklogFallsBackToTheBatchPath() {
+        val loaded = CountDownLatch(1)
+        val saved = SavedAudio().apply { failReads = true }
+        val session = OnDeviceStreamSession(
+            engine = SecondsEngine(loaded),
+            events = { events += it },
+            streamer = ChunkStreamer(minSeconds = 1.0, partialIntervalSeconds = 0.0),
+            maxLiveSamples = ChunkStreamer.SAMPLE_RATE,
+            backlog = { saved },
+        ).start()
+        capture(session, saved, 0 until 3)
+        loaded.countDown()
+
+        assertEquals(CommitOutcome.Fallback("the saved recording could not be read back"), session.finish())
+    }
+
+    @Test
+    fun aBacklogThatCannotBeOpenedKeepsTheOldBufferCap() {
+        val session = OnDeviceStreamSession(
+            engine = FakeEngine(),
+            events = { events += it },
+            maxLiveSamples = ChunkStreamer.SAMPLE_RATE,
+            backlog = { throw java.io.FileNotFoundException("no partial WAV") },
+        ).start()
+        val chunk = pcm(2.0)
+        session.onAudio(chunk, chunk.size)
+
+        val interrupted = awaitEvent { it is StreamEvent.Interrupted } as StreamEvent.Interrupted
+        assertTrue(interrupted.bufferLimitReached)
+    }
+
+    private companion object {
+        /** Sample value step per second of test audio; distinct and exact in PCM16. */
+        const val SECOND_STEP = 100
     }
 }

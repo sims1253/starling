@@ -14,9 +14,11 @@ import dev.starling.mobile.audio.AudioCapture
 import dev.starling.mobile.audio.AudioChunkListener
 import dev.starling.mobile.audio.CaptureResult
 import dev.starling.mobile.data.Recording
+import dev.starling.mobile.engine.ModelLifetime
 import dev.starling.mobile.network.BackendConfig
 import dev.starling.mobile.network.StreamEvent
 import dev.starling.mobile.network.StreamSession
+import dev.starling.mobile.network.TranscriptionEngine
 
 /**
  * The `ACTION_RECOGNIZE_SPEECH` popup (E22): apps that ask the system for
@@ -86,6 +88,9 @@ class RecognizeSpeechActivity : Activity() {
         doneButton.setOnClickListener { if (activeRecording != null) stopAndTranscribe() else finish() }
         cancelButton.setOnClickListener { cancel() }
         setResult(RESULT_CANCELED)
+        // The popup records at once; loading now also covers the time a
+        // permission prompt is on screen.
+        application.preloadOnDeviceModel()
 
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
             beginCapture()
@@ -135,12 +140,13 @@ class RecognizeSpeechActivity : Activity() {
         val config = application.backendSettings.load()
         captureConfig = config
         var session: StreamSession? = null
-        session = application.transcription.beginStreaming(config, application.recordings.partialFile(recording)) { event ->
+        val savedAudio = application.recordings.partialFile(recording)
+        session = application.transcription.beginStreaming(config, savedAudio) { event ->
             if (streamSession === session) onStreamEvent(event)
         }
         val error = capture.start(
             this,
-            application.recordings.partialFile(recording),
+            savedAudio,
             onChunk = session?.let { streaming -> AudioChunkListener { bytes, count -> streaming.onAudio(bytes, count) } },
         )
         if (error != null) {
@@ -151,13 +157,15 @@ class RecognizeSpeechActivity : Activity() {
         }
         activeRecording = recording
         streamSession = session
-        statusView.setText(R.string.recognize_listening)
+        val loading = session != null && config.engine == TranscriptionEngine.ON_DEVICE &&
+            application.modelLifetime.state() !is ModelLifetime.State.Ready
+        statusView.setText(if (loading) R.string.recognize_listening_loading else R.string.recognize_listening)
     }
 
     private fun onStreamEvent(event: StreamEvent) {
         if (isDestroyed || isFinishing) return
         when (event) {
-            StreamEvent.Live -> Unit
+            StreamEvent.Live -> if (activeRecording != null) statusView.setText(R.string.recognize_listening)
             is StreamEvent.Partial -> {
                 partialView.visibility = View.VISIBLE
                 partialView.text = event.text
