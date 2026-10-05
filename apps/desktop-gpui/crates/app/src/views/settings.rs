@@ -11,7 +11,7 @@ use gpui::{
 use starling_dictation::engine::{
     Backend, EngineFailure, EngineSnapshot, InstallState, SwapDecision, SwitchReport, SwitchStage,
 };
-use starling_dictation::settings::EngineMode;
+use starling_dictation::settings::{ActivationMode, EngineMode};
 
 use crate::app::{ConnectionProbe, StarlingApp, settings_callout_view};
 use crate::processing;
@@ -36,6 +36,7 @@ pub fn render_settings_modal(
     let draft_terms = app.draft_terms.clone();
     let engine_section = render_engine_section(app, cx);
     let processing_section = render_processing_section(app, cx);
+    let dictation_section = render_dictation_section(app, cx);
 
     let card = div()
         .id("settings-card")
@@ -164,6 +165,7 @@ pub fn render_settings_modal(
                     ),
             )
         })
+        .child(dictation_section)
         .child(processing_section)
         .child(
             div()
@@ -1025,6 +1027,168 @@ fn render_processing_section(app: &mut StarlingApp, cx: &mut Context<StarlingApp
                 .child(disclosure),
         )
         .child(fields)
+}
+
+/// The activation choices (#221), in the order the dialog lists them.
+pub(crate) const ACTIVATION_CHOICES: [(ActivationMode, &str, &str); 3] = [
+    (
+        ActivationMode::HoldOrToggle,
+        "Hold or tap",
+        "Hold the shortcut to talk and let go to finish, or tap it once to keep recording \
+         until you press it again.",
+    ),
+    (
+        ActivationMode::Hold,
+        "Hold to talk",
+        "Recording runs while the shortcut is held and finishes when you let go.",
+    ),
+    (
+        ActivationMode::Toggle,
+        "Toggle",
+        "Press once to start, press again to finish.",
+    ),
+];
+
+fn render_dictation_section(app: &mut StarlingApp, cx: &mut Context<StarlingApp>) -> Div {
+    let mut rows = div().flex().flex_col().gap(px(6.));
+    for (mode, name, description) in ACTIVATION_CHOICES {
+        let selected = app.draft_activation == mode;
+        rows = rows.child(
+            choice_row(
+                SharedString::from(format!("activation-{name}")),
+                selected,
+                name,
+                description,
+            )
+            .on_click(cx.listener(move |this, _, _window, cx| {
+                this.draft_activation = mode;
+                cx.notify();
+            })),
+        );
+    }
+    let hold = app.draft_activation == ActivationMode::Hold;
+    let double_tap = app.draft_double_tap;
+    let double_tap_row = choice_row(
+        SharedString::from("double-tap-hands-free"),
+        hold && double_tap,
+        "Double tap for hands-free",
+        if hold {
+            "Tap the shortcut twice quickly to keep recording without holding it; press it \
+             again to finish."
+        } else {
+            "Only for Hold to talk: the other modes already keep recording after a tap."
+        },
+    )
+    .when(!hold, |row| row.opacity(0.5))
+    .when(hold, |row| {
+        row.on_click(cx.listener(|this, _, _window, cx| {
+            this.draft_double_tap = !this.draft_double_tap;
+            cx.notify();
+        }))
+    });
+
+    let reach = crate::shortcut::reach_note(
+        app.shortcut_registration.as_ref().map(|_| ()).map_err(String::as_str),
+        &app.shortcut,
+    );
+    let mut field = field_label("Recording shortcut")
+        .child(app.draft_shortcut.clone())
+        .child(helper(
+            "Modifiers and one key, for example Ctrl+Shift+Space, Alt+D, or a single F9. \
+             Escape cancels a take; recording never brings this window forward.",
+        ));
+    if let Some(reason) = app.dictation_draft_error.clone() {
+        field = field.child(
+            div()
+                .id("shortcut-error")
+                .mt(px(2.))
+                .font_weight(FontWeight::NORMAL)
+                .line_height(px(10. * 1.5))
+                .text_color(theme::CORAL)
+                .child(reason),
+        );
+    }
+
+    div()
+        .mt(px(29.))
+        .pt(px(21.))
+        .border_t_1()
+        .border_color(theme::SETTINGS_LINE)
+        .child(
+            div()
+                .mb(px(13.))
+                .font(theme::mono_font())
+                .text_size(px(10.))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(theme::SETTINGS_EYEBROW)
+                .child("DICTATION"),
+        )
+        .child(field)
+        .child(rows)
+        .child(div().mt(px(6.)).child(double_tap_row))
+        .child(
+            div()
+                .id("shortcut-reach")
+                .mt(px(12.))
+                .bg(theme::SETTINGS_CALLOUT)
+                .p(px(12.))
+                .text_size(px(10.))
+                .line_height(px(10. * 1.55))
+                .child(reach),
+        )
+}
+
+/// One selectable row: a radio dot, a name, and a description.
+fn choice_row(
+    id: SharedString,
+    selected: bool,
+    name: &'static str,
+    description: &'static str,
+) -> gpui::Stateful<Div> {
+    div()
+        .id(id)
+        .flex()
+        .flex_row()
+        .gap(px(10.))
+        .p(px(10.))
+        .rounded(px(3.))
+        .border_1()
+        .border_color(if selected {
+            theme::SETTINGS_INK
+        } else {
+            theme::SETTINGS_LINE
+        })
+        .cursor_pointer()
+        .hover(|style| style.bg(theme::PAPER_HOVER))
+        .child(
+            div()
+                .mt(px(2.))
+                .size(px(10.))
+                .flex_none()
+                .rounded(px(5.))
+                .border_1()
+                .border_color(theme::SETTINGS_INK)
+                .when(selected, |dot| dot.bg(theme::SETTINGS_INK)),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(3.))
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(name),
+                )
+                .child(
+                    div()
+                        .text_size(px(10.))
+                        .line_height(px(10. * 1.5))
+                        .text_color(theme::SETTINGS_HELPER)
+                        .child(description),
+                ),
+        )
 }
 
 fn helper(text: &'static str) -> Div {

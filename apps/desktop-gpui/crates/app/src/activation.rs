@@ -180,10 +180,6 @@ impl Activation {
         self.config = config;
     }
 
-    pub(crate) fn config(&self) -> ActivationConfig {
-        self.config
-    }
-
     pub(crate) fn active_take(&self) -> Option<TakeId> {
         match self.phase {
             Phase::Active { take, .. } => Some(take),
@@ -432,6 +428,25 @@ impl Activation {
             Readiness::Starting => vec![Effect::Cancel(take, CancelReason::NoAudioYet)],
         }
     }
+}
+
+/// The capture pane's headline for the active take: listening is only
+/// claimed once real samples arrived.
+pub(crate) fn readiness_headline(readiness: Option<Readiness>) -> &'static str {
+    match readiness {
+        Some(Readiness::Starting) => "Starting the microphone…",
+        Some(Readiness::Listening) => "Listening closely.",
+        None => "Say it as you mean it.",
+    }
+}
+
+/// How the active take ends, in the words the capture pane shows.
+pub(crate) fn finish_hint(latch: Option<Latch>, shortcut: &str) -> Option<String> {
+    Some(match latch? {
+        Latch::Held => "Release to finish · Esc cancels".to_string(),
+        Latch::Latched => format!("Press {shortcut} to finish · Esc cancels"),
+        Latch::HandsFree => format!("Hands-free · press {shortcut} to finish · Esc cancels"),
+    })
 }
 
 // ---- App glue -------------------------------------------------------------
@@ -936,6 +951,22 @@ mod tests {
         assert!(m.release(t0 + ms(2000)).is_empty());
         assert_eq!(m.latch(), Some(Latch::Latched));
         assert_eq!(m.press(t0 + ms(4000), true), vec![Effect::Finish(take)]);
+    }
+
+    #[test]
+    fn the_pane_claims_listening_only_after_samples_and_names_the_latch() {
+        assert_eq!(readiness_headline(None), "Say it as you mean it.");
+        assert_eq!(readiness_headline(Some(Readiness::Starting)), "Starting the microphone…");
+        assert_eq!(readiness_headline(Some(Readiness::Listening)), "Listening closely.");
+        assert_eq!(finish_hint(None, "F9"), None);
+        assert_eq!(
+            finish_hint(Some(Latch::Held), "F9").as_deref(),
+            Some("Release to finish · Esc cancels")
+        );
+        assert_eq!(
+            finish_hint(Some(Latch::HandsFree), "F9").as_deref(),
+            Some("Hands-free · press F9 to finish · Esc cancels")
+        );
     }
 
     #[test]

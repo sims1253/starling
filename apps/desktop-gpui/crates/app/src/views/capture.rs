@@ -136,11 +136,9 @@ pub fn render_capture(
                         .text_size(h1_size)
                         .line_height(h1_size * 0.96)
                         .text_color(theme::INK)
-                        .child(if recording {
-                            "Listening closely."
-                        } else {
-                            "Say it as you mean it."
-                        }),
+                        .child(crate::activation::readiness_headline(
+                            app.activation.readiness().filter(|_| recording),
+                        )),
                 )
                 .child(
                     div()
@@ -333,6 +331,14 @@ fn render_recorder(
                 } else {
                     "Tap to record".to_string()
                 }))
+                // #221: how this take ends (held, latched, hands-free).
+                .children(
+                    crate::activation::finish_hint(
+                        app.activation.latch().filter(|_| recording),
+                        &app.shortcut.label(),
+                    )
+                    .map(|hint| div().id("finish-hint").child(hint)),
+                )
                 .when(!has_transcript, |meta| {
                     meta.child(
                         div()
@@ -344,11 +350,7 @@ fn render_recorder(
                             .font(theme::mono_font())
                             .text_size(px(9.))
                             .text_color(theme::DIM)
-                            .child(if cfg!(target_os = "macos") {
-                                "⌘ Shift Space"
-                            } else {
-                                "Ctrl Shift Space"
-                            }),
+                            .child(app.shortcut.label()),
                     )
                 }),
         )
@@ -547,6 +549,15 @@ fn render_banner(app: &mut StarlingApp, cx: &mut Context<StarlingApp>) -> Option
                 message,
                 "The take was still saved and sent; heavily clipped audio transcribes poorly.",
                 |app: &mut StarlingApp| app.capture_warning = None,
+                cx,
+            ));
+        }
+        if let Some(message) = app.take_notice.clone() {
+            return Some(quality_banner(
+                "Take cancelled",
+                message,
+                "Nothing was inserted or sent anywhere.",
+                |app: &mut StarlingApp| app.take_notice = None,
                 cx,
             ));
         }

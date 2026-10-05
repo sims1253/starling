@@ -1590,6 +1590,14 @@ impl StarlingApp {
         self.draft_api_key_env.update(cx, |field, cx| {
             field.set_value(&processing.api_key_env, cx);
         });
+        // #221: the dictation drafts start from the committed values.
+        let shortcut = self.dictation_settings.shortcut.clone();
+        self.draft_shortcut.update(cx, |field, cx| {
+            field.set_value(&shortcut, cx);
+        });
+        self.draft_activation = self.dictation_settings.activation;
+        self.draft_double_tap = self.dictation_settings.double_tap_hands_free;
+        self.dictation_draft_error = None;
         cx.notify();
     }
 
@@ -1690,6 +1698,17 @@ impl StarlingApp {
     }
 
     pub fn save_settings(&mut self, cx: &mut Context<Self>) {
+        // #221: a shortcut the app cannot use is refused before anything
+        // is applied or persisted; the dialog stays open with the reason.
+        let shortcut = match crate::shortcut::Shortcut::parse(&self.draft_shortcut.read(cx).value()) {
+            Ok(shortcut) => shortcut,
+            Err(reason) => {
+                self.dictation_draft_error = Some(reason);
+                cx.notify();
+                return;
+            }
+        };
+        self.dictation_draft_error = None;
         // #362: the engine mode commits with this save. The manual
         // endpoint rules (#213) apply only in manual mode — a builtin
         // install has no server to name, and refusing the save over an
@@ -1751,6 +1770,20 @@ impl StarlingApp {
                 );
                 self.applied_backend_override = self.engine_settings.backend_override.clone();
             }
+        }
+
+        // #221: the dictation settings apply to the next gesture; a take
+        // that is running keeps running.
+        self.dictation_settings = DictationSettings {
+            shortcut: shortcut.text().to_string(),
+            activation: self.draft_activation,
+            double_tap_hands_free: self.draft_double_tap,
+        };
+        self.activation
+            .set_config(crate::activation::ActivationConfig::from_settings(&self.dictation_settings));
+        if shortcut != self.shortcut {
+            self.shortcut = shortcut;
+            self.register_shortcut();
         }
 
         // R11: an unresolvable config directory is surfaced, not swallowed —
