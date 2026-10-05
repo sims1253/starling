@@ -136,7 +136,8 @@ target_link_libraries(starling_ggml_core PUBLIC ggml)
 if(STARLING_GGML_CUDA AND WIN32)
   find_package(CUDAToolkit REQUIRED)
   target_compile_definitions(starling_ggml_core PRIVATE
-      STARLING_CUBLAS_DLL="cublas64_${CUDAToolkit_VERSION_MAJOR}.dll")
+      STARLING_CUBLAS_DLL="cublas64_${CUDAToolkit_VERSION_MAJOR}.dll"
+      STARLING_CUBLASLT_DLL="cublasLt64_${CUDAToolkit_VERSION_MAJOR}.dll")
 endif()
 
 # Model-specialized fast engines (cpp/fast): hand-written Vulkan kernels for

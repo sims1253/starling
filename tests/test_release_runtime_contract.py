@@ -178,6 +178,75 @@ def test_rejects_implicit_hardware_coverage(mutate):
     assert contract.hardware_coverage_errors(release_runtime, workflow)
 
 
+def test_rejects_archive_added_to_upload_list_without_coverage():
+    # Greptile, PR #396: an archive added to the release upload list but
+    # missing from both tables used to slip through the ledger comparison.
+    release_runtime, workflow = coverage_inputs()
+    anchor = "artifacts/starling-serve-macos-cpu/starling-serve-macos-cpu.tar.gz\n"
+    assert anchor in workflow
+    workflow = workflow.replace(
+        anchor,
+        anchor + "            artifacts/starling-serve-linux-xpu/"
+                 "starling-serve-linux-xpu.tar.gz\n")
+    errors = contract.hardware_coverage_errors(release_runtime, workflow)
+    assert any("linux-xpu" in error and "uploaded=" in error for error in errors)
+
+
+def test_new_archive_with_full_coverage_passes():
+    # The mirror of the Greptile case: adding the archive to the upload list
+    # AND the prerequisites table, the ledger, and the release-body list must
+    # satisfy the contract.
+    release_runtime, workflow = coverage_inputs()
+    upload_anchor = "artifacts/starling-serve-macos-cpu/starling-serve-macos-cpu.tar.gz\n"
+    workflow = workflow.replace(
+        upload_anchor,
+        upload_anchor + "            artifacts/starling-serve-linux-xpu/"
+                         "starling-serve-linux-xpu.tar.gz\n")
+    workflow = workflow.replace(
+        "Not verified on hardware: `linux-rocm`, `macos-metal`, `macos-cpu`.",
+        "Not verified on hardware: `linux-rocm`, `macos-metal`, `macos-cpu`, `linux-xpu`.")
+    prerequisites_anchor = "| `macos-cpu` |"
+    row = next(line for line in release_runtime.splitlines() if line.startswith(prerequisites_anchor))
+    release_runtime = release_runtime.replace(
+        row, row + "\n| `linux-xpu` | placeholder prerequisites | placeholder coverage |")
+    ledger_anchor = "| `macos-cpu` |"
+    ledger_row = next(line for line in release_runtime.split(contract.HARDWARE_SECTION, 1)[1].splitlines()
+                      if line.startswith(ledger_anchor))
+    release_runtime = release_runtime.replace(
+        ledger_row, ledger_row + "\n| `linux-xpu` | Not verified | none | everything |")
+    assert contract.hardware_coverage_errors(release_runtime, workflow) == []
+
+
+def test_rejects_dangling_separator_in_not_verified_list():
+    # "... `macos-cpu`, ." must not parse as a list: the separator belongs
+    # between two items (OpenCodeReview, PR #396).
+    release_runtime, workflow = coverage_inputs()
+    workflow = workflow.replace("`macos-cpu`.", "`macos-cpu`, .")
+    errors = contract.hardware_coverage_errors(release_runtime, workflow)
+    assert any("exactly once" in error for error in errors)
+
+
+def test_all_verified_release_says_none_and_passes():
+    # A fully verified ledger is a legitimate future state; the release body
+    # then says "Not verified on hardware: none." (OpenCodeReview, PR #396).
+    release_runtime, workflow = coverage_inputs()
+    release_runtime = release_runtime.replace("| Not verified", "| Verified")
+    workflow = workflow.replace(
+        "Not verified on hardware: `linux-rocm`, `macos-metal`, `macos-cpu`.",
+        "Not verified on hardware: none.")
+    assert contract.hardware_coverage_errors(release_runtime, workflow) == []
+
+
+def test_none_line_with_unverified_ledger_fails():
+    # "none" is only valid once the ledger has no Not verified rows left.
+    release_runtime, workflow = coverage_inputs()
+    workflow = workflow.replace(
+        "Not verified on hardware: `linux-rocm`, `macos-metal`, `macos-cpu`.",
+        "Not verified on hardware: none.")
+    assert any("must match" in error for error in
+               contract.hardware_coverage_errors(release_runtime, workflow))
+
+
 def test_current_release_contract():
     workflow, docs, dockerfile = inputs()
     assert contract.check(workflow, docs, dockerfile=dockerfile) == []

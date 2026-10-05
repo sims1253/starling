@@ -34,8 +34,21 @@ while [[ $# -gt 0 ]]; do
                 echo "--infer needs GGUF AUDIO EXPECTED_TEXT" >&2
                 exit 2
             fi
-            if [[ -z "$4" ]]; then
-                echo "--infer needs a non-empty EXPECTED_TEXT" >&2
+            if [[ -z "$2" || -z "$3" || -z "$4" ]]; then
+                echo "--infer needs a GGUF path, an audio path, and a non-empty EXPECTED_TEXT" >&2
+                exit 2
+            fi
+            # The in-container comparison greps the raw JSON text field, and
+            # only backslash and double quote are re-escaped for it. The
+            # server's json_escape rewrites every byte below 0x20 (\n, \t,
+            # \uXXXX), so such bytes can never match the raw grep. Reject
+            # them up front instead of failing later with a false "Transcript
+            # mismatch" that masks the real transcript. Bytes 0x20-0xFF are
+            # emitted unchanged (non-ASCII UTF-8 included), so they compare
+            # byte-wise and stay allowed. (wc -c, not a string test: the
+            # leftover can be a bare newline.)
+            if [[ "$(printf '%s' "$4" | tr -d '\40-\377' | wc -c)" -ne 0 ]]; then
+                echo "--infer EXPECTED_TEXT must not contain control characters (the transcript check compares the raw JSON field)" >&2
                 exit 2
             fi
             infer=("$2" "$3" "$4"); shift 4 ;;
@@ -110,7 +123,13 @@ export port=18187
 # Callers bound it with timeout(1) (bounded_http) so a hung server cannot
 # wedge the check.
 http() {
-    exec 3<>"/dev/tcp/127.0.0.1/$port" || return 1
+    # exec (not ':') so fd 3 stays open for the writes and reads below. A
+    # failed connection makes exec's redirection return non-zero without
+    # exiting this non-POSIX bash, which surfaces as a failed request to
+    # the caller.
+    if ! exec 3<>"/dev/tcp/127.0.0.1/$port"; then
+        return 1
+    fi
     if [[ $# -gt 2 ]]; then
         printf '%s %s HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: %s\r\nContent-Length: %s\r\nConnection: close\r\n\r\n' \
             "$1" "$2" "$4" "$(stat -c %s "$3")" >&3

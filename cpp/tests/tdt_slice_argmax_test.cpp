@@ -9,10 +9,12 @@
 // (where Linux Vulkan was validated) but not to NVIDIA's 16. supports_op does
 // not check offsets, so nothing rejected the node before execution.
 //
-//   (1) layout: every ARGMAX source starts at an offset aligned to 256 bytes,
-//       the Vulkan spec's upper bound for minStorageBufferOffsetAlignment, so
-//       no conforming device can see it misaligned (fails on the old graph:
-//       the duration view sat at view_offs 32772);
+//   (1) layout: no ARGMAX source is a view whose byte offset is not a
+//       multiple of 256, the Vulkan spec's upper bound for
+//       minStorageBufferOffsetAlignment — a fresh allocator-aligned tensor
+//       is always fine (fails on the old graph: the duration view sat at
+//       view_offs 32772, and the check fails again if the ggml_cont is ever
+//       removed);
 //   (2) values: token and duration indices match a host argmax over the
 //       same slices at the v3 dimensions (8193 tokens + 5 durations),
 //       including a duration maximum larger than every token logit.
@@ -45,11 +47,6 @@ constexpr int kTokenCount = 8193;  // parakeet-tdt-0.6b-v3: vocab 8192 + blank
 constexpr int kNumDur = 5;         // tdt_durations {0, 1, 2, 3, 4}
 constexpr size_t kMaxVulkanOffsetAlignment = 256;
 
-size_t source_offset(const ggml_tensor* argmax) {
-    const ggml_tensor* src = argmax->src[0];
-    return src->view_src ? src->view_offs : 0;
-}
-
 void run_case(const char* name, const std::vector<float>& logits,
               int want_tok, int want_dur) {
     for (int which = 0; which < 2; ++which) {
@@ -63,10 +60,19 @@ void run_case(const char* name, const std::vector<float>& logits,
             for (const ggml_tensor* t : { amax.tok, amax.dur }) {
                 check(t->op == GGML_OP_ARGMAX && t->type == GGML_TYPE_I32,
                       std::string(name) + ": split must end in i32 ARGMAX nodes");
-                check(source_offset(t) % kMaxVulkanOffsetAlignment == 0,
-                      std::string(name) + ": ARGMAX source at byte offset "
-                      + std::to_string(source_offset(t))
-                      + " is not 256-byte aligned (ggml-vulkan asserts)");
+                // A view's data sits view_offs bytes into its parent buffer;
+                // a non-view tensor's data is allocator-aligned (well under
+                // the Vulkan spec's 256-byte bound). #57's failure mode is
+                // an ARGMAX over a VIEW at a misaligned offset, so assert
+                // exactly that shape: reading a plain offset instead would
+                // always see 0 after the fix and catch nothing.
+                const ggml_tensor* src = t->src[0];
+                check(!src->view_src ||
+                          src->view_offs % kMaxVulkanOffsetAlignment == 0,
+                      std::string(name) + ": ARGMAX source is a view at byte "
+                      "offset " + std::to_string(src->view_offs)
+                      + ", not 256-byte aligned (ggml-vulkan asserts; copy the "
+                        "slice into an aligned tensor first)");
             }
             return ggml_cast(c, which == 0 ? amax.tok : amax.dur, GGML_TYPE_F32);
         }, out);

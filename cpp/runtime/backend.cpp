@@ -297,15 +297,35 @@ Backend::Backend(int n_threads) : impl_(new Impl()), n_threads_(n_threads < 1 ? 
     // would otherwise kill the process with no message on the first matmul,
     // after a load that reported success. Fail the load here instead. The
     // probe uses the same search order as the delay-load helper, and the
-    // module stays loaded for it.
+    // module stays loaded for it. Both cuBLAS DLLs are probed explicitly:
+    // cublas64 happens to import cublasLt64 today, so loading the former
+    // transitively loads the latter, but a ggml that calls cublasLt directly
+    // must not die silently at first use either.
     if (chosen &&
-        std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(chosen)), "CUDA") == 0 &&
-        !LoadLibraryA(STARLING_CUBLAS_DLL)) {
-        throw std::runtime_error(
-            std::string("CUDA device ") + ggml_backend_dev_name(chosen) +
-            " needs " STARLING_CUBLAS_DLL " (cuBLAS), which could not be loaded; "
-            "add the CUDA runtime's cuBLAS DLL directory to PATH (see RUNTIME.md) "
-            "or set STARLING_GGML_DEVICE=cpu");
+        std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(chosen)), "CUDA") == 0) {
+        // cublas64 imports cublasLt64, so probe cublasLt first: when only
+        // cublasLt is missing, loading cublas64 would fail with a misleading
+        // error naming a DLL that is present.
+        const char* const cublas_dlls[] = {
+#ifdef STARLING_CUBLASLT_DLL
+            STARLING_CUBLASLT_DLL,
+#endif
+            STARLING_CUBLAS_DLL,
+        };
+        for (const char* dll : cublas_dlls) {
+            if (!LoadLibraryA(dll)) {
+                // Include GetLastError(): the code separates causes that need
+                // different user fixes (126 = the DLL or one of its
+                // dependencies was not found, 193 = bitness mismatch, ...).
+                const DWORD load_error = GetLastError();
+                throw std::runtime_error(
+                    std::string("CUDA device ") + ggml_backend_dev_name(chosen) +
+                    " needs " + dll + " (cuBLAS), which could not be loaded (Windows error " +
+                    std::to_string(load_error) +
+                    "); add the CUDA runtime's cuBLAS DLL directory to PATH (see RUNTIME.md) "
+                    "or set STARLING_GGML_DEVICE=cpu");
+            }
+        }
     }
 #endif
     if (chosen) {

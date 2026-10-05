@@ -66,8 +66,13 @@ $abiText = (& $exe --abi-version | Out-String).Trim()
 "ABI: $abiText"
 if ($abiText -ne $Abi) { throw "Expected ABI $Abi, got $abiText" }
 
+# Inference takes all three of -Gguf/-Audio/-Expected or none of them: a
+# caller who passes only some asked for the hardware verification, and a
+# silent startup-only pass would be a false success.
+if (($Gguf -or $Audio -or $Expected) -and -not ($Gguf -and $Audio -and $Expected)) {
+    throw 'Inference requires all of -Gguf, -Audio, and -Expected'
+}
 if (-not $Gguf) { "startup check passed (no inference requested)"; exit 0 }
-if (-not $Audio -or -not $Expected) { throw '-Gguf needs -Audio and -Expected' }
 
 # A server already listening on the port could answer for the one under test.
 if (Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue) {
@@ -113,10 +118,17 @@ try {
     if ($text -cne $Expected) { throw "Transcript mismatch: '$text' != '$Expected'" }
     if ($proc.HasExited) { throw 'Server died during transcription' }
 
-    # Which runtime and driver DLLs the server actually loaded, and from where.
-    $modules = (Get-Process -Id $proc.Id).Modules |
-        Where-Object { $_.ModuleName -match '^(vcomp|cudart|cublas|nvcuda|vulkan-1|nvoglv|amdvlk|igvk)' } |
-        Sort-Object ModuleName
+    # Which runtime and driver DLLs the server actually loaded, and from
+    # where. The process can exit between the check above and this query, or
+    # module access can be denied; name the actual failure instead of letting
+    # an unrelated runtime error escape.
+    try {
+        $modules = (Get-Process -Id $proc.Id -ErrorAction Stop).Modules |
+            Where-Object { $_.ModuleName -match '^(vcomp|cudart|cublas|nvcuda|vulkan-1|nvoglv|amdvlk|igvk)' } |
+            Sort-Object ModuleName
+    } catch {
+        throw "Could not enumerate the server's loaded modules (pid $($proc.Id)): $($_.Exception.Message)"
+    }
     $modules | ForEach-Object { "loaded: $($_.FileName) $($_.FileVersionInfo.FileVersion)" }
     if ($flavor -eq 'cuda') {
         # The CUDA runtime (cudart) is linked statically on Windows; cuBLAS

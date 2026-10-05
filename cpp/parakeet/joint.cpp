@@ -28,6 +28,12 @@ TdtSliceArgmax tdt_slice_argmax(ggml_context* ctx, ggml_tensor* y,
     ggml_tensor* tok_view = ggml_view_1d(ctx, y, token_count, 0);
     ggml_tensor* dur_view = ggml_view_1d(ctx, y, num_dur,
                             (size_t)token_count * sizeof(float));
+    // The ggml_cont runs unconditionally on every backend, including CPU and
+    // RADV where the view would be addressable: an exact num_dur (5) float
+    // copy per step is the accepted trade-off. It is negligible next to the
+    // per-step joint matmuls, and gating it on the device's
+    // minStorageBufferOffsetAlignment would fork the decode graph per backend
+    // for no measurable gain. Byte-identical outputs everywhere. See joint.hpp.
     return { ggml_argmax(ctx, tok_view), ggml_argmax(ctx, ggml_cont(ctx, dur_view)) };
 }
 
