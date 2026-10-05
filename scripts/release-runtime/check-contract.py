@@ -135,6 +135,53 @@ def vulkan_sdk_errors(desktop_workflow: str, release_workflow: str) -> list[str]
     return errors
 
 
+HARDWARE_SECTION = "## Hardware verification"
+
+
+def hardware_coverage_errors(release_runtime: str, release_workflow: str) -> list[str]:
+    """Hardware coverage must stay explicit (#57).
+
+    The runtime guide's Hardware verification ledger needs one row per
+    artifact in its Prerequisites table, each starting "Verified" or
+    "Not verified", and the release body must name exactly the
+    "Not verified" artifacts in its "Not verified on hardware:" line, so a
+    new artifact cannot ship without a coverage statement and the release
+    notes cannot drop an unverified one.
+    """
+    errors = []
+    table = re.search(r"^## Prerequisites\n(.*?)(?=\n## |\Z)", release_runtime, re.S | re.M)
+    prerequisites = re.findall(r"^\| `([a-z0-9-]+)` \|", table.group(1) if table else "", re.M)
+    if not prerequisites:
+        errors.append(f"{DOCS[0]}: expected artifact rows in the Prerequisites table")
+    section = re.search(re.escape(HARDWARE_SECTION) + r"\n(.*?)(?=\n## |\Z)", release_runtime, re.S)
+    if not section:
+        return [f"{DOCS[0]}: expected a {HARDWARE_SECTION!r} section"]
+    rows = re.findall(r"^\| `([a-z0-9-]+)` \| ([^|]*) \|", section.group(1), re.M)
+    ledger = [name for name, _ in rows]
+    if sorted(ledger) != sorted(prerequisites) or len(set(ledger)) != len(ledger):
+        errors.append(
+            f"{DOCS[0]}: the Hardware verification ledger must have exactly one row per "
+            f"artifact in the Prerequisites table; prerequisites={prerequisites} ledger={ledger}")
+    unverified = []
+    for name, status in rows:
+        if status.startswith("Not verified"):
+            unverified.append(name)
+        elif not status.startswith("Verified"):
+            errors.append(
+                f"{DOCS[0]}: Hardware verification status for `{name}` must start with "
+                f"\"Verified\" or \"Not verified\"; found {status!r}")
+    found = re.findall(r"Not verified on hardware: ((?:`[a-z0-9-]+`(?:, )?)+)\.", release_workflow)
+    if len(found) != 1:
+        errors.append(f"{WORKFLOW}: the release body must state \"Not verified on hardware: "
+                      "`artifact`, ...\" exactly once")
+    elif sorted(re.findall(r"`([a-z0-9-]+)`", found[0])) != sorted(unverified):
+        errors.append(
+            f"{WORKFLOW}: the release body's \"Not verified on hardware\" list must match the "
+            f"ledger's Not verified rows; release body={re.findall(r'`([a-z0-9-]+)`', found[0])} "
+            f"ledger={unverified}")
+    return errors
+
+
 def check(workflow: str, docs: dict[str, str], executing_cuda_version: str | None = None,
           dockerfile: str = "") -> list[str]:
     errors = []
@@ -234,11 +281,14 @@ def main() -> int:
         (ROOT / PREPARE).read_text(encoding="utf-8"),
         (ROOT / DOCS[0]).read_text(encoding="utf-8"))
     errors += vulkan_sdk_errors(desktop_workflow_text, workflow_text)
+    errors += hardware_coverage_errors(
+        (ROOT / DOCS[0]).read_text(encoding="utf-8"), workflow_text)
     if errors:
         print("\n".join(errors), file=sys.stderr)
         return 1
     print("CUDA and ROCm installers and runtime guidance agree; "
-          "bundled desktop engines agree; Vulkan SDK pins agree")
+          "bundled desktop engines agree; Vulkan SDK pins agree; "
+          "hardware coverage is explicit")
     return 0
 
 

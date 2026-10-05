@@ -132,7 +132,50 @@ def test_rejects_humbletim_vulkan_action():
 def test_release_preflight_checks_bundled_engines_too(monkeypatch, capsys):
     monkeypatch.setattr("sys.argv", ["check-contract.py"])
     assert contract.main() == 0
-    assert "bundled desktop engines agree" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "bundled desktop engines agree" in out
+    assert "hardware coverage is explicit" in out
+
+
+def coverage_inputs():
+    workflow, docs, _ = inputs()
+    return docs[contract.DOCS[0]], workflow
+
+
+def test_current_hardware_coverage_contract():
+    assert contract.hardware_coverage_errors(*coverage_inputs()) == []
+
+
+def ledger_row(release_runtime, artifact):
+    section = release_runtime.split(contract.HARDWARE_SECTION, 1)[1]
+    return re.search(rf"^\| `{artifact}` \|.*$", section, re.M).group(0)
+
+
+@pytest.mark.parametrize("mutate", [
+    "drop-row", "duplicate-row", "vague-status", "unlisted-unverified",
+    "listed-verified", "no-release-line", "no-section",
+])
+def test_rejects_implicit_hardware_coverage(mutate):
+    release_runtime, workflow = coverage_inputs()
+    unverified = re.search(r"Not verified on hardware: ([^\n]*)\.", workflow).group(1)
+    first = re.findall(r"`([a-z0-9-]+)`", unverified)[0]
+    rocm = ledger_row(release_runtime, first)
+    cuda = ledger_row(release_runtime, "linux-cuda")
+    if mutate == "drop-row":
+        release_runtime = release_runtime.replace(rocm + "\n", "")
+    elif mutate == "duplicate-row":
+        release_runtime = release_runtime.replace(cuda, cuda + "\n" + cuda)
+    elif mutate == "vague-status":
+        release_runtime = release_runtime.replace(cuda, cuda.replace("| Verified", "| Probably works", 1))
+    elif mutate == "unlisted-unverified":
+        release_runtime = release_runtime.replace(cuda, cuda.replace("| Verified", "| Not verified", 1))
+    elif mutate == "listed-verified":
+        workflow = workflow.replace(unverified, unverified + ", `linux-cuda`")
+    elif mutate == "no-release-line":
+        workflow = workflow.replace("Not verified on hardware: ", "Untested: ")
+    elif mutate == "no-section":
+        release_runtime = release_runtime.replace(contract.HARDWARE_SECTION, "## Hardware notes")
+    assert contract.hardware_coverage_errors(release_runtime, workflow)
 
 
 def test_current_release_contract():
@@ -147,7 +190,7 @@ def test_current_release_contract():
     (contract.WORKFLOW, 'cuda: ${{ env.CUDA_VERSION }}', "cuda: '@BAD_VERSION@'"),
     (contract.WORKFLOW, 'CUDA requires the @SERIES@', 'CUDA requires the @BAD_SERIES@'),
     (contract.DOCS[0], 'CUDA @SERIES@ runtime and cuBLAS libraries', 'CUDA @BAD_SERIES@ runtime and cuBLAS libraries'),
-    (contract.DOCS[0], 'CUDA @SERIES@ runtime and cuBLAS DLLs', 'CUDA @BAD_SERIES@ runtime and cuBLAS DLLs'),
+    (contract.DOCS[0], "CUDA @SERIES@ runtime's cuBLAS DLLs", "CUDA @BAD_SERIES@ runtime's cuBLAS DLLs"),
     (contract.DOCS[1], 'The workflow builds with CUDA @SERIES@.', 'The workflow builds with CUDA @BAD_SERIES@.'),
     (contract.DOCKERFILE, 'cuda-cudart-@SERIES_DASHED@ libcublas-@SERIES_DASHED@', 'cuda-cudart-@BAD_DASHED@ libcublas-@BAD_DASHED@'),
 ])
