@@ -310,11 +310,15 @@ pub(crate) fn quiesce_salvage_note(samples: u64, sample_rate: u32) -> String {
 
 impl StarlingApp {
     /// The on-screen record button: a toggle in every activation mode,
-    /// through the same machine as the shortcut (#221). `showed_recording`
-    /// is what the button showed when it was rendered (Stop or Start).
-    pub fn toggle_recording(&mut self, showed_recording: bool, cx: &mut Context<Self>) {
+    /// through the same machine as the shortcut (#221). `showed` is what
+    /// the button showed when it was rendered (Stop or Start).
+    pub fn toggle_recording(
+        &mut self,
+        showed: crate::activation::RecordButton,
+        cx: &mut Context<Self>,
+    ) {
         self.flush_system_events(cx);
-        if !crate::activation::click_matches(showed_recording, self.recorder.is_some()) {
+        if !crate::activation::click_matches(showed, self.recorder.is_some()) {
             cx.notify();
             return;
         }
@@ -475,6 +479,7 @@ impl StarlingApp {
                                         journal_report,
                                         note,
                                         None,
+                                        None,
                                         cx,
                                     );
                                 })
@@ -597,6 +602,11 @@ impl StarlingApp {
             Err(recorder::RecorderError::Empty) => (None, None),
             Err(err) => {
                 self.error = Some(err.to_string());
+                // The stop failed before any take existed to bind the kept
+                // draft to; failing it is the honest resolution.
+                if let Some(token) = staging {
+                    self.staging_save_failed(token, cx);
+                }
                 (None, None)
             }
         };
@@ -611,34 +621,47 @@ impl StarlingApp {
         let journal_report =
             journal_report.filter(|report| report.finalized && report.fault.is_none());
         let kept = audio.as_ref().is_some_and(|audio| !audio.samples.is_empty());
-        match reason {
-            CancelReason::Escape => {
-                self.take_notice = Some(if kept {
+        // Notices that promise history are shown only once the save below
+        // lands — a failed save explains itself through the error banner
+        // instead, so the notice can never contradict what happened.
+        let saved_notice = match reason {
+            CancelReason::Escape if kept => {
+                Some(
                     "Cancelled with Escape. Nothing was transcribed or delivered; the audio is \
                      in your history, ready to transcribe if you need the words."
-                        .to_string()
-                } else {
-                    "Cancelled with Escape before any audio was captured.".to_string()
-                });
+                        .to_string(),
+                )
+            }
+            CancelReason::Escape => {
+                self.take_notice = Some(
+                    "Cancelled with Escape before any audio was captured.".to_string(),
+                );
+                None
             }
             CancelReason::NoAudioYet if kept => {
-                self.take_notice = Some(
+                Some(
                     "Stopped before the microphone was fully ready. The little audio it \
                      captured is in your history; nothing was transcribed."
                         .to_string(),
-                );
+                )
             }
-            CancelReason::NoAudioYet => {}
+            CancelReason::NoAudioYet => None,
             CancelReason::MicStalled => {
                 self.error = Some(format!(
                     "The microphone delivered no audio within {} seconds, so the take was \
                      stopped. Check that the input device is connected and not muted.",
                     crate::activation::START_STALL.as_secs()
                 ));
+                None
             }
-        }
+        };
         cx.notify();
         let Some(audio) = audio.filter(|audio| !audio.samples.is_empty()) else {
+            // Nothing was captured, so no take is saved for the kept draft
+            // to bind to: fail it rather than leave it dangling.
+            if let Some(token) = staging {
+                self.staging_save_failed(token, cx);
+            }
             return;
         };
         let note = match reason {
@@ -651,18 +674,33 @@ impl StarlingApp {
             let encoded = cx
                 .background_spawn(async move { audio::encode_wav_16k(&audio) })
                 .await;
-            this.update(cx, |app, cx| {
+            let saved = this.update(cx, |app, cx| {
                 match encoded {
-                    Ok(wav) => {
-                        app.save_interrupted_take(Arc::new(wav), journal_report, note, staging, cx)
-                    }
+                    Ok(wav) => app.save_interrupted_take(
+                        Arc::new(wav),
+                        journal_report,
+                        note,
+                        saved_notice,
+                        staging,
+                        cx,
+                    ),
                     Err(err) => {
                         app.error = Some(err.to_string());
+                        // The take exists only as audio; with no history
+                        // entry to bind to, the kept draft fails here.
+                        if let Some(token) = staging {
+                            app.staging_save_failed(token, cx);
+                        }
                         cx.notify();
                     }
                 }
-            })
-            .ok();
+            });
+            if saved.is_err() {
+                // The window closed while the take was encoding: nothing
+                // can persist the WAV, and the journal, if any, stays on
+                // disk.
+                eprintln!("a cancelled take could not be saved: the app window is gone");
+            }
         })
         .detach();
     }
@@ -746,11 +784,15 @@ impl StarlingApp {
     /// phase 2): the audio goes through the same storage path, then the
     /// session is marked interrupted with `note` stating exactly what
     /// survived. No transcription is started — the user decides to retry.
+    /// `notice`, when set, is the user-facing take notice, shown only
+    /// once the take really is in history.
+    #[allow(clippy::too_many_arguments)]
     pub fn save_interrupted_take(
         &mut self,
         wav: Arc<Vec<u8>>,
         journal: Option<recorder::JournalReport>,
         note: String,
+        notice: Option<String>,
         staging: Option<u64>,
         cx: &mut Context<Self>,
     ) {
@@ -778,8 +820,19 @@ impl StarlingApp {
                 .await;
             match created {
                 Ok(id) => {
-                    if let Some(token) = staging {
-                        this.update(cx, |app, _cx| app.bind_staging(token, &id)).ok();
+                    if notice.is_some() || staging.is_some() {
+                        this.update(cx, |app, cx| {
+                            if let Some(token) = staging {
+                                app.bind_staging(token, &id);
+                            }
+                            // The take is in history only now (#221): the
+                            // cancel notice that says so lands here.
+                            if let Some(notice) = notice {
+                                app.take_notice = Some(notice);
+                            }
+                            cx.notify();
+                        })
+                        .ok();
                     }
                     refresh_sessions(&this, &store, cx).await;
                 }

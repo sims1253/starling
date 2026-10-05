@@ -135,13 +135,21 @@ impl Default for DictationSettings {
 }
 
 /// Reads the `dictation` key without ever failing the whole file: any
-/// shape this build cannot read (a wrong type, `null`) is the defaults.
+/// shape this build cannot read (a wrong type, `null`) is the defaults —
+/// with the reason logged, so a shortcut that "disappeared" is
+/// explainable.
 fn lenient_dictation<'de, D>(deserializer: D) -> Result<DictationSettings, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     let value = <serde_json::Value as serde::Deserialize>::deserialize(deserializer)?;
-    Ok(serde_json::from_value(value).unwrap_or_default())
+    match serde_json::from_value(value) {
+        Ok(dictation) => Ok(dictation),
+        Err(err) => {
+            eprintln!("Unreadable dictation settings; using the defaults: {err}");
+            Ok(DictationSettings::default())
+        }
+    }
 }
 
 /// Which processing mode runs after a take is transcribed, and where its
@@ -277,7 +285,13 @@ impl Settings {
         let dictation = value
             .get("dictation")
             .cloned()
-            .and_then(|dictation| serde_json::from_value(dictation).ok())
+            .and_then(|dictation| match serde_json::from_value::<DictationSettings>(dictation) {
+                Ok(dictation) => Some(dictation),
+                Err(err) => {
+                    eprintln!("Unreadable dictation settings; using the defaults: {err}");
+                    None
+                }
+            })
             .unwrap_or_default();
         let Ok(mut settings) = serde_json::from_value::<Settings>(value) else {
             let mut fallback = Self::default_settings();

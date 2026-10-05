@@ -1059,6 +1059,7 @@ fn render_dictation_section(app: &mut StarlingApp, cx: &mut Context<StarlingApp>
                 selected,
                 name,
                 description,
+                true,
             )
             .on_click(cx.listener(move |this, _, _window, cx| {
                 this.draft_activation = mode;
@@ -1078,6 +1079,7 @@ fn render_dictation_section(app: &mut StarlingApp, cx: &mut Context<StarlingApp>
         } else {
             "Only for Hold to talk: the other modes already keep recording after a tap."
         },
+        hold,
     )
     .when(!hold, |row| row.opacity(0.5))
     .when(hold, |row| {
@@ -1087,10 +1089,7 @@ fn render_dictation_section(app: &mut StarlingApp, cx: &mut Context<StarlingApp>
         }))
     });
 
-    let reach = crate::shortcut::reach_note(
-        app.shortcut_registration.as_ref().map(|_| ()).map_err(String::as_str),
-        &app.shortcut,
-    );
+    let reach = crate::shortcut::reach_note(&app.shortcut_registration, &app.shortcut);
     let mut field = field_label("Recording shortcut")
         .child(app.draft_shortcut.clone())
         .child(helper(
@@ -1138,12 +1137,15 @@ fn render_dictation_section(app: &mut StarlingApp, cx: &mut Context<StarlingApp>
         )
 }
 
-/// One selectable row: a radio dot, a name, and a description.
+/// One selectable row: a radio dot, a name, and a description. A
+/// disabled row carries no pointer or hover affordance — there is
+/// nothing to click.
 fn choice_row(
     id: SharedString,
     selected: bool,
     name: &'static str,
     description: &'static str,
+    enabled: bool,
 ) -> gpui::Stateful<Div> {
     div()
         .id(id)
@@ -1158,8 +1160,10 @@ fn choice_row(
         } else {
             theme::SETTINGS_LINE
         })
-        .cursor_pointer()
-        .hover(|style| style.bg(theme::PAPER_HOVER))
+        .when(enabled, |row| {
+            row.cursor_pointer()
+                .hover(|style| style.bg(theme::PAPER_HOVER))
+        })
         .child(
             div()
                 .mt(px(2.))

@@ -82,6 +82,13 @@ pub fn render_capture(
     cx: &mut Context<StarlingApp>,
 ) -> impl IntoElement {
     let recording = app.recorder.is_some();
+    // What the record button shows, captured for its click handler: a
+    // click only acts while the state it targeted still holds.
+    let record_button = if recording {
+        crate::activation::RecordButton::Stop
+    } else {
+        crate::activation::RecordButton::Start
+    };
     // The staging panel needs the room a transcript would: the recorder
     // and headline go compact either way.
     let has_transcript = app.selected().is_some() || app.staging.is_some();
@@ -154,7 +161,7 @@ pub fn render_capture(
                         ),
                 ),
         )
-        .child(render_recorder(app, cx, recording, has_transcript))
+        .child(render_recorder(app, cx, record_button, has_transcript))
         .children(render_engine_card(app, cx))
         .children(staging_panel)
         .when(recording && app.staging.is_none() && !app.live_partial.is_empty(), |pane| {
@@ -173,10 +180,11 @@ pub fn render_capture(
 fn render_recorder(
     app: &mut StarlingApp,
     cx: &mut Context<StarlingApp>,
-    recording: bool,
+    button: crate::activation::RecordButton,
     has_transcript: bool,
 ) -> Div {
     let button_size = if has_transcript { 90. } else { 116. };
+    let recording = button == crate::activation::RecordButton::Stop;
 
     let recorder = if has_transcript {
         div().h(px(150.)).flex_none()
@@ -293,7 +301,7 @@ fn render_recorder(
                             ])
                         })
                         .on_click(cx.listener(move |this, _, _window, cx| {
-                            this.toggle_recording(recording, cx);
+                            this.toggle_recording(button, cx);
                         }))
                         .child(
                             div()

@@ -1730,7 +1730,7 @@ impl StarlingApp {
         // empty endpoint field the dialog does not even show would lock
         // the user out of saving anything else.
         let engine_mode = self.draft_engine_mode;
-        if engine_mode == EngineMode::Manual {
+        let manual_endpoint = if engine_mode == EngineMode::Manual {
             let draft = self.draft_endpoint.read(cx).value();
             let clean = normalize_draft_endpoint(&draft);
             if let Err(reason) = validated_draft_endpoint(&clean) {
@@ -1750,6 +1750,27 @@ impl StarlingApp {
                 cx.notify();
                 return;
             }
+            Some(clean)
+        } else {
+            None
+        };
+        // #221: the shortcut swap is the last check that can refuse the
+        // save, so it runs before any field is applied: a platform refusal
+        // keeps the previous shortcut registered, nothing else changes,
+        // and the dialog stays open with the reason. Mid-take the swap
+        // waits for the take to end; a failure then keeps the old shortcut
+        // running and says why.
+        if self.activation.is_active() {
+            self.pending_shortcut = Some(shortcut.clone());
+        } else {
+            self.pending_shortcut = None;
+            if let Err(reason) = self.apply_shortcut(shortcut.clone()) {
+                self.dictation_draft_error = Some(reason);
+                cx.notify();
+                return;
+            }
+        }
+        if let Some(clean) = manual_endpoint {
             self.endpoint = clean;
             // R02: only a save that changes the model marks it user-set, so an
             // endpoint-only edit keeps the server's health auto-sync alive.
@@ -1787,8 +1808,6 @@ impl StarlingApp {
             }
         }
 
-        // #221: the dictation settings apply to the next gesture; a take
-        // that is running keeps running.
         self.dictation_settings = DictationSettings {
             shortcut: shortcut.text().to_string(),
             activation: self.draft_activation,
@@ -1796,7 +1815,6 @@ impl StarlingApp {
         };
         self.activation
             .set_config(crate::activation::ActivationConfig::from_settings(&self.dictation_settings));
-        self.set_shortcut(shortcut);
 
         // R11: an unresolvable config directory is surfaced, not swallowed —
         // settings must not silently land in the current working directory.
@@ -2455,7 +2473,11 @@ impl Render for StarlingApp {
             // binding; releases come here, in the capture phase, so no
             // child can swallow the end of a hold.
             .capture_key_up(cx.listener(|this, event: &gpui::KeyUpEvent, _window, cx| {
-                this.shortcut_key_up(&event.keystroke, cx);
+                if this.shortcut_key_up(&event.keystroke, cx) {
+                    // The press was swallowed by the interceptor; its
+                    // release must not reach the focused editor either.
+                    cx.stop_propagation();
+                }
             }))
             .relative()
             .size_full()

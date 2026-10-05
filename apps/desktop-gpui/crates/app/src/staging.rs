@@ -65,6 +65,11 @@ pub(crate) struct Staging {
     pending_accept: Option<(u64, ProposalRow)>,
     failed_revision: Option<u64>,
     close_when_saved: bool,
+    /// A cancelled draft whose interrupted take is still being saved: it
+    /// has no take to recover from yet, so it must survive the next take
+    /// until the save binds it (`bind_staging`) or fails
+    /// (`staging_save_failed`).
+    cancel_save_pending: bool,
     persist_generation: u64,
     persisted_revision: u64,
     _subscription: Subscription,
@@ -201,6 +206,7 @@ impl StarlingApp {
             pending_accept: None,
             failed_revision: None,
             close_when_saved: false,
+            cancel_save_pending: false,
             persist_generation: 0,
             persisted_revision: 0,
             _subscription: subscription,
@@ -232,6 +238,11 @@ impl StarlingApp {
                         "The unsaved draft of take {id} was kept. Select that take in history to \
                          recover it."
                     ));
+                    self.background_stagings.push(staging);
+                } else if staging.cancel_save_pending {
+                    // The cancelled take's save is still in flight; until
+                    // it binds or fails, this panel is the only copy of
+                    // the user's words.
                     self.background_stagings.push(staging);
                 }
             }
@@ -274,7 +285,8 @@ impl StarlingApp {
     /// draft the user typed into stays on screen (interrupted, with the
     /// notice to copy it) and its token is returned, so the cancel path
     /// can bind it to the saved take — a bound draft survives the next
-    /// take starting. An untouched one simply goes away.
+    /// take starting, and so does one whose save is still pending. An
+    /// untouched one simply goes away.
     pub(crate) fn staging_cancelled(&mut self, cx: &mut Context<Self>) -> Option<u64> {
         let staging = self.staging.as_ref()?;
         let token = staging.token;
@@ -284,6 +296,9 @@ impl StarlingApp {
             self.retire_staging(cx);
             None
         } else {
+            if let Some(staging) = self.staging.as_mut() {
+                staging.cancel_save_pending = true;
+            }
             Some(token)
         }
     }
@@ -380,6 +395,7 @@ impl StarlingApp {
     pub(crate) fn bind_staging(&mut self, token: u64, id: &str) {
         if let Some(staging) = self.staging_mut(token) {
             staging.take_id = Some(id.to_string());
+            staging.cancel_save_pending = false;
         }
     }
 
@@ -392,6 +408,9 @@ impl StarlingApp {
                  before you close the panel."
                     .to_string(),
             );
+            // The cancelled take's save resolved (badly): the draft is no
+            // longer waiting for anything.
+            staging.cancel_save_pending = false;
         }
         self.settle_failed_staging(token);
         cx.notify();
@@ -1223,6 +1242,47 @@ mod tests {
                     .iter()
                     .any(|staging| staging.take_id.as_deref() == Some("cancelled-take")),
                 "the edited draft must outlive the next take"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn a_cancelled_draft_awaiting_its_save_survives_the_next_take(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // The next take starts before the interrupted take's save bound
+        // the cancelled draft: it waits in the background, and the save
+        // resolves it either way.
+        let app = cx.new(|cx| StarlingApp::for_test(None, cx));
+        app.update(cx, |app, cx| {
+            app.begin_staging(cx);
+            let editor = app.staging.as_ref().unwrap().editor.clone();
+            editor.update(cx, |editor, _| editor.buffer.text = "my words".into());
+            let token = app.staging_cancelled(cx).expect("an edited draft is kept");
+            app.begin_staging(cx);
+            assert!(
+                app.background_stagings.iter().any(|staging| staging.token == token),
+                "the draft must wait for its save, not die with the next take"
+            );
+            // The save fails: the wait is over and the draft is let go
+            // (its notice said to copy it while it was on screen).
+            app.staging_save_failed(token, cx);
+            assert!(!app.background_stagings.iter().any(|staging| staging.token == token));
+        });
+        // The save binds instead: the draft is recoverable like any kept
+        // draft of a take.
+        let app = cx.new(|cx| StarlingApp::for_test(None, cx));
+        app.update(cx, |app, cx| {
+            app.begin_staging(cx);
+            let editor = app.staging.as_ref().unwrap().editor.clone();
+            editor.update(cx, |editor, _| editor.buffer.text = "my words".into());
+            let token = app.staging_cancelled(cx).expect("an edited draft is kept");
+            app.begin_staging(cx);
+            app.bind_staging(token, "cancelled-take");
+            assert!(
+                app.background_stagings
+                    .iter()
+                    .any(|staging| staging.take_id.as_deref() == Some("cancelled-take"))
             );
         });
     }

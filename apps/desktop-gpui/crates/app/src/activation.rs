@@ -61,12 +61,23 @@ pub(crate) const DOUBLE_TAP_WINDOW: Duration = Duration::from_millis(400);
 /// runs on, so a longer silence means the release was lost.
 pub(crate) const REPEAT_GAP: Duration = Duration::from_millis(1200);
 
+/// What the record button showed when it was clicked: the state a click
+/// must still match for it to mean anything.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RecordButton {
+    Start,
+    Stop,
+}
+
 /// Whether a record-button click still means what the button showed when
 /// it was clicked. A click aimed at Stop after an Escape or release already
 /// ended the take (or at Start after the shortcut began one) is stale and
 /// does nothing, instead of toggling the other way.
-pub(crate) fn click_matches(showed_recording: bool, recording: bool) -> bool {
-    showed_recording == recording
+pub(crate) fn click_matches(showed: RecordButton, recording: bool) -> bool {
+    match showed {
+        RecordButton::Stop => recording,
+        RecordButton::Start => !recording,
+    }
 }
 
 /// Whether the Starling window was focused at `at`, from its recorded
@@ -166,6 +177,10 @@ enum Phase {
         take: TakeId,
         readiness: Readiness,
         latch: Latch,
+        /// The configuration this take started with: a mode saved
+        /// mid-gesture applies to the next take, never to the one the
+        /// user is holding.
+        config: ActivationConfig,
         started_at: Instant,
         pressed_at: Instant,
         /// Hold mode with double tap: the take was tapped and waits this
@@ -246,6 +261,11 @@ impl Activation {
         self.last_key_event = None;
     }
 
+    /// Whether the shortcut key is down from a press the machine took.
+    pub(crate) fn key_is_down(&self) -> bool {
+        self.key_down
+    }
+
     /// The shortcut went down. `may_start` is false while the app must
     /// not begin a take (a modal is open): such a press can still stop
     /// the active take, but never starts one.
@@ -297,7 +317,9 @@ impl Activation {
         }
     }
 
-    /// The shortcut went up.
+    /// The shortcut went up. The take decides with the configuration it
+    /// started with — a mode saved mid-gesture would otherwise change
+    /// what a pending release means.
     pub(crate) fn release(&mut self, now: Instant) -> Vec<Effect> {
         if !self.key_down {
             return Vec::new();
@@ -308,30 +330,27 @@ impl Activation {
             latch: Latch::Held,
             pressed_at,
             tap_deadline: None,
+            config,
             ..
         } = self.phase
         else {
             return Vec::new();
         };
         let tap = now.saturating_duration_since(pressed_at) < TAP_MAX;
-        match self.config.mode {
-            ActivationMode::Toggle => {
-                // Only reachable when the mode changed mid-hold: the take
-                // keeps running until the next press, as toggle does.
-                self.set_latch(Latch::Latched);
-                Vec::new()
-            }
+        match config.mode {
             ActivationMode::HoldOrToggle if tap => {
                 self.set_latch(Latch::Latched);
                 Vec::new()
             }
-            ActivationMode::Hold if tap && self.config.double_tap_hands_free => {
+            ActivationMode::Hold if tap && config.double_tap_hands_free => {
                 if let Phase::Active { tap_deadline, .. } = &mut self.phase {
                     *tap_deadline = Some(now + DOUBLE_TAP_WINDOW);
                 }
                 Vec::new()
             }
-            ActivationMode::HoldOrToggle | ActivationMode::Hold => self.finish(),
+            // A held take never started in Toggle mode (its takes are
+            // latched from the start), so every other release finishes it.
+            _ => self.finish(),
         }
     }
 
@@ -423,6 +442,7 @@ impl Activation {
             take,
             readiness: Readiness::Starting,
             latch,
+            config: self.config,
             started_at: now,
             pressed_at: now,
             tap_deadline: None,
@@ -493,7 +513,8 @@ impl StarlingApp {
         match shortcuts {
             Ok(shortcuts) => {
                 self.global_shortcuts = Some(shortcuts);
-                self.register_shortcut();
+                let current = self.shortcut.clone();
+                self.register_shortcut(&current);
             }
             Err(reason) => self.shortcut_registration = Err(reason),
         }
@@ -512,10 +533,10 @@ impl StarlingApp {
         .detach();
     }
 
-    /// (Re-)register the committed shortcut system-wide.
-    pub(crate) fn register_shortcut(&mut self) {
+    /// (Re-)register a shortcut system-wide, recording whether it took.
+    pub(crate) fn register_shortcut(&mut self, shortcut: &crate::shortcut::Shortcut) {
         if let Some(shortcuts) = self.global_shortcuts.as_mut() {
-            self.shortcut_registration = shortcuts.set_record(&self.shortcut);
+            self.shortcut_registration = shortcuts.set_record(shortcut);
         }
     }
 
@@ -556,7 +577,7 @@ impl StarlingApp {
     /// UI input never overtakes a system-wide one that happened first.
     pub(crate) fn flush_system_events(&mut self, cx: &mut Context<Self>) {
         loop {
-            let Some(shortcuts) = self.global_shortcuts.as_ref() else {
+            let Some(shortcuts) = self.global_shortcuts.as_mut() else {
                 return;
             };
             let Some(raw) = shortcuts.next_raw() else {
@@ -617,12 +638,21 @@ impl StarlingApp {
         true
     }
 
-    /// An in-window key-up: the release of a held shortcut.
-    pub(crate) fn shortcut_key_up(&mut self, keystroke: &gpui::Keystroke, cx: &mut Context<Self>) {
+    /// An in-window key-up: the release of a held shortcut. Returns
+    /// whether it was consumed — the release matched and the machine had
+    /// the key down from a press it took — so an unrelated chord that
+    /// happens to end on this key still reaches the focused editor.
+    pub(crate) fn shortcut_key_up(
+        &mut self,
+        keystroke: &gpui::Keystroke,
+        cx: &mut Context<Self>,
+    ) -> bool {
         self.flush_system_events(cx);
-        if self.shortcut.matches_key_up(keystroke) {
+        let consumed = self.shortcut.matches_key_up(keystroke) && self.activation.key_is_down();
+        if consumed {
             self.activation_input(|machine| machine.release(Instant::now()), cx);
         }
+        consumed
     }
 
     /// One loop turn: system-wide events in arrival order, then timers.
@@ -693,32 +723,56 @@ impl StarlingApp {
         if !self.activation.is_active() {
             // A shortcut saved mid-take takes over once the take ended, so
             // the held key's release still finishes the take it started.
+            // A platform refusal keeps the previous shortcut registered
+            // and committed, and says why.
             if let Some(shortcut) = self.pending_shortcut.take() {
-                self.apply_shortcut(shortcut);
+                if let Err(reason) = self.apply_shortcut(shortcut) {
+                    self.dictation_settings.shortcut = self.shortcut.text().to_string();
+                    self.error = Some(format!(
+                        "The new dictation shortcut could not be registered ({reason}); the \
+                         previous one is still active."
+                    ));
+                }
             }
         }
         self.sync_escape_grab();
         cx.notify();
     }
 
-    /// Make `shortcut` the recording shortcut — now when no take runs,
-    /// otherwise when the take ends.
-    pub(crate) fn set_shortcut(&mut self, shortcut: crate::shortcut::Shortcut) {
-        if self.activation.is_active() {
-            self.pending_shortcut = Some(shortcut);
-        } else {
-            self.pending_shortcut = None;
-            self.apply_shortcut(shortcut);
-        }
-    }
-
-    fn apply_shortcut(&mut self, shortcut: crate::shortcut::Shortcut) {
+    /// Make `shortcut` the recording shortcut, now. A caller with a take
+    /// running defers instead (`pending_shortcut`), so the held key's
+    /// release still finishes the take it started.
+    ///
+    /// `set_record` takes the new grab before releasing the old one, so a
+    /// platform refusal returns here with the previous shortcut still
+    /// registered; only a successful swap changes the app's shortcut.
+    pub(crate) fn apply_shortcut(
+        &mut self,
+        shortcut: crate::shortcut::Shortcut,
+    ) -> Result<(), String> {
         if shortcut == self.shortcut {
-            return;
+            return Ok(());
         }
-        self.shortcut = shortcut;
-        self.activation.reset_key();
-        self.register_shortcut();
+        let outcome = self
+            .global_shortcuts
+            .as_mut()
+            .map(|shortcuts| shortcuts.set_record(&shortcut));
+        match outcome {
+            Some(Err(reason)) => Err(reason),
+            Some(Ok(())) => {
+                self.shortcut_registration = Ok(());
+                self.shortcut = shortcut;
+                self.activation.reset_key();
+                Ok(())
+            }
+            // No system-wide registrations at all (no X display): the
+            // in-window matcher is the shortcut.
+            None => {
+                self.shortcut = shortcut;
+                self.activation.reset_key();
+                Ok(())
+            }
+        }
     }
 
     /// Escape is grabbed system-wide exactly while a take is active.
@@ -1066,9 +1120,15 @@ mod tests {
             mode: ActivationMode::Toggle,
             double_tap_hands_free: false,
         });
-        assert!(m.release(t0 + ms(2000)).is_empty());
+        // The take keeps the config it started with: its release still
+        // finishes it, as hold does.
+        assert_eq!(m.release(t0 + ms(2000)), vec![Effect::Finish(take)]);
+        assert!(!m.is_active());
+        // The new mode applies to the next take.
+        let next = start_listening(&mut m, t0 + ms(4000));
         assert_eq!(m.latch(), Some(Latch::Latched));
-        assert_eq!(m.press(t0 + ms(4000), true), vec![Effect::Finish(take)]);
+        assert!(m.release(t0 + ms(4050)).is_empty());
+        assert_eq!(m.press(t0 + ms(6000), true), vec![Effect::Finish(next)]);
     }
 
     #[test]
@@ -1089,10 +1149,10 @@ mod tests {
 
     #[test]
     fn a_click_acts_only_on_the_state_its_button_showed() {
-        assert!(click_matches(false, false), "Start while idle starts");
-        assert!(click_matches(true, true), "Stop while recording stops");
-        assert!(!click_matches(true, false), "Stop after Escape ended the take");
-        assert!(!click_matches(false, true), "Start after the shortcut began one");
+        assert!(click_matches(RecordButton::Start, false), "Start while idle starts");
+        assert!(click_matches(RecordButton::Stop, true), "Stop while recording stops");
+        assert!(!click_matches(RecordButton::Stop, false), "Stop after Escape ended the take");
+        assert!(!click_matches(RecordButton::Start, true), "Start after the shortcut began one");
     }
 
     #[test]

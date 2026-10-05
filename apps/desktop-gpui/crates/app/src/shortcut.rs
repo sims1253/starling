@@ -162,7 +162,8 @@ fn us_shifted(key: &str) -> Option<&'static str> {
 }
 
 /// Keys that type text (or move through it) when pressed without a
-/// modifier. Grabbing one of them system-wide would break typing.
+/// modifier. Grabbing one of them system-wide would break typing —
+/// the numpad included: `Numpad1` types a digit like `1` does.
 fn is_typing_key(code: Code) -> bool {
     use Code::*;
     matches!(
@@ -173,7 +174,9 @@ fn is_typing_key(code: Code) -> bool {
             | KeyM | KeyN | KeyO | KeyP | KeyQ | KeyR | KeyS | KeyT | KeyU | KeyV | KeyW
             | KeyX | KeyY | KeyZ | Minus | Period | Quote | Semicolon | Slash | Space | Enter
             | Tab | Backspace | Delete | ArrowUp | ArrowDown | ArrowLeft | ArrowRight | Home
-            | End | PageUp | PageDown
+            | End | PageUp | PageDown | Numpad0 | Numpad1 | Numpad2 | Numpad3 | Numpad4
+            | Numpad5 | Numpad6 | Numpad7 | Numpad8 | Numpad9 | NumpadAdd | NumpadDecimal
+            | NumpadDivide | NumpadEnter | NumpadEqual | NumpadMultiply | NumpadSubtract
     )
 }
 
@@ -248,17 +251,145 @@ pub(crate) enum GlobalEvent {
 /// One event as the hotkey thread received it.
 pub(crate) type RawEvent = (u32, HotKeyState, Instant);
 
+/// The Escape grabs a take wants: bare Escape, plus Escape with every
+/// subset of the shortcut's modifiers — any of them may still be held
+/// (or already let go) when Escape comes.
+fn escape_variants(shortcut: &Shortcut) -> Vec<HotKey> {
+    let mut variants = vec![HotKey::new(None, Code::Escape)];
+    let mods = shortcut.modifiers();
+    let parts: Vec<Modifiers> = [
+        Modifiers::CONTROL,
+        Modifiers::SHIFT,
+        Modifiers::ALT,
+        Modifiers::SUPER,
+    ]
+    .into_iter()
+    .filter(|part| mods.contains(*part))
+    .collect();
+    for mask in 1u32..(1 << parts.len()) {
+        let subset = parts
+            .iter()
+            .enumerate()
+            .filter(|(bit, _)| mask & (1 << bit) != 0)
+            .fold(Modifiers::empty(), |acc, (_, part)| acc | *part);
+        variants.push(HotKey::new(Some(subset), Code::Escape));
+    }
+    variants
+}
+
+/// A command for the Linux worker thread that owns the manager.
+enum WorkerCommand {
+    /// Register `new`; once it holds, release `old`. The reply carries
+    /// the refusal when `new` did not register (the old one stays).
+    SetRecord {
+        new: HotKey,
+        old: Option<HotKey>,
+        reply: mpsc::Sender<Result<(), String>>,
+    },
+    /// Register every Escape variant; the report names the refusals.
+    Arm {
+        generation: u64,
+        variants: Vec<HotKey>,
+    },
+    /// Release the Escape grabs an arm took.
+    Disarm {
+        variants: Vec<HotKey>,
+    },
+}
+
+/// The worker's answer to an [`WorkerCommand::Arm`]: which arming it
+/// answers, and which Escape variants the platform refused.
+struct ArmReport {
+    generation: u64,
+    refused: Vec<HotKey>,
+}
+
+/// The Linux manager's home: a plain thread that runs every registration
+/// command in order. Arm and disarm arrive fire-and-forget — their
+/// latency is the X11 backend's one-command-per-50-ms loop, which must
+/// never land on the UI thread, and arming happens at every take start
+/// and end — while `SetRecord` (a settings save) answers through its own
+/// reply channel.
+#[cfg(target_os = "linux")]
+fn manage(
+    manager: GlobalHotKeyManager,
+    commands: mpsc::Receiver<WorkerCommand>,
+    report: mpsc::Sender<ArmReport>,
+) {
+    while let Ok(command) = commands.recv() {
+        match command {
+            WorkerCommand::SetRecord { new, old, reply } => {
+                let outcome = manager
+                    .register(new)
+                    .map_err(|err| err.to_string())
+                    .map(|()| {
+                        if let Some(old) = old {
+                            let _ = manager.unregister(old);
+                        }
+                    });
+                let _ = reply.send(outcome);
+            }
+            WorkerCommand::Arm { generation, variants } => {
+                // Each variant registers on its own, never `register_all`:
+                // the backend replies over a one-slot channel, and a batch
+                // carrying two failures would block its loop for good. A
+                // refusal is logged and simply never fires.
+                let refused = variants
+                    .iter()
+                    .filter(|variant| {
+                        if let Err(err) = manager.register(**variant) {
+                            eprintln!(
+                                "Escape could not be grabbed system-wide ({err}); the Starling \
+                                 window still sees it."
+                            );
+                            true
+                        } else {
+                            false
+                        }
+                    })
+                    .copied()
+                    .collect();
+                let _ = report.send(ArmReport { generation, refused });
+            }
+            WorkerCommand::Disarm { variants } => {
+                // One release per variant, for the same reason as arming.
+                for variant in variants {
+                    if let Err(err) = manager.unregister(variant) {
+                        eprintln!("An Escape grab could not be released ({err}).");
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// The system-wide registrations: the recording shortcut for the app's
 /// lifetime, and Escape only while a take is active (grabbing Escape the
 /// rest of the time would take it away from every other app).
 pub(crate) struct GlobalShortcuts {
-    manager: GlobalHotKeyManager,
+    /// The manager, inline on Windows/macOS: their registrations are fast
+    /// kernel/Carbon calls (and macOS wants the main thread). On Linux it
+    /// moved to the worker thread (`worker`): every manager call there is
+    /// a synchronous round trip to global-hotkey's X11 backend, which
+    /// services one command per 50 ms loop.
+    manager: Option<GlobalHotKeyManager>,
+    /// Linux: where the manager lives; `None` on Windows/macOS.
+    worker: Option<mpsc::Sender<WorkerCommand>>,
     events: mpsc::Receiver<RawEvent>,
+    /// The worker's answers to an arm, whenever they land.
+    reports: mpsc::Receiver<ArmReport>,
     record: Option<HotKey>,
-    /// The Escape registrations while a take is active: bare Escape, and
-    /// Escape with the recording shortcut's modifiers (still held during a
-    /// push-to-talk take).
+    /// The Escape registrations a disarm must release, as requested:
+    /// bare Escape and Escape with (subsets of) the shortcut's
+    /// modifiers.
     escape: Vec<HotKey>,
+    /// The variants that can actually fire: the request until the
+    /// worker's report lands, then exactly the registered ones (a
+    /// refused variant never fires, so it leaves here the moment the
+    /// refusal is known).
+    escape_live: Vec<HotKey>,
+    /// Which arming the in-flight reports belong to.
+    escape_generation: u64,
 }
 
 impl GlobalShortcuts {
@@ -280,74 +411,134 @@ impl GlobalShortcuts {
         GlobalHotKeyEvent::set_event_handler(Some(move |event: GlobalHotKeyEvent| {
             let _ = sender.send((event.id(), event.state(), Instant::now()));
         }));
+        #[cfg(target_os = "linux")]
+        let (manager, worker, reports) = {
+            let (report, reports) = mpsc::channel();
+            let (commands, inbox) = mpsc::channel();
+            // The manager moves off the UI thread for good: its X11 round
+            // trips (one backend command per 50 ms) must never stall a
+            // take's start or end. Moving it in pins that it is `Send`.
+            std::thread::spawn(move || manage(manager, inbox, report));
+            (None, Some(commands), reports)
+        };
+        #[cfg(not(target_os = "linux"))]
+        let (manager, worker, reports) = {
+            let (_, reports) = mpsc::channel();
+            (Some(manager), None, reports)
+        };
         Ok(GlobalShortcuts {
             manager,
+            worker,
             events,
+            reports,
             record: None,
             escape: Vec::new(),
+            escape_live: Vec::new(),
+            escape_generation: 0,
         })
     }
 
-    /// Replace the recording shortcut. On failure nothing is registered
-    /// (the old shortcut is not kept: the user asked for the new one).
+    /// Replace the recording shortcut. The new grab is taken first and
+    /// the old one released only once it holds, so a platform refusal
+    /// leaves the previous shortcut registered and running — never no
+    /// shortcut at all.
     pub(crate) fn set_record(&mut self, shortcut: &Shortcut) -> Result<(), String> {
         if self.record == Some(shortcut.hotkey()) {
             return Ok(());
         }
-        if let Some(old) = self.record.take() {
-            let _ = self.manager.unregister(old);
-        }
-        self.manager
-            .register(shortcut.hotkey())
-            .map_err(|err| err.to_string())?;
-        self.record = Some(shortcut.hotkey());
-        Ok(())
+        let new = shortcut.hotkey();
+        let old = self.record;
+        let outcome = if let Some(manager) = self.manager.as_ref() {
+            // Windows/macOS: direct calls, fine to make inline.
+            manager.register(new).map_err(|err| err.to_string()).map(|()| {
+                if let Some(old) = old {
+                    let _ = manager.unregister(old);
+                }
+            })
+        } else if let Some(worker) = self.worker.as_ref() {
+            // Linux: a request/reply through the worker. Blocking is fine —
+            // this runs on a settings save, not per take.
+            let (reply, replies) = mpsc::channel();
+            worker
+                .send(WorkerCommand::SetRecord { new, old, reply })
+                .map_err(|err| err.to_string())?;
+            replies
+                .recv()
+                .map_err(|_| "the shortcut worker is gone".to_string())?
+        } else {
+            Ok(())
+        };
+        self.record = match &outcome {
+            Ok(()) => Some(new),
+            // The old registration was never released.
+            Err(_) => old,
+        };
+        outcome
     }
 
     /// Grab Escape system-wide while a take is active, release it after.
     /// Bare Escape is required; Escape with (subsets of) the shortcut's
-    /// modifiers is best effort (the platform may reserve it, like Ctrl+Shift+Escape on
-    /// Windows), and the window still sees it either way.
+    /// modifiers is best effort (the platform may reserve it, like
+    /// Ctrl+Shift+Escape on Windows), and the window still sees it either
+    /// way. On Linux this only posts to the worker: the grabs come up off
+    /// the UI thread, and refusals arrive with the next polled events
+    /// (`next_raw`).
     pub(crate) fn arm_escape(&mut self, armed: bool, shortcut: &Shortcut) -> Result<(), String> {
         if !armed {
-            // One batch: the X11 backend answers one command per 50 ms
-            // loop, and this runs on the UI thread. Variants that never
-            // registered fail to unregister harmlessly.
-            let escapes: Vec<HotKey> = self.escape.drain(..).collect();
-            return self.manager.unregister_all(&escapes).map_err(|err| err.to_string());
+            let variants = std::mem::take(&mut self.escape);
+            self.escape_live.clear();
+            if variants.is_empty() {
+                return Ok(());
+            }
+            return match self.worker.as_ref() {
+                Some(worker) => worker
+                    .send(WorkerCommand::Disarm { variants })
+                    .map_err(|err| err.to_string()),
+                None => self
+                    .manager
+                    .as_ref()
+                    .expect("the manager is inline without a worker")
+                    .unregister_all(&variants)
+                    .map_err(|err| err.to_string()),
+            };
         }
         if !self.escape.is_empty() {
             return Ok(());
         }
-        let bare = HotKey::new(None, Code::Escape);
-        self.manager.register(bare).map_err(|err| err.to_string())?;
-        self.escape.push(bare);
-        let mut held = Vec::new();
-        // Every subset of the shortcut's modifiers: any of them may still
-        // be held (or already let go) when Escape comes.
-        let mods = shortcut.modifiers();
-        let parts: Vec<Modifiers> = [
-            Modifiers::CONTROL,
-            Modifiers::SHIFT,
-            Modifiers::ALT,
-            Modifiers::SUPER,
-        ]
-        .into_iter()
-        .filter(|part| mods.contains(*part))
-        .collect();
-        for mask in 1u32..(1 << parts.len()) {
-            let subset = parts
-                .iter()
-                .enumerate()
-                .filter(|(bit, _)| mask & (1 << bit) != 0)
-                .fold(Modifiers::empty(), |acc, (_, part)| acc | *part);
-            held.push(HotKey::new(Some(subset), Code::Escape));
+        let variants = escape_variants(shortcut);
+        self.escape = variants.clone();
+        self.escape_live = variants.clone();
+        self.escape_generation += 1;
+        if let Some(worker) = self.worker.as_ref() {
+            let generation = self.escape_generation;
+            return worker
+                .send(WorkerCommand::Arm { generation, variants })
+                .map_err(|err| err.to_string());
         }
-        // Best effort, in one batch (see the disarm path): a variant the
-        // platform refuses simply never fires; all are disarmed together.
-        if !held.is_empty() {
-            let _ = self.manager.register_all(&held);
-            self.escape.extend(held);
+        let manager = self
+            .manager
+            .as_ref()
+            .expect("the manager is inline without a worker");
+        // Each variant registers on its own — never `register_all`: the
+        // X11 backend replies over a one-slot channel, and a batch
+        // carrying two failures would block its loop for good. A refusal
+        // is logged, never fires, and leaves `escape_live` without it;
+        // only bare Escape failing fails the arm.
+        let mut bare_refused = None;
+        for variant in &variants {
+            if let Err(err) = manager.register(*variant) {
+                eprintln!(
+                    "Escape could not be grabbed system-wide ({err}); the Starling window \
+                     still sees it."
+                );
+                self.escape_live.retain(|live| live != variant);
+                if variant.mods.is_empty() {
+                    bare_refused = Some(err.to_string());
+                }
+            }
+        }
+        if let Some(reason) = bare_refused {
+            return Err(reason);
         }
         Ok(())
     }
@@ -356,8 +547,16 @@ impl GlobalShortcuts {
         !self.escape.is_empty()
     }
 
-    /// The next received event, oldest first, not yet classified.
-    pub(crate) fn next_raw(&self) -> Option<RawEvent> {
+    /// The next received event, oldest first, not yet classified. The
+    /// worker's refusal reports fold in first, so classification sees
+    /// the Escape grabs as they ended up, not as they were requested.
+    pub(crate) fn next_raw(&mut self) -> Option<RawEvent> {
+        while let Ok(report) = self.reports.try_recv() {
+            if report.generation == self.escape_generation {
+                self.escape_live
+                    .retain(|live| !report.refused.contains(live));
+            }
+        }
         self.events.try_recv().ok()
     }
 
@@ -365,13 +564,16 @@ impl GlobalShortcuts {
     /// *now*: the caller classifies each event only when it processes it,
     /// so an event for a shortcut (or an Escape grab) replaced by an
     /// earlier event in the same batch is dropped, never misapplied.
+    /// Only the Escape grabs that actually registered count.
     pub(crate) fn classify(&self, (id, state, at): RawEvent) -> Option<GlobalEvent> {
         if self.record.is_some_and(|hotkey| hotkey.id() == id) {
             Some(match state {
                 HotKeyState::Pressed => GlobalEvent::Pressed(at),
                 HotKeyState::Released => GlobalEvent::Released(at),
             })
-        } else if state == HotKeyState::Pressed && self.escape.iter().any(|hotkey| hotkey.id() == id) {
+        } else if state == HotKeyState::Pressed
+            && self.escape_live.iter().any(|hotkey| hotkey.id() == id)
+        {
             Some(GlobalEvent::Escape(at))
         } else {
             None
@@ -386,7 +588,7 @@ pub(crate) fn wayland_session() -> bool {
 }
 
 /// What the settings dialog says about where the shortcut works.
-pub(crate) fn reach_note(registered: Result<(), &str>, shortcut: &Shortcut) -> String {
+pub(crate) fn reach_note(registered: &Result<(), String>, shortcut: &Shortcut) -> String {
     let wayland = wayland_session();
     let in_window = if shortcut.works_in_window() {
         "It always works while the Starling window is focused."
@@ -462,11 +664,36 @@ mod tests {
 
     #[test]
     fn typing_keys_need_a_modifier() {
-        for text in ["Space", "A", "Enter", "7", "Slash"] {
+        for text in [
+            "Space",
+            "A",
+            "Enter",
+            "7",
+            "Slash",
+            "Numpad1",
+            "NumpadEnter",
+            "NumpadDecimal",
+            "NumpadAdd",
+            "NumpadEqual",
+        ] {
             let err = Shortcut::parse(text).unwrap_err();
             assert!(err.contains("modifier"), "{text}: {err}");
         }
         assert!(Shortcut::parse("Ctrl+A").is_ok());
+        assert!(Shortcut::parse("Ctrl+Numpad1").is_ok());
+    }
+
+    #[test]
+    fn escape_grabs_cover_the_bare_key_and_every_modifiers_subset() {
+        let shortcut = Shortcut::parse("Ctrl+Shift+Space").unwrap();
+        let variants = escape_variants(&shortcut);
+        assert_eq!(variants.len(), 4, "bare + Ctrl + Shift + Ctrl+Shift");
+        assert!(variants[0].mods.is_empty());
+        assert!(variants.iter().all(|hotkey| hotkey.key == Code::Escape));
+        // Distinct registrations, so a refusal can be told apart.
+        let ids: std::collections::HashSet<u32> =
+            variants.iter().map(|hotkey| hotkey.id()).collect();
+        assert_eq!(ids.len(), variants.len());
     }
 
     #[test]
