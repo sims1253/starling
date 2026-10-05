@@ -98,8 +98,15 @@ inline bool shape_eq(const ModelLoader& m, const char* label, const char* name,
         err = std::string(label) + " GGUF missing required tensor: " + name;
         return false;
     }
-    bool ok = (int) want.size() == ggml_n_dims(t) &&
-              want.size() <= GGML_MAX_DIMS;  // ne[] is GGML_MAX_DIMS long
+    // A wanted-dim count beyond GGML_MAX_DIMS is a caller bug (it would index
+    // past t->ne[]), not a GGUF defect — report it as such, up front.
+    if (want.size() > GGML_MAX_DIMS) {
+        err = std::string(label) + " shape_eq: wanted " +
+              std::to_string(want.size()) + " dims (max " +
+              std::to_string(GGML_MAX_DIMS) + ")";
+        return false;
+    }
+    bool ok = (int) want.size() == ggml_n_dims(t);
     int i = 0;
     for (int64_t w : want) {
         if (ok && (int64_t) t->ne[i] != w) ok = false;

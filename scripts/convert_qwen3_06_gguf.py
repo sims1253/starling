@@ -52,8 +52,10 @@ DEFAULT_SNAPSHOT = (
 VOCAB_SIZE = 151936  # identical tokenizer to the 1.7B (asserted against the snapshot)
 
 
-def load_config(snapshot: Path) -> dict:
-    """Parse config.json into the flat dim dict the metadata writer needs.
+def load_config(snapshot: Path) -> tuple[dict, dict]:
+    """Parse config.json into the flat dim dict the metadata writer needs,
+    returning ``(dims, raw_cfg)`` so callers reuse the parsed config instead
+    of re-reading the file.
 
     head_dim of the audio tower is not explicit in the HF config; it is
     d_model // encoder_attention_heads (896 // 14 = 64), exactly how
@@ -63,7 +65,7 @@ def load_config(snapshot: Path) -> dict:
     audio, text = cfg["audio_config"], cfg["text_config"]
     d_model = int(audio["d_model"])
     heads = int(audio["encoder_attention_heads"])
-    return {
+    dims = {
         # audio tower
         "enc.hidden": d_model,
         "enc.layers": int(audio["encoder_layers"]),
@@ -97,6 +99,7 @@ def load_config(snapshot: Path) -> dict:
             cfg.get("tie_word_embeddings", text.get("tie_word_embeddings", True))
         ),
     }
+    return dims, cfg
 
 
 def add_metadata(w: gguf.GGUFWriter, d: dict) -> None:
@@ -217,11 +220,12 @@ def main() -> None:
     )
     args = ap.parse_args()
 
-    dims = load_config(args.snapshot)
+    dims, top_cfg = load_config(args.snapshot)
     # Cross-check the shared tokenizer before baking it: the prompt layout and
     # the byte-level BPE carry over from the 1.7B only if the vocab matches.
     # Real raises (not asserts) so `python -O` cannot strip them.
-    tok_vocab = json.loads((args.snapshot / "tokenizer.json").read_text())["model"]["vocab"]
+    tokenizer_json = json.loads((args.snapshot / "tokenizer.json").read_text())
+    tok_vocab = tokenizer_json["model"]["vocab"]
     if len(tok_vocab) > VOCAB_SIZE or max(tok_vocab.values()) >= VOCAB_SIZE:
         _fail(
             f"tokenizer vocab ({len(tok_vocab)} entries, max id "
@@ -236,12 +240,10 @@ def main() -> None:
     # check above): a future revision that renumbers its special tokens must
     # fail conversion instead of silently baking stale ids. Absent keys fall
     # through to the baked value; a present-but-different value fails.
-    top_cfg = json.loads((args.snapshot / "config.json").read_text())
     try:
         gen_cfg = json.loads((args.snapshot / "generation_config.json").read_text())
     except FileNotFoundError:
         gen_cfg = {}
-    tokenizer_json = json.loads((args.snapshot / "tokenizer.json").read_text())
     added_ids = {item["id"] for item in tokenizer_json.get("added_tokens", [])}
     if int(top_cfg.get("audio_token_id", 151676)) != 151676:
         _fail(f"config.json audio_token_id {top_cfg['audio_token_id']} != baked 151676")

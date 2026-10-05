@@ -44,6 +44,11 @@ if TYPE_CHECKING:
 class MegaPipeline:
     """End-to-end fused ASR pipeline owning encoder + projector + fused LLM."""
 
+    #: Model loader used by :meth:`from_pretrained`; subclasses swap this to
+    #: point at a different hub variant (starling.qwen3_06) while inheriting
+    #: the whole entry point.
+    _load_model_and_processor = staticmethod(load_model_and_processor)
+
     def __init__(
         self,
         model: Any,
@@ -118,15 +123,21 @@ class MegaPipeline:
         cls,
         *,
         attn_impl: str = "eager",
-        dtype: torch.dtype = torch.bfloat16,
+        dtype: torch.dtype | None = None,
         device: str = "cuda",
         max_cache_len: int = 4096,
         use_fused_llm: bool = True,
         steps_per_replay: int | None = None,
         encoder_mode: str = "cudagraph",
         prefill_use_graph: bool = False,
+        model_id: str | None = None,
     ) -> "MegaPipeline":
-        model, processor = load_model_and_processor(attn_impl=attn_impl, dtype=dtype, device=device)
+        # None dtype keeps the historical bf16 default while allowing an
+        # explicit opt-out that defers to the loader's own dtype.
+        dt = torch.bfloat16 if dtype is None else dtype
+        model, processor = cls._load_model_and_processor(
+            attn_impl=attn_impl, dtype=dt, device=device, model_id=model_id
+        )
         return cls(
             model,
             processor,

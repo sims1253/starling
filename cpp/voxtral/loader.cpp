@@ -17,12 +17,13 @@ using lib::str;
 // weight reads ne0=K, ne1=IC, ne2=OC.) Presence is established by the
 // require() pass; a missing tensor here is still a loud error.
 // Local shorthand over the shared lib::shape_eq (lib/loader_kit.hpp):
-// every Voxtral check uses the "VOXTRAL" engine label.
-const auto shape_eq = [](const ModelLoader& m, const char* name,
-                         std::initializer_list<int64_t> want,
-                         std::string& err) {
+// every Voxtral check uses the "VOXTRAL" engine label. A plain function
+// (anonymous namespace, internal linkage) rather than a lambda object:
+// clearer diagnostics, no captureless-closure type at namespace scope.
+bool shape_eq(const ModelLoader& m, const char* name,
+              std::initializer_list<int64_t> want, std::string& err) {
     return lib::shape_eq(m, "VOXTRAL", name, want, err);
-};
+}
 } // namespace
 
 int64_t offline_padded_samples(int64_t n_samples) {
