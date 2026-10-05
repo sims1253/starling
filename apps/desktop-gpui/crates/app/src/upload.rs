@@ -309,7 +309,16 @@ pub(crate) fn quiesce_salvage_note(samples: u64, sample_rate: u32) -> String {
 }
 
 impl StarlingApp {
+    /// The on-screen record button: a toggle in every activation mode,
+    /// through the same machine as the shortcut (#221).
     pub fn toggle_recording(&mut self, cx: &mut Context<Self>) {
+        let effects = self.activation.click(Instant::now());
+        self.apply_activation(effects, cx);
+    }
+
+    /// Stop the running recorder and process the take as usual. Only the
+    /// activation machine calls this (an `Effect::Finish`).
+    pub(crate) fn stop_recording(&mut self, cx: &mut Context<Self>) {
         self.error = None;
         if let Some(handle) = self.recorder.take() {
             let mut stream = self.live_stream.take();
@@ -482,7 +491,16 @@ impl StarlingApp {
                     cx.notify();
                 }
             }
-        } else {
+        }
+    }
+
+    /// Start a take's recorder; `false` when the microphone could not be
+    /// opened (the reason is in the error banner). Only the activation
+    /// machine calls this (an `Effect::Start`).
+    pub(crate) fn start_recording(&mut self, cx: &mut Context<Self>) -> bool {
+        self.error = None;
+        self.take_notice = None;
+        {
             // I1 phase 2: production captures journal to the durable
             // per-take file; only fsynced-boundary samples are
             // acknowledged (see recorder::start_recording_with_journal).
@@ -530,13 +548,109 @@ impl StarlingApp {
                     self.levels = vec![0.06; 52];
                     self.capture_warning = None;
                     cx.notify();
+                    true
                 }
                 Err(err) => {
                     self.error = Some(err.to_string());
                     cx.notify();
+                    false
                 }
             }
         }
+    }
+
+    /// Stop the running recorder without transcribing or delivering
+    /// anything (#221): Escape, a stop before the microphone delivered
+    /// audio, or a microphone that never did. Whatever audio was captured
+    /// is kept — saved to history as an interrupted take the user can
+    /// transcribe later — so a cancel never loses words.
+    pub(crate) fn cancel_recording(
+        &mut self,
+        reason: crate::activation::CancelReason,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::activation::CancelReason;
+        let Some(handle) = self.recorder.take() else {
+            return;
+        };
+        // The stream and the engine lease leave with the take: nothing
+        // is transcribed.
+        self.live_stream = None;
+        self.active_take = None;
+        self.live_partial.clear();
+        let streamed_samples = std::mem::take(&mut self.streamed_samples);
+        self.stream_sent_samples = 0;
+        self.stream_degradation = None;
+        self.levels = vec![0.06; 52];
+        self.staging_cancelled(cx);
+        let (audio, journal_report) = match handle.stop() {
+            Ok(take) => (Some(take.audio), take.journal),
+            Err(recorder::RecorderError::QuiesceTimeout { audio, journal, .. }) => {
+                (Some(audio), journal)
+            }
+            Err(recorder::RecorderError::Empty) => (None, None),
+            Err(err) => {
+                self.error = Some(err.to_string());
+                (None, None)
+            }
+        };
+        let audio = audio.map(|mut audio| {
+            audio.samples.splice(0..0, streamed_samples);
+            audio
+        });
+        let kept = audio.as_ref().is_some_and(|audio| !audio.samples.is_empty());
+        match reason {
+            CancelReason::Escape => {
+                self.take_notice = Some(if kept {
+                    "Cancelled with Escape. Nothing was transcribed or delivered; the audio is \
+                     in your history, ready to transcribe if you need the words."
+                        .to_string()
+                } else {
+                    "Cancelled with Escape before any audio was captured.".to_string()
+                });
+            }
+            CancelReason::NoAudioYet if kept => {
+                self.take_notice = Some(
+                    "Stopped before the microphone was fully ready. The little audio it \
+                     captured is in your history; nothing was transcribed."
+                        .to_string(),
+                );
+            }
+            CancelReason::NoAudioYet => {}
+            CancelReason::MicStalled => {
+                self.error = Some(format!(
+                    "The microphone delivered no audio within {} seconds, so the take was \
+                     stopped. Check that the input device is connected and not muted.",
+                    crate::activation::START_STALL.as_secs()
+                ));
+            }
+        }
+        cx.notify();
+        let Some(audio) = audio.filter(|audio| !audio.samples.is_empty()) else {
+            return;
+        };
+        let note = match reason {
+            CancelReason::Escape => "Cancelled with Escape before transcription; the audio was kept.",
+            CancelReason::NoAudioYet => "Stopped before the microphone was ready; the audio was kept.",
+            CancelReason::MicStalled => "The microphone stalled at the start; the audio was kept.",
+        }
+        .to_string();
+        cx.spawn(async move |this, cx| {
+            let encoded = cx
+                .background_spawn(async move { audio::encode_wav_16k(&audio) })
+                .await;
+            this.update(cx, |app, cx| {
+                match encoded {
+                    Ok(wav) => app.save_interrupted_take(Arc::new(wav), journal_report, note, cx),
+                    Err(err) => {
+                        app.error = Some(err.to_string());
+                        cx.notify();
+                    }
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// The target travels with the take through here (#363); the lease it

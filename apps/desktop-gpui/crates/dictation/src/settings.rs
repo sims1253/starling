@@ -82,6 +82,66 @@ pub struct Settings {
     /// legacy file and loads as `manual` — see [`Settings::load`].
     #[serde(default)]
     pub engine: EngineSettings,
+    /// System-wide dictation controls (#221): the recording shortcut and
+    /// how it activates. A file without the key — or with one this build
+    /// cannot read — loads the defaults for this subsection only; a bad
+    /// shortcut value must never cost the user the rest of the file.
+    #[serde(default, deserialize_with = "lenient_dictation")]
+    pub dictation: DictationSettings,
+}
+
+/// How the recording shortcut starts and stops a take (#221).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ActivationMode {
+    /// Push-to-talk: recording runs while the shortcut is held.
+    Hold,
+    /// Each press starts or stops recording; release does nothing.
+    Toggle,
+    /// A short tap latches recording on (the next press stops it); holding
+    /// the shortcut past the tap limit records until release. Also what
+    /// an unknown value (a file from a newer build) loads as.
+    #[default]
+    #[serde(other)]
+    HoldOrToggle,
+}
+
+/// The dictation subsection of the settings file (#221). Every field has
+/// a default, so a partial object loads with defaults for the rest.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct DictationSettings {
+    /// The recording shortcut in `global-hotkey` notation
+    /// (`CmdOrCtrl+Shift+Space`, `F9`, `Alt+D`). Validated by the app,
+    /// which keeps the default when the stored text cannot be used.
+    pub shortcut: String,
+    pub activation: ActivationMode,
+    /// Hold mode only: a quick double tap latches the take hands-free
+    /// until the next press.
+    pub double_tap_hands_free: bool,
+}
+
+/// The shortcut a fresh install uses: the one every earlier build had.
+pub const DEFAULT_SHORTCUT: &str = "CmdOrCtrl+Shift+Space";
+
+impl Default for DictationSettings {
+    fn default() -> Self {
+        Self {
+            shortcut: DEFAULT_SHORTCUT.to_string(),
+            activation: ActivationMode::default(),
+            double_tap_hands_free: false,
+        }
+    }
+}
+
+/// Reads the `dictation` key without ever failing the whole file: any
+/// shape this build cannot read (a wrong type, `null`) is the defaults.
+fn lenient_dictation<'de, D>(deserializer: D) -> Result<DictationSettings, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = <serde_json::Value as serde::Deserialize>::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).unwrap_or_default())
 }
 
 /// Which processing mode runs after a take is transcribed, and where its
@@ -129,6 +189,7 @@ impl Settings {
             user_set_model: false,
             processing: ProcessingSettings::default(),
             engine: EngineSettings::default(),
+            dictation: DictationSettings::default(),
         }
     }
 
@@ -211,6 +272,13 @@ impl Settings {
         };
         let (active_model, backend_override) =
             (engine_field("activeModel"), engine_field("backendOverride"));
+        // The dictation subsection reads leniently on its own (#221), so
+        // an unreadable sibling key does not reset the user's shortcut.
+        let dictation = value
+            .get("dictation")
+            .cloned()
+            .and_then(|dictation| serde_json::from_value(dictation).ok())
+            .unwrap_or_default();
         let Ok(mut settings) = serde_json::from_value::<Settings>(value) else {
             let mut fallback = Self::default_settings();
             fallback.engine = EngineSettings {
@@ -218,6 +286,7 @@ impl Settings {
                 active_model,
                 backend_override,
             };
+            fallback.dictation = dictation;
             return fallback;
         };
         if legacy_file {
@@ -371,6 +440,11 @@ mod tests {
                 mode: EngineMode::Builtin,
                 active_model: Some("parakeet-v3-q8".to_string()),
                 backend_override: Some("cpu".to_string()),
+            },
+            dictation: DictationSettings {
+                shortcut: "F9".to_string(),
+                activation: ActivationMode::Hold,
+                double_tap_hands_free: true,
             },
         };
 
@@ -617,6 +691,72 @@ mod tests {
         assert_eq!(settings.endpoint, "http://10.0.0.5:8181");
         assert_eq!(settings.model, "whisper-large-v3");
         assert!(!settings.user_set_model, "no recorded choice: auto-sync stays enabled");
+    }
+
+    #[test]
+    fn dictation_defaults_keep_the_historic_shortcut() {
+        let settings = Settings::default_settings();
+        assert_eq!(settings.dictation.shortcut, "CmdOrCtrl+Shift+Space");
+        assert_eq!(settings.dictation.activation, ActivationMode::HoldOrToggle);
+        assert!(!settings.dictation.double_tap_hands_free);
+    }
+
+    #[test]
+    fn an_unreadable_dictation_key_loads_its_defaults_and_keeps_the_rest() {
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("settings.json");
+        for dictation in [
+            serde_json::json!(5),
+            serde_json::json!(null),
+            serde_json::json!({ "shortcut": 7 }),
+        ] {
+            let raw = serde_json::json!({
+                "endpoint": "http://10.0.0.2:8181",
+                "model": "m",
+                "expectedTerms": [],
+                "engine": { "mode": "manual" },
+                "dictation": dictation,
+            });
+            std::fs::write(&path, raw.to_string()).expect("write");
+            let loaded = Settings::load(&path);
+            assert_eq!(loaded.endpoint, "http://10.0.0.2:8181", "{dictation}");
+            assert_eq!(loaded.dictation, DictationSettings::default(), "{dictation}");
+        }
+    }
+
+    #[test]
+    fn a_partial_dictation_key_and_an_unknown_mode_load_leniently() {
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("settings.json");
+        let raw = serde_json::json!({
+            "endpoint": "http://127.0.0.1:8181",
+            "model": "m",
+            "expectedTerms": [],
+            "engine": { "mode": "builtin" },
+            "dictation": { "shortcut": "F9", "activation": "chord-of-the-future" },
+        });
+        std::fs::write(&path, raw.to_string()).expect("write");
+        let loaded = Settings::load(&path).dictation;
+        assert_eq!(loaded.shortcut, "F9");
+        assert_eq!(loaded.activation, ActivationMode::HoldOrToggle);
+        assert!(!loaded.double_tap_hands_free);
+    }
+
+    #[test]
+    fn an_unreadable_sibling_key_keeps_the_dictation_choices() {
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("settings.json");
+        let raw = serde_json::json!({
+            "endpoint": 12,
+            "engine": { "mode": "builtin" },
+            "dictation": { "shortcut": "F9", "activation": "hold", "doubleTapHandsFree": true },
+        });
+        std::fs::write(&path, raw.to_string()).expect("write");
+        let loaded = Settings::load(&path);
+        assert_eq!(loaded.endpoint, Settings::default_settings().endpoint);
+        assert_eq!(loaded.dictation.shortcut, "F9");
+        assert_eq!(loaded.dictation.activation, ActivationMode::Hold);
+        assert!(loaded.dictation.double_tap_hands_free);
     }
 
     #[test]

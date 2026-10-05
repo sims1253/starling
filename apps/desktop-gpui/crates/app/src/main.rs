@@ -1,27 +1,27 @@
-//! Bootstrap: window, key bindings, global hotkey, diagnostics.
+//! Bootstrap: window, key bindings, the recording shortcut, diagnostics.
 
+mod activation;
 mod app;
 mod assets;
 mod editor;
 mod input;
 mod live_stream;
 mod processing;
+mod shortcut;
 mod staging;
 mod store;
 mod theme;
 mod upload;
 mod views;
 
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use global_hotkey::hotkey::{CMD_OR_CTRL, Code, HotKey, Modifiers};
-use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use gpui::{
-    AppContext, Application, Bounds, KeyBinding, Size, TitlebarOptions, WindowBounds,
-    WindowDecorations, WindowOptions, px, size,
+    AppContext, Application, Bounds, Size, TitlebarOptions, WindowBounds, WindowDecorations,
+    WindowOptions, px, size,
 };
 
-use crate::app::{StarlingApp, ToggleRecording};
+use crate::app::StarlingApp;
 
 fn main() {
     let started = Instant::now();
@@ -32,11 +32,6 @@ fn main() {
     Application::new()
         .with_assets(assets::Assets)
         .run(move |cx| {
-            cx.bind_keys([KeyBinding::new(
-                "secondary-shift-space",
-                ToggleRecording,
-                None,
-            )]);
             input::bind_keys(cx);
             editor::bind_keys(cx);
 
@@ -75,7 +70,7 @@ fn main() {
             // own quit hook (app.rs `register_quit_hook`, the single owner
             // of engine shutdown; the server's --parent-pid watchdog is
             // the crash backstop). Process-lifetime hook: forgotten on
-            // purpose, like the hotkey manager below.
+            // purpose.
             std::mem::forget(cx.on_window_closed(|cx| cx.quit()));
 
             match window {
@@ -87,55 +82,24 @@ fn main() {
                     }
                     // No engine shutdown here: the app entity's own quit
                     // hook (app.rs `register_quit_hook`) owns it, so quit
-                    // stops the sidecar exactly once. (`WindowHandle` is
-                    // `Copy`; the hotkey loop below takes its own copy.)
-                    cx.spawn(async move |cx| {
-                        loop {
-                            gpui::Timer::after(Duration::from_millis(150)).await;
-                            for event in GlobalHotKeyEvent::receiver().try_iter() {
-                                if event.state() == HotKeyState::Pressed {
-                                    cx.update(|cx| {
-                                        let _ = handle.update(cx, |app, window, cx| {
-                                            window.activate_window();
-                                            // Same guarded entry as the
-                                            // in-app binding (#209, #214.1):
-                                            // the global path must not start
-                                            // recording behind an open modal
-                                            // or eat a repeat burst either.
-                                            app.hotkey_toggle_recording(cx);
-                                        });
-                                    })
-                                    .ok();
-                                }
-                            }
-                        }
-                    })
-                    .detach();
+                    // stops the sidecar exactly once.
+                    //
+                    // #221: the system-wide recording shortcut is created
+                    // here, on the main thread (macOS requires it), and
+                    // owned by the app from then on. Its events never
+                    // raise or focus this window: the app being dictated
+                    // into keeps focus.
+                    let shortcuts = shortcut::GlobalShortcuts::new();
+                    if let Err(err) = handle.update(cx, |app, _window, cx| {
+                        app.install_global_shortcuts(shortcuts, cx);
+                    }) {
+                        eprintln!("Could not set up the recording shortcut: {err}");
+                    }
                 }
                 Err(err) => {
                     eprintln!("Could not open the Starling window: {err}");
                 }
             }
-
-            setup_global_hotkey();
         });
 }
 
-fn setup_global_hotkey() {
-    match GlobalHotKeyManager::new() {
-        Ok(manager) => {
-            let hotkey = HotKey::new(Some(CMD_OR_CTRL | Modifiers::SHIFT), Code::Space);
-            match manager.register(hotkey) {
-                Ok(()) => {
-                    std::mem::forget(manager);
-                }
-                Err(err) => {
-                    eprintln!("Global shortcut unavailable: {err}");
-                }
-            }
-        }
-        Err(err) => {
-            eprintln!("Global shortcut unavailable: {err}");
-        }
-    }
-}

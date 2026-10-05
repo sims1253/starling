@@ -14,7 +14,7 @@ use std::{
 
 use gpui::{
     AppContext, ClipboardItem, Context, Entity, FocusHandle, Focusable, Pixels, Render, Subscription,
-    Timer, Window, actions, div, prelude::*,
+    Timer, Window, div, prelude::*,
 };
 use starling_dictation::{
     client::{self, StarlingClient},
@@ -23,7 +23,10 @@ use starling_dictation::{
     fidelity::{self, TranscriptAnalysisOptions},
     player::Player,
     recorder::RecorderHandle,
-    settings::{EngineMode, EngineSettings, ProcessingSettings, Settings},
+    settings::{
+        ActivationMode, DictationSettings, EngineMode, EngineSettings, ProcessingSettings,
+        Settings, DEFAULT_SHORTCUT,
+    },
     storage::{DamagedRecord, ListedRecord, SessionSummary},
 };
 
@@ -32,8 +35,6 @@ use crate::live_stream::LiveStream;
 use crate::processing::{self, Providers, TakeProcessing};
 use starling_processing::staging::Draft;
 use starling_processing::CancelToken;
-
-actions!(starling, [ToggleRecording]);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Connection {
@@ -457,11 +458,30 @@ pub struct StarlingApp {
     /// [`surviving_deletes`]) — or by the job's own failure, so a failed
     /// delete stays retryable.
     pub deleting_ids: HashSet<String>,
-    /// When the last record-hotkey event arrived, accepted or not (#209):
-    /// the debounce window slides on every event, so a held key — whose
-    /// auto-repeats arrive every ~25–33 ms — can never squeeze a second
-    /// toggle through. See [`hotkey_toggle_at`].
-    pub last_hotkey_toggle: Option<Instant>,
+    /// The recording shortcut's activation machine (#221): presses,
+    /// releases, the record button and Escape all go through it, and it
+    /// owns the one-take-at-a-time and readiness rules.
+    pub(crate) activation: crate::activation::Activation,
+    /// The take the running recorder belongs to (set only once its start
+    /// succeeded), so effects for any other take are ignored.
+    pub(crate) recording_take: Option<crate::activation::TakeId>,
+    /// The committed dictation settings and the shortcut they name.
+    pub(crate) dictation_settings: DictationSettings,
+    pub(crate) shortcut: crate::shortcut::Shortcut,
+    /// The system-wide registrations (absent in tests and where the
+    /// platform offers none), and how registering the shortcut went.
+    pub(crate) global_shortcuts: Option<crate::shortcut::GlobalShortcuts>,
+    pub(crate) shortcut_registration: Result<(), String>,
+    /// Keeps the in-window shortcut interceptor registered.
+    pub(crate) key_interceptor: Option<Subscription>,
+    /// What happened to a take that was cancelled (Escape, a microphone
+    /// that never delivered audio): shown until dismissed.
+    pub(crate) take_notice: Option<String>,
+    /// The settings dialog's dictation drafts (committed on save).
+    pub(crate) draft_shortcut: Entity<TextField>,
+    pub(crate) draft_activation: ActivationMode,
+    pub(crate) draft_double_tap: bool,
+    pub(crate) dictation_draft_error: Option<String>,
     pub playing_id: Option<String>,
     /// Identifies the current playback so poll-watchers can detect that they
     /// are stale (G04). Bumped whenever playback starts, stops, or is
@@ -671,57 +691,6 @@ pub(crate) fn banner_notice<'a>(
     export_notice: Option<&'a str>,
 ) -> Option<&'a str> {
     capture_warning.or(export_notice)
-}
-
-/// How close together two record-hotkey events may arrive and still be
-/// treated as distinct presses (#209). Keyboard auto-repeat begins after
-/// the platform's initial delay (X11 default 660 ms, desktop settings
-/// commonly 500 ms) and then fires every 25–33 ms — some setups as slowly
-/// as 2 Hz. The window must exceed that interval, and it slides on every
-/// event (see [`hotkey_toggle_at`]), so any repeat stream is suppressed
-/// forever after its first event; only a genuinely separate press — a
-/// human re-pressing the chord — is spaced far enough to pass.
-const HOTKEY_TOGGLE_MIN_INTERVAL: Duration = Duration::from_millis(750);
-
-/// What a record-hotkey event does (#209, #214.1).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum HotkeyToggle {
-    /// A deliberate press: run the toggle.
-    Accept,
-    /// Any modal is open: the toggle is ignored so recording can never
-    /// start invisibly behind a settings scrim.
-    SuppressModalOpen,
-    /// Too close to the previous event: auto-repeat or a double-eaten
-    /// chord, not a deliberate press.
-    SuppressRepeatBurst,
-}
-
-/// The record hotkey's debounce gate (#209, #214.1), as a pure state
-/// machine over `last_event` so the burst behavior is testable.
-///
-/// The window slides — `last_event` is advanced on *every* event, accepted
-/// or suppressed — which is what kills the auto-repeat loop: repeats arrive
-/// 25–33 ms apart, each refreshing the window, so after the first accepted
-/// press no repeat of the same hold can ever be `HOTKEY_TOGGLE_MIN_INTERVAL`
-/// away from its predecessor. A modal-open event also slides the window, so
-/// a chord held through the modal's lifetime cannot fire on the way out.
-pub(crate) fn hotkey_toggle_at(
-    modal_open: bool,
-    last_event: &mut Option<Instant>,
-    now: Instant,
-) -> HotkeyToggle {
-    let decision = if modal_open {
-        HotkeyToggle::SuppressModalOpen
-    } else if last_event
-        .as_ref()
-        .is_some_and(|last| now.duration_since(*last) < HOTKEY_TOGGLE_MIN_INTERVAL)
-    {
-        HotkeyToggle::SuppressRepeatBurst
-    } else {
-        HotkeyToggle::Accept
-    };
-    *last_event = Some(now);
-    decision
 }
 
 /// What a click on a take's trash button does (B05, #208).
@@ -982,6 +951,31 @@ impl StarlingApp {
         let draft_engine_mode = engine_settings.mode;
         let draft_backend_override = engine_settings.backend_override.clone();
 
+        // #221: a stored shortcut this build cannot use falls back to the
+        // default, and says so.
+        let mut dictation_settings = settings.dictation.clone();
+        let (shortcut, shortcut_note) = match crate::shortcut::Shortcut::parse(&dictation_settings.shortcut) {
+            Ok(shortcut) => (shortcut, None),
+            Err(reason) => {
+                dictation_settings.shortcut = DEFAULT_SHORTCUT.to_string();
+                let shortcut = crate::shortcut::Shortcut::parse(DEFAULT_SHORTCUT)
+                    .expect("the default shortcut parses");
+                let note = format!(
+                    "The saved recording shortcut could not be used ({reason}); {} is active \
+                     instead.",
+                    shortcut.label()
+                );
+                (shortcut, Some(note))
+            }
+        };
+        let draft_shortcut = cx.new(|cx| {
+            TextField::new(DEFAULT_SHORTCUT, &dictation_settings.shortcut, cx)
+        });
+        let mode_note = match (mode_note, shortcut_note) {
+            (Some(mode), Some(shortcut)) => Some(format!("{mode}\n{shortcut}")),
+            (mode, shortcut) => mode.or(shortcut),
+        };
+
         Self {
             error: match (store_error.clone(), mode_note) {
                 (Some(store), Some(mode)) => Some(format!("{store}\n{mode}")),
@@ -1039,7 +1033,20 @@ impl StarlingApp {
             wav_saved: None,
             confirm_delete_id: None,
             deleting_ids: HashSet::new(),
-            last_hotkey_toggle: None,
+            activation: crate::activation::Activation::new(
+                crate::activation::ActivationConfig::from_settings(&dictation_settings),
+            ),
+            recording_take: None,
+            draft_shortcut,
+            draft_activation: dictation_settings.activation,
+            draft_double_tap: dictation_settings.double_tap_hands_free,
+            dictation_draft_error: None,
+            shortcut,
+            dictation_settings,
+            global_shortcuts: None,
+            shortcut_registration: Ok(()),
+            key_interceptor: None,
+            take_notice: None,
             playing_id: None,
             playback_generation: 0,
             recorder: None,
@@ -1217,6 +1224,7 @@ impl StarlingApp {
             user_set_model: self.user_set_model,
             processing: self.processing_settings.clone(),
             engine: self.engine_settings.clone(),
+            dictation: self.dictation_settings.clone(),
         };
         settings.set_expected_terms_input(&self.expected_terms_input);
         settings
@@ -2142,30 +2150,6 @@ impl StarlingApp {
         .detach();
     }
 
-    /// The record hotkey's single entry point (#209, #214.1), shared by the
-    /// in-app key binding and the global-hotkey bridge in `main`. The
-    /// on-screen record button calls [`toggle_recording`](Self::toggle_recording)
-    /// directly: mouse clicks do not auto-repeat, and an intentional quick
-    /// start/stop double-click must keep working.
-    ///
-    /// One guard covers both defects: a toggle while any modal is open
-    /// would start recording invisibly behind the scrim, and a toggle
-    /// within the debounce window of the last hotkey event is keyboard
-    /// auto-repeat — each repeated toggle persists a junk take and kicks
-    /// off a transcription job. `toggle_recording` itself transitions
-    /// synchronously, so the sliding window is also the in-flight guard:
-    /// no second toggle can begin until the burst ends.
-    pub fn hotkey_toggle_recording(&mut self, cx: &mut Context<Self>) {
-        let decision = hotkey_toggle_at(
-            self.settings_open,
-            &mut self.last_hotkey_toggle,
-            Instant::now(),
-        );
-        if decision == HotkeyToggle::Accept {
-            self.toggle_recording(cx);
-        }
-    }
-
     pub fn toggle_play(&mut self, id: &str, cx: &mut Context<Self>) {
         let Some(player) = self.player.as_ref() else {
             return;
@@ -2421,8 +2405,12 @@ impl Render for StarlingApp {
             .id("starling-root")
             .track_focus(&root_focus)
             .key_context("Starling")
-            .on_action(cx.listener(|this, _: &ToggleRecording, _window, cx| {
-                this.hotkey_toggle_recording(cx);
+            // #221: shortcut presses arrive through the keystroke
+            // interceptor (`activation.rs`), which sees them before any
+            // binding; releases come here, in the capture phase, so no
+            // child can swallow the end of a hold.
+            .capture_key_up(cx.listener(|this, event: &gpui::KeyUpEvent, _window, cx| {
+                this.shortcut_key_up(&event.keystroke, cx);
             }))
             .relative()
             .size_full()
@@ -2884,111 +2872,6 @@ mod tests {
         assert!(!surviving.contains("deleted-elsewhere"));
         // A listing where everything landed removes every guard.
         assert!(surviving_deletes(&deleting, &[]).is_empty());
-    }
-
-    #[test]
-    fn hotkey_toggles_outside_the_debounce_window_are_accepted() {
-        // Deliberate presses are spaced far apart and must keep working.
-        let start = Instant::now();
-        let mut last = None;
-        assert_eq!(
-            hotkey_toggle_at(false, &mut last, start),
-            HotkeyToggle::Accept
-        );
-        assert_eq!(
-            hotkey_toggle_at(false, &mut last, start + Duration::from_millis(900)),
-            HotkeyToggle::Accept
-        );
-    }
-
-    #[test]
-    fn hotkey_events_inside_the_debounce_window_are_suppressed() {
-        let start = Instant::now();
-        let mut last = None;
-        hotkey_toggle_at(false, &mut last, start);
-        assert_eq!(
-            hotkey_toggle_at(false, &mut last, start + Duration::from_millis(100)),
-            HotkeyToggle::SuppressRepeatBurst
-        );
-        // A deliberate re-press just past the window passes — measured from
-        // the *suppressed* event, which slid it.
-        assert_eq!(
-            hotkey_toggle_at(
-                false,
-                &mut last,
-                start + Duration::from_millis(100) + HOTKEY_TOGGLE_MIN_INTERVAL
-            ),
-            HotkeyToggle::Accept
-        );
-    }
-
-    #[test]
-    fn a_held_hotkey_never_multi_fires_through_the_repeat_stream() {
-        // #209: hold the chord for seconds. The platform starts repeating
-        // after its initial delay (here the 500 ms desktop default; X11's
-        // stock 660 ms behaves the same) and then fires every 33 ms. The
-        // first repeat is already inside the window, and every suppressed
-        // repeat slides it further — exactly one toggle, the initial
-        // press, is ever accepted: no start/stop/start loop, no junk
-        // takes.
-        let start = Instant::now();
-        let mut last = None;
-        assert_eq!(
-            hotkey_toggle_at(false, &mut last, start),
-            HotkeyToggle::Accept
-        );
-        let mut accepted = 1;
-        for repeat in 0..45 {
-            let at = start + Duration::from_millis(500 + 33 * repeat);
-            if hotkey_toggle_at(false, &mut last, at) == HotkeyToggle::Accept {
-                accepted += 1;
-            }
-        }
-        assert_eq!(accepted, 1, "a held chord may toggle exactly once");
-    }
-
-    #[test]
-    fn a_slow_repeat_stream_is_suppressed_too_because_the_window_slides() {
-        // A keyboard repeating as slowly as 2 Hz (500 ms interval) would
-        // beat a static window of less than 500 ms; the sliding window —
-        // advanced by suppressed events as well — keeps it suppressed.
-        let start = Instant::now();
-        let mut last = None;
-        assert_eq!(
-            hotkey_toggle_at(false, &mut last, start),
-            HotkeyToggle::Accept
-        );
-        for tick in 1..=6 {
-            assert_eq!(
-                hotkey_toggle_at(false, &mut last, start + Duration::from_millis(500 * tick)),
-                HotkeyToggle::SuppressRepeatBurst,
-                "repeat #{tick} at a 500 ms interval must stay suppressed"
-            );
-        }
-    }
-
-    #[test]
-    fn the_hotkey_is_ignored_while_a_modal_is_open() {
-        // #214.1: with the settings modal up, the toggle must never start
-        // recording invisibly behind the scrim — whatever the event
-        // spacing.
-        let start = Instant::now();
-        let mut last = None;
-        assert_eq!(
-            hotkey_toggle_at(true, &mut last, start),
-            HotkeyToggle::SuppressModalOpen
-        );
-        assert_eq!(
-            hotkey_toggle_at(true, &mut last, start + Duration::from_secs(30)),
-            HotkeyToggle::SuppressModalOpen
-        );
-        // The window slid during the modal, so a repeat arriving right
-        // after it closes cannot fire either.
-        let after_close = start + Duration::from_secs(30) + HOTKEY_TOGGLE_MIN_INTERVAL / 2;
-        assert_eq!(
-            hotkey_toggle_at(false, &mut last, after_close),
-            HotkeyToggle::SuppressRepeatBurst
-        );
     }
 
     // --- #207: the health-probe subsystem ---

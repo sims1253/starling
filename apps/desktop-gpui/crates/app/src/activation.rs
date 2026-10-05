@@ -1,0 +1,951 @@
+//! The recording shortcut's activation state machine (#221).
+//!
+//! One pure machine turns shortcut presses and releases, the record
+//! button, Escape, timer ticks, and the recorder's own callbacks into
+//! take-level effects. It owns the single-take guarantees, so the app
+//! never decides them ad hoc:
+//!
+//! - **One take at a time.** Every take gets a fresh [`TakeId`]; a
+//!   callback carrying an older id (a late "first samples" report, a
+//!   start failure from a take that was already cancelled) is ignored.
+//! - **Key repeat never acts.** The machine tracks whether the shortcut
+//!   is down; a press while it is down is auto-repeat (Windows sends
+//!   `WM_HOTKEY` repeats, gpui sends held key-downs) and does nothing.
+//!   A press long after the last key event while the key still reads as
+//!   down means a release was lost (focus moved mid-hold): it recovers
+//!   instead of leaving a stuck recording.
+//! - **Readiness tracks real audio.** A take starts in
+//!   [`Readiness::Starting`] and only becomes [`Readiness::Listening`]
+//!   when the app reports captured samples — the announcement effect
+//!   ([`Effect::Listening`]) fires once, and never after the take
+//!   failed, was cancelled, or was superseded. A take that never
+//!   produces samples is cancelled after [`START_STALL`] instead of
+//!   recording silence forever.
+//! - **Stopping before any audio arrived cancels** ([`CancelReason::NoAudioYet`])
+//!   rather than persisting an empty take.
+//! - **Escape cancels** the active take and clears any latch. The app
+//!   keeps whatever audio was captured (recoverable from history) and
+//!   delivers nothing.
+//!
+//! Activation modes (`settings::ActivationMode`): `Toggle` (press starts,
+//! next press stops), `Hold` (push-to-talk; with the optional double tap
+//! a quick tap-tap latches the take hands-free), and `HoldOrToggle`
+//! (a quick tap latches, a long hold records until release).
+
+use std::time::{Duration, Instant};
+
+use gpui::Context;
+use starling_dictation::settings::{ActivationMode, DictationSettings};
+
+use crate::app::StarlingApp;
+use crate::shortcut::{GlobalEvent, GlobalShortcuts};
+
+/// How often the app feeds system-wide shortcut events, timers, and the
+/// recorder's sample count into the machine. Event timestamps are taken
+/// where the events arrive, so this only bounds reaction latency.
+const POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+/// Identifies one take for the lifetime of the app.
+pub(crate) type TakeId = u64;
+
+/// A release this soon after its press is a tap, not a hold.
+pub(crate) const TAP_MAX: Duration = Duration::from_millis(300);
+
+/// Hold mode with double tap: how long after a tap's release the second
+/// press may come to latch the take hands-free.
+pub(crate) const DOUBLE_TAP_WINDOW: Duration = Duration::from_millis(400);
+
+/// A press while the key reads as down is auto-repeat if it comes within
+/// this long of the previous key event. Repeats arrive every 25–50 ms
+/// after an initial delay of at most one second on every desktop the app
+/// runs on, so a longer silence means the release was lost.
+pub(crate) const REPEAT_GAP: Duration = Duration::from_millis(1200);
+
+/// A take whose microphone has delivered no samples this long after the
+/// start is cancelled: the device is not producing audio, and recording
+/// nothing indefinitely would be a stuck take.
+pub(crate) const START_STALL: Duration = Duration::from_secs(5);
+
+/// The machine's configuration, taken from the dictation settings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ActivationConfig {
+    pub mode: ActivationMode,
+    pub double_tap_hands_free: bool,
+}
+
+impl ActivationConfig {
+    pub(crate) fn from_settings(settings: &DictationSettings) -> Self {
+        Self {
+            mode: settings.activation,
+            double_tap_hands_free: settings.double_tap_hands_free,
+        }
+    }
+}
+
+impl Default for ActivationConfig {
+    fn default() -> Self {
+        Self {
+            mode: ActivationMode::default(),
+            double_tap_hands_free: false,
+        }
+    }
+}
+
+/// Whether the take's microphone has delivered audio yet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Readiness {
+    /// The take started; no captured samples have arrived.
+    Starting,
+    /// Real samples arrived: the user is being heard.
+    Listening,
+}
+
+/// What ends the active take.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Latch {
+    /// The shortcut is held: releasing it finishes the take.
+    Held,
+    /// Latched by a tap, the toggle mode, or the record button: the next
+    /// press finishes the take.
+    Latched,
+    /// Latched hands-free by a double tap (hold mode): the next press
+    /// finishes the take.
+    HandsFree,
+}
+
+/// Why a take was cancelled rather than finished.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CancelReason {
+    /// The user pressed Escape.
+    Escape,
+    /// The take was stopped before its microphone delivered any audio.
+    NoAudioYet,
+    /// The microphone delivered no audio within [`START_STALL`].
+    MicStalled,
+}
+
+/// What the app must do in response to an input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Effect {
+    /// Start recording this take. The app reports a failure back through
+    /// [`Activation::start_failed`].
+    Start(TakeId),
+    /// Stop recording and process the take as usual.
+    Finish(TakeId),
+    /// Stop recording, keep any captured audio, deliver nothing.
+    Cancel(TakeId, CancelReason),
+    /// The take's first real samples arrived: announce listening.
+    Listening(TakeId),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Phase {
+    Idle,
+    Active {
+        take: TakeId,
+        readiness: Readiness,
+        latch: Latch,
+        started_at: Instant,
+        pressed_at: Instant,
+        /// Hold mode with double tap: the take was tapped and waits this
+        /// long for the second press before finishing.
+        tap_deadline: Option<Instant>,
+    },
+}
+
+/// The activation state machine. Pure: time comes in as arguments.
+#[derive(Debug)]
+pub(crate) struct Activation {
+    config: ActivationConfig,
+    phase: Phase,
+    key_down: bool,
+    last_key_event: Option<Instant>,
+    last_take: TakeId,
+}
+
+impl Activation {
+    pub(crate) fn new(config: ActivationConfig) -> Self {
+        Self {
+            config,
+            phase: Phase::Idle,
+            key_down: false,
+            last_key_event: None,
+            last_take: 0,
+        }
+    }
+
+    /// A settings change applies to the next gesture; an active take
+    /// keeps running.
+    pub(crate) fn set_config(&mut self, config: ActivationConfig) {
+        self.config = config;
+    }
+
+    pub(crate) fn config(&self) -> ActivationConfig {
+        self.config
+    }
+
+    pub(crate) fn active_take(&self) -> Option<TakeId> {
+        match self.phase {
+            Phase::Active { take, .. } => Some(take),
+            Phase::Idle => None,
+        }
+    }
+
+    pub(crate) fn is_active(&self) -> bool {
+        self.active_take().is_some()
+    }
+
+    pub(crate) fn readiness(&self) -> Option<Readiness> {
+        match self.phase {
+            Phase::Active { readiness, .. } => Some(readiness),
+            Phase::Idle => None,
+        }
+    }
+
+    /// What ends the active take — the latch the UI shows.
+    pub(crate) fn latch(&self) -> Option<Latch> {
+        match self.phase {
+            Phase::Active {
+                latch,
+                tap_deadline,
+                ..
+            } => Some(if tap_deadline.is_some() {
+                // Between the tap and the double-tap deadline the take
+                // ends on its own unless the second press comes; to the
+                // user it is not held any more.
+                Latch::Latched
+            } else {
+                latch
+            }),
+            Phase::Idle => None,
+        }
+    }
+
+    /// The shortcut went down. `may_start` is false while the app must
+    /// not begin a take (a modal is open): such a press can still stop
+    /// the active take, but never starts one.
+    pub(crate) fn press(&mut self, now: Instant, may_start: bool) -> Vec<Effect> {
+        if self.key_down {
+            let repeat = self
+                .last_key_event
+                .is_some_and(|last| now.saturating_duration_since(last) < REPEAT_GAP);
+            self.last_key_event = Some(now);
+            if repeat {
+                return Vec::new();
+            }
+            // The release was lost. A held take would otherwise record
+            // until the next release that may never come: this press is
+            // the user's way out, so it finishes the take and does
+            // nothing else.
+            if let Phase::Active {
+                latch: Latch::Held,
+                tap_deadline: None,
+                ..
+            } = self.phase
+            {
+                return self.finish();
+            }
+        }
+        self.key_down = true;
+        self.last_key_event = Some(now);
+
+        match self.phase {
+            Phase::Idle => self.start(now, may_start, self.initial_latch()),
+            Phase::Active {
+                latch: Latch::Held,
+                tap_deadline: Some(deadline),
+                ..
+            } => {
+                if now <= deadline {
+                    self.set_latch(Latch::HandsFree);
+                    Vec::new()
+                } else {
+                    // The tick that should have finished the tapped take
+                    // has not run yet: finish it now, and this press
+                    // starts the next take.
+                    let mut effects = self.finish();
+                    effects.extend(self.start(now, may_start, self.initial_latch()));
+                    effects
+                }
+            }
+            Phase::Active { .. } => self.finish(),
+        }
+    }
+
+    /// The shortcut went up.
+    pub(crate) fn release(&mut self, now: Instant) -> Vec<Effect> {
+        if !self.key_down {
+            return Vec::new();
+        }
+        self.key_down = false;
+        self.last_key_event = Some(now);
+        let Phase::Active {
+            latch: Latch::Held,
+            pressed_at,
+            tap_deadline: None,
+            ..
+        } = self.phase
+        else {
+            return Vec::new();
+        };
+        let tap = now.saturating_duration_since(pressed_at) < TAP_MAX;
+        match self.config.mode {
+            ActivationMode::Toggle => {
+                // Only reachable when the mode changed mid-hold: the take
+                // keeps running until the next press, as toggle does.
+                self.set_latch(Latch::Latched);
+                Vec::new()
+            }
+            ActivationMode::HoldOrToggle if tap => {
+                self.set_latch(Latch::Latched);
+                Vec::new()
+            }
+            ActivationMode::Hold if tap && self.config.double_tap_hands_free => {
+                if let Phase::Active { tap_deadline, .. } = &mut self.phase {
+                    *tap_deadline = Some(now + DOUBLE_TAP_WINDOW);
+                }
+                Vec::new()
+            }
+            ActivationMode::HoldOrToggle | ActivationMode::Hold => self.finish(),
+        }
+    }
+
+    /// The on-screen record button: a toggle in every mode (a click
+    /// cannot be held, and it never auto-repeats).
+    pub(crate) fn click(&mut self, now: Instant) -> Vec<Effect> {
+        match self.phase {
+            Phase::Idle => self.start(now, true, Latch::Latched),
+            Phase::Active { .. } => self.finish(),
+        }
+    }
+
+    /// Escape: cancel the active take and clear any latch.
+    pub(crate) fn escape(&mut self) -> Vec<Effect> {
+        match self.phase {
+            Phase::Active { take, .. } => {
+                self.phase = Phase::Idle;
+                vec![Effect::Cancel(take, CancelReason::Escape)]
+            }
+            Phase::Idle => Vec::new(),
+        }
+    }
+
+    /// Time passed: the double-tap window and the start stall expire here.
+    pub(crate) fn tick(&mut self, now: Instant) -> Vec<Effect> {
+        let Phase::Active {
+            take,
+            readiness,
+            started_at,
+            tap_deadline,
+            ..
+        } = self.phase
+        else {
+            return Vec::new();
+        };
+        if readiness == Readiness::Starting
+            && now.saturating_duration_since(started_at) >= START_STALL
+        {
+            self.phase = Phase::Idle;
+            return vec![Effect::Cancel(take, CancelReason::MicStalled)];
+        }
+        if tap_deadline.is_some_and(|deadline| now > deadline) {
+            return self.finish();
+        }
+        Vec::new()
+    }
+
+    /// The recorder reported captured samples for `take`.
+    pub(crate) fn samples_arrived(&mut self, take: TakeId) -> Vec<Effect> {
+        match &mut self.phase {
+            Phase::Active {
+                take: active,
+                readiness: readiness @ Readiness::Starting,
+                ..
+            } if *active == take => {
+                *readiness = Readiness::Listening;
+                vec![Effect::Listening(take)]
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Starting `take` failed: nothing is recording, nothing is announced.
+    pub(crate) fn start_failed(&mut self, take: TakeId) {
+        self.ended(take);
+    }
+
+    /// `take` ended outside the machine (the recorder stopped on its own).
+    pub(crate) fn ended(&mut self, take: TakeId) {
+        if self.active_take() == Some(take) {
+            self.phase = Phase::Idle;
+        }
+    }
+
+    fn initial_latch(&self) -> Latch {
+        match self.config.mode {
+            ActivationMode::Toggle => Latch::Latched,
+            ActivationMode::Hold | ActivationMode::HoldOrToggle => Latch::Held,
+        }
+    }
+
+    fn start(&mut self, now: Instant, may_start: bool, latch: Latch) -> Vec<Effect> {
+        if !may_start {
+            return Vec::new();
+        }
+        self.last_take += 1;
+        let take = self.last_take;
+        self.phase = Phase::Active {
+            take,
+            readiness: Readiness::Starting,
+            latch,
+            started_at: now,
+            pressed_at: now,
+            tap_deadline: None,
+        };
+        vec![Effect::Start(take)]
+    }
+
+    fn set_latch(&mut self, new: Latch) {
+        if let Phase::Active {
+            latch,
+            tap_deadline,
+            ..
+        } = &mut self.phase
+        {
+            *latch = new;
+            *tap_deadline = None;
+        }
+    }
+
+    /// End the active take the normal way: finished when it has audio,
+    /// cancelled when its microphone never delivered any.
+    fn finish(&mut self) -> Vec<Effect> {
+        let Phase::Active {
+            take, readiness, ..
+        } = self.phase
+        else {
+            return Vec::new();
+        };
+        self.phase = Phase::Idle;
+        match readiness {
+            Readiness::Listening => vec![Effect::Finish(take)],
+            Readiness::Starting => vec![Effect::Cancel(take, CancelReason::NoAudioYet)],
+        }
+    }
+}
+
+// ---- App glue -------------------------------------------------------------
+
+impl StarlingApp {
+    /// Takes ownership of the system-wide shortcut registrations (#221),
+    /// registers the configured shortcut, and starts the loop that feeds
+    /// the machine.
+    pub(crate) fn install_global_shortcuts(
+        &mut self,
+        shortcuts: Result<GlobalShortcuts, String>,
+        cx: &mut Context<Self>,
+    ) {
+        match shortcuts {
+            Ok(shortcuts) => {
+                self.global_shortcuts = Some(shortcuts);
+                self.register_shortcut();
+            }
+            Err(reason) => self.shortcut_registration = Err(reason),
+        }
+        if let Err(reason) = &self.shortcut_registration {
+            eprintln!("Global shortcut unavailable: {reason}");
+        }
+        self.install_key_interceptor(cx);
+        cx.spawn(async move |this, cx| {
+            loop {
+                gpui::Timer::after(POLL_INTERVAL).await;
+                if this.update(cx, |app, cx| app.poll_activation(cx)).is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// (Re-)register the committed shortcut system-wide.
+    pub(crate) fn register_shortcut(&mut self) {
+        if let Some(shortcuts) = self.global_shortcuts.as_mut() {
+            self.shortcut_registration = shortcuts.set_record(&self.shortcut);
+        }
+    }
+
+    /// In-window presses go through a keystroke interceptor: it runs
+    /// before any key binding, so the shortcut also works while the
+    /// staging editor or a settings field has focus, and a matched press
+    /// never reaches them.
+    fn install_key_interceptor(&mut self, cx: &mut Context<Self>) {
+        let app = cx.entity().downgrade();
+        let subscription = cx.intercept_keystrokes(move |event, _window, cx| {
+            let handled = app
+                .update(cx, |app, cx| app.shortcut_key_down(&event.keystroke, cx))
+                .unwrap_or(false);
+            if handled {
+                cx.stop_propagation();
+            }
+        });
+        self.key_interceptor = Some(subscription);
+    }
+
+    /// An in-window key-down. Returns whether it was the shortcut or the
+    /// Escape that cancels the active take (and so must not propagate).
+    pub(crate) fn shortcut_key_down(
+        &mut self,
+        keystroke: &gpui::Keystroke,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.activation.is_active() && crate::shortcut::is_escape(keystroke) {
+            let effects = self.activation.escape();
+            self.apply_activation(effects, cx);
+            return true;
+        }
+        if !self.shortcut.matches_key_down(keystroke) {
+            return false;
+        }
+        let effects = self.activation.press(Instant::now(), !self.settings_open);
+        self.apply_activation(effects, cx);
+        true
+    }
+
+    /// An in-window key-up: the release of a held shortcut.
+    pub(crate) fn shortcut_key_up(&mut self, keystroke: &gpui::Keystroke, cx: &mut Context<Self>) {
+        if self.shortcut.matches_key_up(keystroke) {
+            let effects = self.activation.release(Instant::now());
+            self.apply_activation(effects, cx);
+        }
+    }
+
+    /// One loop turn: system-wide events, then timers, then readiness.
+    pub(crate) fn poll_activation(&mut self, cx: &mut Context<Self>) {
+        let events = self
+            .global_shortcuts
+            .as_ref()
+            .map(GlobalShortcuts::drain)
+            .unwrap_or_default();
+        for event in events {
+            let effects = match event {
+                GlobalEvent::Pressed(at) => self.activation.press(at, !self.settings_open),
+                GlobalEvent::Released(at) => self.activation.release(at),
+                GlobalEvent::Escape(_) => self.activation.escape(),
+            };
+            self.apply_activation(effects, cx);
+        }
+        let effects = self.activation.tick(Instant::now());
+        self.apply_activation(effects, cx);
+        self.check_readiness(cx);
+    }
+
+    /// Readiness tracks real audio: listening is announced once the
+    /// running take's recorder has captured samples, not when the
+    /// shortcut fired.
+    fn check_readiness(&mut self, cx: &mut Context<Self>) {
+        if self.activation.readiness() != Some(Readiness::Starting) {
+            return;
+        }
+        let (Some(take), Some(recorder)) = (self.recording_take, self.recorder.as_ref()) else {
+            return;
+        };
+        if recorder.captured_sample_count() > 0 {
+            let effects = self.activation.samples_arrived(take);
+            self.apply_activation(effects, cx);
+        }
+    }
+
+    /// Perform the machine's effects, in order.
+    pub(crate) fn apply_activation(&mut self, effects: Vec<Effect>, cx: &mut Context<Self>) {
+        if effects.is_empty() {
+            return;
+        }
+        for effect in effects {
+            match effect {
+                Effect::Start(take) => {
+                    if self.start_recording(cx) {
+                        self.recording_take = Some(take);
+                    } else {
+                        self.activation.start_failed(take);
+                    }
+                }
+                Effect::Finish(take) => {
+                    if self.recording_take == Some(take) {
+                        self.recording_take = None;
+                        self.stop_recording(cx);
+                    }
+                }
+                Effect::Cancel(take, reason) => {
+                    if self.recording_take == Some(take) {
+                        self.recording_take = None;
+                        self.cancel_recording(reason, cx);
+                    }
+                }
+                Effect::Listening(_) => {}
+            }
+        }
+        self.sync_escape_grab();
+        cx.notify();
+    }
+
+    /// Escape is grabbed system-wide exactly while a take is active.
+    fn sync_escape_grab(&mut self) {
+        let active = self.activation.is_active();
+        let Some(shortcuts) = self.global_shortcuts.as_mut() else {
+            return;
+        };
+        if shortcuts.escape_armed() != active {
+            if let Err(reason) = shortcuts.arm_escape(active) {
+                // In-window Escape still cancels; only the system-wide
+                // grab is missing.
+                eprintln!("Escape could not be grabbed system-wide: {reason}");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn machine(mode: ActivationMode, double_tap: bool) -> Activation {
+        Activation::new(ActivationConfig {
+            mode,
+            double_tap_hands_free: double_tap,
+        })
+    }
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    /// Start a take at `t0` and report its first samples.
+    fn start_listening(machine: &mut Activation, t0: Instant) -> TakeId {
+        let effects = machine.press(t0, true);
+        let [Effect::Start(take)] = effects[..] else {
+            panic!("expected a start, got {effects:?}");
+        };
+        assert_eq!(machine.samples_arrived(take), vec![Effect::Listening(take)]);
+        take
+    }
+
+    #[test]
+    fn toggle_starts_on_press_and_stops_on_the_next_press() {
+        let mut m = machine(ActivationMode::Toggle, false);
+        let t0 = Instant::now();
+        let take = start_listening(&mut m, t0);
+        assert_eq!(m.latch(), Some(Latch::Latched));
+        assert!(m.release(t0 + ms(80)).is_empty());
+        assert!(m.is_active());
+        assert_eq!(m.press(t0 + ms(2000), true), vec![Effect::Finish(take)]);
+        assert!(m.release(t0 + ms(2080)).is_empty());
+        assert!(!m.is_active());
+    }
+
+    #[test]
+    fn hold_records_while_held_and_finishes_on_release() {
+        let mut m = machine(ActivationMode::Hold, false);
+        let t0 = Instant::now();
+        let take = start_listening(&mut m, t0);
+        assert_eq!(m.latch(), Some(Latch::Held));
+        assert_eq!(m.release(t0 + ms(1500)), vec![Effect::Finish(take)]);
+        assert!(!m.is_active());
+    }
+
+    #[test]
+    fn hold_without_double_tap_finishes_even_a_quick_tap() {
+        let mut m = machine(ActivationMode::Hold, false);
+        let t0 = Instant::now();
+        let take = start_listening(&mut m, t0);
+        assert_eq!(m.release(t0 + ms(100)), vec![Effect::Finish(take)]);
+    }
+
+    #[test]
+    fn hold_or_toggle_latches_a_tap_and_finishes_a_hold() {
+        let mut m = machine(ActivationMode::HoldOrToggle, false);
+        let t0 = Instant::now();
+        let take = start_listening(&mut m, t0);
+        assert!(m.release(t0 + ms(150)).is_empty());
+        assert_eq!(m.latch(), Some(Latch::Latched));
+        assert_eq!(m.press(t0 + ms(3000), true), vec![Effect::Finish(take)]);
+        // The stopping press's release does nothing.
+        assert!(m.release(t0 + ms(3100)).is_empty());
+
+        let t1 = t0 + ms(5000);
+        let take = start_listening(&mut m, t1);
+        assert_eq!(m.release(t1 + ms(900)), vec![Effect::Finish(take)]);
+    }
+
+    #[test]
+    fn double_tap_latches_hold_mode_hands_free() {
+        let mut m = machine(ActivationMode::Hold, true);
+        let t0 = Instant::now();
+        let take = start_listening(&mut m, t0);
+        assert!(m.release(t0 + ms(120)).is_empty());
+        // Waiting for the second tap: not held any more.
+        assert_eq!(m.latch(), Some(Latch::Latched));
+        assert!(m.press(t0 + ms(300), true).is_empty());
+        assert_eq!(m.latch(), Some(Latch::HandsFree));
+        assert!(m.release(t0 + ms(380)).is_empty());
+        assert!(m.tick(t0 + ms(5000)).is_empty());
+        assert!(m.is_active());
+        assert_eq!(m.press(t0 + ms(9000), true), vec![Effect::Finish(take)]);
+    }
+
+    #[test]
+    fn a_single_tap_in_double_tap_hold_mode_finishes_when_the_window_closes() {
+        let mut m = machine(ActivationMode::Hold, true);
+        let t0 = Instant::now();
+        let take = start_listening(&mut m, t0);
+        assert!(m.release(t0 + ms(120)).is_empty());
+        assert!(m.tick(t0 + ms(120) + DOUBLE_TAP_WINDOW).is_empty());
+        assert_eq!(
+            m.tick(t0 + ms(121) + DOUBLE_TAP_WINDOW),
+            vec![Effect::Finish(take)]
+        );
+    }
+
+    #[test]
+    fn a_late_second_tap_finishes_the_tapped_take_and_starts_the_next() {
+        let mut m = machine(ActivationMode::Hold, true);
+        let t0 = Instant::now();
+        let take = start_listening(&mut m, t0);
+        assert!(m.release(t0 + ms(100)).is_empty());
+        // No tick ran in between: the press itself sees the expired window.
+        let effects = m.press(t0 + ms(100) + DOUBLE_TAP_WINDOW + ms(50), true);
+        assert_eq!(effects, vec![Effect::Finish(take), Effect::Start(take + 1)]);
+        assert_eq!(m.latch(), Some(Latch::Held));
+    }
+
+    #[test]
+    fn a_held_double_tap_hold_records_until_release() {
+        let mut m = machine(ActivationMode::Hold, true);
+        let t0 = Instant::now();
+        let take = start_listening(&mut m, t0);
+        assert_eq!(m.release(t0 + ms(800)), vec![Effect::Finish(take)]);
+    }
+
+    #[test]
+    fn key_repeat_never_starts_or_stops_a_take() {
+        for mode in [
+            ActivationMode::Toggle,
+            ActivationMode::Hold,
+            ActivationMode::HoldOrToggle,
+        ] {
+            let mut m = machine(mode, true);
+            let t0 = Instant::now();
+            let take = start_listening(&mut m, t0);
+            // Windows-style repeats: an initial delay, then every 33 ms.
+            let mut at = t0 + ms(500);
+            for _ in 0..200 {
+                assert!(m.press(at, true).is_empty(), "{mode:?}");
+                at += ms(33);
+            }
+            assert_eq!(m.active_take(), Some(take), "{mode:?}");
+            // The long hold ends: hold-like modes finish, toggle keeps going.
+            let released = m.release(at);
+            match mode {
+                ActivationMode::Toggle => assert!(released.is_empty()),
+                _ => assert_eq!(released, vec![Effect::Finish(take)], "{mode:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn rapid_presses_never_overlap_takes() {
+        let mut m = machine(ActivationMode::Toggle, false);
+        let t0 = Instant::now();
+        let first = start_listening(&mut m, t0);
+        assert!(m.release(t0 + ms(30)).is_empty());
+        assert_eq!(m.press(t0 + ms(60), true), vec![Effect::Finish(first)]);
+        assert!(m.release(t0 + ms(90)).is_empty());
+        let effects = m.press(t0 + ms(120), true);
+        assert_eq!(effects, vec![Effect::Start(first + 1)]);
+        assert!(m.release(t0 + ms(150)).is_empty());
+        // Stopped before its microphone delivered anything: cancelled,
+        // never persisted as an empty take.
+        assert_eq!(
+            m.press(t0 + ms(180), true),
+            vec![Effect::Cancel(first + 1, CancelReason::NoAudioYet)]
+        );
+    }
+
+    #[test]
+    fn a_lost_release_does_not_leave_a_stuck_hold() {
+        let mut m = machine(ActivationMode::Hold, false);
+        let t0 = Instant::now();
+        let take = start_listening(&mut m, t0);
+        // The release never arrived (focus moved). A press long after the
+        // last key event finishes the take and starts nothing.
+        assert_eq!(m.press(t0 + ms(4000), true), vec![Effect::Finish(take)]);
+        assert!(!m.is_active());
+        // Its own release is ignored, and the next press starts normally.
+        assert!(m.release(t0 + ms(4100)).is_empty());
+        assert_eq!(m.press(t0 + ms(6000), true), vec![Effect::Start(take + 1)]);
+    }
+
+    #[test]
+    fn a_lost_release_while_idle_does_not_swallow_the_next_press() {
+        let mut m = machine(ActivationMode::Toggle, false);
+        let t0 = Instant::now();
+        let take = start_listening(&mut m, t0);
+        assert_eq!(m.press(t0 + ms(3000), true), vec![Effect::Finish(take)]);
+        // That press's release was lost; the next real press still works.
+        assert_eq!(m.press(t0 + ms(8000), true), vec![Effect::Start(take + 1)]);
+    }
+
+    #[test]
+    fn escape_cancels_and_clears_the_latch() {
+        let mut m = machine(ActivationMode::Hold, true);
+        let t0 = Instant::now();
+        let take = start_listening(&mut m, t0);
+        assert!(m.release(t0 + ms(100)).is_empty());
+        assert!(m.press(t0 + ms(250), true).is_empty());
+        assert_eq!(m.latch(), Some(Latch::HandsFree));
+        assert_eq!(m.escape(), vec![Effect::Cancel(take, CancelReason::Escape)]);
+        assert_eq!(m.latch(), None);
+        assert!(m.escape().is_empty());
+        // The second tap's release after Escape does nothing.
+        assert!(m.release(t0 + ms(300)).is_empty());
+        assert!(!m.is_active());
+    }
+
+    #[test]
+    fn escape_while_held_ignores_the_later_release() {
+        let mut m = machine(ActivationMode::Hold, false);
+        let t0 = Instant::now();
+        let take = start_listening(&mut m, t0);
+        assert_eq!(m.escape(), vec![Effect::Cancel(take, CancelReason::Escape)]);
+        assert!(m.release(t0 + ms(2000)).is_empty());
+        assert_eq!(m.press(t0 + ms(3000), true), vec![Effect::Start(take + 1)]);
+    }
+
+    #[test]
+    fn listening_is_announced_once_and_only_for_the_live_take() {
+        let mut m = machine(ActivationMode::Toggle, false);
+        let t0 = Instant::now();
+        let [Effect::Start(take)] = m.press(t0, true)[..] else {
+            panic!("expected a start");
+        };
+        assert_eq!(m.readiness(), Some(Readiness::Starting));
+        assert_eq!(m.samples_arrived(take), vec![Effect::Listening(take)]);
+        assert_eq!(m.readiness(), Some(Readiness::Listening));
+        assert!(m.samples_arrived(take).is_empty());
+        // A late report for a superseded take is ignored.
+        assert!(m.samples_arrived(take - 1).is_empty());
+    }
+
+    #[test]
+    fn no_listening_after_a_failed_start_or_a_cancel() {
+        let mut m = machine(ActivationMode::Toggle, false);
+        let t0 = Instant::now();
+        let [Effect::Start(take)] = m.press(t0, true)[..] else {
+            panic!("expected a start");
+        };
+        m.start_failed(take);
+        assert!(!m.is_active());
+        assert!(m.samples_arrived(take).is_empty());
+        assert!(m.release(t0 + ms(50)).is_empty());
+
+        let [Effect::Start(next)] = m.press(t0 + ms(2000), true)[..] else {
+            panic!("expected a start");
+        };
+        assert_eq!(m.escape(), vec![Effect::Cancel(next, CancelReason::Escape)]);
+        assert!(m.samples_arrived(next).is_empty());
+        // A stale failure report cannot end a newer take.
+        let [Effect::Start(third)] = m.press(t0 + ms(4000), true)[..] else {
+            panic!("expected a start");
+        };
+        m.start_failed(next);
+        assert_eq!(m.active_take(), Some(third));
+    }
+
+    #[test]
+    fn a_microphone_that_never_delivers_is_cancelled_not_stuck() {
+        let mut m = machine(ActivationMode::Toggle, false);
+        let t0 = Instant::now();
+        let [Effect::Start(take)] = m.press(t0, true)[..] else {
+            panic!("expected a start");
+        };
+        assert!(m.tick(t0 + START_STALL - ms(1)).is_empty());
+        assert_eq!(
+            m.tick(t0 + START_STALL),
+            vec![Effect::Cancel(take, CancelReason::MicStalled)]
+        );
+        assert!(!m.is_active());
+        assert!(m.samples_arrived(take).is_empty());
+    }
+
+    #[test]
+    fn a_listening_take_never_stalls() {
+        let mut m = machine(ActivationMode::Toggle, false);
+        let t0 = Instant::now();
+        start_listening(&mut m, t0);
+        assert!(m.tick(t0 + START_STALL * 10).is_empty());
+        assert!(m.is_active());
+    }
+
+    #[test]
+    fn a_modal_blocks_starting_but_not_stopping() {
+        let mut m = machine(ActivationMode::Toggle, false);
+        let t0 = Instant::now();
+        assert!(m.press(t0, false).is_empty());
+        assert!(m.release(t0 + ms(50)).is_empty());
+        let take = start_listening(&mut m, t0 + ms(1000));
+        assert!(m.release(t0 + ms(1050)).is_empty());
+        assert_eq!(m.press(t0 + ms(2000), false), vec![Effect::Finish(take)]);
+    }
+
+    #[test]
+    fn a_hold_through_an_opening_modal_does_not_start_on_release() {
+        let mut m = machine(ActivationMode::HoldOrToggle, false);
+        let t0 = Instant::now();
+        assert!(m.press(t0, false).is_empty());
+        assert!(m.release(t0 + ms(100)).is_empty());
+        assert!(!m.is_active());
+    }
+
+    #[test]
+    fn the_record_button_toggles_in_every_mode() {
+        for mode in [
+            ActivationMode::Toggle,
+            ActivationMode::Hold,
+            ActivationMode::HoldOrToggle,
+        ] {
+            let mut m = machine(mode, true);
+            let t0 = Instant::now();
+            let [Effect::Start(take)] = m.click(t0)[..] else {
+                panic!("expected a start");
+            };
+            assert_eq!(m.latch(), Some(Latch::Latched));
+            m.samples_arrived(take);
+            assert!(m.tick(t0 + ms(2000)).is_empty());
+            assert_eq!(m.click(t0 + ms(2100)), vec![Effect::Finish(take)]);
+        }
+    }
+
+    #[test]
+    fn a_config_change_mid_hold_keeps_the_take_running() {
+        let mut m = machine(ActivationMode::Hold, false);
+        let t0 = Instant::now();
+        let take = start_listening(&mut m, t0);
+        m.set_config(ActivationConfig {
+            mode: ActivationMode::Toggle,
+            double_tap_hands_free: false,
+        });
+        assert!(m.release(t0 + ms(2000)).is_empty());
+        assert_eq!(m.latch(), Some(Latch::Latched));
+        assert_eq!(m.press(t0 + ms(4000), true), vec![Effect::Finish(take)]);
+    }
+
+    #[test]
+    fn an_external_end_returns_to_idle_only_for_the_live_take() {
+        let mut m = machine(ActivationMode::Toggle, false);
+        let t0 = Instant::now();
+        let take = start_listening(&mut m, t0);
+        m.ended(take + 7);
+        assert!(m.is_active());
+        m.ended(take);
+        assert!(!m.is_active());
+    }
+}

@@ -270,6 +270,20 @@ impl StarlingApp {
         }
     }
 
+    /// The take was cancelled (#221): nothing will be transcribed. A
+    /// draft the user typed into is kept on screen (interrupted, with the
+    /// notice to copy it); an untouched one simply goes away.
+    pub(crate) fn staging_cancelled(&mut self, cx: &mut Context<Self>) {
+        let untouched = self
+            .staging
+            .as_ref()
+            .is_some_and(|staging| staging.editor.read(cx).buffer.text.trim().is_empty());
+        self.staging_interrupted(cx);
+        if untouched {
+            self.retire_staging(cx);
+        }
+    }
+
     /// The live stream delivered a partial.
     pub(crate) fn staging_partial(&mut self, partial: Partial, cx: &mut Context<Self>) {
         let Some(staging) = self.staging.as_mut() else {
