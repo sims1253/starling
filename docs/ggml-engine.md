@@ -380,19 +380,28 @@ build. The recorded CPU checks reproduce the golden fixture transcripts.
 CPU inference is about 10-20 times slower than CUDA in the recorded benchmarks
 and is useful for correctness checks and machines without a supported GPU.
 
-`STARLING_GGML_CPU_REPACK=1` opts the CPU backend into ggml's repacked GEMM
-kernels (`cpp/runtime/cpu_repack.hpp`); `=0` turns them off. It is on by
-default on Android and off elsewhere. Weights are rewritten in place into the
-interleaved layouts the NEON dotprod/i8mm and AVX2 kernels read (Q4_0, Q4_K,
-Q6_K, Q8_0, IQ4_NL, ... depending on the CPU), so memory use is unchanged. A
-weight is repacked only when every graph use observed so far is a direct 2D
-`MUL_MAT` source with F32 activations; a weight read any other way (views,
-`get_rows`, convolutions) stays in the plain layout, and a graph that reads an
-already-repacked weight through another op fails with a `cpu_repack` error
-instead of computing on the interleaved bytes. On an x86 AVX2 desktop
-(Parakeet TDT 0.6B q4_k_m, 8 threads) it cut transcription time by 9-15% with
-byte-identical transcripts on the fixtures; only the Q4_K tensors have x86
-kernels, while arm64 also repacks Q6_K and Q8_0.
+The CPU backend uses ggml's repacked GEMM kernels (`cpp/runtime/cpu_repack.hpp`)
+by default on every platform; `STARLING_GGML_CPU_REPACK=0` turns them off (`=1`
+forces them on). Weights are rewritten in place into the interleaved layouts the
+NEON dotprod/i8mm and AVX2 kernels read (Q4_0, Q4_K, Q6_K, Q8_0, IQ4_NL, ...
+depending on the CPU), so memory use is unchanged. A weight is repacked only
+when every graph use observed so far is a direct 2D `MUL_MAT` source with F32
+activations; a weight read any other way (views, `get_rows`, convolutions) stays
+in the plain layout, and a graph that reads an already-repacked weight through
+another op fails with a `cpu_repack` error instead of computing on the
+interleaved bytes. On an x86 AVX2 desktop (Parakeet TDT 0.6B q4_k_m, 8 threads)
+it cut transcription time by 9-15% with byte-identical transcripts on the
+fixtures. On a Ryzen 5650U notebook (#59) it cut wall time by 23% (parakeet q4),
+14% (MOSS q4) and 6% (qwen3 dynq4), and the granite encoder by 19%, with
+identical fixture transcripts and FLEURS WER within 0.1 point everywhere except
+MOSS, whose transcripts move by about ±0.4 WER points in either direction (its
+decoder sits close to the decision boundary on many words); the S1 q4_k_m
+normalizer likewise flips an occasional token. On x86 AVX2 only Q4_0, Q4_K and
+IQ4_NL tensors have repacked kernels; arm64 also repacks Q5_K, Q6_K and Q8_0.
+Repacking adds no persistent memory; the cost is a one-time rewrite on a
+weight's first graph use, repaid within the first request. ggml's per-tensor
+`repack tensor ...` debug lines are filtered out of the log;
+`STARLING_GGML_CPU_REPACK_DEBUG=1` shows them again.
 
 ### Apple Metal
 

@@ -33,7 +33,8 @@
 //
 // Gate: STARLING_GGML_CPU_REPACK=1/true/on/yes enables, =0/false/off/no
 // disables (anything else warns and keeps the default). Default: enabled on
-// Android (phones are CPU-only and gain the most), disabled elsewhere.
+// every CPU. ggml's per-tensor "repack tensor" DEBUG log lines are filtered
+// out; STARLING_GGML_CPU_REPACK_DEBUG=1 (same values) keeps them.
 #pragma once
 
 #include <cstddef>
