@@ -4,14 +4,21 @@ import android.app.ActivityManager
 import android.app.Application
 import android.content.ComponentCallbacks2
 import android.content.Context
+import android.os.Handler
+import android.os.Looper
+import dev.starling.mobile.engine.ModelLifetime
 import dev.starling.mobile.engine.OnDeviceBackend
 import dev.starling.mobile.engine.OnDeviceEngine
 import dev.starling.mobile.network.BackendSettings
 import dev.starling.mobile.network.TranscriptionCoordinator
+import dev.starling.mobile.network.TranscriptionEngine
 import dev.starling.mobile.storage.RecordingStore
 import java.io.File
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.ThreadPoolExecutor
+import java.util.concurrent.TimeUnit
 
 class StarlingApplication : Application() {
     lateinit var recordings: RecordingStore
@@ -24,6 +31,10 @@ class StarlingApplication : Application() {
         private set
     lateinit var modelDownloads: ModelDownloadController
         private set
+    lateinit var modelLifetime: ModelLifetime
+        private set
+
+    private val mainHandler = Handler(Looper.getMainLooper())
 
     // One worker for releases: repeated trims while a transcription holds the
     // engine queue behind each other instead of stacking waiting threads.
@@ -31,12 +42,35 @@ class StarlingApplication : Application() {
         Thread(runnable, "starling-model-release").apply { isDaemon = true }
     }
 
+    // Speculative loads (ModelLifetime.preload). One thread at most, and none
+    // while nothing is queued: it exits after a short idle period.
+    private val preloadExecutor = ThreadPoolExecutor(1, 1, 5, TimeUnit.SECONDS, LinkedBlockingQueue()) { runnable ->
+        Thread(runnable, "starling-model-preload").apply { isDaemon = true }
+    }.apply { allowCoreThreadTimeOut(true) }
+
     override fun onCreate() {
         super.onCreate()
         recordings = RecordingStore(this)
         backendSettings = BackendSettings(this)
         onDeviceEngine = OnDeviceEngine(File(filesDir, "models"), memoryGate = ::memoryGate)
         modelDownloads = ModelDownloadController(onDeviceEngine)
+        modelLifetime = ModelLifetime(
+            engine = object : ModelLifetime.Engine {
+                override fun activeModelName() = onDeviceEngine.activeModelName()
+                override fun prepare() = onDeviceEngine.prepare()
+                override fun releaseIfIdle(generation: Long) = onDeviceEngine.releaseIfIdle(generation)
+            },
+            worker = preloadExecutor,
+            // The timer lives on the main looper (no thread of its own); the
+            // release itself waits for the engine lock, so it runs off it.
+            scheduler = { delayMs, task ->
+                val post = Runnable { releaseExecutor.execute(task) }
+                mainHandler.postDelayed(post, delayMs)
+                ModelLifetime.Cancellable { mainHandler.removeCallbacks(post) }
+            },
+            deliver = { mainHandler.post(it) },
+        )
+        onDeviceEngine.observer = modelLifetime
         transcription = TranscriptionCoordinator(
             recordings,
             backendSettings,
@@ -70,6 +104,17 @@ class StarlingApplication : Application() {
     // releaseWhenIdle waits for an in-flight transcription; never on the main thread.
     private fun releaseOnDeviceModel() {
         releaseExecutor.execute { onDeviceEngine.releaseWhenIdle() }
+    }
+
+    /**
+     * A voice surface became active (the keyboard shown, the recognizer popup
+     * or the recorder opened): start loading the selected local model so the
+     * first words of a recording do not wait for it. A no-op for the server
+     * engine; never opens the microphone, never downloads (see ModelLifetime).
+     */
+    fun preloadOnDeviceModel() {
+        if (backendSettings.load().engine != TranscriptionEngine.ON_DEVICE) return
+        runCatching { modelLifetime.preload() }
     }
 
     /**

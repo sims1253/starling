@@ -3,6 +3,7 @@ package dev.starling.mobile.engine
 import dev.starling.mobile.network.CommitOutcome
 import dev.starling.mobile.network.StreamEvent
 import dev.starling.mobile.network.StreamSession
+import java.io.Closeable
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.ReentrantLock
@@ -18,10 +19,19 @@ import kotlin.concurrent.withLock
  * loads the model, then drives a [ChunkStreamer] over the buffer and emits
  * [StreamEvent.Partial] whenever the text changes. [finish] finalizes the
  * remaining tail, so the final transcript is ready moments after Stop
- * instead of after a full pass over the recording. As with the server
- * stream, the saved WAV stays the source of truth: any engine failure or a
- * worker that falls too far behind interrupts the stream, and [finish]
- * answers [CommitOutcome.Fallback] so the batch path transcribes the WAV.
+ * instead of after a full pass over the recording.
+ *
+ * The capture never waits for the model (#229): audio is saved from the
+ * first sample while the worker is still loading, and the samples that
+ * arrived meanwhile are fed to the streamer in order once the model is
+ * ready. The in-memory buffer is bounded by [maxLiveSamples]; audio beyond
+ * it (a slow cold load, or an engine that fell behind) stays only in the
+ * recording's saved WAV, which [backlog] opens for the worker to read back.
+ * Without a [backlog] the bound interrupts the stream as before.
+ *
+ * As with the server stream, the saved WAV stays the source of truth: any
+ * engine failure interrupts the stream, and [finish] answers
+ * [CommitOutcome.Fallback] so the batch path transcribes the WAV.
  */
 class OnDeviceStreamSession(
     private val engine: LiveEngine,
@@ -29,6 +39,7 @@ class OnDeviceStreamSession(
     private val streamer: ChunkStreamer = ChunkStreamer(),
     private val clock: () -> Double = { System.nanoTime() / 1e9 },
     private val maxLiveSamples: Int = MAX_LIVE_SECONDS * ChunkStreamer.SAMPLE_RATE,
+    private val backlog: (() -> Backlog)? = null,
 ) : StreamSession {
     /** The engine surface the session needs; [OnDeviceEngine] in production. */
     interface LiveEngine {
@@ -48,14 +59,35 @@ class OnDeviceStreamSession(
         data class Failed(val reason: String) : WindowResult
     }
 
+    /**
+     * Random access to the audio the capture has already saved, for samples
+     * the bounded live buffer could not hold. Opened on the capture thread
+     * the first time the buffer is full (the recording's file exists then),
+     * read and closed by the worker.
+     */
+    interface Backlog : Closeable {
+        /**
+         * Reads [count] samples starting at absolute sample [from] into [into]
+         * at [offset] as floats in [-1, 1]; returns how many it read.
+         */
+        fun read(from: Long, into: FloatArray, offset: Int, count: Int): Int
+    }
+
     private val lock = ReentrantLock()
     private val changed = lock.newCondition()
     private val settled = CountDownLatch(1)
 
-    // Guarded by [lock]. The capture thread appends; the worker snapshots
-    // and trims finalized audio from the front.
+    // Guarded by [lock]. The buffer holds the samples [base, base + size) of
+    // the recording, out of [captured] delivered so far. The capture thread
+    // appends while the buffer is complete (base + size == captured) and has
+    // room; otherwise the samples stay in the saved WAV ([openBacklog]) and
+    // the worker reads them back in order. The worker snapshots and trims
+    // finalized audio from the front.
     private var buffer = FloatArray(INITIAL_BUFFER_SAMPLES)
     private var size = 0
+    private var base = 0L
+    private var captured = 0L
+    private var openBacklog: Backlog? = null
     private var inputEnded = false
     private var closed = false
     private var failure: String? = null
@@ -88,24 +120,40 @@ class OnDeviceStreamSession(
         if (samples <= 0) return
         lock.withLock {
             if (!acceptsAudioLocked()) return
-            if (size + samples > maxLiveSamples) {
-                // The engine is not keeping up with real time; stop before the
-                // buffer (and the eventual flush) grows without bound.
+            if (base + size == captured && size + samples <= maxLiveSamples) {
+                appendLocked(bytes, samples)
+            } else if (!spillLocked()) {
+                // No saved audio to fall back on: the engine is not keeping up
+                // with real time; stop before the buffer (and the eventual
+                // flush) grows without bound.
                 failLocked("the on-device engine fell behind the recording", bufferLimitReached = true)
                 return
             }
-            if (size + samples > buffer.size) {
-                buffer = buffer.copyOf(maxOf(size + samples, buffer.size * 2))
-            }
-            // PCM16 little-endian, exactly as AudioCapture writes the WAV.
-            for (i in 0 until samples) {
-                val lo = bytes[2 * i].toInt() and 0xff
-                val hi = bytes[2 * i + 1].toInt()
-                buffer[size + i] = ((hi shl 8) or lo).toShort() / 32768f
-            }
-            size += samples
+            captured += samples
             changed.signalAll()
         }
+    }
+
+    private fun appendLocked(bytes: ByteArray, samples: Int) {
+        if (size + samples > buffer.size) {
+            buffer = buffer.copyOf(maxOf(size + samples, buffer.size * 2))
+        }
+        // PCM16 little-endian, exactly as AudioCapture writes the WAV.
+        for (i in 0 until samples) {
+            val lo = bytes[2 * i].toInt() and 0xff
+            val hi = bytes[2 * i + 1].toInt()
+            buffer[size + i] = ((hi shl 8) or lo).toShort() / 32768f
+        }
+        size += samples
+    }
+
+    /**
+     * Leaves a chunk in the saved WAV only (the buffer is full, or behind);
+     * false when there is no saved audio to read it back from.
+     */
+    private fun spillLocked(): Boolean {
+        if (openBacklog == null) openBacklog = backlog?.let { open -> runCatching(open).getOrNull() }
+        return openBacklog != null
     }
 
     override fun finish(): CommitOutcome {
@@ -138,6 +186,10 @@ class OnDeviceStreamSession(
             // fallback so the saved WAV goes through the batch path.
             lock.withLock { failLocked(t.message ?: t::class.java.simpleName, bufferLimitReached = false) }
         } finally {
+            lock.withLock {
+                runCatching { openBacklog?.close() }
+                openBacklog = null
+            }
             engine.liveSessionEnded()
             emitInterruption()
         }
@@ -170,15 +222,19 @@ class OnDeviceStreamSession(
             }
         }
         while (true) {
+            if (!refillFromBacklog()) return
             val snapshot: FloatArray
             val snapshotSize: Int
             val ending: Boolean
+            val behind: Boolean
             lock.withLock {
-                while (!closed && failure == null && !inputEnded && size == steppedSize) {
+                while (!closed && failure == null && !inputEnded && size == steppedSize && !behindLocked()) {
                     changed.await(IDLE_WAIT_MILLIS, TimeUnit.MILLISECONDS)
                 }
                 if (closed || failure != null) return
-                ending = inputEnded
+                behind = behindLocked()
+                // Stop finalizes only once the backlog has been read back.
+                ending = inputEnded && !behind
                 snapshot = buffer.copyOf(size)
                 snapshotSize = size
             }
@@ -197,7 +253,13 @@ class OnDeviceStreamSession(
                 return
             }
 
-            val partial = streamer.step(snapshot, snapshotSize, clock(), tx)
+            // Catching up on a backlog finalizes whole windows only: a tail
+            // partial would be overtaken by the next window right away.
+            val partial = if (behind) {
+                streamer.catchUp(snapshot, snapshotSize, tx)
+            } else {
+                streamer.step(snapshot, snapshotSize, clock(), tx)
+            }
             windowFailure?.let { reason ->
                 lock.withLock { failLocked(reason, bufferLimitReached = false) }
                 return
@@ -208,9 +270,46 @@ class OnDeviceStreamSession(
             }
             steppedSize -= trimFinalized()
             // Throttle: a step that transcribed nothing new must not spin.
-            if (partial == null) sleepQuietly(STEP_BACKOFF_MILLIS)
+            if (partial == null && !behind) sleepQuietly(STEP_BACKOFF_MILLIS)
         }
     }
+
+    private fun behindLocked(): Boolean = base + size < captured
+
+    /**
+     * Reads saved audio the buffer is missing back into it, in order, up to
+     * the buffer bound (never below one streamer window, so catching up
+     * always progresses). The read happens outside the lock: while the
+     * buffer is behind, the capture thread only counts new samples and the
+     * buffer's end is the worker's alone. False when the read failed (the
+     * stream is then failed and falls back to the batch path).
+     */
+    private fun refillFromBacklog(): Boolean {
+        val from: Long
+        val count: Int
+        val source: Backlog
+        lock.withLock {
+            if (!behindLocked()) return true
+            source = openBacklog ?: return true
+            from = base + size
+            count = minOf(captured - from, (refillLimit() - size).toLong()).toInt()
+        }
+        if (count <= 0) return true
+        val samples = FloatArray(count)
+        val read = runCatching { source.read(from, samples, 0, count) }.getOrDefault(-1)
+        lock.withLock {
+            if (read != count) {
+                failLocked("the saved recording could not be read back", bufferLimitReached = false)
+                return false
+            }
+            if (size + count > buffer.size) buffer = buffer.copyOf(maxOf(size + count, buffer.size * 2))
+            System.arraycopy(samples, 0, buffer, size, count)
+            size += count
+        }
+        return true
+    }
+
+    private fun refillLimit(): Int = maxOf(maxLiveSamples, streamer.windowSamples)
 
     /**
      * Drops finalized audio from the buffer front after every step, so the
@@ -222,6 +321,7 @@ class OnDeviceStreamSession(
         lock.withLock {
             System.arraycopy(buffer, dropped, buffer, 0, size - dropped)
             size -= dropped
+            base += dropped
             // Give back a peak-sized array once the live tail is small again.
             if (buffer.size > INITIAL_BUFFER_SAMPLES && buffer.size > size * 4) {
                 buffer = buffer.copyOf(maxOf(INITIAL_BUFFER_SAMPLES, size * 2))
@@ -233,7 +333,9 @@ class OnDeviceStreamSession(
 
     private fun sleepQuietly(millis: Long) {
         lock.withLock {
-            if (!closed && !inputEnded && failure == null) changed.await(millis, TimeUnit.MILLISECONDS)
+            if (!closed && !inputEnded && failure == null && !behindLocked()) {
+                changed.await(millis, TimeUnit.MILLISECONDS)
+            }
         }
     }
 

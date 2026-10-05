@@ -455,7 +455,7 @@ class MainActivity : Activity() {
         // does not support streaming, and the recording proceeds as before.
         val config = application.backendSettings.load()
         var session: StreamSession? = null
-        session = application.transcription.beginStreaming(config) { event ->
+        session = application.transcription.beginStreaming(config, application.recordings.partialFile(recording)) { event ->
             // Events from a superseded session must not rewrite the views of
             // the recording that replaced it.
             if (streamSession === session) onStreamEvent(event)

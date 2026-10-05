@@ -155,7 +155,7 @@ class VoiceInputService : InputMethodService() {
         // configuration records in the plain batch mode.
         val config = application.backendSettings.load()
         var session: StreamSession? = null
-        session = application.transcription.beginStreaming(config) { event ->
+        session = application.transcription.beginStreaming(config, application.recordings.partialFile(recording)) { event ->
             // Events from a superseded session must not touch the state of
             // the recording that replaced it.
             if (streamSession === session) onStreamEvent(event)

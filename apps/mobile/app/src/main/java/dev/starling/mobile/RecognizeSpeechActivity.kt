@@ -135,7 +135,7 @@ class RecognizeSpeechActivity : Activity() {
         val config = application.backendSettings.load()
         captureConfig = config
         var session: StreamSession? = null
-        session = application.transcription.beginStreaming(config) { event ->
+        session = application.transcription.beginStreaming(config, application.recordings.partialFile(recording)) { event ->
             if (streamSession === session) onStreamEvent(event)
         }
         val error = capture.start(

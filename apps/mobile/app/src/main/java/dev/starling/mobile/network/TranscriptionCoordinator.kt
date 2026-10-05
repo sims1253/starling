@@ -7,6 +7,7 @@ import dev.starling.mobile.data.RecordingStatus
 import dev.starling.mobile.data.TranscriptionProvenance
 import dev.starling.mobile.engine.OnDeviceBackend
 import dev.starling.mobile.storage.RecordingStore
+import java.io.File
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -69,14 +70,17 @@ class TranscriptionCoordinator(
      * be trusted — the recording itself is never affected. Callers forward
      * capture chunks to [StreamSession.onAudio] and must eventually call
      * [finishStreaming] (Stop) or [StreamSession.close] (cancel/failure);
-     * nothing else is required of them.
+     * nothing else is required of them. [savedAudio] is the file the capture
+     * writes (RecordingStore.partialFile); the on-device session reads audio
+     * back from it that arrived while the model was still loading.
      */
     fun beginStreaming(
         config: BackendConfig = settings.load(),
+        savedAudio: File? = null,
         onEvent: (StreamEvent) -> Unit = {},
     ): StreamSession? {
         val post: (StreamEvent) -> Unit = { event -> mainHandler.post { onEvent(event) } }
-        if (config.engine == TranscriptionEngine.ON_DEVICE) return onDevice.beginStreaming(post)
+        if (config.engine == TranscriptionEngine.ON_DEVICE) return onDevice.beginStreaming(savedAudio, post)
         if (!streamingEligible(config)) return null
         val url = streamUrl(config.endpoint, config.allowTrustedLanHttp) ?: return null
         return streamClient.connect(url, post)
