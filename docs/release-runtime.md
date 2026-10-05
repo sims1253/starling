@@ -175,7 +175,9 @@ powershell -ExecutionPolicy Bypass -File check-windows-archive.ps1 `
 With `-Gguf`, `-Audio`, and `-Expected` it also runs representative inference:
 `/health` must report a device of the archive's backend (`CUDA0`, `Vulkan0`, or
 `CPU`), the transcript must match exactly, and the server log must contain no
-accelerator-rejected node. It lists the runtime and driver DLLs the server
+accelerator-rejected node. It refuses a port that is already in use, requires
+the listening socket to belong to the server it started, and bounds the
+transcription request. It lists the runtime and driver DLLs the server
 loaded, and for CUDA requires cuBLAS to come from `-RuntimePath`. Installed SDKs
 elsewhere on the machine are not removed, so this is a reduced-`PATH` check,
 not a clean-VM check. The release workflow does not run it; results are
@@ -192,16 +194,21 @@ artifacts have run representative inference on real hardware: the Parakeet TDT
 `POST /v1/audio/transcriptions`, requiring the exact transcript on the device
 the archive targets. Only Parakeet was exercised; other models are not covered
 by this ledger. The release workflow does not re-run these checks, so each
-entry is for the build named in it. Details are on the tracking issue (#57).
+entry is for the build named in it. "E25" is the Experimental 25 prerelease
+(master `74a8fe3`, built by this workflow in experimental mode, CUDA SM 120
+only). Checksums, versions, procedures, and expected versus actual results
+for the 2026-10-05 entries are in the
+[evidence record](https://github.com/sims1253/starling/blob/master/docs/evidence/release-runtime-2026-10-05/README.md)
+(tracking issue #57).
 
 | Artifact | Representative inference | Hardware and runtime | Not covered |
 | --- | --- | --- | --- |
-| `linux-cuda` | Verified (2026-10-05): workflow-built archive (SM 120 only) and a release-recipe build (SM 75-120, CUDA 13.3) | RTX 5090 (SM 120) through WSL2: Windows driver 610.88, Ubuntu 22.04 container with only the documented runtime packages | Bare-metal Linux NVIDIA driver; SM 75-90 GPUs |
+| `linux-cuda` | Verified (2026-10-05): E25 archive and a local release-recipe build (SM 75-120, CUDA 13.3) | RTX 5090 (SM 120) through WSL2: Windows driver 610.88, Ubuntu 22.04 container with only the documented runtime packages | Bare-metal Linux NVIDIA driver; SM 75-90 GPUs |
 | `linux-vulkan` | Verified (#76) | AMD Radeon Graphics (RADV RENOIR), Mesa 26.2.2 and 23.2.1 | NVIDIA and Intel Vulkan drivers |
-| `linux-cpu` | Verified (2026-10-05): workflow-built archive | AMD Ryzen 9 5900X, Ubuntu 22.04 (WSL2) | Non-x86_64 hosts are not a release target |
+| `linux-cpu` | Verified (2026-10-05): E25 archive | AMD Ryzen 9 5900X, Ubuntu 22.04 (WSL2) | Non-x86_64 hosts are not a release target |
 | `linux-rocm` | Not verified | No ROCm hardware available | Everything; only the build runner's version and ABI checks ran |
-| `windows-cuda` | Verified (2026-10-05): workflow-built archive (SM 120 only) | RTX 5090 (SM 120), Windows 11 build 26200, driver 610.88; cuBLAS 13.5.1 from NVIDIA's CUDA 13.3.0 redistributables; reduced `PATH` | SM 75-90 GPUs; a clean Windows install |
-| `windows-vulkan` | Verified on a local build only (2026-10-05). The workflow-built archive of the previous code aborted on the first transcription on NVIDIA (misaligned duration-argmax source); the fix is not yet in a workflow-built archive | RTX 5090, NVIDIA Vulkan driver 610.88 (Vulkan 1.4), Windows 11 build 26200 | AMD and Intel Vulkan drivers; the workflow-built archive with the fix |
-| `windows-cpu` | Verified (2026-10-05): workflow-built archive | AMD Ryzen 9 5900X, Windows 11 build 26200, reduced `PATH` | A clean Windows install |
+| `windows-cuda` | Verified (2026-10-05): E25 archive | RTX 5090 (SM 120), Windows 11 build 26200, driver 610.88; cuBLAS 13.5.1 from NVIDIA's CUDA 13.3.0 redistributables; reduced `PATH` | SM 75-90 GPUs; a clean Windows install |
+| `windows-vulkan` | Verified on a local build only (2026-10-05). The E25 archive aborted on the first transcription on NVIDIA (misaligned duration-argmax source); the fix is not yet in a workflow-built archive | RTX 5090, NVIDIA Vulkan driver 610.88 (Vulkan 1.4), Windows 11 build 26200 | AMD and Intel Vulkan drivers; the workflow-built archive with the fix |
+| `windows-cpu` | Verified (2026-10-05): E25 archive | AMD Ryzen 9 5900X, Windows 11 build 26200, reduced `PATH` | A clean Windows install |
 | `macos-metal` | Not verified | No Apple hardware available | Everything; only the build runner's version and ABI checks ran |
 | `macos-cpu` | Not verified | No Apple hardware available | Everything; only the build runner's version and ABI checks ran |

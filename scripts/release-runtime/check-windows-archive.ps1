@@ -69,6 +69,10 @@ if ($abiText -ne $Abi) { throw "Expected ABI $Abi, got $abiText" }
 if (-not $Gguf) { "startup check passed (no inference requested)"; exit 0 }
 if (-not $Audio -or -not $Expected) { throw '-Gguf needs -Audio and -Expected' }
 
+# A server already listening on the port could answer for the one under test.
+if (Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue) {
+    throw "Port $Port is already in use; pass a free -Port"
+}
 $env:STARLING_SCHED_DEBUG = '1'
 $log = Join-Path $work 'server.log'
 $err = Join-Path $work 'server.err.log'
@@ -89,12 +93,18 @@ try {
         Get-Content $log, $err -ErrorAction SilentlyContinue | Select-Object -Last 40
         throw 'Model did not load'
     }
+    $owners = @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue |
+        Select-Object -ExpandProperty OwningProcess -Unique)
+    if ($owners.Count -ne 1 -or $owners[0] -ne $proc.Id) {
+        throw "Port $Port is not served by the process under test (pid $($proc.Id); listeners: $($owners -join ','))"
+    }
     "health: " + ($health | ConvertTo-Json -Compress)
     if ($health.backend -notmatch $deviceIs) { throw "Expected a $flavor device, got $($health.backend)" }
 
     # curl.exe ships in System32 on Windows 10 1803+ and Windows 11.
-    $response = & curl.exe -sS -w "`n%{http_code}" -F model=parakeet `
+    $response = & curl.exe -sS --connect-timeout 10 --max-time 600 -w "`n%{http_code}" -F model=parakeet `
         -F "file=@$((Resolve-Path $Audio).Path);type=audio/wav" "$base/v1/audio/transcriptions"
+    if ($LASTEXITCODE -ne 0) { throw "curl.exe failed with exit code $LASTEXITCODE" }
     $status = $response[-1]
     $body = ($response[0..($response.Count - 2)] -join "`n")
     "HTTP $status $body"

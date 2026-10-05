@@ -34,6 +34,10 @@ while [[ $# -gt 0 ]]; do
                 echo "--infer needs GGUF AUDIO EXPECTED_TEXT" >&2
                 exit 2
             fi
+            if [[ -z "$4" ]]; then
+                echo "--infer needs a non-empty EXPECTED_TEXT" >&2
+                exit 2
+            fi
             infer=("$2" "$3" "$4"); shift 4 ;;
         *) args+=("$1"); shift ;;
     esac
@@ -54,8 +58,10 @@ image=starling-release-cuda-runtime:ubuntu22.04
 docker build --tag "$image" --file "$script_dir/Dockerfile.cuda" "$script_dir"
 run_flags=()
 if [[ $with_gpu == 1 ]]; then run_flags+=(--gpus all); fi
+infer_flag=0
 expected=""
 if [[ ${#infer[@]} -gt 0 ]]; then
+    infer_flag=1
     run_flags+=(
         --mount "type=bind,source=$(realpath "${infer[0]}"),target=/model.gguf,readonly"
         --mount "type=bind,source=$(realpath "${infer[1]}"),target=/audio.wav,readonly"
@@ -64,7 +70,7 @@ if [[ ${#infer[@]} -gt 0 ]]; then
 fi
 docker run --rm --network none --read-only --tmpfs /tmp:exec "${run_flags[@]}" \
     --mount "type=bind,source=$archive,target=/release.tar.gz,readonly" \
-    -i "$image" bash -s -- "${args[1]}" "${args[2]}" "$with_gpu" "$expected" <<'CHECK'
+    -i "$image" bash -s -- "${args[1]}" "${args[2]}" "$with_gpu" "$infer_flag" "$expected" <<'CHECK'
 set -euo pipefail
 work=$(mktemp -d)
 cd "$work"
@@ -93,14 +99,16 @@ if [[ "$3" == "1" ]]; then
 else
     echo "GPU-less run: startup metadata only; no device was initialized (expected)"
 fi
-expected=$4
-if [[ -z "$expected" ]]; then
+if [[ "$4" != "1" ]]; then
     exit 0
 fi
+expected=$5
 
 # ---- representative inference (--infer) ----
-port=18187
+export port=18187
 # One HTTP/1.1 exchange over bash's /dev/tcp: METHOD PATH [BODY_FILE TYPE].
+# Callers bound it with timeout(1) (bounded_http) so a hung server cannot
+# wedge the check.
 http() {
     exec 3<>"/dev/tcp/127.0.0.1/$port" || return 1
     if [[ $# -gt 2 ]]; then
@@ -112,6 +120,12 @@ http() {
     fi
     cat <&3
     exec 3<&-
+}
+export -f http
+bounded_http() {
+    local seconds=$1
+    shift
+    timeout "$seconds" bash -c 'http "$@"' http "$@"
 }
 STARLING_SCHED_DEBUG=1 "./$binary" --model parakeet --gguf /model.gguf \
     --host 127.0.0.1 --port "$port" > server.log 2>&1 &
@@ -128,7 +142,7 @@ for _ in $(seq 600); do
         echo 'Server exited before the model loaded' >&2
         exit 1
     fi
-    health=$(http GET /health 2>/dev/null | tail -n 1) || true
+    health=$(bounded_http 5 GET /health 2>/dev/null | tail -n 1) || true
     if grep -Fq '"loaded":true' <<< "$health"; then break; fi
     sleep 0.5
 done
@@ -146,7 +160,9 @@ boundary=starling-runtime-check
     cat /audio.wav
     printf '\r\n--%s--\r\n' "$boundary"
 } > request.body
-http POST /v1/audio/transcriptions request.body "multipart/form-data; boundary=$boundary" > response.txt
+bounded_http 600 POST /v1/audio/transcriptions request.body \
+    "multipart/form-data; boundary=$boundary" > response.txt \
+    || { cat server.log >&2; echo 'Transcription request failed or timed out' >&2; exit 1; }
 tr -d '\r' < response.txt | sed -n '1p;$p'
 echo
 head -n 1 response.txt | grep -Eq '^HTTP/1\.[01] 200 ' || { cat server.log >&2; echo 'Transcription failed' >&2; exit 1; }
