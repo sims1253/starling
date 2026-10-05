@@ -67,11 +67,14 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      - name: Test the host crate and the storage-v2 lease
+      # One command per step: PowerShell only reports the last native
+      # command's exit code, so a combined script could mask a failure.
+      - name: Test the host crate over the named pipe
         working-directory: apps/desktop-gpui
-        run: |
-          cargo test -p starling-runtime-host
-          cargo test -p starling-dictation --lib store_v2
+        run: cargo test -p starling-runtime-host
+      - name: Test the storage-v2 lease
+        working-directory: apps/desktop-gpui
+        run: cargo test -p starling-dictation --lib store_v2
 
   # Packaged desktop lanes: the universal macOS bundle (DMG) and the portable
   # Windows archive. Unsigned — artifacts are development builds for testing,

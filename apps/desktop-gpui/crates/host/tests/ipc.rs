@@ -776,6 +776,89 @@ fn a_job_survives_its_submitting_clients_death() {
     host.shutdown();
 }
 
+/// A host that shuts down while a client sits on unread frames (its
+/// hello, the bye) leaves nothing bound: a successor on the same root
+/// serves at once. On Windows the closing host lingers so the client can
+/// read those frames — that linger must finish before the lease is
+/// released, or the old pipe instances keep the name and the successor's
+/// probe finds a "live" foreign server.
+#[test]
+fn a_successor_serves_immediately_after_shutdown_with_an_unread_client() {
+    let root = tempfile::tempdir().unwrap();
+    let config = || {
+        ipc_config(
+            root.path(),
+            FakeCaptureSource::new(vec![]),
+            FakeProvider::new(vec![]),
+        )
+    };
+    let mut host = serve(config()).expect("host serves");
+    let unread = raw_connect(&host);
+    // Let the host greet it (the hello lands unread in the stream).
+    std::thread::sleep(Duration::from_millis(200));
+    host.shutdown();
+    let mut successor = serve(config()).expect("the successor serves at once");
+    let client = connect_with_retry(successor.socket_path());
+    assert!(client.snapshot().is_ok());
+    drop(client);
+    drop(unread);
+    successor.shutdown();
+}
+
+/// Host shutdown cancels and joins in-flight recognition before it
+/// returns (and before the host stops the engine those workers lease):
+/// a recognition parked in the provider is cancelled, its `recognize`
+/// call has returned by the time `shutdown` does, and shutdown is
+/// prompt — not the job's 30 s of work.
+#[test]
+fn shutdown_cancels_and_joins_in_flight_recognition() {
+    let root = tempfile::tempdir().unwrap();
+    let source = FakeCaptureSource::new(vec![FakeTakeScript::clean()]);
+    let mut stuck = starling_runtime::provider::FakeJob::completes_with("never delivered");
+    stuck.work_ms = 30_000;
+    let provider = FakeProvider::new(vec![stuck]);
+    let (mut host, client) = boot(ipc_config(root.path(), source, Arc::clone(&provider)));
+
+    freeze_route(&client, "ctx-1");
+    client
+        .send(Some("take_s"), Command::CaptureStart { policy: "push-to-talk".into() })
+        .expect("start accepted");
+    until(&client, "capture.progress", |e| e.type_name() == "capture.progress", Duration::from_secs(5));
+    client
+        .send(Some("take_s"), Command::CaptureStop { drain: Some(true) })
+        .expect("stop accepted");
+    until(&client, "capture.stopped", |e| e.type_name() == "capture.stopped", Duration::from_secs(10));
+    client
+        .send(
+            Some("job-stuck"),
+            Command::JobsSubmit {
+                capture_ref: "take_s".into(),
+                route: "local-default".into(),
+                budget: "standard".into(),
+            },
+        )
+        .expect("submit accepted");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while provider.requests().is_empty() {
+        assert!(Instant::now() < deadline, "the recognition never reached the provider");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let request_id = provider.requests()[0].0.clone();
+
+    drop(client);
+    let started = Instant::now();
+    host.shutdown();
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "shutdown waited out the stuck job ({:?})",
+        started.elapsed()
+    );
+    assert!(
+        provider.recognize_returned(&request_id),
+        "the in-flight recognition was still running when shutdown returned"
+    );
+}
+
 // --------------------------------------------------------------------- //
 // The slow-consumer posture
 // --------------------------------------------------------------------- //

@@ -152,7 +152,18 @@ pub struct JobsActor {
     /// `Completed`/`Failed`/... instead of snapping back to `Idle`.
     retired_state: String,
     retired_violations: Vec<String>,
+    /// Join handles of spawned workers (finished ones pruned on each
+    /// spawn), so shutdown can cancel and wait for the in-flight ones
+    /// instead of leaving them running past the runtime — and past the
+    /// provider resources (an engine sidecar) their host then releases.
+    workers: Vec<std::thread::JoinHandle<()>>,
 }
+
+/// How long [`JobsActor::run`]'s shutdown waits for cancelled workers to
+/// return. A provider honoring its cancel token returns within one poll;
+/// past the bound a wedged worker is left detached rather than holding
+/// the whole runtime shutdown hostage.
+const WORKER_SHUTDOWN_JOIN: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl JobsActor {
     #[allow(clippy::too_many_arguments)]
@@ -183,6 +194,7 @@ impl JobsActor {
             latest: None,
             retired_state: "Idle".to_string(),
             retired_violations: Vec::new(),
+            workers: Vec::new(),
         }
     }
 
@@ -198,6 +210,35 @@ impl JobsActor {
             }
             self.publish_view();
         }
+        self.stop_workers();
+    }
+
+    /// Shutdown: trip every job's cancel token (in-flight providers abort
+    /// their requests; a provider still waiting for its backend gives up)
+    /// and join the workers, bounded by [`WORKER_SHUTDOWN_JOIN`]. Their
+    /// reports land in a closed inbox — nobody is left to receive them —
+    /// but no worker outlives the runtime while it still uses the
+    /// provider.
+    fn stop_workers(&mut self) {
+        for job in self.jobs.values() {
+            job.cancel.cancel();
+        }
+        let deadline = Instant::now() + WORKER_SHUTDOWN_JOIN;
+        for worker in self.workers.drain(..) {
+            while !worker.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            if worker.is_finished() {
+                let _ = worker.join();
+            }
+        }
+    }
+
+    /// Keeps a spawned worker's handle for shutdown, dropping the
+    /// handles of workers that already finished.
+    fn track_worker(&mut self, worker: std::thread::JoinHandle<()>) {
+        self.workers.retain(|worker| !worker.is_finished());
+        self.workers.push(worker);
     }
 
     fn publish_view(&self) {
@@ -779,16 +820,19 @@ impl JobsActor {
                     })),
                 }
             });
-        if spawned.is_err() {
-            self.emit(
-                &job_id,
-                Event::JobsFailed {
-                    reason: "worker_spawn_failed".to_string(),
-                    retryable: true,
-                },
-            );
-            self.active.remove(&job_id);
-            self.retire(&job_id);
+        match spawned {
+            Ok(worker) => self.track_worker(worker),
+            Err(_) => {
+                self.emit(
+                    &job_id,
+                    Event::JobsFailed {
+                        reason: "worker_spawn_failed".to_string(),
+                        retryable: true,
+                    },
+                );
+                self.active.remove(&job_id);
+                self.retire(&job_id);
+            }
         }
     }
 
@@ -845,16 +889,19 @@ impl JobsActor {
                     })),
                 }
             });
-        if spawned.is_err() {
-            self.emit(
-                &job_id,
-                Event::JobsFailed {
-                    reason: "worker_spawn_failed".to_string(),
-                    retryable: true,
-                },
-            );
-            self.active.remove(&job_id);
-            self.retire(&job_id);
+        match spawned {
+            Ok(worker) => self.track_worker(worker),
+            Err(_) => {
+                self.emit(
+                    &job_id,
+                    Event::JobsFailed {
+                        reason: "worker_spawn_failed".to_string(),
+                        retryable: true,
+                    },
+                );
+                self.active.remove(&job_id);
+                self.retire(&job_id);
+            }
         }
     }
 

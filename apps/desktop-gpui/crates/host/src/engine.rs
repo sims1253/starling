@@ -17,8 +17,8 @@
 
 use std::time::{Duration, Instant};
 
-use starling_dictation::client::StarlingClient;
-use starling_dictation::engine::{EngineConfig, EngineManager, EnginePhase};
+use starling_dictation::client::{ClientError, StarlingClient};
+use starling_dictation::engine::{EngineConfig, EngineLease, EngineManager, EnginePhase};
 use starling_dictation::settings::{EngineMode, Settings};
 use starling_runtime::provider::{
     failure_from_client_error, CancelToken, Partial, ProviderOutcome, TranscriptionProvider,
@@ -172,6 +172,51 @@ fn backend_token(model_id: &str) -> String {
     token
 }
 
+impl EngineProvider {
+    /// Waits (bounded by `deadline`, cancel-aware) for a lease on a ready
+    /// engine other than `avoid` — the `(endpoint, pid)` of an engine a
+    /// request just failed against, which the manager may still report
+    /// Ready until its supervisor notices it is gone.
+    fn wait_for_lease(
+        &self,
+        deadline: Instant,
+        cancel: &CancelToken,
+        avoid: Option<&(String, Option<u32>)>,
+    ) -> Result<(EngineLease, Option<u32>), ProviderOutcome> {
+        loop {
+            if cancel.is_cancelled() {
+                return Err(ProviderOutcome::Failed {
+                    reason: "cancelled".to_string(),
+                    retryable: false,
+                });
+            }
+            if let Some(lease) = self.manager.lease() {
+                let pid = self
+                    .manager
+                    .snapshot()
+                    .active
+                    .filter(|active| active.endpoint == lease.endpoint())
+                    .map(|active| active.pid);
+                let identity = (lease.endpoint().to_string(), pid);
+                if avoid != Some(&identity) {
+                    return Ok((lease, pid));
+                }
+            }
+            let phase = self.manager.snapshot().phase;
+            // A failed engine or a missing model will not fix itself
+            // while this job waits (both need the user): fail now.
+            let settled = matches!(phase, EnginePhase::NoModel | EnginePhase::Failed(_));
+            if settled || Instant::now() >= deadline {
+                return Err(ProviderOutcome::Failed {
+                    reason: unready_reason(&phase).to_string(),
+                    retryable: true,
+                });
+            }
+            std::thread::sleep(READY_POLL);
+        }
+    }
+}
+
 impl TranscriptionProvider for EngineProvider {
     fn recognize(
         &self,
@@ -181,55 +226,57 @@ impl TranscriptionProvider for EngineProvider {
         cancel: &CancelToken,
     ) -> ProviderOutcome {
         let started = Instant::now();
-        let deadline = started + self.ready_wait;
-        let lease = loop {
-            if cancel.is_cancelled() {
-                return ProviderOutcome::Failed {
-                    reason: "cancelled".to_string(),
-                    retryable: false,
-                };
-            }
-            if let Some(lease) = self.manager.lease() {
-                break lease;
-            }
-            let phase = self.manager.snapshot().phase;
-            // A failed engine or a missing model will not fix itself
-            // while this job waits (both need the user): fail now.
-            let settled = matches!(phase, EnginePhase::NoModel | EnginePhase::Failed(_));
-            if settled || Instant::now() >= deadline {
-                return ProviderOutcome::Failed {
-                    reason: unready_reason(&phase).to_string(),
-                    retryable: true,
-                };
-            }
-            std::thread::sleep(READY_POLL);
-        };
-        let client = match StarlingClient::new(lease.endpoint(), lease.slug()) {
-            Ok(client) => client,
-            Err(error) => {
-                let (reason, retryable) = failure_from_client_error(&error);
-                return ProviderOutcome::Failed { reason, retryable };
-            }
-        };
-        let outcome =
-            match client.transcribe_with_cancel(std::sync::Arc::new(wav), request_id, Some(cancel))
-            {
-                Ok(result) => ProviderOutcome::Completed {
-                    text: result.text,
-                    backend: backend_token(lease.model_id()),
-                    timing_ms: started.elapsed().as_secs_f64() * 1000.0,
-                    completion_evidence: "final_decode".to_string(),
-                },
+        let wav = std::sync::Arc::new(wav);
+        let mut failed_engine: Option<(String, Option<u32>)> = None;
+        loop {
+            let deadline = Instant::now() + self.ready_wait;
+            let (lease, pid) = match self.wait_for_lease(deadline, cancel, failed_engine.as_ref()) {
+                Ok(found) => found,
+                Err(outcome) => return outcome,
+            };
+            let client = match StarlingClient::new(lease.endpoint(), lease.slug()) {
+                Ok(client) => client,
                 Err(error) => {
                     let (reason, retryable) = failure_from_client_error(&error);
-                    ProviderOutcome::Failed { reason, retryable }
+                    return ProviderOutcome::Failed { reason, retryable };
                 }
             };
-        // The lease is held until the request is done: a model switch
-        // that started mid-request drains this engine instead of
-        // stopping it under the take (#363).
-        drop(lease);
-        outcome
+            // The lease is held for the whole request: a model switch that
+            // starts mid-request drains this engine instead of stopping it
+            // under the take (#363). It drops at the end of this iteration.
+            match client.transcribe_with_cancel(
+                std::sync::Arc::clone(&wav),
+                request_id,
+                Some(cancel),
+            ) {
+                Ok(result) => {
+                    return ProviderOutcome::Completed {
+                        text: result.text,
+                        backend: backend_token(lease.model_id()),
+                        timing_ms: started.elapsed().as_secs_f64() * 1000.0,
+                        completion_evidence: "final_decode".to_string(),
+                    }
+                }
+                // The engine went away under the request: its process
+                // died (a crash, or — when this host attached to a sidecar
+                // the desktop app started — the app being killed, which
+                // takes that sidecar with it). The supervisor restarts or
+                // takes the engine over; this job retries **once** on the
+                // replacement, so the engine's death costs the job a
+                // delay, not its result. Recognition is idempotent (same
+                // audio, a new request), and one retry bounds the cost of
+                // an engine that keeps dying.
+                Err(ClientError::Transport(_))
+                    if failed_engine.is_none() && !cancel.is_cancelled() =>
+                {
+                    failed_engine = Some((lease.endpoint().to_string(), pid));
+                }
+                Err(error) => {
+                    let (reason, retryable) = failure_from_client_error(&error);
+                    return ProviderOutcome::Failed { reason, retryable };
+                }
+            }
+        }
     }
 }
 

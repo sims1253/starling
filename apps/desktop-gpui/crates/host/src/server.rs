@@ -234,6 +234,11 @@ impl HostHandle {
         if let Some(runtime) = self.runtime.take() {
             runtime.shutdown();
         }
+        // Close work the transport still has in flight (Windows'
+        // lingering pipe disconnects hold handles that keep the endpoint
+        // name bound) finishes before ownership is released, so a
+        // successor never finds this host's instances still there.
+        platform::finish_pending_closes();
         // The engine outlives every job the machines ran; stop it only
         // now (a no-op for an engine another process owns — the attached
         // case leaves that owner's sidecar running).

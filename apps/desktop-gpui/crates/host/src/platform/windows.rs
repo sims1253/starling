@@ -744,42 +744,82 @@ struct PipeShared {
 /// once would swallow exactly the frames that explain the close.
 const DISCONNECT_LINGER: Duration = Duration::from_secs(2);
 
+/// A duplicated pipe handle this module owns outright: closed on drop,
+/// so no path — including a failed thread spawn that discards the
+/// closure holding it — can leak it (and with it the pipe name).
+struct OwnedHandle(HANDLE);
+
+// SAFETY: a kernel object identifier, not a pointer into this process's
+// memory (see `SendHandle`).
+unsafe impl Send for OwnedHandle {}
+
+impl OwnedHandle {
+    fn duplicate(handle: HANDLE) -> io::Result<OwnedHandle> {
+        let mut duplicate: HANDLE = std::ptr::null_mut();
+        // SAFETY: duplicates a live handle into this process; the result
+        // is owned by the returned wrapper.
+        unsafe {
+            let process = GetCurrentProcess();
+            if DuplicateHandle(process, handle, process, &mut duplicate, 0, 0, DUPLICATE_SAME_ACCESS)
+                == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(OwnedHandle(duplicate))
+    }
+}
+
+impl Drop for OwnedHandle {
+    fn drop(&mut self) {
+        // SAFETY: the handle is owned by this wrapper and closed once.
+        unsafe {
+            CloseHandle(self.0);
+        }
+    }
+}
+
+/// Lingering disconnects still in flight. A linger holds pipe handles,
+/// and pipe handles keep the pipe name alive: the host finishes them
+/// ([`finish_pending_closes`]) before it releases ownership, so a
+/// successor never finds the old host's instances still bound.
+static LINGERS: std::sync::Mutex<Vec<std::thread::JoinHandle<()>>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Waits for every lingering disconnect to finish (each is bounded by
+/// [`DISCONNECT_LINGER`] — the disconnect at its end also ends a parked
+/// flush), so no handle of this process's pipe instances outlives the
+/// caller. The host calls this on shutdown after its connections close
+/// and before it releases the lease.
+pub fn finish_pending_closes() {
+    let lingers = std::mem::take(
+        &mut *LINGERS.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
+    );
+    for linger in lingers {
+        let _ = linger.join();
+    }
+}
+
 /// The server side of a close, off the caller's thread: flush (returns
 /// once the client has read everything, or the pipe broke), bounded by
 /// [`DISCONNECT_LINGER`], then the instance-wide disconnect — which also
 /// ends a flush still parked against a client that stopped reading.
 fn schedule_disconnect(handle: HANDLE) -> io::Result<()> {
-    let duplicate = |handle: HANDLE| -> io::Result<SendHandle> {
-        let mut duplicate: HANDLE = std::ptr::null_mut();
-        let process = unsafe { GetCurrentProcess() };
-        if unsafe {
-            DuplicateHandle(process, handle, process, &mut duplicate, 0, 0, DUPLICATE_SAME_ACCESS)
-        } == 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(SendHandle(duplicate))
-    };
-    let flusher = duplicate(handle)?;
-    let disconnector = match duplicate(handle) {
-        Ok(handle) => handle,
-        Err(err) => {
-            unsafe { CloseHandle(flusher.0) };
-            return Err(err);
-        }
-    };
-    let spawned = std::thread::Builder::new()
+    let flusher = OwnedHandle::duplicate(handle)?;
+    let disconnector = OwnedHandle::duplicate(handle)?;
+    // Both handles move into the closure; if the spawn fails the closure
+    // is dropped and so are they.
+    let linger = std::thread::Builder::new()
         .name("starling-host-pipe-linger".into())
         .spawn(move || {
-            let disconnector = disconnector;
             let flush = std::thread::Builder::new()
                 .name("starling-host-pipe-flush".into())
                 .spawn(move || {
-                    let flusher = flusher;
+                    // SAFETY: flushes a handle the closure owns.
                     unsafe {
                         FlushFileBuffers(flusher.0);
-                        CloseHandle(flusher.0);
                     }
+                    drop(flusher);
                 });
             let deadline = Instant::now() + DISCONNECT_LINGER;
             if let Ok(flush) = &flush {
@@ -787,17 +827,23 @@ fn schedule_disconnect(handle: HANDLE) -> io::Result<()> {
                     std::thread::sleep(Duration::from_millis(10));
                 }
             }
+            // SAFETY: disconnects the instance through a handle the
+            // closure owns (closed when `disconnector` drops below).
             unsafe {
                 DisconnectNamedPipe(disconnector.0);
-                CloseHandle(disconnector.0);
             }
+            drop(disconnector);
             if let Ok(flush) = flush {
                 // Bounded by the disconnect above, which completes a
                 // flush parked against a non-reading client.
                 let _ = flush.join();
             }
-        });
-    spawned.map(|_| ()).map_err(io::Error::other)
+        })
+        .map_err(io::Error::other)?;
+    let mut lingers = LINGERS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    lingers.retain(|linger| !linger.is_finished());
+    lingers.push(linger);
+    Ok(())
 }
 
 /// How often a waiting operation re-checks the close mark. Bounds the

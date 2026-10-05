@@ -225,6 +225,16 @@ pub fn listen(path: &Path) -> io::Result<Box<dyn TransportListener>> {
     platform_listen(path)
 }
 
+/// Finishes any close work this process's transport still has in
+/// flight. Windows: the lingering pipe disconnects (they hold handles,
+/// and handles keep the pipe name bound — see `platform::windows`);
+/// unix: nothing (a socket close completes synchronously). The host
+/// calls this on shutdown before releasing its lease.
+pub fn finish_pending_closes() {
+    #[cfg(windows)]
+    windows::finish_pending_closes();
+}
+
 /// Connects a client to the endpoint at `path`.
 pub fn connect(path: &Path) -> io::Result<Box<dyn TransportConn>> {
     platform_connect(path)

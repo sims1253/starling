@@ -151,6 +151,17 @@ fn until(client: &HostClient, label: &str, predicate: impl Fn(&EventWire) -> boo
 
 /// Freezes a route, records a take and submits a job for it.
 fn record_and_submit(client: &HostClient, take: &str, job: &str) {
+    record_and_submit_after(client, take, job, || {});
+}
+
+/// [`record_and_submit`], running `before_submit` between the take's
+/// stop and the job's submit.
+fn record_and_submit_after(
+    client: &HostClient,
+    take: &str,
+    job: &str,
+    before_submit: impl FnOnce(),
+) {
     client
         .send(
             Some("ctx"),
@@ -191,6 +202,7 @@ fn record_and_submit(client: &HostClient, take: &str, job: &str) {
     until(client, "capture.stopped", |e| {
         e.type_name() == "capture.stopped"
     });
+    before_submit();
     client
         .send(
             Some(job),
@@ -339,4 +351,78 @@ fn a_host_that_is_a_client_never_starts_an_engine() {
         "the client host touched the engine state dir"
     );
     owner.shutdown();
+}
+
+/// The engine the host attached to (not started) dies under the host
+/// with no warning — the desktop app owned the shared sidecar and was
+/// hard-killed, so the sidecar's `--parent-pid` watchdog ended it
+/// abruptly (SIGKILL here: no retire step, nothing tells the attached
+/// host first). A job submitted right then hits the dead engine; it must
+/// still complete — the provider retries once on whatever engine the
+/// supervisors bring back (a restart or the host's takeover).
+#[cfg(unix)] // the abrupt kill is a signal; the fixture is unix-built
+#[test]
+fn a_job_survives_the_attached_engine_dying_abruptly() {
+    let Some(fixture) = fixture() else { return };
+    let root = tempfile::tempdir().unwrap();
+    let config = engine_config(root.path(), Some(&fixture));
+
+    // The "renderer" owns the sidecar: it started first.
+    let app_engine =
+        starling_dictation::engine::EngineManager::start(config.clone(), Some(MODEL_ID.into()));
+    wait_ready(&app_engine);
+    assert!(app_engine.snapshot().active.unwrap().owned);
+
+    let engine = EngineChoice::Builtin {
+        config,
+        active_model: Some(MODEL_ID.into()),
+    };
+    let mut host = serve(host_config(root.path(), engine)).expect("host serves");
+    let manager = host.engine().expect("builtin mode").clone();
+    wait_ready(&manager);
+    let attached = manager.snapshot().active.unwrap();
+    assert!(!attached.owned, "the host attached to the app's sidecar");
+
+    let client = connect(host.socket_path());
+    record_and_submit_after(&client, "take_a", "job_a", || {
+        // SAFETY: kill(2) on the sidecar's pid; no memory is involved.
+        assert_eq!(unsafe { libc::kill(attached.pid as i32, libc::SIGKILL) }, 0);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while endpoint_answers(&attached.endpoint) {
+            assert!(
+                Instant::now() < deadline,
+                "the killed sidecar still answers"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    });
+
+    let outcome = job_outcome(&client, "job_a");
+    assert_eq!(
+        outcome.type_name(),
+        "jobs.completed",
+        "{}",
+        outcome.payload()
+    );
+    assert_eq!(outcome.payload()["backend"], format!("engine:{MODEL_ID}"));
+    let now = manager.snapshot().active.expect("an engine serves again");
+    assert_ne!(
+        now.pid, attached.pid,
+        "the job ran on the replacement engine"
+    );
+    drop(client);
+    host.shutdown();
+    app_engine.shutdown();
+}
+
+fn wait_ready(manager: &starling_dictation::engine::EngineManager) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while manager.snapshot().phase != EnginePhase::Ready {
+        assert!(
+            Instant::now() < deadline,
+            "engine never became ready: {:?}",
+            manager.snapshot()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
