@@ -239,6 +239,12 @@ const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
 fn verify_pipe_dacl(handle: HANDLE) -> io::Result<()> {
     unsafe {
         let mut dacl: *mut ACL = std::ptr::null_mut();
+        let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        // `ppSecurityDescriptor` is mandatory whenever `ppDacl` is asked
+        // for: the DACL pointer handed back points *into* that one
+        // allocated descriptor, which is the only thing LocalFree may
+        // release. (Freeing the interior DACL pointer instead corrupted
+        // the process heap on the first Windows run.)
         let result = GetSecurityInfo(
             handle,
             SE_KERNEL_OBJECT,
@@ -247,14 +253,13 @@ fn verify_pipe_dacl(handle: HANDLE) -> io::Result<()> {
             std::ptr::null_mut(),
             &mut dacl,
             std::ptr::null_mut(),
-            std::ptr::null_mut(),
+            &mut descriptor,
         );
         if result != 0 {
             return Err(io::Error::from_raw_os_error(result as i32));
         }
-        // GetSecurityInfo allocates the DACL it hands back.
         let check = verify_dacl_aces(dacl);
-        LocalFree(dacl as _);
+        LocalFree(descriptor as _);
         check
     }
 }

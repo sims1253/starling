@@ -8,8 +8,10 @@
 //! real client library (or a raw socket where a transport violation has
 //! to be hand-crafted). Nothing here mocks the transport.
 
-#![cfg(unix)] // the Windows named-pipe transport cannot run on this box;
-              // see the PR's "Not executed here" section.
+// Portable: every test that drives the host through `HostClient` or a
+// raw `platform::connect` stream runs on the unix socket *and* the
+// Windows named pipe. Tests that need a unix-only lever (SO_RCVBUF
+// shrinking, uid-based policies) are `#[cfg(unix)]` individually.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -21,6 +23,7 @@ use starling_runtime::protocol::replay::{is_directive, MachineReplay};
 use starling_runtime::protocol::{Command, Kind as MessageKind, Revision};
 use starling_runtime::testing::{FakeCaptureSource, FakeTakeScript};
 use starling_runtime::{provider::FakeProvider, Runtime, RuntimeConfig};
+#[cfg(unix)]
 use starling_runtime_host::auth::{ExpectUid, PeerPolicy};
 use starling_runtime_host::client::{ClientError, HostClient};
 use starling_runtime_host::frame::{Frame, FrameError, FrameReader, TransportErrorCode};
@@ -788,6 +791,21 @@ const FILL_EVENTS: usize = 4096;
 /// fill argument is the event count above, never this clock.
 const FILL_BUDGET: Duration = Duration::from_secs(90);
 
+/// Whether the endpoint still exists: the socket file on unix; on
+/// Windows (no filesystem entry — `\\.\pipe\…` lives in the kernel
+/// namespace) whether a probe still finds a server bound to the name.
+fn endpoint_present(socket: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        socket.exists()
+    }
+    #[cfg(windows)]
+    {
+        starling_runtime_host::platform::probe(socket)
+            != starling_runtime_host::platform::Probe::Dead
+    }
+}
+
 /// Waits (bounded) for the endpoint socket to disappear after shutdown.
 /// The unlink is synchronous in shutdown, but a slow filesystem (or a
 /// CI temp dir on unusual storage) can make the *observation* lag — the
@@ -795,11 +813,11 @@ const FILL_BUDGET: Duration = Duration::from_secs(90);
 /// directory entry vanished by the very next instruction.
 fn assert_endpoint_removed(socket: &std::path::Path) {
     let deadline = Instant::now() + Duration::from_secs(5);
-    while socket.exists() && Instant::now() < deadline {
+    while endpoint_present(socket) && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(25));
     }
     assert!(
-        !socket.exists(),
+        !endpoint_present(socket),
         "the endpoint {} was not removed",
         socket.display()
     );
@@ -811,6 +829,7 @@ const DRAIN_BUDGET: Duration = Duration::from_secs(12);
 /// A renderer that stops reading is closed (`slow_consumer`) while the
 /// runtime and the other client continue untouched — the Mode B answer
 /// to "the UI is not a durability dependency".
+#[cfg(unix)] // shrinks SO_RCVBUF / compares uids: unix-only levers
 #[test]
 fn a_stalled_client_is_closed_and_the_runtime_continues() {
     let root = tempfile::tempdir().unwrap();
@@ -963,6 +982,7 @@ fn a_stalled_client_is_closed_and_the_runtime_continues() {
 /// process's own: the same-user policy admits them. This is the
 /// positive, on-the-wire proof that `SO_PEERCRED` was actually read
 /// (an unread credential would be `None` and fail closed).
+#[cfg(unix)] // shrinks SO_RCVBUF / compares uids: unix-only levers
 #[test]
 fn same_user_credentials_pass_over_the_socket() {
     let root = tempfile::tempdir().unwrap();
@@ -980,6 +1000,7 @@ fn same_user_credentials_pass_over_the_socket() {
 /// A policy expecting a different uid refuses the real connection: the
 /// enforcement path (kernel credential → policy → close) runs against
 /// genuine credentials, no second OS user needed.
+#[cfg(unix)] // shrinks SO_RCVBUF / compares uids: unix-only levers
 #[test]
 fn foreign_uid_is_refused_on_the_socket() {
     let root = tempfile::tempdir().unwrap();
@@ -1031,12 +1052,17 @@ fn current_test_uid() -> u32 {
 // Framing limits over the raw socket
 // --------------------------------------------------------------------- //
 
-fn raw_connect(host: &HostHandle) -> std::os::unix::net::UnixStream {
-    std::os::unix::net::UnixStream::connect(host.socket_path()).unwrap()
+/// A raw transport stream (unix socket or named pipe) for hand-crafted
+/// frames — the platform layer's own `connect`, so these tests run on
+/// both transports.
+fn raw_connect(host: &HostHandle) -> RawStream {
+    starling_runtime_host::platform::connect(host.socket_path()).unwrap()
 }
 
+type RawStream = Box<dyn starling_runtime_host::platform::TransportConn>;
+
 fn read_transport_error(
-    stream: &mut std::os::unix::net::UnixStream,
+    stream: &mut impl std::io::Read,
 ) -> (TransportErrorCode, String) {
     let mut reader = FrameReader::new(&mut *stream, usize::MAX);
     // Read-poll timeouts (the 50ms read timeouts these streams carry)
@@ -1057,8 +1083,7 @@ fn read_transport_error(
     }
 }
 
-fn write_raw_frame(stream: &mut std::os::unix::net::UnixStream, body: &[u8]) {
-    use std::io::Write;
+fn write_raw_frame(stream: &mut impl std::io::Write, body: &[u8]) {
     stream
         .write_all(&(body.len() as u32).to_be_bytes())
         .unwrap();
@@ -1069,8 +1094,7 @@ fn write_raw_frame(stream: &mut std::os::unix::net::UnixStream, body: &[u8]) {
 /// [`write_raw_frame`] for floods that expect the host to tear the
 /// connection down mid-stream: `false` when a write failed (the socket
 /// ended under us), which callers treat as "already answered".
-fn write_raw_frame_lossy(stream: &mut std::os::unix::net::UnixStream, body: &[u8]) -> bool {
-    use std::io::Write;
+fn write_raw_frame_lossy(stream: &mut impl std::io::Write, body: &[u8]) -> bool {
     let wire = (body.len() as u32).to_be_bytes();
     stream.write_all(&wire).is_ok() && stream.write_all(body).is_ok()
 }
@@ -1396,6 +1420,7 @@ fn startup_reconcile_on_a_clean_root_reports_nothing() {
 /// bound the host kills the socket, joins its threads, releases the
 /// lease and removes the endpoint. Before the bound this join hung
 /// forever on exactly this shape.
+#[cfg(unix)] // shrinks SO_RCVBUF / compares uids: unix-only levers
 #[test]
 fn shutdown_completes_despite_a_writer_parked_on_a_silent_peer() {
     let root = tempfile::tempdir().unwrap();
@@ -1622,6 +1647,7 @@ fn an_idle_pre_greeting_connection_is_closed_at_the_deadline() {
 /// assertion is the prompt close itself: the client learns the
 /// connection ended — never a silent wedge, and never a bare reply
 /// timeout for a command that already ran.
+#[cfg(unix)] // shrinks SO_RCVBUF / compares uids: unix-only levers
 #[test]
 fn an_outbound_queue_overflow_closes_with_slow_consumer() {
     let root = tempfile::tempdir().unwrap();
