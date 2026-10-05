@@ -468,7 +468,7 @@ libraries. These are not fully static binaries.
 
 | Backend | Runtime prerequisites |
 | --- | --- |
-| CPU | None beyond the platform C/C++ runtime (`libstdc++6` and `libgomp1` on Linux; the Windows build uses the static CRT). |
+| CPU | None beyond the platform C/C++ runtime (`libstdc++6` and `libgomp1` on Linux; on Windows the static CRT plus the Microsoft Visual C++ Redistributable (x64) for `vcomp140.dll`, which every Windows build needs). |
 | CUDA | Compatible NVIDIA driver and CUDA runtime/cuBLAS libraries. The workflow builds with CUDA 13.3. |
 | ROCm / HIP | Compatible AMD driver, HIP runtime, hipBLAS, and rocBLAS libraries. The workflow builds with ROCm 7.2.4. |
 | Vulkan | Vulkan loader and a compatible GPU driver. |
@@ -476,10 +476,13 @@ libraries. These are not fully static binaries.
 
 The Linux CUDA, Vulkan, and CPU archives are smoke-tested outside their
 build environment in a fresh Ubuntu 22.04 container with only the documented
-runtime packages (see the [runtime guide](release-runtime.md)); the Windows
-and macOS archives are checked on their build machines only. None of these
-startup checks verify GPU inference — hardware validation is tracked in
-[issue #57](https://github.com/sims1253/starling/issues/57).
+runtime packages (see the [runtime guide](release-runtime.md)); the release
+workflow checks the Windows and macOS archives on their build machines only.
+None of these startup checks verify GPU inference. Which artifacts have run
+representative inference on real hardware, and on what, is listed in the
+runtime guide's [hardware verification](release-runtime.md#hardware-verification)
+ledger (tracked in [issue #57](https://github.com/sims1253/starling/issues/57));
+`linux-rocm`, `macos-metal`, and `macos-cpu` have not been verified on hardware.
 
 Choose the executable for your operating system, CPU architecture, and GPU:
 

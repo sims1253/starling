@@ -12,27 +12,78 @@
 #
 # --with-gpu (a machine whose docker has the NVIDIA runtime): the driver is
 # injected by the container runtime (the documented provider) and the same
-# checks run under it. Representative inference is verified separately on
-# real hardware and recorded on the tracking issue.
+# checks run under it.
+#
+# --infer GGUF AUDIO EXPECTED_TEXT (requires --with-gpu): representative
+# inference on the host GPU. The Parakeet GGUF and a 16 kHz mono PCM16 WAV
+# are mounted read-only next to the archive; the packaged server loads the
+# model, /health must report a CUDA device, and one POST
+# /v1/audio/transcriptions must return exactly EXPECTED_TEXT with no
+# accelerator-rejected node (STARLING_SCHED_DEBUG=1, #184). The container
+# still has no network, no SDK, and no host library paths; the HTTP client
+# is bash's /dev/tcp, so no package beyond the documented runtime is added.
 set -euo pipefail
 with_gpu=0
+infer=()
 args=()
-for a in "$@"; do
-    if [[ "$a" == "--with-gpu" ]]; then with_gpu=1; else args+=("$a"); fi
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --with-gpu) with_gpu=1; shift ;;
+        --infer)
+            if [[ $# -lt 4 ]]; then
+                echo "--infer needs GGUF AUDIO EXPECTED_TEXT" >&2
+                exit 2
+            fi
+            if [[ -z "$2" || -z "$3" || -z "$4" ]]; then
+                echo "--infer needs a GGUF path, an audio path, and a non-empty EXPECTED_TEXT" >&2
+                exit 2
+            fi
+            # The in-container comparison greps the raw JSON text field, and
+            # only backslash and double quote are re-escaped for it. The
+            # server's json_escape rewrites every byte below 0x20 (\n, \t,
+            # \uXXXX), so such bytes can never match the raw grep. Reject
+            # them up front instead of failing later with a false "Transcript
+            # mismatch" that masks the real transcript. Bytes 0x20-0xFF are
+            # emitted unchanged (non-ASCII UTF-8 included), so they compare
+            # byte-wise and stay allowed. (wc -c, not a string test: the
+            # leftover can be a bare newline.)
+            if [[ "$(printf '%s' "$4" | tr -d '\40-\377' | wc -c)" -ne 0 ]]; then
+                echo "--infer EXPECTED_TEXT must not contain control characters (the transcript check compares the raw JSON field)" >&2
+                exit 2
+            fi
+            infer=("$2" "$3" "$4"); shift 4 ;;
+        *) args+=("$1"); shift ;;
+    esac
 done
 if [[ ${#args[@]} != 3 ]]; then
-    echo "Usage: $0 [--with-gpu] ARCHIVE VERSION ABI_VERSION" >&2
+    echo "Usage: $0 [--with-gpu] [--infer GGUF AUDIO EXPECTED_TEXT] ARCHIVE VERSION ABI_VERSION" >&2
+    exit 2
+fi
+if [[ ${#infer[@]} -gt 0 && $with_gpu != 1 ]]; then
+    # A GPU-less container auto-selects the CPU backend, so a transcript
+    # from it would say nothing about CUDA.
+    echo "--infer requires --with-gpu" >&2
     exit 2
 fi
 archive=$(realpath "${args[0]}")
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 image=starling-release-cuda-runtime:ubuntu22.04
 docker build --tag "$image" --file "$script_dir/Dockerfile.cuda" "$script_dir"
-gpu_flags=()
-if [[ $with_gpu == 1 ]]; then gpu_flags=(--gpus all); fi
-docker run --rm --network none --read-only --tmpfs /tmp:exec "${gpu_flags[@]}" \
+run_flags=()
+if [[ $with_gpu == 1 ]]; then run_flags+=(--gpus all); fi
+infer_flag=0
+expected=""
+if [[ ${#infer[@]} -gt 0 ]]; then
+    infer_flag=1
+    run_flags+=(
+        --mount "type=bind,source=$(realpath "${infer[0]}"),target=/model.gguf,readonly"
+        --mount "type=bind,source=$(realpath "${infer[1]}"),target=/audio.wav,readonly"
+    )
+    expected=${infer[2]}
+fi
+docker run --rm --network none --read-only --tmpfs /tmp:exec "${run_flags[@]}" \
     --mount "type=bind,source=$archive,target=/release.tar.gz,readonly" \
-    -i "$image" bash -s -- "${args[1]}" "${args[2]}" "$with_gpu" <<'CHECK'
+    -i "$image" bash -s -- "${args[1]}" "${args[2]}" "$with_gpu" "$infer_flag" "$expected" <<'CHECK'
 set -euo pipefail
 work=$(mktemp -d)
 cd "$work"
@@ -51,7 +102,7 @@ printf '%s\n' "$version"
 grep -Fqx "starling-serve $1" <<< "$version"
 # The backend line reflects the compiled-in registry + auto-preference, not
 # a probed device: it reads "cuda" on a GPU-less container too. Device-level
-# verification (cuInit, inference) is separate evidence on real hardware.
+# verification is the --infer mode below.
 grep -Fqx "backend: cuda" <<< "$version"
 abi=$("./$binary" --abi-version)
 printf 'ABI: %s\n' "$abi"
@@ -61,4 +112,112 @@ if [[ "$3" == "1" ]]; then
 else
     echo "GPU-less run: startup metadata only; no device was initialized (expected)"
 fi
+if [[ "$4" != "1" ]]; then
+    exit 0
+fi
+expected=$5
+
+# ---- representative inference (--infer) ----
+# Refuse an occupied port up front, mirroring the Windows checker's
+# Get-NetTCPConnection gate: a listener already on it would make the health
+# poll below query the wrong process. The probe runs in this container, in
+# the same loopback namespace (--network none) the server is about to bind
+# in, so it sees exactly what the server will see.
+port=18187
+if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
+    echo "port $port is already in use; free it before running --infer" >&2
+    exit 1
+fi
+export port
+# One HTTP/1.1 exchange over bash's /dev/tcp: METHOD PATH [BODY_FILE TYPE].
+# Callers bound it with timeout(1) (bounded_http) so a hung server cannot
+# wedge the check.
+http() {
+    # exec (not ':') so fd 3 stays open for the writes and reads below. A
+    # failed connection makes exec's redirection return non-zero without
+    # exiting this non-POSIX bash, which surfaces as a failed request to
+    # the caller.
+    if ! exec 3<>"/dev/tcp/127.0.0.1/$port"; then
+        return 1
+    fi
+    if [[ $# -gt 2 ]]; then
+        printf '%s %s HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: %s\r\nContent-Length: %s\r\nConnection: close\r\n\r\n' \
+            "$1" "$2" "$4" "$(stat -c %s "$3")" >&3 || return 1
+        # http() runs in a fresh bash without set -e, so nothing else would
+        # catch a failed or truncated body write; failing here keeps it from
+        # surfacing later as a bogus "Transcript mismatch".
+        cat "$3" >&3 || return 1
+    else
+        printf '%s %s HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n' "$1" "$2" >&3
+    fi
+    cat <&3
+    exec 3<&-
+}
+export -f http
+bounded_http() {
+    local seconds=$1
+    shift
+    timeout "$seconds" bash -c 'http "$@"' http "$@"
+}
+STARLING_SCHED_DEBUG=1 "./$binary" --model parakeet --gguf /model.gguf \
+    --host 127.0.0.1 --port "$port" > server.log 2>&1 &
+server=$!
+stop_server() {
+    kill "$server" 2>/dev/null || true
+    wait "$server" 2>/dev/null || true
+}
+trap stop_server EXIT
+health=""
+for _ in $(seq 600); do
+    if ! kill -0 "$server" 2>/dev/null; then
+        cat server.log >&2
+        echo 'Server exited before the model loaded' >&2
+        exit 1
+    fi
+    health=$(bounded_http 5 GET /health 2>/dev/null | tail -n 1) || true
+    if grep -Fq '"loaded":true' <<< "$health"; then break; fi
+    sleep 0.5
+done
+printf 'health: %s\n' "$health"
+grep -Fq '"loaded":true' <<< "$health" || { cat server.log >&2; echo 'Model did not load' >&2; exit 1; }
+# /health names the runtime-selected device (CUDA0, ...), not the build flavor.
+grep -Eq '"backend":"CUDA[0-9]+"' <<< "$health" || {
+    echo 'The server did not select a CUDA device' >&2
+    exit 1
+}
+boundary=starling-runtime-check
+{
+    printf -- '--%s\r\nContent-Disposition: form-data; name="model"\r\n\r\nparakeet\r\n' "$boundary"
+    printf -- '--%s\r\nContent-Disposition: form-data; name="file"; filename="audio.wav"\r\nContent-Type: audio/wav\r\n\r\n' "$boundary"
+    cat /audio.wav
+    printf '\r\n--%s--\r\n' "$boundary"
+} > request.body
+bounded_http 600 POST /v1/audio/transcriptions request.body \
+    "multipart/form-data; boundary=$boundary" > response.txt \
+    || { cat server.log >&2; echo 'Transcription request failed or timed out' >&2; exit 1; }
+tr -d '\r' < response.txt | sed -n '1p;$p'
+echo
+head -n 1 response.txt | grep -Eq '^HTTP/1\.[01] 200 ' || { cat server.log >&2; echo 'Transcription failed' >&2; exit 1; }
+# Compare the JSON-escaped expected transcript with the response's text field.
+escaped=${expected//\\/\\\\}
+escaped=${escaped//\"/\\\"}
+grep -Fq "\"text\":\"$escaped\"" response.txt || {
+    echo "Transcript mismatch; expected: $expected" >&2
+    exit 1
+}
+kill -0 "$server" || { cat server.log >&2; echo 'Server died during transcription' >&2; exit 1; }
+# Stop the server before scanning its log, like the Windows checker, so the
+# log is final when grep reads it. [sched-dbg] is written to unbuffered
+# stderr (backend.cpp fprintf(stderr)), so every line is already on disk;
+# stopping does NOT flush stdio buffers (the server installs no SIGTERM
+# handler), so this scan relies on that logging staying on stderr. The trap
+# is cleared because the server is already stopped here; every earlier exit
+# path still cleans up.
+stop_server
+trap - EXIT
+if grep -F '[sched-dbg]' server.log; then
+    echo 'The CUDA backend rejected graph nodes (#184)' >&2
+    exit 1
+fi
+echo "inference: exact transcript on the CUDA device"
 CHECK

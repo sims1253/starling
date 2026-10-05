@@ -23,6 +23,20 @@
 
 namespace starling::ggml::parakeet {
 
+TdtSliceArgmax tdt_slice_argmax(ggml_context* ctx, ggml_tensor* y,
+                                int token_count, int num_dur) {
+    ggml_tensor* tok_view = ggml_view_1d(ctx, y, token_count, 0);
+    ggml_tensor* dur_view = ggml_view_1d(ctx, y, num_dur,
+                            (size_t)token_count * sizeof(float));
+    // The ggml_cont runs unconditionally on every backend, including CPU and
+    // RADV where the view would be addressable: an exact num_dur (5) float
+    // copy per step is the accepted trade-off. It is negligible next to the
+    // per-step joint matmuls, and gating it on the device's
+    // minStorageBufferOffsetAlignment would fork the decode graph per backend
+    // for no measurable gain. Byte-identical outputs everywhere. See joint.hpp.
+    return { ggml_argmax(ctx, tok_view), ggml_argmax(ctx, ggml_cont(ctx, dur_view)) };
+}
+
 // Replayable FUSED prediction-LSTM + joint + argmax graph (one ReplayGraph, one
 // host<-device sync per step). The prediction output g flows pred -> joint on
 // the device (never read back). Mirrors parakeet.cpp's Joint::FusedReplay.
@@ -235,13 +249,9 @@ void Joint::step_fused_argmax(const PredictionNet& pred,
                 y = ggml_add(ctx, y, bo);                                // [V_plus]
 
                 // ---- Argmax (token slice + duration slice) ON DEVICE. ----
-                ggml_tensor* tok_view = ggml_view_1d(ctx, y, token_count, 0);
-                ggml_tensor* dur_view = ggml_view_1d(ctx, y, num_dur,
-                                        (size_t)token_count * sizeof(float));
-                ggml_tensor* tok_amax = ggml_argmax(ctx, tok_view);  // i32 [1] (output)
-                ggml_tensor* dur_amax = ggml_argmax(ctx, dur_view);  // i32 [1] (capture)
-                capture_graph_output(dur_amax, &r->cap_dur_amax_f);
-                return tok_amax;
+                const TdtSliceArgmax amax = tdt_slice_argmax(ctx, y, token_count, num_dur);
+                capture_graph_output(amax.dur, &r->cap_dur_amax_f);  // i32 [1] (capture)
+                return amax.tok;                                     // i32 [1] (output)
             }));
         assert(r->rg->n_inputs() == 1 && "fused step graph must have 1 coalesced input");
         fused_replay_ = std::move(pending);
