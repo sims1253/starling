@@ -90,6 +90,12 @@ def load_config(snapshot: Path) -> dict:
         "llm.max_position_embeddings": int(text["max_position_embeddings"]),
         "llm.rope_theta": float(text["rope_parameters"]["rope_theta"]),
         "llm.rms_norm_eps": float(text["rms_norm_eps"]),
+        # tie_word_embeddings lives at the TOP level of config.json (both
+        # pinned revisions carry true); read it so the GGUF cannot drift if a
+        # future revision unties the head.
+        "llm.tied_embeddings": bool(
+            cfg.get("tie_word_embeddings", text.get("tie_word_embeddings", True))
+        ),
     }
 
 
@@ -178,7 +184,7 @@ def add_metadata(w: gguf.GGUFWriter, d: dict) -> None:
         }
     )
     floats(**{"llm.rope_theta": d["llm.rope_theta"], "llm.rms_norm_eps": d["llm.rms_norm_eps"]})
-    w.add_key_value("qwen3.llm.tied_embeddings", True, V.BOOL)
+    w.add_key_value("qwen3.llm.tied_embeddings", d["llm.tied_embeddings"], V.BOOL)
     w.add_key_value("qwen3.llm.has_qk_norm", True, V.BOOL)
 
     # Token ids + generation + the serve chunk policy: identical to the 1.7B
@@ -195,6 +201,12 @@ def add_metadata(w: gguf.GGUFWriter, d: dict) -> None:
     floats(**{"chunk_seconds": 30.0})
 
 
+def _fail(msg: str) -> None:
+    """Raise instead of `assert` so `python -O` cannot strip the external
+    snapshot cross-checks."""
+    raise SystemExit(f"convert_qwen3_06: {msg}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--snapshot", type=Path, default=DEFAULT_SNAPSHOT)
@@ -208,13 +220,16 @@ def main() -> None:
     dims = load_config(args.snapshot)
     # Cross-check the shared tokenizer before baking it: the prompt layout and
     # the byte-level BPE carry over from the 1.7B only if the vocab matches.
+    # Real raises (not asserts) so `python -O` cannot strip them.
     tok_vocab = json.loads((args.snapshot / "tokenizer.json").read_text())["model"]["vocab"]
-    assert len(tok_vocab) <= VOCAB_SIZE and max(tok_vocab.values()) < VOCAB_SIZE, (
-        f"0.6B tokenizer vocab ({len(tok_vocab)} entries, max id "
-        f"{max(tok_vocab.values())}) does not fit the shared {VOCAB_SIZE}-entry "
-        "vocab — the shared 1.7B tokenizer/prompt layout cannot be reused"
-    )
-    assert dims["llm.vocab_size"] == VOCAB_SIZE, dims["llm.vocab_size"]
+    if len(tok_vocab) > VOCAB_SIZE or max(tok_vocab.values()) >= VOCAB_SIZE:
+        _fail(
+            f"tokenizer vocab ({len(tok_vocab)} entries, max id "
+            f"{max(tok_vocab.values())}) does not fit the shared {VOCAB_SIZE}-entry "
+            "vocab — the shared 1.7B tokenizer/prompt layout cannot be reused"
+        )
+    if dims["llm.vocab_size"] != VOCAB_SIZE:
+        _fail(f"config.json vocab_size {dims['llm.vocab_size']} != shared {VOCAB_SIZE}")
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     w = gguf.GGUFWriter(args.output, "qwen3", use_temp_file=True)

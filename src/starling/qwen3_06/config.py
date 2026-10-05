@@ -69,7 +69,6 @@ AUDIO_TOKEN_ID: int = 151676
 by the projected audio embeddings inside ``Qwen3ASRModel.forward``."""
 EOS_TOKEN_ID: int = 151645           # im_end (primary EOS for greedy stop)
 PAD_TOKEN_ID: int = 151645
-TIMESTAMP_TOKEN_ID: int = 151705
 
 DEFAULT_TASK_PROMPT: str = ""
 """Qwen3-ASR takes no instruction prompt: the chat template just wraps the

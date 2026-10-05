@@ -750,11 +750,10 @@ mod tests {
 
     /// Stages two fake engines: scripts that print a valid `--version`
     /// block. `correct_sums` false writes wrong hex so verification
-    /// fails.
-    /// Stages fake `--version`-answering engines for both backends. The
-    /// fixtures track [crate::engine::EXPECTED_ENGINE_ABI] so an expected bump
-    /// does not silently turn these success paths into AbiMismatch failures
-    /// (the deliberate-mismatch tests pin their own values).
+    /// fails. The fixtures track [crate::engine::EXPECTED_ENGINE_ABI]
+    /// so an expected bump does not silently turn these success paths
+    /// into AbiMismatch failures (the deliberate-mismatch tests pin
+    /// their own values).
     fn stage_fake_engines(dir: &Path, correct_sums: bool) {
         for backend in ["vulkan", "cpu"] {
             let name = format!("starling-serve-{backend}");

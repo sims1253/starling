@@ -6,6 +6,7 @@
 // and the accepted profiles differ between models.
 #pragma once
 
+#include "ggml.h"
 #include "runtime/model_loader.hpp"
 #include <cstdint>
 #include <initializer_list>
@@ -80,6 +81,41 @@ inline bool check_gguf_header(const ModelLoader& m, const char* arch, const char
     }
     if (m.tensor_names().empty()) {
         err = std::string(label) + " GGUF contains no tensors";
+        return false;
+    }
+    return true;
+}
+
+// Exact tensor-shape equation shared by the per-model loaders: `name` must
+// have exactly the ggml dims in `want` (GGUF stores row-major [out, in];
+// ggml exposes ne innermost-first). `label` names the model in the error
+// ("QWEN3"/"VOXTRAL"/...); presence errors read
+// "<label> GGUF missing required tensor: <name>".
+inline bool shape_eq(const ModelLoader& m, const char* label, const char* name,
+                     std::initializer_list<int64_t> want, std::string& err) {
+    ggml_tensor* t = m.tensor(name);
+    if (!t) {
+        err = std::string(label) + " GGUF missing required tensor: " + name;
+        return false;
+    }
+    bool ok = (int) want.size() == ggml_n_dims(t);
+    int i = 0;
+    for (int64_t w : want) {
+        if (ok && (int64_t) t->ne[i] != w) ok = false;
+        ++i;
+    }
+    if (!ok) {
+        std::string got, want_s;
+        for (int j = 0; j < ggml_n_dims(t); ++j) {
+            if (j) got += ",";
+            got += std::to_string(t->ne[j]);
+        }
+        for (int64_t w : want) {
+            if (!want_s.empty()) want_s += ",";
+            want_s += std::to_string(w);
+        }
+        err = std::string(label) + " GGUF tensor " + name + " has ne=[" + got +
+              "], expected [" + want_s + "]";
         return false;
     }
     return true;

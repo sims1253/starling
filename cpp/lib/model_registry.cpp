@@ -149,7 +149,8 @@ constexpr ModelDescriptor kRegistry[] = {
     // Qwen3-ASR-0.6B-hf rides the QWEN3 engine unchanged (identical frontend,
     // tokenizer and chat template; every dim comes from qwen3.* GGUF metadata,
     // validated at load — including the 0.6B's 2048-wide attention over a
-    // 1024-wide decoder trunk).
+    // 1024-wide decoder trunk). Error strings intentionally stay "QWEN3" —
+    // the ark06 precedent — until a per-row context label is wired through.
     { STARLING_GGML_QWEN3_06, "qwen3_06",
       starling_ggml_qwen3_load, starling_ggml_qwen3_free,
       starling_ggml_qwen3_decode,

@@ -587,9 +587,9 @@ class Qwen06Starling(Qwen3Starling):
         from starling.qwen3_06.pipeline import MegaPipeline
 
         self._build_inputs = build_inputs
-        self.pipe = MegaPipeline.from_pretrained(
-            dtype=self.dtype, device=self.device
-        )
+        # from_pretrained defaults (bf16/cuda) match every other CUDA engine;
+        # Engine carries no dtype/device state to thread through here.
+        self.pipe = MegaPipeline.from_pretrained()
 
 
 class Qwen3StarlingBatched(Engine):
@@ -1944,6 +1944,16 @@ def _qwen3_on_master() -> bool:
         return False
 
 
+def _qwen3_06_on_master() -> bool:
+    """The 0.6B sibling package imports (its own gate, independent of the
+    1.7B track's availability)."""
+    try:
+        import starling.qwen3_06  # noqa: F401
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _higgs_available() -> bool:
     """True iff the current process is running inside the Higgs venv.
 
@@ -2020,8 +2030,10 @@ def _ggml_moss_keys() -> list[str]:
 def _qwen3_keys() -> list[str]:
     if not _qwen3_on_master():
         return []
-    return ["starling-qwen3", "stock-qwen3", "starling-batched-qwen3",
-            "starling-qwen3_06", "stock-qwen3_06"]
+    keys = ["starling-qwen3", "stock-qwen3", "starling-batched-qwen3"]
+    if _qwen3_06_on_master():
+        keys += ["starling-qwen3_06", "stock-qwen3_06"]
+    return keys
 
 
 def _higgs_keys() -> list[str]:

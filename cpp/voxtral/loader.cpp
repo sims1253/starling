@@ -16,36 +16,11 @@ using lib::str;
 // Linear(out <- in) weight reads ne0=in, ne1=out, and a Conv1d(OC, IC, K)
 // weight reads ne0=K, ne1=IC, ne2=OC.) Presence is established by the
 // require() pass; a missing tensor here is still a loud error.
-bool shape_eq(const ModelLoader& m, const char* name,
-              std::initializer_list<int64_t> want, std::string& err) {
-    ggml_tensor* t = m.tensor(name);
-    if (!t) {
-        err = std::string("VOXTRAL GGUF missing required tensor: ") + name;
-        return false;
-    }
-    bool ok = (int) want.size() == ggml_n_dims(t);
-    int i = 0;
-    for (int64_t w : want) {
-        if (ok && t->ne[i] != w) ok = false;
-        ++i;
-    }
-    if (!ok) {
-        std::string got;
-        for (int j = 0; j < ggml_n_dims(t); ++j) {
-            if (j) got += ",";
-            got += std::to_string(t->ne[j]);
-        }
-        std::string want_s;
-        for (int64_t w : want) {
-            if (!want_s.empty()) want_s += ",";
-            want_s += std::to_string(w);
-        }
-        err = std::string("VOXTRAL GGUF shape mismatch on ") + name +
-              " (ggml dims [" + got + "], want [" + want_s + "])";
-        return false;
-    }
-    return true;
-}
+const auto shape_eq = [](const ModelLoader& m, const char* name,
+                            std::initializer_list<int64_t> want,
+                            std::string& err) {
+    return lib::shape_eq(m, "VOXTRAL", name, want, err);
+};
 } // namespace
 
 int64_t offline_padded_samples(int64_t n_samples) {

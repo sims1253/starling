@@ -28,39 +28,10 @@ int64_t audio_token_count(int64_t n_samples, const Config& c) {
     return full * per_full + r;
 }
 
-// Exact tensor-shape check (voxtral/loader.cpp's shape_eq, QWEN3 label).
+// Exact tensor-shape check (shared lib/loader_kit.hpp shape_eq, QWEN3 label).
 // GGUF ne[] is the reversed checkpoint shape: a torch Linear weight [OC, IC]
 // reads back ne0 = IC (the mul_mat contraction dim), ne1 = OC.
-bool shape_eq(const ModelLoader& m, const char* name,
-              std::initializer_list<int64_t> want, std::string& err) {
-    ggml_tensor* t = m.tensor(name);
-    if (!t) {
-        err = std::string("QWEN3 GGUF missing required tensor: ") + name;
-        return false;
-    }
-    bool ok = (int) want.size() == ggml_n_dims(t);
-    int i = 0;
-    for (int64_t w : want) {
-        if (ok && (int64_t) t->ne[i] != w) ok = false;
-        ++i;
-    }
-    if (!ok) {
-        std::string got, want_s;
-        for (int j = 0; j < ggml_n_dims(t); ++j) {
-            if (j) got += ",";
-            got += std::to_string(t->ne[j]);
-        }
-        i = 0;
-        for (int64_t w : want) {
-            if (i++) want_s += ",";
-            want_s += std::to_string(w);
-        }
-        err = "QWEN3 GGUF tensor " + std::string(name) + " has ne=[" + got +
-              "], expected [" + want_s + "]";
-        return false;
-    }
-    return true;
-}
+#define SHAPE(name, ...) do { if (!lib::shape_eq(m, "QWEN3", name, {__VA_ARGS__}, err)) return false; } while (0)
 
 bool Qwen3Model::load(const char* path, std::string& err) {
     if (!loader.load(path)) {
@@ -215,7 +186,6 @@ bool Qwen3Model::load(const char* path, std::string& err) {
     // change or a metadata/tensor mismatch fails loudly at load. All ne[] are
     // ggml order (reversed checkpoint shape: ne0 = Linear in-features).
     // Frontend constants ([n_mels, 1+n_fft/2] filterbank, [win] window).
-#define SHAPE(name, ...) do { if (!shape_eq(m, name, {__VA_ARGS__}, err)) return false; } while (0)
     SHAPE("audio.mel_filters", c.encoder.n_mel, (int64_t) 1 + c.frontend.n_fft / 2);
     SHAPE("audio.mel_window", (int64_t) c.frontend.win_length);
     // Conv stack: torch [480, ic, 3, 3] -> ne [3, 3, ic, 480]; three stride-2
@@ -247,7 +217,7 @@ bool Qwen3Model::load(const char* path, std::string& err) {
         std::snprintf(n, sizeof n, "enc.blk.%u.", i);
         const std::string pre = n;
 #define ESHAPE(tail, ...) do { \
-            if (!shape_eq(m, (pre + tail).c_str(), {__VA_ARGS__}, err)) return false; \
+            if (!lib::shape_eq(m, "QWEN3", (pre + tail).c_str(), {__VA_ARGS__}, err)) return false; \
         } while (0)
         ESHAPE("attn_norm.weight", c.encoder.hidden);
         ESHAPE("attn_norm.bias", c.encoder.hidden);
@@ -277,7 +247,7 @@ bool Qwen3Model::load(const char* path, std::string& err) {
         std::snprintf(n, sizeof n, "llm.blk.%u.", i);
         const std::string pre = n;
 #define LSHAPE(tail, ...) do { \
-            if (!shape_eq(m, (pre + tail).c_str(), {__VA_ARGS__}, err)) return false; \
+            if (!lib::shape_eq(m, "QWEN3", (pre + tail).c_str(), {__VA_ARGS__}, err)) return false; \
         } while (0)
         LSHAPE("attn_norm.weight", c.llm.hidden);
         LSHAPE("attn.q.weight", c.llm.hidden, QW);
