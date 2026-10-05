@@ -184,6 +184,16 @@ class MegaPipeline:
             self._llms_by_k[k] = llm
         return llm
 
+    def close(self) -> None:
+        """Best-effort CUDA resource release: drop the graphed multi-step
+        decoders (each holds a static KV cache plus captured CUDA graphs) and
+        the graphed encoder so their memory can be reclaimed on shared
+        runners. The pipeline must not be used afterwards.
+        """
+        self._llms_by_k.clear()
+        self.llm = None
+        self.fused_encoder = None
+
     def set_prefill_use_graph(self, on: bool) -> None:
         """Toggle graphed vs eager prefill at runtime (byte-exact either way).
 

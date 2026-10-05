@@ -106,9 +106,23 @@ inline bool shape_eq(const ModelLoader& m, const char* label, const char* name,
               std::to_string(GGML_MAX_DIMS) + ")";
         return false;
     }
-    bool ok = (int) want.size() == ggml_n_dims(t);
+    // ggml_n_dims() counts only non-trailing-1 dims (a tensor stored as
+    // ne=[N,1] reads back as 1-dim), so trim trailing 1s from `want` the
+    // same way before comparing: want {N,1} then matches ne=[N] instead of
+    // reporting a confusing false mismatch.
+    int n_want = (int) want.size();
+    {
+        auto it = want.end();
+        while (it != want.begin()) {
+            --it;
+            if (*it != 1) break;
+            --n_want;
+        }
+    }
+    bool ok = n_want == ggml_n_dims(t);
     int i = 0;
     for (int64_t w : want) {
+        if (i >= n_want) break;  // ignore the trimmed trailing 1s
         if (ok && (int64_t) t->ne[i] != w) ok = false;
         ++i;
     }

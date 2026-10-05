@@ -73,11 +73,21 @@ def pipeline(golden):
     """Build and prewarm the 0.6B MegaPipeline once for the whole module.
 
     Depends on `golden` so a missing gitignored golden skips BEFORE the
-    checkpoint downloads/loads (the ARK06 fixture ordering)."""
+    checkpoint downloads/loads (the ARK06 fixture ordering). Teardown
+    releases the CUDA graphs / KV caches so later test modules on the same
+    runner start from a clean memory pool.
+    """
+    import gc
+
     from starling.qwen3_06.pipeline import MegaPipeline
 
     pipe = MegaPipeline.from_pretrained(encoder_mode="cudagraph")
-    return pipe
+    yield pipe
+    pipe.close()
+    del pipe
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def _wav(name: str) -> np.ndarray:

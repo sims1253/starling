@@ -241,9 +241,15 @@ bool Qwen3Model::load(const char* path, std::string& err) {
         const size_t pre_len = std::strlen(n);
         // Append the tensor tail to the layer prefix in the SAME stack
         // buffer — no per-tensor heap string (load-time churn the original
-        // require-loop avoided by snprintf-ing straight into n).
+        // require-loop avoided by snprintf-ing straight into n). Truncation
+        // (a future longer tail vs the 128-byte buffer) fails loudly
+        // instead of probing a wrong tensor name.
         const auto enc_shape = [&](const char* tail, std::initializer_list<int64_t> want) {
-            std::snprintf(n + pre_len, sizeof n - pre_len, "%s", tail);
+            const int written = std::snprintf(n + pre_len, sizeof n - pre_len, "%s", tail);
+            if (written < 0 || (size_t) written >= sizeof n - pre_len) {
+                err = std::string("QWEN3 GGUF tensor name truncated: ") + n;
+                return false;
+            }
             return lib::shape_eq(m, "QWEN3", n, want, err);
         };
         if (!enc_shape("attn_norm.weight", {c.encoder.hidden})) return false;
@@ -278,9 +284,13 @@ bool Qwen3Model::load(const char* path, std::string& err) {
         char n[128];
         std::snprintf(n, sizeof n, "llm.blk.%u.", i);
         const size_t pre_len = std::strlen(n);
-        // Same stack-buffer reuse as the encoder loop above.
+        // Same stack-buffer reuse + truncation guard as the encoder loop.
         const auto llm_shape = [&](const char* tail, std::initializer_list<int64_t> want) {
-            std::snprintf(n + pre_len, sizeof n - pre_len, "%s", tail);
+            const int written = std::snprintf(n + pre_len, sizeof n - pre_len, "%s", tail);
+            if (written < 0 || (size_t) written >= sizeof n - pre_len) {
+                err = std::string("QWEN3 GGUF tensor name truncated: ") + n;
+                return false;
+            }
             return lib::shape_eq(m, "QWEN3", n, want, err);
         };
         if (!llm_shape("attn_norm.weight", {c.llm.hidden})) return false;

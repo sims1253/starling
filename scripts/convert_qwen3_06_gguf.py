@@ -41,6 +41,7 @@ from convert_qwen3_gguf import (  # noqa: E402
     positional_embedding,
     tokenizer,
 )
+from make_qwen3_golden import MAX_CACHE_LEN  # noqa: E402  # one shared KV-cache policy with the golden captures
 
 REVISION = "7f1569a48a89f3e3f4dc3a5c9d28bddd903bc76c"
 DEFAULT_SNAPSHOT = (
@@ -183,7 +184,7 @@ def add_metadata(w: gguf.GGUFWriter, d: dict) -> None:
             "llm.intermediate_size": d["llm.intermediate_size"],
             "llm.vocab_size": d["llm.vocab_size"],
             "llm.max_position_embeddings": d["llm.max_position_embeddings"],
-            "llm.max_cache_len": 4096,
+            "llm.max_cache_len": MAX_CACHE_LEN,
         }
     )
     floats(**{"llm.rope_theta": d["llm.rope_theta"], "llm.rms_norm_eps": d["llm.rms_norm_eps"]})
@@ -226,10 +227,11 @@ def main() -> None:
     # Real raises (not asserts) so `python -O` cannot strip them.
     tokenizer_json = json.loads((args.snapshot / "tokenizer.json").read_text())
     tok_vocab = tokenizer_json["model"]["vocab"]
-    if len(tok_vocab) > VOCAB_SIZE or max(tok_vocab.values()) >= VOCAB_SIZE:
+    vocab_max = max(tok_vocab.values()) if tok_vocab else -1
+    if not tok_vocab or len(tok_vocab) > VOCAB_SIZE or vocab_max >= VOCAB_SIZE:
         _fail(
             f"tokenizer vocab ({len(tok_vocab)} entries, max id "
-            f"{max(tok_vocab.values())}) does not fit the shared {VOCAB_SIZE}-entry "
+            f"{vocab_max}) does not fit the shared {VOCAB_SIZE}-entry "
             "vocab — the shared 1.7B tokenizer/prompt layout cannot be reused"
         )
     if dims["llm.vocab_size"] != VOCAB_SIZE:
@@ -271,12 +273,10 @@ def main() -> None:
     print(f"prompt: prefix={PROMPT_PREFIX} suffix={PROMPT_SUFFIX}")
 
     learned = 0
-    dtypes = set()
     with safe_open(args.snapshot / "model.safetensors", framework="pt", device="cpu") as f:
         for source in sorted(f.keys()):
             target = gguf_name(source)
             t = f.get_tensor(source)
-            dtypes.add(str(t.dtype))
             if t.dtype is not torch.bfloat16:
                 raise TypeError(f"{source}: expected BF16, found {t.dtype}")
             # GGUF stores dims innermost-first; keep the BF16 byte stream in
@@ -309,7 +309,7 @@ def main() -> None:
     w.close()
     print(
         f"wrote {args.output}: {learned + 3} tensors ({learned} learned + "
-        f"pos_embed/mel/window), source dtypes={sorted(dtypes)}"
+        f"pos_embed/mel/window), every source tensor torch.bfloat16"
     )
     print(
         f"dims: enc(hidden={dims['enc.hidden']}, layers={dims['enc.layers']}, "
