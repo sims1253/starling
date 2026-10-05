@@ -61,14 +61,12 @@ pub(crate) const DOUBLE_TAP_WINDOW: Duration = Duration::from_millis(400);
 /// runs on, so a longer silence means the release was lost.
 pub(crate) const REPEAT_GAP: Duration = Duration::from_millis(1200);
 
-/// A click on the record button this soon after a take ended is ignored:
-/// it was aimed at the Stop button the user saw, not at a new take (an
-/// Escape or release ended the take a moment before the click landed).
-pub(crate) const CLICK_GRACE: Duration = Duration::from_millis(400);
-
-/// Whether a record-button click must be ignored (see [`CLICK_GRACE`]).
-pub(crate) fn click_ignored(active: bool, last_take_end: Option<Instant>, now: Instant) -> bool {
-    !active && last_take_end.is_some_and(|end| now.saturating_duration_since(end) < CLICK_GRACE)
+/// Whether a record-button click still means what the button showed when
+/// it was clicked. A click aimed at Stop after an Escape or release already
+/// ended the take (or at Start after the shortcut began one) is stale and
+/// does nothing, instead of toggling the other way.
+pub(crate) fn click_matches(showed_recording: bool, recording: bool) -> bool {
+    showed_recording == recording
 }
 
 /// Whether the Starling window was focused at `at`, from its recorded
@@ -538,8 +536,18 @@ impl StarlingApp {
     /// compositor may forward the focused native window's keys to XWayland
     /// too, so an event that happened while Starling had focus is the
     /// window's own key event seen twice: the window already handled it.
-    fn system_event_is_ours(&self, at: Instant) -> bool {
-        !(crate::shortcut::wayland_session() && focused_at(&self.window_focus, at))
+    /// Only keys the window can match itself are dropped: a shortcut the
+    /// window has no name for (Pause) still comes through.
+    fn system_event_is_ours(&self, event: GlobalEvent) -> bool {
+        let (at, window_can_match) = match event {
+            GlobalEvent::Pressed(at) | GlobalEvent::Released(at) => {
+                (at, self.shortcut.works_in_window())
+            }
+            GlobalEvent::Escape(at) => (at, true),
+        };
+        !(window_can_match
+            && crate::shortcut::wayland_session()
+            && focused_at(&self.window_focus, at))
     }
 
     /// Feed every system-wide event received so far to the machine, in
@@ -557,10 +565,7 @@ impl StarlingApp {
             let Some(event) = shortcuts.classify(raw) else {
                 continue;
             };
-            let at = match event {
-                GlobalEvent::Pressed(at) | GlobalEvent::Released(at) | GlobalEvent::Escape(at) => at,
-            };
-            if !self.system_event_is_ours(at) {
+            if !self.system_event_is_ours(event) {
                 continue;
             }
             let may_start = !self.settings_open;
@@ -673,14 +678,12 @@ impl StarlingApp {
                 Effect::Finish(take) => {
                     if self.recording_take == Some(take) {
                         self.recording_take = None;
-                        self.last_take_end = Some(Instant::now());
                         self.stop_recording(cx);
                     }
                 }
                 Effect::Cancel(take, reason) => {
                     if self.recording_take == Some(take) {
                         self.recording_take = None;
-                        self.last_take_end = Some(Instant::now());
                         self.cancel_recording(reason, cx);
                     }
                 }
@@ -1085,13 +1088,11 @@ mod tests {
     }
 
     #[test]
-    fn a_click_right_after_a_take_ended_is_not_a_new_take() {
-        let t0 = Instant::now();
-        assert!(!click_ignored(false, None, t0));
-        assert!(click_ignored(false, Some(t0), t0 + ms(100)));
-        assert!(!click_ignored(false, Some(t0), t0 + CLICK_GRACE));
-        // Stopping a running take is never ignored.
-        assert!(!click_ignored(true, Some(t0), t0 + ms(10)));
+    fn a_click_acts_only_on_the_state_its_button_showed() {
+        assert!(click_matches(false, false), "Start while idle starts");
+        assert!(click_matches(true, true), "Stop while recording stops");
+        assert!(!click_matches(true, false), "Stop after Escape ended the take");
+        assert!(!click_matches(false, true), "Start after the shortcut began one");
     }
 
     #[test]

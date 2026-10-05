@@ -292,8 +292,8 @@ fn render_recorder(
                                 },
                             ])
                         })
-                        .on_click(cx.listener(|this, _, _window, cx| {
-                            this.toggle_recording(cx);
+                        .on_click(cx.listener(move |this, _, _window, cx| {
+                            this.toggle_recording(recording, cx);
                         }))
                         .child(
                             div()

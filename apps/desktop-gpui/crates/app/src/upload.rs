@@ -310,14 +310,15 @@ pub(crate) fn quiesce_salvage_note(samples: u64, sample_rate: u32) -> String {
 
 impl StarlingApp {
     /// The on-screen record button: a toggle in every activation mode,
-    /// through the same machine as the shortcut (#221).
-    pub fn toggle_recording(&mut self, cx: &mut Context<Self>) {
+    /// through the same machine as the shortcut (#221). `showed_recording`
+    /// is what the button showed when it was rendered (Stop or Start).
+    pub fn toggle_recording(&mut self, showed_recording: bool, cx: &mut Context<Self>) {
         self.flush_system_events(cx);
-        let now = Instant::now();
-        if crate::activation::click_ignored(self.activation.is_active(), self.last_take_end, now) {
+        if !crate::activation::click_matches(showed_recording, self.recorder.is_some()) {
+            cx.notify();
             return;
         }
-        self.activation_input(|machine| machine.click(now), cx);
+        self.activation_input(|machine| machine.click(Instant::now()), cx);
     }
 
     /// Stop the running recorder and process the take as usual. Only the

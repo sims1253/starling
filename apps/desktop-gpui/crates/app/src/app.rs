@@ -471,8 +471,6 @@ pub struct StarlingApp {
     /// A shortcut saved while a take was running: it takes over when the
     /// take ends, so the held key's release still finishes that take.
     pub(crate) pending_shortcut: Option<crate::shortcut::Shortcut>,
-    /// When the last take ended (see `activation::CLICK_GRACE`).
-    pub(crate) last_take_end: Option<Instant>,
     /// The window's focus changes, oldest first, and the observer that
     /// records them (see `activation::focused_at`).
     pub(crate) window_focus: Vec<(Instant, bool)>,
@@ -1052,7 +1050,6 @@ impl StarlingApp {
             dictation_draft_error: None,
             shortcut,
             pending_shortcut: None,
-            last_take_end: None,
             window_focus: Vec::new(),
             focus_observer: None,
             dictation_settings,

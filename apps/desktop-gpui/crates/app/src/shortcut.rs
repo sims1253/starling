@@ -310,13 +310,11 @@ impl GlobalShortcuts {
     /// Windows), and the window still sees it either way.
     pub(crate) fn arm_escape(&mut self, armed: bool, shortcut: &Shortcut) -> Result<(), String> {
         if !armed {
-            let mut result = Ok(());
-            for escape in self.escape.drain(..) {
-                if let Err(err) = self.manager.unregister(escape) {
-                    result = Err(err.to_string());
-                }
-            }
-            return result;
+            // One batch: the X11 backend answers one command per 50 ms
+            // loop, and this runs on the UI thread. Variants that never
+            // registered fail to unregister harmlessly.
+            let escapes: Vec<HotKey> = self.escape.drain(..).collect();
+            return self.manager.unregister_all(&escapes).map_err(|err| err.to_string());
         }
         if !self.escape.is_empty() {
             return Ok(());
@@ -324,6 +322,7 @@ impl GlobalShortcuts {
         let bare = HotKey::new(None, Code::Escape);
         self.manager.register(bare).map_err(|err| err.to_string())?;
         self.escape.push(bare);
+        let mut held = Vec::new();
         // Every subset of the shortcut's modifiers: any of them may still
         // be held (or already let go) when Escape comes.
         let mods = shortcut.modifiers();
@@ -342,10 +341,13 @@ impl GlobalShortcuts {
                 .enumerate()
                 .filter(|(bit, _)| mask & (1 << bit) != 0)
                 .fold(Modifiers::empty(), |acc, (_, part)| acc | *part);
-            let held = HotKey::new(Some(subset), Code::Escape);
-            if self.manager.register(held).is_ok() {
-                self.escape.push(held);
-            }
+            held.push(HotKey::new(Some(subset), Code::Escape));
+        }
+        // Best effort, in one batch (see the disarm path): a variant the
+        // platform refuses simply never fires; all are disarmed together.
+        if !held.is_empty() {
+            let _ = self.manager.register_all(&held);
+            self.escape.extend(held);
         }
         Ok(())
     }
