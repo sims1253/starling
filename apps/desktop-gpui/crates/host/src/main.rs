@@ -1,7 +1,9 @@
 //! The `starling-runtime-host` binary: one per user session.
 //!
-//! Launch → serve until SIGINT/SIGTERM (graceful: `bye` to clients,
-//! machines join, lease released, endpoint removed) → exit 0.
+//! Launch → serve until SIGINT/SIGTERM (Windows: console Ctrl+C/Break,
+//! close, logoff, shutdown) → graceful stop (`bye` to clients, machines
+//! join, the supervised engine stops, lease released, endpoint removed)
+//! → exit 0.
 //!
 //! Exit contract for launchers (stdout is one JSON line each):
 //! - `{"status":"owner",…}` then `{"status":"stopped"}` — this process
@@ -13,9 +15,13 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use starling_runtime_host::engine::EngineChoice;
 use starling_runtime_host::{default_data_root, platform, serve, HostConfig};
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+/// Set once `host.shutdown()` returned — what the Windows close/logoff
+/// handler waits for before letting the OS end the process.
+static STOPPED: AtomicBool = AtomicBool::new(false);
 
 #[cfg(unix)]
 extern "C" fn on_signal(_signal: i32) {
@@ -23,18 +29,41 @@ extern "C" fn on_signal(_signal: i32) {
     SHUTDOWN.store(true, Ordering::SeqCst);
 }
 
+/// The Windows analogue of SIGINT/SIGTERM: Ctrl+C/Ctrl+Break, console
+/// close, logoff and system shutdown all request the same graceful
+/// stop. The handler runs on its own thread; for the close/logoff/
+/// shutdown events the OS ends the process as soon as the handler
+/// returns, so it waits (bounded, inside the OS's grace period) for the
+/// main loop to finish shutting down — lease released, engine stopped.
+#[cfg(windows)]
+unsafe extern "system" fn on_console_ctrl(ctrl_type: u32) -> windows_sys::Win32::Foundation::BOOL {
+    use windows_sys::Win32::System::Console::{CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT};
+    SHUTDOWN.store(true, Ordering::SeqCst);
+    if matches!(ctrl_type, CTRL_CLOSE_EVENT | CTRL_LOGOFF_EVENT | CTRL_SHUTDOWN_EVENT) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(4500);
+        while !STOPPED.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+    1
+}
+
 fn usage() -> ! {
     eprintln!(
         "starling-runtime-host — the Starling runtime service host (E17 I4)
 
 USAGE:
-    starling-runtime-host [--root <dir>] [--runtime-dir <dir>]
+    starling-runtime-host [--root <dir>] [--runtime-dir <dir>] [--engine <source>]
 
 OPTIONS:
     --root <dir>         storage v2 data root to own
                          (default: the platform default root)
     --runtime-dir <dir>  directory for the IPC endpoint
-                         (default: {})",
+                         (default: {})
+    --engine <source>    settings: the transcription engine the desktop
+                         settings choose (bundled engine supervised by
+                         this host, or the manual server) — the default;
+                         none: no engine (jobs fail no_provider_configured)",
         platform::default_runtime_dir().display()
     );
     std::process::exit(2);
@@ -47,13 +76,17 @@ fn help() -> ! {
         "starling-runtime-host — the Starling runtime service host (E17 I4)
 
 USAGE:
-    starling-runtime-host [--root <dir>] [--runtime-dir <dir>]
+    starling-runtime-host [--root <dir>] [--runtime-dir <dir>] [--engine <source>]
 
 OPTIONS:
     --root <dir>         storage v2 data root to own
                          (default: the platform default root)
     --runtime-dir <dir>  directory for the IPC endpoint
-                         (default: {})",
+                         (default: {})
+    --engine <source>    settings: the transcription engine the desktop
+                         settings choose (bundled engine supervised by
+                         this host, or the manual server) — the default;
+                         none: no engine (jobs fail no_provider_configured)",
         platform::default_runtime_dir().display()
     );
     std::process::exit(0);
@@ -84,21 +117,32 @@ fn main() {
             std::process::exit(1);
         }
     }
-    #[cfg(not(unix))]
-    {
-        // Windows: no console-ctrl handler wired yet (recorded gap);
-        // the process still exits on window-close / taskkill and the OS
-        // closes the pipe handles, so clients observe EOF, and the lease
-        // flock-equivalent (the DACL'd pipe name) disappears with it.
+    #[cfg(windows)]
+    unsafe {
+        // SAFETY: registers a handler that only touches static atomics.
+        if windows_sys::Win32::System::Console::SetConsoleCtrlHandler(Some(on_console_ctrl), 1)
+            == 0
+        {
+            eprintln!("starling-runtime-host: could not install the console control handler");
+            std::process::exit(1);
+        }
     }
 
     let mut root: Option<std::path::PathBuf> = None;
     let mut runtime_dir: Option<std::path::PathBuf> = None;
+    let mut engine_source = "settings".to_string();
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
         match flag.as_str() {
             "--root" => root = Some(value_of(&mut args, &flag)),
             "--runtime-dir" => runtime_dir = Some(value_of(&mut args, &flag)),
+            "--engine" => {
+                engine_source = value_of(&mut args, &flag).to_string_lossy().into_owned();
+                if engine_source != "settings" && engine_source != "none" {
+                    eprintln!("--engine takes settings or none, not {engine_source:?}");
+                    usage();
+                }
+            }
             "--help" | "-h" => help(),
             other => {
                 eprintln!("unknown argument {other:?}");
@@ -121,8 +165,22 @@ fn main() {
     // The runtime dir rides into `production` so only the *final*
     // endpoint directory is created — applying an override afterwards
     // would leave the default directory behind as stray residue.
+    let engine = if engine_source == "none" {
+        EngineChoice::None
+    } else {
+        let settings = starling_dictation::settings::Settings::load_or_default();
+        match EngineChoice::from_settings(&settings) {
+            Ok(engine) => engine,
+            Err(err) => {
+                eprintln!("starling-runtime-host: {err}");
+                std::process::exit(1);
+            }
+        }
+    };
+    let engine_label = engine.label();
+
     let mut host = match HostConfig::production(&root, runtime_dir) {
-        Ok(config) => match serve(config) {
+        Ok(config) => match serve(config.with_engine(engine)) {
             Ok(host) => host,
             Err(starling_runtime_host::HostError::OwnerLive {
                 owner_id,
@@ -158,6 +216,7 @@ fn main() {
             "socket": host.socket_path(),
             "owner": host.owner_id(),
             "pid": std::process::id(),
+            "engine": engine_label,
         })
     );
 
@@ -166,6 +225,7 @@ fn main() {
     }
     host.shutdown();
     println!("{}", serde_json::json!({ "status": "stopped" }));
+    STOPPED.store(true, Ordering::SeqCst);
 }
 
 fn value_of(args: &mut impl Iterator<Item = String>, flag: &str) -> std::path::PathBuf {

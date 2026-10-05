@@ -19,7 +19,8 @@ libc = "0.2"
 
 # The Windows named-pipe transport (platform::windows). The same crate
 # already reaches windows-sys through cpal on Windows builds; the features
-# listed here are the pipe/ACL surface that module needs. None of this
+# listed here are the pipe/ACL surface that module needs (plus the
+# console-ctrl handler the binary's graceful shutdown uses). None of this
 # compiles into non-Windows builds.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
@@ -27,6 +28,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
+    "Win32_System_Console",
     "Win32_System_IO",
     "Win32_System_Pipes",
     "Win32_System_Threading",

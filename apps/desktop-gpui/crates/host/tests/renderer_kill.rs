@@ -499,6 +499,8 @@ fn a_killed_host_with_a_live_renderer_leaves_no_orphan_lease_and_the_successor_s
 
     // The real binary, its own process, its own lease.
     let mut host_process = ProcessCommand::new(HOST_BIN)
+        // Never the user's real engine settings/dirs in a test.
+        .args(["--engine", "none"])
         .arg("--root")
         .arg(root.path())
         .arg("--runtime-dir")

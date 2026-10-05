@@ -62,18 +62,17 @@ pub trait TransportConn: Read + Write + Send + Sync {
     /// Arms a read poll on this connection so a blocking read wakes up
     /// periodically ([io::ErrorKind::WouldBlock]/[io::ErrorKind::TimedOut])
     /// instead of parking forever — the mechanism behind both sides'
-    /// "idle" loops. Errors where the platform cannot poll a synchronous
-    /// read (Windows' synchronous `ReadFile`; recorded gap there — see
-    /// `platform::windows`).
+    /// "idle" loops. The setting is per connection (shared by every
+    /// `try_clone` duplicate), as `SO_RCVTIMEO` is on unix; Windows
+    /// implements it with overlapped reads (see `platform::windows`).
     fn set_read_timeout(&self, timeout: Option<std::time::Duration>) -> io::Result<()>;
     /// Bounds a blocking write the same way: past the deadline a write
     /// parked against a peer that stopped reading fails with
     /// [io::ErrorKind::WouldBlock]/[io::ErrorKind::TimedOut] instead of
     /// blocking the caller indefinitely. The accept path's direct
     /// writes (rejection and auth-failure frames) arm this so a stalled
-    /// peer cannot park the one accept thread. A no-op where the
-    /// platform cannot bound a synchronous write (recorded gap — see
-    /// `platform::windows`).
+    /// peer cannot park the one accept thread. Per connection, like the
+    /// read timeout.
     fn set_write_timeout(&self, timeout: Option<std::time::Duration>) -> io::Result<()>;
 }
 

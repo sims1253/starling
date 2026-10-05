@@ -31,6 +31,8 @@ impl ChildHost {
         // streams nobody drains can deadlock a chatty child on the OS
         // pipe buffer.
         let child = Command::new(BIN)
+            // Never the user's real engine settings/dirs in a test.
+            .args(["--engine", "none"])
             .arg("--root")
             .arg(root)
             .arg("--runtime-dir")
@@ -168,6 +170,8 @@ fn a_second_host_binary_reports_already_running_and_exits_zero() {
     // of reporting already-running and exiting) must fail this test at
     // the deadline, not hang the suite until the job timeout.
     let mut child = Command::new(BIN)
+        // Never the user's real engine settings/dirs in a test.
+        .args(["--engine", "none"])
         .arg("--root")
         .arg(root.path())
         .arg("--runtime-dir")
@@ -339,10 +343,24 @@ fn the_binary_documents_its_interface() {
     assert_eq!(output.status.code(), Some(0), "--help is not an error");
     let help = String::from_utf8_lossy(&output.stdout);
     assert!(help.contains("--root"), "{help}");
+    assert!(help.contains("--engine"), "{help}");
     assert!(help.contains("--runtime-dir"), "{help}");
 
     let output = Command::new(BIN).arg("--bogus").output().unwrap();
     assert_eq!(output.status.code(), Some(2), "a usage error exits 2");
     let usage = String::from_utf8_lossy(&output.stderr);
     assert!(usage.contains("--bogus"), "{usage}");
+
+    // The engine source is a closed set: a typo is a usage error, never
+    // a silent fallback to (or away from) the user's engine.
+    let output = Command::new(BIN)
+        .args(["--engine", "bundled"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2), "an unknown engine source exits 2");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("--engine takes settings or none"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

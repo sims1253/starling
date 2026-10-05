@@ -136,6 +136,9 @@ pub struct HostHandle {
     threads: Mutex<Vec<JoinHandle<()>>>,
     lease: Arc<Mutex<StoreV2>>,
     runtime: Option<Runtime>,
+    /// The bundled engine this host supervises (builtin mode), stopped
+    /// after the machines join.
+    engine: Option<starling_dictation::engine::EngineManager>,
     startup_reconciliation: ReconciliationReport,
     done: AtomicBool,
 }
@@ -155,6 +158,12 @@ impl HostHandle {
     /// report is the normal case.
     pub fn startup_reconciliation(&self) -> &ReconciliationReport {
         &self.startup_reconciliation
+    }
+
+    /// The bundled engine this host supervises, when it runs one
+    /// (builtin mode) — for status reporting and tests.
+    pub fn engine(&self) -> Option<&starling_dictation::engine::EngineManager> {
+        self.engine.as_ref()
     }
 
     /// Graceful shutdown: no client is served past its `bye`, machines
@@ -224,6 +233,12 @@ impl HostHandle {
         // the machines, then release the lease and the endpoint.
         if let Some(runtime) = self.runtime.take() {
             runtime.shutdown();
+        }
+        // The engine outlives every job the machines ran; stop it only
+        // now (a no-op for an engine another process owns — the attached
+        // case leaves that owner's sidecar running).
+        if let Some(engine) = self.engine.take() {
+            engine.shutdown();
         }
         if let Ok(mut lease) = self.lease.lock() {
             let _ = lease.release_lease();
@@ -454,8 +469,13 @@ pub fn serve(config: HostConfig) -> Result<HostHandle, HostError> {
         }
     })?;
 
-    // 3. The runtime (the host owns worker lifetime from here on).
-    let (runtime, client) = starling_runtime::Runtime::start(config.runtime);
+    // 3. The engine, then the runtime (the host owns worker lifetime
+    //    from here on). The engine starts only now — after the lease and
+    //    the endpoint are this process's — so a host that turns out to
+    //    be a client never spawns a sidecar.
+    let mut runtime_config = config.runtime;
+    let engine = crate::engine::attach(config.engine, &mut runtime_config);
+    let (runtime, client) = starling_runtime::Runtime::start(runtime_config);
     let events = client.subscribe();
 
     let shared = Arc::new(HostShared {
@@ -496,6 +516,7 @@ pub fn serve(config: HostConfig) -> Result<HostHandle, HostError> {
         threads: Mutex::new(threads),
         lease,
         runtime: Some(runtime),
+        engine,
         startup_reconciliation,
         done: AtomicBool::new(false),
     })
