@@ -41,10 +41,12 @@ CUDA's driver library comes from the installed NVIDIA driver.
 The Windows CUDA executable delay-loads cuBLAS so that `--version` and
 `--abi-version` work without it. When it selects a CUDA device it loads
 `cublas64_13.dll` through the normal DLL search order (the executable's
-directory, the system directories, then `PATH`); if that fails, the model load
-fails with an error naming the DLL (`/health` reports it as `load_error`)
-instead of the server starting. NVIDIA's redistributable `libcublas` archive
-for CUDA 13.3 provides both cuBLAS DLLs. Install vendor
+directory, the system directories, then `PATH`). If that fails, the model load
+fails with an error naming the DLL: with the default eager load the server
+prints it and exits; with `--no-eager-load` the server keeps running, answers
+transcriptions with 503 "model not loaded", and `/health` reports the error as
+`load_error`. NVIDIA's redistributable `libcublas` archive for CUDA 13.3
+provides both cuBLAS DLLs. Install vendor
 runtime packages through the vendor's supported installer or package repository,
 so their transitive dependencies are installed too. Linux must be able to find
 these libraries through its loader configuration or `LD_LIBRARY_PATH`.
