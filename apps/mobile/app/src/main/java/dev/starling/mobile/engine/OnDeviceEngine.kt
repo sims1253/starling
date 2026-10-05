@@ -85,7 +85,10 @@ class OnDeviceEngine(
     private val activeFile = File(modelDir, ACTIVE_FILE_NAME)
 
     /** Guards engine state: the native handle and the model file's identity. */
-    private val lock = Any()
+    // A java.lang.Object (not Any) so prepare() can wait on it for a pinned
+    // model to be released; Kotlin's Any has no wait/notify.
+    @Suppress("PLATFORM_CLASS_MAPPED_TO_KOTLIN")
+    private val lock = Object()
 
     /**
      * Serializes imports. The staging sweep at the start of an import deletes
@@ -572,6 +575,14 @@ class OnDeviceEngine(
      * the session (see [pinnedSessions]); null when ready. Blocking.
      */
     override fun prepare(): String? = synchronized(lock) {
+        // A new take uses the model selected when it started, never the one
+        // an earlier take (still finalizing) has pinned: wait, with the lock
+        // released, for those takes to end so the switch can happen. The new
+        // take's audio is being saved and backlogged meanwhile. The slice
+        // re-checks the selection, which can change while waiting.
+        while (handle != 0L && pinnedSessions > 0 && loadedFile != activeModelFile()) {
+            lock.wait(PIN_WAIT_SLICE_MILLIS)
+        }
         usingLocked { ensureLoadedLocked().also { if (it == null) pinnedSessions++ } }
     }
 
@@ -649,6 +660,8 @@ class OnDeviceEngine(
                 releasePending = false
                 unload()
             }
+            // A take waiting in prepare() for this pin to drop.
+            if (prepared) lock.notifyAll()
             // Reported as idle only when no session is live (see reportIdleLocked).
             reportIdleLocked()
         }
@@ -708,6 +721,9 @@ class OnDeviceEngine(
 
         /** Name for a model imported without a usable file name. */
         const val DEFAULT_MODEL_NAME = "parakeet.gguf"
+
+        /** How often a take waiting for a pinned model re-checks the selection. */
+        private const val PIN_WAIT_SLICE_MILLIS = 1_000L
         private const val ACTIVE_FILE_NAME = "active-model"
         private const val MODEL_EXTENSION = ".gguf"
         private const val MAX_NAME_CHARS = 120

@@ -140,7 +140,7 @@ class ModelLifetime(
             preloadInFlight = true
         }
         try {
-            worker.execute { runPreload(model) }
+            worker.execute(::runPreload)
         } catch (t: Throwable) {
             // A rejected task (executor shut down) must not wedge preloads.
             synchronized(lock) { preloadInFlight = false }
@@ -149,7 +149,7 @@ class ModelLifetime(
         return PreloadResult.QUEUED
     }
 
-    private fun runPreload(model: String) {
+    private fun runPreload() {
         try {
             // Blocking: waits for the engine lock (an in-flight recording or
             // transcription goes first) and then loads, or merely touches
@@ -157,10 +157,10 @@ class ModelLifetime(
             // observer callbacks below. A driver failure seen while this
             // waited for the lock cancels it there.
             engine.preload { synchronized(lock) { state !is State.DriverFailed } }
-        } catch (t: Throwable) {
-            // A throw (a broken native library) counts as a failed load, so
-            // the state leaves Loading and the backoff applies.
-            loadFailed(model, t.message ?: t::class.java.simpleName)
+        } catch (_: Throwable) {
+            // A throwing load (a broken native library) was already reported
+            // through loadFailed, with the model it actually tried, so the
+            // state leaves Loading and the backoff applies to that model.
         } finally {
             synchronized(lock) { preloadInFlight = false }
         }
@@ -248,12 +248,18 @@ class ModelLifetime(
          */
         internal fun isDriverFailure(reason: String): Boolean {
             if (!GpuFailure.matches(reason)) return false
+            // The GPU memory preflight refuses a load that does not fit the
+            // current budget; nothing is wedged.
+            if (reason.contains(PREFLIGHT_FAILURE)) return false
             if (!reason.contains(ALLOCATION_FAILURE)) return true
             return reason.contains("VkResult -4") || reason.contains("device lost", ignoreCase = true)
         }
 
-        /** The wording of the native vkAllocateMemory failure (cpp/fast/vk_runtime.cpp). */
+        /** Wording of the native vkAllocateMemory failure (cpp/fast/vk_runtime.cpp). */
         private const val ALLOCATION_FAILURE = "the model may not fit"
+
+        /** Wording of the native GPU memory-budget preflight refusal (cpp/fast/vk_runtime.cpp). */
+        private const val PREFLIGHT_FAILURE = "GPU memory preflight failed"
 
         /**
          * How long an idle model stays resident. Long enough to keep it warm

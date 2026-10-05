@@ -186,8 +186,10 @@ class ModelLifetimeTest {
 
     @Test
     fun aThrowingLoadIsAFailureWithBackoffNotAnEndlessLoading() {
+        // As OnDeviceEngine does: a throwing load is reported, then rethrown.
         engine.onPrepare = {
             lifetime.loading("parakeet.gguf")
+            lifetime.loadFailed("parakeet.gguf", "no libstarling_jni")
             throw UnsatisfiedLinkError("no libstarling_jni")
         }
         lifetime.preload()
@@ -218,6 +220,12 @@ class ModelLifetimeTest {
 
         val lost = oom.replace("VkResult -2", "VkResult -4")
         assertTrue(ModelLifetime.isDriverFailure(lost))
+        assertFalse(
+            ModelLifetime.isDriverFailure(
+                "fast engine unavailable: fast engine: GPU memory preflight failed: need 900 MiB, 400 MiB " +
+                    "available - the GPU driver may be degraded; restarting the app/device clears it",
+            ),
+        )
     }
 
     @Test
