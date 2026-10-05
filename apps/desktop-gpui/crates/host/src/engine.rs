@@ -14,14 +14,36 @@
 //! directories the desktop app uses, so the app and the host share one
 //! sidecar through the engine registry (one owns it, the other
 //! attaches) instead of loading the model twice.
+//!
+//! # Following the settings while the host runs (#220)
+//!
+//! The desktop app applies engine changes immediately (its
+//! `apply_engine_mode_change` / activate flows), so a host that froze
+//! its startup choice would drift from what the user just chose. The
+//! host therefore installs [`SettingsProvider`] — a switchable provider
+//! — as the runtime's provider and owns an [`EngineHost`] that tracks
+//! the live engine state. [`watch_settings`] polls the settings file
+//! (path and interval injectable; `Settings::default_path` in
+//! production) and [`EngineHost::apply`] carries each change over:
+//! `activate` for a new model, `set_backend_override` for the CPU
+//! toggle, a fresh manual provider for an endpoint/model change, a
+//! started supervisor for manual→builtin, and a stopped engine for
+//! builtin→manual. An in-flight recognition runs on the provider (and,
+//! through it, the engine lease) it started with: the inner provider is
+//! captured once per call, and a mode switch drains before it stops the
+//! engine.
 
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use starling_dictation::client::{ClientError, StarlingClient};
-use starling_dictation::engine::{EngineConfig, EngineLease, EngineManager, EnginePhase};
+use starling_dictation::engine::{Backend, EngineConfig, EngineLease, EngineManager, EnginePhase};
 use starling_dictation::settings::{EngineMode, Settings};
 use starling_runtime::provider::{
-    failure_from_client_error, CancelToken, Partial, ProviderOutcome, TranscriptionProvider,
+    failure_from_client_error, CancelToken, Partial, ProviderOutcome, StarlingProvider,
+    TranscriptionProvider, UnconfiguredProvider,
 };
 
 /// How long a job waits for the engine to become ready before failing
@@ -31,6 +53,29 @@ pub const DEFAULT_READY_WAIT: Duration = Duration::from_secs(120);
 
 /// How often a waiting job re-checks the engine (and its cancel token).
 const READY_POLL: Duration = Duration::from_millis(50);
+
+/// How often the settings watcher polls the file: one small read, so
+/// the desktop app's engine changes are visible within a poll or two.
+pub const DEFAULT_SETTINGS_POLL: Duration = Duration::from_millis(1500);
+
+/// How long a builtin→manual switch waits for in-flight recognitions
+/// (each holds its provider — and through it its engine lease — for its
+/// whole request) before stopping the engine anyway: a stuck job must
+/// not keep the engine (and its memory) alive indefinitely.
+const ENGINE_DRAIN_GRACE: Duration = Duration::from_secs(10);
+
+/// The sleep slice shared by the drain wait and the watcher's poll loop
+/// (what keeps both promptly stoppable).
+const FOLLOW_SLICE: Duration = Duration::from_millis(50);
+
+/// Locks one of the engine host's mutexes, tolerating poison: none of
+/// this state is ownership-critical, and a panic in one apply must not
+/// cascade into every later status read.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// The user's engine choice, resolved for the host.
 #[derive(Debug, Clone)]
@@ -60,7 +105,7 @@ impl EngineChoice {
                     .engine
                     .backend_override
                     .as_deref()
-                    .and_then(starling_dictation::engine::Backend::parse);
+                    .and_then(Backend::parse);
                 Ok(EngineChoice::Builtin {
                     config,
                     active_model: settings.engine.active_model.clone(),
@@ -84,37 +129,360 @@ impl EngineChoice {
 }
 
 /// Attaches `choice` to the runtime about to start: builtin starts the
-/// engine supervisor (returned, for the host to stop at shutdown) and
-/// installs [`EngineProvider`]; manual installs the plain server
-/// provider; none leaves `runtime.provider` untouched. A manual
-/// endpoint that does not validate is reported and left unconfigured —
-/// the host still owns capture and storage, jobs fail
-/// `no_provider_configured`, and the user's settings are not guessed at.
+/// engine supervisor behind [`SettingsProvider`] (the switchable
+/// provider the host can re-aim while it serves), manual installs the
+/// plain server provider behind the same switch, none leaves
+/// `runtime.provider` untouched. A manual endpoint that does not
+/// validate is reported and left unconfigured — the host still owns
+/// capture and storage, jobs fail `no_provider_configured`, and the
+/// user's settings are not guessed at. The returned [`EngineHost`] is
+/// the host's live handle on the engine (current manager, settings
+/// changes, shutdown).
 pub fn attach(
     choice: EngineChoice,
     runtime: &mut starling_runtime::RuntimeConfig,
-) -> Option<EngineManager> {
+) -> Option<Arc<EngineHost>> {
     match choice {
         EngineChoice::None => None,
         EngineChoice::Builtin {
             config,
             active_model,
         } => {
-            let manager = EngineManager::start(config, active_model);
-            runtime.provider = std::sync::Arc::new(EngineProvider::new(manager.clone()));
-            Some(manager)
+            let host = Arc::new(EngineHost::start_builtin(config, active_model));
+            runtime.provider = host.provider_slot();
+            Some(host)
         }
         EngineChoice::Manual { endpoint, model } => {
-            match starling_runtime::provider::StarlingProvider::new(&endpoint, &model) {
-                Ok(provider) => runtime.provider = std::sync::Arc::new(provider),
-                Err(err) => eprintln!(
-                    "starling-runtime-host: manual engine endpoint {endpoint:?} is unusable \
-                     ({err}); transcription stays unconfigured"
-                ),
-            }
-            None
+            let host = Arc::new(EngineHost::manual(endpoint, model));
+            runtime.provider = host.provider_slot();
+            Some(host)
         }
     }
+}
+
+/// The runtime's switchable provider: whichever inner provider the
+/// current engine settings resolve to, behind one stable
+/// [`TranscriptionProvider`] the jobs machine holds for the host's
+/// whole lifetime. An in-flight call runs on the inner provider it
+/// captured at its start — a settings change mid-request moves the next
+/// job, never the running one.
+pub struct SettingsProvider {
+    current: Mutex<Slot>,
+}
+
+struct Slot {
+    provider: Arc<dyn TranscriptionProvider>,
+    label: String,
+}
+
+impl SettingsProvider {
+    fn new(provider: Arc<dyn TranscriptionProvider>, label: String) -> SettingsProvider {
+        SettingsProvider {
+            current: Mutex::new(Slot { provider, label }),
+        }
+    }
+
+    /// What serves right now — `builtin`, `manual:<endpoint>`, or
+    /// `unconfigured` (status lines and tests).
+    pub fn label(&self) -> String {
+        lock(&self.current).label.clone()
+    }
+
+    /// Swaps the inner provider. The next recognition starts on `provider`;
+    /// calls already running finish on the one they captured.
+    fn install(&self, provider: Arc<dyn TranscriptionProvider>, label: String) {
+        *lock(&self.current) = Slot { provider, label };
+    }
+}
+
+impl TranscriptionProvider for SettingsProvider {
+    fn recognize(
+        &self,
+        wav: Vec<u8>,
+        request_id: &str,
+        on_partial: &mut dyn FnMut(Partial),
+        cancel: &CancelToken,
+    ) -> ProviderOutcome {
+        // Capture first, call second: the swap below this line moves the
+        // *next* job, never this one (an in-flight recognition keeps its
+        // provider — and through it its engine lease — until it returns).
+        let provider = Arc::clone(&lock(&self.current).provider);
+        provider.recognize(wav, request_id, on_partial, cancel)
+    }
+}
+
+/// The host's live engine attachment: the switchable provider the
+/// runtime calls through, the engine state it tracks, and the
+/// transitions ([`EngineHost::apply`]) that follow the settings file.
+/// Shared between the host handle (status, shutdown) and the settings
+/// watcher, which is the only writer while the host serves.
+pub struct EngineHost {
+    provider: Arc<SettingsProvider>,
+    state: Mutex<EngineState>,
+}
+
+/// What the host runs right now; the diff base for the next
+/// [`EngineHost::apply`].
+enum EngineState {
+    /// Builtin mode: this host supervises an engine. `in_flight` counts
+    /// live recognitions on its provider — what a mode switch drains
+    /// before it stops the engine.
+    Builtin {
+        manager: EngineManager,
+        in_flight: Arc<AtomicUsize>,
+        active_model: Option<String>,
+        backend_override: Option<Backend>,
+    },
+    /// Manual mode: the endpoint/model the provider was last built from.
+    Manual { endpoint: String, model: String },
+}
+
+impl EngineHost {
+    fn start_builtin(config: EngineConfig, active_model: Option<String>) -> EngineHost {
+        let manager = EngineManager::start(config.clone(), active_model.clone());
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let provider = EngineProvider::over(manager.clone(), Arc::clone(&in_flight));
+        EngineHost {
+            provider: Arc::new(SettingsProvider::new(
+                Arc::new(provider),
+                "builtin".to_string(),
+            )),
+            state: Mutex::new(EngineState::Builtin {
+                manager,
+                in_flight,
+                active_model,
+                backend_override: config.backend_override,
+            }),
+        }
+    }
+
+    fn manual(endpoint: String, model: String) -> EngineHost {
+        let label = manual_label(&endpoint);
+        EngineHost {
+            provider: Arc::new(SettingsProvider::new(
+                manual_provider(&endpoint, &model),
+                label,
+            )),
+            state: Mutex::new(EngineState::Manual { endpoint, model }),
+        }
+    }
+
+    /// The runtime's provider slot this host fills (`attach` installs
+    /// it; nothing else constructs an `EngineHost`).
+    fn provider_slot(&self) -> Arc<SettingsProvider> {
+        Arc::clone(&self.provider)
+    }
+
+    /// What serves right now (`builtin`, `manual:<endpoint>`, or
+    /// `unconfigured`) — the live analogue of [`EngineChoice::label`].
+    pub fn label(&self) -> String {
+        self.provider.label()
+    }
+
+    /// The engine manager this host supervises right now (builtin
+    /// mode), for status reporting and tests. `None` in manual mode —
+    /// including after a live builtin→manual switch.
+    pub fn manager(&self) -> Option<EngineManager> {
+        match &*lock(&self.state) {
+            EngineState::Builtin { manager, .. } => Some(manager.clone()),
+            EngineState::Manual { .. } => None,
+        }
+    }
+
+    /// Carries a settings-resolved engine choice over to the running
+    /// host, the host-side twin of the app's immediate engine actions:
+    /// a new `activeModel` activates the model, a changed
+    /// `backendOverride` re-selects the backend, manual endpoint/model
+    /// changes rebuild the server provider, manual→builtin starts a
+    /// supervisor, builtin→manual stops routing to the engine and (once
+    /// in-flight recognitions finished, bounded by
+    /// [`ENGINE_DRAIN_GRACE`]) shuts it down. Only the deltas run: an
+    /// unchanged choice costs nothing.
+    pub fn apply(&self, choice: EngineChoice) {
+        let mut state = lock(&self.state);
+        match choice {
+            EngineChoice::None => {}
+            EngineChoice::Builtin {
+                config,
+                active_model,
+            } => match &mut *state {
+                EngineState::Builtin {
+                    manager,
+                    active_model: current_model,
+                    backend_override,
+                    ..
+                } => {
+                    if active_model != *current_model {
+                        match active_model.as_deref() {
+                            Some(model_id) => manager.activate(model_id),
+                            // The settings stopped naming a model. The
+                            // app always persists its active choice, so
+                            // this is a hand-edited or foreign file; keep
+                            // the engine the running jobs know (the
+                            // supervisor has no "serve nothing"
+                            // command, and stopping under the user's
+                            // takes is the worse failure).
+                            None => eprintln!(
+                                "starling-runtime-host: the settings name no engine \
+                                 model; keeping the running one"
+                            ),
+                        }
+                        *current_model = active_model;
+                    }
+                    if config.backend_override != *backend_override {
+                        manager.set_backend_override(config.backend_override);
+                        *backend_override = config.backend_override;
+                    }
+                }
+                EngineState::Manual { .. } => {
+                    // manual → builtin: start a supervisor, then aim the
+                    // runtime at it.
+                    let manager = EngineManager::start(config.clone(), active_model.clone());
+                    let in_flight = Arc::new(AtomicUsize::new(0));
+                    self.provider.install(
+                        Arc::new(EngineProvider::over(
+                            manager.clone(),
+                            Arc::clone(&in_flight),
+                        )),
+                        "builtin".to_string(),
+                    );
+                    *state = EngineState::Builtin {
+                        manager,
+                        in_flight,
+                        active_model,
+                        backend_override: config.backend_override,
+                    };
+                }
+            },
+            EngineChoice::Manual { endpoint, model } => {
+                let changed = match &*state {
+                    EngineState::Manual {
+                        endpoint: current,
+                        model: current_model,
+                    } => current != &endpoint || current_model != &model,
+                    EngineState::Builtin { .. } => true,
+                };
+                if !changed {
+                    return;
+                }
+                // Swap first: every job submitted after this line routes
+                // to the manual provider, never to the engine a mode
+                // switch is about to stop.
+                self.provider
+                    .install(manual_provider(&endpoint, &model), manual_label(&endpoint));
+                let previous = std::mem::replace(
+                    &mut *state,
+                    EngineState::Manual {
+                        endpoint: endpoint.clone(),
+                        model: model.clone(),
+                    },
+                );
+                // The state already says manual: release it before the
+                // drain below, so status reads (`manager()`) and the
+                // host's shutdown never wait out the grace behind it.
+                drop(state);
+                if let EngineState::Builtin {
+                    manager, in_flight, ..
+                } = previous
+                {
+                    // In-flight recognitions hold their provider (and its
+                    // engine lease) for their whole request: give them
+                    // their grace, then stop the engine — the host must
+                    // not keep a user-rejected engine (and its memory)
+                    // alive behind a stuck job.
+                    let deadline = Instant::now() + ENGINE_DRAIN_GRACE;
+                    while in_flight.load(Ordering::SeqCst) > 0 && Instant::now() < deadline {
+                        std::thread::sleep(FOLLOW_SLICE);
+                    }
+                    manager.shutdown();
+                }
+            }
+        }
+    }
+
+    /// Stops the engine this host supervises (a no-op in manual mode,
+    /// or for an engine another process owns — the attached case leaves
+    /// that owner's sidecar running). The host calls this on its
+    /// shutdown path, after the settings watcher stopped and the
+    /// runtime's machines joined.
+    pub fn shutdown(&self) {
+        if let EngineState::Builtin { manager, .. } = &*lock(&self.state) {
+            manager.shutdown();
+        }
+    }
+}
+
+/// The manual provider for `endpoint`/`model`, or the honest
+/// unconfigured one when the endpoint does not validate (reported, not
+/// guessed at — the startup and the follow paths share this posture).
+fn manual_provider(endpoint: &str, model: &str) -> Arc<dyn TranscriptionProvider> {
+    match StarlingProvider::new(endpoint, model) {
+        Ok(provider) => Arc::new(provider),
+        Err(err) => {
+            eprintln!(
+                "starling-runtime-host: manual engine endpoint {endpoint:?} is unusable \
+                 ({err}); transcription stays unconfigured"
+            );
+            Arc::new(UnconfiguredProvider)
+        }
+    }
+}
+
+fn manual_label(endpoint: &str) -> String {
+    format!("manual:{endpoint}")
+}
+
+/// Spawns the host's settings watcher (#220): polls `path`'s bytes
+/// every `poll` and, when they change, resolves the settings' engine
+/// choice ([`EngineChoice::from_settings`], the same load the host
+/// started from) and applies it to `host`. A missing or unreadable
+/// file is skipped, not treated as a change — the host keeps serving
+/// what it served. Stops when `stop` is set (checked every slice), so
+/// the host's shutdown joins it before it stops the engine.
+pub fn watch_settings(
+    host: Arc<EngineHost>,
+    path: PathBuf,
+    poll: Duration,
+    stop: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::Builder::new()
+        .name("starling-host-settings".to_string())
+        .spawn(move || {
+            let mut last = std::fs::read(&path).ok();
+            loop {
+                if stop.load(Ordering::SeqCst) {
+                    return;
+                }
+                let deadline = Instant::now() + poll;
+                while Instant::now() < deadline {
+                    if stop.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    std::thread::sleep(FOLLOW_SLICE.min(deadline - Instant::now()));
+                }
+                let current = std::fs::read(&path).ok();
+                if current != last {
+                    last = current.clone();
+                    // Apply only what the file stably says: `Settings::load`
+                    // falls back to defaults for a missing file, and a
+                    // deletion racing between the two reads must not read
+                    // as "the user chose the defaults" — the host keeps
+                    // its last-known choice until the file says otherwise.
+                    if current.is_some() && current == std::fs::read(&path).ok() {
+                        let settings = Settings::load(&path);
+                        match EngineChoice::from_settings(&settings) {
+                            Ok(choice) => host.apply(choice),
+                            Err(err) => eprintln!(
+                                "starling-runtime-host: engine settings at {}: {err}; \
+                                 the engine stays as it is",
+                                path.display()
+                            ),
+                        }
+                    }
+                }
+            }
+        })
+        .expect("host thread spawn")
 }
 
 /// The jobs machine's provider over the host-owned engine: each
@@ -125,6 +493,7 @@ pub fn attach(
 pub struct EngineProvider {
     manager: EngineManager,
     ready_wait: Duration,
+    in_flight: Arc<AtomicUsize>,
 }
 
 impl EngineProvider {
@@ -132,6 +501,17 @@ impl EngineProvider {
         EngineProvider {
             manager,
             ready_wait: DEFAULT_READY_WAIT,
+            in_flight: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// The provider over `manager`, counting live recognitions on
+    /// `in_flight` (the counter the host's mode-switch drain waits on).
+    fn over(manager: EngineManager, in_flight: Arc<AtomicUsize>) -> EngineProvider {
+        EngineProvider {
+            manager,
+            ready_wait: DEFAULT_READY_WAIT,
+            in_flight,
         }
     }
 
@@ -139,6 +519,29 @@ impl EngineProvider {
     pub fn with_ready_wait(mut self, wait: Duration) -> EngineProvider {
         self.ready_wait = wait;
         self
+    }
+
+    /// Recognitions currently running on this provider — what a
+    /// builtin→manual switch drains before it stops the engine.
+    pub fn in_flight(&self) -> usize {
+        self.in_flight.load(Ordering::SeqCst)
+    }
+}
+
+/// One live recognition's count on its provider's counter, released on
+/// every exit (including panics).
+struct InFlight<'a>(&'a AtomicUsize);
+
+impl<'a> InFlight<'a> {
+    fn on(counter: &'a AtomicUsize) -> InFlight<'a> {
+        counter.fetch_add(1, Ordering::SeqCst);
+        InFlight(counter)
+    }
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -221,8 +624,12 @@ impl TranscriptionProvider for EngineProvider {
         _on_partial: &mut dyn FnMut(Partial),
         cancel: &CancelToken,
     ) -> ProviderOutcome {
+        // Counted for the whole call: a mode switch that swaps this
+        // provider out waits (bounded) for this count before it stops
+        // the engine.
+        let _busy = InFlight::on(&self.in_flight);
         let started = Instant::now();
-        let wav = std::sync::Arc::new(wav);
+        let wav = Arc::new(wav);
         let mut failed_engine: Option<(String, u32)> = None;
         loop {
             let deadline = Instant::now() + self.ready_wait;
@@ -240,11 +647,7 @@ impl TranscriptionProvider for EngineProvider {
             // The lease is held for the whole request: a model switch that
             // starts mid-request drains this engine instead of stopping it
             // under the take (#363). It drops at the end of this iteration.
-            match client.transcribe_with_cancel(
-                std::sync::Arc::clone(&wav),
-                request_id,
-                Some(cancel),
-            ) {
+            match client.transcribe_with_cancel(Arc::clone(&wav), request_id, Some(cancel)) {
                 Ok(result) => {
                     return ProviderOutcome::Completed {
                         text: result.text,
@@ -321,12 +724,197 @@ mod tests {
                 active_model,
             } => {
                 assert_eq!(active_model.as_deref(), Some("parakeet-v3-q8"));
-                assert_eq!(
-                    config.backend_override,
-                    Some(starling_dictation::engine::Backend::Cpu)
-                );
+                assert_eq!(config.backend_override, Some(Backend::Cpu));
             }
             other => panic!("expected builtin, got {other:?}"),
         }
+    }
+
+    /// A provider that parks in `recognize` until the test releases it,
+    /// reporting which slot served the call.
+    struct GatedProvider {
+        started: std::sync::mpsc::Sender<()>,
+        gate: Mutex<std::sync::mpsc::Receiver<()>>,
+        tag: &'static str,
+    }
+
+    impl TranscriptionProvider for GatedProvider {
+        fn recognize(
+            &self,
+            _wav: Vec<u8>,
+            _request_id: &str,
+            _on_partial: &mut dyn FnMut(Partial),
+            _cancel: &CancelToken,
+        ) -> ProviderOutcome {
+            let _ = self.started.send(());
+            let _ = self.gate.lock().unwrap().recv();
+            ProviderOutcome::Completed {
+                text: self.tag.to_string(),
+                backend: self.tag.to_string(),
+                timing_ms: 0.0,
+                completion_evidence: "final_decode".to_string(),
+            }
+        }
+    }
+
+    /// The in-flight rule (#220): a settings change mid-recognition
+    /// moves the next job, never the running one — the call finishes on
+    /// (and reports) the provider it captured at its start.
+    #[test]
+    fn a_recognition_finishes_on_the_provider_it_started_with() {
+        let (first_started, first_started_rx) = std::sync::mpsc::channel();
+        let (release_first, first_gate) = std::sync::mpsc::channel();
+        let first = Arc::new(GatedProvider {
+            started: first_started,
+            gate: Mutex::new(first_gate),
+            tag: "first",
+        });
+        let (second_started, second_started_rx) = std::sync::mpsc::channel();
+        let (release_second, second_gate) = std::sync::mpsc::channel();
+        let second = Arc::new(GatedProvider {
+            started: second_started,
+            gate: Mutex::new(second_gate),
+            tag: "second",
+        });
+
+        let settings = Arc::new(SettingsProvider::new(
+            Arc::clone(&first) as Arc<dyn TranscriptionProvider>,
+            "first".to_string(),
+        ));
+        let runner = {
+            let settings = Arc::clone(&settings);
+            std::thread::spawn(move || {
+                settings.recognize(
+                    vec![0u8; 64],
+                    "job-x",
+                    &mut |_partial| {},
+                    &CancelToken::new(),
+                )
+            })
+        };
+        first_started_rx
+            .recv()
+            .expect("the first provider is running the job");
+
+        // The settings move on while the job runs.
+        settings.install(
+            Arc::clone(&second) as Arc<dyn TranscriptionProvider>,
+            "second".to_string(),
+        );
+        assert_eq!(settings.label(), "second");
+
+        release_first.send(()).expect("release the first provider");
+        match runner.join().expect("the recognition finished") {
+            ProviderOutcome::Completed { backend, .. } => assert_eq!(backend, "first"),
+            ProviderOutcome::Failed { .. } => {
+                panic!("expected a completion on the first provider")
+            }
+        }
+        // The replacement never saw the running job.
+        assert!(
+            second_started_rx.try_recv().is_err(),
+            "the second provider must not serve the job that started on the first"
+        );
+        drop(release_second);
+    }
+
+    /// An unusable manual slot fails jobs honestly instead of guessing
+    /// at the user's settings.
+    #[test]
+    fn an_unconfigured_slot_fails_no_provider_configured() {
+        let settings = SettingsProvider::new(
+            Arc::new(UnconfiguredProvider) as Arc<dyn TranscriptionProvider>,
+            "unconfigured".to_string(),
+        );
+        match settings.recognize(
+            vec![0u8; 64],
+            "job-y",
+            &mut |_partial| {},
+            &CancelToken::new(),
+        ) {
+            ProviderOutcome::Failed { reason, retryable } => {
+                assert_eq!(reason, "no_provider_configured");
+                assert!(!retryable);
+            }
+            ProviderOutcome::Completed { .. } => {
+                panic!("expected the honest failure, got a completion")
+            }
+        }
+        assert_eq!(settings.label(), "unconfigured");
+    }
+
+    /// An engine-less config over a temp dir (no engine staged, no
+    /// models): the supervisor sits at `NoModel`, so mode transitions
+    /// can be driven without spawning anything.
+    fn detached_config(root: &std::path::Path) -> EngineConfig {
+        EngineConfig {
+            engine_dir: Some(root.join("engines")),
+            models_dir: root.join("models"),
+            state_dir: root.join("engine-state"),
+            catalog: Vec::new(),
+            backend_override: None,
+            icd_dirs: Some(Vec::new()),
+            available_memory_override: Some(None),
+            backoff_schedule: Some(vec![Duration::from_millis(100)]),
+        }
+    }
+
+    /// The mode transitions while the host runs (#220): manual→builtin
+    /// starts a supervisor, builtin→manual swaps the provider back and
+    /// stops the engine.
+    #[test]
+    fn apply_moves_the_live_host_between_manual_and_builtin() {
+        let root = tempfile::tempdir().unwrap();
+        let mut runtime = starling_runtime::RuntimeConfig::default();
+        let host = attach(
+            EngineChoice::Manual {
+                endpoint: "http://127.0.0.1:8181".into(),
+                model: "parakeet".into(),
+            },
+            &mut runtime,
+        )
+        .expect("manual mode attaches");
+        assert_eq!(host.label(), "manual:http://127.0.0.1:8181");
+        assert!(host.manager().is_none(), "manual mode runs no engine");
+
+        // manual → builtin: a supervisor starts and the runtime routes
+        // to it.
+        host.apply(EngineChoice::Builtin {
+            config: detached_config(root.path()),
+            active_model: None,
+        });
+        assert_eq!(host.label(), "builtin");
+        assert!(
+            host.manager().is_some(),
+            "builtin mode supervises an engine"
+        );
+
+        // builtin → manual: the provider swaps (the runtime would route
+        // manual from here) and the engine stops.
+        host.apply(EngineChoice::Manual {
+            endpoint: "http://127.0.0.1:9192".into(),
+            model: "parakeet".into(),
+        });
+        assert_eq!(host.label(), "manual:http://127.0.0.1:9192");
+        assert!(
+            host.manager().is_none(),
+            "the mode switch stopped the engine"
+        );
+
+        // A manual endpoint change rebuilds the provider in place.
+        host.apply(EngineChoice::Manual {
+            endpoint: "http://127.0.0.1:9193".into(),
+            model: "parakeet".into(),
+        });
+        assert_eq!(host.label(), "manual:http://127.0.0.1:9193");
+
+        // An unchanged choice is a no-op, and shutdown (manual mode)
+        // stops nothing.
+        host.apply(EngineChoice::Manual {
+            endpoint: "http://127.0.0.1:9193".into(),
+            model: "parakeet".into(),
+        });
+        assert_eq!(host.label(), "manual:http://127.0.0.1:9193");
+        host.shutdown();
     }
 }

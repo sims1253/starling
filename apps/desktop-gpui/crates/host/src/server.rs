@@ -136,9 +136,14 @@ pub struct HostHandle {
     threads: Mutex<Vec<JoinHandle<()>>>,
     lease: Arc<Mutex<StoreV2>>,
     runtime: Option<Runtime>,
-    /// The bundled engine this host supervises (builtin mode), stopped
-    /// after the machines join.
-    engine: Option<starling_dictation::engine::EngineManager>,
+    /// The host's live engine attachment (builtin or manual mode): the
+    /// switchable provider the jobs machine calls through and the
+    /// engine it supervises, stopped after the machines join. `None`
+    /// for `--engine none` and tests that inject their own provider.
+    engine: Option<Arc<crate::engine::EngineHost>>,
+    /// Set at shutdown so the settings watcher stops with the host's
+    /// threads (joined before the engine stops, never after it).
+    watch_stop: Arc<AtomicBool>,
     startup_reconciliation: ReconciliationReport,
     done: AtomicBool,
 }
@@ -160,10 +165,13 @@ impl HostHandle {
         &self.startup_reconciliation
     }
 
-    /// The bundled engine this host supervises, when it runs one
-    /// (builtin mode) — for status reporting and tests.
-    pub fn engine(&self) -> Option<&starling_dictation::engine::EngineManager> {
-        self.engine.as_ref()
+    /// The engine manager this host supervises right now, when it runs
+    /// one (builtin mode) — for status reporting and tests. A host that
+    /// follows the settings file keeps this current while it serves: a
+    /// model switch keeps the manager, a switch to manual mode takes it
+    /// away.
+    pub fn engine(&self) -> Option<starling_dictation::engine::EngineManager> {
+        self.engine.as_ref().and_then(|engine| engine.manager())
     }
 
     /// Graceful shutdown: no client is served past its `bye`, machines
@@ -180,6 +188,11 @@ impl HostHandle {
             return;
         }
         self.shared.shutdown.store(true, Ordering::SeqCst);
+        // The settings watcher stops with the host's threads below
+        // (joined before the runtime and the engine) — flag it now so it
+        // exits even while the connection drain above still waits, and
+        // so no engine change is applied to a host that is going away.
+        self.watch_stop.store(true, Ordering::SeqCst);
 
         // Say goodbye and close every live connection first: writers
         // drain their queues (Bye included) before the senders drop.
@@ -239,9 +252,10 @@ impl HostHandle {
         // name bound) finishes before ownership is released, so a
         // successor never finds this host's instances still there.
         platform::finish_pending_closes();
-        // The engine outlives every job the machines ran; stop it only
-        // now (a no-op for an engine another process owns — the attached
-        // case leaves that owner's sidecar running).
+        // The engine outlives every job the machines ran (the settings
+        // watcher is down with the threads above); stop it only now (a
+        // no-op for an engine another process owns — the attached case
+        // leaves that owner's sidecar running).
         if let Some(engine) = self.engine.take() {
             engine.shutdown();
         }
@@ -495,6 +509,8 @@ pub fn serve(config: HostConfig) -> Result<HostHandle, HostError> {
         live_connections: AtomicUsize::new(0),
     });
 
+    let watch_stop = Arc::new(AtomicBool::new(false));
+
     let mut threads = Vec::new();
     threads.push(spawn("starling-host-accept", {
         let shared = Arc::clone(&shared);
@@ -513,6 +529,19 @@ pub fn serve(config: HostConfig) -> Result<HostHandle, HostError> {
         let shared = Arc::clone(&shared);
         move || lease_heartbeat(lease, shared)
     }));
+    // The settings follower (#220): while the host serves, engine
+    // changes in the settings file apply to it. The watcher rides with
+    // the host's threads, so shutdown joins it before the runtime and
+    // the engine stop — it never applies a change to a host that is
+    // going away.
+    if let (Some(engine), Some(settings_path)) = (&engine, config.settings_path.as_ref()) {
+        threads.push(crate::engine::watch_settings(
+            Arc::clone(engine),
+            settings_path.clone(),
+            config.settings_poll,
+            Arc::clone(&watch_stop),
+        ));
+    }
 
     Ok(HostHandle {
         socket_path,
@@ -522,6 +551,7 @@ pub fn serve(config: HostConfig) -> Result<HostHandle, HostError> {
         lease,
         runtime: Some(runtime),
         engine,
+        watch_stop,
         startup_reconciliation,
         done: AtomicBool::new(false),
     })

@@ -23,7 +23,8 @@
 //! - [`server`] — the ownership ladder (lease → endpoint → runtime),
 //!   connection lifecycle, event fan-out, supervised shutdown.
 //! - [`engine`] — the supervised inference engine attached to the
-//!   runtime.
+//!   runtime, following the desktop settings file while the host
+//!   serves.
 //! - [`client`] — the client library the GPUI app will hold (the
 //!   Electron comparison app has since been removed from the tree).
 //!

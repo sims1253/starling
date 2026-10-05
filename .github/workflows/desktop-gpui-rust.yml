@@ -55,10 +55,15 @@ jobs:
   # lease's Windows lock are cfg(windows) — the ubuntu job never compiles
   # them. Run them for real on a native MSVC runner: the host's portable
   # suites (IPC conformance, limits, renderer-kill, ownership with the
-  # real binary, adapters, the engine attach) over the named pipe, and
-  # the storage-v2 lease/ownership tests over LockFileEx (#220 — their
-  # first Windows run found heap corruption, a pipe I/O deadlock and a
-  # lease any second host could break, none visible to `cargo check`).
+  # real binary, adapters) over the named pipe, and the storage-v2
+  # lease/ownership tests over LockFileEx (#220 — their first Windows
+  # run found heap corruption, a pipe I/O deadlock and a lease any
+  # second host could break, none visible to `cargo check`). The
+  # engine suite's fixture-backed tests (the real starling-serve
+  # sidecar) skip here: the C++ contract fixture is not built on this
+  # runner (deliberate for this PR — see the notice step); the
+  # job-over-the-transport path itself stays covered by the ipc
+  # suite's FakeProvider tests.
   windows-check:
     name: cargo test starling-runtime-host (windows)
     runs-on: windows-2025
@@ -67,6 +72,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
+      # Make the gap visible instead of hiding it in skipped test lines:
+      # the engine suite's fixture-backed tests need the C++ contract
+      # fixture, which this job does not build (a C++ toolchain lane is
+      # its own piece of work). Their own skip line still prints in the
+      # test output below (the fixture() helper).
+      - name: Note the engine fixture gap
+        run: 'echo "::notice::The fixture-backed engine tests (crates/host/tests/engine.rs) skip on this runner: the starling-serve contract fixture is not built here. The jobs-over-named-pipe path remains covered by the ipc suite FakeProvider tests."'
       # One command per step: PowerShell only reports the last native
       # command's exit code, so a combined script could mask a failure.
       - name: Test the host crate over the named pipe

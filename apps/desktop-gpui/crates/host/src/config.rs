@@ -45,6 +45,15 @@ pub struct HostConfig {
     pub first_frame_idle: std::time::Duration,
     /// Who may connect.
     pub peer_policy: Arc<dyn PeerPolicy>,
+    /// The settings file the host follows while it runs (see
+    /// [`crate::engine`]): when set, engine-setting changes apply to the
+    /// serving host without a restart. `None` — the default, tests and
+    /// `--engine none` — fixes the engine at [`HostConfig::engine`].
+    pub settings_path: Option<PathBuf>,
+    /// How often the settings watcher polls [`HostConfig::settings_path`]
+    /// ([`crate::engine::DEFAULT_SETTINGS_POLL`] in production; tests
+    /// tighten it).
+    pub settings_poll: Duration,
     /// Which transcription engine the host attaches to the runtime once
     /// it owns the root (see [`crate::engine`]). [`EngineChoice::None`]
     /// leaves `runtime.provider` as configured — tests inject doubles
@@ -73,6 +82,8 @@ impl HostConfig {
             outbound_capacity: crate::limits::DEFAULT_OUTBOUND_CAPACITY,
             first_frame_idle: Duration::from_secs(10),
             peer_policy: crate::auth::default_policy(),
+            settings_path: None,
+            settings_poll: crate::engine::DEFAULT_SETTINGS_POLL,
             engine: EngineChoice::None,
             runtime: RuntimeConfig::default(),
         }
@@ -131,6 +142,22 @@ impl HostConfig {
     /// Sets the engine the host attaches once it owns the root.
     pub fn with_engine(mut self, engine: EngineChoice) -> Self {
         self.engine = engine;
+        self
+    }
+
+    /// Sets the settings file the host follows while it runs (the
+    /// `--engine settings` path; the binary passes
+    /// `Settings::default_path()`). Without it the startup engine choice
+    /// is fixed — the posture every test that injects an
+    /// [`EngineChoice`] wants.
+    pub fn with_settings_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.settings_path = Some(path.into());
+        self
+    }
+
+    /// Overrides how often the settings watcher polls the file.
+    pub fn with_settings_poll(mut self, poll: Duration) -> Self {
+        self.settings_poll = poll;
         self
     }
 

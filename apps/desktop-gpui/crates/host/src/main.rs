@@ -63,6 +63,8 @@ OPTIONS:
     --engine <source>    settings: the transcription engine the desktop
                          settings choose (bundled engine supervised by
                          this host, or the manual server) — the default;
+                         the file is followed while the host runs, so
+                         engine changes apply without a restart;
                          none: no engine (jobs fail no_provider_configured)",
         platform::default_runtime_dir().display()
     );
@@ -86,6 +88,8 @@ OPTIONS:
     --engine <source>    settings: the transcription engine the desktop
                          settings choose (bundled engine supervised by
                          this host, or the manual server) — the default;
+                         the file is followed while the host runs, so
+                         engine changes apply without a restart;
                          none: no engine (jobs fail no_provider_configured)",
         platform::default_runtime_dir().display()
     );
@@ -165,44 +169,58 @@ fn main() {
     // The runtime dir rides into `production` so only the *final*
     // endpoint directory is created — applying an override afterwards
     // would leave the default directory behind as stray residue.
-    let engine = if engine_source == "none" {
-        EngineChoice::None
+    //
+    // `--engine settings` also *follows* the file while the host runs
+    // (the app applies engine changes immediately; the host must not
+    // freeze its startup choice): the watcher reads the same path the
+    // startup load read. An unresolvable settings path cannot change
+    // under us either — nothing to watch, the choice stays the startup
+    // one. `--engine none` watches nothing.
+    let (engine, settings_path) = if engine_source == "none" {
+        (EngineChoice::None, None)
     } else {
         let settings = starling_dictation::settings::Settings::load_or_default();
-        match EngineChoice::from_settings(&settings) {
+        let choice = match EngineChoice::from_settings(&settings) {
             Ok(engine) => engine,
             Err(err) => {
                 eprintln!("starling-runtime-host: {err}");
                 std::process::exit(1);
             }
-        }
+        };
+        (choice, starling_dictation::settings::Settings::default_path().ok())
     };
     let engine_label = engine.label();
 
     let mut host = match HostConfig::production(&root, runtime_dir) {
-        Ok(config) => match serve(config.with_engine(engine)) {
-            Ok(host) => host,
-            Err(starling_runtime_host::HostError::OwnerLive {
-                owner_id,
-                owner_pid,
-                socket_path,
-            }) => {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "status": "already-running",
-                        "socket": socket_path,
-                        "owner": owner_id,
-                        "ownerPid": owner_pid,
-                    })
-                );
-                std::process::exit(0);
+        Ok(config) => {
+            let config = match settings_path {
+                Some(path) => config.with_engine(engine).with_settings_path(path),
+                None => config.with_engine(engine),
+            };
+            match serve(config) {
+                Ok(host) => host,
+                Err(starling_runtime_host::HostError::OwnerLive {
+                    owner_id,
+                    owner_pid,
+                    socket_path,
+                }) => {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "status": "already-running",
+                            "socket": socket_path,
+                            "owner": owner_id,
+                            "ownerPid": owner_pid,
+                        })
+                    );
+                    std::process::exit(0);
+                }
+                Err(err) => {
+                    eprintln!("starling-runtime-host: {err}");
+                    std::process::exit(1);
+                }
             }
-            Err(err) => {
-                eprintln!("starling-runtime-host: {err}");
-                std::process::exit(1);
-            }
-        },
+        }
         Err(err) => {
             eprintln!("starling-runtime-host: {err}");
             std::process::exit(1);

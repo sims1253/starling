@@ -44,6 +44,7 @@
 use std::ffi::OsString;
 use std::io::{self, Read, Write};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
+use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
@@ -69,7 +70,9 @@ use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FlushFileBuffers, ReadFile, WriteFile, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED,
     OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
 };
-use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
+use windows_sys::Win32::System::IO::{
+    CancelIoEx, CancelSynchronousIo, GetOverlappedResult, OVERLAPPED,
+};
 use windows_sys::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
     NMPWAIT_NOWAIT, NMPWAIT_USE_DEFAULT_WAIT, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE,
@@ -835,8 +838,10 @@ impl Drop for OwnedHandle {
 /// process can never take each other's work and return early.
 static PENDING_LINGERS: AtomicUsize = AtomicUsize::new(0);
 
-/// Upper bound on [`finish_pending_closes`]: one linger's own bound plus
-/// slack for its disconnect and thread exit.
+/// Upper bound on [`finish_pending_closes`]: one linger's own bound
+/// (the [`DISCONNECT_LINGER`] wait, the disconnect, then the bounded
+/// post-disconnect flush join below) plus slack, so the host's shutdown
+/// always outlives its lingers — never the other way around.
 const LINGER_DRAIN: Duration = Duration::from_secs(4);
 
 /// Counts one linger in [`PENDING_LINGERS`] for exactly as long as it
@@ -859,21 +864,45 @@ impl Drop for LingerGuard {
 
 /// Waits (bounded by [`LINGER_DRAIN`]) until no lingering disconnect is
 /// in flight, so no handle of this process's pipe instances outlives the
-/// caller. Each linger ends within [`DISCONNECT_LINGER`] — the
-/// disconnect at its end also ends a parked flush. The host calls this
-/// on shutdown after its connections close and before it releases the
-/// lease.
+/// caller. Each linger ends within [`DISCONNECT_LINGER`] plus its
+/// bounded flush join (below) — well inside this bound. The host calls
+/// this on shutdown after its connections close and before it releases
+/// the lease; a linger that somehow outlives the bound is reported on
+/// stderr rather than passed over silently (its handles close at
+/// process exit, but the successor may then see the old pipe name
+/// still bound — the report is what makes that diagnosable).
 pub fn finish_pending_closes() {
     let deadline = Instant::now() + LINGER_DRAIN;
     while PENDING_LINGERS.load(Ordering::SeqCst) > 0 && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
     }
+    let pending = PENDING_LINGERS.load(Ordering::SeqCst);
+    if pending > 0 {
+        eprintln!(
+            "starling-runtime-host: {pending} pipe disconnect(s) still in flight after \
+             {LINGER_DRAIN:?}; closing the endpoint anyway (their handles close at \
+             process exit)"
+        );
+    }
 }
+
+/// How long a linger waits for its flush thread after the disconnect
+/// before cancelling the flush's synchronous I/O. The disconnect
+/// ordinarily completes a flush parked against a non-reading client,
+/// but that is not a guarantee the host's ownership hand-off may lean
+/// on: this bound keeps the linger (and its pipe handles) inside
+/// [`finish_pending_closes`]'s window even when it does not.
+const FLUSH_CANCEL_GRACE: Duration = Duration::from_millis(250);
 
 /// The server side of a close, off the caller's thread: flush (returns
 /// once the client has read everything, or the pipe broke), bounded by
-/// [`DISCONNECT_LINGER`], then the instance-wide disconnect — which also
-/// ends a flush still parked against a client that stopped reading.
+/// [`DISCONNECT_LINGER`], then the instance-wide disconnect — which
+/// also ends a flush still parked against a client that stopped
+/// reading. The flush join afterwards is bounded too
+/// ([`FLUSH_CANCEL_GRACE`], then `CancelSynchronousIo`): a linger must
+/// never outlive [`finish_pending_closes`], or the host would release
+/// its lease while this process's handles still keep the old pipe name
+/// bound.
 fn schedule_disconnect(handle: HANDLE) -> io::Result<()> {
     let flusher = OwnedHandle::duplicate(handle)?;
     let disconnector = OwnedHandle::duplicate(handle)?;
@@ -906,8 +935,31 @@ fn schedule_disconnect(handle: HANDLE) -> io::Result<()> {
             }
             drop(disconnector);
             if let Ok(flush) = flush {
-                // Bounded by the disconnect above, which completes a
-                // flush parked against a non-reading client.
+                // Usually the disconnect above completes a flush parked
+                // against a non-reading client — but not guaranteed, and
+                // an unbounded join here is exactly how a linger (and
+                // its handles) could outlive the host's ownership
+                // hand-off. After a short grace, cancel the flush's
+                // synchronous I/O, then join: `CancelSynchronousIo`
+                // interrupts the blocking `FlushFileBuffers` on that
+                // thread (it does not close or invalidate the handle
+                // the thread flushes), so the thread unwinds and the
+                // join is prompt.
+                let deadline = Instant::now() + FLUSH_CANCEL_GRACE;
+                while !flush.is_finished() && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                if !flush.is_finished() {
+                    // SAFETY: the handle is the flush thread's own —
+                    // std's JoinHandle implements AsRawHandle on
+                    // Windows — and identifies a thread, not memory in
+                    // this process.
+                    unsafe {
+                        CancelSynchronousIo(flush.as_raw_handle());
+                    }
+                }
+                // Bounded by the cancel above (or the thread having
+                // finished on its own before it landed).
                 let _ = flush.join();
             }
         })
