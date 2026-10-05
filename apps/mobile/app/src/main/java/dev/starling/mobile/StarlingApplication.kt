@@ -57,7 +57,7 @@ class StarlingApplication : Application() {
         modelLifetime = ModelLifetime(
             engine = object : ModelLifetime.Engine {
                 override fun activeModelName() = onDeviceEngine.activeModelName()
-                override fun prepare() = onDeviceEngine.prepare()
+                override fun preload(allowed: () -> Boolean) = onDeviceEngine.preload(allowed)
                 override fun releaseIfIdle(generation: Long) = onDeviceEngine.releaseIfIdle(generation)
             },
             worker = preloadExecutor,

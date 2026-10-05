@@ -110,8 +110,12 @@ class OnDeviceEngine(
     // a preload that holds the lock through a multi-second load.
     private val liveSessions = AtomicInteger()
 
-    // Guarded by [lock]: a memory-pressure release that waits for the live
-    // sessions to end.
+    // Guarded by [lock]: live sessions whose prepare() succeeded and that
+    // therefore use the loaded model until they end, and a release (memory
+    // pressure, model switch) that waits for them. A session that started
+    // but has not loaded yet pins nothing: a release or a model switch then
+    // goes ahead, and its prepare() loads the model it needs.
+    private var pinnedSessions = 0
     private var releasePending = false
 
     // Bumped at the start and the end of every use, so an idle release armed
@@ -178,7 +182,7 @@ class OnDeviceEngine(
 
     /** Frees the resident model now, or when the last live session ends. Caller holds [lock]. */
     private fun releaseLocked() {
-        if (liveSessions.get() > 0) releasePending = true else unload()
+        if (pinnedSessions > 0) releasePending = true else unload()
     }
 
     private fun installedFiles(): List<File> =
@@ -482,9 +486,16 @@ class OnDeviceEngine(
         // The user picked another model since this one was loaded. A live
         // session keeps the loaded one: a mid-recording reload of hundreds
         // of MB would stall the stream (the switch follows the session).
-        if (handle != 0L && loadedFile != modelFile && liveSessions.get() == 0) unload()
+        if (handle != 0L && loadedFile != modelFile && pinnedSessions == 0) unload()
         if (handle != 0L) return null
-        val failed = loadModelLocked(modelFile)
+        val failed = try {
+            loadModelLocked(modelFile)
+        } catch (t: Throwable) {
+            // A missing or broken native library throws; the state must not
+            // stay "loading", and the failure counts for the backoff.
+            observer.loadFailed(modelFile.name, t.message ?: t::class.java.simpleName)
+            throw t
+        }
         if (failed != null) observer.loadFailed(modelFile.name, failed)
         return failed
     }
@@ -557,11 +568,25 @@ class OnDeviceEngine(
     }
 
     /**
-     * Loads the model ahead of a live session, or ahead of a recording the
-     * user is about to start (the [ModelLifetime] preload); null when ready.
-     * Also counts as a use, so it re-arms the idle release. Blocking.
+     * Loads the model for a live session that just started and pins it to
+     * the session (see [pinnedSessions]); null when ready. Blocking.
      */
-    override fun prepare(): String? = synchronized(lock) { usingLocked { ensureLoadedLocked() } }
+    override fun prepare(): String? = synchronized(lock) {
+        usingLocked { ensureLoadedLocked().also { if (it == null) pinnedSessions++ } }
+    }
+
+    /**
+     * The [ModelLifetime] preload: loads the active model ahead of a
+     * recording the user is about to start, or touches the resident one
+     * (a use, so the idle release re-arms). [allowed] is checked once the
+     * engine lock is held, so speculative work that queued behind a request
+     * which then hit a fatal driver failure never runs. Pins nothing; null
+     * when ready or skipped. Blocking.
+     */
+    fun preload(allowed: () -> Boolean): String? = synchronized(lock) {
+        if (!allowed()) return null
+        usingLocked { ensureLoadedLocked() }
+    }
 
     /** One live-stream window of 16 kHz mono samples. Blocking. */
     override fun transcribeWindow(samples: FloatArray): OnDeviceStreamSession.WindowResult = synchronized(lock) {
@@ -600,7 +625,12 @@ class OnDeviceEngine(
      * Returns whether the model was freed. Blocking.
      */
     fun releaseIfIdle(generation: Long): Boolean = synchronized(lock) {
-        if (handle == 0L || useGeneration.get() != generation || liveSessions.get() > 0) return false
+        // A session starting right after this check (it never takes the lock)
+        // finds the model gone and reloads it in its prepare(); its audio is
+        // being saved meanwhile, so the race costs a reload, never audio.
+        if (handle == 0L || useGeneration.get() != generation || pinnedSessions > 0 || liveSessions.get() > 0) {
+            return false
+        }
         unload()
         true
     }
@@ -611,16 +641,15 @@ class OnDeviceEngine(
         useGeneration.incrementAndGet()
     }
 
-    override fun liveSessionEnded() {
-        val remaining = liveSessions.updateAndGet { maxOf(0, it - 1) }
-        if (remaining > 0) return
+    override fun liveSessionEnded(prepared: Boolean) {
+        liveSessions.updateAndGet { maxOf(0, it - 1) }
         synchronized(lock) {
-            // A session started since the decrement keeps the model.
-            if (liveSessions.get() > 0) return
-            if (releasePending) {
+            if (prepared) pinnedSessions = maxOf(0, pinnedSessions - 1)
+            if (pinnedSessions == 0 && releasePending) {
                 releasePending = false
                 unload()
             }
+            // Reported as idle only when no session is live (see reportIdleLocked).
             reportIdleLocked()
         }
     }

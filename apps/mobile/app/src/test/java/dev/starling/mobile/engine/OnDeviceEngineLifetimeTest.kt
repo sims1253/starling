@@ -43,7 +43,7 @@ class OnDeviceEngineLifetimeTest {
 
         release.countDown()
         preload.join(5_000)
-        engine.liveSessionEnded()
+        engine.liveSessionEnded(prepared = false)
     }
 
     @Test
@@ -57,6 +57,29 @@ class OnDeviceEngineLifetimeTest {
         }
         val reason = engine.prepare()
         assertEquals(listOf("parakeet.gguf" to reason), failures)
+    }
+
+    @Test
+    fun aDisallowedPreloadNeverTouchesTheEngine() {
+        var gateCalls = 0
+        val engine = OnDeviceEngine(modelDir(), memoryGate = { gateCalls++; "refused" }, nativeSupport = { null })
+        assertEquals(null, engine.preload { false })
+        assertEquals(0, gateCalls)
+        engine.preload { true }
+        assertEquals(1, gateCalls)
+    }
+
+    @Test
+    fun aThrowingLoadIsReportedAsAFailedLoad() {
+        val failures = mutableListOf<String>()
+        val engine = OnDeviceEngine(modelDir(), memoryGate = { throw IllegalStateException("gate broke") }, nativeSupport = { null })
+        engine.observer = object : OnDeviceEngine.Observer {
+            override fun loadFailed(model: String?, reason: String) {
+                failures += reason
+            }
+        }
+        assertTrue(runCatching { engine.preload { true } }.isFailure)
+        assertEquals(listOf("gate broke"), failures)
     }
 
     @Test

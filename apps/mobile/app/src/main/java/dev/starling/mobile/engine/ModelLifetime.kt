@@ -48,7 +48,9 @@ class ModelLifetime(
     /** The engine surface this policy drives; [OnDeviceEngine] in the app. */
     interface Engine {
         fun activeModelName(): String?
-        fun prepare(): String?
+
+        /** [OnDeviceEngine.preload]: runs only if [allowed] still holds under the engine lock. */
+        fun preload(allowed: () -> Boolean): String?
         fun releaseIfIdle(generation: Long): Boolean
     }
 
@@ -138,7 +140,7 @@ class ModelLifetime(
             preloadInFlight = true
         }
         try {
-            worker.execute(::runPreload)
+            worker.execute { runPreload(model) }
         } catch (t: Throwable) {
             // A rejected task (executor shut down) must not wedge preloads.
             synchronized(lock) { preloadInFlight = false }
@@ -147,16 +149,18 @@ class ModelLifetime(
         return PreloadResult.QUEUED
     }
 
-    private fun runPreload() {
+    private fun runPreload(model: String) {
         try {
             // Blocking: waits for the engine lock (an in-flight recording or
             // transcription goes first) and then loads, or merely touches
             // the resident model. The outcome reaches [state] through the
-            // observer callbacks below.
-            engine.prepare()
-        } catch (_: Throwable) {
-            // prepare() reports failures as a reason; a throw (a broken
-            // native library) must not leave preloads disabled forever.
+            // observer callbacks below. A driver failure seen while this
+            // waited for the lock cancels it there.
+            engine.preload { synchronized(lock) { state !is State.DriverFailed } }
+        } catch (t: Throwable) {
+            // A throw (a broken native library) counts as a failed load, so
+            // the state leaves Loading and the backoff applies.
+            loadFailed(model, t.message ?: t::class.java.simpleName)
         } finally {
             synchronized(lock) { preloadInFlight = false }
         }
@@ -185,7 +189,7 @@ class ModelLifetime(
             failedAtMillis = clock()
             when {
                 current is State.DriverFailed -> current
-                GpuFailure.matches(reason) -> State.DriverFailed(reason)
+                isDriverFailure(reason) -> State.DriverFailed(reason)
                 else -> State.Failed(model, reason)
             }
         }
@@ -200,7 +204,7 @@ class ModelLifetime(
     }
 
     override fun engineFailed(error: String) {
-        if (!GpuFailure.matches(error)) return
+        if (!isDriverFailure(error)) return
         update { current -> if (current is State.DriverFailed) current else State.DriverFailed(error) }
     }
 
@@ -235,6 +239,22 @@ class ModelLifetime(
     }
 
     companion object {
+        /**
+         * A GPU driver failure (#325) that must stop speculative work. The
+         * native allocation error mentions a degraded driver too, but an
+         * allocation that merely did not fit is recoverable (another model,
+         * or more free memory), and the native engine does not mark it as a
+         * wedge either; only a lost device there is fatal.
+         */
+        internal fun isDriverFailure(reason: String): Boolean {
+            if (!GpuFailure.matches(reason)) return false
+            if (!reason.contains(ALLOCATION_FAILURE)) return true
+            return reason.contains("VkResult -4") || reason.contains("device lost", ignoreCase = true)
+        }
+
+        /** The wording of the native vkAllocateMemory failure (cpp/fast/vk_runtime.cpp). */
+        private const val ALLOCATION_FAILURE = "the model may not fit"
+
         /**
          * How long an idle model stays resident. Long enough to keep it warm
          * across a quick app or keyboard switch, short enough that a phone

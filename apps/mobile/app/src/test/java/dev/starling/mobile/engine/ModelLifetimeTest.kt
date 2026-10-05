@@ -19,7 +19,8 @@ class ModelLifetimeTest {
         var onPrepare: () -> String? = { null }
 
         override fun activeModelName() = model
-        override fun prepare(): String? {
+        override fun preload(allowed: () -> Boolean): String? {
+            if (!allowed()) return null
             prepares++
             return onPrepare()
         }
@@ -184,11 +185,39 @@ class ModelLifetimeTest {
     }
 
     @Test
-    fun aThrowingPrepareDoesNotDisablePreloads() {
-        engine.onPrepare = { throw UnsatisfiedLinkError("no libstarling_jni") }
+    fun aThrowingLoadIsAFailureWithBackoffNotAnEndlessLoading() {
+        engine.onPrepare = {
+            lifetime.loading("parakeet.gguf")
+            throw UnsatisfiedLinkError("no libstarling_jni")
+        }
         lifetime.preload()
         runQueued()
+        assertEquals(ModelLifetime.State.Failed("parakeet.gguf", "no libstarling_jni"), lifetime.state())
+        assertEquals(ModelLifetime.PreloadResult.RECENTLY_FAILED, lifetime.preload())
+        now += 300_000L
         assertEquals(ModelLifetime.PreloadResult.QUEUED, lifetime.preload())
+    }
+
+    @Test
+    fun aPreloadQueuedBeforeADriverFailureNeverRuns() {
+        assertEquals(ModelLifetime.PreloadResult.QUEUED, lifetime.preload())
+        // A recording hits the wedge while the preload waits for the engine.
+        lifetime.engineFailed("vkWaitForFences failed (VkResult -4) (device lost: the GPU driver has failed)")
+        runQueued()
+        assertEquals(0, engine.prepares)
+    }
+
+    @Test
+    fun aModelThatDoesNotFitTheGpuIsNotADriverFailure() {
+        val oom = "fast engine unavailable: vkAllocateMemory failed (VkResult -2) (900 MiB) — the model may not fit, " +
+            "or the GPU driver is degraded; a device restart clears the latter (do not keep retrying)"
+        lifetime.loadFailed("big.gguf", oom)
+        assertEquals(ModelLifetime.State.Failed("big.gguf", oom), lifetime.state())
+        engine.model = "small.gguf"
+        assertEquals(ModelLifetime.PreloadResult.QUEUED, lifetime.preload())
+
+        val lost = oom.replace("VkResult -2", "VkResult -4")
+        assertTrue(ModelLifetime.isDriverFailure(lost))
     }
 
     @Test

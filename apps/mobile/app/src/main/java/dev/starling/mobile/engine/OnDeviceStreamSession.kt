@@ -43,15 +43,22 @@ class OnDeviceStreamSession(
 ) : StreamSession {
     /** The engine surface the session needs; [OnDeviceEngine] in production. */
     interface LiveEngine {
-        /** Loads the model if needed; null when ready, else the reason it cannot run. */
+        /**
+         * Loads the model if needed; null when ready, else the reason it
+         * cannot run. A successful prepare pins the loaded model to this
+         * session until [liveSessionEnded] with `prepared = true`.
+         */
         fun prepare(): String?
 
         /** Transcribes one window of 16 kHz mono samples. */
         fun transcribeWindow(samples: FloatArray): WindowResult
 
-        /** Brackets a session so the engine never unloads under a live recording. */
+        /**
+         * Brackets a session so the engine never unloads the model a live
+         * recording uses; [prepared] tells whether [prepare] succeeded.
+         */
         fun liveSessionStarted() = Unit
-        fun liveSessionEnded() = Unit
+        fun liveSessionEnded(prepared: Boolean) = Unit
     }
 
     sealed interface WindowResult {
@@ -101,6 +108,9 @@ class OnDeviceStreamSession(
 
     private val worker = Thread(::run, "starling-on-device-stream").apply { isDaemon = true }
 
+    // Worker thread only: whether prepare() succeeded and pinned the model.
+    private var prepared = false
+
     fun start(): OnDeviceStreamSession = apply {
         // Counted before the worker exists, so a memory-pressure release can
         // never slip in between start() and the worker's first instruction.
@@ -108,7 +118,7 @@ class OnDeviceStreamSession(
         try {
             worker.start()
         } catch (t: Throwable) {
-            engine.liveSessionEnded()
+            engine.liveSessionEnded(prepared = false)
             throw t
         }
     }
@@ -190,7 +200,7 @@ class OnDeviceStreamSession(
                 runCatching { openBacklog?.close() }
                 openBacklog = null
             }
-            engine.liveSessionEnded()
+            engine.liveSessionEnded(prepared)
             emitInterruption()
         }
     }
@@ -201,6 +211,7 @@ class OnDeviceStreamSession(
             lock.withLock { failLocked(loadError, bufferLimitReached = false) }
             return
         }
+        prepared = true
         // Closed or already failed (e.g. the buffer cap) while the model loaded.
         if (lock.withLock { closed || failure != null }) return
         events(StreamEvent.Live)
