@@ -28,10 +28,12 @@ int64_t audio_token_count(int64_t n_samples, const Config& c) {
     return full * per_full + r;
 }
 
-// Exact tensor-shape check (shared lib/loader_kit.hpp shape_eq, QWEN3 label).
-// GGUF ne[] is the reversed checkpoint shape: a torch Linear weight [OC, IC]
-// reads back ne0 = IC (the mul_mat contraction dim), ne1 = OC.
-#define SHAPE(name, ...) do { if (!lib::shape_eq(m, "QWEN3", name, {__VA_ARGS__}, err)) return false; } while (0)
+// Exact tensor-shape checks (shared lib/loader_kit.hpp shape_eq, QWEN3
+// label) as plain lambdas rather than macros: compiler diagnostics and
+// debuggers point at the real call site, and there is no #define/#undef
+// lifecycle to keep in order. GGUF ne[] is the reversed checkpoint shape:
+// a torch Linear weight [OC, IC] reads back ne0 = IC (the mul_mat
+// contraction dim), ne1 = OC.
 
 bool Qwen3Model::load(const char* path, std::string& err) {
     if (!loader.load(path)) {
@@ -40,6 +42,15 @@ bool Qwen3Model::load(const char* path, std::string& err) {
     }
     auto& c = config;
     const auto& m = loader;
+    // Top-level tensors take a literal name; per-layer tensors take the
+    // "<prefix>.<tail>" name built at the call site.
+    const auto shape = [&](const char* name, std::initializer_list<int64_t> want) {
+        return lib::shape_eq(m, "QWEN3", name, want, err);
+    };
+    const auto layer_shape = [&](const std::string& name,
+                                 std::initializer_list<int64_t> want) {
+        return lib::shape_eq(m, "QWEN3", name.c_str(), want, err);
+    };
 #define U(field, key) do { if (!lib::u32(m, "qwen3." key, field, field, err)) return false; } while (0)
 #define F(field, key) field = f32(m, "qwen3." key, field)
     // Frontend (torch.stft mel: 128 bins, n_fft 400, hop 160).
@@ -186,56 +197,74 @@ bool Qwen3Model::load(const char* path, std::string& err) {
     // change or a metadata/tensor mismatch fails loudly at load. All ne[] are
     // ggml order (reversed checkpoint shape: ne0 = Linear in-features).
     // Frontend constants ([n_mels, 1+n_fft/2] filterbank, [win] window).
-    SHAPE("audio.mel_filters", c.encoder.n_mel, (int64_t) 1 + c.frontend.n_fft / 2);
-    SHAPE("audio.mel_window", (int64_t) c.frontend.win_length);
+    if (!shape("audio.mel_filters", {c.encoder.n_mel, (int64_t) 1 + c.frontend.n_fft / 2}))
+        return false;
+    if (!shape("audio.mel_window", {(int64_t) c.frontend.win_length})) return false;
     // Conv stack: torch [480, ic, 3, 3] -> ne [3, 3, ic, 480]; three stride-2
     // k3 convs reduce the 128-bin mel axis to 16 (checked via enc.out below).
-    SHAPE("enc.conv1.weight", 3, 3, 1, c.encoder.downsample_hidden);
-    SHAPE("enc.conv1.bias", c.encoder.downsample_hidden);
-    SHAPE("enc.conv2.weight", 3, 3, c.encoder.downsample_hidden, c.encoder.downsample_hidden);
-    SHAPE("enc.conv2.bias", c.encoder.downsample_hidden);
-    SHAPE("enc.conv3.weight", 3, 3, c.encoder.downsample_hidden, c.encoder.downsample_hidden);
-    SHAPE("enc.conv3.bias", c.encoder.downsample_hidden);
-    // conv_out: bias-free Linear(downsample_hidden * n_mel/8 -> hidden).
-    SHAPE("enc.out.weight",
-          (int64_t) c.encoder.downsample_hidden * (c.encoder.n_mel / 8),
-          c.encoder.hidden);
-    SHAPE("enc.pos_embed", c.encoder.hidden, c.encoder.max_pos_emb);
-    SHAPE("enc.ln_post.weight", c.encoder.hidden);
-    SHAPE("enc.ln_post.bias", c.encoder.hidden);
+    if (!shape("enc.conv1.weight", {3, 3, 1, c.encoder.downsample_hidden})) return false;
+    if (!shape("enc.conv1.bias", {c.encoder.downsample_hidden})) return false;
+    if (!shape("enc.conv2.weight",
+               {3, 3, c.encoder.downsample_hidden, c.encoder.downsample_hidden}))
+        return false;
+    if (!shape("enc.conv2.bias", {c.encoder.downsample_hidden})) return false;
+    if (!shape("enc.conv3.weight",
+               {3, 3, c.encoder.downsample_hidden, c.encoder.downsample_hidden}))
+        return false;
+    if (!shape("enc.conv3.bias", {c.encoder.downsample_hidden})) return false;
+    // conv_out: bias-free Linear(downsample_hidden * n_mel/8 -> hidden). The
+    // mel axis is downsampled by the conv stack's fixed factor 8 (three
+    // stride-2 convs, encoder.cpp's ec.n_mel / 8); guard divisibility so a
+    // future frontend with a non-multiple n_mel fails loudly here instead of
+    // passing a truncated-division shape that mismatches the runtime graph.
+    if (c.encoder.n_mel % 8 != 0) {
+        err = "QWEN3 GGUF enc.n_mel must be divisible by the conv downsample factor (8)";
+        return false;
+    }
+    if (!shape("enc.out.weight",
+               {(int64_t) c.encoder.downsample_hidden * (c.encoder.n_mel / 8),
+                c.encoder.hidden}))
+        return false;
+    if (!shape("enc.pos_embed", {c.encoder.hidden, c.encoder.max_pos_emb})) return false;
+    if (!shape("enc.ln_post.weight", {c.encoder.hidden})) return false;
+    if (!shape("enc.ln_post.bias", {c.encoder.hidden})) return false;
     // Projector: Linear(hidden -> hidden) + GELU + Linear(hidden -> output).
-    SHAPE("proj.linear_1.weight", c.projector.hidden, c.projector.hidden);
-    SHAPE("proj.linear_1.bias", c.projector.hidden);
-    SHAPE("proj.linear_2.weight", c.projector.hidden, c.projector.output_dim);
-    SHAPE("proj.linear_2.bias", c.projector.output_dim);
-    SHAPE("llm.embed.weight", c.llm.hidden, c.llm.vocab);
-    SHAPE("llm.final_norm.weight", c.llm.hidden);
+    if (!shape("proj.linear_1.weight", {c.projector.hidden, c.projector.hidden}))
+        return false;
+    if (!shape("proj.linear_1.bias", {c.projector.hidden})) return false;
+    if (!shape("proj.linear_2.weight", {c.projector.hidden, c.projector.output_dim}))
+        return false;
+    if (!shape("proj.linear_2.bias", {c.projector.output_dim})) return false;
+    if (!shape("llm.embed.weight", {c.llm.hidden, c.llm.vocab})) return false;
+    if (!shape("llm.final_norm.weight", {c.llm.hidden})) return false;
     // Encoder layers: 16 tensors each (biased MHA + two biased LayerNorms +
     // biased FFN); MHA projects hidden -> hidden (kv heads == heads).
     for (uint32_t i = 0; i < c.encoder.n_layers; ++i) {
         char n[128];
         std::snprintf(n, sizeof n, "enc.blk.%u.", i);
         const std::string pre = n;
-#define ESHAPE(tail, ...) do { \
-            if (!lib::shape_eq(m, "QWEN3", (pre + tail).c_str(), {__VA_ARGS__}, err)) return false; \
-        } while (0)
-        ESHAPE("attn_norm.weight", c.encoder.hidden);
-        ESHAPE("attn_norm.bias", c.encoder.hidden);
-        ESHAPE("attn_q.weight", c.encoder.hidden, c.encoder.hidden);
-        ESHAPE("attn_q.bias", c.encoder.hidden);
-        ESHAPE("attn_k.weight", c.encoder.hidden, c.encoder.hidden);
-        ESHAPE("attn_k.bias", c.encoder.hidden);
-        ESHAPE("attn_v.weight", c.encoder.hidden, c.encoder.hidden);
-        ESHAPE("attn_v.bias", c.encoder.hidden);
-        ESHAPE("attn_o.weight", c.encoder.hidden, c.encoder.hidden);
-        ESHAPE("attn_o.bias", c.encoder.hidden);
-        ESHAPE("ffn_norm.weight", c.encoder.hidden);
-        ESHAPE("ffn_norm.bias", c.encoder.hidden);
-        ESHAPE("ff_up.weight", c.encoder.hidden, c.encoder.ffn_dim);
-        ESHAPE("ff_up.bias", c.encoder.ffn_dim);
-        ESHAPE("ff_down.weight", c.encoder.ffn_dim, c.encoder.hidden);
-        ESHAPE("ff_down.bias", c.encoder.hidden);
-#undef ESHAPE
+        if (!layer_shape(pre + "attn_norm.weight", {c.encoder.hidden})) return false;
+        if (!layer_shape(pre + "attn_norm.bias", {c.encoder.hidden})) return false;
+        if (!layer_shape(pre + "attn_q.weight", {c.encoder.hidden, c.encoder.hidden}))
+            return false;
+        if (!layer_shape(pre + "attn_q.bias", {c.encoder.hidden})) return false;
+        if (!layer_shape(pre + "attn_k.weight", {c.encoder.hidden, c.encoder.hidden}))
+            return false;
+        if (!layer_shape(pre + "attn_k.bias", {c.encoder.hidden})) return false;
+        if (!layer_shape(pre + "attn_v.weight", {c.encoder.hidden, c.encoder.hidden}))
+            return false;
+        if (!layer_shape(pre + "attn_v.bias", {c.encoder.hidden})) return false;
+        if (!layer_shape(pre + "attn_o.weight", {c.encoder.hidden, c.encoder.hidden}))
+            return false;
+        if (!layer_shape(pre + "attn_o.bias", {c.encoder.hidden})) return false;
+        if (!layer_shape(pre + "ffn_norm.weight", {c.encoder.hidden})) return false;
+        if (!layer_shape(pre + "ffn_norm.bias", {c.encoder.hidden})) return false;
+        if (!layer_shape(pre + "ff_up.weight", {c.encoder.hidden, c.encoder.ffn_dim}))
+            return false;
+        if (!layer_shape(pre + "ff_up.bias", {c.encoder.ffn_dim})) return false;
+        if (!layer_shape(pre + "ff_down.weight", {c.encoder.ffn_dim, c.encoder.hidden}))
+            return false;
+        if (!layer_shape(pre + "ff_down.bias", {c.encoder.hidden})) return false;
     }
     // LLM layers: bias-free Qwen3 trunk with per-head q/k norm (11 each).
     // q/k/v project hidden -> {QW, KVW, KVW}; o projects the concatenated
@@ -246,23 +275,21 @@ bool Qwen3Model::load(const char* path, std::string& err) {
         char n[128];
         std::snprintf(n, sizeof n, "llm.blk.%u.", i);
         const std::string pre = n;
-#define LSHAPE(tail, ...) do { \
-            if (!lib::shape_eq(m, "QWEN3", (pre + tail).c_str(), {__VA_ARGS__}, err)) return false; \
-        } while (0)
-        LSHAPE("attn_norm.weight", c.llm.hidden);
-        LSHAPE("attn.q.weight", c.llm.hidden, QW);
-        LSHAPE("attn.k.weight", c.llm.hidden, KVW);
-        LSHAPE("attn.v.weight", c.llm.hidden, KVW);
-        LSHAPE("attn.o.weight", QW, c.llm.hidden);
-        LSHAPE("attn.q_norm.weight", c.llm.head_dim);
-        LSHAPE("attn.k_norm.weight", c.llm.head_dim);
-        LSHAPE("ffn_norm.weight", c.llm.hidden);
-        LSHAPE("ffn.gate.weight", c.llm.hidden, c.llm.intermediate);
-        LSHAPE("ffn.up.weight", c.llm.hidden, c.llm.intermediate);
-        LSHAPE("ffn.down.weight", c.llm.intermediate, c.llm.hidden);
-#undef LSHAPE
+        if (!layer_shape(pre + "attn_norm.weight", {c.llm.hidden})) return false;
+        if (!layer_shape(pre + "attn.q.weight", {c.llm.hidden, QW})) return false;
+        if (!layer_shape(pre + "attn.k.weight", {c.llm.hidden, KVW})) return false;
+        if (!layer_shape(pre + "attn.v.weight", {c.llm.hidden, KVW})) return false;
+        if (!layer_shape(pre + "attn.o.weight", {QW, c.llm.hidden})) return false;
+        if (!layer_shape(pre + "attn.q_norm.weight", {c.llm.head_dim})) return false;
+        if (!layer_shape(pre + "attn.k_norm.weight", {c.llm.head_dim})) return false;
+        if (!layer_shape(pre + "ffn_norm.weight", {c.llm.hidden})) return false;
+        if (!layer_shape(pre + "ffn.gate.weight", {c.llm.hidden, c.llm.intermediate}))
+            return false;
+        if (!layer_shape(pre + "ffn.up.weight", {c.llm.hidden, c.llm.intermediate}))
+            return false;
+        if (!layer_shape(pre + "ffn.down.weight", {c.llm.intermediate, c.llm.hidden}))
+            return false;
     }
-#undef SHAPE
     return true;
 }
 } // namespace starling::ggml::qwen3

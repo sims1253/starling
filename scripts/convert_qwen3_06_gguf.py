@@ -231,6 +231,35 @@ def main() -> None:
     if dims["llm.vocab_size"] != VOCAB_SIZE:
         _fail(f"config.json vocab_size {dims['llm.vocab_size']} != shared {VOCAB_SIZE}")
 
+    # Cross-check the baked special-token ids and the shared prompt layout
+    # against the snapshot's own configs (same drift doctrine as the vocab
+    # check above): a future revision that renumbers its special tokens must
+    # fail conversion instead of silently baking stale ids. Absent keys fall
+    # through to the baked value; a present-but-different value fails.
+    top_cfg = json.loads((args.snapshot / "config.json").read_text())
+    try:
+        gen_cfg = json.loads((args.snapshot / "generation_config.json").read_text())
+    except FileNotFoundError:
+        gen_cfg = {}
+    tokenizer_json = json.loads((args.snapshot / "tokenizer.json").read_text())
+    added_ids = {item["id"] for item in tokenizer_json.get("added_tokens", [])}
+    if int(top_cfg.get("audio_token_id", 151676)) != 151676:
+        _fail(f"config.json audio_token_id {top_cfg['audio_token_id']} != baked 151676")
+    for key, want in (("eos_token_id", 151645), ("pad_token_id", 151645)):
+        got = gen_cfg.get(key, top_cfg.get(key, want))
+        if isinstance(got, (list, tuple)):  # some checkpoints list several ids
+            got = got[0] if got else want
+        if int(got) != want:
+            _fail(f"snapshot {key} {got} != baked {want}")
+    baked_ids = [151676, 151645, *PROMPT_PREFIX, *PROMPT_SUFFIX]
+    valid_ids = set(tok_vocab.values()) | added_ids
+    missing = sorted(i for i in baked_ids if i not in valid_ids)
+    if missing:
+        _fail(
+            f"prompt/special token ids {missing} are absent from the snapshot's "
+            "own tokenizer — the shared 1.7B prompt layout cannot be reused"
+        )
+
     args.output.parent.mkdir(parents=True, exist_ok=True)
     w = gguf.GGUFWriter(args.output, "qwen3", use_temp_file=True)
     add_metadata(w, dims)

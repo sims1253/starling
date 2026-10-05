@@ -9,10 +9,11 @@ loading differs (the 0.6B hub id). The 0.6B's 2048-wide attention over a
 ``head_dim`` / head counts from the model config (never
 ``hidden_size // num_heads``).
 
-Public API (inherited unchanged)
+Public API (inherited unless noted)
 --------------------------------
 ``MegaPipeline(model, processor, *, max_cache_len=4096, use_fused_llm=True, ...)``
-``MegaPipeline.from_pretrained(...)``
+``MegaPipeline.from_pretrained(...)`` (overridden here to point at the 0.6B
+loader; accepts an optional ``model_id`` override and a nullable ``dtype``)
 ``MegaPipeline.transcribe(input_features, input_ids, mask=None, max_new_tokens=200) -> (text, ids)``
 """
 

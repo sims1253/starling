@@ -106,13 +106,9 @@ def main() -> int:
                 chunk_dur = (end - start) / SAMPLE_RATE
                 budget = decode_budget(chunk_dur)
                 inputs = build_inputs(processor, chunk_wav, sr=SAMPLE_RATE)
-                text, ids = pipe.transcribe(
-                    inputs["input_features"],
-                    inputs["input_ids"],
-                    inputs.get("input_features_mask"),
-                    max_new_tokens=budget,
-                )
-                ids = ids[0].cpu().tolist()
+                # Guard BEFORE the decode: an overflowing budget would be
+                # consumed by pipe.transcribe (it does not clamp
+                # max_new_tokens internally) and corrupt the capture.
                 prompt_len = int(inputs["input_ids"].shape[1])
                 if prompt_len + budget > MAX_CACHE_LEN + 1:
                     raise SystemExit(
@@ -120,6 +116,13 @@ def main() -> int:
                         f"(prompt {prompt_len} + budget {budget} > "
                         f"max_cache_len {MAX_CACHE_LEN} + 1)"
                     )
+                text, ids = pipe.transcribe(
+                    inputs["input_features"],
+                    inputs["input_ids"],
+                    inputs.get("input_features_mask"),
+                    max_new_tokens=budget,
+                )
+                ids = ids[0].cpu().tolist()
                 chunks.append(
                     {
                         "start_s": start / SAMPLE_RATE,

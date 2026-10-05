@@ -64,6 +64,14 @@ class MegaPipeline:
         # so existing callers are unchanged.
         self.device = str(getattr(model, "device", "cuda"))
         self.audio_token_id = int(getattr(model.config, "audio_token_id", AUDIO_TOKEN_ID))
+        # Greedy stop token: prefer the loaded model's own config (the 0.6B
+        # sibling track reuses this pipeline), falling back to the 1.7B module
+        # constant — mirrors the audio_token_id pattern above. A list (some
+        # checkpoints list multiple EOS ids) takes the first entry.
+        eos = getattr(model.config, "eos_token_id", None)
+        if isinstance(eos, (list, tuple)):
+            eos = eos[0] if eos else None
+        self.eos_token_id = int(eos) if eos is not None else EOS_TOKEN_ID
         # Prefill eager by default: the per-prompt-length prefill graphs (cap 8,
         # evict+reset) churn the CUDA-graph allocator on a diverse-length sweep
         # and corrupt it into an illegal memory access. Eager prefill keeps the
@@ -98,7 +106,7 @@ class MegaPipeline:
                 self._language_model,
                 self._lm_head,
                 max_cache_len=self._max_cache_len,
-                eos_token_id=EOS_TOKEN_ID,
+                eos_token_id=self.eos_token_id,
                 prefill_use_graph=self.prefill_use_graph,
                 device=self.device,
                 dtype=self.dtype,
@@ -158,7 +166,7 @@ class MegaPipeline:
                 self._lm_head,
                 max_cache_len=self._max_cache_len,
                 steps_per_replay=k,
-                eos_token_id=EOS_TOKEN_ID,
+                eos_token_id=self.eos_token_id,
                 prefill_use_graph=self.prefill_use_graph,
                 device=self.device,
                 dtype=self.dtype,

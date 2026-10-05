@@ -19,8 +19,8 @@ using lib::str;
 // Local shorthand over the shared lib::shape_eq (lib/loader_kit.hpp):
 // every Voxtral check uses the "VOXTRAL" engine label.
 const auto shape_eq = [](const ModelLoader& m, const char* name,
-                            std::initializer_list<int64_t> want,
-                            std::string& err) {
+                         std::initializer_list<int64_t> want,
+                         std::string& err) {
     return lib::shape_eq(m, "VOXTRAL", name, want, err);
 };
 } // namespace
