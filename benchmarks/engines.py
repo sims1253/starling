@@ -587,7 +587,9 @@ class Qwen06Starling(Qwen3Starling):
         from starling.qwen3_06.pipeline import MegaPipeline
 
         self._build_inputs = build_inputs
-        self.pipe = MegaPipeline.from_pretrained()
+        self.pipe = MegaPipeline.from_pretrained(
+            dtype=self.dtype, device=self.device
+        )
 
 
 class Qwen3StarlingBatched(Engine):

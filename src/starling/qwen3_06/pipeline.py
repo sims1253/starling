@@ -18,8 +18,13 @@ Public API (inherited unchanged)
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from ..qwen3.pipeline import MegaPipeline as _Qwen3MegaPipeline
 from .loader import load_model_and_processor
+
+if TYPE_CHECKING:
+    import torch
 
 __all__ = ["MegaPipeline", "load_model_and_processor"]
 
@@ -37,7 +42,7 @@ class MegaPipeline(_Qwen3MegaPipeline):
         cls,
         *,
         attn_impl: str = "eager",
-        dtype: type | None = None,
+        dtype: "torch.dtype | None" = None,
         device: str = "cuda",
         max_cache_len: int = 4096,
         use_fused_llm: bool = True,
@@ -47,9 +52,10 @@ class MegaPipeline(_Qwen3MegaPipeline):
     ) -> "MegaPipeline":
         import torch
 
+        dt = torch.bfloat16 if dtype is None else dtype  # noqa: RUF046
         model, processor = load_model_and_processor(
             attn_impl=attn_impl,
-            dtype=torch.bfloat16 if dtype is None else dtype,  # noqa: RUF046
+            dtype=dt,
             device=device,
         )
         return cls(

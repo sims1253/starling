@@ -59,6 +59,10 @@ class MegaPipeline:
         self.model = model
         self.processor = processor
         self.dtype = getattr(model, "dtype", torch.bfloat16)
+        # Decode dtype/device: the loaded model's own placement (from_pretrained
+        # threads its dtype/device here), defaulting to the historical bf16/CUDA
+        # so existing callers are unchanged.
+        self.device = str(getattr(model, "device", "cuda"))
         self.audio_token_id = int(getattr(model.config, "audio_token_id", AUDIO_TOKEN_ID))
         # Prefill eager by default: the per-prompt-length prefill graphs (cap 8,
         # evict+reset) churn the CUDA-graph allocator on a diverse-length sweep
@@ -96,6 +100,8 @@ class MegaPipeline:
                 max_cache_len=self._max_cache_len,
                 eos_token_id=EOS_TOKEN_ID,
                 prefill_use_graph=self.prefill_use_graph,
+                device=self.device,
+                dtype=self.dtype,
             )
         self.use_fused_llm = use_fused_llm
 
@@ -154,6 +160,8 @@ class MegaPipeline:
                 steps_per_replay=k,
                 eos_token_id=EOS_TOKEN_ID,
                 prefill_use_graph=self.prefill_use_graph,
+                device=self.device,
+                dtype=self.dtype,
             )
             self._llms_by_k[k] = llm
         return llm

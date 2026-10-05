@@ -65,8 +65,11 @@ def golden():
 
 
 @pytest.fixture(scope="module")
-def pipeline():
-    """Build and prewarm the 0.6B MegaPipeline once for the whole module."""
+def pipeline(golden):
+    """Build and prewarm the 0.6B MegaPipeline once for the whole module.
+
+    Depends on `golden` so a missing gitignored golden skips BEFORE the
+    checkpoint downloads/loads (the ARK06 fixture ordering)."""
     from starling.qwen3_06.pipeline import MegaPipeline
 
     pipe = MegaPipeline.from_pretrained(encoder_mode="cudagraph")
@@ -90,9 +93,8 @@ def test_transcribe_matches_golden_text(pipeline, golden, fixture):
     """The fused pipeline reproduces the stock-numerics golden transcript.
 
     Chunked exactly like the serving path (30 s chunks, duration-scaled
-    budgets, whitespace-collapsed join); the comparison is on the final text
-    (the C++ engine carries the byte-exact token-stream gate in
-    tests/test_ggml_parity.py::test_starling_ggml_qwen3_06_text_parity).
+    budgets, whitespace-collapsed join); the comparison is exact-text on
+    the final transcript.
     """
     if fixture not in golden["fixtures"]:
         pytest.skip(f"golden has no entry for {fixture!r}")
