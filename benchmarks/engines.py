@@ -2028,9 +2028,9 @@ def _ggml_moss_keys() -> list[str]:
 
 
 def _qwen3_keys() -> list[str]:
-    if not _qwen3_on_master():
-        return []
-    keys = ["starling-qwen3", "stock-qwen3", "starling-batched-qwen3"]
+    keys = []
+    if _qwen3_on_master():
+        keys += ["starling-qwen3", "stock-qwen3", "starling-batched-qwen3"]
     if _qwen3_06_on_master():
         keys += ["starling-qwen3_06", "stock-qwen3_06"]
     return keys

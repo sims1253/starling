@@ -1006,7 +1006,7 @@
       },
       "reference": {
         "capture": "scripts/make_qwen3_06_golden.py -> golden/qwen3_06_reference.json (stock-numerics Python path; chunk policy imported from scripts/make_qwen3_golden.py)",
-        "pin_status": "UNPINNED \u2014 gitignored golden; validated on CUDA (RTX 5090) at authoring time against revision 7f1569a4 of the checkpoint"
+        "pin_status": "UNPINNED \u2014 gitignored golden; the cuda status records the authoring-time measurement (RTX 5090) against revision 7f1569a4 of the checkpoint. The golden hash itself is not pinned (the same carry pattern as the other UNPINNED sibling entries), so a later regeneration of qwen3_06_reference.json cannot be hash-checked: re-run the parity gate on CUDA after any regeneration before relying on this status"
       },
       "gguf": {
         "env": "STARLING_GGML_QWEN3_06_MODEL",

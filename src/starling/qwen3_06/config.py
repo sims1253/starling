@@ -24,6 +24,11 @@ the qwen3 track's encoder/LLM/pipeline modules are reused directly.
 
 from __future__ import annotations
 
+# NOTE: reference/documentation constants only. The megakernels, pipelines,
+# and C++ loader derive every dim from the loaded model config / GGUF
+# metadata (never from this module), so nothing below is imported at runtime
+# except MODEL_ID; these pins document the architecture the reuse contract
+# (see the module docstring) was verified against.
 # ---------------------------------------------------------------------------
 # Model identity
 # ---------------------------------------------------------------------------

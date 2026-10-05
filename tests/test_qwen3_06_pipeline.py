@@ -40,10 +40,19 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 GOLDEN_PATH = REPO_ROOT / "golden" / "qwen3_06_reference.json"
 FIXTURES = REPO_ROOT / "tests" / "fixtures"
 
-# The serve chunk policy the golden was captured under (mirrors
-# ModelBackend._transcribe_chunked / the C++ decode entry).
-SAMPLE_RATE = 16000
-MAX_NEW_TOKENS = 200
+# The serve chunk policy the golden was captured under, imported from the
+# 1.7B generator (like scripts/make_qwen3_06_golden.py) so the capture and
+# this test share ONE policy implementation and cannot drift
+# (mirrors ModelBackend._transcribe_chunked / the C++ decode entry).
+_SCRIPTS = REPO_ROOT / "scripts"
+if str(_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS))
+from make_qwen3_golden import (  # noqa: E402
+    SAMPLE_RATE,
+    decode_budget,
+    effective_chunk_seconds,
+    join_chunk_texts,
+)
 
 
 def _load_golden():
@@ -52,11 +61,6 @@ def _load_golden():
             f"golden reference {GOLDEN_PATH} not found; run scripts/make_qwen3_06_golden.py"
         )
     return json.loads(GOLDEN_PATH.read_text())
-
-
-def _decode_budget(duration_s: float) -> int:
-    estimated = max(1, int(np.ceil(duration_s * 5.0)) + 32)
-    return min(MAX_NEW_TOKENS, estimated)
 
 
 @pytest.fixture(scope="module")
@@ -81,7 +85,8 @@ def _wav(name: str) -> np.ndarray:
     if not path.exists():
         pytest.skip(f"fixture {path} not found; run tests/fixtures/make_fixtures.py")
     data, sr = sf.read(str(path))
-    assert sr == SAMPLE_RATE, f"fixture {path} is {sr} Hz"
+    if sr != SAMPLE_RATE:
+        pytest.fail(f"fixture {path} is {sr} Hz, expected {SAMPLE_RATE}")
     if data.ndim > 1:
         data = data[:, 0]
     return np.ascontiguousarray(data, dtype=np.float32)
@@ -102,12 +107,12 @@ def test_transcribe_matches_golden_text(pipeline, golden, fixture):
 
     wav_np = _wav(fixture)
     n_samples = wav_np.shape[0]
-    chunk_samples = max(1, round(30.0 * SAMPLE_RATE))
+    chunk_samples = max(1, round(effective_chunk_seconds() * SAMPLE_RATE))
 
     texts: list[str] = []
     for start in range(0, n_samples, chunk_samples):
         piece = wav_np[start : min(start + chunk_samples, n_samples)]
-        budget = _decode_budget(len(piece) / SAMPLE_RATE)
+        budget = decode_budget(len(piece) / SAMPLE_RATE)
         wav = torch.from_numpy(piece).float().unsqueeze(0).contiguous()
         inp = build_inputs(pipeline.processor, wav, sr=SAMPLE_RATE)
         text, _ = pipeline.transcribe(
@@ -117,7 +122,7 @@ def test_transcribe_matches_golden_text(pipeline, golden, fixture):
             max_new_tokens=budget,
         )
         texts.append(text)
-    out = " ".join(" ".join(texts).split())
+    out = join_chunk_texts(texts)
     golden_text = golden["fixtures"][fixture]["text"]
     assert out == golden_text, (
         f"{fixture}: fused qwen3_06 transcript diverges from the golden reference:\n"

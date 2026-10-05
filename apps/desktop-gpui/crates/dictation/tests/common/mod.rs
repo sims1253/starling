@@ -67,7 +67,7 @@ pub fn stage_engine_dir(root: &Path, fixture: &Path) -> PathBuf {
     std::fs::write(
         dir.join("engines.json"),
         format!(
-            r#"{{\"version\":\"0.1.0\",\"abi\":{},\"engines\":[{{\"backend\":\"cpu\",\"file\":\"starling-serve-cpu\"}}]}}\"#,
+            r#"{{"version":"0.1.0","abi":{},"engines":[{{"backend":"cpu","file":"starling-serve-cpu"}}]}}"#,
             starling_dictation::engine::EXPECTED_ENGINE_ABI
         ),
     )

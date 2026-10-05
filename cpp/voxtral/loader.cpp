@@ -16,6 +16,8 @@ using lib::str;
 // Linear(out <- in) weight reads ne0=in, ne1=out, and a Conv1d(OC, IC, K)
 // weight reads ne0=K, ne1=IC, ne2=OC.) Presence is established by the
 // require() pass; a missing tensor here is still a loud error.
+// Local shorthand over the shared lib::shape_eq (lib/loader_kit.hpp):
+// every Voxtral check uses the "VOXTRAL" engine label.
 const auto shape_eq = [](const ModelLoader& m, const char* name,
                             std::initializer_list<int64_t> want,
                             std::string& err) {

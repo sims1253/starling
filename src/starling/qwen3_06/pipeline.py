@@ -49,6 +49,7 @@ class MegaPipeline(_Qwen3MegaPipeline):
         steps_per_replay: int | None = None,
         encoder_mode: str = "cudagraph",
         prefill_use_graph: bool = False,
+        model_id: str | None = None,
     ) -> "MegaPipeline":
         import torch
 
@@ -57,6 +58,7 @@ class MegaPipeline(_Qwen3MegaPipeline):
             attn_impl=attn_impl,
             dtype=dt,
             device=device,
+            model_id=model_id,
         )
         return cls(
             model,

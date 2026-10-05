@@ -114,9 +114,12 @@ def main() -> int:
                 )
                 ids = ids[0].cpu().tolist()
                 prompt_len = int(inputs["input_ids"].shape[1])
-                assert prompt_len + budget <= MAX_CACHE_LEN + 1, (
-                    f"{name}: budget would overflow the static KV cache"
-                )
+                if prompt_len + budget > MAX_CACHE_LEN + 1:
+                    raise SystemExit(
+                        f"{name}: budget would overflow the static KV cache "
+                        f"(prompt {prompt_len} + budget {budget} > "
+                        f"max_cache_len {MAX_CACHE_LEN} + 1)"
+                    )
                 chunks.append(
                     {
                         "start_s": start / SAMPLE_RATE,
