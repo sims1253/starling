@@ -686,6 +686,7 @@ def _starling_ggml_qwen3_06_available() -> bool:
     except Exception:
         return False
 
+
 @pytest.fixture(scope="module")
 def starling_ggml_qwen3_06_engine():
     if not _starling_ggml_qwen3_06_available():

@@ -132,8 +132,7 @@ class MegaPipeline:
         prefill_use_graph: bool = False,
         model_id: str | None = None,
     ) -> "MegaPipeline":
-        # None dtype keeps the historical bf16 default while allowing an
-        # explicit opt-out that defers to the loader's own dtype.
+        # None dtype restores the historical bf16 default.
         dt = torch.bfloat16 if dtype is None else dtype
         model, processor = cls._load_model_and_processor(
             attn_impl=attn_impl, dtype=dt, device=device, model_id=model_id

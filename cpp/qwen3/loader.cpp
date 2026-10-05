@@ -1,5 +1,6 @@
 #include "loader.hpp"
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -42,14 +43,9 @@ bool Qwen3Model::load(const char* path, std::string& err) {
     }
     auto& c = config;
     const auto& m = loader;
-    // Top-level tensors take a literal name; per-layer tensors take the
-    // "<prefix>.<tail>" name built at the call site.
+    // Top-level tensors take a literal name.
     const auto shape = [&](const char* name, std::initializer_list<int64_t> want) {
         return lib::shape_eq(m, "QWEN3", name, want, err);
-    };
-    const auto layer_shape = [&](const std::string& name,
-                                 std::initializer_list<int64_t> want) {
-        return lib::shape_eq(m, "QWEN3", name.c_str(), want, err);
     };
 #define U(field, key) do { if (!lib::u32(m, "qwen3." key, field, field, err)) return false; } while (0)
 #define F(field, key) field = f32(m, "qwen3." key, field)
@@ -242,29 +238,36 @@ bool Qwen3Model::load(const char* path, std::string& err) {
     for (uint32_t i = 0; i < c.encoder.n_layers; ++i) {
         char n[128];
         std::snprintf(n, sizeof n, "enc.blk.%u.", i);
-        const std::string pre = n;
-        if (!layer_shape(pre + "attn_norm.weight", {c.encoder.hidden})) return false;
-        if (!layer_shape(pre + "attn_norm.bias", {c.encoder.hidden})) return false;
-        if (!layer_shape(pre + "attn_q.weight", {c.encoder.hidden, c.encoder.hidden}))
+        const size_t pre_len = std::strlen(n);
+        // Append the tensor tail to the layer prefix in the SAME stack
+        // buffer — no per-tensor heap string (load-time churn the original
+        // require-loop avoided by snprintf-ing straight into n).
+        const auto enc_shape = [&](const char* tail, std::initializer_list<int64_t> want) {
+            std::snprintf(n + pre_len, sizeof n - pre_len, "%s", tail);
+            return lib::shape_eq(m, "QWEN3", n, want, err);
+        };
+        if (!enc_shape("attn_norm.weight", {c.encoder.hidden})) return false;
+        if (!enc_shape("attn_norm.bias", {c.encoder.hidden})) return false;
+        if (!enc_shape("attn_q.weight", {c.encoder.hidden, c.encoder.hidden}))
             return false;
-        if (!layer_shape(pre + "attn_q.bias", {c.encoder.hidden})) return false;
-        if (!layer_shape(pre + "attn_k.weight", {c.encoder.hidden, c.encoder.hidden}))
+        if (!enc_shape("attn_q.bias", {c.encoder.hidden})) return false;
+        if (!enc_shape("attn_k.weight", {c.encoder.hidden, c.encoder.hidden}))
             return false;
-        if (!layer_shape(pre + "attn_k.bias", {c.encoder.hidden})) return false;
-        if (!layer_shape(pre + "attn_v.weight", {c.encoder.hidden, c.encoder.hidden}))
+        if (!enc_shape("attn_k.bias", {c.encoder.hidden})) return false;
+        if (!enc_shape("attn_v.weight", {c.encoder.hidden, c.encoder.hidden}))
             return false;
-        if (!layer_shape(pre + "attn_v.bias", {c.encoder.hidden})) return false;
-        if (!layer_shape(pre + "attn_o.weight", {c.encoder.hidden, c.encoder.hidden}))
+        if (!enc_shape("attn_v.bias", {c.encoder.hidden})) return false;
+        if (!enc_shape("attn_o.weight", {c.encoder.hidden, c.encoder.hidden}))
             return false;
-        if (!layer_shape(pre + "attn_o.bias", {c.encoder.hidden})) return false;
-        if (!layer_shape(pre + "ffn_norm.weight", {c.encoder.hidden})) return false;
-        if (!layer_shape(pre + "ffn_norm.bias", {c.encoder.hidden})) return false;
-        if (!layer_shape(pre + "ff_up.weight", {c.encoder.hidden, c.encoder.ffn_dim}))
+        if (!enc_shape("attn_o.bias", {c.encoder.hidden})) return false;
+        if (!enc_shape("ffn_norm.weight", {c.encoder.hidden})) return false;
+        if (!enc_shape("ffn_norm.bias", {c.encoder.hidden})) return false;
+        if (!enc_shape("ff_up.weight", {c.encoder.hidden, c.encoder.ffn_dim}))
             return false;
-        if (!layer_shape(pre + "ff_up.bias", {c.encoder.ffn_dim})) return false;
-        if (!layer_shape(pre + "ff_down.weight", {c.encoder.ffn_dim, c.encoder.hidden}))
+        if (!enc_shape("ff_up.bias", {c.encoder.ffn_dim})) return false;
+        if (!enc_shape("ff_down.weight", {c.encoder.ffn_dim, c.encoder.hidden}))
             return false;
-        if (!layer_shape(pre + "ff_down.bias", {c.encoder.hidden})) return false;
+        if (!enc_shape("ff_down.bias", {c.encoder.hidden})) return false;
     }
     // LLM layers: bias-free Qwen3 trunk with per-head q/k norm (11 each).
     // q/k/v project hidden -> {QW, KVW, KVW}; o projects the concatenated
@@ -274,20 +277,25 @@ bool Qwen3Model::load(const char* path, std::string& err) {
     for (uint32_t i = 0; i < c.llm.n_layers; ++i) {
         char n[128];
         std::snprintf(n, sizeof n, "llm.blk.%u.", i);
-        const std::string pre = n;
-        if (!layer_shape(pre + "attn_norm.weight", {c.llm.hidden})) return false;
-        if (!layer_shape(pre + "attn.q.weight", {c.llm.hidden, QW})) return false;
-        if (!layer_shape(pre + "attn.k.weight", {c.llm.hidden, KVW})) return false;
-        if (!layer_shape(pre + "attn.v.weight", {c.llm.hidden, KVW})) return false;
-        if (!layer_shape(pre + "attn.o.weight", {QW, c.llm.hidden})) return false;
-        if (!layer_shape(pre + "attn.q_norm.weight", {c.llm.head_dim})) return false;
-        if (!layer_shape(pre + "attn.k_norm.weight", {c.llm.head_dim})) return false;
-        if (!layer_shape(pre + "ffn_norm.weight", {c.llm.hidden})) return false;
-        if (!layer_shape(pre + "ffn.gate.weight", {c.llm.hidden, c.llm.intermediate}))
+        const size_t pre_len = std::strlen(n);
+        // Same stack-buffer reuse as the encoder loop above.
+        const auto llm_shape = [&](const char* tail, std::initializer_list<int64_t> want) {
+            std::snprintf(n + pre_len, sizeof n - pre_len, "%s", tail);
+            return lib::shape_eq(m, "QWEN3", n, want, err);
+        };
+        if (!llm_shape("attn_norm.weight", {c.llm.hidden})) return false;
+        if (!llm_shape("attn.q.weight", {c.llm.hidden, QW})) return false;
+        if (!llm_shape("attn.k.weight", {c.llm.hidden, KVW})) return false;
+        if (!llm_shape("attn.v.weight", {c.llm.hidden, KVW})) return false;
+        if (!llm_shape("attn.o.weight", {QW, c.llm.hidden})) return false;
+        if (!llm_shape("attn.q_norm.weight", {c.llm.head_dim})) return false;
+        if (!llm_shape("attn.k_norm.weight", {c.llm.head_dim})) return false;
+        if (!llm_shape("ffn_norm.weight", {c.llm.hidden})) return false;
+        if (!llm_shape("ffn.gate.weight", {c.llm.hidden, c.llm.intermediate}))
             return false;
-        if (!layer_shape(pre + "ffn.up.weight", {c.llm.hidden, c.llm.intermediate}))
+        if (!llm_shape("ffn.up.weight", {c.llm.hidden, c.llm.intermediate}))
             return false;
-        if (!layer_shape(pre + "ffn.down.weight", {c.llm.intermediate, c.llm.hidden}))
+        if (!llm_shape("ffn.down.weight", {c.llm.intermediate, c.llm.hidden}))
             return false;
     }
     return true;
