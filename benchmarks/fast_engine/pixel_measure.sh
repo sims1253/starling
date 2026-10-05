@@ -23,8 +23,11 @@ BASE=$HERE/pixel_baseline_transcripts.txt
 
 command -v adb >/dev/null || { echo "adb missing" >&2; exit 1; }
 adb get-state >/dev/null 2>&1 || { echo "phone not connected" >&2; exit 1; }
+. "$HERE/phone_common.sh"
 TMP=$(mktemp -d)
-trap 'rm -rf "$TMP"' EXIT
+trap 'rm -rf "$TMP"; wake_release || true' EXIT
+# the screen may be off for the run: hold the phone out of suspend (#325)
+wake_hold
 
 # --- build + push ------------------------------------------------------------
 if [ "${NO_BUILD:-0}" != 1 ]; then

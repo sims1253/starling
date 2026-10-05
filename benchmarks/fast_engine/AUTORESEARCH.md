@@ -98,8 +98,9 @@ status:
   lock wedged 5/6 trials, awake 0/13, and screen off in forced deep Doze
   under a held wake lock 0/3 (RESEARCH_LOG P3-1–P3-4). Suspend is the
   trigger, not Doze, so a plugged-in phone with the screen off is exposed
-  too. `phone_gates.sh` and `phone_energy.sh` hold a shell-uid partial wake
-  lock for the whole session (`phone_common.sh` `wake_hold`;
+  too. Every phone bench script (`android_bench.sh`, `phone_ab.sh`,
+  `phone_gates.sh`, `phone_energy.sh`, `pixel_measure.sh`) holds a
+  shell-uid partial wake lock for the whole session (`phone_common.sh` `wake_hold`;
   `wakehold/WakeHold.java`, built on demand — needs a JDK and the Android
   SDK). Any other script that runs benches with the screen off must do the
   same: `wake_hold` before the first bench, `wake_release || true` in its

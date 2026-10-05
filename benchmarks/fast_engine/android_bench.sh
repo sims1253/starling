@@ -46,6 +46,10 @@ if [ "$BUILD_IT" = 1 ]; then
   cmake --build "$BUILD" -j --target starling-bench
 fi
 
+. "$ROOT/benchmarks/fast_engine/phone_common.sh"
+trap 'wake_release || true' EXIT
+# the screen may be off for the run: hold the phone out of suspend (#325)
+wake_hold
 adb shell mkdir -p "$DEV_DIR"
 adb push "$BUILD/starling-bench" "$DEV_DIR/" >/dev/null
 find "$BUILD/ggml" -name 'libggml*.so' -exec adb push {} "$DEV_DIR/" \; >/dev/null

@@ -25,6 +25,11 @@ PK_WAV=${PK_WAV:-medium.wav}
 MOSS_WAV=${MOSS_WAV:-short.wav}
 EXTRA_ENV=${EXTRA_ENV:-}
 
+. "$(dirname "$0")/phone_common.sh"
+trap 'wake_release || true' EXIT
+# the screen may be off for the run: hold the phone out of suspend (#325)
+wake_hold
+
 names=()
 for spec in "$@"; do
   name=${spec%%=*}; bin=${spec#*=}
