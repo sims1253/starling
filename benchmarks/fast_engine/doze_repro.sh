@@ -16,7 +16,10 @@
 # means waiting. Always restores normal Doze and wakes the screen.
 #
 # Needs: a Pixel on adb (ANDROID_SERIAL when several devices), UNPLUGGED
-# (Doze never engages on power), the bench binary + libs in $DEV/lt and the
+# (Doze never engages on power) — or FAKE_UNPLUG=1: the framework is told the
+# phone is unplugged (`dumpsys battery unplug`, reset on exit) while it stays
+# on the charger; run D arms alongside as the control that the wedge still
+# reproduces that way, the bench binary + libs in $DEV/lt and the
 # model/fixture in $DEV. Every adb call is bounded. Results: one line per
 # trial on stdout and in $OUT/trials.txt.
 set -uo pipefail
@@ -34,7 +37,11 @@ export STARLING_FORENSICS_DIR=$OUT
 sh_() { timeout "$1" adb shell "$2" 2>/dev/null | tr -d '\r'; }
 log() { echo "$(date +%H:%M:%S) $*" | tee -a "$OUT/trials.txt"; }
 state() { sh_ 15 "dumpsys power | grep -m1 -o 'mWakefulness=[A-Za-z]*'; dumpsys deviceidle | grep -m1 -o 'mState=[A-Z_]*'; dumpsys battery | grep -E '^  (level|USB powered|AC powered):' | tr -d ' ' | tr '\n' ' '" | tr '\n' ' '; }
-restore() { wake_release || true; sh_ 15 "dumpsys deviceidle unforce; input keyevent KEYCODE_WAKEUP" >/dev/null; }
+restore() {
+  wake_release || true
+  [ -n "${FAKE_UNPLUG:-}" ] && sh_ 15 "dumpsys battery reset" >/dev/null
+  sh_ 15 "dumpsys deviceidle unforce; input keyevent KEYCODE_WAKEUP" >/dev/null
+}
 trap restore EXIT
 
 # Wifi adb drops while the phone dozes and comes back on a new port: on a
@@ -57,6 +64,7 @@ marker_fresh() {   # the engine refuses for 15 min after a wedge
 }
 
 reachable || { echo "phone not reachable" >&2; exit 1; }
+[ -n "${FAKE_UNPLUG:-}" ] && { sh_ 15 "dumpsys battery unplug" >/dev/null; log "FAKE_UNPLUG: framework told the phone is unplugged"; }
 sh_ 15 "dumpsys battery" | grep -qE "(AC|USB|Wireless) powered: true" &&
   { echo "phone is on power: Doze never engages — unplug it first" >&2; exit 1; }
 "$HERE/wedge_forensics.sh" watch start >/dev/null
