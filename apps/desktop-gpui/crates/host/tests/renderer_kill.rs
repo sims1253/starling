@@ -14,8 +14,9 @@
 //! suite already covers. The host under test is the real `server::serve`
 //! (or, for the host-death case, the real host binary).
 
-#![cfg(unix)] // the kill signals and the fill mode's socket shrink are
-              // unix surfaces; the Windows transport runs elsewhere.
+// Portable: `Child::kill` is SIGKILL on unix and TerminateProcess on
+// Windows — the same no-handler, no-cleanup death. Only the fill mode
+// (a receive-buffer shrink) is unix-only, and its test is gated.
 
 use std::io::Read;
 use std::path::Path;
@@ -210,13 +211,28 @@ impl Drop for DoubleRenderer {
     }
 }
 
+/// Whether the endpoint still exists: the socket file on unix; on
+/// Windows (the pipe name lives in the kernel namespace) whether a
+/// probe still finds a server bound to it.
+fn endpoint_present(socket: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        socket.exists()
+    }
+    #[cfg(windows)]
+    {
+        starling_runtime_host::platform::probe(socket)
+            != starling_runtime_host::platform::Probe::Dead
+    }
+}
+
 /// Waits (bounded) for the endpoint socket to disappear after shutdown.
 fn assert_endpoint_removed(socket: &Path) {
     let deadline = Instant::now() + Duration::from_secs(5);
-    while socket.exists() && Instant::now() < deadline {
+    while endpoint_present(socket) && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(25));
     }
-    assert!(!socket.exists(), "the endpoint {} was not removed", socket.display());
+    assert!(!endpoint_present(socket), "the endpoint {} was not removed", socket.display());
 }
 
 // --------------------------------------------------------------------- //
@@ -436,6 +452,7 @@ fn a_renderer_process_killed_mid_take_leaves_a_durable_take_and_a_serving_host()
 /// shutdown drain window. Shutdown must still complete in bounded time
 /// with the full teardown — machines joined, endpoint removed, lease
 /// released (a successor owns the root immediately after).
+#[cfg(unix)] // the fill mode shrinks SO_RCVBUF
 #[test]
 fn shutdown_completes_when_the_renderer_is_killed_mid_drain() {
     let root = tempfile::tempdir().unwrap();

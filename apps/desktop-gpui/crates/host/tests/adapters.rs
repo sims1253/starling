@@ -15,7 +15,7 @@
 //! read. The stubs remain the unwired default; this suite pins the
 //! wiring an adapter's own increment will ride on.
 
-#![cfg(unix)] // matches the sibling suites (one transport, one CI job).
+// Portable: runs over the unix socket and the Windows named pipe.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};

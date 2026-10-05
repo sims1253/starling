@@ -53,6 +53,7 @@ use windows_sys::Win32::Foundation::{
     CloseHandle, DuplicateHandle, GetLastError, LocalFree, BOOL, DUPLICATE_SAME_ACCESS,
     ERROR_BROKEN_PIPE, ERROR_FILE_NOT_FOUND, ERROR_IO_PENDING, ERROR_NO_DATA,
     ERROR_OPERATION_ABORTED, ERROR_PATH_NOT_FOUND, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED,
+    ERROR_PIPE_NOT_CONNECTED,
     ERROR_SEM_TIMEOUT, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
     WAIT_TIMEOUT,
 };
@@ -638,11 +639,19 @@ impl TransportListener for PipeListener {
             .as_ref()
             .expect("the receiver lives until Drop");
         match connections.try_recv() {
-            Ok(result) => Ok(Box::new(PipeConn {
-                handle: result?,
-                server: true,
-                shared: Arc::default(),
-            })),
+            Ok(result) => {
+                let conn = PipeConn {
+                    handle: result?,
+                    server: true,
+                    shared: Arc::default(),
+                };
+                // Readers run with a poll timeout (the unix accept arms
+                // the same 250 ms) so a connection the host abandoned —
+                // or one that never speaks (the pre-greeting idle bound)
+                // — never parks its reader forever.
+                conn.set_read_timeout(Some(Duration::from_millis(250)))?;
+                Ok(Box::new(conn))
+            }
             Err(mpsc::TryRecvError::Empty) => Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "no pipe client waiting",
@@ -1022,9 +1031,16 @@ impl Read for PipeConn {
         };
         match result {
             Ok(read) => Ok(read as usize),
-            // ERROR_BROKEN_PIPE: the peer closed — a clean EOF for a
-            // pipe. A locally closed connection reads EOF too.
-            Err(err) if err.raw_os_error() == Some(ERROR_BROKEN_PIPE as i32) => Ok(0),
+            // ERROR_BROKEN_PIPE: the peer closed its handles;
+            // ERROR_PIPE_NOT_CONNECTED: the server disconnected the
+            // instance (after its linger). Both are a clean EOF for a
+            // pipe, and a locally closed connection reads EOF too.
+            Err(err)
+                if err.raw_os_error() == Some(ERROR_BROKEN_PIPE as i32)
+                    || err.raw_os_error() == Some(ERROR_PIPE_NOT_CONNECTED as i32) =>
+            {
+                Ok(0)
+            }
             Err(err) if err.kind() == io::ErrorKind::ConnectionAborted => Ok(0),
             Err(err) => Err(err),
         }

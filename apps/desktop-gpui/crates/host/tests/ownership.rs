@@ -6,7 +6,9 @@
 //! two owners: a second host (process or in-process) against a live
 //! owner answers `already-running` and exits 0.
 
-#![cfg(unix)]
+// Portable except where a test needs a socket *file* (the stale-file
+// takeover, a squatting listener, a non-socket file at the endpoint) —
+// those are gated individually; the pipe namespace has no residue.
 
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -134,6 +136,7 @@ fn a_killed_host_is_taken_over_by_the_next_one() {
     // happens — the lease's flock releases because the OS does it.
     first.child.kill().expect("SIGKILL the host");
     let _ = first.child.wait();
+    #[cfg(unix)]
     assert!(
         socket.exists(),
         "the killed host leaves its socket file behind (the stale-owner case)"
@@ -273,6 +276,7 @@ fn an_unanswerable_lease_refuses_ownership_and_names_the_wedge() {
 /// The ownership-ladder refusal the binary encodes, exercised in-process
 /// (fast): a live foreign owner makes the second serve() a client, and a
 /// socket answering without the lease makes binding refuse.
+#[cfg(unix)] // binds a squatting UnixListener
 #[test]
 fn a_live_foreign_server_without_the_lease_is_refused() {
     let root = tempfile::tempdir().unwrap();
@@ -313,6 +317,7 @@ fn a_live_foreign_server_without_the_lease_is_refused() {
 /// removed and rebound (already covered by the kill test), and a socket
 /// file that was never a socket is refused honestly rather than crashed
 /// on.
+#[cfg(unix)] // a regular file at a socket path
 #[test]
 fn a_non_socket_file_at_the_endpoint_is_refused_not_crashed() {
     let root = tempfile::tempdir().unwrap();

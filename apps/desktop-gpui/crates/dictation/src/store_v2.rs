@@ -3363,16 +3363,78 @@ fn try_flock_exclusive(file: &File) -> io::Result<FlockEvidence> {
     Err(error)
 }
 
-/// Without flock there is no lock to ask (#213 review): the probe answers
-/// [`FlockEvidence::Unknown`] and the marker's recorded PID decides
-/// ownership instead (see [`attempt_owned_from`]). Every desktop target
-/// this port builds today is unix; on flock-less platforms foreign PIDs
-/// read as dead so crash-orphaned attempts stay sweepable — the
-/// multi-instance spare is then unix-only, matching what the reference
-/// can guarantee without a lock manager.
-#[cfg(not(unix))]
+/// Windows: the same probe with `LockFileEx` (exclusive, fail
+/// immediately) — a lock on the file object that the OS releases when
+/// the holding handle closes or its process dies, which is exactly the
+/// flock contract the lease and attempt markers rely on (#220: without
+/// it a second host broke a live owner's lease). The locked byte lies
+/// far past EOF on purpose: Windows byte-range locks are mandatory, and
+/// locking the record's own bytes would stop every prober from reading
+/// the identity it needs.
+#[cfg(windows)]
+fn try_flock_exclusive(file: &File) -> io::Result<FlockEvidence> {
+    Ok(if windows_lock::try_lock(file)? {
+        FlockEvidence::Free
+    } else {
+        FlockEvidence::Held
+    })
+}
+
+/// Without any lock primitive there is nothing to ask (#213 review): the
+/// probe answers [`FlockEvidence::Unknown`] and the marker's recorded PID
+/// decides ownership instead (see [`attempt_owned_from`]).
+#[cfg(not(any(unix, windows)))]
 fn try_flock_exclusive(_file: &File) -> io::Result<FlockEvidence> {
     Ok(FlockEvidence::Unknown)
+}
+
+/// The Windows lock primitive behind [`try_flock_exclusive`] and the
+/// lease sentinel.
+#[cfg(windows)]
+mod windows_lock {
+    use std::fs::File;
+    use std::io;
+    use std::os::windows::io::AsRawHandle;
+
+    use windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION;
+    use windows_sys::Win32::Storage::FileSystem::{
+        LockFileEx, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
+    };
+    use windows_sys::Win32::System::IO::OVERLAPPED;
+
+    /// High dword of the locked offset (2^62): far past any real file
+    /// content, so the mandatory lock never covers bytes anyone reads.
+    const LOCK_OFFSET_HIGH: u32 = 0x4000_0000;
+
+    /// `Ok(true)` = this handle now holds the lock; `Ok(false)` = another
+    /// handle (this process or another) holds it.
+    pub(super) fn try_lock(file: &File) -> io::Result<bool> {
+        // SAFETY: a zeroed OVERLAPPED is valid input; `std` opens files
+        // synchronously, so LockFileEx with FAIL_IMMEDIATELY completes
+        // before returning and the OVERLAPPED (only carrying the offset)
+        // is not referenced afterwards. The handle stays open for the
+        // call (borrowed from `file`).
+        let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+        overlapped.Anonymous.Anonymous.OffsetHigh = LOCK_OFFSET_HIGH;
+        let locked = unsafe {
+            LockFileEx(
+                file.as_raw_handle(),
+                LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+                0,
+                1,
+                0,
+                &mut overlapped,
+            )
+        };
+        if locked != 0 {
+            return Ok(true);
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(ERROR_LOCK_VIOLATION as i32) {
+            return Ok(false);
+        }
+        Err(error)
+    }
 }
 
 /// Whether the process `pid` is still alive (#213 review) — the fallback
@@ -3389,7 +3451,34 @@ fn process_is_alive(pid: u32) -> bool {
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-/// Without a std primitive to ask the OS about a foreign PID (#213
+/// Windows: open the process for a limited query and read its exit
+/// code. A pid that cannot be opened because it belongs to someone else
+/// (ACCESS_DENIED) exists; any other open failure means no such
+/// process. A query that fails on an opened process is not proof of
+/// death — presumed alive, never break what cannot be proven dead.
+#[cfg(windows)]
+fn process_is_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ACCESS_DENIED};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    /// `STILL_ACTIVE`: the exit code a running process reports.
+    const STILL_ACTIVE: u32 = 259;
+    // SAFETY: plain Win32 calls with owned out-parameters; the handle is
+    // closed on every path that opened it.
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return GetLastError() == ERROR_ACCESS_DENIED;
+        }
+        let mut code = 0u32;
+        let queried = GetExitCodeProcess(handle, &mut code);
+        CloseHandle(handle);
+        queried == 0 || code == STILL_ACTIVE
+    }
+}
+
+/// Without a primitive to ask the OS about a foreign PID (#213
 /// review), it is presumed dead: this process's OWN attempts are spared
 /// by the in-process registry before any marker is probed, so the only
 /// markers read here belong to other processes — unknowable liveness
@@ -3398,7 +3487,7 @@ fn process_is_alive(pid: u32) -> bool {
 /// platform can have its attempt interrupted, the same degradation the
 /// Electron reference accepts without a lock manager; unix keeps the
 /// full cross-process guarantee via flock.
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn process_is_alive(_pid: u32) -> bool {
     false
 }
@@ -3632,7 +3721,7 @@ impl LeaseSentinel {
     }
 
     /// Take the sentinel: a non-blocking flock retried under a BOUNDED
-    /// wait (flock(2) on unix; no-op elsewhere). The sentinel coordinates
+    /// wait (flock(2) on unix, `LockFileEx` on Windows; no-op elsewhere). The sentinel coordinates
     /// probe-and-publish only — it is not a liveness primitive — so a
     /// holder wedged mid-acquisition (hung fsync, stuck disk) must not be
     /// able to block every other process's lease acquisition, and
@@ -3681,7 +3770,29 @@ impl LeaseSentinel {
                 std::thread::sleep(std::time::Duration::from_millis(25));
             }
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(leases_dir.join(LEASE_SENTINEL_FILE))?;
+            let deadline = std::time::Instant::now() + timeout;
+            loop {
+                if windows_lock::try_lock(&file)? {
+                    return Ok(Self { file: Some(file) });
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(StoreV2Error::Invalid(format!(
+                        "the lease sentinel stayed busy for more than {timeout:?} — another \
+                         lease acquisition appears wedged; retrying may help"
+                    )));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = (leases_dir, timeout);
             Ok(Self { file: None })
