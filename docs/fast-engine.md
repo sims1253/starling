@@ -193,9 +193,9 @@ with an awake-hold measure **62.5–64 ms/token**; the historical 68–77
 band spans boots without the hold; and a locked phone without any hold
 reads 105–141 ms/token because system suspend stalls each decode
 round-trip by ~0.7 s (the Starling app holds a partial wake lock around on-device GPU work since #325; the
-bench protocol measures unlocked or with `svc power stayon`, which only
-holds the phone awake while plugged in — see the phone measurement
-protocol in `benchmarks/fast_engine/AUTORESEARCH.md`). MOSS short wall ≈ 5.25 s
+bench scripts hold a shell-uid partial wake lock for their screen-off
+windows, which also keeps suspend from wedging the GPU driver — see the
+phone measurement protocol in `benchmarks/fast_engine/AUTORESEARCH.md`). MOSS short wall ≈ 5.25 s
 median in a 12-run window; Parakeet medium 2.27–2.34 s (in band).
 
 | Model / audio | ggml CPU | fast (start of tuning) | fast (tuned) |

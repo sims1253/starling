@@ -90,14 +90,22 @@ status:
   Android's *stay awake while plugged in* option — it is **not** a wake lock
   for an unplugged (discharging) energy run. The stall-free discharging
   windows in P2-8 had stayon set, but which mechanism kept them awake is
-  **unverified**; establish one (and keep idle-control conditions identical
-  across arms) before trusting a new energy window.
-- **Never run GPU work on a dozing phone.** A screen-off, unplugged phone
-  dozes; P3-1 wedged there (fence hung with the GPU rail at ~0 mW) while
-  11/11 identical awake runs were clean (P3-2). Plugged in: `svc power
-  stayon true`. Unplugged: keep the screen awake for the run (re-send
-  `input keyevent KEYCODE_WAKEUP` every ~10 s) and check
-  `dumpsys power | grep mWakefulness=` reads `Awake` before each window.
+  **unverified**. The verified wake source for screen-off windows is the
+  shell wake lock below; `phone_energy.sh` holds it for the idle control
+  too, so every arm shares the wake state.
+- **Never run GPU work on a phone that may suspend.** Kernel suspend with
+  GPU work outstanding wedges the PowerVR driver: screen off without a wake
+  lock wedged 5/6 trials, awake 0/13, and screen off in forced deep Doze
+  under a held wake lock 0/3 (RESEARCH_LOG P3-1–P3-4). Suspend is the
+  trigger, not Doze, so a plugged-in phone with the screen off is exposed
+  too. `phone_gates.sh` and `phone_energy.sh` hold a shell-uid partial wake
+  lock for the whole session (`phone_common.sh` `wake_hold`;
+  `wakehold/WakeHold.java`, built on demand — needs a JDK and the Android
+  SDK). Any other script that runs benches with the screen off must do the
+  same: `wake_hold` before the first bench, `wake_release || true` in its
+  EXIT trap, `wake_held` before each measurement window. Doze does not
+  disable it (uid 2000, verified in `dumpsys power`), and killing the holder
+  releases it.
 - **Run `wedge_forensics.sh watch start` at the start of every phone
   session**, so an incident's minutes are still on the device.
 - **Energy runs** need a discharging battery: verify the charge counter

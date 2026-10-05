@@ -930,3 +930,45 @@ wake lock, which blocks kernel suspend but is ignored by Doze for apps that
 are not exempt. Untested whether it prevents the wedge — the next arm is
 screen off + Doze + a held partial wake lock (needs the app, since shell
 cannot take a kernel wake lock on a user build).
+
+### P3-4: a shell-uid wake lock prevents the wedge in deep Doze — the trigger is suspend, not Doze
+
+Shell cannot write `/sys/power/wake_lock` on a user build, but it holds
+`android.permission.WAKE_LOCK`. `wakehold/WakeHold.java` (run via
+`app_process`) takes a `PARTIAL_WAKE_LOCK` through `IPowerManager` as uid
+2000. Checked in `dumpsys power` with the screen off and deep Doze forced
+(`mWakefulness=Dozing`, `mState=IDLE`): the lock stays active (not
+`DISABLED` — Doze only disables app-uid locks) and holds the suspend
+blocker (`mHoldingWakeLockSuspendBlocker=true`); killing the holder releases
+it.
+
+`doze_repro.sh "W D W D W"` (2026-10-05 15:12–15:35), phone on the charger
+with `FAKE_UNPLUG=1` (`dumpsys battery unplug`, so Doze engages); W = the D
+setup plus the wake lock. Results:
+`~/starling-forensics/doze-repro-20261005-151249`.
+
+| trial | arm | outcome |
+|---|---|---|
+| 1 | W | clean, runs 2.25–2.51 s, lock held at the end |
+| 2 | D | wedge on cycle 1's first transcription; GPU rail 0.74–0.98 mW during the fence wait |
+| 3 | W | clean, runs 2.17–2.49 s, lock held at the end |
+| 4 | D | clean, runs 2.19–2.47 s |
+| 5 | W | clean, runs 2.19–2.45 s, lock held at the end |
+
+- The D control wedged with the P3-1 signature while the charger was
+  connected: physical discharge is not part of the trigger.
+- The W arms ran in forced deep Doze (`mState=IDLE`) with only suspend
+  blocked, and were clean in the normal band. Doze itself is not the
+  trigger; kernel suspend with GPU work outstanding is. A plugged-in phone
+  with the screen off can suspend too.
+- Tally (P3-1–P3-4): screen off without a lock 5/6 wedged, awake 0/13,
+  screen off in deep Doze under the lock 0/3 (W vs. unlocked: Fisher exact,
+  one-sided p = 6/126 ≈ 0.05). Small n on the W side; strong mechanism
+  evidence.
+
+Consequences landed: `phone_gates.sh` and `phone_energy.sh` hold the lock
+for the whole session (`phone_common.sh` `wake_hold` / `wake_release` /
+`wake_held`), and the protocol rule now names suspend. Open: the app's own
+wake lock is an app-uid lock, which deep Doze disables. App GPU work in
+deep idle needs a long stationary screen-off period first, so the window is
+small, but not closed.
