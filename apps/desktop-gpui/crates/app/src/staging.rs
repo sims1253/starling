@@ -271,16 +271,20 @@ impl StarlingApp {
     }
 
     /// The take was cancelled (#221): nothing will be transcribed. A
-    /// draft the user typed into is kept on screen (interrupted, with the
-    /// notice to copy it); an untouched one simply goes away.
-    pub(crate) fn staging_cancelled(&mut self, cx: &mut Context<Self>) {
-        let untouched = self
-            .staging
-            .as_ref()
-            .is_some_and(|staging| staging.editor.read(cx).buffer.text.trim().is_empty());
+    /// draft the user typed into stays on screen (interrupted, with the
+    /// notice to copy it) and its token is returned, so the cancel path
+    /// can bind it to the saved take — a bound draft survives the next
+    /// take starting. An untouched one simply goes away.
+    pub(crate) fn staging_cancelled(&mut self, cx: &mut Context<Self>) -> Option<u64> {
+        let staging = self.staging.as_ref()?;
+        let token = staging.token;
+        let untouched = staging.editor.read(cx).buffer.text.trim().is_empty();
         self.staging_interrupted(cx);
         if untouched {
             self.retire_staging(cx);
+            None
+        } else {
+            Some(token)
         }
     }
 
@@ -1198,6 +1202,37 @@ mod tests {
             "raw edited"
         );
         app.update(cx, |app, _| {
+            assert!(app.staging.is_none());
+            assert!(app.background_stagings.is_empty());
+        });
+    }
+
+    #[gpui::test]
+    fn a_cancelled_draft_with_edits_survives_the_next_take(cx: &mut gpui::TestAppContext) {
+        let app = cx.new(|cx| StarlingApp::for_test(None, cx));
+        app.update(cx, |app, cx| {
+            app.begin_staging(cx);
+            let editor = app.staging.as_ref().unwrap().editor.clone();
+            editor.update(cx, |editor, _| editor.buffer.text = "my words".into());
+            let token = app.staging_cancelled(cx).expect("an edited draft is kept");
+            // The cancel path binds it to the interrupted take it saved.
+            app.bind_staging(token, "cancelled-take");
+            app.begin_staging(cx);
+            assert!(
+                app.background_stagings
+                    .iter()
+                    .any(|staging| staging.take_id.as_deref() == Some("cancelled-take")),
+                "the edited draft must outlive the next take"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn an_untouched_cancelled_draft_just_goes_away(cx: &mut gpui::TestAppContext) {
+        let app = cx.new(|cx| StarlingApp::for_test(None, cx));
+        app.update(cx, |app, cx| {
+            app.begin_staging(cx);
+            assert_eq!(app.staging_cancelled(cx), None);
             assert!(app.staging.is_none());
             assert!(app.background_stagings.is_empty());
         });

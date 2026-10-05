@@ -86,23 +86,33 @@ impl Shortcut {
     }
 
     /// Whether an in-window key-down is this shortcut (exact modifiers).
+    /// With Shift, gpui may report the shifted character instead of the
+    /// key (`?` rather than shift-`/` on a US layout); both forms match.
     pub(crate) fn matches_key_down(&self, keystroke: &gpui::Keystroke) -> bool {
         let Some(key) = gpui_key(self.hotkey.key) else {
             return false;
         };
         let mods = self.hotkey.mods;
-        keystroke.key == key
-            && keystroke.modifiers.control == mods.contains(Modifiers::CONTROL)
+        let others = keystroke.modifiers.control == mods.contains(Modifiers::CONTROL)
             && keystroke.modifiers.alt == mods.contains(Modifiers::ALT)
-            && keystroke.modifiers.shift == mods.contains(Modifiers::SHIFT)
-            && keystroke.modifiers.platform == mods.contains(Modifiers::SUPER)
+            && keystroke.modifiers.platform == mods.contains(Modifiers::SUPER);
+        let shift = mods.contains(Modifiers::SHIFT);
+        let plain = keystroke.key == key && keystroke.modifiers.shift == shift;
+        let shifted = shift && us_shifted(&key).is_some_and(|symbol| keystroke.key == symbol);
+        others && (plain || shifted)
     }
 
     /// Whether an in-window key-up ends this shortcut. Only the key
     /// counts: people let go of the modifiers first as often as last, and
     /// a hold must end either way.
     pub(crate) fn matches_key_up(&self, keystroke: &gpui::Keystroke) -> bool {
-        gpui_key(self.hotkey.key).is_some_and(|key| keystroke.key == key)
+        gpui_key(self.hotkey.key).is_some_and(|key| {
+            keystroke.key == key || us_shifted(&key).is_some_and(|symbol| keystroke.key == symbol)
+        })
+    }
+
+    pub(crate) fn modifiers(&self) -> Modifiers {
+        self.hotkey.mods
     }
 
     /// Whether the window can see this shortcut at all (keys gpui does
@@ -112,13 +122,40 @@ impl Shortcut {
     }
 }
 
-/// Whether a bare in-window key-down is the Escape that cancels a take.
+/// Whether an in-window key-down is the Escape that cancels a take. Any
+/// modifiers count: the shortcut's own may still be held (Escape while
+/// holding Ctrl+Shift+Space must cancel, not wait for the release).
 pub(crate) fn is_escape(keystroke: &gpui::Keystroke) -> bool {
     keystroke.key == "escape"
-        && !keystroke.modifiers.control
-        && !keystroke.modifiers.alt
-        && !keystroke.modifiers.shift
-        && !keystroke.modifiers.platform
+}
+
+/// The character Shift turns a key into on a US layout, the form some
+/// platforms report a shifted symbol key in.
+fn us_shifted(key: &str) -> Option<&'static str> {
+    Some(match key {
+        "`" => "~",
+        "1" => "!",
+        "2" => "@",
+        "3" => "#",
+        "4" => "$",
+        "5" => "%",
+        "6" => "^",
+        "7" => "&",
+        "8" => "*",
+        "9" => "(",
+        "0" => ")",
+        "-" => "_",
+        "=" => "+",
+        "[" => "{",
+        "]" => "}",
+        "\\" => "|",
+        ";" => ":",
+        "'" => "\"",
+        "," => "<",
+        "." => ">",
+        "/" => "?",
+        _ => return None,
+    })
 }
 
 /// Keys that type text (or move through it) when pressed without a
@@ -212,13 +249,26 @@ pub(crate) struct GlobalShortcuts {
     manager: GlobalHotKeyManager,
     events: mpsc::Receiver<(u32, HotKeyState, Instant)>,
     record: Option<HotKey>,
-    escape: Option<HotKey>,
+    /// The Escape registrations while a take is active: bare Escape, and
+    /// Escape with the recording shortcut's modifiers (still held during a
+    /// push-to-talk take).
+    escape: Vec<HotKey>,
 }
 
 impl GlobalShortcuts {
     /// Create the manager and route its events here. Only one instance may
     /// exist: the event handler is process-wide.
     pub(crate) fn new() -> Result<GlobalShortcuts, String> {
+        // On Linux `global-hotkey` only speaks X11, and with no display it
+        // fails silently (its registrations report success with no backend
+        // behind them). Say so instead of claiming a registration.
+        if cfg!(target_os = "linux") && std::env::var_os("DISPLAY").is_none_or(|d| d.is_empty()) {
+            return Err(
+                "no X11 display (DISPLAY is not set); the system-wide shortcut needs X11 or \
+                 XWayland"
+                    .to_string(),
+            );
+        }
         let manager = GlobalHotKeyManager::new().map_err(|err| err.to_string())?;
         let (sender, events) = mpsc::channel();
         GlobalHotKeyEvent::set_event_handler(Some(move |event: GlobalHotKeyEvent| {
@@ -228,7 +278,7 @@ impl GlobalShortcuts {
             manager,
             events,
             record: None,
-            escape: None,
+            escape: Vec::new(),
         })
     }
 
@@ -249,31 +299,44 @@ impl GlobalShortcuts {
     }
 
     /// Grab Escape system-wide while a take is active, release it after.
-    pub(crate) fn arm_escape(&mut self, armed: bool) -> Result<(), String> {
-        match (armed, self.escape) {
-            (true, None) => {
-                let escape = HotKey::new(None, Code::Escape);
-                self.manager.register(escape).map_err(|err| err.to_string())?;
-                self.escape = Some(escape);
+    /// Bare Escape is required; Escape with the shortcut's modifiers is
+    /// best effort (the platform may reserve it, like Ctrl+Shift+Escape on
+    /// Windows), and the window still sees it either way.
+    pub(crate) fn arm_escape(&mut self, armed: bool, shortcut: &Shortcut) -> Result<(), String> {
+        if !armed {
+            let mut result = Ok(());
+            for escape in self.escape.drain(..) {
+                if let Err(err) = self.manager.unregister(escape) {
+                    result = Err(err.to_string());
+                }
             }
-            (false, Some(escape)) => {
-                self.escape = None;
-                self.manager.unregister(escape).map_err(|err| err.to_string())?;
+            return result;
+        }
+        if !self.escape.is_empty() {
+            return Ok(());
+        }
+        let bare = HotKey::new(None, Code::Escape);
+        self.manager.register(bare).map_err(|err| err.to_string())?;
+        self.escape.push(bare);
+        let mods = shortcut.modifiers();
+        if !mods.is_empty() {
+            let held = HotKey::new(Some(mods), Code::Escape);
+            if self.manager.register(held).is_ok() {
+                self.escape.push(held);
             }
-            _ => {}
         }
         Ok(())
     }
 
     pub(crate) fn escape_armed(&self) -> bool {
-        self.escape.is_some()
+        !self.escape.is_empty()
     }
 
     /// Events received since the last call, oldest first. Events for a
     /// shortcut that has since been replaced are dropped.
     pub(crate) fn drain(&self) -> Vec<GlobalEvent> {
         let record = self.record.map(|hotkey| hotkey.id());
-        let escape = self.escape.map(|hotkey| hotkey.id());
+        let escape: Vec<u32> = self.escape.iter().map(|hotkey| hotkey.id()).collect();
         self.events
             .try_iter()
             .filter_map(|(id, state, at)| {
@@ -282,7 +345,7 @@ impl GlobalShortcuts {
                         HotKeyState::Pressed => GlobalEvent::Pressed(at),
                         HotKeyState::Released => GlobalEvent::Released(at),
                     })
-                } else if Some(id) == escape && state == HotKeyState::Pressed {
+                } else if escape.contains(&id) && state == HotKeyState::Pressed {
                     Some(GlobalEvent::Escape(at))
                 } else {
                     None
@@ -387,9 +450,27 @@ mod tests {
     }
 
     #[test]
-    fn only_a_bare_escape_cancels() {
+    fn escape_cancels_even_with_the_shortcut_modifiers_held() {
         assert!(is_escape(&keystroke("escape")));
-        assert!(!is_escape(&keystroke("shift-escape")));
+        assert!(is_escape(&keystroke("ctrl-shift-escape")));
         assert!(!is_escape(&keystroke("space")));
+    }
+
+    #[test]
+    fn shifted_symbol_shortcuts_match_either_event_shape() {
+        let shortcut = Shortcut::parse("Ctrl+Shift+Slash").unwrap();
+        assert!(shortcut.matches_key_down(&keystroke("ctrl-shift-/")));
+        // gpui on Linux/macOS: Shift absorbed into the character.
+        let mut absorbed = keystroke("ctrl-?");
+        assert!(!absorbed.modifiers.shift);
+        assert!(shortcut.matches_key_down(&absorbed));
+        absorbed.modifiers.shift = true;
+        assert!(shortcut.matches_key_down(&absorbed));
+        assert!(shortcut.matches_key_up(&keystroke("?")));
+        // Without Shift in the shortcut, the symbol is a different key.
+        let plain = Shortcut::parse("Ctrl+Slash").unwrap();
+        assert!(!plain.matches_key_down(&keystroke("ctrl-?")));
+        let digit = Shortcut::parse("Ctrl+Shift+1").unwrap();
+        assert!(digit.matches_key_down(&keystroke("ctrl-!")));
     }
 }

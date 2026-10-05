@@ -312,8 +312,7 @@ impl StarlingApp {
     /// The on-screen record button: a toggle in every activation mode,
     /// through the same machine as the shortcut (#221).
     pub fn toggle_recording(&mut self, cx: &mut Context<Self>) {
-        let effects = self.activation.click(Instant::now());
-        self.apply_activation(effects, cx);
+        self.activation_input(|machine| machine.click(Instant::now()), cx);
     }
 
     /// Stop the running recorder and process the take as usual. Only the
@@ -469,6 +468,7 @@ impl StarlingApp {
                                         Arc::new(wav),
                                         journal_report,
                                         note,
+                                        None,
                                         cx,
                                     );
                                 })
@@ -582,7 +582,7 @@ impl StarlingApp {
         self.stream_sent_samples = 0;
         self.stream_degradation = None;
         self.levels = vec![0.06; 52];
-        self.staging_cancelled(cx);
+        let staging = self.staging_cancelled(cx);
         let (audio, journal_report) = match handle.stop() {
             Ok(take) => (Some(take.audio), take.journal),
             Err(recorder::RecorderError::QuiesceTimeout { audio, journal, .. }) => {
@@ -598,6 +598,12 @@ impl StarlingApp {
             audio.samples.splice(0..0, streamed_samples);
             audio
         });
+        // Only a clean, finalized journal is adopted as the take's audio.
+        // A faulted one holds just the prefix written before the fault;
+        // adopting it would drop the words spoken after it, so the full
+        // in-memory take is stored instead.
+        let journal_report =
+            journal_report.filter(|report| report.finalized && report.fault.is_none());
         let kept = audio.as_ref().is_some_and(|audio| !audio.samples.is_empty());
         match reason {
             CancelReason::Escape => {
@@ -641,7 +647,9 @@ impl StarlingApp {
                 .await;
             this.update(cx, |app, cx| {
                 match encoded {
-                    Ok(wav) => app.save_interrupted_take(Arc::new(wav), journal_report, note, cx),
+                    Ok(wav) => {
+                        app.save_interrupted_take(Arc::new(wav), journal_report, note, staging, cx)
+                    }
                     Err(err) => {
                         app.error = Some(err.to_string());
                         cx.notify();
@@ -737,6 +745,7 @@ impl StarlingApp {
         wav: Arc<Vec<u8>>,
         journal: Option<recorder::JournalReport>,
         note: String,
+        staging: Option<u64>,
         cx: &mut Context<Self>,
     ) {
         let Some(store) = self.store.clone() else {
@@ -747,6 +756,9 @@ impl StarlingApp {
             self.stash_unsaved(wav, &format!(
                 "Local storage failed: {reason} Keep this window open and download the unsaved WAV to recover it."
             ));
+            if let Some(token) = staging {
+                self.staging_save_failed(token, cx);
+            }
             cx.notify();
             return;
         };
@@ -759,11 +771,17 @@ impl StarlingApp {
                 })
                 .await;
             match created {
-                Ok(_id) => {
+                Ok(id) => {
+                    if let Some(token) = staging {
+                        this.update(cx, |app, _cx| app.bind_staging(token, &id)).ok();
+                    }
                     refresh_sessions(&this, &store, cx).await;
                 }
                 Err(err) => {
                     this.update(cx, |app, cx| {
+                        if let Some(token) = staging {
+                            app.staging_save_failed(token, cx);
+                        }
                         app.stash_unsaved(wav, &format!(
                             "Local storage failed: {err} Keep this window open and download the unsaved WAV to recover it."
                         ));

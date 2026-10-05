@@ -61,6 +61,36 @@ pub(crate) const DOUBLE_TAP_WINDOW: Duration = Duration::from_millis(400);
 /// runs on, so a longer silence means the release was lost.
 pub(crate) const REPEAT_GAP: Duration = Duration::from_millis(1200);
 
+/// The same press (or release) reported by both the system-wide grab and
+/// the window within this long is one physical event, whatever order the
+/// two reports arrive in.
+pub(crate) const DUPLICATE_WINDOW: Duration = Duration::from_millis(150);
+
+/// Where a shortcut press or release was observed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Source {
+    /// The system-wide registration (`global-hotkey`).
+    System,
+    /// The Starling window's own key events.
+    Window,
+}
+
+impl Source {
+    fn index(self) -> usize {
+        match self {
+            Source::System => 0,
+            Source::Window => 1,
+        }
+    }
+
+    fn other(self) -> Source {
+        match self {
+            Source::System => Source::Window,
+            Source::Window => Source::System,
+        }
+    }
+}
+
 /// A take whose microphone has delivered no samples this long after the
 /// start is cancelled: the device is not producing audio, and recording
 /// nothing indefinitely would be a stuck take.
@@ -160,6 +190,10 @@ pub(crate) struct Activation {
     phase: Phase,
     key_down: bool,
     last_key_event: Option<Instant>,
+    /// Per source, when it last reported a press and a release: a report
+    /// that the other source already made is a duplicate.
+    last_press: [Option<Instant>; 2],
+    last_release: [Option<Instant>; 2],
     last_take: TakeId,
 }
 
@@ -170,6 +204,8 @@ impl Activation {
             phase: Phase::Idle,
             key_down: false,
             last_key_event: None,
+            last_press: [None; 2],
+            last_release: [None; 2],
             last_take: 0,
         }
     }
@@ -217,10 +253,32 @@ impl Activation {
         }
     }
 
+    /// The shortcut changed: forget the old key's state.
+    pub(crate) fn reset_key(&mut self) {
+        self.key_down = false;
+        self.last_key_event = None;
+        self.last_press = [None; 2];
+        self.last_release = [None; 2];
+    }
+
+    /// Whether `source` reporting an event at `now` repeats one the other
+    /// source already reported; records it otherwise.
+    fn duplicate(log: &mut [Option<Instant>; 2], source: Source, now: Instant) -> bool {
+        let other = log[source.other().index()];
+        if other.is_some_and(|at| abs_diff(at, now) < DUPLICATE_WINDOW) {
+            return true;
+        }
+        log[source.index()] = Some(now);
+        false
+    }
+
     /// The shortcut went down. `may_start` is false while the app must
     /// not begin a take (a modal is open): such a press can still stop
     /// the active take, but never starts one.
-    pub(crate) fn press(&mut self, now: Instant, may_start: bool) -> Vec<Effect> {
+    pub(crate) fn press(&mut self, now: Instant, source: Source, may_start: bool) -> Vec<Effect> {
+        if Self::duplicate(&mut self.last_press, source, now) {
+            return Vec::new();
+        }
         if self.key_down {
             let repeat = self
                 .last_key_event
@@ -269,7 +327,10 @@ impl Activation {
     }
 
     /// The shortcut went up.
-    pub(crate) fn release(&mut self, now: Instant) -> Vec<Effect> {
+    pub(crate) fn release(&mut self, now: Instant, source: Source) -> Vec<Effect> {
+        if Self::duplicate(&mut self.last_release, source, now) {
+            return Vec::new();
+        }
         if !self.key_down {
             return Vec::new();
         }
@@ -430,6 +491,10 @@ impl Activation {
     }
 }
 
+fn abs_diff(a: Instant, b: Instant) -> Duration {
+    a.saturating_duration_since(b).max(b.saturating_duration_since(a))
+}
+
 /// The capture pane's headline for the active take: listening is only
 /// claimed once real samples arrived.
 pub(crate) fn readiness_headline(readiness: Option<Readiness>) -> &'static str {
@@ -514,23 +579,24 @@ impl StarlingApp {
         cx: &mut Context<Self>,
     ) -> bool {
         if self.activation.is_active() && crate::shortcut::is_escape(keystroke) {
-            let effects = self.activation.escape();
-            self.apply_activation(effects, cx);
+            self.activation_input(|machine| machine.escape(), cx);
             return true;
         }
         if !self.shortcut.matches_key_down(keystroke) {
             return false;
         }
-        let effects = self.activation.press(Instant::now(), !self.settings_open);
-        self.apply_activation(effects, cx);
+        let may_start = !self.settings_open;
+        self.activation_input(
+            |machine| machine.press(Instant::now(), Source::Window, may_start),
+            cx,
+        );
         true
     }
 
     /// An in-window key-up: the release of a held shortcut.
     pub(crate) fn shortcut_key_up(&mut self, keystroke: &gpui::Keystroke, cx: &mut Context<Self>) {
         if self.shortcut.matches_key_up(keystroke) {
-            let effects = self.activation.release(Instant::now());
-            self.apply_activation(effects, cx);
+            self.activation_input(|machine| machine.release(Instant::now(), Source::Window), cx);
         }
     }
 
@@ -541,17 +607,32 @@ impl StarlingApp {
             .as_ref()
             .map(GlobalShortcuts::drain)
             .unwrap_or_default();
+        let may_start = !self.settings_open;
         for event in events {
-            let effects = match event {
-                GlobalEvent::Pressed(at) => self.activation.press(at, !self.settings_open),
-                GlobalEvent::Released(at) => self.activation.release(at),
-                GlobalEvent::Escape(_) => self.activation.escape(),
-            };
-            self.apply_activation(effects, cx);
+            self.activation_input(
+                |machine| match event {
+                    GlobalEvent::Pressed(at) => machine.press(at, Source::System, may_start),
+                    GlobalEvent::Released(at) => machine.release(at, Source::System),
+                    GlobalEvent::Escape(_) => machine.escape(),
+                },
+                cx,
+            );
         }
-        let effects = self.activation.tick(Instant::now());
-        self.apply_activation(effects, cx);
+        self.activation_input(|machine| machine.tick(Instant::now()), cx);
+    }
+
+    /// Feed one input to the machine and perform its effects. Readiness
+    /// is refreshed first, so a stop or stall decision never acts on a
+    /// sample count older than the input itself: audio that already
+    /// arrived is never cancelled as "no audio".
+    pub(crate) fn activation_input(
+        &mut self,
+        input: impl FnOnce(&mut Activation) -> Vec<Effect>,
+        cx: &mut Context<Self>,
+    ) {
         self.check_readiness(cx);
+        let effects = input(&mut self.activation);
+        self.apply_activation(effects, cx);
     }
 
     /// Readiness tracks real audio: listening is announced once the
@@ -599,8 +680,35 @@ impl StarlingApp {
                 Effect::Listening(_) => {}
             }
         }
+        if !self.activation.is_active() {
+            // A shortcut saved mid-take takes over once the take ended, so
+            // the held key's release still finishes the take it started.
+            if let Some(shortcut) = self.pending_shortcut.take() {
+                self.apply_shortcut(shortcut);
+            }
+        }
         self.sync_escape_grab();
         cx.notify();
+    }
+
+    /// Make `shortcut` the recording shortcut — now when no take runs,
+    /// otherwise when the take ends.
+    pub(crate) fn set_shortcut(&mut self, shortcut: crate::shortcut::Shortcut) {
+        if self.activation.is_active() {
+            self.pending_shortcut = Some(shortcut);
+        } else {
+            self.pending_shortcut = None;
+            self.apply_shortcut(shortcut);
+        }
+    }
+
+    fn apply_shortcut(&mut self, shortcut: crate::shortcut::Shortcut) {
+        if shortcut == self.shortcut {
+            return;
+        }
+        self.shortcut = shortcut;
+        self.activation.reset_key();
+        self.register_shortcut();
     }
 
     /// Escape is grabbed system-wide exactly while a take is active.
@@ -610,7 +718,7 @@ impl StarlingApp {
             return;
         };
         if shortcuts.escape_armed() != active {
-            if let Err(reason) = shortcuts.arm_escape(active) {
+            if let Err(reason) = shortcuts.arm_escape(active, &self.shortcut) {
                 // In-window Escape still cancels; only the system-wide
                 // grab is missing.
                 eprintln!("Escape could not be grabbed system-wide: {reason}");
@@ -636,7 +744,7 @@ mod tests {
 
     /// Start a take at `t0` and report its first samples.
     fn start_listening(machine: &mut Activation, t0: Instant) -> TakeId {
-        let effects = machine.press(t0, true);
+        let effects = machine.press(t0, Source::Window, true);
         let [Effect::Start(take)] = effects[..] else {
             panic!("expected a start, got {effects:?}");
         };
@@ -650,10 +758,10 @@ mod tests {
         let t0 = Instant::now();
         let take = start_listening(&mut m, t0);
         assert_eq!(m.latch(), Some(Latch::Latched));
-        assert!(m.release(t0 + ms(80)).is_empty());
+        assert!(m.release(t0 + ms(80), Source::Window).is_empty());
         assert!(m.is_active());
-        assert_eq!(m.press(t0 + ms(2000), true), vec![Effect::Finish(take)]);
-        assert!(m.release(t0 + ms(2080)).is_empty());
+        assert_eq!(m.press(t0 + ms(2000), Source::Window, true), vec![Effect::Finish(take)]);
+        assert!(m.release(t0 + ms(2080), Source::Window).is_empty());
         assert!(!m.is_active());
     }
 
@@ -663,7 +771,7 @@ mod tests {
         let t0 = Instant::now();
         let take = start_listening(&mut m, t0);
         assert_eq!(m.latch(), Some(Latch::Held));
-        assert_eq!(m.release(t0 + ms(1500)), vec![Effect::Finish(take)]);
+        assert_eq!(m.release(t0 + ms(1500), Source::Window), vec![Effect::Finish(take)]);
         assert!(!m.is_active());
     }
 
@@ -672,7 +780,7 @@ mod tests {
         let mut m = machine(ActivationMode::Hold, false);
         let t0 = Instant::now();
         let take = start_listening(&mut m, t0);
-        assert_eq!(m.release(t0 + ms(100)), vec![Effect::Finish(take)]);
+        assert_eq!(m.release(t0 + ms(100), Source::Window), vec![Effect::Finish(take)]);
     }
 
     #[test]
@@ -680,15 +788,15 @@ mod tests {
         let mut m = machine(ActivationMode::HoldOrToggle, false);
         let t0 = Instant::now();
         let take = start_listening(&mut m, t0);
-        assert!(m.release(t0 + ms(150)).is_empty());
+        assert!(m.release(t0 + ms(150), Source::Window).is_empty());
         assert_eq!(m.latch(), Some(Latch::Latched));
-        assert_eq!(m.press(t0 + ms(3000), true), vec![Effect::Finish(take)]);
+        assert_eq!(m.press(t0 + ms(3000), Source::Window, true), vec![Effect::Finish(take)]);
         // The stopping press's release does nothing.
-        assert!(m.release(t0 + ms(3100)).is_empty());
+        assert!(m.release(t0 + ms(3100), Source::Window).is_empty());
 
         let t1 = t0 + ms(5000);
         let take = start_listening(&mut m, t1);
-        assert_eq!(m.release(t1 + ms(900)), vec![Effect::Finish(take)]);
+        assert_eq!(m.release(t1 + ms(900), Source::Window), vec![Effect::Finish(take)]);
     }
 
     #[test]
@@ -696,15 +804,15 @@ mod tests {
         let mut m = machine(ActivationMode::Hold, true);
         let t0 = Instant::now();
         let take = start_listening(&mut m, t0);
-        assert!(m.release(t0 + ms(120)).is_empty());
+        assert!(m.release(t0 + ms(120), Source::Window).is_empty());
         // Waiting for the second tap: not held any more.
         assert_eq!(m.latch(), Some(Latch::Latched));
-        assert!(m.press(t0 + ms(300), true).is_empty());
+        assert!(m.press(t0 + ms(300), Source::Window, true).is_empty());
         assert_eq!(m.latch(), Some(Latch::HandsFree));
-        assert!(m.release(t0 + ms(380)).is_empty());
+        assert!(m.release(t0 + ms(380), Source::Window).is_empty());
         assert!(m.tick(t0 + ms(5000)).is_empty());
         assert!(m.is_active());
-        assert_eq!(m.press(t0 + ms(9000), true), vec![Effect::Finish(take)]);
+        assert_eq!(m.press(t0 + ms(9000), Source::Window, true), vec![Effect::Finish(take)]);
     }
 
     #[test]
@@ -712,7 +820,7 @@ mod tests {
         let mut m = machine(ActivationMode::Hold, true);
         let t0 = Instant::now();
         let take = start_listening(&mut m, t0);
-        assert!(m.release(t0 + ms(120)).is_empty());
+        assert!(m.release(t0 + ms(120), Source::Window).is_empty());
         assert!(m.tick(t0 + ms(120) + DOUBLE_TAP_WINDOW).is_empty());
         assert_eq!(
             m.tick(t0 + ms(121) + DOUBLE_TAP_WINDOW),
@@ -725,9 +833,9 @@ mod tests {
         let mut m = machine(ActivationMode::Hold, true);
         let t0 = Instant::now();
         let take = start_listening(&mut m, t0);
-        assert!(m.release(t0 + ms(100)).is_empty());
+        assert!(m.release(t0 + ms(100), Source::Window).is_empty());
         // No tick ran in between: the press itself sees the expired window.
-        let effects = m.press(t0 + ms(100) + DOUBLE_TAP_WINDOW + ms(50), true);
+        let effects = m.press(t0 + ms(100) + DOUBLE_TAP_WINDOW + ms(50), Source::Window, true);
         assert_eq!(effects, vec![Effect::Finish(take), Effect::Start(take + 1)]);
         assert_eq!(m.latch(), Some(Latch::Held));
     }
@@ -737,7 +845,7 @@ mod tests {
         let mut m = machine(ActivationMode::Hold, true);
         let t0 = Instant::now();
         let take = start_listening(&mut m, t0);
-        assert_eq!(m.release(t0 + ms(800)), vec![Effect::Finish(take)]);
+        assert_eq!(m.release(t0 + ms(800), Source::Window), vec![Effect::Finish(take)]);
     }
 
     #[test]
@@ -753,12 +861,12 @@ mod tests {
             // Windows-style repeats: an initial delay, then every 33 ms.
             let mut at = t0 + ms(500);
             for _ in 0..200 {
-                assert!(m.press(at, true).is_empty(), "{mode:?}");
+                assert!(m.press(at, Source::Window, true).is_empty(), "{mode:?}");
                 at += ms(33);
             }
             assert_eq!(m.active_take(), Some(take), "{mode:?}");
             // The long hold ends: hold-like modes finish, toggle keeps going.
-            let released = m.release(at);
+            let released = m.release(at, Source::Window);
             match mode {
                 ActivationMode::Toggle => assert!(released.is_empty()),
                 _ => assert_eq!(released, vec![Effect::Finish(take)], "{mode:?}"),
@@ -771,16 +879,16 @@ mod tests {
         let mut m = machine(ActivationMode::Toggle, false);
         let t0 = Instant::now();
         let first = start_listening(&mut m, t0);
-        assert!(m.release(t0 + ms(30)).is_empty());
-        assert_eq!(m.press(t0 + ms(60), true), vec![Effect::Finish(first)]);
-        assert!(m.release(t0 + ms(90)).is_empty());
-        let effects = m.press(t0 + ms(120), true);
+        assert!(m.release(t0 + ms(30), Source::Window).is_empty());
+        assert_eq!(m.press(t0 + ms(60), Source::Window, true), vec![Effect::Finish(first)]);
+        assert!(m.release(t0 + ms(90), Source::Window).is_empty());
+        let effects = m.press(t0 + ms(120), Source::Window, true);
         assert_eq!(effects, vec![Effect::Start(first + 1)]);
-        assert!(m.release(t0 + ms(150)).is_empty());
+        assert!(m.release(t0 + ms(150), Source::Window).is_empty());
         // Stopped before its microphone delivered anything: cancelled,
         // never persisted as an empty take.
         assert_eq!(
-            m.press(t0 + ms(180), true),
+            m.press(t0 + ms(180), Source::Window, true),
             vec![Effect::Cancel(first + 1, CancelReason::NoAudioYet)]
         );
     }
@@ -792,11 +900,11 @@ mod tests {
         let take = start_listening(&mut m, t0);
         // The release never arrived (focus moved). A press long after the
         // last key event finishes the take and starts nothing.
-        assert_eq!(m.press(t0 + ms(4000), true), vec![Effect::Finish(take)]);
+        assert_eq!(m.press(t0 + ms(4000), Source::Window, true), vec![Effect::Finish(take)]);
         assert!(!m.is_active());
         // Its own release is ignored, and the next press starts normally.
-        assert!(m.release(t0 + ms(4100)).is_empty());
-        assert_eq!(m.press(t0 + ms(6000), true), vec![Effect::Start(take + 1)]);
+        assert!(m.release(t0 + ms(4100), Source::Window).is_empty());
+        assert_eq!(m.press(t0 + ms(6000), Source::Window, true), vec![Effect::Start(take + 1)]);
     }
 
     #[test]
@@ -804,9 +912,9 @@ mod tests {
         let mut m = machine(ActivationMode::Toggle, false);
         let t0 = Instant::now();
         let take = start_listening(&mut m, t0);
-        assert_eq!(m.press(t0 + ms(3000), true), vec![Effect::Finish(take)]);
+        assert_eq!(m.press(t0 + ms(3000), Source::Window, true), vec![Effect::Finish(take)]);
         // That press's release was lost; the next real press still works.
-        assert_eq!(m.press(t0 + ms(8000), true), vec![Effect::Start(take + 1)]);
+        assert_eq!(m.press(t0 + ms(8000), Source::Window, true), vec![Effect::Start(take + 1)]);
     }
 
     #[test]
@@ -814,14 +922,14 @@ mod tests {
         let mut m = machine(ActivationMode::Hold, true);
         let t0 = Instant::now();
         let take = start_listening(&mut m, t0);
-        assert!(m.release(t0 + ms(100)).is_empty());
-        assert!(m.press(t0 + ms(250), true).is_empty());
+        assert!(m.release(t0 + ms(100), Source::Window).is_empty());
+        assert!(m.press(t0 + ms(250), Source::Window, true).is_empty());
         assert_eq!(m.latch(), Some(Latch::HandsFree));
         assert_eq!(m.escape(), vec![Effect::Cancel(take, CancelReason::Escape)]);
         assert_eq!(m.latch(), None);
         assert!(m.escape().is_empty());
         // The second tap's release after Escape does nothing.
-        assert!(m.release(t0 + ms(300)).is_empty());
+        assert!(m.release(t0 + ms(300), Source::Window).is_empty());
         assert!(!m.is_active());
     }
 
@@ -831,15 +939,15 @@ mod tests {
         let t0 = Instant::now();
         let take = start_listening(&mut m, t0);
         assert_eq!(m.escape(), vec![Effect::Cancel(take, CancelReason::Escape)]);
-        assert!(m.release(t0 + ms(2000)).is_empty());
-        assert_eq!(m.press(t0 + ms(3000), true), vec![Effect::Start(take + 1)]);
+        assert!(m.release(t0 + ms(2000), Source::Window).is_empty());
+        assert_eq!(m.press(t0 + ms(3000), Source::Window, true), vec![Effect::Start(take + 1)]);
     }
 
     #[test]
     fn listening_is_announced_once_and_only_for_the_live_take() {
         let mut m = machine(ActivationMode::Toggle, false);
         let t0 = Instant::now();
-        let [Effect::Start(take)] = m.press(t0, true)[..] else {
+        let [Effect::Start(take)] = m.press(t0, Source::Window, true)[..] else {
             panic!("expected a start");
         };
         assert_eq!(m.readiness(), Some(Readiness::Starting));
@@ -854,21 +962,21 @@ mod tests {
     fn no_listening_after_a_failed_start_or_a_cancel() {
         let mut m = machine(ActivationMode::Toggle, false);
         let t0 = Instant::now();
-        let [Effect::Start(take)] = m.press(t0, true)[..] else {
+        let [Effect::Start(take)] = m.press(t0, Source::Window, true)[..] else {
             panic!("expected a start");
         };
         m.start_failed(take);
         assert!(!m.is_active());
         assert!(m.samples_arrived(take).is_empty());
-        assert!(m.release(t0 + ms(50)).is_empty());
+        assert!(m.release(t0 + ms(50), Source::Window).is_empty());
 
-        let [Effect::Start(next)] = m.press(t0 + ms(2000), true)[..] else {
+        let [Effect::Start(next)] = m.press(t0 + ms(2000), Source::Window, true)[..] else {
             panic!("expected a start");
         };
         assert_eq!(m.escape(), vec![Effect::Cancel(next, CancelReason::Escape)]);
         assert!(m.samples_arrived(next).is_empty());
         // A stale failure report cannot end a newer take.
-        let [Effect::Start(third)] = m.press(t0 + ms(4000), true)[..] else {
+        let [Effect::Start(third)] = m.press(t0 + ms(4000), Source::Window, true)[..] else {
             panic!("expected a start");
         };
         m.start_failed(next);
@@ -879,7 +987,7 @@ mod tests {
     fn a_microphone_that_never_delivers_is_cancelled_not_stuck() {
         let mut m = machine(ActivationMode::Toggle, false);
         let t0 = Instant::now();
-        let [Effect::Start(take)] = m.press(t0, true)[..] else {
+        let [Effect::Start(take)] = m.press(t0, Source::Window, true)[..] else {
             panic!("expected a start");
         };
         assert!(m.tick(t0 + START_STALL - ms(1)).is_empty());
@@ -904,19 +1012,19 @@ mod tests {
     fn a_modal_blocks_starting_but_not_stopping() {
         let mut m = machine(ActivationMode::Toggle, false);
         let t0 = Instant::now();
-        assert!(m.press(t0, false).is_empty());
-        assert!(m.release(t0 + ms(50)).is_empty());
+        assert!(m.press(t0, Source::Window, false).is_empty());
+        assert!(m.release(t0 + ms(50), Source::Window).is_empty());
         let take = start_listening(&mut m, t0 + ms(1000));
-        assert!(m.release(t0 + ms(1050)).is_empty());
-        assert_eq!(m.press(t0 + ms(2000), false), vec![Effect::Finish(take)]);
+        assert!(m.release(t0 + ms(1050), Source::Window).is_empty());
+        assert_eq!(m.press(t0 + ms(2000), Source::Window, false), vec![Effect::Finish(take)]);
     }
 
     #[test]
     fn a_hold_through_an_opening_modal_does_not_start_on_release() {
         let mut m = machine(ActivationMode::HoldOrToggle, false);
         let t0 = Instant::now();
-        assert!(m.press(t0, false).is_empty());
-        assert!(m.release(t0 + ms(100)).is_empty());
+        assert!(m.press(t0, Source::Window, false).is_empty());
+        assert!(m.release(t0 + ms(100), Source::Window).is_empty());
         assert!(!m.is_active());
     }
 
@@ -948,9 +1056,9 @@ mod tests {
             mode: ActivationMode::Toggle,
             double_tap_hands_free: false,
         });
-        assert!(m.release(t0 + ms(2000)).is_empty());
+        assert!(m.release(t0 + ms(2000), Source::Window).is_empty());
         assert_eq!(m.latch(), Some(Latch::Latched));
-        assert_eq!(m.press(t0 + ms(4000), true), vec![Effect::Finish(take)]);
+        assert_eq!(m.press(t0 + ms(4000), Source::Window, true), vec![Effect::Finish(take)]);
     }
 
     #[test]
@@ -966,6 +1074,48 @@ mod tests {
         assert_eq!(
             finish_hint(Some(Latch::HandsFree), "F9").as_deref(),
             Some("Hands-free · press F9 to finish · Esc cancels")
+        );
+    }
+
+    #[test]
+    fn one_gesture_reported_by_both_sources_acts_once_in_any_order() {
+        // The window handles press and release before the system-wide
+        // press (timestamped at the same instant) reaches the poll loop.
+        let mut m = machine(ActivationMode::Toggle, false);
+        let t0 = Instant::now();
+        let take = start_listening(&mut m, t0);
+        assert!(m.release(t0 + ms(60), Source::Window).is_empty());
+        assert!(m.press(t0 + ms(1), Source::System, true).is_empty());
+        assert!(m.release(t0 + ms(61), Source::System).is_empty());
+        assert_eq!(m.active_take(), Some(take));
+        // The next real press (from either source) stops it.
+        assert_eq!(
+            m.press(t0 + ms(2000), Source::System, true),
+            vec![Effect::Finish(take)]
+        );
+        assert!(m.press(t0 + ms(2002), Source::Window, true).is_empty());
+
+        // Hold mode: a late duplicate press must not start a second take.
+        let mut m = machine(ActivationMode::Hold, false);
+        let take = start_listening(&mut m, t0);
+        assert_eq!(m.release(t0 + ms(900), Source::Window), vec![Effect::Finish(take)]);
+        assert!(m.press(t0 + ms(2), Source::System, true).is_empty());
+        assert!(m.release(t0 + ms(901), Source::System).is_empty());
+        assert!(!m.is_active());
+    }
+
+    #[test]
+    fn a_new_shortcut_starts_with_a_clean_key_state() {
+        let mut m = machine(ActivationMode::Toggle, false);
+        let t0 = Instant::now();
+        let take = start_listening(&mut m, t0);
+        assert!(m.release(t0 + ms(50), Source::Window).is_empty());
+        assert_eq!(m.press(t0 + ms(1000), Source::Window, true), vec![Effect::Finish(take)]);
+        // The old key is still down when the shortcut changes.
+        m.reset_key();
+        assert_eq!(
+            m.press(t0 + ms(1100), Source::Window, true),
+            vec![Effect::Start(take + 1)]
         );
     }
 

@@ -468,6 +468,9 @@ pub struct StarlingApp {
     /// The committed dictation settings and the shortcut they name.
     pub(crate) dictation_settings: DictationSettings,
     pub(crate) shortcut: crate::shortcut::Shortcut,
+    /// A shortcut saved while a take was running: it takes over when the
+    /// take ends, so the held key's release still finishes that take.
+    pub(crate) pending_shortcut: Option<crate::shortcut::Shortcut>,
     /// The system-wide registrations (absent in tests and where the
     /// platform offers none), and how registering the shortcut went.
     pub(crate) global_shortcuts: Option<crate::shortcut::GlobalShortcuts>,
@@ -1042,6 +1045,7 @@ impl StarlingApp {
             draft_double_tap: dictation_settings.double_tap_hands_free,
             dictation_draft_error: None,
             shortcut,
+            pending_shortcut: None,
             dictation_settings,
             global_shortcuts: None,
             shortcut_registration: Ok(()),
@@ -1781,10 +1785,7 @@ impl StarlingApp {
         };
         self.activation
             .set_config(crate::activation::ActivationConfig::from_settings(&self.dictation_settings));
-        if shortcut != self.shortcut {
-            self.shortcut = shortcut;
-            self.register_shortcut();
-        }
+        self.set_shortcut(shortcut);
 
         // R11: an unresolvable config directory is surfaced, not swallowed —
         // settings must not silently land in the current working directory.
