@@ -45,7 +45,7 @@ use std::ffi::OsString;
 use std::io::{self, Read, Write};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
@@ -101,6 +101,33 @@ struct SendHandle(HANDLE);
 // SAFETY: the handle is a kernel object identifier, not a pointer into
 // this process's memory; Win32 calls on one handle are thread-safe.
 unsafe impl Send for SendHandle {}
+
+/// A connected server instance in flight from the acceptor to
+/// `accept()`. Owning: an instance still queued when the listener goes
+/// away (a connection burst just before shutdown) — or bounced back to
+/// the acceptor by a closed channel — is disconnected and closed on
+/// drop, never leaked with the pipe name it keeps bound.
+struct ConnectedInstance(Option<SendHandle>);
+
+impl ConnectedInstance {
+    /// Hands the handle to its new owner (`PipeConn`).
+    fn into_handle(mut self) -> SendHandle {
+        self.0.take().expect("an instance is taken once")
+    }
+}
+
+impl Drop for ConnectedInstance {
+    fn drop(&mut self) {
+        if let Some(SendHandle(handle)) = self.0.take() {
+            // SAFETY: an instance this wrapper still owns — never handed
+            // out — closed exactly once.
+            unsafe {
+                DisconnectNamedPipe(handle);
+                CloseHandle(handle);
+            }
+        }
+    }
+}
 
 /// The current process user's SID, as a string (S-1-5-21-…).
 fn current_user_sid() -> io::Result<String> {
@@ -371,7 +398,7 @@ pub fn listen(path: &Path) -> io::Result<Box<dyn TransportListener>> {
         // park the acceptor in `send` (backpressure at connection time)
         // rather than accumulate unbounded connected instances.
         let first = SendHandle(handle);
-        let (tx, rx) = mpsc::sync_channel::<io::Result<SendHandle>>(4);
+        let (tx, rx) = mpsc::sync_channel::<io::Result<ConnectedInstance>>(4);
         let name_for_thread = name.clone();
         let acceptor = std::thread::Builder::new()
             .name("starling-host-pipe-accept".into())
@@ -398,7 +425,7 @@ pub fn listen(path: &Path) -> io::Result<Box<dyn TransportListener>> {
 fn acceptor_loop(
     name: Vec<u16>,
     mut current: SendHandle,
-    tx: mpsc::SyncSender<io::Result<SendHandle>>,
+    tx: mpsc::SyncSender<io::Result<ConnectedInstance>>,
 ) {
     loop {
         let connected = unsafe { connect_instance(current.0) };
@@ -454,20 +481,12 @@ fn acceptor_loop(
                 continue;
             }
         }
-        match tx.send(Ok(current)) {
+        match tx.send(Ok(ConnectedInstance(Some(current)))) {
             Ok(()) => {}
-            Err(sent) => {
-                // Listener gone: nobody will service this instance. The
-                // value bounced back is the one we tried to send — the
-                // connected instance by construction.
-                if let Ok(SendHandle(dead)) = sent.0 {
-                    unsafe {
-                        DisconnectNamedPipe(dead);
-                        CloseHandle(dead);
-                    }
-                }
-                return;
-            }
+            // Listener gone: nobody will service this instance. The
+            // bounced value is the connected instance, disconnected and
+            // closed as it drops here.
+            Err(_bounced) => return,
         }
         current = match unsafe { create_instance(&name) } {
             Ok(next) => next,
@@ -624,7 +643,7 @@ pub struct PipeListener {
     name: Vec<u16>,
     /// `Option` so `Drop` can end the channel **before** joining the
     /// acceptor (see [`Drop for PipeListener`]).
-    connections: Option<mpsc::Receiver<io::Result<SendHandle>>>,
+    connections: Option<mpsc::Receiver<io::Result<ConnectedInstance>>>,
     /// Kept alive so the acceptor thread's channel has a sender-side
     /// counterpart to observe; joined on Drop.
     _acceptor: std::thread::JoinHandle<()>,
@@ -641,7 +660,7 @@ impl TransportListener for PipeListener {
         match connections.try_recv() {
             Ok(result) => {
                 let conn = PipeConn {
-                    handle: result?,
+                    handle: result?.into_handle(),
                     server: true,
                     shared: Arc::default(),
                 };
@@ -779,24 +798,47 @@ impl Drop for OwnedHandle {
     }
 }
 
-/// Lingering disconnects still in flight. A linger holds pipe handles,
-/// and pipe handles keep the pipe name alive: the host finishes them
-/// ([`finish_pending_closes`]) before it releases ownership, so a
-/// successor never finds the old host's instances still bound.
-static LINGERS: std::sync::Mutex<Vec<std::thread::JoinHandle<()>>> =
-    std::sync::Mutex::new(Vec::new());
+/// Lingering disconnects still in flight, process-wide. A linger holds
+/// pipe handles, and pipe handles keep the pipe name alive: the host
+/// waits for this to reach zero ([`finish_pending_closes`]) before it
+/// releases ownership, so a successor never finds the old host's
+/// instances still bound. A count, not a list of join handles: every
+/// finisher waits for *all* lingers, so two hosts shutting down in one
+/// process can never take each other's work and return early.
+static PENDING_LINGERS: AtomicUsize = AtomicUsize::new(0);
 
-/// Waits for every lingering disconnect to finish (each is bounded by
-/// [`DISCONNECT_LINGER`] — the disconnect at its end also ends a parked
-/// flush), so no handle of this process's pipe instances outlives the
-/// caller. The host calls this on shutdown after its connections close
-/// and before it releases the lease.
+/// Upper bound on [`finish_pending_closes`]: one linger's own bound plus
+/// slack for its disconnect and thread exit.
+const LINGER_DRAIN: Duration = Duration::from_secs(4);
+
+/// Counts one linger in [`PENDING_LINGERS`] for exactly as long as it
+/// lives — moved into the linger's closure, so it is released when the
+/// linger finishes *or* when a failed spawn drops the closure unrun.
+struct LingerGuard;
+
+impl LingerGuard {
+    fn new() -> LingerGuard {
+        PENDING_LINGERS.fetch_add(1, Ordering::SeqCst);
+        LingerGuard
+    }
+}
+
+impl Drop for LingerGuard {
+    fn drop(&mut self) {
+        PENDING_LINGERS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Waits (bounded by [`LINGER_DRAIN`]) until no lingering disconnect is
+/// in flight, so no handle of this process's pipe instances outlives the
+/// caller. Each linger ends within [`DISCONNECT_LINGER`] — the
+/// disconnect at its end also ends a parked flush. The host calls this
+/// on shutdown after its connections close and before it releases the
+/// lease.
 pub fn finish_pending_closes() {
-    let lingers = std::mem::take(
-        &mut *LINGERS.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
-    );
-    for linger in lingers {
-        let _ = linger.join();
+    let deadline = Instant::now() + LINGER_DRAIN;
+    while PENDING_LINGERS.load(Ordering::SeqCst) > 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
     }
 }
 
@@ -807,11 +849,13 @@ pub fn finish_pending_closes() {
 fn schedule_disconnect(handle: HANDLE) -> io::Result<()> {
     let flusher = OwnedHandle::duplicate(handle)?;
     let disconnector = OwnedHandle::duplicate(handle)?;
-    // Both handles move into the closure; if the spawn fails the closure
-    // is dropped and so are they.
-    let linger = std::thread::Builder::new()
+    // The handles and the pending-count guard move into the closure; if
+    // the spawn fails the closure is dropped and so are they.
+    let guard = LingerGuard::new();
+    std::thread::Builder::new()
         .name("starling-host-pipe-linger".into())
         .spawn(move || {
+            let _guard = guard;
             let flush = std::thread::Builder::new()
                 .name("starling-host-pipe-flush".into())
                 .spawn(move || {
@@ -839,11 +883,8 @@ fn schedule_disconnect(handle: HANDLE) -> io::Result<()> {
                 let _ = flush.join();
             }
         })
-        .map_err(io::Error::other)?;
-    let mut lingers = LINGERS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    lingers.retain(|linger| !linger.is_finished());
-    lingers.push(linger);
-    Ok(())
+        .map(|_detached| ())
+        .map_err(io::Error::other)
 }
 
 /// How often a waiting operation re-checks the close mark. Bounds the

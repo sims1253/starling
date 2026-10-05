@@ -210,6 +210,13 @@ impl JobsActor {
             }
             self.publish_view();
         }
+        // Close the inbox first: a worker parked delivering a report
+        // into a full queue is woken by the receiver going away
+        // (`send_blocking` reports Closed) instead of holding the join
+        // below for its whole budget. The swapped-in receiver is closed
+        // already — nothing will ever be read again.
+        let (_, closed) = crate::channel::bounded(1);
+        drop(std::mem::replace(&mut self.inbox, closed));
         self.stop_workers();
     }
 

@@ -176,13 +176,15 @@ impl EngineProvider {
     /// Waits (bounded by `deadline`, cancel-aware) for a lease on a ready
     /// engine other than `avoid` — the `(endpoint, pid)` of an engine a
     /// request just failed against, which the manager may still report
-    /// Ready until its supervisor notices it is gone.
+    /// Ready until its supervisor notices it is gone. The identity comes
+    /// from the lease itself (the engine it holds), never from a
+    /// separately-locked snapshot that could already have moved on.
     fn wait_for_lease(
         &self,
         deadline: Instant,
         cancel: &CancelToken,
-        avoid: Option<&(String, Option<u32>)>,
-    ) -> Result<(EngineLease, Option<u32>), ProviderOutcome> {
+        avoid: Option<&(String, u32)>,
+    ) -> Result<EngineLease, ProviderOutcome> {
         loop {
             if cancel.is_cancelled() {
                 return Err(ProviderOutcome::Failed {
@@ -191,15 +193,9 @@ impl EngineProvider {
                 });
             }
             if let Some(lease) = self.manager.lease() {
-                let pid = self
-                    .manager
-                    .snapshot()
-                    .active
-                    .filter(|active| active.endpoint == lease.endpoint())
-                    .map(|active| active.pid);
-                let identity = (lease.endpoint().to_string(), pid);
+                let identity = (lease.endpoint().to_string(), lease.pid());
                 if avoid != Some(&identity) {
-                    return Ok((lease, pid));
+                    return Ok(lease);
                 }
             }
             let phase = self.manager.snapshot().phase;
@@ -227,10 +223,10 @@ impl TranscriptionProvider for EngineProvider {
     ) -> ProviderOutcome {
         let started = Instant::now();
         let wav = std::sync::Arc::new(wav);
-        let mut failed_engine: Option<(String, Option<u32>)> = None;
+        let mut failed_engine: Option<(String, u32)> = None;
         loop {
             let deadline = Instant::now() + self.ready_wait;
-            let (lease, pid) = match self.wait_for_lease(deadline, cancel, failed_engine.as_ref()) {
+            let lease = match self.wait_for_lease(deadline, cancel, failed_engine.as_ref()) {
                 Ok(found) => found,
                 Err(outcome) => return outcome,
             };
@@ -269,7 +265,7 @@ impl TranscriptionProvider for EngineProvider {
                 Err(ClientError::Transport(_))
                     if failed_engine.is_none() && !cancel.is_cancelled() =>
                 {
-                    failed_engine = Some((lease.endpoint().to_string(), pid));
+                    failed_engine = Some((lease.endpoint().to_string(), lease.pid()));
                 }
                 Err(error) => {
                     let (reason, retryable) = failure_from_client_error(&error);

@@ -303,6 +303,13 @@ impl EngineLease {
         &self.model_id
     }
 
+    /// The pid of the engine process this lease holds — with
+    /// [`Self::endpoint`], the engine's identity (a restarted or
+    /// taken-over engine differs in pid even on a reused port).
+    pub fn pid(&self) -> u32 {
+        self.engine.pid
+    }
+
     /// Provenance label stored with the recognition attempt.
     pub fn provenance(&self) -> String {
         format!("engine:{}", self.model_id)
