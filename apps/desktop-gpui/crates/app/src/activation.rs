@@ -61,6 +61,29 @@ pub(crate) const DOUBLE_TAP_WINDOW: Duration = Duration::from_millis(400);
 /// runs on, so a longer silence means the release was lost.
 pub(crate) const REPEAT_GAP: Duration = Duration::from_millis(1200);
 
+/// A click on the record button this soon after a take ended is ignored:
+/// it was aimed at the Stop button the user saw, not at a new take (an
+/// Escape or release ended the take a moment before the click landed).
+pub(crate) const CLICK_GRACE: Duration = Duration::from_millis(400);
+
+/// Whether a record-button click must be ignored (see [`CLICK_GRACE`]).
+pub(crate) fn click_ignored(active: bool, last_take_end: Option<Instant>, now: Instant) -> bool {
+    !active && last_take_end.is_some_and(|end| now.saturating_duration_since(end) < CLICK_GRACE)
+}
+
+/// Whether the Starling window was focused at `at`, from its recorded
+/// focus changes (oldest first). Before the first record: not focused.
+pub(crate) fn focused_at(changes: &[(Instant, bool)], at: Instant) -> bool {
+    changes
+        .iter()
+        .rev()
+        .find(|(when, _)| *when <= at)
+        .is_some_and(|(_, focused)| *focused)
+}
+
+/// How many focus changes are remembered for [`focused_at`].
+const FOCUS_HISTORY: usize = 16;
+
 /// A take whose microphone has delivered no samples this long after the
 /// start is cancelled: the device is not producing audio, and recording
 /// nothing indefinitely would be a stuck take.
@@ -498,6 +521,60 @@ impl StarlingApp {
         }
     }
 
+    /// Record the window's focus changes, so system-wide events can be
+    /// matched to whether Starling had focus when they happened.
+    pub(crate) fn track_window_focus(&mut self, window: &mut gpui::Window, cx: &mut Context<Self>) {
+        self.window_focus.push((Instant::now(), window.is_window_active()));
+        let subscription = cx.observe_window_activation(window, |app, window, _cx| {
+            app.window_focus.push((Instant::now(), window.is_window_active()));
+            if app.window_focus.len() > FOCUS_HISTORY {
+                app.window_focus.remove(0);
+            }
+        });
+        self.focus_observer = Some(subscription);
+    }
+
+    /// Whether a system-wide event belongs to the machine. On Wayland a
+    /// compositor may forward the focused native window's keys to XWayland
+    /// too, so an event that happened while Starling had focus is the
+    /// window's own key event seen twice: the window already handled it.
+    fn system_event_is_ours(&self, at: Instant) -> bool {
+        !(crate::shortcut::wayland_session() && focused_at(&self.window_focus, at))
+    }
+
+    /// Feed every system-wide event received so far to the machine, in
+    /// arrival order. Runs on the poll and before every UI-thread input
+    /// (window keys, the record button, opening or closing Settings), so a
+    /// UI input never overtakes a system-wide one that happened first.
+    pub(crate) fn flush_system_events(&mut self, cx: &mut Context<Self>) {
+        loop {
+            let Some(shortcuts) = self.global_shortcuts.as_ref() else {
+                return;
+            };
+            let Some(raw) = shortcuts.next_raw() else {
+                return;
+            };
+            let Some(event) = shortcuts.classify(raw) else {
+                continue;
+            };
+            let at = match event {
+                GlobalEvent::Pressed(at) | GlobalEvent::Released(at) | GlobalEvent::Escape(at) => at,
+            };
+            if !self.system_event_is_ours(at) {
+                continue;
+            }
+            let may_start = !self.settings_open;
+            self.activation_input(
+                |machine| match event {
+                    GlobalEvent::Pressed(at) => machine.press(at, may_start),
+                    GlobalEvent::Released(at) => machine.release(at),
+                    GlobalEvent::Escape(_) => machine.escape(),
+                },
+                cx,
+            );
+        }
+    }
+
     /// In-window presses go through a keystroke interceptor: it runs
     /// before any key binding, so the shortcut also works while the
     /// staging editor or a settings field has focus, and a matched press
@@ -522,11 +599,12 @@ impl StarlingApp {
         keystroke: &gpui::Keystroke,
         cx: &mut Context<Self>,
     ) -> bool {
+        self.flush_system_events(cx);
         if self.activation.is_active() && crate::shortcut::is_escape(keystroke) {
             self.activation_input(|machine| machine.escape(), cx);
             return true;
         }
-        if !self.window_shortcut_enabled() || !self.shortcut.matches_key_down(keystroke) {
+        if !self.shortcut.matches_key_down(keystroke) {
             return false;
         }
         let may_start = !self.settings_open;
@@ -536,43 +614,16 @@ impl StarlingApp {
 
     /// An in-window key-up: the release of a held shortcut.
     pub(crate) fn shortcut_key_up(&mut self, keystroke: &gpui::Keystroke, cx: &mut Context<Self>) {
-        if self.window_shortcut_enabled() && self.shortcut.matches_key_up(keystroke) {
+        self.flush_system_events(cx);
+        if self.shortcut.matches_key_up(keystroke) {
             self.activation_input(|machine| machine.release(Instant::now()), cx);
         }
     }
 
     /// One loop turn: system-wide events in arrival order, then timers.
     pub(crate) fn poll_activation(&mut self, cx: &mut Context<Self>) {
-        let events = self
-            .global_shortcuts
-            .as_ref()
-            .map(GlobalShortcuts::drain)
-            .unwrap_or_default();
-        let may_start = !self.settings_open;
-        for event in events {
-            self.activation_input(
-                |machine| match event {
-                    GlobalEvent::Pressed(at) => machine.press(at, may_start),
-                    GlobalEvent::Released(at) => machine.release(at),
-                    GlobalEvent::Escape(_) => machine.escape(),
-                },
-                cx,
-            );
-        }
+        self.flush_system_events(cx);
         self.activation_input(|machine| machine.tick(Instant::now()), cx);
-    }
-
-    /// Whether the window's own key events drive the shortcut. Exactly one
-    /// source reports a given press, so no gesture is ever seen twice: a
-    /// working system-wide grab consumes the key everywhere (an X11 key
-    /// grab, `RegisterHotKey`, Carbon hot keys), so the window path is
-    /// only for when there is none — registration failed — or when the
-    /// grab cannot see the window's keys at all: on Wayland the window is
-    /// a native Wayland client, and the X11 grab only hears XWayland apps.
-    pub(crate) fn window_shortcut_enabled(&self) -> bool {
-        self.global_shortcuts.is_none()
-            || self.shortcut_registration.is_err()
-            || crate::shortcut::wayland_session()
     }
 
     /// Feed one input to the machine and perform its effects. Readiness
@@ -622,12 +673,14 @@ impl StarlingApp {
                 Effect::Finish(take) => {
                     if self.recording_take == Some(take) {
                         self.recording_take = None;
+                        self.last_take_end = Some(Instant::now());
                         self.stop_recording(cx);
                     }
                 }
                 Effect::Cancel(take, reason) => {
                     if self.recording_take == Some(take) {
                         self.recording_take = None;
+                        self.last_take_end = Some(Instant::now());
                         self.cancel_recording(reason, cx);
                     }
                 }
@@ -1029,6 +1082,27 @@ mod tests {
             finish_hint(Some(Latch::HandsFree), "F9").as_deref(),
             Some("Hands-free · press F9 to finish · Esc cancels")
         );
+    }
+
+    #[test]
+    fn a_click_right_after_a_take_ended_is_not_a_new_take() {
+        let t0 = Instant::now();
+        assert!(!click_ignored(false, None, t0));
+        assert!(click_ignored(false, Some(t0), t0 + ms(100)));
+        assert!(!click_ignored(false, Some(t0), t0 + CLICK_GRACE));
+        // Stopping a running take is never ignored.
+        assert!(!click_ignored(true, Some(t0), t0 + ms(10)));
+    }
+
+    #[test]
+    fn focus_at_an_instant_follows_the_recorded_changes() {
+        let t0 = Instant::now();
+        let changes = [(t0, false), (t0 + ms(100), true), (t0 + ms(500), false)];
+        assert!(!focused_at(&changes, t0 + ms(50)));
+        assert!(focused_at(&changes, t0 + ms(100)));
+        assert!(focused_at(&changes, t0 + ms(499)));
+        assert!(!focused_at(&changes, t0 + ms(600)));
+        assert!(!focused_at(&[], t0));
     }
 
     #[test]

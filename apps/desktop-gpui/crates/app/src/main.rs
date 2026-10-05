@@ -90,8 +90,9 @@ fn main() {
                     // raise or focus this window: the app being dictated
                     // into keeps focus.
                     let shortcuts = shortcut::GlobalShortcuts::new();
-                    if let Err(err) = handle.update(cx, |app, _window, cx| {
+                    if let Err(err) = handle.update(cx, |app, window, cx| {
                         app.install_global_shortcuts(shortcuts, cx);
+                        app.track_window_focus(window, cx);
                     }) {
                         eprintln!("Could not set up the recording shortcut: {err}");
                     }

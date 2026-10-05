@@ -312,7 +312,12 @@ impl StarlingApp {
     /// The on-screen record button: a toggle in every activation mode,
     /// through the same machine as the shortcut (#221).
     pub fn toggle_recording(&mut self, cx: &mut Context<Self>) {
-        self.activation_input(|machine| machine.click(Instant::now()), cx);
+        self.flush_system_events(cx);
+        let now = Instant::now();
+        if crate::activation::click_ignored(self.activation.is_active(), self.last_take_end, now) {
+            return;
+        }
+        self.activation_input(|machine| machine.click(now), cx);
     }
 
     /// Stop the running recorder and process the take as usual. Only the

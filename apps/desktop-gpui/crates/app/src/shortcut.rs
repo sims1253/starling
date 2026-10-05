@@ -1,12 +1,16 @@
 //! The configurable recording shortcut (#221): parsing and validation,
 //! the in-window key matcher, and the system-wide registration.
 //!
-//! Two sources can feed the activation machine, and exactly one reports
-//! any given press. The system-wide one (`global-hotkey`: X11 key grab,
-//! Windows `RegisterHotKey`, macOS Carbon hot keys) consumes the key
-//! everywhere it works; the in-window one is enabled only where that grab
-//! cannot hear the window (a native Wayland window) or registration
-//! failed (see `StarlingApp::window_shortcut_enabled`).
+//! Two sources feed the activation machine, and one physical press is
+//! taken from only one of them. The system-wide one (`global-hotkey`: X11
+//! key grab, Windows `RegisterHotKey`, macOS Carbon hot keys) consumes the
+//! key wherever its grab matches, so the window never sees that press;
+//! the window's own key events cover the rest (no registration, an X11
+//! lock modifier the grab does not list, a native Wayland window). The
+//! one place both can fire is Wayland, where a compositor may forward a
+//! native window's keys to XWayland as well (KDE's legacy X11 app
+//! support): there, system-wide events that arrive while the Starling
+//! window is focused are dropped (see `StarlingApp::system_event_is_ours`).
 //!
 //! Neither source ever raises or focuses the Starling window: the app the
 //! user is dictating into keeps keyboard focus.
@@ -241,12 +245,15 @@ pub(crate) enum GlobalEvent {
     Escape(Instant),
 }
 
+/// One event as the hotkey thread received it.
+pub(crate) type RawEvent = (u32, HotKeyState, Instant);
+
 /// The system-wide registrations: the recording shortcut for the app's
 /// lifetime, and Escape only while a take is active (grabbing Escape the
 /// rest of the time would take it away from every other app).
 pub(crate) struct GlobalShortcuts {
     manager: GlobalHotKeyManager,
-    events: mpsc::Receiver<(u32, HotKeyState, Instant)>,
+    events: mpsc::Receiver<RawEvent>,
     record: Option<HotKey>,
     /// The Escape registrations while a take is active: bare Escape, and
     /// Escape with the recording shortcut's modifiers (still held during a
@@ -347,26 +354,26 @@ impl GlobalShortcuts {
         !self.escape.is_empty()
     }
 
-    /// Events received since the last call, oldest first. Events for a
-    /// shortcut that has since been replaced are dropped.
-    pub(crate) fn drain(&self) -> Vec<GlobalEvent> {
-        let record = self.record.map(|hotkey| hotkey.id());
-        let escape: Vec<u32> = self.escape.iter().map(|hotkey| hotkey.id()).collect();
-        self.events
-            .try_iter()
-            .filter_map(|(id, state, at)| {
-                if Some(id) == record {
-                    Some(match state {
-                        HotKeyState::Pressed => GlobalEvent::Pressed(at),
-                        HotKeyState::Released => GlobalEvent::Released(at),
-                    })
-                } else if escape.contains(&id) && state == HotKeyState::Pressed {
-                    Some(GlobalEvent::Escape(at))
-                } else {
-                    None
-                }
+    /// The next received event, oldest first, not yet classified.
+    pub(crate) fn next_raw(&self) -> Option<RawEvent> {
+        self.events.try_recv().ok()
+    }
+
+    /// Classify a received event against the registrations as they are
+    /// *now*: the caller classifies each event only when it processes it,
+    /// so an event for a shortcut (or an Escape grab) replaced by an
+    /// earlier event in the same batch is dropped, never misapplied.
+    pub(crate) fn classify(&self, (id, state, at): RawEvent) -> Option<GlobalEvent> {
+        if self.record.is_some_and(|hotkey| hotkey.id() == id) {
+            Some(match state {
+                HotKeyState::Pressed => GlobalEvent::Pressed(at),
+                HotKeyState::Released => GlobalEvent::Released(at),
             })
-            .collect()
+        } else if state == HotKeyState::Pressed && self.escape.iter().any(|hotkey| hotkey.id() == id) {
+            Some(GlobalEvent::Escape(at))
+        } else {
+            None
+        }
     }
 }
 

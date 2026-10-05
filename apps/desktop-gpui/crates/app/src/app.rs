@@ -471,6 +471,12 @@ pub struct StarlingApp {
     /// A shortcut saved while a take was running: it takes over when the
     /// take ends, so the held key's release still finishes that take.
     pub(crate) pending_shortcut: Option<crate::shortcut::Shortcut>,
+    /// When the last take ended (see `activation::CLICK_GRACE`).
+    pub(crate) last_take_end: Option<Instant>,
+    /// The window's focus changes, oldest first, and the observer that
+    /// records them (see `activation::focused_at`).
+    pub(crate) window_focus: Vec<(Instant, bool)>,
+    pub(crate) focus_observer: Option<Subscription>,
     /// The system-wide registrations (absent in tests and where the
     /// platform offers none), and how registering the shortcut went.
     pub(crate) global_shortcuts: Option<crate::shortcut::GlobalShortcuts>,
@@ -1046,6 +1052,9 @@ impl StarlingApp {
             dictation_draft_error: None,
             shortcut,
             pending_shortcut: None,
+            last_take_end: None,
+            window_focus: Vec::new(),
+            focus_observer: None,
             dictation_settings,
             global_shortcuts: None,
             shortcut_registration: Ok(()),
@@ -1555,6 +1564,9 @@ impl StarlingApp {
     }
 
     pub fn open_settings(&mut self, cx: &mut Context<Self>) {
+        // #221: shortcut presses that happened before the dialog opened
+        // are judged with the dialog closed.
+        self.flush_system_events(cx);
         self.settings_open = true;
         // A fresh dialog starts with no probe (#207): retire anything
         // still in flight from a previous dialog and clear its settled
@@ -1623,6 +1635,8 @@ impl StarlingApp {
     }
 
     pub fn close_settings(&mut self, cx: &mut Context<Self>) {
+        // #221: presses made while the dialog was open never start a take.
+        self.flush_system_events(cx);
         self.settings_open = false;
         // B06 (#207): in-flight probes are retired with the dialog — a
         // stray probe has nothing to land in, and the settled outcome
