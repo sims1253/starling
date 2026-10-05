@@ -126,6 +126,7 @@ jobs:
             graph_snapshot_test \
             replay_graph_support_test cpu_repack_test \
             device_cache_clear_test greedy_termination_test tdt_graph_budget_test \
+            tdt_slice_argmax_test \
             speculative_verifier_test moss-preview-copy-test s1_copy_draft_test
 
       - name: Quantizer storage and recipe regressions
@@ -149,6 +150,7 @@ jobs:
       - name: Engine contract tests (KV, termination, verifier, CTC)
         run: |
           for t in device_cache_clear_test greedy_termination_test tdt_graph_budget_test \
+                   tdt_slice_argmax_test \
                    speculative_verifier_test granite_ctc_proposer_test \
                    granite_ctc_entry_test s1_copy_draft_test; do
             "./build/$t"
