@@ -3,7 +3,7 @@
 from __future__ import annotations
 from typing import Any, Optional
 import torch
-from .config import EOS_TOKEN_ID
+from .config import EOS_TOKEN_ID, EOS_TOKEN_IDS
 from .llm_mega import FusedLLMMega, GenerateResult
 from .._kernels._compile import torch_compile
 from ..multistep import MultiStepDecoder
@@ -20,6 +20,7 @@ class MultiStepLLMMega(MultiStepDecoder, FusedLLMMega):
         device: str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
         eos_token_id: int = EOS_TOKEN_ID,
+        eos_token_ids: tuple[int, ...] | list[int] | None = None,
         compile_decode: bool = True,
         prefill_use_graph: bool = True,
     ) -> None:
@@ -31,6 +32,7 @@ class MultiStepLLMMega(MultiStepDecoder, FusedLLMMega):
             device=device,
             dtype=dtype,
             eos_token_id=eos_token_id,
+            eos_token_ids=tuple(eos_token_ids) if eos_token_ids is not None else EOS_TOKEN_IDS,
             prefill_use_graph=prefill_use_graph,
         )
         if compile_decode:
@@ -44,7 +46,8 @@ class MultiStepLLMMega(MultiStepDecoder, FusedLLMMega):
         self,
         inputs_embeds: torch.Tensor,
         max_new_tokens: int = 200,
-        eos_token_id: Optional[int] = None,
+        eos_token_id: Optional[int | tuple[int, ...] | list[int]] = None,
+        eos_token_ids: Optional[tuple[int, ...] | list[int]] = None,
         tokenizer: Any = None,
         capture: bool = True,
     ) -> GenerateResult:
@@ -55,11 +58,20 @@ class MultiStepLLMMega(MultiStepDecoder, FusedLLMMega):
         prompt_len = inputs_embeds.shape[1]
         self._validate_token_budget(prompt_len, max_new_tokens)
         first_token = self.prefill(inputs_embeds, use_graph=self.prefill_use_graph)
+        if eos_token_ids is None and isinstance(eos_token_id, (list, tuple)):
+            eos_token_ids = tuple(eos_token_id)
+            eos_token_id = None
+        if eos_token_ids is None:
+            stop: tuple[int, ...] = (
+                (int(eos_token_id),) if eos_token_id is not None else tuple(self.eos_token_ids)
+            )
+        else:
+            stop = tuple(int(t) for t in eos_token_ids)
         ids, elapsed = self._generate_multistep(
             first_token,
             prompt_len,
             max_new_tokens,
-            (self.eos_token_id if eos_token_id is None else eos_token_id,),
+            stop,
             capture,
         )
         return self._finalize(ids, elapsed, tokenizer)

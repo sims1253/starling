@@ -19,6 +19,10 @@ We use ``-hf`` (not the original ``Qwen/Qwen3-ASR-1.7B``) because it ships a
 single ``model.safetensors`` + native ``Qwen3ASRProcessor``/chat template that
 loads straight into ``transformers.Qwen3ASRForConditionalGeneration``.
 """
+MODEL_REVISION: str = "bcd2b5b7f32b480ab5790554cfa8347f246a14f3"
+"""Pinned HF revision the converter and golden captures were verified against.
+``load_model_and_processor`` defaults to this so reference generation cannot
+drift to a moving ``main`` (issue #353 source/config/processor pinning)."""
 
 # ---------------------------------------------------------------------------
 # Audio encoder dims (Qwen3ASREncoderConfig / audio_config)
@@ -58,6 +62,11 @@ AUDIO_TOKEN_ID: int = 151676
 """The ``<|audio|>`` placeholder token id; positions carrying it are clobbered
 by the projected audio embeddings inside ``Qwen3ASRModel.forward``."""
 EOS_TOKEN_ID: int = 151645           # im_end (primary EOS for greedy stop)
+EOS_TOKEN_IDS: tuple[int, ...] = (151645, 151643)
+"""Greedy stop set: ``<|im_end|>`` (151645, the established serving stop) plus
+``<|endoftext|>`` (151643). Both ids appear in the pinned checkpoints'
+``generation_config.json`` EOS lists; the fused decoders stop on either so a
+151643 emission cannot run past the historical stop."""
 PAD_TOKEN_ID: int = 151645
 TIMESTAMP_TOKEN_ID: int = 151705
 

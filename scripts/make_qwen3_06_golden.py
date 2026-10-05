@@ -41,6 +41,7 @@ from make_qwen3_golden import (  # noqa: E402
     SAMPLE_RATE,
     decode_budget,
     effective_chunk_seconds,
+    extract_transcription,
     join_chunk_texts,
     load_fixture,
 )
@@ -51,7 +52,7 @@ GOLDEN_PATH = REPO_ROOT / "golden" / "qwen3_06_reference.json"
 
 def main() -> int:
     from starling.qwen3.audio import build_inputs
-    from starling.qwen3_06.config import MODEL_ID
+    from starling.qwen3_06.config import MODEL_ID, MODEL_REVISION
     from starling.qwen3_06.loader import load_model_and_processor
     from starling.qwen3_06.pipeline import MegaPipeline
     from starling.parakeet.gpu_lock import with_gpu_lock
@@ -63,6 +64,8 @@ def main() -> int:
         note="capturing qwen3_06 C++ reference goldens",
     ):
         print("[qwen3_06-golden] loading model (eager, bf16) ...")
+        # Pinned revision comes from the 0.6B loader default (MODEL_REVISION),
+        # matching the converter snapshot — no moving-main drift (#353).
         model, processor = load_model_and_processor(attn_impl="eager")
         # STOCK numerics: eager encoder + the model's own decoder layers. This
         # is the op-for-op oracle the C++ engine mirrors (the fused/multistep
@@ -79,6 +82,7 @@ def main() -> int:
         chunk_samples = max(1, round(max_chunk * SAMPLE_RATE))
         out: dict[str, Any] = {
             "model": MODEL_ID,
+            "revision": MODEL_REVISION,
             "policy": {
                 "sample_rate": SAMPLE_RATE,
                 "max_new_tokens": MAX_NEW_TOKENS,
@@ -123,6 +127,14 @@ def main() -> int:
                     max_new_tokens=budget,
                 )
                 ids = ids[0].cpu().tolist()
+                # ids/text consistency through the transcription_only path
+                # (mirrors the 1.7B capture so the two goldens cannot drift).
+                decoded = extract_transcription(
+                    processor.tokenizer.batch_decode(
+                        torch.tensor([ids]), skip_special_tokens=True
+                    )[0]
+                )
+                assert decoded == text, f"{name}: ids detokenize mismatch"
                 chunks.append(
                     {
                         "start_s": start / SAMPLE_RATE,

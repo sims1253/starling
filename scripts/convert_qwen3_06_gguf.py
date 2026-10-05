@@ -251,9 +251,12 @@ def main() -> None:
         _fail(f"config.json audio_token_id {top_cfg['audio_token_id']} != baked 151676")
     for key, want in (("eos_token_id", 151645), ("pad_token_id", 151645)):
         got = gen_cfg.get(key, top_cfg.get(key, want))
-        if isinstance(got, (list, tuple)):  # some checkpoints list several ids
-            got = got[0] if got else want
-        if int(got) != want:
+        if isinstance(got, (list, tuple)):
+            # Pinned checkpoints list several EOS ids ([151643, 151645]): the
+            # established stop must belong to the set, not equal the first.
+            if int(want) not in {int(v) for v in got}:
+                _fail(f"snapshot {key} {list(got)} lacks baked {want}")
+        elif int(got) != want:
             _fail(f"snapshot {key} {got} != baked {want}")
     baked_ids = [151676, 151645, *PROMPT_PREFIX, *PROMPT_SUFFIX]
     valid_ids = set(tok_vocab.values()) | added_ids

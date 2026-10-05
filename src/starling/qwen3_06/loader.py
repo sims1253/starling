@@ -14,9 +14,9 @@ from typing import Any
 import torch
 
 from ..qwen3.loader import get_components, load_model_and_processor as _load
-from .config import MODEL_ID
+from .config import MODEL_ID, MODEL_REVISION
 
-__all__ = ["MODEL_ID", "get_components", "load_model_and_processor"]
+__all__ = ["MODEL_ID", "MODEL_REVISION", "get_components", "load_model_and_processor"]
 
 
 def load_model_and_processor(
@@ -25,6 +25,7 @@ def load_model_and_processor(
     dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
     model_id: str | None = None,
+    revision: str | None = None,
 ) -> tuple[Any, Any]:
     """Load the Qwen3-ASR-0.6B model and processor.
 
@@ -34,6 +35,9 @@ def load_model_and_processor(
         dtype: Model dtype (bf16 is the checkpoint dtype).
         device: Target device.
         model_id: HF hub repo id override (defaults to the 0.6B MODEL_ID).
+        revision: HF hub revision override (defaults to the pinned 0.6B
+            MODEL_REVISION so golden captures stay on the converted
+            checkpoint).
 
     Returns:
         ``(model, processor)`` with the model in eval mode.
@@ -41,4 +45,5 @@ def load_model_and_processor(
     return _load(
         attn_impl=attn_impl, dtype=dtype, device=device,
         model_id=model_id or MODEL_ID,
+        revision=MODEL_REVISION if revision is None else revision,
     )

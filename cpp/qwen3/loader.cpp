@@ -1,10 +1,7 @@
 #include "loader.hpp"
-#include <cstdio>
-#include <cstring>
 #include <string>
 #include <vector>
 
-#include "ggml.h"
 #include "lib/loader_kit.hpp"
 namespace starling::ggml::qwen3 {
 namespace {
@@ -12,21 +9,6 @@ namespace {
 using lib::f32;
 using lib::f64;
 using lib::str;
-
-// Appends `tail` to the layer prefix already written into `n` and runs the
-// exact-shape check on the combined name — the ONE shared implementation
-// behind the encoder/LLM layer loops. Fails loudly on snprintf truncation
-// instead of probing a wrong tensor name.
-bool layer_shape(const ModelLoader& m, char* n, size_t cap, size_t pre_len,
-                 const char* tail, std::initializer_list<int64_t> want,
-                 std::string& err) {
-    const int written = std::snprintf(n + pre_len, cap - pre_len, "%s", tail);
-    if (written < 0 || (size_t) written >= cap - pre_len) {
-        err = std::string("QWEN3 GGUF tensor name truncated: ") + n;
-        return false;
-    }
-    return lib::shape_eq(m, "QWEN3", n, want, err);
-}
 } // namespace
 
 int64_t audio_token_count(int64_t n_samples, const Config& c) {
@@ -251,14 +233,9 @@ bool Qwen3Model::load(const char* path, std::string& err) {
     // Encoder layers: 16 tensors each (biased MHA + two biased LayerNorms +
     // biased FFN); MHA projects hidden -> hidden (kv heads == heads).
     for (uint32_t i = 0; i < c.encoder.n_layers; ++i) {
-        char n[128];
-        std::snprintf(n, sizeof n, "enc.blk.%u.", i);
-        const size_t pre_len = std::strlen(n);
-        // Append the tensor tail to the layer prefix in the SAME stack
-        // buffer — no per-tensor heap string (load-time churn the original
-        // require-loop avoided by snprintf-ing straight into n).
-        const auto enc_shape = [&](const char* tail, std::initializer_list<int64_t> want) {
-            return layer_shape(m, n, sizeof n, pre_len, tail, want, err);
+        const std::string pre = "enc.blk." + std::to_string(i) + ".";
+        const auto enc_shape = [&](const std::string& tail, std::initializer_list<int64_t> want) {
+            return lib::shape_eq(m, "QWEN3", (pre + tail).c_str(), want, err);
         };
         if (!enc_shape("attn_norm.weight", {c.encoder.hidden})) return false;
         if (!enc_shape("attn_norm.bias", {c.encoder.hidden})) return false;
@@ -289,12 +266,9 @@ bool Qwen3Model::load(const char* path, std::string& err) {
     const int64_t QW = (int64_t) c.llm.n_heads * c.llm.head_dim;
     const int64_t KVW = (int64_t) c.llm.n_kv_heads * c.llm.head_dim;
     for (uint32_t i = 0; i < c.llm.n_layers; ++i) {
-        char n[128];
-        std::snprintf(n, sizeof n, "llm.blk.%u.", i);
-        const size_t pre_len = std::strlen(n);
-        // Same stack-buffer reuse + truncation guard as the encoder loop.
-        const auto llm_shape = [&](const char* tail, std::initializer_list<int64_t> want) {
-            return layer_shape(m, n, sizeof n, pre_len, tail, want, err);
+        const std::string pre = "llm.blk." + std::to_string(i) + ".";
+        const auto llm_shape = [&](const std::string& tail, std::initializer_list<int64_t> want) {
+            return lib::shape_eq(m, "QWEN3", (pre + tail).c_str(), want, err);
         };
         if (!llm_shape("attn_norm.weight", {c.llm.hidden})) return false;
         if (!llm_shape("attn.q.weight", {c.llm.hidden, QW})) return false;

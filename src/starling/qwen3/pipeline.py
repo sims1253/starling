@@ -29,7 +29,7 @@ from typing import Any, Optional, TYPE_CHECKING
 
 import torch
 
-from .config import AUDIO_TOKEN_ID, EOS_TOKEN_ID
+from .config import AUDIO_TOKEN_ID, EOS_TOKEN_ID, EOS_TOKEN_IDS
 from .encoder_mega import GraphedEncoder
 from .loader import get_components, load_model_and_processor
 from .llm_mega import LLMMega
@@ -69,14 +69,13 @@ class MegaPipeline:
         # so existing callers are unchanged.
         self.device = str(getattr(model, "device", "cuda"))
         self.audio_token_id = int(getattr(model.config, "audio_token_id", AUDIO_TOKEN_ID))
-        # Greedy stop token: prefer the loaded model's own config (the 0.6B
-        # sibling track reuses this pipeline), falling back to the 1.7B module
-        # constant — mirrors the audio_token_id pattern above. A list (some
-        # checkpoints list multiple EOS ids) takes the first entry.
-        eos = getattr(model.config, "eos_token_id", None)
-        if isinstance(eos, (list, tuple)):
-            eos = eos[0] if eos else None
-        self.eos_token_id = int(eos) if eos is not None else EOS_TOKEN_ID
+        # Greedy stop: restore the established <|im_end|> (151645) contract and
+        # stop on the checkpoint's second EOS (151643) as well. Both pinned
+        # checkpoints list eos_token_id=[151643, 151645]; taking the first
+        # entry regressed stopping (continued past <|im_end|>). The primary
+        # stays EOS_TOKEN_ID; the set covers both.
+        self.eos_token_id = int(EOS_TOKEN_ID)
+        self.eos_token_ids: tuple[int, ...] = tuple(EOS_TOKEN_IDS)
         # Prefill eager by default: the per-prompt-length prefill graphs (cap 8,
         # evict+reset) churn the CUDA-graph allocator on a diverse-length sweep
         # and corrupt it into an illegal memory access. Eager prefill keeps the
@@ -112,6 +111,7 @@ class MegaPipeline:
                 self._lm_head,
                 max_cache_len=self._max_cache_len,
                 eos_token_id=self.eos_token_id,
+                eos_token_ids=self.eos_token_ids,
                 prefill_use_graph=self.prefill_use_graph,
                 device=self.device,
                 dtype=self.dtype,
@@ -131,11 +131,13 @@ class MegaPipeline:
         encoder_mode: str = "cudagraph",
         prefill_use_graph: bool = False,
         model_id: str | None = None,
+        revision: str | None = None,
     ) -> "MegaPipeline":
         # None dtype restores the historical bf16 default.
         dt = torch.bfloat16 if dtype is None else dtype
         model, processor = cls._load_model_and_processor(
-            attn_impl=attn_impl, dtype=dt, device=device, model_id=model_id
+            attn_impl=attn_impl, dtype=dt, device=device, model_id=model_id,
+            revision=revision,
         )
         return cls(
             model,
@@ -177,6 +179,7 @@ class MegaPipeline:
                 max_cache_len=self._max_cache_len,
                 steps_per_replay=k,
                 eos_token_id=self.eos_token_id,
+                eos_token_ids=self.eos_token_ids,
                 prefill_use_graph=self.prefill_use_graph,
                 device=self.device,
                 dtype=self.dtype,

@@ -34,6 +34,10 @@ from __future__ import annotations
 # ---------------------------------------------------------------------------
 MODEL_ID: str = "Qwen/Qwen3-ASR-0.6B-hf"
 """HF hub repo id for the transformers-native (``-hf``) Qwen3-ASR 0.6B variant."""
+MODEL_REVISION: str = "7f1569a48a89f3e3f4dc3a5c9d28bddd903bc76c"
+"""Pinned HF revision the 0.6B converter and golden capture were verified
+against. The 0.6B loader defaults to this so reference generation stays on
+the converted checkpoint (issue #353 pinning)."""
 
 # ---------------------------------------------------------------------------
 # Audio encoder dims (Qwen3ASREncoderConfig / audio_config)
@@ -73,6 +77,8 @@ AUDIO_TOKEN_ID: int = 151676
 """The ``<|audio|>`` placeholder token id; positions carrying it are clobbered
 by the projected audio embeddings inside ``Qwen3ASRModel.forward``."""
 EOS_TOKEN_ID: int = 151645           # im_end (primary EOS for greedy stop)
+EOS_TOKEN_IDS: tuple[int, ...] = (151645, 151643)
+"""Greedy stop set shared with the 1.7B track (see ``starling.qwen3.config``)."""
 PAD_TOKEN_ID: int = 151645
 
 DEFAULT_TASK_PROMPT: str = ""
