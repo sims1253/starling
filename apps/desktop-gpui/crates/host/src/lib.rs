@@ -51,13 +51,14 @@
 //!
 //! # What remains outside this crate (the consuming increments)
 //!
-//! Neither the GPUI app (`crates/app`) nor the Electron comparison
-//! adapter embeds the runtime today — the app talks to
-//! `starling-dictation` directly, and the Mode A embed was deliberately
-//! left as "the consuming increment's wiring" when I3 merged (same note
-//! as `default_capture_store`). Both become [`client::HostClient`]
-//! holders in their own switchover increments; the client library here
-//! is that surface.
+//! The GPUI app (`crates/app`) does not hold a [`client::HostClient`]
+//! yet — it still talks to `starling-dictation` directly (recorder,
+//! uploads, its own engine manager), and the switchover is its own
+//! increment: the client library here is that surface, and the engine
+//! supervisor it would hand over already runs here and shares the app's
+//! sidecar through the engine registry in the meantime. The Electron
+//! comparison app the design names as a second client has been removed
+//! from the tree, so there is no second adapter to switch.
 
 pub mod auth;
 pub mod client;

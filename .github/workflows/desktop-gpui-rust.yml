@@ -51,22 +51,27 @@ jobs:
           cargo check --workspace
           cargo test --workspace
 
-  # The service host's Windows named-pipe transport is cfg(windows) — the
-  # ubuntu job never compiles it. Keep that path compile-verified on a
-  # native MSVC toolchain so the DACL/FFI surface cannot rot silently
-  # (runtime coverage on Windows remains a recorded gap; see
-  # crates/host/src/platform/windows.rs).
+  # The service host's Windows named-pipe transport and the storage-v2
+  # lease's Windows lock are cfg(windows) — the ubuntu job never compiles
+  # them. Run them for real on a native MSVC runner: the host's portable
+  # suites (IPC conformance, limits, renderer-kill, ownership with the
+  # real binary, adapters, the engine attach) over the named pipe, and
+  # the storage-v2 lease/ownership tests over LockFileEx (#220 — their
+  # first Windows run found heap corruption, a pipe I/O deadlock and a
+  # lease any second host could break, none visible to `cargo check`).
   windows-check:
-    name: cargo check starling-runtime-host (windows)
+    name: cargo test starling-runtime-host (windows)
     runs-on: windows-2025
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      - name: Check the host crate
+      - name: Test the host crate and the storage-v2 lease
         working-directory: apps/desktop-gpui
-        run: cargo check -p starling-runtime-host
+        run: |
+          cargo test -p starling-runtime-host
+          cargo test -p starling-dictation --lib store_v2
 
   # Packaged desktop lanes: the universal macOS bundle (DMG) and the portable
   # Windows archive. Unsigned — artifacts are development builds for testing,
