@@ -150,10 +150,11 @@ scripts/release-runtime/check-linux-cuda.sh --with-gpu \
 ```
 
 The Parakeet GGUF and a 16 kHz mono PCM16 WAV are mounted read-only; the
-container still has no network, SDK, or host library paths. The packaged
-server loads the model, `/health` must report a CUDA device, and one
-`POST /v1/audio/transcriptions` must return exactly the expected transcript
-with no accelerator-rejected graph node (#184). Results are recorded under
+container still has no network, SDK, or host library paths. Before the server
+starts, the check refuses a port that is already in use inside the container.
+The packaged server loads the model, `/health` must report a CUDA device,
+and one `POST /v1/audio/transcriptions` must return exactly the expected
+transcript with no accelerator-rejected graph node (#184). Results are recorded under
 [Hardware verification](#hardware-verification).
 
 ## Windows archive check
@@ -178,7 +179,10 @@ With `-Gguf`, `-Audio`, and `-Expected` it also runs representative inference:
 accelerator-rejected node. It refuses a port that is already in use, requires
 the listening socket to belong to the server it started, and bounds the
 transcription request. It lists the runtime and driver DLLs the server
-loaded, and for CUDA requires cuBLAS to come from `-RuntimePath`. Installed SDKs
+loaded; for CUDA it requires cuBLAS to come from `-RuntimePath`, and for
+Vulkan it requires the `vulkan-1.dll` loader to come from `-RuntimePath` or
+the Windows system directories. The extraction directory is removed when the
+check passes and kept, with its path printed, when it fails. Installed SDKs
 elsewhere on the machine are not removed, so this is a reduced-`PATH` check,
 not a clean-VM check. The release workflow does not run it; results are
 recorded below.
@@ -194,10 +198,10 @@ artifacts have run representative inference on real hardware: the Parakeet TDT
 `POST /v1/audio/transcriptions`, requiring the exact transcript on the device
 the archive targets. Only Parakeet was exercised; other models are not covered
 by this ledger. The release workflow does not re-run these checks, so each
-entry is for the build named in it. "E25" is the Experimental 25 prerelease
-(master `74a8fe3`, built by this workflow in experimental mode, CUDA SM 120
-only). Checksums, versions, procedures, and expected versus actual results
-for the 2026-10-05 entries are in the
+entry is for the build named in it. "E25" and "E26" are the Experimental 25
+and 26 prereleases (masters `74a8fe3` and `1060be8`, built by this workflow
+in experimental mode, CUDA SM 120 only). Checksums, versions, procedures, and
+expected versus actual results for the 2026-10-05 entries are in the
 [evidence record](https://github.com/sims1253/starling/blob/master/docs/evidence/release-runtime-2026-10-05/README.md)
 (tracking issue #57).
 
@@ -207,8 +211,8 @@ for the 2026-10-05 entries are in the
 | `linux-vulkan` | Verified ([#76](https://github.com/sims1253/starling/pull/76)): a local release-recipe build of that change (merged as `abd6ff3`); no executable checksum was recorded | AMD Radeon Graphics (RADV RENOIR), Mesa 26.2.2 on the host and Mesa 23.2.1 with Vulkan loader 1.3.204.1 in a fresh Ubuntu 22.04 container | NVIDIA and Intel Vulkan drivers |
 | `linux-cpu` | Verified (2026-10-05): E25 archive | AMD Ryzen 9 5900X, Ubuntu 22.04 (WSL2) | Non-x86_64 hosts are not a release target |
 | `linux-rocm` | Not verified | No ROCm hardware available | Everything; only the build runner's version and ABI checks ran |
-| `windows-cuda` | Verified (2026-10-05): E25 archive | RTX 5090 (SM 120), Windows 11 build 26200, driver 610.88; cuBLAS 13.5.1 from NVIDIA's CUDA 13.3.0 redistributables; reduced `PATH` | SM 75-90 GPUs; a clean Windows install |
+| `windows-cuda` | Verified (2026-10-05): E25 and E26 archives | RTX 5090 (SM 120), Windows 11 build 26200, driver 610.88; cuBLAS 13.5.1 from NVIDIA's CUDA 13.3.0 redistributables; reduced `PATH` | SM 75-90 GPUs; a clean Windows install |
 | `windows-vulkan` | Verified on a local build only (2026-10-05). The E25 archive aborted on the first transcription on NVIDIA (misaligned duration-argmax source); the fix is not yet in a workflow-built archive | RTX 5090, NVIDIA Vulkan driver 610.88 (Vulkan 1.4), Windows 11 build 26200 | AMD and Intel Vulkan drivers; the workflow-built archive with the fix |
-| `windows-cpu` | Verified (2026-10-05): E25 archive | AMD Ryzen 9 5900X, Windows 11 build 26200, reduced `PATH` | A clean Windows install |
+| `windows-cpu` | Verified (2026-10-05): E25 and E26 archives | AMD Ryzen 9 5900X, Windows 11 build 26200, reduced `PATH` | A clean Windows install |
 | `macos-metal` | Not verified | No Apple hardware available | Everything; only the build runner's version and ABI checks ran |
 | `macos-cpu` | Not verified | No Apple hardware available | Everything; only the build runner's version and ABI checks ran |

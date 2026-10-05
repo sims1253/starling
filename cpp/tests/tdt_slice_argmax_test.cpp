@@ -43,6 +43,11 @@ void check(bool cond, const std::string& what) {
     }
 }
 
+// The v3 dims the #57 reproduction depends on: kTokenCount * 4 = 32772 is
+// the misaligned duration-slice byte offset. They mirror joint.hpp's
+// vocab_size_ (8192) and num_durations_ (5), which are loaded from the GGUF
+// at runtime — no shared compile-time constant exists to derive from, so
+// keep these in sync with joint.hpp's config-derived members.
 constexpr int kTokenCount = 8193;  // parakeet-tdt-0.6b-v3: vocab 8192 + blank
 constexpr int kNumDur = 5;         // tdt_durations {0, 1, 2, 3, 4}
 constexpr size_t kMaxVulkanOffsetAlignment = 256;

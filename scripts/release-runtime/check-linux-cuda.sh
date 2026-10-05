@@ -118,7 +118,17 @@ fi
 expected=$5
 
 # ---- representative inference (--infer) ----
-export port=18187
+# Refuse an occupied port up front, mirroring the Windows checker's
+# Get-NetTCPConnection gate: a listener already on it would make the health
+# poll below query the wrong process. The probe runs in this container, in
+# the same loopback namespace (--network none) the server is about to bind
+# in, so it sees exactly what the server will see.
+port=18187
+if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
+    echo "port $port is already in use; free it before running --infer" >&2
+    exit 1
+fi
+export port
 # One HTTP/1.1 exchange over bash's /dev/tcp: METHOD PATH [BODY_FILE TYPE].
 # Callers bound it with timeout(1) (bounded_http) so a hung server cannot
 # wedge the check.

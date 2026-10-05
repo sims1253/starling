@@ -28,9 +28,12 @@ machine; no release was published and no release workflow was dispatched.
 
 Workflow-built archives come from the **Experimental 25** prerelease (tag
 `experimental-25-74a8fe3909ca`, master `74a8fe3909ca9b3c223675304f63efc378f195a6`,
-[run 37078967790](https://github.com/sims1253/starling/actions/runs/37078967790)),
-built by `release-starling-serve.yml` in experimental mode (CUDA SM 120 only);
-each archive matched the release's `SHA256SUMS.txt`. Local builds are from
+[run 37078967790](https://github.com/sims1253/starling/actions/runs/37078967790))
+and, for the Round 2 section below, from **Experimental 26** (tag
+`experimental-26-1060be8e6de0`, master `1060be8e6de0cd21662e4b4c89874955fcb319ac`,
+[run 37249282556](https://github.com/sims1253/starling/actions/runs/37249282556)),
+both built by `release-starling-serve.yml` in experimental mode (CUDA SM 120
+only); each archive matched the release's `SHA256SUMS.txt`. Local builds are from
 master `1060be8` or the commits of the change that added this record.
 
 | Label | Archive / executable sha256 | Build |
@@ -89,6 +92,33 @@ Every inference row posted the 11 s clip to `/v1/audio/transcriptions` with
 set as eager imports and `cublas64_13.dll` as its only delay-load import. The
 host has the VC++ redistributable installed, so the missing-`vcomp140.dll`
 case was not run.
+
+## Round 2 (PR #396 review, 2026-10-05)
+
+Re-runs with the round-2 checkers (port probe in `check-linux-cuda.sh`;
+extraction-directory cleanup, argument-quoting hardening, and the Vulkan
+loader provenance assertion in `check-windows-archive.ps1`) against the
+**Experimental 26** prerelease (tag `experimental-26-1060be8e6de0`, master
+`1060be8e6de0cd21662e4b4c89874955fcb319ac`,
+[run 37249282556](https://github.com/sims1253/starling/actions/runs/37249282556);
+archive sha256 — cpu `5e56a768545c9b2432f82e1993d72c47730b7a0e7e1430bcf66b37aac6941485`,
+cuda `bb06be3cf710a7e13fcb5bfef6c32625f642912d6372888eda1edaa45a830b27`,
+vulkan `c84406d9376ad21608eb8b76fca8c89b016bc44209204aea83b1b73aae7d5435` —
+all matching the release's `SHA256SUMS.txt`; master `1060be8` is the same
+master as L1/L4, so the Vulkan build still predates the joint.cpp fix).
+The `-Gguf`/`-Audio` paths used for the cpu and L5 runs contain a space
+(`...\path with space\...`) to prove the server argument quoting. As before,
+no release was published and no workflow dispatched.
+
+| Artifact | Procedure | Device | Actual |
+| --- | --- | --- | --- |
+| E26 `windows-cpu` (exe `cc997140df3be164852782bba5a45047ce78bab64162f7c726dffe7848e7a262`) | full check, space paths | `CPU` | pass: exact transcript; extraction directory removed on success |
+| E26 `windows-cuda` (exe `cb793c03561361375b09383ba77d5a76770b23e58e19efde63c8f81becb24bbc`) | full check, cuBLAS `-RuntimePath`, space `-Gguf` | `CUDA0` | pass: exact transcript, cuBLAS 6.14.11.1351 from the redistributable |
+| E26 `windows-vulkan` (exe `c506d0bcc6ab6ada6798b87cbdf958ababd52c9d49988a703034506bf4b27d98`) | startup check only | — | pass (the workflow still ships no fix; inference is known to abort) |
+| L5 `windows-vulkan` | full check, space `-Gguf` | `Vulkan0` | pass: exact transcript; `vulkan-1.dll` from System32 satisfies the new provenance assertion |
+| L5 `windows-vulkan`, `vulkan-1.dll` planted next to the exe | full check | `Vulkan0` | **fail (intended)**: the transcript itself passes, then `…\vulkan-1.dll resolved outside -RuntimePath and the system directories`; the work directory is kept and its path printed |
+| E25 `linux-cuda` | `check-linux-cuda.sh --with-gpu --infer` (port free) | `CUDA0` | pass: exact transcript |
+| E25 `linux-cuda`, leftover server on 18187 | a modified copy of the checker that starts a leftover server in the container before the probe (a fresh `--rm --network none` container cannot otherwise have one) | — | **fail (intended)**: `port 18187 is already in use; free it before running --infer` |
 
 ## Not covered
 
