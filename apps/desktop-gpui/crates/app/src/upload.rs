@@ -603,10 +603,8 @@ impl StarlingApp {
             Err(err) => {
                 self.error = Some(err.to_string());
                 // The stop failed before any take existed to bind the kept
-                // draft to; failing it is the honest resolution.
-                if let Some(token) = staging {
-                    self.staging_save_failed(token, cx);
-                }
+                // draft to; no audio came back either, so the no-audio
+                // guard below resolves it — once.
                 (None, None)
             }
         };
@@ -648,20 +646,35 @@ impl StarlingApp {
                         .to_string(),
                 )
             }
-            CancelReason::NoAudioYet => None,
+            CancelReason::NoAudioYet => {
+                self.take_notice = Some(
+                    "Stopped before the microphone delivered any audio; nothing was \
+                     recorded."
+                        .to_string(),
+                );
+                None
+            }
             CancelReason::MicStalled => {
                 self.error = Some(format!(
                     "The microphone delivered no audio within {} seconds, so the take was \
                      stopped. Check that the input device is connected and not muted.",
                     crate::activation::START_STALL.as_secs()
                 ));
-                None
+                // With audio kept, the saved notice tells the user the words
+                // survived once the save lands — the error above only says
+                // why the take was stopped.
+                kept.then(|| {
+                    "The microphone stalled at the start, so the take was stopped. The audio \
+                     it did capture is in your history; nothing was transcribed."
+                        .to_string()
+                })
             }
         };
         cx.notify();
         let Some(audio) = audio.filter(|audio| !audio.samples.is_empty()) else {
             // Nothing was captured, so no take is saved for the kept draft
-            // to bind to: fail it rather than leave it dangling.
+            // to bind to: fail it here rather than leave it dangling — the
+            // single resolution for every path that arrives with no audio.
             if let Some(token) = staging {
                 self.staging_save_failed(token, cx);
             }

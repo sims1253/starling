@@ -196,8 +196,7 @@ pub(crate) struct Activation {
     phase: Phase,
     key_down: bool,
     last_key_event: Option<Instant>,
-    /// Per source, when it last reported a press and a release: a report
-    /// that the other source already made is a duplicate.
+    /// The most recently issued take id; takes are numbered from 1.
     last_take: TakeId,
 }
 

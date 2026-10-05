@@ -282,18 +282,21 @@ impl Settings {
             (engine_field("activeModel"), engine_field("backendOverride"));
         // The dictation subsection reads leniently on its own (#221), so
         // an unreadable sibling key does not reset the user's shortcut.
-        let dictation = value
-            .get("dictation")
-            .cloned()
-            .and_then(|dictation| match serde_json::from_value::<DictationSettings>(dictation) {
-                Ok(dictation) => Some(dictation),
-                Err(err) => {
-                    eprintln!("Unreadable dictation settings; using the defaults: {err}");
-                    None
-                }
-            })
-            .unwrap_or_default();
+        // The subtree is taken before `value` moves into `from_value` and
+        // parsed only inside its failure branch: a load that succeeds
+        // relies on the field-level `lenient_dictation` alone, instead of
+        // parsing (and logging) the subsection twice.
+        let dictation_subtree = value.get("dictation").cloned();
         let Ok(mut settings) = serde_json::from_value::<Settings>(value) else {
+            let dictation = dictation_subtree
+                .and_then(|dictation| match serde_json::from_value::<DictationSettings>(dictation) {
+                    Ok(dictation) => Some(dictation),
+                    Err(err) => {
+                        eprintln!("Unreadable dictation settings; using the defaults: {err}");
+                        None
+                    }
+                })
+                .unwrap_or_default();
             let mut fallback = Self::default_settings();
             fallback.engine = EngineSettings {
                 mode: safe_mode,

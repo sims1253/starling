@@ -1071,7 +1071,7 @@ fn render_dictation_section(app: &mut StarlingApp, cx: &mut Context<StarlingApp>
     let double_tap = app.draft_double_tap;
     let double_tap_row = choice_row(
         SharedString::from("double-tap-hands-free"),
-        hold && double_tap,
+        double_tap,
         "Double tap for hands-free",
         if hold {
             "Tap the shortcut twice quickly to keep recording without holding it; press it \

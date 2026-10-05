@@ -16,6 +16,7 @@
 //! user is dictating into keeps keyboard focus.
 
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::Instant;
 
@@ -28,6 +29,10 @@ pub(crate) struct Shortcut {
     hotkey: HotKey,
     /// The text the user configured, as stored in settings.
     text: String,
+    /// The key's name in `gpui::Keystroke::key`, precomputed once:
+    /// matching a keystroke is the path every in-window key flows
+    /// through, and it must not allocate per key.
+    window_key: Option<String>,
 }
 
 impl Shortcut {
@@ -38,10 +43,10 @@ impl Shortcut {
         if text.is_empty() {
             return Err("Enter a shortcut, for example Ctrl+Shift+Space or F9.".to_string());
         }
-        let hotkey = HotKey::from_str(text).map_err(|_| {
+        let hotkey = HotKey::from_str(text).map_err(|err| {
             format!(
-                "\"{text}\" is not a shortcut Starling can register. Use modifiers and one \
-                 key, for example Ctrl+Shift+Space, Alt+D, or F9."
+                "\"{text}\" is not a shortcut Starling can register ({err}). Use modifiers \
+                 and one key, for example Ctrl+Shift+Space, Alt+D, or F9."
             )
         })?;
         if hotkey.key == Code::Escape {
@@ -54,9 +59,11 @@ impl Shortcut {
                 key_label(hotkey.key)
             ));
         }
+        let window_key = gpui_key(hotkey.key);
         Ok(Shortcut {
             hotkey,
             text: text.to_string(),
+            window_key,
         })
     }
 
@@ -92,7 +99,7 @@ impl Shortcut {
     /// With Shift, gpui may report the shifted character instead of the
     /// key (`?` rather than shift-`/` on a US layout); both forms match.
     pub(crate) fn matches_key_down(&self, keystroke: &gpui::Keystroke) -> bool {
-        let Some(key) = gpui_key(self.hotkey.key) else {
+        let Some(key) = self.window_key.as_deref() else {
             return false;
         };
         let mods = self.hotkey.mods;
@@ -101,7 +108,7 @@ impl Shortcut {
             && keystroke.modifiers.platform == mods.contains(Modifiers::SUPER);
         let shift = mods.contains(Modifiers::SHIFT);
         let plain = keystroke.key == key && keystroke.modifiers.shift == shift;
-        let shifted = shift && us_shifted(&key).is_some_and(|symbol| keystroke.key == symbol);
+        let shifted = shift && us_shifted(key).is_some_and(|symbol| keystroke.key == symbol);
         others && (plain || shifted)
     }
 
@@ -109,8 +116,8 @@ impl Shortcut {
     /// counts: people let go of the modifiers first as often as last, and
     /// a hold must end either way.
     pub(crate) fn matches_key_up(&self, keystroke: &gpui::Keystroke) -> bool {
-        gpui_key(self.hotkey.key).is_some_and(|key| {
-            keystroke.key == key || us_shifted(&key).is_some_and(|symbol| keystroke.key == symbol)
+        self.window_key.as_deref().is_some_and(|key| {
+            keystroke.key == key || us_shifted(key).is_some_and(|symbol| keystroke.key == symbol)
         })
     }
 
@@ -121,7 +128,7 @@ impl Shortcut {
     /// Whether the window can see this shortcut at all (keys gpui does
     /// not name, like Pause, only work system-wide).
     pub(crate) fn works_in_window(&self) -> bool {
-        gpui_key(self.hotkey.key).is_some()
+        self.window_key.is_some()
     }
 }
 
@@ -369,6 +376,13 @@ fn manage(
     }
 }
 
+/// Whether a `GlobalShortcuts` has taken the process-wide event handler.
+/// `GlobalHotKeyEvent::set_event_handler` routes every hotkey event to one
+/// closure, so a second instance would silently replace it and leave the
+/// first's registrations firing into a dropped sender — the shortcut
+/// would look registered but never act. One instance per process, enforced.
+static HANDLER_INSTALLED: AtomicBool = AtomicBool::new(false);
+
 /// The system-wide registrations: the recording shortcut for the app's
 /// lifetime, and Escape only while a take is active (grabbing Escape the
 /// rest of the time would take it away from every other app).
@@ -400,7 +414,8 @@ pub(crate) struct GlobalShortcuts {
 
 impl GlobalShortcuts {
     /// Create the manager and route its events here. Only one instance may
-    /// exist: the event handler is process-wide.
+    /// exist — enforced below, not just documented: the event handler is
+    /// process-wide, and a second one would orphan the first's grabs.
     pub(crate) fn new() -> Result<GlobalShortcuts, String> {
         // On Linux `global-hotkey` only speaks X11, and with no display it
         // fails silently (its registrations report success with no backend
@@ -413,6 +428,13 @@ impl GlobalShortcuts {
             );
         }
         let manager = GlobalHotKeyManager::new().map_err(|err| err.to_string())?;
+        if HANDLER_INSTALLED.swap(true, Ordering::SeqCst) {
+            return Err(
+                "a GlobalShortcuts already exists in this process; the hotkey event \
+                 handler is process-wide"
+                    .to_string(),
+            );
+        }
         let (sender, events) = mpsc::channel();
         GlobalHotKeyEvent::set_event_handler(Some(move |event: GlobalHotKeyEvent| {
             let _ = sender.send((event.id(), event.state(), Instant::now()));
@@ -483,16 +505,17 @@ impl GlobalShortcuts {
     }
 
     /// Grab Escape system-wide while a take is active, release it after.
-    /// Bare Escape is required; Escape with (subsets of) the shortcut's
-    /// modifiers is best effort (the platform may reserve it, like
-    /// Ctrl+Shift+Escape on Windows), and the window still sees it either
-    /// way. On Linux this only posts to the worker: the grabs come up off
-    /// the UI thread, and refusals arrive with the next polled events
-    /// (`next_raw`).
+    /// Escape with (subsets of) the shortcut's modifiers is best effort
+    /// (the platform may reserve it, like Ctrl+Shift+Escape on Windows),
+    /// and the window still sees it either way. Inline (Windows/macOS)
+    /// the arm fails on a refused bare Escape; on Linux it only posts to
+    /// the worker, so even that refusal is known asynchronously — the
+    /// worker logs it, it never reaches this call's result, and the
+    /// window still sees Escape. The grabs come up off the UI thread.
     pub(crate) fn arm_escape(&mut self, armed: bool, shortcut: &Shortcut) -> Result<(), String> {
         if !armed {
             let variants = std::mem::take(&mut self.escape);
-            self.escape_live.clear();
+            let live = std::mem::take(&mut self.escape_live);
             if variants.is_empty() {
                 return Ok(());
             }
@@ -500,12 +523,23 @@ impl GlobalShortcuts {
                 Some(worker) => worker
                     .send(WorkerCommand::Disarm { variants })
                     .map_err(|err| err.to_string()),
-                None => self
-                    .manager
-                    .as_ref()
-                    .expect("the manager is inline without a worker")
-                    .unregister_all(&variants)
-                    .map_err(|err| err.to_string()),
+                None => {
+                    let manager = self
+                        .manager
+                        .as_ref()
+                        .expect("the manager is inline without a worker");
+                    // One release per variant, and only the ones that
+                    // registered: `unregister_all` fails fast on a variant
+                    // the platform refused at arm time and would leave
+                    // every grab after it live. An individual failure is
+                    // logged and the rest still released.
+                    for variant in &live {
+                        if let Err(err) = manager.unregister(*variant) {
+                            eprintln!("An Escape grab could not be released ({err}).");
+                        }
+                    }
+                    Ok(())
+                }
             };
         }
         if !self.escape.is_empty() {
