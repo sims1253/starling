@@ -400,9 +400,11 @@ pub fn listen(path: &Path) -> io::Result<Box<dyn TransportListener>> {
         let first = SendHandle(handle);
         let (tx, rx) = mpsc::sync_channel::<io::Result<ConnectedInstance>>(4);
         let name_for_thread = name.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_for_thread = Arc::clone(&stop);
         let acceptor = std::thread::Builder::new()
             .name("starling-host-pipe-accept".into())
-            .spawn(move || acceptor_loop(name_for_thread, first, tx))
+            .spawn(move || acceptor_loop(name_for_thread, first, tx, stop_for_thread))
             .map_err(|err| {
                 // The acceptor will never service (or close) the
                 // instance: close it here or it leaks for the process
@@ -413,6 +415,7 @@ pub fn listen(path: &Path) -> io::Result<Box<dyn TransportListener>> {
         Ok(Box::new(PipeListener {
             name,
             connections: Some(rx),
+            stop,
             _acceptor: acceptor,
         }))
     }
@@ -420,15 +423,27 @@ pub fn listen(path: &Path) -> io::Result<Box<dyn TransportListener>> {
 
 /// The acceptor thread body: block on `ConnectNamedPipe` for the current
 /// instance, deliver it, create the next instance, repeat. Exits when the
-/// receiver is gone (listener dropped — the Drop impl wakes the pending
-/// ConnectNamedPipe with a self-connection first).
+/// receiver is gone or `stop` is set (listener dropped). The connect
+/// wait is cancel-aware: it re-checks `stop` every [`CLOSE_POLL`], so the
+/// acceptor ends even when no wake connection reaches it (the wake can
+/// race a just-closed instance) — it never parks on a fresh instance
+/// past its listener and keeps the pipe name bound.
 fn acceptor_loop(
     name: Vec<u16>,
     mut current: SendHandle,
     tx: mpsc::SyncSender<io::Result<ConnectedInstance>>,
+    stop: Arc<AtomicBool>,
 ) {
     loop {
-        let connected = unsafe { connect_instance(current.0) };
+        if stop.load(Ordering::SeqCst) {
+            // SAFETY: the current, never-delivered instance is ours alone.
+            unsafe {
+                DisconnectNamedPipe(current.0);
+                CloseHandle(current.0);
+            }
+            return;
+        }
+        let connected = unsafe { connect_instance(current.0, &stop) };
         if let Err(err) = connected {
             // ERROR_PIPE_CONNECTED: a client completed the connection
             // between instance creation and this call — the instance is
@@ -525,7 +540,7 @@ impl Drop for Event {
 /// call); `Err(code)` otherwise. Blocks for as long as no client comes —
 /// the acceptor thread's job; the listener's Drop wakes it with a
 /// self-connection.
-unsafe fn connect_instance(handle: HANDLE) -> Result<(), u32> {
+unsafe fn connect_instance(handle: HANDLE, stop: &AtomicBool) -> Result<(), u32> {
     let event = Event::new().map_err(|err| err.raw_os_error().unwrap_or(0) as u32)?;
     let mut overlapped: OVERLAPPED = std::mem::zeroed();
     overlapped.hEvent = event.0;
@@ -535,8 +550,17 @@ unsafe fn connect_instance(handle: HANDLE) -> Result<(), u32> {
     match GetLastError() {
         ERROR_PIPE_CONNECTED => Ok(()),
         ERROR_IO_PENDING => {
-            // The kernel owns `overlapped` until completion: wait it out
-            // (bWait = TRUE) before the frame (and the event) go away.
+            // Wait in slices so a stop request is seen without a wake
+            // connection; on stop, cancel the connect.
+            while WaitForSingleObject(event.0, CLOSE_POLL.as_millis() as u32) == WAIT_TIMEOUT {
+                if stop.load(Ordering::SeqCst) {
+                    CancelIoEx(handle, &overlapped);
+                    break;
+                }
+            }
+            // The kernel owns `overlapped` until completion (or the
+            // cancellation) lands: wait it out (bWait = TRUE) before the
+            // frame and the event go away.
             let mut ignored = 0u32;
             if GetOverlappedResult(handle, &overlapped, &mut ignored, 1) != 0 {
                 Ok(())
@@ -644,6 +668,8 @@ pub struct PipeListener {
     /// `Option` so `Drop` can end the channel **before** joining the
     /// acceptor (see [`Drop for PipeListener`]).
     connections: Option<mpsc::Receiver<io::Result<ConnectedInstance>>>,
+    /// Tells the acceptor to stop (checked between and during connects).
+    stop: Arc<AtomicBool>,
     /// Kept alive so the acceptor thread's channel has a sender-side
     /// counterpart to observe; joined on Drop.
     _acceptor: std::thread::JoinHandle<()>,
@@ -700,9 +726,11 @@ impl Drop for PipeListener {
         // receiver still alive it would instead create the *next*
         // instance and park on it forever, and the join would hang even
         // on this happy path.
+        self.stop.store(true, Ordering::SeqCst);
         drop(self.connections.take());
-        // (2) Wake the acceptor: connect to our own pipe name so the
-        // pending ConnectNamedPipe completes.
+        // (2) Wake the acceptor promptly: connect to our own pipe name so
+        // the pending connect completes. Not load-bearing — the stop flag
+        // ends a connect this wake misses within CLOSE_POLL.
         let _ = connect(Path::new(&String::from_utf16_lossy(&self.name)));
         // (3) Bounded wait: a wake that cannot reach the acceptor
         // (create_instance failed, the name is gone) must not hang the
@@ -1158,6 +1186,52 @@ impl Write for PipeConn {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_pipe(tag: &str) -> PathBuf {
+        PathBuf::from(format!(
+            "\\\\.\\pipe\\starling-host-test-{}-{tag}",
+            std::process::id()
+        ))
+    }
+
+    /// Bounded wait for the name to stop resolving to a server.
+    fn assert_name_released(path: &Path) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while probe(path) != Probe::Dead {
+            assert!(
+                Instant::now() < deadline,
+                "the pipe name stayed bound after its listener dropped"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// A dropped listener ends its acceptor and releases the pipe name —
+    /// no instance outlives the listener (a successor's probe must not
+    /// find a "live" server).
+    #[test]
+    fn a_dropped_listener_releases_the_pipe_name() {
+        let path = test_pipe("idle");
+        let listener = listen(&path).expect("listen");
+        assert_eq!(probe(&path), Probe::Live);
+        drop(listener);
+        assert_name_released(&path);
+    }
+
+    /// The same with connections the host never accepted: queued
+    /// instances are closed with the listener, and the acceptor (which
+    /// moved on to a fresh instance after queueing them) stops anyway.
+    #[test]
+    fn a_dropped_listener_closes_unaccepted_connections() {
+        let path = test_pipe("queued");
+        let listener = listen(&path).expect("listen");
+        let clients: Vec<_> = (0..3).map(|_| connect(&path).expect("connect")).collect();
+        // Let the acceptor queue them and park on its next instance.
+        std::thread::sleep(Duration::from_millis(200));
+        drop(listener);
+        assert_name_released(&path);
+        drop(clients);
+    }
 
     #[test]
     fn sddl_grants_read_write_to_system_and_owner_only() {
