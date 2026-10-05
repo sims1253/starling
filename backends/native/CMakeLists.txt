@@ -130,6 +130,14 @@ target_include_directories(starling_ggml_core PUBLIC
     ${STARLING_REPO_ROOT}/third_party/ggml/src ${STARLING_REPO_ROOT}/third_party/ggml/include)
 target_compile_definitions(starling_ggml_core PUBLIC $<$<CXX_COMPILER_ID:MSVC>:_USE_MATH_DEFINES>)
 target_link_libraries(starling_ggml_core PUBLIC ggml)
+# Windows CUDA: the Backend probes the cuBLAS DLL before selecting a CUDA
+# device, so a missing runtime DLL fails the model load with a message
+# instead of terminating the process at the first delay-loaded call.
+if(STARLING_GGML_CUDA AND WIN32)
+  find_package(CUDAToolkit REQUIRED)
+  target_compile_definitions(starling_ggml_core PRIVATE
+      STARLING_CUBLAS_DLL="cublas64_${CUDAToolkit_VERSION_MAJOR}.dll")
+endif()
 
 # Model-specialized fast engines (cpp/fast): hand-written Vulkan kernels for
 # the Parakeet and MOSS Q4 checkpoints, selected at load time by

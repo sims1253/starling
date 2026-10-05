@@ -148,6 +148,7 @@ boundary=starling-runtime-check
 } > request.body
 http POST /v1/audio/transcriptions request.body "multipart/form-data; boundary=$boundary" > response.txt
 tr -d '\r' < response.txt | sed -n '1p;$p'
+echo
 head -n 1 response.txt | grep -Eq '^HTTP/1\.[01] 200 ' || { cat server.log >&2; echo 'Transcription failed' >&2; exit 1; }
 # Compare the JSON-escaped expected transcript with the response's text field.
 escaped=${expected//\\/\\\\}

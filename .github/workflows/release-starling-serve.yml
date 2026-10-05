@@ -769,10 +769,21 @@ jobs:
             Read `RUNTIME.md` inside the archive before running it. GPU drivers and
             accelerator runtime libraries are not bundled. CUDA requires the 13.3
             runtime and cuBLAS; ROCm requires the 7.2.4 HIP/BLAS runtime.
-            The CPU builds need only the platform C/C++ runtime. Linux CUDA,
-            Linux Vulkan and Linux CPU are smoke-tested outside their build
+            The Linux CPU build needs only the platform C/C++ runtime. Every
+            Windows build also needs the Microsoft Visual C++ Redistributable
+            (x64) for the OpenMP runtime `vcomp140.dll`. Linux CUDA, Linux
+            Vulkan and Linux CPU are smoke-tested outside their build
             environment in a clean container. These startup checks do not
             verify GPU inference.
+
+            ### Hardware coverage
+            Representative Parakeet inference has been verified on real
+            hardware for `linux-cuda`, `windows-cuda` (RTX 5090), `linux-vulkan`
+            (AMD RADV), `linux-cpu` and `windows-cpu`.
+            Verified on a local build only: `windows-vulkan` (RTX 5090).
+            Not verified on hardware: `linux-rocm`, `macos-metal`, `macos-cpu`.
+            Other GPUs, drivers and models are untested; the "Hardware
+            verification" section of `RUNTIME.md` lists what each entry covers.
 
             ### Usage
             ```bash

@@ -47,6 +47,15 @@
 
 #ifdef _WIN32
 #include <process.h>
+#ifdef STARLING_CUBLAS_DLL
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>  // LoadLibraryA: the cuBLAS probe in Backend::Backend
+#endif
 #else
 #include <unistd.h>
 #endif
@@ -282,6 +291,23 @@ Backend::Backend(int n_threads) : impl_(new Impl()), n_threads_(n_threads < 1 ? 
         if (!chosen) chosen = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU);
         if (!chosen) chosen = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
     }
+#if defined(_WIN32) && defined(STARLING_CUBLAS_DLL)
+    // Windows CUDA builds delay-load cuBLAS (release-starling-serve.yml) so the
+    // exe starts without it; the CUDA runtime itself is static. A missing DLL
+    // would otherwise kill the process with no message on the first matmul,
+    // after a load that reported success. Fail the load here instead. The
+    // probe uses the same search order as the delay-load helper, and the
+    // module stays loaded for it.
+    if (chosen &&
+        std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(chosen)), "CUDA") == 0 &&
+        !LoadLibraryA(STARLING_CUBLAS_DLL)) {
+        throw std::runtime_error(
+            std::string("CUDA device ") + ggml_backend_dev_name(chosen) +
+            " needs " STARLING_CUBLAS_DLL " (cuBLAS), which could not be loaded; "
+            "add the CUDA runtime's cuBLAS DLL directory to PATH (see RUNTIME.md) "
+            "or set STARLING_GGML_DEVICE=cpu");
+    }
+#endif
     if (chosen) {
         device_name_ = ggml_backend_dev_name(chosen);
         dev_ = chosen;
