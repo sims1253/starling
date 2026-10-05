@@ -32,6 +32,7 @@
 //! a quick tap-tap latches the take hands-free), and `HoldOrToggle`
 //! (a quick tap latches, a long hold records until release).
 
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use gpui::Context;
@@ -62,9 +63,48 @@ pub(crate) const DOUBLE_TAP_WINDOW: Duration = Duration::from_millis(400);
 pub(crate) const REPEAT_GAP: Duration = Duration::from_millis(1200);
 
 /// The same press (or release) reported by both the system-wide grab and
-/// the window within this long is one physical event, whatever order the
-/// two reports arrive in.
+/// the window within this long is one physical event — unless the first
+/// source reported the opposite edge in between, which makes the second
+/// report a new gesture.
 pub(crate) const DUPLICATE_WINDOW: Duration = Duration::from_millis(150);
+
+/// How long shortcut events wait before the machine sees them. Both
+/// sources feed one queue that is processed in timestamp order; holding
+/// events back this long lets a slower source's report of the same edge
+/// arrive first (`global-hotkey` polls X11 every 50 ms), so duplicates
+/// are judged in true order, never by arrival order.
+pub(crate) const ORDERING_HOLD_BACK: Duration = Duration::from_millis(60);
+
+/// One edge of the shortcut key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Edge {
+    Press,
+    Release,
+}
+
+/// One shortcut event waiting in the ordering queue.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum KeyInput {
+    Edge(Edge, Source),
+    Escape,
+}
+
+/// Take the events that have waited out [`ORDERING_HOLD_BACK`] from
+/// `queue`, oldest first; younger ones stay queued.
+pub(crate) fn ready_inputs(
+    queue: &mut Vec<(Instant, KeyInput)>,
+    now: Instant,
+) -> Vec<(Instant, KeyInput)> {
+    queue.sort_by_key(|(at, _)| *at);
+    let ready = queue
+        .iter()
+        .take_while(|(at, _)| now.saturating_duration_since(*at) >= ORDERING_HOLD_BACK)
+        .count();
+    queue.drain(..ready).collect()
+}
+
+/// How many recent edges each source remembers for duplicate matching.
+const EDGE_HISTORY: usize = 8;
 
 /// Where a shortcut press or release was observed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -192,8 +232,7 @@ pub(crate) struct Activation {
     last_key_event: Option<Instant>,
     /// Per source, when it last reported a press and a release: a report
     /// that the other source already made is a duplicate.
-    last_press: [Option<Instant>; 2],
-    last_release: [Option<Instant>; 2],
+    edges: [VecDeque<(Edge, Instant)>; 2],
     last_take: TakeId,
 }
 
@@ -204,8 +243,7 @@ impl Activation {
             phase: Phase::Idle,
             key_down: false,
             last_key_event: None,
-            last_press: [None; 2],
-            last_release: [None; 2],
+            edges: [VecDeque::new(), VecDeque::new()],
             last_take: 0,
         }
     }
@@ -257,26 +295,41 @@ impl Activation {
     pub(crate) fn reset_key(&mut self) {
         self.key_down = false;
         self.last_key_event = None;
-        self.last_press = [None; 2];
-        self.last_release = [None; 2];
+        self.edges = [VecDeque::new(), VecDeque::new()];
     }
 
-    /// Whether `source` reporting an event at `now` repeats one the other
-    /// source already reported; records it otherwise.
-    fn duplicate(log: &mut [Option<Instant>; 2], source: Source, now: Instant) -> bool {
-        let other = log[source.other().index()];
-        if other.is_some_and(|at| abs_diff(at, now) < DUPLICATE_WINDOW) {
-            return true;
+    /// Whether `source` reporting `edge` at `at` repeats an edge the other
+    /// source already reported: the same edge within [`DUPLICATE_WINDOW`]
+    /// with no opposite edge from that source in between (an opposite
+    /// edge means the key went the other way: this is a new gesture).
+    /// Accepted edges are recorded. Callers feed edges in timestamp order
+    /// (see [`ORDERING_HOLD_BACK`]).
+    fn duplicate(&mut self, edge: Edge, source: Source, at: Instant) -> bool {
+        let other = &self.edges[source.other().index()];
+        let duplicate = other.iter().any(|&(seen, seen_at)| {
+            seen == edge
+                && abs_diff(seen_at, at) < DUPLICATE_WINDOW
+                && !other.iter().any(|&(between, between_at)| {
+                    between != edge
+                        && between_at > seen_at.min(at)
+                        && between_at < seen_at.max(at)
+                })
+        });
+        if !duplicate {
+            let own = &mut self.edges[source.index()];
+            own.push_back((edge, at));
+            if own.len() > EDGE_HISTORY {
+                own.pop_front();
+            }
         }
-        log[source.index()] = Some(now);
-        false
+        duplicate
     }
 
     /// The shortcut went down. `may_start` is false while the app must
     /// not begin a take (a modal is open): such a press can still stop
     /// the active take, but never starts one.
     pub(crate) fn press(&mut self, now: Instant, source: Source, may_start: bool) -> Vec<Effect> {
-        if Self::duplicate(&mut self.last_press, source, now) {
+        if self.duplicate(Edge::Press, source, now) {
             return Vec::new();
         }
         if self.key_down {
@@ -328,7 +381,7 @@ impl Activation {
 
     /// The shortcut went up.
     pub(crate) fn release(&mut self, now: Instant, source: Source) -> Vec<Effect> {
-        if Self::duplicate(&mut self.last_release, source, now) {
+        if self.duplicate(Edge::Release, source, now) {
             return Vec::new();
         }
         if !self.key_down {
@@ -562,7 +615,7 @@ impl StarlingApp {
         let app = cx.entity().downgrade();
         let subscription = cx.intercept_keystrokes(move |event, _window, cx| {
             let handled = app
-                .update(cx, |app, cx| app.shortcut_key_down(&event.keystroke, cx))
+                .update(cx, |app, _cx| app.shortcut_key_down(&event.keystroke))
                 .unwrap_or(false);
             if handled {
                 cx.stop_propagation();
@@ -573,52 +626,57 @@ impl StarlingApp {
 
     /// An in-window key-down. Returns whether it was the shortcut or the
     /// Escape that cancels the active take (and so must not propagate).
-    pub(crate) fn shortcut_key_down(
-        &mut self,
-        keystroke: &gpui::Keystroke,
-        cx: &mut Context<Self>,
-    ) -> bool {
+    pub(crate) fn shortcut_key_down(&mut self, keystroke: &gpui::Keystroke) -> bool {
         if self.activation.is_active() && crate::shortcut::is_escape(keystroke) {
-            self.activation_input(|machine| machine.escape(), cx);
+            self.key_queue.push((Instant::now(), KeyInput::Escape));
             return true;
         }
         if !self.shortcut.matches_key_down(keystroke) {
             return false;
         }
-        let may_start = !self.settings_open;
-        self.activation_input(
-            |machine| machine.press(Instant::now(), Source::Window, may_start),
-            cx,
-        );
+        self.key_queue
+            .push((Instant::now(), KeyInput::Edge(Edge::Press, Source::Window)));
         true
     }
 
     /// An in-window key-up: the release of a held shortcut.
-    pub(crate) fn shortcut_key_up(&mut self, keystroke: &gpui::Keystroke, cx: &mut Context<Self>) {
+    pub(crate) fn shortcut_key_up(&mut self, keystroke: &gpui::Keystroke) {
         if self.shortcut.matches_key_up(keystroke) {
-            self.activation_input(|machine| machine.release(Instant::now(), Source::Window), cx);
+            self.key_queue
+                .push((Instant::now(), KeyInput::Edge(Edge::Release, Source::Window)));
         }
     }
 
-    /// One loop turn: system-wide events, then timers, then readiness.
+    /// One loop turn: queue the system-wide events next to the window's,
+    /// feed every event that waited out the ordering hold-back to the
+    /// machine in timestamp order, then run its timers on the same lagged
+    /// clock (so a queued second tap is never overtaken by the double-tap
+    /// deadline it beat).
     pub(crate) fn poll_activation(&mut self, cx: &mut Context<Self>) {
         let events = self
             .global_shortcuts
             .as_ref()
             .map(GlobalShortcuts::drain)
             .unwrap_or_default();
+        self.key_queue.extend(events.into_iter().map(|event| match event {
+            GlobalEvent::Pressed(at) => (at, KeyInput::Edge(Edge::Press, Source::System)),
+            GlobalEvent::Released(at) => (at, KeyInput::Edge(Edge::Release, Source::System)),
+            GlobalEvent::Escape(at) => (at, KeyInput::Escape),
+        }));
+        let now = Instant::now();
         let may_start = !self.settings_open;
-        for event in events {
+        for (at, input) in ready_inputs(&mut self.key_queue, now) {
             self.activation_input(
-                |machine| match event {
-                    GlobalEvent::Pressed(at) => machine.press(at, Source::System, may_start),
-                    GlobalEvent::Released(at) => machine.release(at, Source::System),
-                    GlobalEvent::Escape(_) => machine.escape(),
+                |machine| match input {
+                    KeyInput::Edge(Edge::Press, source) => machine.press(at, source, may_start),
+                    KeyInput::Edge(Edge::Release, source) => machine.release(at, source),
+                    KeyInput::Escape => machine.escape(),
                 },
                 cx,
             );
         }
-        self.activation_input(|machine| machine.tick(Instant::now()), cx);
+        let lagged = now.checked_sub(ORDERING_HOLD_BACK).unwrap_or(now);
+        self.activation_input(|machine| machine.tick(lagged), cx);
     }
 
     /// Feed one input to the machine and perform its effects. Readiness
@@ -1102,6 +1160,58 @@ mod tests {
         assert!(m.press(t0 + ms(2), Source::System, true).is_empty());
         assert!(m.release(t0 + ms(901), Source::System).is_empty());
         assert!(!m.is_active());
+    }
+
+    #[test]
+    fn delayed_duplicates_of_several_gestures_never_restart_a_take() {
+        // Window: tap to start, tap to stop. The system-wide copies of all
+        // four edges follow in timestamp order.
+        let mut m = machine(ActivationMode::Toggle, false);
+        let t0 = Instant::now();
+        let take = start_listening(&mut m, t0);
+        assert!(m.press(t0 + ms(1), Source::System, true).is_empty());
+        assert!(m.release(t0 + ms(60), Source::Window).is_empty());
+        assert!(m.release(t0 + ms(61), Source::System).is_empty());
+        assert_eq!(m.press(t0 + ms(250), Source::Window, true), vec![Effect::Finish(take)]);
+        assert!(m.press(t0 + ms(251), Source::System, true).is_empty());
+        assert!(m.release(t0 + ms(310), Source::Window).is_empty());
+        assert!(m.release(t0 + ms(311), Source::System).is_empty());
+        assert!(!m.is_active());
+    }
+
+    #[test]
+    fn a_quick_second_gesture_from_the_other_source_is_not_a_duplicate() {
+        // An XWayland app had focus for the first tap, Starling's own
+        // window for the second: the system release in between makes the
+        // window press a new gesture.
+        let mut m = machine(ActivationMode::Toggle, false);
+        let t0 = Instant::now();
+        let [Effect::Start(take)] = m.press(t0, Source::System, true)[..] else {
+            panic!("expected a start");
+        };
+        m.samples_arrived(take);
+        assert!(m.release(t0 + ms(40), Source::System).is_empty());
+        assert_eq!(m.press(t0 + ms(100), Source::Window, true), vec![Effect::Finish(take)]);
+        assert!(m.release(t0 + ms(140), Source::Window).is_empty());
+    }
+
+    #[test]
+    fn the_queue_releases_events_in_timestamp_order_after_the_hold_back() {
+        let t0 = Instant::now();
+        let window = KeyInput::Edge(Edge::Press, Source::Window);
+        let system = KeyInput::Edge(Edge::Press, Source::System);
+        // The window's report was queued first but happened later.
+        let mut queue = vec![(t0 + ms(30), window), (t0, system)];
+        assert!(ready_inputs(&mut queue, t0 + ORDERING_HOLD_BACK - ms(1)).is_empty());
+        assert_eq!(
+            ready_inputs(&mut queue, t0 + ORDERING_HOLD_BACK),
+            vec![(t0, system)]
+        );
+        assert_eq!(
+            ready_inputs(&mut queue, t0 + ms(30) + ORDERING_HOLD_BACK),
+            vec![(t0 + ms(30), window)]
+        );
+        assert!(queue.is_empty());
     }
 
     #[test]

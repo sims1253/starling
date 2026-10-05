@@ -299,8 +299,8 @@ impl GlobalShortcuts {
     }
 
     /// Grab Escape system-wide while a take is active, release it after.
-    /// Bare Escape is required; Escape with the shortcut's modifiers is
-    /// best effort (the platform may reserve it, like Ctrl+Shift+Escape on
+    /// Bare Escape is required; Escape with (subsets of) the shortcut's
+    /// modifiers is best effort (the platform may reserve it, like Ctrl+Shift+Escape on
     /// Windows), and the window still sees it either way.
     pub(crate) fn arm_escape(&mut self, armed: bool, shortcut: &Shortcut) -> Result<(), String> {
         if !armed {
@@ -318,9 +318,25 @@ impl GlobalShortcuts {
         let bare = HotKey::new(None, Code::Escape);
         self.manager.register(bare).map_err(|err| err.to_string())?;
         self.escape.push(bare);
+        // Every subset of the shortcut's modifiers: any of them may still
+        // be held (or already let go) when Escape comes.
         let mods = shortcut.modifiers();
-        if !mods.is_empty() {
-            let held = HotKey::new(Some(mods), Code::Escape);
+        let parts: Vec<Modifiers> = [
+            Modifiers::CONTROL,
+            Modifiers::SHIFT,
+            Modifiers::ALT,
+            Modifiers::SUPER,
+        ]
+        .into_iter()
+        .filter(|part| mods.contains(*part))
+        .collect();
+        for mask in 1u32..(1 << parts.len()) {
+            let subset = parts
+                .iter()
+                .enumerate()
+                .filter(|(bit, _)| mask & (1 << bit) != 0)
+                .fold(Modifiers::empty(), |acc, (_, part)| acc | *part);
+            let held = HotKey::new(Some(subset), Code::Escape);
             if self.manager.register(held).is_ok() {
                 self.escape.push(held);
             }
