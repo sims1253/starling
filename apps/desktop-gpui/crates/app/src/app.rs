@@ -471,9 +471,6 @@ pub struct StarlingApp {
     /// A shortcut saved while a take was running: it takes over when the
     /// take ends, so the held key's release still finishes that take.
     pub(crate) pending_shortcut: Option<crate::shortcut::Shortcut>,
-    /// Shortcut events from both sources, processed in timestamp order
-    /// once they waited out `activation::ORDERING_HOLD_BACK`.
-    pub(crate) key_queue: Vec<(Instant, crate::activation::KeyInput)>,
     /// The system-wide registrations (absent in tests and where the
     /// platform offers none), and how registering the shortcut went.
     pub(crate) global_shortcuts: Option<crate::shortcut::GlobalShortcuts>,
@@ -1049,7 +1046,6 @@ impl StarlingApp {
             dictation_draft_error: None,
             shortcut,
             pending_shortcut: None,
-            key_queue: Vec::new(),
             dictation_settings,
             global_shortcuts: None,
             shortcut_registration: Ok(()),
@@ -2447,8 +2443,8 @@ impl Render for StarlingApp {
             // interceptor (`activation.rs`), which sees them before any
             // binding; releases come here, in the capture phase, so no
             // child can swallow the end of a hold.
-            .capture_key_up(cx.listener(|this, event: &gpui::KeyUpEvent, _window, _cx| {
-                this.shortcut_key_up(&event.keystroke);
+            .capture_key_up(cx.listener(|this, event: &gpui::KeyUpEvent, _window, cx| {
+                this.shortcut_key_up(&event.keystroke, cx);
             }))
             .relative()
             .size_full()

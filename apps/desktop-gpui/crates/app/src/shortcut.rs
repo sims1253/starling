@@ -1,13 +1,12 @@
 //! The configurable recording shortcut (#221): parsing and validation,
 //! the in-window key matcher, and the system-wide registration.
 //!
-//! Two sources feed the activation machine with presses and releases of
-//! the same shortcut. The system-wide one (`global-hotkey`: X11 key grab,
+//! Two sources can feed the activation machine, and exactly one reports
+//! any given press. The system-wide one (`global-hotkey`: X11 key grab,
 //! Windows `RegisterHotKey`, macOS Carbon hot keys) consumes the key
-//! where it works, so the window rarely sees it too; the in-window one
-//! covers sessions where the system-wide grab cannot reach (a native
-//! Wayland window) or registration failed. Where both do see one press,
-//! the machine's key-down tracking makes the second report a repeat.
+//! everywhere it works; the in-window one is enabled only where that grab
+//! cannot hear the window (a native Wayland window) or registration
+//! failed (see `StarlingApp::window_shortcut_enabled`).
 //!
 //! Neither source ever raises or focuses the Starling window: the app the
 //! user is dictating into keeps keyboard focus.
@@ -371,9 +370,15 @@ impl GlobalShortcuts {
     }
 }
 
+/// Whether this is a Wayland session (the window is a native Wayland
+/// client the X11 grab cannot hear).
+pub(crate) fn wayland_session() -> bool {
+    cfg!(target_os = "linux") && std::env::var_os("WAYLAND_DISPLAY").is_some_and(|d| !d.is_empty())
+}
+
 /// What the settings dialog says about where the shortcut works.
 pub(crate) fn reach_note(registered: Result<(), &str>, shortcut: &Shortcut) -> String {
-    let wayland = cfg!(target_os = "linux") && std::env::var_os("WAYLAND_DISPLAY").is_some();
+    let wayland = wayland_session();
     let in_window = if shortcut.works_in_window() {
         "It always works while the Starling window is focused."
     } else {
