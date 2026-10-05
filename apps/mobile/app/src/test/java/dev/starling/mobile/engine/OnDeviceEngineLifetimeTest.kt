@@ -33,7 +33,7 @@ class OnDeviceEngineLifetimeTest {
             },
             nativeSupport = { null },
         )
-        val preload = thread { engine.prepare() }
+        val preload = thread { engine.prepare { false } }
         assertTrue(loading.await(5, TimeUnit.SECONDS))
 
         // The Record tap runs this on the main thread while the load holds the lock.
@@ -55,7 +55,7 @@ class OnDeviceEngineLifetimeTest {
                 failures += model to reason
             }
         }
-        val reason = engine.prepare()
+        val reason = engine.prepare { false }
         assertEquals(listOf("parakeet.gguf" to reason), failures)
     }
 
@@ -83,9 +83,17 @@ class OnDeviceEngineLifetimeTest {
     }
 
     @Test
+    fun aClosedSessionNeverLoads() {
+        var gateCalls = 0
+        val engine = OnDeviceEngine(modelDir(), memoryGate = { gateCalls++; null }, nativeSupport = { null })
+        assertEquals("the live session was closed", engine.prepare { true })
+        assertEquals(0, gateCalls)
+    }
+
+    @Test
     fun theIdleReleaseHasNothingToFreeWithoutAResidentModel() {
         val engine = OnDeviceEngine(modelDir(), memoryGate = { "refused" }, nativeSupport = { null })
-        engine.prepare()
+        engine.prepare { false }
         assertFalse(engine.releaseIfIdle(0))
     }
 }

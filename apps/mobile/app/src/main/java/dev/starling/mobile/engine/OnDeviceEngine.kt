@@ -574,15 +574,17 @@ class OnDeviceEngine(
      * Loads the model for a live session that just started and pins it to
      * the session (see [pinnedSessions]); null when ready. Blocking.
      */
-    override fun prepare(): String? = synchronized(lock) {
+    override fun prepare(cancelled: () -> Boolean): String? = synchronized(lock) {
         // A new take uses the model selected when it started, never the one
         // an earlier take (still finalizing) has pinned: wait, with the lock
         // released, for those takes to end so the switch can happen. The new
         // take's audio is being saved and backlogged meanwhile. The slice
         // re-checks the selection, which can change while waiting.
-        while (handle != 0L && pinnedSessions > 0 && loadedFile != activeModelFile()) {
+        while (!cancelled() && handle != 0L && pinnedSessions > 0 && loadedFile != activeModelFile()) {
             lock.wait(PIN_WAIT_SLICE_MILLIS)
         }
+        // A closed session must not load (and so undo a deferred release).
+        if (cancelled()) return "the live session was closed"
         usingLocked { ensureLoadedLocked().also { if (it == null) pinnedSessions++ } }
     }
 

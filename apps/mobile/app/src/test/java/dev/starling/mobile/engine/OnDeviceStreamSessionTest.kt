@@ -26,7 +26,7 @@ class OnDeviceStreamSessionTest {
     ) : OnDeviceStreamSession.LiveEngine {
         val calls = AtomicInteger()
 
-        override fun prepare(): String? = loadError
+        override fun prepare(cancelled: () -> Boolean): String? = loadError
 
         override fun transcribeWindow(samples: FloatArray): OnDeviceStreamSession.WindowResult {
             if (calls.incrementAndGet() > failAfterCalls) {
@@ -170,7 +170,7 @@ class OnDeviceStreamSessionTest {
      */
     private class SecondsEngine(private val loaded: CountDownLatch = CountDownLatch(0)) :
         OnDeviceStreamSession.LiveEngine {
-        override fun prepare(): String? {
+        override fun prepare(cancelled: () -> Boolean): String? {
             loaded.await(10, TimeUnit.SECONDS)
             return null
         }

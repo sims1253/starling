@@ -46,9 +46,10 @@ class OnDeviceStreamSession(
         /**
          * Loads the model if needed; null when ready, else the reason it
          * cannot run. A successful prepare pins the loaded model to this
-         * session until [liveSessionEnded] with `prepared = true`.
+         * session until [liveSessionEnded] with `prepared = true`. Gives up,
+         * without loading, once [cancelled] (the session was closed) holds.
          */
-        fun prepare(): String?
+        fun prepare(cancelled: () -> Boolean): String?
 
         /** Transcribes one window of 16 kHz mono samples. */
         fun transcribeWindow(samples: FloatArray): WindowResult
@@ -96,6 +97,8 @@ class OnDeviceStreamSession(
     private var captured = 0L
     private var openBacklog: Backlog? = null
     private var inputEnded = false
+    // Written under [lock]; volatile so the engine can poll it from prepare().
+    @Volatile
     private var closed = false
     private var failure: String? = null
     private var outcome: CommitOutcome? = null
@@ -206,7 +209,7 @@ class OnDeviceStreamSession(
     }
 
     private fun runLoop() {
-        val loadError = runCatching { engine.prepare() }.getOrElse { it.message ?: it::class.java.simpleName }
+        val loadError = runCatching { engine.prepare { closed } }.getOrElse { it.message ?: it::class.java.simpleName }
         if (loadError != null) {
             lock.withLock { failLocked(loadError, bufferLimitReached = false) }
             return
