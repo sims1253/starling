@@ -37,6 +37,7 @@ from starling.server import (  # noqa: E402
     ModelBackend,
     ParakeetBackend,
     ParakeetUnifiedBackend,
+    Qwen06Backend,
     Qwen3Backend,
     SAMPLE_RATE,
     ServerConfig,
@@ -49,8 +50,8 @@ from starling.server import (  # noqa: E402
 
 def test_model_slugs_are_the_supported_set() -> None:
     assert set(MODEL_SLUGS) == {
-        "granite", "parakeet", "parakeet_unified", "moss", "qwen3", "ark",
-        "ark06", "cohere", "higgs", "audex", "voxtral",
+        "granite", "parakeet", "parakeet_unified", "moss", "qwen3", "qwen3_06",
+        "ark", "ark06", "cohere", "higgs", "audex", "voxtral",
     }
 
 
@@ -61,6 +62,7 @@ def test_get_backend_resolves_each_slug_to_the_right_class() -> None:
     assert isinstance(get_backend("parakeet_unified", cfg), ParakeetUnifiedBackend)
     assert isinstance(get_backend("moss", cfg), MossBackend)
     assert isinstance(get_backend("qwen3", cfg), Qwen3Backend)
+    assert isinstance(get_backend("qwen3_06", cfg), Qwen06Backend)
     assert isinstance(get_backend("ark", cfg), ArkBackend)
     assert isinstance(get_backend("ark06", cfg), Ark06Backend)
     assert isinstance(get_backend("cohere", cfg), CohereBackend)

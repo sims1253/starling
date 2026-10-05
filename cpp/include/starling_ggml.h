@@ -37,7 +37,9 @@ extern "C" {
 //   8 — added STARLING_GGML_VOXTRAL (mistralai/Voxtral-Mini-4B-Realtime-2602;
 //       Phase 1: GGUF load + metadata/tokenizer validation only; decode
 //       returns the Phase-2 error until the encoder/decoder graph lands).
-#define STARLING_GGML_ABI_VERSION 8
+//   9 — added STARLING_GGML_QWEN3_06 (Qwen/Qwen3-ASR-0.6B-hf; served by the
+//       QWEN3 engine — same architecture, dims come from GGUF metadata).
+#define STARLING_GGML_ABI_VERSION 9
 
 // ABI / build introspection --------------------------------------------------
 
@@ -67,6 +69,7 @@ typedef enum {
     STARLING_GGML_AUDEX        = 9,  // nvidia/Nemotron-Labs-Audex-2B
     STARLING_GGML_ARK06        = 10, // Audio8/ARK-ASR-0.6B (ARK engine, 0.6B GGUF)
     STARLING_GGML_VOXTRAL      = 11, // mistralai/Voxtral-Mini-4B-Realtime-2602
+    STARLING_GGML_QWEN3_06     = 12, // Qwen/Qwen3-ASR-0.6B-hf (QWEN3 engine, 0.6B GGUF)
 } starling_ggml_model;
 
 // Lifecycle ------------------------------------------------------------------

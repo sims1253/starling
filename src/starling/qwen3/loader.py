@@ -19,8 +19,9 @@ def load_model_and_processor(
     *,
     dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
+    model_id: str | None = None,
 ) -> tuple[Any, Any]:
-    """Load the Qwen3-ASR-1.7B model and processor.
+    """Load a Qwen3-ASR model and processor.
 
     Args:
         attn_impl: Attention implementation. ``"eager"`` is the byte-exact
@@ -29,19 +30,23 @@ def load_model_and_processor(
             text decoder.
         dtype: Model dtype (bf16 is the checkpoint dtype).
         device: Target device.
+        model_id: HF hub repo id. Defaults to the 1.7B MODEL_ID; the 0.6B
+            track passes its own id (same processor/tokenizer/template, only
+            architecture dims differ).
 
     Returns:
         ``(model, processor)`` with the model in eval mode.
     """
     from transformers import AutoProcessor, Qwen3ASRForConditionalGeneration
 
+    repo = model_id or MODEL_ID
     model = Qwen3ASRForConditionalGeneration.from_pretrained(
-        MODEL_ID,
+        repo,
         torch_dtype=dtype,
         attn_implementation=attn_impl,
     ).to(device)
     model.eval()
-    processor = AutoProcessor.from_pretrained(MODEL_ID)
+    processor = AutoProcessor.from_pretrained(repo)
     return model, processor
 
 

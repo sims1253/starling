@@ -575,6 +575,21 @@ class Qwen3Starling(Engine):
         return text
 
 
+class Qwen06Starling(Qwen3Starling):
+    """starling fused pipeline for Qwen3-ASR-0.6B (same encoder/decoder
+    kernels as the 1.7B, loading the 0.6B hub id)."""
+
+    def __init__(self) -> None:
+        Engine.__init__(self, "starling", "qwen3_06", supports_batch=False)
+
+    def _load(self) -> None:
+        from starling.qwen3.audio import build_inputs
+        from starling.qwen3_06.pipeline import MegaPipeline
+
+        self._build_inputs = build_inputs
+        self.pipe = MegaPipeline.from_pretrained()
+
+
 class Qwen3StarlingBatched(Engine):
     """starling fused pipeline for Qwen3-ASR, **batched** decode.
 
@@ -657,6 +672,21 @@ class Qwen3Stock(Engine):
             return self.processor.decode(gen_new, return_format="transcription_only")[0]
         except Exception:  # noqa: BLE001 -- older processor API
             return self.processor.batch_decode(gen_new, skip_special_tokens=True)[0]
+
+
+class Qwen06Stock(Qwen3Stock):
+    """Stock ``model.generate`` reference for Qwen3-ASR-0.6B (same drive as
+    the 1.7B stock path; the reference the qwen3_06 golden is captured with)."""
+
+    def __init__(self) -> None:
+        Engine.__init__(self, "stock transformers", "qwen3_06", supports_batch=False)
+
+    def _load(self) -> None:
+        from starling.qwen3.audio import build_inputs
+        from starling.qwen3_06.loader import load_model_and_processor
+
+        self._build_inputs = build_inputs
+        self.model, self.processor = load_model_and_processor(attn_impl="eager")
 
 
 # ====================================================================== #
@@ -1507,6 +1537,19 @@ class StarlingGgmlQwen3(_StarlingGgml):
         super().__init__("qwen3", "QWEN3", STARLING_GGML_QWEN3_MODEL)
 
 
+STARLING_GGML_QWEN3_06_MODEL = Path(os.environ.get(
+    "STARLING_GGML_QWEN3_06_MODEL",
+    str(REPO_ROOT / "models" / "qwen3-asr-0.6b-bf16-exact.gguf"),
+)).expanduser()
+
+
+class StarlingGgmlQwen3_06(_StarlingGgml):
+    """The 0.6B sibling on the shared qwen3 C API (registry slug qwen3_06)."""
+
+    def __init__(self) -> None:
+        super().__init__("qwen3_06", "QWEN3_06", STARLING_GGML_QWEN3_06_MODEL)
+
+
 # ====================================================================== #
 # S1-mini (superwhisper/s1-mini) — text normalizer (no audio front-end)
 # ====================================================================== #
@@ -1975,7 +2018,8 @@ def _ggml_moss_keys() -> list[str]:
 def _qwen3_keys() -> list[str]:
     if not _qwen3_on_master():
         return []
-    return ["starling-qwen3", "stock-qwen3", "starling-batched-qwen3"]
+    return ["starling-qwen3", "stock-qwen3", "starling-batched-qwen3",
+            "starling-qwen3_06", "stock-qwen3_06"]
 
 
 def _higgs_keys() -> list[str]:
@@ -1992,6 +2036,7 @@ _STARLING_GGML_ENGINES = {
     "hojo": StarlingGgmlHojo,
     "granite": StarlingGgmlGranite,
     "qwen3": StarlingGgmlQwen3,
+    "qwen3_06": StarlingGgmlQwen3_06,
     "s1": StarlingGgmlS1,
     "audex": StarlingGgmlAudex,
 }
@@ -2051,8 +2096,11 @@ def build_engines(
                                 "qwen3": Qwen3StarlingBatched}[mdl]())
         elif key == "starling-spec-granite":
             chosen[mdl].append(GraniteStarlingSpec())
-        elif key.startswith("qwen3") or mdl == "qwen3":
-            cls = Qwen3Starling if fam == "starling" else Qwen3Stock
+        elif key.startswith("qwen3") or mdl in ("qwen3", "qwen3_06"):
+            if mdl == "qwen3_06":
+                cls = Qwen06Starling if fam == "starling" else Qwen06Stock
+            else:
+                cls = Qwen3Starling if fam == "starling" else Qwen3Stock
             chosen[mdl].append(cls())
         elif mdl == "higgs":
             cls = HiggsStarling if fam == "starling" else HiggsStock

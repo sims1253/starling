@@ -118,6 +118,7 @@ This table is GENERATED from `tests/native_parity_manifest.json` (schema v1, rev
 | `audex.intree.text` | nvidia/nemotron-labs-audex-2b | starling-ggml-audex | exact-text | short, medium, long | cpu:-, cuda:V | no |
 | `s1.intree.text` | superwhisper/s1-mini | starling-ggml-s1 | exact-text | short, medium, long | cpu:-, cuda:V | no |
 | `s1.intree.control_matrix_smoke` | superwhisper/s1-mini | starling-ggml-s1 | smoke (non-certifying) | control_matrix_16_cells | cpu:-, cuda:V | no |
+| `qwen3_06.intree.text` | Qwen/Qwen3-ASR-0.6B-hf | starling-ggml-qwen3 | exact-text | short, medium, long | cpu:-, cuda:V | no |
 <!-- parity-manifest:v1 end -->
 
 Semantics:

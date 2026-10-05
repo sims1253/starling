@@ -125,7 +125,7 @@ bounding per-append ``np.concatenate`` copying and RAM. 1 second of audio.
 
 # Supported model slugs -> (backend class, display name, gpu-lock model label).
 # Built lazily as backend classes are defined below.
-MODEL_SLUGS = ("granite", "parakeet", "parakeet_unified", "moss", "qwen3", "ark", "ark06", "cohere", "higgs", "audex", "voxtral")
+MODEL_SLUGS = ("granite", "parakeet", "parakeet_unified", "moss", "qwen3", "qwen3_06", "ark", "ark06", "cohere", "higgs", "audex", "voxtral")
 
 
 def _gpu_lock_model(slug: str) -> str:
@@ -135,6 +135,7 @@ def _gpu_lock_model(slug: str) -> str:
         "parakeet_unified": "parakeet-unified-en-0.6b",
         "moss": "moss-transcribe-preview-2b",
         "qwen3": "qwen3-asr-1.7b",
+        "qwen3_06": "qwen3-asr-0.6b",
         "ark": "ark-asr-3b",
         "ark06": "ark-asr-0.6b",
         "cohere": "cohere-transcribe-03-2026",
@@ -500,6 +501,36 @@ class Qwen3Backend(ModelBackend):
         return self._transcribe_chunked(samples, self._transcribe_chunk)
 
 
+class Qwen06Backend(Qwen3Backend):
+    """qwen3-asr-0.6b: the smaller Qwen3-ASR sibling, same serving policy.
+
+    Identical processor-built inputs, chunk policy and decode budgets as the
+    1.7B (the hub tokenizer/chat template/processor are byte-identical); only
+    the loaded hub id and the fused pipeline's derived dims differ. Kept
+    selectable on every platform alongside the 1.7B — the weaker public
+    English score is a per-device latency/energy/memory tradeoff to measure
+    (issue #353), not grounds for hiding it.
+    """
+
+    slug = "qwen3_06"
+
+    def load(self) -> None:
+        from .qwen3_06.loader import load_model_and_processor
+        from .qwen3_06.pipeline import MegaPipeline
+
+        # Construct from the pair loaded above (granite-style) -- NOT
+        # MegaPipeline.from_pretrained(), which would discard it and re-load
+        # the model a second time with default attn/encoder settings.
+        model, processor = load_model_and_processor(attn_impl=self.config.attn_impl)
+        self.pipe = MegaPipeline(
+            model,
+            processor,
+            encoder_mode=self.config.encoder_mode,
+            use_fused_llm=self.config.use_fused_llm,
+        )
+        self.processor = processor
+
+
 class ArkBackend(ModelBackend):
     """ark-asr-3b: Whisper+adapter encoder + Qwen2.5 decoder megakernel.
 
@@ -694,6 +725,7 @@ _BACKENDS: dict[str, type[ModelBackend]] = {
     "parakeet_unified": ParakeetUnifiedBackend,
     "moss": MossBackend,
     "qwen3": Qwen3Backend,
+    "qwen3_06": Qwen06Backend,
     "ark": ArkBackend,
     "ark06": Ark06Backend,
     "cohere": CohereBackend,

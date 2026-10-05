@@ -1,7 +1,9 @@
 #include "loader.hpp"
 #include <cstdio>
+#include <string>
 #include <vector>
 
+#include "ggml.h"
 #include "lib/loader_kit.hpp"
 namespace starling::ggml::qwen3 {
 namespace {
@@ -24,6 +26,40 @@ int64_t audio_token_count(int64_t n_samples, const Config& c) {
     for (int i = 0; i < 3 && r > 0; ++i) r = (r - 1) / 2 + 1;
     const int64_t per_full = c.encoder.max_pos_emb;  // 13 post-CNN rows
     return full * per_full + r;
+}
+
+// Exact tensor-shape check (voxtral/loader.cpp's shape_eq, QWEN3 label).
+// GGUF ne[] is the reversed checkpoint shape: a torch Linear weight [OC, IC]
+// reads back ne0 = IC (the mul_mat contraction dim), ne1 = OC.
+bool shape_eq(const ModelLoader& m, const char* name,
+              std::initializer_list<int64_t> want, std::string& err) {
+    ggml_tensor* t = m.tensor(name);
+    if (!t) {
+        err = std::string("QWEN3 GGUF missing required tensor: ") + name;
+        return false;
+    }
+    bool ok = (int) want.size() == ggml_n_dims(t);
+    int i = 0;
+    for (int64_t w : want) {
+        if (ok && (int64_t) t->ne[i] != w) ok = false;
+        ++i;
+    }
+    if (!ok) {
+        std::string got, want_s;
+        for (int j = 0; j < ggml_n_dims(t); ++j) {
+            if (j) got += ",";
+            got += std::to_string(t->ne[j]);
+        }
+        i = 0;
+        for (int64_t w : want) {
+            if (i++) want_s += ",";
+            want_s += std::to_string(w);
+        }
+        err = "QWEN3 GGUF tensor " + std::string(name) + " has ne=[" + got +
+              "], expected [" + want_s + "]";
+        return false;
+    }
+    return true;
 }
 
 bool Qwen3Model::load(const char* path, std::string& err) {
@@ -136,21 +172,18 @@ bool Qwen3Model::load(const char* path, std::string& err) {
         err = "QWEN3 GGUF enc.hidden != enc.heads * enc.head_dim";
         return false;
     }
-    // conv_out in_features: downsample_hidden * (mel 128 -> 64 -> 32 -> 16).
-    if (c.encoder.downsample_hidden * 16 != 7680) {
-        err = "QWEN3 GGUF conv stack must reduce 128 mel bins to 16";
-        return false;
-    }
     // Attention windows must be chunk-aligned: n_window_infer a multiple of
     // 2*n_window (get_audio_cu_seqlens' n_window_ratio).
     if (c.encoder.n_window_infer % (2 * c.encoder.n_window) != 0) {
         err = "QWEN3 GGUF enc.n_window_infer must be a multiple of 2*enc.n_window";
         return false;
     }
-    if (c.llm.hidden != c.llm.n_heads * c.llm.head_dim) {
-        err = "QWEN3 GGUF llm.hidden_size != llm.num_heads * llm.head_dim";
-        return false;
-    }
+    // NOTE: llm.hidden_size and the attention width heads*head_dim are
+    // INDEPENDENT fields. The 1.7B happens to equate them (2048 == 16*128);
+    // the 0.6B runs a 1024-wide trunk under a 2048-wide attention (16 heads x
+    // 128), which the shared decode stack has supported since voxtral's
+    // 4096-wide attention over a 3072 trunk. The dimensions are validated
+    // against the actual tensor shapes below instead of equated.
     if (c.llm.n_heads % c.llm.n_kv_heads != 0) {
         err = "QWEN3 GGUF llm.num_heads must be a multiple of llm.num_kv_heads";
         return false;
@@ -178,45 +211,88 @@ bool Qwen3Model::load(const char* path, std::string& err) {
         return false;
     }
 
-    // Require every expected tensor so a structural change fails loudly.
-    for (const char* n : {"audio.mel_filters", "audio.mel_window",
-                          "enc.conv1.weight", "enc.conv1.bias",
-                          "enc.conv2.weight", "enc.conv2.bias",
-                          "enc.conv3.weight", "enc.conv3.bias",
-                          "enc.out.weight", "enc.pos_embed",
-                          "enc.ln_post.weight", "enc.ln_post.bias",
-                          "proj.linear_1.weight", "proj.linear_1.bias",
-                          "proj.linear_2.weight", "proj.linear_2.bias",
-                          "llm.embed.weight", "llm.final_norm.weight"})
-        if (!lib::require(m, n, "QWEN3", err)) return false;
+    // Require every expected tensor with its EXACT shape so a structural
+    // change or a metadata/tensor mismatch fails loudly at load. All ne[] are
+    // ggml order (reversed checkpoint shape: ne0 = Linear in-features).
+    // Frontend constants ([n_mels, 1+n_fft/2] filterbank, [win] window).
+#define SHAPE(name, ...) do { if (!shape_eq(m, name, {__VA_ARGS__}, err)) return false; } while (0)
+    SHAPE("audio.mel_filters", c.encoder.n_mel, (int64_t) 1 + c.frontend.n_fft / 2);
+    SHAPE("audio.mel_window", (int64_t) c.frontend.win_length);
+    // Conv stack: torch [480, ic, 3, 3] -> ne [3, 3, ic, 480]; three stride-2
+    // k3 convs reduce the 128-bin mel axis to 16 (checked via enc.out below).
+    SHAPE("enc.conv1.weight", 3, 3, 1, c.encoder.downsample_hidden);
+    SHAPE("enc.conv1.bias", c.encoder.downsample_hidden);
+    SHAPE("enc.conv2.weight", 3, 3, c.encoder.downsample_hidden, c.encoder.downsample_hidden);
+    SHAPE("enc.conv2.bias", c.encoder.downsample_hidden);
+    SHAPE("enc.conv3.weight", 3, 3, c.encoder.downsample_hidden, c.encoder.downsample_hidden);
+    SHAPE("enc.conv3.bias", c.encoder.downsample_hidden);
+    // conv_out: bias-free Linear(downsample_hidden * n_mel/8 -> hidden).
+    SHAPE("enc.out.weight",
+          (int64_t) c.encoder.downsample_hidden * (c.encoder.n_mel / 8),
+          c.encoder.hidden);
+    SHAPE("enc.pos_embed", c.encoder.hidden, c.encoder.max_pos_emb);
+    SHAPE("enc.ln_post.weight", c.encoder.hidden);
+    SHAPE("enc.ln_post.bias", c.encoder.hidden);
+    // Projector: Linear(hidden -> hidden) + GELU + Linear(hidden -> output).
+    SHAPE("proj.linear_1.weight", c.projector.hidden, c.projector.hidden);
+    SHAPE("proj.linear_1.bias", c.projector.hidden);
+    SHAPE("proj.linear_2.weight", c.projector.hidden, c.projector.output_dim);
+    SHAPE("proj.linear_2.bias", c.projector.output_dim);
+    SHAPE("llm.embed.weight", c.llm.hidden, c.llm.vocab);
+    SHAPE("llm.final_norm.weight", c.llm.hidden);
     // Encoder layers: 16 tensors each (biased MHA + two biased LayerNorms +
-    // biased FFN).
+    // biased FFN); MHA projects hidden -> hidden (kv heads == heads).
     for (uint32_t i = 0; i < c.encoder.n_layers; ++i) {
         char n[128];
-        for (const char* tail : {"attn_norm.weight", "attn_norm.bias",
-                                 "attn_q.weight", "attn_q.bias",
-                                 "attn_k.weight", "attn_k.bias",
-                                 "attn_v.weight", "attn_v.bias",
-                                 "attn_o.weight", "attn_o.bias",
-                                 "ffn_norm.weight", "ffn_norm.bias",
-                                 "ff_up.weight", "ff_up.bias",
-                                 "ff_down.weight", "ff_down.bias"}) {
-            std::snprintf(n, sizeof n, "enc.blk.%u.%s", i, tail);
-            if (!lib::require(m, n, "QWEN3", err)) return false;
-        }
+        std::snprintf(n, sizeof n, "enc.blk.%u.", i);
+        const std::string pre = n;
+#define ESHAPE(tail, ...) do { \
+            if (!shape_eq(m, (pre + tail).c_str(), {__VA_ARGS__}, err)) return false; \
+        } while (0)
+        ESHAPE("attn_norm.weight", c.encoder.hidden);
+        ESHAPE("attn_norm.bias", c.encoder.hidden);
+        ESHAPE("attn_q.weight", c.encoder.hidden, c.encoder.hidden);
+        ESHAPE("attn_q.bias", c.encoder.hidden);
+        ESHAPE("attn_k.weight", c.encoder.hidden, c.encoder.hidden);
+        ESHAPE("attn_k.bias", c.encoder.hidden);
+        ESHAPE("attn_v.weight", c.encoder.hidden, c.encoder.hidden);
+        ESHAPE("attn_v.bias", c.encoder.hidden);
+        ESHAPE("attn_o.weight", c.encoder.hidden, c.encoder.hidden);
+        ESHAPE("attn_o.bias", c.encoder.hidden);
+        ESHAPE("ffn_norm.weight", c.encoder.hidden);
+        ESHAPE("ffn_norm.bias", c.encoder.hidden);
+        ESHAPE("ff_up.weight", c.encoder.hidden, c.encoder.ffn_dim);
+        ESHAPE("ff_up.bias", c.encoder.ffn_dim);
+        ESHAPE("ff_down.weight", c.encoder.ffn_dim, c.encoder.hidden);
+        ESHAPE("ff_down.bias", c.encoder.hidden);
+#undef ESHAPE
     }
-    // LLM layers: bias-free Qwen3 trunk with q/k norm = 11 each.
+    // LLM layers: bias-free Qwen3 trunk with per-head q/k norm (11 each).
+    // q/k/v project hidden -> {QW, KVW, KVW}; o projects the concatenated
+    // heads QW back to hidden — the width relation the 0.6B exercises.
+    const int64_t QW = (int64_t) c.llm.n_heads * c.llm.head_dim;
+    const int64_t KVW = (int64_t) c.llm.n_kv_heads * c.llm.head_dim;
     for (uint32_t i = 0; i < c.llm.n_layers; ++i) {
         char n[128];
-        for (const char* tail : {"attn_norm.weight", "attn.q.weight", "attn.k.weight",
-                                 "attn.v.weight", "attn.o.weight",
-                                 "attn.q_norm.weight", "attn.k_norm.weight",
-                                 "ffn_norm.weight", "ffn.gate.weight",
-                                 "ffn.up.weight", "ffn.down.weight"}) {
-            std::snprintf(n, sizeof n, "llm.blk.%u.%s", i, tail);
-            if (!lib::require(m, n, "QWEN3", err)) return false;
-        }
+        std::snprintf(n, sizeof n, "llm.blk.%u.", i);
+        const std::string pre = n;
+#define LSHAPE(tail, ...) do { \
+            if (!shape_eq(m, (pre + tail).c_str(), {__VA_ARGS__}, err)) return false; \
+        } while (0)
+        LSHAPE("attn_norm.weight", c.llm.hidden);
+        LSHAPE("attn.q.weight", c.llm.hidden, QW);
+        LSHAPE("attn.k.weight", c.llm.hidden, KVW);
+        LSHAPE("attn.v.weight", c.llm.hidden, KVW);
+        LSHAPE("attn.o.weight", QW, c.llm.hidden);
+        LSHAPE("attn.q_norm.weight", c.llm.head_dim);
+        LSHAPE("attn.k_norm.weight", c.llm.head_dim);
+        LSHAPE("ffn_norm.weight", c.llm.hidden);
+        LSHAPE("ffn.gate.weight", c.llm.hidden, c.llm.intermediate);
+        LSHAPE("ffn.up.weight", c.llm.hidden, c.llm.intermediate);
+        LSHAPE("ffn.down.weight", c.llm.intermediate, c.llm.hidden);
+#undef LSHAPE
     }
+#undef SHAPE
     return true;
 }
 } // namespace starling::ggml::qwen3

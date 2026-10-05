@@ -67,6 +67,7 @@ MODEL_LABELS = {
     "parakeet_unified": "parakeet-unified-en-0.6b",
     "moss": "moss-transcribe-preview-2b",
     "qwen3": "qwen3-asr-1.7b",
+    "qwen3_06": "qwen3-asr-0.6b",
     "ark": "ark-asr-3b",
     "ark06": "ark-asr-0.6b",
     "cohere": "cohere-transcribe-03-2026",
@@ -455,8 +456,8 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--models", default="granite,parakeet,moss,ark,cohere",
                     help="comma list of model slugs "
-                         "(granite,parakeet,moss,ark,ark06,cohere,qwen3,higgs,audex,voxtral,s1; "
-                         "qwen3/higgs/audex/s1 are auto-gated on availability; "
+                         "(granite,parakeet,moss,ark,ark06,cohere,qwen3,qwen3_06,higgs,audex,voxtral,s1; "
+                         "qwen3/qwen3_06/higgs/audex/s1 are auto-gated on availability; "
                          "s1 is text-in/text-out: fixture tiers select transcripts "
                          "and RTFx reads normalized words/s)")
     ap.add_argument("--engines", default="starling,stock",

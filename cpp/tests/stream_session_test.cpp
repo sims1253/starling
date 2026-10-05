@@ -333,7 +333,7 @@ static void test_model_mapping() {
 
     // Exact equality pins the registry-derived ordering (a reordered or
     // duplicated row would change it).
-    CHECK(supported_models_str() == "parakeet moss ark higgs hojo granite qwen3 s1 audex ark06 voxtral");
+    CHECK(supported_models_str() == "parakeet moss ark higgs hojo granite qwen3 s1 audex ark06 voxtral qwen3_06");
 }
 
 // ---- ChunkStreamer::rebase -------------------------------------------------
