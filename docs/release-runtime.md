@@ -204,7 +204,7 @@ for the 2026-10-05 entries are in the
 | Artifact | Representative inference | Hardware and runtime | Not covered |
 | --- | --- | --- | --- |
 | `linux-cuda` | Verified (2026-10-05): E25 archive and a local release-recipe build (SM 75-120, CUDA 13.3) | RTX 5090 (SM 120) through WSL2: Windows driver 610.88, Ubuntu 22.04 container with only the documented runtime packages | Bare-metal Linux NVIDIA driver; SM 75-90 GPUs |
-| `linux-vulkan` | Verified (#76) | AMD Radeon Graphics (RADV RENOIR), Mesa 26.2.2 and 23.2.1 | NVIDIA and Intel Vulkan drivers |
+| `linux-vulkan` | Verified ([#76](https://github.com/sims1253/starling/pull/76)): a local release-recipe build of that change (merged as `abd6ff3`); no executable checksum was recorded | AMD Radeon Graphics (RADV RENOIR), Mesa 26.2.2 on the host and Mesa 23.2.1 with Vulkan loader 1.3.204.1 in a fresh Ubuntu 22.04 container | NVIDIA and Intel Vulkan drivers |
 | `linux-cpu` | Verified (2026-10-05): E25 archive | AMD Ryzen 9 5900X, Ubuntu 22.04 (WSL2) | Non-x86_64 hosts are not a release target |
 | `linux-rocm` | Not verified | No ROCm hardware available | Everything; only the build runner's version and ABI checks ran |
 | `windows-cuda` | Verified (2026-10-05): E25 archive | RTX 5090 (SM 120), Windows 11 build 26200, driver 610.88; cuBLAS 13.5.1 from NVIDIA's CUDA 13.3.0 redistributables; reduced `PATH` | SM 75-90 GPUs; a clean Windows install |
