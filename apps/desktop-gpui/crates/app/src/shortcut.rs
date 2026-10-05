@@ -266,7 +266,13 @@ fn escape_variants(shortcut: &Shortcut) -> Vec<HotKey> {
     .into_iter()
     .filter(|part| mods.contains(*part))
     .collect();
-    for mask in 1u32..(1 << parts.len()) {
+    // Largest subsets first: the X11 worker registers one variant per
+    // 50 ms, and the likeliest Escape mid-take comes with the whole chord
+    // still held, so that grab must not wait behind the partial ones.
+    let full = (1u32 << parts.len()) - 1;
+    let mut masks: Vec<u32> = (1..=full).collect();
+    masks.sort_by_key(|mask| std::cmp::Reverse(mask.count_ones()));
+    for mask in masks {
         let subset = parts
             .iter()
             .enumerate()
@@ -689,6 +695,8 @@ mod tests {
         let variants = escape_variants(&shortcut);
         assert_eq!(variants.len(), 4, "bare + Ctrl + Shift + Ctrl+Shift");
         assert!(variants[0].mods.is_empty());
+        // The whole chord right after bare Escape: the likeliest one held.
+        assert_eq!(variants[1].mods, Modifiers::CONTROL | Modifiers::SHIFT);
         assert!(variants.iter().all(|hotkey| hotkey.key == Code::Escape));
         // Distinct registrations, so a refusal can be told apart.
         let ids: std::collections::HashSet<u32> =

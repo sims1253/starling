@@ -624,6 +624,9 @@ impl StarlingApp {
         // Notices that promise history are shown only once the save below
         // lands — a failed save explains itself through the error banner
         // instead, so the notice can never contradict what happened.
+        // The cancelled take is the newest one; its notice is shown only
+        // while no later take has started.
+        let cancelled_take = self.activation.last_started();
         let saved_notice = match reason {
             CancelReason::Escape if kept => {
                 Some(
@@ -680,7 +683,7 @@ impl StarlingApp {
                         Arc::new(wav),
                         journal_report,
                         note,
-                        saved_notice,
+                        saved_notice.map(|notice| (notice, cancelled_take)),
                         staging,
                         cx,
                     ),
@@ -792,7 +795,7 @@ impl StarlingApp {
         wav: Arc<Vec<u8>>,
         journal: Option<recorder::JournalReport>,
         note: String,
-        notice: Option<String>,
+        notice: Option<(String, crate::activation::TakeId)>,
         staging: Option<u64>,
         cx: &mut Context<Self>,
     ) {
@@ -826,9 +829,13 @@ impl StarlingApp {
                                 app.bind_staging(token, &id);
                             }
                             // The take is in history only now (#221): the
-                            // cancel notice that says so lands here.
-                            if let Some(notice) = notice {
-                                app.take_notice = Some(notice);
+                            // cancel notice that says so lands here — unless
+                            // a newer take started meanwhile, which it would
+                            // misdescribe.
+                            if let Some((notice, take)) = notice {
+                                if app.activation.last_started() == take {
+                                    app.take_notice = Some(notice);
+                                }
                             }
                             cx.notify();
                         })

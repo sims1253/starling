@@ -352,7 +352,7 @@ pub struct StarlingApp {
     /// The committed engine settings: mode, the persisted active model,
     /// and the backend override. `active_model` follows the engine
     /// snapshot (the engine is the source of truth) and is persisted
-    /// through [`StarlingApp::persist_engine_settings`].
+    /// through [`StarlingApp::persist_committed_settings`].
     pub(crate) engine_settings: EngineSettings,
     /// The backend override the running manager was started or toggled
     /// with, so Save only restarts the engine when the override actually
@@ -1183,7 +1183,7 @@ impl StarlingApp {
                             {
                                 app.engine_settings.active_model =
                                     Some(active.model_id.clone());
-                                app.persist_engine_settings(cx);
+                                app.persist_committed_settings(cx);
                             }
                         }
                         cx.notify();
@@ -1242,9 +1242,10 @@ impl StarlingApp {
 
     /// Persist the committed settings in the background (the engine
     /// active-model path of #363: the manager switched models, the file
-    /// follows). A failure surfaces through the error banner like any
-    /// other save.
-    fn persist_engine_settings(&self, cx: &mut Context<Self>) {
+    /// follows; #221: a refused mid-take shortcut swap writes the shortcut
+    /// that stayed active back). A failure surfaces through the error
+    /// banner like any other save.
+    pub(crate) fn persist_committed_settings(&self, cx: &mut Context<Self>) {
         let Ok(path) = Settings::default_path() else {
             return;
         };
@@ -1433,7 +1434,7 @@ impl StarlingApp {
         }
         self.engine_settings.backend_override = next.clone();
         self.draft_backend_override = next;
-        self.persist_engine_settings(cx);
+        self.persist_committed_settings(cx);
         cx.notify();
     }
 
@@ -1444,7 +1445,7 @@ impl StarlingApp {
         self.draft_engine_mode = EngineMode::Manual;
         self.engine_settings.mode = EngineMode::Manual;
         self.apply_engine_mode_change(cx);
-        self.persist_engine_settings(cx);
+        self.persist_committed_settings(cx);
         // The manual indicator starts as a probe in flight, exactly like
         // a startup in manual mode.
         self.connection = Connection::Checking;

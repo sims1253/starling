@@ -218,6 +218,11 @@ impl Activation {
         self.config = config;
     }
 
+    /// The most recently started take (0 before the first).
+    pub(crate) fn last_started(&self) -> TakeId {
+        self.last_take
+    }
+
     pub(crate) fn active_take(&self) -> Option<TakeId> {
         match self.phase {
             Phase::Active { take, .. } => Some(take),
@@ -720,11 +725,16 @@ impl StarlingApp {
                 Effect::Listening(_) => {}
             }
         }
+        // Escape cleanup is queued first, so a deferred swap below never
+        // holds it back.
+        self.sync_escape_grab();
         if !self.activation.is_active() {
             // A shortcut saved mid-take takes over once the take ended, so
             // the held key's release still finishes the take it started.
-            // A platform refusal keeps the previous shortcut registered
-            // and committed, and says why.
+            // (On Linux this waits for the worker once, only after a
+            // shortcut was changed mid-take.) A platform refusal keeps the
+            // previous shortcut registered, writes it back to the settings
+            // file the save already wrote, and says why.
             if let Some(shortcut) = self.pending_shortcut.take() {
                 if let Err(reason) = self.apply_shortcut(shortcut) {
                     self.dictation_settings.shortcut = self.shortcut.text().to_string();
@@ -732,10 +742,10 @@ impl StarlingApp {
                         "The new dictation shortcut could not be registered ({reason}); the \
                          previous one is still active."
                     ));
+                    self.persist_committed_settings(cx);
                 }
             }
         }
-        self.sync_escape_grab();
         cx.notify();
     }
 
