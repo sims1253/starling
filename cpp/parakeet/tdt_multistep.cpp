@@ -554,11 +554,9 @@ static KStepGraph* acquire_kstep(KStepCache& kstep_cache,
                     y = ggml_add(ctx, y, bo);                                       // [V_plus]
 
                     // --- Argmax (token slice + duration slice) ON DEVICE. ---
-                    ggml_tensor* tok_view = ggml_view_1d(ctx, y, token_count, 0);
-                    ggml_tensor* dur_view = ggml_view_1d(ctx, y, num_dur,
-                                            (size_t)token_count * sizeof(float));
-                    ggml_tensor* tok = ggml_argmax(ctx, tok_view);   // i32 [1]
-                    ggml_tensor* dur_idx = ggml_argmax(ctx, dur_view); // i32 [1]
+                    const TdtSliceArgmax amax = tdt_slice_argmax(ctx, y, token_count, num_dur);
+                    ggml_tensor* tok = amax.tok;      // i32 [1]
+                    ggml_tensor* dur_idx = amax.dur;  // i32 [1]
 
                     // --- TDT frame-advance (in-graph). ---
                     // dur = dur_table[dur_idx]  (i32 gather).

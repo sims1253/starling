@@ -27,7 +27,28 @@
 #include <memory>
 #include <vector>
 
+struct ggml_context;
+struct ggml_tensor;
+
 namespace starling::ggml::parakeet {
+
+// In-graph TDT argmax split of the joint logits y [V_plus]: tok = argmax over
+// y[0 : token_count), dur = argmax over y[token_count : token_count + num_dur).
+// Shared by the fused step graph and the K-step multistep graph.
+//
+// The duration slice starts token_count * 4 bytes into y (32772 for the v3
+// 8193-token slice). ggml-vulkan's ARGMAX cannot address a source below the
+// device's minStorageBufferOffsetAlignment (16 bytes on NVIDIA, 4 on RADV) and
+// asserts mid-graph (init_pushconst_tensor_offsets) — supports_op does not
+// check it, so the #184 rejected-node guard cannot catch it. The slice is
+// copied into its own allocator-aligned tensor first: an exact f32 copy of
+// num_dur floats, so the argmax is unchanged on every backend.
+struct TdtSliceArgmax {
+    ggml_tensor* tok = nullptr;  // i32 [1]
+    ggml_tensor* dur = nullptr;  // i32 [1]
+};
+TdtSliceArgmax tdt_slice_argmax(ggml_context* ctx, ggml_tensor* y,
+                                int token_count, int num_dur);
 
 class Joint {
 public:
