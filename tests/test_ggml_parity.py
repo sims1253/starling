@@ -697,6 +697,7 @@ def starling_ggml_qwen3_06_engine():
     yield engine
     engine.close()
 
+
 @pytest.mark.skipif(not _starling_ggml_qwen3_06_available(),
                     reason="in-tree libstarling_ggml or qwen3_06 GGUF unavailable")
 @pytest.mark.parametrize("name", ["short", "medium", "long"])

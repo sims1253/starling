@@ -132,9 +132,9 @@ inline bool shape_eq(const ModelLoader& m, const char* label, const char* name,
             if (j) got += ",";
             got += std::to_string(t->ne[j]);
         }
-        for (int64_t w : want) {
-            if (!want_s.empty()) want_s += ",";
-            want_s += std::to_string(w);
+        for (int i2 = 0; i2 < n_want; ++i2) {
+            if (i2) want_s += ",";
+            want_s += std::to_string(want.begin()[i2]);
         }
         err = std::string(label) + " GGUF tensor " + name + " has ne=[" + got +
               "], expected [" + want_s + "]";
