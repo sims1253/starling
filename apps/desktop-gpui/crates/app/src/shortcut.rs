@@ -17,7 +17,7 @@
 
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
+use std::sync::{mpsc, Mutex, Once};
 use std::time::Instant;
 
 use global_hotkey::hotkey::{Code, HotKey, Modifiers};
@@ -443,6 +443,26 @@ fn manage(
 /// invariant survives a dropped instance instead of being assumed.
 static HANDLER_INSTALLED: AtomicBool = AtomicBool::new(false);
 
+/// Where the process-wide hotkey handler forwards events: the live
+/// instance's channel, or nowhere. global-hotkey keeps the first handler
+/// it is given for the life of the process (a `OnceCell`; later calls,
+/// `None` included, are ignored), so the handler is installed exactly
+/// once ([`EVENT_DISPATCHER`]) and every instance only swaps this sink —
+/// a recreated instance receives its events instead of a dead channel.
+static EVENT_SINK: Mutex<Option<mpsc::Sender<RawEvent>>> = Mutex::new(None);
+static EVENT_DISPATCHER: Once = Once::new();
+
+fn event_sink() -> std::sync::MutexGuard<'static, Option<mpsc::Sender<RawEvent>>> {
+    EVENT_SINK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The one handler body: forward to whichever instance owns the sink.
+fn dispatch(event: RawEvent) {
+    if let Some(sink) = event_sink().as_ref() {
+        let _ = sink.send(event);
+    }
+}
+
 /// The system-wide registrations: the recording shortcut for the app's
 /// lifetime, and Escape only while a take is active (grabbing Escape the
 /// rest of the time would take it away from every other app).
@@ -506,9 +526,12 @@ impl GlobalShortcuts {
             }
         };
         let (sender, events) = mpsc::channel();
-        GlobalHotKeyEvent::set_event_handler(Some(move |event: GlobalHotKeyEvent| {
-            let _ = sender.send((event.id(), event.state(), Instant::now()));
-        }));
+        *event_sink() = Some(sender);
+        EVENT_DISPATCHER.call_once(|| {
+            GlobalHotKeyEvent::set_event_handler(Some(|event: GlobalHotKeyEvent| {
+                dispatch((event.id(), event.state(), Instant::now()));
+            }));
+        });
         #[cfg(target_os = "linux")]
         let (manager, worker, reports) = {
             let (report, reports) = mpsc::channel();
@@ -723,10 +746,10 @@ impl Drop for GlobalShortcuts {
     /// struct, so that teardown ends the worker loop, whose exit drops
     /// the manager on the worker thread.
     fn drop(&mut self) {
-        // `None` uninstalls the handler; events global-hotkey still
-        // delivers afterwards land in its default channel, not in the
-        // sender this instance's handler closure captured.
-        GlobalHotKeyEvent::set_event_handler(None::<fn(GlobalHotKeyEvent)>);
+        // The handler itself cannot be uninstalled (see `EVENT_SINK`):
+        // emptying the sink makes it forward nowhere until the next
+        // instance takes it.
+        *event_sink() = None;
         HANDLER_INSTALLED.store(false, Ordering::SeqCst);
     }
 }
@@ -848,8 +871,30 @@ mod tests {
         assert_eq!(ids.len(), variants.len());
     }
 
+    /// Tests touching the process-wide hotkey sink run one at a time.
+    static SINK_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn a_recreated_instance_receives_events_through_the_permanent_handler() {
+        let _serial = SINK_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (first, first_events) = mpsc::channel();
+        *event_sink() = Some(first);
+        // The first instance is dropped; global-hotkey keeps the handler,
+        // and the next instance takes the sink.
+        *event_sink() = None;
+        let (second, second_events) = mpsc::channel();
+        *event_sink() = Some(second);
+        dispatch((7, HotKeyState::Pressed, Instant::now()));
+        assert!(first_events.try_recv().is_err());
+        assert_eq!(second_events.try_recv().map(|(id, _, _)| id), Ok(7));
+        *event_sink() = None;
+        dispatch((8, HotKeyState::Pressed, Instant::now()));
+        assert!(second_events.try_recv().is_err(), "an empty sink forwards nowhere");
+    }
+
     #[test]
     fn a_second_global_shortcuts_is_refused() {
+        let _serial = SINK_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         // The hotkey event handler is process-wide, so a second instance
         // would leave the first's registrations firing into a dropped
         // sender. With a display the refusal is observed through `new`

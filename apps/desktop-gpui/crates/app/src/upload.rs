@@ -625,6 +625,10 @@ impl StarlingApp {
         // no audio still rebuilds the drained prefix at the take's own
         // device rate.
         let device_sample_rate = handle.sample_rate();
+        // This stop's own failure, kept apart from `self.error` (which may
+        // hold an unrelated earlier message) so the stall report below
+        // only ever joins what actually happened to this take.
+        let mut stop_error = None;
         let (stopped, journal_report) = match handle.stop() {
             Ok(take) => (Some(take.audio), take.journal),
             Err(recorder::RecorderError::QuiesceTimeout { audio, journal, .. }) => {
@@ -632,7 +636,7 @@ impl StarlingApp {
             }
             Err(recorder::RecorderError::Empty) => (None, None),
             Err(err) => {
-                self.error = Some(format!(
+                stop_error = Some(format!(
                     "{}. The capture journal, if this take had one, stays on disk \
                      for recovery.",
                     err.to_string().trim_end_matches('.')
@@ -701,7 +705,7 @@ impl StarlingApp {
                 // The stop above may already have surfaced its own failure
                 // (the generic `Err` arm); a stall must not overwrite it —
                 // both stay, joined at a sentence boundary.
-                if let Some(stop_error) = self.error.take() {
+                if let Some(stop_error) = stop_error.take() {
                     stall = format!(
                         "{stall} Stopping it also failed: {}",
                         stop_error.trim_end_matches('.')
@@ -718,6 +722,9 @@ impl StarlingApp {
                 })
             }
         };
+        if let Some(stop_error) = stop_error {
+            self.error = Some(stop_error);
+        }
         cx.notify();
         let Some(audio) = audio.filter(|audio| !audio.samples.is_empty()) else {
             // Nothing was captured, so no take is saved for the kept draft
