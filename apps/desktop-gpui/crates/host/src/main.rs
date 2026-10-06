@@ -1,7 +1,8 @@
 //! The `starling-runtime-host` binary: one per user session.
 //!
-//! Launch → serve until SIGINT/SIGTERM (Windows: console Ctrl+C/Break,
-//! close, logoff, shutdown — see `on_console_ctrl`) → graceful stop
+//! Launch → serve until SIGINT/SIGTERM (Windows: console Ctrl+C/Break
+//! or close; at logoff/shutdown an interactive-session process is
+//! terminated by the OS — see `on_console_ctrl`) → graceful stop
 //! (`bye` to clients, machines join, the supervised engine stops, lease
 //! released, endpoint removed) → exit 0.
 //!
@@ -19,7 +20,7 @@ use starling_runtime_host::engine::EngineChoice;
 use starling_runtime_host::{default_data_root, platform, serve, HostConfig};
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
-/// Set once `host.shutdown()` returned — what the Windows close/logoff/shutdown
+/// Set once `host.shutdown()` returned — what the Windows console-close
 /// handler waits for before letting the OS end the process.
 static STOPPED: AtomicBool = AtomicBool::new(false);
 
@@ -29,18 +30,18 @@ extern "C" fn on_signal(_signal: i32) {
     SHUTDOWN.store(true, Ordering::SeqCst);
 }
 
-/// The Windows analogue of SIGINT/SIGTERM: Ctrl+C/Ctrl+Break, console
-/// close, logoff and system shutdown all request the same graceful
-/// stop. The handler runs on its own thread; for the close/logoff/
-/// shutdown events the OS ends the process as soon as the handler
+/// The Windows analogue of SIGINT/SIGTERM: Ctrl+C/Ctrl+Break and a
+/// console close request the graceful stop. The handler runs on its own
+/// thread; for a close the OS ends the process as soon as the handler
 /// returns, so it waits (bounded, inside the OS's grace period) for the
 /// main loop to finish shutting down — lease released, engine stopped.
-/// (Windows withholds logoff/shutdown from console processes that load
-/// user32/gdi32; then, like any force-kill past the grace period, the
-/// process simply dies — still safe: the lease lock (`LockFileEx`) and
-/// every pipe handle are kernel objects the OS releases at process
-/// death, so ownership cannot be stranded; the successor's
-/// crash-recovery sweep handles the rest.)
+/// `CTRL_LOGOFF_EVENT`/`CTRL_SHUTDOWN_EVENT` reach only services (an
+/// interactive-session process is terminated before they are sent);
+/// their arms stay so a host run as a service stops gracefully too.
+/// Termination without the handshake is still safe: the lease lock
+/// (`LockFileEx`) and every pipe handle are kernel objects the OS
+/// releases at process death, so ownership cannot be stranded — the
+/// successor's crash-recovery sweep handles the rest.
 #[cfg(windows)]
 unsafe extern "system" fn on_console_ctrl(ctrl_type: u32) -> windows_sys::Win32::Foundation::BOOL {
     use windows_sys::Win32::System::Console::{
