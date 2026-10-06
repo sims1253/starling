@@ -483,8 +483,8 @@ class OnDeviceEngine(
      * Loads the model when it is not resident. Caller holds [lock]. Returns
      * null when the engine is ready, else the user-facing reason it is not.
      */
-    private fun ensureLoadedLocked(): String? {
-        val modelFile = activeModelFile()
+    private fun ensureLoadedLocked(active: File? = activeModelFile()): String? {
+        val modelFile = active
             ?: return "Download or import a Parakeet model first to transcribe on this device."
         // The user picked another model since this one was loaded. A live
         // session keeps the loaded one: a mid-recording reload of hundreds
@@ -610,9 +610,12 @@ class OnDeviceEngine(
      * which then hit a fatal driver failure never runs. Pins nothing; null
      * when ready or skipped. Blocking.
      */
-    fun preload(allowed: () -> Boolean): String? = synchronized(lock) {
-        if (!allowed()) return null
-        usingLocked { ensureLoadedLocked() }
+    fun preload(allowed: (model: String) -> Boolean): String? = synchronized(lock) {
+        // Resolved once: the backoff check and the load see the same model,
+        // even if a selection lands in between.
+        val model = activeModelFile() ?: return null
+        if (!allowed(model.name)) return null
+        usingLocked { ensureLoadedLocked(model) }
     }
 
     /** One live-stream window of 16 kHz mono samples. Blocking. */

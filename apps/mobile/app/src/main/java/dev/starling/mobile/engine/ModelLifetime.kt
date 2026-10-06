@@ -47,20 +47,19 @@ class ModelLifetime(
     private val scheduler: Scheduler,
     private val deliver: (Runnable) -> Unit,
     private val clock: () -> Long = System::currentTimeMillis,
+    private val logFailure: (Throwable) -> Unit = {},
     private val idleReleaseMs: Long = IDLE_RELEASE_MS,
     private val retryFailedAfterMs: Long = RETRY_FAILED_AFTER_MS,
 ) : OnDeviceEngine.Observer {
     /** The engine surface this policy drives; [OnDeviceEngine] in the app. */
     interface Engine {
         /**
-         * The model a preload would load; a models-directory scan plus a
-         * marker read, so it is called on the worker only, never on the
-         * (UI) thread that calls [preload].
+         * [OnDeviceEngine.preload]: resolves the active model on the worker
+         * (a models-directory scan, never on the thread that calls
+         * [preload]) and loads it only if [allowed] holds for it under the
+         * engine lock. Nothing happens without an installed model.
          */
-        fun activeModelName(): String?
-
-        /** [OnDeviceEngine.preload]: runs only if [allowed] still holds under the engine lock. */
-        fun preload(allowed: () -> Boolean): String?
+        fun preload(allowed: (model: String) -> Boolean): String?
         fun releaseIfIdle(generation: Long): Boolean
     }
 
@@ -160,10 +159,11 @@ class ModelLifetime(
             // waited for the lock cancels it there, and so does a recording
             // that failed the model in the meantime (see [preloadAllowed]).
             engine.preload(::preloadAllowed)
-        } catch (_: Throwable) {
+        } catch (t: Throwable) {
             // A throwing load (a broken native library) was already reported
             // through loadFailed, with the model it actually tried, so the
             // state leaves Loading and the backoff applies to that model.
+            runCatching { logFailure(t) }
         } finally {
             synchronized(lock) { preloadInFlight = false }
         }
@@ -180,8 +180,7 @@ class ModelLifetime(
      * failure being recorded, because failures are reported under the
      * engine lock too.
      */
-    private fun preloadAllowed(): Boolean {
-        val model = engine.activeModelName() ?: return false
+    private fun preloadAllowed(model: String): Boolean {
         return synchronized(lock) {
             state !is State.DriverFailed &&
                 (failedModel != model || clock() - failedAtMillis >= retryFailedAfterMs)

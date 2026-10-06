@@ -174,8 +174,11 @@ class RecognizeSpeechActivity : Activity() {
                     partialView.scrollTo(0, maxOf(0, bottom))
                 }
             }
-            // The stop path falls back to the batch transcription of the WAV.
-            is StreamEvent.Interrupted -> Unit
+            // The stop path falls back to the batch transcription of the WAV;
+            // the status must not keep claiming the model is loading.
+            is StreamEvent.Interrupted -> if (activeRecording != null) {
+                statusView.text = getString(R.string.keyboard_stream_interrupted, event.reason)
+            }
         }
     }
 

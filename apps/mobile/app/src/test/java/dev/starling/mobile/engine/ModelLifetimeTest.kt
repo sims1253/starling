@@ -18,9 +18,9 @@ class ModelLifetimeTest {
         val releases = mutableListOf<Long>()
         var onPrepare: () -> String? = { null }
 
-        override fun activeModelName() = model
-        override fun preload(allowed: () -> Boolean): String? {
-            if (!allowed()) return null
+        override fun preload(allowed: (model: String) -> Boolean): String? {
+            val active = model ?: return null
+            if (!allowed(active)) return null
             prepares++
             return onPrepare()
         }

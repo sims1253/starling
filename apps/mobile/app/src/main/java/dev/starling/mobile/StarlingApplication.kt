@@ -58,8 +58,7 @@ class StarlingApplication : Application() {
         modelDownloads = ModelDownloadController(onDeviceEngine)
         modelLifetime = ModelLifetime(
             engine = object : ModelLifetime.Engine {
-                override fun activeModelName() = onDeviceEngine.activeModelName()
-                override fun preload(allowed: () -> Boolean) = onDeviceEngine.preload(allowed)
+                override fun preload(allowed: (model: String) -> Boolean) = onDeviceEngine.preload(allowed)
                 override fun releaseIfIdle(generation: Long) = onDeviceEngine.releaseIfIdle(generation)
             },
             worker = preloadExecutor,
@@ -71,6 +70,7 @@ class StarlingApplication : Application() {
                 ModelLifetime.Cancellable { mainHandler.removeCallbacks(post) }
             },
             deliver = { mainHandler.post(it) },
+            logFailure = { t -> runCatching { Log.w(TAG, "on-device model preload failed", t) } },
         )
         onDeviceEngine.observer = modelLifetime
         transcription = TranscriptionCoordinator(
