@@ -604,6 +604,7 @@ impl StarlingApp {
     /// transcribe later — so a cancel never loses words.
     pub(crate) fn cancel_recording(
         &mut self,
+        cancelled_take: crate::activation::TakeId,
         reason: crate::activation::CancelReason,
         cx: &mut Context<Self>,
     ) {
@@ -663,9 +664,10 @@ impl StarlingApp {
         // Notices that promise history are shown only once the save below
         // lands — a failed save explains itself through the error banner
         // instead, so the notice can never contradict what happened.
-        // The cancelled take is the newest one; its notice is shown only
-        // while no later take has started.
-        let cancelled_take = self.activation.last_started();
+        // The notice belongs to `cancelled_take` (the effect's own id, not
+        // the newest: a late second tap cancels one take and starts the
+        // next in the same step) and is shown only while no later take has
+        // started.
         let saved_notice = match reason {
             CancelReason::Escape if kept => {
                 Some(

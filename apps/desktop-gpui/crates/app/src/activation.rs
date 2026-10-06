@@ -598,6 +598,10 @@ impl StarlingApp {
             let active = window.is_window_active();
             app.window_focus.push((Instant::now(), active));
             if !active {
+                // Like every UI-thread input: system-wide events that came
+                // first (an Escape) are processed before the synthetic
+                // release, so a focus change never overtakes a cancel.
+                app.flush_system_events(cx);
                 app.activation_input(|machine| machine.window_lost_focus(Instant::now()), cx);
             }
             if app.window_focus.len() > FOCUS_HISTORY {
@@ -779,7 +783,7 @@ impl StarlingApp {
                 Effect::Cancel(take, reason) => {
                     if self.recording_take == Some(take) {
                         self.recording_take = None;
-                        self.cancel_recording(reason, cx);
+                        self.cancel_recording(take, reason, cx);
                     }
                 }
                 Effect::Listening(_) => {}
