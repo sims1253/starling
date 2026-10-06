@@ -872,10 +872,23 @@ const LINGER_DRAIN: Duration = Duration::from_secs(4);
 /// linger finishes *or* when a failed spawn drops the closure unrun.
 struct LingerGuard;
 
+/// Most lingering disconnects allowed in flight at once, process-wide.
+/// Each linger costs two short-lived threads for up to
+/// [`DISCONNECT_LINGER`], and closes are not all bounded by the
+/// connection cap (a connection refused at the cap closes after giving
+/// its slot back), so a burst of clients that connect and never read
+/// must not pile up threads: past this budget a close disconnects at
+/// once — the pre-linger behaviour, final frames lost for that peer only.
+const MAX_PENDING_LINGERS: usize = 32;
+
 impl LingerGuard {
-    fn new() -> LingerGuard {
-        PENDING_LINGERS.fetch_add(1, Ordering::SeqCst);
-        LingerGuard
+    /// Reserves one linger slot, or `None` when the budget is spent.
+    fn try_new() -> Option<LingerGuard> {
+        if PENDING_LINGERS.fetch_add(1, Ordering::SeqCst) >= MAX_PENDING_LINGERS {
+            PENDING_LINGERS.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
+        Some(LingerGuard)
     }
 }
 
@@ -930,11 +943,18 @@ const FLUSH_CANCEL_GRACE: Duration = Duration::from_millis(250);
 /// its lease while this process's handles still keep the old pipe name
 /// bound.
 fn schedule_disconnect(handle: HANDLE) -> io::Result<()> {
+    let Some(guard) = LingerGuard::try_new() else {
+        // Linger budget spent (see MAX_PENDING_LINGERS): disconnect now.
+        // SAFETY: a live server instance handle owned by the caller.
+        unsafe {
+            DisconnectNamedPipe(handle);
+        }
+        return Ok(());
+    };
     let flusher = OwnedHandle::duplicate(handle)?;
     let disconnector = OwnedHandle::duplicate(handle)?;
     // The handles and the pending-count guard move into the closure; if
     // the spawn fails the closure is dropped and so are they.
-    let guard = LingerGuard::new();
     std::thread::Builder::new()
         .name("starling-host-pipe-linger".into())
         .spawn(move || {
@@ -1330,6 +1350,20 @@ mod tests {
         drop(listener);
         assert_name_released(&path);
         drop(clients);
+    }
+
+    /// The linger budget is a hard cap: past it a close gets no linger
+    /// slot (it disconnects at once), and a released slot is reusable.
+    #[test]
+    fn the_linger_budget_caps_concurrent_lingers() {
+        let mut held = Vec::new();
+        while let Some(guard) = LingerGuard::try_new() {
+            held.push(guard);
+            assert!(held.len() <= MAX_PENDING_LINGERS, "the budget did not cap");
+        }
+        assert!(LingerGuard::try_new().is_none());
+        held.pop();
+        assert!(LingerGuard::try_new().is_some(), "a released slot is reusable");
     }
 
     #[test]
