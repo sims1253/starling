@@ -76,7 +76,9 @@ OPTIONS:
                          settings choose (bundled engine supervised by
                          this host, or the manual server) — the default;
                          the file is followed while the host runs, so
-                         engine changes apply without a restart;
+                         model and mode changes apply without a restart
+                         (a CPU/automatic backend change applies at the
+                         next start);
                          none: no engine (jobs fail no_provider_configured)",
         platform::default_runtime_dir().display()
     );
@@ -101,7 +103,9 @@ OPTIONS:
                          settings choose (bundled engine supervised by
                          this host, or the manual server) — the default;
                          the file is followed while the host runs, so
-                         engine changes apply without a restart;
+                         model and mode changes apply without a restart
+                         (a CPU/automatic backend change applies at the
+                         next start);
                          none: no engine (jobs fail no_provider_configured)",
         platform::default_runtime_dir().display()
     );
