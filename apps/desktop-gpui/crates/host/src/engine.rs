@@ -26,11 +26,13 @@
 //! (path and interval injectable; `Settings::default_path` in
 //! production) and [`EngineHost::apply`] carries each change over:
 //! `activate` for a new model, `set_backend_override` for the CPU
-//! toggle, a fresh manual provider for an endpoint/model change, a
-//! started supervisor for manual→builtin, and a stopped engine for
-//! builtin→manual. An in-flight recognition runs on the provider (and,
-//! through it, the engine lease) it started with: the inner provider is
-//! captured once per call, and a mode switch drains before it stops the
+//! toggle (only on an engine this host owns — attached, the reload
+//! belongs to the owner), a fresh manual provider for an endpoint/model
+//! change, a started supervisor for manual→builtin, and a stopped
+//! engine for builtin→manual. An in-flight recognition runs on the
+//! provider (and, through it, the engine lease) it started with: the
+//! provider and its in-flight count are captured together under the
+//! slot lock, and a mode switch drains that count before it stops the
 //! engine.
 
 use std::path::PathBuf;
@@ -173,7 +175,10 @@ pub fn attach(
 /// [`TranscriptionProvider`] the jobs machine holds for the host's
 /// whole lifetime. An in-flight call runs on the inner provider it
 /// captured at its start — a settings change mid-request moves the next
-/// job, never the running one.
+/// job, never the running one. The slot also carries its provider's
+/// in-flight counter: [`SettingsProvider::recognize`] raises it under
+/// the slot lock, so a mode switch that swaps the slot after that point
+/// sees the call in its drain instead of stopping the engine under it.
 pub struct SettingsProvider {
     current: Mutex<Slot>,
 }
@@ -181,12 +186,26 @@ pub struct SettingsProvider {
 struct Slot {
     provider: Arc<dyn TranscriptionProvider>,
     label: String,
+    /// The counter of live recognitions on `provider`: `Some` for the
+    /// engine provider (the same counter [`EngineState::Builtin`]
+    /// holds, so the mode-switch drain in [`EngineHost::apply`] waits
+    /// on exactly these calls), `None` for manual/unconfigured slots
+    /// (nothing drains behind them).
+    in_flight: Option<Arc<AtomicUsize>>,
 }
 
 impl SettingsProvider {
-    fn new(provider: Arc<dyn TranscriptionProvider>, label: String) -> SettingsProvider {
+    fn new(
+        provider: Arc<dyn TranscriptionProvider>,
+        label: String,
+        in_flight: Option<Arc<AtomicUsize>>,
+    ) -> SettingsProvider {
         SettingsProvider {
-            current: Mutex::new(Slot { provider, label }),
+            current: Mutex::new(Slot {
+                provider,
+                label,
+                in_flight,
+            }),
         }
     }
 
@@ -196,10 +215,22 @@ impl SettingsProvider {
         lock(&self.current).label.clone()
     }
 
-    /// Swaps the inner provider. The next recognition starts on `provider`;
-    /// calls already running finish on the one they captured.
-    fn install(&self, provider: Arc<dyn TranscriptionProvider>, label: String) {
-        *lock(&self.current) = Slot { provider, label };
+    /// Swaps the inner provider (with its in-flight counter — `None`
+    /// when no drain waits behind it). The next recognition starts on
+    /// `provider`; calls already running finish on the one they
+    /// captured — and stay counted on the counter they captured, which
+    /// is what a mode switch drains on before it stops the engine.
+    fn install(
+        &self,
+        provider: Arc<dyn TranscriptionProvider>,
+        label: String,
+        in_flight: Option<Arc<AtomicUsize>>,
+    ) {
+        *lock(&self.current) = Slot {
+            provider,
+            label,
+            in_flight,
+        };
     }
 }
 
@@ -211,10 +242,19 @@ impl TranscriptionProvider for SettingsProvider {
         on_partial: &mut dyn FnMut(Partial),
         cancel: &CancelToken,
     ) -> ProviderOutcome {
-        // Capture first, call second: the swap below this line moves the
-        // *next* job, never this one (an in-flight recognition keeps its
-        // provider — and through it its engine lease — until it returns).
-        let provider = Arc::clone(&lock(&self.current).provider);
+        // Capture and count under one lock hold: the count rises before
+        // the slot can be swapped, so a mode switch that installs after
+        // this point finds this call already in the drain's counter
+        // (raising it inside the inner provider instead would leave a
+        // window where the switch sees zero and stops the engine under
+        // this worker). The guard lives in this frame, released only
+        // when the call returns; the swap below moves the *next* job,
+        // never this one.
+        let (provider, _busy) = {
+            let slot = lock(&self.current);
+            let busy = slot.in_flight.as_ref().map(InFlight::on);
+            (Arc::clone(&slot.provider), busy)
+        };
         provider.recognize(wav, request_id, on_partial, cancel)
     }
 }
@@ -233,8 +273,8 @@ pub struct EngineHost {
 /// [`EngineHost::apply`].
 enum EngineState {
     /// Builtin mode: this host supervises an engine. `in_flight` counts
-    /// live recognitions on its provider — what a mode switch drains
-    /// before it stops the engine.
+    /// live recognitions on the slot fronting its provider — what a
+    /// mode switch drains before it stops the engine.
     Builtin {
         manager: EngineManager,
         in_flight: Arc<AtomicUsize>,
@@ -248,12 +288,16 @@ enum EngineState {
 impl EngineHost {
     fn start_builtin(config: EngineConfig, active_model: Option<String>) -> EngineHost {
         let manager = EngineManager::start(config.clone(), active_model.clone());
+        // One counter, shared by the slot (which raises it under its
+        // lock per call) and the state (whose mode-switch drain waits
+        // on it): the engine provider itself stays counter-free.
         let in_flight = Arc::new(AtomicUsize::new(0));
-        let provider = EngineProvider::over(manager.clone(), Arc::clone(&in_flight));
+        let provider = EngineProvider::new(manager.clone());
         EngineHost {
             provider: Arc::new(SettingsProvider::new(
                 Arc::new(provider),
                 "builtin".to_string(),
+                Some(Arc::clone(&in_flight)),
             )),
             state: Mutex::new(EngineState::Builtin {
                 manager,
@@ -267,7 +311,7 @@ impl EngineHost {
     fn manual(endpoint: String, model: String) -> EngineHost {
         let (provider, label) = manual_slot(&endpoint, &model);
         EngineHost {
-            provider: Arc::new(SettingsProvider::new(provider, label)),
+            provider: Arc::new(SettingsProvider::new(provider, label, None)),
             state: Mutex::new(EngineState::Manual { endpoint, model }),
         }
     }
@@ -297,12 +341,22 @@ impl EngineHost {
     /// Carries a settings-resolved engine choice over to the running
     /// host, the host-side twin of the app's immediate engine actions:
     /// a new `activeModel` activates the model, a changed
-    /// `backendOverride` re-selects the backend, manual endpoint/model
-    /// changes rebuild the server provider, manual→builtin starts a
+    /// `backendOverride` re-selects the backend (only when this host
+    /// owns its engine — see [`forward_backend_change`]; attached, the
+    /// reload belongs to the owner), manual endpoint/model changes
+    /// rebuild the server provider, manual→builtin starts a
     /// supervisor, builtin→manual stops routing to the engine and (once
     /// in-flight recognitions finished, bounded by
     /// [`ENGINE_DRAIN_GRACE`]) shuts it down. Only the deltas run: an
     /// unchanged choice costs nothing.
+    ///
+    /// Within one builtin→builtin apply the backend override is carried
+    /// over **before** the model activation: a backend reload cancels
+    /// an in-progress activation, so issuing activate first would let
+    /// the override's reload cancel it and reload the *old* model while
+    /// this host already records the new one. Override first, activate
+    /// second, and the model is only recorded as current once its
+    /// activation has been issued on the post-override manager.
     pub fn apply(&self, choice: EngineChoice) {
         let mut state = lock(&self.state);
         match choice {
@@ -317,6 +371,30 @@ impl EngineHost {
                     backend_override,
                     ..
                 } => {
+                    // Backend override first, model second — see the
+                    // method doc: the override's reload must not cancel
+                    // the activation this host is about to record as
+                    // served.
+                    if config.backend_override != *backend_override {
+                        if forward_backend_change(
+                            manager.snapshot().active.map(|active| active.owned),
+                        ) {
+                            manager.set_backend_override(config.backend_override);
+                        } else {
+                            // Attached: the desktop app owns the sidecar.
+                            // Forwarding the reload would run it through
+                            // this manager's `run_reload`, which spawns
+                            // with `share = false` — host and app would
+                            // each end up owning a separate sidecar. The
+                            // setting is recorded here; the owner's own
+                            // toggle reloads its sidecar, and this host's
+                            // attached manager follows the replacement
+                            // through its attach poll
+                            // (`poll_attached` → `launch_model` →
+                            // `try_attach`).
+                        }
+                        *backend_override = config.backend_override;
+                    }
                     if active_model != *current_model {
                         match active_model.as_deref() {
                             Some(model_id) => manager.activate(model_id),
@@ -334,22 +412,17 @@ impl EngineHost {
                         }
                         *current_model = active_model;
                     }
-                    if config.backend_override != *backend_override {
-                        manager.set_backend_override(config.backend_override);
-                        *backend_override = config.backend_override;
-                    }
                 }
                 EngineState::Manual { .. } => {
                     // manual → builtin: start a supervisor, then aim the
-                    // runtime at it.
+                    // runtime at it (with the counter its future mode
+                    // switch will drain on).
                     let manager = EngineManager::start(config.clone(), active_model.clone());
                     let in_flight = Arc::new(AtomicUsize::new(0));
                     self.provider.install(
-                        Arc::new(EngineProvider::over(
-                            manager.clone(),
-                            Arc::clone(&in_flight),
-                        )),
+                        Arc::new(EngineProvider::new(manager.clone())),
                         "builtin".to_string(),
+                        Some(Arc::clone(&in_flight)),
                     );
                     *state = EngineState::Builtin {
                         manager,
@@ -375,8 +448,12 @@ impl EngineHost {
                 // switch is about to stop. The label is the effective
                 // one: an endpoint that does not validate reads as
                 // `unconfigured`, not as a manual engine that serves.
+                // A recognition that entered the old slot before this
+                // swap already raised the counter the drain below waits
+                // on (see `SettingsProvider::recognize`), so it cannot
+                // be missed.
                 let (provider, label) = manual_slot(&endpoint, &model);
-                self.provider.install(provider, label);
+                self.provider.install(provider, label, None);
                 let previous = std::mem::replace(
                     &mut *state,
                     EngineState::Manual {
@@ -443,13 +520,53 @@ fn manual_label(endpoint: &str) -> String {
     format!("manual:{endpoint}")
 }
 
+/// Whether a backend-override change is this host's to run, given
+/// `manager.snapshot().active.map(|active| active.owned)`:
+///
+/// * `Some(true)` — the active engine is a sidecar this host owns, so
+///   the reload runs here (`set_backend_override` restarts the model
+///   on the newly selected backend).
+/// * `Some(false)` — this host **attached** to a sidecar another
+///   process owns (the desktop app started it): forwarding the change
+///   would run this manager's `run_reload`, which spawns its
+///   replacement with `share = false` — host and app would each own a
+///   separate sidecar. The owner reloads its own engine; this host's
+///   manager follows the replacement through its attach poll
+///   (`poll_attached` → `launch_model` → `try_attach`).
+/// * `None` — no active engine (nothing started, or still loading):
+///   forwarding only records the override and re-runs backend
+///   selection, so the engine this host starts later uses it.
+///
+/// Known limitation: a host that is attached when the override changes
+/// and later takes the engine over (the owner dies and the supervisor
+/// restarts it here) keeps the backend its manager was started with
+/// until the *next* override change names it again.
+fn forward_backend_change(active_owned: Option<bool>) -> bool {
+    active_owned.unwrap_or(true)
+}
+
 /// Spawns the host's settings watcher (#220): polls `path`'s bytes
-/// every `poll` and, when they change, resolves the settings' engine
-/// choice ([`EngineChoice::from_settings`], the same load the host
-/// started from) and applies it to `host`. A missing or unreadable
-/// file is skipped, not treated as a change — the host keeps serving
-/// what it served. Stops when `stop` is set (checked every slice), so
-/// the host's shutdown joins it before it stops the engine.
+/// every `poll` and, when they change, parses the **captured** bytes
+/// ([`Settings::from_json_bytes`], never a second read of the file —
+/// the bytes between two reads could differ) and applies the engine
+/// choice they resolve to ([`EngineChoice::from_settings`], the same
+/// load the host started from) to `host`.
+///
+/// Bytes that are not valid JSON — an empty or truncated file, what a
+/// non-atomic writer looks like mid-write — state no choice: the host
+/// keeps its last-applied one (reported once per distinct bad content)
+/// until the file says something parseable again. A missing file is
+/// the same non-event, and a deletion racing the stability re-read
+/// must not read as "the user chose the defaults".
+///
+/// The watcher starts with no `last`: whatever the file says at its
+/// first poll is applied, so a change between the startup load (which
+/// resolved the host's initial [`EngineChoice`]) and the watcher's
+/// start is not silently frozen out. That first apply is a no-op when
+/// the file still agrees with the startup choice — `apply` only runs
+/// deltas (same model and backend for builtin, same endpoint and model
+/// for manual). Stops when `stop` is set (checked every slice), so the
+/// host's shutdown joins it before it stops the engine.
 pub fn watch_settings(
     host: Arc<EngineHost>,
     path: PathBuf,
@@ -459,7 +576,11 @@ pub fn watch_settings(
     std::thread::Builder::new()
         .name("starling-host-settings".to_string())
         .spawn(move || {
-            let mut last = std::fs::read(&path).ok();
+            // No seed: the first poll applies what the file says now (a
+            // change since the startup load must not wait for a second
+            // one).
+            let mut last: Option<Vec<u8>> = None;
+            let mut reported_bad: Option<Vec<u8>> = None;
             loop {
                 if stop.load(Ordering::SeqCst) {
                     return;
@@ -474,20 +595,38 @@ pub fn watch_settings(
                 let current = std::fs::read(&path).ok();
                 if current != last {
                     last = current.clone();
-                    // Apply only what the file stably says: `Settings::load`
-                    // falls back to defaults for a missing file, and a
-                    // deletion racing between the two reads must not read
-                    // as "the user chose the defaults" — the host keeps
-                    // its last-known choice until the file says otherwise.
-                    if current.is_some() && current == std::fs::read(&path).ok() {
-                        let settings = Settings::load(&path);
-                        match EngineChoice::from_settings(&settings) {
+                    let Some(bytes) = current.as_deref() else {
+                        continue;
+                    };
+                    // Apply only what the file stably says: a deletion
+                    // racing between the two reads must not read as a
+                    // choice (the missing file is not "the user chose
+                    // the defaults").
+                    if std::fs::read(&path).ok().as_deref() != Some(bytes) {
+                        continue;
+                    }
+                    match Settings::from_json_bytes(bytes) {
+                        Some(settings) => match EngineChoice::from_settings(&settings) {
                             Ok(choice) => host.apply(choice),
                             Err(err) => eprintln!(
                                 "starling-runtime-host: engine settings at {}: {err}; \
                                  the engine stays as it is",
                                 path.display()
                             ),
+                        },
+                        // Not JSON — an empty or truncated file. The host
+                        // keeps its last-applied choice; report each
+                        // distinct bad content once (the same truncated
+                        // bytes on every poll must not spam).
+                        None => {
+                            if reported_bad.as_deref() != Some(bytes) {
+                                eprintln!(
+                                    "starling-runtime-host: engine settings at {} are not \
+                                     valid JSON; the engine stays as it is",
+                                    path.display()
+                                );
+                                reported_bad = current.clone();
+                            }
                         }
                     }
                 }
@@ -501,10 +640,15 @@ pub fn watch_settings(
 /// model switch drains it rather than cutting it off), sends the take
 /// through `starling-dictation`'s client, and reports the model it ran
 /// on as the completion's `backend` (`engine:<model id>`).
+///
+/// In-flight counting is **not** here: the [`SettingsProvider`] slot
+/// that fronts this provider raises (and drains on) the one counter
+/// under its own lock — one counter, no window between "captured the
+/// provider" and "counted the call" for a mode switch to slip through
+/// (see [`SettingsProvider::recognize`]).
 pub struct EngineProvider {
     manager: EngineManager,
     ready_wait: Duration,
-    in_flight: Arc<AtomicUsize>,
 }
 
 impl EngineProvider {
@@ -512,17 +656,6 @@ impl EngineProvider {
         EngineProvider {
             manager,
             ready_wait: DEFAULT_READY_WAIT,
-            in_flight: Arc::new(AtomicUsize::new(0)),
-        }
-    }
-
-    /// The provider over `manager`, counting live recognitions on
-    /// `in_flight` (the counter the host's mode-switch drain waits on).
-    fn over(manager: EngineManager, in_flight: Arc<AtomicUsize>) -> EngineProvider {
-        EngineProvider {
-            manager,
-            ready_wait: DEFAULT_READY_WAIT,
-            in_flight,
         }
     }
 
@@ -531,26 +664,23 @@ impl EngineProvider {
         self.ready_wait = wait;
         self
     }
-
-    /// Recognitions currently running on this provider — what a
-    /// builtin→manual switch drains before it stops the engine.
-    pub fn in_flight(&self) -> usize {
-        self.in_flight.load(Ordering::SeqCst)
-    }
 }
 
-/// One live recognition's count on its provider's counter, released on
-/// every exit (including panics).
-struct InFlight<'a>(&'a AtomicUsize);
+/// One live recognition's count on its slot's counter, released on
+/// every exit (including panics). It owns a handle to the counter
+/// rather than borrowing it: the count must outlive the slot lock it
+/// was raised under (the slot swaps mid-call; the count drains only
+/// when the call returns).
+struct InFlight(Arc<AtomicUsize>);
 
-impl<'a> InFlight<'a> {
-    fn on(counter: &'a AtomicUsize) -> InFlight<'a> {
+impl InFlight {
+    fn on(counter: &Arc<AtomicUsize>) -> InFlight {
         counter.fetch_add(1, Ordering::SeqCst);
-        InFlight(counter)
+        InFlight(Arc::clone(counter))
     }
 }
 
-impl Drop for InFlight<'_> {
+impl Drop for InFlight {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::SeqCst);
     }
@@ -665,10 +795,9 @@ impl TranscriptionProvider for EngineProvider {
         _on_partial: &mut dyn FnMut(Partial),
         cancel: &CancelToken,
     ) -> ProviderOutcome {
-        // Counted for the whole call: a mode switch that swaps this
-        // provider out waits (bounded) for this count before it stops
-        // the engine.
-        let _busy = InFlight::on(&self.in_flight);
+        // Counted at the slot that fronts this provider (see the struct
+        // doc): a mode switch that swaps the slot out waits (bounded) on
+        // that count before it stops the engine under this call.
         let wav = Arc::new(wav);
         let mut failed_engine: Option<(String, u32)> = None;
         // One ready-wait deadline for the whole call: the initial wait
@@ -843,6 +972,7 @@ mod tests {
         let settings = Arc::new(SettingsProvider::new(
             Arc::clone(&first) as Arc<dyn TranscriptionProvider>,
             "first".to_string(),
+            None,
         ));
         let runner = {
             let settings = Arc::clone(&settings);
@@ -863,6 +993,7 @@ mod tests {
         settings.install(
             Arc::clone(&second) as Arc<dyn TranscriptionProvider>,
             "second".to_string(),
+            None,
         );
         assert_eq!(settings.label(), "second");
 
@@ -888,6 +1019,7 @@ mod tests {
         let settings = SettingsProvider::new(
             Arc::new(UnconfiguredProvider) as Arc<dyn TranscriptionProvider>,
             "unconfigured".to_string(),
+            None,
         );
         match settings.recognize(
             vec![0u8; 64],
@@ -1013,6 +1145,158 @@ mod tests {
             model: "parakeet".into(),
         });
         assert_eq!(host.label(), "manual:http://127.0.0.1:9193");
+        host.shutdown();
+    }
+
+    /// The backend-forwarding decision (review on #220): an override
+    /// change is forwarded to the manager only when this host owns its
+    /// active engine, or has no active engine to attach to yet —
+    /// attached, the reload (and its replacement sidecar) belong to
+    /// the owner.
+    #[test]
+    fn backend_changes_forward_only_for_owned_engines() {
+        assert!(
+            forward_backend_change(Some(true)),
+            "an engine this host owns reloads here"
+        );
+        assert!(
+            forward_backend_change(None),
+            "no active engine: the override is only recorded, nothing spawns"
+        );
+        assert!(
+            !forward_backend_change(Some(false)),
+            "an attached engine is the owner's to reload (forwarding would spawn a second, host-owned sidecar)"
+        );
+    }
+
+    /// Re-applying the same builtin choice runs no deltas — the
+    /// property the watcher's unseeded first poll relies on: applying
+    /// what the file already said must not start a switch (same model
+    /// and backend ⇒ no activate, no backend reload).
+    #[test]
+    fn an_unchanged_builtin_choice_is_a_no_op() {
+        let root = tempfile::tempdir().unwrap();
+        let config = detached_config(root.path());
+        let mut runtime = starling_runtime::RuntimeConfig::default();
+        let host = attach(
+            EngineChoice::Builtin {
+                config: config.clone(),
+                active_model: None,
+            },
+            &mut runtime,
+        )
+        .expect("builtin mode attaches");
+        let manager = host.manager().expect("builtin mode supervises an engine");
+        assert!(manager.snapshot().switch.is_none());
+
+        host.apply(EngineChoice::Builtin {
+            config,
+            active_model: None,
+        });
+
+        assert!(
+            manager.snapshot().switch.is_none(),
+            "an unchanged choice must not start a switch (the watcher's first poll relies on it)"
+        );
+        assert_eq!(host.label(), "builtin");
+        host.shutdown();
+    }
+
+    /// The drain rule (review on #220): a recognition that entered the
+    /// slot before a builtin→manual switch keeps that switch's drain
+    /// waiting until the call returns — the count is raised under the
+    /// slot lock, before the switch can swap the slot out, so the
+    /// switch never sees zero and stops the engine under the worker.
+    #[test]
+    fn a_switch_drains_a_recognition_captured_before_it() {
+        let root = tempfile::tempdir().unwrap();
+        let mut runtime = starling_runtime::RuntimeConfig::default();
+        let host = attach(
+            EngineChoice::Builtin {
+                config: detached_config(root.path()),
+                active_model: None,
+            },
+            &mut runtime,
+        )
+        .expect("builtin mode attaches");
+        // The counter the switch will drain on — the one the builtin
+        // slot carries (the real engine provider is swapped for a
+        // gated one on the SAME counter, so the drain observes this
+        // call instead of a real engine request).
+        let in_flight = match &*lock(&host.state) {
+            EngineState::Builtin { in_flight, .. } => Arc::clone(in_flight),
+            EngineState::Manual { .. } => panic!("the host started builtin"),
+        };
+        let (started, started_rx) = std::sync::mpsc::channel();
+        let (release, gate) = std::sync::mpsc::channel();
+        host.provider.install(
+            Arc::new(GatedProvider {
+                started,
+                gate: Mutex::new(gate),
+                tag: "gated",
+            }),
+            "builtin".to_string(),
+            Some(Arc::clone(&in_flight)),
+        );
+
+        let runner = {
+            let provider = Arc::clone(&host.provider);
+            std::thread::spawn(move || {
+                provider.recognize(
+                    vec![0u8; 64],
+                    "job-d",
+                    &mut |_partial| {},
+                    &CancelToken::new(),
+                )
+            })
+        };
+        started_rx
+            .recv()
+            .expect("the gated provider is running the job");
+        // Raised before the swap, held for the whole call.
+        assert_eq!(in_flight.load(Ordering::SeqCst), 1);
+
+        // The switch to manual: it swaps the slot, then drains.
+        let applier = {
+            let host = Arc::clone(&host);
+            std::thread::spawn(move || {
+                host.apply(EngineChoice::Manual {
+                    endpoint: "http://127.0.0.1:9194".into(),
+                    model: "parakeet".into(),
+                })
+            })
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while host.label() != "manual:http://127.0.0.1:9194" {
+            assert!(
+                Instant::now() < deadline,
+                "the slot never swapped (still {})",
+                host.label()
+            );
+            std::thread::sleep(FOLLOW_SLICE);
+        }
+        // The slot has moved on, but the switch has not finished: it is
+        // draining the captured recognition (well inside the 10 s
+        // grace, which a finished switch would not wait out).
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            !applier.is_finished(),
+            "the switch must still be waiting for the in-flight recognition"
+        );
+
+        release.send(()).expect("release the gated provider");
+        match runner.join().expect("the recognition finished") {
+            ProviderOutcome::Completed { backend, .. } => assert_eq!(backend, "gated"),
+            ProviderOutcome::Failed { .. } => {
+                panic!("expected a completion on the gated provider")
+            }
+        }
+        assert_eq!(in_flight.load(Ordering::SeqCst), 0);
+        applier.join().expect("the switch finishes once drained");
+        assert!(
+            host.manager().is_none(),
+            "the switch stopped the engine after the drain"
+        );
         host.shutdown();
     }
 }

@@ -626,6 +626,12 @@ fn connect_with_wait(path: &Path, wait: u32) -> io::Result<Box<dyn TransportConn
                 return Err(io::Error::from_raw_os_error(err as i32));
             }
         }
+        // Allocated before the handle is acquired: a failure after
+        // CreateFileW succeeds would leak the open pipe handle
+        // (SendHandle has no Drop), holding the client's instance of
+        // the pipe until process exit. An event that fails here closes
+        // nothing of the server's.
+        let event = Event::new()?;
         let handle = CreateFileW(
             name.as_ptr(),
             GENERIC_READ | GENERIC_WRITE,
@@ -642,7 +648,7 @@ fn connect_with_wait(path: &Path, wait: u32) -> io::Result<Box<dyn TransportConn
             handle: SendHandle(handle),
             server: false,
             shared: Arc::default(),
-            event: Event::new()?,
+            event,
         }))
     }
 }
@@ -691,11 +697,18 @@ impl TransportListener for PipeListener {
             .expect("the receiver lives until Drop");
         match connections.try_recv() {
             Ok(result) => {
+                // The event is created before the handle leaves its
+                // wrapper: `SendHandle` has no Drop, so an event-creation
+                // failure after `into_handle()` would leak the pipe
+                // handle (and keep its instance of the pipe name bound).
+                // A failure before it just drops the instance through
+                // its own owning wrapper.
+                let event = Event::new()?;
                 let conn = PipeConn {
                     handle: result?.into_handle(),
                     server: true,
                     shared: Arc::default(),
-                    event: Event::new()?,
+                    event,
                 };
                 // Readers run with a poll timeout (the unix accept arms
                 // the same 250 ms) so a connection the host abandoned —
@@ -1135,6 +1148,11 @@ impl TransportConn for PipeConn {
         // DuplicateHandle: a real second handle to the same pipe, so the
         // host's reader/writer/shutdown split works exactly as on unix.
         unsafe {
+            // Allocated before the duplicate exists: an event-creation
+            // failure after DuplicateHandle succeeds would leak the
+            // duplicate (SendHandle has no Drop), pinning the pipe's
+            // file object for the life of the process.
+            let event = Event::new()?;
             let mut duplicate: HANDLE = std::ptr::null_mut();
             let process = GetCurrentProcess();
             if DuplicateHandle(
@@ -1153,7 +1171,7 @@ impl TransportConn for PipeConn {
                 handle: SendHandle(duplicate),
                 server: self.server,
                 shared: Arc::clone(&self.shared),
-                event: Event::new()?,
+                event,
             }))
         }
     }

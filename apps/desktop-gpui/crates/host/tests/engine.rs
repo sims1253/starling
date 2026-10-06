@@ -514,6 +514,123 @@ fn a_manual_endpoint_change_is_applied_without_a_restart() {
     host.shutdown();
 }
 
+/// #220: a torn settings write is a non-event, not a choice. The file
+/// truncated mid-document or emptied — what a non-atomic writer looks
+/// like between two identical reads — must not fall back to the load
+/// defaults (which would replace a working manual provider with the
+/// bundled-engine none); the host keeps its last-applied choice and
+/// follows the next valid write.
+#[test]
+fn a_torn_settings_write_keeps_the_last_engine_choice() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("settings.json");
+
+    let mut settings = Settings::default_settings();
+    settings.engine.mode = EngineMode::Manual;
+    settings.endpoint = "http://127.0.0.1:8181".into();
+    settings.save(&path).unwrap();
+
+    let mut runtime = starling_runtime::RuntimeConfig::default();
+    let host = engine::attach(
+        EngineChoice::Manual {
+            endpoint: settings.endpoint.clone(),
+            model: settings.model.clone(),
+        },
+        &mut runtime,
+    )
+    .expect("manual mode attaches");
+
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let watcher = engine::watch_settings(
+        Arc::clone(&host),
+        path.clone(),
+        Duration::from_millis(20),
+        Arc::clone(&stop),
+    );
+
+    // Truncated mid-document.
+    std::fs::write(&path, r#"{"engine":{"mo"#).unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(
+        host.label(),
+        "manual:http://127.0.0.1:8181",
+        "a truncated settings file must not change the engine"
+    );
+
+    // Emptied — the same non-event.
+    std::fs::write(&path, b"").unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(
+        host.label(),
+        "manual:http://127.0.0.1:8181",
+        "an empty settings file must not change the engine"
+    );
+
+    // The next valid write is followed again.
+    settings.endpoint = "http://127.0.0.1:9195".into();
+    settings.save(&path).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while host.label() != "manual:http://127.0.0.1:9195" {
+        assert!(
+            Instant::now() < deadline,
+            "the valid write after the torn ones was never picked up (still {})",
+            host.label()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    watcher.join().expect("the watcher stops on its stop flag");
+    host.shutdown();
+}
+
+/// #220: the watcher starts with no `last`, so a change between the
+/// startup load (which resolved the host's initial engine choice) and
+/// the watcher's start is applied at its first poll. The startup
+/// choice here names the old endpoint while the file already names a
+/// new one — exactly that gap — and the host converges to the file.
+#[test]
+fn a_change_before_the_watcher_starts_is_still_applied() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("settings.json");
+
+    // What the file said when the host's startup resolved its choice…
+    let mut settings = Settings::default_settings();
+    settings.engine.mode = EngineMode::Manual;
+    settings.endpoint = "http://127.0.0.1:8181".into();
+    // …and what it says by the time the watcher first polls: the user
+    // moved the manual endpoint while the host was starting.
+    settings.endpoint = "http://127.0.0.1:9196".into();
+    settings.save(&path).unwrap();
+
+    let host_setup = host_config(
+        root.path(),
+        EngineChoice::Manual {
+            endpoint: "http://127.0.0.1:8181".into(),
+            model: "parakeet".into(),
+        },
+    )
+    .with_settings_path(&path)
+    .with_settings_poll(Duration::from_millis(20));
+    let mut host = serve(host_setup).expect("host serves");
+    assert_eq!(
+        host.engine_label(),
+        "manual:http://127.0.0.1:8181",
+        "the startup choice serves first"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while host.engine_label() != "manual:http://127.0.0.1:9196" {
+        assert!(
+            Instant::now() < deadline,
+            "the pre-watcher change was never applied (still {})",
+            host.engine_label()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    host.shutdown();
+}
+
 /// #220: the host follows a builtin activeModel change while it runs.
 /// The watcher activates the new model on the host's own manager (the
 /// host-side twin of the app's Activate action), and a job submitted
