@@ -132,6 +132,27 @@ the draft's delivery is Copy.
 
 ## Hotkeys
 
-`Cmd/Ctrl+Shift+Space` toggles recording — focused (in-app action) and
-system-wide (`global-hotkey`; on Wayland this is portal/compositor dependent
-and degrades to a console warning, mirroring the Electron fallback).
+The recording shortcut (default `Cmd/Ctrl+Shift+Space`) is configurable in
+Settings → Dictation, including a single key such as `F9` (#221). It works
+system-wide (`global-hotkey`: an X11 key grab, `RegisterHotKey` on Windows,
+Carbon hot keys on macOS) and inside the window, and it never raises or
+focuses the Starling window, so the app you dictate into keeps focus.
+
+- **Hold or tap** (default): hold to talk and let go to finish, or tap once
+  to keep recording until the next press.
+- **Hold to talk**: records while held. Optional double tap latches the take
+  hands-free until the next press.
+- **Toggle**: press to start, press again to finish.
+
+Escape cancels the active take: nothing is transcribed or delivered, and any
+captured audio is kept in history as an interrupted take. While a take is
+active, Escape is grabbed system-wide — alone or with any of the shortcut's
+own modifiers still held, any of them cancels the take — so it is not
+delivered to other apps; the rest of the time it is left alone. The pane
+says "Starting the microphone…" until real samples arrive, and only then
+"Listening closely."; a microphone that delivers nothing for five seconds
+stops the take with an error. Key repeat never starts or stops a take.
+
+On Wayland the system-wide shortcut only reaches Starling while an X11
+(XWayland) app is focused; the XDG GlobalShortcuts portal is not wired yet.
+The shortcut always works while the Starling window is focused.
