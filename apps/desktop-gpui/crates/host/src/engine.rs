@@ -267,6 +267,11 @@ impl TranscriptionProvider for SettingsProvider {
 pub struct EngineHost {
     provider: Arc<SettingsProvider>,
     state: Mutex<EngineState>,
+    /// Set when the host begins shutting down: a builtin→manual drain
+    /// in progress on the watcher thread stops waiting, so the host's
+    /// shutdown (which joins the watcher) is not held for the drain's
+    /// grace. The runtime's own shutdown cancels the drained jobs.
+    closing: AtomicBool,
 }
 
 /// What the host runs right now; the diff base for the next
@@ -311,6 +316,7 @@ impl EngineHost {
                 active_model,
                 backend_override: config.backend_override,
             }),
+            closing: AtomicBool::new(false),
         }
     }
 
@@ -319,6 +325,7 @@ impl EngineHost {
         EngineHost {
             provider: Arc::new(SettingsProvider::new(provider, label, None)),
             state: Mutex::new(EngineState::Manual { endpoint, model }),
+            closing: AtomicBool::new(false),
         }
     }
 
@@ -473,7 +480,10 @@ impl EngineHost {
                     // not keep a user-rejected engine (and its memory)
                     // alive behind a stuck job.
                     let deadline = Instant::now() + ENGINE_DRAIN_GRACE;
-                    while in_flight.load(Ordering::SeqCst) > 0 && Instant::now() < deadline {
+                    while in_flight.load(Ordering::SeqCst) > 0
+                        && Instant::now() < deadline
+                        && !self.closing.load(Ordering::SeqCst)
+                    {
                         std::thread::sleep(FOLLOW_SLICE);
                     }
                     // A recognition still past the grace is waiting for a
@@ -491,6 +501,12 @@ impl EngineHost {
     /// that owner's sidecar running). The host calls this on its
     /// shutdown path, after the settings watcher stopped and the
     /// runtime's machines joined.
+    /// Marks the host as shutting down (see `closing`). The host calls
+    /// this before it joins the settings watcher.
+    pub fn begin_shutdown(&self) {
+        self.closing.store(true, Ordering::SeqCst);
+    }
+
     pub fn shutdown(&self) {
         // Clone out and release the state lock before the blocking stop,
         // so status reads (`label()`, `manager()`) never wait behind it.

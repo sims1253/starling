@@ -207,6 +207,9 @@ impl HostHandle {
         // exits even while the connection drain above still waits, and
         // so no engine change is applied to a host that is going away.
         self.watch_stop.store(true, Ordering::SeqCst);
+        if let Some(engine) = &self.engine {
+            engine.begin_shutdown();
+        }
 
         // Say goodbye and close every live connection first: writers
         // drain their queues (Bye included) before the senders drop.

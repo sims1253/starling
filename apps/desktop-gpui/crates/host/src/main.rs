@@ -195,27 +195,35 @@ fn main() {
     let (engine, settings_path) = if engine_source == "none" {
         (EngineChoice::None, None)
     } else {
-        let settings = starling_dictation::settings::Settings::load_or_default();
-        // `load_or_default` falls back to the defaults for a file that is
-        // not JSON; say so, rather than silently starting the bundled
-        // engine on a corrupt file (the watcher then applies the file's
-        // real choice once it parses).
-        if let Ok(path) = starling_dictation::settings::Settings::default_path() {
-            if let Ok(bytes) = std::fs::read(&path) {
-                if starling_dictation::settings::Settings::from_json_bytes(&bytes).is_none() {
+        use starling_dictation::settings::Settings;
+        // One read decides both the settings and the diagnostic: a file
+        // that is not JSON falls back to the defaults (as
+        // `load_or_default` would) and says so, rather than silently
+        // starting the bundled engine on a corrupt file (the watcher then
+        // applies the file's real choice once it parses).
+        let settings = match Settings::default_path() {
+            Ok(path) => match std::fs::read(&path) {
+                Ok(bytes) => Settings::from_json_bytes(&bytes).unwrap_or_else(|| {
                     eprintln!(
                         "starling-runtime-host: settings at {} are not valid JSON; \
                          starting with the default engine settings",
                         path.display()
                     );
-                }
-            }
-        }
+                    Settings::default_settings()
+                }),
+                Err(_) => Settings::default_settings(),
+            },
+            Err(_) => Settings::default_settings(),
+        };
+        // An engine choice that cannot resolve (no user data directory)
+        // must not cost a second launch its ownership answer: serve
+        // without an engine and say so, rather than exit before the
+        // lease ladder ran.
         let choice = match EngineChoice::from_settings(&settings) {
             Ok(engine) => engine,
             Err(err) => {
-                eprintln!("starling-runtime-host: {err}");
-                std::process::exit(1);
+                eprintln!("starling-runtime-host: {err}; serving without an engine");
+                EngineChoice::None
             }
         };
         (choice, starling_dictation::settings::Settings::default_path().ok())

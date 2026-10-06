@@ -218,11 +218,11 @@ impl JobsActor {
         let (_, closed) = crate::channel::bounded(1);
         drop(std::mem::replace(&mut self.inbox, closed));
         self.stop_workers();
-        // Publish once more after the workers stopped: the last loop
-        // iteration's view predates the cancels, so an observer reading
-        // the shared snapshot after the runtime loop exits must not see
-        // a stale in-flight state (`Recording`/`Recognizing`) for jobs
-        // the shutdown just cancelled.
+        // Publish once more after the workers stopped, so the snapshot
+        // reflects the final bookkeeping. Cancelling a token does not move
+        // a job's state machine (only a delivered worker report does, and
+        // the inbox is closed), so jobs cancelled here may still read as
+        // in flight; nothing consumes the view once the runtime is down.
         self.publish_view();
     }
 
