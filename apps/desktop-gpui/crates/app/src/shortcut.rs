@@ -103,7 +103,10 @@ impl Shortcut {
 
     /// Whether an in-window key-down is this shortcut (exact modifiers).
     /// With Shift, gpui may report the shifted character instead of the
-    /// key (`?` rather than shift-`/` on a US layout); both forms match.
+    /// key (`?` rather than shift-`/` on a US layout), and a shifted
+    /// letter as either the lowercase key with Shift held — the shape
+    /// every gpui platform produces — or the uppercase name, which only
+    /// x11's compose path emits. All of these forms match.
     pub(crate) fn matches_key_down(&self, keystroke: &gpui::Keystroke) -> bool {
         let Some(key) = self.window_key.as_deref() else {
             return false;
@@ -113,17 +116,28 @@ impl Shortcut {
             && keystroke.modifiers.alt == mods.contains(Modifiers::ALT)
             && keystroke.modifiers.platform == mods.contains(Modifiers::SUPER);
         let shift = mods.contains(Modifiers::SHIFT);
-        let plain = keystroke.key == key && keystroke.modifiers.shift == shift;
+        // A single ASCII letter matches case-insensitively when Shift is
+        // part of the shortcut: gpui lowercases a shifted letter on every
+        // platform (x11 and Wayland lowercase `key_utf8`, macOS reports
+        // `charactersIgnoringModifiers`, Windows lowercases the vkey
+        // character), but x11's compose path sets `key` straight from
+        // `keysym_get_name`, which hands back the uppercase name.
+        let plain = (keystroke.key == key
+            || (shift && is_ascii_letter(key) && keystroke.key.eq_ignore_ascii_case(key)))
+            && keystroke.modifiers.shift == shift;
         let shifted = shift && self.window_shifted.is_some_and(|symbol| keystroke.key == symbol);
         others && (plain || shifted)
     }
 
     /// Whether an in-window key-up ends this shortcut. Only the key
     /// counts: people let go of the modifiers first as often as last, and
-    /// a hold must end either way.
+    /// a hold must end either way. The key may arrive in either letter
+    /// case or as the character Shift makes of it (see
+    /// [`Shortcut::matches_key_down`]).
     pub(crate) fn matches_key_up(&self, keystroke: &gpui::Keystroke) -> bool {
         self.window_key.as_deref().is_some_and(|key| {
             keystroke.key == key
+                || (is_ascii_letter(key) && keystroke.key.eq_ignore_ascii_case(key))
                 || self
                     .window_shifted
                     .is_some_and(|symbol| keystroke.key == symbol)
@@ -146,6 +160,14 @@ impl Shortcut {
 /// holding Ctrl+Shift+Space must cancel, not wait for the release).
 pub(crate) fn is_escape(keystroke: &gpui::Keystroke) -> bool {
     keystroke.key == "escape"
+}
+
+/// Whether a gpui key name is one ASCII letter: the one key whose
+/// shifted form reaches the window in either case (see
+/// [`Shortcut::matches_key_down`]).
+fn is_ascii_letter(key: &str) -> bool {
+    let bytes = key.as_bytes();
+    bytes.len() == 1 && bytes[0].is_ascii_alphabetic()
 }
 
 /// The character Shift turns a key into on a US layout, the form some
@@ -393,7 +415,9 @@ fn manage(
 /// `GlobalHotKeyEvent::set_event_handler` routes every hotkey event to one
 /// closure, so a second instance would silently replace it and leave the
 /// first's registrations firing into a dropped sender — the shortcut
-/// would look registered but never act. One instance per process, enforced.
+/// would look registered but never act. One instance per process,
+/// enforced: the claim `new` makes is handed back in `Drop`, so the
+/// invariant survives a dropped instance instead of being assumed.
 static HANDLER_INSTALLED: AtomicBool = AtomicBool::new(false);
 
 /// The system-wide registrations: the recording shortcut for the app's
@@ -663,6 +687,24 @@ impl GlobalShortcuts {
     }
 }
 
+impl Drop for GlobalShortcuts {
+    /// The process-wide event handler and the single-instance slot are
+    /// handed back, so "one `GlobalShortcuts` per process" is enforced
+    /// rather than assumed: after a drop a new instance works instead of
+    /// failing forever with "already exists". The registrations go with
+    /// it — the inline manager (Windows/macOS) drops as this struct tears
+    /// down, and on Linux the worker's command sender is a field of this
+    /// struct, so that teardown ends the worker loop, whose exit drops
+    /// the manager on the worker thread.
+    fn drop(&mut self) {
+        // `None` uninstalls the handler; events global-hotkey still
+        // delivers afterwards land in its default channel, not in the
+        // sender this instance's handler closure captured.
+        GlobalHotKeyEvent::set_event_handler(None::<fn(GlobalHotKeyEvent)>);
+        HANDLER_INSTALLED.store(false, Ordering::SeqCst);
+    }
+}
+
 /// Whether this is a Wayland session (the window is a native Wayland
 /// client the X11 grab cannot hear).
 pub(crate) fn wayland_session() -> bool {
@@ -785,15 +827,20 @@ mod tests {
         // The hotkey event handler is process-wide, so a second instance
         // would leave the first's registrations firing into a dropped
         // sender. With a display the refusal is observed through `new`
-        // itself; headless (CI) not even the first manager can be built,
-        // so the claim `new` makes is exercised directly and restored.
+        // itself, and dropping the first hands the slot back: a new
+        // instance is allowed again rather than refused forever.
+        // Headless (CI) not even the first manager can be built, so the
+        // claim `new` makes is exercised directly and restored.
         match GlobalShortcuts::new() {
-            Ok(_shortcuts) => {
+            Ok(shortcuts) => {
                 let err = match GlobalShortcuts::new() {
                     Ok(_second) => panic!("a second GlobalShortcuts must be refused"),
                     Err(err) => err,
                 };
                 assert!(err.contains("already exists"), "{err}");
+                drop(shortcuts);
+                let _revived = GlobalShortcuts::new()
+                    .expect("a GlobalShortcuts is allowed again after the drop");
             }
             Err(_) => {
                 assert!(!HANDLER_INSTALLED.swap(true, Ordering::SeqCst));
@@ -818,6 +865,34 @@ mod tests {
         assert!(is_escape(&keystroke("escape")));
         assert!(is_escape(&keystroke("ctrl-shift-escape")));
         assert!(!is_escape(&keystroke("space")));
+    }
+
+    #[test]
+    fn shifted_letter_shortcuts_match_both_event_shapes() {
+        // The shape every gpui platform produces for a shifted letter:
+        // the lowercase key with Shift held (x11 and Wayland lowercase
+        // `key_utf8`, macOS reports `charactersIgnoringModifiers`, Windows
+        // lowercases the vkey character) — also what `Keystroke::parse`
+        // builds, which is why the parse-based event below is that shape.
+        let shortcut = Shortcut::parse("Alt+Shift+D").unwrap();
+        assert!(shortcut.matches_key_down(&keystroke("alt-shift-d")));
+        // The x11 compose path sets `key` from `keysym_get_name` without
+        // lowercasing, so the uppercase name must match as well.
+        let mut upper = keystroke("alt-shift-d");
+        upper.key = "D".to_string();
+        assert!(shortcut.matches_key_down(&upper));
+        // The release matches on the key alone, in either case.
+        assert!(shortcut.matches_key_up(&keystroke("d")));
+        let mut upper_up = keystroke("d");
+        upper_up.key = "D".to_string();
+        assert!(shortcut.matches_key_up(&upper_up));
+        // Shift held still mismatches a shortcut that has no Shift.
+        let plain = Shortcut::parse("Alt+D").unwrap();
+        assert!(!plain.matches_key_down(&keystroke("alt-shift-d")));
+        let mut plain_upper = keystroke("alt-d");
+        plain_upper.key = "D".to_string();
+        assert!(!plain_upper.modifiers.shift);
+        assert!(!plain.matches_key_down(&plain_upper));
     }
 
     #[test]

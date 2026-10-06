@@ -41,9 +41,19 @@ use crate::app::StarlingApp;
 use crate::shortcut::{GlobalEvent, GlobalShortcuts};
 
 /// How often the app feeds system-wide shortcut events, timers, and the
-/// recorder's sample count into the machine. Event timestamps are taken
-/// where the events arrive, so this only bounds reaction latency.
+/// recorder's sample count into the machine while one is running (a
+/// take is active, or the shortcut key is down and its repeats stream
+/// in). Event timestamps are taken where the events arrive, so this
+/// only bounds reaction latency.
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+/// The cadence the same loop backs off to once the machine idles: no
+/// take runs and the shortcut key is up, so the poll's only job is to
+/// notice the next event or the next take — and a system-wide event
+/// carries the timestamp of when it was received, so tap and hold
+/// durations stay honest; only how long an idle press takes to start a
+/// take grows, by at most the difference between the two cadences.
+const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Identifies one take for the lifetime of the app.
 pub(crate) type TakeId = u64;
@@ -527,10 +537,15 @@ impl StarlingApp {
         }
         self.install_key_interceptor(cx);
         cx.spawn(async move |this, cx| {
+            // 20 ms while a take runs or the key is held; the idle
+            // backoff otherwise — `poll_activation` says which, turn by
+            // turn.
+            let mut wait = POLL_INTERVAL;
             loop {
-                gpui::Timer::after(POLL_INTERVAL).await;
-                if this.update(cx, |app, cx| app.poll_activation(cx)).is_err() {
-                    break;
+                gpui::Timer::after(wait).await;
+                match this.update(cx, |app, cx| app.poll_activation(cx)) {
+                    Ok(next) => wait = next,
+                    Err(_) => break,
                 }
             }
         })
@@ -660,9 +675,20 @@ impl StarlingApp {
     }
 
     /// One loop turn: system-wide events in arrival order, then timers.
-    pub(crate) fn poll_activation(&mut self, cx: &mut Context<Self>) {
+    /// Returns how long the loop waits before its next turn: the fast
+    /// [`POLL_INTERVAL`] while a take is active or the shortcut key is
+    /// down (the press/release pair and the repeats arrive as a stream
+    /// then), and the slower [`IDLE_POLL_INTERVAL`] once the machine
+    /// idles — which costs nothing but idle start latency, since the
+    /// timers act on the events' receive timestamps, not on the poll's.
+    pub(crate) fn poll_activation(&mut self, cx: &mut Context<Self>) -> Duration {
         self.flush_system_events(cx);
         self.activation_input(|machine| machine.tick(Instant::now()), cx);
+        if self.activation.is_active() || self.activation.key_is_down() {
+            POLL_INTERVAL
+        } else {
+            IDLE_POLL_INTERVAL
+        }
     }
 
     /// Feed one input to the machine and perform its effects. Readiness
