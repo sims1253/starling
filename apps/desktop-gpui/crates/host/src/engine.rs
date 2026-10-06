@@ -496,17 +496,17 @@ impl EngineHost {
         }
     }
 
-    /// Stops the engine this host supervises (a no-op in manual mode,
-    /// or for an engine another process owns — the attached case leaves
-    /// that owner's sidecar running). The host calls this on its
-    /// shutdown path, after the settings watcher stopped and the
-    /// runtime's machines joined.
     /// Marks the host as shutting down (see `closing`). The host calls
     /// this before it joins the settings watcher.
     pub fn begin_shutdown(&self) {
         self.closing.store(true, Ordering::SeqCst);
     }
 
+    /// Stops the engine this host supervises (a no-op in manual mode,
+    /// or for an engine another process owns — the attached case leaves
+    /// that owner's sidecar running). The host calls this on its
+    /// shutdown path, after the settings watcher stopped and the
+    /// runtime's machines joined.
     pub fn shutdown(&self) {
         // Clone out and release the state lock before the blocking stop,
         // so status reads (`label()`, `manager()`) never wait behind it.
