@@ -476,7 +476,13 @@ impl EngineHost {
     /// shutdown path, after the settings watcher stopped and the
     /// runtime's machines joined.
     pub fn shutdown(&self) {
-        if let EngineState::Builtin { manager, .. } = &*lock(&self.state) {
+        // Clone out and release the state lock before the blocking stop,
+        // so status reads (`label()`, `manager()`) never wait behind it.
+        let manager = match &*lock(&self.state) {
+            EngineState::Builtin { manager, .. } => Some(manager.clone()),
+            EngineState::Manual { .. } => None,
+        };
+        if let Some(manager) = manager {
             manager.shutdown();
         }
     }

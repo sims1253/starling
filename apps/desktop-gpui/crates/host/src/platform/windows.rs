@@ -1075,7 +1075,12 @@ unsafe fn overlapped_io(
             if waited != WAIT_TIMEOUT {
                 let err = io::Error::last_os_error();
                 CancelIoEx(handle, &overlapped);
-                GetOverlappedResult(handle, &overlapped, &mut transferred, 1);
+                // Wait out the cancellation (the kernel owns `overlapped`
+                // and the buffer until then); an operation that completed
+                // before the cancel landed moved real bytes — report them.
+                if GetOverlappedResult(handle, &overlapped, &mut transferred, 1) != 0 {
+                    return Ok(transferred);
+                }
                 return Err(err);
             }
             let closed = shared.closed.load(Ordering::SeqCst);
