@@ -25,11 +25,11 @@
 //! the live engine state. [`watch_settings`] polls the settings file
 //! (path and interval injectable; `Settings::default_path` in
 //! production) and [`EngineHost::apply`] carries each change over:
-//! `activate` for a new model, `set_backend_override` for the CPU
-//! toggle (only on an engine this host owns — attached, the reload
-//! belongs to the owner), a fresh manual provider for an endpoint/model
+//! `activate` for a new model, a fresh manual provider for an endpoint/model
 //! change, a started supervisor for manual→builtin, and a stopped
-//! engine for builtin→manual. An in-flight recognition runs on the
+//! engine for builtin→manual. A changed CPU/automatic backend override
+//! is **not** applied live — it takes effect at the host's next start
+//! (see [`EngineHost::apply`] for why). An in-flight recognition runs on the
 //! provider (and, through it, the engine lease) it started with: the
 //! provider and its in-flight count are captured together under the
 //! slot lock, and a mode switch drains that count before it stops the
@@ -340,23 +340,26 @@ impl EngineHost {
 
     /// Carries a settings-resolved engine choice over to the running
     /// host, the host-side twin of the app's immediate engine actions:
-    /// a new `activeModel` activates the model, a changed
-    /// `backendOverride` re-selects the backend (only when this host
-    /// owns its engine — see [`forward_backend_change`]; attached, the
-    /// reload belongs to the owner), manual endpoint/model changes
+    /// a new `activeModel` activates the model, manual endpoint/model changes
     /// rebuild the server provider, manual→builtin starts a
     /// supervisor, builtin→manual stops routing to the engine and (once
     /// in-flight recognitions finished, bounded by
     /// [`ENGINE_DRAIN_GRACE`]) shuts it down. Only the deltas run: an
     /// unchanged choice costs nothing.
     ///
-    /// Within one builtin→builtin apply the backend override is carried
-    /// over **before** the model activation: a backend reload cancels
-    /// an in-progress activation, so issuing activate first would let
-    /// the override's reload cancel it and reload the *old* model while
-    /// this host already records the new one. Override first, activate
-    /// second, and the model is only recorded as current once its
-    /// activation has been issued on the post-override manager.
+    /// A changed `backendOverride` (the app's "Use CPU engine" toggle)
+    /// is recorded and reported, not applied live: it takes effect at
+    /// the host's next start. Applying it means
+    /// `EngineManager::set_backend_override`, whose reload spawns the
+    /// replacement sidecar unshared — and whether this host owns its
+    /// engine or is attached to the desktop app's is only known once the
+    /// supervisor's startup resolves, *after* a queued command was
+    /// accepted. Forwarding from here would therefore let host and app
+    /// each end up owning a separate sidecar (two models resident); the
+    /// app's own toggle reloads the engine it owns, and an attached host
+    /// follows that replacement through its attach poll. A live
+    /// host-side reload needs ownership-aware support in the engine
+    /// manager itself — recorded as a follow-up, not guessed at here.
     pub fn apply(&self, choice: EngineChoice) {
         let mut state = lock(&self.state);
         match choice {
@@ -371,28 +374,11 @@ impl EngineHost {
                     backend_override,
                     ..
                 } => {
-                    // Backend override first, model second — see the
-                    // method doc: the override's reload must not cancel
-                    // the activation this host is about to record as
-                    // served.
                     if config.backend_override != *backend_override {
-                        if forward_backend_change(
-                            manager.snapshot().active.map(|active| active.owned),
-                        ) {
-                            manager.set_backend_override(config.backend_override);
-                        } else {
-                            // Attached: the desktop app owns the sidecar.
-                            // Forwarding the reload would run it through
-                            // this manager's `run_reload`, which spawns
-                            // with `share = false` — host and app would
-                            // each end up owning a separate sidecar. The
-                            // setting is recorded here; the owner's own
-                            // toggle reloads its sidecar, and this host's
-                            // attached manager follows the replacement
-                            // through its attach poll
-                            // (`poll_attached` → `launch_model` →
-                            // `try_attach`).
-                        }
+                        eprintln!(
+                            "starling-runtime-host: the engine backend setting changed; \
+                             it applies at the host's next start"
+                        );
                         *backend_override = config.backend_override;
                     }
                     if active_model != *current_model {
@@ -518,31 +504,6 @@ fn manual_slot(endpoint: &str, model: &str) -> (Arc<dyn TranscriptionProvider>, 
 
 fn manual_label(endpoint: &str) -> String {
     format!("manual:{endpoint}")
-}
-
-/// Whether a backend-override change is this host's to run, given
-/// `manager.snapshot().active.map(|active| active.owned)`:
-///
-/// * `Some(true)` — the active engine is a sidecar this host owns, so
-///   the reload runs here (`set_backend_override` restarts the model
-///   on the newly selected backend).
-/// * `Some(false)` — this host **attached** to a sidecar another
-///   process owns (the desktop app started it): forwarding the change
-///   would run this manager's `run_reload`, which spawns its
-///   replacement with `share = false` — host and app would each own a
-///   separate sidecar. The owner reloads its own engine; this host's
-///   manager follows the replacement through its attach poll
-///   (`poll_attached` → `launch_model` → `try_attach`).
-/// * `None` — no active engine (nothing started, or still loading):
-///   forwarding only records the override and re-runs backend
-///   selection, so the engine this host starts later uses it.
-///
-/// Known limitation: a host that is attached when the override changes
-/// and later takes the engine over (the owner dies and the supervisor
-/// restarts it here) keeps the backend its manager was started with
-/// until the *next* override change names it again.
-fn forward_backend_change(active_owned: Option<bool>) -> bool {
-    active_owned.unwrap_or(true)
 }
 
 /// Spawns the host's settings watcher (#220): polls `path`'s bytes
@@ -1146,27 +1107,6 @@ mod tests {
         });
         assert_eq!(host.label(), "manual:http://127.0.0.1:9193");
         host.shutdown();
-    }
-
-    /// The backend-forwarding decision (review on #220): an override
-    /// change is forwarded to the manager only when this host owns its
-    /// active engine, or has no active engine to attach to yet —
-    /// attached, the reload (and its replacement sidecar) belong to
-    /// the owner.
-    #[test]
-    fn backend_changes_forward_only_for_owned_engines() {
-        assert!(
-            forward_backend_change(Some(true)),
-            "an engine this host owns reloads here"
-        );
-        assert!(
-            forward_backend_change(None),
-            "no active engine: the override is only recorded, nothing spawns"
-        );
-        assert!(
-            !forward_backend_change(Some(false)),
-            "an attached engine is the owner's to reload (forwarding would spawn a second, host-owned sidecar)"
-        );
     }
 
     /// Re-applying the same builtin choice runs no deltas — the
