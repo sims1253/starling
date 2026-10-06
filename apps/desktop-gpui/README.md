@@ -146,11 +146,12 @@ focuses the Starling window, so the app you dictate into keeps focus.
 
 Escape cancels the active take: nothing is transcribed or delivered, and any
 captured audio is kept in history as an interrupted take. While a take is
-active, Escape is grabbed system-wide; the rest of the time it is left
-alone. The pane says "Starting the microphone…" until real samples arrive,
-and only then "Listening closely."; a microphone that delivers nothing for
-five seconds stops the take with an error. Key repeat never starts or stops
-a take.
+active, Escape is grabbed system-wide — alone or with any of the shortcut's
+own modifiers still held, any of them cancels the take — so it is not
+delivered to other apps; the rest of the time it is left alone. The pane
+says "Starting the microphone…" until real samples arrive, and only then
+"Listening closely."; a microphone that delivers nothing for five seconds
+stops the take with an error. Key repeat never starts or stops a take.
 
 On Wayland the system-wide shortcut only reaches Starling while an X11
 (XWayland) app is focused; the XDG GlobalShortcuts portal is not wired yet.

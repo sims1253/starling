@@ -29,10 +29,14 @@ pub(crate) struct Shortcut {
     hotkey: HotKey,
     /// The text the user configured, as stored in settings.
     text: String,
-    /// The key's name in `gpui::Keystroke::key`, precomputed once:
-    /// matching a keystroke is the path every in-window key flows
-    /// through, and it must not allocate per key.
+    /// The key's name in `gpui::Keystroke::key`, and the character
+    /// Shift makes of it on a US layout (the form some platforms report
+    /// a shifted symbol key in), both precomputed once: matching a
+    /// keystroke is the path every in-window key flows through, and it
+    /// must not allocate or re-derive per key. Both follow from the
+    /// hotkey, so equal shortcuts still compare equal.
     window_key: Option<String>,
+    window_shifted: Option<&'static str>,
 }
 
 impl Shortcut {
@@ -60,10 +64,12 @@ impl Shortcut {
             ));
         }
         let window_key = gpui_key(hotkey.key);
+        let window_shifted = window_key.as_deref().and_then(us_shifted);
         Ok(Shortcut {
             hotkey,
             text: text.to_string(),
             window_key,
+            window_shifted,
         })
     }
 
@@ -108,7 +114,7 @@ impl Shortcut {
             && keystroke.modifiers.platform == mods.contains(Modifiers::SUPER);
         let shift = mods.contains(Modifiers::SHIFT);
         let plain = keystroke.key == key && keystroke.modifiers.shift == shift;
-        let shifted = shift && us_shifted(key).is_some_and(|symbol| keystroke.key == symbol);
+        let shifted = shift && self.window_shifted.is_some_and(|symbol| keystroke.key == symbol);
         others && (plain || shifted)
     }
 
@@ -117,7 +123,10 @@ impl Shortcut {
     /// a hold must end either way.
     pub(crate) fn matches_key_up(&self, keystroke: &gpui::Keystroke) -> bool {
         self.window_key.as_deref().is_some_and(|key| {
-            keystroke.key == key || us_shifted(key).is_some_and(|symbol| keystroke.key == symbol)
+            keystroke.key == key
+                || self
+                    .window_shifted
+                    .is_some_and(|symbol| keystroke.key == symbol)
         })
     }
 
@@ -260,7 +269,11 @@ pub(crate) type RawEvent = (u32, HotKeyState, Instant);
 
 /// The Escape grabs a take wants: bare Escape, plus Escape with every
 /// subset of the shortcut's modifiers — any of them may still be held
-/// (or already let go) when Escape comes.
+/// (or already let go) when Escape comes. Taking them is intended: for
+/// the duration of the take, Escape — alone or with any of the
+/// shortcut's modifiers — cancels the take and is not delivered to
+/// other apps, so a chord the desktop may reserve (Ctrl+Shift+Escape,
+/// Alt+Escape) counts as a cancel while a take is active.
 fn escape_variants(shortcut: &Shortcut) -> Vec<HotKey> {
     let mut variants = vec![HotKey::new(None, Code::Escape)];
     let mods = shortcut.modifiers();
@@ -427,7 +440,6 @@ impl GlobalShortcuts {
                     .to_string(),
             );
         }
-        let manager = GlobalHotKeyManager::new().map_err(|err| err.to_string())?;
         if HANDLER_INSTALLED.swap(true, Ordering::SeqCst) {
             return Err(
                 "a GlobalShortcuts already exists in this process; the hotkey event \
@@ -435,6 +447,17 @@ impl GlobalShortcuts {
                     .to_string(),
             );
         }
+        // The claim comes before any platform work — a second instance is
+        // refused before it builds anything — and a manager that cannot
+        // be built hands the slot back, so a failed construction does not
+        // poison the next attempt.
+        let manager = match GlobalHotKeyManager::new() {
+            Ok(manager) => manager,
+            Err(err) => {
+                HANDLER_INSTALLED.store(false, Ordering::SeqCst);
+                return Err(err.to_string());
+            }
+        };
         let (sender, events) = mpsc::channel();
         GlobalHotKeyEvent::set_event_handler(Some(move |event: GlobalHotKeyEvent| {
             let _ = sender.send((event.id(), event.state(), Instant::now()));
@@ -505,13 +528,17 @@ impl GlobalShortcuts {
     }
 
     /// Grab Escape system-wide while a take is active, release it after.
-    /// Escape with (subsets of) the shortcut's modifiers is best effort
-    /// (the platform may reserve it, like Ctrl+Shift+Escape on Windows),
-    /// and the window still sees it either way. Inline (Windows/macOS)
-    /// the arm fails on a refused bare Escape; on Linux it only posts to
-    /// the worker, so even that refusal is known asynchronously — the
-    /// worker logs it, it never reaches this call's result, and the
-    /// window still sees Escape. The grabs come up off the UI thread.
+    /// The variants are the shortcut's modifier subsets too (see
+    /// [`escape_variants`]): while a take is active, Escape — alone or
+    /// with any of the shortcut's modifiers — cancels it and is not
+    /// delivered to other apps. A variant the platform reserves
+    /// (Ctrl+Shift+Escape on Windows) is best effort — the window still
+    /// sees Escape either way. Inline (Windows/macOS) a refused bare
+    /// Escape fails the arm and releases whatever did register, so the
+    /// state never says armed on a partial set; on Linux the arm only
+    /// posts to the worker, so even that refusal is known asynchronously
+    /// — the worker logs it, it never reaches this call's result, and
+    /// the window still sees Escape. The grabs come up off the UI thread.
     pub(crate) fn arm_escape(&mut self, armed: bool, shortcut: &Shortcut) -> Result<(), String> {
         if !armed {
             let variants = std::mem::take(&mut self.escape);
@@ -519,20 +546,24 @@ impl GlobalShortcuts {
             if variants.is_empty() {
                 return Ok(());
             }
+            // Only what registered is released, on either path: a variant
+            // the platform refused at arm time was never grabbed, and
+            // unregistering it would only log an error. On Linux the
+            // not-yet-reported refusals may still ride along in `live`;
+            // the worker logs those and carries on.
             return match self.worker.as_ref() {
                 Some(worker) => worker
-                    .send(WorkerCommand::Disarm { variants })
+                    .send(WorkerCommand::Disarm { variants: live })
                     .map_err(|err| err.to_string()),
                 None => {
                     let manager = self
                         .manager
                         .as_ref()
                         .expect("the manager is inline without a worker");
-                    // One release per variant, and only the ones that
-                    // registered: `unregister_all` fails fast on a variant
-                    // the platform refused at arm time and would leave
-                    // every grab after it live. An individual failure is
-                    // logged and the rest still released.
+                    // One release per variant, never `unregister_all`: it
+                    // fails fast on a variant the platform refused at arm
+                    // time and would leave every grab after it live. An
+                    // individual failure is logged and the rest released.
                     for variant in &live {
                         if let Err(err) = manager.unregister(*variant) {
                             eprintln!("An Escape grab could not be released ({err}).");
@@ -578,6 +609,17 @@ impl GlobalShortcuts {
             }
         }
         if let Some(reason) = bare_refused {
+            // Bare Escape is the one grab the arm promises, so a refusal
+            // fails the arm: the variants that did register are released
+            // and the armed state cleared, so the next arm retries
+            // cleanly instead of sitting "armed" on a partial set.
+            for variant in &self.escape_live {
+                if let Err(err) = manager.unregister(*variant) {
+                    eprintln!("An Escape grab could not be released ({err}).");
+                }
+            }
+            self.escape.clear();
+            self.escape_live.clear();
             return Err(reason);
         }
         Ok(())
@@ -736,6 +778,29 @@ mod tests {
         let ids: std::collections::HashSet<u32> =
             variants.iter().map(|hotkey| hotkey.id()).collect();
         assert_eq!(ids.len(), variants.len());
+    }
+
+    #[test]
+    fn a_second_global_shortcuts_is_refused() {
+        // The hotkey event handler is process-wide, so a second instance
+        // would leave the first's registrations firing into a dropped
+        // sender. With a display the refusal is observed through `new`
+        // itself; headless (CI) not even the first manager can be built,
+        // so the claim `new` makes is exercised directly and restored.
+        match GlobalShortcuts::new() {
+            Ok(_shortcuts) => {
+                let err = match GlobalShortcuts::new() {
+                    Ok(_second) => panic!("a second GlobalShortcuts must be refused"),
+                    Err(err) => err,
+                };
+                assert!(err.contains("already exists"), "{err}");
+            }
+            Err(_) => {
+                assert!(!HANDLER_INSTALLED.swap(true, Ordering::SeqCst));
+                assert!(HANDLER_INSTALLED.swap(true, Ordering::SeqCst));
+                HANDLER_INSTALLED.store(false, Ordering::SeqCst);
+            }
+        }
     }
 
     #[test]
