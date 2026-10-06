@@ -30,6 +30,9 @@ use starling_runtime_host::frame::{Frame, FrameError, FrameReader, TransportErro
 use starling_runtime_host::limits::RateLimit;
 use starling_runtime_host::{serve, HostConfig, HostError, HostHandle};
 
+mod common;
+use common::endpoint_present;
+
 // --------------------------------------------------------------------- //
 // Helpers
 // --------------------------------------------------------------------- //
@@ -873,21 +876,6 @@ const FILL_EVENTS: usize = 4096;
 /// Failure bound for the fill phase. Generous on purpose (slow CI): the
 /// fill argument is the event count above, never this clock.
 const FILL_BUDGET: Duration = Duration::from_secs(90);
-
-/// Whether the endpoint still exists: the socket file on unix; on
-/// Windows (no filesystem entry — `\\.\pipe\…` lives in the kernel
-/// namespace) whether a probe still finds a server bound to the name.
-fn endpoint_present(socket: &std::path::Path) -> bool {
-    #[cfg(unix)]
-    {
-        socket.exists()
-    }
-    #[cfg(windows)]
-    {
-        starling_runtime_host::platform::probe(socket)
-            != starling_runtime_host::platform::Probe::Dead
-    }
-}
 
 /// Waits (bounded) for the endpoint socket to disappear after shutdown.
 /// The unlink is synchronous in shutdown, but a slow filesystem (or a

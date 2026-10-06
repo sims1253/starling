@@ -218,26 +218,50 @@ impl JobsActor {
         let (_, closed) = crate::channel::bounded(1);
         drop(std::mem::replace(&mut self.inbox, closed));
         self.stop_workers();
+        // Publish once more after the workers stopped: the last loop
+        // iteration's view predates the cancels, so an observer reading
+        // the shared snapshot after the runtime loop exits must not see
+        // a stale in-flight state (`Recording`/`Recognizing`) for jobs
+        // the shutdown just cancelled.
+        self.publish_view();
     }
 
     /// Shutdown: trip every job's cancel token (in-flight providers abort
     /// their requests; a provider still waiting for its backend gives up)
-    /// and join the workers, bounded by [`WORKER_SHUTDOWN_JOIN`]. Their
-    /// reports land in a closed inbox — nobody is left to receive them —
-    /// but no worker outlives the runtime while it still uses the
-    /// provider.
+    /// and join the workers, bounded by [`WORKER_SHUTDOWN_JOIN`] — one
+    /// shared budget for all of them, an intentional bound: shutdown must
+    /// not spend 5 s per wedged worker. A worker finished by (or after)
+    /// the deadline is still joined; only one wedged past it is left
+    /// detached — and never silently: the detached count and thread
+    /// names land on stderr, because a wedged worker may still be
+    /// touching provider resources (an engine sidecar) the shutdown has
+    /// already released. Their reports land in the closed inbox
+    /// above — nobody is left to receive them.
     fn stop_workers(&mut self) {
         for job in self.jobs.values() {
             job.cancel.cancel();
         }
         let deadline = Instant::now() + WORKER_SHUTDOWN_JOIN;
+        let mut detached: Vec<String> = Vec::new();
         for worker in self.workers.drain(..) {
             while !worker.is_finished() && Instant::now() < deadline {
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
             if worker.is_finished() {
                 let _ = worker.join();
+            } else {
+                // The handle drops here; the worker keeps running past
+                // the runtime, detached (and named in the report below).
+                detached.push(worker.thread().name().unwrap_or("<unnamed>").to_string());
             }
+        }
+        if !detached.is_empty() {
+            eprintln!(
+                "jobs: {} worker(s) left detached past the {WORKER_SHUTDOWN_JOIN:?} shutdown \
+                 deadline: {detached:?} — they may still be using provider resources \
+                 (an engine sidecar) the shutdown has released",
+                detached.len()
+            );
         }
     }
 
@@ -829,18 +853,24 @@ impl JobsActor {
             });
         match spawned {
             Ok(worker) => self.track_worker(worker),
-            Err(_) => {
-                self.emit(
-                    &job_id,
-                    Event::JobsFailed {
-                        reason: "worker_spawn_failed".to_string(),
-                        retryable: true,
-                    },
-                );
-                self.active.remove(&job_id);
-                self.retire(&job_id);
-            }
+            Err(_) => self.worker_spawn_failed(&job_id),
         }
+    }
+
+    /// The shared spawn-failure path of both worker kinds: the job is
+    /// emitted failed (retryable — a thread that could not spawn now may
+    /// spawn later), dropped from `active`, and retired. One helper so
+    /// the two dispatch paths cannot drift apart.
+    fn worker_spawn_failed(&mut self, job_id: &str) {
+        self.emit(
+            job_id,
+            Event::JobsFailed {
+                reason: "worker_spawn_failed".to_string(),
+                retryable: true,
+            },
+        );
+        self.active.remove(job_id);
+        self.retire(job_id);
     }
 
     fn spawn_transform_worker(
@@ -898,17 +928,7 @@ impl JobsActor {
             });
         match spawned {
             Ok(worker) => self.track_worker(worker),
-            Err(_) => {
-                self.emit(
-                    &job_id,
-                    Event::JobsFailed {
-                        reason: "worker_spawn_failed".to_string(),
-                        retryable: true,
-                    },
-                );
-                self.active.remove(&job_id);
-                self.retire(&job_id);
-            }
+            Err(_) => self.worker_spawn_failed(&job_id),
         }
     }
 

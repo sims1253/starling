@@ -1,9 +1,9 @@
 //! The `starling-runtime-host` binary: one per user session.
 //!
 //! Launch → serve until SIGINT/SIGTERM (Windows: console Ctrl+C/Break,
-//! close, logoff, shutdown) → graceful stop (`bye` to clients, machines
-//! join, the supervised engine stops, lease released, endpoint removed)
-//! → exit 0.
+//! close, logoff, shutdown — see `on_console_ctrl`) → graceful stop
+//! (`bye` to clients, machines join, the supervised engine stops, lease
+//! released, endpoint removed) → exit 0.
 //!
 //! Exit contract for launchers (stdout is one JSON line each):
 //! - `{"status":"owner",…}` then `{"status":"stopped"}` — this process
@@ -19,7 +19,7 @@ use starling_runtime_host::engine::EngineChoice;
 use starling_runtime_host::{default_data_root, platform, serve, HostConfig};
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
-/// Set once `host.shutdown()` returned — what the Windows close/logoff
+/// Set once `host.shutdown()` returned — what the Windows close/logoff/shutdown
 /// handler waits for before letting the OS end the process.
 static STOPPED: AtomicBool = AtomicBool::new(false);
 
@@ -35,11 +35,22 @@ extern "C" fn on_signal(_signal: i32) {
 /// shutdown events the OS ends the process as soon as the handler
 /// returns, so it waits (bounded, inside the OS's grace period) for the
 /// main loop to finish shutting down — lease released, engine stopped.
+/// (Windows withholds logoff/shutdown from console processes that load
+/// user32/gdi32; then, like any force-kill past the grace period, the
+/// process simply dies — still safe: the lease lock (`LockFileEx`) and
+/// every pipe handle are kernel objects the OS releases at process
+/// death, so ownership cannot be stranded; the successor's
+/// crash-recovery sweep handles the rest.)
 #[cfg(windows)]
 unsafe extern "system" fn on_console_ctrl(ctrl_type: u32) -> windows_sys::Win32::Foundation::BOOL {
-    use windows_sys::Win32::System::Console::{CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT};
+    use windows_sys::Win32::System::Console::{
+        CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT,
+    };
     SHUTDOWN.store(true, Ordering::SeqCst);
-    if matches!(ctrl_type, CTRL_CLOSE_EVENT | CTRL_LOGOFF_EVENT | CTRL_SHUTDOWN_EVENT) {
+    if matches!(
+        ctrl_type,
+        CTRL_CLOSE_EVENT | CTRL_LOGOFF_EVENT | CTRL_SHUTDOWN_EVENT
+    ) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(4500);
         while !STOPPED.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(50));
@@ -189,7 +200,6 @@ fn main() {
         };
         (choice, starling_dictation::settings::Settings::default_path().ok())
     };
-    let engine_label = engine.label();
 
     let mut host = match HostConfig::production(&root, runtime_dir) {
         Ok(config) => {
@@ -234,7 +244,10 @@ fn main() {
             "socket": host.socket_path(),
             "owner": host.owner_id(),
             "pid": std::process::id(),
-            "engine": engine_label,
+            // The effective engine, not the startup choice's label: a
+            // manual endpoint that did not validate reads as
+            // `unconfigured` here, matching what jobs actually face.
+            "engine": host.engine_label(),
         })
     );
 
@@ -242,8 +255,12 @@ fn main() {
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
     host.shutdown();
-    println!("{}", serde_json::json!({ "status": "stopped" }));
+    // Before the println: the console-close handler's bounded wait ends
+    // as soon as the flag is set, so the stop work must be accounted
+    // first — printing after it keeps the handler's remaining grace
+    // budget real.
     STOPPED.store(true, Ordering::SeqCst);
+    println!("{}", serde_json::json!({ "status": "stopped" }));
 }
 
 fn value_of(args: &mut impl Iterator<Item = String>, flag: &str) -> std::path::PathBuf {

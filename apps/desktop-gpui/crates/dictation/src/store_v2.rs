@@ -3435,6 +3435,42 @@ mod windows_lock {
         }
         Err(error)
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Empirically settles the read-only-handle question (review on
+        /// #220): the Win32 docs say `LockFileEx` wants a handle opened
+        /// with GENERIC_READ *or* GENERIC_WRITE, so a read-only handle
+        /// is *expected* to take the exclusive lock — the read-only
+        /// probe opens (`probe_leases`, the stale-temp sweep) lean on
+        /// exactly that. Pin it: the first read-only handle locks
+        /// (`Ok(true)`) and a second one on the same file answers held
+        /// (`Ok(false)`), not an error. If this ever fails on a Windows
+        /// runner, those probe opens must switch to read+write.
+        #[test]
+        fn readonly_handles_take_and_hold_the_exclusive_lock() {
+            let temp = tempfile::NamedTempFile::new().expect("a temp file");
+            let first = File::open(temp.path()).expect("the first read-only open");
+            assert!(
+                try_lock(&first).expect("the first read-only handle locks"),
+                "LockFileEx refused a GENERIC_READ-only handle"
+            );
+            let second = File::open(temp.path()).expect("the second read-only open");
+            match try_lock(&second) {
+                Ok(held) => assert!(
+                    !held,
+                    "the second read-only handle must see the first one's lock"
+                ),
+                Err(err) => {
+                    panic!(
+                        "the contended read-only probe errored instead of answering Held: {err}"
+                    )
+                }
+            }
+        }
+    }
 }
 
 /// Whether the process `pid` is still alive (#213 review) — the fallback
@@ -3474,6 +3510,11 @@ fn process_is_alive(pid: u32) -> bool {
         let mut code = 0u32;
         let queried = GetExitCodeProcess(handle, &mut code);
         CloseHandle(handle);
+        // NOTE: PID recycling and an exit code of 259 both read as
+        // "alive"; liveness here is best-effort, matching unix kill(0).
+        // It is only the fallback signal: wherever the flock /
+        // LockFileEx probe can speak (the lease and attempt markers),
+        // its answer takes precedence over this pid query.
         queried == 0 || code == STILL_ACTIVE
     }
 }
@@ -3733,71 +3774,78 @@ impl LeaseSentinel {
         leases_dir: &Path,
         timeout: std::time::Duration,
     ) -> Result<Self, StoreV2Error> {
-        #[cfg(unix)]
-        {
-            use std::os::fd::AsRawFd;
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(leases_dir.join(LEASE_SENTINEL_FILE))?;
-            let deadline = std::time::Instant::now() + timeout;
-
-            loop {
-                // SAFETY: flock(2) on an fd this guard owns and keeps open
-                // until dropped; no close or hand-off happens here.
-                let taken =
-                    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-
-                if taken == 0 {
-                    return Ok(Self { file: Some(file) });
-                }
-
-                let err = io::Error::last_os_error();
-
-                if err.raw_os_error() != Some(libc::EWOULDBLOCK) {
-                    return Err(err.into());
-                }
-
-                if std::time::Instant::now() >= deadline {
-                    return Err(StoreV2Error::Invalid(format!(
-                        "the lease sentinel stayed busy for more than {timeout:?} — another \
-                         lease acquisition appears wedged; retrying may help"
-                    )));
-                }
-
-                std::thread::sleep(std::time::Duration::from_millis(25));
-            }
-        }
-        #[cfg(windows)]
-        {
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(leases_dir.join(LEASE_SENTINEL_FILE))?;
-            let deadline = std::time::Instant::now() + timeout;
-            loop {
-                if windows_lock::try_lock(&file)? {
-                    return Ok(Self { file: Some(file) });
-                }
-                if std::time::Instant::now() >= deadline {
-                    return Err(StoreV2Error::Invalid(format!(
-                        "the lease sentinel stayed busy for more than {timeout:?} — another \
-                         lease acquisition appears wedged; retrying may help"
-                    )));
-                }
-                std::thread::sleep(std::time::Duration::from_millis(25));
-            }
-        }
+        // Only the lock call differs between the platforms (flock(2) vs
+        // `LockFileEx`); the open/retry/deadline spine is shared below
+        // so a fix on one backend cannot drift past the other. No lock
+        // primitive at all: the sentinel is a no-op.
         #[cfg(not(any(unix, windows)))]
         {
             let _ = (leases_dir, timeout);
-            Ok(Self { file: None })
+            return Ok(Self { file: None });
+        }
+        #[cfg(any(unix, windows))]
+        Self::take_with_lock(leases_dir, timeout, sentinel_try_lock)
+    }
+
+    /// The shared spine of [`Self::acquire_with_timeout`]: open the
+    /// sentinel read-write, retry `try_lock` every 25 ms until it takes
+    /// the lock or `timeout` passes, then fail with the distinct
+    /// wedged-holder error. `Ok(true)` from `try_lock` means this
+    /// handle holds the lock; `Ok(false)` means another holder;
+    /// `Err` propagates (a genuinely failed lock call is not a timeout).
+    #[cfg(any(unix, windows))]
+    fn take_with_lock(
+        leases_dir: &Path,
+        timeout: std::time::Duration,
+        mut try_lock: impl FnMut(&File) -> io::Result<bool>,
+    ) -> Result<Self, StoreV2Error> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(leases_dir.join(LEASE_SENTINEL_FILE))?;
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if try_lock(&file)? {
+                return Ok(Self { file: Some(file) });
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(StoreV2Error::Invalid(format!(
+                    "the lease sentinel stayed busy for more than {timeout:?} — another \
+                     lease acquisition appears wedged; retrying may help"
+                )));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
         }
     }
+}
+
+/// The unix sentinel lock call, in the shape
+/// [`LeaseSentinel::acquire_with_timeout`]'s shared spine wants:
+/// `Ok(true)` = locked, `Ok(false)` = another holder (EWOULDBLOCK),
+/// `Err` = anything else.
+#[cfg(unix)]
+fn sentinel_try_lock(file: &File) -> io::Result<bool> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: flock(2) on an fd this guard owns and keeps open until
+    // dropped; no close or hand-off happens here.
+    let taken = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if taken == 0 {
+        return Ok(true);
+    }
+    let err = io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
+        return Ok(false);
+    }
+    Err(err)
+}
+
+/// The Windows sentinel lock call: [`windows_lock::try_lock`] in the
+/// same shape as the unix one above.
+#[cfg(windows)]
+fn sentinel_try_lock(file: &File) -> io::Result<bool> {
+    windows_lock::try_lock(file)
 }
 
 /// Open a freshly created unique lease temp and flock it — the shared

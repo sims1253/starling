@@ -54,9 +54,8 @@ use windows_sys::Win32::Foundation::{
     CloseHandle, DuplicateHandle, GetLastError, LocalFree, BOOL, DUPLICATE_SAME_ACCESS,
     ERROR_BROKEN_PIPE, ERROR_FILE_NOT_FOUND, ERROR_IO_PENDING, ERROR_NO_DATA,
     ERROR_OPERATION_ABORTED, ERROR_PATH_NOT_FOUND, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED,
-    ERROR_PIPE_NOT_CONNECTED,
-    ERROR_SEM_TIMEOUT, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
-    WAIT_TIMEOUT,
+    ERROR_PIPE_NOT_CONNECTED, ERROR_SEM_TIMEOUT, GENERIC_READ, GENERIC_WRITE, HANDLE,
+    INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo,
@@ -79,7 +78,7 @@ use windows_sys::Win32::System::Pipes::{
     PIPE_UNLIMITED_INSTANCES, PIPE_WAIT, WaitNamedPipeW,
 };
 use windows_sys::Win32::System::Threading::{
-    CreateEventW, GetCurrentProcess, OpenProcessToken, WaitForSingleObject,
+    CreateEventW, GetCurrentProcess, OpenProcessToken, ResetEvent, WaitForSingleObject,
 };
 
 use super::{Probe, TransportConn, TransportListener};
@@ -516,7 +515,10 @@ fn acceptor_loop(
     }
 }
 
-/// An owned manual-reset event for one overlapped operation.
+/// An owned manual-reset event for one pipe connection's overlapped
+/// operations: created with the connection (or its duplicate) and
+/// reused across them — reset before each operation — instead of one
+/// `CreateEventW`/`CloseHandle` kernel-object pair per read and write.
 struct Event(HANDLE);
 
 impl Event {
@@ -640,6 +642,7 @@ fn connect_with_wait(path: &Path, wait: u32) -> io::Result<Box<dyn TransportConn
             handle: SendHandle(handle),
             server: false,
             shared: Arc::default(),
+            event: Event::new()?,
         }))
     }
 }
@@ -692,6 +695,7 @@ impl TransportListener for PipeListener {
                     handle: result?.into_handle(),
                     server: true,
                     shared: Arc::default(),
+                    event: Event::new()?,
                 };
                 // Readers run with a poll timeout (the unix accept arms
                 // the same 250 ms) so a connection the host abandoned —
@@ -771,6 +775,12 @@ pub struct PipeConn {
     /// socket-option semantics of unix (`SO_RCVTIMEO` and `shutdown(2)`
     /// act on the connection, not on one descriptor).
     shared: Arc<PipeShared>,
+    /// This connection's cached manual-reset event for its overlapped
+    /// operations: one op at a time (`Read`/`Write` take `&mut self`;
+    /// `try_clone` builds its own `PipeConn` with its own event), so
+    /// the event is reset and reused per op instead of a
+    /// `CreateEventW`/`CloseHandle` kernel-object pair on every I/O.
+    event: Event,
 }
 
 /// Per-connection state every duplicate of one pipe handle shares.
@@ -887,11 +897,14 @@ pub fn finish_pending_closes() {
 }
 
 /// How long a linger waits for its flush thread after the disconnect
-/// before cancelling the flush's synchronous I/O. The disconnect
-/// ordinarily completes a flush parked against a non-reading client,
-/// but that is not a guarantee the host's ownership hand-off may lean
-/// on: this bound keeps the linger (and its pipe handles) inside
-/// [`finish_pending_closes`]'s window even when it does not.
+/// before cancelling the flush's synchronous I/O. That a disconnect
+/// completes a flush parked against a non-reading client is
+/// **empirically pinned, not documented**: the ipc suite's
+/// `a_successor_serves_immediately_after_shutdown_with_an_unread_client`
+/// (run on the Windows CI lane) exercises exactly that shape. The
+/// bound below is the documented backstop — `CancelSynchronousIo` ends
+/// the flush whatever the disconnect did — so a linger (and its pipe
+/// handles) always stays inside [`finish_pending_closes`]'s window.
 const FLUSH_CANCEL_GRACE: Duration = Duration::from_millis(250);
 
 /// The server side of a close, off the caller's thread: flush (returns
@@ -935,16 +948,17 @@ fn schedule_disconnect(handle: HANDLE) -> io::Result<()> {
             }
             drop(disconnector);
             if let Ok(flush) = flush {
-                // Usually the disconnect above completes a flush parked
-                // against a non-reading client — but not guaranteed, and
-                // an unbounded join here is exactly how a linger (and
-                // its handles) could outlive the host's ownership
-                // hand-off. After a short grace, cancel the flush's
-                // synchronous I/O, then join: `CancelSynchronousIo`
-                // interrupts the blocking `FlushFileBuffers` on that
-                // thread (it does not close or invalidate the handle
-                // the thread flushes), so the thread unwinds and the
-                // join is prompt.
+                // In practice the disconnect above completes a flush
+                // parked against a client that stopped reading — an
+                // empirical pin (see [`FLUSH_CANCEL_GRACE`]), not a
+                // documented Win32 guarantee — so an unbounded join
+                // here is exactly how a linger (and its handles) could
+                // outlive the host's ownership hand-off. After a short
+                // grace, cancel the flush's synchronous I/O, then join:
+                // `CancelSynchronousIo` interrupts the blocking
+                // `FlushFileBuffers` on that thread (it does not close
+                // or invalidate the handle the thread flushes), so the
+                // thread unwinds and the join is prompt.
                 let deadline = Instant::now() + FLUSH_CANCEL_GRACE;
                 while !flush.is_finished() && Instant::now() < deadline {
                     std::thread::sleep(Duration::from_millis(10));
@@ -1007,9 +1021,12 @@ fn store_timeout(slot: &AtomicU64, timeout: Option<Duration>) -> io::Result<()> 
 /// bytes transferred. The kernel owns the `OVERLAPPED` and the caller's
 /// buffer until the operation completes, so every exit path that
 /// cancels also *waits* for the cancellation (`GetOverlappedResult` with
-/// bWait) before returning.
+/// bWait) before returning. `event` is the connection's cached
+/// manual-reset event — reset here, because a manual-reset event stays
+/// signaled after the operation that signaled it.
 unsafe fn overlapped_io(
     handle: HANDLE,
+    event: &Event,
     shared: &PipeShared,
     timeout: Option<Duration>,
     start: impl FnOnce(*mut OVERLAPPED) -> BOOL,
@@ -1017,7 +1034,11 @@ unsafe fn overlapped_io(
     if shared.closed.load(Ordering::SeqCst) {
         return Err(closed_error());
     }
-    let event = Event::new()?;
+    // SAFETY: resets the connection's cached event; no other operation
+    // of this connection is in flight (reads and writes take `&mut
+    // self`, and duplicates own their own event), so the reset cannot
+    // race a waiter.
+    unsafe { ResetEvent(event.0) };
     let mut overlapped: OVERLAPPED = std::mem::zeroed();
     overlapped.hEvent = event.0;
     let mut transferred = 0u32;
@@ -1077,12 +1098,14 @@ unsafe fn overlapped_io(
 // SAFETY (Send and Sync): the handle is a kernel object identifier, not
 // a pointer into this process's memory. Send: Win32 calls on one handle
 // are thread-safe. Sync: `PipeConn` is shared across the host's
-// reader/writer/closer threads through *duplicated* handle values;
-// each overlapped operation owns its own OVERLAPPED + event (on the
-// issuing thread's stack, waited to completion before return), the
-// shared state is atomics, and DisconnectNamedPipe/CancelIoEx racing
-// in-flight I/O is documented to fail those operations, not corrupt
-// state.
+// reader/writer/closer threads through *duplicated* handle values, and
+// each duplicate is its own `PipeConn` with its own cached event; a
+// single connection serializes its overlapped operations behind
+// `&mut self` (its `OVERLAPPED` lives on the issuing thread's stack,
+// waited to completion before return, and its event is reset at op
+// start), the shared state is atomics, and
+// DisconnectNamedPipe/CancelIoEx racing in-flight I/O is documented to
+// fail those operations, not corrupt state.
 unsafe impl Send for PipeConn {}
 unsafe impl Sync for PipeConn {}
 
@@ -1130,6 +1153,7 @@ impl TransportConn for PipeConn {
                 handle: SendHandle(duplicate),
                 server: self.server,
                 shared: Arc::clone(&self.shared),
+                event: Event::new()?,
             }))
         }
     }
@@ -1192,7 +1216,7 @@ impl Read for PipeConn {
         let handle = self.handle.0;
         let timeout = timeout_of(&self.shared.read_timeout_ms);
         let result = unsafe {
-            overlapped_io(handle, &self.shared, timeout, |overlapped| {
+            overlapped_io(handle, &self.event, &self.shared, timeout, |overlapped| {
                 ReadFile(handle, buf.as_mut_ptr(), len, std::ptr::null_mut(), overlapped)
             })
         };
@@ -1220,7 +1244,7 @@ impl Write for PipeConn {
         let handle = self.handle.0;
         let timeout = timeout_of(&self.shared.write_timeout_ms);
         let written = unsafe {
-            overlapped_io(handle, &self.shared, timeout, |overlapped| {
+            overlapped_io(handle, &self.event, &self.shared, timeout, |overlapped| {
                 WriteFile(handle, buf.as_ptr(), len, std::ptr::null_mut(), overlapped)
             })
         }?;

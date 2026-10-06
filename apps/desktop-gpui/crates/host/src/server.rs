@@ -174,6 +174,20 @@ impl HostHandle {
         self.engine.as_ref().and_then(|engine| engine.manager())
     }
 
+    /// The *effective* engine label right now (`builtin`,
+    /// `manual:<endpoint>`, `unconfigured` for an engine attachment
+    /// whose manual endpoint does not validate, `none` for a host
+    /// without one): what the status line reports. Unlike the startup
+    /// choice's label this one follows what actually serves — a manual
+    /// endpoint that failed validation never shows up as a serving
+    /// engine while jobs fail `no_provider_configured`.
+    pub fn engine_label(&self) -> String {
+        self.engine
+            .as_ref()
+            .map(|engine| engine.label())
+            .unwrap_or_else(|| "none".to_string())
+    }
+
     /// Graceful shutdown: no client is served past its `bye`, machines
     /// join, the lease is released, the endpoint is removed. Idempotent.
     ///

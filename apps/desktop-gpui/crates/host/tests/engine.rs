@@ -34,8 +34,17 @@ fn fixture() -> Option<PathBuf> {
             return Some(path);
         }
     }
-    let default = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../../build/native-cpu/starling-serve-contract-fixture");
+    // The repo build dir serves portable runs too: cargo names the
+    // fixture for the target OS (`.exe` on Windows), so probe the
+    // platform's name instead of silently skipping where the fixture
+    // exists next to it.
+    let build = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../../build/native-cpu");
+    let name = if cfg!(windows) {
+        "starling-serve-contract-fixture.exe"
+    } else {
+        "starling-serve-contract-fixture"
+    };
+    let default = build.join(name);
     if default.is_file() {
         return Some(default);
     }
@@ -260,15 +269,7 @@ fn jobs_run_on_the_host_owned_engine_which_outlives_its_renderer() {
         .clone();
 
     // The host started the engine itself — no renderer exists yet.
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while manager.snapshot().phase != EnginePhase::Ready {
-        assert!(
-            Instant::now() < deadline,
-            "engine never became ready: {:?}",
-            manager.snapshot()
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    wait_ready(&manager);
     let active = manager.snapshot().active.expect("a ready engine is active");
     assert!(active.owned, "the host owns the sidecar it started");
 
@@ -397,6 +398,17 @@ fn a_job_survives_the_attached_engine_dying_abruptly() {
 
     let client = connect(host.socket_path());
     record_and_submit_after(&client, "take_a", "job_a", || {
+        // Re-read right before the kill: the config restarts a dead
+        // engine on a 100 ms backoff, so the earlier snapshot could be
+        // stale — signal only the engine that is still the attached one
+        // (endpoint and pid), never a pid the supervisor already
+        // replaced (or the OS recycled).
+        let current = manager.snapshot().active.expect("engine still active");
+        assert_eq!(
+            (current.endpoint.as_str(), current.pid),
+            (attached.endpoint.as_str(), attached.pid),
+            "the sidecar was replaced before the kill"
+        );
         // SAFETY: kill(2) on the sidecar's pid; no memory is involved.
         assert_eq!(unsafe { libc::kill(attached.pid as i32, libc::SIGKILL) }, 0);
         let deadline = Instant::now() + Duration::from_secs(5);

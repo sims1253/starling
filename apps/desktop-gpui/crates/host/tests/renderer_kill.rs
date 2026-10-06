@@ -32,6 +32,9 @@ use starling_runtime::testing::{FakeCaptureSource, FakeTakeScript};
 use starling_runtime_host::client::HostClient;
 use starling_runtime_host::{serve, HostConfig};
 
+mod common;
+use common::endpoint_present;
+
 /// The renderer double (a bin target of this crate — cargo exports the
 /// built path to integration tests).
 const DOUBLE: &str = env!("CARGO_BIN_EXE_renderer-double");
@@ -208,21 +211,6 @@ impl Drop for DoubleRenderer {
         // reaped it); kill on an exited process is a no-op error.
         let _ = self.child.kill();
         let _ = self.child.wait();
-    }
-}
-
-/// Whether the endpoint still exists: the socket file on unix; on
-/// Windows (the pipe name lives in the kernel namespace) whether a
-/// probe still finds a server bound to it.
-fn endpoint_present(socket: &Path) -> bool {
-    #[cfg(unix)]
-    {
-        socket.exists()
-    }
-    #[cfg(windows)]
-    {
-        starling_runtime_host::platform::probe(socket)
-            != starling_runtime_host::platform::Probe::Dead
     }
 }
 

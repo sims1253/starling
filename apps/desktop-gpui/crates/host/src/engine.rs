@@ -54,6 +54,14 @@ pub const DEFAULT_READY_WAIT: Duration = Duration::from_secs(120);
 /// How often a waiting job re-checks the engine (and its cancel token).
 const READY_POLL: Duration = Duration::from_millis(50);
 
+/// How long the avoid-wait backs off between probes: while the only
+/// ready engine is the one a request just failed against, re-leasing
+/// every `READY_POLL` would churn lease-marker file I/O on an engine
+/// this job will not use — poll it gently instead while the
+/// supervisor's own detection (its ~2 s attach poll and restart
+/// backoff) replaces or reaps it.
+const AVOID_POLL: Duration = Duration::from_millis(250);
+
 /// How often the settings watcher polls the file: one small read, so
 /// the desktop app's engine changes are visible within a poll or two.
 pub const DEFAULT_SETTINGS_POLL: Duration = Duration::from_millis(1500);
@@ -257,12 +265,9 @@ impl EngineHost {
     }
 
     fn manual(endpoint: String, model: String) -> EngineHost {
-        let label = manual_label(&endpoint);
+        let (provider, label) = manual_slot(&endpoint, &model);
         EngineHost {
-            provider: Arc::new(SettingsProvider::new(
-                manual_provider(&endpoint, &model),
-                label,
-            )),
+            provider: Arc::new(SettingsProvider::new(provider, label)),
             state: Mutex::new(EngineState::Manual { endpoint, model }),
         }
     }
@@ -367,9 +372,11 @@ impl EngineHost {
                 }
                 // Swap first: every job submitted after this line routes
                 // to the manual provider, never to the engine a mode
-                // switch is about to stop.
-                self.provider
-                    .install(manual_provider(&endpoint, &model), manual_label(&endpoint));
+                // switch is about to stop. The label is the effective
+                // one: an endpoint that does not validate reads as
+                // `unconfigured`, not as a manual engine that serves.
+                let (provider, label) = manual_slot(&endpoint, &model);
+                self.provider.install(provider, label);
                 let previous = std::mem::replace(
                     &mut *state,
                     EngineState::Manual {
@@ -412,18 +419,22 @@ impl EngineHost {
     }
 }
 
-/// The manual provider for `endpoint`/`model`, or the honest
-/// unconfigured one when the endpoint does not validate (reported, not
-/// guessed at — the startup and the follow paths share this posture).
-fn manual_provider(endpoint: &str, model: &str) -> Arc<dyn TranscriptionProvider> {
+/// The manual provider for `endpoint`/`model` and the label that goes
+/// with it: the honest `manual:<endpoint>` when the endpoint validates,
+/// or `unconfigured` beside the honest [`UnconfiguredProvider`] when it
+/// does not (reported, not guessed at — the startup and the follow
+/// paths share this posture). The status line reads this label, so a
+/// manual endpoint that cannot serve never claims an engine is
+/// attached while jobs fail `no_provider_configured`.
+fn manual_slot(endpoint: &str, model: &str) -> (Arc<dyn TranscriptionProvider>, String) {
     match StarlingProvider::new(endpoint, model) {
-        Ok(provider) => Arc::new(provider),
+        Ok(provider) => (Arc::new(provider), manual_label(endpoint)),
         Err(err) => {
             eprintln!(
                 "starling-runtime-host: manual engine endpoint {endpoint:?} is unusable \
-                 ({err}); transcription stays unconfigured"
+                 ({err}); transcription stays unconfigured (reporting engine: unconfigured)"
             );
-            Arc::new(UnconfiguredProvider)
+            (Arc::new(UnconfiguredProvider), "unconfigured".to_string())
         }
     }
 }
@@ -559,9 +570,14 @@ fn unready_reason(phase: &EnginePhase) -> &'static str {
 /// `engine:<model id>` as a contract `safeToken`
 /// (`[A-Za-z0-9_.:+-]{1,128}`): catalog ids already fit; anything else
 /// is replaced rather than letting the completion event fail
-/// validation.
+/// validation. An id past the bound keeps its distinctness: the tail is
+/// replaced by a fold of the whole id, so two long ids sharing a prefix
+/// must not collapse into one token (that would silently corrupt
+/// completion-event analytics).
 fn backend_token(model_id: &str) -> String {
-    let mut token: String = format!("engine:{model_id}")
+    /// The contract `safeToken`'s length bound.
+    const SAFE_TOKEN_MAX: usize = 128;
+    let token: String = format!("engine:{model_id}")
         .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || "_.:+-".contains(c) {
@@ -571,8 +587,27 @@ fn backend_token(model_id: &str) -> String {
             }
         })
         .collect();
-    token.truncate(128);
+    if token.len() > SAFE_TOKEN_MAX {
+        // The token is pure ASCII by construction, so byte and char
+        // indices agree. The fold is deterministic within a process —
+        // all distinctness needs (two ids, one comparison).
+        let digest = tail_fold(&token);
+        let mut folded = token[..SAFE_TOKEN_MAX - digest.len()].to_string();
+        folded.push_str(&digest);
+        return folded;
+    }
     token
+}
+
+/// A short hex fold of the full `token`, spliced into the tail when a
+/// model id outgrows the contract's `safeToken` bound: enough bits
+/// that distinct ids stay distinct in practice, short enough to keep
+/// most of the readable prefix.
+fn tail_fold(token: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    token.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
 }
 
 impl EngineProvider {
@@ -595,11 +630,13 @@ impl EngineProvider {
                     retryable: false,
                 });
             }
+            let mut avoiding = false;
             if let Some(lease) = self.manager.lease() {
                 let identity = (lease.endpoint().to_string(), lease.pid());
                 if avoid != Some(&identity) {
                     return Ok(lease);
                 }
+                avoiding = true;
             }
             let phase = self.manager.snapshot().phase;
             // A failed engine or a missing model will not fix itself
@@ -611,7 +648,11 @@ impl EngineProvider {
                     retryable: true,
                 });
             }
-            std::thread::sleep(READY_POLL);
+            // While the only ready engine is the one being avoided,
+            // back off: every `lease()` is lease-marker file I/O on an
+            // engine this job will not use again, so poll it gently
+            // until the supervisor replaces it.
+            std::thread::sleep(if avoiding { AVOID_POLL } else { READY_POLL });
         }
     }
 }
@@ -628,11 +669,14 @@ impl TranscriptionProvider for EngineProvider {
         // provider out waits (bounded) for this count before it stops
         // the engine.
         let _busy = InFlight::on(&self.in_flight);
-        let started = Instant::now();
         let wav = Arc::new(wav);
         let mut failed_engine: Option<(String, u32)> = None;
+        // One ready-wait deadline for the whole call: the initial wait
+        // and the crash-retry wait share it, so a job never waits more
+        // than `ready_wait` in total — the documented bound — and the
+        // retry waits only for what is left of it.
+        let deadline = Instant::now() + self.ready_wait;
         loop {
-            let deadline = Instant::now() + self.ready_wait;
             let lease = match self.wait_for_lease(deadline, cancel, failed_engine.as_ref()) {
                 Ok(found) => found,
                 Err(outcome) => return outcome,
@@ -644,6 +688,11 @@ impl TranscriptionProvider for EngineProvider {
                     return ProviderOutcome::Failed { reason, retryable };
                 }
             };
+            // The clock starts when the request is issued on a held
+            // lease, not when the job arrived: `timing_ms` measures the
+            // recognition, not the engine's warm-up or a crash-retry
+            // wait.
+            let started = Instant::now();
             // The lease is held for the whole request: a model switch that
             // starts mid-request drains this engine instead of stopping it
             // under the take (#363). It drops at the end of this iteration.
@@ -687,7 +736,21 @@ mod tests {
     fn backend_tokens_fit_the_contract_pattern() {
         assert_eq!(backend_token("parakeet-v3-q8"), "engine:parakeet-v3-q8");
         assert_eq!(backend_token("we ird/id"), "engine:we_ird_id");
-        assert_eq!(backend_token(&"x".repeat(300)).len(), 128);
+        // Long ids fold their tail instead of silently truncating: the
+        // token still fits the 128-char bound, two ids sharing the
+        // whole readable prefix stay distinct, and every character
+        // stays inside the safeToken alphabet.
+        let long = backend_token(&"x".repeat(300));
+        let sibling = backend_token(&format!("{}y", "x".repeat(300)));
+        assert_eq!(long.len(), 128);
+        assert_eq!(sibling.len(), 128);
+        assert_ne!(long, sibling, "distinct ids must not collapse to one token");
+        assert!(long.starts_with("engine:"));
+        for token in [long, sibling] {
+            assert!(token
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "_.:+-".contains(c)));
+        }
     }
 
     #[test]
@@ -841,6 +904,41 @@ mod tests {
             }
         }
         assert_eq!(settings.label(), "unconfigured");
+    }
+
+    /// The effective engine label (review on #220): a manual endpoint
+    /// that does not validate reads as `unconfigured` — at startup and
+    /// after a settings change — so the status line never claims a
+    /// manual engine serves while jobs fail `no_provider_configured`.
+    /// A later change to a usable endpoint installs it.
+    #[test]
+    fn an_unusable_manual_endpoint_reports_unconfigured() {
+        let mut runtime = starling_runtime::RuntimeConfig::default();
+        let host = attach(
+            EngineChoice::Manual {
+                endpoint: "not a valid endpoint".into(),
+                model: "parakeet".into(),
+            },
+            &mut runtime,
+        )
+        .expect("manual mode attaches");
+        assert_eq!(host.label(), "unconfigured");
+
+        // The follow path keeps the same honesty: another unusable
+        // endpoint (a scheme the client rejects) stays unconfigured.
+        host.apply(EngineChoice::Manual {
+            endpoint: "ftp://127.0.0.1:1".into(),
+            model: "parakeet".into(),
+        });
+        assert_eq!(host.label(), "unconfigured");
+
+        // And a usable endpoint takes over.
+        host.apply(EngineChoice::Manual {
+            endpoint: "http://127.0.0.1:8181".into(),
+            model: "parakeet".into(),
+        });
+        assert_eq!(host.label(), "manual:http://127.0.0.1:8181");
+        host.shutdown();
     }
 
     /// An engine-less config over a temp dir (no engine staged, no

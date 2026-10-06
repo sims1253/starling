@@ -64,7 +64,7 @@ jobs:
   # runner (deliberate for this PR — see the notice step); the
   # job-over-the-transport path itself stays covered by the ipc
   # suite's FakeProvider tests.
-  windows-check:
+  windows-test:
     name: cargo test starling-runtime-host (windows)
     runs-on: windows-2025
     timeout-minutes: 45
