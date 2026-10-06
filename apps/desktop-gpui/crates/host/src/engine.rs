@@ -557,24 +557,34 @@ pub fn watch_settings(
                     if stop.load(Ordering::SeqCst) {
                         return;
                     }
-                    std::thread::sleep(FOLLOW_SLICE.min(deadline - Instant::now()));
+                    std::thread::sleep(
+                        FOLLOW_SLICE.min(deadline.saturating_duration_since(Instant::now())),
+                    );
                 }
                 let current = std::fs::read(&path).ok();
                 if current != last {
-                    last = current.clone();
                     let Some(bytes) = current.as_deref() else {
+                        last = None;
                         continue;
                     };
                     // Apply only what the file stably says: a deletion
                     // racing between the two reads must not read as a
                     // choice (the missing file is not "the user chose
-                    // the defaults").
+                    // the defaults"). An unstable read leaves `last`
+                    // untouched, so the next poll retries these bytes
+                    // instead of treating them as already seen.
                     if std::fs::read(&path).ok().as_deref() != Some(bytes) {
                         continue;
                     }
+                    last = current.clone();
                     match Settings::from_json_bytes(bytes) {
                         Some(settings) => match EngineChoice::from_settings(&settings) {
-                            Ok(choice) => host.apply(choice),
+                            Ok(choice) => {
+                                // Valid again: a later recurrence of a
+                                // bad content is reported anew.
+                                reported_bad = None;
+                                host.apply(choice);
+                            }
                             Err(err) => eprintln!(
                                 "starling-runtime-host: engine settings at {}: {err}; \
                                  the engine stays as it is",
