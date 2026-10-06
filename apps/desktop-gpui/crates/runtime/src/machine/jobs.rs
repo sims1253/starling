@@ -231,8 +231,8 @@ impl JobsActor {
     /// and join the workers, bounded by [`WORKER_SHUTDOWN_JOIN`] — one
     /// shared budget for all of them, an intentional bound: shutdown must
     /// not spend 5 s per wedged worker. A worker finished by (or after)
-    /// the deadline is still joined; only one wedged past it is left
-    /// detached — and never silently: the detached count and thread
+    /// the deadline is still joined; every worker still running past it
+    /// is left detached (there can be several) — and never silently: the detached count and thread
     /// names land on stderr, because a wedged worker may still be
     /// touching provider resources (an engine sidecar) the shutdown has
     /// already released. Their reports land in the closed inbox

@@ -483,7 +483,8 @@ fn a_manual_endpoint_change_is_applied_without_a_restart() {
         path.clone(),
         Duration::from_millis(20),
         Arc::clone(&stop),
-    );
+    )
+    .expect("watcher spawns");
 
     settings.endpoint = "http://127.0.0.1:9199".into();
     settings.save(&path).unwrap();
@@ -546,7 +547,8 @@ fn a_torn_settings_write_keeps_the_last_engine_choice() {
         path.clone(),
         Duration::from_millis(20),
         Arc::clone(&stop),
-    );
+    )
+    .expect("watcher spawns");
 
     // Truncated mid-document.
     std::fs::write(&path, r#"{"engine":{"mo"#).unwrap();

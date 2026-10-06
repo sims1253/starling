@@ -278,6 +278,10 @@ enum EngineState {
     Builtin {
         manager: EngineManager,
         in_flight: Arc<AtomicUsize>,
+        /// Set just before a mode switch stops `manager`: a recognition
+        /// still waiting for a lease then fails at once instead of
+        /// polling a stopped engine for its whole ready wait.
+        stopped: Arc<AtomicBool>,
         active_model: Option<String>,
         backend_override: Option<Backend>,
     },
@@ -293,6 +297,7 @@ impl EngineHost {
         // on it): the engine provider itself stays counter-free.
         let in_flight = Arc::new(AtomicUsize::new(0));
         let provider = EngineProvider::new(manager.clone());
+        let stopped = provider.stopped_flag();
         EngineHost {
             provider: Arc::new(SettingsProvider::new(
                 Arc::new(provider),
@@ -302,6 +307,7 @@ impl EngineHost {
             state: Mutex::new(EngineState::Builtin {
                 manager,
                 in_flight,
+                stopped,
                 active_model,
                 backend_override: config.backend_override,
             }),
@@ -405,14 +411,17 @@ impl EngineHost {
                     // switch will drain on).
                     let manager = EngineManager::start(config.clone(), active_model.clone());
                     let in_flight = Arc::new(AtomicUsize::new(0));
+                    let provider = EngineProvider::new(manager.clone());
+                    let stopped = provider.stopped_flag();
                     self.provider.install(
-                        Arc::new(EngineProvider::new(manager.clone())),
+                        Arc::new(provider),
                         "builtin".to_string(),
                         Some(Arc::clone(&in_flight)),
                     );
                     *state = EngineState::Builtin {
                         manager,
                         in_flight,
+                        stopped,
                         active_model,
                         backend_override: config.backend_override,
                     };
@@ -452,7 +461,10 @@ impl EngineHost {
                 // host's shutdown never wait out the grace behind it.
                 drop(state);
                 if let EngineState::Builtin {
-                    manager, in_flight, ..
+                    manager,
+                    in_flight,
+                    stopped,
+                    ..
                 } = previous
                 {
                     // In-flight recognitions hold their provider (and its
@@ -464,6 +476,10 @@ impl EngineHost {
                     while in_flight.load(Ordering::SeqCst) > 0 && Instant::now() < deadline {
                         std::thread::sleep(FOLLOW_SLICE);
                     }
+                    // A recognition still past the grace is waiting for a
+                    // lease (or a crash retry): tell it the engine is
+                    // going away so it fails now, not after its ready wait.
+                    stopped.store(true, Ordering::SeqCst);
                     manager.shutdown();
                 }
             }
@@ -539,7 +555,7 @@ pub fn watch_settings(
     path: PathBuf,
     poll: Duration,
     stop: Arc<AtomicBool>,
-) -> std::thread::JoinHandle<()> {
+) -> std::io::Result<std::thread::JoinHandle<()>> {
     std::thread::Builder::new()
         .name("starling-host-settings".to_string())
         .spawn(move || {
@@ -609,7 +625,6 @@ pub fn watch_settings(
                 }
             }
         })
-        .expect("host thread spawn")
 }
 
 /// The jobs machine's provider over the host-owned engine: each
@@ -626,6 +641,9 @@ pub fn watch_settings(
 pub struct EngineProvider {
     manager: EngineManager,
     ready_wait: Duration,
+    /// Set when the host stops `manager` for good (a switch away from
+    /// the builtin engine): lease waits end at once.
+    stopped: Arc<AtomicBool>,
 }
 
 impl EngineProvider {
@@ -633,7 +651,14 @@ impl EngineProvider {
         EngineProvider {
             manager,
             ready_wait: DEFAULT_READY_WAIT,
+            stopped: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// The flag that tells this provider its engine was stopped for
+    /// good.
+    fn stopped_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.stopped)
     }
 
     /// Overrides how long a job waits for a ready engine.
@@ -735,6 +760,14 @@ impl EngineProvider {
                 return Err(ProviderOutcome::Failed {
                     reason: "cancelled".to_string(),
                     retryable: false,
+                });
+            }
+            if self.stopped.load(Ordering::SeqCst) {
+                // The host switched away from this engine: the take is
+                // durable and a retry routes to the new choice.
+                return Err(ProviderOutcome::Failed {
+                    reason: "engine_unavailable".to_string(),
+                    retryable: true,
                 });
             }
             let mut avoiding = false;

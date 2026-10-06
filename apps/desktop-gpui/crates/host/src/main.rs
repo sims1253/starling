@@ -196,6 +196,21 @@ fn main() {
         (EngineChoice::None, None)
     } else {
         let settings = starling_dictation::settings::Settings::load_or_default();
+        // `load_or_default` falls back to the defaults for a file that is
+        // not JSON; say so, rather than silently starting the bundled
+        // engine on a corrupt file (the watcher then applies the file's
+        // real choice once it parses).
+        if let Ok(path) = starling_dictation::settings::Settings::default_path() {
+            if let Ok(bytes) = std::fs::read(&path) {
+                if starling_dictation::settings::Settings::from_json_bytes(&bytes).is_none() {
+                    eprintln!(
+                        "starling-runtime-host: settings at {} are not valid JSON; \
+                         starting with the default engine settings",
+                        path.display()
+                    );
+                }
+            }
+        }
         let choice = match EngineChoice::from_settings(&settings) {
             Ok(engine) => engine,
             Err(err) => {

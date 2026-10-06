@@ -549,12 +549,21 @@ pub fn serve(config: HostConfig) -> Result<HostHandle, HostError> {
     // the engine stop — it never applies a change to a host that is
     // going away.
     if let (Some(engine), Some(settings_path)) = (&engine, config.settings_path.as_ref()) {
-        threads.push(crate::engine::watch_settings(
+        match crate::engine::watch_settings(
             Arc::clone(engine),
             settings_path.clone(),
             config.settings_poll,
             Arc::clone(&watch_stop),
-        ));
+        ) {
+            Ok(watcher) => threads.push(watcher),
+            // No thread for the watcher: degrade to the startup choice
+            // (the `--engine` posture without a settings path) rather
+            // than abort a host that otherwise serves.
+            Err(err) => eprintln!(
+                "starling-runtime-host: cannot start the settings watcher ({err}); \
+                 the engine stays as configured at startup"
+            ),
+        }
     }
 
     Ok(HostHandle {
