@@ -692,7 +692,14 @@ impl StarlingApp {
             return false;
         }
         let may_start = !self.settings_open;
-        self.activation_input(|machine| machine.press_in_window(Instant::now(), may_start), cx);
+        // A window press while the key is down is a repeat — unless the
+        // window can never see this shortcut's release (a Cmd chord on
+        // macOS), where it keeps the system path's lost-release recovery.
+        if self.shortcut.window_reports_release() {
+            self.activation_input(|machine| machine.press_in_window(Instant::now(), may_start), cx);
+        } else {
+            self.activation_input(|machine| machine.press(Instant::now(), may_start), cx);
+        }
         true
     }
 

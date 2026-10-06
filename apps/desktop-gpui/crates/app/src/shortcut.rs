@@ -144,6 +144,15 @@ impl Shortcut {
         })
     }
 
+    /// Whether the window reports this shortcut's release. AppKit sends no
+    /// `keyUp` for a key pressed while Cmd is held (and gpui synthesizes
+    /// none), so on macOS a Cmd chord seen in the window never reads as
+    /// released: such a press must keep the time-based lost-release
+    /// recovery instead of counting every later press as a repeat.
+    pub(crate) fn window_reports_release(&self) -> bool {
+        !(cfg!(target_os = "macos") && self.hotkey.mods.contains(Modifiers::SUPER))
+    }
+
     pub(crate) fn modifiers(&self) -> Modifiers {
         self.hotkey.mods
     }
@@ -929,6 +938,14 @@ mod tests {
         assert!(Shortcut::parse("Ctrl").is_err());
         assert!(Shortcut::parse("Ctrl+Shift+Banana").is_err());
         assert!(Shortcut::parse("Ctrl+A+B").is_err());
+    }
+
+    #[test]
+    fn only_a_macos_cmd_chord_loses_its_window_release() {
+        let cmd = Shortcut::parse("Super+Shift+Space").unwrap();
+        assert_eq!(cmd.window_reports_release(), !cfg!(target_os = "macos"));
+        assert!(Shortcut::parse("Ctrl+Shift+Space").unwrap().window_reports_release());
+        assert!(Shortcut::parse("F9").unwrap().window_reports_release());
     }
 
     #[test]
