@@ -3363,16 +3363,114 @@ fn try_flock_exclusive(file: &File) -> io::Result<FlockEvidence> {
     Err(error)
 }
 
-/// Without flock there is no lock to ask (#213 review): the probe answers
-/// [`FlockEvidence::Unknown`] and the marker's recorded PID decides
-/// ownership instead (see [`attempt_owned_from`]). Every desktop target
-/// this port builds today is unix; on flock-less platforms foreign PIDs
-/// read as dead so crash-orphaned attempts stay sweepable — the
-/// multi-instance spare is then unix-only, matching what the reference
-/// can guarantee without a lock manager.
-#[cfg(not(unix))]
+/// Windows: the same probe with `LockFileEx` (exclusive, fail
+/// immediately) — a lock on the file object that the OS releases when
+/// the holding handle closes or its process dies, which is exactly the
+/// flock contract the lease and attempt markers rely on (#220: without
+/// it a second host broke a live owner's lease). The locked byte lies
+/// far past EOF on purpose: Windows byte-range locks are mandatory, and
+/// locking the record's own bytes would stop every prober from reading
+/// the identity it needs.
+#[cfg(windows)]
+fn try_flock_exclusive(file: &File) -> io::Result<FlockEvidence> {
+    Ok(if windows_lock::try_lock(file)? {
+        FlockEvidence::Free
+    } else {
+        FlockEvidence::Held
+    })
+}
+
+/// Without any lock primitive there is nothing to ask (#213 review): the
+/// probe answers [`FlockEvidence::Unknown`] and the marker's recorded PID
+/// decides ownership instead (see [`attempt_owned_from`]).
+#[cfg(not(any(unix, windows)))]
 fn try_flock_exclusive(_file: &File) -> io::Result<FlockEvidence> {
     Ok(FlockEvidence::Unknown)
+}
+
+/// The Windows lock primitive behind [`try_flock_exclusive`] and the
+/// lease sentinel.
+#[cfg(windows)]
+mod windows_lock {
+    use std::fs::File;
+    use std::io;
+    use std::os::windows::io::AsRawHandle;
+
+    use windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION;
+    use windows_sys::Win32::Storage::FileSystem::{
+        LockFileEx, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
+    };
+    use windows_sys::Win32::System::IO::OVERLAPPED;
+
+    /// High dword of the locked offset (2^62): far past any real file
+    /// content, so the mandatory lock never covers bytes anyone reads.
+    const LOCK_OFFSET_HIGH: u32 = 0x4000_0000;
+
+    /// `Ok(true)` = this handle now holds the lock; `Ok(false)` = another
+    /// handle (this process or another) holds it.
+    pub(super) fn try_lock(file: &File) -> io::Result<bool> {
+        // SAFETY: a zeroed OVERLAPPED is valid input; `std` opens files
+        // synchronously, so LockFileEx with FAIL_IMMEDIATELY completes
+        // before returning and the OVERLAPPED (only carrying the offset)
+        // is not referenced afterwards. The handle stays open for the
+        // call (borrowed from `file`).
+        let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+        overlapped.Anonymous.Anonymous.OffsetHigh = LOCK_OFFSET_HIGH;
+        let locked = unsafe {
+            LockFileEx(
+                file.as_raw_handle(),
+                LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+                0,
+                1,
+                0,
+                &mut overlapped,
+            )
+        };
+        if locked != 0 {
+            return Ok(true);
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(ERROR_LOCK_VIOLATION as i32) {
+            return Ok(false);
+        }
+        Err(error)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Empirically settles the read-only-handle question (review on
+        /// #220): the Win32 docs say `LockFileEx` wants a handle opened
+        /// with GENERIC_READ *or* GENERIC_WRITE, so a read-only handle
+        /// is *expected* to take the exclusive lock — the read-only
+        /// probe opens (`probe_leases`, the stale-temp sweep) lean on
+        /// exactly that. Pin it: the first read-only handle locks
+        /// (`Ok(true)`) and a second one on the same file answers held
+        /// (`Ok(false)`), not an error. If this ever fails on a Windows
+        /// runner, those probe opens must switch to read+write.
+        #[test]
+        fn readonly_handles_take_and_hold_the_exclusive_lock() {
+            let temp = tempfile::NamedTempFile::new().expect("a temp file");
+            let first = File::open(temp.path()).expect("the first read-only open");
+            assert!(
+                try_lock(&first).expect("the first read-only handle locks"),
+                "LockFileEx refused a GENERIC_READ-only handle"
+            );
+            let second = File::open(temp.path()).expect("the second read-only open");
+            match try_lock(&second) {
+                Ok(held) => assert!(
+                    !held,
+                    "the second read-only handle must see the first one's lock"
+                ),
+                Err(err) => {
+                    panic!(
+                        "the contended read-only probe errored instead of answering Held: {err}"
+                    )
+                }
+            }
+        }
+    }
 }
 
 /// Whether the process `pid` is still alive (#213 review) — the fallback
@@ -3389,7 +3487,39 @@ fn process_is_alive(pid: u32) -> bool {
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-/// Without a std primitive to ask the OS about a foreign PID (#213
+/// Windows: open the process for a limited query and read its exit
+/// code. A pid that cannot be opened because it belongs to someone else
+/// (ACCESS_DENIED) exists; any other open failure means no such
+/// process. A query that fails on an opened process is not proof of
+/// death — presumed alive, never break what cannot be proven dead.
+#[cfg(windows)]
+fn process_is_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ACCESS_DENIED};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    /// `STILL_ACTIVE`: the exit code a running process reports.
+    const STILL_ACTIVE: u32 = 259;
+    // SAFETY: plain Win32 calls with owned out-parameters; the handle is
+    // closed on every path that opened it.
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return GetLastError() == ERROR_ACCESS_DENIED;
+        }
+        let mut code = 0u32;
+        let queried = GetExitCodeProcess(handle, &mut code);
+        CloseHandle(handle);
+        // NOTE: PID recycling and an exit code of 259 both read as
+        // "alive"; liveness here is best-effort, matching unix kill(0).
+        // It is only the fallback signal: wherever the flock /
+        // LockFileEx probe can speak (the lease and attempt markers),
+        // its answer takes precedence over this pid query.
+        queried == 0 || code == STILL_ACTIVE
+    }
+}
+
+/// Without a primitive to ask the OS about a foreign PID (#213
 /// review), it is presumed dead: this process's OWN attempts are spared
 /// by the in-process registry before any marker is probed, so the only
 /// markers read here belong to other processes — unknowable liveness
@@ -3398,7 +3528,7 @@ fn process_is_alive(pid: u32) -> bool {
 /// platform can have its attempt interrupted, the same degradation the
 /// Electron reference accepts without a lock manager; unix keeps the
 /// full cross-process guarantee via flock.
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn process_is_alive(_pid: u32) -> bool {
     false
 }
@@ -3632,7 +3762,7 @@ impl LeaseSentinel {
     }
 
     /// Take the sentinel: a non-blocking flock retried under a BOUNDED
-    /// wait (flock(2) on unix; no-op elsewhere). The sentinel coordinates
+    /// wait (flock(2) on unix, `LockFileEx` on Windows; no-op elsewhere). The sentinel coordinates
     /// probe-and-publish only — it is not a liveness primitive — so a
     /// holder wedged mid-acquisition (hung fsync, stuck disk) must not be
     /// able to block every other process's lease acquisition, and
@@ -3644,49 +3774,78 @@ impl LeaseSentinel {
         leases_dir: &Path,
         timeout: std::time::Duration,
     ) -> Result<Self, StoreV2Error> {
-        #[cfg(unix)]
-        {
-            use std::os::fd::AsRawFd;
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(leases_dir.join(LEASE_SENTINEL_FILE))?;
-            let deadline = std::time::Instant::now() + timeout;
-
-            loop {
-                // SAFETY: flock(2) on an fd this guard owns and keeps open
-                // until dropped; no close or hand-off happens here.
-                let taken =
-                    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-
-                if taken == 0 {
-                    return Ok(Self { file: Some(file) });
-                }
-
-                let err = io::Error::last_os_error();
-
-                if err.raw_os_error() != Some(libc::EWOULDBLOCK) {
-                    return Err(err.into());
-                }
-
-                if std::time::Instant::now() >= deadline {
-                    return Err(StoreV2Error::Invalid(format!(
-                        "the lease sentinel stayed busy for more than {timeout:?} — another \
-                         lease acquisition appears wedged; retrying may help"
-                    )));
-                }
-
-                std::thread::sleep(std::time::Duration::from_millis(25));
-            }
-        }
-        #[cfg(not(unix))]
+        // Only the lock call differs between the platforms (flock(2) vs
+        // `LockFileEx`); the open/retry/deadline spine is shared below
+        // so a fix on one backend cannot drift past the other. No lock
+        // primitive at all: the sentinel is a no-op.
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = (leases_dir, timeout);
-            Ok(Self { file: None })
+            return Ok(Self { file: None });
+        }
+        #[cfg(any(unix, windows))]
+        Self::take_with_lock(leases_dir, timeout, sentinel_try_lock)
+    }
+
+    /// The shared spine of [`Self::acquire_with_timeout`]: open the
+    /// sentinel read-write, retry `try_lock` every 25 ms until it takes
+    /// the lock or `timeout` passes, then fail with the distinct
+    /// wedged-holder error. `Ok(true)` from `try_lock` means this
+    /// handle holds the lock; `Ok(false)` means another holder;
+    /// `Err` propagates (a genuinely failed lock call is not a timeout).
+    #[cfg(any(unix, windows))]
+    fn take_with_lock(
+        leases_dir: &Path,
+        timeout: std::time::Duration,
+        mut try_lock: impl FnMut(&File) -> io::Result<bool>,
+    ) -> Result<Self, StoreV2Error> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(leases_dir.join(LEASE_SENTINEL_FILE))?;
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if try_lock(&file)? {
+                return Ok(Self { file: Some(file) });
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(StoreV2Error::Invalid(format!(
+                    "the lease sentinel stayed busy for more than {timeout:?} — another \
+                     lease acquisition appears wedged; retrying may help"
+                )));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
         }
     }
+}
+
+/// The unix sentinel lock call, in the shape
+/// [`LeaseSentinel::acquire_with_timeout`]'s shared spine wants:
+/// `Ok(true)` = locked, `Ok(false)` = another holder (EWOULDBLOCK),
+/// `Err` = anything else.
+#[cfg(unix)]
+fn sentinel_try_lock(file: &File) -> io::Result<bool> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: flock(2) on an fd this guard owns and keeps open until
+    // dropped; no close or hand-off happens here.
+    let taken = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if taken == 0 {
+        return Ok(true);
+    }
+    let err = io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
+        return Ok(false);
+    }
+    Err(err)
+}
+
+/// The Windows sentinel lock call: [`windows_lock::try_lock`] in the
+/// same shape as the unix one above.
+#[cfg(windows)]
+fn sentinel_try_lock(file: &File) -> io::Result<bool> {
+    windows_lock::try_lock(file)
 }
 
 /// Open a freshly created unique lease temp and flock it — the shared

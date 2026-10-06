@@ -6,7 +6,9 @@
 //! two owners: a second host (process or in-process) against a live
 //! owner answers `already-running` and exits 0.
 
-#![cfg(unix)]
+// Portable except where a test needs a socket *file* (the stale-file
+// takeover, a squatting listener, a non-socket file at the endpoint) —
+// those are gated individually; the pipe namespace has no residue.
 
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -31,6 +33,8 @@ impl ChildHost {
         // streams nobody drains can deadlock a chatty child on the OS
         // pipe buffer.
         let child = Command::new(BIN)
+            // Never the user's real engine settings/dirs in a test.
+            .args(["--engine", "none"])
             .arg("--root")
             .arg(root)
             .arg("--runtime-dir")
@@ -132,6 +136,7 @@ fn a_killed_host_is_taken_over_by_the_next_one() {
     // happens — the lease's flock releases because the OS does it.
     first.child.kill().expect("SIGKILL the host");
     let _ = first.child.wait();
+    #[cfg(unix)]
     assert!(
         socket.exists(),
         "the killed host leaves its socket file behind (the stale-owner case)"
@@ -168,6 +173,8 @@ fn a_second_host_binary_reports_already_running_and_exits_zero() {
     // of reporting already-running and exiting) must fail this test at
     // the deadline, not hang the suite until the job timeout.
     let mut child = Command::new(BIN)
+        // Never the user's real engine settings/dirs in a test.
+        .args(["--engine", "none"])
         .arg("--root")
         .arg(root.path())
         .arg("--runtime-dir")
@@ -269,6 +276,7 @@ fn an_unanswerable_lease_refuses_ownership_and_names_the_wedge() {
 /// The ownership-ladder refusal the binary encodes, exercised in-process
 /// (fast): a live foreign owner makes the second serve() a client, and a
 /// socket answering without the lease makes binding refuse.
+#[cfg(unix)] // binds a squatting UnixListener
 #[test]
 fn a_live_foreign_server_without_the_lease_is_refused() {
     let root = tempfile::tempdir().unwrap();
@@ -309,6 +317,7 @@ fn a_live_foreign_server_without_the_lease_is_refused() {
 /// removed and rebound (already covered by the kill test), and a socket
 /// file that was never a socket is refused honestly rather than crashed
 /// on.
+#[cfg(unix)] // a regular file at a socket path
 #[test]
 fn a_non_socket_file_at_the_endpoint_is_refused_not_crashed() {
     let root = tempfile::tempdir().unwrap();
@@ -339,10 +348,24 @@ fn the_binary_documents_its_interface() {
     assert_eq!(output.status.code(), Some(0), "--help is not an error");
     let help = String::from_utf8_lossy(&output.stdout);
     assert!(help.contains("--root"), "{help}");
+    assert!(help.contains("--engine"), "{help}");
     assert!(help.contains("--runtime-dir"), "{help}");
 
     let output = Command::new(BIN).arg("--bogus").output().unwrap();
     assert_eq!(output.status.code(), Some(2), "a usage error exits 2");
     let usage = String::from_utf8_lossy(&output.stderr);
     assert!(usage.contains("--bogus"), "{usage}");
+
+    // The engine source is a closed set: a typo is a usage error, never
+    // a silent fallback to (or away from) the user's engine.
+    let output = Command::new(BIN)
+        .args(["--engine", "bundled"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2), "an unknown engine source exits 2");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("--engine takes settings or none"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

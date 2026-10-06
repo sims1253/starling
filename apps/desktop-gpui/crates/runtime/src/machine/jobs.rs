@@ -152,7 +152,18 @@ pub struct JobsActor {
     /// `Completed`/`Failed`/... instead of snapping back to `Idle`.
     retired_state: String,
     retired_violations: Vec<String>,
+    /// Join handles of spawned workers (finished ones pruned on each
+    /// spawn), so shutdown can cancel and wait for the in-flight ones
+    /// instead of leaving them running past the runtime — and past the
+    /// provider resources (an engine sidecar) their host then releases.
+    workers: Vec<std::thread::JoinHandle<()>>,
 }
+
+/// How long [`JobsActor::run`]'s shutdown waits for cancelled workers to
+/// return. A provider honoring its cancel token returns within one poll;
+/// past the bound a wedged worker is left detached rather than holding
+/// the whole runtime shutdown hostage.
+const WORKER_SHUTDOWN_JOIN: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl JobsActor {
     #[allow(clippy::too_many_arguments)]
@@ -183,6 +194,7 @@ impl JobsActor {
             latest: None,
             retired_state: "Idle".to_string(),
             retired_violations: Vec::new(),
+            workers: Vec::new(),
         }
     }
 
@@ -198,6 +210,66 @@ impl JobsActor {
             }
             self.publish_view();
         }
+        // Close the inbox first: a worker parked delivering a report
+        // into a full queue is woken by the receiver going away
+        // (`send_blocking` reports Closed) instead of holding the join
+        // below for its whole budget. The swapped-in receiver is closed
+        // already — nothing will ever be read again.
+        let (_, closed) = crate::channel::bounded(1);
+        drop(std::mem::replace(&mut self.inbox, closed));
+        self.stop_workers();
+        // Publish once more after the workers stopped, so the snapshot
+        // reflects the final bookkeeping. Cancelling a token does not move
+        // a job's state machine (only a delivered worker report does, and
+        // the inbox is closed), so jobs cancelled here may still read as
+        // in flight; nothing consumes the view once the runtime is down.
+        self.publish_view();
+    }
+
+    /// Shutdown: trip every job's cancel token (in-flight providers abort
+    /// their requests; a provider still waiting for its backend gives up)
+    /// and join the workers, bounded by [`WORKER_SHUTDOWN_JOIN`] — one
+    /// shared budget for all of them, an intentional bound: shutdown must
+    /// not spend 5 s per wedged worker. A worker finished by (or after)
+    /// the deadline is still joined; every worker still running past it
+    /// is left detached (there can be several) — and never silently: the detached count and thread
+    /// names land on stderr, because a wedged worker may still be
+    /// touching provider resources (an engine sidecar) the shutdown has
+    /// already released. Their reports land in the closed inbox
+    /// above — nobody is left to receive them.
+    fn stop_workers(&mut self) {
+        for job in self.jobs.values() {
+            job.cancel.cancel();
+        }
+        let deadline = Instant::now() + WORKER_SHUTDOWN_JOIN;
+        let mut detached: Vec<String> = Vec::new();
+        for worker in self.workers.drain(..) {
+            while !worker.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            if worker.is_finished() {
+                let _ = worker.join();
+            } else {
+                // The handle drops here; the worker keeps running past
+                // the runtime, detached (and named in the report below).
+                detached.push(worker.thread().name().unwrap_or("<unnamed>").to_string());
+            }
+        }
+        if !detached.is_empty() {
+            eprintln!(
+                "jobs: {} worker(s) left detached past the {WORKER_SHUTDOWN_JOIN:?} shutdown \
+                 deadline: {detached:?} — they may still be using provider resources \
+                 (an engine sidecar) the shutdown has released",
+                detached.len()
+            );
+        }
+    }
+
+    /// Keeps a spawned worker's handle for shutdown, dropping the
+    /// handles of workers that already finished.
+    fn track_worker(&mut self, worker: std::thread::JoinHandle<()>) {
+        self.workers.retain(|worker| !worker.is_finished());
+        self.workers.push(worker);
     }
 
     fn publish_view(&self) {
@@ -779,17 +851,26 @@ impl JobsActor {
                     })),
                 }
             });
-        if spawned.is_err() {
-            self.emit(
-                &job_id,
-                Event::JobsFailed {
-                    reason: "worker_spawn_failed".to_string(),
-                    retryable: true,
-                },
-            );
-            self.active.remove(&job_id);
-            self.retire(&job_id);
+        match spawned {
+            Ok(worker) => self.track_worker(worker),
+            Err(_) => self.worker_spawn_failed(&job_id),
         }
+    }
+
+    /// The shared spawn-failure path of both worker kinds: the job is
+    /// emitted failed (retryable — a thread that could not spawn now may
+    /// spawn later), dropped from `active`, and retired. One helper so
+    /// the two dispatch paths cannot drift apart.
+    fn worker_spawn_failed(&mut self, job_id: &str) {
+        self.emit(
+            job_id,
+            Event::JobsFailed {
+                reason: "worker_spawn_failed".to_string(),
+                retryable: true,
+            },
+        );
+        self.active.remove(job_id);
+        self.retire(job_id);
     }
 
     fn spawn_transform_worker(
@@ -845,16 +926,9 @@ impl JobsActor {
                     })),
                 }
             });
-        if spawned.is_err() {
-            self.emit(
-                &job_id,
-                Event::JobsFailed {
-                    reason: "worker_spawn_failed".to_string(),
-                    retryable: true,
-                },
-            );
-            self.active.remove(&job_id);
-            self.retire(&job_id);
+        match spawned {
+            Ok(worker) => self.track_worker(worker),
+            Err(_) => self.worker_spawn_failed(&job_id),
         }
     }
 

@@ -1,7 +1,10 @@
 //! The `starling-runtime-host` binary: one per user session.
 //!
-//! Launch → serve until SIGINT/SIGTERM (graceful: `bye` to clients,
-//! machines join, lease released, endpoint removed) → exit 0.
+//! Launch → serve until SIGINT/SIGTERM (Windows: console Ctrl+C/Break
+//! or close; at logoff/shutdown an interactive-session process is
+//! terminated by the OS — see `on_console_ctrl`) → graceful stop
+//! (`bye` to clients, machines join, the supervised engine stops, lease
+//! released, endpoint removed) → exit 0.
 //!
 //! Exit contract for launchers (stdout is one JSON line each):
 //! - `{"status":"owner",…}` then `{"status":"stopped"}` — this process
@@ -13,9 +16,13 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use starling_runtime_host::engine::EngineChoice;
 use starling_runtime_host::{default_data_root, platform, serve, HostConfig};
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+/// Set once `host.shutdown()` returned — what the Windows console-close
+/// handler waits for before letting the OS end the process.
+static STOPPED: AtomicBool = AtomicBool::new(false);
 
 #[cfg(unix)]
 extern "C" fn on_signal(_signal: i32) {
@@ -23,18 +30,56 @@ extern "C" fn on_signal(_signal: i32) {
     SHUTDOWN.store(true, Ordering::SeqCst);
 }
 
+/// The Windows analogue of SIGINT/SIGTERM: Ctrl+C/Ctrl+Break and a
+/// console close request the graceful stop. The handler runs on its own
+/// thread; for a close the OS ends the process as soon as the handler
+/// returns, so it waits (bounded, inside the OS's grace period) for the
+/// main loop to finish shutting down — lease released, engine stopped.
+/// `CTRL_LOGOFF_EVENT`/`CTRL_SHUTDOWN_EVENT` reach only services (an
+/// interactive-session process is terminated before they are sent);
+/// their arms stay so a host run as a service stops gracefully too.
+/// Termination without the handshake is still safe: the lease lock
+/// (`LockFileEx`) and every pipe handle are kernel objects the OS
+/// releases at process death, so ownership cannot be stranded — the
+/// successor's crash-recovery sweep handles the rest.
+#[cfg(windows)]
+unsafe extern "system" fn on_console_ctrl(ctrl_type: u32) -> windows_sys::Win32::Foundation::BOOL {
+    use windows_sys::Win32::System::Console::{
+        CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT,
+    };
+    SHUTDOWN.store(true, Ordering::SeqCst);
+    if matches!(
+        ctrl_type,
+        CTRL_CLOSE_EVENT | CTRL_LOGOFF_EVENT | CTRL_SHUTDOWN_EVENT
+    ) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(4500);
+        while !STOPPED.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+    1
+}
+
 fn usage() -> ! {
     eprintln!(
         "starling-runtime-host — the Starling runtime service host (E17 I4)
 
 USAGE:
-    starling-runtime-host [--root <dir>] [--runtime-dir <dir>]
+    starling-runtime-host [--root <dir>] [--runtime-dir <dir>] [--engine <source>]
 
 OPTIONS:
     --root <dir>         storage v2 data root to own
                          (default: the platform default root)
     --runtime-dir <dir>  directory for the IPC endpoint
-                         (default: {})",
+                         (default: {})
+    --engine <source>    settings: the transcription engine the desktop
+                         settings choose (bundled engine supervised by
+                         this host, or the manual server) — the default;
+                         the file is followed while the host runs, so
+                         model and mode changes apply without a restart
+                         (a CPU/automatic backend change applies at the
+                         next start);
+                         none: no engine (jobs fail no_provider_configured)",
         platform::default_runtime_dir().display()
     );
     std::process::exit(2);
@@ -47,13 +92,21 @@ fn help() -> ! {
         "starling-runtime-host — the Starling runtime service host (E17 I4)
 
 USAGE:
-    starling-runtime-host [--root <dir>] [--runtime-dir <dir>]
+    starling-runtime-host [--root <dir>] [--runtime-dir <dir>] [--engine <source>]
 
 OPTIONS:
     --root <dir>         storage v2 data root to own
                          (default: the platform default root)
     --runtime-dir <dir>  directory for the IPC endpoint
-                         (default: {})",
+                         (default: {})
+    --engine <source>    settings: the transcription engine the desktop
+                         settings choose (bundled engine supervised by
+                         this host, or the manual server) — the default;
+                         the file is followed while the host runs, so
+                         model and mode changes apply without a restart
+                         (a CPU/automatic backend change applies at the
+                         next start);
+                         none: no engine (jobs fail no_provider_configured)",
         platform::default_runtime_dir().display()
     );
     std::process::exit(0);
@@ -84,21 +137,32 @@ fn main() {
             std::process::exit(1);
         }
     }
-    #[cfg(not(unix))]
-    {
-        // Windows: no console-ctrl handler wired yet (recorded gap);
-        // the process still exits on window-close / taskkill and the OS
-        // closes the pipe handles, so clients observe EOF, and the lease
-        // flock-equivalent (the DACL'd pipe name) disappears with it.
+    #[cfg(windows)]
+    unsafe {
+        // SAFETY: registers a handler that only touches static atomics.
+        if windows_sys::Win32::System::Console::SetConsoleCtrlHandler(Some(on_console_ctrl), 1)
+            == 0
+        {
+            eprintln!("starling-runtime-host: could not install the console control handler");
+            std::process::exit(1);
+        }
     }
 
     let mut root: Option<std::path::PathBuf> = None;
     let mut runtime_dir: Option<std::path::PathBuf> = None;
+    let mut engine_source = "settings".to_string();
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
         match flag.as_str() {
             "--root" => root = Some(value_of(&mut args, &flag)),
             "--runtime-dir" => runtime_dir = Some(value_of(&mut args, &flag)),
+            "--engine" => {
+                engine_source = value_of(&mut args, &flag).to_string_lossy().into_owned();
+                if engine_source != "settings" && engine_source != "none" {
+                    eprintln!("--engine takes settings or none, not {engine_source:?}");
+                    usage();
+                }
+            }
             "--help" | "-h" => help(),
             other => {
                 eprintln!("unknown argument {other:?}");
@@ -121,30 +185,80 @@ fn main() {
     // The runtime dir rides into `production` so only the *final*
     // endpoint directory is created — applying an override afterwards
     // would leave the default directory behind as stray residue.
-    let mut host = match HostConfig::production(&root, runtime_dir) {
-        Ok(config) => match serve(config) {
-            Ok(host) => host,
-            Err(starling_runtime_host::HostError::OwnerLive {
-                owner_id,
-                owner_pid,
-                socket_path,
-            }) => {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "status": "already-running",
-                        "socket": socket_path,
-                        "owner": owner_id,
-                        "ownerPid": owner_pid,
-                    })
-                );
-                std::process::exit(0);
-            }
+    //
+    // `--engine settings` also *follows* the file while the host runs
+    // (the app applies engine changes immediately; the host must not
+    // freeze its startup choice): the watcher reads the same path the
+    // startup load read. An unresolvable settings path cannot change
+    // under us either — nothing to watch, the choice stays the startup
+    // one. `--engine none` watches nothing.
+    let (engine, settings_path) = if engine_source == "none" {
+        (EngineChoice::None, None)
+    } else {
+        use starling_dictation::settings::Settings;
+        // One read decides both the settings and the diagnostic: a file
+        // that is not JSON falls back to the defaults (as
+        // `load_or_default` would) and says so, rather than silently
+        // starting the bundled engine on a corrupt file (the watcher then
+        // applies the file's real choice once it parses).
+        let settings = match Settings::default_path() {
+            Ok(path) => match std::fs::read(&path) {
+                Ok(bytes) => Settings::from_json_bytes(&bytes).unwrap_or_else(|| {
+                    eprintln!(
+                        "starling-runtime-host: settings at {} are not valid JSON; \
+                         starting with the default engine settings",
+                        path.display()
+                    );
+                    Settings::default_settings()
+                }),
+                Err(_) => Settings::default_settings(),
+            },
+            Err(_) => Settings::default_settings(),
+        };
+        // An engine choice that cannot resolve (no user data directory)
+        // must not cost a second launch its ownership answer: serve
+        // without an engine and say so, rather than exit before the
+        // lease ladder ran.
+        let choice = match EngineChoice::from_settings(&settings) {
+            Ok(engine) => engine,
             Err(err) => {
-                eprintln!("starling-runtime-host: {err}");
-                std::process::exit(1);
+                eprintln!("starling-runtime-host: {err}; serving without an engine");
+                EngineChoice::None
             }
-        },
+        };
+        (choice, starling_dictation::settings::Settings::default_path().ok())
+    };
+
+    let mut host = match HostConfig::production(&root, runtime_dir) {
+        Ok(config) => {
+            let config = match settings_path {
+                Some(path) => config.with_engine(engine).with_settings_path(path),
+                None => config.with_engine(engine),
+            };
+            match serve(config) {
+                Ok(host) => host,
+                Err(starling_runtime_host::HostError::OwnerLive {
+                    owner_id,
+                    owner_pid,
+                    socket_path,
+                }) => {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "status": "already-running",
+                            "socket": socket_path,
+                            "owner": owner_id,
+                            "ownerPid": owner_pid,
+                        })
+                    );
+                    std::process::exit(0);
+                }
+                Err(err) => {
+                    eprintln!("starling-runtime-host: {err}");
+                    std::process::exit(1);
+                }
+            }
+        }
         Err(err) => {
             eprintln!("starling-runtime-host: {err}");
             std::process::exit(1);
@@ -158,6 +272,10 @@ fn main() {
             "socket": host.socket_path(),
             "owner": host.owner_id(),
             "pid": std::process::id(),
+            // The effective engine, not the startup choice's label: a
+            // manual endpoint that did not validate reads as
+            // `unconfigured` here, matching what jobs actually face.
+            "engine": host.engine_label(),
         })
     );
 
@@ -165,6 +283,11 @@ fn main() {
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
     host.shutdown();
+    // Before the println: the console-close handler's bounded wait ends
+    // as soon as the flag is set, so the stop work must be accounted
+    // first — printing after it keeps the handler's remaining grace
+    // budget real.
+    STOPPED.store(true, Ordering::SeqCst);
     println!("{}", serde_json::json!({ "status": "stopped" }));
 }
 

@@ -10,6 +10,7 @@ use starling_runtime::machine::capture::V2CaptureStore;
 use starling_runtime::RuntimeConfig;
 
 use crate::auth::PeerPolicy;
+use crate::engine::EngineChoice;
 use crate::limits::RateLimit;
 use crate::platform;
 
@@ -44,6 +45,20 @@ pub struct HostConfig {
     pub first_frame_idle: std::time::Duration,
     /// Who may connect.
     pub peer_policy: Arc<dyn PeerPolicy>,
+    /// The settings file the host follows while it runs (see
+    /// [`crate::engine`]): when set, engine-setting changes apply to the
+    /// serving host without a restart. `None` — the default, tests and
+    /// `--engine none` — fixes the engine at [`HostConfig::engine`].
+    pub settings_path: Option<PathBuf>,
+    /// How often the settings watcher polls [`HostConfig::settings_path`]
+    /// ([`crate::engine::DEFAULT_SETTINGS_POLL`] in production; tests
+    /// tighten it).
+    pub settings_poll: Duration,
+    /// Which transcription engine the host attaches to the runtime once
+    /// it owns the root (see [`crate::engine`]). [`EngineChoice::None`]
+    /// leaves `runtime.provider` as configured — tests inject doubles
+    /// there.
+    pub engine: EngineChoice,
     /// The runtime this host owns. Production builds pass
     /// [`HostConfig::production`]; tests inject doubles through the same
     /// builders [`RuntimeConfig`] offers.
@@ -67,6 +82,9 @@ impl HostConfig {
             outbound_capacity: crate::limits::DEFAULT_OUTBOUND_CAPACITY,
             first_frame_idle: Duration::from_secs(10),
             peer_policy: crate::auth::default_policy(),
+            settings_path: None,
+            settings_poll: crate::engine::DEFAULT_SETTINGS_POLL,
+            engine: EngineChoice::None,
             runtime: RuntimeConfig::default(),
         }
     }
@@ -80,10 +98,10 @@ impl HostConfig {
     /// default), and only that final directory is created here — so a
     /// missing `$XDG_RUNTIME_DIR` surfaces at launch, not at first bind,
     /// and an overridden dir never leaves the default behind as stray
-    /// residue. The inference provider stays unconfigured — an honest
-    /// default that fails jobs with `no_provider_configured` rather than
-    /// inventing an endpoint — until a configuration surface (app
-    /// settings or the E03 engine attach) supplies one; the context and
+    /// residue. The inference engine is chosen separately
+    /// ([`HostConfig::with_engine`]; the binary passes the user's
+    /// settings) — left alone, jobs fail `no_provider_configured` rather
+    /// than inventing an endpoint; the context and
     /// delivery adapters likewise stay the honest stubs until E03's
     /// platform adapters (issue #221) plug into the `RuntimeConfig`
     /// seams.
@@ -118,6 +136,28 @@ impl HostConfig {
     /// foreign user).
     pub fn with_peer_policy(mut self, policy: Arc<dyn PeerPolicy>) -> Self {
         self.peer_policy = policy;
+        self
+    }
+
+    /// Sets the engine the host attaches once it owns the root.
+    pub fn with_engine(mut self, engine: EngineChoice) -> Self {
+        self.engine = engine;
+        self
+    }
+
+    /// Sets the settings file the host follows while it runs (the
+    /// `--engine settings` path; the binary passes
+    /// `Settings::default_path()`). Without it the startup engine choice
+    /// is fixed — the posture every test that injects an
+    /// [`EngineChoice`] wants.
+    pub fn with_settings_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.settings_path = Some(path.into());
+        self
+    }
+
+    /// Overrides how often the settings watcher polls the file.
+    pub fn with_settings_poll(mut self, poll: Duration) -> Self {
+        self.settings_poll = poll;
         self
     }
 

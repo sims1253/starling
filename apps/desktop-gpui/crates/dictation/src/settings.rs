@@ -258,6 +258,8 @@ impl Settings {
     }
 
     /// Missing or corrupt file always falls back to the defaults; never panics.
+    /// The post-read logic lives in [`Settings::from_json_bytes`] (the
+    /// host's settings watcher reuses it on bytes it already holds).
     ///
     /// A file that parses but carries no `engine` key — or an explicit
     /// JSON `null` one — is a legacy file (#362): it loads with
@@ -273,12 +275,21 @@ impl Settings {
     /// partially unreadable file must never change where audio is sent,
     /// so the fallback errs toward the hand-run server the user had.
     pub fn load(path: &Path) -> Self {
-        let Some(text) = std::fs::read_to_string(path).ok() else {
+        let Ok(text) = std::fs::read_to_string(path) else {
             return Self::default_settings();
         };
-        let Some(mut value) = serde_json::from_str::<serde_json::Value>(&text).ok() else {
-            return Self::default_settings();
-        };
+        Self::from_json_bytes(text.as_bytes()).unwrap_or_else(Self::default_settings)
+    }
+
+    /// The settings `bytes` state, or `None` when they are not valid
+    /// JSON (an empty or truncated file — what a watcher sees while a
+    /// writer is mid-atomic-write, and must not read as "the user chose
+    /// the defaults"). Otherwise exactly what [`Settings::load`]
+    /// derives from a file it read: the legacy-file and
+    /// typed-deserialization-fallback rules documented there, applied
+    /// once here so both callers share them.
+    pub fn from_json_bytes(bytes: &[u8]) -> Option<Settings> {
+        let mut value = serde_json::from_slice::<serde_json::Value>(bytes).ok()?;
         // Checked before `value` is moved into `from_value` (a deep clone
         // of the whole document just to look at one key would be waste).
         // A JSON `null` engine key states no engine any more than an
@@ -339,12 +350,12 @@ impl Settings {
                 backend_override,
             };
             fallback.dictation = dictation;
-            return fallback;
+            return Some(fallback);
         };
         if legacy_file {
             settings.engine.mode = EngineMode::Manual;
         }
-        settings
+        Some(settings)
     }
 
     /// Atomic write: serialize pretty JSON to a sibling `.tmp`, then rename.
@@ -565,6 +576,43 @@ mod tests {
         let settings = Settings::load(&path);
         assert_eq!(settings.endpoint, "http://10.0.0.5:8181");
         assert_eq!(settings.engine.mode, EngineMode::Manual);
+    }
+
+    #[test]
+    fn from_json_bytes_rejects_what_is_not_json_and_parses_what_is() {
+        // The watcher's read path (#220): an empty or truncated file —
+        // what a mid-atomic-write looks like — is `None` ("the file
+        // states nothing"), never the defaults.
+        assert_eq!(Settings::from_json_bytes(b""), None);
+        assert_eq!(Settings::from_json_bytes(b"{\"engine\":{\"mo"), None);
+        assert_eq!(Settings::from_json_bytes(b"not json at all"), None);
+
+        // Valid JSON parses exactly like `load` would: a full manual
+        // file round-trips, and the legacy rules (no engine key →
+        // manual; typed failure → the safe mode) apply unchanged.
+        let manual = r#"{"endpoint":"http://10.0.0.5:8181","model":"whisper-large-v3","expectedTerms":["auth"],"engine":{"mode":"manual"}}"#;
+        let parsed = Settings::from_json_bytes(manual.as_bytes()).expect("valid JSON parses");
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("settings.json");
+        std::fs::write(&path, manual).expect("write settings");
+        assert_eq!(Settings::load(&path), parsed);
+
+        let legacy = r#"{"endpoint":"http://10.0.0.5:8181","model":"whisper-large-v3","expectedTerms":["auth"]}"#;
+        assert_eq!(
+            Settings::from_json_bytes(legacy.as_bytes())
+                .expect("legacy parses")
+                .engine
+                .mode,
+            EngineMode::Manual
+        );
+        let unreadable = r#"{"endpoint":42,"model":"parakeet","expectedTerms":["auth"],"engine":{"mode":"builtin"}}"#;
+        assert_eq!(
+            Settings::from_json_bytes(unreadable.as_bytes())
+                .expect("the fallback parses")
+                .engine
+                .mode,
+            EngineMode::Builtin
+        );
     }
 
     #[test]

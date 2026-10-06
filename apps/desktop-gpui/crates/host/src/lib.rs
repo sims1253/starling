@@ -22,8 +22,11 @@
 //! - [`limits`] — per-connection size/rate budgets.
 //! - [`server`] — the ownership ladder (lease → endpoint → runtime),
 //!   connection lifecycle, event fan-out, supervised shutdown.
-//! - [`client`] — the client library GPUI and the Electron adapter will
-//!   hold.
+//! - [`engine`] — the supervised inference engine attached to the
+//!   runtime, following the desktop settings file while the host
+//!   serves.
+//! - [`client`] — the client library the GPUI app will hold (the
+//!   Electron comparison app has since been removed from the tree).
 //!
 //! # Worker supervision boundary (recorded precisely)
 //!
@@ -39,27 +42,29 @@
 //!   workers per §2.2 (bounded concurrency, crash demotion to
 //!   `Failed{retryable}` — proven by `starling-runtime`'s
 //!   `scripted_take` suite).
-//! - What does not exist yet: any engine-process attach interface. There
-//!   is no C++ engine worker protocol or entrypoint in-tree (the ggml
-//!   submodule has no server shape), so a subprocess provider adapter
-//!   and its supervisor would be speculative code against an interface
-//!   nobody defined. When E03/I5 defines the engine's attach surface, it
-//!   lands as a `TranscriptionProvider` adapter plus process
-//!   supervision in this host; nothing here blocks it.
+//! - The C++ engine process attaches here ([`engine`], #220): the host
+//!   owns the bundled `starling-serve` sidecar's supervisor
+//!   (`starling_dictation::engine::EngineManager` — readiness, crash
+//!   restart, model switching) per the user's engine settings, and the
+//!   jobs machine reaches it through [`engine::EngineProvider`], which
+//!   leases the active engine per job. The sidecar's `--parent-pid` is
+//!   the host, so it dies with the host, never with a renderer.
 //!
 //! # What remains outside this crate (the consuming increments)
 //!
-//! Neither the GPUI app (`crates/app`) nor the Electron comparison
-//! adapter embeds the runtime today — the app talks to
-//! `starling-dictation` directly, and the Mode A embed was deliberately
-//! left as "the consuming increment's wiring" when I3 merged (same note
-//! as `default_capture_store`). Both become [`client::HostClient`]
-//! holders in their own switchover increments; the client library here
-//! is that surface.
+//! The GPUI app (`crates/app`) does not hold a [`client::HostClient`]
+//! yet — it still talks to `starling-dictation` directly (recorder,
+//! uploads, its own engine manager), and the switchover is its own
+//! increment: the client library here is that surface, and the engine
+//! supervisor it would hand over already runs here and shares the app's
+//! sidecar through the engine registry in the meantime. The Electron
+//! comparison app the design names as a second client has been removed
+//! from the tree, so there is no second adapter to switch.
 
 pub mod auth;
 pub mod client;
 pub mod config;
+pub mod engine;
 pub mod frame;
 pub mod limits;
 pub mod platform;

@@ -14,8 +14,9 @@
 //! suite already covers. The host under test is the real `server::serve`
 //! (or, for the host-death case, the real host binary).
 
-#![cfg(unix)] // the kill signals and the fill mode's socket shrink are
-              // unix surfaces; the Windows transport runs elsewhere.
+// Portable: `Child::kill` is SIGKILL on unix and TerminateProcess on
+// Windows — the same no-handler, no-cleanup death. Only the fill mode
+// (a receive-buffer shrink) is unix-only, and its test is gated.
 
 use std::io::Read;
 use std::path::Path;
@@ -30,6 +31,9 @@ use starling_runtime::provider::FakeProvider;
 use starling_runtime::testing::{FakeCaptureSource, FakeTakeScript};
 use starling_runtime_host::client::HostClient;
 use starling_runtime_host::{serve, HostConfig};
+
+mod common;
+use common::endpoint_present;
 
 /// The renderer double (a bin target of this crate — cargo exports the
 /// built path to integration tests).
@@ -213,10 +217,10 @@ impl Drop for DoubleRenderer {
 /// Waits (bounded) for the endpoint socket to disappear after shutdown.
 fn assert_endpoint_removed(socket: &Path) {
     let deadline = Instant::now() + Duration::from_secs(5);
-    while socket.exists() && Instant::now() < deadline {
+    while endpoint_present(socket) && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(25));
     }
-    assert!(!socket.exists(), "the endpoint {} was not removed", socket.display());
+    assert!(!endpoint_present(socket), "the endpoint {} was not removed", socket.display());
 }
 
 // --------------------------------------------------------------------- //
@@ -436,6 +440,7 @@ fn a_renderer_process_killed_mid_take_leaves_a_durable_take_and_a_serving_host()
 /// shutdown drain window. Shutdown must still complete in bounded time
 /// with the full teardown — machines joined, endpoint removed, lease
 /// released (a successor owns the root immediately after).
+#[cfg(unix)] // the fill mode shrinks SO_RCVBUF
 #[test]
 fn shutdown_completes_when_the_renderer_is_killed_mid_drain() {
     let root = tempfile::tempdir().unwrap();
@@ -499,6 +504,8 @@ fn a_killed_host_with_a_live_renderer_leaves_no_orphan_lease_and_the_successor_s
 
     // The real binary, its own process, its own lease.
     let mut host_process = ProcessCommand::new(HOST_BIN)
+        // Never the user's real engine settings/dirs in a test.
+        .args(["--engine", "none"])
         .arg("--root")
         .arg(root.path())
         .arg("--runtime-dir")

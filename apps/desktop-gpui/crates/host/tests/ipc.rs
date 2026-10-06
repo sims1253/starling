@@ -8,8 +8,10 @@
 //! real client library (or a raw socket where a transport violation has
 //! to be hand-crafted). Nothing here mocks the transport.
 
-#![cfg(unix)] // the Windows named-pipe transport cannot run on this box;
-              // see the PR's "Not executed here" section.
+// Portable: every test that drives the host through `HostClient` or a
+// raw `platform::connect` stream runs on the unix socket *and* the
+// Windows named pipe. Tests that need a unix-only lever (SO_RCVBUF
+// shrinking, uid-based policies) are `#[cfg(unix)]` individually.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -21,11 +23,15 @@ use starling_runtime::protocol::replay::{is_directive, MachineReplay};
 use starling_runtime::protocol::{Command, Kind as MessageKind, Revision};
 use starling_runtime::testing::{FakeCaptureSource, FakeTakeScript};
 use starling_runtime::{provider::FakeProvider, Runtime, RuntimeConfig};
+#[cfg(unix)]
 use starling_runtime_host::auth::{ExpectUid, PeerPolicy};
 use starling_runtime_host::client::{ClientError, HostClient};
 use starling_runtime_host::frame::{Frame, FrameError, FrameReader, TransportErrorCode};
 use starling_runtime_host::limits::RateLimit;
 use starling_runtime_host::{serve, HostConfig, HostError, HostHandle};
+
+mod common;
+use common::endpoint_present;
 
 // --------------------------------------------------------------------- //
 // Helpers
@@ -773,6 +779,89 @@ fn a_job_survives_its_submitting_clients_death() {
     host.shutdown();
 }
 
+/// A host that shuts down while a client sits on unread frames (its
+/// hello, the bye) leaves nothing bound: a successor on the same root
+/// serves at once. On Windows the closing host lingers so the client can
+/// read those frames — that linger must finish before the lease is
+/// released, or the old pipe instances keep the name and the successor's
+/// probe finds a "live" foreign server.
+#[test]
+fn a_successor_serves_immediately_after_shutdown_with_an_unread_client() {
+    let root = tempfile::tempdir().unwrap();
+    let config = || {
+        ipc_config(
+            root.path(),
+            FakeCaptureSource::new(vec![]),
+            FakeProvider::new(vec![]),
+        )
+    };
+    let mut host = serve(config()).expect("host serves");
+    let unread = raw_connect(&host);
+    // Let the host greet it (the hello lands unread in the stream).
+    std::thread::sleep(Duration::from_millis(200));
+    host.shutdown();
+    let mut successor = serve(config()).expect("the successor serves at once");
+    let client = connect_with_retry(successor.socket_path());
+    assert!(client.snapshot().is_ok());
+    drop(client);
+    drop(unread);
+    successor.shutdown();
+}
+
+/// Host shutdown cancels and joins in-flight recognition before it
+/// returns (and before the host stops the engine those workers lease):
+/// a recognition parked in the provider is cancelled, its `recognize`
+/// call has returned by the time `shutdown` does, and shutdown is
+/// prompt — not the job's 30 s of work.
+#[test]
+fn shutdown_cancels_and_joins_in_flight_recognition() {
+    let root = tempfile::tempdir().unwrap();
+    let source = FakeCaptureSource::new(vec![FakeTakeScript::clean()]);
+    let mut stuck = starling_runtime::provider::FakeJob::completes_with("never delivered");
+    stuck.work_ms = 30_000;
+    let provider = FakeProvider::new(vec![stuck]);
+    let (mut host, client) = boot(ipc_config(root.path(), source, Arc::clone(&provider)));
+
+    freeze_route(&client, "ctx-1");
+    client
+        .send(Some("take_s"), Command::CaptureStart { policy: "push-to-talk".into() })
+        .expect("start accepted");
+    until(&client, "capture.progress", |e| e.type_name() == "capture.progress", Duration::from_secs(5));
+    client
+        .send(Some("take_s"), Command::CaptureStop { drain: Some(true) })
+        .expect("stop accepted");
+    until(&client, "capture.stopped", |e| e.type_name() == "capture.stopped", Duration::from_secs(10));
+    client
+        .send(
+            Some("job-stuck"),
+            Command::JobsSubmit {
+                capture_ref: "take_s".into(),
+                route: "local-default".into(),
+                budget: "standard".into(),
+            },
+        )
+        .expect("submit accepted");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while provider.requests().is_empty() {
+        assert!(Instant::now() < deadline, "the recognition never reached the provider");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let request_id = provider.requests()[0].0.clone();
+
+    drop(client);
+    let started = Instant::now();
+    host.shutdown();
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "shutdown waited out the stuck job ({:?})",
+        started.elapsed()
+    );
+    assert!(
+        provider.recognize_returned(&request_id),
+        "the in-flight recognition was still running when shutdown returned"
+    );
+}
+
 // --------------------------------------------------------------------- //
 // The slow-consumer posture
 // --------------------------------------------------------------------- //
@@ -795,11 +884,11 @@ const FILL_BUDGET: Duration = Duration::from_secs(90);
 /// directory entry vanished by the very next instruction.
 fn assert_endpoint_removed(socket: &std::path::Path) {
     let deadline = Instant::now() + Duration::from_secs(5);
-    while socket.exists() && Instant::now() < deadline {
+    while endpoint_present(socket) && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(25));
     }
     assert!(
-        !socket.exists(),
+        !endpoint_present(socket),
         "the endpoint {} was not removed",
         socket.display()
     );
@@ -811,6 +900,7 @@ const DRAIN_BUDGET: Duration = Duration::from_secs(12);
 /// A renderer that stops reading is closed (`slow_consumer`) while the
 /// runtime and the other client continue untouched — the Mode B answer
 /// to "the UI is not a durability dependency".
+#[cfg(unix)] // shrinks SO_RCVBUF / compares uids: unix-only levers
 #[test]
 fn a_stalled_client_is_closed_and_the_runtime_continues() {
     let root = tempfile::tempdir().unwrap();
@@ -963,6 +1053,7 @@ fn a_stalled_client_is_closed_and_the_runtime_continues() {
 /// process's own: the same-user policy admits them. This is the
 /// positive, on-the-wire proof that `SO_PEERCRED` was actually read
 /// (an unread credential would be `None` and fail closed).
+#[cfg(unix)] // shrinks SO_RCVBUF / compares uids: unix-only levers
 #[test]
 fn same_user_credentials_pass_over_the_socket() {
     let root = tempfile::tempdir().unwrap();
@@ -980,6 +1071,7 @@ fn same_user_credentials_pass_over_the_socket() {
 /// A policy expecting a different uid refuses the real connection: the
 /// enforcement path (kernel credential → policy → close) runs against
 /// genuine credentials, no second OS user needed.
+#[cfg(unix)] // shrinks SO_RCVBUF / compares uids: unix-only levers
 #[test]
 fn foreign_uid_is_refused_on_the_socket() {
     let root = tempfile::tempdir().unwrap();
@@ -1031,12 +1123,17 @@ fn current_test_uid() -> u32 {
 // Framing limits over the raw socket
 // --------------------------------------------------------------------- //
 
-fn raw_connect(host: &HostHandle) -> std::os::unix::net::UnixStream {
-    std::os::unix::net::UnixStream::connect(host.socket_path()).unwrap()
+/// A raw transport stream (unix socket or named pipe) for hand-crafted
+/// frames — the platform layer's own `connect`, so these tests run on
+/// both transports.
+fn raw_connect(host: &HostHandle) -> RawStream {
+    starling_runtime_host::platform::connect(host.socket_path()).unwrap()
 }
 
+type RawStream = Box<dyn starling_runtime_host::platform::TransportConn>;
+
 fn read_transport_error(
-    stream: &mut std::os::unix::net::UnixStream,
+    stream: &mut impl std::io::Read,
 ) -> (TransportErrorCode, String) {
     let mut reader = FrameReader::new(&mut *stream, usize::MAX);
     // Read-poll timeouts (the 50ms read timeouts these streams carry)
@@ -1057,8 +1154,7 @@ fn read_transport_error(
     }
 }
 
-fn write_raw_frame(stream: &mut std::os::unix::net::UnixStream, body: &[u8]) {
-    use std::io::Write;
+fn write_raw_frame(stream: &mut impl std::io::Write, body: &[u8]) {
     stream
         .write_all(&(body.len() as u32).to_be_bytes())
         .unwrap();
@@ -1069,8 +1165,7 @@ fn write_raw_frame(stream: &mut std::os::unix::net::UnixStream, body: &[u8]) {
 /// [`write_raw_frame`] for floods that expect the host to tear the
 /// connection down mid-stream: `false` when a write failed (the socket
 /// ended under us), which callers treat as "already answered".
-fn write_raw_frame_lossy(stream: &mut std::os::unix::net::UnixStream, body: &[u8]) -> bool {
-    use std::io::Write;
+fn write_raw_frame_lossy(stream: &mut impl std::io::Write, body: &[u8]) -> bool {
     let wire = (body.len() as u32).to_be_bytes();
     stream.write_all(&wire).is_ok() && stream.write_all(body).is_ok()
 }
@@ -1396,6 +1491,7 @@ fn startup_reconcile_on_a_clean_root_reports_nothing() {
 /// bound the host kills the socket, joins its threads, releases the
 /// lease and removes the endpoint. Before the bound this join hung
 /// forever on exactly this shape.
+#[cfg(unix)] // shrinks SO_RCVBUF / compares uids: unix-only levers
 #[test]
 fn shutdown_completes_despite_a_writer_parked_on_a_silent_peer() {
     let root = tempfile::tempdir().unwrap();
@@ -1622,6 +1718,7 @@ fn an_idle_pre_greeting_connection_is_closed_at_the_deadline() {
 /// assertion is the prompt close itself: the client learns the
 /// connection ended — never a silent wedge, and never a bare reply
 /// timeout for a command that already ran.
+#[cfg(unix)] // shrinks SO_RCVBUF / compares uids: unix-only levers
 #[test]
 fn an_outbound_queue_overflow_closes_with_slow_consumer() {
     let root = tempfile::tempdir().unwrap();

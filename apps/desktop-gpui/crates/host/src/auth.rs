@@ -212,6 +212,17 @@ mod tests {
             };
             assert_eq!(policy.authenticate(mine), Ok(()));
         }
+        // Windows: the pipe DACL made the same-user decision at connect
+        // time, so a peer with no uid (the only shape that platform
+        // produces) is admitted.
+        #[cfg(windows)]
+        {
+            let pipe_peer = PeerCredentials {
+                uid: None,
+                pid: Some(std::process::id()),
+            };
+            assert_eq!(policy.authenticate(pipe_peer), Ok(()));
+        }
     }
 }
 
@@ -245,9 +256,10 @@ mod expect_uid_tests {
         );
         assert!(policy
             .authenticate(PeerCredentials {
-                uid: Some(current_uid()),
+                uid: Some(12346),
                 pid: None
             })
             .is_err());
+        assert!(policy.authenticate(PeerCredentials::absent()).is_err());
     }
 }
