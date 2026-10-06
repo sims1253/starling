@@ -325,6 +325,45 @@ fn escape_variants(shortcut: &Shortcut) -> Vec<HotKey> {
     variants
 }
 
+/// Register one Escape grab, logging a refusal with the one message every
+/// arming path shares (the inline Windows/macOS loop and the Linux
+/// worker's); `Err` carries the refusal for callers that act on it.
+fn register_escape_variant(
+    manager: &GlobalHotKeyManager,
+    variant: &HotKey,
+) -> Result<(), String> {
+    manager.register(*variant).map_err(|err| {
+        eprintln!(
+            "Escape could not be grabbed system-wide ({err}); the Starling window still \
+             sees it."
+        );
+        err.to_string()
+    })
+}
+
+/// Release one Escape grab, logging a failure with the one message every
+/// disarm path shares (the inline loop and the Linux worker's).
+fn release_escape_variant(manager: &GlobalHotKeyManager, variant: &HotKey) {
+    if let Err(err) = manager.unregister(*variant) {
+        eprintln!("An Escape grab could not be released ({err}).");
+    }
+}
+
+/// Release the previous recording shortcut's grab once the new one holds
+/// (both `set_record` paths). A failed release leaves the old and the new
+/// shortcut live system-wide — logged, never swallowed, since either may
+/// then toggle recording.
+fn release_previous_record(manager: &GlobalHotKeyManager, old: Option<HotKey>) {
+    if let Some(old) = old {
+        if let Err(err) = manager.unregister(old) {
+            eprintln!(
+                "the previous shortcut's grab could not be released ({err}); both it and \
+                 the new shortcut may now toggle recording"
+            );
+        }
+    }
+}
+
 /// A command for the Linux worker thread that owns the manager.
 enum WorkerCommand {
     /// Register `new`; once it holds, release `old`. The reply carries
@@ -370,11 +409,7 @@ fn manage(
                 let outcome = manager
                     .register(new)
                     .map_err(|err| err.to_string())
-                    .map(|()| {
-                        if let Some(old) = old {
-                            let _ = manager.unregister(old);
-                        }
-                    });
+                    .map(|()| release_previous_record(&manager, old));
                 let _ = reply.send(outcome);
             }
             WorkerCommand::Arm { generation, variants } => {
@@ -384,27 +419,15 @@ fn manage(
                 // refusal is logged and simply never fires.
                 let refused = variants
                     .iter()
-                    .filter(|variant| {
-                        if let Err(err) = manager.register(**variant) {
-                            eprintln!(
-                                "Escape could not be grabbed system-wide ({err}); the Starling \
-                                 window still sees it."
-                            );
-                            true
-                        } else {
-                            false
-                        }
-                    })
+                    .filter(|variant| register_escape_variant(&manager, variant).is_err())
                     .copied()
                     .collect();
                 let _ = report.send(ArmReport { generation, refused });
             }
             WorkerCommand::Disarm { variants } => {
                 // One release per variant, for the same reason as arming.
-                for variant in variants {
-                    if let Err(err) = manager.unregister(variant) {
-                        eprintln!("An Escape grab could not be released ({err}).");
-                    }
+                for variant in &variants {
+                    release_escape_variant(&manager, variant);
                 }
             }
         }
@@ -525,11 +548,10 @@ impl GlobalShortcuts {
         let old = self.record;
         let outcome = if let Some(manager) = self.manager.as_ref() {
             // Windows/macOS: direct calls, fine to make inline.
-            manager.register(new).map_err(|err| err.to_string()).map(|()| {
-                if let Some(old) = old {
-                    let _ = manager.unregister(old);
-                }
-            })
+            manager
+                .register(new)
+                .map_err(|err| err.to_string())
+                .map(|()| release_previous_record(manager, old))
         } else if let Some(worker) = self.worker.as_ref() {
             // Linux: a request/reply through the worker. Blocking is fine —
             // this runs on a settings save, not per take.
@@ -589,9 +611,7 @@ impl GlobalShortcuts {
                     // time and would leave every grab after it live. An
                     // individual failure is logged and the rest released.
                     for variant in &live {
-                        if let Err(err) = manager.unregister(*variant) {
-                            eprintln!("An Escape grab could not be released ({err}).");
-                        }
+                        release_escape_variant(manager, variant);
                     }
                     Ok(())
                 }
@@ -606,9 +626,21 @@ impl GlobalShortcuts {
         self.escape_generation += 1;
         if let Some(worker) = self.worker.as_ref() {
             let generation = self.escape_generation;
-            return worker
-                .send(WorkerCommand::Arm { generation, variants })
-                .map_err(|err| err.to_string());
+            let sent = worker.send(WorkerCommand::Arm { generation, variants });
+            // A failed send means nothing registered: the fields above
+            // already claim the armed state, so hand it back — otherwise
+            // `escape_armed()` stays true forever, every later arm
+            // early-returns at the guard above, and the system-wide
+            // Escape cancel is silently dead for the session. Cleared
+            // here, the next arm (and the disarm at take end) retries.
+            return match sent {
+                Ok(()) => Ok(()),
+                Err(err) => {
+                    self.escape.clear();
+                    self.escape_live.clear();
+                    Err(err.to_string())
+                }
+            };
         }
         let manager = self
             .manager
@@ -621,14 +653,10 @@ impl GlobalShortcuts {
         // only bare Escape failing fails the arm.
         let mut bare_refused = None;
         for variant in &variants {
-            if let Err(err) = manager.register(*variant) {
-                eprintln!(
-                    "Escape could not be grabbed system-wide ({err}); the Starling window \
-                     still sees it."
-                );
+            if let Err(reason) = register_escape_variant(manager, variant) {
                 self.escape_live.retain(|live| live != variant);
                 if variant.mods.is_empty() {
-                    bare_refused = Some(err.to_string());
+                    bare_refused = Some(reason);
                 }
             }
         }
@@ -638,9 +666,7 @@ impl GlobalShortcuts {
             // and the armed state cleared, so the next arm retries
             // cleanly instead of sitting "armed" on a partial set.
             for variant in &self.escape_live {
-                if let Err(err) = manager.unregister(*variant) {
-                    eprintln!("An Escape grab could not be released ({err}).");
-                }
+                release_escape_variant(manager, variant);
             }
             self.escape.clear();
             self.escape_live.clear();

@@ -205,6 +205,12 @@ pub(crate) struct Activation {
     config: ActivationConfig,
     phase: Phase,
     key_down: bool,
+    /// Whether the window reported the press that holds the key down. A
+    /// window press while the key is down is always auto-repeat (gpui
+    /// forwards held repeats, after a delay the user may set above
+    /// `REPEAT_GAP`); that path's lost release is the window losing focus
+    /// instead (see [`Activation::window_lost_focus`]).
+    key_from_window: bool,
     last_key_event: Option<Instant>,
     /// The most recently issued take id; takes are numbered from 1.
     last_take: TakeId,
@@ -216,6 +222,7 @@ impl Activation {
             config,
             phase: Phase::Idle,
             key_down: false,
+            key_from_window: false,
             last_key_event: None,
             last_take: 0,
         }
@@ -284,6 +291,30 @@ impl Activation {
     /// not begin a take (a modal is open): such a press can still stop
     /// the active take, but never starts one.
     pub(crate) fn press(&mut self, now: Instant, may_start: bool) -> Vec<Effect> {
+        self.press_from(now, may_start, false)
+    }
+
+    /// A press the Starling window reported (see `key_from_window`).
+    pub(crate) fn press_in_window(&mut self, now: Instant, may_start: bool) -> Vec<Effect> {
+        self.press_from(now, may_start, true)
+    }
+
+    /// The window lost focus. A key it saw go down can no longer be seen
+    /// going up, so its release is taken as happening now: a held take
+    /// finishes instead of recording until a release that never comes.
+    pub(crate) fn window_lost_focus(&mut self, now: Instant) -> Vec<Effect> {
+        if self.key_down && self.key_from_window {
+            self.release(now)
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn press_from(&mut self, now: Instant, may_start: bool, window: bool) -> Vec<Effect> {
+        if self.key_down && window && self.key_from_window {
+            self.last_key_event = Some(now);
+            return Vec::new();
+        }
         if self.key_down {
             let repeat = self
                 .last_key_event
@@ -306,6 +337,7 @@ impl Activation {
             }
         }
         self.key_down = true;
+        self.key_from_window = window;
         self.last_key_event = Some(now);
 
         match self.phase {
@@ -493,7 +525,6 @@ impl Activation {
     }
 }
 
-
 /// The capture pane's headline for the active take: listening is only
 /// claimed once real samples arrived.
 pub(crate) fn readiness_headline(readiness: Option<Readiness>) -> &'static str {
@@ -563,8 +594,12 @@ impl StarlingApp {
     /// matched to whether Starling had focus when they happened.
     pub(crate) fn track_window_focus(&mut self, window: &mut gpui::Window, cx: &mut Context<Self>) {
         self.window_focus.push((Instant::now(), window.is_window_active()));
-        let subscription = cx.observe_window_activation(window, |app, window, _cx| {
-            app.window_focus.push((Instant::now(), window.is_window_active()));
+        let subscription = cx.observe_window_activation(window, |app, window, cx| {
+            let active = window.is_window_active();
+            app.window_focus.push((Instant::now(), active));
+            if !active {
+                app.activation_input(|machine| machine.window_lost_focus(Instant::now()), cx);
+            }
             if app.window_focus.len() > FOCUS_HISTORY {
                 app.window_focus.remove(0);
             }
@@ -653,7 +688,7 @@ impl StarlingApp {
             return false;
         }
         let may_start = !self.settings_open;
-        self.activation_input(|machine| machine.press(Instant::now(), may_start), cx);
+        self.activation_input(|machine| machine.press_in_window(Instant::now(), may_start), cx);
         true
     }
 
@@ -1004,6 +1039,38 @@ mod tests {
         // Its own release is ignored, and the next press starts normally.
         assert!(m.release(t0 + ms(4100)).is_empty());
         assert_eq!(m.press(t0 + ms(6000), true), vec![Effect::Start(take + 1)]);
+    }
+
+    #[test]
+    fn a_slow_window_repeat_never_ends_a_held_take() {
+        // Native Wayland: gpui forwards held repeats through the window,
+        // after a delay the user may set well above REPEAT_GAP.
+        let mut m = machine(ActivationMode::Hold, false);
+        let t0 = Instant::now();
+        let [Effect::Start(take)] = m.press_in_window(t0, true)[..] else {
+            panic!("expected a start");
+        };
+        m.samples_arrived(take);
+        assert!(m.press_in_window(t0 + ms(1500), true).is_empty());
+        assert!(m.press_in_window(t0 + ms(1530), true).is_empty());
+        assert_eq!(m.active_take(), Some(take));
+        assert_eq!(m.release(t0 + ms(4000)), vec![Effect::Finish(take)]);
+    }
+
+    #[test]
+    fn losing_window_focus_releases_a_key_the_window_held() {
+        let mut m = machine(ActivationMode::Hold, false);
+        let t0 = Instant::now();
+        let [Effect::Start(take)] = m.press_in_window(t0, true)[..] else {
+            panic!("expected a start");
+        };
+        m.samples_arrived(take);
+        assert_eq!(m.window_lost_focus(t0 + ms(800)), vec![Effect::Finish(take)]);
+        assert!(m.window_lost_focus(t0 + ms(900)).is_empty());
+        // A key held through the system-wide grab is not the window's.
+        let take = start_listening(&mut m, t0 + ms(2000));
+        assert!(m.window_lost_focus(t0 + ms(2500)).is_empty());
+        assert_eq!(m.active_take(), Some(take));
     }
 
     #[test]

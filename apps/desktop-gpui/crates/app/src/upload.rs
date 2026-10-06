@@ -308,6 +308,33 @@ pub(crate) fn quiesce_salvage_note(samples: u64, sample_rate: u32) -> String {
     )
 }
 
+/// The cancelled take's audio (see `StarlingApp::cancel_recording`):
+/// whatever the recorder's stop handed back, with the live-stream prefix
+/// the take already drained spliced back in front — or, when the stop
+/// handed back nothing at all, the prefix alone, rebuilt at the take's
+/// device rate. The prefix is samples this app already owns
+/// (`drain_chunks` hands them out for live streaming), so a stop that
+/// reports `Empty` or fails outright must not lose them: a cancel never
+/// loses words.
+fn salvaged_take_audio(
+    stopped: Option<audio::PcmAudio>,
+    streamed_prefix: Vec<f32>,
+    sample_rate: u32,
+) -> Option<audio::PcmAudio> {
+    match stopped {
+        Some(mut audio) => {
+            audio.samples.splice(0..0, streamed_prefix);
+            Some(audio)
+        }
+        None if !streamed_prefix.is_empty() => Some(audio::PcmAudio {
+            samples: streamed_prefix,
+            sample_rate,
+            channels: 1,
+        }),
+        None => None,
+    }
+}
+
 impl StarlingApp {
     /// The on-screen record button: a toggle in every activation mode,
     /// through the same machine as the shortcut (#221). `showed` is what
@@ -594,24 +621,34 @@ impl StarlingApp {
         self.stream_degradation = None;
         self.levels = vec![0.06; 52];
         let staging = self.staging_cancelled(cx);
-        let (audio, journal_report) = match handle.stop() {
+        // Read before `stop` consumes the handle: a stop that hands back
+        // no audio still rebuilds the drained prefix at the take's own
+        // device rate.
+        let device_sample_rate = handle.sample_rate();
+        let (stopped, journal_report) = match handle.stop() {
             Ok(take) => (Some(take.audio), take.journal),
             Err(recorder::RecorderError::QuiesceTimeout { audio, journal, .. }) => {
                 (Some(audio), journal)
             }
             Err(recorder::RecorderError::Empty) => (None, None),
             Err(err) => {
-                self.error = Some(err.to_string());
-                // The stop failed before any take existed to bind the kept
-                // draft to; no audio came back either, so the no-audio
-                // guard below resolves it — once.
+                self.error = Some(format!(
+                    "{}. The capture journal, if this take had one, stays on disk \
+                     for recovery.",
+                    err.to_string().trim_end_matches('.')
+                ));
+                // The stop failed, so no take came back to bind the kept
+                // draft to; the salvage below may still produce audio from
+                // the drained prefix, and when it does not, the no-audio
+                // guard below resolves the draft — once.
                 (None, None)
             }
         };
-        let audio = audio.map(|mut audio| {
-            audio.samples.splice(0..0, streamed_samples);
-            audio
-        });
+        // The prefix drained for live streaming is spliced in front of
+        // whatever the stop handed back, or becomes the whole take when it
+        // handed back nothing (`Empty`, a failed stop): samples this app
+        // already owns are never dropped by a cancel.
+        let audio = salvaged_take_audio(stopped, streamed_samples, device_sample_rate);
         // Only a clean, finalized journal is adopted as the take's audio.
         // A faulted one holds just the prefix written before the fault;
         // adopting it would drop the words spoken after it, so the full
@@ -628,8 +665,9 @@ impl StarlingApp {
         let saved_notice = match reason {
             CancelReason::Escape if kept => {
                 Some(
-                    "Cancelled with Escape. Nothing was transcribed or delivered; the audio is \
-                     in your history, ready to transcribe if you need the words."
+                    "Cancelled with Escape. No transcript was kept and nothing was inserted \
+                     anywhere; the audio is in your history, ready to transcribe if you need \
+                     the words."
                         .to_string(),
                 )
             }
@@ -642,7 +680,7 @@ impl StarlingApp {
             CancelReason::NoAudioYet if kept => {
                 Some(
                     "Stopped before the microphone was fully ready. The little audio it \
-                     captured is in your history; nothing was transcribed."
+                     captured is in your history; no transcript was kept."
                         .to_string(),
                 )
             }
@@ -655,17 +693,27 @@ impl StarlingApp {
                 None
             }
             CancelReason::MicStalled => {
-                self.error = Some(format!(
+                let mut stall = format!(
                     "The microphone delivered no audio within {} seconds, so the take was \
                      stopped. Check that the input device is connected and not muted.",
                     crate::activation::START_STALL.as_secs()
-                ));
+                );
+                // The stop above may already have surfaced its own failure
+                // (the generic `Err` arm); a stall must not overwrite it —
+                // both stay, joined at a sentence boundary.
+                if let Some(stop_error) = self.error.take() {
+                    stall = format!(
+                        "{stall} Stopping it also failed: {}",
+                        stop_error.trim_end_matches('.')
+                    );
+                }
+                self.error = Some(stall);
                 // With audio kept, the saved notice tells the user the words
                 // survived once the save lands — the error above only says
                 // why the take was stopped.
                 kept.then(|| {
                     "The microphone stalled at the start, so the take was stopped. The audio \
-                     it did capture is in your history; nothing was transcribed."
+                     it did capture is in your history; no transcript was kept."
                         .to_string()
                 })
             }
@@ -1533,6 +1581,36 @@ mod tests {
         assert!(note.contains("interrupted recording"), "{note}");
         assert!(note.contains("retry"), "{note}");
         assert!(!note.contains("lost"), "{note}");
+    }
+
+    #[test]
+    fn a_cancelled_take_splices_the_streamed_prefix_in_front_of_the_stop_audio() {
+        // The drained live-stream prefix is the start of the take, so it
+        // goes in front of whatever the stop handed back — never after.
+        let stopped = audio::PcmAudio {
+            samples: vec![0.5, 0.25],
+            sample_rate: 48_000,
+            channels: 1,
+        };
+        let salvaged = salvaged_take_audio(Some(stopped), vec![0.1, 0.2, 0.3], 48_000).unwrap();
+        assert_eq!(salvaged.samples, vec![0.1, 0.2, 0.3, 0.5, 0.25]);
+        assert_eq!(salvaged.sample_rate, 48_000);
+    }
+
+    #[test]
+    fn a_stop_that_hands_back_nothing_still_keeps_the_streamed_prefix() {
+        // `Empty` and a failed stop must not drop samples the app already
+        // drained: the prefix alone is the interrupted take, mono, at the
+        // device rate captured before `stop` consumed the handle.
+        let salvaged = salvaged_take_audio(None, vec![0.1, 0.2], 44_100).unwrap();
+        assert_eq!(salvaged.samples, vec![0.1, 0.2]);
+        assert_eq!(salvaged.sample_rate, 44_100);
+        assert_eq!(salvaged.channels, 1);
+    }
+
+    #[test]
+    fn a_stop_with_no_audio_and_no_prefix_salvages_nothing() {
+        assert!(salvaged_take_audio(None, Vec::new(), 48_000).is_none());
     }
 
     #[test]

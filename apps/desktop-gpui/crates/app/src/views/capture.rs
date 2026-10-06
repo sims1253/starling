@@ -564,7 +564,7 @@ fn render_banner(app: &mut StarlingApp, cx: &mut Context<StarlingApp>) -> Option
             return Some(quality_banner(
                 "Take cancelled",
                 message,
-                "Nothing was inserted or sent anywhere.",
+                "No transcript was kept and nothing was inserted anywhere.",
                 |app: &mut StarlingApp| app.take_notice = None,
                 cx,
             ));
