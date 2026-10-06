@@ -29,7 +29,6 @@ import dev.starling.mobile.data.Recording
 import dev.starling.mobile.data.RecordingStatus
 import dev.starling.mobile.data.TranscriptionProvenance
 import dev.starling.mobile.engine.ModelCatalog
-import dev.starling.mobile.engine.ModelLifetime
 import dev.starling.mobile.engine.OnDeviceEngine
 import dev.starling.mobile.network.BackendConfig
 import dev.starling.mobile.network.EndpointPolicy
@@ -484,8 +483,7 @@ class MainActivity : Activity() {
         recordingMessage.setText(
             when {
                 session == null -> R.string.recording_now
-                config.engine == TranscriptionEngine.ON_DEVICE &&
-                    application.modelLifetime.state() !is ModelLifetime.State.Ready -> R.string.streaming_loading
+                application.isOnDeviceModelLoading(config) -> R.string.streaming_loading
                 else -> R.string.streaming_connecting
             },
         )

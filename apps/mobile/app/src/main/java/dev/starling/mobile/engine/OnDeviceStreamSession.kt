@@ -138,7 +138,10 @@ class OnDeviceStreamSession(
             } else if (!spillLocked()) {
                 // No saved audio to fall back on: the engine is not keeping up
                 // with real time; stop before the buffer (and the eventual
-                // flush) grows without bound.
+                // flush) grows without bound. A backlog that exists but could
+                // not be opened already failed the stream with its own cause
+                // (see [spillLocked]); failLocked is first-wins, so this cap
+                // failure stays the genuine no-backlog case.
                 failLocked("the on-device engine fell behind the recording", bufferLimitReached = true)
                 return
             }
@@ -162,10 +165,22 @@ class OnDeviceStreamSession(
 
     /**
      * Leaves a chunk in the saved WAV only (the buffer is full, or behind);
-     * false when there is no saved audio to read it back from.
+     * false when there is no saved audio to read it back from. A backlog
+     * that exists but cannot be opened fails the stream right here with
+     * the real cause, so an I/O failure is not misreported as the engine
+     * falling behind (the caller's cap message applies to the genuine
+     * no-backlog case only, and [failLocked] is first-wins).
      */
     private fun spillLocked(): Boolean {
-        if (openBacklog == null) openBacklog = backlog?.let { open -> runCatching(open).getOrNull() }
+        val opener = backlog ?: return false
+        if (openBacklog == null) {
+            openBacklog = runCatching(opener).onFailure { t ->
+                failLocked(
+                    "the saved recording could not be opened: ${t.message ?: t::class.java.simpleName}",
+                    bufferLimitReached = false,
+                )
+            }.getOrNull()
+        }
         return openBacklog != null
     }
 
@@ -304,7 +319,14 @@ class OnDeviceStreamSession(
         val source: Backlog
         lock.withLock {
             if (!behindLocked()) return true
-            source = openBacklog ?: return true
+            // Defensive: behind implies an open backlog (the spill that made
+            // the buffer behind opened one), so this is unreachable today —
+            // but returning true would busy-spin the loop below, whose idle
+            // wait never ends while behind. Fail the stream instead.
+            source = openBacklog ?: run {
+                failLocked("the saved recording could not be read back", bufferLimitReached = false)
+                return false
+            }
             from = base + size
             count = minOf(captured - from, (refillLimit() - size).toLong()).toInt()
         }

@@ -207,8 +207,7 @@ class VoiceInputService : InputMethodService() {
             when {
                 session == null -> R.string.keyboard_recording
                 // Audio is already being saved; live text follows the load.
-                config.engine == TranscriptionEngine.ON_DEVICE &&
-                    application.modelLifetime.state() !is ModelLifetime.State.Ready -> R.string.keyboard_recording_loading
+                application.isOnDeviceModelLoading(config) -> R.string.keyboard_recording_loading
                 else -> R.string.keyboard_streaming
             },
         )

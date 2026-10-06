@@ -10,16 +10,21 @@ import java.util.concurrent.Executor
  * - **Preload.** [preload] is the speculative trigger of a voice surface
  *   becoming active (the keyboard shown, the recognizer popup or recorder
  *   opened). It loads and warms up the *active* installed model on [worker],
- *   never on the calling (UI) thread, and never opens the microphone or
- *   downloads anything. Concurrent requests collapse into the one in flight,
- *   and a model already resident is only touched (its idle timer re-armed).
+ *   never on the calling (UI) thread — which only reads the in-memory state
+ *   and queues; the models-directory scan that resolves the active model
+ *   happens on the worker, under the engine lock — and never opens the
+ *   microphone or downloads anything. Concurrent requests collapse into the
+ *   one in flight, and a model already resident is only touched (its idle
+ *   timer re-armed).
  *   A recording never waits for a preload: the live session captures from
  *   the first sample and feeds the backlog once the model is ready (see
  *   [OnDeviceStreamSession]).
  * - **Failures.** A load that failed for a model is not retried
  *   speculatively for [retryFailedAfterMs] (a corrupt or oversized model
- *   must not reload on every keyboard show); selecting another model, or a
- *   recording, still tries at once. A GPU driver failure (#325, see
+ *   must not reload on every keyboard show); the check runs on the worker,
+ *   under the engine lock, so it keys on the model the queued load is
+ *   actually about to use. Selecting another model, or a recording, still
+ *   tries at once. A GPU driver failure (#325, see
  *   [GpuFailure]) is fatal to speculative work for the rest of the process:
  *   it is reported as [State.DriverFailed] and never retried, because every
  *   retry into a wedged driver prolongs the wedge. Recordings stay safe
@@ -47,6 +52,11 @@ class ModelLifetime(
 ) : OnDeviceEngine.Observer {
     /** The engine surface this policy drives; [OnDeviceEngine] in the app. */
     interface Engine {
+        /**
+         * The model a preload would load; a models-directory scan plus a
+         * marker read, so it is called on the worker only, never on the
+         * (UI) thread that calls [preload].
+         */
         fun activeModelName(): String?
 
         /** [OnDeviceEngine.preload]: runs only if [allowed] still holds under the engine lock. */
@@ -87,12 +97,6 @@ class ModelLifetime(
         /** A preload is already queued or running; this request joined it. */
         IN_FLIGHT,
 
-        /** No model is installed, so there is nothing to preload. */
-        NO_MODEL,
-
-        /** The last load of this model failed recently; not retried speculatively yet. */
-        RECENTLY_FAILED,
-
         /** A GPU driver failure was seen; speculative work stays off. */
         DRIVER_FAILED,
     }
@@ -125,18 +129,16 @@ class ModelLifetime(
 
     /**
      * Speculatively loads the active installed model, or keeps the resident
-     * one warm. Cheap and safe to call from every activation callback: it
-     * returns at once and does nothing while a preload is in flight.
+     * one warm. Cheap and safe to call from every activation callback: the
+     * calling thread only reads the in-memory state and queues — no
+     * file-system work, and nothing while a preload is in flight. Which
+     * model is active, and whether it is still inside its failure backoff,
+     * are resolved on the worker (see [preloadAllowed]).
      */
     fun preload(): PreloadResult {
-        // File-system work, outside the monitor (see the class doc).
-        val model = engine.activeModelName() ?: return PreloadResult.NO_MODEL
         synchronized(lock) {
             if (state is State.DriverFailed) return PreloadResult.DRIVER_FAILED
             if (preloadInFlight) return PreloadResult.IN_FLIGHT
-            if (failedModel == model && clock() - failedAtMillis < retryFailedAfterMs) {
-                return PreloadResult.RECENTLY_FAILED
-            }
             preloadInFlight = true
         }
         try {
@@ -155,14 +157,34 @@ class ModelLifetime(
             // transcription goes first) and then loads, or merely touches
             // the resident model. The outcome reaches [state] through the
             // observer callbacks below. A driver failure seen while this
-            // waited for the lock cancels it there.
-            engine.preload { synchronized(lock) { state !is State.DriverFailed } }
+            // waited for the lock cancels it there, and so does a recording
+            // that failed the model in the meantime (see [preloadAllowed]).
+            engine.preload(::preloadAllowed)
         } catch (_: Throwable) {
             // A throwing load (a broken native library) was already reported
             // through loadFailed, with the model it actually tried, so the
             // state leaves Loading and the backoff applies to that model.
         } finally {
             synchronized(lock) { preloadInFlight = false }
+        }
+    }
+
+    /**
+     * Whether a queued preload may still run. Evaluated on the worker, under
+     * the engine lock: the model it resolves is the one this load is about
+     * to use — not a name read when the preload was queued — so the
+     * [retryFailedAfterMs] backoff keys on exactly that model, and a
+     * recording that failed it (or a wedge) while this waited for the lock
+     * cancels the load. The engine call stays outside this object's monitor
+     * (see the class doc); the check under it cannot interleave with a
+     * failure being recorded, because failures are reported under the
+     * engine lock too.
+     */
+    private fun preloadAllowed(): Boolean {
+        val model = engine.activeModelName() ?: return false
+        return synchronized(lock) {
+            state !is State.DriverFailed &&
+                (failedModel != model || clock() - failedAtMillis >= retryFailedAfterMs)
         }
     }
 

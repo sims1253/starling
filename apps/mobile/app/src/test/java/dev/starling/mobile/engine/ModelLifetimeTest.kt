@@ -77,8 +77,9 @@ class ModelLifetimeTest {
     @Test
     fun nothingIsPreloadedWithoutAnInstalledModel() {
         engine.model = null
-        assertEquals(ModelLifetime.PreloadResult.NO_MODEL, lifetime.preload())
-        assertTrue(queued.isEmpty())
+        assertEquals(ModelLifetime.PreloadResult.QUEUED, lifetime.preload())
+        runQueued()
+        assertEquals(0, engine.prepares)
     }
 
     @Test
@@ -102,17 +103,23 @@ class ModelLifetimeTest {
     fun aFailedModelIsNotReloadedOnEveryActivation() {
         lifetime.loadFailed("parakeet.gguf", "not enough free memory")
         assertEquals(ModelLifetime.State.Failed("parakeet.gguf", "not enough free memory"), lifetime.state())
-        assertEquals(ModelLifetime.PreloadResult.RECENTLY_FAILED, lifetime.preload())
+        // The backoff is decided on the worker, so the preload still queues.
+        assertEquals(ModelLifetime.PreloadResult.QUEUED, lifetime.preload())
+        runQueued()
+        assertEquals(0, engine.prepares)
 
         // Another model is tried at once.
         engine.model = "other.gguf"
         assertEquals(ModelLifetime.PreloadResult.QUEUED, lifetime.preload())
         runQueued()
+        assertEquals(1, engine.prepares)
 
         // The failed one again after the backoff.
         engine.model = "parakeet.gguf"
         now += 300_000L
         assertEquals(ModelLifetime.PreloadResult.QUEUED, lifetime.preload())
+        runQueued()
+        assertEquals(2, engine.prepares)
     }
 
     @Test
@@ -122,6 +129,8 @@ class ModelLifetimeTest {
         lifetime.loaded("parakeet.gguf")
         assertEquals(ModelLifetime.State.Ready("parakeet.gguf"), lifetime.state())
         assertEquals(ModelLifetime.PreloadResult.QUEUED, lifetime.preload())
+        runQueued()
+        assertEquals(1, engine.prepares)
     }
 
     @Test
@@ -195,9 +204,24 @@ class ModelLifetimeTest {
         lifetime.preload()
         runQueued()
         assertEquals(ModelLifetime.State.Failed("parakeet.gguf", "no libstarling_jni"), lifetime.state())
-        assertEquals(ModelLifetime.PreloadResult.RECENTLY_FAILED, lifetime.preload())
+        // The failed model is inside its backoff: queued, but never loaded.
+        lifetime.preload()
+        runQueued()
+        assertEquals(1, engine.prepares)
         now += 300_000L
+        lifetime.preload()
+        runQueued()
+        assertEquals(2, engine.prepares)
+    }
+
+    @Test
+    fun aPreloadQueuedBeforeALoadFailureNeverRetriesIt() {
         assertEquals(ModelLifetime.PreloadResult.QUEUED, lifetime.preload())
+        // A recording fails this model while the preload waits for the engine;
+        // the backoff check runs on the worker, after that failure.
+        lifetime.loadFailed("parakeet.gguf", "no libstarling_jni")
+        runQueued()
+        assertEquals(0, engine.prepares)
     }
 
     @Test
@@ -217,6 +241,8 @@ class ModelLifetimeTest {
         assertEquals(ModelLifetime.State.Failed("big.gguf", oom), lifetime.state())
         engine.model = "small.gguf"
         assertEquals(ModelLifetime.PreloadResult.QUEUED, lifetime.preload())
+        runQueued()
+        assertEquals(1, engine.prepares)
 
         val lost = oom.replace("VkResult -2", "VkResult -4")
         assertTrue(ModelLifetime.isDriverFailure(lost))

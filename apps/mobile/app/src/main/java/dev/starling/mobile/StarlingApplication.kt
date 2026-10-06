@@ -6,9 +6,11 @@ import android.content.ComponentCallbacks2
 import android.content.Context
 import android.os.Handler
 import android.os.Looper
+import android.util.Log
 import dev.starling.mobile.engine.ModelLifetime
 import dev.starling.mobile.engine.OnDeviceBackend
 import dev.starling.mobile.engine.OnDeviceEngine
+import dev.starling.mobile.network.BackendConfig
 import dev.starling.mobile.network.BackendSettings
 import dev.starling.mobile.network.TranscriptionCoordinator
 import dev.starling.mobile.network.TranscriptionEngine
@@ -115,7 +117,22 @@ class StarlingApplication : Application() {
     fun preloadOnDeviceModel() {
         if (backendSettings.load().engine != TranscriptionEngine.ON_DEVICE) return
         runCatching { modelLifetime.preload() }
+            .onFailure { t ->
+                // runCatching around Log: it is a stub in local unit tests,
+                // and a failed diagnostic must not take down the surface.
+                runCatching { Log.w(TAG, "on-device model preload failed", t) }
+            }
     }
+
+    /**
+     * Whether [config] streams on-device while the model is still loading:
+     * the one predicate behind the voice surfaces' "loading" status (the
+     * recorder, the recognizer popup and the keyboard), so they cannot
+     * drift apart. Audio is saved from the first sample either way.
+     */
+    fun isOnDeviceModelLoading(config: BackendConfig): Boolean =
+        config.engine == TranscriptionEngine.ON_DEVICE &&
+            modelLifetime.state() !is ModelLifetime.State.Ready
 
     /**
      * Refuses a model load that clearly cannot fit: the model's file size is
@@ -137,6 +154,8 @@ class StarlingApplication : Application() {
     }
 
     private companion object {
+        private const val TAG = "StarlingApplication"
+
         /** Activations and graph buffers on top of the weights. */
         const val MODEL_WORKING_SET_BYTES = 128L * 1024 * 1024
     }

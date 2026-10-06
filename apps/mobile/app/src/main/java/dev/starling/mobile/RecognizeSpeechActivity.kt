@@ -14,11 +14,9 @@ import dev.starling.mobile.audio.AudioCapture
 import dev.starling.mobile.audio.AudioChunkListener
 import dev.starling.mobile.audio.CaptureResult
 import dev.starling.mobile.data.Recording
-import dev.starling.mobile.engine.ModelLifetime
 import dev.starling.mobile.network.BackendConfig
 import dev.starling.mobile.network.StreamEvent
 import dev.starling.mobile.network.StreamSession
-import dev.starling.mobile.network.TranscriptionEngine
 
 /**
  * The `ACTION_RECOGNIZE_SPEECH` popup (E22): apps that ask the system for
@@ -157,8 +155,7 @@ class RecognizeSpeechActivity : Activity() {
         }
         activeRecording = recording
         streamSession = session
-        val loading = session != null && config.engine == TranscriptionEngine.ON_DEVICE &&
-            application.modelLifetime.state() !is ModelLifetime.State.Ready
+        val loading = session != null && application.isOnDeviceModelLoading(config)
         statusView.setText(if (loading) R.string.recognize_listening_loading else R.string.recognize_listening)
     }
 

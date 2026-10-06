@@ -303,7 +303,7 @@ class OnDeviceStreamSessionTest {
     }
 
     @Test
-    fun aBacklogThatCannotBeOpenedKeepsTheOldBufferCap() {
+    fun aBacklogThatCannotBeOpenedFailsWithTheRealCauseNotTheBufferCap() {
         val session = OnDeviceStreamSession(
             engine = FakeEngine(),
             events = { events += it },
@@ -314,7 +314,12 @@ class OnDeviceStreamSessionTest {
         session.onAudio(chunk, chunk.size)
 
         val interrupted = awaitEvent { it is StreamEvent.Interrupted } as StreamEvent.Interrupted
-        assertTrue(interrupted.bufferLimitReached)
+        // An I/O failure is not the engine falling behind: the reason keeps
+        // the exception's message, and the buffer-cap flag stays reserved for
+        // the genuine no-backlog case.
+        assertFalse(interrupted.bufferLimitReached)
+        assertEquals("the saved recording could not be opened: no partial WAV", interrupted.reason)
+        assertTrue(session.finish() is CommitOutcome.Fallback)
     }
 
     private companion object {

@@ -534,7 +534,12 @@ class OnDeviceEngine(
         // mirroring starling-serve's warmup.
         if (StarlingNative.transcribe(handle, FloatArray(Warmup.SAMPLES), Warmup.SAMPLE_RATE) == null) {
             val error = StarlingNative.lastError(handle)
-            if (GpuFailure.matches(error)) {
+            // The same discrimination as ModelLifetime: an allocation that
+            // did not fit (another model, or more free memory, may work) or
+            // a preflight refusal is recoverable, so the warmup leaves the
+            // model resident for the first real request to report; only a
+            // lost/wedged device is fatal to the handle.
+            if (error != null && ModelLifetime.isDriverFailure(error)) {
                 // #325: a GPU driver that fails the warmup fails every request
                 // after it. Report it instead of serving from a broken handle;
                 // the caller decides whether a retry is wanted (speculative
@@ -585,7 +590,16 @@ class OnDeviceEngine(
         }
         // A closed session must not load (and so undo a deferred release).
         if (cancelled()) return "the live session was closed"
-        usingLocked { ensureLoadedLocked().also { if (it == null) pinnedSessions++ } }
+        usingLocked {
+            ensureLoadedLocked().also {
+                // Pins the loaded model to this session until
+                // liveSessionEnded(prepared = true). Invariant: every path
+                // that decrements [pinnedSessions] must lock.notifyAll(),
+                // or a take waiting above strands for a full
+                // PIN_WAIT_SLICE_MILLIS per slice.
+                if (it == null) pinnedSessions++
+            }
+        }
     }
 
     /**
@@ -657,13 +671,17 @@ class OnDeviceEngine(
     override fun liveSessionEnded(prepared: Boolean) {
         liveSessions.updateAndGet { maxOf(0, it - 1) }
         synchronized(lock) {
-            if (prepared) pinnedSessions = maxOf(0, pinnedSessions - 1)
+            if (prepared && pinnedSessions > 0) {
+                pinnedSessions--
+                // Tied to the decrement itself (see prepare()'s invariant):
+                // a take waiting there for this pin to drop must be woken,
+                // so any future path that decrements cannot strand it.
+                lock.notifyAll()
+            }
             if (pinnedSessions == 0 && releasePending) {
                 releasePending = false
                 unload()
             }
-            // A take waiting in prepare() for this pin to drop.
-            if (prepared) lock.notifyAll()
             // Reported as idle only when no session is live (see reportIdleLocked).
             reportIdleLocked()
         }
