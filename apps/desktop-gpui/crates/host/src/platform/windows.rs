@@ -928,9 +928,12 @@ pub fn finish_pending_closes() {
 /// **empirically pinned, not documented**: the ipc suite's
 /// `a_successor_serves_immediately_after_shutdown_with_an_unread_client`
 /// (run on the Windows CI lane) exercises exactly that shape. The
-/// bound below is the documented backstop — `CancelSynchronousIo` ends
-/// the flush whatever the disconnect did — so a linger (and its pipe
-/// handles) always stays inside [`finish_pending_closes`]'s window.
+/// bound below is an attempted backstop, not a guarantee:
+/// `CancelSynchronousIo` only *requests* cancellation of the flush (the
+/// operation may still run to completion first), so a linger normally
+/// ends well inside [`finish_pending_closes`]'s window, and when one
+/// does not, that function reports the overrun on stderr instead of
+/// passing it silently.
 const FLUSH_CANCEL_GRACE: Duration = Duration::from_millis(250);
 
 /// The server side of a close, off the caller's thread: flush (returns
