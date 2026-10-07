@@ -340,11 +340,17 @@ pub enum InsertError {
     /// next chunk never started, not that typing rode the keys.
     ModifiersHeld { held: Vec<String> },
     /// Typing stopped part-way through the text: `delivered_chars`
-    /// characters were fully typed before `cause` stopped the rest —
-    /// the target may hold that much, and only that much. `cause` is
-    /// boxed so the variant stays flat in size. Zero characters
-    /// delivered never produces this variant: with nothing typed, the
-    /// cause is returned bare (there is nothing "partial" to report).
+    /// characters had their key-**down** accepted before `cause`
+    /// stopped the rest — the target may hold that much, and only that
+    /// much. A character counts the moment its key-down was accepted
+    /// (on Windows: the keydown event's index is below `SendInput`'s
+    /// returned count; on X11: the press request was issued
+    /// successfully), even if the rest of its keystroke never
+    /// completed — so the count never understates what may have
+    /// landed. `cause` is boxed so the variant stays flat in size.
+    /// With no key-down accepted at all this variant is never
+    /// produced: with nothing typed, the cause is returned bare (there
+    /// is nothing "partial" to report).
     PartialDelivery {
         delivered_chars: usize,
         total_chars: usize,
@@ -826,22 +832,26 @@ pub(crate) fn weighed_segments<'a, F: Fn(char) -> usize>(
     segments
 }
 
-/// How many leading characters of `text` are *completely* contained in
-/// the first `units` UTF-16 units — a character whose surrogate pair
-/// was cut in half was not delivered. Windows reports SendInput's
-/// progress in events (down+up pairs per unit), and half a pair is
-/// worse than nothing, so only whole characters count.
+/// How many leading characters of `text` had their first key-DOWN
+/// event accepted, given that the first `accepted_events` events of
+/// the Windows-style down/up stream went in. Events alternate
+/// down/up per UTF-16 unit, so character *i*'s first keydown is event
+/// number `2 * (utf16 unit index of its first unit)`. A surrogate
+/// pair counts as delivered once its **first unit's** keydown was
+/// accepted: the second unit may never arrive, but a half-typed pair
+/// is possibly-delivered garbage in the target, not "nothing" — the
+/// count is an upper bound of what may have landed and must never
+/// understate it.
 #[cfg(any(windows, test))]
-pub(crate) fn chars_complete_within_units(text: &str, units: usize) -> usize {
-    let mut remaining = units;
+pub(crate) fn chars_keyed_down_within_events(text: &str, accepted_events: usize) -> usize {
+    let mut unit_index = 0usize;
     let mut characters = 0usize;
     for character in text.chars() {
-        let length = character.len_utf16();
-        if length > remaining {
+        if 2 * unit_index >= accepted_events {
             break;
         }
-        remaining -= length;
         characters += 1;
+        unit_index += character.len_utf16();
     }
     characters
 }
@@ -1180,18 +1190,57 @@ mod tests {
     }
 
     #[test]
-    fn complete_chars_never_count_a_severed_surrogate_half() {
+    fn keyed_down_chars_count_the_moment_their_keydown_was_accepted() {
+        // The Windows-style event stream of "a😀b": down(a), up(a),
+        // down(hi-surrogate), up(hi), down(lo), up(lo), down(b),
+        // up(b) — events 0..8. A character counts once its key-DOWN
+        // (an even index) is below the accepted count; a surrogate
+        // pair counts once its first unit's keydown went in, even if
+        // the pair was cut right after it.
         let text = "a😀b";
-        assert_eq!(chars_complete_within_units(text, 0), 0);
-        assert_eq!(chars_complete_within_units(text, 1), 1, "just 'a'");
         assert_eq!(
-            chars_complete_within_units(text, 2),
-            1,
-            "the pair's first half does not count as a delivered character"
+            chars_keyed_down_within_events(text, 0),
+            0,
+            "nothing accepted"
         );
-        assert_eq!(chars_complete_within_units(text, 3), 2, "'a😀'");
-        assert_eq!(chars_complete_within_units(text, 4), 3, "everything");
-        assert_eq!(chars_complete_within_units(text, 99), 3);
+        assert_eq!(
+            chars_keyed_down_within_events(text, 1),
+            1,
+            "only down(a) accepted: 'a' may have landed"
+        );
+        assert_eq!(
+            chars_keyed_down_within_events(text, 2),
+            1,
+            "down(a)+up(a): still just 'a'"
+        );
+        assert_eq!(
+            chars_keyed_down_within_events(text, 3),
+            2,
+            "the pair's first unit's keydown accepted: the pair counts"
+        );
+        assert_eq!(
+            chars_keyed_down_within_events(text, 4),
+            2,
+            "the pair cut after its first down+up: still counts as keyed down"
+        );
+        assert_eq!(
+            chars_keyed_down_within_events(text, 5),
+            2,
+            "the pair's second unit's keydown accepted: one character, not two"
+        );
+        assert_eq!(
+            chars_keyed_down_within_events(text, 7),
+            3,
+            "down(b) accepted: everything counts"
+        );
+        assert_eq!(chars_keyed_down_within_events(text, 99), 3);
+
+        // The odd short count — a stream cut right after a keydown,
+        // SendInput returning an odd number — must not round the
+        // character away: 3 events in (down(a), up(a), down(hi)), 2
+        // characters may have landed.
+        assert_eq!("a😀b".encode_utf16().count(), 4, "a, hi, lo, b");
+        assert_eq!(chars_keyed_down_within_events("a😀b", 3), 2);
     }
 
     /// The chunk loop, scripted like a backend: a queue of check and

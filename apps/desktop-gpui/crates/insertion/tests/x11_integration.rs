@@ -32,6 +32,12 @@
 //!    and the whole keyboard mapping is byte-for-byte what it was
 //!    before the insert — the leak-free invariant, asserted against
 //!    the live server rather than the backend's return value.
+//!    3b. The same remap path with an *unmapped uppercase letter*
+//!    (picked at runtime like the BMP one): a borrow that wrote only
+//!    the base column would let XKB expand a lowercase/uppercase pair
+//!    (the planner would then find the letter gone or the unshifted
+//!    press would type the wrong case), so this pins that an
+//!    uppercase borrow decodes as text with its case intact.
 //! 4. **Held modifiers refuse typing**: Ctrl held down via XTest
 //!    during an insert makes the insert wait out the bounded release
 //!    window and then refuse with `ModifiersHeld` — nothing typed,
@@ -44,6 +50,10 @@
 //!    with `PartialDelivery`, names how much may have landed, exactly
 //!    that prefix decodes from the event stream, and the keyboard
 //!    mapping still ends where it started.
+//!    5b. **Concurrent inserts serialize**: two inserts racing from
+//!    two threads land whole and in order (`text + text`, never a
+//!    character-level interleave) — the process-wide insert lock in
+//!    action, including the mapping load.
 //! 6. **Focus safety at the edges**: with the second window focused,
 //!    revalidate of the first snapshot reports `TargetChanged` (naming
 //!    the new target), `insert` into the old snapshot refuses, and
@@ -93,6 +103,10 @@ const MIXED_TAIL: &str = " → 42!";
 const MIXED_REMAP_CANDIDATES: &[char] = &['ŋ', 'ƍ', 'Ƃ', 'ǅ', 'ƞ'];
 /// Candidate astral characters for the dedicated remap-path insert.
 const UNMAPPED_CANDIDATES: &[char] = &['🦄', '🥑', '🛰', '𝄞'];
+/// Candidate *uppercase* BMP letters (each with a lowercase twin, so
+/// XKB's case-pair expansion would apply to a single-column borrow)
+/// for the uppercase remap-path insert.
+const UPPER_UNMAPPED_CANDIDATES: &[char] = &['Ŋ', 'Ƕ', 'Ǯ', 'Ǥ', 'Ɣ'];
 /// `XK_Control_L` — the held-modifier test's key.
 const XK_CONTROL_L: u32 = 0xffe3;
 /// `XK_Control_R`, the fallback if a layout has no left Control.
@@ -156,6 +170,7 @@ fn main_test() -> Result<(), ItError> {
     // is genuinely absent from the live mapping.
     let mixed_remap = unmapped_char(&kb, MIXED_REMAP_CANDIDATES);
     let unmapped = unmapped_char(&kb, UNMAPPED_CANDIDATES);
+    let upper = unmapped_char(&kb, UPPER_UNMAPPED_CANDIDATES);
     let mixed = format!("{MIXED_HEAD}{mixed_remap}{MIXED_TAIL}");
 
     // Normalize the keyboard state the backend is entitled to require:
@@ -209,10 +224,13 @@ fn main_test() -> Result<(), ItError> {
             let backend_thread = X11Backend::new();
             let snapshot = snap_a.clone();
             let payload = mixed.clone();
-            std::thread::spawn(move || backend_thread.insert(&snapshot, &payload))
+            vec![std::thread::spawn(move || {
+                backend_thread.insert(&snapshot, &payload)
+            })]
         },
         None,
     )?;
+    let receipt = receipt.into_iter().next().expect("one insert thread");
     let receipt = receipt.map_err(|e| x11(format!("inserting {mixed:?}: {e}")))?;
     assert_eq!(receipt.evidence, EVIDENCE_SYNTHETIC_KEYS);
     assert_eq!(typed, mixed, "the KeyPress stream decodes back to the text");
@@ -230,15 +248,49 @@ fn main_test() -> Result<(), ItError> {
             let backend_thread = X11Backend::new();
             let snapshot = snap_a.clone();
             let payload = unmapped_text.clone();
-            std::thread::spawn(move || backend_thread.insert(&snapshot, &payload))
+            vec![std::thread::spawn(move || {
+                backend_thread.insert(&snapshot, &payload)
+            })]
         },
         None,
     )?;
+    let receipt = receipt.into_iter().next().expect("one insert thread");
     let receipt = receipt.map_err(|e| x11(format!("inserting {unmapped}: {e}")))?;
     assert_eq!(receipt.evidence, EVIDENCE_SYNTHETIC_KEYS);
     assert_eq!(
         typed, unmapped_text,
         "the remapped character must arrive as text, not as a bare keycode"
+    );
+    kb.assert_mapping_is(&conn, &mapping_before)?;
+
+    // 3b. The remap path with an unmapped *uppercase* letter. The
+    //     borrow must write the keysym into every column (all groups ×
+    //     levels), leaving XKB no case pair to expand: the unshifted
+    //     press then yields exactly the uppercase letter, and the
+    //     decode must carry the case. A single column-0 write would
+    //     come back expanded into a lowercase/uppercase pair here and
+    //     type the wrong case (or find nothing to type at all).
+    let upper_text = format!("a{upper}b{upper}");
+    let (receipt, typed) = insert_and_decode(
+        &conn,
+        a,
+        &mut kb,
+        || {
+            let backend_thread = X11Backend::new();
+            let snapshot = snap_a.clone();
+            let payload = upper_text.clone();
+            vec![std::thread::spawn(move || {
+                backend_thread.insert(&snapshot, &payload)
+            })]
+        },
+        None,
+    )?;
+    let receipt = receipt.into_iter().next().expect("one insert thread");
+    let receipt = receipt.map_err(|e| x11(format!("inserting {upper_text:?}: {e}")))?;
+    assert_eq!(receipt.evidence, EVIDENCE_SYNTHETIC_KEYS);
+    assert_eq!(
+        typed, upper_text,
+        "an uppercase borrowed keycode must decode as text with its case intact"
     );
     kb.assert_mapping_is(&conn, &mapping_before)?;
 
@@ -271,6 +323,41 @@ fn main_test() -> Result<(), ItError> {
         drain_text(&conn, a, &mut kb)?.is_empty(),
         "a held-modifier refusal may not type"
     );
+
+    // 5b. Concurrent inserts serialize: two inserts racing from two
+    //     threads must not interleave — the process-wide insert lock
+    //     means one types (and borrows, and restores) to completion
+    //     before the other even loads the keyboard mapping, so the
+    //     event stream is exactly one text then the other, never a
+    //     character-level interleave (and the second insert must not
+    //     consume the first's temporary remap).
+    let (results, typed) = insert_and_decode(
+        &conn,
+        a,
+        &mut kb,
+        || {
+            (0..2)
+                .map(|_| {
+                    let backend_thread = X11Backend::new();
+                    let snapshot = snap_a.clone();
+                    let payload = mixed.clone();
+                    std::thread::spawn(move || backend_thread.insert(&snapshot, &payload))
+                })
+                .collect()
+        },
+        None,
+    )?;
+    assert_eq!(results.len(), 2);
+    for (index, result) in results.into_iter().enumerate() {
+        let receipt = result.map_err(|e| x11(format!("concurrent insert {index}: {e}")))?;
+        assert_eq!(receipt.evidence, EVIDENCE_SYNTHETIC_KEYS);
+    }
+    assert_eq!(
+        typed,
+        format!("{mixed}{mixed}"),
+        "two concurrent inserts must land whole and in order, never interleaved"
+    );
+    kb.assert_mapping_is(&conn, &mapping_before)?;
 
     // 5. Chunked typing rechecks the target. B is created *unmapped*
     //    (creating a window takes no focus) and mapped the moment the
@@ -333,10 +420,13 @@ fn main_test() -> Result<(), ItError> {
             let backend_thread = X11Backend::new();
             let snapshot = snap_a.clone();
             let payload = long.clone();
-            std::thread::spawn(move || backend_thread.insert(&snapshot, &payload))
+            vec![std::thread::spawn(move || {
+                backend_thread.insert(&snapshot, &payload)
+            })]
         },
         Some(&steal),
     )?;
+    let result = result.into_iter().next().expect("one insert thread");
     match result {
         Err(InsertError::PartialDelivery {
             delivered_chars,
@@ -414,9 +504,9 @@ fn main_test() -> Result<(), ItError> {
     cleanup.run();
     println!(
         "starling-insertion X11 IT passed: capture identity, mixed-string decode as text \
-         ({mixed:?}), remap+restore (mapping byte-for-byte unchanged), held-modifier \
-         refusal, chunk-bounded partial delivery on focus steal, changed and gone \
-         revalidation"
+         ({mixed:?}), remap+restore (mapping byte-for-byte unchanged), uppercase remap decode \
+         ({upper_text:?}), held-modifier refusal, chunk-bounded partial delivery on focus \
+         steal, serialized concurrent inserts, changed and gone revalidation"
     );
     Ok(())
 }
@@ -536,23 +626,26 @@ fn normalize_keyboard_state(tapper: &RustConnection, kb: &Keyboard) -> Result<()
     Ok(())
 }
 
-/// Run one insert (on its own thread, via `spawn`) while this thread
-/// consumes this connection's event stream *as it arrives*: every
-/// `KeyPress` for `window` is decoded with the keymap copy current at
-/// the moment the event is read, and the copy is refreshed whenever a
-/// `MappingNotify` flows past — the faithful "decode as text at event
-/// time" a promptly-reading target performs (decoding after the fact
-/// would read the restored mapping and hide remap/restore bugs).
-/// `on_first_press` runs (on this thread) when the first `KeyPress`
-/// is observed — the deterministic hook the focus-steal test uses.
+/// Run one or more inserts (each on its own thread, via `spawn`)
+/// while this thread consumes this connection's event stream *as it
+/// arrives*: every `KeyPress` for `window` is decoded with the keymap
+/// copy current at the moment the event is read, and the copy is
+/// refreshed whenever a `MappingNotify` flows past — the faithful
+/// "decode as text at event time" a promptly-reading target performs
+/// (decoding after the fact would read the restored mapping and hide
+/// remap/restore bugs). `on_first_press` runs (on this thread) when
+/// the first `KeyPress` is observed — the deterministic hook the
+/// focus-steal test uses. Every spawned handle is joined before the
+/// result is returned, so a caller spawning concurrent inserts sees
+/// all their outcomes.
 fn insert_and_decode(
     conn: &RustConnection,
     window: Window,
     kb: &mut Keyboard,
-    spawn: impl FnOnce() -> std::thread::JoinHandle<Result<InsertReceipt, InsertError>>,
+    spawn: impl FnOnce() -> Vec<std::thread::JoinHandle<Result<InsertReceipt, InsertError>>>,
     on_press: Option<&dyn Fn(usize, &RustConnection) -> Result<(), ItError>>,
-) -> Result<(Result<InsertReceipt, InsertError>, String), ItError> {
-    let handle = spawn();
+) -> Result<(Vec<Result<InsertReceipt, InsertError>>, String), ItError> {
+    let handles = spawn();
     let deadline = Instant::now() + INSERT_BUDGET;
     let mut decoded = String::new();
     let mut first_press_seen = 0usize;
@@ -588,8 +681,8 @@ fn insert_and_decode(
     };
     loop {
         pump(&mut *kb, &mut decoded);
-        if handle.is_finished() {
-            // Stragglers: events the server queued before the insert
+        if handles.iter().all(|handle| handle.is_finished()) {
+            // Stragglers: events the server queued before the inserts
             // returned still count as "what the target saw".
             std::thread::sleep(DRAIN_GRACE);
             pump(&mut *kb, &mut decoded);
@@ -602,7 +695,10 @@ fn insert_and_decode(
         }
         std::thread::sleep(Duration::from_millis(2));
     }
-    let joined = handle.join().expect("the inserting thread must not panic");
+    let joined = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("an inserting thread must not panic"))
+        .collect();
     match listener_error {
         Some(error) => Err(error),
         None => Ok((joined, decoded)),

@@ -37,12 +37,15 @@
 //! identity checks repeated before every chunk. A send that comes
 //! back short — input blocked mid-stream, classically UIPI against a
 //! higher-privilege target, but also a switch of the input desktop —
-//! is reported honestly as [`InsertError::PartialDelivery`]: the
-//! events that did go in were typed, down to the last *complete*
-//! character (a severed surrogate half counts as nothing), and the
-//! message never claims nothing landed. With zero events delivered
-//! the underlying refusal (typically
-//! [`InsertError::PermissionDenied`]) is returned bare.
+//! is reported honestly as [`InsertError::PartialDelivery`]: a
+//! character counts as possibly delivered the moment its key-DOWN
+//! was accepted (the index of its first keydown event is below
+//! `SendInput`'s returned count; a surrogate pair counts once its
+//! first unit's keydown went in — a half-typed pair is
+//! possibly-delivered garbage, not "nothing"), and the message never
+//! claims nothing landed. With no key-down accepted at all the
+//! underlying refusal (typically [`InsertError::PermissionDenied`])
+//! is returned bare.
 //!
 //! # Deliberately absent in phase A
 //!
@@ -51,7 +54,7 @@
 //! reports it absent until then).
 
 use crate::{
-    chars_complete_within_units, cheap_insertion_guards, deliver_in_chunks, format_ref,
+    chars_keyed_down_within_events, cheap_insertion_guards, deliver_in_chunks, format_ref,
     merge_excluded_pids, parse_ref, weighed_segments, Availability, BackendKind, ChunkFailure,
     InsertError, InsertReceipt, InsertionBackend, SurroundingText, TargetCheck, TargetSnapshot,
     MODIFIER_POLL_INTERVAL, MODIFIER_RELEASE_WAIT,
@@ -116,7 +119,9 @@ impl WindowsBackend {
     /// window of their own. Production code uses
     /// [`Self::with_excluded_pids`] (or the [`crate::Inserter`]), which
     /// always protects this process.
-    pub fn with_exact_excluded_pids_for_self_typing_tests(excluded_pids: Vec<u32>) -> WindowsBackend {
+    pub fn with_exact_excluded_pids_for_self_typing_tests(
+        excluded_pids: Vec<u32>,
+    ) -> WindowsBackend {
         WindowsBackend { excluded_pids }
     }
 
@@ -401,13 +406,18 @@ impl InsertionBackend for WindowsBackend {
                     // A short count means the stream was cut: blocked
                     // input is *not* all-or-nothing across a chunked
                     // delivery, so never claim nothing landed. What
-                    // went in are the first `sent` events — whole
-                    // down/up pairs each, and only complete characters
-                    // count (a severed surrogate half delivered
-                    // nothing readable).
-                    let units_delivered = unit_cursor - units + sent as usize / 2;
+                    // went in are the first `sent` events of this
+                    // chunk's slice, i.e. the first
+                    // `(unit_cursor - units) * 2 + sent` events of the
+                    // whole text's array — and a character counts as
+                    // possibly delivered the moment its key-DOWN (an
+                    // even event index) was accepted: a cut right
+                    // after a keydown still counts that character,
+                    // and a surrogate pair counts once its first
+                    // unit's keydown went in.
+                    let accepted_events = (unit_cursor - units) * 2 + sent as usize;
                     return Err(ChunkFailure {
-                        delivered: chars_complete_within_units(text, units_delivered),
+                        delivered: chars_keyed_down_within_events(text, accepted_events),
                         cause: InsertError::PermissionDenied {
                             reason: "the input stream was cut part-way, possibly blocked by a \
                                      higher-privilege target (UIPI) or an input desktop change"

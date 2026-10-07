@@ -39,13 +39,17 @@
 //!   refuses with [`InsertError::ModifiersHeld`]; it never synthesizes
 //!   a modifier release to fake readiness. After any wait the identity
 //!   check runs again before a key moves.
-//! - **Effective/locked group and Caps/Shift Lock** (`group`,
-//!   `locked_mods`, `latched_mods`): if a group other than the first
-//!   is active, or Caps/Shift Lock (or any locked modifier that
-//!   changes what a bare keypress means — Alt, Super, AltGr) is
-//!   engaged, the base/Shift columns do not identify the effective
+//! - **Effective/locked group and locked or latched modifiers**
+//!   (`group`, `locked_mods`, `latched_mods`): if a group other than
+//!   the first is active, or *any* modifier bit is locked or latched
+//!   except the one bit the live modifier mapping actually binds to
+//!   `Num_Lock`, the base/Shift columns do not identify the effective
 //!   character, and the backend refuses with
 //!   [`InsertError::KeyboardStateUnsupported`] instead of guessing.
+//!   Which bit Num_Lock is must be *read* from the server, not
+//!   assumed: layouts bind it anywhere in Mod1..Mod5 (or nowhere),
+//!   and a locked Mod2 that is not this session's Num_Lock changes
+//!   what a bare keypress means.
 //!
 //! Pre-mapped keycodes are used only under the state those checks
 //! establish: a keysym found in columns 0/1 of group 0 where Shift is
@@ -61,11 +65,34 @@
 //! The remap is server-global and racing other clients would corrupt
 //! *their* typing, so it is transactional:
 //!
-//! - a process-wide mutex serializes remap transactions of this
-//!   process (concurrent inserts never share a spare);
+//! - a process-wide lock (`INSERT_LOCK`) serializes whole X11
+//!   *inserts* of this process — taken before the keyboard mapping is
+//!   loaded for planning and held through typing and cleanup — because
+//!   even a mapping *read* can consume a sibling's borrow: a mapping
+//!   loaded while another insert of this process holds a temporary
+//!   remap plans "pre-mapped" keycodes that the sibling restores to
+//!   all-`NoSymbol` before the first key is typed. One X11 insert runs
+//!   at a time per process (the lock's own docs say why that is the
+//!   honest granularity);
+//! - each borrow's short read→write→echo-read sequence and each
+//!   restore's compare→write sequence run inside a server grab
+//!   (`GrabServer`/`UngrabServer`), so no *other X client* can
+//!   interleave a remap of the same keycode between the ownership
+//!   check and the write. The grab is held for those few requests
+//!   only — never across a sleep, a wait or any typing — and the
+//!   guard releases it even on error;
 //! - right before remapping, the keycode's *live* mapping is re-read
 //!   and required to still be all-`NoSymbol` (another client's remap
-//!   picks the next spare; none free is a `keyboard_busy` refusal);
+//!   picks the next spare; none free is a `keyboard_busy`-style
+//!   refusal). The requested keysym is written into **every** column
+//!   of the keycode — all groups × levels the server reports — so
+//!   there is no lowercase/uppercase pair for XKB to expand (writing
+//!   only column 0 would let an uppercase letter come back expanded
+//!   into a case pair and type in the wrong case, or not at all), and
+//!   the server's echo is verified to still carry the requested
+//!   keysym in the base column; an unexpected echo is a refusal,
+//!   never a panic. The keysym a plan types is kept separately from
+//!   the echoed mapping the restore comparison uses;
 //! - on restore, the live mapping is re-read and restored only if it
 //!   still equals exactly what Starling wrote — another client's
 //!   change is left alone (with a warning logged);
@@ -84,7 +111,10 @@
 //! characters, with the full safety check (held modifiers, keyboard
 //! state, focus/identity/pid) repeated before *every* chunk; a change
 //! part-way stops typing immediately and reports
-//! [`InsertError::PartialDelivery`] with how much may have landed.
+//! [`InsertError::PartialDelivery`] with how much may have landed — a
+//! character counts as possibly delivered the moment its key-down was
+//! issued, so the count never understates what the target may hold
+//! (even a character whose keystroke did not complete).
 //!
 //! # Connections
 //!
@@ -129,23 +159,14 @@ const FOCUS_POINTER_ROOT: Window = 1;
 /// keyboard the Shift state a column-1 keysym needs.
 const XK_SHIFT_L: Keysym = 0xffe1;
 const XK_SHIFT_R: Keysym = 0xffe2;
+/// `XK_Num_Lock` — the keysym whose bound modifier bit is the one
+/// locked modifier that stays harmless (see [`check_keyboard_state`]:
+/// which bit that is is read from the live modifier mapping, never
+/// assumed).
+const XK_NUM_LOCK: Keysym = 0xff7f;
 
 /// `xkbUseCoreKeyboard` — the device `GetState` is asked about.
 const USE_CORE_KEYBOARD: u16 = 0x100;
-
-/// Locked modifiers that change what a bare keypress means, so typing
-/// under them would not type what was asked: Shift and Lock (Caps Lock
-/// and Shift Lock), Control, Mod1 (usually Alt), Mod4 (usually Super)
-/// and Mod5 (usually AltGr). NumLock (Mod2) and Mod3 only reshape
-/// keypad keys, which text characters never ride on, so a locked
-/// NumLock stays allowed. Bit positions are the core protocol's
-/// modifier mask bits (x11rb's `ModMask` constants in `u16` form).
-const HAZARDOUS_LOCKED_MODS: u16 = 0b0000_0001 /* Shift */
-        | 0b0000_0010 /* Lock: Caps Lock / Shift Lock */
-        | 0b0000_0100 /* Control */
-        | 0b0000_1000 /* Mod1: usually Alt */
-        | 0b0100_0000 /* Mod4: usually Super */
-        | 0b1000_0000; /* Mod5: usually AltGr */
 
 /// How long a synthetic key stays "down". Real keys are down for tens
 /// of milliseconds; a zero hold can be dropped or coalesced by
@@ -168,15 +189,24 @@ pub const X11_CHUNK_CHARS: usize = 16;
 /// the restored all-`NoSymbol` mapping and drop it.
 const KEYMAP_SETTLE: Duration = Duration::from_millis(50);
 
-/// Serializes every remap *transaction* of this process: from the
-/// first `ChangeKeyboardMapping` a transaction writes until it has
-/// restored (or decided not to restore) every keycode it touched.
-/// Concurrent inserts therefore never share a spare keycode, and the
-/// "still all-`NoSymbol`?" re-read each transaction performs cannot
-/// race a sibling transaction inside this process. Other X clients
-/// are serialized by the server and handled by the same re-read plus
-/// the restore-only-if-unchanged rule.
-static REMAP_LOCK: Mutex<()> = Mutex::new(());
+/// Serializes every X11 *insert* of this process, from before the
+/// keyboard mapping is loaded for planning until cleanup has given
+/// back (or attempted to give back) every borrowed keycode. The
+/// granularity is the whole insert, not just the remap write,
+/// because the keyboard mapping is server-global state that even a
+/// *read* consumes: a `GetKeyboardMapping` performed while a sibling
+/// insert of this process holds a temporary remap reports the
+/// sibling's keysyms as pre-mapped, the reader plans those keycodes,
+/// and the sibling's restore then unmapps them before the reader's
+/// first key is typed — one insert silently consuming another's
+/// mapping. Holding the lock across load → plan → type → cleanup is
+/// the only placement after which no such interleaving exists, so
+/// one X11 insert runs at a time per process (inserts are seconds-long
+/// typing bursts at most; queueing them is the honest behavior).
+/// Other X clients are not covered by this lock — the
+/// `GrabServer`-wrapped ownership sections and the restore's
+/// compare-before-write handle them.
+static INSERT_LOCK: Mutex<()> = Mutex::new(());
 
 /// The X11 backend. Stateless: every call opens its own connection
 /// (see the module docs for why that is simpler and *more* robust than
@@ -423,6 +453,36 @@ impl Session {
             .collect())
     }
 
+    /// The modifier bit the *live* modifier mapping binds to `Num_Lock`:
+    /// the first row (of the eight) with a keycode whose trusted
+    /// columns carry the `Num_Lock` keysym. `None` when no row carries
+    /// it — and then no locked or latched bit is harmless. Read from
+    /// the server every time it matters, never assumed: which of
+    /// Mod1..Mod5 carries NumLock is a property of the session's
+    /// layout, and "Mod2 is probably NumLock" is exactly the guess
+    /// that types wrong characters.
+    fn num_lock_bit(&self) -> Result<Option<u16>, InsertError> {
+        let setup = self.conn.setup();
+        let (min, max) = (setup.min_keycode, setup.max_keycode);
+        let rows = self.modifier_rows()?;
+        for (bit, row) in rows.iter().enumerate() {
+            for &keycode in row
+                .iter()
+                .filter(|&keycode| *keycode >= min && *keycode <= max)
+            {
+                if self
+                    .keycode_syms(keycode)?
+                    .iter()
+                    .take(2)
+                    .any(|&sym| sym == XK_NUM_LOCK)
+                {
+                    return Ok(Some(1u16 << bit));
+                }
+            }
+        }
+        Ok(None)
+    }
+
     /// Handshake the XKB extension. Without it the live keyboard state
     /// (held modifiers, active group, locks) is unreadable, and typing
     /// without reading it would be guessing — refuse instead.
@@ -545,6 +605,11 @@ impl InsertionBackend for X11Backend {
 
     fn insert(&self, target: &TargetSnapshot, text: &str) -> Result<InsertReceipt, InsertError> {
         cheap_insertion_guards(text, target.pid, &self.excluded_pids)?;
+        // The process-wide insert lock, taken BEFORE anything reads the
+        // keyboard mapping and held through typing and cleanup
+        // ([`INSERT_LOCK`]'s docs say why the whole insert is the honest
+        // granularity): one X11 insert at a time per process.
+        let _insert_lock = insert_lock();
         // One connection for the checks and the keys (module docs): the
         // revalidation inside the chunk loop rides the same server
         // view as the typing.
@@ -581,9 +646,18 @@ impl InsertionBackend for X11Backend {
         let mut remap = RemapTransaction::begin(&session, &keyboard, &remap_keysyms)?;
         for plan in plans.values_mut() {
             if let CharPlan::NeedsKeysym(keysym) = *plan {
-                let keycode = remap
-                    .keycode_for(keysym)
-                    .expect("begin assigned every keysym");
+                // `begin` assigned every keysym it was given or failed
+                // the insert; a miss here is still an error, never a
+                // panic — the typer must not be able to crash the
+                // delivery path.
+                let Some(keycode) = remap.keycode_for(keysym) else {
+                    return Err(InsertError::Rejected {
+                        reason: format!(
+                            "internal error: no keycode was borrowed for U+{:04X}",
+                            keysym_codepoint(keysym)
+                        ),
+                    });
+                };
                 *plan = CharPlan::Remapped { keycode };
             }
         }
@@ -606,7 +680,17 @@ impl InsertionBackend for X11Backend {
                 remap.finish()?;
                 Ok(receipt)
             }
-            Err(error) => Err(error), // `remap` drops: guarded best-effort restore
+            Err(delivery) => {
+                // Cleanup is not skippable on a failed delivery either:
+                // `finish` attempts every restore, and a restore that
+                // fails must not hide the delivery outcome (nor may
+                // the delivery error hide a broken keyboard) — the
+                // combined error states both.
+                Err(match remap.finish() {
+                    Ok(()) => delivery,
+                    Err(restore) => combine_delivery_and_restore_failure(&delivery, restore),
+                })
+            }
         }
     }
 }
@@ -842,8 +926,11 @@ fn wait_modifiers_released(session: &Session) -> Result<(), InsertError> {
 
 /// Refuse keyboard states synthetic typing cannot reproduce: an
 /// active group other than the first (columns 0/1 would not be the
-/// effective characters), or Caps/Shift Lock — or any locked or
-/// latched modifier from the hazardous set — engaged. Do not guess.
+/// effective characters), or *any* locked or latched modifier bit
+/// except the one the live modifier mapping binds to `Num_Lock` —
+/// that bit is read from the server here, so a locked Mod2 that is
+/// not this session's NumLock (or a NumLock bound elsewhere) is a
+/// refusal, and a locked NumLock stays allowed. Do not guess.
 fn check_keyboard_state(session: &Session) -> Result<(), InsertError> {
     let state = session.xkb_state()?;
     if u8::from(state.group) != 0
@@ -858,21 +945,22 @@ fn check_keyboard_state(session: &Session) -> Result<(), InsertError> {
             ),
         });
     }
-    let locked = u16::from(state.locked_mods) & HAZARDOUS_LOCKED_MODS;
+    let harmless = session.num_lock_bit()?.unwrap_or(0);
+    let locked = u16::from(state.locked_mods) & !harmless;
     if locked != 0 {
         return Err(InsertError::KeyboardStateUnsupported {
             reason: format!(
-                "a modifier that changes plain typing is locked on (mask {locked:#x}: Caps/Shift \
-                 Lock, Alt, Super or AltGr)"
+                "a modifier that changes plain typing is locked on (mask {locked:#x}: every \
+                 locked modifier except Num_Lock refuses)"
             ),
         });
     }
-    let latched = u16::from(state.latched_mods) & HAZARDOUS_LOCKED_MODS;
+    let latched = u16::from(state.latched_mods) & !harmless;
     if latched != 0 {
         return Err(InsertError::KeyboardStateUnsupported {
             reason: format!(
-                "a modifier that changes plain typing is latched on (mask {latched:#x}: sticky \
-                 Shift, Alt, Super or AltGr)"
+                "a modifier that changes plain typing is latched on (mask {latched:#x}: every \
+                 latched modifier except Num_Lock refuses)"
             ),
         });
     }
@@ -1019,70 +1107,99 @@ enum CharPlan {
 }
 
 /// One temporarily-remapped keycode, with everything needed to give it
-/// back. `(keycode, what Starling wrote, what was there before)` —
-/// the before is all-`NoSymbol` by the spare rule, recorded from the
-/// live re-read rather than assumed.
-type BorrowedKey = (Keycode, Vec<Keysym>, Vec<Keysym>);
+/// back. The keysym it was borrowed *for* (planning identity — which
+/// keycode types this character) is kept separate from the echoed
+/// mapping the server reports (the ownership baseline the restore
+/// comparison uses), because the server canonicalizes what it stores
+/// and the plan must not depend on that canonicalization. `original`
+/// is what was there before (all-`NoSymbol` by the spare rule,
+/// recorded from the live re-read rather than assumed).
+struct BorrowedKey {
+    keycode: Keycode,
+    /// The keysym this borrow was requested for — column 0 of what
+    /// was written, before the server canonicalized anything.
+    keysym: Keysym,
+    /// What the server says it now holds for this keycode — the exact
+    /// value a restore compares the live mapping against.
+    echoed: Vec<Keysym>,
+    /// The all-`NoSymbol` columns to write back on restore.
+    original: Vec<Keysym>,
+}
 
-/// A keyboard-mapping borrow: the process-wide lock, the keycodes
-/// written, and the discipline of giving them back. Created *before*
-/// the first mutating request is sent (the entry list is what Drop
-/// restores), finished explicitly on the success path (where a failed
-/// restore is a real error) and by Drop everywhere else.
+/// A keyboard-mapping borrow: the keycodes written and the discipline
+/// of giving them back. Process-wide serialization is *not* this
+/// type's business — [`INSERT_LOCK`] covers the whole insert, and the
+/// transaction is created inside it. Entries are recorded *before*
+/// the mutating request is sent (the entry list is what Drop
+/// restores), finished explicitly on the success path (where a
+/// failed restore is a real error) and by Drop everywhere else.
 struct RemapTransaction<'a> {
     session: &'a Session,
-    /// Held for its drop (the serialization itself); never read.
-    #[allow(dead_code)]
-    lock: Option<MutexGuard<'static, ()>>,
     borrowed: Vec<BorrowedKey>,
     finished: bool,
 }
 
 impl RemapTransaction<'_> {
-    /// Borrow spare keycodes for every `needed` keysym. Each keycode's
-    /// *live* mapping is re-read immediately before the write and
-    /// must still be all-`NoSymbol` (another client's remap means the
-    /// next candidate; none free is a `keyboard_busy` refusal). With
-    /// nothing to borrow this is a no-op that takes no lock — an
-    /// all-pre-mapped insert never serializes against anything.
+    /// Borrow spare keycodes for every `needed` keysym. Each
+    /// keycode's read→write→echo-read sequence runs inside a server
+    /// grab, so no other X client can remap the same keycode between
+    /// the ownership check and the write; the live mapping must still
+    /// be all-`NoSymbol` (another client's remap means the next
+    /// candidate; none free is a `keyboard_busy`-style refusal); the
+    /// requested keysym is written into **every** column (all groups ×
+    /// levels the server reports for that keycode, so there is no
+    /// case pair for XKB to expand and an unshifted press yields
+    /// exactly the requested keysym — the reason an uppercase letter
+    /// must not be written into column 0 alone); and the server's
+    /// echo must still carry the keysym in the base column, or the
+    /// borrow is refused — never a panic. With nothing to borrow this
+    /// is a no-op.
     fn begin<'a>(
         session: &'a Session,
         keyboard: &Keyboard,
         needed: &[Keysym],
     ) -> Result<RemapTransaction<'a>, InsertError> {
-        if needed.is_empty() {
-            return Ok(RemapTransaction {
-                session,
-                lock: None,
-                borrowed: Vec::new(),
-                finished: false,
-            });
-        }
-        let lock = REMAP_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut transaction = RemapTransaction {
             session,
-            lock: Some(lock),
             borrowed: Vec::new(),
             finished: false,
         };
+        if needed.is_empty() {
+            return Ok(transaction);
+        }
         let mut candidates = keyboard.spares.iter().copied();
         'needed: for &keysym in needed {
             while let Some(candidate) = candidates.next() {
+                // The grabbed section: read, verify spare, write,
+                // echo-read. Held for these few requests only (the
+                // guard releases it on every exit, error included).
+                let _grab = ServerGrab::new(session)?;
                 let live = session.keycode_syms(candidate)?;
+                if live.is_empty() {
+                    // A keycode with no columns can carry nothing;
+                    // not a usable spare (and writing an empty
+                    // mapping would be meaningless).
+                    continue;
+                }
                 if !live.iter().all(|&sym| sym == x11rb::NO_SYMBOL) {
                     // Another client (or a Starling in another process)
                     // owns this keycode now; leave it alone.
                     continue;
                 }
-                let mut wrote = vec![x11rb::NO_SYMBOL; live.len()];
-                wrote[0] = keysym;
+                // Every column the server reports for this keycode:
+                // identical columns leave XKB no pair to expand, so
+                // the unshifted press produces exactly `keysym`.
+                let wrote = vec![keysym; live.len()];
                 // The restore guard is recorded BEFORE the mutating
                 // request: a failure between record and write restores
                 // a no-op, a failure after it restores the original,
                 // and nothing is left borrowed unrecorded.
-                transaction.borrowed.push((candidate, wrote.clone(), live));
+                transaction.borrowed.push(BorrowedKey {
+                    keycode: candidate,
+                    keysym,
+                    echoed: wrote.clone(),
+                    original: live,
+                });
                 match session
                     .conn
                     .change_keyboard_mapping(1, candidate, wrote.len() as u8, &wrote)
@@ -1094,15 +1211,28 @@ impl RemapTransaction<'_> {
                     }
                     Err(error) => return Err(x11_conn_error(error)),
                 }
-                // The server canonicalizes what it stores (an XKB
-                // server may echo a two-column write back padded or
-                // duplicated per group), so "what Starling wrote" is
-                // what the server says it now holds — re-read and
-                // record that as the comparison baseline for the
-                // restore, or the restore's other-client check would
-                // disown our own mapping and leave it borrowed.
+                // The server canonicalizes what it stores, so "what
+                // Starling wrote" is what the server says it now
+                // holds — re-read and record that as the comparison
+                // baseline for the restore, or the restore's
+                // other-client check would disown our own mapping and
+                // leave it borrowed. The echo must also prove the
+                // borrow usable: the base column (what an unshifted
+                // press types) must still be the requested keysym —
+                // an unexpected echo is a refusal, never a panic.
                 let echoed = session.keycode_syms(candidate)?;
-                transaction.borrowed.last_mut().expect("just pushed").1 = echoed;
+                if echoed.first() != Some(&keysym) {
+                    return Err(InsertError::Rejected {
+                        reason: format!(
+                            "the X server did not keep U+{:04X} in the base column of keycode \
+                             {candidate} (keyboard busy or an unusual XKB canonicalization)",
+                            keysym_codepoint(keysym)
+                        ),
+                    });
+                }
+                if let Some(entry) = transaction.borrowed.last_mut() {
+                    entry.echoed = echoed;
+                }
                 continue 'needed;
             }
             return Err(InsertError::Rejected {
@@ -1114,76 +1244,120 @@ impl RemapTransaction<'_> {
             });
         }
         // Round trip: the mapping must be live before any keypress is
-        // interpreted by anyone.
+        // interpreted by anyone. (Outside any grab — it is a wait, and
+        // grabs are never held across waits.)
         session.sync()?;
         Ok(transaction)
     }
 
-    /// The keycode this transaction borrowed for `keysym`.
+    /// The keycode this transaction borrowed for `keysym` — looked up
+    /// by the keysym the plan asked for, never by the server's
+    /// canonicalized echo (which an XKB server may have expanded into
+    /// a case-pair shape that hides the requested symbol).
     fn keycode_for(&self, keysym: Keysym) -> Option<Keycode> {
         self.borrowed
             .iter()
-            .find(|(_, wrote, _)| wrote.first() == Some(&keysym))
-            .map(|(keycode, _, _)| *keycode)
+            .find(|entry| entry.keysym == keysym)
+            .map(|entry| entry.keycode)
     }
 
     /// Give every borrowed keycode back. The server is synced (all
     /// queued keys processed) and the mapping held through
-    /// [`KEYMAP_SETTLE`] first; each keycode's live mapping is re-read
-    /// and restored only if it still equals exactly what Starling
-    /// wrote — another client's change is left alone, with a warning.
+    /// [`KEYMAP_SETTLE`] first; then each keycode's compare→restore
+    /// sequence runs inside its own server grab and restores only if
+    /// the live mapping still equals exactly what Starling wrote —
+    /// another client's change is left alone, with a warning. A
+    /// failed initial sync does **not** skip the restores: every one
+    /// is attempted regardless (a dying connection makes each attempt
+    /// fail on its own and those failures are collected), and
+    /// `finished` is only set once restoration has been attempted —
+    /// so Drop retries anything not yet attempted. A restore failure
+    /// always surfaces; on the error path of an insert it is combined
+    /// with the delivery outcome by
+    /// [`combine_delivery_and_restore_failure`].
     fn finish(&mut self) -> Result<(), InsertError> {
         if self.finished {
             return Ok(());
         }
-        self.finished = true;
         if self.borrowed.is_empty() {
+            self.finished = true;
             return Ok(());
         }
-        self.session.sync()?;
-        std::thread::sleep(KEYMAP_SETTLE);
         let mut failure: Option<InsertError> = None;
-        for (keycode, wrote, original) in &self.borrowed {
-            match self.session.keycode_syms(*keycode) {
-                Ok(live) if live == *wrote => {
-                    let restore = self
-                        .session
-                        .conn
-                        .change_keyboard_mapping(1, *keycode, original.len() as u8, original)
-                        .map_err(x11_conn_error)
-                        .and_then(|cookie| cookie.check().map_err(reply_error));
-                    if let Err(error) = restore {
-                        failure = failure.or_else(|| {
-                            InsertError::KeyboardRestoreFailed {
-                                detail: format!("restoring keycode {keycode}: {error}"),
-                            }
-                            .into()
-                        });
-                    }
-                }
-                Ok(live) => {
-                    // Not ours anymore: another client re-mapped it
-                    // while borrowed. Restoring would clobber *their*
-                    // change; leave it and say so.
-                    log::warn!(
-                        "starling-insertion: keycode {keycode} was re-mapped by another \
-                         client while Starling borrowed it; leaving their mapping {live:?} \
-                         in place"
-                    );
-                }
-                Err(error) => {
-                    failure = failure.or_else(|| {
-                        InsertError::KeyboardRestoreFailed {
-                            detail: format!("re-reading keycode {keycode}: {error}"),
-                        }
-                        .into()
-                    });
-                }
+        if let Err(error) = self.session.sync() {
+            // Not a reason to skip the restores below: attempt them
+            // anyway (the writes may still reach the server), but the
+            // flush failure is part of the story.
+            failure = Some(InsertError::KeyboardRestoreFailed {
+                detail: format!("flushing the typed keys before restoring: {error}"),
+            });
+        }
+        // The settle delay stays outside every grab (no sleeps while
+        // grabbed); it exists so a target that processes its
+        // MappingNotify late does not decode already-typed keys
+        // against the restored mapping.
+        std::thread::sleep(KEYMAP_SETTLE);
+        for entry in &self.borrowed {
+            let grabbed = ServerGrab::new(self.session);
+            let outcome = match grabbed {
+                Ok(_grab) => self.restore_one(entry),
+                Err(error) => Err(InsertError::KeyboardRestoreFailed {
+                    detail: format!(
+                        "grabbing the server to restore keycode {}: {error}",
+                        entry.keycode
+                    ),
+                }),
+            };
+            if let Err(error) = outcome {
+                failure = failure.or(Some(error));
             }
         }
+        // Only now may the transaction count as finished: every
+        // restore has been attempted.
+        self.finished = true;
         match failure {
             None => Ok(()),
             Some(error) => Err(error),
+        }
+    }
+
+    /// The compare→restore of one borrowed keycode — the body the
+    /// server grab in [`Self::finish`] wraps.
+    fn restore_one(&self, entry: &BorrowedKey) -> Result<(), InsertError> {
+        match self.session.keycode_syms(entry.keycode) {
+            Ok(live) if live == entry.echoed => {
+                let restore = self
+                    .session
+                    .conn
+                    .change_keyboard_mapping(
+                        1,
+                        entry.keycode,
+                        entry.original.len() as u8,
+                        &entry.original,
+                    )
+                    .map_err(x11_conn_error)
+                    .and_then(|cookie| cookie.check().map_err(reply_error));
+                if let Err(error) = restore {
+                    return Err(InsertError::KeyboardRestoreFailed {
+                        detail: format!("restoring keycode {}: {error}", entry.keycode),
+                    });
+                }
+                Ok(())
+            }
+            Ok(live) => {
+                // Not ours anymore: another client re-mapped it while
+                // borrowed. Restoring would clobber *their* change;
+                // leave it and say so.
+                log::warn!(
+                    "starling-insertion: keycode {} was re-mapped by another client while \
+                     Starling borrowed it; leaving their mapping {live:?} in place",
+                    entry.keycode
+                );
+                Ok(())
+            }
+            Err(error) => Err(InsertError::KeyboardRestoreFailed {
+                detail: format!("re-reading keycode {}: {error}", entry.keycode),
+            }),
         }
     }
 }
@@ -1193,10 +1367,53 @@ impl Drop for RemapTransaction<'_> {
         if !self.finished {
             // Errors are swallowed (Drop cannot report; the insert's
             // own error is the honest one to surface), but the
-            // restore discipline itself is identical.
+            // restore discipline itself is identical — and anything
+            // not yet attempted is retried here.
             let _ = self.finish();
         }
     }
+}
+
+/// A server grab held across a few requests and released on drop —
+/// also on error, because Drop cannot report (an ungrab that itself
+/// fails means the connection is dying and the grab dies with it;
+/// both are logged). While grabbed, the X server processes no other
+/// client's requests, so a read→write→read-back ownership sequence
+/// cannot interleave with another client's remap of the same keycode.
+/// Only ever held for those few requests: no sleeps, no waits, no
+/// typing, no event reading while grabbed.
+struct ServerGrab<'a> {
+    session: &'a Session,
+}
+
+impl<'a> ServerGrab<'a> {
+    fn new(session: &'a Session) -> Result<ServerGrab<'a>, InsertError> {
+        session.conn.grab_server().map_err(x11_conn_error)?;
+        Ok(ServerGrab { session })
+    }
+}
+
+impl Drop for ServerGrab<'_> {
+    fn drop(&mut self) {
+        if let Err(error) = self.session.conn.ungrab_server() {
+            log::warn!("starling-insertion: releasing the server grab failed: {error}");
+        }
+        // Flush so the ungrab reaches the server now, not whenever
+        // the next request happens to be queued.
+        if let Err(error) = self.session.conn.flush() {
+            log::warn!("starling-insertion: flushing the server-ungrab failed: {error}");
+        }
+    }
+}
+
+/// Take [`INSERT_LOCK`] for a whole insert. A panicked previous
+/// holder poisons the lock; the state it protected (the keyboard
+/// mapping) is server-global and repairable by the restore path, so
+/// the next insert proceeds rather than every future insert failing.
+fn insert_lock() -> MutexGuard<'static, ()> {
+    INSERT_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// The keys a single segment press has put down, released in reverse
@@ -1243,8 +1460,22 @@ impl Drop for PressedKeys<'_> {
     }
 }
 
+/// Where in its keystroke a character's typing failed: before the
+/// character's own key went down (nothing of it can have landed — a
+/// failed send, a failed Shift press, an unplanned plan), or after
+/// the key-down was issued (the character may have landed even though
+/// its keystroke — the release, the Shift release — did not complete).
+/// The distinction is the delivery count: a character counts as
+/// possibly delivered the moment its key-down was issued.
+enum CharFailure {
+    BeforeKeydown(InsertError),
+    AfterKeydown(InsertError),
+}
+
 /// Type one segment (up to [`X11_CHUNK_CHARS`] characters), reporting
-/// exactly how many characters landed if typing fails part-way.
+/// exactly how many characters may have landed if typing fails
+/// part-way: every character whose key-down was issued counts,
+/// including the one that failed mid-keystroke.
 fn type_segment(
     session: &Session,
     keyboard: &Keyboard,
@@ -1258,13 +1489,25 @@ fn type_segment(
         let plan = plans
             .get(&character)
             .expect("every character of the text was planned");
-        if let Err(cause) = type_character(keyboard, plan, &mut pressed) {
-            return Err(ChunkFailure {
-                delivered: delivered_before + typed,
-                cause,
-            });
+        match type_character(keyboard, plan, &mut pressed) {
+            Ok(()) => typed += 1,
+            Err(CharFailure::BeforeKeydown(cause)) => {
+                return Err(ChunkFailure {
+                    delivered: delivered_before + typed,
+                    cause,
+                });
+            }
+            Err(CharFailure::AfterKeydown(cause)) => {
+                // The character's key-down was issued: it may have
+                // landed even though its keystroke failed, so it
+                // counts — the report must never understate what the
+                // target may hold.
+                return Err(ChunkFailure {
+                    delivered: delivered_before + typed + 1,
+                    cause,
+                });
+            }
         }
-        typed += 1;
     }
     Ok(typed)
 }
@@ -1272,11 +1515,14 @@ fn type_segment(
 /// Type one character through its plan: press Shift if the column
 /// needs it, tap the key, release in reverse. The `pressed` guard
 /// guarantees the releases even when a send fails mid-keystroke.
+/// Failures are classified for the delivery count by
+/// [`CharFailure`]'s rule: anything at or after the character's own
+/// key-down counts as possibly delivered.
 fn type_character(
     keyboard: &Keyboard,
     plan: &CharPlan,
     pressed: &mut PressedKeys<'_>,
-) -> Result<(), InsertError> {
+) -> Result<(), CharFailure> {
     let (keycode, needs_shift) = match plan {
         CharPlan::Pre {
             keycode,
@@ -1284,29 +1530,40 @@ fn type_character(
         } => (*keycode, *needs_shift),
         CharPlan::Remapped { keycode } => (*keycode, false),
         CharPlan::NeedsKeysym(_) => {
-            return Err(InsertError::Rejected {
+            return Err(CharFailure::BeforeKeydown(InsertError::Rejected {
                 reason: "internal error: an unplanned character reached the typer".to_string(),
-            })
+            }))
         }
     };
     // A real Shift press (a key event the target sees, exactly like a
     // human typing `C`) rather than a synthetic modifier mask — XTest
     // only speaks keycodes — and only the modifier-mapping-bound Shift
     // keycode `find` verified before planning a column-1 character.
-    if needs_shift {
-        let shift = keyboard
-            .shift
-            .expect("a shift-needing plan exists only when a Shift keycode is bound");
-        pressed.press(shift)?;
+    // Even this planning invariant surfaces as an error rather than a
+    // panic: the typer must not be able to crash the delivery path.
+    let shift = if needs_shift {
+        Some(keyboard.shift.ok_or_else(|| {
+            CharFailure::BeforeKeydown(InsertError::Rejected {
+                reason: "internal error: a shift-needing plan exists without a bound Shift \
+                         keycode"
+                    .to_string(),
+            })
+        })?)
+    } else {
+        None
+    };
+    if let Some(shift) = shift {
+        pressed.press(shift).map_err(CharFailure::BeforeKeydown)?;
     }
-    pressed.press(keycode)?;
+    pressed.press(keycode).map_err(CharFailure::BeforeKeydown)?;
+    // The key-down was issued: from here the character may have
+    // landed, whatever happens to the rest of its keystroke.
     std::thread::sleep(KEY_HOLD);
-    pressed.release(keycode)?;
-    if needs_shift {
-        let shift = keyboard
-            .shift
-            .expect("a shift-needing plan exists only when a Shift keycode is bound");
-        pressed.release(shift)?;
+    pressed
+        .release(keycode)
+        .map_err(CharFailure::AfterKeydown)?;
+    if let Some(shift) = shift {
+        pressed.release(shift).map_err(CharFailure::AfterKeydown)?;
     }
     std::thread::sleep(KEY_GAP);
     Ok(())
@@ -1377,5 +1634,129 @@ fn reply_error(error: x11rb::errors::ReplyError) -> InsertError {
         x11rb::errors::ReplyError::X11Error(inner) => InsertError::Rejected {
             reason: format!("the X server refused a request: {inner:?}"),
         },
+    }
+}
+
+/// Fold a failed delivery and a failed keyboard restore into the one
+/// error an insert returns on that path. The restore failure is the
+/// actionable headline (the user's keyboard may type wrong characters
+/// until the layout is reloaded — `keyboard_restore_failed`), but its
+/// message must also state the delivery outcome, so recovery sees
+/// both facts: what may be in the target *and* what happened to the
+/// keyboard. Neither error may hide the other.
+fn combine_delivery_and_restore_failure(
+    delivery: &InsertError,
+    restore: InsertError,
+) -> InsertError {
+    let outcome = match delivery {
+        InsertError::PartialDelivery {
+            delivered_chars,
+            total_chars,
+            cause,
+        } => format!(
+            "up to {delivered_chars} of {total_chars} characters may have been typed before \
+             the failure ({cause})"
+        ),
+        other => format!("no character's key-down was accepted before the failure ({other})"),
+    };
+    match restore {
+        InsertError::KeyboardRestoreFailed { detail } => InsertError::KeyboardRestoreFailed {
+            detail: format!("{detail}; and {outcome}"),
+        },
+        // `finish` only produces `KeyboardRestoreFailed`; if that ever
+        // changes, the restore error is still the one to return.
+        other => other,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_restore_failure_on_an_error_path_keeps_the_delivery_outcome() {
+        let delivery = InsertError::PartialDelivery {
+            delivered_chars: 16,
+            total_chars: 20,
+            cause: Box::new(InsertError::TargetChanged {
+                expected: "x11:1:1".to_string(),
+                actual: "x11:2:2".to_string(),
+            }),
+        };
+        let combined = combine_delivery_and_restore_failure(
+            &delivery,
+            InsertError::KeyboardRestoreFailed {
+                detail: "restoring keycode 255: the X connection failed".to_string(),
+            },
+        );
+        // The restore failure is the headline (the actionable fact),
+        // and both halves of the story survive in the message.
+        assert_eq!(combined.code(), "keyboard_restore_failed");
+        let message = combined.message();
+        assert!(
+            message.contains("could not be restored"),
+            "the restore failure stays visible: {message}"
+        );
+        assert!(
+            message.contains("keycode 255"),
+            "the restore detail stays visible: {message}"
+        );
+        assert!(
+            message.contains("up to 16 of 20 characters may have been typed"),
+            "the delivery outcome stays visible: {message}"
+        );
+
+        // A delivery that failed before any key-down says that too.
+        let bare = combine_delivery_and_restore_failure(
+            &InsertError::TargetGone,
+            InsertError::KeyboardRestoreFailed {
+                detail: "re-reading keycode 255: the X connection failed".to_string(),
+            },
+        );
+        let message = bare.message();
+        assert!(
+            message.contains("no character's key-down was accepted"),
+            "the zero-delivery outcome is stated: {message}"
+        );
+        assert!(message.contains("could not be restored"));
+    }
+
+    #[test]
+    fn a_keyed_down_character_counts_in_the_chunk_failure_delivered() {
+        // The X11 typer's counting rule, pinned at the seam the chunk
+        // loop sees: a character whose key-down was issued counts as
+        // delivered even when its keystroke failed — so the first
+        // segment failing *after* its first key-down reports 1, which
+        // `deliver_in_chunks` must wrap as a partial delivery (the
+        // bare cause would claim nothing landed).
+        let error = crate::deliver_in_chunks(
+            3,
+            &["abc"],
+            || Ok(()),
+            |_, _| {
+                Err(ChunkFailure {
+                    delivered: 0 + 0 + 1, // first char keyed down, keystroke failed
+                    cause: InsertError::Unavailable {
+                        reason: "the X connection failed".to_string(),
+                        setup_hint: None,
+                    },
+                })
+            },
+        )
+        .unwrap_err();
+        match error {
+            InsertError::PartialDelivery {
+                delivered_chars,
+                total_chars,
+                cause,
+            } => {
+                assert_eq!(delivered_chars, 1, "the keyed-down character counts");
+                assert_eq!(total_chars, 3);
+                assert_eq!(cause.code(), "insertion_unavailable");
+            }
+            other => {
+                panic!("a keyed-down character means partial delivery, not a bare cause: {other:?}")
+            }
+        }
     }
 }
