@@ -68,7 +68,23 @@ pub struct InputRoute {
     pub reason: RouteReason,
 }
 
+/// Whether `device` is a sound-server routing device rather than a
+/// physical input: on Linux the ALSA `default`/`pulse`/`pipewire`/`jack`
+/// PCMs hand capture to PulseAudio, PipeWire or JACK, which choose — and
+/// may change mid-stream — the physical source. Starling cannot see or pin
+/// that choice through ALSA, so the UI must say so instead of naming the
+/// route as if it were one microphone.
+pub fn is_sound_server_device(device: &str) -> bool {
+    cfg!(target_os = "linux") && matches!(device, "default" | "pulse" | "pipewire" | "jack")
+}
+
 impl InputRoute {
+    /// Whether the physical microphone behind this route is chosen (and
+    /// may be switched mid-take) by the sound server, not by Starling.
+    pub fn follows_sound_server(&self) -> bool {
+        is_sound_server_device(&self.device)
+    }
+
     /// Whether the take records from something other than the device the
     /// user asked for.
     pub fn is_fallback(&self) -> bool {
@@ -281,19 +297,32 @@ impl InputProblem {
                  retry."
             }
             InputProblem::Silent { .. } => {
-                "Check the device's mute switch and input level. On macOS, silence also means \
-                 Starling has no microphone permission (System Settings → Privacy & Security → \
-                 Microphone)."
+                "Check the device's mute switch and input level. Missing microphone permission \
+                 can also look like this (macOS records silence instead of reporting an \
+                 error), so check the privacy settings too."
             }
             InputProblem::Failed { .. } => "Pick another microphone, or retry.",
         }
     }
 
-    /// Whether the privacy settings (rather than the sound settings) are
-    /// the right place to send the user.
-    pub fn wants_privacy_settings(&self) -> bool {
-        matches!(self, InputProblem::PermissionDenied { .. })
+    /// The OS settings pages worth offering, most likely first. Silence
+    /// gets both: a muted device and a missing permission look the same.
+    pub fn settings_pages(&self) -> &'static [SettingsPage] {
+        match self {
+            InputProblem::PermissionDenied { .. } => &[SettingsPage::Privacy],
+            InputProblem::Silent { .. } => &[SettingsPage::Sound, SettingsPage::Privacy],
+            _ => &[SettingsPage::Sound],
+        }
     }
+}
+
+/// An OS settings page a recovery action can open.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SettingsPage {
+    /// Sound input devices and levels.
+    Sound,
+    /// Microphone access permission.
+    Privacy,
 }
 
 impl std::fmt::Display for InputProblem {
@@ -534,8 +563,35 @@ mod tests {
         let messages: std::collections::HashSet<_> =
             problems.iter().map(InputProblem::message).collect();
         assert_eq!(messages.len(), problems.len(), "messages must be distinct");
-        assert!(problems[2].wants_privacy_settings());
-        assert!(!problems[3].wants_privacy_settings());
+        assert_eq!(problems[2].settings_pages(), &[SettingsPage::Privacy]);
+        // Silence: a muted device or a missing permission — offer both.
+        assert_eq!(
+            problems[3].settings_pages(),
+            &[SettingsPage::Sound, SettingsPage::Privacy]
+        );
+        assert_eq!(problems[1].settings_pages(), &[SettingsPage::Sound]);
+    }
+
+    #[test]
+    fn sound_server_routes_are_recognised_on_linux_only() {
+        let linux = cfg!(target_os = "linux");
+        for name in ["default", "pulse", "pipewire", "jack"] {
+            assert_eq!(is_sound_server_device(name), linux, "{name}");
+        }
+        for name in [
+            "hw:CARD=USB,DEV=0",
+            "sysdefault:CARD=PCH",
+            "USB Mic",
+            "wslg_mic",
+        ] {
+            assert!(!is_sound_server_device(name), "{name}");
+        }
+        let route = InputRoute {
+            preferred: None,
+            device: "default".to_string(),
+            reason: RouteReason::FollowingDefault,
+        };
+        assert_eq!(route.follows_sound_server(), linux);
     }
 
     #[test]

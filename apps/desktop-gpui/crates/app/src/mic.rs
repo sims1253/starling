@@ -14,7 +14,9 @@ use std::time::{Duration, Instant};
 
 use gpui::{AppContext, Context, Window};
 use starling_dictation::client::StarlingClient;
-use starling_dictation::microphone::{self, InputDevice, InputProblem, InputRoute, SignalLevel};
+use starling_dictation::microphone::{
+    self, InputDevice, InputProblem, InputRoute, SettingsPage, SignalLevel,
+};
 use starling_dictation::recorder::{self, CaptureRequest, RecorderFault, RecorderHandle};
 
 use crate::app::StarlingApp;
@@ -158,10 +160,13 @@ pub(crate) enum LiveInput {
     NotResponding,
 }
 
-pub(crate) fn live_input(elapsed: Duration, source_peak: f32, stalled_for: Duration) -> LiveInput {
+/// `silent_for` is how long the input has carried no sound (since the
+/// last audible window, or since the take started) — recent evidence, so
+/// an input muted after speech is caught too.
+pub(crate) fn live_input(silent_for: Duration, stalled_for: Duration) -> LiveInput {
     if stalled_for >= Duration::from_millis(1_500) {
         LiveInput::NotResponding
-    } else if elapsed >= SILENCE_GRACE && source_peak < microphone::SILENT_PEAK {
+    } else if silent_for >= SILENCE_GRACE {
         LiveInput::Silent
     } else {
         LiveInput::Listening
@@ -235,6 +240,9 @@ pub(crate) struct MicState {
     /// Why the current take is being ended as interrupted, read by the
     /// cancel path (`CancelReason::InputLost`).
     pub(crate) interruption: Option<(String, InputProblem)>,
+    /// When the live take's input last carried sound (render-loop
+    /// evidence); `None` until it first does.
+    pub(crate) last_sound_at: Option<Instant>,
 }
 
 impl Default for MicState {
@@ -249,6 +257,7 @@ impl Default for MicState {
             problem: None,
             settings_launch_error: None,
             interruption: None,
+            last_sound_at: None,
         }
     }
 }
@@ -277,6 +286,31 @@ pub(crate) fn settings_commands(privacy: bool) -> Vec<(&'static str, Vec<&'stati
             ("systemsettings", vec!["kcm_pulseaudio"]),
             ("pavucontrol", vec!["--tab=4"]),
         ]
+    }
+}
+
+/// The settings pages a problem offers, as this platform can open them:
+/// Linux desktops have no separate microphone-permission page, so a
+/// privacy page folds into the sound settings there.
+pub(crate) fn platform_pages(problem: &InputProblem) -> Vec<SettingsPage> {
+    let mut pages = Vec::new();
+    for &page in problem.settings_pages() {
+        let page = if cfg!(target_os = "linux") {
+            SettingsPage::Sound
+        } else {
+            page
+        };
+        if !pages.contains(&page) {
+            pages.push(page);
+        }
+    }
+    pages
+}
+
+pub(crate) fn page_label(page: SettingsPage) -> &'static str {
+    match page {
+        SettingsPage::Sound => "Open sound settings",
+        SettingsPage::Privacy => "Open privacy settings",
     }
 }
 
@@ -330,13 +364,17 @@ impl StarlingApp {
     /// "listening" to an input that is silent or not responding.
     pub(crate) fn live_input_headline(&self) -> Option<&'static str> {
         let handle = self.recorder.as_ref()?;
-        match live_input(handle.elapsed(), handle.source_peak(), {
-            if handle.captured_sample_count() > 0 {
-                handle.input_stalled_for()
-            } else {
-                Duration::ZERO
-            }
-        }) {
+        let silent_for = self
+            .mic
+            .last_sound_at
+            .map(|at| at.elapsed())
+            .unwrap_or_else(|| handle.elapsed());
+        let stalled_for = if handle.captured_sample_count() > 0 {
+            handle.input_stalled_for()
+        } else {
+            Duration::ZERO
+        };
+        match live_input(silent_for, stalled_for) {
             LiveInput::Listening => None,
             LiveInput::Silent => Some("No sound from the microphone."),
             LiveInput::NotResponding => Some("The microphone stopped responding."),
@@ -407,8 +445,8 @@ impl StarlingApp {
     }
 
     /// Opens the OS sound settings (or the microphone privacy page).
-    pub(crate) fn open_input_settings(&mut self, privacy: bool, cx: &mut Context<Self>) {
-        self.mic.settings_launch_error = open_system_settings(privacy).err();
+    pub(crate) fn open_input_settings(&mut self, page: SettingsPage, cx: &mut Context<Self>) {
+        self.mic.settings_launch_error = open_system_settings(page == SettingsPage::Privacy).err();
         cx.notify();
     }
 
@@ -460,12 +498,26 @@ impl StarlingApp {
             .as_ref()
             .map(|route| route.device.clone())
             .unwrap_or_else(|| "The microphone".to_string());
-        let interruption =
-            take_interruption(handle.capture_fault().as_ref(), handle.input_stalled_for());
+        let mut interruption =
+            take_interruption(handle.capture_fault().as_ref(), handle.input_stalled_for())
+                .map(|interruption| interruption.describe(&device));
         let stopped = handle.stop();
         let audio = match stopped {
-            Ok(take) => take.audio,
-            Err(recorder::RecorderError::QuiesceTimeout { audio, .. }) => audio,
+            Ok(take) => {
+                // A fault posted after the check above still counts.
+                if let (None, Some(fault)) = (&interruption, take.device_fault) {
+                    interruption = Some(Interruption::DeviceFailed(fault).describe(&device));
+                }
+                take.audio
+            }
+            Err(recorder::RecorderError::QuiesceTimeout { audio, .. }) => {
+                // The audio is salvaged, but the device did not stop
+                // cleanly: never report that as a working microphone.
+                interruption.get_or_insert_with(|| {
+                    format!("{device} did not stop cleanly (the audio callback hung)")
+                });
+                audio
+            }
             Err(err) => {
                 self.mic.check = Some(MicCheck::Done {
                     route,
@@ -486,9 +538,7 @@ impl StarlingApp {
             outcome,
         };
         if let Some(interruption) = interruption {
-            self.mic.check = Some(finish(CheckOutcome::Interrupted(
-                interruption.describe(&device),
-            )));
+            self.mic.check = Some(finish(CheckOutcome::Interrupted(interruption)));
             cx.notify();
             return;
         }
@@ -652,15 +702,39 @@ mod tests {
     fn the_pane_stops_claiming_to_listen_to_a_dead_or_silent_input() {
         let quick = Duration::from_millis(5);
         assert_eq!(
-            live_input(Duration::from_secs(1), 0.0, quick),
+            live_input(Duration::from_secs(1), quick),
             LiveInput::Listening
         );
-        assert_eq!(live_input(SILENCE_GRACE, 0.0, quick), LiveInput::Silent);
-        assert_eq!(live_input(SILENCE_GRACE, 0.2, quick), LiveInput::Listening);
+        assert_eq!(live_input(SILENCE_GRACE, quick), LiveInput::Silent);
+        // Silence measured from the last audible window: speech followed
+        // by a muted input becomes "silent" too, not only a take that was
+        // silent from the start.
         assert_eq!(
-            live_input(Duration::from_secs(10), 0.2, Duration::from_secs(2)),
+            live_input(SILENCE_GRACE - Duration::from_millis(1), quick),
+            LiveInput::Listening
+        );
+        assert_eq!(
+            live_input(Duration::ZERO, Duration::from_secs(2)),
             LiveInput::NotResponding
         );
+    }
+
+    #[test]
+    fn silence_offers_privacy_where_the_platform_has_such_a_page() {
+        let silent = InputProblem::Silent {
+            device: "Mic".to_string(),
+        };
+        let pages = platform_pages(&silent);
+        if cfg!(target_os = "linux") {
+            assert_eq!(pages, vec![SettingsPage::Sound]);
+        } else {
+            assert_eq!(pages, vec![SettingsPage::Sound, SettingsPage::Privacy]);
+        }
+        let denied = InputProblem::PermissionDenied {
+            device: "Mic".to_string(),
+            detail: "denied".to_string(),
+        };
+        assert_eq!(platform_pages(&denied).len(), 1);
     }
 
     #[test]

@@ -6,6 +6,8 @@
 use gpui::{div, prelude::*, px, relative, Context, Div, FontWeight, SharedString};
 use starling_dictation::microphone::{InputProblem, InputRoute};
 
+use crate::mic::{page_label, platform_pages};
+
 use crate::app::StarlingApp;
 use crate::mic::{picker_rows, CheckOutcome, DeviceList, MicCheck};
 use crate::theme;
@@ -50,6 +52,13 @@ fn eyebrow(text: &'static str) -> Div {
 pub(crate) fn route_line(route: &InputRoute) -> String {
     match route.notice() {
         Some(notice) => notice,
+        // Not one microphone: the sound server picks (and may switch) the
+        // physical source behind it — say so rather than name a device.
+        None if route.follows_sound_server() => format!(
+            "Recording from the system default input ({}) — PulseAudio/PipeWire picks the \
+             microphone and may switch it if that device disconnects.",
+            route.device
+        ),
         None => format!("Recording from {}.", route.device),
     }
 }
@@ -61,11 +70,12 @@ fn platform_note() -> &'static str {
          one. The sound server may move a running “default” stream to another input when its \
          device disappears — Starling cannot see that move, so pin a device if it matters."
     } else if cfg!(target_os = "macos") {
-        "Microphones are listed by name. Without microphone permission macOS delivers silence \
-         instead of an error; the test below tells you when that happens."
+        "Microphones are listed by name. Without microphone permission macOS records silence \
+         instead of reporting an error, so when the test below hears only silence, check the \
+         permission as well as the device."
     } else {
         "Microphones are listed by name. Windows privacy settings can block microphone access \
-         for desktop apps; the test below tells you when that happens."
+         for desktop apps; the test below reports an access error or silence when they do."
     }
 }
 
@@ -207,8 +217,24 @@ fn meter(fill: f32) -> Div {
         )
 }
 
+/// One button per OS settings page the problem offers.
+fn settings_buttons(
+    problem: &InputProblem,
+    prefix: &'static str,
+    cx: &mut Context<StarlingApp>,
+) -> Vec<gpui::Stateful<Div>> {
+    platform_pages(problem)
+        .into_iter()
+        .map(|page| {
+            button(format!("{prefix}-{page:?}"), page_label(page)).on_click(
+                cx.listener(move |this, _, _window, cx| this.open_input_settings(page, cx)),
+            )
+        })
+        .collect()
+}
+
 fn problem_block(problem: &InputProblem, cx: &mut Context<StarlingApp>) -> Div {
-    let privacy = problem.wants_privacy_settings();
+    let settings = settings_buttons(problem, "mic-check-settings", cx);
     div()
         .flex()
         .flex_col()
@@ -232,19 +258,7 @@ fn problem_block(problem: &InputProblem, cx: &mut Context<StarlingApp>) -> Div {
                     button("mic-check-retry", "Retry")
                         .on_click(cx.listener(|this, _, _window, cx| this.start_mic_check(cx))),
                 )
-                .child(
-                    button(
-                        "mic-open-settings",
-                        if privacy {
-                            "Open privacy settings"
-                        } else {
-                            "Open sound settings"
-                        },
-                    )
-                    .on_click(cx.listener(move |this, _, _window, cx| {
-                        this.open_input_settings(privacy, cx)
-                    })),
-                ),
+                .children(settings),
         )
 }
 
@@ -411,6 +425,8 @@ pub(crate) fn live_input_line(app: &StarlingApp) -> Option<Div> {
                 .text_color(if fallback { theme::CORAL } else { theme::DIM })
                 .child(if fallback {
                     route_line(route)
+                } else if route.follows_sound_server() {
+                    "Mic: system default (chosen by the sound server)".to_string()
                 } else {
                     format!("Mic: {}", route.device)
                 }),
@@ -424,7 +440,7 @@ pub(crate) fn input_problem_actions(
     app: &StarlingApp,
     cx: &mut Context<StarlingApp>,
 ) -> Option<Div> {
-    let privacy = app.shown_input_problem()?.wants_privacy_settings();
+    let settings = settings_buttons(app.shown_input_problem()?, "input-settings", cx);
     Some(
         div()
             .mt(px(6.))
@@ -437,19 +453,7 @@ pub(crate) fn input_problem_actions(
                     this.toggle_recording(crate::activation::RecordButton::Start, cx)
                 })),
             )
-            .child(
-                button(
-                    "input-settings",
-                    if privacy {
-                        "Open privacy settings"
-                    } else {
-                        "Open sound settings"
-                    },
-                )
-                .on_click(
-                    cx.listener(move |this, _, _window, cx| this.open_input_settings(privacy, cx)),
-                ),
-            )
+            .children(settings)
             .child(
                 button("input-choose", "Choose microphone")
                     .on_click(cx.listener(|this, _, _window, cx| this.open_settings(cx))),

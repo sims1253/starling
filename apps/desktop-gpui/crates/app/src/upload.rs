@@ -380,11 +380,70 @@ impl StarlingApp {
             if capture_fault.is_some() {
                 stream = None;
             }
+            // #222: the device the take recorded from, for an
+            // interruption reported by the stop itself.
+            let take_device = handle
+                .input_route()
+                .map(|route| route.device.clone())
+                .unwrap_or_else(|| "The microphone".to_string());
             // Stop-to-processed latency (#295) starts here.
             let stopped_at = Instant::now();
             // The staging panel keeps its draft while the take is saved.
             let staging = self.stop_staging();
             match handle.stop() {
+                // #222: the device had already failed when the stop began
+                // (after the last watchdog check): the audio is kept as an
+                // interrupted take, never transcribed as complete.
+                Ok(mut take) if take.device_fault.is_some() => {
+                    take.audio.samples.splice(0..0, streamed_samples);
+                    let fault = take.device_fault.take().unwrap_or_default();
+                    let journal_report = take
+                        .journal
+                        .filter(|report| report.finalized && report.fault.is_none());
+                    let note = format!(
+                        "{take_device} failed mid-recording ({fault}); the audio captured \
+                         before that was kept."
+                    );
+                    self.staging_interrupted(cx);
+                    self.levels = vec![0.06; 52];
+                    self.capture_warning = recorder::clipping_warning(source_clip_ratio);
+                    self.report_input_problem(
+                        starling_dictation::microphone::InputProblem::Unavailable {
+                            device: take_device.clone(),
+                            detail: "it stopped during the last recording".to_string(),
+                        },
+                        format!(
+                            "{take_device} stopped working mid-recording ({fault}). Everything \
+                             captured before that was saved to your history as an interrupted \
+                             recording; transcribe it from there. Check the microphone \
+                             (Settings → Microphone can test it or pick another), then record \
+                             again."
+                        ),
+                    );
+                    cx.notify();
+                    let audio = take.audio;
+                    cx.spawn(async move |this, cx| {
+                        let encoded = cx
+                            .background_spawn(async move { audio::encode_wav_16k(&audio) })
+                            .await;
+                        this.update(cx, |app, cx| match encoded {
+                            Ok(wav) => app.save_interrupted_take(
+                                Arc::new(wav),
+                                journal_report,
+                                note,
+                                None,
+                                None,
+                                cx,
+                            ),
+                            Err(err) => {
+                                app.error = Some(err.to_string());
+                                cx.notify();
+                            }
+                        })
+                        .ok();
+                    })
+                    .detach();
+                }
                 Ok(mut take) => {
                     // `sent_samples` indexes device-rate samples of the
                     // spliced layout (drained stream prefix + journal
@@ -552,6 +611,7 @@ impl StarlingApp {
                 Ok(handle) => {
                     self.mic.problem = None;
                     self.mic.interruption = None;
+                    self.mic.last_sound_at = None;
                     self.mic.last_route = handle.input_route().cloned();
                     self.live_partial.clear();
                     if self.staged_mode() {

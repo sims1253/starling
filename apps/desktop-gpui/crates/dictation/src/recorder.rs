@@ -216,6 +216,12 @@ pub struct CapturedTake {
     pub audio: crate::audio::PcmAudio,
     /// The durable journal report, when this capture journaled.
     pub journal: Option<JournalReport>,
+    /// A device-side failure the capture had already reported when the
+    /// stop handshake began (#222): the audio is complete up to the
+    /// failure, but the take was interrupted and must not be presented
+    /// as complete. Errors posted while the stream is being torn down are
+    /// not counted — some backends report one on a normal stop.
+    pub device_fault: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1085,6 +1091,9 @@ impl RecorderHandle {
     /// caller and do not make the take "empty".
     pub fn stop(mut self) -> Result<CapturedTake, RecorderError> {
         let final_sample_index = self.shared.written_seq.load(Ordering::Acquire);
+        // #222: the device fault as of the stop decision, before teardown
+        // can post errors of its own.
+        let device_fault = self.shared.lock_consumer().stream_error.clone();
 
         if let Some(stream) = self.stream.take() {
             // Explicit stop; pause is unsupported on some backends, and
@@ -1197,6 +1206,7 @@ impl RecorderHandle {
                 channels: 1,
             },
             journal,
+            device_fault,
         })
     }
 }
@@ -2762,6 +2772,29 @@ mod tests {
         assert!(stalled >= Duration::from_millis(50), "{stalled:?}");
         callback.process(&[0.1f32; 160], &shared);
         assert!(handle.input_stalled_for() < stalled);
+    }
+
+    #[test]
+    fn stop_reports_a_device_fault_posted_before_the_handshake() {
+        // #222: a device that failed before stop — even after the app's
+        // last health check — leaves its mark on the returned take, so the
+        // app files it as interrupted instead of complete.
+        let shared = test_shared(8_192);
+        let handle = test_handle(Arc::clone(&shared), 16_000);
+        CallbackState::new(1).process(&[0.2f32; 320], &shared);
+        shared.record_stream_error("The requested device is no longer available.".to_string());
+        let take = handle.stop().expect("the audio before the fault is returned");
+        assert_eq!(take.audio.samples.len(), 320);
+        assert_eq!(
+            take.device_fault.as_deref(),
+            Some("The requested device is no longer available.")
+        );
+
+        let shared = test_shared(8_192);
+        let handle = test_handle(Arc::clone(&shared), 16_000);
+        CallbackState::new(1).process(&[0.2f32; 320], &shared);
+        let take = handle.stop().expect("clean take");
+        assert_eq!(take.device_fault, None, "a healthy take carries no fault");
     }
 
     #[test]
