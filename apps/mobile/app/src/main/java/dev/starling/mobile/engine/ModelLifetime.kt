@@ -98,6 +98,9 @@ class ModelLifetime(
 
         /** A GPU driver failure was seen; speculative work stays off. */
         DRIVER_FAILED,
+
+        /** The worker refused the task (it was shut down); nothing was queued. */
+        REJECTED,
     }
 
     private val lock = Any()
@@ -132,7 +135,9 @@ class ModelLifetime(
      * calling thread only reads the in-memory state and queues — no
      * file-system work, and nothing while a preload is in flight. Which
      * model is active, and whether it is still inside its failure backoff,
-     * are resolved on the worker (see [preloadAllowed]).
+     * are resolved on the worker (see [preloadAllowed]). A worker that
+     * refuses the task is reported through [logFailure], never thrown: a
+     * later activation simply queues again.
      */
     fun preload(): PreloadResult {
         synchronized(lock) {
@@ -143,9 +148,11 @@ class ModelLifetime(
         try {
             worker.execute(::runPreload)
         } catch (t: Throwable) {
-            // A rejected task (executor shut down) must not wedge preloads.
+            // A rejected task (executor shut down) must not wedge preloads,
+            // nor surface into the activation callback that queued it.
             synchronized(lock) { preloadInFlight = false }
-            throw t
+            runCatching { logFailure(t) }
+            return PreloadResult.REJECTED
         }
         return PreloadResult.QUEUED
     }
@@ -233,12 +240,17 @@ class ModelLifetime(
         synchronized(lock) {
             cancelIdleTimerLocked()
             if (idleReleaseMs <= 0) return
-            idleTimer = scheduler.schedule(idleReleaseMs) {
-                synchronized(lock) { idleTimer = null }
+            var timer: Cancellable? = null
+            timer = scheduler.schedule(idleReleaseMs) {
+                // Only its own task clears the field: a stale timer firing
+                // after a newer idle re-armed must not erase that Cancellable
+                // (it could then never be cancelled).
+                synchronized(lock) { if (idleTimer === timer) idleTimer = null }
                 // The engine refuses when anything used the model since
                 // [generation]; a refused release changes nothing.
                 runCatching { engine.releaseIfIdle(generation) }
             }
+            idleTimer = timer
         }
     }
 

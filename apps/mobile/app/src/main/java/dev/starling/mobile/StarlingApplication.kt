@@ -128,11 +128,16 @@ class StarlingApplication : Application() {
      * Whether [config] streams on-device while the model is still loading:
      * the one predicate behind the voice surfaces' "loading" status (the
      * recorder, the recognizer popup and the keyboard), so they cannot
-     * drift apart. Audio is saved from the first sample either way.
+     * drift apart. True while the model is Loading, and while it is
+     * Unloaded — a take that starts cold loads in its own prepare(), which
+     * reports its state asynchronously, so Unloaded at the Record tap means
+     * the load is about to start. Failed and DriverFailed are not loading:
+     * nothing retries them speculatively, so the surface must not promise
+     * text that will not come. Audio is saved from the first sample either
+     * way.
      */
     fun isOnDeviceModelLoading(config: BackendConfig): Boolean =
-        config.engine == TranscriptionEngine.ON_DEVICE &&
-            modelLifetime.state() !is ModelLifetime.State.Ready
+        config.engine == TranscriptionEngine.ON_DEVICE && isLoading(modelLifetime.state())
 
     /**
      * Refuses a model load that clearly cannot fit: the model's file size is
@@ -153,11 +158,24 @@ class StarlingApplication : Application() {
         )
     }
 
-    private companion object {
+    internal companion object {
         private const val TAG = "StarlingApplication"
 
         /** Activations and graph buffers on top of the weights. */
         const val MODEL_WORKING_SET_BYTES = 128L * 1024 * 1024
+
+        /**
+         * The state half of [isOnDeviceModelLoading], split out for its
+         * unit test (the application itself needs the main looper).
+         */
+        fun isLoading(state: ModelLifetime.State): Boolean = when (state) {
+            is ModelLifetime.State.Loading -> true
+            ModelLifetime.State.Unloaded -> true
+            is ModelLifetime.State.Ready,
+            is ModelLifetime.State.Failed,
+            is ModelLifetime.State.DriverFailed,
+            -> false
+        }
     }
 }
 

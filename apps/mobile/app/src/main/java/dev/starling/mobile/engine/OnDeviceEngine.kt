@@ -626,6 +626,9 @@ class OnDeviceEngine(
             if (text == null) {
                 val error = StarlingNative.lastError(handle)
                 error?.let(observer::engineFailed)
+                if (error != null && ModelLifetime.isDriverFailure(error)) {
+                    releaseDriverFailureLocked(error)
+                }
                 return OnDeviceStreamSession.WindowResult.Failed(
                     "the on-device engine returned an error: ${error ?: "unknown error"}",
                 )
@@ -720,6 +723,9 @@ class OnDeviceEngine(
             if (text == null) {
                 val error = StarlingNative.lastError(handle)
                 error?.let(observer::engineFailed)
+                if (error != null && ModelLifetime.isDriverFailure(error)) {
+                    releaseDriverFailureLocked(error)
+                }
                 return InferenceResult.Failure("The on-device engine returned an error: ${error ?: "unknown error"}", false)
             }
             texts.add(text)
@@ -727,6 +733,19 @@ class OnDeviceEngine(
         // A single window is the direct path; joining would only normalize.
         val text = if (texts.size == 1) texts[0] else ChunkedTranscription.joinTexts(texts)
         return InferenceResult.Success(text)
+    }
+
+    /**
+     * A request that failed through the GPU driver (#325) leaves the
+     * resident handle wedged: free it now, or when the pinned live sessions
+     * end ([releaseLocked]). Propagate, not retry — this request still
+     * returns its failure, the next user-initiated load reloads (the native
+     * engine falls back to the CPU there), and speculative preloads stay
+     * off through ModelLifetime's DriverFailed. Caller holds [lock].
+     */
+    private fun releaseDriverFailureLocked(error: String) {
+        releaseLocked()
+        loadError = error
     }
 
     private fun unload() {

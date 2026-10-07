@@ -5,6 +5,7 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.util.concurrent.RejectedExecutionException
 
 /**
  * The lifetime policy against a fake engine, a manual executor and a
@@ -80,6 +81,28 @@ class ModelLifetimeTest {
         assertEquals(ModelLifetime.PreloadResult.QUEUED, lifetime.preload())
         runQueued()
         assertEquals(0, engine.prepares)
+    }
+
+    @Test
+    fun aRejectedPreloadTaskIsLoggedNotThrownAndUnwedges() {
+        val failures = mutableListOf<Throwable>()
+        var workerRejects = true
+        val rejectingLifetime = ModelLifetime(
+            engine = engine,
+            worker = { if (workerRejects) throw RejectedExecutionException("shut down") else queued.addLast(it) },
+            scheduler = { _, _ -> ModelLifetime.Cancellable { } },
+            deliver = { it.run() },
+            logFailure = { failures += it },
+        )
+        assertEquals(ModelLifetime.PreloadResult.REJECTED, rejectingLifetime.preload())
+        assertEquals("shut down", failures.single().message)
+
+        // The rejection reset the in-flight flag: once the worker accepts
+        // tasks again, a later activation queues instead of joining a ghost.
+        workerRejects = false
+        assertEquals(ModelLifetime.PreloadResult.QUEUED, rejectingLifetime.preload())
+        runQueued()
+        assertEquals(1, engine.prepares)
     }
 
     @Test
@@ -181,6 +204,18 @@ class ModelLifetimeTest {
         val timer = liveTimers().single()
         timer.task.run()
         assertEquals(listOf(9L), engine.releases)
+    }
+
+    @Test
+    fun aStaleIdleTimerCannotEraseTheNewerOne() {
+        lifetime.idle(7)
+        lifetime.idle(9)
+        // Timer 1 fires late, after the newer idle re-armed: its release is
+        // refused by the generation, and it must not clear timer 2 either.
+        timers.first().task.run()
+        assertEquals(listOf(7L), engine.releases)
+        lifetime.loading("parakeet.gguf")
+        assertTrue(liveTimers().isEmpty())
     }
 
     @Test

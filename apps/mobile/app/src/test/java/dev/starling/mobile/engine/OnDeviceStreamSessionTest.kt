@@ -186,11 +186,13 @@ class OnDeviceStreamSessionTest {
     /** The capture's saved WAV payload, as SavedAudioBacklog would read it. */
     private class SavedAudio : OnDeviceStreamSession.Backlog {
         val bytes = ByteArrayOutputStream()
+        val destinations = mutableListOf<FloatArray>()
         var opened = 0
         var failReads = false
 
         override fun read(from: Long, into: FloatArray, offset: Int, count: Int): Int {
             if (failReads) throw java.io.IOException("gone")
+            destinations += into
             val data = synchronized(bytes) { bytes.toByteArray() }
             var n = 0
             while (n < count && 2 * (from + n) + 1 < data.size) {
@@ -283,6 +285,29 @@ class OnDeviceStreamSessionTest {
         Thread { Thread.sleep(200); loaded.countDown() }.start()
 
         assertEquals(CommitOutcome.Final(expected(25)), session.finish())
+    }
+
+    @Test
+    fun catchingUpReusesOneScratchArrayAcrossRefills() {
+        val loaded = CountDownLatch(1)
+        val saved = SavedAudio()
+        val session = OnDeviceStreamSession(
+            engine = SecondsEngine(loaded),
+            events = { events += it },
+            // 1 s windows with a 5 s buffer: catching up on the spilled audio
+            // takes several refill passes.
+            streamer = ChunkStreamer(chunkSeconds = 1.0, overlapSeconds = 0.0, minSeconds = 1.0, partialIntervalSeconds = 0.0),
+            maxLiveSamples = 5 * ChunkStreamer.SAMPLE_RATE,
+            backlog = { saved },
+        ).start()
+        capture(session, saved, 0 until 25)
+        loaded.countDown()
+
+        assertEquals(CommitOutcome.Final(expected(25)), session.finish())
+        // Several reads, one reused (grown on demand) destination array
+        // instead of a fresh maxLiveSamples allocation per refill.
+        assertTrue(saved.destinations.size > 1)
+        assertTrue(saved.destinations.all { it === saved.destinations.first() })
     }
 
     @Test

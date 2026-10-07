@@ -114,6 +114,11 @@ class OnDeviceStreamSession(
     // Worker thread only: whether prepare() succeeded and pinned the model.
     private var prepared = false
 
+    // Worker thread only (refillFromBacklog): the read destination, reused
+    // across refills and grown on demand, so catching up on a cold load does
+    // not allocate a fresh maxLiveSamples array per loop iteration.
+    private var refillScratch = FloatArray(0)
+
     fun start(): OnDeviceStreamSession = apply {
         // Counted before the worker exists, so a memory-pressure release can
         // never slip in between start() and the worker's first instruction.
@@ -331,15 +336,15 @@ class OnDeviceStreamSession(
             count = minOf(captured - from, (refillLimit() - size).toLong()).toInt()
         }
         if (count <= 0) return true
-        val samples = FloatArray(count)
-        val read = runCatching { source.read(from, samples, 0, count) }.getOrDefault(-1)
+        if (refillScratch.size < count) refillScratch = FloatArray(count)
+        val read = runCatching { source.read(from, refillScratch, 0, count) }.getOrDefault(-1)
         lock.withLock {
             if (read != count) {
                 failLocked("the saved recording could not be read back", bufferLimitReached = false)
                 return false
             }
             if (size + count > buffer.size) buffer = buffer.copyOf(maxOf(size + count, buffer.size * 2))
-            System.arraycopy(samples, 0, buffer, size, count)
+            System.arraycopy(refillScratch, 0, buffer, size, count)
             size += count
         }
         return true
