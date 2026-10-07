@@ -48,6 +48,18 @@
 //!    during an insert makes the insert wait out the bounded release
 //!    window and then refuse with `ModifiersHeld` — nothing typed,
 //!    and no modifier was released behind the user's back.
+//! 4b. **A mapping that drifts between the chunk checks and the
+//!    press stops typing before the key-down**: with Ctrl held (the
+//!    insert waits), the test itself re-maps the exact keycode a plan
+//!    is about to press to `Return` — once the borrowed spare of an
+//!    unmapped character (bare refusal, nothing typed), once a
+//!    pre-mapped letter's key after a first character was already
+//!    delivered (partial delivery naming the keycode). After Ctrl is
+//!    released the insert must refuse with a keyboard-busy cause, the
+//!    window must have seen no `Return`/`KP_Enter` key at all, and
+//!    the foreign mapping must survive untouched for the test to
+//!    restore — the no-Enter rule cannot be broken by another
+//!    client's hand.
 //! 5. **Chunked typing rechecks the target**: a long string types in
 //!    chunks; when a second window is mapped the moment the first
 //!    chunk's first key is *observed* here (the clean seam: this
@@ -119,6 +131,11 @@ const XK_CONTROL_L: u32 = 0xffe3;
 const XK_CONTROL_R: u32 = 0xffe4;
 /// `XK_Caps_Lock` — the setup normalization's key.
 const XK_CAPS_LOCK: u32 = 0xffe5;
+/// `XK_Return` and `XK_KP_Enter` — the keysyms the mapping-drift
+/// regression must never let reach the window, however the drift
+/// happened.
+const XK_RETURN: u32 = 0xff0d;
+const XK_KP_ENTER: u32 = 0xff8b;
 
 /// A one-string failure type: every site has a different failure but
 /// the handler only needs to report it.
@@ -354,6 +371,212 @@ fn main_test() -> Result<(), ItError> {
         "a held-modifier refusal may not type"
     );
 
+    // 4b. A mapping that drifts between the chunk checks and the
+    //     press must stop typing before the key-down. The chunk
+    //     checks (held modifiers, keyboard state, identity) never
+    //     read the keycode mappings, so a foreign client can flip the
+    //     exact keycode a plan is about to press — during the
+    //     held-modifier wait, say — and a blind press would type
+    //     whatever the *new* mapping decodes to: a foreign `Return`
+    //     is the no-Enter rule broken by another client's hand. Both
+    //     plan kinds are pinned: a borrowed spare re-mapped to
+    //     `Return` (bare refusal, nothing typed) and a pre-mapped
+    //     letter re-mapped to `Return` after a first character was
+    //     already delivered (partial delivery naming the keycode). In
+    //     both, the window sees no Return/KP_Enter at all, Starling
+    //     leaves the foreign mapping exactly as the interloper wrote
+    //     it, and the test restores the session itself.
+    {
+        // The keycode the backend will borrow for an unmapped
+        // character: the highest live all-`NoSymbol` one — the same
+        // top-down policy the backend's spare pool draws from, so the
+        // prediction is exact.
+        let borrowed = kb
+            .spare_keycodes(1)
+            .ok_or_else(|| focus_error("this keyboard has no spare keycode to borrow"))?[0];
+        let control_keysym = *kb
+            .syms_of(control)
+            .first()
+            .expect("the Control keycode carries its keysym");
+
+        // Variant A: the borrowed keycode itself is re-mapped to
+        // Return while the insert waits out the held Ctrl. The payload
+        // is the single unmapped character that rides it, so the
+        // refusal must come before its key-down: a bare keyboard-busy
+        // rejection naming the keycode, nothing typed.
+        cleanup.premaps.push((borrowed, vec![0; kb.width]));
+        xtest_press(&conn, control)?;
+        let payload_a = unmapped.to_string();
+        let (result, pressed) = drift_round(
+            &conn,
+            a,
+            &mut kb,
+            || {
+                let backend_thread = X11Backend::new();
+                let snapshot = snap_a.clone();
+                let payload = payload_a.clone();
+                std::thread::spawn(move || backend_thread.insert(&snapshot, &payload))
+            },
+            borrowed,
+            keysym_of(unmapped),
+            |conn, kb| {
+                // The foreign remap: every column of the borrowed
+                // keycode becomes Return (what an interloper's "make
+                // this key Enter" looks like), then Ctrl is released
+                // so typing proceeds straight into the drifted
+                // mapping.
+                let columns = vec![XK_RETURN; kb.width];
+                conn.change_keyboard_mapping(1, borrowed, kb.width as u8, &columns)
+                    .map_err(x11)?
+                    .check()
+                    .map_err(x11)?;
+                xtest_release(conn, control)
+            },
+        )?;
+        match result {
+            Err(InsertError::Rejected { reason }) => {
+                assert!(
+                    reason.contains("keyboard busy"),
+                    "the refusal says why: {reason}"
+                );
+                assert!(
+                    reason.contains(&format!("keycode {borrowed}")),
+                    "the refusal names the drifted keycode: {reason}"
+                );
+            }
+            other => {
+                panic!("a drifted borrowed keycode must refuse before any key-down: {other:?}")
+            }
+        }
+        assert!(
+            !pressed.contains(&XK_RETURN) && !pressed.contains(&XK_KP_ENTER),
+            "no Return or KP_Enter may reach the window (saw {pressed:?})"
+        );
+        assert_eq!(
+            pressed,
+            vec![control_keysym],
+            "nothing but the held Ctrl reached the window"
+        );
+        kb.reload(&conn)?;
+        assert_eq!(
+            kb.syms_of(borrowed).first(),
+            Some(&XK_RETURN),
+            "Starling must leave the interloper's mapping exactly as it was written"
+        );
+        // The test cleans up its own foreign mapping (all-`NoSymbol`
+        // was there before the interloper touched it).
+        let zeros = vec![0u32; kb.width];
+        conn.change_keyboard_mapping(1, borrowed, kb.width as u8, &zeros)
+            .map_err(x11)?
+            .check()
+            .map_err(x11)?;
+        kb.assert_mapping_is(&conn, &mapping_before)?;
+
+        // Variant B: a *pre-mapped* keycode drifts. The payload's
+        // first character rides the borrow (delivered normally — its
+        // mapping is untouched), the second is a plain layout letter
+        // whose keycode the interloper re-maps to Return during the
+        // same wait: typing stops between the two, reporting exactly
+        // one character may have landed and a keyboard-busy cause
+        // naming the letter's keycode.
+        let letter = ['q', 'x', 'z', 'v', 'k', 'j']
+            .iter()
+            .copied()
+            .find(|&candidate| {
+                kb.keycode_of(keysym_of(candidate)).is_some_and(|keycode| {
+                    kb.syms_of(keycode).first() == Some(&keysym_of(candidate))
+                })
+            })
+            .ok_or_else(|| focus_error("this keyboard has no plain unshifted letter to drift"))?;
+        let letter_keycode = kb
+            .keycode_of(keysym_of(letter))
+            .expect("the find above proved the letter is mapped");
+        let letter_original = kb.syms_of(letter_keycode).to_vec();
+        cleanup
+            .premaps
+            .push((letter_keycode, letter_original.clone()));
+        xtest_press(&conn, control)?;
+        let payload_b = format!("{unmapped}{letter}");
+        let (result, pressed) = drift_round(
+            &conn,
+            a,
+            &mut kb,
+            || {
+                let backend_thread = X11Backend::new();
+                let snapshot = snap_a.clone();
+                let payload = payload_b.clone();
+                std::thread::spawn(move || backend_thread.insert(&snapshot, &payload))
+            },
+            borrowed,
+            keysym_of(unmapped),
+            |conn, kb| {
+                let columns = vec![XK_RETURN; kb.width];
+                conn.change_keyboard_mapping(1, letter_keycode, kb.width as u8, &columns)
+                    .map_err(x11)?
+                    .check()
+                    .map_err(x11)?;
+                xtest_release(conn, control)
+            },
+        )?;
+        match result {
+            Err(InsertError::PartialDelivery {
+                delivered_chars,
+                total_chars,
+                cause,
+            }) => {
+                assert_eq!(
+                    delivered_chars, 1,
+                    "exactly the first character may have landed"
+                );
+                assert_eq!(total_chars, payload_b.chars().count());
+                match *cause {
+                    InsertError::Rejected { reason } => {
+                        assert!(
+                            reason.contains("keyboard busy"),
+                            "the stop says why: {reason}"
+                        );
+                        assert!(
+                            reason.contains(&format!("keycode {letter_keycode}")),
+                            "the stop names the drifted keycode: {reason}"
+                        );
+                    }
+                    other => panic!("the drift must be the stop cause, not {other:?}"),
+                }
+            }
+            other => panic!(
+                "a drifted pre-mapped keycode after a delivered character must stop partially: \
+                 {other:?}"
+            ),
+        }
+        assert!(
+            !pressed.contains(&XK_RETURN) && !pressed.contains(&XK_KP_ENTER),
+            "no Return or KP_Enter may reach the window (saw {pressed:?})"
+        );
+        assert_eq!(
+            pressed,
+            vec![control_keysym, keysym_of(unmapped)],
+            "only the held Ctrl and the first character were pressed — never the drifted key"
+        );
+        kb.reload(&conn)?;
+        assert_eq!(
+            kb.syms_of(letter_keycode).first(),
+            Some(&XK_RETURN),
+            "Starling must leave the interloper's mapping on the pre-mapped key too"
+        );
+        // Restore the letter's real columns, then prove the whole
+        // mapping is back at the baseline before the later rounds run.
+        conn.change_keyboard_mapping(
+            1,
+            letter_keycode,
+            letter_original.len() as u8,
+            &letter_original,
+        )
+        .map_err(x11)?
+        .check()
+        .map_err(x11)?;
+        kb.assert_mapping_is(&conn, &mapping_before)?;
+    }
+
     // 5b. Concurrent inserts serialize: two inserts racing from two
     //     threads must not interleave — the process-wide insert lock
     //     means one types (and borrows, and restores) to completion
@@ -536,8 +759,10 @@ fn main_test() -> Result<(), ItError> {
         "starling-insertion X11 IT passed: capture identity, mixed-string decode as text \
          ({mixed:?}), remap+restore (mapping byte-for-byte unchanged), uppercase remap decode \
          ({upper_text:?}), preparation-failure refusal with a restored mapping ({} spare \
-         keycodes exhausted), held-modifier refusal, chunk-bounded partial delivery on focus \
-         steal, serialized concurrent inserts, changed and gone revalidation",
+         keycodes exhausted), held-modifier refusal, mapping-drift refusal (borrowed and \
+         pre-mapped keycodes re-mapped to Return mid-wait: no Enter reached the window, the \
+         foreign mappings survived for the test to restore), chunk-bounded partial delivery \
+         on focus steal, serialized concurrent inserts, changed and gone revalidation",
         spares_left
     );
     Ok(())
@@ -762,6 +987,117 @@ fn insert_and_decode(
     match listener_error {
         Some(error) => Err(error),
         None => Ok((joined, decoded)),
+    }
+}
+
+/// The live keysyms of one keycode, straight from the server — the
+/// drift round's poll of the backend's borrow.
+fn live_keycode_syms(conn: &RustConnection, keycode: u8) -> Result<Vec<u32>, ItError> {
+    Ok(conn
+        .get_keyboard_mapping(keycode, 1)
+        .map_err(x11)?
+        .reply()
+        .map_err(x11)?
+        .keysyms)
+}
+
+/// One mapping-drift round (the regression for the pre-press
+/// verification): the insert (`spawn`) runs while Ctrl is physically
+/// held; this connection watches for the backend's borrow to land on
+/// `borrow_keycode` (its base column carrying `borrow_keysym` —
+/// preparation is done by then, and the insert is parked in the
+/// held-modifier wait, the exact exposure window the regression
+/// targets), then runs `interfere` — the foreign remap, plus the Ctrl
+/// release that lets typing proceed into the drifted mapping — and
+/// finally drains the stream until the insert returns. Every
+/// `KeyPress` for `window` is collected as its event-time keysym
+/// (modifier keysyms included, characters and all), so the caller can
+/// assert exactly which keys the window saw. Modeled on
+/// [`insert_and_decode`]: the join always happens, and listener-side
+/// errors surface after it, never by orphaning the typing thread.
+#[allow(clippy::type_complexity)]
+fn drift_round(
+    conn: &RustConnection,
+    window: Window,
+    kb: &mut Keyboard,
+    spawn: impl FnOnce() -> std::thread::JoinHandle<Result<InsertReceipt, InsertError>>,
+    borrow_keycode: u8,
+    borrow_keysym: u32,
+    interfere: impl FnOnce(&RustConnection, &mut Keyboard) -> Result<(), ItError>,
+) -> Result<(Result<InsertReceipt, InsertError>, Vec<u32>), ItError> {
+    fn pump(
+        conn: &RustConnection,
+        window: Window,
+        kb: &mut Keyboard,
+        pressed: &mut Vec<u32>,
+        listener_error: &mut Option<ItError>,
+    ) {
+        while let Some(event) = conn.poll_for_event().unwrap() {
+            match event {
+                x11rb::protocol::Event::KeyPress(press) if press.event == window => {
+                    // Event-time keysym: the column the event's own
+                    // modifier state selects, decoded through the
+                    // keymap copy current when the event is read.
+                    let column = if u16::from(press.state) & 0x01 != 0 {
+                        1
+                    } else {
+                        0
+                    };
+                    if let Some(&keysym) = kb.syms_of(press.detail).get(column) {
+                        pressed.push(keysym);
+                    }
+                }
+                x11rb::protocol::Event::MappingNotify(_) => {
+                    if let Err(error) = kb.reload(conn) {
+                        listener_error.get_or_insert(error);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let handle = spawn();
+    let deadline = Instant::now() + INSERT_BUDGET;
+    let mut pressed: Vec<u32> = Vec::new();
+    let mut listener_error: Option<ItError> = None;
+    let mut interfere = Some(interfere);
+    let mut interfered = false;
+    loop {
+        pump(conn, window, kb, &mut pressed, &mut listener_error);
+        if !interfered {
+            // The borrow's write and echo-read both run inside the
+            // backend's server grab, so a poll that sees the keysym
+            // necessarily runs after the whole borrow — the interloper
+            // cannot race the echo.
+            let landed =
+                live_keycode_syms(conn, borrow_keycode)?.first().copied() == Some(borrow_keysym);
+            if landed {
+                if let Some(interfere) = interfere.take() {
+                    if let Err(error) = interfere(conn, kb) {
+                        listener_error.get_or_insert(error);
+                    }
+                }
+                interfered = true;
+            }
+        }
+        if handle.is_finished() {
+            // Stragglers: events the server queued before the insert
+            // returned still count as "what the target saw".
+            std::thread::sleep(DRAIN_GRACE);
+            pump(conn, window, kb, &mut pressed, &mut listener_error);
+            break;
+        }
+        if Instant::now() > deadline {
+            return Err(focus_error(
+                "the drifted insert did not finish within the test budget",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let result = handle.join().expect("an inserting thread must not panic");
+    match listener_error {
+        Some(error) => Err(error),
+        None => Ok((result, pressed)),
     }
 }
 

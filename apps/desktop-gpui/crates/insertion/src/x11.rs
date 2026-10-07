@@ -74,13 +74,15 @@
 //!   all-`NoSymbol` before the first key is typed. One X11 insert runs
 //!   at a time per process (the lock's own docs say why that is the
 //!   honest granularity);
-//! - each borrow's short read→write→echo-read sequence and each
-//!   restore's compare→write sequence run inside a server grab
+//! - each borrow's short read→write→echo-read sequence, each
+//!   restore's compare→write sequence, and each character's
+//!   read→compare→press sequence run inside a server grab
 //!   (`GrabServer`/`UngrabServer`), so no *other X client* can
 //!   interleave a remap of the same keycode between the ownership
-//!   check and the write. The grab is held for those few requests
-//!   only — never across a sleep, a wait or any typing — and the
-//!   guard releases it even on error;
+//!   check and the write — or between the pre-press check and the
+//!   key-down. The grab is held for those few requests only — never
+//!   across a sleep, a wait or a key's hold time — and the guard
+//!   releases it even on error;
 //! - right before remapping, the keycode's *live* mapping is re-read
 //!   and required to still be all-`NoSymbol` (another client's remap
 //!   picks the next spare; none free is a `keyboard_busy`-style
@@ -93,6 +95,23 @@
 //!   keysym in the base column; an unexpected echo is a refusal,
 //!   never a panic. The keysym a plan types is kept separately from
 //!   the echoed mapping the restore comparison uses;
+//! - immediately before each character's key goes down, that keycode's
+//!   live mapping is re-read inside the same short grab and required
+//!   to still be what the plan expects: a borrowed keycode carries
+//!   exactly the recorded echo, a pre-mapped keycode still produces
+//!   the planned keysym in the planned column, and the Shift keycode
+//!   a column-1 plan presses still carries a Shift keysym and stays
+//!   bound to the Shift modifier. The chunk checks cannot see a
+//!   remap that lands while they run (the held-modifier wait alone
+//!   is seconds of exposure), and a press through a drifted mapping
+//!   would type whatever the *new* mapping decodes to — another
+//!   client's `Return`, say, which is the no-Enter rule broken by a
+//!   foreign hand. A drift stops typing before the key-down with a
+//!   keyboard-busy [`InsertError::Rejected`] naming the keycode
+//!   (wrapped as [`InsertError::PartialDelivery`] when earlier
+//!   characters may have landed), and the conditional restore then
+//!   leaves the foreign mapping alone (logged) — an insert never
+//!   reports a clean success over a mapping Starling no longer owns;
 //! - on restore, the live mapping is re-read and restored only if it
 //!   still equals exactly what Starling wrote — another client's
 //!   change is left alone (with a warning logged);
@@ -109,8 +128,10 @@
 //!
 //! Long texts type in chunks of at most [`X11_CHUNK_CHARS`]
 //! characters, with the full safety check (held modifiers, keyboard
-//! state, focus/identity/pid) repeated before *every* chunk; a change
-//! part-way stops typing immediately and reports
+//! state, focus/identity/pid) repeated before *every* chunk and every
+//! character's keycode re-verified against the live mapping
+//! immediately before its key-down (the transaction rules above); a
+//! change part-way stops typing immediately and reports
 //! [`InsertError::PartialDelivery`] with how much may have landed — a
 //! character counts as possibly delivered the moment its key-down was
 //! issued, so the count never understates what the target may hold
@@ -669,7 +690,9 @@ impl InsertionBackend for X11Backend {
             total,
             &segments,
             || self.chunk_check(&session, &target.target_ref),
-            |segment, delivered| type_segment(&session, &keyboard, &plans, segment, delivered),
+            |segment, delivered| {
+                type_segment(&session, &keyboard, &remap, &plans, segment, delivered)
+            },
         );
         match typed {
             Ok(receipt) => {
@@ -1312,6 +1335,17 @@ impl RemapTransaction<'_> {
             .map(|entry| entry.keycode)
     }
 
+    /// The recorded echo for a keycode this transaction borrowed —
+    /// the exact baseline the pre-press check compares the live
+    /// mapping against (the same value a restore compares against, so
+    /// "drifted" means the same thing at the press and at cleanup).
+    fn echoed_for(&self, keycode: Keycode) -> Option<&[Keysym]> {
+        self.borrowed
+            .iter()
+            .find(|entry| entry.keycode == keycode)
+            .map(|entry| entry.echoed.as_slice())
+    }
+
     /// Give every borrowed keycode back. The server is synced (all
     /// queued keys processed) and the mapping held through
     /// [`KEYMAP_SETTLE`] first; then each keycode's compare→restore
@@ -1432,7 +1466,12 @@ impl Drop for RemapTransaction<'_> {
 /// client's requests, so a read→write→read-back ownership sequence
 /// cannot interleave with another client's remap of the same keycode.
 /// Only ever held for those few requests: no sleeps, no waits, no
-/// typing, no event reading while grabbed.
+/// event reading while grabbed. A character's key-down requests are
+/// issued inside the grab that verified their mapping and flushed
+/// before it releases; the key's hold time and its release follow
+/// outside the grab (a release is a bare keycode event — no mapping
+/// can make it type anything, so the never-across-a-sleep discipline
+/// keeps the hold outside).
 struct ServerGrab<'a> {
     session: &'a Session,
 }
@@ -1544,6 +1583,7 @@ enum CharFailure {
 fn type_segment(
     session: &Session,
     keyboard: &Keyboard,
+    remap: &RemapTransaction<'_>,
     plans: &HashMap<char, CharPlan>,
     segment: &str,
     delivered_before: usize,
@@ -1554,7 +1594,7 @@ fn type_segment(
         let plan = plans
             .get(&character)
             .expect("every character of the text was planned");
-        match type_character(keyboard, plan, &mut pressed) {
+        match type_character(session, keyboard, remap, character, plan, &mut pressed) {
             Ok(()) => typed += 1,
             Err(CharFailure::BeforeKeydown(cause)) => {
                 return Err(ChunkFailure {
@@ -1577,14 +1617,20 @@ fn type_segment(
     Ok(typed)
 }
 
-/// Type one character through its plan: press Shift if the column
-/// needs it, tap the key, release in reverse. The `pressed` guard
-/// guarantees the releases even when a send fails mid-keystroke.
-/// Failures are classified for the delivery count by
+/// Type one character through its plan: verify the keycode's live
+/// mapping inside a short server grab, issue the presses (Shift and
+/// the key) while that verification still holds, then complete the
+/// keystroke — hold time, releases — after the grab has dropped. The
+/// `pressed` guard guarantees the releases even when a send fails
+/// mid-keystroke. Failures are classified for the delivery count by
 /// [`CharFailure`]'s rule: anything at or after the character's own
-/// key-down counts as possibly delivered.
+/// key-down counts as possibly delivered; a grab or verification
+/// failure happens strictly before it.
 fn type_character(
+    session: &Session,
     keyboard: &Keyboard,
+    remap: &RemapTransaction<'_>,
+    character: char,
     plan: &CharPlan,
     pressed: &mut PressedKeys<'_>,
 ) -> Result<(), CharFailure> {
@@ -1617,12 +1663,45 @@ fn type_character(
     } else {
         None
     };
-    if let Some(shift) = shift {
-        pressed.press(shift).map_err(CharFailure::BeforeKeydown)?;
+    // The grabbed verify→press section: the chunk checks cannot see a
+    // remap that lands while they run (the held-modifier wait alone
+    // is seconds of exposure), so the keycode's live mapping is
+    // re-read immediately before the key-down and the presses are
+    // issued inside the same grab — no other X client can interleave
+    // a remap between the read and the key-down. A drift (or a
+    // refused grab) stops typing here, before any key of this
+    // character goes down, with a keyboard-busy refusal naming the
+    // keycode. Only the read-compare-press requests run inside the
+    // grab: the presses are flushed while it is held, and the hold
+    // time and releases follow after it drops (a release is a bare
+    // keycode event — no mapping can make it type anything — so the
+    // never-across-a-sleep discipline keeps the hold outside).
+    {
+        let _grab = ServerGrab::new(session).map_err(|error| match error {
+            // Connection trouble stays "unavailable" — it is the
+            // backend, not the keyboard, that failed.
+            unavailable @ InsertError::Unavailable { .. } => {
+                CharFailure::BeforeKeydown(unavailable)
+            }
+            cause => CharFailure::BeforeKeydown(InsertError::Rejected {
+                reason: format!(
+                    "the X server refused the exclusive grab re-verifying keycode {keycode} \
+                     before its press, so U+{:04X} cannot be typed (keyboard busy): {}",
+                    character as u32,
+                    cause.message()
+                ),
+            }),
+        })?;
+        verify_press_mapping(session, remap, character, plan, keycode, shift)
+            .map_err(CharFailure::BeforeKeydown)?;
+        if let Some(shift) = shift {
+            pressed.press(shift).map_err(CharFailure::BeforeKeydown)?;
+        }
+        pressed.press(keycode).map_err(CharFailure::BeforeKeydown)?;
     }
-    pressed.press(keycode).map_err(CharFailure::BeforeKeydown)?;
-    // The key-down was issued: from here the character may have
-    // landed, whatever happens to the rest of its keystroke.
+    // The key-down was issued (and flushed) under the verified
+    // mapping: from here the character may have landed, whatever
+    // happens to the rest of its keystroke.
     std::thread::sleep(KEY_HOLD);
     pressed
         .release(keycode)
@@ -1632,6 +1711,108 @@ fn type_character(
     }
     std::thread::sleep(KEY_GAP);
     Ok(())
+}
+
+/// The in-grab, pre-press comparison of the keycode a plan is about
+/// to press against its live mapping — the guard that keeps a press
+/// from ever riding a mapping another client changed after planning
+/// (the chunk checks cannot see such a change; the held-modifier wait
+/// alone is seconds of exposure). A borrowed keycode must still carry
+/// exactly the recorded echo; a pre-mapped keycode must still produce
+/// the planned keysym in the planned column, and the Shift keycode a
+/// column-1 plan presses must still carry a Shift keysym (trusted
+/// columns) and remain bound to the Shift modifier. Any drift is a
+/// keyboard-busy [`InsertError::Rejected`] naming the keycode — never
+/// a press through a mapping Starling does not own.
+fn verify_press_mapping(
+    session: &Session,
+    remap: &RemapTransaction<'_>,
+    character: char,
+    plan: &CharPlan,
+    keycode: Keycode,
+    shift: Option<Keycode>,
+) -> Result<(), InsertError> {
+    let keysym = keysym_for_char(character);
+    match plan {
+        CharPlan::Remapped { .. } => {
+            // The borrow's recorded echo is the baseline — the same
+            // value a restore compares against, so "drifted" means
+            // the same thing at the press and at cleanup. A keycode
+            // pressed as borrowed with no recorded borrow is an
+            // internal error: the typer must not be able to crash the
+            // delivery path, but it may be stopped.
+            let Some(expected) = remap.echoed_for(keycode) else {
+                return Err(InsertError::Rejected {
+                    reason: format!(
+                        "internal error: keycode {keycode} is pressed as borrowed, but no \
+                         borrow is recorded for it"
+                    ),
+                });
+            };
+            let live = session.keycode_syms(keycode)?;
+            if live.as_slice() != expected {
+                return Err(mapping_drifted_rejection(keycode, character, &live));
+            }
+        }
+        CharPlan::Pre { needs_shift, .. } => {
+            let live = session.keycode_syms(keycode)?;
+            if live.get(usize::from(*needs_shift)) != Some(&keysym) {
+                return Err(mapping_drifted_rejection(keycode, character, &live));
+            }
+            if let Some(shift) = shift {
+                let shift_live = session.keycode_syms(shift)?;
+                if !shift_live
+                    .iter()
+                    .take(2)
+                    .any(|&sym| sym == XK_SHIFT_L || sym == XK_SHIFT_R)
+                {
+                    return Err(InsertError::Rejected {
+                        reason: format!(
+                            "keycode {shift}, the Shift key pressed for U+{:04X}, no longer \
+                             carries a Shift keysym (now {:?}), so the character cannot be \
+                             typed (keyboard busy)",
+                            character as u32, shift_live
+                        ),
+                    });
+                }
+                let still_bound = session
+                    .modifier_rows()?
+                    .first()
+                    .is_some_and(|row| row.contains(&shift));
+                if !still_bound {
+                    return Err(InsertError::Rejected {
+                        reason: format!(
+                            "keycode {shift}, the Shift key pressed for U+{:04X}, is no longer \
+                             bound to the Shift modifier, so the character cannot be typed \
+                             (keyboard busy)",
+                            character as u32
+                        ),
+                    });
+                }
+            }
+        }
+        CharPlan::NeedsKeysym(_) => {
+            return Err(InsertError::Rejected {
+                reason: "internal error: an unplanned character reached the typer".to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// The keyboard-busy refusal for a keycode whose live mapping drifted
+/// from the plan: typing stops before the key-down, the keycode is
+/// named, and what the mapping now holds is stated — which is how a
+/// foreign `Return` shows up in the report.
+fn mapping_drifted_rejection(keycode: Keycode, character: char, live: &[Keysym]) -> InsertError {
+    InsertError::Rejected {
+        reason: format!(
+            "keycode {keycode} no longer carries the mapping the insert planned for U+{:04X} \
+             (another X client changed it while the text was being typed; it now holds {live:?}), \
+             so the character cannot be typed (keyboard busy)",
+            character as u32
+        ),
+    }
 }
 
 /// The standard keysym for a character: Latin-1 for the first 256
