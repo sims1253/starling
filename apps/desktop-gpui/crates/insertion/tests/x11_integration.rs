@@ -657,7 +657,14 @@ fn main_test() -> Result<(), ItError> {
             a,
             &mut kb,
             || {
-                let backend_thread = X11Backend::new();
+                // A long hold makes the interference land inside the
+                // keystroke (and its grab) deterministically, rather
+                // than racing the production 3 ms hold against the
+                // scheduler — the round only discriminates a grab that
+                // ends before the release if the remap is issued while
+                // the key is provably still down.
+                let backend_thread =
+                    X11Backend::new().with_key_hold_for_tests(Duration::from_millis(250));
                 let snapshot = snap_a.clone();
                 let payload = payload_c.clone();
                 std::thread::spawn(move || backend_thread.insert(&snapshot, &payload))
@@ -1557,12 +1564,15 @@ fn hold_round(
 fn grab_exclusion_honored(conn: &RustConnection) -> Result<bool, ItError> {
     let (other, _) =
         x11rb::connect(None).map_err(|e| x11(format!("connecting a probe connection: {e}")))?;
+    // The grab is established and acknowledged *before* the probe
+    // starts: otherwise a quick probe can finish ahead of the grab on
+    // a conforming server and wrongly report the exclusion as missing.
+    conn.grab_server().map_err(x11)?.check().map_err(x11)?;
     let probe = std::thread::spawn(move || -> Result<Duration, ItError> {
         let sent = Instant::now();
         other.get_input_focus().map_err(x11)?.reply().map_err(x11)?;
         Ok(sent.elapsed())
     });
-    conn.grab_server().map_err(x11)?.check().map_err(x11)?;
     std::thread::sleep(Duration::from_millis(150));
     conn.ungrab_server().map_err(x11)?;
     conn.flush().map_err(x11)?;

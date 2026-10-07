@@ -276,6 +276,8 @@ static INSERT_LOCK: Mutex<()> = Mutex::new(());
 #[derive(Debug)]
 pub struct X11Backend {
     excluded_pids: Vec<u32>,
+    /// How long each key stays down ([`KEY_HOLD`] in production).
+    key_hold: Duration,
 }
 
 impl X11Backend {
@@ -293,7 +295,18 @@ impl X11Backend {
     pub fn with_excluded_pids(excluded_pids: Vec<u32>) -> X11Backend {
         X11Backend {
             excluded_pids: merge_excluded_pids(excluded_pids),
+            key_hold: KEY_HOLD,
         }
+    }
+
+    /// Hold every key this long instead of [`KEY_HOLD`] — tests only,
+    /// so a regression can land interference deterministically inside
+    /// one keystroke's hold (and therefore inside its server grab)
+    /// instead of racing a 3 ms window against the scheduler.
+    #[cfg(any(test, feature = "test-doubles"))]
+    pub fn with_key_hold_for_tests(mut self, key_hold: Duration) -> X11Backend {
+        self.key_hold = key_hold;
+        self
     }
 
     /// The configured exclusion set (always contains this process).
@@ -316,6 +329,8 @@ struct Session {
     /// requests before that handshake are not guaranteed to work, and
     /// `GetState` is asked for on every chunk, so memoize the probe.
     xkb_ready: Cell<bool>,
+    /// The backend's per-key hold (see [`X11Backend::with_key_hold_for_tests`]).
+    key_hold: Duration,
 }
 
 impl Session {
@@ -327,6 +342,7 @@ impl Session {
             conn,
             root,
             xkb_ready: Cell::new(false),
+            key_hold: KEY_HOLD,
         })
     }
 
@@ -625,7 +641,8 @@ impl InsertionBackend for X11Backend {
                 return Err(InsertError::Unavailable { reason, setup_hint })
             }
         }
-        let session = Session::open()?;
+        let mut session = Session::open()?;
+        session.key_hold = self.key_hold;
         let Some((active, focus)) = session.focus_pair()? else {
             return Err(InsertError::Rejected {
                 reason: "no window has input focus".to_string(),
@@ -651,7 +668,8 @@ impl InsertionBackend for X11Backend {
     }
 
     fn revalidate(&self, target: &TargetSnapshot) -> Result<TargetCheck, InsertError> {
-        let session = Session::open()?;
+        let mut session = Session::open()?;
+        session.key_hold = self.key_hold;
         self.revalidate_on(&session, target)
     }
 
@@ -674,7 +692,8 @@ impl InsertionBackend for X11Backend {
         // One connection for the checks and the keys (module docs): the
         // revalidation inside the chunk loop rides the same server
         // view as the typing.
-        let session = Session::open()?;
+        let mut session = Session::open()?;
+        session.key_hold = self.key_hold;
 
         // ---- prepare everything BEFORE the final revalidation ----
         // (a failed check must leave the keyboard exactly as it was,
@@ -1765,7 +1784,7 @@ fn type_character(
         // mapping: from here the character may have landed, whatever
         // happens to the rest of its keystroke.
         pressed.press(keycode).map_err(CharFailure::BeforeKeydown)?;
-        std::thread::sleep(KEY_HOLD);
+        std::thread::sleep(session.key_hold);
         pressed
             .release(keycode)
             .map_err(CharFailure::AfterKeydown)?;
