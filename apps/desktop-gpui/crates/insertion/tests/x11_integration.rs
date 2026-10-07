@@ -60,6 +60,40 @@
 //!    the foreign mapping must survive untouched for the test to
 //!    restore — the no-Enter rule cannot be broken by another
 //!    client's hand.
+//! 4c. **A remap aimed at the pressed key during its hold is blocked
+//!    by the keystroke grab** (on a server that honors `GrabServer`):
+//!    the payload is one unmapped character riding the predicted
+//!    borrowed spare, and the moment this connection observes that
+//!    keycode's `KeyPress` — the key is down right now, inside its
+//!    3 ms hold — the test re-maps that same *pressed* keycode to
+//!    `Return` (a second client as far as the server is concerned).
+//!    Xlib translates `KeyRelease` events through the live mapping
+//!    too and apps can act on a release, so an unguarded hold would
+//!    let the window's `KeyRelease` decode as Return. The grab the
+//!    backend holds through the whole keystroke must keep the
+//!    foreign request unprocessed until the key-up: the `KeyRelease`
+//!    decodes as the original character, no `MappingNotify` lands
+//!    between the press and the release, the foreign remap takes
+//!    effect only after the release, and no Return/KP_Enter press or
+//!    release ever reaches the window. The round first *probes*
+//!    whether this X server actually curtails other clients'
+//!    requests during `GrabServer`: WSLg's XWayland does not
+//!    (measured — a second connection round-trips freely mid-grab),
+//!    and on such a server no client-side mechanism can keep a
+//!    hostile remap from landing mid-hold, so the round degrades to
+//!    the press-side guarantees (the press decodes as the character;
+//!    no Return *press* reaches the window) and prints the gap.
+//! 4d. **A Shift keycode whose unshifted column stopped being Shift
+//!    is refused**: during the held-Ctrl wait the test re-maps the
+//!    planned Shift keycode to `[Return, Shift_L]` — still bound to
+//!    the Shift modifier, still carrying a Shift keysym in column 1,
+//!    exactly the shape a keysym-in-either-column check lets
+//!    through. Starling presses Shift with no other modifier down
+//!    (column 0), so the press would emit Return; the insert must
+//!    refuse before the Shift key goes down, naming the keycode,
+//!    with no Return reaching the window, and the test restores the
+//!    real Shift mapping itself (a cleanup guard holds it too, so
+//!    even a failure leaves the session keyboard as it found it).
 //! 5. **Chunked typing rechecks the target**: a long string types in
 //!    chunks; when a second window is mapped the moment the first
 //!    chunk's first key is *observed* here (the clean seam: this
@@ -136,6 +170,11 @@ const XK_CAPS_LOCK: u32 = 0xffe5;
 /// happened.
 const XK_RETURN: u32 = 0xff0d;
 const XK_KP_ENTER: u32 = 0xff8b;
+/// `XK_Shift_L` / `XK_Shift_R` — the keysyms a usable Shift keycode
+/// carries in its *unshifted* column, the level the backend's own
+/// Shift press decodes through.
+const XK_SHIFT_L: u32 = 0xffe1;
+const XK_SHIFT_R: u32 = 0xffe2;
 
 /// A one-string failure type: every site has a different failure but
 /// the handler only needs to report it.
@@ -577,6 +616,260 @@ fn main_test() -> Result<(), ItError> {
         kb.assert_mapping_is(&conn, &mapping_before)?;
     }
 
+    // 4c. A remap aimed at the *pressed* key during its hold: the
+    //     keystroke grab must keep it out. The payload is one
+    //     unmapped character riding the predicted borrowed spare; the
+    //     moment this connection observes that keycode's KeyPress —
+    //     while the key is still down, inside KEY_HOLD — the test (a
+    //     second client as far as the grab is concerned) re-maps the
+    //     pressed keycode to Return. On a server that honors
+    //     GrabServer's exclusion, the backend's whole-keystroke grab
+    //     keeps the foreign request unprocessed until the key-up: the
+    //     window's KeyRelease decodes as the original character, no
+    //     MappingNotify lands between the press and the release, and
+    //     the foreign remap takes effect only after the release. On a
+    //     server that does not honor the exclusion (WSLg's XWayland,
+    //     measured by the probe below), *no* client-side mechanism
+    //     can keep a hostile remap from landing mid-hold — the round
+    //     then degrades to what such a server can still prove (the
+    //     press decodes as the character and no Return *press* ever
+    //     reaches the window) and says so loudly.
+    let grab_excluded = grab_exclusion_honored(&conn)?;
+    if !grab_excluded {
+        println!(
+            "starling-insertion X11 IT: this X server does not curtail other clients' \
+             requests during GrabServer (WSLg's XWayland); the mid-hold remap round \
+             degrades to the press-side guarantees — the release-decode guarantee is \
+             a server property this box does not provide"
+        );
+    }
+    {
+        let borrowed = kb
+            .spare_keycodes(1)
+            .ok_or_else(|| focus_error("this keyboard has no spare keycode to borrow"))?[0];
+        // The failure guard: whatever happens below, the borrowed
+        // keycode ends the test all-`NoSymbol` again (the interloper
+        // takes it from Starling's borrow, whose baseline was zeros).
+        cleanup.premaps.push((borrowed, vec![0; kb.width]));
+        let payload_c = unmapped.to_string();
+        let (result, seen, interfered) = hold_round(
+            &conn,
+            a,
+            &mut kb,
+            || {
+                let backend_thread = X11Backend::new();
+                let snapshot = snap_a.clone();
+                let payload = payload_c.clone();
+                std::thread::spawn(move || backend_thread.insert(&snapshot, &payload))
+            },
+            borrowed,
+            |conn, kb| {
+                // The foreign remap of the key that is down right
+                // now: every column Return — what an interloper's
+                // "make this key Enter" looks like. The check()
+                // round trip can only complete once the server has
+                // processed the request, so its timing relative to
+                // the keystroke is exactly what the Seen order
+                // asserts.
+                let columns = vec![XK_RETURN; kb.width];
+                conn.change_keyboard_mapping(1, borrowed, kb.width as u8, &columns)
+                    .map_err(x11)?
+                    .check()
+                    .map_err(x11)?;
+                Ok(())
+            },
+        )?;
+        assert!(interfered, "the foreign remap must fire during the hold");
+        let receipt = result.map_err(|e| x11(format!("inserting {unmapped}: {e}")))?;
+        assert_eq!(receipt.evidence, EVIDENCE_SYNTHETIC_KEYS);
+        let char_keysym = keysym_of(unmapped);
+        let press = seen
+            .iter()
+            .position(|seen| matches!(seen, Seen::Press(keycode, _) if *keycode == borrowed))
+            .unwrap_or_else(|| panic!("the character's key went down: {seen:?}"));
+        assert_eq!(
+            seen[press],
+            Seen::Press(borrowed, char_keysym),
+            "the press decodes as the character (the press always precedes the interloper's \
+             trigger, so this holds even without grab exclusion): {seen:?}"
+        );
+        let release = seen
+            .iter()
+            .position(|seen| matches!(seen, Seen::Release(keycode, _) if *keycode == borrowed))
+            .unwrap_or_else(|| panic!("the character's key came back up: {seen:?}"));
+        assert!(press < release, "the press precedes the release: {seen:?}");
+        assert!(
+            seen.iter().all(|seen| match seen {
+                Seen::Press(_, keysym) => *keysym != XK_RETURN && *keysym != XK_KP_ENTER,
+                _ => true,
+            }),
+            "no Return or KP_Enter press may ever reach the window: {seen:?}"
+        );
+        if grab_excluded {
+            // The keystroke grab held: the interloper's request sat
+            // unprocessed until the ungrab, which the backend sends
+            // only after the key-up — so the release decodes as the
+            // character and the MappingNotify lands after it.
+            assert_eq!(
+                seen[release],
+                Seen::Release(borrowed, char_keysym),
+                "the release decodes as the character, never the interloper's Return: {seen:?}"
+            );
+            assert!(
+                !seen[press + 1..release]
+                    .iter()
+                    .any(|seen| matches!(seen, Seen::Map)),
+                "no mapping change may take effect while the pressed key is down: {seen:?}"
+            );
+            assert!(
+                seen.iter()
+                    .enumerate()
+                    .any(|(index, seen)| { index > release && matches!(seen, Seen::Map) }),
+                "the foreign remap lands (only after the release): {seen:?}"
+            );
+            assert!(
+                seen.iter().all(|seen| match seen {
+                    Seen::Press(_, keysym) | Seen::Release(_, keysym) => {
+                        *keysym != XK_RETURN && *keysym != XK_KP_ENTER
+                    }
+                    Seen::Map => true,
+                }),
+                "no Return or KP_Enter press or release may reach the window: {seen:?}"
+            );
+        }
+        kb.reload(&conn)?;
+        assert_eq!(
+            kb.syms_of(borrowed).first(),
+            Some(&XK_RETURN),
+            "Starling must leave the interloper's mapping exactly as it was written"
+        );
+        // Give the borrowed keycode back to the spare pool (it was
+        // all-`NoSymbol` before the interloper touched it).
+        let zeros = vec![0u32; kb.width];
+        conn.change_keyboard_mapping(1, borrowed, kb.width as u8, &zeros)
+            .map_err(x11)?
+            .check()
+            .map_err(x11)?;
+        kb.assert_mapping_is(&conn, &mapping_before)?;
+    }
+
+    // 4d. The Shift keycode's *effective* keysym: during the same
+    //     held-Ctrl wait the interloper re-maps the planned Shift
+    //     keycode to `[Return, Shift_L]` — column 1 still carries a
+    //     Shift keysym and the modifier binding is untouched, so only
+    //     the column the press itself decodes through can catch it.
+    //     Starling presses Shift with no modifier down (column 0), so
+    //     the press would emit Return; the insert must refuse before
+    //     the Shift key goes down, naming the keycode. The cleanup
+    //     guard holds the real Shift columns from before the attack,
+    //     so even a failure leaves the session keyboard as it was
+    //     found.
+    {
+        let shift_keycode = shift_keycode_of(&conn, &kb)?;
+        let shift_original = kb.syms_of(shift_keycode).to_vec();
+        cleanup
+            .premaps
+            .push((shift_keycode, shift_original.clone()));
+        let borrowed = kb
+            .spare_keycodes(1)
+            .ok_or_else(|| focus_error("this keyboard has no spare keycode to borrow"))?[0];
+        let control_keysym = *kb
+            .syms_of(control)
+            .first()
+            .expect("the Control keycode carries its keysym");
+        xtest_press(&conn, control)?;
+        let payload_d = format!("{unmapped}C");
+        let (result, pressed) = drift_round(
+            &conn,
+            a,
+            &mut kb,
+            || {
+                let backend_thread = X11Backend::new();
+                let snapshot = snap_a.clone();
+                let payload = payload_d.clone();
+                std::thread::spawn(move || backend_thread.insert(&snapshot, &payload))
+            },
+            borrowed,
+            keysym_of(unmapped),
+            |conn, _kb| {
+                // `[Return, Shift_L]`, written as exactly two
+                // columns: the attack shape — a Shift keysym is still
+                // present (column 1) and the keycode is still
+                // Shift-bound, but the unshifted press Starling is
+                // about to make decodes as Return. Exactly two
+                // columns, not the keycode's full width, because a
+                // write padded with trailing zeros makes this
+                // server's XKB canonicalization widen the *global*
+                // keymap width, which re-pads every keycode's
+                // columns and would drift the borrowed keycode's
+                // echo comparison for a reason that has nothing to
+                // do with the Shift attack (measured).
+                conn.change_keyboard_mapping(1, shift_keycode, 2, &[XK_RETURN, XK_SHIFT_L])
+                    .map_err(x11)?
+                    .check()
+                    .map_err(x11)?;
+                xtest_release(conn, control)
+            },
+        )?;
+        match result {
+            Err(InsertError::PartialDelivery {
+                delivered_chars,
+                total_chars,
+                cause,
+            }) => {
+                assert_eq!(
+                    delivered_chars, 1,
+                    "exactly the first character may have landed"
+                );
+                assert_eq!(total_chars, payload_d.chars().count());
+                match *cause {
+                    InsertError::Rejected { reason } => {
+                        assert!(
+                            reason.contains("keyboard busy"),
+                            "the refusal says why: {reason}"
+                        );
+                        assert!(
+                            reason.contains(&format!("keycode {shift_keycode}")),
+                            "the refusal names the Shift keycode: {reason}"
+                        );
+                    }
+                    other => panic!("the Shift drift must be the stop cause, not {other:?}"),
+                }
+            }
+            other => panic!(
+                "a Shift keycode whose unshifted column is no longer Shift must refuse before \
+                 its press: {other:?}"
+            ),
+        }
+        assert!(
+            !pressed.contains(&XK_RETURN) && !pressed.contains(&XK_KP_ENTER),
+            "no Return or KP_Enter may reach the window (saw {pressed:?})"
+        );
+        assert_eq!(
+            pressed,
+            vec![control_keysym, keysym_of(unmapped)],
+            "the Shift key itself never went down"
+        );
+        kb.reload(&conn)?;
+        assert_eq!(
+            kb.syms_of(shift_keycode).first(),
+            Some(&XK_RETURN),
+            "Starling must leave the interloper's mapping on the Shift key too"
+        );
+        // Restore the real Shift columns and prove the whole mapping
+        // is back at the baseline before the later rounds run.
+        conn.change_keyboard_mapping(
+            1,
+            shift_keycode,
+            shift_original.len() as u8,
+            &shift_original,
+        )
+        .map_err(x11)?
+        .check()
+        .map_err(x11)?;
+        kb.assert_mapping_is(&conn, &mapping_before)?;
+    }
+
     // 5b. Concurrent inserts serialize: two inserts racing from two
     //     threads must not interleave — the process-wide insert lock
     //     means one types (and borrows, and restores) to completion
@@ -761,9 +1054,13 @@ fn main_test() -> Result<(), ItError> {
          ({upper_text:?}), preparation-failure refusal with a restored mapping ({} spare \
          keycodes exhausted), held-modifier refusal, mapping-drift refusal (borrowed and \
          pre-mapped keycodes re-mapped to Return mid-wait: no Enter reached the window, the \
-         foreign mappings survived for the test to restore), chunk-bounded partial delivery \
+         foreign mappings survived for the test to restore), remap-during-the-hold blocked \
+         by the keystroke grab (grab exclusion {}, the release still decoded as the character \
+         where the server provides it, the foreign remap landed only after it), Shift \
+         effective-keysym refusal (a [Return, Shift_L] Shift key never pressed), chunk-bounded partial delivery \
          on focus steal, serialized concurrent inserts, changed and gone revalidation",
-        spares_left
+        spares_left,
+        if grab_excluded { "honored" } else { "not honored by this server" },
     );
     Ok(())
 }
@@ -1099,6 +1396,213 @@ fn drift_round(
         Some(error) => Err(error),
         None => Ok((result, pressed)),
     }
+}
+
+/// One observed keyboard event of the remap-during-the-hold
+/// regression, in stream order: the `(keycode, event-time keysym)`
+/// of a `KeyPress`/`KeyRelease` for the window (the keysym is the
+/// column the event's own modifier state selects, decoded through
+/// the keymap copy current when the event is read — which is the
+/// decode a target performing the same reads would produce), or a
+/// `MappingNotify` (the copy is refreshed before anything later
+/// decodes). The stream order is the server's generation order, so
+/// "a mapping change took effect between the press and the
+/// release" is decidable from this sequence alone — and carrying
+/// the keycode separately matters exactly when a foreign remap won
+/// the race: the release of the pressed keycode then decodes as the
+/// *foreign* keysym, which is the regression's failure signature.
+#[derive(Debug, PartialEq, Clone, Copy)]
+enum Seen {
+    Press(u8, u32),
+    Release(u8, u32),
+    Map,
+}
+
+/// One remap-during-the-hold round (the regression for the
+/// whole-keystroke server grab): the insert (`spawn`) runs while
+/// this thread consumes this connection's event stream as it
+/// arrives, recording [`Seen`] in order. The moment the `KeyPress`
+/// of `watch_keycode` is observed — that key is down right now,
+/// inside its hold — `interfere` runs: the foreign remap of that
+/// same pressed keycode, issued and round-tripped from this
+/// connection (a second client as far as the server grab is
+/// concerned; the round trip completing at all proves the request
+/// was accepted — when it completed relative to the keystroke is
+/// what the [`Seen`] order asserts). Modeled on [`drift_round`]: the
+/// join always happens, and listener-side errors surface after it,
+/// never by orphaning the typing thread.
+#[allow(clippy::type_complexity)]
+fn hold_round(
+    conn: &RustConnection,
+    window: Window,
+    kb: &mut Keyboard,
+    spawn: impl FnOnce() -> std::thread::JoinHandle<Result<InsertReceipt, InsertError>>,
+    watch_keycode: u8,
+    interfere: impl FnOnce(&RustConnection, &mut Keyboard) -> Result<(), ItError>,
+) -> Result<(Result<InsertReceipt, InsertError>, Vec<Seen>, bool), ItError> {
+    fn pump<F>(
+        conn: &RustConnection,
+        window: Window,
+        kb: &mut Keyboard,
+        seen: &mut Vec<Seen>,
+        watch_keycode: u8,
+        interfere: &mut Option<F>,
+        interfered: &mut bool,
+        listener_error: &mut Option<ItError>,
+    ) where
+        F: FnOnce(&RustConnection, &mut Keyboard) -> Result<(), ItError>,
+    {
+        while let Some(event) = conn.poll_for_event().unwrap() {
+            match event {
+                x11rb::protocol::Event::KeyPress(press) if press.event == window => {
+                    // Event-time keysym: the column the event's own
+                    // modifier state selects, decoded through the
+                    // keymap copy current when the event is read.
+                    let column = if u16::from(press.state) & 0x01 != 0 {
+                        1
+                    } else {
+                        0
+                    };
+                    if let Some(&keysym) = kb.syms_of(press.detail).get(column) {
+                        seen.push(Seen::Press(press.detail, keysym));
+                    }
+                    if press.detail == watch_keycode && !*interfered {
+                        *interfered = true;
+                        if let Some(interfere) = interfere.take() {
+                            if let Err(error) = interfere(conn, kb) {
+                                listener_error.get_or_insert(error);
+                            }
+                        }
+                    }
+                }
+                x11rb::protocol::Event::KeyRelease(release) if release.event == window => {
+                    let column = if u16::from(release.state) & 0x01 != 0 {
+                        1
+                    } else {
+                        0
+                    };
+                    if let Some(&keysym) = kb.syms_of(release.detail).get(column) {
+                        seen.push(Seen::Release(release.detail, keysym));
+                    }
+                }
+                x11rb::protocol::Event::MappingNotify(_) => {
+                    if let Err(error) = kb.reload(conn) {
+                        listener_error.get_or_insert(error);
+                    }
+                    seen.push(Seen::Map);
+                }
+                _ => {}
+            }
+        }
+    }
+    let handle = spawn();
+    let deadline = Instant::now() + INSERT_BUDGET;
+    let mut seen: Vec<Seen> = Vec::new();
+    let mut listener_error: Option<ItError> = None;
+    let mut interfere = Some(interfere);
+    let mut interfered = false;
+    loop {
+        pump(
+            conn,
+            window,
+            kb,
+            &mut seen,
+            watch_keycode,
+            &mut interfere,
+            &mut interfered,
+            &mut listener_error,
+        );
+        if handle.is_finished() {
+            // Stragglers: events the server queued before the insert
+            // returned still count as "what the target saw" — the
+            // foreign remap's MappingNotify included, when the
+            // interference fired during the hold.
+            std::thread::sleep(DRAIN_GRACE);
+            pump(
+                conn,
+                window,
+                kb,
+                &mut seen,
+                watch_keycode,
+                &mut interfere,
+                &mut interfered,
+                &mut listener_error,
+            );
+            break;
+        }
+        if Instant::now() > deadline {
+            return Err(focus_error(
+                "the hold-round insert did not finish within the test budget",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let result = handle.join().expect("an inserting thread must not panic");
+    match listener_error {
+        Some(error) => Err(error),
+        None => Ok((result, seen, interfered)),
+    }
+}
+
+/// Whether this X server honors `GrabServer`'s contract of
+/// curtailing the processing of other clients' requests: a second
+/// connection round-trips one plain request during a grab held by
+/// this connection across a short sleep — the exact shape the
+/// backend's keystroke grab has (the grabber sleeps KEY_HOLD between
+/// requests). On a conforming server the reply cannot come back
+/// before the ungrab (measured: stock Xvfb blocks the probe for the
+/// whole grab); a server that ignores the exclusion — WSLg's
+/// XWayland does, measured — answers in microseconds. The probe
+/// touches no keyboard state, so it cannot dirty the session.
+fn grab_exclusion_honored(conn: &RustConnection) -> Result<bool, ItError> {
+    let (other, _) =
+        x11rb::connect(None).map_err(|e| x11(format!("connecting a probe connection: {e}")))?;
+    let probe = std::thread::spawn(move || -> Result<Duration, ItError> {
+        let sent = Instant::now();
+        other.get_input_focus().map_err(x11)?.reply().map_err(x11)?;
+        Ok(sent.elapsed())
+    });
+    conn.grab_server().map_err(x11)?.check().map_err(x11)?;
+    std::thread::sleep(Duration::from_millis(150));
+    conn.ungrab_server().map_err(x11)?;
+    conn.flush().map_err(x11)?;
+    let round_trip = probe.join().expect("the probe thread must not panic")?;
+    Ok(round_trip >= Duration::from_millis(100))
+}
+
+/// The keycode the backend will press as Shift for a column-1
+/// character: the first keycode of the live Shift modifier row whose
+/// *unshifted* column carries Shift_L/Shift_R — the same
+/// effective-column rule the backend's planning and pre-press
+/// verification apply, so the test remaps the exact key the plan
+/// will press.
+fn shift_keycode_of(conn: &RustConnection, kb: &Keyboard) -> Result<u8, ItError> {
+    let reply = conn
+        .get_modifier_mapping()
+        .map_err(x11)?
+        .reply()
+        .map_err(x11)?;
+    let per_row = reply.keycodes_per_modifier() as usize;
+    if per_row == 0 {
+        return Err(focus_error(
+            "the server reported an unusable modifier mapping",
+        ));
+    }
+    let count = kb.syms.len() / kb.width;
+    let (min, max) = (kb.min as usize, kb.min as usize + count - 1);
+    reply.keycodes[0..per_row]
+        .iter()
+        .copied()
+        .find(|&keycode| {
+            let keycode = keycode as usize;
+            keycode >= min
+                && keycode <= max
+                && matches!(
+                    kb.syms_of(keycode as u8).first(),
+                    Some(&XK_SHIFT_L) | Some(&XK_SHIFT_R)
+                )
+        })
+        .ok_or_else(|| focus_error("this keyboard has no usable Shift keycode"))
 }
 
 /// The atoms the test needs, interned once.

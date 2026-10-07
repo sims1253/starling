@@ -24,6 +24,24 @@
 //! or empty, so the backend reports itself unavailable rather than
 //! guess a target (the portal or IBus, slice 2b, is the fix).
 //!
+//! # Threat model
+//!
+//! X11 has no isolation between clients: any client on the display can
+//! read every key, inject its own (XTest) and rewrite the keyboard
+//! mapping. A hostile X client therefore needs no race against Starling
+//! to type Enter — it can simply send one. What this backend defends
+//! against is *benign* interference: another program (a layout switcher,
+//! `setxkbmap`, an IME helper) changing the keymap, the focus or the
+//! modifier state while a transcript is being typed. Every keystroke is
+//! verified against the live mapping inside a short `GrabServer` section
+//! that spans the whole press–hold–release, which makes the check atomic
+//! on servers that honor the grab (stock Xorg and Xvfb do). Some servers
+//! do not: WSLg's XWayland lets other clients' requests through during a
+//! grab (measured during #221), so there the per-key verification is the
+//! remaining protection and a change that lands inside one keystroke's
+//! few-millisecond hold cannot be prevented client-side. Wayland sessions
+//! do not use this backend at all.
+//!
 //! # Typing
 //!
 //! XTest fake key events are keycode-level: the server delivers the
@@ -74,15 +92,32 @@
 //!   all-`NoSymbol` before the first key is typed. One X11 insert runs
 //!   at a time per process (the lock's own docs say why that is the
 //!   honest granularity);
-//! - each borrow's short read→write→echo-read sequence, each
-//!   restore's compare→write sequence, and each character's
-//!   read→compare→press sequence run inside a server grab
+//! - each borrow's short read→write→echo-read sequence and each
+//!   restore's compare→write sequence run inside a server grab
 //!   (`GrabServer`/`UngrabServer`), so no *other X client* can
 //!   interleave a remap of the same keycode between the ownership
-//!   check and the write — or between the pre-press check and the
-//!   key-down. The grab is held for those few requests only — never
-//!   across a sleep, a wait or a key's hold time — and the guard
-//!   releases it even on error;
+//!   check and the write — and each character's *whole keystroke*
+//!   (verify the live mapping, Shift↓, key↓, the key's hold time,
+//!   key↑, Shift↑, flush) runs inside one grab, so no client can
+//!   interleave a remap between the pre-press check and the key-down
+//!   *or between the key-down and the key-up*: X translates
+//!   KeyRelease events through the live mapping just as it does
+//!   presses, and targets can act on a release, so a remap landing
+//!   mid-hold would make Starling's own release decode as a foreign
+//!   keysym — another client's `Return`, say, which is the no-Enter
+//!   rule broken by a foreign hand. The keystroke grab holds
+//!   [`KEY_HOLD`], the one sleep ever taken while grabbed (that is
+//!   what makes the guarantee deterministic instead of a race an
+//!   interloper might lose); a grab is therefore held for roughly
+//!   `KEY_HOLD` plus a few requests per character — never across the
+//!   inter-character gap, a wait or an event read — and the guard
+//!   releases it even on error. This exclusion is the X protocol's
+//!   `GrabServer` contract ("the processing of requests from other
+//!   clients is curtailed"); a server that does not honor it — WSLg's
+//!   XWayland does not, measured — voids the no-interleave guarantee
+//!   for every grabbed section alike, and no client-side mechanism
+//!   can restore it there. The grabs are held as specified
+//!   regardless, so a conforming server gets the full guarantee;
 //! - right before remapping, the keycode's *live* mapping is re-read
 //!   and required to still be all-`NoSymbol` (another client's remap
 //!   picks the next spare; none free is a `keyboard_busy`-style
@@ -100,10 +135,13 @@
 //!   to still be what the plan expects: a borrowed keycode carries
 //!   exactly the recorded echo, a pre-mapped keycode still produces
 //!   the planned keysym in the planned column, and the Shift keycode
-//!   a column-1 plan presses still carries a Shift keysym and stays
-//!   bound to the Shift modifier. The chunk checks cannot see a
-//!   remap that lands while they run (the held-modifier wait alone
-//!   is seconds of exposure), and a press through a drifted mapping
+//!   a column-1 plan presses still carries a Shift keysym in its
+//!   unshifted column — the level that press itself decodes through,
+//!   since Shift goes down with no other modifier held, so a
+//!   `[Return, Shift_L]` remap is refused rather than pressed as
+//!   Return — and stays bound to the Shift modifier. The chunk
+//!   checks cannot see a remap that lands while they run (the
+//!   held-modifier wait alone is seconds of exposure), and a press through a drifted mapping
 //!   would type whatever the *new* mapping decodes to — another
 //!   client's `Return`, say, which is the no-Enter rule broken by a
 //!   foreign hand. A drift stops typing before the key-down with a
@@ -192,7 +230,9 @@ const USE_CORE_KEYBOARD: u16 = 0x100;
 /// How long a synthetic key stays "down". Real keys are down for tens
 /// of milliseconds; a zero hold can be dropped or coalesced by
 /// toolkits that watch press/release pairing, and the X server's own
-/// auto-repeat only fires for keys held far longer than this.
+/// auto-repeat only fires for keys held far longer than this. This is
+/// also the one sleep ever taken while a server grab is held — the
+/// per-character keystroke grab spans it (see [`type_character`]).
 const KEY_HOLD: Duration = Duration::from_millis(3);
 /// Gap between characters, so event-driven targets (and their IME
 /// layers, which often settle per key) can keep up with a burst.
@@ -1042,10 +1082,16 @@ impl Keyboard {
         };
         // The Shift key, the policy way: the Shift *modifier's* row of
         // the modifier mapping, and among its keycodes one that
-        // actually carries a Shift keysym in the trusted columns. A
+        // actually carries a Shift keysym in its unshifted column. A
         // Shift keysym on an unbound keycode would not set the Shift
         // modifier state targets decode with, so only a bound one
-        // counts as usable.
+        // counts as usable; and a Shift keysym in a *shifted* column
+        // alone would not do either — this is the keycode the typer
+        // presses with no modifier down, so the level that press
+        // decodes through is column 0, and a `[Return, Shift_L]`
+        // keycode would press as Return (the pre-press verification
+        // applies the same effective-column rule live before every
+        // press).
         let rows = session.modifier_rows()?;
         let shift = rows
             .first()
@@ -1054,11 +1100,10 @@ impl Keyboard {
             .copied()
             .filter(|&keycode| keycode >= min && keycode <= max)
             .find(|&keycode| {
-                keyboard
-                    .keysyms(keycode)
-                    .iter()
-                    .take(2)
-                    .any(|&sym| sym == XK_SHIFT_L || sym == XK_SHIFT_R)
+                matches!(
+                    keyboard.keysyms(keycode).first(),
+                    Some(&XK_SHIFT_L) | Some(&XK_SHIFT_R)
+                )
             });
         // Spare candidates: every all-NoSymbol keycode, top down (the
         // choice stays clear of the low keycodes real hardware lives
@@ -1377,10 +1422,10 @@ impl RemapTransaction<'_> {
                 detail: format!("flushing the typed keys before restoring: {error}"),
             });
         }
-        // The settle delay stays outside every grab (no sleeps while
-        // grabbed); it exists so a target that processes its
-        // MappingNotify late does not decode already-typed keys
-        // against the restored mapping.
+        // The settle delay stays outside every grab (KEY_HOLD is the
+        // only sleep ever held inside one); it exists so a target that
+        // processes its MappingNotify late does not decode
+        // already-typed keys against the restored mapping.
         std::thread::sleep(KEYMAP_SETTLE);
         for entry in &self.borrowed {
             let grabbed = ServerGrab::new(self.session);
@@ -1459,19 +1504,27 @@ impl Drop for RemapTransaction<'_> {
     }
 }
 
-/// A server grab held across a few requests and released on drop —
+/// A server grab held across a section and released on drop —
 /// also on error, because Drop cannot report (an ungrab that itself
 /// fails means the connection is dying and the grab dies with it;
 /// both are logged). While grabbed, the X server processes no other
 /// client's requests, so a read→write→read-back ownership sequence
 /// cannot interleave with another client's remap of the same keycode.
-/// Only ever held for those few requests: no sleeps, no waits, no
-/// event reading while grabbed. A character's key-down requests are
-/// issued inside the grab that verified their mapping and flushed
-/// before it releases; the key's hold time and its release follow
-/// outside the grab (a release is a bare keycode event — no mapping
-/// can make it type anything, so the never-across-a-sleep discipline
-/// keeps the hold outside).
+/// Two section shapes exist: the few-request ownership sections (a
+/// borrow's read→write→echo-read, a restore's compare→write) hold no
+/// sleep at all; and a character's whole keystroke — verify the live
+/// mapping, Shift↓, key↓, the [`KEY_HOLD`] sleep, key↑, Shift↑, flush
+/// — deliberately holds that one sleep, because X translates
+/// KeyRelease events through the live mapping too and a remap landing
+/// between a key-down and its key-up would make the release decode as
+/// a foreign keysym. A keystroke grab is therefore held for roughly
+/// [`KEY_HOLD`] plus a few requests per character; no grab is ever
+/// held across the inter-character gap, a modifier wait or an event
+/// read. The exclusion itself is the X protocol's `GrabServer`
+/// contract: a server that does not curtail other clients' processing
+/// during a grab (WSLg's XWayland does not) voids it for every
+/// grabbed section alike — the grabs are held as specified
+/// regardless, so a conforming server gets the full guarantee.
 struct ServerGrab<'a> {
     session: &'a Session,
 }
@@ -1618,14 +1671,17 @@ fn type_segment(
 }
 
 /// Type one character through its plan: verify the keycode's live
-/// mapping inside a short server grab, issue the presses (Shift and
-/// the key) while that verification still holds, then complete the
-/// keystroke — hold time, releases — after the grab has dropped. The
-/// `pressed` guard guarantees the releases even when a send fails
-/// mid-keystroke. Failures are classified for the delivery count by
-/// [`CharFailure`]'s rule: anything at or after the character's own
-/// key-down counts as possibly delivered; a grab or verification
-/// failure happens strictly before it.
+/// mapping and run the *whole keystroke* — Shift press, key press,
+/// the hold, both releases — inside one short server grab, so no
+/// other client's remap can ride any part of the keystroke (X
+/// translates KeyRelease events through the live mapping too, and
+/// targets can act on a release); the inter-character gap follows
+/// after the grab has dropped. The `pressed` guard guarantees the
+/// releases even when a send fails mid-keystroke. Failures are
+/// classified for the delivery count by [`CharFailure`]'s rule:
+/// anything at or after the character's own key-down counts as
+/// possibly delivered; a grab or verification failure happens
+/// strictly before it.
 fn type_character(
     session: &Session,
     keyboard: &Keyboard,
@@ -1663,19 +1719,27 @@ fn type_character(
     } else {
         None
     };
-    // The grabbed verify→press section: the chunk checks cannot see a
-    // remap that lands while they run (the held-modifier wait alone
-    // is seconds of exposure), so the keycode's live mapping is
-    // re-read immediately before the key-down and the presses are
-    // issued inside the same grab — no other X client can interleave
-    // a remap between the read and the key-down. A drift (or a
-    // refused grab) stops typing here, before any key of this
-    // character goes down, with a keyboard-busy refusal naming the
-    // keycode. Only the read-compare-press requests run inside the
-    // grab: the presses are flushed while it is held, and the hold
-    // time and releases follow after it drops (a release is a bare
-    // keycode event — no mapping can make it type anything — so the
-    // never-across-a-sleep discipline keeps the hold outside).
+    // The grabbed verify→keystroke section: the chunk checks cannot
+    // see a remap that lands while they run (the held-modifier wait
+    // alone is seconds of exposure), so the keycode's live mapping is
+    // re-read immediately before the key-down and the whole
+    // keystroke is issued inside the same grab — no other X client
+    // can interleave a remap between the read and the key-down, and
+    // none between the key-down and the key-up either: Xlib
+    // translates KeyRelease events through the live mapping just as
+    // it does presses, and apps can act on a release, so a remap
+    // landing mid-hold would make Starling's own release decode as
+    // whatever the new mapping says — another client's `Return`,
+    // say. The grab therefore spans verify → Shift↓ → key↓ → hold →
+    // key↑ → Shift↑ → flush → ungrab: [`KEY_HOLD`] is the one sleep
+    // ever taken while grabbed (it is what makes the
+    // no-remap-mid-keystroke guarantee deterministic instead of a
+    // race the interloper might lose), so a grab is held for roughly
+    // KEY_HOLD plus a few requests per character — never across the
+    // inter-character gap ([`KEY_GAP`]), a modifier wait or an event
+    // read. A drift (or a refused grab) stops typing here, before
+    // any key of this character goes down, with a keyboard-busy
+    // refusal naming the keycode.
     {
         let _grab = ServerGrab::new(session).map_err(|error| match error {
             // Connection trouble stays "unavailable" — it is the
@@ -1697,18 +1761,32 @@ fn type_character(
         if let Some(shift) = shift {
             pressed.press(shift).map_err(CharFailure::BeforeKeydown)?;
         }
+        // The key-down was issued (and flushed) under the verified
+        // mapping: from here the character may have landed, whatever
+        // happens to the rest of its keystroke.
         pressed.press(keycode).map_err(CharFailure::BeforeKeydown)?;
+        std::thread::sleep(KEY_HOLD);
+        pressed
+            .release(keycode)
+            .map_err(CharFailure::AfterKeydown)?;
+        if let Some(shift) = shift {
+            pressed.release(shift).map_err(CharFailure::AfterKeydown)?;
+        }
+        // Both releases flushed before the ungrab leaves this
+        // connection, so the server lifts the grab only after it has
+        // generated the release events (the requests of one
+        // connection are processed in order, so this is belt and
+        // braces over the per-event flushes `fake_key` already did).
+        session
+            .conn
+            .flush()
+            .map_err(x11_conn_error)
+            .map_err(CharFailure::AfterKeydown)?;
     }
-    // The key-down was issued (and flushed) under the verified
-    // mapping: from here the character may have landed, whatever
-    // happens to the rest of its keystroke.
-    std::thread::sleep(KEY_HOLD);
-    pressed
-        .release(keycode)
-        .map_err(CharFailure::AfterKeydown)?;
-    if let Some(shift) = shift {
-        pressed.release(shift).map_err(CharFailure::AfterKeydown)?;
-    }
+    // The inter-character gap: the deliberately ungrabbed part of
+    // typing (a mapping that changes here is caught by the next
+    // character's own verification — everything before it already
+    // typed under a mapping this code verified).
     std::thread::sleep(KEY_GAP);
     Ok(())
 }
@@ -1720,10 +1798,12 @@ fn type_character(
 /// alone is seconds of exposure). A borrowed keycode must still carry
 /// exactly the recorded echo; a pre-mapped keycode must still produce
 /// the planned keysym in the planned column, and the Shift keycode a
-/// column-1 plan presses must still carry a Shift keysym (trusted
-/// columns) and remain bound to the Shift modifier. Any drift is a
-/// keyboard-busy [`InsertError::Rejected`] naming the keycode — never
-/// a press through a mapping Starling does not own.
+/// column-1 plan presses must still carry a Shift keysym in column 0
+/// — the effective level of that very press, since Shift goes down
+/// with no other modifier held — and remain bound to the Shift
+/// modifier. Any drift is a keyboard-busy [`InsertError::Rejected`]
+/// naming the keycode — never a press through a mapping Starling does
+/// not own.
 fn verify_press_mapping(
     session: &Session,
     remap: &RemapTransaction<'_>,
@@ -1760,17 +1840,23 @@ fn verify_press_mapping(
                 return Err(mapping_drifted_rejection(keycode, character, &live));
             }
             if let Some(shift) = shift {
+                // The effective keysym of the press about to happen:
+                // the Shift key goes down with no other modifier held,
+                // so the level its own event decodes through is the
+                // unshifted one, column 0. A Shift keysym somewhere in
+                // the first two columns is not enough — `[Return,
+                // Shift_L]` passes that check while still Shift-bound,
+                // and the actual press then emits Return (the no-Enter
+                // rule broken with Starling's own hand) — so column 0
+                // itself must carry Shift_L or Shift_R.
                 let shift_live = session.keycode_syms(shift)?;
-                if !shift_live
-                    .iter()
-                    .take(2)
-                    .any(|&sym| sym == XK_SHIFT_L || sym == XK_SHIFT_R)
-                {
+                let effective = shift_live.first().copied();
+                if effective != Some(XK_SHIFT_L) && effective != Some(XK_SHIFT_R) {
                     return Err(InsertError::Rejected {
                         reason: format!(
                             "keycode {shift}, the Shift key pressed for U+{:04X}, no longer \
-                             carries a Shift keysym (now {:?}), so the character cannot be \
-                             typed (keyboard busy)",
+                             carries a Shift keysym in its unshifted column (now {:?}), so the \
+                             character cannot be typed (keyboard busy)",
                             character as u32, shift_live
                         ),
                     });
