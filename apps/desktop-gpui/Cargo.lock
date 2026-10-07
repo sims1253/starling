@@ -5713,6 +5713,7 @@ dependencies = [
 name = "starling-insertion"
 version = "0.1.0"
 dependencies = [
+ "log",
  "starling-insertion",
  "starling-runtime",
  "windows-sys 0.59.0",

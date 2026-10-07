@@ -28,6 +28,17 @@
 //!   the failure surfaces from `insert` as `delivery.failed{reason}`
 //!   with the honest code (`insertion_unavailable`), not as a
 //!   target-change story the user would misread.
+//! - A conflict detected *inside* `insert` maps to
+//!   `delivery.failed{reason: target_changed}`, **not** to
+//!   `delivery.conflict`: the `DeliveryAdapter` seam has no conflict
+//!   channel out of `insert` (its result is `InsertEvidence` or
+//!   `InsertionFailure`), and inventing one is deliberately left to a
+//!   seam extension tracked by #220. The same applies to a target
+//!   that changes *part-way through* typing — the backend stops
+//!   immediately and the bridge reports
+//!   `delivery.failed{reason: partial_delivery}` (the counts live in
+//!   the error's human message, which the wire does not carry; only
+//!   the safeToken code crosses the seam).
 //! - `insert` failures map `InsertError::code()` straight to
 //!   `delivery.failed{reason}` (safeToken-shaped by construction) and
 //!   `fallback_suggested()` to `fallbackSuggested`; success passes
@@ -68,9 +79,10 @@ impl DeliveryAdapter for InsertionDeliveryAdapter {
         // backend is absent from this session cannot be inserted by
         // this host — both refuse at prepare, before any delivery
         // exists to strand.
-        let snapshot = self.inserter.parse_target_ref(target_ref).ok_or_else(|| {
-            format!("unknown or malformed target ref: {target_ref}")
-        })?;
+        let snapshot = self
+            .inserter
+            .parse_target_ref(target_ref)
+            .ok_or_else(|| format!("unknown or malformed target ref: {target_ref}"))?;
         if self.inserter.backend_for(&snapshot).is_none() {
             return Err(format!(
                 "this session has no insertion backend for the {} ref scheme",
@@ -105,10 +117,9 @@ impl DeliveryAdapter for InsertionDeliveryAdapter {
         };
         match backend.revalidate(&snapshot) {
             Ok(TargetCheck::Same) => Revalidation::Unchanged,
-            Ok(TargetCheck::Changed { expected, actual }) => Revalidation::Changed {
-                expected,
-                actual,
-            },
+            Ok(TargetCheck::Changed { expected, actual }) => {
+                Revalidation::Changed { expected, actual }
+            }
             Ok(TargetCheck::Gone) => Revalidation::Changed {
                 expected: target_ref.to_string(),
                 actual: "gone".to_string(),
@@ -163,9 +174,10 @@ mod tests {
     fn session() -> (Arc<FakeBackend>, Arc<InsertionDeliveryAdapter>) {
         let fake = Arc::new(FakeBackend::new());
         fake.focus(FakeTarget::named("Notes", "Meeting notes"));
-        let adapter = InsertionDeliveryAdapter::new(Arc::new(Inserter::with_backends(vec![
-            Box::new(fake.clone()),
-        ])));
+        let adapter =
+            InsertionDeliveryAdapter::new(Arc::new(Inserter::with_backends(vec![Box::new(
+                fake.clone(),
+            )])));
         (fake, adapter)
     }
 
@@ -175,7 +187,10 @@ mod tests {
         // A fake-scheme ref the inserter can serve.
         let target = adapter.inserter.capture().expect("focus is set");
         let token = adapter.prepare(&target.target_ref).expect("prepares");
-        assert!(token.starts_with("ins-v1:"), "token is version-tagged: {token}");
+        assert!(
+            token.starts_with("ins-v1:"),
+            "token is version-tagged: {token}"
+        );
         // ... but a ref from a backend this session does not run, and
         // plain garbage, both refuse — before any delivery exists.
         assert!(adapter.prepare("x11:1:2:3").is_err());
@@ -302,8 +317,11 @@ mod tests {
         let target = fake.capture().expect("focus is set");
         fake.focus(FakeTarget::named("Browser", "A tab"));
         // The bridge's insert delegates to the backend, whose own
-        // guards revalidate first — the changed target refuses there,
-        // surfaced as a target_changed failure.
+        // guards revalidate first — the changed target refuses there.
+        // Note *what* crosses the seam: a delivery.failure with reason
+        // `target_changed`, not a delivery.conflict — the
+        // DeliveryAdapter seam cannot carry a conflict out of `insert`
+        // (see the module docs; the seam extension is #220's to make).
         match adapter.insert("dlv-1", &target.target_ref, "hello") {
             Err(InsertionFailure { reason, .. }) => assert_eq!(reason, "target_changed"),
             other => panic!("a changed target must refuse: {other:?}"),
@@ -312,12 +330,83 @@ mod tests {
     }
 
     #[test]
+    fn insert_never_types_when_revalidation_persists_erroring() {
+        let (fake, adapter) = session();
+        let target = fake.capture().expect("focus is set");
+        // A backend whose revalidate keeps erroring (a dying
+        // connection, say): the bridge reports Unchanged from
+        // `revalidate` (no fake conflict), `insert` fails with the
+        // honest reason, and nothing is ever typed — the guard cannot
+        // be waited out.
+        fake.fail_revalidate(
+            crate::InsertError::Unavailable {
+                reason: "connection reset".to_string(),
+                setup_hint: None,
+            },
+            None,
+        );
+        let token = adapter.prepare(&target.target_ref).expect("prepares");
+        assert_eq!(
+            adapter.revalidate(&target.target_ref, &token),
+            Revalidation::Unchanged,
+            "an erroring check is not a conflict"
+        );
+        for attempt in 1..=3 {
+            match adapter.insert("dlv-1", &target.target_ref, "hello") {
+                Err(InsertionFailure {
+                    reason,
+                    fallback_suggested,
+                }) => {
+                    assert_eq!(reason, "insertion_unavailable", "attempt {attempt}");
+                    assert!(fallback_suggested);
+                }
+                other => panic!("a persistently erroring check must refuse: {other:?}"),
+            }
+        }
+        assert!(
+            fake.insertions().is_empty(),
+            "nothing may be typed while the check cannot answer"
+        );
+    }
+
+    #[test]
+    fn insert_recovers_once_a_transient_revalidate_error_clears() {
+        let (fake, adapter) = session();
+        let target = fake.capture().expect("focus is set");
+        // The check errors exactly once (a blip), then answers again:
+        // the first insert refuses, the next one types in full.
+        fake.fail_revalidate(
+            crate::InsertError::Unavailable {
+                reason: "connection blip".to_string(),
+                setup_hint: None,
+            },
+            Some(1),
+        );
+        match adapter.insert("dlv-1", &target.target_ref, "hello") {
+            Err(InsertionFailure { reason, .. }) => {
+                assert_eq!(reason, "insertion_unavailable")
+            }
+            other => panic!("the blip must surface: {other:?}"),
+        }
+        assert!(fake.insertions().is_empty());
+        let evidence = adapter
+            .insert("dlv-2", &target.target_ref, "hello")
+            .expect("the transient error cleared");
+        assert_eq!(evidence.level, "synthetic_keys_sent");
+        assert_eq!(
+            fake.insertions(),
+            vec![(target.target_ref.clone(), "hello".to_string())]
+        );
+    }
+
+    #[test]
     fn insert_refuses_a_starling_owned_target_with_its_own_code() {
         let fake = Arc::new(FakeBackend::new());
         fake.focus(FakeTarget::owned_by_this_process());
-        let adapter = InsertionDeliveryAdapter::new(Arc::new(Inserter::with_backends(vec![
-            Box::new(fake.clone()),
-        ])));
+        let adapter =
+            InsertionDeliveryAdapter::new(Arc::new(Inserter::with_backends(vec![Box::new(
+                fake.clone(),
+            )])));
         // Capture itself refuses, so drive insert with a hand-built
         // snapshot carrying our pid — the mode-B shape (a ref captured
         // by the app, typed by the host, both being Starling here).

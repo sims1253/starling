@@ -24,7 +24,11 @@
 //!   first act and returns [`InsertError::TargetChanged`] /
 //!   [`InsertError::TargetGone`] instead of typing into anything else.
 //!   Focus may have moved anywhere between capture and insert (the take
-//!   ran for minutes); the check happens last.
+//!   ran for minutes); the check happens last. And because focus can
+//!   *keep* moving while a long text types, typing runs in chunks with
+//!   the same revalidation repeated before every chunk — a change
+//!   part-way stops the typing immediately and reports how much may
+//!   already have landed ([`InsertError::PartialDelivery`]).
 //! - Text containing any control character — `\n`, `\r`, `\t`, or any
 //!   other Cc character — is refused with
 //!   [`InsertError::MultilineUnsupported`] before a single key moves.
@@ -32,10 +36,19 @@
 //!   Tab) into an unknown window can submit forms, send messages, or
 //!   change focus, which is exactly the class of accident this slice
 //!   exists to prevent.
+//! - Typing never rides on held modifiers: if the user still physically
+//!   holds Ctrl/Alt/Shift/Super (typically from the dictation shortcut
+//!   itself), the backend waits up to [`MODIFIER_RELEASE_WAIT`] for
+//!   release and then refuses with [`InsertError::ModifiersHeld`] —
+//!   characters typed with modifiers held become commands, and no
+//!   modifier release is ever synthesized to fake readiness.
 //! - A target owned by the inserting process itself is refused with
 //!   [`InsertError::TargetIsStarling`]: Starling never types into
 //!   Starling (a dictation take landing in its own editor would both
-//!   confuse the user and could re-trigger the shortcut).
+//!   confuse the user and could re-trigger the shortcut). The check
+//!   consults a process-wide *exclusion set* (see
+//!   [`Inserter::with_excluded_pids`]) against the **live** target's
+//!   pid, not the frozen snapshot field.
 //! - Evidence is honest: a typing backend can only ever return
 //!   [`EVIDENCE_SYNTHETIC_KEYS`] — synthetic key *acceptance* is not
 //!   proof the text landed (the target may swallow, drop or transform
@@ -72,14 +85,26 @@
 
 use std::fmt;
 
-#[cfg(target_os = "linux")]
-pub mod x11;
 #[cfg(feature = "runtime")]
 pub mod runtime;
 #[cfg(any(test, feature = "test-doubles"))]
 pub mod testing;
 #[cfg(windows)]
 pub mod windows;
+#[cfg(target_os = "linux")]
+pub mod x11;
+
+/// How long an insert waits for physically held modifier keys
+/// (Ctrl/Alt/Shift/Super — the dictation shortcut's own keys) to be
+/// released, polling about every [`MODIFIER_POLL_INTERVAL`], before
+/// refusing with [`InsertError::ModifiersHeld`]. Bounded so a stuck key
+/// delays one insert by a moment instead of hanging the delivery actor;
+/// the copy fallback remains the escape hatch when the user really is
+/// holding a key down. Modifiers are never released synthetically —
+/// that would be Starling editing the user's physical keyboard state.
+pub const MODIFIER_RELEASE_WAIT: std::time::Duration = std::time::Duration::from_millis(1500);
+/// The polling granularity of the held-modifier wait.
+pub const MODIFIER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
 
 /// Which backend produced a [`TargetSnapshot`] / serves an insert.
 /// Every variant exists now so `target_ref` schemes and capability
@@ -295,7 +320,10 @@ pub enum InsertError {
     },
     /// The OS refused the input (UIPI on Windows: the target runs
     /// elevated above Starling). `settings_hint` is the actionable fix.
-    PermissionDenied { reason: String, settings_hint: String },
+    PermissionDenied {
+        reason: String,
+        settings_hint: String,
+    },
     /// Focus/identity moved since capture. Never a blind write.
     TargetChanged { expected: String, actual: String },
     /// The captured window no longer exists.
@@ -303,6 +331,36 @@ pub enum InsertError {
     /// The target belongs to this Starling process. Starling never
     /// types into itself.
     TargetIsStarling,
+    /// Physically held modifier keys (Ctrl/Alt/Shift/Super, typically
+    /// left over from the dictation shortcut) that did not clear within
+    /// [`MODIFIER_RELEASE_WAIT`]. Typing with them held would turn
+    /// characters into commands, so nothing is typed; `held` names the
+    /// keys for the recovery panel. The check runs before every chunk,
+    /// so as a *cause* of [`InsertError::PartialDelivery`] it means the
+    /// next chunk never started, not that typing rode the keys.
+    ModifiersHeld { held: Vec<String> },
+    /// Typing stopped part-way through the text: `delivered_chars`
+    /// characters were fully typed before `cause` stopped the rest —
+    /// the target may hold that much, and only that much. `cause` is
+    /// boxed so the variant stays flat in size. Zero characters
+    /// delivered never produces this variant: with nothing typed, the
+    /// cause is returned bare (there is nothing "partial" to report).
+    PartialDelivery {
+        delivered_chars: usize,
+        total_chars: usize,
+        cause: Box<InsertError>,
+    },
+    /// The keyboard's live state (active group, Caps/Shift Lock, latched
+    /// modifiers — read through XKB on X11) is something synthetic
+    /// typing cannot reproduce faithfully, so the backend refuses
+    /// rather than guess and type the wrong characters. The IME path
+    /// (phase C) is the real fix for such layouts.
+    KeyboardStateUnsupported { reason: String },
+    /// A keyboard mapping temporarily borrowed for characters no key
+    /// produces could not be given back. The text was typed, but the
+    /// user's keyboard may produce wrong characters until the layout is
+    /// reloaded — a visible, actionable failure, not a silent success.
+    KeyboardRestoreFailed { detail: String },
     /// The text contains a control character (`\n`, `\r`, `\t`, ...);
     /// v1 inserts single-line text only, and the copy fallback is the
     /// escape hatch.
@@ -324,6 +382,10 @@ impl InsertError {
             InsertError::TargetChanged { .. } => "target_changed",
             InsertError::TargetGone => "target_gone",
             InsertError::TargetIsStarling => "target_is_starling",
+            InsertError::ModifiersHeld { .. } => "modifiers_held",
+            InsertError::PartialDelivery { .. } => "partial_delivery",
+            InsertError::KeyboardStateUnsupported { .. } => "keyboard_state_unsupported",
+            InsertError::KeyboardRestoreFailed { .. } => "keyboard_restore_failed",
             InsertError::MultilineUnsupported => "multiline_unsupported",
             InsertError::Rejected { .. } => "insertion_rejected",
         }
@@ -354,18 +416,38 @@ impl InsertError {
             } => format!("the system refused the input: {reason} ({settings_hint})"),
             InsertError::TargetChanged { expected, actual } => format!(
                 "the focused target changed since the take started (was {expected}, is now \
-                 {actual}); nothing was typed",
+                 {actual})",
             ),
             InsertError::TargetGone => {
-                "the target window closed before the text could be delivered; nothing was \
-                 typed"
-                    .to_string()
+                "the target window closed while the text was being delivered".to_string()
             }
             InsertError::TargetIsStarling => {
                 "the focused window belongs to Starling itself; Starling never types into \
                  itself"
                     .to_string()
             }
+            InsertError::ModifiersHeld { held } => format!(
+                "modifier keys are still held down ({}); release them so the typed text is \
+                 not turned into commands",
+                held.join(", ")
+            ),
+            InsertError::PartialDelivery {
+                delivered_chars,
+                total_chars,
+                cause,
+            } => format!(
+                "typing stopped part-way: up to {delivered_chars} of {total_chars} \
+                 characters may have been typed before the failure ({cause})"
+            ),
+            InsertError::KeyboardStateUnsupported { reason } => format!(
+                "the keyboard is in a state synthetic typing cannot reproduce safely \
+                 ({reason}); use the copy fallback"
+            ),
+            InsertError::KeyboardRestoreFailed { detail } => format!(
+                "the keyboard mapping borrowed for unmapped characters could not be \
+                 restored ({detail}); the keyboard may type wrong characters until the \
+                 layout is reloaded"
+            ),
             InsertError::MultilineUnsupported => {
                 "the text contains a line break or other control character; only single-line \
                  text can be typed"
@@ -406,8 +488,10 @@ pub trait InsertionBackend: Send + Sync {
     fn revalidate(&self, target: &TargetSnapshot) -> Result<TargetCheck, InsertError>;
     /// Text around the target's cursor; `Ok(None)` when the backend
     /// has no such capability (both phase A backends).
-    fn surrounding_text(&self, target: &TargetSnapshot)
-        -> Result<Option<SurroundingText>, InsertError>;
+    fn surrounding_text(
+        &self,
+        target: &TargetSnapshot,
+    ) -> Result<Option<SurroundingText>, InsertError>;
     /// Type `text` into `target`. Must itself revalidate immediately
     /// before the first key, refuse control characters, and refuse a
     /// target owned by this process.
@@ -427,14 +511,37 @@ impl Inserter {
     /// The production backend order for this platform. Phase A has one
     /// backend per platform; phase C inserts the Wayland portal and
     /// IBus *before* X11 on Linux (a portal that works is strictly
-    /// more honest than X11 guessing under Wayland).
+    /// more honest than X11 guessing under Wayland). Self-target
+    /// protection covers only this process's own pid; the mode-B host
+    /// (or any embedding that splits capture from delivery) wants
+    /// [`Self::with_excluded_pids`].
     pub fn for_this_session() -> Inserter {
+        Self::with_excluded_pids(Vec::new())
+    }
+
+    /// The session backends with an *ownership policy*: every pid in
+    /// `excluded` — plus always `std::process::id()` — marks a target
+    /// Starling refuses to type into ([`InsertError::TargetIsStarling`]),
+    /// checked against the **live** target's pid at insert time, not
+    /// the frozen snapshot field (the snapshot's pid is advisory and
+    /// may be stale or absent).
+    ///
+    /// This is the mode-B constructor: the runtime host (#220) runs in
+    /// its own process and passes the desktop app's pid, so a ref the
+    /// app captured cannot be typed back into the app by the host.
+    /// On platforms with no phase A backend the list is still stored by
+    /// the backends that will exist; nothing can be inserted either
+    /// way. Note the exclusion is a *refusal* policy, not identity: it
+    /// widens the self-target guard, never narrows it.
+    pub fn with_excluded_pids(excluded: Vec<u32>) -> Inserter {
+        let excluded = merge_excluded_pids(excluded);
         #[cfg(target_os = "linux")]
         let backends: Vec<Box<dyn InsertionBackend>> =
-            vec![Box::new(x11::X11Backend::new())];
+            vec![Box::new(x11::X11Backend::with_excluded_pids(excluded))];
         #[cfg(windows)]
-        let backends: Vec<Box<dyn InsertionBackend>> =
-            vec![Box::new(windows::WindowsBackend::new())];
+        let backends: Vec<Box<dyn InsertionBackend>> = vec![Box::new(
+            windows::WindowsBackend::with_excluded_pids(excluded),
+        )];
         #[cfg(not(any(target_os = "linux", windows)))]
         let backends: Vec<Box<dyn InsertionBackend>> = Vec::new();
         Inserter::with_backends(backends)
@@ -458,10 +565,7 @@ impl Inserter {
                 Availability::Ready => return backend.capture(),
                 Availability::Unavailable { reason, setup_hint } => {
                     if first_blocker.is_none() {
-                        first_blocker = Some(InsertError::Unavailable {
-                            reason,
-                            setup_hint,
-                        });
+                        first_blocker = Some(InsertError::Unavailable { reason, setup_hint });
                     }
                 }
             }
@@ -482,13 +586,6 @@ impl Inserter {
             .find(|b| b.kind() == target.backend)
     }
 
-    /// Parse a `target_ref` back into a snapshot. Refs are
-    /// self-describing (scheme + ids + optional pid), so this needs no
-    /// backend and no server round trip — the runtime host parses refs
-    /// the app captured. Advisory fields (`app`/`title`) are not in the
-    /// ref and come back `None`; identity is complete. Returns `None`
-    /// for anything malformed or of an unknown scheme (a host rejects
-    /// such a ref at `delivery.prepare`).
     /// Parse a `target_ref` back into a snapshot. Refs are
     /// self-describing (scheme + ids + optional pid), so this needs no
     /// backend and no server round trip — the runtime host parses refs
@@ -529,12 +626,7 @@ impl Inserter {
 /// Format a target ref. Window ids are lowercase hex (no `0x`), the
 /// pid is decimal and omitted when the platform could not learn one —
 /// both forms parse, and both are safeToken-clean.
-pub(crate) fn format_ref(
-    kind: BackendKind,
-    active: u64,
-    focus: u64,
-    pid: Option<u32>,
-) -> String {
+pub(crate) fn format_ref(kind: BackendKind, active: u64, focus: u64, pid: Option<u32>) -> String {
     match pid {
         Some(pid) => format!("{}:{:x}:{:x}:{}", kind.scheme(), active, focus, pid),
         None => format!("{}:{:x}:{:x}", kind.scheme(), active, focus),
@@ -617,17 +709,28 @@ pub(crate) fn fnv1a64(bytes: &[u8]) -> u64 {
     hash
 }
 
-/// The shared pre-insert guards, in the order every backend must apply
-/// them. Centralized so a new backend cannot get the order wrong:
-/// cheap content checks first (nothing typed, nothing learned), the
-/// self-ownership refusal next, then the backend's own live
-/// revalidation — as a closure because each backend revalidates over
-/// *its* connection, immediately before typing, so the check and the
-/// keys ride the same server view.
-pub(crate) fn insertion_guards(
+/// The pids Starling refuses to type into, from any caller-supplied
+/// list plus always this process's own: sorted and deduped so equality
+/// and containment behave. Public only as the shared helper behind
+/// [`Inserter::with_excluded_pids`] and the backend constructors that
+/// mirror it.
+pub(crate) fn merge_excluded_pids(excluded: Vec<u32>) -> Vec<u32> {
+    let mut pids = excluded;
+    pids.push(std::process::id());
+    pids.sort_unstable();
+    pids.dedup();
+    pids
+}
+
+/// The cheap, target-independent pre-insert guards: nothing typed,
+/// nothing learned about the live target. Real backends run these
+/// first, then do their platform preparation, then their *live*
+/// revalidation last (see [`deliver_in_chunks`]); the fake has no
+/// preparation phase and uses the combined [`insertion_guards`].
+pub(crate) fn cheap_insertion_guards(
     text: &str,
     pid: Option<u32>,
-    live_revalidate: impl FnOnce() -> Result<TargetCheck, InsertError>,
+    excluded_pids: &[u32],
 ) -> Result<(), InsertError> {
     if text.is_empty() {
         // An empty insert types nothing and "succeeded" would claim
@@ -643,9 +746,34 @@ pub(crate) fn insertion_guards(
         // platform layer were forgetful.
         return Err(InsertError::MultilineUnsupported);
     }
-    if pid == Some(std::process::id()) {
+    if pid.is_some_and(|pid| excluded_pids.contains(&pid)) {
+        // The frozen snapshot's own pid — an early refusal for a ref
+        // that was Starling-owned at capture time. The authoritative
+        // check is against the *live* pid in each backend's
+        // revalidation; this one only catches what the ref itself
+        // already admits.
         return Err(InsertError::TargetIsStarling);
     }
+    Ok(())
+}
+
+/// The shared pre-insert guards, in the order every backend must apply
+/// them. Centralized so a new backend cannot get the order wrong:
+/// cheap content checks first (nothing typed, nothing learned), the
+/// self-ownership refusal next, then the backend's own live
+/// revalidation — as a closure because each backend revalidates over
+/// *its* connection, immediately before typing, so the check and the
+/// keys ride the same server view. Only the test-double fake uses
+/// this combined form (the platform backends run the cheap guards,
+/// their preparation, then their own chunked checks); hence the cfg.
+#[cfg(any(test, feature = "test-doubles"))]
+pub(crate) fn insertion_guards(
+    text: &str,
+    pid: Option<u32>,
+    excluded_pids: &[u32],
+    live_revalidate: impl FnOnce() -> Result<TargetCheck, InsertError>,
+) -> Result<(), InsertError> {
+    cheap_insertion_guards(text, pid, excluded_pids)?;
     match live_revalidate()? {
         TargetCheck::Same => Ok(()),
         check @ (TargetCheck::Changed { .. } | TargetCheck::Gone) => Err(check_to_error(check)),
@@ -658,16 +786,124 @@ pub(crate) fn insertion_guards(
 /// a refusal at all and maps to a clearly-internal error (a caller
 /// that lands there has a bug, and an honest error beats a silent
 /// `Ok`).
+#[cfg(any(test, feature = "test-doubles"))]
 pub(crate) fn check_to_error(check: TargetCheck) -> InsertError {
     match check {
         TargetCheck::Same => InsertError::Rejected {
             reason: "internal error: target check passed but insert still refused".to_string(),
         },
-        TargetCheck::Changed { expected, actual } => InsertError::TargetChanged {
-            expected,
-            actual,
-        },
+        TargetCheck::Changed { expected, actual } => {
+            InsertError::TargetChanged { expected, actual }
+        }
         TargetCheck::Gone => InsertError::TargetGone,
+    }
+}
+
+/// Split `text` into segments of at most `max_weight` "weight" per
+/// segment (`weight` is 1 per char for X11's char cap, the UTF-16 unit
+/// count for Windows' SendInput cap), never cutting a character in
+/// half — surrogate pairs always travel inside one segment. Text is
+/// non-empty by the time this runs (the guards refused the empty
+/// case), so the result is never empty.
+pub(crate) fn weighed_segments<'a, F: Fn(char) -> usize>(
+    text: &'a str,
+    max_weight: usize,
+    weight: F,
+) -> Vec<&'a str> {
+    let mut segments = Vec::new();
+    let mut start = 0usize;
+    let mut weight_sum = 0usize;
+    for (index, character) in text.char_indices() {
+        let char_weight = weight(character);
+        if index > start && weight_sum + char_weight > max_weight {
+            segments.push(&text[start..index]);
+            start = index;
+            weight_sum = 0;
+        }
+        weight_sum += char_weight;
+    }
+    segments.push(&text[start..]);
+    segments
+}
+
+/// How many leading characters of `text` are *completely* contained in
+/// the first `units` UTF-16 units — a character whose surrogate pair
+/// was cut in half was not delivered. Windows reports SendInput's
+/// progress in events (down+up pairs per unit), and half a pair is
+/// worse than nothing, so only whole characters count.
+#[cfg(any(windows, test))]
+pub(crate) fn chars_complete_within_units(text: &str, units: usize) -> usize {
+    let mut remaining = units;
+    let mut characters = 0usize;
+    for character in text.chars() {
+        let length = character.len_utf16();
+        if length > remaining {
+            break;
+        }
+        remaining -= length;
+        characters += 1;
+    }
+    characters
+}
+
+/// What a segment typer reports when typing failed part-way through
+/// the segment: how many characters were delivered *in total* (the
+/// chunks before this one plus whatever of this one landed) and the
+/// underlying cause.
+pub(crate) struct ChunkFailure {
+    pub delivered: usize,
+    pub cause: InsertError,
+}
+
+/// The chunked typing loop every platform backend drives: `check` runs
+/// before *every* chunk (held modifiers waited out, focus/identity
+/// revalidated — the same final check as before the first chunk), then
+/// `type_segment` types one chunk and reports exactly how many
+/// characters it delivered. Any failure stops typing immediately:
+/// with nothing delivered the cause is returned bare, otherwise it is
+/// wrapped as [`InsertError::PartialDelivery`] so the user learns how
+/// much may have landed. Success is only the weak synthetic-keys
+/// evidence — chunking does not make delivery more provable.
+pub(crate) fn deliver_in_chunks(
+    total_chars: usize,
+    segments: &[&str],
+    mut check: impl FnMut() -> Result<(), InsertError>,
+    mut type_segment: impl FnMut(&str, usize) -> Result<usize, ChunkFailure>,
+) -> Result<InsertReceipt, InsertError> {
+    let mut delivered = 0usize;
+    for segment in segments {
+        if let Err(cause) = check() {
+            return Err(partialize(delivered, total_chars, cause));
+        }
+        match type_segment(segment, delivered) {
+            Ok(typed) => {
+                debug_assert_eq!(
+                    typed,
+                    segment.chars().count(),
+                    "a segment typer either delivers the whole segment or fails"
+                );
+                delivered += typed;
+            }
+            Err(failure) => return Err(partialize(failure.delivered, total_chars, failure.cause)),
+        }
+    }
+    Ok(InsertReceipt {
+        evidence: EVIDENCE_SYNTHETIC_KEYS,
+    })
+}
+
+/// Wrap a mid-typing failure: nothing delivered means the cause tells
+/// the whole story on its own; anything delivered turns it into a
+/// partial-delivery report that says how much may have landed.
+pub(crate) fn partialize(delivered: usize, total_chars: usize, cause: InsertError) -> InsertError {
+    if delivered == 0 {
+        cause
+    } else {
+        InsertError::PartialDelivery {
+            delivered_chars: delivered,
+            total_chars,
+            cause: Box::new(cause),
+        }
     }
 }
 
@@ -703,13 +939,34 @@ mod tests {
             },
             InsertError::TargetGone,
             InsertError::TargetIsStarling,
+            InsertError::ModifiersHeld {
+                held: vec!["Control".into(), "Shift".into()],
+            },
+            InsertError::PartialDelivery {
+                delivered_chars: 16,
+                total_chars: 64,
+                cause: Box::new(InsertError::TargetChanged {
+                    expected: "x11:1:1".into(),
+                    actual: "x11:2:2".into(),
+                }),
+            },
+            InsertError::KeyboardStateUnsupported {
+                reason: "Caps Lock is engaged".into(),
+            },
+            InsertError::KeyboardRestoreFailed {
+                detail: "the X server refused the restore".into(),
+            },
             InsertError::MultilineUnsupported,
             InsertError::Rejected {
                 reason: "no focused window".into(),
             },
         ];
         for error in &samples {
-            assert!(is_safe_token(error.code()), "{} is a safeToken", error.code());
+            assert!(
+                is_safe_token(error.code()),
+                "{} is a safeToken",
+                error.code()
+            );
             assert!(error.fallback_suggested());
             assert!(!error.message().is_empty());
         }
@@ -719,6 +976,70 @@ mod tests {
         codes.sort_unstable();
         codes.dedup();
         assert_eq!(codes.len(), samples.len());
+    }
+
+    #[test]
+    fn partial_delivery_message_reports_how_much_may_have_landed() {
+        let error = InsertError::PartialDelivery {
+            delivered_chars: 16,
+            total_chars: 64,
+            cause: Box::new(InsertError::TargetChanged {
+                expected: "x11:1:1".into(),
+                actual: "x11:2:2".into(),
+            }),
+        };
+        let message = error.message();
+        assert!(
+            message.contains("16"),
+            "names the delivered count: {message}"
+        );
+        assert!(message.contains("64"), "names the total: {message}");
+        assert!(
+            message.contains("may have been typed"),
+            "hedges honestly: {message}"
+        );
+        assert_eq!(error.code(), "partial_delivery");
+        assert!(error.fallback_suggested());
+        // The cause is inspectable for recovery logic ("keep the tail,
+        // not the head").
+        let cause = match error {
+            InsertError::PartialDelivery { cause, .. } => *cause,
+            other => panic!("expected a partial delivery, got {other:?}"),
+        };
+        assert!(matches!(cause, InsertError::TargetChanged { .. }));
+    }
+
+    #[test]
+    fn held_modifier_and_keyboard_state_errors_carry_their_detail() {
+        let held = InsertError::ModifiersHeld {
+            held: vec!["Control".into(), "Mod4".into()],
+        };
+        let message = held.message();
+        assert!(
+            message.contains("Control"),
+            "names the held keys: {message}"
+        );
+        assert!(message.contains("Mod4"), "names the held keys: {message}");
+        assert!(
+            message.contains("still held"),
+            "says what happened: {message}"
+        );
+        assert_eq!(held.code(), "modifiers_held");
+        assert!(held.fallback_suggested());
+
+        let state = InsertError::KeyboardStateUnsupported {
+            reason: "group 1 is active".into(),
+        };
+        assert!(state.message().contains("group 1"));
+        assert_eq!(state.code(), "keyboard_state_unsupported");
+        assert!(state.fallback_suggested());
+
+        let restore = InsertError::KeyboardRestoreFailed {
+            detail: "connection lost".into(),
+        };
+        assert!(restore.message().contains("connection lost"));
+        assert_eq!(restore.code(), "keyboard_restore_failed");
+        assert!(restore.fallback_suggested());
     }
 
     #[test]
@@ -741,25 +1062,22 @@ mod tests {
         // Each of these must fail prepare loudly, not silently mean
         // something else.
         for bad in [
-            "",                       // nothing
-            "x11",                    // scheme only
-            "x11:",                   // empty ids
-            "x11:0:0",                // zero window id never happens
-            "x11:zz:1",               // non-hex
-            "x11:1:2:notanumber",     // pid not decimal
-            "x11:1:2:3:4",            // trailing component
+            "",                             // nothing
+            "x11",                          // scheme only
+            "x11:",                         // empty ids
+            "x11:0:0",                      // zero window id never happens
+            "x11:zz:1",                     // non-hex
+            "x11:1:2:notanumber",           // pid not decimal
+            "x11:1:2:3:4",                  // trailing component
             "x11:1:2:18446744073709551616", // pid overflow
-            "macos:1:2",              // scheme from a future/other port
-            "fake:1:2:3:4:5",         // too many parts for the fake scheme too
-            &"x:".repeat(100),        // over the safeToken bound
+            "macos:1:2",                    // scheme from a future/other port
+            "fake:1:2:3:4:5",               // too many parts for the fake scheme too
+            &"x:".repeat(100),              // over the safeToken bound
         ] {
             assert!(parse_ref(bad).is_none(), "{bad:?} must not parse");
         }
         // Hex case-insensitivity: the identity is the number.
-        assert_eq!(
-            parse_ref("x11:ABC:Def:7"),
-            parse_ref("x11:abc:def:7")
-        );
+        assert_eq!(parse_ref("x11:ABC:Def:7"), parse_ref("x11:abc:def:7"));
     }
 
     #[test]
@@ -822,5 +1140,207 @@ mod tests {
             Err(InsertError::Unavailable { reason, .. })
                 if reason.contains("no insertion backend")
         ));
+    }
+
+    #[test]
+    fn segments_split_by_weight_without_cutting_characters() {
+        // X11: 16 characters per chunk, weight 1 per char.
+        let text = "a".repeat(40);
+        let segments = weighed_segments(&text, 16, |_| 1);
+        assert_eq!(
+            segments
+                .iter()
+                .map(|s| s.chars().count())
+                .collect::<Vec<_>>(),
+            [16, 16, 8],
+            "40 chars pack into 16-char chunks"
+        );
+        assert_eq!(segments.concat(), text);
+
+        // Windows: 32 UTF-16 units per chunk; a surrogate pair never
+        // splits, and one pair more than the cap starts a new segment.
+        let emoji: String = "😀".repeat(17); // 34 units
+        let segments = weighed_segments(&emoji, 32, char::len_utf16);
+        assert_eq!(
+            segments
+                .iter()
+                .map(|s| s.chars().count())
+                .collect::<Vec<_>>(),
+            [16, 1],
+            "16 pairs (32 units) then the 17th alone"
+        );
+        assert_eq!(segments.concat(), emoji);
+
+        // Mixed BMP and supplementary characters stay in order.
+        let mixed = "a😀b";
+        assert_eq!(weighed_segments(mixed, 32, char::len_utf16), vec![mixed]);
+        // A single character heavier than the cap still ships — the
+        // alternative (dropping it) would silently eat text.
+        assert_eq!(weighed_segments("😀", 1, char::len_utf16), vec!["😀"]);
+    }
+
+    #[test]
+    fn complete_chars_never_count_a_severed_surrogate_half() {
+        let text = "a😀b";
+        assert_eq!(chars_complete_within_units(text, 0), 0);
+        assert_eq!(chars_complete_within_units(text, 1), 1, "just 'a'");
+        assert_eq!(
+            chars_complete_within_units(text, 2),
+            1,
+            "the pair's first half does not count as a delivered character"
+        );
+        assert_eq!(chars_complete_within_units(text, 3), 2, "'a😀'");
+        assert_eq!(chars_complete_within_units(text, 4), 3, "everything");
+        assert_eq!(chars_complete_within_units(text, 99), 3);
+    }
+
+    /// The chunk loop, scripted like a backend: a queue of check and
+    /// typing outcomes the test drives step by step.
+    #[test]
+    fn the_chunk_loop_types_every_segment_after_rechecking() {
+        let text = "0123456789abcdefghij"; // 20 chars
+        let segments = weighed_segments(text, 16, |_| 1);
+        let mut checks = 0;
+        let mut typed = Vec::new();
+        let receipt = deliver_in_chunks(
+            text.chars().count(),
+            &segments,
+            || {
+                checks += 1;
+                Ok(())
+            },
+            |segment, _| {
+                typed.push(segment.to_string());
+                Ok(segment.chars().count())
+            },
+        )
+        .expect("a clean run types everything");
+        assert_eq!(receipt.evidence, EVIDENCE_SYNTHETIC_KEYS);
+        assert_eq!(checks, 2, "one check per chunk, including the first");
+        assert_eq!(typed.len(), 2);
+        assert_eq!(typed.concat(), text);
+    }
+
+    #[test]
+    fn the_chunk_loop_wraps_mid_way_failures_but_not_first_chunk_ones() {
+        let text = "0123456789abcdefghij";
+        let segments = weighed_segments(text, 16, |_| 1);
+        let changed = InsertError::TargetChanged {
+            expected: "x11:1:1".into(),
+            actual: "x11:2:2".into(),
+        };
+
+        // The check before the *first* chunk fails: nothing was typed,
+        // so the cause returns bare (there is nothing "partial").
+        let error = deliver_in_chunks(
+            text.chars().count(),
+            &segments,
+            || Err(changed.clone()),
+            |segment, _| Ok(segment.chars().count()),
+        )
+        .unwrap_err();
+        assert_eq!(error, changed);
+
+        // The check before the *second* chunk fails after 16 chars
+        // landed: a partial-delivery report naming the counts.
+        let mut checks = 0;
+        let error = deliver_in_chunks(
+            text.chars().count(),
+            &segments,
+            || {
+                checks += 1;
+                if checks == 1 {
+                    Ok(())
+                } else {
+                    Err(changed.clone())
+                }
+            },
+            |segment, _| Ok(segment.chars().count()),
+        )
+        .unwrap_err();
+        match error {
+            InsertError::PartialDelivery {
+                delivered_chars,
+                total_chars,
+                cause,
+            } => {
+                assert_eq!(delivered_chars, 16);
+                assert_eq!(total_chars, 20);
+                assert_eq!(*cause, changed);
+            }
+            other => panic!("a mid-typing change is partial delivery: {other:?}"),
+        }
+
+        // Typing itself fails mid-segment (say the 5th char of chunk
+        // two): the report counts exactly what landed, chunk plus
+        // partial chunk.
+        let error = deliver_in_chunks(
+            text.chars().count(),
+            &segments,
+            || Ok(()),
+            |segment, delivered| {
+                if delivered == 0 {
+                    Ok(segment.chars().count())
+                } else {
+                    Err(ChunkFailure {
+                        delivered: delivered + 5,
+                        cause: InsertError::PermissionDenied {
+                            reason: "blocked".into(),
+                            settings_hint: "same integrity level".into(),
+                        },
+                    })
+                }
+            },
+        )
+        .unwrap_err();
+        match error {
+            InsertError::PartialDelivery {
+                delivered_chars, ..
+            } => {
+                assert_eq!(delivered_chars, 21, "16 from chunk one + 5 of chunk two")
+            }
+            other => panic!("a mid-segment typing failure is partial delivery: {other:?}"),
+        }
+
+        // Typing fails with nothing landed in the failing chunk's run
+        // at all (first chunk, zero chars): bare cause again.
+        let error = deliver_in_chunks(
+            text.chars().count(),
+            &segments,
+            || Ok(()),
+            |_, _| {
+                Err(ChunkFailure {
+                    delivered: 0,
+                    cause: changed.clone(),
+                })
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error, changed);
+    }
+
+    #[test]
+    fn excluded_pids_always_include_this_process() {
+        assert_eq!(
+            merge_excluded_pids(Vec::new()),
+            vec![std::process::id()],
+            "the plain self-target guard survives"
+        );
+        let merged = merge_excluded_pids(vec![7, std::process::id(), 7, 900]);
+        assert_eq!(merged, {
+            let mut expected = vec![std::process::id(), 7, 900];
+            expected.sort_unstable();
+            expected
+        });
+        // The production constructor routes the same merge into its
+        // platform backend (X11 here; the Windows twin compiles there
+        // and is exercised by its interactive test).
+        #[cfg(target_os = "linux")]
+        {
+            let backend = crate::x11::X11Backend::with_excluded_pids(vec![4213]);
+            let excluded = backend.excluded_pids();
+            assert!(excluded.contains(&4213));
+            assert!(excluded.contains(&std::process::id()));
+        }
     }
 }
