@@ -38,6 +38,12 @@
 //!    (the planner would then find the letter gone or the unshifted
 //!    press would type the wrong case), so this pins that an
 //!    uppercase borrow decodes as text with its case intact.
+//!    3c. **Preparation failure restores what it borrowed**: one more
+//!    unmapped character than the keyboard has spare keycodes makes
+//!    borrowing stop part-way — the insert refuses (keyboard busy),
+//!    types nothing, and the live mapping still ends exactly where it
+//!    started, proving cleanup on the preparation-failure path runs
+//!    (explicitly, not lost in Drop).
 //! 4. **Held modifiers refuse typing**: Ctrl held down via XTest
 //!    during an insert makes the insert wait out the bounded release
 //!    window and then refuse with `ModifiersHeld` — nothing typed,
@@ -294,6 +300,30 @@ fn main_test() -> Result<(), ItError> {
     );
     kb.assert_mapping_is(&conn, &mapping_before)?;
 
+    // 3c. Preparation failure after a borrow: one more unmapped
+    //     character than the keyboard has spare keycodes means
+    //     borrowing stops part-way — the last character finds no
+    //     candidate. The insert must refuse (keyboard busy), type
+    //     nothing, and still give back every keycode borrowed before
+    //     the failure (the mapping ends byte-for-byte where it
+    //     started).
+    let spares_left = spare_count(&kb);
+    let overflow: String = unmapped_chars(&kb, spares_left + 1).iter().collect();
+    match backend.insert(&snap_a, &overflow) {
+        Err(InsertError::Rejected { reason }) => {
+            assert!(
+                reason.contains("keyboard busy"),
+                "the refusal says why: {reason}"
+            );
+        }
+        other => panic!("an exhausted spare pool must refuse the insert: {other:?}"),
+    }
+    assert!(
+        drain_text(&conn, a, &mut kb)?.is_empty(),
+        "a preparation refusal may not type"
+    );
+    kb.assert_mapping_is(&conn, &mapping_before)?;
+
     // 4. Held modifiers: Ctrl physically down (a real XTest press the
     //    server's keyboard state reflects) makes the insert wait out
     //    the bounded release window and then refuse — without typing
@@ -505,8 +535,10 @@ fn main_test() -> Result<(), ItError> {
     println!(
         "starling-insertion X11 IT passed: capture identity, mixed-string decode as text \
          ({mixed:?}), remap+restore (mapping byte-for-byte unchanged), uppercase remap decode \
-         ({upper_text:?}), held-modifier refusal, chunk-bounded partial delivery on focus \
-         steal, serialized concurrent inserts, changed and gone revalidation"
+         ({upper_text:?}), preparation-failure refusal with a restored mapping ({} spare \
+         keycodes exhausted), held-modifier refusal, chunk-bounded partial delivery on focus \
+         steal, serialized concurrent inserts, changed and gone revalidation",
+        spares_left
     );
     Ok(())
 }
@@ -547,6 +579,34 @@ fn unmapped_char(kb: &Keyboard, candidates: &[char]) -> char {
         .copied()
         .find(|&candidate| kb.keycode_of(keysym_of(candidate)).is_none())
         .unwrap_or_else(|| panic!("none of {candidates:?} is unmapped on this keyboard"))
+}
+
+/// How many all-`NoSymbol` keycodes the live mapping holds — the same
+/// pool, counted the same way, the backend's borrow loop draws from.
+fn spare_count(kb: &Keyboard) -> usize {
+    let keycode_count = kb.syms.len() / kb.width;
+    (0..keycode_count)
+        .map(|index| kb.min + index as u8)
+        .filter(|&keycode| kb.syms_of(keycode).iter().all(|&sym| sym == 0))
+        .count()
+}
+
+/// `count` distinct characters no trusted column of the live mapping
+/// produces — astral codepoints (each with its Unicode-convention
+/// keysym, which no real layout carries), so every one must ride the
+/// remap path.
+fn unmapped_chars(kb: &Keyboard, count: usize) -> Vec<char> {
+    let mut found = Vec::with_capacity(count);
+    let mut codepoint = 0x2_0000u32;
+    while found.len() < count {
+        let character = char::from_u32(codepoint)
+            .expect("codepoints past the astral plane boundary are all valid chars");
+        if kb.keycode_of(0x0100_0000 | codepoint).is_none() {
+            found.push(character);
+        }
+        codepoint += 1;
+    }
+    found
 }
 
 /// One XTest fake key event on this test's own connection.

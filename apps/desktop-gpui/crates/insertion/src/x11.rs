@@ -1131,8 +1131,10 @@ struct BorrowedKey {
 /// type's business — [`INSERT_LOCK`] covers the whole insert, and the
 /// transaction is created inside it. Entries are recorded *before*
 /// the mutating request is sent (the entry list is what Drop
-/// restores), finished explicitly on the success path (where a
-/// failed restore is a real error) and by Drop everywhere else.
+/// restores), finished explicitly on the success path and on the
+/// preparation-failure path (where a failed restore is a real error,
+/// combined with the preparation cause — [`RemapTransaction::begin`])
+/// and by Drop everywhere else.
 struct RemapTransaction<'a> {
     session: &'a Session,
     borrowed: Vec<BorrowedKey>,
@@ -1153,7 +1155,12 @@ impl RemapTransaction<'_> {
     /// must not be written into column 0 alone); and the server's
     /// echo must still carry the keysym in the base column, or the
     /// borrow is refused — never a panic. With nothing to borrow this
-    /// is a no-op.
+    /// is a no-op. A failure *part-way* (after some keycodes were
+    /// borrowed) does not leave cleanup to Drop, which cannot report:
+    /// [`Self::finish`] runs explicitly and a failed restore is
+    /// combined with the preparation cause by
+    /// [`combine_preparation_with_restore_outcome`] — nothing has been
+    /// typed at that point, and the combined error says so.
     fn begin<'a>(
         session: &'a Session,
         keyboard: &Keyboard,
@@ -1164,8 +1171,28 @@ impl RemapTransaction<'_> {
             borrowed: Vec::new(),
             finished: false,
         };
+        if let Err(preparation) = transaction.borrow_needed(keyboard, needed) {
+            // Every keycode borrowed before the failure is given back
+            // here, out-of-band of the error: `finish` attempts every
+            // restore (and sets `finished`, so Drop does not retry),
+            // and a restore that failed must not hide behind the
+            // preparation error (nor may the preparation error hide a
+            // broken keyboard) — the combined error states both.
+            return Err(combine_preparation_with_restore_outcome(
+                preparation,
+                transaction.finish(),
+            ));
+        }
+        Ok(transaction)
+    }
+
+    /// The borrowing loop behind [`Self::begin`]: one spare keycode
+    /// per `needed` keysym, or the first failure for `begin` to clean
+    /// up after.
+    fn borrow_needed(&mut self, keyboard: &Keyboard, needed: &[Keysym]) -> Result<(), InsertError> {
+        let session = self.session;
         if needed.is_empty() {
-            return Ok(transaction);
+            return Ok(());
         }
         let mut candidates = keyboard.spares.iter().copied();
         'needed: for &keysym in needed {
@@ -1173,7 +1200,23 @@ impl RemapTransaction<'_> {
                 // The grabbed section: read, verify spare, write,
                 // echo-read. Held for these few requests only (the
                 // guard releases it on every exit, error included).
-                let _grab = ServerGrab::new(session)?;
+                // A grab the server refused means no remap may
+                // happen: the character is refused (keyboard busy) —
+                // never typed through an unprotected read→write.
+                let _grab = ServerGrab::new(session).map_err(|error| match error {
+                    // Connection trouble stays "unavailable" — it is
+                    // the backend, not the keyboard, that failed.
+                    unavailable @ InsertError::Unavailable { .. } => unavailable,
+                    cause => InsertError::Rejected {
+                        reason: format!(
+                            "the X server refused the exclusive grab borrowing a keycode for \
+                             U+{:04X} needs, so the character cannot be typed (keyboard busy): \
+                             {}",
+                            keysym_codepoint(keysym),
+                            cause.message()
+                        ),
+                    },
+                })?;
                 let live = session.keycode_syms(candidate)?;
                 if live.is_empty() {
                     // A keycode with no columns can carry nothing;
@@ -1194,7 +1237,7 @@ impl RemapTransaction<'_> {
                 // request: a failure between record and write restores
                 // a no-op, a failure after it restores the original,
                 // and nothing is left borrowed unrecorded.
-                transaction.borrowed.push(BorrowedKey {
+                self.borrowed.push(BorrowedKey {
                     keycode: candidate,
                     keysym,
                     echoed: wrote.clone(),
@@ -1219,9 +1262,20 @@ impl RemapTransaction<'_> {
                 // leave it borrowed. The echo must also prove the
                 // borrow usable: the base column (what an unshifted
                 // press types) must still be the requested keysym —
-                // an unexpected echo is a refusal, never a panic.
+                // an unexpected echo is a refusal, never a panic. It
+                // is recorded BEFORE that usability decision: the
+                // write has already landed, so a rejected echo is
+                // still Starling's mapping and cleanup must compare
+                // against — and restore — exactly it; had cleanup
+                // compared against the requested write instead, the
+                // server's canonicalized form would read as another
+                // client's mapping and the borrow would leak.
                 let echoed = session.keycode_syms(candidate)?;
-                if echoed.first() != Some(&keysym) {
+                let base_column = echoed.first().copied();
+                if let Some(entry) = self.borrowed.last_mut() {
+                    entry.echoed = echoed;
+                }
+                if base_column != Some(keysym) {
                     return Err(InsertError::Rejected {
                         reason: format!(
                             "the X server did not keep U+{:04X} in the base column of keycode \
@@ -1229,9 +1283,6 @@ impl RemapTransaction<'_> {
                             keysym_codepoint(keysym)
                         ),
                     });
-                }
-                if let Some(entry) = transaction.borrowed.last_mut() {
-                    entry.echoed = echoed;
                 }
                 continue 'needed;
             }
@@ -1247,7 +1298,7 @@ impl RemapTransaction<'_> {
         // interpreted by anyone. (Outside any grab — it is a wait, and
         // grabs are never held across waits.)
         session.sync()?;
-        Ok(transaction)
+        Ok(())
     }
 
     /// The keycode this transaction borrowed for `keysym` — looked up
@@ -1388,8 +1439,22 @@ struct ServerGrab<'a> {
 
 impl<'a> ServerGrab<'a> {
     fn new(session: &'a Session) -> Result<ServerGrab<'a>, InsertError> {
-        session.conn.grab_server().map_err(x11_conn_error)?;
-        Ok(ServerGrab { session })
+        let cookie = session.conn.grab_server().map_err(x11_conn_error)?;
+        // The guard is constructed before the grab's reply is checked,
+        // so a rejected grab still unwinds through Drop's ungrab (an
+        // ungrab for a grab the server never held is harmless).
+        let guard = ServerGrab { session };
+        // The grab's reply must be checked, never assumed: a security
+        // policy such as XACE may deny GrabServer while still allowing
+        // mapping requests, and a section that ran ungrabbed could
+        // interleave its ownership read→write (or compare→restore)
+        // with another client's remap of the same keycode. A rejected
+        // grab is an error before any mapping read or write of the
+        // section — never a fallback to an unprotected sequence.
+        if let Err(error) = cookie.check() {
+            return Err(grab_refused(error));
+        }
+        Ok(guard)
     }
 }
 
@@ -1637,6 +1702,21 @@ fn reply_error(error: x11rb::errors::ReplyError) -> InsertError {
     }
 }
 
+/// A checked server grab the server refused. A connection failure
+/// means the backend is unavailable; an X11 error means the server
+/// refused the exclusion the grabbed section needs (a security policy
+/// such as XACE may deny GrabServer while still allowing mapping
+/// requests) — a refusal the caller turns into the section's own
+/// failure mode, never into an unprotected fallback.
+fn grab_refused(error: x11rb::errors::ReplyError) -> InsertError {
+    match error {
+        x11rb::errors::ReplyError::ConnectionError(inner) => x11_conn_error(inner),
+        x11rb::errors::ReplyError::X11Error(inner) => InsertError::Rejected {
+            reason: format!("the X server refused the server grab: {inner:?}"),
+        },
+    }
+}
+
 /// Fold a failed delivery and a failed keyboard restore into the one
 /// error an insert returns on that path. The restore failure is the
 /// actionable headline (the user's keyboard may type wrong characters
@@ -1659,6 +1739,45 @@ fn combine_delivery_and_restore_failure(
         ),
         other => format!("no character's key-down was accepted before the failure ({other})"),
     };
+    restore_with_outcome(outcome, restore)
+}
+
+/// The decision `RemapTransaction::begin` makes when borrowing fails
+/// part-way: a *successful* restore changes nothing about the report
+/// (the preparation error alone is the honest outcome — the keyboard
+/// is exactly as it was), while a failed restore must not hide behind
+/// the preparation error.
+fn combine_preparation_with_restore_outcome(
+    preparation: InsertError,
+    restore: Result<(), InsertError>,
+) -> InsertError {
+    match restore {
+        Ok(()) => preparation,
+        Err(restore) => combine_preparation_and_restore_failure(&preparation, restore),
+    }
+}
+
+/// Fold a preparation failure and a failed keyboard restore into the
+/// one error `begin` returns on that path — the same discipline as
+/// [`combine_delivery_and_restore_failure`]: the restore failure is
+/// the actionable headline, and the message states both facts (the
+/// original preparation cause *and* the delivery outcome). Here the
+/// outcome is fixed: preparation precedes every key-down, so nothing
+/// was typed — no "may have landed" needs reporting.
+fn combine_preparation_and_restore_failure(
+    preparation: &InsertError,
+    restore: InsertError,
+) -> InsertError {
+    restore_with_outcome(
+        format!("nothing was typed (the insert failed while preparing: {preparation})"),
+        restore,
+    )
+}
+
+/// The fold both combination helpers share: the restore failure stays
+/// the headline error and the outcome sentence rides along in its
+/// detail, so neither fact can hide the other.
+fn restore_with_outcome(outcome: String, restore: InsertError) -> InsertError {
     match restore {
         InsertError::KeyboardRestoreFailed { detail } => InsertError::KeyboardRestoreFailed {
             detail: format!("{detail}; and {outcome}"),
@@ -1719,6 +1838,69 @@ mod tests {
             "the zero-delivery outcome is stated: {message}"
         );
         assert!(message.contains("could not be restored"));
+    }
+
+    #[test]
+    fn a_preparation_failure_keeps_the_restore_failure_and_says_nothing_was_typed() {
+        // Borrowing stopped part-way (the spare pool ran out) and the
+        // restore of what *was* borrowed also failed: the restore
+        // failure is the headline (the actionable fact), and both
+        // halves of the story survive in the message — the preparation
+        // cause and the fact that no key-down ever happened.
+        let combined = combine_preparation_with_restore_outcome(
+            InsertError::Rejected {
+                reason: "every spare keycode is already in use, so the character U+1F984 \
+                         cannot be typed (keyboard busy)"
+                    .to_string(),
+            },
+            Err(InsertError::KeyboardRestoreFailed {
+                detail: "restoring keycode 255: the X connection failed".to_string(),
+            }),
+        );
+        assert_eq!(combined.code(), "keyboard_restore_failed");
+        let message = combined.message();
+        assert!(
+            message.contains("could not be restored"),
+            "the restore failure stays visible: {message}"
+        );
+        assert!(
+            message.contains("keycode 255"),
+            "the restore detail stays visible: {message}"
+        );
+        assert!(
+            message.contains("every spare keycode is already in use"),
+            "the preparation cause stays visible: {message}"
+        );
+        assert!(
+            message.contains("nothing was typed"),
+            "the zero-delivery outcome is stated: {message}"
+        );
+    }
+
+    #[test]
+    fn a_preparation_failure_with_a_clean_restore_surfaces_alone() {
+        // The other arm of the decision: giving back every borrowed
+        // keycode cleanly means the preparation error is the whole
+        // story — no restore fact to fold in, no "nothing was typed"
+        // rider on a failure the caller already understands.
+        let combined = combine_preparation_with_restore_outcome(
+            InsertError::Rejected {
+                reason: "every spare keycode is already in use, so the character U+1F984 \
+                         cannot be typed (keyboard busy)"
+                    .to_string(),
+            },
+            Ok(()),
+        );
+        assert_eq!(combined.code(), "insertion_rejected");
+        let message = combined.message();
+        assert!(
+            message.contains("every spare keycode is already in use"),
+            "the preparation cause is the report: {message}"
+        );
+        assert!(
+            !message.contains("could not be restored"),
+            "a clean restore adds no restore failure: {message}"
+        );
     }
 
     #[test]
