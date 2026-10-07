@@ -404,7 +404,9 @@ impl StarlingApp {
                         "{take_device} failed mid-recording ({fault}); the audio captured \
                          before that was kept."
                     );
-                    self.staging_interrupted(cx);
+                    // Like a cancel: a draft the user typed into stays and
+                    // is bound to the saved take; an untouched one goes.
+                    let kept_draft = self.staging_cancelled(cx);
                     self.levels = vec![0.06; 52];
                     self.capture_warning = recorder::clipping_warning(source_clip_ratio);
                     self.report_input_problem(
@@ -432,11 +434,14 @@ impl StarlingApp {
                                 journal_report,
                                 note,
                                 None,
-                                None,
+                                kept_draft,
                                 cx,
                             ),
                             Err(err) => {
                                 app.error = Some(err.to_string());
+                                if let Some(token) = kept_draft {
+                                    app.staging_save_failed(token, cx);
+                                }
                                 cx.notify();
                             }
                         })

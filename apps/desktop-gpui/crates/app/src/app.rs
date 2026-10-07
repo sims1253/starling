@@ -1598,6 +1598,9 @@ impl StarlingApp {
         self.cancel_mic_check();
         self.mic.check = None;
         self.mic.settings_launch_error = None;
+        // Shortcut evidence is per dialog: a press heard last time may
+        // have been a shortcut that has since changed.
+        self.mic.shortcut_heard = None;
         self.refresh_input_devices(cx);
         self.draft_endpoint.update(cx, |field, cx| {
             field.set_value(&endpoint, cx);
