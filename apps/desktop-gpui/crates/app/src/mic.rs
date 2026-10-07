@@ -237,6 +237,9 @@ pub(crate) struct MicState {
     /// The outcome of the last "open sound settings" action, when it
     /// could not open anything.
     pub(crate) settings_launch_error: Option<String>,
+    /// Retires a settings-launch result that lands after a newer launch,
+    /// or after the dialog it belonged to closed.
+    pub(crate) settings_launch_generation: u64,
     /// Why the current take is being ended as interrupted, read by the
     /// cancel path (`CancelReason::InputLost`).
     pub(crate) interruption: Option<(String, InputProblem)>,
@@ -256,6 +259,7 @@ impl Default for MicState {
             last_route: None,
             problem: None,
             settings_launch_error: None,
+            settings_launch_generation: 0,
             interruption: None,
             last_sound_at: None,
         }
@@ -545,12 +549,17 @@ impl StarlingApp {
     pub(crate) fn open_input_settings(&mut self, page: SettingsPage, cx: &mut Context<Self>) {
         let privacy = page == SettingsPage::Privacy;
         self.mic.settings_launch_error = None;
+        self.mic.settings_launch_generation += 1;
+        let generation = self.mic.settings_launch_generation;
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_spawn(async move { open_system_settings(privacy) })
                 .await;
             this.update(cx, |app, cx| {
+                if app.mic.settings_launch_generation != generation {
+                    return;
+                }
                 app.mic.settings_launch_error = result.err();
                 cx.notify();
             })

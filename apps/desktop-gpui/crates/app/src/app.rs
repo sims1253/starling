@@ -1598,6 +1598,7 @@ impl StarlingApp {
         self.cancel_mic_check();
         self.mic.check = None;
         self.mic.settings_launch_error = None;
+        self.mic.settings_launch_generation += 1;
         // Shortcut evidence is per dialog: a press heard last time may
         // have been a shortcut that has since changed.
         self.mic.shortcut_heard = None;
@@ -1662,6 +1663,7 @@ impl StarlingApp {
         // dialog; a pending check transcription has nowhere to land.
         self.cancel_mic_check();
         self.mic.check = None;
+        self.mic.settings_launch_generation += 1;
         // B06 (#207): in-flight probes are retired with the dialog — a
         // stray probe has nothing to land in, and the settled outcome
         // dies with the draft it tested. Live state was never theirs to
