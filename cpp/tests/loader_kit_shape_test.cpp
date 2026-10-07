@@ -16,6 +16,13 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <vector>
+#ifdef _WIN32
+#include <process.h>
+#define getpid _getpid
+#else
+#include <unistd.h>
+#endif
 
 static int failures = 0;
 
@@ -30,7 +37,9 @@ static bool contains(const std::string& hay, const char* needle) {
 }
 
 int main() {
-    const char* path = "/tmp/loader_kit_shape_test.gguf";
+    // Unique path per process so parallel test runs cannot collide.
+    char path[256];
+    std::snprintf(path, sizeof path, "/tmp/loader_kit_shape_test_%d.gguf", (int) getpid());
     std::remove(path);
 
     // Tensors: ne=[8] (1-dim), ne=[6,1] (2-dim whose trailing dim is 1, so
@@ -92,10 +101,20 @@ int main() {
           "want {8,2} still rejected against ne=[8]", err);
 
     // --- GGML_MAX_DIMS caller-bug guard --------------------------------------
-    err.clear();
-    check(!shape_eq(m, "TEST", "t.two_dim", {3, 4, 2, 1, 5}, err) &&
-              contains(err, "shape_eq: wanted 5 dims (max 4)"),
-          "want beyond GGML_MAX_DIMS fails with dedicated error", err);
+    // Derived from the macro so a build with a different GGML_MAX_DIMS still
+    // exercises the guard instead of failing on a hardcoded "max 4".
+    {
+        std::vector<int64_t> too_many((size_t) GGML_MAX_DIMS + 1, 1);
+        too_many[0] = 3;
+        too_many[1] = 4;
+        const std::string want_msg = "shape_eq: wanted " +
+            std::to_string(too_many.size()) + " dims (max " +
+            std::to_string(GGML_MAX_DIMS) + ")";
+        err.clear();
+        check(!shape_eq(m, "TEST", "t.two_dim", too_many, err) &&
+                  contains(err, want_msg.c_str()),
+              "want beyond GGML_MAX_DIMS fails with dedicated error", err);
+    }
 
     // --- missing tensor -----------------------------------------------------
     err.clear();
@@ -113,7 +132,14 @@ int main() {
               contains(err, "expected [9]") &&
               !contains(err, "expected [9,1]"),
           "mismatch error prints the TRIMMED want (no trailing 1)", err);
+    // Multi-dim value mismatch: pins the got/want printing loop (which
+    // indexes the want list) against silent rewording regressions.
+    err.clear();
+    check(!shape_eq(m, "TEST", "t.two_dim", {3, 5}, err) &&
+              contains(err, "TEST GGUF tensor t.two_dim has ne=[3,4], expected [3,5]"),
+          "multi-dim mismatch error wording pinned (ne + want)", err);
 
+    std::remove(path);
     std::printf("%s\n", failures ? "LOADER KIT SHAPE TEST FAILED" : "LOADER KIT SHAPE TEST OK");
     return failures ? 1 : 0;
 }

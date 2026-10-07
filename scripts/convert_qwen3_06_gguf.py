@@ -250,14 +250,19 @@ def main() -> None:
     if int(top_cfg.get("audio_token_id", 151676)) != 151676:
         _fail(f"config.json audio_token_id {top_cfg['audio_token_id']} != baked 151676")
     for key, want in (("eos_token_id", 151645), ("pad_token_id", 151645)):
-        got = gen_cfg.get(key, top_cfg.get(key, want))
-        if isinstance(got, (list, tuple)):
-            # Pinned checkpoints list several EOS ids ([151643, 151645]): the
-            # established stop must belong to the set, not equal the first.
-            if int(want) not in {int(v) for v in got}:
-                _fail(f"snapshot {key} {list(got)} lacks baked {want}")
-        elif int(got) != want:
-            _fail(f"snapshot {key} {got} != baked {want}")
+        # Either source may store a scalar or a list (pinned checkpoints list
+        # several EOS ids, e.g. [151643, 151645], in either file); normalize
+        # both before comparing so a future list-typed top-level config.json
+        # gets the readable drift error instead of an unhandled TypeError.
+        # The established stop must belong to the set, not equal the first.
+        raw = gen_cfg.get(key, top_cfg.get(key, want))
+        vals = list(raw) if isinstance(raw, (list, tuple)) else [raw]
+        try:
+            ids = {int(v) for v in vals}
+        except (TypeError, ValueError):
+            _fail(f"snapshot {key} {raw!r} is not an int id list (baked {want})")
+        if int(want) not in ids:
+            _fail(f"snapshot {key} {list(vals)} lacks baked {want}")
     baked_ids = [151676, 151645, *PROMPT_PREFIX, *PROMPT_SUFFIX]
     valid_ids = set(tok_vocab.values()) | added_ids
     missing = sorted(i for i in baked_ids if i not in valid_ids)

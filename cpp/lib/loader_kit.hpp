@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <initializer_list>
 #include <string>
+#include <vector>
 
 namespace starling::ggml::lib {
 
@@ -91,8 +92,11 @@ inline bool check_gguf_header(const ModelLoader& m, const char* arch, const char
 // ggml exposes ne innermost-first). `label` names the model in the error
 // ("QWEN3"/"VOXTRAL"/...); presence errors read
 // "<label> GGUF missing required tensor: <name>".
+// The vector overload is the implementation; the initializer_list overload
+// forwards to it (tests build macro-derived want lists that an
+// initializer_list cannot express).
 inline bool shape_eq(const ModelLoader& m, const char* label, const char* name,
-                     std::initializer_list<int64_t> want, std::string& err) {
+                     const std::vector<int64_t>& want, std::string& err) {
     ggml_tensor* t = m.tensor(name);
     if (!t) {
         err = std::string(label) + " GGUF missing required tensor: " + name;
@@ -134,13 +138,18 @@ inline bool shape_eq(const ModelLoader& m, const char* label, const char* name,
         }
         for (int i2 = 0; i2 < n_want; ++i2) {
             if (i2) want_s += ",";
-            want_s += std::to_string(want.begin()[i2]);
+            want_s += std::to_string(want[(size_t) i2]);
         }
         err = std::string(label) + " GGUF tensor " + name + " has ne=[" + got +
               "], expected [" + want_s + "]";
         return false;
     }
     return true;
+}
+
+inline bool shape_eq(const ModelLoader& m, const char* label, const char* name,
+                     std::initializer_list<int64_t> want, std::string& err) {
+    return shape_eq(m, label, name, std::vector<int64_t>(want), err);
 }
 
 } // namespace starling::ggml::lib
