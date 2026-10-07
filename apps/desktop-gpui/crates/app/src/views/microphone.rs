@@ -287,8 +287,10 @@ fn render_check(app: &mut StarlingApp, cx: &mut Context<StarlingApp>) -> Div {
     let body: Div = match app.mic.check.as_ref() {
         None => note(
             "Records a few seconds from the selection above (before saving), shows the level, \
-             and transcribes it here. Nothing is saved to history, processed or typed into \
-             another app. Optional — you can record normally without it.",
+             and transcribes it here. Like a normal take, non-silent audio is sent to your \
+             transcription engine (the bundled engine on this machine, or your own server in \
+             manual mode) for this preview. Nothing is saved to history or typed into another \
+             app. Optional — you can record normally without it.",
         ),
         Some(MicCheck::Blocked(reason)) => note(*reason),
         Some(MicCheck::Recording {

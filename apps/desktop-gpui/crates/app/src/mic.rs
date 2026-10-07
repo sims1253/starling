@@ -368,6 +368,18 @@ pub(crate) fn candidate_verdict(progress: CandidateProgress) -> CandidateVerdict
     }
 }
 
+/// What the one final `try_wait` after the launch wait ran out proves
+/// (#222): `Some(success)` is a real exit — non-zero right at the
+/// deadline fails like any other non-zero exit — while `None` (still
+/// running) keeps the waited-out verdict that counts as opened. Pure,
+/// so the deadline's last look is unit-tested like `candidate_verdict`.
+fn final_candidate_progress(exited: Option<bool>) -> CandidateProgress {
+    match exited {
+        Some(success) => CandidateProgress::Exited { success },
+        None => CandidateProgress::Running { waited_out: true },
+    }
+}
+
 /// Tries each settings candidate in order. A candidate that spawns but
 /// exits non-zero within [`SETTINGS_LAUNCH_WAIT`] (a wrong-desktop
 /// launcher, e.g. `gnome-control-center` outside GNOME) moves on to the
@@ -393,12 +405,24 @@ fn open_system_settings(privacy: bool) -> Result<(), String> {
                 Ok(Some(status)) => CandidateProgress::Exited {
                     success: status.success(),
                 },
-                Ok(None) => CandidateProgress::Running {
-                    waited_out: Instant::now() >= deadline,
+                Ok(None) if Instant::now() < deadline => CandidateProgress::Running {
+                    waited_out: false,
                 },
+                // The wait ran out and it looked running: one last look
+                // (#222) — a launcher exiting non-zero right at the
+                // deadline failed, and the next candidate must get its
+                // turn instead of trusting the earlier "still running".
+                Ok(None) => final_candidate_progress(
+                    child.try_wait().ok().flatten().map(|status| status.success()),
+                ),
                 // The status itself is unreadable: this candidate
-                // counts as failed, like a non-zero exit.
-                Err(_) => CandidateProgress::Exited { success: false },
+                // counts as failed, like a non-zero exit — killed and
+                // reaped, so it cannot linger as a zombie (#222).
+                Err(_) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    CandidateProgress::Exited { success: false }
+                }
             };
             match candidate_verdict(progress) {
                 CandidateVerdict::Opened => {
@@ -420,6 +444,13 @@ fn open_system_settings(privacy: bool) -> Result<(), String> {
             .map(|(program, _)| *program)
             .collect::<Vec<_>>(),
     ))
+}
+
+/// Whether a capture window counts as sound (#222): a peak at or
+/// above the digital-silence floor. Pure, so the silence evidence's
+/// threshold is unit-tested without a device.
+fn window_is_audible(samples: &[f32]) -> bool {
+    SignalLevel::measure(samples).peak >= microphone::SILENT_PEAK
 }
 
 /// The interruption a live recorder is under. A stall only counts once
@@ -735,9 +766,20 @@ impl StarlingApp {
     /// Timer-driven microphone upkeep (#222), run from the activation
     /// loop (`poll_activation`) every 20–50 ms instead of from render: a
     /// hidden or minimized window stops rendering, and a dead input
-    /// must not stay "recording" nor a check run past its limit. Render
-    /// keeps only what rendering needs — the meter fill and the frames.
+    /// must not stay "recording", nor a check run past its limit, nor a
+    /// healthy input look silent because the render-side sound stamp
+    /// went stale while hidden. Render keeps only what rendering needs
+    /// — the meter fill and the frames.
     pub(crate) fn poll_microphone(&mut self, cx: &mut Context<Self>) {
+        if let Some(handle) = self.recorder.as_ref() {
+            // #222: `last_sound_at` is stamped here, on the timer, so a
+            // window hidden mid-take and restored cannot briefly claim
+            // "No sound from the microphone." for a healthy input —
+            // render's own stoppage is not the input's silence.
+            if window_is_audible(&handle.latest_window(1_024)) {
+                self.mic.last_sound_at = Some(Instant::now());
+            }
+        }
         if self.recording_take.is_some() {
             self.end_interrupted_take(cx);
         }
@@ -951,5 +993,48 @@ mod tests {
             candidate_verdict(Running { waited_out: false }),
             CandidateVerdict::KeepWaiting
         );
+    }
+
+    #[test]
+    fn a_non_zero_exit_at_the_deadline_still_fails_the_candidate() {
+        // #222: the waited-out verdict must rest on a final `try_wait`,
+        // not on the earlier "still running" — a launcher exiting
+        // non-zero right at the deadline failed, so the next candidate
+        // gets its turn; exit 0 or still running counts as opened.
+        use CandidateProgress::{Exited, Running};
+        assert_eq!(
+            final_candidate_progress(Some(false)),
+            Exited { success: false }
+        );
+        assert_eq!(
+            final_candidate_progress(Some(true)),
+            Exited { success: true }
+        );
+        assert_eq!(
+            final_candidate_progress(None),
+            Running { waited_out: true }
+        );
+        // Composition: only the non-zero exit at the deadline diverges
+        // from the plain waited-out "opened".
+        assert_eq!(
+            candidate_verdict(final_candidate_progress(Some(false))),
+            CandidateVerdict::TryNext
+        );
+        assert_eq!(
+            candidate_verdict(final_candidate_progress(None)),
+            CandidateVerdict::Opened
+        );
+    }
+
+    #[test]
+    fn a_window_counts_as_sound_at_or_above_the_silence_floor() {
+        // #222: the timer loop stamps `last_sound_at` from its own
+        // window through this threshold, so a hidden window's stopped
+        // rendering can never read as the input's silence.
+        assert!(!window_is_audible(&[]));
+        assert!(!window_is_audible(&[0.0; 64]));
+        assert!(window_is_audible(&[0.0, 0.5, 0.0]));
+        assert!(window_is_audible(&[0.0, microphone::SILENT_PEAK]));
+        assert!(!window_is_audible(&[0.0, microphone::SILENT_PEAK * 0.5]));
     }
 }

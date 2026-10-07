@@ -2475,21 +2475,17 @@ impl Render for StarlingApp {
                 }
             }
             let window_samples = handle.latest_window(1024);
-            // #222: recent sound, so a take whose input went silent after
-            // speech stops claiming to listen.
-            if starling_dictation::microphone::SignalLevel::measure(&window_samples).peak
-                >= starling_dictation::microphone::SILENT_PEAK
-            {
-                self.mic.last_sound_at = Some(Instant::now());
-            }
             let magnitudes = fft::magnitude_spectrum(&window_samples);
             self.levels = fft::waveform_levels(&magnitudes, 52);
             self.elapsed_ms = handle.elapsed().as_secs_f64() * 1000.0;
-            // The input-loss watchdog and the mic check's limit are not
-            // here: they run on the timer loop (`poll_microphone` from
+            // The input-loss watchdog, the mic check's limit and the
+            // silence evidence (`last_sound_at`) are not here: they run
+            // on the timer loop (`poll_microphone` from
             // `poll_activation`), which keeps running while a hidden or
-            // minimized window renders nothing (#222). Render keeps only
-            // what rendering needs — the meter, the levels, the frames.
+            // minimized window renders nothing (#222) — render's own
+            // stoppage must not read as the input's silence on restore.
+            // Render keeps only what rendering needs — the meter, the
+            // levels, the frames.
             window.request_animation_frame();
         }
         self.tick_mic_check(window);
