@@ -273,13 +273,16 @@ fn render_check(app: &mut StarlingApp, cx: &mut Context<StarlingApp>) -> Div {
              this window has focus."
         ),
     };
-    let heard = app
-        .mic
-        .shortcut_heard
-        .map(|at| format!("✓ {shortcut} received {:.0} s ago.", at.elapsed().as_secs_f32()))
-        .unwrap_or_else(|| {
-            format!("Press {shortcut} now to check it arrives (it does not record while Settings is open).")
-        });
+    // Static on purpose (#222): a running "N s ago" would only stay
+    // true if something re-rendered, and nothing schedules that while
+    // the dialog just sits open.
+    let heard = if app.mic.shortcut_heard.is_some() {
+        format!("✓ {shortcut} was received while this dialog was open.")
+    } else {
+        format!(
+            "Press {shortcut} now to check it arrives (it does not record while Settings is open)."
+        )
+    };
 
     let body: Div = match app.mic.check.as_ref() {
         None => note(

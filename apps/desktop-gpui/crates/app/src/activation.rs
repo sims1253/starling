@@ -745,15 +745,24 @@ impl StarlingApp {
 
     /// One loop turn: system-wide events in arrival order, then timers.
     /// Returns how long the loop waits before its next turn: the fast
-    /// [`POLL_INTERVAL`] while a take is active or the shortcut key is
+    /// [`POLL_INTERVAL`] while a take is active, the shortcut key is
     /// down (the press/release pair and the repeats arrive as a stream
-    /// then), and the slower [`IDLE_POLL_INTERVAL`] once the machine
-    /// idles — which costs nothing but idle start latency, since the
-    /// timers act on the events' receive timestamps, not on the poll's.
+    /// then), or the settings dialog's microphone check is recording
+    /// (its time limit is enforced here), and the slower
+    /// [`IDLE_POLL_INTERVAL`] once the machine idles — which costs
+    /// nothing but idle start latency, since the timers act on the
+    /// events' receive timestamps, not on the poll's.
     pub(crate) fn poll_activation(&mut self, cx: &mut Context<Self>) -> Duration {
         self.flush_system_events(cx);
         self.activation_input(|machine| machine.tick(Instant::now()), cx);
-        if self.activation.is_active() || self.activation.key_is_down() {
+        // #222: microphone health (the live-take input-loss watchdog and
+        // the mic check's limit) is timer-driven, not render-driven — a
+        // hidden window stops rendering but must not stop these.
+        self.poll_microphone(cx);
+        if self.activation.is_active()
+            || self.activation.key_is_down()
+            || self.mic_check_recording()
+        {
             POLL_INTERVAL
         } else {
             IDLE_POLL_INTERVAL

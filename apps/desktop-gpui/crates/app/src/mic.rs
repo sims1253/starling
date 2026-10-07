@@ -314,24 +314,108 @@ pub(crate) fn page_label(page: SettingsPage) -> &'static str {
     }
 }
 
+/// How long each settings candidate gets to prove itself (#222): GUI
+/// apps stay running once they open, while a launcher installed for the
+/// wrong desktop exits at once with a non-zero status — a `spawn` that
+/// succeeds is never evidence on its own.
+const SETTINGS_LAUNCH_WAIT: Duration = Duration::from_millis(1_500);
+
+/// The message when no settings app could be opened, naming the programs
+/// actually tried — built from the candidate list, never hard-coded, so
+/// it never claims Linux panels were tried on macOS/Windows (#222).
+pub(crate) fn settings_launch_failure(programs: &[&str]) -> String {
+    format!(
+        "No sound settings app could be opened (tried {}). Open your desktop's sound \
+         settings yourself to check the input.",
+        programs.join(", ")
+    )
+}
+
+/// What `try_wait` reported about one settings candidate inside its
+/// grace period (#222): the process exited (with its success flag), or
+/// it is still running and `waited_out` says whether
+/// [`SETTINGS_LAUNCH_WAIT`] has already elapsed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CandidateProgress {
+    Exited { success: bool },
+    Running { waited_out: bool },
+}
+
+/// What one launch attempt proved (#222). Pure over the exit outcome,
+/// so the fallback order is unit-tested without spawning anything.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CandidateVerdict {
+    /// Exited 0 (a handing-off launcher) or still running past the wait:
+    /// the settings app opened — let it run, take no further candidate.
+    Opened,
+    /// Exited non-zero inside the wait (a wrong-desktop launcher) or an
+    /// unreadable status: this candidate failed — try the next.
+    TryNext,
+    /// Still running inside the wait: poll again.
+    KeepWaiting,
+}
+
+pub(crate) fn candidate_verdict(progress: CandidateProgress) -> CandidateVerdict {
+    match progress {
+        CandidateProgress::Exited { success: true } => CandidateVerdict::Opened,
+        CandidateProgress::Exited { success: false } => CandidateVerdict::TryNext,
+        CandidateProgress::Running { waited_out: true } => CandidateVerdict::Opened,
+        CandidateProgress::Running { waited_out: false } => CandidateVerdict::KeepWaiting,
+    }
+}
+
+/// Tries each settings candidate in order. A candidate that spawns but
+/// exits non-zero within [`SETTINGS_LAUNCH_WAIT`] (a wrong-desktop
+/// launcher, e.g. `gnome-control-center` outside GNOME) moves on to the
+/// next; one still running after the wait, or exited 0, counts as
+/// opened. Blocking for up to ~1.5 s per failing candidate, so it runs
+/// off the UI thread (`open_input_settings`).
 fn open_system_settings(privacy: bool) -> Result<(), String> {
-    for (program, args) in settings_commands(privacy) {
-        if std::process::Command::new(program)
-            .args(&args)
+    let commands = settings_commands(privacy);
+    for (program, args) in &commands {
+        let Ok(mut child) = std::process::Command::new(program)
+            .args(args)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
-            .is_ok()
-        {
-            return Ok(());
+        else {
+            // Not installed: the next candidate.
+            continue;
+        };
+        let deadline = Instant::now() + SETTINGS_LAUNCH_WAIT;
+        loop {
+            let progress = match child.try_wait() {
+                Ok(Some(status)) => CandidateProgress::Exited {
+                    success: status.success(),
+                },
+                Ok(None) => CandidateProgress::Running {
+                    waited_out: Instant::now() >= deadline,
+                },
+                // The status itself is unreadable: this candidate
+                // counts as failed, like a non-zero exit.
+                Err(_) => CandidateProgress::Exited { success: false },
+            };
+            match candidate_verdict(progress) {
+                CandidateVerdict::Opened => {
+                    // Reap it whenever it exits, so a settings app the
+                    // user closes later never lingers as a zombie.
+                    std::thread::spawn(move || {
+                        let _ = child.wait();
+                    });
+                    return Ok(());
+                }
+                CandidateVerdict::TryNext => break,
+                CandidateVerdict::KeepWaiting => std::thread::sleep(Duration::from_millis(50)),
+            }
         }
     }
-    Err(
-        "No sound settings app was found (tried GNOME Settings, KDE System Settings and \
-         pavucontrol). Open your desktop's sound settings to check the input."
-            .to_string(),
-    )
+    Err(settings_launch_failure(
+        &commands
+            .iter()
+            .map(|(program, _)| *program)
+            .collect::<Vec<_>>(),
+    ))
 }
 
 /// The interruption a live recorder is under. A stall only counts once
@@ -344,6 +428,15 @@ pub(crate) fn live_interruption(handle: &RecorderHandle) -> Option<Interruption>
         Duration::ZERO
     };
     take_interruption(handle.capture_fault().as_ref(), stalled_for)
+}
+
+/// The mic check's stop decision, pure so it can be tested: its time
+/// limit ([`CHECK_MAX`]), or an input that died mid-check
+/// ([`live_interruption`]'s verdict). Called from the timer loop
+/// (`poll_microphone`), not render, so a hidden window cannot let a
+/// check run past its limit (#222).
+pub(crate) fn check_should_stop(elapsed: Duration, interruption: Option<Interruption>) -> bool {
+    elapsed >= CHECK_MAX || interruption.is_some()
 }
 
 impl StarlingApp {
@@ -402,9 +495,10 @@ impl StarlingApp {
         true
     }
 
-    /// The live-take watchdog (render loop): a device that failed or
-    /// stopped delivering ends the take as interrupted, its audio kept,
-    /// instead of the pane presenting a dead input as listening.
+    /// The live-take watchdog (the timer loop's `poll_microphone`, so a
+    /// hidden window cannot pause it): a device that failed or stopped
+    /// delivering ends the take as interrupted, its audio kept, instead
+    /// of the pane presenting a dead input as listening.
     pub(crate) fn end_interrupted_take(&mut self, cx: &mut Context<Self>) {
         let Some(take) = self.recording_take else {
             return;
@@ -445,9 +539,24 @@ impl StarlingApp {
     }
 
     /// Opens the OS sound settings (or the microphone privacy page).
+    /// Launched off the UI thread (#222): a failing candidate takes up
+    /// to [`SETTINGS_LAUNCH_WAIT`] to prove it failed, and several may
+    /// be tried before one opens.
     pub(crate) fn open_input_settings(&mut self, page: SettingsPage, cx: &mut Context<Self>) {
-        self.mic.settings_launch_error = open_system_settings(page == SettingsPage::Privacy).err();
+        let privacy = page == SettingsPage::Privacy;
+        self.mic.settings_launch_error = None;
         cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move { open_system_settings(privacy) })
+                .await;
+            this.update(cx, |app, cx| {
+                app.mic.settings_launch_error = result.err();
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Starts the microphone check on the dialog's draft choice, through
@@ -498,9 +607,12 @@ impl StarlingApp {
             .as_ref()
             .map(|route| route.device.clone())
             .unwrap_or_else(|| "The microphone".to_string());
-        let mut interruption =
-            take_interruption(handle.capture_fault().as_ref(), handle.input_stalled_for())
-                .map(|interruption| interruption.describe(&device));
+        // `live_interruption`, not raw `take_interruption`: a stall only
+        // counts once audio first arrived, so a device slow to deliver
+        // its first buffer (Bluetooth) is never reported as "stopped
+        // delivering" — a take that delivered nothing reaches the
+        // silence/empty handling below instead (#222).
+        let mut interruption = live_interruption(&handle).map(|i| i.describe(&device));
         let stopped = handle.stop();
         let audio = match stopped {
             Ok(take) => {
@@ -598,21 +710,45 @@ impl StarlingApp {
         .detach();
     }
 
-    /// Per-frame check upkeep while it records: the level meter, the
-    /// time limit, and a device that dies mid-check.
-    pub(crate) fn tick_mic_check(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Per-frame check upkeep while it records: the level meter only.
+    /// The time limit and the mid-check interruption decision run on the
+    /// timer loop (`poll_microphone`), which does not pause when a
+    /// hidden or minimized window stops rendering (#222).
+    pub(crate) fn tick_mic_check(&mut self, window: &mut Window) {
         let Some(MicCheck::Recording { handle, meter }) = self.mic.check.as_mut() else {
             return;
         };
         let level = SignalLevel::measure(&handle.latest_window(1_024));
         *meter = microphone::meter_fill(level.rms_dbfs());
-        let done = handle.elapsed() >= CHECK_MAX
-            || take_interruption(handle.capture_fault().as_ref(), handle.input_stalled_for())
-                .is_some();
-        if done {
-            cx.defer_in(window, |app, _window, cx| app.stop_mic_check(cx));
-        }
         window.request_animation_frame();
+    }
+
+    /// Timer-driven microphone upkeep (#222), run from the activation
+    /// loop (`poll_activation`) every 20–50 ms instead of from render: a
+    /// hidden or minimized window stops rendering, and a dead input
+    /// must not stay "recording" nor a check run past its limit. Render
+    /// keeps only what rendering needs — the meter fill and the frames.
+    pub(crate) fn poll_microphone(&mut self, cx: &mut Context<Self>) {
+        if self.recording_take.is_some() {
+            self.end_interrupted_take(cx);
+        }
+        let stop_check = match self.mic.check.as_ref() {
+            Some(MicCheck::Recording { handle, .. }) => {
+                check_should_stop(handle.elapsed(), live_interruption(handle))
+            }
+            _ => false,
+        };
+        if stop_check {
+            self.stop_mic_check(cx);
+        }
+    }
+
+    /// Whether the settings dialog's check is recording right now: the
+    /// activation loop keeps its fast interval then, so the check's time
+    /// limit is enforced on time and not only when a window renders
+    /// (#222). It never stops the loop from polling.
+    pub(crate) fn mic_check_recording(&self) -> bool {
+        matches!(self.mic.check, Some(MicCheck::Recording { .. }))
     }
 
     /// The record shortcut fired while the dialog is open: it never
@@ -741,5 +877,70 @@ mod tests {
     fn every_platform_has_a_settings_command_to_try() {
         assert!(!settings_commands(false).is_empty());
         assert!(!settings_commands(true).is_empty());
+    }
+
+    #[test]
+    fn the_check_stops_at_its_limit_or_an_interruption() {
+        // #222: the decision is timer-driven (`poll_microphone`), so it
+        // must not need a window: pure elapsed-vs-limit plus the
+        // interruption verdict.
+        assert!(!check_should_stop(
+            CHECK_MAX - Duration::from_millis(1),
+            None
+        ));
+        assert!(check_should_stop(CHECK_MAX, None));
+        assert!(check_should_stop(
+            Duration::ZERO,
+            Some(Interruption::DeviceFailed("unplugged".to_string()))
+        ));
+        assert!(check_should_stop(
+            Duration::ZERO,
+            Some(Interruption::Stalled(STALL_LIMIT))
+        ));
+    }
+
+    #[test]
+    fn the_settings_failure_message_names_the_programs_actually_tried() {
+        // #222: built from the candidate list, never hard-coded — a
+        // macOS/Windows build must not claim Linux panels were tried.
+        let message = settings_launch_failure(&["gnome-control-center", "pavucontrol"]);
+        assert!(message.contains("gnome-control-center"), "{message}");
+        assert!(message.contains("pavucontrol"), "{message}");
+        let programs: Vec<&str> = settings_commands(true)
+            .iter()
+            .map(|(program, _)| *program)
+            .collect();
+        let per_platform = settings_launch_failure(&programs);
+        for program in &programs {
+            assert!(per_platform.contains(program), "{per_platform}");
+        }
+    }
+
+    #[test]
+    fn a_wrong_desktop_launcher_moves_on_but_a_running_one_counts_as_opened() {
+        // #222: a successful `spawn` is never evidence on its own — the
+        // decision is what `try_wait` shows inside the grace period.
+        use CandidateProgress::{Exited, Running};
+        // gnome-control-center outside GNOME: starts, exits non-zero at
+        // once — the next candidate must get its turn.
+        assert_eq!(
+            candidate_verdict(Exited { success: false }),
+            CandidateVerdict::TryNext
+        );
+        // A handing-off launcher runs to completion: opened.
+        assert_eq!(
+            candidate_verdict(Exited { success: true }),
+            CandidateVerdict::Opened
+        );
+        // Still running once the wait ran out: opened (never killed).
+        assert_eq!(
+            candidate_verdict(Running { waited_out: true }),
+            CandidateVerdict::Opened
+        );
+        // Still inside the wait: keep polling, decide nothing yet.
+        assert_eq!(
+            candidate_verdict(Running { waited_out: false }),
+            CandidateVerdict::KeepWaiting
+        );
     }
 }

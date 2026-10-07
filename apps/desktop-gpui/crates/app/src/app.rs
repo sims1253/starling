@@ -2483,15 +2483,14 @@ impl Render for StarlingApp {
             let magnitudes = fft::magnitude_spectrum(&window_samples);
             self.levels = fft::waveform_levels(&magnitudes, 52);
             self.elapsed_ms = handle.elapsed().as_secs_f64() * 1000.0;
-            // #222: a device that failed or stopped delivering ends the
-            // take as interrupted (its audio kept) instead of the pane
-            // presenting a dead input as listening.
-            if crate::mic::live_interruption(handle).is_some() {
-                cx.defer_in(window, |app, _window, cx| app.end_interrupted_take(cx));
-            }
+            // The input-loss watchdog and the mic check's limit are not
+            // here: they run on the timer loop (`poll_microphone` from
+            // `poll_activation`), which keeps running while a hidden or
+            // minimized window renders nothing (#222). Render keeps only
+            // what rendering needs — the meter, the levels, the frames.
             window.request_animation_frame();
         }
-        self.tick_mic_check(window, cx);
+        self.tick_mic_check(window);
         if let Some(partial) = staged_partial {
             self.staging_partial(partial, cx);
         }

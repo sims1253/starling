@@ -839,10 +839,19 @@ impl CallbackState {
         shared.callback_alive.store(true, Ordering::Release);
         downmix_into(data, self.channels, &mut self.mono);
         shared.clip.observe(&self.mono);
-        let peak = self
-            .mono
-            .iter()
-            .fold(0.0f32, |peak, sample| if sample.abs() > peak { sample.abs() } else { peak });
+        // Non-finite samples never set the peak (#222): +∞ wins the bit
+        // comparison forever (and a NaN's bits sort above every finite
+        // value), so one bad block would silence the silence check for
+        // the rest of the take. `abs` is bound once; the finiteness test
+        // is a bit test — no allocation, lock or call out.
+        let peak = self.mono.iter().fold(0.0f32, |peak, sample| {
+            let magnitude = sample.abs();
+            if magnitude.is_finite() && magnitude > peak {
+                magnitude
+            } else {
+                peak
+            }
+        });
         shared.source_peak.fetch_max(peak.to_bits(), Ordering::Relaxed);
         self.attenuator.process(&mut self.mono);
         shared.push_block(&self.mono);
@@ -2753,6 +2762,27 @@ mod tests {
         let window = handle.latest_window(AUTO_GAIN_BLOCK * 4);
         let stored_peak = window.iter().fold(0.0f32, |peak, s| peak.max(s.abs()));
         assert!(stored_peak < 0.95, "{stored_peak}");
+    }
+
+    #[test]
+    fn source_peak_ignores_non_finite_samples() {
+        // #222: a non-finite sample carries bits that sort above every
+        // finite float, so a single one reaching the fold would win
+        // `fetch_max` for the rest of the take — the input would never
+        // read as silent again. The peak must stay the largest finite
+        // |sample|.
+        let shared = test_shared(8_192);
+        let handle = test_handle(Arc::clone(&shared), 16_000);
+        let mut callback = CallbackState::new(1);
+        let mut poisoned: Vec<f32> = vec![f32::NAN; AUTO_GAIN_BLOCK];
+        poisoned[AUTO_GAIN_BLOCK / 2] = f32::INFINITY;
+        poisoned[AUTO_GAIN_BLOCK / 3] = f32::NEG_INFINITY;
+        callback.process(&poisoned, &shared);
+        let finite: Vec<f32> = (0..AUTO_GAIN_BLOCK)
+            .map(|i| if i % 2 == 0 { 0.5 } else { -0.5 })
+            .collect();
+        callback.process(&finite, &shared);
+        assert!((handle.source_peak() - 0.5).abs() < 1e-6, "{}", handle.source_peak());
     }
 
     #[test]

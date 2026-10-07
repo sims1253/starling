@@ -90,7 +90,11 @@ pub struct Settings {
     pub dictation: DictationSettings,
     /// The microphone choice (#222). A file without the key follows the
     /// system default, which is what every earlier build recorded from.
-    #[serde(default)]
+    /// The subsection is read leniently (like `dictation` above): a
+    /// `null`, a non-object, or a wrong-typed `preferredDevice` resets
+    /// only the microphone choice — never the endpoint, model or
+    /// processing the rest of the file carries.
+    #[serde(default, deserialize_with = "lenient_microphone")]
     pub microphone: MicrophoneSettings,
 }
 
@@ -202,6 +206,42 @@ fn lenient_dictation_value(value: serde_json::Value) -> DictationSettings {
         shortcut: lenient_dictation_field(&value, "shortcut", || DEFAULT_SHORTCUT.to_string()),
         activation: lenient_dictation_field(&value, "activation", ActivationMode::default),
         double_tap_hands_free: lenient_dictation_field(&value, "doubleTapHandsFree", bool::default),
+    }
+}
+
+/// Reads the `microphone` value without ever failing the whole file
+/// (#222), in the shape of [`lenient_dictation`]: a `null` or non-object
+/// is the default, and a `preferredDevice` that is not a string resets
+/// only the microphone choice (to follow the system default) with the
+/// reason logged — the file's other sections load normally.
+fn lenient_microphone<'de, D>(deserializer: D) -> Result<MicrophoneSettings, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = <serde_json::Value as serde::Deserialize>::deserialize(deserializer)?;
+    Ok(lenient_microphone_value(value))
+}
+
+/// The value-wise leniency itself, shared by the `microphone` attribute
+/// and the [`Settings::load`] fallback below — same shape as
+/// [`lenient_dictation_value`].
+fn lenient_microphone_value(value: serde_json::Value) -> MicrophoneSettings {
+    if !value.is_object() {
+        eprintln!("Unreadable microphone settings ({value}); following the system default");
+        return MicrophoneSettings::default();
+    }
+    match value.get("preferredDevice") {
+        None | Some(serde_json::Value::Null) => MicrophoneSettings::default(),
+        Some(serde_json::Value::String(name)) => MicrophoneSettings {
+            preferred_device: Some(name.clone()),
+        },
+        Some(other) => {
+            eprintln!(
+                "Unreadable microphone field `preferredDevice` ({other}); following the \
+                 system default"
+            );
+            MicrophoneSettings::default()
+        }
     }
 }
 
@@ -354,11 +394,12 @@ impl Settings {
         let dictation_subtree = value.get("dictation").cloned();
         // Likewise the preferred microphone (#222): an unreadable field
         // elsewhere must not silently move recording to another device.
-        let preferred_device = value
+        // Read with the same leniency as the field itself.
+        let microphone = value
             .get("microphone")
-            .and_then(|microphone| microphone.get("preferredDevice"))
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string);
+            .cloned()
+            .map(lenient_microphone_value)
+            .unwrap_or_default();
         let Ok(mut settings) = serde_json::from_value::<Settings>(value) else {
             // The same field-wise leniency as the `dictation` attribute:
             // an unreadable sibling key must not cost the user their
@@ -373,7 +414,7 @@ impl Settings {
                 active_model,
                 backend_override,
             };
-            fallback.microphone = MicrophoneSettings { preferred_device };
+            fallback.microphone = microphone;
             fallback.dictation = dictation;
             return Some(fallback);
         };
@@ -792,6 +833,51 @@ mod tests {
             Settings::load(&path).microphone.preferred_device.as_deref(),
             Some("USB Mic")
         );
+    }
+
+    #[test]
+    fn an_unreadable_microphone_key_resets_only_the_microphone_choice() {
+        // #222: a `null`, a non-object, or a wrong-typed `preferredDevice`
+        // must cost only the microphone choice — never the endpoint,
+        // model, terms or dictation settings the rest of the file
+        // carries (the strict read fell back to whole-file defaults).
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("settings.json");
+        for microphone in [
+            serde_json::json!(null),
+            serde_json::json!(5),
+            serde_json::json!({ "preferredDevice": 42 }),
+            serde_json::json!(["USB Mic"]),
+        ] {
+            let raw = serde_json::json!({
+                "endpoint": "http://10.0.0.9:8181",
+                "model": "whisper-large-v3",
+                "expectedTerms": ["auth", "Starling"],
+                "engine": { "mode": "builtin" },
+                "dictation": { "shortcut": "F9", "activation": "hold" },
+                "microphone": microphone,
+            });
+            std::fs::write(&path, raw.to_string()).expect("write");
+            let loaded = Settings::load(&path);
+            assert_eq!(loaded.endpoint, "http://10.0.0.9:8181", "{microphone}");
+            assert_eq!(loaded.model, "whisper-large-v3", "{microphone}");
+            assert_eq!(
+                loaded.expected_terms,
+                vec!["auth".to_string(), "Starling".to_string()],
+                "{microphone}"
+            );
+            assert_eq!(loaded.dictation.shortcut, "F9", "{microphone}");
+            assert_eq!(
+                loaded.dictation.activation,
+                ActivationMode::Hold,
+                "{microphone}"
+            );
+            assert_eq!(
+                loaded.microphone,
+                MicrophoneSettings::default(),
+                "{microphone}"
+            );
+        }
     }
 
     #[test]
