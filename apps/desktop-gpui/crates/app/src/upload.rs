@@ -84,11 +84,11 @@ impl TakeTarget {
         }
     }
 
-    fn endpoint(&self) -> &str {
+    pub(crate) fn endpoint(&self) -> &str {
         &self.endpoint
     }
 
-    fn model(&self) -> &str {
+    pub(crate) fn model(&self) -> &str {
         &self.model
     }
 
@@ -542,8 +542,17 @@ impl StarlingApp {
             // I1 phase 2: production captures journal to the durable
             // per-take file; only fsynced-boundary samples are
             // acknowledged (see recorder::start_recording_with_journal).
-            match recorder::start_recording_with_journal(&journal::default_journals_root()) {
+            // #222: the take opens the preferred microphone, or falls back
+            // to the system default visibly (the route says which).
+            let journals_root = journal::default_journals_root();
+            match recorder::start_capture(recorder::CaptureRequest {
+                journals_dir: Some(&journals_root),
+                preferred_device: self.microphone_settings.preferred_device.as_deref(),
+            }) {
                 Ok(handle) => {
+                    self.mic.problem = None;
+                    self.mic.interruption = None;
+                    self.mic.last_route = handle.input_route().cloned();
                     self.live_partial.clear();
                     if self.staged_mode() {
                         self.begin_staging(cx);
@@ -589,7 +598,15 @@ impl StarlingApp {
                     true
                 }
                 Err(err) => {
-                    self.error = Some(err.to_string());
+                    // #222: missing, refused and failing inputs each get
+                    // their own explanation and recovery actions.
+                    self.error = Some(format!(
+                        "{} {}",
+                        err.problem.message(),
+                        err.problem.recovery()
+                    ));
+                    self.mic.last_route = err.route;
+                    self.mic.problem = Some(err.problem);
                     cx.notify();
                     false
                 }
@@ -723,6 +740,30 @@ impl StarlingApp {
                         .to_string()
                 })
             }
+            CancelReason::InputLost => {
+                let what = self
+                    .mic
+                    .interruption
+                    .take()
+                    .unwrap_or_else(|| "The microphone stopped mid-recording".to_string());
+                let mut lost = format!(
+                    "{what}. Check the microphone (Settings → Microphone can test it or pick \
+                     another), then record again."
+                );
+                if let Some(stop_error) = stop_error.take() {
+                    lost = format!(
+                        "{lost} Stopping it also failed: {}",
+                        stop_error.trim_end_matches('.')
+                    );
+                }
+                self.error = Some(lost);
+                kept.then(|| {
+                    "The recording was interrupted when the microphone stopped. Everything \
+                     captured before that is in your history as an interrupted recording; \
+                     transcribe it from there."
+                        .to_string()
+                })
+            }
         };
         if let Some(stop_error) = stop_error {
             self.error = Some(stop_error);
@@ -741,6 +782,10 @@ impl StarlingApp {
             CancelReason::Escape => "Cancelled with Escape before transcription; the audio was kept.",
             CancelReason::NoAudioYet => "Stopped before the microphone was ready; the audio was kept.",
             CancelReason::MicStalled => "The microphone stalled at the start; the audio was kept.",
+            CancelReason::InputLost => {
+                "The microphone failed or stopped delivering mid-recording; the audio captured \
+                 before that was kept."
+            }
         }
         .to_string();
         cx.spawn(async move |this, cx| {

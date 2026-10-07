@@ -9,10 +9,10 @@
 //! never touches the output device: its transcript only appears in the
 //! dialog's preview.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use gpui::{Context, Window};
+use gpui::{AppContext, Context, Window};
 use starling_dictation::client::StarlingClient;
 use starling_dictation::microphone::{
     self, InputDevice, InputProblem, InputRoute, SignalLevel,
@@ -36,19 +36,6 @@ pub(crate) const CHECK_MAX: Duration = Duration::from_secs(8);
 
 /// How long a check transcription may take before it is reported failed.
 const CHECK_TRANSCRIBE_TIMEOUT_MS: u64 = 60_000;
-
-/// Whether registering the global record shortcut worked, set once by
-/// `main.rs` at startup (`Err` carries the platform's reason).
-pub(crate) static SHORTCUT_REGISTRATION: OnceLock<Result<(), String>> = OnceLock::new();
-
-/// The record shortcut as the UI spells it.
-pub(crate) fn shortcut_label() -> &'static str {
-    if cfg!(target_os = "macos") {
-        "⌘ Shift Space"
-    } else {
-        "Ctrl Shift Space"
-    }
-}
 
 /// What the settings dialog knows about the host's capture devices.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -245,6 +232,9 @@ pub(crate) struct MicState {
     /// The outcome of the last "open sound settings" action, when it
     /// could not open anything.
     pub(crate) settings_launch_error: Option<String>,
+    /// Why the current take is being ended as interrupted, read by the
+    /// cancel path (`CancelReason::InputLost`).
+    pub(crate) interruption: Option<String>,
 }
 
 impl Default for MicState {
@@ -258,6 +248,7 @@ impl Default for MicState {
             last_route: None,
             problem: None,
             settings_launch_error: None,
+            interruption: None,
         }
     }
 }
@@ -309,7 +300,52 @@ fn open_system_settings(privacy: bool) -> Result<(), String> {
     )
 }
 
+/// The interruption a live recorder is under. A stall only counts once
+/// audio has arrived: a take that never delivered is the activation
+/// machine's start stall (`activation::START_STALL`), not a lost input.
+pub(crate) fn live_interruption(handle: &RecorderHandle) -> Option<Interruption> {
+    let stalled_for = if handle.captured_sample_count() > 0 {
+        handle.input_stalled_for()
+    } else {
+        Duration::ZERO
+    };
+    take_interruption(handle.capture_fault().as_ref(), stalled_for)
+}
+
 impl StarlingApp {
+    /// Records why the running take lost its input, if it did; `true`
+    /// when the take must end as interrupted.
+    pub(crate) fn note_live_interruption(&mut self) -> bool {
+        let Some(handle) = self.recorder.as_ref() else {
+            return false;
+        };
+        let Some(interruption) = live_interruption(handle) else {
+            return false;
+        };
+        let device = handle
+            .input_route()
+            .map(|route| route.device.clone())
+            .unwrap_or_else(|| "The microphone".to_string());
+        self.mic.problem = Some(InputProblem::Unavailable {
+            device: device.clone(),
+            detail: "it stopped during the last recording".to_string(),
+        });
+        self.mic.interruption = Some(interruption.describe(&device));
+        true
+    }
+
+    /// The live-take watchdog (render loop): a device that failed or
+    /// stopped delivering ends the take as interrupted, its audio kept,
+    /// instead of the pane presenting a dead input as listening.
+    pub(crate) fn end_interrupted_take(&mut self, cx: &mut Context<Self>) {
+        let Some(take) = self.recording_take else {
+            return;
+        };
+        if self.note_live_interruption() {
+            self.activation_input(|machine| machine.input_lost(take), cx);
+        }
+    }
+
     /// The microphone preference takes resolve against now (committed).
     pub(crate) fn preferred_microphone(&self) -> Option<&str> {
         self.microphone_settings.preferred_device.as_deref()
@@ -596,11 +632,5 @@ mod tests {
     fn every_platform_has_a_settings_command_to_try() {
         assert!(!settings_commands(false).is_empty());
         assert!(!settings_commands(true).is_empty());
-    }
-
-    #[test]
-    fn the_shortcut_label_names_the_platform_modifier() {
-        let label = shortcut_label();
-        assert!(label.ends_with("Shift Space"), "{label}");
     }
 }

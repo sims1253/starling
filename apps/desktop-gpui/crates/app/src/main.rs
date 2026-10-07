@@ -6,6 +6,7 @@ mod assets;
 mod editor;
 mod input;
 mod live_stream;
+mod mic;
 mod processing;
 mod shortcut;
 mod staging;

@@ -1012,9 +1012,6 @@ impl StarlingApp {
             draft_microphone: settings.microphone.preferred_device.clone(),
             microphone_settings: settings.microphone.clone(),
             mic: crate::mic::MicState::default(),
-            draft_microphone: settings.microphone.preferred_device.clone(),
-            microphone_settings: settings.microphone.clone(),
-            mic: crate::mic::MicState::default(),
             quit_hook: None,
             active_take: None,
             endpoint,
@@ -2479,12 +2476,7 @@ impl Render for StarlingApp {
             // #222: a device that failed or stopped delivering ends the
             // take as interrupted (its audio kept) instead of the pane
             // presenting a dead input as listening.
-            if crate::mic::take_interruption(
-                handle.capture_fault().as_ref(),
-                handle.input_stalled_for(),
-            )
-            .is_some()
-            {
+            if crate::mic::live_interruption(handle).is_some() {
                 cx.defer_in(window, |app, _window, cx| app.end_interrupted_take(cx));
             }
             window.request_animation_frame();
