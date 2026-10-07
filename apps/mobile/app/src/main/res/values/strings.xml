@@ -97,5 +97,13 @@
     <string name="recognize_failed">Transcription failed. The recording is kept in Starling Mobile for retry.</string>
     <string name="recognize_no_match">No speech was recognized.</string>
     <string name="recognize_permission_denied">Starling needs microphone permission to listen.</string>
+    <string name="keyboard_recording_loading">Recording… the on-device model is still loading; live text follows once it is ready.</string>
+    <string name="recognize_listening_loading">Listening… the model is still loading. Tap Done when finished.</string>
+    <string name="streaming_loading">Recording… loading the on-device model; live text follows once it is ready.</string>
+    <string name="model_status_loading">Loading the on-device model… you can already record.</string>
+    <!-- The reason comes last, after a separator, so the message reads
+         correctly whether or not the engine's reason ends with punctuation. -->
+    <string name="model_status_failed">Recordings are still saved; you can pick another model or a server in Starling Mobile — %1$s</string>
+    <string name="model_status_driver_failed">The phone\'s GPU driver reported a failure (%1$s). Recordings are still saved; restarting the phone clears it.</string>
     <string name="keyboard_stream_interrupted">Live transcription stopped: %1$s. Transcribing after stop.</string>
 </resources>

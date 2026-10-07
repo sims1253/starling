@@ -86,6 +86,9 @@ class RecognizeSpeechActivity : Activity() {
         doneButton.setOnClickListener { if (activeRecording != null) stopAndTranscribe() else finish() }
         cancelButton.setOnClickListener { cancel() }
         setResult(RESULT_CANCELED)
+        // The popup records at once; loading now also covers the time a
+        // permission prompt is on screen.
+        application.preloadOnDeviceModel()
 
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
             beginCapture()
@@ -135,12 +138,13 @@ class RecognizeSpeechActivity : Activity() {
         val config = application.backendSettings.load()
         captureConfig = config
         var session: StreamSession? = null
-        session = application.transcription.beginStreaming(config) { event ->
+        val savedAudio = application.recordings.partialFile(recording)
+        session = application.transcription.beginStreaming(config, savedAudio) { event ->
             if (streamSession === session) onStreamEvent(event)
         }
         val error = capture.start(
             this,
-            application.recordings.partialFile(recording),
+            savedAudio,
             onChunk = session?.let { streaming -> AudioChunkListener { bytes, count -> streaming.onAudio(bytes, count) } },
         )
         if (error != null) {
@@ -151,13 +155,14 @@ class RecognizeSpeechActivity : Activity() {
         }
         activeRecording = recording
         streamSession = session
-        statusView.setText(R.string.recognize_listening)
+        val loading = session != null && application.isOnDeviceModelLoading(config)
+        statusView.setText(if (loading) R.string.recognize_listening_loading else R.string.recognize_listening)
     }
 
     private fun onStreamEvent(event: StreamEvent) {
         if (isDestroyed || isFinishing) return
         when (event) {
-            StreamEvent.Live -> Unit
+            StreamEvent.Live -> if (activeRecording != null) statusView.setText(R.string.recognize_listening)
             is StreamEvent.Partial -> {
                 partialView.visibility = View.VISIBLE
                 partialView.text = event.text
@@ -169,8 +174,11 @@ class RecognizeSpeechActivity : Activity() {
                     partialView.scrollTo(0, maxOf(0, bottom))
                 }
             }
-            // The stop path falls back to the batch transcription of the WAV.
-            is StreamEvent.Interrupted -> Unit
+            // The stop path falls back to the batch transcription of the WAV;
+            // the status must not keep claiming the model is loading.
+            is StreamEvent.Interrupted -> if (activeRecording != null) {
+                statusView.text = getString(R.string.keyboard_stream_interrupted, event.reason)
+            }
         }
     }
 

@@ -82,12 +82,13 @@ class StarlingRecognitionService : RecognitionService() {
         // The live stream is an observer of the capture: null means this
         // configuration captures for the ordinary batch transcription.
         val config = application.backendSettings.load()
-        val session = application.transcription.beginStreaming(config) { event ->
+        val savedAudio = application.recordings.partialFile(recording)
+        val session = application.transcription.beginStreaming(config, savedAudio) { event ->
             onStreamEvent(callback, event)
         }
         val error = capture.start(
             captureContext,
-            application.recordings.partialFile(recording),
+            savedAudio,
             onChunk = session?.let { streaming ->
                 AudioChunkListener { bytes, count -> streaming.onAudio(bytes, count) }
             },

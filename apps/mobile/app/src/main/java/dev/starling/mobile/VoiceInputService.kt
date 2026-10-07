@@ -20,8 +20,10 @@ import dev.starling.mobile.audio.CaptureResult
 import dev.starling.mobile.data.Recording
 import dev.starling.mobile.data.RecordingStatus
 import dev.starling.mobile.data.TranscriptionProvenance
+import dev.starling.mobile.engine.ModelLifetime
 import dev.starling.mobile.network.StreamEvent
 import dev.starling.mobile.network.StreamSession
+import dev.starling.mobile.network.TranscriptionEngine
 import dev.starling.mobile.ui.InputTargetGuard
 import dev.starling.mobile.ui.RequestGenerationGuard
 
@@ -51,6 +53,8 @@ class VoiceInputService : InputMethodService() {
     private var insertButton: Button? = null
     private var statusView: TextView? = null
     private var transcriptView: TextView? = null
+    private var modelStatusView: TextView? = null
+    private val modelStateListener: (ModelLifetime.State) -> Unit = { renderModelState(it) }
     private var activeRecording: Recording? = null
     private var recordingTarget: InputTargetGuard.Snapshot<InputConnection>? = null
     private var activeRequestGeneration = 0L
@@ -72,6 +76,7 @@ class VoiceInputService : InputMethodService() {
 
     override fun onCreate() {
         super.onCreate()
+        application.modelLifetime.addListener(modelStateListener)
     }
 
     override fun onCreateInputView(): View {
@@ -88,6 +93,8 @@ class VoiceInputService : InputMethodService() {
         insertButton = view.findViewById(R.id.keyboard_insert_button)
         statusView = view.findViewById(R.id.keyboard_status)
         transcriptView = view.findViewById(R.id.keyboard_transcript)
+        modelStatusView = view.findViewById(R.id.keyboard_model_status)
+        renderModelState(application.modelLifetime.state())
 
         recordButton?.setOnClickListener {
             if (activeRecording == null) requestOrStartRecording() else stopAndQueueRecording()
@@ -112,6 +119,17 @@ class VoiceInputService : InputMethodService() {
         renderIdle()
     }
 
+    /**
+     * The keyboard is on screen: the user is likely about to dictate, so the
+     * selected local model starts loading (or stays warm) now rather than at
+     * the Record tap. Deduplicated and off the main thread (ModelLifetime).
+     */
+    override fun onStartInputView(info: EditorInfo?, restarting: Boolean) {
+        super.onStartInputView(info, restarting)
+        application.preloadOnDeviceModel()
+        renderModelState(application.modelLifetime.state())
+    }
+
     override fun onFinishInput() {
         if (activeRecording != null) stopAndQueueRecording()
         targetGuard.targetFinished()
@@ -123,6 +141,7 @@ class VoiceInputService : InputMethodService() {
     }
 
     override fun onDestroy() {
+        application.modelLifetime.removeListener(modelStateListener)
         if (activeRecording != null) stopAndQueueRecording()
         super.onDestroy()
     }
@@ -155,14 +174,15 @@ class VoiceInputService : InputMethodService() {
         // configuration records in the plain batch mode.
         val config = application.backendSettings.load()
         var session: StreamSession? = null
-        session = application.transcription.beginStreaming(config) { event ->
+        val savedAudio = application.recordings.partialFile(recording)
+        session = application.transcription.beginStreaming(config, savedAudio) { event ->
             // Events from a superseded session must not touch the state of
             // the recording that replaced it.
             if (streamSession === session) onStreamEvent(event)
         }
         val error = capture.start(
             this,
-            application.recordings.partialFile(recording),
+            savedAudio,
             onChunk = session?.let { streaming ->
                 AudioChunkListener { bytes, count -> streaming.onAudio(bytes, count) }
             },
@@ -184,8 +204,30 @@ class VoiceInputService : InputMethodService() {
         insertButton?.visibility = View.GONE
         recordButton?.setText(R.string.keyboard_stop)
         statusView?.setText(
-            if (session == null) R.string.keyboard_recording else R.string.keyboard_streaming,
+            when {
+                session == null -> R.string.keyboard_recording
+                // Audio is already being saved; live text follows the load.
+                application.isOnDeviceModelLoading(config) -> R.string.keyboard_recording_loading
+                else -> R.string.keyboard_streaming
+            },
         )
+    }
+
+    /** Shows where the on-device model stands; hidden when it is ready or unused. */
+    private fun renderModelState(state: ModelLifetime.State) {
+        val view = modelStatusView ?: return
+        val text = if (application.backendSettings.load().engine != TranscriptionEngine.ON_DEVICE) {
+            null
+        } else {
+            when (state) {
+                is ModelLifetime.State.Loading -> getString(R.string.model_status_loading)
+                is ModelLifetime.State.Failed -> getString(R.string.model_status_failed, state.reason)
+                is ModelLifetime.State.DriverFailed -> getString(R.string.model_status_driver_failed, state.reason)
+                is ModelLifetime.State.Ready, ModelLifetime.State.Unloaded -> null
+            }
+        }
+        view.text = text
+        view.visibility = if (text == null) View.GONE else View.VISIBLE
     }
 
     /**

@@ -27,7 +27,18 @@ class OnDeviceBackend(private val engine: OnDeviceEngine) {
      * through [transcribe] after Stop, which reports the missing model).
      * [events] is invoked on the session's worker thread; callers that need
      * main-thread delivery repost it (TranscriptionCoordinator does).
+     * [savedAudio] is the file the capture writes (its partial WAV): audio the
+     * session cannot hold in memory while the model loads is read back from
+     * it instead of interrupting the stream.
      */
-    fun beginStreaming(events: (StreamEvent) -> Unit): StreamSession? =
-        if (engine.hasModel()) OnDeviceStreamSession(engine, events).start() else null
+    fun beginStreaming(savedAudio: File? = null, events: (StreamEvent) -> Unit): StreamSession? =
+        if (engine.hasModel()) {
+            OnDeviceStreamSession(
+                engine,
+                events,
+                backlog = savedAudio?.let { file -> { SavedAudioBacklog(file) } },
+            ).start()
+        } else {
+            null
+        }
 }

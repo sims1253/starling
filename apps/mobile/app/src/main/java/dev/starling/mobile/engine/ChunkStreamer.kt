@@ -40,6 +40,10 @@ class ChunkStreamer(
     private var committed: List<String> = emptyList()
     private var lastEmit = Double.NEGATIVE_INFINITY
 
+    /** Samples in one window: a buffer that holds this much always lets [catchUp] progress. */
+    val windowSamples: Int
+        get() = chunk
+
     /** Sample index up to which audio is finalized; audio before it can be dropped. */
     var boundary: Int = 0
         private set
@@ -84,6 +88,14 @@ class ChunkStreamer(
         }
         return committedText
     }
+
+    /**
+     * Finalizes the full windows of `samples[0 until size]` without a tail
+     * partial, for a session reading back a backlog it is behind on. Returns
+     * the committed text when a window was finalized, else null.
+     */
+    fun catchUp(samples: FloatArray, size: Int, tx: Transcriber): String? =
+        if (finalizeFullWindows(samples, size, tx)) join(committed) else null
 
     /** Finalizes all remaining audio; the full text, or null when the engine failed. */
     fun flush(samples: FloatArray, size: Int, tx: Transcriber): String? {

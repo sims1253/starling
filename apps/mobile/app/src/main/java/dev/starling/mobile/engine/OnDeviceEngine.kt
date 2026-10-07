@@ -12,6 +12,8 @@ import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Owns the on-device Parakeet engine: the installed GGUFs, which one is
@@ -19,10 +21,14 @@ import java.util.UUID
  * [modelDir] is an installed model (imports keep their file name, downloads
  * their catalog name); the active one is named in [ACTIVE_FILE_NAME], and
  * falls back to the first installed model when that file is missing or
- * names a deleted model. The model loads lazily on first use and then
- * stays resident (hundreds of MB for a 0.6B q4 model) until
- * [releaseWhenIdle] drops it under memory pressure; the next use reloads it.
- * All calls are serialized; the engine additionally mutexes inside the C API.
+ * names a deleted model. The model loads on first use, or ahead of it
+ * through [prepare] (the [ModelLifetime] preload), and then stays resident
+ * (hundreds of MB for a 0.6B q4 model) until [releaseWhenIdle] drops it
+ * under memory pressure or [releaseIfIdle] drops it after the idle policy's
+ * timeout; the next use reloads it. All calls are serialized; the engine
+ * additionally mutexes inside the C API. [observer] learns about loads,
+ * unloads, failures, and the end of each use, so the lifetime policy and the
+ * UI never have to take the engine lock to know where the model stands.
  *
  * [memoryGate] is consulted before each load with the model's size and
  * returns a reason to refuse it (not enough free memory), so a load that
@@ -45,10 +51,44 @@ class OnDeviceEngine(
 
     data class InstalledModel(val name: String, val sizeBytes: Long, val active: Boolean)
 
+    /**
+     * Residency and use events, delivered on the thread that caused them and
+     * with the engine lock held: implementations must return at once and must
+     * never call back into the engine.
+     */
+    interface Observer {
+        /** A load of [model] started (it may take seconds). */
+        fun loading(model: String) = Unit
+
+        /** [model] is resident and warmed up. */
+        fun loaded(model: String) = Unit
+
+        /** A load failed; [reason] is the user-facing explanation. */
+        fun loadFailed(model: String?, reason: String) = Unit
+
+        /** The resident model was freed. */
+        fun unloaded() = Unit
+
+        /** The resident model failed a request (not a load); [error] is the native reason. */
+        fun engineFailed(error: String) = Unit
+
+        /**
+         * A use ended with the model resident and no live session running;
+         * [generation] identifies this point for [releaseIfIdle].
+         */
+        fun idle(generation: Long) = Unit
+    }
+
+    @Volatile
+    var observer: Observer = object : Observer {}
+
     private val activeFile = File(modelDir, ACTIVE_FILE_NAME)
 
     /** Guards engine state: the native handle and the model file's identity. */
-    private val lock = Any()
+    // A java.lang.Object (not Any) so prepare() can wait on it for a pinned
+    // model to be released; Kotlin's Any has no wait/notify.
+    @Suppress("PLATFORM_CLASS_MAPPED_TO_KOTLIN")
+    private val lock = Object()
 
     /**
      * Serializes imports. The staging sweep at the start of an import deletes
@@ -68,10 +108,22 @@ class OnDeviceEngine(
     private var loadedFile: File? = null
     private var loadError: String? = null
 
-    // Guarded by [lock]: live sessions in progress, and a memory-pressure
-    // release that waits for them to end.
-    private var liveSessions = 0
+    // Live sessions in progress. Counted without the engine lock: a session
+    // starts on the main thread at the Record tap, which must never wait for
+    // a preload that holds the lock through a multi-second load.
+    private val liveSessions = AtomicInteger()
+
+    // Guarded by [lock]: live sessions whose prepare() succeeded and that
+    // therefore use the loaded model until they end, and a release (memory
+    // pressure, model switch) that waits for them. A session that started
+    // but has not loaded yet pins nothing: a release or a model switch then
+    // goes ahead, and its prepare() loads the model it needs.
+    private var pinnedSessions = 0
     private var releasePending = false
+
+    // Bumped at the start and the end of every use, so an idle release armed
+    // at one point never frees a model used since.
+    private val useGeneration = AtomicLong()
 
     fun hasModel(): Boolean = activeModelFile() != null
 
@@ -133,7 +185,7 @@ class OnDeviceEngine(
 
     /** Frees the resident model now, or when the last live session ends. Caller holds [lock]. */
     private fun releaseLocked() {
-        if (liveSessions > 0) releasePending = true else unload()
+        if (pinnedSessions > 0) releasePending = true else unload()
     }
 
     private fun installedFiles(): List<File> =
@@ -431,14 +483,28 @@ class OnDeviceEngine(
      * Loads the model when it is not resident. Caller holds [lock]. Returns
      * null when the engine is ready, else the user-facing reason it is not.
      */
-    private fun ensureLoadedLocked(): String? {
-        val modelFile = activeModelFile()
+    private fun ensureLoadedLocked(active: File? = activeModelFile()): String? {
+        val modelFile = active
             ?: return "Download or import a Parakeet model first to transcribe on this device."
         // The user picked another model since this one was loaded. A live
         // session keeps the loaded one: a mid-recording reload of hundreds
         // of MB would stall the stream (the switch follows the session).
-        if (handle != 0L && loadedFile != modelFile && liveSessions == 0) unload()
+        if (handle != 0L && loadedFile != modelFile && pinnedSessions == 0) unload()
         if (handle != 0L) return null
+        val failed = try {
+            loadModelLocked(modelFile)
+        } catch (t: Throwable) {
+            // A missing or broken native library throws; the state must not
+            // stay "loading", and the failure counts for the backoff.
+            observer.loadFailed(modelFile.name, t.message ?: t::class.java.simpleName)
+            throw t
+        }
+        if (failed != null) observer.loadFailed(modelFile.name, failed)
+        return failed
+    }
+
+    /** Loads and warms up [modelFile]; null when it is resident. Caller holds [lock]. */
+    private fun loadModelLocked(modelFile: File): String? {
         nativeSupport()?.let { reason ->
             loadError = reason
             return "The on-device engine cannot run here: $reason"
@@ -447,6 +513,7 @@ class OnDeviceEngine(
             loadError = reason
             return "The on-device model was not loaded: $reason"
         }
+        observer.loading(modelFile.name)
         NativeSupport.applyThreadDefault()
         NativeSupport.applyFastEngineDefaults(modelFile.parentFile)
         val abi = StarlingNative.abiVersion()
@@ -465,21 +532,109 @@ class OnDeviceEngine(
         loadError = null
         // Absorb lazy graph construction before the first real request,
         // mirroring starling-serve's warmup.
-        StarlingNative.transcribe(handle, FloatArray(Warmup.SAMPLES), Warmup.SAMPLE_RATE)
+        if (StarlingNative.transcribe(handle, FloatArray(Warmup.SAMPLES), Warmup.SAMPLE_RATE) == null) {
+            val error = StarlingNative.lastError(handle)
+            // The same discrimination as ModelLifetime: an allocation that
+            // did not fit (another model, or more free memory, may work) or
+            // a preflight refusal is recoverable, so the warmup leaves the
+            // model resident for the first real request to report; only a
+            // lost/wedged device is fatal to the handle.
+            if (error != null && ModelLifetime.isDriverFailure(error)) {
+                // #325: a GPU driver that fails the warmup fails every request
+                // after it. Report it instead of serving from a broken handle;
+                // the caller decides whether a retry is wanted (speculative
+                // preloads never retry it, see ModelLifetime).
+                unload()
+                loadError = error
+                return "The on-device engine failed its warmup: $error"
+            }
+            // Any other warmup failure is left to the first real request,
+            // which reports its own error (the pre-#229 behavior).
+        }
+        observer.loaded(modelFile.name)
         return null
     }
 
-    /** Loads the model ahead of a live session; null when ready. Blocking. */
-    override fun prepare(): String? = synchronized(lock) { ensureLoadedLocked() }
+    /**
+     * Brackets one use of the engine. Caller holds [lock]. When the use ends
+     * with the model resident and no live session running, [Observer.idle]
+     * hands the lifetime policy the point an idle release is measured from.
+     */
+    private inline fun <T> usingLocked(block: () -> T): T {
+        useGeneration.incrementAndGet()
+        try {
+            return block()
+        } finally {
+            reportIdleLocked()
+        }
+    }
+
+    /** Ends a use: a new generation, reported as idle when nothing else is using the model. Caller holds [lock]. */
+    private fun reportIdleLocked() {
+        val generation = useGeneration.incrementAndGet()
+        if (handle != 0L && liveSessions.get() == 0) observer.idle(generation)
+    }
+
+    /**
+     * Loads the model for a live session that just started and pins it to
+     * the session (see [pinnedSessions]); null when ready. Blocking.
+     */
+    override fun prepare(cancelled: () -> Boolean): String? = synchronized(lock) {
+        // A new take uses the model selected when it started, never the one
+        // an earlier take (still finalizing) has pinned: wait, with the lock
+        // released, for those takes to end so the switch can happen. The new
+        // take's audio is being saved and backlogged meanwhile. The slice
+        // re-checks the selection, which can change while waiting.
+        while (!cancelled() && handle != 0L && pinnedSessions > 0 && loadedFile != activeModelFile()) {
+            lock.wait(PIN_WAIT_SLICE_MILLIS)
+        }
+        // A closed session must not load (and so undo a deferred release).
+        if (cancelled()) return "the live session was closed"
+        usingLocked {
+            ensureLoadedLocked().also {
+                // Pins the loaded model to this session until
+                // liveSessionEnded(prepared = true). Invariant: every path
+                // that decrements [pinnedSessions] must lock.notifyAll(),
+                // or a take waiting above strands for a full
+                // PIN_WAIT_SLICE_MILLIS per slice.
+                if (it == null) pinnedSessions++
+            }
+        }
+    }
+
+    /**
+     * The [ModelLifetime] preload: loads the active model ahead of a
+     * recording the user is about to start, or touches the resident one
+     * (a use, so the idle release re-arms). [allowed] is checked once the
+     * engine lock is held, so speculative work that queued behind a request
+     * which then hit a fatal driver failure never runs. Pins nothing; null
+     * when ready or skipped. Blocking.
+     */
+    fun preload(allowed: (model: String) -> Boolean): String? = synchronized(lock) {
+        // Resolved once: the backoff check and the load see the same model,
+        // even if a selection lands in between.
+        val model = activeModelFile() ?: return null
+        if (!allowed(model.name)) return null
+        usingLocked { ensureLoadedLocked(model) }
+    }
 
     /** One live-stream window of 16 kHz mono samples. Blocking. */
     override fun transcribeWindow(samples: FloatArray): OnDeviceStreamSession.WindowResult = synchronized(lock) {
-        ensureLoadedLocked()?.let { return OnDeviceStreamSession.WindowResult.Failed(it) }
-        val text = StarlingNative.transcribe(handle, samples, ChunkStreamer.SAMPLE_RATE)
-            ?: return OnDeviceStreamSession.WindowResult.Failed(
-                "the on-device engine returned an error: ${StarlingNative.lastError(handle) ?: "unknown error"}",
-            )
-        OnDeviceStreamSession.WindowResult.Text(text)
+        usingLocked {
+            ensureLoadedLocked()?.let { return OnDeviceStreamSession.WindowResult.Failed(it) }
+            val text = StarlingNative.transcribe(handle, samples, ChunkStreamer.SAMPLE_RATE)
+            if (text == null) {
+                val error = StarlingNative.lastError(handle)
+                error?.let(observer::engineFailed)
+                if (error != null && ModelLifetime.isDriverFailure(error)) {
+                    releaseDriverFailureLocked(error)
+                }
+                return OnDeviceStreamSession.WindowResult.Failed(
+                    "the on-device engine returned an error: ${error ?: "unknown error"}",
+                )
+            }
+            OnDeviceStreamSession.WindowResult.Text(text)
+        }
     }
 
     /**
@@ -495,22 +650,54 @@ class OnDeviceEngine(
      */
     fun releaseWhenIdle() = synchronized(lock) { releaseLocked() }
 
-    override fun liveSessionStarted() {
-        synchronized(lock) { liveSessions++ }
+    /**
+     * The idle policy's release ([ModelLifetime]): frees the resident model
+     * only when nothing used it since [generation] (see [Observer.idle]) and
+     * no live session is running, so a timer that fires late can never pull
+     * the model out from under a recording or a use that just started.
+     * Returns whether the model was freed. Blocking.
+     */
+    fun releaseIfIdle(generation: Long): Boolean = synchronized(lock) {
+        // A session starting right after this check (it never takes the lock)
+        // finds the model gone and reloads it in its prepare(); its audio is
+        // being saved meanwhile, so the race costs a reload, never audio.
+        if (handle == 0L || useGeneration.get() != generation || pinnedSessions > 0 || liveSessions.get() > 0) {
+            return false
+        }
+        unload()
+        true
     }
 
-    override fun liveSessionEnded() {
+    /** Never takes the engine lock: called on the main thread when a recording starts. */
+    override fun liveSessionStarted() {
+        liveSessions.incrementAndGet()
+        useGeneration.incrementAndGet()
+    }
+
+    override fun liveSessionEnded(prepared: Boolean) {
+        liveSessions.updateAndGet { maxOf(0, it - 1) }
         synchronized(lock) {
-            liveSessions = maxOf(0, liveSessions - 1)
-            if (liveSessions == 0 && releasePending) {
+            if (prepared && pinnedSessions > 0) {
+                pinnedSessions--
+                // Tied to the decrement itself (see prepare()'s invariant):
+                // a take waiting there for this pin to drop must be woken,
+                // so any future path that decrements cannot strand it.
+                lock.notifyAll()
+            }
+            if (pinnedSessions == 0 && releasePending) {
                 releasePending = false
                 unload()
             }
+            // Reported as idle only when no session is live (see reportIdleLocked).
+            reportIdleLocked()
         }
     }
 
     /** Blocking transcription of a finalized WAV recording. */
-    fun transcribe(audioFile: File): InferenceResult = synchronized(lock) {
+    fun transcribe(audioFile: File): InferenceResult = synchronized(lock) { usingLocked { transcribeLocked(audioFile) } }
+
+    /** Caller holds [lock] inside [usingLocked]. */
+    private fun transcribeLocked(audioFile: File): InferenceResult {
         ensureLoadedLocked()?.let { return InferenceResult.Failure(it, false) }
 
         val decoded = WavPcm.decodeMonoFloat(audioFile)
@@ -533,17 +720,35 @@ class OnDeviceEngine(
                 decoded.samples.copyOfRange(window.start, window.endExclusive)
             }
             val text = StarlingNative.transcribe(handle, samples, decoded.sampleRate)
-                ?: return InferenceResult.Failure(
-                    "The on-device engine returned an error: ${
-                        StarlingNative.lastError(handle) ?: "unknown error"
-                    }",
-                    false,
-                )
+            if (text == null) {
+                val error = StarlingNative.lastError(handle)
+                error?.let(observer::engineFailed)
+                if (error != null && ModelLifetime.isDriverFailure(error)) {
+                    releaseDriverFailureLocked(error)
+                }
+                return InferenceResult.Failure("The on-device engine returned an error: ${error ?: "unknown error"}", false)
+            }
             texts.add(text)
         }
         // A single window is the direct path; joining would only normalize.
         val text = if (texts.size == 1) texts[0] else ChunkedTranscription.joinTexts(texts)
-        InferenceResult.Success(text)
+        return InferenceResult.Success(text)
+    }
+
+    /**
+     * A request that failed through the GPU driver (#325) leaves the
+     * resident handle wedged: free it now, pinned sessions or not. Pins
+     * protect a working model from a mid-take reload; a wedged one serves
+     * nobody, and keeping it until the pins drop would let the batch
+     * fallback of the failed take (which can win the lock before that take
+     * unpins) run into the same broken handle. Propagate, not retry: this
+     * request still returns its failure, the next request reloads (the
+     * native engine falls back to the CPU there), and speculative preloads
+     * stay off through ModelLifetime's DriverFailed. Caller holds [lock].
+     */
+    private fun releaseDriverFailureLocked(error: String) {
+        unload()
+        loadError = error
     }
 
     private fun unload() {
@@ -552,6 +757,7 @@ class OnDeviceEngine(
             handle = 0L
             loadedFile = null
             loadError = null
+            observer.unloaded()
         }
     }
 
@@ -560,6 +766,9 @@ class OnDeviceEngine(
 
         /** Name for a model imported without a usable file name. */
         const val DEFAULT_MODEL_NAME = "parakeet.gguf"
+
+        /** How often a take waiting for a pinned model re-checks the selection. */
+        private const val PIN_WAIT_SLICE_MILLIS = 1_000L
         private const val ACTIVE_FILE_NAME = "active-model"
         private const val MODEL_EXTENSION = ".gguf"
         private const val MAX_NAME_CHARS = 120

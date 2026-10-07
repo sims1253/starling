@@ -13,6 +13,20 @@
         android:textColor="@color/starling_muted"
         android:textSize="13sp" />
 
+    <!-- Where the on-device model stands (loading, failed); hidden when
+         it is ready or the server engine is selected. -->
+    <TextView
+        android:id="@+id/keyboard_model_status"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="2dp"
+        android:accessibilityLiveRegion="polite"
+        android:ellipsize="end"
+        android:maxLines="3"
+        android:textColor="@color/starling_muted"
+        android:textSize="12sp"
+        android:visibility="gone" />
+
     <!-- The keyboard keeps a fixed height, so long transcripts scroll
          instead of pushing the buttons off the view. -->
     <ScrollView
