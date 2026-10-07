@@ -1,5 +1,5 @@
 #include "loader.hpp"
-#include <cstdio>
+#include <string>
 #include <vector>
 
 #include "lib/loader_kit.hpp"
@@ -26,6 +26,13 @@ int64_t audio_token_count(int64_t n_samples, const Config& c) {
     return full * per_full + r;
 }
 
+// Exact tensor-shape checks (shared lib/loader_kit.hpp shape_eq, QWEN3
+// label) as plain lambdas rather than macros: compiler diagnostics and
+// debuggers point at the real call site, and there is no #define/#undef
+// lifecycle to keep in order. GGUF ne[] is the reversed checkpoint shape:
+// a torch Linear weight [OC, IC] reads back ne0 = IC (the mul_mat
+// contraction dim), ne1 = OC.
+
 bool Qwen3Model::load(const char* path, std::string& err) {
     if (!loader.load(path)) {
         err = loader.last_error();
@@ -33,6 +40,10 @@ bool Qwen3Model::load(const char* path, std::string& err) {
     }
     auto& c = config;
     const auto& m = loader;
+    // Top-level tensors take a literal name.
+    const auto shape = [&](const char* name, std::initializer_list<int64_t> want) {
+        return lib::shape_eq(m, "QWEN3", name, want, err);
+    };
 #define U(field, key) do { if (!lib::u32(m, "qwen3." key, field, field, err)) return false; } while (0)
 #define F(field, key) field = f32(m, "qwen3." key, field)
     // Frontend (torch.stft mel: 128 bins, n_fft 400, hop 160).
@@ -136,21 +147,18 @@ bool Qwen3Model::load(const char* path, std::string& err) {
         err = "QWEN3 GGUF enc.hidden != enc.heads * enc.head_dim";
         return false;
     }
-    // conv_out in_features: downsample_hidden * (mel 128 -> 64 -> 32 -> 16).
-    if (c.encoder.downsample_hidden * 16 != 7680) {
-        err = "QWEN3 GGUF conv stack must reduce 128 mel bins to 16";
-        return false;
-    }
     // Attention windows must be chunk-aligned: n_window_infer a multiple of
     // 2*n_window (get_audio_cu_seqlens' n_window_ratio).
     if (c.encoder.n_window_infer % (2 * c.encoder.n_window) != 0) {
         err = "QWEN3 GGUF enc.n_window_infer must be a multiple of 2*enc.n_window";
         return false;
     }
-    if (c.llm.hidden != c.llm.n_heads * c.llm.head_dim) {
-        err = "QWEN3 GGUF llm.hidden_size != llm.num_heads * llm.head_dim";
-        return false;
-    }
+    // NOTE: llm.hidden_size and the attention width heads*head_dim are
+    // INDEPENDENT fields. The 1.7B happens to equate them (2048 == 16*128);
+    // the 0.6B runs a 1024-wide trunk under a 2048-wide attention (16 heads x
+    // 128), which the shared decode stack has supported since voxtral's
+    // 4096-wide attention over a 3072 trunk. The dimensions are validated
+    // against the actual tensor shapes below instead of equated.
     if (c.llm.n_heads % c.llm.n_kv_heads != 0) {
         err = "QWEN3 GGUF llm.num_heads must be a multiple of llm.num_kv_heads";
         return false;
@@ -178,44 +186,104 @@ bool Qwen3Model::load(const char* path, std::string& err) {
         return false;
     }
 
-    // Require every expected tensor so a structural change fails loudly.
-    for (const char* n : {"audio.mel_filters", "audio.mel_window",
-                          "enc.conv1.weight", "enc.conv1.bias",
-                          "enc.conv2.weight", "enc.conv2.bias",
-                          "enc.conv3.weight", "enc.conv3.bias",
-                          "enc.out.weight", "enc.pos_embed",
-                          "enc.ln_post.weight", "enc.ln_post.bias",
-                          "proj.linear_1.weight", "proj.linear_1.bias",
-                          "proj.linear_2.weight", "proj.linear_2.bias",
-                          "llm.embed.weight", "llm.final_norm.weight"})
-        if (!lib::require(m, n, "QWEN3", err)) return false;
-    // Encoder layers: 16 tensors each (biased MHA + two biased LayerNorms +
-    // biased FFN).
-    for (uint32_t i = 0; i < c.encoder.n_layers; ++i) {
-        char n[128];
-        for (const char* tail : {"attn_norm.weight", "attn_norm.bias",
-                                 "attn_q.weight", "attn_q.bias",
-                                 "attn_k.weight", "attn_k.bias",
-                                 "attn_v.weight", "attn_v.bias",
-                                 "attn_o.weight", "attn_o.bias",
-                                 "ffn_norm.weight", "ffn_norm.bias",
-                                 "ff_up.weight", "ff_up.bias",
-                                 "ff_down.weight", "ff_down.bias"}) {
-            std::snprintf(n, sizeof n, "enc.blk.%u.%s", i, tail);
-            if (!lib::require(m, n, "QWEN3", err)) return false;
-        }
+    // Require every expected tensor with its EXACT shape so a structural
+    // change or a metadata/tensor mismatch fails loudly at load. All ne[] are
+    // ggml order (reversed checkpoint shape: ne0 = Linear in-features).
+    // Frontend constants ([n_mels, 1+n_fft/2] filterbank, [win] window).
+    if (!shape("audio.mel_filters", {c.encoder.n_mel, (int64_t) 1 + c.frontend.n_fft / 2}))
+        return false;
+    if (!shape("audio.mel_window", {(int64_t) c.frontend.win_length})) return false;
+    // Conv stack: torch [480, ic, 3, 3] -> ne [3, 3, ic, 480]; three stride-2
+    // k3 convs reduce the 128-bin mel axis to 16 (checked via enc.out below).
+    if (!shape("enc.conv1.weight", {3, 3, 1, c.encoder.downsample_hidden})) return false;
+    if (!shape("enc.conv1.bias", {c.encoder.downsample_hidden})) return false;
+    if (!shape("enc.conv2.weight",
+               {3, 3, c.encoder.downsample_hidden, c.encoder.downsample_hidden}))
+        return false;
+    if (!shape("enc.conv2.bias", {c.encoder.downsample_hidden})) return false;
+    if (!shape("enc.conv3.weight",
+               {3, 3, c.encoder.downsample_hidden, c.encoder.downsample_hidden}))
+        return false;
+    if (!shape("enc.conv3.bias", {c.encoder.downsample_hidden})) return false;
+    // conv_out: bias-free Linear(downsample_hidden * n_mel/8 -> hidden). The
+    // mel axis is downsampled by the conv stack's fixed factor 8 (three
+    // stride-2 convs, encoder.cpp's ec.n_mel / 8); guard divisibility so a
+    // future frontend with a non-multiple n_mel fails loudly here instead of
+    // passing a truncated-division shape that mismatches the runtime graph.
+    if (c.encoder.n_mel % 8 != 0) {
+        err = "QWEN3 GGUF enc.n_mel must be divisible by the conv downsample factor (8)";
+        return false;
     }
-    // LLM layers: bias-free Qwen3 trunk with q/k norm = 11 each.
+    if (!shape("enc.out.weight",
+               {(int64_t) c.encoder.downsample_hidden * (c.encoder.n_mel / 8),
+                c.encoder.hidden}))
+        return false;
+    if (!shape("enc.pos_embed", {c.encoder.hidden, c.encoder.max_pos_emb})) return false;
+    if (!shape("enc.ln_post.weight", {c.encoder.hidden})) return false;
+    if (!shape("enc.ln_post.bias", {c.encoder.hidden})) return false;
+    // Projector: Linear(hidden -> hidden) + GELU + Linear(hidden -> output).
+    if (!shape("proj.linear_1.weight", {c.projector.hidden, c.projector.hidden}))
+        return false;
+    if (!shape("proj.linear_1.bias", {c.projector.hidden})) return false;
+    if (!shape("proj.linear_2.weight", {c.projector.hidden, c.projector.output_dim}))
+        return false;
+    if (!shape("proj.linear_2.bias", {c.projector.output_dim})) return false;
+    if (!shape("llm.embed.weight", {c.llm.hidden, c.llm.vocab})) return false;
+    if (!shape("llm.final_norm.weight", {c.llm.hidden})) return false;
+    // Encoder layers: 16 tensors each (biased MHA + two biased LayerNorms +
+    // biased FFN); MHA projects hidden -> hidden (kv heads == heads).
+    for (uint32_t i = 0; i < c.encoder.n_layers; ++i) {
+        const std::string pre = "enc.blk." + std::to_string(i) + ".";
+        const auto enc_shape = [&](const std::string& tail, std::initializer_list<int64_t> want) {
+            return lib::shape_eq(m, "QWEN3", (pre + tail).c_str(), want, err);
+        };
+        if (!enc_shape("attn_norm.weight", {c.encoder.hidden})) return false;
+        if (!enc_shape("attn_norm.bias", {c.encoder.hidden})) return false;
+        if (!enc_shape("attn_q.weight", {c.encoder.hidden, c.encoder.hidden}))
+            return false;
+        if (!enc_shape("attn_q.bias", {c.encoder.hidden})) return false;
+        if (!enc_shape("attn_k.weight", {c.encoder.hidden, c.encoder.hidden}))
+            return false;
+        if (!enc_shape("attn_k.bias", {c.encoder.hidden})) return false;
+        if (!enc_shape("attn_v.weight", {c.encoder.hidden, c.encoder.hidden}))
+            return false;
+        if (!enc_shape("attn_v.bias", {c.encoder.hidden})) return false;
+        if (!enc_shape("attn_o.weight", {c.encoder.hidden, c.encoder.hidden}))
+            return false;
+        if (!enc_shape("attn_o.bias", {c.encoder.hidden})) return false;
+        if (!enc_shape("ffn_norm.weight", {c.encoder.hidden})) return false;
+        if (!enc_shape("ffn_norm.bias", {c.encoder.hidden})) return false;
+        if (!enc_shape("ff_up.weight", {c.encoder.hidden, c.encoder.ffn_dim}))
+            return false;
+        if (!enc_shape("ff_up.bias", {c.encoder.ffn_dim})) return false;
+        if (!enc_shape("ff_down.weight", {c.encoder.ffn_dim, c.encoder.hidden}))
+            return false;
+        if (!enc_shape("ff_down.bias", {c.encoder.hidden})) return false;
+    }
+    // LLM layers: bias-free Qwen3 trunk with per-head q/k norm (11 each).
+    // q/k/v project hidden -> {QW, KVW, KVW}; o projects the concatenated
+    // heads QW back to hidden — the width relation the 0.6B exercises.
+    const int64_t QW = (int64_t) c.llm.n_heads * c.llm.head_dim;
+    const int64_t KVW = (int64_t) c.llm.n_kv_heads * c.llm.head_dim;
     for (uint32_t i = 0; i < c.llm.n_layers; ++i) {
-        char n[128];
-        for (const char* tail : {"attn_norm.weight", "attn.q.weight", "attn.k.weight",
-                                 "attn.v.weight", "attn.o.weight",
-                                 "attn.q_norm.weight", "attn.k_norm.weight",
-                                 "ffn_norm.weight", "ffn.gate.weight",
-                                 "ffn.up.weight", "ffn.down.weight"}) {
-            std::snprintf(n, sizeof n, "llm.blk.%u.%s", i, tail);
-            if (!lib::require(m, n, "QWEN3", err)) return false;
-        }
+        const std::string pre = "llm.blk." + std::to_string(i) + ".";
+        const auto llm_shape = [&](const std::string& tail, std::initializer_list<int64_t> want) {
+            return lib::shape_eq(m, "QWEN3", (pre + tail).c_str(), want, err);
+        };
+        if (!llm_shape("attn_norm.weight", {c.llm.hidden})) return false;
+        if (!llm_shape("attn.q.weight", {c.llm.hidden, QW})) return false;
+        if (!llm_shape("attn.k.weight", {c.llm.hidden, KVW})) return false;
+        if (!llm_shape("attn.v.weight", {c.llm.hidden, KVW})) return false;
+        if (!llm_shape("attn.o.weight", {QW, c.llm.hidden})) return false;
+        if (!llm_shape("attn.q_norm.weight", {c.llm.head_dim})) return false;
+        if (!llm_shape("attn.k_norm.weight", {c.llm.head_dim})) return false;
+        if (!llm_shape("ffn_norm.weight", {c.llm.hidden})) return false;
+        if (!llm_shape("ffn.gate.weight", {c.llm.hidden, c.llm.intermediate}))
+            return false;
+        if (!llm_shape("ffn.up.weight", {c.llm.hidden, c.llm.intermediate}))
+            return false;
+        if (!llm_shape("ffn.down.weight", {c.llm.intermediate, c.llm.hidden}))
+            return false;
     }
     return true;
 }

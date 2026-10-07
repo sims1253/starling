@@ -41,6 +41,7 @@ from typing import Any, Optional
 import torch
 
 from .config import (
+    EOS_TOKEN_IDS,
     LLM_RMS_NORM_EPS,
 )
 
@@ -97,6 +98,7 @@ class LLMMega:
         device: str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
         eos_token_id: int = 151645,
+        eos_token_ids: tuple[int, ...] | list[int] | None = None,
         prefill_use_graph: bool = True,
     ) -> None:
         self.lm = language_model
@@ -107,6 +109,13 @@ class LLMMega:
         self.device = device
         self.dtype = dtype
         self.eos_token_id = int(eos_token_id)
+        # Greedy stop set: the established <|im_end|> primary plus the
+        # checkpoint's second EOS (<|endoftext|> 151643). Callers may pass an
+        # explicit set; otherwise default to the shared EOS_TOKEN_IDS pinned
+        # with the primary first so both siblings stop identically.
+        if eos_token_ids is None:
+            eos_token_ids = (self.eos_token_id, *tuple(t for t in EOS_TOKEN_IDS if t != self.eos_token_id))
+        self.eos_token_ids: tuple[int, ...] = tuple(int(t) for t in eos_token_ids)
         # Prefill graphs are captured per prompt length T (cap 8, evict+reset).
         # On a diverse-length sweep (~50 distinct T/dataset) that churn corrupts
         # the CUDA-graph allocator and surfaces as an illegal memory access a few
@@ -281,11 +290,17 @@ class LLMMega:
         self,
         inputs_embeds: torch.Tensor,
         max_new_tokens: int = 200,
-        eos_token_id: Optional[int] = None,
+        eos_token_id: Optional[int | tuple[int, ...] | list[int]] = None,
+        eos_token_ids: Optional[tuple[int, ...] | list[int]] = None,
         tokenizer: Any = None,
         capture: bool = True,
     ) -> GenerateResult:
-        eos = int(eos_token_id) if eos_token_id is not None else self.eos_token_id
+        if eos_token_ids is None and isinstance(eos_token_id, (list, tuple)):
+            eos_token_ids, eos_token_id = tuple(eos_token_id), None
+        if eos_token_ids is None:
+            eos_set = {int(eos_token_id)} if eos_token_id is not None else set(self.eos_token_ids)
+        else:
+            eos_set = {int(t) for t in eos_token_ids}
         T = inputs_embeds.shape[1]
         max_safe = self.max_cache_len - T + 1
         if max_new_tokens > max_safe:
@@ -319,7 +334,7 @@ class LLMMega:
                 self._decode_step_eager()
             next_token = self.static_logits.argmax(dim=-1)
             gen_ids.append(int(next_token.item()))
-            if int(next_token.item()) == eos:
+            if int(next_token.item()) in eos_set:
                 break
         torch.cuda.synchronize()
         t1 = time.perf_counter()

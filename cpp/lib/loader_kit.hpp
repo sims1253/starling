@@ -6,10 +6,12 @@
 // and the accepted profiles differ between models.
 #pragma once
 
+#include "ggml.h"
 #include "runtime/model_loader.hpp"
 #include <cstdint>
 #include <initializer_list>
 #include <string>
+#include <vector>
 
 namespace starling::ggml::lib {
 
@@ -83,6 +85,71 @@ inline bool check_gguf_header(const ModelLoader& m, const char* arch, const char
         return false;
     }
     return true;
+}
+
+// Exact tensor-shape equation shared by the per-model loaders: `name` must
+// have exactly the ggml dims in `want` (GGUF stores row-major [out, in];
+// ggml exposes ne innermost-first). `label` names the model in the error
+// ("QWEN3"/"VOXTRAL"/...); presence errors read
+// "<label> GGUF missing required tensor: <name>".
+// The vector overload is the implementation; the initializer_list overload
+// forwards to it (tests build macro-derived want lists that an
+// initializer_list cannot express).
+inline bool shape_eq(const ModelLoader& m, const char* label, const char* name,
+                     const std::vector<int64_t>& want, std::string& err) {
+    ggml_tensor* t = m.tensor(name);
+    if (!t) {
+        err = std::string(label) + " GGUF missing required tensor: " + name;
+        return false;
+    }
+    // A wanted-dim count beyond GGML_MAX_DIMS is a caller bug (it would index
+    // past t->ne[]), not a GGUF defect — report it as such, up front.
+    if (want.size() > GGML_MAX_DIMS) {
+        err = std::string(label) + " shape_eq: wanted " +
+              std::to_string(want.size()) + " dims (max " +
+              std::to_string(GGML_MAX_DIMS) + ")";
+        return false;
+    }
+    // ggml_n_dims() counts only non-trailing-1 dims (a tensor stored as
+    // ne=[N,1] reads back as 1-dim), so trim trailing 1s from `want` the
+    // same way before comparing: want {N,1} then matches ne=[N] instead of
+    // reporting a confusing false mismatch.
+    int n_want = (int) want.size();
+    {
+        auto it = want.end();
+        while (it != want.begin()) {
+            --it;
+            if (*it != 1) break;
+            --n_want;
+        }
+    }
+    bool ok = n_want == ggml_n_dims(t);
+    int i = 0;
+    for (int64_t w : want) {
+        if (i >= n_want) break;  // ignore the trimmed trailing 1s
+        if (ok && (int64_t) t->ne[i] != w) ok = false;
+        ++i;
+    }
+    if (!ok) {
+        std::string got, want_s;
+        for (int j = 0; j < ggml_n_dims(t); ++j) {
+            if (j) got += ",";
+            got += std::to_string(t->ne[j]);
+        }
+        for (int i2 = 0; i2 < n_want; ++i2) {
+            if (i2) want_s += ",";
+            want_s += std::to_string(want[(size_t) i2]);
+        }
+        err = std::string(label) + " GGUF tensor " + name + " has ne=[" + got +
+              "], expected [" + want_s + "]";
+        return false;
+    }
+    return true;
+}
+
+inline bool shape_eq(const ModelLoader& m, const char* label, const char* name,
+                     std::initializer_list<int64_t> want, std::string& err) {
+    return shape_eq(m, label, name, std::vector<int64_t>(want), err);
 }
 
 } // namespace starling::ggml::lib

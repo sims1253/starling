@@ -18,17 +18,14 @@ fn stage_dying_engine(root: &std::path::Path) -> std::path::PathBuf {
     let dir = root.join("engines");
     std::fs::create_dir_all(&dir).expect("create engines dir");
     let engine = dir.join("starling-serve-cpu");
+    // The fake answers with the CURRENTLY expected ABI (bumping
+    // EXPECTED_ENGINE_ABI must not break this success-path fixture) and an
+    // older version string, so probing passes and serving dies.
     std::fs::write(
         &engine,
-        concat!(
-            "#!/bin/sh\n",
-            "case \"$1\" in\n",
-            "  --version)\n",
-            "    printf 'starling-serve 0.1.0\\nabi-version: 8\\nbackend: cpu\\nsupported-models: parakeet s1\\n'\n",
-            "    exit 0\n",
-            "    ;;\n",
-            "  *) exit 1 ;;\n",
-            "esac\n",
+        format!(
+            "#!/bin/sh\ncase \"$1\" in\n  --version)\n    printf 'starling-serve 0.1.0\\nabi-version: {}\\nbackend: cpu\\nsupported-models: parakeet s1\\n'\n    exit 0\n    ;;\n  *) exit 1 ;;\nesac\n",
+            starling_dictation::engine::EXPECTED_ENGINE_ABI
         ),
     )
     .expect("write dying engine");
@@ -47,7 +44,10 @@ fn stage_dying_engine(root: &std::path::Path) -> std::path::PathBuf {
     .expect("sums");
     std::fs::write(
         dir.join("engines.json"),
-        r#"{"version":"0.1.0","abi":8,"engines":[{"backend":"cpu","file":"starling-serve-cpu"}]}"#,
+        format!(
+            r#"{{"version":"0.1.0","abi":{},"engines":[{{"backend":"cpu","file":"starling-serve-cpu"}}]}}"#,
+            starling_dictation::engine::EXPECTED_ENGINE_ABI
+        ),
     )
     .expect("manifest");
     dir

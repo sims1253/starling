@@ -73,6 +73,7 @@ T_HIGGS_TEXT = "higgs.intree.text"
 T_HOJO_TEXT = "hojo.intree.text"
 T_GRANITE_TEXT = "granite.intree.text"
 T_QWEN3_TEXT = "qwen3.intree.text"
+T_QWEN3_06_TEXT = "qwen3_06.intree.text"
 T_AUDEX_TEXT = "audex.intree.text"
 T_S1_TEXT = "s1.intree.text"
 T_S1_CONTROL = "s1.intree.control_matrix_smoke"
@@ -673,6 +674,48 @@ def test_starling_ggml_qwen3_text_parity(starling_ggml_qwen3_engine, name: str) 
     golden_text = golden["fixtures"][name]["text"]
     out = starling_ggml_qwen3_engine._run_one(FIXTURES[name])
     pc.assert_exact_text(out, golden_text, target=T_QWEN3_TEXT, fixture=name)
+
+
+# --------------------------------------------------------------------------- #
+# In-tree Qwen3-ASR-0.6B C API
+# --------------------------------------------------------------------------- #
+def _starling_ggml_qwen3_06_available() -> bool:
+    try:
+        from engines import StarlingGgmlQwen3_06
+        return StarlingGgmlQwen3_06().available
+    except Exception:
+        return False
+
+
+@pytest.fixture(scope="module")
+def starling_ggml_qwen3_06_engine():
+    if not _starling_ggml_qwen3_06_available():
+        pytest.skip("in-tree libstarling_ggml or STARLING_GGML_QWEN3_06_MODEL unavailable")
+    from engines import StarlingGgmlQwen3_06
+    engine = StarlingGgmlQwen3_06()
+    engine.load()
+    yield engine
+    engine.close()
+
+
+@pytest.mark.skipif(not _starling_ggml_qwen3_06_available(),
+                    reason="in-tree libstarling_ggml or qwen3_06 GGUF unavailable")
+@pytest.mark.parametrize("name", ["short", "medium", "long"])
+def test_starling_ggml_qwen3_06_text_parity(starling_ggml_qwen3_06_engine, name: str) -> None:
+    """The in-tree C API returns the golden qwen3_06 transcript.
+
+    Same engine as the 1.7B gate (windowed conv encoder + MLP projector +
+    Qwen3 trunk under a 2048-wide attention over the 0.6B's 1024-wide trunk),
+    same serve chunk policy and transcription_only extraction, against the
+    stock-numerics reference captured by scripts/make_qwen3_06_golden.py
+    (golden/qwen3_06_reference.json). Exact text parity, no tolerance.
+    """
+    _manifest_gate(T_QWEN3_06_TEXT)
+    pc.record_executed(T_QWEN3_06_TEXT)
+    golden = json.loads((GOLDEN / "qwen3_06_reference.json").read_text())
+    golden_text = golden["fixtures"][name]["text"]
+    out = starling_ggml_qwen3_06_engine._run_one(FIXTURES[name])
+    pc.assert_exact_text(out, golden_text, target=T_QWEN3_06_TEXT, fixture=name)
 
 
 # --------------------------------------------------------------------------- #

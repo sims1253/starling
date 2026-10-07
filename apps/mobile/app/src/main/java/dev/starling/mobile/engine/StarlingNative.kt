@@ -8,7 +8,7 @@ package dev.starling.mobile.engine
  */
 object StarlingNative {
     /** ABI the JNI library is built against; refused on mismatch. */
-    const val EXPECTED_ABI_VERSION = 8
+    const val EXPECTED_ABI_VERSION = 9
 
     init {
         System.loadLibrary("starling_jni")

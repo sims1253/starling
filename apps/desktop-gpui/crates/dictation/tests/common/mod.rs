@@ -50,8 +50,8 @@ pub fn fixture() -> Option<PathBuf> {
 }
 
 /// Stages `<root>/engines/` with the fixture copied as
-/// `starling-serve-cpu`, plus `engines.json` (version 0.1.0, abi 8) and
-/// its `SHA256SUMS.txt`.
+/// `starling-serve-cpu`, plus `engines.json` (version 0.1.0, the expected
+/// ABI) and its `SHA256SUMS.txt`.
 pub fn stage_engine_dir(root: &Path, fixture: &Path) -> PathBuf {
     let dir = root.join("engines");
     std::fs::create_dir_all(&dir).expect("create engines dir");
@@ -66,7 +66,10 @@ pub fn stage_engine_dir(root: &Path, fixture: &Path) -> PathBuf {
     .expect("write sums");
     std::fs::write(
         dir.join("engines.json"),
-        r#"{"version":"0.1.0","abi":8,"engines":[{"backend":"cpu","file":"starling-serve-cpu"}]}"#,
+        format!(
+            r#"{{"version":"0.1.0","abi":{},"engines":[{{"backend":"cpu","file":"starling-serve-cpu"}}]}}"#,
+            starling_dictation::engine::EXPECTED_ENGINE_ABI
+        ),
     )
     .expect("write manifest");
     dir

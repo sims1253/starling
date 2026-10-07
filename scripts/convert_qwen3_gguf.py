@@ -120,20 +120,21 @@ def gguf_name(name: str) -> str:
     raise KeyError(f"no qwen3 GGUF mapping for {name!r}")
 
 
-def positional_embedding() -> torch.Tensor:
-    """(13, 1024) SinusoidsPositionEmbedding table, float64 math -> BF16.
+def positional_embedding(length: int = 13, channels: int = 1024) -> torch.Tensor:
+    """(length, channels) SinusoidsPositionEmbedding table, f64 math -> BF16.
 
     Mirrors SinusoidsPositionEmbedding.compute_default_singular_positional_embedding
     exactly: the reference computes sin/cos in float64 (np.log is float64 and
     propagates) and the buffer is rounded to the model dtype (bf16) once at
-    load, so baking the direct float64->BF16 rounding is bit-exact.
+    load, so baking the direct float64->BF16 rounding is bit-exact. `channels`
+    is the audio tower's d_model (1024 for the 1.7B, 896 for the 0.6B).
     """
-    length, channels, max_timescale = 13, 1024, 10000
+    max_timescale = 10000
     log_timescale_increment = np.log(max_timescale) / (channels // 2 - 1)
     inv_timescales = np.exp(-log_timescale_increment * np.arange(channels // 2))
     scaled_time = np.arange(length)[:, np.newaxis] * inv_timescales[np.newaxis, :]
     pos = np.concatenate([np.sin(scaled_time), np.cos(scaled_time)], axis=1)
-    return torch.from_numpy(pos).to(torch.bfloat16)  # (13, 1024)
+    return torch.from_numpy(pos).to(torch.bfloat16)  # (length, channels)
 
 
 def add_metadata(w: gguf.GGUFWriter) -> None:
@@ -370,7 +371,6 @@ def main() -> None:
         "enc.pos_embed", a, raw_shape=(13, 1024),
         raw_dtype=gguf.GGMLQuantizationType.BF16,
     )
-
     mel, window = frontend()
     w.add_tensor("audio.mel_filters", np.ascontiguousarray(mel, dtype=np.float32))
     w.add_tensor("audio.mel_window", np.ascontiguousarray(window, dtype=np.float32))

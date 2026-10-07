@@ -100,7 +100,7 @@ def load_fixture(path: Path) -> torch.Tensor:
 
 def main() -> int:
     from starling.qwen3.audio import build_inputs
-    from starling.qwen3.config import MODEL_ID
+    from starling.qwen3.config import MODEL_ID, MODEL_REVISION
     from starling.qwen3.loader import load_model_and_processor
     from starling.qwen3.pipeline import MegaPipeline
     from starling.parakeet.gpu_lock import with_gpu_lock
@@ -112,6 +112,8 @@ def main() -> int:
         note="capturing qwen3 C++ reference goldens",
     ):
         print("[qwen3-golden] loading model (eager, bf16) ...")
+        # Pinned revision from the loader default (MODEL_REVISION) — the same
+        # pin the converter snapshot uses, so captures track it (#353).
         model, processor = load_model_and_processor(attn_impl="eager")
         # STOCK numerics: eager encoder + the model's own decoder layers. This
         # is the op-for-op oracle the C++ engine mirrors (the fused/multistep
@@ -128,6 +130,7 @@ def main() -> int:
         chunk_samples = max(1, round(max_chunk * SAMPLE_RATE))
         out: dict[str, Any] = {
             "model": MODEL_ID,
+            "revision": MODEL_REVISION,
             "policy": {
                 "sample_rate": SAMPLE_RATE,
                 "max_new_tokens": MAX_NEW_TOKENS,
@@ -154,6 +157,14 @@ def main() -> int:
                 chunk_wav = wav[:, start:end].contiguous()
                 chunk_dur = (end - start) / SAMPLE_RATE
                 budget = decode_budget(chunk_dur)
+                # Guard BEFORE the decode (mirrors the 0.6B capture): an
+                # overflowing budget must abort instead of corrupting goldens.
+                probe_len = int(
+                    build_inputs(processor, chunk_wav, sr=SAMPLE_RATE)["input_ids"].shape[1]
+                )
+                assert probe_len + budget <= MAX_CACHE_LEN + 1, (
+                    f"{name}: budget would overflow the static KV cache"
+                )
                 prompt_len = None
                 text, ids = transcribe_chunk(pipe, processor, chunk_wav, budget)
                 # ids/text consistency through the transcription_only path.

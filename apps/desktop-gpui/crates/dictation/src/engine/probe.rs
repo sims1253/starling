@@ -691,7 +691,10 @@ mod tests {
         let hex = crate::engine::bundle::sha256_file(&engine).expect("hash");
         std::fs::write(
             dir.path().join("engines.json"),
-            r#"{"version":"9.9.9","abi":8,"engines":[{"backend":"vulkan","file":"starling-serve-vulkan"}]}"#,
+            format!(
+                r#"{{"version":"9.9.9","abi":{},"engines":[{{"backend":"vulkan","file":"starling-serve-vulkan"}}]}}"#,
+                crate::engine::EXPECTED_ENGINE_ABI
+            ),
         )
         .expect("manifest");
         std::fs::write(
@@ -747,7 +750,10 @@ mod tests {
 
     /// Stages two fake engines: scripts that print a valid `--version`
     /// block. `correct_sums` false writes wrong hex so verification
-    /// fails.
+    /// fails. The fixtures track [crate::engine::EXPECTED_ENGINE_ABI]
+    /// so an expected bump does not silently turn these success paths
+    /// into AbiMismatch failures (the deliberate-mismatch tests pin
+    /// their own values).
     fn stage_fake_engines(dir: &Path, correct_sums: bool) {
         for backend in ["vulkan", "cpu"] {
             let name = format!("starling-serve-{backend}");
@@ -755,7 +761,8 @@ mod tests {
             std::fs::write(
                 &path,
                 format!(
-                    "#!/bin/sh\ncat <<'EOF'\nstarling-serve 1.2.3\nabi-version: 8\nbackend: {backend}\nsupported-models: parakeet\nEOF\n"
+                    "#!/bin/sh\ncat <<'EOF'\nstarling-serve 1.2.3\nabi-version: {}\nbackend: {backend}\nsupported-models: parakeet\nEOF\n",
+                    crate::engine::EXPECTED_ENGINE_ABI
                 ),
             )
             .expect("write engine");
@@ -769,9 +776,12 @@ mod tests {
         }
         std::fs::write(
             dir.join("engines.json"),
-            r#"{"version":"1.2.3","abi":8,"engines":[
-                {"backend":"vulkan","file":"starling-serve-vulkan"},
-                {"backend":"cpu","file":"starling-serve-cpu"}]}"#,
+            format!(
+                r#"{{"version":"1.2.3","abi":{},"engines":[
+                {{"backend":"vulkan","file":"starling-serve-vulkan"}},
+                {{"backend":"cpu","file":"starling-serve-cpu"}}]}}"#,
+                crate::engine::EXPECTED_ENGINE_ABI
+            ),
         )
         .expect("manifest");
     }
@@ -780,9 +790,15 @@ mod tests {
     fn probe_detects_version_mismatch() {
         let dir = tempfile::tempdir().expect("tempdir");
         let engine = dir.path().join("engine");
+        // The ABI matches EXPECTED_ENGINE_ABI so the probe reaches the version
+        // check this test exercises (an ABI mismatch would short-circuit to
+        // AbiMismatch before the version comparison).
         std::fs::write(
             &engine,
-            "#!/bin/sh\necho 'starling-serve 0.9.0'; echo 'abi-version: 8'; echo 'backend: cpu'\n",
+            format!(
+                "#!/bin/sh\necho 'starling-serve 0.9.0'; echo 'abi-version: {}'; echo 'backend: cpu'\n",
+                crate::engine::EXPECTED_ENGINE_ABI
+            ),
         )
         .expect("write engine");
         make_executable(&engine);

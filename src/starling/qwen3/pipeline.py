@@ -29,7 +29,7 @@ from typing import Any, Optional, TYPE_CHECKING
 
 import torch
 
-from .config import AUDIO_TOKEN_ID, EOS_TOKEN_ID
+from .config import AUDIO_TOKEN_ID, EOS_TOKEN_ID, EOS_TOKEN_IDS
 from .encoder_mega import GraphedEncoder
 from .loader import get_components, load_model_and_processor
 from .llm_mega import LLMMega
@@ -43,6 +43,11 @@ if TYPE_CHECKING:
 
 class MegaPipeline:
     """End-to-end fused ASR pipeline owning encoder + projector + fused LLM."""
+
+    #: Model loader used by :meth:`from_pretrained`; subclasses swap this to
+    #: point at a different hub variant (starling.qwen3_06) while inheriting
+    #: the whole entry point.
+    _load_model_and_processor = staticmethod(load_model_and_processor)
 
     def __init__(
         self,
@@ -59,7 +64,18 @@ class MegaPipeline:
         self.model = model
         self.processor = processor
         self.dtype = getattr(model, "dtype", torch.bfloat16)
+        # Decode dtype/device: the loaded model's own placement (from_pretrained
+        # threads its dtype/device here), defaulting to the historical bf16/CUDA
+        # so existing callers are unchanged.
+        self.device = str(getattr(model, "device", "cuda"))
         self.audio_token_id = int(getattr(model.config, "audio_token_id", AUDIO_TOKEN_ID))
+        # Greedy stop: restore the established <|im_end|> (151645) contract and
+        # stop on the checkpoint's second EOS (151643) as well. Both pinned
+        # checkpoints list eos_token_id=[151643, 151645]; taking the first
+        # entry regressed stopping (continued past <|im_end|>). The primary
+        # stays EOS_TOKEN_ID; the set covers both.
+        self.eos_token_id = int(EOS_TOKEN_ID)
+        self.eos_token_ids: tuple[int, ...] = tuple(EOS_TOKEN_IDS)
         # Prefill eager by default: the per-prompt-length prefill graphs (cap 8,
         # evict+reset) churn the CUDA-graph allocator on a diverse-length sweep
         # and corrupt it into an illegal memory access. Eager prefill keeps the
@@ -94,8 +110,11 @@ class MegaPipeline:
                 self._language_model,
                 self._lm_head,
                 max_cache_len=self._max_cache_len,
-                eos_token_id=EOS_TOKEN_ID,
+                eos_token_id=self.eos_token_id,
+                eos_token_ids=self.eos_token_ids,
                 prefill_use_graph=self.prefill_use_graph,
+                device=self.device,
+                dtype=self.dtype,
             )
         self.use_fused_llm = use_fused_llm
 
@@ -104,15 +123,22 @@ class MegaPipeline:
         cls,
         *,
         attn_impl: str = "eager",
-        dtype: torch.dtype = torch.bfloat16,
+        dtype: torch.dtype | None = None,
         device: str = "cuda",
         max_cache_len: int = 4096,
         use_fused_llm: bool = True,
         steps_per_replay: int | None = None,
         encoder_mode: str = "cudagraph",
         prefill_use_graph: bool = False,
+        model_id: str | None = None,
+        revision: str | None = None,
     ) -> "MegaPipeline":
-        model, processor = load_model_and_processor(attn_impl=attn_impl, dtype=dtype, device=device)
+        # None dtype restores the historical bf16 default.
+        dt = torch.bfloat16 if dtype is None else dtype
+        model, processor = cls._load_model_and_processor(
+            attn_impl=attn_impl, dtype=dt, device=device, model_id=model_id,
+            revision=revision,
+        )
         return cls(
             model,
             processor,
@@ -152,11 +178,24 @@ class MegaPipeline:
                 self._lm_head,
                 max_cache_len=self._max_cache_len,
                 steps_per_replay=k,
-                eos_token_id=EOS_TOKEN_ID,
+                eos_token_id=self.eos_token_id,
+                eos_token_ids=self.eos_token_ids,
                 prefill_use_graph=self.prefill_use_graph,
+                device=self.device,
+                dtype=self.dtype,
             )
             self._llms_by_k[k] = llm
         return llm
+
+    def close(self) -> None:
+        """Best-effort CUDA resource release: drop the graphed multi-step
+        decoders (each holds a static KV cache plus captured CUDA graphs) and
+        the graphed encoder so their memory can be reclaimed on shared
+        runners. The pipeline must not be used afterwards.
+        """
+        self._llms_by_k.clear()
+        self.llm = None
+        self.fused_encoder = None
 
     def set_prefill_use_graph(self, on: bool) -> None:
         """Toggle graphed vs eager prefill at runtime (byte-exact either way).
