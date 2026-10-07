@@ -737,14 +737,17 @@ class OnDeviceEngine(
 
     /**
      * A request that failed through the GPU driver (#325) leaves the
-     * resident handle wedged: free it now, or when the pinned live sessions
-     * end ([releaseLocked]). Propagate, not retry — this request still
-     * returns its failure, the next user-initiated load reloads (the native
-     * engine falls back to the CPU there), and speculative preloads stay
-     * off through ModelLifetime's DriverFailed. Caller holds [lock].
+     * resident handle wedged: free it now, pinned sessions or not. Pins
+     * protect a working model from a mid-take reload; a wedged one serves
+     * nobody, and keeping it until the pins drop would let the batch
+     * fallback of the failed take (which can win the lock before that take
+     * unpins) run into the same broken handle. Propagate, not retry: this
+     * request still returns its failure, the next request reloads (the
+     * native engine falls back to the CPU there), and speculative preloads
+     * stay off through ModelLifetime's DriverFailed. Caller holds [lock].
      */
     private fun releaseDriverFailureLocked(error: String) {
-        releaseLocked()
+        unload()
         loadError = error
     }
 
