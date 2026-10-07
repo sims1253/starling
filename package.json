@@ -21,7 +21,7 @@
     "fmt:check": "vp fmt --check packages/dictation packages/serve vite.config.ts"
   },
   "devDependencies": {
-    "@oxlint/plugins": "1.85.0",
+    "@oxlint/plugins": "1.86.0",
     "@types/node": "catalog:",
     "typescript": "catalog:",
     "vite": "catalog:",
