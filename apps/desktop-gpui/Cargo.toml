@@ -1,3 +1,10 @@
 [workspace]
-members = ["crates/dictation", "crates/processing", "crates/runtime", "crates/host", "crates/app"]
+members = [
+    "crates/dictation",
+    "crates/processing",
+    "crates/runtime",
+    "crates/host",
+    "crates/app",
+    "crates/insertion",
+]
 resolver = "2"

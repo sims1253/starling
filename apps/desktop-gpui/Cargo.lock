@@ -5710,6 +5710,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "starling-insertion"
+version = "0.1.0"
+dependencies = [
+ "starling-insertion",
+ "starling-runtime",
+ "windows-sys 0.59.0",
+ "x11rb",
+]
+
+[[package]]
 name = "starling-processing"
 version = "0.1.0"
 dependencies = [
