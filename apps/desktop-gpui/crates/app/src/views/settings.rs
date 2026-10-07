@@ -36,6 +36,7 @@ pub fn render_settings_modal(
     let draft_terms = app.draft_terms.clone();
     let engine_section = render_engine_section(app, cx);
     let processing_section = render_processing_section(app, cx);
+    let microphone_section = crate::views::microphone::render_microphone_section(app, cx);
     let dictation_section = render_dictation_section(app, cx);
 
     let card = div()
@@ -166,6 +167,7 @@ pub fn render_settings_modal(
             )
         })
         .child(dictation_section)
+        .child(microphone_section)
         .child(processing_section)
         .child(
             div()

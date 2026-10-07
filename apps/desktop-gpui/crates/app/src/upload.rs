@@ -600,13 +600,9 @@ impl StarlingApp {
                 Err(err) => {
                     // #222: missing, refused and failing inputs each get
                     // their own explanation and recovery actions.
-                    self.error = Some(format!(
-                        "{} {}",
-                        err.problem.message(),
-                        err.problem.recovery()
-                    ));
+                    let text = format!("{} {}", err.problem.message(), err.problem.recovery());
                     self.mic.last_route = err.route;
-                    self.mic.problem = Some(err.problem);
+                    self.report_input_problem(err.problem, text);
                     cx.notify();
                     false
                 }
@@ -741,11 +737,15 @@ impl StarlingApp {
                 })
             }
             CancelReason::InputLost => {
-                let what = self
-                    .mic
-                    .interruption
-                    .take()
-                    .unwrap_or_else(|| "The microphone stopped mid-recording".to_string());
+                let (what, problem) = self.mic.interruption.take().unwrap_or_else(|| {
+                    (
+                        "The microphone stopped mid-recording".to_string(),
+                        starling_dictation::microphone::InputProblem::Unavailable {
+                            device: "The microphone".to_string(),
+                            detail: "it stopped during the last recording".to_string(),
+                        },
+                    )
+                });
                 let mut lost = format!(
                     "{what}. Check the microphone (Settings → Microphone can test it or pick \
                      another), then record again."
@@ -756,7 +756,7 @@ impl StarlingApp {
                         stop_error.trim_end_matches('.')
                     );
                 }
-                self.error = Some(lost);
+                self.report_input_problem(problem, lost);
                 kept.then(|| {
                     "The recording was interrupted when the microphone stopped. Everything \
                      captured before that is in your history as an interrupted recording; \

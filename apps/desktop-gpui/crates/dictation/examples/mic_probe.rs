@@ -7,8 +7,8 @@
 
 use std::time::Duration;
 
-use starling_dictation::microphone::{SignalLevel, list_input_devices};
-use starling_dictation::recorder::{CaptureRequest, start_capture};
+use starling_dictation::microphone::{list_input_devices, SignalLevel};
+use starling_dictation::recorder::{start_capture, CaptureRequest};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -26,7 +26,10 @@ fn main() {
         Err(err) => println!("listing failed: {err}"),
     }
 
-    println!("preferred: {}", preferred.as_deref().unwrap_or("<follow system default>"));
+    println!(
+        "preferred: {}",
+        preferred.as_deref().unwrap_or("<follow system default>")
+    );
     let handle = match start_capture(CaptureRequest {
         journals_dir: None,
         preferred_device: preferred.as_deref(),

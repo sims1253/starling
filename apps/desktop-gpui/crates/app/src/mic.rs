@@ -14,9 +14,7 @@ use std::time::{Duration, Instant};
 
 use gpui::{AppContext, Context, Window};
 use starling_dictation::client::StarlingClient;
-use starling_dictation::microphone::{
-    self, InputDevice, InputProblem, InputRoute, SignalLevel,
-};
+use starling_dictation::microphone::{self, InputDevice, InputProblem, InputRoute, SignalLevel};
 use starling_dictation::recorder::{self, CaptureRequest, RecorderFault, RecorderHandle};
 
 use crate::app::StarlingApp;
@@ -227,14 +225,16 @@ pub(crate) struct MicState {
     /// The input the latest main take opened, for "last recorded from".
     pub(crate) last_route: Option<InputRoute>,
     /// An input problem that stopped a main take from starting (or ended
-    /// it), with its recovery actions shown in the capture pane.
-    pub(crate) problem: Option<InputProblem>,
+    /// it), beside the exact error-banner text it produced: the banner
+    /// offers the problem's recovery actions only while it still shows
+    /// that text, never under an unrelated later error.
+    pub(crate) problem: Option<(InputProblem, String)>,
     /// The outcome of the last "open sound settings" action, when it
     /// could not open anything.
     pub(crate) settings_launch_error: Option<String>,
     /// Why the current take is being ended as interrupted, read by the
     /// cancel path (`CancelReason::InputLost`).
-    pub(crate) interruption: Option<String>,
+    pub(crate) interruption: Option<(String, InputProblem)>,
 }
 
 impl Default for MicState {
@@ -313,6 +313,36 @@ pub(crate) fn live_interruption(handle: &RecorderHandle) -> Option<Interruption>
 }
 
 impl StarlingApp {
+    /// Shows `text` in the error banner as the explanation of `problem`,
+    /// so the banner can offer that problem's recovery actions.
+    pub(crate) fn report_input_problem(&mut self, problem: InputProblem, text: String) {
+        self.error = Some(text.clone());
+        self.mic.problem = Some((problem, text));
+    }
+
+    /// The input problem the error banner is currently explaining.
+    pub(crate) fn shown_input_problem(&self) -> Option<&InputProblem> {
+        let (problem, text) = self.mic.problem.as_ref()?;
+        (self.error.as_deref() == Some(text.as_str())).then_some(problem)
+    }
+
+    /// The capture pane's headline override while a take records: never
+    /// "listening" to an input that is silent or not responding.
+    pub(crate) fn live_input_headline(&self) -> Option<&'static str> {
+        let handle = self.recorder.as_ref()?;
+        match live_input(handle.elapsed(), handle.source_peak(), {
+            if handle.captured_sample_count() > 0 {
+                handle.input_stalled_for()
+            } else {
+                Duration::ZERO
+            }
+        }) {
+            LiveInput::Listening => None,
+            LiveInput::Silent => Some("No sound from the microphone."),
+            LiveInput::NotResponding => Some("The microphone stopped responding."),
+        }
+    }
+
     /// Records why the running take lost its input, if it did; `true`
     /// when the take must end as interrupted.
     pub(crate) fn note_live_interruption(&mut self) -> bool {
@@ -326,11 +356,11 @@ impl StarlingApp {
             .input_route()
             .map(|route| route.device.clone())
             .unwrap_or_else(|| "The microphone".to_string());
-        self.mic.problem = Some(InputProblem::Unavailable {
+        let problem = InputProblem::Unavailable {
             device: device.clone(),
             detail: "it stopped during the last recording".to_string(),
-        });
-        self.mic.interruption = Some(interruption.describe(&device));
+        };
+        self.mic.interruption = Some((interruption.describe(&device), problem));
         true
     }
 
@@ -344,11 +374,6 @@ impl StarlingApp {
         if self.note_live_interruption() {
             self.activation_input(|machine| machine.input_lost(take), cx);
         }
-    }
-
-    /// The microphone preference takes resolve against now (committed).
-    pub(crate) fn preferred_microphone(&self) -> Option<&str> {
-        self.microphone_settings.preferred_device.as_deref()
     }
 
     /// Lists capture devices off the UI thread (ALSA probes each PCM).
@@ -435,10 +460,8 @@ impl StarlingApp {
             .as_ref()
             .map(|route| route.device.clone())
             .unwrap_or_else(|| "The microphone".to_string());
-        let interruption = take_interruption(
-            handle.capture_fault().as_ref(),
-            handle.input_stalled_for(),
-        );
+        let interruption =
+            take_interruption(handle.capture_fault().as_ref(), handle.input_stalled_for());
         let stopped = handle.stop();
         let audio = match stopped {
             Ok(take) => take.audio,
@@ -579,7 +602,10 @@ mod tests {
 
     #[test]
     fn a_failed_listing_never_drops_the_preferred_device_from_the_picker() {
-        let rows = picker_rows(&DeviceList::Failed("ALSA busy".to_string()), Some("USB Mic"));
+        let rows = picker_rows(
+            &DeviceList::Failed("ALSA busy".to_string()),
+            Some("USB Mic"),
+        );
         assert_eq!(rows.len(), 2);
         assert!(rows[1].selected);
         assert_eq!(rows[1].device.as_deref(), Some("USB Mic"));
@@ -602,7 +628,10 @@ mod tests {
         let journal = RecorderFault::Journal("disk full".to_string());
         let device_fault = RecorderFault::Device("device unplugged".to_string());
         assert_eq!(take_interruption(None, Duration::ZERO), None);
-        assert_eq!(take_interruption(Some(&journal), Duration::from_secs(1)), None);
+        assert_eq!(
+            take_interruption(Some(&journal), Duration::from_secs(1)),
+            None
+        );
         assert_eq!(
             take_interruption(Some(&device_fault), Duration::ZERO),
             Some(Interruption::DeviceFailed("device unplugged".to_string()))
@@ -611,7 +640,10 @@ mod tests {
             take_interruption(None, STALL_LIMIT),
             Some(Interruption::Stalled(STALL_LIMIT))
         );
-        assert_eq!(take_interruption(None, STALL_LIMIT - Duration::from_millis(1)), None);
+        assert_eq!(
+            take_interruption(None, STALL_LIMIT - Duration::from_millis(1)),
+            None
+        );
         let text = Interruption::Stalled(Duration::from_secs(5)).describe("USB Mic");
         assert!(text.contains("USB Mic") && text.contains("5 s"), "{text}");
     }
@@ -619,7 +651,10 @@ mod tests {
     #[test]
     fn the_pane_stops_claiming_to_listen_to_a_dead_or_silent_input() {
         let quick = Duration::from_millis(5);
-        assert_eq!(live_input(Duration::from_secs(1), 0.0, quick), LiveInput::Listening);
+        assert_eq!(
+            live_input(Duration::from_secs(1), 0.0, quick),
+            LiveInput::Listening
+        );
         assert_eq!(live_input(SILENCE_GRACE, 0.0, quick), LiveInput::Silent);
         assert_eq!(live_input(SILENCE_GRACE, 0.2, quick), LiveInput::Listening);
         assert_eq!(

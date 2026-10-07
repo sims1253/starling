@@ -202,14 +202,16 @@ pub(crate) fn open_input(
         }
         RoutePlan::Default(reason) => reason,
     };
-    let device = host.default_input_device().ok_or_else(|| InputProblem::NoDevice {
-        detail: match (&reason, preferred) {
-            (RouteReason::PreferredMissing, Some(name)) => format!(
-                "{name} is not connected and there is no other microphone to fall back to."
-            ),
-            _ => "No microphone was found.".to_string(),
-        },
-    })?;
+    let device = host
+        .default_input_device()
+        .ok_or_else(|| InputProblem::NoDevice {
+            detail: match (&reason, preferred) {
+                (RouteReason::PreferredMissing, Some(name)) => format!(
+                    "{name} is not connected and there is no other microphone to fall back to."
+                ),
+                _ => "No microphone was found.".to_string(),
+            },
+        })?;
     let name = device
         .name()
         .unwrap_or_else(|_| "system default input".to_string());
@@ -255,9 +257,9 @@ impl InputProblem {
             InputProblem::PermissionDenied { device, detail } => {
                 format!("Microphone access to {device} was denied: {detail}")
             }
-            InputProblem::Silent { device } => format!(
-                "{device} is delivering silence — no sound at all reached Starling."
-            ),
+            InputProblem::Silent { device } => {
+                format!("{device} is delivering silence — no sound at all reached Starling.")
+            }
             InputProblem::Failed { device, detail } => {
                 format!("{device} could not be used: {detail}")
             }
@@ -311,9 +313,15 @@ pub(crate) fn classify_backend(device: &str, unavailable: bool, detail: String) 
         return InputProblem::Unavailable { device, detail };
     }
     let lower = detail.to_ascii_lowercase();
-    let denied = ["access is denied", "access denied", "permission", "not permitted", "0x80070005"]
-        .iter()
-        .any(|needle| lower.contains(needle));
+    let denied = [
+        "access is denied",
+        "access denied",
+        "permission",
+        "not permitted",
+        "0x80070005",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle));
     if denied {
         InputProblem::PermissionDenied { device, detail }
     } else {
@@ -518,7 +526,11 @@ mod tests {
         ];
         let recoveries: std::collections::HashSet<_> =
             problems.iter().map(InputProblem::recovery).collect();
-        assert_eq!(recoveries.len(), problems.len(), "recoveries must be distinct");
+        assert_eq!(
+            recoveries.len(),
+            problems.len(),
+            "recoveries must be distinct"
+        );
         let messages: std::collections::HashSet<_> =
             problems.iter().map(InputProblem::message).collect();
         assert_eq!(messages.len(), problems.len(), "messages must be distinct");
@@ -536,7 +548,11 @@ mod tests {
             .collect();
         let level = SignalLevel::measure(&room);
         assert!(!level.is_silent());
-        assert!((level.rms_dbfs() - (-70.5)).abs() < 1.0, "{}", level.rms_dbfs());
+        assert!(
+            (level.rms_dbfs() - (-70.5)).abs() < 1.0,
+            "{}",
+            level.rms_dbfs()
+        );
         // Non-finite samples are ignored rather than poisoning the level.
         let level = SignalLevel::measure(&[f32::NAN, 0.5, -0.5]);
         assert_eq!(level.peak, 0.5);
