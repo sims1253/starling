@@ -1,14 +1,15 @@
-//! `starling-mcp-dictation` — the MCP stdio server a coding agent
-//! launches (issue #309). Stdin/stdout are the agent's JSON-RPC 2.0;
+//! `mcp-dictation` — the MCP stdio server a coding agent launches
+//! (issue #309). Stdin/stdout are the agent's JSON-RPC 2.0;
 //! everything else (errors, diagnostics) goes to stderr, because
 //! stdout belongs to the protocol alone.
 //!
 //! The process connects to the Starling runtime host over the same
 //! authenticated IPC transport as the desktop app, identifies itself
-//! with `--client`/`--token` against the host's allowlist (default
-//! deny — see `starling_runtime_host::agent`), and then serves exactly
-//! one tool, `ask_user_dictation`, bridging `tools/call` onto the
-//! host's ask surface.
+//! with `--client` and its token (the `STARLING_MCP_TOKEN`
+//! environment variable, or `--token` as a fallback) against the
+//! host's allowlist (default deny — see `starling_runtime_host::agent`),
+//! and then serves exactly one tool, `ask_user_dictation`, bridging
+//! `tools/call` onto the host's ask surface.
 //!
 //! Exit contract:
 //! - `0` on a clean stdin EOF (the agent closed the session);
@@ -26,18 +27,26 @@ use starling_runtime_host::client::HostClient;
 use starling_runtime_host::mcp::{AskSink, McpServer};
 use starling_runtime_host::{default_data_root, platform};
 
+/// The environment variable the allowlist token is read from — the
+/// preferred channel: `--token` on the command line is world-readable
+/// through `/proc/<pid>/cmdline`, an environment variable is not.
+const TOKEN_ENV: &str = "STARLING_MCP_TOKEN";
+
 fn usage() -> ! {
     eprintln!(
-        "starling-mcp-dictation — the Starling dictation MCP server (issue #309)
+        "mcp-dictation — the Starling dictation MCP server (issue #309)
 
 USAGE:
-    starling-mcp-dictation --client <name> --token <token> [options]
+    mcp-dictation --client <name> [options]
+
+    The token is read from the {TOKEN_ENV} environment variable
+    (preferred — argv is world-readable via /proc/<pid>/cmdline).
 
 OPTIONS:
     --client <name>   the allowlisted agent client name (see the host's
                       {ALLOWLIST_FILE})
-    --token <token>   that client's token (the same string the allowlist
-                      file carries)
+    --token <token>   that client's token (fallback when {TOKEN_ENV}
+                      is unset)
     --socket <path>   the runtime host's IPC endpoint
                       (default: derived from the default data root)
     --root <dir>      the storage v2 data root whose host to use
@@ -93,8 +102,10 @@ fn main() {
         eprintln!("--client is required (the allowlisted agent client name)");
         usage();
     };
+    // The environment variable first; the flag is the fallback.
+    let token = std::env::var(TOKEN_ENV).ok().or(token);
     let Some(token) = token else {
-        eprintln!("--token is required (that client's allowlist token)");
+        eprintln!("a token is required: set {TOKEN_ENV} (or pass --token)");
         usage();
     };
     let socket = socket.unwrap_or_else(|| {
@@ -103,7 +114,7 @@ fn main() {
             // root fails at connect with the endpoint missing, which
             // is the honest error.
             default_data_root().unwrap_or_else(|err| {
-                eprintln!("starling-mcp-dictation: {err}");
+                eprintln!("mcp-dictation: {err}");
                 std::process::exit(1);
             }));
         platform::socket_path(&platform::default_runtime_dir(), &root)
@@ -118,7 +129,7 @@ fn main() {
                 Ok(client) => break client,
                 Err(err) if Instant::now() >= deadline => {
                     eprintln!(
-                        "starling-mcp-dictation: no Starling host at {} within 5s: {err}; \
+                        "mcp-dictation: no Starling host at {} within 5s: {err}; \
                          start the desktop app or starling-runtime-host first",
                         socket.display()
                     );
@@ -134,7 +145,7 @@ fn main() {
     // not allowlisted fails fast with the refusal on stderr.
     if let Err(err) = client.agent_hello(&client_name, &token) {
         eprintln!(
-            "starling-mcp-dictation: the host refused client {client_name:?}: {err}; \
+            "mcp-dictation: the host refused client {client_name:?}: {err}; \
              add the client to the host's {ALLOWLIST_FILE}"
         );
         std::process::exit(1);
@@ -180,10 +191,16 @@ fn main() {
     // ask is cancelled — the deliberate disconnect rule.
     server.serve_read(BufReader::new(std::io::stdin().lock()), &sink);
     server.cancel_pending(&sink, "the agent closed the MCP session");
-    // Dropping the client ends the connection; the host's broker sees
-    // the disconnect and aborts any take the cancels could not reach
-    // (the belt-and-braces pair of rules — see docs/mcp-dictation.md).
-    drop(client);
+    // End the host connection explicitly (the drain thread holds its
+    // own client handle, so dropping this one would not): the host's
+    // broker sees the disconnect and aborts any take the cancels could
+    // not reach (the belt-and-braces pair of rules — see
+    // docs/mcp-dictation.md), and the drain thread's poll sees the
+    // connection closed and exits.
+    client.close();
+    // Drop the writer's sender so the writer thread drains its queue
+    // and exits too — without this both joins below would wait forever.
+    server.shutdown_writer();
     let _ = pump.join();
     let _ = writer.join();
     std::process::exit(0);

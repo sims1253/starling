@@ -35,7 +35,7 @@
 //! - [`mcp`] — the MCP stdio server (JSON-RPC 2.0, no dependencies):
 //!   what a coding agent launches and talks to; the bridge between
 //!   its `tools/call` and [`agent`]'s ask frames. The binary a coding
-//!   agent registers is `starling-mcp-dictation` (`src/bin`).
+//!   agent registers is `mcp-dictation` (`src/bin`).
 //! - [`client`] — the client library the GPUI app will hold (the
 //!   Electron comparison app has since been removed from the tree).
 //!

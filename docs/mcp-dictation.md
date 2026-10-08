@@ -6,7 +6,7 @@ desktop app shows the prompt, and the agent receives the spoken answer
 as the tool result.
 
 ```
-coding agent ──JSON-RPC 2.0 (stdio)── starling-mcp-dictation
+coding agent ──JSON-RPC 2.0 (stdio)── mcp-dictation
                                           │ AgentHello/AskUser (host IPC,
                                           │ same-user authenticated)
                                           ▼
@@ -37,20 +37,27 @@ today; see *What is deliberately not here* below).
   fails with the typed error `no_prompt_ack` and the mic is never
   touched; with no app connection attached the ask fails immediately.
   A prompt dismissed mid-take (`visible: false` after the take began)
-  stops the capture.
+  stops the capture. Acks are **bound**: only a connection the prompt
+  was fanned out to may ack it, only the acking connection's later
+  frames (dismiss, done) count, and an agent-flagged connection
+  sending ack/done is closed as a protocol violation — an allowlisted
+  agent cannot forge the app side of the handshake to open the mic.
 - **Per-client allowlist, default deny.** MCP over stdio has no strong
   client identity (whoever can spawn a process can speak the
   protocol), so the boundary is a shared secret the *user* provisions:
   `<data_root>/mcp-clients.json` names each agent client and its
-  token, and the same token is registered in the agent's MCP config.
-  The token rides the host's same-user-authenticated IPC transport (UDS
-  `SO_PEERCRED` / a DACL'd named pipe), so it is not exposed
-  cross-user; but this is a *user intent* boundary (which agents may
-  summon the mic), not a defense against malware already running as
-  the same user. Unknown client, wrong token, or no allowlist file →
-  the agent hello is refused (`auth_failed`) and the connection
-  closes. A malformed allowlist file refuses host startup (fail
-  closed, loudly).
+  token, and the same token is registered in the agent's MCP config
+  (passed via the `STARLING_MCP_TOKEN` environment variable — not on
+  the command line, which is world-readable through
+  `/proc/<pid>/cmdline`). The token rides the host's
+  same-user-authenticated IPC transport (UDS `SO_PEERCRED` / a DACL'd
+  named pipe), so it is not exposed cross-user; but this is a *user
+  intent* boundary (which agents may summon the mic), not a defense
+  against malware already running as the same user. Unknown client,
+  wrong token, or no allowlist file → the agent hello is refused
+  (`auth_failed`) and the connection closes. A malformed allowlist
+  file (including duplicate client names, which would silently
+  shadow) refuses host startup (fail closed, loudly).
 - **Queueing.** Concurrent `tools/call`s (and asks from several
   agents) are serialized by the host broker: one visible prompt, one
   live capture at a time; the rest wait in a bounded queue (4) and
@@ -62,8 +69,12 @@ today; see *What is deliberately not here* below).
   the prompt hides, and the caller receives the typed no-answer
   `agent_cancelled`.
 - **Timeout.** `timeout_ms` (default 120 000, bounds 1 000–600 000)
-  covers admission → prompt → speaking → transcription; expiry aborts
-  a live take and returns the typed no-answer `timeout`.
+  covers admission → prompt → speaking; it ends when the microphone
+  closes, so a captured take is never discarded on the clock —
+  persistence and transcription run to their own outcome (cancel,
+  disconnect, and shutdown still end them). While the prompt waits or
+  the mic is open, expiry aborts a live take and returns the typed
+  no-answer `timeout`.
 - **Disconnect.** An ask is bound to the connection that sent it: that
   connection dying — EOF, crash, `kill -9` of the MCP server — cancels
   its asks the same way an explicit cancel would. This rule is
@@ -103,18 +114,21 @@ speaking.
    ```
 
    Missing file = deny all (the unconfigured host serves; MCP clients
-   are refused). Restart the host after editing the file (it is read
-   once at startup).
+   are refused). The file is read once at startup and never re-read —
+   rotating a token requires editing the file and restarting the host.
 
 2. **Register the command with the agent.** The binary is
-   `starling-mcp-dictation` from the desktop workspace
+   `mcp-dictation` from the desktop workspace
    (`cargo build -p starling-runtime-host` in `apps/desktop-gpui`).
+   Pass the token through the `STARLING_MCP_TOKEN` environment
+   variable — not `--token` — so it stays out of the world-readable
+   command line.
 
    **Claude Code** (project or user scope):
 
    ```bash
-   claude mcp add --transport stdio starling-dictation -- \
-     /path/to/starling-mcp-dictation --client claude-code --token <paste-your-token>
+   claude mcp add --transport stdio starling-dictation --env STARLING_MCP_TOKEN=<paste-your-token> -- \
+     /path/to/mcp-dictation --client claude-code
    ```
 
    or in `.mcp.json` / `~/.claude.json`:
@@ -124,9 +138,9 @@ speaking.
      "mcpServers": {
        "starling-dictation": {
          "type": "stdio",
-         "command": "/path/to/starling-mcp-dictation",
-         "args": ["--client", "claude-code", "--token", "<paste-your-token>"],
-         "env": {}
+         "command": "/path/to/mcp-dictation",
+         "args": ["--client", "claude-code"],
+         "env": {"STARLING_MCP_TOKEN": "<paste-your-token>"}
        }
      }
    }
@@ -136,12 +150,14 @@ speaking.
 
    ```toml
    [mcp_servers.starling-dictation]
-   command = "/path/to/starling-mcp-dictation"
-   args = ["--client", "codex", "--token", "<paste-your-token>"]
+   command = "/path/to/mcp-dictation"
+   args = ["--client", "codex"]
+   env = { "STARLING_MCP_TOKEN" = "<paste-your-token>" }
    ```
 
    The server derives the host endpoint from the default data root;
-   `--socket <path>` or `--root <dir>` override it. `--help` documents
+   `--socket <path>` or `--root <dir>` override it. `--token` still
+   works as a fallback for throwaway setups. `--help` documents
    everything.
 
 3. **Ask.** The agent now sees `ask_user_dictation`; the desktop app

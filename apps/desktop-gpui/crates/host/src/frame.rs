@@ -209,12 +209,16 @@ pub enum Frame {
     /// `visible: false` declines the ask (resolved as
     /// [`AskOutcome::NoAnswer`] declined). A later `visible: false`
     /// after the take started cancels it (the user dismissed the
-    /// prompt — the mic must stop).
+    /// prompt — the mic must stop). Only a connection this prompt was
+    /// fanned out to may ack it, and only an app connection may send
+    /// it at all (an agent connection's ack is a protocol violation —
+    /// it never received a prompt to ack).
     PromptAck { req: String, visible: bool },
     /// The app reporting that the user finished speaking (app → host):
     /// the host stops the capture, persists the take, transcribes it,
-    /// and answers the agent. Sent only after that connection's
-    /// `visible: true` ack.
+    /// and answers the agent. Only the connection whose `visible:
+    /// true` ack opened the gate may send it; an early Done (before
+    /// any ack) is ignored.
     PromptDone { req: String },
 }
 
@@ -240,8 +244,9 @@ pub enum AskOutcome {
     NoAnswer { reason: NoAnswerReason },
     /// The ask was refused or failed. `code` is a closed vocabulary:
     /// `not_allowlisted`, `invalid_questions`, `invalid_timeout`,
-    /// `queue_full`, `no_prompt_ack`, `capture_busy`, `capture_failed`,
-    /// `transcription_failed`, `shutting_down`.
+    /// `duplicate_req`, `queue_full`, `host_busy`, `no_prompt_ack`,
+    /// `capture_busy`, `capture_failed`, `transcription_failed`,
+    /// `shutting_down`.
     Error { code: String, message: String },
 }
 
@@ -249,8 +254,9 @@ pub enum AskOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NoAnswerReason {
-    /// The ask's `timeout_ms` budget expired (from admission — prompt
-    /// display, speaking, and transcription all draw on it).
+    /// The ask's `timeout_ms` budget expired (it runs from admission
+    /// until the microphone closes — prompt display and speaking draw
+    /// on it; a captured take is never discarded on the clock).
     Timeout,
     /// The agent cancelled (MCP `notifications/cancelled`, disconnect,
     /// or an explicit cancel frame).

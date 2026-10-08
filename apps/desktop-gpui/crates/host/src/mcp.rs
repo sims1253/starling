@@ -145,6 +145,14 @@ impl McpServer {
             .expect("mcp writer spawn")
     }
 
+    /// Drops the writer's sender so the writer thread drains what is
+    /// queued and exits — the shutdown path (every reply already
+    /// queued still reaches stdout; later writes drop with nobody to
+    /// serve them).
+    pub fn shutdown_writer(&self) {
+        self.inner.out.lock().expect("mcp writer lock").take();
+    }
+
     /// Reads stdin until EOF, answering everything. Returns on EOF (or
     /// a stdin error — the agent is gone either way); the caller then
     /// cancels what is pending ([`McpServer::cancel_pending`]).
@@ -505,7 +513,9 @@ pub fn tool_spec() -> Value {
                     "minimum": MIN_TIMEOUT_MS,
                     "maximum": MAX_TIMEOUT_MS,
                     "default": DEFAULT_TIMEOUT_MS,
-                    "description": "The ask's total budget, from the prompt appearing.",
+                    "description": "The ask's budget, from the prompt appearing until \
+                                    the microphone closes; a captured answer is never \
+                                    discarded on the clock.",
                 },
             },
             "required": ["questions"],

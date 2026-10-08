@@ -384,10 +384,19 @@ pub(crate) enum BrokerMsg {
         client_req: String,
         reason: String,
     },
-    /// `Frame::PromptAck` from any connection.
-    Ack { ask_id: String, visible: bool },
-    /// `Frame::PromptDone` from any connection.
-    Done { ask_id: String },
+    /// `Frame::PromptAck` from a non-agent connection (the reader
+    /// refuses agent ones — they never receive a prompt to ack), with
+    /// the connection that sent it (the broker binds acks to the
+    /// connections the prompt was fanned out to).
+    Ack {
+        conn: Arc<ConnState>,
+        ask_id: String,
+        visible: bool,
+    },
+    /// `Frame::PromptDone` from a non-agent connection, with the
+    /// connection that sent it (only the acking connection's done
+    /// counts).
+    Done { conn: Arc<ConnState>, ask_id: String },
     /// A connection ended: cancel its asks (the disconnect rule).
     ConnGone { conn: Arc<ConnState> },
 }
@@ -989,18 +998,44 @@ fn connection_reader(
                             reason,
                         });
                     }
-                    // The app side of the prompt handshake — any
-                    // authenticated connection may play it (the GPUI
-                    // app is the intended player; tests drive it the
-                    // same way).
+                    // The app side of the prompt handshake — the GPUI
+                    // app plays it (tests drive it the same way). An
+                    // agent-flagged connection cannot: it never
+                    // receives a ShowPrompt (it is the asker, not the
+                    // askee), so its ack/done can only be a forge
+                    // attempt against the visibility gate.
                     Frame::PromptAck { req, visible } => {
+                        if state.is_agent() {
+                            terminate(
+                                &state,
+                                TransportErrorCode::ProtocolViolation,
+                                "prompt_ack from an agent connection: the prompt handshake \
+                                 is the app side"
+                                    .to_string(),
+                            );
+                            break;
+                        }
                         let _ = shared.broker.try_send(BrokerMsg::Ack {
+                            conn: Arc::clone(&state),
                             ask_id: req,
                             visible,
                         });
                     }
                     Frame::PromptDone { req } => {
-                        let _ = shared.broker.try_send(BrokerMsg::Done { ask_id: req });
+                        if state.is_agent() {
+                            terminate(
+                                &state,
+                                TransportErrorCode::ProtocolViolation,
+                                "prompt_done from an agent connection: the prompt handshake \
+                                 is the app side"
+                                    .to_string(),
+                            );
+                            break;
+                        }
+                        let _ = shared.broker.try_send(BrokerMsg::Done {
+                            conn: Arc::clone(&state),
+                            ask_id: req,
+                        });
                     }
                     Frame::GetSnapshot { req } => {
                         let snapshot = shared.client.snapshot();

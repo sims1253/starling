@@ -9,15 +9,24 @@
 //!   microphone (the fake source's `started_takes`) opens only after
 //!   the app acked, and an un-acked ask fails `no_prompt_ack` with the
 //!   mic never touched.
+//! - **Ack binding (anti-forgery)** —
+//!   `a_forged_ack_from_a_connection_that_never_saw_the_prompt_is_ignored`
+//!   and `an_agent_connection_cannot_forge_prompt_frames`.
 //! - **Allowlist (default deny)** — `agent_hello_is_checked_against_the_allowlist`
 //!   and `asks_from_non_agent_connections_are_refused`.
-//! - **Queueing** — `concurrent_asks_queue_one_prompt_at_a_time`.
+//! - **Queueing** — `concurrent_asks_queue_one_prompt_at_a_time` and
+//!   `a_duplicate_in_flight_ask_token_is_refused_with_duplicate_req`.
 //! - **Cancel** — `agent_cancel_mid_recording_stops_the_capture`.
-//! - **Timeout** — `timeout_mid_recording_returns_no_answer`.
+//! - **Timeout** — `timeout_mid_recording_returns_no_answer` and
+//!   `the_budget_ends_at_capture_stop_so_a_captured_take_survives_slow_transcription`.
 //! - **Disconnect** — `agent_disconnect_mid_recording_cancels_the_take`
 //!   (the deliberate rule: the ask dies with its connection).
+//! - **Early done** — `a_done_before_the_visibility_ack_is_ignored_not_failed`.
+//! - **The binary** — `the_stdio_server_exits_zero_promptly_on_stdin_eof`
+//!   (spawns the real `mcp-dictation` against the real host).
 //! - **End to end** — `a_spoken_answer_flows_back_as_the_tool_result`.
 
+use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -699,6 +708,226 @@ fn late_prompt_frames_for_resolved_asks_are_ignored() {
         AskOutcome::Answered { text, .. } => assert_eq!(text, "fine"),
         other => panic!("second ask: {other:?}"),
     }
+
+    host.shutdown();
+}
+
+#[test]
+fn a_done_before_the_visibility_ack_is_ignored_not_failed() {
+    // An early Done (before any ack) is the app misbehaving: it must
+    // be ignored — the ack bound still applies — never resolved as a
+    // capture failure, and the ask must stay live for an honest ack.
+    let root = tempfile::tempdir().unwrap();
+    let source = one_clean_take();
+    let provider = FakeProvider::new(vec![FakeJob::completes_with("yes")]);
+    let (mut host, path) = boot(root.path(), source.clone(), provider);
+
+    let app = connect(&path);
+    let agent = agent(&path);
+    agent.ask_user("1", &["Ready?".into()], 20_000).unwrap();
+    let shown = until_ui(&app, "ShowPrompt", |frame| matches!(frame, UiWire::Show { .. }));
+
+    // Done with no ack in sight.
+    app.prompt_done(&ask_id_of(&shown)).unwrap();
+    std::thread::sleep(Duration::from_millis(250));
+    assert!(
+        source.started_takes.lock().unwrap().is_empty(),
+        "an early done must not open the mic or resolve the ask"
+    );
+    assert_eq!(capture_state(&app), "Idle");
+
+    // The ask survived: an honest decline still resolves it.
+    app.prompt_ack(&ask_id_of(&shown), false).unwrap();
+    match until_ask(&agent, "1") {
+        AskOutcome::NoAnswer { reason } => assert_eq!(reason, NoAnswerReason::Declined),
+        other => panic!("expected the decline after the ignored done, got {other:?}"),
+    }
+
+    host.shutdown();
+}
+
+#[test]
+fn a_forged_ack_from_a_connection_that_never_saw_the_prompt_is_ignored() {
+    // The binding: only a connection the prompt was fanned out to may
+    // ack it. A renderer connecting after the fan-out guesses the ask
+    // id and forges `visible: true` — the gate must stay shut, and the
+    // honest ack must still work.
+    let root = tempfile::tempdir().unwrap();
+    let source = FakeCaptureSource::new(vec![FakeTakeScript::clean(), FakeTakeScript::clean()]);
+    let provider = FakeProvider::new(vec![FakeJob::completes_with("yes")]);
+    let (mut host, path) = boot(root.path(), source.clone(), provider);
+
+    let app = connect(&path);
+    let agent = agent(&path);
+    agent.ask_user("1", &["Ready?".into()], 20_000).unwrap();
+    let shown = until_ui(&app, "ShowPrompt", |frame| matches!(frame, UiWire::Show { .. }));
+
+    // Connected after the fan-out: never shown this prompt.
+    let forger = connect(&path);
+    forger.prompt_ack(&ask_id_of(&shown), true).unwrap();
+    std::thread::sleep(Duration::from_millis(250));
+    assert!(
+        source.started_takes.lock().unwrap().is_empty(),
+        "a forged ack must not open the microphone"
+    );
+    assert_eq!(capture_state(&app), "Idle");
+
+    // The honest ack from the connection that was shown the prompt.
+    app.prompt_ack(&ask_id_of(&shown), true).unwrap();
+    until_event(&app, "capture.started", |e| e.type_name() == "capture.started");
+    assert_eq!(source.started_takes.lock().unwrap().len(), 1);
+    app.prompt_done(&ask_id_of(&shown)).unwrap();
+    match until_ask(&agent, "1") {
+        AskOutcome::Answered { text, .. } => assert_eq!(text, "yes"),
+        other => panic!("expected the answer after the honest ack, got {other:?}"),
+    }
+
+    host.shutdown();
+}
+
+#[test]
+fn an_agent_connection_cannot_forge_prompt_frames() {
+    // An agent-flagged connection never receives a ShowPrompt, so its
+    // ack/done can only be a forge attempt: the host closes the
+    // connection as a protocol violation, and the disconnect rule
+    // then cancels its live ask.
+    let root = tempfile::tempdir().unwrap();
+    let source = one_clean_take();
+    let provider = FakeProvider::new(vec![]);
+    let (mut host, path) = boot(root.path(), source.clone(), provider);
+
+    let app = connect(&path);
+    let agent = agent(&path);
+    agent.ask_user("1", &["Ready?".into()], 20_000).unwrap();
+    let shown = until_ui(&app, "ShowPrompt", |frame| matches!(frame, UiWire::Show { .. }));
+
+    // The forged ack sends fine on the wire; the host's verdict
+    // follows.
+    agent.prompt_ack(&ask_id_of(&shown), true).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !agent.is_closed() {
+        assert!(Instant::now() < deadline, "the host never refused the forged ack");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(agent.close_reason().contains("protocol_violation"));
+
+    // The mic never opened, and the disconnect rule hid the prompt.
+    assert!(source.started_takes.lock().unwrap().is_empty());
+    until_ui(&app, "HidePrompt after the forged ack", |frame| {
+        matches!(frame, UiWire::Hide { .. })
+    });
+
+    host.shutdown();
+}
+
+#[test]
+fn a_duplicate_in_flight_ask_token_is_refused_with_duplicate_req() {
+    let root = tempfile::tempdir().unwrap();
+    let source = one_clean_take();
+    let provider = FakeProvider::new(vec![]);
+    let (mut host, path) = boot(root.path(), source, provider);
+
+    let app = connect(&path);
+    let agent = agent(&path);
+    agent.ask_user("dup", &["Ready?".into()], 30_000).unwrap();
+    let shown = until_ui(&app, "the live prompt", |frame| matches!(frame, UiWire::Show { .. }));
+
+    // The same token while the first is still in flight: refused with
+    // the accurate code (a duplicate correlation token, not an
+    // invalid-questions shape).
+    agent.ask_user("dup", &["Ready?".into()], 30_000).unwrap();
+    match until_ask(&agent, "dup") {
+        AskOutcome::Error { code, message } => {
+            assert_eq!(code, "duplicate_req", "{message}");
+        }
+        other => panic!("expected duplicate_req, got {other:?}"),
+    }
+
+    // The original ask is untouched and still resolvable.
+    app.prompt_ack(&ask_id_of(&shown), false).unwrap();
+    match until_ask(&agent, "dup") {
+        AskOutcome::NoAnswer { reason } => assert_eq!(reason, NoAnswerReason::Declined),
+        other => panic!("expected the decline of the original ask, got {other:?}"),
+    }
+
+    host.shutdown();
+}
+
+#[test]
+fn the_budget_ends_at_capture_stop_so_a_captured_take_survives_slow_transcription() {
+    // The timeout is user-facing: once the microphone closes it stops
+    // ticking, so a transcription slower than the whole budget still
+    // answers instead of discarding the captured take on the clock.
+    let root = tempfile::tempdir().unwrap();
+    let source = one_clean_take();
+    // Transcription outlasts the ask's entire budget.
+    let provider = FakeProvider::new(vec![FakeJob {
+        work_ms: 2_500,
+        ..FakeJob::completes_with("worth the wait")
+    }]);
+    let (mut host, path) = boot(root.path(), source.clone(), provider);
+
+    let app = connect(&path);
+    let agent = agent(&path);
+    agent.ask_user("1", &["Ready?".into()], 1_500).unwrap();
+    let shown = until_ui(&app, "ShowPrompt", |frame| matches!(frame, UiWire::Show { .. }));
+    app.prompt_ack(&ask_id_of(&shown), true).unwrap();
+    until_event(&app, "capture.started", |e| e.type_name() == "capture.started");
+    // The mic closes well before the budget expires.
+    app.prompt_done(&ask_id_of(&shown)).unwrap();
+
+    match until_ask(&agent, "1") {
+        AskOutcome::Answered { text, .. } => assert_eq!(text, "worth the wait"),
+        other => panic!("a captured take must not be discarded on the clock, got {other:?}"),
+    }
+    assert_eq!(source.started_takes.lock().unwrap().len(), 1);
+
+    host.shutdown();
+}
+
+#[test]
+fn the_stdio_server_exits_zero_promptly_on_stdin_eof() {
+    // The exit contract: a graceful stdin EOF (the agent closing the
+    // session) must end the process — drain thread, writer thread and
+    // all — with status 0, not park it forever on joined threads.
+    let root = tempfile::tempdir().unwrap();
+    let source = one_clean_take();
+    let provider = FakeProvider::new(vec![]);
+    let (mut host, path) = boot(root.path(), source, provider);
+    let _app = connect(&path);
+
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_mcp-dictation"))
+        .arg("--socket")
+        .arg(&path)
+        .arg("--client")
+        .arg(CLIENT)
+        // The preferred channel (argv would be world-readable).
+        .env("STARLING_MCP_TOKEN", TOKEN)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("the mcp-dictation binary builds and spawns");
+
+    // One handshake line, then EOF: the agent closed the session.
+    {
+        let mut stdin = child.stdin.take().expect("stdin piped");
+        writeln!(
+            stdin,
+            r#"{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{}}}}"#
+        )
+        .unwrap();
+    }
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait());
+    });
+    let status = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the server exited after stdin EOF instead of hanging")
+        .expect("the wait itself succeeded");
+    assert!(status.success(), "clean EOF exits 0, got {status:?}");
 
     host.shutdown();
 }

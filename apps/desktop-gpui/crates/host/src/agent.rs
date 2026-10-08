@@ -24,7 +24,13 @@
 //! - **Timeout**: each ask carries a `timeout_ms` budget that starts at
 //!   admission (when the ask leaves the queue — a queued ask shows no
 //!   prompt, so the user-facing clock starts when the prompt could).
-//!   Expiry aborts a live take and resolves `NoAnswer { timeout }`.
+//!   The budget is user-facing: it ends the moment the microphone
+//!   closes (`PromptDone` → `capture.stop`) — a take already captured
+//!   is never discarded on a wall clock. Persistence and transcription
+//!   run to their own outcome (the jobs machine's failure paths;
+//!   cancel, disconnect, and host shutdown still end them). While the
+//!   prompt waits or the mic is open, expiry aborts a live take and
+//!   resolves `NoAnswer { timeout }`.
 //! - **Agent cancel** (`Frame::AskCancel`, or the MCP layer's
 //!   `notifications/cancelled`): aborts a live take
 //!   (`NoAnswer { agent_cancelled }`); a queued ask is dropped without
@@ -43,6 +49,13 @@
 //!   [`ACK_BOUND`] (clamped by the ask's remaining budget) fails with
 //!   `Error { no_prompt_ack }` — no capture ever starts. A host with no
 //!   app connection attached fails the same way, immediately.
+//! - **Ack binding (anti-forgery)**: `PromptAck`/`PromptDone` count
+//!   only from a connection the prompt was actually fanned out to;
+//!   once a connection's `visible: true` opens the gate, only that
+//!   connection's later frames (dismiss, done) apply. Agent-flagged
+//!   connections never receive `ShowPrompt` and are refused at the
+//!   reader if they send ack/done — an allowlisted agent cannot open
+//!   the microphone by forging the app side of the handshake.
 //!
 //! # Trust boundary (documented honestly)
 //!
@@ -61,7 +74,7 @@
 //! alternative (an unmarked ask surface open to any connected renderer)
 //! would make "which agent started the mic" unanswerable.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -126,8 +139,11 @@ const POLL: Duration = Duration::from_millis(20);
 ///
 /// Unknown `version` values are refused (the file is user-writable
 /// configuration; silently guessing at a future shape could turn a
-/// refuse-list into an allowlist). Loaded once at host startup — see
-/// the module docs for the trust boundary this draws.
+/// refuse-list into an allowlist), as are duplicate client names (the
+/// second entry would silently shadow the first's token). Loaded once
+/// at host startup and never re-read — rotating a token means editing
+/// the file and restarting the host. See the module docs for the trust
+/// boundary this draws.
 #[derive(Debug, Clone, Default)]
 pub struct Allowlist {
     clients: Vec<(String, String)>,
@@ -199,11 +215,20 @@ impl Allowlist {
             )));
         }
         let mut clients = Vec::new();
+        let mut seen = HashSet::new();
         for entry in file.clients {
             if entry.name.is_empty() || entry.token.is_empty() {
                 return Err(malformed(
                     "every client needs a non-empty name and token".to_string(),
                 ));
+            }
+            // A duplicate name would silently shadow the first entry's
+            // token — refuse, matching the malformed-file posture.
+            if !seen.insert(entry.name.clone()) {
+                return Err(malformed(format!(
+                    "duplicate client name {:?}; names must be unique",
+                    entry.name
+                )));
             }
             clients.push((entry.name, entry.token));
         }
@@ -248,9 +273,17 @@ struct Ask {
     client_req: String,
     ask_id: String,
     questions: Vec<String>,
-    /// Budget start (admission) and total; every phase draws on it.
+    /// Budget start (admission) and total; every user-facing phase
+    /// draws on it (see the module docs for where it ends).
     started: Instant,
     timeout: Duration,
+    /// The app connections the prompt was fanned out to at admission —
+    /// the only connections whose `PromptAck` counts (the anti-forgery
+    /// binding; see the module docs).
+    shown_to: Vec<Arc<ConnState>>,
+    /// The connection whose `visible: true` ack opened the gate: the
+    /// only connection whose later frames (dismiss, done) apply.
+    acker: Option<Arc<ConnState>>,
 }
 
 impl Ask {
@@ -386,8 +419,12 @@ impl Broker {
                 client_req,
                 reason,
             } => self.on_cancel(&conn, &client_req, &reason),
-            BrokerMsg::Ack { ask_id, visible } => self.on_ack(ask_id, visible),
-            BrokerMsg::Done { ask_id } => self.on_done(ask_id),
+            BrokerMsg::Ack {
+                conn,
+                ask_id,
+                visible,
+            } => self.on_ack(ask_id, visible, &conn),
+            BrokerMsg::Done { conn, ask_id } => self.on_done(ask_id, &conn),
             BrokerMsg::ConnGone { conn } => self.on_conn_gone(&conn),
         }
     }
@@ -446,7 +483,7 @@ impl Broker {
             .is_some_and(|(ask, _)| ask.client_req == client_req && Arc::ptr_eq(&ask.conn, &conn));
         if duplicate {
             reject(
-                "invalid_questions",
+                "duplicate_req",
                 format!("ask token {client_req:?} is already in flight on this connection"),
             );
             return;
@@ -470,6 +507,8 @@ impl Broker {
             questions,
             started: Instant::now(),
             timeout: Duration::from_millis(timeout_ms),
+            shown_to: Vec::new(),
+            acker: None,
         });
     }
 
@@ -488,8 +527,11 @@ impl Broker {
             // The gate's first arm: with no app connection attached
             // there is nobody who could ever ack visibility — fail now
             // instead of burning the ack bound on a prompt nobody
-            // displays.
-            if !self.any_app_connection() {
+            // displays. The same snapshot is the fan-out set: the only
+            // connections that may later ack this prompt (the
+            // anti-forgery binding).
+            let apps = self.app_connections();
+            if apps.is_empty() {
                 ask.resolve(
                     &self.shared,
                     AskOutcome::Error {
@@ -500,26 +542,30 @@ impl Broker {
                 );
                 continue;
             }
-            fan_out_show(
-                &self.shared,
-                &ask.ask_id,
-                ask.questions.clone(),
-                ask.timeout.as_millis() as u64,
-            );
+            for conn in &apps {
+                let _ = conn.try_deliver(Frame::ShowPrompt {
+                    req: ask.ask_id.clone(),
+                    questions: ask.questions.clone(),
+                    timeout_ms: ask.timeout.as_millis() as u64,
+                });
+            }
+            ask.shown_to = apps;
             self.live = Some((ask, Phase::Prompting));
         }
     }
 
-    fn any_app_connection(&self) -> bool {
+    fn app_connections(&self) -> Vec<Arc<ConnState>> {
         self.shared
             .conns
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .iter()
-            .any(|conn| !conn.is_agent())
+            .filter(|conn| !conn.is_agent())
+            .cloned()
+            .collect()
     }
 
-    fn on_ack(&mut self, ask_id: String, visible: bool) {
+    fn on_ack(&mut self, ask_id: String, visible: bool, conn: &Arc<ConnState>) {
         enum AckEffect {
             None,
             Decline,
@@ -527,19 +573,37 @@ impl Broker {
             OpenGate(String),
         }
         let effect = match self.live.as_ref() {
-            Some((ask, phase)) if ask.ask_id == ask_id => match (phase, visible) {
-                // The gate opens: capture may start (after the
-                // route-freeze dance; see `Preparing`).
-                (Phase::Prompting, true) => AckEffect::OpenGate(ask.ask_id.clone()),
-                (Phase::Prompting, false) => AckEffect::Decline,
-                // A dismissal after the gate opened: the mic (or the
-                // job) must stop — the no-mic-without-a-visible-prompt
-                // rule is held for the whole take, not just its start.
-                (_, false) => AckEffect::Dismiss,
-                // A second visible:true restates what the gate already
-                // recorded; nothing to do.
-                _ => AckEffect::None,
-            },
+            Some((ask, phase)) if ask.ask_id == ask_id => {
+                // The binding (anti-forgery): only a connection the
+                // prompt was fanned out to may ack it, and once the
+                // gate opened only the acking connection's frames
+                // count — an ack from anyone else (an agent forging
+                // the app side, a connection that never saw the
+                // prompt) is dropped on the floor.
+                if !ask.shown_to.iter().any(|c| Arc::ptr_eq(c, conn)) {
+                    AckEffect::None
+                } else {
+                    let from_acker = ask
+                        .acker
+                        .as_ref()
+                        .is_some_and(|acker| Arc::ptr_eq(acker, conn));
+                    match (phase, visible) {
+                        // The gate opens: capture may start (after the
+                        // route-freeze dance; see `Preparing`), and
+                        // this connection becomes the bound acker.
+                        (Phase::Prompting, true) => AckEffect::OpenGate(ask.ask_id.clone()),
+                        (Phase::Prompting, false) => AckEffect::Decline,
+                        // A dismissal after the gate opened: the mic (or
+                        // the job) must stop — the
+                        // no-mic-without-a-visible-prompt rule is held
+                        // for the whole take, not just its start.
+                        (_, false) if from_acker => AckEffect::Dismiss,
+                        // A second visible:true restates what the gate
+                        // already recorded; nothing to do.
+                        _ => AckEffect::None,
+                    }
+                }
+            }
             // A late ack for a resolved ask, or an id from an earlier
             // one: already answered.
             _ => AckEffect::None,
@@ -553,6 +617,9 @@ impl Broker {
                 self.cancel_live(NoAnswerReason::UserCancelled, "the user dismissed the prompt")
             }
             AckEffect::OpenGate(ask_id) => {
+                if let Some((ask, _)) = self.live.as_mut() {
+                    ask.acker = Some(Arc::clone(conn));
+                }
                 let shared = Arc::clone(&self.shared);
                 let corr = format!("{ask_id}-ctx");
                 match shared.client.send(
@@ -573,37 +640,61 @@ impl Broker {
         }
     }
 
-    fn on_done(&mut self, ask_id: String) {
-        let applies = match self.live.as_ref() {
-            // Done before the gate opened: the app is misbehaving (its
-            // own protocol says Done follows a visible ack). Ignore —
-            // the ack bound still applies.
-            Some((ask, Phase::Prompting | Phase::Preparing { .. })) => ask.ask_id == ask_id,
-            // A second Done (or one racing the stop handshake): the
-            // stop already covers it.
-            Some((_, Phase::Persisting | Phase::Transcribing { .. })) => false,
-            Some((ask, Phase::Recording)) => ask.ask_id == ask_id,
-            None => false,
+    fn on_done(&mut self, ask_id: String, conn: &Arc<ConnState>) {
+        enum DoneEffect {
+            None,
+            Dismissed,
+            StopCapture,
+        }
+        // Done is bound to the connection whose visible ack opened the
+        // gate: an app that never acked cannot be done. Before the gate
+        // opened there is no acker, so an early Done (the app
+        // misbehaving — its own protocol says Done follows a visible
+        // ack) is ignored; the ack bound still applies.
+        let effect = match self.live.as_ref() {
+            Some((ask, phase))
+                if ask.ask_id == ask_id
+                    && ask.acker.as_ref().is_some_and(|acker| Arc::ptr_eq(acker, conn)) =>
+            {
+                match phase {
+                    Phase::Prompting => DoneEffect::None,
+                    // The gate is open but the mic is not: nothing was
+                    // captured, so there is nothing to stop — resolve
+                    // as dismissed, never as a capture failure.
+                    Phase::Preparing { .. } => DoneEffect::Dismissed,
+                    Phase::Recording => DoneEffect::StopCapture,
+                    // A second Done (or one racing the stop handshake):
+                    // the stop already covers it.
+                    Phase::Persisting | Phase::Transcribing { .. } => DoneEffect::None,
+                }
+            }
+            _ => DoneEffect::None,
         };
-        if !applies {
-            return;
+        match effect {
+            DoneEffect::None => {}
+            DoneEffect::Dismissed => self.cancel_live(
+                NoAnswerReason::UserCancelled,
+                "the user finished before the microphone opened",
+            ),
+            DoneEffect::StopCapture => {
+                let ask_id = self
+                    .live
+                    .as_ref()
+                    .map(|(ask, _)| ask.ask_id.clone())
+                    .unwrap_or_default();
+                let shared = Arc::clone(&self.shared);
+                if let Err(rejection) =
+                    shared.client.send(Some(&ask_id), Command::CaptureStop { drain: Some(true) })
+                {
+                    self.fail_live(
+                        "capture_failed",
+                        format!("capture.stop was refused: {rejection}"),
+                    );
+                    return;
+                }
+                self.set_phase(Phase::Persisting);
+            }
         }
-        let ask_id = self
-            .live
-            .as_ref()
-            .map(|(ask, _)| ask.ask_id.clone())
-            .unwrap_or_default();
-        let shared = Arc::clone(&self.shared);
-        if let Err(rejection) =
-            shared.client.send(Some(&ask_id), Command::CaptureStop { drain: Some(true) })
-        {
-            self.fail_live(
-                "capture_failed",
-                format!("capture.stop was refused: {rejection}"),
-            );
-            return;
-        }
-        self.set_phase(Phase::Persisting);
     }
 
     /// An explicit agent cancel: the owner's queued ask is dropped
@@ -710,13 +801,20 @@ impl Broker {
         }
     }
 
-    /// Deadline sweep: the ack bound and the overall budget.
+    /// Deadline sweep: the ack bound and the user-facing budget.
     fn tick_deadlines(&mut self) {
         let (budget_expired, ack_expired, ack_bound) = match self.live.as_ref() {
             None => (false, false, Duration::ZERO),
             Some((ask, phase)) => {
                 let now = Instant::now();
-                if now >= ask.deadline() {
+                // The budget is user-facing: it ends when the microphone
+                // closes. Past `capture.stop` the take is already
+                // captured — discarding it on a wall clock would throw
+                // away the user's spoken answer, so persistence and
+                // transcription run unbudgeted (to their own outcome;
+                // cancel, disconnect, and shutdown still end them).
+                let user_facing = !matches!(phase, Phase::Persisting | Phase::Transcribing { .. });
+                if user_facing && now >= ask.deadline() {
                     (true, false, Duration::ZERO)
                 } else if matches!(phase, Phase::Prompting) {
                     // The visibility gate's own bound:
@@ -935,17 +1033,6 @@ fn fan_out(shared: &HostShared, frame: Frame) {
     }
 }
 
-fn fan_out_show(shared: &HostShared, ask_id: &str, questions: Vec<String>, timeout_ms: u64) {
-    fan_out(
-        shared,
-        Frame::ShowPrompt {
-            req: ask_id.to_string(),
-            questions,
-            timeout_ms,
-        },
-    );
-}
-
 fn fan_out_hide(shared: &HostShared, ask_id: &str, reason: &str) {
     fan_out(
         shared,
@@ -974,6 +1061,23 @@ mod tests {
             Allowlist::from_bytes(Path::new("f"), br#"{"version": 2, "clients": []}"#.as_slice())
                 .unwrap_err();
         assert!(err.to_string().contains("version 2"));
+    }
+
+    #[test]
+    fn duplicate_allowlist_names_are_refused() {
+        // The second entry would silently shadow the first's token —
+        // the file is refused at load, matching the malformed posture.
+        let err = Allowlist::from_bytes(
+            Path::new("f"),
+            br#"{"version":1,"clients":[
+                {"name":"claude-code","token":"tok-1"},
+                {"name":"claude-code","token":"tok-2"}
+            ]}"#
+                .as_slice(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, AllowlistError::Malformed { .. }));
+        assert!(err.to_string().contains("duplicate"), "{err}");
     }
 
     #[test]

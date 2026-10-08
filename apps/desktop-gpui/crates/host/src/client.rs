@@ -525,11 +525,6 @@ impl HostClient {
         self.asks.recv_timeout(timeout)
     }
 
-    /// Non-blocking ask-result poll.
-    pub fn try_recv_ask(&self) -> Result<AskResultWire, RecvError> {
-        self.asks.try_recv()
-    }
-
     /// Writes a frame no reply will ever answer (the ask surface's
     /// client→host frames either answer on their own streams or not at
     /// all), refusing it locally when the connection is closed.
@@ -557,6 +552,19 @@ impl HostClient {
         self.closed.load(Ordering::SeqCst)
     }
 
+    /// Ends both directions of the connection (idempotent): the
+    /// detached reader's blocking read returns, every stream reports
+    /// closed, and in-flight sends fail. [`Drop`] does the same; this
+    /// is for owners that share `Arc`s of the client and cannot rely
+    /// on the last drop happening (the MCP bridge's drain thread).
+    pub fn close(&self) {
+        // Through the dedicated `closer` handle, NOT the writer lock: a
+        // send parked in a blocking write holds that lock, and teardown
+        // must not wait behind a wedged host (the shutdown on the
+        // duplicate unblocks the parked write too — same socket).
+        let _ = self.closer.shutdown_both();
+    }
+
     pub fn close_reason(&self) -> String {
         self.close_reason
             .lock()
@@ -569,12 +577,8 @@ impl HostClient {
 impl Drop for HostClient {
     fn drop(&mut self) {
         // End both directions so the detached reader thread's blocking
-        // read returns; it then drops the original handle. Through the
-        // dedicated `closer` handle, NOT the writer lock: a send parked
-        // in a blocking write holds that lock, and teardown must not
-        // wait behind a wedged host (the shutdown on the duplicate
-        // unblocks the parked write too — same socket).
-        let _ = self.closer.shutdown_both();
+        // read returns; it then drops the original handle.
+        self.close();
     }
 }
 
