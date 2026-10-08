@@ -31,6 +31,7 @@ use std::time::Instant;
 use gpui::{AppContext, Context};
 use starling_dictation::settings::ProcessingSettings;
 use starling_dictation::storage::{self, now_iso};
+use starling_dictation::store_v2::{CorrectionDecision, CorrectionRecord};
 use starling_processing::CancelToken;
 use starling_processing::contract::{
     ContextField, Failure, FailureReason, Locality, ModeEntry, ProcessingRoute, ProfilesDocument,
@@ -49,7 +50,7 @@ use starling_processing::staging::{
 };
 
 use crate::app::StarlingApp;
-use crate::store::{ProcessingDoc, ProposalRow, RowStatus};
+use crate::store::{ProcessingDoc, ProposalOrigin, ProposalRow, RowStatus};
 
 const MODES_JSON: &str = include_str!("../modes/desktop-profiles.json");
 
@@ -648,7 +649,83 @@ fn stored_row(
         label: label.to_string(),
         failure: result.failure.as_ref().map(|_| message.to_string()),
         stop_to_result_ms: result.timing.stop_to_result_ms,
+        // #304: provenance pinned at request time — what the runtime
+        // knows when the job runs. The decision seams (accept/dismiss/
+        // revert/edit) read it back off the row; nothing is guessed
+        // later.
+        origin: Some(ProposalOrigin {
+            mode_id: request.mode_id.clone(),
+            mode_version: request.mode_version,
+            provider_id: request.provider.id.clone(),
+            provider_kind: request.provider.kind.as_str().to_string(),
+            provider_model: request.provider.model.clone(),
+            locality: locality_str(request.provider.locality).to_string(),
+            transform_kinds: request
+                .kinds
+                .iter()
+                .map(|kind| kind.as_str().to_string())
+                .collect(),
+            language: request.language.clone(),
+            queued_ms: result.timing.queued_ms,
+            processing_ms: result.timing.processing_ms,
+        }),
     })
+}
+
+/// `Locality` as the wire spelling (`serde(rename_all = "snake_case")`),
+/// for provenance columns that store text.
+fn locality_str(locality: Locality) -> &'static str {
+    match locality {
+        Locality::Local => "local",
+        Locality::Remote => "remote",
+    }
+}
+
+/// Builds the correction record for one observed decision (#304): the
+/// raw pair from the take's processing document, the proposal with its
+/// request-time provenance, and the decision. The `asr_*` columns are
+/// left for the store to fill from the attempt row; a provenance field
+/// the runtime does not have (`settings_strength`) stays NULL rather
+/// than guessed.
+fn correction_record_for(
+    id: &str,
+    doc: &crate::store::ProcessingDoc,
+    row: &ProposalRow,
+    decision: CorrectionDecision,
+    final_text: Option<String>,
+) -> CorrectionRecord {
+    let origin = row.origin.as_ref();
+    let timings = serde_json::json!({
+        "queued_ms": origin.map(|o| o.queued_ms),
+        "processing_ms": origin.map(|o| o.processing_ms),
+        "stop_to_result_ms": row.stop_to_result_ms,
+    });
+    CorrectionRecord {
+        id: format!("{id}#c:{}", row.request_id),
+        capture_id: id.to_string(),
+        request_id: row.request_id.clone(),
+        raw_attempt_id: doc.raw_attempt_id.clone(),
+        raw_text: doc.raw_text.clone(),
+        processed_text: row.text.clone(),
+        final_text,
+        decision,
+        decision_utc: now_iso(),
+        mode_id: origin.map(|o| o.mode_id.clone()),
+        mode_version: origin.map(|o| o.mode_version),
+        provider_id: origin.map(|o| o.provider_id.clone()),
+        provider_kind: origin.map(|o| o.provider_kind.clone()),
+        provider_model: origin.map(|o| o.provider_model.clone()),
+        locality: origin.map(|o| o.locality.clone()),
+        transform_kinds: origin
+            .map(|o| serde_json::to_string(&o.transform_kinds).unwrap_or_default())
+            .filter(|text| !text.is_empty()),
+        language: origin.and_then(|o| o.language.clone()),
+        asr_backend: None, // the store fills these from the attempt row
+        asr_model_hash: None,
+        timings_json: Some(timings.to_string()),
+        settings_strength: None, // no editing-strength setting exists yet
+        extra_json: serde_json::to_string(&serde_json::json!({ "label": row.label })).ok(),
+    }
 }
 
 impl StarlingApp {
@@ -1127,6 +1204,66 @@ impl StarlingApp {
         self.stop_instants.remove(id);
     }
 
+    /// Records one correction-dataset decision (#304): the transcript →
+    /// edit pair for one processing proposal, with the decision the user
+    /// made. `row` may be omitted (the decision seam that does not hold
+    /// it — a revert, a persisted edit): it is then looked up from the
+    /// take's processing document, and a row that is neither in hand nor
+    /// durable records nothing (conservative: a decision racing the
+    /// write that would make it attributable is dropped, never guessed).
+    /// A take deleted or re-transcribed meanwhile records nothing.
+    /// Excluded takes (secure/incognito capture) answer `Ok(false)` in
+    /// the store and record nothing by design.
+    pub(crate) fn record_correction_decision(
+        &mut self,
+        cx: &mut Context<Self>,
+        id: &str,
+        row: Option<ProposalRow>,
+        request_id: &str,
+        decision: CorrectionDecision,
+        final_text: Option<String>,
+    ) {
+        let Some(store) = self.store.clone() else {
+            return;
+        };
+        let id = id.to_string();
+        let request_id = request_id.to_string();
+        cx.spawn(async move |this, cx| {
+            let written = cx
+                .background_spawn(async move {
+                    let Ok(Some(doc)) = store.processing_doc(&id) else {
+                        // Deleted, unreadable, or built on an earlier
+                        // transcript: nothing to attribute the decision to.
+                        return Ok(());
+                    };
+                    let row = row.or_else(|| {
+                        doc.proposals
+                            .iter()
+                            .find(|row| row.request_id == request_id)
+                            .cloned()
+                    });
+                    let Some(row) = row else {
+                        return Ok(());
+                    };
+                    let record = correction_record_for(&id, &doc, &row, decision, final_text);
+                    store.record_correction(&record).map(|_| ())
+                })
+                .await;
+            if let Err(err) = written {
+                if !matches!(err, storage::StorageError::NotFound(_)) {
+                    this.update(cx, |app, cx| {
+                        app.error = Some(format!(
+                            "Could not record the correction decision: {err}"
+                        ));
+                        cx.notify();
+                    })
+                    .ok();
+                }
+            }
+        })
+        .detach();
+    }
+
     /// "Use processed": the proposal becomes the take's head, if it is
     /// still current (or the user forces a stale one).
     pub(crate) fn accept_processed(&mut self, id: &str, force: bool, cx: &mut Context<Self>) {
@@ -1171,6 +1308,16 @@ impl StarlingApp {
             .first()
             .map(|attempt| attempt.attempt_id.clone())
             .unwrap_or_default();
+        // #304: the user kept the processed output — the pair's decision
+        // is `accepted`, with the applied text as the final text.
+        self.record_correction_decision(
+            cx,
+            id,
+            Some(row.clone()),
+            &row.request_id,
+            CorrectionDecision::Accepted,
+            Some(text.clone()),
+        );
         let accepted = ProposalRow {
             status: RowStatus::Accepted,
             ..row
@@ -1206,6 +1353,17 @@ impl StarlingApp {
             cx.notify();
             return;
         };
+        // #304: "Back to raw" over a processed head is a decision on the
+        // proposal that produced that head — its request id is on the
+        // processed region, and it goes away with the revert, so read it
+        // first. A revert over plain manual edits (no processed region)
+        // decides nothing: no processing was involved.
+        let reverted_request = draft
+            .snapshot()
+            .regions
+            .iter()
+            .find(|region| region.kind == RegionKind::Processed && region.request_id.is_some())
+            .and_then(|region| region.request_id.clone());
         if draft.revert_raw() != Outcome::Applied {
             return;
         }
@@ -1223,6 +1381,18 @@ impl StarlingApp {
             }
         }
         cx.notify();
+        if let Some(request_id) = reverted_request {
+            // #304: the processed output was undone after being used —
+            // decision `reverted`, the raw transcript as the final text.
+            self.record_correction_decision(
+                cx,
+                id,
+                None,
+                &request_id,
+                CorrectionDecision::Reverted,
+                Some(text.clone()),
+            );
+        }
         self.persist_head(
             store,
             id.to_string(),
@@ -1251,6 +1421,7 @@ impl StarlingApp {
         if let Some(draft) = self.drafts.get_mut(id) {
             draft.reject(&row.request_id);
         }
+        let final_text = self.drafts.get(id).map(|draft| draft.text());
         self.set_processing(id, label, ProcessingState::Idle);
         cx.notify();
         let id = id.to_string();
@@ -1258,6 +1429,16 @@ impl StarlingApp {
             status: RowStatus::Rejected,
             ..row
         };
+        // #304: the user dismissed the proposal unused — decision
+        // `rejected`, with the head text as it stood (usually the raw).
+        self.record_correction_decision(
+            cx,
+            &id,
+            Some(rejected.clone()),
+            &rejected.request_id,
+            CorrectionDecision::Rejected,
+            final_text,
+        );
         cx.spawn(async move |this, cx| {
             let saved = cx
                 .background_spawn(async move { store.save_proposal(&id, &rejected) })
@@ -1740,6 +1921,7 @@ mod tests {
             label: "S1-mini · this computer".to_string(),
             failure: None,
             stop_to_result_ms: Some(900.0),
+            origin: None,
         };
         let doc = ProcessingDoc {
             head_revision: 1,
@@ -1774,6 +1956,7 @@ mod tests {
                 label: String::new(),
                 failure: None,
                 stop_to_result_ms: None,
+                origin: None,
             }],
         };
         assert!(matches!(

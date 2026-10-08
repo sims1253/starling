@@ -33,6 +33,29 @@ pub(crate) struct ProcessingDoc {
     pub proposals: Vec<ProposalRow>,
 }
 
+/// What produced a proposal, pinned at request time (#304's correction
+/// dataset provenance): the mode that ran, the provider that answered,
+/// the transform kinds and language, and the per-stage timings the
+/// pipeline already reports. Recorded on the row so the decision seam
+/// (accept/dismiss/revert/edit) can attribute the pair without
+/// reconstructing job state. `None` on rows written before the field
+/// existed — never guessed.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ProposalOrigin {
+    pub mode_id: String,
+    pub mode_version: u32,
+    pub provider_id: String,
+    pub provider_kind: String,
+    pub provider_model: String,
+    pub locality: String,
+    #[serde(default)]
+    pub transform_kinds: Vec<String>,
+    #[serde(default)]
+    pub language: Option<String>,
+    pub queued_ms: f64,
+    pub processing_ms: f64,
+}
+
 /// One processing result as stored: a proposal pinned to the head
 /// revision its request read, or the failure it ended in.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -45,6 +68,10 @@ pub(crate) struct ProposalRow {
     pub label: String,
     pub failure: Option<String>,
     pub stop_to_result_ms: Option<f64>,
+    /// Request-time provenance for the correction dataset (#304);
+    /// `None` on rows this build did not write.
+    #[serde(default)]
+    pub origin: Option<ProposalOrigin>,
 }
 
 /// The disposition of a stored processing result.
@@ -88,6 +115,8 @@ struct ProposalProvenance {
     label: String,
     failure: Option<String>,
     stop_to_result_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    origin: Option<ProposalOrigin>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -130,6 +159,7 @@ impl ProposalRow {
                 label: self.label.clone(),
                 failure: self.failure.clone(),
                 stop_to_result_ms: self.stop_to_result_ms,
+                origin: self.origin.clone(),
             })
             .ok(),
             disposition: Some("proposal".to_string()),
@@ -161,6 +191,7 @@ impl ProcessingDoc {
                     label: provenance.label,
                     failure: provenance.failure,
                     stop_to_result_ms: provenance.stop_to_result_ms,
+                    origin: provenance.origin,
                 })
             })
             .collect();
@@ -209,6 +240,29 @@ impl Store {
     #[cfg(test)]
     pub(crate) fn at_test_root(root: &std::path::Path) -> Self {
         Self(Arc::new(Mutex::new(StoreV2::open(root).unwrap())))
+    }
+
+    /// Test-only: persist a take whose recording context was marked
+    /// secure/incognito (#304's API-boundary exclusion — the desktop app
+    /// has no secure capture path yet, so tests drive the seam directly).
+    #[cfg(test)]
+    pub(crate) fn save_capture_marked_secure(
+        &self,
+        wav: Arc<Vec<u8>>,
+    ) -> Result<String, storage::StorageError> {
+        let pcm = decode_wav(&wav)?;
+        let mut v2 = lock_v2(&self.0);
+        let mut meta = store_v2::TakeMeta::for_device("");
+        meta.secure_field = true;
+        let mut take = v2
+            .begin_take_at_rate(pcm.sample_rate, meta)
+            .map_err(v2_err)?;
+        take.append_and_seal(&pcm.samples).map_err(v2_err)?;
+        let finalized = take.finalize().map_err(v2_err)?;
+        let committed = finalized
+            .commit_marked(&mut v2, store_v2::CommitMark::Complete)
+            .map_err(v2_err)?;
+        Ok(committed.record.id)
     }
 
     /// Open the store at its default data root. This is the app's only
@@ -537,6 +591,32 @@ impl Store {
         store
             .record_insight_event(event_id, id, kind, occurred_at, payload_json)
             .map_err(v2_err)
+    }
+
+    /// Writes (or revises) one correction record (#304): the transcript →
+    /// edit pair for one processing proposal, with the user's decision.
+    /// `Ok(false)` is the designed exclusion — the take was captured
+    /// against a secure/incognito field and never contributes; a take
+    /// deleted meanwhile is `NotFound` like the other processing writes.
+    /// Nothing about success or failure elsewhere touches these rows:
+    /// only an explicit decision records, and only deletion removes.
+    pub(crate) fn record_correction(
+        &self,
+        record: &store_v2::CorrectionRecord,
+    ) -> Result<bool, storage::StorageError> {
+        let store = lock_v2(&self.0);
+        store.upsert_correction_record(record).map_err(v2_err)
+    }
+
+    /// One take's correction records, in insertion order (no UI reads
+    /// these yet; the browse/review surface is later work).
+    #[cfg(test)]
+    pub(crate) fn correction_records(
+        &self,
+        id: &str,
+    ) -> Result<Vec<store_v2::CorrectionRecord>, storage::StorageError> {
+        let store = lock_v2(&self.0);
+        store.correction_records_for(id).map_err(v2_err)
     }
 
     /// The startup recovery pass: reconcile journals against the metadata
@@ -912,6 +992,7 @@ mod tests {
             status,
             retention_class: "standard".to_string(),
             extra_json: extra.map(str::to_string),
+            secure_field: false,
         }
     }
 
@@ -1127,6 +1208,7 @@ mod tests {
             label: "S1-mini · this computer".to_string(),
             failure: None,
             stop_to_result_ms: Some(1234.5),
+            origin: None,
         }
     }
 
@@ -1215,6 +1297,51 @@ mod tests {
             Err(storage::StorageError::NotFound(_))
         ));
         assert!(lock_v2(&store.0).insight_events_for(&id).expect("events").is_empty());
+    }
+
+    #[test]
+    fn deleting_a_take_takes_its_correction_records_too() {
+        let store = v2_store("correction-delete");
+        let id = transcribed(&store, "um to be deleted");
+        let (attempt, raw) = store.latest_raw(&id).expect("raw").expect("final");
+        store
+            .start_processing_doc(&id, &attempt, &raw)
+            .expect("start");
+        let record = store_v2::CorrectionRecord {
+            id: format!("{id}#c:r1"),
+            capture_id: id.clone(),
+            request_id: "r1".to_string(),
+            raw_attempt_id: attempt.clone(),
+            raw_text: raw.clone(),
+            processed_text: "Deleted.".to_string(),
+            final_text: Some("Deleted.".to_string()),
+            decision: store_v2::CorrectionDecision::Accepted,
+            decision_utc: "2026-09-24T10:00:00Z".to_string(),
+            mode_id: Some("clean-local".to_string()),
+            mode_version: Some(3),
+            provider_id: Some("local-s1".to_string()),
+            provider_kind: Some("s1".to_string()),
+            provider_model: Some("s1-mini".to_string()),
+            locality: Some("local".to_string()),
+            transform_kinds: Some(r#"["clean"]"#.to_string()),
+            language: Some("en".to_string()),
+            asr_backend: None,
+            asr_model_hash: None,
+            timings_json: Some("{}".to_string()),
+            settings_strength: None,
+            extra_json: None,
+        };
+        assert!(store.record_correction(&record).expect("record"));
+        assert_eq!(store.correction_records(&id).expect("read").len(), 1);
+        // The facade delete (processing document first, then the capture)
+        // removes the correction records with the capture row — and a
+        // late decision for the deleted take lands nowhere.
+        store.delete(&id).expect("delete");
+        assert!(store.correction_records(&id).expect("read").is_empty());
+        assert!(matches!(
+            store.record_correction(&record),
+            Err(storage::StorageError::NotFound(_))
+        ));
     }
 
     #[test]
