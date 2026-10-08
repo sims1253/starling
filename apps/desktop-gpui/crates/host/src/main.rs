@@ -231,6 +231,14 @@ fn main() {
 
     let mut host = match HostConfig::production(&root, runtime_dir) {
         Ok(config) => {
+            // The MCP-agent allowlist (issue #309) lives beside the
+            // host's data: `<data_root>/mcp-clients.json`. Missing file
+            // = deny all (the unconfigured host serves, MCP clients are
+            // refused); a malformed file refuses startup
+            // (`HostError::Allowlist`).
+            let config = config.with_agent_allowlist(Some(
+                root.join(starling_runtime_host::agent::ALLOWLIST_FILE),
+            ));
             let config = match settings_path {
                 Some(path) => config.with_engine(engine).with_settings_path(path),
                 None => config.with_engine(engine),

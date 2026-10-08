@@ -15,7 +15,10 @@
 //! # Layout
 //!
 //! - [`frame`] — the length-prefixed frame around the I3 envelope
-//!   (no second wire format; transport control only).
+//!   (no second wire format; transport control only) — since issue
+//!   #309 it also carries the agent-dictation ask frames (prompt
+//!   handshake, ask/result), still host-level, never a second machine
+//!   surface.
 //! - [`auth`] + [`platform`] — peer authentication and the per-OS
 //!   transport: UDS + `SO_PEERCRED`/`LOCAL_PEERCRED` on unix, a DACL'd
 //!   named pipe on Windows (compile-unverified there — see that module).
@@ -25,6 +28,14 @@
 //! - [`engine`] — the supervised inference engine attached to the
 //!   runtime, following the desktop settings file while the host
 //!   serves.
+//! - [`agent`] — the agent-dictation ask surface (issue #309): the
+//!   per-client allowlist and the one broker that serializes
+//!   `ask_user_dictation` asks, gates capture on a prompt-visibility
+//!   ack, and drives the existing capture/jobs path.
+//! - [`mcp`] — the MCP stdio server (JSON-RPC 2.0, no dependencies):
+//!   what a coding agent launches and talks to; the bridge between
+//!   its `tools/call` and [`agent`]'s ask frames. The binary a coding
+//!   agent registers is `starling-mcp-dictation` (`src/bin`).
 //! - [`client`] — the client library the GPUI app will hold (the
 //!   Electron comparison app has since been removed from the tree).
 //!
@@ -61,12 +72,14 @@
 //! comparison app the design names as a second client has been removed
 //! from the tree, so there is no second adapter to switch.
 
+pub mod agent;
 pub mod auth;
 pub mod client;
 pub mod config;
 pub mod engine;
 pub mod frame;
 pub mod limits;
+pub mod mcp;
 pub mod platform;
 pub mod server;
 

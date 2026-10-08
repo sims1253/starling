@@ -48,6 +48,7 @@ use starling_runtime::bus::EventSub;
 use starling_runtime::channel::{bounded, Receiver, Sender, TrySendError};
 use starling_runtime::{Runtime, RuntimeClient};
 
+use crate::agent::{broker_loop, Allowlist, AllowlistError};
 use crate::auth::PeerPolicy;
 use crate::config::HostConfig;
 use crate::frame::{encode, Frame, FrameError, FrameReader, TransportErrorCode};
@@ -56,6 +57,11 @@ use crate::platform::{self, Probe, TransportConn, TransportListener};
 
 /// How often the accept loop and event pump re-check the shutdown flag.
 const POLL: Duration = Duration::from_millis(50);
+
+/// The agent broker's inbox depth (issue #309). Deliberately small:
+/// past it the connection reader answers `host_busy` immediately — an
+/// agent flooding asks is refused, never queued unboundedly.
+const BROKER_INBOX: usize = 64;
 
 /// How long shutdown waits for every connection thread to end itself
 /// before it kills the sockets outright. A well-behaved peer drains its
@@ -121,6 +127,15 @@ pub enum HostError {
     Reconcile {
         root: PathBuf,
         source: StoreV2Error,
+    },
+    /// The MCP-agent allowlist (issue #309) exists but will not load.
+    /// The host refuses to serve beside a configuration whose meaning
+    /// it cannot know — fail closed, loudly (see
+    /// [`crate::agent::Allowlist::load`]).
+    #[error("the agent allowlist {path:?} will not load: {source}")]
+    Allowlist {
+        path: PathBuf,
+        source: AllowlistError,
     },
 }
 
@@ -292,7 +307,8 @@ impl Drop for HostHandle {
     }
 }
 
-/// State shared by the accept loop, the event pump and every connection.
+/// State shared by the accept loop, the event pump, the agent broker
+/// and every connection.
 ///
 /// Every atomic here runs at `SeqCst` as a deliberate blanket choice:
 /// these are low-frequency flags and counters (shutdown polls, one
@@ -301,8 +317,8 @@ impl Drop for HostHandle {
 /// synchronization intent the host does not actually depend on beyond
 /// "this store is visible to the next load".
 pub struct HostShared {
-    shutdown: AtomicBool,
-    client: RuntimeClient,
+    pub(crate) shutdown: AtomicBool,
+    pub(crate) client: RuntimeClient,
     owner_id: String,
     max_frame_bytes: usize,
     command_rate: RateLimit,
@@ -314,28 +330,74 @@ pub struct HostShared {
     /// Live, **authenticated and greeted** connections — the event
     /// pump's fan-out set (see `connection_reader` for why registration
     /// waits until the hello is queued).
-    conns: Mutex<Vec<Arc<ConnState>>>,
+    pub(crate) conns: Mutex<Vec<Arc<ConnState>>>,
     /// Every connection's threads, paired with the connection's state
     /// so shutdown's force-close can reach a connection whose reader
     /// already exited and unregistered (a parked writer must never
     /// escape the drain bound by leaving the registry first).
     conn_threads: Mutex<Vec<(JoinHandle<()>, Arc<ConnState>)>>,
     live_connections: AtomicUsize,
+    /// The agent-dictation broker's inbox (issue #309; see
+    /// [`crate::agent`]). Every ask-side frame a connection sends is
+    /// routed here; bounded, so a flood of asks is refused at the
+    /// reader (`host_busy`) rather than parked behind a full broker.
+    pub(crate) broker: Sender<BrokerMsg>,
+    /// The allowlist every `Frame::AgentHello` is checked against
+    /// (default deny — see [`crate::agent::Allowlist`]).
+    agent_allowlist: Arc<Allowlist>,
 }
 
-struct ConnState {
+pub(crate) struct ConnState {
     outbound: Sender<Frame>,
     closed: AtomicBool,
     /// Set exactly once by `unregister` (the reader's exit path, also
     /// armed as a panic guard) so the live-connection count is
     /// decremented once per admission even if the reader panics.
     unregistered: AtomicBool,
+    /// Whether this connection identified itself as an allowlisted MCP
+    /// agent client (`Frame::AgentHello` + `Frame::AgentWelcome`). Agent
+    /// connections are excluded from the app-side prompt fan-out (they
+    /// are the askers, not the askee) and are the only connections
+    /// allowed to send `Frame::AskUser`.
+    agent: AtomicBool,
     /// A handle to the connection for immediate shutdown of both
     /// directions (the reader owns the original; the writer a clone).
     closer: Box<dyn TransportConn>,
 }
 
+/// What the connection reader hands to the agent-dictation broker
+/// (issue #309; see [`crate::agent`]). The broker owns every ask-side
+/// frame; the reader only routes and enforces the direction rules.
+pub(crate) enum BrokerMsg {
+    /// A validated `Frame::AskUser` from an allowlisted agent
+    /// connection, with the connection that owns it (answers and
+    /// disconnect-cancels ride it).
+    Ask {
+        conn: Arc<ConnState>,
+        client_req: String,
+        questions: Vec<String>,
+        timeout_ms: u64,
+    },
+    /// `Frame::AskCancel`: the owner cancelling a queued or live ask.
+    Cancel {
+        conn: Arc<ConnState>,
+        client_req: String,
+        reason: String,
+    },
+    /// `Frame::PromptAck` from any connection.
+    Ack { ask_id: String, visible: bool },
+    /// `Frame::PromptDone` from any connection.
+    Done { ask_id: String },
+    /// A connection ended: cancel its asks (the disconnect rule).
+    ConnGone { conn: Arc<ConnState> },
+}
+
 impl ConnState {
+    /// Whether this connection passed the agent allowlist hello.
+    pub(crate) fn is_agent(&self) -> bool {
+        self.agent.load(Ordering::SeqCst)
+    }
+
     /// Stops accepting frames for this connection. Does **not** touch
     /// the socket: queued frames (a final transport error, a goodbye)
     /// must still reach the peer — the writer thread performs the
@@ -354,7 +416,7 @@ impl ConnState {
     /// Offers a frame to this connection's writer. `Err` when the
     /// connection's queue is full (slow consumer) or it is already
     /// closed.
-    fn try_deliver(&self, frame: Frame) -> Result<(), ()> {
+    pub(crate) fn try_deliver(&self, frame: Frame) -> Result<(), ()> {
         if self.closed.load(Ordering::SeqCst) {
             return Err(());
         }
@@ -367,6 +429,17 @@ impl ConnState {
 
 /// Boots the host per the ownership ladder (see the module docs).
 pub fn serve(config: HostConfig) -> Result<HostHandle, HostError> {
+    // 0. The agent allowlist (issue #309), before any ownership step:
+    // a file that will not load must cost nothing but this check — no
+    // lease to release, no endpoint to remove. A missing file is the
+    // unconfigured host (deny all), not an error.
+    let agent_allowlist = match &config.agent_allowlist {
+        None => Allowlist::empty(),
+        Some(path) => Allowlist::load(path).map_err(|source| HostError::Allowlist {
+            path: path.clone(),
+            source,
+        })?,
+    };
     // 1. The lease. The store instance holding it stays alive (and the
     //    flock with it) for the host's lifetime; the capture machine's
     //    own StoreV2 handle over the same root is a second SQLite
@@ -514,6 +587,11 @@ pub fn serve(config: HostConfig) -> Result<HostHandle, HostError> {
     let (runtime, client) = starling_runtime::Runtime::start(runtime_config);
     let events = client.subscribe();
 
+    // The agent-dictation broker (issue #309): one actor for every
+    // `AskUser`. Its inbox is bounded at the reader — a flood of asks
+    // is answered `host_busy` there, never parked here.
+    let (broker_tx, broker_rx) = bounded(BROKER_INBOX);
+
     let shared = Arc::new(HostShared {
         shutdown: AtomicBool::new(false),
         client,
@@ -524,11 +602,17 @@ pub fn serve(config: HostConfig) -> Result<HostHandle, HostError> {
         conns: Mutex::new(Vec::new()),
         conn_threads: Mutex::new(Vec::new()),
         live_connections: AtomicUsize::new(0),
+        broker: broker_tx,
+        agent_allowlist: Arc::new(agent_allowlist),
     });
 
     let watch_stop = Arc::new(AtomicBool::new(false));
 
     let mut threads = Vec::new();
+    threads.push(spawn("starling-host-agent", {
+        let shared = Arc::clone(&shared);
+        move || broker_loop(shared, broker_rx)
+    }));
     threads.push(spawn("starling-host-accept", {
         let shared = Arc::clone(&shared);
         let listener = listener;
@@ -660,6 +744,7 @@ fn accept_loop(
                     outbound: outbound_tx,
                     closed: AtomicBool::new(false),
                     unregistered: AtomicBool::new(false),
+                    agent: AtomicBool::new(false),
                     closer,
                 });
 
@@ -823,6 +908,100 @@ fn connection_reader(
                             break;
                         }
                     }
+                    // The agent-dictation surface (issue #309). The
+                    // hello is answered inline (an allowlist lookup);
+                    // everything else routes to the broker, whose inbox
+                    // is bounded — a full inbox answers `host_busy` on
+                    // the connection it came from.
+                    Frame::AgentHello { req, client, token } => {
+                        if state.is_agent() {
+                            terminate(
+                                &state,
+                                TransportErrorCode::ProtocolViolation,
+                                "a second agent hello on one connection".to_string(),
+                            );
+                            break;
+                        }
+                        match shared.agent_allowlist.authenticate(&client, &token) {
+                            Ok(()) => {
+                                state.agent.store(true, Ordering::SeqCst);
+                                if state
+                                    .try_deliver(Frame::AgentWelcome {
+                                        req,
+                                        client,
+                                    })
+                                    .is_err()
+                                {
+                                    state.close();
+                                    break;
+                                }
+                            }
+                            Err(refused) => {
+                                terminate(
+                                    &state,
+                                    TransportErrorCode::AuthFailed,
+                                    refused,
+                                );
+                                break;
+                            }
+                        }
+                    }
+                    Frame::AskUser { req, questions, timeout_ms } => {
+                        if !state.is_agent() {
+                            terminate(
+                                &state,
+                                TransportErrorCode::ProtocolViolation,
+                                "ask_user from a connection that did not identify itself \
+                                 as an allowlisted agent client"
+                                    .to_string(),
+                            );
+                            break;
+                        }
+                        if shared
+                            .broker
+                            .try_send(BrokerMsg::Ask {
+                                conn: Arc::clone(&state),
+                                client_req: req.clone(),
+                                questions,
+                                timeout_ms,
+                            })
+                            .is_err()
+                        {
+                            let _ = state.try_deliver(Frame::AskResult {
+                                req,
+                                outcome: crate::frame::AskOutcome::Error {
+                                    code: "host_busy".to_string(),
+                                    message: "the host's ask broker cannot take another \
+                                             ask right now; retry"
+                                        .to_string(),
+                                },
+                            });
+                        }
+                    }
+                    Frame::AskCancel { req, reason } => {
+                        // Best-effort by design: cancelling an ask that
+                        // no longer exists (already answered) is a
+                        // no-op, and a full broker inbox cannot be
+                        // holding the ask the cancel targets.
+                        let _ = shared.broker.try_send(BrokerMsg::Cancel {
+                            conn: Arc::clone(&state),
+                            client_req: req,
+                            reason,
+                        });
+                    }
+                    // The app side of the prompt handshake — any
+                    // authenticated connection may play it (the GPUI
+                    // app is the intended player; tests drive it the
+                    // same way).
+                    Frame::PromptAck { req, visible } => {
+                        let _ = shared.broker.try_send(BrokerMsg::Ack {
+                            ask_id: req,
+                            visible,
+                        });
+                    }
+                    Frame::PromptDone { req } => {
+                        let _ = shared.broker.try_send(BrokerMsg::Done { ask_id: req });
+                    }
                     Frame::GetSnapshot { req } => {
                         let snapshot = shared.client.snapshot();
                         let value = serde_json::to_value(&snapshot)
@@ -848,7 +1027,11 @@ fn connection_reader(
                     | Frame::Event { .. }
                     | Frame::Snapshot { .. }
                     | Frame::TransportError { .. }
-                    | Frame::Bye { .. } => {
+                    | Frame::Bye { .. }
+                    | Frame::AgentWelcome { .. }
+                    | Frame::AskResult { .. }
+                    | Frame::ShowPrompt { .. }
+                    | Frame::HidePrompt { .. } => {
                         terminate(
                             &state,
                             TransportErrorCode::ProtocolViolation,
@@ -924,6 +1107,15 @@ impl UnregisterOnDrop<'_> {
             lock_registry(&self.shared.conns)
                 .retain(|registered| !Arc::ptr_eq(registered, self.state));
             self.shared.live_connections.fetch_sub(1, Ordering::SeqCst);
+            // The disconnect rule (issue #309): an agent connection's
+            // death cancels its asks — the broker aborts any live take
+            // so the microphone never outlives the agent that asked.
+            // The broker holds its own `Arc` clone per ask, so the
+            // pointer comparison stays valid regardless of who drops
+            // the last handle when.
+            let _ = self.shared.broker.try_send(BrokerMsg::ConnGone {
+                conn: Arc::clone(self.state),
+            });
         }
     }
 }

@@ -111,4 +111,5 @@ serving work targets the native engine and the portable HTTP contract.
 [Quantization tools](quants/README.md) · [Quantization research](docs/quantization.md) ·
 [Benchmarks](docs/benchmarks.md) · [Engine development](docs/ggml-engine.md) ·
 [Fast Vulkan engines](docs/fast-engine.md) ·
+[Coding-agent dictation (MCP)](docs/mcp-dictation.md) ·
 [Model Optimizer and Unsloth research](docs/research/model-optimizer-unsloth-cross-backend.md)
