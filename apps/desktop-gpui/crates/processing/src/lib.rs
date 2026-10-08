@@ -3,6 +3,9 @@
 //! - [`contract`]: the #293 records (mode entry, provider declaration,
 //!   transform request/result) and the provider choice, ported from the
 //!   executable oracle `tests/mode_routing.py`.
+//! - [`boundary`]: the insertion-boundary rules (#341) — the deterministic
+//!   delivery-time step (leading space, first-letter case), frozen in
+//!   `packages/contracts/insertion-boundary/`.
 //! - [`staging`]: the staged draft of one take (typed regions, immutable
 //!   raw attempts, proposals pinned to a revision), ported from
 //!   `tests/staging.py`.
@@ -20,6 +23,7 @@
 //! conformance tests here read those fixtures in place, so the Rust port
 //! and the Python oracle can never test against different copies.
 
+pub mod boundary;
 pub mod contract;
 pub mod http;
 pub mod insight;
