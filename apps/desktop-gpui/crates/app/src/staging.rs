@@ -99,8 +99,9 @@ fn edited_text(text: &str, edit: &TextEdit) -> String {
 
 /// Applies one editor edit to the draft. An edit that restores the raw
 /// transcript exactly (undoing an accepted proposal) goes back to raw, so
-/// the text is raw again rather than a user copy of it.
-fn apply_edit(draft: &mut Draft, edit: &TextEdit) {
+/// the text is raw again rather than a user copy of it. Returns whether
+/// that revert branch fired.
+fn apply_edit(draft: &mut Draft, edit: &TextEdit) -> bool {
     let result = edited_text(&draft.text(), edit);
     let live_tail = draft
         .snapshot()
@@ -109,7 +110,7 @@ fn apply_edit(draft: &mut Draft, edit: &TextEdit) {
         .any(|region| region.kind == RegionKind::Partial);
     if !live_tail && !result.is_empty() && result == draft.raw_text() {
         draft.revert_raw();
-        return;
+        return true;
     }
     if edit.end > edit.start {
         draft.delete(edit.start, edit.end);
@@ -117,6 +118,7 @@ fn apply_edit(draft: &mut Draft, edit: &TextEdit) {
     if !edit.text.is_empty() {
         draft.insert(edit.start, &edit.text);
     }
+    false
 }
 
 /// Whether the user changed anything the recognition did not produce.
@@ -130,18 +132,26 @@ fn user_edited(draft: &Draft) -> bool {
         || snapshot.text != draft.raw_text()
 }
 
+/// The request whose accepted proposal is (still) the draft's processed
+/// region. A draft holds at most one Processed region — `take_proposal`
+/// replaces all regions — so "the first" is "the only"; the mirrored
+/// lookups share this one helper for exactly that reason.
+pub(crate) fn processed_request_id(draft: &Draft) -> Option<String> {
+    draft
+        .snapshot()
+        .regions
+        .iter()
+        .find(|region| region.kind == RegionKind::Processed && region.request_id.is_some())
+        .and_then(|region| region.request_id.clone())
+}
+
 /// The request whose accepted proposal a persisted edit changed (#304):
 /// the draft still contains its processed region and the text no longer
 /// equals the proposal itself. An edit that restores the raw transcript
 /// exactly never reaches here (it becomes `revert_raw`); an edit that
 /// lands back on the proposal's exact text is not an edit.
 fn edited_decision_request(draft: &Draft) -> Option<String> {
-    let request_id = draft
-        .snapshot()
-        .regions
-        .iter()
-        .find(|region| region.kind == RegionKind::Processed && region.request_id.is_some())
-        .and_then(|region| region.request_id.clone())?;
+    let request_id = processed_request_id(draft)?;
     let proposal = draft.proposal_text(&request_id)?;
     (draft.text() != proposal).then_some(request_id)
 }
@@ -399,12 +409,38 @@ impl StarlingApp {
         let Some(draft) = self.staging_draft(token) else {
             return;
         };
-        apply_edit(draft, edit);
+        // #304: an edit that restores the raw transcript exactly undoes an
+        // accepted proposal the same way the "Back to raw" button does.
+        // The revert inside `apply_edit` destroys the processed region, so
+        // read the request id first; the decision is recorded after the
+        // edit applies, and only when a proposal was actually undone.
+        let undone_request = processed_request_id(draft);
+        let reverted_to_raw = apply_edit(draft, edit);
         // Whatever the draft made of the edit (a pinned partial becomes the
         // user's), the editor shows the draft.
         self.sync_staging_editor(token, false, cx);
         if ready {
             self.schedule_staging_persist(token, cx);
+        }
+        if reverted_to_raw {
+            let take = self
+                .staging_mut(token)
+                .and_then(|staging| staging.take_id.clone());
+            if let (Some(id), Some(request_id)) = (take, undone_request) {
+                let raw_text = self
+                    .drafts
+                    .get(&id)
+                    .map(|draft| draft.raw_text())
+                    .unwrap_or_default();
+                self.record_correction_decision(
+                    cx,
+                    &id,
+                    None,
+                    &request_id,
+                    CorrectionDecision::Reverted,
+                    Some(raw_text),
+                );
+            }
         }
     }
 
@@ -1635,6 +1671,67 @@ mod tests {
         assert_eq!(records[0].decision, CorrectionDecision::Reverted);
         assert_eq!(records[0].final_text.as_deref(), Some("raw"));
         assert_eq!(records[0].processed_text, "Clean.", "the pair stays");
+    }
+
+    #[gpui::test]
+    fn an_exact_raw_edit_records_a_reverted_decision(cx: &mut gpui::TestAppContext) {
+        let root = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::at_test_root(root.path());
+        let app = cx.new(|cx| StarlingApp::for_test(Some(store.clone()), cx));
+        let (id, token) = app.update(cx, |app, cx| {
+            let (id, _attempt, _row) = proposed_take(app, &store);
+            app.begin_staging(cx);
+            let staging = app.staging.as_mut().unwrap();
+            staging.phase = StagingPhase::Ready;
+            staging.take_id = Some(id.clone());
+            staging.live = None;
+            let token = staging.token;
+            app.accept_processed(&id, false, cx);
+            (id, token)
+        });
+        cx.run_until_parked();
+        // The accepted head is "Clean." — an edit that restores the raw
+        // transcript exactly is the undo of that acceptance (the review's
+        // gap: it used to record nothing and left the row `accepted`).
+        app.update(cx, |app, cx| {
+            app.apply_staging_edit(
+                token,
+                &TextEdit {
+                    start: 0,
+                    end: 6,
+                    text: "raw".into(),
+                },
+                cx,
+            );
+            app.persist_staging_now(token, cx);
+        });
+        cx.run_until_parked();
+        let records = store.correction_records(&id).expect("records");
+        assert_eq!(records.len(), 1, "one row, revised in place");
+        assert_eq!(records[0].decision, CorrectionDecision::Reverted);
+        assert_eq!(records[0].final_text.as_deref(), Some("raw"));
+        assert_eq!(records[0].processed_text, "Clean.", "the pair stays");
+    }
+
+    #[gpui::test]
+    fn quickly_revised_decisions_keep_the_newer_label(cx: &mut gpui::TestAppContext) {
+        let root = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::at_test_root(root.path());
+        let app = cx.new(|cx| StarlingApp::for_test(Some(store.clone()), cx));
+        let id = app.update(cx, |app, cx| {
+            let (id, _attempt, _row) = proposed_take(app, &store);
+            // Accept, then immediately revert — back to back, no parking
+            // in between, exactly the race the review found: the writes
+            // must land in user-action order (FIFO chain), so the row
+            // ends `reverted`, not `accepted`.
+            app.accept_processed(&id, false, cx);
+            app.revert_to_raw(&id, cx);
+            id
+        });
+        cx.run_until_parked();
+        let records = store.correction_records(&id).expect("records");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].decision, CorrectionDecision::Reverted);
     }
 
     #[gpui::test]

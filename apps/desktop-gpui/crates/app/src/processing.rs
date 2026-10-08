@@ -50,6 +50,7 @@ use starling_processing::staging::{
 };
 
 use crate::app::StarlingApp;
+use crate::staging::processed_request_id;
 use crate::store::{ProcessingDoc, ProposalOrigin, ProposalRow, RowStatus};
 
 const MODES_JSON: &str = include_str!("../modes/desktop-profiles.json");
@@ -717,6 +718,9 @@ fn correction_record_for(
         provider_model: origin.map(|o| o.provider_model.clone()),
         locality: origin.map(|o| o.locality.clone()),
         transform_kinds: origin
+            // Vec<String> cannot fail to serialize; an empty result is
+            // kept as NULL rather than an empty JSON array (deliberate,
+            // and the only silent fallback here).
             .map(|o| serde_json::to_string(&o.transform_kinds).unwrap_or_default())
             .filter(|text| !text.is_empty()),
         language: origin.and_then(|o| o.language.clone()),
@@ -1228,7 +1232,17 @@ impl StarlingApp {
         };
         let id = id.to_string();
         let request_id = request_id.to_string();
-        cx.spawn(async move |this, cx| {
+        // FIFO: every decision write waits for the previous one, so a
+        // quickly revised decision (accept, then revert or edit) can never
+        // land out of order and overwrite the newer label (review finding:
+        // fire-and-forget spawns race and the older write could finish
+        // last). All decisions originate on the UI thread, so chain order
+        // IS user-action order.
+        let previous = self.correction_chain.take();
+        let task = cx.spawn(async move |this, cx| {
+            if let Some(previous) = previous {
+                previous.await;
+            }
             let written = cx
                 .background_spawn(async move {
                     let Ok(Some(doc)) = store.processing_doc(&id) else {
@@ -1260,8 +1274,8 @@ impl StarlingApp {
                     .ok();
                 }
             }
-        })
-        .detach();
+        });
+        self.correction_chain = Some(task);
     }
 
     /// "Use processed": the proposal becomes the take's head, if it is
@@ -1358,12 +1372,7 @@ impl StarlingApp {
         // processed region, and it goes away with the revert, so read it
         // first. A revert over plain manual edits (no processed region)
         // decides nothing: no processing was involved.
-        let reverted_request = draft
-            .snapshot()
-            .regions
-            .iter()
-            .find(|region| region.kind == RegionKind::Processed && region.request_id.is_some())
-            .and_then(|region| region.request_id.clone());
+        let reverted_request = processed_request_id(draft);
         if draft.revert_raw() != Outcome::Applied {
             return;
         }

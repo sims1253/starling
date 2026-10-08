@@ -1541,8 +1541,10 @@ impl StoreV2 {
     }
 
     /// One capture's correction records, in insertion order. Damaged
-    /// rows (an unknown decision spelling) surface as `Invalid` for that
-    /// row's read, mirroring how unknown capture statuses behave.
+    /// rows (an unknown decision spelling) fail the whole listing with
+    /// `Invalid` — deliberately LOUD, unlike capture listings, which
+    /// degrade per row: a dataset read must not silently drop pairs a
+    /// future training step would count on.
     pub fn correction_records_for(
         &self,
         capture_id: &str,
@@ -1590,6 +1592,19 @@ impl StoreV2 {
                     row.0, row.7
                 ))
             })?;
+            // A negative mode_version is damaged the same way an unknown
+            // decision is (Invalid), not silently clamped to 0 — one
+            // discipline per read path, per the review.
+            let mode_version = match row.10 {
+                Some(value) if value >= 0 => Some(value as u32),
+                Some(value) => {
+                    return Err(StoreV2Error::Invalid(format!(
+                        "correction record {:?} has negative mode_version {value}",
+                        row.0
+                    )))
+                }
+                None => None,
+            };
             records.push(CorrectionRecord {
                 id: row.0,
                 capture_id: row.1,
@@ -1601,7 +1616,7 @@ impl StoreV2 {
                 decision,
                 decision_utc: row.8,
                 mode_id: row.9,
-                mode_version: row.10.map(|value| value.max(0) as u32),
+                mode_version,
                 provider_id: row.11,
                 provider_kind: row.12,
                 provider_model: row.13,
@@ -7449,6 +7464,16 @@ mod tests {
             CorrectionDecision::Edited,
         ] {
             assert_eq!(CorrectionDecision::parse(decision.as_str()), Some(decision));
+            // The two textual encodings (serde's `lowercase` and the
+            // database layer's as_str/parse) are one and the same — a
+            // future variant added with different spellings on either
+            // side fails here instead of desyncing silently (review).
+            let json = serde_json::to_string(&decision).unwrap();
+            assert_eq!(json.trim_matches('"'), decision.as_str());
+            assert_eq!(
+                serde_json::from_str::<CorrectionDecision>(&json).unwrap(),
+                decision
+            );
         }
         assert_eq!(CorrectionDecision::parse("nope"), None);
     }
