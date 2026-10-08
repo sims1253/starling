@@ -28,7 +28,6 @@ const TABLE_JSON: &str =
 
 #[derive(Debug, Deserialize)]
 struct Delimiter {
-    canonical: String,
     match_tokens: Vec<String>,
     window_words: usize,
 }
@@ -41,11 +40,6 @@ struct Table {
 fn table() -> &'static Table {
     static TABLE: OnceLock<Table> = OnceLock::new();
     TABLE.get_or_init(|| serde_json::from_str(TABLE_JSON).expect("spoken-instructions.json parses"))
-}
-
-/// The delimiter spelling the UI shows (contract data).
-pub fn canonical() -> &'static str {
-    &table().delimiter.canonical
 }
 
 /// One whitespace-separated token: byte span, code-point span and core.
@@ -180,8 +174,8 @@ mod tests {
 
     #[test]
     fn the_table_compiles_in() {
-        assert_eq!(canonical(), "Starling,");
         assert!(table().delimiter.window_words >= 1);
+        assert!(!table().delimiter.match_tokens.is_empty());
     }
 
     #[test]

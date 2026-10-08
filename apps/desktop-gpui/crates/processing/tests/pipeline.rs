@@ -399,10 +399,9 @@ fn transcribe_only_and_builtin_plans() {
 /// region, the way the #298 wiring does.
 fn mark_instruction(draft: &mut Draft, text: &str) {
     let split = starling_processing::instructions::split(text, Some("en"));
-    let Some((start, _)) = split.delimiter_span else {
+    let (Some((start, _)), Some((_, end))) = (split.delimiter_span, split.instruction_span) else {
         panic!("fixture must fire");
     };
-    let end = text.chars().count();
     assert_eq!(
         draft.mark_command(start, end, CommandKind::TrailingInstruction),
         Outcome::Applied
@@ -470,7 +469,12 @@ fn an_instruction_never_reaches_a_model_that_cannot_take_one() {
         &ContextValues::default(),
         &options("g1"),
     );
-    assert_eq!(refused.as_ref().unwrap_err().detail, pipeline::INSTRUCTION_CAPABLE_DETAIL);
+    let (request, failure) = refused.unwrap_err();
+    assert_eq!(failure.detail, pipeline::INSTRUCTION_CAPABLE_DETAIL);
+    // The refused request still names the job (the caller records the
+    // refusal against it); the instruction does not travel with it.
+    assert_eq!(request.request_id, "g1");
+    assert!(request.instruction.is_none());
     let builtin = build_request(
         &draft,
         &mode,
@@ -502,7 +506,39 @@ fn an_instruction_with_no_payload_is_refused_too() {
         &ContextValues::default(),
         &options("g3"),
     );
-    assert_eq!(refused.as_ref().unwrap_err().detail, pipeline::INSTRUCTION_EMPTY_DETAIL);
+    assert_eq!(refused.unwrap_err().1.detail, pipeline::INSTRUCTION_EMPTY_DETAIL);
+}
+
+#[test]
+fn an_instruction_that_strips_to_nothing_is_refused_not_dropped() {
+    // A command region carrying only the delimiter (an instruction
+    // edited away after marking) must not become `instruction: None` on
+    // a request a capable model then runs (#298).
+    let mut draft = Draft::new("d", "c");
+    let text = "send the report Starling,";
+    draft.final_attempt(0, "a", text);
+    let end = text.chars().count();
+    assert_eq!(
+        draft.mark_command(16, end, CommandKind::TrailingInstruction),
+        Outcome::Applied
+    );
+    assert_eq!(draft.instruction().as_deref(), Some("Starling,"));
+    let mut mode = clean_mode("local-authoring-chat", true);
+    mode.transform_kinds = vec![TransformKind::Rewrite];
+    mode.style = None;
+    let (_, failure) = build_request(
+        &draft,
+        &mode,
+        &chat_decl(Locality::Local),
+        &[],
+        &ContextValues::default(),
+        &options("g4"),
+    )
+    .unwrap_err();
+    assert_eq!(failure.reason, FailureReason::InvalidInput);
+    assert_eq!(failure.detail, pipeline::INSTRUCTION_BLANK_DETAIL);
+    // The raw text stands: nothing was sent anywhere.
+    assert_eq!(draft.text(), text);
 }
 
 #[test]
