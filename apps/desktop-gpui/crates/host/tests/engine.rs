@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use starling_dictation::engine::bundle::sha256_file;
-use starling_dictation::engine::{CatalogEntry, EngineConfig, EnginePhase};
+use starling_dictation::engine::{CatalogEntry, EngineConfig, EnginePhase, EXPECTED_ENGINE_ABI};
 use starling_dictation::settings::{EngineMode, Settings};
 use starling_runtime::machine::capture::{CaptureConfig, V2CaptureStore};
 use starling_runtime::protocol::Command;
@@ -81,9 +81,14 @@ fn engine_config_with_models(root: &Path, engine: Option<&Path>, models: &[&str]
             format!("{sha}  starling-serve-cpu\n"),
         )
         .unwrap();
+        // The manifest's abi derives from the app's expected ABI so a
+        // future bump can't leave this fixture staging a bundle its own
+        // engine refuses (#397 follow-up).
         std::fs::write(
             engines.join("engines.json"),
-            r#"{"version":"0.1.0","abi":8,"engines":[{"backend":"cpu","file":"starling-serve-cpu"}]}"#,
+            format!(
+                r#"{{"version":"0.1.0","abi":{EXPECTED_ENGINE_ABI},"engines":[{{"backend":"cpu","file":"starling-serve-cpu"}}]}}"#
+            ),
         )
         .unwrap();
     }
