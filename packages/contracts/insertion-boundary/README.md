@@ -46,7 +46,9 @@ byte-for-byte the raw text.
    - `before`'s last non-whitespace character is mid-sentence: alphanumeric,
      or one of `, ; : ) ] } ” ’ » 」 』 】 ） 》` — sentence enders
      (`. ! ? … 。 ！ ？`) and the opening set keep the case;
-   - the character has a lowercase mapping different from itself.
+   - the character has a lowercase mapping different from itself; the
+     **full** mapping is applied (multi-character lowercases such as `İ`
+     → `i̇` included — the Python `str.lower()` semantics).
 4. **Trailing.** Never. The end of `raw` is not modified whatever `after`
    contains ("no trailing-space changes inside words"); `after` is carried in
    the contract so future rules have pinned data, and so adapters can be

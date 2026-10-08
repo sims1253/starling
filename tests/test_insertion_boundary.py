@@ -67,24 +67,22 @@ def test_case(doc: dict) -> None:
 
 def test_raw_is_never_modified_beyond_the_boundary() -> None:
     """The adjustment may only prepend one space and lowercase the first
-    cased character: modulo an optional leading space, the result differs
-    from the raw text in exactly that one character, by its lowercase."""
+    cased character (its full lowercase mapping — 'İ' maps to two code
+    points): modulo an optional leading space, the result equals the raw
+    text with exactly that one character replaced."""
     for doc in _cases():
         got = oracle.adjust(oracle.BoundaryCase.from_json(doc)).text
         raw = doc["raw"]
         stripped = got[1:] if got.startswith(" ") and not raw.startswith(" ") else got
         # `stripped` is index-aligned with `raw` in both branches.
-        diffs = [i for i, (a, b) in enumerate(zip(stripped, raw)) if a != b]
-        if not diffs:
+        if stripped == raw:
             continue
         first_cased = next(
             (i for i, ch in enumerate(raw) if ch.isalpha() and ch != ch.lower()),
             None,
         )
-        assert first_cased is not None, f"{doc['case_id']}: unexpected diff at {diffs}"
-        assert diffs == [first_cased], (
-            f"{doc['case_id']}: changes beyond the boundary at {diffs}"
-        )
-        assert stripped[first_cased] == raw[first_cased].lower(), (
-            f"{doc['case_id']}: not a case change"
+        assert first_cased is not None, f"{doc['case_id']}: unexpected change to {got!r}"
+        expected = raw[:first_cased] + raw[first_cased].lower() + raw[first_cased + 1 :]
+        assert stripped == expected, (
+            f"{doc['case_id']}: changes beyond the boundary: {stripped!r} != {expected!r}"
         )

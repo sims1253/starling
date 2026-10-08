@@ -101,8 +101,8 @@ fn replays_every_pinned_case() {
 }
 
 /// The same invariant the Python suite pins: the adjustment may only
-/// prepend one space and lowercase the first cased character — nothing
-/// beyond the boundary ever changes.
+/// prepend one space and lowercase the first cased character (its full
+/// lowercase mapping) — nothing beyond the boundary ever changes.
 #[test]
 fn raw_is_never_modified_beyond_the_boundary() {
     for doc in cases() {
@@ -123,34 +123,26 @@ fn raw_is_never_modified_beyond_the_boundary() {
         } else {
             got.text.clone()
         };
-
-        let raw_chars: Vec<char> = case.raw.chars().collect();
-        let stripped_chars: Vec<char> = stripped.chars().collect();
-        let diffs: Vec<usize> = raw_chars
-            .iter()
-            .zip(&stripped_chars)
-            .enumerate()
-            .filter(|(_, (a, b))| a != b)
-            .map(|(i, _)| i)
-            .collect();
-
-        if diffs.is_empty() {
+        if stripped == case.raw {
             continue;
         }
+
+        // `stripped` equals the raw text with exactly the first cased
+        // character replaced by its full lowercase mapping.
+        let raw_chars: Vec<char> = case.raw.chars().collect();
         let first_cased = raw_chars
             .iter()
             .position(|ch| ch.is_alphabetic() && ch.to_lowercase().next() != Some(*ch))
             .expect("an unexpected difference appeared");
+        let lowered: String = raw_chars[first_cased].to_lowercase().collect();
+        let mut expected = String::new();
+        expected.extend(&raw_chars[..first_cased]);
+        expected.push_str(&lowered);
+        expected.extend(&raw_chars[first_cased + 1..]);
         assert_eq!(
-            diffs,
-            vec![first_cased],
+            stripped, expected,
             "{}: changes beyond the boundary",
             doc["case_id"].as_str().unwrap()
-        );
-        let expected_lower: char = raw_chars[first_cased].to_lowercase().next().unwrap();
-        assert_eq!(
-            stripped_chars[first_cased], expected_lower,
-            "not a case change"
         );
     }
 }

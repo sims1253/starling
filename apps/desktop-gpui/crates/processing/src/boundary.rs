@@ -128,50 +128,41 @@ pub fn adjust(raw: &str, ctx: &BoundaryContext<'_>, opts: &BoundaryOptions) -> B
     }
 
     // Rule 3: first-letter case.
-    if continues_sentence(ctx.before) && !first_token_is_protected(&text) {
-        if let Some(index) = first_uppercase_char_index(&text) {
-            let lowered: String = text
-                .chars()
-                .enumerate()
-                .map(|(i, ch)| {
-                    if i == index {
-                        ch.to_lowercase().next().unwrap_or(ch)
-                    } else {
-                        ch
-                    }
-                })
-                .collect();
-            let last = last_non_whitespace(ctx.before).expect("continues_sentence implies one");
-            text = lowered;
-            changes.push(BoundaryChange {
-                kind: BoundaryChangeKind::FirstLetterCase,
-                detail: format!("previous non-whitespace {last:?} continues the sentence"),
-            });
+    if let Some(last) = continuing_char(ctx.before) {
+        if !first_token_is_protected(&text) {
+            if let Some(index) = first_uppercase_char_index(&text) {
+                // Full lowercase mapping (multi-character mappings are
+                // possible, e.g. 'İ'), matching the Python oracle's
+                // `ch.lower()`.
+                if let Some((byte_index, ch)) = text.char_indices().nth(index) {
+                    let lowered = ch.to_lowercase().to_string();
+                    text.replace_range(byte_index..byte_index + ch.len_utf8(), &lowered);
+                    changes.push(BoundaryChange {
+                        kind: BoundaryChangeKind::FirstLetterCase,
+                        detail: format!("previous non-whitespace {last:?} continues the sentence"),
+                    });
+                }
+            }
         }
     }
 
     BoundaryAdjustment { text, changes }
 }
 
-/// The trailing whitespace run of `before` must contain no newline, and the
-/// last non-whitespace character must be mid-sentence (alphanumeric or
-/// continuing punctuation). A newline boundary behaves like the start of a
-/// field: the case is kept as recognized.
-fn continues_sentence(before: &str) -> bool {
+/// The last non-whitespace character of `before` when it continues the
+/// sentence (alphanumeric or continuing punctuation): a newline in the
+/// trailing whitespace run behaves like the start of a field (the case is
+/// kept as recognized), and sentence enders keep it too. Returns the
+/// character so callers never re-derive it.
+fn continuing_char(before: &str) -> Option<char> {
     let trimmed = before.trim_end();
-    let Some(last) = trimmed.chars().next_back() else {
-        return false;
-    };
+    let last = trimmed.chars().next_back()?;
     // A newline in the trailing whitespace run behaves like the start of a
     // field: the case is kept as recognized.
     if before[trimmed.len()..].contains(['\n', '\r']) {
-        return false;
+        return None;
     }
-    last.is_alphanumeric() || CONTINUING.contains(&last)
-}
-
-fn last_non_whitespace(before: &str) -> Option<char> {
-    before.trim_end().chars().next_back()
+    (last.is_alphanumeric() || CONTINUING.contains(&last)).then_some(last)
 }
 
 /// The first whitespace-delimited token.
@@ -269,6 +260,15 @@ mod tests {
             assert_eq!(adj.changes.len(), 1, "{raw}");
             assert_eq!(adj.changes[0].kind, BoundaryChangeKind::LeadingSpace);
         }
+    }
+
+    #[test]
+    fn multi_character_lowercase_mapping_matches_the_oracle() {
+        // 'İ' (U+0130) lowercases to "i̇" (two code points) — the full
+        // mapping is applied, not just its first character.
+        let adj = adjust("İstanbul", &ctx("text", ""), &BoundaryOptions::new());
+        assert_eq!(adj.text, " i̇stanbul");
+        assert_eq!(adj.changes.len(), 2);
     }
 
     #[test]

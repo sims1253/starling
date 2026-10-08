@@ -374,9 +374,14 @@ impl DeliveryActor {
                 // recorded as a delivery-time revision derived from the
                 // source: the raw recognition text stays unchanged and one
                 // action away, and a later prepare against either id
-                // delivers exactly that revision's text. A mode's verbatim
-                // flag is not carried into delivery in v1; verbatim modes
-                // surface once mode context reaches this machine.
+                // delivers exactly that revision's text. Two v1 limits,
+                // deliberate: the surrounding text is a PREPARE-TIME
+                // snapshot (apply revalidates target identity, not the
+                // boundary; re-reading at apply becomes worthwhile once a
+                // real adapter reports surrounding text), and a mode's
+                // verbatim flag does not reach this machine — today no
+                // adapter reports surrounding text at all, so nothing is
+                // adjusted in practice until that lands with mode context.
                 let (text, delivered_revision_id, raw_revision_id) =
                     match self.adapter.surrounding_text(&target_ref) {
                         SurroundingText::Available { before, after } => {
@@ -390,18 +395,32 @@ impl DeliveryActor {
                                 (text, revision_id.clone(), revision_id.clone())
                             } else {
                                 let derived_id = format!("{revision_id}#boundary");
+                                // Register the derived revision and decide
+                                // under one lock: if the source revision
+                                // vanished since the earlier read, deliver
+                                // the raw text unchanged rather than a
+                                // derived id that was never registered.
                                 let mut registry =
                                     self.revisions.lock().expect("revision registry lock");
-                                if let Some((doc_id, source)) = registry.get(&revision_id).cloned()
-                                {
-                                    let mut derived = source;
-                                    derived.rev_id = derived_id.clone();
-                                    derived.provenance = "insertion-boundary".to_string();
-                                    derived.text = adjustment.text.clone();
-                                    registry.insert(derived_id.clone(), (doc_id, derived));
-                                }
+                                let registered = registry
+                                    .get(&revision_id)
+                                    .cloned()
+                                    .map(|(doc_id, source)| {
+                                        let mut derived = source;
+                                        derived.rev_id = derived_id.clone();
+                                        derived.provenance =
+                                            "insertion-boundary".to_string();
+                                        derived.text = adjustment.text.clone();
+                                        registry
+                                            .insert(derived_id.clone(), (doc_id, derived));
+                                    })
+                                    .is_some();
                                 drop(registry);
-                                (adjustment.text, derived_id, revision_id.clone())
+                                if registered {
+                                    (adjustment.text, derived_id, revision_id.clone())
+                                } else {
+                                    (text, revision_id.clone(), revision_id.clone())
+                                }
                             }
                         }
                         SurroundingText::Unavailable { .. } => {

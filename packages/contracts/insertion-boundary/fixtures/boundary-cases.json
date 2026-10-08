@@ -420,6 +420,20 @@
   },
   {
     "schema_version": 1,
+    "case_id": "multi-char-lowercase-mapping",
+    "description": "a multi-character lowercase mapping is applied in full",
+    "before": "text",
+    "after": "",
+    "raw": "İstanbul",
+    "verbatim": false,
+    "expected_text": " i̇stanbul",
+    "expected_changes": [
+      { "kind": "leading_space", "detail": "previous character 't' is not whitespace or an opening bracket/quote" },
+      { "kind": "first_letter_case", "detail": "previous non-whitespace 't' continues the sentence" }
+    ]
+  },
+  {
+    "schema_version": 1,
     "case_id": "verbatim-mode",
     "description": "verbatim mode disables every rule",
     "before": "Done.",
