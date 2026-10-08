@@ -31,9 +31,9 @@ use starling_dictation::settings::ProcessingSettings;
 use starling_dictation::storage::{self, now_iso};
 use starling_processing::CancelToken;
 use starling_processing::contract::{
-    ContextField, FailureReason, Locality, ModeEntry, ProcessingRoute, ProfilesDocument,
-    ProviderDecl, ProviderKind, ResultStatus, RouteBlock, TransformKind, TransformRequest,
-    TransformResult, processing_route,
+    ContextField, Failure, FailureReason, Locality, ModeEntry, ProcessingRoute,
+    ProfilesDocument, ProviderDecl, ProviderKind, ResultStatus, RouteBlock, TransformKind,
+    TransformRequest, TransformResult, processing_route,
 };
 use starling_processing::http::validate_endpoint;
 use starling_processing::insight::{Arrival, ProcessingRecorded};
@@ -42,7 +42,8 @@ use starling_processing::providers::openai::OpenAiProvider;
 use starling_processing::providers::s1::S1Provider;
 use starling_processing::providers::{ChatConfig, Provider};
 use starling_processing::staging::{
-    Attempt, Draft, Outcome, ProposalStatus, RegionKind, ResultKind, StoredProposal,
+    Attempt, CommandKind, Draft, Outcome, ProposalStatus, RegionKind, ResultKind,
+    StoredProposal,
 };
 
 use crate::app::StarlingApp;
@@ -471,6 +472,28 @@ pub(crate) fn failure_message(
     format!("{what} The raw transcript is unchanged.")
 }
 
+/// The user-facing sentence when a take's trailing instruction is
+/// refused before any request exists (#298): this mode's model cannot
+/// follow instructions, or the instruction has no payload to work on.
+/// Nothing was sent anywhere; the raw transcript stands.
+fn instruction_refusal_message(failure: &Failure, label: &str) -> String {
+    match failure.detail.as_str() {
+        pipeline::INSTRUCTION_CAPABLE_DETAIL => format!(
+            "{label} cannot follow spoken instructions: an instruction \
+             requires an instruction-capable model. The raw transcript is unchanged."
+        ),
+        pipeline::INSTRUCTION_EMPTY_DETAIL => {
+            "A spoken instruction needs text to work on. The raw transcript is unchanged."
+                .to_string()
+        }
+        _ => format!(
+            "{}: {}. The raw transcript is unchanged.",
+            failure.reason.as_str(),
+            failure.detail
+        ),
+    }
+}
+
 fn result_kind(status: ResultStatus) -> ResultKind {
     match status {
         ResultStatus::Completed => ResultKind::Completed,
@@ -737,8 +760,23 @@ impl StarlingApp {
                         cx.notify();
                         return None;
                     }
+                    // A finalized take may end in a spoken instruction
+                    // (#298): the delimiter grammar splits it here, on
+                    // the finalized text only (live partials are never
+                    // parsed). The delimiter and everything after it
+                    // become the draft's command region, so the
+                    // instruction travels as the request's instruction
+                    // and never as input text. Re-running on the same
+                    // text re-marks the same span: a no-op.
+                    let text = draft.text();
+                    let split =
+                        starling_processing::instructions::split(&text, mode.language.as_deref());
+                    if let Some((start, _)) = split.delimiter_span {
+                        let end = text.chars().count();
+                        draft.mark_command(start, end, CommandKind::TrailingInstruction);
+                    }
                     let input_chars = draft.payload_text().chars().count() as u64;
-                    let request = pipeline::build_request(
+                    let request = match pipeline::build_request(
                         &draft,
                         mode,
                         &decl,
@@ -752,7 +790,27 @@ impl StarlingApp {
                             // far past any honest answer.
                             max_output_chars: input_chars.saturating_mul(4).max(2_000),
                         },
-                    );
+                    ) {
+                        Ok(request) => request,
+                        Err(failure) => {
+                            // The take ends in a spoken instruction this
+                            // plan cannot take (#298): nothing is sent
+                            // anywhere, the raw transcript stands and the
+                            // drawer says why through the failure channel.
+                            draft.result(&request_id, ResultKind::Failed, None);
+                            app.drafts.insert(id.clone(), draft);
+                            app.processing_jobs.remove(&id);
+                            app.set_processing(
+                                &id,
+                                label.clone(),
+                                ProcessingState::Failed {
+                                    message: instruction_refusal_message(&failure, &label),
+                                },
+                            );
+                            cx.notify();
+                            return None;
+                        }
+                    };
                     app.drafts.insert(id.clone(), draft);
                     Some(request)
                 })
@@ -1182,6 +1240,76 @@ mod tests {
         assert_eq!(mode("no-such-mode").id, "verbatim");
     }
 
+    #[gpui::test]
+    fn a_spoken_instruction_is_refused_not_fed_to_s1_mini(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // The take ends in the delimiter; the active mode is S1-mini
+        // cleanup, which cannot follow instructions (#298). The refusal
+        // names the reason, nothing is sent anywhere and the raw
+        // transcript stands.
+        let root = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::at_test_root(root.path());
+        let raw = "Please send the report Starling, make it formal";
+        let (id, _attempt) = saved_take_with_transcript(&store, raw);
+        let app = cx.new(|cx| StarlingApp::for_test(Some(store.clone()), cx));
+        app.update(cx, |app, cx| {
+            app.processing_settings.mode = "clean-local".to_string();
+            app.after_transcription(id.clone(), cx);
+        });
+        cx.run_until_parked();
+        app.update(cx, |app, _| {
+            let processing = app.processing.get(&id).expect("the take was processed");
+            let ProcessingState::Failed { message } = &processing.state else {
+                panic!("the instruction is refused, not run: {:?}", processing.state);
+            };
+            assert!(
+                message.contains("an instruction requires an instruction-capable model"),
+                "{message}"
+            );
+            let draft = app.drafts.get(&id).expect("the draft survives");
+            assert_eq!(draft.raw_text(), raw);
+            assert_eq!(draft.text(), raw, "nothing was sent or rewritten");
+            assert_eq!(
+                store.processing_doc(&id).unwrap().unwrap().head_text,
+                raw
+            );
+        });
+    }
+
+    /// A capture with a finalized transcript, like the tests in
+    /// `staging.rs` build one.
+    fn saved_take_with_transcript(
+        store: &crate::store::Store,
+        text: &str,
+    ) -> (String, String) {
+        use starling_dictation::{audio, storage::TranscriptionResult};
+        let wav = audio::encode_wav_16k(&audio::PcmAudio {
+            samples: vec![0.; 160],
+            sample_rate: 16_000,
+            channels: 1,
+        })
+        .unwrap();
+        let id = store
+            .save_capture(std::sync::Arc::new(wav), None)
+            .unwrap()
+            .id;
+        store.mark_attempt(&id, "test").unwrap();
+        store
+            .save_transcript(
+                &id,
+                TranscriptionResult {
+                    text: text.into(),
+                    segments: vec![],
+                    duration_seconds: None,
+                    request_id: None,
+                },
+            )
+            .unwrap();
+        let (attempt, _) = store.latest_raw(&id).unwrap().unwrap();
+        (id, attempt)
+    }
+
     #[test]
     fn modes_route_to_the_desktop_providers_without_fallback() {
         let providers = vec![s1_declaration(), api_declaration("m")];
@@ -1308,7 +1436,8 @@ mod tests {
                 deadline_ms: 1,
                 max_output_chars: 10,
             },
-        );
+        )
+        .unwrap();
         let cancelled = pipeline::run(&request, None, Clock::default(), &mut |_| {}, &{
             let token = CancelToken::new();
             token.cancel();

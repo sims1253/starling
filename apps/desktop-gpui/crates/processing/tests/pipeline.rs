@@ -149,7 +149,8 @@ fn process(
         &context_fields,
         &ContextValues::default(),
         &options(id),
-    );
+    )
+    .unwrap();
     pipeline::run(
         &request,
         Some(provider.as_ref()),
@@ -313,7 +314,8 @@ fn raw_survives_every_failure() {
             &context_fields,
             &ContextValues::default(),
             &request_options,
-        );
+        )
+        .unwrap();
         let result = pipeline::run(
             &request,
             Some(provider.as_ref()),
@@ -378,7 +380,8 @@ fn transcribe_only_and_builtin_plans() {
         &[],
         &ContextValues::default(),
         &options("b1"),
-    );
+    )
+    .unwrap();
     assert!(request.kinds.is_empty());
     assert!(request.prompt_version.is_none());
     let result = pipeline::run(
@@ -392,25 +395,126 @@ fn transcribe_only_and_builtin_plans() {
     assert_eq!(result.provider.kind, ProviderKind::Builtin);
 }
 
+/// Marks the split's delimiter and instruction as the draft's command
+/// region, the way the #298 wiring does.
+fn mark_instruction(draft: &mut Draft, text: &str) {
+    let split = starling_processing::instructions::split(text, Some("en"));
+    let Some((start, _)) = split.delimiter_span else {
+        panic!("fixture must fire");
+    };
+    let end = text.chars().count();
+    assert_eq!(
+        draft.mark_command(start, end, CommandKind::TrailingInstruction),
+        Outcome::Applied
+    );
+}
+
 #[test]
-fn instructions_travel_only_for_rewrite() {
+fn instruction_fixtures_replay_like_the_oracle() {
+    let cases = fixture("spoken-instructions.json");
+    let mut failures = Vec::new();
+    for case in cases.as_array().unwrap() {
+        let got = starling_processing::instructions::split(
+            case["input"].as_str().unwrap(),
+            case["language"].as_str(),
+        );
+        let matched = got.matched == case["expected"]["matched"].as_bool().unwrap();
+        let payload = got.payload == case["expected"]["payload"].as_str().unwrap();
+        let instruction =
+            got.instruction == case["expected"]["instruction"].as_str().unwrap();
+        let span = |value: &Value| -> Option<Vec<u64>> {
+            value.as_array().map(|items| {
+                items
+                    .iter()
+                    .map(|item| item.as_u64().unwrap())
+                    .collect::<Vec<u64>>()
+            })
+        };
+        let delimiter = got
+            .delimiter_span
+            .map(|(a, b)| vec![a as u64, b as u64])
+            == span(&case["expected"]["delimiter_span"]);
+        let instruction_span = got
+            .instruction_span
+            .map(|(a, b)| vec![a as u64, b as u64])
+            == span(&case["expected"]["instruction_span"]);
+        if !(matched && payload && instruction && delimiter && instruction_span) {
+            failures.push(format!("{}: got {got:?}", case["name"]));
+        }
+    }
+    assert_eq!(cases.as_array().unwrap().len(), 18, "the corpus is loaded");
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+#[test]
+fn an_instruction_never_reaches_a_model_that_cannot_take_one() {
+    // S1-mini cleanup (and the builtin step) cannot follow an
+    // instruction: the request is refused with the typed detail, never
+    // built with the instruction dropped into the input (#298).
     let mut draft = Draft::new("d", "c");
-    draft.final_attempt(0, "a", "send the report make it formal");
-    draft.mark_command(15, 30, CommandKind::TrailingInstruction);
+    let text = "send the report Starling, make it formal";
+    draft.final_attempt(0, "a", text);
+    mark_instruction(&mut draft, text);
+    let mode = clean_mode("local-authoring-chat", true);
+    let s1 = {
+        let mut decl = chat_decl(Locality::Local);
+        decl.instructions = false;
+        decl.transform_kinds = vec![TransformKind::Clean];
+        decl
+    };
+    let refused = build_request(
+        &draft,
+        &mode,
+        &s1,
+        &[],
+        &ContextValues::default(),
+        &options("g1"),
+    );
+    assert_eq!(refused.as_ref().unwrap_err().detail, pipeline::INSTRUCTION_CAPABLE_DETAIL);
+    let builtin = build_request(
+        &draft,
+        &mode,
+        &pipeline::builtin_declaration(),
+        &[],
+        &ContextValues::default(),
+        &options("g2"),
+    );
+    assert!(builtin.is_err());
+    // The raw text stands: nothing was sent anywhere.
+    assert_eq!(draft.text(), text);
+}
+
+#[test]
+fn an_instruction_with_no_payload_is_refused_too() {
+    let mut draft = Draft::new("d", "c");
+    let text = "Starling, clean this up";
+    draft.final_attempt(0, "a", text);
+    mark_instruction(&mut draft, text);
     let mut mode = clean_mode("local-authoring-chat", true);
+    mode.transform_kinds = vec![TransformKind::Rewrite];
+    mode.style = None;
     let decl = chat_decl(Locality::Local);
-    let clean = build_request(
+    let refused = build_request(
         &draft,
         &mode,
         &decl,
         &[],
         &ContextValues::default(),
-        &options("c1"),
+        &options("g3"),
     );
-    assert_eq!(clean.input, "send the report");
-    assert_eq!(clean.instruction, None);
+    assert_eq!(refused.as_ref().unwrap_err().detail, pipeline::INSTRUCTION_EMPTY_DETAIL);
+}
+
+#[test]
+fn the_delimiter_is_stripped_from_the_instruction_the_model_sees() {
+    let mut draft = Draft::new("d", "c");
+    let text = "send the report Starling, make it formal";
+    draft.final_attempt(0, "a", text);
+    mark_instruction(&mut draft, text);
+    let mut mode = clean_mode("local-authoring-chat", true);
     mode.transform_kinds = vec![TransformKind::Rewrite];
     mode.style = None;
+    let decl = chat_decl(Locality::Local);
     let rewrite = build_request(
         &draft,
         &mode,
@@ -418,8 +522,11 @@ fn instructions_travel_only_for_rewrite() {
         &[],
         &ContextValues::default(),
         &options("c2"),
-    );
-    assert_eq!(rewrite.instruction.as_deref(), Some(" make it formal"));
+    )
+    .unwrap();
+    // The command region carries the delimiter; the request does not.
+    assert_eq!(rewrite.input, "send the report ");
+    assert_eq!(rewrite.instruction.as_deref(), Some("make it formal"));
     assert!(
         rewrite.context.vocabulary.is_none(),
         "no field the plan did not allow"
@@ -440,7 +547,8 @@ fn results_validate_as_the_contract_records() {
         &[],
         &ContextValues::default(),
         &options("v1"),
-    );
+    )
+    .unwrap();
     assert!(matches!(plan(faithful, &registry), Plan::Builtin));
     let result = pipeline::run(
         &request,
@@ -516,7 +624,8 @@ fn processing_recorded_events_match_the_insight_contract() {
         &[],
         &ContextValues::default(),
         &options("req:1"),
-    );
+    )
+    .unwrap();
     request.capture_id = "cap:1".into();
     let result = pipeline::run(
         &request,

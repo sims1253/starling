@@ -1,0 +1,290 @@
+[
+  {
+    "name": "trailing_instruction",
+    "description": "The delimiter near the end splits payload from instruction.",
+    "input": "Please send the report Starling, make it formal and short",
+    "language": "en",
+    "expected": {
+      "matched": true,
+      "payload": "Please send the report ",
+      "instruction": "make it formal and short",
+      "delimiter_span": [
+        23,
+        32
+      ],
+      "instruction_span": [
+        32,
+        57
+      ]
+    }
+  },
+  {
+    "name": "asr_misspelling_sterling",
+    "description": "An ASR spelling variant of the delimiter still fires.",
+    "input": "Finish the draft sterling translate it to German",
+    "language": "en",
+    "expected": {
+      "matched": true,
+      "payload": "Finish the draft ",
+      "instruction": "translate it to German",
+      "delimiter_span": [
+        17,
+        25
+      ],
+      "instruction_span": [
+        25,
+        48
+      ]
+    }
+  },
+  {
+    "name": "asr_misspelling_starlin",
+    "description": "A dropped final consonant is still the delimiter.",
+    "input": "send that email starlin make it a short bulleted list",
+    "language": "en",
+    "expected": {
+      "matched": true,
+      "payload": "send that email ",
+      "instruction": "make it a short bulleted list",
+      "delimiter_span": [
+        16,
+        23
+      ],
+      "instruction_span": [
+        23,
+        53
+      ]
+    }
+  },
+  {
+    "name": "case_and_attached_punctuation",
+    "description": "Matching is case-insensitive and ignores recognizer punctuation attached to the token.",
+    "input": "one more thing STARLING! keep the greeting informal",
+    "language": "en",
+    "expected": {
+      "matched": true,
+      "payload": "one more thing ",
+      "instruction": "keep the greeting informal",
+      "delimiter_span": [
+        15,
+        24
+      ],
+      "instruction_span": [
+        24,
+        51
+      ]
+    }
+  },
+  {
+    "name": "mid_sentence_delimiter_does_not_fire",
+    "description": "A delimiter outside the last window words is mid-sentence text: nothing fires.",
+    "input": "Starling, two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen",
+    "language": "en",
+    "expected": {
+      "matched": false,
+      "payload": "Starling, two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen",
+      "instruction": "",
+      "delimiter_span": null,
+      "instruction_span": null
+    }
+  },
+  {
+    "name": "quoted_mention_does_not_fire",
+    "description": "A quoted mention never matches: the opening quote stays attached to the token.",
+    "input": "The wake word \"Starling\" ends this take now",
+    "language": "en",
+    "expected": {
+      "matched": false,
+      "payload": "The wake word \"Starling\" ends this take now",
+      "instruction": "",
+      "delimiter_span": null,
+      "instruction_span": null
+    }
+  },
+  {
+    "name": "german_quoted_mention_does_not_fire",
+    "description": "Typographic quotes block the match the same way.",
+    "input": "Er sagte „Starling“ und tippte einfach weiter",
+    "language": "de",
+    "expected": {
+      "matched": false,
+      "payload": "Er sagte „Starling“ und tippte einfach weiter",
+      "instruction": "",
+      "delimiter_span": null,
+      "instruction_span": null
+    }
+  },
+  {
+    "name": "repeated_delimiters_last_wins",
+    "description": "Among delimiters inside the window the last one wins; earlier ones stay payload text.",
+    "input": "Send it Starling, make it formal Starling, translate it to German",
+    "language": "en",
+    "expected": {
+      "matched": true,
+      "payload": "Send it Starling, make it formal ",
+      "instruction": "translate it to German",
+      "delimiter_span": [
+        33,
+        42
+      ],
+      "instruction_span": [
+        42,
+        65
+      ]
+    }
+  },
+  {
+    "name": "literal_escape_keeps_text",
+    "description": "The literal word before the delimiter dictates it as text; nothing fires.",
+    "input": "Send the report literal Starling, make it formal",
+    "language": "en",
+    "expected": {
+      "matched": false,
+      "payload": "Send the report literal Starling, make it formal",
+      "instruction": "",
+      "delimiter_span": null,
+      "instruction_span": null
+    }
+  },
+  {
+    "name": "german_literal_escape",
+    "description": "The escape word follows the take's language table.",
+    "input": "Sende den Bericht wörtlich Starling, übersetze ihn ins Englische",
+    "language": "de",
+    "expected": {
+      "matched": false,
+      "payload": "Sende den Bericht wörtlich Starling, übersetze ihn ins Englische",
+      "instruction": "",
+      "delimiter_span": null,
+      "instruction_span": null
+    }
+  },
+  {
+    "name": "empty_instruction_payload_untouched",
+    "description": "No instruction after the delimiter: no split, the payload keeps everything.",
+    "input": "Send the report Starling,",
+    "language": "en",
+    "expected": {
+      "matched": false,
+      "payload": "Send the report Starling,",
+      "instruction": "",
+      "delimiter_span": null,
+      "instruction_span": null
+    }
+  },
+  {
+    "name": "punctuation_only_tail_is_not_an_instruction",
+    "description": "A tail without a letter or digit is not an instruction.",
+    "input": "Send the report Starling, !",
+    "language": "en",
+    "expected": {
+      "matched": false,
+      "payload": "Send the report Starling, !",
+      "instruction": "",
+      "delimiter_span": null,
+      "instruction_span": null
+    }
+  },
+  {
+    "name": "non_english_payload_english_instruction",
+    "description": "The payload can be any language; the instruction is whatever follows the delimiter.",
+    "input": "Bitte sende den Bericht an Max Starling, translate this to English",
+    "language": "de",
+    "expected": {
+      "matched": true,
+      "payload": "Bitte sende den Bericht an Max ",
+      "instruction": "translate this to English",
+      "delimiter_span": [
+        31,
+        40
+      ],
+      "instruction_span": [
+        40,
+        66
+      ]
+    }
+  },
+  {
+    "name": "no_delimiter",
+    "description": "Plain text: no match.",
+    "input": "Just a normal take with no wake word in it",
+    "language": "en",
+    "expected": {
+      "matched": false,
+      "payload": "Just a normal take with no wake word in it",
+      "instruction": "",
+      "delimiter_span": null,
+      "instruction_span": null
+    }
+  },
+  {
+    "name": "delimiter_first_word_empty_payload",
+    "description": "A take that is only an instruction: the payload is empty (the pipeline refuses to run it).",
+    "input": "Starling, clean this up",
+    "language": "en",
+    "expected": {
+      "matched": true,
+      "payload": "",
+      "instruction": "clean this up",
+      "delimiter_span": [
+        0,
+        9
+      ],
+      "instruction_span": [
+        9,
+        23
+      ]
+    }
+  },
+  {
+    "name": "window_edge_fires",
+    "description": "The delimiter exactly window words from the end still fires.",
+    "input": "word Starling, one two three four five six seven eight nine ten eleven",
+    "language": "en",
+    "expected": {
+      "matched": true,
+      "payload": "word ",
+      "instruction": "one two three four five six seven eight nine ten eleven",
+      "delimiter_span": [
+        5,
+        14
+      ],
+      "instruction_span": [
+        14,
+        70
+      ]
+    }
+  },
+  {
+    "name": "just_outside_window_does_not_fire",
+    "description": "One word further from the end and it is mid-sentence text.",
+    "input": "word Starling, one two three four five six seven eight nine ten eleven twelve",
+    "language": "en",
+    "expected": {
+      "matched": false,
+      "payload": "word Starling, one two three four five six seven eight nine ten eleven twelve",
+      "instruction": "",
+      "delimiter_span": null,
+      "instruction_span": null
+    }
+  },
+  {
+    "name": "newline_before_delimiter",
+    "description": "The whitespace set is the six ASCII characters, so a newline before the delimiter is just a separator.",
+    "input": "line one\nStarling, make it a list",
+    "language": "en",
+    "expected": {
+      "matched": true,
+      "payload": "line one\n",
+      "instruction": "make it a list",
+      "delimiter_span": [
+        9,
+        18
+      ],
+      "instruction_span": [
+        18,
+        33
+      ]
+    }
+  }
+]

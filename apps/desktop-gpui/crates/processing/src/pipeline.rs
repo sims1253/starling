@@ -6,8 +6,10 @@
 //! `processing_route`, so there is no second place that picks providers
 //! and no fallback: a blocked plan runs nothing and the raw text stands.
 //! [`build_request`] reads a [`Draft`] (never its live partials) and
-//! pins the request to the draft's revision; [`run`] executes it. A
-//! result is only ever a proposal for the draft to judge.
+//! pins the request to the draft's revision; a draft carrying a
+//! trailing instruction the plan cannot take refuses instead of
+//! dropping it (#298); [`run`] executes it. A result is only ever a
+//! proposal for the draft to judge.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -139,9 +141,23 @@ pub struct RequestOptions {
     pub max_output_chars: u64,
 }
 
+/// The typed detail when a take carries a trailing instruction but the
+/// plan cannot take one (#298): the instruction is never fed to the
+/// model as text, the job reports why instead.
+pub const INSTRUCTION_CAPABLE_DETAIL: &str = "an instruction requires an instruction-capable model";
+/// The typed detail when a trailing instruction has no payload to work
+/// on (a take that was only the instruction).
+pub const INSTRUCTION_EMPTY_DETAIL: &str = "an instruction has no text to work on";
+
 /// Builds the request for the draft's current revision. The input is the
 /// draft's payload (command regions excluded) after the deterministic
 /// step; the trailing instruction, if any, travels separately.
+///
+/// Fails ([`Err`]) when the draft carries an instruction this plan
+/// cannot take: a mode without an instruction-capable kind, a provider
+/// that declares no instruction capability (S1-mini cleanup, the
+/// builtin step), or an instruction with no payload. The instruction is
+/// never silently dropped and never fed to the model as input text.
 pub fn build_request(
     draft: &Draft,
     mode: &ModeEntry,
@@ -149,13 +165,35 @@ pub fn build_request(
     context_fields: &[ContextField],
     values: &ContextValues,
     options: &RequestOptions,
-) -> TransformRequest {
+) -> Result<TransformRequest, Failure> {
     let input = transforms::apply(
         &draft.payload_text(),
         mode.language.as_deref(),
         mode.spoken_commands,
         &mode.snippets,
     );
+    let instruction_region = draft.instruction();
+    if instruction_region.is_some() {
+        let capable = provider.instructions
+            && mode
+                .transform_kinds
+                .iter()
+                .any(|kind| kind.needs_instructions());
+        if !capable {
+            return Err(Failure::new(
+                FailureReason::UnsupportedKind,
+                false,
+                INSTRUCTION_CAPABLE_DETAIL,
+            ));
+        }
+        if input.trim().is_empty() {
+            return Err(Failure::new(
+                FailureReason::InvalidInput,
+                false,
+                INSTRUCTION_EMPTY_DETAIL,
+            ));
+        }
+    }
     let model_step = provider.kind != ProviderKind::Builtin;
     let mut context = RequestContext::default();
     if model_step {
@@ -170,12 +208,15 @@ pub fn build_request(
                 .filter(|value| !value.is_empty());
         }
     }
-    let instruction = draft.instruction().filter(|_| {
-        mode.transform_kinds
-            .iter()
-            .any(|kind| kind.needs_instructions())
-    });
-    TransformRequest {
+    let instruction = instruction_region
+        .map(|text| crate::instructions::strip_delimiter(&text))
+        .filter(|_| {
+            mode.transform_kinds
+                .iter()
+                .any(|kind| kind.needs_instructions())
+        })
+        .filter(|text| !text.is_empty());
+    Ok(TransformRequest {
         schema_version: 1,
         request_id: options.request_id.clone(),
         retry_of: options.retry_of.clone(),
@@ -203,7 +244,7 @@ pub fn build_request(
         local_only: mode.local_only,
         deadline_ms: options.deadline_ms,
         max_output_chars: options.max_output_chars,
-    }
+    })
 }
 
 /// When the job was queued and when the take stopped, for timing.

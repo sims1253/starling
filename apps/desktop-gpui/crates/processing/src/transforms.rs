@@ -23,6 +23,26 @@ const WHITESPACE: [char; 6] = [' ', '\t', '\n', '\r', '\u{b}', '\u{c}'];
 /// Punctuation a recognizer attaches to a command word.
 const ATTACHED: [char; 6] = [',', '.', ';', ':', '!', '?'];
 
+/// The whitespace predicate of the six-character set (shared with the
+/// trailing instruction grammar so both grammars tokenize alike).
+pub(crate) fn is_ws(c: char) -> bool {
+    WHITESPACE.contains(&c)
+}
+
+/// A token's core: the punctuation a recognizer attaches stripped from
+/// both ends, lowercased (shared with the trailing instruction grammar).
+pub(crate) fn token_core(token: &str) -> String {
+    token
+        .trim_matches(|c: char| ATTACHED.contains(&c))
+        .to_lowercase()
+}
+
+/// The literal escape word of a language's spoken-commands table (the
+/// English "literal" when the language has no table).
+pub(crate) fn literal_word(language: Option<&str>) -> &'static str {
+    language_table(language).map_or("literal", |lang| lang.literal.as_str())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Action {
@@ -78,10 +98,6 @@ struct Phrase<'a> {
     chars: usize,
     snippet: bool,
     replacement: Replacement<'a>,
-}
-
-fn is_ws(c: char) -> bool {
-    WHITESPACE.contains(&c)
 }
 
 fn trim_end_ws(out: &mut String, set: &[char]) {

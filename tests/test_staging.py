@@ -347,6 +347,78 @@ def test_a_dictated_command_line_is_just_text() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# The trailing instruction grammar (#298)
+# --------------------------------------------------------------------------- #
+import spoken_instructions as si  # noqa: E402
+
+INSTRUCTION_TABLE = si.load_table()
+INSTRUCTION_CASES = si.cases()
+INSTRUCTION_SCHEMA = mr.load_schema("spoken-instruction.schema.json")
+
+
+@pytest.mark.parametrize("case", INSTRUCTION_CASES, ids=[c["name"] for c in INSTRUCTION_CASES])
+def test_instruction_case(case) -> None:
+    got = si.split(case["input"], language=case["language"], table=INSTRUCTION_TABLE,
+                   commands_table=COMMAND_TABLE)
+    assert got == case["expected"]
+    # Raw preservation: the payload plus the tail from the delimiter
+    # reconstructs the take exactly.
+    if got["matched"]:
+        assert case["input"] == got["payload"] + case["input"][got["delimiter_span"][0]:]
+
+
+def test_instruction_records_conform() -> None:
+    for case in INSTRUCTION_CASES:
+        record = si.record(case["input"], language=case["language"], table=INSTRUCTION_TABLE,
+                           commands_table=COMMAND_TABLE)
+        assert_valid(record, INSTRUCTION_SCHEMA)
+
+
+def test_unknown_instruction_field_rejected() -> None:
+    record = si.record(INSTRUCTION_CASES[0]["input"], language="en", table=INSTRUCTION_TABLE,
+                       commands_table=COMMAND_TABLE)
+    record["provider"] = "remote-asr"
+    assert_invalid(record, INSTRUCTION_SCHEMA)
+
+
+def test_instruction_fixtures_cover_the_acceptance_list() -> None:
+    names = {c["name"] for c in INSTRUCTION_CASES}
+    assert {
+        "asr_misspelling_sterling",
+        "mid_sentence_delimiter_does_not_fire",
+        "quoted_mention_does_not_fire",
+        "repeated_delimiters_last_wins",
+        "literal_escape_keeps_text",
+        "empty_instruction_payload_untouched",
+        "non_english_payload_english_instruction",
+    } <= names
+    languages = {c["language"] for c in INSTRUCTION_CASES}
+    assert {"en", "de"} <= languages
+    assert any(not c["expected"]["matched"] for c in INSTRUCTION_CASES)
+
+
+def test_instruction_table_is_closed() -> None:
+    assert INSTRUCTION_TABLE["schema_version"] == 1
+    delimiter = INSTRUCTION_TABLE["delimiter"]
+    assert delimiter["canonical"]
+    assert delimiter["window_words"] >= 1
+    tokens = delimiter["match_tokens"]
+    assert tokens and len(tokens) == len(set(tokens))
+    assert all(t == t.lower() and t.strip(",.;:!?") == t for t in tokens)
+
+
+def test_the_delimiter_is_stripped_from_an_instruction_region() -> None:
+    # The draft's command region carries "Starling, <instruction>"; the
+    # request the model sees carries only the instruction.
+    stripped = si.strip_delimiter("Starling, make it formal", table=INSTRUCTION_TABLE)
+    assert stripped == "make it formal"
+    # A repeated delimiter already lost to last-one-wins is not stripped
+    # twice: only the leading token goes.
+    kept = si.strip_delimiter("make it formal", table=INSTRUCTION_TABLE)
+    assert kept == "make it formal"
+
+
+# --------------------------------------------------------------------------- #
 # The desktop app's built-in modes (#295) are an ordinary profiles document
 # --------------------------------------------------------------------------- #
 DESKTOP_MODES = mr.load_json(mr.REPO / "apps" / "desktop-gpui" / "crates" / "app" / "modes"
