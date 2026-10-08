@@ -1,0 +1,255 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:starling:contracts:personalization:v1",
+  "$comment": [
+    "Starling personalization without training contract, v1 (#305).",
+    "Covers two zero-training personalization mechanisms over #304 data:",
+    "1. Vocabulary and replacement suggestions: repeated corrections become",
+    "   candidate dictionary entries or replacement snippets, gated by frequency",
+    "   and consistency thresholds and conflict detection. Suggestions are",
+    "   reviewed and never enabled silently.",
+    "2. Few-shot style retrieval: deterministic retrieval of accepted examples",
+    "   for processing modes, isolated by language, mode, and project, capped",
+    "   by example and character budgets, formatted into personal_context with provenance."
+  ],
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "kind"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "kind": {
+      "enum": [
+        "correction_record",
+        "suggestion",
+        "retrieval_request",
+        "retrieval_result",
+        "config"
+      ]
+    }
+  },
+  "$defs": {
+    "token": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_.:-]{1,128}$"
+    },
+    "correctionRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "capture_id",
+        "request_id",
+        "raw_text",
+        "final_text",
+        "decision",
+        "decision_utc"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "capture_id": {
+          "type": "string"
+        },
+        "request_id": {
+          "type": "string"
+        },
+        "raw_text": {
+          "type": "string"
+        },
+        "final_text": {
+          "type": "string"
+        },
+        "decision": {
+          "enum": [
+            "accepted",
+            "reverted",
+            "edited",
+            "dismissed"
+          ]
+        },
+        "decision_utc": {
+          "type": "string"
+        },
+        "mode_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "language": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "project_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "secure_field": {
+          "type": "boolean"
+        }
+      }
+    },
+    "suggestion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "target_type",
+        "source_phrase",
+        "target_phrase",
+        "frequency",
+        "consistency",
+        "status"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "target_type": {
+          "enum": [
+            "vocabulary",
+            "replacement"
+          ]
+        },
+        "source_phrase": {
+          "type": "string",
+          "minLength": 1
+        },
+        "target_phrase": {
+          "type": "string",
+          "minLength": 1
+        },
+        "frequency": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "consistency": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "status": {
+          "enum": [
+            "suggested",
+            "accepted",
+            "ignored"
+          ]
+        },
+        "conflict": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "last_seen_utc": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "retrievalRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode_id"
+      ],
+      "properties": {
+        "mode_id": {
+          "type": "string"
+        },
+        "language": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "project_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "max_examples": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_characters": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "personalization_enabled": {
+          "type": "boolean"
+        }
+      }
+    },
+    "retrievalResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "examples_used",
+        "character_count",
+        "formatted_context"
+      ],
+      "properties": {
+        "examples_used": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "character_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "formatted_context": {
+          "type": "string"
+        }
+      }
+    },
+    "config": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "min_frequency",
+        "min_consistency",
+        "max_retrieval_examples",
+        "max_retrieval_characters",
+        "personalization_enabled"
+      ],
+      "properties": {
+        "min_frequency": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "min_consistency": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "max_retrieval_examples": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_retrieval_characters": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "personalization_enabled": {
+          "type": "boolean"
+        }
+      }
+    }
+  }
+}

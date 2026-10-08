@@ -1,0 +1,370 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Fixture table for few-shot style retrieval (#305)",
+  "cases": [
+    {
+      "id": "normal_retrieval_under_budgets",
+      "description": "Retrieves accepted examples matching mode and language within budgets",
+      "history": [
+        {
+          "id": "rec_01",
+          "capture_id": "cap_01",
+          "request_id": "req_01",
+          "raw_text": "hey send the report please",
+          "final_text": "Hey, please send the report.",
+          "decision": "accepted",
+          "decision_utc": "2026-10-01T10:00:00Z",
+          "mode_id": "email",
+          "language": "en",
+          "project_id": null,
+          "secure_field": false
+        },
+        {
+          "id": "rec_02",
+          "capture_id": "cap_02",
+          "request_id": "req_02",
+          "raw_text": "thanks for meeting today",
+          "final_text": "Thanks for meeting today!",
+          "decision": "accepted",
+          "decision_utc": "2026-10-01T11:00:00Z",
+          "mode_id": "email",
+          "language": "en",
+          "project_id": null,
+          "secure_field": false
+        }
+      ],
+      "deleted_captures": [],
+      "request": {
+        "mode_id": "email",
+        "language": "en",
+        "project_id": null,
+        "max_examples": 3,
+        "max_characters": 500,
+        "personalization_enabled": true
+      },
+      "expected_result": {
+        "examples_used": [
+          "rec_02",
+          "rec_01"
+        ],
+        "character_count": 156,
+        "formatted_context": "[Style References]\nInput: thanks for meeting today\nOutput: Thanks for meeting today!\n\nInput: hey send the report please\nOutput: Hey, please send the report."
+      }
+    },
+    {
+      "id": "max_examples_cap_enforced",
+      "description": "Caps output to max_examples even if character budget remains",
+      "history": [
+        {
+          "id": "rec_11",
+          "capture_id": "cap_11",
+          "request_id": "req_11",
+          "raw_text": "one",
+          "final_text": "One.",
+          "decision": "accepted",
+          "decision_utc": "2026-10-02T10:00:00Z",
+          "mode_id": "clean",
+          "language": "en",
+          "project_id": null,
+          "secure_field": false
+        },
+        {
+          "id": "rec_12",
+          "capture_id": "cap_12",
+          "request_id": "req_12",
+          "raw_text": "two",
+          "final_text": "Two.",
+          "decision": "accepted",
+          "decision_utc": "2026-10-02T11:00:00Z",
+          "mode_id": "clean",
+          "language": "en",
+          "project_id": null,
+          "secure_field": false
+        },
+        {
+          "id": "rec_13",
+          "capture_id": "cap_13",
+          "request_id": "req_13",
+          "raw_text": "three",
+          "final_text": "Three.",
+          "decision": "accepted",
+          "decision_utc": "2026-10-02T12:00:00Z",
+          "mode_id": "clean",
+          "language": "en",
+          "project_id": null,
+          "secure_field": false
+        },
+        {
+          "id": "rec_14",
+          "capture_id": "cap_14",
+          "request_id": "req_14",
+          "raw_text": "four",
+          "final_text": "Four.",
+          "decision": "accepted",
+          "decision_utc": "2026-10-02T13:00:00Z",
+          "mode_id": "clean",
+          "language": "en",
+          "project_id": null,
+          "secure_field": false
+        }
+      ],
+      "deleted_captures": [],
+      "request": {
+        "mode_id": "clean",
+        "language": "en",
+        "project_id": null,
+        "max_examples": 2,
+        "max_characters": 500,
+        "personalization_enabled": true
+      },
+      "expected_result": {
+        "examples_used": [
+          "rec_14",
+          "rec_13"
+        ],
+        "character_count": 73,
+        "formatted_context": "[Style References]\nInput: four\nOutput: Four.\n\nInput: three\nOutput: Three."
+      }
+    },
+    {
+      "id": "max_characters_cap_enforced",
+      "description": "Stops retrieval before exceeding the character budget",
+      "history": [
+        {
+          "id": "rec_21",
+          "capture_id": "cap_21",
+          "request_id": "req_21",
+          "raw_text": "This is a moderately long sentence for dictation testing purpose.",
+          "final_text": "This is a moderately long sentence for dictation testing purposes.",
+          "decision": "accepted",
+          "decision_utc": "2026-10-03T10:00:00Z",
+          "mode_id": "clean",
+          "language": "en",
+          "project_id": null,
+          "secure_field": false
+        },
+        {
+          "id": "rec_22",
+          "capture_id": "cap_22",
+          "request_id": "req_22",
+          "raw_text": "Here is another lengthy transcript that would definitely push the total character count over eighty characters.",
+          "final_text": "Here is another lengthy transcript that would definitely push the total character count over eighty characters.",
+          "decision": "accepted",
+          "decision_utc": "2026-10-03T11:00:00Z",
+          "mode_id": "clean",
+          "language": "en",
+          "project_id": null,
+          "secure_field": false
+        }
+      ],
+      "deleted_captures": [],
+      "request": {
+        "mode_id": "clean",
+        "language": "en",
+        "project_id": null,
+        "max_examples": 3,
+        "max_characters": 270,
+        "personalization_enabled": true
+      },
+      "expected_result": {
+        "examples_used": [
+          "rec_22"
+        ],
+        "character_count": 257,
+        "formatted_context": "[Style References]\nInput: Here is another lengthy transcript that would definitely push the total character count over eighty characters.\nOutput: Here is another lengthy transcript that would definitely push the total character count over eighty characters."
+      }
+    },
+    {
+      "id": "language_isolation",
+      "description": "Never retrieves examples from a different language",
+      "history": [
+        {
+          "id": "rec_31",
+          "capture_id": "cap_31",
+          "request_id": "req_31",
+          "raw_text": "hallo welt",
+          "final_text": "Hallo Welt!",
+          "decision": "accepted",
+          "decision_utc": "2026-10-04T10:00:00Z",
+          "mode_id": "clean",
+          "language": "de",
+          "project_id": null,
+          "secure_field": false
+        },
+        {
+          "id": "rec_32",
+          "capture_id": "cap_32",
+          "request_id": "req_32",
+          "raw_text": "hola mundo",
+          "final_text": "¡Hola mundo!",
+          "decision": "accepted",
+          "decision_utc": "2026-10-04T11:00:00Z",
+          "mode_id": "clean",
+          "language": "es",
+          "project_id": null,
+          "secure_field": false
+        }
+      ],
+      "deleted_captures": [],
+      "request": {
+        "mode_id": "clean",
+        "language": "de",
+        "project_id": null,
+        "max_examples": 3,
+        "max_characters": 500,
+        "personalization_enabled": true
+      },
+      "expected_result": {
+        "examples_used": [
+          "rec_31"
+        ],
+        "character_count": 56,
+        "formatted_context": "[Style References]\nInput: hallo welt\nOutput: Hallo Welt!"
+      }
+    },
+    {
+      "id": "project_isolation",
+      "description": "Never cross-contaminates between distinct project IDs",
+      "history": [
+        {
+          "id": "rec_41",
+          "capture_id": "cap_41",
+          "request_id": "req_41",
+          "raw_text": "alpha secret formula",
+          "final_text": "Alpha Secret Formula",
+          "decision": "accepted",
+          "decision_utc": "2026-10-05T10:00:00Z",
+          "mode_id": "clean",
+          "language": "en",
+          "project_id": "project-alpha",
+          "secure_field": false
+        },
+        {
+          "id": "rec_42",
+          "capture_id": "cap_42",
+          "request_id": "req_42",
+          "raw_text": "beta public notes",
+          "final_text": "Beta Public Notes",
+          "decision": "accepted",
+          "decision_utc": "2026-10-05T11:00:00Z",
+          "mode_id": "clean",
+          "language": "en",
+          "project_id": "project-beta",
+          "secure_field": false
+        }
+      ],
+      "deleted_captures": [],
+      "request": {
+        "mode_id": "clean",
+        "language": "en",
+        "project_id": "project-alpha",
+        "max_examples": 3,
+        "max_characters": 500,
+        "personalization_enabled": true
+      },
+      "expected_result": {
+        "examples_used": [
+          "rec_41"
+        ],
+        "character_count": 75,
+        "formatted_context": "[Style References]\nInput: alpha secret formula\nOutput: Alpha Secret Formula"
+      }
+    },
+    {
+      "id": "deleted_and_secure_exclusion",
+      "description": "Deleted captures and secure field entries are immediately excluded",
+      "history": [
+        {
+          "id": "rec_51",
+          "capture_id": "cap_deleted",
+          "request_id": "req_51",
+          "raw_text": "deleted item",
+          "final_text": "Deleted item.",
+          "decision": "accepted",
+          "decision_utc": "2026-10-06T10:00:00Z",
+          "mode_id": "clean",
+          "language": "en",
+          "project_id": null,
+          "secure_field": false
+        },
+        {
+          "id": "rec_52",
+          "capture_id": "cap_secure",
+          "request_id": "req_52",
+          "raw_text": "my password is secret",
+          "final_text": "My password is secret.",
+          "decision": "accepted",
+          "decision_utc": "2026-10-06T11:00:00Z",
+          "mode_id": "clean",
+          "language": "en",
+          "project_id": null,
+          "secure_field": true
+        },
+        {
+          "id": "rec_53",
+          "capture_id": "cap_valid",
+          "request_id": "req_53",
+          "raw_text": "valid item",
+          "final_text": "Valid item.",
+          "decision": "accepted",
+          "decision_utc": "2026-10-06T12:00:00Z",
+          "mode_id": "clean",
+          "language": "en",
+          "project_id": null,
+          "secure_field": false
+        }
+      ],
+      "deleted_captures": [
+        "cap_deleted"
+      ],
+      "request": {
+        "mode_id": "clean",
+        "language": "en",
+        "project_id": null,
+        "max_examples": 3,
+        "max_characters": 500,
+        "personalization_enabled": true
+      },
+      "expected_result": {
+        "examples_used": [
+          "rec_53"
+        ],
+        "character_count": 56,
+        "formatted_context": "[Style References]\nInput: valid item\nOutput: Valid item."
+      }
+    },
+    {
+      "id": "toggle_disabled",
+      "description": "Returns empty result when personalization is disabled",
+      "history": [
+        {
+          "id": "rec_61",
+          "capture_id": "cap_61",
+          "request_id": "req_61",
+          "raw_text": "hello",
+          "final_text": "Hello!",
+          "decision": "accepted",
+          "decision_utc": "2026-10-07T10:00:00Z",
+          "mode_id": "clean",
+          "language": "en",
+          "project_id": null,
+          "secure_field": false
+        }
+      ],
+      "deleted_captures": [],
+      "request": {
+        "mode_id": "clean",
+        "language": "en",
+        "project_id": null,
+        "max_examples": 3,
+        "max_characters": 500,
+        "personalization_enabled": false
+      },
+      "expected_result": {
+        "examples_used": [],
+        "character_count": 0,
+        "formatted_context": ""
+      }
+    }
+  ]
+}

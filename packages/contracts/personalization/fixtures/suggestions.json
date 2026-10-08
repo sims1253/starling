@@ -1,0 +1,267 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Fixture table for vocabulary and replacement suggestion engine (#305)",
+  "cases": [
+    {
+      "id": "repeated_asr_fix_vocabulary",
+      "description": "Repeated correction of an ASR error produces a vocabulary suggestion",
+      "records": [
+        {
+          "id": "rec_01",
+          "capture_id": "cap_01",
+          "request_id": "req_01",
+          "raw_text": "I used sterling for dictation.",
+          "final_text": "I used Starling for dictation.",
+          "decision": "accepted",
+          "decision_utc": "2026-10-01T10:00:00Z",
+          "mode_id": "clean",
+          "language": "en",
+          "project_id": null,
+          "secure_field": false
+        },
+        {
+          "id": "rec_02",
+          "capture_id": "cap_02",
+          "request_id": "req_02",
+          "raw_text": "Launch sterling on startup.",
+          "final_text": "Launch Starling on startup.",
+          "decision": "accepted",
+          "decision_utc": "2026-10-01T11:00:00Z",
+          "mode_id": "clean",
+          "language": "en",
+          "project_id": null,
+          "secure_field": false
+        },
+        {
+          "id": "rec_03",
+          "capture_id": "cap_03",
+          "request_id": "req_03",
+          "raw_text": "Is sterling running now?",
+          "final_text": "Is Starling running now?",
+          "decision": "accepted",
+          "decision_utc": "2026-10-01T12:00:00Z",
+          "mode_id": "clean",
+          "language": "en",
+          "project_id": null,
+          "secure_field": false
+        }
+      ],
+      "existing_vocabulary": [],
+      "existing_snippets": [],
+      "min_frequency": 2,
+      "min_consistency": 0.8,
+      "expected_suggestions": [
+        {
+          "target_type": "vocabulary",
+          "source_phrase": "sterling",
+          "target_phrase": "Starling",
+          "frequency": 3,
+          "consistency": 1.0,
+          "status": "suggested",
+          "conflict": null
+        }
+      ]
+    },
+    {
+      "id": "low_frequency_discarded",
+      "description": "Single occurrence does not reach frequency threshold of 2",
+      "records": [
+        {
+          "id": "rec_10",
+          "capture_id": "cap_10",
+          "request_id": "req_10",
+          "raw_text": "Check the quatization score.",
+          "final_text": "Check the quantization score.",
+          "decision": "accepted",
+          "decision_utc": "2026-10-02T10:00:00Z",
+          "mode_id": "clean",
+          "language": "en",
+          "project_id": null,
+          "secure_field": false
+        }
+      ],
+      "existing_vocabulary": [],
+      "existing_snippets": [],
+      "min_frequency": 2,
+      "min_consistency": 0.8,
+      "expected_suggestions": []
+    },
+    {
+      "id": "inconsistent_edits_rejected",
+      "description": "Edits that are inconsistent do not reach consistency threshold",
+      "records": [
+        {
+          "id": "rec_21",
+          "capture_id": "cap_21",
+          "request_id": "req_21",
+          "raw_text": "Send it their way.",
+          "final_text": "Send it there way.",
+          "decision": "accepted",
+          "decision_utc": "2026-10-03T10:00:00Z",
+          "mode_id": "clean",
+          "language": "en",
+          "project_id": null,
+          "secure_field": false
+        },
+        {
+          "id": "rec_22",
+          "capture_id": "cap_22",
+          "request_id": "req_22",
+          "raw_text": "Go over their.",
+          "final_text": "Go over there.",
+          "decision": "accepted",
+          "decision_utc": "2026-10-03T11:00:00Z",
+          "mode_id": "clean",
+          "language": "en",
+          "project_id": null,
+          "secure_field": false
+        },
+        {
+          "id": "rec_23",
+          "capture_id": "cap_23",
+          "request_id": "req_23",
+          "raw_text": "Look at their dog.",
+          "final_text": "Look at their dog.",
+          "decision": "accepted",
+          "decision_utc": "2026-10-03T12:00:00Z",
+          "mode_id": "clean",
+          "language": "en",
+          "project_id": null,
+          "secure_field": false
+        },
+        {
+          "id": "rec_24",
+          "capture_id": "cap_24",
+          "request_id": "req_24",
+          "raw_text": "Are they their yet?",
+          "final_text": "Are they there yet.",
+          "decision": "accepted",
+          "decision_utc": "2026-10-03T13:00:00Z",
+          "mode_id": "clean",
+          "language": "en",
+          "project_id": null,
+          "secure_field": false
+        },
+        {
+          "id": "rec_25",
+          "capture_id": "cap_25",
+          "request_id": "req_25",
+          "raw_text": "Take their coats.",
+          "final_text": "Take their coats.",
+          "decision": "accepted",
+          "decision_utc": "2026-10-03T14:00:00Z",
+          "mode_id": "clean",
+          "language": "en",
+          "project_id": null,
+          "secure_field": false
+        }
+      ],
+      "existing_vocabulary": [],
+      "existing_snippets": [],
+      "min_frequency": 2,
+      "min_consistency": 0.8,
+      "expected_suggestions": []
+    },
+    {
+      "id": "conflict_already_in_vocabulary",
+      "description": "Suggestion target is already in the vocabulary",
+      "records": [
+        {
+          "id": "rec_31",
+          "capture_id": "cap_31",
+          "request_id": "req_31",
+          "raw_text": "Hello world wide web.",
+          "final_text": "Hello WWW.",
+          "decision": "accepted",
+          "decision_utc": "2026-10-04T10:00:00Z",
+          "mode_id": "clean",
+          "language": "en",
+          "project_id": null,
+          "secure_field": false
+        },
+        {
+          "id": "rec_32",
+          "capture_id": "cap_32",
+          "request_id": "req_32",
+          "raw_text": "Open the world wide web link.",
+          "final_text": "Open the WWW link.",
+          "decision": "accepted",
+          "decision_utc": "2026-10-04T11:00:00Z",
+          "mode_id": "clean",
+          "language": "en",
+          "project_id": null,
+          "secure_field": false
+        }
+      ],
+      "existing_vocabulary": [
+        "WWW"
+      ],
+      "existing_snippets": [],
+      "min_frequency": 2,
+      "min_consistency": 0.8,
+      "expected_suggestions": [
+        {
+          "target_type": "replacement",
+          "source_phrase": "world wide web",
+          "target_phrase": "WWW",
+          "frequency": 2,
+          "consistency": 1.0,
+          "status": "suggested",
+          "conflict": "already_in_vocabulary"
+        }
+      ]
+    },
+    {
+      "id": "conflict_snippet_collision",
+      "description": "Candidate replacement conflicts with an existing snippet expansion",
+      "records": [
+        {
+          "id": "rec_41",
+          "capture_id": "cap_41",
+          "request_id": "req_41",
+          "raw_text": "I will be afk shortly.",
+          "final_text": "I will be away from keyboard shortly.",
+          "decision": "accepted",
+          "decision_utc": "2026-10-05T10:00:00Z",
+          "mode_id": "clean",
+          "language": "en",
+          "project_id": null,
+          "secure_field": false
+        },
+        {
+          "id": "rec_42",
+          "capture_id": "cap_42",
+          "request_id": "req_42",
+          "raw_text": "Going afk now.",
+          "final_text": "Going away from keyboard now.",
+          "decision": "accepted",
+          "decision_utc": "2026-10-05T11:00:00Z",
+          "mode_id": "clean",
+          "language": "en",
+          "project_id": null,
+          "secure_field": false
+        }
+      ],
+      "existing_vocabulary": [],
+      "existing_snippets": [
+        {
+          "spoken": "afk",
+          "expansion": "away for a bit"
+        }
+      ],
+      "min_frequency": 2,
+      "min_consistency": 0.8,
+      "expected_suggestions": [
+        {
+          "target_type": "replacement",
+          "source_phrase": "afk",
+          "target_phrase": "away from keyboard",
+          "frequency": 2,
+          "consistency": 1.0,
+          "status": "suggested",
+          "conflict": "snippet_collision"
+        }
+      ]
+    }
+  ]
+}

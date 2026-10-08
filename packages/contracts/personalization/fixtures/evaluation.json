@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Held-out evaluation dataset measuring correction burden reduction (#305)",
+  "sessions": [
+    {
+      "session_id": "eval_session_vocabulary",
+      "mode_id": "clean",
+      "language": "en",
+      "takes": [
+        {
+          "take_id": "t1",
+          "raw": "Welcome to sterling dictation system.",
+          "unpersonalized_output": "Welcome to sterling dictation system.",
+          "ground_truth_target": "Welcome to Starling dictation system.",
+          "protected_spans": []
+        },
+        {
+          "take_id": "t2",
+          "raw": "Deploy the pod to k8s cluster.",
+          "unpersonalized_output": "Deploy the pod to k8s cluster.",
+          "ground_truth_target": "Deploy the pod to Kubernetes cluster.",
+          "protected_spans": []
+        },
+        {
+          "take_id": "t3",
+          "raw": "Call getUserProfile with camelCase.",
+          "unpersonalized_output": "Call getUserProfile with camelCase.",
+          "ground_truth_target": "Call getUserProfile with camelCase.",
+          "protected_spans": [
+            "getUserProfile",
+            "camelCase"
+          ]
+        }
+      ],
+      "active_suggestions": [
+        {
+          "target_type": "vocabulary",
+          "source_phrase": "sterling",
+          "target_phrase": "Starling"
+        },
+        {
+          "target_type": "replacement",
+          "source_phrase": "k8s",
+          "target_phrase": "Kubernetes"
+        }
+      ]
+    },
+    {
+      "session_id": "eval_session_style_retrieval",
+      "mode_id": "email",
+      "language": "en",
+      "takes": [
+        {
+          "take_id": "t4",
+          "raw": "see you tomorrow thanks max",
+          "unpersonalized_output": "See you tomorrow thanks max.",
+          "ground_truth_target": "See you tomorrow,\nThanks,\nMax",
+          "protected_spans": []
+        }
+      ],
+      "retrieved_style_examples": [
+        {
+          "raw": "talk next week best max",
+          "final": "Talk next week,\nBest,\nMax"
+        }
+      ]
+    }
+  ]
+}
