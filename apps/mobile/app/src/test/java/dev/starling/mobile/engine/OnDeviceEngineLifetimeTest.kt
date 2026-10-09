@@ -91,6 +91,21 @@ class OnDeviceEngineLifetimeTest {
     }
 
     @Test
+    fun aLoadRunsAwake() {
+        var held = 0
+        var heldDuringLoad = -1
+        val engine = OnDeviceEngine(
+            modelDir(),
+            memoryGate = { heldDuringLoad = held; "refused" },
+            nativeSupport = { null },
+            keepAwake = { held++; AutoCloseable { held-- } },
+        )
+        engine.prepare { false }
+        assertEquals(1, heldDuringLoad)
+        assertEquals(0, held)
+    }
+
+    @Test
     fun theIdleReleaseHasNothingToFreeWithoutAResidentModel() {
         val engine = OnDeviceEngine(modelDir(), memoryGate = { "refused" }, nativeSupport = { null })
         engine.prepare { false }
