@@ -23,22 +23,39 @@ const WHITESPACE: [char; 6] = [' ', '\t', '\n', '\r', '\u{b}', '\u{c}'];
 /// Punctuation a recognizer attaches to a command word.
 const ATTACHED: [char; 6] = [',', '.', ';', ':', '!', '?'];
 
-/// The whitespace predicate of the six-character set (shared with the
-/// trailing instruction grammar so both grammars tokenize alike).
 pub(crate) fn is_ws(c: char) -> bool {
     WHITESPACE.contains(&c)
 }
 
-/// A token's core: the punctuation a recognizer attaches stripped from
-/// both ends, lowercased (shared with the trailing instruction grammar).
+/// Byte spans of the whitespace-separated tokens (the whitespace set is
+/// ASCII, so byte boundaries are always char boundaries).
+pub(crate) fn token_spans(text: &str) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut start = None;
+    for (index, c) in text.char_indices() {
+        match (is_ws(c), start) {
+            (true, Some(begin)) => {
+                spans.push((begin, index));
+                start = None;
+            }
+            (false, None) => start = Some(index),
+            _ => {}
+        }
+    }
+    if let Some(begin) = start {
+        spans.push((begin, text.len()));
+    }
+    spans
+}
+
+/// A token's core: attached recognizer punctuation stripped, lowercased.
 pub(crate) fn token_core(token: &str) -> String {
     token
         .trim_matches(|c: char| ATTACHED.contains(&c))
         .to_lowercase()
 }
 
-/// The literal escape word of a language's spoken-commands table (the
-/// English "literal" when the language has no table).
+/// The language's literal escape word ("literal" without a table).
 pub(crate) fn literal_word(language: Option<&str>) -> &'static str {
     language_table(language).map_or("literal", |lang| lang.literal.as_str())
 }
@@ -119,7 +136,7 @@ pub fn apply(
         return text.to_owned();
     }
     let lang = language_table(language);
-    let literal = lang.map_or("literal", |lang| lang.literal.as_str());
+    let literal = literal_word(language);
     let mut phrases: Vec<Phrase> = Vec::new();
     if spoken_commands {
         if let Some(lang) = lang {
@@ -163,30 +180,10 @@ pub fn apply(
             .then(a.snippet.cmp(&b.snippet))
     });
 
-    // Byte spans of the tokens (the whitespace set is ASCII, so byte
-    // boundaries are always char boundaries).
-    let mut spans: Vec<(usize, usize)> = Vec::new();
-    let mut start = None;
-    for (index, c) in text.char_indices() {
-        match (is_ws(c), start) {
-            (true, Some(begin)) => {
-                spans.push((begin, index));
-                start = None;
-            }
-            (false, None) => start = Some(index),
-            _ => {}
-        }
-    }
-    if let Some(begin) = start {
-        spans.push((begin, text.len()));
-    }
+    let spans = token_spans(text);
     let cores: Vec<String> = spans
         .iter()
-        .map(|&(s, e)| {
-            text[s..e]
-                .trim_matches(|c| ATTACHED.contains(&c))
-                .to_lowercase()
-        })
+        .map(|&(s, e)| token_core(&text[s..e]))
         .collect();
 
     let match_at = |i: usize| -> Option<(usize, &Replacement)> {

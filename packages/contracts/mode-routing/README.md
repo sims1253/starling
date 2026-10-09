@@ -12,7 +12,7 @@ this directory in place.
 | `draft.schema.json` | A staged take: typed regions over one text, immutable raw attempts, proposals pinned to a revision, deliveries. | `tests/staging.py` |
 | `provider.schema.json` | What a processing provider can do and where text goes. | `validate_provider`, `processing_route` |
 | `transform-request.schema.json`, `transform-result.schema.json` | One model step and its answer. | `check_request`, `check_result` |
-| `spoken-instruction.schema.json` | One trailing spoken-instruction record per finalized take (#298): the delimiter/payload split with code-point spans. | `tests/spoken_instructions.py` (`split`, `record`) |
+| `spoken-instruction.schema.json` | One trailing spoken-instruction record per finalized take: the delimiter/payload split with code-point spans. | `tests/spoken_instructions.py` (`split`, `record`) |
 
 Fixtures: `fixtures/staging.json` (the #293 scenarios: revised partials,
 typing during a partial replacement, stale proposal, concurrent retry, delete

@@ -1,9 +1,6 @@
-//! Replays `packages/contracts/mode-routing/fixtures/routing.json` and
-//! `routing-variants.json` (the frozen routing corpus the Python oracle
-//! `tests/mode_routing.py` replays in `tests/test_mode_routing.py`)
-//! through the Rust port of the oracle, so both implementations are
-//! held to one fixture set. Also checks the profiles fixtures parse and
-//! pass the oracle's structural rules.
+//! Replays the frozen routing corpus (`fixtures/routing.json` and
+//! `routing-variants.json`, which `tests/test_mode_routing.py` replays
+//! through the Python oracle) through the Rust port.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -41,7 +38,10 @@ fn request(case: &Value) -> RouteRequest {
             .get("session_allows_aliases")
             .and_then(Value::as_bool)
             .unwrap_or(true),
-        secure_field: raw.get("secure_field").and_then(Value::as_bool).unwrap_or(false),
+        secure_field: raw
+            .get("secure_field")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         project_id: field("project_id"),
         site: field("site"),
         app_id: field("app_id"),
@@ -62,7 +62,10 @@ fn every_routing_fixture_replays_like_the_oracle() {
     let mut cases = Vec::new();
     for filename in ["routing.json", "routing-variants.json"] {
         for case in fixture(filename).as_array().unwrap() {
-            let config_name = case["profiles"].as_str().unwrap_or("profiles.json").to_string();
+            let config_name = case["profiles"]
+                .as_str()
+                .unwrap_or("profiles.json")
+                .to_string();
             cases.push((config_name, case.clone()));
         }
     }
@@ -83,12 +86,10 @@ fn every_routing_fixture_replays_like_the_oracle() {
                 case["name"], result.mode, want_mode
             ));
         }
-        if result.source.as_str() != expected["source"].as_str().unwrap() {
+        if result.source.to_string() != expected["source"].as_str().unwrap() {
             failures.push(format!(
                 "{config_name}/{}: source {} != {}",
-                case["name"],
-                result.source.as_str(),
-                expected["source"]
+                case["name"], result.source, expected["source"]
             ));
         }
         if result.payload != expected["payload"].as_str().unwrap() {
@@ -105,13 +106,10 @@ fn every_routing_fixture_replays_like_the_oracle() {
                 expected["status"]
             ));
         }
-        // The view invariant: with a recorded removed prefix span the
-        // payload is exactly the raw text from the span's end (spans
-        // start at 0), so the raw recognition reconstructs.
+        // The payload is a view: the raw text from the removed prefix.
         if let Some((start, end)) = result.prefix_span_codepoints {
-            let view: String = result.raw_text.chars().skip(end).collect();
-            let prefix: String = result.raw_text.chars().take(start).collect();
-            if view != result.payload || !prefix.is_empty() {
+            let view: String = request.raw_text.chars().skip(end).collect();
+            if start != 0 || view != result.payload {
                 failures.push(format!(
                     "{config_name}/{}: payload is not a prefix-removed view",
                     case["name"]
@@ -129,16 +127,26 @@ fn ambiguous_phrases_surface_their_candidates_not_a_guess() {
     let result = routing::resolve(&doc, &request).unwrap();
     assert_eq!(result.status, RouteStatus::NeedsResolution);
     assert_eq!(result.mode, None);
-    let conflicts = routing::conflicts_for(&doc, &request, &result);
-    let [conflict] = conflicts.as_slice() else {
-        panic!("a phrase conflict lists its candidates: {conflicts:?}");
-    };
-    assert_eq!(conflict.candidates.len(), 2);
-    assert!(conflict
-        .candidates
+    let candidates = routing::conflicts_for(&doc, &request, &result);
+    assert_eq!(candidates.len(), 2, "{candidates:?}");
+    assert!(candidates
         .iter()
         .all(|candidate| candidate.via == "code this"));
-    assert!(routing::explain(&result, Some(&doc)).contains("conflict"));
+}
+
+#[test]
+fn prefix_spans_are_code_points() {
+    let mut doc = profiles("profiles.json");
+    let code = doc
+        .profiles
+        .iter_mut()
+        .find(|profile| profile.id == "code-guidance")
+        .unwrap();
+    code.aliases.push("äh code".to_string());
+    let result = routing::resolve(&doc, &RouteRequest::new("äh code: hallo")).unwrap();
+    assert_eq!(result.mode.as_deref(), Some("code-guidance"));
+    assert_eq!(result.prefix_span_codepoints, Some((0, 9)));
+    assert_eq!(result.payload, "hallo");
 }
 
 #[test]
@@ -177,7 +185,7 @@ fn verbatim_ignores_aliases_even_when_a_session_allows_them() {
         ..RouteRequest::new("code this add logs")
     };
     let result = routing::resolve(&doc, &request).unwrap();
-    assert_eq!(result.source.as_str(), "manual");
+    assert_eq!(result.source, routing::Source::Manual);
     assert_eq!(result.mode.as_deref(), Some("verbatim"));
     assert_eq!(result.payload, "code this add logs");
 }

@@ -6,9 +6,8 @@
 //! `processing_route`, so there is no second place that picks providers
 //! and no fallback: a blocked plan runs nothing and the raw text stands.
 //! [`build_request`] reads a [`Draft`] (never its live partials) and
-//! pins the request to the draft's revision; a draft carrying a
-//! trailing instruction the plan cannot take refuses instead of
-//! dropping it (#298); [`run`] executes it. A result is only ever a
+//! pins the request to the draft's revision, refusing an instruction
+//! the plan cannot take; [`run`] executes it. A result is only ever a
 //! proposal for the draft to judge.
 
 use std::sync::Arc;
@@ -141,30 +140,20 @@ pub struct RequestOptions {
     pub max_output_chars: u64,
 }
 
-/// The typed detail when a take carries a trailing instruction but the
-/// plan cannot take one (#298): the instruction is never fed to the
-/// model as text, the job reports why instead.
+/// Failure details of a refused trailing instruction (see [`build_request`]).
 pub const INSTRUCTION_CAPABLE_DETAIL: &str = "an instruction requires an instruction-capable model";
-/// The typed detail when a trailing instruction has no payload to work
-/// on (a take that was only the instruction).
 pub const INSTRUCTION_EMPTY_DETAIL: &str = "an instruction has no text to work on";
-/// The typed detail when a command region carries only the delimiter:
-/// the instruction edited away after marking must not silently become
-/// `instruction: None`.
 pub const INSTRUCTION_BLANK_DETAIL: &str = "an instruction must say something";
 
 /// Builds the request for the draft's current revision. The input is the
 /// draft's payload (command regions excluded) after the deterministic
 /// step; the trailing instruction, if any, travels separately.
 ///
-/// Fails ([`Err`]) when the draft carries an instruction this plan
-/// cannot take: a mode without an instruction-capable kind, a provider
-/// that declares no instruction capability (S1-mini cleanup, the
-/// builtin step), a blank instruction (its region carried only the
-/// delimiter), or an instruction with no payload. The instruction is
-/// never silently dropped and never fed to the model as input text;
-/// [`Err`] carries the refused request — without the instruction — so
-/// the caller records the refusal like any failure and sends nothing.
+/// Refuses a draft carrying an instruction the plan cannot take (a mode
+/// without an instruction-capable kind, a provider without instruction
+/// capability), a blank instruction, or an instruction with no payload:
+/// an instruction is never silently dropped. [`Err`] carries the refused
+/// request, without the instruction, for the caller to record.
 pub fn build_request(
     draft: &Draft,
     mode: &ModeEntry,
@@ -179,39 +168,27 @@ pub fn build_request(
         mode.spoken_commands,
         &mode.snippets,
     );
-    let instruction_region = draft.instruction();
-    // The instruction travels without its delimiter token; a region
-    // that is only the delimiter is a blank instruction, refused below
-    // instead of silently dropped.
-    let instruction = instruction_region
-        .as_ref()
-        .map(|text| crate::instructions::strip_delimiter(text));
-    let refusal = match &instruction {
-        Some(_)
-            if !provider.instructions
-                || !mode
-                    .transform_kinds
-                    .iter()
-                    .any(|kind| kind.needs_instructions()) =>
-        {
-            Some(Failure::new(
-                FailureReason::UnsupportedKind,
-                false,
-                INSTRUCTION_CAPABLE_DETAIL,
-            ))
-        }
-        Some(text) if text.is_empty() => Some(Failure::new(
-            FailureReason::InvalidInput,
-            false,
-            INSTRUCTION_BLANK_DETAIL,
-        )),
-        Some(_) if input.trim().is_empty() => Some(Failure::new(
-            FailureReason::InvalidInput,
-            false,
-            INSTRUCTION_EMPTY_DETAIL,
-        )),
-        _ => None,
-    };
+    // The model sees the instruction without its delimiter token.
+    let instruction = draft
+        .instruction()
+        .map(|region| crate::instructions::strip_delimiter(&region));
+    let refusal = instruction.as_deref().and_then(|text| {
+        let capable = provider.instructions
+            && mode
+                .transform_kinds
+                .iter()
+                .any(|kind| kind.needs_instructions());
+        let (reason, detail) = if !capable {
+            (FailureReason::UnsupportedKind, INSTRUCTION_CAPABLE_DETAIL)
+        } else if text.is_empty() {
+            (FailureReason::InvalidInput, INSTRUCTION_BLANK_DETAIL)
+        } else if input.trim().is_empty() {
+            (FailureReason::InvalidInput, INSTRUCTION_EMPTY_DETAIL)
+        } else {
+            return None;
+        };
+        Some(Failure::new(reason, false, detail))
+    });
     let model_step = provider.kind != ProviderKind::Builtin;
     let mut context = RequestContext::default();
     if model_step {
@@ -226,10 +203,6 @@ pub fn build_request(
                 .filter(|value| !value.is_empty());
         }
     }
-    let instruction = match refusal {
-        Some(_) => None,
-        None => instruction,
-    };
     let request = TransformRequest {
         schema_version: 1,
         request_id: options.request_id.clone(),
@@ -251,7 +224,7 @@ pub fn build_request(
         },
         language: mode.language.clone(),
         input,
-        instruction,
+        instruction: instruction.filter(|_| refusal.is_none()),
         style: mode.style,
         context,
         provider: provider.reference(),

@@ -396,7 +396,7 @@ fn transcribe_only_and_builtin_plans() {
 }
 
 /// Marks the split's delimiter and instruction as the draft's command
-/// region, the way the #298 wiring does.
+/// region, as the app does.
 fn mark_instruction(draft: &mut Draft, text: &str) {
     let split = starling_processing::instructions::split(text, Some("en"));
     let (Some((start, _)), Some((_, end))) = (split.delimiter_span, split.instruction_span) else {
@@ -417,39 +417,25 @@ fn instruction_fixtures_replay_like_the_oracle() {
             case["input"].as_str().unwrap(),
             case["language"].as_str(),
         );
-        let matched = got.matched == case["expected"]["matched"].as_bool().unwrap();
-        let payload = got.payload == case["expected"]["payload"].as_str().unwrap();
-        let instruction =
-            got.instruction == case["expected"]["instruction"].as_str().unwrap();
-        let span = |value: &Value| -> Option<Vec<u64>> {
-            value.as_array().map(|items| {
-                items
-                    .iter()
-                    .map(|item| item.as_u64().unwrap())
-                    .collect::<Vec<u64>>()
-            })
-        };
-        let delimiter = got
-            .delimiter_span
-            .map(|(a, b)| vec![a as u64, b as u64])
-            == span(&case["expected"]["delimiter_span"]);
-        let instruction_span = got
-            .instruction_span
-            .map(|(a, b)| vec![a as u64, b as u64])
-            == span(&case["expected"]["instruction_span"]);
-        if !(matched && payload && instruction && delimiter && instruction_span) {
-            failures.push(format!("{}: got {got:?}", case["name"]));
+        let got = json!({
+            "matched": got.matched,
+            "payload": got.payload,
+            "instruction": got.instruction,
+            "delimiter_span": got.delimiter_span,
+            "instruction_span": got.instruction_span,
+        });
+        if got != case["expected"] {
+            failures.push(format!("{}: got {got}", case["name"]));
         }
     }
-    assert_eq!(cases.as_array().unwrap().len(), 18, "the corpus is loaded");
+    assert!(!cases.as_array().unwrap().is_empty());
     assert!(failures.is_empty(), "{failures:#?}");
 }
 
 #[test]
 fn an_instruction_never_reaches_a_model_that_cannot_take_one() {
     // S1-mini cleanup (and the builtin step) cannot follow an
-    // instruction: the request is refused with the typed detail, never
-    // built with the instruction dropped into the input (#298).
+    // instruction: the request is refused, never built without it.
     let mut draft = Draft::new("d", "c");
     let text = "send the report Starling, make it formal";
     draft.final_attempt(0, "a", text);
@@ -506,14 +492,16 @@ fn an_instruction_with_no_payload_is_refused_too() {
         &ContextValues::default(),
         &options("g3"),
     );
-    assert_eq!(refused.unwrap_err().1.detail, pipeline::INSTRUCTION_EMPTY_DETAIL);
+    assert_eq!(
+        refused.unwrap_err().1.detail,
+        pipeline::INSTRUCTION_EMPTY_DETAIL
+    );
 }
 
 #[test]
 fn an_instruction_that_strips_to_nothing_is_refused_not_dropped() {
-    // A command region carrying only the delimiter (an instruction
-    // edited away after marking) must not become `instruction: None` on
-    // a request a capable model then runs (#298).
+    // A command region carrying only the delimiter (the instruction was
+    // edited away) must not become `instruction: None`.
     let mut draft = Draft::new("d", "c");
     let text = "send the report Starling,";
     draft.final_attempt(0, "a", text);

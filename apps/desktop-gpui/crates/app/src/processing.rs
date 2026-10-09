@@ -7,9 +7,8 @@
 //! second, loopback starling-serve (one model is resident per server, so
 //! it cannot share the transcription server) and an OpenAI-compatible API.
 //! `pipeline::plan` picks at most one of them; a blocked plan runs nothing.
-//! A finalized take is routed first (#298): the frozen oracle reads its
-//! text, and a leading spoken phrase (or the literal escape) overrides the
-//! mode for that one take — never the app's active mode.
+//! A finalized take is routed first: a leading spoken phrase (or the
+//! literal escape) overrides the active mode for that one take.
 //!
 //! Every result is a proposal. The take's staged draft (`staging::Draft`,
 //! resumed from the take's processing document in storage v2) decides
@@ -88,31 +87,24 @@ pub(crate) fn unknown_mode_note(id: &str) -> Option<String> {
     })
 }
 
-/// Where a finalized take's leading text routes it (#298): through the
-/// frozen oracle, whose precedence (a locked manual choice, the literal
-/// escape, longest unambiguous leading alias, conflicts surfaced not
-/// guessed) is entirely [`routing::resolve`]'s.
+/// Where a finalized take's leading text routes it, per [`routing::resolve`].
 #[derive(Debug)]
 enum TakeRoute<'a> {
-    /// No leading phrase: the active mode processes the take as it
-    /// stands.
+    /// No leading phrase: the active mode processes the take.
     Active,
-    /// A leading phrase (or the literal escape) selected another mode
-    /// for this one take; `span` is the consumed prefix, in code
-    /// points, to keep out of the payload.
+    /// A leading phrase (or the literal escape) selected a mode for this
+    /// take; `span` is the consumed prefix in code points.
     Override {
         mode: &'a ModeEntry,
         span: (usize, usize),
     },
-    /// Equal-rank phrases matched: nothing runs, the conflict is named.
+    /// Equal-rank phrases matched: nothing runs, the message names them.
     Conflict(String),
 }
 
-/// Routes a finalized take. The app's active mode is a manual choice
-/// that allows spoken overrides (when the mode says so), so
-/// `manual_locked` is false: a verbatim session (and any mode with
-/// `allow_spoken_overrides` off) never has its text parsed for phrases,
-/// exactly the oracle's rule.
+/// Routes a finalized take. The active mode is an unlocked manual
+/// choice, so only a mode with `allow_spoken_overrides` has its text
+/// parsed for phrases.
 fn route_take<'a>(doc: &'a ProfilesDocument, text: &str, active: &'a ModeEntry) -> TakeRoute<'a> {
     let request = RouteRequest {
         raw_text: text.to_string(),
@@ -129,7 +121,7 @@ fn route_take<'a>(doc: &'a ProfilesDocument, text: &str, active: &'a ModeEntry) 
                 .mode
                 .as_deref()
                 .and_then(|id| doc.profile(id))
-                .unwrap_or(active),
+                .expect("resolve routes to a mode of the document"),
             span: resolved
                 .prefix_span_codepoints
                 .expect("a phrase match carries its prefix span"),
@@ -137,7 +129,6 @@ fn route_take<'a>(doc: &'a ProfilesDocument, text: &str, active: &'a ModeEntry) 
         Source::PhraseConflict => {
             let names = routing::conflicts_for(doc, &request, &resolved)
                 .iter()
-                .flat_map(|conflict| &conflict.candidates)
                 .map(|candidate| format!("\"{}\" ({})", candidate.via, candidate.mode_id))
                 .collect::<Vec<_>>()
                 .join(", ");
@@ -505,57 +496,54 @@ pub(crate) fn failure_message(
     let Some(failure) = &result.failure else {
         return String::new();
     };
-    // A spoken-instruction refusal (#298) gets its own sentences: nothing
-    // was sent anywhere, whatever the failure reason says.
-    let what = match failure.detail.as_str() {
-        pipeline::INSTRUCTION_CAPABLE_DETAIL => format!(
-            "{label} cannot follow spoken instructions: an instruction \
-             requires an instruction-capable model."
-        ),
-        pipeline::INSTRUCTION_EMPTY_DETAIL => {
+    let what = match failure.reason {
+        FailureReason::UnsupportedKind
+            if failure.detail == pipeline::INSTRUCTION_CAPABLE_DETAIL =>
+        {
+            format!(
+                "{label} cannot follow spoken instructions: an instruction \
+                 requires an instruction-capable model."
+            )
+        }
+        FailureReason::InvalidInput if failure.detail == pipeline::INSTRUCTION_EMPTY_DETAIL => {
             "A spoken instruction needs text to work on.".to_string()
         }
-        pipeline::INSTRUCTION_BLANK_DETAIL => {
+        FailureReason::InvalidInput if failure.detail == pipeline::INSTRUCTION_BLANK_DETAIL => {
             "The spoken instruction was empty.".to_string()
         }
-        _ => match failure.reason {
-            FailureReason::ProviderUnavailable if result.provider.kind == ProviderKind::S1 => format!(
-                "S1-mini is not reachable at {}. Start a starling-serve with the S1-mini GGUF there. ({})",
-                settings.s1_endpoint.trim(),
-                failure.detail
-            ),
-            FailureReason::UnsupportedLanguage if result.provider.kind == ProviderKind::S1 => {
-                "S1-mini only processes English.".to_string()
-            }
-            FailureReason::UnsupportedLanguage => {
-                format!("{label} does not process this language.")
-            }
-            FailureReason::RateLimited => format!(
-                "{label} is rate-limiting requests; try again later. ({})",
-                failure.detail
-            ),
-            FailureReason::Timeout => {
-                format!("{label} did not answer within {} s.", DEADLINE_MS / 1000)
-            }
-            FailureReason::UnknownModel => {
-                format!("{label} does not know this model. ({})", failure.detail)
-            }
-            FailureReason::TruncatedOutput => {
-                format!("{label} returned a cut-off answer. ({})", failure.detail)
-            }
-            FailureReason::EmptyOutput => format!("{label} returned no text."),
-            FailureReason::RemoteForbidden => {
-                "This mode is local-only; nothing was sent.".to_string()
-            }
-            _ => format!("{}: {}", failure.reason.as_str(), failure.detail),
-        },
+        FailureReason::ProviderUnavailable if result.provider.kind == ProviderKind::S1 => format!(
+            "S1-mini is not reachable at {}. Start a starling-serve with the S1-mini GGUF there. ({})",
+            settings.s1_endpoint.trim(),
+            failure.detail
+        ),
+        FailureReason::UnsupportedLanguage if result.provider.kind == ProviderKind::S1 => {
+            "S1-mini only processes English.".to_string()
+        }
+        FailureReason::UnsupportedLanguage => {
+            format!("{label} does not process this language.")
+        }
+        FailureReason::RateLimited => format!(
+            "{label} is rate-limiting requests; try again later. ({})",
+            failure.detail
+        ),
+        FailureReason::Timeout => {
+            format!("{label} did not answer within {} s.", DEADLINE_MS / 1000)
+        }
+        FailureReason::UnknownModel => {
+            format!("{label} does not know this model. ({})", failure.detail)
+        }
+        FailureReason::TruncatedOutput => {
+            format!("{label} returned a cut-off answer. ({})", failure.detail)
+        }
+        FailureReason::EmptyOutput => format!("{label} returned no text."),
+        FailureReason::RemoteForbidden => "This mode is local-only; nothing was sent.".to_string(),
+        _ => format!("{}: {}", failure.reason.as_str(), failure.detail),
     };
     format!("{what} The raw transcript is unchanged.")
 }
 
-/// The user-facing sentence when a spoken phrase's command region could
-/// not be marked (#298): the phrase would travel to the model as text it
-/// cannot take, so the take is refused instead. Nothing was sent.
+/// A spoken phrase whose command region could not be marked would reach
+/// the model as text, so the take is refused instead.
 fn marking_refused(kind: &str) -> String {
     format!(
         "The spoken {kind} could not be kept out of the text; nothing was \
@@ -696,10 +684,28 @@ impl StarlingApp {
         .detach();
     }
 
-    /// Runs the take's routed mode on its latest transcript (#298): the
-    /// frozen oracle reads the finalized text first, and a leading
-    /// spoken phrase (or the literal escape) overrides the app's active
-    /// mode for THIS take only — the active mode is never changed. A job
+    /// Ends a job before anything runs: the draft is kept, the superseded
+    /// request (if any) is cancelled, and the take shows `state`.
+    fn end_job(
+        &mut self,
+        id: &str,
+        mut draft: Draft,
+        retry_of: Option<&str>,
+        label: String,
+        state: ProcessingState,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(earlier) = retry_of {
+            draft.cancel(earlier);
+        }
+        self.drafts.insert(id.to_string(), draft);
+        self.processing_jobs.remove(id);
+        self.set_processing(id, label, state);
+        cx.notify();
+    }
+
+    /// Runs the take's routed mode on its latest transcript: a leading
+    /// spoken phrase overrides the active mode for this take only. A job
     /// already running for the take is superseded and cancelled.
     pub(crate) fn process_take(&mut self, id: String, cx: &mut Context<Self>) {
         let Some(store) = self.store.clone() else {
@@ -710,9 +716,7 @@ impl StarlingApp {
         // Taken whatever the plan: a take that is not processed must not
         // keep its stop instant.
         let stopped_at: Option<Instant> = self.stop_instants.remove(&id);
-        // A job already running for the take is superseded: its result,
-        // if it still arrives, lands nowhere. The plan itself is only
-        // known once the take's text is loaded and routed below.
+        // The plan is only known once the take's text is loaded and routed.
         let retry_of = self
             .processing_jobs
             .remove(&id)
@@ -761,9 +765,8 @@ impl StarlingApp {
                 }
             };
 
-            // 2. Route the finalized take (#298), mark its spoken
-            //    phrases, and build the request pinned to the draft's
-            //    revision.
+            // 2. Route the take, mark its spoken phrases, and build the
+            //    request pinned to the draft's revision.
             let built = this
                 .update(cx, |app, cx| {
                     if !app.job_is(&id, &request_id) {
@@ -783,115 +786,71 @@ impl StarlingApp {
                         }
                         _ => draft_from_doc(&id, &doc),
                     };
-                    // A superseded job's request must not stay pending
-                    // when this run never records its own.
-                    let retire = |draft: &mut Draft| {
-                        if let Some(earlier) = retry_of.as_deref() {
-                            draft.cancel(earlier);
-                        }
-                    };
-                    // Both spoken grammars re-mark from the current text
-                    // each run: a command region an edit moved or removed
-                    // can never survive into this take's payload.
+                    // Re-mark from the current text each run, so a region an
+                    // edit moved or removed cannot survive.
                     draft.clear_commands();
+                    let retired = retry_of.as_deref();
                     let mut prefix = 0;
                     let mode = match route_take(modes(), &draft.text(), active) {
+                        TakeRoute::Active => active,
                         TakeRoute::Override { mode, span } => {
-                            // The leading phrase never reaches the payload:
-                            // its prefix span becomes the take's ModePhrase
-                            // command region, and the routed mode processes
-                            // this take.
                             if draft.mark_command(span.0, span.1, CommandKind::ModePhrase)
                                 != Outcome::Applied
                             {
-                                retire(&mut draft);
-                                app.drafts.insert(id.clone(), draft);
-                                app.processing_jobs.remove(&id);
-                                app.set_processing(
-                                    &id,
-                                    String::new(),
-                                    ProcessingState::Failed {
-                                        message: marking_refused("phrase"),
-                                    },
-                                );
-                                cx.notify();
+                                let message = marking_refused("phrase");
+                                let state = ProcessingState::Failed { message };
+                                app.end_job(&id, draft, retired, String::new(), state, cx);
                                 return None;
                             }
                             prefix = span.1;
                             mode
                         }
-                        // Equal-rank phrases matched: surfaced, not
-                        // guessed. Nothing runs and the raw text stands.
                         TakeRoute::Conflict(message) => {
-                            retire(&mut draft);
-                            app.drafts.insert(id.clone(), draft);
-                            app.processing_jobs.remove(&id);
-                            app.set_processing(
-                                &id,
-                                String::new(),
-                                ProcessingState::Failed { message },
-                            );
-                            cx.notify();
+                            let state = ProcessingState::Failed { message };
+                            app.end_job(&id, draft, retired, String::new(), state, cx);
                             return None;
                         }
-                        TakeRoute::Active => active,
                     };
                     let (decl, provider, fields): (
                         ProviderDecl,
                         Option<Arc<dyn Provider>>,
                         Vec<ContextField>,
                     ) = match pipeline::plan(mode, &app.providers.registry) {
-                            // The take routed to a mode that processes
-                            // nothing (the literal escape): nothing runs,
-                            // the raw transcript stands, and a job still
-                            // running for the take must not land a
-                            // proposal afterwards.
-                            Plan::Nothing => {
-                                retire(&mut draft);
-                                app.drafts.insert(id.clone(), draft);
-                                app.processing_jobs.remove(&id);
-                                app.set_processing(&id, String::new(), ProcessingState::Idle);
-                                cx.notify();
-                                return None;
-                            }
-                            // A job still running for the take (settings
-                            // changed under it) must not land over what
-                            // the user is told.
-                            Plan::Blocked(block) => {
-                                retire(&mut draft);
-                                app.drafts.insert(id.clone(), draft);
-                                app.processing_jobs.remove(&id);
-                                let message = blocked_text(block, mode, &app.providers.problems);
-                                app.set_processing(
-                                    &id,
-                                    String::new(),
-                                    ProcessingState::Blocked { message },
-                                );
-                                cx.notify();
-                                return None;
-                            }
-                            Plan::Builtin => (pipeline::builtin_declaration(), None, Vec::new()),
-                            Plan::Model {
-                                provider,
-                                context_fields,
-                            } => (
-                                provider.declaration().clone(),
-                                Some(provider),
-                                context_fields,
-                            ),
-                        };
+                        Plan::Nothing => {
+                            app.end_job(
+                                &id,
+                                draft,
+                                retired,
+                                String::new(),
+                                ProcessingState::Idle,
+                                cx,
+                            );
+                            return None;
+                        }
+                        Plan::Blocked(block) => {
+                            let message = blocked_text(block, mode, &app.providers.problems);
+                            let state = ProcessingState::Blocked { message };
+                            app.end_job(&id, draft, retired, String::new(), state, cx);
+                            return None;
+                        }
+                        Plan::Builtin => (pipeline::builtin_declaration(), None, Vec::new()),
+                        Plan::Model {
+                            provider,
+                            context_fields,
+                        } => (
+                            provider.declaration().clone(),
+                            Some(provider),
+                            context_fields,
+                        ),
+                    };
                     let label = provider_label(&decl, &settings);
-                    // A finalized take may end in a spoken instruction
-                    // (#298): the delimiter grammar splits the payload
-                    // (a leading phrase is already excluded), on the
-                    // finalized text only (live partials are never
-                    // parsed). The delimiter and everything after it
-                    // become the draft's command region, so the
-                    // instruction travels as the request's instruction
-                    // and never as input text.
-                    let payload = draft.payload_text();
-                    let split =
-                        starling_processing::instructions::split(&payload, mode.language.as_deref());
+                    app.set_processing(&id, label.clone(), ProcessingState::Running);
+                    // A trailing instruction becomes a command region, so it
+                    // travels as the request's instruction, never as input.
+                    let split = starling_processing::instructions::split(
+                        &draft.payload_text(),
+                        mode.language.as_deref(),
+                    );
                     if let (Some((start, _)), Some((_, end))) =
                         (split.delimiter_span, split.instruction_span)
                     {
@@ -901,20 +860,9 @@ impl StarlingApp {
                             CommandKind::TrailingInstruction,
                         ) != Outcome::Applied
                         {
-                            // The delimiter would stay in the payload and a
-                            // model that cannot take instructions would see
-                            // instruction text: refuse the take instead.
-                            retire(&mut draft);
-                            app.drafts.insert(id.clone(), draft);
-                            app.processing_jobs.remove(&id);
-                            app.set_processing(
-                                &id,
-                                label.clone(),
-                                ProcessingState::Failed {
-                                    message: marking_refused("instruction"),
-                                },
-                            );
-                            cx.notify();
+                            let message = marking_refused("instruction");
+                            let state = ProcessingState::Failed { message };
+                            app.end_job(&id, draft, retired, label, state, cx);
                             return None;
                         }
                     }
@@ -949,13 +897,10 @@ impl StarlingApp {
                         },
                     ) {
                         Ok(request) => (request, None),
-                        // The take ends in a spoken instruction this plan
-                        // cannot take (#298): nothing is sent anywhere and
-                        // the raw transcript stands — the refused request
-                        // records the refusal like any failure below.
                         Err((request, failure)) => (request, Some(failure)),
                     };
                     app.drafts.insert(id.clone(), draft);
+                    cx.notify();
                     Some((request, refusal, provider, label))
                 })
                 .ok()
@@ -964,9 +909,8 @@ impl StarlingApp {
                 return;
             };
 
-            // 3. The job itself, off the UI thread. A refusal never
-            //    runs: its result is the typed failure for the refused
-            //    request, and the raw transcript stands.
+            // 3. The job itself, off the UI thread. A refused request
+            //    never runs; its failure is recorded like any other.
             let result = match refusal {
                 Some(failure) => pipeline::failure_result(
                     &request,
@@ -974,8 +918,7 @@ impl StarlingApp {
                     Timing {
                         queued_ms: 0.0,
                         processing_ms: 0.0,
-                        stop_to_result_ms: stopped_at
-                            .map(|at| at.elapsed().as_secs_f64() * 1000.0),
+                        stop_to_result_ms: stopped_at.map(|at| at.elapsed().as_secs_f64() * 1000.0),
                     },
                 ),
                 None => {
@@ -1399,13 +1342,9 @@ mod tests {
     }
 
     #[gpui::test]
-    fn a_spoken_instruction_is_refused_not_fed_to_s1_mini(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        // The take ends in the delimiter; the active mode is S1-mini
-        // cleanup, which cannot follow instructions (#298). The refusal
-        // names the reason, nothing is sent anywhere and the raw
-        // transcript stands.
+    fn a_spoken_instruction_is_refused_not_fed_to_s1_mini(cx: &mut gpui::TestAppContext) {
+        // S1-mini cleanup cannot follow instructions: the take is refused,
+        // nothing is sent and the raw transcript stands.
         let root = tempfile::tempdir().unwrap();
         let store = crate::store::Store::at_test_root(root.path());
         let raw = "Please send the report Starling, make it formal";
@@ -1419,7 +1358,10 @@ mod tests {
         app.update(cx, |app, _| {
             let processing = app.processing.get(&id).expect("the take was processed");
             let ProcessingState::Failed { message } = &processing.state else {
-                panic!("the instruction is refused, not run: {:?}", processing.state);
+                panic!(
+                    "the instruction is refused, not run: {:?}",
+                    processing.state
+                );
             };
             assert!(
                 message.contains("an instruction requires an instruction-capable model"),
@@ -1428,22 +1370,25 @@ mod tests {
             let draft = app.drafts.get(&id).expect("the draft survives");
             assert_eq!(draft.raw_text(), raw);
             assert_eq!(draft.text(), raw, "nothing was sent or rewritten");
-            assert_eq!(
-                store.processing_doc(&id).unwrap().unwrap().head_text,
-                raw
-            );
+            assert_eq!(store.processing_doc(&id).unwrap().unwrap().head_text, raw);
             // The refusal is durable like every other failure: a failed
             // row survives a restart instead of living only in the UI.
             let stored = store.processing_doc(&id).unwrap().unwrap();
             let row = stored.proposals.last().expect("a stored failure");
             assert_eq!(row.status, RowStatus::Failed);
             assert!(
-                row.failure.as_deref().unwrap_or_default().contains("instruction-capable model"),
+                row.failure
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("instruction-capable model"),
                 "{:?}",
                 row.failure
             );
             assert!(
-                matches!(TakeProcessing::from_doc(&stored).state, ProcessingState::Failed { .. }),
+                matches!(
+                    TakeProcessing::from_doc(&stored).state,
+                    ProcessingState::Failed { .. }
+                ),
                 "the failure is what a restart shows"
             );
         });
@@ -1451,10 +1396,7 @@ mod tests {
 
     /// A capture with a finalized transcript, like the tests in
     /// `staging.rs` build one.
-    fn saved_take_with_transcript(
-        store: &crate::store::Store,
-        text: &str,
-    ) -> (String, String) {
+    fn saved_take_with_transcript(store: &crate::store::Store, text: &str) -> (String, String) {
         use starling_dictation::{audio, storage::TranscriptionResult};
         let wav = audio::encode_wav_16k(&audio::PcmAudio {
             samples: vec![0.; 160],
@@ -1486,12 +1428,9 @@ mod tests {
     fn a_leading_alias_routes_the_take_and_never_reaches_the_payload(
         cx: &mut gpui::TestAppContext,
     ) {
-        // The active mode is clean-local, whose own alias does not match;
-        // the longest alias ("clean this online") routes the take to
-        // clean-api for this take only. The API is not set up (the test
-        // settings ship no model), so the routed plan is blocked — which
-        // is exactly how the test sees the routed mode: the active mode
-        // would have planned S1-mini instead (#298).
+        // The longest alias ("clean this online") routes the take to
+        // clean-api. The test settings have no API model, so the routed
+        // plan is blocked, which is how the test sees the routed mode.
         let root = tempfile::tempdir().unwrap();
         let store = crate::store::Store::at_test_root(root.path());
         let raw = "Clean this online: send the report";
@@ -1505,7 +1444,10 @@ mod tests {
         app.update(cx, |app, _| {
             let processing = app.processing.get(&id).expect("the take was routed");
             let ProcessingState::Blocked { message } = &processing.state else {
-                panic!("the routed mode (clean-api) is not set up: {:?}", processing.state);
+                panic!(
+                    "the routed mode (clean-api) is not set up: {:?}",
+                    processing.state
+                );
             };
             assert!(message.contains("Set the API model"), "{message}");
             // The phrase is the take's ModePhrase command region: it never
@@ -1527,12 +1469,9 @@ mod tests {
     }
 
     #[gpui::test]
-    fn instruction_regions_are_recomputed_from_the_edited_text(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        // Re-running the mode after a staging edit must leave exactly one
-        // command region over the CURRENT text — never a stale or
-        // fragmented mark from the previous run (#298).
+    fn instruction_regions_are_recomputed_from_the_edited_text(cx: &mut gpui::TestAppContext) {
+        // Re-running after a staging edit leaves exactly one command
+        // region over the current text, never a stale mark.
         let root = tempfile::tempdir().unwrap();
         let store = crate::store::Store::at_test_root(root.path());
         let (id, _attempt) =
@@ -1580,7 +1519,10 @@ mod tests {
                 vec![(vec![20, 44], Some(CommandKind::TrailingInstruction))]
             );
             assert_eq!(draft.payload_text(), "now send the report ");
-            assert_eq!(draft.instruction().as_deref(), Some("Starling, make it formal"));
+            assert_eq!(
+                draft.instruction().as_deref(),
+                Some("Starling, make it formal")
+            );
         });
         // The delimiter deleted: nothing fires, no stale region survives,
         // and the whole text is payload again.
@@ -1607,12 +1549,9 @@ mod tests {
     }
 
     #[gpui::test]
-    fn an_instruction_that_cannot_be_marked_refuses_the_take(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        // A live tail over the delimiter: the command region cannot be
-        // marked, so the take fails instead of sending the delimiter and
-        // instruction as text to a model that cannot take one (#298).
+    fn an_instruction_that_cannot_be_marked_refuses_the_take(cx: &mut gpui::TestAppContext) {
+        // A live partial over the delimiter cannot be marked, so the take
+        // fails instead of sending the instruction as text.
         let root = tempfile::tempdir().unwrap();
         let store = crate::store::Store::at_test_root(root.path());
         let (id, _attempt) =
@@ -1626,14 +1565,20 @@ mod tests {
         // A new live segment ends in a delimiter: the marking spans a
         // partial and is refused.
         app.update(cx, |app, cx| {
-            app.drafts.get_mut(&id).unwrap().partial(1, " now Starling, formalize");
+            app.drafts
+                .get_mut(&id)
+                .unwrap()
+                .partial(1, " now Starling, formalize");
             app.process_take(id.clone(), cx);
         });
         cx.run_until_parked();
         app.update(cx, |app, _| {
             let processing = app.processing.get(&id).expect("the take was processed");
             let ProcessingState::Failed { message } = &processing.state else {
-                panic!("the unmarkable instruction refuses the take: {:?}", processing.state);
+                panic!(
+                    "the unmarkable instruction refuses the take: {:?}",
+                    processing.state
+                );
             };
             assert!(
                 message.contains("could not be kept out of the text"),
@@ -1669,20 +1614,22 @@ mod tests {
 
     #[test]
     fn a_leading_alias_conflict_surfaces_the_candidates() {
-        // Equal-rank phrases on different modes are the oracle's
-        // `needs_resolution`: the app names the candidates and runs
-        // nothing rather than guess (#298).
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../../../packages/contracts/mode-routing/fixtures/profiles-alias-collision.json");
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
+            "../../../../packages/contracts/mode-routing/fixtures/profiles-alias-collision.json",
+        );
         let doc: ProfilesDocument = serde_json::from_str(
-            &std::fs::read_to_string(&path).unwrap_or_else(|err| panic!("{}: {err}", path.display())),
+            &std::fs::read_to_string(&path)
+                .unwrap_or_else(|err| panic!("{}: {err}", path.display())),
         )
         .unwrap();
         let active = doc.profile("capture").unwrap();
         let TakeRoute::Conflict(message) = route_take(&doc, "code this: hello", active) else {
             panic!("equal-rank phrases conflict");
         };
-        assert!(message.contains("faithful") && message.contains("code-guidance"), "{message}");
+        assert!(
+            message.contains("faithful") && message.contains("code-guidance"),
+            "{message}"
+        );
         assert!(message.contains("raw transcript is unchanged"), "{message}");
     }
 

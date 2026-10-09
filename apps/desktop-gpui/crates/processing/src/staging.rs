@@ -782,10 +782,8 @@ impl Draft {
 
     /// Returns every command region's text to the payload as user text;
     /// the text and the revision do not change. Spoken-phrase detection
-    /// re-marks from the current text each run (#298), so a mark from an
-    /// earlier run can never survive the edit that moved or removed its
-    /// span. The staging contract has no unmark op; this is the
-    /// embedder's re-mark discipline over the same regions.
+    /// re-marks from the current text on each run, so a stale mark cannot
+    /// outlive the edit that moved or removed its span.
     pub fn clear_commands(&mut self) {
         for region in &mut self.regions {
             if region.kind == RegionKind::Command {

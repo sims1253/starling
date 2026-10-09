@@ -2,26 +2,13 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "urn:starling:contracts:mode-routing:spoken-instruction:v1",
   "$comment": [
-    "Starling trailing spoken instruction record, v1 (#298).",
-    "One record per finalized take: whether the trailing delimiter",
-    "grammar fired, the payload (everything before the delimiter) and",
-    "the instruction (everything after it), with the delimiter and",
-    "instruction spans. The payload is a VIEW: the raw recognition text",
-    "is preserved and reconstructs as raw == payload + raw[delimiter_span",
-    "[0]:] (the delimiter and instruction are the tail). Spans are",
-    "Unicode code-point offsets, explicitly not native UTF-16 ranges.",
-    "matched false means no delimiter fired: the payload is the whole",
-    "text, the instruction is empty and both spans are null. The",
-    "deliberate non-fires (mid-take delimiter, quoted mention, literal",
-    "escape, empty instruction) are recorded by fixtures/",
-    "spoken-instructions.json, not by extra fields here.",
-    "The record carries text the user dictated; it is a processing-time",
-    "view, not a permission change: it cannot name a provider, route or",
-    "grant (the frozen decision and context-snapshot records own those).",
-    "Semantics: tests/spoken_instructions.py; Rust port: apps/desktop-gpui/",
-    "crates/processing/src/instructions.rs.",
-    "Keyword subset: only keywords the repo's minischema.py fallback",
-    "understands are used, so jsonschema and minischema agree."
+    "Trailing spoken instruction record, v1: one per finalized take. The",
+    "payload is a view: raw == payload + raw[delimiter_span[0]:]. Spans are",
+    "Unicode code points. matched false means no delimiter fired: the",
+    "payload is the whole text, the instruction is empty and both spans are",
+    "null. The record cannot name a provider, route or grant.",
+    "Semantics: tests/spoken_instructions.py. Only keywords minischema.py",
+    "understands are used."
   ],
   "type": "object",
   "additionalProperties": false,
@@ -66,6 +53,7 @@
         {
           "type": "array",
           "minItems": 2,
+          "maxItems": 2,
           "items": {
             "type": "integer",
             "minimum": 0

@@ -347,7 +347,7 @@ def test_a_dictated_command_line_is_just_text() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# The trailing instruction grammar (#298)
+# The trailing instruction grammar
 # --------------------------------------------------------------------------- #
 import spoken_instructions as si  # noqa: E402
 
@@ -408,12 +408,8 @@ def test_instruction_table_is_closed() -> None:
 
 
 def test_the_delimiter_is_stripped_from_an_instruction_region() -> None:
-    # The draft's command region carries "Starling, <instruction>"; the
-    # request the model sees carries only the instruction.
     stripped = si.strip_delimiter("Starling, make it formal", table=INSTRUCTION_TABLE)
     assert stripped == "make it formal"
-    # A repeated delimiter already lost to last-one-wins is not stripped
-    # twice: only the leading token goes.
     kept = si.strip_delimiter("make it formal", table=INSTRUCTION_TABLE)
     assert kept == "make it formal"
 

@@ -9,13 +9,15 @@
 //! - [`routing`]: the frozen routing oracle itself (leading mode
 //!   phrases, the literal escape, rule conflicts), ported from the same
 //!   file (#298).
+//! - [`routing`]: the routing oracle itself (leading mode phrases, the
+//!   literal escape, rule conflicts), ported from the same file.
 //! - [`staging`]: the staged draft of one take (typed regions, immutable
 //!   raw attempts, proposals pinned to a revision), ported from
 //!   `tests/staging.py`.
 //! - [`transforms`]: the deterministic step (spoken commands, snippets),
 //!   ported from `tests/spoken_commands.py` (#294).
 //! - [`instructions`]: the trailing spoken instruction grammar, ported
-//!   from `tests/spoken_instructions.py` (#298).
+//!   from `tests/spoken_instructions.py`.
 //! - [`providers`] + [`http`]: the model step behind one contract: S1-mini
 //!   on a local starling-serve, OpenAI-compatible, Anthropic, Gemini.
 //! - [`pipeline`]: plan → request → run, one [`contract::TransformResult`]
