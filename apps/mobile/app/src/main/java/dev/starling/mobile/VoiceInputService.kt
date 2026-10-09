@@ -51,10 +51,12 @@ import dev.starling.mobile.ui.RequestGenerationGuard
  * A take outlives the keyboard window. While it records, a microphone
  * foreground service keeps the capture alive through a screen lock or an app
  * switch, and the notification offers Stop. Leaving the field detaches the
- * take (its composing text is removed, never committed); when the same field
- * comes back — recognized by its declared [EditorField] attributes, held in
- * memory only — the take attaches again and continues. A different field
- * never receives the take's text automatically: it can only be copied.
+ * take (its composing text is removed, never committed). When a field with
+ * the same declared [EditorField] attributes (held in memory only) comes
+ * back, the take attaches again — but attributes cannot prove it is the same
+ * editor (two chats share one layout), so from then on the take never writes
+ * by itself: its live text stays in the keyboard and the final waits for an
+ * explicit Insert. Any other field can only copy the take's text.
  *
  * Private fields ([EditorField.sensitive]: passwords, incognito) dictate an
  * ephemeral take that never shows up in the history and is deleted as soon
@@ -124,11 +126,21 @@ class VoiceInputService : InputMethodService() {
         if (connection != null) targetGuard.targetStarted(connection) else targetGuard.targetFinished()
         val current = take
         if (current != null) {
-            // The guard generation moved on, so the old binding is dead
-            // either way; the take keeps recording or settling.
-            current.target = null
-            current.composing = false
-            if (connection != null && field != null && current.field.sameFieldAs(field)) attach(current)
+            val previous = current.target
+            if (previous != null && connection != null && previous.target === connection) {
+                // restartInput on the very same connection: the composing
+                // region is still the take's own.
+                current.target = targetGuard.capture()
+            } else {
+                // The guard generation moved on, so the old binding is dead.
+                // A connection replaced without onFinishInput may have had
+                // its composing text finished by the editor; nothing more is
+                // written automatically for this take.
+                if (previous != null) current.explicitOnly = true
+                current.target = null
+                current.composing = false
+                if (connection != null && field != null && current.field.sameFieldAs(field)) attach(current)
+            }
         } else {
             // Text of an earlier take never carries over to another field.
             transcriptView?.visibility = View.GONE
@@ -144,9 +156,40 @@ class VoiceInputService : InputMethodService() {
      */
     override fun onStartInputView(info: EditorInfo?, restarting: Boolean) {
         super.onStartInputView(info, restarting)
+        resumeComposing()
         application.preloadOnDeviceModel()
         renderModelState(application.modelLifetime.state())
         switchKeyboardButton?.visibility = if (offersKeyboardSwitch()) View.VISIBLE else View.GONE
+    }
+
+    /**
+     * Hiding the keyboard (Back) while the field keeps focus finishes
+     * composing in super, which would commit the live partial as ordinary
+     * text. The take's composing text is removed first and comes back in
+     * [onStartInputView], on the same connection.
+     */
+    override fun onFinishInputView(finishingInput: Boolean) {
+        val current = take
+        if (!finishingInput && current != null && current.composing) {
+            clearComposingText(current)
+            current.composingSuspended = true
+        }
+        super.onFinishInputView(finishingInput)
+    }
+
+    private fun resumeComposing() {
+        val current = take ?: return
+        if (!current.composingSuspended) return
+        current.composingSuspended = false
+        val target = current.target ?: return
+        val connection = currentInputConnection
+        if (current.explicitOnly || current.liveBroken || current.ready != null ||
+            !targetGuard.isCurrent(target, connection)
+        ) {
+            return
+        }
+        current.composing = true
+        current.lastPartial?.let { connection.setComposingText(it, 1) }
     }
 
     override fun onFinishInput() {
@@ -163,16 +206,26 @@ class VoiceInputService : InputMethodService() {
         application.modelLifetime.removeListener(modelStateListener)
         // Switching to another keyboard unbinds this one: the take ends here
         // and settles into the store (deleted again if it was private).
-        if (take?.capturing == true) stopTake()
-        CaptureForegroundService.release()
+        if (take?.capturing == true) stopTake() else CaptureForegroundService.release()
         super.onDestroy()
     }
 
     private fun requestOrStartRecording() {
-        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+        val microphone = checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+        val preferences = getSharedPreferences(PREFERENCES, MODE_PRIVATE)
+        // The take notification (and its Stop) needs its own permission on
+        // Android 13+; it is asked once, even when the microphone was
+        // already granted elsewhere, and a refusal is not asked again.
+        val askNotifications = Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED &&
+            !preferences.getBoolean(KEY_NOTIFICATIONS_ASKED, false)
+        if (!microphone || askNotifications) {
+            if (askNotifications) preferences.edit().putBoolean(KEY_NOTIFICATIONS_ASKED, true).apply()
             // A keyboard cannot show a permission dialog; the app asks and
             // closes again, back to this field.
-            statusView?.setText(R.string.keyboard_microphone_permission)
+            statusView?.setText(
+                if (microphone) R.string.keyboard_notification_permission else R.string.keyboard_microphone_permission,
+            )
             startActivity(
                 Intent(this, MainActivity::class.java)
                     .setAction(MainActivity.ACTION_REQUEST_MICROPHONE)
@@ -190,9 +243,6 @@ class VoiceInputService : InputMethodService() {
             statusView?.setText(R.string.keyboard_no_target)
             return
         }
-        // Invalidate any earlier take whose callbacks may still be queued; it
-        // stays in the store (or is deleted there, if it was private).
-        val requestGeneration = requestGuard.begin()
         val sensitive = field.sensitive
         val recording = runCatching { application.recordings.create(ephemeral = sensitive) }.getOrElse {
             statusView?.setText(R.string.recording_storage_error)
@@ -222,6 +272,12 @@ class VoiceInputService : InputMethodService() {
             statusView?.text = error
             return
         }
+        // Only a capture that really started invalidates the earlier take,
+        // whose callbacks may still be queued; it stays in the store (or is
+        // deleted there, if it was private).
+        val requestGeneration = requestGuard.begin()
+        transcriptView?.visibility = View.GONE
+        transcriptView?.text = null
         take = Take(recording, requestGeneration, field, sensitive, streaming = session != null).also { started ->
             started.session = session
             started.target = target
@@ -240,17 +296,20 @@ class VoiceInputService : InputMethodService() {
     }
 
     /**
-     * Binds a detached take to the focused field again. A live take resumes
-     * its composing region from the newest partial, so the final text still
-     * replaces it in one commit.
+     * Binds a detached take to a field with the same attributes. Only an
+     * explicit Insert writes there from now on; the live text shows in the
+     * keyboard.
      */
     private fun attach(current: Take) {
-        val target = targetGuard.capture() ?: return
-        current.target = target
-        current.composing = current.streaming && !current.liveBroken &&
-            current.ready == null && editorField?.supportsComposing == true
-        val partial = current.lastPartial
-        if (current.composing && partial != null) target.target.setComposingText(partial, 1)
+        current.target = targetGuard.capture() ?: return
+        current.explicitOnly = true
+        current.composing = false
+        if (current.ready == null) {
+            current.lastPartial?.let { partial ->
+                transcriptView?.visibility = View.VISIBLE
+                transcriptView?.text = visibleText(current, partial)
+            }
+        }
     }
 
     /** Unbinds the take from a field that is going away, leaving no text behind. */
@@ -297,7 +356,7 @@ class VoiceInputService : InputMethodService() {
                     // No composing region (detached, or a field that cannot
                     // compose): the keyboard shows the live text itself.
                     transcriptView?.visibility = View.VISIBLE
-                    transcriptView?.text = event.text
+                    transcriptView?.text = visibleText(current, event.text)
                 }
             }
             is StreamEvent.Interrupted -> {
@@ -332,14 +391,19 @@ class VoiceInputService : InputMethodService() {
         current.capturing = false
         val session = current.session
         current.session = null
-        CaptureForegroundService.release()
         renderTake()
 
         // The capture settles inline on this main thread in the common
         // case; when the microphone refuses to stop, the outcome is
         // delivered later, still on the main thread, so input teardown and
         // onDestroy never block on the forced-release wait.
-        capture.stop { result -> settleStoppedRecording(current, session, result) }
+        capture.stop { result ->
+            // The foreground lasts until the capture has really let go of the
+            // microphone and finalized its WAV. No newer capture can have
+            // started meanwhile: AudioCapture refuses one while stopping.
+            if (take?.capturing != true) CaptureForegroundService.release()
+            settleStoppedRecording(current, session, result)
+        }
     }
 
     private fun settleStoppedRecording(current: Take, session: StreamSession?, result: CaptureResult) {
@@ -487,7 +551,7 @@ class VoiceInputService : InputMethodService() {
         copyButton?.visibility = if (ready != null && !bound) View.VISIBLE else View.GONE
         if (ready != null) {
             transcriptView?.visibility = View.VISIBLE
-            transcriptView?.text = ready
+            transcriptView?.text = visibleText(current, ready)
             statusView?.setText(
                 when {
                     bound -> R.string.keyboard_ready_to_insert
@@ -498,6 +562,16 @@ class VoiceInputService : InputMethodService() {
         } else if (current == null && statusView?.text.isNullOrEmpty()) {
             statusView?.setText(R.string.keyboard_ready)
         }
+    }
+
+    /**
+     * A private take's text shows only while its own field is focused; in
+     * any other field (or none) the keyboard says it is hidden. It can
+     * still be copied there, marked sensitive.
+     */
+    private fun visibleText(current: Take, text: String): String {
+        val bound = current.target?.let { targetGuard.isCurrent(it, currentInputConnection) } == true
+        return if (current.sensitive && !bound) getString(R.string.keyboard_private_hidden) else text
     }
 
     /**
@@ -548,6 +622,11 @@ class VoiceInputService : InputMethodService() {
         }
     }
 
+    private companion object {
+        const val PREFERENCES = "keyboard"
+        const val KEY_NOTIFICATIONS_ASKED = "notifications_asked"
+    }
+
     /**
      * One take, from Record until its text is inserted, copied or given up.
      * Main thread only; the capture worker sees only the stream session it
@@ -571,8 +650,17 @@ class VoiceInputService : InputMethodService() {
         /** Whether the take owns a composing region in [target]. */
         var composing = false
 
-        /** The live stream failed; composing does not come back on attach. */
+        /** The live stream failed; composing does not come back. */
         var liveBroken = false
+
+        /**
+         * The take lost its original connection; it never writes into a
+         * field by itself again, only on an explicit Insert.
+         */
+        var explicitOnly = false
+
+        /** Composing text was removed while the keyboard was hidden. */
+        var composingSuspended = false
         var lastPartial: String? = null
 
         /** Final text waiting for an explicit Insert or Copy. */

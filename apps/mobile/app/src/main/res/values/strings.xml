@@ -88,6 +88,8 @@
     <string name="keyboard_target_changed_private">The take was dictated in another, private field. It is not kept; copy it now or record again.</string>
     <string name="keyboard_transcription_failed_private">Transcription failed. Takes in private fields are not kept; record again.</string>
     <string name="keyboard_copy">Copy transcript</string>
+    <string name="keyboard_private_hidden">Private text hidden outside its field.</string>
+    <string name="keyboard_notification_permission">Allow notifications in Starling, so a take that keeps recording in the background can be stopped from there; then tap Record again.</string>
     <string name="keyboard_copied">Transcript copied.</string>
     <string name="keyboard_switch_label">⌨</string>
     <string name="keyboard_switch_description">Switch to the previous keyboard</string>

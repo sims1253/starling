@@ -163,17 +163,21 @@ Starling to ask for it and closes again.
 
 A keyboard take keeps recording while the keyboard is hidden — screen lock,
 app switch, another field — through a microphone foreground service; its
-notification carries **Stop**. Leaving the field removes the take's composing
-text (it is never committed there). When the same field comes back, the take
-attaches again and live text continues; in any other field its transcript is
-never inserted automatically and can only be copied, and it stays in
-Starling.
+notification carries **Stop** (Android 13+ asks once for notifications for
+this). Leaving the field — or hiding the keyboard — removes the take's
+composing text; it is never committed there. When the keyboard comes back
+over the same connection, live text continues. When a field with the same
+declared attributes comes back, the take attaches to it but writes nothing
+by itself any more (two chats can share one field layout): its live text stays
+in the keyboard and the final waits for **Insert transcript**. In any other
+field the transcript can only be copied, and it stays in Starling.
 
 Private fields — password input types and fields that set
 `IME_FLAG_NO_PERSONALIZED_LEARNING`, such as incognito browser tabs — get an
 ephemeral take: it never appears in Saved recordings, its WAV and transcript
 are deleted as soon as it settles (a crash leftover is deleted on the next
-start), and a copied transcript is marked sensitive.
+start), its text is hidden in the keyboard outside its own field, and a
+copied transcript is marked sensitive.
 
 ### Live streaming and its fallback
 

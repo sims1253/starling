@@ -43,4 +43,20 @@ class RecordingStoreEphemeralTest {
         assertFalse(File(storeDir(), "${private.id}.wav.part").exists())
         assertTrue(File(storeDir(), "${kept.id}.json").exists())
     }
+
+    @Test
+    fun aFailedDeleteKeepsTheMarkerForTheNextSweep() {
+        val store = RecordingStore(storeDir())
+        val private = store.create(ephemeral = true)
+        // A non-empty directory where the WAV belongs cannot be deleted.
+        val stuck = File(storeDir(), "${private.id}.wav").apply { mkdirs() }
+        File(stuck, "x").writeBytes(ByteArray(1))
+
+        assertTrue(runCatching { store.delete(private.id) }.isFailure)
+        assertTrue(File(storeDir(), "${private.id}.json").exists())
+
+        stuck.deleteRecursively()
+        RecordingStore(storeDir())
+        assertFalse(File(storeDir(), "${private.id}.json").exists())
+    }
 }

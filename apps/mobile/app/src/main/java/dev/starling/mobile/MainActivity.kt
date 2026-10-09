@@ -151,15 +151,15 @@ class MainActivity : Activity() {
      */
     private fun handleKeyboardRequest(intent: Intent?) {
         if (intent?.action != ACTION_REQUEST_MICROPHONE) return
-        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+        val missing = buildList {
+            add(Manifest.permission.RECORD_AUDIO)
+            if (Build.VERSION.SDK_INT >= 33) add(Manifest.permission.POST_NOTIFICATIONS)
+        }.filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
+        if (missing.isEmpty()) {
             recordingMessage.setText(R.string.keyboard_permission_granted)
             return
         }
-        val permissions = buildList {
-            add(Manifest.permission.RECORD_AUDIO)
-            if (Build.VERSION.SDK_INT >= 33) add(Manifest.permission.POST_NOTIFICATIONS)
-        }
-        requestPermissions(permissions.toTypedArray(), REQUEST_KEYBOARD_MICROPHONE)
+        requestPermissions(missing.toTypedArray(), REQUEST_KEYBOARD_MICROPHONE)
     }
 
     override fun onResume() {
@@ -633,8 +633,9 @@ class MainActivity : Activity() {
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (requestCode == REQUEST_KEYBOARD_MICROPHONE) {
-            val microphone = permissions.indexOf(Manifest.permission.RECORD_AUDIO)
-            if (microphone >= 0 && grantResults.getOrNull(microphone) == PackageManager.PERMISSION_GRANTED) {
+            // Back to the field as soon as the microphone is allowed; the
+            // notification answer, whatever it is, does not hold that up.
+            if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
                 finish()
             } else {
                 recordingMessage.setText(R.string.microphone_permission_required)

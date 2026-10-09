@@ -6,14 +6,17 @@ import android.content.ComponentName
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.speech.RecognizerIntent
+import android.view.KeyEvent
 import android.widget.Button
 import android.widget.TextView
 import androidx.test.core.app.ActivityScenario
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
+import androidx.test.platform.app.InstrumentationRegistry
 import androidx.test.rule.GrantPermissionRule
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
+import org.junit.Assume.assumeTrue
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -50,26 +53,46 @@ class RecognizeSpeechActivityTest {
         assertTrue(activities.single().activityInfo.exported)
     }
 
+    /** Whether the popup opened the microphone (an emulator started with -noaudio cannot). */
+    private fun listening(scenario: ActivityScenario<RecognizeSpeechActivity>): Boolean {
+        var listening = false
+        scenario.onActivity { activity ->
+            listening = activity.findViewById<TextView>(R.id.recognize_status).text.toString() in setOf(
+                activity.getString(R.string.recognize_listening),
+                activity.getString(R.string.recognize_listening_loading),
+            )
+        }
+        return listening
+    }
+
     @Test
-    fun popupLaunchesListeningAndShowsTheCallersPrompt() {
+    fun popupLaunchesAndShowsTheCallersPrompt() {
         ActivityScenario.launchActivityForResult<RecognizeSpeechActivity>(recognizeIntent("Say a city")).use { scenario ->
-            var listening = false
             scenario.onActivity { activity ->
                 assertTrue(!activity.isFinishing)
                 assertEquals("Say a city", activity.findViewById<TextView>(R.id.recognize_prompt).text.toString())
-                listening = activity.findViewById<TextView>(R.id.recognize_status).text.toString() in setOf(
-                    activity.getString(R.string.recognize_listening),
-                    activity.getString(R.string.recognize_listening_loading),
-                )
             }
             scenario.onActivity { it.findViewById<Button>(R.id.recognize_cancel_button).performClick() }
-            // An emulator started without audio input (-noaudio) cannot open
-            // the microphone: the popup reports RESULT_AUDIO_ERROR then and
-            // Cancel keeps it. With a microphone, Cancel is RESULT_CANCELED.
-            assertEquals(
-                if (listening) Activity.RESULT_CANCELED else RecognizerIntent.RESULT_AUDIO_ERROR,
-                scenario.result.resultCode,
-            )
+            assertTrue(scenario.result.resultCode != Activity.RESULT_OK)
+        }
+    }
+
+    @Test
+    fun cancelWhileListeningReturnsCanceled() {
+        ActivityScenario.launchActivityForResult<RecognizeSpeechActivity>(recognizeIntent()).use { scenario ->
+            assumeTrue("no microphone on this emulator", listening(scenario))
+            scenario.onActivity { it.findViewById<Button>(R.id.recognize_cancel_button).performClick() }
+            assertEquals(Activity.RESULT_CANCELED, scenario.result.resultCode)
+        }
+    }
+
+    @Test
+    fun microphoneFailureIsAnAudioError() {
+        ActivityScenario.launchActivityForResult<RecognizeSpeechActivity>(recognizeIntent()).use { scenario ->
+            assumeTrue("this emulator has a microphone", !listening(scenario))
+            // The error stays on screen; closing it keeps the error code.
+            scenario.onActivity { it.findViewById<Button>(R.id.recognize_done_button).performClick() }
+            assertEquals(RecognizerIntent.RESULT_AUDIO_ERROR, scenario.result.resultCode)
         }
     }
 
@@ -86,14 +109,12 @@ class RecognizeSpeechActivityTest {
     }
 
     @Test
-    fun backCancelsWithoutAResult() {
+    fun systemBackCancelsWithoutAResult() {
         ActivityScenario.launchActivityForResult<RecognizeSpeechActivity>(recognizeIntent()).use { scenario ->
-            scenario.onActivity { activity ->
-                @Suppress("DEPRECATION")
-                activity.onBackPressed()
-            }
+            assumeTrue("no microphone on this emulator", listening(scenario))
+            InstrumentationRegistry.getInstrumentation().sendKeyDownUpSync(KeyEvent.KEYCODE_BACK)
             val result = scenario.result
-            assertTrue(result.resultCode != Activity.RESULT_OK)
+            assertEquals(Activity.RESULT_CANCELED, result.resultCode)
             assertTrue(result.resultData?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS).isNullOrEmpty())
         }
     }

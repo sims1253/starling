@@ -141,9 +141,12 @@ class RecordingStore internal constructor(private val directory: File) {
         val audio = File(directory, "$id.wav")
         val partial = File(directory, "$id.wav.part")
         val temporary = File(directory, ".$id.json.tmp")
-        val failures = listOf(metadata, audio, partial, temporary)
+        // Metadata goes last: until every payload file is gone it stays,
+        // so an interrupted or failed delete (of an ephemeral take, too) is
+        // found and finished again on the next open.
+        val failures = listOf(audio, partial, temporary)
             .filter { it.exists() && !it.delete() }
-        if (failures.isNotEmpty()) {
+        if (failures.isNotEmpty() || (metadata.exists() && !metadata.delete())) {
             throw IOException("Unable to delete recording files")
         }
     }
