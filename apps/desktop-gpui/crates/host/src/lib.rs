@@ -15,10 +15,8 @@
 //! # Layout
 //!
 //! - [`frame`] — the length-prefixed frame around the I3 envelope
-//!   (no second wire format; transport control only) — since issue
-//!   #309 it also carries the agent-dictation ask frames (prompt
-//!   handshake, ask/result), still host-level, never a second machine
-//!   surface.
+//!   (no second wire format; transport control plus the host-level
+//!   agent-dictation ask frames).
 //! - [`auth`] + [`platform`] — peer authentication and the per-OS
 //!   transport: UDS + `SO_PEERCRED`/`LOCAL_PEERCRED` on unix, a DACL'd
 //!   named pipe on Windows (compile-unverified there — see that module).
@@ -28,14 +26,11 @@
 //! - [`engine`] — the supervised inference engine attached to the
 //!   runtime, following the desktop settings file while the host
 //!   serves.
-//! - [`agent`] — the agent-dictation ask surface (issue #309): the
-//!   per-client allowlist and the one broker that serializes
-//!   `ask_user_dictation` asks, gates capture on a prompt-visibility
-//!   ack, and drives the existing capture/jobs path.
-//! - [`mcp`] — the MCP stdio server (JSON-RPC 2.0, no dependencies):
-//!   what a coding agent launches and talks to; the bridge between
-//!   its `tools/call` and [`agent`]'s ask frames. The binary a coding
-//!   agent registers is `mcp-dictation` (`src/bin`).
+//! - [`agent`] — the agent-dictation ask surface: the client allowlist
+//!   and the broker that serializes asks behind a prompt-visibility
+//!   gate and drives the existing capture/jobs path.
+//! - [`mcp`] — the MCP stdio server behind the `mcp-dictation` binary,
+//!   bridging `tools/call` onto [`agent`]'s ask frames.
 //! - [`client`] — the client library the GPUI app will hold (the
 //!   Electron comparison app has since been removed from the tree).
 //!

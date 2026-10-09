@@ -9,14 +9,9 @@
 //! discriminator, the receipt for a command (the runtime's
 //! `Result<Receipt, Rejection>`, serialized by the runtime crate
 //! itself), the snapshot projection, transport-level errors with clear
-//! codes — and, since issue #309, the agent-dictation ask frames
-//! ([`Frame::AgentHello`] … [`Frame::PromptDone`]). The ask surface is
-//! host-level, not machine-level: the frozen v1 command/event sets are
-//! untouched (the broker drives the *existing* capture/jobs commands
-//! through the runtime like any client), and what it adds over the
-//! envelope is exactly what the envelope deliberately does not carry —
-//! a human-facing prompt handshake between the host and the app showing
-//! it, plus the ask/result correlation for MCP agent connections.
+//! codes, and the agent-dictation ask frames ([`Frame::AgentHello`] …
+//! [`Frame::PromptDone`]). The ask frames are host-level: the v1
+//! command/event sets are untouched.
 //!
 //! Wire form: `u32` big-endian byte length, then that many bytes of
 //! UTF-8 JSON. The length header is checked against the connection's
@@ -152,120 +147,77 @@ pub enum Frame {
     /// survives it: acknowledged audio is in storage v2, and a new host
     /// can take over the socket via the lease.
     Bye { reason: String },
-    /// An MCP agent connection identifying itself (client → host, once,
-    /// immediately after the host's [`Frame::Hello`]): the named client
-    /// and its token are checked against the host's agent allowlist
-    /// (issue #309; default deny). `req` is echoed on the welcome so a
-    /// client can correlate the reply. A rejected hello answers
-    /// [`Frame::TransportError`] with `auth_failed` and closes the
-    /// connection; an [`Frame::AskUser`] from a connection that never
-    /// hellos is a protocol violation — the ask surface is opt-in per
-    /// connection, not open to every renderer.
+    /// An MCP agent connection identifying itself against the host's
+    /// allowlist. A refusal answers `auth_failed` and closes the
+    /// connection; only welcomed connections may send
+    /// [`Frame::AskUser`].
     AgentHello {
         req: String,
         client: String,
         token: String,
     },
-    /// The host's acceptance of [`Frame::AgentHello`] (host → agent):
-    /// the connection may now send [`Frame::AskUser`].
+    /// The host's acceptance of [`Frame::AgentHello`].
     AgentWelcome { req: String, client: String },
-    /// A coding agent asking the user one or more questions by voice
-    /// (agent → host; issue #309). `req` is the caller's correlation
-    /// token, echoed on the [`Frame::AskResult`] that eventually
-    /// resolves the ask — "eventually" can be minutes later (a human
-    /// speaks), so no receipt-style fast answer exists. The host queues
-    /// concurrent asks (serialized prompts, never overlapping
-    /// captures); validation bounds are on the broker
-    /// ([`crate::agent`]).
+    /// An agent asking the user questions by voice. `req` is echoed on
+    /// the [`Frame::AskResult`] that resolves it, possibly minutes
+    /// later. Concurrent asks are queued.
     AskUser {
         req: String,
         questions: Vec<String>,
         timeout_ms: u64,
     },
-    /// The outcome of an [`Frame::AskUser`] (host → agent). Exactly one
-    /// per accepted ask — the spoken answer, a typed no-answer, or an
-    /// error. See [`AskOutcome`] for the vocabulary.
+    /// The one outcome of an [`Frame::AskUser`].
     AskResult { req: String, outcome: AskOutcome },
-    /// The agent cancelling a queued or in-flight ask (agent → host):
-    /// stops the microphone if the take is live, hides the prompt, and
-    /// resolves the ask with [`AskOutcome::NoAnswer`] (agent_cancelled).
+    /// The agent cancelling a queued or in-flight ask
+    /// (`NoAnswer { agent_cancelled }`).
     AskCancel { req: String, reason: String },
-    /// The host asking an app connection to show the dictation prompt
-    /// (host → app). Capture starts only after a connection answers
-    /// [`Frame::PromptAck`] with `visible: true` — the no-mic-without-a-
-    /// visible-prompt rule from issue #309. `req` is the broker's ask id
-    /// (stable across connections), not the agent's own token.
+    /// The host asking app connections to show a prompt. Capture
+    /// starts only after a [`Frame::PromptAck`] with `visible: true`.
+    /// `req` is the broker's ask id, not the agent's token.
     ShowPrompt {
         req: String,
         questions: Vec<String>,
         timeout_ms: u64,
     },
-    /// The host telling app connections an ask ended (host → app):
-    /// hide the prompt. Sent on every resolution — answer, no-answer,
-    /// error — so the overlay never outlives its ask.
+    /// The ask ended (any outcome): hide the prompt.
     HidePrompt { req: String, reason: String },
-    /// An app acknowledging [`Frame::ShowPrompt`] (app → host). The
-    /// first ack binds: `visible: true` releases the capture gate;
-    /// `visible: false` declines the ask (resolved as
-    /// [`AskOutcome::NoAnswer`] declined). A later `visible: false`
-    /// after the take started cancels it (the user dismissed the
-    /// prompt — the mic must stop). Only a connection this prompt was
-    /// fanned out to may ack it, and only an app connection may send
-    /// it at all (an agent connection's ack is a protocol violation —
-    /// it never received a prompt to ack).
+    /// An app acknowledging [`Frame::ShowPrompt`]. `visible: true`
+    /// opens the capture gate; `visible: false` declines the ask, or
+    /// stops the take if the gate is already open. Agent connections
+    /// sending it are closed.
     PromptAck { req: String, visible: bool },
-    /// The app reporting that the user finished speaking (app → host):
-    /// the host stops the capture, persists the take, transcribes it,
-    /// and answers the agent. Only the connection whose `visible:
-    /// true` ack opened the gate may send it; an early Done (before
-    /// any ack) is ignored.
+    /// The user finished speaking: stop, transcribe, answer. Counts
+    /// only from the connection whose ack opened the gate.
     PromptDone { req: String },
 }
 
-/// The outcome of an [`Frame::AskUser`] (issue #309): the spoken
-/// answer, a typed no-answer, or an error. The distinction that matters
-/// on the wire: `Answered` carries a transcript; `NoAnswer` is a
-/// *completed* ask with deliberately no transcript (the MCP layer maps
-/// it to an `isError` result whose text says "No answer" so an agent
-/// can never mistake it for spoken words); `Error` is a refusal or
-/// failure (not allowlisted, no prompt ack within the bound, capture or
-/// transcription failed, …).
+/// The outcome of an [`Frame::AskUser`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AskOutcome {
-    /// The user's spoken answer, transcribed. `text` is the finalized
-    /// raw transcript (processed output is a separate, explicitly
-    /// selected step this surface does not take); `backend` names what
-    /// transcribed it (the jobs machine's provider label).
+    /// The finalized raw transcript and the backend that produced it.
     Answered { text: String, backend: String },
-    /// The ask completed with no transcript, by design. The reason
-    /// vocabulary is closed: `timeout`, `agent_cancelled`,
-    /// `user_cancelled`, `declined`.
+    /// The ask completed without a transcript.
     NoAnswer { reason: NoAnswerReason },
-    /// The ask was refused or failed. `code` is a closed vocabulary:
-    /// `not_allowlisted`, `invalid_questions`, `invalid_timeout`,
-    /// `duplicate_req`, `queue_full`, `host_busy`, `no_prompt_ack`,
-    /// `capture_busy`, `capture_failed`, `transcription_failed`,
-    /// `shutting_down`.
+    /// The ask was refused or failed. `code` is one of
+    /// `invalid_questions`, `invalid_timeout`, `duplicate_req`,
+    /// `queue_full`, `host_busy`, `no_prompt_ack`, `capture_busy`,
+    /// `capture_failed`, `transcription_failed`, `shutting_down`.
     Error { code: String, message: String },
 }
 
-/// Why an ask ended with no answer. Snake-cased on the wire.
+/// Why an ask ended with no answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NoAnswerReason {
-    /// The ask's `timeout_ms` budget expired (it runs from admission
-    /// until the microphone closes — prompt display and speaking draw
-    /// on it; a captured take is never discarded on the clock).
+    /// The budget expired before the microphone closed.
     Timeout,
-    /// The agent cancelled (MCP `notifications/cancelled`, disconnect,
-    /// or an explicit cancel frame).
+    /// The agent cancelled or disconnected.
     AgentCancelled,
-    /// The user cancelled from the app side (the prompt was dismissed
-    /// after capture had started).
+    /// The prompt was dismissed (or its app disconnected) after the
+    /// gate opened.
     UserCancelled,
-    /// The app declined the prompt before capture started
-    /// (`PromptAck { visible: false }`).
+    /// The prompt was declined before the gate opened.
     Declined,
 }
 

@@ -1,40 +1,28 @@
-//! `mcp-dictation` — the MCP stdio server a coding agent launches
-//! (issue #309). Stdin/stdout are the agent's JSON-RPC 2.0;
-//! everything else (errors, diagnostics) goes to stderr, because
-//! stdout belongs to the protocol alone.
+//! `mcp-dictation`: the MCP stdio server a coding agent launches.
+//! Stdout carries only JSON-RPC; diagnostics go to stderr.
 //!
-//! The process connects to the Starling runtime host over the same
-//! authenticated IPC transport as the desktop app, identifies itself
-//! with `--client` and its token (the `STARLING_MCP_TOKEN`
-//! environment variable, or `--token` as a fallback) against the
-//! host's allowlist (default deny — see `starling_runtime_host::agent`),
-//! and then serves exactly one tool, `ask_user_dictation`, bridging
-//! `tools/call` onto the host's ask surface.
-//!
-//! Exit contract:
-//! - `0` on a clean stdin EOF (the agent closed the session);
-//! - `1` when the host is unreachable or the client is not
-//!   allowlisted (stderr says which — the agent surfaces it).
-//!
-//! See `docs/mcp-dictation.md` for the Claude Code / Codex setup.
+//! It connects to the running host, identifies itself with `--client`
+//! and the token from `STARLING_MCP_TOKEN` (or `--token`), and serves
+//! `ask_user_dictation`. Exits 0 on stdin EOF and 1 when the host is
+//! unreachable or refuses the client. See `docs/mcp-dictation.md`.
 
 use std::io::BufReader;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use starling_runtime::channel::RecvError;
 use starling_runtime_host::agent::ALLOWLIST_FILE;
 use starling_runtime_host::client::HostClient;
 use starling_runtime_host::mcp::{AskSink, McpServer};
 use starling_runtime_host::{default_data_root, platform};
 
-/// The environment variable the allowlist token is read from — the
-/// preferred channel: `--token` on the command line is world-readable
-/// through `/proc/<pid>/cmdline`, an environment variable is not.
+/// Preferred over `--token`, which other users can read from the
+/// process's command line.
 const TOKEN_ENV: &str = "STARLING_MCP_TOKEN";
 
 fn usage() -> ! {
     eprintln!(
-        "mcp-dictation — the Starling dictation MCP server (issue #309)
+        "mcp-dictation — the Starling dictation MCP server
 
 USAGE:
     mcp-dictation --client <name> [options]
@@ -59,10 +47,6 @@ this server is the agent-side bridge, not a host itself."
     std::process::exit(2);
 }
 
-/// The ask sink: one live host connection. `ask` is fire-and-forget on
-/// the wire (the answer arrives on the asks stream minutes later);
-/// `cancel` routes the agent's cancellation to the host, which stops
-/// the microphone if the take is live.
 struct HostSink {
     client: Arc<HostClient>,
 }
@@ -102,26 +86,22 @@ fn main() {
         eprintln!("--client is required (the allowlisted agent client name)");
         usage();
     };
-    // The environment variable first; the flag is the fallback.
     let token = std::env::var(TOKEN_ENV).ok().or(token);
     let Some(token) = token else {
         eprintln!("a token is required: set {TOKEN_ENV} (or pass --token)");
         usage();
     };
     let socket = socket.unwrap_or_else(|| {
-        let root = root.unwrap_or_else(||
-            // The same default the host binary serves; a mismatched
-            // root fails at connect with the endpoint missing, which
-            // is the honest error.
+        let root = root.unwrap_or_else(|| {
             default_data_root().unwrap_or_else(|err| {
                 eprintln!("mcp-dictation: {err}");
                 std::process::exit(1);
-            }));
+            })
+        });
         platform::socket_path(&platform::default_runtime_dir(), &root)
     });
 
-    // Connect with a short bounded retry: the agent may start this
-    // server in the same breath as the host.
+    // The agent may start this server in the same breath as the host.
     let client = {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
@@ -141,8 +121,6 @@ fn main() {
     };
     let client = Arc::new(client);
 
-    // The allowlist gate, before a single tool call: a client that is
-    // not allowlisted fails fast with the refusal on stderr.
     if let Err(err) = client.agent_hello(&client_name, &token) {
         eprintln!(
             "mcp-dictation: the host refused client {client_name:?}: {err}; \
@@ -151,58 +129,32 @@ fn main() {
         std::process::exit(1);
     }
 
-    let server = McpServer::new();
-    // A `Stdout` handle (not a lock guard) crosses the thread; the
-    // writer thread is the process's only stdout writer, so per-call
-    // internal locking still leaves every line atomic. Diagnostics go
-    // to stderr — stdout belongs to the protocol alone.
-    let writer = server.spawn_writer(std::io::stdout());
+    let server = McpServer::new(std::io::stdout());
 
-    // The completion pump: host ask results → JSON-RPC tool results.
-    // On connection loss every pending call fails honestly and the
-    // server keeps serving (initialize/tools/list need no host).
-    let pump = {
+    // Host results → tool results. If the host connection dies, pending
+    // calls fail and later ones are refused, but the session goes on.
+    {
         let server = server.clone();
         let client = Arc::clone(&client);
         std::thread::Builder::new()
-            .name("starling-mcp-drain".to_string())
+            .name("starling-mcp-results".to_string())
             .spawn(move || loop {
                 match client.recv_ask_timeout(Duration::from_millis(250)) {
                     Ok(result) => server.complete(&result.req, result.outcome),
-                    Err(starling_runtime::channel::RecvError::Timeout) => {
-                        if client.is_closed() {
-                            server.fail_pending(&client.close_reason());
-                            return;
-                        }
-                    }
-                    Err(starling_runtime::channel::RecvError::Closed) => {
+                    Err(RecvError::Timeout) if !client.is_closed() => {}
+                    Err(_) => {
                         server.fail_pending(&client.close_reason());
                         return;
                     }
                 }
             })
-            .expect("mcp drain spawn")
-    };
+            .expect("mcp results thread spawns");
+    }
 
-    let sink = HostSink {
-        client: Arc::clone(&client),
-    };
-    // stdin to EOF: answers everything; on return (EOF) every pending
-    // ask is cancelled — the deliberate disconnect rule.
+    let sink = HostSink { client };
     server.serve_read(BufReader::new(std::io::stdin().lock()), &sink);
-    server.cancel_pending(&sink, "the agent closed the MCP session");
-    // End the host connection explicitly (the drain thread holds its
-    // own client handle, so dropping this one would not): the host's
-    // broker sees the disconnect and aborts any take the cancels could
-    // not reach (the belt-and-braces pair of rules — see
-    // docs/mcp-dictation.md), and the drain thread's poll sees the
-    // connection closed and exits.
-    client.close();
-    // Drop the writer's sender so the writer thread drains its queue
-    // and exits too — without this both joins below would wait forever.
-    server.shutdown_writer();
-    let _ = pump.join();
-    let _ = writer.join();
+    // Stdin EOF: the agent ended the session. Exiting closes the host
+    // connection, and the host cancels this connection's asks.
     std::process::exit(0);
 }
 

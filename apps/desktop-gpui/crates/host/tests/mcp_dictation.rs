@@ -1,30 +1,6 @@
-//! The agent-dictation slice of issue #309, over the real IPC transport
-//! with the real host (`server::serve`), the scripted fake capture
-//! source, and the fake provider — no real audio, no real agent.
-//!
-//! What each acceptance from the issue is proven by:
-//!
-//! - **Visibility gate** — `capture_starts_only_after_the_app_acks_the_prompt`
-//!   and `no_ack_within_the_bound_fails_without_opening_the_mic`: the
-//!   microphone (the fake source's `started_takes`) opens only after
-//!   the app acked, and an un-acked ask fails `no_prompt_ack` with the
-//!   mic never touched.
-//! - **Ack binding (anti-forgery)** —
-//!   `a_forged_ack_from_a_connection_that_never_saw_the_prompt_is_ignored`
-//!   and `an_agent_connection_cannot_forge_prompt_frames`.
-//! - **Allowlist (default deny)** — `agent_hello_is_checked_against_the_allowlist`
-//!   and `asks_from_non_agent_connections_are_refused`.
-//! - **Queueing** — `concurrent_asks_queue_one_prompt_at_a_time` and
-//!   `a_duplicate_in_flight_ask_token_is_refused_with_duplicate_req`.
-//! - **Cancel** — `agent_cancel_mid_recording_stops_the_capture`.
-//! - **Timeout** — `timeout_mid_recording_returns_no_answer` and
-//!   `the_budget_ends_at_capture_stop_so_a_captured_take_survives_slow_transcription`.
-//! - **Disconnect** — `agent_disconnect_mid_recording_cancels_the_take`
-//!   (the deliberate rule: the ask dies with its connection).
-//! - **Early done** — `a_done_before_the_visibility_ack_is_ignored_not_failed`.
-//! - **The binary** — `the_stdio_server_exits_zero_promptly_on_stdin_eof`
-//!   (spawns the real `mcp-dictation` against the real host).
-//! - **End to end** — `a_spoken_answer_flows_back_as_the_tool_result`.
+//! The agent-dictation ask surface over the real IPC transport and the
+//! real host, with the scripted fake capture source and fake provider.
+//! `started_takes` on the fake source is the microphone.
 
 use std::io::Write;
 use std::path::Path;
@@ -59,8 +35,7 @@ fn host_config(
     source: Arc<FakeCaptureSource>,
     provider: Arc<FakeProvider>,
 ) -> HostConfig {
-    let mut config = HostConfig::new(root, root.join("endpoints"))
-        .with_agent_allowlist(allowlist);
+    let mut config = HostConfig::new(root, root.join("endpoints")).with_agent_allowlist(allowlist);
     config.runtime = config
         .runtime
         .with_capture_source(source)
@@ -117,7 +92,10 @@ fn until_ask(client: &HostClient, req: &str) -> AskOutcome {
     loop {
         match client.recv_ask_timeout(Duration::from_millis(20)) {
             Ok(result) if result.req == req => return result.outcome,
-            Ok(other) => panic!("ask {req}: got a result for {} first: {:?}", other.req, other.outcome),
+            Ok(other) => panic!(
+                "ask {req}: got a result for {} first: {:?}",
+                other.req, other.outcome
+            ),
             Err(RecvError::Timeout) => {
                 assert!(Instant::now() < deadline, "timed out waiting for ask {req}");
             }
@@ -207,13 +185,24 @@ fn a_spoken_answer_flows_back_as_the_tool_result() {
     let agent = agent(&path);
 
     agent
-        .ask_user("1", &["Should I fix the parser or the writer?".into()], 30_000)
+        .ask_user(
+            "1",
+            &["Should I fix the parser or the writer?".into()],
+            30_000,
+        )
         .expect("ask sent");
 
     // The prompt reaches the app with the questions intact.
-    let shown = until_ui(&app, "ShowPrompt", |frame| matches!(frame, UiWire::Show { .. }));
-    let UiWire::Show { questions, .. } = &shown else { unreachable!() };
-    assert_eq!(questions, &["Should I fix the parser or the writer?".to_string()]);
+    let shown = until_ui(&app, "ShowPrompt", |frame| {
+        matches!(frame, UiWire::Show { .. })
+    });
+    let UiWire::Show { questions, .. } = &shown else {
+        unreachable!()
+    };
+    assert_eq!(
+        questions,
+        &["Should I fix the parser or the writer?".to_string()]
+    );
 
     // Before the ack: no capture has been started.
     assert!(
@@ -222,12 +211,16 @@ fn a_spoken_answer_flows_back_as_the_tool_result() {
     );
 
     app.prompt_ack(&ask_id_of(&shown), true).unwrap();
-    until_event(&app, "capture.started", |e| e.type_name() == "capture.started");
+    until_event(&app, "capture.started", |e| {
+        e.type_name() == "capture.started"
+    });
     assert_eq!(source.started_takes.lock().unwrap().len(), 1);
 
     // The user finishes speaking; the host stops, persists, transcribes.
     app.prompt_done(&ask_id_of(&shown)).unwrap();
-    until_event(&app, "jobs.completed", |e| e.type_name() == "jobs.completed");
+    until_event(&app, "jobs.completed", |e| {
+        e.type_name() == "jobs.completed"
+    });
 
     match until_ask(&agent, "1") {
         AskOutcome::Answered { text, backend } => {
@@ -237,7 +230,9 @@ fn a_spoken_answer_flows_back_as_the_tool_result() {
         other => panic!("expected the spoken answer, got {other:?}"),
     }
     // The overlay is cleared on every resolution.
-    until_ui(&app, "HidePrompt", |frame| matches!(frame, UiWire::Hide { .. }));
+    until_ui(&app, "HidePrompt", |frame| {
+        matches!(frame, UiWire::Hide { .. })
+    });
 
     host.shutdown();
 }
@@ -251,13 +246,14 @@ fn no_ack_within_the_bound_fails_without_opening_the_mic() {
 
     let app = connect(&path);
     let agent = agent(&path);
-    // Short timeout: the ack bound clamps to the remaining budget, so
-    // this also exercises the bound, not just the overall timeout.
+    // A timeout below the ack bound clamps the bound to it.
+    let asked = Instant::now();
     agent
         .ask_user("1", &["Ready?".into()], 1_500)
         .expect("ask sent");
-    until_ui(&app, "ShowPrompt", |frame| matches!(frame, UiWire::Show { .. }));
-    // No ack. Ever.
+    until_ui(&app, "ShowPrompt", |frame| {
+        matches!(frame, UiWire::Show { .. })
+    });
 
     match until_ask(&agent, "1") {
         AskOutcome::Error { code, message } => {
@@ -266,6 +262,11 @@ fn no_ack_within_the_bound_fails_without_opening_the_mic() {
         }
         other => panic!("expected the visibility-gate failure, got {other:?}"),
     }
+    assert!(
+        asked.elapsed() >= Duration::from_millis(1_400),
+        "the prompt got its whole bound, not part of it: {:?}",
+        asked.elapsed()
+    );
     assert!(
         source.started_takes.lock().unwrap().is_empty(),
         "an un-acked prompt must never open the microphone"
@@ -287,7 +288,9 @@ fn capture_starts_only_after_the_app_acks_the_prompt() {
     let app = connect(&path);
     let agent = agent(&path);
     agent.ask_user("1", &["Ready?".into()], 20_000).unwrap();
-    let shown = until_ui(&app, "ShowPrompt", |frame| matches!(frame, UiWire::Show { .. }));
+    let shown = until_ui(&app, "ShowPrompt", |frame| {
+        matches!(frame, UiWire::Show { .. })
+    });
 
     // Give the broker every chance to misbehave, then assert it did
     // not: 250 ms of an un-acked prompt must not open the mic.
@@ -296,7 +299,9 @@ fn capture_starts_only_after_the_app_acks_the_prompt() {
     assert_eq!(capture_state(&app), "Idle");
 
     app.prompt_ack(&ask_id_of(&shown), true).unwrap();
-    until_event(&app, "capture.started", |e| e.type_name() == "capture.started");
+    until_event(&app, "capture.started", |e| {
+        e.type_name() == "capture.started"
+    });
     assert_eq!(source.started_takes.lock().unwrap().len(), 1);
 
     // Wind the take down cleanly.
@@ -318,7 +323,9 @@ fn an_ask_without_any_app_connection_fails_fast() {
 
     // No app connects; only the agent.
     let agent = agent(&path);
-    agent.ask_user("1", &["Anyone there?".into()], 20_000).unwrap();
+    agent
+        .ask_user("1", &["Anyone there?".into()], 20_000)
+        .unwrap();
     match until_ask(&agent, "1") {
         AskOutcome::Error { code, message } => {
             assert_eq!(code, "no_prompt_ack", "{message}");
@@ -351,7 +358,9 @@ fn concurrent_asks_queue_one_prompt_at_a_time() {
     agent.ask_user("a", &["First?".into()], 30_000).unwrap();
     agent.ask_user("b", &["Second?".into()], 30_000).unwrap();
 
-    let first = until_ui(&app, "the first prompt", |frame| matches!(frame, UiWire::Show { .. }));
+    let first = until_ui(&app, "the first prompt", |frame| {
+        matches!(frame, UiWire::Show { .. })
+    });
     assert_eq!(
         match &first {
             UiWire::Show { questions, .. } => questions.first().map(String::as_str),
@@ -369,20 +378,26 @@ fn concurrent_asks_queue_one_prompt_at_a_time() {
     );
 
     app.prompt_ack(&ask_id_of(&first), true).unwrap();
-    until_event(&app, "capture.started", |e| e.type_name() == "capture.started");
+    until_event(&app, "capture.started", |e| {
+        e.type_name() == "capture.started"
+    });
     app.prompt_done(&ask_id_of(&first)).unwrap();
     match until_ask(&agent, "a") {
         AskOutcome::Answered { text, .. } => assert_eq!(text, "first answer"),
         other => panic!("first ask: {other:?}"),
     }
     // Only now does the second prompt appear.
-    let second = until_ui(&app, "the second prompt", |frame| matches!(frame, UiWire::Show { .. }));
+    let second = until_ui(&app, "the second prompt", |frame| {
+        matches!(frame, UiWire::Show { .. })
+    });
     assert!(
         ask_id_of(&second) != ask_id_of(&first),
         "each ask has its own broker-scoped id"
     );
     app.prompt_ack(&ask_id_of(&second), true).unwrap();
-    until_event(&app, "second capture.started", |e| e.type_name() == "capture.started");
+    until_event(&app, "second capture.started", |e| {
+        e.type_name() == "capture.started"
+    });
     app.prompt_done(&ask_id_of(&second)).unwrap();
     match until_ask(&agent, "b") {
         AskOutcome::Answered { text, .. } => assert_eq!(text, "second answer"),
@@ -403,10 +418,16 @@ fn agent_cancel_mid_recording_stops_the_capture() {
 
     let app = connect(&path);
     let agent = agent(&path);
-    agent.ask_user("1", &["Keep going?".into()], 30_000).unwrap();
-    let shown = until_ui(&app, "ShowPrompt", |frame| matches!(frame, UiWire::Show { .. }));
+    agent
+        .ask_user("1", &["Keep going?".into()], 30_000)
+        .unwrap();
+    let shown = until_ui(&app, "ShowPrompt", |frame| {
+        matches!(frame, UiWire::Show { .. })
+    });
     app.prompt_ack(&ask_id_of(&shown), true).unwrap();
-    until_event(&app, "capture.started", |e| e.type_name() == "capture.started");
+    until_event(&app, "capture.started", |e| {
+        e.type_name() == "capture.started"
+    });
     assert_eq!(capture_state(&app), "Recording");
 
     // The agent gives up mid-recording.
@@ -422,7 +443,9 @@ fn agent_cancel_mid_recording_stops_the_capture() {
         std::thread::sleep(Duration::from_millis(20));
     }
     assert_eq!(source.started_takes.lock().unwrap().len(), 1);
-    until_ui(&app, "HidePrompt", |frame| matches!(frame, UiWire::Hide { .. }));
+    until_ui(&app, "HidePrompt", |frame| {
+        matches!(frame, UiWire::Hide { .. })
+    });
 
     host.shutdown();
 }
@@ -439,9 +462,13 @@ fn timeout_mid_recording_returns_no_answer() {
     // A budget that expires mid-recording (the fake take records
     // forever until stopped).
     agent.ask_user("1", &["Ready?".into()], 1_500).unwrap();
-    let shown = until_ui(&app, "ShowPrompt", |frame| matches!(frame, UiWire::Show { .. }));
+    let shown = until_ui(&app, "ShowPrompt", |frame| {
+        matches!(frame, UiWire::Show { .. })
+    });
     app.prompt_ack(&ask_id_of(&shown), true).unwrap();
-    until_event(&app, "capture.started", |e| e.type_name() == "capture.started");
+    until_event(&app, "capture.started", |e| {
+        e.type_name() == "capture.started"
+    });
 
     match until_ask(&agent, "1") {
         AskOutcome::NoAnswer { reason } => assert_eq!(reason, NoAnswerReason::Timeout),
@@ -452,7 +479,11 @@ fn timeout_mid_recording_returns_no_answer() {
         assert!(Instant::now() < deadline, "capture never returned to Idle");
         std::thread::sleep(Duration::from_millis(20));
     }
-    assert_eq!(source.started_takes.lock().unwrap().len(), 1, "one open, then aborted");
+    assert_eq!(
+        source.started_takes.lock().unwrap().len(),
+        1,
+        "one open, then aborted"
+    );
 
     host.shutdown();
 }
@@ -467,9 +498,13 @@ fn user_dismissal_mid_recording_returns_no_answer() {
     let app = connect(&path);
     let agent = agent(&path);
     agent.ask_user("1", &["Ready?".into()], 30_000).unwrap();
-    let shown = until_ui(&app, "ShowPrompt", |frame| matches!(frame, UiWire::Show { .. }));
+    let shown = until_ui(&app, "ShowPrompt", |frame| {
+        matches!(frame, UiWire::Show { .. })
+    });
     app.prompt_ack(&ask_id_of(&shown), true).unwrap();
-    until_event(&app, "capture.started", |e| e.type_name() == "capture.started");
+    until_event(&app, "capture.started", |e| {
+        e.type_name() == "capture.started"
+    });
 
     // The app dismisses the prompt mid-take.
     app.prompt_ack(&ask_id_of(&shown), false).unwrap();
@@ -501,10 +536,16 @@ fn agent_disconnect_mid_recording_cancels_the_take() {
     let app = connect(&path);
     {
         let agent = agent(&path);
-        agent.ask_user("1", &["Still there?".into()], 30_000).unwrap();
-        let shown = until_ui(&app, "ShowPrompt", |frame| matches!(frame, UiWire::Show { .. }));
+        agent
+            .ask_user("1", &["Still there?".into()], 30_000)
+            .unwrap();
+        let shown = until_ui(&app, "ShowPrompt", |frame| {
+            matches!(frame, UiWire::Show { .. })
+        });
         app.prompt_ack(&ask_id_of(&shown), true).unwrap();
-        until_event(&app, "capture.started", |e| e.type_name() == "capture.started");
+        until_event(&app, "capture.started", |e| {
+            e.type_name() == "capture.started"
+        });
         // EOF: the agent process dies mid-recording.
         drop(agent);
     }
@@ -514,7 +555,10 @@ fn agent_disconnect_mid_recording_cancels_the_take() {
     });
     let deadline = Instant::now() + Duration::from_secs(5);
     while capture_state(&app) != "Idle" {
-        assert!(Instant::now() < deadline, "a disconnected agent's take kept the mic open");
+        assert!(
+            Instant::now() < deadline,
+            "a disconnected agent's take kept the mic open"
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
     assert_eq!(source.started_takes.lock().unwrap().len(), 1);
@@ -523,9 +567,51 @@ fn agent_disconnect_mid_recording_cancels_the_take() {
     source.push(FakeTakeScript::clean());
     let agent = agent(&path);
     agent.ask_user("2", &["Again?".into()], 30_000).unwrap();
-    let shown = until_ui(&app, "the follow-up prompt", |frame| matches!(frame, UiWire::Show { .. }));
+    let shown = until_ui(&app, "the follow-up prompt", |frame| {
+        matches!(frame, UiWire::Show { .. })
+    });
     app.prompt_ack(&ask_id_of(&shown), true).unwrap();
-    until_event(&app, "capture.started again", |e| e.type_name() == "capture.started");
+    until_event(&app, "capture.started again", |e| {
+        e.type_name() == "capture.started"
+    });
+
+    host.shutdown();
+}
+
+#[test]
+fn app_disconnect_mid_recording_cancels_the_take() {
+    // With the acking app gone no visible prompt is left, so the take
+    // must stop instead of running to the budget.
+    let root = tempfile::tempdir().unwrap();
+    let source = one_clean_take();
+    let provider = FakeProvider::new(vec![]);
+    let (mut host, path) = boot(root.path(), source.clone(), provider);
+
+    let observer = connect(&path);
+    let agent = agent(&path);
+    {
+        let app = connect(&path);
+        agent
+            .ask_user("1", &["Still there?".into()], 60_000)
+            .unwrap();
+        let shown = until_ui(&app, "ShowPrompt", |frame| {
+            matches!(frame, UiWire::Show { .. })
+        });
+        app.prompt_ack(&ask_id_of(&shown), true).unwrap();
+        until_event(&app, "capture.started", |e| {
+            e.type_name() == "capture.started"
+        });
+    }
+
+    match until_ask(&agent, "1") {
+        AskOutcome::NoAnswer { reason } => assert_eq!(reason, NoAnswerReason::UserCancelled),
+        other => panic!("expected the dismissal, got {other:?}"),
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while capture_state(&observer) != "Idle" {
+        assert!(Instant::now() < deadline, "the take outlived its prompt");
+        std::thread::sleep(Duration::from_millis(20));
+    }
 
     host.shutdown();
 }
@@ -536,8 +622,13 @@ fn agent_hello_is_checked_against_the_allowlist() {
     let source = one_clean_take();
     let provider = FakeProvider::new(vec![]);
     let allowlist = allowlist_at(root.path());
-    let mut host = serve(host_config(root.path(), Some(allowlist), source.clone(), provider.clone()))
-        .expect("host serves");
+    let mut host = serve(host_config(
+        root.path(),
+        Some(allowlist),
+        source.clone(),
+        provider.clone(),
+    ))
+    .expect("host serves");
     let path = host.socket_path().to_path_buf();
 
     // Unknown client: refused, connection closed, default deny.
@@ -558,7 +649,8 @@ fn agent_hello_is_checked_against_the_allowlist() {
 
     // And with no allowlist configured at all, nobody is admitted.
     let root2 = tempfile::tempdir().unwrap();
-    let mut host2 = serve(host_config(root2.path(), None, source.clone(), provider)).expect("host serves");
+    let mut host2 =
+        serve(host_config(root2.path(), None, source.clone(), provider)).expect("host serves");
     let denied = connect(host2.socket_path());
     assert!(
         denied.agent_hello(CLIENT, TOKEN).is_err(),
@@ -617,9 +709,7 @@ fn invalid_asks_are_answered_with_typed_errors() {
         other => panic!("blank question: {other:?}"),
     }
     // An oversized question.
-    agent
-        .ask_user("o", &["x".repeat(2_001)], 10_000)
-        .unwrap();
+    agent.ask_user("o", &["x".repeat(2_001)], 10_000).unwrap();
     match until_ask(&agent, "o") {
         AskOutcome::Error { code, .. } => assert_eq!(code, "invalid_questions"),
         other => panic!("oversized question: {other:?}"),
@@ -648,7 +738,9 @@ fn a_burst_of_asks_overflows_the_queue_with_a_typed_error() {
     let agent = agent(&path);
     // One live (un-acked) ask…
     agent.ask_user("live", &["Held?".into()], 30_000).unwrap();
-    let held = until_ui(&app, "the held prompt", |frame| matches!(frame, UiWire::Show { .. }));
+    let held = until_ui(&app, "the held prompt", |frame| {
+        matches!(frame, UiWire::Show { .. })
+    });
     // …then the queue's full worth of waiting asks…
     for index in 0..4 {
         agent
@@ -656,7 +748,9 @@ fn a_burst_of_asks_overflows_the_queue_with_a_typed_error() {
             .unwrap();
     }
     // …and one past the bound: refused immediately and typed.
-    agent.ask_user("overflow", &["One too many?".into()], 30_000).unwrap();
+    agent
+        .ask_user("overflow", &["One too many?".into()], 30_000)
+        .unwrap();
     match until_ask(&agent, "overflow") {
         AskOutcome::Error { code, message } => {
             assert_eq!(code, "queue_full", "{message}");
@@ -670,7 +764,9 @@ fn a_burst_of_asks_overflows_the_queue_with_a_typed_error() {
         AskOutcome::NoAnswer { reason } => assert_eq!(reason, NoAnswerReason::Declined),
         other => panic!("decline: {other:?}"),
     }
-    until_ui(&app, "the first queued prompt", |frame| matches!(frame, UiWire::Show { .. }));
+    until_ui(&app, "the first queued prompt", |frame| {
+        matches!(frame, UiWire::Show { .. })
+    });
 
     host.shutdown();
 }
@@ -687,7 +783,9 @@ fn late_prompt_frames_for_resolved_asks_are_ignored() {
     let app = connect(&path);
     let agent = agent(&path);
     agent.ask_user("1", &["First?".into()], 5_000).unwrap();
-    let shown = until_ui(&app, "the prompt", |frame| matches!(frame, UiWire::Show { .. }));
+    let shown = until_ui(&app, "the prompt", |frame| {
+        matches!(frame, UiWire::Show { .. })
+    });
     app.prompt_ack(&ask_id_of(&shown), false).unwrap(); // declined → resolved
     match until_ask(&agent, "1") {
         AskOutcome::NoAnswer { reason } => assert_eq!(reason, NoAnswerReason::Declined),
@@ -700,9 +798,13 @@ fn late_prompt_frames_for_resolved_asks_are_ignored() {
 
     // A fresh ask flows normally.
     agent.ask_user("2", &["Second?".into()], 20_000).unwrap();
-    let shown = until_ui(&app, "the second prompt", |frame| matches!(frame, UiWire::Show { .. }));
+    let shown = until_ui(&app, "the second prompt", |frame| {
+        matches!(frame, UiWire::Show { .. })
+    });
     app.prompt_ack(&ask_id_of(&shown), true).unwrap();
-    until_event(&app, "capture.started", |e| e.type_name() == "capture.started");
+    until_event(&app, "capture.started", |e| {
+        e.type_name() == "capture.started"
+    });
     app.prompt_done(&ask_id_of(&shown)).unwrap();
     match until_ask(&agent, "2") {
         AskOutcome::Answered { text, .. } => assert_eq!(text, "fine"),
@@ -725,7 +827,9 @@ fn a_done_before_the_visibility_ack_is_ignored_not_failed() {
     let app = connect(&path);
     let agent = agent(&path);
     agent.ask_user("1", &["Ready?".into()], 20_000).unwrap();
-    let shown = until_ui(&app, "ShowPrompt", |frame| matches!(frame, UiWire::Show { .. }));
+    let shown = until_ui(&app, "ShowPrompt", |frame| {
+        matches!(frame, UiWire::Show { .. })
+    });
 
     // Done with no ack in sight.
     app.prompt_done(&ask_id_of(&shown)).unwrap();
@@ -760,7 +864,9 @@ fn a_forged_ack_from_a_connection_that_never_saw_the_prompt_is_ignored() {
     let app = connect(&path);
     let agent = agent(&path);
     agent.ask_user("1", &["Ready?".into()], 20_000).unwrap();
-    let shown = until_ui(&app, "ShowPrompt", |frame| matches!(frame, UiWire::Show { .. }));
+    let shown = until_ui(&app, "ShowPrompt", |frame| {
+        matches!(frame, UiWire::Show { .. })
+    });
 
     // Connected after the fan-out: never shown this prompt.
     let forger = connect(&path);
@@ -774,7 +880,9 @@ fn a_forged_ack_from_a_connection_that_never_saw_the_prompt_is_ignored() {
 
     // The honest ack from the connection that was shown the prompt.
     app.prompt_ack(&ask_id_of(&shown), true).unwrap();
-    until_event(&app, "capture.started", |e| e.type_name() == "capture.started");
+    until_event(&app, "capture.started", |e| {
+        e.type_name() == "capture.started"
+    });
     assert_eq!(source.started_takes.lock().unwrap().len(), 1);
     app.prompt_done(&ask_id_of(&shown)).unwrap();
     match until_ask(&agent, "1") {
@@ -799,14 +907,19 @@ fn an_agent_connection_cannot_forge_prompt_frames() {
     let app = connect(&path);
     let agent = agent(&path);
     agent.ask_user("1", &["Ready?".into()], 20_000).unwrap();
-    let shown = until_ui(&app, "ShowPrompt", |frame| matches!(frame, UiWire::Show { .. }));
+    let shown = until_ui(&app, "ShowPrompt", |frame| {
+        matches!(frame, UiWire::Show { .. })
+    });
 
     // The forged ack sends fine on the wire; the host's verdict
     // follows.
     agent.prompt_ack(&ask_id_of(&shown), true).unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     while !agent.is_closed() {
-        assert!(Instant::now() < deadline, "the host never refused the forged ack");
+        assert!(
+            Instant::now() < deadline,
+            "the host never refused the forged ack"
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
     assert!(agent.close_reason().contains("protocol_violation"));
@@ -830,7 +943,9 @@ fn a_duplicate_in_flight_ask_token_is_refused_with_duplicate_req() {
     let app = connect(&path);
     let agent = agent(&path);
     agent.ask_user("dup", &["Ready?".into()], 30_000).unwrap();
-    let shown = until_ui(&app, "the live prompt", |frame| matches!(frame, UiWire::Show { .. }));
+    let shown = until_ui(&app, "the live prompt", |frame| {
+        matches!(frame, UiWire::Show { .. })
+    });
 
     // The same token while the first is still in flight: refused with
     // the accurate code (a duplicate correlation token, not an
@@ -870,9 +985,13 @@ fn the_budget_ends_at_capture_stop_so_a_captured_take_survives_slow_transcriptio
     let app = connect(&path);
     let agent = agent(&path);
     agent.ask_user("1", &["Ready?".into()], 1_500).unwrap();
-    let shown = until_ui(&app, "ShowPrompt", |frame| matches!(frame, UiWire::Show { .. }));
+    let shown = until_ui(&app, "ShowPrompt", |frame| {
+        matches!(frame, UiWire::Show { .. })
+    });
     app.prompt_ack(&ask_id_of(&shown), true).unwrap();
-    until_event(&app, "capture.started", |e| e.type_name() == "capture.started");
+    until_event(&app, "capture.started", |e| {
+        e.type_name() == "capture.started"
+    });
     // The mic closes well before the budget expires.
     app.prompt_done(&ask_id_of(&shown)).unwrap();
 
@@ -887,9 +1006,6 @@ fn the_budget_ends_at_capture_stop_so_a_captured_take_survives_slow_transcriptio
 
 #[test]
 fn the_stdio_server_exits_zero_promptly_on_stdin_eof() {
-    // The exit contract: a graceful stdin EOF (the agent closing the
-    // session) must end the process — drain thread, writer thread and
-    // all — with status 0, not park it forever on joined threads.
     let root = tempfile::tempdir().unwrap();
     let source = one_clean_take();
     let provider = FakeProvider::new(vec![]);
@@ -901,7 +1017,6 @@ fn the_stdio_server_exits_zero_promptly_on_stdin_eof() {
         .arg(&path)
         .arg("--client")
         .arg(CLIENT)
-        // The preferred channel (argv would be world-readable).
         .env("STARLING_MCP_TOKEN", TOKEN)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -909,16 +1024,16 @@ fn the_stdio_server_exits_zero_promptly_on_stdin_eof() {
         .spawn()
         .expect("the mcp-dictation binary builds and spawns");
 
-    // One handshake line, then EOF: the agent closed the session.
     {
         let mut stdin = child.stdin.take().expect("stdin piped");
         writeln!(
             stdin,
-            r#"{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{}}}}"#
+            r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{}}}}"#
         )
         .unwrap();
     }
 
+    let mut child_stdout = child.stdout.take().expect("stdout piped");
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let _ = tx.send(child.wait());
@@ -928,6 +1043,12 @@ fn the_stdio_server_exits_zero_promptly_on_stdin_eof() {
         .expect("the server exited after stdin EOF instead of hanging")
         .expect("the wait itself succeeded");
     assert!(status.success(), "clean EOF exits 0, got {status:?}");
+    let mut stdout = String::new();
+    std::io::Read::read_to_string(&mut child_stdout, &mut stdout).unwrap();
+    let reply: serde_json::Value =
+        serde_json::from_str(stdout.lines().next().expect("the handshake was answered")).unwrap();
+    assert_eq!(reply["id"], 1);
+    assert!(reply["result"]["protocolVersion"].is_string(), "{reply}");
 
     host.shutdown();
 }

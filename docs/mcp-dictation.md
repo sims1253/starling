@@ -20,88 +20,56 @@ coding agent ──JSON-RPC 2.0 (stdio)── mcp-dictation
 ```
 
 There is exactly one tool: `ask_user_dictation(questions: string[],
-timeout_ms?: integer)`. It never reads history or documents — explicit
-sharing with agents is [#224]'s separate scope — and it never returns
-processed text: the answer is the finalized **raw** transcript (a
-processing mode would have to be selected through the existing
-processing configuration, which no host config wires to agent asks
-today; see *What is deliberately not here* below).
+timeout_ms?: integer)`. It never reads history or documents ([#224] is
+the separate explicit-sharing scope) and returns the finalized **raw**
+transcript.
 
 ## Protocol & safety model
 
-- **Prompt-visibility gate.** No agent can start the microphone without
-  a visible prompt. The host broker shows the questions to the app
-  connection (`ShowPrompt`) and sends `capture.start` **only after**
-  the app acks visibility (`PromptAck { visible: true }`). With no ack
-  within a bound (10 s, clamped by the ask's remaining budget) the ask
-  fails with the typed error `no_prompt_ack` and the mic is never
-  touched; with no app connection attached the ask fails immediately.
-  A prompt dismissed mid-take (`visible: false` after the take began)
-  stops the capture. Acks are **bound**: only a connection the prompt
-  was fanned out to may ack it, only the acking connection's later
-  frames (dismiss, done) count, and an agent-flagged connection
-  sending ack/done is closed as a protocol violation — an allowlisted
-  agent cannot forge the app side of the handshake to open the mic.
-- **Per-client allowlist, default deny.** MCP over stdio has no strong
-  client identity (whoever can spawn a process can speak the
-  protocol), so the boundary is a shared secret the *user* provisions:
-  `<data_root>/mcp-clients.json` names each agent client and its
-  token, and the same token is registered in the agent's MCP config
-  (passed via the `STARLING_MCP_TOKEN` environment variable — not on
-  the command line, which is world-readable through
-  `/proc/<pid>/cmdline`). The token rides the host's
-  same-user-authenticated IPC transport (UDS `SO_PEERCRED` / a DACL'd
-  named pipe), so it is not exposed cross-user; but this is a *user
-  intent* boundary (which agents may summon the mic), not a defense
-  against malware already running as the same user. Unknown client,
-  wrong token, or no allowlist file → the agent hello is refused
-  (`auth_failed`) and the connection closes. A malformed allowlist
-  file (including duplicate client names, which would silently
-  shadow) refuses host startup (fail closed, loudly).
-- **Queueing.** Concurrent `tools/call`s (and asks from several
-  agents) are serialized by the host broker: one visible prompt, one
-  live capture at a time; the rest wait in a bounded queue (4) and
-  past it are refused with `queue_full`. The timeout budget of a
-  queued ask starts when it is admitted (a queued ask shows no prompt,
-  so the user-facing clock starts when one could).
-- **Cancel.** An MCP `notifications/cancelled` (or the agent closing
-  stdin) cancels the ask: a live take is aborted (`capture.abort`),
-  the prompt hides, and the caller receives the typed no-answer
-  `agent_cancelled`.
-- **Timeout.** `timeout_ms` (default 120 000, bounds 1 000–600 000)
-  covers admission → prompt → speaking; it ends when the microphone
-  closes, so a captured take is never discarded on the clock —
-  persistence and transcription run to their own outcome (cancel,
-  disconnect, and shutdown still end them). While the prompt waits or
-  the mic is open, expiry aborts a live take and returns the typed
-  no-answer `timeout`.
-- **Disconnect.** An ask is bound to the connection that sent it: that
-  connection dying — EOF, crash, `kill -9` of the MCP server — cancels
-  its asks the same way an explicit cancel would. This rule is
-  enforced by the *host*, so it holds even when the MCP server process
-  is gone before it could say anything.
-- **No-answer vs error (the MCP mapping).** `Answered` returns the
-  transcript as plain text. A *completed* ask with no transcript
-  (timeout, agent cancel, user cancel, decline) returns
-  `isError: true` with a `"No answer: <reason>."` text — the choice is
-  deliberate: an error result can never be mistaken for spoken words.
-  Refusals and failures (not allowlisted, no prompt ack, queue full,
-  capture/transcription failed) return `isError: true` with
-  `"Error [<code>]: <message>."`. Malformed tool arguments are refused
-  with JSON-RPC `-32602`.
+- **Prompt-visibility gate.** The host shows the questions to the app
+  connections (`ShowPrompt`) and sends `capture.start` only after one
+  of them acks `PromptAck { visible: true }`. No ack within
+  `min(10 s, timeout_ms)` fails the ask with `no_prompt_ack` and the
+  microphone is never touched; with no app connected the ask fails
+  immediately. Only a connection the prompt was shown to may ack it,
+  only the acking connection may dismiss or finish it, and an agent
+  connection sending prompt frames is closed.
+- **Allowlist, default deny.** MCP over stdio has no client identity,
+  so the boundary is a token the user provisions in
+  `<data_root>/mcp-clients.json` and in the agent's MCP config (via
+  `STARLING_MCP_TOKEN`; argv is readable by other users). Unknown
+  client, wrong token, or no file → `auth_failed` and the connection
+  closes. A malformed file (including duplicate names) refuses host
+  startup. The token travels over the same-user-authenticated IPC
+  transport, so this decides *which agents may use the microphone*; it
+  does not defend against other processes running as the same user.
+- **Queueing.** Asks from any number of `tools/call`s or agents are
+  serialized: one prompt and one capture at a time, up to 4 waiting,
+  `queue_full` beyond that.
+- **Timeout.** `timeout_ms` (default 120 000, 1 000–600 000) runs from
+  when the ask leaves the queue until the microphone closes; expiry
+  aborts the take with the no-answer `timeout`. A captured take is
+  never discarded on the clock.
+- **Cancel and disconnect.** `notifications/cancelled`, or the MCP
+  server's host connection ending for any reason (including `kill -9`),
+  aborts the take with the no-answer `agent_cancelled`. The app
+  dismissing the prompt, or disconnecting, mid-take stops it with
+  `user_cancelled`.
+- **Result mapping.** An answer is returned as plain text. A no-answer
+  (timeout, cancel, decline) returns `isError: true` with
+  `"No answer: <reason>."` so it cannot be mistaken for spoken words.
+  Failures (no prompt ack, queue full, capture or transcription failed)
+  return `isError: true` with `"Error [<code>]: <message>."`. Malformed
+  arguments are JSON-RPC `-32602`.
 
 ## Setup
 
-You need: a running host (the desktop app, or `starling-runtime-host`),
-one token, and the agent registration. The MCP server is stdio-only on
-purpose — Claude Code's HTTP tool timeout is shorter than a human
-speaking.
+You need a running host (the desktop app, or `starling-runtime-host`),
+a token, and the agent registration.
 
-1. **Create the token and allow the client** — write
-   `<data_root>/mcp-clients.json` next to the host's storage v2 root
-   (the desktop app's data directory; the default root is what
-   `starling-runtime-host` serves with no `--root`). Use a fresh random
-   token, e.g. `openssl rand -hex 32`:
+1. **Allow the client.** Write `<data_root>/mcp-clients.json` in the
+   host's storage v2 root with a fresh random token per client (e.g.
+   `openssl rand -hex 32`):
 
    ```json
    {
@@ -113,16 +81,11 @@ speaking.
    }
    ```
 
-   Missing file = deny all (the unconfigured host serves; MCP clients
-   are refused). The file is read once at startup and never re-read —
-   rotating a token requires editing the file and restarting the host.
+   The file is read once at startup; restart the host after editing it.
 
 2. **Register the command with the agent.** The binary is
-   `mcp-dictation` from the desktop workspace
-   (`cargo build -p starling-runtime-host` in `apps/desktop-gpui`).
-   Pass the token through the `STARLING_MCP_TOKEN` environment
-   variable — not `--token` — so it stays out of the world-readable
-   command line.
+   `mcp-dictation` (`cargo build -p starling-runtime-host` in
+   `apps/desktop-gpui`).
 
    **Claude Code** (project or user scope):
 
@@ -156,31 +119,20 @@ speaking.
    ```
 
    The server derives the host endpoint from the default data root;
-   `--socket <path>` or `--root <dir>` override it. `--token` still
-   works as a fallback for throwaway setups. `--help` documents
-   everything.
-
-3. **Ask.** The agent now sees `ask_user_dictation`; the desktop app
-   shows the prompt (see the caveat below), the user speaks, the agent
-   gets the text.
+   `--socket <path>` or `--root <dir>` override it (see `--help`).
 
 ## What is deliberately not here
 
-- **HTTP transport.** stdio only (#309 notes Claude Code's HTTP tool
-  timeout is too short for speaking).
-- **App-side prompt polish.** The frame protocol (`ShowPrompt`,
-  `PromptAck`, `PromptDone`, `HidePrompt` in the host's IPC) and its
-  client API (`HostClient::recv_ui_timeout` / `prompt_ack` /
-  `prompt_done`) are the seam the GPUI overlay plugs into; the GPUI app
-  does not hold a `HostClient` yet (the E17 switchover is its own
-  increment), so today a connected client — a test, a tray helper —
-  plays the app side. Until the app implements the overlay, register
-  the ask surface only where you control the acking side.
-- **Processed output.** The tool returns the raw transcript; wiring a
-  processing mode (#294) into agent asks is follow-up work.
-- **Real-agent E2E.** The suites prove the host and MCP layers with
-  fake transport peers and the scripted capture source; a live Claude
-  Code / Codex session is the remaining acceptance check of #309.
+- **HTTP transport.** Claude Code's HTTP tool timeout is shorter than
+  a human speaking, so the server is stdio only.
+- **The app-side prompt.** The GPUI app does not hold a `HostClient`
+  yet, so nothing in the app shows prompts today. The seam is the
+  `ShowPrompt`/`PromptAck`/`PromptDone`/`HidePrompt` frames and
+  `HostClient::recv_ui_timeout`/`prompt_ack`/`prompt_done`; until the
+  overlay exists, some other client has to play the app side.
+- **Processed output** ([#294]).
+- **A live Claude Code / Codex session** as acceptance; the tests use
+  fake peers and the scripted capture source.
 
 [#292]: https://github.com/sims1253/starling/issues/292
 [#309]: https://github.com/sims1253/starling/issues/309

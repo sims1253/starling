@@ -59,13 +59,9 @@ pub struct HostConfig {
     /// leaves `runtime.provider` as configured — tests inject doubles
     /// there.
     pub engine: EngineChoice,
-    /// The MCP-agent allowlist file (issue #309): which named agent
-    /// clients may call `ask_user_dictation` on this host. `None` —
-    /// tests, and any host without the MCP surface — denies every agent
-    /// client (default deny). A missing file at a `Some` path is also
-    /// deny-all (the unconfigured host), while an unparseable one
-    /// refuses startup (`HostError::Allowlist`). The production binary
-    /// passes `<data_root>/mcp-clients.json`.
+    /// The agent allowlist file (see [`crate::agent::Allowlist`]).
+    /// `None` or a missing file denies every agent client; a malformed
+    /// file refuses startup.
     pub agent_allowlist: Option<PathBuf>,
     /// The runtime this host owns. Production builds pass
     /// [`HostConfig::production`]; tests inject doubles through the same
@@ -170,8 +166,7 @@ impl HostConfig {
         self
     }
 
-    /// Sets the MCP-agent allowlist file (issue #309); `None` (the
-    /// default) denies every agent client.
+    /// Sets the agent allowlist file.
     pub fn with_agent_allowlist(mut self, path: Option<PathBuf>) -> Self {
         self.agent_allowlist = path;
         self

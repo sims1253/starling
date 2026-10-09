@@ -112,25 +112,21 @@ impl EventWire {
     }
 }
 
-/// One app-side prompt frame off the wire (issue #309): the host
-/// asking this client to show (or stop showing) a dictation prompt.
+/// An app-side prompt frame: show or hide a dictation prompt.
 #[derive(Debug, Clone, PartialEq)]
 pub enum UiWire {
-    /// `Frame::ShowPrompt`: display the questions; the capture gate
-    /// opens only after the client answers
-    /// [`HostClient::prompt_ack`] with `visible: true`.
     Show {
         ask_id: String,
         questions: Vec<String>,
         timeout_ms: u64,
     },
-    /// `Frame::HidePrompt`: the ask ended (answered, cancelled, timed
-    /// out, failed) — clear the overlay.
-    Hide { ask_id: String, reason: String },
+    Hide {
+        ask_id: String,
+        reason: String,
+    },
 }
 
-/// One agent-side ask result off the wire (issue #309): the host's
-/// eventual answer to a `HostClient::ask_user`.
+/// The host's answer to a [`HostClient::ask_user`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct AskResultWire {
     pub req: String,
@@ -142,7 +138,6 @@ enum Reply {
     /// The receipt plus the `seq` the host routed the command under.
     Receipt(Result<Receipt, Rejection>, Option<u64>),
     Snapshot(Value),
-    /// The host's acceptance of an [`Frame::AgentHello`].
     AgentWelcome(String),
 }
 
@@ -181,11 +176,7 @@ pub struct HostClient {
     closer: Box<dyn TransportConn>,
     pending: Arc<Mutex<HashMap<String, Sender<Reply>>>>,
     events: Receiver<EventWire>,
-    /// App-side prompt frames (issue #309), delivered like events — the
-    /// GPUI app drains these on its UI thread.
     ui: Receiver<UiWire>,
-    /// Agent-side ask results (issue #309), delivered like events — the
-    /// MCP bridge drains these and answers its JSON-RPC requests.
     asks: Receiver<AskResultWire>,
     closed: Arc<AtomicBool>,
     close_reason: Arc<Mutex<Option<String>>>,
@@ -233,7 +224,14 @@ impl HostClient {
                 let close_reason = Arc::clone(&close_reason);
                 move || {
                     client_reader(
-                        conn, pending, event_tx, ui_tx, ask_tx, hello_tx, closed, close_reason,
+                        conn,
+                        pending,
+                        event_tx,
+                        ui_tx,
+                        ask_tx,
+                        hello_tx,
+                        closed,
+                        close_reason,
                     )
                 }
             })
@@ -394,20 +392,7 @@ impl HostClient {
             pending.insert(id.clone(), tx);
         }
         let result = (|| {
-            // Encode against the host's advertised cap so an oversized
-            // send is refused here, before any bytes hit the wire — a
-            // server-side refusal costs the whole connection.
-            let cap = usize::try_from(self.info.max_frame_bytes).unwrap_or(usize::MAX);
-            let wire = encode(&frame, cap)
-                .map_err(|err| ClientError::Protocol(format!("frame does not encode: {err:?}")))?;
-            {
-                use std::io::Write;
-                let mut writer = self.writer.lock().expect("writer lock");
-                writer
-                    .write_all(&wire)
-                    .and_then(|()| writer.flush())
-                    .map_err(|err| ClientError::Closed(format!("write failed: {err}")))?;
-            }
+            self.write_frame(&frame)?;
             match rx.recv_timeout(REPLY_TIMEOUT) {
                 Ok(reply) => interpret(reply),
                 Err(RecvError::Timeout) => Err(ClientError::Timeout),
@@ -418,6 +403,21 @@ impl HostClient {
         })();
         self.pending.lock().expect("pending map").remove(&id);
         result
+    }
+
+    fn write_frame(&self, frame: &Frame) -> Result<(), ClientError> {
+        // Encode against the host's advertised cap so an oversized
+        // send is refused here, before any bytes hit the wire — a
+        // server-side refusal costs the whole connection.
+        let cap = usize::try_from(self.info.max_frame_bytes).unwrap_or(usize::MAX);
+        let wire = encode(frame, cap)
+            .map_err(|err| ClientError::Protocol(format!("frame does not encode: {err:?}")))?;
+        use std::io::Write;
+        let mut writer = self.writer.lock().expect("writer lock");
+        writer
+            .write_all(&wire)
+            .and_then(|()| writer.flush())
+            .map_err(|err| ClientError::Closed(format!("write failed: {err}")))
     }
 
     /// The next event envelope, if one arrived within `timeout`
@@ -431,19 +431,12 @@ impl HostClient {
         self.events.try_recv()
     }
 
-    // ----------------------------------------------------------------- //
-    // The agent-dictation ask surface (issue #309). One connection is
-    // either an app (shows prompts: the ui stream) or an agent (asks
-    // questions: agent_hello + ask_user + the asks stream) — never
-    // both, and the hello decides which.
-    // ----------------------------------------------------------------- //
+    // An agent connection sends `agent_hello` then asks; an app
+    // connection receives prompts and answers them.
 
-    /// Identifies this connection as the named MCP agent client and
-    /// waits for the host's allowlist verdict. `Err(ClientError::Closed)`
-    /// carrying `auth_failed` is the default-deny refusal (unknown
-    /// client or wrong token — see the host's `agent` module for the
-    /// trust boundary). Once accepted, [`HostClient::ask_user`] is
-    /// legal on this connection.
+    /// Identifies this connection as an allowlisted agent client. A
+    /// refusal closes the connection (`ClientError::Closed` carrying
+    /// `auth_failed`).
     pub fn agent_hello(&self, client: &str, token: &str) -> Result<String, ClientError> {
         let req = new_id("agent");
         self.exchange_reply(
@@ -462,107 +455,65 @@ impl HostClient {
         )
     }
 
-    /// Sends one ask (a `tools/ccall` for `ask_user_dictation`, on the
-    /// far side of the MCP bridge): the questions to show, and the ask's
-    /// total `timeout_ms` budget. Fire-and-forget by design — the
-    /// answer is a human speaking, so it arrives on the asks stream
-    /// ([`HostClient::recv_ask_timeout`]) minutes later, keyed by this
-    /// same `req`.
+    /// Queues an ask. The answer arrives on
+    /// [`HostClient::recv_ask_timeout`] under the same `req`.
     pub fn ask_user(
         &self,
         req: &str,
         questions: &[String],
         timeout_ms: u64,
     ) -> Result<(), ClientError> {
-        self.send_unidirectional(Frame::AskUser {
+        self.send_unanswered(Frame::AskUser {
             req: req.to_string(),
             questions: questions.to_vec(),
             timeout_ms,
         })
     }
 
-    /// Cancels a queued or in-flight ask ([`HostClient::ask_user`]).
-    /// Stopping the microphone mid-take is the host's job once the
-    /// cancel lands.
     pub fn ask_cancel(&self, req: &str, reason: &str) -> Result<(), ClientError> {
-        self.send_unidirectional(Frame::AskCancel {
+        self.send_unanswered(Frame::AskCancel {
             req: req.to_string(),
             reason: reason.to_string(),
         })
     }
 
-    /// The app-side half of the prompt gate: answers a `UiWire::Show`
-    /// with whether the prompt is visible. `true` is what opens the
-    /// capture gate; `false` before capture declines the ask, and after
-    /// it cancels the take (the user dismissed the prompt).
+    /// Answers a [`UiWire::Show`]: `true` opens the capture gate,
+    /// `false` declines the ask or stops a running take.
     pub fn prompt_ack(&self, ask_id: &str, visible: bool) -> Result<(), ClientError> {
-        self.send_unidirectional(Frame::PromptAck {
+        self.send_unanswered(Frame::PromptAck {
             req: ask_id.to_string(),
             visible,
         })
     }
 
-    /// The app reporting the user finished speaking: the host stops the
-    /// capture, transcribes, and answers the asking agent.
+    /// The user finished speaking.
     pub fn prompt_done(&self, ask_id: &str) -> Result<(), ClientError> {
-        self.send_unidirectional(Frame::PromptDone {
+        self.send_unanswered(Frame::PromptDone {
             req: ask_id.to_string(),
         })
     }
 
-    /// The next app-side prompt frame, if one arrived within `timeout`.
     pub fn recv_ui_timeout(&self, timeout: Duration) -> Result<UiWire, RecvError> {
         self.ui.recv_timeout(timeout)
     }
 
-    /// Non-blocking prompt-frame poll.
     pub fn try_recv_ui(&self) -> Result<UiWire, RecvError> {
         self.ui.try_recv()
     }
 
-    /// The next agent-side ask result, if one arrived within `timeout`.
     pub fn recv_ask_timeout(&self, timeout: Duration) -> Result<AskResultWire, RecvError> {
         self.asks.recv_timeout(timeout)
     }
 
-    /// Writes a frame no reply will ever answer (the ask surface's
-    /// client→host frames either answer on their own streams or not at
-    /// all), refusing it locally when the connection is closed.
-    fn send_unidirectional(&self, frame: Frame) -> Result<(), ClientError> {
+    fn send_unanswered(&self, frame: Frame) -> Result<(), ClientError> {
         if self.closed.load(Ordering::SeqCst) {
             return Err(ClientError::Closed(self.close_reason()));
         }
-        let cap = usize::try_from(self.info.max_frame_bytes).unwrap_or(usize::MAX);
-        let wire =
-            encode(&frame, cap).map_err(|err| ClientError::Protocol(format!(
-                "frame does not encode: {err:?}"
-            )))?;
-        {
-            use std::io::Write;
-            let mut writer = self.writer.lock().expect("writer lock");
-            writer
-                .write_all(&wire)
-                .and_then(|()| writer.flush())
-                .map_err(|err| ClientError::Closed(format!("write failed: {err}")))?;
-        }
-        Ok(())
+        self.write_frame(&frame)
     }
 
     pub fn is_closed(&self) -> bool {
         self.closed.load(Ordering::SeqCst)
-    }
-
-    /// Ends both directions of the connection (idempotent): the
-    /// detached reader's blocking read returns, every stream reports
-    /// closed, and in-flight sends fail. [`Drop`] does the same; this
-    /// is for owners that share `Arc`s of the client and cannot rely
-    /// on the last drop happening (the MCP bridge's drain thread).
-    pub fn close(&self) {
-        // Through the dedicated `closer` handle, NOT the writer lock: a
-        // send parked in a blocking write holds that lock, and teardown
-        // must not wait behind a wedged host (the shutdown on the
-        // duplicate unblocks the parked write too — same socket).
-        let _ = self.closer.shutdown_both();
     }
 
     pub fn close_reason(&self) -> String {
@@ -577,8 +528,12 @@ impl HostClient {
 impl Drop for HostClient {
     fn drop(&mut self) {
         // End both directions so the detached reader thread's blocking
-        // read returns; it then drops the original handle.
-        self.close();
+        // read returns; it then drops the original handle. Through the
+        // dedicated `closer` handle, NOT the writer lock: a send parked
+        // in a blocking write holds that lock, and teardown must not
+        // wait behind a wedged host (the shutdown on the duplicate
+        // unblocks the parked write too — same socket).
+        let _ = self.closer.shutdown_both();
     }
 }
 
@@ -656,42 +611,40 @@ fn client_reader(
             Ok(Frame::AgentWelcome { req, client }) => {
                 deliver(&pending, &req, Reply::AgentWelcome(client));
             }
+            // Ask results and prompt frames are rare; a full channel
+            // means the owner stopped draining, so the connection fails
+            // like a slow event consumer would.
             Ok(Frame::AskResult { req, outcome }) => {
-                // The ask stream rides its own bounded channel; a full
-                // one means this client is not draining asks — the same
-                // slow-consumer posture as events, minus the backlog
-                // (asks are rare, one per spoken answer).
-                match asks.try_send(AskResultWire { req, outcome }) {
-                    Ok(()) => {}
-                    Err(TrySendError::Full(_)) | Err(TrySendError::Closed(_)) => {
-                        fail("ask results are not being drained; connection failed".to_string());
-                        break;
-                    }
+                if asks.try_send(AskResultWire { req, outcome }).is_err() {
+                    fail("ask results are not being drained; connection failed".to_string());
+                    break;
                 }
             }
-            Ok(Frame::ShowPrompt { req, questions, timeout_ms }) => {
-                match ui.try_send(UiWire::Show {
+            Ok(Frame::ShowPrompt {
+                req,
+                questions,
+                timeout_ms,
+            }) => {
+                let show = UiWire::Show {
                     ask_id: req,
                     questions,
                     timeout_ms,
-                }) {
-                    Ok(()) => {}
-                    Err(TrySendError::Full(_)) | Err(TrySendError::Closed(_)) => {
-                        fail("prompt frames are not being drained; connection failed".to_string());
-                        break;
-                    }
+                };
+                if ui.try_send(show).is_err() {
+                    fail("prompt frames are not being drained; connection failed".to_string());
+                    break;
                 }
             }
             Ok(Frame::HidePrompt { req, reason }) => {
-                match ui.try_send(UiWire::Hide {
-                    ask_id: req,
-                    reason,
-                }) {
-                    Ok(()) => {}
-                    Err(TrySendError::Full(_)) | Err(TrySendError::Closed(_)) => {
-                        fail("prompt frames are not being drained; connection failed".to_string());
-                        break;
-                    }
+                if ui
+                    .try_send(UiWire::Hide {
+                        ask_id: req,
+                        reason,
+                    })
+                    .is_err()
+                {
+                    fail("prompt frames are not being drained; connection failed".to_string());
+                    break;
                 }
             }
             Ok(Frame::Event { envelope }) => {
