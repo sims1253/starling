@@ -590,8 +590,9 @@ class VoiceInputService : InputMethodService() {
             if (!switchToPreviousInputMethod()) switchToNextInputMethod(false)
         } else {
             val token = window?.window?.attributes?.token ?: return
+            val manager = getSystemService(InputMethodManager::class.java) ?: return
             @Suppress("DEPRECATION")
-            getSystemService(InputMethodManager::class.java)?.switchToLastInputMethod(token)
+            if (!manager.switchToLastInputMethod(token)) manager.switchToNextInputMethod(token, false)
         }
     }
 

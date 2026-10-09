@@ -91,8 +91,9 @@ class RecognizeSpeechActivity : Activity() {
         doneButton.setOnClickListener { if (activeRecording != null) stopAndTranscribe() else finish() }
         cancelButton.setOnClickListener { cancel() }
         if (Build.VERSION.SDK_INT >= 33) {
-            // System Back on Android 13+ (and the predictive-back gesture)
-            // arrives here; onBackPressed below covers older releases.
+            // The activity opts in to OnBackInvokedCallback (manifest), so
+            // system Back and the predictive-back gesture on Android 13+
+            // arrive here; onBackPressed below covers older releases.
             onBackInvokedDispatcher.registerOnBackInvokedCallback(OnBackInvokedDispatcher.PRIORITY_DEFAULT) { cancel() }
         }
         setResult(RESULT_CANCELED)

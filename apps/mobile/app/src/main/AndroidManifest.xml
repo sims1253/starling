@@ -37,6 +37,7 @@
         <activity
             android:name=".RecognizeSpeechActivity"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|keyboard"
+            android:enableOnBackInvokedCallback="true"
             android:excludeFromRecents="true"
             android:exported="true"
             android:label="@string/recognition_service_name"
