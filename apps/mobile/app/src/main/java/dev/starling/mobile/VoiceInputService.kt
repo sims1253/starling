@@ -108,6 +108,7 @@ class VoiceInputService : InputMethodService() {
     private var modeList: LinearLayout? = null
     private var decisionRow: View? = null
     private var decisionView: TextView? = null
+    private var decisionUndo: Button? = null
     private var draftTools: View? = null
     private var viewToggle: Button? = null
     private val modelStateListener: (ModelLifetime.State) -> Unit = { renderModelState(it) }
@@ -163,7 +164,8 @@ class VoiceInputService : InputMethodService() {
         }
         copyButton?.setOnClickListener { copyReadyTranscript() }
         switchKeyboardButton?.setOnClickListener { switchToPreviousKeyboard() }
-        view.findViewById<Button>(R.id.keyboard_decision_undo).setOnClickListener {
+        decisionUndo = view.findViewById(R.id.keyboard_decision_undo)
+        decisionUndo?.setOnClickListener {
             take?.staged?.undoDecision()
             renderTake()
         }
@@ -733,7 +735,8 @@ class VoiceInputService : InputMethodService() {
      */
     private fun pressEditorAction(connection: InputConnection): Boolean {
         val info = currentInputEditorInfo ?: return false
-        if (info.actionLabel != null && info.actionId != 0) return connection.performEditorAction(info.actionId)
+        // A custom action the app labelled is its own, whatever its id (0 included).
+        if (info.actionLabel != null) return connection.performEditorAction(info.actionId)
         val action = info.imeOptions and EditorInfo.IME_MASK_ACTION
         if (action == EditorInfo.IME_ACTION_NONE || action == EditorInfo.IME_ACTION_UNSPECIFIED) return false
         return connection.performEditorAction(action)
@@ -967,6 +970,10 @@ class VoiceInputService : InputMethodService() {
         decisionRow?.visibility =
             if (decision != null && !current.capturing && !current.awaitingFinal) View.VISIBLE else View.GONE
         decisionView?.text = decision
+        // Undoing the literal escape means the word "literal" was meant.
+        decisionUndo?.setText(
+            if (staged?.decision == StagedTake.Decision.Literal) R.string.staging_undo_literal else R.string.staging_that_was_literal,
+        )
         if (staged != null) {
             val settled = !current.capturing && !current.awaitingFinal && !staged.busy
             transcriptView?.visibility = View.VISIBLE

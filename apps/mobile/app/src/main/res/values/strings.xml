@@ -120,6 +120,7 @@
     <string name="keyboard_stream_interrupted">Live transcription stopped: %1$s. Transcribing after stop.</string>
     <!-- Staged dictation (#302) -->
     <string name="staging_that_was_literal">That was literal</string>
+    <string name="staging_undo_literal">Keep “literal”</string>
     <string name="staging_delete_word">Delete word</string>
     <string name="staging_discard">Discard</string>
     <string name="staging_show_raw">Show raw</string>
