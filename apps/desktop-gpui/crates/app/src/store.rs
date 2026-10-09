@@ -31,6 +31,10 @@ pub(crate) struct ProcessingDoc {
     pub raw_attempt_id: String,
     pub raw_text: String,
     pub proposals: Vec<ProposalRow>,
+    /// The accepted proposal the head still derives from: set by the
+    /// head that accepted it, kept through later edits, cleared by a
+    /// raw head.
+    pub accepted_request: Option<String>,
 }
 
 /// What produced a proposal, pinned at request time for the correction
@@ -166,6 +170,24 @@ impl ProcessingDoc {
             .find(|row| row.rev_id == head_rev_id(id, document.head_revision))?;
         let raw = document.revisions.iter().find(|row| row.rev_id == head_rev_id(id, 1))?;
         let sources: HeadSources = serde_json::from_str(raw.sources_json.as_deref()?).ok()?;
+        let head_prefix = format!("{id}#h");
+        let mut heads: Vec<(u64, &RevisionRow)> = document
+            .revisions
+            .iter()
+            .filter_map(|row| Some((row.rev_id.strip_prefix(&head_prefix)?.parse().ok()?, row)))
+            .filter(|(revision, _)| *revision <= document.head_revision)
+            .collect();
+        heads.sort_by_key(|(revision, _)| *revision);
+        let accepted_request = heads.into_iter().fold(None, |active, (_, row)| {
+            if row.status == "raw" {
+                return None;
+            }
+            row.sources_json
+                .as_deref()
+                .and_then(|json| serde_json::from_str::<HeadSources>(json).ok())
+                .and_then(|sources| sources.request_id)
+                .or(active)
+        });
         let proposals = document
             .revisions
             .iter()
@@ -193,6 +215,7 @@ impl ProcessingDoc {
             raw_attempt_id: sources.attempt_id,
             raw_text: raw.text.clone(),
             proposals,
+            accepted_request,
         })
     }
 }
@@ -499,6 +522,7 @@ impl Store {
             raw_attempt_id: attempt_id.to_string(),
             raw_text: raw.to_string(),
             proposals: Vec::new(),
+            accepted_request: None,
         })
     }
 

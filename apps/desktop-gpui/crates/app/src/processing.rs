@@ -50,7 +50,6 @@ use starling_processing::staging::{
 };
 
 use crate::app::StarlingApp;
-use crate::staging::processed_request_id;
 use crate::store::{ProcessingDoc, ProposalOrigin, ProposalRow, RowStatus};
 
 const MODES_JSON: &str = include_str!("../modes/desktop-profiles.json");
@@ -413,6 +412,9 @@ pub(crate) struct TakeProcessing {
     pub state: ProcessingState,
     /// The used processed text, when the take's head is not raw.
     pub processed_head: Option<String>,
+    /// The accepted proposal the head derives from, until a decision
+    /// returns the head to raw.
+    pub accepted_request: Option<String>,
 }
 
 impl TakeProcessing {
@@ -436,6 +438,7 @@ impl TakeProcessing {
             label: latest.map(|row| row.label.clone()).unwrap_or_default(),
             state,
             processed_head: (!doc.head_is_raw).then(|| doc.head_text.clone()),
+            accepted_request: doc.accepted_request.clone(),
         }
     }
 }
@@ -677,15 +680,34 @@ fn locality_str(locality: Locality) -> &'static str {
     }
 }
 
-/// The correction record for one decision on `row`, a proposal of the
-/// take whose processing document is `doc`.
-fn correction_record_for(
-    id: &str,
-    doc: &ProcessingDoc,
-    row: &ProposalRow,
-    decision: CorrectionDecision,
-    final_text: Option<String>,
-) -> CorrectionRecord {
+/// A decision on one proposal as the user made it. The transcript, the
+/// resulting text and the time are captured here, not when the queued
+/// write runs.
+pub(crate) struct Decision {
+    request_id: String,
+    kind: CorrectionDecision,
+    final_text: String,
+    raw_attempt_id: String,
+    raw_text: String,
+    decided_utc: String,
+}
+
+impl Decision {
+    /// `kind` on proposal `request_id`, leaving the head at `draft`'s text.
+    pub(crate) fn of(draft: &Draft, request_id: &str, kind: CorrectionDecision) -> Option<Self> {
+        Some(Decision {
+            request_id: request_id.to_string(),
+            kind,
+            final_text: draft.text(),
+            raw_attempt_id: draft.attempts().first()?.attempt_id.clone(),
+            raw_text: draft.raw_text(),
+            decided_utc: now_iso(),
+        })
+    }
+}
+
+/// The correction record for `decision` on `row`, a proposal of take `id`.
+fn correction_record_for(id: &str, row: &ProposalRow, decision: Decision) -> CorrectionRecord {
     let origin = row.origin.as_ref();
     let timings = serde_json::json!({
         "queued_ms": origin.map(|o| o.queued_ms),
@@ -694,13 +716,13 @@ fn correction_record_for(
     });
     CorrectionRecord {
         capture_id: id.to_string(),
-        request_id: row.request_id.clone(),
-        raw_attempt_id: doc.raw_attempt_id.clone(),
-        raw_text: doc.raw_text.clone(),
+        request_id: decision.request_id,
+        raw_attempt_id: decision.raw_attempt_id,
+        raw_text: decision.raw_text,
         processed_text: row.text.clone(),
-        final_text,
-        decision,
-        decision_utc: now_iso(),
+        final_text: Some(decision.final_text),
+        decision: decision.kind,
+        decision_utc: decision.decided_utc,
         mode_id: origin.map(|o| o.mode_id.clone()),
         mode_version: origin.map(|o| o.mode_version),
         provider_id: origin.map(|o| o.provider_id.clone()),
@@ -737,16 +759,18 @@ impl StarlingApp {
     }
 
     fn set_processing(&mut self, id: &str, label: String, state: ProcessingState) {
-        let processed_head = self
+        let (processed_head, accepted_request) = self
             .processing
             .get(id)
-            .and_then(|take| take.processed_head.clone());
+            .map(|take| (take.processed_head.clone(), take.accepted_request.clone()))
+            .unwrap_or_default();
         self.processing.insert(
             id.to_string(),
             TakeProcessing {
                 label,
                 state,
                 processed_head,
+                accepted_request,
             },
         );
     }
@@ -1193,24 +1217,21 @@ impl StarlingApp {
         self.stop_instants.remove(id);
     }
 
-    /// Records the user's decision on proposal `request_id` of take `id`.
-    /// Without `row` in hand it is looked up in the stored processing
-    /// document; when neither the row nor the document (deleted or
-    /// re-transcribed take) is there, nothing is recorded.
+    /// Queues `decision` on take `id` for the correction records. `row`
+    /// is the proposal when the seam holds it; otherwise it is looked up
+    /// in the stored processing document, and nothing is recorded when it
+    /// is not there (deleted or re-transcribed take).
     pub(crate) fn record_correction_decision(
         &mut self,
         cx: &mut Context<Self>,
         id: &str,
         row: Option<ProposalRow>,
-        request_id: &str,
-        decision: CorrectionDecision,
-        final_text: Option<String>,
+        decision: Decision,
     ) {
         let Some(store) = self.store.clone() else {
             return;
         };
         let id = id.to_string();
-        let request_id = request_id.to_string();
         // Each write waits for the previous one, so a quickly revised
         // decision cannot be overwritten by the older one landing late.
         let previous = self.correction_chain.take();
@@ -1220,20 +1241,25 @@ impl StarlingApp {
             }
             let written = cx
                 .background_spawn(async move {
-                    let Ok(Some(doc)) = store.processing_doc(&id) else {
-                        return Ok(());
+                    let row = match row {
+                        Some(row) => row,
+                        None => {
+                            let Ok(Some(doc)) = store.processing_doc(&id) else {
+                                return Ok(());
+                            };
+                            let Some(row) = doc
+                                .proposals
+                                .into_iter()
+                                .find(|row| row.request_id == decision.request_id)
+                            else {
+                                return Ok(());
+                            };
+                            row
+                        }
                     };
-                    let row = row.or_else(|| {
-                        doc.proposals
-                            .iter()
-                            .find(|row| row.request_id == request_id)
-                            .cloned()
-                    });
-                    let Some(row) = row else {
-                        return Ok(());
-                    };
-                    let record = correction_record_for(&id, &doc, &row, decision, final_text);
-                    store.record_correction(&record).map(|_| ())
+                    store
+                        .record_correction(&correction_record_for(&id, &row, decision))
+                        .map(|_| ())
                 })
                 .await;
             if let Err(err) = written {
@@ -1294,14 +1320,7 @@ impl StarlingApp {
             .first()
             .map(|attempt| attempt.attempt_id.clone())
             .unwrap_or_default();
-        self.record_correction_decision(
-            cx,
-            id,
-            Some(row.clone()),
-            &row.request_id,
-            CorrectionDecision::Accepted,
-            Some(text.clone()),
-        );
+        let decision = Decision::of(draft, &row.request_id, CorrectionDecision::Accepted);
         let accepted = ProposalRow {
             status: RowStatus::Accepted,
             ..row
@@ -1312,8 +1331,12 @@ impl StarlingApp {
                 label,
                 state: ProcessingState::Idle,
                 processed_head: Some(text.clone()),
+                accepted_request: Some(accepted.request_id.clone()),
             },
         );
+        if let Some(decision) = decision {
+            self.record_correction_decision(cx, id, Some(accepted.clone()), decision);
+        }
         cx.notify();
         self.persist_head(
             store,
@@ -1337,9 +1360,6 @@ impl StarlingApp {
             cx.notify();
             return;
         };
-        // The processed region goes away with the revert; a revert of
-        // plain manual edits has none and decides nothing.
-        let reverted_request = processed_request_id(draft);
         if draft.revert_raw() != Outcome::Applied {
             return;
         }
@@ -1350,22 +1370,21 @@ impl StarlingApp {
             .first()
             .map(|attempt| attempt.attempt_id.clone())
             .unwrap_or_default();
+        let mut decision = None;
         if let Some(take) = self.processing.get_mut(id) {
             take.processed_head = None;
+            // A revert of plain manual edits has no accepted proposal and
+            // decides nothing.
+            decision = take.accepted_request.take().and_then(|request_id| {
+                Decision::of(draft, &request_id, CorrectionDecision::Reverted)
+            });
             if let ProcessingState::Proposal { current, .. } = &mut take.state {
                 *current = false;
             }
         }
         cx.notify();
-        if let Some(request_id) = reverted_request {
-            self.record_correction_decision(
-                cx,
-                id,
-                None,
-                &request_id,
-                CorrectionDecision::Reverted,
-                Some(text.clone()),
-            );
+        if let Some(decision) = decision {
+            self.record_correction_decision(cx, id, None, decision);
         }
         self.persist_head(
             store,
@@ -1392,10 +1411,10 @@ impl StarlingApp {
         else {
             return;
         };
-        if let Some(draft) = self.drafts.get_mut(id) {
+        let decision = self.drafts.get_mut(id).and_then(|draft| {
             draft.reject(&row.request_id);
-        }
-        let final_text = self.drafts.get(id).map(|draft| draft.text());
+            Decision::of(draft, &row.request_id, CorrectionDecision::Rejected)
+        });
         self.set_processing(id, label, ProcessingState::Idle);
         cx.notify();
         let id = id.to_string();
@@ -1403,14 +1422,9 @@ impl StarlingApp {
             status: RowStatus::Rejected,
             ..row
         };
-        self.record_correction_decision(
-            cx,
-            &id,
-            Some(rejected.clone()),
-            &rejected.request_id,
-            CorrectionDecision::Rejected,
-            final_text,
-        );
+        if let Some(decision) = decision {
+            self.record_correction_decision(cx, &id, Some(rejected.clone()), decision);
+        }
         cx.spawn(async move |this, cx| {
             let saved = cx
                 .background_spawn(async move { store.save_proposal(&id, &rejected) })
@@ -1902,6 +1916,7 @@ mod tests {
             raw_attempt_id: "a1".to_string(),
             raw_text: "um clean".to_string(),
             proposals: vec![row.clone()],
+            accepted_request: None,
         };
         let view = TakeProcessing::from_doc(&doc);
         assert_eq!(view.state, ProcessingState::Proposal { row, current: true });
@@ -1930,6 +1945,7 @@ mod tests {
                 stop_to_result_ms: None,
                 origin: None,
             }],
+            accepted_request: None,
         };
         assert!(matches!(
             TakeProcessing::from_doc(&doc).state,

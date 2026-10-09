@@ -364,10 +364,11 @@ pub struct CaptureRecord {
     pub status: CaptureStatus,
     pub retention_class: String,
     pub extra_json: Option<String>,
-    /// Captured against a secure/incognito input: such takes never get
+    /// Captured against a secure/incognito input, or recovered by
+    /// [`StoreV2::reconcile`] without its marker: such takes never get
     /// correction records ([`StoreV2::upsert_correction_record`]). The
-    /// desktop app has no secure-field capture path, so this is false
-    /// there; a keyboard/IME integration marks takes when recording.
+    /// desktop app has no secure-field capture path; a keyboard/IME
+    /// integration marks takes when recording.
     pub secure_field: bool,
 }
 
@@ -2047,7 +2048,8 @@ impl StoreV2 {
                 status: CaptureStatus::Interrupted,
                 retention_class: "standard".to_string(),
                 extra_json: None,
-                secure_field: false,
+                // The take's marker never reached disk: exclude it.
+                secure_field: true,
             };
             match self.get_capture(&id)? {
                 Some(existing) => {
@@ -2147,7 +2149,8 @@ impl StoreV2 {
                         status: CaptureStatus::Interrupted,
                         retention_class: "standard".to_string(),
                         extra_json: Some(merge_extra_note(None, &note)),
-                        secure_field: false,
+                        // The take's marker never reached disk: exclude it.
+                        secure_field: true,
                     };
                     self.commit_capture(&record)?;
                     report.orphan_sessions.push(id);
@@ -4611,6 +4614,7 @@ mod tests {
         let record = store.get_capture(&id).expect("get").expect("row");
         assert_eq!(record.status, CaptureStatus::Interrupted);
         assert_eq!(record.frame_count, 800, "only the verified prefix");
+        assert!(record.secure_field, "an unknown marker excludes the take");
         let audio = store.load_audio(&id).expect("load audio");
         assert!(audio.finalized, "recovery sealed a valid trailer");
         assert_eq!(audio.samples, confirmed);
@@ -4680,6 +4684,7 @@ mod tests {
         let record = store.get_capture(&id).expect("get").expect("orphan row");
         assert_eq!(record.status, CaptureStatus::Interrupted);
         assert_eq!(record.frame_count, 300);
+        assert!(record.secure_field, "an unknown marker excludes the take");
         let extra: serde_json::Value =
             serde_json::from_str(record.extra_json.as_deref().expect("note")).expect("parse");
         assert!(
@@ -7192,6 +7197,10 @@ mod tests {
         revised.decision = CorrectionDecision::Reverted;
         revised.decision_utc = "2026-09-24T10:02:00Z".to_string();
         revised.final_text = Some("um so hello there".to_string());
+        revised.raw_text = "changed raw".to_string();
+        revised.processed_text = "Changed.".to_string();
+        revised.mode_id = Some("other-mode".to_string());
+        revised.provider_model = Some("other-model".to_string());
         assert!(store.upsert_correction_record(&revised).expect("upsert"));
         let stored = store.correction_records_for(&id).expect("read");
         assert_eq!(
@@ -7202,7 +7211,10 @@ mod tests {
         assert_eq!(stored[0].decision, CorrectionDecision::Reverted);
         assert_eq!(stored[0].decision_utc, "2026-09-24T10:02:00Z");
         assert_eq!(stored[0].final_text.as_deref(), Some("um so hello there"));
+        assert_eq!(stored[0].raw_text, "um so hello there");
+        assert_eq!(stored[0].processed_text, "So, hello there.");
         assert_eq!(stored[0].mode_id.as_deref(), Some("clean-local"));
+        assert_eq!(stored[0].provider_model.as_deref(), Some("s1-mini"));
 
         // A second proposal of the same take is its own row.
         assert!(
