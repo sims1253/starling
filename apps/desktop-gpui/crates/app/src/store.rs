@@ -31,6 +31,24 @@ pub(crate) struct ProcessingDoc {
     pub raw_attempt_id: String,
     pub raw_text: String,
     pub proposals: Vec<ProposalRow>,
+    /// The accepted proposal the head derives from, as the head records it.
+    pub accepted_request: Option<String>,
+}
+
+/// What produced a proposal, pinned at request time for the correction
+/// records: the mode, the provider, and the pipeline's stage timings.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ProposalOrigin {
+    pub mode_id: String,
+    pub mode_version: u32,
+    pub provider_id: String,
+    pub provider_kind: String,
+    pub provider_model: String,
+    pub locality: String,
+    pub transform_kinds: Vec<String>,
+    pub language: Option<String>,
+    pub queued_ms: f64,
+    pub processing_ms: f64,
 }
 
 /// One processing result as stored: a proposal pinned to the head
@@ -45,6 +63,8 @@ pub(crate) struct ProposalRow {
     pub label: String,
     pub failure: Option<String>,
     pub stop_to_result_ms: Option<f64>,
+    /// `None` on rows written before provenance was recorded.
+    pub origin: Option<ProposalOrigin>,
 }
 
 /// The disposition of a stored processing result.
@@ -88,11 +108,14 @@ struct ProposalProvenance {
     label: String,
     failure: Option<String>,
     stop_to_result_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    origin: Option<ProposalOrigin>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct HeadSources {
     attempt_id: String,
+    /// The accepted proposal this head derives from.
     request_id: Option<String>,
 }
 
@@ -130,6 +153,7 @@ impl ProposalRow {
                 label: self.label.clone(),
                 failure: self.failure.clone(),
                 stop_to_result_ms: self.stop_to_result_ms,
+                origin: self.origin.clone(),
             })
             .ok(),
             disposition: Some("proposal".to_string()),
@@ -145,6 +169,12 @@ impl ProcessingDoc {
             .find(|row| row.rev_id == head_rev_id(id, document.head_revision))?;
         let raw = document.revisions.iter().find(|row| row.rev_id == head_rev_id(id, 1))?;
         let sources: HeadSources = serde_json::from_str(raw.sources_json.as_deref()?).ok()?;
+        let accepted_request = head
+            .sources_json
+            .as_deref()
+            .and_then(|json| serde_json::from_str::<HeadSources>(json).ok())
+            .and_then(|sources| sources.request_id)
+            .filter(|_| head.status != "raw");
         let proposals = document
             .revisions
             .iter()
@@ -161,6 +191,7 @@ impl ProcessingDoc {
                     label: provenance.label,
                     failure: provenance.failure,
                     stop_to_result_ms: provenance.stop_to_result_ms,
+                    origin: provenance.origin,
                 })
             })
             .collect();
@@ -171,6 +202,7 @@ impl ProcessingDoc {
             raw_attempt_id: sources.attempt_id,
             raw_text: raw.text.clone(),
             proposals,
+            accepted_request,
         })
     }
 }
@@ -209,6 +241,23 @@ impl Store {
     #[cfg(test)]
     pub(crate) fn at_test_root(root: &std::path::Path) -> Self {
         Self(Arc::new(Mutex::new(StoreV2::open(root).unwrap())))
+    }
+
+    /// A short silent take marked as captured against a secure field
+    /// (the desktop app has no such capture path).
+    #[cfg(test)]
+    pub(crate) fn save_secure_take(&self) -> String {
+        let mut meta = store_v2::TakeMeta::for_device("");
+        meta.secure_field = true;
+        let mut v2 = lock_v2(&self.0);
+        let mut take = v2.begin_take_at_rate(16_000, meta).unwrap();
+        take.append_and_seal(&[0.0; 160]).unwrap();
+        let finalized = take.finalize().unwrap();
+        finalized
+            .commit_marked(&mut v2, store_v2::CommitMark::Complete)
+            .unwrap()
+            .record
+            .id
     }
 
     /// Open the store at its default data root. This is the app's only
@@ -460,6 +509,7 @@ impl Store {
             raw_attempt_id: attempt_id.to_string(),
             raw_text: raw.to_string(),
             proposals: Vec::new(),
+            accepted_request: None,
         })
     }
 
@@ -498,6 +548,7 @@ impl Store {
         is_raw: bool,
         attempt_id: &str,
         accepted: Option<&ProposalRow>,
+        derived_from: Option<&str>,
     ) -> Result<(), storage::StorageError> {
         let store = lock_v2(&self.0);
         if store.get_capture(id).map_err(v2_err)?.is_none() {
@@ -512,13 +563,12 @@ impl Store {
         if current.is_none_or(|doc| doc.raw_attempt_id != attempt_id) {
             return Err(storage::StorageError::NotFound(id.to_string()));
         }
-        let request_id = accepted.map(|proposal| proposal.request_id.as_str());
         // The head and the proposal it accepted land together or not at
         // all, so a crash cannot leave an accepted head next to a live
         // proposal.
         let also: Vec<RevisionRow> = accepted.map(|proposal| proposal.to_row(id)).into_iter().collect();
         store
-            .commit_document_head_with(PROCESSING_DOC, revision, 0, &head_row(id, revision, text, is_raw, attempt_id, request_id), &also)
+            .commit_document_head_with(PROCESSING_DOC, revision, 0, &head_row(id, revision, text, is_raw, attempt_id, derived_from), &also)
             .map_err(v2_err)
     }
 
@@ -537,6 +587,41 @@ impl Store {
         store
             .record_insight_event(event_id, id, kind, occurred_at, payload_json)
             .map_err(v2_err)
+    }
+
+    /// Writes or revises one correction record; `Ok(false)` when the take
+    /// is excluded (secure field).
+    pub(crate) fn record_correction(
+        &self,
+        record: &store_v2::CorrectionRecord,
+    ) -> Result<bool, storage::StorageError> {
+        let store = lock_v2(&self.0);
+        store.upsert_correction_record(record).map_err(v2_err)
+    }
+
+    /// Revises the decision of an existing correction record; `Ok(false)`
+    /// when there is none.
+    pub(crate) fn revise_correction(
+        &self,
+        id: &str,
+        request_id: &str,
+        decision: store_v2::CorrectionDecision,
+        decision_utc: &str,
+        final_text: &str,
+    ) -> Result<bool, storage::StorageError> {
+        let store = lock_v2(&self.0);
+        store
+            .revise_correction_record(id, request_id, decision, decision_utc, final_text)
+            .map_err(v2_err)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn correction_records(
+        &self,
+        id: &str,
+    ) -> Result<Vec<store_v2::CorrectionRecord>, storage::StorageError> {
+        let store = lock_v2(&self.0);
+        store.correction_records_for(id).map_err(v2_err)
     }
 
     /// The startup recovery pass: reconcile journals against the metadata
@@ -912,6 +997,7 @@ mod tests {
             status,
             retention_class: "standard".to_string(),
             extra_json: extra.map(str::to_string),
+            secure_field: false,
         }
     }
 
@@ -1127,6 +1213,7 @@ mod tests {
             label: "S1-mini · this computer".to_string(),
             failure: None,
             stop_to_result_ms: Some(1234.5),
+            origin: None,
         }
     }
 
@@ -1141,7 +1228,7 @@ mod tests {
         let (attempt, raw) = store.latest_raw(&id).expect("raw").expect("final");
         store.start_processing_doc(&id, &attempt, &raw).expect("start");
         store
-            .commit_processing_head(&id, 2, "First take.", false, &attempt, None)
+            .commit_processing_head(&id, 2, "First take.", false, &attempt, None, None)
             .expect("accept");
         assert!(store.processing_doc(&id).expect("load").is_some());
         store.mark_attempt(&id, "starling:parakeet").expect("retry");
@@ -1168,7 +1255,7 @@ mod tests {
 
         let accepted = ProposalRow { status: RowStatus::Accepted, ..proposal("p1", 1, "So, hello there.") };
         store
-            .commit_processing_head(&id, 2, "So, hello there.", false, &attempt, Some(&accepted))
+            .commit_processing_head(&id, 2, "So, hello there.", false, &attempt, Some(&accepted), Some("p1"))
             .expect("accept");
         // A job's late write of the same proposal never demotes it.
         store.save_proposal(&id, &proposal("p1", 1, "So, hello there.")).expect("late write");
@@ -1215,6 +1302,47 @@ mod tests {
             Err(storage::StorageError::NotFound(_))
         ));
         assert!(lock_v2(&store.0).insight_events_for(&id).expect("events").is_empty());
+    }
+
+    #[test]
+    fn deleting_a_take_takes_its_correction_records_too() {
+        let store = v2_store("correction-delete");
+        let id = transcribed(&store, "um to be deleted");
+        let (attempt, raw) = store.latest_raw(&id).expect("raw").expect("final");
+        store
+            .start_processing_doc(&id, &attempt, &raw)
+            .expect("start");
+        let record = store_v2::CorrectionRecord {
+            capture_id: id.clone(),
+            request_id: "r1".to_string(),
+            raw_attempt_id: attempt.clone(),
+            raw_text: raw.clone(),
+            processed_text: "Deleted.".to_string(),
+            final_text: Some("Deleted.".to_string()),
+            decision: store_v2::CorrectionDecision::Accepted,
+            decision_utc: "2026-09-24T10:00:00Z".to_string(),
+            mode_id: None,
+            mode_version: None,
+            provider_id: None,
+            provider_kind: None,
+            provider_model: None,
+            locality: None,
+            transform_kinds: None,
+            language: None,
+            asr_backend: None,
+            asr_model_hash: None,
+            timings_json: None,
+            settings_strength: None,
+            extra_json: None,
+        };
+        assert!(store.record_correction(&record).expect("record"));
+        assert_eq!(store.correction_records(&id).expect("read").len(), 1);
+        store.delete(&id).expect("delete");
+        assert!(store.correction_records(&id).expect("read").is_empty());
+        assert!(matches!(
+            store.record_correction(&record),
+            Err(storage::StorageError::NotFound(_))
+        ));
     }
 
     #[test]

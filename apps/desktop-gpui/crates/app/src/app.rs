@@ -13,8 +13,8 @@ use std::{
 };
 
 use gpui::{
-    AppContext, ClipboardItem, Context, Entity, FocusHandle, Focusable, Pixels, Render, Subscription,
-    Timer, Window, div, prelude::*,
+    AppContext, ClipboardItem, Context, Entity, FocusHandle, Focusable, Pixels, Render,
+    Subscription, Task, Timer, Window, div, prelude::*,
 };
 use starling_dictation::{
     client::{self, StarlingClient},
@@ -494,6 +494,9 @@ pub struct StarlingApp {
     /// The latest playback-attenuation notice. Its own slot: the take
     /// lifecycle clears `error` and `take_notice` on every start/stop.
     pub(crate) playback_notice: Option<PlaybackNotice>,
+    /// The latest correction-decision write; each write awaits the one
+    /// before it so decisions land in the order they were made.
+    pub(crate) correction_chain: Option<Task<()>>,
     /// The settings dialog's dictation drafts (committed on save).
     pub(crate) draft_shortcut: Entity<TextField>,
     pub(crate) draft_activation: ActivationMode,
@@ -1088,6 +1091,7 @@ impl StarlingApp {
             key_interceptor: None,
             take_notice: None,
             playback_notice: None,
+            correction_chain: None,
             playing_id: None,
             playback_generation: 0,
             recorder: None,

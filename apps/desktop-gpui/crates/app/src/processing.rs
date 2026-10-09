@@ -31,6 +31,7 @@ use std::time::Instant;
 use gpui::{AppContext, Context};
 use starling_dictation::settings::ProcessingSettings;
 use starling_dictation::storage::{self, now_iso};
+use starling_dictation::store_v2::{CorrectionDecision, CorrectionRecord};
 use starling_processing::CancelToken;
 use starling_processing::contract::{
     ContextField, Failure, FailureReason, Locality, ModeEntry, ProcessingRoute, ProfilesDocument,
@@ -49,7 +50,7 @@ use starling_processing::staging::{
 };
 
 use crate::app::StarlingApp;
-use crate::store::{ProcessingDoc, ProposalRow, RowStatus};
+use crate::store::{ProcessingDoc, ProposalOrigin, ProposalRow, RowStatus};
 
 const MODES_JSON: &str = include_str!("../modes/desktop-profiles.json");
 
@@ -411,6 +412,9 @@ pub(crate) struct TakeProcessing {
     pub state: ProcessingState,
     /// The used processed text, when the take's head is not raw.
     pub processed_head: Option<String>,
+    /// The accepted proposal the head derives from, until a decision
+    /// returns the head to raw.
+    pub accepted_request: Option<String>,
 }
 
 impl TakeProcessing {
@@ -434,6 +438,7 @@ impl TakeProcessing {
             label: latest.map(|row| row.label.clone()).unwrap_or_default(),
             state,
             processed_head: (!doc.head_is_raw).then(|| doc.head_text.clone()),
+            accepted_request: doc.accepted_request.clone(),
         }
     }
 }
@@ -648,7 +653,90 @@ fn stored_row(
         label: label.to_string(),
         failure: result.failure.as_ref().map(|_| message.to_string()),
         stop_to_result_ms: result.timing.stop_to_result_ms,
+        origin: Some(ProposalOrigin {
+            mode_id: request.mode_id.clone(),
+            mode_version: request.mode_version,
+            provider_id: request.provider.id.clone(),
+            provider_kind: request.provider.kind.as_str().to_string(),
+            provider_model: request.provider.model.clone(),
+            locality: locality_str(request.provider.locality).to_string(),
+            transform_kinds: request
+                .kinds
+                .iter()
+                .map(|kind| kind.as_str().to_string())
+                .collect(),
+            language: request.language.clone(),
+            queued_ms: result.timing.queued_ms,
+            processing_ms: result.timing.processing_ms,
+        }),
     })
+}
+
+/// `Locality`'s wire spelling.
+fn locality_str(locality: Locality) -> &'static str {
+    match locality {
+        Locality::Local => "local",
+        Locality::Remote => "remote",
+    }
+}
+
+/// A decision on one proposal as the user made it. The transcript, the
+/// resulting text and the time are captured here, not when the queued
+/// write runs.
+pub(crate) struct Decision {
+    request_id: String,
+    kind: CorrectionDecision,
+    final_text: String,
+    raw_attempt_id: String,
+    raw_text: String,
+    decided_utc: String,
+}
+
+impl Decision {
+    /// `kind` on proposal `request_id`, leaving the head at `draft`'s text.
+    pub(crate) fn of(draft: &Draft, request_id: &str, kind: CorrectionDecision) -> Option<Self> {
+        Some(Decision {
+            request_id: request_id.to_string(),
+            kind,
+            final_text: draft.text(),
+            raw_attempt_id: draft.attempts().first()?.attempt_id.clone(),
+            raw_text: draft.raw_text(),
+            decided_utc: now_iso(),
+        })
+    }
+}
+
+/// The correction record for `decision` on `row`, a proposal of take `id`.
+fn correction_record_for(id: &str, row: &ProposalRow, decision: Decision) -> CorrectionRecord {
+    let origin = row.origin.as_ref();
+    let timings = serde_json::json!({
+        "queued_ms": origin.map(|o| o.queued_ms),
+        "processing_ms": origin.map(|o| o.processing_ms),
+        "stop_to_result_ms": row.stop_to_result_ms,
+    });
+    CorrectionRecord {
+        capture_id: id.to_string(),
+        request_id: decision.request_id,
+        raw_attempt_id: decision.raw_attempt_id,
+        raw_text: decision.raw_text,
+        processed_text: row.text.clone(),
+        final_text: Some(decision.final_text),
+        decision: decision.kind,
+        decision_utc: decision.decided_utc,
+        mode_id: origin.map(|o| o.mode_id.clone()),
+        mode_version: origin.map(|o| o.mode_version),
+        provider_id: origin.map(|o| o.provider_id.clone()),
+        provider_kind: origin.map(|o| o.provider_kind.clone()),
+        provider_model: origin.map(|o| o.provider_model.clone()),
+        locality: origin.map(|o| o.locality.clone()),
+        transform_kinds: origin.map(|o| serde_json::json!(o.transform_kinds).to_string()),
+        language: origin.and_then(|o| o.language.clone()),
+        asr_backend: None,
+        asr_model_hash: None,
+        timings_json: Some(timings.to_string()),
+        settings_strength: None,
+        extra_json: Some(serde_json::json!({ "label": row.label }).to_string()),
+    }
 }
 
 impl StarlingApp {
@@ -671,16 +759,18 @@ impl StarlingApp {
     }
 
     fn set_processing(&mut self, id: &str, label: String, state: ProcessingState) {
-        let processed_head = self
+        let (processed_head, accepted_request) = self
             .processing
             .get(id)
-            .and_then(|take| take.processed_head.clone());
+            .map(|take| (take.processed_head.clone(), take.accepted_request.clone()))
+            .unwrap_or_default();
         self.processing.insert(
             id.to_string(),
             TakeProcessing {
                 label,
                 state,
                 processed_head,
+                accepted_request,
             },
         );
     }
@@ -1127,6 +1217,58 @@ impl StarlingApp {
         self.stop_instants.remove(id);
     }
 
+    /// Queues `decision` on take `id` for the correction records: a new
+    /// record when the seam holds the proposal `row`, otherwise a revision
+    /// of the request's existing record (none there: nothing recorded).
+    pub(crate) fn record_correction_decision(
+        &mut self,
+        cx: &mut Context<Self>,
+        id: &str,
+        row: Option<ProposalRow>,
+        decision: Decision,
+    ) {
+        let Some(store) = self.store.clone() else {
+            return;
+        };
+        let id = id.to_string();
+        // Each write waits for the previous one, so a quickly revised
+        // decision cannot be overwritten by the older one landing late.
+        let previous = self.correction_chain.take();
+        let task = cx.spawn(async move |this, cx| {
+            if let Some(previous) = previous {
+                previous.await;
+            }
+            let written = cx
+                .background_spawn(async move {
+                    match row {
+                        Some(row) => {
+                            store.record_correction(&correction_record_for(&id, &row, decision))
+                        }
+                        None => store.revise_correction(
+                            &id,
+                            &decision.request_id,
+                            decision.kind,
+                            &decision.decided_utc,
+                            &decision.final_text,
+                        ),
+                    }
+                    .map(|_| ())
+                })
+                .await;
+            if let Err(err) = written {
+                if !matches!(err, storage::StorageError::NotFound(_)) {
+                    this.update(cx, |app, cx| {
+                        app.error =
+                            Some(format!("Could not record the correction decision: {err}"));
+                        cx.notify();
+                    })
+                    .ok();
+                }
+            }
+        });
+        self.correction_chain = Some(task);
+    }
+
     /// "Use processed": the proposal becomes the take's head, if it is
     /// still current (or the user forces a stale one).
     pub(crate) fn accept_processed(&mut self, id: &str, force: bool, cx: &mut Context<Self>) {
@@ -1171,6 +1313,7 @@ impl StarlingApp {
             .first()
             .map(|attempt| attempt.attempt_id.clone())
             .unwrap_or_default();
+        let decision = Decision::of(draft, &row.request_id, CorrectionDecision::Accepted);
         let accepted = ProposalRow {
             status: RowStatus::Accepted,
             ..row
@@ -1181,8 +1324,12 @@ impl StarlingApp {
                 label,
                 state: ProcessingState::Idle,
                 processed_head: Some(text.clone()),
+                accepted_request: Some(accepted.request_id.clone()),
             },
         );
+        if let Some(decision) = decision {
+            self.record_correction_decision(cx, id, Some(accepted.clone()), decision);
+        }
         cx.notify();
         self.persist_head(
             store,
@@ -1216,13 +1363,22 @@ impl StarlingApp {
             .first()
             .map(|attempt| attempt.attempt_id.clone())
             .unwrap_or_default();
+        let mut decision = None;
         if let Some(take) = self.processing.get_mut(id) {
             take.processed_head = None;
+            // A revert of plain manual edits has no accepted proposal and
+            // decides nothing.
+            decision = take.accepted_request.take().and_then(|request_id| {
+                Decision::of(draft, &request_id, CorrectionDecision::Reverted)
+            });
             if let ProcessingState::Proposal { current, .. } = &mut take.state {
                 *current = false;
             }
         }
         cx.notify();
+        if let Some(decision) = decision {
+            self.record_correction_decision(cx, id, None, decision);
+        }
         self.persist_head(
             store,
             id.to_string(),
@@ -1248,9 +1404,10 @@ impl StarlingApp {
         else {
             return;
         };
-        if let Some(draft) = self.drafts.get_mut(id) {
+        let decision = self.drafts.get_mut(id).and_then(|draft| {
             draft.reject(&row.request_id);
-        }
+            Decision::of(draft, &row.request_id, CorrectionDecision::Rejected)
+        });
         self.set_processing(id, label, ProcessingState::Idle);
         cx.notify();
         let id = id.to_string();
@@ -1258,6 +1415,9 @@ impl StarlingApp {
             status: RowStatus::Rejected,
             ..row
         };
+        if let Some(decision) = decision {
+            self.record_correction_decision(cx, &id, Some(rejected.clone()), decision);
+        }
         cx.spawn(async move |this, cx| {
             let saved = cx
                 .background_spawn(async move { store.save_proposal(&id, &rejected) })
@@ -1298,6 +1458,11 @@ impl StarlingApp {
         cx: &mut Context<Self>,
     ) {
         let accepted = self.staging_head_started(&id, revision, accepted);
+        let derived_from = self
+            .processing
+            .get(&id)
+            .and_then(|take| take.accepted_request.clone())
+            .filter(|_| !is_raw);
         cx.spawn(async move |this, cx| {
             let write_id = id.clone();
             let write_attempt = attempt_id.clone();
@@ -1310,6 +1475,7 @@ impl StarlingApp {
                         is_raw,
                         &write_attempt,
                         accepted.as_ref(),
+                        derived_from.as_deref(),
                     )
                 })
                 .await;
@@ -1740,6 +1906,7 @@ mod tests {
             label: "S1-mini · this computer".to_string(),
             failure: None,
             stop_to_result_ms: Some(900.0),
+            origin: None,
         };
         let doc = ProcessingDoc {
             head_revision: 1,
@@ -1748,6 +1915,7 @@ mod tests {
             raw_attempt_id: "a1".to_string(),
             raw_text: "um clean".to_string(),
             proposals: vec![row.clone()],
+            accepted_request: None,
         };
         let view = TakeProcessing::from_doc(&doc);
         assert_eq!(view.state, ProcessingState::Proposal { row, current: true });
@@ -1774,7 +1942,9 @@ mod tests {
                 label: String::new(),
                 failure: None,
                 stop_to_result_ms: None,
+                origin: None,
             }],
+            accepted_request: None,
         };
         assert!(matches!(
             TakeProcessing::from_doc(&doc).state,
