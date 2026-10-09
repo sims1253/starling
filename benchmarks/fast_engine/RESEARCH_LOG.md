@@ -828,7 +828,7 @@ validating the AMD pins on other AMD GPUs (measured on RENOIR only); and a
 Pixel A/B of `STARLING_FAST_ATTN_SPLIT=4` under the phone gates — the
 16-workgroup latency argument likely applies to the DXT too.
 
-## #325 prevention work (2026-10-03, branch `fix/325-device-lifetime`)
+## #325 prevention work (2026-10-03)
 
 ### P3-1: a wedge on in-process device re-creation — GPU rail ~0 mW while the fence hung
 
@@ -880,10 +880,9 @@ re-creation is not the trigger on this evidence; screen-off doze/suspend
 during GPU work is (n=1 on the failing side — a deliberate dozing repro is
 the next experiment, and risks a phone restart).
 
-Consequences landed: the app holds a partial wake lock for loads,
-transcriptions and the idle release (device teardown); bench sessions on
+Consequences landed: the app holds a partial wake lock around every use
+and free of the model (the free tears the device down); bench sessions on
 an unplugged phone must keep it awake (see the protocol).
-
 
 ### P3-3: deliberate doze repro — 3/3 dozing trials wedged, 2/2 awake clean
 
@@ -921,8 +920,8 @@ one-sided p = 1/C(17,4) ≈ 4·10⁻⁴). Trigger confirmed: GPU work submitted
 while the phone is allowed to suspend. The likely mechanism is a suspend/
 resume of the PowerVR stack losing an in-flight job or its completion —
 driver/firmware code we cannot fix. Prevention is to never let the phone
-suspend with GPU work outstanding: the app's partial wake lock (b340ad8)
-and the bench protocol's awake rule. `doze_repro.sh` is the upstream
+suspend with GPU work outstanding: the app's partial wake lock and the
+bench protocol's awake rule. `doze_repro.sh` is the upstream
 reproducer.
 
 Open: the A arm kept the screen on; the app's guard is a screen-off partial
@@ -968,8 +967,8 @@ setup plus the wake lock. Results:
 
 Consequences landed: every phone bench script (`android_bench.sh`,
 `phone_ab.sh`, `phone_gates.sh`, `phone_energy.sh`, `pixel_measure.sh`)
-holds the lock for the whole session (`phone_common.sh` `wake_hold` / `wake_release` /
-`wake_held`), and the protocol rule now names suspend. Open: the app's own
+holds the lock for the whole session (`phone_common.sh` `wake_hold` /
+`wake_release` / `wake_held`), and the protocol rule now names suspend. Open: the app's own
 wake lock is an app-uid lock, which deep Doze disables. App GPU work in
 deep idle needs a long stationary screen-off period first, so the window is
 small, but not closed.

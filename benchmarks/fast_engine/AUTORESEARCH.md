@@ -85,28 +85,21 @@ status:
   per-session load budget is a fine experiment setting; it is not an
   established limit.
 - **Wake state.** A locked phone without any wake source stalls each decode
-  round-trip ~0.7 s through system suspend (P2-3/P2-4); measure unlocked,
-  or with a verified wake source. `svc power stayon true` only sets
-  Android's *stay awake while plugged in* option — it is **not** a wake lock
-  for an unplugged (discharging) energy run. The stall-free discharging
-  windows in P2-8 had stayon set, but which mechanism kept them awake is
-  **unverified**. The verified wake source for screen-off windows is the
-  shell wake lock below; `phone_energy.sh` holds it for the idle control
-  too, so every arm shares the wake state.
+  round-trip ~0.7 s through system suspend (P2-3/P2-4). `svc power stayon
+  true` only keeps a plugged-in phone awake; it is **not** a wake lock, and
+  what kept the P2-8 discharging windows stall-free is **unverified**. The
+  verified wake source for screen-off windows is the shell wake lock below.
 - **Never run GPU work on a phone that may suspend.** Kernel suspend with
   GPU work outstanding wedges the PowerVR driver: screen off without a wake
-  lock wedged 5/6 trials, awake 0/13, and screen off in forced deep Doze
-  under a held wake lock 0/3 (RESEARCH_LOG P3-1–P3-4). Suspend is the
-  trigger, not Doze, so a plugged-in phone with the screen off is exposed
-  too. Every phone bench script (`android_bench.sh`, `phone_ab.sh`,
-  `phone_gates.sh`, `phone_energy.sh`, `pixel_measure.sh`) holds a
-  shell-uid partial wake lock for the whole session (`phone_common.sh` `wake_hold`;
-  `wakehold/WakeHold.java`, built on demand — needs a JDK and the Android
-  SDK). Any other script that runs benches with the screen off must do the
-  same: `wake_hold` before the first bench, `wake_release || true` in its
-  EXIT trap, `wake_held` before each measurement window. Doze does not
-  disable it (uid 2000, verified in `dumpsys power`), and killing the holder
-  releases it.
+  lock wedged 5/6 trials, awake 0/13, forced deep Doze under a wake lock 0/3
+  (RESEARCH_LOG P3-1–P3-4). Suspend, not Doze, is the trigger, so a
+  plugged-in phone with the screen off is exposed too. The phone bench
+  scripts hold a shell-uid partial wake lock for the whole session, which
+  Doze does not disable (`phone_common.sh` `wake_hold`, built on demand from
+  `wakehold/WakeHold.java`; needs a JDK and the Android SDK). A new script
+  that runs benches with the screen off does the same: `wake_hold` before
+  the first bench, `wake_release || true` in its EXIT trap, `wake_held`
+  before each measurement window.
 - **Run `wedge_forensics.sh watch start` at the start of every phone
   session**, so an incident's minutes are still on the device.
 - **Energy runs** need a discharging battery: verify the charge counter
@@ -114,45 +107,35 @@ status:
 - **Wifi adb.** Stream bench output to device-side files; the TLS transport
   stalls under sustained shell output.
 
-### GPU failures and phone restarts (#325) — what to do
+### GPU failures and phone restarts
 
-The root cause of the Pixel's GPU wedges and spontaneous restarts is still
-open. Every incident is a datapoint only if its evidence is captured before
-it rotates away, so this procedure outranks the experiment in progress.
+The evidence rotates away within minutes (logcat) to hours (kernel log), so
+this procedure outranks the experiment in progress.
 
-**Recognize it.** Any of: a fence timeout (`vkWaitForFences failed
-(VkResult 2)`), `device lost`, a wedge marker refusing a load, a bench hung
-past its timeout, decode times jumping to the degraded band (~2× the
-session's own median, bimodal), or the phone rebooting on its own (uptime
-reset you did not cause; boot reason not `reboot,shell` /
+**Recognize it.** A fence timeout (`vkWaitForFences failed (VkResult 2)`),
+`device lost`, a wedge marker refusing a load, a bench hung past its
+timeout, decode times in the degraded band (~2× the session's median,
+bimodal), or a restart you did not cause (boot reason not `reboot,shell` /
 `reboot,userrequested`).
 
-**1. Capture, first.**
-- Phone still up: `benchmarks/fast_engine/wedge_forensics.sh event <label>`.
-  The kernel log is a ring buffer — GPU driver lines rotate out within
-  hours — so do this before any retry, recovery load or reboot.
-- Phone restarted: as soon as adb is back,
-  `wedge_forensics.sh post-reboot <label> --bugreport` (the bugreport holds
-  the previous boot's kernel log; the live kernel log is already the new
-  boot's).
+1. **Capture first**, before any retry, recovery load or reboot:
+   `wedge_forensics.sh event <label>` while the phone is up, or
+   `wedge_forensics.sh post-reboot <label> --bugreport` as soon as adb is
+   back after a restart (only the bugreport keeps the previous boot's
+   kernel log).
+2. **Record it** in `RESEARCH_LOG.md`: the forensics directory, the boot
+   reason, and what the capture cannot see — binary and commit, model,
+   `STARLING_FAST_KSTEP`, loads and dirty deaths (SIGKILL/timeouts) this
+   boot, uptime, battery and charging, what ran in the minutes before.
+   Write "unknown" where unknown.
+3. **Then** follow rule 3 of the root `AUTORESEARCH.md`. Never delete a
+   wedge marker to get past it; wait out its 15 minutes or reboot.
 
-**2. Record it** in `RESEARCH_LOG.md`: the forensics directory, the boot
-reason, and the context the forensics cannot see — binary and commit,
-model, `STARLING_FAST_KSTEP`, loads and dirty deaths (SIGKILL/timeouts)
-this boot, uptime, battery level, charging or not, what ran in the minutes
-before. Unknown is fine; write "unknown".
-
-**3. Then** follow rule 3 of the root `AUTORESEARCH.md`: unattended loops
-stop device work; attended sessions may attempt recovery (one clean load
-after idling; reboot as the fallback), and measure again only after a
-healthy load plus a baseline back in band. Never delete a wedge marker to
-get past it — wait out its 15 minutes or reboot.
-
-**What the evidence decides.** Each open hypothesis and the data that
-settles it:
+**What the evidence decides:**
 
 | hypothesis | look for |
 | --- | --- |
+| kernel suspend with GPU work outstanding (reproduced, P3-3/P3-4) | `mWakefulness` and suspend blockers in `summary.txt`; GPU rail ~0 mW during the hang in `gpu-rail.txt` |
 | unclean device death (process killed with a live VkDevice; P2-12) | dirty deaths this boot before the incident; clean `vk teardown` lines on the clean ones |
 | GPU job too long → failed hardware recovery | `pvr`/`rogue`/`HWR`/`lockup` lines in `gpu-lines.txt` before the hang; KSTEP of the run |
 | thermal | thermal status and temperatures in `summary.txt` |
@@ -160,9 +143,9 @@ settles it:
 | memory pressure | `lowmemorykiller`/`lmkd` kills, `MemAvailable` |
 | driver/firmware | build fingerprint; the boot-time `RGXValidateFWHeaderVersion2: KM and FW version mismatch` line seen on this unit (2026-10) |
 
-A spontaneous restart with a boot reason such as `kernel_panic` or
-`watchdog` plus driver lines before it is the report Imagination/Google
-need: attach the forensics directory and the bugreport.
+A restart with a boot reason such as `kernel_panic` or `watchdog`, with
+driver lines before it, is the report Imagination/Google need: attach the
+forensics directory and the bugreport.
 
 ## Experiment loop
 
