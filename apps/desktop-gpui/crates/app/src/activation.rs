@@ -164,8 +164,8 @@ pub(crate) enum CancelReason {
     NoAudioYet,
     /// The microphone delivered no audio within [`START_STALL`].
     MicStalled,
-    /// The microphone failed or stopped delivering mid-take (#222): the
-    /// audio captured before that is kept as an interrupted take.
+    /// The microphone failed or stopped delivering mid-take: the audio
+    /// captured before that is kept as an interrupted take.
     InputLost,
 }
 
@@ -447,8 +447,8 @@ impl Activation {
         Vec::new()
     }
 
-    /// `take`'s microphone failed or went silent mid-take (#222): cancel
-    /// it as interrupted. A stale id (an older take) does nothing.
+    /// `take`'s microphone failed or stopped delivering mid-take: cancel it
+    /// as interrupted. A stale id (an older take) does nothing.
     pub(crate) fn input_lost(&mut self, take: TakeId) -> Vec<Effect> {
         match self.phase {
             Phase::Active { take: active, .. } if active == take => {
@@ -663,7 +663,6 @@ impl StarlingApp {
                 continue;
             }
             if self.settings_open && matches!(event, GlobalEvent::Pressed(_)) {
-                // #222: the dialog's shortcut check shows the press arrived.
                 self.note_shortcut_in_dialog(cx);
             }
             let may_start = !self.settings_open;
@@ -711,7 +710,6 @@ impl StarlingApp {
             return false;
         }
         if self.settings_open {
-            // #222: the dialog's shortcut check shows the press arrived.
             self.note_shortcut_in_dialog(cx);
         }
         let may_start = !self.settings_open;
@@ -755,9 +753,6 @@ impl StarlingApp {
     pub(crate) fn poll_activation(&mut self, cx: &mut Context<Self>) -> Duration {
         self.flush_system_events(cx);
         self.activation_input(|machine| machine.tick(Instant::now()), cx);
-        // #222: microphone health (the live-take input-loss watchdog and
-        // the mic check's limit) is timer-driven, not render-driven — a
-        // hidden window stops rendering but must not stop these.
         self.poll_microphone(cx);
         if self.activation.is_active()
             || self.activation.key_is_down()
@@ -816,9 +811,9 @@ impl StarlingApp {
                 Effect::Finish(take) => {
                     if self.recording_take == Some(take) {
                         self.recording_take = None;
-                        // #222: a take whose microphone died is never
-                        // presented as complete, even when the stop came
-                        // before the watchdog noticed.
+                        // A take whose microphone died is never presented
+                        // as complete, even when the stop came before the
+                        // watchdog noticed.
                         if self.note_live_interruption() {
                             self.cancel_recording(take, CancelReason::InputLost, cx);
                         } else {

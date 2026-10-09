@@ -143,7 +143,7 @@ pub fn render_capture(
                         .text_size(h1_size)
                         .line_height(h1_size * 0.96)
                         .text_color(theme::INK)
-                        // #222: never "listening" to a silent or dead input.
+                        // Never "listening" to a silent or dead input.
                         .child(
                             app.live_input_headline()
                                 .filter(|_| {
@@ -357,7 +357,6 @@ fn render_recorder(
                     )
                     .map(|hint| div().id("finish-hint").child(hint)),
                 )
-                // #222: the microphone this take records from.
                 .children(crate::views::microphone::live_input_line(app))
                 .when(!has_transcript, |meta| {
                     meta.child(
@@ -631,7 +630,6 @@ fn render_banner(app: &mut StarlingApp, cx: &mut Context<StarlingApp>) -> Option
                     }),
                 )
                 .children(error.clone().map(|message| div().child(message)))
-                // #222: an input problem's recovery actions.
                 .children(crate::views::microphone::input_problem_actions(app, cx))
                 .children(
                     surface

@@ -88,20 +88,17 @@ pub struct Settings {
     /// rest of the subsection, and never the rest of the file.
     #[serde(default, deserialize_with = "lenient_dictation")]
     pub dictation: DictationSettings,
-    /// The microphone choice (#222). A file without the key follows the
-    /// system default, which is what every earlier build recorded from.
-    /// The subsection is read leniently (like `dictation` above): a
-    /// `null`, a non-object, or a wrong-typed `preferredDevice` resets
-    /// only the microphone choice — never the endpoint, model or
-    /// processing the rest of the file carries.
+    /// The microphone choice. A file without the key follows the system
+    /// default, which is what every earlier build recorded from. An
+    /// unreadable value resets only this choice, never the rest of the
+    /// file.
     #[serde(default, deserialize_with = "lenient_microphone")]
     pub microphone: MicrophoneSettings,
 }
 
-/// Which microphone takes record from (#222). Only the user changes this:
-/// a preferred device that is unplugged, or a device listing that fails,
-/// makes a take fall back to the system default *for that take* (see
-/// `crate::microphone`), and the preference stays as it was.
+/// Which microphone takes record from. Only the user changes this: a take
+/// whose preferred device is missing falls back to the system default for
+/// that take alone (see `crate::microphone`).
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct MicrophoneSettings {
@@ -209,11 +206,8 @@ fn lenient_dictation_value(value: serde_json::Value) -> DictationSettings {
     }
 }
 
-/// Reads the `microphone` value without ever failing the whole file
-/// (#222), in the shape of [`lenient_dictation`]: a `null` or non-object
-/// is the default, and a `preferredDevice` that is not a string resets
-/// only the microphone choice (to follow the system default) with the
-/// reason logged — the file's other sections load normally.
+/// Reads the `microphone` value without ever failing the whole file: an
+/// unreadable value follows the system default, with the reason logged.
 fn lenient_microphone<'de, D>(deserializer: D) -> Result<MicrophoneSettings, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -222,27 +216,14 @@ where
     Ok(lenient_microphone_value(value))
 }
 
-/// The value-wise leniency itself, shared by the `microphone` attribute
-/// and the [`Settings::load`] fallback below — same shape as
-/// [`lenient_dictation_value`].
 fn lenient_microphone_value(value: serde_json::Value) -> MicrophoneSettings {
-    if !value.is_object() {
-        eprintln!("Unreadable microphone settings ({value}); following the system default");
-        return MicrophoneSettings::default();
-    }
-    match value.get("preferredDevice") {
-        None | Some(serde_json::Value::Null) => MicrophoneSettings::default(),
-        Some(serde_json::Value::String(name)) => MicrophoneSettings {
-            preferred_device: Some(name.clone()),
-        },
-        Some(other) => {
-            eprintln!(
-                "Unreadable microphone field `preferredDevice` ({other}); following the \
-                 system default"
-            );
-            MicrophoneSettings::default()
+    if value.is_object() {
+        if let Ok(microphone) = serde_json::from_value(value.clone()) {
+            return microphone;
         }
     }
+    eprintln!("Unreadable microphone settings ({value}); following the system default");
+    MicrophoneSettings::default()
 }
 
 /// Which processing mode runs after a take is transcribed, and where its
@@ -392,14 +373,9 @@ impl Settings {
         // relies on the field-level `lenient_dictation` alone, instead of
         // parsing (and logging) the subsection twice.
         let dictation_subtree = value.get("dictation").cloned();
-        // Likewise the preferred microphone (#222): an unreadable field
-        // elsewhere must not silently move recording to another device.
-        // Read with the same leniency as the field itself.
-        let microphone = value
-            .get("microphone")
-            .cloned()
-            .map(lenient_microphone_value)
-            .unwrap_or_default();
+        // Likewise the microphone choice: an unreadable sibling key must
+        // not silently move recording to another device.
+        let microphone_subtree = value.get("microphone").cloned();
         let Ok(mut settings) = serde_json::from_value::<Settings>(value) else {
             // The same field-wise leniency as the `dictation` attribute:
             // an unreadable sibling key must not cost the user their
@@ -414,7 +390,9 @@ impl Settings {
                 active_model,
                 backend_override,
             };
-            fallback.microphone = microphone;
+            fallback.microphone = microphone_subtree
+                .map(lenient_microphone_value)
+                .unwrap_or_default();
             fallback.dictation = dictation;
             return Some(fallback);
         };
@@ -582,8 +560,6 @@ mod tests {
 
         settings.save(&path).expect("save");
         assert_eq!(Settings::load(&path), settings);
-        let raw = std::fs::read_to_string(&path).expect("read settings file");
-        assert!(raw.contains("\"preferredDevice\": \"USB Mic\""), "{raw}");
 
         // camelCase keys on disk.
         let raw = std::fs::read_to_string(&path).expect("read settings file");
@@ -601,6 +577,7 @@ mod tests {
         assert_eq!(value["engine"]["mode"], "builtin");
         assert_eq!(value["engine"]["activeModel"], "parakeet-v3-q8");
         assert_eq!(value["engine"]["backendOverride"], "cpu");
+        assert_eq!(value["microphone"]["preferredDevice"], "USB Mic");
     }
 
     #[test]
@@ -820,8 +797,6 @@ mod tests {
 
     #[test]
     fn an_unreadable_file_keeps_the_preferred_microphone() {
-        // #222: a typed-deserialization failure elsewhere must not erase
-        // the microphone choice — recording would silently move devices.
         let temp = TempDir::new().expect("tempdir");
         let path = temp.path().join("settings.json");
         std::fs::write(
@@ -837,10 +812,6 @@ mod tests {
 
     #[test]
     fn an_unreadable_microphone_key_resets_only_the_microphone_choice() {
-        // #222: a `null`, a non-object, or a wrong-typed `preferredDevice`
-        // must cost only the microphone choice — never the endpoint,
-        // model, terms or dictation settings the rest of the file
-        // carries (the strict read fell back to whole-file defaults).
         let temp = TempDir::new().expect("tempdir");
         let path = temp.path().join("settings.json");
         for microphone in [

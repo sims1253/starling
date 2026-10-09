@@ -367,13 +367,11 @@ pub struct StarlingApp {
     /// manager and never lives here.
     pub(crate) draft_engine_mode: EngineMode,
     pub(crate) draft_backend_override: Option<String>,
-    /// The committed microphone choice (#222), and the dialog's draft of
-    /// it (Save-saved like the other fields; the microphone check runs
-    /// on the draft so a choice can be tried before it is saved).
+    /// The committed microphone choice, and the dialog's draft of it
+    /// (the microphone check runs on the draft, so a choice can be tried
+    /// before it is saved).
     pub(crate) microphone_settings: MicrophoneSettings,
     pub(crate) draft_microphone: Option<String>,
-    /// Device list, microphone check, last route and input problem
-    /// (#222).
     pub(crate) mic: crate::mic::MicState,
     /// Keeps the quit hook (engine shutdown) registered for the entity's
     /// lifetime — a dropped `Subscription` unsubscribes.
@@ -1592,15 +1590,12 @@ impl StarlingApp {
         // everything else in the Engine section is live manager state.
         self.draft_engine_mode = self.engine_settings.mode;
         self.draft_backend_override = self.engine_settings.backend_override.clone();
-        // #222: the microphone draft starts from the committed choice,
-        // and the device list is fresh for every dialog.
+        // The device list and the shortcut evidence are fresh for every
+        // dialog: the shortcut heard last time may have changed since.
         self.draft_microphone = self.microphone_settings.preferred_device.clone();
         self.cancel_mic_check();
-        self.mic.check = None;
         self.mic.settings_launch_error = None;
         self.mic.settings_launch_generation += 1;
-        // Shortcut evidence is per dialog: a press heard last time may
-        // have been a shortcut that has since changed.
         self.mic.shortcut_heard = None;
         self.refresh_input_devices(cx);
         self.draft_endpoint.update(cx, |field, cx| {
@@ -1659,10 +1654,10 @@ impl StarlingApp {
         // #221: presses made while the dialog was open never start a take.
         self.flush_system_events(cx);
         self.settings_open = false;
-        // #222: a running microphone check releases its device with the
-        // dialog; a pending check transcription has nowhere to land.
+        // A running microphone check releases its device with the dialog;
+        // a pending check transcription has nowhere to land.
         self.cancel_mic_check();
-        self.mic.check = None;
+        self.mic.settings_launch_error = None;
         self.mic.settings_launch_generation += 1;
         // B06 (#207): in-flight probes are retired with the dialog — a
         // stray probe has nothing to land in, and the settled outcome
@@ -1813,8 +1808,8 @@ impl StarlingApp {
         // jobs already running keep the provider they started with.
         self.processing_settings = self.draft_processing_settings(cx);
         self.providers = processing::build_providers(&self.processing_settings);
-        // #222: the next take resolves against the saved choice; a take
-        // already recording keeps the device it opened.
+        // The next take resolves against the saved choice; a take already
+        // recording keeps the device it opened.
         self.microphone_settings.preferred_device = self.draft_microphone.clone();
 
         // #362: mode and backend override commit here, like the other
@@ -2478,14 +2473,6 @@ impl Render for StarlingApp {
             let magnitudes = fft::magnitude_spectrum(&window_samples);
             self.levels = fft::waveform_levels(&magnitudes, 52);
             self.elapsed_ms = handle.elapsed().as_secs_f64() * 1000.0;
-            // The input-loss watchdog, the mic check's limit and the
-            // silence evidence (`last_sound_at`) are not here: they run
-            // on the timer loop (`poll_microphone` from
-            // `poll_activation`), which keeps running while a hidden or
-            // minimized window renders nothing (#222) — render's own
-            // stoppage must not read as the input's silence on restore.
-            // Render keeps only what rendering needs — the meter, the
-            // levels, the frames.
             window.request_animation_frame();
         }
         self.tick_mic_check(window);

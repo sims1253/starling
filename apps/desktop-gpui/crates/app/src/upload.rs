@@ -380,75 +380,11 @@ impl StarlingApp {
             if capture_fault.is_some() {
                 stream = None;
             }
-            // #222: the device the take recorded from, for an
-            // interruption reported by the stop itself.
-            let take_device = handle
-                .input_route()
-                .map(|route| route.device.clone())
-                .unwrap_or_else(|| "The microphone".to_string());
             // Stop-to-processed latency (#295) starts here.
             let stopped_at = Instant::now();
             // The staging panel keeps its draft while the take is saved.
             let staging = self.stop_staging();
             match handle.stop() {
-                // #222: the device had already failed when the stop began
-                // (after the last watchdog check): the audio is kept as an
-                // interrupted take, never transcribed as complete.
-                Ok(mut take) if take.device_fault.is_some() => {
-                    take.audio.samples.splice(0..0, streamed_samples);
-                    let fault = take.device_fault.take().unwrap_or_default();
-                    let journal_report = take
-                        .journal
-                        .filter(|report| report.finalized && report.fault.is_none());
-                    let note = format!(
-                        "{take_device} failed mid-recording ({fault}); the audio captured \
-                         before that was kept."
-                    );
-                    // Like a cancel: a draft the user typed into stays and
-                    // is bound to the saved take; an untouched one goes.
-                    let kept_draft = self.staging_cancelled(cx);
-                    self.levels = vec![0.06; 52];
-                    self.capture_warning = recorder::clipping_warning(source_clip_ratio);
-                    self.report_input_problem(
-                        starling_dictation::microphone::InputProblem::Unavailable {
-                            device: take_device.clone(),
-                            detail: "it stopped during the last recording".to_string(),
-                        },
-                        format!(
-                            "{take_device} stopped working mid-recording ({fault}). Everything \
-                             captured before that was saved to your history as an interrupted \
-                             recording; transcribe it from there. Check the microphone \
-                             (Settings → Microphone can test it or pick another), then record \
-                             again."
-                        ),
-                    );
-                    cx.notify();
-                    let audio = take.audio;
-                    cx.spawn(async move |this, cx| {
-                        let encoded = cx
-                            .background_spawn(async move { audio::encode_wav_16k(&audio) })
-                            .await;
-                        this.update(cx, |app, cx| match encoded {
-                            Ok(wav) => app.save_interrupted_take(
-                                Arc::new(wav),
-                                journal_report,
-                                note,
-                                None,
-                                kept_draft,
-                                cx,
-                            ),
-                            Err(err) => {
-                                app.error = Some(err.to_string());
-                                if let Some(token) = kept_draft {
-                                    app.staging_save_failed(token, cx);
-                                }
-                                cx.notify();
-                            }
-                        })
-                        .ok();
-                    })
-                    .detach();
-                }
                 Ok(mut take) => {
                     // `sent_samples` indexes device-rate samples of the
                     // spliced layout (drained stream prefix + journal
@@ -606,8 +542,6 @@ impl StarlingApp {
             // I1 phase 2: production captures journal to the durable
             // per-take file; only fsynced-boundary samples are
             // acknowledged (see recorder::start_recording_with_journal).
-            // #222: the take opens the preferred microphone, or falls back
-            // to the system default visibly (the route says which).
             let journals_root = journal::default_journals_root();
             match recorder::start_capture(recorder::CaptureRequest {
                 journals_dir: Some(&journals_root),
@@ -663,10 +597,7 @@ impl StarlingApp {
                     true
                 }
                 Err(err) => {
-                    // #222: missing, refused and failing inputs each get
-                    // their own explanation and recovery actions.
                     let text = format!("{} {}", err.problem.message(), err.problem.recovery());
-                    self.mic.last_route = err.route;
                     self.report_input_problem(err.problem, text);
                     cx.notify();
                     false

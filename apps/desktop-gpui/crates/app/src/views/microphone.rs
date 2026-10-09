@@ -1,4 +1,4 @@
-//! Microphone views (#222): the settings dialog's Microphone section —
+//! Microphone views: the settings dialog's Microphone section —
 //! picker, preferred vs. in-use input, the repeatable microphone and
 //! shortcut check — and the capture pane's input line and recovery
 //! actions.
@@ -6,10 +6,8 @@
 use gpui::{div, prelude::*, px, relative, Context, Div, FontWeight, SharedString};
 use starling_dictation::microphone::{InputProblem, InputRoute};
 
-use crate::mic::{page_label, platform_pages};
-
 use crate::app::StarlingApp;
-use crate::mic::{picker_rows, CheckOutcome, DeviceList, MicCheck};
+use crate::mic::{CheckOutcome, DeviceList, MicCheck, page_label, picker_rows, platform_pages};
 use crate::theme;
 
 fn button(id: impl Into<SharedString>, label: &'static str) -> gpui::Stateful<Div> {
@@ -134,7 +132,7 @@ pub(crate) fn render_microphone_section(
     }
 
     let listing_line = match &app.mic.devices {
-        DeviceList::Unknown | DeviceList::Loading => Some(note("Looking for microphones…")),
+        DeviceList::Loading => Some(note("Looking for microphones…")),
         DeviceList::Failed(error) => Some(note(format!(
             "Could not list microphones ({error}). Your saved choice is kept; recordings use the \
              system default until listing works again."
@@ -273,9 +271,6 @@ fn render_check(app: &mut StarlingApp, cx: &mut Context<StarlingApp>) -> Div {
              this window has focus."
         ),
     };
-    // Static on purpose (#222): a running "N s ago" would only stay
-    // true if something re-rendered, and nothing schedules that while
-    // the dialog just sits open.
     let heard = if app.mic.shortcut_heard.is_some() {
         format!("✓ {shortcut} was received while this dialog was open.")
     } else {
@@ -446,22 +441,28 @@ pub(crate) fn input_problem_actions(
     cx: &mut Context<StarlingApp>,
 ) -> Option<Div> {
     let settings = settings_buttons(app.shown_input_problem()?, "input-settings", cx);
+    let actions = div()
+        .mt(px(6.))
+        .flex()
+        .flex_row()
+        .flex_wrap()
+        .gap(px(6.))
+        .child(
+            button("input-retry", "Retry").on_click(cx.listener(|this, _, _window, cx| {
+                this.toggle_recording(crate::activation::RecordButton::Start, cx)
+            })),
+        )
+        .children(settings)
+        .child(
+            button("input-choose", "Choose microphone")
+                .on_click(cx.listener(|this, _, _window, cx| this.open_settings(cx))),
+        );
     Some(
-        div()
-            .mt(px(6.))
-            .flex()
-            .flex_row()
-            .flex_wrap()
-            .gap(px(6.))
-            .child(
-                button("input-retry", "Retry").on_click(cx.listener(|this, _, _window, cx| {
-                    this.toggle_recording(crate::activation::RecordButton::Start, cx)
-                })),
-            )
-            .children(settings)
-            .child(
-                button("input-choose", "Choose microphone")
-                    .on_click(cx.listener(|this, _, _window, cx| this.open_settings(cx))),
-            ),
+        div().child(actions).children(
+            app.mic
+                .settings_launch_error
+                .clone()
+                .map(|error| div().mt(px(6.)).child(error)),
+        ),
     )
 }

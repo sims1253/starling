@@ -216,12 +216,6 @@ pub struct CapturedTake {
     pub audio: crate::audio::PcmAudio,
     /// The durable journal report, when this capture journaled.
     pub journal: Option<JournalReport>,
-    /// A device-side failure the capture had already reported when the
-    /// stop handshake began (#222): the audio is complete up to the
-    /// failure, but the take was interrupted and must not be presented
-    /// as complete. Errors posted while the stream is being torn down are
-    /// not counted — some backends report one on a normal stop.
-    pub device_fault: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -381,8 +375,8 @@ struct ConsumerState {
     /// Set when the writer task finalized the journal (trailer + file and
     /// parent-dir fsyncs) on its exit path.
     journal_finalized: bool,
-    /// When a drain last found new samples (#222): the input-stall
-    /// evidence. `None` until the first sample arrives.
+    /// When a drain last found new samples; `None` until the first
+    /// sample arrives.
     last_advance: Option<Instant>,
 }
 
@@ -434,10 +428,6 @@ struct Shared {
     callback_alive: AtomicBool,
     /// Pre-DSP clipping evidence, updated from the callback (G03).
     clip: ClipCounters,
-    /// Largest raw (pre-DSP) |sample| so far, as `f32` bits (#222): for
-    /// non-negative floats the bit patterns order like the values, so the
-    /// callback can `fetch_max` it lock-free (R01).
-    source_peak: AtomicU32,
     /// Consumer-side accumulation and gap bookkeeping.
     consumer: Mutex<ConsumerState>,
     /// Wakes the writer promptly for its final drain at stop.
@@ -446,7 +436,7 @@ struct Shared {
     /// dropped and `callback_alive` has cleared, or the bounded quiesce
     /// wait has given up — so the writer's exit path (final drain + journal
     /// finalize) observes the complete, stable take (#204). The
-    /// `stream.play()` failure teardown in `start_recording_inner` also
+    /// `stream.play()` failure teardown in `start_on_device` also
     /// sets it directly; no callback ever ran there.
     stopping: AtomicBool,
 }
@@ -493,7 +483,6 @@ impl Shared {
             durable_ack: AtomicU64::new(0),
             callback_alive: AtomicBool::new(false),
             clip: ClipCounters::default(),
-            source_peak: AtomicU32::new(0),
             consumer: Mutex::new(ConsumerState::default()),
             wake: Condvar::new(),
             stopping: AtomicBool::new(false),
@@ -839,20 +828,6 @@ impl CallbackState {
         shared.callback_alive.store(true, Ordering::Release);
         downmix_into(data, self.channels, &mut self.mono);
         shared.clip.observe(&self.mono);
-        // Non-finite samples never set the peak (#222): +∞ wins the bit
-        // comparison forever (and a NaN's bits sort above every finite
-        // value), so one bad block would silence the silence check for
-        // the rest of the take. `abs` is bound once; the finiteness test
-        // is a bit test — no allocation, lock or call out.
-        let peak = self.mono.iter().fold(0.0f32, |peak, sample| {
-            let magnitude = sample.abs();
-            if magnitude.is_finite() && magnitude > peak {
-                magnitude
-            } else {
-                peak
-            }
-        });
-        shared.source_peak.fetch_max(peak.to_bits(), Ordering::Relaxed);
         self.attenuator.process(&mut self.mono);
         shared.push_block(&self.mono);
         shared.callback_alive.store(false, Ordering::Release);
@@ -918,38 +893,25 @@ pub struct RecorderHandle {
     started_at: Instant,
     quiesce_timeout: Duration,
     journal: Option<JournalIdentity>,
-    /// The input this take opened and why (#222); `None` for simulated
-    /// captures.
+    /// The input this take opened and why; `None` for simulated captures.
     route: Option<InputRoute>,
 }
 
 impl RecorderHandle {
-    /// The microphone this take is recording from, beside the preference
-    /// it was resolved from (#222). Fixed for the take's lifetime: the
-    /// recorder never moves a running take to another device.
+    /// The microphone this take records from, fixed for the take's
+    /// lifetime.
     pub fn input_route(&self) -> Option<&InputRoute> {
         self.route.as_ref()
     }
 
-    /// Largest raw (pre-attenuation) |sample| captured so far, 0..=1
-    /// (#222). Below [`microphone::SILENT_PEAK`] after a few seconds means
-    /// the input delivers digital silence. Lock-free (R01).
-    pub fn source_peak(&self) -> f32 {
-        f32::from_bits(self.shared.source_peak.load(Ordering::Relaxed))
-    }
-
-    /// How long the input has delivered no new samples (#222): since the
-    /// last sample, or since the take started when none ever arrived. A
-    /// healthy device delivers every few milliseconds, so seconds here
-    /// mean the input is dead even though no error was reported (some
-    /// backends just stop calling back on unplug).
-    pub fn input_stalled_for(&self) -> Duration {
+    /// How long the input has delivered no new samples; `None` until the
+    /// first sample arrives. A healthy device delivers every few
+    /// milliseconds, so seconds here mean the input is dead even though no
+    /// error was reported (some backends just stop calling back on unplug).
+    pub fn input_stalled_for(&self) -> Option<Duration> {
         let mut guard = self.shared.lock_consumer();
         self.shared.drain_ring(&mut guard);
-        guard
-            .last_advance
-            .unwrap_or(self.started_at)
-            .elapsed()
+        guard.last_advance.map(|at| at.elapsed())
     }
 
     /// Actual capture rate of the device (16 kHz when it was available
@@ -1100,9 +1062,6 @@ impl RecorderHandle {
     /// caller and do not make the take "empty".
     pub fn stop(mut self) -> Result<CapturedTake, RecorderError> {
         let final_sample_index = self.shared.written_seq.load(Ordering::Acquire);
-        // #222: the device fault as of the stop decision, before teardown
-        // can post errors of its own.
-        let device_fault = self.shared.lock_consumer().stream_error.clone();
 
         if let Some(stream) = self.stream.take() {
             // Explicit stop; pause is unsupported on some backends, and
@@ -1215,7 +1174,6 @@ impl RecorderHandle {
                 channels: 1,
             },
             journal,
-            device_fault,
         })
     }
 }
@@ -1245,7 +1203,7 @@ pub fn start_recording_with_journal(
     .map_err(RecorderError::from)
 }
 
-/// What a capture opens (#222).
+/// What a capture opens.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CaptureRequest<'a> {
     /// Journal the take here (see [`start_recording_with_journal`]);
@@ -1260,8 +1218,8 @@ pub struct CaptureRequest<'a> {
 }
 
 /// A capture that could not start, classified so the UI can explain a
-/// missing, refused or failing input distinctly (#222). `route` is the
-/// input the start resolved to before failing, when it got that far.
+/// missing, refused or failing input distinctly. `route` is the input the
+/// start resolved to before failing, when it got that far.
 #[derive(Debug, Clone, thiserror::Error)]
 #[error("{problem}")]
 pub struct StartError {
@@ -1275,8 +1233,8 @@ impl From<StartError> for RecorderError {
     }
 }
 
-/// Starts a mono capture from the input `request` resolves to (#222) —
-/// the one start path behind [`start_recording`] and
+/// Starts a mono capture from the input `request` resolves to — the one
+/// start path behind [`start_recording`] and
 /// [`start_recording_with_journal`].
 pub fn start_capture(request: CaptureRequest<'_>) -> Result<RecorderHandle, StartError> {
     let (device, route) = microphone::open_input(request.preferred_device)
@@ -2738,93 +2696,19 @@ mod tests {
         }
     }
 
-    /// Live round-trip against the real microphone. Skips itself (rather than
-    /// failing) in environments without an input device.
     #[test]
-    fn source_peak_tracks_the_raw_input_before_attenuation() {
-        // #222: the silence check must see what the device delivered, not
-        // the attenuated copy — and a later quiet block must not lower it.
+    fn input_stall_counts_from_the_last_delivery() {
         let shared = test_shared(8_192);
         let handle = test_handle(Arc::clone(&shared), 16_000);
-        assert_eq!(handle.source_peak(), 0.0, "nothing captured yet");
-        let mut callback = CallbackState::new(1);
-        callback.process(&[0.0f32; 256], &shared);
-        assert_eq!(handle.source_peak(), 0.0, "digital silence stays at zero");
-        let hot: Vec<f32> = (0..AUTO_GAIN_BLOCK)
-            .map(|i| if i % 2 == 0 { 0.95 } else { -0.95 })
-            .collect();
-        for _ in 0..20 {
-            callback.process(&hot, &shared);
-        }
-        callback.process(&[0.01f32; 256], &shared);
-        assert!((handle.source_peak() - 0.95).abs() < 1e-6, "{}", handle.source_peak());
-        // The ring holds the attenuated copy, below the raw peak.
-        let window = handle.latest_window(AUTO_GAIN_BLOCK * 4);
-        let stored_peak = window.iter().fold(0.0f32, |peak, s| peak.max(s.abs()));
-        assert!(stored_peak < 0.95, "{stored_peak}");
-    }
-
-    #[test]
-    fn source_peak_ignores_non_finite_samples() {
-        // #222: a non-finite sample carries bits that sort above every
-        // finite float, so a single one reaching the fold would win
-        // `fetch_max` for the rest of the take — the input would never
-        // read as silent again. The peak must stay the largest finite
-        // |sample|.
-        let shared = test_shared(8_192);
-        let handle = test_handle(Arc::clone(&shared), 16_000);
-        let mut callback = CallbackState::new(1);
-        let mut poisoned: Vec<f32> = vec![f32::NAN; AUTO_GAIN_BLOCK];
-        poisoned[AUTO_GAIN_BLOCK / 2] = f32::INFINITY;
-        poisoned[AUTO_GAIN_BLOCK / 3] = f32::NEG_INFINITY;
-        callback.process(&poisoned, &shared);
-        let finite: Vec<f32> = (0..AUTO_GAIN_BLOCK)
-            .map(|i| if i % 2 == 0 { 0.5 } else { -0.5 })
-            .collect();
-        callback.process(&finite, &shared);
-        assert!((handle.source_peak() - 0.5).abs() < 1e-6, "{}", handle.source_peak());
-    }
-
-    #[test]
-    fn input_stall_grows_until_samples_arrive_and_resets_when_they_do() {
-        // #222: a backend that silently stops calling back must not look
-        // like a live input. With no samples the stall counts from the
-        // start of the take; each delivery resets it.
-        let shared = test_shared(8_192);
-        let mut handle = test_handle(Arc::clone(&shared), 16_000);
-        handle.started_at = Instant::now() - Duration::from_secs(5);
-        assert!(handle.input_stalled_for() >= Duration::from_secs(5));
+        assert_eq!(handle.input_stalled_for(), None, "nothing delivered yet");
         let mut callback = CallbackState::new(1);
         callback.process(&[0.1f32; 160], &shared);
-        assert!(handle.input_stalled_for() < Duration::from_secs(1));
+        assert!(handle.input_stalled_for().expect("samples arrived") < Duration::from_secs(1));
         std::thread::sleep(Duration::from_millis(60));
-        let stalled = handle.input_stalled_for();
+        let stalled = handle.input_stalled_for().expect("samples arrived");
         assert!(stalled >= Duration::from_millis(50), "{stalled:?}");
         callback.process(&[0.1f32; 160], &shared);
-        assert!(handle.input_stalled_for() < stalled);
-    }
-
-    #[test]
-    fn stop_reports_a_device_fault_posted_before_the_handshake() {
-        // #222: a device that failed before stop — even after the app's
-        // last health check — leaves its mark on the returned take, so the
-        // app files it as interrupted instead of complete.
-        let shared = test_shared(8_192);
-        let handle = test_handle(Arc::clone(&shared), 16_000);
-        CallbackState::new(1).process(&[0.2f32; 320], &shared);
-        shared.record_stream_error("The requested device is no longer available.".to_string());
-        let take = handle.stop().expect("the audio before the fault is returned");
-        assert_eq!(take.audio.samples.len(), 320);
-        assert_eq!(
-            take.device_fault.as_deref(),
-            Some("The requested device is no longer available.")
-        );
-
-        let shared = test_shared(8_192);
-        let handle = test_handle(Arc::clone(&shared), 16_000);
-        CallbackState::new(1).process(&[0.2f32; 320], &shared);
-        let take = handle.stop().expect("clean take");
-        assert_eq!(take.device_fault, None, "a healthy take carries no fault");
+        assert!(handle.input_stalled_for().expect("samples arrived") < stalled);
     }
 
     #[test]
@@ -2844,12 +2728,10 @@ mod tests {
         }
     }
 
+    /// Live capture on whatever input this machine has; skips itself
+    /// without one.
     #[test]
     fn live_capture_reports_the_route_it_opened() {
-        // #222 on whatever input this machine has: following the default
-        // reports the default, and a preferred device that does not exist
-        // falls back to it visibly instead of failing or recording
-        // silently from it.
         let handle = match start_capture(CaptureRequest::default()) {
             Ok(handle) => handle,
             Err(err) => {
@@ -2875,6 +2757,8 @@ mod tests {
         let _ = handle.stop();
     }
 
+    /// Live round-trip against the real microphone. Skips itself (rather than
+    /// failing) in environments without an input device.
     #[test]
     fn live_capture_produces_mono_samples() {
         let handle = match start_recording() {

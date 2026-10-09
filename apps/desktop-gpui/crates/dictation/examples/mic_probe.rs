@@ -1,8 +1,7 @@
-//! Microphone selection probe (#222): lists the capture devices the host
-//! reports, then records a short take through the app's own start path
-//! with the given preference and prints the route it resolved to, the raw
-//! level, and any start problem — the evidence behind the settings
-//! picker's preferred/active/fallback display.
+//! Microphone selection probe: lists the capture devices the host reports,
+//! then records a short take through the app's start path with the given
+//! preference and prints the route it resolved to, the level, and any
+//! start problem.
 //! Run: cargo run -p starling-dictation --example mic_probe -- [preferred-device|-] [seconds]
 
 use std::time::Duration;
@@ -52,7 +51,6 @@ fn main() {
     }
     std::thread::sleep(Duration::from_secs_f64(seconds));
     println!("stalled for: {:?}", handle.input_stalled_for());
-    println!("source peak: {:.5}", handle.source_peak());
     if let Some(fault) = handle.capture_fault() {
         println!("fault: {fault:?} (fatal: {})", fault.is_fatal());
     }

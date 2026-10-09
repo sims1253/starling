@@ -1,23 +1,13 @@
-//! Microphone selection (#222): which capture device a take opens, why,
-//! and how the capture path explains an input that is missing, refused,
-//! dead or silent.
+//! Microphone selection: which capture device a take opens, why, and how
+//! the capture path explains an input that is missing, refused, dead or
+//! silent.
 //!
-//! Three things are kept apart on purpose:
-//!
-//! - the user's **preference** — "follow the system default" or one named
-//!   device — stored in settings and only ever changed by the user;
-//! - the **route** a take actually opened ([`InputRoute`]) — the preferred
-//!   device when it is present, otherwise the system default with the
-//!   reason stated;
-//! - the **listing** of devices the host reports right now, which can be
-//!   empty or fail transiently.
-//!
-//! A preferred device that is missing, or a listing that fails, never
-//! rewrites the preference: the take falls back to the system default and
-//! says so ([`InputRoute::notice`]). The route is resolved once, when the
-//! take starts; nothing in the recorder ever moves a running take to a
-//! different device. A device that disappears mid-take surfaces as a fatal
-//! capture fault instead (see [`crate::recorder::RecorderFault`]).
+//! The user's preference ("follow the system default" or one named device)
+//! is only ever changed by the user. Each take resolves it once, at start,
+//! into an [`InputRoute`]: the preferred device when it is listed,
+//! otherwise the system default with a visible [`InputRoute::notice`]. A
+//! running take is never moved to another device; one that disappears
+//! mid-take surfaces as a fatal [`crate::recorder::RecorderFault`].
 //!
 //! Device identity is the host's device name: cpal 0.15 exposes no stable
 //! device id, so two devices reporting the same name resolve to the first
@@ -68,21 +58,17 @@ pub struct InputRoute {
     pub reason: RouteReason,
 }
 
-/// Whether `device` is a sound-server routing device rather than a
-/// physical input: on Linux the ALSA `default`/`pulse`/`pipewire`/`jack`
-/// PCMs hand capture to PulseAudio, PipeWire or JACK, which choose — and
-/// may change mid-stream — the physical source. Starling cannot see or pin
-/// that choice through ALSA, so the UI must say so instead of naming the
-/// route as if it were one microphone.
-pub fn is_sound_server_device(device: &str) -> bool {
-    cfg!(target_os = "linux") && matches!(device, "default" | "pulse" | "pipewire" | "jack")
-}
-
 impl InputRoute {
     /// Whether the physical microphone behind this route is chosen (and
-    /// may be switched mid-take) by the sound server, not by Starling.
+    /// may be switched mid-take) by the sound server, not by Starling: on
+    /// Linux the ALSA `default`/`pulse`/`pipewire`/`jack` PCMs hand capture
+    /// to PulseAudio, PipeWire or JACK, which Starling cannot see or pin.
     pub fn follows_sound_server(&self) -> bool {
-        is_sound_server_device(&self.device)
+        cfg!(target_os = "linux")
+            && matches!(
+                self.device.as_str(),
+                "default" | "pulse" | "pipewire" | "jack"
+            )
     }
 
     /// Whether the take records from something other than the device the
@@ -115,33 +101,6 @@ impl InputRoute {
     }
 }
 
-/// What to open, decided from the preference and the current listing
-/// before any device is touched. Pure, so every fallback rule is testable
-/// without hardware.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum RoutePlan {
-    /// Open the listed device with this name.
-    Named(String),
-    /// Open the system default input, for this reason.
-    Default(RouteReason),
-}
-
-/// Resolves a preference against a listing. `listing` is `Err` when the
-/// host failed to enumerate; that only matters when a device is preferred
-/// (following the default never needs the list).
-pub fn plan_route(preferred: Option<&str>, listing: Result<&[InputDevice], &str>) -> RoutePlan {
-    let Some(preferred) = preferred else {
-        return RoutePlan::Default(RouteReason::FollowingDefault);
-    };
-    match listing {
-        Ok(devices) if devices.iter().any(|device| device.name == preferred) => {
-            RoutePlan::Named(preferred.to_string())
-        }
-        Ok(_) => RoutePlan::Default(RouteReason::PreferredMissing),
-        Err(error) => RoutePlan::Default(RouteReason::ListingFailed(error.to_string())),
-    }
-}
-
 /// Lists the default host's capture devices, default first-flagged.
 /// Devices whose name cannot be read are skipped (they cannot be selected
 /// or remembered). Blocking: on ALSA, listing probes each PCM, so call it
@@ -163,60 +122,31 @@ pub fn list_input_devices() -> Result<Vec<InputDevice>, String> {
     Ok(devices)
 }
 
-/// The name of the host's current default input, if there is one.
-/// Blocking, like [`list_input_devices`].
-pub fn default_input_name() -> Option<String> {
-    cpal::default_host()
-        .default_input_device()
-        .and_then(|device| device.name().ok())
-}
-
 /// Opens the device a preference resolves to now, with the route that
-/// explains it. A preferred device that vanished between listing and
-/// lookup degrades to the default like a missing one.
+/// explains it. A missing preferred device, or a failed listing, falls
+/// back to the system default.
 pub(crate) fn open_input(
     preferred: Option<&str>,
 ) -> Result<(cpal::Device, InputRoute), InputProblem> {
     let host = cpal::default_host();
-    // The listing is only needed (and only taken) when a device is
-    // preferred; a failed listing is a reason, never an error.
-    let mut named: Vec<(String, cpal::Device)> = Vec::new();
-    let listing = match preferred {
-        None => Ok(Vec::new()),
-        Some(_) => host
-            .input_devices()
-            .map(|devices| {
-                named = devices
-                    .filter_map(|device| device.name().ok().map(|name| (name, device)))
-                    .collect();
-                named
-                    .iter()
-                    .map(|(name, _)| InputDevice {
-                        name: name.clone(),
-                        is_default: false,
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .map_err(|err| err.to_string()),
-    };
-    let reason = match plan_route(preferred, listing.as_deref().map_err(String::as_str)) {
-        RoutePlan::Named(name) => {
-            // `plan_route` only names a device it found in `named`.
-            let index = named
-                .iter()
-                .position(|(listed, _)| *listed == name)
-                .expect("a named plan comes from the listing");
-            let (_, device) = named.swap_remove(index);
-            return Ok((
-                device,
-                InputRoute {
-                    preferred: Some(name.clone()),
-                    device: name,
-                    reason: RouteReason::Preferred,
-                },
-            ));
-        }
-        RoutePlan::Default(reason) => reason,
+    let reason = match preferred {
+        None => RouteReason::FollowingDefault,
+        Some(name) => match host.input_devices() {
+            Ok(mut devices) => {
+                if let Some(device) =
+                    devices.find(|device| device.name().is_ok_and(|listed| listed == name))
+                {
+                    let route = InputRoute {
+                        preferred: Some(name.to_string()),
+                        device: name.to_string(),
+                        reason: RouteReason::Preferred,
+                    };
+                    return Ok((device, route));
+                }
+                RouteReason::PreferredMissing
+            }
+            Err(err) => RouteReason::ListingFailed(err.to_string()),
+        },
     };
     let device = host
         .default_input_device()
@@ -407,100 +337,34 @@ pub fn meter_fill(dbfs: f32) -> f32 {
 mod tests {
     use super::*;
 
-    fn listed(names: &[(&str, bool)]) -> Vec<InputDevice> {
-        names
-            .iter()
-            .map(|(name, is_default)| InputDevice {
-                name: name.to_string(),
-                is_default: *is_default,
-            })
-            .collect()
-    }
-
-    #[test]
-    fn following_the_default_never_needs_the_listing() {
-        assert_eq!(
-            plan_route(None, Err("backend down")),
-            RoutePlan::Default(RouteReason::FollowingDefault)
-        );
-        assert_eq!(
-            plan_route(None, Ok(&[])),
-            RoutePlan::Default(RouteReason::FollowingDefault)
-        );
-    }
-
-    #[test]
-    fn a_listed_preferred_device_is_opened_by_name() {
-        let devices = listed(&[("Laptop Mic", true), ("USB Mic", false)]);
-        assert_eq!(
-            plan_route(Some("USB Mic"), Ok(&devices)),
-            RoutePlan::Named("USB Mic".to_string())
-        );
-    }
-
-    #[test]
-    fn a_missing_preferred_device_falls_back_to_the_default_visibly() {
-        let devices = listed(&[("Laptop Mic", true)]);
-        assert_eq!(
-            plan_route(Some("USB Mic"), Ok(&devices)),
-            RoutePlan::Default(RouteReason::PreferredMissing)
-        );
-        let route = InputRoute {
+    fn route(device: &str, reason: RouteReason) -> InputRoute {
+        InputRoute {
             preferred: Some("USB Mic".to_string()),
-            device: "Laptop Mic".to_string(),
-            reason: RouteReason::PreferredMissing,
-        };
-        assert!(route.is_fallback());
-        let notice = route.notice().expect("a fallback is announced");
+            device: device.to_string(),
+            reason,
+        }
+    }
+
+    #[test]
+    fn fallback_routes_announce_themselves_and_keep_the_preference() {
+        let missing = route("Laptop Mic", RouteReason::PreferredMissing);
+        assert!(missing.is_fallback());
+        let notice = missing.notice().expect("a fallback is announced");
         assert!(notice.contains("USB Mic"), "{notice}");
         assert!(notice.contains("Laptop Mic"), "{notice}");
         assert!(notice.contains("kept"), "{notice}");
-    }
 
-    #[test]
-    fn a_failed_listing_falls_back_without_forgetting_the_preference() {
-        let plan = plan_route(Some("USB Mic"), Err("ALSA lib busy"));
-        assert_eq!(
-            plan,
-            RoutePlan::Default(RouteReason::ListingFailed("ALSA lib busy".to_string()))
+        let unlisted = route(
+            "default",
+            RouteReason::ListingFailed("ALSA lib busy".to_string()),
         );
-        let route = InputRoute {
-            preferred: Some("USB Mic".to_string()),
-            device: "default".to_string(),
-            reason: RouteReason::ListingFailed("ALSA lib busy".to_string()),
-        };
-        assert!(route.is_fallback());
-        let notice = route.notice().expect("a fallback is announced");
+        assert!(unlisted.is_fallback());
+        let notice = unlisted.notice().expect("a fallback is announced");
         assert!(notice.contains("ALSA lib busy"), "{notice}");
         assert!(notice.contains("USB Mic"), "{notice}");
-    }
 
-    #[test]
-    fn reconnecting_the_preferred_device_resolves_back_to_it() {
-        // Unplugged: the next take falls back. Plugged back in: the very
-        // next resolution picks it again — the preference was never
-        // rewritten by the fallback.
-        let preferred = Some("USB Mic");
-        let unplugged = listed(&[("Laptop Mic", true)]);
-        let replugged = listed(&[("Laptop Mic", true), ("USB Mic", false)]);
-        assert_eq!(
-            plan_route(preferred, Ok(&unplugged)),
-            RoutePlan::Default(RouteReason::PreferredMissing)
-        );
-        assert_eq!(
-            plan_route(preferred, Ok(&replugged)),
-            RoutePlan::Named("USB Mic".to_string())
-        );
-    }
-
-    #[test]
-    fn routes_that_honour_the_choice_carry_no_notice() {
         for reason in [RouteReason::FollowingDefault, RouteReason::Preferred] {
-            let route = InputRoute {
-                preferred: None,
-                device: "Laptop Mic".to_string(),
-                reason,
-            };
+            let route = route("Laptop Mic", reason);
             assert!(!route.is_fallback());
             assert_eq!(route.notice(), None);
         }
@@ -576,7 +440,11 @@ mod tests {
     fn sound_server_routes_are_recognised_on_linux_only() {
         let linux = cfg!(target_os = "linux");
         for name in ["default", "pulse", "pipewire", "jack"] {
-            assert_eq!(is_sound_server_device(name), linux, "{name}");
+            assert_eq!(
+                route(name, RouteReason::FollowingDefault).follows_sound_server(),
+                linux,
+                "{name}"
+            );
         }
         for name in [
             "hw:CARD=USB,DEV=0",
@@ -584,14 +452,11 @@ mod tests {
             "USB Mic",
             "wslg_mic",
         ] {
-            assert!(!is_sound_server_device(name), "{name}");
+            assert!(
+                !route(name, RouteReason::FollowingDefault).follows_sound_server(),
+                "{name}"
+            );
         }
-        let route = InputRoute {
-            preferred: None,
-            device: "default".to_string(),
-            reason: RouteReason::FollowingDefault,
-        };
-        assert_eq!(route.follows_sound_server(), linux);
     }
 
     #[test]
