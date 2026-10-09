@@ -149,7 +149,8 @@ fn process(
         &context_fields,
         &ContextValues::default(),
         &options(id),
-    );
+    )
+    .unwrap();
     pipeline::run(
         &request,
         Some(provider.as_ref()),
@@ -313,7 +314,8 @@ fn raw_survives_every_failure() {
             &context_fields,
             &ContextValues::default(),
             &request_options,
-        );
+        )
+        .unwrap();
         let result = pipeline::run(
             &request,
             Some(provider.as_ref()),
@@ -378,7 +380,8 @@ fn transcribe_only_and_builtin_plans() {
         &[],
         &ContextValues::default(),
         &options("b1"),
-    );
+    )
+    .unwrap();
     assert!(request.kinds.is_empty());
     assert!(request.prompt_version.is_none());
     let result = pipeline::run(
@@ -392,25 +395,150 @@ fn transcribe_only_and_builtin_plans() {
     assert_eq!(result.provider.kind, ProviderKind::Builtin);
 }
 
+/// Marks the split's delimiter and instruction as the draft's command
+/// region, as the app does.
+fn mark_instruction(draft: &mut Draft, text: &str) {
+    let split = starling_processing::instructions::split(text, Some("en"));
+    let (Some((start, _)), Some((_, end))) = (split.delimiter_span, split.instruction_span) else {
+        panic!("fixture must fire");
+    };
+    assert_eq!(
+        draft.mark_command(start, end, CommandKind::TrailingInstruction),
+        Outcome::Applied
+    );
+}
+
 #[test]
-fn instructions_travel_only_for_rewrite() {
+fn instruction_fixtures_replay_like_the_oracle() {
+    let cases = fixture("spoken-instructions.json");
+    let mut failures = Vec::new();
+    for case in cases.as_array().unwrap() {
+        let got = starling_processing::instructions::split(
+            case["input"].as_str().unwrap(),
+            case["language"].as_str(),
+        );
+        let got = json!({
+            "matched": got.matched,
+            "payload": got.payload,
+            "instruction": got.instruction,
+            "delimiter_span": got.delimiter_span,
+            "instruction_span": got.instruction_span,
+        });
+        if got != case["expected"] {
+            failures.push(format!("{}: got {got}", case["name"]));
+        }
+    }
+    assert!(!cases.as_array().unwrap().is_empty());
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+#[test]
+fn an_instruction_never_reaches_a_model_that_cannot_take_one() {
+    // S1-mini cleanup (and the builtin step) cannot follow an
+    // instruction: the request is refused, never built without it.
     let mut draft = Draft::new("d", "c");
-    draft.final_attempt(0, "a", "send the report make it formal");
-    draft.mark_command(15, 30, CommandKind::TrailingInstruction);
+    let text = "send the report Starling, make it formal";
+    draft.final_attempt(0, "a", text);
+    mark_instruction(&mut draft, text);
+    let mode = clean_mode("local-authoring-chat", true);
+    let s1 = {
+        let mut decl = chat_decl(Locality::Local);
+        decl.instructions = false;
+        decl.transform_kinds = vec![TransformKind::Clean];
+        decl
+    };
+    let refused = build_request(
+        &draft,
+        &mode,
+        &s1,
+        &[],
+        &ContextValues::default(),
+        &options("g1"),
+    );
+    let (request, failure) = refused.unwrap_err();
+    assert_eq!(failure.detail, pipeline::INSTRUCTION_CAPABLE_DETAIL);
+    // The refused request still names the job (the caller records the
+    // refusal against it); the instruction does not travel with it.
+    assert_eq!(request.request_id, "g1");
+    assert!(request.instruction.is_none());
+    let builtin = build_request(
+        &draft,
+        &mode,
+        &pipeline::builtin_declaration(),
+        &[],
+        &ContextValues::default(),
+        &options("g2"),
+    );
+    assert!(builtin.is_err());
+    // The raw text stands: nothing was sent anywhere.
+    assert_eq!(draft.text(), text);
+}
+
+#[test]
+fn an_instruction_with_no_payload_is_refused_too() {
+    let mut draft = Draft::new("d", "c");
+    let text = "Starling, clean this up";
+    draft.final_attempt(0, "a", text);
+    mark_instruction(&mut draft, text);
     let mut mode = clean_mode("local-authoring-chat", true);
+    mode.transform_kinds = vec![TransformKind::Rewrite];
+    mode.style = None;
     let decl = chat_decl(Locality::Local);
-    let clean = build_request(
+    let refused = build_request(
         &draft,
         &mode,
         &decl,
         &[],
         &ContextValues::default(),
-        &options("c1"),
+        &options("g3"),
     );
-    assert_eq!(clean.input, "send the report");
-    assert_eq!(clean.instruction, None);
+    assert_eq!(
+        refused.unwrap_err().1.detail,
+        pipeline::INSTRUCTION_EMPTY_DETAIL
+    );
+}
+
+#[test]
+fn an_instruction_that_strips_to_nothing_is_refused_not_dropped() {
+    // A command region carrying only the delimiter (the instruction was
+    // edited away) must not become `instruction: None`.
+    let mut draft = Draft::new("d", "c");
+    let text = "send the report Starling,";
+    draft.final_attempt(0, "a", text);
+    let end = text.chars().count();
+    assert_eq!(
+        draft.mark_command(16, end, CommandKind::TrailingInstruction),
+        Outcome::Applied
+    );
+    assert_eq!(draft.instruction().as_deref(), Some("Starling,"));
+    let mut mode = clean_mode("local-authoring-chat", true);
     mode.transform_kinds = vec![TransformKind::Rewrite];
     mode.style = None;
+    let (_, failure) = build_request(
+        &draft,
+        &mode,
+        &chat_decl(Locality::Local),
+        &[],
+        &ContextValues::default(),
+        &options("g4"),
+    )
+    .unwrap_err();
+    assert_eq!(failure.reason, FailureReason::InvalidInput);
+    assert_eq!(failure.detail, pipeline::INSTRUCTION_BLANK_DETAIL);
+    // The raw text stands: nothing was sent anywhere.
+    assert_eq!(draft.text(), text);
+}
+
+#[test]
+fn the_delimiter_is_stripped_from_the_instruction_the_model_sees() {
+    let mut draft = Draft::new("d", "c");
+    let text = "send the report Starling, make it formal";
+    draft.final_attempt(0, "a", text);
+    mark_instruction(&mut draft, text);
+    let mut mode = clean_mode("local-authoring-chat", true);
+    mode.transform_kinds = vec![TransformKind::Rewrite];
+    mode.style = None;
+    let decl = chat_decl(Locality::Local);
     let rewrite = build_request(
         &draft,
         &mode,
@@ -418,8 +546,11 @@ fn instructions_travel_only_for_rewrite() {
         &[],
         &ContextValues::default(),
         &options("c2"),
-    );
-    assert_eq!(rewrite.instruction.as_deref(), Some(" make it formal"));
+    )
+    .unwrap();
+    // The command region carries the delimiter; the request does not.
+    assert_eq!(rewrite.input, "send the report ");
+    assert_eq!(rewrite.instruction.as_deref(), Some("make it formal"));
     assert!(
         rewrite.context.vocabulary.is_none(),
         "no field the plan did not allow"
@@ -440,7 +571,8 @@ fn results_validate_as_the_contract_records() {
         &[],
         &ContextValues::default(),
         &options("v1"),
-    );
+    )
+    .unwrap();
     assert!(matches!(plan(faithful, &registry), Plan::Builtin));
     let result = pipeline::run(
         &request,
@@ -516,7 +648,8 @@ fn processing_recorded_events_match_the_insight_contract() {
         &[],
         &ContextValues::default(),
         &options("req:1"),
-    );
+    )
+    .unwrap();
     request.capture_id = "cap:1".into();
     let result = pipeline::run(
         &request,

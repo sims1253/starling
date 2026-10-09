@@ -6,8 +6,9 @@
 //! `processing_route`, so there is no second place that picks providers
 //! and no fallback: a blocked plan runs nothing and the raw text stands.
 //! [`build_request`] reads a [`Draft`] (never its live partials) and
-//! pins the request to the draft's revision; [`run`] executes it. A
-//! result is only ever a proposal for the draft to judge.
+//! pins the request to the draft's revision, refusing an instruction
+//! the plan cannot take; [`run`] executes it. A result is only ever a
+//! proposal for the draft to judge.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -139,9 +140,20 @@ pub struct RequestOptions {
     pub max_output_chars: u64,
 }
 
+/// Failure details of a refused trailing instruction (see [`build_request`]).
+pub const INSTRUCTION_CAPABLE_DETAIL: &str = "an instruction requires an instruction-capable model";
+pub const INSTRUCTION_EMPTY_DETAIL: &str = "an instruction has no text to work on";
+pub const INSTRUCTION_BLANK_DETAIL: &str = "an instruction must say something";
+
 /// Builds the request for the draft's current revision. The input is the
 /// draft's payload (command regions excluded) after the deterministic
 /// step; the trailing instruction, if any, travels separately.
+///
+/// Refuses a draft carrying an instruction the plan cannot take (a mode
+/// without an instruction-capable kind, a provider without instruction
+/// capability), a blank instruction, or an instruction with no payload:
+/// an instruction is never silently dropped. [`Err`] carries the refused
+/// request, without the instruction, for the caller to record.
 pub fn build_request(
     draft: &Draft,
     mode: &ModeEntry,
@@ -149,13 +161,34 @@ pub fn build_request(
     context_fields: &[ContextField],
     values: &ContextValues,
     options: &RequestOptions,
-) -> TransformRequest {
+) -> Result<TransformRequest, (TransformRequest, Failure)> {
     let input = transforms::apply(
         &draft.payload_text(),
         mode.language.as_deref(),
         mode.spoken_commands,
         &mode.snippets,
     );
+    // The model sees the instruction without its delimiter token.
+    let instruction = draft
+        .instruction()
+        .map(|region| crate::instructions::strip_delimiter(&region));
+    let refusal = instruction.as_deref().and_then(|text| {
+        let capable = provider.instructions
+            && mode
+                .transform_kinds
+                .iter()
+                .any(|kind| kind.needs_instructions());
+        let (reason, detail) = if !capable {
+            (FailureReason::UnsupportedKind, INSTRUCTION_CAPABLE_DETAIL)
+        } else if text.is_empty() {
+            (FailureReason::InvalidInput, INSTRUCTION_BLANK_DETAIL)
+        } else if input.trim().is_empty() {
+            (FailureReason::InvalidInput, INSTRUCTION_EMPTY_DETAIL)
+        } else {
+            return None;
+        };
+        Some(Failure::new(reason, false, detail))
+    });
     let model_step = provider.kind != ProviderKind::Builtin;
     let mut context = RequestContext::default();
     if model_step {
@@ -170,12 +203,7 @@ pub fn build_request(
                 .filter(|value| !value.is_empty());
         }
     }
-    let instruction = draft.instruction().filter(|_| {
-        mode.transform_kinds
-            .iter()
-            .any(|kind| kind.needs_instructions())
-    });
-    TransformRequest {
+    let request = TransformRequest {
         schema_version: 1,
         request_id: options.request_id.clone(),
         retry_of: options.retry_of.clone(),
@@ -196,13 +224,17 @@ pub fn build_request(
         },
         language: mode.language.clone(),
         input,
-        instruction,
+        instruction: instruction.filter(|_| refusal.is_none()),
         style: mode.style,
         context,
         provider: provider.reference(),
         local_only: mode.local_only,
         deadline_ms: options.deadline_ms,
         max_output_chars: options.max_output_chars,
+    };
+    match refusal {
+        None => Ok(request),
+        Some(failure) => Err((request, failure)),
     }
 }
 

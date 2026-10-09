@@ -1,0 +1,20 @@
+{
+  "$comment": [
+    "Trailing spoken instructions, schema v1. A delimiter near the end of a",
+    "finalized take splits it into payload (before) and instruction (after).",
+    "canonical is the spelling shown in the UI; match_tokens are the token",
+    "cores a recognizer may produce (lowercased, attached ,.;:!? ignored);",
+    "window_words is how many trailing words the delimiter may sit in.",
+    "Rules: the last occurrence in the window wins; a delimiter after the",
+    "language's literal word, or with no letter or digit after it, is not",
+    "an occurrence; a quoted mention never matches; offsets are Unicode",
+    "code points. Semantics: tests/spoken_instructions.py; Rust port:",
+    "apps/desktop-gpui/crates/processing/src/instructions.rs."
+  ],
+  "schema_version": 1,
+  "delimiter": {
+    "canonical": "Starling,",
+    "match_tokens": ["starling", "sterling", "starlin"],
+    "window_words": 12
+  }
+}

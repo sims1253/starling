@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:starling:contracts:mode-routing:spoken-instruction:v1",
+  "$comment": [
+    "Trailing spoken instruction record, v1: one per finalized take. The",
+    "payload is a view: raw == payload + raw[delimiter_span[0]:]. Spans are",
+    "Unicode code points. matched false means no delimiter fired: the",
+    "payload is the whole text, the instruction is empty and both spans are",
+    "null. The record cannot name a provider, route or grant.",
+    "Semantics: tests/spoken_instructions.py. Only keywords minischema.py",
+    "understands are used."
+  ],
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "matched",
+    "payload",
+    "instruction",
+    "delimiter_span",
+    "instruction_span",
+    "span_encoding"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "matched": {
+      "type": "boolean"
+    },
+    "payload": {
+      "type": "string"
+    },
+    "instruction": {
+      "type": "string"
+    },
+    "delimiter_span": {
+      "$ref": "#/$defs/span"
+    },
+    "instruction_span": {
+      "$ref": "#/$defs/span"
+    },
+    "span_encoding": {
+      "const": "unicode_codepoints"
+    }
+  },
+  "$defs": {
+    "span": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      ]
+    }
+  }
+}

@@ -38,8 +38,10 @@
       "intent": "dictate",
       "behavior": "faithful",
       "prompt_file": null,
-      "aliases": [],
-      "allow_spoken_overrides": false,
+      "aliases": [
+        "clean this"
+      ],
+      "allow_spoken_overrides": true,
       "vocabulary": [],
       "snippets": [],
       "asr_route": "local-default",
@@ -72,8 +74,10 @@
       "intent": "dictate",
       "behavior": "faithful",
       "prompt_file": null,
-      "aliases": [],
-      "allow_spoken_overrides": false,
+      "aliases": [
+        "clean this online"
+      ],
+      "allow_spoken_overrides": true,
       "vocabulary": [],
       "snippets": [],
       "asr_route": "local-default",

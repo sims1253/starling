@@ -780,6 +780,19 @@ impl Draft {
         Outcome::Applied
     }
 
+    /// Returns every command region's text to the payload as user text;
+    /// the text and the revision do not change. Spoken-phrase detection
+    /// re-marks from the current text on each run, so a stale mark cannot
+    /// outlive the edit that moved or removed its span.
+    pub fn clear_commands(&mut self) {
+        for region in &mut self.regions {
+            if region.kind == RegionKind::Command {
+                region.kind = RegionKind::User;
+                region.command = None;
+            }
+        }
+    }
+
     /// Records a transform request against the current revision.
     pub fn request_transform(&mut self, request_id: &str, retry_of: Option<&str>) -> Outcome {
         if self.deleted {
