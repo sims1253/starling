@@ -8,7 +8,7 @@
 //!   starling-serve-cpu[.exe]
 //!   starling-serve-vulkan[.exe]
 //!   SHA256SUMS.txt   "<sha256 hex>  <file name>" per line
-//!   engines.json     {"version": "...", "abi": 8, "engines": [...]}
+//!   engines.json     {"version": "...", "abi": 9, "engines": [...]}
 //!   RUNTIME.md
 //! ```
 //!
