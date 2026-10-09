@@ -16,7 +16,6 @@
           "decision_utc": "2026-10-01T10:00:00Z",
           "mode_id": "email",
           "language": "en",
-          "project_id": null,
           "secure_field": false
         },
         {
@@ -29,7 +28,6 @@
           "decision_utc": "2026-10-01T11:00:00Z",
           "mode_id": "email",
           "language": "en",
-          "project_id": null,
           "secure_field": false
         }
       ],
@@ -37,7 +35,6 @@
       "request": {
         "mode_id": "email",
         "language": "en",
-        "project_id": null,
         "max_examples": 3,
         "max_characters": 500,
         "personalization_enabled": true
@@ -65,7 +62,6 @@
           "decision_utc": "2026-10-02T10:00:00Z",
           "mode_id": "clean",
           "language": "en",
-          "project_id": null,
           "secure_field": false
         },
         {
@@ -78,7 +74,6 @@
           "decision_utc": "2026-10-02T11:00:00Z",
           "mode_id": "clean",
           "language": "en",
-          "project_id": null,
           "secure_field": false
         },
         {
@@ -91,7 +86,6 @@
           "decision_utc": "2026-10-02T12:00:00Z",
           "mode_id": "clean",
           "language": "en",
-          "project_id": null,
           "secure_field": false
         },
         {
@@ -104,7 +98,6 @@
           "decision_utc": "2026-10-02T13:00:00Z",
           "mode_id": "clean",
           "language": "en",
-          "project_id": null,
           "secure_field": false
         }
       ],
@@ -112,7 +105,6 @@
       "request": {
         "mode_id": "clean",
         "language": "en",
-        "project_id": null,
         "max_examples": 2,
         "max_characters": 500,
         "personalization_enabled": true
@@ -140,7 +132,6 @@
           "decision_utc": "2026-10-03T09:00:00Z",
           "mode_id": "clean",
           "language": "en",
-          "project_id": null,
           "secure_field": false
         },
         {
@@ -153,7 +144,6 @@
           "decision_utc": "2026-10-03T10:00:00Z",
           "mode_id": "clean",
           "language": "en",
-          "project_id": null,
           "secure_field": false
         },
         {
@@ -166,7 +156,6 @@
           "decision_utc": "2026-10-03T11:00:00Z",
           "mode_id": "clean",
           "language": "en",
-          "project_id": null,
           "secure_field": false
         }
       ],
@@ -174,7 +163,6 @@
       "request": {
         "mode_id": "clean",
         "language": "en",
-        "project_id": null,
         "max_examples": 3,
         "max_characters": 280,
         "personalization_enabled": true
@@ -202,7 +190,6 @@
           "decision_utc": "2026-10-04T10:00:00Z",
           "mode_id": "clean",
           "language": "de",
-          "project_id": null,
           "secure_field": false
         },
         {
@@ -215,7 +202,6 @@
           "decision_utc": "2026-10-04T11:00:00Z",
           "mode_id": "clean",
           "language": "es",
-          "project_id": null,
           "secure_field": false
         }
       ],
@@ -223,7 +209,6 @@
       "request": {
         "mode_id": "clean",
         "language": "de",
-        "project_id": null,
         "max_examples": 3,
         "max_characters": 500,
         "personalization_enabled": true
@@ -234,54 +219,6 @@
         ],
         "character_count": 56,
         "formatted_context": "[Style References]\nInput: hallo welt\nOutput: Hallo Welt!"
-      }
-    },
-    {
-      "id": "project_isolation",
-      "description": "Never cross-contaminates between distinct project IDs",
-      "history": [
-        {
-          "id": "rec_41",
-          "capture_id": "cap_41",
-          "request_id": "req_41",
-          "raw_text": "alpha secret formula",
-          "final_text": "Alpha Secret Formula",
-          "decision": "accepted",
-          "decision_utc": "2026-10-05T10:00:00Z",
-          "mode_id": "clean",
-          "language": "en",
-          "project_id": "project-alpha",
-          "secure_field": false
-        },
-        {
-          "id": "rec_42",
-          "capture_id": "cap_42",
-          "request_id": "req_42",
-          "raw_text": "beta public notes",
-          "final_text": "Beta Public Notes",
-          "decision": "accepted",
-          "decision_utc": "2026-10-05T11:00:00Z",
-          "mode_id": "clean",
-          "language": "en",
-          "project_id": "project-beta",
-          "secure_field": false
-        }
-      ],
-      "deleted_captures": [],
-      "request": {
-        "mode_id": "clean",
-        "language": "en",
-        "project_id": "project-alpha",
-        "max_examples": 3,
-        "max_characters": 500,
-        "personalization_enabled": true
-      },
-      "expected_result": {
-        "examples_used": [
-          "rec_41"
-        ],
-        "character_count": 75,
-        "formatted_context": "[Style References]\nInput: alpha secret formula\nOutput: Alpha Secret Formula"
       }
     },
     {
@@ -298,7 +235,6 @@
           "decision_utc": "2026-10-06T10:00:00Z",
           "mode_id": "clean",
           "language": "en",
-          "project_id": null,
           "secure_field": false
         },
         {
@@ -311,7 +247,6 @@
           "decision_utc": "2026-10-06T11:00:00Z",
           "mode_id": "clean",
           "language": "en",
-          "project_id": null,
           "secure_field": true
         },
         {
@@ -324,7 +259,6 @@
           "decision_utc": "2026-10-06T12:00:00Z",
           "mode_id": "clean",
           "language": "en",
-          "project_id": null,
           "secure_field": false
         }
       ],
@@ -334,7 +268,6 @@
       "request": {
         "mode_id": "clean",
         "language": "en",
-        "project_id": null,
         "max_examples": 3,
         "max_characters": 500,
         "personalization_enabled": true
@@ -361,7 +294,6 @@
           "decision_utc": "2026-10-08T10:00:00Z",
           "mode_id": "clean",
           "language": "en",
-          "project_id": null,
           "secure_field": false
         },
         {
@@ -374,7 +306,6 @@
           "decision_utc": "2026-10-08T11:00:00Z",
           "mode_id": "clean",
           "language": "en",
-          "project_id": null,
           "secure_field": false
         },
         {
@@ -387,7 +318,6 @@
           "decision_utc": "2026-10-08T12:00:00Z",
           "mode_id": "clean",
           "language": "en",
-          "project_id": null,
           "secure_field": false
         },
         {
@@ -400,7 +330,6 @@
           "decision_utc": "2026-10-08T13:00:00Z",
           "mode_id": "clean",
           "language": "en",
-          "project_id": null,
           "secure_field": false
         }
       ],
@@ -408,7 +337,6 @@
       "request": {
         "mode_id": "clean",
         "language": "en",
-        "project_id": null,
         "max_examples": 3,
         "max_characters": 500,
         "personalization_enabled": true
@@ -436,7 +364,6 @@
           "decision_utc": "2026-10-09T10:00:00Z",
           "mode_id": "clean",
           "language": null,
-          "project_id": null,
           "secure_field": false
         },
         {
@@ -449,7 +376,6 @@
           "decision_utc": "2026-10-09T11:00:00Z",
           "mode_id": "clean",
           "language": "en",
-          "project_id": null,
           "secure_field": false
         }
       ],
@@ -457,7 +383,6 @@
       "request": {
         "mode_id": "clean",
         "language": null,
-        "project_id": null,
         "max_examples": 3,
         "max_characters": 500,
         "personalization_enabled": true
@@ -484,7 +409,6 @@
           "decision_utc": "2026-10-07T10:00:00Z",
           "mode_id": "clean",
           "language": "en",
-          "project_id": null,
           "secure_field": false
         }
       ],
@@ -492,7 +416,6 @@
       "request": {
         "mode_id": "clean",
         "language": "en",
-        "project_id": null,
         "max_examples": 3,
         "max_characters": 500,
         "personalization_enabled": false

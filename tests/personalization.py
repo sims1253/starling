@@ -6,40 +6,39 @@ mined from correction records, and few-shot style retrieval.
 from __future__ import annotations
 
 import difflib
+import hashlib
 import re
+from collections import Counter
 from typing import Any
 
 ATTACHED = ",.;:!?"
 HEADER = "[Style References]"
 # Decisions whose final text the user endorsed.
 ELIGIBLE_DECISIONS = {"accepted", "edited"}
-# A whitespace token containing a path/URL/email separator, an inner dot,
-# an underscore or camelCase is code-like and never rewritten.
-PROTECTED = re.compile(r"[/\\@_]|\w\.\w|[a-z][A-Z]")
+# Transforms that change wording on purpose; their records are not mined.
+UNMINED_KINDS = {"rewrite", "translate"}
+PROTECTED = re.compile(
+    r"`[^`]*`"  # inline code
+    r"|\S*[/\\](?:[\w -]*[/\\])*\S*"  # paths and URLs; inner segments may hold spaces
+    r"|\S*(?:[@_]|\w\.\w|[a-z][A-Z])\S*"  # emails, identifiers, dotted names
+)
 
 
-def extract_substitutions(raw_text: str, final_text: str) -> list[tuple[str, str]]:
-    """(source, target) pairs between raw and final text, including unchanged
-    tokens as (token, token) so they count against consistency. Sources are
-    lowercased; targets keep their casing."""
-    raw_tokens = [t.strip(ATTACHED) for t in raw_text.split()]
-    final_tokens = [t.strip(ATTACHED) for t in final_text.split()]
+def tokens(text: str) -> list[str]:
+    return [t for t in (t.strip(ATTACHED) for t in text.split()) if t]
+
+
+def extract_substitutions(raw: list[str], final: list[str]) -> list[tuple[str, str]]:
+    """Replaced token runs as (source, target); sources are lowercased,
+    targets keep their casing."""
     matcher = difflib.SequenceMatcher(
-        None,
-        [t.lower() for t in raw_tokens],
-        [t.lower() for t in final_tokens],
-        autojunk=False,
+        None, [t.lower() for t in raw], [t.lower() for t in final], autojunk=False
     )
-    substitutions: list[tuple[str, str]] = []
-    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
-        if tag == "replace":
-            src = " ".join(raw_tokens[i1:i2])
-            tgt = " ".join(final_tokens[j1:j2])
-            if src and tgt and src.lower() != tgt.lower():
-                substitutions.append((src.lower(), tgt))
-        elif tag == "equal":
-            substitutions.extend((t.lower(), t) for t in raw_tokens[i1:i2] if t)
-    return substitutions
+    return [
+        (" ".join(raw[i1:i2]).lower(), " ".join(final[j1:j2]))
+        for tag, i1, i2, j1, j2 in matcher.get_opcodes()
+        if tag == "replace"
+    ]
 
 
 def is_eligible(rec: dict[str, Any]) -> bool:
@@ -49,6 +48,11 @@ def is_eligible(rec: dict[str, Any]) -> bool:
         and bool((rec.get("raw_text") or "").strip())
         and bool((rec.get("final_text") or "").strip())
     )
+
+
+def suggestion_id(source: str, target: str) -> str:
+    digest = hashlib.sha256(f"{source}\n{target}".encode()).hexdigest()
+    return f"sug_{digest[:16]}"
 
 
 def suggest_vocabulary_and_replacements(
@@ -61,44 +65,50 @@ def suggest_vocabulary_and_replacements(
     vocabulary = {v.lower() for v in existing_vocabulary or []}
     snippets = {s["spoken"].lower(): s["expansion"] for s in existing_snippets or []}
 
-    counts: dict[str, dict[str, int]] = {}
-    last_seen: dict[str, str] = {}
-    for rec in filter(is_eligible, records):
-        for src, tgt in extract_substitutions(rec["raw_text"], rec["final_text"]):
-            targets = counts.setdefault(src, {})
-            targets[tgt] = targets.get(tgt, 0) + 1
-            if tgt.lower() != src:
-                last_seen[src] = max(last_seen.get(src, ""), rec["decision_utc"])
+    edits: Counter[tuple[str, str]] = Counter()
+    last_seen: dict[tuple[str, str], str] = {}
+    raw_texts: list[list[str]] = []
+    for rec in records:
+        if not is_eligible(rec) or UNMINED_KINDS & set(rec.get("transform_kinds") or []):
+            continue
+        raw = tokens(rec["raw_text"])
+        raw_texts.append([t.lower() for t in raw])
+        for src, tgt in extract_substitutions(raw, tokens(rec["final_text"])):
+            edits[src, tgt] += 1
+            last_seen[src, tgt] = max(last_seen.get((src, tgt), ""), rec["decision_utc"])
 
+    def occurrences(phrase: str) -> int:
+        words = phrase.split()
+        n = len(words)
+        return sum(t[i : i + n] == words for t in raw_texts for i in range(len(t) - n + 1))
+
+    frequent = {pair: f for pair, f in edits.items() if f >= min_frequency}
     suggestions: list[dict[str, Any]] = []
-    for src, targets in counts.items():
-        total = sum(targets.values())
-        edits = {t: f for t, f in targets.items() if t.lower() != src and f >= min_frequency}
-        for tgt, freq in edits.items():
-            consistency = freq / total
-            if consistency < min_consistency:
-                continue
-            if tgt.lower() in vocabulary:
-                conflict = "already_in_vocabulary"
-            elif src in snippets:
-                conflict = "snippet_collision" if snippets[src] != tgt else None
-            elif len(edits) > 1:
-                conflict = "competing_targets"
-            else:
-                conflict = None
-            suggestions.append(
-                {
-                    "id": f"sug_{src.replace(' ', '_')}_{tgt.replace(' ', '_').lower()}",
-                    "target_type": "replacement" if " " in src or " " in tgt else "vocabulary",
-                    "source_phrase": src,
-                    "target_phrase": tgt,
-                    "frequency": freq,
-                    "consistency": round(consistency, 4),
-                    "status": "suggested",
-                    "conflict": conflict,
-                    "last_seen_utc": last_seen[src],
-                }
-            )
+    for (src, tgt), freq in frequent.items():
+        consistency = freq / occurrences(src)
+        if consistency < min_consistency:
+            continue
+        if tgt.lower() in vocabulary:
+            conflict = "already_in_vocabulary"
+        elif snippets.get(src, tgt) != tgt:
+            conflict = "snippet_collision"
+        elif sum(s == src for s, _ in frequent) > 1:
+            conflict = "competing_targets"
+        else:
+            conflict = None
+        suggestions.append(
+            {
+                "id": suggestion_id(src, tgt),
+                "target_type": "replacement" if " " in src or " " in tgt else "vocabulary",
+                "source_phrase": src,
+                "target_phrase": tgt,
+                "frequency": freq,
+                "consistency": round(consistency, 4),
+                "status": "suggested",
+                "conflict": conflict,
+                "last_seen_utc": last_seen[src, tgt],
+            }
+        )
 
     suggestions.sort(key=lambda s: (-s["frequency"], -s["consistency"], s["source_phrase"]))
     return suggestions
@@ -118,9 +128,8 @@ def retrieve_style_examples(
             for rec in history
             if is_eligible(rec)
             and rec.get("capture_id") not in deleted
-            and all(
-                rec.get(key) == request.get(key) for key in ("mode_id", "language", "project_id")
-            )
+            and rec.get("mode_id") == request["mode_id"]
+            and rec.get("language") == request.get("language")
         ]
         eligible.sort(key=lambda r: (r["decision_utc"], r["id"]), reverse=True)
 
@@ -147,18 +156,20 @@ def retrieve_style_examples(
 
 
 def apply_suggestions_to_text(text: str, suggestions: list[dict[str, Any]]) -> str:
-    """Apply accepted suggestions in one pass (no chained rewrites), leaving
-    code-like tokens (paths, URLs, identifiers) untouched."""
-    mapping = {s["source_phrase"].lower(): s["target_phrase"] for s in suggestions}
-    if not mapping:
+    """Apply accepted suggestions in one pass (no chained rewrites), outside
+    protected spans (inline code, paths, URLs, identifiers)."""
+    if not suggestions:
         return text
-    sources = sorted(mapping, key=len, reverse=True)
-    pattern = re.compile(r"\b(?:" + "|".join(map(re.escape, sources)) + r")\b", re.IGNORECASE)
+    ordered = sorted(suggestions, key=lambda s: len(s["source_phrase"]), reverse=True)
+    pattern = re.compile(
+        r"\b(?:" + "|".join(f"({re.escape(s['source_phrase'])})" for s in ordered) + r")\b",
+        re.IGNORECASE,
+    )
+    protected = [m.span() for m in PROTECTED.finditer(text)]
 
     def replace(m: re.Match[str]) -> str:
-        left = re.search(r"\S*$", text[: m.start()]).group()
-        right = re.match(r"\S*", text[m.end() :]).group()
-        token = (left + m.group() + right).strip(ATTACHED)
-        return m.group() if PROTECTED.search(token) else mapping[m.group().lower()]
+        if any(start < m.end() and m.start() < end for start, end in protected):
+            return m.group()
+        return ordered[m.lastindex - 1]["target_phrase"]
 
     return pattern.sub(replace, text)

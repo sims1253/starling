@@ -1,12 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "urn:starling:contracts:personalization:v1",
-  "$comment": [
-    "Starling personalization without training, v1. Definitions only: each",
-    "payload validates against its $defs entry. correctionRecord is the subset",
-    "of a store_v2 correction_records row this contract reads; other row",
-    "columns (processed_text, provider provenance, ...) are allowed."
-  ],
+  "$comment": "Starling personalization without training, v1. Definitions only: each payload validates against its $defs entry. correctionRecord is the subset of a store_v2 correction_records row this contract reads (transform_kinds decoded to an array); other row columns are allowed.",
   "$defs": {
     "correctionRecord": {
       "type": "object",
@@ -61,11 +56,19 @@
             "null"
           ]
         },
-        "project_id": {
+        "transform_kinds": {
           "type": [
-            "string",
+            "array",
             "null"
-          ]
+          ],
+          "items": {
+            "enum": [
+              "clean",
+              "format",
+              "rewrite",
+              "translate"
+            ]
+          }
         },
         "secure_field": {
           "type": "boolean"
@@ -143,12 +146,6 @@
           "type": "string"
         },
         "language": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "project_id": {
           "type": [
             "string",
             "null"

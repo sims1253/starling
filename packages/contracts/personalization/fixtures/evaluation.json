@@ -39,6 +39,24 @@
           "protected_spans": [
             "https://sterling.example/k8s"
           ]
+        },
+        {
+          "take_id": "t5",
+          "raw": "Call `sterling()` before k8s.",
+          "unpersonalized_output": "Call `sterling()` before k8s.",
+          "ground_truth_target": "Call `sterling()` before Kubernetes.",
+          "protected_spans": [
+            "`sterling()`"
+          ]
+        },
+        {
+          "take_id": "t6",
+          "raw": "Open /my sterling notes/file.txt now.",
+          "unpersonalized_output": "Open /my sterling notes/file.txt now.",
+          "ground_truth_target": "Open /my sterling notes/file.txt now.",
+          "protected_spans": [
+            "/my sterling notes/file.txt"
+          ]
         }
       ],
       "active_suggestions": [

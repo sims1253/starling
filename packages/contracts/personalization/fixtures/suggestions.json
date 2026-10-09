@@ -16,7 +16,6 @@
           "decision_utc": "2026-10-01T10:00:00Z",
           "mode_id": "clean",
           "language": "en",
-          "project_id": null,
           "secure_field": false
         },
         {
@@ -29,7 +28,6 @@
           "decision_utc": "2026-10-01T11:00:00Z",
           "mode_id": "clean",
           "language": "en",
-          "project_id": null,
           "secure_field": false
         },
         {
@@ -42,7 +40,6 @@
           "decision_utc": "2026-10-01T12:00:00Z",
           "mode_id": "clean",
           "language": "en",
-          "project_id": null,
           "secure_field": false
         }
       ],
@@ -52,13 +49,15 @@
       "min_consistency": 0.8,
       "expected_suggestions": [
         {
+          "id": "sug_c3939c132e34266b",
           "target_type": "vocabulary",
           "source_phrase": "sterling",
           "target_phrase": "Starling",
           "frequency": 3,
           "consistency": 1.0,
           "status": "suggested",
-          "conflict": null
+          "conflict": null,
+          "last_seen_utc": "2026-10-01T12:00:00Z"
         }
       ]
     },
@@ -76,7 +75,6 @@
           "decision_utc": "2026-10-02T10:00:00Z",
           "mode_id": "clean",
           "language": "en",
-          "project_id": null,
           "secure_field": false
         },
         {
@@ -89,7 +87,6 @@
           "decision_utc": "2026-10-02T11:00:00Z",
           "mode_id": "clean",
           "language": "en",
-          "project_id": null,
           "secure_field": false
         }
       ],
@@ -113,7 +110,6 @@
           "decision_utc": "2026-10-03T10:00:00Z",
           "mode_id": "clean",
           "language": "en",
-          "project_id": null,
           "secure_field": false
         },
         {
@@ -126,7 +122,6 @@
           "decision_utc": "2026-10-03T11:00:00Z",
           "mode_id": "clean",
           "language": "en",
-          "project_id": null,
           "secure_field": false
         },
         {
@@ -139,7 +134,6 @@
           "decision_utc": "2026-10-03T12:00:00Z",
           "mode_id": "clean",
           "language": "en",
-          "project_id": null,
           "secure_field": false
         },
         {
@@ -152,7 +146,6 @@
           "decision_utc": "2026-10-03T13:00:00Z",
           "mode_id": "clean",
           "language": "en",
-          "project_id": null,
           "secure_field": false
         },
         {
@@ -165,7 +158,6 @@
           "decision_utc": "2026-10-03T14:00:00Z",
           "mode_id": "clean",
           "language": "en",
-          "project_id": null,
           "secure_field": false
         }
       ],
@@ -189,7 +181,6 @@
           "decision_utc": "2026-10-04T10:00:00Z",
           "mode_id": "clean",
           "language": "en",
-          "project_id": null,
           "secure_field": false
         },
         {
@@ -202,7 +193,6 @@
           "decision_utc": "2026-10-04T11:00:00Z",
           "mode_id": "clean",
           "language": "en",
-          "project_id": null,
           "secure_field": false
         }
       ],
@@ -214,13 +204,15 @@
       "min_consistency": 0.8,
       "expected_suggestions": [
         {
+          "id": "sug_798c30d6b48a77cb",
           "target_type": "replacement",
           "source_phrase": "world wide web",
           "target_phrase": "WWW",
           "frequency": 2,
           "consistency": 1.0,
           "status": "suggested",
-          "conflict": "already_in_vocabulary"
+          "conflict": "already_in_vocabulary",
+          "last_seen_utc": "2026-10-04T11:00:00Z"
         }
       ]
     },
@@ -238,7 +230,6 @@
           "decision_utc": "2026-10-05T10:00:00Z",
           "mode_id": "clean",
           "language": "en",
-          "project_id": null,
           "secure_field": false
         },
         {
@@ -251,7 +242,6 @@
           "decision_utc": "2026-10-05T11:00:00Z",
           "mode_id": "clean",
           "language": "en",
-          "project_id": null,
           "secure_field": false
         }
       ],
@@ -266,15 +256,224 @@
       "min_consistency": 0.8,
       "expected_suggestions": [
         {
+          "id": "sug_8bd88adc0ba93bbd",
           "target_type": "replacement",
           "source_phrase": "afk",
           "target_phrase": "away from keyboard",
           "frequency": 2,
           "consistency": 1.0,
           "status": "suggested",
-          "conflict": "snippet_collision"
+          "conflict": "snippet_collision",
+          "last_seen_utc": "2026-10-05T11:00:00Z"
         }
       ]
+    },
+    {
+      "id": "multiword_unchanged_occurrences_count",
+      "description": "Unchanged occurrences of a phrase count against its consistency (2 of 3)",
+      "records": [
+        {
+          "id": "rec_51",
+          "capture_id": "cap_51",
+          "request_id": "req_51",
+          "raw_text": "Open the world wide web link.",
+          "final_text": "Open the WWW link.",
+          "decision": "accepted",
+          "decision_utc": "2026-10-06T11:00:00Z",
+          "mode_id": "clean",
+          "language": "en",
+          "secure_field": false
+        },
+        {
+          "id": "rec_52",
+          "capture_id": "cap_52",
+          "request_id": "req_52",
+          "raw_text": "The world wide web is big.",
+          "final_text": "The WWW is big.",
+          "decision": "accepted",
+          "decision_utc": "2026-10-06T12:00:00Z",
+          "mode_id": "clean",
+          "language": "en",
+          "secure_field": false
+        },
+        {
+          "id": "rec_53",
+          "capture_id": "cap_53",
+          "request_id": "req_53",
+          "raw_text": "I like the world wide web.",
+          "final_text": "I like the world wide web.",
+          "decision": "accepted",
+          "decision_utc": "2026-10-06T13:00:00Z",
+          "mode_id": "clean",
+          "language": "en",
+          "secure_field": false
+        }
+      ],
+      "existing_vocabulary": [],
+      "existing_snippets": [],
+      "min_frequency": 2,
+      "min_consistency": 0.8,
+      "expected_suggestions": []
+    },
+    {
+      "id": "snippet_match_still_reports_competition",
+      "description": "A snippet with the same expansion does not hide a competing target",
+      "records": [
+        {
+          "id": "rec_61",
+          "capture_id": "cap_61",
+          "request_id": "req_61",
+          "raw_text": "Going afk now.",
+          "final_text": "Going away from keyboard now.",
+          "decision": "accepted",
+          "decision_utc": "2026-10-07T11:00:00Z",
+          "mode_id": "clean",
+          "language": "en",
+          "secure_field": false
+        },
+        {
+          "id": "rec_62",
+          "capture_id": "cap_62",
+          "request_id": "req_62",
+          "raw_text": "I am afk.",
+          "final_text": "I am away from keyboard.",
+          "decision": "accepted",
+          "decision_utc": "2026-10-07T12:00:00Z",
+          "mode_id": "clean",
+          "language": "en",
+          "secure_field": false
+        },
+        {
+          "id": "rec_63",
+          "capture_id": "cap_63",
+          "request_id": "req_63",
+          "raw_text": "Back from afk soon.",
+          "final_text": "Back from away from keyboard soon.",
+          "decision": "accepted",
+          "decision_utc": "2026-10-07T13:00:00Z",
+          "mode_id": "clean",
+          "language": "en",
+          "secure_field": false
+        },
+        {
+          "id": "rec_64",
+          "capture_id": "cap_64",
+          "request_id": "req_64",
+          "raw_text": "Going afk now.",
+          "final_text": "Going away for coffee now.",
+          "decision": "accepted",
+          "decision_utc": "2026-10-07T14:00:00Z",
+          "mode_id": "clean",
+          "language": "en",
+          "secure_field": false
+        },
+        {
+          "id": "rec_65",
+          "capture_id": "cap_65",
+          "request_id": "req_65",
+          "raw_text": "Still afk here.",
+          "final_text": "Still away for coffee here.",
+          "decision": "accepted",
+          "decision_utc": "2026-10-07T15:00:00Z",
+          "mode_id": "clean",
+          "language": "en",
+          "secure_field": false
+        }
+      ],
+      "existing_vocabulary": [],
+      "existing_snippets": [
+        {
+          "spoken": "afk",
+          "expansion": "away from keyboard"
+        }
+      ],
+      "min_frequency": 2,
+      "min_consistency": 0.6,
+      "expected_suggestions": [
+        {
+          "id": "sug_8bd88adc0ba93bbd",
+          "target_type": "replacement",
+          "source_phrase": "afk",
+          "target_phrase": "away from keyboard",
+          "frequency": 3,
+          "consistency": 0.6,
+          "status": "suggested",
+          "conflict": "competing_targets",
+          "last_seen_utc": "2026-10-07T13:00:00Z"
+        }
+      ]
+    },
+    {
+      "id": "rewrite_and_translate_not_mined",
+      "description": "Records from rewrite or translate transforms are not mined",
+      "records": [
+        {
+          "id": "rec_71",
+          "capture_id": "cap_71",
+          "request_id": "req_71",
+          "raw_text": "hello world",
+          "final_text": "hallo world",
+          "decision": "accepted",
+          "decision_utc": "2026-10-08T11:00:00Z",
+          "mode_id": "clean",
+          "language": "en",
+          "secure_field": false,
+          "transform_kinds": [
+            "translate"
+          ]
+        },
+        {
+          "id": "rec_72",
+          "capture_id": "cap_72",
+          "request_id": "req_72",
+          "raw_text": "hello again",
+          "final_text": "hallo again",
+          "decision": "accepted",
+          "decision_utc": "2026-10-08T12:00:00Z",
+          "mode_id": "clean",
+          "language": "en",
+          "secure_field": false,
+          "transform_kinds": [
+            "clean",
+            "translate"
+          ]
+        },
+        {
+          "id": "rec_73",
+          "capture_id": "cap_73",
+          "request_id": "req_73",
+          "raw_text": "goodbye there",
+          "final_text": "farewell there",
+          "decision": "accepted",
+          "decision_utc": "2026-10-08T13:00:00Z",
+          "mode_id": "clean",
+          "language": "en",
+          "secure_field": false,
+          "transform_kinds": [
+            "rewrite"
+          ]
+        },
+        {
+          "id": "rec_74",
+          "capture_id": "cap_74",
+          "request_id": "req_74",
+          "raw_text": "goodbye now",
+          "final_text": "farewell now",
+          "decision": "accepted",
+          "decision_utc": "2026-10-08T14:00:00Z",
+          "mode_id": "clean",
+          "language": "en",
+          "secure_field": false,
+          "transform_kinds": [
+            "rewrite"
+          ]
+        }
+      ],
+      "existing_vocabulary": [],
+      "existing_snippets": [],
+      "min_frequency": 2,
+      "min_consistency": 0.8,
+      "expected_suggestions": []
     }
   ]
 }

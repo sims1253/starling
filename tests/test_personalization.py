@@ -14,16 +14,6 @@ from parity_contract import levenshtein
 
 CONTRACT = Path(__file__).resolve().parents[1] / "packages" / "contracts" / "personalization"
 SCHEMA = json.loads((CONTRACT / "personalization.schema.json").read_text(encoding="utf-8"))
-# The fixture pins everything except the derived `id` and `last_seen_utc`.
-SUGGESTION_KEYS = (
-    "target_type",
-    "source_phrase",
-    "target_phrase",
-    "frequency",
-    "consistency",
-    "status",
-    "conflict",
-)
 
 
 def load(name: str) -> dict:
@@ -33,6 +23,11 @@ def load(name: str) -> dict:
 def assert_valid(instance: dict, definition: str) -> None:
     errs = list(minischema.errors(instance, SCHEMA["$defs"][definition], root=SCHEMA))
     assert not errs, errs
+
+
+def test_schema_is_valid_draft_2020_12():
+    jsonschema = pytest.importorskip("jsonschema")
+    jsonschema.Draft202012Validator.check_schema(SCHEMA)
 
 
 @pytest.mark.parametrize("case", load("suggestions.json")["cases"], ids=lambda c: c["id"])
@@ -48,7 +43,7 @@ def test_suggestion_fixture(case):
     )
     for suggestion in actual:
         assert_valid(suggestion, "suggestion")
-    assert [{k: s[k] for k in SUGGESTION_KEYS} for s in actual] == case["expected_suggestions"]
+    assert actual == case["expected_suggestions"]
 
 
 @pytest.mark.parametrize("case", load("retrieval.json")["cases"], ids=lambda c: c["id"])
@@ -79,3 +74,8 @@ def test_suggestions_reduce_correction_burden(session):
         for span in take["protected_spans"]:
             assert span in personalized
     assert after < before
+
+
+def test_apply_matches_case_folded_spellings():
+    suggestions = [{"source_phrase": "izmir", "target_phrase": "Izmir"}]
+    assert personalization.apply_suggestions_to_text("İzmir", suggestions) == "Izmir"
