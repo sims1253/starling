@@ -172,7 +172,7 @@ impl X11Backend {
             Ok((held != 0).then(|| modifier_names(held)))
         })?;
         let state = KeyboardState::read(session)?;
-        state.check_reproducible(session)?;
+        state.check_typable(session.num_lock_bit()?.unwrap_or(0))?;
         self.check_target(session, target_ref)?;
         Ok(state)
     }
@@ -598,9 +598,16 @@ impl KeyboardState {
         })
     }
 
-    /// Refuse states in which columns 0 and 1 are not what a key types: a
-    /// non-first group, or any locked or latched modifier except Num_Lock.
-    fn check_reproducible(&self, session: &Session) -> Result<(), InsertError> {
+    /// Refuse a chunk-start state the keystrokes cannot be verified
+    /// against: a modifier held (pressed after the wait's last read; as the
+    /// baseline it would ride every key), a non-first group, or any locked
+    /// or latched modifier except `num_lock`.
+    fn check_typable(&self, num_lock: u16) -> Result<(), InsertError> {
+        if self.base_mods != 0 {
+            return Err(InsertError::ModifiersHeld {
+                held: modifier_names(self.base_mods),
+            });
+        }
         if self.groups != [0; 4] {
             return Err(InsertError::KeyboardStateUnsupported {
                 reason: format!(
@@ -609,9 +616,8 @@ impl KeyboardState {
                 ),
             });
         }
-        let harmless = session.num_lock_bit()?.unwrap_or(0);
         for (what, mods) in [("locked", self.locked_mods), ("latched", self.latched_mods)] {
-            let mods = mods & !harmless;
+            let mods = mods & !num_lock;
             if mods != 0 {
                 return Err(InsertError::KeyboardStateUnsupported {
                     reason: format!("a modifier other than Num_Lock is {what} (mask {mods:#x})"),
@@ -1179,6 +1185,32 @@ mod tests {
             with_restore_outcome::<()>(Err(InsertError::TargetGone), Ok(())),
             Err(InsertError::TargetGone)
         );
+    }
+
+    #[test]
+    fn a_chunk_starts_only_from_a_typable_keyboard_state() {
+        let state = |base_mods, locked_mods, group| KeyboardState {
+            base_mods,
+            latched_mods: 0,
+            locked_mods,
+            groups: [group, 0, 0, group],
+        };
+        let num_lock = 0x10;
+        assert_eq!(state(0, num_lock, 0).check_typable(num_lock), Ok(()));
+        assert_eq!(
+            state(0x4, 0, 0).check_typable(num_lock),
+            Err(InsertError::ModifiersHeld {
+                held: vec!["Control".to_string()]
+            })
+        );
+        assert!(matches!(
+            state(0, 0x2, 0).check_typable(num_lock),
+            Err(InsertError::KeyboardStateUnsupported { .. })
+        ));
+        assert!(matches!(
+            state(0, 0, 1).check_typable(num_lock),
+            Err(InsertError::KeyboardStateUnsupported { .. })
+        ));
     }
 
     #[test]
