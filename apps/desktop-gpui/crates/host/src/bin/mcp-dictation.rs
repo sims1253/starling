@@ -4,7 +4,8 @@
 //! It connects to the running host, identifies itself with `--client`
 //! and the token from `STARLING_MCP_TOKEN` (or `--token`), and serves
 //! `ask_user_dictation`. Exits 0 on stdin EOF, and 1 when the host is
-//! unreachable, refuses the client, or the agent stops reading stdout.
+//! unreachable, refuses the client, or a stdout write fails or the
+//! reply queue overflows.
 //! See `docs/mcp-dictation.md`.
 
 use std::io::BufReader;
@@ -130,8 +131,8 @@ fn main() {
         std::process::exit(1);
     }
 
-    // An agent that stops reading replies has ended the session; exiting
-    // closes the host connection, and the host cancels its asks.
+    // A failed stdout write or a reply-queue overflow ends the session;
+    // exiting closes the host connection, and the host cancels its asks.
     let server = McpServer::new(std::io::stdout(), || std::process::exit(1));
 
     // Host results → tool results. If the host connection dies, pending
@@ -156,6 +157,7 @@ fn main() {
 
     let sink = HostSink { client };
     server.serve_read(BufReader::new(std::io::stdin().lock()), &sink);
+    server.drain(Duration::from_secs(2));
     // Stdin EOF: the agent ended the session. Exiting closes the host
     // connection, and the host cancels this connection's asks.
     std::process::exit(0);

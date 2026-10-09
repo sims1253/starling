@@ -34,6 +34,13 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Threading",
 ] }
 
+[features]
+# Exposes `HostConfig::with_insecure_test_app_role` to this crate's own
+# integration tests via the self dev-dependency below. Production builds
+# never enable it.
+test-support = []
+
 [dev-dependencies]
 starling-runtime = { path = "../runtime", features = ["test-doubles"] }
+starling-runtime-host = { path = ".", features = ["test-support"] }
 tempfile = "3"

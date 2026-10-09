@@ -64,9 +64,10 @@ pub struct HostConfig {
     /// file refuses startup.
     pub agent_allowlist: Option<PathBuf>,
     /// Treats every non-agent connection as the Starling app, which may
-    /// show and answer prompts. Tests only: no app-role credential
-    /// exists yet, so production leaves this off and every ask fails
-    /// with `no_app`.
+    /// show and answer prompts. No app-role credential exists yet, so
+    /// builds without the `test-support` feature have no app and every
+    /// ask fails with `no_app`.
+    #[cfg(feature = "test-support")]
     pub insecure_test_app_role: bool,
     /// The runtime this host owns. Production builds pass
     /// [`HostConfig::production`]; tests inject doubles through the same
@@ -95,6 +96,7 @@ impl HostConfig {
             settings_poll: crate::engine::DEFAULT_SETTINGS_POLL,
             engine: EngineChoice::None,
             agent_allowlist: None,
+            #[cfg(feature = "test-support")]
             insecure_test_app_role: false,
             runtime: RuntimeConfig::default(),
         }
@@ -179,6 +181,7 @@ impl HostConfig {
     }
 
     /// See [`HostConfig::insecure_test_app_role`].
+    #[cfg(feature = "test-support")]
     pub fn with_insecure_test_app_role(mut self) -> Self {
         self.insecure_test_app_role = true;
         self

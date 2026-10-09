@@ -3284,3 +3284,42 @@ fn a_journal_fault_is_surfaced_once_non_fatal_and_the_take_completes() {
     wait_for_state(&client, "Persisted", Duration::from_secs(2));
     runtime.shutdown();
 }
+
+#[test]
+fn stop_and_abort_naming_another_take_are_refused() {
+    let source = FakeCaptureSource::new(vec![FakeTakeScript::clean()]);
+    let config = test_config(
+        source,
+        starling_runtime::provider::FakeProvider::new(vec![]),
+        InMemoryCaptureStore::new(),
+        JobLimits {
+            max_queued: 8,
+            max_concurrent: 2,
+            per_route: vec![],
+        },
+    );
+    let (runtime, client) = Runtime::start(config);
+    let events = client.subscribe();
+
+    freeze_route(&client, &events);
+    client
+        .send(Some("take_a"), Command::CaptureStart { policy: "push-to-talk".into() })
+        .expect("start accepted");
+    until(&events, "capture.started", |m| m.type_name() == "capture.started", Duration::from_secs(5));
+
+    for command in [Command::CaptureStop { drain: Some(true) }, Command::CaptureAbort] {
+        match client.send(Some("take_b"), command) {
+            Err(Rejection::IllegalInState { detail, .. }) => {
+                assert!(detail.contains("take_a"), "{detail}")
+            }
+            other => panic!("a command naming another take must be refused, got {other:?}"),
+        }
+    }
+    assert_eq!(client.snapshot().capture.state, "Recording");
+
+    // Without a corr, a stop still applies to the current take.
+    client
+        .send(None, Command::CaptureStop { drain: Some(true) })
+        .expect("an uncorrelated stop is accepted");
+    runtime.shutdown();
+}

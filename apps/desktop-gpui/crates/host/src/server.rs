@@ -336,7 +336,20 @@ pub struct HostShared {
     /// The agent broker's inbox (see [`crate::agent`]).
     pub(crate) broker: Sender<BrokerMsg>,
     agent_allowlist: Allowlist,
+    #[cfg(feature = "test-support")]
     insecure_test_app_role: bool,
+}
+
+impl HostShared {
+    /// Whether a new connection holds the app role. Nothing grants it
+    /// outside the `test-support` feature until the app-role credential
+    /// exists.
+    fn grants_app_role(&self) -> bool {
+        #[cfg(feature = "test-support")]
+        return self.insecure_test_app_role;
+        #[cfg(not(feature = "test-support"))]
+        false
+    }
 }
 
 pub(crate) struct ConnState {
@@ -591,6 +604,7 @@ pub fn serve(config: HostConfig) -> Result<HostHandle, HostError> {
         live_connections: AtomicUsize::new(0),
         broker: broker_tx,
         agent_allowlist,
+        #[cfg(feature = "test-support")]
         insecure_test_app_role: config.insecure_test_app_role,
     });
 
@@ -733,7 +747,7 @@ fn accept_loop(
                     closed: AtomicBool::new(false),
                     unregistered: AtomicBool::new(false),
                     agent: AtomicBool::new(false),
-                    app: AtomicBool::new(shared.insecure_test_app_role),
+                    app: AtomicBool::new(shared.grants_app_role()),
                     closer,
                 });
 

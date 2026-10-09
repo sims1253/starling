@@ -65,10 +65,15 @@ surface must not widen that for agents, so:
   aborts the take with the no-answer `timeout`. A captured take is
   never discarded on the clock.
 - **Cancel and disconnect.** `notifications/cancelled`, or the MCP
-  server's host connection ending for any reason (including `kill -9`
-  or the agent no longer reading stdout), aborts the take with the
-  no-answer `agent_cancelled`. The app dismissing the prompt, or
-  disconnecting, stops it with `user_cancelled`.
+  server's host connection ending for any reason (including `kill -9`,
+  a stdout write failure, or reply-queue overflow), aborts the take
+  with the no-answer `agent_cancelled`. The app dismissing the prompt,
+  or disconnecting, stops it with `user_cancelled`. Cancelling a queued
+  ask answers it the same way.
+- **Settling.** An ask that ends leaves cleanup for the runtime
+  (aborting its take, expiring its provisional context). The host
+  retries it until the runtime accepts it or reports nothing left to
+  undo, and admits no other ask until then.
 - **Result mapping.** An answer is returned as plain text. A no-answer
   (timeout, cancel, decline) returns `isError: true` with
   `"No answer: <reason>."` so it cannot be mistaken for spoken words.

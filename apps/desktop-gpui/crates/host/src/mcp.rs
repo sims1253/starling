@@ -16,13 +16,15 @@
 //! `tools/call` requests may overlap. Replies are written whenever the
 //! host resolves each ask, so the stdin loop never waits on an answer
 //! and stays free to read cancellations. Replies leave through a writer
-//! thread with a bounded queue: an agent that stops reading stdout ends
-//! the session rather than stalling the stdin loop or losing replies.
+//! thread with a bounded queue: a stdout write failure or a reply-queue
+//! overflow ends the session rather than stalling the stdin loop or
+//! losing replies.
 
 use std::collections::HashMap;
 use std::io::{BufRead, Read, Write};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use starling_runtime::channel::{bounded, Receiver, Sender};
@@ -68,6 +70,8 @@ struct Shared {
     /// Host-side ask token → the JSON-RPC id waiting on it.
     pending: Mutex<HashMap<String, Value>>,
     out: Sender<String>,
+    /// Replies queued or being written.
+    unwritten: Arc<AtomicUsize>,
     broken: Arc<dyn Fn() + Send + Sync>,
 }
 
@@ -81,11 +85,13 @@ impl McpServer {
     ) -> McpServer {
         let (tx, rx) = bounded(OUT_QUEUE);
         let broken: Arc<dyn Fn() + Send + Sync> = Arc::new(on_broken);
+        let unwritten = Arc::new(AtomicUsize::new(0));
         {
             let broken = Arc::clone(&broken);
+            let unwritten = Arc::clone(&unwritten);
             std::thread::Builder::new()
                 .name("starling-mcp-write".to_string())
-                .spawn(move || write_loop(out, rx, &*broken))
+                .spawn(move || write_loop(out, rx, &unwritten, &*broken))
                 .expect("mcp writer thread spawns");
         }
         McpServer {
@@ -94,6 +100,7 @@ impl McpServer {
                 initialized: AtomicBool::new(false),
                 pending: Mutex::new(HashMap::new()),
                 out: tx,
+                unwritten,
                 broken,
             }),
         }
@@ -257,18 +264,34 @@ impl McpServer {
     /// One JSON document per line; the lock keeps concurrent replies
     /// from interleaving.
     fn write(&self, message: Value) {
+        self.inner.unwritten.fetch_add(1, Ordering::SeqCst);
         if self.inner.out.try_send(message.to_string()).is_err() {
+            self.inner.unwritten.fetch_sub(1, Ordering::SeqCst);
             (self.inner.broken)();
+        }
+    }
+
+    /// Waits, up to `within`, for every queued reply to be written.
+    pub fn drain(&self, within: Duration) {
+        let deadline = Instant::now() + within;
+        while self.inner.unwritten.load(Ordering::SeqCst) > 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
         }
     }
 }
 
-fn write_loop(mut out: impl Write, replies: Receiver<String>, broken: &dyn Fn()) {
+fn write_loop(
+    mut out: impl Write,
+    replies: Receiver<String>,
+    unwritten: &AtomicUsize,
+    broken: &dyn Fn(),
+) {
     while let Ok(line) = replies.recv() {
         if writeln!(out, "{line}").and_then(|()| out.flush()).is_err() {
             broken();
             return;
         }
+        unwritten.fetch_sub(1, Ordering::SeqCst);
     }
 }
 

@@ -8,7 +8,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use starling_runtime::channel::RecvError;
-use starling_runtime::machine::capture::{CaptureConfig, CaptureStore, TakeRecord, V2CaptureStore};
+use starling_runtime::machine::capture::{
+    CaptureConfig, CaptureSession, CaptureSource, CaptureStore, TakeRecord, V2CaptureStore,
+};
 use starling_runtime::machine::context::{ContextProvider, StubContextProvider};
 use starling_runtime::protocol::{Command, TargetSnapshotData};
 use starling_runtime::provider::{FakeJob, FakeProvider};
@@ -1312,6 +1314,140 @@ fn the_broker_never_ends_a_take_it_did_not_start() {
         "Recording",
         "the other take survives"
     );
+
+    host.shutdown();
+}
+
+#[test]
+fn cancelling_a_queued_ask_answers_it() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut host, path) = boot(root.path(), one_clean_take(), FakeProvider::new(vec![]));
+
+    let app = connect(&path);
+    let agent = agent(&path);
+    agent.ask_user("live", &["First?".into()], 30_000).unwrap();
+    let shown = until_ui(&app, "the live prompt", |frame| {
+        matches!(frame, UiWire::Show { .. })
+    });
+    agent
+        .ask_user("queued", &["Second?".into()], 30_000)
+        .unwrap();
+    agent.ask_cancel("queued", "no longer needed").unwrap();
+    match until_ask(&agent, "queued") {
+        AskOutcome::NoAnswer { reason } => assert_eq!(reason, NoAnswerReason::AgentCancelled),
+        other => panic!("expected the queued cancel, got {other:?}"),
+    }
+
+    // The live ask is untouched, and the cancelled one never prompts.
+    app.prompt_ack(&ask_id_of(&shown), false).unwrap();
+    match until_ask(&agent, "live") {
+        AskOutcome::NoAnswer { reason } => assert_eq!(reason, NoAnswerReason::Declined),
+        other => panic!("expected the decline, got {other:?}"),
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    while let Ok(frame) = app.try_recv_ui() {
+        assert!(!matches!(frame, UiWire::Show { .. }), "{frame:?}");
+    }
+
+    host.shutdown();
+}
+
+/// Holds the capture actor inside `start` until opened.
+struct GatedSource {
+    inner: Arc<FakeCaptureSource>,
+    entered: std::sync::atomic::AtomicBool,
+    open: std::sync::Mutex<bool>,
+    opened: std::sync::Condvar,
+}
+
+impl GatedSource {
+    fn release(&self) {
+        *self.open.lock().unwrap() = true;
+        self.opened.notify_all();
+    }
+}
+
+impl CaptureSource for GatedSource {
+    fn start(&self, journals: &Path, policy: &str) -> Result<Box<dyn CaptureSession>, String> {
+        self.entered
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut open = self.open.lock().unwrap();
+        while !*open {
+            open = self.opened.wait(open).unwrap();
+        }
+        drop(open);
+        self.inner.start(journals, policy)
+    }
+}
+
+#[test]
+fn an_abort_refused_by_a_full_inbox_is_retried_before_the_next_ask() {
+    let root = tempfile::tempdir().unwrap();
+    let gate = Arc::new(GatedSource {
+        inner: one_clean_take(),
+        entered: std::sync::atomic::AtomicBool::new(false),
+        open: std::sync::Mutex::new(false),
+        opened: std::sync::Condvar::new(),
+    });
+    let mut config = host_config(
+        root.path(),
+        Some(allowlist_at(root.path())),
+        one_clean_take(),
+        FakeProvider::new(vec![]),
+    );
+    config.runtime.command_capacity = 1;
+    config.runtime = config.runtime.with_capture_source(gate.clone());
+    let (mut host, path) = serve_at(config);
+
+    let app = connect(&path);
+    let agent = agent(&path);
+    agent.ask_user("1", &["Ready?".into()], 30_000).unwrap();
+    let shown = until_ui(&app, "the first prompt", |frame| {
+        matches!(frame, UiWire::Show { .. })
+    });
+    app.prompt_ack(&ask_id_of(&shown), true).unwrap();
+    // capture.start is accepted, then the actor parks in the gated source.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !gate.entered.load(std::sync::atomic::Ordering::SeqCst) {
+        assert!(Instant::now() < deadline, "the take never started");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // Fill the parked actor's one-slot inbox.
+    let filler = {
+        let filler = connect(&path);
+        std::thread::spawn(move || {
+            let _ = filler.send(Some("take_filler"), Command::CaptureAbort);
+            filler
+        })
+    };
+    std::thread::sleep(Duration::from_millis(200));
+
+    agent.ask_user("2", &["Next?".into()], 30_000).unwrap();
+    agent.ask_cancel("1", "never mind").unwrap();
+    match until_ask(&agent, "1") {
+        AskOutcome::NoAnswer { reason } => assert_eq!(reason, NoAnswerReason::AgentCancelled),
+        other => panic!("expected the cancel, got {other:?}"),
+    }
+    // The abort could not land, so the next ask stays queued.
+    std::thread::sleep(Duration::from_millis(300));
+    while let Ok(frame) = app.try_recv_ui() {
+        assert!(
+            !matches!(frame, UiWire::Show { .. }),
+            "admitted too early: {frame:?}"
+        );
+    }
+
+    gate.release();
+    let _ = filler.join();
+    until_ui(&app, "the next prompt", |frame| {
+        matches!(frame, UiWire::Show { .. })
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while capture_state(&app) != "Idle" {
+        assert!(Instant::now() < deadline, "the retried abort never landed");
+        std::thread::sleep(Duration::from_millis(20));
+    }
 
     host.shutdown();
 }

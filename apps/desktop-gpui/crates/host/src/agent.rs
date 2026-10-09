@@ -28,10 +28,12 @@
 //!   ask before capture (`declined`) and stops it after
 //!   (`user_cancelled`); the acking app disconnecting before or during
 //!   the take counts as a dismissal.
-//! - **Ending a take**: the broker only stops or aborts the take it
-//!   started (the capture machine refuses a stop or abort naming
-//!   another take). An abort the runtime cannot take yet is retried,
-//!   and no other ask is admitted until it lands.
+//! - **Settling**: an ask that ends leaves cleanup behind (aborting
+//!   its take, expiring its provisional context). The broker retries it
+//!   until the runtime accepts it or reports nothing left to undo, and
+//!   admits no other ask until then. It only ever aborts the take it
+//!   started: the capture machine refuses a stop or abort naming
+//!   another take.
 //!
 //! # Trust boundary
 //!
@@ -45,12 +47,12 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
-use std::sync::{mpsc, Arc};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use starling_runtime::bus::EventMessage;
-use starling_runtime::channel::{Receiver, RecvError};
+use starling_runtime::channel::{bounded, Receiver, RecvError, TrySendError};
 use starling_runtime::machine::Rejection;
 use starling_runtime::protocol::{Command, Event as RtEvent, Manual};
 
@@ -71,6 +73,13 @@ pub const ACK_BOUND: Duration = Duration::from_secs(10);
 
 /// The allowlist's file name inside the host's data root.
 pub const ALLOWLIST_FILE: &str = "mcp-clients.json";
+
+/// Prefix of every ask id, and so of every runtime corr the broker uses.
+const ASK_PREFIX: &str = "ask_";
+
+/// Runtime events buffered for the broker. An ask produces a handful
+/// plus capture progress, so overflow means the broker is stuck.
+const EVENT_BUFFER: usize = 1024;
 
 /// How often the broker re-checks deadlines and drains its event
 /// subscription (the bus backpressures slow subscribers).
@@ -268,12 +277,16 @@ enum Phase {
 /// everything live or queued with `Error { shutting_down }`.
 pub(crate) fn broker_loop(shared: Arc<HostShared>, inbox: Receiver<BrokerMsg>) {
     // The broker waits for receipts from runtime actors, and an actor
-    // publishing into a full subscription waits for its reader. A
-    // separate thread keeps the subscription drained so the two can
-    // never wait on each other.
-    let (event_tx, events) = mpsc::channel();
+    // publishing into a full subscription waits for its reader, so a
+    // separate thread keeps the subscription drained. It forwards only
+    // the broker's own events, into a bounded buffer; anything that
+    // does not fit is dropped and flagged, and the broker then gives up
+    // the live ask rather than miss its outcome.
+    let (event_tx, events) = bounded(EVENT_BUFFER);
+    let overflowed = Arc::new(AtomicBool::new(false));
     let forwarder = {
         let shared = Arc::clone(&shared);
+        let overflowed = Arc::clone(&overflowed);
         let subscription = shared.client.subscribe();
         std::thread::Builder::new()
             .name("starling-host-agent-events".to_string())
@@ -281,8 +294,19 @@ pub(crate) fn broker_loop(shared: Arc<HostShared>, inbox: Receiver<BrokerMsg>) {
                 while !shared.shutdown.load(Ordering::SeqCst) {
                     match subscription.recv_timeout(POLL) {
                         Ok(message) => {
-                            if event_tx.send(message).is_err() {
-                                return;
+                            let ours = message
+                                .corr
+                                .as_deref()
+                                .is_some_and(|corr| corr.starts_with(ASK_PREFIX));
+                            if !ours {
+                                continue;
+                            }
+                            match event_tx.try_send(message) {
+                                Ok(()) => {}
+                                Err(TrySendError::Full(_)) => {
+                                    overflowed.store(true, Ordering::SeqCst)
+                                }
+                                Err(TrySendError::Closed(_)) => return,
                             }
                         }
                         Err(RecvError::Timeout) => {}
@@ -297,7 +321,7 @@ pub(crate) fn broker_loop(shared: Arc<HostShared>, inbox: Receiver<BrokerMsg>) {
         next_ask: 0,
         live: None,
         waiting: VecDeque::new(),
-        aborting: None,
+        settling: Vec::new(),
     };
     loop {
         if broker.shared.shutdown.load(Ordering::SeqCst) {
@@ -307,6 +331,12 @@ pub(crate) fn broker_loop(shared: Arc<HostShared>, inbox: Receiver<BrokerMsg>) {
         // advances on behalf of an ask that is already dead.
         while let Ok(msg) = inbox.try_recv() {
             broker.on_msg(msg);
+        }
+        if overflowed.swap(false, Ordering::SeqCst) {
+            broker.fail_live(
+                "capture_failed",
+                "the host fell behind the runtime's events for this ask".to_string(),
+            );
         }
         while let Ok(message) = events.try_recv() {
             broker.on_event(message);
@@ -328,9 +358,16 @@ struct Broker {
     next_ask: u64,
     live: Option<(Ask, Phase)>,
     waiting: VecDeque<Ask>,
-    /// The corr of an ended ask whose take abort the runtime could not
-    /// take yet (a full inbox). No ask is admitted until it lands.
-    aborting: Option<String>,
+    /// Cleanup an ended ask still owes the runtime. No ask is admitted
+    /// until every entry has settled.
+    settling: Vec<Cleanup>,
+}
+
+/// A command that undoes what an ended ask left behind, retried until
+/// the runtime accepts it or says there is nothing left to undo.
+struct Cleanup {
+    corr: String,
+    command: fn() -> Command,
 }
 
 impl Broker {
@@ -350,7 +387,19 @@ impl Broker {
                 client_req,
                 reason,
             } => {
-                self.waiting.retain(|ask| !ask.is(&conn, &client_req));
+                if let Some(index) = self
+                    .waiting
+                    .iter()
+                    .position(|ask| ask.is(&conn, &client_req))
+                {
+                    let ask = self.waiting.remove(index).expect("index is in range");
+                    let _ = ask.conn.try_deliver(Frame::AskResult {
+                        req: ask.client_req,
+                        outcome: AskOutcome::NoAnswer {
+                            reason: NoAnswerReason::AgentCancelled,
+                        },
+                    });
+                }
                 if self
                     .live
                     .as_ref()
@@ -410,7 +459,7 @@ impl Broker {
         self.waiting.push_back(Ask {
             conn,
             client_req,
-            ask_id: format!("ask_{}", self.next_ask),
+            ask_id: format!("{ASK_PREFIX}{}", self.next_ask),
             questions,
             started: Instant::now(),
             timeout: Duration::from_millis(timeout_ms),
@@ -422,7 +471,7 @@ impl Broker {
     /// Fills the live slot from the queue. Loops because an ask can
     /// fail at admission (no app attached) and must not wedge the rest.
     fn admit_next(&mut self) {
-        while self.live.is_none() && self.aborting.is_none() {
+        while self.live.is_none() && self.settling.is_empty() {
             let Some(mut ask) = self.waiting.pop_front() else {
                 return;
             };
@@ -548,40 +597,45 @@ impl Broker {
         self.admit_next();
     }
 
+    /// Queues the cleanup the phase leaves behind and tries it once.
     fn abort_phase(&mut self, ask: &Ask, phase: &Phase) {
-        let client = &self.shared.client;
         match phase {
             Phase::Prompting => {}
-            // Release the provisional context so the next snapshot, or
-            // someone else's capture, does not inherit it.
-            Phase::Snapshotting | Phase::SettingMode => {
-                let corr = format!("{}-ctx", ask.ask_id);
-                let _ = client.send(Some(&corr), Command::ContextExpire);
-            }
-            Phase::Recording | Phase::Persisting => {
-                if !self.abort_take(&ask.ask_id) {
-                    self.aborting = Some(ask.ask_id.clone());
-                }
-            }
+            // The provisional context must not reach the next snapshot,
+            // or someone else's capture.
+            Phase::Snapshotting | Phase::SettingMode => self.settling.push(Cleanup {
+                corr: format!("{}-ctx", ask.ask_id),
+                command: || Command::ContextExpire,
+            }),
+            Phase::Recording | Phase::Persisting => self.settling.push(Cleanup {
+                corr: ask.ask_id.clone(),
+                command: || Command::CaptureAbort,
+            }),
+            // The microphone is already closed; the job only costs time.
             Phase::Transcribing { job } => {
-                let _ = client.send(
-                    None,
-                    Command::JobsCancel {
-                        job_id: job.clone(),
-                    },
-                );
+                let job_id = job.clone();
+                let _ = self
+                    .shared
+                    .client
+                    .send(None, Command::JobsCancel { job_id });
             }
         }
+        self.settle();
     }
 
-    /// Whether the take named `corr` is no longer running: the abort was
-    /// accepted, or refused for a reason other than a full queue (the
-    /// take already ended, or the current take is someone else's).
-    fn abort_take(&self, corr: &str) -> bool {
-        !matches!(
-            self.shared.client.send(Some(corr), Command::CaptureAbort),
-            Err(Rejection::InboxFull | Rejection::Closed)
-        )
+    /// Retries every pending cleanup. One is done when the runtime
+    /// accepts it or refuses it as illegal in the machine's state (the
+    /// take or context already ended, or the current one belongs to
+    /// someone else); anything else (a full queue, a sequencing race,
+    /// a pending command) is transient.
+    fn settle(&mut self) {
+        let client = &self.shared.client;
+        self.settling.retain(|cleanup| {
+            !matches!(
+                client.send(Some(&cleanup.corr), (cleanup.command)()),
+                Ok(_) | Err(Rejection::IllegalInState { .. })
+            )
+        });
     }
 
     /// Who left, if the asking agent or the acking app is gone.
@@ -601,11 +655,9 @@ impl Broker {
     }
 
     fn tick(&mut self) {
-        if let Some(corr) = self.aborting.clone() {
-            if self.abort_take(&corr) {
-                self.aborting = None;
-                self.admit_next();
-            }
+        if !self.settling.is_empty() {
+            self.settle();
+            self.admit_next();
         }
         let Some((ask, phase)) = self.live.as_ref() else {
             return;
