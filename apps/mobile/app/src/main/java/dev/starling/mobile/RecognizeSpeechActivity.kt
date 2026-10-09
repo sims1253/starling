@@ -53,6 +53,9 @@ class RecognizeSpeechActivity : Activity() {
 
     private var activeRecording: Recording? = null
 
+    /** Whether the microphone capture is running; instrumented tests branch on it. */
+    internal val capturing: Boolean get() = activeRecording != null
+
     // Read by the capture worker through the chunk listener.
     @Volatile
     private var streamSession: StreamSession? = null

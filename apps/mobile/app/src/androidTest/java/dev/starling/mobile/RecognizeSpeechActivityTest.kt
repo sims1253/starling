@@ -53,15 +53,14 @@ class RecognizeSpeechActivityTest {
         assertTrue(activities.single().activityInfo.exported)
     }
 
-    /** Whether the popup opened the microphone (an emulator started with -noaudio cannot). */
+    /**
+     * Whether the popup opened the microphone. An emulator started with
+     * -noaudio may refuse it; the status text is no signal, since a live
+     * stream that fails to connect rewrites it while the capture runs.
+     */
     private fun listening(scenario: ActivityScenario<RecognizeSpeechActivity>): Boolean {
         var listening = false
-        scenario.onActivity { activity ->
-            listening = activity.findViewById<TextView>(R.id.recognize_status).text.toString() in setOf(
-                activity.getString(R.string.recognize_listening),
-                activity.getString(R.string.recognize_listening_loading),
-            )
-        }
+        scenario.onActivity { listening = it.capturing }
         return listening
     }
 
