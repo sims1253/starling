@@ -31,12 +31,51 @@ fn words(phrase: &str) -> impl Iterator<Item = &str> {
     phrase.split(is_ws).filter(|word| !word.is_empty())
 }
 
+/// A character's class under Python's `re.IGNORECASE`: the simple
+/// (single-character) lowercase, merged by sre's extra equivalences
+/// (`_equivalences` in Python's regex compiler).
+fn fold(c: char) -> char {
+    let mut lower = c.to_lowercase();
+    let lower = match (lower.next(), lower.next()) {
+        (Some(single), None) => single,
+        // U+0130 is the only character with a multi-character lowercase;
+        // its simple lowercase is 'i'.
+        _ => 'i',
+    };
+    match lower {
+        '\u{131}' => 'i',
+        '\u{17f}' => 's',
+        '\u{b5}' => '\u{3bc}',
+        '\u{345}' | '\u{1fbe}' => '\u{3b9}',
+        '\u{1fd3}' => '\u{390}',
+        '\u{1fe3}' => '\u{3b0}',
+        '\u{3d0}' => '\u{3b2}',
+        '\u{3f5}' => '\u{3b5}',
+        '\u{3d1}' => '\u{3b8}',
+        '\u{3f0}' => '\u{3ba}',
+        '\u{3d6}' => '\u{3c0}',
+        '\u{3f1}' => '\u{3c1}',
+        '\u{3c2}' => '\u{3c3}',
+        '\u{3d5}' => '\u{3c6}',
+        '\u{1e9b}' => '\u{1e61}',
+        '\u{fb05}' => '\u{fb06}',
+        '\u{1c80}' => '\u{432}',
+        '\u{1c81}' => '\u{434}',
+        '\u{1c82}' => '\u{43e}',
+        '\u{1c83}' => '\u{441}',
+        '\u{1c84}' | '\u{1c85}' => '\u{442}',
+        '\u{1c86}' => '\u{44a}',
+        '\u{1c87}' => '\u{463}',
+        '\u{1c88}' => '\u{a64b}',
+        other => other,
+    }
+}
+
 /// Strips `word` from the front of `text`, case-insensitively.
 fn strip_word_ci<'a>(text: &'a str, word: &str) -> Option<&'a str> {
     let mut rest = text.chars();
     for expected in word.chars() {
-        let found = rest.next()?;
-        if !found.to_lowercase().eq(expected.to_lowercase()) {
+        if fold(rest.next()?) != fold(expected) {
             return None;
         }
     }
@@ -396,6 +435,8 @@ mod tests {
         assert_eq!(prefix_match("Code this: add logs", "code this"), Some(11));
         assert_eq!(prefix_match("  code this add logs", "code this"), Some(12));
         assert_eq!(prefix_match("code this", "code this"), Some(9));
+        // Python's re.IGNORECASE classes: dotless ı, long ſ, Kelvin K, İ.
+        assert_eq!(prefix_match("İ thıſ \u{212a}", "i this k"), Some(13));
         // Whole token: a longer word is not the alias.
         assert_eq!(prefix_match("code thisway stays", "code this"), None);
         // A comma directly after the alias is not a permitted separator.

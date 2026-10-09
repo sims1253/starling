@@ -109,5 +109,29 @@
       "payload": "hello",
       "status": "blocked"
     }
+  },
+  {
+    "name": "ignorecase_dotless_i",
+    "request": {
+      "raw_text": "Code thıs: add logs"
+    },
+    "expected": {
+      "mode": "code-guidance",
+      "source": "phrase:code this",
+      "payload": "add logs",
+      "status": "ready"
+    }
+  },
+  {
+    "name": "ignorecase_long_s",
+    "request": {
+      "raw_text": "code thiſ add logs"
+    },
+    "expected": {
+      "mode": "code-guidance",
+      "source": "phrase:code this",
+      "payload": "add logs",
+      "status": "ready"
+    }
   }
 ]

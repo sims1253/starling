@@ -69,7 +69,7 @@ fn every_routing_fixture_replays_like_the_oracle() {
             cases.push((config_name, case.clone()));
         }
     }
-    assert_eq!(cases.len(), 33, "25 reference cases plus 8 variants");
+    assert_eq!(cases.len(), 35, "25 reference cases plus 10 variants");
 
     let mut failures = Vec::new();
     for (config_name, case) in &cases {

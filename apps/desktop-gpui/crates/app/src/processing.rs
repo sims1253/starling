@@ -551,6 +551,64 @@ fn marking_refused(kind: &str) -> String {
     )
 }
 
+/// Whether a phrase-routed plan would send the take to a remote provider,
+/// or remote context, the active mode's plan does not already use. A
+/// leading phrase recognized after capture cannot authorize additional
+/// providers or context (decision.schema.json's permission boundary).
+fn widens_scope(routed: &Plan, active: &Plan) -> bool {
+    let Plan::Model {
+        provider,
+        context_fields,
+    } = routed
+    else {
+        return false;
+    };
+    let decl = provider.declaration();
+    if decl.locality != Locality::Remote {
+        return false;
+    }
+    match active {
+        Plan::Model {
+            provider: active_provider,
+            context_fields: active_fields,
+        } => {
+            active_provider.declaration().reference() != decl.reference()
+                || !context_fields
+                    .iter()
+                    .all(|field| active_fields.contains(field))
+        }
+        _ => true,
+    }
+}
+
+/// Marks a trailing instruction as the draft's command region, so it
+/// travels as the request's instruction and never as input. Only a mode
+/// that takes instructions parses one; elsewhere "Starling, …" or
+/// "pounds sterling" is ordinary text. `prefix` is the routed phrase's
+/// length, which the payload's offsets skip. False when the region
+/// cannot be marked.
+fn mark_instruction(draft: &mut Draft, mode: &ModeEntry, prefix: usize) -> bool {
+    if !mode
+        .transform_kinds
+        .iter()
+        .any(|kind| kind.needs_instructions())
+    {
+        return true;
+    }
+    let split =
+        starling_processing::instructions::split(&draft.payload_text(), mode.language.as_deref());
+    match (split.delimiter_span, split.instruction_span) {
+        (Some((start, _)), Some((_, end))) => {
+            draft.mark_command(
+                start + prefix,
+                end + prefix,
+                CommandKind::TrailingInstruction,
+            ) == Outcome::Applied
+        }
+        _ => true,
+    }
+}
+
 fn result_kind(status: ResultStatus) -> ResultKind {
     match status {
         ResultStatus::Completed => ResultKind::Completed,
@@ -811,11 +869,31 @@ impl StarlingApp {
                             return None;
                         }
                     };
+                    let plan = pipeline::plan(mode, &app.providers.registry);
+                    if prefix > 0
+                        && widens_scope(&plan, &pipeline::plan(active, &app.providers.registry))
+                    {
+                        let message = format!(
+                            "The leading phrase selects {}, which would send this take \
+                             where {} does not; a spoken phrase cannot add a provider. \
+                             Nothing was sent. The raw transcript is unchanged.",
+                            mode.name, active.name
+                        );
+                        let state = ProcessingState::Failed { message };
+                        app.end_job(&id, draft, retired, String::new(), state, cx);
+                        return None;
+                    }
                     let (decl, provider, fields): (
                         ProviderDecl,
                         Option<Arc<dyn Provider>>,
                         Vec<ContextField>,
-                    ) = match pipeline::plan(mode, &app.providers.registry) {
+                    ) = match plan {
+                        // A phrase routed the take to a mode that processes
+                        // nothing (the literal escape): the builtin step
+                        // offers the payload without the phrase as a proposal.
+                        Plan::Nothing if prefix > 0 => {
+                            (pipeline::builtin_declaration(), None, Vec::new())
+                        }
                         Plan::Nothing => {
                             app.end_job(
                                 &id,
@@ -845,26 +923,11 @@ impl StarlingApp {
                     };
                     let label = provider_label(&decl, &settings);
                     app.set_processing(&id, label.clone(), ProcessingState::Running);
-                    // A trailing instruction becomes a command region, so it
-                    // travels as the request's instruction, never as input.
-                    let split = starling_processing::instructions::split(
-                        &draft.payload_text(),
-                        mode.language.as_deref(),
-                    );
-                    if let (Some((start, _)), Some((_, end))) =
-                        (split.delimiter_span, split.instruction_span)
-                    {
-                        if draft.mark_command(
-                            start + prefix,
-                            end + prefix,
-                            CommandKind::TrailingInstruction,
-                        ) != Outcome::Applied
-                        {
-                            let message = marking_refused("instruction");
-                            let state = ProcessingState::Failed { message };
-                            app.end_job(&id, draft, retired, label, state, cx);
-                            return None;
-                        }
+                    if !mark_instruction(&mut draft, mode, prefix) {
+                        let message = marking_refused("instruction");
+                        let state = ProcessingState::Failed { message };
+                        app.end_job(&id, draft, retired, label, state, cx);
+                        return None;
                     }
                     let retry = retry_of.filter(|earlier| draft.request(earlier).is_some());
                     if draft.request_transform(&request_id, retry.as_deref()) != Outcome::Pending {
@@ -1341,59 +1404,6 @@ mod tests {
         assert_eq!(mode("no-such-mode").id, "verbatim");
     }
 
-    #[gpui::test]
-    fn a_spoken_instruction_is_refused_not_fed_to_s1_mini(cx: &mut gpui::TestAppContext) {
-        // S1-mini cleanup cannot follow instructions: the take is refused,
-        // nothing is sent and the raw transcript stands.
-        let root = tempfile::tempdir().unwrap();
-        let store = crate::store::Store::at_test_root(root.path());
-        let raw = "Please send the report Starling, make it formal";
-        let (id, _attempt) = saved_take_with_transcript(&store, raw);
-        let app = cx.new(|cx| StarlingApp::for_test(Some(store.clone()), cx));
-        app.update(cx, |app, cx| {
-            app.processing_settings.mode = "clean-local".to_string();
-            app.after_transcription(id.clone(), cx);
-        });
-        cx.run_until_parked();
-        app.update(cx, |app, _| {
-            let processing = app.processing.get(&id).expect("the take was processed");
-            let ProcessingState::Failed { message } = &processing.state else {
-                panic!(
-                    "the instruction is refused, not run: {:?}",
-                    processing.state
-                );
-            };
-            assert!(
-                message.contains("an instruction requires an instruction-capable model"),
-                "{message}"
-            );
-            let draft = app.drafts.get(&id).expect("the draft survives");
-            assert_eq!(draft.raw_text(), raw);
-            assert_eq!(draft.text(), raw, "nothing was sent or rewritten");
-            assert_eq!(store.processing_doc(&id).unwrap().unwrap().head_text, raw);
-            // The refusal is durable like every other failure: a failed
-            // row survives a restart instead of living only in the UI.
-            let stored = store.processing_doc(&id).unwrap().unwrap();
-            let row = stored.proposals.last().expect("a stored failure");
-            assert_eq!(row.status, RowStatus::Failed);
-            assert!(
-                row.failure
-                    .as_deref()
-                    .unwrap_or_default()
-                    .contains("instruction-capable model"),
-                "{:?}",
-                row.failure
-            );
-            assert!(
-                matches!(
-                    TakeProcessing::from_doc(&stored).state,
-                    ProcessingState::Failed { .. }
-                ),
-                "the failure is what a restart shows"
-            );
-        });
-    }
-
     /// A capture with a finalized transcript, like the tests in
     /// `staging.rs` build one.
     fn saved_take_with_transcript(store: &crate::store::Store, text: &str) -> (String, String) {
@@ -1468,124 +1478,154 @@ mod tests {
         });
     }
 
-    #[gpui::test]
-    fn instruction_regions_are_recomputed_from_the_edited_text(cx: &mut gpui::TestAppContext) {
-        // Re-running after a staging edit leaves exactly one command
-        // region over the current text, never a stale mark.
-        let root = tempfile::tempdir().unwrap();
-        let store = crate::store::Store::at_test_root(root.path());
-        let (id, _attempt) =
-            saved_take_with_transcript(&store, "send the report Starling, make it formal");
+    /// Processes a saved take with `active` as the active mode.
+    fn process_with(
+        cx: &mut gpui::TestAppContext,
+        store: &crate::store::Store,
+        raw: &str,
+        active: &str,
+        with_api: bool,
+    ) -> (gpui::Entity<StarlingApp>, String) {
+        let (id, _attempt) = saved_take_with_transcript(store, raw);
         let app = cx.new(|cx| StarlingApp::for_test(Some(store.clone()), cx));
         app.update(cx, |app, cx| {
-            app.processing_settings.mode = "clean-local".to_string();
+            if with_api {
+                app.processing_settings = settings();
+                app.providers = build_providers(&app.processing_settings);
+            }
+            app.processing_settings.mode = active.to_string();
             app.after_transcription(id.clone(), cx);
         });
         cx.run_until_parked();
-        let command_regions = |app: &StarlingApp| -> Vec<(Vec<usize>, Option<CommandKind>)> {
-            app.drafts
-                .get(&id)
-                .expect("the draft survives")
-                .snapshot()
-                .regions
-                .iter()
-                .filter(|region| region.kind == RegionKind::Command)
-                .map(|region| (region.span.to_vec(), region.command))
-                .collect()
-        };
-        // First run: the delimiter and its instruction are one region.
-        // (clean-local cannot take the instruction, so the take is
-        // refused — the marking happened before that.)
+        (app, id)
+    }
+
+    fn command_regions(app: &StarlingApp, id: &str) -> Vec<(Vec<usize>, Option<CommandKind>)> {
+        app.drafts
+            .get(id)
+            .expect("the draft survives")
+            .snapshot()
+            .regions
+            .iter()
+            .filter(|region| region.kind == RegionKind::Command)
+            .map(|region| (region.span.to_vec(), region.command))
+            .collect()
+    }
+
+    #[gpui::test]
+    fn a_leading_alias_cannot_add_a_remote_provider(cx: &mut gpui::TestAppContext) {
+        // With the API set up, "clean this online" from the local-only
+        // mode would send the take to the API: refused, nothing sent.
+        let root = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::at_test_root(root.path());
+        let raw = "clean this online: confidential text";
+        let (app, id) = process_with(cx, &store, raw, "clean-local", true);
         app.update(cx, |app, _| {
-            assert_eq!(
-                command_regions(app),
-                vec![(vec![16, 40], Some(CommandKind::TrailingInstruction))],
-                "{:?}",
-                app.drafts.get(&id).unwrap().snapshot().regions
-            );
-        });
-        // The user types before the delimiter, shifting its span; the
-        // next run re-marks over the shifted text: one region, the
-        // current span, the whole instruction.
-        app.update(cx, |app, cx| {
-            app.drafts.get_mut(&id).unwrap().insert(0, "now ");
-            app.process_take(id.clone(), cx);
-        });
-        cx.run_until_parked();
-        app.update(cx, |app, _| {
-            let draft = app.drafts.get(&id).unwrap();
-            assert_eq!(
-                command_regions(app),
-                vec![(vec![20, 44], Some(CommandKind::TrailingInstruction))]
-            );
-            assert_eq!(draft.payload_text(), "now send the report ");
-            assert_eq!(
-                draft.instruction().as_deref(),
-                Some("Starling, make it formal")
-            );
-        });
-        // The delimiter deleted: nothing fires, no stale region survives,
-        // and the whole text is payload again.
-        app.update(cx, |app, cx| {
-            app.drafts.get_mut(&id).unwrap().delete(20, 29);
-            app.process_take(id.clone(), cx);
-        });
-        cx.run_until_parked();
-        app.update(cx, |app, _| {
-            let draft = app.drafts.get(&id).unwrap();
-            assert!(command_regions(app).is_empty(), "no stale command region");
-            assert_eq!(draft.instruction(), None);
-            assert_eq!(
-                draft.payload_text(),
-                draft.text(),
-                "the whole text is payload again"
-            );
-            let processing = app.processing.get(&id).unwrap();
+            let processing = app.processing.get(&id).expect("the take was routed");
             let ProcessingState::Failed { message } = &processing.state else {
-                panic!("the take itself ran (S1-mini): {:?}", processing.state)
+                panic!("the widening route is refused: {:?}", processing.state);
+            };
+            assert!(message.contains("cannot add a provider"), "{message}");
+            assert_eq!(app.drafts.get(&id).unwrap().text(), raw);
+            assert!(
+                store
+                    .processing_doc(&id)
+                    .unwrap()
+                    .unwrap()
+                    .proposals
+                    .is_empty()
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn ordinary_dictation_is_never_an_instruction_in_a_cleanup_mode(cx: &mut gpui::TestAppContext) {
+        let root = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::at_test_root(root.path());
+        let raw = "I paid five pounds sterling yesterday";
+        let (app, id) = process_with(cx, &store, raw, "clean-local", false);
+        app.update(cx, |app, _| {
+            assert!(command_regions(app, &id).is_empty());
+            assert_eq!(app.drafts.get(&id).unwrap().payload_text(), raw);
+            // The take ran on S1-mini (not running in tests) as plain text.
+            let ProcessingState::Failed { message } = &app.processing[&id].state else {
+                panic!("{:?}", app.processing[&id].state);
             };
             assert!(message.contains("S1-mini is not reachable"), "{message}");
         });
     }
 
     #[gpui::test]
-    fn an_instruction_that_cannot_be_marked_refuses_the_take(cx: &mut gpui::TestAppContext) {
-        // A live partial over the delimiter cannot be marked, so the take
-        // fails instead of sending the instruction as text.
+    fn the_literal_escape_proposes_the_payload_without_the_escape(cx: &mut gpui::TestAppContext) {
         let root = tempfile::tempdir().unwrap();
         let store = crate::store::Store::at_test_root(root.path());
-        let (id, _attempt) =
-            saved_take_with_transcript(&store, "send the report Starling, make it formal");
-        let app = cx.new(|cx| StarlingApp::for_test(Some(store.clone()), cx));
-        app.update(cx, |app, cx| {
-            app.processing_settings.mode = "clean-local".to_string();
-            app.after_transcription(id.clone(), cx);
+        let raw = "literal send the report";
+        let (app, id) = process_with(cx, &store, raw, "clean-local", false);
+        app.update(cx, |app, _| {
+            let ProcessingState::Proposal { row, current } = &app.processing[&id].state else {
+                panic!("{:?}", app.processing[&id].state);
+            };
+            assert!(current);
+            assert_eq!(row.text, "send the report");
+            assert_eq!(app.drafts.get(&id).unwrap().raw_text(), raw);
         });
-        cx.run_until_parked();
-        // A new live segment ends in a delimiter: the marking spans a
-        // partial and is refused.
+    }
+
+    #[gpui::test]
+    fn command_regions_are_recomputed_from_the_edited_text(cx: &mut gpui::TestAppContext) {
+        // A phrase region from an earlier run never survives the edit
+        // that made the phrase stop matching.
+        let root = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::at_test_root(root.path());
+        let (app, id) = process_with(
+            cx,
+            &store,
+            "clean this send the report",
+            "clean-local",
+            false,
+        );
+        app.update(cx, |app, _| {
+            assert_eq!(
+                command_regions(app, &id),
+                vec![(vec![0, 11], Some(CommandKind::ModePhrase))]
+            );
+        });
         app.update(cx, |app, cx| {
-            app.drafts
-                .get_mut(&id)
-                .unwrap()
-                .partial(1, " now Starling, formalize");
+            app.drafts.get_mut(&id).unwrap().insert(0, "now ");
             app.process_take(id.clone(), cx);
         });
         cx.run_until_parked();
         app.update(cx, |app, _| {
-            let processing = app.processing.get(&id).expect("the take was processed");
-            let ProcessingState::Failed { message } = &processing.state else {
-                panic!(
-                    "the unmarkable instruction refuses the take: {:?}",
-                    processing.state
-                );
-            };
-            assert!(
-                message.contains("could not be kept out of the text"),
-                "{message}"
-            );
-            assert!(message.contains("raw transcript is unchanged"), "{message}");
+            assert!(command_regions(app, &id).is_empty());
+            let draft = app.drafts.get(&id).unwrap();
+            assert_eq!(draft.payload_text(), draft.text());
         });
+    }
+
+    #[test]
+    fn trailing_instructions_are_parsed_only_by_instruction_modes() {
+        let text = "send the report Starling, make it formal";
+        let draft = || {
+            let mut draft = Draft::new("d", "c");
+            draft.final_attempt(0, "a", text);
+            draft
+        };
+        let mut cleanup = draft();
+        assert!(mark_instruction(&mut cleanup, mode("clean-local"), 0));
+        assert_eq!(cleanup.instruction(), None);
+
+        let mut rewrite_mode = mode("clean-api").clone();
+        rewrite_mode.transform_kinds = vec![TransformKind::Rewrite];
+        let mut rewrite = draft();
+        assert!(mark_instruction(&mut rewrite, &rewrite_mode, 0));
+        assert_eq!(
+            rewrite.instruction().as_deref(),
+            Some("Starling, make it formal")
+        );
+        // A live partial over the delimiter cannot be marked.
+        let mut live = draft();
+        live.partial(1, " now Starling, formalize");
+        assert!(!mark_instruction(&mut live, &rewrite_mode, 0));
     }
 
     #[test]
