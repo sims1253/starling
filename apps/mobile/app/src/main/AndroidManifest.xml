@@ -4,6 +4,12 @@
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <!-- The on-device engine holds the CPU awake around GPU work. -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- A keyboard take keeps recording while the keyboard is hidden
+         (screen lock, app switch) through a microphone foreground service;
+         its notification carries Stop. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <application
         android:name=".StarlingApplication"
@@ -53,6 +59,11 @@
                 android:name="android.view.im"
                 android:resource="@xml/method" />
         </service>
+
+        <service
+            android:name=".CaptureForegroundService"
+            android:exported="false"
+            android:foregroundServiceType="microphone" />
 
         <service
             android:name=".StarlingRecognitionService"

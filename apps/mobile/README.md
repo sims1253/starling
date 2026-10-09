@@ -23,7 +23,9 @@ calls `InputConnection.commitText` after the user taps **Insert transcript** —
 except while a live stream is running, where growing partials are shown as
 composing text (the Android dictation idiom) and the final text is committed
 once, on Stop, into the field the recording started in. The keyboard does not
-read surrounding editor text, package names, or selection context. An editor
+read surrounding editor text or selection context; the field's declared
+attributes (package, id, input type, hint) are compared in memory only, to
+recognize the same field after a screen lock or app switch. An editor
 target generation and connection identity check prevents a late network
 response from being inserted into a field that has changed.
 
@@ -153,9 +155,25 @@ recording list. Deleting an item requires an explicit confirmation and removes
 its WAV and transcript from this app.
 
 To enable the keyboard, tap **Enable Starling keyboard**, enable Starling Voice
-Input in Android settings, then select it from the keyboard switcher. Switching
-apps or editor fields while a request is in flight leaves the transcript in
-Starling and disables insertion for the old target.
+Input in Android settings, then select it from the keyboard switcher. The
+**⌨** button switches back to the previous keyboard, so Starling also works as
+the voice key of typing keyboards that switch to a voice input method
+(HeliBoard, FUTO Keyboard). Without the microphone permission, Record opens
+Starling to ask for it and closes again.
+
+A keyboard take keeps recording while the keyboard is hidden — screen lock,
+app switch, another field — through a microphone foreground service; its
+notification carries **Stop**. Leaving the field removes the take's composing
+text (it is never committed there). When the same field comes back, the take
+attaches again and live text continues; in any other field its transcript is
+never inserted automatically and can only be copied, and it stays in
+Starling.
+
+Private fields — password input types and fields that set
+`IME_FLAG_NO_PERSONALIZED_LEARNING`, such as incognito browser tabs — get an
+ephemeral take: it never appears in Saved recordings, its WAV and transcript
+are deleted as soon as it settles (a crash leftover is deleted on the next
+start), and a copied transcript is marked sensitive.
 
 ### Live streaming and its fallback
 
@@ -214,8 +232,8 @@ gets `/v1/audio/transcriptions` appended; a root ending in `/v1` gets
 This directory contains the Android app. The sibling standalone iOS recorder is
 at `../ios`, and the desktop client is at `../desktop`. The
 Android app does not provide an iOS keyboard extension; its system-wide voice
-keyboard is Android-specific. Background recording and push-to-talk hardware
-integration remain future extensions. Server live streaming follows the
+keyboard is Android-specific. Push-to-talk hardware integration remains a
+future extension. Server live streaming follows the
 `WS /stream` contract in `../../docs/native-serving.md` and requires a native
 Starling server; on-device live transcription uses the same window geometry
 (12 s windows, 3 s overlap, word stitching) with partials about every second. The app does not ship model weights or

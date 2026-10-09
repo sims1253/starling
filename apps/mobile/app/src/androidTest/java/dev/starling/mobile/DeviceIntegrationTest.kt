@@ -2,6 +2,9 @@ package dev.starling.mobile
 
 import android.content.ComponentName
 import android.content.Intent
+import android.content.pm.ServiceInfo
+import android.os.Build
+import android.view.inputmethod.InputMethod
 import android.speech.RecognitionService
 import android.speech.SpeechRecognizer
 import androidx.test.core.app.ActivityScenario
@@ -37,6 +40,31 @@ class DeviceIntegrationTest {
             services.map { it.serviceInfo.name },
         )
         assertTrue(SpeechRecognizer.isRecognitionAvailable(context))
+    }
+
+    @Test
+    fun voiceKeyboardIsDiscoverableAsAnInputMethod() {
+        val services = context.packageManager.queryIntentServices(
+            Intent(InputMethod.SERVICE_INTERFACE).setPackage(context.packageName),
+            0,
+        )
+        assertEquals(
+            listOf(ComponentName(context, VoiceInputService::class.java).className),
+            services.map { it.serviceInfo.name },
+        )
+    }
+
+    @Test
+    fun takeServiceIsAMicrophoneForegroundService() {
+        // Android 14+ refuses a background microphone without this type.
+        val info = context.packageManager.getServiceInfo(
+            ComponentName(context, CaptureForegroundService::class.java),
+            0,
+        )
+        assertFalse(info.exported)
+        if (Build.VERSION.SDK_INT >= 29) {
+            assertEquals(ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE, info.foregroundServiceType)
+        }
     }
 
     @Test
