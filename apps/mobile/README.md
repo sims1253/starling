@@ -164,9 +164,12 @@ Starling to ask for it and closes again.
 A keyboard take keeps recording while the keyboard is hidden — screen lock,
 app switch, another field — through a microphone foreground service; its
 notification carries **Stop** (Android 13+ asks once for notifications for
-this). Leaving the field — or hiding the keyboard — removes the take's
-composing text; it is never committed there. When the keyboard comes back
-over the same connection, live text continues. When a field with the same
+this). Hiding the keyboard, or leaving the field, removes the take's
+composing text while the keyboard can still reach the field; the final is
+then committed in one piece. (An app that closes its input connection before
+Android tells the keyboard the field is gone can finish the partial as
+ordinary text itself — the same outcome as switching fields mid-take always
+had.) While the field keeps focus, live text continues. When a field with the same
 declared attributes comes back, the take attaches to it but writes nothing
 by itself any more (two chats can share one field layout): its live text stays
 in the keyboard and the final waits for **Insert transcript**. In any other

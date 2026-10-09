@@ -51,7 +51,7 @@ import dev.starling.mobile.ui.RequestGenerationGuard
  * A take outlives the keyboard window. While it records, a microphone
  * foreground service keeps the capture alive through a screen lock or an app
  * switch, and the notification offers Stop. Leaving the field detaches the
- * take (its composing text is removed, never committed). When a field with
+ * take (its composing text is removed while the connection still answers). When a field with
  * the same declared [EditorField] attributes (held in memory only) comes
  * back, the take attaches again — but attributes cannot prove it is the same
  * editor (two chats share one layout), so from then on the take never writes
@@ -139,6 +139,7 @@ class VoiceInputService : InputMethodService() {
                 if (previous != null) current.explicitOnly = true
                 current.target = null
                 current.composing = false
+                current.liveInField = false
                 if (connection != null && field != null && current.field.sameFieldAs(field)) attach(current)
             }
         } else {
@@ -156,7 +157,6 @@ class VoiceInputService : InputMethodService() {
      */
     override fun onStartInputView(info: EditorInfo?, restarting: Boolean) {
         super.onStartInputView(info, restarting)
-        resumeComposing()
         application.preloadOnDeviceModel()
         renderModelState(application.modelLifetime.state())
         switchKeyboardButton?.visibility = if (offersKeyboardSwitch()) View.VISIBLE else View.GONE
@@ -165,31 +165,12 @@ class VoiceInputService : InputMethodService() {
     /**
      * Hiding the keyboard (Back) while the field keeps focus finishes
      * composing in super, which would commit the live partial as ordinary
-     * text. The take's composing text is removed first and comes back in
-     * [onStartInputView], on the same connection.
+     * text. The take's composing text is removed first; the next partial
+     * (or the final's commitText) writes it again on the same connection.
      */
     override fun onFinishInputView(finishingInput: Boolean) {
-        val current = take
-        if (!finishingInput && current != null && current.composing) {
-            clearComposingText(current)
-            current.composingSuspended = true
-        }
+        if (!finishingInput) take?.let(::clearComposingText)
         super.onFinishInputView(finishingInput)
-    }
-
-    private fun resumeComposing() {
-        val current = take ?: return
-        if (!current.composingSuspended) return
-        current.composingSuspended = false
-        val target = current.target ?: return
-        val connection = currentInputConnection
-        if (current.explicitOnly || current.liveBroken || current.ready != null ||
-            !targetGuard.isCurrent(target, connection)
-        ) {
-            return
-        }
-        current.composing = true
-        current.lastPartial?.let { connection.setComposingText(it, 1) }
     }
 
     override fun onFinishInput() {
@@ -206,7 +187,8 @@ class VoiceInputService : InputMethodService() {
         application.modelLifetime.removeListener(modelStateListener)
         // Switching to another keyboard unbinds this one: the take ends here
         // and settles into the store (deleted again if it was private).
-        if (take?.capturing == true) stopTake() else CaptureForegroundService.release()
+        // A stop already in flight releases its own hold when it settles.
+        if (take?.capturing == true) stopTake()
         super.onDestroy()
     }
 
@@ -229,6 +211,7 @@ class VoiceInputService : InputMethodService() {
             startActivity(
                 Intent(this, MainActivity::class.java)
                     .setAction(MainActivity.ACTION_REQUEST_MICROPHONE)
+                    .putExtra(MainActivity.EXTRA_ASK_NOTIFICATIONS, askNotifications)
                     .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
             )
             return
@@ -281,9 +264,9 @@ class VoiceInputService : InputMethodService() {
         take = Take(recording, requestGeneration, field, sensitive, streaming = session != null).also { started ->
             started.session = session
             started.target = target
-            started.composing = session != null && field.supportsComposing
+            started.liveInField = session != null && field.supportsComposing
         }
-        CaptureForegroundService.hold(this) { stopTake() }
+        take?.foregroundHold = CaptureForegroundService.hold(this) { stopTake() }
         renderTake()
         statusView?.setText(
             when {
@@ -304,6 +287,7 @@ class VoiceInputService : InputMethodService() {
         current.target = targetGuard.capture() ?: return
         current.explicitOnly = true
         current.composing = false
+        current.liveInField = false
         if (current.ready == null) {
             current.lastPartial?.let { partial ->
                 transcriptView?.visibility = View.VISIBLE
@@ -315,6 +299,7 @@ class VoiceInputService : InputMethodService() {
     /** Unbinds the take from a field that is going away, leaving no text behind. */
     private fun detach(current: Take) {
         clearComposingText(current)
+        current.liveInField = false
         current.target = null
     }
 
@@ -348,10 +333,14 @@ class VoiceInputService : InputMethodService() {
                 current.lastPartial = event.text
                 val target = current.target
                 val connection = currentInputConnection
-                if (current.composing && target != null && targetGuard.isCurrent(target, connection)) {
+                if (current.liveInField && target != null && targetGuard.isCurrent(target, connection)) {
                     // The partial grows over the whole session, so each one
-                    // replaces the composing region entirely.
-                    connection.setComposingText(event.text, 1)
+                    // replaces the composing region entirely. An empty text
+                    // without a region of ours would replace the selection.
+                    if (current.composing || event.text.isNotEmpty()) {
+                        connection.setComposingText(event.text, 1)
+                        current.composing = event.text.isNotEmpty()
+                    }
                 } else {
                     // No composing region (detached, or a field that cannot
                     // compose): the keyboard shows the live text itself.
@@ -361,6 +350,7 @@ class VoiceInputService : InputMethodService() {
             }
             is StreamEvent.Interrupted -> {
                 current.liveBroken = true
+                current.liveInField = false
                 clearComposingText(current)
                 statusView?.text = getString(R.string.keyboard_stream_interrupted, event.reason)
             }
@@ -399,9 +389,9 @@ class VoiceInputService : InputMethodService() {
         // onDestroy never block on the forced-release wait.
         capture.stop { result ->
             // The foreground lasts until the capture has really let go of the
-            // microphone and finalized its WAV. No newer capture can have
-            // started meanwhile: AudioCapture refuses one while stopping.
-            if (take?.capturing != true) CaptureForegroundService.release()
+            // microphone and finalized its WAV; the token keeps this late
+            // callback from releasing a newer take's hold.
+            CaptureForegroundService.release(current.foregroundHold)
             settleStoppedRecording(current, session, result)
         }
     }
@@ -469,11 +459,12 @@ class VoiceInputService : InputMethodService() {
         }
         val target = current.target
         val connection = currentInputConnection
-        if (completed.provenance == TranscriptionProvenance.LIVE_STREAM && current.composing &&
+        if (completed.provenance == TranscriptionProvenance.LIVE_STREAM && current.liveInField &&
             target != null && targetGuard.isCurrent(target, connection)
         ) {
-            // The single asynchronous commitText of the composing path:
-            // it replaces the composing region and finishes composing.
+            // The single asynchronous commitText of the live path, in the
+            // field the take started in: it replaces the composing region
+            // (or, with none left, inserts at the cursor) and finishes it.
             connection.commitText(text, 1)
             current.composing = false
             endTake(current, R.string.keyboard_inserted, shown = text.takeUnless { current.sensitive })
@@ -559,7 +550,15 @@ class VoiceInputService : InputMethodService() {
                     else -> R.string.keyboard_target_changed
                 },
             )
-        } else if (current == null && statusView?.text.isNullOrEmpty()) {
+        } else if (current != null) {
+            // Every binding change re-renders the live text the keyboard
+            // shows, so private text never outlives its field on screen.
+            val partial = current.lastPartial
+            if (partial != null && !current.composing) {
+                transcriptView?.visibility = View.VISIBLE
+                transcriptView?.text = visibleText(current, partial)
+            }
+        } else if (statusView?.text.isNullOrEmpty()) {
             statusView?.setText(R.string.keyboard_ready)
         }
     }
@@ -570,7 +569,10 @@ class VoiceInputService : InputMethodService() {
      * still be copied there, marked sensitive.
      */
     private fun visibleText(current: Take, text: String): String {
-        val bound = current.target?.let { targetGuard.isCurrent(it, currentInputConnection) } == true
+        // A field matched only by its attributes is not proof of the private
+        // field itself, so its text stays hidden there too.
+        val bound = !current.explicitOnly &&
+            current.target?.let { targetGuard.isCurrent(it, currentInputConnection) } == true
         return if (current.sensitive && !bound) getString(R.string.keyboard_private_hidden) else text
     }
 
@@ -647,7 +649,13 @@ class VoiceInputService : InputMethodService() {
         /** The editor binding; null while the take's field is not focused. */
         var target: InputTargetGuard.Snapshot<InputConnection>? = null
 
-        /** Whether the take owns a composing region in [target]. */
+        /**
+         * Whether the take writes its live text and final into [target] by
+         * itself: a live stream into the verified field it started in.
+         */
+        var liveInField = false
+
+        /** Whether the take owns an established (non-empty) composing region in [target]. */
         var composing = false
 
         /** The live stream failed; composing does not come back. */
@@ -659,8 +667,9 @@ class VoiceInputService : InputMethodService() {
          */
         var explicitOnly = false
 
-        /** Composing text was removed while the keyboard was hidden. */
-        var composingSuspended = false
+        /** This take's foreground-service hold, released when its capture settles. */
+        var foregroundHold = 0L
+
         var lastPartial: String? = null
 
         /** Final text waiting for an explicit Insert or Copy. */

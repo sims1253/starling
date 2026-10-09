@@ -101,17 +101,20 @@ class CaptureForegroundService : Service() {
         private const val ACTION_STOP_TAKE = "dev.starling.mobile.action.STOP_TAKE"
 
         private var held = false
+        private var holder = 0L
         private var stopListener: (() -> Unit)? = null
         private var running: CaptureForegroundService? = null
 
         /**
-         * Enters the foreground for a take that just started. [onStop] runs
-         * when the user taps Stop in the notification. A refusal (an
-         * Android version or state that does not allow it) is logged and
-         * the take records as before, only without surviving a hidden window.
+         * Enters the foreground for a take that just started and returns its
+         * hold token. [onStop] runs when the user taps Stop in the
+         * notification. A refusal (an Android version or state that does not
+         * allow it) is logged and the take records as before, only without
+         * surviving a hidden window.
          */
-        fun hold(context: Context, onStop: () -> Unit) {
+        fun hold(context: Context, onStop: () -> Unit): Long {
             held = true
+            holder += 1
             stopListener = onStop
             runCatching {
                 ContextCompat.startForegroundService(
@@ -123,10 +126,16 @@ class CaptureForegroundService : Service() {
                 held = false
                 stopListener = null
             }
+            return holder
         }
 
-        /** The take's capture ended; leave the foreground. */
-        fun release() {
+        /**
+         * The capture holding [token] has settled; leave the foreground. A
+         * stale token (a newer take holds the service now, possibly from
+         * another keyboard instance) changes nothing.
+         */
+        fun release(token: Long) {
+            if (token != holder) return
             held = false
             stopListener = null
             running?.takeIf { it.inForeground }?.stop()

@@ -151,9 +151,12 @@ class MainActivity : Activity() {
      */
     private fun handleKeyboardRequest(intent: Intent?) {
         if (intent?.action != ACTION_REQUEST_MICROPHONE) return
+        // The keyboard decides whether notifications are asked: once only, so
+        // a refusal is not asked again on a later microphone hand-off.
+        val askNotifications = intent.getBooleanExtra(EXTRA_ASK_NOTIFICATIONS, false)
         val missing = buildList {
             add(Manifest.permission.RECORD_AUDIO)
-            if (Build.VERSION.SDK_INT >= 33) add(Manifest.permission.POST_NOTIFICATIONS)
+            if (Build.VERSION.SDK_INT >= 33 && askNotifications) add(Manifest.permission.POST_NOTIFICATIONS)
         }.filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
         if (missing.isEmpty()) {
             recordingMessage.setText(R.string.keyboard_permission_granted)
@@ -755,6 +758,7 @@ class MainActivity : Activity() {
 
         /** The voice keyboard asks for the microphone through this screen. */
         const val ACTION_REQUEST_MICROPHONE = "dev.starling.mobile.action.REQUEST_MICROPHONE"
+        const val EXTRA_ASK_NOTIFICATIONS = "dev.starling.mobile.extra.ASK_NOTIFICATIONS"
         // Decimal megabytes, as Hugging Face and file managers show sizes.
         private const val MB = 1_000_000L
 
