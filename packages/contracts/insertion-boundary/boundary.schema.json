@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "starling/contracts/insertion-boundary/boundary.schema.json",
+  "title": "One insertion-boundary fixture case",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "case_id",
+    "description",
+    "before",
+    "after",
+    "raw",
+    "verbatim",
+    "expected_text",
+    "expected_changes"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "case_id": { "type": "string", "minLength": 1 },
+    "description": { "type": "string", "minLength": 1 },
+    "before": { "type": "string" },
+    "after": { "type": "string" },
+    "raw": { "type": "string" },
+    "verbatim": { "type": "boolean" },
+    "expected_text": { "type": "string" },
+    "expected_changes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "detail"],
+        "properties": {
+          "kind": { "enum": ["leading_space", "first_letter_case"] },
+          "detail": { "type": "string", "minLength": 1 }
+        }
+      }
+    }
+  }
+}

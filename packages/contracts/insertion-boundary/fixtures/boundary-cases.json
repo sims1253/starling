@@ -1,0 +1,580 @@
+[
+  {
+    "schema_version": 1,
+    "case_id": "start-of-field",
+    "description": "empty before-text: no space, recognizer casing kept",
+    "before": "",
+    "after": " world",
+    "raw": "Hello",
+    "verbatim": false,
+    "expected_text": "Hello",
+    "expected_changes": []
+  },
+  {
+    "schema_version": 1,
+    "case_id": "start-of-field-before-existing-punct",
+    "description": "start of field with a comma after the cursor: no trailing change",
+    "before": "",
+    "after": ", actually",
+    "raw": "Hello",
+    "verbatim": false,
+    "expected_text": "Hello",
+    "expected_changes": []
+  },
+  {
+    "schema_version": 1,
+    "case_id": "mid-sentence-lowercase",
+    "description": "letter before the cursor: leading space plus lowercase",
+    "before": "The quick brown",
+    "after": "",
+    "raw": "Fox jumps",
+    "verbatim": false,
+    "expected_text": " fox jumps",
+    "expected_changes": [
+      { "kind": "leading_space", "detail": "previous character 'n' is not whitespace or an opening bracket/quote" },
+      { "kind": "first_letter_case", "detail": "previous non-whitespace 'n' continues the sentence" }
+    ]
+  },
+  {
+    "schema_version": 1,
+    "case_id": "mid-sentence-already-lowercase",
+    "description": "letter before the cursor, dictated text already lowercase",
+    "before": "The quick brown",
+    "after": "",
+    "raw": "fox jumps",
+    "verbatim": false,
+    "expected_text": " fox jumps",
+    "expected_changes": [
+      { "kind": "leading_space", "detail": "previous character 'n' is not whitespace or an opening bracket/quote" }
+    ]
+  },
+  {
+    "schema_version": 1,
+    "case_id": "mid-sentence-later-capital-kept",
+    "description": "the first cased character is already lowercase: later capitals are not touched",
+    "before": "word ",
+    "after": "",
+    "raw": "hello. Next sentence",
+    "verbatim": false,
+    "expected_text": "hello. Next sentence",
+    "expected_changes": []
+  },
+  {
+    "schema_version": 1,
+    "case_id": "after-period-keep-capital",
+    "description": "sentence-ending punctuation keeps the capital",
+    "before": "Done.",
+    "after": "",
+    "raw": "Next one",
+    "verbatim": false,
+    "expected_text": " Next one",
+    "expected_changes": [
+      { "kind": "leading_space", "detail": "previous character '.' is not whitespace or an opening bracket/quote" }
+    ]
+  },
+  {
+    "schema_version": 1,
+    "case_id": "after-period-space-present",
+    "description": "sentence end with the space already there: nothing to do",
+    "before": "Done. ",
+    "after": "",
+    "raw": "Next one",
+    "verbatim": false,
+    "expected_text": "Next one",
+    "expected_changes": []
+  },
+  {
+    "schema_version": 1,
+    "case_id": "after-question-exclamation",
+    "description": "mixed ?! keeps the capital, space still added",
+    "before": "Really?!",
+    "after": "",
+    "raw": "Next",
+    "verbatim": false,
+    "expected_text": " Next",
+    "expected_changes": [
+      { "kind": "leading_space", "detail": "previous character '!' is not whitespace or an opening bracket/quote" }
+    ]
+  },
+  {
+    "schema_version": 1,
+    "case_id": "after-comma-lowercase",
+    "description": "comma continues the sentence",
+    "before": "First,",
+    "after": "",
+    "raw": "Second",
+    "verbatim": false,
+    "expected_text": " second",
+    "expected_changes": [
+      { "kind": "leading_space", "detail": "previous character ',' is not whitespace or an opening bracket/quote" },
+      { "kind": "first_letter_case", "detail": "previous non-whitespace ',' continues the sentence" }
+    ]
+  },
+  {
+    "schema_version": 1,
+    "case_id": "after-semicolon",
+    "description": "semicolon continues the sentence",
+    "before": "a;",
+    "after": "",
+    "raw": "B",
+    "verbatim": false,
+    "expected_text": " b",
+    "expected_changes": [
+      { "kind": "leading_space", "detail": "previous character ';' is not whitespace or an opening bracket/quote" },
+      { "kind": "first_letter_case", "detail": "previous non-whitespace ';' continues the sentence" }
+    ]
+  },
+  {
+    "schema_version": 1,
+    "case_id": "after-colon",
+    "description": "colon continues the sentence",
+    "before": "Note:",
+    "after": "",
+    "raw": "This",
+    "verbatim": false,
+    "expected_text": " this",
+    "expected_changes": [
+      { "kind": "leading_space", "detail": "previous character ':' is not whitespace or an opening bracket/quote" },
+      { "kind": "first_letter_case", "detail": "previous non-whitespace ':' continues the sentence" }
+    ]
+  },
+  {
+    "schema_version": 1,
+    "case_id": "after-newline",
+    "description": "a newline boundary behaves like the start of a field",
+    "before": "line one\n",
+    "after": "",
+    "raw": "Second line",
+    "verbatim": false,
+    "expected_text": "Second line",
+    "expected_changes": []
+  },
+  {
+    "schema_version": 1,
+    "case_id": "after-newline-indented",
+    "description": "newline plus indentation still behaves like a field start (list item)",
+    "before": "item one\n- ",
+    "after": "",
+    "raw": "Second item",
+    "verbatim": false,
+    "expected_text": "Second item",
+    "expected_changes": []
+  },
+  {
+    "schema_version": 1,
+    "case_id": "after-opening-paren",
+    "description": "opening parenthesis: quoted-content start, no space, case kept",
+    "before": "(",
+    "after": ")",
+    "raw": "see note",
+    "verbatim": false,
+    "expected_text": "see note",
+    "expected_changes": []
+  },
+  {
+    "schema_version": 1,
+    "case_id": "after-opening-bracket",
+    "description": "opening bracket: content start",
+    "before": "[",
+    "after": "]",
+    "raw": "first",
+    "verbatim": false,
+    "expected_text": "first",
+    "expected_changes": []
+  },
+  {
+    "schema_version": 1,
+    "case_id": "after-opening-straight-quote",
+    "description": "straight double quote counts as opening at the insertion point",
+    "before": "He said \"",
+    "after": "\"",
+    "raw": "hello",
+    "verbatim": false,
+    "expected_text": "hello",
+    "expected_changes": []
+  },
+  {
+    "schema_version": 1,
+    "case_id": "after-opening-typographic-quote",
+    "description": "typographic opening quote: content start",
+    "before": "Er sagte „",
+    "after": "“",
+    "raw": "hallo",
+    "verbatim": false,
+    "expected_text": "hallo",
+    "expected_changes": []
+  },
+  {
+    "schema_version": 1,
+    "case_id": "after-opening-guillemet",
+    "description": "opening guillemet: content start",
+    "before": "Il dit «",
+    "after": "»",
+    "raw": "Bonjour",
+    "verbatim": false,
+    "expected_text": "Bonjour",
+    "expected_changes": []
+  },
+  {
+    "schema_version": 1,
+    "case_id": "after-closing-quote-continues",
+    "description": "typographic closing quote continues the sentence",
+    "before": "said “hi”",
+    "after": "",
+    "raw": "And",
+    "verbatim": false,
+    "expected_text": " and",
+    "expected_changes": [
+      { "kind": "leading_space", "detail": "previous character '”' is not whitespace or an opening bracket/quote" },
+      { "kind": "first_letter_case", "detail": "previous non-whitespace '”' continues the sentence" }
+    ]
+  },
+  {
+    "schema_version": 1,
+    "case_id": "after-closing-paren-continues",
+    "description": "closing parenthesis continues the sentence",
+    "before": "(see this)",
+    "after": "",
+    "raw": "Now",
+    "verbatim": false,
+    "expected_text": " now",
+    "expected_changes": [
+      { "kind": "leading_space", "detail": "previous character ')' is not whitespace or an opening bracket/quote" },
+      { "kind": "first_letter_case", "detail": "previous non-whitespace ')' continues the sentence" }
+    ]
+  },
+  {
+    "schema_version": 1,
+    "case_id": "before-existing-punct-no-trailing",
+    "description": "punctuation right after the cursor never gets a trailing space",
+    "before": "Note",
+    "after": ", please",
+    "raw": "this",
+    "verbatim": false,
+    "expected_text": " this",
+    "expected_changes": [
+      { "kind": "leading_space", "detail": "previous character 'e' is not whitespace or an opening bracket/quote" }
+    ]
+  },
+  {
+    "schema_version": 1,
+    "case_id": "after-mid-word-no-trailing-space",
+    "description": "cursor inside a word after the insertion point: no trailing change",
+    "before": "The quick",
+    "after": "ing fox",
+    "raw": "brown",
+    "verbatim": false,
+    "expected_text": " brown",
+    "expected_changes": [
+      { "kind": "leading_space", "detail": "previous character 'k' is not whitespace or an opening bracket/quote" }
+    ]
+  },
+  {
+    "schema_version": 1,
+    "case_id": "raw-starts-with-whitespace",
+    "description": "dictated text already starting with a space is not double-spaced, case rule still applies",
+    "before": "word",
+    "after": "",
+    "raw": " Next",
+    "verbatim": false,
+    "expected_text": " next",
+    "expected_changes": [
+      { "kind": "first_letter_case", "detail": "previous non-whitespace 'd' continues the sentence" }
+    ]
+  },
+  {
+    "schema_version": 1,
+    "case_id": "mid-sentence-space-before",
+    "description": "properly spaced mid-sentence: only the case rule fires",
+    "before": "word ",
+    "after": "",
+    "raw": "Next",
+    "verbatim": false,
+    "expected_text": "next",
+    "expected_changes": [
+      { "kind": "first_letter_case", "detail": "previous non-whitespace 'd' continues the sentence" }
+    ]
+  },
+  {
+    "schema_version": 1,
+    "case_id": "camel-case-protected",
+    "description": "camelCase identifier keeps its case",
+    "before": "Use",
+    "after": "",
+    "raw": "MyClass here",
+    "verbatim": false,
+    "expected_text": " MyClass here",
+    "expected_changes": [
+      { "kind": "leading_space", "detail": "previous character 'e' is not whitespace or an opening bracket/quote" }
+    ]
+  },
+  {
+    "schema_version": 1,
+    "case_id": "snake-case-protected",
+    "description": "snake_case identifier keeps its case",
+    "before": "Take",
+    "after": "",
+    "raw": "Snake_case token",
+    "verbatim": false,
+    "expected_text": " Snake_case token",
+    "expected_changes": [
+      { "kind": "leading_space", "detail": "previous character 'e' is not whitespace or an opening bracket/quote" }
+    ]
+  },
+  {
+    "schema_version": 1,
+    "case_id": "path-protected",
+    "description": "a path keeps its case",
+    "before": "Copy",
+    "after": "",
+    "raw": "C:/Temp file",
+    "verbatim": false,
+    "expected_text": " C:/Temp file",
+    "expected_changes": [
+      { "kind": "leading_space", "detail": "previous character 'y' is not whitespace or an opening bracket/quote" }
+    ]
+  },
+  {
+    "schema_version": 1,
+    "case_id": "url-protected",
+    "description": "a URL keeps its case",
+    "before": "See",
+    "after": "",
+    "raw": "https://Example.com works",
+    "verbatim": false,
+    "expected_text": " https://Example.com works",
+    "expected_changes": [
+      { "kind": "leading_space", "detail": "previous character 'e' is not whitespace or an opening bracket/quote" }
+    ]
+  },
+  {
+    "schema_version": 1,
+    "case_id": "all-caps-protected",
+    "description": "an ALL-CAPS token is left alone",
+    "before": "From",
+    "after": "",
+    "raw": "NASA launched",
+    "verbatim": false,
+    "expected_text": " NASA launched",
+    "expected_changes": [
+      { "kind": "leading_space", "detail": "previous character 'm' is not whitespace or an opening bracket/quote" }
+    ]
+  },
+  {
+    "schema_version": 1,
+    "case_id": "pronoun-i-protected",
+    "description": "the English pronoun I is never lowercased",
+    "before": "and",
+    "after": "",
+    "raw": "I said",
+    "verbatim": false,
+    "expected_text": " I said",
+    "expected_changes": [
+      { "kind": "leading_space", "detail": "previous character 'd' is not whitespace or an opening bracket/quote" }
+    ]
+  },
+  {
+    "schema_version": 1,
+    "case_id": "pronoun-i-comma",
+    "description": "I before punctuation keeps its case",
+    "before": "and ",
+    "after": "",
+    "raw": "I, too",
+    "verbatim": false,
+    "expected_text": "I, too",
+    "expected_changes": []
+  },
+  {
+    "schema_version": 1,
+    "case_id": "pronoun-i-period",
+    "description": "I alone with a full stop keeps its case",
+    "before": "and ",
+    "after": "",
+    "raw": "I.",
+    "verbatim": false,
+    "expected_text": "I.",
+    "expected_changes": []
+  },
+  {
+    "schema_version": 1,
+    "case_id": "pronoun-i-contraction",
+    "description": "I'm keeps its case",
+    "before": "and ",
+    "after": "",
+    "raw": "I'm ready",
+    "verbatim": false,
+    "expected_text": "I'm ready",
+    "expected_changes": []
+  },
+  {
+    "schema_version": 1,
+    "case_id": "pronoun-i-curly-contraction",
+    "description": "I’ll (curly apostrophe) keeps its case",
+    "before": "and",
+    "after": "",
+    "raw": "I’ll go",
+    "verbatim": false,
+    "expected_text": " I’ll go",
+    "expected_changes": [
+      { "kind": "leading_space", "detail": "previous character 'd' is not whitespace or an opening bracket/quote" }
+    ]
+  },
+  {
+    "schema_version": 1,
+    "case_id": "digit-before-lowercase",
+    "description": "a digit before the cursor continues the sentence",
+    "before": "version 2",
+    "after": "",
+    "raw": "Works fine",
+    "verbatim": false,
+    "expected_text": " works fine",
+    "expected_changes": [
+      { "kind": "leading_space", "detail": "previous character '2' is not whitespace or an opening bracket/quote" },
+      { "kind": "first_letter_case", "detail": "previous non-whitespace '2' continues the sentence" }
+    ]
+  },
+  {
+    "schema_version": 1,
+    "case_id": "cjk-no-case",
+    "description": "CJK has no case; the space rule is script-agnostic",
+    "before": "hello",
+    "after": "",
+    "raw": "你好世界",
+    "verbatim": false,
+    "expected_text": " 你好世界",
+    "expected_changes": [
+      { "kind": "leading_space", "detail": "previous character 'o' is not whitespace or an opening bracket/quote" }
+    ]
+  },
+  {
+    "schema_version": 1,
+    "case_id": "cjk-sentence-end",
+    "description": "CJK full stop before Han: no space, no case to change",
+    "before": "完成。",
+    "after": "",
+    "raw": "下一步",
+    "verbatim": false,
+    "expected_text": "下一步",
+    "expected_changes": []
+  },
+  {
+    "schema_version": 1,
+    "case_id": "han-after-han",
+    "description": "Han after Han: no space",
+    "before": "我们",
+    "after": "",
+    "raw": "你好",
+    "verbatim": false,
+    "expected_text": "你好",
+    "expected_changes": []
+  },
+  {
+    "schema_version": 1,
+    "case_id": "kana-after-han",
+    "description": "kana after Han: no space",
+    "before": "今日",
+    "after": "",
+    "raw": "はいい天気",
+    "verbatim": false,
+    "expected_text": "はいい天気",
+    "expected_changes": []
+  },
+  {
+    "schema_version": 1,
+    "case_id": "han-after-katakana",
+    "description": "Han after Katakana: no space",
+    "before": "コーヒー",
+    "after": "",
+    "raw": "店",
+    "verbatim": false,
+    "expected_text": "店",
+    "expected_changes": []
+  },
+  {
+    "schema_version": 1,
+    "case_id": "korean-spacing",
+    "description": "Hangul is spaced like Latin",
+    "before": "안녕하세요",
+    "after": "",
+    "raw": "반갑습니다",
+    "verbatim": false,
+    "expected_text": " 반갑습니다",
+    "expected_changes": [
+      { "kind": "leading_space", "detail": "previous character '요' is not whitespace or an opening bracket/quote" }
+    ]
+  },
+  {
+    "schema_version": 1,
+    "case_id": "arabic-rtl-preserved",
+    "description": "Arabic RTL text: only the boundary changes, order preserved",
+    "before": "text",
+    "after": "",
+    "raw": "مرحبا بالعالم",
+    "verbatim": false,
+    "expected_text": " مرحبا بالعالم",
+    "expected_changes": [
+      { "kind": "leading_space", "detail": "previous character 't' is not whitespace or an opening bracket/quote" }
+    ]
+  },
+  {
+    "schema_version": 1,
+    "case_id": "greek-cased",
+    "description": "a cased non-Latin script lowercases like Latin",
+    "before": "αυτά είναι",
+    "after": "",
+    "raw": "Λατινικά",
+    "verbatim": false,
+    "expected_text": " λατινικά",
+    "expected_changes": [
+      { "kind": "leading_space", "detail": "previous character 'ι' is not whitespace or an opening bracket/quote" },
+      { "kind": "first_letter_case", "detail": "previous non-whitespace 'ι' continues the sentence" }
+    ]
+  },
+  {
+    "schema_version": 1,
+    "case_id": "multi-char-lowercase-mapping",
+    "description": "a multi-character lowercase mapping is applied in full",
+    "before": "text",
+    "after": "",
+    "raw": "İstanbul",
+    "verbatim": false,
+    "expected_text": " i̇stanbul",
+    "expected_changes": [
+      { "kind": "leading_space", "detail": "previous character 't' is not whitespace or an opening bracket/quote" },
+      { "kind": "first_letter_case", "detail": "previous non-whitespace 't' continues the sentence" }
+    ]
+  },
+  {
+    "schema_version": 1,
+    "case_id": "verbatim-mode",
+    "description": "verbatim mode disables every rule",
+    "before": "Done.",
+    "after": "",
+    "raw": "Next",
+    "verbatim": true,
+    "expected_text": "Next",
+    "expected_changes": []
+  },
+  {
+    "schema_version": 1,
+    "case_id": "empty-raw",
+    "description": "nothing dictated, nothing changed",
+    "before": "word",
+    "after": "",
+    "raw": "",
+    "verbatim": false,
+    "expected_text": "",
+    "expected_changes": []
+  },
+  {
+    "schema_version": 1,
+    "case_id": "whitespace-raw",
+    "description": "whitespace-only dictated text is passed through",
+    "before": "word",
+    "after": "",
+    "raw": "   ",
+    "verbatim": false,
+    "expected_text": "   ",
+    "expected_changes": []
+  }
+]

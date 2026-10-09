@@ -20,6 +20,11 @@
 //! [`StubDeliveryAdapter`] stays the unwired default and records what it
 //! did, failing apply honestly (`no_delivery_adapter`) instead of
 //! pretending text landed.
+//!
+//! When an adapter reports the text around the insertion point, prepare
+//! applies the insertion-boundary rules (`starling-processing`'s
+//! `boundary` module) and delivers the result as a revision derived from
+//! the requested one; the requested revision itself is never edited.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -27,9 +32,14 @@ use std::sync::{Arc, Mutex};
 use crate::bus::EventBus;
 use crate::machine::{Inbound, MachineCore, Receipt, Rejection};
 use crate::protocol::tables::DELIVERY;
-use crate::protocol::{Command, Event};
+use crate::protocol::{Command, Event, Revision};
+
+use starling_processing::boundary::{self, BoundaryChange, BoundaryContext, BoundaryOptions};
 
 use super::docs::RevisionRegistry;
+
+/// The provenance of a revision produced by the insertion-boundary rules.
+const BOUNDARY_PROVENANCE: &str = "insertion-boundary";
 
 /// What an adapter learned revalidating a target just before apply.
 #[derive(Debug, Clone, PartialEq)]
@@ -56,6 +66,13 @@ pub struct InsertEvidence {
     pub level: String,
 }
 
+/// The text immediately around an insertion point.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SurroundingText {
+    pub before: String,
+    pub after: String,
+}
+
 /// The external-target seam (the adapters are E03's platform work,
 /// issue #221). `insert` is only ever called from the user-initiated
 /// `delivery.apply` path.
@@ -69,6 +86,14 @@ pub trait DeliveryAdapter: Send + Sync {
         -> Result<InsertEvidence, InsertionFailure>;
     /// An honest description for snapshots.
     fn describe(&self) -> String;
+    /// The text around the insertion point, where the platform exposes it
+    /// without extra permissions; `None` (the default) delivers the
+    /// dictated text unchanged. Adapters must return `None` for secure and
+    /// incognito targets without reading anything. The text is used for
+    /// the boundary decision only: never stored, never sent to a provider.
+    fn surrounding_text(&self, _target_ref: &str) -> Option<SurroundingText> {
+        None
+    }
 }
 
 /// The Mode A stub adapter. It prepares (bookkeeping it can honestly do)
@@ -289,13 +314,11 @@ impl DeliveryActor {
     ) {
         // A delivery may only be prepared against a revision this runtime
         // knows (committed heads published by the docs service).
-        let text = {
+        let source = {
             let revisions = self.revisions.lock().expect("revision registry lock");
-            revisions
-                .get(&revision_id)
-                .map(|(_, revision)| revision.text.clone())
+            revisions.get(&revision_id).cloned()
         };
-        let Some(text) = text else {
+        let Some((doc_id, source)) = source else {
             let _ = reply.try_send(Err(Rejection::UnknownRevision { revision_id }));
             return;
         };
@@ -307,6 +330,14 @@ impl DeliveryActor {
                 let _ = reply.try_send(Err(Rejection::InvalidPayload(
                     format!("delivery adapter could not prepare: {message}"),
                 )));
+                return;
+            }
+        };
+        let (revision_id, text) = match self.boundary_revision(&doc_id, &source, &target_ref) {
+            Ok(Some(derived)) => (derived.rev_id, derived.text),
+            Ok(None) => (revision_id, source.text),
+            Err(rejection) => {
+                let _ = reply.try_send(Err(rejection));
                 return;
             }
         };
@@ -354,6 +385,66 @@ impl DeliveryActor {
                 let _ = reply.try_send(Err(illegal("delivery.prepare", core.state(), violation)));
             }
         }
+    }
+
+    /// Applies the insertion-boundary rules when the adapter reports
+    /// surrounding text and registers the adjusted text as a revision
+    /// derived from `source`. `None` when nothing changes.
+    ///
+    /// The derived revision lives only in the delivery registry: the
+    /// document service never sees it. The surrounding text is a
+    /// prepare-time snapshot: apply revalidates the target's identity, not
+    /// its boundary. A mode's verbatim flag does not reach this machine
+    /// yet, so the rules always run.
+    fn boundary_revision(
+        &self,
+        doc_id: &str,
+        source: &Revision,
+        target_ref: &str,
+    ) -> Result<Option<Revision>, Rejection> {
+        // A derived revision is delivered exactly as recorded.
+        if source.provenance == BOUNDARY_PROVENANCE {
+            return Ok(None);
+        }
+        let Some(surrounding) = self.adapter.surrounding_text(target_ref) else {
+            return Ok(None);
+        };
+        let context = BoundaryContext {
+            before: &surrounding.before,
+            after: &surrounding.after,
+        };
+        let adjustment = boundary::adjust(&source.text, &context, &BoundaryOptions::default());
+        if adjustment.is_unchanged() {
+            return Ok(None);
+        }
+        // The fired rules determine the adjusted text, so naming the id
+        // after them never maps one id to two different texts.
+        let rules: Vec<&str> = adjustment
+            .changes
+            .iter()
+            .map(|change| match change {
+                BoundaryChange::LeadingSpace => "space",
+                BoundaryChange::FirstLetterCase => "case",
+            })
+            .collect();
+        let derived = Revision {
+            rev_id: format!("{}#boundary-{}", source.rev_id, rules.join("-")),
+            text: adjustment.text,
+            provenance: BOUNDARY_PROVENANCE.to_string(),
+            ..source.clone()
+        };
+        let mut revisions = self.revisions.lock().expect("revision registry lock");
+        let (_, registered) = revisions
+            .entry(derived.rev_id.clone())
+            .or_insert_with(|| (doc_id.to_string(), derived.clone()));
+        // Re-deriving yields an identical revision; anything else under
+        // this id is an unrelated revision that must not be replaced.
+        if *registered != derived {
+            return Err(Rejection::RevisionIdTaken {
+                revision_id: derived.rev_id,
+            });
+        }
+        Ok(Some(derived))
     }
 
     fn handle_apply(&mut self, reply: super::ReceiptTx, corr: String, delivery_id: String) {
