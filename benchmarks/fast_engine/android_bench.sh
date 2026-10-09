@@ -47,7 +47,7 @@ if [ "$BUILD_IT" = 1 ]; then
 fi
 
 . "$ROOT/benchmarks/fast_engine/phone_common.sh"
-trap 'wake_release || true' EXIT
+trap 'kill_benches || true; wake_release || true' EXIT
 # the screen may be off: keep the phone out of suspend
 wake_hold
 adb shell mkdir -p "$DEV_DIR"

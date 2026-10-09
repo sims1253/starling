@@ -26,7 +26,7 @@ MOSS_WAV=${MOSS_WAV:-short.wav}
 EXTRA_ENV=${EXTRA_ENV:-}
 
 . "$(dirname "$0")/phone_common.sh"
-trap 'wake_release || true' EXIT
+trap 'kill_benches || true; wake_release || true' EXIT
 # the screen may be off: keep the phone out of suspend
 wake_hold
 
@@ -35,6 +35,7 @@ for spec in "$@"; do
   name=${spec%%=*}; bin=${spec#*=}
   [ -f "$bin" ] || { echo "missing binary: $bin" >&2; exit 1; }
   adb push "$bin" "$DEV/starling-bench-$name" >/dev/null
+  BENCH_BINS+=" starling-bench-$name"   # for kill_benches
   names+=("$name")
 done
 

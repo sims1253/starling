@@ -119,6 +119,20 @@ ContextRegistry& registry() {
     return *r;
 }
 
+// The last holder's release: a clean teardown, or a hung context parked.
+// Disarmed until the shared_ptr owns the context: if allocating its control
+// block throws, acquire() still holds reg.mu and owns the context itself.
+struct ReleaseContext {
+    bool armed = false;
+    void operator()(Context* p) const {
+        if (!armed) return;
+        ContextRegistry& r = registry();
+        std::lock_guard<std::mutex> rk(r.mu);
+        if (p->gpu_hung()) { r.hung = p; return; }   // its work never finished
+        delete p;
+    }
+};
+
 } // namespace
 
 std::shared_ptr<Context> Context::acquire(std::string& err) {
@@ -146,12 +160,9 @@ std::shared_ptr<Context> Context::acquire(std::string& err) {
                                  reg.wedge_why + "); restart the app/device before retrying";
         }
     }
-    std::shared_ptr<Context> c(fresh.release(), [](Context* p) {
-        ContextRegistry& r = registry();
-        std::lock_guard<std::mutex> rk(r.mu);
-        if (p->gpu_hung()) { r.hung = p; return; }   // its work never finished
-        delete p;
-    });
+    std::shared_ptr<Context> c(fresh.get(), ReleaseContext{});
+    std::get_deleter<ReleaseContext>(c)->armed = true;
+    fresh.release();
     reg.live = c;
     return c;
 }

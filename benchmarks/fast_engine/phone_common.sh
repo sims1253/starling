@@ -46,6 +46,7 @@ wake_hold() {   # wake_hold [max_seconds]
   [ -f "$dex" ] || "$(dirname "$dex")/build.sh" >/dev/null ||
     { echo "ERROR: cannot build $dex" >&2; return 1; }
   wake_release || true
+  timeout 15 adb shell "mkdir -p ${WAKEHOLD_DEX%/*}" >/dev/null 2>&1
   timeout 30 adb push "$dex" "$WAKEHOLD_DEX" >/dev/null 2>&1 ||
     { echo "ERROR: could not push wakehold.dex" >&2; return 1; }
   timeout 15 adb shell "CLASSPATH=$WAKEHOLD_DEX nohup app_process / WakeHold $WAKEHOLD_TAG ${1:-7200} >/dev/null 2>&1 & echo \$! > $WAKEHOLD_DEX.pid" >/dev/null 2>&1

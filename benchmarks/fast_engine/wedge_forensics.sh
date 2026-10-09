@@ -32,10 +32,12 @@ case "$mode" in
     if [ "$label" = stop ]; then
       echo "logcat watch stopped (files stay in $WATCH until the next start)"
     elif timeout 15 adb shell "mkdir -p $WATCH && (logcat -b all -v threadtime -f $WATCH/logcat.txt -r 16384 -n 8 \
-        </dev/null >/dev/null 2>&1 &)"; then
+        </dev/null >/dev/null 2>$WATCH/stderr.txt & echo \$! > $WATCH/pid) && sleep 1 && kill -0 \$(cat $WATCH/pid)"; then
       echo "logcat watch running (device: $WATCH, 8 x 16 MB)"
     else
-      echo "ERROR: could not start the logcat watch" >&2; exit 1
+      echo "ERROR: the logcat watch did not start:" >&2
+      timeout 15 adb shell "cat $WATCH/stderr.txt" >&2
+      exit 1
     fi
     exit 0 ;;
   event|post-reboot) ;;
