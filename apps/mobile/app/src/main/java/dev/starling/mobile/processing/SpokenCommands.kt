@@ -103,48 +103,29 @@ class SpokenCommands(tableJson: String) {
     /** The escape word that makes the next phrase plain text; "literal" when the language has no table. */
     fun literalWord(language: String?): String = tableFor(language)?.literal ?: "literal"
 
+    /**
+     * Applies the commands to [text]. [prefix] is text already processed
+     * before it (an accepted proposal in a staged draft): it is never
+     * matched as commands, but it is the output a punctuation mark attaches
+     * to or a bullet starts a line after, exactly as if the two had been
+     * processed together. The result includes the prefix. With an empty
+     * prefix this is the contract's step, line for line.
+     */
     fun apply(
         text: String,
         language: String?,
         spokenCommands: Boolean,
         snippets: List<Snippet>,
+        prefix: String = "",
     ): String {
         val lang = tableFor(language)
         val literal = lang?.literal ?: "literal"
-        val phrases = ArrayList<Phrase>()
-        if (spokenCommands && lang != null) phrases += lang.commands
-        for (snippet in snippets) {
-            phrases += Phrase(
-                words = words(snippet.spoken.lowercase()),
-                rank = 1,
-                action = Action.Expand(snippet.expansion),
-            )
-        }
-        // Longest words first, then longest characters (code points, as Python's len counts), commands before snippets.
-        val ordered = phrases
-            .filter { it.words.isNotEmpty() }
-            .sortedWith(
-                compareBy<Phrase>(
-                    { -it.words.size },
-                    { -it.words.joinToString(" ").let { joined -> joined.codePointCount(0, joined.length) } },
-                    { it.rank },
-                ),
-            )
-
+        val ordered = orderedPhrases(lang, spokenCommands, snippets)
         val spans = tokens(text)
         val cores = spans.map { core(text.substring(it.first, it.second)) }
+        fun matchAt(i: Int): Pair<Int, Action>? = matchPhrase(ordered, cores, i)
 
-        fun matchAt(i: Int): Pair<Int, Action>? {
-            for (phrase in ordered) {
-                val n = phrase.words.size
-                if (i + n <= spans.size && cores.subList(i, i + n) == phrase.words) {
-                    return n to phrase.action
-                }
-            }
-            return null
-        }
-
-        var out = ""
+        var out = prefix
         var pos = 0
         var skipWs = false
         var i = 0
@@ -207,6 +188,36 @@ class SpokenCommands(tableJson: String) {
         }
         if (!skipWs) out += text.substring(pos)
         return out
+    }
+
+    private fun orderedPhrases(lang: Language?, spokenCommands: Boolean, snippets: List<Snippet>): List<Phrase> {
+        val phrases = ArrayList<Phrase>()
+        if (spokenCommands && lang != null) phrases += lang.commands
+        for (snippet in snippets) {
+            phrases += Phrase(
+                words = words(snippet.spoken.lowercase()),
+                rank = 1,
+                action = Action.Expand(snippet.expansion),
+            )
+        }
+        // Longest words first, then longest characters (code points, as Python's len counts), commands before snippets.
+        return phrases
+            .filter { it.words.isNotEmpty() }
+            .sortedWith(
+                compareBy<Phrase>(
+                    { -it.words.size },
+                    { -it.words.joinToString(" ").let { joined -> joined.codePointCount(0, joined.length) } },
+                    { it.rank },
+                ),
+            )
+    }
+
+    private fun matchPhrase(ordered: List<Phrase>, cores: List<String>, i: Int): Pair<Int, Action>? {
+        for (phrase in ordered) {
+            val n = phrase.words.size
+            if (i + n <= cores.size && cores.subList(i, i + n) == phrase.words) return n to phrase.action
+        }
+        return null
     }
 
     private companion object {

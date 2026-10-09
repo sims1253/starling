@@ -189,6 +189,9 @@ class StagedTake(
     /** Switches the draft's mode by hand (the mode picker) and processes again. */
     fun switchMode(target: Mode) {
         manualMode = target
+        // The old mode's proposal is gone at once; processing in the new
+        // mode follows as soon as no capture is feeding the draft.
+        proposal = null
         if (!busy) process()
     }
 
@@ -284,21 +287,36 @@ class StagedTake(
     fun finishCorrection(text: String): Boolean {
         val (target, revision) = correction ?: return false
         correction = null
-        val routed = catalog.route(text, mode, secure = false).payload
-        val payload = catalog.instructions.split(routed, mode.language).payload.trim()
+        val routed = catalog.route(text, mode, secure = false)
+        val literal = (routed.mode?.let(catalog::mode) ?: mode).behavior == VERBATIM
+        // "literal …" keeps every word, a delimiter included; otherwise a
+        // trailing instruction is dropped like any other command text.
+        val payload = if (literal) {
+            routed.payload.trim()
+        } else {
+            catalog.instructions.split(routed.payload, mode.language).payload.trim()
+        }
         if (draft.revision != revision || payload.isEmpty()) {
             afterEdit()
             return false
         }
         draft.delete(target.first, target.last + 1)
         draft.insert(target.first, payload)
+        if (literal) {
+            // The draft becomes a processed revision right away with the
+            // correction passed through untouched, so no later rules pass
+            // turns its words into commands.
+            process(passThroughUser = true, keepUnchanged = true)
+            proposal?.let { if (draft.accept(it.requestId) == Outcome.APPLIED) proposal = null }
+        }
         afterEdit()
         return true
     }
 
-    /** The correction's capture failed: the draft stays as it was. */
+    /** The correction's capture failed: the draft stays as it was, processed in the current mode. */
     fun cancelCorrection() {
         correction = null
+        if (!recording) process()
     }
 
     /**
@@ -351,7 +369,7 @@ class StagedTake(
      * revision. Rules take microseconds, so the result is judged at once;
      * it still goes through the contract as a request and a proposal.
      */
-    private fun process() {
+    private fun process(passThroughUser: Boolean = false, keepUnchanged: Boolean = false) {
         proposal = null
         selection = null
         showProcessed = true
@@ -359,27 +377,38 @@ class StagedTake(
         val requestId = "processing-${++requests}"
         if (draft.request(requestId) != Outcome.PENDING) return
         val input = draft.payloadText()
-        val snippets = mode.snippets.map { Snippet(it.spoken, it.expansion) }
+        val snippets = snippets()
         val started = nanoTime()
-        // Text already processed (an accepted proposal) passes through as
-        // it is: its escaped words ("literal comma") stay words.
-        val output = draft.regions()
-            .filter { it.kind != RegionKind.COMMAND }
-            .joinToString("") { region ->
-                if (region.kind == RegionKind.PROCESSED) {
-                    region.text
-                } else {
-                    catalog.commands.apply(region.text, mode.language, mode.spokenCommands, snippets)
-                }
+        // Text already processed (an accepted proposal) passes through as it
+        // is, so its escaped words ("literal comma") stay words; the text
+        // around it is processed in runs, each seeded with everything before
+        // it, so a command still attaches across the boundary.
+        var output = ""
+        val run = StringBuilder()
+        fun flush() {
+            if (run.isEmpty()) return
+            output = catalog.commands.apply(run.toString(), mode.language, mode.spokenCommands, snippets, output)
+            run.clear()
+        }
+        draft.regions().filter { it.kind != RegionKind.COMMAND }.forEach { region ->
+            if (region.kind == RegionKind.PROCESSED || (passThroughUser && region.kind == RegionKind.USER)) {
+                flush()
+                output += region.text
+            } else {
+                run.append(region.text)
             }
+        }
+        flush()
         val elapsedMs = (nanoTime() - started) / 1_000_000
         if (draft.result(requestId, true, output) != Outcome.CURRENT) return
-        if (output == input) {
+        if (output == input && !keepUnchanged) {
             draft.reject(requestId)
             return
         }
         proposal = Proposal(requestId, output, elapsedMs)
     }
+
+    private fun snippets() = mode.snippets.map { Snippet(it.spoken, it.expansion) }
 
     companion object {
         private const val VERBATIM = "verbatim"

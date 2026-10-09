@@ -302,4 +302,50 @@ class StagedTakeTest {
         assertNull(instructions.liveCut("Send the report", "en"))
         assertNull(instructions.liveCut("the word literal starling stays", "en"))
     }
+
+    @Test
+    fun commandsAttachAcrossCaptures() {
+        // Review #302 round 3, item 1.
+        val bullets = take().apply {
+            dictate(final = "one")
+            dictate(final = "bullet two", attempt = "a-2")
+        }
+        assertEquals("one\n- two", bullets.displayText())
+        val period = take().apply {
+            dictate(final = "hello comma")
+            dictate(final = "period", attempt = "a-2")
+        }
+        assertEquals("hello.", period.displayText())
+    }
+
+    @Test
+    fun aLiteralCorrectionKeepsItsWords() {
+        // Review #302 round 3, item 2.
+        val take = take()
+        take.dictate(final = "meet at sex")
+        take.toggleView()
+        take.selectWordAt(8)
+        assertTrue(take.beginCorrection())
+        assertTrue(take.finishCorrection("literal six comma Starling, ok"))
+        assertEquals("meet at six comma Starling, ok", take.displayText())
+        assertEquals("meet at six comma Starling, ok", take.deliveryText())
+        // Later processing leaves the corrected words alone.
+        take.dictate(final = "period", attempt = "a-2")
+        assertEquals("meet at six comma Starling, ok.", take.displayText())
+    }
+
+    @Test
+    fun aModeSwitchDuringACorrectionNeverLeavesTheOldProposal() {
+        // Review #302 round 3, item 3.
+        val take = take()
+        take.dictate(final = "hello comma")
+        take.toggleView()
+        take.selectWordAt(0)
+        assertTrue(take.beginCorrection())
+        take.switchMode(catalog.mode("direct"))
+        assertNull(take.proposal)
+        take.cancelCorrection()
+        assertNull(take.proposal)
+        assertEquals("hello comma", take.deliveryText())
+    }
 }
