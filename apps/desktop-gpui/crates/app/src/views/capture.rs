@@ -8,6 +8,7 @@ use gpui::{
     ease_in_out, point, prelude::*, px, rgba,
 };
 use starling_dictation::engine::{EnginePhase, InstallState, SwitchStage};
+use starling_dictation::playback::NoticeKind;
 use starling_dictation::settings::EngineMode;
 
 use crate::app::StarlingApp;
@@ -568,6 +569,20 @@ fn render_banner(app: &mut StarlingApp, cx: &mut Context<StarlingApp>) -> Option
                 message,
                 "The take was still saved and sent; heavily clipped audio transcribes poorly.",
                 |app: &mut StarlingApp| app.capture_warning = None,
+                cx,
+            ));
+        }
+        if let Some(notice) = app.playback_notice.clone() {
+            let title = match notice.kind {
+                NoticeKind::AdjustFailed => "Playback not adjusted",
+                NoticeKind::RestoreFailed => "Playback not restored",
+                NoticeKind::OutputRemoved => "Playback device removed",
+            };
+            return Some(quality_banner(
+                title,
+                notice.message,
+                "The recording itself is unaffected.",
+                |app: &mut StarlingApp| app.playback_notice = None,
                 cx,
             ));
         }

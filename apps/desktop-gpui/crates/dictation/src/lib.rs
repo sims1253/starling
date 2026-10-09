@@ -11,6 +11,7 @@ pub mod fft;
 pub mod fidelity;
 pub mod journal;
 pub mod microphone;
+pub mod playback;
 pub mod player;
 pub mod recorder;
 pub mod settings;

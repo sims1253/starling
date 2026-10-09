@@ -94,6 +94,10 @@ pub struct Settings {
     /// file.
     #[serde(default, deserialize_with = "lenient_microphone")]
     pub microphone: MicrophoneSettings,
+    /// Playback during recording (#361). An unreadable subsection loads
+    /// its defaults (off) and never the rest of the file.
+    #[serde(default, deserialize_with = "lenient_playback")]
+    pub playback: PlaybackSettings,
 }
 
 /// Which microphone takes record from. Only the user changes this: a take
@@ -142,6 +146,66 @@ pub struct DictationSettings {
 
 /// The shortcut a fresh install uses: the one every earlier build had.
 pub const DEFAULT_SHORTCUT: &str = "CmdOrCtrl+Shift+Space";
+
+/// What happens to system playback while a recording runs. An unknown
+/// value (a file from a newer build) loads as `Off`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PlaybackMode {
+    Lower,
+    Mute,
+    #[default]
+    #[serde(other)]
+    Off,
+}
+
+/// The playback subsection of the settings file. Attenuation is opt-in:
+/// a file without the key loads `Off`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct PlaybackSettings {
+    pub during_recording: PlaybackMode,
+    /// `Lower` mode's target volume in percent.
+    #[serde(deserialize_with = "clamped_percent")]
+    pub lower_level_percent: u8,
+}
+
+/// A hand-edited level outside 0..=100 (or a fraction) is clamped rather
+/// than failing the whole settings document.
+fn clamped_percent<'de, D>(deserializer: D) -> Result<u8, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = <f64 as serde::Deserialize>::deserialize(deserializer)?;
+    Ok(raw.round().clamp(0.0, 100.0) as u8)
+}
+
+fn lenient_playback<'de, D>(deserializer: D) -> Result<PlaybackSettings, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = <serde_json::Value as serde::Deserialize>::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).unwrap_or_else(|err| {
+        eprintln!("Unreadable playback settings; using the defaults: {err}");
+        PlaybackSettings::default()
+    }))
+}
+
+impl Default for PlaybackSettings {
+    fn default() -> Self {
+        Self {
+            during_recording: PlaybackMode::Off,
+            lower_level_percent: 30,
+        }
+    }
+}
+
+impl PlaybackSettings {
+    /// The `Lower` target, never above 100% whatever the field holds.
+    pub fn effective_lower_percent(&self) -> u32 {
+        self.lower_level_percent.min(100).into()
+    }
+}
 
 impl Default for DictationSettings {
     fn default() -> Self {
@@ -273,6 +337,7 @@ impl Settings {
             engine: EngineSettings::default(),
             dictation: DictationSettings::default(),
             microphone: MicrophoneSettings::default(),
+            playback: PlaybackSettings::default(),
         }
     }
 
@@ -556,6 +621,7 @@ mod tests {
             microphone: MicrophoneSettings {
                 preferred_device: Some("USB Mic".to_string()),
             },
+            playback: PlaybackSettings::default(),
         };
 
         settings.save(&path).expect("save");
@@ -915,6 +981,73 @@ mod tests {
         assert_eq!(settings.dictation.shortcut, "CmdOrCtrl+Shift+Space");
         assert_eq!(settings.dictation.activation, ActivationMode::HoldOrToggle);
         assert!(!settings.dictation.double_tap_hands_free);
+    }
+
+    #[test]
+    fn playback_settings_load_leniently() {
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("settings.json");
+        let load = |playback: &str| {
+            std::fs::write(
+                &path,
+                format!(
+                    r#"{{"endpoint":"http://10.0.0.5:8181","model":"m","expectedTerms":[]{playback}}}"#
+                ),
+            )
+            .expect("write settings");
+            Settings::load(&path)
+        };
+
+        // A file from before the key existed: off.
+        assert_eq!(load("").playback, PlaybackSettings::default());
+        assert_eq!(PlaybackSettings::default().during_recording, PlaybackMode::Off);
+        // Partial object: defaults for the rest.
+        assert_eq!(
+            load(r#","playback":{"duringRecording":"mute"}"#).playback,
+            PlaybackSettings {
+                during_recording: PlaybackMode::Mute,
+                lower_level_percent: 30,
+            }
+        );
+        // An unknown mode is off, never a silent mute.
+        let unknown = load(r#","playback":{"duringRecording":"duck","lowerLevelPercent":45}"#);
+        assert_eq!(unknown.playback.during_recording, PlaybackMode::Off);
+        assert_eq!(unknown.playback.lower_level_percent, 45);
+        // Out-of-range levels clamp without resetting anything else.
+        let high = load(r#","playback":{"duringRecording":"lower","lowerLevelPercent":300}"#);
+        assert_eq!(high.endpoint, "http://10.0.0.5:8181");
+        assert_eq!(high.playback.lower_level_percent, 100);
+        let low = load(r#","playback":{"lowerLevelPercent":-20}"#);
+        assert_eq!(low.playback.lower_level_percent, 0);
+        let fraction = load(r#","playback":{"lowerLevelPercent":55.5}"#);
+        assert_eq!(fraction.playback.lower_level_percent, 56);
+        // An unreadable subsection is off, and costs nothing else.
+        for playback in [
+            r#","playback":null"#,
+            r#","playback":{"duringRecording":"mute","lowerLevelPercent":"30%"}"#,
+        ] {
+            let loaded = load(playback);
+            assert_eq!(loaded.playback, PlaybackSettings::default(), "{playback}");
+            assert_eq!(loaded.endpoint, "http://10.0.0.5:8181", "{playback}");
+            assert_eq!(loaded.model, "m", "{playback}");
+        }
+    }
+
+    #[test]
+    fn playback_settings_roundtrip() {
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("settings.json");
+        let settings = Settings {
+            playback: PlaybackSettings {
+                during_recording: PlaybackMode::Lower,
+                lower_level_percent: 45,
+            },
+            ..Settings::default_settings()
+        };
+        settings.save(&path).expect("save");
+        let raw = std::fs::read_to_string(&path).expect("read");
+        assert!(raw.contains("\"duringRecording\": \"lower\""), "{raw}");
+        assert_eq!(Settings::load(&path), settings);
     }
 
     #[test]

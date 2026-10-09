@@ -9,6 +9,7 @@ mod live_stream;
 mod mic;
 mod processing;
 mod shortcut;
+mod slider;
 mod staging;
 mod store;
 mod theme;

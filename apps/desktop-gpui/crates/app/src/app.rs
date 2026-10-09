@@ -21,11 +21,12 @@ use starling_dictation::{
     engine::{Backend, EngineConfig, EngineManager},
     fft,
     fidelity::{self, TranscriptAnalysisOptions},
+    playback::{platform_backend, PlaybackAttenuation, PlaybackLease, PlaybackNotice},
     player::Player,
     recorder::RecorderHandle,
     settings::{
         ActivationMode, DictationSettings, EngineMode, EngineSettings, MicrophoneSettings,
-        ProcessingSettings, Settings, DEFAULT_SHORTCUT,
+        PlaybackMode, PlaybackSettings, ProcessingSettings, Settings, DEFAULT_SHORTCUT,
     },
     storage::{DamagedRecord, ListedRecord, SessionSummary},
 };
@@ -490,11 +491,21 @@ pub struct StarlingApp {
     /// What happened to a take that was cancelled (Escape, a microphone
     /// that never delivered audio): shown until dismissed.
     pub(crate) take_notice: Option<String>,
+    /// The latest playback-attenuation notice. Its own slot: the take
+    /// lifecycle clears `error` and `take_notice` on every start/stop.
+    pub(crate) playback_notice: Option<PlaybackNotice>,
     /// The settings dialog's dictation drafts (committed on save).
     pub(crate) draft_shortcut: Entity<TextField>,
     pub(crate) draft_activation: ActivationMode,
     pub(crate) draft_double_tap: bool,
     pub(crate) dictation_draft_error: Option<String>,
+    pub(crate) draft_playback_mode: PlaybackMode,
+    pub(crate) draft_lower_level: Entity<crate::slider::LevelSlider>,
+    /// Playback attenuation during takes (#361); `playback_lease` is the
+    /// live take's.
+    pub(crate) playback_settings: PlaybackSettings,
+    pub(crate) playback: PlaybackAttenuation,
+    pub(crate) playback_lease: Option<PlaybackLease>,
     pub playing_id: Option<String>,
     /// Identifies the current playback so poll-watchers can detect that they
     /// are stale (G04). Bumped whenever playback starts, stops, or is
@@ -989,6 +1000,11 @@ impl StarlingApp {
             (mode, shortcut) => mode.or(shortcut),
         };
 
+        let draft_lower_level =
+            cx.new(|_| crate::slider::LevelSlider::new(settings.playback.lower_level_percent));
+        // The level readout lives in the settings view.
+        cx.observe(&draft_lower_level, |_, _, cx| cx.notify()).detach();
+
         Self {
             error: match (store_error.clone(), mode_note) {
                 (Some(store), Some(mode)) => Some(format!("{store}\n{mode}")),
@@ -1057,6 +1073,11 @@ impl StarlingApp {
             draft_activation: dictation_settings.activation,
             draft_double_tap: dictation_settings.double_tap_hands_free,
             dictation_draft_error: None,
+            draft_playback_mode: settings.playback.during_recording,
+            draft_lower_level,
+            playback_settings: settings.playback,
+            playback: PlaybackAttenuation::start(platform_backend()),
+            playback_lease: None,
             shortcut,
             pending_shortcut: None,
             window_focus: Vec::new(),
@@ -1066,6 +1087,7 @@ impl StarlingApp {
             shortcut_registration: Ok(()),
             key_interceptor: None,
             take_notice: None,
+            playback_notice: None,
             playing_id: None,
             playback_generation: 0,
             recorder: None,
@@ -1139,6 +1161,7 @@ impl StarlingApp {
             })
             .detach();
         }
+        self.watch_playback_notices(cx);
         match self.engine_settings.mode {
             // #362: in builtin mode the connection indicator derives from
             // the engine snapshot (the notifier loop refreshes it); probing
@@ -1227,8 +1250,34 @@ impl StarlingApp {
             if let Some(engine) = app.engine.take() {
                 engine.shutdown();
             }
+            // Restores playback if a take is still live.
+            app.playback.shutdown();
             async {}
         }));
+    }
+
+    /// Surfaces the playback service's notices (#361), polled like the
+    /// engine notifier.
+    fn watch_playback_notices(&mut self, cx: &mut Context<Self>) {
+        let handle = self.playback.handle();
+        cx.spawn(async move |this, cx| {
+            loop {
+                Timer::after(Duration::from_millis(250)).await;
+                let notices = handle.take_notices();
+                let alive = this
+                    .update(cx, |app, cx| {
+                        if let Some(notice) = notices.into_iter().last() {
+                            app.playback_notice = Some(notice);
+                            cx.notify();
+                        }
+                    })
+                    .is_ok();
+                if !alive {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 
     /// The settings file's contents as of the app's current state: every
@@ -1245,6 +1294,7 @@ impl StarlingApp {
             engine: self.engine_settings.clone(),
             dictation: self.dictation_settings.clone(),
             microphone: self.microphone_settings.clone(),
+            playback: self.playback_settings,
         };
         settings.set_expected_terms_input(&self.expected_terms_input);
         settings
@@ -1630,6 +1680,10 @@ impl StarlingApp {
         self.draft_activation = self.dictation_settings.activation;
         self.draft_double_tap = self.dictation_settings.double_tap_hands_free;
         self.dictation_draft_error = None;
+        self.draft_playback_mode = self.playback_settings.during_recording;
+        self.draft_lower_level.update(cx, |slider, cx| {
+            slider.set_value(self.playback_settings.lower_level_percent, cx);
+        });
         cx.notify();
     }
 
@@ -1842,6 +1896,12 @@ impl StarlingApp {
         };
         self.activation
             .set_config(crate::activation::ActivationConfig::from_settings(&self.dictation_settings));
+
+        // Applies from the next take on.
+        self.playback_settings = PlaybackSettings {
+            during_recording: self.draft_playback_mode,
+            lower_level_percent: self.draft_lower_level.read(cx).value(),
+        };
 
         // R11: an unresolvable config directory is surfaced, not swallowed —
         // settings must not silently land in the current working directory.

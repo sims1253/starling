@@ -361,6 +361,8 @@ impl StarlingApp {
         cx: &mut Context<Self>,
     ) {
         self.error = None;
+        // Playback comes back when recording stops, not after transcription.
+        self.end_playback_lease();
         if let Some(handle) = self.recorder.take() {
             let mut stream = self.live_stream.take();
             // The binding resolved at START leaves with the take (#363);
@@ -560,6 +562,8 @@ impl StarlingApp {
     pub(crate) fn start_recording(&mut self, cx: &mut Context<Self>) -> bool {
         self.error = None;
         self.take_notice = None;
+        // Attenuation begins with the attempt, before the microphone opens.
+        let playback_lease = self.playback.handle().begin(&self.playback_settings);
         {
             // I1 phase 2: production captures journal to the durable
             // per-take file; only fsynced-boundary samples are
@@ -612,6 +616,7 @@ impl StarlingApp {
                     }
                     self.active_take = Some(target);
                     self.recorder = Some(handle);
+                    self.playback_lease = Some(playback_lease);
                     self.elapsed_ms = 0.0;
                     self.levels = vec![0.06; 52];
                     self.capture_warning = None;
@@ -619,12 +624,20 @@ impl StarlingApp {
                     true
                 }
                 Err(err) => {
+                    self.playback.handle().end(playback_lease);
                     let text = format!("{} {}", err.problem.message(), err.problem.recovery());
                     self.report_input_problem(err.problem, text);
                     cx.notify();
                     false
                 }
             }
+        }
+    }
+
+    /// Restores playback for the live take (asynchronously).
+    fn end_playback_lease(&mut self) {
+        if let Some(lease) = self.playback_lease.take() {
+            self.playback.handle().end(lease);
         }
     }
 
@@ -639,6 +652,7 @@ impl StarlingApp {
         reason: crate::activation::CancelReason,
         cx: &mut Context<Self>,
     ) {
+        self.end_playback_lease();
         let Some(handle) = self.recorder.take() else {
             return;
         };
