@@ -195,8 +195,12 @@ contract in `packages/contracts/mode-routing/` by `tests/test_staging.py`:
   the keyboard: the live tail while speaking, then the text with spoken
   punctuation and layout commands ("comma", "new line", "bullet") applied as
   a processed proposal. **Show raw** flips to the recognition exactly as it
-  arrived; tapping a word selects it for **Delete word**; Record again adds
-  to the draft; only **Insert** writes, once, into the take's field.
+  arrived; tapping a word selects it for **Delete word**, or for a spoken
+  correction (tap Record with the word selected and say what replaces it);
+  Record again adds to the draft; only **Insert** writes, once, into the
+  take's field — and if the field refuses the text, the draft stays and
+  nothing is sent. Typed edits need a typing keyboard: insert, then switch
+  with **⌨**.
 - **Message**: like Draft, but Insert also presses the field's own action
   (Send, Search, Go) through `performEditorAction` — never a synthetic Enter.
 
@@ -205,7 +209,8 @@ A leading phrase picks a mode for one take ("draft mode …", "message mode
 instruction is recognized; both follow the contract grammar and are shown
 struck through in the draft, never sent to the field, with **That was
 literal** to undo the decision. Until the first words are clearly not a
-phrase, direct mode holds them back from the field. An instruction needs a
+phrase, direct mode holds them back from the field, and from a possible
+"Starling" delimiter on, nothing more is composed into it. An instruction needs a
 text model, which the phone does not have yet (#295), so it is only set
 aside. Private fields never stage, route or process.
 

@@ -14,6 +14,11 @@ package dev.starling.mobile.processing
  * default and can always flip back to the raw text, and the text that is
  * delivered is exactly the view they had on screen.
  *
+ * Commands are remembered per segment, in that segment's raw coordinates:
+ * they are marked once, when the segment's final lands at the end of the
+ * draft, and again for every segment whenever the draft is rebuilt from its
+ * raw attempts. Edits in between never shift them onto other text.
+ *
  * Offsets are Unicode code points, as everywhere in the contract.
  */
 class StagedTake(
@@ -26,12 +31,13 @@ class StagedTake(
 ) {
     val draft = StagedDraft(draftId, draftId)
 
-    var mode: Mode = startMode
-        private set
+    /** A mode picked by hand; it outranks any spoken phrase. */
+    private var manualMode: Mode? = null
 
-    /** Why the draft looks the way it does, for the one-line explanation. */
-    var decision: Decision? = null
-        private set
+    /** The mode a leading phrase picked, while that phrase stands. */
+    private var phraseMode: Mode? = null
+
+    val mode: Mode get() = manualMode ?: phraseMode ?: startMode
 
     /** The open processed proposal for the current revision, if any. */
     var proposal: Proposal? = null
@@ -45,20 +51,25 @@ class StagedTake(
     var selection: IntRange? = null
         private set
 
-    var plan: ModeCatalog.Plan = catalog.plan(startMode, powerSaver)
-        private set
+    val plan: ModeCatalog.Plan get() = catalog.plan(mode, powerSaver)
 
     private var segment = -1
     private var separator = ""
     private var requests = 0
-    private var phraseIsLiteral = false
-    private var instructionIsLiteral = false
 
-    // Segment 0's routing and the last segment's instruction, kept so a
-    // rebuild after "that was literal" can re-mark the other one.
-    private var phraseEnd = 0
-    private var phraseMode: Mode? = null
-    private var instructionSpan: IntRange? = null
+    /** The raw text of every finalized segment (separator included), by segment. */
+    private val segmentTexts = sortedMapOf<Int, String>()
+
+    /** Commands that stand, in their segment's raw coordinates. */
+    private val commands = mutableListOf<SegmentCommand>()
+
+    private class SegmentCommand(
+        val segment: Int,
+        val start: Int,
+        val end: Int,
+        val kind: CommandKind,
+        val decision: Decision,
+    )
 
     sealed interface Decision {
         data class Phrase(val phrase: String, val mode: Mode) : Decision
@@ -68,14 +79,29 @@ class StagedTake(
 
     data class Proposal(val requestId: String, val text: String, val elapsedMs: Long)
 
+    /**
+     * The newest spoken decision still standing, for the one-line
+     * explanation and its undo. A phrase overruled by a hand-picked mode is
+     * still kept out of the text but is no longer the explanation.
+     */
+    val decision: Decision?
+        get() = commands.lastOrNull { it.kind == CommandKind.TRAILING_INSTRUCTION }?.decision
+            ?: commands.firstOrNull { it.kind == CommandKind.MODE_PHRASE && manualMode == null }?.decision
+
     val recording: Boolean get() = draft.regions().any { it.kind == RegionKind.PARTIAL }
 
-    /** A new capture adds a segment at the end of the draft. */
+    /**
+     * A new capture adds a segment at the end of the draft. What the user
+     * was looking at becomes the base: a processed view on screen is taken
+     * into the draft, so the live tail shows right after it.
+     */
     fun beginSegment() {
+        takeProcessedIntoDraft()
+        proposal = null
+        selection = null
         segment += 1
         val text = draft.text()
         separator = if (text.isEmpty() || text.last().isWhitespace()) "" else " "
-        selection = null
     }
 
     fun partial(text: String) {
@@ -84,36 +110,54 @@ class StagedTake(
 
     /**
      * The final text of the current segment. The first segment of a draft
-     * may start with a mode phrase; the newest segment may end with a
-     * spoken instruction. Then the draft is processed.
+     * may start with a mode phrase; any segment may end with a spoken
+     * instruction. Then the draft is processed.
      */
     fun final(attemptId: String, text: String) {
-        draft.final(segment, attemptId, separator + text)
-        val start = draft.text().codePointCount() - (separator + text).codePointCount()
-        if (segment == 0 && !phraseIsLiteral) {
+        val segmentText = separator + text
+        draft.final(segment, attemptId, segmentText)
+        segmentTexts[segment] = segmentText
+        val found = mutableListOf<SegmentCommand>()
+        var phraseEnd = 0
+        if (segment == 0) {
             val routed = catalog.route(text, startMode, secure = false)
             val span = routed.prefixSpanCodepoints
             if (span != null && routed.mode != null && span.second > span.first) {
-                phraseEnd = start + separator.codePointCount() + span.second
-                phraseMode = catalog.mode(routed.mode)
-                mode = catalog.mode(routed.mode)
-                plan = catalog.plan(mode, powerSaver)
-                decision = if (routed.source.startsWith("escape:")) {
+                val routedMode = catalog.mode(routed.mode)
+                phraseEnd = separator.codePointCount() + span.second
+                phraseMode = routedMode
+                val decision = if (routed.source.startsWith("escape:")) {
                     Decision.Literal
                 } else {
-                    Decision.Phrase(routed.source.removePrefix("phrase:"), mode)
+                    Decision.Phrase(routed.source.removePrefix("phrase:"), routedMode)
+                }
+                found += SegmentCommand(segment, 0, phraseEnd, CommandKind.MODE_PHRASE, decision)
+            }
+        }
+        if (mode.behavior != VERBATIM) {
+            val split = catalog.instructions.split(segmentText, mode.language)
+            val delimiter = split.delimiterSpan
+            if (split.matched && delimiter != null) {
+                // The whitespace before the delimiter goes with it, so the
+                // payload ends where the spoken text did.
+                val cps = segmentText.codePoints().toArray()
+                var start = delimiter.first
+                while (start > 0 && Character.isWhitespace(cps[start - 1])) start -= 1
+                if (start >= phraseEnd) {
+                    found += SegmentCommand(
+                        segment,
+                        start,
+                        cps.size,
+                        CommandKind.TRAILING_INSTRUCTION,
+                        Decision.Instruction(split.instruction),
+                    )
                 }
             }
         }
-        if (!instructionIsLiteral && mode.behavior != "verbatim") {
-            val split = catalog.instructions.split(separator + text, null)
-            val delimiter = split.delimiterSpan
-            if (split.matched && delimiter != null && start + delimiter.first >= phraseEnd) {
-                instructionSpan = (start + delimiter.first) until draft.text().codePointCount()
-                decision = Decision.Instruction(split.instruction)
-            }
-        }
-        markCommands()
+        // The segment's final is the end of the draft right now.
+        val base = draft.text().codePointCount() - segmentText.codePointCount()
+        found.forEach { draft.markCommand(base + it.start, base + it.end, it.kind) }
+        commands += found
         process()
     }
 
@@ -130,39 +174,23 @@ class StagedTake(
 
     /** Switches the draft's mode by hand (the mode picker) and processes again. */
     fun switchMode(target: Mode) {
-        mode = target
-        plan = catalog.plan(mode, powerSaver)
-        if (decision is Decision.Phrase || decision is Decision.Literal) {
-            // A hand-picked mode overrides the spoken one; the phrase text
-            // stays out of the payload all the same.
-            decision = null
-        }
-        process()
+        manualMode = target
+        if (!recording) process()
     }
 
     /**
-     * "That was literal": the mode phrase or instruction was meant as
-     * words. The draft goes back to its raw attempts with that span kept
-     * as ordinary text, and processing runs again.
+     * "That was literal" for the decision on screen: that phrase or
+     * instruction was meant as words. The draft goes back to its raw
+     * attempts with every other command still set aside, and is processed
+     * again.
      */
     fun undoDecision() {
-        when (decision) {
-            is Decision.Phrase, Decision.Literal -> {
-                phraseIsLiteral = true
-                phraseEnd = 0
-                phraseMode = null
-                mode = startMode
-                plan = catalog.plan(mode, powerSaver)
-            }
-            is Decision.Instruction -> {
-                instructionIsLiteral = true
-                instructionSpan = null
-            }
-            null -> return
-        }
-        decision = null
-        draft.revertRaw()
-        markCommands()
+        if (recording) return
+        val shown = decision ?: return
+        val command = commands.first { it.decision === shown }
+        commands.remove(command)
+        if (command.kind == CommandKind.MODE_PHRASE) phraseMode = null
+        rebuildFromRaw()
         process()
     }
 
@@ -185,9 +213,8 @@ class StagedTake(
      * raw attempts come back (edits are dropped) and processing runs again.
      */
     fun backToRaw() {
-        draft.revertRaw()
-        markCommands()
-        showProcessed = false
+        if (recording) return
+        rebuildFromRaw()
         process()
         showProcessed = false
     }
@@ -198,33 +225,40 @@ class StagedTake(
 
     /**
      * Selects the word at [offset] (code points into [displayText]), or
-     * clears the selection when that word is already selected. Editing a
-     * processed proposal takes it into the draft first, so the edit applies
-     * to the text the user is looking at.
+     * clears the selection when that word is already selected.
      */
     fun selectWordAt(offset: Int) {
-        val text = displayText()
-        val word = wordAt(text, offset) ?: run { selection = null; return }
+        val word = wordAt(displayText(), offset) ?: run { selection = null; return }
         selection = if (selection == word) null else word
     }
 
     /** Deletes the selected word, or the last word when nothing is selected. */
     fun deleteWord() {
         if (recording) return
+        val target = selection ?: lastWord(displayText()) ?: return
         takeProcessedIntoDraft()
-        val text = draft.text()
-        val target = selection ?: lastWord(text) ?: return
+        val cps = draft.text().codePoints().toArray()
         // One adjacent space goes with the word, so no double space is left.
-        val cps = text.codePoints().toArray()
         var start = target.first
         var end = target.last + 1
         if (end < cps.size && cps[end] == ' '.code) end += 1
         else if (start > 0 && cps[start - 1] == ' '.code) start -= 1
         draft.delete(start, end)
-        selection = null
-        process()
-        // The user edited the text on screen; keep showing it, not a new proposal.
-        showProcessed = false
+        afterEdit()
+    }
+
+    /**
+     * Replaces the selected word with [text] (a spoken correction): user
+     * text in the draft, at the word's place. False when nothing is selected.
+     */
+    fun replaceSelection(text: String): Boolean {
+        if (recording) return false
+        val target = selection ?: return false
+        takeProcessedIntoDraft()
+        draft.delete(target.first, target.last + 1)
+        draft.insert(target.first, text)
+        afterEdit()
+        return true
     }
 
     /**
@@ -234,17 +268,22 @@ class StagedTake(
      */
     fun deliveryText(): String {
         takeProcessedIntoDraft()
-        val text = draft.payloadText()
-        return if (instructionSpan != null) text.trimEnd() else text
+        return draft.payloadText()
     }
 
     /**
      * Records one delivery for [targetDigest] (the editor binding); false
-     * when this revision was already delivered there, so a double tap or a
-     * replayed callback cannot insert twice.
+     * when this revision was already delivered there.
      */
     fun deliver(deliveryId: String, targetDigest: String): Boolean =
         draft.deliver(deliveryId, targetDigest) == Outcome.DELIVERED
+
+    /** The user edited the text on screen: keep showing it, processed again underneath. */
+    private fun afterEdit() {
+        selection = null
+        process()
+        showProcessed = false
+    }
 
     private fun takeProcessedIntoDraft() {
         val open = proposal ?: return
@@ -255,12 +294,15 @@ class StagedTake(
         }
     }
 
-    private fun markCommands() {
-        if (phraseEnd > 0 && !phraseIsLiteral) {
-            draft.markCommand(0, phraseEnd, CommandKind.MODE_PHRASE)
-        }
-        instructionSpan?.let { span ->
-            draft.markCommand(span.first, span.last + 1, CommandKind.TRAILING_INSTRUCTION)
+    /** The raw attempts again, with every standing command set aside. */
+    private fun rebuildFromRaw() {
+        draft.revertRaw()
+        var base = 0
+        segmentTexts.forEach { (index, text) ->
+            commands.filter { it.segment == index }.forEach {
+                draft.markCommand(base + it.start, base + it.end, it.kind)
+            }
+            base += text.codePointCount()
         }
     }
 
@@ -294,9 +336,15 @@ class StagedTake(
     }
 
     companion object {
+        private const val VERBATIM = "verbatim"
+
         private fun String.codePointCount(): Int = codePointCount(0, length)
 
-        /** The word (maximal non-whitespace run) at [offset], in code points. */
+        /**
+         * The word at [offset], in code points: the maximal non-whitespace
+         * run, without the punctuation a recognizer attaches to its end, so
+         * a correction keeps the comma that follows the word.
+         */
         internal fun wordAt(text: String, offset: Int): IntRange? {
             val cps = text.codePoints().toArray()
             if (offset !in cps.indices || Character.isWhitespace(cps[offset])) return null
@@ -304,8 +352,11 @@ class StagedTake(
             var end = offset
             while (start > 0 && !Character.isWhitespace(cps[start - 1])) start -= 1
             while (end + 1 < cps.size && !Character.isWhitespace(cps[end + 1])) end += 1
+            while (end > start && cps[end] < 0x10000 && cps[end].toChar() in ATTACHED) end -= 1
             return start..end
         }
+
+        private const val ATTACHED = ",.;:!?"
 
         internal fun lastWord(text: String): IntRange? {
             val cps = text.codePoints().toArray()

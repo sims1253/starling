@@ -193,9 +193,12 @@ class VoiceInputService : InputMethodService() {
         val current = take
         if (current != null) {
             val previous = current.target
-            if (previous != null && connection != null && previous.target === connection) {
-                // restartInput on the very same connection: the composing
-                // region is still the take's own.
+            if (previous != null && connection != null && previous.target === connection &&
+                field != null && current.field.sameFieldAs(field)
+            ) {
+                // restartInput on the very same connection and field: the
+                // composing region is still the take's own. (A restart that
+                // changes the field — say, into a password — is a new field.)
                 current.target = targetGuard.capture()
             } else {
                 // The guard generation moved on, so the old binding is dead.
@@ -293,10 +296,19 @@ class VoiceInputService : InputMethodService() {
             return
         }
         val sensitive = field.sensitive
-        // Recording again with a draft open (in its own field) adds to it.
-        val continuing = take?.takeIf {
-            !it.capturing && it.staged != null && it.target?.let { t -> targetGuard.isCurrent(t, currentInputConnection) } == true
+        if (take?.staged != null && take?.awaitingFinal == true) {
+            // The last capture's text has not reached the draft yet; a new
+            // one now would invalidate it.
+            statusView?.setText(R.string.staging_wait)
+            return
         }
+        // Recording again with a draft open (in its own field, never a
+        // private one) adds to it, or replaces its selected word.
+        val continuing = take?.takeIf {
+            !sensitive && !it.capturing && it.staged != null &&
+                it.target?.let { t -> targetGuard.isCurrent(t, currentInputConnection) } == true
+        }
+        val replacing = continuing?.staged?.selection != null
         // A private field gets the default mode: its route is blocked, so no
         // phrase, rule or processing ever applies there.
         val mode = continuing?.mode ?: if (sensitive) catalog.mode(null) else selectedMode()
@@ -348,13 +360,15 @@ class VoiceInputService : InputMethodService() {
             started.target = target
             started.staged = continuing?.staged
                 ?: if (!sensitive && mode.processingDelivery == STAGED) newStagedTake(mode, recording.id) else null
-            started.staged?.beginSegment()
+            started.replacing = replacing
+            if (!replacing) started.staged?.beginSegment()
             started.liveInField = session != null && field.supportsComposing && started.staged == null
         }
         take?.foregroundHold = CaptureForegroundService.hold(this) { stopTake() }
         renderTake()
         statusView?.setText(
             when {
+                take?.replacing == true -> R.string.staging_say_replacement
                 take?.staged != null -> R.string.staging_drafting
                 session == null -> R.string.keyboard_recording
                 // Audio is already being saved; live text follows the load.
@@ -416,6 +430,10 @@ class VoiceInputService : InputMethodService() {
         when (event) {
             StreamEvent.Live -> statusView?.setText(R.string.keyboard_streaming)
             is StreamEvent.Partial -> {
+                if (current.replacing) {
+                    statusView?.text = getString(R.string.staging_replacing, event.text)
+                    return
+                }
                 current.staged?.let { staged ->
                     staged.partial(event.text)
                     renderTake()
@@ -493,6 +511,7 @@ class VoiceInputService : InputMethodService() {
         // Request-local state is captured in the take itself; a new editor
         // or take may replace the keyboard's fields while this one settles.
         current.capturing = false
+        current.awaitingFinal = true
         current.stoppedAtNanos = System.nanoTime()
         val session = current.session
         current.session = null
@@ -521,7 +540,7 @@ class VoiceInputService : InputMethodService() {
                 }.getOrElse {
                     session?.close()
                     discardOrFail(recording, current.sensitive, "Unable to finalize the private WAV recording")
-                    endTake(current, R.string.recording_finalize_error)
+                    failCapture(current, R.string.recording_finalize_error)
                     return
                 }
                 if (take === current) {
@@ -544,12 +563,12 @@ class VoiceInputService : InputMethodService() {
                 // any composing region the live stream left in the editor.
                 session?.close()
                 discardOrFail(recording, current.sensitive, result.message)
-                endTake(current, null, result.message)
+                failCapture(current, null, result.message)
             }
             CaptureResult.AlreadyStopped -> {
                 session?.close()
                 if (current.sensitive) runCatching { application.recordings.delete(recording.id) }
-                endTake(current, R.string.recording_already_stopped)
+                failCapture(current, R.string.recording_already_stopped)
             }
         }
     }
@@ -565,11 +584,9 @@ class VoiceInputService : InputMethodService() {
         if (!requestGuard.isCurrent(current.requestGeneration) || take !== current) return
         var text = completed.rawTranscript
         if (completed.status != RecordingStatus.TRANSCRIBED || text == null) {
-            val staged = current.staged
-            if (staged != null && staged.abandonSegment()) {
+            if (keepDraft(current)) {
                 // An earlier capture's text is still in the draft; only this
                 // one failed (its audio stays in Starling for retry).
-                renderTake()
                 statusView?.setText(R.string.staging_segment_failed)
                 return
             }
@@ -582,8 +599,15 @@ class VoiceInputService : InputMethodService() {
         }
         val staged = current.staged
         if (staged != null) {
-            staged.final(completed.id, text)
-            settleDraft(current, staged)
+            current.awaitingFinal = false
+            if (current.replacing) {
+                staged.replaceSelection(text.trim())
+                renderTake()
+                statusView?.setText(R.string.staging_replaced)
+            } else {
+                staged.final(completed.id, text)
+                settleDraft(current, staged)
+            }
             return
         }
         if (!current.sensitive) {
@@ -597,6 +621,7 @@ class VoiceInputService : InputMethodService() {
             if (routedMode.processingDelivery == STAGED || instruction || routed.mode == null ||
                 routed.payload.isBlank()
             ) {
+                current.awaitingFinal = false
                 switchToStaged(current).final(completed.id, text)
                 settleDraft(current, current.staged ?: return)
                 return
@@ -668,10 +693,16 @@ class VoiceInputService : InputMethodService() {
             return
         }
         val text = staged.deliveryText()
-        // Exactly once per draft revision and field binding, whatever taps
-        // or callbacks repeat.
-        if (!staged.deliver(UUID.randomUUID().toString(), "${target.generation}")) return
-        connection.commitText(text, 1)
+        if (!connection.commitText(text, 1)) {
+            // The editor refused the text: the draft stays, and nothing is
+            // pressed — a Send now would submit whatever the field held.
+            renderTake()
+            statusView?.setText(R.string.staging_insert_failed)
+            return
+        }
+        // The delivery record of the inserted revision; the take ends here,
+        // so no tap or callback can insert it twice.
+        staged.deliver(UUID.randomUUID().toString(), "${target.generation}")
         val status = if (staged.mode.delivery == INSERT_ENTER && !pressEditorAction(connection)) {
             R.string.staging_no_action
         } else {
@@ -803,7 +834,8 @@ class VoiceInputService : InputMethodService() {
     /** A tap on a draft word selects it for Delete word. */
     private fun onDraftTouch(view: View, event: MotionEvent): Boolean {
         val staged = take?.staged ?: return false
-        if (event.action != MotionEvent.ACTION_UP || staged.recording) return event.action == MotionEvent.ACTION_DOWN
+        if (take?.capturing == true || staged.recording) return false
+        if (event.action != MotionEvent.ACTION_UP) return event.action == MotionEvent.ACTION_DOWN
         val text = (view as TextView).text.toString()
         val offset = view.getOffsetForPosition(event.x, event.y).coerceIn(0, text.length)
         staged.selectWordAt(text.codePointCount(0, offset))
@@ -865,6 +897,30 @@ class VoiceInputService : InputMethodService() {
         statusView?.text = listOfNotNull(statusRes?.let(::getString), detail).joinToString(" ")
     }
 
+    /**
+     * A capture failed before its text existed. A draft keeps whatever
+     * earlier captures put there; anything else ends the take.
+     */
+    private fun failCapture(current: Take, statusRes: Int?, detail: String? = null) {
+        if (keepDraft(current)) {
+            statusView?.text = listOfNotNull(statusRes?.let(::getString), detail).joinToString(" ")
+            return
+        }
+        endTake(current, statusRes, detail)
+    }
+
+    /** Drops the failed capture from the take's draft; true when the draft still has text to keep. */
+    private fun keepDraft(current: Take): Boolean {
+        val staged = current.staged ?: return false
+        if (take !== current) return false
+        val kept = if (current.replacing) true else staged.abandonSegment()
+        if (kept) {
+            current.awaitingFinal = false
+            renderTake()
+        }
+        return kept
+    }
+
     /** A private take is deleted outright; any other failure stays retryable. */
     private fun discardOrFail(recording: Recording, sensitive: Boolean, message: String) {
         runCatching {
@@ -888,7 +944,7 @@ class VoiceInputService : InputMethodService() {
         decisionRow?.visibility = if (decision != null && !current.capturing) View.VISIBLE else View.GONE
         decisionView?.text = decision
         if (staged != null) {
-            val settled = !current.capturing && !staged.recording
+            val settled = !current.capturing && !current.awaitingFinal && !staged.recording
             transcriptView?.visibility = View.VISIBLE
             transcriptView?.text = renderDraft(staged)
             draftTools?.visibility = if (settled) View.VISIBLE else View.GONE
@@ -1056,5 +1112,11 @@ class VoiceInputService : InputMethodService() {
 
         /** When Stop was tapped, for the stop→raw/processed timings. */
         var stoppedAtNanos = 0L
+
+        /** Stopped, but its transcript has not settled yet. */
+        var awaitingFinal = false
+
+        /** The capture is a spoken correction for the draft's selected word, not a new segment. */
+        var replacing = false
     }
 }

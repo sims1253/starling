@@ -187,4 +187,82 @@ class StagedTakeTest {
         empty.partial("lost")
         assertFalse(empty.abandonSegment())
     }
+
+    @Test
+    fun editsNeverShiftACommandOntoOtherText() {
+        // Review #302-5: a cached phrase offset swallowed the payload after an edit.
+        val take = take()
+        take.dictate(final = "draft mode hello comma world")
+        assertEquals("hello, world", take.displayText())
+        take.selectWordAt(7)
+        take.deleteWord()
+        assertEquals("hello,", take.displayText().trimEnd())
+        take.dictate("more", final = "more words", attempt = "a-2")
+        assertEquals("hello, more words", take.deliveryText().replace("  ", " "))
+    }
+
+    @Test
+    fun undoingTheNewestInstructionKeepsOlderOnesAside() {
+        // Review #302-6.
+        val take = take()
+        take.dictate(final = "first Starling, make it formal")
+        take.dictate(final = "second Starling, make it shorter", attempt = "a-2")
+        assertEquals(StagedTake.Decision.Instruction("make it shorter"), take.decision)
+        assertEquals("first second", take.deliveryText())
+        take.undoDecision()
+        assertEquals(StagedTake.Decision.Instruction("make it formal"), take.decision)
+        assertEquals("first second Starling, make it shorter", take.deliveryText())
+    }
+
+    @Test
+    fun aHandPickedModeOutranksTheSpokenPhrase() {
+        // Review #302-7: the Send opt-out must hold through the final.
+        val take = take("direct")
+        take.beginSegment()
+        take.partial("message mode see you")
+        take.switchMode(catalog.mode("draft"))
+        take.final("a-1", "message mode see you")
+        assertEquals("draft", take.mode.id)
+        assertNull(take.decision)
+        assertEquals("see you", take.deliveryText())
+    }
+
+    @Test
+    fun theNextCaptureShowsItsLiveTailAfterTheProcessedText() {
+        // Review #302-11.
+        val take = take()
+        take.dictate(final = "hello comma world")
+        take.beginSegment()
+        take.partial("again")
+        assertEquals("hello, world again", take.displayText())
+    }
+
+    @Test
+    fun processedLineBreaksAreDeliveredUnchanged() {
+        // Review #302-13.
+        val take = take()
+        take.dictate(final = "hello new line Starling, make it formal")
+        assertEquals("hello\n", take.displayText())
+        assertEquals("hello\n", take.deliveryText())
+    }
+
+    @Test
+    fun aSpokenCorrectionReplacesTheSelectedWord() {
+        val take = take()
+        take.dictate(final = "meet at sex comma ok")
+        take.selectWordAt(8)
+        assertTrue(take.replaceSelection("six"))
+        assertEquals("meet at six, ok", take.deliveryText())
+        assertFalse(take.replaceSelection("nothing selected"))
+    }
+
+    @Test
+    fun liveTextStopsBeforeAPossibleInstruction() {
+        // Review #302-2: an instruction never reaches the field while spoken.
+        val instructions = catalog.instructions
+        assertEquals("Send the report".length, instructions.liveCut("Send the report Starling,", "en"))
+        assertEquals("Send the report".length, instructions.liveCut("Send the report sterling make it", "en"))
+        assertNull(instructions.liveCut("Send the report", "en"))
+        assertNull(instructions.liveCut("the word literal starling stays", "en"))
+    }
 }
