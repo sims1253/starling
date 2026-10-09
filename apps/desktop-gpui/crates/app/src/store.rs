@@ -31,9 +31,7 @@ pub(crate) struct ProcessingDoc {
     pub raw_attempt_id: String,
     pub raw_text: String,
     pub proposals: Vec<ProposalRow>,
-    /// The accepted proposal the head still derives from: set by the
-    /// head that accepted it, kept through later edits, cleared by a
-    /// raw head.
+    /// The accepted proposal the head derives from, as the head records it.
     pub accepted_request: Option<String>,
 }
 
@@ -117,6 +115,7 @@ struct ProposalProvenance {
 #[derive(serde::Serialize, serde::Deserialize)]
 struct HeadSources {
     attempt_id: String,
+    /// The accepted proposal this head derives from.
     request_id: Option<String>,
 }
 
@@ -170,24 +169,12 @@ impl ProcessingDoc {
             .find(|row| row.rev_id == head_rev_id(id, document.head_revision))?;
         let raw = document.revisions.iter().find(|row| row.rev_id == head_rev_id(id, 1))?;
         let sources: HeadSources = serde_json::from_str(raw.sources_json.as_deref()?).ok()?;
-        let head_prefix = format!("{id}#h");
-        let mut heads: Vec<(u64, &RevisionRow)> = document
-            .revisions
-            .iter()
-            .filter_map(|row| Some((row.rev_id.strip_prefix(&head_prefix)?.parse().ok()?, row)))
-            .filter(|(revision, _)| *revision <= document.head_revision)
-            .collect();
-        heads.sort_by_key(|(revision, _)| *revision);
-        let accepted_request = heads.into_iter().fold(None, |active, (_, row)| {
-            if row.status == "raw" {
-                return None;
-            }
-            row.sources_json
-                .as_deref()
-                .and_then(|json| serde_json::from_str::<HeadSources>(json).ok())
-                .and_then(|sources| sources.request_id)
-                .or(active)
-        });
+        let accepted_request = head
+            .sources_json
+            .as_deref()
+            .and_then(|json| serde_json::from_str::<HeadSources>(json).ok())
+            .and_then(|sources| sources.request_id)
+            .filter(|_| head.status != "raw");
         let proposals = document
             .revisions
             .iter()
@@ -561,6 +548,7 @@ impl Store {
         is_raw: bool,
         attempt_id: &str,
         accepted: Option<&ProposalRow>,
+        derived_from: Option<&str>,
     ) -> Result<(), storage::StorageError> {
         let store = lock_v2(&self.0);
         if store.get_capture(id).map_err(v2_err)?.is_none() {
@@ -575,13 +563,12 @@ impl Store {
         if current.is_none_or(|doc| doc.raw_attempt_id != attempt_id) {
             return Err(storage::StorageError::NotFound(id.to_string()));
         }
-        let request_id = accepted.map(|proposal| proposal.request_id.as_str());
         // The head and the proposal it accepted land together or not at
         // all, so a crash cannot leave an accepted head next to a live
         // proposal.
         let also: Vec<RevisionRow> = accepted.map(|proposal| proposal.to_row(id)).into_iter().collect();
         store
-            .commit_document_head_with(PROCESSING_DOC, revision, 0, &head_row(id, revision, text, is_raw, attempt_id, request_id), &also)
+            .commit_document_head_with(PROCESSING_DOC, revision, 0, &head_row(id, revision, text, is_raw, attempt_id, derived_from), &also)
             .map_err(v2_err)
     }
 
@@ -610,6 +597,22 @@ impl Store {
     ) -> Result<bool, storage::StorageError> {
         let store = lock_v2(&self.0);
         store.upsert_correction_record(record).map_err(v2_err)
+    }
+
+    /// Revises the decision of an existing correction record; `Ok(false)`
+    /// when there is none.
+    pub(crate) fn revise_correction(
+        &self,
+        id: &str,
+        request_id: &str,
+        decision: store_v2::CorrectionDecision,
+        decision_utc: &str,
+        final_text: &str,
+    ) -> Result<bool, storage::StorageError> {
+        let store = lock_v2(&self.0);
+        store
+            .revise_correction_record(id, request_id, decision, decision_utc, final_text)
+            .map_err(v2_err)
     }
 
     #[cfg(test)]
@@ -1225,7 +1228,7 @@ mod tests {
         let (attempt, raw) = store.latest_raw(&id).expect("raw").expect("final");
         store.start_processing_doc(&id, &attempt, &raw).expect("start");
         store
-            .commit_processing_head(&id, 2, "First take.", false, &attempt, None)
+            .commit_processing_head(&id, 2, "First take.", false, &attempt, None, None)
             .expect("accept");
         assert!(store.processing_doc(&id).expect("load").is_some());
         store.mark_attempt(&id, "starling:parakeet").expect("retry");
@@ -1252,7 +1255,7 @@ mod tests {
 
         let accepted = ProposalRow { status: RowStatus::Accepted, ..proposal("p1", 1, "So, hello there.") };
         store
-            .commit_processing_head(&id, 2, "So, hello there.", false, &attempt, Some(&accepted))
+            .commit_processing_head(&id, 2, "So, hello there.", false, &attempt, Some(&accepted), Some("p1"))
             .expect("accept");
         // A job's late write of the same proposal never demotes it.
         store.save_proposal(&id, &proposal("p1", 1, "So, hello there.")).expect("late write");

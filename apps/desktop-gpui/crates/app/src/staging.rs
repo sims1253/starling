@@ -538,6 +538,7 @@ impl StarlingApp {
                             false,
                             &attempt_id,
                             None,
+                            None,
                         )?;
                         doc.head_revision = revision;
                         doc.head_text = text;
@@ -1698,6 +1699,12 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].decision, CorrectionDecision::Edited);
         assert_eq!(records[0].final_text.as_deref(), Some("Clean.!"));
+        let doc = store.processing_doc(&id).unwrap().unwrap();
+        assert_eq!(
+            doc.accepted_request.as_deref(),
+            Some("r1"),
+            "the edited head records it"
+        );
 
         // Back on the proposal's exact text: accepted again.
         let edit = TextEdit {
@@ -1757,6 +1764,46 @@ mod tests {
     }
 
     #[gpui::test]
+    fn a_reverted_acceptance_stays_unattributed_after_reload(cx: &mut gpui::TestAppContext) {
+        let root = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::at_test_root(root.path());
+        let app = cx.new(|cx| StarlingApp::for_test(Some(store.clone()), cx));
+        let (id, token) = app.update(cx, |app, cx| {
+            let id = proposed_take(app, &store);
+            let token = stage(app, &id, cx);
+            app.accept_processed(&id, false, cx);
+            (id, token)
+        });
+        cx.run_until_parked();
+        // Back to the exact raw text, then typing on before the raw head
+        // is ever saved: only the manual head lands.
+        app.update(cx, |app, cx| {
+            let edits = [
+                TextEdit {
+                    start: 0,
+                    end: 6,
+                    text: "raw".into(),
+                },
+                TextEdit {
+                    start: 3,
+                    end: 3,
+                    text: " more".into(),
+                },
+            ];
+            for edit in &edits {
+                app.apply_staging_edit(token, edit, cx);
+            }
+            app.persist_staging_now(token, cx);
+        });
+        cx.run_until_parked();
+        let doc = store.processing_doc(&id).unwrap().unwrap();
+        assert_eq!(doc.head_text, "raw more");
+        assert_eq!(doc.accepted_request, None);
+        let records = store.correction_records(&id).expect("records");
+        assert_eq!(records[0].decision, CorrectionDecision::Reverted);
+    }
+
+    #[gpui::test]
     fn a_decision_keeps_the_transcript_it_was_made_on(cx: &mut gpui::TestAppContext) {
         let root = tempfile::tempdir().unwrap();
         let store = crate::store::Store::at_test_root(root.path());
@@ -1765,7 +1812,8 @@ mod tests {
             let (id, attempt) = saved_take(&store);
             propose(app, &store, &id, &attempt);
             app.accept_processed(&id, false, cx);
-            // Re-transcribed before the queued write runs.
+            app.revert_to_raw(&id, cx);
+            // Re-transcribed before the queued writes run.
             let newer = transcribe(&store, &id, "newer raw");
             store
                 .start_processing_doc(&id, &newer, "newer raw")
@@ -1775,6 +1823,7 @@ mod tests {
         cx.run_until_parked();
         let records = store.correction_records(&id).expect("records");
         assert_eq!(records.len(), 1);
+        assert_eq!(records[0].decision, CorrectionDecision::Reverted);
         assert_eq!(records[0].raw_attempt_id, attempt);
         assert_eq!(records[0].raw_text, "raw");
     }

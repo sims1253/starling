@@ -561,6 +561,11 @@ pub struct CorrectionRecord {
     pub extra_json: Option<String>,
 }
 
+/// A correction record's id: one record per take per processing request.
+fn correction_id(capture_id: &str, request_id: &str) -> String {
+    format!("{capture_id}#c:{request_id}")
+}
+
 /// Metadata known when a take starts (the columns not derived from the
 /// journal itself).
 #[derive(Clone, Debug, Default)]
@@ -1453,7 +1458,7 @@ impl StoreV2 {
                 timings_json = excluded.timings_json,
                 extra_json = excluded.extra_json",
             params![
-                format!("{}#c:{}", record.capture_id, record.request_id),
+                correction_id(&record.capture_id, &record.request_id),
                 record.capture_id,
                 record.request_id,
                 record.raw_attempt_id,
@@ -1478,6 +1483,29 @@ impl StoreV2 {
             ],
         )?;
         Ok(true)
+    }
+
+    /// Revises the decision columns of an existing correction record;
+    /// `Ok(false)` when the take has no record for `request_id`.
+    pub fn revise_correction_record(
+        &self,
+        capture_id: &str,
+        request_id: &str,
+        decision: CorrectionDecision,
+        decision_utc: &str,
+        final_text: &str,
+    ) -> Result<bool, StoreV2Error> {
+        let changed = self.conn.execute(
+            "UPDATE correction_records SET decision = ?2, decision_utc = ?3, final_text = ?4
+             WHERE id = ?1",
+            params![
+                correction_id(capture_id, request_id),
+                decision.as_str(),
+                decision_utc,
+                final_text,
+            ],
+        )?;
+        Ok(changed > 0)
     }
 
     /// One capture's correction records, in insertion order. A damaged
@@ -7215,6 +7243,23 @@ mod tests {
         assert_eq!(stored[0].processed_text, "So, hello there.");
         assert_eq!(stored[0].mode_id.as_deref(), Some("clean-local"));
         assert_eq!(stored[0].provider_model.as_deref(), Some("s1-mini"));
+
+        // A revision without the proposal in hand moves only the decision.
+        assert!(
+            store
+                .revise_correction_record(&id, "req-1", CorrectionDecision::Edited, "t", "Edited.")
+                .expect("revise")
+        );
+        let stored = store.correction_records_for(&id).expect("read");
+        assert_eq!(stored[0].decision, CorrectionDecision::Edited);
+        assert_eq!(stored[0].final_text.as_deref(), Some("Edited."));
+        assert_eq!(stored[0].processed_text, "So, hello there.");
+        assert!(
+            !store
+                .revise_correction_record(&id, "req-none", CorrectionDecision::Edited, "t", "x")
+                .expect("revise"),
+            "nothing to revise"
+        );
 
         // A second proposal of the same take is its own row.
         assert!(

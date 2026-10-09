@@ -1217,10 +1217,9 @@ impl StarlingApp {
         self.stop_instants.remove(id);
     }
 
-    /// Queues `decision` on take `id` for the correction records. `row`
-    /// is the proposal when the seam holds it; otherwise it is looked up
-    /// in the stored processing document, and nothing is recorded when it
-    /// is not there (deleted or re-transcribed take).
+    /// Queues `decision` on take `id` for the correction records: a new
+    /// record when the seam holds the proposal `row`, otherwise a revision
+    /// of the request's existing record (none there: nothing recorded).
     pub(crate) fn record_correction_decision(
         &mut self,
         cx: &mut Context<Self>,
@@ -1241,25 +1240,19 @@ impl StarlingApp {
             }
             let written = cx
                 .background_spawn(async move {
-                    let row = match row {
-                        Some(row) => row,
-                        None => {
-                            let Ok(Some(doc)) = store.processing_doc(&id) else {
-                                return Ok(());
-                            };
-                            let Some(row) = doc
-                                .proposals
-                                .into_iter()
-                                .find(|row| row.request_id == decision.request_id)
-                            else {
-                                return Ok(());
-                            };
-                            row
+                    match row {
+                        Some(row) => {
+                            store.record_correction(&correction_record_for(&id, &row, decision))
                         }
-                    };
-                    store
-                        .record_correction(&correction_record_for(&id, &row, decision))
-                        .map(|_| ())
+                        None => store.revise_correction(
+                            &id,
+                            &decision.request_id,
+                            decision.kind,
+                            &decision.decided_utc,
+                            &decision.final_text,
+                        ),
+                    }
+                    .map(|_| ())
                 })
                 .await;
             if let Err(err) = written {
@@ -1465,6 +1458,11 @@ impl StarlingApp {
         cx: &mut Context<Self>,
     ) {
         let accepted = self.staging_head_started(&id, revision, accepted);
+        let derived_from = self
+            .processing
+            .get(&id)
+            .and_then(|take| take.accepted_request.clone())
+            .filter(|_| !is_raw);
         cx.spawn(async move |this, cx| {
             let write_id = id.clone();
             let write_attempt = attempt_id.clone();
@@ -1477,6 +1475,7 @@ impl StarlingApp {
                         is_raw,
                         &write_attempt,
                         accepted.as_ref(),
+                        derived_from.as_deref(),
                     )
                 })
                 .await;
