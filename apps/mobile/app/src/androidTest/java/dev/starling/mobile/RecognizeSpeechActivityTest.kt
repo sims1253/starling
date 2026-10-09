@@ -111,7 +111,17 @@ class RecognizeSpeechActivityTest {
     fun systemBackCancelsWithoutAResult() {
         ActivityScenario.launchActivityForResult<RecognizeSpeechActivity>(recognizeIntent()).use { scenario ->
             assumeTrue("no microphone on this emulator", listening(scenario))
-            InstrumentationRegistry.getInstrumentation().sendKeyDownUpSync(KeyEvent.KEYCODE_BACK)
+            // The key goes to the focused window; the dialog gets focus a
+            // moment after it is resumed.
+            val instrumentation = InstrumentationRegistry.getInstrumentation()
+            val deadline = System.currentTimeMillis() + 10_000
+            var focused = false
+            while (!focused && System.currentTimeMillis() < deadline) {
+                scenario.onActivity { focused = it.hasWindowFocus() }
+                if (!focused) Thread.sleep(100)
+            }
+            assertTrue("the popup never got window focus", focused)
+            instrumentation.sendKeyDownUpSync(KeyEvent.KEYCODE_BACK)
             val result = scenario.result
             assertEquals(Activity.RESULT_CANCELED, result.resultCode)
             assertTrue(result.resultData?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS).isNullOrEmpty())

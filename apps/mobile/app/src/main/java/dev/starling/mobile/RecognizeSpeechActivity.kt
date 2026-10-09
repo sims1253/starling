@@ -4,12 +4,14 @@ import android.Manifest
 import android.app.Activity
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import android.speech.RecognizerIntent
 import android.text.method.ScrollingMovementMethod
 import android.view.View
 import android.widget.Button
 import android.widget.TextView
+import android.window.OnBackInvokedDispatcher
 import dev.starling.mobile.audio.AudioCapture
 import dev.starling.mobile.audio.AudioChunkListener
 import dev.starling.mobile.audio.CaptureResult
@@ -88,6 +90,11 @@ class RecognizeSpeechActivity : Activity() {
 
         doneButton.setOnClickListener { if (activeRecording != null) stopAndTranscribe() else finish() }
         cancelButton.setOnClickListener { cancel() }
+        if (Build.VERSION.SDK_INT >= 33) {
+            // System Back on Android 13+ (and the predictive-back gesture)
+            // arrives here; onBackPressed below covers older releases.
+            onBackInvokedDispatcher.registerOnBackInvokedCallback(OnBackInvokedDispatcher.PRIORITY_DEFAULT) { cancel() }
+        }
         setResult(RESULT_CANCELED)
         // The popup records at once; loading now also covers the time a
         // permission prompt is on screen.
