@@ -319,19 +319,22 @@ class StagedTakeTest {
     }
 
     @Test
-    fun aLiteralCorrectionKeepsItsWords() {
-        // Review #302 round 3, item 2.
+    fun aLiteralCorrectionKeepsTheDelimiterAsWords() {
         val take = take()
         take.dictate(final = "meet at sex")
-        take.toggleView()
         take.selectWordAt(8)
         assertTrue(take.beginCorrection())
-        assertTrue(take.finishCorrection("literal six comma Starling, ok"))
-        assertEquals("meet at six comma Starling, ok", take.displayText())
+        assertTrue(take.finishCorrection("literal six Starling, ok"))
+        assertEquals("meet at six Starling, ok", take.deliveryText())
+        // Command words in a correction use the grammar's own escape.
+        take.selectWordAt(8)
+        assertTrue(take.beginCorrection())
+        assertTrue(take.finishCorrection("six literal comma"))
+        // The raw view (where the correction was made) shows what was said;
+        // the processed proposal applies the escape.
+        assertEquals("meet at six literal comma Starling, ok", take.displayText())
+        take.toggleView()
         assertEquals("meet at six comma Starling, ok", take.deliveryText())
-        // Later processing leaves the corrected words alone.
-        take.dictate(final = "period", attempt = "a-2")
-        assertEquals("meet at six comma Starling, ok.", take.displayText())
     }
 
     @Test

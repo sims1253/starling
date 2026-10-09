@@ -58,6 +58,9 @@ class StagedTake(
      */
     private var correction: Pair<IntRange, Int>? = null
 
+    /** Whether the processed view was on screen when the pending correction began. */
+    private var correctionInProcessedView = false
+
     val plan: ModeCatalog.Plan get() = catalog.plan(mode, powerSaver)
 
     private var segment = -1
@@ -254,6 +257,7 @@ class StagedTake(
     fun deleteWord() {
         if (busy) return
         val target = selection ?: lastWord(displayText()) ?: return
+        val processedView = showingProcessed
         takeProcessedIntoDraft()
         val cps = draft.text().codePoints().toArray()
         // One adjacent space goes with the word, so no double space is left.
@@ -262,7 +266,7 @@ class StagedTake(
         if (end < cps.size && cps[end] == ' '.code) end += 1
         else if (start > 0 && cps[start - 1] == ' '.code) start -= 1
         draft.delete(start, end)
-        afterEdit()
+        afterEdit(processedView)
     }
 
     /**
@@ -273,6 +277,7 @@ class StagedTake(
     fun beginCorrection(): Boolean {
         if (busy) return false
         val target = selection ?: return false
+        correctionInProcessedView = showingProcessed
         takeProcessedIntoDraft()
         correction = target to draft.revision
         return true
@@ -281,35 +286,29 @@ class StagedTake(
     /**
      * Replaces the frozen word with a spoken correction: its payload only —
      * a leading mode phrase or trailing instruction in it is dropped, never
-     * inserted. False (and nothing changed) when there was no correction
-     * pending, the draft moved on meanwhile, or nothing was said.
+     * inserted, unless the correction starts with "literal", which keeps a
+     * "Starling, …" as words. The inserted words are draft text like any
+     * other: spoken commands in them follow the grammar's own escape
+     * ("six literal comma"). False (and nothing changed) when there was no
+     * correction pending, the draft moved on meanwhile, or nothing was said.
      */
     fun finishCorrection(text: String): Boolean {
         val (target, revision) = correction ?: return false
         correction = null
         val routed = catalog.route(text, mode, secure = false)
         val literal = (routed.mode?.let(catalog::mode) ?: mode).behavior == VERBATIM
-        // "literal …" keeps every word, a delimiter included; otherwise a
-        // trailing instruction is dropped like any other command text.
         val payload = if (literal) {
             routed.payload.trim()
         } else {
             catalog.instructions.split(routed.payload, mode.language).payload.trim()
         }
         if (draft.revision != revision || payload.isEmpty()) {
-            afterEdit()
+            afterEdit(correctionInProcessedView)
             return false
         }
         draft.delete(target.first, target.last + 1)
         draft.insert(target.first, payload)
-        if (literal) {
-            // The draft becomes a processed revision right away with the
-            // correction passed through untouched, so no later rules pass
-            // turns its words into commands.
-            process(passThroughUser = true, keepUnchanged = true)
-            proposal?.let { if (draft.accept(it.requestId) == Outcome.APPLIED) proposal = null }
-        }
-        afterEdit()
+        afterEdit(correctionInProcessedView)
         return true
     }
 
@@ -336,11 +335,15 @@ class StagedTake(
     fun deliver(deliveryId: String, targetDigest: String): Boolean =
         draft.deliver(deliveryId, targetDigest) == Outcome.DELIVERED
 
-    /** The user edited the text on screen: keep showing it, processed again underneath. */
-    private fun afterEdit() {
+    /**
+     * The user edited the text on screen: processing runs again, and the
+     * view stays the one they edited in — processed text keeps showing
+     * processed, the raw view stays raw.
+     */
+    private fun afterEdit(processedView: Boolean) {
         selection = null
         process()
-        showProcessed = false
+        showProcessed = processedView
     }
 
     private fun takeProcessedIntoDraft() {
@@ -369,7 +372,7 @@ class StagedTake(
      * revision. Rules take microseconds, so the result is judged at once;
      * it still goes through the contract as a request and a proposal.
      */
-    private fun process(passThroughUser: Boolean = false, keepUnchanged: Boolean = false) {
+    private fun process() {
         proposal = null
         selection = null
         showProcessed = true
@@ -391,7 +394,7 @@ class StagedTake(
             run.clear()
         }
         draft.regions().filter { it.kind != RegionKind.COMMAND }.forEach { region ->
-            if (region.kind == RegionKind.PROCESSED || (passThroughUser && region.kind == RegionKind.USER)) {
+            if (region.kind == RegionKind.PROCESSED) {
                 flush()
                 output += region.text
             } else {
@@ -401,7 +404,7 @@ class StagedTake(
         flush()
         val elapsedMs = (nanoTime() - started) / 1_000_000
         if (draft.result(requestId, true, output) != Outcome.CURRENT) return
-        if (output == input && !keepUnchanged) {
+        if (output == input) {
             draft.reject(requestId)
             return
         }
