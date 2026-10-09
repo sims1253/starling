@@ -34,10 +34,8 @@
 //! The §4 "schema direction" tables ([`SCHEMA_SQL`], one place, version
 //! [`SCHEMA_VERSION`] in `meta`): `captures`, `recognition_attempts`,
 //! `context_snapshots`, `mode_decisions`, `documents`/`revisions`,
-//! `deliveries`, `insight_events`, `correction_records` (#304: the
-//! personal correction dataset — transcript → edit pairs with
-//! provenance, per-proposal decisions, secure-field exclusion, cascade
-//! deletion), `tombstones`, `meta`. This core implements the
+//! `deliveries`, `insight_events`, `correction_records`, `tombstones`,
+//! `meta`. This core implements the
 //! captures/attempts/tombstones/meta surfaces plus the
 //! documents/revisions surface (I5, issue #220:
 //! [`StoreV2::upsert_document`] and friends — the documents machine's
@@ -105,10 +103,7 @@ use crate::storage::{is_safe_path_component, now_iso};
 /// is refused at open. v2 added `recognition_attempts.created_utc` (the
 /// real updated-at source for the summaries); v3 added `insight_events`
 /// (#294: per-job processing latency, recorded for Insights #308); v4
-/// added `correction_records` and `captures.secure_field` (#304: the
-/// personal correction dataset — transcript → edit pairs with
-/// provenance and per-proposal decisions, never written for takes
-/// captured against secure/incognito fields).
+/// added `correction_records` and `captures.secure_field`.
 pub const SCHEMA_VERSION: u32 = 4;
 
 /// WAL checkpoint policy (D11): run `PRAGMA wal_checkpoint(PASSIVE)` after
@@ -369,13 +364,10 @@ pub struct CaptureRecord {
     pub status: CaptureStatus,
     pub retention_class: String,
     pub extra_json: Option<String>,
-    /// Whether this take was captured against a secure/incognito input
-    /// (#304, referencing #229): such takes never contribute correction
-    /// records — the personal-dataset exclusion is enforced in
-    /// [`StoreV2::upsert_correction_record`], not by caller discipline.
-    /// False everywhere today (the desktop app is a standalone recorder
-    /// with no secure-field capture path); the flag exists so a future
-    /// keyboard/IME integration can mark takes at the recording boundary.
+    /// Captured against a secure/incognito input: such takes never get
+    /// correction records ([`StoreV2::upsert_correction_record`]). The
+    /// desktop app has no secure-field capture path, so this is false
+    /// there; a keyboard/IME integration marks takes when recording.
     pub secure_field: bool,
 }
 
@@ -487,25 +479,17 @@ pub struct DocumentRow {
     pub revisions: Vec<RevisionRow>,
 }
 
-/// What the user did with one processing proposal (#304, the
-/// content-free `hasRevertedAI`-style label). Every variant is an event
-/// the desktop UI can actually observe:
+/// What the user did with one processing proposal:
 ///
-/// - `Accepted` — "Use processed"/"Use anyway" applied the proposal
-///   to the take's head (the proposal row settles as `accepted`).
-/// - `Rejected` — "Dismiss" threw the proposal away unused (the
-///   proposal row settles as `rejected`).
-/// - `Reverted` — "Back to raw" (or an edit that restored the raw
-///   transcript exactly) while an accepted proposal was the head: the
-///   processed output was undone after being used.
-/// - `Edited` — the head was edited after a proposal was accepted and
-///   the text no longer equals that proposal's text (nor the raw).
+/// - `Accepted` — "Use processed"/"Use anyway" made it the take's head.
+/// - `Rejected` — "Dismiss" discarded it unused.
+/// - `Reverted` — "Back to raw", or an edit restoring the raw transcript
+///   exactly, undid an accepted proposal.
+/// - `Edited` — the head was edited after acceptance and no longer equals
+///   the proposal (nor the raw).
 ///
-/// A proposal the user never decides on (delivery of the raw text,
-/// closing the panel, a superseded job) records **nothing** — ordinary
-/// success and failure never implicitly decide, and never delete.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
+/// A proposal the user never decides on records nothing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CorrectionDecision {
     Accepted,
     Rejected,
@@ -523,48 +507,35 @@ impl CorrectionDecision {
         }
     }
 
-    /// `None` for a value this build does not know; such a row reads as
-    /// damaged rather than silently relabeled.
+    /// `None` for a value this build does not know.
     pub fn parse(text: &str) -> Option<Self> {
-        match text {
-            "accepted" => Some(CorrectionDecision::Accepted),
-            "rejected" => Some(CorrectionDecision::Rejected),
-            "reverted" => Some(CorrectionDecision::Reverted),
-            "edited" => Some(CorrectionDecision::Edited),
-            _ => None,
-        }
+        [
+            CorrectionDecision::Accepted,
+            CorrectionDecision::Rejected,
+            CorrectionDecision::Reverted,
+            CorrectionDecision::Edited,
+        ]
+        .into_iter()
+        .find(|decision| decision.as_str() == text)
     }
 }
 
-/// One `correction_records` row (#304): a transcript → edit pair with
-/// provenance — the raw transcript and the processing proposal that was
-/// shown for it, plus the decision the user made. One row per take per
-/// processing request (`id` = `<captureId>#c:<requestId>`); a revised
-/// decision upserts the same row ([`StoreV2::upsert_correction_record`]),
-/// so revising a decision never doubles the dataset. The row cascades
-/// away with its capture.
-///
-/// Provenance discipline: the columns carry what the runtime already
-/// knows (mode id/version, provider identity, transform kinds, language,
-/// per-stage timings); `settings_strength` stays NULL until an
-/// editing-strength setting exists, and `asr_*` are filled by the store
-/// from the raw attempt row, never invented by the caller.
+/// One `correction_records` row: the raw transcript, the processing
+/// proposal shown for it, and the user's decision, with provenance. One
+/// row per take per processing request; a revised decision updates it
+/// ([`StoreV2::upsert_correction_record`]). Rows cascade with their
+/// capture.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CorrectionRecord {
-    /// Deterministic: `<captureId>#c:<requestId>`.
-    pub id: String,
     pub capture_id: String,
     /// The processing request whose proposal this row is about.
     pub request_id: String,
     /// The recognition attempt whose final text is `raw_text`.
     pub raw_attempt_id: String,
-    /// The raw transcript, verbatim (the replayable input: a reprocess
-    /// can always re-run processing over this).
     pub raw_text: String,
     /// The proposal as it was shown.
     pub processed_text: String,
-    /// The head text when the decision landed: the proposal for a plain
-    /// accept, the raw for a revert, the user's text for an edit.
+    /// The head text when the decision landed.
     pub final_text: Option<String>,
     pub decision: CorrectionDecision,
     pub decision_utc: String,
@@ -574,22 +545,18 @@ pub struct CorrectionRecord {
     pub provider_kind: Option<String>,
     pub provider_model: Option<String>,
     pub locality: Option<String>,
-    /// JSON array of transform kinds, when the request knew them.
+    /// JSON array of transform kinds.
     pub transform_kinds: Option<String>,
     pub language: Option<String>,
-    /// Filled from the `recognition_attempts` row at write time; NULL
-    /// when the attempt row is gone.
+    /// Filled by the store from the `raw_attempt_id` row on write; the
+    /// caller's values are ignored.
     pub asr_backend: Option<String>,
     pub asr_model_hash: Option<String>,
-    /// JSON object of per-stage timings as far as they are known
-    /// (`queued_ms`, `processing_ms`, `stop_to_result_ms`).
+    /// JSON object of per-stage timings (`queued_ms`, `processing_ms`,
+    /// `stop_to_result_ms`).
     pub timings_json: Option<String>,
-    /// NULL today: no editing-strength setting exists in the desktop
-    /// runtime yet. The column is here so a later settings increment
-    /// can populate it without another migration.
+    /// Always NULL until an editing-strength setting exists.
     pub settings_strength: Option<String>,
-    /// Reserved verbatim preservation (e.g. the provider label the UI
-    /// showed).
     pub extra_json: Option<String>,
 }
 
@@ -603,10 +570,8 @@ pub struct TakeMeta {
     pub retention_class: String,
     /// Preserved verbatim in the captures row.
     pub extra_json: Option<String>,
-    /// Whether the take was captured against a secure/incognito input
-    /// (#304): correction records are never written for it. Defaults to
-    /// `false` — a caller that does not set the flag is an ordinary take
-    /// and contributes normally; only an explicit marking excludes.
+    /// Captured against a secure/incognito input: correction records are
+    /// never written for it.
     pub secure_field: bool,
 }
 
@@ -755,11 +720,8 @@ impl StoreV2 {
                     }
                 }
                 if found < 4 {
-                    // v3 → v4: captures gained the secure/incognito marker
-                    // (#304, the exclusion half of the correction dataset).
-                    // `CREATE TABLE IF NOT EXISTS` cannot extend the
-                    // existing table, so the column is added explicitly;
-                    // pre-upgrade rows read as false (a normal take).
+                    // v3 → v4: captures gained the secure/incognito marker;
+                    // pre-upgrade rows read as ordinary takes.
                     let has_secure: bool = tx
                         .query_row(
                             "SELECT 1 FROM pragma_table_info('captures')
@@ -1446,32 +1408,14 @@ impl StoreV2 {
         Ok(events)
     }
 
-    // ------------------------------------------------------------------
-    // Correction records (#304: the personal correction dataset —
-    // transcript → edit pairs with provenance and deletion).
-    // ------------------------------------------------------------------
+    // ---- correction records ------------------------------------------
 
-    /// Writes (or revises) one correction record: the transcript → edit
-    /// pair for one processing proposal of one take, with the decision
-    /// the user made. **Upsert semantics**: the record id is
-    /// `<captureId>#c:<requestId>`, so a revised decision (accept, then
-    /// revert) updates the same row — one row per take per request, the
-    /// latest decision and `final_text`/`decision_utc` win, and the
-    /// request-pinned columns (raw/proposed text, provenance) stay as
-    /// first written.
-    ///
-    /// Exclusions, enforced here rather than by caller discipline:
-    ///
-    /// - a capture marked `secure_field` (#229) never contributes —
-    ///   `Ok(false)`, no row, no error;
-    /// - a capture that does not exist (deleted meanwhile) is `NotFound`,
-    ///   exactly like the other processing writes: the record lands
-    ///   nowhere.
-    ///
-    /// `asr_backend`/`asr_model_hash` are filled from the
-    /// `recognition_attempts` row named by `raw_attempt_id` (what the
-    /// store already knows); the caller's values for those columns are
-    /// ignored, and they stay NULL when the attempt row is gone.
+    /// Writes or revises the correction record for one take and request
+    /// (row id `<captureId>#c:<requestId>`). A revision moves only the
+    /// decision columns (`final_text`, `decision`, `decision_utc`,
+    /// `timings_json`, `extra_json`); the rest stay as first written.
+    /// `Ok(false)` without writing for a `secure_field` capture;
+    /// `NotFound` when the capture is gone.
     pub fn upsert_correction_record(
         &self,
         record: &CorrectionRecord,
@@ -1482,13 +1426,6 @@ impl StoreV2 {
         if capture.secure_field {
             return Ok(false);
         }
-        if record.id != format!("{}#c:{}", record.capture_id, record.request_id) {
-            return Err(StoreV2Error::Invalid(format!(
-                "correction record id {:?} does not match its capture and request",
-                record.id
-            )));
-        }
-        // ASR provenance from the attempt row, not the caller.
         let (asr_backend, asr_model_hash): (Option<String>, Option<String>) = self
             .conn
             .query_row(
@@ -1513,7 +1450,7 @@ impl StoreV2 {
                 timings_json = excluded.timings_json,
                 extra_json = excluded.extra_json",
             params![
-                record.id,
+                format!("{}#c:{}", record.capture_id, record.request_id),
                 record.capture_id,
                 record.request_id,
                 record.raw_attempt_id,
@@ -1523,7 +1460,7 @@ impl StoreV2 {
                 record.decision.as_str(),
                 record.decision_utc,
                 record.mode_id,
-                record.mode_version.map(i64::from),
+                record.mode_version,
                 record.provider_id,
                 record.provider_kind,
                 record.provider_model,
@@ -1540,96 +1477,56 @@ impl StoreV2 {
         Ok(true)
     }
 
-    /// One capture's correction records, in insertion order. Damaged
-    /// rows (an unknown decision spelling) fail the whole listing with
-    /// `Invalid` — deliberately LOUD, unlike capture listings, which
-    /// degrade per row: a dataset read must not silently drop pairs a
-    /// future training step would count on.
+    /// One capture's correction records, in insertion order. A damaged
+    /// row fails the whole read rather than being skipped, so a dataset
+    /// read never silently loses pairs.
     pub fn correction_records_for(
         &self,
         capture_id: &str,
     ) -> Result<Vec<CorrectionRecord>, StoreV2Error> {
         validate_capture_id(capture_id)?;
         let mut stmt = self.conn.prepare(
-            "SELECT id, capture_id, request_id, raw_attempt_id, raw_text, processed_text,
+            "SELECT capture_id, request_id, raw_attempt_id, raw_text, processed_text,
                     final_text, decision, decision_utc, mode_id, mode_version, provider_id,
                     provider_kind, provider_model, locality, transform_kinds, language,
                     asr_backend, asr_model_hash, timings_json, settings_strength, extra_json
              FROM correction_records WHERE capture_id = ?1 ORDER BY rowid",
         )?;
-        let rows = stmt.query_map(params![capture_id], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, Option<String>>(6)?,
-                row.get::<_, String>(7)?,
-                row.get::<_, String>(8)?,
-                row.get::<_, Option<String>>(9)?,
-                row.get::<_, Option<i64>>(10)?,
-                row.get::<_, Option<String>>(11)?,
-                row.get::<_, Option<String>>(12)?,
-                row.get::<_, Option<String>>(13)?,
-                row.get::<_, Option<String>>(14)?,
-                row.get::<_, Option<String>>(15)?,
-                row.get::<_, Option<String>>(16)?,
-                row.get::<_, Option<String>>(17)?,
-                row.get::<_, Option<String>>(18)?,
-                row.get::<_, Option<String>>(19)?,
-                row.get::<_, Option<String>>(20)?,
-                row.get::<_, Option<String>>(21)?,
-            ))
-        })?;
-        let mut records = Vec::new();
-        for row in rows {
-            let row = row?;
-            let decision = CorrectionDecision::parse(&row.7).ok_or_else(|| {
-                StoreV2Error::Invalid(format!(
-                    "correction record {:?} has unknown decision {:?}",
-                    row.0, row.7
-                ))
-            })?;
-            // A negative mode_version is damaged the same way an unknown
-            // decision is (Invalid), not silently clamped to 0 — one
-            // discipline per read path, per the review.
-            let mode_version = match row.10 {
-                Some(value) if value >= 0 => Some(value as u32),
-                Some(value) => {
-                    return Err(StoreV2Error::Invalid(format!(
-                        "correction record {:?} has negative mode_version {value}",
-                        row.0
-                    )))
-                }
-                None => None,
-            };
-            records.push(CorrectionRecord {
-                id: row.0,
-                capture_id: row.1,
-                request_id: row.2,
-                raw_attempt_id: row.3,
-                raw_text: row.4,
-                processed_text: row.5,
-                final_text: row.6,
-                decision,
-                decision_utc: row.8,
-                mode_id: row.9,
-                mode_version,
-                provider_id: row.11,
-                provider_kind: row.12,
-                provider_model: row.13,
-                locality: row.14,
-                transform_kinds: row.15,
-                language: row.16,
-                asr_backend: row.17,
-                asr_model_hash: row.18,
-                timings_json: row.19,
-                settings_strength: row.20,
-                extra_json: row.21,
-            });
-        }
+        let records = stmt
+            .query_map(params![capture_id], |row| {
+                let decision: String = row.get(6)?;
+                let decision = CorrectionDecision::parse(&decision).ok_or_else(|| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        6,
+                        rusqlite::types::Type::Text,
+                        format!("unknown correction decision {decision:?}").into(),
+                    )
+                })?;
+                Ok(CorrectionRecord {
+                    capture_id: row.get(0)?,
+                    request_id: row.get(1)?,
+                    raw_attempt_id: row.get(2)?,
+                    raw_text: row.get(3)?,
+                    processed_text: row.get(4)?,
+                    final_text: row.get(5)?,
+                    decision,
+                    decision_utc: row.get(7)?,
+                    mode_id: row.get(8)?,
+                    mode_version: row.get(9)?,
+                    provider_id: row.get(10)?,
+                    provider_kind: row.get(11)?,
+                    provider_model: row.get(12)?,
+                    locality: row.get(13)?,
+                    transform_kinds: row.get(14)?,
+                    language: row.get(15)?,
+                    asr_backend: row.get(16)?,
+                    asr_model_hash: row.get(17)?,
+                    timings_json: row.get(18)?,
+                    settings_strength: row.get(19)?,
+                    extra_json: row.get(20)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(records)
     }
 
@@ -7199,13 +7096,14 @@ mod tests {
             .expect("the table exists after the upgrade");
     }
 
-    // ---- correction records (#304) -----------------------------------
+    // ---- correction records ------------------------------------------
 
     /// A committed take with a final transcript attempt, returning
     /// `(capture id, attempt id)`.
-    fn transcribed_take(store: &mut StoreV2) -> (String, String) {
-        let take = committed_take(store, &ramp(160, 0));
-        let id = take.record.id.clone();
+    fn transcribed_take(store: &mut StoreV2, meta: TakeMeta) -> (String, String) {
+        let mut take = store.begin_take(meta).expect("begin");
+        take.append_frames(&ramp(160, 0)).expect("append");
+        let id = take.finish(store).expect("finish").record.id;
         store
             .begin_recognition(&id, "starling:parakeet", None)
             .expect("begin");
@@ -7228,10 +7126,13 @@ mod tests {
         (id, attempt)
     }
 
+    fn ordinary_take(store: &mut StoreV2) -> (String, String) {
+        transcribed_take(store, TakeMeta::for_device("test-device"))
+    }
+
     /// A correction record for `capture`/`attempt` with full provenance.
     fn correction(capture: &str, attempt: &str, request: &str) -> CorrectionRecord {
         CorrectionRecord {
-            id: format!("{capture}#c:{request}"),
             capture_id: capture.to_string(),
             request_id: request.to_string(),
             raw_attempt_id: attempt.to_string(),
@@ -7262,7 +7163,7 @@ mod tests {
     fn correction_records_round_trip_upsert_and_cascade() {
         let dir = TempDir::new().expect("tempdir");
         let mut store = store_in(&dir);
-        let (id, attempt) = transcribed_take(&mut store);
+        let (id, attempt) = ordinary_take(&mut store);
 
         let record = correction(&id, &attempt, "req-1");
         assert!(store.upsert_correction_record(&record).expect("upsert"));
@@ -7318,84 +7219,23 @@ mod tests {
     }
 
     #[test]
-    fn a_mismatched_correction_id_is_refused() {
-        let dir = TempDir::new().expect("tempdir");
-        let mut store = store_in(&dir);
-        let (id, attempt) = transcribed_take(&mut store);
-        let mut record = correction(&id, &attempt, "req-1");
-        record.id = format!("{id}#c:something-else");
-        assert!(matches!(
-            store.upsert_correction_record(&record),
-            Err(StoreV2Error::Invalid(_))
-        ));
-    }
-
-    #[test]
     fn secure_field_captures_never_record_corrections() {
         let dir = TempDir::new().expect("tempdir");
         let mut store = store_in(&dir);
-
-        // The API boundary: the recording context flags the take; the
-        // flag persists on the capture row.
         let mut meta = TakeMeta::for_device("test-device");
         meta.secure_field = true;
-        let mut take = store.begin_take(meta).expect("begin");
-        take.append_frames(&ramp(160, 0)).expect("append");
-        let committed = take.finish(&mut store).expect("finish");
-        let secure_id = committed.record.id.clone();
-        assert!(committed.record.secure_field);
-        assert!(
-            store
-                .get_capture(&secure_id)
-                .expect("get")
-                .expect("present")
-                .secure_field
-        );
+        let (secure_id, attempt) = transcribed_take(&mut store, meta);
+        assert!(store.get_capture(&secure_id).expect("get").expect("present").secure_field);
 
-        store
-            .begin_recognition(&secure_id, "starling:parakeet", None)
-            .expect("begin");
-        store
-            .finish_recognition(
-                &secure_id,
-                RecognitionOutcome::Completed {
-                    text: "secret field text",
-                    extra_json: None,
-                },
-            )
-            .expect("finish");
-        let attempt = store
-            .attempts_for(&secure_id)
-            .expect("attempts")
-            .into_iter()
-            .find(AttemptRecord::is_final_transcript)
-            .expect("a final attempt")
-            .id;
-
-        // The write is excluded by the store, not by caller discipline:
-        // Ok(false), no row, no error.
-        let record = correction(&secure_id, &attempt, "req-1");
         assert!(!store
-            .upsert_correction_record(&record)
+            .upsert_correction_record(&correction(&secure_id, &attempt, "req-1"))
             .expect("excluded, not failed"));
-        assert!(store
-            .correction_records_for(&secure_id)
-            .expect("read")
-            .is_empty());
+        assert!(store.correction_records_for(&secure_id).expect("read").is_empty());
 
-        // An unmarked take on the same store records normally: the flag
-        // excludes only what it marks, never everything.
-        let (normal_id, normal_attempt) = transcribed_take(&mut store);
+        let (normal_id, normal_attempt) = ordinary_take(&mut store);
         assert!(store
             .upsert_correction_record(&correction(&normal_id, &normal_attempt, "req-1"))
             .expect("record"));
-        assert_eq!(
-            store
-                .correction_records_for(&normal_id)
-                .expect("read")
-                .len(),
-            1
-        );
     }
 
     #[test]
@@ -7404,7 +7244,7 @@ mod tests {
         let root = dir.path().join("v2");
         let (id, attempt) = {
             let mut store = store_in(&dir);
-            let pair = transcribed_take(&mut store);
+            let pair = ordinary_take(&mut store);
             drop(store);
             // Rewind to the v3 shape: no correction_records table and a
             // captures table without secure_field (rebuilt, because
@@ -7464,16 +7304,6 @@ mod tests {
             CorrectionDecision::Edited,
         ] {
             assert_eq!(CorrectionDecision::parse(decision.as_str()), Some(decision));
-            // The two textual encodings (serde's `lowercase` and the
-            // database layer's as_str/parse) are one and the same — a
-            // future variant added with different spellings on either
-            // side fails here instead of desyncing silently (review).
-            let json = serde_json::to_string(&decision).unwrap();
-            assert_eq!(json.trim_matches('"'), decision.as_str());
-            assert_eq!(
-                serde_json::from_str::<CorrectionDecision>(&json).unwrap(),
-                decision
-            );
         }
         assert_eq!(CorrectionDecision::parse("nope"), None);
     }

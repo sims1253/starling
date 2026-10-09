@@ -33,13 +33,8 @@ pub(crate) struct ProcessingDoc {
     pub proposals: Vec<ProposalRow>,
 }
 
-/// What produced a proposal, pinned at request time (#304's correction
-/// dataset provenance): the mode that ran, the provider that answered,
-/// the transform kinds and language, and the per-stage timings the
-/// pipeline already reports. Recorded on the row so the decision seam
-/// (accept/dismiss/revert/edit) can attribute the pair without
-/// reconstructing job state. `None` on rows written before the field
-/// existed — never guessed.
+/// What produced a proposal, pinned at request time for the correction
+/// records: the mode, the provider, and the pipeline's stage timings.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ProposalOrigin {
     pub mode_id: String,
@@ -48,9 +43,7 @@ pub(crate) struct ProposalOrigin {
     pub provider_kind: String,
     pub provider_model: String,
     pub locality: String,
-    #[serde(default)]
     pub transform_kinds: Vec<String>,
-    #[serde(default)]
     pub language: Option<String>,
     pub queued_ms: f64,
     pub processing_ms: f64,
@@ -68,9 +61,7 @@ pub(crate) struct ProposalRow {
     pub label: String,
     pub failure: Option<String>,
     pub stop_to_result_ms: Option<f64>,
-    /// Request-time provenance for the correction dataset (#304);
-    /// `None` on rows this build did not write.
-    #[serde(default)]
+    /// `None` on rows written before provenance was recorded.
     pub origin: Option<ProposalOrigin>,
 }
 
@@ -115,7 +106,7 @@ struct ProposalProvenance {
     label: String,
     failure: Option<String>,
     stop_to_result_ms: Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     origin: Option<ProposalOrigin>,
 }
 
@@ -242,27 +233,21 @@ impl Store {
         Self(Arc::new(Mutex::new(StoreV2::open(root).unwrap())))
     }
 
-    /// Test-only: persist a take whose recording context was marked
-    /// secure/incognito (#304's API-boundary exclusion — the desktop app
-    /// has no secure capture path yet, so tests drive the seam directly).
+    /// A short silent take marked as captured against a secure field
+    /// (the desktop app has no such capture path).
     #[cfg(test)]
-    pub(crate) fn save_capture_marked_secure(
-        &self,
-        wav: Arc<Vec<u8>>,
-    ) -> Result<String, storage::StorageError> {
-        let pcm = decode_wav(&wav)?;
-        let mut v2 = lock_v2(&self.0);
+    pub(crate) fn save_secure_take(&self) -> String {
         let mut meta = store_v2::TakeMeta::for_device("");
         meta.secure_field = true;
-        let mut take = v2
-            .begin_take_at_rate(pcm.sample_rate, meta)
-            .map_err(v2_err)?;
-        take.append_and_seal(&pcm.samples).map_err(v2_err)?;
-        let finalized = take.finalize().map_err(v2_err)?;
-        let committed = finalized
+        let mut v2 = lock_v2(&self.0);
+        let mut take = v2.begin_take_at_rate(16_000, meta).unwrap();
+        take.append_and_seal(&[0.0; 160]).unwrap();
+        let finalized = take.finalize().unwrap();
+        finalized
             .commit_marked(&mut v2, store_v2::CommitMark::Complete)
-            .map_err(v2_err)?;
-        Ok(committed.record.id)
+            .unwrap()
+            .record
+            .id
     }
 
     /// Open the store at its default data root. This is the app's only
@@ -593,13 +578,8 @@ impl Store {
             .map_err(v2_err)
     }
 
-    /// Writes (or revises) one correction record (#304): the transcript →
-    /// edit pair for one processing proposal, with the user's decision.
-    /// `Ok(false)` is the designed exclusion — the take was captured
-    /// against a secure/incognito field and never contributes; a take
-    /// deleted meanwhile is `NotFound` like the other processing writes.
-    /// Nothing about success or failure elsewhere touches these rows:
-    /// only an explicit decision records, and only deletion removes.
+    /// Writes or revises one correction record; `Ok(false)` when the take
+    /// is excluded (secure field).
     pub(crate) fn record_correction(
         &self,
         record: &store_v2::CorrectionRecord,
@@ -608,8 +588,6 @@ impl Store {
         store.upsert_correction_record(record).map_err(v2_err)
     }
 
-    /// One take's correction records, in insertion order (no UI reads
-    /// these yet; the browse/review surface is later work).
     #[cfg(test)]
     pub(crate) fn correction_records(
         &self,
@@ -1308,7 +1286,6 @@ mod tests {
             .start_processing_doc(&id, &attempt, &raw)
             .expect("start");
         let record = store_v2::CorrectionRecord {
-            id: format!("{id}#c:r1"),
             capture_id: id.clone(),
             request_id: "r1".to_string(),
             raw_attempt_id: attempt.clone(),
@@ -1317,25 +1294,22 @@ mod tests {
             final_text: Some("Deleted.".to_string()),
             decision: store_v2::CorrectionDecision::Accepted,
             decision_utc: "2026-09-24T10:00:00Z".to_string(),
-            mode_id: Some("clean-local".to_string()),
-            mode_version: Some(3),
-            provider_id: Some("local-s1".to_string()),
-            provider_kind: Some("s1".to_string()),
-            provider_model: Some("s1-mini".to_string()),
-            locality: Some("local".to_string()),
-            transform_kinds: Some(r#"["clean"]"#.to_string()),
-            language: Some("en".to_string()),
+            mode_id: None,
+            mode_version: None,
+            provider_id: None,
+            provider_kind: None,
+            provider_model: None,
+            locality: None,
+            transform_kinds: None,
+            language: None,
             asr_backend: None,
             asr_model_hash: None,
-            timings_json: Some("{}".to_string()),
+            timings_json: None,
             settings_strength: None,
             extra_json: None,
         };
         assert!(store.record_correction(&record).expect("record"));
         assert_eq!(store.correction_records(&id).expect("read").len(), 1);
-        // The facade delete (processing document first, then the capture)
-        // removes the correction records with the capture row — and a
-        // late decision for the deleted take lands nowhere.
         store.delete(&id).expect("delete");
         assert!(store.correction_records(&id).expect("read").is_empty());
         assert!(matches!(

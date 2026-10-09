@@ -494,9 +494,8 @@ pub struct StarlingApp {
     /// The latest playback-attenuation notice. Its own slot: the take
     /// lifecycle clears `error` and `take_notice` on every start/stop.
     pub(crate) playback_notice: Option<PlaybackNotice>,
-    /// The tail of the FIFO chain of correction-decision writes (#304
-    /// review): each write awaits the previous one so quickly revised
-    /// decisions can never land out of order.
+    /// The latest correction-decision write; each write awaits the one
+    /// before it so decisions land in the order they were made.
     pub(crate) correction_chain: Option<Task<()>>,
     /// The settings dialog's dictation drafts (committed on save).
     pub(crate) draft_shortcut: Entity<TextField>,

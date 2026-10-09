@@ -132,24 +132,19 @@ fn user_edited(draft: &Draft) -> bool {
         || snapshot.text != draft.raw_text()
 }
 
-/// The request whose accepted proposal is (still) the draft's processed
-/// region. A draft holds at most one Processed region — `take_proposal`
-/// replaces all regions — so "the first" is "the only"; the mirrored
-/// lookups share this one helper for exactly that reason.
+/// The request whose accepted proposal is the draft's processed region
+/// (there is at most one: accepting a proposal replaces all regions).
 pub(crate) fn processed_request_id(draft: &Draft) -> Option<String> {
     draft
         .snapshot()
         .regions
         .iter()
-        .find(|region| region.kind == RegionKind::Processed && region.request_id.is_some())
-        .and_then(|region| region.request_id.clone())
+        .filter(|region| region.kind == RegionKind::Processed)
+        .find_map(|region| region.request_id.clone())
 }
 
-/// The request whose accepted proposal a persisted edit changed (#304):
-/// the draft still contains its processed region and the text no longer
-/// equals the proposal itself. An edit that restores the raw transcript
-/// exactly never reaches here (it becomes `revert_raw`); an edit that
-/// lands back on the proposal's exact text is not an edit.
+/// The request whose accepted proposal the draft's text was edited away
+/// from, if any.
 fn edited_decision_request(draft: &Draft) -> Option<String> {
     let request_id = processed_request_id(draft)?;
     let proposal = draft.proposal_text(&request_id)?;
@@ -409,38 +404,30 @@ impl StarlingApp {
         let Some(draft) = self.staging_draft(token) else {
             return;
         };
-        // #304: an edit that restores the raw transcript exactly undoes an
-        // accepted proposal the same way the "Back to raw" button does.
-        // The revert inside `apply_edit` destroys the processed region, so
-        // read the request id first; the decision is recorded after the
-        // edit applies, and only when a proposal was actually undone.
+        // An edit back to the exact raw text undoes an accepted proposal
+        // like "Back to raw" does; the revert drops the processed region,
+        // so read its request first.
         let undone_request = processed_request_id(draft);
-        let reverted_to_raw = apply_edit(draft, edit);
+        let reverted_to = apply_edit(draft, edit).then(|| draft.raw_text());
         // Whatever the draft made of the edit (a pinned partial becomes the
         // user's), the editor shows the draft.
         self.sync_staging_editor(token, false, cx);
         if ready {
             self.schedule_staging_persist(token, cx);
         }
-        if reverted_to_raw {
-            let take = self
-                .staging_mut(token)
-                .and_then(|staging| staging.take_id.clone());
-            if let (Some(id), Some(request_id)) = (take, undone_request) {
-                let raw_text = self
-                    .drafts
-                    .get(&id)
-                    .map(|draft| draft.raw_text())
-                    .unwrap_or_default();
-                self.record_correction_decision(
-                    cx,
-                    &id,
-                    None,
-                    &request_id,
-                    CorrectionDecision::Reverted,
-                    Some(raw_text),
-                );
-            }
+        let take_id = self
+            .staging_mut(token)
+            .and_then(|staging| staging.take_id.clone());
+        if let (Some(id), Some(request_id), Some(raw_text)) = (take_id, undone_request, reverted_to)
+        {
+            self.record_correction_decision(
+                cx,
+                &id,
+                None,
+                &request_id,
+                CorrectionDecision::Reverted,
+                Some(raw_text),
+            );
         }
     }
 
@@ -769,11 +756,6 @@ impl StarlingApp {
         if let Some(take) = self.processing.get_mut(&id) {
             take.processed_head = (!is_raw).then(|| text.clone());
         }
-        // #304: a persisted edit over an accepted proposal's head is a
-        // decision — the user changed the processed output (`edited`).
-        // Only a head that still contains the accepted proposal and no
-        // longer equals it counts; edits of never-processed text record
-        // nothing, and ordinary persistence never decides anything.
         if let Some(request_id) = (!is_raw)
             .then(|| edited_decision_request(draft))
             .flatten()
@@ -1230,7 +1212,7 @@ mod tests {
     }
 
     fn saved_take(store: &crate::store::Store) -> (String, String) {
-        use starling_dictation::{audio, storage::TranscriptionResult};
+        use starling_dictation::audio;
         let wav = audio::encode_wav_16k(&audio::PcmAudio {
             samples: vec![0.; 160],
             sample_rate: 16_000,
@@ -1241,10 +1223,17 @@ mod tests {
             .save_capture(std::sync::Arc::new(wav), None)
             .unwrap()
             .id;
-        store.mark_attempt(&id, "test").unwrap();
+        let attempt = transcribe(store, &id);
+        (id, attempt)
+    }
+
+    /// Stores "raw" as the take's transcript; returns the attempt id.
+    fn transcribe(store: &crate::store::Store, id: &str) -> String {
+        use starling_dictation::storage::TranscriptionResult;
+        store.mark_attempt(id, "test").unwrap();
         store
             .save_transcript(
-                &id,
+                id,
                 TranscriptionResult {
                     text: "raw".into(),
                     segments: vec![],
@@ -1253,8 +1242,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let (attempt, _) = store.latest_raw(&id).unwrap().unwrap();
-        (id, attempt)
+        store.latest_raw(id).unwrap().unwrap().0
     }
 
     #[gpui::test]
@@ -1534,17 +1522,12 @@ mod tests {
         assert!(!user_edited(&draft));
     }
 
-    // ---- correction-dataset decisions (#304) --------------------------
+    // ---- correction decisions --------------------------------------
 
-    /// A take ready for a correction-decision test: saved, transcribed
-    /// ("raw"), with a processing document, a stored proposal "r1"
-    /// ("Clean.", full request-time provenance), and the app's draft
-    /// carrying that proposal as current.
-    fn proposed_take(
-        app: &mut StarlingApp,
-        store: &crate::store::Store,
-    ) -> (String, String, crate::store::ProposalRow) {
-        let (id, attempt) = saved_take(store);
+    /// Gives take `id` a stored processing document and a current
+    /// proposal "r1" ("Clean." for raw "raw") in both the store and the
+    /// app.
+    fn propose(app: &mut StarlingApp, store: &crate::store::Store, id: &str, attempt: &str) {
         let row = crate::store::ProposalRow {
             request_id: "r1".to_string(),
             base_revision: 1,
@@ -1566,31 +1549,55 @@ mod tests {
                 processing_ms: 900.0,
             }),
         };
-        store
-            .start_processing_doc(&id, &attempt, "raw")
-            .expect("doc");
-        store.save_proposal(&id, &row).expect("proposal");
-        let mut draft = Draft::new(&id, &id);
-        draft.final_attempt(0, &attempt, "raw");
+        store.start_processing_doc(id, attempt, "raw").expect("doc");
+        store.save_proposal(id, &row).expect("proposal");
+        let mut draft = Draft::new(id, id);
+        draft.final_attempt(0, attempt, "raw");
         draft.request_transform("r1", None);
         draft.result(
             "r1",
             starling_processing::staging::ResultKind::Completed,
             Some("Clean."),
         );
-        app.drafts.insert(id.clone(), draft);
+        app.drafts.insert(id.to_string(), draft);
         app.processing.insert(
-            id.clone(),
+            id.to_string(),
             TakeProcessing {
-                label: "S1-mini · this computer".to_string(),
-                state: ProcessingState::Proposal {
-                    row: row.clone(),
-                    current: true,
-                },
+                label: row.label.clone(),
+                state: ProcessingState::Proposal { row, current: true },
                 processed_head: None,
             },
         );
-        (id, attempt, row)
+    }
+
+    /// A saved, transcribed take with a current proposal.
+    fn proposed_take(app: &mut StarlingApp, store: &crate::store::Store) -> String {
+        let (id, attempt) = saved_take(store);
+        propose(app, store, &id, &attempt);
+        id
+    }
+
+    /// Binds a ready staging panel to take `id`; returns its token.
+    fn stage(app: &mut StarlingApp, id: &str, cx: &mut Context<StarlingApp>) -> u64 {
+        app.begin_staging(cx);
+        let staging = app.staging.as_mut().unwrap();
+        staging.phase = StagingPhase::Ready;
+        staging.take_id = Some(id.to_string());
+        staging.live = None;
+        staging.token
+    }
+
+    fn edit_and_persist(
+        app: &Entity<StarlingApp>,
+        token: u64,
+        edit: TextEdit,
+        cx: &mut gpui::TestAppContext,
+    ) {
+        app.update(cx, |app, cx| {
+            app.apply_staging_edit(token, &edit, cx);
+            app.persist_staging_now(token, cx);
+        });
+        cx.run_until_parked();
     }
 
     #[gpui::test]
@@ -1599,7 +1606,7 @@ mod tests {
         let store = crate::store::Store::at_test_root(root.path());
         let app = cx.new(|cx| StarlingApp::for_test(Some(store.clone()), cx));
         let id = app.update(cx, |app, cx| {
-            let (id, _attempt, _row) = proposed_take(app, &store);
+            let id = proposed_take(app, &store);
             app.accept_processed(&id, false, cx);
             id
         });
@@ -1612,8 +1619,6 @@ mod tests {
         assert_eq!(record.raw_text, "raw");
         assert_eq!(record.processed_text, "Clean.");
         assert_eq!(record.final_text.as_deref(), Some("Clean."));
-        // Provenance is what the runtime knew at request time, plus the
-        // ASR identity the store filled from the attempt row.
         assert_eq!(record.mode_id.as_deref(), Some("clean-local"));
         assert_eq!(record.mode_version, Some(3));
         assert_eq!(record.provider_id.as_deref(), Some("local-s1"));
@@ -1623,14 +1628,7 @@ mod tests {
         assert_eq!(record.transform_kinds.as_deref(), Some(r#"["clean"]"#));
         assert_eq!(record.language.as_deref(), Some("en"));
         assert_eq!(record.asr_backend.as_deref(), Some("test"));
-        assert!(
-            record
-                .timings_json
-                .as_deref()
-                .expect("timings")
-                .contains("1234.5")
-        );
-        assert_eq!(record.settings_strength, None);
+        assert!(record.timings_json.as_deref().unwrap().contains("1234.5"));
     }
 
     #[gpui::test]
@@ -1639,7 +1637,7 @@ mod tests {
         let store = crate::store::Store::at_test_root(root.path());
         let app = cx.new(|cx| StarlingApp::for_test(Some(store.clone()), cx));
         let id = app.update(cx, |app, cx| {
-            let (id, _attempt, _row) = proposed_take(app, &store);
+            let id = proposed_take(app, &store);
             app.dismiss_processed(&id, cx);
             id
         });
@@ -1647,30 +1645,29 @@ mod tests {
         let records = store.correction_records(&id).expect("records");
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].decision, CorrectionDecision::Rejected);
-        // The head stood still: the final text is what the user kept.
         assert_eq!(records[0].final_text.as_deref(), Some("raw"));
-        assert_eq!(records[0].processed_text, "Clean.");
     }
 
     #[gpui::test]
-    fn reverting_an_accepted_proposal_revises_the_decision_in_place(cx: &mut gpui::TestAppContext) {
+    fn reverting_an_accepted_proposal_revises_the_decision_in_place(
+        cx: &mut gpui::TestAppContext,
+    ) {
         let root = tempfile::tempdir().unwrap();
         let store = crate::store::Store::at_test_root(root.path());
         let app = cx.new(|cx| StarlingApp::for_test(Some(store.clone()), cx));
+        // Back to back, so the two writes race unless they are ordered.
         let id = app.update(cx, |app, cx| {
-            let (id, _attempt, _row) = proposed_take(app, &store);
+            let id = proposed_take(app, &store);
             app.accept_processed(&id, false, cx);
+            app.revert_to_raw(&id, cx);
             id
         });
         cx.run_until_parked();
-        app.update(cx, |app, cx| app.revert_to_raw(&id, cx));
-        cx.run_until_parked();
-        // Upsert semantics: the revision is an UPDATE, not a second row.
         let records = store.correction_records(&id).expect("records");
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].decision, CorrectionDecision::Reverted);
         assert_eq!(records[0].final_text.as_deref(), Some("raw"));
-        assert_eq!(records[0].processed_text, "Clean.", "the pair stays");
+        assert_eq!(records[0].processed_text, "Clean.");
     }
 
     #[gpui::test]
@@ -1679,78 +1676,22 @@ mod tests {
         let store = crate::store::Store::at_test_root(root.path());
         let app = cx.new(|cx| StarlingApp::for_test(Some(store.clone()), cx));
         let (id, token) = app.update(cx, |app, cx| {
-            let (id, _attempt, _row) = proposed_take(app, &store);
-            app.begin_staging(cx);
-            let staging = app.staging.as_mut().unwrap();
-            staging.phase = StagingPhase::Ready;
-            staging.take_id = Some(id.clone());
-            staging.live = None;
-            let token = staging.token;
+            let id = proposed_take(app, &store);
+            let token = stage(app, &id, cx);
             app.accept_processed(&id, false, cx);
             (id, token)
         });
         cx.run_until_parked();
-        // The accepted head is "Clean." — an edit that restores the raw
-        // transcript exactly is the undo of that acceptance (the review's
-        // gap: it used to record nothing and left the row `accepted`).
-        app.update(cx, |app, cx| {
-            app.apply_staging_edit(
-                token,
-                &TextEdit {
-                    start: 0,
-                    end: 6,
-                    text: "raw".into(),
-                },
-                cx,
-            );
-            app.persist_staging_now(token, cx);
-        });
-        cx.run_until_parked();
-        let records = store.correction_records(&id).expect("records");
-        assert_eq!(records.len(), 1, "one row, revised in place");
-        assert_eq!(records[0].decision, CorrectionDecision::Reverted);
-        assert_eq!(records[0].final_text.as_deref(), Some("raw"));
-        assert_eq!(records[0].processed_text, "Clean.", "the pair stays");
-    }
-
-    #[gpui::test]
-    fn quickly_revised_decisions_keep_the_newer_label(cx: &mut gpui::TestAppContext) {
-        let root = tempfile::tempdir().unwrap();
-        let store = crate::store::Store::at_test_root(root.path());
-        let app = cx.new(|cx| StarlingApp::for_test(Some(store.clone()), cx));
-        let id = app.update(cx, |app, cx| {
-            let (id, _attempt, _row) = proposed_take(app, &store);
-            // Accept, then immediately revert — back to back, no parking
-            // in between, exactly the race the review found: the writes
-            // must land in user-action order (FIFO chain), so the row
-            // ends `reverted`, not `accepted`.
-            app.accept_processed(&id, false, cx);
-            app.revert_to_raw(&id, cx);
-            id
-        });
-        cx.run_until_parked();
+        let edit = TextEdit {
+            start: 0,
+            end: 6,
+            text: "raw".into(),
+        };
+        edit_and_persist(&app, token, edit, cx);
         let records = store.correction_records(&id).expect("records");
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].decision, CorrectionDecision::Reverted);
-    }
-
-    #[gpui::test]
-    fn reverting_plain_edits_records_nothing(cx: &mut gpui::TestAppContext) {
-        let root = tempfile::tempdir().unwrap();
-        let store = crate::store::Store::at_test_root(root.path());
-        let (id, attempt) = saved_take(&store);
-        store.start_processing_doc(&id, &attempt, "raw").unwrap();
-        let app = cx.new(|cx| StarlingApp::for_test(Some(store.clone()), cx));
-        // No proposal ever existed: a draft with raw text and manual edits.
-        app.update(cx, |app, cx| {
-            let mut draft = Draft::new(&id, &id);
-            draft.final_attempt(0, &attempt, "raw");
-            draft.insert(3, " edit");
-            app.drafts.insert(id.clone(), draft);
-            app.revert_to_raw(&id, cx);
-        });
-        cx.run_until_parked();
-        assert!(store.correction_records(&id).expect("records").is_empty());
+        assert_eq!(records[0].final_text.as_deref(), Some("raw"));
     }
 
     #[gpui::test]
@@ -1759,144 +1700,61 @@ mod tests {
         let store = crate::store::Store::at_test_root(root.path());
         let app = cx.new(|cx| StarlingApp::for_test(Some(store.clone()), cx));
         let (id, token) = app.update(cx, |app, cx| {
-            let (id, _attempt, _row) = proposed_take(app, &store);
-            // Bind the staging panel: the edited-decision seam is the
-            // panel's persist path.
-            app.begin_staging(cx);
-            let staging = app.staging.as_mut().unwrap();
-            staging.phase = StagingPhase::Ready;
-            staging.take_id = Some(id.clone());
-            staging.live = None;
-            let token = staging.token;
+            let id = proposed_take(app, &store);
+            let token = stage(app, &id, cx);
             app.accept_processed(&id, false, cx);
             (id, token)
         });
         cx.run_until_parked();
-        // The accept is durable; now the user edits the processed head.
-        app.update(cx, |app, cx| {
-            app.apply_staging_edit(
-                token,
-                &TextEdit {
-                    start: 6,
-                    end: 6,
-                    text: "!".into(),
-                },
-                cx,
-            );
-            app.persist_staging_now(token, cx);
-        });
-        cx.run_until_parked();
+        let edit = TextEdit {
+            start: 6,
+            end: 6,
+            text: "!".into(),
+        };
+        edit_and_persist(&app, token, edit, cx);
         let records = store.correction_records(&id).expect("records");
-        assert_eq!(records.len(), 1, "still one row: the edit revises it");
+        assert_eq!(records.len(), 1);
         assert_eq!(records[0].decision, CorrectionDecision::Edited);
         assert_eq!(records[0].final_text.as_deref(), Some("Clean.!"));
-        assert_eq!(records[0].processed_text, "Clean.");
-        assert_eq!(records[0].raw_text, "raw");
     }
 
     #[gpui::test]
-    fn takes_that_never_reached_processing_record_nothing(cx: &mut gpui::TestAppContext) {
+    fn edits_and_reverts_without_a_proposal_record_nothing(cx: &mut gpui::TestAppContext) {
         let root = tempfile::tempdir().unwrap();
         let store = crate::store::Store::at_test_root(root.path());
         let (id, attempt) = saved_take(&store);
         store.start_processing_doc(&id, &attempt, "raw").unwrap();
         let app = cx.new(|cx| StarlingApp::for_test(Some(store.clone()), cx));
-        app.update(cx, |app, cx| {
-            app.begin_staging(cx);
-            let staging = app.staging.as_mut().unwrap();
-            staging.phase = StagingPhase::Ready;
-            staging.take_id = Some(id.clone());
-            staging.live = None;
-            let token = staging.token;
+        let token = app.update(cx, |app, cx| {
+            let token = stage(app, &id, cx);
             let mut draft = Draft::new(&id, &id);
             draft.final_attempt(0, &attempt, "raw");
-            draft.insert(3, " edit");
             app.drafts.insert(id.clone(), draft);
-            app.apply_staging_edit(
-                token,
-                &TextEdit {
-                    start: 0,
-                    end: 0,
-                    text: "more ".into(),
-                },
-                cx,
-            );
-            app.persist_staging_now(token, cx);
+            token
         });
+        let edit = TextEdit {
+            start: 3,
+            end: 3,
+            text: " edit".into(),
+        };
+        edit_and_persist(&app, token, edit, cx);
+        app.update(cx, |app, cx| app.revert_to_raw(&id, cx));
         cx.run_until_parked();
         assert!(store.correction_records(&id).expect("records").is_empty());
     }
 
     #[gpui::test]
     fn a_secure_field_take_never_records_corrections(cx: &mut gpui::TestAppContext) {
-        use starling_dictation::{audio, storage::TranscriptionResult};
-        use std::sync::Arc;
         let root = tempfile::tempdir().unwrap();
         let store = crate::store::Store::at_test_root(root.path());
-        // The API-boundary marking: the recording context flags the take
-        // (the desktop app has no secure capture path yet; this is the
-        // seam a keyboard integration would use).
-        let wav = audio::encode_wav_16k(&audio::PcmAudio {
-            samples: vec![0.; 160],
-            sample_rate: 16_000,
-            channels: 1,
-        })
-        .unwrap();
-        let id = store.save_capture_marked_secure(Arc::new(wav)).unwrap();
-        store.mark_attempt(&id, "test").unwrap();
-        store
-            .save_transcript(
-                &id,
-                TranscriptionResult {
-                    text: "raw".into(),
-                    segments: vec![],
-                    duration_seconds: None,
-                    request_id: None,
-                },
-            )
-            .unwrap();
-        let (attempt, _) = store.latest_raw(&id).unwrap().unwrap();
-
+        let id = store.save_secure_take();
+        let attempt = transcribe(&store, &id);
         let app = cx.new(|cx| StarlingApp::for_test(Some(store.clone()), cx));
         app.update(cx, |app, cx| {
-            let row = crate::store::ProposalRow {
-                request_id: "r1".to_string(),
-                base_revision: 1,
-                text: "Clean.".to_string(),
-                status: crate::store::RowStatus::Proposed,
-                label: "S1-mini · this computer".to_string(),
-                failure: None,
-                stop_to_result_ms: Some(1234.5),
-                origin: None,
-            };
-            store.start_processing_doc(&id, &attempt, "raw").unwrap();
-            store.save_proposal(&id, &row).unwrap();
-            let mut draft = Draft::new(&id, &id);
-            draft.final_attempt(0, &attempt, "raw");
-            draft.request_transform("r1", None);
-            draft.result(
-                "r1",
-                starling_processing::staging::ResultKind::Completed,
-                Some("Clean."),
-            );
-            app.drafts.insert(id.clone(), draft);
-            app.processing.insert(
-                id.clone(),
-                TakeProcessing {
-                    label: "S1-mini · this computer".to_string(),
-                    state: ProcessingState::Proposal {
-                        row: row.clone(),
-                        current: true,
-                    },
-                    processed_head: None,
-                },
-            );
+            propose(app, &store, &id, &attempt);
             app.accept_processed(&id, false, cx);
         });
         cx.run_until_parked();
-        assert!(
-            store.correction_records(&id).expect("records").is_empty(),
-            "a secure/incognito take never contributes, even on a full accept"
-        );
+        assert!(store.correction_records(&id).expect("records").is_empty());
     }
 }

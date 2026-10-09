@@ -650,10 +650,6 @@ fn stored_row(
         label: label.to_string(),
         failure: result.failure.as_ref().map(|_| message.to_string()),
         stop_to_result_ms: result.timing.stop_to_result_ms,
-        // #304: provenance pinned at request time — what the runtime
-        // knows when the job runs. The decision seams (accept/dismiss/
-        // revert/edit) read it back off the row; nothing is guessed
-        // later.
         origin: Some(ProposalOrigin {
             mode_id: request.mode_id.clone(),
             mode_version: request.mode_version,
@@ -673,8 +669,7 @@ fn stored_row(
     })
 }
 
-/// `Locality` as the wire spelling (`serde(rename_all = "snake_case")`),
-/// for provenance columns that store text.
+/// `Locality`'s wire spelling.
 fn locality_str(locality: Locality) -> &'static str {
     match locality {
         Locality::Local => "local",
@@ -682,15 +677,11 @@ fn locality_str(locality: Locality) -> &'static str {
     }
 }
 
-/// Builds the correction record for one observed decision (#304): the
-/// raw pair from the take's processing document, the proposal with its
-/// request-time provenance, and the decision. The `asr_*` columns are
-/// left for the store to fill from the attempt row; a provenance field
-/// the runtime does not have (`settings_strength`) stays NULL rather
-/// than guessed.
+/// The correction record for one decision on `row`, a proposal of the
+/// take whose processing document is `doc`.
 fn correction_record_for(
     id: &str,
-    doc: &crate::store::ProcessingDoc,
+    doc: &ProcessingDoc,
     row: &ProposalRow,
     decision: CorrectionDecision,
     final_text: Option<String>,
@@ -702,7 +693,6 @@ fn correction_record_for(
         "stop_to_result_ms": row.stop_to_result_ms,
     });
     CorrectionRecord {
-        id: format!("{id}#c:{}", row.request_id),
         capture_id: id.to_string(),
         request_id: row.request_id.clone(),
         raw_attempt_id: doc.raw_attempt_id.clone(),
@@ -717,18 +707,13 @@ fn correction_record_for(
         provider_kind: origin.map(|o| o.provider_kind.clone()),
         provider_model: origin.map(|o| o.provider_model.clone()),
         locality: origin.map(|o| o.locality.clone()),
-        transform_kinds: origin
-            // Vec<String> cannot fail to serialize; an empty result is
-            // kept as NULL rather than an empty JSON array (deliberate,
-            // and the only silent fallback here).
-            .map(|o| serde_json::to_string(&o.transform_kinds).unwrap_or_default())
-            .filter(|text| !text.is_empty()),
+        transform_kinds: origin.map(|o| serde_json::json!(o.transform_kinds).to_string()),
         language: origin.and_then(|o| o.language.clone()),
-        asr_backend: None, // the store fills these from the attempt row
+        asr_backend: None,
         asr_model_hash: None,
         timings_json: Some(timings.to_string()),
-        settings_strength: None, // no editing-strength setting exists yet
-        extra_json: serde_json::to_string(&serde_json::json!({ "label": row.label })).ok(),
+        settings_strength: None,
+        extra_json: Some(serde_json::json!({ "label": row.label }).to_string()),
     }
 }
 
@@ -1208,16 +1193,10 @@ impl StarlingApp {
         self.stop_instants.remove(id);
     }
 
-    /// Records one correction-dataset decision (#304): the transcript →
-    /// edit pair for one processing proposal, with the decision the user
-    /// made. `row` may be omitted (the decision seam that does not hold
-    /// it — a revert, a persisted edit): it is then looked up from the
-    /// take's processing document, and a row that is neither in hand nor
-    /// durable records nothing (conservative: a decision racing the
-    /// write that would make it attributable is dropped, never guessed).
-    /// A take deleted or re-transcribed meanwhile records nothing.
-    /// Excluded takes (secure/incognito capture) answer `Ok(false)` in
-    /// the store and record nothing by design.
+    /// Records the user's decision on proposal `request_id` of take `id`.
+    /// Without `row` in hand it is looked up in the stored processing
+    /// document; when neither the row nor the document (deleted or
+    /// re-transcribed take) is there, nothing is recorded.
     pub(crate) fn record_correction_decision(
         &mut self,
         cx: &mut Context<Self>,
@@ -1232,12 +1211,8 @@ impl StarlingApp {
         };
         let id = id.to_string();
         let request_id = request_id.to_string();
-        // FIFO: every decision write waits for the previous one, so a
-        // quickly revised decision (accept, then revert or edit) can never
-        // land out of order and overwrite the newer label (review finding:
-        // fire-and-forget spawns race and the older write could finish
-        // last). All decisions originate on the UI thread, so chain order
-        // IS user-action order.
+        // Each write waits for the previous one, so a quickly revised
+        // decision cannot be overwritten by the older one landing late.
         let previous = self.correction_chain.take();
         let task = cx.spawn(async move |this, cx| {
             if let Some(previous) = previous {
@@ -1246,8 +1221,6 @@ impl StarlingApp {
             let written = cx
                 .background_spawn(async move {
                     let Ok(Some(doc)) = store.processing_doc(&id) else {
-                        // Deleted, unreadable, or built on an earlier
-                        // transcript: nothing to attribute the decision to.
                         return Ok(());
                     };
                     let row = row.or_else(|| {
@@ -1322,8 +1295,6 @@ impl StarlingApp {
             .first()
             .map(|attempt| attempt.attempt_id.clone())
             .unwrap_or_default();
-        // #304: the user kept the processed output — the pair's decision
-        // is `accepted`, with the applied text as the final text.
         self.record_correction_decision(
             cx,
             id,
@@ -1367,11 +1338,8 @@ impl StarlingApp {
             cx.notify();
             return;
         };
-        // #304: "Back to raw" over a processed head is a decision on the
-        // proposal that produced that head — its request id is on the
-        // processed region, and it goes away with the revert, so read it
-        // first. A revert over plain manual edits (no processed region)
-        // decides nothing: no processing was involved.
+        // The processed region goes away with the revert; a revert of
+        // plain manual edits has none and decides nothing.
         let reverted_request = processed_request_id(draft);
         if draft.revert_raw() != Outcome::Applied {
             return;
@@ -1391,8 +1359,6 @@ impl StarlingApp {
         }
         cx.notify();
         if let Some(request_id) = reverted_request {
-            // #304: the processed output was undone after being used —
-            // decision `reverted`, the raw transcript as the final text.
             self.record_correction_decision(
                 cx,
                 id,
@@ -1438,8 +1404,6 @@ impl StarlingApp {
             status: RowStatus::Rejected,
             ..row
         };
-        // #304: the user dismissed the proposal unused — decision
-        // `rejected`, with the head text as it stood (usually the raw).
         self.record_correction_decision(
             cx,
             &id,
