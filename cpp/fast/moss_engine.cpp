@@ -100,6 +100,8 @@ struct MossEngine::Impl {
     vk::Buffer kcache, vcache, state, ids, xd, qkvd, attd, hd, part;
     vk::Buffer mel_in, cv1, cv2, cv3, ex, eh, eq, ek, ev, esc, ep, ectx, effh, eproj, eproj2, adh;
     vk::Buffer lx, lhn, lqkv, lqr, lsc, lp, lctx, lmlp;
+    vk::Buffer apart;   // attention split partials [NH][S][2+HDIM]
+    static constexpr uint32_t kAttnSplitMax = 8;
     int cap_C = 0, cap_A = 0, cap_S = 0;
     uint32_t n_part = 0;
 
@@ -425,7 +427,8 @@ bool MossEngine::Impl::alloc_static(std::string& err) {
     return mk(kcache, cache_elems * 2) && mk(vcache, cache_elems * 2) &&
            mk(state, (16 + (size_t)cfg.max_new_tokens) * 4, vk::Mem::Readback) && mk(ids, kMaxPromptIds * 4, vk::Mem::Readback) &&
            mk(xd, HD * 4) && mk(qkvd, (size_t)(NH + 2 * NKV) * HDIM * 4) && mk(attd, (size_t)NH * HDIM * 4) &&
-           mk(hd, (size_t)FF * 4) && mk(part, (size_t)n_part * 8);
+           mk(hd, (size_t)FF * 4) && mk(part, (size_t)n_part * 8) &&
+           mk(apart, (size_t)NH * kAttnSplitMax * (2 + HDIM) * 4);
 }
 
 bool MossEngine::Impl::ensure(int C, int A, int S, std::string& err) {
@@ -759,8 +762,28 @@ bool MossEngine::Impl::record_decode(uint32_t steps, std::string& err) {
     rc.begin();
     const float leps = cfg.llm.rms_norm_eps;
     const float lscale = 1.0f / std::sqrt((float)HDIM);
-    const vk::Pipeline* ap = ctx->pipeline("attn_decode", {HDIM, MAXPOS}, err);
-    if (!ap) return false;
+    // Decode attention as a flash-decode KV split: S chunks per query head,
+    // then a combine. The single-pass kernel runs one workgroup per head (16
+    // on MOSS), too few to hide cache-load latency on an iGPU. The chunked
+    // exp/sum/value accumulation differs from the single pass at ulp level,
+    // so the split is on by default only where it was measured and gated
+    // (AMD/RADV); other vendors, including the Pixel's PowerVR, keep the
+    // single pass. STARLING_FAST_ATTN_SPLIT=S overrides: 0 = single pass,
+    // 1..kAttnSplitMax = chunk count.
+    static const int split_env = [] {
+        const char* e = std::getenv("STARLING_FAST_ATTN_SPLIT");
+        if (!e) return -1;
+        char* end = nullptr;
+        const unsigned long v = std::strtoul(e, &end, 10);
+        if (*e >= '0' && *e <= '9' && *end == '\0' && v <= kAttnSplitMax) return (int)v;
+        std::fprintf(stderr, "[fast-moss] ignoring STARLING_FAST_ATTN_SPLIT='%s' (want 0..%u)\n", e, kAttnSplitMax);
+        return -1;
+    }();
+    const uint32_t asplit = split_env >= 0 ? (uint32_t)split_env : ctx->info().vendor_id == 0x1002 ? 4 : 0;
+    const vk::Pipeline* ap = asplit ? ctx->pipeline("attn_decode_split", {HDIM, MAXPOS, ceil_div(MAXPOS, asplit)}, err)
+                                    : ctx->pipeline("attn_decode", {HDIM, MAXPOS}, err);
+    const vk::Pipeline* ac = asplit ? ctx->pipeline("attn_split_combine", {HDIM}, err) : nullptr;
+    if (!ap || (asplit && !ac)) return false;
     for (uint32_t s = 0; s < steps; ++s) {
         // No split() per token: the decode recording is one command buffer
         // per round (one submit instead of `steps`). The per-step split
@@ -780,10 +803,17 @@ bool MossEngine::Impl::record_decode(uint32_t steps, std::string& err) {
                 return false;
             rc.barrier();
             rc.label("dec_attn");
-            struct { uint32_t H, KVH, cache_off; float eps, scale; } pa{NH, NKV, l * NKV * MAXPOS * HDIM, leps, lscale};
-            rc.dispatch(*ap, {vk::Ref(qkvd), vk::Ref(kcache), vk::Ref(vcache), vk::Ref(attd), R(Y.q_norm),
-                              R(Y.k_norm), R(rope_tab), vk::Ref(state)},
-                        &pa, sizeof(pa), NH);
+            // attn_decode ignores the trailing S (push constants are one fixed block).
+            struct { uint32_t H, KVH, cache_off; float eps, scale; uint32_t S; } pa{
+                NH, NKV, l * NKV * MAXPOS * HDIM, leps, lscale, asplit};
+            rc.dispatch(*ap, {vk::Ref(qkvd), vk::Ref(kcache), vk::Ref(vcache), vk::Ref(asplit ? apart : attd),
+                              R(Y.q_norm), R(Y.k_norm), R(rope_tab), vk::Ref(state)},
+                        &pa, sizeof(pa), NH, std::max(asplit, 1u));
+            if (asplit) {
+                rc.barrier();
+                rc.label("dec_attn_combine");
+                rc.dispatch(*ac, {vk::Ref(apart), vk::Ref(attd), vk::Ref(state)}, &asplit, sizeof(asplit), NH);
+            }
             rc.barrier();
             rc.label("dec_o");
             if (!K.gemv(rc, ar, Y.o, vk::Ref(attd), vk::Ref(xd), {}, vk::Ref(state), {}, 1, a, err)) return false;

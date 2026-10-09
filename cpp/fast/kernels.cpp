@@ -182,15 +182,27 @@ bool Kernels::init(vk::Context& ctx, std::string& err) {
         gemv_tgt_wgs = ~0u;   // no adaptive growth
         gemv_min_wgs = 0;     // and no shrink-to-256-workgroups floor: rows=16
                               // measured best at N=2048 with just 128 WGs
+    } else if (ctx.info().vendor_id == 0x1002 && !tune_forced) {
+        // AMD (measured on a RADV RENOIR iGPU, MOSS q4e8 decode): cap rows at
+        // 16 with no growth — the grow-to-384-WGs rule took the big-N GEMVs
+        // (gateup, lm_head) to 32, and 16 measured 6.6 % faster in decode.
+        // Small N shrinks deeper instead (min 512 WGs, down to 4-row
+        // workgroups: o/down 4, qkv 8); pinning them to 16 cost 4.4 pt.
+        // STARLING_FAST_TUNE=1 runs the tuner instead; STARLING_FAST_GEMV_ROWS
+        // replaces the cap (the shrink still applies).
+        gemv_rows_max = 16;
+        gemv_tgt_wgs = ~0u;
+        gemv_min_wgs = 512;
     } else if (!autotune(err)) {
         return false;
     }
     // W4 GEMV nibble unpack through unpackUnorm4x8 (~5 ALU ops per 8
     // weights instead of ~16). Decode GEMVs on PowerVR are issue-bound, not
     // bandwidth-bound (W4 and W8 both run at ~33 G weights/s): MOSS decode
-    // -12.7 % on the Pixel 10 Pro. Slower on RADV (38 -> 31 GB/s isolated),
-    // so PowerVR only; STARLING_FAST_W4U=0/1 overrides.
-    w4_unpack_ = ctx.info().vendor_id == 0x1010;
+    // -12.7 % on the Pixel 10 Pro. On RADV an isolated micro measured it
+    // slower (38 -> 31 GB/s), but in context MOSS decode gained 1.8 pt on
+    // top of the rows pin above. STARLING_FAST_W4U=0/1 overrides.
+    w4_unpack_ = ctx.info().vendor_id == 0x1010 || ctx.info().vendor_id == 0x1002;
     if (const char* e = std::getenv("STARLING_FAST_W4U")) w4_unpack_ = e[0] == '1';
     // Diagnostics: STARLING_FAST_MICRO runs one isolated kernel probe.
     if (const char* mi = std::getenv("STARLING_FAST_MICRO"))
@@ -308,6 +320,11 @@ uint32_t Kernels::gemv_rows(uint32_t N) {
     // ~384 workgroups for occupancy and cap at 32 (48+ costs registers).
     while (rows < 32 && N / (rows * 2) >= gemv_tgt_wgs) rows *= 2;
     while (rows > 8 && N / rows < gemv_min_wgs) rows -= 8;
+    // Deep shrink (min_wgs > 256, AMD): 4-row workgroups for small N give
+    // shorter serial row chains and more workgroups in flight; x re-reads
+    // stay in cache. Per-row math is unchanged.
+    if (gemv_min_wgs > 256)
+        while (rows > 4 && N / rows < gemv_min_wgs) rows -= 4;
     return rows;
 }
 

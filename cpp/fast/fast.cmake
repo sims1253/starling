@@ -79,6 +79,8 @@ set(STARLING_FAST_SHADERS
   "gemv_w8|gemv.comp|W_W8|7"
   "gemv_f16|gemv.comp|W_F16|7"
   "attn_decode|attn_decode.comp||8"
+  "attn_decode_split|attn_decode_split.comp||8"
+  "attn_split_combine|attn_split_combine.comp||3"
   "rope_kv|rope_kv.comp||7"
   "embed_rows|embed_rows.comp|W_W4|10"
   "embed_rows_w8|embed_rows.comp|W_W8|10"

@@ -1,0 +1,33 @@
+#version 450
+// attn_split_combine.comp — merge the per-chunk attention partials written by
+// attn_decode_split for one query head: global max, rescaled exp-sum and
+// value mix. One workgroup of D threads per head.
+
+#include "common.glsl"
+
+layout(constant_id = 0) const uint D = 128;      // head dim == workgroup size
+layout(local_size_x_id = 0) in;
+
+layout(std430, binding = 0) readonly buffer PA { float pa[]; };   // [H][S][2+D]
+layout(std430, binding = 1) buffer O { float o[]; };
+layout(std430, binding = 2) readonly buffer ST { uint state[]; };
+
+layout(push_constant) uniform PC {
+    uint S;
+} p;
+
+void main() {
+    if (state[2] != 0u) return;
+    const uint d = gl_LocalInvocationID.x;
+    const uint h = gl_WorkGroupID.x;
+    float m = -3.0e38;
+    for (uint c = 0; c < p.S; ++c) m = max(m, pa[(h * p.S + c) * (2u + D)]);
+    float l = 0.0, acc = 0.0;
+    for (uint c = 0; c < p.S; ++c) {
+        const uint b = (h * p.S + c) * (2u + D);
+        const float f = exp(pa[b] - m);   // 1.0 exactly for the max chunk
+        l += pa[b + 1u] * f;
+        acc += pa[b + 2u + d] * f;
+    }
+    o[h * D + d] = acc * (1.0 / l);
+}
