@@ -2,17 +2,13 @@
 // attn_decode_split.comp — flash-decode variant of attn_decode: the cached
 // key/value range is split into S chunks; one workgroup per (query head,
 // chunk) computes the chunk's scores, its local softmax (max, exp-sum) and a
-// partial value mix. attn_split_combine.comp merges the S partials into the
-// head output. Why: attn_decode runs one 128-thread workgroup per query head
-// (16 WGs on MOSS) — far too little parallelism to hide cache-load latency on
-// an iGPU; the split multiplies the in-flight workgroups by S and cuts each
-// serial accumulation chain by S.
+// partial value mix, and attn_split_combine.comp merges the S partials. The
+// single-pass kernel's one workgroup per head is too little parallelism to
+// hide cache-load latency on an iGPU.
 //
-// Numerics contract (issue #350): per-position score dots, the new-key path
-// and the global max are bit-identical to attn_decode; the exp/sum/value
-// accumulation is chunk-partitioned and rescaled, a ulp-level difference —
-// gated by the exact-transcript contract and the FLEURS WER gate.
-// STARLING_FAST_ATTN_SPLIT selects this kernel (see moss_engine.cpp).
+// Numerics: per-position score dots and the new-key path match attn_decode
+// bit for bit; the exp/sum/value accumulation is chunk-partitioned and
+// rescaled, a ulp-level difference.
 
 #include "common.glsl"
 

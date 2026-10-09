@@ -101,7 +101,7 @@ struct MossEngine::Impl {
     vk::Buffer mel_in, cv1, cv2, cv3, ex, eh, eq, ek, ev, esc, ep, ectx, effh, eproj, eproj2, adh;
     vk::Buffer lx, lhn, lqkv, lqr, lsc, lp, lctx, lmlp;
     vk::Buffer apart;   // attention split partials [NH][S][2+HDIM]
-    static constexpr uint32_t kAttnSplitMax = 8;   // largest STARLING_FAST_ATTN_SPLIT
+    static constexpr uint32_t kAttnSplitMax = 8;
     int cap_C = 0, cap_A = 0, cap_S = 0;
     uint32_t n_part = 0;
 
@@ -762,33 +762,27 @@ bool MossEngine::Impl::record_decode(uint32_t steps, std::string& err) {
     rc.begin();
     const float leps = cfg.llm.rms_norm_eps;
     const float lscale = 1.0f / std::sqrt((float)HDIM);
-    // Decode attention: flash-decode KV split (S chunks per head). The
-    // single-pass kernel runs one 128-thread WG per query head — 16 WGs on
-    // MOSS — far too little parallelism to hide cache-load latency on an
-    // iGPU; the split multiplies in-flight WGs by S and cuts every serial
-    // accumulation chain by S. exp/sum/value accumulation is chunk-
-    // partitioned (ulp-level numerics difference; transcript + FLEURS WER
-    // gated — measured under issue #350). STARLING_FAST_ATTN_SPLIT=S picks
-    // the chunk count (2..kAttnSplitMax); =0 restores the single pass.
-    // Default on: only for vendors where the split is measured and gated
-    // (AMD/RADV — issue #350: transcripts + FLEURS on RENOIR, wins across
-    // three workloads and two quantization draws). Other vendors (PowerVR
-    // included — the Pixel's MOSS path) keep the single-pass attn_decode
-    // that the phone campaign's numbers and gates were measured on, until a
-    // Pixel session runs its own gates; STARLING_FAST_ATTN_SPLIT=S opts any
-    // device in, =0 forces the legacy kernel everywhere.
-    uint32_t asplit = ctx->info().vendor_id == 0x1002 ? 4 : 0;
-    if (const char* as = std::getenv("STARLING_FAST_ATTN_SPLIT"))
-        asplit = (uint32_t)std::max(0, std::atoi(as));
-    asplit = std::min(asplit, kAttnSplitMax);
-    const vk::Pipeline* ap = nullptr;
-    const vk::Pipeline* ac = nullptr;
-    if (asplit) {
-        ap = ctx->pipeline("attn_decode_split", {HDIM, MAXPOS, ceil_div(MAXPOS, asplit)}, err);
-        ac = ctx->pipeline("attn_split_combine", {HDIM}, err);
-    } else {
-        ap = ctx->pipeline("attn_decode", {HDIM, MAXPOS}, err);
-    }
+    // Decode attention as a flash-decode KV split: S chunks per query head,
+    // then a combine. The single-pass kernel runs one workgroup per head (16
+    // on MOSS), too few to hide cache-load latency on an iGPU. The chunked
+    // exp/sum/value accumulation differs from the single pass at ulp level,
+    // so the split is on by default only where it was measured and gated
+    // (AMD/RADV); other vendors, including the Pixel's PowerVR, keep the
+    // single pass. STARLING_FAST_ATTN_SPLIT=S overrides: 0 = single pass,
+    // 1..kAttnSplitMax = chunk count.
+    static const int split_env = [] {
+        const char* e = std::getenv("STARLING_FAST_ATTN_SPLIT");
+        if (!e) return -1;
+        char* end = nullptr;
+        const unsigned long v = std::strtoul(e, &end, 10);
+        if (end != e && *end == '\0' && v <= kAttnSplitMax) return (int)v;
+        std::fprintf(stderr, "[fast-moss] ignoring STARLING_FAST_ATTN_SPLIT='%s' (want 0..%u)\n", e, kAttnSplitMax);
+        return -1;
+    }();
+    const uint32_t asplit = split_env >= 0 ? (uint32_t)split_env : ctx->info().vendor_id == 0x1002 ? 4 : 0;
+    const vk::Pipeline* ap = asplit ? ctx->pipeline("attn_decode_split", {HDIM, MAXPOS, ceil_div(MAXPOS, asplit)}, err)
+                                    : ctx->pipeline("attn_decode", {HDIM, MAXPOS}, err);
+    const vk::Pipeline* ac = asplit ? ctx->pipeline("attn_split_combine", {HDIM}, err) : nullptr;
     if (!ap || (asplit && !ac)) return false;
     for (uint32_t s = 0; s < steps; ++s) {
         // No split() per token: the decode recording is one command buffer
@@ -809,22 +803,16 @@ bool MossEngine::Impl::record_decode(uint32_t steps, std::string& err) {
                 return false;
             rc.barrier();
             rc.label("dec_attn");
+            // attn_decode ignores the trailing S (push constants are one fixed block).
+            struct { uint32_t H, KVH, cache_off; float eps, scale; uint32_t S; } pa{
+                NH, NKV, l * NKV * MAXPOS * HDIM, leps, lscale, asplit};
+            rc.dispatch(*ap, {vk::Ref(qkvd), vk::Ref(kcache), vk::Ref(vcache), vk::Ref(asplit ? apart : attd),
+                              R(Y.q_norm), R(Y.k_norm), R(rope_tab), vk::Ref(state)},
+                        &pa, sizeof(pa), NH, std::max(asplit, 1u));
             if (asplit) {
-                struct { uint32_t H, KVH, cache_off; float eps, scale; uint32_t S; } pa{
-                    NH, NKV, l * NKV * MAXPOS * HDIM, leps, lscale, asplit};
-                rc.dispatch(*ap, {vk::Ref(qkvd), vk::Ref(kcache), vk::Ref(vcache), vk::Ref(apart),
-                                  R(Y.q_norm), R(Y.k_norm), R(rope_tab), vk::Ref(state)},
-                            &pa, sizeof(pa), NH, asplit);
                 rc.barrier();
                 rc.label("dec_attn_combine");
-                struct { uint32_t S; } ca{asplit};
-                rc.dispatch(*ac, {vk::Ref(apart), vk::Ref(attd), vk::Ref(state)},
-                            &ca, sizeof(ca), NH);
-            } else {
-                struct { uint32_t H, KVH, cache_off; float eps, scale; } pa{NH, NKV, l * NKV * MAXPOS * HDIM, leps, lscale};
-                rc.dispatch(*ap, {vk::Ref(qkvd), vk::Ref(kcache), vk::Ref(vcache), vk::Ref(attd), R(Y.q_norm),
-                                  R(Y.k_norm), R(rope_tab), vk::Ref(state)},
-                            &pa, sizeof(pa), NH);
+                rc.dispatch(*ac, {vk::Ref(apart), vk::Ref(attd), vk::Ref(state)}, &asplit, sizeof(asplit), NH);
             }
             rc.barrier();
             rc.label("dec_o");

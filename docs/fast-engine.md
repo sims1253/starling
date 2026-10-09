@@ -31,11 +31,12 @@ devices (SwiftShader, llvmpipe) are ignored.
 | --- | --- |
 | `STARLING_FAST_F16=0` | f32 products in the GEMMs (default: packed-f16 products with f32 accumulation per 32-deep slice where the device has `shaderFloat16`) |
 | `STARLING_FAST_CACHE_DIR` | where the Vulkan pipeline cache and autotuning results persist (the Android app sets it to its model directory) |
-| `STARLING_FAST_TUNE=1` | re-run the tile autotuner now (also on PowerVR, which otherwise ships measured defaults) |
-| `STARLING_FAST_W4U=0/1` | W4 decode GEMVs through `unpackUnorm4x8` (default on for PowerVR only) |
+| `STARLING_FAST_TUNE=1` | re-run the tile autotuner now (also on PowerVR and AMD, which otherwise ship measured defaults) |
+| `STARLING_FAST_W4U=0/1` | W4 decode GEMVs through `unpackUnorm4x8` (default on for PowerVR and AMD) |
 | `STARLING_FAST_MICRO=...` | run one isolated kernel probe at load (`bits,N,K[,reps[,rows]]` GEMV, `norm,...`, `alu,...`, `idot,...`; see `Kernels::micro`) |
 | `STARLING_FAST_TILE=BM,BN,TM,TN` / `STARLING_FAST_GEMV_ROWS=n` | override the tuned GEMM tile / GEMV rows |
 | `STARLING_FAST_KSTEP=n` | MOSS decode tokens per submission (default 16) |
+| `STARLING_FAST_ATTN_SPLIT=S` | MOSS decode attention split into `S` KV chunks, 1–8; `0` = single pass (default 4 on AMD, 0 elsewhere) |
 | `STARLING_FAST_DEVICE=n` | Vulkan physical device index |
 | `STARLING_FAST_TIMING=1` / `STARLING_FAST_PROFILE=1` | per-stage wall times / per-kernel GPU times |
 | `STARLING_FAST_VERBOSE=1` | device, weights and tuning choices at load |
@@ -65,7 +66,8 @@ GELU), residual accumulation, GLU / SwiGLU pairs, and Parakeet's two
 positional-bias query projections. A layer's closing LayerNorm is fused with
 the next layer's first. Decode GEMVs fuse the preceding RMSNorm. MOSS decode
 attention fuses q/k RMSNorm, RoPE, the KV-cache append and the attention
-itself into one dispatch per head.
+itself into one dispatch per head (on AMD, one per head and KV chunk plus a
+merge).
 
 **No host round trips.** The Parakeet mel runs on the CPU (bit-identical to
 the reference, 4–6× faster than the ggml CPU frontend). Everything from mel
@@ -92,6 +94,7 @@ stores the choice.
 | `gemm.comp` | tiled GEMM, B = W4/W8/F16/F16ᵀ, f16-packed shared tiles, batched heads/windows, implicit-GEMM 3×3/s2 convs (MOSS), fused epilogues |
 | `gemv.comp` | decode matrix-vector, x kept in registers per K slice, fused RMSNorm, residual / SwiGLU / argmax-partial epilogues |
 | `attn_decode.comp` | fused qk-norm + RoPE + KV append + attention (one query head per workgroup) |
+| `attn_decode_split.comp`, `attn_split_combine.comp` | the same, split over KV chunks (one workgroup per head and chunk), then a per-head merge of the partial softmaxes |
 | `rope_kv.comp` | prefill q/k norm + RoPE + KV-cache write |
 | `softmax.comp` | attention softmax with Parakeet's relative-position skew folded into the read index, causal and key-length masks |
 | `norm.comp` | LayerNorm / RMSNorm, including the fused layer-boundary pair |

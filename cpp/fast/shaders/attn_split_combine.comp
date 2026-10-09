@@ -1,9 +1,7 @@
 #version 450
 // attn_split_combine.comp — merge the per-chunk attention partials written by
 // attn_decode_split for one query head: global max, rescaled exp-sum and
-// value mix. One workgroup of D threads per head (gl_WorkGroupID.x).
-// Numerics note: see attn_decode_split.comp — ulp-level differences from the
-// single-pass attn_decode are gated by the transcript/WER contracts.
+// value mix. One workgroup of D threads per head.
 
 #include "common.glsl"
 
