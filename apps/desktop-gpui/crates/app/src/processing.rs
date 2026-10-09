@@ -1239,9 +1239,8 @@ impl StarlingApp {
             if let Err(err) = written {
                 if !matches!(err, storage::StorageError::NotFound(_)) {
                     this.update(cx, |app, cx| {
-                        app.error = Some(format!(
-                            "Could not record the correction decision: {err}"
-                        ));
+                        app.error =
+                            Some(format!("Could not record the correction decision: {err}"));
                         cx.notify();
                     })
                     .ok();

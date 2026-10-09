@@ -1408,7 +1408,9 @@ impl StoreV2 {
         Ok(events)
     }
 
-    // ---- correction records ------------------------------------------
+    // ------------------------------------------------------------------
+    // Correction records.
+    // ------------------------------------------------------------------
 
     /// Writes or revises the correction record for one take and request
     /// (row id `<captureId>#c:<requestId>`). A revision moves only the
@@ -7203,9 +7205,11 @@ mod tests {
         assert_eq!(stored[0].mode_id.as_deref(), Some("clean-local"));
 
         // A second proposal of the same take is its own row.
-        assert!(store
-            .upsert_correction_record(&correction(&id, &attempt, "req-2"))
-            .expect("upsert"));
+        assert!(
+            store
+                .upsert_correction_record(&correction(&id, &attempt, "req-2"))
+                .expect("upsert")
+        );
         assert_eq!(store.correction_records_for(&id).expect("read").len(), 2);
 
         // Deleting the take removes its correction records (cascade) and
@@ -7225,17 +7229,32 @@ mod tests {
         let mut meta = TakeMeta::for_device("test-device");
         meta.secure_field = true;
         let (secure_id, attempt) = transcribed_take(&mut store, meta);
-        assert!(store.get_capture(&secure_id).expect("get").expect("present").secure_field);
+        assert!(
+            store
+                .get_capture(&secure_id)
+                .expect("get")
+                .expect("present")
+                .secure_field
+        );
 
-        assert!(!store
-            .upsert_correction_record(&correction(&secure_id, &attempt, "req-1"))
-            .expect("excluded, not failed"));
-        assert!(store.correction_records_for(&secure_id).expect("read").is_empty());
+        assert!(
+            !store
+                .upsert_correction_record(&correction(&secure_id, &attempt, "req-1"))
+                .expect("excluded, not failed")
+        );
+        assert!(
+            store
+                .correction_records_for(&secure_id)
+                .expect("read")
+                .is_empty()
+        );
 
         let (normal_id, normal_attempt) = ordinary_take(&mut store);
-        assert!(store
-            .upsert_correction_record(&correction(&normal_id, &normal_attempt, "req-1"))
-            .expect("record"));
+        assert!(
+            store
+                .upsert_correction_record(&correction(&normal_id, &normal_attempt, "req-1"))
+                .expect("record")
+        );
     }
 
     #[test]
@@ -7283,15 +7302,17 @@ mod tests {
         // Opening upgrades: version bumped, column added, pre-upgrade
         // rows read as ordinary takes (secure_field false), and the
         // pre-upgrade attempt is intact.
-        let mut store = StoreV2::open(&root).expect("reopen upgrades");
+        let store = StoreV2::open(&root).expect("reopen upgrades");
         assert_eq!(store.schema_version().expect("version"), SCHEMA_VERSION);
         let capture = store.get_capture(&id).expect("get").expect("present");
         assert!(!capture.secure_field);
         assert_eq!(store.attempts_for(&id).expect("attempts").len(), 1);
         // The upgraded store records corrections normally.
-        assert!(store
-            .upsert_correction_record(&correction(&id, &attempt, "req-1"))
-            .expect("the table exists after the upgrade"));
+        assert!(
+            store
+                .upsert_correction_record(&correction(&id, &attempt, "req-1"))
+                .expect("the table exists after the upgrade")
+        );
         assert_eq!(store.correction_records_for(&id).expect("read").len(), 1);
     }
 

@@ -756,10 +756,7 @@ impl StarlingApp {
         if let Some(take) = self.processing.get_mut(&id) {
             take.processed_head = (!is_raw).then(|| text.clone());
         }
-        if let Some(request_id) = (!is_raw)
-            .then(|| edited_decision_request(draft))
-            .flatten()
-        {
+        if let Some(request_id) = (!is_raw).then(|| edited_decision_request(draft)).flatten() {
             self.record_correction_decision(
                 cx,
                 &id,
@@ -1649,9 +1646,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn reverting_an_accepted_proposal_revises_the_decision_in_place(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    fn reverting_an_accepted_proposal_revises_the_decision_in_place(cx: &mut gpui::TestAppContext) {
         let root = tempfile::tempdir().unwrap();
         let store = crate::store::Store::at_test_root(root.path());
         let app = cx.new(|cx| StarlingApp::for_test(Some(store.clone()), cx));
