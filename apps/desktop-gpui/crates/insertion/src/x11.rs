@@ -38,10 +38,13 @@
 //! non-first group, any lock or latch except the bit the live modifier
 //! mapping binds to `Num_Lock`), and revalidates the target. Each
 //! character's keystroke then runs inside one server grab that first
-//! re-reads the held modifiers and the live mapping of the keys about to
-//! be pressed: a remap between that check and the key-down, or between
-//! key-down and key-up (targets act on releases too), would make
-//! Starling's own key produce another client's keysym, e.g. Return.
+//! re-verifies all of it: the XKB state must still equal the chunk-start
+//! snapshot (no newly held modifier, lock, latch or group), the target
+//! and its ownership must be unchanged, and the keys about to be pressed
+//! must still carry the planned keysyms. A change between that check and
+//! the key-down, or between key-down and key-up (targets act on releases
+//! too), would otherwise make Starling's own key produce something else,
+//! e.g. another client's Return, or text in a newly focused window.
 //!
 //! The keyboard mapping is server-global, so borrowing is transactional:
 //!
@@ -59,6 +62,7 @@
 //! cached connection. Within one insert, checks and keys share one
 //! connection so they see the same server state.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
@@ -86,7 +90,6 @@ const FOCUS_POINTER_ROOT: Window = 1;
 const XK_SHIFT_L: Keysym = 0xffe1;
 const XK_SHIFT_R: Keysym = 0xffe2;
 const XK_NUM_LOCK: Keysym = 0xff7f;
-const SHIFT_MASK: u16 = 1;
 /// `xkbUseCoreKeyboard`.
 const USE_CORE_KEYBOARD: u16 = 0x100;
 const MODIFIER_NAMES: [&str; 8] = [
@@ -156,11 +159,26 @@ impl X11Backend {
         self
     }
 
-    /// Wait out held modifiers, check the keyboard state, then the live
-    /// identity: last, because the modifier wait can take seconds.
-    fn chunk_check(&self, session: &Session, target_ref: &str) -> Result<(), InsertError> {
-        wait_modifiers_released(|| held_modifier_names(session, 0))?;
-        check_keyboard_state(session)?;
+    /// Wait out held modifiers, check the keyboard state, then the target:
+    /// last, because the modifier wait can take seconds. Returns the
+    /// keyboard state every keystroke of the chunk is verified against.
+    fn chunk_check(
+        &self,
+        session: &Session,
+        target_ref: &str,
+    ) -> Result<KeyboardState, InsertError> {
+        wait_modifiers_released(|| {
+            let held = KeyboardState::read(session)?.base_mods;
+            Ok((held != 0).then(|| modifier_names(held)))
+        })?;
+        let state = KeyboardState::read(session)?;
+        state.check_reproducible(session)?;
+        self.check_target(session, target_ref)?;
+        Ok(state)
+    }
+
+    /// The live target is still the captured one and not Starling's.
+    fn check_target(&self, session: &Session, target_ref: &str) -> Result<(), InsertError> {
         match live_target(session, target_ref)? {
             LiveTarget::Same { live_pid, active } => {
                 let class = match live_pid {
@@ -275,7 +293,9 @@ impl InsertionBackend for X11Backend {
             text.chars().count(),
             &segments,
             || self.chunk_check(&session, &target.target_ref),
-            |segment| type_segment(&session, &plans, segment, self.key_hold),
+            |segment, state| {
+                self.type_segment(&session, &plans, &target.target_ref, &state, segment)
+            },
         );
         with_restore_outcome(typed, remap.finish())
     }
@@ -285,6 +305,7 @@ impl InsertionBackend for X11Backend {
 struct Session {
     conn: RustConnection,
     root: Window,
+    atoms: RefCell<HashMap<&'static str, Atom>>,
 }
 
 impl Session {
@@ -301,7 +322,11 @@ impl Session {
         let (conn, screen) = x11rb::connect(None)
             .map_err(|error| unavailable(&format!("cannot reach the X server: {error}")))?;
         let root = conn.setup().roots[screen].root;
-        Ok(Session { conn, root })
+        Ok(Session {
+            conn,
+            root,
+            atoms: RefCell::default(),
+        })
     }
 
     /// A round trip: every request queued so far has been processed.
@@ -319,20 +344,25 @@ impl Session {
             .focus)
     }
 
-    fn atom(&self, name: &str) -> Result<Atom, InsertError> {
-        Ok(self
+    fn atom(&self, name: &'static str) -> Result<Atom, InsertError> {
+        if let Some(&atom) = self.atoms.borrow().get(name) {
+            return Ok(atom);
+        }
+        let atom = self
             .conn
             .intern_atom(false, name.as_bytes())
             .map_err(x11_conn_error)?
             .reply()
             .map_err(reply_error)?
-            .atom)
+            .atom;
+        self.atoms.borrow_mut().insert(name, atom);
+        Ok(atom)
     }
 
     fn property(
         &self,
         window: Window,
-        name: &str,
+        name: &'static str,
     ) -> Result<Option<GetPropertyReply>, InsertError> {
         let reply = self
             .conn
@@ -343,7 +373,7 @@ impl Session {
         Ok((reply.type_ != x11rb::NONE).then_some(reply))
     }
 
-    fn card32(&self, window: Window, name: &str) -> Result<Option<u32>, InsertError> {
+    fn card32(&self, window: Window, name: &'static str) -> Result<Option<u32>, InsertError> {
         Ok(self
             .property(window, name)?
             .filter(|reply| reply.format == 32)
@@ -532,48 +562,79 @@ fn live_target(session: &Session, target_ref: &str) -> Result<LiveTarget, Insert
     })
 }
 
-/// The physically held modifiers (XKB `base_mods`) outside `ignore`.
-fn held_modifier_names(session: &Session, ignore: u16) -> Result<Option<Vec<String>>, InsertError> {
-    let held = u16::from(session.xkb_state()?.base_mods) & !ignore;
-    Ok((held != 0).then(|| {
-        MODIFIER_NAMES
-            .iter()
-            .enumerate()
-            .filter(|(bit, _)| held & (1 << bit) != 0)
-            .map(|(_, name)| name.to_string())
-            .collect()
-    }))
+fn modifier_names(mask: u16) -> Vec<String> {
+    MODIFIER_NAMES
+        .iter()
+        .enumerate()
+        .filter(|(bit, _)| mask & (1 << bit) != 0)
+        .map(|(_, name)| name.to_string())
+        .collect()
 }
 
-/// Refuse states in which columns 0 and 1 are not what a key types: a
-/// non-first group, or any locked or latched modifier except Num_Lock.
-fn check_keyboard_state(session: &Session) -> Result<(), InsertError> {
-    let state = session.xkb_state()?;
-    if u8::from(state.group) != 0
-        || u8::from(state.locked_group) != 0
-        || state.base_group != 0
-        || state.latched_group != 0
-    {
-        return Err(InsertError::KeyboardStateUnsupported {
-            reason: format!(
-                "an alternate keyboard group is active (group {})",
-                u8::from(state.group)
-            ),
-        });
+/// The XKB state of the core keyboard that decides what a key types.
+#[derive(Debug, PartialEq, Eq)]
+struct KeyboardState {
+    /// Physically held modifiers.
+    base_mods: u16,
+    latched_mods: u16,
+    locked_mods: u16,
+    /// Effective, base, latched and locked group.
+    groups: [i32; 4],
+}
+
+impl KeyboardState {
+    fn read(session: &Session) -> Result<KeyboardState, InsertError> {
+        let state = session.xkb_state()?;
+        Ok(KeyboardState {
+            base_mods: state.base_mods.into(),
+            latched_mods: state.latched_mods.into(),
+            locked_mods: state.locked_mods.into(),
+            groups: [
+                u8::from(state.group).into(),
+                state.base_group.into(),
+                state.latched_group.into(),
+                u8::from(state.locked_group).into(),
+            ],
+        })
     }
-    let harmless = session.num_lock_bit()?.unwrap_or(0);
-    for (what, mods) in [
-        ("locked", state.locked_mods),
-        ("latched", state.latched_mods),
-    ] {
-        let mods = u16::from(mods) & !harmless;
-        if mods != 0 {
+
+    /// Refuse states in which columns 0 and 1 are not what a key types: a
+    /// non-first group, or any locked or latched modifier except Num_Lock.
+    fn check_reproducible(&self, session: &Session) -> Result<(), InsertError> {
+        if self.groups != [0; 4] {
             return Err(InsertError::KeyboardStateUnsupported {
-                reason: format!("a modifier other than Num_Lock is {what} (mask {mods:#x})"),
+                reason: format!(
+                    "an alternate keyboard group is active (group {})",
+                    self.groups[0]
+                ),
             });
         }
+        let harmless = session.num_lock_bit()?.unwrap_or(0);
+        for (what, mods) in [("locked", self.locked_mods), ("latched", self.latched_mods)] {
+            let mods = mods & !harmless;
+            if mods != 0 {
+                return Err(InsertError::KeyboardStateUnsupported {
+                    reason: format!("a modifier other than Num_Lock is {what} (mask {mods:#x})"),
+                });
+            }
+        }
+        Ok(())
     }
-    Ok(())
+
+    /// Why `self` (read now) differs from the chunk-start `expected`.
+    fn changed_from(&self, expected: &KeyboardState) -> Option<InsertError> {
+        if self == expected {
+            None
+        } else if self.base_mods & !expected.base_mods != 0 {
+            Some(InsertError::ModifiersHeld {
+                held: modifier_names(self.base_mods & !expected.base_mods),
+            })
+        } else {
+            Some(InsertError::KeyboardStateUnsupported {
+                reason: "a modifier, lock or keyboard group changed while typing".to_string(),
+            })
+        }
+    }
 }
 
 /// The keyboard mapping one insert plans with.
@@ -898,13 +959,13 @@ struct PressedKeys<'a> {
 }
 
 impl PressedKeys<'_> {
-    fn press(&mut self, keycode: Keycode) -> Result<(), InsertError> {
+    fn press(&mut self, keycode: Keycode) -> Result<(), ReplyError> {
         // Recorded first: a failed send may still have reached the server.
         self.keys.push(keycode);
         fake_key(self.session, keycode, KEY_PRESS)
     }
 
-    fn release(&mut self, keycode: Keycode) -> Result<(), InsertError> {
+    fn release(&mut self, keycode: Keycode) -> Result<(), ReplyError> {
         self.keys.retain(|&pressed| pressed != keycode);
         fake_key(self.session, keycode, KEY_RELEASE)
     }
@@ -914,7 +975,7 @@ impl Drop for PressedKeys<'_> {
     fn drop(&mut self) {
         while let Some(keycode) = self.keys.pop() {
             if let Err(error) = fake_key(self.session, keycode, KEY_RELEASE) {
-                log::warn!("starling-insertion: releasing keycode {keycode} failed: {error}");
+                log::warn!("starling-insertion: releasing keycode {keycode} failed: {error:?}");
             }
         }
     }
@@ -927,77 +988,90 @@ enum CharFailure {
     AfterKeydown(InsertError),
 }
 
-fn type_segment(
-    session: &Session,
-    plans: &HashMap<char, CharPlan>,
-    segment: &str,
-    key_hold: Duration,
-) -> Result<(), ChunkFailure> {
-    for (typed, character) in segment.chars().enumerate() {
-        type_character(session, character, &plans[&character], key_hold).map_err(|failure| {
-            match failure {
-                CharFailure::BeforeKeydown(cause) => ChunkFailure {
-                    delivered: typed,
-                    cause,
-                },
-                CharFailure::AfterKeydown(cause) => ChunkFailure {
-                    delivered: typed + 1,
-                    cause,
-                },
-            }
-        })?;
+impl X11Backend {
+    fn type_segment(
+        &self,
+        session: &Session,
+        plans: &HashMap<char, CharPlan>,
+        target_ref: &str,
+        state: &KeyboardState,
+        segment: &str,
+    ) -> Result<(), ChunkFailure> {
+        for (typed, character) in segment.chars().enumerate() {
+            self.type_character(session, &plans[&character], target_ref, state, character)
+                .map_err(|failure| match failure {
+                    CharFailure::BeforeKeydown(cause) => ChunkFailure {
+                        delivered: typed,
+                        cause,
+                    },
+                    CharFailure::AfterKeydown(cause) => ChunkFailure {
+                        delivered: typed + 1,
+                        cause,
+                    },
+                })?;
+        }
+        Ok(())
     }
-    Ok(())
-}
 
-/// Verify and type one character inside one server grab spanning the
-/// whole keystroke (see the module docs).
-fn type_character(
-    session: &Session,
-    character: char,
-    plan: &CharPlan,
-    key_hold: Duration,
-) -> Result<(), CharFailure> {
-    let (keycode, shift) = match plan {
-        CharPlan::Mapped { keycode, shift } => (*keycode, *shift),
-        CharPlan::Borrowed { keycode, .. } => (*keycode, None),
-    };
-    {
-        let _grab = ServerGrab::new(session).map_err(CharFailure::BeforeKeydown)?;
-        // Declared after the grab, so its drop releases keys while grabbed.
-        let mut pressed = PressedKeys {
-            session,
-            keys: Vec::new(),
+    /// Verify and type one character inside one server grab spanning the
+    /// whole keystroke (see the module docs).
+    fn type_character(
+        &self,
+        session: &Session,
+        plan: &CharPlan,
+        target_ref: &str,
+        state: &KeyboardState,
+        character: char,
+    ) -> Result<(), CharFailure> {
+        use CharFailure::{AfterKeydown, BeforeKeydown};
+        let (keycode, shift) = match plan {
+            CharPlan::Mapped { keycode, shift } => (*keycode, *shift),
+            CharPlan::Borrowed { keycode, .. } => (*keycode, None),
         };
-        verify_before_press(session, character, plan).map_err(CharFailure::BeforeKeydown)?;
-        if let Some(shift) = shift {
-            pressed.press(shift).map_err(CharFailure::BeforeKeydown)?;
+        {
+            let _grab = ServerGrab::new(session).map_err(BeforeKeydown)?;
+            // Declared after the grab, so its drop releases keys while grabbed.
+            let mut pressed = PressedKeys {
+                session,
+                keys: Vec::new(),
+            };
+            if let Some(changed) = KeyboardState::read(session)
+                .map_err(BeforeKeydown)?
+                .changed_from(state)
+            {
+                return Err(BeforeKeydown(changed));
+            }
+            self.check_target(session, target_ref)
+                .map_err(BeforeKeydown)?;
+            verify_mapping(session, character, plan).map_err(BeforeKeydown)?;
+            if let Some(shift) = shift {
+                pressed
+                    .press(shift)
+                    .map_err(|e| BeforeKeydown(reply_error(e)))?;
+            }
+            // A refused key-down did not happen; a transport failure may
+            // have delivered it.
+            pressed.press(keycode).map_err(|error| match error {
+                ReplyError::X11Error(_) => BeforeKeydown(reply_error(error)),
+                ReplyError::ConnectionError(_) => AfterKeydown(reply_error(error)),
+            })?;
+            std::thread::sleep(self.key_hold);
+            pressed
+                .release(keycode)
+                .map_err(|e| AfterKeydown(reply_error(e)))?;
+            if let Some(shift) = shift {
+                pressed
+                    .release(shift)
+                    .map_err(|e| AfterKeydown(reply_error(e)))?;
+            }
         }
-        pressed.press(keycode).map_err(CharFailure::AfterKeydown)?;
-        std::thread::sleep(key_hold);
-        pressed
-            .release(keycode)
-            .map_err(CharFailure::AfterKeydown)?;
-        if let Some(shift) = shift {
-            pressed.release(shift).map_err(CharFailure::AfterKeydown)?;
-        }
+        std::thread::sleep(KEY_GAP);
+        Ok(())
     }
-    std::thread::sleep(KEY_GAP);
-    Ok(())
 }
 
-/// Inside the keystroke grab: stop if a command modifier went down since
-/// the chunk check (Shift only changes case, and is Starling's own key
-/// here), or if the keys about to be pressed no longer carry what the
-/// plan expects.
-fn verify_before_press(
-    session: &Session,
-    character: char,
-    plan: &CharPlan,
-) -> Result<(), InsertError> {
-    if let Some(held) = held_modifier_names(session, SHIFT_MASK)? {
-        return Err(InsertError::ModifiersHeld { held });
-    }
+/// The keys about to be pressed still carry what the plan expects.
+fn verify_mapping(session: &Session, character: char, plan: &CharPlan) -> Result<(), InsertError> {
     match plan {
         CharPlan::Borrowed { keycode, echoed } => {
             let live = session.keycode_syms(*keycode)?;
@@ -1045,14 +1119,14 @@ fn keysym_for_char(character: char) -> Keysym {
     }
 }
 
-/// One XTest key event on the core keyboard.
-fn fake_key(session: &Session, keycode: Keycode, event_type: u8) -> Result<(), InsertError> {
+/// One XTest key event on the core keyboard, checked: a refusal is an
+/// error, not an unread event.
+fn fake_key(session: &Session, keycode: Keycode, event_type: u8) -> Result<(), ReplyError> {
     use xtest::ConnectionExt as _;
     session
         .conn
-        .xtest_fake_input(event_type, keycode, 0, x11rb::NONE, 0, 0, 0)
-        .map_err(x11_conn_error)?;
-    session.conn.flush().map_err(x11_conn_error)
+        .xtest_fake_input(event_type, keycode, 0, x11rb::NONE, 0, 0, 0)?
+        .check()
 }
 
 fn unavailable(reason: &str) -> InsertError {

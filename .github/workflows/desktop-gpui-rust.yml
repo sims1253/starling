@@ -87,6 +87,10 @@ jobs:
       - name: Test the storage-v2 lease
         working-directory: apps/desktop-gpui
         run: cargo test -p starling-dictation --lib store_v2
+      # The insertion crate's Windows backend is cfg(windows) only.
+      - name: Check the insertion crate
+        working-directory: apps/desktop-gpui
+        run: cargo check -p starling-insertion --all-targets
 
   # Packaged desktop lanes: the universal macOS bundle (DMG) and the portable
   # Windows archive. Unsigned — artifacts are development builds for testing,

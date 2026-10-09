@@ -502,17 +502,18 @@ pub(crate) struct ChunkFailure {
 }
 
 /// The chunk loop of every platform backend: `check` before each
-/// segment, then `type_segment`, stopping at the first failure.
-pub(crate) fn deliver_in_chunks(
+/// segment, then `type_segment` with what the check found, stopping at the
+/// first failure.
+pub(crate) fn deliver_in_chunks<C>(
     total_chars: usize,
     segments: &[&str],
-    mut check: impl FnMut() -> Result<(), InsertError>,
-    mut type_segment: impl FnMut(&str) -> Result<(), ChunkFailure>,
+    mut check: impl FnMut() -> Result<C, InsertError>,
+    mut type_segment: impl FnMut(&str, C) -> Result<(), ChunkFailure>,
 ) -> Result<InsertReceipt, InsertError> {
     let mut delivered = 0;
     for segment in segments {
-        check().map_err(|cause| partialize(delivered, total_chars, cause))?;
-        type_segment(segment).map_err(|failure| {
+        let checked = check().map_err(|cause| partialize(delivered, total_chars, cause))?;
+        type_segment(segment, checked).map_err(|failure| {
             partialize(delivered + failure.delivered, total_chars, failure.cause)
         })?;
         delivered += segment.chars().count();
@@ -701,7 +702,7 @@ mod tests {
                 checks += 1;
                 Ok(())
             },
-            |segment| {
+            |segment, ()| {
                 typed.push_str(segment);
                 Ok(())
             },
@@ -722,7 +723,12 @@ mod tests {
         };
 
         // A failing first check: nothing typed, the cause comes back bare.
-        let error = deliver_in_chunks(20, &segments, || Err(InsertError::TargetGone), |_| Ok(()));
+        let error = deliver_in_chunks(
+            20,
+            &segments,
+            || Err(InsertError::TargetGone),
+            |_, ()| Ok(()),
+        );
         assert_eq!(error, Err(InsertError::TargetGone));
 
         // A failing second check after 16 characters.
@@ -738,7 +744,7 @@ mod tests {
                     Err(InsertError::TargetGone)
                 }
             },
-            |_| Ok(()),
+            |_, ()| Ok(()),
         );
         assert_eq!(error, Err(partial(16)));
 
@@ -747,7 +753,7 @@ mod tests {
             20,
             &segments,
             || Ok(()),
-            |segment| {
+            |segment, ()| {
                 if segment.starts_with('0') {
                     Ok(())
                 } else {
@@ -765,7 +771,7 @@ mod tests {
             20,
             &segments,
             || Ok(()),
-            |_| {
+            |_, ()| {
                 Err(ChunkFailure {
                     delivered: 1,
                     cause: InsertError::TargetGone,

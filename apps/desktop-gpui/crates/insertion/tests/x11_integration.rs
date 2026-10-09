@@ -19,9 +19,11 @@
 //!    after one delivered character) stops typing before its key-down;
 //!    4c. a remap of the pressed key during its hold is held back by the
 //!    keystroke grab, where the server honors grabs; 4d. a Shift key
-//!    remapped to `[Return, Shift_L]` is never pressed;
-//! 5. two concurrent inserts land whole and in order; a focus steal
-//!    mid-insert stops on a chunk boundary;
+//!    remapped to `[Return, Shift_L]` is never pressed; 4e. a Shift held
+//!    or Caps Lock tapped mid-chunk stops typing at the next character;
+//! 5. two concurrent inserts land whole and in order; a focus steal to a
+//!    window of an excluded process mid-chunk stops at the next character,
+//!    and that window receives no key;
 //! 6. a changed target refuses and a destroyed one reports `Gone`;
 //! 7. a newline is refused before any key moves.
 //!
@@ -42,8 +44,9 @@ use x11rb::protocol::xproto::{
 };
 use x11rb::protocol::Event;
 use x11rb::rust_connection::RustConnection;
+use x11rb::wrapper::ConnectionExt as _;
 
-use starling_insertion::x11::{X11Backend, X11_CHUNK_CHARS};
+use starling_insertion::x11::X11Backend;
 use starling_insertion::{
     BackendKind, InsertError, InsertReceipt, Inserter, InsertionBackend, TargetCheck,
     TargetSnapshot, EVIDENCE_SYNTHETIC_KEYS, MODIFIER_RELEASE_WAIT,
@@ -353,6 +356,54 @@ fn main_test() -> ItResult<()> {
     set_keysyms(&conn, borrowed, &vec![0; kb.width])?;
     kb.assert_mapping_is(&conn, &mapping_before)?;
 
+    // 4e. The user holds Shift, or taps Caps Lock, after the first
+    // character: typing stops before the next one, so no character comes
+    // out in the wrong case.
+    let caps = kb
+        .keycode_of(XK_CAPS_LOCK)
+        .ok_or("this keyboard has no Caps Lock")?;
+    let lower = "abcdefghijkl";
+    for (key, tap) in [(shift_keycode, false), (caps, true)] {
+        let handle = spawn_insert(X11Backend::new(), &snap_a, lower);
+        let mut fired = false;
+        let (results, seen) = listen(&conn, a, &mut kb, vec![handle], |seen| {
+            if !fired && !text_of(seen).is_empty() {
+                fired = true;
+                xtest_key(&conn, key, true)?;
+                if tap {
+                    xtest_key(&conn, key, false)?;
+                }
+            }
+            Ok(())
+        })?;
+        if tap {
+            normalize_keyboard_state(&conn, &kb)?;
+        } else {
+            xtest_key(&conn, key, false)?;
+        }
+        drain_text(&conn, a, &mut kb)?;
+        match results[0].clone() {
+            Err(InsertError::PartialDelivery {
+                delivered_chars,
+                cause,
+                ..
+            }) => {
+                assert!(delivered_chars < lower.len());
+                assert_eq!(text_of(&seen), lower[..delivered_chars]);
+                match *cause {
+                    InsertError::ModifiersHeld { held } if !tap => {
+                        assert_eq!(held, ["Shift"])
+                    }
+                    InsertError::ModifiersHeld { .. }
+                    | InsertError::KeyboardStateUnsupported { .. }
+                        if tap => {}
+                    other => panic!("unexpected stop cause: {other:?}"),
+                }
+            }
+            other => panic!("a mid-chunk keyboard change must stop typing: {other:?}"),
+        }
+    }
+
     // 5. Two concurrent inserts are serialized.
     let handles = (0..2)
         .map(|_| spawn_insert(X11Backend::new(), &snap_a, &mixed))
@@ -364,13 +415,31 @@ fn main_test() -> ItResult<()> {
     assert_eq!(text_of(&seen), format!("{mixed}{mixed}"));
     kb.assert_mapping_is(&conn, &mapping_before)?;
 
-    // 5. A second window B takes the focus at the first decoded character.
-    // The running chunk finishes typing (there is no mid-chunk identity
-    // check), so A sees a prefix of at most the reported count.
-    let b = make_window(&conn, root, &atoms, "second", false)?;
+    // 5. A window B of an excluded process (on its own connection, like
+    // another client) takes the focus after the first character: typing
+    // stops before the next key, so A holds exactly the delivered prefix
+    // and B receives nothing.
+    let (conn_b, _) = x11rb::connect(None).map_err(err)?;
+    let b = make_window(&conn_b, root, &atoms, "second", false)?;
     cleanup.windows.push(b);
+    let excluded_pid = 4_000_001;
+    conn_b
+        .change_property32(
+            PropMode::REPLACE,
+            b,
+            atoms.net_wm_pid,
+            atoms.cardinal,
+            &[excluded_pid],
+        )
+        .map_err(err)?
+        .check()
+        .map_err(err)?;
     let long = format!("{mixed} ").repeat(8);
-    let handle = spawn_insert(X11Backend::new(), &snap_a, &long);
+    let handle = spawn_insert(
+        X11Backend::with_excluded_pids(vec![excluded_pid]),
+        &snap_a,
+        &long,
+    );
     let mut stolen = false;
     let (results, seen) = listen(&conn, a, &mut kb, vec![handle], |seen| {
         if !stolen && !text_of(seen).is_empty() {
@@ -384,28 +453,32 @@ fn main_test() -> ItResult<()> {
         }
         Ok(())
     })?;
-    let typed = text_of(&seen);
     match results[0].clone() {
         Err(InsertError::PartialDelivery {
             delivered_chars,
             total_chars,
             cause,
         }) => {
-            assert_eq!(total_chars, long.chars().count());
             assert!(0 < delivered_chars && delivered_chars < total_chars);
-            assert_eq!(
-                delivered_chars % X11_CHUNK_CHARS,
-                0,
-                "stops on a chunk boundary"
-            );
             assert!(
                 matches!(*cause, InsertError::TargetChanged { .. }),
                 "{cause:?}"
             );
-            assert!(!typed.is_empty() && typed.chars().count() <= delivered_chars);
-            assert!(long.starts_with(&typed), "A received a prefix: {typed:?}");
+            let prefix: String = long.chars().take(delivered_chars).collect();
+            assert_eq!(
+                text_of(&seen),
+                prefix,
+                "A holds exactly the delivered prefix"
+            );
         }
         other => panic!("a focus steal must stop the insert part-way: {other:?}"),
+    }
+    std::thread::sleep(DRAIN_GRACE);
+    while let Some(event) = conn_b.poll_for_event().map_err(err)? {
+        assert!(
+            !matches!(event, Event::KeyPress(_) | Event::KeyRelease(_)),
+            "the excluded window received a key: {event:?}"
+        );
     }
     kb.assert_mapping_is(&conn, &mapping_before)?;
 
@@ -689,6 +762,8 @@ struct Atoms {
     utf8_string: Atom,
     net_wm_name: Atom,
     net_active_window: Atom,
+    net_wm_pid: Atom,
+    cardinal: Atom,
 }
 
 impl Atoms {
@@ -711,6 +786,8 @@ impl Atoms {
             utf8_string: one("UTF8_STRING")?,
             net_wm_name: one("_NET_WM_NAME")?,
             net_active_window: one("_NET_ACTIVE_WINDOW")?,
+            net_wm_pid: one("_NET_WM_PID")?,
+            cardinal: one("CARDINAL")?,
         })
     }
 }

@@ -37,7 +37,10 @@ fn windows_end_to_end_edit_control_round_trip() {
     }
     for key in [VK_SHIFT, VK_CONTROL, VK_MENU, VK_LWIN, VK_RWIN] {
         let held = unsafe { GetAsyncKeyState(i32::from(key)) } as u16 & 0x8000 != 0;
-        assert!(!held, "release virtual key {key:#x} before running this test");
+        assert!(
+            !held,
+            "release virtual key {key:#x} before running this test"
+        );
     }
 
     let class: Vec<u16> = "EDIT\0".encode_utf16().collect();

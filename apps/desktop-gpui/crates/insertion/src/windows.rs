@@ -9,9 +9,10 @@
 //! of the keyboard layout. Text goes out in chunks of at most
 //! [`WIN_CHUNK_UTF16_UNITS`] units (a surrogate pair is never split), each
 //! preceded by the held-modifier wait (`GetAsyncKeyState`) and the
-//! identity check. `SendInput` cannot bind input to a window, so focus
-//! that moves between that check and the send is not caught; chunking
-//! bounds what such a move can misdirect.
+//! identity check, and the foreground window is compared once more right
+//! before the send. `SendInput` cannot bind input to a window, so a switch
+//! inside that last gap is not caught; chunking bounds what it can
+//! misdirect.
 //!
 //! Starling never calls `SetForegroundWindow`, and has no surrounding
 //! text here (that needs UI Automation).
@@ -141,6 +142,11 @@ impl InsertionBackend for WindowsBackend {
 
     fn insert(&self, target: &TargetSnapshot, text: &str) -> Result<InsertReceipt, InsertError> {
         insertion_guards(text, target.pid, &self.excluded_pids)?;
+        let Some((_, active, _, _)) = parse_ref(&target.target_ref) else {
+            return Err(InsertError::Rejected {
+                reason: format!("malformed target ref: {}", target.target_ref),
+            });
+        };
         let segments = weighed_segments(text, WIN_CHUNK_UTF16_UNITS, char::len_utf16);
         // Built before the first check, so only the send follows it.
         let mut chunks = segments
@@ -157,8 +163,17 @@ impl InsertionBackend for WindowsBackend {
             text.chars().count(),
             &segments,
             || self.chunk_check(&target.target_ref),
-            |segment| {
+            |segment, ()| {
                 let events = chunks.next().expect("one chunk per segment");
+                if foreground_id() != active {
+                    return Err(ChunkFailure {
+                        delivered: 0,
+                        cause: InsertError::TargetChanged {
+                            expected: target.target_ref.clone(),
+                            actual: format!("win:{:x}", foreground_id()),
+                        },
+                    });
+                }
                 let sent = unsafe {
                     SendInput(
                         events.len() as u32,
@@ -190,6 +205,10 @@ fn hwnd_id(hwnd: HWND) -> u32 {
     hwnd as usize as u32
 }
 
+fn foreground_id() -> u32 {
+    hwnd_id(unsafe { GetForegroundWindow() })
+}
+
 fn hwnd_from(id: u32) -> HWND {
     id as i32 as isize as HWND
 }
@@ -217,7 +236,8 @@ fn focus_pair() -> Option<(HWND, HWND, u32)> {
     if unsafe { GetGUIThreadInfo(thread_id, &mut info) } == 0 || info.hwndFocus.is_null() {
         return None;
     }
-    Some((active, info.hwndFocus, pid))
+    // The focus read belongs to `active` only if it is still foreground.
+    (unsafe { GetForegroundWindow() } == active).then_some((active, info.hwndFocus, pid))
 }
 
 fn live_target(target_ref: &str) -> Result<LiveTarget, InsertError> {
