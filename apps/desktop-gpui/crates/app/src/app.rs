@@ -24,8 +24,8 @@ use starling_dictation::{
     player::Player,
     recorder::RecorderHandle,
     settings::{
-        ActivationMode, DictationSettings, EngineMode, EngineSettings, ProcessingSettings,
-        Settings, DEFAULT_SHORTCUT,
+        ActivationMode, DictationSettings, EngineMode, EngineSettings, MicrophoneSettings,
+        ProcessingSettings, Settings, DEFAULT_SHORTCUT,
     },
     storage::{DamagedRecord, ListedRecord, SessionSummary},
 };
@@ -367,6 +367,12 @@ pub struct StarlingApp {
     /// manager and never lives here.
     pub(crate) draft_engine_mode: EngineMode,
     pub(crate) draft_backend_override: Option<String>,
+    /// The committed microphone choice, and the dialog's draft of it
+    /// (the microphone check runs on the draft, so a choice can be tried
+    /// before it is saved).
+    pub(crate) microphone_settings: MicrophoneSettings,
+    pub(crate) draft_microphone: Option<String>,
+    pub(crate) mic: crate::mic::MicState,
     /// Keeps the quit hook (engine shutdown) registered for the entity's
     /// lifetime — a dropped `Subscription` unsubscribes.
     quit_hook: Option<Subscription>,
@@ -1001,6 +1007,9 @@ impl StarlingApp {
             engine_instance,
             draft_engine_mode,
             draft_backend_override,
+            draft_microphone: settings.microphone.preferred_device.clone(),
+            microphone_settings: settings.microphone.clone(),
+            mic: crate::mic::MicState::default(),
             quit_hook: None,
             active_take: None,
             endpoint,
@@ -1235,6 +1244,7 @@ impl StarlingApp {
             processing: self.processing_settings.clone(),
             engine: self.engine_settings.clone(),
             dictation: self.dictation_settings.clone(),
+            microphone: self.microphone_settings.clone(),
         };
         settings.set_expected_terms_input(&self.expected_terms_input);
         settings
@@ -1580,6 +1590,14 @@ impl StarlingApp {
         // everything else in the Engine section is live manager state.
         self.draft_engine_mode = self.engine_settings.mode;
         self.draft_backend_override = self.engine_settings.backend_override.clone();
+        // The device list and the shortcut evidence are fresh for every
+        // dialog: the shortcut heard last time may have changed since.
+        self.draft_microphone = self.microphone_settings.preferred_device.clone();
+        self.cancel_mic_check();
+        self.mic.settings_launch_error = None;
+        self.mic.settings_launch_generation += 1;
+        self.mic.shortcut_heard = None;
+        self.refresh_input_devices(cx);
         self.draft_endpoint.update(cx, |field, cx| {
             field.set_value(&endpoint, cx);
         });
@@ -1636,6 +1654,11 @@ impl StarlingApp {
         // #221: presses made while the dialog was open never start a take.
         self.flush_system_events(cx);
         self.settings_open = false;
+        // A running microphone check releases its device with the dialog;
+        // a pending check transcription has nowhere to land.
+        self.cancel_mic_check();
+        self.mic.settings_launch_error = None;
+        self.mic.settings_launch_generation += 1;
         // B06 (#207): in-flight probes are retired with the dialog — a
         // stray probe has nothing to land in, and the settled outcome
         // dies with the draft it tested. Live state was never theirs to
@@ -1785,6 +1808,9 @@ impl StarlingApp {
         // jobs already running keep the provider they started with.
         self.processing_settings = self.draft_processing_settings(cx);
         self.providers = processing::build_providers(&self.processing_settings);
+        // The next take resolves against the saved choice; a take already
+        // recording keeps the device it opened.
+        self.microphone_settings.preferred_device = self.draft_microphone.clone();
 
         // #362: mode and backend override commit here, like the other
         // fields — and are applied now (the manager starts or stops with
@@ -2449,6 +2475,7 @@ impl Render for StarlingApp {
             self.elapsed_ms = handle.elapsed().as_secs_f64() * 1000.0;
             window.request_animation_frame();
         }
+        self.tick_mic_check(window);
         if let Some(partial) = staged_partial {
             self.staging_partial(partial, cx);
         }

@@ -143,9 +143,19 @@ pub fn render_capture(
                         .text_size(h1_size)
                         .line_height(h1_size * 0.96)
                         .text_color(theme::INK)
-                        .child(crate::activation::readiness_headline(
-                            app.activation.readiness().filter(|_| recording),
-                        )),
+                        // Never "listening" to a silent or dead input.
+                        .child(
+                            app.live_input_headline()
+                                .filter(|_| {
+                                    app.activation.readiness()
+                                        == Some(crate::activation::Readiness::Listening)
+                                })
+                                .unwrap_or_else(|| {
+                                    crate::activation::readiness_headline(
+                                        app.activation.readiness().filter(|_| recording),
+                                    )
+                                }),
+                        ),
                 )
                 .child(
                     div()
@@ -347,6 +357,7 @@ fn render_recorder(
                     )
                     .map(|hint| div().id("finish-hint").child(hint)),
                 )
+                .children(crate::views::microphone::live_input_line(app))
                 .when(!has_transcript, |meta| {
                     meta.child(
                         div()
@@ -619,6 +630,7 @@ fn render_banner(app: &mut StarlingApp, cx: &mut Context<StarlingApp>) -> Option
                     }),
                 )
                 .children(error.clone().map(|message| div().child(message)))
+                .children(crate::views::microphone::input_problem_actions(app, cx))
                 .children(
                     surface
                         .footer

@@ -164,6 +164,9 @@ pub(crate) enum CancelReason {
     NoAudioYet,
     /// The microphone delivered no audio within [`START_STALL`].
     MicStalled,
+    /// The microphone failed or stopped delivering mid-take: the audio
+    /// captured before that is kept as an interrupted take.
+    InputLost,
 }
 
 /// What the app must do in response to an input.
@@ -444,6 +447,18 @@ impl Activation {
         Vec::new()
     }
 
+    /// `take`'s microphone failed or stopped delivering mid-take: cancel it
+    /// as interrupted. A stale id (an older take) does nothing.
+    pub(crate) fn input_lost(&mut self, take: TakeId) -> Vec<Effect> {
+        match self.phase {
+            Phase::Active { take: active, .. } if active == take => {
+                self.phase = Phase::Idle;
+                vec![Effect::Cancel(take, CancelReason::InputLost)]
+            }
+            _ => Vec::new(),
+        }
+    }
+
     /// The recorder reported captured samples for `take`.
     pub(crate) fn samples_arrived(&mut self, take: TakeId) -> Vec<Effect> {
         match &mut self.phase {
@@ -647,6 +662,9 @@ impl StarlingApp {
             if !self.system_event_is_ours(event) {
                 continue;
             }
+            if self.settings_open && matches!(event, GlobalEvent::Pressed(_)) {
+                self.note_shortcut_in_dialog(cx);
+            }
             let may_start = !self.settings_open;
             self.activation_input(
                 |machine| match event {
@@ -691,6 +709,9 @@ impl StarlingApp {
         if !self.shortcut.matches_key_down(keystroke) {
             return false;
         }
+        if self.settings_open {
+            self.note_shortcut_in_dialog(cx);
+        }
         let may_start = !self.settings_open;
         // A window press while the key is down is a repeat — unless the
         // window can never see this shortcut's release (a Cmd chord on
@@ -722,15 +743,21 @@ impl StarlingApp {
 
     /// One loop turn: system-wide events in arrival order, then timers.
     /// Returns how long the loop waits before its next turn: the fast
-    /// [`POLL_INTERVAL`] while a take is active or the shortcut key is
+    /// [`POLL_INTERVAL`] while a take is active, the shortcut key is
     /// down (the press/release pair and the repeats arrive as a stream
-    /// then), and the slower [`IDLE_POLL_INTERVAL`] once the machine
-    /// idles — which costs nothing but idle start latency, since the
-    /// timers act on the events' receive timestamps, not on the poll's.
+    /// then), or the settings dialog's microphone check is recording
+    /// (its time limit is enforced here), and the slower
+    /// [`IDLE_POLL_INTERVAL`] once the machine idles — which costs
+    /// nothing but idle start latency, since the timers act on the
+    /// events' receive timestamps, not on the poll's.
     pub(crate) fn poll_activation(&mut self, cx: &mut Context<Self>) -> Duration {
         self.flush_system_events(cx);
         self.activation_input(|machine| machine.tick(Instant::now()), cx);
-        if self.activation.is_active() || self.activation.key_is_down() {
+        self.poll_microphone(cx);
+        if self.activation.is_active()
+            || self.activation.key_is_down()
+            || self.mic_check_recording()
+        {
             POLL_INTERVAL
         } else {
             IDLE_POLL_INTERVAL
@@ -784,7 +811,14 @@ impl StarlingApp {
                 Effect::Finish(take) => {
                     if self.recording_take == Some(take) {
                         self.recording_take = None;
-                        self.stop_recording(cx);
+                        // A take whose microphone died is never presented
+                        // as complete, even when the stop came before the
+                        // watchdog noticed.
+                        if self.note_live_interruption() {
+                            self.cancel_recording(take, CancelReason::InputLost, cx);
+                        } else {
+                            self.stop_recording(take, cx);
+                        }
                     }
                 }
                 Effect::Cancel(take, reason) => {
@@ -1183,6 +1217,21 @@ mod tests {
         start_listening(&mut m, t0);
         assert!(m.tick(t0 + START_STALL * 10).is_empty());
         assert!(m.is_active());
+    }
+
+    #[test]
+    fn a_lost_input_cancels_only_its_own_active_take() {
+        let t0 = Instant::now();
+        let mut machine = machine(ActivationMode::Toggle, false);
+        let take = start_listening(&mut machine, t0);
+        assert_eq!(machine.input_lost(take + 1), Vec::new(), "a stale id does nothing");
+        assert!(machine.is_active());
+        assert_eq!(
+            machine.input_lost(take),
+            vec![Effect::Cancel(take, CancelReason::InputLost)]
+        );
+        assert!(!machine.is_active());
+        assert_eq!(machine.input_lost(take), Vec::new(), "already ended");
     }
 
     #[test]

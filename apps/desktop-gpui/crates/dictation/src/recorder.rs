@@ -51,9 +51,10 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::traits::{DeviceTrait, StreamTrait};
 
 use crate::journal::{FileSink, JournalSink, JournalWriter};
+use crate::microphone::{self, InputProblem, InputRoute};
 
 /// Sample rate requested from the microphone. Devices that cannot capture
 /// natively at 16 kHz are used at their own rate; the UI resamples when
@@ -215,6 +216,11 @@ pub struct CapturedTake {
     pub audio: crate::audio::PcmAudio,
     /// The durable journal report, when this capture journaled.
     pub journal: Option<JournalReport>,
+    /// A device fault already reported when the stop began: the audio is
+    /// complete up to the fault, but the take was interrupted. Errors
+    /// posted while the stream is torn down are not counted — some
+    /// backends report one on a normal stop.
+    pub device_fault: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -374,6 +380,9 @@ struct ConsumerState {
     /// Set when the writer task finalized the journal (trailer + file and
     /// parent-dir fsyncs) on its exit path.
     journal_finalized: bool,
+    /// When a drain last found new samples; `None` until the first
+    /// sample arrives.
+    last_advance: Option<Instant>,
 }
 
 impl ConsumerState {
@@ -432,7 +441,7 @@ struct Shared {
     /// dropped and `callback_alive` has cleared, or the bounded quiesce
     /// wait has given up — so the writer's exit path (final drain + journal
     /// finalize) observes the complete, stable take (#204). The
-    /// `stream.play()` failure teardown in `start_recording_inner` also
+    /// `stream.play()` failure teardown in `start_on_device` also
     /// sets it directly; no callback ever ran there.
     stopping: AtomicBool,
 }
@@ -560,6 +569,7 @@ impl Shared {
                 }
             }
             state.read_pos = frontier;
+            state.last_advance = Some(Instant::now());
             // Loop while the producer advanced during the copy; each
             // iteration consumes to a freshly loaded frontier, so this
             // terminates (copying is orders of magnitude faster than
@@ -888,9 +898,27 @@ pub struct RecorderHandle {
     started_at: Instant,
     quiesce_timeout: Duration,
     journal: Option<JournalIdentity>,
+    /// The input this take opened and why; `None` for simulated captures.
+    route: Option<InputRoute>,
 }
 
 impl RecorderHandle {
+    /// The microphone this take records from, fixed for the take's
+    /// lifetime.
+    pub fn input_route(&self) -> Option<&InputRoute> {
+        self.route.as_ref()
+    }
+
+    /// How long the input has delivered no new samples; `None` until the
+    /// first sample arrives. A healthy device delivers every few
+    /// milliseconds, so seconds here mean the input is dead even though no
+    /// error was reported (some backends just stop calling back on unplug).
+    pub fn input_stalled_for(&self) -> Option<Duration> {
+        let mut guard = self.shared.lock_consumer();
+        self.shared.drain_ring(&mut guard);
+        guard.last_advance.map(|at| at.elapsed())
+    }
+
     /// Actual capture rate of the device (16 kHz when it was available
     /// natively, otherwise the device default).
     pub fn sample_rate(&self) -> u32 {
@@ -1039,6 +1067,8 @@ impl RecorderHandle {
     /// caller and do not make the take "empty".
     pub fn stop(mut self) -> Result<CapturedTake, RecorderError> {
         let final_sample_index = self.shared.written_seq.load(Ordering::Acquire);
+        // Before pause/drop, which can post teardown errors of their own.
+        let device_fault = self.shared.lock_consumer().stream_error.clone();
 
         if let Some(stream) = self.stream.take() {
             // Explicit stop; pause is unsupported on some backends, and
@@ -1151,6 +1181,7 @@ impl RecorderHandle {
                 channels: 1,
             },
             journal,
+            device_fault,
         })
     }
 }
@@ -1159,7 +1190,7 @@ impl RecorderHandle {
 /// no durable journal (tests, probes). The production path is
 /// [`start_recording_with_journal`].
 pub fn start_recording() -> Result<RecorderHandle, RecorderError> {
-    start_recording_inner(None)
+    start_capture(CaptureRequest::default()).map_err(RecorderError::from)
 }
 
 /// [`start_recording`] with the per-take durable journal (I1 phase 2):
@@ -1173,20 +1204,62 @@ pub fn start_recording() -> Result<RecorderHandle, RecorderError> {
 pub fn start_recording_with_journal(
     journals_dir: &Path,
 ) -> Result<RecorderHandle, RecorderError> {
-    start_recording_inner(Some(journals_dir))
+    start_capture(CaptureRequest {
+        journals_dir: Some(journals_dir),
+        preferred_device: None,
+    })
+    .map_err(RecorderError::from)
 }
 
-fn start_recording_inner(
-    journals_dir: Option<&Path>,
-) -> Result<RecorderHandle, RecorderError> {
-    let host = cpal::default_host();
-    let device = host.default_input_device().ok_or_else(|| {
-        RecorderError::Device(
-            "No microphone was found. Connect an input device and try again.".to_string(),
-        )
-    })?;
+/// What a capture opens.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CaptureRequest<'a> {
+    /// Journal the take here (see [`start_recording_with_journal`]);
+    /// `None` captures in memory only.
+    pub journals_dir: Option<&'a Path>,
+    /// The preferred input device by name; `None` follows the system
+    /// default. A preferred device that is not connected — or a device
+    /// listing that fails — falls back to the system default, reported on
+    /// [`RecorderHandle::input_route`]; the preference is never rewritten
+    /// here.
+    pub preferred_device: Option<&'a str>,
+}
 
-    let supported = pick_input_config(&device)?;
+/// A capture that could not start, classified so the UI can explain a
+/// missing, refused or failing input distinctly. `route` is the input the
+/// start resolved to before failing, when it got that far.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("{problem}")]
+pub struct StartError {
+    pub problem: InputProblem,
+    pub route: Option<InputRoute>,
+}
+
+impl From<StartError> for RecorderError {
+    fn from(err: StartError) -> Self {
+        RecorderError::Device(err.problem.message())
+    }
+}
+
+/// Starts a mono capture from the input `request` resolves to — the one
+/// start path behind [`start_recording`] and
+/// [`start_recording_with_journal`].
+pub fn start_capture(request: CaptureRequest<'_>) -> Result<RecorderHandle, StartError> {
+    let (device, route) = microphone::open_input(request.preferred_device)
+        .map_err(|problem| StartError { problem, route: None })?;
+    start_on_device(&device, route, request.journals_dir)
+}
+
+fn start_on_device(
+    device: &cpal::Device,
+    route: InputRoute,
+    journals_dir: Option<&Path>,
+) -> Result<RecorderHandle, StartError> {
+    let fail = |problem: InputProblem| StartError {
+        problem,
+        route: Some(route.clone()),
+    };
+    let supported = pick_input_config(device, &route.device).map_err(fail)?;
     let sample_format = supported.sample_format();
     let stream_config = supported.config();
     let sample_rate = stream_config.sample_rate.0;
@@ -1219,7 +1292,8 @@ fn start_recording_inner(
         None => (None, None),
     };
 
-    let stream = open_stream(&device, sample_format, &stream_config, &shared)?;
+    let stream =
+        open_stream(device, &route.device, sample_format, &stream_config, &shared).map_err(fail)?;
 
     // The writer task owns the take for the whole session (§3 G01). Starting
     // it before `play` means the first callback already has a drainer; a
@@ -1231,7 +1305,10 @@ fn start_recording_inner(
             move || writer_loop(shared, journal)
         })
         .map_err(|err| {
-            RecorderError::Device(format!("Could not start the capture writer task: {err}"))
+            fail(InputProblem::Failed {
+                device: route.device.clone(),
+                detail: format!("could not start the capture writer task: {err}"),
+            })
         })?;
 
     if let Err(err) = stream.play() {
@@ -1242,8 +1319,14 @@ fn start_recording_inner(
             shared.wake.notify_all();
         }
         let _ = writer.join();
-        return Err(RecorderError::Device(format!(
-            "Failed to start the microphone stream: {err}"
+        let (unavailable, detail) = match err {
+            cpal::PlayStreamError::DeviceNotAvailable => (true, err.to_string()),
+            cpal::PlayStreamError::BackendSpecific { err } => (false, err.description),
+        };
+        return Err(fail(microphone::classify_backend(
+            &route.device,
+            unavailable,
+            format!("the stream did not start ({detail})"),
         )));
     }
 
@@ -1255,16 +1338,31 @@ fn start_recording_inner(
         started_at: Instant::now(),
         quiesce_timeout: QUIESCE_TIMEOUT,
         journal: journal_identity,
+        route: Some(route),
     })
 }
 
 /// Prefer f32 / 1 channel / 16 kHz when the device offers it; otherwise use
 /// the device's default input config (converted in the callback).
-fn pick_input_config(device: &cpal::Device) -> Result<cpal::SupportedStreamConfig, RecorderError> {
+fn pick_input_config(
+    device: &cpal::Device,
+    name: &str,
+) -> Result<cpal::SupportedStreamConfig, InputProblem> {
     let ranges: Vec<_> = device
         .supported_input_configs()
         .map_err(|err| {
-            RecorderError::Device(format!("Could not query microphone configurations: {err}"))
+            let (unavailable, detail) = match err {
+                cpal::SupportedStreamConfigsError::DeviceNotAvailable => (true, err.to_string()),
+                cpal::SupportedStreamConfigsError::BackendSpecific { err } => {
+                    (false, err.description)
+                }
+                other => (false, other.to_string()),
+            };
+            microphone::classify_backend(
+                name,
+                unavailable,
+                format!("could not query its configurations ({detail})"),
+            )
         })?
         .collect();
 
@@ -1278,9 +1376,16 @@ fn pick_input_config(device: &cpal::Device) -> Result<cpal::SupportedStreamConfi
     }
 
     device.default_input_config().map_err(|err| {
-        RecorderError::Device(format!(
-            "Could not choose a microphone configuration: {err}"
-        ))
+        let (unavailable, detail) = match err {
+            cpal::DefaultStreamConfigError::DeviceNotAvailable => (true, err.to_string()),
+            cpal::DefaultStreamConfigError::BackendSpecific { err } => (false, err.description),
+            other => (false, other.to_string()),
+        };
+        microphone::classify_backend(
+            name,
+            unavailable,
+            format!("could not choose a configuration ({detail})"),
+        )
     })
 }
 
@@ -1288,13 +1393,13 @@ fn pick_input_config(device: &cpal::Device) -> Result<cpal::SupportedStreamConfi
 /// config must be rejected loudly at stream-open: letting it through would
 /// silently fall into the downmixer's mono passthrough and treat
 /// interleaved nothing-at-all as if it were mono samples.
-fn reject_zero_channels(channels: u16) -> Result<(), RecorderError> {
+fn reject_zero_channels(name: &str, channels: u16) -> Result<(), InputProblem> {
     if channels == 0 {
-        Err(RecorderError::Device(
-            "The microphone reported a zero-channel configuration and cannot be captured \
-             from."
+        Err(InputProblem::Failed {
+            device: name.to_string(),
+            detail: "it reported a zero-channel configuration and cannot be captured from."
                 .to_string(),
-        ))
+        })
     } else {
         Ok(())
     }
@@ -1303,11 +1408,12 @@ fn reject_zero_channels(channels: u16) -> Result<(), RecorderError> {
 /// Build the input stream for whichever sample format the config settled on.
 fn open_stream(
     device: &cpal::Device,
+    name: &str,
     sample_format: cpal::SampleFormat,
     config: &cpal::StreamConfig,
     shared: &Arc<Shared>,
-) -> Result<cpal::Stream, RecorderError> {
-    reject_zero_channels(config.channels)?;
+) -> Result<cpal::Stream, InputProblem> {
+    reject_zero_channels(name, config.channels)?;
     let attempted = match sample_format {
         cpal::SampleFormat::I8 => Some(build_stream::<i8>(device, config, shared)),
         cpal::SampleFormat::I16 => Some(build_stream::<i16>(device, config, shared)),
@@ -1325,13 +1431,21 @@ fn open_stream(
     };
 
     attempted
-        .ok_or_else(|| {
-            RecorderError::Device(format!(
-                "Microphone sample format {sample_format} is not supported."
-            ))
+        .ok_or_else(|| InputProblem::Failed {
+            device: name.to_string(),
+            detail: format!("its sample format {sample_format} is not supported."),
         })?
         .map_err(|err| {
-            RecorderError::Device(format!("Failed to open the microphone stream: {err}"))
+            let (unavailable, detail) = match err {
+                cpal::BuildStreamError::DeviceNotAvailable => (true, err.to_string()),
+                cpal::BuildStreamError::BackendSpecific { err } => (false, err.description),
+                other => (false, other.to_string()),
+            };
+            microphone::classify_backend(
+                name,
+                unavailable,
+                format!("the stream could not be opened ({detail})"),
+            )
         })
 }
 
@@ -1385,6 +1499,7 @@ mod tests {
             started_at: Instant::now(),
             quiesce_timeout: Duration::from_millis(500),
             journal: None,
+            route: None,
         }
     }
 
@@ -1425,6 +1540,7 @@ mod tests {
             started_at: Instant::now(),
             quiesce_timeout: Duration::from_millis(500),
             journal: Some(identity),
+            route: None,
         }
     }
 
@@ -1783,6 +1899,7 @@ mod tests {
             started_at: Instant::now(),
             quiesce_timeout: Duration::from_millis(500),
             journal: None,
+            route: None,
         };
 
         let mut callback = CallbackState::new(1);
@@ -1820,6 +1937,7 @@ mod tests {
             started_at: Instant::now(),
             quiesce_timeout: Duration::from_millis(500),
             journal: None,
+            route: None,
         };
 
         // Stereo input exercises the downmix path, like a real device; L = R
@@ -1888,6 +2006,7 @@ mod tests {
             started_at: Instant::now(),
             quiesce_timeout: Duration::from_millis(40),
             journal: None,
+            route: None,
         };
 
         match handle.stop() {
@@ -1955,6 +2074,7 @@ mod tests {
             // join inside `stop`.
             quiesce_timeout: Duration::from_millis(30),
             journal: None,
+            route: None,
         };
 
         let salvaged = match handle.stop() {
@@ -2054,6 +2174,7 @@ mod tests {
             started_at: Instant::now(),
             quiesce_timeout: Duration::from_millis(200),
             journal: None,
+            route: None,
         };
 
         let take = handle.stop().expect("samples that made it are returned");
@@ -2070,14 +2191,14 @@ mod tests {
     #[test]
     fn zero_channel_configs_are_rejected_not_treated_as_mono() {
         // A device config with no channels must fail stream-open loudly…
-        let err = reject_zero_channels(0).unwrap_err();
+        let err = reject_zero_channels("Mic", 0).unwrap_err();
         assert!(
             err.to_string().to_lowercase().contains("zero-channel"),
             "{err}"
         );
         // …while every real channel count opens as before.
         for channels in 1..=8u16 {
-            assert!(reject_zero_channels(channels).is_ok());
+            assert!(reject_zero_channels("Mic", channels).is_ok());
         }
     }
 
@@ -2168,6 +2289,7 @@ mod tests {
             started_at: Instant::now(),
             quiesce_timeout: Duration::from_millis(200),
             journal: None,
+            route: None,
         };
         // Poll for the writer's drain instead of sleeping past a couple of
         // ticks (#217): the honest-acknowledgment claim below must hold
@@ -2580,6 +2702,89 @@ mod tests {
             }
             other => panic!("expected QuiesceTimeout, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn input_stall_counts_from_the_last_delivery() {
+        let shared = test_shared(8_192);
+        let handle = test_handle(Arc::clone(&shared), 16_000);
+        assert_eq!(handle.input_stalled_for(), None, "nothing delivered yet");
+        let mut callback = CallbackState::new(1);
+        callback.process(&[0.1f32; 160], &shared);
+        assert!(handle.input_stalled_for().expect("samples arrived") < Duration::from_secs(1));
+        std::thread::sleep(Duration::from_millis(60));
+        let stalled = handle.input_stalled_for().expect("samples arrived");
+        assert!(stalled >= Duration::from_millis(50), "{stalled:?}");
+        callback.process(&[0.1f32; 160], &shared);
+        assert!(handle.input_stalled_for().expect("samples arrived") < stalled);
+    }
+
+    #[test]
+    fn stop_reports_a_device_fault_posted_before_the_handshake() {
+        let shared = test_shared(8_192);
+        let handle = test_handle(Arc::clone(&shared), 16_000);
+        CallbackState::new(1).process(&[0.2f32; 320], &shared);
+        shared.record_stream_error("The requested device is no longer available.".to_string());
+        let take = handle
+            .stop()
+            .expect("the audio before the fault is returned");
+        assert_eq!(take.audio.samples.len(), 320);
+        assert_eq!(
+            take.device_fault.as_deref(),
+            Some("The requested device is no longer available.")
+        );
+
+        let shared = test_shared(8_192);
+        let handle = test_handle(Arc::clone(&shared), 16_000);
+        CallbackState::new(1).process(&[0.2f32; 320], &shared);
+        let take = handle.stop().expect("clean take");
+        assert_eq!(take.device_fault, None, "a healthy take carries no fault");
+    }
+
+    #[test]
+    fn a_start_error_converts_to_the_legacy_device_error_with_its_explanation() {
+        let err = StartError {
+            problem: InputProblem::NoDevice {
+                detail: "No microphone was found.".to_string(),
+            },
+            route: None,
+        };
+        match RecorderError::from(err) {
+            RecorderError::Device(message) => {
+                assert!(message.contains("No microphone was found."), "{message}");
+                assert!(message.contains("Connect a microphone"), "{message}");
+            }
+            other => panic!("expected a device error, got {other:?}"),
+        }
+    }
+
+    /// Live capture on whatever input this machine has; skips itself
+    /// without one.
+    #[test]
+    fn live_capture_reports_the_route_it_opened() {
+        let handle = match start_capture(CaptureRequest::default()) {
+            Ok(handle) => handle,
+            Err(err) => {
+                eprintln!("skipping live route test: {err}");
+                return;
+            }
+        };
+        let route = handle.input_route().expect("a live capture has a route").clone();
+        assert_eq!(route.reason, microphone::RouteReason::FollowingDefault);
+        assert!(!route.device.is_empty());
+        let _ = handle.stop();
+
+        let handle = start_capture(CaptureRequest {
+            journals_dir: None,
+            preferred_device: Some("starling-test: no such microphone"),
+        })
+        .expect("a missing preferred device falls back to the default");
+        let fallback = handle.input_route().expect("route").clone();
+        assert!(fallback.is_fallback(), "{fallback:?}");
+        assert_eq!(fallback.preferred.as_deref(), Some("starling-test: no such microphone"));
+        assert_eq!(fallback.device, route.device);
+        assert!(fallback.notice().is_some());
+        let _ = handle.stop();
     }
 
     /// Live round-trip against the real microphone. Skips itself (rather than

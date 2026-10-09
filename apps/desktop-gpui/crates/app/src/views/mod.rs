@@ -5,6 +5,7 @@
 mod capture;
 mod drawer;
 mod history;
+pub(crate) mod microphone;
 mod settings;
 pub(crate) mod staging;
 mod topbar;

@@ -17,6 +17,7 @@ use starling_dictation::{
 
 use crate::app::{HealthCheckPurpose, StarlingApp, UnsavedWav};
 use crate::live_stream::LiveStream;
+use crate::mic::Interruption;
 use crate::store::Store;
 
 /// A take's endpoint/model binding (#363), resolved once at the moment
@@ -84,11 +85,11 @@ impl TakeTarget {
         }
     }
 
-    fn endpoint(&self) -> &str {
+    pub(crate) fn endpoint(&self) -> &str {
         &self.endpoint
     }
 
-    fn model(&self) -> &str {
+    pub(crate) fn model(&self) -> &str {
         &self.model
     }
 
@@ -354,7 +355,11 @@ impl StarlingApp {
 
     /// Stop the running recorder and process the take as usual. Only the
     /// activation machine calls this (an `Effect::Finish`).
-    pub(crate) fn stop_recording(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn stop_recording(
+        &mut self,
+        finished_take: crate::activation::TakeId,
+        cx: &mut Context<Self>,
+    ) {
         self.error = None;
         if let Some(handle) = self.recorder.take() {
             let mut stream = self.live_stream.take();
@@ -380,11 +385,28 @@ impl StarlingApp {
             if capture_fault.is_some() {
                 stream = None;
             }
+            let device = crate::mic::device_name(&handle);
+            let device_sample_rate = handle.sample_rate();
             // Stop-to-processed latency (#295) starts here.
             let stopped_at = Instant::now();
             // The staging panel keeps its draft while the take is saved.
             let staging = self.stop_staging();
             match handle.stop() {
+                // The device failed after the last input check: the take
+                // was interrupted and is never transcribed as complete.
+                Ok(take) if take.device_fault.is_some() => {
+                    if let Some(fault) = &take.device_fault {
+                        self.note_interruption(&device, Interruption::DeviceFailed(fault.clone()));
+                    }
+                    self.keep_untranscribed_take(
+                        finished_take,
+                        crate::activation::CancelReason::InputLost,
+                        Ok(take),
+                        streamed_samples,
+                        device_sample_rate,
+                        cx,
+                    );
+                }
                 Ok(mut take) => {
                     // `sent_samples` indexes device-rate samples of the
                     // spliced layout (drained stream prefix + journal
@@ -542,8 +564,16 @@ impl StarlingApp {
             // I1 phase 2: production captures journal to the durable
             // per-take file; only fsynced-boundary samples are
             // acknowledged (see recorder::start_recording_with_journal).
-            match recorder::start_recording_with_journal(&journal::default_journals_root()) {
+            let journals_root = journal::default_journals_root();
+            match recorder::start_capture(recorder::CaptureRequest {
+                journals_dir: Some(&journals_root),
+                preferred_device: self.microphone_settings.preferred_device.as_deref(),
+            }) {
                 Ok(handle) => {
+                    self.mic.problem = None;
+                    self.mic.interruption = None;
+                    self.mic.last_sound_at = None;
+                    self.mic.last_route = handle.input_route().cloned();
                     self.live_partial.clear();
                     if self.staged_mode() {
                         self.begin_staging(cx);
@@ -589,7 +619,8 @@ impl StarlingApp {
                     true
                 }
                 Err(err) => {
-                    self.error = Some(err.to_string());
+                    let text = format!("{} {}", err.problem.message(), err.problem.recovery());
+                    self.report_input_problem(err.problem, text);
                     cx.notify();
                     false
                 }
@@ -608,7 +639,6 @@ impl StarlingApp {
         reason: crate::activation::CancelReason,
         cx: &mut Context<Self>,
     ) {
-        use crate::activation::CancelReason;
         let Some(handle) = self.recorder.take() else {
             return;
         };
@@ -619,18 +649,43 @@ impl StarlingApp {
         self.live_partial.clear();
         let streamed_samples = std::mem::take(&mut self.streamed_samples);
         self.stream_sent_samples = 0;
-        self.stream_degradation = None;
-        self.levels = vec![0.06; 52];
-        let staging = self.staging_cancelled(cx);
         // Read before `stop` consumes the handle: a stop that hands back
         // no audio still rebuilds the drained prefix at the take's own
         // device rate.
         let device_sample_rate = handle.sample_rate();
+        let stopped = handle.stop();
+        self.keep_untranscribed_take(
+            cancelled_take,
+            reason,
+            stopped,
+            streamed_samples,
+            device_sample_rate,
+            cx,
+        );
+    }
+
+    /// Saves a take that ends without transcription — cancelled, or
+    /// interrupted by its microphone — to history as an interrupted take,
+    /// from the recorder's `stopped` result and the live-stream prefix
+    /// already drained from it.
+    fn keep_untranscribed_take(
+        &mut self,
+        cancelled_take: crate::activation::TakeId,
+        reason: crate::activation::CancelReason,
+        stopped: Result<recorder::CapturedTake, recorder::RecorderError>,
+        streamed_samples: Vec<f32>,
+        device_sample_rate: u32,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::activation::CancelReason;
+        self.stream_degradation = None;
+        self.levels = vec![0.06; 52];
+        let staging = self.staging_cancelled(cx);
         // This stop's own failure, kept apart from `self.error` (which may
         // hold an unrelated earlier message) so the stall report below
         // only ever joins what actually happened to this take.
         let mut stop_error = None;
-        let (stopped, journal_report) = match handle.stop() {
+        let (stopped, journal_report) = match stopped {
             Ok(take) => (Some(take.audio), take.journal),
             Err(recorder::RecorderError::QuiesceTimeout { audio, journal, .. }) => {
                 (Some(audio), journal)
@@ -723,6 +778,34 @@ impl StarlingApp {
                         .to_string()
                 })
             }
+            CancelReason::InputLost => {
+                let (what, problem) = self.mic.interruption.take().unwrap_or_else(|| {
+                    (
+                        "The microphone stopped mid-recording".to_string(),
+                        starling_dictation::microphone::InputProblem::Unavailable {
+                            device: "The microphone".to_string(),
+                            detail: "it stopped during the last recording".to_string(),
+                        },
+                    )
+                });
+                let mut lost = format!(
+                    "{what}. Check the microphone (Settings → Microphone can test it or pick \
+                     another), then record again."
+                );
+                if let Some(stop_error) = stop_error.take() {
+                    lost = format!(
+                        "{lost} Stopping it also failed: {}",
+                        stop_error.trim_end_matches('.')
+                    );
+                }
+                self.report_input_problem(problem, lost);
+                kept.then(|| {
+                    "The recording was interrupted when the microphone stopped. Everything \
+                     captured before that is in your history as an interrupted recording; \
+                     transcribe it from there."
+                        .to_string()
+                })
+            }
         };
         if let Some(stop_error) = stop_error {
             self.error = Some(stop_error);
@@ -741,6 +824,10 @@ impl StarlingApp {
             CancelReason::Escape => "Cancelled with Escape before transcription; the audio was kept.",
             CancelReason::NoAudioYet => "Stopped before the microphone was ready; the audio was kept.",
             CancelReason::MicStalled => "The microphone stalled at the start; the audio was kept.",
+            CancelReason::InputLost => {
+                "The microphone failed or stopped delivering mid-recording; the audio captured \
+                 before that was kept."
+            }
         }
         .to_string();
         cx.spawn(async move |this, cx| {

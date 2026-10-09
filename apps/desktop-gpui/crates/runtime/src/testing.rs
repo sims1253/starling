@@ -137,6 +137,7 @@ impl CaptureSession for FakeSession {
                         finalized: true,
                         fault: None,
                     }),
+                    device_fault: None,
                 })
             }
             FakeStop::QuiesceTimeout { journal_id } => {

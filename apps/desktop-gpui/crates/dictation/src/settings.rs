@@ -88,6 +88,23 @@ pub struct Settings {
     /// rest of the subsection, and never the rest of the file.
     #[serde(default, deserialize_with = "lenient_dictation")]
     pub dictation: DictationSettings,
+    /// The microphone choice. A file without the key follows the system
+    /// default, which is what every earlier build recorded from. An
+    /// unreadable value resets only this choice, never the rest of the
+    /// file.
+    #[serde(default, deserialize_with = "lenient_microphone")]
+    pub microphone: MicrophoneSettings,
+}
+
+/// Which microphone takes record from. Only the user changes this: a take
+/// whose preferred device is missing falls back to the system default for
+/// that take alone (see `crate::microphone`).
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct MicrophoneSettings {
+    /// The preferred input device by name; `None` follows the system
+    /// default input.
+    pub preferred_device: Option<String>,
 }
 
 /// How the recording shortcut starts and stops a take (#221).
@@ -189,6 +206,26 @@ fn lenient_dictation_value(value: serde_json::Value) -> DictationSettings {
     }
 }
 
+/// Reads the `microphone` value without ever failing the whole file: an
+/// unreadable value follows the system default, with the reason logged.
+fn lenient_microphone<'de, D>(deserializer: D) -> Result<MicrophoneSettings, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = <serde_json::Value as serde::Deserialize>::deserialize(deserializer)?;
+    Ok(lenient_microphone_value(value))
+}
+
+fn lenient_microphone_value(value: serde_json::Value) -> MicrophoneSettings {
+    if value.is_object() {
+        if let Ok(microphone) = serde_json::from_value(value.clone()) {
+            return microphone;
+        }
+    }
+    eprintln!("Unreadable microphone settings ({value}); following the system default");
+    MicrophoneSettings::default()
+}
+
 /// Which processing mode runs after a take is transcribed, and where its
 /// providers live. The key itself never goes into this file: only the
 /// name of the environment variable that holds it.
@@ -235,6 +272,7 @@ impl Settings {
             processing: ProcessingSettings::default(),
             engine: EngineSettings::default(),
             dictation: DictationSettings::default(),
+            microphone: MicrophoneSettings::default(),
         }
     }
 
@@ -335,6 +373,9 @@ impl Settings {
         // relies on the field-level `lenient_dictation` alone, instead of
         // parsing (and logging) the subsection twice.
         let dictation_subtree = value.get("dictation").cloned();
+        // Likewise the microphone choice: an unreadable sibling key must
+        // not silently move recording to another device.
+        let microphone_subtree = value.get("microphone").cloned();
         let Ok(mut settings) = serde_json::from_value::<Settings>(value) else {
             // The same field-wise leniency as the `dictation` attribute:
             // an unreadable sibling key must not cost the user their
@@ -349,6 +390,9 @@ impl Settings {
                 active_model,
                 backend_override,
             };
+            fallback.microphone = microphone_subtree
+                .map(lenient_microphone_value)
+                .unwrap_or_default();
             fallback.dictation = dictation;
             return Some(fallback);
         };
@@ -509,6 +553,9 @@ mod tests {
                 activation: ActivationMode::Hold,
                 double_tap_hands_free: true,
             },
+            microphone: MicrophoneSettings {
+                preferred_device: Some("USB Mic".to_string()),
+            },
         };
 
         settings.save(&path).expect("save");
@@ -530,6 +577,7 @@ mod tests {
         assert_eq!(value["engine"]["mode"], "builtin");
         assert_eq!(value["engine"]["activeModel"], "parakeet-v3-q8");
         assert_eq!(value["engine"]["backendOverride"], "cpu");
+        assert_eq!(value["microphone"]["preferredDevice"], "USB Mic");
     }
 
     #[test]
@@ -733,6 +781,74 @@ mod tests {
         assert_eq!(settings.engine.mode, EngineMode::Builtin);
         assert_eq!(settings.engine.active_model, Some("parakeet-v3-q8".to_string()));
         assert_eq!(settings.engine.backend_override, None);
+    }
+
+    #[test]
+    fn a_file_without_a_microphone_key_follows_the_system_default() {
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"endpoint":"http://127.0.0.1:8181","model":"parakeet","expectedTerms":["auth"],"engine":{"mode":"builtin"}}"#,
+        )
+        .expect("write settings");
+        assert_eq!(Settings::load(&path).microphone.preferred_device, None);
+    }
+
+    #[test]
+    fn an_unreadable_file_keeps_the_preferred_microphone() {
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"endpoint":42,"model":"parakeet","expectedTerms":["auth"],"engine":{"mode":"builtin"},"microphone":{"preferredDevice":"USB Mic"}}"#,
+        )
+        .expect("write unreadable settings");
+        assert_eq!(
+            Settings::load(&path).microphone.preferred_device.as_deref(),
+            Some("USB Mic")
+        );
+    }
+
+    #[test]
+    fn an_unreadable_microphone_key_resets_only_the_microphone_choice() {
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("settings.json");
+        for microphone in [
+            serde_json::json!(null),
+            serde_json::json!(5),
+            serde_json::json!({ "preferredDevice": 42 }),
+            serde_json::json!(["USB Mic"]),
+        ] {
+            let raw = serde_json::json!({
+                "endpoint": "http://10.0.0.9:8181",
+                "model": "whisper-large-v3",
+                "expectedTerms": ["auth", "Starling"],
+                "engine": { "mode": "builtin" },
+                "dictation": { "shortcut": "F9", "activation": "hold" },
+                "microphone": microphone,
+            });
+            std::fs::write(&path, raw.to_string()).expect("write");
+            let loaded = Settings::load(&path);
+            assert_eq!(loaded.endpoint, "http://10.0.0.9:8181", "{microphone}");
+            assert_eq!(loaded.model, "whisper-large-v3", "{microphone}");
+            assert_eq!(
+                loaded.expected_terms,
+                vec!["auth".to_string(), "Starling".to_string()],
+                "{microphone}"
+            );
+            assert_eq!(loaded.dictation.shortcut, "F9", "{microphone}");
+            assert_eq!(
+                loaded.dictation.activation,
+                ActivationMode::Hold,
+                "{microphone}"
+            );
+            assert_eq!(
+                loaded.microphone,
+                MicrophoneSettings::default(),
+                "{microphone}"
+            );
+        }
     }
 
     #[test]
