@@ -253,8 +253,8 @@ private:
 class Context {
 public:
     // The shared context: created on the first acquire, destroyed — a clean
-    // vkDestroyDevice — when the last holder (an engine) releases it. #325:
-    // a process holds a live device only while an engine is loaded, so the
+    // vkDestroyDevice — when the last holder (an engine) releases it. A
+    // process holds a live device only while an engine is loaded, so the
     // SIGKILL that ends most Android processes finds none to abandon. A hung
     // context is never destroyed (see ~Context) and is handed out again; a
     // new context inherits a wedge this process saw in the last 15 min.

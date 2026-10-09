@@ -110,7 +110,7 @@ struct ContextRegistry {
     Context* hung = nullptr;             // a hung context: never destroyed
     bool unavailable = false;            // init failed: no usable device
     std::string init_err;
-    std::mutex wedge_mu;                 // guards the wedge record (taken after mu)
+    std::mutex wedge_mu;                 // guards the wedge record (innermost)
     std::string wedge_why;               // last wedge this process observed
     std::chrono::steady_clock::time_point wedge_at;
 };
@@ -134,12 +134,13 @@ std::shared_ptr<Context> Context::acquire(std::string& err) {
         return nullptr;
     }
     // A wedge this process observed recently outlives the context that saw
-    // it, even when no marker file could be written.
+    // it, even when no marker file could be written. `fresh` is not shared
+    // yet, so its wedge state needs no lock (mark_wedged takes wedge_mu_
+    // before reg.wedge_mu).
     {
         std::lock_guard<std::mutex> rw(reg.wedge_mu);
         if (!reg.wedge_why.empty() && !fresh->wedged_ &&
             std::chrono::duration<double>(std::chrono::steady_clock::now() - reg.wedge_at).count() < kWedgeTtlSec) {
-            std::lock_guard<std::mutex> wk(fresh->wedge_mu_);
             fresh->wedged_ = true;
             fresh->wedged_why_ = "fast engine: GPU driver failure earlier in this process (" +
                                  reg.wedge_why + "); restart the app/device before retrying";
@@ -474,16 +475,16 @@ Context::~Context() {
 }
 
 void Context::mark_wedged(const std::string& why) {
+    std::lock_guard<std::mutex> lk(wedge_mu_);
+    if (wedged_) return;
+    wedged_why_ = why;
+    wedged_ = true;
     {   // Remembered for later contexts of this process (see acquire()).
         ContextRegistry& reg = registry();
         std::lock_guard<std::mutex> rk(reg.wedge_mu);
         reg.wedge_why = why;
         reg.wedge_at = std::chrono::steady_clock::now();
     }
-    std::lock_guard<std::mutex> lk(wedge_mu_);
-    if (wedged_) return;
-    wedged_why_ = why;
-    wedged_ = true;
     if (!wedge_path_.empty()) {
         if (FILE* f = std::fopen(wedge_path_.c_str(), "w")) {
             std::fprintf(f, "%s", why.c_str());

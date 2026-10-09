@@ -50,8 +50,7 @@ void usage() {
     std::fprintf(stderr,
         "usage: starling-bench --model <parakeet|moss|...> --gguf <file> [--runs N]\n"
         "                      [--cycles N] [--warmup] [--quiet] file.wav [file.wav ...]\n"
-        "  --cycles N  load, run and free the model N times in this process\n"
-        "              (device lifetime / reload studies, #325)\n");
+        "  --cycles N  load, run and free the model N times in this process\n");
 }
 
 starling_ggml_model model_kind(const std::string& s) {
@@ -102,7 +101,8 @@ int main(int argc, char** argv) {
         starling_ggml_ctx* ctx = starling_ggml_load(kind, gguf.c_str());
         if (!ctx) {
             std::fprintf(stderr, "load failed: %s\n", starling_ggml_last_error(nullptr));
-            return 1;
+            rc = 1;
+            break;
         }
         std::printf("load %.1f ms  backend=%s\n", now_ms() - t0, starling_ggml_backend_name());
 
@@ -121,7 +121,11 @@ int main(int argc, char** argv) {
                 starling::ggml::resample_pcm(pcm.data(), pcm.size(), sr, 16000, rs);
                 pcm.swap(rs);
             }
-            if (pcm.empty()) { std::fprintf(stderr, "%s: no samples\n", path.c_str()); return 1; }
+            if (pcm.empty()) {
+                std::fprintf(stderr, "%s: no samples\n", path.c_str());
+                rc = 1;
+                continue;
+            }
             const double dur = pcm.size() / 16000.0;
             if (warmup) {
                 char* w = starling_ggml_transcribe_pcm(ctx, pcm.data(), (int64_t)pcm.size(), 16000);
