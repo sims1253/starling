@@ -118,4 +118,25 @@
     <string name="model_status_failed">Recordings are still saved; you can pick another model or a server in Starling Mobile — %1$s</string>
     <string name="model_status_driver_failed">The phone\'s GPU driver reported a failure (%1$s). Recordings are still saved; restarting the phone clears it.</string>
     <string name="keyboard_stream_interrupted">Live transcription stopped: %1$s. Transcribing after stop.</string>
+    <!-- Staged dictation (#302) -->
+    <string name="staging_that_was_literal">That was literal</string>
+    <string name="staging_delete_word">Delete word</string>
+    <string name="staging_discard">Discard</string>
+    <string name="staging_show_raw">Show raw</string>
+    <string name="staging_show_processed">Show processed</string>
+    <string name="staging_back_to_raw">Back to raw</string>
+    <string name="staging_mode_chip">Mode: %1$s ▾</string>
+    <string name="staging_insert_action">Insert &amp; %1$s</string>
+    <string name="staging_insert_enter">Insert &amp; send</string>
+    <string name="staging_drafting">Recording into the draft… nothing is inserted until you tap Insert.</string>
+    <string name="staging_ready">Draft ready. Edit it, then Insert.</string>
+    <string name="staging_ready_processed">Draft ready, processed by rules in %1$d ms. Edit it, then Insert.</string>
+    <string name="staging_no_changes">Draft ready; the rules changed nothing. Edit it, then Insert.</string>
+    <string name="staging_discarded">Draft discarded. The recording stays in Starling.</string>
+    <string name="staging_no_action">Inserted. This field has no send action, so nothing was pressed.</string>
+    <string name="staging_matched_phrase">Matched “%1$s” at the start: %2$s mode.</string>
+    <string name="staging_matched_literal">“literal” at the start: the rest is kept exactly as spoken.</string>
+    <string name="staging_instruction">Instruction “%1$s” needs a text model, which this device does not have yet; it is left out of the draft.</string>
+    <string name="staging_word_selected">Word selected. Tap Delete word, or tap it again to clear.</string>
+    <string name="staging_power_saver">Battery saver: rules only.</string>
 </resources>

@@ -446,3 +446,36 @@ def test_desktop_modes_route_to_the_desktop_providers() -> None:
     # Without the S1 server configured, the local mode blocks; it never
     # falls back to the API.
     assert mr.processing_route(by_id["clean-local"], [api])["reason"] == "provider_unavailable"
+
+
+# --------------------------------------------------------------------------- #
+# The Android keyboard's built-in modes (#302) are an ordinary profiles
+# document too
+# --------------------------------------------------------------------------- #
+ANDROID_MODES = mr.load_json(mr.REPO / "apps" / "mobile" / "app" / "src" / "main" / "assets"
+                             / "modes" / "android-profiles.json")
+
+
+def test_android_modes_conform_and_pass_every_rule() -> None:
+    assert_valid(ANDROID_MODES, mr.load_schema("profiles.schema.json"))
+    mr.validate_config(ANDROID_MODES)
+    mr.validate_processing(ANDROID_MODES)
+    by_id = {p["id"]: p for p in ANDROID_MODES["profiles"]}
+    # Direct mode stays as it was: raw, live, committed on Stop.
+    default = by_id[ANDROID_MODES["default_profile"]]
+    assert default["processing_delivery"] == "direct" and default["transform_kinds"] == []
+    assert not default["spoken_commands"]
+    # No model step ships on the phone yet (#295): every mode is rules-only
+    # and nothing leaves the device.
+    assert all(p["transform_kinds"] == [] and p["local_only"] for p in ANDROID_MODES["profiles"])
+    providers = [PROVIDERS_BY_ID["local-s1"]]
+    assert all(mr.processing_route(p, providers)["status"] == "none" for p in ANDROID_MODES["profiles"])
+
+
+def test_android_mode_phrases_route() -> None:
+    staged = mr.resolve(ANDROID_MODES, {"raw_text": "Draft mode: hello comma world"})
+    assert (staged["mode"], staged["payload"]) == ("draft", "hello comma world")
+    literal = mr.resolve(ANDROID_MODES, {"raw_text": "literal message mode hi"})
+    assert (literal["mode"], literal["payload"]) == ("verbatim", "message mode hi")
+    secure = mr.resolve(ANDROID_MODES, {"raw_text": "draft mode hunter2", "secure_field": True})
+    assert secure["status"] == "blocked"
