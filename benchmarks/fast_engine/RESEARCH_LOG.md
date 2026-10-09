@@ -968,7 +968,8 @@ setup plus the wake lock. Results:
 Consequences landed: every phone bench script (`android_bench.sh`,
 `phone_ab.sh`, `phone_gates.sh`, `phone_energy.sh`, `pixel_measure.sh`)
 holds the lock for the whole session (`phone_common.sh` `wake_hold` /
-`wake_release` / `wake_held`), and the protocol rule now names suspend. Open: the app's own
-wake lock is an app-uid lock, which deep Doze disables. App GPU work in
-deep idle needs a long stationary screen-off period first, so the window is
-small, but not closed.
+`wake_release` / `wake_held`), and the protocol rule now names suspend.
+
+Open: the app's partial wake lock is disabled in deep Doze and for a cached
+(backgrounded) process, so on-device GPU work there is unprotected. Closing
+that needs a foreground service during transcription (not done).

@@ -36,8 +36,8 @@ import java.util.concurrent.atomic.AtomicLong
  * [nativeSupport] decides whether this CPU can run the native library at all
  * (see [NativeSupport]); it is checked before the library is first loaded.
  * [keepAwake] holds the CPU awake (a partial wake lock in the app) around
- * every use and every free of the model: kernel suspend with GPU work
- * outstanding wedges the Pixel's GPU driver.
+ * each native load, transcription call and free: kernel suspend with GPU
+ * work outstanding wedges the Pixel's GPU driver.
  */
 class OnDeviceEngine(
     private val modelDir: File,
@@ -496,7 +496,7 @@ class OnDeviceEngine(
         if (handle != 0L && loadedFile != modelFile && pinnedSessions == 0) unload()
         if (handle != 0L) return null
         val failed = try {
-            loadModelLocked(modelFile)
+            awake { loadModelLocked(modelFile) }
         } catch (t: Throwable) {
             // A missing or broken native library throws; the state must not
             // stay "loading", and the failure counts for the backoff.
@@ -567,11 +567,14 @@ class OnDeviceEngine(
     private inline fun <T> usingLocked(block: () -> T): T {
         useGeneration.incrementAndGet()
         try {
-            return keepAwake().use { block() }
+            return block()
         } finally {
             reportIdleLocked()
         }
     }
+
+    /** Runs one bounded native call with the CPU held awake (see [keepAwake]). */
+    private inline fun <T> awake(call: () -> T): T = keepAwake().use { call() }
 
     /** Ends a use: a new generation, reported as idle when nothing else is using the model. Caller holds [lock]. */
     private fun reportIdleLocked() {
@@ -626,7 +629,7 @@ class OnDeviceEngine(
     override fun transcribeWindow(samples: FloatArray): OnDeviceStreamSession.WindowResult = synchronized(lock) {
         usingLocked {
             ensureLoadedLocked()?.let { return OnDeviceStreamSession.WindowResult.Failed(it) }
-            val text = StarlingNative.transcribe(handle, samples, ChunkStreamer.SAMPLE_RATE)
+            val text = awake { StarlingNative.transcribe(handle, samples, ChunkStreamer.SAMPLE_RATE) }
             if (text == null) {
                 val error = StarlingNative.lastError(handle)
                 error?.let(observer::engineFailed)
@@ -699,14 +702,22 @@ class OnDeviceEngine(
 
     /**
      * Blocking transcription of a finalized WAV recording. A GPU driver
-     * failure frees the wedged model and retries once: the reload falls back
-     * to the CPU engine, so the recording still transcribes.
+     * failure, in the load's warmup or mid-transcription, has freed the
+     * model; it is retried once, and the reload falls back to the CPU engine.
      */
-    fun transcribe(audioFile: File): InferenceResult =
-        synchronized(lock) { usingLocked { transcribeLocked(audioFile, retryDriverFailure = true) } }
+    fun transcribe(audioFile: File): InferenceResult = synchronized(lock) {
+        usingLocked {
+            val result = transcribeLocked(audioFile)
+            if (result is InferenceResult.Failure && ModelLifetime.isDriverFailure(result.message)) {
+                transcribeLocked(audioFile)
+            } else {
+                result
+            }
+        }
+    }
 
     /** Caller holds [lock] inside [usingLocked]. */
-    private fun transcribeLocked(audioFile: File, retryDriverFailure: Boolean): InferenceResult {
+    private fun transcribeLocked(audioFile: File): InferenceResult {
         ensureLoadedLocked()?.let { return InferenceResult.Failure(it, false) }
 
         val decoded = WavPcm.decodeMonoFloat(audioFile)
@@ -728,13 +739,12 @@ class OnDeviceEngine(
             } else {
                 decoded.samples.copyOfRange(window.start, window.endExclusive)
             }
-            val text = StarlingNative.transcribe(handle, samples, decoded.sampleRate)
+            val text = awake { StarlingNative.transcribe(handle, samples, decoded.sampleRate) }
             if (text == null) {
                 val error = StarlingNative.lastError(handle)
                 error?.let(observer::engineFailed)
                 if (error != null && ModelLifetime.isDriverFailure(error)) {
                     releaseDriverFailureLocked(error)
-                    if (retryDriverFailure) return transcribeLocked(audioFile, retryDriverFailure = false)
                 }
                 return InferenceResult.Failure("The on-device engine returned an error: ${error ?: "unknown error"}", false)
             }
@@ -764,7 +774,7 @@ class OnDeviceEngine(
     private fun unload() {
         if (handle != 0L) {
             // Destroys the GPU device with the last engine: awake, like all GPU work.
-            keepAwake().use { StarlingNative.free(handle) }
+            awake { StarlingNative.free(handle) }
             handle = 0L
             loadedFile = null
             loadError = null
