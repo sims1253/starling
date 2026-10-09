@@ -11,7 +11,7 @@ use gpui::{
 use starling_dictation::engine::{
     Backend, EngineFailure, EngineSnapshot, InstallState, SwapDecision, SwitchReport, SwitchStage,
 };
-use starling_dictation::settings::{ActivationMode, EngineMode};
+use starling_dictation::settings::{ActivationMode, EngineMode, PlaybackMode};
 
 use crate::app::{ConnectionProbe, StarlingApp, settings_callout_view};
 use crate::processing;
@@ -38,6 +38,7 @@ pub fn render_settings_modal(
     let processing_section = render_processing_section(app, cx);
     let microphone_section = crate::views::microphone::render_microphone_section(app, cx);
     let dictation_section = render_dictation_section(app, cx);
+    let playback_section = render_playback_section(app, cx);
 
     let card = div()
         .id("settings-card")
@@ -168,6 +169,7 @@ pub fn render_settings_modal(
         })
         .child(dictation_section)
         .child(microphone_section)
+        .child(playback_section)
         .child(processing_section)
         .child(
             div()
@@ -1137,6 +1139,127 @@ fn render_dictation_section(app: &mut StarlingApp, cx: &mut Context<StarlingApp>
                 .line_height(px(10. * 1.55))
                 .child(reach),
         )
+}
+
+/// "During recording" (#361).
+const PLAYBACK_CHOICES: [(PlaybackMode, &str, &str); 3] = [
+    (
+        PlaybackMode::Off,
+        "Off",
+        "Playback keeps playing while you record.",
+    ),
+    (
+        PlaybackMode::Lower,
+        "Lower volume",
+        "Playback is lowered to the level below while you record and restored when recording \
+         stops.",
+    ),
+    (
+        PlaybackMode::Mute,
+        "Mute",
+        "Playback is muted while you record and unmuted when recording stops.",
+    ),
+];
+
+fn render_playback_section(app: &mut StarlingApp, cx: &mut Context<StarlingApp>) -> Div {
+    let mut rows = div().flex().flex_col().gap(px(6.));
+    for (mode, name, description) in PLAYBACK_CHOICES {
+        let selected = app.draft_playback_mode == mode;
+        rows = rows.child(
+            choice_row(
+                SharedString::from(format!("playback-{name}")),
+                selected,
+                name,
+                description,
+                true,
+            )
+            .on_click(cx.listener(move |this, _, _window, cx| {
+                this.draft_playback_mode = mode;
+                cx.notify();
+            })),
+        );
+    }
+
+    // Dimmed outside Lower mode, like the double-tap row.
+    let lowering = app.draft_playback_mode == PlaybackMode::Lower;
+    let level = app.draft_lower_level.read(cx).value();
+    let slider_row = div()
+        .id("playback-lower-level")
+        .flex()
+        .flex_col()
+        .gap(px(6.))
+        .p(px(10.))
+        .rounded(px(3.))
+        .border_1()
+        .border_color(if lowering {
+            theme::SETTINGS_INK
+        } else {
+            theme::SETTINGS_LINE
+        })
+        .when(!lowering, |row| row.opacity(0.5))
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .justify_between()
+                .text_size(px(11.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .child("Lower playback to")
+                .child(
+                    div()
+                        .font(theme::mono_font())
+                        .font_weight(FontWeight::NORMAL)
+                        .child(format!("{level}%")),
+                ),
+        )
+        .child(app.draft_lower_level.clone())
+        .child(helper("A level above your current volume leaves it unchanged."));
+
+    // Known only once a take has tried.
+    let unsupported = app.playback.handle().unsupported_reason();
+    let mut section = div()
+        .mt(px(29.))
+        .pt(px(21.))
+        .border_t_1()
+        .border_color(theme::SETTINGS_LINE)
+        .child(
+            div()
+                .mb(px(13.))
+                .font(theme::mono_font())
+                .text_size(px(10.))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(theme::SETTINGS_EYEBROW)
+                .child("PLAYBACK"),
+        )
+        .child(
+            div()
+                .mb(px(13.))
+                .text_size(px(11.))
+                .line_height(px(11. * 1.65))
+                .text_color(theme::SETTINGS_MUTED)
+                .child(
+                    "What happens to other audio while you dictate. Your volume and mute settings \
+                     are restored when each recording ends.",
+                ),
+        )
+        .child(rows)
+        .child(div().mt(px(6.)).child(slider_row));
+    if let Some(reason) = unsupported {
+        section = section.child(
+            div()
+                .id("playback-unsupported")
+                .mt(px(12.))
+                .bg(theme::SETTINGS_CALLOUT)
+                .p(px(12.))
+                .text_size(px(10.))
+                .line_height(px(10. * 1.55))
+                .child(format!(
+                    "Playback cannot be adjusted on this system ({reason}); recordings leave it \
+                     as it is."
+                )),
+        );
+    }
+    section
 }
 
 /// One selectable row: a radio dot, a name, and a description. A
