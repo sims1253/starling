@@ -1,5 +1,4 @@
-# phone_common.sh — helpers shared by the phone measurement scripts
-# (phone_gates.sh, phone_energy.sh). Sourced, not run.
+# phone_common.sh — helpers shared by the phone bench scripts. Sourced, not run.
 
 BENCH_BINS="starling-bench starling-bench-base starling-bench-cand"
 
@@ -26,12 +25,12 @@ screen_off() {
   esac
 }
 
-# #325: GPU work on a phone that may suspend wedges the PowerVR driver
-# (RESEARCH_LOG P3-3), and these scripts measure with the screen off. Hold a
-# shell-uid partial wake lock for the whole session (wakehold/WakeHold.java;
-# Doze does not disable wake locks of non-app uids): `wake_hold` before the
-# first bench, `wake_release || true` in the EXIT trap. The holder bounds
-# itself (default 2 h), and killing it releases the lock.
+# Kernel suspend with GPU work outstanding wedges the PowerVR driver
+# (RESEARCH_LOG P3-4), and these scripts measure with the screen off. Hold a
+# shell-uid partial wake lock (wakehold/WakeHold.java; Doze leaves non-app
+# locks alone) for the session: `wake_hold` before the first bench,
+# `wake_release || true` in the EXIT trap. The holder exits after
+# max_seconds (default 2 h); killing it releases the lock.
 WAKEHOLD_DEX=/data/local/tmp/starling/wakehold.dex
 WAKEHOLD_TAG=starling-bench
 wake_held() {

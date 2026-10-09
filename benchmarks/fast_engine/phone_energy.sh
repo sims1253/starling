@@ -52,9 +52,8 @@ adb shell "dumpsys battery | grep -E 'status|level|Charge counter' | head -3; du
 trap 'kill_benches || true; wake_release || true' EXIT   # an abort must not leave a bench running on the phone
 on_battery
 kill_benches
-# Screen off and discharging is the #325 wedge setup unless the phone is held
-# out of suspend; held for every window, idle control included, so the
-# subtracted baseline carries the same wake state.
+# Out of suspend for every window, idle control included, so the subtracted
+# baseline shares the wake state.
 wake_hold
 wait_benches
 

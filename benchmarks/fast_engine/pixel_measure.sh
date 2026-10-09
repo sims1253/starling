@@ -26,7 +26,7 @@ adb get-state >/dev/null 2>&1 || { echo "phone not connected" >&2; exit 1; }
 . "$HERE/phone_common.sh"
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"; wake_release || true' EXIT
-# the screen may be off for the run: hold the phone out of suspend (#325)
+# the screen may be off: keep the phone out of suspend
 wake_hold
 
 # --- build + push ------------------------------------------------------------

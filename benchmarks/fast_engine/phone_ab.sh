@@ -27,7 +27,7 @@ EXTRA_ENV=${EXTRA_ENV:-}
 
 . "$(dirname "$0")/phone_common.sh"
 trap 'wake_release || true' EXIT
-# the screen may be off for the run: hold the phone out of suspend (#325)
+# the screen may be off: keep the phone out of suspend
 wake_hold
 
 names=()

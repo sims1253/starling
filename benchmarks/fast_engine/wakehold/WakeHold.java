@@ -1,10 +1,10 @@
-// WakeHold — hold a PARTIAL_WAKE_LOCK as the shell uid while it runs (#325).
+// WakeHold — hold a PARTIAL_WAKE_LOCK as the shell uid while it runs.
 //
 //   adb shell CLASSPATH=/data/local/tmp/starling/wakehold.dex \
 //     app_process / WakeHold [tag] [max_seconds]
 //
 // GPU work on a phone that may suspend wedges the PowerVR driver (RESEARCH_LOG
-// P3-3), and the measurement scripts need the screen off. Shell cannot write
+// P3-4), and the measurement scripts need the screen off. Shell cannot write
 // /sys/power/wake_lock on a user build, but it holds android.permission.
 // WAKE_LOCK, and a wake lock of a uid below FIRST_APPLICATION_UID is not
 // disabled by Doze. The lock token is a Binder owned by this process:

@@ -1,22 +1,18 @@
 #!/usr/bin/env bash
-# wedge_forensics.sh — capture the evidence for a GPU wedge or a spontaneous
-# phone restart (#325) so the root cause can eventually be identified.
+# wedge_forensics.sh — capture the evidence of a GPU wedge or a spontaneous
+# phone restart.
 #
-#   wedge_forensics.sh watch start|stop               # around a phone session
-#   wedge_forensics.sh event <label>                  # the phone is still up
+#   wedge_forensics.sh watch start|stop                    # around a phone session
+#   wedge_forensics.sh event <label>                       # the phone is still up
 #   wedge_forensics.sh post-reboot <label> [--bugreport]   # it restarted
 #
-# `watch start` keeps a rotating logcat (all buffers, incl. kernel) on the
-# device for the session: the main buffer rotates in under a minute on a
-# Pixel (thermal logging), so a capture taken after an incident has usually
-# already lost the minutes that matter. `event`/`post-reboot` pull it.
-# Run `event`/`post-reboot` FIRST, before any retry, recovery load or
-# reboot: the kernel log is a ring buffer and a reboot replaces it.
-# Captures go to a directory under $STARLING_FORENSICS_DIR (default
-# ~/starling-forensics), with a one-screen summary printed. Every adb call is
-# bounded. Uses the adb device from ANDROID_SERIAL when several are attached.
-# What to do with the result: benchmarks/fast_engine/AUTORESEARCH.md,
-# "GPU failures and phone restarts".
+# `watch start` keeps a rotating device-side logcat (all buffers) for the
+# session: pixel-thermal floods the main buffer within a minute, so a later
+# capture has lost the minutes that matter. `event`/`post-reboot` pull it.
+# Capture before any retry, recovery load or reboot. Output goes under
+# $STARLING_FORENSICS_DIR (default ~/starling-forensics). Every adb call is
+# bounded; ANDROID_SERIAL picks the device. Procedure:
+# benchmarks/fast_engine/AUTORESEARCH.md, "GPU failures and phone restarts".
 set -uo pipefail
 
 mode=${1:-}
@@ -29,18 +25,23 @@ WATCH=$DEV/forensics-logcat   # rotating files: logcat.txt, logcat.txt.1, ...
 
 case "$mode" in
   watch)
-    # Restart the watcher either way, so `start` never leaves two running.
-    timeout 15 adb shell "pkill -f 'logcat -b all -v threadtime -f $WATCH' ; true" >/dev/null 2>&1
-    if [ "$label" = start ]; then
-      timeout 15 adb shell "mkdir -p $WATCH && (logcat -b all -v threadtime -f $WATCH/logcat.txt -r 16384 -n 8 \
-        </dev/null >/dev/null 2>&1 &)" && echo "logcat watch running (device: $WATCH, 8 x 16 MB)"
-    else
+    case "$label" in start|stop) ;; *) echo "usage: $0 watch start|stop" >&2; exit 2 ;; esac
+    # Stop any watcher first, so `start` never leaves two running. ([l]: the
+    # pattern must not match the shell running pkill.)
+    timeout 15 adb shell "pkill -f '[l]ogcat -b all -v threadtime -f $WATCH' ; true" >/dev/null 2>&1
+    if [ "$label" = stop ]; then
       echo "logcat watch stopped (files stay in $WATCH until the next start)"
+    elif timeout 15 adb shell "mkdir -p $WATCH && (logcat -b all -v threadtime -f $WATCH/logcat.txt -r 16384 -n 8 \
+        </dev/null >/dev/null 2>&1 &)"; then
+      echo "logcat watch running (device: $WATCH, 8 x 16 MB)"
+    else
+      echo "ERROR: could not start the logcat watch" >&2; exit 1
     fi
     exit 0 ;;
   event|post-reboot) ;;
   *) echo "usage: $0 watch start|stop | event|post-reboot <label> [--bugreport]" >&2; exit 2 ;;
 esac
+adb get-state >/dev/null 2>&1 || { echo "no adb device reachable" >&2; exit 1; }
 out="${STARLING_FORENSICS_DIR:-$HOME/starling-forensics}/$(date +%Y%m%d-%H%M%S)-$mode-$label"
 mkdir -p "$out"
 
@@ -82,12 +83,12 @@ if timeout 15 adb shell "ls $WATCH/logcat.txt" >/dev/null 2>&1; then
   timeout 300 adb pull "$WATCH" "$out/watch" >/dev/null 2>&1 || echo "watch pull failed" >&2
 fi
 grep -rhiE "pvr|rogue|rgx|hwr|lockup|gpu|watchdog|panic|vulkan|starling|lowmemorykiller|lmkd" \
-  "$out/kernel.txt" "$out/logcat.txt" ${out:+"$out/watch"} 2>/dev/null | sort -u > "$out/gpu-lines.txt" || true
-# GPU power rail over time (pixel-thermal logs the rails once a minute): a
-# rail near 0 mW while a fence wait is blocked means the GPU sat idle with
-# work outstanding — lost work, not a long-running job.
-grep -rh "S2S_VDD_GPU" "$out/logcat.txt" ${out:+"$out/watch"} 2>/dev/null | sort -u |
-  sed -E 's/^([0-9-]+ [0-9:.]+).*(S2S_VDD_GPU: [0-9.]+ mW).*(VSYS_PWR_VBATT: [0-9.]+ mW).*/\1  \2  \3/' \
+  "$out/kernel.txt" "$out/logcat.txt" "$out/watch" 2>/dev/null | sort -u > "$out/gpu-lines.txt" || true
+# GPU power rail, logged once a minute by pixel-thermal: near 0 mW during a
+# blocked fence wait means the GPU sat idle with work outstanding (lost work,
+# not a long job).
+grep -rh "S2S_VDD_GPU" "$out/logcat.txt" "$out/watch" 2>/dev/null | sort -u |
+  sed -nE 's/^([0-9-]+ [0-9:.]+).*(S2S_VDD_GPU: [0-9.]+ mW).*(VSYS_PWR_VBATT: [0-9.]+ mW).*/\1  \2  \3/p' \
   > "$out/gpu-rail.txt" || true
 
 if [ "$mode" = post-reboot ]; then

@@ -1,27 +1,21 @@
 #!/usr/bin/env bash
-# doze_repro.sh — does GPU work on a dozing phone wedge the driver? (#325)
+# doze_repro.sh — does GPU work on a dozing phone wedge the driver?
 #
 #   doze_repro.sh [arms]      # default arms: "D A D A D A"
 #
-# Alternates trials of the same workload with the phone in deep Doze (D:
-# screen off + `dumpsys deviceidle force-idle`, no wake signals) and held
-# awake (A: Doze lifted, screen woken every poll), or dozing under the
-# benches' shell wake lock (W: as D, plus phone_common.sh `wake_hold`; does
-# the lock alone prevent the wedge?). Each trial is one bench
-# process: load / run / free the model 3 times (`--cycles 3 --runs 2`).
-# After a wedge it captures forensics (wedge_forensics.sh event) and waits
-# out the 15-minute wedge marker before the next trial. Stops after 3
-# wedges, or on a restart (the kernel boot id changed: post-reboot forensics,
-# then stop) — a dozing phone may just drop wifi adb for a while, which only
-# means waiting. Always restores normal Doze and wakes the screen.
+# One bench process per trial (`--cycles 3 --runs 2`), in one of three arms:
+#   D  screen off + `dumpsys deviceidle force-idle`, no wake signals
+#   A  Doze lifted, screen woken every poll
+#   W  as D, plus the shell wake lock (phone_common.sh `wake_hold`)
+# After a wedge it captures `wedge_forensics.sh event` and waits out the
+# 15-minute wedge marker. Stops after 3 wedges or on a restart (boot id
+# changed: post-reboot forensics). A dozing phone may drop wifi adb for a
+# while; that only means waiting. Always restores Doze and wakes the screen.
 #
-# Needs: a Pixel on adb (ANDROID_SERIAL when several devices), UNPLUGGED
-# (Doze never engages on power) — or FAKE_UNPLUG=1: the framework is told the
-# phone is unplugged (`dumpsys battery unplug`, reset on exit) while it stays
-# on the charger; run D arms alongside as the control that the wedge still
-# reproduces that way, the bench binary + libs in $DEV/lt and the
-# model/fixture in $DEV. Every adb call is bounded. Results: one line per
-# trial on stdout and in $OUT/trials.txt.
+# Needs a Pixel on adb (ANDROID_SERIAL), the bench binary + libs in $DEV/lt
+# and the model/fixture in $DEV. Doze never engages on power: unplug, or set
+# FAKE_UNPLUG=1 (`dumpsys battery unplug`, reset on exit) and keep D arms as
+# the control. Results: one line per trial on stdout and in $OUT/trials.txt.
 set -uo pipefail
 
 arms=${1:-"D A D A D A"}
