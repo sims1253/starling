@@ -250,10 +250,47 @@ class StagedTakeTest {
     fun aSpokenCorrectionReplacesTheSelectedWord() {
         val take = take()
         take.dictate(final = "meet at sex comma ok")
+        assertFalse(take.beginCorrection())
         take.selectWordAt(8)
-        assertTrue(take.replaceSelection("six"))
+        assertTrue(take.beginCorrection())
+        // Frozen until the correction lands: no other edit, no new target.
+        take.selectWordAt(0)
+        take.deleteWord()
+        assertEquals("meet at sex, ok", take.displayText())
+        assertTrue(take.finishCorrection("six"))
         assertEquals("meet at six, ok", take.deliveryText())
-        assertFalse(take.replaceSelection("nothing selected"))
+        assertFalse(take.finishCorrection("again"))
+    }
+
+    @Test
+    fun aCorrectionNeverInsertsCommandText() {
+        // Review #302 round 2, item 4.
+        val take = take()
+        take.dictate(final = "meet at sex")
+        take.selectWordAt(8)
+        assertTrue(take.beginCorrection())
+        assertTrue(take.finishCorrection("six Starling, make it formal"))
+        assertEquals("meet at six", take.deliveryText())
+    }
+
+    @Test
+    fun anInstructionRightAfterTheModePhraseStaysOut() {
+        // Review #302 round 2, item 3.
+        val take = take("direct")
+        take.dictate(final = "message mode Starling, make it formal")
+        assertEquals("message", take.mode.id)
+        assertFalse(take.hasPayload)
+        assertEquals("", take.deliveryText().trim())
+    }
+
+    @Test
+    fun acceptedProcessedTextIsNotProcessedAgain() {
+        // Review #302 round 2, item 6: the literal escape survives a continuation.
+        val take = take()
+        take.dictate(final = "say literal comma")
+        assertEquals("say comma", take.displayText())
+        take.dictate(final = "again period", attempt = "a-2")
+        assertEquals("say comma again.", take.displayText())
     }
 
     @Test

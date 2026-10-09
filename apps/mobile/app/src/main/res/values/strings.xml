@@ -140,6 +140,8 @@
     <string name="staging_word_selected">Word selected. Delete it, or tap Record and say what replaces it.</string>
     <string name="staging_say_replacement">Say what replaces the selected word, then tap Stop.</string>
     <string name="staging_replacing">Replacing with: %1$s</string>
+    <string name="staging_replace_failed">Nothing was replaced: the correction was empty or the draft changed meanwhile.</string>
+    <string name="staging_nothing_to_insert">Only a mode phrase or instruction was said; there is nothing to insert.</string>
     <string name="staging_replaced">Word replaced. Edit more, or Insert.</string>
     <string name="staging_wait">The last recording is still on its way into the draft.</string>
     <string name="staging_insert_failed">The field did not accept the text; the draft is kept and nothing was sent.</string>

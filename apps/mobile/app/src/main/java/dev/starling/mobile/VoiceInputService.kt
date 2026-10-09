@@ -360,8 +360,8 @@ class VoiceInputService : InputMethodService() {
             started.target = target
             started.staged = continuing?.staged
                 ?: if (!sensitive && mode.processingDelivery == STAGED) newStagedTake(mode, recording.id) else null
-            started.replacing = replacing
-            if (!replacing) started.staged?.beginSegment()
+            started.replacing = replacing && started.staged?.beginCorrection() == true
+            if (!started.replacing) started.staged?.beginSegment()
             started.liveInField = session != null && field.supportsComposing && started.staged == null
         }
         take?.foregroundHold = CaptureForegroundService.hold(this) { stopTake() }
@@ -601,9 +601,9 @@ class VoiceInputService : InputMethodService() {
         if (staged != null) {
             current.awaitingFinal = false
             if (current.replacing) {
-                staged.replaceSelection(text.trim())
+                val replaced = staged.finishCorrection(text)
                 renderTake()
-                statusView?.setText(R.string.staging_replaced)
+                statusView?.setText(if (replaced) R.string.staging_replaced else R.string.staging_replace_failed)
             } else {
                 staged.final(completed.id, text)
                 settleDraft(current, staged)
@@ -690,6 +690,13 @@ class VoiceInputService : InputMethodService() {
         val connection = currentInputConnection
         if (current.capturing || staged.recording || target == null || !targetGuard.isCurrent(target, connection)) {
             renderTake()
+            return
+        }
+        if (!staged.hasPayload) {
+            // Only a mode phrase or an instruction was said: an empty commit
+            // would replace the field's selection, and nothing is sent.
+            renderTake()
+            statusView?.setText(R.string.staging_nothing_to_insert)
             return
         }
         val text = staged.deliveryText()
@@ -824,6 +831,8 @@ class VoiceInputService : InputMethodService() {
                 current.mode = mode
                 if (mode.processingDelivery == STAGED) {
                     val staged = switchToStaged(current)
+                    // Picked by hand: it outranks a phrase the final may still carry.
+                    staged.switchMode(mode)
                     current.lastPartial?.let(staged::partial)
                 }
             }
@@ -834,7 +843,7 @@ class VoiceInputService : InputMethodService() {
     /** A tap on a draft word selects it for Delete word. */
     private fun onDraftTouch(view: View, event: MotionEvent): Boolean {
         val staged = take?.staged ?: return false
-        if (take?.capturing == true || staged.recording) return false
+        if (take?.capturing == true || take?.awaitingFinal == true || staged.busy) return false
         if (event.action != MotionEvent.ACTION_UP) return event.action == MotionEvent.ACTION_DOWN
         val text = (view as TextView).text.toString()
         val offset = view.getOffsetForPosition(event.x, event.y).coerceIn(0, text.length)
@@ -913,7 +922,12 @@ class VoiceInputService : InputMethodService() {
     private fun keepDraft(current: Take): Boolean {
         val staged = current.staged ?: return false
         if (take !== current) return false
-        val kept = if (current.replacing) true else staged.abandonSegment()
+        val kept = if (current.replacing) {
+            staged.cancelCorrection()
+            true
+        } else {
+            staged.abandonSegment()
+        }
         if (kept) {
             current.awaitingFinal = false
             renderTake()
@@ -941,10 +955,11 @@ class VoiceInputService : InputMethodService() {
         val staged = current?.staged
         modeChip?.text = getString(R.string.staging_mode_chip, (staged?.mode ?: current?.mode ?: selectedMode()).name)
         val decision = staged?.let(::decisionText)
-        decisionRow?.visibility = if (decision != null && !current.capturing) View.VISIBLE else View.GONE
+        decisionRow?.visibility =
+            if (decision != null && !current.capturing && !current.awaitingFinal) View.VISIBLE else View.GONE
         decisionView?.text = decision
         if (staged != null) {
-            val settled = !current.capturing && !current.awaitingFinal && !staged.recording
+            val settled = !current.capturing && !current.awaitingFinal && !staged.busy
             transcriptView?.visibility = View.VISIBLE
             transcriptView?.text = renderDraft(staged)
             draftTools?.visibility = if (settled) View.VISIBLE else View.GONE
@@ -959,7 +974,7 @@ class VoiceInputService : InputMethodService() {
                     else -> R.string.staging_show_processed
                 },
             )
-            insertButton?.visibility = if (settled && bound) View.VISIBLE else View.GONE
+            insertButton?.visibility = if (settled && bound && staged.hasPayload) View.VISIBLE else View.GONE
             insertButton?.text = if (staged.mode.delivery == INSERT_ENTER) insertActionLabel() else getString(R.string.keyboard_insert)
             copyButton?.visibility = if (settled && !bound) View.VISIBLE else View.GONE
             return

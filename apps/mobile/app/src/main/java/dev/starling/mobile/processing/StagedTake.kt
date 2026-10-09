@@ -51,6 +51,13 @@ class StagedTake(
     var selection: IntRange? = null
         private set
 
+    /**
+     * The word a spoken correction will replace, frozen when its capture
+     * starts, with the revision it belongs to; nothing else edits the draft
+     * until the correction lands or is dropped.
+     */
+    private var correction: Pair<IntRange, Int>? = null
+
     val plan: ModeCatalog.Plan get() = catalog.plan(mode, powerSaver)
 
     private var segment = -1
@@ -89,6 +96,13 @@ class StagedTake(
             ?: commands.firstOrNull { it.kind == CommandKind.MODE_PHRASE && manualMode == null }?.decision
 
     val recording: Boolean get() = draft.regions().any { it.kind == RegionKind.PARTIAL }
+
+    /** A capture is feeding the draft (a segment or a correction); no edits until it lands. */
+    val busy: Boolean get() = recording || correction != null
+
+    /** Whether Insert has anything to deliver: text beyond commands and whitespace. */
+    val hasPayload: Boolean
+        get() = (if (showingProcessed) proposal?.text.orEmpty() else draft.payloadText()).isNotBlank()
 
     /**
      * A new capture adds a segment at the end of the draft. What the user
@@ -142,7 +156,7 @@ class StagedTake(
                 // payload ends where the spoken text did.
                 val cps = segmentText.codePoints().toArray()
                 var start = delimiter.first
-                while (start > 0 && Character.isWhitespace(cps[start - 1])) start -= 1
+                while (start > phraseEnd && Character.isWhitespace(cps[start - 1])) start -= 1
                 if (start >= phraseEnd) {
                     found += SegmentCommand(
                         segment,
@@ -175,7 +189,7 @@ class StagedTake(
     /** Switches the draft's mode by hand (the mode picker) and processes again. */
     fun switchMode(target: Mode) {
         manualMode = target
-        if (!recording) process()
+        if (!busy) process()
     }
 
     /**
@@ -185,7 +199,7 @@ class StagedTake(
      * again.
      */
     fun undoDecision() {
-        if (recording) return
+        if (busy) return
         val shown = decision ?: return
         val command = commands.first { it.decision === shown }
         commands.remove(command)
@@ -213,7 +227,7 @@ class StagedTake(
      * raw attempts come back (edits are dropped) and processing runs again.
      */
     fun backToRaw() {
-        if (recording) return
+        if (busy) return
         rebuildFromRaw()
         process()
         showProcessed = false
@@ -228,13 +242,14 @@ class StagedTake(
      * clears the selection when that word is already selected.
      */
     fun selectWordAt(offset: Int) {
+        if (busy) return
         val word = wordAt(displayText(), offset) ?: run { selection = null; return }
         selection = if (selection == word) null else word
     }
 
     /** Deletes the selected word, or the last word when nothing is selected. */
     fun deleteWord() {
-        if (recording) return
+        if (busy) return
         val target = selection ?: lastWord(displayText()) ?: return
         takeProcessedIntoDraft()
         val cps = draft.text().codePoints().toArray()
@@ -248,17 +263,42 @@ class StagedTake(
     }
 
     /**
-     * Replaces the selected word with [text] (a spoken correction): user
-     * text in the draft, at the word's place. False when nothing is selected.
+     * Freezes the selected word as the target of a spoken correction about
+     * to be recorded; false when nothing is selected. A processed view is
+     * taken into the draft first, so the range and revision are the draft's.
      */
-    fun replaceSelection(text: String): Boolean {
-        if (recording) return false
+    fun beginCorrection(): Boolean {
+        if (busy) return false
         val target = selection ?: return false
         takeProcessedIntoDraft()
+        correction = target to draft.revision
+        return true
+    }
+
+    /**
+     * Replaces the frozen word with a spoken correction: its payload only —
+     * a leading mode phrase or trailing instruction in it is dropped, never
+     * inserted. False (and nothing changed) when there was no correction
+     * pending, the draft moved on meanwhile, or nothing was said.
+     */
+    fun finishCorrection(text: String): Boolean {
+        val (target, revision) = correction ?: return false
+        correction = null
+        val routed = catalog.route(text, mode, secure = false).payload
+        val payload = catalog.instructions.split(routed, mode.language).payload.trim()
+        if (draft.revision != revision || payload.isEmpty()) {
+            afterEdit()
+            return false
+        }
         draft.delete(target.first, target.last + 1)
-        draft.insert(target.first, text)
+        draft.insert(target.first, payload)
         afterEdit()
         return true
+    }
+
+    /** The correction's capture failed: the draft stays as it was. */
+    fun cancelCorrection() {
+        correction = null
     }
 
     /**
@@ -319,13 +359,19 @@ class StagedTake(
         val requestId = "processing-${++requests}"
         if (draft.request(requestId) != Outcome.PENDING) return
         val input = draft.payloadText()
+        val snippets = mode.snippets.map { Snippet(it.spoken, it.expansion) }
         val started = nanoTime()
-        val output = catalog.commands.apply(
-            input,
-            mode.language,
-            mode.spokenCommands,
-            mode.snippets.map { Snippet(it.spoken, it.expansion) },
-        )
+        // Text already processed (an accepted proposal) passes through as
+        // it is: its escaped words ("literal comma") stay words.
+        val output = draft.regions()
+            .filter { it.kind != RegionKind.COMMAND }
+            .joinToString("") { region ->
+                if (region.kind == RegionKind.PROCESSED) {
+                    region.text
+                } else {
+                    catalog.commands.apply(region.text, mode.language, mode.spokenCommands, snippets)
+                }
+            }
         val elapsedMs = (nanoTime() - started) / 1_000_000
         if (draft.result(requestId, true, output) != Outcome.CURRENT) return
         if (output == input) {
