@@ -264,7 +264,7 @@ class VoiceInputService : InputMethodService() {
         take?.let(::clearComposingText)
         transcriptView?.visibility = View.GONE
         transcriptView?.text = null
-        take = Take(recording, requestGeneration, field, sensitive, streaming = session != null).also { started ->
+        take = Take(recording, requestGeneration, field, sensitive).also { started ->
             started.session = session
             started.target = target
             started.liveInField = session != null && field.supportsComposing
@@ -352,7 +352,6 @@ class VoiceInputService : InputMethodService() {
                 }
             }
             is StreamEvent.Interrupted -> {
-                current.liveBroken = true
                 current.liveInField = false
                 clearComposingText(current)
                 statusView?.text = getString(R.string.keyboard_stream_interrupted, event.reason)
@@ -645,8 +644,6 @@ class VoiceInputService : InputMethodService() {
         /** The field the take was started in; it attaches only to that field. */
         val field: EditorField,
         val sensitive: Boolean,
-        /** Whether the take started with a live stream. */
-        val streaming: Boolean,
     ) {
         var capturing = true
         var session: StreamSession? = null
@@ -662,9 +659,6 @@ class VoiceInputService : InputMethodService() {
 
         /** Whether the take owns an established (non-empty) composing region in [target]. */
         var composing = false
-
-        /** The live stream failed; composing does not come back. */
-        var liveBroken = false
 
         /**
          * The take lost its original connection; it never writes into a
