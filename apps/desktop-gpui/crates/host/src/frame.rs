@@ -8,8 +8,10 @@
 //! transport needs and the envelope does not carry: a kind
 //! discriminator, the receipt for a command (the runtime's
 //! `Result<Receipt, Rejection>`, serialized by the runtime crate
-//! itself), the snapshot projection, and transport-level errors with
-//! clear codes.
+//! itself), the snapshot projection, transport-level errors with clear
+//! codes, and the agent-dictation ask frames ([`Frame::AgentHello`] …
+//! [`Frame::PromptDone`]). The ask frames are host-level: the v1
+//! command/event sets are untouched.
 //!
 //! Wire form: `u32` big-endian byte length, then that many bytes of
 //! UTF-8 JSON. The length header is checked against the connection's
@@ -84,9 +86,13 @@ impl TransportErrorCode {
 /// One transport frame. `kind` is the serde tag.
 ///
 /// Direction rules (enforced by both sides):
-/// - client → host: [`Frame::Command`], [`Frame::GetSnapshot`]
+/// - client → host: [`Frame::Command`], [`Frame::GetSnapshot`],
+///   [`Frame::AgentHello`], [`Frame::AskUser`], [`Frame::AskCancel`],
+///   [`Frame::PromptAck`], [`Frame::PromptDone`]
 /// - host → client: [`Frame::Hello`], [`Frame::Receipt`], [`Frame::Event`],
-///   [`Frame::Snapshot`], [`Frame::TransportError`], [`Frame::Bye`]
+///   [`Frame::Snapshot`], [`Frame::TransportError`], [`Frame::Bye`],
+///   [`Frame::AgentWelcome`], [`Frame::AskResult`], [`Frame::ShowPrompt`],
+///   [`Frame::HidePrompt`]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Frame {
@@ -141,6 +147,79 @@ pub enum Frame {
     /// survives it: acknowledged audio is in storage v2, and a new host
     /// can take over the socket via the lease.
     Bye { reason: String },
+    /// An MCP agent connection identifying itself against the host's
+    /// allowlist. A refusal answers `auth_failed` and closes the
+    /// connection; only welcomed connections may send
+    /// [`Frame::AskUser`].
+    AgentHello {
+        req: String,
+        client: String,
+        token: String,
+    },
+    /// The host's acceptance of [`Frame::AgentHello`].
+    AgentWelcome { req: String, client: String },
+    /// An agent asking the user questions by voice. `req` is echoed on
+    /// the [`Frame::AskResult`] that resolves it, possibly minutes
+    /// later. Concurrent asks are queued.
+    AskUser {
+        req: String,
+        questions: Vec<String>,
+        timeout_ms: u64,
+    },
+    /// The one outcome of an [`Frame::AskUser`].
+    AskResult { req: String, outcome: AskOutcome },
+    /// The agent cancelling a queued or in-flight ask
+    /// (`NoAnswer { agent_cancelled }`).
+    AskCancel { req: String, reason: String },
+    /// The host asking the app to show a prompt. Capture
+    /// starts only after a [`Frame::PromptAck`] with `visible: true`.
+    /// `req` is the broker's ask id, not the agent's token.
+    ShowPrompt {
+        req: String,
+        questions: Vec<String>,
+        timeout_ms: u64,
+    },
+    /// The ask ended (any outcome): hide the prompt.
+    HidePrompt { req: String, reason: String },
+    /// An app acknowledging [`Frame::ShowPrompt`]. `visible: true`
+    /// opens the capture gate; `visible: false` declines the ask, or
+    /// stops the take if the gate is already open. A connection without
+    /// the app role sending it is closed.
+    PromptAck { req: String, visible: bool },
+    /// The user finished speaking: stop, transcribe, answer. Counts
+    /// only from the connection whose ack opened the gate.
+    PromptDone { req: String },
+}
+
+/// The outcome of an [`Frame::AskUser`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AskOutcome {
+    /// The finalized raw transcript and the backend that produced it.
+    Answered { text: String, backend: String },
+    /// The ask completed without a transcript.
+    NoAnswer { reason: NoAnswerReason },
+    /// The ask was refused or failed. `code` is one of
+    /// `invalid_questions`, `invalid_timeout`, `duplicate_req`,
+    /// `queue_full`, `host_busy`, `no_app`, `no_prompt_ack`, `capture_busy`,
+    /// `capture_failed`, `transcription_failed`, `runtime_unavailable`,
+    /// `shutting_down`.
+    Error { code: String, message: String },
+}
+
+/// Why an ask ended with no answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NoAnswerReason {
+    /// The budget expired before the microphone closed.
+    Timeout,
+    /// The agent cancelled or disconnected.
+    AgentCancelled,
+    /// The prompt was dismissed (or its app disconnected) after the
+    /// gate opened.
+    UserCancelled,
+    /// The prompt was declined before the gate opened.
+    Declined,
 }
 
 /// Why a frame could not be read.

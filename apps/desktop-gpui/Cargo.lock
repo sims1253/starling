@@ -5756,6 +5756,7 @@ dependencies = [
  "serde_json",
  "starling-dictation",
  "starling-runtime",
+ "starling-runtime-host",
  "tempfile",
  "thiserror 2.0.20",
  "windows-sys 0.59.0",

@@ -59,6 +59,16 @@ pub struct HostConfig {
     /// leaves `runtime.provider` as configured — tests inject doubles
     /// there.
     pub engine: EngineChoice,
+    /// The agent allowlist file (see [`crate::agent::Allowlist`]).
+    /// `None` or a missing file denies every agent client; a malformed
+    /// file refuses startup.
+    pub agent_allowlist: Option<PathBuf>,
+    /// Treats every non-agent connection as the Starling app, which may
+    /// show and answer prompts. No app-role credential exists yet, so
+    /// builds without the `test-support` feature have no app and every
+    /// ask fails with `no_app`.
+    #[cfg(feature = "test-support")]
+    pub insecure_test_app_role: bool,
     /// The runtime this host owns. Production builds pass
     /// [`HostConfig::production`]; tests inject doubles through the same
     /// builders [`RuntimeConfig`] offers.
@@ -85,6 +95,9 @@ impl HostConfig {
             settings_path: None,
             settings_poll: crate::engine::DEFAULT_SETTINGS_POLL,
             engine: EngineChoice::None,
+            agent_allowlist: None,
+            #[cfg(feature = "test-support")]
+            insecure_test_app_role: false,
             runtime: RuntimeConfig::default(),
         }
     }
@@ -158,6 +171,19 @@ impl HostConfig {
     /// Overrides how often the settings watcher polls the file.
     pub fn with_settings_poll(mut self, poll: Duration) -> Self {
         self.settings_poll = poll;
+        self
+    }
+
+    /// Sets the agent allowlist file.
+    pub fn with_agent_allowlist(mut self, path: Option<PathBuf>) -> Self {
+        self.agent_allowlist = path;
+        self
+    }
+
+    /// See [`HostConfig::insecure_test_app_role`].
+    #[cfg(feature = "test-support")]
+    pub fn with_insecure_test_app_role(mut self) -> Self {
+        self.insecure_test_app_role = true;
         self
     }
 

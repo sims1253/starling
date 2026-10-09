@@ -82,7 +82,10 @@ Transitions: `capture.start` from `Idle|Persisted` → `Acquiring`;
 errors surface without a transition); internal: `Interrupted → Recovering` on
 restart. `capture.stopped` carries `sampleDurationMs` (acknowledged samples /
 actual rate) separately from `wallClockMs` (includes start latency + drain
-wait). **Invariant: no `jobs.*` message participates in any capture exit —
+wait). Take binding: a `capture.stop` or `capture.abort` whose `corr` names a
+take is rejected (`IllegalInState`) unless it is the current take (the live
+one, or the one whose stop is still persisting); one without a `corr` applies
+to the current take as before. **Invariant: no `jobs.*` message participates in any capture exit —
 Draining never waits on inference (test-enforced).**
 
 ### jobs (scheduler; supervised workers)

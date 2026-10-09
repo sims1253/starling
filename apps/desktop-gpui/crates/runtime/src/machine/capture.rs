@@ -1294,6 +1294,20 @@ impl CaptureActor {
         let super::Inbound {
             corr, command, reply, ..
         } = inbound;
+        // A stop or abort that names a take must name the current one,
+        // so a client can never end someone else's take by accident.
+        if let (Command::CaptureStop { .. } | Command::CaptureAbort, Some(named)) =
+            (&command, corr.as_deref())
+        {
+            if let Some(current) = self.current_take_corr().filter(|current| *current != named) {
+                let _ = reply.try_send(Err(Rejection::IllegalInState {
+                    command: command.type_name().to_string(),
+                    state: self.core.state().to_string(),
+                    detail: format!("take {named:?} is not the current take {current:?}"),
+                }));
+                return;
+            }
+        }
         let corr = corr.unwrap_or_else(|| "take-anon".to_string());
         match command {
             Command::CaptureStart { policy } => {
@@ -1351,6 +1365,14 @@ impl CaptureActor {
             }
         }
         self.publish_view();
+    }
+
+    /// The live take's corr, or the one whose stop is still persisting.
+    fn current_take_corr(&self) -> Option<&str> {
+        self.take
+            .as_ref()
+            .map(|take| take.corr.as_str())
+            .or_else(|| self.pending_persists.last().map(|(_, corr)| corr.as_str()))
     }
 
     fn start_take(&mut self, corr: String, policy: String) {

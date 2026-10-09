@@ -15,7 +15,8 @@
 //! # Layout
 //!
 //! - [`frame`] — the length-prefixed frame around the I3 envelope
-//!   (no second wire format; transport control only).
+//!   (no second wire format; transport control plus the host-level
+//!   agent-dictation ask frames).
 //! - [`auth`] + [`platform`] — peer authentication and the per-OS
 //!   transport: UDS + `SO_PEERCRED`/`LOCAL_PEERCRED` on unix, a DACL'd
 //!   named pipe on Windows (compile-unverified there — see that module).
@@ -25,6 +26,11 @@
 //! - [`engine`] — the supervised inference engine attached to the
 //!   runtime, following the desktop settings file while the host
 //!   serves.
+//! - [`agent`] — the agent-dictation ask surface: the client allowlist
+//!   and the broker that serializes asks behind a prompt-visibility
+//!   gate and drives the existing capture/jobs path.
+//! - [`mcp`] — the MCP stdio server behind the `mcp-dictation` binary,
+//!   bridging `tools/call` onto [`agent`]'s ask frames.
 //! - [`client`] — the client library the GPUI app will hold (the
 //!   Electron comparison app has since been removed from the tree).
 //!
@@ -61,12 +67,14 @@
 //! comparison app the design names as a second client has been removed
 //! from the tree, so there is no second adapter to switch.
 
+pub mod agent;
 pub mod auth;
 pub mod client;
 pub mod config;
 pub mod engine;
 pub mod frame;
 pub mod limits;
+pub mod mcp;
 pub mod platform;
 pub mod server;
 
