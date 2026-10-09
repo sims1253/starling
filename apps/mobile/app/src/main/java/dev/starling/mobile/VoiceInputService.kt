@@ -444,7 +444,11 @@ class VoiceInputService : InputMethodService() {
                 if (!current.sensitive) {
                     val routed = catalog.route(event.text, current.mode, secure = false)
                     val routedMode = routed.mode?.let(catalog::mode)
-                    if (routed.prefixSpanCodepoints != null && routedMode?.processingDelivery == STAGED) {
+                    // A hand-picked mode is locked: a phrase is still kept
+                    // out of the field, but it switches nothing.
+                    if (!current.manualLocked && routed.prefixSpanCodepoints != null &&
+                        routedMode?.processingDelivery == STAGED
+                    ) {
                         // "draft mode …": the rest of this take is a draft.
                         switchToStaged(current)
                         current.staged?.partial(event.text)
@@ -597,6 +601,8 @@ class VoiceInputService : InputMethodService() {
             )
             return
         }
+        // Measured before any processing runs, so stop->raw is the recognizer's alone.
+        val rawMs = (System.nanoTime() - current.stoppedAtNanos) / 1_000_000
         val staged = current.staged
         if (staged != null) {
             current.awaitingFinal = false
@@ -606,24 +612,26 @@ class VoiceInputService : InputMethodService() {
                 statusView?.setText(if (replaced) R.string.staging_replaced else R.string.staging_replace_failed)
             } else {
                 staged.final(completed.id, text)
-                settleDraft(current, staged)
+                settleDraft(current, staged, rawMs)
             }
             return
         }
         if (!current.sensitive) {
             val routed = catalog.route(text, current.mode, secure = false)
-            val routedMode = routed.mode?.let(catalog::mode) ?: current.mode
+            val routedMode = if (current.manualLocked) current.mode else routed.mode?.let(catalog::mode) ?: current.mode
             val instruction = routedMode.behavior != VERBATIM &&
                 catalog.instructions.split(routed.payload, routedMode.language).matched
             // A staged mode phrase, a spoken instruction, an ambiguous phrase
             // or nothing left after the phrase: the take becomes a draft
             // instead of being delivered.
-            if (routedMode.processingDelivery == STAGED || instruction || routed.mode == null ||
-                routed.payload.isBlank()
+            if (routedMode.processingDelivery == STAGED || instruction ||
+                (routed.mode == null && !current.manualLocked) || routed.payload.isBlank()
             ) {
                 current.awaitingFinal = false
-                switchToStaged(current).final(completed.id, text)
-                settleDraft(current, current.staged ?: return)
+                val draft = switchToStaged(current)
+                if (current.manualLocked) draft.switchMode(current.mode)
+                draft.final(completed.id, text)
+                settleDraft(current, draft, rawMs)
                 return
             }
             text = routed.payload
@@ -772,8 +780,7 @@ class VoiceInputService : InputMethodService() {
     }
 
     /** A capture's final landed in the draft: show it, and log the timings for #226. */
-    private fun settleDraft(current: Take, staged: StagedTake) {
-        val rawMs = (System.nanoTime() - current.stoppedAtNanos) / 1_000_000
+    private fun settleDraft(current: Take, staged: StagedTake, rawMs: Long) {
         val processedMs = staged.proposal?.elapsedMs
         runCatching {
             Log.i(
@@ -825,10 +832,12 @@ class VoiceInputService : InputMethodService() {
             current == null || current.sensitive || current.ready != null -> Unit
             current.staged != null -> {
                 current.mode = mode
+                current.manualLocked = true
                 current.staged?.switchMode(mode)
             }
             current.capturing -> {
                 current.mode = mode
+                current.manualLocked = true
                 if (mode.processingDelivery == STAGED) {
                     val staged = switchToStaged(current)
                     // Picked by hand: it outranks a phrase the final may still carry.
@@ -964,7 +973,7 @@ class VoiceInputService : InputMethodService() {
             transcriptView?.text = renderDraft(staged)
             draftTools?.visibility = if (settled) View.VISIBLE else View.GONE
             viewToggle?.visibility = when {
-                staged.proposal != null || staged.processedInDraft -> View.VISIBLE
+                staged.proposal != null || staged.canRevertToRaw -> View.VISIBLE
                 else -> View.INVISIBLE
             }
             viewToggle?.setText(
@@ -1127,6 +1136,9 @@ class VoiceInputService : InputMethodService() {
 
         /** When Stop was tapped, for the stop→raw/processed timings. */
         var stoppedAtNanos = 0L
+
+        /** The mode was picked by hand during this take; spoken phrases no longer switch it. */
+        var manualLocked = false
 
         /** Stopped, but its transcript has not settled yet. */
         var awaitingFinal = false

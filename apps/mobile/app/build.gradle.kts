@@ -71,8 +71,10 @@ if (releaseSigning != null) {
 // app and every other port read one copy.
 val contractsDir = layout.projectDirectory.dir("../../../packages/contracts")
 
+@CacheableTask
 abstract class ContractAssetsTask : DefaultTask() {
     @get:InputFiles
+    @get:PathSensitive(PathSensitivity.NAME_ONLY)
     abstract val tables: ConfigurableFileCollection
 
     @get:OutputDirectory
@@ -82,7 +84,7 @@ abstract class ContractAssetsTask : DefaultTask() {
     fun copy() {
         val out = outputDir.get().asFile.resolve("contracts")
         out.deleteRecursively()
-        out.mkdirs()
+        check(out.mkdirs() || out.isDirectory) { "Unable to create the contract assets directory $out" }
         tables.files.forEach { it.copyTo(out.resolve(it.name)) }
     }
 }

@@ -127,7 +127,6 @@
     <string name="staging_back_to_raw">Back to raw</string>
     <string name="staging_mode_chip">Mode: %1$s ▾</string>
     <string name="staging_insert_action">Insert &amp; %1$s</string>
-    <string name="staging_insert_enter">Insert &amp; send</string>
     <string name="staging_drafting">Recording into the draft… nothing is inserted until you tap Insert.</string>
     <string name="staging_ready">Draft ready. Edit it, then Insert.</string>
     <string name="staging_ready_processed">Draft ready, processed by rules in %1$d ms. Edit it, then Insert.</string>

@@ -351,4 +351,16 @@ class StagedTakeTest {
         assertNull(take.proposal)
         assertEquals("hello comma", take.deliveryText())
     }
+
+    @Test
+    fun backToRawStaysAvailableAfterAnEditTheRulesIgnore() {
+        val take = take()
+        take.dictate(final = "one two")
+        assertFalse(take.canRevertToRaw)
+        take.deleteWord()
+        assertNull(take.proposal)
+        assertTrue(take.canRevertToRaw)
+        take.backToRaw()
+        assertEquals("one two", take.displayText())
+    }
 }

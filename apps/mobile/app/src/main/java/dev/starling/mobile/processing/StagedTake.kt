@@ -244,6 +244,14 @@ class StagedTake(
         get() = draft.regions().any { it.kind == RegionKind.PROCESSED }
 
     /**
+     * Whether "Back to raw" would change anything: a processed revision was
+     * taken in, or the user edited the text (commands only relabel spans, so
+     * an unedited draft reads exactly as its raw attempts).
+     */
+    val canRevertToRaw: Boolean
+        get() = !busy && (processedInDraft || draft.text() != draft.rawText())
+
+    /**
      * Selects the word at [offset] (code points into [displayText]), or
      * clears the selection when that word is already selected.
      */
