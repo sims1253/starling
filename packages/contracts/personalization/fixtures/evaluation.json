@@ -1,0 +1,103 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Held-out evaluation dataset measuring correction burden reduction (#305)",
+  "sessions": [
+    {
+      "session_id": "eval_session_vocabulary",
+      "mode_id": "clean",
+      "language": "en",
+      "takes": [
+        {
+          "take_id": "t1",
+          "raw": "Welcome to sterling dictation system.",
+          "unpersonalized_output": "Welcome to sterling dictation system.",
+          "ground_truth_target": "Welcome to Starling dictation system.",
+          "protected_spans": []
+        },
+        {
+          "take_id": "t2",
+          "raw": "Deploy the pod to k8s cluster.",
+          "unpersonalized_output": "Deploy the pod to k8s cluster.",
+          "ground_truth_target": "Deploy the pod to Kubernetes cluster.",
+          "protected_spans": []
+        },
+        {
+          "take_id": "t3",
+          "raw": "Call getUserProfile with camelCase.",
+          "unpersonalized_output": "Call getUserProfile with camelCase.",
+          "ground_truth_target": "Call getUserProfile with camelCase.",
+          "protected_spans": [
+            "getUserProfile",
+            "camelCase"
+          ]
+        },
+        {
+          "take_id": "t4",
+          "raw": "See https://sterling.example/k8s for details.",
+          "unpersonalized_output": "See https://sterling.example/k8s for details.",
+          "ground_truth_target": "See https://sterling.example/k8s for details.",
+          "protected_spans": [
+            "https://sterling.example/k8s"
+          ]
+        },
+        {
+          "take_id": "t5",
+          "raw": "Call `sterling()` before k8s.",
+          "unpersonalized_output": "Call `sterling()` before k8s.",
+          "ground_truth_target": "Call `sterling()` before Kubernetes.",
+          "protected_spans": [
+            "`sterling()`"
+          ]
+        },
+        {
+          "take_id": "t6",
+          "raw": "Open /my sterling notes/file.txt now.",
+          "unpersonalized_output": "Open /my sterling notes/file.txt now.",
+          "ground_truth_target": "Open /my sterling notes/file.txt now.",
+          "protected_spans": [
+            "/my sterling notes/file.txt"
+          ]
+        },
+        {
+          "take_id": "t7",
+          "raw": "Open \"/tmp/my sterling notes.txt\" now.",
+          "unpersonalized_output": "Open \"/tmp/my sterling notes.txt\" now.",
+          "ground_truth_target": "Open \"/tmp/my sterling notes.txt\" now.",
+          "protected_spans": [
+            "\"/tmp/my sterling notes.txt\""
+          ]
+        },
+        {
+          "take_id": "t8",
+          "raw": "Open \"C:\\Users\\me\\sterling notes.txt\" now.",
+          "unpersonalized_output": "Open \"C:\\Users\\me\\sterling notes.txt\" now.",
+          "ground_truth_target": "Open \"C:\\Users\\me\\sterling notes.txt\" now.",
+          "protected_spans": [
+            "\"C:\\Users\\me\\sterling notes.txt\""
+          ]
+        },
+        {
+          "take_id": "t9",
+          "raw": "Run ``sterling k8s`` here.",
+          "unpersonalized_output": "Run ``sterling k8s`` here.",
+          "ground_truth_target": "Run ``sterling k8s`` here.",
+          "protected_spans": [
+            "``sterling k8s``"
+          ]
+        }
+      ],
+      "active_suggestions": [
+        {
+          "target_type": "vocabulary",
+          "source_phrase": "sterling",
+          "target_phrase": "Starling"
+        },
+        {
+          "target_type": "vocabulary",
+          "source_phrase": "k8s",
+          "target_phrase": "Kubernetes"
+        }
+      ]
+    }
+  ]
+}
