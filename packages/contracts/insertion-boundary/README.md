@@ -1,89 +1,80 @@
 # Insertion-boundary contract
 
 Deterministic boundary formatting for dictated text that lands in the middle
-of existing text (#341). When an insertion target can report the text
-immediately around the insertion point (an Android `InputConnection`, the
-Linux IBus surrounding-text capability, or a desktop adapter that exposes it),
-the delivery step adjusts **only** the boundary: a leading space and the case
-of the dictated text's first letter. Nothing else is ever touched.
+of existing text. When an insertion target can report the text around the
+insertion point (an Android `InputConnection`, IBus surrounding text, a
+desktop adapter that exposes it), delivery adjusts **only** the boundary: a
+leading space and the case of the first letter.
 
-The raw recognition text stays unchanged and one action away: the adjustment
-is recorded as a delivery-time revision whose source is the raw revision
-(`provenance: "insertion-boundary"`), never an edit of it.
+The raw recognition text is never edited: the adjustment is recorded as a
+separate revision derived from the raw one (`provenance:
+"insertion-boundary"`).
 
-This folder is frozen contract data. The Python oracle
-(`tests/insertion_boundary.py` + `tests/test_insertion_boundary.py`) and the
-Rust port (`starling-processing`'s `boundary` module + its conformance test)
-replay `fixtures/boundary-cases.json` against the same rules, so the two
-implementations can never test against different copies.
+The Python oracle (`tests/insertion_boundary.py`) and the Rust port
+(`starling-processing`'s `boundary` module) both replay
+`fixtures/boundary-cases.json`.
 
 ## Inputs and outputs
 
-Inputs per case: `before` (text immediately before the insertion point),
-`after` (text immediately after it), `raw` (the dictated text), and the
-`verbatim` flag (a verbatim mode disables every rule).
+Inputs: `before` (text immediately before the insertion point), `after`
+(text immediately after it), `raw` (the dictated text) and `verbatim`.
 
-Output: the adjusted text plus the list of changes that fired, each one
-`leading_space` or `first_letter_case`. When no rule fires, the output is
-byte-for-byte the raw text.
+Output: the adjusted text plus the rules that fired, each `leading_space` or
+`first_letter_case`. When no rule fires, the output is byte-for-byte `raw`.
+A fixture change's `detail` is an explanation for readers, not compared.
 
-## Rules (in order; each rule is independent)
+## Rules
 
 1. **Verbatim.** `verbatim: true` → no changes at all.
-2. **Leading space.** Prepend one U+0020 iff ALL hold:
+2. **Leading space.** Prepend one U+0020 iff all hold:
    - `before` is non-empty;
-   - its last character is not whitespace;
-   - its last character is not in the opening set
-     `( [ { " ' “ ‘ „ « 「 『 【 （` — straight `"` and `'` count as opening
-     here (at an insertion point they are ambiguous; this pins one reading);
-   - the first character of `raw` is not whitespace (never double-space).
-3. **First-letter case.** Lowercase the first cased character of `raw` iff
-   ALL hold:
+   - its last character is neither whitespace nor in the opening set
+     `( [ { " ' “ ‘ „ « 「 『 【 （` (straight `"` and `'` are ambiguous at an
+     insertion point; this pins them as opening);
+   - `raw` does not start with whitespace (never double-space).
+3. **First-letter case.** Take the first cased character of `raw`; if it has
+   a lowercase mapping different from itself, replace it with its **full**
+   lowercase mapping (`İ` → `i̇`, Python `str.lower()` semantics), iff all
+   hold:
    - the first whitespace-delimited token of `raw` is not protected (below);
-   - `before`'s trailing whitespace run contains no newline or carriage
-     return (a newline boundary behaves like the start of a field: case is
-     kept as recognized);
-   - `before`'s last non-whitespace character is mid-sentence: alphanumeric,
-     or one of `, ; : ) ] } ” ’ » 」 』 】 ） 》` — sentence enders
-     (`. ! ? … 。 ！ ？`) and the opening set keep the case;
-   - the character has a lowercase mapping different from itself; the
-     **full** mapping is applied (multi-character lowercases such as `İ`
-     → `i̇` included — the Python `str.lower()` semantics).
+   - `before`'s trailing whitespace contains no `\n` or `\r` (a new line
+     behaves like the start of a field);
+   - `before`'s last non-whitespace character is alphanumeric or one of
+     `, ; : ) ] } ” ’ » 」 』 】 ） 》`. Sentence enders (`. ! ? … 。 ！ ？`)
+     and the opening set keep the case.
+
+   If the first cased character is already lowercase, nothing changes:
+   later capitals are never touched.
 4. **Trailing.** Never. The end of `raw` is not modified whatever `after`
-   contains ("no trailing-space changes inside words"); `after` is carried in
-   the contract so future rules have pinned data, and so adapters can be
-   validated on what they read.
+   contains; `after` is part of the contract so future rules have pinned
+   data.
 
-**Protected first tokens (no case change; the space rule still applies):**
-the first token contains any of `_ / \ @ #`, or contains `://`, or starts
-with `www.` (paths, URLs, emails, hashtags, snake_case); or contains a camel
-hump (a lowercase letter immediately followed by an uppercase one —
-`camelCase`, `PascalCase` with a leading lower elsewhere, `iPhone`); or is
-all-uppercase with at least two alphabetic characters (`NASA`, `MY_CONST` is
-already covered by `_`); or is the English pronoun `I`.
+**Protected first tokens** (no case change; the space rule still applies):
+the token contains any of `_ / \ @ #` or starts with `www.` (paths, URLs,
+emails, hashtags, snake_case); contains a camel hump (a lowercase letter
+immediately followed by an uppercase one: `camelCase`, `iPhone`); is
+all-uppercase with at least two letters (`NASA`); or is the English pronoun
+`I`.
 
-Non-cased scripts (CJK, Arabic, Hebrew) naturally record no case change; the
-space rule is script-agnostic. All processing is on logical text; no
-reordering, no normalization, no combining-character changes.
+Scripts without case (CJK, Arabic, Hebrew) never get a case change; the
+space rule is script-agnostic. Processing is on logical text: no reordering,
+no normalization.
 
 ## Security
 
 Surrounding text is read only where the platform exposes it without extra
 permissions, and **never** for secure/password fields or fields marked
-incognito (`IME_FLAG_NO_PERSONALIZED_LEARNING`); that exclusion is an
-adapter-side duty (see the runtime `DeliveryAdapter::surrounding_text` seam:
-capability-reported, refused for secure targets). The text is used for this
-decision only — it is not stored in history and not sent to any processing
-provider.
+incognito (`IME_FLAG_NO_PERSONALIZED_LEARNING`); enforcing that is the
+adapter's duty (`DeliveryAdapter::surrounding_text`). The text is used for
+this decision only: it is not stored in history and not sent to any
+processing provider.
 
 ## Files
 
 | File | Role |
 |---|---|
 | `boundary.schema.json` | Structure of one fixture case. |
-| `fixtures/boundary-cases.json` | The pinned cases: start of field, mid-sentence, after `.`/`?`/`!`, after a newline, after an opening quote/bracket, before existing punctuation, mid-word after-text, code identifiers, non-Latin scripts, RTL, verbatim, empties. |
-
-Run the conformance suites with:
+| `fixtures/boundary-cases.json` | The pinned cases. |
 
 ```
 uv run python -m pytest tests/test_insertion_boundary.py -q

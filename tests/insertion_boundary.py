@@ -1,180 +1,85 @@
-"""Insertion-boundary oracle (#341) — the executable contract behind
-``packages/contracts/insertion-boundary``.
+"""Insertion-boundary oracle — the executable contract behind
+``packages/contracts/insertion-boundary`` (the README there is
+authoritative).
 
-Stdlib only, like every oracle here: this module is the rules, the fixtures
-are the pinned truth, and ``tests/test_insertion_boundary.py`` replays the
-fixture table through it. The Rust port (``starling-processing``'s ``boundary``
-module) replays the same files, so neither implementation can drift from the
-contract.
-
-The rules in full are frozen in the contract README; this docstring is a
-summary, the README is authoritative:
-
-1. ``verbatim`` disables every rule.
-2. Leading space: prepend one U+0020 iff ``before`` is non-empty, its last
-   character is neither whitespace nor in the opening set, and ``raw`` does
-   not already start with whitespace.
-3. First-letter case: lowercase the first cased character of ``raw`` iff the
-   first token of ``raw`` is not protected, the trailing whitespace run of
-   ``before`` contains no newline, and ``before``'s last non-whitespace
-   character is mid-sentence (alphanumeric or one of the listed continuing
-   punctuation characters; sentence enders and the opening set keep the
-   case).
-4. Trailing: never — ``after`` is carried for validation and future rules,
-   but no rule touches the end of ``raw``.
+Stdlib only, like every oracle here. ``tests/test_insertion_boundary.py``
+replays the fixture table through ``adjust``; the Rust port
+(``starling-processing``'s ``boundary`` module) replays the same file.
 """
 
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
-CONTRACT = Path(__file__).parent.parent / "packages" / "contracts" / "insertion-boundary"
+CASES_PATH = (
+    Path(__file__).parent.parent
+    / "packages"
+    / "contracts"
+    / "insertion-boundary"
+    / "fixtures"
+    / "boundary-cases.json"
+)
 
-# Characters after which dictated content is *starting* (no space, case
-# kept). Straight `"` and `'` are ambiguous at an insertion point; the
-# contract pins them as opening.
-OPENING = set('([{"\'“‘„「『【（')
+# After these, dictated content is starting (no space, case kept). Straight
+# `"` and `'` are ambiguous at an insertion point; the contract pins them as
+# opening.
+OPENING = set("([{\"'“‘„«「『【（")
 
-# Mid-sentence punctuation (continues the sentence) beyond alphanumerics.
+# Punctuation that continues a sentence (besides alphanumerics). Sentence
+# enders are deliberately absent: the case is kept after them.
 CONTINUING = set(",;:)]}”’»」』】）》")
-
-# Sentence enders: the case is kept as recognized.
-SENTENCE_END = set(".!?…。！？")
-
-LEADING_SPACE = "leading_space"
-FIRST_LETTER_CASE = "first_letter_case"
-
-
-@dataclass
-class BoundaryCase:
-    """One fixture case, field-for-field with boundary.schema.json."""
-
-    case_id: str
-    before: str
-    after: str
-    raw: str
-    verbatim: bool
-    description: str = ""
-
-    @classmethod
-    def from_json(cls, doc: dict) -> "BoundaryCase":
-        return cls(
-            case_id=doc["case_id"],
-            before=doc["before"],
-            after=doc["after"],
-            raw=doc["raw"],
-            verbatim=doc["verbatim"],
-            description=doc.get("description", ""),
-        )
-
-
-@dataclass
-class BoundaryAdjustment:
-    """The adjusted text plus the changes that fired, in order."""
-
-    text: str
-    changes: list[dict] = field(default_factory=list)
 
 
 def _is_cased(ch: str) -> bool:
     return ch != ch.lower() or ch != ch.upper()
 
 
-def _has_newline_in_trailing_whitespace(before: str) -> bool:
-    i = len(before)
-    while i > 0 and before[i - 1].isspace():
-        i -= 1
-    return any(c in "\r\n" for c in before[i:])
-
-
-def _last_non_whitespace(before: str) -> str | None:
-    for ch in reversed(before):
-        if not ch.isspace():
-            return ch
-    return None
-
-
-def _first_token(raw: str) -> str:
-    parts = raw.split()
-    return parts[0] if parts else ""
-
-
-def _protected_token(token: str) -> bool:
-    if not token:
+def _continues_sentence(before: str) -> bool:
+    trimmed = before.rstrip()
+    if not trimmed:
         return False
-    if any(c in token for c in "_/\\@#"):
+    trailing = before[len(trimmed) :]
+    last = trimmed[-1]
+    return "\n" not in trailing and "\r" not in trailing and (last.isalnum() or last in CONTINUING)
+
+
+def _protected_token(raw: str) -> bool:
+    parts = raw.split()
+    if not parts:
+        return False
+    token = parts[0]
+    if any(c in token for c in "_/\\@#") or token.startswith("www."):
         return True
-    if "://" in token or token.startswith("www."):
+    if token == "I":
         return True
     if any(a.islower() and b.isupper() for a, b in zip(token, token[1:])):
-        return True  # camel hump: a lowercase letter immediately followed by an uppercase one
+        return True  # camel hump
     letters = [c for c in token if c.isalpha()]
-    if len(letters) >= 2 and all(c.isupper() for c in letters):
-        return True  # ALL-CAPS
-    if token == "I":
-        return True  # the English pronoun
-    return False
+    return len(letters) >= 2 and all(c.isupper() for c in letters)  # ALL-CAPS
 
 
-def adjust(case: BoundaryCase) -> BoundaryAdjustment:
-    """Apply the frozen rules; never more than the boundary."""
-    changes: list[dict] = []
-    if case.verbatim or not case.raw:
-        return BoundaryAdjustment(case.raw, changes)
+def adjust(before: str, raw: str, verbatim: bool) -> tuple[str, list[str]]:
+    """The adjusted text and the kinds of the rules that fired, in order."""
+    if verbatim or not raw:
+        return raw, []
+    text, changes = raw, []
 
-    text = case.raw
-
-    # Rule 2: leading space.
-    if (
-        case.before
-        and not text[0].isspace()
-        and not case.before[-1].isspace()
-        and case.before[-1] not in OPENING
-    ):
+    if before and not raw[0].isspace() and not before[-1].isspace() and before[-1] not in OPENING:
         text = " " + text
-        changes.append(
-            {
-                "kind": LEADING_SPACE,
-                "detail": (
-                    f"previous character {case.before[-1]!r} is not whitespace "
-                    "or an opening bracket/quote"
-                ),
-            }
-        )
+        changes.append("leading_space")
 
-    # Rule 3: first-letter case.
-    last = _last_non_whitespace(case.before)
-    continues = (
-        last is not None
-        and not _has_newline_in_trailing_whitespace(case.before)
-        and (last.isalnum() or last in CONTINUING)
-    )
-    if continues and not _protected_token(_first_token(text)):
-        chars = list(text)
-        for i, ch in enumerate(chars):
-            if _is_cased(ch) and ch.lower() != ch:
-                chars[i] = ch.lower()
-                text = "".join(chars)
-                changes.append(
-                    {
-                        "kind": FIRST_LETTER_CASE,
-                        "detail": (
-                            f"previous non-whitespace {last!r} continues the sentence"
-                        ),
-                    }
-                )
-                break
+    if _continues_sentence(before) and not _protected_token(raw):
+        # Only the first cased character is considered: if it is already
+        # lowercase, later capitals are left alone.
+        i = next((i for i, ch in enumerate(text) if _is_cased(ch)), None)
+        if i is not None and text[i].lower() != text[i]:
+            text = text[:i] + text[i].lower() + text[i + 1 :]
+            changes.append("first_letter_case")
 
-    return BoundaryAdjustment(text, changes)
+    return text, changes
 
 
-def load_cases() -> list[tuple[dict, BoundaryCase, dict]]:
-    """(fixture doc, parsed case, expected block) for every pinned case."""
-    path = CONTRACT / "fixtures" / "boundary-cases.json"
-    docs = json.loads(path.read_text(encoding="utf-8"))
-    return [
-        (doc, BoundaryCase.from_json(doc), doc)
-        for doc in docs
-    ]
+def load_cases() -> list[dict[str, Any]]:
+    return json.loads(CASES_PATH.read_text(encoding="utf-8"))

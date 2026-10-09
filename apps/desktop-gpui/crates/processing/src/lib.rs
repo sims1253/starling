@@ -3,8 +3,8 @@
 //! - [`contract`]: the #293 records (mode entry, provider declaration,
 //!   transform request/result) and the provider choice, ported from the
 //!   executable oracle `tests/mode_routing.py`.
-//! - [`boundary`]: the insertion-boundary rules (#341) — the deterministic
-//!   delivery-time step (leading space, first-letter case), frozen in
+//! - [`boundary`]: the delivery-time insertion-boundary rules (leading
+//!   space, first-letter case), frozen in
 //!   `packages/contracts/insertion-boundary/`.
 //! - [`staging`]: the staged draft of one take (typed regions, immutable
 //!   raw attempts, proposals pinned to a revision), ported from

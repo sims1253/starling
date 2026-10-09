@@ -1,18 +1,11 @@
 """Replays ``packages/contracts/insertion-boundary/fixtures/boundary-cases.json``
-through the oracle in ``tests/insertion_boundary.py`` (#341).
-
-Run with:
-
-    uv run python -m pytest tests/test_insertion_boundary.py -q
-
-The Rust port replays the same file (``starling-processing`` conformance
-test), so a case changed on one side fails on the other.
+through the oracle in ``tests/insertion_boundary.py``. The Rust port
+replays the same file (``starling-processing``'s ``boundary_conformance``).
 """
 
 from __future__ import annotations
 
 import json
-import pathlib
 
 import pytest
 
@@ -24,65 +17,42 @@ try:
 except ImportError:  # pragma: no cover - exercised only without the package
     jsonschema = None
 
-CONTRACT = pathlib.Path(__file__).parent.parent / "packages" / "contracts" / "insertion-boundary"
-CASES_PATH = CONTRACT / "fixtures" / "boundary-cases.json"
-SCHEMA_PATH = CONTRACT / "boundary.schema.json"
+CASES = oracle.load_cases()
+SCHEMA = json.loads(
+    (oracle.CASES_PATH.parent.parent / "boundary.schema.json").read_text(encoding="utf-8")
+)
 
 
-def _cases() -> list[dict]:
-    return json.loads(CASES_PATH.read_text(encoding="utf-8"))
-
-
-def test_fixture_table_is_valid_and_unique() -> None:
-    cases = _cases()
-    assert len(cases) >= 30, "the acceptance fixture classes must stay pinned"
-    ids = [case["case_id"] for case in cases]
+def test_fixture_table_is_complete_and_unique() -> None:
+    assert len(CASES) >= 30, "the acceptance fixture classes must stay pinned"
+    ids = [case["case_id"] for case in CASES]
     assert len(ids) == len(set(ids)), "case ids must be unique"
 
 
-@pytest.mark.parametrize("doc", _cases(), ids=lambda doc: doc["case_id"])
-def test_case_conforms_to_schema(doc: dict) -> None:
-    schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
-    errors = minischema.errors(doc, schema)
-    assert not errors, errors
-    if jsonschema is not None:  # pragma: no branch - both paths run when present
-        validator = jsonschema.Draft202012Validator(schema)
-        extra = [f"jsonschema: {e.message}" for e in validator.iter_errors(doc)]
-        assert not extra, extra
-
-
-@pytest.mark.parametrize("doc", _cases(), ids=lambda doc: doc["case_id"])
+@pytest.mark.parametrize("doc", CASES, ids=lambda doc: doc["case_id"])
 def test_case(doc: dict) -> None:
-    case = oracle.BoundaryCase.from_json(doc)
-    got = oracle.adjust(case)
+    errors = minischema.errors(doc, SCHEMA)
+    if jsonschema is not None:
+        validator = jsonschema.Draft202012Validator(SCHEMA)
+        errors += [f"jsonschema: {e.message}" for e in validator.iter_errors(doc)]
+    assert not errors, errors
 
-    assert got.text == doc["expected_text"], (
-        f"{doc['case_id']}: expected {doc['expected_text']!r}, got {got.text!r}"
-    )
-    assert got.changes == doc["expected_changes"], (
-        f"{doc['case_id']}: expected changes {doc['expected_changes']}, "
-        f"got {got.changes}"
-    )
+    text, changes = oracle.adjust(doc["before"], doc["raw"], doc["verbatim"])
+    assert text == doc["expected_text"]
+    assert changes == [change["kind"] for change in doc["expected_changes"]]
 
 
-def test_raw_is_never_modified_beyond_the_boundary() -> None:
-    """The adjustment may only prepend one space and lowercase the first
-    cased character (its full lowercase mapping — 'İ' maps to two code
-    points): modulo an optional leading space, the result equals the raw
-    text with exactly that one character replaced."""
-    for doc in _cases():
-        got = oracle.adjust(oracle.BoundaryCase.from_json(doc)).text
-        raw = doc["raw"]
-        stripped = got[1:] if got.startswith(" ") and not raw.startswith(" ") else got
-        # `stripped` is index-aligned with `raw` in both branches.
-        if stripped == raw:
-            continue
-        first_cased = next(
-            (i for i, ch in enumerate(raw) if ch.isalpha() and ch != ch.lower()),
-            None,
-        )
-        assert first_cased is not None, f"{doc['case_id']}: unexpected change to {got!r}"
-        expected = raw[:first_cased] + raw[first_cased].lower() + raw[first_cased + 1 :]
-        assert stripped == expected, (
-            f"{doc['case_id']}: changes beyond the boundary: {stripped!r} != {expected!r}"
-        )
+@pytest.mark.parametrize("doc", CASES, ids=lambda doc: doc["case_id"])
+def test_expected_text_changes_only_the_boundary(doc: dict) -> None:
+    """Pins the fixture table itself: an expected text may differ from the
+    raw text only by one prepended space and the full lowercase mapping of
+    the first cased character."""
+    raw, expected = doc["raw"], doc["expected_text"]
+    kinds = [change["kind"] for change in doc["expected_changes"]]
+    if "leading_space" in kinds:
+        assert expected.startswith(" ")
+        expected = expected[1:]
+    if "first_letter_case" in kinds:
+        i = next(i for i, ch in enumerate(raw) if oracle._is_cased(ch))
+        raw = raw[:i] + raw[i].lower() + raw[i + 1 :]
+    assert expected == raw

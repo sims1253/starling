@@ -50,6 +50,17 @@
   },
   {
     "schema_version": 1,
+    "case_id": "mid-sentence-later-capital-kept",
+    "description": "the first cased character is already lowercase: later capitals are not touched",
+    "before": "word ",
+    "after": "",
+    "raw": "hello. Next sentence",
+    "verbatim": false,
+    "expected_text": "hello. Next sentence",
+    "expected_changes": []
+  },
+  {
+    "schema_version": 1,
     "case_id": "after-period-keep-capital",
     "description": "sentence-ending punctuation keeps the capital",
     "before": "Done.",
@@ -191,6 +202,17 @@
     "raw": "hallo",
     "verbatim": false,
     "expected_text": "hallo",
+    "expected_changes": []
+  },
+  {
+    "schema_version": 1,
+    "case_id": "after-opening-guillemet",
+    "description": "opening guillemet: content start",
+    "before": "Il dit «",
+    "after": "»",
+    "raw": "Bonjour",
+    "verbatim": false,
+    "expected_text": "Bonjour",
     "expected_changes": []
   },
   {
