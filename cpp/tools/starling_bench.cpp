@@ -49,7 +49,8 @@ bool stop_now() {
 void usage() {
     std::fprintf(stderr,
         "usage: starling-bench --model <parakeet|moss|...> --gguf <file> [--runs N]\n"
-        "                      [--warmup] [--quiet] file.wav [file.wav ...]\n");
+        "                      [--cycles N] [--warmup] [--quiet] file.wav [file.wav ...]\n"
+        "  --cycles N  load, run and free the model N times in this process\n");
 }
 
 starling_ggml_model model_kind(const std::string& s) {
@@ -71,7 +72,7 @@ double now_ms() {
 
 int main(int argc, char** argv) {
     std::string model, gguf;
-    int runs = 1;
+    int runs = 1, cycles = 1;
     bool warmup = false, quiet = false;
     std::vector<std::string> wavs;
     for (int i = 1; i < argc; ++i) {
@@ -79,6 +80,7 @@ int main(int argc, char** argv) {
         if (a == "--model" && i + 1 < argc) model = argv[++i];
         else if (a == "--gguf" && i + 1 < argc) gguf = argv[++i];
         else if (a == "--runs" && i + 1 < argc) runs = std::max(1, std::atoi(argv[++i]));
+        else if (a == "--cycles" && i + 1 < argc) cycles = std::max(1, std::atoi(argv[++i]));
         else if (a == "--warmup") warmup = true;
         else if (a == "--quiet") quiet = true;
         else if (a == "-h" || a == "--help") { usage(); return 0; }
@@ -92,57 +94,65 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "warning: cannot install the signal %d handler; "
                                  "it will kill without teardown\n", sig);
 
-    const double t0 = now_ms();
-    starling_ggml_ctx* ctx = starling_ggml_load(kind, gguf.c_str());
-    if (!ctx) {
-        std::fprintf(stderr, "load failed: %s\n", starling_ggml_last_error(nullptr));
-        return 1;
-    }
-    std::printf("load %.1f ms  backend=%s\n", now_ms() - t0, starling_ggml_backend_name());
-
     int rc = 0;
-    for (const std::string& path : wavs) {
-        if (stop_now()) break;
-        std::vector<float> pcm;
-        int sr = 0;
-        std::string err;
-        if (!starling::ggml::read_wav(path.c_str(), pcm, sr, err)) {
-            std::fprintf(stderr, "%s: %s\n", path.c_str(), err.c_str());
+    for (int cycle = 0; cycle < cycles && !stop_now(); ++cycle) {
+        if (cycles > 1) std::printf("cycle %d/%d\n", cycle + 1, cycles);
+        const double t0 = now_ms();
+        starling_ggml_ctx* ctx = starling_ggml_load(kind, gguf.c_str());
+        if (!ctx) {
+            std::fprintf(stderr, "load failed: %s\n", starling_ggml_last_error(nullptr));
             rc = 1;
-            continue;
+            break;
         }
-        if (sr != 16000) {
-            std::vector<float> rs;
-            starling::ggml::resample_pcm(pcm.data(), pcm.size(), sr, 16000, rs);
-            pcm.swap(rs);
-        }
-        if (pcm.empty()) { std::fprintf(stderr, "%s: no samples\n", path.c_str()); return 1; }
-        const double dur = pcm.size() / 16000.0;
-        if (warmup) {
-            char* w = starling_ggml_transcribe_pcm(ctx, pcm.data(), (int64_t)pcm.size(), 16000);
-            starling_ggml_free_string(w);
-        }
-        for (int r = 0; r < runs; ++r) {
+        std::printf("load %.1f ms  backend=%s\n", now_ms() - t0, starling_ggml_backend_name());
+
+        for (const std::string& path : wavs) {
             if (stop_now()) break;
-            const double a = now_ms();
-            char* text = starling_ggml_transcribe_pcm(ctx, pcm.data(), (int64_t)pcm.size(), 16000);
-            const double ms = now_ms() - a;
-            if (!text) {
-                std::fprintf(stderr, "%s: transcribe failed: %s\n", path.c_str(), starling_ggml_last_error(ctx));
+            std::vector<float> pcm;
+            int sr = 0;
+            std::string err;
+            if (!starling::ggml::read_wav(path.c_str(), pcm, sr, err)) {
+                std::fprintf(stderr, "%s: %s\n", path.c_str(), err.c_str());
                 rc = 1;
-                break;
+                continue;
             }
-            // A stop mid-call may have cut the transcript short (MOSS returns
-            // the prefix): label it so it is never read as a full result.
-            const bool cut = starling_ggml_stop_requested();
-            std::printf("%s run=%d audio=%.2fs time=%.1fms rtf=%.4f%s%s%s\n", path.c_str(), r, dur, ms,
-                        ms / 1000.0 / dur, cut ? " [stopped: may be truncated]" : "",
-                        quiet ? "" : "\n  ", quiet ? "" : text);
-            std::fflush(stdout);
-            starling_ggml_free_string(text);
+            if (sr != 16000) {
+                std::vector<float> rs;
+                starling::ggml::resample_pcm(pcm.data(), pcm.size(), sr, 16000, rs);
+                pcm.swap(rs);
+            }
+            if (pcm.empty()) {
+                std::fprintf(stderr, "%s: no samples\n", path.c_str());
+                rc = 1;
+                continue;
+            }
+            const double dur = pcm.size() / 16000.0;
+            if (warmup) {
+                char* w = starling_ggml_transcribe_pcm(ctx, pcm.data(), (int64_t)pcm.size(), 16000);
+                starling_ggml_free_string(w);
+            }
+            for (int r = 0; r < runs; ++r) {
+                if (stop_now()) break;
+                const double a = now_ms();
+                char* text = starling_ggml_transcribe_pcm(ctx, pcm.data(), (int64_t)pcm.size(), 16000);
+                const double ms = now_ms() - a;
+                if (!text) {
+                    std::fprintf(stderr, "%s: transcribe failed: %s\n", path.c_str(), starling_ggml_last_error(ctx));
+                    rc = 1;
+                    break;
+                }
+                // A stop mid-call may have cut the transcript short (MOSS returns
+                // the prefix): label it so it is never read as a full result.
+                const bool cut = starling_ggml_stop_requested();
+                std::printf("%s run=%d audio=%.2fs time=%.1fms rtf=%.4f%s%s%s\n", path.c_str(), r, dur, ms,
+                            ms / 1000.0 / dur, cut ? " [stopped: may be truncated]" : "",
+                            quiet ? "" : "\n  ", quiet ? "" : text);
+                std::fflush(stdout);
+                starling_ggml_free_string(text);
+            }
         }
+        starling_ggml_free(ctx);
     }
-    starling_ggml_free(ctx);
     starling_ggml_shutdown();
     // Stopped by a signal: exit like one (128 + signo) so callers never read
     // a stopped — possibly truncated or incomplete — bench as a full result.

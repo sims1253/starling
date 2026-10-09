@@ -65,8 +65,9 @@ bench() {
 decode_mspt() { sed -n 's/.*decode=\([0-9.]*\)ms (\([0-9]*\) tokens.*/\1 \2/p' "$1" | awk '$2 > 0 {print $1 / $2}'; }
 total_ms() { sed -n 's/.*time=\([0-9.]*\)ms.*/\1/p' "$1"; }
 
-TMP=$(mktemp -d); trap 'rm -rf "$TMP"; kill_benches || true' EXIT
+TMP=$(mktemp -d); trap 'rm -rf "$TMP"; kill_benches || true; wake_release || true' EXIT
 kill_benches
+wake_hold   # screen off below: keep the phone out of suspend
 
 declare -a base_vals cand_vals
 screen_off

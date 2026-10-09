@@ -35,11 +35,15 @@ import java.util.concurrent.atomic.AtomicLong
  * cannot fit fails with an explanation instead of the process being killed.
  * [nativeSupport] decides whether this CPU can run the native library at all
  * (see [NativeSupport]); it is checked before the library is first loaded.
+ * [keepAwake] holds the CPU awake (a partial wake lock in the app) around
+ * each native load, transcription call and free: kernel suspend with GPU
+ * work outstanding wedges the Pixel's GPU driver.
  */
 class OnDeviceEngine(
     private val modelDir: File,
     private val memoryGate: (modelBytes: Long) -> String? = { null },
     private val nativeSupport: () -> String? = NativeSupport::unsupportedReason,
+    private val keepAwake: () -> AutoCloseable = { AutoCloseable {} },
 ) : OnDeviceStreamSession.LiveEngine {
     /** Where in [importModel] a rejection happened; import failures report their stage. */
     enum class ImportStage { OPEN, COPY, VALIDATE, PROMOTE }
@@ -492,7 +496,7 @@ class OnDeviceEngine(
         if (handle != 0L && loadedFile != modelFile && pinnedSessions == 0) unload()
         if (handle != 0L) return null
         val failed = try {
-            loadModelLocked(modelFile)
+            awake { loadModelLocked(modelFile) }
         } catch (t: Throwable) {
             // A missing or broken native library throws; the state must not
             // stay "loading", and the failure counts for the backoff.
@@ -569,6 +573,9 @@ class OnDeviceEngine(
         }
     }
 
+    /** Runs one bounded native call with the CPU held awake (see [keepAwake]). */
+    private inline fun <T> awake(call: () -> T): T = keepAwake().use { call() }
+
     /** Ends a use: a new generation, reported as idle when nothing else is using the model. Caller holds [lock]. */
     private fun reportIdleLocked() {
         val generation = useGeneration.incrementAndGet()
@@ -622,7 +629,7 @@ class OnDeviceEngine(
     override fun transcribeWindow(samples: FloatArray): OnDeviceStreamSession.WindowResult = synchronized(lock) {
         usingLocked {
             ensureLoadedLocked()?.let { return OnDeviceStreamSession.WindowResult.Failed(it) }
-            val text = StarlingNative.transcribe(handle, samples, ChunkStreamer.SAMPLE_RATE)
+            val text = awake { StarlingNative.transcribe(handle, samples, ChunkStreamer.SAMPLE_RATE) }
             if (text == null) {
                 val error = StarlingNative.lastError(handle)
                 error?.let(observer::engineFailed)
@@ -693,8 +700,21 @@ class OnDeviceEngine(
         }
     }
 
-    /** Blocking transcription of a finalized WAV recording. */
-    fun transcribe(audioFile: File): InferenceResult = synchronized(lock) { usingLocked { transcribeLocked(audioFile) } }
+    /**
+     * Blocking transcription of a finalized WAV recording. A GPU driver
+     * failure, in the load's warmup or mid-transcription, has freed the
+     * model; it is retried once, and the reload falls back to the CPU engine.
+     */
+    fun transcribe(audioFile: File): InferenceResult = synchronized(lock) {
+        usingLocked {
+            val result = transcribeLocked(audioFile)
+            if (result is InferenceResult.Failure && ModelLifetime.isDriverFailure(result.message)) {
+                transcribeLocked(audioFile)
+            } else {
+                result
+            }
+        }
+    }
 
     /** Caller holds [lock] inside [usingLocked]. */
     private fun transcribeLocked(audioFile: File): InferenceResult {
@@ -719,7 +739,7 @@ class OnDeviceEngine(
             } else {
                 decoded.samples.copyOfRange(window.start, window.endExclusive)
             }
-            val text = StarlingNative.transcribe(handle, samples, decoded.sampleRate)
+            val text = awake { StarlingNative.transcribe(handle, samples, decoded.sampleRate) }
             if (text == null) {
                 val error = StarlingNative.lastError(handle)
                 error?.let(observer::engineFailed)
@@ -741,9 +761,9 @@ class OnDeviceEngine(
      * protect a working model from a mid-take reload; a wedged one serves
      * nobody, and keeping it until the pins drop would let the batch
      * fallback of the failed take (which can win the lock before that take
-     * unpins) run into the same broken handle. Propagate, not retry: this
-     * request still returns its failure, the next request reloads (the
-     * native engine falls back to the CPU there), and speculative preloads
+     * unpins) run into the same broken handle. The next load falls back to
+     * the CPU engine: a live window still returns its failure and the next
+     * one reloads, [transcribe] retries at once, and speculative preloads
      * stay off through ModelLifetime's DriverFailed. Caller holds [lock].
      */
     private fun releaseDriverFailureLocked(error: String) {
@@ -753,7 +773,8 @@ class OnDeviceEngine(
 
     private fun unload() {
         if (handle != 0L) {
-            StarlingNative.free(handle)
+            // Destroys the GPU device with the last engine: awake, like all GPU work.
+            awake { StarlingNative.free(handle) }
             handle = 0L
             loadedFile = null
             loadError = null

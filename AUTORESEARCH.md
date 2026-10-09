@@ -50,9 +50,11 @@ region the agent may touch. Everything else lives here.
 2. Record the baseline before the first attempt; every claim is relative to
    it.
 3. Device safety (#325): on a GPU failure (hang, fence timeout, wedge
-   marker) **capture it** — forensics (`.auto/wedge-forensics.sh` or
-   equivalent: logcat tail, thermals, marker content) plus a
-   `RESEARCH_LOG.md` entry. **Unattended loops stop** device work after a
+   marker) or a spontaneous phone restart, **capture it first** —
+   `benchmarks/fast_engine/wedge_forensics.sh event|post-reboot <label>`
+   before any retry, recovery or reboot — plus a `RESEARCH_LOG.md` entry
+   (procedure: `benchmarks/fast_engine/AUTORESEARCH.md`, "GPU failures and
+   phone restarts"). **Unattended loops stop** device work after a
    failure; an attended operator may attempt recovery. Either way, measure
    again only after a **verified recovery**: one healthy load and a fresh
    baseline that matches the session's earlier numbers. **Terminate

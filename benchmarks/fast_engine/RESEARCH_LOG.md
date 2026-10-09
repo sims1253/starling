@@ -827,3 +827,150 @@ still 18.7 GB/s inside the split); the S=6 default flip for long-form;
 validating the AMD pins on other AMD GPUs (measured on RENOIR only); and a
 Pixel A/B of `STARLING_FAST_ATTN_SPLIT=4` under the phone gates — the
 16-workgroup latency argument likely applies to the DXT too.
+
+## #325 prevention work (2026-10-03)
+
+### P3-1: a wedge on in-process device re-creation — GPU rail ~0 mW while the fence hung
+
+Run: `starling-bench --cycles 3 --runs 2` (Parakeet q4_k_m-shrink16,
+medium.wav, `STARLING_ENGINE=fast`, KSTEP default) — the new refcounted
+context destroys the VkDevice when the engine is freed and creates a fresh
+one on the next load, all in one process. Phone: uptime 15 h (user reboot
+the morning before), battery 49 %, **discharging** (no stay-awake hold is
+possible unplugged), 30 °C skin, ~01:53 at night; the same test had passed
+3/3 cycles on the previous boot.
+
+- Cycle 1: load 2.07 s, runs 2.60 / 2.30 s, `vk teardown: device destroyed
+  cleanly`.
+- Cycle 2: load 3.18 s (slow), first transcribe: fence timeout at the
+  120 s default, drain grace (10 s) expired → context marked hung; the
+  process still exited by itself (cycle 3 refused by the wedge; no stuck
+  process) — the #379 bounded-teardown paths held on real hardware.
+- Forensics (`wedge_forensics.sh event`, `~/starling-forensics/
+  20261003-015557-event-cycles-reload-wedge`): **no kernel log line at all**
+  between 01:41 and the capture — the PowerVR driver reported no hardware
+  recovery, lockup or fault for a 120 s hang. pixel-thermal's per-minute
+  power rails during the hang: **`S2S_VDD_GPU` 0.80 / 0.73 mW** (GPU idle,
+  effectively power-gated) with the CPU rails at 50–67 mW: the GPU was not
+  busy with a long job — the submitted work never completed while the GPU
+  sat idle (lost submission or lost completion). Power state at capture:
+  `mWakefulness=Dozing`, deep-idle `IDLE`, `mStayOn=false`, no suspend
+  blockers held. The main logcat buffer had already rotated past the hang
+  (pixel-thermal floods it in < 1 min) → `wedge_forensics.sh watch start`
+  added: a rotating device-side logcat for the whole session.
+- Boot log of this unit (any boot): `gpu-secure-trusty:
+  RGXValidateFWHeaderVersion2: KM and FW version mismatch (expected: 24.2,
+  found: 25.3)` — recorded for the upstream report; meaning unknown.
+
+Open: in-process re-creation vs. doze/suspend as the trigger (P3-2). The
+GPU-idle signature fits the earlier locked-phone stalls (P2-3/P2-4: system
+suspend between rounds) and the night-time, unplugged wedges of #325. The
+app held **no** wake lock at all (the old note in `docs/fast-engine.md`
+was wrong); it now holds a partial wake lock around on-device GPU work.
+
+### P3-2: in-process re-creation is clean when the phone is awake — doze is the suspect
+
+Same binary and command as P3-1, after the marker expired (02:11), phone
+held awake (`input keyevent KEYCODE_WAKEUP` re-sent every ~10 s; still
+unplugged): **3/3 and then 5/5 cycles clean** — every free printed
+`device destroyed cleanly`, loads 1.2–2.6 s, Parakeet medium 2.26–3.17 s
+(in band). With the previous boot's 3/3, that is 11/11 awake in-process
+device re-creations against 1/1 wedged while dozing. In-process
+re-creation is not the trigger on this evidence; screen-off doze/suspend
+during GPU work is (n=1 on the failing side — a deliberate dozing repro is
+the next experiment, and risks a phone restart).
+
+Consequences landed: the app holds a partial wake lock around every use
+and free of the model (the free tears the device down); bench sessions on
+an unplugged phone must keep it awake (see the protocol).
+
+### P3-3: deliberate doze repro — 3/3 dozing trials wedged, 2/2 awake clean
+
+`doze_repro.sh` (02:35–03:22): alternating trials of the P3-1 workload
+(one process, `--cycles 3 --runs 2`, Parakeet q4_k_m-shrink16, medium.wav),
+phone unplugged, battery 47 → 43 %, rotating logcat throughout. D = screen
+off + `dumpsys deviceidle force-idle`, no wake signals; A = Doze lifted,
+screen woken every poll. Planned D A D A D A; stopped after trial 5 on the
+3-wedge rule. Results: `~/starling-forensics/doze-repro-20261003-023500`.
+
+| trial | arm | outcome |
+|---|---|---|
+| 1 | D | wedge on cycle 3's first transcription (2 clean cycles before) |
+| 2 | A | clean, runs 2.33–4.03 s |
+| 3 | D | wedge on cycle 1's first transcription |
+| 4 | A | clean, runs 2.23–2.46 s |
+| 5 | D | cycle 1 run 0 stalled 48.0 s then recovered (the P2-3 suspend-stall pattern); wedge on cycle 2 run 1 |
+
+- Every wedge has the P3-1 signature: `S2S_VDD_GPU` 133–174 mW while
+  transcribing, then 0.6–0.8 mW for the whole 120 s fence wait (GPU idle
+  with work outstanding); no PowerVR kernel line; `mWakefulness=Dozing`,
+  no suspend blockers held. The #379 bounded teardown held each time (no
+  stuck process; marker written; later cycles refused).
+- No restart: device uptime ran on (15:56 → 16:38 h across the wedges; 1 d
+  54 min the next morning), boot reasons unchanged. Three wedges in an hour
+  did not escalate.
+- The wedge point varies (first transcription of a fresh device in 1 and 3,
+  second run on a device in 5): not tied to device re-creation.
+- Deep-idle `mState` read IDLE in trial 2 and ACTIVE in trial 4, both clean:
+  the variable that separates the arms is wakefulness (Dozing vs. Awake —
+  whether the kernel may suspend), not the deviceidle state itself.
+
+Tally with P3-1, in process-level trials (one bench process each):
+**dozing 4/4 wedged, awake 0/2**; P3-2 adds 0 wedges in 11 awake in-process
+cycles. Trigger identified: GPU work submitted while the phone is allowed
+to suspend. The likely mechanism is a suspend/
+resume of the PowerVR stack losing an in-flight job or its completion —
+driver/firmware code we cannot fix. Prevention is to never let the phone
+suspend with GPU work outstanding: the app's partial wake lock and the
+bench protocol's awake rule. `doze_repro.sh` is the upstream
+reproducer.
+
+Open: the A arm kept the screen on; the app's guard is a screen-off partial
+wake lock, which blocks kernel suspend but is ignored by Doze for apps that
+are not exempt. Untested whether it prevents the wedge — the next arm is
+screen off + Doze + a held partial wake lock (needs the app, since shell
+cannot take a kernel wake lock on a user build).
+
+### P3-4: a shell-uid wake lock prevents the wedge in deep Doze — the trigger is suspend, not Doze
+
+Shell cannot write `/sys/power/wake_lock` on a user build, but it holds
+`android.permission.WAKE_LOCK`. `wakehold/WakeHold.java` (run via
+`app_process`) takes a `PARTIAL_WAKE_LOCK` through `IPowerManager` as uid
+2000. Checked in `dumpsys power` with the screen off and deep Doze forced
+(`mWakefulness=Dozing`, `mState=IDLE`): the lock stays active (not
+`DISABLED` — Doze only disables app-uid locks) and holds the suspend
+blocker (`mHoldingWakeLockSuspendBlocker=true`); killing the holder releases
+it.
+
+`doze_repro.sh "W D W D W"` (2026-10-05 15:12–15:35), phone on the charger
+with `FAKE_UNPLUG=1` (`dumpsys battery unplug`, so Doze engages); W = the D
+setup plus the wake lock. Results:
+`~/starling-forensics/doze-repro-20261005-151249`.
+
+| trial | arm | outcome |
+|---|---|---|
+| 1 | W | clean, runs 2.25–2.51 s, lock held at the end |
+| 2 | D | wedge on cycle 1's first transcription; GPU rail 0.74–0.98 mW during the fence wait |
+| 3 | W | clean, runs 2.17–2.49 s, lock held at the end |
+| 4 | D | clean, runs 2.19–2.47 s |
+| 5 | W | clean, runs 2.19–2.45 s, lock held at the end |
+
+- The D control wedged with the P3-1 signature while the charger was
+  connected: physical discharge is not part of the trigger.
+- The W arms ran in forced deep Doze (`mState=IDLE`) with only suspend
+  blocked, and were clean in the normal band. Doze itself is not the
+  trigger; kernel suspend with GPU work outstanding is. A plugged-in phone
+  with the screen off can suspend too.
+- Tally (P3-1–P3-4), process-level trials: screen off without a lock 5/6
+  wedged, screen off in deep Doze under the lock 0/3, awake 0/2 (plus 0
+  wedges in 11 awake in-process cycles, P3-2). Small n; the mechanism
+  evidence (GPU rail, wakefulness) carries more weight than the counts.
+
+Consequences landed: every phone bench script (`android_bench.sh`,
+`phone_ab.sh`, `phone_gates.sh`, `phone_energy.sh`, `pixel_measure.sh`)
+holds the lock for the whole session (`phone_common.sh` `wake_hold` /
+`wake_release` / `wake_held`), and the protocol rule now names suspend.
+
+Open: the app's partial wake lock is disabled in deep Doze and for a cached
+(backgrounded) process, so on-device GPU work there is unprotected. Closing
+that needs a foreground service during transcription (not done).

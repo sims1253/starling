@@ -1,5 +1,4 @@
-# phone_common.sh — helpers shared by the phone measurement scripts
-# (phone_gates.sh, phone_energy.sh). Sourced, not run.
+# phone_common.sh — helpers shared by the phone bench scripts. Sourced, not run.
 
 BENCH_BINS="starling-bench starling-bench-base starling-bench-cand"
 
@@ -26,11 +25,45 @@ screen_off() {
   esac
 }
 
+# Kernel suspend with GPU work outstanding wedges the PowerVR driver
+# (RESEARCH_LOG P3-4), and these scripts measure with the screen off. Hold a
+# shell-uid partial wake lock (wakehold/WakeHold.java; Doze leaves non-app
+# locks alone) for the session: `wake_hold` before the first bench,
+# `wake_release || true` in the EXIT trap. The holder exits after
+# max_seconds (default 2 h); killing it releases the lock.
+WAKEHOLD_DEX=/data/local/tmp/starling/wakehold.dex
+WAKEHOLD_TAG=starling-bench
+wake_held() {
+  timeout 15 adb shell "dumpsys power" 2>/dev/null | tr -d '\r' |
+    grep "PARTIAL_WAKE_LOCK.*'$WAKEHOLD_TAG'" | grep -qv DISABLED
+}
+wake_release() {
+  timeout 15 adb shell "p=\$(cat $WAKEHOLD_DEX.pid 2>/dev/null) && grep -q WakeHold /proc/\$p/cmdline 2>/dev/null && kill \$p; rm -f $WAKEHOLD_DEX.pid" >/dev/null 2>&1
+}
+wake_hold() {   # wake_hold [max_seconds]
+  local dex
+  dex="$(dirname "${BASH_SOURCE[0]}")/wakehold/wakehold.dex"
+  [ -f "$dex" ] || "$(dirname "$dex")/build.sh" >/dev/null ||
+    { echo "ERROR: cannot build $dex" >&2; return 1; }
+  wake_release || true
+  timeout 15 adb shell "mkdir -p ${WAKEHOLD_DEX%/*}" >/dev/null 2>&1
+  timeout 30 adb push "$dex" "$WAKEHOLD_DEX" >/dev/null 2>&1 ||
+    { echo "ERROR: could not push wakehold.dex" >&2; return 1; }
+  timeout 15 adb shell "CLASSPATH=$WAKEHOLD_DEX nohup app_process / WakeHold $WAKEHOLD_TAG ${1:-7200} >/dev/null 2>&1 & echo \$! > $WAKEHOLD_DEX.pid" >/dev/null 2>&1
+  for _ in 1 2 3 4 5; do
+    sleep 1
+    wake_held && return 0
+  done
+  echo "ERROR: the $WAKEHOLD_TAG wake lock is not held (dumpsys power)" >&2
+  return 1
+}
+
 # Wait up to $1 s (bounded on the device and on the host) for every bench
 # to exit; succeeds only if none is left.
 benches_gone() {
   local secs=${1:-10}
-  timeout $(( secs + 10 )) adb shell "i=0; while pidof $BENCH_BINS >/dev/null 2>&1 && [ \$i -lt $secs ]; do sleep 1; i=\$((i+1)); done; ! pidof $BENCH_BINS >/dev/null 2>&1" \
+  # Host cap > device loop: each iteration is sleep 1 + pidof + shell overhead.
+  timeout $(( secs + secs / 4 + 15 )) adb shell "i=0; while pidof $BENCH_BINS >/dev/null 2>&1 && [ \$i -lt $secs ]; do sleep 1; i=\$((i+1)); done; ! pidof $BENCH_BINS >/dev/null 2>&1" \
     >/dev/null 2>&1
 }
 
@@ -45,7 +78,7 @@ benches_gone() {
 # timeout never orphans a remote shell. Fails if a bench survives KILL (the
 # next 1.6 GB load must not collide with it); in EXIT traps call it as
 # `kill_benches || true` so cleanup cannot mask the script's own status.
-# Worst case (hung adb) ~70 s: two 15 s adb calls + two 20 s capped waits.
+# Worst case (hung adb) ~85 s: two 15 s adb calls + two 27 s capped waits.
 kill_benches() {
   timeout 15 adb shell "for p in \$(pidof $BENCH_BINS); do kill -TERM \$p; done" >/dev/null 2>&1 || true
   benches_gone 10 && return 0

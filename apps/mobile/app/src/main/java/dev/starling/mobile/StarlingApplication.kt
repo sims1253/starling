@@ -6,6 +6,7 @@ import android.content.ComponentCallbacks2
 import android.content.Context
 import android.os.Handler
 import android.os.Looper
+import android.os.PowerManager
 import android.util.Log
 import dev.starling.mobile.engine.ModelLifetime
 import dev.starling.mobile.engine.OnDeviceBackend
@@ -54,7 +55,11 @@ class StarlingApplication : Application() {
         super.onCreate()
         recordings = RecordingStore(this)
         backendSettings = BackendSettings(this)
-        onDeviceEngine = OnDeviceEngine(File(filesDir, "models"), memoryGate = ::memoryGate)
+        onDeviceEngine = OnDeviceEngine(
+            File(filesDir, "models"),
+            memoryGate = ::memoryGate,
+            keepAwake = partialWakeLock(),
+        )
         modelDownloads = ModelDownloadController(onDeviceEngine)
         modelLifetime = ModelLifetime(
             engine = object : ModelLifetime.Engine {
@@ -158,11 +163,34 @@ class StarlingApplication : Application() {
         )
     }
 
+    /**
+     * The engine's keepAwake, one hold per native call: kernel suspend with
+     * GPU work outstanding wedges the Pixel's GPU driver
+     * (benchmarks/fast_engine/RESEARCH_LOG.md, P3-4). Reference-counted, so
+     * nested holds are fine; the timeout only bounds a leaked hold. Not
+     * covered: the system disables partial wake locks of cached (backgrounded)
+     * processes and in deep Doze; that needs a foreground service.
+     */
+    private fun partialWakeLock(): () -> AutoCloseable {
+        val lock = getSystemService(PowerManager::class.java)
+            .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "starling:on-device-engine")
+        return {
+            lock.acquire(WAKE_LOCK_TIMEOUT_MS)
+            // Released once per hold, even after its timeout, to keep the count
+            // balanced; a platform that throws under-locked then must not fail
+            // the GPU work this wraps.
+            AutoCloseable { runCatching { lock.release() } }
+        }
+    }
+
     internal companion object {
         private const val TAG = "StarlingApplication"
 
         /** Activations and graph buffers on top of the weights. */
         const val MODEL_WORKING_SET_BYTES = 128L * 1024 * 1024
+
+        /** Upper bound on one wake-lock hold (one native load, window or free). */
+        private const val WAKE_LOCK_TIMEOUT_MS = 10L * 60 * 1000
 
         /**
          * The state half of [isOnDeviceModelLoading], split out for its

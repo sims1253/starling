@@ -192,10 +192,11 @@ the decode number depends on the measurement protocol: cool fresh boots
 with an awake-hold measure **62.5–64 ms/token**; the historical 68–77
 band spans boots without the hold; and a locked phone without any hold
 reads 105–141 ms/token because system suspend stalls each decode
-round-trip by ~0.7 s (apps hold a wakelock during real transcription; the
-bench protocol measures unlocked or with `svc power stayon`, which only
-holds the phone awake while plugged in — see the phone measurement
-protocol in `benchmarks/fast_engine/AUTORESEARCH.md`). MOSS short wall ≈ 5.25 s
+round-trip by ~0.7 s, and suspend with GPU work outstanding wedges the
+driver. The app holds a partial wake lock around on-device GPU work; the
+bench scripts hold a shell-uid one, which Doze does not disable, for their
+screen-off windows (phone measurement protocol in
+`benchmarks/fast_engine/AUTORESEARCH.md`). MOSS short wall ≈ 5.25 s
 median in a 12-run window; Parakeet medium 2.27–2.34 s (in band).
 
 | Model / audio | ggml CPU | fast (start of tuning) | fast (tuned) |

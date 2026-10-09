@@ -85,17 +85,68 @@ status:
   per-session load budget is a fine experiment setting; it is not an
   established limit.
 - **Wake state.** A locked phone without any wake source stalls each decode
-  round-trip ~0.7 s through system suspend (P2-3/P2-4); measure unlocked,
-  or with a verified wake source. `svc power stayon true` only sets
-  Android's *stay awake while plugged in* option — it is **not** a wake lock
-  for an unplugged (discharging) energy run. The stall-free discharging
-  windows in P2-8 had stayon set, but which mechanism kept them awake is
-  **unverified**; establish one (and keep idle-control conditions identical
-  across arms) before trusting a new energy window.
+  round-trip ~0.7 s through system suspend (P2-3/P2-4). `svc power stayon
+  true` only keeps a plugged-in phone awake; it is **not** a wake lock, and
+  what kept the P2-8 discharging windows stall-free is **unverified**. The
+  verified wake source for screen-off windows is the shell wake lock below.
+- **Never run GPU work on a phone that may suspend.** Kernel suspend with
+  GPU work outstanding wedges the PowerVR driver: in process-level trials,
+  screen off without a wake lock wedged 5/6, forced deep Doze under a wake
+  lock 0/3, awake 0/2, plus 0 wedges in 11 awake in-process cycles
+  (RESEARCH_LOG P3-1–P3-4). Suspend, not Doze, is the trigger, so a
+  plugged-in phone with the screen off is exposed too. The phone bench
+  scripts hold a shell-uid partial wake lock for the whole session, which
+  Doze does not disable (`phone_common.sh` `wake_hold`, built on demand from
+  `wakehold/WakeHold.java`; needs a JDK and the Android SDK). A new script
+  that runs benches with the screen off does the same: `wake_hold` before
+  the first bench, `wake_release || true` in its EXIT trap, `wake_held`
+  before each measurement window.
+- **Run `wedge_forensics.sh watch start` at the start of every phone
+  session**, so an incident's minutes are still on the device.
 - **Energy runs** need a discharging battery: verify the charge counter
   moves between two reads before opening a window.
 - **Wifi adb.** Stream bench output to device-side files; the TLS transport
   stalls under sustained shell output.
+
+### GPU failures and phone restarts
+
+The evidence rotates away within minutes (logcat) to hours (kernel log), so
+this procedure outranks the experiment in progress.
+
+**Recognize it.** A fence timeout (`vkWaitForFences failed (VkResult 2)`),
+`device lost`, a wedge marker refusing a load, a bench hung past its
+timeout, decode times in the degraded band (~2× the session's median,
+bimodal), or a restart you did not cause (boot reason not `reboot,shell` /
+`reboot,userrequested`).
+
+1. **Capture first**, before any retry, recovery load or reboot:
+   `wedge_forensics.sh event <label>` while the phone is up, or
+   `wedge_forensics.sh post-reboot <label> --bugreport` as soon as adb is
+   back after a restart (only the bugreport keeps the previous boot's
+   kernel log).
+2. **Record it** in `RESEARCH_LOG.md`: the forensics directory, the boot
+   reason, and what the capture cannot see — binary and commit, model,
+   `STARLING_FAST_KSTEP`, loads and dirty deaths (SIGKILL/timeouts) this
+   boot, uptime, battery and charging, what ran in the minutes before.
+   Write "unknown" where unknown.
+3. **Then** follow rule 3 of the root `AUTORESEARCH.md`. Never delete a
+   wedge marker to get past it; wait out its 15 minutes or reboot.
+
+**What the evidence decides:**
+
+| hypothesis | look for |
+| --- | --- |
+| kernel suspend with GPU work outstanding (reproduced, P3-3/P3-4) | `mWakefulness` and suspend blockers in `summary.txt`; GPU rail ~0 mW during the hang in `gpu-rail.txt` |
+| unclean device death (process killed with a live VkDevice; P2-12) | dirty deaths this boot before the incident; clean `vk teardown` lines on the clean ones |
+| GPU job too long → failed hardware recovery | `pvr`/`rogue`/`HWR`/`lockup` lines in `gpu-lines.txt` before the hang; KSTEP of the run |
+| thermal | thermal status and temperatures in `summary.txt` |
+| low battery / power management (all early wedges at ≤ 44 %) | battery level and charging state |
+| memory pressure | `lowmemorykiller`/`lmkd` kills, `MemAvailable` |
+| driver/firmware | build fingerprint; the boot-time `RGXValidateFWHeaderVersion2: KM and FW version mismatch` line seen on this unit (2026-10) |
+
+A restart with a boot reason such as `kernel_panic` or `watchdog`, with
+driver lines before it, is the report Imagination/Google need: attach the
+forensics directory and the bugreport.
 
 ## Experiment loop
 
