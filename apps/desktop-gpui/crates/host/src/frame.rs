@@ -171,7 +171,7 @@ pub enum Frame {
     /// The agent cancelling a queued or in-flight ask
     /// (`NoAnswer { agent_cancelled }`).
     AskCancel { req: String, reason: String },
-    /// The host asking app connections to show a prompt. Capture
+    /// The host asking the app to show a prompt. Capture
     /// starts only after a [`Frame::PromptAck`] with `visible: true`.
     /// `req` is the broker's ask id, not the agent's token.
     ShowPrompt {
@@ -183,8 +183,8 @@ pub enum Frame {
     HidePrompt { req: String, reason: String },
     /// An app acknowledging [`Frame::ShowPrompt`]. `visible: true`
     /// opens the capture gate; `visible: false` declines the ask, or
-    /// stops the take if the gate is already open. Agent connections
-    /// sending it are closed.
+    /// stops the take if the gate is already open. A connection without
+    /// the app role sending it is closed.
     PromptAck { req: String, visible: bool },
     /// The user finished speaking: stop, transcribe, answer. Counts
     /// only from the connection whose ack opened the gate.
@@ -201,7 +201,7 @@ pub enum AskOutcome {
     NoAnswer { reason: NoAnswerReason },
     /// The ask was refused or failed. `code` is one of
     /// `invalid_questions`, `invalid_timeout`, `duplicate_req`,
-    /// `queue_full`, `host_busy`, `no_prompt_ack`, `capture_busy`,
+    /// `queue_full`, `host_busy`, `no_app`, `no_prompt_ack`, `capture_busy`,
     /// `capture_failed`, `transcription_failed`, `shutting_down`.
     Error { code: String, message: String },
 }

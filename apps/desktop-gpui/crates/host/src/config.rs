@@ -63,6 +63,11 @@ pub struct HostConfig {
     /// `None` or a missing file denies every agent client; a malformed
     /// file refuses startup.
     pub agent_allowlist: Option<PathBuf>,
+    /// Treats every non-agent connection as the Starling app, which may
+    /// show and answer prompts. Tests only: no app-role credential
+    /// exists yet, so production leaves this off and every ask fails
+    /// with `no_app`.
+    pub insecure_test_app_role: bool,
     /// The runtime this host owns. Production builds pass
     /// [`HostConfig::production`]; tests inject doubles through the same
     /// builders [`RuntimeConfig`] offers.
@@ -90,6 +95,7 @@ impl HostConfig {
             settings_poll: crate::engine::DEFAULT_SETTINGS_POLL,
             engine: EngineChoice::None,
             agent_allowlist: None,
+            insecure_test_app_role: false,
             runtime: RuntimeConfig::default(),
         }
     }
@@ -169,6 +175,12 @@ impl HostConfig {
     /// Sets the agent allowlist file.
     pub fn with_agent_allowlist(mut self, path: Option<PathBuf>) -> Self {
         self.agent_allowlist = path;
+        self
+    }
+
+    /// See [`HostConfig::insecure_test_app_role`].
+    pub fn with_insecure_test_app_role(mut self) -> Self {
+        self.insecure_test_app_role = true;
         self
     }
 

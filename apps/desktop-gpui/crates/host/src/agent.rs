@@ -5,7 +5,7 @@
 //!   file, or an empty one, admits no agent client.
 //! - [`broker_loop`] owns every `Frame::AskUser`. It serializes asks
 //!   (one visible prompt, one capture at a time), opens the microphone
-//!   only after an app connection acks `PromptAck { visible: true }`,
+//!   only after the Starling app acks `PromptAck { visible: true }`,
 //!   and then drives the existing capture path — `context.snapshot` →
 //!   `mode.set` → `capture.start` → `capture.stop` → `jobs.submit` —
 //!   like any other client. There is no second recording stack.
@@ -19,37 +19,39 @@
 //!   transcription run to their own outcome.
 //! - **Prompt ack bound**: no visible ack within
 //!   `min(ACK_BOUND, timeout)` fails with `Error { no_prompt_ack }` and
-//!   the microphone is never touched; with no app connection attached
-//!   the ask fails the same way immediately.
+//!   the microphone is never touched.
 //! - **Agent cancel / disconnect**: `Frame::AskCancel`, or the asking
 //!   connection ending for any reason, aborts the take
 //!   (`NoAnswer { agent_cancelled }`). The host enforces this, so it
 //!   holds even when the MCP process is killed.
 //! - **User dismissal**: `PromptAck { visible: false }` declines the
 //!   ask before capture (`declined`) and stops it after
-//!   (`user_cancelled`); the acking app disconnecting mid-take counts as
-//!   a dismissal.
-//! - **Ack binding**: only a connection the prompt was shown to may ack
-//!   it, and once one acks, only that connection's dismiss/done count.
-//!   Agent connections never see prompts and are closed if they send
-//!   prompt frames.
+//!   (`user_cancelled`); the acking app disconnecting before or during
+//!   the take counts as a dismissal.
+//! - **Ending a take**: the broker only stops or aborts the take it
+//!   started (the capture machine refuses a stop or abort naming
+//!   another take). An abort the runtime cannot take yet is retried,
+//!   and no other ask is admitted until it lands.
 //!
 //! # Trust boundary
 //!
-//! MCP over stdio has no client identity, so the allowlist is a shared
-//! secret the user provisions in `mcp-clients.json` and in the agent's
-//! MCP config. It rides the same-user-authenticated IPC transport, so
-//! it decides *which agents may summon the microphone*; it is not a
-//! defense against other processes running as the same user.
+//! Prompts go only to connections holding the app role, and only they
+//! may answer them. No app-role credential exists yet, so the surface
+//! fails closed: every ask is refused with `Error { no_app }`. Agent
+//! connections are admitted by the allowlist (a token the user
+//! provisions in `mcp-clients.json` and in the agent's MCP config),
+//! never see prompts, and cannot send runtime commands; they reach the
+//! microphone only through an ask the app shows.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
-use starling_runtime::bus::{EventMessage, EventSub};
+use starling_runtime::bus::EventMessage;
 use starling_runtime::channel::{Receiver, RecvError};
+use starling_runtime::machine::Rejection;
 use starling_runtime::protocol::{Command, Event as RtEvent, Manual};
 
 use crate::frame::{AskOutcome, Frame, NoAnswerReason};
@@ -265,21 +267,51 @@ enum Phase {
 /// The broker thread. Exits when the host shuts down, resolving
 /// everything live or queued with `Error { shutting_down }`.
 pub(crate) fn broker_loop(shared: Arc<HostShared>, inbox: Receiver<BrokerMsg>) {
+    // The broker waits for receipts from runtime actors, and an actor
+    // publishing into a full subscription waits for its reader. A
+    // separate thread keeps the subscription drained so the two can
+    // never wait on each other.
+    let (event_tx, events) = mpsc::channel();
+    let forwarder = {
+        let shared = Arc::clone(&shared);
+        let subscription = shared.client.subscribe();
+        std::thread::Builder::new()
+            .name("starling-host-agent-events".to_string())
+            .spawn(move || {
+                while !shared.shutdown.load(Ordering::SeqCst) {
+                    match subscription.recv_timeout(POLL) {
+                        Ok(message) => {
+                            if event_tx.send(message).is_err() {
+                                return;
+                            }
+                        }
+                        Err(RecvError::Timeout) => {}
+                        Err(RecvError::Closed) => return,
+                    }
+                }
+            })
+            .expect("agent event thread spawns")
+    };
     let mut broker = Broker {
-        events: shared.client.subscribe(),
         shared,
         next_ask: 0,
         live: None,
         waiting: VecDeque::new(),
+        aborting: None,
     };
     loop {
         if broker.shared.shutdown.load(Ordering::SeqCst) {
             break;
         }
-        while let Ok(message) = broker.events.try_recv() {
+        // Cancellations and disconnects first, so the gate never
+        // advances on behalf of an ask that is already dead.
+        while let Ok(msg) = inbox.try_recv() {
+            broker.on_msg(msg);
+        }
+        while let Ok(message) = events.try_recv() {
             broker.on_event(message);
         }
-        broker.tick_deadlines();
+        broker.tick();
         match inbox.recv_timeout(POLL) {
             Ok(msg) => broker.on_msg(msg),
             Err(RecvError::Timeout) => {}
@@ -287,14 +319,18 @@ pub(crate) fn broker_loop(shared: Arc<HostShared>, inbox: Receiver<BrokerMsg>) {
         }
     }
     broker.finish_all("the host is shutting down");
+    drop(events);
+    let _ = forwarder.join();
 }
 
 struct Broker {
     shared: Arc<HostShared>,
-    events: EventSub,
     next_ask: u64,
     live: Option<(Ask, Phase)>,
     waiting: VecDeque<Ask>,
+    /// The corr of an ended ask whose take abort the runtime could not
+    /// take yet (a full inbox). No ask is admitted until it lands.
+    aborting: Option<String>,
 }
 
 impl Broker {
@@ -386,7 +422,7 @@ impl Broker {
     /// Fills the live slot from the queue. Loops because an ask can
     /// fail at admission (no app attached) and must not wedge the rest.
     fn admit_next(&mut self) {
-        while self.live.is_none() {
+        while self.live.is_none() && self.aborting.is_none() {
             let Some(mut ask) = self.waiting.pop_front() else {
                 return;
             };
@@ -395,11 +431,8 @@ impl Broker {
             if apps.is_empty() {
                 ask.resolve(
                     &self.shared,
-                    error(
-                        "no_prompt_ack",
-                        "no app connection is attached to show the prompt",
-                    ),
-                    "no app connection",
+                    error("no_app", "no Starling app can show the prompt"),
+                    "no app",
                 );
                 continue;
             }
@@ -515,12 +548,20 @@ impl Broker {
         self.admit_next();
     }
 
-    fn abort_phase(&self, ask: &Ask, phase: &Phase) {
+    fn abort_phase(&mut self, ask: &Ask, phase: &Phase) {
         let client = &self.shared.client;
         match phase {
-            Phase::Prompting | Phase::Snapshotting | Phase::SettingMode => {}
+            Phase::Prompting => {}
+            // Release the provisional context so the next snapshot, or
+            // someone else's capture, does not inherit it.
+            Phase::Snapshotting | Phase::SettingMode => {
+                let corr = format!("{}-ctx", ask.ask_id);
+                let _ = client.send(Some(&corr), Command::ContextExpire);
+            }
             Phase::Recording | Phase::Persisting => {
-                let _ = client.send(Some(&ask.ask_id), Command::CaptureAbort);
+                if !self.abort_take(&ask.ask_id) {
+                    self.aborting = Some(ask.ask_id.clone());
+                }
             }
             Phase::Transcribing { job } => {
                 let _ = client.send(
@@ -533,7 +574,39 @@ impl Broker {
         }
     }
 
-    fn tick_deadlines(&mut self) {
+    /// Whether the take named `corr` is no longer running: the abort was
+    /// accepted, or refused for a reason other than a full queue (the
+    /// take already ended, or the current take is someone else's).
+    fn abort_take(&self, corr: &str) -> bool {
+        !matches!(
+            self.shared.client.send(Some(corr), Command::CaptureAbort),
+            Err(Rejection::InboxFull | Rejection::Closed)
+        )
+    }
+
+    /// Who left, if the asking agent or the acking app is gone.
+    fn departed(&self, ask: &Ask) -> Option<(NoAnswerReason, &'static str)> {
+        let registered = lock_registry(&self.shared.conns);
+        let alive = |conn: &Arc<ConnState>| registered.iter().any(|c| Arc::ptr_eq(c, conn));
+        if !alive(&ask.conn) {
+            Some((NoAnswerReason::AgentCancelled, "the agent connection ended"))
+        } else if ask.acker.as_ref().is_some_and(|acker| !alive(acker)) {
+            Some((
+                NoAnswerReason::UserCancelled,
+                "the app showing the prompt disconnected",
+            ))
+        } else {
+            None
+        }
+    }
+
+    fn tick(&mut self) {
+        if let Some(corr) = self.aborting.clone() {
+            if self.abort_take(&corr) {
+                self.aborting = None;
+                self.admit_next();
+            }
+        }
         let Some((ask, phase)) = self.live.as_ref() else {
             return;
         };
@@ -588,12 +661,17 @@ impl Broker {
             Phase::SettingMode
                 if name == "mode.decision" && corr == Some(&format!("{id}-mode")) =>
             {
+                if let Some((reason, detail)) = self.departed(ask) {
+                    self.cancel_live(reason, detail);
+                    return;
+                }
                 let command = Command::CaptureStart {
                     policy: "push-to-talk".to_string(),
                 };
                 self.advance(&id, command, Phase::Recording, "capture_busy");
             }
-            Phase::Recording if corr == Some(&id) => {
+            Phase::Recording | Phase::Persisting if corr == Some(&id) => {
+                let persisting = matches!(phase, Phase::Persisting);
                 if let RtEvent::CaptureError { fatal: true, code } = &message.event {
                     self.fail_live(
                         "capture_failed",
@@ -602,21 +680,20 @@ impl Broker {
                              storage for manual recovery"
                         ),
                     );
+                } else if persisting && name == "capture.stopped" {
+                    let job = format!("{id}_job");
+                    let command = Command::JobsSubmit {
+                        capture_ref: id,
+                        route: "local-default".to_string(),
+                        budget: "standard".to_string(),
+                    };
+                    self.advance(
+                        &job.clone(),
+                        command,
+                        Phase::Transcribing { job },
+                        "transcription_failed",
+                    );
                 }
-            }
-            Phase::Persisting if corr == Some(&id) && name == "capture.stopped" => {
-                let job = format!("{id}_job");
-                let command = Command::JobsSubmit {
-                    capture_ref: id,
-                    route: "local-default".to_string(),
-                    budget: "standard".to_string(),
-                };
-                self.advance(
-                    &job.clone(),
-                    command,
-                    Phase::Transcribing { job },
-                    "transcription_failed",
-                );
             }
             Phase::Transcribing { job } if corr == Some(job.as_str()) => match message.event {
                 RtEvent::JobsCompleted(data) => {
@@ -660,11 +737,11 @@ fn error(code: &str, message: &str) -> AskOutcome {
     }
 }
 
-/// Every live non-agent connection: the app side that shows prompts.
+/// Every live app-role connection: the only ones that see prompts.
 fn app_connections(shared: &HostShared) -> Vec<Arc<ConnState>> {
     lock_registry(&shared.conns)
         .iter()
-        .filter(|conn| !conn.is_agent())
+        .filter(|conn| conn.is_app())
         .cloned()
         .collect()
 }

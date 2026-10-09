@@ -336,6 +336,7 @@ pub struct HostShared {
     /// The agent broker's inbox (see [`crate::agent`]).
     pub(crate) broker: Sender<BrokerMsg>,
     agent_allowlist: Allowlist,
+    insecure_test_app_role: bool,
 }
 
 pub(crate) struct ConnState {
@@ -348,6 +349,10 @@ pub(crate) struct ConnState {
     /// Set once an allowlisted `Frame::AgentHello` is accepted: only
     /// agent connections may ask, and they never see prompts.
     agent: AtomicBool,
+    /// Whether this connection is the Starling app, the only role that
+    /// sees and answers prompts. Nothing grants it in production yet,
+    /// so asks fail closed with `no_app`.
+    app: AtomicBool,
     /// A handle to the connection for immediate shutdown of both
     /// directions (the reader owns the original; the writer a clone).
     closer: Box<dyn TransportConn>,
@@ -379,6 +384,10 @@ pub(crate) enum BrokerMsg {
 impl ConnState {
     pub(crate) fn is_agent(&self) -> bool {
         self.agent.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn is_app(&self) -> bool {
+        self.app.load(Ordering::SeqCst) && !self.is_agent()
     }
 
     /// Stops accepting frames for this connection. Does **not** touch
@@ -582,6 +591,7 @@ pub fn serve(config: HostConfig) -> Result<HostHandle, HostError> {
         live_connections: AtomicUsize::new(0),
         broker: broker_tx,
         agent_allowlist,
+        insecure_test_app_role: config.insecure_test_app_role,
     });
 
     let watch_stop = Arc::new(AtomicBool::new(false));
@@ -723,6 +733,7 @@ fn accept_loop(
                     closed: AtomicBool::new(false),
                     unregistered: AtomicBool::new(false),
                     agent: AtomicBool::new(false),
+                    app: AtomicBool::new(shared.insecure_test_app_role),
                     closer,
                 });
 
@@ -881,6 +892,16 @@ fn connection_reader(
                     break;
                 }
                 match frame {
+                    // Agents reach the microphone only through asks.
+                    Frame::Command { .. } if state.is_agent() => {
+                        terminate(
+                            &state,
+                            TransportErrorCode::ProtocolViolation,
+                            "agent connections cannot send runtime commands; use ask_user"
+                                .to_string(),
+                        );
+                        break;
+                    }
                     Frame::Command { mut envelope } => {
                         if handle_command(&shared, &state, &mut envelope).is_err() {
                             break;
@@ -950,14 +971,13 @@ fn connection_reader(
                             reason,
                         });
                     }
-                    // An agent never receives a prompt, so its prompt
-                    // frames can only be an attempt to open the gate.
-                    Frame::PromptAck { .. } | Frame::PromptDone { .. } if state.is_agent() => {
+                    // Only the app sees prompts, so prompt frames from
+                    // anyone else can only be an attempt to open the gate.
+                    Frame::PromptAck { .. } | Frame::PromptDone { .. } if !state.is_app() => {
                         terminate(
                             &state,
                             TransportErrorCode::ProtocolViolation,
-                            "prompt frames come from the app side, not an agent connection"
-                                .to_string(),
+                            "prompt frames are only accepted from the Starling app".to_string(),
                         );
                         break;
                     }

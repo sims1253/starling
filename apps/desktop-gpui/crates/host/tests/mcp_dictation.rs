@@ -8,7 +8,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use starling_runtime::channel::RecvError;
-use starling_runtime::machine::capture::{CaptureConfig, V2CaptureStore};
+use starling_runtime::machine::capture::{CaptureConfig, CaptureStore, TakeRecord, V2CaptureStore};
+use starling_runtime::machine::context::{ContextProvider, StubContextProvider};
+use starling_runtime::protocol::{Command, TargetSnapshotData};
 use starling_runtime::provider::{FakeJob, FakeProvider};
 use starling_runtime::testing::{FakeCaptureSource, FakeTakeScript};
 use starling_runtime_host::agent::ALLOWLIST_FILE;
@@ -35,7 +37,9 @@ fn host_config(
     source: Arc<FakeCaptureSource>,
     provider: Arc<FakeProvider>,
 ) -> HostConfig {
-    let mut config = HostConfig::new(root, root.join("endpoints")).with_agent_allowlist(allowlist);
+    let mut config = HostConfig::new(root, root.join("endpoints"))
+        .with_agent_allowlist(allowlist)
+        .with_insecure_test_app_role();
     config.runtime = config
         .runtime
         .with_capture_source(source)
@@ -79,10 +83,26 @@ fn boot(
     source: Arc<FakeCaptureSource>,
     provider: Arc<FakeProvider>,
 ) -> (HostHandle, std::path::PathBuf) {
-    let allowlist = allowlist_at(root);
-    let host = serve(host_config(root, Some(allowlist), source, provider)).expect("host serves");
+    serve_at(host_config(
+        root,
+        Some(allowlist_at(root)),
+        source,
+        provider,
+    ))
+}
+
+fn serve_at(config: HostConfig) -> (HostHandle, std::path::PathBuf) {
+    let host = serve(config).expect("host serves");
     let path = host.socket_path().to_path_buf();
     (host, path)
+}
+
+fn until_closed(client: &HostClient, what: &str) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !client.is_closed() {
+        assert!(Instant::now() < deadline, "the host never refused {what}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 /// Waits for an ask result with this req (or panics with everything
@@ -327,10 +347,7 @@ fn an_ask_without_any_app_connection_fails_fast() {
         .ask_user("1", &["Anyone there?".into()], 20_000)
         .unwrap();
     match until_ask(&agent, "1") {
-        AskOutcome::Error { code, message } => {
-            assert_eq!(code, "no_prompt_ack", "{message}");
-            assert!(message.contains("no app connection"), "{message}");
-        }
+        AskOutcome::Error { code, message } => assert_eq!(code, "no_app", "{message}"),
         other => panic!("expected the fast no-listener failure, got {other:?}"),
     }
     assert!(source.started_takes.lock().unwrap().is_empty());
@@ -1049,6 +1066,252 @@ fn the_stdio_server_exits_zero_promptly_on_stdin_eof() {
         serde_json::from_str(stdout.lines().next().expect("the handshake was answered")).unwrap();
     assert_eq!(reply["id"], 1);
     assert!(reply["result"]["protocolVersion"].is_string(), "{reply}");
+
+    host.shutdown();
+}
+
+#[test]
+fn without_the_app_role_every_ask_fails_closed() {
+    let root = tempfile::tempdir().unwrap();
+    let source = one_clean_take();
+    let mut config = host_config(
+        root.path(),
+        Some(allowlist_at(root.path())),
+        source.clone(),
+        FakeProvider::new(vec![]),
+    );
+    config.insecure_test_app_role = false;
+    let (mut host, path) = serve_at(config);
+
+    // The agent's own second, plain connection: same user, no app role.
+    let plain = connect(&path);
+    let agent = agent(&path);
+    agent.ask_user("1", &["Ready?".into()], 20_000).unwrap();
+    match until_ask(&agent, "1") {
+        AskOutcome::Error { code, message } => assert_eq!(code, "no_app", "{message}"),
+        other => panic!("expected the fail-closed refusal, got {other:?}"),
+    }
+    assert!(plain.try_recv_ui().is_err(), "no prompt reaches it");
+
+    plain.prompt_ack("ask_1", true).unwrap();
+    until_closed(&plain, "an ack without the app role");
+    assert!(plain.close_reason().contains("protocol_violation"));
+    assert!(source.started_takes.lock().unwrap().is_empty());
+
+    host.shutdown();
+}
+
+#[test]
+fn an_agent_connection_cannot_send_runtime_commands() {
+    let root = tempfile::tempdir().unwrap();
+    let source = one_clean_take();
+    let (mut host, path) = boot(root.path(), source.clone(), FakeProvider::new(vec![]));
+
+    let agent = agent(&path);
+    let start = Command::CaptureStart {
+        policy: "push-to-talk".into(),
+    };
+    match agent.send(Some("take_direct"), start) {
+        Err(ClientError::Closed(reason)) => {
+            assert!(reason.contains("protocol_violation"), "{reason}")
+        }
+        other => panic!("an agent's capture.start must be refused, got {other:?}"),
+    }
+    assert!(source.started_takes.lock().unwrap().is_empty());
+
+    host.shutdown();
+}
+
+/// A context provider slow enough for connection messages to overtake
+/// the route freeze.
+struct SlowContext;
+
+impl ContextProvider for SlowContext {
+    fn snapshot(&self, source: &str) -> Result<TargetSnapshotData, String> {
+        std::thread::sleep(Duration::from_millis(500));
+        StubContextProvider::default().snapshot(source)
+    }
+}
+
+#[test]
+fn an_app_leaving_while_the_route_freezes_never_opens_the_mic() {
+    let root = tempfile::tempdir().unwrap();
+    let source = one_clean_take();
+    let mut config = host_config(
+        root.path(),
+        Some(allowlist_at(root.path())),
+        source.clone(),
+        FakeProvider::new(vec![]),
+    );
+    config.runtime = config.runtime.with_context_provider(Arc::new(SlowContext));
+    let (mut host, path) = serve_at(config);
+
+    let agent = agent(&path);
+    {
+        let app = connect(&path);
+        agent.ask_user("1", &["Ready?".into()], 30_000).unwrap();
+        let shown = until_ui(&app, "ShowPrompt", |frame| {
+            matches!(frame, UiWire::Show { .. })
+        });
+        app.prompt_ack(&ask_id_of(&shown), true).unwrap();
+    }
+    match until_ask(&agent, "1") {
+        AskOutcome::NoAnswer { reason } => assert_eq!(reason, NoAnswerReason::UserCancelled),
+        other => panic!("expected the dismissal, got {other:?}"),
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(source.started_takes.lock().unwrap().is_empty());
+
+    // The abandoned context was released, so the next ask can freeze a
+    // route of its own and record.
+    let app = connect(&path);
+    agent.ask_user("2", &["Again?".into()], 30_000).unwrap();
+    let shown = until_ui(&app, "the second prompt", |frame| {
+        matches!(frame, UiWire::Show { .. })
+    });
+    app.prompt_ack(&ask_id_of(&shown), true).unwrap();
+    until_event(&app, "capture.started", |e| {
+        e.type_name() == "capture.started"
+    });
+
+    host.shutdown();
+}
+
+#[test]
+fn a_tiny_event_buffer_cannot_wedge_the_broker() {
+    // With a one-slot subscription the capture actor blocks on the
+    // broker's subscription while the broker waits on its receipts,
+    // unless the subscription is drained independently.
+    let root = tempfile::tempdir().unwrap();
+    let source = FakeCaptureSource::new(vec![FakeTakeScript::clean(); 3]);
+    let mut config = host_config(
+        root.path(),
+        Some(allowlist_at(root.path())),
+        source.clone(),
+        FakeProvider::new(vec![]),
+    );
+    config.runtime.event_capacity = 1;
+    let (mut host, path) = serve_at(config);
+
+    let app = connect(&path);
+    let agent = agent(&path);
+    for round in 0..3 {
+        let req = round.to_string();
+        agent.ask_user(&req, &["Ready?".into()], 30_000).unwrap();
+        let shown = until_ui(&app, "ShowPrompt", |frame| {
+            matches!(frame, UiWire::Show { .. })
+        });
+        app.prompt_ack(&ask_id_of(&shown), true).unwrap();
+        until_event(&app, "capture.started", |e| {
+            e.type_name() == "capture.started"
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        agent.ask_cancel(&req, "changed my mind").unwrap();
+        match until_ask(&agent, &req) {
+            AskOutcome::NoAnswer { reason } => {
+                assert_eq!(reason, NoAnswerReason::AgentCancelled)
+            }
+            other => panic!("round {round}: expected the cancel, got {other:?}"),
+        }
+    }
+
+    host.shutdown();
+}
+
+struct FailingStore;
+
+impl CaptureStore for FailingStore {
+    fn commit_take(&self, _: &TakeRecord) -> Result<(), String> {
+        Err("disk full".to_string())
+    }
+    fn mark_interrupted(&self, _: &TakeRecord, _: &str) -> Result<(), String> {
+        Ok(())
+    }
+    fn describe(&self) -> String {
+        "failing".to_string()
+    }
+}
+
+#[test]
+fn a_failed_store_commit_fails_the_ask() {
+    let root = tempfile::tempdir().unwrap();
+    let mut config = host_config(
+        root.path(),
+        Some(allowlist_at(root.path())),
+        one_clean_take(),
+        FakeProvider::new(vec![]),
+    );
+    config.runtime = config.runtime.with_capture_store(Arc::new(FailingStore));
+    let (mut host, path) = serve_at(config);
+
+    let app = connect(&path);
+    let agent = agent(&path);
+    agent.ask_user("1", &["Ready?".into()], 30_000).unwrap();
+    let shown = until_ui(&app, "ShowPrompt", |frame| {
+        matches!(frame, UiWire::Show { .. })
+    });
+    app.prompt_ack(&ask_id_of(&shown), true).unwrap();
+    until_event(&app, "capture.started", |e| {
+        e.type_name() == "capture.started"
+    });
+    app.prompt_done(&ask_id_of(&shown)).unwrap();
+    match until_ask(&agent, "1") {
+        AskOutcome::Error { code, message } => assert_eq!(code, "capture_failed", "{message}"),
+        other => panic!("expected the storage failure, got {other:?}"),
+    }
+
+    host.shutdown();
+}
+
+#[test]
+fn the_broker_never_ends_a_take_it_did_not_start() {
+    let root = tempfile::tempdir().unwrap();
+    let source = FakeCaptureSource::new(vec![FakeTakeScript::clean(), FakeTakeScript::clean()]);
+    let (mut host, path) = boot(root.path(), source.clone(), FakeProvider::new(vec![]));
+
+    let app = connect(&path);
+    let agent = agent(&path);
+    agent.ask_user("1", &["Ready?".into()], 30_000).unwrap();
+    let shown = until_ui(&app, "ShowPrompt", |frame| {
+        matches!(frame, UiWire::Show { .. })
+    });
+    let ask_id = ask_id_of(&shown);
+    app.prompt_ack(&ask_id, true).unwrap();
+    until_event(&app, "capture.started", |e| {
+        e.type_name() == "capture.started"
+    });
+
+    // Another client ends the ask's take and starts its own.
+    let renderer = connect(&path);
+    renderer
+        .send(Some(&ask_id), Command::CaptureStop { drain: Some(true) })
+        .expect("stop accepted");
+    until_event(&renderer, "capture.stopped", |e| {
+        e.type_name() == "capture.stopped"
+    });
+    renderer
+        .send(
+            Some("take_other"),
+            Command::CaptureStart {
+                policy: "push-to-talk".into(),
+            },
+        )
+        .expect("start accepted");
+    until_event(&renderer, "capture.started", |e| {
+        e.type_name() == "capture.started" && e.corr() == Some("take_other")
+    });
+
+    agent.ask_cancel("1", "never mind").unwrap();
+    match until_ask(&agent, "1") {
+        AskOutcome::NoAnswer { reason } => assert_eq!(reason, NoAnswerReason::AgentCancelled),
+        other => panic!("expected the cancel, got {other:?}"),
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(
+        capture_state(&renderer),
+        "Recording",
+        "the other take survives"
+    );
 
     host.shutdown();
 }

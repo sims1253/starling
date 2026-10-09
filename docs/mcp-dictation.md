@@ -24,25 +24,39 @@ timeout_ms?: integer)`. It never reads history or documents ([#224] is
 the separate explicit-sharing scope) and returns the finalized **raw**
 transcript.
 
+> **Status: fails closed.** Prompts may only be shown and answered by a
+> connection holding the *app role*, and no app-role credential exists
+> yet. Until it lands, every ask is refused with `Error [no_app]` and
+> the microphone is never opened for an agent.
+
+## Threat model
+
+The host's IPC transport only admits processes of the same OS user,
+and any such process can already send `capture.start` directly. This
+surface must not widen that for agents, so:
+
+- **Agent connections** are admitted by the allowlist (below), never
+  see prompts, and are closed if they send runtime commands or prompt
+  frames. They reach the microphone only through an ask.
+- **Prompts** go only to app-role connections, and only an app-role
+  connection may answer one. A plain connection, including an agent's
+  own second connection, has no app role and is closed if it tries.
+
 ## Protocol & safety model
 
 - **Prompt-visibility gate.** The host shows the questions to the app
-  connections (`ShowPrompt`) and sends `capture.start` only after one
-  of them acks `PromptAck { visible: true }`. No ack within
-  `min(10 s, timeout_ms)` fails the ask with `no_prompt_ack` and the
-  microphone is never touched; with no app connected the ask fails
-  immediately. Only a connection the prompt was shown to may ack it,
-  only the acking connection may dismiss or finish it, and an agent
-  connection sending prompt frames is closed.
+  (`ShowPrompt`) and sends `capture.start` only after it acks
+  `PromptAck { visible: true }`. No ack within `min(10 s, timeout_ms)`
+  fails the ask with `no_prompt_ack` and the microphone is never
+  touched. Only the connection that acked may dismiss or finish the
+  ask, and the broker only ever stops or aborts the take it started.
 - **Allowlist, default deny.** MCP over stdio has no client identity,
-  so the boundary is a token the user provisions in
+  so agents are admitted by a token the user provisions in
   `<data_root>/mcp-clients.json` and in the agent's MCP config (via
   `STARLING_MCP_TOKEN`; argv is readable by other users). Unknown
   client, wrong token, or no file → `auth_failed` and the connection
   closes. A malformed file (including duplicate names) refuses host
-  startup. The token travels over the same-user-authenticated IPC
-  transport, so this decides *which agents may use the microphone*; it
-  does not defend against other processes running as the same user.
+  startup.
 - **Queueing.** Asks from any number of `tools/call`s or agents are
   serialized: one prompt and one capture at a time, up to 4 waiting,
   `queue_full` beyond that.
@@ -51,16 +65,17 @@ transcript.
   aborts the take with the no-answer `timeout`. A captured take is
   never discarded on the clock.
 - **Cancel and disconnect.** `notifications/cancelled`, or the MCP
-  server's host connection ending for any reason (including `kill -9`),
-  aborts the take with the no-answer `agent_cancelled`. The app
-  dismissing the prompt, or disconnecting, mid-take stops it with
-  `user_cancelled`.
+  server's host connection ending for any reason (including `kill -9`
+  or the agent no longer reading stdout), aborts the take with the
+  no-answer `agent_cancelled`. The app dismissing the prompt, or
+  disconnecting, stops it with `user_cancelled`.
 - **Result mapping.** An answer is returned as plain text. A no-answer
   (timeout, cancel, decline) returns `isError: true` with
   `"No answer: <reason>."` so it cannot be mistaken for spoken words.
-  Failures (no prompt ack, queue full, capture or transcription failed)
-  return `isError: true` with `"Error [<code>]: <message>."`. Malformed
-  arguments are JSON-RPC `-32602`.
+  Failures (no app, no prompt ack, queue full, capture or
+  transcription failed) return `isError: true` with
+  `"Error [<code>]: <message>."`. Malformed arguments are JSON-RPC
+  `-32602`.
 
 ## Setup
 
@@ -125,11 +140,11 @@ a token, and the agent registration.
 
 - **HTTP transport.** Claude Code's HTTP tool timeout is shorter than
   a human speaking, so the server is stdio only.
-- **The app-side prompt.** The GPUI app does not hold a `HostClient`
-  yet, so nothing in the app shows prompts today. The seam is the
-  `ShowPrompt`/`PromptAck`/`PromptDone`/`HidePrompt` frames and
-  `HostClient::recv_ui_timeout`/`prompt_ack`/`prompt_done`; until the
-  overlay exists, some other client has to play the app side.
+- **The app role and the prompt UI.** The app-role credential (granted
+  through the trusted app-launch path) and the GPUI overlay are
+  follow-ups. The seam is the `ShowPrompt`/`PromptAck`/`PromptDone`/
+  `HidePrompt` frames and `HostClient::recv_ui_timeout`/`prompt_ack`/
+  `prompt_done`.
 - **Processed output** ([#294]).
 - **A live Claude Code / Codex session** as acceptance; the tests use
   fake peers and the scripted capture source.

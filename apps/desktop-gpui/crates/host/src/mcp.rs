@@ -15,7 +15,9 @@
 //!
 //! `tools/call` requests may overlap. Replies are written whenever the
 //! host resolves each ask, so the stdin loop never waits on an answer
-//! and stays free to read cancellations.
+//! and stays free to read cancellations. Replies leave through a writer
+//! thread with a bounded queue: an agent that stops reading stdout ends
+//! the session rather than stalling the stdin loop or losing replies.
 
 use std::collections::HashMap;
 use std::io::{BufRead, Read, Write};
@@ -23,6 +25,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use serde_json::{json, Value};
+use starling_runtime::channel::{bounded, Receiver, Sender};
 
 use crate::agent::{validate_ask, MAX_QUESTIONS, MAX_TIMEOUT_MS, MIN_TIMEOUT_MS};
 use crate::frame::{AskOutcome, NoAnswerReason};
@@ -39,6 +42,10 @@ pub const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const MAX_LINE_BYTES: usize = 1024 * 1024;
 
 const SERVER_NOT_INITIALIZED: i64 = -32002;
+
+/// Replies waiting for stdout. A full queue means the agent stopped
+/// reading.
+const OUT_QUEUE: usize = 256;
 
 pub const TOOL_NAME: &str = "ask_user_dictation";
 
@@ -60,17 +67,34 @@ struct Shared {
     initialized: AtomicBool,
     /// Host-side ask token → the JSON-RPC id waiting on it.
     pending: Mutex<HashMap<String, Value>>,
-    out: Mutex<Box<dyn Write + Send>>,
+    out: Sender<String>,
+    broken: Arc<dyn Fn() + Send + Sync>,
 }
 
 impl McpServer {
-    pub fn new(out: impl Write + Send + 'static) -> McpServer {
+    /// Writes replies to `out` on a dedicated thread. `on_broken` runs
+    /// when the agent stops draining replies or the write fails; the
+    /// caller ends the session there.
+    pub fn new(
+        out: impl Write + Send + 'static,
+        on_broken: impl Fn() + Send + Sync + 'static,
+    ) -> McpServer {
+        let (tx, rx) = bounded(OUT_QUEUE);
+        let broken: Arc<dyn Fn() + Send + Sync> = Arc::new(on_broken);
+        {
+            let broken = Arc::clone(&broken);
+            std::thread::Builder::new()
+                .name("starling-mcp-write".to_string())
+                .spawn(move || write_loop(out, rx, &*broken))
+                .expect("mcp writer thread spawns");
+        }
         McpServer {
             inner: Arc::new(Shared {
                 next_req: AtomicU64::new(0),
                 initialized: AtomicBool::new(false),
                 pending: Mutex::new(HashMap::new()),
-                out: Mutex::new(Box::new(out)),
+                out: tx,
+                broken,
             }),
         }
     }
@@ -233,10 +257,18 @@ impl McpServer {
     /// One JSON document per line; the lock keeps concurrent replies
     /// from interleaving.
     fn write(&self, message: Value) {
-        let mut out = self.inner.out.lock().expect("mcp output lock");
-        // A failed write means the agent stopped reading; nobody is
-        // left to tell.
-        let _ = writeln!(out, "{message}").and_then(|()| out.flush());
+        if self.inner.out.try_send(message.to_string()).is_err() {
+            (self.inner.broken)();
+        }
+    }
+}
+
+fn write_loop(mut out: impl Write, replies: Receiver<String>, broken: &dyn Fn()) {
+    while let Ok(line) = replies.recv() {
+        if writeln!(out, "{line}").and_then(|()| out.flush()).is_err() {
+            broken();
+            return;
+        }
     }
 }
 
@@ -367,8 +399,22 @@ mod tests {
     }
 
     impl Output {
-        /// Every reply written since the last call.
-        fn replies(&self) -> Vec<Value> {
+        /// Every reply written since the last call, once the writer
+        /// thread has written at least `expected` and then gone quiet.
+        fn replies(&self, expected: usize) -> Vec<Value> {
+            let lines = || {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|&&b| b == b'\n')
+                    .count()
+            };
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while lines() < expected && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
             let bytes = std::mem::take(&mut *self.0.lock().unwrap());
             String::from_utf8(bytes)
                 .unwrap()
@@ -400,7 +446,7 @@ mod tests {
 
     fn server() -> (McpServer, Output) {
         let output = Output::default();
-        (McpServer::new(output.clone()), output)
+        (McpServer::new(output.clone(), || {}), output)
     }
 
     fn drive(server: &McpServer, sink: &dyn AskSink, lines: &[String]) {
@@ -439,7 +485,7 @@ mod tests {
                 request(2, "tools/list", json!({})),
             ],
         );
-        let replies = output.replies();
+        let replies = output.replies(2);
         assert_eq!(
             replies.len(),
             2,
@@ -463,7 +509,7 @@ mod tests {
             let (server, output) = server();
             let init = request(7, "initialize", json!({"protocolVersion": requested}));
             drive(&server, &FakeSink::default(), &[init]);
-            assert_eq!(output.replies()[0]["result"]["protocolVersion"], expected);
+            assert_eq!(output.replies(1)[0]["result"]["protocolVersion"], expected);
         }
     }
 
@@ -480,7 +526,7 @@ mod tests {
             ],
         );
         let codes: Vec<Value> = output
-            .replies()
+            .replies(3)
             .iter()
             .map(|r| r["error"]["code"].clone())
             .collect();
@@ -499,7 +545,7 @@ mod tests {
             &FakeSink::default(),
             &["not json".into(), "[[1,2]]".into(), overlong, initialize()],
         );
-        let replies = output.replies();
+        let replies = output.replies(4);
         assert_eq!(replies.len(), 4, "{replies:?}");
         assert_eq!(replies[0]["error"]["code"], -32700);
         assert_eq!(replies[1]["error"]["code"], -32600);
@@ -527,7 +573,7 @@ mod tests {
             lines.push(call(2, arguments));
         }
         drive(&server, &sink, &lines);
-        let replies = output.replies();
+        let replies = output.replies(lines.len());
         assert_eq!(replies.len(), lines.len());
         for reply in &replies[1..] {
             assert_eq!(reply["error"]["code"], -32602, "{reply}");
@@ -548,7 +594,7 @@ mod tests {
                 call("b", json!({"questions": ["Ready?"], "timeout_ms": 1_000})),
             ],
         );
-        assert_eq!(output.replies().len(), 1, "calls wait for the host");
+        assert_eq!(output.replies(1).len(), 1, "calls wait for the host");
         let asks = sink.asks.lock().unwrap().clone();
         assert_eq!(asks[0].1, ["Which fix?"]);
         assert_eq!(asks[0].2, DEFAULT_TIMEOUT_MS);
@@ -574,7 +620,7 @@ mod tests {
                 reason: NoAnswerReason::Timeout,
             },
         );
-        let replies = output.replies();
+        let replies = output.replies(2);
         assert_eq!(replies.len(), 2, "a req is answered once");
         assert_eq!(replies[0]["id"], "a");
         assert_eq!(
@@ -612,9 +658,34 @@ mod tests {
             &sink,
             &[initialize(), call(1, json!({"questions": ["Q?"]}))],
         );
-        let replies = output.replies();
+        let replies = output.replies(2);
         assert_eq!(replies.len(), 2, "{replies:?}");
         assert_eq!(replies[1]["result"]["isError"], true);
+    }
+
+    #[test]
+    fn a_stalled_stdout_ends_the_session_instead_of_blocking_stdin() {
+        struct Stalled;
+        impl Write for Stalled {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                loop {
+                    std::thread::park();
+                }
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let broken = Arc::new(AtomicBool::new(false));
+        let server = {
+            let broken = Arc::clone(&broken);
+            McpServer::new(Stalled, move || broken.store(true, Ordering::SeqCst))
+        };
+        let mut lines = vec![initialize()];
+        lines.extend((1..=OUT_QUEUE as u64 + 10).map(|id| request(id, "ping", json!({}))));
+        // Returning at all shows stdin was never blocked on stdout.
+        drive(&server, &FakeSink::default(), &lines);
+        assert!(broken.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -631,7 +702,7 @@ mod tests {
                 notification("notifications/cancelled", json!({"requestId": 42})),
             ],
         );
-        assert_eq!(output.replies().len(), 1, "only initialize is answered");
+        assert_eq!(output.replies(1).len(), 1, "only initialize is answered");
         let asked = sink.asks.lock().unwrap()[0].0.clone();
         assert_eq!(*sink.cancels.lock().unwrap(), [asked]);
     }
