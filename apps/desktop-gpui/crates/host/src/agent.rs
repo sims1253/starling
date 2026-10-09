@@ -51,7 +51,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use starling_runtime::bus::EventMessage;
+use starling_runtime::bus::{new_id, EventMessage};
 use starling_runtime::channel::{bounded, Receiver, RecvError, TrySendError};
 use starling_runtime::machine::Rejection;
 use starling_runtime::protocol::{Command, Event as RtEvent, Manual};
@@ -75,7 +75,8 @@ pub const ACK_BOUND: Duration = Duration::from_secs(10);
 pub const ALLOWLIST_FILE: &str = "mcp-clients.json";
 
 /// Prefix of every ask id, and so of every runtime corr the broker uses.
-const ASK_PREFIX: &str = "ask_";
+/// Reserved: the host refuses client commands whose corr carries it.
+pub(crate) const ASK_PREFIX: &str = "ask_";
 
 /// Runtime events buffered for the broker. An ask produces a handful
 /// plus capture progress, so overflow means the broker is stuck.
@@ -318,7 +319,6 @@ pub(crate) fn broker_loop(shared: Arc<HostShared>, inbox: Receiver<BrokerMsg>) {
     };
     let mut broker = Broker {
         shared,
-        next_ask: 0,
         live: None,
         waiting: VecDeque::new(),
         settling: Vec::new(),
@@ -355,7 +355,6 @@ pub(crate) fn broker_loop(shared: Arc<HostShared>, inbox: Receiver<BrokerMsg>) {
 
 struct Broker {
     shared: Arc<HostShared>,
-    next_ask: u64,
     live: Option<(Ask, Phase)>,
     waiting: VecDeque<Ask>,
     /// Cleanup an ended ask still owes the runtime. No ask is admitted
@@ -455,11 +454,11 @@ impl Broker {
             });
             return;
         }
-        self.next_ask += 1;
         self.waiting.push_back(Ask {
             conn,
             client_req,
-            ask_id: format!("{ASK_PREFIX}{}", self.next_ask),
+            // `ask_<uuid>`: unguessable, so no client can aim at the take.
+            ask_id: new_id("ask"),
             questions,
             started: Instant::now(),
             timeout: Duration::from_millis(timeout_ms),
@@ -626,16 +625,34 @@ impl Broker {
     /// Retries every pending cleanup. One is done when the runtime
     /// accepts it or refuses it as illegal in the machine's state (the
     /// take or context already ended, or the current one belongs to
-    /// someone else); anything else (a full queue, a sequencing race,
-    /// a pending command) is transient.
+    /// someone else). A closed actor never comes back: its cleanup is
+    /// dropped and queued asks fail with `runtime_unavailable`. Anything
+    /// else (a full queue, a sequencing race, a pending command) is
+    /// retried on the next tick.
     fn settle(&mut self) {
         let client = &self.shared.client;
+        let mut runtime_gone = false;
         self.settling.retain(|cleanup| {
-            !matches!(
-                client.send(Some(&cleanup.corr), (cleanup.command)()),
-                Ok(_) | Err(Rejection::IllegalInState { .. })
-            )
+            match client.send(Some(&cleanup.corr), (cleanup.command)()) {
+                Ok(_) | Err(Rejection::IllegalInState { .. }) => false,
+                // The actor is gone for good: nothing is left to undo,
+                // and nothing can be served either.
+                Err(Rejection::Closed) => {
+                    runtime_gone = true;
+                    false
+                }
+                Err(_) => true,
+            }
         });
+        if runtime_gone {
+            for ask in self.waiting.drain(..) {
+                ask.resolve(
+                    &self.shared,
+                    error("runtime_unavailable", "the runtime is no longer running"),
+                    "runtime unavailable",
+                );
+            }
+        }
     }
 
     /// Who left, if the asking agent or the acking app is gone.

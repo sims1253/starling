@@ -46,9 +46,10 @@ use starling_dictation::store_v2::{
 };
 use starling_runtime::bus::EventSub;
 use starling_runtime::channel::{bounded, Receiver, Sender, TrySendError};
+use starling_runtime::machine::Rejection;
 use starling_runtime::{Runtime, RuntimeClient};
 
-use crate::agent::{broker_loop, Allowlist, AllowlistError};
+use crate::agent::{broker_loop, Allowlist, AllowlistError, ASK_PREFIX};
 use crate::auth::PeerPolicy;
 use crate::config::HostConfig;
 use crate::frame::{encode, Frame, FrameError, FrameReader, TransportErrorCode};
@@ -1163,6 +1164,20 @@ fn handle_command(
         .and_then(|object| object.get("corr"))
         .and_then(serde_json::Value::as_str)
         .map(str::to_string);
+    // The broker's corrs are reserved, so no client can address an ask's
+    // take or context by name.
+    if corr.as_deref().is_some_and(|corr| corr.starts_with(ASK_PREFIX)) {
+        let refusal = Rejection::InvalidEnvelope(format!(
+            "corr prefix {ASK_PREFIX:?} is reserved for the host's agent asks"
+        ));
+        return state
+            .try_deliver(Frame::Receipt {
+                req: id,
+                seq: None,
+                result: Err(refusal),
+            })
+            .map_err(|()| state.close());
+    }
     let client_supplied_seq = envelope
         .as_object()
         .is_some_and(|object| object.contains_key("seq"));

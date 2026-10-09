@@ -202,7 +202,8 @@ pub enum AskOutcome {
     /// The ask was refused or failed. `code` is one of
     /// `invalid_questions`, `invalid_timeout`, `duplicate_req`,
     /// `queue_full`, `host_busy`, `no_app`, `no_prompt_ack`, `capture_busy`,
-    /// `capture_failed`, `transcription_failed`, `shutting_down`.
+    /// `capture_failed`, `transcription_failed`, `runtime_unavailable`,
+    /// `shutting_down`.
     Error { code: String, message: String },
 }
 

@@ -38,6 +38,9 @@ surface must not widen that for agents, so:
 - **Agent connections** are admitted by the allowlist (below), never
   see prompts, and are closed if they send runtime commands or prompt
   frames. They reach the microphone only through an ask.
+- **Ask ids** are unguessable (`ask_<uuid>`), and the host refuses any
+  client command whose `corr` starts with `ask_`, so no client can
+  address or impersonate an ask's take or context.
 - **Prompts** go only to app-role connections, and only an app-role
   connection may answer one. A plain connection, including an agent's
   own second connection, has no app role and is closed if it tries.
@@ -73,7 +76,9 @@ surface must not widen that for agents, so:
 - **Settling.** An ask that ends leaves cleanup for the runtime
   (aborting its take, expiring its provisional context). The host
   retries it until the runtime accepts it or reports nothing left to
-  undo, and admits no other ask until then.
+  undo, and admits no other ask until then. If the runtime itself is
+  gone, the cleanup is dropped and queued asks fail with
+  `runtime_unavailable`.
 - **Result mapping.** An answer is returned as plain text. A no-answer
   (timeout, cancel, decline) returns `isError: true` with
   `"No answer: <reason>."` so it cannot be mistaken for spoken words.

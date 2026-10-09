@@ -632,17 +632,16 @@ impl RuntimeClient {
         let corr = corr.map(str::to_string);
         let seq = self.bus.next_seq(corr.as_deref());
         let (tx, rx) = channel::bounded(1);
-        if self
-            .router
-            .try_send(RouterMsg::Typed {
-                corr,
-                seq: Some(seq),
-                command,
-                reply: tx,
-            })
-            .is_err()
-        {
-            return Err(Rejection::Closed);
+        match self.router.try_send(RouterMsg::Typed {
+            corr,
+            seq: Some(seq),
+            command,
+            reply: tx,
+        }) {
+            Ok(()) => {}
+            // A saturated router is as transient as a full machine inbox.
+            Err(channel::TrySendError::Full(_)) => return Err(Rejection::InboxFull),
+            Err(channel::TrySendError::Closed(_)) => return Err(Rejection::Closed),
         }
         match rx.recv() {
             Ok(result) => result,

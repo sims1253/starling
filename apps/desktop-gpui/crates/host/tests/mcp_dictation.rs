@@ -12,6 +12,7 @@ use starling_runtime::machine::capture::{
     CaptureConfig, CaptureSession, CaptureSource, CaptureStore, TakeRecord, V2CaptureStore,
 };
 use starling_runtime::machine::context::{ContextProvider, StubContextProvider};
+use starling_runtime::machine::Rejection;
 use starling_runtime::protocol::{Command, TargetSnapshotData};
 use starling_runtime::provider::{FakeJob, FakeProvider};
 use starling_runtime::testing::{FakeCaptureSource, FakeTakeScript};
@@ -1283,14 +1284,33 @@ fn the_broker_never_ends_a_take_it_did_not_start() {
         e.type_name() == "capture.started"
     });
 
-    // Another client ends the ask's take and starts its own.
+    // The ask's corr is reserved: no client can address its take by
+    // name, or reuse the name for a take of its own.
     let renderer = connect(&path);
+    assert!(
+        ask_id.starts_with("ask_") && ask_id.len() > "ask_".len() + 8,
+        "{ask_id}"
+    );
+    for command in [
+        Command::CaptureStop { drain: Some(true) },
+        Command::CaptureStart {
+            policy: "push-to-talk".into(),
+        },
+    ] {
+        match renderer.send(Some(&ask_id), command) {
+            Err(ClientError::Rejected(Rejection::InvalidEnvelope(detail))) => {
+                assert!(detail.contains("reserved"), "{detail}")
+            }
+            other => panic!("a reserved corr must be refused, got {other:?}"),
+        }
+    }
+    assert_eq!(capture_state(&renderer), "Recording");
+
+    // Another client ends the ask's take without naming it and starts
+    // its own.
     renderer
-        .send(Some(&ask_id), Command::CaptureStop { drain: Some(true) })
-        .expect("stop accepted");
-    until_event(&renderer, "capture.stopped", |e| {
-        e.type_name() == "capture.stopped"
-    });
+        .send(None, Command::CaptureAbort)
+        .expect("abort accepted");
     renderer
         .send(
             Some("take_other"),
@@ -1367,6 +1387,16 @@ impl GatedSource {
     }
 }
 
+/// Opens the gate when dropped, so a failing test cannot leave the
+/// capture actor parked and the host's shutdown hanging.
+struct ReleaseOnDrop(Arc<GatedSource>);
+
+impl Drop for ReleaseOnDrop {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
 impl CaptureSource for GatedSource {
     fn start(&self, journals: &Path, policy: &str) -> Result<Box<dyn CaptureSession>, String> {
         self.entered
@@ -1398,6 +1428,9 @@ fn an_abort_refused_by_a_full_inbox_is_retried_before_the_next_ask() {
     config.runtime.command_capacity = 1;
     config.runtime = config.runtime.with_capture_source(gate.clone());
     let (mut host, path) = serve_at(config);
+    // Declared after the host so it is dropped, and the gate opened,
+    // before the host shuts down.
+    let _release = ReleaseOnDrop(Arc::clone(&gate));
 
     let app = connect(&path);
     let agent = agent(&path);
@@ -1413,15 +1446,23 @@ fn an_abort_refused_by_a_full_inbox_is_retried_before_the_next_ask() {
         std::thread::sleep(Duration::from_millis(20));
     }
 
-    // Fill the parked actor's one-slot inbox.
-    let filler = {
-        let filler = connect(&path);
-        std::thread::spawn(move || {
-            let _ = filler.send(Some("take_filler"), Command::CaptureAbort);
-            filler
+    // Two senders race for the parked actor's one inbox slot: one is
+    // queued, the other refused at once, which proves the slot is taken.
+    let (results, outcomes) = std::sync::mpsc::channel();
+    let fillers: Vec<_> = ["take_filler_a", "take_filler_b"]
+        .into_iter()
+        .map(|corr| {
+            let filler = connect(&path);
+            let results = results.clone();
+            std::thread::spawn(move || {
+                let _ = results.send(filler.send(Some(corr), Command::CaptureAbort));
+            })
         })
-    };
-    std::thread::sleep(Duration::from_millis(200));
+        .collect();
+    match outcomes.recv_timeout(Duration::from_secs(5)) {
+        Ok(Err(ClientError::Rejected(Rejection::InboxFull))) => {}
+        other => panic!("expected one filler refused by the full inbox, got {other:?}"),
+    }
 
     agent.ask_user("2", &["Next?".into()], 30_000).unwrap();
     agent.ask_cancel("1", "never mind").unwrap();
@@ -1439,7 +1480,9 @@ fn an_abort_refused_by_a_full_inbox_is_retried_before_the_next_ask() {
     }
 
     gate.release();
-    let _ = filler.join();
+    for filler in fillers {
+        let _ = filler.join();
+    }
     until_ui(&app, "the next prompt", |frame| {
         matches!(frame, UiWire::Show { .. })
     });
