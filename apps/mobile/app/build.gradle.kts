@@ -65,6 +65,46 @@ if (releaseSigning != null) {
     }
 }
 
+// Contract data shared with the Python oracles and the Rust ports
+// (packages/contracts/mode-routing). The JVM tests replay its fixtures in
+// place; the runtime tables ship as assets, copied at build time, so the
+// app and every other port read one copy.
+val contractsDir = layout.projectDirectory.dir("../../../packages/contracts")
+
+abstract class ContractAssetsTask : DefaultTask() {
+    @get:InputFiles
+    abstract val tables: ConfigurableFileCollection
+
+    @get:OutputDirectory
+    abstract val outputDir: DirectoryProperty
+
+    @TaskAction
+    fun copy() {
+        val out = outputDir.get().asFile.resolve("contracts")
+        out.deleteRecursively()
+        out.mkdirs()
+        tables.files.forEach { it.copyTo(out.resolve(it.name)) }
+    }
+}
+
+val contractAssets = tasks.register<ContractAssetsTask>("contractAssets") {
+    tables.from(
+        contractsDir.file("mode-routing/spoken-commands.json"),
+        contractsDir.file("mode-routing/spoken-instructions.json"),
+    )
+}
+
+androidComponents {
+    onVariants { variant ->
+        variant.sources.assets?.addGeneratedSourceDirectory(contractAssets, ContractAssetsTask::outputDir)
+    }
+}
+
+tasks.withType<Test>().configureEach {
+    systemProperty("starling.contracts", contractsDir.asFile.absolutePath)
+    inputs.dir(contractsDir.dir("mode-routing")).withPropertyName("contracts").withPathSensitivity(PathSensitivity.RELATIVE)
+}
+
 android {
     namespace = "dev.starling.mobile"
     compileSdk = 37
