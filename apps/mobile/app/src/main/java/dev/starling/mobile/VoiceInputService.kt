@@ -259,6 +259,9 @@ class VoiceInputService : InputMethodService() {
         // whose callbacks may still be queued; it stays in the store (or is
         // deleted there, if it was private).
         val requestGeneration = requestGuard.begin()
+        // A take still settling owns its composing region until now; the
+        // new take does not, so the old region leaves the field first.
+        take?.let(::clearComposingText)
         transcriptView?.visibility = View.GONE
         transcriptView?.text = null
         take = Take(recording, requestGeneration, field, sensitive, streaming = session != null).also { started ->
@@ -465,7 +468,9 @@ class VoiceInputService : InputMethodService() {
             // The single asynchronous commitText of the live path, in the
             // field the take started in: it replaces the composing region
             // (or, with none left, inserts at the cursor) and finishes it.
-            connection.commitText(text, 1)
+            // An empty final with no region of ours writes nothing: an empty
+            // commit would replace whatever the user has selected.
+            if (text.isNotEmpty() || current.composing) connection.commitText(text, 1)
             current.composing = false
             endTake(current, R.string.keyboard_inserted, shown = text.takeUnless { current.sensitive })
             return
