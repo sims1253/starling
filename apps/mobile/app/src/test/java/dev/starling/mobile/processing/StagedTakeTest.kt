@@ -172,4 +172,19 @@ class StagedTakeTest {
         assertEquals(ModeCatalog.Plan.RULES_NO_MODEL, catalog.plan(clean, powerSaver = false))
         assertEquals(ModeCatalog.Plan.RULES_POWER_SAVER, catalog.plan(clean, powerSaver = true))
     }
+
+    @Test
+    fun aFailedCaptureLeavesTheEarlierDraft() {
+        val take = take()
+        take.dictate(final = "first comma")
+        take.beginSegment()
+        take.partial("lost words")
+        assertTrue(take.abandonSegment())
+        assertFalse(take.recording)
+        assertEquals("first,", take.displayText())
+        val empty = take()
+        empty.beginSegment()
+        empty.partial("lost")
+        assertFalse(empty.abandonSegment())
+    }
 }

@@ -138,5 +138,13 @@
     <string name="staging_matched_literal">“literal” at the start: the rest is kept exactly as spoken.</string>
     <string name="staging_instruction">Instruction “%1$s” needs a text model, which this device does not have yet; it is left out of the draft.</string>
     <string name="staging_word_selected">Word selected. Tap Delete word, or tap it again to clear.</string>
+    <string name="staging_segment_failed">This recording could not be transcribed; it stays in Starling for retry. The draft keeps its earlier text.</string>
     <string name="staging_power_saver">Battery saver: rules only.</string>
+    <string name="staging_no_model">This mode asks for a text model the phone does not have yet; rules only.</string>
+    <string name="staging_action_send">send</string>
+    <string name="staging_action_search">search</string>
+    <string name="staging_action_go">go</string>
+    <string name="staging_action_done">done</string>
+    <string name="staging_action_next">next</string>
+    <string name="staging_mode_picker_hint">Choose a mode for the next take, or say its phrase at the start.</string>
 </resources>

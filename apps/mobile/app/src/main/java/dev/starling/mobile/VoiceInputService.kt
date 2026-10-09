@@ -9,6 +9,16 @@ import android.content.pm.PackageManager
 import android.inputmethodservice.InputMethodService
 import android.os.Build
 import android.os.PersistableBundle
+import android.os.PowerManager
+import android.text.SpannableStringBuilder
+import android.text.Spanned
+import android.text.style.BackgroundColorSpan
+import android.text.style.ForegroundColorSpan
+import android.text.style.StrikethroughSpan
+import android.text.style.StyleSpan
+import android.graphics.Typeface
+import android.util.Log
+import android.view.MotionEvent
 import android.view.LayoutInflater
 import android.view.View
 import android.view.inputmethod.EditorInfo
@@ -16,6 +26,8 @@ import android.view.inputmethod.InputConnection
 import android.view.inputmethod.InputMethodManager
 import android.widget.Button
 import android.widget.FrameLayout
+import android.widget.HorizontalScrollView
+import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
@@ -29,9 +41,14 @@ import dev.starling.mobile.engine.ModelLifetime
 import dev.starling.mobile.network.StreamEvent
 import dev.starling.mobile.network.StreamSession
 import dev.starling.mobile.network.TranscriptionEngine
+import dev.starling.mobile.processing.ModeCatalog
+import dev.starling.mobile.processing.Mode
+import dev.starling.mobile.processing.RegionKind
+import dev.starling.mobile.processing.StagedTake
 import dev.starling.mobile.ui.EditorField
 import dev.starling.mobile.ui.InputTargetGuard
 import dev.starling.mobile.ui.RequestGenerationGuard
+import java.util.UUID
 
 /**
  * Lightweight voice keyboard. It never reads surrounding editor text. Two
@@ -61,6 +78,16 @@ import dev.starling.mobile.ui.RequestGenerationGuard
  * Private fields ([EditorField.sensitive]: passwords, incognito) dictate an
  * ephemeral take that never shows up in the history and is deleted as soon
  * as it settles.
+ *
+ * Modes (#302) come from [ModeCatalog]. Direct mode is the flow above. A
+ * staged mode ([StagedTake]) never writes while it records: Stop leaves an
+ * editable draft above the keyboard — live tail, mode chip, the processed
+ * proposal with the raw text one tap away — and only Insert writes, once,
+ * into the take's field (and, for insert_enter modes, presses the field's own
+ * action). A leading mode phrase may switch a direct take to a staged one
+ * while it is spoken; until it is clear whether the first words are a phrase,
+ * nothing is composed into the field, so command text never reaches it. A
+ * trailing instruction always stages the take. Private fields never stage.
  */
 class VoiceInputService : InputMethodService() {
     private val application by lazy { starlingApplication() }
@@ -76,6 +103,13 @@ class VoiceInputService : InputMethodService() {
     private var statusView: TextView? = null
     private var transcriptView: TextView? = null
     private var modelStatusView: TextView? = null
+    private var modeChip: Button? = null
+    private var modePicker: HorizontalScrollView? = null
+    private var modeList: LinearLayout? = null
+    private var decisionRow: View? = null
+    private var decisionView: TextView? = null
+    private var draftTools: View? = null
+    private var viewToggle: Button? = null
     private val modelStateListener: (ModelLifetime.State) -> Unit = { renderModelState(it) }
 
     /** The focused field, from onStartInput; null when there is none. */
@@ -83,6 +117,8 @@ class VoiceInputService : InputMethodService() {
 
     /** The one take this keyboard follows, from Record until it is settled. */
     private var take: Take? = null
+
+    private val catalog: ModeCatalog by lazy { application.modeCatalog }
 
     override fun onCreate() {
         super.onCreate()
@@ -106,14 +142,44 @@ class VoiceInputService : InputMethodService() {
         statusView = view.findViewById(R.id.keyboard_status)
         transcriptView = view.findViewById(R.id.keyboard_transcript)
         modelStatusView = view.findViewById(R.id.keyboard_model_status)
+        modeChip = view.findViewById(R.id.keyboard_mode_chip)
+        modePicker = view.findViewById(R.id.keyboard_mode_picker)
+        modeList = view.findViewById(R.id.keyboard_mode_list)
+        decisionRow = view.findViewById(R.id.keyboard_decision_row)
+        decisionView = view.findViewById(R.id.keyboard_decision)
+        draftTools = view.findViewById(R.id.keyboard_draft_tools)
+        viewToggle = view.findViewById(R.id.keyboard_view_toggle)
         renderModelState(application.modelLifetime.state())
 
         recordButton?.setOnClickListener {
             if (take?.capturing == true) stopTake() else requestOrStartRecording()
         }
-        insertButton?.setOnClickListener { insertReadyTranscript() }
+        // Long-press on the mic is the thumb-reachable way to the modes.
+        recordButton?.setOnLongClickListener { toggleModePicker(); true }
+        modeChip?.setOnClickListener { toggleModePicker() }
+        buildModePicker()
+        insertButton?.setOnClickListener {
+            if (take?.staged != null) insertDraft() else insertReadyTranscript()
+        }
         copyButton?.setOnClickListener { copyReadyTranscript() }
         switchKeyboardButton?.setOnClickListener { switchToPreviousKeyboard() }
+        view.findViewById<Button>(R.id.keyboard_decision_undo).setOnClickListener {
+            take?.staged?.undoDecision()
+            renderTake()
+        }
+        view.findViewById<Button>(R.id.keyboard_delete_word).setOnClickListener {
+            take?.staged?.deleteWord()
+            renderTake()
+        }
+        view.findViewById<Button>(R.id.keyboard_discard).setOnClickListener {
+            take?.let { endTake(it, R.string.staging_discarded) }
+        }
+        viewToggle?.setOnClickListener {
+            val staged = take?.staged ?: return@setOnClickListener
+            if (staged.proposal != null) staged.toggleView() else staged.backToRaw()
+            renderTake()
+        }
+        transcriptView?.setOnTouchListener { v, event -> onDraftTouch(v, event) }
         renderTake()
         return container
     }
@@ -227,6 +293,13 @@ class VoiceInputService : InputMethodService() {
             return
         }
         val sensitive = field.sensitive
+        // Recording again with a draft open (in its own field) adds to it.
+        val continuing = take?.takeIf {
+            !it.capturing && it.staged != null && it.target?.let { t -> targetGuard.isCurrent(t, currentInputConnection) } == true
+        }
+        // A private field gets the default mode: its route is blocked, so no
+        // phrase, rule or processing ever applies there.
+        val mode = continuing?.mode ?: if (sensitive) catalog.mode(null) else selectedMode()
         val recording = runCatching { application.recordings.create(ephemeral = sensitive) }.getOrElse {
             statusView?.setText(R.string.recording_storage_error)
             return
@@ -264,15 +337,25 @@ class VoiceInputService : InputMethodService() {
         take?.let(::clearComposingText)
         transcriptView?.visibility = View.GONE
         transcriptView?.text = null
-        take = Take(recording, requestGeneration, field, sensitive).also { started ->
+        take = Take(
+            recording,
+            requestGeneration,
+            continuing?.field ?: field,
+            sensitive,
+            mode = mode,
+        ).also { started ->
             started.session = session
             started.target = target
-            started.liveInField = session != null && field.supportsComposing
+            started.staged = continuing?.staged
+                ?: if (!sensitive && mode.processingDelivery == STAGED) newStagedTake(mode, recording.id) else null
+            started.staged?.beginSegment()
+            started.liveInField = session != null && field.supportsComposing && started.staged == null
         }
         take?.foregroundHold = CaptureForegroundService.hold(this) { stopTake() }
         renderTake()
         statusView?.setText(
             when {
+                take?.staged != null -> R.string.staging_drafting
                 session == null -> R.string.keyboard_recording
                 // Audio is already being saved; live text follows the load.
                 application.isOnDeviceModelLoading(config) -> R.string.keyboard_recording_loading
@@ -333,20 +416,49 @@ class VoiceInputService : InputMethodService() {
         when (event) {
             StreamEvent.Live -> statusView?.setText(R.string.keyboard_streaming)
             is StreamEvent.Partial -> {
-                current.lastPartial = event.text
+                current.staged?.let { staged ->
+                    staged.partial(event.text)
+                    renderTake()
+                    return
+                }
+                var shown = event.text
+                var holdBack = false
+                if (!current.sensitive) {
+                    val routed = catalog.route(event.text, current.mode, secure = false)
+                    val routedMode = routed.mode?.let(catalog::mode)
+                    if (routed.prefixSpanCodepoints != null && routedMode?.processingDelivery == STAGED) {
+                        // "draft mode …": the rest of this take is a draft.
+                        switchToStaged(current)
+                        current.staged?.partial(event.text)
+                        renderTake()
+                        return
+                    }
+                    // A phrase that keeps the take direct ("literal …") is
+                    // never composed; neither are words that may still
+                    // become one.
+                    if (routed.prefixSpanCodepoints != null) shown = routed.payload
+                    holdBack = catalog.couldBecomePhrase(event.text, current.mode)
+                    // From a possible "Starling, …" delimiter on, nothing is
+                    // composed: an instruction never reaches the field, even
+                    // for a moment. The final decides whether it was one.
+                    catalog.instructions.liveCut(shown, current.mode.language)?.let { cut ->
+                        shown = shown.substring(0, cut)
+                    }
+                }
+                current.lastPartial = shown
                 val target = current.target
                 val connection = currentInputConnection
-                if (current.liveInField && target != null && targetGuard.isCurrent(target, connection)) {
+                if (!holdBack && current.liveInField && target != null && targetGuard.isCurrent(target, connection)) {
                     // The partial grows over the whole session, so each one
                     // replaces the composing region entirely. An empty text
                     // without a region of ours would replace the selection.
-                    if (current.composing || event.text.isNotEmpty()) {
-                        connection.setComposingText(event.text, 1)
-                        current.composing = event.text.isNotEmpty()
+                    if (current.composing || shown.isNotEmpty()) {
+                        connection.setComposingText(shown, 1)
+                        current.composing = shown.isNotEmpty()
                     }
                 } else {
-                    // No composing region (detached, or a field that cannot
-                    // compose): the keyboard shows the live text itself.
+                    // No composing region (held back, detached, or a field
+                    // that cannot compose): the keyboard shows the live text.
                     transcriptView?.visibility = View.VISIBLE
                     transcriptView?.text = visibleText(current, event.text)
                 }
@@ -381,6 +493,7 @@ class VoiceInputService : InputMethodService() {
         // Request-local state is captured in the take itself; a new editor
         // or take may replace the keyboard's fields while this one settles.
         current.capturing = false
+        current.stoppedAtNanos = System.nanoTime()
         val session = current.session
         current.session = null
         renderTake()
@@ -450,14 +563,45 @@ class VoiceInputService : InputMethodService() {
     private fun onTranscriptionSettled(current: Take, completed: Recording) {
         if (current.sensitive) runCatching { application.recordings.delete(completed.id) }
         if (!requestGuard.isCurrent(current.requestGeneration) || take !== current) return
-        val text = completed.rawTranscript
+        var text = completed.rawTranscript
         if (completed.status != RecordingStatus.TRANSCRIBED || text == null) {
+            val staged = current.staged
+            if (staged != null && staged.abandonSegment()) {
+                // An earlier capture's text is still in the draft; only this
+                // one failed (its audio stays in Starling for retry).
+                renderTake()
+                statusView?.setText(R.string.staging_segment_failed)
+                return
+            }
             endTake(
                 current,
                 if (current.sensitive) R.string.keyboard_transcription_failed_private
                 else R.string.keyboard_transcription_failed,
             )
             return
+        }
+        val staged = current.staged
+        if (staged != null) {
+            staged.final(completed.id, text)
+            settleDraft(current, staged)
+            return
+        }
+        if (!current.sensitive) {
+            val routed = catalog.route(text, current.mode, secure = false)
+            val routedMode = routed.mode?.let(catalog::mode) ?: current.mode
+            val instruction = routedMode.behavior != VERBATIM &&
+                catalog.instructions.split(routed.payload, routedMode.language).matched
+            // A staged mode phrase, a spoken instruction, an ambiguous phrase
+            // or nothing left after the phrase: the take becomes a draft
+            // instead of being delivered.
+            if (routedMode.processingDelivery == STAGED || instruction || routed.mode == null ||
+                routed.payload.isBlank()
+            ) {
+                switchToStaged(current).final(completed.id, text)
+                settleDraft(current, current.staged ?: return)
+                return
+            }
+            text = routed.payload
         }
         val target = current.target
         val connection = currentInputConnection
@@ -500,7 +644,7 @@ class VoiceInputService : InputMethodService() {
     /** The take's field is gone; the user can still take the text along. */
     private fun copyReadyTranscript() {
         val current = take ?: return
-        val text = current.ready ?: return
+        val text = current.staged?.deliveryText() ?: current.ready ?: return
         val clipboard = getSystemService(ClipboardManager::class.java) ?: return
         val clip = ClipData.newPlainText(getString(R.string.keyboard_name), text)
         if (current.sensitive && Build.VERSION.SDK_INT >= 33) {
@@ -511,6 +655,203 @@ class VoiceInputService : InputMethodService() {
         }
         clipboard.setPrimaryClip(clip)
         endTake(current, R.string.keyboard_copied, shown = text.takeUnless { current.sensitive })
+    }
+
+    /** The draft's text goes into the take's field, once, on this explicit tap. */
+    private fun insertDraft() {
+        val current = take ?: return
+        val staged = current.staged ?: return
+        val target = current.target
+        val connection = currentInputConnection
+        if (current.capturing || staged.recording || target == null || !targetGuard.isCurrent(target, connection)) {
+            renderTake()
+            return
+        }
+        val text = staged.deliveryText()
+        // Exactly once per draft revision and field binding, whatever taps
+        // or callbacks repeat.
+        if (!staged.deliver(UUID.randomUUID().toString(), "${target.generation}")) return
+        connection.commitText(text, 1)
+        val status = if (staged.mode.delivery == INSERT_ENTER && !pressEditorAction(connection)) {
+            R.string.staging_no_action
+        } else {
+            R.string.keyboard_inserted
+        }
+        endTake(current, status, shown = text)
+    }
+
+    /**
+     * Presses the field's own action (Send, Search, Go) the way the app
+     * declared it, never a synthetic Enter key. False when the field
+     * declares none.
+     */
+    private fun pressEditorAction(connection: InputConnection): Boolean {
+        val info = currentInputEditorInfo ?: return false
+        if (info.actionLabel != null && info.actionId != 0) return connection.performEditorAction(info.actionId)
+        val action = info.imeOptions and EditorInfo.IME_MASK_ACTION
+        if (action == EditorInfo.IME_ACTION_NONE || action == EditorInfo.IME_ACTION_UNSPECIFIED) return false
+        return connection.performEditorAction(action)
+    }
+
+    /** What the Insert button says in an insert_enter mode: the field's own action. */
+    private fun insertActionLabel(): String {
+        val info = currentInputEditorInfo
+        val label = info?.actionLabel?.toString()?.takeIf { it.isNotBlank() } ?: when (
+            (info?.imeOptions ?: 0) and EditorInfo.IME_MASK_ACTION
+        ) {
+            EditorInfo.IME_ACTION_SEND -> getString(R.string.staging_action_send)
+            EditorInfo.IME_ACTION_SEARCH -> getString(R.string.staging_action_search)
+            EditorInfo.IME_ACTION_GO -> getString(R.string.staging_action_go)
+            EditorInfo.IME_ACTION_DONE -> getString(R.string.staging_action_done)
+            EditorInfo.IME_ACTION_NEXT -> getString(R.string.staging_action_next)
+            else -> return getString(R.string.keyboard_insert)
+        }
+        return getString(R.string.staging_insert_action, label)
+    }
+
+    private fun selectedMode(): Mode =
+        catalog.mode(getSharedPreferences(PREFERENCES, MODE_PRIVATE).getString(KEY_MODE, null))
+
+    private fun newStagedTake(mode: Mode, id: String) = StagedTake(
+        catalog,
+        mode,
+        id,
+        powerSaver = getSystemService(PowerManager::class.java)?.isPowerSaveMode == true,
+    )
+
+    /**
+     * A direct take becomes a draft (a staged phrase was spoken, or the
+     * final needs a decision): its composing text leaves the field first.
+     */
+    private fun switchToStaged(current: Take): StagedTake {
+        current.staged?.let { return it }
+        clearComposingText(current)
+        current.liveInField = false
+        return newStagedTake(current.mode, current.recording.id).also { staged ->
+            staged.beginSegment()
+            current.staged = staged
+        }
+    }
+
+    /** A capture's final landed in the draft: show it, and log the timings for #226. */
+    private fun settleDraft(current: Take, staged: StagedTake) {
+        val rawMs = (System.nanoTime() - current.stoppedAtNanos) / 1_000_000
+        val processedMs = staged.proposal?.elapsedMs
+        runCatching {
+            Log.i(
+                TIMING_TAG,
+                "take ${current.recording.id}: stop->raw ${rawMs} ms, processing " +
+                    "${processedMs ?: "-"} ms (${staged.plan}), stop->processed ${rawMs + (processedMs ?: 0)} ms",
+            )
+        }
+        renderTake()
+        statusView?.text = when {
+            staged.plan == ModeCatalog.Plan.RULES_POWER_SAVER -> getString(R.string.staging_power_saver)
+            staged.plan == ModeCatalog.Plan.RULES_NO_MODEL -> getString(R.string.staging_no_model)
+            processedMs != null -> getString(R.string.staging_ready_processed, processedMs)
+            staged.plan == ModeCatalog.Plan.RULES -> getString(R.string.staging_no_changes)
+            else -> getString(R.string.staging_ready)
+        }
+    }
+
+    private fun buildModePicker() {
+        val list = modeList ?: return
+        list.removeAllViews()
+        catalog.modes.filter { it.id != VERBATIM }.forEach { mode ->
+            val chip = Button(this, null, android.R.attr.buttonBarButtonStyle).apply {
+                text = mode.name
+                isAllCaps = false
+                contentDescription = mode.description
+                setOnClickListener { chooseMode(mode) }
+            }
+            list.addView(chip)
+        }
+    }
+
+    private fun toggleModePicker() {
+        val picker = modePicker ?: return
+        val show = picker.visibility != View.VISIBLE
+        picker.visibility = if (show) View.VISIBLE else View.GONE
+        if (show) statusView?.setText(R.string.staging_mode_picker_hint)
+    }
+
+    /**
+     * The picked mode is the default for the next takes; an open draft or
+     * a running direct take switches to it at once.
+     */
+    private fun chooseMode(mode: Mode) {
+        getSharedPreferences(PREFERENCES, MODE_PRIVATE).edit().putString(KEY_MODE, mode.id).apply()
+        modePicker?.visibility = View.GONE
+        val current = take
+        when {
+            current == null || current.sensitive || current.ready != null -> Unit
+            current.staged != null -> {
+                current.mode = mode
+                current.staged?.switchMode(mode)
+            }
+            current.capturing -> {
+                current.mode = mode
+                if (mode.processingDelivery == STAGED) {
+                    val staged = switchToStaged(current)
+                    current.lastPartial?.let(staged::partial)
+                }
+            }
+        }
+        renderTake()
+    }
+
+    /** A tap on a draft word selects it for Delete word. */
+    private fun onDraftTouch(view: View, event: MotionEvent): Boolean {
+        val staged = take?.staged ?: return false
+        if (event.action != MotionEvent.ACTION_UP || staged.recording) return event.action == MotionEvent.ACTION_DOWN
+        val text = (view as TextView).text.toString()
+        val offset = view.getOffsetForPosition(event.x, event.y).coerceIn(0, text.length)
+        staged.selectWordAt(text.codePointCount(0, offset))
+        renderTake()
+        statusView?.text = if (staged.selection != null) getString(R.string.staging_word_selected) else null
+        view.performClick()
+        return true
+    }
+
+    /** The draft on screen: command spans struck through, the live tail muted, the selection marked. */
+    private fun renderDraft(staged: StagedTake): CharSequence {
+        val text = staged.displayText()
+        val styled = SpannableStringBuilder(text)
+        fun utf16(codePoint: Int) = text.offsetByCodePoints(0, codePoint.coerceIn(0, text.codePointCount(0, text.length)))
+        val muted = getColor(R.color.starling_muted)
+        if (!staged.showingProcessed) {
+            staged.draft.regions().forEach { region ->
+                val start = utf16(region.span.start)
+                val end = utf16(region.span.end)
+                when (region.kind) {
+                    RegionKind.COMMAND -> {
+                        styled.setSpan(ForegroundColorSpan(muted), start, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+                        styled.setSpan(StrikethroughSpan(), start, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+                    }
+                    RegionKind.PARTIAL -> {
+                        styled.setSpan(ForegroundColorSpan(muted), start, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+                        styled.setSpan(StyleSpan(Typeface.ITALIC), start, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+                    }
+                    else -> Unit
+                }
+            }
+        }
+        staged.selection?.let { word ->
+            styled.setSpan(
+                BackgroundColorSpan(getColor(R.color.starling_line)),
+                utf16(word.first),
+                utf16(word.last + 1),
+                Spanned.SPAN_EXCLUSIVE_EXCLUSIVE,
+            )
+        }
+        return styled
+    }
+
+    private fun decisionText(staged: StagedTake): String? = when (val decision = staged.decision) {
+        is StagedTake.Decision.Phrase -> getString(R.string.staging_matched_phrase, decision.phrase, decision.mode.name)
+        StagedTake.Decision.Literal -> getString(R.string.staging_matched_literal)
+        is StagedTake.Decision.Instruction -> getString(R.string.staging_instruction, decision.instruction)
+        null -> null
     }
 
     /** Clears the take and leaves a final status (and, optionally, its text) on screen. */
@@ -540,8 +881,36 @@ class VoiceInputService : InputMethodService() {
     private fun renderTake() {
         val current = take
         recordButton?.setText(if (current?.capturing == true) R.string.keyboard_stop else R.string.keyboard_record)
-        val ready = current?.ready
         val bound = current?.target?.let { targetGuard.isCurrent(it, currentInputConnection) } == true
+        val staged = current?.staged
+        modeChip?.text = getString(R.string.staging_mode_chip, (staged?.mode ?: current?.mode ?: selectedMode()).name)
+        val decision = staged?.let(::decisionText)
+        decisionRow?.visibility = if (decision != null && !current.capturing) View.VISIBLE else View.GONE
+        decisionView?.text = decision
+        if (staged != null) {
+            val settled = !current.capturing && !staged.recording
+            transcriptView?.visibility = View.VISIBLE
+            transcriptView?.text = renderDraft(staged)
+            draftTools?.visibility = if (settled) View.VISIBLE else View.GONE
+            viewToggle?.visibility = when {
+                staged.proposal != null || staged.processedInDraft -> View.VISIBLE
+                else -> View.INVISIBLE
+            }
+            viewToggle?.setText(
+                when {
+                    staged.proposal == null -> R.string.staging_back_to_raw
+                    staged.showingProcessed -> R.string.staging_show_raw
+                    else -> R.string.staging_show_processed
+                },
+            )
+            insertButton?.visibility = if (settled && bound) View.VISIBLE else View.GONE
+            insertButton?.text = if (staged.mode.delivery == INSERT_ENTER) insertActionLabel() else getString(R.string.keyboard_insert)
+            copyButton?.visibility = if (settled && !bound) View.VISIBLE else View.GONE
+            return
+        }
+        draftTools?.visibility = View.GONE
+        insertButton?.setText(R.string.keyboard_insert)
+        val ready = current?.ready
         insertButton?.visibility = if (ready != null && bound) View.VISIBLE else View.GONE
         copyButton?.visibility = if (ready != null && !bound) View.VISIBLE else View.GONE
         if (ready != null) {
@@ -632,6 +1001,11 @@ class VoiceInputService : InputMethodService() {
     private companion object {
         const val PREFERENCES = "keyboard"
         const val KEY_NOTIFICATIONS_ASKED = "notifications_asked"
+        const val KEY_MODE = "mode"
+        const val STAGED = "staged"
+        const val VERBATIM = "verbatim"
+        const val INSERT_ENTER = "insert_enter"
+        const val TIMING_TAG = "StarlingTiming"
     }
 
     /**
@@ -645,6 +1019,8 @@ class VoiceInputService : InputMethodService() {
         /** The field the take was started in; it attaches only to that field. */
         val field: EditorField,
         val sensitive: Boolean,
+        /** The mode the take runs in; a spoken phrase or the picker may change it. */
+        var mode: Mode,
     ) {
         var capturing = true
         var session: StreamSession? = null
@@ -674,5 +1050,11 @@ class VoiceInputService : InputMethodService() {
 
         /** Final text waiting for an explicit Insert or Copy. */
         var ready: String? = null
+
+        /** The take's draft, for a staged mode (or a direct take that became one). */
+        var staged: StagedTake? = null
+
+        /** When Stop was tapped, for the stop→raw/processed timings. */
+        var stoppedAtNanos = 0L
     }
 }

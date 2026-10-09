@@ -70,6 +70,24 @@ class SpokenInstructions(tableJson: String, private val commands: SpokenCommands
         )
     }
 
+    /**
+     * Where live text must stop while a take is still being spoken: the
+     * UTF-16 start of the first delimiter candidate in the trailing window
+     * (whitespace before it included), or null. Unlike [split] it does not
+     * wait for words after the delimiter, since they have not been spoken
+     * yet; the final's [split] decides.
+     */
+    fun liveCut(text: String, language: String?): Int? {
+        val spans = tokens(text)
+        val literal = commands.literalWord(language)
+        for (i in maxOf(0, spans.size - windowWords) until spans.size) {
+            if (core(text.substring(spans[i].first, spans[i].second)) !in matchTokens) continue
+            if (i > 0 && core(text.substring(spans[i - 1].first, spans[i - 1].second)) == literal) continue
+            return text.substring(0, spans[i].first).trimEnd(' ', '\t', '\n', '\r', '\u000B', '\u000C').length
+        }
+        return null
+    }
+
     /** Removes a leading delimiter token from an instruction region's text; anything else is returned unchanged. */
     fun stripDelimiter(instruction: String): String {
         val first = tokens(instruction).firstOrNull() ?: return instruction

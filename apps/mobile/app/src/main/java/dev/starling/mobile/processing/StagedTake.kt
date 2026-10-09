@@ -117,6 +117,17 @@ class StagedTake(
         process()
     }
 
+    /**
+     * The current capture failed: its live tail leaves the draft (partials
+     * are not durable; the contract's restart drops them) and the earlier
+     * text stays. True when the draft still has text.
+     */
+    fun abandonSegment(): Boolean {
+        draft.crash()
+        process()
+        return draft.text().isNotEmpty()
+    }
+
     /** Switches the draft's mode by hand (the mode picker) and processes again. */
     fun switchMode(target: Mode) {
         mode = target

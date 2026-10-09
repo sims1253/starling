@@ -182,6 +182,42 @@ are deleted as soon as it settles (a crash leftover is deleted on the next
 start), its text is hidden in the keyboard outside its own field, and a
 copied transcript is marked sensitive.
 
+### Modes and staged dictation
+
+The keyboard's mode chip (or a long-press on Record) picks the mode for the
+next takes. The modes are an ordinary profiles document
+(`app/src/main/assets/modes/android-profiles.json`), held to the shared
+contract in `packages/contracts/mode-routing/` by `tests/test_staging.py`:
+
+- **Direct** (default): the flow above — live text in the field, the
+  verbatim final committed on Stop.
+- **Draft**: Stop does not insert. The take waits in an editable draft above
+  the keyboard: the live tail while speaking, then the text with spoken
+  punctuation and layout commands ("comma", "new line", "bullet") applied as
+  a processed proposal. **Show raw** flips to the recognition exactly as it
+  arrived; tapping a word selects it for **Delete word**; Record again adds
+  to the draft; only **Insert** writes, once, into the take's field.
+- **Message**: like Draft, but Insert also presses the field's own action
+  (Send, Search, Go) through `performEditorAction` — never a synthetic Enter.
+
+A leading phrase picks a mode for one take ("draft mode …", "message mode
+…"; "literal …" keeps the rest verbatim), and a trailing "Starling, …"
+instruction is recognized; both follow the contract grammar and are shown
+struck through in the draft, never sent to the field, with **That was
+literal** to undo the decision. Until the first words are clearly not a
+phrase, direct mode holds them back from the field. An instruction needs a
+text model, which the phone does not have yet (#295), so it is only set
+aside. Private fields never stage, route or process.
+
+Processing is the deterministic rules step only, on the device, in
+microseconds; the draft's status shows its time, and `adb logcat -s
+StarlingTiming` logs stop→raw and stop→processed per take for device
+measurements. A mode that asks for a model step runs rules only (and says so,
+also under battery saver). The draft, routing and rules are Kotlin ports
+(`processing/`) that replay the same fixtures as the Python oracles and the
+desktop's Rust ports. The draft lives in memory: the raw recording is in
+Saved recordings as always, but edits are lost if Android kills the keyboard.
+
 ### Live streaming and its fallback
 
 The WAV written during capture stays the source of truth: the stream is an
