@@ -4,7 +4,7 @@
   "cases": [
     {
       "id": "repeated_asr_fix_vocabulary",
-      "description": "Repeated correction of an ASR error produces a vocabulary suggestion",
+      "description": "Repeated correction of an ASR error, accepted or edited, produces a vocabulary suggestion",
       "records": [
         {
           "id": "rec_01",
@@ -38,7 +38,7 @@
           "request_id": "req_03",
           "raw_text": "Is sterling running now?",
           "final_text": "Is Starling running now?",
-          "decision": "accepted",
+          "decision": "edited",
           "decision_utc": "2026-10-01T12:00:00Z",
           "mode_id": "clean",
           "language": "en",
@@ -64,7 +64,7 @@
     },
     {
       "id": "low_frequency_discarded",
-      "description": "Single occurrence does not reach frequency threshold of 2",
+      "description": "One accepted occurrence does not reach frequency 2; rejected takes never count",
       "records": [
         {
           "id": "rec_10",
@@ -74,6 +74,19 @@
           "final_text": "Check the quantization score.",
           "decision": "accepted",
           "decision_utc": "2026-10-02T10:00:00Z",
+          "mode_id": "clean",
+          "language": "en",
+          "project_id": null,
+          "secure_field": false
+        },
+        {
+          "id": "rec_11",
+          "capture_id": "cap_11",
+          "request_id": "req_11",
+          "raw_text": "The quatization is slow.",
+          "final_text": "The quantization is slow.",
+          "decision": "rejected",
+          "decision_utc": "2026-10-02T11:00:00Z",
           "mode_id": "clean",
           "language": "en",
           "project_id": null,

@@ -1,215 +1,81 @@
-"""Test suite for personalization contract and oracle (#305).
-
-Replays shared contract fixtures, tests schema conformance, and asserts
-acceptance invariants for training-free personalization.
-"""
+"""Replays the personalization contract fixtures against the oracle in
+``personalization.py`` and validates every payload against the schema."""
 
 from __future__ import annotations
 
 import json
 from pathlib import Path
+
 import pytest
 
 import minischema
 import personalization
+from parity_contract import levenshtein
 
-REPO = Path(__file__).resolve().parents[1]
-CONTRACT = REPO / "packages" / "contracts" / "personalization"
-SCHEMA_PATH = CONTRACT / "personalization.schema.json"
-
-
-@pytest.fixture(scope="module")
-def schema():
-    return json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
-
-
-def assert_valid(instance, subschema, root=None):
-    errs = list(minischema.errors(instance, subschema, root=root))
-    assert not errs, f"Validation errors: {errs}"
-
-
-def test_schema_itself_is_valid(schema):
-    assert schema["$id"] == "urn:starling:contracts:personalization:v1"
-    assert "suggestion" in schema["$defs"]
-    assert "retrievalRequest" in schema["$defs"]
-    assert "retrievalResult" in schema["$defs"]
+CONTRACT = Path(__file__).resolve().parents[1] / "packages" / "contracts" / "personalization"
+SCHEMA = json.loads((CONTRACT / "personalization.schema.json").read_text(encoding="utf-8"))
+# The fixture pins everything except the derived `id` and `last_seen_utc`.
+SUGGESTION_KEYS = (
+    "target_type",
+    "source_phrase",
+    "target_phrase",
+    "frequency",
+    "consistency",
+    "status",
+    "conflict",
+)
 
 
-def test_suggestion_fixtures(schema):
-    fixture_path = CONTRACT / "fixtures" / "suggestions.json"
-    data = json.loads(fixture_path.read_text(encoding="utf-8"))
+def load(name: str) -> dict:
+    return json.loads((CONTRACT / "fixtures" / name).read_text(encoding="utf-8"))
 
-    for case in data["cases"]:
-        case_id = case["id"]
-        records = case["records"]
-        existing_vocab = case.get("existing_vocabulary", [])
-        existing_snippets = case.get("existing_snippets", [])
-        min_freq = case.get("min_frequency", 2)
-        min_cons = case.get("min_consistency", 0.8)
 
-        actual = personalization.suggest_vocabulary_and_replacements(
-            records=records,
-            existing_vocabulary=existing_vocab,
-            existing_snippets=existing_snippets,
-            min_frequency=min_freq,
-            min_consistency=min_cons,
+def assert_valid(instance: dict, definition: str) -> None:
+    errs = list(minischema.errors(instance, SCHEMA["$defs"][definition], root=SCHEMA))
+    assert not errs, errs
+
+
+@pytest.mark.parametrize("case", load("suggestions.json")["cases"], ids=lambda c: c["id"])
+def test_suggestion_fixture(case):
+    for record in case["records"]:
+        assert_valid(record, "correctionRecord")
+    actual = personalization.suggest_vocabulary_and_replacements(
+        records=case["records"],
+        existing_vocabulary=case["existing_vocabulary"],
+        existing_snippets=case["existing_snippets"],
+        min_frequency=case["min_frequency"],
+        min_consistency=case["min_consistency"],
+    )
+    for suggestion in actual:
+        assert_valid(suggestion, "suggestion")
+    assert [{k: s[k] for k in SUGGESTION_KEYS} for s in actual] == case["expected_suggestions"]
+
+
+@pytest.mark.parametrize("case", load("retrieval.json")["cases"], ids=lambda c: c["id"])
+def test_retrieval_fixture(case):
+    for record in case["history"]:
+        assert_valid(record, "correctionRecord")
+    assert_valid(case["request"], "retrievalRequest")
+    actual = personalization.retrieve_style_examples(
+        history=case["history"],
+        request=case["request"],
+        deleted_captures=case["deleted_captures"],
+    )
+    assert_valid(actual, "retrievalResult")
+    assert actual == case["expected_result"]
+
+
+@pytest.mark.parametrize(
+    "session", load("evaluation.json")["sessions"], ids=lambda s: s["session_id"]
+)
+def test_suggestions_reduce_correction_burden(session):
+    before = after = 0
+    for take in session["takes"]:
+        personalized = personalization.apply_suggestions_to_text(
+            take["raw"], session["active_suggestions"]
         )
-
-        expected = case["expected_suggestions"]
-        assert len(actual) == len(expected), f"Case {case_id}: count mismatch"
-
-        for act, exp in zip(actual, expected):
-            # Validate against suggestion schema
-            assert_valid(act, schema["$defs"]["suggestion"], root=schema)
-
-            assert act["target_type"] == exp["target_type"], f"Case {case_id}: type mismatch"
-            assert act["source_phrase"] == exp["source_phrase"], f"Case {case_id}: source mismatch"
-            assert act["target_phrase"] == exp["target_phrase"], f"Case {case_id}: target mismatch"
-            assert act["frequency"] == exp["frequency"], f"Case {case_id}: frequency mismatch"
-            assert act["consistency"] == exp["consistency"], f"Case {case_id}: consistency mismatch"
-            assert act["status"] == exp["status"], f"Case {case_id}: status mismatch"
-            assert act["conflict"] == exp["conflict"], f"Case {case_id}: conflict mismatch"
-
-
-def test_retrieval_fixtures(schema):
-    fixture_path = CONTRACT / "fixtures" / "retrieval.json"
-    data = json.loads(fixture_path.read_text(encoding="utf-8"))
-
-    for case in data["cases"]:
-        case_id = case["id"]
-        history = case["history"]
-        deleted = case.get("deleted_captures", [])
-        request = case["request"]
-
-        # Validate request schema
-        assert_valid(request, schema["$defs"]["retrievalRequest"], root=schema)
-
-        actual = personalization.retrieve_style_examples(
-            history=history,
-            request=request,
-            deleted_captures=deleted,
-        )
-
-        # Validate result schema
-        assert_valid(actual, schema["$defs"]["retrievalResult"], root=schema)
-
-        expected = case["expected_result"]
-        assert actual["examples_used"] == expected["examples_used"], f"Case {case_id}: examples_used mismatch"
-        assert actual["character_count"] == expected["character_count"], f"Case {case_id}: character_count mismatch"
-        assert actual["formatted_context"] == expected["formatted_context"], f"Case {case_id}: formatted_context mismatch"
-
-
-def test_evaluation_baseline_reduction():
-    fixture_path = CONTRACT / "fixtures" / "evaluation.json"
-    data = json.loads(fixture_path.read_text(encoding="utf-8"))
-
-    for session in data["sessions"]:
-        takes = session["takes"]
-        suggestions = session.get("active_suggestions", [])
-
-        total_unpersonalized_burden = 0
-        total_personalized_burden = 0
-
-        for take in takes:
-            raw = take["raw"]
-            ground_truth = take["ground_truth_target"]
-
-            # Unpersonalized burden (edit distance from raw/unpersonalized to target)
-            unpersonalized = take["unpersonalized_output"]
-            burden_unpersonalized = personalization.levenshtein(unpersonalized, ground_truth)
-            total_unpersonalized_burden += burden_unpersonalized
-
-            # Personalized output with suggestions applied
-            personalized_text = personalization.apply_suggestions_to_text(raw, suggestions)
-            burden_personalized = personalization.levenshtein(personalized_text, ground_truth)
-            total_personalized_burden += burden_personalized
-
-            # Check protected spans are never modified
-            for protected in take.get("protected_spans", []):
-                assert protected in personalized_text, f"Protected span {protected} was modified"
-
-        # Assert correction burden strictly drops when suggestions are applicable
-        if suggestions:
-            assert total_personalized_burden < total_unpersonalized_burden
-
-
-def test_isolated_project_and_language():
-    history = [
-        {
-            "id": "rec_proj_1",
-            "capture_id": "c1",
-            "request_id": "r1",
-            "raw_text": "project 1 text",
-            "final_text": "Project 1 text.",
-            "decision": "accepted",
-            "decision_utc": "2026-10-01T10:00:00Z",
-            "mode_id": "clean",
-            "language": "en",
-            "project_id": "alpha",
-            "secure_field": False,
-        },
-        {
-            "id": "rec_proj_2",
-            "capture_id": "c2",
-            "request_id": "r2",
-            "raw_text": "project 2 text",
-            "final_text": "Project 2 text.",
-            "decision": "accepted",
-            "decision_utc": "2026-10-01T11:00:00Z",
-            "mode_id": "clean",
-            "language": "en",
-            "project_id": "beta",
-            "secure_field": False,
-        },
-    ]
-
-    # Query for alpha
-    res_alpha = personalization.retrieve_style_examples(
-        history=history,
-        request={"mode_id": "clean", "language": "en", "project_id": "alpha"},
-    )
-    assert res_alpha["examples_used"] == ["rec_proj_1"]
-    assert "project 2" not in res_alpha["formatted_context"]
-
-    # Query for beta
-    res_beta = personalization.retrieve_style_examples(
-        history=history,
-        request={"mode_id": "clean", "language": "en", "project_id": "beta"},
-    )
-    assert res_beta["examples_used"] == ["rec_proj_2"]
-    assert "project 1" not in res_beta["formatted_context"]
-
-
-def test_immediate_tombstone_deletion():
-    history = [
-        {
-            "id": "rec_del",
-            "capture_id": "cap_to_delete",
-            "request_id": "r_del",
-            "raw_text": "deleted phrase",
-            "final_text": "Deleted phrase.",
-            "decision": "accepted",
-            "decision_utc": "2026-10-01T10:00:00Z",
-            "mode_id": "clean",
-            "language": "en",
-            "project_id": None,
-            "secure_field": False,
-        }
-    ]
-
-    # Without tombstone: retrieved
-    before = personalization.retrieve_style_examples(
-        history=history,
-        request={"mode_id": "clean", "language": "en"},
-        deleted_captures=[],
-    )
-    assert before["examples_used"] == ["rec_del"]
-
-    # With tombstone: immediately omitted
-    after = personalization.retrieve_style_examples(
-        history=history,
-        request={"mode_id": "clean", "language": "en"},
-        deleted_captures=["cap_to_delete"],
-    )
-    assert after["examples_used"] == []
-    assert after["formatted_context"] == ""
+        before += levenshtein(take["unpersonalized_output"], take["ground_truth_target"])
+        after += levenshtein(personalized, take["ground_truth_target"])
+        for span in take["protected_spans"]:
+            assert span in personalized
+    assert after < before

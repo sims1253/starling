@@ -2,44 +2,14 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "urn:starling:contracts:personalization:v1",
   "$comment": [
-    "Starling personalization without training contract, v1 (#305).",
-    "Covers two zero-training personalization mechanisms over #304 data:",
-    "1. Vocabulary and replacement suggestions: repeated corrections become",
-    "   candidate dictionary entries or replacement snippets, gated by frequency",
-    "   and consistency thresholds and conflict detection. Suggestions are",
-    "   reviewed and never enabled silently.",
-    "2. Few-shot style retrieval: deterministic retrieval of accepted examples",
-    "   for processing modes, isolated by language, mode, and project, capped",
-    "   by example and character budgets, formatted into personal_context with provenance."
+    "Starling personalization without training, v1. Definitions only: each",
+    "payload validates against its $defs entry. correctionRecord is the subset",
+    "of a store_v2 correction_records row this contract reads; other row",
+    "columns (processed_text, provider provenance, ...) are allowed."
   ],
-  "type": "object",
-  "additionalProperties": false,
-  "required": [
-    "schema_version",
-    "kind"
-  ],
-  "properties": {
-    "schema_version": {
-      "const": 1
-    },
-    "kind": {
-      "enum": [
-        "correction_record",
-        "suggestion",
-        "retrieval_request",
-        "retrieval_result",
-        "config"
-      ]
-    }
-  },
   "$defs": {
-    "token": {
-      "type": "string",
-      "pattern": "^[A-Za-z0-9_.:-]{1,128}$"
-    },
     "correctionRecord": {
       "type": "object",
-      "additionalProperties": false,
       "required": [
         "id",
         "capture_id",
@@ -63,14 +33,17 @@
           "type": "string"
         },
         "final_text": {
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "decision": {
           "enum": [
             "accepted",
+            "rejected",
             "reverted",
-            "edited",
-            "dismissed"
+            "edited"
           ]
         },
         "decision_utc": {

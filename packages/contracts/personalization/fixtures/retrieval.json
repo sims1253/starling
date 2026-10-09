@@ -128,8 +128,21 @@
     },
     {
       "id": "max_characters_cap_enforced",
-      "description": "Stops retrieval before exceeding the character budget",
+      "description": "Skips an example that would exceed the character budget and keeps filling with older, smaller ones",
       "history": [
+        {
+          "id": "rec_20",
+          "capture_id": "cap_20",
+          "request_id": "req_20",
+          "raw_text": "ok",
+          "final_text": "OK.",
+          "decision": "accepted",
+          "decision_utc": "2026-10-03T09:00:00Z",
+          "mode_id": "clean",
+          "language": "en",
+          "project_id": null,
+          "secure_field": false
+        },
         {
           "id": "rec_21",
           "capture_id": "cap_21",
@@ -163,15 +176,16 @@
         "language": "en",
         "project_id": null,
         "max_examples": 3,
-        "max_characters": 270,
+        "max_characters": 280,
         "personalization_enabled": true
       },
       "expected_result": {
         "examples_used": [
-          "rec_22"
+          "rec_22",
+          "rec_20"
         ],
-        "character_count": 257,
-        "formatted_context": "[Style References]\nInput: Here is another lengthy transcript that would definitely push the total character count over eighty characters.\nOutput: Here is another lengthy transcript that would definitely push the total character count over eighty characters."
+        "character_count": 280,
+        "formatted_context": "[Style References]\nInput: Here is another lengthy transcript that would definitely push the total character count over eighty characters.\nOutput: Here is another lengthy transcript that would definitely push the total character count over eighty characters.\n\nInput: ok\nOutput: OK."
       }
     },
     {
@@ -331,6 +345,129 @@
         ],
         "character_count": 56,
         "formatted_context": "[Style References]\nInput: valid item\nOutput: Valid item."
+      }
+    },
+    {
+      "id": "decision_eligibility",
+      "description": "Accepted and edited takes are examples; rejected and reverted takes are not",
+      "history": [
+        {
+          "id": "rec_71",
+          "capture_id": "cap_71",
+          "request_id": "req_71",
+          "raw_text": "first draft",
+          "final_text": "First draft.",
+          "decision": "accepted",
+          "decision_utc": "2026-10-08T10:00:00Z",
+          "mode_id": "clean",
+          "language": "en",
+          "project_id": null,
+          "secure_field": false
+        },
+        {
+          "id": "rec_72",
+          "capture_id": "cap_72",
+          "request_id": "req_72",
+          "raw_text": "second draft",
+          "final_text": "Second, edited draft.",
+          "decision": "edited",
+          "decision_utc": "2026-10-08T11:00:00Z",
+          "mode_id": "clean",
+          "language": "en",
+          "project_id": null,
+          "secure_field": false
+        },
+        {
+          "id": "rec_73",
+          "capture_id": "cap_73",
+          "request_id": "req_73",
+          "raw_text": "third draft",
+          "final_text": null,
+          "decision": "rejected",
+          "decision_utc": "2026-10-08T12:00:00Z",
+          "mode_id": "clean",
+          "language": "en",
+          "project_id": null,
+          "secure_field": false
+        },
+        {
+          "id": "rec_74",
+          "capture_id": "cap_74",
+          "request_id": "req_74",
+          "raw_text": "fourth draft",
+          "final_text": "fourth draft",
+          "decision": "reverted",
+          "decision_utc": "2026-10-08T13:00:00Z",
+          "mode_id": "clean",
+          "language": "en",
+          "project_id": null,
+          "secure_field": false
+        }
+      ],
+      "deleted_captures": [],
+      "request": {
+        "mode_id": "clean",
+        "language": "en",
+        "project_id": null,
+        "max_examples": 3,
+        "max_characters": 500,
+        "personalization_enabled": true
+      },
+      "expected_result": {
+        "examples_used": [
+          "rec_72",
+          "rec_71"
+        ],
+        "character_count": 109,
+        "formatted_context": "[Style References]\nInput: second draft\nOutput: Second, edited draft.\n\nInput: first draft\nOutput: First draft."
+      }
+    },
+    {
+      "id": "unknown_language_isolation",
+      "description": "A request without a language only retrieves examples without one",
+      "history": [
+        {
+          "id": "rec_81",
+          "capture_id": "cap_81",
+          "request_id": "req_81",
+          "raw_text": "no language",
+          "final_text": "No language.",
+          "decision": "accepted",
+          "decision_utc": "2026-10-09T10:00:00Z",
+          "mode_id": "clean",
+          "language": null,
+          "project_id": null,
+          "secure_field": false
+        },
+        {
+          "id": "rec_82",
+          "capture_id": "cap_82",
+          "request_id": "req_82",
+          "raw_text": "english text",
+          "final_text": "English text.",
+          "decision": "accepted",
+          "decision_utc": "2026-10-09T11:00:00Z",
+          "mode_id": "clean",
+          "language": "en",
+          "project_id": null,
+          "secure_field": false
+        }
+      ],
+      "deleted_captures": [],
+      "request": {
+        "mode_id": "clean",
+        "language": null,
+        "project_id": null,
+        "max_examples": 3,
+        "max_characters": 500,
+        "personalization_enabled": true
+      },
+      "expected_result": {
+        "examples_used": [
+          "rec_81"
+        ],
+        "character_count": 58,
+        "formatted_context": "[Style References]\nInput: no language\nOutput: No language."
       }
     },
     {
