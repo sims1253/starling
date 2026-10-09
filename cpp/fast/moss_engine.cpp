@@ -775,7 +775,7 @@ bool MossEngine::Impl::record_decode(uint32_t steps, std::string& err) {
         if (!e) return -1;
         char* end = nullptr;
         const unsigned long v = std::strtoul(e, &end, 10);
-        if (end != e && *end == '\0' && v <= kAttnSplitMax) return (int)v;
+        if (*e >= '0' && *e <= '9' && *end == '\0' && v <= kAttnSplitMax) return (int)v;
         std::fprintf(stderr, "[fast-moss] ignoring STARLING_FAST_ATTN_SPLIT='%s' (want 0..%u)\n", e, kAttnSplitMax);
         return -1;
     }();
