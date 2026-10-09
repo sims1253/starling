@@ -33,7 +33,7 @@ use starling_dictation::settings::ProcessingSettings;
 use starling_dictation::storage::{self, now_iso};
 use starling_processing::CancelToken;
 use starling_processing::contract::{
-    ContextField, FailureReason, Locality, ModeEntry, ProcessingRoute, ProfilesDocument,
+    ContextField, Failure, FailureReason, Locality, ModeEntry, ProcessingRoute, ProfilesDocument,
     ProviderDecl, ProviderKind, ResultStatus, RouteBlock, Timing, TransformKind, TransformRequest,
     TransformResult, processing_route,
 };
@@ -511,6 +511,11 @@ pub(crate) fn failure_message(
         FailureReason::InvalidInput if failure.detail == pipeline::INSTRUCTION_BLANK_DETAIL => {
             "The spoken instruction was empty.".to_string()
         }
+        FailureReason::RemoteForbidden if failure.detail == PHRASE_SCOPE_DETAIL => {
+            "A spoken phrase cannot add a provider the active mode does not use; select \
+             that mode manually. Nothing was sent."
+                .to_string()
+        }
         FailureReason::ProviderUnavailable if result.provider.kind == ProviderKind::S1 => format!(
             "S1-mini is not reachable at {}. Start a starling-serve with the S1-mini GGUF there. ({})",
             settings.s1_endpoint.trim(),
@@ -550,6 +555,9 @@ fn marking_refused(kind: &str) -> String {
          sent. The raw transcript is unchanged."
     )
 }
+
+/// The failure detail when [`widens_scope`] refuses a phrase-routed take.
+const PHRASE_SCOPE_DETAIL: &str = "a spoken phrase cannot add a provider";
 
 /// Whether a phrase-routed plan would send the take to a remote provider,
 /// or remote context, the active mode's plan does not already use. A
@@ -770,7 +778,9 @@ impl StarlingApp {
             return;
         };
         let active = self.active_mode();
+        // A running job keeps the providers and settings it started with.
         let settings = self.processing_settings.clone();
+        let providers = self.providers.clone();
         // Taken whatever the plan: a take that is not processed must not
         // keep its stop instant.
         let stopped_at: Option<Instant> = self.stop_instants.remove(&id);
@@ -869,20 +879,12 @@ impl StarlingApp {
                             return None;
                         }
                     };
-                    let plan = pipeline::plan(mode, &app.providers.registry);
-                    if prefix > 0
-                        && widens_scope(&plan, &pipeline::plan(active, &app.providers.registry))
-                    {
-                        let message = format!(
-                            "The leading phrase selects {}, which would send this take \
-                             where {} does not; a spoken phrase cannot add a provider. \
-                             Nothing was sent. The raw transcript is unchanged.",
-                            mode.name, active.name
-                        );
-                        let state = ProcessingState::Failed { message };
-                        app.end_job(&id, draft, retired, String::new(), state, cx);
-                        return None;
-                    }
+                    let plan = pipeline::plan(mode, &providers.registry);
+                    let scope_refusal = (prefix > 0
+                        && widens_scope(&plan, &pipeline::plan(active, &providers.registry)))
+                    .then(|| {
+                        Failure::new(FailureReason::RemoteForbidden, false, PHRASE_SCOPE_DETAIL)
+                    });
                     let (decl, provider, fields): (
                         ProviderDecl,
                         Option<Arc<dyn Provider>>,
@@ -906,7 +908,7 @@ impl StarlingApp {
                             return None;
                         }
                         Plan::Blocked(block) => {
-                            let message = blocked_text(block, mode, &app.providers.problems);
+                            let message = blocked_text(block, mode, &providers.problems);
                             let state = ProcessingState::Blocked { message };
                             app.end_job(&id, draft, retired, String::new(), state, cx);
                             return None;
@@ -959,8 +961,10 @@ impl StarlingApp {
                             max_output_chars: input_chars.saturating_mul(4).max(2_000),
                         },
                     ) {
-                        Ok(request) => (request, None),
-                        Err((request, failure)) => (request, Some(failure)),
+                        Ok(request) => (request, scope_refusal),
+                        Err((request, failure)) => {
+                            (request, Some(scope_refusal.unwrap_or(failure)))
+                        }
                     };
                     app.drafts.insert(id.clone(), draft);
                     cx.notify();
@@ -1527,14 +1531,14 @@ mod tests {
             };
             assert!(message.contains("cannot add a provider"), "{message}");
             assert_eq!(app.drafts.get(&id).unwrap().text(), raw);
-            assert!(
-                store
-                    .processing_doc(&id)
-                    .unwrap()
-                    .unwrap()
-                    .proposals
-                    .is_empty()
-            );
+            // The refusal is stored like any failure: a restart shows it.
+            let stored = store.processing_doc(&id).unwrap().unwrap();
+            assert_eq!(stored.head_text, raw);
+            let ProcessingState::Failed { message } = TakeProcessing::from_doc(&stored).state
+            else {
+                panic!("a restart shows the refusal");
+            };
+            assert!(message.contains("cannot add a provider"), "{message}");
         });
     }
 

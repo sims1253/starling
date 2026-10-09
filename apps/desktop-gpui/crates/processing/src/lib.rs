@@ -6,9 +6,6 @@
 //! - [`boundary`]: the delivery-time insertion-boundary rules (leading
 //!   space, first-letter case), frozen in
 //!   `packages/contracts/insertion-boundary/`.
-//! - [`routing`]: the frozen routing oracle itself (leading mode
-//!   phrases, the literal escape, rule conflicts), ported from the same
-//!   file (#298).
 //! - [`routing`]: the routing oracle itself (leading mode phrases, the
 //!   literal escape, rule conflicts), ported from the same file.
 //! - [`staging`]: the staged draft of one take (typed regions, immutable
