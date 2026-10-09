@@ -817,7 +817,7 @@ impl StarlingApp {
                         if self.note_live_interruption() {
                             self.cancel_recording(take, CancelReason::InputLost, cx);
                         } else {
-                            self.stop_recording(cx);
+                            self.stop_recording(take, cx);
                         }
                     }
                 }

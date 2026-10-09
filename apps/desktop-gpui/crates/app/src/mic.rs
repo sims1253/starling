@@ -353,6 +353,14 @@ fn open_system_settings(privacy: bool) -> Result<(), String> {
     ))
 }
 
+/// The device a recorder captures from, for messages.
+pub(crate) fn device_name(handle: &RecorderHandle) -> String {
+    handle
+        .input_route()
+        .map(|route| route.device.clone())
+        .unwrap_or_else(|| "The microphone".to_string())
+}
+
 /// The interruption a live recorder is under. A stall only counts once
 /// audio has arrived: a take that never delivered is the activation
 /// machine's start stall (`activation::START_STALL`), not a lost input.
@@ -401,16 +409,19 @@ impl StarlingApp {
         let Some(interruption) = live_interruption(handle) else {
             return false;
         };
-        let device = handle
-            .input_route()
-            .map(|route| route.device.clone())
-            .unwrap_or_else(|| "The microphone".to_string());
+        let device = device_name(handle);
+        self.note_interruption(&device, interruption);
+        true
+    }
+
+    /// Records why the current take is ending as interrupted, for the
+    /// `CancelReason::InputLost` save path.
+    pub(crate) fn note_interruption(&mut self, device: &str, interruption: Interruption) {
         let problem = InputProblem::Unavailable {
-            device: device.clone(),
+            device: device.to_string(),
             detail: "it stopped during the last recording".to_string(),
         };
-        self.mic.interruption = Some((interruption.describe(&device), problem));
-        true
+        self.mic.interruption = Some((interruption.describe(device), problem));
     }
 
     /// Lists capture devices off the UI thread (ALSA probes each PCM).
@@ -511,13 +522,16 @@ impl StarlingApp {
             return;
         };
         let route = handle.input_route().cloned();
-        let device = route
-            .as_ref()
-            .map(|route| route.device.clone())
-            .unwrap_or_else(|| "The microphone".to_string());
+        let device = device_name(&handle);
         let mut interruption = live_interruption(&handle).map(|i| i.describe(&device));
         let audio = match handle.stop() {
-            Ok(take) => take.audio,
+            Ok(take) => {
+                // A fault posted after the check above still counts.
+                if let (None, Some(fault)) = (&interruption, take.device_fault) {
+                    interruption = Some(Interruption::DeviceFailed(fault).describe(&device));
+                }
+                take.audio
+            }
             Err(recorder::RecorderError::QuiesceTimeout { audio, .. }) => {
                 // The audio is salvaged, but the device did not stop
                 // cleanly: never report that as a working microphone.
