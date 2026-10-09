@@ -57,6 +57,33 @@
           "protected_spans": [
             "/my sterling notes/file.txt"
           ]
+        },
+        {
+          "take_id": "t7",
+          "raw": "Open \"/tmp/my sterling notes.txt\" now.",
+          "unpersonalized_output": "Open \"/tmp/my sterling notes.txt\" now.",
+          "ground_truth_target": "Open \"/tmp/my sterling notes.txt\" now.",
+          "protected_spans": [
+            "\"/tmp/my sterling notes.txt\""
+          ]
+        },
+        {
+          "take_id": "t8",
+          "raw": "Open \"C:\\Users\\me\\sterling notes.txt\" now.",
+          "unpersonalized_output": "Open \"C:\\Users\\me\\sterling notes.txt\" now.",
+          "ground_truth_target": "Open \"C:\\Users\\me\\sterling notes.txt\" now.",
+          "protected_spans": [
+            "\"C:\\Users\\me\\sterling notes.txt\""
+          ]
+        },
+        {
+          "take_id": "t9",
+          "raw": "Run ``sterling k8s`` here.",
+          "unpersonalized_output": "Run ``sterling k8s`` here.",
+          "ground_truth_target": "Run ``sterling k8s`` here.",
+          "protected_spans": [
+            "``sterling k8s``"
+          ]
         }
       ],
       "active_suggestions": [

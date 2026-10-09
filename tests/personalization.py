@@ -18,7 +18,8 @@ ELIGIBLE_DECISIONS = {"accepted", "edited"}
 # Transforms that change wording on purpose; their records are not mined.
 UNMINED_KINDS = {"rewrite", "translate"}
 PROTECTED = re.compile(
-    r"`[^`]*`"  # inline code
+    r"(`+).+?\1"  # inline code, closed by a backtick run of the same length
+    r'|"[^"\n]*[/\\][^"\n]*"'  # quoted paths, which may contain spaces anywhere
     r"|\S*[/\\](?:[\w -]*[/\\])*\S*"  # paths and URLs; inner segments may hold spaces
     r"|\S*(?:[@_]|\w\.\w|[a-z][A-Z])\S*"  # emails, identifiers, dotted names
 )

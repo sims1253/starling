@@ -76,7 +76,7 @@ capture ids. `max_examples` defaults to `3`, `max_characters` to `500`,
 
 `fixtures/evaluation.json` is a held-out set: applying a session's
 `active_suggestions` (one pass, case-insensitive whole-word matches, never
-inside inline code, a path or URL (whose segments may contain spaces), an
-email or an identifier) must lower the total edit
+inside inline code (any backtick run length), a quoted path, a path or URL
+(whose inner segments may contain spaces), an email or an identifier) must lower the total edit
 distance to `ground_truth_target` and leave every `protected_spans` entry
 intact.
