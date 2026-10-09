@@ -90,8 +90,9 @@ status:
   what kept the P2-8 discharging windows stall-free is **unverified**. The
   verified wake source for screen-off windows is the shell wake lock below.
 - **Never run GPU work on a phone that may suspend.** Kernel suspend with
-  GPU work outstanding wedges the PowerVR driver: screen off without a wake
-  lock wedged 5/6 trials, awake 0/13, forced deep Doze under a wake lock 0/3
+  GPU work outstanding wedges the PowerVR driver: in process-level trials,
+  screen off without a wake lock wedged 5/6, forced deep Doze under a wake
+  lock 0/3, awake 0/2, plus 0 wedges in 11 awake in-process cycles
   (RESEARCH_LOG P3-1–P3-4). Suspend, not Doze, is the trigger, so a
   plugged-in phone with the screen off is exposed too. The phone bench
   scripts hold a shell-uid partial wake lock for the whole session, which

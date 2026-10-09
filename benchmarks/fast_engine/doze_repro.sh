@@ -32,6 +32,7 @@ sh_() { timeout "$1" adb shell "$2" 2>/dev/null | tr -d '\r'; }
 log() { echo "$(date +%H:%M:%S) $*" | tee -a "$OUT/trials.txt"; }
 state() { sh_ 15 "dumpsys power | grep -m1 -o 'mWakefulness=[A-Za-z]*'; dumpsys deviceidle | grep -m1 -o 'mState=[A-Z_]*'; dumpsys battery | grep -E '^  (level|USB powered|AC powered):' | tr -d ' ' | tr '\n' ' '" | tr '\n' ' '; }
 restore() {
+  kill_benches || true
   wake_release || true
   [ -n "${FAKE_UNPLUG:-}" ] && sh_ 15 "dumpsys battery reset" >/dev/null
   sh_ 15 "dumpsys deviceidle unforce; input keyevent KEYCODE_WAKEUP" >/dev/null

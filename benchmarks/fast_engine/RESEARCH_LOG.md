@@ -915,9 +915,10 @@ screen woken every poll. Planned D A D A D A; stopped after trial 5 on the
   the variable that separates the arms is wakefulness (Dozing vs. Awake —
   whether the kernel may suspend), not the deviceidle state itself.
 
-Tally with P3-1/P3-2: **dozing 4/4 wedged, awake 0/13** (Fisher exact,
-one-sided p = 1/C(17,4) ≈ 4·10⁻⁴). Trigger confirmed: GPU work submitted
-while the phone is allowed to suspend. The likely mechanism is a suspend/
+Tally with P3-1, in process-level trials (one bench process each):
+**dozing 4/4 wedged, awake 0/2**; P3-2 adds 0 wedges in 11 awake in-process
+cycles. Trigger identified: GPU work submitted while the phone is allowed
+to suspend. The likely mechanism is a suspend/
 resume of the PowerVR stack losing an in-flight job or its completion —
 driver/firmware code we cannot fix. Prevention is to never let the phone
 suspend with GPU work outstanding: the app's partial wake lock and the
@@ -960,10 +961,10 @@ setup plus the wake lock. Results:
   blocked, and were clean in the normal band. Doze itself is not the
   trigger; kernel suspend with GPU work outstanding is. A plugged-in phone
   with the screen off can suspend too.
-- Tally (P3-1–P3-4): screen off without a lock 5/6 wedged, awake 0/13,
-  screen off in deep Doze under the lock 0/3 (W vs. unlocked: Fisher exact,
-  one-sided p = 6/126 ≈ 0.05). Small n on the W side; strong mechanism
-  evidence.
+- Tally (P3-1–P3-4), process-level trials: screen off without a lock 5/6
+  wedged, screen off in deep Doze under the lock 0/3, awake 0/2 (plus 0
+  wedges in 11 awake in-process cycles, P3-2). Small n; the mechanism
+  evidence (GPU rail, wakefulness) carries more weight than the counts.
 
 Consequences landed: every phone bench script (`android_bench.sh`,
 `phone_ab.sh`, `phone_gates.sh`, `phone_energy.sh`, `pixel_measure.sh`)
