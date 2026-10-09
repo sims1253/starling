@@ -333,14 +333,17 @@ impl DeliveryActor {
                 return;
             }
         };
+        let (revision_id, text) = match self.boundary_revision(&doc_id, &source, &target_ref) {
+            Ok(Some(derived)) => (derived.rev_id, derived.text),
+            Ok(None) => (revision_id, source.text),
+            Err(rejection) => {
+                let _ = reply.try_send(Err(rejection));
+                return;
+            }
+        };
         let mut core = MachineCore::new(&DELIVERY);
         match core.commit_command("delivery.prepare", Some(corr.clone())) {
             Ok(_) => {
-                let (revision_id, text) =
-                    match self.boundary_revision(&doc_id, &source, &target_ref) {
-                        Some(derived) => (derived.rev_id, derived.text),
-                        None => (revision_id, source.text),
-                    };
                 let delivery_id = crate::bus::new_id("dlv");
                 let _ = reply.try_send(Ok(Receipt::Accepted));
                 // `delivery.prepare` is outcome-pending: resolve_outcome
@@ -388,27 +391,31 @@ impl DeliveryActor {
     /// surrounding text and registers the adjusted text as a revision
     /// derived from `source`. `None` when nothing changes.
     ///
-    /// The surrounding text is a prepare-time snapshot: apply revalidates
-    /// the target's identity, not its boundary. A mode's verbatim flag does
-    /// not reach this machine yet, so the rules always run.
+    /// The derived revision lives only in the delivery registry: the
+    /// document service never sees it. The surrounding text is a
+    /// prepare-time snapshot: apply revalidates the target's identity, not
+    /// its boundary. A mode's verbatim flag does not reach this machine
+    /// yet, so the rules always run.
     fn boundary_revision(
         &self,
         doc_id: &str,
         source: &Revision,
         target_ref: &str,
-    ) -> Option<Revision> {
+    ) -> Result<Option<Revision>, Rejection> {
         // A derived revision is delivered exactly as recorded.
         if source.provenance == BOUNDARY_PROVENANCE {
-            return None;
+            return Ok(None);
         }
-        let surrounding = self.adapter.surrounding_text(target_ref)?;
+        let Some(surrounding) = self.adapter.surrounding_text(target_ref) else {
+            return Ok(None);
+        };
         let context = BoundaryContext {
             before: &surrounding.before,
             after: &surrounding.after,
         };
         let adjustment = boundary::adjust(&source.text, &context, &BoundaryOptions::default());
         if adjustment.is_unchanged() {
-            return None;
+            return Ok(None);
         }
         // The fired rules determine the adjusted text, so naming the id
         // after them never maps one id to two different texts.
@@ -426,14 +433,18 @@ impl DeliveryActor {
             provenance: BOUNDARY_PROVENANCE.to_string(),
             ..source.clone()
         };
-        self.revisions
-            .lock()
-            .expect("revision registry lock")
-            .insert(
-                derived.rev_id.clone(),
-                (doc_id.to_string(), derived.clone()),
-            );
-        Some(derived)
+        let mut revisions = self.revisions.lock().expect("revision registry lock");
+        let (_, registered) = revisions
+            .entry(derived.rev_id.clone())
+            .or_insert_with(|| (doc_id.to_string(), derived.clone()));
+        // Re-deriving yields an identical revision; anything else under
+        // this id is an unrelated revision that must not be replaced.
+        if *registered != derived {
+            return Err(Rejection::RevisionIdTaken {
+                revision_id: derived.rev_id,
+            });
+        }
+        Ok(Some(derived))
     }
 
     fn handle_apply(&mut self, reply: super::ReceiptTx, corr: String, delivery_id: String) {

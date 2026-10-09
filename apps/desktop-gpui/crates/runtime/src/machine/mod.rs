@@ -385,6 +385,9 @@ pub enum Rejection {
     UnknownJob { job_id: String },
     /// The named revision does not exist (delivery.prepare).
     UnknownRevision { revision_id: String },
+    /// delivery.prepare would register its boundary-adjusted revision
+    /// under an id an unrelated revision already holds.
+    RevisionIdTaken { revision_id: String },
     /// The named delivery does not exist or is not in the required state.
     UnknownDelivery { delivery_id: String },
     /// The machine's bounded inbox is full; retry.
@@ -419,6 +422,9 @@ impl std::fmt::Display for Rejection {
             Rejection::UnknownJob { job_id } => write!(f, "unknown or terminal job {job_id:?}"),
             Rejection::UnknownRevision { revision_id } => {
                 write!(f, "unknown revision {revision_id:?}")
+            }
+            Rejection::RevisionIdTaken { revision_id } => {
+                write!(f, "revision id {revision_id:?} is taken by an unrelated revision")
             }
             Rejection::UnknownDelivery { delivery_id } => {
                 write!(f, "unknown delivery {delivery_id:?}")
@@ -539,6 +545,10 @@ mod tests {
             (
                 Rejection::UnknownRevision { revision_id: "rev-1".into() },
                 serde_json::json!({ "UnknownRevision": { "revision_id": "rev-1" } }),
+            ),
+            (
+                Rejection::RevisionIdTaken { revision_id: "rev-1".into() },
+                serde_json::json!({ "RevisionIdTaken": { "revision_id": "rev-1" } }),
             ),
             (
                 Rejection::UnknownDelivery { delivery_id: "d-1".into() },

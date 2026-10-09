@@ -6,8 +6,8 @@ insertion point (an Android `InputConnection`, IBus surrounding text, a
 desktop adapter that exposes it), delivery adjusts **only** the boundary: a
 leading space and the case of the first letter.
 
-The raw recognition text is never edited: the adjustment is recorded as a
-separate revision derived from the raw one (`provenance:
+The raw recognition text is never edited: the runtime delivers the
+adjustment as a separate revision derived from the raw one (`provenance:
 "insertion-boundary"`).
 
 The Python oracle (`tests/insertion_boundary.py`) and the Rust port
@@ -31,7 +31,11 @@ A fixture change's `detail` is an explanation for readers, not compared.
    - its last character is neither whitespace nor in the opening set
      `( [ { " ' “ ‘ „ « 「 『 【 （` (straight `"` and `'` are ambiguous at an
      insertion point; this pins them as opening);
-   - `raw` does not start with whitespace (never double-space).
+   - `raw` does not start with whitespace (never double-space);
+   - not both the last character of `before` and the first of `raw` are
+     Han, kana or CJK punctuation (U+3000–30FF, 31F0–31FF, 3400–4DBF,
+     4E00–9FFF, F900–FAFF, FF01–FF0F, FF1A–FF20, FF5B–FF9F, 20000–3FFFF).
+     Hangul is not in the set: Korean is spaced like Latin text.
 3. **First-letter case.** Take the first cased character of `raw`; if it has
    a lowercase mapping different from itself, replace it with its **full**
    lowercase mapping (`İ` → `i̇`, Python `str.lower()` semantics), iff all
@@ -54,10 +58,11 @@ the token contains any of `_ / \ @ #` or starts with `www.` (paths, URLs,
 emails, hashtags, snake_case); contains a camel hump (a lowercase letter
 immediately followed by an uppercase one: `camelCase`, `iPhone`); is
 all-uppercase with at least two letters (`NASA`); or is the English pronoun
-`I`.
+`I`, alone or followed by a non-alphanumeric character (`I,` `I.` `I'm`
+`I’ll`).
 
-Scripts without case (CJK, Arabic, Hebrew) never get a case change; the
-space rule is script-agnostic. Processing is on logical text: no reordering,
+Scripts without case (CJK, Arabic, Hebrew) never get a case change.
+Processing is on logical text: no reordering,
 no normalization.
 
 ## Security

@@ -11,6 +11,7 @@ use starling_runtime::channel::RecvError;
 use starling_runtime::machine::delivery::{
     DeliveryAdapter, InsertEvidence, InsertionFailure, Revalidation, SurroundingText,
 };
+use starling_runtime::machine::Rejection;
 use starling_runtime::protocol::{Command, Event, Revision};
 use starling_runtime::{Runtime, RuntimeClient, RuntimeConfig};
 
@@ -102,31 +103,36 @@ fn prepare_and_apply(
     adapter.inserted.lock().unwrap().last().cloned().unwrap()
 }
 
-#[test]
-fn boundary_adjustments_are_delivered_as_derived_revisions() {
-    let adapter = Arc::new(RecordingAdapter::default());
-    let (runtime, client) =
-        Runtime::start(RuntimeConfig::default().with_delivery_adapter(adapter.clone()));
-    let events = client.subscribe();
+/// Commits `text` as the head of a fresh document `doc_id`.
+fn commit(client: &RuntimeClient, events: &EventSub, doc_id: &str, rev_id: &str, text: &str) {
     client
         .send(
             Some("doc"),
             Command::DocsUpdateHead {
-                doc_id: "notes".into(),
+                doc_id: doc_id.into(),
                 expected_base: 0,
                 new_revision: Revision {
-                    rev_id: "rev-1".to_string(),
+                    rev_id: rev_id.to_string(),
                     base_revision: 0,
                     source_attempt_ids: vec![],
                     instruction_template_id: "tpl-none".to_string(),
-                    text: "Fox jumps".to_string(),
+                    text: text.to_string(),
                     status: "candidate".to_string(),
                     provenance: "recognition".to_string(),
                 },
             },
         )
         .expect("updateHead accepted");
-    until(&events, "docs.headUpdated");
+    until(events, "docs.headUpdated");
+}
+
+#[test]
+fn boundary_adjustments_are_delivered_as_derived_revisions() {
+    let adapter = Arc::new(RecordingAdapter::default());
+    let (runtime, client) =
+        Runtime::start(RuntimeConfig::default().with_delivery_adapter(adapter.clone()));
+    let events = client.subscribe();
+    commit(&client, &events, "notes", "rev-1", "Fox jumps");
     let deliver = |rev, target| prepare_and_apply(&client, &events, &adapter, rev, target);
 
     assert_eq!(deliver("rev-1", "mid-sentence"), " fox jumps");
@@ -138,9 +144,41 @@ fn boundary_adjustments_are_delivered_as_derived_revisions() {
         " Fox jumps"
     );
     assert_eq!(deliver("rev-1#boundary-space-case", "plain"), " fox jumps");
+    // Re-deriving the same revision reuses it.
+    assert_eq!(deliver("rev-1", "mid-sentence"), " fox jumps");
     // The requested revision is untouched.
     assert_eq!(deliver("rev-1", "plain"), "Fox jumps");
     assert_eq!(deliver("rev-1", "field-start"), "Fox jumps");
+
+    runtime.shutdown();
+}
+
+#[test]
+fn a_derived_id_never_replaces_an_unrelated_revision() {
+    let adapter = Arc::new(RecordingAdapter::default());
+    let (runtime, client) =
+        Runtime::start(RuntimeConfig::default().with_delivery_adapter(adapter.clone()));
+    let events = client.subscribe();
+    commit(&client, &events, "notes", "r", "Next one");
+    commit(&client, &events, "other", "r#boundary-space", "Unrelated");
+
+    let refused = client.send(
+        Some("dlv"),
+        Command::DeliveryPrepare {
+            revision_id: "r".into(),
+            target_ref: "after-period".into(),
+        },
+    );
+    assert_eq!(
+        refused,
+        Err(Rejection::RevisionIdTaken {
+            revision_id: "r#boundary-space".into()
+        })
+    );
+    assert_eq!(
+        prepare_and_apply(&client, &events, &adapter, "r#boundary-space", "plain"),
+        "Unrelated"
+    );
 
     runtime.shutdown();
 }

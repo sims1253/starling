@@ -375,6 +375,52 @@
   },
   {
     "schema_version": 1,
+    "case_id": "pronoun-i-comma",
+    "description": "I before punctuation keeps its case",
+    "before": "and ",
+    "after": "",
+    "raw": "I, too",
+    "verbatim": false,
+    "expected_text": "I, too",
+    "expected_changes": []
+  },
+  {
+    "schema_version": 1,
+    "case_id": "pronoun-i-period",
+    "description": "I alone with a full stop keeps its case",
+    "before": "and ",
+    "after": "",
+    "raw": "I.",
+    "verbatim": false,
+    "expected_text": "I.",
+    "expected_changes": []
+  },
+  {
+    "schema_version": 1,
+    "case_id": "pronoun-i-contraction",
+    "description": "I'm keeps its case",
+    "before": "and ",
+    "after": "",
+    "raw": "I'm ready",
+    "verbatim": false,
+    "expected_text": "I'm ready",
+    "expected_changes": []
+  },
+  {
+    "schema_version": 1,
+    "case_id": "pronoun-i-curly-contraction",
+    "description": "I’ll (curly apostrophe) keeps its case",
+    "before": "and",
+    "after": "",
+    "raw": "I’ll go",
+    "verbatim": false,
+    "expected_text": " I’ll go",
+    "expected_changes": [
+      { "kind": "leading_space", "detail": "previous character 'd' is not whitespace or an opening bracket/quote" }
+    ]
+  },
+  {
+    "schema_version": 1,
     "case_id": "digit-before-lowercase",
     "description": "a digit before the cursor continues the sentence",
     "before": "version 2",
@@ -403,14 +449,58 @@
   {
     "schema_version": 1,
     "case_id": "cjk-sentence-end",
-    "description": "CJK full stop: space rule applies, no case to change",
+    "description": "CJK full stop before Han: no space, no case to change",
     "before": "完成。",
     "after": "",
     "raw": "下一步",
     "verbatim": false,
-    "expected_text": " 下一步",
+    "expected_text": "下一步",
+    "expected_changes": []
+  },
+  {
+    "schema_version": 1,
+    "case_id": "han-after-han",
+    "description": "Han after Han: no space",
+    "before": "我们",
+    "after": "",
+    "raw": "你好",
+    "verbatim": false,
+    "expected_text": "你好",
+    "expected_changes": []
+  },
+  {
+    "schema_version": 1,
+    "case_id": "kana-after-han",
+    "description": "kana after Han: no space",
+    "before": "今日",
+    "after": "",
+    "raw": "はいい天気",
+    "verbatim": false,
+    "expected_text": "はいい天気",
+    "expected_changes": []
+  },
+  {
+    "schema_version": 1,
+    "case_id": "han-after-katakana",
+    "description": "Han after Katakana: no space",
+    "before": "コーヒー",
+    "after": "",
+    "raw": "店",
+    "verbatim": false,
+    "expected_text": "店",
+    "expected_changes": []
+  },
+  {
+    "schema_version": 1,
+    "case_id": "korean-spacing",
+    "description": "Hangul is spaced like Latin",
+    "before": "안녕하세요",
+    "after": "",
+    "raw": "반갑습니다",
+    "verbatim": false,
+    "expected_text": " 반갑습니다",
     "expected_changes": [
-      { "kind": "leading_space", "detail": "previous character '。' is not whitespace or an opening bracket/quote" }
+      { "kind": "leading_space", "detail": "previous character '요' is not whitespace or an opening bracket/quote" }
     ]
   },
   {

@@ -63,6 +63,26 @@ const CONTINUING: [char; 14] = [
     ',', ';', ':', ')', ']', '}', '”', '’', '»', '」', '』', '】', '）', '》',
 ];
 
+/// Han, kana and CJK punctuation: no space between two of them. Hangul is
+/// absent on purpose (Korean separates words with spaces).
+const NO_SPACE_SCRIPTS: [(char, char); 9] = [
+    ('\u{3000}', '\u{30FF}'), // CJK symbols and punctuation, Hiragana, Katakana
+    ('\u{31F0}', '\u{31FF}'), // Katakana phonetic extensions
+    ('\u{3400}', '\u{4DBF}'), // CJK Extension A
+    ('\u{4E00}', '\u{9FFF}'), // CJK Unified Ideographs
+    ('\u{F900}', '\u{FAFF}'), // CJK Compatibility Ideographs
+    ('\u{FF01}', '\u{FF0F}'), // fullwidth punctuation
+    ('\u{FF1A}', '\u{FF20}'), // fullwidth punctuation
+    ('\u{FF5B}', '\u{FF9F}'), // fullwidth punctuation, halfwidth Katakana
+    ('\u{20000}', '\u{3FFFF}'), // CJK Extensions B and later
+];
+
+fn no_space_boundary(ch: char) -> bool {
+    NO_SPACE_SCRIPTS
+        .iter()
+        .any(|&(low, high)| (low..=high).contains(&ch))
+}
+
 pub fn adjust(raw: &str, ctx: &BoundaryContext<'_>, opts: &BoundaryOptions) -> BoundaryAdjustment {
     let mut text = raw.to_string();
     let mut changes = Vec::new();
@@ -74,6 +94,7 @@ pub fn adjust(raw: &str, ctx: &BoundaryContext<'_>, opts: &BoundaryOptions) -> B
         if !first_raw.is_whitespace()
             && !last_before.is_whitespace()
             && !OPENING.contains(&last_before)
+            && !(no_space_boundary(last_before) && no_space_boundary(first_raw))
         {
             text.insert(0, ' ');
             changes.push(BoundaryChange::LeadingSpace);
@@ -110,15 +131,16 @@ fn continues_sentence(before: &str) -> bool {
 
 /// Code-looking first tokens keep their case: paths, URLs, emails,
 /// hashtags, snake_case, camel humps, ALL-CAPS (two or more letters), and
-/// the pronoun `I`.
+/// the pronoun `I` (also `I,` and `I'm`).
 fn first_token_is_protected(raw: &str) -> bool {
     let Some(token) = raw.split_whitespace().next() else {
         return false;
     };
-    if token.contains(['_', '/', '\\', '@', '#'])
-        || token.starts_with("www.")
-        || token == "I"
-    {
+    if token.contains(['_', '/', '\\', '@', '#']) || token.starts_with("www.") {
+        return true;
+    }
+    let mut chars = token.chars();
+    if chars.next() == Some('I') && !chars.next().is_some_and(char::is_alphanumeric) {
         return true;
     }
     let has_hump = token

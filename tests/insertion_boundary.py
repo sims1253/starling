@@ -31,6 +31,24 @@ OPENING = set("([{\"'“‘„«「『【（")
 # enders are deliberately absent: the case is kept after them.
 CONTINUING = set(",;:)]}”’»」』】）》")
 
+# Han, kana and CJK punctuation: no space between two of them. Hangul is
+# absent on purpose (Korean separates words with spaces).
+NO_SPACE_SCRIPTS = (
+    ("\u3000", "\u30ff"),  # CJK symbols and punctuation, Hiragana, Katakana
+    ("\u31f0", "\u31ff"),  # Katakana phonetic extensions
+    ("\u3400", "\u4dbf"),  # CJK Extension A
+    ("\u4e00", "\u9fff"),  # CJK Unified Ideographs
+    ("\uf900", "\ufaff"),  # CJK Compatibility Ideographs
+    ("\uff01", "\uff0f"),  # fullwidth punctuation
+    ("\uff1a", "\uff20"),  # fullwidth punctuation
+    ("\uff5b", "\uff9f"),  # fullwidth punctuation, halfwidth Katakana
+    ("\U00020000", "\U0003ffff"),  # CJK Extensions B and later
+)
+
+
+def _no_space_boundary(ch: str) -> bool:
+    return any(low <= ch <= high for low, high in NO_SPACE_SCRIPTS)
+
 
 def _is_cased(ch: str) -> bool:
     return ch != ch.lower() or ch != ch.upper()
@@ -52,8 +70,8 @@ def _protected_token(raw: str) -> bool:
     token = parts[0]
     if any(c in token for c in "_/\\@#") or token.startswith("www."):
         return True
-    if token == "I":
-        return True
+    if token[0] == "I" and not token[1:2].isalnum():
+        return True  # the pronoun, also before punctuation or an apostrophe
     if any(a.islower() and b.isupper() for a, b in zip(token, token[1:])):
         return True  # camel hump
     letters = [c for c in token if c.isalpha()]
@@ -66,7 +84,13 @@ def adjust(before: str, raw: str, verbatim: bool) -> tuple[str, list[str]]:
         return raw, []
     text, changes = raw, []
 
-    if before and not raw[0].isspace() and not before[-1].isspace() and before[-1] not in OPENING:
+    if (
+        before
+        and not raw[0].isspace()
+        and not before[-1].isspace()
+        and before[-1] not in OPENING
+        and not (_no_space_boundary(before[-1]) and _no_space_boundary(raw[0]))
+    ):
         text = " " + text
         changes.append("leading_space")
 
