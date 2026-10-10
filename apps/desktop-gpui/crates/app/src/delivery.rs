@@ -200,11 +200,13 @@ fn boundary_text(
     if reading.swap(true, Ordering::SeqCst) {
         return None;
     }
+    // Made before the thread, so a thread that never starts clears it too.
+    let read = OutGuard(reading);
     let (sender, receiver) = mpsc::channel();
     let spawned = std::thread::Builder::new()
         .name("starling-boundary".into())
         .spawn(move || {
-            let _read = OutGuard(reading);
+            let _read = read;
             let _ = sender.send(adjust_at(&inserter, &target, &anchor, &text));
         });
     if spawned.is_err() {
@@ -2119,7 +2121,7 @@ mod tests {
     fn a_field_that_reads_too_slowly_gets_the_text_as_dictated(cx: &mut gpui::TestAppContext) {
         let (app, fake, fields) = app_with_fields(cx, None, "clean-local");
         fields.focus_text("The quick brown");
-        fields.set_read_delay(READ_BUDGET * 5);
+        fields.hold_reads(true);
         located_take(&app, cx, "take-1", "Fox jumps.", true, || {});
         assert_eq!(fake.insertions()[0].1, "Fox jumps.");
         assert_eq!(failure(&app, cx), None);
@@ -2127,9 +2129,9 @@ mod tests {
             app.delivery.boundary_out.load(Ordering::SeqCst)
         }));
 
-        fields.set_read_delay(Duration::ZERO);
         located_take(&app, cx, "take-2", "Fox jumps.", true, || {});
         assert_eq!(fake.insertions()[1].1, "Fox jumps.");
+        fields.hold_reads(false);
 
         // Once it is back, reads run again.
         let deadline = Instant::now() + Duration::from_secs(5);

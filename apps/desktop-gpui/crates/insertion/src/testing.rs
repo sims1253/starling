@@ -361,6 +361,7 @@ impl InsertionBackend for FakeBackend {
 #[derive(Default)]
 pub struct FakeFields {
     state: Mutex<FieldsState>,
+    released: std::sync::Condvar,
 }
 
 #[derive(Default)]
@@ -372,8 +373,9 @@ struct FieldsState {
     locates: usize,
     /// How long `locate` takes, like a big accessibility tree.
     locate_delay: std::time::Duration,
-    /// How long `read` takes, like an application busy elsewhere.
-    read_delay: std::time::Duration,
+    /// `read` does not answer until released, like an application busy
+    /// elsewhere.
+    reads_held: bool,
     /// Reads that returned a field's text.
     text_reads: usize,
 }
@@ -426,9 +428,10 @@ impl FakeFields {
         self.state().locate_delay = delay;
     }
 
-    /// Make `read` take `delay` before it answers.
-    pub fn set_read_delay(&self, delay: std::time::Duration) {
-        self.state().read_delay = delay;
+    /// Hold every `read` until released, or release them.
+    pub fn hold_reads(&self, held: bool) {
+        self.state().reads_held = held;
+        self.released.notify_all();
     }
 
     pub fn locates(&self) -> usize {
@@ -453,11 +456,10 @@ impl FieldReader for FakeFields {
     }
 
     fn read(&self, _target: &TargetSnapshot, field: &FieldAnchor) -> Surrounding {
-        let delay = self.state().read_delay;
-        if !delay.is_zero() {
-            std::thread::sleep(delay);
-        }
         let mut state = self.state();
+        while state.reads_held {
+            state = self.released.wait(state).expect("fake fields state");
+        }
         let before = match &state.focused {
             Some((anchor, _)) if anchor != field => return Surrounding::Unsupported,
             None => return Surrounding::Unsupported,
