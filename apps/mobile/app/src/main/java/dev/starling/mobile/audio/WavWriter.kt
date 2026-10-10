@@ -61,6 +61,9 @@ internal class WavWriter(
         open.add(file.absolutePath)
     }
 
+    /** Whether [finish] has closed the file. */
+    val isClosed: Boolean get() = closed
+
     /** Bytes of PCM written so far. */
     val writtenBytes: Long get() = dataBytes
 

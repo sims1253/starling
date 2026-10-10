@@ -195,8 +195,9 @@ class AudioCapture(
      * The durability checkpoints of one capture (see [WavWriter.checkpoint]):
      * every [CHECKPOINT_INTERVAL_MILLIS] the written audio is fsynced and its
      * size recorded in the header, off the capture thread so a slow flush
-     * can never make the microphone overrun. The same thread watches the
-     * free space ([diskWatch]). Ends with the writer.
+     * can never make the microphone overrun. The free space ([diskWatch])
+     * is watched on a thread of its own, so a stalled flush cannot keep a
+     * filling disk from stopping the take. Both end with the writer.
      */
     private fun startCheckpoints(wavWriter: WavWriter, diskWatch: DiskWatch) {
         Thread({
@@ -207,12 +208,21 @@ class AudioCapture(
                     // the capture itself reports write failures.
                     val confirmed = runCatching { wavWriter.checkpoint() }.getOrNull()
                     if (confirmed != null && confirmed < 0) return@Thread
-                    if (!stopRequested && diskWatch.critical()) lowDisk = true
                 }
             } catch (_: InterruptedException) {
                 // Daemon; nothing to clean up.
             }
         }, "starling-audio-checkpoint").apply { isDaemon = true }.start()
+        Thread({
+            try {
+                while (!wavWriter.isClosed) {
+                    Thread.sleep(CHECKPOINT_INTERVAL_MILLIS)
+                    if (!wavWriter.isClosed && !stopRequested && diskWatch.critical()) lowDisk = true
+                }
+            } catch (_: InterruptedException) {
+                // Daemon; nothing to clean up.
+            }
+        }, "starling-disk-watch").apply { isDaemon = true }.start()
     }
 
     /**

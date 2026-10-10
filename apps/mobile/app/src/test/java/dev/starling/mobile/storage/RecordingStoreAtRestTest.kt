@@ -134,6 +134,26 @@ class RecordingStoreAtRestTest {
     }
 
     @Test
+    fun aFlacWithADamagedSampleRateBesideItsWavIsDroppedAndTheWavKept() {
+        val store = RecordingStore(storeDir())
+        val take = committedTake(store)
+        val expected = requestAudio(store, take.id)
+        store.compressionHook = { step -> if (step == RecordingStore.CompressionStep.PUBLISHED) throw IllegalStateException("killed") }
+        runCatching { store.compressAudio(take.id) }
+        // STREAMINFO's sample rate (its 20 bits start at byte 18): the samples
+        // and their MD5 still match, but the request path refuses the stream.
+        val damaged = flac(take.id).readBytes()
+        damaged[18] = (damaged[18].toInt() xor 0x01).toByte()
+        flac(take.id).writeBytes(damaged)
+
+        val reopened = RecordingStore(storeDir())
+
+        assertTrue(wav(take.id).isFile)
+        assertFalse(flac(take.id).exists())
+        assertArrayEquals(expected, requestAudio(reopened, take.id))
+    }
+
+    @Test
     fun aDamagedFlacAloneFailsTheAttemptInsteadOfSendingOtherAudio() {
         val store = RecordingStore(storeDir())
         val take = committedTake(store)

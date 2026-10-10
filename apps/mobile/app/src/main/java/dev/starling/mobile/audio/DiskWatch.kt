@@ -8,7 +8,7 @@ import java.io.IOException
 
 /**
  * The free-space watch of one running take (#342): asked once a second by
- * the capture's checkpoint thread, it probes [directory] every
+ * a thread of its own (a stalled checkpoint fsync must not hold it up), it probes [directory] every
  * [intervalMillis] and says whether the take has to stop. A failing probe
  * never stops a take.
  */
@@ -17,7 +17,8 @@ internal class DiskWatch(
     private val directory: File,
     private val policy: DiskPolicy,
     private val intervalMillis: Long = DiskPolicy.IN_TAKE_INTERVAL_MILLIS,
-    private val clock: () -> Long = System::currentTimeMillis,
+    // Monotonic: a clock set back must not postpone the next probe.
+    private val clock: () -> Long = { System.nanoTime() / 1_000_000 },
 ) {
     private var nextCheck = clock() + intervalMillis
 

@@ -345,12 +345,7 @@ class RecordingStore internal constructor(
                     output.fd.sync()
                 }
             }
-            FileInputStream(wav).use { input ->
-                skipFully(input, WAV_HEADER_BYTES)
-                val comparing = ComparingOutputStream(input)
-                FileInputStream(temporary).use { flac -> Flac.decode(flac, comparing) }
-                comparing.requireExhausted()
-            }
+            verifyAgainstWav(temporary, wav)
             compressionHook?.invoke(CompressionStep.ENCODED)
         } catch (exception: Exception) {
             temporary.delete()
@@ -596,14 +591,7 @@ class RecordingStore internal constructor(
                 when {
                     recording.audioRemoved != null -> if (wav.exists() || flac.exists()) unlinkAudio(recording.id)
                     wav.isFile && flac.isFile -> {
-                        val same = runCatching {
-                            FileInputStream(wav).use { input ->
-                                skipFully(input, WAV_HEADER_BYTES)
-                                val comparing = ComparingOutputStream(input)
-                                FileInputStream(flac).use { Flac.decode(it, comparing) }
-                                comparing.requireExhausted()
-                            }
-                        }.isSuccess
+                        val same = runCatching { verifyAgainstWav(flac, wav) }.isSuccess
                         if (same && hasOwnHeader(wav)) {
                             // The FLAC's rename may not be durable yet (the
                             // crash may have come before the publish's sync):
@@ -618,6 +606,22 @@ class RecordingStore internal constructor(
                 }
             }
         }
+    }
+
+    /**
+     * Throws unless [flac] is exactly [wav]'s audio as the request path will
+     * read it back ([withRequestAudio]): the same samples, and a stream the
+     * request path accepts (16 kHz).
+     */
+    private fun verifyAgainstWav(flac: File, wav: File) = FileInputStream(wav).use { input ->
+        skipFully(input, WAV_HEADER_BYTES)
+        val comparing = ComparingOutputStream(input)
+        FileInputStream(flac).use { stream ->
+            Flac.decode(stream, comparing) { info ->
+                if (info.sampleRate != WavWriter.SAMPLE_RATE) throw IOException("Unexpected sample rate in the compressed audio")
+            }
+        }
+        comparing.requireExhausted()
     }
 
     /** Fails the moment what is written differs from [expected]. */
