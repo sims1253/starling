@@ -452,15 +452,19 @@ fn apply_rechecks_the_boundary_and_target_after_registering() {
     let mut session = Session::start(ScriptedAdapter::new());
     session.commit("notes", "rev-1", "Fox jumps");
 
-    // Cleared while the derivation was being registered.
+    // Cleared while the derivation was being registered. Read counts are
+    // pinned so a drift in read order fails here, not as a wrong text.
     let delivery = session.prepare("rev-1", "field-start");
+    let reads = session.adapter.reads();
     session.adapter.queue_befores(&["The quick brown", ""]);
     session.apply(delivery);
+    assert_eq!(session.adapter.reads(), reads + 2, "read order drifted");
     assert_eq!(session.adapter.inserted().last().unwrap(), "Fox jumps");
 
     // Moving on every read: nothing is inserted.
     let inserted = session.adapter.inserted().len();
     let delivery = session.prepare("rev-1", "field-start");
+    let reads = session.adapter.reads();
     session
         .adapter
         .queue_befores(&["The quick brown", "Done.", "The quick brown", "Done."]);
@@ -471,10 +475,12 @@ fn apply_rechecks_the_boundary_and_target_after_registering() {
             fallback_suggested: true,
         }
     );
+    assert_eq!(session.adapter.reads(), reads + 4, "read order drifted");
     assert_eq!(session.adapter.inserted().len(), inserted);
 
     // The target moved while the registration waited.
     let delivery = session.prepare("rev-1", "field-start");
+    let reads = session.adapter.reads();
     session
         .adapter
         .queue_befores(&["The quick brown", "The quick brown"]);
@@ -506,6 +512,7 @@ fn apply_rechecks_the_boundary_and_target_after_registering() {
             actual_target: "elsewhere".into(),
         }
     );
+    assert_eq!(session.adapter.reads(), reads + 2, "read order drifted");
     assert_eq!(session.adapter.inserted().len(), inserted);
 
     session.runtime.shutdown();
@@ -698,6 +705,29 @@ fn derived_revisions_persist_in_storage_v2_and_the_context_does_not() {
     for row in &document.revisions {
         assert!(!format!("{row:?}").contains("Zanzibar"), "{row:?}");
     }
+    drop(store);
+    // Every byte on disk, whatever column, table or sidecar file holds it;
+    // the delivered text being found keeps the scan from passing vacuously.
+    let holds = |bytes: &[u8], needle: &[u8]| bytes.windows(needle.len()).any(|w| w == needle);
+    let mut delivered_on_disk = false;
+    let mut dirs = vec![root.path().to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).expect("store dir lists") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                dirs.push(path);
+                continue;
+            }
+            let bytes = std::fs::read(&path).expect("store file reads");
+            delivered_on_disk |= holds(&bytes, b" fox jumps");
+            assert!(
+                !holds(&bytes, b"Zanzibar"),
+                "{} holds the context",
+                path.display()
+            );
+        }
+    }
+    assert!(delivered_on_disk, "the scan found no stored revision text");
 }
 
 /// A recorded derived revision's id is never written again through
@@ -727,7 +757,7 @@ fn update_head_never_rewrites_a_derived_revision() {
     let taken = Err(Rejection::RevisionIdTaken {
         revision_id: "r:boundary-space".into(),
     });
-    let recorded = vec![
+    let recorded = [
         (
             "r".to_string(),
             "committed".to_string(),

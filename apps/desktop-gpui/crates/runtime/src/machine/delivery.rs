@@ -479,13 +479,15 @@ impl DeliveryActor {
     }
 
     /// What apply delivers under the boundary rules: `source` derived
-    /// against the boundary as it is now. A derivation prepare already
-    /// recorded (`recorded`) is delivered as is; registering a new one
-    /// waits on the document service, so the boundary is read again
-    /// afterwards and the derivation repeated when it moved in the
-    /// meantime (a busy document service is retried the same way). The
-    /// flag says whether a registration waited (the target is then
-    /// revalidated again); the error is a `delivery.failed` reason.
+    /// against the boundary as it is now — `source` itself when no rule
+    /// fires any more (it is already recorded, so nothing waits and the
+    /// revalidation just made still covers the target). A derivation
+    /// prepare already recorded (`recorded`) is delivered as is;
+    /// registering a new one waits on the document service, so the
+    /// boundary is read again afterwards and the derivation repeated when
+    /// it moved in the meantime (a busy document service is retried the
+    /// same way). The flag says whether a registration waited (the target
+    /// is then revalidated again); the error is a `delivery.failed` reason.
     fn derive_at_apply(
         &self,
         doc_id: &str,
@@ -700,30 +702,33 @@ fn derive(source: &Revision, surrounding: Option<&SurroundingText>) -> Option<Re
     })
 }
 
-/// `{source}:boundary-{rules}` (`:` keeps it a wire-legal `msgId`). A
-/// source id too long for the suffix is shortened and tagged with a
-/// digest of the full id, so the result stays within [`MSG_ID_MAX`] and
-/// one source still maps to one id.
+/// `{source}:boundary-{rules}` (`:` keeps it a wire-legal `msgId`). An
+/// id over [`MSG_ID_MAX`] is shortened and tagged with a digest of the
+/// full id, so it always stays within the limit and one source and rule
+/// list still map to one id. The suffix is kept whole when it fits next
+/// to the tag (any realistic rule list, pinned by the tests below).
 fn derived_id(source_id: &str, rules: &str) -> String {
-    let suffix = format!(":boundary-{rules}");
-    if source_id.len() + suffix.len() <= MSG_ID_MAX {
-        return format!("{source_id}{suffix}");
+    let id = format!("{source_id}:boundary-{rules}");
+    if id.len() <= MSG_ID_MAX {
+        return id;
     }
     // 64-bit FNV-1a: an id tag, not a security boundary (a collision is
     // still refused as `RevisionIdTaken`).
-    let digest = source_id
-        .bytes()
-        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
-            (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
-        });
-    // Saturating: today's rule vocabulary leaves ample room (pinned by
-    // the tests below); a far longer one would yield an over-long id,
-    // never a panic in the delivery actor.
-    let mut keep = MSG_ID_MAX.saturating_sub(suffix.len() + 17);
-    while !source_id.is_char_boundary(keep) {
-        keep -= 1;
+    let digest = id.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    });
+    let tag = format!(".{digest:016x}");
+    let prefix = |text: &str, mut keep: usize| {
+        while !text.is_char_boundary(keep) {
+            keep -= 1;
+        }
+        text[..keep].to_string()
+    };
+    let suffix = &id[source_id.len()..];
+    match MSG_ID_MAX.checked_sub(suffix.len() + tag.len()) {
+        Some(keep) => format!("{}{tag}{suffix}", prefix(source_id, keep)),
+        None => format!("{}{tag}", prefix(&id, MSG_ID_MAX - tag.len())),
     }
-    format!("{}.{digest:016x}{suffix}", &source_id[..keep])
 }
 
 /// `delivery.failed.reason` for a derived revision apply could not record.
@@ -766,9 +771,13 @@ mod tests {
         // Same shortened prefix, different sources: different ids.
         assert_ne!(a, b);
         assert_eq!(a, derived_id(&long, "space-case"));
-        // A rule list longer than the limit itself shortens to nothing
-        // rather than panicking.
-        let rules = "case-".repeat(MSG_ID_MAX);
-        assert!(derived_id(&long, &rules).ends_with(&rules));
+        // A rule list longer than the limit itself still yields a legal,
+        // distinct id.
+        let (rules, other) = ("case-".repeat(MSG_ID_MAX), "space-".repeat(MSG_ID_MAX));
+        let (c, d) = (derived_id("rev-1", &rules), derived_id("rev-1", &other));
+        for id in [&c, &d] {
+            assert!(id.len() <= MSG_ID_MAX && is_msg_id(id), "{id}");
+        }
+        assert_ne!(c, d);
     }
 }

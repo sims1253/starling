@@ -495,7 +495,7 @@ fn an_unverifiable_revision_id_is_refused_without_writing() {
         )
         .expect("docs.get served")
     {
-        Receipt::Served(view) => assert_eq!(view["found"], false, "{view}"),
+        Receipt::Served(view) => assert!(!view["found"].as_bool().unwrap(), "{view}"),
         other => panic!("docs.get answered {other:?}"),
     }
     runtime.shutdown();
