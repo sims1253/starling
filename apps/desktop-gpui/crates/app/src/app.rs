@@ -439,6 +439,9 @@ pub struct StarlingApp {
     pub(crate) retry_menu: Option<String>,
     /// A retry waiting for the engine to switch to its model (#356).
     pub(crate) pending_retry: Option<crate::upload::PendingRetry>,
+    /// Bumped by every retry request: only the newest acts once its
+    /// audio has loaded.
+    pub(crate) retry_seq: u64,
     pub error: Option<String>,
     pub capture_warning: Option<String>,
     /// Ephemeral one-off export notice (G05: a renamed export is surfaced,
@@ -1102,6 +1105,7 @@ impl StarlingApp {
             active_ids: HashSet::new(),
             retry_menu: None,
             pending_retry: None,
+            retry_seq: 0,
             unsaved: Vec::new(),
             confirm_discard_for: None,
             copied: None,
@@ -1198,15 +1202,18 @@ impl StarlingApp {
                     let store = store.clone();
                     cx.background_spawn(async move { store.startup_recovery() }).await
                 };
+                let mut recheck = false;
                 match recovered {
-                    Ok(summary) if !summary.is_empty() => {
-                        this.update(cx, |app, cx| {
-                            app.error = Some(summary);
-                            cx.notify();
-                        })
-                        .ok();
+                    Ok(recovery) => {
+                        recheck = recovery.recheck;
+                        if !recovery.summary.is_empty() {
+                            this.update(cx, |app, cx| {
+                                app.error = Some(recovery.summary);
+                                cx.notify();
+                            })
+                            .ok();
+                        }
                     }
-                    Ok(_) => {}
                     Err(err) => {
                         this.update(cx, |app, cx| {
                             app.error = Some(format!(
@@ -1221,6 +1228,9 @@ impl StarlingApp {
                 refresh_sessions(&this, &store, cx).await;
                 // #342: compression and retention after recovery settled.
                 this.update(cx, |app, cx| app.start_audio_upkeep(cx)).ok();
+                if recheck {
+                    crate::upload::recheck_capture_journals(&this, &store, cx).await;
+                }
             })
             .detach();
         }

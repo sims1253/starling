@@ -116,18 +116,29 @@ impl FileSink {
     fn create(dir: &Path, id: &str) -> io::Result<(Self, PathBuf)> {
         std::fs::create_dir_all(dir)?;
         let path = dir.join(format!("{id}.{JOURNAL_EXT}"));
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)?;
         // The writer's liveness signal (#356): the startup scan of the
         // recorder's tree ([`crate::store_v2::StoreV2::recover_capture_journals`])
         // never adopts a journal whose lock is held — that take is still
         // being recorded, by this process or another. The OS drops the
-        // lock with the handle, so a killed writer leaves it free.
-        // Best-effort: without a lock the scan falls back on the file's
-        // age.
+        // lock with the handle, so a killed writer leaves it free. The
+        // file is created and locked under a name the scan ignores and
+        // only then renamed into place, so the scan never sees an
+        // unlocked live journal. Best-effort: without a lock the scan
+        // falls back on the file's age.
+        let creating = dir.join(format!("{id}.{JOURNAL_EXT}.creating"));
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&creating)?;
         let _ = crate::store_v2::try_flock_exclusive(&file);
+        // A hard link publishes the name atomically and fails on anything
+        // already there (a file or a planted symlink) — `create_new`
+        // semantics for the real name.
+        let linked = std::fs::hard_link(&creating, &path);
+        let _ = std::fs::remove_file(&creating);
+        linked?;
+        // The header write that follows fsyncs the directory, making the
+        // rename durable with it.
         Ok((Self { file, dir: dir.to_path_buf() }, path))
     }
 }

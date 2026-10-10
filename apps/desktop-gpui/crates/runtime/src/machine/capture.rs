@@ -461,8 +461,15 @@ impl V2CaptureStore {
         let mut adoption_error = None;
         {
             let mut store = self.store.lock().expect("v2 store lock");
+            // #356: a faulted or unfinalized journal holds only the audio
+            // before its fault, while the take's samples kept everything;
+            // it is adopted only when the samples are all there is.
             let adoption = match &take.journal {
-                Some(report) if report.path.exists() => {
+                Some(report)
+                    if report.path.exists()
+                        && ((report.finalized && report.fault.is_none())
+                            || take.samples.is_empty()) =>
+                {
                     Some((report, store.adopt_journal(&report.path, note)))
                 }
                 _ => None,

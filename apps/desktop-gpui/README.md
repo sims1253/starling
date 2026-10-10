@@ -121,17 +121,20 @@ same recording; earlier results stay listed and an empty answer never replaces
 real text. A retried transcript is never typed into another app: it is offered
 for Copy, or Paste last into the field you pick.
 
-How much survives a crash: the journal confirms audio on disk at least every
-250 ms (or 64 KiB). If Starling is killed or crashes while recording, the next
-launch adopts the journal as an interrupted take holding everything up to the
-last confirmed point — the last moment before the crash (under a quarter
-second, plus audio still in the capture buffer) is lost, and an unconfirmed
-partial write at the end is discarded and noted, never joined. A take whose
-app stopped after the recording ended but before it was saved comes back
-complete. If the journal itself fails mid-take (a full disk), recording
+How much survives a crash: the journal aims to confirm audio on disk every
+250 ms (or 64 KiB) — a slow disk stretches that. If Starling is killed or
+crashes while recording, the next launch adopts the journal as an interrupted
+take holding everything up to the last confirmed point, and the drawer shows
+how much that is. Audio after it (normally the last moment before the crash,
+plus anything still in the capture buffer) is lost; an unconfirmed partial
+write at the end is discarded and noted, never joined. A take whose app
+stopped after the recording ended but before it was saved comes back complete
+(a journal finished less than a minute before launch is left to a save that
+may still be running and picked up a minute later). If the journal itself fails mid-take (a full disk), recording
 continues in memory and the whole take is saved from memory at stop; if that
 save fails too, the take stays downloadable from the unsaved banner and its
-journal is recovered at the next launch up to the failure.
+journal is recovered at the next launch up to the failure. A journal whose
+take was saved from memory is kept under `journals/superseded/`.
 
 ## Staging panel
 

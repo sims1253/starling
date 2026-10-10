@@ -1990,7 +1990,10 @@ impl StoreV2 {
     ///   ([`Self::delete_capture`], interrupted deletes completed by
     ///   [`Self::reconcile`]);
     /// - `journals/deleted/` — the v1 journal tree's tombstones (R21),
-    ///   left behind by the deleted v1 store, still awaiting this sweep.
+    ///   left behind by the deleted v1 store, still awaiting this sweep;
+    /// - `journals/superseded/` — recorder journals whose take was stored
+    ///   from its in-memory audio instead (#356,
+    ///   [`supersede_capture_journal`]).
     ///
     /// Bookkeeping: per file, the `tombstones` row is stamped
     /// `retention = 'swept'` **before** the bytes are unlinked (a
@@ -2006,6 +2009,13 @@ impl StoreV2 {
         self.sweep_tree(&self.root.join(QUARANTINE_DIR), "capture", &mut report)?;
         self.sweep_tree(
             &self.root.join(LEGACY_DELETED_SUBPATH),
+            "journal",
+            &mut report,
+        )?;
+        // Recorder journals whose take was stored from memory (#356): a
+        // partial copy of audio history already holds whole.
+        self.sweep_tree(
+            &self.root.join("journals").join(SUPERSEDED_SUBDIR),
             "journal",
             &mut report,
         )?;
@@ -4261,8 +4271,9 @@ fn recovered_journal_note(facts: &AdoptedJournal) -> String {
     }
     let mut note = format!(
         "Starling closed while this take was recording. Recovered {seconds:.1} s: everything \
-         the capture journal had confirmed on disk. The journal confirms audio at least every \
-         quarter second, so the last moment before Starling closed is missing."
+         the capture journal had confirmed on disk. Audio after its last confirmation is \
+         missing — normally only the last moment, as the journal confirms about every quarter \
+         second while the disk keeps up."
     );
     if facts.torn_tail_bytes > 0 {
         note.push_str(&format!(

@@ -216,3 +216,42 @@ fn a_missing_journal_tree_is_nothing_to_recover() {
         .expect("scan");
     assert!(report.recovered.is_empty() && report.summary().is_empty());
 }
+
+#[test]
+fn a_journal_is_locked_from_the_moment_its_name_appears() {
+    // The scan must never find a live journal unlocked — not even in the
+    // instant between creating the file and writing its header.
+    let dir = TempDir::new().expect("tempdir");
+    let tree = journals(&dir);
+    let writer =
+        JournalWriter::create_named(&tree, "j_new".to_string(), 16_000).expect("writer");
+    let probe = File::open(writer.path()).expect("open");
+    assert_eq!(try_flock_exclusive(&probe).expect("probe"), FlockEvidence::Held);
+    let names: Vec<_> = std::fs::read_dir(&tree)
+        .expect("tree")
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .collect();
+    assert_eq!(names, vec!["j_new.sj".to_string()], "no creation scratch left behind");
+    // And a name already taken is never overwritten.
+    drop(writer);
+    assert!(JournalWriter::create_named(&tree, "j_new".to_string(), 16_000).is_err());
+}
+
+#[test]
+fn the_retention_sweep_empties_superseded_journals() {
+    let dir = TempDir::new().expect("tempdir");
+    let mut store = store_in(&dir);
+    let tree = journals(&dir);
+    let path = {
+        let mut writer =
+            JournalWriter::create_named(&tree, "j_partial".to_string(), 16_000).expect("writer");
+        writer.append_frames(&ramp(1_600, 0)).expect("append");
+        writer.write_boundary().expect("boundary");
+        writer.path().to_path_buf()
+    };
+    supersede_capture_journal(&path).expect("supersede");
+    let report = store.sweep_retention().expect("sweep");
+    assert_eq!(report.swept.len(), 1, "{report:?}");
+    assert!(!tree.join(SUPERSEDED_SUBDIR).join("j_partial.sj").exists());
+}

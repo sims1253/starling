@@ -774,12 +774,10 @@ impl StarlingApp {
         // handed back nothing (`Empty`, a failed stop): samples this app
         // already owns are never dropped by a cancel.
         let audio = salvaged_take_audio(stopped, streamed_samples, device_sample_rate);
-        // Only a clean, finalized journal is adopted as the take's audio.
-        // A faulted one holds just the prefix written before the fault;
-        // adopting it would drop the words spoken after it, so the full
-        // in-memory take is stored instead.
-        let journal_report =
-            journal_report.filter(|report| report.finalized && report.fault.is_none());
+        // The journal rides along whatever its state: the store adopts
+        // only a clean, finalized one (a faulted one holds just the prefix
+        // before the fault, so the full in-memory take is stored instead)
+        // and moves a journal it did not adopt aside (#356).
         let kept = audio.as_ref().is_some_and(|audio| !audio.samples.is_empty());
         // Notices that promise history are shown only once the save below
         // lands — a failed save explains itself through the error banner
@@ -1516,8 +1514,11 @@ impl StarlingApp {
             return;
         }
         self.retry_menu = None;
-        // A newer choice replaces a retry still waiting for its model.
+        // A newer choice replaces a retry still loading its audio or
+        // waiting for its model.
         self.pending_retry = None;
+        self.retry_seq += 1;
+        let seq = self.retry_seq;
         if with == RetryWith::Server && self.endpoint.trim().is_empty() {
             self.error = Some(
                 "No server is set up: add its endpoint in Settings → Engine, then retry."
@@ -1547,6 +1548,8 @@ impl StarlingApp {
                 .await
             };
             this.update(cx, |app, cx| match loaded {
+                // Superseded by a newer choice: the pin drops, nothing runs.
+                _ if app.retry_seq != seq => {}
                 Ok(Some((wav, pin))) => match with {
                     RetryWith::Current => {
                         let target = app.resolve_take_target();
@@ -1621,6 +1624,12 @@ impl StarlingApp {
                     {
                         // Replaced by another choice, or the engine itself
                         // was replaced (a mode switch): this wait is over.
+                        return true;
+                    }
+                    if !app.sessions.iter().any(|session| session.id == pending.take_id) {
+                        // Deleted while the model loaded: nothing to retry.
+                        app.pending_retry = None;
+                        cx.notify();
                         return true;
                     }
                     match switch_progress(&engine.snapshot(), &model_id, started.elapsed()) {
@@ -1813,6 +1822,38 @@ pub(crate) fn request_timeout_ms(wav_bytes: usize) -> u64 {
     // 16 kHz mono PCM16: 32 000 bytes a second, after the 44-byte header.
     let audio_ms = (wav_bytes.saturating_sub(44) as u64) / 32;
     (BASE_MS + audio_ms).min(MAX_MS)
+}
+
+/// The second look at the recorder's tree (#356): a journal the startup
+/// pass left to a save that may have been under way is recovered once
+/// that save would long have finished, in this launch rather than the
+/// next.
+pub(crate) async fn recheck_capture_journals(
+    this: &WeakEntity<StarlingApp>,
+    store: &Store,
+    cx: &mut AsyncApp,
+) {
+    cx.background_executor()
+        .timer(starling_dictation::store_v2::FINALIZED_ADOPTION_GRACE + std::time::Duration::from_secs(2))
+        .await;
+    let recovered = {
+        let store = store.clone();
+        cx.background_spawn(async move { store.recover_capture_journals() })
+            .await
+    };
+    let summary = match recovered {
+        Ok(recovery) => recovery.summary(),
+        Err(err) => format!("Could not scan for interrupted recordings: {err}"),
+    };
+    if summary.is_empty() {
+        return;
+    }
+    this.update(cx, |app, cx| {
+        app.error = Some(summary);
+        cx.notify();
+    })
+    .ok();
+    refresh_sessions(this, store, cx).await;
 }
 
 pub(crate) async fn refresh_sessions(
