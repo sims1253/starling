@@ -38,6 +38,9 @@ fn overlay_reach_note() -> &'static str {
     } else if cfg!(target_os = "linux") {
         "The overlay opens at the bottom of the monitor under the pointer and never takes \
          keyboard focus."
+    } else if cfg!(target_os = "windows") {
+        "The overlay opens at the bottom of the primary display. Other windows can cover it, and \
+         clicking it can take focus from the app you dictate into."
     } else {
         "The overlay opens at the bottom of the primary display and never takes keyboard focus."
     }

@@ -21,8 +21,10 @@
 //!   the compositor decides where the overlay goes, whether it floats,
 //!   and whether it takes focus. The window's app id is
 //!   [`OVERLAY_APP_ID`] so a compositor rule can float it unfocused.
-//! - **Windows**: a `WS_EX_TOOLWINDOW` pop-up. **macOS**: a non-activating
-//!   panel. Both open on the primary display (no pointer lookup here);
+//! - **Windows**: gpui makes a `WS_EX_TOOLWINDOW` pop-up, without
+//!   `WS_EX_TOPMOST` or `WS_EX_NOACTIVATE`: other windows can cover it and
+//!   clicking it (Cancel) can activate it. **macOS**: a pop-up-level
+//!   window. Both open on the primary display (no pointer lookup here);
 //!   neither was run for this change.
 
 use std::time::{Duration, Instant};
@@ -134,6 +136,9 @@ pub(crate) struct Pipeline {
 #[derive(Debug)]
 pub(crate) struct OverlayModel {
     follow: Follow,
+    /// The session id of the take on the overlay once its save landed;
+    /// kept through the terminal linger.
+    take_id: Option<String>,
     /// A terminal phase and when it was entered.
     terminal: Option<(OverlayPhase, Instant)>,
     delivery: DeliveryStatus,
@@ -144,6 +149,7 @@ impl OverlayModel {
     pub(crate) fn new(now: Instant) -> Self {
         Self {
             follow: Follow::None,
+            take_id: None,
             terminal: None,
             delivery: DeliveryStatus::Idle,
             delivery_since: now,
@@ -153,6 +159,7 @@ impl OverlayModel {
     /// A new take started: whatever the overlay showed is replaced.
     pub(crate) fn take_started(&mut self, now: Instant) {
         self.follow = Follow::None;
+        self.take_id = None;
         self.terminal = None;
         self.delivery = DeliveryStatus::Idle;
         self.delivery_since = now;
@@ -181,6 +188,7 @@ impl OverlayModel {
     pub(crate) fn take_saved(&mut self, stopped_at: Instant, id: &str) {
         if self.follow == Follow::Saving(stopped_at) {
             self.follow = Follow::Take(id.to_string());
+            self.take_id = Some(id.to_string());
         }
     }
 
@@ -198,6 +206,12 @@ impl OverlayModel {
             Follow::Take(id) => Some(id),
             _ => None,
         }
+    }
+
+    /// The session id of the take the overlay shows, once saved — also
+    /// while its terminal phase lingers. `None` while it records or saves.
+    pub(crate) fn take_id(&self) -> Option<&str> {
+        self.take_id.as_deref()
     }
 
     pub(crate) fn set_delivery(&mut self, status: DeliveryStatus, now: Instant) {
@@ -394,10 +408,11 @@ pub(crate) struct Overlay {
     window: Option<WindowHandle<OverlayView>>,
     /// The mode the open window was sized for.
     window_mode: OverlayMode,
-    /// An open is in flight (the placement lookup runs off the UI thread).
-    opening: bool,
+    /// An open in flight for this mode (the placement lookup runs off the
+    /// UI thread).
+    opening: Option<OverlayMode>,
     /// Bumped whenever the window should go away, so an open that was
-    /// still in flight closes what it opened.
+    /// still in flight never shows a window.
     generation: u64,
     /// The main window's scale factor, for placing on X11.
     pub(crate) scale: f32,
@@ -410,7 +425,7 @@ impl Overlay {
             phase: None,
             window: None,
             window_mode: OverlayMode::Minimal,
-            opening: false,
+            opening: None,
             generation: 0,
             scale: 1.,
         }
@@ -480,10 +495,16 @@ impl StarlingApp {
         self.overlay.phase = phase;
         let mode = self.feedback.overlay;
         let visible = overlay_visible(mode, phase);
-        if self.overlay.window.is_some() && (!visible || self.overlay.window_mode != mode) {
+        let stale_window =
+            self.overlay.window.is_some() && (!visible || self.overlay.window_mode != mode);
+        let stale_open = self
+            .overlay
+            .opening
+            .is_some_and(|opening| !visible || opening != mode);
+        if stale_window || stale_open {
             self.close_overlay(cx);
         }
-        if visible && self.overlay.window.is_none() && !self.overlay.opening {
+        if visible && self.overlay.window.is_none() && self.overlay.opening.is_none() {
             self.open_overlay(mode, cx);
         }
         if changed {
@@ -495,6 +516,7 @@ impl StarlingApp {
 
     fn close_overlay(&mut self, cx: &mut Context<Self>) {
         self.overlay.generation += 1;
+        self.overlay.opening = None;
         if let Some(window) = self.overlay.window.take() {
             window
                 .update(cx, |_, window, _| window.remove_window())
@@ -503,7 +525,7 @@ impl StarlingApp {
     }
 
     fn open_overlay(&mut self, mode: OverlayMode, cx: &mut Context<Self>) {
-        self.overlay.opening = true;
+        self.overlay.opening = Some(mode);
         let generation = self.overlay.generation;
         let scale = self.overlay.scale;
         let app = cx.entity().downgrade();
@@ -557,13 +579,24 @@ impl StarlingApp {
                 window_decorations: Some(WindowDecorations::Client),
                 tabbing_identifier: None,
             };
+            // Hidden, re-moded or done while the placement was looked up:
+            // never map a window nobody wants.
+            let current = this
+                .update(cx, |this, _| this.overlay.generation == generation)
+                .unwrap_or(false);
+            if !current {
+                return;
+            }
             let opened = cx.open_window(options, |_window, cx| {
                 cx.new(|cx| OverlayView::new(app, cx))
             });
             this.update(cx, |this, cx| {
-                this.overlay.opening = false;
+                let current = this.overlay.generation == generation;
+                if current {
+                    this.overlay.opening = None;
+                }
                 match opened {
-                    Ok(window) if this.overlay.generation == generation => {
+                    Ok(window) if current => {
                         this.overlay.window = Some(window);
                         this.overlay.window_mode = mode;
                     }
@@ -670,6 +703,24 @@ mod tests {
             Some(OverlayPhase::Ready)
         );
         assert_eq!(model.phase(None, idle(), false, t1 + TERMINAL_LINGER), None);
+    }
+
+    #[test]
+    fn the_take_id_is_known_from_the_save_through_the_linger() {
+        let t0 = Instant::now();
+        let mut model = OverlayModel::new(t0);
+        model.take_started(t0);
+        model.take_finished(t0);
+        assert_eq!(model.take_id(), None, "not saved yet");
+        model.take_saved(t0, "take-1");
+        assert_eq!(model.take_id(), Some("take-1"));
+        assert_eq!(
+            model.phase(None, idle(), false, t0),
+            Some(OverlayPhase::Ready)
+        );
+        assert_eq!(model.take_id(), Some("take-1"), "still shown");
+        model.take_started(t0);
+        assert_eq!(model.take_id(), None);
     }
 
     #[test]

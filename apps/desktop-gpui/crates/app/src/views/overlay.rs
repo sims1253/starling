@@ -14,6 +14,7 @@ use starling_dictation::settings::OverlayMode;
 
 use crate::app::StarlingApp;
 use crate::overlay::OverlayPhase;
+use crate::staging::StagingPhase;
 use crate::theme;
 
 /// How much of the live transcript the overlay shows: its tail.
@@ -86,12 +87,26 @@ impl StarlingApp {
         };
         let text = (self.feedback.overlay == OverlayMode::LiveText)
             .then(|| {
-                // The staging draft when one is shown (read-only here: the
-                // staging editor owns edits), the direct-mode partial
-                // otherwise.
+                // The take's staging draft (read-only here: the staging
+                // editor owns edits), the direct-mode partial otherwise.
+                // Another take's draft brought forward in the main window
+                // is not this take's text.
+                let take_id = self.overlay.model.take_id();
+                let ours = |staging: &&crate::staging::Staging| match take_id {
+                    Some(id) => staging.take_id.as_deref() == Some(id),
+                    None => {
+                        staging.take_id.is_none()
+                            && matches!(
+                                staging.phase,
+                                StagingPhase::Recording | StagingPhase::Finishing
+                            )
+                    }
+                };
                 let staged = self
                     .staging
-                    .as_ref()
+                    .iter()
+                    .chain(&self.background_stagings)
+                    .find(ours)
                     .map(|staging| staging.editor.read(cx).buffer.text.clone());
                 staged.unwrap_or_else(|| self.live_partial.clone())
             })

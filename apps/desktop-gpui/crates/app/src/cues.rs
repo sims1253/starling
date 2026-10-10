@@ -35,7 +35,8 @@ const SAMPLE_RATE: u32 = 44_100;
 const TONE: Duration = Duration::from_millis(60);
 const PAUSE: Duration = Duration::from_millis(20);
 
-/// How long the stop cue waits at most for playback to be restored.
+/// How long the stop cue waits at most for playback to be restored;
+/// past it the cue is dropped.
 const SETTLE_LIMIT: Duration = Duration::from_millis(1500);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -243,12 +244,14 @@ impl StarlingApp {
         }
         let settled = self.playback.handle().settled();
         cx.spawn(async move |this, cx| {
-            cx.background_spawn(async move {
-                let _ = settled.recv_timeout(SETTLE_LIMIT);
-            })
-            .await;
+            // A restore that has not finished in time (or a service that
+            // shut down) drops the cue: it would play into a lowered or
+            // muted output, or long after the take.
+            let restored = cx
+                .background_spawn(async move { settled.recv_timeout(SETTLE_LIMIT).is_ok() })
+                .await;
             this.update(cx, |app, _| {
-                let enabled = app.feedback.cues;
+                let enabled = app.feedback.cues && restored;
                 if app
                     .cue_gate
                     .settled(take, app.activation.active_take(), enabled)
