@@ -111,7 +111,8 @@ pub(crate) struct Facts {
     pub insertion: Vec<(String, Result<(), String>)>,
     pub atspi: Option<Result<(), String>>,
     pub input_methods: InputMethodFacts,
-    pub audio: AudioFacts,
+    /// `None`: the sockets did not answer in time.
+    pub audio: Option<AudioFacts>,
     /// Capture devices: (name, is default).
     pub microphones: Option<Result<Vec<(String, bool)>, String>>,
 }
@@ -128,7 +129,7 @@ pub(crate) fn evaluate(facts: &Facts, portal_status: Option<&PortalStatus>) -> V
         insertion_line(facts),
         atspi_line(facts.atspi.as_ref()),
         input_method_line(&facts.input_methods),
-        audio_line(&facts.audio),
+        audio_line(facts.audio.as_ref()),
         microphone_line(facts.microphones.as_ref()),
     ]
 }
@@ -255,10 +256,12 @@ fn shortcut_line(facts: &Facts, portal_status: Option<&PortalStatus>) -> CheckLi
             )),
         );
     };
+    // Which backend serves it is the portal's choice (portals.conf can
+    // pick any installed one), so these are the installed candidates.
     let backend = if in_use.is_empty() {
-        "backend not identified from the .portal files".to_string()
+        format!("no installed backend with it names {desktop}")
     } else {
-        format!("backend: {}", in_use.join(", "))
+        format!("installed for {desktop}: {}", in_use.join(", "))
     };
     let summary = format!("GlobalShortcuts portal version {version} ({backend}).");
     match portal_status {
@@ -407,8 +410,19 @@ fn input_method_line(ime: &InputMethodFacts) -> CheckLine {
     )
 }
 
-fn audio_line(audio: &AudioFacts) -> CheckLine {
+fn audio_line(audio: Option<&AudioFacts>) -> CheckLine {
     const TOPIC: &str = "Sound server";
+    let Some(audio) = audio else {
+        return line(
+            TOPIC,
+            Verdict::Missing,
+            format!(
+                "The sound server's sockets did not answer within {} s.",
+                PROBE_TIMEOUT.as_secs()
+            ),
+            Some("Restart it: `systemctl --user restart pipewire pipewire-pulse`.".to_string()),
+        );
+    };
     match (audio.pipewire, audio.pulse) {
         (true, true) => line(TOPIC, Verdict::Ok, "PipeWire with its PulseAudio socket.", None),
         (false, true) => line(TOPIC, Verdict::Ok, "PulseAudio.", None),
@@ -461,6 +475,24 @@ fn microphone_line(microphones: Option<&Result<Vec<(String, bool)>, String>>) ->
             line(TOPIC, Verdict::Ok, format!("{count} capture {noun} visible{default}."), None)
         }
     }
+}
+
+/// Where PipeWire's socket is: `PIPEWIRE_REMOTE` is a socket *name*
+/// (default `pipewire-0`) resolved in `PIPEWIRE_RUNTIME_DIR`, else
+/// `XDG_RUNTIME_DIR`; an absolute path is taken as is.
+fn pipewire_socket(
+    remote: Option<&str>,
+    pipewire_runtime: Option<&str>,
+    xdg_runtime: Option<&std::path::Path>,
+) -> Option<std::path::PathBuf> {
+    let name = remote.unwrap_or("pipewire-0");
+    if name.starts_with('/') {
+        return Some(name.into());
+    }
+    pipewire_runtime
+        .map(std::path::PathBuf::from)
+        .or_else(|| xdg_runtime.map(std::path::Path::to_path_buf))
+        .map(|dir| dir.join(name))
 }
 
 /// The check as plain text (for copying into a bug report).
@@ -589,8 +621,12 @@ pub(crate) fn gather() -> Facts {
         .into_iter()
         .filter_map(|name| env(name).map(|value| (name.to_string(), value)))
         .collect();
+    let backends = std::thread::spawn(move || {
+        bounded(move || live::portal_backends(&desktops)).unwrap_or_default()
+    });
+    let audio = bounded(live::audio);
     Facts {
-        portal_backends: live::portal_backends(&desktops),
+        portal_backends: backends.join().unwrap_or_default(),
         session,
         portal: Some(portal.join().unwrap_or_else(|_| Err("the probe failed".to_string()))),
         insertion: insertion.join().unwrap_or_default(),
@@ -600,7 +636,7 @@ pub(crate) fn gather() -> Facts {
             fcitx_running,
             configured,
         },
-        audio: live::audio(),
+        audio,
         microphones: Some(
             microphones
                 .join()
@@ -616,7 +652,10 @@ mod live {
 
     use zbus::blocking::{Connection, Proxy};
 
-    use super::{env, parse_portal_file, AudioFacts, PortalBackend, PortalFacts, GLOBAL_SHORTCUTS};
+    use super::{
+        env, parse_portal_file, pipewire_socket, AudioFacts, PortalBackend, PortalFacts,
+        GLOBAL_SHORTCUTS,
+    };
 
     const PORTAL: &str = "org.freedesktop.portal.Desktop";
     const PORTAL_PATH: &str = "/org/freedesktop/portal/desktop";
@@ -748,11 +787,11 @@ mod live {
             None => runtime.as_ref().map(|dir| dir.join("pulse/native")),
         };
         AudioFacts {
-            pipewire: reachable(
-                env("PIPEWIRE_REMOTE")
-                    .map(PathBuf::from)
-                    .or_else(|| runtime.as_ref().map(|dir| dir.join("pipewire-0"))),
-            ),
+            pipewire: reachable(pipewire_socket(
+                env("PIPEWIRE_REMOTE").as_deref(),
+                env("PIPEWIRE_RUNTIME_DIR").as_deref(),
+                runtime.as_deref(),
+            )),
             pulse: reachable(pulse_path),
         }
     }
@@ -829,10 +868,10 @@ mod tests {
             insertion: vec![("x11".to_string(), Ok(()))],
             atspi: Some(Ok(())),
             input_methods: InputMethodFacts::default(),
-            audio: AudioFacts {
+            audio: Some(AudioFacts {
                 pipewire: true,
                 pulse: true,
-            },
+            }),
             microphones: Some(Ok(vec![
                 ("Built-in".to_string(), false),
                 ("USB mic".to_string(), true),
@@ -854,7 +893,7 @@ mod tests {
         let shortcut = find(&lines, "System-wide shortcut");
         assert_eq!(shortcut.verdict, Verdict::Ok);
         assert!(shortcut.summary.contains("version 2"), "{}", shortcut.summary);
-        assert!(shortcut.summary.contains("backend: kde"), "{}", shortcut.summary);
+        assert!(shortcut.summary.contains("installed for KDE: kde"), "{}", shortcut.summary);
         assert!(shortcut.summary.contains("Meta+Space"), "{}", shortcut.summary);
         assert_eq!(find(&lines, "Session").verdict, Verdict::Ok);
         let mic = find(&lines, "Microphone");
@@ -938,7 +977,7 @@ mod tests {
     #[test]
     fn missing_audio_microphones_and_atspi_carry_fixes() {
         let mut facts = healthy_kde();
-        facts.audio = AudioFacts::default();
+        facts.audio = Some(AudioFacts::default());
         facts.microphones = Some(Ok(Vec::new()));
         facts.atspi = Some(Err("org.a11y.Bus does not answer".to_string()));
         let lines = evaluate(&facts, None);
@@ -951,6 +990,30 @@ mod tests {
         let atspi = find(&lines, "Accessibility bus (AT-SPI)");
         assert_eq!(atspi.verdict, Verdict::Limited);
         assert!(atspi.fix.as_deref().unwrap().contains("at-spi2-core"));
+    }
+
+    #[test]
+    fn a_sound_server_that_never_answers_is_named() {
+        let mut facts = healthy_kde();
+        facts.audio = None;
+        let audio = find(&evaluate(&facts, None), "Sound server").clone();
+        assert_eq!(audio.verdict, Verdict::Missing);
+        assert!(audio.summary.contains("did not answer within 3 s"));
+    }
+
+    #[test]
+    fn the_pipewire_socket_name_resolves_in_its_runtime_dir() {
+        let xdg = std::path::Path::new("/run/user/1000");
+        assert_eq!(pipewire_socket(None, None, Some(xdg)), Some(xdg.join("pipewire-0")));
+        assert_eq!(
+            pipewire_socket(Some("pipewire-1"), Some("/tmp/pw"), Some(xdg)),
+            Some("/tmp/pw/pipewire-1".into())
+        );
+        assert_eq!(
+            pipewire_socket(Some("/srv/pw.sock"), None, Some(xdg)),
+            Some("/srv/pw.sock".into())
+        );
+        assert_eq!(pipewire_socket(None, None, None), None);
     }
 
     #[test]
@@ -970,7 +1033,7 @@ mod tests {
     #[test]
     fn the_report_lists_every_line_with_its_fix() {
         let mut facts = healthy_kde();
-        facts.audio = AudioFacts::default();
+        facts.audio = Some(AudioFacts::default());
         let text = report(&evaluate(&facts, None));
         assert_eq!(text.lines().filter(|line| line.starts_with('[')).count(), 7);
         assert!(text.contains("[missing] Sound server: Neither PipeWire nor PulseAudio answers."));

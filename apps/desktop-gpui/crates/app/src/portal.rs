@@ -264,6 +264,8 @@ pub(crate) struct PortalShortcuts {
     commands: Option<tokio::sync::mpsc::UnboundedSender<Command>>,
     signals: mpsc::Receiver<PortalSignal>,
     keys: PortalKeys,
+    /// Machine inputs received but not yet taken, oldest first.
+    pending: std::collections::VecDeque<GlobalEvent>,
     status: PortalStatus,
     status_changed: bool,
 }
@@ -301,6 +303,7 @@ impl PortalShortcuts {
             commands: Some(commands),
             signals,
             keys: PortalKeys::default(),
+            pending: Default::default(),
             status: PortalStatus::Starting,
             status_changed: false,
         };
@@ -322,6 +325,7 @@ impl PortalShortcuts {
             commands: None,
             signals,
             keys: PortalKeys::default(),
+            pending: Default::default(),
             status: PortalStatus::Unavailable("not a Linux desktop".to_string()),
             status_changed: false,
         }
@@ -363,22 +367,26 @@ impl PortalShortcuts {
         }
     }
 
-    /// The next machine input from the portal, oldest first. Status
-    /// changes in between are folded in (see [`Self::take_status_changed`]).
-    pub(crate) fn next_event(&mut self) -> Option<GlobalEvent> {
+    /// Take in everything the worker sent: status changes apply now (so
+    /// [`Self::is_bound`] is current before other sources' events are
+    /// judged), machine inputs queue for [`Self::next_event`].
+    pub(crate) fn poll(&mut self) {
         while let Ok(signal) = self.signals.try_recv() {
             if let PortalSignal::Status(status) = signal {
                 if status != self.status {
                     self.status = status;
                     self.status_changed = true;
                 }
-                continue;
-            }
-            if let Some(event) = self.keys.map(&signal) {
-                return Some(event);
+            } else if let Some(event) = self.keys.map(&signal) {
+                self.pending.push_back(event);
             }
         }
-        None
+    }
+
+    /// The next machine input from the portal, oldest first.
+    pub(crate) fn next_event(&mut self) -> Option<GlobalEvent> {
+        self.poll();
+        self.pending.pop_front()
     }
 
     /// Whether the status changed since the last call (the UI repaints).
@@ -393,10 +401,11 @@ impl PortalShortcuts {
 #[cfg(target_os = "linux")]
 mod dbus {
     use std::collections::HashMap;
-    use std::sync::mpsc;
+    use std::sync::{mpsc, Arc, Mutex};
     use std::time::{Duration, Instant};
 
     use futures_util::StreamExt;
+    use tokio::sync::watch;
     use serde::Deserialize;
     use tokio::sync::mpsc::UnboundedReceiver;
     use zbus::proxy::{CacheProperties, OwnerChangedStream, SignalStream};
@@ -545,11 +554,163 @@ mod dbus {
             .unwrap_or_else(|_| Err("the desktop portal did not answer".to_string()))
     }
 
-    /// The next message of an optional stream; never ready without one.
-    async fn next_or_pending(stream: &mut Option<SignalStream<'static>>) -> Option<zbus::Message> {
-        match stream.as_mut() {
-            Some(stream) => stream.next().await,
-            None => std::future::pending().await,
+    /// What the command side and the signal forwarder share: the live
+    /// session and whether this app's shortcut is bound in it.
+    #[derive(Default)]
+    struct Live {
+        session: Option<OwnedObjectPath>,
+        bound: bool,
+        configurable: bool,
+    }
+
+    type Shared = Arc<Mutex<Live>>;
+
+    fn lock(live: &Shared) -> std::sync::MutexGuard<'_, Live> {
+        live.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// What the forwarder tells the command loop.
+    enum Lifecycle {
+        /// The portal left the bus; its sessions went with it.
+        PortalGone,
+        /// A (new) portal owns the name again: start over, registering
+        /// the app id with it first.
+        PortalBack,
+        /// The bus connection ended.
+        BusLost,
+    }
+
+    /// The live session ended: release a held shortcut and say why.
+    fn session_ended(live: &Shared, out: &mpsc::Sender<PortalSignal>, reason: &str) {
+        let _ = out.send(PortalSignal::SessionEnded(Instant::now()));
+        let (was_bound, configurable) = {
+            let mut live = lock(live);
+            live.session = None;
+            (std::mem::take(&mut live.bound), live.configurable)
+        };
+        let status = if was_bound {
+            PortalStatus::Lost {
+                reason: reason.to_string(),
+                configurable: false,
+            }
+        } else {
+            PortalStatus::NeedsSetup { configurable }
+        };
+        let _ = out.send(PortalSignal::Status(status));
+    }
+
+    /// One portal signal, in wire order.
+    fn handle_signal(message: &zbus::Message, live: &Shared, out: &mpsc::Sender<PortalSignal>) {
+        let header = message.header();
+        let (Some(interface), Some(member), Some(path)) =
+            (header.interface(), header.member(), header.path())
+        else {
+            return;
+        };
+        match (interface.as_str(), member.as_str()) {
+            (INTERFACE, edge @ ("Activated" | "Deactivated")) => {
+                let Ok((session, id, _timestamp, _options)) = message
+                    .body()
+                    .deserialize::<(OwnedObjectPath, String, u64, HashMap<String, OwnedValue>)>()
+                else {
+                    return;
+                };
+                let ours = {
+                    let live = lock(live);
+                    live.bound && id == SHORTCUT_ID && live.session.as_ref() == Some(&session)
+                };
+                if ours {
+                    let now = Instant::now();
+                    let _ = out.send(if edge == "Activated" {
+                        PortalSignal::Activated(now)
+                    } else {
+                        PortalSignal::Deactivated(now)
+                    });
+                }
+            }
+            (INTERFACE, "ShortcutsChanged") => {
+                let Ok((session, entries)) = message
+                    .body()
+                    .deserialize::<(OwnedObjectPath, Vec<ShortcutEntry>)>()
+                else {
+                    return;
+                };
+                let configurable = {
+                    let live = lock(live);
+                    if live.session.as_ref() != Some(&session) || !live.bound {
+                        return;
+                    }
+                    live.configurable
+                };
+                match find_ours(&entries) {
+                    Some(trigger) => {
+                        let _ = out.send(PortalSignal::Status(PortalStatus::Bound {
+                            trigger,
+                            configurable,
+                        }));
+                    }
+                    None => {
+                        // The user removed it in the desktop's settings.
+                        let _ = out.send(PortalSignal::SessionEnded(Instant::now()));
+                        lock(live).bound = false;
+                        let _ = out.send(PortalSignal::Status(PortalStatus::Lost {
+                            reason: "the shortcut was removed in the desktop's settings"
+                                .to_string(),
+                            configurable,
+                        }));
+                    }
+                }
+            }
+            (SESSION_INTERFACE, "Closed") => {
+                let live_session = lock(live).session.clone();
+                if live_session.as_ref().map(|session| session.as_str()) == Some(path.as_str()) {
+                    session_ended(live, out, "the desktop closed Starling's shortcut session");
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The forwarder: every signal from the portal, in the order the bus
+    /// delivered them (one stream, so a release can never overtake its
+    /// press), handled at once — never queued behind a command or an
+    /// open dialog, so edge timestamps stay honest.
+    async fn forward(
+        mut signals: zbus::MessageStream,
+        mut owner: OwnerChangedStream<'static>,
+        live: Shared,
+        out: mpsc::Sender<PortalSignal>,
+        lifecycle: tokio::sync::mpsc::UnboundedSender<Lifecycle>,
+        gone: watch::Sender<u64>,
+    ) {
+        let bus_lost = |live: &Shared| {
+            session_ended(live, &out, "the session bus connection ended");
+            let _ = out.send(PortalSignal::Status(PortalStatus::Unavailable(
+                "the session bus connection ended".to_string(),
+            )));
+            gone.send_modify(|epoch| *epoch += 1);
+            let _ = lifecycle.send(Lifecycle::BusLost);
+        };
+        loop {
+            tokio::select! {
+                message = signals.next() => match message {
+                    Some(Ok(message)) => handle_signal(&message, &live, &out),
+                    Some(Err(_)) => {}
+                    None => return bus_lost(&live),
+                },
+                change = owner.next() => match change {
+                    Some(None) => {
+                        session_ended(&live, &out, "the desktop portal stopped");
+                        gone.send_modify(|epoch| *epoch += 1);
+                        let _ = lifecycle.send(Lifecycle::PortalGone);
+                    }
+                    Some(Some(_)) => {
+                        let _ = lifecycle.send(Lifecycle::PortalBack);
+                        return;
+                    }
+                    None => return bus_lost(&live),
+                },
+            }
         }
     }
 
@@ -558,30 +719,24 @@ mod dbus {
         portal: Proxy<'static>,
         out: mpsc::Sender<PortalSignal>,
         version: u32,
-        /// The live session, and whether a bind was attempted on it (the
-        /// portal allows one per session).
-        session: Option<OwnedObjectPath>,
+        live: Shared,
+        /// Whether a bind was attempted on the live session (the portal
+        /// allows one per session).
         bind_attempted: bool,
-        /// Whether the shortcut is bound in the live session.
-        bound: bool,
-        /// The desktop's description of the bound keys.
-        trigger_description: Option<String>,
         /// The configured shortcut, offered as `preferred_trigger`.
         preferred: Option<String>,
         tokens: u64,
-        /// The portal's signals, subscribed before the first call that
-        /// could make them fire, so no early edge is lost; `serve` takes
-        /// them over.
-        streams: Option<Streams>,
-        /// The live session's `Closed`, subscribed before CreateSession.
-        closed: Option<SignalStream<'static>>,
+        /// Bumped by the forwarder when the portal or the bus goes away:
+        /// interrupts a request waiting for a response that cannot come.
+        gone: watch::Receiver<u64>,
+        lifecycle: tokio::sync::mpsc::UnboundedReceiver<Lifecycle>,
+        forwarder: tokio::task::JoinHandle<()>,
     }
 
-    struct Streams {
-        activated: SignalStream<'static>,
-        deactivated: SignalStream<'static>,
-        changed: SignalStream<'static>,
-        owner: OwnerChangedStream<'static>,
+    impl Drop for Worker {
+        fn drop(&mut self) {
+            self.forwarder.abort();
+        }
     }
 
     /// Why a worker could not open a session.
@@ -589,6 +744,14 @@ mod dbus {
         /// The portal needs an app id it can resolve to a desktop entry.
         NeedsDesktopEntry,
         Failed(String),
+    }
+
+    /// How the steady state ended.
+    enum Exit {
+        /// The UI dropped its handle, or the bus is gone.
+        Done,
+        /// The portal restarted: start over on a fresh connection.
+        Restart,
     }
 
     pub(super) async fn run(
@@ -617,15 +780,24 @@ mod dbus {
             .await;
             match opened {
                 Ok(mut worker) => {
-                    worker.serve(&mut commands).await;
+                    let exit = worker.serve(&mut commands).await;
                     worker.close_session().await;
-                    return;
+                    match exit {
+                        Exit::Done => return,
+                        Exit::Restart => {
+                            // A new portal instance knows nothing of this
+                            // connection: register again on a fresh one. A
+                            // binding it remembers is re-bound by `open`.
+                            preferred = worker.preferred.clone();
+                            bind_now = false;
+                        }
+                    }
                 }
                 Err(OpenError::Failed(reason)) => return status(PortalStatus::Unavailable(reason)),
                 Err(OpenError::NeedsDesktopEntry) => {
                     status(PortalStatus::NeedsDesktopEntry);
-                    // Wait for the user's set-up; keep the preferred keys
-                    // current meanwhile.
+                    // Wait for the user's set-up; it carries the current
+                    // keys.
                     loop {
                         match commands.recv().await {
                             None => return,
@@ -633,7 +805,6 @@ mod dbus {
                                 preferred = trigger;
                                 break;
                             }
-                            // The set-up carries the current keys.
                             Some(Command::Rebind { .. } | Command::Configure) => {}
                         }
                     }
@@ -677,19 +848,6 @@ mod dbus {
             })
             .await
             .map_err(OpenError::Failed)?;
-            let streams = bounded(async {
-                let subscribed = async {
-                    Ok::<_, zbus::Error>(Streams {
-                        activated: portal.receive_signal("Activated").await?,
-                        deactivated: portal.receive_signal("Deactivated").await?,
-                        changed: portal.receive_signal("ShortcutsChanged").await?,
-                        owner: portal.receive_owner_changed().await?,
-                    })
-                };
-                subscribed.await.map_err(|err| err.to_string())
-            })
-            .await
-            .map_err(OpenError::Failed)?;
             // Host apps have no app id the portal can see; without one it
             // refuses shortcut sessions. Registering must be this
             // connection's first portal call (the portal fixes a sender's
@@ -711,9 +869,6 @@ mod dbus {
                     .map_err(|err| err.to_string())
             })
             .await;
-            if let Err(reason) = &registered {
-                eprintln!("The portal registry did not take Starling's app id ({reason}).");
-            }
             let version = bounded(async {
                 portal
                     .get_property::<u32>("version")
@@ -722,19 +877,58 @@ mod dbus {
             })
             .await
             .map_err(OpenError::Failed)?;
+            if let Err(reason) = &registered {
+                eprintln!("The portal registry did not take Starling's app id ({reason}).");
+            }
+            // Every signal from this portal instance, on one ordered
+            // stream, subscribed before the first call that can make one
+            // fire. Matched on the instance's unique name: a restarted
+            // portal is a new instance and a fresh start.
+            let subscribed = bounded(async {
+                let subscribing = async {
+                    let bus = zbus::fdo::DBusProxy::new(&connection).await?;
+                    let owner = bus
+                        .get_name_owner(zbus::names::BusName::try_from(DESTINATION)?)
+                        .await?;
+                    let rule = zbus::MatchRule::builder()
+                        .msg_type(zbus::message::Type::Signal)
+                        .sender(owner)?
+                        .build();
+                    let signals = zbus::MessageStream::for_match_rule(rule, &connection, None).await?;
+                    let owner = portal.receive_owner_changed().await?;
+                    Ok::<_, zbus::Error>((signals, owner))
+                };
+                subscribing.await.map_err(|err| describe_error(&err))
+            })
+            .await
+            .map_err(OpenError::Failed)?;
+            let (signals, owner) = subscribed;
+            let live: Shared = Arc::new(Mutex::new(Live {
+                configurable: version >= 2,
+                ..Default::default()
+            }));
+            let (gone_tx, gone) = watch::channel(0);
+            let (lifecycle_tx, lifecycle) = tokio::sync::mpsc::unbounded_channel();
+            let forwarder = tokio::spawn(forward(
+                signals,
+                owner,
+                live.clone(),
+                out.clone(),
+                lifecycle_tx,
+                gone_tx,
+            ));
             let mut worker = Worker {
                 connection,
                 portal,
                 out,
                 version,
-                session: None,
+                live,
                 bind_attempted: false,
-                bound: false,
-                trigger_description: None,
                 preferred,
                 tokens: 0,
-                streams: Some(streams),
-                closed: None,
+                gone,
+                lifecycle,
+                forwarder,
             };
             if let Err(reason) = worker.create_session().await {
                 // No app id: the registry (xdg-desktop-portal 1.19+) only
@@ -778,6 +972,10 @@ mod dbus {
             let _ = self.out.send(PortalSignal::Status(status));
         }
 
+        fn session(&self) -> Option<OwnedObjectPath> {
+            lock(&self.live).session.clone()
+        }
+
         fn token(&mut self) -> String {
             self.tokens += 1;
             format!("starling{}_{}", std::process::id(), self.tokens)
@@ -797,7 +995,8 @@ mod dbus {
 
         /// Call a request-style method and wait for its `Response`. The
         /// subscription is made before the call, so a fast response is
-        /// never missed. `dialog` requests wait as long as the user takes.
+        /// never missed. `dialog` requests wait as long as the user takes
+        /// — unless the portal or the bus goes away meanwhile.
         async fn request<B>(
             &mut self,
             method: &str,
@@ -808,6 +1007,8 @@ mod dbus {
         where
             B: serde::Serialize + zbus::zvariant::DynamicType,
         {
+            let mut gone = self.gone.clone();
+            gone.borrow_and_update();
             let path = self.handle_path("request", token)?;
             let mut responses = bounded(self.subscribe_response(&path)).await?;
             let handle: OwnedObjectPath = bounded(async {
@@ -829,10 +1030,16 @@ mod dbus {
                     .await
                     .ok_or_else(|| "the portal connection closed".to_string())
             };
-            if dialog {
-                response.await
-            } else {
-                bounded(response).await
+            let response = async {
+                if dialog {
+                    response.await
+                } else {
+                    bounded(response).await
+                }
+            };
+            tokio::select! {
+                response = response => response,
+                _ = gone.changed() => Err("the desktop portal stopped".to_string()),
             }
         }
 
@@ -859,40 +1066,56 @@ mod dbus {
                 ("handle_token", Value::from(handle_token.as_str())),
                 ("session_handle_token", Value::from(session_token.as_str())),
             ]);
-            // `Closed` is subscribed on the handle the session will get, so
-            // a session closed right after it opened is still seen.
-            let predicted = self.handle_path("session", &session_token)?;
-            self.closed = self.subscribe_closed(&predicted).await;
-            let message = self
-                .request("CreateSession", &handle_token, &(options,), false)
-                .await?;
-            let (code, results) = response_body::<HashMap<String, OwnedValue>>(&message)?;
-            if code != RESPONSE_SUCCESS {
-                return Err(format!("the desktop refused a shortcut session (response {code})"));
+            // The forwarder knows the session's handle before it exists,
+            // so a `Closed` right after creation is not missed.
+            let predicted = OwnedObjectPath::try_from(self.handle_path("session", &session_token)?)
+                .map_err(|err| err.to_string())?;
+            {
+                let mut live = lock(&self.live);
+                live.session = Some(predicted.clone());
+                live.bound = false;
             }
-            let handle = session_handle_of(&results)
-                .ok_or("the portal returned no session handle")?;
-            let path = OwnedObjectPath::try_from(handle)
-                .map_err(|err| format!("the portal returned a bad session handle ({err})"))?;
-            if path.as_str() != predicted {
-                // An old portal ignoring `session_handle_token`.
-                self.closed = self.subscribe_closed(path.as_str()).await;
-            }
-            self.session = Some(path);
             self.bind_attempted = false;
-            self.bound = false;
-            self.trigger_description = None;
-            Ok(())
+            let created = async {
+                let message = self
+                    .request("CreateSession", &handle_token, &(options,), false)
+                    .await?;
+                let (code, results) = response_body::<HashMap<String, OwnedValue>>(&message)?;
+                if code != RESPONSE_SUCCESS {
+                    return Err(format!(
+                        "the desktop refused a shortcut session (response {code})"
+                    ));
+                }
+                let handle = session_handle_of(&results)
+                    .ok_or("the portal returned no session handle")?;
+                OwnedObjectPath::try_from(handle)
+                    .map_err(|err| format!("the portal returned a bad session handle ({err})"))
+            };
+            match created.await {
+                Ok(path) => {
+                    // An old portal may ignore `session_handle_token`.
+                    lock(&self.live).session = Some(path);
+                    Ok(())
+                }
+                Err(reason) => {
+                    lock(&self.live).session = None;
+                    Err(reason)
+                }
+            }
         }
 
         /// Close the live session (a rebind, or the app going away). A
         /// shortcut held down through it is released.
         async fn close_session(&mut self) {
-            let Some(session) = self.session.take() else {
+            let session = {
+                let mut live = lock(&self.live);
+                live.bound = false;
+                live.session.take()
+            };
+            let Some(session) = session else {
                 return;
             };
             let _ = self.out.send(PortalSignal::SessionEnded(Instant::now()));
-            self.bound = false;
             let _ = tokio::time::timeout(
                 CALL_TIMEOUT,
                 self.connection.call_method(
@@ -907,7 +1130,7 @@ mod dbus {
         }
 
         async fn list(&mut self) -> Result<Vec<ShortcutEntry>, String> {
-            let session = self.session.clone().ok_or("no session")?;
+            let session = self.session().ok_or("no session")?;
             let token = self.token();
             let options: HashMap<&str, Value> =
                 HashMap::from([("handle_token", Value::from(token.as_str()))]);
@@ -923,7 +1146,7 @@ mod dbus {
         /// Bind the shortcut in the live session, opening a fresh session
         /// first when this one already had its one bind.
         async fn bind(&mut self) {
-            if self.session.is_none() || self.bind_attempted {
+            if self.session().is_none() || self.bind_attempted {
                 self.close_session().await;
                 if let Err(reason) = self.create_session().await {
                     self.status(PortalStatus::Lost {
@@ -933,7 +1156,7 @@ mod dbus {
                     return;
                 }
             }
-            let Some(session) = self.session.clone() else {
+            let Some(session) = self.session() else {
                 return;
             };
             self.bind_attempted = true;
@@ -949,15 +1172,20 @@ mod dbus {
                 HashMap::from([("handle_token", Value::from(token.as_str()))]);
             let configurable = self.configurable();
             let outcome = self
-                .request("BindShortcuts", &token, &(session, shortcuts, "", options), true)
+                .request("BindShortcuts", &token, &(session.clone(), shortcuts, "", options), true)
                 .await
                 .and_then(|message| response_body::<ShortcutResults>(&message));
             let status = match outcome {
                 Ok((RESPONSE_SUCCESS, results)) => {
                     match find_ours(results.shortcuts.as_deref().unwrap_or_default()) {
                         Some(trigger) => {
-                            self.bound = true;
-                            self.trigger_description = trigger.clone();
+                            let mut live = lock(&self.live);
+                            // Still the same session: the desktop may have
+                            // closed it while the dialog was open.
+                            if live.session.as_ref() != Some(&session) {
+                                return;
+                            }
+                            live.bound = true;
                             PortalStatus::Bound {
                                 trigger,
                                 configurable,
@@ -980,7 +1208,7 @@ mod dbus {
         }
 
         async fn configure(&mut self) {
-            let Some(session) = self.session.clone() else {
+            let Some(session) = self.session() else {
                 return;
             };
             if !self.configurable() {
@@ -1000,90 +1228,23 @@ mod dbus {
             }
         }
 
-        /// The steady state: portal signals and UI commands, in order,
-        /// until the UI drops its handle or the bus goes away.
-        async fn serve(&mut self, commands: &mut UnboundedReceiver<Command>) {
-            let Some(Streams {
-                mut activated,
-                mut deactivated,
-                mut changed,
-                mut owner,
-            }) = self.streams.take()
-            else {
-                return;
-            };
-            let mut closed = self.closed.take();
+        /// The steady state: UI commands, and what the forwarder reports
+        /// about the portal's lifetime. Signals never wait here: the
+        /// forwarder handles them as they arrive.
+        async fn serve(&mut self, commands: &mut UnboundedReceiver<Command>) -> Exit {
             loop {
                 tokio::select! {
-                    command = commands.recv() => {
-                        let Some(command) = command else { return };
-                        let session = self.session.clone();
-                        self.command(command).await;
-                        if self.session != session {
-                            closed = self.closed.take();
-                        }
-                    }
-                    Some(message) = activated.next() => {
-                        if self.ours(&message) {
-                            let _ = self.out.send(PortalSignal::Activated(Instant::now()));
-                        }
-                    }
-                    Some(message) = deactivated.next() => {
-                        if self.ours(&message) {
-                            let _ = self.out.send(PortalSignal::Deactivated(Instant::now()));
-                        }
-                    }
-                    Some(message) = changed.next() => self.shortcuts_changed(&message),
-                    Some(_) = next_or_pending(&mut closed) => {
-                        // The desktop closed the session.
-                        closed = None;
-                        self.session = None;
-                        self.ended("the desktop closed Starling's shortcut session");
-                    }
-                    Some(owner) = owner.next() => {
-                        if owner.is_none() {
-                            // The portal went away; its sessions with it.
-                            closed = None;
-                            self.session = None;
-                            self.ended("the desktop portal stopped");
-                        }
-                    }
-                    else => return,
+                    command = commands.recv() => match command {
+                        Some(command) => self.command(command).await,
+                        None => return Exit::Done,
+                    },
+                    event = self.lifecycle.recv() => match event {
+                        // The forwarder already released and reported.
+                        Some(Lifecycle::PortalGone) => {}
+                        Some(Lifecycle::PortalBack) => return Exit::Restart,
+                        Some(Lifecycle::BusLost) | None => return Exit::Done,
+                    },
                 }
-            }
-        }
-
-        async fn subscribe_closed(&self, session: &str) -> Option<SignalStream<'static>> {
-            let subscribing = async {
-                let proxy = zbus::proxy::Builder::<Proxy<'static>>::new(&self.connection)
-                    .destination(DESTINATION)?
-                    .path(session.to_string())?
-                    .interface(SESSION_INTERFACE)?
-                    .cache_properties(CacheProperties::No)
-                    .build()
-                    .await?;
-                proxy.receive_signal("Closed").await
-            };
-            match tokio::time::timeout(CALL_TIMEOUT, subscribing).await {
-                Ok(Ok(stream)) => Some(stream),
-                _ => None,
-            }
-        }
-
-        /// The session is gone: release a held shortcut and say why.
-        fn ended(&mut self, reason: &str) {
-            let _ = self.out.send(PortalSignal::SessionEnded(Instant::now()));
-            let was_bound = std::mem::take(&mut self.bound);
-            self.bind_attempted = false;
-            if was_bound {
-                self.status(PortalStatus::Lost {
-                    reason: reason.to_string(),
-                    configurable: false,
-                });
-            } else {
-                self.status(PortalStatus::NeedsSetup {
-                    configurable: false,
-                });
             }
         }
 
@@ -1098,54 +1259,11 @@ mod dbus {
                     self.preferred = trigger;
                     // Without a binding there is nothing to move: the next
                     // set-up offers the new keys.
-                    if changed && self.bound {
+                    if changed && lock(&self.live).bound {
                         self.bind().await;
                     }
                 }
                 Command::Configure => self.configure().await,
-            }
-        }
-
-        /// Whether an `Activated`/`Deactivated` is this app's shortcut in
-        /// the live, bound session.
-        fn ours(&self, message: &zbus::Message) -> bool {
-            let Ok((session, id, _timestamp, _options)) = message
-                .body()
-                .deserialize::<(OwnedObjectPath, String, u64, HashMap<String, OwnedValue>)>()
-            else {
-                return false;
-            };
-            self.bound && id == SHORTCUT_ID && Some(&session) == self.session.as_ref()
-        }
-
-        fn shortcuts_changed(&mut self, message: &zbus::Message) {
-            let Ok((session, entries)) = message
-                .body()
-                .deserialize::<(OwnedObjectPath, Vec<ShortcutEntry>)>()
-            else {
-                return;
-            };
-            if Some(&session) != self.session.as_ref() || !self.bound {
-                return;
-            }
-            let configurable = self.configurable();
-            match find_ours(&entries) {
-                Some(trigger) => {
-                    self.trigger_description = trigger.clone();
-                    self.status(PortalStatus::Bound {
-                        trigger,
-                        configurable,
-                    });
-                }
-                None => {
-                    // The user removed it in the desktop's settings.
-                    let _ = self.out.send(PortalSignal::SessionEnded(Instant::now()));
-                    self.bound = false;
-                    self.status(PortalStatus::Lost {
-                        reason: "the shortcut was removed in the desktop's settings".to_string(),
-                        configurable,
-                    });
-                }
             }
         }
     }

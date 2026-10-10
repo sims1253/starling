@@ -394,6 +394,31 @@ pub(crate) enum GlobalEvent {
     Escape(Instant),
 }
 
+/// One physical press from one source: which of the X11 grab's events go
+/// to the machine once the desktop portal may own the shortcut. While the
+/// portal holds a binding, the grab's presses are dropped — but a press
+/// the machine already took from the grab keeps its release, or a hold
+/// that started before the portal bound would never end.
+#[derive(Debug, Default)]
+pub(crate) struct SourceGate {
+    /// The grab's press the machine took, until its release.
+    held: bool,
+}
+
+impl SourceGate {
+    pub(crate) fn admit(&mut self, event: GlobalEvent, portal_bound: bool) -> bool {
+        match event {
+            GlobalEvent::Escape(_) => true,
+            GlobalEvent::Pressed(_) if portal_bound => false,
+            GlobalEvent::Pressed(_) => {
+                self.held = true;
+                true
+            }
+            GlobalEvent::Released(_) => std::mem::take(&mut self.held) || !portal_bound,
+        }
+    }
+}
+
 /// One event as the hotkey thread received it.
 pub(crate) type RawEvent = (u32, HotKeyState, Instant);
 
@@ -598,6 +623,8 @@ pub(crate) struct GlobalShortcuts {
     escape_live: Vec<HotKey>,
     /// Which arming the in-flight reports belong to.
     escape_generation: u64,
+    /// Hands the record shortcut over to the desktop portal (`activation.rs`).
+    pub(crate) gate: SourceGate,
 }
 
 impl GlobalShortcuts {
@@ -664,6 +691,7 @@ impl GlobalShortcuts {
             escape: Vec::new(),
             escape_live: Vec::new(),
             escape_generation: 0,
+            gate: SourceGate::default(),
         })
     }
 
@@ -1054,6 +1082,24 @@ mod tests {
         assert_eq!(trigger("Ctrl+Numpad1").as_deref(), Some("CTRL+KP_1"));
         assert_eq!(trigger("Pause").as_deref(), Some("Pause"));
         assert_eq!(trigger("Ctrl+PageDown").as_deref(), Some("CTRL+Page_Down"));
+    }
+
+    #[test]
+    fn the_x11_grab_hands_over_to_the_portal_without_losing_a_release() {
+        let at = Instant::now();
+        let mut gate = SourceGate::default();
+        // Unbound: everything passes.
+        assert!(gate.admit(GlobalEvent::Pressed(at), false));
+        // The portal bound while the grab's press is held: its release
+        // still reaches the machine, so the hold ends.
+        assert!(gate.admit(GlobalEvent::Released(at), true));
+        // Bound: the grab's presses (and their releases) are dropped,
+        // Escape is not.
+        assert!(!gate.admit(GlobalEvent::Pressed(at), true));
+        assert!(!gate.admit(GlobalEvent::Released(at), true));
+        assert!(gate.admit(GlobalEvent::Escape(at), true));
+        // A release seen without the portal is the machine's to judge.
+        assert!(gate.admit(GlobalEvent::Released(at), false));
     }
 
     #[test]

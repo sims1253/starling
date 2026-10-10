@@ -663,12 +663,14 @@ impl StarlingApp {
     pub(crate) fn flush_system_events(&mut self, cx: &mut Context<Self>) {
         // One physical press from one source: while the desktop's portal
         // holds a binding it is the system-wide shortcut, and the X11
-        // grab's presses (an XWayland app focused) are dropped. Its Escape
-        // grabs still cancel.
-        let portal_bound = self
-            .portal_shortcuts
-            .as_ref()
-            .is_some_and(|portal| portal.is_bound());
+        // grab's presses (an XWayland app focused) are dropped — a press
+        // taken before the portal bound keeps its release (`SourceGate`).
+        // Its Escape grabs still cancel. The portal's status is taken in
+        // first, so the handover is judged on its current state.
+        let portal_bound = self.portal_shortcuts.as_mut().is_some_and(|portal| {
+            portal.poll();
+            portal.is_bound()
+        });
         while let Some(shortcuts) = self.global_shortcuts.as_mut() {
             let Some(raw) = shortcuts.next_raw() else {
                 break;
@@ -676,9 +678,13 @@ impl StarlingApp {
             let Some(event) = shortcuts.classify(raw) else {
                 continue;
             };
-            if !self.system_event_is_ours(event)
-                || (portal_bound && !matches!(event, GlobalEvent::Escape(_)))
-            {
+            if !self.system_event_is_ours(event) {
+                continue;
+            }
+            let Some(shortcuts) = self.global_shortcuts.as_mut() else {
+                break;
+            };
+            if !shortcuts.gate.admit(event, portal_bound) {
                 continue;
             }
             self.system_event(event, cx);
