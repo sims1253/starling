@@ -2425,6 +2425,14 @@ impl StoreV2 {
         Ok(report)
     }
 
+    /// [`Self::apply_retention_policy`] as of the current time.
+    pub fn apply_retention_policy_now(
+        &mut self,
+        policy: &RetentionPolicy,
+    ) -> Result<RetentionReport, StoreV2Error> {
+        self.apply_retention_policy(policy, time::OffsetDateTime::now_utc())
+    }
+
     /// Why a due take keeps its audio, if it does.
     fn retention_hold(
         &self,

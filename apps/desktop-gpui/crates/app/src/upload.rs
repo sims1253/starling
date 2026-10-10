@@ -8,6 +8,7 @@ use gpui::{AppContext, AsyncApp, Context, PathPromptOptions, WeakEntity};
 use starling_dictation::{
     audio,
     client::{ClientError, StarlingClient},
+    disk::{self, DiskLevel},
     engine::EngineLease,
     journal,
     recorder,
@@ -19,6 +20,10 @@ use crate::app::{HealthCheckPurpose, StarlingApp, UnsavedWav};
 use crate::live_stream::LiveStream;
 use crate::mic::Interruption;
 use crate::store::Store;
+
+/// The capture rate a pre-start disk estimate assumes (the device rate
+/// is only known once the microphone opened).
+const PREFERRED_RATE_FOR_ESTIMATES: u32 = 48_000;
 
 /// A take's endpoint/model binding (#363), resolved once at the moment
 /// the take starts and carried with it to the end of its transcription
@@ -577,9 +582,27 @@ impl StarlingApp {
             // per-take file; only fsynced-boundary samples are
             // acknowledged (see recorder::start_recording_with_journal).
             let journals_root = journal::default_journals_root();
+            // #342: no take starts on a disk too full to keep it; a low
+            // disk starts with a warning. A probe that cannot answer
+            // never blocks recording.
+            let disk_watch = disk::DiskWatch::system();
+            let disk_reading = disk_watch
+                .policy
+                .check(disk_watch.probe.as_ref(), &journals_root)
+                .ok();
+            if let Some(reading) = disk_reading.filter(|reading| reading.level == DiskLevel::Critical)
+            {
+                if let Some(lease) = playback_lease {
+                    self.playback.handle().end(lease);
+                }
+                self.error = disk_watch.policy.warning(reading, PREFERRED_RATE_FOR_ESTIMATES);
+                cx.notify();
+                return false;
+            }
             match recorder::start_capture(recorder::CaptureRequest {
                 journals_dir: Some(&journals_root),
                 preferred_device: self.microphone_settings.preferred_device.as_deref(),
+                disk_watch: Some(disk_watch.clone()),
             }) {
                 Ok(handle) => {
                     self.mic.problem = None;
@@ -623,11 +646,15 @@ impl StarlingApp {
                         }
                     }
                     self.active_take = Some(target);
+                    let handle_rate = handle.sample_rate();
                     self.recorder = Some(handle);
                     self.playback_lease = playback_lease;
                     self.elapsed_ms = 0.0;
                     self.levels = vec![0.06; 52];
-                    self.capture_warning = None;
+                    self.capture_warning = disk_reading.and_then(|reading| {
+                        disk_watch.policy.warning(reading, handle_rate)
+                    });
+                    self.mic.disk_warned = self.capture_warning.is_some();
                     cx.notify();
                     true
                 }

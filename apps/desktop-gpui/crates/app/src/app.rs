@@ -519,6 +519,8 @@ pub struct StarlingApp {
     pub(crate) draft_overlay_mode: OverlayMode,
     pub(crate) draft_cues: bool,
     pub(crate) draft_cue_volume: Entity<crate::slider::LevelSlider>,
+    /// History audio compression and retention (#342).
+    pub(crate) audio_upkeep: crate::upkeep::AudioUpkeep,
     pub playing_id: Option<String>,
     /// Identifies the current playback so poll-watchers can detect that they
     /// are stale (G04). Bumped whenever playback starts, stops, or is
@@ -1100,6 +1102,7 @@ impl StarlingApp {
             draft_overlay_mode: settings.feedback.overlay,
             draft_cues: settings.feedback.cues,
             draft_cue_volume,
+            audio_upkeep: crate::upkeep::AudioUpkeep::new(settings.storage),
             shortcut,
             pending_shortcut: None,
             window_focus: Vec::new(),
@@ -1181,6 +1184,8 @@ impl StarlingApp {
                 }
 
                 refresh_sessions(&this, &store, cx).await;
+                // #342: compression and retention after recovery settled.
+                this.update(cx, |app, cx| app.start_audio_upkeep(cx)).ok();
             })
             .detach();
         }
@@ -1319,6 +1324,7 @@ impl StarlingApp {
             microphone: self.microphone_settings.clone(),
             playback: self.playback_settings,
             feedback: self.feedback,
+            storage: self.audio_upkeep.settings,
         };
         settings.set_expected_terms_input(&self.expected_terms_input);
         settings
@@ -1713,6 +1719,7 @@ impl StarlingApp {
         self.draft_cue_volume.update(cx, |slider, cx| {
             slider.set_value(self.feedback.cue_volume_percent, cx);
         });
+        self.audio_upkeep.draft = self.audio_upkeep.settings;
         cx.notify();
     }
 
@@ -1938,6 +1945,7 @@ impl StarlingApp {
             cue_volume_percent: self.draft_cue_volume.read(cx).value(),
         };
         self.sync_overlay(cx);
+        self.commit_storage_draft(cx);
 
         // R11: an unresolvable config directory is surfaced, not swallowed —
         // settings must not silently land in the current working directory.

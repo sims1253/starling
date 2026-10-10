@@ -14,8 +14,9 @@ use starling_dictation::{
         self, DamagedRecord, ListedRecord, SessionStatus, SessionSummary, TranscriptionResult,
     },
     store_v2::{
-        self, AttemptRecord, CaptureRecord, CaptureStatus, ListedCapture, RecognitionOutcome,
-        RevisionRow, StoreV2, StoreV2Error,
+        self, AttemptRecord, AudioAtRest, CaptureRecord, CaptureStatus, CompressionOutcome,
+        HoldReason, ListedCapture, RecognitionOutcome, RetentionPolicy, RevisionRow, StoreV2,
+        StoreV2Error,
     },
 };
 
@@ -624,6 +625,45 @@ impl Store {
         store.correction_records_for(id).map_err(v2_err)
     }
 
+    /// History audio upkeep (#342): replace every settled journal with
+    /// its verified FLAC, then apply the retention policy (nothing while
+    /// it is off). The guard covers only the cheap steps — listing the
+    /// candidates, each publish, the policy run — never an encode, so a
+    /// long take's compression does not pin every other store call.
+    pub(crate) fn audio_upkeep(
+        &self,
+        policy: &RetentionPolicy,
+    ) -> Result<UpkeepReport, storage::StorageError> {
+        let mut report = UpkeepReport::default();
+        let jobs = lock_v2(&self.0)
+            .compression_candidates(usize::MAX)
+            .map_err(v2_err)?;
+        for job in jobs {
+            let prepared = match store_v2::prepare_compression(&job) {
+                Ok(prepared) => prepared,
+                Err(err) => {
+                    report.failures.push((job.id.clone(), err.to_string()));
+                    continue;
+                }
+            };
+            match lock_v2(&self.0).commit_compression(prepared) {
+                Ok(CompressionOutcome::Compressed {
+                    journal_bytes,
+                    flac_bytes,
+                }) => {
+                    report.compressed += 1;
+                    report.saved_bytes += journal_bytes.saturating_sub(flac_bytes);
+                }
+                Ok(CompressionOutcome::Skipped(_)) => {}
+                Err(err) => report.failures.push((job.id.clone(), err.to_string())),
+            }
+        }
+        report.retention = lock_v2(&self.0)
+            .apply_retention_policy_now(policy)
+            .map_err(v2_err)?;
+        Ok(report)
+    }
+
     /// The startup recovery pass: reconcile journals against the metadata
     /// rows (§4), then fail recognition attempts still marked started by a
     /// previous run. Returns a user-facing summary string, empty when
@@ -680,6 +720,81 @@ impl Store {
         let mut store = lock_v2(&self.0);
         let committed = finalized.commit_marked(&mut store, mark).map_err(v2_err)?;
         Ok(committed.record.id)
+    }
+}
+
+/// What one [`Store::audio_upkeep`] pass did.
+#[derive(Debug, Default)]
+pub(crate) struct UpkeepReport {
+    pub compressed: usize,
+    pub saved_bytes: u64,
+    /// `(id, reason)` for journals that could not be compressed; they
+    /// stay journals and are tried again next pass.
+    pub failures: Vec<(String, String)>,
+    pub retention: store_v2::RetentionReport,
+}
+
+impl UpkeepReport {
+    /// One line for the settings dialog; `None` when nothing happened.
+    pub(crate) fn summary(&self) -> Option<String> {
+        let mb = |bytes: u64| bytes.div_ceil(1024 * 1024);
+        let plural = |count: usize| if count == 1 { "" } else { "s" };
+        let mut parts = Vec::new();
+        if self.compressed > 0 {
+            parts.push(format!(
+                "compressed {} recording{} losslessly (saved {} MB)",
+                self.compressed,
+                plural(self.compressed),
+                mb(self.saved_bytes)
+            ));
+        }
+        let retired = self.retention.retired.len();
+        if retired > 0 {
+            parts.push(format!(
+                "removed the audio of {retired} recording{} ({} MB); transcripts are kept",
+                plural(retired),
+                mb(self.retention.retired_bytes)
+            ));
+        }
+        let count = |wanted: fn(&HoldReason) -> bool| {
+            self.retention
+                .held
+                .iter()
+                .filter(|held| wanted(&held.reason))
+                .count()
+        };
+        let referenced = count(|reason| matches!(reason, HoldReason::Referenced { .. }));
+        if referenced > 0 {
+            parts.push(format!(
+                "kept {referenced} due recording{} that documents or corrections use",
+                plural(referenced)
+            ));
+        }
+        let untranscribed = count(|reason| matches!(reason, HoldReason::Untranscribed));
+        if untranscribed > 0 {
+            parts.push(format!(
+                "kept {untranscribed} due recording{} that never got a transcript",
+                plural(untranscribed)
+            ));
+        }
+        for (class, bytes) in &self.retention.over_limit {
+            parts.push(format!(
+                "the {class} size limit is still exceeded by {} MB",
+                mb(*bytes)
+            ));
+        }
+        if !self.failures.is_empty() {
+            parts.push(format!(
+                "{} recording{} could not be compressed and stay as they are",
+                self.failures.len(),
+                plural(self.failures.len())
+            ));
+        }
+        (!parts.is_empty()).then(|| {
+            let mut text = parts.join("; ");
+            text[..1].make_ascii_uppercase();
+            format!("{text}.")
+        })
     }
 }
 
@@ -779,7 +894,14 @@ fn list_v2(store: &StoreV2) -> Result<Vec<ListedRecord>, storage::StorageError> 
                         .get(&listing.record.id)
                         .cloned()
                         .unwrap_or_default();
-                    ListedRecord::Session(v2_summary(&listing.record, &listing.problems, &attempts))
+                    let mut problems = listing.problems;
+                    if let AudioAtRest::Retired { utc } = &listing.audio {
+                        problems.push(format!(
+                            "Audio removed by your retention policy on {}; the transcript is kept.",
+                            utc.get(..10).unwrap_or(utc)
+                        ));
+                    }
+                    ListedRecord::Session(v2_summary(&listing.record, &problems, &attempts))
                 }
                 ListedCapture::Damaged(damaged) => {
                     ListedRecord::Damaged(DamagedRecord {
@@ -1616,6 +1738,67 @@ mod tests {
         let reloaded = store.audio_wav(&saved.id).expect("reload").expect("present");
         let reloaded = audio::decode_pcm16_wav(&reloaded).expect("decode");
         assert_eq!(reloaded.samples, decoded.samples);
+    }
+
+    #[test]
+    fn upkeep_compresses_and_a_retry_sends_the_same_request_wav() {
+        // #342 acceptance: a retried take from FLAC produces the same
+        // request audio as from the journal.
+        let store = v2_store("upkeep-flac");
+        let samples: Vec<f32> = (0..32_000)
+            .map(|i| ((i as f32 * 0.05).sin() * 0.3) + ((i % 7) as f32 * 0.001))
+            .collect();
+        let report = finalized_journal("upkeep-flac-src", &samples);
+        let saved = store
+            .save_capture(tiny_wav(32_000), Some(&report))
+            .expect("adopting save");
+        let before = store.audio_wav(&saved.id).expect("load").expect("present");
+        assert_eq!(*before, *saved.wav, "the first transcription's audio");
+
+        let upkeep = store
+            .audio_upkeep(&store_v2::RetentionPolicy::default())
+            .expect("upkeep");
+        assert_eq!(upkeep.compressed, 1);
+        assert!(upkeep.saved_bytes > 0);
+        assert!(upkeep.retention.retired.is_empty(), "retention is off");
+        assert!(upkeep.summary().expect("summary").starts_with("Compressed 1 recording"));
+        let after = store.audio_wav(&saved.id).expect("load").expect("present");
+        assert_eq!(*after, *before);
+        // A second pass finds nothing to do.
+        let again = store
+            .audio_upkeep(&store_v2::RetentionPolicy::default())
+            .expect("upkeep");
+        assert_eq!(again.compressed, 0);
+        assert!(again.summary().is_none());
+    }
+
+    #[test]
+    fn retired_audio_is_explained_and_the_transcript_stays() {
+        let store = v2_store("upkeep-retire");
+        let id = transcribed(&store, "keep this text");
+        let mut policy = store_v2::RetentionPolicy::default();
+        policy.grace = std::time::Duration::ZERO;
+        policy.limits.insert(
+            store_v2::STANDARD_CLASS.to_string(),
+            store_v2::ClassLimits {
+                max_age_days: Some(0),
+                max_total_bytes: None,
+            },
+        );
+        let upkeep = store.audio_upkeep(&policy).expect("upkeep");
+        assert_eq!(upkeep.retention.retired.len(), 1);
+        assert!(
+            upkeep.summary().expect("summary").contains("removed the audio of 1 recording"),
+            "{:?}",
+            upkeep.summary()
+        );
+        let summary = summary_of(&store, &id);
+        assert_eq!(summary.status, SessionStatus::Transcribed);
+        assert_eq!(transcript_text(&store, &id).as_deref(), Some("keep this text"));
+        let note = summary.last_error.expect("note");
+        assert!(note.contains("retention policy"), "{note}");
+        let err = store.audio_wav(&id).expect_err("no audio left");
+        assert!(err.to_string().contains("retention policy"), "{err}");
     }
 
     #[test]

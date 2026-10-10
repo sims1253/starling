@@ -225,8 +225,14 @@ mod tests {
     fn minutes_left_count_journal_bytes_above_the_stop_line() {
         let policy = DiskPolicy::default();
         let minute_16k = 16_000u64 * 4 * 60;
-        assert_eq!(policy.minutes_left(policy.stop_below + 10 * minute_16k, 16_000), 10);
-        assert_eq!(policy.minutes_left(policy.stop_below + 10 * minute_16k, 48_000), 3);
+        assert_eq!(
+            policy.minutes_left(policy.stop_below + 10 * minute_16k, 16_000),
+            10
+        );
+        assert_eq!(
+            policy.minutes_left(policy.stop_below + 10 * minute_16k, 48_000),
+            3
+        );
         assert_eq!(policy.minutes_left(policy.stop_below / 2, 16_000), 0);
         let text = policy
             .warning(policy.assess(policy.stop_below + 10 * minute_16k), 16_000)

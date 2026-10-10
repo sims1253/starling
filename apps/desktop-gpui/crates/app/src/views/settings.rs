@@ -40,6 +40,7 @@ pub fn render_settings_modal(
     let dictation_section = render_dictation_section(app, cx);
     let playback_section = render_playback_section(app, cx);
     let feedback_section = crate::views::feedback::render_feedback_section(app, cx);
+    let storage_section = crate::views::storage::render_storage_section(app, cx);
 
     let card = div()
         .id("settings-card")
@@ -172,6 +173,7 @@ pub fn render_settings_modal(
         .child(microphone_section)
         .child(playback_section)
         .child(feedback_section)
+        .child(storage_section)
         .child(processing_section)
         .child(
             div()

@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use gpui::{AppContext, Context, Window};
 use starling_dictation::client::StarlingClient;
+use starling_dictation::disk::DiskLevel;
 use starling_dictation::microphone::{
     self, InputDevice, InputProblem, InputRoute, SettingsPage, SignalLevel,
 };
@@ -243,6 +244,9 @@ pub(crate) struct MicState {
     /// When the live take's input last carried sound; `None` until it
     /// first does.
     pub(crate) last_sound_at: Option<Instant>,
+    /// The live take already showed its low-disk warning (#342), so a
+    /// dismissed warning is not raised again on every poll.
+    pub(crate) disk_warned: bool,
 }
 
 /// Candidate commands that open the OS sound (or microphone privacy)
@@ -400,6 +404,40 @@ impl StarlingApp {
         }
     }
 
+    /// The live take's free-space reading (#342): a low disk warns once;
+    /// a critical one stops the take the normal way — finalized, saved
+    /// and transcribed — while there is still room to do that, and says
+    /// why.
+    fn watch_take_disk(&mut self, take: crate::activation::TakeId, cx: &mut Context<Self>) {
+        let Some(handle) = self.recorder.as_ref() else {
+            return;
+        };
+        let Some(reading) = handle.disk_reading() else {
+            return;
+        };
+        let rate = handle.sample_rate();
+        let policy = starling_dictation::disk::DiskPolicy::default();
+        match reading.level {
+            DiskLevel::Ok => {}
+            DiskLevel::Low => {
+                if !self.mic.disk_warned {
+                    self.mic.disk_warned = true;
+                    self.capture_warning = policy.warning(reading, rate);
+                    cx.notify();
+                }
+            }
+            DiskLevel::Critical => {
+                self.activation_input(|machine| machine.storage_full(take), cx);
+                self.error = Some(format!(
+                    "Recording stopped because the disk is almost full ({} MB free). The \
+                     recording was saved; free up space before recording again.",
+                    reading.available / (1024 * 1024)
+                ));
+                cx.notify();
+            }
+        }
+    }
+
     /// Records why the running take lost its input, if it did; `true`
     /// when the take must end as interrupted.
     pub(crate) fn note_live_interruption(&mut self) -> bool {
@@ -494,6 +532,7 @@ impl StarlingApp {
         self.cue_take_starting();
         self.mic.check = Some(
             match recorder::start_capture(CaptureRequest {
+                disk_watch: None,
                 journals_dir: None,
                 preferred_device: self.draft_microphone.as_deref(),
             }) {
@@ -645,6 +684,8 @@ impl StarlingApp {
         if let Some(take) = self.recording_take {
             if self.note_live_interruption() {
                 self.activation_input(|machine| machine.input_lost(take), cx);
+            } else {
+                self.watch_take_disk(take, cx);
             }
         }
         let stop_check = match self.mic.check.as_ref() {

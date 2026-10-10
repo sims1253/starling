@@ -15,6 +15,7 @@ mod slider;
 mod staging;
 mod store;
 mod theme;
+mod upkeep;
 mod upload;
 mod views;
 

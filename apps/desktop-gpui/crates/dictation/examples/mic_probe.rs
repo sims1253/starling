@@ -30,6 +30,7 @@ fn main() {
         preferred.as_deref().unwrap_or("<follow system default>")
     );
     let handle = match start_capture(CaptureRequest {
+        disk_watch: None,
         journals_dir: None,
         preferred_device: preferred.as_deref(),
     }) {

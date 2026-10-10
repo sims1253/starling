@@ -35,7 +35,9 @@ pub enum FlacError {
     Encode(String),
     #[error("FLAC audio is unreadable: {0}")]
     Decode(String),
-    #[error("FLAC audio is not 16 kHz mono 16-bit (got {rate} Hz, {channels} channel(s), {bits} bits)")]
+    #[error(
+        "FLAC audio is not 16 kHz mono 16-bit (got {rate} Hz, {channels} channel(s), {bits} bits)"
+    )]
     Format { rate: u32, channels: u32, bits: u32 },
     #[error("FLAC audio failed verification: {0}")]
     Mismatch(String),
@@ -59,12 +61,8 @@ pub fn encode(samples: &[i16]) -> Result<Vec<u8>, FlacError> {
         .into_verified()
         .map_err(|(_, err)| FlacError::Encode(err.to_string()))?;
     let widened: Vec<i32> = samples.iter().map(|&sample| i32::from(sample)).collect();
-    let source = flacenc::source::MemSource::from_samples(
-        &widened,
-        1,
-        16,
-        STARLING_SAMPLE_RATE as usize,
-    );
+    let source =
+        flacenc::source::MemSource::from_samples(&widened, 1, 16, STARLING_SAMPLE_RATE as usize);
     let stream = flacenc::encode_with_fixed_block_size(&config, source, config.block_size)
         .map_err(|err| FlacError::Encode(err.to_string()))?;
     let mut sink = flacenc::bitsink::ByteSink::new();
@@ -138,8 +136,8 @@ mod tests {
     fn the_pcm16_inverse_is_exact_for_every_value() {
         // Exhaustive: the store's whole retry guarantee rests on this.
         for value in i16::MIN..=i16::MAX {
-            let back = request_pcm16(&[pcm16_to_f32(value)], STARLING_SAMPLE_RATE)
-                .expect("quantize");
+            let back =
+                request_pcm16(&[pcm16_to_f32(value)], STARLING_SAMPLE_RATE).expect("quantize");
             assert_eq!(back, vec![value], "value {value}");
         }
     }
@@ -150,8 +148,14 @@ mod tests {
         edge.extend(std::iter::repeat_n(i16::MAX, 5_000));
         edge.extend(std::iter::repeat_n(i16::MIN, 5_000));
         let cases: Vec<(&str, Vec<i16>)> = vec![
-            ("minimum length", (0..MIN_SAMPLES as i16).map(|i| i * 999).collect()),
-            ("one short block", (0..100).map(|i| (i * 37) as i16).collect()),
+            (
+                "minimum length",
+                (0..MIN_SAMPLES as i16).map(|i| i * 999).collect(),
+            ),
+            (
+                "one short block",
+                (0..100).map(|i| (i * 37) as i16).collect(),
+            ),
             ("silence", vec![0; 48_000]),
             ("full-scale edges", edge),
             ("noise", noise(70_001, 0x9e37_79b9)),
