@@ -85,6 +85,30 @@ class TakeMetricsTest(unittest.TestCase):
         log["events"] = []
         self.assertEqual(sr.take_metrics(log, "x", None)["failed"], "no final")
 
+    def test_stop_latency_counts_busy_commit_retries(self):
+        log = _log(partials=[], final=(4.4, {"text": "x", "duration_s": 4.0,
+                                             "trace": FINAL_TRACE}))
+        log["commits"].append(100.0 + 4.35)  # a busy commit, then a retry
+        self.assertEqual(sr.take_metrics(log, "x", None)["stop_to_final_ms"], 300.0)
+
+
+class AggregateTest(unittest.TestCase):
+    def test_a_take_without_partials_has_no_first_partial_latency(self):
+        with_partial = _log(
+            partials=[(1.2, {"text": "hi", "stable_words": 0, "trace": {"covered_s": 1.0}})],
+            final=(4.4, {"text": "hi", "duration_s": 4.0, "trace": FINAL_TRACE}))
+        without = _log(partials=[], final=(4.4, {"text": "hi", "duration_s": 4.0,
+                                                 "trace": FINAL_TRACE}))
+        runs = []
+        for log in (with_partial, without):
+            m = sr.take_metrics(log, "hi", "hi")
+            m.update({"take": "short"})
+            runs.append(m)
+        agg = sr._aggregate(runs)["short"]
+        self.assertEqual(agg["first_partial_missing"], 1)
+        self.assertIsNone(agg["first_partial_wall_s_median"])
+        self.assertEqual(sr._aggregate(runs[:1])["short"]["first_partial_wall_s_median"], 1.2)
+
 
 class CheckTest(unittest.TestCase):
     def test_rules(self):

@@ -1859,6 +1859,99 @@ static void test_pump_event_bound_blocks_control_frames() {
     CHECK(fx.count("\"type\":\"pong\"") == 2);
 }
 
+// A pump fixture whose first engine call blocks until release(), so a test
+// can queue a whole batch behind it.
+struct GatedEngine {
+    std::mutex mu;
+    std::condition_variable cv;
+    bool released = false;
+    std::atomic<int> calls{0};
+    std::atomic<int> previews{0};  // calls shorter than a window
+    TranscribeFn fn() {
+        return [this](const float*, int64_t n) -> std::optional<std::string> {
+            if (n < 16000) previews.fetch_add(1);
+            if (calls.fetch_add(1) == 0) {
+                std::unique_lock<std::mutex> lk(mu);
+                cv.wait(lk, [&] { return released; });
+            }
+            return std::string("w");
+        };
+    }
+    void wait_first() {
+        while (calls.load() == 0) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    void release() {
+        { std::lock_guard<std::mutex> lk(mu); released = true; }
+        cv.notify_all();
+    }
+};
+
+static void test_pump_ping_preview_coalesced_by_later_batch_audio() {
+    // Batch [audio, ping, audio, ping]: the first ping's preview would miss
+    // the audio queued behind it, so only the last ping previews. The worker
+    // is held in its first send (not in the engine, whose cost would stretch
+    // the preview interval) while the batch queues.
+    PumpFixture fx;
+    std::atomic<int> previews{0};
+    fx.session.set_transcribe_fn([&](const float*, int64_t n) -> std::optional<std::string> {
+        if (n < 16000) previews.fetch_add(1);
+        return std::string("w");
+    });
+    std::mutex gate_mu;
+    std::condition_variable gate_cv;
+    bool released = false;
+    std::atomic<bool> in_send{false};
+    auto inner = fx.sender();
+    StreamPump pump(fx.session, {}, [&](const std::string& m) {
+        if (!in_send.exchange(true)) {
+            std::unique_lock<std::mutex> lk(gate_mu);
+            gate_cv.wait(lk, [&] { return released; });
+        }
+        inner(m);
+    });
+    pump.push_audio(pcm_for_range(0, 8000));  // preview, then the send blocks
+    while (!in_send.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    pump.push_audio(pcm_for_range(8000, 1600));
+    pump.push_ping();
+    pump.push_audio(pcm_for_range(9600, 1600));
+    pump.push_ping();
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));  // past the interval
+    {
+        std::lock_guard<std::mutex> lk(gate_mu);
+        released = true;
+    }
+    gate_cv.notify_all();
+    pump.drain();
+    CHECK(fx.count("\"type\":\"pong\"") == 2);
+    CHECK(previews.load() == 2);  // the first one + one for the whole batch
+    CHECK(fx.session.chunker()->coalesced_previews() == 1);
+}
+
+static void test_pump_ping_after_rejected_frame_sends_no_partial() {
+    // Batch [valid audio, odd-length frame, ping]: the refused frame ends
+    // partials for the take, so the ping only answers with a pong.
+    PumpFixture fx;
+    GatedEngine eng;
+    fx.session.set_transcribe_fn(eng.fn());
+    StreamPump pump(fx.session, {}, fx.sender());
+    pump.push_audio(pcm_for_range(0, 8000));  // preview blocks
+    eng.wait_first();
+    pump.push_audio(pcm_for_range(8000, 1600));
+    pump.push_audio(std::string(3, '\0'));    // odd PCM length
+    pump.push_ping();
+    eng.release();
+    pump.drain();
+    CHECK(eng.calls.load() == 1);
+    std::lock_guard<std::mutex> lk(fx.mu);
+    size_t err = SIZE_MAX;
+    for (size_t i = 0; i < fx.sent.size(); ++i)
+        if (fx.sent[i].find("\"type\":\"error\"") != std::string::npos) { err = i; break; }
+    CHECK(err != SIZE_MAX);
+    for (size_t i = err; i < fx.sent.size() && err != SIZE_MAX; ++i)
+        CHECK(fx.sent[i].find("\"type\":\"partial\"") == std::string::npos);
+    CHECK(!fx.sent.empty() && fx.sent.back() == "{\"type\":\"pong\"}");
+}
+
 // ---- main -----------------------------------------------------------------
 int main() {
     test_stitch_basic();
@@ -1921,6 +2014,8 @@ int main() {
     test_pump_ping_does_not_coalesce_the_preview();
     test_pump_backlog_commits_windows_before_the_cap();
     test_pump_event_bound_blocks_control_frames();
+    test_pump_ping_preview_coalesced_by_later_batch_audio();
+    test_pump_ping_after_rejected_frame_sends_no_partial();
 
     std::printf("stream_session_test: %d/%d passed\n", g_passed, g_tests);
     return g_passed == g_tests ? 0 : 1;

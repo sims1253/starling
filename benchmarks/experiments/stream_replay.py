@@ -258,11 +258,16 @@ def _aggregate(runs: list[dict]) -> dict:
         ok = [r for r in rs if "failed" not in r]
         med = lambda xs: statistics.median(xs) if xs else None  # noqa: E731
         firsts = [r["first_partial"]["wall_s"] for r in ok if r.get("first_partial")]
+        # Every workload take is speech: a run without any nonempty partial
+        # is a preview failure, so its take has no latency (a threshold on it
+        # then fails as missing) instead of a median over the lucky runs.
+        missing = len(ok) - len(firsts)
         agg[take] = {
             "runs": len(rs), "failed": len(rs) - len(ok),
             "audio_complete_all": all(r.get("audio_complete") for r in ok) and bool(ok),
-            "first_partial_wall_s_median": med(firsts),
-            "first_partial_wall_s_max": max(firsts) if firsts else None,
+            "first_partial_missing": missing,
+            "first_partial_wall_s_median": med(firsts) if not missing else None,
+            "first_partial_wall_s_max": max(firsts) if firsts and not missing else None,
             "partial_age_ms_p50_median": med([r["partial_age_ms"]["p50"] for r in ok
                                               if r["partial_age_ms"]["p50"] is not None]),
             "partial_age_ms_p95_median": med([r["partial_age_ms"]["p95"] for r in ok

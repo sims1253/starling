@@ -180,11 +180,19 @@ void StreamPump::run() {
                         step(/*coalesce_preview=*/true);
                 }
                 break;
-            case Kind::Ping:
-                if (need_step) step();
+            case Kind::Ping: {
+                // The step owed for earlier audio, unless a refused frame
+                // ended partials for this take. Audio or a commit/reset
+                // later in this batch makes its preview obsolete.
+                bool later_work = false;
+                for (size_t j = i + 1; j < batch.size() && !later_work; ++j)
+                    later_work = batch[j].kind != Kind::Ping;
+                if (need_step && !session_.overflowed() && !session_.take_invalid())
+                    step(/*coalesce_preview=*/later_work);
                 need_step = false;
                 send_("{\"type\":\"pong\"}");
                 break;
+            }
             case Kind::Commit:
                 // The flush covers everything appended so far; a preview
                 // before it would be obsolete.

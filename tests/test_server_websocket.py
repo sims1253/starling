@@ -296,9 +296,12 @@ def test_stream_burst_coalesces_previews_and_keeps_audio(server, monkeypatch):
     assert msg["trace"]["audio_s"] == 3.0
 
 
-def test_stream_ping_does_not_coalesce_the_preview(server, monkeypatch):
-    # A ping queued while a window commits carries no audio: the preview of
-    # the newest tail still runs, and the pong follows it.
+@pytest.mark.parametrize("message,reply", [({"type": "ping"}, "pong"),
+                                           ({"type": "bogus"}, "error")])
+def test_stream_ping_does_not_coalesce_the_preview(server, monkeypatch, message, reply):
+    # A ping (or an unrecognized message) queued while a window commits
+    # carries no audio: the preview of the newest tail still runs, and the
+    # reply follows it.
     import time as _time
 
     server.config.stream_chunk_seconds = 1
@@ -317,9 +320,9 @@ def test_stream_ping_does_not_coalesce_the_preview(server, monkeypatch):
                                       '&partial_interval_seconds=0') as ws:
             ws.send_bytes(audio)
             _time.sleep(0.1)
-            ws.send_json({"type": "ping"})
+            ws.send_json(message)
             types = []
-            while (msg := ws.receive_json())["type"] != "pong":
+            while (msg := ws.receive_json())["type"] != reply:
                 types.append(msg["type"])
     assert "partial" in types
     assert [n for n in lens if n < S.SAMPLE_RATE] != []

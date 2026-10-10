@@ -58,7 +58,9 @@ public:
     // (including the step owed for earlier audio), as with the former
     // synchronous loop.
     void push_ping();
-    // Stop the worker after its current engine call; queued events are
+    // Stop the worker after its current step (the engine calls of one
+    // append or commit: at most the windows of the --max-stream-seconds
+    // buffer, as in the former synchronous loop); queued events are
     // discarded (the peer is gone). Idempotent.
     void close();
 

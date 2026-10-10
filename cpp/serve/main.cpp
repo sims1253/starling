@@ -1103,8 +1103,8 @@ int main(int argc, char** argv) {
                     msg.clear();
                 }
             }
-            // The worker finishes its current engine call and exits before
-            // the socket goes away.
+            // The worker finishes its current step and exits before the
+            // socket goes away.
             pump.close();
             std::fprintf(stderr,
                 "[starling-serve] WS /stream client disconnected\n");

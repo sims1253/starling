@@ -129,6 +129,12 @@ STREAM_QUEUE_MAX_FRAMES: int = 1024
 A full queue pauses receiving (TCP backpressure); audio is never dropped.
 """
 
+STREAM_QUEUE_MAX_BYTES: int = 32 * 1024 * 1024
+"""Bound on WS /stream audio bytes received but not yet taken by the worker
+(issue #357; ``max_pending_bytes`` in cpp/serve/stream_pump.hpp). A single
+larger frame is still admitted when nothing else is queued.
+"""
+
 # Supported model slugs -> (backend class, display name, gpu-lock model label).
 # Built lazily as backend classes are defined below.
 MODEL_SLUGS = ("granite", "parakeet", "parakeet_unified", "moss", "qwen3", "qwen3_06", "ark", "ark06", "cohere", "higgs", "audex", "voxtral")
@@ -1703,23 +1709,34 @@ def create_app(
         # is bounded: a full queue pauses receiving (backpressure), never
         # drops audio. ``None`` marks the disconnect.
         queue: asyncio.Queue = asyncio.Queue(maxsize=STREAM_QUEUE_MAX_FRAMES)
-        # Queued items other than pings: a ping carries no audio, so it does
-        # not make a preview obsolete (mirrors pending_work_ in
-        # cpp/serve/stream_pump.cpp).
+        # Queued items that make a preview obsolete: audio, a commit or reset
+        # (which end or discard the take) and the disconnect. A ping or an
+        # unrecognized message carries no audio and does not (mirrors
+        # pending_work_ in cpp/serve/stream_pump.cpp).
         pending_work = 0
+        # Queued audio bytes not yet taken by the worker; above
+        # STREAM_QUEUE_MAX_BYTES the receiver waits for ``space``.
+        pending_bytes = 0
+        space = asyncio.Event()
 
-        def _is_ping(text: str) -> bool:
+        def _ends_preview(text: str) -> bool:
             try:
                 cmd = json.loads(text)
             except json.JSONDecodeError:
                 return False
-            return isinstance(cmd, dict) and cmd.get("type") == "ping"
+            return isinstance(cmd, dict) and cmd.get("type") in ("commit", "reset")
 
-        async def enqueue(item) -> None:  # noqa: ANN001
-            nonlocal pending_work
-            if item is None or item[0] != "ping":
+        async def enqueue(item, work: bool) -> None:  # noqa: ANN001
+            nonlocal pending_work, pending_bytes
+            if item is not None and item[0] == "bytes":
+                size = len(item[1])
+                while pending_bytes and pending_bytes + size > STREAM_QUEUE_MAX_BYTES:
+                    space.clear()
+                    await space.wait()
+                pending_bytes += size
+            if work:
                 pending_work += 1
-            await queue.put(item)
+            await queue.put((item, work))
 
         async def receive() -> None:
             try:
@@ -1729,9 +1746,9 @@ def create_app(
                         break
                     text_msg = msg.get("text")
                     if text_msg is not None:
-                        await enqueue(("ping" if _is_ping(text_msg) else "text", text_msg))
+                        await enqueue(("text", text_msg), _ends_preview(text_msg))
                     elif msg.get("bytes"):
-                        await enqueue(("bytes", msg["bytes"]))
+                        await enqueue(("bytes", msg["bytes"]), True)
             except WebSocketDisconnect:
                 pass
             except Exception:  # transport failure: handled like a disconnect
@@ -1739,7 +1756,7 @@ def create_app(
             # Not in ``finally``: when the handler exits it cancels this task,
             # and a cancelled receiver must not block on a full queue that
             # nobody drains any more.
-            await enqueue(None)
+            await enqueue(None, True)
 
         async def send_partial(text: str, segments: list) -> None:
             partial = {
@@ -1753,20 +1770,24 @@ def create_app(
                 partial["trace"] = sess.trace_partial()
             await ws.send_json(partial)
 
-        async def step() -> None:
+        async def step(coalesce_preview: bool = False) -> None:
+            """``coalesce_preview``: commit due windows but skip the preview
+            (more queued audio follows in the same batch)."""
             await asyncio.to_thread(server._ensure_loaded)
             now = time.monotonic()
             if sess.chunker is not None:
                 # Chunked path: finalize full windows + emit committed+tail.
                 # ChunkStreamer handles throttling, coalescing and busy
                 # (-> None) itself.
-                text = await asyncio.to_thread(sess.stream_step, now,
-                                               lambda: pending_work > 0)
+                text = await asyncio.to_thread(
+                    sess.stream_step, now,
+                    lambda: coalesce_preview or pending_work > 0)
                 if text is not None:
                     sess.last_partial_ts = now
                     await send_partial(text, [{"text": text, "start_s": 0.0,
                                                "end_s": sess.buffered_seconds}])
-            elif sess.should_emit_partial(now) and pending_work == 0:
+            elif (sess.should_emit_partial(now) and not coalesce_preview
+                  and pending_work == 0):
                 try:
                     result = await asyncio.to_thread(sess.transcribe_current_sync)
                 except (_Busy, _Cancelled):
@@ -1830,12 +1851,16 @@ def create_app(
                 batch = [await queue.get()]
                 while not queue.empty():
                     batch.append(queue.get_nowait())
+                # The batch is taken: its audio no longer counts against the
+                # receiver's byte budget (as in the native pump).
+                pending_bytes = 0
+                space.set()
                 need_step = False
-                for item in batch:
+                for idx, (item, work) in enumerate(batch):
                     if item is None:
                         return
                     kind, payload = item
-                    if kind != "ping":
+                    if work:
                         pending_work -= 1
                     if kind == "bytes":
                         # append_wav itself sniffs RIFF/WAVE vs raw PCM16. A
@@ -1845,6 +1870,14 @@ def create_app(
                         outcome = sess.append_wav(payload)
                         if outcome is AppendOutcome.ACCEPTED:
                             need_step = True
+                            # Catching up on a backlog: commit each full
+                            # window as soon as it is buffered, so finalized
+                            # audio is trimmed before the rest of the batch
+                            # is appended. Only the preview waits.
+                            chunker = sess.chunker
+                            if (chunker is not None and idx + 1 < len(batch)
+                                    and len(sess.samples) - chunker.boundary >= chunker.chunk):
+                                await step(coalesce_preview=True)
                         elif not reject_error_sent:
                             reject_error_sent = True
                             await ws.send_json(
