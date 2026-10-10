@@ -503,6 +503,8 @@ pub struct StarlingApp {
     /// What happened to a take that was cancelled (Escape, a microphone
     /// that never delivered audio): shown until dismissed.
     pub(crate) take_notice: Option<String>,
+    /// Takes startup recovery brought back (#356): shown until dismissed.
+    pub(crate) recovery_notice: Option<String>,
     /// The latest playback-attenuation notice. Its own slot: the take
     /// lifecycle clears `error` and `take_notice` on every start/stop.
     pub(crate) playback_notice: Option<PlaybackNotice>,
@@ -1149,6 +1151,7 @@ impl StarlingApp {
             system_check: Default::default(),
             key_interceptor: None,
             take_notice: None,
+            recovery_notice: None,
             playback_notice: None,
             correction_chain: None,
             playing_id: None,
@@ -1206,13 +1209,16 @@ impl StarlingApp {
                 match recovered {
                     Ok(recovery) => {
                         recheck = recovery.recheck;
-                        if !recovery.summary.is_empty() {
-                            this.update(cx, |app, cx| {
+                        this.update(cx, |app, cx| {
+                            if !recovery.summary.is_empty() {
                                 app.error = Some(recovery.summary);
-                                cx.notify();
-                            })
-                            .ok();
-                        }
+                            }
+                            if !recovery.notice.is_empty() {
+                                app.recovery_notice = Some(recovery.notice);
+                            }
+                            cx.notify();
+                        })
+                        .ok();
                     }
                     Err(err) => {
                         this.update(cx, |app, cx| {

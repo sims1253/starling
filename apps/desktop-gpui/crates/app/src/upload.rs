@@ -1841,15 +1841,23 @@ pub(crate) async fn recheck_capture_journals(
         cx.background_spawn(async move { store.recover_capture_journals() })
             .await
     };
-    let summary = match recovered {
-        Ok(recovery) => recovery.summary(),
-        Err(err) => format!("Could not scan for interrupted recordings: {err}"),
+    let (problems, notice) = match recovered {
+        Ok(recovery) => (recovery.problems(), recovery.recovered_summary()),
+        Err(err) => (
+            format!("Could not scan for interrupted recordings: {err}"),
+            String::new(),
+        ),
     };
-    if summary.is_empty() {
+    if problems.is_empty() && notice.is_empty() {
         return;
     }
     this.update(cx, |app, cx| {
-        app.error = Some(summary);
+        if !problems.is_empty() {
+            app.error = Some(problems);
+        }
+        if !notice.is_empty() {
+            app.recovery_notice = Some(notice);
+        }
         cx.notify();
     })
     .ok();

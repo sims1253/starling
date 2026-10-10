@@ -757,9 +757,17 @@ impl Store {
         // #356: takes whose app stopped mid-recording (or between stop and
         // save) are still journals in the recorder's tree; they come back
         // as interrupted takes. Independent of the two repairs above.
-        let (journals, recheck) = match self.recover_capture_journals() {
-            Ok(recovery) => (recovery.summary(), !recovery.deferred.is_empty()),
-            Err(err) => (format!("Could not scan for interrupted recordings: {err}"), false),
+        let (journals, notice, recheck) = match self.recover_capture_journals() {
+            Ok(recovery) => (
+                recovery.problems(),
+                recovery.recovered_summary(),
+                !recovery.deferred.is_empty(),
+            ),
+            Err(err) => (
+                format!("Could not scan for interrupted recordings: {err}"),
+                String::new(),
+                false,
+            ),
         };
         match (reconciled.map_err(v2_err), staled.map_err(v2_err)) {
             (Ok(report), Ok(_)) => {
@@ -774,6 +782,7 @@ impl Store {
                         .filter(|part| !part.is_empty())
                         .collect::<Vec<_>>()
                         .join(" "),
+                    notice,
                     recheck,
                 })
             }
@@ -822,8 +831,11 @@ impl Store {
 /// What [`Store::startup_recovery`] found.
 #[derive(Debug)]
 pub(crate) struct StartupRecovery {
-    /// The user-facing report; empty when there is nothing to say.
+    /// What went wrong, for the error banner; empty when nothing did.
     pub summary: String,
+    /// Takes brought back from the recorder's tree, for a notice; empty
+    /// when there were none.
+    pub notice: String,
     /// The recorder's tree held journals left to a live writer or save:
     /// look again once [`store_v2::FINALIZED_ADOPTION_GRACE`] has passed.
     pub recheck: bool,
@@ -2323,7 +2335,7 @@ mod tests {
         std::fs::remove_file(&staging).expect("unblock");
         drop(store);
         let relaunched = reopen_v2(&root);
-        let summary = relaunched.startup_recovery().expect("recovery").summary;
+        let summary = relaunched.startup_recovery().expect("recovery").notice;
         assert!(summary.contains("Recovered 1 recording"), "{summary}");
         let take = summary_of(&relaunched, "j_full_disk");
         assert_eq!(take.status, SessionStatus::Interrupted);
@@ -2339,7 +2351,7 @@ mod tests {
         drop(store);
 
         let store = reopen_v2(&root);
-        let summary = store.startup_recovery().expect("recovery").summary;
+        let summary = store.startup_recovery().expect("recovery").notice;
         assert!(summary.contains("Recovered 1 recording"), "{summary}");
 
         let take = summary_of(&store, "j_killed");

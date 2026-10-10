@@ -609,6 +609,15 @@ fn render_banner(app: &mut StarlingApp, cx: &mut Context<StarlingApp>) -> Option
                 cx,
             ));
         }
+        if let Some(message) = app.recovery_notice.clone() {
+            return Some(quality_banner(
+                "Recordings recovered",
+                message,
+                "Audio is kept up to the last point the capture journal confirmed on disk.",
+                |app: &mut StarlingApp| app.recovery_notice = None,
+                cx,
+            ));
+        }
         if let Some(message) = app.take_notice.clone() {
             return Some(quality_banner(
                 "Take cancelled",

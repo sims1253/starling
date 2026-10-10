@@ -4341,21 +4341,34 @@ pub struct RecoveredJournal {
 }
 
 impl JournalRecovery {
-    /// One line for the startup banner; empty when there is nothing to
-    /// say.
+    /// Everything this pass has to say; empty when nothing.
     pub fn summary(&self) -> String {
+        [self.recovered_summary(), self.problems()]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// What came back, for a notice; empty when nothing did.
+    pub fn recovered_summary(&self) -> String {
+        let recovered = self.recovered.len();
+        if recovered == 0 {
+            return String::new();
+        }
+        format!(
+            "Recovered {recovered} recording{} Starling was still recording or saving when it \
+             closed; {} in your history as interrupted, ready to play, export or transcribe.",
+            if recovered == 1 { "" } else { "s" },
+            if recovered == 1 { "it is" } else { "they are" }
+        )
+    }
+
+    /// What could not be recovered or read, for the error banner; empty
+    /// when nothing went wrong.
+    pub fn problems(&self) -> String {
         let plural = |count: usize| if count == 1 { "" } else { "s" };
         let mut parts = Vec::new();
-        let recovered = self.recovered.len();
-        if recovered > 0 {
-            parts.push(format!(
-                "Recovered {recovered} recording{} Starling was still recording or saving when \
-                 it closed; {} in your history as interrupted, ready to play, export or \
-                 transcribe.",
-                plural(recovered),
-                if recovered == 1 { "it is" } else { "they are" }
-            ));
-        }
         if !self.failed.is_empty() {
             let reasons: Vec<String> = self
                 .failed
