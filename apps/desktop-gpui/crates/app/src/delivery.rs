@@ -33,7 +33,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use gpui::{AppContext, ClipboardItem, Context};
@@ -188,6 +188,33 @@ impl Recovery {
     }
 }
 
+/// Starling's window focus as typing off the UI thread sees it (Wayland
+/// cannot tell that Starling's window took focus; Starling can).
+#[derive(Default)]
+pub(crate) struct OwnFocus {
+    focused: AtomicBool,
+    /// Bumped on every focus gain, so a trip through Starling's window
+    /// and back out still counts.
+    gains: AtomicU64,
+}
+
+impl OwnFocus {
+    fn set(&self, active: bool) {
+        if active {
+            self.gains.fetch_add(1, Ordering::SeqCst);
+        }
+        self.focused.store(active, Ordering::SeqCst);
+    }
+
+    /// The stop check for one insert: Starling's window has had focus
+    /// at some point since this call.
+    fn had_focus_since_now(self: &Arc<Self>) -> impl Fn() -> bool + Send + 'static {
+        let start = self.gains.load(Ordering::SeqCst);
+        let focus = self.clone();
+        move || focus.focused.load(Ordering::SeqCst) || focus.gains.load(Ordering::SeqCst) != start
+    }
+}
+
 /// The app's delivery state.
 pub(crate) struct DeliveryState {
     pub(crate) inserter: Arc<Inserter>,
@@ -203,10 +230,9 @@ pub(crate) struct DeliveryState {
     /// Bumped on every focus change of Starling's window, so only the
     /// settle timer of the latest focus loss fires Paste last.
     focus_changes: u64,
-    /// Whether Starling's window has focus, for typing off the UI thread:
-    /// an insert stops before its next key once it turns true (Wayland
-    /// cannot tell that Starling's window took focus; Starling can).
-    own_focus: Arc<AtomicBool>,
+    /// An insert stops before its next key once Starling's window has
+    /// had focus since it was started.
+    own_focus: Arc<OwnFocus>,
 }
 
 impl DeliveryState {
@@ -219,7 +245,7 @@ impl DeliveryState {
             recovery: None,
             generation: 0,
             focus_changes: 0,
-            own_focus: Arc::new(AtomicBool::new(false)),
+            own_focus: Arc::default(),
         }
     }
 
@@ -334,16 +360,12 @@ impl StarlingApp {
         cx: &mut Context<Self>,
     ) {
         let inserter = self.delivery.inserter.clone();
-        let own_focus = self.delivery.own_focus.clone();
+        let had_focus = self.delivery.own_focus.had_focus_since_now();
         let typed_text = text.clone();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_spawn(async move {
-                    let stop = || {
-                        own_focus
-                            .load(Ordering::SeqCst)
-                            .then_some(InsertError::TargetIsStarling)
-                    };
+                    let stop = || had_focus().then_some(InsertError::TargetIsStarling);
                     inserter.insert(&target, &typed_text, &stop)
                 })
                 .await;
@@ -450,7 +472,7 @@ impl StarlingApp {
     /// Starling's window gained or lost focus.
     pub(crate) fn delivery_window_activation(&mut self, active: bool, cx: &mut Context<Self>) {
         self.delivery.focus_changes += 1;
-        self.delivery.own_focus.store(active, Ordering::SeqCst);
+        self.delivery.own_focus.set(active);
         if active {
             return;
         }
@@ -753,15 +775,18 @@ mod tests {
         let (app, fake) = app_with(cx, opted_in);
         fake.set_verifies_target(false);
         fake.focus(FakeTarget::named("Editor", "notes.txt"));
-        // Focus comes to Starling while the insert is still queued.
+        // Focus passes through Starling while the insert is still queued:
+        // the window it lands in afterwards is not the take's.
         app.update(cx, |app, cx| {
             app.delivery_take_started();
             let capture = app.delivery_take_stopped();
             app.bind_delivery(capture, "take-1");
             app.sessions.push(session("take-1", "Hello there."));
             app.deliver_finished_take("take-1", cx);
-            app.window_focus.push((Instant::now(), true));
-            app.delivery_window_activation(true, cx);
+            for active in [true, false] {
+                app.window_focus.push((Instant::now(), active));
+                app.delivery_window_activation(active, cx);
+            }
         });
         cx.run_until_parked();
         assert!(fake.insertions().is_empty());
@@ -777,7 +802,8 @@ mod tests {
         let own_focus = app.read_with(cx, |app, _| app.delivery.own_focus.clone());
         fake.on_key(move |index| {
             if index == 5 {
-                own_focus.store(true, Ordering::SeqCst);
+                own_focus.set(true);
+                own_focus.set(false);
             }
         });
         take(&app, cx, "take-1", "Hello there.", |_| {});
