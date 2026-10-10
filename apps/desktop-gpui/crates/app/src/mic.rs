@@ -428,11 +428,25 @@ impl StarlingApp {
             }
             DiskLevel::Critical => {
                 self.activation_input(|machine| machine.storage_full(take), cx);
-                self.error = Some(format!(
-                    "Recording stopped because the disk is almost full ({} MB free). The \
-                     recording was saved; free up space before recording again.",
-                    reading.available / (1024 * 1024)
-                ));
+                // The stop above ran synchronously and set the take's own
+                // warnings; this joins them. It never claims the take was
+                // saved — saving is still under way, and a failure there
+                // (or a journal fault) reports itself through `error`.
+                let note = if reading.available == 0 {
+                    "Recording stopped because the disk is full. Free up space before recording \
+                     again."
+                        .to_string()
+                } else {
+                    format!(
+                        "Recording stopped because the disk is almost full ({} MB free). Free \
+                         up space before recording again.",
+                        reading.available / (1024 * 1024)
+                    )
+                };
+                self.capture_warning = Some(match self.capture_warning.take() {
+                    Some(existing) => format!("{note} {existing}"),
+                    None => note,
+                });
                 cx.notify();
             }
         }

@@ -19,7 +19,7 @@ use starling_dictation::{
 use crate::app::{HealthCheckPurpose, StarlingApp, UnsavedWav};
 use crate::live_stream::LiveStream;
 use crate::mic::Interruption;
-use crate::store::Store;
+use crate::store::{AudioPin, Store};
 
 /// The capture rate a pre-start disk estimate assumes (the device rate
 /// is only known once the microphone opened).
@@ -974,7 +974,7 @@ impl StarlingApp {
                         if let Some(token) = staging {
                             app.bind_staging(token, &saved.id);
                         }
-                        app.transcribe_with_stream(saved.id, saved.wav, stream, target, cx);
+                        app.transcribe_with_stream(saved.id, saved.wav, stream, target, None, cx);
                     })
                     .ok();
                 }
@@ -1088,12 +1088,20 @@ impl StarlingApp {
         self.error = Some(message.to_string());
     }
 
-    pub fn transcribe(&mut self, id: String, wav: Arc<Vec<u8>>, cx: &mut Context<Self>) {
+    /// `pin` holds a retried take's audio until its attempt is marked
+    /// started (#342).
+    pub fn transcribe(
+        &mut self,
+        id: String,
+        wav: Arc<Vec<u8>>,
+        pin: Option<AudioPin>,
+        cx: &mut Context<Self>,
+    ) {
         // A retry is a new job: it resolves a fresh target at the moment
         // it starts (#363) — the engine may serve a different model now,
         // or the user may have switched to their own server.
         let target = self.resolve_take_target();
-        self.transcribe_with_stream(id, wav, None, target, cx);
+        self.transcribe_with_stream(id, wav, None, target, pin, cx);
     }
 
     fn transcribe_with_stream(
@@ -1102,6 +1110,7 @@ impl StarlingApp {
         wav: Arc<Vec<u8>>,
         stream: Option<LiveStream>,
         mut target: TakeTarget,
+        pin: Option<AudioPin>,
         cx: &mut Context<Self>,
     ) {
         if self.active_ids.contains(&id) {
@@ -1155,8 +1164,13 @@ impl StarlingApp {
                 let id = id.clone();
                 let backend = backend.clone();
                 let store = store_for_job.clone();
-                cx.background_spawn(async move { store.mark_attempt(&id, &backend) })
-                    .await
+                cx.background_spawn(async move {
+                    let marked = store.mark_attempt(&id, &backend);
+                    // The started attempt holds the audio from here on.
+                    drop(pin);
+                    marked
+                })
+                .await
             };
             match marked {
                 Ok(_) => {
@@ -1466,14 +1480,22 @@ impl StarlingApp {
             return;
         };
         cx.spawn(async move |this, cx| {
+            // #342: pinned from before the load until the retry's attempt
+            // is marked started, so upkeep cannot remove the audio between.
             let loaded = {
                 let store = store.clone();
                 let id = id.clone();
-                cx.background_spawn(async move { store.audio_wav(&id) }).await
+                cx.background_spawn(async move {
+                    let pin = store.pin_audio(&id);
+                    store
+                        .audio_wav(&id)
+                        .map(|wav| wav.map(|wav| (wav, pin)))
+                })
+                .await
             };
             this.update(cx, |app, cx| match loaded {
-                Ok(Some(wav)) => {
-                    app.transcribe(id, wav, cx);
+                Ok(Some((wav, pin))) => {
+                    app.transcribe(id, wav, Some(pin), cx);
                 }
                 Ok(None) => {
                     app.error = Some(format!("Recording {id} was not found."));

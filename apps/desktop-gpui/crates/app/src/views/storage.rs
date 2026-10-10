@@ -2,7 +2,7 @@
 //! recordings are kept as, and the opt-in retention limits.
 
 use gpui::{Context, Div, FontWeight, SharedString, div, prelude::*, px};
-use starling_dictation::settings::RetentionLimits;
+use starling_dictation::settings::{RetentionLimits, StorageSettings};
 
 use crate::app::StarlingApp;
 use crate::theme;
@@ -24,42 +24,22 @@ const SIZE_CHOICES: [(Option<u64>, &str); 4] = [
 ];
 
 pub(crate) fn render_storage_section(app: &mut StarlingApp, cx: &mut Context<StarlingApp>) -> Div {
-    let limits = app.audio_upkeep.draft.standard;
-    let mut age_row = div().flex().flex_row().flex_wrap().gap(px(6.));
-    for (days, label) in AGE_CHOICES {
-        age_row = age_row.child(
-            chip(
-                SharedString::from(format!("retention-age-{label}")),
-                limits.max_age_days == days,
-                label,
-            )
-            .on_click(cx.listener(move |this, _, _window, cx| {
-                this.audio_upkeep.draft.standard = RetentionLimits {
-                    max_age_days: days,
-                    ..this.audio_upkeep.draft.standard
-                };
-                cx.notify();
-            })),
-        );
-    }
-    let mut size_row = div().flex().flex_row().flex_wrap().gap(px(6.));
-    for (mb, label) in SIZE_CHOICES {
-        size_row = size_row.child(
-            chip(
-                SharedString::from(format!("retention-size-{label}")),
-                limits.max_total_mb == mb,
-                label,
-            )
-            .on_click(cx.listener(move |this, _, _window, cx| {
-                this.audio_upkeep.draft.standard = RetentionLimits {
-                    max_total_mb: mb,
-                    ..this.audio_upkeep.draft.standard
-                };
-                cx.notify();
-            })),
-        );
-    }
-    let limited = limits.max_age_days.is_some() || limits.max_total_mb.is_some();
+    let draft = app.audio_upkeep.draft;
+    let standard = limit_rows(
+        "standard",
+        draft.standard,
+        |settings| &mut settings.standard,
+        cx,
+    );
+    let archival = limit_rows(
+        "archival",
+        draft.archival,
+        |settings| &mut settings.archival,
+        cx,
+    );
+    let limited = [draft.standard, draft.archival]
+        .iter()
+        .any(|limits| limits.max_age_days.is_some() || limits.max_total_mb.is_some());
     let include_referenced = app.audio_upkeep.draft.include_referenced;
     let referenced_row = super::settings::choice_row(
         SharedString::from("retention-include-referenced"),
@@ -106,10 +86,21 @@ pub(crate) fn render_storage_section(app: &mut StarlingApp, cx: &mut Context<Sta
                      that never got a transcript.",
                 ),
         )
-        .child(row_label("Remove audio older than"))
-        .child(age_row)
-        .child(row_label("Keep at most").mt(px(12.)))
-        .child(size_row)
+        .child(standard)
+        .child(
+            div()
+                .mt(px(16.))
+                .mb(px(10.))
+                .text_size(px(11.))
+                .line_height(px(11. * 1.65))
+                .text_color(theme::SETTINGS_MUTED)
+                .child(
+                    "Archived recordings (Archive in a take's drawer) follow their own limits. \
+                     They are kept as FLAC too; a smaller lossy archival format is not available \
+                     yet.",
+                ),
+        )
+        .child(archival)
         .child(div().mt(px(12.)).child(referenced_row));
     if let Some(report) = app.audio_upkeep.last_report.clone() {
         section = section.child(
@@ -124,6 +115,54 @@ pub(crate) fn render_storage_section(app: &mut StarlingApp, cx: &mut Context<Sta
         );
     }
     section
+}
+
+/// The age and size chip rows for one class; `field` picks the class's
+/// limits out of the draft.
+fn limit_rows(
+    class: &'static str,
+    limits: RetentionLimits,
+    field: fn(&mut StorageSettings) -> &mut RetentionLimits,
+    cx: &mut Context<StarlingApp>,
+) -> Div {
+    let mut age_row = div().flex().flex_row().flex_wrap().gap(px(6.));
+    for (days, label) in AGE_CHOICES {
+        age_row = age_row.child(
+            chip(
+                SharedString::from(format!("retention-{class}-age-{label}")),
+                limits.max_age_days == days,
+                label,
+            )
+            .on_click(cx.listener(move |this, _, _window, cx| {
+                field(&mut this.audio_upkeep.draft).max_age_days = days;
+                cx.notify();
+            })),
+        );
+    }
+    let mut size_row = div().flex().flex_row().flex_wrap().gap(px(6.));
+    for (mb, label) in SIZE_CHOICES {
+        size_row = size_row.child(
+            chip(
+                SharedString::from(format!("retention-{class}-size-{label}")),
+                limits.max_total_mb == mb,
+                label,
+            )
+            .on_click(cx.listener(move |this, _, _window, cx| {
+                field(&mut this.audio_upkeep.draft).max_total_mb = mb;
+                cx.notify();
+            })),
+        );
+    }
+    let (age_label, size_label) = if class == "archival" {
+        ("Remove archived audio older than", "Keep at most, archived")
+    } else {
+        ("Remove audio older than", "Keep at most")
+    };
+    div()
+        .child(row_label(age_label))
+        .child(age_row)
+        .child(row_label(size_label).mt(px(12.)))
+        .child(size_row)
 }
 
 fn row_label(text: &'static str) -> Div {

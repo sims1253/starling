@@ -820,3 +820,83 @@ fn a_crash_between_stamp_and_unlink_is_finished_by_reconcile() {
     assert_eq!(files(&store, &id), (false, false));
     assert!(store.get_capture(&id).expect("row").is_some());
 }
+
+#[test]
+fn an_in_process_pin_holds_compression_and_retention() {
+    // A retry pins before it loads the audio and keeps the pin until its
+    // attempt is marked started: nothing acts in between.
+    let dir = TempDir::new().expect("tempdir");
+    let mut store = store_in(&dir);
+    let id = aged_take(&mut store, 90, 16_000);
+    store.pin_audio(&id);
+    store.pin_audio(&id);
+    assert!(store.compression_candidates(10).expect("candidates").is_empty());
+    let now = time::OffsetDateTime::now_utc();
+    let report = store
+        .apply_retention_policy(&policy(STANDARD_CLASS, age(30)), now)
+        .expect("apply");
+    assert!(report.retired.is_empty());
+    assert_eq!(held(&report, &id), Some(HoldReason::InUse));
+
+    // A compression prepared before the pin does not publish under it.
+    store.unpin_audio(&id);
+    store.unpin_audio(&id);
+    let job = store.compression_candidates(1).expect("candidates").remove(0);
+    let prepared = prepare_compression(&job).expect("prepare");
+    store.pin_audio(&id);
+    assert!(matches!(
+        store.commit_compression(prepared).expect("commit"),
+        CompressionOutcome::Skipped(_)
+    ));
+    assert_eq!(files(&store, &id), (true, false));
+
+    // Pins nest; the last release frees the take.
+    store.pin_audio(&id);
+    store.unpin_audio(&id);
+    assert!(store.compression_candidates(10).expect("candidates").is_empty());
+    store.unpin_audio(&id);
+    store.unpin_audio(&id); // an extra release does nothing
+    compressed(store.compress_audio(&id).expect("compress"));
+    let report = store
+        .apply_retention_policy(&policy(STANDARD_CLASS, age(30)), now)
+        .expect("apply");
+    assert_eq!(retired_ids(&report), vec![id]);
+}
+
+#[test]
+fn retention_decides_after_a_peer_connection_commits() {
+    // Another connection on the same root (another process) is starting a
+    // transcription of the take. The hold check and the stamp take the
+    // write lock first, so they wait for the peer and see its attempt
+    // instead of retiring the audio under it.
+    let dir = TempDir::new().expect("tempdir");
+    let mut store = store_in(&dir);
+    let id = aged_take(&mut store, 90, 16_000);
+    let peer = Connection::open(store.root().join(DB_FILE)).expect("peer");
+    peer.busy_timeout(std::time::Duration::from_secs(5))
+        .expect("busy timeout");
+    peer.execute_batch("BEGIN IMMEDIATE").expect("peer write lock");
+    peer.execute(
+        "INSERT INTO recognition_attempts
+             (id, capture_id, backend, text, partial_or_final, status)
+         VALUES ('peer-attempt', ?1, 'engine:peer', '', 'final', 'started')",
+        params![id],
+    )
+    .expect("peer attempt");
+
+    let sweeper = std::thread::spawn(move || {
+        let report = store
+            .apply_retention_policy(
+                &policy(STANDARD_CLASS, age(30)),
+                time::OffsetDateTime::now_utc(),
+            )
+            .expect("apply");
+        (store, report)
+    });
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    peer.execute_batch("COMMIT").expect("peer commit");
+    let (store, report) = sweeper.join().expect("sweeper");
+    assert!(report.retired.is_empty(), "{report:?}");
+    assert_eq!(held(&report, &id), Some(HoldReason::InUse));
+    assert_eq!(store.audio_at_rest(&id).expect("state"), AudioAtRest::Journal);
+}

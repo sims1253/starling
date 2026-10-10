@@ -123,6 +123,19 @@ pub fn render_drawer(
         .child("Export"),
     );
 
+    // #342: the archival class keeps its own retention limits.
+    actions = actions.child(
+        action_button(
+            "drawer-archive",
+            false,
+            cx.listener(|this, _, _window, cx| {
+                this.toggle_archival_selected(cx);
+            }),
+        )
+        .child(icon("icons/archive.svg", 16., theme::PAPER_INK))
+        .child(if session.archival { "Archived" } else { "Archive" }),
+    );
+
     // B05, #208: the trash button never deletes on its first click. It
     // arms a "Confirm delete?" state for exactly the selected take; only a
     // second click confirms. Also disabled while a confirmed delete is in

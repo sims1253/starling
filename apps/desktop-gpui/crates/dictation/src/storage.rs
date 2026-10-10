@@ -92,6 +92,9 @@ pub struct SessionSummary {
     /// Always `None` on v2 rows (the capture id *is* the journal linkage);
     /// kept in the shape the UI consumes.
     pub journal_id: Option<String>,
+    /// The take is in the archival retention class (#342): its audio
+    /// follows the archival limits instead of the standard ones.
+    pub archival: bool,
 }
 
 /// One damaged record as the listing reports it (G02): flagged with the

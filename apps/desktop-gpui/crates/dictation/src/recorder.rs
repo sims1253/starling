@@ -758,11 +758,22 @@ fn journal_boundary_step<S: JournalSink>(
 
 /// A journal write or fsync failed mid-take: record the fault, drop the
 /// journal, and leave acknowledgment frozen at the last good boundary.
+/// A full disk (#342) also publishes a critical free-space reading, so
+/// the UI stops the take as it would on a probe's warning — the disk
+/// filled faster than the watch looked, and nothing probes it after the
+/// journal is gone.
 fn journal_failed<S: JournalSink>(
     shared: &Shared,
     journal: &mut Option<JournalWriter<S>>,
     err: std::io::Error,
 ) {
+    if matches!(
+        err.kind(),
+        std::io::ErrorKind::StorageFull | std::io::ErrorKind::QuotaExceeded
+    ) {
+        shared.disk_available.store(0, Ordering::Relaxed);
+        shared.disk_level.store(DISK_CRITICAL, Ordering::Release);
+    }
     let frozen = shared.durable_ack.load(Ordering::Acquire);
     let mut guard = shared.lock_consumer();
     guard.journal_fault = Some(format!(
@@ -3042,5 +3053,61 @@ mod tests {
         // Without a watch there is never a reading either.
         let plain = test_handle(test_shared(1_024), 16_000);
         assert_eq!(plain.disk_reading(), None);
+    }
+
+    /// A sink that accepts the header, then runs out of space.
+    struct FullDiskSink {
+        full: Arc<AtomicBool>,
+    }
+
+    impl JournalSink for FullDiskSink {
+        fn append(&mut self, _bytes: &[u8]) -> std::io::Result<()> {
+            if self.full.load(Ordering::Acquire) {
+                return Err(std::io::Error::from(std::io::ErrorKind::StorageFull));
+            }
+            Ok(())
+        }
+
+        fn sync(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn sync_parent_dir(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_journal_write_that_finds_the_disk_full_reads_as_critical() {
+        // #342: the disk filled between two free-space probes (or no
+        // watch runs at all). The failed write itself must make the UI
+        // stop the take: after it nothing probes the dropped journal.
+        let full = Arc::new(AtomicBool::new(false));
+        let writer = JournalWriter::over_sink(
+            FullDiskSink {
+                full: Arc::clone(&full),
+            },
+            "j_full".to_string(),
+            PathBuf::from("full-disk-sink-has-no-file.sj"),
+            16_000,
+        )
+        .expect("writer over the full-disk sink");
+        let shared = test_shared(32_768);
+        let handle = journaled_test_handle(Arc::clone(&shared), writer, 16_000);
+        assert_eq!(handle.disk_reading(), None);
+        full.store(true, Ordering::Release);
+        let mut callback = CallbackState::new(1);
+        callback.process(&[0.1; 2_000], &shared);
+        let reading = wait_until(|| handle.disk_reading(), |reading| reading.is_some());
+        assert_eq!(
+            reading,
+            Some(DiskReading {
+                available: 0,
+                level: DiskLevel::Critical,
+            })
+        );
+        assert!(handle.capture_fault().is_some(), "the journal fault is surfaced too");
+        let take = handle.stop().expect("the in-memory take survives");
+        assert_eq!(take.audio.samples.len(), 2_000);
     }
 }

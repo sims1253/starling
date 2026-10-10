@@ -91,7 +91,7 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 
 use crate::audio::{decode_pcm16_wav, pcm16_to_f32, request_pcm16, STARLING_SAMPLE_RATE};
 use crate::flac;
@@ -662,6 +662,12 @@ pub struct StoreV2 {
     /// How stale a foreign lease's heartbeat may be before the lease is
     /// breakable (D11-style tunable; default [`LEASE_HEARTBEAT_TTL`]).
     lease_ttl: std::time::Duration,
+    /// Takes whose audio a caller of this instance is using right now
+    /// (#342): id → pin count. A retry pins before it loads the audio and
+    /// keeps the pin until its attempt is marked started, so neither
+    /// compression nor retention acts in between. In-process only —
+    /// another process's take is protected once its attempt row exists.
+    audio_pins: HashMap<String, usize>,
 }
 
 /// The lease this process holds: the owner id and the flocked lease file
@@ -798,6 +804,7 @@ impl StoreV2 {
             attempt_locks: HashMap::new(),
             lease: None,
             lease_ttl: LEASE_HEARTBEAT_TTL,
+            audio_pins: HashMap::new(),
         })
     }
 
@@ -2096,9 +2103,31 @@ impl StoreV2 {
     // Lossless at-rest audio (#342).
     // ------------------------------------------------------------------
 
-    /// Whether a recognition attempt on `id` is in flight — the take is
-    /// pinned (#356): its audio is never compressed or retired under it.
-    fn has_started_attempt(&self, id: &str) -> Result<bool, StoreV2Error> {
+    /// Pin `id`'s audio for this instance (#342): until the matching
+    /// [`Self::unpin_audio`], it is neither compressed nor retired. Pins
+    /// nest.
+    pub fn pin_audio(&mut self, id: &str) {
+        *self.audio_pins.entry(id.to_string()).or_default() += 1;
+    }
+
+    /// Release one [`Self::pin_audio`] (a release without a pin does
+    /// nothing).
+    pub fn unpin_audio(&mut self, id: &str) {
+        if let Some(count) = self.audio_pins.get_mut(id) {
+            *count -= 1;
+            if *count == 0 {
+                self.audio_pins.remove(id);
+            }
+        }
+    }
+
+    /// Whether `id`'s audio is in use: pinned by a caller of this
+    /// instance, or a recognition attempt on it is in flight (#356). Its
+    /// audio is never compressed or retired under it.
+    fn audio_in_use(&self, id: &str) -> Result<bool, StoreV2Error> {
+        if self.audio_pins.contains_key(id) {
+            return Ok(true);
+        }
         Ok(self
             .conn
             .query_row(
@@ -2143,7 +2172,7 @@ impl StoreV2 {
             if jobs.len() >= limit {
                 break;
             }
-            if !is_safe_path_component(&id) || rate == 0 {
+            if !is_safe_path_component(&id) || rate == 0 || self.audio_pins.contains_key(&id) {
                 continue;
             }
             // Shorter than FLAC's minimum block at 16 kHz: stays a journal.
@@ -2175,13 +2204,17 @@ impl StoreV2 {
             Ok(CompressionOutcome::Skipped(reason.to_string()))
         };
         let id = prepared.id.as_str();
+        // The checks and the publish hold the database's write lock, so
+        // no other connection can retire, delete or start a transcription
+        // of the take in between.
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         if self.get_capture(id)?.is_none() {
             return skip("the take was deleted while it was being compressed");
         }
         if self.audio_retired_utc(id)?.is_some() {
             return skip("the retention policy removed the take's audio meanwhile");
         }
-        if self.has_started_attempt(id)? {
+        if self.audio_in_use(id)? {
             return skip("a transcription of the take started meanwhile");
         }
         let journal = self.audio_path(id);
@@ -2197,6 +2230,7 @@ impl StoreV2 {
             ))
         })?;
         sync_dir(&self.root.join(AUDIO_DIR))?;
+        tx.commit()?;
         // The FLAC is durable and verified: the journal may go.
         match std::fs::remove_file(&journal) {
             Ok(()) => {}
@@ -2259,6 +2293,9 @@ impl StoreV2 {
             });
         match verified {
             Ok(()) => {
+                // The compressor may have died before its directory fsync:
+                // make the FLAC's name durable before the journal goes.
+                sync_dir(&self.root.join(AUDIO_DIR))?;
                 match std::fs::remove_file(&journal) {
                     Ok(()) => {}
                     Err(err) if err.kind() == io::ErrorKind::NotFound => {}
@@ -2397,7 +2434,12 @@ impl StoreV2 {
                 let Some(reason) = due else {
                     continue;
                 };
+                // The hold check and the stamp share the database's write
+                // lock: another connection cannot start a transcription,
+                // add a revision or a correction record in between.
+                let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
                 if let Some(hold) = self.retention_hold(&id, &created_utc, &grace_cutoff, policy)? {
+                    drop(tx);
                     report.held.push(HeldAudio {
                         id,
                         class: class.clone(),
@@ -2406,7 +2448,9 @@ impl StoreV2 {
                     });
                     continue;
                 }
-                self.retire_audio(&id)?;
+                self.stamp_audio_retired(&id)?;
+                tx.commit()?;
+                self.unlink_audio(&id)?;
                 kept_bytes -= bytes;
                 report.retired_bytes += bytes;
                 report.retired.push(RetiredAudio {
@@ -2444,7 +2488,7 @@ impl StoreV2 {
         if created_utc >= grace_cutoff {
             return Ok(Some(HoldReason::Recent));
         }
-        if self.has_started_attempt(id)? {
+        if self.audio_in_use(id)? {
             return Ok(Some(HoldReason::InUse));
         }
         let transcribed = self
@@ -2487,15 +2531,15 @@ impl StoreV2 {
         }))
     }
 
-    /// Stamp `id`'s audio as retired, then unlink it.
-    fn retire_audio(&mut self, id: &str) -> Result<(), StoreV2Error> {
+    /// Stamp `id`'s audio as retired; [`Self::unlink_audio`] follows.
+    fn stamp_audio_retired(&self, id: &str) -> Result<(), StoreV2Error> {
         self.conn.execute(
             "INSERT INTO tombstones(id, kind, deleted_utc, retention)
              VALUES (?1, 'audio', ?2, 'swept')
              ON CONFLICT(id) DO NOTHING",
             params![format!("{AUDIO_TOMBSTONE_PREFIX}{id}"), now_iso()],
         )?;
-        self.unlink_audio(id)
+        Ok(())
     }
 
     /// Unlink whatever audio `id` has under `audio/` (idempotent).

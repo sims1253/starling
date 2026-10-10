@@ -2901,6 +2901,7 @@ mod tests {
             last_error: None,
             model_label: None,
             journal_id: None,
+            archival: false,
         }
     }
 

@@ -293,6 +293,8 @@ impl Store {
     /// listing, playback, deletes, and the transcription job's
     /// exists-checks are never pinned behind one load.
     pub(crate) fn audio_wav(&self, id: &str) -> Result<Option<Arc<Vec<u8>>>, storage::StorageError> {
+        // #342: upkeep neither compresses nor retires the take mid-read.
+        let _pin = self.pin_audio(id);
         let path = {
             let store = lock_v2(&self.0);
             match store.audio_journal_path(id) {
@@ -421,6 +423,18 @@ impl Store {
         let mut store = lock_v2(&self.0);
         store
             .finish_recognition(id, RecognitionOutcome::Failed { message })
+            .map_err(v2_err)
+    }
+
+    /// Move a take into the archival retention class or back (#342).
+    pub(crate) fn set_archival(&self, id: &str, archival: bool) -> Result<(), storage::StorageError> {
+        let class = if archival {
+            store_v2::ARCHIVAL_CLASS
+        } else {
+            store_v2::STANDARD_CLASS
+        };
+        lock_v2(&self.0)
+            .set_retention_class(id, class)
             .map_err(v2_err)
     }
 
@@ -625,14 +639,26 @@ impl Store {
         store.correction_records_for(id).map_err(v2_err)
     }
 
+    /// Pin `id`'s audio until the returned guard drops (#342): upkeep
+    /// neither compresses nor retires it meanwhile.
+    pub(crate) fn pin_audio(&self, id: &str) -> AudioPin {
+        lock_v2(&self.0).pin_audio(id);
+        AudioPin {
+            store: Arc::clone(&self.0),
+            id: id.to_string(),
+        }
+    }
+
     /// History audio upkeep (#342): replace every settled journal with
     /// its verified FLAC, then apply the retention policy (nothing while
     /// it is off). The guard covers only the cheap steps — listing the
     /// candidates, each publish, the policy run — never an encode, so a
     /// long take's compression does not pin every other store call.
+    /// `policy` is read under the guard right before the policy run, so
+    /// a limit the user lifted while the pass compressed is not applied.
     pub(crate) fn audio_upkeep(
         &self,
-        policy: &RetentionPolicy,
+        policy: impl Fn() -> RetentionPolicy,
     ) -> Result<UpkeepReport, storage::StorageError> {
         let mut report = UpkeepReport::default();
         let jobs = lock_v2(&self.0)
@@ -658,8 +684,9 @@ impl Store {
                 Err(err) => report.failures.push((job.id.clone(), err.to_string())),
             }
         }
-        report.retention = lock_v2(&self.0)
-            .apply_retention_policy_now(policy)
+        let mut store = lock_v2(&self.0);
+        report.retention = store
+            .apply_retention_policy_now(&policy())
             .map_err(v2_err)?;
         Ok(report)
     }
@@ -720,6 +747,19 @@ impl Store {
         let mut store = lock_v2(&self.0);
         let committed = finalized.commit_marked(&mut store, mark).map_err(v2_err)?;
         Ok(committed.record.id)
+    }
+}
+
+/// A [`Store::pin_audio`] guard. Dropping it takes the store lock: never
+/// drop one while holding that lock.
+pub(crate) struct AudioPin {
+    store: Arc<Mutex<StoreV2>>,
+    id: String,
+}
+
+impl Drop for AudioPin {
+    fn drop(&mut self) {
+        lock_v2(&self.store).unpin_audio(&self.id);
     }
 }
 
@@ -1006,6 +1046,7 @@ pub(crate) fn v2_summary(
         // The capture id *is* the journal linkage in v2; there is no
         // separate v1 journal to point at.
         journal_id: None,
+        archival: record.retention_class == store_v2::ARCHIVAL_CLASS,
     }
 }
 
@@ -1756,7 +1797,7 @@ mod tests {
         assert_eq!(*before, *saved.wav, "the first transcription's audio");
 
         let upkeep = store
-            .audio_upkeep(&store_v2::RetentionPolicy::default())
+            .audio_upkeep(store_v2::RetentionPolicy::default)
             .expect("upkeep");
         assert_eq!(upkeep.compressed, 1);
         assert!(upkeep.saved_bytes > 0);
@@ -1766,10 +1807,60 @@ mod tests {
         assert_eq!(*after, *before);
         // A second pass finds nothing to do.
         let again = store
-            .audio_upkeep(&store_v2::RetentionPolicy::default())
+            .audio_upkeep(store_v2::RetentionPolicy::default)
             .expect("upkeep");
         assert_eq!(again.compressed, 0);
         assert!(again.summary().is_none());
+    }
+
+    #[test]
+    fn archiving_a_take_moves_it_under_the_archival_limits() {
+        let store = v2_store("upkeep-archive");
+        let id = transcribed(&store, "an archived take");
+        assert!(!summary_of(&store, &id).archival);
+        store.set_archival(&id, true).expect("archive");
+        assert!(summary_of(&store, &id).archival);
+        // A standard-only limit no longer reaches it; the archival one does.
+        let mut policy = store_v2::RetentionPolicy::default();
+        policy.grace = std::time::Duration::ZERO;
+        let expired = store_v2::ClassLimits {
+            max_age_days: Some(0),
+            max_total_bytes: None,
+        };
+        policy
+            .limits
+            .insert(store_v2::STANDARD_CLASS.to_string(), expired);
+        let upkeep = store.audio_upkeep(|| policy.clone()).expect("upkeep");
+        assert!(upkeep.retention.retired.is_empty());
+        policy
+            .limits
+            .insert(store_v2::ARCHIVAL_CLASS.to_string(), expired);
+        let upkeep = store.audio_upkeep(|| policy.clone()).expect("upkeep");
+        assert_eq!(upkeep.retention.retired.len(), 1);
+        store.set_archival(&id, false).expect("unarchive");
+        assert!(!summary_of(&store, &id).archival);
+    }
+
+    #[test]
+    fn a_pinned_take_keeps_its_audio_until_the_pin_drops() {
+        let store = v2_store("upkeep-pin");
+        let id = transcribed(&store, "pinned");
+        let mut policy = store_v2::RetentionPolicy::default();
+        policy.grace = std::time::Duration::ZERO;
+        policy.limits.insert(
+            store_v2::STANDARD_CLASS.to_string(),
+            store_v2::ClassLimits {
+                max_age_days: Some(0),
+                max_total_bytes: None,
+            },
+        );
+        let pin = store.pin_audio(&id);
+        let upkeep = store.audio_upkeep(|| policy.clone()).expect("upkeep");
+        assert!(upkeep.retention.retired.is_empty());
+        assert!(store.audio_wav(&id).expect("load").is_some());
+        drop(pin);
+        let upkeep = store.audio_upkeep(|| policy.clone()).expect("upkeep");
+        assert_eq!(upkeep.retention.retired.len(), 1);
     }
 
     #[test]
@@ -1785,7 +1876,7 @@ mod tests {
                 max_total_bytes: None,
             },
         );
-        let upkeep = store.audio_upkeep(&policy).expect("upkeep");
+        let upkeep = store.audio_upkeep(|| policy.clone()).expect("upkeep");
         assert_eq!(upkeep.retention.retired.len(), 1);
         assert!(
             upkeep.summary().expect("summary").contains("removed the audio of 1 recording"),
