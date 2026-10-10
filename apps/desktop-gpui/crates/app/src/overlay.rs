@@ -21,11 +21,13 @@
 //!   the compositor decides where the overlay goes, whether it floats,
 //!   and whether it takes focus. The window's app id is
 //!   [`OVERLAY_APP_ID`] so a compositor rule can float it unfocused.
-//! - **Windows**: gpui makes a `WS_EX_TOOLWINDOW` pop-up and shows new
-//!   windows activated; the overlay opens hidden, adds `WS_EX_TOPMOST` and
-//!   `WS_EX_NOACTIVATE` itself and shows itself without activation
-//!   ([`show_on_top_without_focus`]), so it stays above other windows and
-//!   neither opening nor a click on Cancel activates it. **macOS**: a pop-up-level
+//! - **Windows**: gpui makes a `WS_EX_TOOLWINDOW` pop-up, neither topmost
+//!   nor non-activating; once it is open the overlay adds `WS_EX_TOPMOST`
+//!   and `WS_EX_NOACTIVATE` ([`keep_on_top_without_focus`]), so it stays
+//!   above other windows and a click on Cancel does not activate it.
+//!   gpui's own first show may still activate it (it restores the window
+//!   placement); that is left to gpui rather than re-implementing its
+//!   window sizing here. **macOS**: a pop-up-level
 //!   window. Both open on the primary display (no pointer lookup here);
 //!   neither was run for this change (the Windows part is compile-checked
 //!   only).
@@ -570,8 +572,7 @@ impl StarlingApp {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: None,
                 focus: false,
-                // Windows: shown by `show_on_top_without_focus`.
-                show: !cfg!(target_os = "windows"),
+                show: true,
                 kind: WindowKind::PopUp,
                 is_movable: false,
                 is_resizable: false,
@@ -598,17 +599,15 @@ impl StarlingApp {
             let opened = cx.open_window(options, |_window, cx| {
                 cx.new(|cx| OverlayView::new(app, cx))
             });
-            this.update(cx, |this, cx| {
+            let kept = this.update(cx, |this, cx| {
                 let current = this.overlay.generation == generation;
                 if current {
                     this.overlay.opening = None;
                 }
+                let mut kept = None;
                 match opened {
                     Ok(window) if current => {
-                        #[cfg(target_os = "windows")]
-                        window
-                            .update(cx, |_, window, _| show_on_top_without_focus(window, bounds))
-                            .ok();
+                        kept = Some(window);
                         this.overlay.window = Some(window);
                         this.overlay.window_mode = mode;
                     }
@@ -622,35 +621,48 @@ impl StarlingApp {
                 }
                 // The phase may have moved on while the window opened.
                 this.sync_overlay(cx);
-            })
-            .ok();
+                kept
+            });
+            // Outside every gpui borrow, so the window messages the change
+            // sends reach gpui.
+            #[cfg(target_os = "windows")]
+            if let Some(hwnd) = kept.ok().flatten().and_then(|window| {
+                window
+                    .update(cx, |_, window, _| overlay_hwnd(window))
+                    .ok()
+                    .flatten()
+            }) {
+                keep_on_top_without_focus(hwnd);
+            }
+            #[cfg(not(target_os = "windows"))]
+            let _ = kept;
         })
         .detach();
     }
 }
 
-/// gpui's Windows pop-up is neither topmost nor non-activating, and gpui
-/// shows a new window activated: the overlay opens hidden there, gets both
-/// styles, and is then shown at `bounds` (logical pixels) without being
-/// activated, so it stays above the app being dictated into and never
-/// takes that app's focus.
+/// The overlay's native window handle (Windows).
 #[cfg(target_os = "windows")]
-fn show_on_top_without_focus(window: &gpui::Window, bounds: Bounds<Pixels>) {
+fn overlay_hwnd(window: &gpui::Window) -> Option<isize> {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    match window.window_handle().ok()?.as_raw() {
+        RawWindowHandle::Win32(handle) => Some(handle.hwnd.get()),
+        _ => None,
+    }
+}
+
+/// gpui's Windows pop-up is neither topmost nor non-activating: adds both,
+/// so the overlay stays above the app being dictated into and clicking it
+/// never takes that app's focus. Neither moves nor resizes the window.
+/// Call it outside gpui updates.
+#[cfg(target_os = "windows")]
+fn keep_on_top_without_focus(hwnd: isize) {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::{
         GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos, GWL_EXSTYLE, HWND_TOPMOST,
-        SWP_NOACTIVATE, SWP_SHOWWINDOW, WS_EX_NOACTIVATE, WS_EX_TOPMOST,
+        SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, WS_EX_NOACTIVATE, WS_EX_TOPMOST,
     };
-    let Ok(handle) = window.window_handle() else {
-        return;
-    };
-    let RawWindowHandle::Win32(handle) = handle.as_raw() else {
-        return;
-    };
-    let hwnd = HWND(handle.hwnd.get() as *mut core::ffi::c_void);
-    let scale = window.scale_factor();
-    let device = |value: Pixels| (f32::from(value) * scale).round() as i32;
+    let hwnd = HWND(hwnd as *mut core::ffi::c_void);
     // SAFETY: `hwnd` is the live overlay window, owned by this thread.
     unsafe {
         let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
@@ -662,11 +674,11 @@ fn show_on_top_without_focus(window: &gpui::Window, bounds: Bounds<Pixels>) {
         let _ = SetWindowPos(
             hwnd,
             Some(HWND_TOPMOST),
-            device(bounds.origin.x),
-            device(bounds.origin.y),
-            device(bounds.size.width),
-            device(bounds.size.height),
-            SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
         );
     }
 }

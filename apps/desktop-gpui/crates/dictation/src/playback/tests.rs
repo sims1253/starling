@@ -587,10 +587,13 @@ fn a_restore_that_keeps_failing_tells_the_user() {
     handle.flush();
     *backend.failing_applies.lock().unwrap() = RESTORE_ATTEMPTS;
     handle.end(lease);
-    // The cue (#221) right after it is not played into the still-muted
-    // output; later ones are not held back by it.
+    // The cues (#221) are not played into the still-muted output until
+    // the next take begins (whatever its mode): the user was told.
     assert!(!handle.settled().recv().unwrap());
+    assert!(!handle.settled().recv().unwrap());
+    let next = handle.begin(&PlaybackSettings::default());
     assert!(handle.settled().recv().unwrap());
+    handle.end(next);
     let notices = handle.take_notices();
     assert_eq!(notices.len(), 1);
     assert_eq!(notices[0].kind, NoticeKind::RestoreFailed);
