@@ -9,6 +9,7 @@
 #include "runtime/call_abort.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cmath>
 #include <chrono>
@@ -273,43 +274,77 @@ double expected_words(int64_t words, const std::vector<uint8_t>& flags, int64_t 
 }
 }  // namespace
 
+namespace {
+// The back-to-back run of one phrase (1..max_n words, more than max_repeats
+// copies) covering the most words: {start, phrase length, repeats}, the
+// earliest, then the shortest phrase on a tie; {0, 0, 0} when there is none.
+// Port of _longest_repeat() in stream_chunk.py.
+std::array<size_t, 3> longest_repeat(const std::vector<std::string>& keys,
+                                     size_t max_repeats, size_t max_n) {
+    std::array<size_t, 3> best{0, 0, 0};
+    const size_t len = keys.size();
+    for (size_t i = 0; i < len; ++i) {
+        for (size_t n = 1; n <= max_n; ++n) {
+            if (i + n * (max_repeats + 1) > len) break;
+            size_t reps = 1;
+            while (i + (reps + 1) * n <= len
+                   && std::equal(keys.begin() + i, keys.begin() + i + n,
+                                 keys.begin() + i + reps * n)) {
+                ++reps;
+            }
+            if (reps > max_repeats && reps * n > best[1] * best[2]) best = {i, n, reps};
+        }
+    }
+    return best;
+}
+
+// Cut a run found by longest_repeat() to `keep` copies, in words and keys.
+void cut_run(std::vector<std::string>& words, std::vector<std::string>& keys,
+             const std::array<size_t, 3>& run, size_t keep) {
+    const auto from = static_cast<std::ptrdiff_t>(run[0] + keep * run[1]);
+    const auto to = static_cast<std::ptrdiff_t>(run[0] + run[2] * run[1]);
+    words.erase(words.begin() + from, words.begin() + to);
+    keys.erase(keys.begin() + from, keys.begin() + to);
+}
+
+std::vector<std::string> norm_keys(const std::vector<std::string>& words) {
+    std::vector<std::string> keys;
+    keys.reserve(words.size());
+    for (const auto& w : words) keys.push_back(norm_word(w));
+    return keys;
+}
+
+// A preview loop: one phrase repeated back to back more than this many
+// times, covering at least kPreviewLoopMinWords words.
+constexpr size_t kPreviewLoopMaxRepeats = 3;
+constexpr size_t kPreviewLoopMinWords = 8;
+}  // namespace
+
 std::vector<std::string> suppress_loops(const std::vector<std::string>& words,
                                         double seconds, int max_repeats, int max_n) {
     const size_t bound = static_cast<size_t>(std::max(0, max_plausible_words(seconds)));
     std::vector<std::string> out = words;
-    std::vector<std::string> keys;
-    keys.reserve(out.size());
-    for (const auto& w : out) keys.push_back(norm_word(w));
+    std::vector<std::string> keys = norm_keys(out);
     const size_t reps_max = static_cast<size_t>(std::max(0, max_repeats));
     while (out.size() > bound) {
-        // The run of one phrase (more than max_repeats copies back to back)
-        // covering the most words; the earliest, then shortest, wins a tie.
-        size_t best_i = 0, best_n = 0, best_reps = 0;
-        const size_t len = keys.size();
-        for (size_t i = 0; i < len; ++i) {
-            for (size_t n = 1; n <= static_cast<size_t>(max_n); ++n) {
-                if (i + n * (reps_max + 1) > len) break;
-                size_t reps = 1;
-                while (i + (reps + 1) * n <= len
-                       && std::equal(keys.begin() + i, keys.begin() + i + n,
-                                     keys.begin() + i + reps * n)) {
-                    ++reps;
-                }
-                if (reps > reps_max && reps * n > best_reps * best_n) {
-                    best_i = i;
-                    best_n = n;
-                    best_reps = reps;
-                }
-            }
-        }
-        if (!best_n) break;
-        const auto from = static_cast<std::ptrdiff_t>(best_i + reps_max * best_n);
-        const auto to = static_cast<std::ptrdiff_t>(best_i + best_reps * best_n);
-        out.erase(out.begin() + from, out.begin() + to);
-        keys.erase(keys.begin() + from, keys.begin() + to);
+        const auto run = longest_repeat(keys, reps_max, static_cast<size_t>(max_n));
+        if (!run[1]) break;
+        cut_run(out, keys, run, reps_max);
     }
     if (out.size() > bound) out.resize(bound);
     return out;
+}
+
+std::vector<std::string> suppress_preview_loops(const std::vector<std::string>& words,
+                                                double seconds, int max_n) {
+    std::vector<std::string> out = suppress_loops(words, seconds, 2, max_n);
+    std::vector<std::string> keys = norm_keys(out);
+    for (;;) {
+        const auto run = longest_repeat(keys, kPreviewLoopMaxRepeats,
+                                        static_cast<size_t>(max_n));
+        if (!run[1] || run[1] * run[2] < kPreviewLoopMinWords) return out;
+        cut_run(out, keys, run, 2);
+    }
 }
 
 // ---- ChunkStreamer --------------------------------------------------------
@@ -695,7 +730,7 @@ std::optional<std::string> ChunkStreamer::step(
     // it), but never with a decoding loop in it (issue #357).
     const int64_t n = static_cast<int64_t>(samples.size());
     return join_words(stitched(Decoded{
-        suppress_loops(split_words(*text), static_cast<double>(tail_len) / sr_),
+        suppress_preview_loops(split_words(*text), static_cast<double>(tail_len) / sr_),
         boundary_, n, voiced_frames(samples.data() + boundary_, tail_len, sr_)}));
 }
 

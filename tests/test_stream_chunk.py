@@ -21,6 +21,7 @@ from starling.stream_chunk import (
     stitch_words,
     stream_window_config_error,
     suppress_loops,
+    suppress_preview_loops,
     voiced_seconds,
 )
 
@@ -622,7 +623,7 @@ def _parse_cases() -> list[dict]:
         if not line or line.startswith("#"):
             continue
         tag, _, rest = line.partition(" ")
-        if tag in ("stitch", "suppress", "stream"):
+        if tag in ("stitch", "suppress", "preview", "stream"):
             cases.append({"op": tag, "args": rest.split(), "tx": []})
         elif tag in ("<", ">", "="):
             cases[-1][tag] = rest.split()
@@ -679,6 +680,8 @@ def test_stitch_fixture_case(case):
         assert stitch_words(case.get("<", []), case.get(">", [])) == case["="]
     elif case["op"] == "suppress":
         assert suppress_loops(case["<"], float(case["args"][1])) == case["="]
+    elif case["op"] == "preview":
+        assert suppress_preview_loops(case["<"], float(case["args"][1])) == case["="]
     else:
         final, calls = _replay_stream(case)
         assert final == case["="]

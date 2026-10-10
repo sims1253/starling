@@ -83,6 +83,12 @@ std::vector<uint8_t> voiced_frames(const float* samples, int64_t n, int sample_r
 std::vector<std::string> suppress_loops(const std::vector<std::string>& words,
                                         double seconds, int max_repeats = 2,
                                         int max_n = 8);
+// suppress_loops() for a preview, which also cuts every phrase repeated
+// back to back more than 3 times (covering 8 or more words) to two copies,
+// within the bound too: a preview never becomes the final, so a phrase said
+// four times shows twice for a moment while a decoding loop never shows.
+std::vector<std::string> suppress_preview_loops(const std::vector<std::string>& words,
+                                                double seconds, int max_n = 8);
 
 // Split a string on whitespace into words (matching Python's str.split()).
 std::vector<std::string> split_words(const std::string& s);

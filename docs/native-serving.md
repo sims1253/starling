@@ -451,10 +451,12 @@ fixture, `tests/fixtures/stream_stitch_cases.txt`):
   above the span's quiet floor and above -60 dBFS.
 - Text over the word bound has its longest back-to-back repeated phrase cut
   to two copies, one run at a time, only until it fits, and is cut at the
-  bound if it still does not. Previews (never re-decoded) get this, so a
-  decoding loop never reaches the client, and so does a committed window
-  whose every re-decode loops. Text within the bound is not touched, so real
-  repeated speech survives.
+  bound if it still does not. A committed window whose every re-decode loops
+  gets this; text within the bound is not touched, so real repeated speech
+  survives in the final. Previews (never re-decoded, replaced by the next one)
+  get it too, and additionally have any phrase repeated back to back more
+  than three times (8 words or more) cut to two copies, so a decoding loop
+  never reaches the client.
 With opt-in Granite chunk fairness, a blocking queue timeout ends the current
 take with `request timed out`; it is not retried as `server busy`. Reset the
 stream before sending more audio.

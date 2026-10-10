@@ -351,7 +351,7 @@ std::vector<FixtureCase> load_fixture_cases() {
         if (words.empty() || words[0][0] == '#') continue;
         const std::string tag = words[0];
         std::vector<std::string> rest(words.begin() + 1, words.end());
-        if (tag == "stitch" || tag == "suppress" || tag == "stream") {
+        if (tag == "stitch" || tag == "suppress" || tag == "preview" || tag == "stream") {
             FixtureCase c;
             c.op = tag;
             c.name = rest.empty() ? "" : rest[0];
@@ -401,6 +401,11 @@ static void test_stitch_fixture_cases() {
         } else if (c.op == "suppress") {
             const bool ok = suppress_loops(c.committed, std::stod(c.args.at(1))) == c.expect;
             if (!ok) std::fprintf(stderr, "suppress case %s differs\n", c.name.c_str());
+            CHECK(ok);
+        } else if (c.op == "preview") {
+            const bool ok =
+                suppress_preview_loops(c.committed, std::stod(c.args.at(1))) == c.expect;
+            if (!ok) std::fprintf(stderr, "preview case %s differs\n", c.name.c_str());
             CHECK(ok);
         } else {
             std::vector<float> samples;

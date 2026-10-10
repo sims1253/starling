@@ -9,6 +9,9 @@
 # suppress <name> <seconds>   suppress_loops(words, seconds)
 #   < words
 #   = expected words
+# preview <name> <seconds>    suppress_preview_loops(words, seconds)
+#   < words
+#   = expected words
 # stream <name> <chunk_s> <overlap_s>   ChunkStreamer.flush over synthetic audio
 #   audio <seconds> <amplitude> ...     constant-amplitude segments, 16 kHz
 #   tx <kind> <start_s> <length_s> <text...>   the transcriber's answer for a
@@ -81,6 +84,14 @@ suppress real_repetition_within_bound 2
 suppress real_repetition_beside_a_loop 12
 < no no no no no I said la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la
 = no no no no no I said la la
+
+preview loop_within_the_bound 12
+< then a little bit of a little bit of a little bit of a little bit of a little bit of a little bit of a so on
+= then a little bit of a little bit of a so on
+
+preview short_or_rare_repeats_stay 12
+< no no no no I said no no no yes yes yes and then
+= no no no no I said no no no yes yes yes and then
 
 suppress over_bound_without_repeats 1
 < w1 w2 w3 w4 w5 w6 w7 w8 w9 w10 w11 w12 w13 w14 w15

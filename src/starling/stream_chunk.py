@@ -274,6 +274,28 @@ def suppress_loops(words: list[str], seconds: float, *, max_repeats: int = 2,
     return out[:max(bound, 0)]
 
 
+# A preview loop: one phrase repeated back to back more than this many times,
+# covering at least _PREVIEW_LOOP_MIN_WORDS words (stream_replay.py counts the
+# same as a looping partial).
+_PREVIEW_LOOP_MAX_REPEATS = 3
+_PREVIEW_LOOP_MIN_WORDS = 8
+
+
+def suppress_preview_loops(words: list[str], seconds: float, *, max_n: int = 8) -> list[str]:
+    """suppress_loops() for a preview, which also cuts every loop within the
+    bound to two copies: a preview is replaced by the next one and never
+    becomes the final, so a phrase said four times shows twice for a moment
+    while a decoding loop never shows."""
+    out = suppress_loops(words, seconds, max_n=max_n)
+    keys = [_norm(w) for w in out]
+    while True:
+        i, n, reps = _longest_repeat(keys, _PREVIEW_LOOP_MAX_REPEATS, max_n)
+        if not n or n * reps < _PREVIEW_LOOP_MIN_WORDS:
+            return out
+        cut = slice(i + 2 * n, i + reps * n)
+        del out[cut], keys[cut]
+
+
 # Text transcription of a mono float32 window -> its text, or ``None`` if the
 # transcribe could not run right now (e.g. server busy) and this step should be
 # skipped without advancing state.
@@ -689,7 +711,7 @@ class ChunkStreamer:
         self.emit_due = False
         # A preview is shown as decoded (no re-decode: the next one replaces
         # it), but never with a decoding loop in it (issue #357).
-        return " ".join(self._stitched(suppress_loops(text.split(), tail_len / self.sr),
+        return " ".join(self._stitched(suppress_preview_loops(text.split(), tail_len / self.sr),
                                        self.boundary, len(samples),
                                        voiced_frames(samples[self.boundary:], self.sr)))
 
