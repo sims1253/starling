@@ -223,7 +223,9 @@ std::optional<std::pair<int, int>> stitch_timed(
     const std::vector<int64_t>& committed_starts,
     const std::vector<std::string>& new_words,
     const std::vector<int64_t>& new_starts,
-    int64_t center, int64_t tolerance) {
+    int64_t lo, int64_t hi, int64_t tolerance) {
+    if (hi <= lo) return std::nullopt;
+    const int64_t center = (lo + hi) / 2;
     const int n = static_cast<int>(committed.size());
     const int m = static_cast<int>(new_words.size());
     std::vector<std::string> a, b;
@@ -235,20 +237,35 @@ std::optional<std::pair<int, int>> stitch_timed(
         const int64_t diff = std::llabs(committed_starts[i] - new_starts[j]);
         return diff <= tolerance ? diff : -1;
     };
-    // (pairs, total start difference): more pairs, then a smaller total.
-    using Score = std::pair<int, int64_t>;
+    // (pairs, pairs inside [lo, hi), total start difference).
+    struct Score {
+        int pairs = 0, inside = 0;
+        int64_t diff = 0;
+        bool operator==(const Score& o) const {
+            return pairs == o.pairs && inside == o.inside && diff == o.diff;
+        }
+    };
+    auto with_pair = [&](const Score& s, int i, int j, int64_t g) {
+        const bool inside = lo <= committed_starts[i] && committed_starts[i] < hi
+                         && lo <= new_starts[j] && new_starts[j] < hi;
+        return Score{s.pairs + 1, s.inside + (inside ? 1 : 0), s.diff + g};
+    };
+    // More pairs, then more pairs inside the shared audio, then a smaller
+    // total start difference.
     auto better = [](const Score& x, const Score& y) {
-        return x.first > y.first || (x.first == y.first && x.second < y.second);
+        if (x.pairs != y.pairs) return x.pairs > y.pairs;
+        if (x.inside != y.inside) return x.inside > y.inside;
+        return x.diff < y.diff;
     };
     // d[i][j]: the best score between committed[0, i) and new_words[0, j).
-    std::vector<std::vector<Score>> d(n + 1, std::vector<Score>(m + 1, Score{0, 0}));
+    std::vector<std::vector<Score>> d(n + 1, std::vector<Score>(m + 1));
     for (int i = 1; i <= n; ++i) {
         for (int j = 1; j <= m; ++j) {
             Score cell = d[i - 1][j];
             if (better(d[i][j - 1], cell)) cell = d[i][j - 1];
             const int64_t g = gap(i - 1, j - 1);
             if (g >= 0) {
-                const Score diag{d[i - 1][j - 1].first + 1, d[i - 1][j - 1].second + g};
+                const Score diag = with_pair(d[i - 1][j - 1], i - 1, j - 1, g);
                 if (better(diag, cell)) cell = diag;
             }
             d[i][j] = cell;
@@ -258,8 +275,7 @@ std::optional<std::pair<int, int>> stitch_timed(
     int64_t best = 0;
     for (int i = n, j = m; i > 0 && j > 0;) {
         const int64_t g = gap(i - 1, j - 1);
-        if (g >= 0
-            && d[i][j] == Score{d[i - 1][j - 1].first + 1, d[i - 1][j - 1].second + g}) {
+        if (g >= 0 && d[i][j] == with_pair(d[i - 1][j - 1], i - 1, j - 1, g)) {
             // Walking back: an equally close earlier pair replaces a later
             // one (the earlier pair wins a tie).
             const int64_t dist =
@@ -664,7 +680,7 @@ ChunkStreamer::stitched(const Decoded& d) const {
         for (const auto& sp : tail_spans) tail_starts.push_back(sp->first);
         for (const auto& sp : *d.spans) new_starts.push_back(sp.first);
         cut = stitch_timed(tail, tail_starts, d.words, new_starts,
-                           (2 * rebased_ + lo + hi) / 2, time_tolerance_);
+                           rebased_ + lo, rebased_ + hi, time_tolerance_);
         if (!cut) cut = std::make_pair(static_cast<int>(tail.size()), 0);
     }
     if (!cut) {

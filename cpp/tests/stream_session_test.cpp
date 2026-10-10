@@ -416,7 +416,7 @@ int64_t nearest_sample(double seconds) {
     return static_cast<int64_t>(std::floor(seconds * 16000.0 + 0.5));
 }
 
-// tstitch: the chunker's timed stitch at the given overlap center; no shared
+// tstitch: the chunker's timed stitch over the given shared audio; no shared
 // word concatenates.
 std::vector<std::string> fixture_stitch_timed(const FixtureCase& c) {
     std::vector<std::string> a, b;
@@ -432,6 +432,7 @@ std::vector<std::string> fixture_stitch_timed(const FixtureCase& c) {
         bs.push_back(nearest_sample(w.start));
     }
     const auto cut = stitch_timed(a, as, b, bs, nearest_sample(std::stod(c.args.at(1))),
+                                  nearest_sample(std::stod(c.args.at(2))),
                                   static_cast<int64_t>(kStitchTimeToleranceSeconds * 16000));
     const auto [keep, skip] = cut ? *cut : std::make_pair(static_cast<int>(a.size()), 0);
     std::vector<std::string> out(a.begin(), a.begin() + keep);

@@ -62,23 +62,25 @@ std::pair<int, int> stitch_cut(
 // window's edge.
 constexpr double kStitchTimeToleranceSeconds = 0.3;
 
-// The cut from word start times (any common unit, e.g. take samples):
-// {keep, skip} for committed[:keep] + new_words[skip:], or nullopt when no
-// word was heard by both windows. A committed and a new word are the same
-// when their norm_word() keys match (nonempty) and their starts are at most
-// `tolerance` apart; the most such pairs in order (a longest common
-// subsequence; among those, the smallest total start difference, so a word
-// said several times in a row pairs with the same occurrence) form the
-// alignment, so text repeated elsewhere or a common word far from the
-// boundary cannot match and one shared word is enough.
-// The cut is the pair closest to `center` (the middle of the shared audio;
-// the earlier pair on a tie). Port of stitch_timed() in stream_chunk.py.
+// The cut from word start times (any common unit, e.g. take samples) and
+// the audio both windows heard, [lo, hi): {keep, skip} for committed[:keep] +
+// new_words[skip:], or nullopt when no word was heard by both windows (or
+// they share no audio). A committed and a new word are the same when their
+// norm_word() keys match (nonempty) and their starts are at most `tolerance`
+// apart. The alignment is the most such pairs in order (a longest common
+// subsequence); among those, the one with the most pairs inside [lo, hi)
+// (a word only one window heard cannot pair), then the smallest total start
+// difference, so a word said several times in a row pairs with the same
+// occurrence. Text repeated elsewhere or a common word far from the
+// boundary cannot match and one shared word is enough. The cut is the pair
+// closest to the middle of [lo, hi) (the earlier pair on a tie). Port of
+// stitch_timed() in stream_chunk.py.
 std::optional<std::pair<int, int>> stitch_timed(
     const std::vector<std::string>& committed,
     const std::vector<int64_t>& committed_starts,
     const std::vector<std::string>& new_words,
     const std::vector<int64_t>& new_starts,
-    int64_t center, int64_t tolerance);
+    int64_t lo, int64_t hi, int64_t tolerance);
 
 // ---- window plausibility (issue #357) ---------------------------------------
 // Parakeet sometimes stops emitting partway through a window, or emits
@@ -347,7 +349,8 @@ private:
     int verdict(size_t words, double seconds, double voiced) const;
     // committed_ and its spans with d.words stitched onto its unfrozen
     // tail: by time when both sides have word times (stitch_timed; without
-    // a shared word the two are concatenated), otherwise by words
+    // a shared word or shared audio the two are concatenated), otherwise by
+    // words
     // (stitch_cut), where each side's share of speech in the audio both
     // decodes heard predicts how many of its words the overlap holds.
     std::pair<std::vector<std::string>, std::vector<std::optional<Span>>>

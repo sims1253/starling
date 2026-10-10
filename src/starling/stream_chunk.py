@@ -183,27 +183,33 @@ def stitch_timed(
     new: list[str],
     new_starts: list[int],
     *,
-    center: int,
+    lo: int,
+    hi: int,
     tolerance: int,
 ) -> Optional[tuple[int, int]]:
     """Like :func:`stitch_cut`, from word start times (any common unit, e.g.
-    take samples): ``(keep, skip)`` for ``committed[:keep] + new[skip:]``,
-    or ``None`` when no word was heard by both windows.
+    take samples) and the audio both windows heard, ``[lo, hi)``:
+    ``(keep, skip)`` for ``committed[:keep] + new[skip:]``, or ``None`` when
+    no word was heard by both windows (or they share no audio).
 
     A committed word and a new word are the same when their keys match and
-    their starts are at most ``tolerance`` apart. The most such pairs in
-    order (a longest common subsequence; among those, the smallest total
-    start difference, so a word said several times in a row pairs with the
-    same occurrence) form the alignment, so text a window repeats elsewhere
-    ("one two one two") or a common word far from the boundary cannot match,
-    and a single shared word is enough. The cut is the pair closest to
-    ``center`` (the middle of the shared audio, where both windows have the
-    most context; the earlier pair on a tie): ``committed`` up to and
-    including it, then ``new`` after it.
+    their starts are at most ``tolerance`` apart. The alignment is the most
+    such pairs in order (a longest common subsequence); among those, the one
+    with the most pairs inside the shared audio (a word only one window
+    heard cannot pair), then the smallest total start difference, so a word
+    said several times in a row pairs with the same occurrence. Text a
+    window repeats elsewhere ("one two one two") or a common word far from
+    the boundary cannot match, and a single shared word is enough. The cut
+    is the pair closest to the middle of the shared audio (where both
+    windows have the most context; the earlier pair on a tie): ``committed``
+    up to and including it, then ``new`` after it.
 
     Kept in lockstep with ``stitch_timed`` in cpp/serve/stream_session.cpp,
     including the tie-breaking.
     """
+    if hi <= lo:
+        return None
+    center = (lo + hi) // 2
     n, m = len(committed), len(new)
     a = [_norm(w) for w in committed]
     b = [_norm(w) for w in new]
@@ -215,13 +221,21 @@ def stitch_timed(
         diff = abs(committed_starts[i] - new_starts[j])
         return diff if diff <= tolerance else None
 
-    def better(x: tuple[int, int], y: tuple[int, int]) -> bool:
-        """More pairs, then a smaller total start difference."""
-        return x[0] > y[0] or (x[0] == y[0] and x[1] < y[1])
+    def pair_score(i: int, j: int, g: int) -> tuple[int, int, int]:
+        inside = lo <= committed_starts[i] < hi and lo <= new_starts[j] < hi
+        return (1, int(inside), g)
 
-    # d[i][j]: (most pairs, their least total start difference) between
-    # committed[:i] and new[:j].
-    d = [[(0, 0)] * (m + 1) for _ in range(n + 1)]
+    def add(x: tuple[int, int, int], y: tuple[int, int, int]) -> tuple[int, int, int]:
+        return (x[0] + y[0], x[1] + y[1], x[2] + y[2])
+
+    def better(x: tuple[int, int, int], y: tuple[int, int, int]) -> bool:
+        """More pairs, then more pairs inside the shared audio, then a
+        smaller total start difference."""
+        return (x[0], x[1], -x[2]) > (y[0], y[1], -y[2])
+
+    # d[i][j]: the best (pairs, pairs inside, total start difference)
+    # between committed[:i] and new[:j].
+    d = [[(0, 0, 0)] * (m + 1) for _ in range(n + 1)]
     for i in range(1, n + 1):
         for j in range(1, m + 1):
             cell = d[i - 1][j]
@@ -229,7 +243,7 @@ def stitch_timed(
                 cell = d[i][j - 1]
             g = gap(i - 1, j - 1)
             if g is not None:
-                diag = (d[i - 1][j - 1][0] + 1, d[i - 1][j - 1][1] + g)
+                diag = add(d[i - 1][j - 1], pair_score(i - 1, j - 1, g))
                 if better(diag, cell):
                     cell = diag
             d[i][j] = cell
@@ -237,7 +251,7 @@ def stitch_timed(
     i, j = n, m
     while i > 0 and j > 0:
         g = gap(i - 1, j - 1)
-        if g is not None and d[i][j] == (d[i - 1][j - 1][0] + 1, d[i - 1][j - 1][1] + g):
+        if g is not None and d[i][j] == add(d[i - 1][j - 1], pair_score(i - 1, j - 1, g)):
             pairs.append((i - 1, j - 1))
             i, j = i - 1, j - 1
         elif d[i][j] == d[i - 1][j]:
@@ -676,7 +690,8 @@ class ChunkStreamer:
         buffer[start:end], with those voiced ``flags`` and word ``spans``)
         stitched onto its unfrozen tail. With times on both sides, the words
         both windows heard at the same time are deduplicated
-        (stitch_timed; without one, the two are concatenated). Otherwise
+        (stitch_timed; without one, or without shared audio, the two are
+        concatenated). Otherwise
         the words are aligned (stitch_cut), and each side's share of speech
         in the audio both decodes heard predicts how many of its words the
         overlap holds."""
@@ -687,9 +702,9 @@ class ChunkStreamer:
                 and all(t is not None for t in tail_spans)):
             _, last_start, last_len, _ = self.last
             lo, hi = max(start, last_start), min(end, last_start + last_len)
-            center = (2 * self.rebased + lo + hi) // 2
             cut = stitch_timed(tail, [t[0] for t in tail_spans], words, [t[0] for t in spans],
-                               center=center, tolerance=self.time_tolerance)
+                               lo=self.rebased + lo, hi=self.rebased + hi,
+                               tolerance=self.time_tolerance)
             if cut is None:
                 cut = (len(tail), 0)
         if cut is None:

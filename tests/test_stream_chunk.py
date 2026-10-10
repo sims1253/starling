@@ -717,7 +717,7 @@ def _transcript(tokens: list[str]) -> Transcript:
 
 
 def _stitch_timed_case(case: dict) -> list[str]:
-    """tstitch: the chunker's timed stitch at the given overlap center; no
+    """tstitch: the chunker's timed stitch over the given shared audio; no
     shared word concatenates."""
     committed = [_timed(t) for t in case.get("<", [])]
     new = [_timed(t) for t in case.get(">", [])]
@@ -725,7 +725,8 @@ def _stitch_timed_case(case: dict) -> list[str]:
                        [int(math.floor(a * SR + 0.5)) for _, a, _ in committed],
                        [w for w, _, _ in new],
                        [int(math.floor(a * SR + 0.5)) for _, a, _ in new],
-                       center=int(math.floor(float(case["args"][1]) * SR + 0.5)),
+                       lo=int(math.floor(float(case["args"][1]) * SR + 0.5)),
+                       hi=int(math.floor(float(case["args"][2]) * SR + 0.5)),
                        tolerance=int(STITCH_TIME_TOLERANCE_SECONDS * SR))
     keep, skip = cut if cut is not None else (len(committed), 0)
     return [w for w, _, _ in committed[:keep]] + [w for w, _, _ in new[skip:]]
