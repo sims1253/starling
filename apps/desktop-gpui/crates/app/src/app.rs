@@ -1579,8 +1579,11 @@ impl StarlingApp {
             .and_then(|id| self.sessions.iter().find(|session| &session.id == id))
     }
 
+    /// Whether take `id` is being transcribed, or a transcription this
+    /// window asked the recording service for has not started yet.
     pub fn is_active(&self, id: &str) -> bool {
         self.active_ids.contains(id)
+            || self.host.requests.values().any(|request| request.stored_id == id)
     }
 
     /// Split a metadata-only listing (G02) into readable summaries and

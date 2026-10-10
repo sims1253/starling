@@ -297,18 +297,18 @@ impl TakeHub {
                 .as_ref()
                 .is_some_and(|recipient| Arc::ptr_eq(recipient, &watcher.conn));
             reached |= yours;
-            let delivered = match take {
-                Some(take) => watcher.deliver_after_tap(take, frame(yours)),
-                None => watcher.conn.try_deliver(frame(yours)).is_ok(),
-            };
-            if yours && !delivered {
-                owed.push((Arc::clone(&watcher.conn), frame(true)));
+            match take {
+                Some(take) if watcher.tapping(take) => {
+                    watcher.deliver_after_tap(take, frame(yours));
+                }
+                _ if yours => deliver_owed(owed, &watcher.conn, frame(true)),
+                _ => {
+                    let _ = watcher.conn.try_deliver(frame(false));
+                }
             }
         }
         if let (Some(recipient), false) = (recipient, reached) {
-            if recipient.try_deliver(frame(true)).is_err() {
-                owed.push((recipient, frame(true)));
-            }
+            deliver_owed(owed, &recipient, frame(true));
         }
     }
 
@@ -539,8 +539,21 @@ impl TakeHub {
             state
                 .watchers
                 .retain(|watcher| !watcher.conn.closed.load(Ordering::SeqCst));
+            // In order, per connection: one that still has no room keeps
+            // the rest of its frames behind the first it could not take.
+            let mut stuck: Vec<Arc<ConnState>> = Vec::new();
             state.owed.retain(|(conn, frame)| {
-                !conn.closed.load(Ordering::SeqCst) && conn.try_deliver(frame.clone()).is_err()
+                if conn.closed.load(Ordering::SeqCst) {
+                    return false;
+                }
+                if stuck.iter().any(|known| Arc::ptr_eq(known, conn)) {
+                    return true;
+                }
+                let held = conn.try_deliver(frame.clone()).is_err();
+                if held {
+                    stuck.push(Arc::clone(conn));
+                }
+                held
             });
             let HubState {
                 live,
@@ -934,11 +947,24 @@ impl CaptureObserver for TakeHub {
                 let theirs = owner
                     .as_ref()
                     .is_some_and(|owner| Arc::ptr_eq(&watcher.conn, owner));
-                if !watcher.deliver_after_tap(corr, frame.clone()) && theirs {
-                    owed.push((Arc::clone(&watcher.conn), frame.clone()));
+                if watcher.tapping(corr) {
+                    watcher.deliver_after_tap(corr, frame.clone());
+                } else if theirs {
+                    deliver_owed(owed, &watcher.conn, frame.clone());
+                } else {
+                    let _ = watcher.conn.try_deliver(frame.clone());
                 }
             }
         }
+    }
+}
+
+/// Sends `frame` to `conn` now, or — when its queue is full, or frames
+/// owed to it wait already — after those, in order.
+fn deliver_owed(owed: &mut Vec<(Arc<ConnState>, Frame)>, conn: &Arc<ConnState>, frame: Frame) {
+    let behind = owed.iter().any(|(owed_to, _)| Arc::ptr_eq(owed_to, conn));
+    if behind || conn.try_deliver(frame.clone()).is_err() {
+        owed.push((Arc::clone(conn), frame));
     }
 }
 

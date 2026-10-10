@@ -384,7 +384,7 @@ impl StarlingApp {
             return;
         };
         let id = session.id.clone();
-        if self.active_ids.contains(&id) || self.is_deleting(&id) {
+        if self.is_active(&id) || self.is_deleting(&id) {
             return;
         }
         self.retry_menu = None;
