@@ -340,7 +340,9 @@ fn a_renderer_killed_with_a_command_in_flight_costs_only_the_receipt() {
     // Wait until the host has observably routed the command, then kill —
     // no fixed sleep guessing at the reader.
     let probe = connect_with_retry(&socket);
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // Generous: loaded Windows CI runners have missed 5 s here (routing,
+    // not timing, is what this waits for).
+    let deadline = Instant::now() + Duration::from_secs(30);
     while probe.snapshot().expect("probe snapshot")["jobs"]["limits"]["maxQueued"] != 3 {
         assert!(Instant::now() < deadline, "the renderer's command was never routed");
         std::thread::sleep(Duration::from_millis(20));
