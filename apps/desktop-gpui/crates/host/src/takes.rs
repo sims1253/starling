@@ -114,6 +114,9 @@ struct HubState {
     unclaimed: Vec<Frame>,
     /// Startup recovery's findings until an app hears them.
     recovery: Option<HostRecovery>,
+    /// A `capture.start` still opening its device, and who sent it: it
+    /// owns the take before the take exists.
+    acquiring: Option<(String, Arc<ConnState>)>,
     /// Since when the live take has had no watcher.
     orphaned_since: Option<Instant>,
     /// Takes the hub stopped itself (orphaned).
@@ -325,12 +328,23 @@ impl TakeHub {
     /// window records).
     pub(crate) fn may_end(&self, corr: Option<&str>, conn: &Arc<ConnState>) -> bool {
         let state = lock_registry(&self.state);
-        match state
+        if let Some(live) = state
             .live
             .as_ref()
             .filter(|live| corr.is_none_or(|corr| live.take == corr))
         {
-            Some(live) => owner_for(&live.owner, conn) != TakeOwner::Another,
+            return owner_for(&live.owner, conn) != TakeOwner::Another;
+        }
+        // The take may still be opening its device: the command would run
+        // after the start, on that take.
+        match state
+            .acquiring
+            .as_ref()
+            .filter(|(take, _)| corr.is_none_or(|corr| take == corr))
+        {
+            Some((_, starter)) => {
+                owner_for(&Some(Arc::clone(starter)), conn) != TakeOwner::Another
+            }
             None => true,
         }
     }
@@ -343,6 +357,9 @@ impl TakeHub {
         let mut state = lock_registry(&self.state);
         state.starters.retain(|(known, _)| known != corr);
         state.starters.push_back((corr.to_string(), Arc::clone(conn)));
+        if state.live.is_none() {
+            state.acquiring = Some((corr.to_string(), Arc::clone(conn)));
+        }
         while state.starters.len() > ENDED_KEEP {
             state.starters.pop_front();
         }
@@ -367,12 +384,16 @@ impl TakeHub {
             .iter_mut()
             .find(|watcher| Arc::ptr_eq(&watcher.conn, conn))
         {
-            watcher.taps.retain(|tap| tap.take != take);
-            watcher.taps.push(Tap {
-                take,
-                cursor: from,
-                held: Vec::new(),
-            });
+            // Re-tapping a take restarts its audio but keeps what was held
+            // for after its end.
+            match watcher.taps.iter_mut().find(|tap| tap.take == take) {
+                Some(tap) => tap.cursor = from,
+                None => watcher.taps.push(Tap {
+                    take,
+                    cursor: from,
+                    held: Vec::new(),
+                }),
+            }
         }
     }
 
@@ -422,6 +443,18 @@ impl TakeHub {
                         }
                     }
                 }
+            }
+            // Orphans waiting for an app go to one that is here already
+            // (an orphan found mid-session, or one a full queue refused).
+            if !state.unclaimed.is_empty() && !state.watchers.is_empty() {
+                let conn = Arc::clone(&state.watchers[0].conn);
+                let unclaimed = std::mem::take(&mut state.unclaimed);
+                for frame in unclaimed {
+                    if let Err(()) = conn.try_deliver(frame.clone()) {
+                        state.unclaimed.push(frame);
+                    }
+                }
+                self.save_unclaimed(&state);
             }
             let HubState {
                 live,
@@ -629,6 +662,7 @@ impl CaptureObserver for TakeHub {
             return;
         }
         let mut state = lock_registry(&self.state);
+        state.acquiring = None;
         let rate = monitor.as_ref().map(|monitor| monitor.sample_rate()).unwrap_or(0);
         let owner = state
             .starters
@@ -652,7 +686,10 @@ impl CaptureObserver for TakeHub {
             Ok(failure) => (failure.problem, failure.message),
             Err(_) => (None, detail.to_string()),
         };
-        let state = lock_registry(&self.state);
+        let mut state = lock_registry(&self.state);
+        if state.acquiring.as_ref().is_some_and(|(take, _)| take == corr) {
+            state.acquiring = None;
+        }
         for watcher in &state.watchers {
             let _ = watcher.conn.try_deliver(Frame::TakeStartFailed {
                 take: corr.to_string(),
@@ -684,8 +721,15 @@ impl CaptureObserver for TakeHub {
             owner: owner.clone(),
             record: record.cloned(),
         });
+        // The oldest go first — but never one a tap still replays: its
+        // audio, end and ownership are what that tap resolves on.
         while state.ended.len() > ENDED_KEEP {
-            state.ended.pop_front();
+            let Some(index) = state.ended.iter().position(|done| {
+                !state.watchers.iter().any(|watcher| watcher.tapping(&done.take))
+            }) else {
+                break;
+            };
+            state.ended.remove(index);
         }
         // Watchers that do not tap this take hear the end now; a tap
         // hears it after its last sample (the tick).

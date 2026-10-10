@@ -934,6 +934,15 @@ impl StarlingApp {
                 Effect::Listening(take) => self.cue_listening(take, cx),
             }
         }
+        self.activation_settled(cx);
+    }
+
+    /// What follows any change of the active take — through the machine's
+    /// effects or outside them (#220: a take adopted from, or ended by, the
+    /// recording service): the Escape grab follows the machine, a shortcut
+    /// saved mid-take takes over once no take is active, and the overlay
+    /// catches up.
+    pub(crate) fn activation_settled(&mut self, cx: &mut Context<Self>) {
         // Escape cleanup is queued first, so a deferred swap below never
         // holds it back.
         self.sync_escape_grab();

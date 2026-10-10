@@ -977,26 +977,14 @@ impl CaptureStore for V2CaptureStore {
     /// The adoption path keys the row by the journal's id; the samples
     /// path names the journal it replaces (`supersedes_journal`), so either
     /// way the take's capture id finds its row.
+    /// Only what the commit itself recorded: a commit whose outcome it
+    /// could not read back names nothing, rather than a row that merely
+    /// holds the same journal id (another take's audio).
     fn stored_id(&self, take: &TakeRecord) -> Option<String> {
-        if let Some(id) = self
-            .committed
+        self.committed
             .lock()
             .expect("committed ids lock")
             .remove(&committed_key(take))
-        {
-            return Some(id);
-        }
-        // A commit whose outcome it could not read back: a replacement
-        // row names the journal it replaced; only then the journal's own.
-        let store = self.store.lock().expect("v2 store lock");
-        if let Ok(Some(id)) = store.journal_superseded_by(&take.capture_id) {
-            return Some(id);
-        }
-        store
-            .get_capture(&take.capture_id)
-            .ok()
-            .flatten()
-            .map(|record| record.id)
     }
 }
 

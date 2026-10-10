@@ -373,7 +373,7 @@ impl StarlingApp {
             self.activation.ended(take);
             self.overlay.model.take_cancelled(Instant::now());
         }
-        self.sync_overlay(cx);
+        self.activation_settled(cx);
     }
 
     fn take_update(&mut self, update: TakeUpdate, cx: &mut Context<Self>) {
@@ -545,7 +545,7 @@ impl StarlingApp {
                 self.overlay.model.take_cancelled(Instant::now());
             }
             self.cue_take_ended(take, cx);
-            self.sync_overlay(cx);
+            self.activation_settled(cx);
             return;
         }
         if !self.note_live_interruption() {
@@ -592,7 +592,7 @@ impl StarlingApp {
             Some(problem) => self.report_input_problem(problem, message),
             None => self.error = Some(message),
         }
-        self.sync_overlay(cx);
+        self.activation_settled(cx);
     }
 
     /// Makes a take the host records — with no live owner — this
@@ -634,7 +634,7 @@ impl StarlingApp {
         self.overlay_take_started();
         // The tap replays the take from its start, so live text catches up.
         self.live_tick(&take, rate, status, cx);
-        self.sync_overlay(cx);
+        self.activation_settled(cx);
     }
 
     /// A finishing take's audio or end arrived: a cancel that kept
