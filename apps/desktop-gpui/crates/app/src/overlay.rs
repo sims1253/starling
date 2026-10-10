@@ -540,6 +540,20 @@ impl StarlingApp {
         }
     }
 
+    /// An overlay window went away, closed here or by the compositor. A
+    /// closed window reports no focus loss: delivery forgets its focus
+    /// unless another overlay window is the one kept.
+    pub(crate) fn overlay_window_released(
+        &mut self,
+        handle: AnyWindowHandle,
+        cx: &mut Context<Self>,
+    ) {
+        let kept = self.overlay.window.map(AnyWindowHandle::from);
+        if kept.is_none() || kept == Some(handle) {
+            self.delivery_overlay_activation(false, cx);
+        }
+    }
+
     fn close_overlay(&mut self, cx: &mut Context<Self>) {
         self.overlay.generation += 1;
         self.overlay.opening = None;

@@ -143,6 +143,7 @@ pub(crate) struct OverlayView {
     app: WeakEntity<StarlingApp>,
     _observe: Option<Subscription>,
     _activation: Subscription,
+    _release: Subscription,
 }
 
 impl OverlayView {
@@ -162,10 +163,18 @@ impl OverlayView {
                 .update(cx, |app, cx| app.delivery_overlay_activation(active, cx))
                 .ok();
         });
+        // A window the compositor closes reports no focus loss.
+        let handle = window.window_handle();
+        let release = cx.on_release(move |view, cx| {
+            view.app
+                .update(cx, |app, cx| app.overlay_window_released(handle, cx))
+                .ok();
+        });
         Self {
             app,
             _observe: observe,
             _activation: activation,
+            _release: release,
         }
     }
 }

@@ -1378,6 +1378,23 @@ mod tests {
         assert_eq!(fake.field(), "Hello there.");
     }
 
+    /// An overlay window that goes away without reporting its focus loss
+    /// (a compositor closed it) no longer counts as Starling's focus.
+    #[gpui::test]
+    fn a_closed_overlay_stops_counting_as_focus(cx: &mut gpui::TestAppContext) {
+        let (app, _fake) = app_with(cx, on());
+        let weak = app.downgrade();
+        let overlay =
+            cx.add_window(|window, cx| crate::views::overlay::OverlayView::new(weak, window, cx));
+        app.update(cx, |app, cx| app.delivery_overlay_activation(true, cx));
+        app.read_with(cx, |app, _| assert!(app.starling_focused()));
+        overlay
+            .update(cx, |_, window, _| window.remove_window())
+            .unwrap();
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| assert!(!app.starling_focused()));
+    }
+
     #[gpui::test]
     fn a_take_types_its_text_into_the_target_it_started_in(cx: &mut gpui::TestAppContext) {
         let (app, fake) = app_with(cx, on());
