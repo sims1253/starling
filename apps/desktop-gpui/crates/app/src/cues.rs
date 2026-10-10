@@ -147,15 +147,32 @@ pub(crate) struct CueGate {
     announced: Option<TakeId>,
     /// An ended take whose stop cue waits for playback to be restored.
     stop_pending: Option<TakeId>,
+    /// The settings preview whose stop cue is still due.
+    preview: u64,
 }
 
 impl CueGate {
-    /// A take is about to open its microphone: cues still waiting for an
-    /// earlier take are dropped.
+    /// A microphone is about to open (a take, or the settings' microphone
+    /// check): cues still waiting for an earlier take or a preview are
+    /// dropped.
     pub(crate) fn started(&mut self) {
         self.starting = None;
         self.announced = None;
         self.stop_pending = None;
+        self.preview += 1;
+    }
+
+    /// A preview played its start cue; an earlier preview's stop cue is
+    /// dropped. Returns the preview to hand to [`Self::preview_stop`].
+    pub(crate) fn preview_started(&mut self) -> u64 {
+        self.preview += 1;
+        self.preview
+    }
+
+    /// Whether `preview`'s stop cue plays: only if no later preview and no
+    /// microphone started since.
+    pub(crate) fn preview_stop(&self, preview: u64) -> bool {
+        self.preview == preview
     }
 
     /// `take` reported its first samples while `active` is the live take.
@@ -230,7 +247,8 @@ impl StarlingApp {
         }
     }
 
-    /// A take is about to open its microphone: no cue may sound into it.
+    /// A microphone is about to open (a take, or the settings' microphone
+    /// check): no cue may sound into it.
     pub(crate) fn cue_take_starting(&mut self) {
         self.cue_gate.started();
         if let Some(player) = self.player.as_ref() {
@@ -313,17 +331,25 @@ impl StarlingApp {
     }
 
     /// The settings dialog's preview: both cues at the draft volume. Not
-    /// while a take records: its microphone would hear them.
+    /// while a take or the microphone check records: its microphone would
+    /// hear them. A new preview replaces one still sounding.
     pub(crate) fn preview_cues(&mut self, cx: &mut Context<Self>) {
-        if self.recording_take.is_some() {
+        if self.recording_take.is_some() || self.mic_check_recording() {
             return;
         }
         let volume = self.draft_cue_volume.read(cx).value();
+        if let Some(player) = self.player.as_ref() {
+            player.stop_cues();
+        }
+        let preview = self.cue_gate.preview_started();
         self.play_cue(Cue::Start, volume);
         cx.spawn(async move |this, cx| {
             Timer::after(cue_length() + Duration::from_millis(250)).await;
             this.update(cx, |app, _| {
-                if app.recording_take.is_none() {
+                if app.cue_gate.preview_stop(preview)
+                    && app.recording_take.is_none()
+                    && !app.mic_check_recording()
+                {
                     app.play_cue(Cue::Stop, volume);
                 }
             })
@@ -454,6 +480,19 @@ mod tests {
         heard(&mut gate, 1);
         assert!(gate.ended(1));
         assert!(!gate.settled(1, None, false));
+    }
+
+    #[test]
+    fn a_preview_stop_cue_is_dropped_by_a_newer_preview_or_an_opening_microphone() {
+        let mut gate = CueGate::default();
+        let first = gate.preview_started();
+        let second = gate.preview_started();
+        assert!(!gate.preview_stop(first), "double click: one stop cue");
+        assert!(gate.preview_stop(second));
+        let third = gate.preview_started();
+        // A take or the microphone check opened its microphone.
+        gate.started();
+        assert!(!gate.preview_stop(third));
     }
 
     #[test]

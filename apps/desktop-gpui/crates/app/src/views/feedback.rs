@@ -133,7 +133,9 @@ pub(crate) fn render_feedback_section(app: &mut StarlingApp, cx: &mut Context<St
         )
         .child(app.draft_cue_volume.clone())
         .child(helper(
-            "The sounds stay audible while playback is lowered or muted during recording.",
+            "The sounds stay audible while playback is lowered or muted during recording. \
+             Through speakers, the microphone can pick up the start sound at the very start of \
+             a take; headphones avoid that.",
         ));
 
     div()

@@ -202,9 +202,10 @@ impl PlaybackHandle {
     /// Answers once every request sent before it was handled, including
     /// an `end`'s restore (retries and all), with whether playback is now
     /// as the user left it: `false` while attenuated, and after a restore
-    /// that failed until the next take begins (the user was told; what
-    /// they fix by hand is theirs). The start/stop cues (#221) wait on it so they are not
-    /// played into a lowered or muted output. Disconnects without an
+    /// that failed or left a changed volume alone, until the next take
+    /// begins (the user was told; what they fix by hand is theirs). The
+    /// start/stop cues (#221) wait on it so they are not played into a
+    /// lowered or muted output. Disconnects without an
     /// answer once the service has shut down.
     pub fn settled(&self) -> Receiver<bool> {
         let (tx, rx) = mpsc::channel();
@@ -398,8 +399,9 @@ struct Worker {
     backend: Arc<dyn PlaybackBackend>,
     shared: Arc<Shared>,
     attenuation: Option<Attenuation>,
-    /// A restore gave up with playback still adjusted since the last
-    /// `begin`.
+    /// Since the last `begin`, a restore gave up with playback still
+    /// adjusted, or left a volume the user changed under our lowering
+    /// (some channel may still hold it).
     restore_failed: bool,
 }
 
@@ -512,6 +514,7 @@ impl Worker {
             }
         }
         if attenuation.volume_stranded {
+            self.restore_failed = true;
             self.shared.notice(
                 NoticeKind::RestoreFailed,
                 format!(

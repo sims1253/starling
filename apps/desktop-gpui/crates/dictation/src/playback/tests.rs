@@ -282,6 +282,21 @@ fn a_partly_changed_volume_is_left_alone_and_reported() {
 }
 
 #[test]
+fn a_volume_left_alone_is_not_settled_until_the_next_take() {
+    // A channel may still hold our lowering: the cues (#221) stay quiet.
+    let (backend, _service, handle) = start();
+    let lease = handle.begin(&lower(30));
+    handle.flush();
+    backend.user_sets_volumes("speakers", &[raw(25), raw(30)]);
+    handle.end(lease);
+    assert!(!handle.settled().recv().unwrap());
+    let next = handle.begin(&PlaybackSettings::default());
+    assert!(handle.settled().recv().unwrap());
+    handle.end(next);
+    assert_eq!(notice_kinds(&handle), [NoticeKind::RestoreFailed]);
+}
+
+#[test]
 fn a_changed_channel_count_is_left_alone_and_reported() {
     // Shrinking and growing alike.
     for changed in [&[raw(30)][..], &[raw(30), raw(30), raw(30)]] {

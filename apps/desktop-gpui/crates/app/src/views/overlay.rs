@@ -4,6 +4,7 @@
 //! the only thing the overlay can do is Cancel, which goes through the
 //! activation machine like Escape.
 
+use std::cell::RefCell;
 use std::time::Duration;
 
 use gpui::{
@@ -63,6 +64,18 @@ pub(crate) fn text_tail(text: &str, max: usize) -> String {
     format!("…{tail}")
 }
 
+/// The live text to show: the followed take's own text while it can still
+/// be read (`current`), the text last shown for it once it cannot.
+pub(crate) fn live_text(current: Option<String>, shown: &RefCell<String>) -> String {
+    match current {
+        Some(text) => {
+            shown.replace(text.clone());
+            text
+        }
+        None => shown.borrow().clone(),
+    }
+}
+
 impl StarlingApp {
     /// The overlay's current frame, or `None` when it has nothing to show.
     pub(crate) fn overlay_state(&self, cx: &App) -> Option<OverlayState> {
@@ -84,21 +97,27 @@ impl StarlingApp {
             }
             _ => 0.,
         };
-        let text = (self.feedback.overlay == OverlayMode::LiveText)
-            .then(|| {
+        let text = (self.feedback.overlay == OverlayMode::LiveText).then(|| {
+            let current = match self.overlay.staging_token {
                 // The take's own staging draft (read-only here: the
                 // staging editor owns edits) wherever the main window put
-                // it, the direct-mode partial otherwise.
-                let staged = self.overlay.staging_token.and_then(|token| {
-                    self.staging
-                        .iter()
-                        .chain(&self.background_stagings)
-                        .find(|staging| staging.token == token)
-                        .map(|staging| staging.editor.read(cx).buffer.text.clone())
-                });
-                staged.unwrap_or_else(|| self.live_partial.clone())
-            })
-            .map(|text| text_tail(&text, LIVE_TEXT_CHARS));
+                // it, until it is dismissed.
+                Some(token) => self
+                    .staging
+                    .iter()
+                    .chain(&self.background_stagings)
+                    .find(|staging| staging.token == token)
+                    .map(|staging| {
+                        text_tail(&staging.editor.read(cx).buffer.text, LIVE_TEXT_CHARS)
+                    }),
+                // The direct-mode partial, cleared when the take stops.
+                None => self
+                    .recorder
+                    .is_some()
+                    .then(|| text_tail(&self.live_partial, LIVE_TEXT_CHARS)),
+            };
+            live_text(current, &self.overlay.live_text)
+        });
         let failure = match self.overlay.model.delivery() {
             crate::overlay::DeliveryStatus::Failed(reason) => Some(reason.clone()),
             _ => None,
@@ -324,5 +343,16 @@ mod tests {
         assert!(!tail.trim_start_matches('…').starts_with(' '), "{tail}");
         // Multi-byte text is cut on characters.
         assert_eq!(text_tail("äöüäöü", 3), "…äöü");
+    }
+
+    #[test]
+    fn the_live_text_stays_once_its_source_is_gone() {
+        let shown = RefCell::default();
+        assert_eq!(live_text(Some("all nouns".into()), &shown), "all nouns");
+        // The take stopped (partial cleared) or its draft was dismissed.
+        assert_eq!(live_text(None, &shown), "all nouns");
+        // A source that is still there is shown as it is, even emptied.
+        assert_eq!(live_text(Some(String::new()), &shown), "");
+        assert_eq!(live_text(None, &shown), "");
     }
 }

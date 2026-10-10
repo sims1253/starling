@@ -32,6 +32,7 @@
 //!   neither was run for this change (the Windows part is compile-checked
 //!   only).
 
+use std::cell::RefCell;
 use std::time::{Duration, Instant};
 
 use gpui::{
@@ -412,6 +413,10 @@ pub(crate) struct Overlay {
     /// The staging draft of the take on the overlay (staged dictation):
     /// the live text shows that draft and no other.
     pub(crate) staging_token: Option<u64>,
+    /// The live text last shown for the take on the overlay, kept once
+    /// its source is gone (the direct-mode partial is cleared at stop, a
+    /// saved draft can be dismissed) until the next take.
+    pub(crate) live_text: RefCell<String>,
 }
 
 impl Overlay {
@@ -425,6 +430,7 @@ impl Overlay {
             generation: 0,
             scale: 1.,
             staging_token: None,
+            live_text: RefCell::default(),
         }
     }
 
@@ -449,6 +455,7 @@ impl StarlingApp {
     /// draft when it has one.
     pub(crate) fn overlay_take_started(&mut self) {
         self.overlay.model.take_started(Instant::now());
+        self.overlay.live_text.get_mut().clear();
         self.overlay.staging_token = self
             .staging
             .as_ref()
@@ -645,7 +652,9 @@ impl StarlingApp {
 #[cfg(target_os = "windows")]
 fn overlay_hwnd(window: &gpui::Window) -> Option<isize> {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-    match window.window_handle().ok()?.as_raw() {
+    // gpui's inherent `Window::window_handle` is its own handle type; the
+    // native one comes through raw-window-handle's trait.
+    match HasWindowHandle::window_handle(window).ok()?.as_raw() {
         RawWindowHandle::Win32(handle) => Some(handle.hwnd.get()),
         _ => None,
     }
