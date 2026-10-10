@@ -841,9 +841,13 @@ class VoiceInputService : InputMethodService() {
             return
         }
         if (staged.mode.delivery == INSERT_ENTER && !pressEditorAction(connection)) {
-            // Both outcomes are reported: no action, and an unsaved derived revision.
-            val unsaved = getString(R.string.keyboard_derived_unsaved).takeIf { current.derivedUnsaved }
-            endTake(current, R.string.staging_no_action, detail = unsaved, shown = delivered.text)
+            // Both outcomes are reported: no action, and how the boundary went.
+            val boundary = when {
+                current.derivedUnsaved -> getString(R.string.keyboard_derived_unsaved)
+                delivered.skipped == BoundaryDelivery.Skip.UNREADABLE -> getString(R.string.keyboard_boundary_unread)
+                else -> null
+            }
+            endTake(current, R.string.staging_no_action, detail = boundary, shown = delivered.text)
         } else {
             endTake(current, insertedStatus(current, delivered), shown = delivered.text)
         }

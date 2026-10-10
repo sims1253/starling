@@ -166,6 +166,7 @@
     <string name="keyboard_sending">Saved privately. Transcribing…</string>
     <string name="keyboard_ready_to_insert">Transcript ready. Tap Insert transcript.</string>
     <string name="keyboard_inserted">Transcript inserted.</string>
+    <string name="keyboard_boundary_unread">The field did not share its text, so spacing and capitals were not adjusted.</string>
     <string name="keyboard_derived_unsaved">Its adjusted form could not be saved to Saved recordings.</string>
     <string name="keyboard_inserted_unrecorded">Transcript inserted, but its adjusted form could not be saved to Saved recordings.</string>
     <string name="keyboard_inserted_unadjusted">Transcript inserted as dictated: the field did not share its text, so spacing and capitals were not adjusted.</string>
