@@ -217,11 +217,10 @@ def test_stream_trace_ledger(server, monkeypatch, chunk_seconds):
             trace = ws.receive_json()["trace"]
     calls = trace["calls"]
     if chunk_seconds:
-        # 1.0 s buffered: the second step finalizes one full window and
-        # previews the 0.25 s past the boundary (advance 0.75 s); the stop
-        # flushes only that tail.
-        assert [c["kind"] for c in calls] == [
-            "preview", "window", "preview", "flush_tail"]
+        # 1.0 s buffered: the second step finalizes one full window, whose
+        # committed text is the partial (no preview right behind a commit);
+        # the stop flushes only the 0.25 s past the boundary (advance 0.75 s).
+        assert [c["kind"] for c in calls] == ["preview", "window", "flush_tail"]
         assert trace["by_kind"]["window"]["engine_audio_s"] == 1.0
         assert trace["stop"]["path"] == "tail"
         assert trace["stop"]["unfinalized_s"] == .25
@@ -352,6 +351,152 @@ def test_stream_tiny_queue_bounds_keep_every_frame(server, monkeypatch):
             while (msg := ws.receive_json())["type"] != "final":
                 assert msg["type"] == "partial"
     assert msg["duration_s"] == 4.0
+
+
+def _abortable_preview(started):
+    """A fake transcribe whose previews run until their cancel flag fires
+    (polled like a backend checkpoint), 10 s otherwise; windows and flushes
+    answer at once with their length."""
+    import time as _time
+
+    def transcribe(samples, rid, *, streaming=False, cancel=None):
+        if cancel is not None:  # only previews carry a preempt flag
+            started.set()
+            t0 = _time.monotonic()
+            while _time.monotonic() - t0 < 10:
+                if cancel.is_set():
+                    raise S._Cancelled()
+                _time.sleep(0.001)
+            return S.TranscribeResult(text="stale preview")
+        return S.TranscribeResult(text=f"w{len(samples)}")
+
+    return transcribe
+
+
+def test_stream_stop_preempts_running_preview(server, monkeypatch):
+    # Stop after newer audio while a preview runs: the preview is cancelled
+    # and the flush covers all audio without waiting for it (issue #357).
+    import threading
+    import time as _time
+
+    started = threading.Event()
+    monkeypatch.setattr(server, "_run_queued_sync", _abortable_preview(started))
+    with TestClient(S.create_app(server=server, load_on_startup=False)) as client:
+        with client.websocket_connect('/stream?trace=1') as ws:
+            ws.send_bytes(np.zeros(9600, dtype=np.int16).tobytes())
+            assert started.wait(5)
+            t_stop = _time.monotonic()
+            ws.send_bytes(np.zeros(3200, dtype=np.int16).tobytes())
+            ws.send_json({"type": "commit"})
+            while (msg := ws.receive_json())["type"] != "final":
+                assert "stale" not in msg.get("text", "")
+            stop_s = _time.monotonic() - t_stop
+    assert stop_s < 2.0
+    assert msg["text"] == "w12800"
+    assert msg["duration_s"] == .8
+    results = [c["result"] for c in msg["trace"]["calls"]]
+    assert "preempted" in results
+    assert msg["trace"]["totals"]["preempted"] == 1
+    assert msg["trace"]["stop"]["path"] == "tail"
+
+
+def test_stream_commit_without_new_audio_preempts_preview(server, monkeypatch):
+    # Stop with no audio after the preview started: this server has no
+    # exact-tail reuse (the native one lets the preview finish and reuses
+    # it), so the preview is cancelled and the flush decodes the tail once.
+    import threading
+
+    started = threading.Event()
+    release = threading.Event()
+    calls = []
+
+    def transcribe(samples, rid, *, streaming=False, cancel=None):
+        calls.append(("preview" if cancel is not None else "other", len(samples)))
+        if cancel is not None:
+            started.set()
+            while not release.wait(0.001):
+                if cancel.is_set():
+                    raise S._Cancelled()
+        return S.TranscribeResult(text=f"w{len(samples)}")
+
+    monkeypatch.setattr(server, "_run_queued_sync", transcribe)
+    with TestClient(S.create_app(server=server, load_on_startup=False)) as client:
+        with client.websocket_connect('/stream?trace=1') as ws:
+            ws.send_bytes(np.zeros(9600, dtype=np.int16).tobytes())
+            assert started.wait(5)
+            ws.send_json({"type": "commit"})
+            import time as _time
+            _time.sleep(0.05)
+            release.set()
+            while (msg := ws.receive_json())["type"] != "final":
+                pass
+    assert msg["text"] == "w9600"
+    assert msg["trace"]["totals"]["preempted"] == 1
+    assert calls == [("preview", 9600), ("other", 9600)]
+    assert msg["trace"]["stop"]["path"] == "tail"
+
+
+def test_stream_reset_preempts_running_preview(server, monkeypatch):
+    import threading
+    import time as _time
+
+    started = threading.Event()
+    monkeypatch.setattr(server, "_run_queued_sync", _abortable_preview(started))
+    with TestClient(S.create_app(server=server, load_on_startup=False)) as client:
+        with client.websocket_connect('/stream') as ws:
+            ws.send_bytes(np.zeros(9600, dtype=np.int16).tobytes())
+            assert started.wait(5)
+            t0 = _time.monotonic()
+            ws.send_json({"type": "reset"})
+            while (msg := ws.receive_json())["type"] != "reset_ack":
+                assert "stale" not in msg.get("text", "")
+    assert _time.monotonic() - t0 < 2.0
+
+
+def test_stream_empty_commit_reports_committed_stop(server):
+    with TestClient(S.create_app(server=server, load_on_startup=False)) as client:
+        with client.websocket_connect('/stream?trace=1') as ws:
+            ws.send_json({"type": "commit"})
+            final = ws.receive_json()
+    assert final["type"] == "final"
+    stop = final["trace"]["stop"]
+    assert stop["path"] == "committed"
+    assert stop["t0_ms"] == 0.0 and stop["t1_ms"] == 0.0
+
+
+def test_frame_samples_follow_the_decoded_audio():
+    import io
+    import wave
+
+    def wav(rate, channels, width, frames):
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as w:
+            w.setnchannels(channels)
+            w.setsampwidth(width)
+            w.setframerate(rate)
+            w.writeframes(b"\x00" * frames * channels * width)
+        return buf.getvalue()
+
+    assert S._frame_samples(b"\x00" * 3200) == 1600                # raw PCM16
+    assert S._frame_samples(wav(16000, 1, 1, 6400)) == 6400        # 0.4 s mono 8-bit
+    assert S._frame_samples(wav(16000, 2, 2, 3200)) == 3200        # 0.2 s stereo PCM16
+    assert S._frame_samples(wav(8000, 1, 2, 1600)) == 3200         # resampled to 16 kHz
+    assert S._frame_samples(b"RIFF\x00\x00\x00\x00WAVEjunk") == 0  # refused
+    # A header claiming 192,000 frames over a 1,600-frame payload counts
+    # what is there.
+    full = wav(16000, 1, 2, 1600)
+    claim = full[:40] + (192000 * 2).to_bytes(4, "little") + full[44:]
+    assert S._frame_samples(claim) == 1600
+
+
+def test_preempt_event_latches_its_predicate():
+    state = {"go": False}
+    ev = S._PreemptEvent(lambda: state["go"])
+    assert not ev.is_set() and not ev.wait(0.01) and not ev.fired
+    state["go"] = True
+    assert ev.is_set() and ev.fired
+    state["go"] = False
+    assert ev.is_set()  # latched, like a cancel
 
 
 def test_lifespan_owns_eager_load(server):

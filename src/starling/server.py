@@ -44,7 +44,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 from email.parser import BytesParser
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import numpy as np
 
@@ -790,6 +790,36 @@ class RequestContext:
     deadline: float = float("inf")
 
 
+class _PreemptEvent:
+    """A ``RequestContext.cancel`` stand-in whose state is a predicate (issue
+    #357): a streaming preview is cancelled while the predicate reports
+    required work waiting behind it. The serial queue and the backends poll
+    ``is_set()`` at their checkpoints, as for an explicit cancel."""
+
+    def __init__(self, predicate: Callable[[], bool]) -> None:
+        self._predicate = predicate
+        self._set = False
+        self.fired = False
+
+    def is_set(self) -> bool:
+        if not self._set and self._predicate():
+            self._set = True
+        self.fired = self.fired or self._set
+        return self._set
+
+    def set(self) -> None:
+        self._set = True
+
+    def wait(self, timeout: Optional[float] = None) -> bool:
+        deadline = time.monotonic() + (timeout or 0.0)
+        while not self.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(remaining, 0.005))
+        return True
+
+
 class _Busy(Exception):
     """Internal sentinel: queue is full (backpressure) — client should retry."""
 
@@ -1014,12 +1044,17 @@ class StarlingServer:
         return samples
 
     def _run_queued_sync(
-        self, samples: np.ndarray, request_id: Optional[str], *, streaming: bool = False
+        self, samples: np.ndarray, request_id: Optional[str], *, streaming: bool = False,
+        cancel: Optional[Any] = None,
     ) -> TranscribeResult:
+        """``cancel``: an event-like object (``is_set``/``wait``/``set``) used as
+        the request's cancel flag, e.g. a :class:`_PreemptEvent`."""
         rid = request_id or uuid.uuid4().hex
         timeout = float(self.config.request_timeout_seconds)
         deadline = time.monotonic() + timeout if timeout > 0 else float("inf")
         ctx = RequestContext(rid, deadline=deadline)
+        if cancel is not None:
+            ctx.cancel = cancel
         with self._queue_changed:
             if len(self._requests) >= MAX_WAITERS:
                 raise _Busy()
@@ -1177,6 +1212,24 @@ def _wav_bytes_to_float32(data: bytes) -> tuple[np.ndarray, int]:
     return samples, framerate
 
 
+def _frame_samples(data: bytes) -> int:
+    """Mono 16 kHz samples a binary /stream frame adds (StreamSession.append_wav):
+    two bytes per raw PCM16 sample; a WAV frame's frame count, resampled to
+    16 kHz (any width or channel count). 0 for a WAV that will be refused."""
+    if data[:4] != b"RIFF" or data[8:12] != b"WAVE":
+        return len(data) // 2
+    try:
+        with wave.open(io.BytesIO(data), "rb") as wf:
+            width, channels, rate = wf.getsampwidth(), wf.getnchannels(), wf.getframerate()
+            # The frames actually present: a header may claim more.
+            payload = len(wf.readframes(wf.getnframes()))
+    except (wave.Error, EOFError, ValueError):
+        return 0
+    if width not in (1, 2, 4) or rate <= 0:  # _wav_bytes_to_float32 refuses it
+        return 0
+    return math.ceil(payload // (width * channels) * SAMPLE_RATE / rate)
+
+
 def _pcm16_bytes_to_float32(data: bytes) -> np.ndarray:
     if len(data) == 0:
         return np.zeros(0, dtype=np.float32)
@@ -1264,6 +1317,9 @@ class StreamSession:
     # minimum and the preview interval, defaulting to the server flags.
     min_partial_seconds: float = -1.0
     partial_interval_seconds: float = -1.0
+    # Set for the duration of stream_step(): reports required work queued
+    # behind a running preview (issue #357).
+    _preempt: Any = None
 
     def __post_init__(self) -> None:
         from .stream_chunk import StreamTrace
@@ -1291,13 +1347,22 @@ class StreamSession:
         # preview tail and the flush tail alike).
         abs_start = self.trimmed_samples + self.chunker.boundary
         t0 = self.trace.now_ms()
+        # A running preview is cancelled when required work queues behind it
+        # (issue #357; mirrors the native CallAbortScope). The backends poll
+        # the cancel flag between chunks, and a result that finishes after it
+        # fired is discarded.
+        preempt = None
+        if self._preempt is not None and self.chunker.call_kind == "preview":
+            preempt = _PreemptEvent(self._preempt)
+        extra = {} if preempt is None else {"cancel": preempt}
         try:
             res = self.server._run_queued_sync(
-                np.ascontiguousarray(window, dtype=np.float32), None, streaming=True
+                np.ascontiguousarray(window, dtype=np.float32), None, streaming=True, **extra
             )
         except (_Busy, _Cancelled):
+            result = "preempted" if preempt is not None and preempt.fired else "busy"
             self.trace.record(self.chunker.call_kind, abs_start, len(window), t0,
-                              self.trace.now_ms(), "busy")
+                              self.trace.now_ms(), result)
             return None
         self.trace.record(self.chunker.call_kind, abs_start, len(window), t0,
                           self.trace.now_ms(), "ok")
@@ -1316,12 +1381,23 @@ class StreamSession:
         if self.chunker is not None:
             self.chunker.set_preview_policy(min_seconds, interval_seconds)
 
-    def stream_step(self, now: float, newer_pending=None) -> Optional[str]:  # noqa: ANN001
+    def stream_step(self, now: float, newer_pending=None, preempt=None) -> Optional[str]:  # noqa: ANN001
         """Advance the chunked stream; returns text to emit as a partial, or None.
 
-        ``newer_pending`` coalesces obsolete previews (ChunkStreamer.step).
+        ``newer_pending`` coalesces obsolete previews (ChunkStreamer.step);
+        ``preempt`` cancels a preview that is already running.
         """
-        return self.chunker.step(self.samples, now, self._tx, newer_pending)
+        self._preempt = preempt
+        try:
+            return self.chunker.step(self.samples, now, self._tx, newer_pending)
+        finally:
+            self._preempt = None
+
+    def samples_to_next_window(self) -> int:
+        """Audio still needed before the next window commit; -1 without a chunker."""
+        if self.chunker is None:
+            return -1
+        return self.chunker.samples_to_next_window(len(self.samples))
 
     def stream_flush(self) -> str:
         """Finalize all buffered audio (on commit) and return the full text."""
@@ -1718,22 +1794,61 @@ def create_app(
         # STREAM_QUEUE_MAX_BYTES the receiver waits for ``space``.
         pending_bytes = 0
         space = asyncio.Event()
+        # For preempt_preview(): queued audio samples (estimated from the
+        # frame size), resets and commits, and the disconnect (mirrors
+        # cpp/serve/stream_pump.cpp).
+        pending_samples = 0
+        pending_resets = 0
+        pending_commits = 0
+        disconnected = False
 
-        def _ends_preview(text: str) -> bool:
+        def _command(text: str) -> Optional[str]:
             try:
                 cmd = json.loads(text)
             except json.JSONDecodeError:
-                return False
-            return isinstance(cmd, dict) and cmd.get("type") in ("commit", "reset")
+                return None
+            return cmd.get("type") if isinstance(cmd, dict) else None
+
+        def _preempt_counts(item) -> tuple[int, int, int]:  # noqa: ANN001
+            """(audio samples, resets, commits) an item adds to the queue."""
+            if item is None:
+                return 0, 0, 0
+            kind, payload = item
+            if kind == "bytes":
+                return _frame_samples(payload), 0, 0
+            command = _command(payload)
+            return 0, int(command == "reset"), int(command == "commit")
+
+        def preempt_preview() -> bool:
+            """Polled from the worker thread inside a running preview."""
+            # A commit always preempts here: the flush decodes the tail anyway
+            # (the native server lets an unchanged-tail preview finish because
+            # its exact-tail reuse turns it into the final; this server has no
+            # such reuse).
+            if disconnected or pending_resets or pending_commits:
+                return True
+            # Queued audio that completes a window supersedes the preview.
+            to_window = sess.samples_to_next_window()
+            return to_window >= 0 and 0 < pending_samples and pending_samples >= to_window
+
+        def _ends_preview(text: str) -> bool:
+            return _command(text) in ("commit", "reset")
 
         async def enqueue(item, work: bool) -> None:  # noqa: ANN001
-            nonlocal pending_work, pending_bytes
+            nonlocal pending_work, pending_bytes, pending_samples, pending_resets
+            nonlocal pending_commits, disconnected
             if item is not None and item[0] == "bytes":
                 size = len(item[1])
                 while pending_bytes and pending_bytes + size > STREAM_QUEUE_MAX_BYTES:
                     space.clear()
                     await space.wait()
                 pending_bytes += size
+            if item is None:
+                disconnected = True
+            samples, resets, commits = _preempt_counts(item)
+            pending_samples += samples
+            pending_resets += resets
+            pending_commits += commits
             if work:
                 pending_work += 1
             await queue.put((item, work))
@@ -1781,7 +1896,8 @@ def create_app(
                 # (-> None) itself.
                 text = await asyncio.to_thread(
                     sess.stream_step, now,
-                    lambda: coalesce_preview or pending_work > 0)
+                    lambda: coalesce_preview or pending_work > 0,
+                    preempt_preview)
                 if text is not None:
                     sess.last_partial_ts = now
                     await send_partial(text, [{"text": text, "start_s": 0.0,
@@ -1832,6 +1948,7 @@ def create_app(
                     return False
             else:
                 result = TranscribeResult(text="")
+                sess.trace.mark_empty_commit()
             final = {
                 "type": "final",
                 "text": result.text,
@@ -1858,6 +1975,12 @@ def create_app(
                 pending_bytes -= sum(len(item[1]) for item, _ in batch
                                      if item is not None and item[0] == "bytes")
                 space.set()
+                # The batch is taken: it no longer waits behind a preview.
+                for item, _ in batch:
+                    samples, resets, commits = _preempt_counts(item)
+                    pending_samples -= samples
+                    pending_resets -= resets
+                    pending_commits -= commits
                 need_step = False
                 for idx, (item, work) in enumerate(batch):
                     if item is None:

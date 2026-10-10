@@ -1,6 +1,7 @@
 // stream_pump.cpp — WS /stream worker: queue, drain, coalesce (issue #357).
 
 #include "stream_pump.hpp"
+#include "audio.hpp"
 
 #include <chrono>
 #include <sstream>
@@ -90,6 +91,9 @@ StreamPump::~StreamPump() {
 }
 
 void StreamPump::push(Event ev) {
+    // Counted before taking the lock: a WAV frame is decoded to count it,
+    // and the worker must not wait on that.
+    const int64_t samples = ev.kind == Kind::Audio ? frame_samples(ev.bytes) : 0;
     std::unique_lock<std::mutex> lk(mu_);
     // Bounded queue, never dropping: wait for space (backpressure).
     space_cv_.wait(lk, [&] {
@@ -99,10 +103,36 @@ void StreamPump::push(Event ev) {
             || pending_bytes_ + ev.bytes.size() <= opt_.max_pending_bytes;
     });
     if (closed_) return;
-    if (ev.kind == Kind::Audio) pending_bytes_ += ev.bytes.size();
+    if (ev.kind == Kind::Audio) {
+        pending_bytes_ += ev.bytes.size();
+        pending_samples_ += samples;
+    } else if (ev.kind == Kind::Commit) {
+        if (pending_commits_++ == 0) samples_before_commit_ = pending_samples_;
+    } else if (ev.kind == Kind::Reset) {
+        ++pending_resets_;
+    }
     if (ev.kind != Kind::Ping) ++pending_work_;
     queue_.push_back(std::move(ev));
     cv_.notify_one();
+}
+
+int64_t StreamPump::frame_samples(const std::string& bytes) {
+    // What append_wav/append_pcm will add: raw PCM16 is two bytes per
+    // sample; a WAV frame is decoded (any format or channel count) and
+    // counts only at 16 kHz, the one rate the session accepts.
+    if (bytes.size() >= 12 && bytes.compare(0, 4, "RIFF") == 0
+        && bytes.compare(8, 4, "WAVE") == 0) {
+        std::vector<float> decoded;
+        int sr = 0;
+        if (!audio::wav_bytes_to_float32(bytes, decoded, sr) || sr != kSampleRate)
+            return 0;
+        return static_cast<int64_t>(decoded.size());
+    }
+    return static_cast<int64_t>(bytes.size() / 2);
+}
+
+void StreamPump::send(const std::string& frame) {
+    if (!send_(frame)) close();
 }
 
 void StreamPump::push_audio(std::string bytes) {
@@ -121,6 +151,10 @@ void StreamPump::close() {
     queue_.clear();
     pending_bytes_ = 0;
     pending_work_ = 0;
+    pending_samples_ = 0;
+    pending_resets_ = 0;
+    pending_commits_ = 0;
+    samples_before_commit_ = 0;
     cv_.notify_all();
     space_cv_.notify_all();
     idle_cv_.notify_all();
@@ -146,6 +180,25 @@ bool StreamPump::newer_pending() {
     return closed_ || pending_work_ > 0;
 }
 
+bool StreamPump::preempt_preview() {
+    // Runs on the worker inside the preview's engine call, so the session
+    // may be read here.
+    const int64_t to_window = session_.samples_to_next_window();
+    std::lock_guard<std::mutex> lk(mu_);
+    // A reset discards the take; a closed connection wants no more work.
+    if (closed_ || pending_resets_ > 0) return true;
+    // A commit after newer audio: the flush must decode that audio anyway,
+    // so the preview's result would be thrown away. A commit with no newer
+    // audio lets the preview finish: its result is exactly the flush tail
+    // and the session's exact-tail reuse turns it into the final.
+    if (pending_commits_ > 0 && samples_before_commit_ > 0) return true;
+    // Queued audio that completes a window: the window commit is required
+    // work and supersedes the preview. Only this take's audio counts: what
+    // follows a queued commit belongs to the next take.
+    const int64_t take_audio = pending_commits_ > 0 ? samples_before_commit_ : pending_samples_;
+    return to_window >= 0 && take_audio > 0 && take_audio >= to_window;
+}
+
 void StreamPump::run() {
     for (;;) {
         std::deque<Event> batch;
@@ -158,6 +211,10 @@ void StreamPump::run() {
             batch.swap(queue_);
             pending_bytes_ = 0;
             pending_work_ = 0;
+            pending_samples_ = 0;
+            pending_resets_ = 0;
+            pending_commits_ = 0;
+            samples_before_commit_ = 0;
             busy_ = true;
             space_cv_.notify_all();
         }
@@ -190,7 +247,7 @@ void StreamPump::run() {
                 if (need_step && !session_.overflowed() && !session_.take_invalid())
                     step(/*coalesce_preview=*/later_work);
                 need_step = false;
-                send_("{\"type\":\"pong\"}");
+                send("{\"type\":\"pong\"}");
                 break;
             }
             case Kind::Commit:
@@ -203,7 +260,7 @@ void StreamPump::run() {
                 need_step = false;
                 session_.reset();
                 reject_error_sent_ = false;
-                send_("{\"type\":\"reset_ack\"}");
+                send("{\"type\":\"reset_ack\"}");
                 break;
             }
         }
@@ -234,7 +291,7 @@ bool StreamPump::handle_audio(const std::string& msg) {
     }
     if (outcome != AppendOutcome::Accepted && !reject_error_sent_) {
         reject_error_sent_ = true;
-        send_(ws_append_error(outcome, session_, opt_.max_stream_seconds));
+        send(ws_append_error(outcome, session_, opt_.max_stream_seconds));
     }
     return outcome == AppendOutcome::Accepted;
 }
@@ -246,11 +303,12 @@ void StreamPump::step(bool coalesce_preview) {
     // session's exact-tail reuse instead of re-running the engine.
     auto text_opt = session_.stream_step(
         steady_seconds(),
-        [this, coalesce_preview] { return coalesce_preview || newer_pending(); });
+        [this, coalesce_preview] { return coalesce_preview || newer_pending(); },
+        [this] { return preempt_preview(); });
     if (!session_.terminal_error().empty()) {
         if (!reject_error_sent_) {
             reject_error_sent_ = true;
-            send_("{\"type\":\"error\",\"message\":\"request timed out\"}");
+            send("{\"type\":\"error\",\"message\":\"request timed out\"}");
         }
         return;
     }
@@ -265,7 +323,7 @@ void StreamPump::step(bool coalesce_preview) {
        << ",\"stable_words\":" << session_.stable_words();
     if (opt_.trace) ss << ",\"trace\":" << session_.trace_partial_json();
     ss << "}";
-    send_(ss.str());
+    send(ss.str());
 }
 
 void StreamPump::handle_commit() {
@@ -280,7 +338,7 @@ void StreamPump::handle_commit() {
         ss << "{\"type\":\"error\",\"message\":\"take "
            << "invalidated (" << session_.invalid_reason()
            << "); reset and resend\"}";
-        send_(ss.str());
+        send(ss.str());
         return;
     }
     double dur = session_.buffered_seconds();
@@ -288,12 +346,14 @@ void StreamPump::handle_commit() {
     if (dur > 0.0) {
         auto final = session_.stream_flush();
         if (!final.has_value()) {
-            send_(session_.terminal_error().empty()
+            send(session_.terminal_error().empty()
                 ? "{\"type\":\"error\",\"message\":\"server busy\"}"
                 : "{\"type\":\"error\",\"message\":\"request timed out\"}");
             return;
         }
         text = *final;
+    } else {
+        session_.mark_empty_commit();
     }
     std::string safe_text = json_escape(text);
     std::ostringstream ss;
@@ -303,7 +363,7 @@ void StreamPump::handle_commit() {
        << dur << "}],\"duration_s\":" << dur;
     if (opt_.trace) ss << ",\"trace\":" << session_.trace_final_json();
     ss << "}";
-    send_(ss.str());
+    send(ss.str());
     session_.reset();
     // reset() re-enables audio (clears the buffer cap and any take
     // invalidation); re-arm the one-shot error frame with it.

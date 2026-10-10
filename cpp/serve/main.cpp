@@ -96,8 +96,8 @@ static void usage(const char* prog) {
         "Streaming:\n"
         "  --stream-chunk-seconds <s>    Fixed stream window (default 12.0)\n"
         "  --stream-overlap-seconds <s>  Overlap between windows (default 3.0)\n"
-        "  --min-chunk-seconds <s>       Min audio before first partial (default 5.0)\n"
-        "  --partial-interval-seconds <s> Min gap between partials (default 3.0)\n"
+        "  --min-chunk-seconds <s>       Min audio before first partial (default 1.0)\n"
+        "  --partial-interval-seconds <s> Min gap between partials (default 0.5)\n"
         "  --max-stream-seconds <s>      Per-connection audio buffer cap in s\n"
         "                     (0 = unlimited, default 60). A frame that would\n"
         "                     exceed it is rejected with an error frame and the\n"
@@ -147,8 +147,8 @@ struct Args {
     double max_stream_seconds = 60.0;
     double stream_chunk = 12.0;
     double stream_overlap = 3.0;
-    double min_chunk = 5.0;
-    double partial_interval = 3.0;
+    double min_chunk = 1.0;
+    double partial_interval = 0.5;
     bool show_version = false;
     bool show_abi = false;
     bool show_help = false;
@@ -1049,12 +1049,21 @@ int main(int argc, char** argv) {
                 }
                 session.set_preview_policy(min_s, interval_s);
             }
-            serve::StreamPump pump(session, opt,
-                                   [&ws](const std::string& m) { ws.send(m); });
+            // A failed send (the peer stopped reading past the write
+            // timeout) aborts the connection: the socket is shut down, so a
+            // read in progress on this thread returns. The pump stops too.
+            serve::StreamPump pump(session, opt, [&ws](const std::string& m) {
+                if (ws.send(m)) return true;
+                ws.shutdown_transport();
+                return false;
+            });
             std::fprintf(stderr, "[starling-serve] WS /stream client connected\n");
 
             std::string msg;
-            while (ws.is_open()) {
+            // A pump closed by a failed send (the peer stopped reading)
+            // ends the connection at the next frame, so the client sees the
+            // close instead of an open socket that ignores its audio.
+            while (ws.is_open() && !pump.is_closed()) {
                 auto rr = ws.read(msg);
                 if (rr == httplib::ws::ReadResult::Fail) break;
                 // Every received message counts as activity so the idle

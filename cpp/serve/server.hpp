@@ -43,8 +43,11 @@ namespace starling::serve {
 // ---- constants (mirror src/starling/server.py) ---------------------------
 constexpr int    kSampleRate           = 16000;
 constexpr double kDefaultMaxChunk      = 30.0;
-constexpr double kDefaultMinChunk      = 5.0;
-constexpr double kDefaultPartialInt    = 3.0;
+// Preview cadence: 1 s first-partial minimum, 0.5 s interval (issue #357).
+// Chosen from the notebook replay against the frozen thresholds; the
+// Python server keeps 5 s / 3 s until it is measured.
+constexpr double kDefaultMinChunk      = 1.0;
+constexpr double kDefaultPartialInt    = 0.5;
 constexpr double kDefaultStreamChunk   = 12.0;
 constexpr double kDefaultStreamOverlap = 3.0;
 constexpr double kWarmupSeconds        = 5.0;

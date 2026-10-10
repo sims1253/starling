@@ -13,7 +13,8 @@ capturing — commits at the end, and records what a dictating user sees:
   violations (a partial's ``stable_words`` that the final does not keep),
 - inference work per recorded second from the server's call ledger: engine
   audio seconds (overlap and repeated previews included) and engine wall
-  seconds, per call kind,
+  seconds (including previews cancelled mid-call), per call kind; a
+  missing measurement stays missing and fails the rules that use it,
 - stop-to-final wall time, the server's stop path (``tail``/``reused``/
   ``committed``/``full_take``) and the audio the stop actually transcribed,
 - WER of the final against the reference and against the batch
@@ -23,7 +24,8 @@ Each repeat starts a fresh server process (runner.ArmServer). The first
 take of a process is ``cold`` unless ``--warmup`` sends one batch request
 first. Results are one JSON file per configuration;
 ``check`` compares a candidate against a baseline under a frozen
-thresholds file (``stream_thresholds.json``).
+thresholds file (``stream_thresholds.json``); both must come from the same
+workload manifest.
 
     python benchmarks/experiments/stream_replay.py run \\
         --binary build/starling-serve --model models/parakeet.gguf \\
@@ -114,6 +116,7 @@ def replay(ws_url: str, pcm: bytes, frame_ms: float, timeout_s: float) -> dict:
     events: list[tuple[float, dict]] = []
     done = threading.Event()
     sends: list[tuple[float, int]] = []  # (send time, cumulative samples sent)
+    rx_errors: list[BaseException] = []  # why the receiver stopped, if it failed
     with connect(ws_url, max_size=None, ping_interval=None, open_timeout=30) as ws:
         def receive():
             try:
@@ -122,8 +125,10 @@ def replay(ws_url: str, pcm: bytes, frame_ms: float, timeout_s: float) -> dict:
                     events.append((time.monotonic(), msg))
                     if msg.get("type") in ("final", "error") and commit_sent.is_set():
                         done.set()
-            except Exception:  # noqa: BLE001 - connection closed
-                pass
+            except Exception as exc:  # noqa: BLE001 - surfaced by the sender below
+                rx_errors.append(exc)
+                events.append((time.monotonic(),
+                               {"type": "error", "message": f"receiver: {exc!r}"}))
             done.set()
 
         commit_sent = threading.Event()
@@ -146,10 +151,21 @@ def replay(ws_url: str, pcm: bytes, frame_ms: float, timeout_s: float) -> dict:
             done.clear()
             commit_sent.set()
             commits.append(time.monotonic())
+            since = len(events)
             ws.send(json.dumps({"type": "commit"}))
-            if not done.wait(timeout_s):
+            # A receiver that died before the commit already set (and lost)
+            # `done`: fail with its cause instead of waiting for the timeout.
+            # One that fails only after this commit's final arrived (a server
+            # closing right after it) does not fail the run.
+            if not rx_errors:
+                done.wait(timeout_s)
+            replies = [m for _, m in events[since:] if m.get("type") in ("final", "error")
+                       and not str(m.get("message", "")).startswith("receiver: ")]
+            if not replies:
+                if rx_errors:
+                    raise RunnerError(f"receiver failed: {rx_errors[0]!r}") from rx_errors[0]
                 raise RunnerError("no final within timeout")
-            last = events[-1][1] if events else {}
+            last = replies[-1] if replies else {}
             if last.get("type") == "error" and last.get("message") == "server busy" and retries < 20:
                 retries += 1
                 time.sleep(0.2)
@@ -198,8 +214,21 @@ def take_metrics(log: dict, reference: str, batch_text: str | None) -> dict:
         if sw and m["text"].split()[:sw] != final_words[:sw]:
             stable_violations += 1
 
-    totals = trace.get("totals", {})
-    stop = trace.get("stop", {})
+    # One partial without `covered_s` makes the run's age and backlog
+    # unmeasured: statistics over the measured rest would look complete.
+    if len(ages) != len(partials):
+        ages, backlogs = [], []
+
+    # Missing trace measurements stay missing (None), so a server that drops
+    # `trace` or its totals fails the work rules instead of looking free.
+    totals = trace.get("totals") or {}
+    stop = trace.get("stop") or {}
+    stop_totals = stop.get("totals") or {}
+    engine_audio = totals.get("engine_audio_s")
+    engine_ms = totals.get("engine_ms")
+    # Preempted previews used the engine too. A server older than #357's
+    # preemption never cancels one and reports no field: 0 is exact there.
+    engine_wall_ms = None if engine_ms is None else engine_ms + totals.get("preempted_ms", 0.0)
     out.update({
         "first_partial": first,
         "partials": len(partials),
@@ -215,15 +244,18 @@ def take_metrics(log: dict, reference: str, batch_text: str | None) -> dict:
         "audio_complete": abs(float(final.get("duration_s", -1)) - duration) < 1e-3,
         "work": {
             "engine_calls": totals.get("engine_calls"),
-            "engine_audio_per_audio_s": round(totals.get("engine_audio_s", 0) / duration, 3),
-            "engine_wall_per_audio_s": round(totals.get("engine_ms", 0) / 1000.0 / duration, 4),
+            "engine_audio_per_audio_s":
+                None if engine_audio is None else round(engine_audio / duration, 3),
+            "engine_wall_per_audio_s":
+                None if engine_wall_ms is None else round(engine_wall_ms / 1000.0 / duration, 4),
             "busy_calls": totals.get("busy"),
             "reused_calls": totals.get("reused"),
+            "preempted_calls": totals.get("preempted"),
             "by_kind": trace.get("by_kind"),
         },
         "stop": {"path": stop.get("path"), "unfinalized_s": stop.get("unfinalized_s"),
-                 "engine_audio_s": (stop.get("totals") or {}).get("engine_audio_s"),
-                 "engine_ms": (stop.get("totals") or {}).get("engine_ms")},
+                 "engine_audio_s": stop_totals.get("engine_audio_s"),
+                 "engine_ms": stop_totals.get("engine_ms")},
         "wer_final_vs_ref": round(wer(reference, final["text"]), 4),
         "wer_batch_vs_ref": None if batch_text is None else round(wer(reference, batch_text), 4),
         "wer_final_vs_batch": None if batch_text is None else round(wer(batch_text, final["text"]), 4),
@@ -257,6 +289,9 @@ def _aggregate(runs: list[dict]) -> dict:
     for take, rs in by_take.items():
         ok = [r for r in rs if "failed" not in r]
         med = lambda xs: statistics.median(xs) if xs else None  # noqa: E731
+        # A measurement missing from any run leaves the metric missing.
+        med_all = lambda xs: None if None in xs else med(xs)  # noqa: E731
+        max_all = lambda xs: None if None in xs or not xs else max(xs)  # noqa: E731
         firsts = [r["first_partial"]["wall_s"] for r in ok if r.get("first_partial")]
         # Every workload take is speech: a run without any nonempty partial
         # is a preview failure, so its take has no latency (a threshold on it
@@ -268,22 +303,22 @@ def _aggregate(runs: list[dict]) -> dict:
             "first_partial_missing": missing,
             "first_partial_wall_s_median": med(firsts) if not missing else None,
             "first_partial_wall_s_max": max(firsts) if firsts and not missing else None,
-            "partial_age_ms_p50_median": med([r["partial_age_ms"]["p50"] for r in ok
-                                              if r["partial_age_ms"]["p50"] is not None]),
-            "partial_age_ms_p95_median": med([r["partial_age_ms"]["p95"] for r in ok
-                                              if r["partial_age_ms"]["p95"] is not None]),
-            "partial_age_ms_max": max([r["partial_age_ms"]["max"] for r in ok
-                                       if r["partial_age_ms"]["max"] is not None], default=None),
-            "backlog_s_max": max([r["backlog_s"]["max"] for r in ok
-                                  if r["backlog_s"]["max"] is not None], default=None),
+            # A run without age/backlog measurements (no partial carried
+            # `covered_s`) leaves these missing instead of being skipped.
+            "partial_age_ms_p50_median": med_all([r["partial_age_ms"]["p50"] for r in ok]),
+            "partial_age_ms_p95_median": med_all([r["partial_age_ms"]["p95"] for r in ok]),
+            "partial_age_ms_max": max_all([r["partial_age_ms"]["max"] for r in ok]),
+            "backlog_s_max": max_all([r["backlog_s"]["max"] for r in ok]),
             "revisions_per_min_median": med([r["revisions_per_min"] for r in ok]),
             "stable_violations_total": sum(r["stable_violations"] for r in ok),
-            "engine_audio_per_audio_s_median": med([r["work"]["engine_audio_per_audio_s"] for r in ok]),
-            "engine_wall_per_audio_s_median": med([r["work"]["engine_wall_per_audio_s"] for r in ok]),
+            "engine_audio_per_audio_s_median":
+                med_all([r["work"]["engine_audio_per_audio_s"] for r in ok]),
+            "engine_wall_per_audio_s_median":
+                med_all([r["work"]["engine_wall_per_audio_s"] for r in ok]),
             "stop_to_final_ms_median": med([r["stop_to_final_ms"] for r in ok]),
             "stop_to_final_ms_max": max([r["stop_to_final_ms"] for r in ok], default=None),
-            "stop_engine_audio_s_max": max([r["stop"]["engine_audio_s"] or 0 for r in ok], default=None),
-            "stop_paths": sorted({r["stop"]["path"] for r in ok}),
+            "stop_engine_audio_s_max": max_all([r["stop"]["engine_audio_s"] for r in ok]),
+            "stop_paths": sorted({r["stop"]["path"] or "missing" for r in ok}),
             "wer_final_vs_ref_median": med([r["wer_final_vs_ref"] for r in ok]),
             "wer_batch_vs_ref_median": med([r["wer_batch_vs_ref"] for r in ok
                                             if r["wer_batch_vs_ref"] is not None]),
@@ -369,6 +404,15 @@ def check(thresholds: dict, baseline: dict, candidate: dict) -> list[dict]:
     (``equals``) must hold exactly.
     """
     out = []
+    # Only runs over the same recordings are comparable: a regenerated
+    # workload can change the audio and the references.
+    wb = (baseline.get("provenance") or {}).get("workload_manifest_sha256")
+    wc = (candidate.get("provenance") or {}).get("workload_manifest_sha256")
+    if wb is None or wb != wc:
+        out.append({"take": "*", "metric": "workload_manifest_sha256", "baseline": wb,
+                    "candidate": wc, "pass": False,
+                    "why": "missing" if wb is None else "different workloads",
+                    "rule": "baseline and candidate replay the same recordings"})
     for rule in thresholds["rules"]:
         take, metric = rule["take"], rule["metric"]
         c = candidate["aggregate"].get(take, {}).get(metric)

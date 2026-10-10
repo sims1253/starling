@@ -85,6 +85,59 @@ class TakeMetricsTest(unittest.TestCase):
         log["events"] = []
         self.assertEqual(sr.take_metrics(log, "x", None)["failed"], "no final")
 
+    def test_missing_trace_is_missing_work_not_zero(self):
+        log = _log(partials=[], final=(4.4, {"text": "x", "duration_s": 4.0}))
+        m = sr.take_metrics(log, "x", None)
+        self.assertIsNone(m["work"]["engine_audio_per_audio_s"])
+        self.assertIsNone(m["work"]["engine_wall_per_audio_s"])
+        self.assertIsNone(m["stop"]["engine_audio_s"])
+        m.update({"take": "short"})
+        ok = sr.take_metrics(_log(partials=[], final=(4.4, {
+            "text": "x", "duration_s": 4.0, "trace": FINAL_TRACE})), "x", None)
+        ok.update({"take": "short"})
+        agg = sr._aggregate([ok, m])["short"]
+        self.assertIsNone(agg["engine_wall_per_audio_s_median"])
+        self.assertIsNone(agg["engine_audio_per_audio_s_median"])
+        self.assertIsNone(agg["stop_engine_audio_s_max"])
+
+    def test_missing_partial_age_is_missing_not_skipped(self):
+        with_age = _log(
+            partials=[(1.2, {"text": "hi", "stable_words": 0, "trace": {"covered_s": 1.0}})],
+            final=(4.4, {"text": "hi", "duration_s": 4.0, "trace": FINAL_TRACE}))
+        without = _log(
+            partials=[(1.2, {"text": "hi", "stable_words": 0})],
+            final=(4.4, {"text": "hi", "duration_s": 4.0, "trace": FINAL_TRACE}))
+        runs = []
+        for log in (with_age, without):
+            m = sr.take_metrics(log, "hi", "hi")
+            m.update({"take": "medium"})
+            runs.append(m)
+        agg = sr._aggregate(runs)["medium"]
+        self.assertIsNone(agg["partial_age_ms_p95_median"])
+        self.assertIsNone(agg["backlog_s_max"])
+        self.assertIsNotNone(sr._aggregate(runs[:1])["medium"]["partial_age_ms_p95_median"])
+
+    def test_one_unmeasured_partial_leaves_the_run_unmeasured(self):
+        mixed = _log(
+            partials=[(1.2, {"text": "hi", "stable_words": 0, "trace": {"covered_s": 1.0}}),
+                      (2.2, {"text": "hi there", "stable_words": 0})],
+            final=(4.4, {"text": "hi there", "duration_s": 4.0, "trace": FINAL_TRACE}))
+        m = sr.take_metrics(mixed, "hi there", "hi there")
+        self.assertIsNone(m["partial_age_ms"]["max"])
+        self.assertIsNone(m["backlog_s"]["max"])
+        m.update({"take": "medium"})
+        agg = sr._aggregate([m])["medium"]
+        self.assertIsNone(agg["partial_age_ms_p95_median"])
+        self.assertIsNone(agg["backlog_s_max"])
+
+    def test_preempted_previews_count_as_engine_wall_time(self):
+        trace = {**FINAL_TRACE, "totals": {**FINAL_TRACE["totals"], "preempted": 2,
+                                           "preempted_ms": 400.0}}
+        log = _log(partials=[], final=(4.4, {"text": "x", "duration_s": 4.0, "trace": trace}))
+        m = sr.take_metrics(log, "x", None)
+        self.assertEqual(m["work"]["engine_wall_per_audio_s"], 0.2)  # (400 + 400) ms / 4 s
+        self.assertEqual(m["work"]["preempted_calls"], 2)
+
     def test_stop_latency_counts_busy_commit_retries(self):
         log = _log(partials=[], final=(4.4, {"text": "x", "duration_s": 4.0,
                                              "trace": FINAL_TRACE}))
@@ -112,8 +165,9 @@ class AggregateTest(unittest.TestCase):
 
 class CheckTest(unittest.TestCase):
     def test_rules(self):
-        base = {"aggregate": {"short": {"a": 10.0, "b": 0.1, "c": True}}}
-        cand = {"aggregate": {"short": {"a": 12.0, "b": 0.12, "c": False}}}
+        prov = {"provenance": {"workload_manifest_sha256": "w1"}}
+        base = {**prov, "aggregate": {"short": {"a": 10.0, "b": 0.1, "c": True}}}
+        cand = {**prov, "aggregate": {"short": {"a": 12.0, "b": 0.12, "c": False}}}
         rules = {"rules": [
             {"take": "short", "metric": "a", "max_vs_baseline_ratio": 1.1},
             {"take": "short", "metric": "b", "max_vs_baseline_delta": 0.05},
@@ -123,6 +177,56 @@ class CheckTest(unittest.TestCase):
         ]}
         verdicts = [r["pass"] for r in sr.check(rules, base, cand)]
         self.assertEqual(verdicts, [False, True, False, True, False])
+
+    def test_different_workloads_are_not_comparable(self):
+        base = {"provenance": {"workload_manifest_sha256": "w1"},
+                "aggregate": {"short": {"a": 1.0}}}
+        rules = {"rules": [{"take": "short", "metric": "a", "max": 2}]}
+        cand = {**base, "provenance": {"workload_manifest_sha256": "w2"}}
+        out = sr.check(rules, base, cand)
+        self.assertEqual([r["pass"] for r in out], [False, True])
+        self.assertEqual(out[0]["metric"], "workload_manifest_sha256")
+        self.assertFalse(sr.check(rules, {"aggregate": base["aggregate"]}, cand)[0]["pass"])
+        self.assertEqual([r["pass"] for r in sr.check(rules, base, base)], [True])
+
+
+class ReplayReceiverTest(unittest.TestCase):
+    def test_receiver_failure_fails_the_run_with_its_cause(self):
+        import types
+
+        class Boom(Exception):
+            pass
+
+        class FakeWs:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def __iter__(self):
+                raise Boom("connection dropped")
+
+            def send(self, _msg):
+                pass
+
+        client = types.ModuleType("websockets.sync.client")
+        client.connect = lambda *a, **k: FakeWs()
+        saved = {k: sys.modules.get(k) for k in
+                 ("websockets", "websockets.sync", "websockets.sync.client")}
+        sys.modules.update({"websockets": types.ModuleType("websockets"),
+                            "websockets.sync": types.ModuleType("websockets.sync"),
+                            "websockets.sync.client": client})
+        try:
+            with self.assertRaises(sr.RunnerError) as cm:
+                sr.replay("ws://x", b"\0\0" * 3200, 100.0, timeout_s=30.0)
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    sys.modules.pop(k, None)
+                else:
+                    sys.modules[k] = v
+        self.assertIn("connection dropped", str(cm.exception))
 
 
 if __name__ == "__main__":

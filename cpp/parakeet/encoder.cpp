@@ -140,6 +140,9 @@ bool Encoder::encode(const std::vector<float>& mel, int n_mels, int T,
                                        entry.Tp, entry.valid_len,
                                        ph_ok ? entry.ph_scratch.data() : nullptr);
                 });
+            // A cancelled preview stops between encoder slices; encode()
+            // reports the failure and capi_parakeet maps it to "cancelled".
+            entry.graph->set_abortable(true);
             // Static persistent inputs (their own host data: e.g. the
             // transposed depthwise-conv kernels) upload immediately; the ph
             // inputs share one scratch and need the layer-by-layer dance.

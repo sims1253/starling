@@ -51,6 +51,13 @@ using TranscribeFn = std::function<std::optional<std::string>(const float*, int6
 // preview would be obsolete before it finished (issue #357).
 using PendingFn = std::function<bool()>;
 
+// Polled during a running preview (issue #357): true when the preview is
+// no longer worth finishing because required work is waiting behind it (a
+// commit or reset, or queued audio that completes a window). The preview
+// is then cancelled at the engine's next checkpoint (ggml::CallAbortScope)
+// and its audio stays in the buffer for the work that follows.
+using PreemptFn = std::function<bool()>;
+
 // Preview cadence bound (issue #357): the effective preview interval is
 // at least the latest preview's engine time divided by this duty, so on a
 // slow model or device previews take at most this fraction of wall time
@@ -158,6 +165,9 @@ public:
         return static_cast<int64_t>(n_samples) - boundary_ >= chunk_;
     }
 
+    // Samples per window (the commit size).
+    int64_t window_samples() const { return chunk_; }
+
     // Previews skipped because newer audio was already queued.
     int64_t coalesced_previews() const { return coalesced_; }
     double min_preview_seconds() const {
@@ -217,7 +227,8 @@ struct StreamCall {
     double t0_ms = 0.0;       // call start, ms since the take's first audio
     double t1_ms = 0.0;       // call end
     // "ok" (engine ran), "reused" (exact-tail reuse; engine not called),
-    // "busy" (engine busy or cancelled; state not advanced), "timed_out".
+    // "busy" (engine busy or cancelled; state not advanced), "timed_out",
+    // "preempted" (a preview cancelled mid-call for waiting required work).
     const char* result = "";
 };
 
@@ -229,6 +240,8 @@ struct StreamCallTotals {
     double engine_ms = 0.0;     // wall time of those engine calls
     int64_t reused = 0;
     int64_t busy = 0;           // busy, cancelled and timed-out calls
+    int64_t preempted = 0;      // previews cancelled while running
+    double preempted_ms = 0.0;  // engine wall time those previews used
     void add(const StreamCall& c);
 };
 
@@ -277,9 +290,11 @@ public:
     const std::string& terminal_error() const { return terminal_error_; }
 
     // Advance the chunked stream; returns text to emit as a partial, or
-    // nullopt. `newer_pending` coalesces obsolete previews (ChunkStreamer::step).
+    // nullopt. `newer_pending` coalesces obsolete previews (ChunkStreamer::step);
+    // `preempt` cancels a preview that is already running (PreemptFn).
     std::optional<std::string> stream_step(double now,
-                                           const PendingFn& newer_pending = nullptr);
+                                           const PendingFn& newer_pending = nullptr,
+                                           const PreemptFn& preempt = nullptr);
 
     // Per-connection preview cadence (issue #357); throws
     // std::invalid_argument when invalid. No-op in whole-buffer mode.
@@ -290,6 +305,14 @@ public:
     // The buffer holds a full window that the next stream_step commits.
     bool full_window_pending() const {
         return chunker_ && chunker_->full_window_pending(samples_.size());
+    }
+    // Audio still needed before the next window commit (samples); -1 in
+    // whole-buffer mode.
+    int64_t samples_to_next_window() const {
+        if (!chunker_) return -1;
+        return std::max<int64_t>(
+            0, chunker_->window_samples()
+                   - (static_cast<int64_t>(samples_.size()) - chunker_->boundary()));
     }
 
     // The chunker's stable word count (ChunkStreamer::stable_words); 0 in
@@ -368,6 +391,9 @@ public:
     // finalized only the unfinalized remainder), "reused" (the exact-tail
     // result answered it), "committed" (nothing was left to finalize).
     const char* final_path() const { return final_path_; }
+    // A commit of an empty take: no flush runs, but the stop section still
+    // reports the "committed" path and its time.
+    void mark_empty_commit();
 
     // Ledger bound: a 10-minute take at a 0.5 s preview cadence makes ~1300
     // calls; beyond this, calls still count in the totals but are dropped
@@ -424,6 +450,7 @@ private:
     std::string invalid_reason_;  // machine-readable code for the rejection
     std::string terminal_error_;  // nonempty after a blocking queue timeout
     TranscribeFn custom_tx_;  // when set, used instead of the server callback
+    PreemptFn preempt_;       // set for the duration of stream_step()
     TranscribeFn wrapped_tx_;  // cached active_tx() wrapper (see active_tx)
     std::unique_ptr<ChunkStreamer> chunker_;
 
