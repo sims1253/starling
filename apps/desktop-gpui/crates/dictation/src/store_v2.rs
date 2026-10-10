@@ -3185,7 +3185,9 @@ impl StoreV2 {
             let hash = format!("{:016x}", samples_hash(&parsed.samples));
 
             // Seal the verified prefix (§4: truncate + gap flag) and
-            // promote. `seal_recovered_journal` is idempotent, so a crash
+            // promote. A journal already finalized (by its recorder, or by
+            // a pass that died after sealing it) is left as it is — a
+            // second trailer would make it unreadable — so a crash
             // mid-recovery re-runs cleanly; the seal is noted first, so
             // the re-run still knows the take was cut short (#220).
             if cut {
@@ -3193,7 +3195,9 @@ impl StoreV2 {
             }
             #[cfg(test)]
             self.crash_point(RecoveryStep::SealNoted)?;
-            seal_recovered_journal(&path, &parsed)?;
+            if !parsed.finalized || parsed.torn_tail_bytes > 0 {
+                seal_recovered_journal(&path, &parsed)?;
+            }
             #[cfg(test)]
             self.crash_point(RecoveryStep::Sealed)?;
             self.promote_from_staging(&id)?;
@@ -7113,6 +7117,44 @@ mod tests {
         assert!(rerun.orphan_sessions.is_empty());
     }
 
+    /// The control: a complete take still in staging whose commit was to
+    /// carry its transcription intent, and whose salvage dies at any step,
+    /// is stored whole with that intent — its journal is never sealed a
+    /// second time.
+    #[test]
+    fn a_complete_staging_salvage_that_dies_at_any_step_keeps_its_intent() {
+        for step in [RecoveryStep::SealNoted, RecoveryStep::Sealed, RecoveryStep::Moved] {
+            let dir = TempDir::new().expect("tempdir");
+            let samples = ramp(800, 0);
+            let id = {
+                let mut store = store_in(&dir);
+                let mut take = store
+                    .begin_take(TakeMeta::for_device("mic"))
+                    .expect("begin");
+                take.append_and_seal(&samples).expect("append");
+                let finalized = take.finalize().expect("finalize");
+                // The commit's first step, then the recorder's crash.
+                store.note_pending_intent(&finalized.id).expect("intent");
+                store.crash_after = Some(step);
+                // Nothing is noted or sealed for a complete journal; the
+                // step boundaries still stop the salvage there.
+                assert!(store.reconcile().is_err(), "{step:?}");
+                finalized.id
+            };
+
+            let mut store = store_in(&dir);
+            store.reconcile().expect("reconcile");
+            let record = store.get_capture(&id).expect("get").expect("row");
+            assert_eq!(record.frame_count, 800, "{step:?}");
+            let audio = store.load_audio(&id).expect("audio");
+            assert!(audio.finalized && audio.torn_tail_bytes == 0, "{step:?}: one valid trailer");
+            assert_eq!(audio.samples, samples, "{step:?}");
+            let note = record.recovery_note().expect("note");
+            assert!(note.contains("finished cleanly"), "{step:?}: {note}");
+            assert!(store.transcription_wanted(&id).unwrap(), "{step:?}: the intent survives");
+        }
+    }
+
     /// #220/#356: a reconcile that dies at any step of salvaging a cut
     /// staging journal — after noting the seal, after sealing it, after
     /// promoting it — leaves a take the next one still stores as
@@ -7145,6 +7187,8 @@ mod tests {
             assert_eq!(record.status, CaptureStatus::Interrupted, "{step:?}");
             assert_eq!(record.frame_count, 800, "{step:?}: only the verified prefix");
             assert_eq!(store.load_audio(&id).expect("audio").samples, confirmed, "{step:?}");
+            let audio = store.load_audio(&id).expect("audio");
+            assert!(audio.finalized && audio.torn_tail_bytes == 0, "{step:?}: one valid trailer");
             let note = record.recovery_note().expect("note");
             assert!(!note.contains("finished cleanly"), "{step:?}: {note}");
             assert!(note.contains("gap flagged"), "{step:?}: the torn tail is named: {note}");

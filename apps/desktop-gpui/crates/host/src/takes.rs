@@ -417,12 +417,15 @@ impl TakeHub {
     /// What holds the microphone when `conn`'s `capture.start` for take
     /// `corr` was refused in capture state `machine_state` (see
     /// [`TakeBusy`]); `None` when no take does — the machine refused it
-    /// for another reason. That start's own registration
-    /// ([`TakeHub::starting`]) is not what holds it.
+    /// for another reason. When that start registered itself
+    /// (`registered`, [`TakeHub::starting`]'s answer), its own
+    /// registration is not what holds it; when it did not, a take opening
+    /// under its corr is that connection's earlier start.
     pub(crate) fn busy_for(
         &self,
         conn: &ConnState,
         corr: Option<&str>,
+        registered: bool,
         machine_state: &str,
     ) -> Option<TakeBusy> {
         match machine_state {
@@ -438,7 +441,7 @@ impl TakeHub {
             None => state
                 .acquiring
                 .as_ref()
-                .filter(|(take, starter)| !(take == refused && yours(starter)))
+                .filter(|(take, starter)| !(registered && take == refused && yours(starter)))
                 .map(|(_, starter)| starter),
         };
         Some(TakeBusy::Recording {
@@ -1087,6 +1090,42 @@ mod tests {
 
     fn drained(inbound: &starling_runtime::channel::Receiver<Frame>) -> Vec<Frame> {
         std::iter::from_fn(|| inbound.try_recv().ok()).collect()
+    }
+
+    /// A refused start while a take opens its device names who holds the
+    /// microphone: a repeat of the connection's own earlier start (which
+    /// registered nothing) is told the take is its own; a start that
+    /// registered itself over a dead starter's entry is not told its own
+    /// registration holds it; another connection is told it is not its.
+    #[test]
+    fn a_refused_start_tells_its_own_earlier_start_from_its_own_registration() {
+        let hub = TakeHub::new(Duration::from_secs(60));
+        let (owner, _owner_inbound) = ConnState::for_test(16);
+        let (other, _other_inbound) = ConnState::for_test(16);
+        assert!(hub.starting("take-x", &owner), "the first start registers");
+        assert!(!hub.starting("take-x", &owner), "its repeat does not");
+        assert_eq!(
+            hub.busy_for(&owner, Some("take-x"), false, "Acquiring"),
+            Some(TakeBusy::Recording { yours: true }),
+            "the earlier start is the connection's own"
+        );
+        assert!(hub.starting("take-y", &other));
+        assert_eq!(
+            hub.busy_for(&other, Some("take-y"), true, "Acquiring"),
+            Some(TakeBusy::Recording { yours: false })
+        );
+
+        // The starter died while opening: the next start takes its place
+        // in the registry, and its refusal is not about itself.
+        let hub = TakeHub::new(Duration::from_secs(60));
+        let (dead, _dead_inbound) = ConnState::for_test(16);
+        assert!(hub.starting("take-dead", &dead));
+        dead.closed.store(true, Ordering::SeqCst);
+        assert!(hub.starting("take-x", &owner), "registered over the dead starter");
+        assert_eq!(
+            hub.busy_for(&owner, Some("take-x"), true, "Acquiring"),
+            Some(TakeBusy::Recording { yours: false })
+        );
     }
 
     /// A window that is not the one to act on a transcription still hears

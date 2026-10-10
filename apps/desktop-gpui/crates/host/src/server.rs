@@ -1241,7 +1241,7 @@ fn connection_reader(
                             }
                             continue;
                         }
-                        match handle_command(&shared, &state, &mut envelope) {
+                        match handle_command(&shared, &state, &mut envelope, registered) {
                             Err(()) => break,
                             Ok(false) if registered => {
                                 // Refused: no take opens, so the
@@ -1617,11 +1617,13 @@ impl Drop for UnregisterOnDrop<'_> {
 /// out, the host assigns it from the runtime's own frontier (see
 /// `RuntimeClient::assign_seq`) so a reconnecting client cannot collide
 /// with stream positions a dead connection consumed. `Ok(true)` when the
-/// runtime accepted the command.
+/// runtime accepted the command. `registered`: a `capture.start` that
+/// [`crate::takes::TakeHub::starting`] registered.
 fn handle_command(
     shared: &HostShared,
     state: &ConnState,
     envelope: &mut serde_json::Value,
+    registered: bool,
 ) -> Result<bool, ()> {
     // Shape first: the receipt is keyed by the envelope's string `id`,
     // so an envelope without one could never be answered — the command
@@ -1703,7 +1705,7 @@ fn handle_command(
         Err(Rejection::IllegalInState {
             state: machine_state,
             ..
-        }) if starts => shared.takes.busy_for(state, corr.as_deref(), machine_state),
+        }) if starts => shared.takes.busy_for(state, corr.as_deref(), registered, machine_state),
         _ => None,
     };
     if state

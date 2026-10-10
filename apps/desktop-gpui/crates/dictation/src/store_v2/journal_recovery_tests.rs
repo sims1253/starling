@@ -214,7 +214,9 @@ fn a_cut_journal_whose_recovery_dies_at_any_step_still_reads_as_cut() {
             let record = store.get_capture("j_cut").unwrap().expect("row");
             assert_eq!(record.status, CaptureStatus::Interrupted, "{case}");
             assert_eq!(record.frame_count, 4_800, "{case}: the confirmed extent");
-            assert_eq!(store.load_audio("j_cut").expect("audio").samples, confirmed, "{case}");
+            let audio = store.load_audio("j_cut").expect("audio");
+            assert_eq!(audio.samples, confirmed, "{case}");
+            assert!(audio.finalized && audio.torn_tail_bytes == 0, "{case}: one valid trailer");
             assert!(!store.transcription_wanted("j_cut").unwrap(), "{case}: waits for the user");
             let note = record.recovery_note().expect("note");
             assert!(
