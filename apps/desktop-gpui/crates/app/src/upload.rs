@@ -599,6 +599,7 @@ impl StarlingApp {
                 .ok();
             if let Some(reading) = disk_reading.filter(|reading| reading.level == DiskLevel::Critical)
             {
+                self.delivery_take_stopped();
                 if let Some(lease) = playback_lease {
                     self.playback.handle().end(lease);
                 }
