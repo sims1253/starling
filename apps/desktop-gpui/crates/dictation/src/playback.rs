@@ -127,8 +127,8 @@ enum Msg {
         epoch: u64,
     },
     Shutdown,
-    /// Answered once every earlier message is handled: whether playback is
-    /// as the user left it (nothing attenuated, the last restore worked).
+    /// Answered once every earlier message is handled: whether nothing is
+    /// attenuated and no restore failed since the previous answer.
     Flush(Sender<bool>),
 }
 
@@ -201,8 +201,9 @@ impl PlaybackHandle {
 
     /// Answers once every request sent before it was handled, including
     /// an `end`'s restore (retries and all), with whether playback is now
-    /// as the user left it — `false` while attenuated or after a restore
-    /// that failed. The start/stop cues (#221) wait on it so they are not
+    /// as the user left it: `false` while attenuated, or once after a
+    /// restore that failed (the user was told; what they fix by hand is
+    /// theirs). The start/stop cues (#221) wait on it so they are not
     /// played into a lowered or muted output. Disconnects without an
     /// answer once the service has shut down.
     pub fn settled(&self) -> Receiver<bool> {
@@ -397,7 +398,8 @@ struct Worker {
     backend: Arc<dyn PlaybackBackend>,
     shared: Arc<Shared>,
     attenuation: Option<Attenuation>,
-    /// The last restore gave up with playback still adjusted.
+    /// A restore gave up with playback still adjusted, and no `Flush` has
+    /// reported it yet.
     restore_failed: bool,
 }
 
@@ -409,7 +411,8 @@ impl Worker {
                 Msg::End { epoch } => self.end(epoch),
                 Msg::Shutdown => break,
                 Msg::Flush(done) => {
-                    let _ = done.send(self.attenuation.is_none() && !self.restore_failed);
+                    let failed = std::mem::take(&mut self.restore_failed);
+                    let _ = done.send(self.attenuation.is_none() && !failed);
                 }
             }
         }
@@ -478,7 +481,6 @@ impl Worker {
     fn restore(&mut self, mut attenuation: Attenuation) {
         let device = attenuation.device.clone();
         let mut attempt = 1;
-        self.restore_failed = false;
         loop {
             match self.try_restore(&mut attenuation) {
                 Ok(()) => break,

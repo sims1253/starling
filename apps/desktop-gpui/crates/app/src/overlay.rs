@@ -21,10 +21,11 @@
 //!   the compositor decides where the overlay goes, whether it floats,
 //!   and whether it takes focus. The window's app id is
 //!   [`OVERLAY_APP_ID`] so a compositor rule can float it unfocused.
-//! - **Windows**: gpui makes a `WS_EX_TOOLWINDOW` pop-up; the overlay adds
-//!   `WS_EX_TOPMOST` and `WS_EX_NOACTIVATE` itself
-//!   ([`keep_on_top_without_focus`]) so it stays above other windows and a
-//!   click on Cancel does not activate it. **macOS**: a pop-up-level
+//! - **Windows**: gpui makes a `WS_EX_TOOLWINDOW` pop-up and shows new
+//!   windows activated; the overlay opens hidden, adds `WS_EX_TOPMOST` and
+//!   `WS_EX_NOACTIVATE` itself and shows itself without activation
+//!   ([`show_on_top_without_focus`]), so it stays above other windows and
+//!   neither opening nor a click on Cancel activates it. **macOS**: a pop-up-level
 //!   window. Both open on the primary display (no pointer lookup here);
 //!   neither was run for this change (the Windows part is compile-checked
 //!   only).
@@ -561,14 +562,16 @@ impl StarlingApp {
                 .update(|cx| cx.primary_display().map(|display| display.id()))
                 .ok()
                 .flatten();
+            let bounds = Bounds::new(
+                origin.unwrap_or_else(|| point(px(0.), px(0.))),
+                overlay_size,
+            );
             let options = WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(Bounds::new(
-                    origin.unwrap_or_else(|| point(px(0.), px(0.))),
-                    overlay_size,
-                ))),
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: None,
                 focus: false,
-                show: true,
+                // Windows: shown by `show_on_top_without_focus`.
+                show: !cfg!(target_os = "windows"),
                 kind: WindowKind::PopUp,
                 is_movable: false,
                 is_resizable: false,
@@ -604,7 +607,7 @@ impl StarlingApp {
                     Ok(window) if current => {
                         #[cfg(target_os = "windows")]
                         window
-                            .update(cx, |_, window, _| keep_on_top_without_focus(window))
+                            .update(cx, |_, window, _| show_on_top_without_focus(window, bounds))
                             .ok();
                         this.overlay.window = Some(window);
                         this.overlay.window_mode = mode;
@@ -626,16 +629,18 @@ impl StarlingApp {
     }
 }
 
-/// gpui's Windows pop-up is neither topmost nor non-activating: adds both,
-/// so the overlay stays above the app being dictated into and clicking it
-/// never takes that app's focus.
+/// gpui's Windows pop-up is neither topmost nor non-activating, and gpui
+/// shows a new window activated: the overlay opens hidden there, gets both
+/// styles, and is then shown at `bounds` (logical pixels) without being
+/// activated, so it stays above the app being dictated into and never
+/// takes that app's focus.
 #[cfg(target_os = "windows")]
-fn keep_on_top_without_focus(window: &gpui::Window) {
+fn show_on_top_without_focus(window: &gpui::Window, bounds: Bounds<Pixels>) {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::{
         GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos, GWL_EXSTYLE, HWND_TOPMOST,
-        SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, WS_EX_NOACTIVATE, WS_EX_TOPMOST,
+        SWP_NOACTIVATE, SWP_SHOWWINDOW, WS_EX_NOACTIVATE, WS_EX_TOPMOST,
     };
     let Ok(handle) = window.window_handle() else {
         return;
@@ -644,6 +649,8 @@ fn keep_on_top_without_focus(window: &gpui::Window) {
         return;
     };
     let hwnd = HWND(handle.hwnd.get() as *mut core::ffi::c_void);
+    let scale = window.scale_factor();
+    let device = |value: Pixels| (f32::from(value) * scale).round() as i32;
     // SAFETY: `hwnd` is the live overlay window, owned by this thread.
     unsafe {
         let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
@@ -655,11 +662,11 @@ fn keep_on_top_without_focus(window: &gpui::Window) {
         let _ = SetWindowPos(
             hwnd,
             Some(HWND_TOPMOST),
-            0,
-            0,
-            0,
-            0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            device(bounds.origin.x),
+            device(bounds.origin.y),
+            device(bounds.size.width),
+            device(bounds.size.height),
+            SWP_NOACTIVATE | SWP_SHOWWINDOW,
         );
     }
 }

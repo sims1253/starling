@@ -9,11 +9,13 @@
 //!   for a take whose start cue played, only after its capture has
 //!   stopped (so it is never recorded into that take), and never once a
 //!   newer take has started (whose microphone could hear it). A cue still
-//!   sounding when a take starts is silenced before its microphone opens.
+//!   sounding when a take starts is stopped before its microphone opens
+//!   (what the output device has already buffered, a few milliseconds,
+//!   still plays).
 //! - **Attenuation (#361) does not swallow them.** Each cue waits until
 //!   playback is as the user left it
 //!   ([`PlaybackHandle::settled`](starling_dictation::playback::PlaybackHandle::settled):
-//!   an earlier take's restore has been carried out and worked), and with
+//!   an earlier take's restore has been carried out and did not fail), and with
 //!   a start cue to play, lowering or muting waits until it has played. A
 //!   cue that cannot get there within [`SETTLE_LIMIT`] is dropped, and a
 //!   dropped start cue drops its stop cue.
@@ -290,11 +292,11 @@ impl StarlingApp {
         }
         let settled = self.playback.handle().settled();
         cx.spawn(async move |this, cx| {
-            // A restore that has not finished in time (or a service that
-            // shut down) drops the cue: it would play into a lowered or
-            // muted output, or long after the take.
+            // A restore that failed or has not finished in time (or a
+            // service that shut down) drops the cue: it would play into a
+            // lowered or muted output, or long after the take.
             let restored = cx
-                .background_spawn(async move { settled.recv_timeout(SETTLE_LIMIT).is_ok() })
+                .background_spawn(async move { settled.recv_timeout(SETTLE_LIMIT) == Ok(true) })
                 .await;
             this.update(cx, |app, _| {
                 let enabled = app.feedback.cues && restored;
