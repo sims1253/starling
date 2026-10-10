@@ -1178,6 +1178,9 @@ impl StarlingApp {
                 SessionGone,
             }
             let mut outcome = Outcome::Success;
+            // #356: a blank retry is kept as a result but leaves the
+            // take's earlier words shown; nothing follows up on it.
+            let mut kept_earlier_text = false;
 
             let marked = {
                 let id = id.clone();
@@ -1261,17 +1264,33 @@ impl StarlingApp {
                                 let store = store_for_job.clone();
                                 cx.background_spawn(async move {
                                     let session_found = store.exists(&id)?;
+                                    let blank = result.text.trim().is_empty();
                                     let write_error = if session_found {
                                         store.save_transcript(&id, result).err()
                                     } else {
                                         None
                                     };
-                                    Ok::<_, storage::StorageError>((session_found, write_error))
+                                    // Unreadable afterwards: assume the
+                                    // earlier words still show — a blank
+                                    // result has nothing to follow up on.
+                                    let kept_earlier = retry
+                                        && blank
+                                        && session_found
+                                        && write_error.is_none()
+                                        && store.latest_raw(&id).map_or(true, |shown| {
+                                            shown.is_some_and(|(_, text)| !text.trim().is_empty())
+                                        });
+                                    Ok::<_, storage::StorageError>((
+                                        session_found,
+                                        write_error,
+                                        kept_earlier,
+                                    ))
                                 })
                                 .await
                             };
                             match saved {
-                                Ok((session_found, write_error)) => {
+                                Ok((session_found, write_error, kept_earlier)) => {
+                                    kept_earlier_text = kept_earlier;
                                     match save_race_decision(
                                         session_found,
                                         write_error.as_ref(),
@@ -1430,8 +1449,10 @@ impl StarlingApp {
             .ok();
             refresh_sessions(&this, &store_for_job, cx).await;
             // Raw text is in history now; the active mode's processing
-            // follows as a proposal (#295).
-            if transcribed {
+            // follows as a proposal (#295). A blank retry changed no
+            // shown text: no draft is dropped, nothing is reprocessed or
+            // offered again.
+            if transcribed && !kept_earlier_text {
                 this.update(cx, |app, cx| {
                     app.after_transcription(id.clone(), cx);
                     if retry {
@@ -1605,7 +1626,7 @@ impl StarlingApp {
             self.retry_on(id, wav, TakeTarget::from_lease(lease), pin, cx);
             return;
         }
-        engine.activate(&model_id);
+        let request = engine.activate(&model_id);
         let pending = PendingRetry {
             take_id: id.clone(),
             model_id: model_id.clone(),
@@ -1622,11 +1643,23 @@ impl StarlingApp {
                     .timer(std::time::Duration::from_millis(250))
                     .await;
                 let done = this.update(cx, |app, cx| {
-                    if app.pending_retry.as_ref() != Some(&pending)
-                        || app.engine_instance != instance
-                    {
-                        // Replaced by another choice, or the engine itself
-                        // was replaced (a mode switch): this wait is over.
+                    if app.pending_retry.as_ref() != Some(&pending) {
+                        // Replaced by another choice: this wait is over.
+                        return true;
+                    }
+                    if app.engine_instance != instance {
+                        // The engine itself was replaced or stopped (a
+                        // mode switch): the model will not load for this
+                        // retry, and its audio is released.
+                        app.pending_retry = None;
+                        app.error = Some(format!(
+                            "The retry with {} was cancelled: the engine changed in \
+                             Settings while the model loaded. The recording is unchanged.",
+                            crate::views::drawer::provenance_label(&format!(
+                                "engine:{model_id}"
+                            ))
+                        ));
+                        cx.notify();
                         return true;
                     }
                     if app.retry_target_gone(&pending.take_id) {
@@ -1635,7 +1668,12 @@ impl StarlingApp {
                         cx.notify();
                         return true;
                     }
-                    match switch_progress(&engine.snapshot(), &model_id, started.elapsed()) {
+                    match switch_progress(
+                        &engine.snapshot(),
+                        &model_id,
+                        request,
+                        started.elapsed(),
+                    ) {
                         SwitchProgress::Waiting => false,
                         SwitchProgress::Ready => {
                             let Some(lease) =
@@ -1776,14 +1814,17 @@ pub(crate) enum SwitchProgress {
 /// How long a retry waits for its model before giving up. Covers a
 /// download-free load of the largest catalog model with room to spare.
 const RETRY_SWITCH_CAP: std::time::Duration = std::time::Duration::from_secs(10 * 60);
-/// How long the engine may show no sign of the requested switch before
-/// the request counts as not taken (the command is asynchronous).
-const RETRY_SWITCH_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+/// How long the engine may take to pick up the retry's activation (its
+/// command queue can be busy winding down an earlier switch) before the
+/// retry gives up.
+const RETRY_SWITCH_PICKUP: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Read an engine snapshot for a retry waiting on `model_id`.
+/// Read an engine snapshot for a retry waiting on `model_id`, whose
+/// switch is the engine's activation `request`.
 pub(crate) fn switch_progress(
     snapshot: &starling_dictation::engine::EngineSnapshot,
     model_id: &str,
+    request: u64,
     waited: std::time::Duration,
 ) -> SwitchProgress {
     use starling_dictation::engine::{EnginePhase, SwapDecision};
@@ -1797,11 +1838,16 @@ pub(crate) fn switch_progress(
     if waited >= RETRY_SWITCH_CAP {
         return SwitchProgress::Failed("the model did not finish loading in time.".to_string());
     }
-    if let Some(SwapDecision::Refused { .. }) = snapshot.pending_decision {
-        return SwitchProgress::Failed(
-            "there is not enough free memory to load that model.".to_string(),
-        );
+    if snapshot.activations_handled < request {
+        // Not taken up yet: any switch, refusal or error in view is left
+        // over from an earlier request and says nothing about this one.
+        return if waited < RETRY_SWITCH_PICKUP {
+            SwitchProgress::Waiting
+        } else {
+            SwitchProgress::Failed("the engine did not start the switch in time.".to_string())
+        };
     }
+    // From here on the snapshot answers this request or a later intent.
     if let Some(switch) = &snapshot.switch {
         return if switch.target_model_id == model_id {
             SwitchProgress::Waiting
@@ -1809,12 +1855,19 @@ pub(crate) fn switch_progress(
             SwitchProgress::Failed("another model switch replaced it.".to_string())
         };
     }
+    if snapshot.activations_handled > request && !serving {
+        return SwitchProgress::Failed("another model switch replaced it.".to_string());
+    }
+    if let Some(SwapDecision::Refused { .. }) = snapshot.pending_decision {
+        return SwitchProgress::Failed(
+            "there is not enough free memory to load that model.".to_string(),
+        );
+    }
     if let EnginePhase::Failed(failure) = &snapshot.phase {
         return SwitchProgress::Failed(format!("{failure}"));
     }
-    if serving || waited < RETRY_SWITCH_GRACE {
-        // Loading, warming, restarting — or the command is not picked up
-        // yet.
+    if serving {
+        // Warming or restarting after the cutover.
         return SwitchProgress::Waiting;
     }
     SwitchProgress::Failed(
@@ -2281,6 +2334,7 @@ mod tests {
             models: Vec::new(),
             notices: Vec::new(),
             last_error: None,
+            activations_handled: 0,
         }
     }
 
@@ -2292,57 +2346,107 @@ mod tests {
         })
     }
 
+    /// A snapshot that has taken up activation `handled`.
+    fn handled(mut snapshot: EngineSnapshot, handled: u64) -> EngineSnapshot {
+        snapshot.activations_handled = handled;
+        snapshot
+    }
+
     #[test]
     fn a_retry_waits_for_its_model_and_gives_up_honestly() {
         let secs = std::time::Duration::from_secs;
         // Serving the model: go.
         assert_eq!(
-            switch_progress(&snapshot(Some("b"), EnginePhase::Ready), "b", secs(1)),
+            switch_progress(&snapshot(Some("b"), EnginePhase::Ready), "b", 5, secs(1)),
             SwitchProgress::Ready
         );
         // The switch to it is running, or the command is not picked up yet.
-        let mut loading = snapshot(Some("a"), EnginePhase::Ready);
+        let mut loading = handled(snapshot(Some("a"), EnginePhase::Ready), 5);
         loading.switch = switching_to("b");
-        assert_eq!(switch_progress(&loading, "b", secs(30)), SwitchProgress::Waiting);
+        assert_eq!(switch_progress(&loading, "b", 5, secs(30)), SwitchProgress::Waiting);
         assert_eq!(
-            switch_progress(&snapshot(Some("a"), EnginePhase::Ready), "b", secs(1)),
+            switch_progress(&snapshot(Some("a"), EnginePhase::Ready), "b", 5, secs(1)),
             SwitchProgress::Waiting
         );
         assert_eq!(
-            switch_progress(&snapshot(Some("b"), EnginePhase::Loading), "b", secs(30)),
+            switch_progress(&handled(snapshot(Some("b"), EnginePhase::Loading), 5), "b", 5, secs(30)),
             SwitchProgress::Waiting
         );
         // Everything else ends the wait with a reason.
-        let mut replaced = snapshot(Some("a"), EnginePhase::Ready);
+        let mut replaced = handled(snapshot(Some("a"), EnginePhase::Ready), 5);
         replaced.switch = switching_to("c");
-        assert!(matches!(switch_progress(&replaced, "b", secs(5)), SwitchProgress::Failed(_)));
-        let mut refused = snapshot(Some("a"), EnginePhase::Ready);
+        assert!(matches!(
+            switch_progress(&replaced, "b", 5, secs(5)),
+            SwitchProgress::Failed(_)
+        ));
+        // A later activation finished on another model.
+        assert!(matches!(
+            switch_progress(&handled(snapshot(Some("c"), EnginePhase::Ready), 6), "b", 5, secs(5)),
+            SwitchProgress::Failed(reason) if reason.contains("another model switch")
+        ));
+        let mut refused = handled(snapshot(Some("a"), EnginePhase::Ready), 5);
         refused.pending_decision = Some(SwapDecision::Refused {
             needed: 2,
             available: 1,
         });
         assert!(matches!(
-            switch_progress(&refused, "b", secs(1)),
+            switch_progress(&refused, "b", 5, secs(1)),
             SwitchProgress::Failed(reason) if reason.contains("memory")
         ));
         assert!(matches!(
             switch_progress(
-                &snapshot(None, EnginePhase::Failed(EngineFailure::LoadFailed("bad file".into()))),
+                &handled(
+                    snapshot(None, EnginePhase::Failed(EngineFailure::LoadFailed("bad file".into()))),
+                    5
+                ),
                 "b",
+                5,
                 secs(5)
             ),
             SwitchProgress::Failed(_)
         ));
-        let mut ignored = snapshot(Some("a"), EnginePhase::Ready);
+        let mut ignored = handled(snapshot(Some("a"), EnginePhase::Ready), 5);
         ignored.last_error = Some("the model file failed verification".to_string());
         assert_eq!(
-            switch_progress(&ignored, "b", secs(5)),
+            switch_progress(&ignored, "b", 5, secs(5)),
             SwitchProgress::Failed("the model file failed verification".to_string())
         );
         assert!(matches!(
-            switch_progress(&loading, "b", RETRY_SWITCH_CAP),
+            switch_progress(&loading, "b", 5, RETRY_SWITCH_CAP),
             SwitchProgress::Failed(_)
         ));
+    }
+
+    /// Until the engine takes up the retry's own activation, an earlier
+    /// switch's refusal, error or failed phase is not this retry's
+    /// outcome: the wait goes on, bounded, and then fails with its own
+    /// reason (#356).
+    #[test]
+    fn a_retry_ignores_outcomes_from_before_its_activation() {
+        let secs = std::time::Duration::from_secs;
+        let mut stale = handled(
+            snapshot(Some("a"), EnginePhase::Failed(EngineFailure::LoadFailed("old".into()))),
+            4,
+        );
+        stale.pending_decision = Some(SwapDecision::Refused {
+            needed: 2,
+            available: 1,
+        });
+        stale.last_error = Some("an earlier switch failed".to_string());
+        stale.switch = switching_to("c");
+        assert_eq!(switch_progress(&stale, "b", 5, secs(1)), SwitchProgress::Waiting);
+        assert_eq!(
+            switch_progress(&stale, "b", 5, RETRY_SWITCH_PICKUP - secs(1)),
+            SwitchProgress::Waiting
+        );
+        assert_eq!(
+            switch_progress(&stale, "b", 5, RETRY_SWITCH_PICKUP),
+            SwitchProgress::Failed("the engine did not start the switch in time.".to_string())
+        );
+        // Taken up: the engine's own state for this request decides.
+        let mut taken = handled(snapshot(Some("a"), EnginePhase::Ready), 5);
+        taken.switch = switching_to("b");
+        assert_eq!(switch_progress(&taken, "b", 5, secs(40)), SwitchProgress::Waiting);
     }
 
     #[test]
@@ -2553,11 +2657,13 @@ mod tests {
         assert_eq!(take.attempt_count, 3);
         audio_intact(&store);
 
-        // An empty answer is kept as a result, never shown over words.
+        // An empty answer is kept as a result, never shown over words —
+        // and the words it did not replace are not offered again.
         retry(&app, cx, RetryWith::Server);
         let take = summary(&store, &id);
         assert_eq!(take.transcript.as_ref().expect("kept").text, "first words");
         assert_eq!(take.results.len(), 2);
+        assert!(app.read_with(cx, |app, _| app.delivery.recovery.is_none()));
 
         // A real answer: a new result, attached to the same recording.
         retry(&app, cx, RetryWith::Server);
@@ -2614,6 +2720,57 @@ mod tests {
             assert!(app.unsaved.is_empty(), "the deleted audio is not resurrected");
             assert!(!app.active_ids.contains(&id));
         });
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Settings switching the engine off while a retry waits for its
+    /// model ends that wait visibly: no "Loading" left in the drawer, a
+    /// sentence saying why, and nothing sent.
+    #[gpui::test]
+    fn an_engine_change_cancels_a_retry_waiting_for_its_model(cx: &mut gpui::TestAppContext) {
+        let root = scratch("engine-change");
+        let store = Store::at_test_root(&root);
+        let id = store.save_capture(one_second_wav(), None).expect("save").id;
+        std::fs::create_dir_all(root.join("engines")).expect("engines");
+        // No engine binaries: the manager never serves, so the retry
+        // stays waiting until the change.
+        let engine = starling_dictation::engine::EngineManager::start(
+            starling_dictation::engine::EngineConfig {
+                engine_dir: Some(root.join("engines")),
+                models_dir: root.join("models"),
+                state_dir: root.join("state"),
+                catalog: Vec::new(),
+                backend_override: None,
+                icd_dirs: None,
+                available_memory_override: None,
+                backoff_schedule: None,
+            },
+            None,
+        );
+        let app = cx.new(|cx| {
+            let mut app = StarlingApp::for_test(Some(store.clone()), cx);
+            app.engine = Some(engine.clone());
+            app.apply_sessions(store.list().expect("list"));
+            app.selected_id = Some(id.clone());
+            app
+        });
+        retry(&app, cx, RetryWith::Model("model-b".to_string()));
+        assert!(app.read_with(cx, |app, _| app.pending_retry.is_some()));
+        // Settings → Engine: your own server.
+        app.update(cx, |app, _| {
+            app.engine = None;
+            app.engine_instance += 1;
+        });
+        cx.executor().advance_clock(std::time::Duration::from_secs(1));
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert!(app.pending_retry.is_none());
+            let error = app.error.as_deref().expect("explained");
+            assert!(error.contains("cancelled"), "{error}");
+            assert!(!app.active_ids.contains(&id));
+        });
+        assert_eq!(summary(&store, &id).attempt_count, 0);
+        engine.shutdown();
         let _ = std::fs::remove_dir_all(&root);
     }
 

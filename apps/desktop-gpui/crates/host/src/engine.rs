@@ -396,7 +396,9 @@ impl EngineHost {
                     }
                     if active_model != *current_model {
                         match active_model.as_deref() {
-                            Some(model_id) => manager.activate(model_id),
+                            Some(model_id) => {
+                                manager.activate(model_id);
+                            }
                             // The settings stopped naming a model. The
                             // app always persists its active choice, so
                             // this is a hand-edited or foreign file; keep

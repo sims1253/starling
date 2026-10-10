@@ -202,6 +202,22 @@ fn a_superseded_journal_is_kept_but_never_recovered_twice() {
     assert!(tree.join(SUPERSEDED_SUBDIR).join("j_faulted.sj").exists());
     // Superseding what is already gone is fine.
     supersede_capture_journal(&path).expect("idempotent");
+    // A second journal of the same name never replaces the kept one.
+    let again = {
+        let mut writer =
+            JournalWriter::create_named(&tree, "j_faulted".to_string(), 16_000).expect("writer");
+        writer.append_frames(&ramp(800, 0)).expect("append");
+        writer.write_boundary().expect("boundary");
+        writer.path().to_path_buf()
+    };
+    let kept = std::fs::read(tree.join(SUPERSEDED_SUBDIR).join("j_faulted.sj")).expect("kept");
+    supersede_capture_journal(&again).expect("supersede again");
+    assert!(!again.exists());
+    assert_eq!(
+        std::fs::read(tree.join(SUPERSEDED_SUBDIR).join("j_faulted.sj")).expect("still kept"),
+        kept
+    );
+    assert!(tree.join(SUPERSEDED_SUBDIR).join("j_faulted.1.sj").exists());
 
     let report = store.recover_capture_journals(&tree).expect("scan");
     assert!(report.recovered.is_empty(), "{report:?}");

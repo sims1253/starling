@@ -4313,6 +4313,8 @@ fn modified_age(path: &Path) -> Option<std::time::Duration> {
 /// into `superseded/` beside it (#356): kept — journals are never
 /// deleted outside the retention sweep — but no longer a take startup
 /// recovery would adopt a second time. A journal already gone is fine.
+/// A name already taken in `superseded/` gets a numbered one: the kept
+/// journal there is never replaced.
 pub fn supersede_capture_journal(path: &Path) -> Result<(), StoreV2Error> {
     let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
         return Ok(());
@@ -4322,10 +4324,67 @@ pub fn supersede_capture_journal(path: &Path) -> Result<(), StoreV2Error> {
     }
     let aside = dir.join(SUPERSEDED_SUBDIR);
     std::fs::create_dir_all(&aside)?;
-    std::fs::rename(path, aside.join(name))?;
+    let stem = path.file_stem().unwrap_or(name).to_string_lossy().to_string();
+    let mut attempt = 0u32;
+    loop {
+        let destination = if attempt == 0 {
+            aside.join(name)
+        } else {
+            aside.join(format!("{stem}.{attempt}.sj"))
+        };
+        // One atomic move that never replaces what is already kept: no
+        // instant has the journal under both names (recovery would offer
+        // the tree's copy, sharing the kept one's bytes).
+        if rename_noreplace(path, &destination)? {
+            break;
+        }
+        attempt += 1;
+    }
     sync_dir(dir)?;
     sync_dir(&aside)?;
     Ok(())
+}
+
+/// Rename `from` to `to` unless `to` exists: `Ok(false)` when the name is
+/// taken. Linux (glibc) asks the kernel for it atomically
+/// (`RENAME_NOREPLACE`); a filesystem or platform without that checks
+/// first — only [`supersede_capture_journal`] writes in `superseded/`, so
+/// the check-to-rename window has no competing writer in practice.
+fn rename_noreplace(from: &Path, to: &Path) -> io::Result<bool> {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let from_c = CString::new(from.as_os_str().as_bytes())?;
+        let to_c = CString::new(to.as_os_str().as_bytes())?;
+        // SAFETY: two NUL-terminated paths that outlive the call.
+        let renamed = unsafe {
+            libc::renameat2(
+                libc::AT_FDCWD,
+                from_c.as_ptr(),
+                libc::AT_FDCWD,
+                to_c.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        if renamed == 0 {
+            return Ok(true);
+        }
+        let error = io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::EEXIST) => return Ok(false),
+            // No RENAME_NOREPLACE on this filesystem or kernel.
+            Some(libc::EINVAL) | Some(libc::ENOSYS) => {}
+            _ => return Err(error),
+        }
+    }
+    match std::fs::symlink_metadata(to) {
+        Ok(_) => Ok(false),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            std::fs::rename(from, to).map(|()| true)
+        }
+        Err(err) => Err(err),
+    }
 }
 
 /// Where [`supersede_capture_journal`] keeps journals, under the

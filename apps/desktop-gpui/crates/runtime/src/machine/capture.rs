@@ -685,6 +685,8 @@ impl V2CaptureStore {
                     // A successfully recorded note is the normal sub-path,
                     // not divergence — the channel stays free of
                     // normal-path traffic for operators keying on it.
+                    drop(store);
+                    supersede_stored_take_journal(take);
                     return Ok(());
                 }
                 Err(read_err) => {
@@ -693,6 +695,11 @@ impl V2CaptureStore {
                          read back ({read_err}) — the commit's outcome is unknown; reconcile \
                          will surface whatever landed"
                     ));
+                    // Whatever landed came from the samples, whose sealed
+                    // journal reconcile surfaces: the recorder's journal
+                    // is no second copy to offer.
+                    drop(store);
+                    supersede_stored_take_journal(take);
                     return Ok(());
                 }
                 Ok(None) => {}
@@ -747,19 +754,24 @@ impl V2CaptureStore {
             return Err(chained_with_rollback(err, rollback));
         }
         drop(store);
-        // #356: the take is stored from its samples; a journal it left in
-        // the recorder's tree must not come back as a second, partial take
-        // at the next startup recovery. Kept, never deleted.
-        if let Some(report) = &take.journal {
-            if let Err(err) = starling_dictation::store_v2::supersede_capture_journal(&report.path) {
-                report_divergence(format!(
-                    "the stored take's capture journal {} could not be moved aside ({err}); \
-                     startup recovery may list it as an interrupted copy",
-                    report.path.display()
-                ));
-            }
-        }
+        supersede_stored_take_journal(take);
         Ok(())
+    }
+}
+
+/// #356: a take stored from its samples (every exit that answers Ok on
+/// the samples path) leaves no journal in the recorder's tree to come
+/// back as a second, partial take at the next startup recovery. Kept,
+/// never deleted.
+fn supersede_stored_take_journal(take: &TakeRecord) {
+    if let Some(report) = &take.journal {
+        if let Err(err) = starling_dictation::store_v2::supersede_capture_journal(&report.path) {
+            report_divergence(format!(
+                "the stored take's capture journal {} could not be moved aside ({err}); \
+                 startup recovery may list it as an interrupted copy",
+                report.path.display()
+            ));
+        }
     }
 }
 

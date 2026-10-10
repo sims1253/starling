@@ -282,6 +282,7 @@ mod tests {
             models,
             notices: Vec::new(),
             last_error: None,
+            activations_handled: 0,
         }
     }
 

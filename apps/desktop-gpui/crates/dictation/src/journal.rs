@@ -123,14 +123,23 @@ impl FileSink {
         // lock with the handle, so a killed writer leaves it free. The
         // file is created and locked under a name the scan ignores and
         // only then renamed into place, so the scan never sees an
-        // unlocked live journal. Best-effort: without a lock the scan
-        // falls back on the file's age.
+        // unlocked live journal. Best-effort: a filesystem that cannot
+        // lock answers the scan's probe with an error too, which the scan
+        // reads as held; without a lock primitive at all it falls back on
+        // the file's age. Creation does not fail on it — staging journals
+        // share this path, and a save must not depend on file locks.
         let creating = dir.join(format!("{id}.{JOURNAL_EXT}.creating"));
         let file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&creating)?;
-        let _ = crate::store_v2::try_flock_exclusive(&file);
+        if let Err(err) = crate::store_v2::try_flock_exclusive(&file) {
+            eprintln!(
+                "STARLING journal {} has no liveness lock ({err}); startup recovery leaves it \
+                 for as long as its lock cannot be checked",
+                path.display()
+            );
+        }
         // A hard link publishes the name atomically and fails on anything
         // already there (a file or a planted symlink) — `create_new`
         // semantics for the real name. A filesystem without hard links
