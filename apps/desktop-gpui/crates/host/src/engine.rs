@@ -653,6 +653,9 @@ fn is_secret_key(key: &str) -> bool {
     while at < bytes.len() {
         let hex = bytes
             .get(at + 1..at + 3)
+            // Exactly two hex digits: `from_str_radix` alone would take
+            // a sign (`%+f`).
+            .filter(|hex| hex.iter().all(u8::is_ascii_hexdigit))
             .and_then(|hex| std::str::from_utf8(hex).ok())
             .and_then(|hex| u8::from_str_radix(hex, 16).ok());
         match (bytes[at], hex) {
