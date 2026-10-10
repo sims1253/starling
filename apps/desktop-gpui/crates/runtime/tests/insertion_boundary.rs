@@ -5,7 +5,7 @@
 //! revision is never edited. Apply reads the boundary again; `raw` and
 //! `verbatim` deliveries read nothing and deliver the text unchanged.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -23,10 +23,13 @@ use starling_runtime::protocol::{BoundaryPolicy, Command, Event, Revision};
 use starling_runtime::{Runtime, RuntimeClient, RuntimeConfig};
 
 /// Reports scripted surrounding text per target (`Unsupported` for any
-/// target never scripted) and records every read and insertion.
+/// target never scripted) and records every read and insertion. Queued
+/// reads and revalidations are answered first, one per call.
 #[derive(Default)]
 struct ScriptedAdapter {
     surroundings: Mutex<HashMap<String, SurroundingRead>>,
+    queued_reads: Mutex<VecDeque<SurroundingRead>>,
+    queued_revalidations: Mutex<VecDeque<Revalidation>>,
     reads: Mutex<Vec<String>>,
     inserted: Mutex<Vec<String>>,
 }
@@ -57,6 +60,19 @@ impl ScriptedAdapter {
         );
     }
 
+    /// The next reads, whatever the target, before the scripted ones.
+    fn queue_befores(&self, befores: &[&str]) {
+        self.queued_reads
+            .lock()
+            .unwrap()
+            .extend(befores.iter().map(|before| {
+                SurroundingRead::Text(SurroundingText {
+                    before: before.to_string(),
+                    ..SurroundingText::default()
+                })
+            }));
+    }
+
     fn reads(&self) -> usize {
         self.reads.lock().unwrap().len()
     }
@@ -72,7 +88,11 @@ impl DeliveryAdapter for ScriptedAdapter {
     }
 
     fn revalidate(&self, _target_ref: &str, _compare_token: &str) -> Revalidation {
-        Revalidation::Unchanged
+        self.queued_revalidations
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(Revalidation::Unchanged)
     }
 
     fn insert(
@@ -93,6 +113,9 @@ impl DeliveryAdapter for ScriptedAdapter {
 
     fn surrounding_text(&self, target_ref: &str) -> SurroundingRead {
         self.reads.lock().unwrap().push(target_ref.to_string());
+        if let Some(read) = self.queued_reads.lock().unwrap().pop_front() {
+            return read;
+        }
         self.surroundings
             .lock()
             .unwrap()
@@ -421,6 +444,73 @@ fn apply_rederives_when_the_boundary_changed_since_prepare() {
     session.runtime.shutdown();
 }
 
+/// Registering a derivation waits on the document service: apply reads the
+/// boundary again afterwards, derives again when it moved, gives up when
+/// it keeps moving, and revalidates the target once more.
+#[test]
+fn apply_rechecks_the_boundary_and_target_after_registering() {
+    let mut session = Session::start(ScriptedAdapter::new());
+    session.commit("notes", "rev-1", "Fox jumps");
+
+    // Cleared while the derivation was being registered.
+    let delivery = session.prepare("rev-1", "field-start");
+    session.adapter.queue_befores(&["The quick brown", ""]);
+    session.apply(delivery);
+    assert_eq!(session.adapter.inserted().last().unwrap(), "Fox jumps");
+
+    // Moving on every read: nothing is inserted.
+    let inserted = session.adapter.inserted().len();
+    let delivery = session.prepare("rev-1", "field-start");
+    session
+        .adapter
+        .queue_befores(&["The quick brown", "Done.", "The quick brown", "Done."]);
+    assert_eq!(
+        session.apply(delivery),
+        Event::DeliveryFailed {
+            reason: "boundary_unstable".into(),
+            fallback_suggested: true,
+        }
+    );
+    assert_eq!(session.adapter.inserted().len(), inserted);
+
+    // The target moved while the registration waited.
+    let delivery = session.prepare("rev-1", "field-start");
+    session
+        .adapter
+        .queue_befores(&["The quick brown", "The quick brown"]);
+    session
+        .adapter
+        .queued_revalidations
+        .lock()
+        .unwrap()
+        .extend([
+            Revalidation::Unchanged,
+            Revalidation::Changed {
+                expected: "field-start".into(),
+                actual: "elsewhere".into(),
+            },
+        ]);
+    session
+        .client
+        .send(
+            Some("dlv"),
+            Command::DeliveryApply {
+                delivery_id: delivery,
+            },
+        )
+        .expect("apply accepted");
+    assert_eq!(
+        session.until("delivery.conflict"),
+        Event::DeliveryConflict {
+            expected_target: "field-start".into(),
+            actual_target: "elsewhere".into(),
+        }
+    );
+    assert_eq!(session.adapter.inserted().len(), inserted);
+
+    session.runtime.shutdown();
+}
+
 #[test]
 fn protected_and_hint_only_fields_are_never_adjusted() {
     let adapter = ScriptedAdapter::new();
@@ -490,6 +580,33 @@ fn a_derived_id_never_replaces_an_unrelated_revision() {
         )]
     );
 
+    session.runtime.shutdown();
+}
+
+/// A derived id durably held by a document this session never loaded is
+/// refused like one held in memory.
+#[test]
+fn a_derived_id_held_by_an_unloaded_document_is_refused() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let config = || {
+        let store = V2DocumentStore::open(root.path()).expect("v2 document store opens");
+        RuntimeConfig::default().with_document_store(Arc::new(store))
+    };
+    let mut session = Session::start_with(config(), ScriptedAdapter::new());
+    session.commit("notes", "r", "Next one");
+    session.commit("other", "r:boundary-space", "Unrelated");
+    session.runtime.shutdown();
+
+    let mut session = Session::start_with(config(), ScriptedAdapter::new());
+    session.docs_get("notes");
+    assert_eq!(
+        session.prepare_with("r", "after-period", BoundaryPolicy::Adjust),
+        Err(Rejection::RevisionIdTaken {
+            revision_id: "r:boundary-space".into()
+        })
+    );
+    assert_eq!(revisions(&session.docs_get("notes")).len(), 1);
+    assert_eq!(revisions(&session.docs_get("other"))[0].2, "Unrelated");
     session.runtime.shutdown();
 }
 

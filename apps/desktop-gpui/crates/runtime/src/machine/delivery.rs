@@ -47,6 +47,14 @@ use super::docs::{DerivedRevisions, RevisionRegistry};
 /// The provenance of a revision produced by the insertion-boundary rules.
 const BOUNDARY_PROVENANCE: &str = "insertion-boundary";
 
+/// How often apply derives again when the boundary keeps moving while a
+/// derivation is being registered, before it gives up.
+const APPLY_DERIVE_ATTEMPTS: usize = 3;
+
+/// The protocol's `msgId` length limit: a derived id stays nameable by a
+/// later `delivery.prepare`.
+const MSG_ID_MAX: usize = 128;
+
 /// What an adapter learned revalidating a target just before apply.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Revalidation {
@@ -381,7 +389,10 @@ impl DeliveryActor {
             && source.provenance != BOUNDARY_PROVENANCE)
             .then(|| (doc_id, source.clone()));
         let derived = match &boundary_source {
-            Some((doc_id, source)) => self.boundary_revision(doc_id, source, &target_ref),
+            Some((doc_id, source)) => {
+                let surrounding = self.read_surrounding(&target_ref);
+                self.boundary_revision(doc_id, source, surrounding.as_ref())
+            }
             None => Ok(None),
         };
         let (revision_id, text) = match derived {
@@ -439,21 +450,28 @@ impl DeliveryActor {
         }
     }
 
-    /// Reads the text around the insertion point and, when the
-    /// insertion-boundary rules change `source`, registers the adjusted
-    /// text as a revision derived from it through the document service.
-    /// `None` delivers `source` unchanged: no text reported, a protected
-    /// field, or no rule fired. The surrounding text lives only in this
-    /// call.
+    /// The text around the insertion point; `None` when the target
+    /// reports none or is a protected field. The caller holds it only for
+    /// the boundary decision.
+    fn read_surrounding(&self, target_ref: &str) -> Option<SurroundingText> {
+        match self.adapter.surrounding_text(target_ref) {
+            SurroundingRead::Text(surrounding) => Some(surrounding),
+            SurroundingRead::Unsupported | SurroundingRead::Protected(_) => None,
+        }
+    }
+
+    /// When the insertion-boundary rules change `source` at `surrounding`,
+    /// registers the adjusted text as a revision derived from it through
+    /// the document service. `None` delivers `source` unchanged: no text
+    /// reported, a protected field, or no rule fired.
     fn boundary_revision(
         &self,
         doc_id: &str,
         source: &Revision,
-        target_ref: &str,
+        surrounding: Option<&SurroundingText>,
     ) -> Result<Option<Revision>, Rejection> {
-        let surrounding = match self.adapter.surrounding_text(target_ref) {
-            SurroundingRead::Text(surrounding) => surrounding,
-            SurroundingRead::Unsupported | SurroundingRead::Protected(_) => return Ok(None),
+        let Some(surrounding) = surrounding else {
+            return Ok(None);
         };
         let context = BoundaryContext {
             before: &surrounding.before,
@@ -474,10 +492,8 @@ impl DeliveryActor {
                 BoundaryChange::FirstLetterCase => "case",
             })
             .collect();
-        // `:` keeps the id a wire-legal `msgId`, so a derived revision can
-        // be named by a later `delivery.prepare`.
         let derived = Revision {
-            rev_id: format!("{}:boundary-{}", source.rev_id, rules.join("-")),
+            rev_id: derived_id(&source.rev_id, &rules.join("-")),
             text: adjustment.text,
             provenance: BOUNDARY_PROVENANCE.to_string(),
             ..source.clone()
@@ -485,6 +501,37 @@ impl DeliveryActor {
         self.derived
             .record(doc_id, &source.rev_id, derived.clone())?;
         Ok(Some(derived))
+    }
+
+    /// What apply delivers under the boundary rules: `source` derived
+    /// against the boundary as it is now. Registering a derivation waits
+    /// on the document service, so the boundary is read again afterwards
+    /// and the derivation repeated when it moved in the meantime. The flag
+    /// says whether a registration waited (the target is then revalidated
+    /// again); the error is a `delivery.failed` reason.
+    fn derive_at_apply(
+        &self,
+        doc_id: &str,
+        source: &Revision,
+        target_ref: &str,
+    ) -> Result<(Revision, bool), &'static str> {
+        let mut surrounding = self.read_surrounding(target_ref);
+        let mut waited = false;
+        for _ in 0..APPLY_DERIVE_ATTEMPTS {
+            let derived = self
+                .boundary_revision(doc_id, source, surrounding.as_ref())
+                .map_err(|rejection| failure_reason(&rejection))?;
+            let Some(derived) = derived else {
+                return Ok((source.clone(), waited));
+            };
+            waited = true;
+            let now = self.read_surrounding(target_ref);
+            if now == surrounding {
+                return Ok((derived, waited));
+            }
+            surrounding = now;
+        }
+        Err("boundary_unstable")
     }
 
     fn handle_apply(&mut self, reply: super::ReceiptTx, corr: String, delivery_id: String) {
@@ -516,15 +563,14 @@ impl DeliveryActor {
                         // user kept typing): derive again from the
                         // requested revision, never deliver the stale text.
                         if let Some((doc_id, source)) = &boundary_source {
-                            let delivered =
-                                match self.boundary_revision(doc_id, source, &target_ref) {
-                                    Ok(Some(derived)) => derived,
-                                    Ok(None) => source.clone(),
-                                    Err(rejection) => {
+                            let (delivered, waited) =
+                                match self.derive_at_apply(doc_id, source, &target_ref) {
+                                    Ok(derived) => derived,
+                                    Err(reason) => {
                                         self.emit(
                                             &delivery_id,
                                             Event::DeliveryFailed {
-                                                reason: failure_reason(&rejection).to_string(),
+                                                reason: reason.to_string(),
                                                 fallback_suggested: true,
                                             },
                                             &corr,
@@ -532,6 +578,23 @@ impl DeliveryActor {
                                         return;
                                     }
                                 };
+                            // The target may have moved while the
+                            // registration waited.
+                            if waited {
+                                if let Revalidation::Changed { expected, actual } =
+                                    self.adapter.revalidate(&target_ref, &compare_token)
+                                {
+                                    self.emit(
+                                        &delivery_id,
+                                        Event::DeliveryConflict {
+                                            expected_target: expected,
+                                            actual_target: actual,
+                                        },
+                                        &corr,
+                                    );
+                                    return;
+                                }
+                            }
                             text = delivered.text;
                             if let Some(state) = self.deliveries.get_mut(&delivery_id) {
                                 state.revision_id = delivered.rev_id;
@@ -613,6 +676,29 @@ impl DeliveryActor {
     }
 }
 
+/// `{source}:boundary-{rules}` (`:` keeps it a wire-legal `msgId`). A
+/// source id too long for the suffix is shortened and tagged with a
+/// digest of the full id, so the result stays within [`MSG_ID_MAX`] and
+/// one source still maps to one id.
+fn derived_id(source_id: &str, rules: &str) -> String {
+    let suffix = format!(":boundary-{rules}");
+    if source_id.len() + suffix.len() <= MSG_ID_MAX {
+        return format!("{source_id}{suffix}");
+    }
+    // 64-bit FNV-1a: an id tag, not a security boundary (a collision is
+    // still refused as `RevisionIdTaken`).
+    let digest = source_id
+        .bytes()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        });
+    let mut keep = MSG_ID_MAX - suffix.len() - 17;
+    while !source_id.is_char_boundary(keep) {
+        keep -= 1;
+    }
+    format!("{}.{digest:016x}{suffix}", &source_id[..keep])
+}
+
 /// `delivery.failed.reason` for a derived revision apply could not record.
 fn failure_reason(rejection: &Rejection) -> &'static str {
     match rejection {
@@ -626,5 +712,32 @@ fn illegal(command: &str, state: &str, violation: crate::protocol::replay::Viola
         command: command.to_string(),
         state: state.to_string(),
         detail: violation.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::is_msg_id;
+
+    #[test]
+    fn derived_ids_stay_wire_legal() {
+        assert_eq!(
+            derived_id("rev-1", "space-case"),
+            "rev-1:boundary-space-case"
+        );
+        let long = "r".repeat(MSG_ID_MAX);
+        let near = format!("{}x", "r".repeat(MSG_ID_MAX - 1));
+        let (a, b) = (
+            derived_id(&long, "space-case"),
+            derived_id(&near, "space-case"),
+        );
+        for id in [&a, &b] {
+            assert!(id.len() <= MSG_ID_MAX && is_msg_id(id), "{id}");
+            assert!(id.ends_with(":boundary-space-case"), "{id}");
+        }
+        // Same shortened prefix, different sources: different ids.
+        assert_ne!(a, b);
+        assert_eq!(a, derived_id(&long, "space-case"));
     }
 }

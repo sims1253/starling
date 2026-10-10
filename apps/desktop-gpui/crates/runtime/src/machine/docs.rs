@@ -164,6 +164,13 @@ pub trait DocumentStore: Send + Sync {
         let _ = derived_from;
         self.store_revision(doc_id, revision, RevisionSlot::Derived)
     }
+    /// The document durably holding revision `rev_id`, also one this
+    /// session never hydrated. The default answers "none" (the in-memory
+    /// store has no durable state beyond the session's documents).
+    fn revision_owner(&self, rev_id: &str) -> Result<Option<String>, String> {
+        let _ = rev_id;
+        Ok(None)
+    }
     fn bump_turn(&self, doc_id: &str, turn_seq: u32) -> Result<(), String>;
     /// One document's durable rows; `Ok(None)` when this store has never
     /// held the document. Hydration consults this exactly once per
@@ -386,6 +393,13 @@ impl DocumentStore for V2DocumentStore {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .commit_document_head(name, head_revision, turn_seq, &row)
+            .map_err(|err| err.to_string())
+    }
+    fn revision_owner(&self, rev_id: &str) -> Result<Option<String>, String> {
+        self.store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .revision_document(rev_id)
             .map_err(|err| err.to_string())
     }
     fn bump_turn(&self, doc_id: &str, turn_seq: u32) -> Result<(), String> {
@@ -768,9 +782,10 @@ impl DocsActor {
 
     /// Adds a derived revision to its source's document without touching
     /// the head or the machine state (no v1 command or event models it).
-    /// Ids are unique across documents, preserved candidates included: an
-    /// identical revision under the id is the same derivation again,
-    /// anything else is an unrelated revision that must not be replaced.
+    /// Ids are unique across documents, preserved candidates and documents
+    /// this session never hydrated included: an identical revision under
+    /// the id is the same derivation again, anything else is an unrelated
+    /// revision that must not be replaced.
     fn record_derived(
         &mut self,
         doc_id: String,
@@ -797,6 +812,17 @@ impl DocsActor {
                     revision_id: revision.rev_id,
                 })
             };
+        }
+        // Every hydrated document was checked above, so a durable owner is
+        // a document this session has not loaded (or a row it could not).
+        match self.store.revision_owner(&revision.rev_id) {
+            Ok(None) => {}
+            Ok(Some(_)) => {
+                return Err(Rejection::RevisionIdTaken {
+                    revision_id: revision.rev_id,
+                })
+            }
+            Err(detail) => report_store_failure("revision_owner", &doc_id, detail),
         }
         let Some(record) = self.documents.get_mut(&doc_id) else {
             return Err(Rejection::UnknownRevision {
