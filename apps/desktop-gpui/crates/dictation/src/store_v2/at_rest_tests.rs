@@ -189,10 +189,17 @@ fn assert_flac_fidelity(store: &mut StoreV2, rate: u32, samples: &[f32], name: &
     compressed(store.compress_audio(&id).expect(name));
     assert_eq!(files(store, &id), (false, true), "{name}");
     let from_flac = request_wav(store, &id);
-    assert!(from_flac == from_journal, "{name}: request WAV differs after compression");
+    assert!(
+        from_flac == from_journal,
+        "{name}: request WAV differs after compression"
+    );
     let expected = request_pcm16(samples, rate).expect("pcm16");
     let file = File::open(store.flac_path(&id)).expect("flac");
-    assert_eq!(flac::decode(io::BufReader::new(file)).expect("decode"), expected, "{name}");
+    assert_eq!(
+        flac::decode(io::BufReader::new(file)).expect("decode"),
+        expected,
+        "{name}"
+    );
 }
 
 #[test]
@@ -204,7 +211,10 @@ fn flac_is_sample_exact_on_the_fidelity_corpus() {
     let dir = TempDir::new().expect("tempdir");
     let mut store = store_in(&dir);
     let fixtures = corpus["fixtures"].as_array().expect("fixtures");
-    assert!(fixtures.len() >= 8, "the whole corpus, long passage included");
+    assert!(
+        fixtures.len() >= 8,
+        "the whole corpus, long passage included"
+    );
     for fixture in fixtures {
         let name = fixture["id"].as_str().expect("id");
         let synthesis = &fixture["synthesis"];
@@ -242,7 +252,12 @@ fn flac_is_sample_exact_on_real_speech_and_device_rates() {
     ))
     .expect("LibriSpeech fixture");
     let speech = decode_pcm16_wav(&wav).expect("decode fixture");
-    assert_flac_fidelity(&mut store, speech.sample_rate, &speech.samples, "librispeech");
+    assert_flac_fidelity(
+        &mut store,
+        speech.sample_rate,
+        &speech.samples,
+        "librispeech",
+    );
     // Raw f32 captures, not PCM16-derived: at 16 kHz and at device rates
     // the request path resamples (48 kHz, 44.1 kHz).
     assert_flac_fidelity(&mut store, 16_000, &speechy(40_000, 3), "f32 16k");
@@ -267,7 +282,9 @@ fn compression_lists_and_plays_like_the_journal_did() {
     let dir = TempDir::new().expect("tempdir");
     let mut store = store_in(&dir);
     let id = take_at(&mut store, 16_000, &speechy(32_000, 1));
-    let journal_bytes = std::fs::metadata(store.audio_path(&id)).expect("journal").len();
+    let journal_bytes = std::fs::metadata(store.audio_path(&id))
+        .expect("journal")
+        .len();
     let CompressionOutcome::Compressed {
         journal_bytes: reported,
         flac_bytes,
@@ -276,7 +293,10 @@ fn compression_lists_and_plays_like_the_journal_did() {
         panic!("not compressed");
     };
     assert_eq!(reported, journal_bytes);
-    assert!(flac_bytes * 3 < journal_bytes, "{flac_bytes} vs {journal_bytes}");
+    assert!(
+        flac_bytes * 3 < journal_bytes,
+        "{flac_bytes} vs {journal_bytes}"
+    );
     assert_eq!(store.audio_at_rest(&id).expect("state"), AudioAtRest::Flac);
     assert!(store.audio_journal_exists(&id).expect("exists"));
     let page = store.list_records(0, 10).expect("list");
@@ -286,7 +306,12 @@ fn compression_lists_and_plays_like_the_journal_did() {
     assert!(listing.problems.is_empty(), "{:?}", listing.problems);
     assert_eq!(listing.audio, AudioAtRest::Flac);
     // Nothing left to do, and nothing for reconcile to repair.
-    assert!(store.compression_candidates(10).expect("candidates").is_empty());
+    assert!(
+        store
+            .compression_candidates(10)
+            .expect("candidates")
+            .is_empty()
+    );
     let report = store.reconcile().expect("reconcile");
     assert!(!report.has_findings(), "{}", report.summary());
     assert_eq!(files(&store, &id), (false, true));
@@ -314,7 +339,10 @@ fn a_crash_before_publishing_leaves_the_journal_and_scratch_only() {
     let mut store = store_in(&dir);
     let id = take_at(&mut store, 16_000, &speechy(16_000, 3));
     let before = request_wav(&store, &id);
-    let job = store.compression_candidates(1).expect("candidates").remove(0);
+    let job = store
+        .compression_candidates(1)
+        .expect("candidates")
+        .remove(0);
     // Killed after the temp was written and verified, before the rename.
     let prepared = prepare_compression(&job).expect("prepare");
     let temp = prepared.temp.clone();
@@ -348,13 +376,19 @@ fn a_crash_after_publishing_is_completed_by_reconcile() {
     let mut store = store_in(&dir);
     let id = take_at(&mut store, 48_000, &speechy(48_000, 4));
     let before = request_wav(&store, &id);
-    let job = store.compression_candidates(1).expect("candidates").remove(0);
+    let job = store
+        .compression_candidates(1)
+        .expect("candidates")
+        .remove(0);
     let prepared = prepare_compression(&job).expect("prepare");
     // Killed between the rename and the journal unlink.
     std::fs::rename(&prepared.temp, store.flac_path(&id)).expect("publish");
     assert_eq!(files(&store, &id), (true, true));
     // Both files: the journal is what reads resolve to meanwhile.
-    assert_eq!(store.audio_at_rest(&id).expect("state"), AudioAtRest::Journal);
+    assert_eq!(
+        store.audio_at_rest(&id).expect("state"),
+        AudioAtRest::Journal
+    );
     assert_eq!(request_wav(&store, &id), before);
 
     let report = store.reconcile().expect("reconcile");
@@ -370,7 +404,10 @@ fn a_damaged_published_flac_never_costs_the_journal() {
     let mut store = store_in(&dir);
     let id = take_at(&mut store, 16_000, &speechy(16_000, 5));
     let before = request_wav(&store, &id);
-    let job = store.compression_candidates(1).expect("candidates").remove(0);
+    let job = store
+        .compression_candidates(1)
+        .expect("candidates")
+        .remove(0);
     let prepared = prepare_compression(&job).expect("prepare");
     std::fs::rename(&prepared.temp, store.flac_path(&id)).expect("publish");
     // The published copy is damaged (disk trouble after the publish).
@@ -382,7 +419,10 @@ fn a_damaged_published_flac_never_costs_the_journal() {
     let report = store.reconcile().expect("reconcile");
     assert!(report.completed_compressions.is_empty());
     assert!(
-        report.unreadable.iter().any(|(unreadable, _)| unreadable == &id),
+        report
+            .unreadable
+            .iter()
+            .any(|(unreadable, _)| unreadable == &id),
         "{:?}",
         report.unreadable
     );
@@ -406,7 +446,10 @@ fn every_compression_step_leaves_complete_audio() {
         let reopened = StoreV2::open(dir.path().join("v2")).expect("reopen");
         assert_eq!(request_wav(&reopened, &id), before, "{label}");
     };
-    let job = store.compression_candidates(1).expect("candidates").remove(0);
+    let job = store
+        .compression_candidates(1)
+        .expect("candidates")
+        .remove(0);
     check("before");
     let prepared = prepare_compression(&job).expect("prepare");
     check("temp written");
@@ -424,7 +467,12 @@ fn audio_pinned_by_an_attempt_is_never_compressed_under_it() {
     store
         .begin_recognition(&id, "engine:test", None)
         .expect("begin");
-    assert!(store.compression_candidates(10).expect("candidates").is_empty());
+    assert!(
+        store
+            .compression_candidates(10)
+            .expect("candidates")
+            .is_empty()
+    );
     assert!(matches!(
         store.compress_audio(&id).expect("compress"),
         CompressionOutcome::Skipped(_)
@@ -439,7 +487,10 @@ fn audio_pinned_by_an_attempt_is_never_compressed_under_it() {
         .expect("finish");
 
     // A retry that starts while the encode runs off the lock wins.
-    let job = store.compression_candidates(1).expect("candidates").remove(0);
+    let job = store
+        .compression_candidates(1)
+        .expect("candidates")
+        .remove(0);
     let prepared = prepare_compression(&job).expect("prepare");
     store
         .begin_recognition(&id, "engine:test", None)
@@ -461,9 +512,17 @@ fn a_take_still_recording_is_not_a_candidate() {
         .expect("begin");
     take.append_frames(&speechy(16_000, 8)).expect("append");
     take.write_boundary().expect("boundary");
-    assert!(store.compression_candidates(10).expect("candidates").is_empty());
+    assert!(
+        store
+            .compression_candidates(10)
+            .expect("candidates")
+            .is_empty()
+    );
     let id = take.finish(&mut store).expect("finish").record.id;
-    assert_eq!(store.compression_candidates(10).expect("candidates").len(), 1);
+    assert_eq!(
+        store.compression_candidates(10).expect("candidates").len(),
+        1
+    );
     compressed(store.compress_audio(&id).expect("compress"));
 }
 
@@ -473,7 +532,10 @@ fn deleting_during_compression_and_after_it_keeps_r21_semantics() {
     let mut store = store_in(&dir);
     // Deleted while the encode runs off the lock.
     let racing = take_at(&mut store, 16_000, &speechy(16_000, 9));
-    let job = store.compression_candidates(1).expect("candidates").remove(0);
+    let job = store
+        .compression_candidates(1)
+        .expect("candidates")
+        .remove(0);
     let prepared = prepare_compression(&job).expect("prepare");
     store.delete_capture(&racing).expect("delete");
     assert!(matches!(
@@ -491,18 +553,27 @@ fn deleting_during_compression_and_after_it_keeps_r21_semantics() {
     assert!(store.quarantine_flac_path(&done).exists());
     assert_eq!(files(&store, &done), (false, false));
     store.reconcile().expect("reconcile");
-    assert!(store.get_capture(&done).expect("row").is_none(), "never resurrected");
+    assert!(
+        store.get_capture(&done).expect("row").is_none(),
+        "never resurrected"
+    );
     let report = store.sweep_retention().expect("sweep");
     let swept: Vec<&str> = report.swept.iter().map(|file| file.id.as_str()).collect();
-    assert!(swept.contains(&racing.as_str()) && swept.contains(&done.as_str()), "{swept:?}");
+    assert!(
+        swept.contains(&racing.as_str()) && swept.contains(&done.as_str()),
+        "{swept:?}"
+    );
     assert!(!store.quarantine_flac_path(&done).exists());
 
     // A quarantined FLAC whose delete crashed before the row went is
     // completed, not resurrected.
     let crashed = take_at(&mut store, 16_000, &speechy(16_000, 11));
     compressed(store.compress_audio(&crashed).expect("compress"));
-    std::fs::rename(store.flac_path(&crashed), store.quarantine_flac_path(&crashed))
-        .expect("quarantine rename");
+    std::fs::rename(
+        store.flac_path(&crashed),
+        store.quarantine_flac_path(&crashed),
+    )
+    .expect("quarantine rename");
     let report = store.reconcile().expect("reconcile");
     assert!(report.completed_deletes.contains(&crashed));
     assert!(store.get_capture(&crashed).expect("row").is_none());
@@ -521,7 +592,10 @@ fn retention_is_off_by_default() {
         .apply_retention_policy(&policy, time::OffsetDateTime::now_utc())
         .expect("apply");
     assert!(report.retired.is_empty() && report.held.is_empty());
-    assert_eq!(store.audio_at_rest(&id).expect("state"), AudioAtRest::Journal);
+    assert_eq!(
+        store.audio_at_rest(&id).expect("state"),
+        AudioAtRest::Journal
+    );
 }
 
 #[test]
@@ -534,7 +608,10 @@ fn the_age_limit_retires_old_audio_and_keeps_everything_else() {
     let attempts_before = store.attempts_for(&old).expect("attempts").len();
 
     let report = store
-        .apply_retention_policy(&policy(STANDARD_CLASS, age(30)), time::OffsetDateTime::now_utc())
+        .apply_retention_policy(
+            &policy(STANDARD_CLASS, age(30)),
+            time::OffsetDateTime::now_utc(),
+        )
         .expect("apply");
     assert_eq!(retired_ids(&report), vec![old.clone()]);
     assert_eq!(report.retired[0].reason, RetireReason::Age);
@@ -545,7 +622,10 @@ fn the_age_limit_retires_old_audio_and_keeps_everything_else() {
     // Only the audio went: the row and its transcript stay, the listing
     // says retired without calling it a problem, reads explain why.
     assert!(store.get_capture(&old).expect("row").is_some());
-    assert_eq!(store.attempts_for(&old).expect("attempts").len(), attempts_before);
+    assert_eq!(
+        store.attempts_for(&old).expect("attempts").len(),
+        attempts_before
+    );
     assert!(matches!(
         store.audio_at_rest(&old).expect("state"),
         AudioAtRest::Retired { .. }
@@ -570,7 +650,10 @@ fn the_age_limit_retires_old_audio_and_keeps_everything_else() {
     let candidates = store.compression_candidates(10).expect("candidates");
     assert!(candidates.iter().all(|job| job.id != old));
     let again = store
-        .apply_retention_policy(&policy(STANDARD_CLASS, age(30)), time::OffsetDateTime::now_utc())
+        .apply_retention_policy(
+            &policy(STANDARD_CLASS, age(30)),
+            time::OffsetDateTime::now_utc(),
+        )
         .expect("apply again");
     assert!(again.retired.is_empty());
 }
@@ -581,13 +664,17 @@ fn referenced_in_use_untranscribed_and_recent_audio_is_held_and_said() {
     let mut store = store_in(&dir);
     // Referenced by a correction record (#304).
     let corrected = aged_take(&mut store, 90, 16_000);
-    let attempt = store.attempts_for(&corrected).expect("attempts")[0].id.clone();
+    let attempt = store.attempts_for(&corrected).expect("attempts")[0]
+        .id
+        .clone();
     store
         .upsert_correction_record(&correction_for(&corrected, &attempt))
         .expect("correction");
     // Referenced by a document revision naming its attempt.
     let documented = aged_take(&mut store, 90, 16_000);
-    let doc_attempt = store.attempts_for(&documented).expect("attempts")[0].id.clone();
+    let doc_attempt = store.attempts_for(&documented).expect("attempts")[0]
+        .id
+        .clone();
     store.upsert_document("doc_1", "notes", 1, 1).expect("doc");
     store
         .store_document_revision(&RevisionRow {
@@ -650,9 +737,20 @@ fn referenced_in_use_untranscribed_and_recent_audio_is_held_and_said() {
     let mut expected = vec![corrected.clone(), documented.clone()];
     expected.sort();
     assert_eq!(retired, expected);
-    assert_eq!(store.correction_records_for(&corrected).expect("records").len(), 1);
     assert_eq!(
-        store.get_document("doc_1").expect("doc").expect("doc").revisions.len(),
+        store
+            .correction_records_for(&corrected)
+            .expect("records")
+            .len(),
+        1
+    );
+    assert_eq!(
+        store
+            .get_document("doc_1")
+            .expect("doc")
+            .expect("doc")
+            .revisions
+            .len(),
         1
     );
     assert_eq!(held(&report, &failed), Some(HoldReason::Untranscribed));
@@ -661,7 +759,10 @@ fn referenced_in_use_untranscribed_and_recent_audio_is_held_and_said() {
     // The grace protects fresh takes from any limit.
     let fresh = aged_take(&mut store, 0, 16_000);
     let report = store
-        .apply_retention_policy(&policy(STANDARD_CLASS, age(0)), now + time::Duration::seconds(5))
+        .apply_retention_policy(
+            &policy(STANDARD_CLASS, age(0)),
+            now + time::Duration::seconds(5),
+        )
         .expect("apply");
     assert_eq!(held(&report, &fresh), Some(HoldReason::Recent));
 }
@@ -679,7 +780,10 @@ fn the_size_limit_keeps_the_newest_audio_that_fits() {
         max_total_bytes: Some(each * 2 + each / 2),
     };
     let report = store
-        .apply_retention_policy(&policy(STANDARD_CLASS, limits), time::OffsetDateTime::now_utc())
+        .apply_retention_policy(
+            &policy(STANDARD_CLASS, limits),
+            time::OffsetDateTime::now_utc(),
+        )
         .expect("apply");
     assert_eq!(retired_ids(&report), vec![oldest.clone()]);
     assert_eq!(report.retired[0].reason, RetireReason::Size);
@@ -697,7 +801,10 @@ fn the_size_limit_keeps_the_newest_audio_that_fits() {
         max_total_bytes: Some(each / 2),
     };
     let report = store
-        .apply_retention_policy(&policy(STANDARD_CLASS, tight), time::OffsetDateTime::now_utc())
+        .apply_retention_policy(
+            &policy(STANDARD_CLASS, tight),
+            time::OffsetDateTime::now_utc(),
+        )
         .expect("apply");
     assert_eq!(retired_ids(&report), vec![newest.clone()]);
     assert_eq!(held(&report, &middle), Some(HoldReason::InUse));
@@ -757,7 +864,10 @@ fn limits_reached_mid_take_never_touch_the_take_being_recorded() {
         max_total_bytes: Some(0),
     };
     let report = store
-        .apply_retention_policy(&policy(STANDARD_CLASS, zero), time::OffsetDateTime::now_utc())
+        .apply_retention_policy(
+            &policy(STANDARD_CLASS, zero),
+            time::OffsetDateTime::now_utc(),
+        )
         .expect("apply");
     assert_eq!(retired_ids(&report), vec![old]);
     // The take finishes and commits untouched; once committed it is a
@@ -766,7 +876,10 @@ fn limits_reached_mid_take_never_touch_the_take_being_recorded() {
     assert_eq!(store.load_audio(&id).expect("audio").samples.len(), 32_000);
     complete(&mut store, &id);
     let report = store
-        .apply_retention_policy(&policy(STANDARD_CLASS, zero), time::OffsetDateTime::now_utc())
+        .apply_retention_policy(
+            &policy(STANDARD_CLASS, zero),
+            time::OffsetDateTime::now_utc(),
+        )
         .expect("apply");
     assert!(report.retired.is_empty());
     assert_eq!(held(&report, &id), Some(HoldReason::Recent));
@@ -780,7 +893,10 @@ fn deleted_and_retired_takes_stay_distinct() {
     let retired = aged_take(&mut store, 60, 16_000);
     store.delete_capture(&deleted).expect("delete");
     let report = store
-        .apply_retention_policy(&policy(STANDARD_CLASS, age(30)), time::OffsetDateTime::now_utc())
+        .apply_retention_policy(
+            &policy(STANDARD_CLASS, age(30)),
+            time::OffsetDateTime::now_utc(),
+        )
         .expect("apply");
     // The deleted take is the sweep's, not the policy's.
     assert_eq!(retired_ids(&report), vec![retired.clone()]);
@@ -830,7 +946,12 @@ fn an_in_process_pin_holds_compression_and_retention() {
     let id = aged_take(&mut store, 90, 16_000);
     store.pin_audio(&id);
     store.pin_audio(&id);
-    assert!(store.compression_candidates(10).expect("candidates").is_empty());
+    assert!(
+        store
+            .compression_candidates(10)
+            .expect("candidates")
+            .is_empty()
+    );
     let now = time::OffsetDateTime::now_utc();
     let report = store
         .apply_retention_policy(&policy(STANDARD_CLASS, age(30)), now)
@@ -841,7 +962,10 @@ fn an_in_process_pin_holds_compression_and_retention() {
     // A compression prepared before the pin does not publish under it.
     store.unpin_audio(&id);
     store.unpin_audio(&id);
-    let job = store.compression_candidates(1).expect("candidates").remove(0);
+    let job = store
+        .compression_candidates(1)
+        .expect("candidates")
+        .remove(0);
     let prepared = prepare_compression(&job).expect("prepare");
     store.pin_audio(&id);
     assert!(matches!(
@@ -853,7 +977,12 @@ fn an_in_process_pin_holds_compression_and_retention() {
     // Pins nest; the last release frees the take.
     store.pin_audio(&id);
     store.unpin_audio(&id);
-    assert!(store.compression_candidates(10).expect("candidates").is_empty());
+    assert!(
+        store
+            .compression_candidates(10)
+            .expect("candidates")
+            .is_empty()
+    );
     store.unpin_audio(&id);
     store.unpin_audio(&id); // an extra release does nothing
     compressed(store.compress_audio(&id).expect("compress"));
@@ -875,7 +1004,8 @@ fn retention_decides_after_a_peer_connection_commits() {
     let peer = Connection::open(store.root().join(DB_FILE)).expect("peer");
     peer.busy_timeout(std::time::Duration::from_secs(5))
         .expect("busy timeout");
-    peer.execute_batch("BEGIN IMMEDIATE").expect("peer write lock");
+    peer.execute_batch("BEGIN IMMEDIATE")
+        .expect("peer write lock");
     peer.execute(
         "INSERT INTO recognition_attempts
              (id, capture_id, backend, text, partial_or_final, status)
@@ -898,7 +1028,10 @@ fn retention_decides_after_a_peer_connection_commits() {
     let (store, report) = sweeper.join().expect("sweeper");
     assert!(report.retired.is_empty(), "{report:?}");
     assert_eq!(held(&report, &id), Some(HoldReason::InUse));
-    assert_eq!(store.audio_at_rest(&id).expect("state"), AudioAtRest::Journal);
+    assert_eq!(
+        store.audio_at_rest(&id).expect("state"),
+        AudioAtRest::Journal
+    );
 }
 
 #[test]
@@ -909,7 +1042,10 @@ fn retired_audio_is_never_transcribed_again() {
     let mut store = store_in(&dir);
     let id = aged_take(&mut store, 90, 16_000);
     let report = store
-        .apply_retention_policy(&policy(STANDARD_CLASS, age(30)), time::OffsetDateTime::now_utc())
+        .apply_retention_policy(
+            &policy(STANDARD_CLASS, age(30)),
+            time::OffsetDateTime::now_utc(),
+        )
         .expect("apply");
     assert_eq!(retired_ids(&report), vec![id.clone()]);
     let err = store
@@ -951,7 +1087,10 @@ fn a_policy_changed_mid_run_stops_before_removing_more() {
     assert!(report.policy_changed);
     // Walked newest first: `old` went under the limit as it stood then.
     assert_eq!(retired_ids(&report), vec![old]);
-    assert_eq!(store.audio_at_rest(&older).expect("state"), AudioAtRest::Journal);
+    assert_eq!(
+        store.audio_at_rest(&older).expect("state"),
+        AudioAtRest::Journal
+    );
 }
 
 #[test]
@@ -964,7 +1103,8 @@ fn a_class_change_by_a_peer_mid_run_is_respected() {
     let peer = Connection::open(store.root().join(DB_FILE)).expect("peer");
     peer.busy_timeout(std::time::Duration::from_secs(5))
         .expect("busy timeout");
-    peer.execute_batch("BEGIN IMMEDIATE").expect("peer write lock");
+    peer.execute_batch("BEGIN IMMEDIATE")
+        .expect("peer write lock");
     peer.execute(
         "UPDATE captures SET retention_class = ?2 WHERE id = ?1",
         params![id, ARCHIVAL_CLASS],
@@ -984,7 +1124,10 @@ fn a_class_change_by_a_peer_mid_run_is_respected() {
     peer.execute_batch("COMMIT").expect("peer commit");
     let (store, report) = sweeper.join().expect("sweeper");
     assert!(report.retired.is_empty(), "{report:?}");
-    assert_eq!(store.audio_at_rest(&id).expect("state"), AudioAtRest::Journal);
+    assert_eq!(
+        store.audio_at_rest(&id).expect("state"),
+        AudioAtRest::Journal
+    );
 }
 
 #[test]
@@ -1000,7 +1143,8 @@ fn a_size_limit_recounts_after_a_peer_moves_a_newer_take_away() {
     let peer = Connection::open(store.root().join(DB_FILE)).expect("peer");
     peer.busy_timeout(std::time::Duration::from_secs(5))
         .expect("busy timeout");
-    peer.execute_batch("BEGIN IMMEDIATE").expect("peer write lock");
+    peer.execute_batch("BEGIN IMMEDIATE")
+        .expect("peer write lock");
     peer.execute(
         "UPDATE captures SET retention_class = ?2 WHERE id = ?1",
         params![newer, ARCHIVAL_CLASS],
@@ -1027,6 +1171,144 @@ fn a_size_limit_recounts_after_a_peer_moves_a_newer_take_away() {
     let (store, report) = sweeper.join().expect("sweeper");
     assert!(report.retired.is_empty(), "{report:?}");
     assert!(report.over_limit.is_empty(), "{report:?}");
-    assert_eq!(store.audio_at_rest(&older).expect("state"), AudioAtRest::Journal);
-    assert_eq!(store.audio_at_rest(&newer).expect("state"), AudioAtRest::Journal);
+    assert_eq!(
+        store.audio_at_rest(&older).expect("state"),
+        AudioAtRest::Journal
+    );
+    assert_eq!(
+        store.audio_at_rest(&newer).expect("state"),
+        AudioAtRest::Journal
+    );
+}
+
+#[test]
+fn a_take_a_peer_moved_away_is_never_removed_later_in_the_walk() {
+    // Three takes under a limit that fits one. While the sweep waits to
+    // retire the middle one, a peer moves the oldest into the archival
+    // class: the sweep reaches it after its recount and must still not
+    // remove it under the standard limit.
+    let dir = TempDir::new().expect("tempdir");
+    let mut store = store_in(&dir);
+    let oldest = aged_take(&mut store, 150, 16_000);
+    let middle = aged_take(&mut store, 120, 16_000);
+    let newest = aged_take(&mut store, 90, 16_000);
+    let limit = store.audio_bytes(&newest);
+    let peer = Connection::open(store.root().join(DB_FILE)).expect("peer");
+    peer.busy_timeout(std::time::Duration::from_secs(5))
+        .expect("busy timeout");
+    peer.execute_batch("BEGIN IMMEDIATE")
+        .expect("peer write lock");
+    peer.execute(
+        "UPDATE captures SET retention_class = ?2 WHERE id = ?1",
+        params![oldest, ARCHIVAL_CLASS],
+    )
+    .expect("peer class change");
+
+    let sweeper = std::thread::spawn(move || {
+        let report = store
+            .apply_retention_policy(
+                &policy(
+                    STANDARD_CLASS,
+                    ClassLimits {
+                        max_age_days: None,
+                        max_total_bytes: Some(limit),
+                    },
+                ),
+                time::OffsetDateTime::now_utc(),
+            )
+            .expect("apply");
+        (store, report)
+    });
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    peer.execute_batch("COMMIT").expect("peer commit");
+    let (store, report) = sweeper.join().expect("sweeper");
+    assert_eq!(retired_ids(&report), vec![middle]);
+    assert_eq!(
+        store.audio_at_rest(&oldest).expect("state"),
+        AudioAtRest::Journal
+    );
+    assert_eq!(
+        store.audio_at_rest(&newest).expect("state"),
+        AudioAtRest::Journal
+    );
+}
+
+#[test]
+fn a_peer_compression_mid_sweep_is_counted_at_its_new_size() {
+    // The sweep counted a newer take as its journal; a peer then
+    // compresses it. With the FLAC's size the class fits, so the older
+    // take keeps its audio.
+    let dir = TempDir::new().expect("tempdir");
+    let mut store = store_in(&dir);
+    let older = aged_take(&mut store, 120, 16_000);
+    let newer = aged_take(&mut store, 90, 16_000);
+    let job = store
+        .compression_candidates(10)
+        .expect("candidates")
+        .into_iter()
+        .find(|job| job.id == newer)
+        .expect("newer is a candidate");
+    let prepared = prepare_compression(&job).expect("prepare");
+    let limit = prepared.flac_bytes + store.audio_bytes(&older);
+    assert!(store.audio_bytes(&newer) + store.audio_bytes(&older) > limit);
+    let (journal, flac) = (store.audio_path(&newer), store.flac_path(&newer));
+    // The peer compressor holds the write lock across its publish, as
+    // `commit_compression` does.
+    let peer = Connection::open(store.root().join(DB_FILE)).expect("peer");
+    peer.busy_timeout(std::time::Duration::from_secs(5))
+        .expect("busy timeout");
+    peer.execute_batch("BEGIN IMMEDIATE")
+        .expect("peer write lock");
+
+    let sweeper = std::thread::spawn(move || {
+        let report = store
+            .apply_retention_policy(
+                &policy(
+                    STANDARD_CLASS,
+                    ClassLimits {
+                        max_age_days: None,
+                        max_total_bytes: Some(limit),
+                    },
+                ),
+                time::OffsetDateTime::now_utc(),
+            )
+            .expect("apply");
+        (store, report)
+    });
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    std::fs::rename(&prepared.temp, &flac).expect("publish");
+    std::fs::remove_file(&journal).expect("journal unlink");
+    peer.execute(
+        "INSERT INTO meta(key, value) VALUES ('audio_generation', '1')
+         ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1",
+        [],
+    )
+    .expect("generation bump");
+    peer.execute_batch("COMMIT").expect("peer commit");
+    let (store, report) = sweeper.join().expect("sweeper");
+    assert!(report.retired.is_empty(), "{report:?}");
+    assert_eq!(
+        store.audio_at_rest(&older).expect("state"),
+        AudioAtRest::Journal
+    );
+    assert_eq!(
+        store.audio_at_rest(&newer).expect("state"),
+        AudioAtRest::Flac
+    );
+}
+
+#[test]
+fn a_compression_bumps_the_audio_generation_other_connections_see() {
+    let dir = TempDir::new().expect("tempdir");
+    let mut store = store_in(&dir);
+    let id = take_at(&mut store, 16_000, &speechy(16_000, 3));
+    let peer = Connection::open(store.root().join(DB_FILE)).expect("peer");
+    let version = |conn: &Connection| -> i64 {
+        conn.query_row("PRAGMA data_version", [], |row| row.get(0))
+            .expect("version")
+    };
+    let before = version(&peer);
+    compressed(store.compress_audio(&id).expect("compress"));
+    assert_ne!(version(&peer), before);
+    assert_eq!(files(&store, &id), (false, true));
 }

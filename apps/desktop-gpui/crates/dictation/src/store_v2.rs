@@ -2231,14 +2231,21 @@ impl StoreV2 {
             ))
         })?;
         sync_dir(&self.root.join(AUDIO_DIR))?;
-        tx.commit()?;
-        // The FLAC is durable and verified: the journal may go.
+        // The FLAC is durable and verified: the journal may go — still
+        // under the lock, with a generation bump, so a retention run on
+        // another connection sees the sizes changed and counts again.
         match std::fs::remove_file(&journal) {
             Ok(()) => {}
             Err(err) if err.kind() == io::ErrorKind::NotFound => {}
             Err(err) => return Err(err.into()),
         }
         sync_dir(&self.root.join(AUDIO_DIR))?;
+        self.conn.execute(
+            "INSERT INTO meta(key, value) VALUES ('audio_generation', '1')
+             ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1",
+            [],
+        )?;
+        tx.commit()?;
         Ok(CompressionOutcome::Compressed {
             journal_bytes: prepared.journal_bytes,
             flac_bytes: prepared.flac_bytes,
@@ -2360,13 +2367,16 @@ impl StoreV2 {
         Ok(())
     }
 
-    /// Bytes `id`'s audio occupies under `audio/` (journal and FLAC).
+    /// Bytes `id`'s audio occupies under `audio/`. While a compression
+    /// has both its journal and its FLAC on disk, the smaller counts:
+    /// one of the two is about to go, and over-counting would remove
+    /// audio a limit does not require removing.
     fn audio_bytes(&self, id: &str) -> u64 {
-        [self.audio_path(id), self.flac_path(id)]
-            .iter()
-            .filter_map(|path| std::fs::metadata(path).ok())
-            .map(|meta| meta.len())
-            .sum()
+        let size = |path: PathBuf| std::fs::metadata(path).ok().map(|meta| meta.len());
+        match (size(self.audio_path(id)), size(self.flac_path(id))) {
+            (Some(journal), Some(flac)) => journal.min(flac),
+            (journal, flac) => journal.or(flac).unwrap_or(0),
+        }
     }
 
     /// Apply the user's retention limits as of `now` — the one code path
@@ -2463,8 +2473,9 @@ impl StoreV2 {
                     return Ok(report);
                 }
                 // Another connection committed since the walk looked: takes
-                // may have moved to another class, been deleted or retired.
-                // Recount what this class still holds before deciding.
+                // may have moved to another class, been deleted, retired or
+                // compressed (which bumps a generation for this). Recount
+                // what this class still holds before deciding.
                 let version = self.data_version()?;
                 if version != seen_version {
                     seen_version = version;
@@ -2480,16 +2491,22 @@ impl StoreV2 {
                     counted = recounted;
                     kept_bytes = counted.iter().map(|(_, bytes)| bytes).sum();
                 }
-                // Moved to another class (or deleted): those limits decide,
-                // on their own walk. Under a size limit the recount may
-                // also show the class fits now.
-                let Some(bytes) = counted
+                // Moved to another class, deleted or retired since the walk
+                // read it: those limits decide, on their own walk. Under a
+                // size limit the recount may also show the class fits now.
+                let candidate = counted
                     .iter()
-                    .find(|(counted_id, _)| *counted_id == id)
-                    .map(|(_, bytes)| *bytes)
-                else {
+                    .position(|(counted_id, _)| *counted_id == id);
+                let Some(index) = candidate else {
                     continue;
                 };
+                if !self.in_retention_class(&id, class)? || self.audio_retired_utc(&id)?.is_some()
+                {
+                    let (_, gone) = counted.remove(index);
+                    kept_bytes -= gone;
+                    continue;
+                }
+                let bytes = counted[index].1;
                 let still_due = match reason {
                     RetireReason::Age => true,
                     RetireReason::Size => {
