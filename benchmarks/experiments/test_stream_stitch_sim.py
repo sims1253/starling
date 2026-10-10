@@ -95,14 +95,18 @@ class SrcTest(unittest.TestCase):
             self.assertEqual(out.stdout.strip(), "True", form)
 
     def test_another_copy_already_imported_is_refused(self):
-        import starling.stream_chunk  # noqa: F401
-
-        src = self.fake_src().resolve()
-        try:
-            with self.assertRaises(SystemExit):
-                sim.use_stitcher(src)
-        finally:
-            sys.path.remove(str(src))
+        # Two fake checkouts in a fresh interpreter: no dependency on the
+        # real package being importable (the CI harness runs stdlib-only).
+        first, second = self.fake_src(), self.fake_src()
+        code = ("import stream_stitch_sim as sim\n"
+                f"sim.use_stitcher(sim.Path({str(first)!r}))\n"
+                "try:\n"
+                f"    sim.use_stitcher(sim.Path({str(second)!r}))\n"
+                "except SystemExit:\n"
+                "    print('refused')\n")
+        out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                             cwd=Path(__file__).resolve().parent, check=True)
+        self.assertEqual(out.stdout.strip(), "refused")
 
 
 if __name__ == "__main__":
