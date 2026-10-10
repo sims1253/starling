@@ -130,6 +130,8 @@ pub(crate) fn render_system_check(app: &mut StarlingApp, cx: &mut Context<Starli
                                 .flex()
                                 .flex_col()
                                 .flex_1()
+                                // Lets the text wrap instead of widening the card.
+                                .min_w(px(0.))
                                 .child(
                                     div()
                                         .text_size(px(10.))
