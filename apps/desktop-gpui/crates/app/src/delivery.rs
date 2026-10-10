@@ -199,6 +199,9 @@ pub(crate) struct DeliveryState {
     /// Bumped whenever the recovery is replaced or dismissed, so a late
     /// Paste last result lands only on the notice it was started from.
     generation: u64,
+    /// Bumped on every focus change of Starling's window, so only the
+    /// settle timer of the latest focus loss fires Paste last.
+    focus_changes: u64,
 }
 
 impl DeliveryState {
@@ -210,6 +213,7 @@ impl DeliveryState {
             by_take: HashMap::new(),
             recovery: None,
             generation: 0,
+            focus_changes: 0,
         }
     }
 
@@ -431,6 +435,7 @@ impl StarlingApp {
 
     /// Starling's window gained or lost focus.
     pub(crate) fn delivery_window_activation(&mut self, active: bool, cx: &mut Context<Self>) {
+        self.delivery.focus_changes += 1;
         if active {
             return;
         }
@@ -445,10 +450,17 @@ impl StarlingApp {
     }
 
     fn schedule_paste_last(&mut self, armed_at: Instant, cx: &mut Context<Self>) {
+        let focus_changes = self.delivery.focus_changes;
         cx.spawn(async move |this, cx| {
             cx.background_executor().timer(PASTE_SETTLE).await;
-            this.update(cx, |app, cx| app.fire_paste_last(armed_at, cx))
-                .ok();
+            this.update(cx, |app, cx| {
+                // Focus moved again meanwhile: that move's own timer
+                // decides, after its full settle.
+                if app.delivery.focus_changes == focus_changes {
+                    app.fire_paste_last(armed_at, cx);
+                }
+            })
+            .ok();
         })
         .detach();
     }
@@ -818,6 +830,45 @@ mod tests {
             failure(&app, cx),
             None,
             "a successful paste resolves the notice"
+        );
+    }
+
+    #[gpui::test]
+    fn paste_last_waits_out_the_settle_of_the_latest_focus_loss(cx: &mut gpui::TestAppContext) {
+        let (app, fake) = app_with(cx, on());
+        fake.focus(FakeTarget::named("Editor", "notes.txt"));
+        take(&app, cx, "take-1", "Hello there.", |_| {
+            fake.destroy_target()
+        });
+        let focus = |app: &gpui::Entity<StarlingApp>, cx: &mut gpui::TestAppContext, active| {
+            app.update(cx, |app, cx| {
+                app.window_focus.push((Instant::now(), active));
+                app.delivery_window_activation(active, cx);
+            })
+        };
+        app.update(cx, |app, cx| {
+            app.window_focus.push((Instant::now(), true));
+            app.toggle_paste_last(cx);
+        });
+        // Out to a window switcher, back, and out again: the first loss's
+        // timer must not capture the switcher.
+        fake.focus(FakeTarget::named("Switcher", "Overview"));
+        focus(&app, cx, false);
+        cx.executor().advance_clock(PASTE_SETTLE / 4);
+        focus(&app, cx, true);
+        cx.executor().advance_clock(PASTE_SETTLE / 2);
+        focus(&app, cx, false);
+        cx.executor().advance_clock(PASTE_SETTLE / 2);
+        cx.run_until_parked();
+        assert!(fake.insertions().is_empty(), "{:?}", fake.insertions());
+
+        fake.focus(FakeTarget::named("Chat", "Message"));
+        let chosen = fake.capture().unwrap();
+        cx.executor().advance_clock(PASTE_SETTLE / 2);
+        cx.run_until_parked();
+        assert_eq!(
+            fake.insertions(),
+            vec![(chosen.target_ref, "Hello there.".to_string())]
         );
     }
 

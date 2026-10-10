@@ -306,11 +306,20 @@ impl Inserter {
     /// app's pid so a ref the app captured is never typed back into the
     /// app.
     pub fn with_excluded_pids(excluded: Vec<u32>) -> Inserter {
+        // The session's own backend first, so when nothing is available
+        // its reason is the one reported (X11 always refuses on Wayland).
         #[cfg(target_os = "linux")]
-        let backends: Vec<Box<dyn InsertionBackend>> = vec![
-            Box::new(x11::X11Backend::with_excluded_pids(excluded.clone())),
-            Box::new(wayland::WaylandBackend::with_excluded_pids(excluded)),
-        ];
+        let backends: Vec<Box<dyn InsertionBackend>> = {
+            let x11: Box<dyn InsertionBackend> =
+                Box::new(x11::X11Backend::with_excluded_pids(excluded.clone()));
+            let wayland: Box<dyn InsertionBackend> =
+                Box::new(wayland::WaylandBackend::with_excluded_pids(excluded));
+            if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+                vec![wayland, x11]
+            } else {
+                vec![x11, wayland]
+            }
+        };
         #[cfg(windows)]
         let backends: Vec<Box<dyn InsertionBackend>> = vec![Box::new(
             windows::WindowsBackend::with_excluded_pids(excluded),

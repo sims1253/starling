@@ -35,9 +35,10 @@ fn action(id: &'static str, label: impl Into<SharedString>) -> Stateful<Div> {
 }
 
 /// The notice for a take whose text did not land, in the capture pane's
-/// banner slot.
+/// banner slot, or at the pane's top while an error banner holds it.
 pub(crate) fn render_recovery(
     app: &StarlingApp,
+    at_top: bool,
     cx: &mut Context<StarlingApp>,
 ) -> Option<Stateful<Div>> {
     let recovery = app.delivery.recovery.as_ref()?;
@@ -83,7 +84,13 @@ pub(crate) fn render_recovery(
             .absolute()
             .left(px(28.))
             .right(px(28.))
-            .bottom(px(28.))
+            .map(|card| {
+                if at_top {
+                    card.top(px(28.))
+                } else {
+                    card.bottom(px(28.))
+                }
+            })
             .flex()
             .flex_row()
             .items_start()
