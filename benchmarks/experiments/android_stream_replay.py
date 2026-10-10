@@ -80,8 +80,9 @@ def thermal_snapshot() -> dict:
     snap: dict = {}
     m = re.search(r"Thermal Status: (\d+)", out)
     snap["status"] = int(m.group(1)) if m else None
-    cached = out.split("Cached temperatures:", 1)[-1].split("HAL Ready:", 1)[0]
-    for value, name in re.findall(r"mValue=([-\d.E]+), mType=-?\d+, mName=([\w-]+)", cached):
+    # The HAL's current readings; "Cached temperatures" can be minutes old.
+    current = out.split("Current temperatures from HAL:", 1)[-1].split("Current cooling devices", 1)[0]
+    for value, name in re.findall(r"mValue=([-\d.E]+), mType=-?\d+, mName=([\w-]+)", current):
         if name in ("BIG", "MID", "LITTLE", "soc_therm", "battery", "VIRTUAL-SKIN"):
             snap[name] = round(float(value), 1)
     return snap
