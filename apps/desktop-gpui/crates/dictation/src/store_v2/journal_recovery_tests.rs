@@ -978,3 +978,56 @@ fn a_reconcile_that_keeps_failing_holds_the_journal_back_only_a_few_passes() {
     let report = store.recover_capture_journals(&tree).expect("scan");
     adopted_whole(&store, &report, "j_stuck", &confirmed);
 }
+
+// --- #342 sweep in upkeep, review round 1 ---
+
+#[test]
+fn a_peer_compression_landing_before_the_sweep_lock_keeps_the_copy() {
+    // The proof runs under the write lock the removal holds: a peer that
+    // compresses the 48 kHz take after the sweep listed the tree, and
+    // before it locks, leaves a copy no longer proven — kept.
+    let dir = TempDir::new().expect("tempdir");
+    let mut store = store_in(&dir);
+    let tree = journals(&dir);
+    let samples = ramp(4_800, 4);
+    let path = {
+        let mut writer =
+            JournalWriter::create_named(&tree, "j_48k".to_string(), 48_000).expect("writer");
+        writer.append_frames(&samples).expect("append");
+        writer.finalize().expect("finalize");
+        writer.path().to_path_buf()
+    };
+    store.adopt_journal(&path, None).expect("adopt");
+    std::fs::copy(store.audio_path("j_48k"), &path).expect("name comes back");
+    age(&path, old());
+    let report = store.recover_capture_journals(&tree).expect("scan");
+    assert_eq!(report.superseded, vec!["j_48k".to_string()], "{report:?}");
+
+    let mut peer = store_in(&dir);
+    store.before_sweep_lock = Some(TestHook(Box::new(move || {
+        peer.compress_audio("j_48k").expect("peer compresses");
+    })));
+    let report = store.sweep_retention().expect("sweep");
+    assert!(report.swept.is_empty(), "{report:?}");
+    assert_eq!(report.retained.len(), 1, "{report:?}");
+    assert_eq!(store.load_audio("j_48k").expect("audio").sample_rate, 16_000);
+    let kept = tree.join(SUPERSEDED_SUBDIR).join("j_48k.sj");
+    assert_eq!(read_audio_journal(&kept).expect("kept whole").samples, samples);
+}
+
+#[test]
+fn a_stopped_sweep_removes_nothing_more() {
+    let dir = TempDir::new().expect("tempdir");
+    let mut store = store_in(&dir);
+    let quarantine = store.root().join(QUARANTINE_DIR);
+    std::fs::create_dir_all(&quarantine).expect("quarantine");
+    for id in ["c_a", "c_b"] {
+        std::fs::write(quarantine.join(format!("{id}.sj")), b"deleted bytes").expect("write");
+    }
+    let report = store
+        .sweep_retention_until(|| !quarantine.join("c_a.sj").exists())
+        .expect("sweep");
+    assert!(report.stopped, "{report:?}");
+    assert_eq!(report.swept.len(), 1, "{report:?}");
+    assert!(quarantine.join("c_b.sj").exists());
+}

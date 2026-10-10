@@ -696,6 +696,10 @@ pub struct StoreV2 {
     /// where a peer's commit or file change lands in the race tests.
     #[cfg(test)]
     before_retention_lock: Option<TestHook>,
+    /// Runs once, in [`Self::sweep_retention_until`], before a file's
+    /// removal takes the write lock.
+    #[cfg(test)]
+    before_sweep_lock: Option<TestHook>,
 }
 
 #[cfg(test)]
@@ -846,6 +850,8 @@ impl StoreV2 {
             compression_failures: HashMap::new(),
             #[cfg(test)]
             before_retention_lock: None,
+            #[cfg(test)]
+            before_sweep_lock: None,
         })
     }
 
@@ -2060,101 +2066,123 @@ impl StoreV2 {
     /// audio still pinned ([`Self::pin_audio`]: a read that began before
     /// the delete) stays until a sweep after the pin is released.
     pub fn sweep_retention(&mut self) -> Result<SweepReport, StoreV2Error> {
+        self.sweep_retention_until(|| false)
+    }
+
+    /// [`Self::sweep_retention`] that ends early, with
+    /// [`SweepReport::stopped`], once `stop` says so — asked under the
+    /// database's write lock before each removal (a take started
+    /// recording).
+    pub fn sweep_retention_until(
+        &mut self,
+        stop: impl Fn() -> bool,
+    ) -> Result<SweepReport, StoreV2Error> {
         let mut report = SweepReport::default();
         // Recorder journals a stored take provably holds (#356): a copy
-        // of audio history already kept whole. Proven again first — the
-        // take may have changed since (compression resamples a take not
-        // recorded at 16 kHz), and a copy no longer proven is kept. Swept
-        // before quarantine, whose deleted takes' audio may be the proof.
+        // of audio history already kept whole. Proven again, per journal,
+        // under the write lock its removal holds — the take may have
+        // changed since (another connection's compression resamples a take
+        // not recorded at 16 kHz), and a copy no longer proven is kept.
+        // Swept before quarantine, whose deleted takes' audio may be the
+        // proof.
         let superseded = self.root.join("journals").join(SUPERSEDED_SUBDIR);
-        // An allowlist, not a keep-set: a journal the proof scan did not
-        // see (a failed or partial directory read) is never swept.
-        let proven = self.proven_superseded_journals(&superseded);
+        let unproven = |store: &Self, path: &Path| {
+            (!store.superseded_journal_proven(path))
+                .then_some("no stored take is proven to hold this journal's audio any more")
+        };
         self.sweep_tree(
             &superseded,
             "journal",
             SUPERSEDED_TOMBSTONE_PREFIX,
-            &|path: &Path| {
-                (!proven.contains(path))
-                    .then_some("no stored take is proven to hold this journal's audio any more")
-            },
+            &unproven,
+            &stop,
             &mut report,
         )?;
-        let pinned: HashSet<String> = self.audio_pins.keys().cloned().collect();
-        let in_use = |path: &Path| {
+        let in_use = |store: &Self, path: &Path| {
             let id = path.file_stem().and_then(|stem| stem.to_str()).unwrap_or_default();
-            pinned
-                .contains(id)
+            store
+                .audio_pins
+                .contains_key(id)
                 .then_some("the deleted recording's audio is still being read")
         };
-        self.sweep_tree(&self.root.join(QUARANTINE_DIR), "capture", "", &in_use, &mut report)?;
-        let none = |_: &Path| None;
+        self.sweep_tree(
+            &self.root.join(QUARANTINE_DIR),
+            "capture",
+            "",
+            &in_use,
+            &stop,
+            &mut report,
+        )?;
         self.sweep_tree(
             &self.root.join(LEGACY_DELETED_SUBPATH),
             "journal",
             "",
-            &none,
+            &|_, _| None,
+            &stop,
             &mut report,
         )?;
         Ok(report)
     }
 
-    /// The journals in `superseded/` (#356) a take's audio, read back
-    /// now, still proves a copy of ([`Self::journal_copy`]): only these
-    /// may be swept. A numbered name (`<id>.<n>.sj`) is proven as `<id>`.
-    /// A failed directory read proves nothing, so nothing is swept.
-    fn proven_superseded_journals(&self, dir: &Path) -> HashSet<PathBuf> {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return HashSet::new();
+    /// Whether journal `path` in `superseded/` (#356) is a copy a take's
+    /// audio, read back now, still proves ([`Self::journal_copy`]): only
+    /// these may be swept. A numbered name (`<id>.<n>.sj`) is proven as
+    /// `<id>`.
+    fn superseded_journal_proven(&self, path: &Path) -> bool {
+        let stem = path.file_stem().and_then(|stem| stem.to_str()).unwrap_or("");
+        let id = match stem.rsplit_once('.') {
+            Some((id, n)) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => id,
+            _ => stem,
         };
-        entries
-            .flatten()
-            .map(|entry| entry.path())
-            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("sj"))
-            .filter(|path| {
-                let stem = path.file_stem().and_then(|stem| stem.to_str()).unwrap_or("");
-                let id = match stem.rsplit_once('.') {
-                    Some((id, n)) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => id,
-                    _ => stem,
-                };
-                read_journal(path).ok().is_some_and(|parsed| {
-                    matches!(
-                        self.journal_copy(id, &parsed.samples, parsed.sample_rate),
-                        Ok(JournalCopy::Stored | JournalCopy::Deleted)
-                    )
-                })
-            })
-            .collect()
+        read_journal(path).ok().is_some_and(|parsed| {
+            matches!(
+                self.journal_copy(id, &parsed.samples, parsed.sample_rate),
+                Ok(JournalCopy::Stored | JournalCopy::Deleted)
+            )
+        })
     }
 
     /// Sweep one tombstone tree into `report` (`kind` is the tombstone
     /// kind rows get: `capture` for v2 quarantine, `journal` for the
-    /// legacy v1 tree; `stamp_prefix` goes before each file's id in its
+    /// journal trees; `stamp_prefix` goes before each file's id in its
     /// stamp, so a tree of copies never deadens the id of a live take;
-    /// the files `keep` gives a reason for are left in place).
+    /// the files `keep` gives a reason for are left in place; once `stop`
+    /// says so, nothing more is removed and the report says stopped).
     ///
-    /// Per file, the ordering is **stamp, then unlink**: the `tombstones`
-    /// UPSERT (retention `'swept'`) is committed before the bytes are
-    /// removed. Both steps are idempotent, so any crash inside the pair
-    /// leaves either file-plus-stamped-row (the next sweep re-attempts the
-    /// unlink) or just the stamped row — never the bytes without their
-    /// tombstone. That ordering is what makes the never-resurrect
-    /// guarantee hold for the two populations that reach the sweep with
-    /// **no** tombstone row of their own: the legacy `journals/deleted/`
-    /// tree (v1 never wrote v2 rows — the sweep is their only stamper)
-    /// and quarantine files from `delete_capture`'s own crash window
-    /// (rename committed, transaction not — the shape `reconcile`'s
-    /// `complete_tombstoned` heals). Reconcile's dead set reads
-    /// `tombstones` rows ∪ quarantine files regardless of the retention
-    /// value, so a stamped-but-not-yet-unlinked id is already dead to it.
+    /// Per file, `stop`, `keep` and the stamp run under the database's
+    /// write lock, so no other connection deletes, compresses or retires
+    /// a take between the decision and the removal. The ordering is
+    /// **stamp, then unlink**: the `tombstones` UPSERT (retention
+    /// `'swept'`) is committed before the bytes are removed. Both steps
+    /// are idempotent, so any crash inside the pair leaves either
+    /// file-plus-stamped-row (the next sweep re-attempts the unlink) or
+    /// just the stamped row — never the bytes without their tombstone.
+    /// That ordering is what makes the never-resurrect guarantee hold for
+    /// the two populations that reach the sweep with **no** tombstone row
+    /// of their own: the legacy `journals/deleted/` tree (v1 never wrote
+    /// v2 rows — the sweep is their only stamper) and quarantine files
+    /// from `delete_capture`'s own crash window (rename committed,
+    /// transaction not — the shape `reconcile`'s `complete_tombstoned`
+    /// heals). Reconcile's dead set reads `tombstones` rows ∪ quarantine
+    /// files regardless of the retention value, so a stamped-but-not-yet-
+    /// unlinked id is already dead to it.
+    ///
+    /// A prefixed tree (`superseded/`) is the exception: its proof holds
+    /// only while the lock does, so its copies are unlinked before the
+    /// commit. A crash in between loses only the stamp of a copy, which
+    /// deadens no id anyway.
     fn sweep_tree(
         &mut self,
         dir: &Path,
         kind: &str,
         stamp_prefix: &str,
-        keep: &dyn Fn(&Path) -> Option<&'static str>,
+        keep: &dyn Fn(&Self, &Path) -> Option<&'static str>,
+        stop: &dyn Fn() -> bool,
         report: &mut SweepReport,
     ) -> Result<(), StoreV2Error> {
+        if report.stopped {
+            return Ok(());
+        }
         let Ok(entries) = std::fs::read_dir(dir) else {
             return Ok(()); // nothing tombstoned under this tree
         };
@@ -2192,7 +2220,17 @@ impl StoreV2 {
                     .push((name, "not a regular file".to_string()));
                 continue;
             }
-            if let Some(reason) = keep(&path) {
+            #[cfg(test)]
+            if let Some(hook) = self.before_sweep_lock.take() {
+                (hook.0)();
+            }
+            // Dropped without a commit, the transaction rolls back.
+            let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+            if stop() {
+                report.stopped = true;
+                break;
+            }
+            if let Some(reason) = keep(self, &path) {
                 report.retained.push((name, reason.to_string()));
                 continue;
             }
@@ -2202,12 +2240,11 @@ impl StoreV2 {
                 .and_then(|stem| stem.to_str())
                 .unwrap_or_default()
                 .to_string();
-            // 1. Stamp first, transactionally: the tombstone outlives the
-            //    bytes, and a crash after this commit but before the
-            //    unlink leaves a dead id whose file the next sweep
-            //    re-attempts. Created if the delete never wrote one — the
-            //    file under a tombstone tree is itself the
-            //    deliberate-delete evidence.
+            // 1. Stamp first: the tombstone outlives the bytes, and a
+            //    crash after this commit but before the unlink leaves a
+            //    dead id whose file the next sweep re-attempts. Created if
+            //    the delete never wrote one — the file under a tombstone
+            //    tree is itself the deliberate-delete evidence.
             self.conn.execute(
                 "INSERT INTO tombstones(id, kind, deleted_utc, retention)
                  VALUES (?1, ?2, ?3, 'swept')
@@ -2215,7 +2252,17 @@ impl StoreV2 {
                 params![format!("{stamp_prefix}{id}"), kind, now_iso()],
             )?;
             // 2. Only now may the bytes go.
-            match std::fs::remove_file(&path) {
+            let removed = if stamp_prefix.is_empty() {
+                tx.commit()?;
+                std::fs::remove_file(&path)
+            } else {
+                let removed = std::fs::remove_file(&path);
+                if removed.is_ok() {
+                    tx.commit()?;
+                }
+                removed
+            };
+            match removed {
                 Ok(()) => {
                     swept_here = true;
                     report.swept.push(SweptFile {
@@ -5303,6 +5350,9 @@ pub struct SweepReport {
     pub swept: Vec<SweptFile>,
     /// Total bytes unlinked.
     pub swept_bytes: u64,
+    /// The `stop` of [`StoreV2::sweep_retention_until`] said so: the
+    /// sweep ended before every tree was done.
+    pub stopped: bool,
     /// `(name, reason)` for entries left in place: files that are not
     /// `.sj` journals or `.flac` audio, superseded journals no longer
     /// proven copies, deleted audio still pinned, or removals that failed
