@@ -129,7 +129,7 @@ class BoundedTranscriptionTest {
         assertFalse(engine.cancelled.get())
         assertEquals(InferenceResult.Success("slow but done"), result)
 
-        val overBudget = bound(engine, nativeCallLimitMillis = 20).run(budgetMillis = 100) { attempt ->
+        val overBudget = bound(engine, nativeCallLimitMillis = 20, graceMillis = 5_000).run(budgetMillis = 100) { attempt ->
             engine.transcribe(attempt) { engine.cooperative(it) }
         }
         assertTrue(engine.cancelled.get())
@@ -221,7 +221,7 @@ class BoundedTranscriptionTest {
         val spawned = AtomicInteger()
         val wedged = CountDownLatch(1)
         val bound = bound(engine, nativeCallLimitMillis = 30, graceMillis = 20, spawned = spawned)
-        val first = bound.run(budgetMillis = 60_000) { attempt ->
+        val first = bound.run(budgetMillis = 100) { attempt ->
             engine.transcribe(attempt) {
                 wedged.await()
                 InferenceResult.Success("late")
