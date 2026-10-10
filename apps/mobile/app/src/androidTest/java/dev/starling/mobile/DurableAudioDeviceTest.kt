@@ -33,7 +33,10 @@ import java.util.concurrent.TimeUnit
  *   verify     after relaunch: both takes restored with truthful status,
  *              played back, and retranscribed with each installed model
  *
- * Opt-in: `am instrument -e durable <phase> [-e minutes N] ...`.
+ * Opt-in: `am instrument -e durable <phase> [-e minutes N]
+ * [-e killedBytes B -e killedConfirmedBytes C] ...`, the last two (verify)
+ * being the partial WAV's payload size and header data size the host read
+ * after the kill.
  */
 @RunWith(AndroidJUnit4::class)
 class DurableAudioDeviceTest {
@@ -100,7 +103,11 @@ class DurableAudioDeviceTest {
             val audio = app.recordings.audioFile(restored)
             val pcm = WavPcm.decodePcm16(audio)!!.pcm
             if (key == "record-id") {
-                assertEquals(RecordingStatus.FAILED, restored.status)
+                // Failed after Stop; an earlier verify run may have retried it.
+                assertEquals(
+                    if (restored.revisions.isEmpty()) RecordingStatus.FAILED else RecordingStatus.TRANSCRIBED,
+                    restored.status,
+                )
                 assertTrue(restored.durationSeconds >= 600.0)
             } else {
                 assertEquals(RecordingStatus.PENDING, restored.status)
@@ -109,6 +116,13 @@ class DurableAudioDeviceTest {
                 assertTrue(recovery.confirmedSeconds <= recovery.recoveredSeconds)
                 // The watermark trails the last write by about two checkpoints.
                 assertTrue(recovery.recoveredSeconds - recovery.confirmedSeconds < 5.0)
+                // Measured by the host on the partial WAV after the kill
+                // (its size and header data size), so recovery is checked
+                // against what the dead process left, not against itself.
+                arguments.getString("killedBytes")?.toInt()?.let { assertEquals(it, pcm.size) }
+                arguments.getString("killedConfirmedBytes")?.toInt()?.let {
+                    assertEquals(it / 32_000.0, recovery.confirmedSeconds, 1e-6)
+                }
             }
             // Every recovered sample is the test microphone's, in order.
             assertEquals(restored.durationSeconds, pcm.size / 32_000.0, 1e-6)
@@ -119,7 +133,7 @@ class DurableAudioDeviceTest {
             assertTrue(restored in app.recordings.list())
             play(audio)
 
-            var revisions = 0
+            var revisions = restored.revisions.size
             for (model in models) {
                 val settled = transcribe(id, model)
                 Log.i(TAG, "verify $key with $model: ${settled.status} ${settled.errorMessage ?: ""}")

@@ -1,5 +1,6 @@
 package dev.starling.mobile.audio
 
+import dev.starling.mobile.storage.Durability
 import java.io.File
 import java.io.RandomAccessFile
 import java.nio.ByteBuffer
@@ -43,10 +44,20 @@ internal class WavWriter(
     private var closed = false
 
     init {
-        output.setLength(0)
-        // A valid header with an empty payload from the start: a capture that
-        // dies before its first checkpoint is still recognizably this app's WAV.
-        output.write(header(0))
+        try {
+            output.setLength(0)
+            // A valid header with an empty payload from the start: a capture
+            // that dies before its first checkpoint is still recognizably this
+            // app's WAV. The file and its directory entry are synced before any
+            // audio, so a later checkpoint never confirms samples of a file
+            // whose name a power loss could take away.
+            output.write(header(0))
+            output.fd.sync()
+            file.parentFile?.let(Durability::syncDirectory)
+        } catch (exception: Exception) {
+            output.close()
+            throw exception
+        }
         open.add(file.absolutePath)
     }
 
