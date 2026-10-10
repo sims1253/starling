@@ -43,14 +43,17 @@ def stitch_words(
     new: list[str],
     *,
     max_overlap: int = 24,
+    max_head: Optional[int] = None,
 ) -> list[str]:
     """Append ``new`` to ``committed``, deduping the overlapping boundary words.
 
     The two texts come from windows that share some audio, so the words the
     windows agree on sit at the END of ``committed`` and the START of
     ``new``. This aligns a suffix of ``committed``'s last ``max_overlap`` words
-    with a prefix of ``new``'s first ``max_overlap`` words (match +2, mismatch
-    and gap -1; words left out on the committed side before the suffix and on
+    with a prefix of ``new``'s first ``max_head`` words (default
+    ``max_overlap``; a re-decoded window that starts earlier shares more
+    audio, and its words before the committed tail align as gaps) (match
+    +2, mismatch and gap -1; words left out on the committed side before the suffix and on
     the new side after the prefix are free). Every committed word after the
     aligned suffix's start and every new word before the prefix's end costs a
     gap, so a common phrase ("of the") far from the boundary cannot win the
@@ -71,7 +74,7 @@ def stitch_words(
         return list(committed)
 
     tail = committed[-max_overlap:]
-    head = new[:max_overlap]
+    head = new[: max_overlap if max_head is None else max_head]
     # Empty keys (words that normalize to "", e.g. pure punctuation) never
     # match: runs of empty keys would align unrelated boundary words and drop
     # them (issue #118 defense in depth). The sentinels are unique per side
@@ -181,39 +184,40 @@ def _repeat_run(keys: list[str], i: int, n: int) -> int:
     return reps
 
 
-def collapse_repeats(words: list[str], *, max_repeats: int = 2, max_n: int = 8) -> list[str]:
-    """Cut every run of one phrase (1..``max_n`` words) repeated back to back
-    more than ``max_repeats`` times down to ``max_repeats`` copies; the
-    longest run starting at a word wins."""
-    keys = [_norm(w) for w in words]
-    out: list[str] = []
-    i = 0
-    while i < len(words):
-        best_n, best_reps = 0, 0
+def _longest_repeat(keys: list[str], max_repeats: int, max_n: int) -> tuple[int, int, int]:
+    """(start, phrase length, repeats) of the back-to-back run of one phrase
+    (1..``max_n`` words, more than ``max_repeats`` copies) covering the most
+    words; the earliest, then the shortest phrase, wins a tie. (0, 0, 0)
+    when there is none."""
+    best = (0, 0, 0)
+    for i in range(len(keys)):
         for n in range(1, max_n + 1):
-            if i + n * (max_repeats + 1) > len(words):
+            if i + n * (max_repeats + 1) > len(keys):
                 break
             reps = _repeat_run(keys, i, n)
-            if reps > max_repeats and reps * n > best_reps * best_n:
-                best_n, best_reps = n, reps
-        if best_n:
-            out.extend(words[i: i + max_repeats * best_n])
-            i += best_reps * best_n
-        else:
-            out.append(words[i])
-            i += 1
-    return out
+            if reps > max_repeats and reps * n > best[1] * best[2]:
+                best = (i, n, reps)
+    return best
 
 
-def suppress_loops(words: list[str], seconds: float) -> list[str]:
-    """Words of a decode over ``seconds`` of audio, with a decoding loop
+def suppress_loops(words: list[str], seconds: float, *, max_repeats: int = 2,
+                   max_n: int = 8) -> list[str]:
+    """Words of a decode over ``seconds`` of audio with a decoding loop
     removed. Text within max_plausible_words() is returned unchanged, so
-    real repeated speech is never touched; a longer one has its repeated
-    runs collapsed and is then cut to the bound."""
+    real repeated speech is never touched. Longer text has its longest
+    back-to-back run of one phrase cut to ``max_repeats`` copies, one run at
+    a time, only until it fits; what still does not fit is cut at the bound
+    (more words than the audio can hold are not speech)."""
     bound = max_plausible_words(seconds)
-    if len(words) <= bound:
-        return list(words)
-    return collapse_repeats(words)[:bound]
+    out = list(words)
+    keys = [_norm(w) for w in out]
+    while len(out) > bound:
+        i, n, reps = _longest_repeat(keys, max_repeats, max_n)
+        if not n:
+            break
+        cut = slice(i + max_repeats * n, i + reps * n)
+        del out[cut], keys[cut]
+    return out[:max(bound, 0)]
 
 
 # Text transcription of a mono float32 window -> its text, or ``None`` if the
@@ -362,6 +366,9 @@ class ChunkStreamer:
         # Audio kept before the boundary for re-decoding an implausible
         # window from an earlier start (issue #357).
         self.lookback = int(max(REDECODE_SHIFTS) * self.overlap)
+        # New words searched when stitching: a re-decoded window starts up to
+        # the lookback earlier and shares that much more audio (issue #357).
+        self.max_head_words = 2 * self.max_overlap_words
 
         self.committed: list[str] = []
         # Leading committed words stitching never touches (stable_words()).
@@ -423,7 +430,8 @@ class ChunkStreamer:
     def _stitched(self, words: list[str]) -> list[str]:
         """``committed`` with ``words`` stitched onto its unfrozen tail."""
         tail = stitch_words(self.committed[self.frozen:], words,
-                            max_overlap=self.max_overlap_words)
+                            max_overlap=self.max_overlap_words,
+                            max_head=self.max_head_words)
         return self.committed[: self.frozen] + tail
 
     def _commit(self, words: list[str]) -> None:
@@ -452,9 +460,9 @@ class ChunkStreamer:
         return 0
 
     def _decode_committed(self, samples: np.ndarray, start: int, end: int, kind: str,
-                          tx: TranscribeFn) -> Optional[list[str]]:
-        """Words of samples[start:end] for the committed text, or ``None``
-        when the engine is busy. An implausible result (too sparse for its
+                          tx: TranscribeFn) -> Optional[tuple[list[str], int]]:
+        """Words of samples[start:end] for the committed text and where the
+        audio they come from ends, or ``None`` when the engine is busy. An implausible result (too sparse for its
         voiced audio, or a loop) is decoded again from the earlier starts in
         REDECODE_SHIFTS, until one is plausible: a full window moves
         back whole (the next window's overlap still covers its end), or
@@ -462,7 +470,10 @@ class ChunkStreamer:
         first window); the flush tail grows backwards up to one window
         (nothing else covers its end). A candidate replaces the current one
         when it is plausible and the current one loops, or when it is denser
-        by _REDECODE_MIN_GAIN. A busy re-decode keeps the best so far."""
+        by _REDECODE_MIN_GAIN. A busy re-decode keeps the best so far if it is
+        plausible, and otherwise leaves the window pending (``None``): the
+        audio stays in the buffer for a retry instead of committing text
+        known to be wrong."""
         text = self._tx(samples, start, end, kind, tx)
         if text is None:
             return None
@@ -483,6 +494,8 @@ class ChunkStreamer:
             tried.add((a, z))
             text = self._tx(samples, a, z, "redecode", tx)
             if text is None:
+                if best_verdict:
+                    return None
                 break
             cand = text.split()
             v_voiced = voiced_seconds(samples[a:z], self.sr)
@@ -504,7 +517,7 @@ class ChunkStreamer:
             best = suppress_loops(best, (best_span[1] - best_span[0]) / self.sr)
         elif best_voiced >= _MIN_VOICED_SECONDS:
             self.rates = (self.rates + [len(best) / best_voiced])[-_RATE_HISTORY:]
-        return best
+        return best, best_span[1]
 
     def _finalize_full_windows(
         self, samples: np.ndarray, tx: TranscribeFn, *, flushing: bool = False
@@ -513,13 +526,16 @@ class ChunkStreamer:
         if at least one window was committed."""
         did = False
         while (len(samples) - self.boundary) >= self.chunk:
-            words = self._decode_committed(
-                samples, self.boundary, self.boundary + self.chunk,
-                "flush_window" if flushing else "window", tx)
-            if words is None:  # busy/cancelled -> stop; boundary unchanged for retry
+            end = self.boundary + self.chunk
+            got = self._decode_committed(
+                samples, self.boundary, end, "flush_window" if flushing else "window", tx)
+            if got is None:  # busy/cancelled -> stop; boundary unchanged for retry
                 break
+            words, used_end = got
             self._commit(words)
-            self.boundary += self.advance
+            # The next window overlaps the audio the committed text came
+            # from by the full overlap, also when a re-decode ended earlier.
+            self.boundary += self.advance - (end - used_end)
             did = True
         return did
 
@@ -605,10 +621,10 @@ class ChunkStreamer:
             # validated at construction, but the transcriber contract (a
             # nonempty window) is enforced here regardless.
             if 0 < len(tail) < self.chunk:
-                words = self._decode_committed(samples, self.boundary, len(samples),
-                                               "flush_tail", tx)
-                if words is not None:
-                    self._commit(words)
+                got = self._decode_committed(samples, self.boundary, len(samples),
+                                             "flush_tail", tx)
+                if got is not None:
+                    self._commit(got[0])
                     self.boundary = len(samples)
                     self.emit_due = False
                     return " ".join(self.committed)

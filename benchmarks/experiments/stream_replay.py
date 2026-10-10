@@ -156,13 +156,16 @@ def locate_errors(batch_text: str, final_text: str, utterances: list[dict] | Non
     final inserts (``duplicated`` when the inserted run repeats the words
     right before or after it), its estimated audio time (from the workload's
     utterance spans) and whether it falls into a window overlap (between the
-    next committed call's start and the current one's end, from the trace's
-    ``window``/``flush_window``/``flush_tail`` spans, +-1 s) or elsewhere.
+    next committing call's start and the current one's end, from the trace's
+    ``window``/``flush_window``/``flush_tail``/``redecode`` spans, +-1 s) or
+    elsewhere. The trace does not say which re-decode candidate was kept, so
+    every candidate counts and the label errs toward ``overlap``.
     """
     b, f = normalize(batch_text), normalize(final_text)
     times = _word_times(b, reference, utterances or [])
     committing = sorted((c for c in calls
-                         if c.get("kind") in ("window", "flush_window", "flush_tail")
+                         if c.get("kind") in ("window", "flush_window", "flush_tail",
+                                              "redecode")
                          and c.get("result", "ok") in ("ok", "reused")),
                         key=lambda c: c["start_s"])
     overlaps = [(nxt["start_s"], cur["end_s"]) for cur, nxt in zip(committing, committing[1:])

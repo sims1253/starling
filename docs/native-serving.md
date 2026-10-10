@@ -333,9 +333,10 @@ take's first audio; audio positions are seconds into the take.
 at microphone pace and to report latency, work and stop-time metrics.
 
 **Buffer cap** (`--max-stream-seconds`, default 60 s): a binary frame that
-would push the session's live audio buffer past the cap is refused. The
-live buffer holds the audio past the committed boundary plus up to 0.75 x
-the overlap before it (2.25 s by default), which a re-decode may still read. The
+would push the session's live audio buffer past the cap is refused. The cap
+counts the audio past the committed boundary. The session also keeps up to
+0.75 x the overlap before that boundary (2.25 s by default) for re-decodes;
+that audio is not counted, so memory is bounded by the cap plus it. The
 server emits one error frame:
 
 ```json
@@ -434,12 +435,18 @@ fixture, `tests/fixtures/stream_stitch_cases.txt`):
   and 0.75 x the overlap earlier (a full window moves back whole, or ends
   earlier at the take's start; the flush tail grows backwards up to one
   window) until a result is plausible, and a candidate replaces it when it
-  is 1.25 x denser or the current one loops. "Voiced" is 20 ms frames 15 dB
+  is 1.25 x denser or the current one loops. The next window then starts
+  one overlap before the end of the audio the kept text came from. If a
+  re-decode finds the engine busy before a plausible result is in hand, the
+  window stays pending, like a busy window, instead of committing text known
+  to be wrong. "Voiced" is 20 ms frames 15 dB
   above the span's quiet floor and above -60 dBFS.
-- A preview is never re-decoded, but a preview over the bound has its
-  repeated runs collapsed and is cut to the bound, so a decoding loop never
-  reaches the client. Text within the bound is not touched, so real repeated
-  speech survives.
+- Text over the word bound has its longest back-to-back repeated phrase cut
+  to two copies, one run at a time, only until it fits, and is cut at the
+  bound if it still does not. Previews (never re-decoded) get this, so a
+  decoding loop never reaches the client, and so does a committed window
+  whose every re-decode loops. Text within the bound is not touched, so real
+  repeated speech survives.
 With opt-in Granite chunk fairness, a blocking queue timeout ends the current
 take with `request timed out`; it is not retried as `server busy`. Reset the
 stream before sending more audio.

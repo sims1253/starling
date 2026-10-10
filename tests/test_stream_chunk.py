@@ -10,13 +10,13 @@ verifies the reconstructed transcript equals the ground truth despite overlap.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import pytest
 
 from starling.stream_chunk import (
     ChunkStreamer,
-    collapse_repeats,
     max_plausible_words,
     stitch_words,
     stream_window_config_error,
@@ -558,14 +558,20 @@ def test_voiced_seconds_counts_loud_frames_only():
     assert voiced_seconds(np.zeros(100, dtype=np.float32), SR) == 0.0
 
 
-def test_collapse_repeats_keeps_two_copies_of_the_longest_run():
-    words = "so a little bit of a little bit of a little bit of a little bit of it".split()
-    assert collapse_repeats(words) == ["so", "a", "little", "bit", "of", "a", "little", "bit", "of", "it"]
-    assert collapse_repeats("no no no no".split()) == ["no", "no"]
-    assert collapse_repeats("no no".split()) == ["no", "no"]
+def test_suppress_loops_collapses_only_what_does_not_fit():
+    # Within the bound (7 words/s + 4) nothing changes, repeats included.
+    assert suppress_loops("no no no no no".split(), 1.0) == "no no no no no".split()
+    # Over it, the longest run goes first, and only until the text fits:
+    # the real "no no no no no" survives next to a loop.
+    words = "no no no no no I said".split() + ["la"] * 100
+    assert suppress_loops(words, 2.0) == "no no no no no I said la la".split()
+    loop = "so a little bit of a little bit of a little bit of a little bit of it".split()
+    assert suppress_loops(loop, 0.5) == "so a little bit of a little".split()  # bound 7
     # Punctuation and case do not hide a loop.
-    assert collapse_repeats("Again, again again. again".split()) == ["Again,", "again"]
-    assert collapse_repeats([]) == []
+    assert suppress_loops("Again, again again. again again".split(), 0.0) == ["Again,", "again"]
+    # No repeats left: cut at the bound.
+    assert suppress_loops([f"w{i}" for i in range(30)], 1.0) == [f"w{i}" for i in range(11)]
+    assert suppress_loops([], 0.0) == []
 
 
 def test_max_plausible_words_bounds_a_window():
@@ -645,15 +651,20 @@ def _replay_stream(case: dict) -> tuple[list[str], list[str]]:
                        min_seconds=0.0, partial_interval_seconds=0.0)
     calls: list[str] = []
 
-    def tx(window: np.ndarray) -> str:
+    used: set[int] = set()
+
+    def tx(window: np.ndarray) -> Optional[str]:
         start, n = cs.call_start, len(window)
         calls.append(f"{cs.call_kind}@{_seconds(start)}+{_seconds(n)}")
-        for kind, a, length, text in case["tx"]:
-            if (kind in ("*", cs.call_kind)
-                    and (a == "*" or int(round(float(a) * SR)) == start)
-                    and (length == "*" or int(round(float(length) * SR)) == n)):
-                return text
-        raise AssertionError(f"no scripted text for {calls[-1]}")
+        hits = [k for k, (kind, a, length, _) in enumerate(case["tx"])
+                if k not in used and kind in ("*", cs.call_kind)
+                and (a == "*" or int(round(float(a) * SR)) == start)
+                and (length == "*" or int(round(float(length) * SR)) == n)]
+        assert hits, f"no scripted text for {calls[-1]}"
+        if len(hits) > 1:
+            used.add(hits[0])
+        text = case["tx"][hits[0]][3]
+        return None if text == "BUSY" else text
 
     final = cs.flush(samples, tx)
     assert final is not None

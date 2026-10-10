@@ -20,9 +20,10 @@ namespace starling::serve {
 
 // Append `new_words` to `committed`, deduping the overlapping boundary words
 // (issue #357). Aligns a suffix of committed's last `max_overlap` words with a
-// prefix of new_words' first `max_overlap` words (match +2, mismatch and gap
-// -1; committed words before the suffix and new words after the prefix are
-// free), so a common phrase far from the boundary cannot win and drop the
+// prefix of new_words' first `max_head` words (default max_overlap; a
+// re-decoded window that starts earlier shares more audio) (match +2,
+// mismatch and gap -1; committed words before the suffix and new words after
+// the prefix are free), so a common phrase far from the boundary cannot win and drop the
 // words between. The cut is the middle matched word: committed up to and
 // including it, then new_words after it. Without an alignment scoring at
 // least kStitchMinScore the two are concatenated.
@@ -32,7 +33,8 @@ namespace starling::serve {
 std::vector<std::string> stitch_words(
     const std::vector<std::string>& committed,
     const std::vector<std::string>& new_words,
-    int max_overlap = 24);
+    int max_overlap = 24,
+    int max_head = -1);
 
 // ---- window plausibility (issue #357) ---------------------------------------
 // Parakeet sometimes stops emitting partway through a window, or emits
@@ -65,15 +67,14 @@ int max_plausible_words(double seconds);
 // span's quiet floor (its 10th-percentile frame, at most -45 dBFS) and over
 // -60 dBFS.
 double voiced_seconds(const float* samples, int64_t n, int sample_rate);
-// Cut every run of one phrase (1..max_n words) repeated back to back more
-// than max_repeats times down to max_repeats copies.
-std::vector<std::string> collapse_repeats(const std::vector<std::string>& words,
-                                          int max_repeats = 2, int max_n = 8);
 // Words of a decode over `seconds` of audio with a decoding loop removed:
-// unchanged within max_plausible_words(), otherwise repeats collapsed and
-// cut to that bound. Real repeated speech within the bound is never touched.
+// unchanged within max_plausible_words(), so real repeated speech is never
+// touched. Longer text has its longest back-to-back run of one phrase
+// (1..max_n words) cut to max_repeats copies, one run at a time, only until
+// it fits; what still does not fit is cut at the bound.
 std::vector<std::string> suppress_loops(const std::vector<std::string>& words,
-                                        double seconds);
+                                        double seconds, int max_repeats = 2,
+                                        int max_n = 8);
 
 // Split a string on whitespace into words (matching Python's str.split()).
 std::vector<std::string> split_words(const std::string& s);
@@ -243,10 +244,11 @@ public:
 private:
     bool finalize_full_windows(const std::vector<float>& samples,
                                const TranscribeFn& tx, bool flushing);
-    // Words of samples[start, end) for the committed text, re-decoded when
-    // implausible (see stream_chunk.py _decode_committed); nullopt when the
-    // engine is busy on the first call.
-    std::optional<std::vector<std::string>> decode_committed(
+    // Words of samples[start, end) for the committed text and the end of
+    // the audio they come from, re-decoded when implausible (see
+    // stream_chunk.py _decode_committed); nullopt when the engine is busy
+    // before a plausible result is in hand.
+    std::optional<std::pair<std::vector<std::string>, int64_t>> decode_committed(
         const std::vector<float>& samples, int64_t start, int64_t end,
         const char* kind, const TranscribeFn& tx);
     // Words per voiced second below which a window dropped speech.
@@ -266,6 +268,7 @@ private:
     double partial_interval_;
     int max_overlap_words_;
     int lookback_;        // samples kept before the boundary for re-decodes
+    int max_head_words_;  // new words searched when stitching
 
     std::vector<std::string> committed_;
     int64_t frozen_ = 0;    // leading committed_ words stitching never touches
@@ -333,9 +336,10 @@ public:
 
     // True when a frame exceeded the per-connection buffer cap
     // (config.max_stream_seconds): the frame was refused and every further
-    // append is a no-op until reset(). The cap bounds the LIVE rolling
-    // buffer (memory): finalized windows are trimmed from the buffer, so
-    // long dictation sessions without commits keep memory bounded without
+    // append is a no-op until reset(). The cap bounds the audio past the
+    // committed boundary (unfinalized_seconds()): finalized windows are
+    // trimmed from the buffer, apart from the re-decode lookback, so long
+    // dictation sessions without commits keep memory bounded without
     // tripping the cap. The WS layer reports overflow to the client as an
     // error frame.
     bool overflowed() const { return overflow_; }
@@ -394,6 +398,10 @@ public:
 
     double buffered_seconds() const;
     double live_seconds() const;
+    // Audio past the committed boundary: what the buffer cap counts. The
+    // audio kept before the boundary for re-decodes (issue #357) is not
+    // counted, so a cap that held one window still does.
+    double unfinalized_seconds() const;
 
     // Build the chunked-streaming transcribe callback.
     TranscribeFn make_transcribe_fn(RequestContext* ctx);
