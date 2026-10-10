@@ -34,6 +34,7 @@
 //! gate on it.
 
 use std::fmt;
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 #[cfg(feature = "runtime")]
@@ -309,6 +310,10 @@ pub trait InsertionBackend: Send + Sync {
 /// scheme.
 pub struct Inserter {
     backends: Vec<Box<dyn InsertionBackend>>,
+    /// Held for a whole [`Inserter::insert`], whatever the backend: two
+    /// inserts typing at once would interleave in the target. Not every
+    /// backend serializes itself (Windows sends chunk by chunk).
+    insert_lock: Mutex<()>,
 }
 
 impl Inserter {
@@ -349,7 +354,10 @@ impl Inserter {
     }
 
     pub fn with_backends(backends: Vec<Box<dyn InsertionBackend>>) -> Inserter {
-        Inserter { backends }
+        Inserter {
+            backends,
+            insert_lock: Mutex::new(()),
+        }
     }
 
     /// Capture through the first available backend. When none is
@@ -378,7 +386,11 @@ impl Inserter {
 
     /// Type `text` into `target` through the backend of its scheme,
     /// stopping when `stop` says so (see
-    /// [`InsertionBackend::insert_guarded`]).
+    /// [`InsertionBackend::insert_guarded`]). Inserts through one
+    /// `Inserter` run whole, one at a time; one waiting for another is
+    /// stopped by `stop` once its turn comes, before its first key. The
+    /// order waiting inserts get their turn in is unspecified: a caller
+    /// that needs an order issues them one after another.
     pub fn insert(
         &self,
         target: &TargetSnapshot,
@@ -386,7 +398,13 @@ impl Inserter {
         stop: &dyn Fn() -> Option<InsertError>,
     ) -> Result<InsertReceipt, InsertError> {
         match self.backend_for(target) {
-            Some(backend) => backend.insert_guarded(target, text, stop),
+            Some(backend) => {
+                let _whole_insert = self
+                    .insert_lock
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                backend.insert_guarded(target, text, stop)
+            }
             None => Err(InsertError::Unavailable {
                 reason: format!("no {} backend in this session", target.backend.scheme()),
             }),
@@ -720,6 +738,39 @@ mod tests {
             assert!(parse_ref(bad).is_none(), "{bad:?} must not parse");
         }
         assert_eq!(parse_ref("x11:ABC:Def:7"), parse_ref("x11:abc:def:7"));
+    }
+
+    #[test]
+    fn overlapping_inserts_through_one_inserter_type_whole_texts() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{mpsc, Arc};
+        use std::thread;
+
+        let fake = Arc::new(FakeBackend::new());
+        fake.focus(crate::testing::FakeTarget::named("Editor", "notes.txt"));
+        let target = fake.capture().unwrap();
+        let inserter = Arc::new(Inserter::with_backends(vec![Box::new(fake.clone())]));
+        // The first insert pauses after its first key, long enough for the
+        // second to type all of its keys if it were let in.
+        let (paused, first_paused) = mpsc::channel();
+        let first_key = AtomicBool::new(true);
+        fake.on_key(move |index| {
+            if index == 1 && first_key.swap(false, Ordering::SeqCst) {
+                paused.send(()).unwrap();
+                thread::sleep(Duration::from_millis(200));
+            }
+        });
+        let spawn_insert = |text: &'static str| {
+            let (inserter, target) = (inserter.clone(), target.clone());
+            thread::spawn(move || inserter.insert(&target, text, &|| None).map(|_| ()))
+        };
+
+        let first = spawn_insert("aaaa");
+        first_paused.recv().unwrap();
+        let second = spawn_insert("bbbb");
+        assert_eq!(first.join().unwrap(), Ok(()));
+        assert_eq!(second.join().unwrap(), Ok(()));
+        assert_eq!(fake.field(), "aaaabbbb");
     }
 
     #[test]

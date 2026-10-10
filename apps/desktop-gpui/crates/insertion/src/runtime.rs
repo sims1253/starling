@@ -104,9 +104,12 @@ impl DeliveryAdapter for InsertionDeliveryAdapter {
             reason: reason.to_string(),
             fallback_suggested: true,
         };
-        let (snapshot, backend) = self.resolve(target_ref).map_err(failure)?;
-        let receipt = backend
-            .insert(&snapshot, text)
+        let (snapshot, _) = self.resolve(target_ref).map_err(failure)?;
+        // Through the inserter, so it runs whole, never overlapping
+        // another insert through the same inserter.
+        let receipt = self
+            .inserter
+            .insert(&snapshot, text, &|| None)
             .map_err(|error| failure(error.code()))?;
         Ok(InsertEvidence {
             level: receipt.evidence.to_string(),

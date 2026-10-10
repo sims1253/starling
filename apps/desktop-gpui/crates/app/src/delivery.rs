@@ -36,7 +36,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use gpui::{AppContext, ClipboardItem, Context};
+use gpui::{AppContext, ClipboardItem, Context, Task};
 use starling_dictation::settings::InsertionSettings;
 use starling_insertion::{InsertError, Inserter, TargetSnapshot};
 
@@ -233,6 +233,9 @@ pub(crate) struct DeliveryState {
     /// An insert stops before its next key once Starling's window has
     /// had focus since it was started.
     own_focus: Arc<OwnFocus>,
+    /// The latest insert. The next one waits for it, so inserts type in
+    /// the order they were started, one at a time.
+    last_insert: Option<Task<()>>,
 }
 
 impl DeliveryState {
@@ -246,6 +249,7 @@ impl DeliveryState {
             generation: 0,
             focus_changes: 0,
             own_focus: Arc::default(),
+            last_insert: None,
         }
     }
 
@@ -348,9 +352,9 @@ impl StarlingApp {
         }
     }
 
-    /// Types `text` into `target` off the UI thread. `paste` is the
-    /// recovery generation a Paste last runs for; `None` for the take's
-    /// own delivery.
+    /// Types `text` into `target` off the UI thread, after every insert
+    /// started before it finished. `paste` is the recovery generation a
+    /// Paste last runs for; `None` for the take's own delivery.
     fn spawn_insert(
         &mut self,
         id: String,
@@ -362,7 +366,11 @@ impl StarlingApp {
         let inserter = self.delivery.inserter.clone();
         let had_focus = self.delivery.own_focus.had_focus_since_now();
         let typed_text = text.clone();
-        cx.spawn(async move |this, cx| {
+        let previous = self.delivery.last_insert.take();
+        let insert = cx.spawn(async move |this, cx| {
+            if let Some(previous) = previous {
+                previous.await;
+            }
             let result = cx
                 .background_spawn(async move {
                     let stop = || had_focus().then_some(InsertError::TargetIsStarling);
@@ -373,8 +381,8 @@ impl StarlingApp {
                 app.insert_finished(id, text, paste, result, cx)
             })
             .ok();
-        })
-        .detach();
+        });
+        self.delivery.last_insert = Some(insert);
     }
 
     fn insert_finished(
@@ -686,6 +694,41 @@ mod tests {
             plan(&ok, opted_in, false, true, "hi"),
             Plan::Fail(Failure::FocusMovedThroughStarling)
         );
+    }
+
+    /// Takes finishing together type one after another, in the order
+    /// they were delivered. The test executor runs background work in a
+    /// random order per seed, so without the chain some seeds type the
+    /// later take first.
+    #[gpui::test(iterations = 30)]
+    fn overlapping_deliveries_type_whole_texts_in_take_order(cx: &mut gpui::TestAppContext) {
+        let (app, fake) = app_with(cx, on());
+        fake.focus(FakeTarget::named("Editor", "notes.txt"));
+        let target = fake.capture().unwrap();
+        app.update(cx, |app, cx| {
+            for (id, text) in [
+                ("take-1", "first take."),
+                ("take-2", "second take."),
+                ("take-3", "third take."),
+            ] {
+                app.delivery_take_started();
+                let capture = app.delivery_take_stopped();
+                app.bind_delivery(capture, id);
+                app.sessions.push(session(id, text));
+            }
+            for id in ["take-1", "take-2", "take-3"] {
+                app.deliver_finished_take(id, cx);
+            }
+        });
+        cx.run_until_parked();
+        assert_eq!(fake.field(), "first take.second take.third take.");
+        assert_eq!(
+            fake.insertions(),
+            ["first take.", "second take.", "third take."]
+                .map(|text| (target.target_ref.clone(), text.to_string()))
+                .to_vec()
+        );
+        assert_eq!(failure(&app, cx), None);
     }
 
     #[gpui::test]

@@ -56,6 +56,9 @@ struct State {
     verifies_target: bool,
     key_hook: Option<KeyHook>,
     insertions: Vec<(String, String)>,
+    /// Every key `insert_guarded` sent, in arrival order, as one field
+    /// would receive them.
+    field: String,
 }
 
 /// Runs before each character `insert_guarded` types, with its index.
@@ -102,6 +105,7 @@ impl FakeBackend {
                 verifies_target: true,
                 key_hook: None,
                 insertions: Vec::new(),
+                field: String::new(),
             }),
             excluded_pids: merge_excluded_pids(excluded_pids),
         }
@@ -163,6 +167,13 @@ impl FakeBackend {
     /// The `(target_ref, text)` pairs `insert` accepted, in order.
     pub fn insertions(&self) -> Vec<(String, String)> {
         self.state().insertions.clone()
+    }
+
+    /// Every key sent so far, across inserts, in the order it arrived:
+    /// what a single field would hold, so overlapping inserts show up
+    /// mixed.
+    pub fn field(&self) -> String {
+        self.state().field.clone()
     }
 }
 
@@ -226,8 +237,10 @@ impl InsertionBackend for FakeBackend {
         self.insert_guarded(target, text, &|| None)
     }
 
-    /// Checks `stop` before every character, like the Wayland backend;
-    /// the text is recorded only when every character went out.
+    /// Checks the target right before typing, then `stop` before every
+    /// character like the Wayland backend: a failed check types nothing,
+    /// a stop part-way is a partial delivery. The text is recorded only
+    /// when every character went out.
     fn insert_guarded(
         &self,
         target: &TargetSnapshot,
@@ -235,14 +248,32 @@ impl InsertionBackend for FakeBackend {
         stop: &dyn Fn() -> Option<InsertError>,
     ) -> Result<InsertReceipt, InsertError> {
         insertion_guards(text, target.pid, &self.excluded_pids)?;
-        let hook = self.state().key_hook.clone();
+        match self.revalidate(target)? {
+            TargetCheck::Same => {}
+            TargetCheck::Changed { expected, actual } => {
+                return Err(InsertError::TargetChanged { expected, actual })
+            }
+            TargetCheck::Gone => return Err(InsertError::TargetGone),
+        }
+        let (hook, behavior) = {
+            let state = self.state();
+            // The live pid decides ownership, like the real backends' checks.
+            let live_pid = state.focus.as_ref().and_then(|focus| focus.pid);
+            if live_pid.is_some_and(|pid| self.excluded_pids.contains(&pid)) {
+                return Err(InsertError::TargetIsStarling);
+            }
+            (state.key_hook.clone(), state.insert_behavior.clone())
+        };
+        if let InsertBehavior::FailWith(error) = behavior {
+            return Err(error);
+        }
         let total_chars = text.chars().count();
-        for index in 0..total_chars {
+        for (index, character) in text.chars().enumerate() {
             if let Some(hook) = &hook {
                 hook(index);
             }
             match stop() {
-                None => {}
+                None => self.state().field.push(character),
                 Some(error) if index == 0 => return Err(error),
                 Some(error) => {
                     return Err(InsertError::PartialDelivery {
@@ -253,30 +284,12 @@ impl InsertionBackend for FakeBackend {
                 }
             }
         }
-        match self.revalidate(target)? {
-            TargetCheck::Same => {}
-            TargetCheck::Changed { expected, actual } => {
-                return Err(InsertError::TargetChanged { expected, actual })
-            }
-            TargetCheck::Gone => return Err(InsertError::TargetGone),
-        }
-        let mut state = self.state();
-        // The live pid decides ownership, like the real backends' checks.
-        let live_pid = state.focus.as_ref().and_then(|focus| focus.pid);
-        if live_pid.is_some_and(|pid| self.excluded_pids.contains(&pid)) {
-            return Err(InsertError::TargetIsStarling);
-        }
-        match state.insert_behavior.clone() {
-            InsertBehavior::Type => {
-                state
-                    .insertions
-                    .push((target.target_ref.clone(), text.to_string()));
-                Ok(InsertReceipt {
-                    evidence: EVIDENCE_SYNTHETIC_KEYS,
-                })
-            }
-            InsertBehavior::FailWith(error) => Err(error),
-        }
+        self.state()
+            .insertions
+            .push((target.target_ref.clone(), text.to_string()));
+        Ok(InsertReceipt {
+            evidence: EVIDENCE_SYNTHETIC_KEYS,
+        })
     }
 }
 
