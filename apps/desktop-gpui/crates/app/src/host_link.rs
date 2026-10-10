@@ -536,18 +536,28 @@ fn route(
 /// Connects to the host at `endpoint`, starting one first when nothing
 /// serves there (and `launch` allows it).
 fn connect_or_launch(endpoint: &Path, launch: &Launch) -> Result<HostClient, String> {
-    match HostClient::connect(endpoint) {
-        Ok(client) => return Ok(client),
-        Err(err) => {
-            if matches!(launch, Launch::Never) {
-                return Err(format!("the recording service is not running ({err})"));
-            }
-        }
+    match launch {
+        Launch::SelfAsHost { log } => connect_or_start(endpoint, || launch_self(log)),
+        Launch::Never => HostClient::connect(endpoint)
+            .map_err(|err| format!("the recording service is not running ({err})")),
     }
-    if let Launch::SelfAsHost { log } = launch {
-        launch_self(log)?;
+}
+
+/// Connects to the host at `endpoint`, running `start` first when nothing
+/// serves there. A started host is given [`HOST_START_TIMEOUT`] from its
+/// start to serve, however it reported: one that found another host
+/// starting ("already-running") waits out that host's startup recovery
+/// rather than giving up early, and a slow start is never started again
+/// over itself.
+fn connect_or_start(
+    endpoint: &Path,
+    start: impl FnOnce() -> Result<(), String>,
+) -> Result<HostClient, String> {
+    if let Ok(client) = HostClient::connect(endpoint) {
+        return Ok(client);
     }
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + HOST_START_TIMEOUT;
+    start()?;
     loop {
         match HostClient::connect(endpoint) {
             Ok(client) => return Ok(client),
@@ -572,6 +582,22 @@ pub(crate) fn host_log_path() -> Option<PathBuf> {
 fn launch_self(log: &Path) -> Result<(), String> {
     let exe = std::env::current_exe()
         .map_err(|err| format!("cannot find the Starling executable to start the recording service: {err}"))?;
+    let mut command = std::process::Command::new(exe);
+    command
+        .arg("--runtime-host")
+        // The app transcribes its own takes for now (#220 later work
+        // moves jobs into the host): the host runs no engine of its own,
+        // so the app's engine stays the only one.
+        .args(["--engine", "none"])
+        .arg("--exit-when-idle")
+        .arg(HOST_IDLE_EXIT.as_secs().to_string());
+    start_host(command, log)
+}
+
+/// Runs `command` as the host, logging to `log`, and waits for its status
+/// line. Its stdout is read for as long as it runs: a pipe nobody reads
+/// would block (or break) a host that writes more than that line.
+fn start_host(mut command: std::process::Command, log: &Path) -> Result<(), String> {
     if let Some(dir) = log.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
@@ -585,15 +611,7 @@ fn launch_self(log: &Path) -> Result<(), String> {
         .open(log)
         .map(std::process::Stdio::from)
         .unwrap_or_else(|_| std::process::Stdio::null());
-    let mut command = std::process::Command::new(exe);
     command
-        .arg("--runtime-host")
-        // The app transcribes its own takes for now (#220 later work
-        // moves jobs into the host): the host runs no engine of its own,
-        // so the app's engine stays the only one.
-        .args(["--engine", "none"])
-        .arg("--exit-when-idle")
-        .arg(HOST_IDLE_EXIT.as_secs().to_string())
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(stderr);
@@ -616,10 +634,14 @@ fn launch_self(log: &Path) -> Result<(), String> {
     let (line_tx, line_rx) = std::sync::mpsc::channel::<String>();
     std::thread::spawn(move || {
         let mut line = String::new();
-        if let Some(stdout) = stdout {
-            let _ = std::io::BufReader::new(stdout).read_line(&mut line);
+        let mut stdout = stdout.map(std::io::BufReader::new);
+        if let Some(stdout) = stdout.as_mut() {
+            let _ = stdout.read_line(&mut line);
         }
         let _ = line_tx.send(line);
+        if let Some(stdout) = stdout.as_mut() {
+            let _ = std::io::copy(stdout, &mut std::io::sink());
+        }
     });
     // Reap the host whenever it exits, so it never lingers as a zombie of
     // this app.
@@ -856,6 +878,86 @@ impl LiveCapture {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scratch(tag: &str) -> PathBuf {
+        // Short: the host's socket path lives under it.
+        let root = std::env::temp_dir().join(format!("sl-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("scratch");
+        root
+    }
+
+    #[cfg(unix)]
+    fn shell(script: &str) -> std::process::Command {
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", script]);
+        command
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_host_that_starts_slowly_is_waited_for_and_started_once() {
+        // The launched process finds another host starting (it holds the
+        // lease and is still recovering) and says so at once; that host
+        // serves only seconds later.
+        let root = scratch("slow");
+        let config = starling_runtime_host::HostConfig::new(&root, root.join("endpoints"));
+        let endpoint = config.socket_path();
+        let serving = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(6));
+            starling_runtime_host::serve(config).expect("host serves")
+        });
+        let launches = std::sync::atomic::AtomicUsize::new(0);
+        let log = root.join("runtime-host.log");
+        let started = Instant::now();
+        let client = connect_or_start(&endpoint, || {
+            launches.fetch_add(1, Ordering::SeqCst);
+            start_host(shell(r#"echo '{"status":"already-running"}'"#), &log)
+        });
+        assert!(client.is_ok(), "connected: {:?}", client.err());
+        assert!(started.elapsed() >= Duration::from_secs(6));
+        assert_eq!(launches.load(Ordering::SeqCst), 1, "started once");
+        drop(client);
+        serving.join().expect("host thread").shutdown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_started_host_can_keep_writing_to_its_stdout() {
+        let root = scratch("out");
+        let done = root.join("done");
+        let script = format!(
+            r#"echo '{{"status":"owner"}}'; head -c 1000000 /dev/zero && touch '{}'"#,
+            done.display()
+        );
+        start_host(shell(&script), &root.join("runtime-host.log")).expect("reported");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !done.exists() {
+            assert!(Instant::now() < deadline, "the host's writes after its status line blocked or broke");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_gap_is_asked_for_once_however_much_audio_arrives_past_it() {
+        let feed = Arc::new(TakeFeed::default());
+        feed.receive(16_000, None, Some((0, vec![0.1; 4])), None);
+        assert_eq!(feed.receive(16_000, None, Some((8, vec![0.2; 4])), None), Some(4));
+        for start in (12..400).step_by(4) {
+            assert_eq!(
+                feed.receive(16_000, None, Some((start, vec![0.2; 4])), None),
+                None,
+                "asked again at {start}"
+            );
+        }
+        // The replay from the gap fills it; a later gap is asked for once.
+        assert_eq!(feed.receive(16_000, None, Some((4, vec![0.3; 8])), None), None);
+        assert_eq!(feed.samples_from(0).len(), 12);
+        assert_eq!(feed.receive(16_000, None, Some((20, vec![0.4; 4])), None), Some(12));
+        assert_eq!(feed.receive(16_000, None, Some((24, vec![0.4; 4])), None), None);
+    }
 
     #[test]
     fn a_feed_takes_audio_in_order_once_and_knows_when_it_is_complete() {
