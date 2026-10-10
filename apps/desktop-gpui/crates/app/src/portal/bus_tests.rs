@@ -93,6 +93,8 @@ struct Script {
     version: u32,
     /// ListShortcuts reports a binding remembered from an earlier run.
     remembered: bool,
+    /// ... or only an entry without keys (the user cleared them).
+    remembered_keyless: bool,
     /// BindShortcuts' response code, and the trigger it reports bound.
     bind_response: u32,
     bound_trigger: Option<String>,
@@ -104,6 +106,8 @@ struct Script {
     remove_after_bind: bool,
     /// The desktop closes each session right after creating it.
     close_after_create: bool,
+    /// How long Session.Close takes to return.
+    close_takes: Duration,
     registered: Vec<String>,
     sessions: Vec<String>,
     closed: Vec<String>,
@@ -160,7 +164,6 @@ fn shortcut_entries(trigger: Option<&str>) -> ShortcutList {
     vec![("record".to_string(), info)]
 }
 
-/// The same list as a results-dict value.
 async fn close(connection: &zbus::Connection, session: &str) {
     connection
         .emit_signal(
@@ -174,6 +177,7 @@ async fn close(connection: &zbus::Connection, session: &str) {
         .expect("emit Closed");
 }
 
+/// The same list as a results-dict value.
 fn shortcut_list(trigger: Option<&str>) -> Value<'static> {
     Value::from(shortcut_entries(trigger))
 }
@@ -307,9 +311,14 @@ impl FakeGlobalShortcuts {
             sender_part(&header),
             token(&options, "handle_token")
         );
-        let remembered = self.0.lock().unwrap().remembered;
+        let (remembered, keyless) = {
+            let script = self.0.lock().unwrap();
+            (script.remembered, script.remembered_keyless)
+        };
         let list = if remembered {
             shortcut_list(Some("Ctrl+Shift+Space"))
+        } else if keyless {
+            shortcut_list(None)
         } else {
             Value::from(Vec::<(String, HashMap<String, Value>)>::new())
         };
@@ -342,6 +351,8 @@ impl FakeSession {
             .path()
             .map(|path| path.to_string())
             .unwrap_or_default();
+        let takes = self.0.lock().unwrap().close_takes;
+        std::thread::sleep(takes);
         self.0.lock().unwrap().closed.push(path);
     }
 }
@@ -499,7 +510,7 @@ fn a_first_run_waits_for_set_up_then_delivers_hold_to_talk_edges() {
         script.lock().unwrap().preferred,
         vec![Some("CTRL+SHIFT+space".to_string())]
     );
-    let session = script.lock().unwrap().sessions[0].clone();
+    let session = script.lock().unwrap().sessions.last().cloned().unwrap();
 
     // Another app's shortcut or another session never reaches the machine.
     emit(&portal, "Activated", &session, "other");
@@ -571,6 +582,25 @@ fn a_remembered_binding_is_bound_again_at_start() {
 }
 
 #[test]
+fn a_remembered_entry_without_keys_waits_for_set_up() {
+    let bus = private_bus!();
+    let (_portal, script) = fake_portal(
+        &bus,
+        Script {
+            remembered_keyless: true,
+            ..bound_script()
+        },
+    );
+    let mut client = PortalShortcuts::spawn(Some(bus.address.clone()), None, &shortcut("F9"));
+    let mut events = Vec::new();
+    wait_for(&mut client, &mut events, "needs set-up", |status, _| {
+        matches!(status, PortalStatus::NeedsSetup { .. })
+    });
+    // Nothing was bound behind the user's back.
+    assert!(script.lock().unwrap().preferred.is_empty());
+}
+
+#[test]
 fn a_declined_dialog_can_be_retried_in_a_fresh_session() {
     let bus = private_bus!();
     let (_portal, script) = fake_portal(
@@ -638,7 +668,7 @@ fn a_session_closed_mid_hold_releases_the_shortcut() {
     wait_for(&mut client, &mut events, "bound", |status, _| {
         status.is_bound()
     });
-    let session = script.lock().unwrap().sessions[0].clone();
+    let session = script.lock().unwrap().sessions.last().cloned().unwrap();
     emit(&portal, "Activated", &session, "record");
     wait_for(&mut client, &mut events, "press", |_, events| {
         !events.is_empty()
@@ -687,7 +717,7 @@ fn shortcut_changes_follow_the_desktop() {
     wait_for(&mut client, &mut events, "bound", |status, _| {
         status.is_bound()
     });
-    let session = script.lock().unwrap().sessions[0].clone();
+    let session = script.lock().unwrap().sessions.last().cloned().unwrap();
     let changed = |trigger: Option<&str>| {
         let list = match trigger {
             Some(trigger) => shortcut_entries(Some(trigger)),
@@ -796,6 +826,36 @@ fn a_new_shortcut_is_offered_through_a_fresh_session() {
 }
 
 #[test]
+fn a_rebind_unpublishes_the_old_binding_before_closing_its_session() {
+    let bus = private_bus!();
+    let (_portal, script) = fake_portal(
+        &bus,
+        Script {
+            remembered: true,
+            close_takes: Duration::from_millis(1500),
+            ..bound_script()
+        },
+    );
+    let mut client = PortalShortcuts::spawn(Some(bus.address.clone()), None, &shortcut("F9"));
+    let mut events = Vec::new();
+    wait_for(&mut client, &mut events, "bound", |status, _| {
+        status.is_bound()
+    });
+    client.rebind(&shortcut("Alt+D"));
+    // The old session no longer delivers once the rebind starts: the
+    // status says so while its slow Close is still running, so the other
+    // sources stop deferring to it.
+    wait_for(&mut client, &mut events, "unbound", |status, _| {
+        !status.is_bound()
+    });
+    assert!(script.lock().unwrap().closed.is_empty());
+    assert!(!client.bound_at(Instant::now()));
+    wait_for(&mut client, &mut events, "second bind", |status, _| {
+        status.is_bound() && script.lock().unwrap().preferred.len() == 2
+    });
+}
+
+#[test]
 fn the_portal_going_away_releases_and_reports_it() {
     let bus = private_bus!();
     let (portal, script) = fake_portal(
@@ -810,7 +870,7 @@ fn the_portal_going_away_releases_and_reports_it() {
     wait_for(&mut client, &mut events, "bound", |status, _| {
         status.is_bound()
     });
-    let session = script.lock().unwrap().sessions[0].clone();
+    let session = script.lock().unwrap().sessions.last().cloned().unwrap();
     emit(&portal, "Activated", &session, "record");
     wait_for(&mut client, &mut events, "press", |_, events| {
         !events.is_empty()
@@ -846,7 +906,7 @@ fn a_press_and_release_sent_back_to_back_keep_their_order() {
     wait_for(&mut client, &mut events, "bound", |status, _| {
         status.is_bound()
     });
-    let session = script.lock().unwrap().sessions[0].clone();
+    let session = script.lock().unwrap().sessions.last().cloned().unwrap();
     // A quick tap: both edges are on the wire before either is handled.
     for _ in 0..20 {
         emit(&portal, "Activated", &session, "record");
@@ -904,7 +964,7 @@ fn a_restarted_portal_is_registered_with_again_and_rebinds() {
     wait_for(&mut client, &mut events, "bound", |status, _| {
         status.is_bound()
     });
-    let session = script.lock().unwrap().sessions[0].clone();
+    let session = script.lock().unwrap().sessions.last().cloned().unwrap();
     emit(&portal, "Activated", &session, "record");
     wait_for(&mut client, &mut events, "press", |_, events| {
         !events.is_empty()
@@ -927,7 +987,7 @@ fn a_restarted_portal_is_registered_with_again_and_rebinds() {
         status.is_bound()
     });
     assert_eq!(script.lock().unwrap().registered, vec![APP_ID.to_string()]);
-    let session = script.lock().unwrap().sessions[0].clone();
+    let session = script.lock().unwrap().sessions.last().cloned().unwrap();
     emit(&portal, "Activated", &session, "record");
     wait_for(
         &mut client,
@@ -952,7 +1012,7 @@ fn losing_the_bus_mid_hold_releases_and_reports_it() {
     wait_for(&mut client, &mut events, "bound", |status, _| {
         status.is_bound()
     });
-    let session = script.lock().unwrap().sessions[0].clone();
+    let session = script.lock().unwrap().sessions.last().cloned().unwrap();
     emit(&portal, "Activated", &session, "record");
     wait_for(&mut client, &mut events, "press", |_, events| {
         !events.is_empty()
@@ -990,7 +1050,7 @@ fn a_session_closed_while_the_dialog_is_open_ends_the_wait() {
     wait_for(&mut client, &mut events, "binding", |status, _| {
         *status == PortalStatus::Binding
     });
-    let session = script.lock().unwrap().sessions[0].clone();
+    let session = script.lock().unwrap().sessions.last().cloned().unwrap();
     portal
         .emit_signal(
             None::<&str>,
@@ -1346,6 +1406,21 @@ fn the_real_portal_frontend_binds_and_forwards_hold_edges() {
         std::thread::sleep(Duration::from_millis(50));
     }
 
+    // xdg-desktop-portal 1.19 added the host app registry; before it,
+    // the frontend identifies no unsandboxed app and opens sessions
+    // without an app id (the worker's failed `Register` is not fatal).
+    let introspected: String = zbus::blocking::Proxy::new(
+        &probe,
+        DESTINATION,
+        PATH,
+        "org.freedesktop.DBus.Introspectable",
+    )
+    .unwrap()
+    .call("Introspect", &())
+    .expect("introspect the frontend");
+    let has_registry =
+        introspected.contains("<interface name=\"org.freedesktop.host.portal.Registry\"");
+
     // The frontend resolves a registered host app id through
     // `<id>.desktop` in its data dirs; the scratch data home has none yet.
     let entries = scratch.path().join("applications");
@@ -1355,27 +1430,40 @@ fn the_real_portal_frontend_binds_and_forwards_hold_edges() {
         &shortcut("Ctrl+Shift+Space"),
     );
     let mut events = Vec::new();
-    wait_for(
-        &mut client,
-        &mut events,
-        "needs a desktop entry",
-        |status, _| *status == PortalStatus::NeedsDesktopEntry,
-    );
-    assert!(script.lock().unwrap().app_ids.is_empty());
-    // Set-up installs the entry, reconnects, registers and binds.
+    if has_registry {
+        wait_for(
+            &mut client,
+            &mut events,
+            "needs a desktop entry",
+            |status, _| *status == PortalStatus::NeedsDesktopEntry,
+        );
+        assert!(script.lock().unwrap().app_ids.is_empty());
+    } else {
+        eprintln!("xdg-desktop-portal before 1.19 (no host app registry): no app id");
+        wait_for(&mut client, &mut events, "needs set-up", |status, _| {
+            matches!(status, PortalStatus::NeedsSetup { .. })
+        });
+    }
+    // Set-up installs the entry, reconnects, registers and binds (1.19+),
+    // or binds in the open session (before).
     client.set_up(&shortcut("Ctrl+Shift+Space"));
     wait_for(&mut client, &mut events, "bound", |status, _| {
         status.is_bound()
     });
-    assert!(entries.join(format!("{APP_ID}.desktop")).is_file());
-    // The frontend accepted the session only with an app id: the one the
-    // worker registered.
-    assert_eq!(script.lock().unwrap().app_ids, vec![APP_ID.to_string()]);
+    if has_registry {
+        assert!(entries.join(format!("{APP_ID}.desktop")).is_file());
+        // The frontend accepted the session only with an app id: the one
+        // the worker registered.
+        assert_eq!(script.lock().unwrap().app_ids, vec![APP_ID.to_string()]);
+    } else {
+        assert!(!entries.join(format!("{APP_ID}.desktop")).exists());
+        assert_eq!(script.lock().unwrap().app_ids, vec![String::new()]);
+    }
     assert_eq!(
         script.lock().unwrap().preferred,
         vec![Some("CTRL+SHIFT+space".to_string())]
     );
-    let session = script.lock().unwrap().sessions[0].clone();
+    let session = script.lock().unwrap().sessions.last().cloned().unwrap();
     for signal in ["Activated", "Deactivated"] {
         backend
             .emit_signal(

@@ -101,18 +101,29 @@ pub(crate) struct AudioFacts {
     pub pulse: bool,
 }
 
+/// One insertion backend, as [`starling_insertion::Inserter::availability`]
+/// reports it, in capture order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct InsertionFacts {
+    /// The backend's ref scheme (`x11`, `wl`, `win`), or `unknown` when
+    /// the probe gave no answer.
+    pub scheme: String,
+    /// Whether it can check the target window (Wayland cannot).
+    pub verifies_target: bool,
+    pub availability: Result<(), String>,
+}
+
 /// Everything [`evaluate`] needs; each probe's failure is its own `Err`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Facts {
     pub session: SessionFacts,
     pub portal: Option<Result<PortalFacts, String>>,
     pub portal_backends: Vec<PortalBackend>,
-    /// Each insertion backend: its scheme and availability.
-    pub insertion: Vec<(String, Result<(), String>)>,
+    /// The insertion backends, in capture order.
+    pub insertion: Vec<InsertionFacts>,
     pub atspi: Option<Result<(), String>>,
     pub input_methods: InputMethodFacts,
-    /// `None`: the sockets did not answer in time.
-    pub audio: Option<AudioFacts>,
+    pub audio: Option<Result<AudioFacts, String>>,
     /// Capture devices: (name, is default).
     pub microphones: Option<Result<Vec<(String, bool)>, String>>,
 }
@@ -120,12 +131,21 @@ pub(crate) struct Facts {
 const GLOBAL_SHORTCUTS: &str = "org.freedesktop.portal.GlobalShortcuts";
 const REMOTE_DESKTOP: &str = "org.freedesktop.portal.RemoteDesktop";
 
-/// The check's lines, in a fixed order. `portal_status` is the live
-/// shortcut binding, when the portal source is running.
-pub(crate) fn evaluate(facts: &Facts, portal_status: Option<&PortalStatus>) -> Vec<CheckLine> {
+/// The live shortcut sources the check reports alongside its facts.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ShortcutState<'a> {
+    /// How registering the X11 (or other platform) system-wide shortcut
+    /// went.
+    pub registration: &'a Result<(), String>,
+    /// The portal binding, when the portal source is running.
+    pub portal: Option<&'a PortalStatus>,
+}
+
+/// The check's lines, in a fixed order.
+pub(crate) fn evaluate(facts: &Facts, shortcut: ShortcutState<'_>) -> Vec<CheckLine> {
     vec![
         session_line(&facts.session),
-        shortcut_line(facts, portal_status),
+        shortcut_line(facts, shortcut),
         insertion_line(facts),
         atspi_line(facts.atspi.as_ref()),
         input_method_line(&facts.input_methods),
@@ -190,17 +210,49 @@ fn session_line(session: &SessionFacts) -> CheckLine {
     }
 }
 
-fn shortcut_line(facts: &Facts, portal_status: Option<&PortalStatus>) -> CheckLine {
-    const TOPIC: &str = "System-wide shortcut";
+fn shortcut_line(facts: &Facts, shortcut: ShortcutState<'_>) -> CheckLine {
     let session = &facts.session;
     if !session.wayland() {
-        return line(
-            TOPIC,
-            Verdict::Ok,
-            "X11: the shortcut is grabbed directly; no portal needed.",
-            None,
-        );
+        return match shortcut.registration {
+            Ok(()) => line(
+                SHORTCUT_TOPIC,
+                Verdict::Ok,
+                "X11: the shortcut is grabbed directly; no portal needed.",
+                None,
+            ),
+            Err(reason) => line(
+                SHORTCUT_TOPIC,
+                Verdict::Missing,
+                format!("X11: the shortcut could not be grabbed ({reason})."),
+                Some(
+                    "Another app may hold these keys: choose a different recording shortcut \
+                     above. Until then the shortcut works only in the Starling window."
+                        .to_string(),
+                ),
+            ),
+        };
     }
+    let mut checked = wayland_shortcut_line(facts, shortcut.portal);
+    // Short of a portal binding, the X11 grab is what reaches XWayland apps.
+    if let (false, Err(reason)) = (
+        shortcut.portal.is_some_and(PortalStatus::is_bound),
+        shortcut.registration,
+    ) {
+        checked.summary.push_str(&format!(
+            " The X11 grab for XWayland apps failed too ({reason})."
+        ));
+        if checked.verdict == Verdict::Limited {
+            checked.verdict = Verdict::Missing;
+        }
+    }
+    checked
+}
+
+const SHORTCUT_TOPIC: &str = "System-wide shortcut";
+
+fn wayland_shortcut_line(facts: &Facts, portal_status: Option<&PortalStatus>) -> CheckLine {
+    const TOPIC: &str = SHORTCUT_TOPIC;
+    let session = &facts.session;
     let desktop = desktop_name(session);
     let portal = match facts.portal.as_ref() {
         None => {
@@ -308,20 +360,18 @@ fn shortcut_line(facts: &Facts, portal_status: Option<&PortalStatus>) -> CheckLi
 
 fn insertion_line(facts: &Facts) -> CheckLine {
     const TOPIC: &str = "Typing into other apps";
-    let available: Vec<&str> = facts
-        .insertion
-        .iter()
-        .filter(|(_, availability)| availability.is_ok())
-        .map(|(scheme, _)| scheme.as_str())
-        .collect();
+    const WAYLAND_FIX: &str = "Typing into native Wayland apps needs a compositor that offers \
+         virtual keyboards (wlroots-based ones, niri, COSMIC; not GNOME or KDE). Elsewhere, \
+         copy the transcript and paste it yourself.";
     let blocked: Vec<String> = facts
         .insertion
         .iter()
-        .filter_map(|(scheme, availability)| {
-            availability
+        .filter_map(|backend| {
+            backend
+                .availability
                 .as_ref()
                 .err()
-                .map(|reason| format!("{scheme}: {reason}"))
+                .map(|reason| format!("{}: {reason}", backend.scheme))
         })
         .collect();
     let remote_desktop = facts
@@ -342,7 +392,12 @@ fn insertion_line(facts: &Facts) -> CheckLine {
             Some("Copy the transcript and paste it yourself.".to_string()),
         );
     }
-    if available.is_empty() {
+    // Capture takes the first available backend in this order.
+    let Some(used) = facts
+        .insertion
+        .iter()
+        .find(|backend| backend.availability.is_ok())
+    else {
         return line(
             TOPIC,
             Verdict::Missing,
@@ -351,23 +406,47 @@ fn insertion_line(facts: &Facts) -> CheckLine {
                 blocked.join("; ")
             ),
             Some(if facts.session.wayland() {
-                "On Wayland, typing into other apps needs the compositor's virtual-keyboard \
-                 protocol; until then copy the transcript and paste it yourself."
-                    .to_string()
+                WAYLAND_FIX.to_string()
             } else {
                 "Copy the transcript and paste it yourself.".to_string()
             }),
         );
-    }
-    let only_x11 = available.iter().all(|scheme| *scheme == "x11");
-    if facts.session.wayland() && only_x11 {
+    };
+    let available: Vec<&str> = facts
+        .insertion
+        .iter()
+        .filter(|backend| backend.availability.is_ok())
+        .map(|backend| backend.scheme.as_str())
+        .collect();
+    if facts.session.wayland() && used.scheme == "x11" {
+        let not_wayland = if blocked.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", blocked.join("; "))
+        };
         line(
             TOPIC,
             Verdict::Limited,
             format!(
-                "X11 typing only: it reaches XWayland apps, not native Wayland ones.{portal_note}"
+                "X11 typing only{not_wayland}: it reaches XWayland apps, not native Wayland \
+                 ones.{portal_note}"
             ),
-            Some("For native Wayland apps, copy the transcript and paste it yourself.".to_string()),
+            Some(WAYLAND_FIX.to_string()),
+        )
+    } else if !used.verifies_target {
+        line(
+            TOPIC,
+            Verdict::Limited,
+            format!(
+                "Types through the compositor's virtual keyboard ({}), which cannot check \
+                 which window has focus.{portal_note}",
+                used.scheme
+            ),
+            Some(
+                "Turn on \"Also type where the window cannot be checked\" under Settings → \
+                 After a take; without it, takes are left for you to copy."
+                    .to_string(),
+            ),
         )
     } else {
         line(
@@ -428,18 +507,19 @@ fn input_method_line(ime: &InputMethodFacts) -> CheckLine {
     )
 }
 
-fn audio_line(audio: Option<&AudioFacts>) -> CheckLine {
+fn audio_line(audio: Option<&Result<AudioFacts, String>>) -> CheckLine {
     const TOPIC: &str = "Sound server";
-    let Some(audio) = audio else {
-        return line(
-            TOPIC,
-            Verdict::Missing,
-            format!(
-                "The sound server's sockets did not answer within {} s.",
-                PROBE_TIMEOUT.as_secs()
-            ),
-            Some("Restart it: `systemctl --user restart pipewire pipewire-pulse`.".to_string()),
-        );
+    let audio = match audio {
+        None => return line(TOPIC, Verdict::Info, "Not checked.", None),
+        Some(Err(reason)) => {
+            return line(
+                TOPIC,
+                Verdict::Missing,
+                format!("The sound server's sockets could not be checked ({reason})."),
+                Some("Restart it: `systemctl --user restart pipewire pipewire-pulse`.".to_string()),
+            );
+        }
+        Some(Ok(audio)) => audio,
     };
     match (audio.pipewire, audio.pulse) {
         (true, true) => line(
@@ -582,21 +662,40 @@ pub(crate) fn parse_portal_file(name: &str, contents: &str, desktops: &[String])
     backend
 }
 
-/// Run `probe` on its own thread; `None` when it takes longer than
-/// [`PROBE_TIMEOUT`] (the thread is left to finish on its own).
-fn bounded<T: Send + 'static>(probe: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+/// Run `probe` on its own thread. `Err` says why it gave no answer: it
+/// took longer than [`PROBE_TIMEOUT`] (the thread is left to finish on
+/// its own), or it crashed.
+fn bounded<T: Send + 'static>(probe: impl FnOnce() -> T + Send + 'static) -> Result<T, String> {
+    use std::sync::mpsc::RecvTimeoutError;
     let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::Builder::new()
         .name("starling-check".to_string())
         .spawn(move || {
-            let _ = sender.send(probe());
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(probe));
+            let _ = sender.send(outcome.map_err(|panic| panic_message(&*panic)));
         })
-        .ok()?;
-    receiver.recv_timeout(PROBE_TIMEOUT).ok()
+        .map_err(|err| format!("the probe could not start ({err})"))?;
+    match receiver.recv_timeout(PROBE_TIMEOUT) {
+        Ok(Ok(answer)) => Ok(answer),
+        Ok(Err(message)) => Err(format!("the probe failed: {message}")),
+        Err(RecvTimeoutError::Timeout) => {
+            Err(format!("no answer within {} s", PROBE_TIMEOUT.as_secs()))
+        }
+        Err(RecvTimeoutError::Disconnected) => Err("the probe failed".to_string()),
+    }
 }
 
-fn timed_out<T>(outcome: Option<Result<T, String>>) -> Result<T, String> {
-    outcome.unwrap_or_else(|| Err(format!("no answer within {} s", PROBE_TIMEOUT.as_secs())))
+fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
+    panic
+        .downcast_ref::<&str>()
+        .map(|text| text.to_string())
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "it panicked".to_string())
+}
+
+/// A bounded probe that itself can fail: either failure is the reason.
+fn answered<T>(outcome: Result<Result<T, String>, String>) -> Result<T, String> {
+    outcome.and_then(|answer| answer)
 }
 
 fn env(name: &str) -> Option<String> {
@@ -621,31 +720,25 @@ pub(crate) fn gather() -> Facts {
         .map(str::to_string)
         .collect();
 
-    let portal = std::thread::spawn(|| timed_out(bounded(live::portal)));
-    let atspi = std::thread::spawn(|| timed_out(bounded(live::atspi)));
+    let portal = std::thread::spawn(|| answered(bounded(live::portal)));
+    let atspi = std::thread::spawn(|| answered(bounded(live::atspi)));
     let names = std::thread::spawn(|| bounded(live::input_method_names).unwrap_or_default());
     let insertion = std::thread::spawn(|| {
         bounded(|| {
             starling_insertion::Inserter::for_this_session()
                 .availability()
                 .into_iter()
-                .map(|(kind, availability)| {
-                    (
-                        kind.scheme().to_string(),
-                        availability.map_err(|err| err.message()),
-                    )
+                .map(|backend| InsertionFacts {
+                    scheme: backend.kind.scheme().to_string(),
+                    verifies_target: backend.verifies_target,
+                    availability: backend.availability.map_err(|err| err.message()),
                 })
                 .collect::<Vec<_>>()
         })
-        .unwrap_or_else(|| {
-            vec![(
-                "x11".to_string(),
-                Err(format!("no answer within {} s", PROBE_TIMEOUT.as_secs())),
-            )]
-        })
+        .unwrap_or_else(unknown_insertion)
     });
     let microphones = std::thread::spawn(|| {
-        timed_out(bounded(|| {
+        answered(bounded(|| {
             starling_dictation::microphone::list_input_devices().map(|devices| {
                 devices
                     .into_iter()
@@ -664,32 +757,33 @@ pub(crate) fn gather() -> Facts {
         bounded(move || live::portal_backends(&desktops)).unwrap_or_default()
     });
     let audio = bounded(live::audio);
+    let failed = || "the probe failed".to_string();
     Facts {
         portal_backends: backends.join().unwrap_or_default(),
         session,
-        portal: Some(
-            portal
-                .join()
-                .unwrap_or_else(|_| Err("the probe failed".to_string())),
-        ),
-        insertion: insertion.join().unwrap_or_default(),
-        atspi: Some(
-            atspi
-                .join()
-                .unwrap_or_else(|_| Err("the probe failed".to_string())),
-        ),
+        portal: Some(portal.join().unwrap_or_else(|_| Err(failed()))),
+        insertion: insertion
+            .join()
+            .unwrap_or_else(|_| unknown_insertion(failed())),
+        atspi: Some(atspi.join().unwrap_or_else(|_| Err(failed()))),
         input_methods: InputMethodFacts {
             ibus_running,
             fcitx_running,
             configured,
         },
-        audio,
-        microphones: Some(
-            microphones
-                .join()
-                .unwrap_or_else(|_| Err("the probe failed".to_string())),
-        ),
+        audio: Some(audio),
+        microphones: Some(microphones.join().unwrap_or_else(|_| Err(failed()))),
     }
+}
+
+/// The insertion probe gave no answer: which backends exist is unknown
+/// too, so none is named.
+fn unknown_insertion(reason: String) -> Vec<InsertionFacts> {
+    vec![InsertionFacts {
+        scheme: "unknown".to_string(),
+        verifies_target: false,
+        availability: Err(reason),
+    }]
 }
 
 #[cfg(target_os = "linux")]
@@ -886,7 +980,10 @@ impl StarlingApp {
         let facts = self.system_check.facts.as_ref()?;
         Some(evaluate(
             facts,
-            self.portal_shortcuts.as_ref().map(|portal| portal.status()),
+            ShortcutState {
+                registration: &self.shortcut_registration,
+                portal: self.portal_shortcuts.as_ref().map(|portal| portal.status()),
+            },
         ))
     }
 }
@@ -916,18 +1013,45 @@ mod tests {
                 implements_global_shortcuts: true,
                 used_here: true,
             }],
-            insertion: vec![("x11".to_string(), Ok(()))],
+            insertion: vec![x11("x11", Ok(()))],
             atspi: Some(Ok(())),
             input_methods: InputMethodFacts::default(),
-            audio: Some(AudioFacts {
+            audio: Some(Ok(AudioFacts {
                 pipewire: true,
                 pulse: true,
-            }),
+            })),
             microphones: Some(Ok(vec![
                 ("Built-in".to_string(), false),
                 ("USB mic".to_string(), true),
             ])),
         }
+    }
+
+    fn x11(name: &str, availability: Result<(), String>) -> InsertionFacts {
+        InsertionFacts {
+            scheme: name.to_string(),
+            verifies_target: true,
+            availability,
+        }
+    }
+
+    fn wl(availability: Result<(), String>) -> InsertionFacts {
+        InsertionFacts {
+            scheme: "wl".to_string(),
+            verifies_target: false,
+            availability,
+        }
+    }
+
+    /// The check with the X11 shortcut registered.
+    fn check(facts: &Facts, portal: Option<&PortalStatus>) -> Vec<CheckLine> {
+        evaluate(
+            facts,
+            ShortcutState {
+                registration: &Ok(()),
+                portal,
+            },
+        )
     }
 
     fn find<'a>(lines: &'a [CheckLine], topic: &str) -> &'a CheckLine {
@@ -940,7 +1064,7 @@ mod tests {
             trigger: Some("Meta+Space".to_string()),
             configurable: true,
         };
-        let lines = evaluate(&healthy_kde(), Some(&status));
+        let lines = check(&healthy_kde(), Some(&status));
         let shortcut = find(&lines, "System-wide shortcut");
         assert_eq!(shortcut.verdict, Verdict::Ok);
         assert!(
@@ -984,7 +1108,7 @@ mod tests {
                 used_here: false,
             },
         ];
-        let lines = evaluate(&facts, Some(&PortalStatus::Unavailable("x".into())));
+        let lines = check(&facts, Some(&PortalStatus::Unavailable("x".into())));
         let shortcut = find(&lines, "System-wide shortcut");
         assert_eq!(shortcut.verdict, Verdict::Limited);
         assert!(
@@ -1012,21 +1136,21 @@ mod tests {
             x11_display: true,
             desktop: Some("XFCE".to_string()),
         };
-        let lines = evaluate(&facts, None);
+        let lines = check(&facts, None);
         assert_eq!(find(&lines, "Session").summary, "X11 (XFCE).");
         assert_eq!(find(&lines, "System-wide shortcut").verdict, Verdict::Ok);
         assert_eq!(find(&lines, "Typing into other apps").verdict, Verdict::Ok);
 
         let mut facts = healthy_kde();
         facts.portal = Some(Err("xdg-desktop-portal does not answer".to_string()));
-        let shortcut = find(&evaluate(&facts, None), "System-wide shortcut").clone();
+        let shortcut = find(&check(&facts, None), "System-wide shortcut").clone();
         assert_eq!(shortcut.verdict, Verdict::Missing);
         assert!(shortcut.fix.unwrap().contains("xdg-desktop-portal-kde"));
     }
 
     #[test]
     fn a_portal_waiting_for_setup_points_at_the_button() {
-        let lines = evaluate(
+        let lines = check(
             &healthy_kde(),
             Some(&PortalStatus::NeedsSetup { configurable: true }),
         );
@@ -1045,22 +1169,149 @@ mod tests {
     fn wayland_without_xwayland_or_insertion_backends_says_so() {
         let mut facts = healthy_kde();
         facts.session = wayland("sway", false);
-        facts.insertion = vec![("x11".to_string(), Err("no X11 display".to_string()))];
-        let lines = evaluate(&facts, None);
+        facts.insertion = vec![
+            wl(Err(
+                "the compositor does not offer virtual keyboards".to_string()
+            )),
+            x11("x11", Err("no X11 display".to_string())),
+        ];
+        let lines = check(&facts, None);
         assert_eq!(find(&lines, "Session").verdict, Verdict::Limited);
         let typing = find(&lines, "Typing into other apps");
         assert_eq!(typing.verdict, Verdict::Missing);
-        assert!(typing.summary.contains("x11: no X11 display"));
-        assert!(typing.fix.as_deref().unwrap().contains("virtual-keyboard"));
+        assert!(
+            typing.summary.contains("x11: no X11 display"),
+            "{}",
+            typing.summary
+        );
+        assert!(typing.summary.contains("wl: the compositor does not offer"));
+        assert!(typing.fix.as_deref().unwrap().contains("virtual keyboards"));
+    }
+
+    #[test]
+    fn the_wayland_virtual_keyboard_is_reported_as_unverified_typing() {
+        let mut facts = healthy_kde();
+        facts.session = wayland("niri", true);
+        facts.insertion = vec![wl(Ok(())), x11("x11", Ok(()))];
+        let typing = find(&check(&facts, None), "Typing into other apps").clone();
+        assert_eq!(typing.verdict, Verdict::Limited);
+        assert!(
+            typing.summary.contains("virtual keyboard (wl)"),
+            "{}",
+            typing.summary
+        );
+        assert!(
+            typing
+                .fix
+                .unwrap()
+                .contains("Also type where the window cannot be checked")
+        );
+
+        // A compositor without it leaves X11 typing, and says why.
+        facts.insertion = vec![
+            wl(Err(
+                "the compositor does not offer virtual keyboards".to_string()
+            )),
+            x11("x11", Ok(())),
+        ];
+        let typing = find(&check(&facts, None), "Typing into other apps").clone();
+        assert_eq!(typing.verdict, Verdict::Limited);
+        assert!(
+            typing
+                .summary
+                .starts_with("X11 typing only (wl: the compositor")
+        );
+        assert!(typing.fix.unwrap().contains("not GNOME or KDE"));
+    }
+
+    #[test]
+    fn an_insertion_probe_without_an_answer_names_no_backend() {
+        let mut facts = healthy_kde();
+        facts.insertion = unknown_insertion("no answer within 3 s".to_string());
+        let typing = find(&check(&facts, None), "Typing into other apps").clone();
+        assert_eq!(typing.verdict, Verdict::Missing);
+        assert!(
+            typing.summary.contains("(unknown: no answer within 3 s)"),
+            "{}",
+            typing.summary
+        );
+        assert!(!typing.summary.contains("x11"));
+    }
+
+    #[test]
+    fn a_failed_x11_grab_is_reported() {
+        let mut facts = healthy_kde();
+        facts.session = SessionFacts {
+            session_type: Some("x11".to_string()),
+            wayland_display: false,
+            x11_display: true,
+            desktop: Some("XFCE".to_string()),
+        };
+        let failed = Err("F9 is taken by another app".to_string());
+        let lines = evaluate(
+            &facts,
+            ShortcutState {
+                registration: &failed,
+                portal: None,
+            },
+        );
+        let shortcut = find(&lines, "System-wide shortcut");
+        assert_eq!(shortcut.verdict, Verdict::Missing);
+        assert!(
+            shortcut.summary.contains("F9 is taken"),
+            "{}",
+            shortcut.summary
+        );
+        assert!(shortcut.fix.is_some());
+
+        // On Wayland it is the XWayland fallback that fails, short of a
+        // portal binding.
+        let lines = evaluate(
+            &healthy_kde(),
+            ShortcutState {
+                registration: &failed,
+                portal: Some(&PortalStatus::NeedsSetup { configurable: true }),
+            },
+        );
+        let shortcut = find(&lines, "System-wide shortcut");
+        assert_eq!(shortcut.verdict, Verdict::Missing);
+        assert!(
+            shortcut
+                .summary
+                .contains("X11 grab for XWayland apps failed")
+        );
+        let bound = PortalStatus::Bound {
+            trigger: None,
+            configurable: true,
+        };
+        let lines = evaluate(
+            &healthy_kde(),
+            ShortcutState {
+                registration: &failed,
+                portal: Some(&bound),
+            },
+        );
+        assert_eq!(find(&lines, "System-wide shortcut").verdict, Verdict::Ok);
+    }
+
+    #[test]
+    fn a_crashing_probe_is_an_error_not_a_timeout() {
+        let crashed = bounded(|| -> Result<(), String> { panic!("no bus") });
+        assert_eq!(crashed, Err("the probe failed: no bus".to_string()));
+        assert_eq!(answered(bounded(|| Ok::<_, String>(7))), Ok(7));
+        assert_eq!(
+            answered(bounded(|| Err::<(), _>("refused".to_string()))),
+            Err("refused".to_string())
+        );
     }
 
     #[test]
     fn missing_audio_microphones_and_atspi_carry_fixes() {
         let mut facts = healthy_kde();
-        facts.audio = Some(AudioFacts::default());
+        facts.audio = Some(Ok(AudioFacts::default()));
         facts.microphones = Some(Ok(Vec::new()));
         facts.atspi = Some(Err("org.a11y.Bus does not answer".to_string()));
-        let lines = evaluate(&facts, None);
+        let lines = check(&facts, None);
         let audio = find(&lines, "Sound server");
         assert_eq!(audio.verdict, Verdict::Missing);
         assert!(
@@ -1081,10 +1332,14 @@ mod tests {
     #[test]
     fn a_sound_server_that_never_answers_is_named() {
         let mut facts = healthy_kde();
-        facts.audio = None;
-        let audio = find(&evaluate(&facts, None), "Sound server").clone();
+        facts.audio = Some(Err("no answer within 3 s".to_string()));
+        let audio = find(&check(&facts, None), "Sound server").clone();
         assert_eq!(audio.verdict, Verdict::Missing);
-        assert!(audio.summary.contains("did not answer within 3 s"));
+        assert!(
+            audio.summary.contains("no answer within 3 s"),
+            "{}",
+            audio.summary
+        );
     }
 
     #[test]
@@ -1113,7 +1368,7 @@ mod tests {
             fcitx_running: false,
             configured: vec![("GTK_IM_MODULE".to_string(), "ibus".to_string())],
         };
-        let line = find(&evaluate(&facts, None), "Input method").clone();
+        let line = find(&check(&facts, None), "Input method").clone();
         assert_eq!(line.verdict, Verdict::Info);
         assert!(
             line.summary
@@ -1125,8 +1380,8 @@ mod tests {
     #[test]
     fn the_report_lists_every_line_with_its_fix() {
         let mut facts = healthy_kde();
-        facts.audio = Some(AudioFacts::default());
-        let text = report(&evaluate(&facts, None));
+        facts.audio = Some(Ok(AudioFacts::default()));
+        let text = report(&check(&facts, None));
         assert_eq!(text.lines().filter(|line| line.starts_with('[')).count(), 7);
         assert!(text.contains("[missing] Sound server: Neither PipeWire nor PulseAudio answers."));
         assert!(text.contains("        fix: Start the sound server"));
@@ -1153,7 +1408,7 @@ mod tests {
     fn live_check_of_this_session() {
         let started = std::time::Instant::now();
         let facts = gather();
-        eprintln!("{}", report(&evaluate(&facts, None)));
+        eprintln!("{}", report(&check(&facts, None)));
         eprintln!("gathered in {:?}", started.elapsed());
         assert!(started.elapsed() < PROBE_TIMEOUT * 2);
     }

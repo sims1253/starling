@@ -960,7 +960,7 @@ mod dbus {
             match opened {
                 Ok(mut worker) => {
                     let exit = worker.serve(&mut commands).await;
-                    worker.close_session().await;
+                    worker.close_session(PortalStatus::Starting).await;
                     match exit {
                         Exit::Done => return,
                         Exit::Restart => {
@@ -1169,10 +1169,12 @@ mod dbus {
                 Ok(()) => {}
             }
             // A binding the desktop remembers from an earlier run is
-            // re-bound now: the desktop shows no dialog for it. Anything
-            // else waits for the user to ask.
+            // re-bound now: the desktop shows no dialog for it. An entry
+            // without keys is a binding the user cleared (as in
+            // `ShortcutsChanged`); it, and anything else, waits for the
+            // user to ask.
             let remembered = match worker.list().await {
-                Ok(entries) => find_ours(&entries).is_some(),
+                Ok(entries) => matches!(find_ours(&entries), Some(Some(_))),
                 Err(reason) => {
                     eprintln!("Could not list the desktop's shortcuts for Starling ({reason}).");
                     false
@@ -1350,18 +1352,26 @@ mod dbus {
             }
         }
 
-        /// Close the live session (a rebind, or the app going away). A
-        /// shortcut held down through it is released.
-        async fn close_session(&mut self) {
+        /// Close the live session (a rebind, a portal restart, or the app
+        /// going away). A shortcut held down through it is released, and a
+        /// binding it held is unpublished as `unbound` at once, not after
+        /// the slow `Close` and whatever follows it: until then the other
+        /// sources would defer to a binding that no longer delivers.
+        async fn close_session(&mut self, unbound: PortalStatus) {
             let session = {
                 let mut live = lock(&self.live);
-                live.bound = false;
-                live.session.take()
+                let session = live.session.take();
+                if session.is_some() {
+                    let _ = self.out.send(PortalSignal::SessionEnded(Instant::now()));
+                }
+                if std::mem::take(&mut live.bound) {
+                    live.publish(&self.out, unbound);
+                }
+                session
             };
             let Some(session) = session else {
                 return;
             };
-            let _ = self.out.send(PortalSignal::SessionEnded(Instant::now()));
             let _ = tokio::time::timeout(
                 CALL_TIMEOUT,
                 self.connection.call_method(
@@ -1401,7 +1411,7 @@ mod dbus {
         /// published by the forwarder as the response arrives.
         async fn bind(&mut self) {
             if self.session().is_none() || self.bind_attempted {
-                self.close_session().await;
+                self.close_session(PortalStatus::Binding).await;
                 if let Err(reason) = self.create_session().await {
                     lock(&self.live).publish(
                         &self.out,
