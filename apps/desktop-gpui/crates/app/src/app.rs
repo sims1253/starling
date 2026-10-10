@@ -526,7 +526,8 @@ pub struct StarlingApp {
     pub(crate) delivery: crate::delivery::DeliveryState,
     pub(crate) draft_insertion: InsertionSettings,
     /// Whether this session types where the target cannot be verified
-    /// (Wayland's virtual keyboard), asked when the settings dialog opens.
+    /// (Wayland's virtual keyboard), asked in the background whenever the
+    /// settings dialog opens.
     pub(crate) insertion_unverifiable: bool,
     pub playing_id: Option<String>,
     /// Identifies the current playback so poll-watchers can detect that they
@@ -1740,7 +1741,20 @@ impl StarlingApp {
         });
         self.audio_upkeep.draft = self.audio_upkeep.settings;
         self.draft_insertion = self.delivery.settings;
-        self.insertion_unverifiable = self.delivery.inserter.session_verifies() == Some(false);
+        // A display round trip: off the UI thread, so a compositor that
+        // stopped answering cannot freeze the dialog.
+        let inserter = self.delivery.inserter.clone();
+        cx.spawn(async move |this, cx| {
+            let unverifiable = cx
+                .background_spawn(async move { inserter.session_verifies() == Some(false) })
+                .await;
+            this.update(cx, |app, cx| {
+                app.insertion_unverifiable = unverifiable;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
         cx.notify();
     }
 
