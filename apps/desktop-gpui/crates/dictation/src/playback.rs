@@ -127,9 +127,9 @@ enum Msg {
         epoch: u64,
     },
     Shutdown,
-    /// Answered once every earlier message is handled.
-    #[cfg(test)]
-    Flush(Sender<()>),
+    /// Answered once every earlier message is handled: whether nothing is
+    /// attenuated and no restore failed since the last take began.
+    Flush(Sender<bool>),
 }
 
 struct Shared {
@@ -199,14 +199,23 @@ impl PlaybackHandle {
         self.shared.state().notices.drain(..).collect()
     }
 
+    /// Answers once every request sent before it was handled, including
+    /// an `end`'s restore (retries and all), with whether playback is now
+    /// as the user left it: `false` while attenuated, and after a restore
+    /// that failed or left a changed volume alone, until the next take
+    /// begins (the user was told; what they fix by hand is theirs). The
+    /// start/stop cues (#221) wait on it so they are not played into a
+    /// lowered or muted output. Disconnects without an
+    /// answer once the service has shut down.
+    pub fn settled(&self) -> Receiver<bool> {
+        let (tx, rx) = mpsc::channel();
+        let _ = self.shared.tx.send(Msg::Flush(tx));
+        rx
+    }
+
     #[cfg(test)]
     fn flush(&self) {
-        let (tx, rx) = mpsc::channel();
-        self.shared
-            .tx
-            .send(Msg::Flush(tx))
-            .expect("service running");
-        rx.recv().expect("service flushed");
+        self.settled().recv().expect("service flushed");
     }
 }
 
@@ -228,6 +237,7 @@ impl PlaybackAttenuation {
             backend,
             shared: Arc::clone(&shared),
             attenuation: None,
+            restore_failed: false,
         };
         let thread = std::thread::Builder::new()
             .name("starling-playback-attenuation".to_string())
@@ -389,6 +399,10 @@ struct Worker {
     backend: Arc<dyn PlaybackBackend>,
     shared: Arc<Shared>,
     attenuation: Option<Attenuation>,
+    /// Since the last `begin`, a restore gave up with playback still
+    /// adjusted, or left a volume the user changed under our lowering
+    /// (some channel may still hold it).
+    restore_failed: bool,
 }
 
 impl Worker {
@@ -398,9 +412,8 @@ impl Worker {
                 Msg::Begin { epoch, settings } => self.begin(epoch, settings),
                 Msg::End { epoch } => self.end(epoch),
                 Msg::Shutdown => break,
-                #[cfg(test)]
                 Msg::Flush(done) => {
-                    let _ = done.send(());
+                    let _ = done.send(self.attenuation.is_none() && !self.restore_failed);
                 }
             }
         }
@@ -410,6 +423,7 @@ impl Worker {
     }
 
     fn begin(&mut self, epoch: u64, settings: PlaybackSettings) {
+        self.restore_failed = false;
         if settings.during_recording == PlaybackMode::Off {
             return;
         }
@@ -466,7 +480,7 @@ impl Worker {
         }
     }
 
-    fn restore(&self, mut attenuation: Attenuation) {
+    fn restore(&mut self, mut attenuation: Attenuation) {
         let device = attenuation.device.clone();
         let mut attempt = 1;
         loop {
@@ -483,6 +497,7 @@ impl Worker {
                     return;
                 }
                 Err(err) if attempt >= RESTORE_ATTEMPTS => {
+                    self.restore_failed = true;
                     self.shared.notice(
                         NoticeKind::RestoreFailed,
                         format!(
@@ -499,6 +514,7 @@ impl Worker {
             }
         }
         if attenuation.volume_stranded {
+            self.restore_failed = true;
             self.shared.notice(
                 NoticeKind::RestoreFailed,
                 format!(

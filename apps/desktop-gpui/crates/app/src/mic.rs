@@ -490,6 +490,8 @@ impl StarlingApp {
             return;
         }
         self.mic.shortcut_heard = None;
+        // A preview or stop cue still sounding would be heard as signal.
+        self.cue_take_starting();
         self.mic.check = Some(
             match recorder::start_capture(CaptureRequest {
                 journals_dir: None,

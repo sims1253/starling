@@ -25,8 +25,9 @@ use starling_dictation::{
     player::Player,
     recorder::RecorderHandle,
     settings::{
-        ActivationMode, DictationSettings, EngineMode, EngineSettings, MicrophoneSettings,
-        PlaybackMode, PlaybackSettings, ProcessingSettings, Settings, DEFAULT_SHORTCUT,
+        ActivationMode, DictationSettings, EngineMode, EngineSettings, FeedbackSettings,
+        MicrophoneSettings, OverlayMode, PlaybackMode, PlaybackSettings, ProcessingSettings,
+        Settings, DEFAULT_SHORTCUT,
     },
     storage::{DamagedRecord, ListedRecord, SessionSummary},
 };
@@ -509,6 +510,15 @@ pub struct StarlingApp {
     pub(crate) playback_settings: PlaybackSettings,
     pub(crate) playback: PlaybackAttenuation,
     pub(crate) playback_lease: Option<PlaybackLease>,
+    /// The overlay and start/stop cues (#221): the committed settings,
+    /// the overlay window, which cues may still play, and the dialog's
+    /// drafts.
+    pub(crate) feedback: FeedbackSettings,
+    pub(crate) overlay: crate::overlay::Overlay,
+    pub(crate) cue_gate: crate::cues::CueGate,
+    pub(crate) draft_overlay_mode: OverlayMode,
+    pub(crate) draft_cues: bool,
+    pub(crate) draft_cue_volume: Entity<crate::slider::LevelSlider>,
     pub playing_id: Option<String>,
     /// Identifies the current playback so poll-watchers can detect that they
     /// are stale (G04). Bumped whenever playback starts, stops, or is
@@ -1007,6 +1017,9 @@ impl StarlingApp {
             cx.new(|_| crate::slider::LevelSlider::new(settings.playback.lower_level_percent));
         // The level readout lives in the settings view.
         cx.observe(&draft_lower_level, |_, _, cx| cx.notify()).detach();
+        let draft_cue_volume =
+            cx.new(|_| crate::slider::LevelSlider::new(settings.feedback.cue_volume_percent));
+        cx.observe(&draft_cue_volume, |_, _, cx| cx.notify()).detach();
 
         Self {
             error: match (store_error.clone(), mode_note) {
@@ -1081,6 +1094,12 @@ impl StarlingApp {
             playback_settings: settings.playback,
             playback: PlaybackAttenuation::start(platform_backend()),
             playback_lease: None,
+            feedback: settings.feedback,
+            overlay: crate::overlay::Overlay::new(Instant::now()),
+            cue_gate: crate::cues::CueGate::default(),
+            draft_overlay_mode: settings.feedback.overlay,
+            draft_cues: settings.feedback.cues,
+            draft_cue_volume,
             shortcut,
             pending_shortcut: None,
             window_focus: Vec::new(),
@@ -1299,6 +1318,7 @@ impl StarlingApp {
             dictation: self.dictation_settings.clone(),
             microphone: self.microphone_settings.clone(),
             playback: self.playback_settings,
+            feedback: self.feedback,
         };
         settings.set_expected_terms_input(&self.expected_terms_input);
         settings
@@ -1688,6 +1708,11 @@ impl StarlingApp {
         self.draft_lower_level.update(cx, |slider, cx| {
             slider.set_value(self.playback_settings.lower_level_percent, cx);
         });
+        self.draft_overlay_mode = self.feedback.overlay;
+        self.draft_cues = self.feedback.cues;
+        self.draft_cue_volume.update(cx, |slider, cx| {
+            slider.set_value(self.feedback.cue_volume_percent, cx);
+        });
         cx.notify();
     }
 
@@ -1906,6 +1931,13 @@ impl StarlingApp {
             during_recording: self.draft_playback_mode,
             lower_level_percent: self.draft_lower_level.read(cx).value(),
         };
+        // The overlay follows at once; cues from the next cue on.
+        self.feedback = FeedbackSettings {
+            overlay: self.draft_overlay_mode,
+            cues: self.draft_cues,
+            cue_volume_percent: self.draft_cue_volume.read(cx).value(),
+        };
+        self.sync_overlay(cx);
 
         // R11: an unresolvable config directory is surfaced, not swallowed —
         // settings must not silently land in the current working directory.
@@ -2466,6 +2498,8 @@ impl Render for StarlingApp {
             }
         }
 
+        // The overlay is placed in this window's scale (#221).
+        self.overlay.scale = window.scale_factor();
         let mut staged_partial = None;
         if let Some(handle) = self.recorder.as_mut() {
             if let Some(stream) = self.live_stream.as_ref() {

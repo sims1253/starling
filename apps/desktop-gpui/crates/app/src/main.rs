@@ -3,10 +3,12 @@
 mod activation;
 mod app;
 mod assets;
+mod cues;
 mod editor;
 mod input;
 mod live_stream;
 mod mic;
+mod overlay;
 mod processing;
 mod shortcut;
 mod slider;
@@ -73,7 +75,17 @@ fn main() {
             // of engine shutdown; the server's --parent-pid watchdog is
             // the crash backstop). Process-lifetime hook: forgotten on
             // purpose.
-            std::mem::forget(cx.on_window_closed(|cx| cx.quit()));
+            // The dictation overlay (#221) is a window too: only the main
+            // window going away quits.
+            std::mem::forget(cx.on_window_closed(|cx| {
+                if cx
+                    .windows()
+                    .into_iter()
+                    .all(overlay::Overlay::is_overlay_window)
+                {
+                    cx.quit();
+                }
+            }));
 
             match window {
                 Ok(handle) => {

@@ -5699,6 +5699,7 @@ dependencies = [
  "futures-util",
  "global-hotkey",
  "gpui",
+ "raw-window-handle",
  "serde",
  "serde_json",
  "starling-dictation",
@@ -5707,6 +5708,8 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "unicode-segmentation",
+ "windows 0.61.3",
+ "x11rb",
 ]
 
 [[package]]
