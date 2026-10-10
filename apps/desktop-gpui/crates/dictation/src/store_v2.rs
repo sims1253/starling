@@ -2149,7 +2149,8 @@ impl StoreV2 {
     /// the files `keep` gives a reason for are left in place; once `stop`
     /// says so, nothing more is removed and the report says stopped).
     ///
-    /// Per file, `stop`, `keep` and the stamp run under the database's
+    /// Per file, `stop` (before and after `keep`), `keep` and the stamp
+    /// run under the database's
     /// write lock, so no other connection deletes, compresses or retires
     /// a take between the decision and the removal. The ordering is
     /// **stamp, then unlink**: the `tombstones` UPSERT (retention
@@ -2233,6 +2234,11 @@ impl StoreV2 {
             if let Some(reason) = keep(self, &path) {
                 report.retained.push((name, reason.to_string()));
                 continue;
+            }
+            // The proof reads audio: a take may have started meanwhile.
+            if stop() {
+                report.stopped = true;
+                break;
             }
             let bytes = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
             let id = path

@@ -1031,3 +1031,37 @@ fn a_stopped_sweep_removes_nothing_more() {
     assert_eq!(report.swept.len(), 1, "{report:?}");
     assert!(quarantine.join("c_b.sj").exists());
 }
+
+#[test]
+fn a_take_starting_during_the_proof_stops_the_sweep() {
+    let dir = TempDir::new().expect("tempdir");
+    let mut store = store_in(&dir);
+    let tree = journals(&dir);
+    let samples = ramp(4_800, 5);
+    let path = {
+        let mut writer =
+            JournalWriter::create_named(&tree, "j_proof".to_string(), 16_000).expect("writer");
+        writer.append_frames(&samples).expect("append");
+        writer.finalize().expect("finalize");
+        writer.path().to_path_buf()
+    };
+    store.adopt_journal(&path, None).expect("adopt");
+    std::fs::copy(store.audio_path("j_proof"), &path).expect("name comes back");
+    age(&path, old());
+    let report = store.recover_capture_journals(&tree).expect("scan");
+    assert_eq!(report.superseded, vec!["j_proof".to_string()], "{report:?}");
+
+    // Asked once before the proof (not yet), once after it (recording).
+    let asked = std::cell::Cell::new(0);
+    let report = store
+        .sweep_retention_until(|| {
+            asked.set(asked.get() + 1);
+            asked.get() > 1
+        })
+        .expect("sweep");
+    assert_eq!(asked.get(), 2);
+    assert!(report.stopped && report.swept.is_empty(), "{report:?}");
+    assert!(tree.join(SUPERSEDED_SUBDIR).join("j_proof.sj").exists());
+    // Proven, so the next sweep removes it.
+    assert_eq!(store.sweep_retention().expect("sweep").swept.len(), 1);
+}
