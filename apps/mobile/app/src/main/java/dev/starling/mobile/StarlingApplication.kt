@@ -135,7 +135,7 @@ class StarlingApplication : Application() {
             PcmSource.debugSource = ::debugTestMicrophone
             FreeSpaceProbe.debugOverride = FreeSpaceProbe { directory -> debugFreeSpace() ?: FreeSpaceProbe.SYSTEM.availableBytes(directory) }
             StreamDebug.cadence = ::debugStreamCadence
-            StreamDebug.traceSink = { trace -> if (File(filesDir, "debug/stream-trace").exists()) debugWriteTrace(trace) }
+            StreamDebug.traceSink = { if (File(filesDir, "debug/stream-trace").exists()) ::debugWriteTrace else null }
         }
         scheduleAudioUpkeep()
     }
@@ -178,9 +178,10 @@ class StarlingApplication : Application() {
      * low-space warning, refusal and in-take stop can be driven;
      * `files/debug/stream-cadence` holding "<min> <interval>" (seconds)
      * overrides the on-device preview cadence, and while
-     * `files/debug/stream-trace` exists every on-device live session writes
-     * its call ledger to `files/debug/stream-traces/` (#226/#357). Release
-     * builds never read them.
+     * `files/debug/stream-trace` exists every on-device live session that
+     * starts records and writes its call ledger to `files/debug/stream-traces/`
+     * (#226/#357; checked per session, so removing it stops tracing from the
+     * next take on). Release builds never read them.
      */
     private fun debugTestMicrophone(): PcmSource? =
         File(filesDir, "debug/test-mic.wav").takeIf(File::isFile)?.let(LoopingWavSource::fromWav)

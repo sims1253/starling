@@ -32,6 +32,11 @@ Android-specific differences, all recorded in the result:
         --repeats 3 --min 1.0 --interval 1.0 --label pixel-1s1s \\
         --out runs/pixel-1s1s.json
 
+Each result records the installed app's build (versionName/versionCode,
+the APK's SHA-256, the ``BuildConfig.GIT_SHA`` it was built from, and the
+active model every take ran on); ``merge`` refuses parts of different
+builds.
+
 Needs the debug app and its test APK installed (``connectedDebugAndroidTest``
 installs both; or ``adb install`` the two APKs) with an on-device model
 imported, and ``adb`` on PATH (``ANDROID_SERIAL`` picks the phone).
@@ -72,6 +77,39 @@ def adb(*args: str, timeout: float = 120.0, binary: bool = False):
 
 def run_as(*cmd: str, timeout: float = 120.0) -> str:
     return adb("shell", "run-as", PACKAGE, *cmd, timeout=timeout)
+
+
+def parse_package_info(dumpsys: str) -> dict:
+    """versionName/versionCode of the installed app from ``dumpsys package``."""
+    name = re.search(r"^\s*versionName=(\S+)", dumpsys, re.M)
+    code = re.search(r"^\s*versionCode=(\d+)", dumpsys, re.M)
+    return {"version_name": name.group(1) if name else None,
+            "version_code": int(code.group(1)) if code else None}
+
+
+def parse_apk_path(pm_path: str) -> str | None:
+    """The base APK from ``pm path`` (split APKs list it first as base.apk)."""
+    paths = re.findall(r"^package:(\S+)$", pm_path, re.M)
+    return next((p for p in paths if p.endswith("/base.apk")), paths[0] if paths else None)
+
+
+def app_identity() -> dict:
+    """The installed debug app's version and APK hash (the build that is measured)."""
+    info = parse_package_info(adb("shell", "dumpsys", "package", PACKAGE))
+    apk = parse_apk_path(adb("shell", "pm", "path", PACKAGE))
+    digest = adb("shell", "sha256sum", apk).split()[0] if apk else None
+    return dict(info, apk_sha256=digest)
+
+
+def trace_identity(runs: list[dict]) -> dict:
+    """The build revision and model the device test recorded in every trace; one of each."""
+    out = {}
+    for key, field in (("git_sha", "app_git_sha"), ("model", "model")):
+        values = {r.get(field) for r in runs}
+        if len(values) > 1:
+            raise RunnerError(f"takes ran on different {key}s: {sorted(map(str, values))}")
+        out[key] = values.pop() if values else None
+    return out
 
 
 def thermal_snapshot() -> dict:
@@ -153,7 +191,7 @@ def run_metrics(log: dict, take: dict) -> dict:
     duration = log["samples"] / 16000.0
     m.update({
         "take": marks.get("take"), "repeat": marks.get("repeat"), "state": marks.get("state"),
-        "model": marks.get("model"),
+        "model": marks.get("model"), "app_git_sha": marks.get("app_git_sha"),
         "finish_to_final_ms": None if not finals or finish_at is None
         else round((finals[-1] - finish_at) * 1000.0, 1),
         "stop_to_delivered_ms": round((marks["delivered"] - marks["stop_pressed"]) * 1000.0, 1)
@@ -214,6 +252,7 @@ def run(args: argparse.Namespace) -> dict:
             raise RunnerError(f"{name}: WAV does not match the workload manifest")
     push_workload(args.workload, manifest, takes)
     run_as("rm", "-rf", f"files/debug/stream-runs/{args.label}")
+    app = app_identity()
     device = {k: adb("shell", "getprop", p).strip() for k, p in (
         ("model", "ro.product.model"), ("fingerprint", "ro.build.fingerprint"),
         ("soc", "ro.soc.model"))}
@@ -248,7 +287,9 @@ def run(args: argparse.Namespace) -> dict:
         "version": RESULT_VERSION,
         "label": args.label,
         "provenance": {
+            # The host checkout; "app" is the build that was measured.
             "repo_revision": _git(REPO, "rev-parse", "HEAD"),
+            "app": dict(app, **trace_identity(runs)),
             "client": "android-on-device",
             "device": device,
             "model": args.model,
@@ -264,7 +305,7 @@ def run(args: argparse.Namespace) -> dict:
 
 def merge(label: str, parts: list[dict]) -> dict:
     """One result from per-repeat results of the same configuration (interleaved runs)."""
-    keys = ("client", "device", "model", "cadence", "warmup", "batch", "cool_to_c",
+    keys = ("client", "device", "app", "model", "cadence", "warmup", "batch", "cool_to_c",
             "workload_manifest_sha256")
     first = parts[0]["provenance"]
     for p in parts:

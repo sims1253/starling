@@ -389,7 +389,12 @@ class OnDeviceStreamSessionTest {
      * audio it covered) and whose previews run [preview] with the session's
      * cancel predicate, as a native call polling its checkpoints would.
      */
+    /**
+     * Previews come from [preview]; with [tracksLoads] the engine reports
+     * [generation] as its load and stamps previews that do not name one.
+     */
     private class PreviewEngine(
+        private val tracksLoads: Boolean = true,
         private val preview: (cancel: () -> Boolean) -> OnDeviceStreamSession.WindowResult,
     ) : OnDeviceStreamSession.LiveEngine {
         val windows = CopyOnWriteArrayList<Int>()
@@ -397,11 +402,12 @@ class OnDeviceStreamSessionTest {
         val previewStarted = java.util.concurrent.Semaphore(0)
 
         @Volatile
-        var generation = 0L
+        var generation = 1L
 
         override fun prepare(cancelled: () -> Boolean): String? = null
 
-        override fun loadGeneration(): Long = generation
+        override fun loadGeneration(): Long =
+            if (tracksLoads) generation else OnDeviceStreamSession.LiveEngine.UNKNOWN_GENERATION
 
         override fun transcribeWindow(samples: FloatArray): OnDeviceStreamSession.WindowResult {
             windows += samples.size
@@ -411,7 +417,14 @@ class OnDeviceStreamSessionTest {
         override fun transcribePreview(samples: FloatArray, cancel: () -> Boolean): OnDeviceStreamSession.WindowResult {
             previews += samples.size
             previewStarted.release()
-            return preview(cancel)
+            val result = preview(cancel)
+            val unstamped = result is OnDeviceStreamSession.WindowResult.Text &&
+                result.generation == OnDeviceStreamSession.LiveEngine.UNKNOWN_GENERATION
+            return if (tracksLoads && unstamped) {
+                (result as OnDeviceStreamSession.WindowResult.Text).copy(generation = generation)
+            } else {
+                result
+            }
         }
     }
 
@@ -439,7 +452,7 @@ class OnDeviceStreamSessionTest {
 
     @Test
     fun stopDuringAPreviewCancelsItAndTheFlushCoversTheNewerAudio() {
-        val engine = PreviewEngine(::untilCancelled)
+        val engine = PreviewEngine(preview = ::untilCancelled)
         val trace = StreamTrace()
         val session = tracedSession(engine, trace)
         val second = pcm(1.0)
@@ -583,6 +596,31 @@ class OnDeviceStreamSessionTest {
 
         // A driver failure elsewhere reloaded the engine before Stop.
         engine.generation = 2
+        assertEquals(CommitOutcome.Final("n16000"), session.finish())
+        assertEquals(listOf(16_000), engine.windows)
+    }
+
+    @Test
+    fun anEngineThatDoesNotTrackItsLoadsNeverReusesAPreview() {
+        val engine = PreviewEngine(tracksLoads = false) { OnDeviceStreamSession.WindowResult.Text("p") }
+        val session = tracedSession(engine, StreamTrace())
+        val second = pcm(1.0)
+        session.onAudio(second, second.size)
+        awaitEvent { it == StreamEvent.Partial("p") }
+
+        assertEquals(CommitOutcome.Final("n16000"), session.finish())
+        assertEquals(listOf(16_000), engine.windows)
+    }
+
+    @Test
+    fun unknownGenerationsOnBothSidesAreNotTheSameLoad() {
+        val engine = PreviewEngine { OnDeviceStreamSession.WindowResult.Text("p") }
+        engine.generation = OnDeviceStreamSession.LiveEngine.UNKNOWN_GENERATION
+        val session = tracedSession(engine, StreamTrace())
+        val second = pcm(1.0)
+        session.onAudio(second, second.size)
+        awaitEvent { it == StreamEvent.Partial("p") }
+
         assertEquals(CommitOutcome.Final("n16000"), session.finish())
         assertEquals(listOf(16_000), engine.windows)
     }

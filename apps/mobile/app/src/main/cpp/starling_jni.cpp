@@ -94,7 +94,11 @@ Java_dev_starling_mobile_engine_StarlingNative_transcribeCancellable(
   jmethodID requested = env->GetMethodID(type, "requested", "()Z");
   env->DeleteLocalRef(type);
   if (requested == nullptr) {
-    return nullptr;  // NoSuchMethodError is pending for the caller.
+    // Like a predicate that throws: clear the NoSuchMethodError and run
+    // without checkpoints, so the call fails or succeeds on its own terms
+    // (the session discards a preview that completes after it was dropped).
+    env->ExceptionClear();
+    return transcribe(env, handle, samples, sample_rate);
   }
   JavaCancel state{env, cancel, requested};
   starling::ggml::CallAbortScope scope(javaCancelRequested, &state);

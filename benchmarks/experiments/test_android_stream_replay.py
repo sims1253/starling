@@ -38,6 +38,7 @@ def _trace(provenance="LIVE_STREAM", final=True):
             "commits": [104.2], "busy_commit_retries": 0, "samples": 64000,
             "prepare_ms": 3.0, "fallback": None if final else "engine failed",
             "marks": {"take": "short", "repeat": 0, "state": "warm", "model": "m.gguf",
+                      "app_git_sha": "abc123",
                       "stop_pressed": 104.0, "delivered": 105.3,
                       "final_provenance": provenance, "batch_text": "hello there you",
                       "app_cpu_s": 6.0,
@@ -79,7 +80,9 @@ class MergeTest(unittest.TestCase):
         base = {"client": "android-on-device", "device": {"model": "Pixel 10 Pro"}, "model": "m.gguf",
                 "cadence": {"min_partial_seconds": 1.0, "partial_interval_seconds": 1.0},
                 "warmup": True, "batch": True, "cool_to_c": 33.0, "workload_manifest_sha256": "x",
-                "repo_revision": "r", "repeats": [{"repeat": 0}]}
+                "repo_revision": "r", "repeats": [{"repeat": 0}],
+                "app": {"version_name": "0.1.0", "version_code": 1, "apk_sha256": "a",
+                        "git_sha": "g", "model": "m.gguf"}}
         base.update(provenance)
         run = asr.run_metrics(_trace(), {"reference": "hello there you"})
         return {"label": label, "provenance": base, "runs": [run]}
@@ -94,9 +97,43 @@ class MergeTest(unittest.TestCase):
             asr.merge("all", [self._part("a", repeats=[{"repeat": 0}, {"repeat": 1}]), self._part("b")])
 
     def test_parts_from_another_device_or_batch_setting_are_refused(self):
-        for change in ({"device": {"model": "Pixel 8"}}, {"batch": False}):
+        other_build = dict(self._part("x")["provenance"]["app"], apk_sha256="b")
+        for change in ({"device": {"model": "Pixel 8"}}, {"batch": False}, {"app": other_build}):
             with self.assertRaises(asr.RunnerError):
                 asr.merge("all", [self._part("a"), self._part("b", **change)])
+
+
+DUMPSYS_PACKAGE = """\
+Packages:
+  Package [dev.starling.mobile.debug] (7a1b2c3):
+    appId=10321
+    pkg=Package{4d5e6f dev.starling.mobile.debug}
+    versionCode=1 minSdk=26 targetSdk=35
+    minExtensionVersions=[]
+    versionName=0.1.0
+    flags=[ DEBUGGABLE HAS_CODE ALLOW_CLEAR_USER_DATA ]
+"""
+
+
+class AppIdentityTest(unittest.TestCase):
+    def test_version_from_dumpsys_package(self):
+        self.assertEqual(asr.parse_package_info(DUMPSYS_PACKAGE),
+                         {"version_name": "0.1.0", "version_code": 1})
+        self.assertEqual(asr.parse_package_info("Unable to find package"),
+                         {"version_name": None, "version_code": None})
+
+    def test_base_apk_from_pm_path(self):
+        out = ("package:/data/app/~~x==/dev.starling.mobile.debug-y==/split_config.arm64_v8a.apk\n"
+               "package:/data/app/~~x==/dev.starling.mobile.debug-y==/base.apk\n")
+        self.assertEqual(asr.parse_apk_path(out), "/data/app/~~x==/dev.starling.mobile.debug-y==/base.apk")
+        self.assertEqual(asr.parse_apk_path("package:/data/app/a/app.apk\n"), "/data/app/a/app.apk")
+        self.assertIsNone(asr.parse_apk_path(""))
+
+    def test_trace_identity_comes_from_the_takes(self):
+        run = asr.run_metrics(_trace(), {"reference": "hello there you"})
+        self.assertEqual(asr.trace_identity([run, run]), {"git_sha": "abc123", "model": "m.gguf"})
+        with self.assertRaises(asr.RunnerError):
+            asr.trace_identity([run, dict(run, app_git_sha="def456")])
 
 
 if __name__ == "__main__":

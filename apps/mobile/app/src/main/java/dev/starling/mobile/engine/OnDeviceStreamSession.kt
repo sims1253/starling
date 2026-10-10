@@ -70,9 +70,10 @@ class OnDeviceStreamSession(
         /**
          * Identifies the engine's current model load; [WindowResult.Text.generation]
          * names the load that produced a result. Results of an earlier load
-         * are never reused.
+         * are never reused, and neither is anything while either side is
+         * [UNKNOWN_GENERATION] (an engine that does not track its loads).
          */
-        fun loadGeneration(): Long = 0L
+        fun loadGeneration(): Long = UNKNOWN_GENERATION
 
         /** The model a successful [prepare] pinned to this session, for the transcript's record. */
         fun loadedModelName(): String? = null
@@ -83,6 +84,11 @@ class OnDeviceStreamSession(
          */
         fun liveSessionStarted() = Unit
         fun liveSessionEnded(prepared: Boolean) = Unit
+
+        companion object {
+            /** No known model load: a preview stamped with it is never reused. */
+            const val UNKNOWN_GENERATION = Long.MIN_VALUE
+        }
     }
 
     sealed interface WindowResult {
@@ -90,7 +96,11 @@ class OnDeviceStreamSession(
          * [model]: the model that transcribed this window, when the engine
          * knows it; [generation]: the engine load that produced it ([LiveEngine.loadGeneration]).
          */
-        data class Text(val text: String, val model: String? = null, val generation: Long = 0L) : WindowResult
+        data class Text(
+            val text: String,
+            val model: String? = null,
+            val generation: Long = LiveEngine.UNKNOWN_GENERATION,
+        ) : WindowResult
         data class Failed(val reason: String) : WindowResult
 
         /** A preview stopped because the session no longer needed it; not a failure. */
@@ -289,7 +299,7 @@ class OnDeviceStreamSession(
         // Whether the last step's preview was preempted (see [previewObsolete]).
         var preempted = false
         // The engine load that produced the last successful preview.
-        var previewGeneration = Long.MIN_VALUE
+        var previewGeneration = LiveEngine.UNKNOWN_GENERATION
         val tx = ChunkStreamer.Transcriber { samples, start, length, kind ->
             // The snapshot is exactly the live tail, so a window that spans all
             // of it (every flush, most partials) is passed without a copy.
@@ -368,8 +378,10 @@ class OnDeviceStreamSession(
                 val tailStart = snapshotBase + streamer.boundary
                 // The streamer's last preview is reusable only if the model
                 // that made it is still the loaded one (a driver failure
-                // elsewhere can reload the engine mid-take).
-                val sameEngine = runCatching { engine.loadGeneration() }.getOrNull() == previewGeneration
+                // elsewhere can reload the engine mid-take); an engine that
+                // does not track its loads never gets the reuse.
+                val sameEngine = previewGeneration != LiveEngine.UNKNOWN_GENERATION &&
+                    runCatching { engine.loadGeneration() }.getOrNull() == previewGeneration
                 val text = streamer.flush(snapshot, snapshotSize, tx, reuseTail = sameEngine)
                 if (streamer.flushReusedTail) {
                     val now = clock()

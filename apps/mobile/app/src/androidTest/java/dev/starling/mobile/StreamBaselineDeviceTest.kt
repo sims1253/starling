@@ -81,9 +81,11 @@ class StreamBaselineDeviceTest {
         val traced = AtomicReference<StreamTrace?>()
         val traceDone = AtomicReference(CountDownLatch(1))
         StreamDebug.cadence = { min to interval }
-        StreamDebug.traceSink = { trace ->
-            traced.set(trace)
-            traceDone.get().countDown()
+        StreamDebug.traceSink = {
+            { trace ->
+                traced.set(trace)
+                traceDone.get().countDown()
+            }
         }
         val previousSource = PcmSource.debugSource
         // Recording keeps the CPU awake in real use (AudioRecord is active);
@@ -126,6 +128,7 @@ class StreamBaselineDeviceTest {
                 trace.mark("label", label)
                 trace.mark("state", state)
                 trace.mark("model", model)
+                trace.mark("app_git_sha", BuildConfig.GIT_SHA)
                 trace.mark("stop_pressed", run.stopPressed)
                 trace.mark("delivered", run.delivered)
                 trace.mark("final_status", run.recording.status.name)
