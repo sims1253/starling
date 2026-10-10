@@ -107,8 +107,11 @@ use crate::storage::{is_safe_path_component, iso_utc, now_iso};
 /// (#294: per-job processing latency, recorded for Insights #308); v4
 /// added `correction_records` and `captures.secure_field`; v5 added
 /// `journal_supersessions` (#356); v6 added `transcription_intents` and
-/// `audio_holds` (#220).
-pub const SCHEMA_VERSION: u32 = 6;
+/// `audio_holds` (#220); v7 added `pending_intents` and `recovery_seals`
+/// (#220: a take's transcription intent survives a crash between its
+/// audio's promotion and its metadata commit, and a journal recovery
+/// sealed never reads as complete).
+pub const SCHEMA_VERSION: u32 = 7;
 
 /// WAL checkpoint policy (D11): run `PRAGMA wal_checkpoint(PASSIVE)` after
 /// every N metadata commits. Default 64 — frequent enough that the WAL
@@ -338,6 +341,14 @@ CREATE TABLE IF NOT EXISTS audio_holds (
     capture_id  TEXT NOT NULL REFERENCES captures(id) ON DELETE CASCADE,
     holder_pid  INTEGER NOT NULL,
     created_utc TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS pending_intents (
+    capture_id  TEXT PRIMARY KEY,
+    created_utc TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS recovery_seals (
+    journal_id TEXT PRIMARY KEY,
+    sealed_utc TEXT NOT NULL
 );
 ";
 
@@ -1079,6 +1090,54 @@ impl StoreV2 {
         self.commit_capture_superseding(record, None, false)
     }
 
+    /// Notes, before capture `id`'s audio moves into `audio/`, that its
+    /// commit carries the intent to transcribe it: reconcile adopts a take
+    /// whose commit a crash cut off with that intent (#220). The commit
+    /// clears it.
+    fn note_pending_intent(&self, id: &str) -> Result<(), StoreV2Error> {
+        self.conn.execute(
+            "INSERT INTO pending_intents(capture_id, created_utc) VALUES (?1, ?2)
+             ON CONFLICT(capture_id) DO NOTHING",
+            params![id, now_iso()],
+        )?;
+        Ok(())
+    }
+
+    fn pending_intent(&self, id: &str) -> Result<bool, StoreV2Error> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT 1 FROM pending_intents WHERE capture_id = ?1",
+                params![id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    /// Notes that recovery sealed journal `journal_id` (it was cut short),
+    /// before it does: once sealed it looks like a take that stopped.
+    fn note_recovery_seal(&self, journal_id: &str) -> Result<(), StoreV2Error> {
+        self.conn.execute(
+            "INSERT INTO recovery_seals(journal_id, sealed_utc) VALUES (?1, ?2)
+             ON CONFLICT(journal_id) DO NOTHING",
+            params![journal_id, now_iso()],
+        )?;
+        Ok(())
+    }
+
+    fn recovery_sealed(&self, journal_id: &str) -> Result<bool, StoreV2Error> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT 1 FROM recovery_seals WHERE journal_id = ?1",
+                params![journal_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
     /// [`Self::commit_capture`] that also records, in the same
     /// transaction, the recorder journal the take is stored in place of
     /// ([`TakeMeta::supersedes_journal`]) and, when `transcribe` (the
@@ -1126,6 +1185,10 @@ impl StoreV2 {
                 params![record.id, now_iso()],
             )?;
         }
+        tx.execute(
+            "DELETE FROM pending_intents WHERE capture_id = ?1",
+            params![record.id],
+        )?;
         tx.commit()?;
 
         self.commits_since_checkpoint += 1;
@@ -3082,7 +3145,12 @@ impl StoreV2 {
                         extra_json: Some(merge_extra_note(None, &note)),
                         ..record
                     };
-                    self.commit_capture(&record)?;
+                    // A complete take whose commit was to carry the intent
+                    // to transcribe it still does (#220).
+                    let transcribe = parsed.finalized
+                        && torn_tail_bytes == 0
+                        && self.pending_intent(&id)?;
+                    self.commit_capture_superseding(&record, None, transcribe)?;
                 }
             }
             report.recovered_torn.push(RecoveredTake {
@@ -3204,6 +3272,27 @@ impl StoreV2 {
             report.marked_interrupted.push(id);
         }
 
+        if !client_mode {
+            // A noted intent whose take is stored, or whose audio exists
+            // nowhere (its save failed before the move), is done with.
+            let pending: Vec<String> = {
+                let mut stmt = self.conn.prepare("SELECT capture_id FROM pending_intents")?;
+                let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+                rows.collect::<Result<_, _>>()?
+            };
+            for id in pending {
+                let stored = self.get_capture(&id)?.is_some();
+                let audio = is_safe_path_component(&id)
+                    && (self.audio_path(&id).exists() || self.staging_path(&id).exists());
+                if stored || !audio {
+                    self.conn.execute(
+                        "DELETE FROM pending_intents WHERE capture_id = ?1",
+                        params![id],
+                    )?;
+                }
+            }
+        }
+
         Ok(report)
     }
 
@@ -3279,7 +3368,12 @@ impl StoreV2 {
             // The take's marker never reached disk: exclude it.
             secure_field: true,
         };
-        self.commit_capture(&record)?;
+        // A complete take whose commit was to carry the intent to
+        // transcribe it still does (#220): the row was written before its
+        // audio moved here.
+        let transcribe =
+            parsed.finalized && parsed.torn_tail_bytes == 0 && self.pending_intent(&id)?;
+        self.commit_capture_superseding(&record, None, transcribe)?;
         report.orphan_sessions.push(id);
         Ok(false)
     }
@@ -3911,12 +4005,26 @@ impl StoreV2 {
         // An unsealed or torn journal is sealed to its verified prefix
         // first (idempotent), so audio/ only ever holds trailer-valid
         // files. The discarded tail — if any — is recorded as the gap.
+        // That it was sealed here is recorded first: a pass that dies
+        // before the adoption commits leaves a sealed journal that must
+        // still read as cut short, never as a take that stopped (#220).
+        let source_id = source
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or_default()
+            .to_string();
         let torn_tail_bytes = parsed.torn_tail_bytes;
-        let was_finalized = parsed.finalized;
-        if !was_finalized || torn_tail_bytes > 0 {
+        let was_finalized = parsed.finalized && !self.recovery_sealed(&source_id)?;
+        if !parsed.finalized || torn_tail_bytes > 0 {
+            self.note_recovery_seal(&source_id)?;
             seal_recovered_journal(source, &parsed)?;
             parsed.finalized = true;
             parsed.torn_tail_bytes = 0;
+        }
+        let complete = was_finalized && torn_tail_bytes == 0;
+        let transcribe = transcribe && complete;
+        if transcribe {
+            self.note_pending_intent(&id)?;
         }
 
         std::fs::create_dir_all(self.root.join(AUDIO_DIR))?;
@@ -3955,8 +4063,13 @@ impl StoreV2 {
             extra_json: (!note.is_empty()).then(|| merge_extra_note(None, &note)),
             secure_field: false,
         };
-        let complete = was_finalized && torn_tail_bytes == 0;
-        self.commit_capture_superseding(&record, None, transcribe && complete)?;
+        self.commit_capture_superseding(&record, None, transcribe)?;
+        if !source_id.is_empty() {
+            self.conn.execute(
+                "DELETE FROM recovery_seals WHERE journal_id = ?1",
+                params![source_id],
+            )?;
+        }
         Ok(record)
     }
 
@@ -5213,7 +5326,6 @@ impl FinalizedTake {
         store: &mut StoreV2,
         mark: CommitMark,
     ) -> Result<CommittedTake, StoreV2Error> {
-        store.promote_from_staging(&self.id)?;
         let (status, extra_json) = match mark {
             CommitMark::Complete => (CaptureStatus::Complete, self.meta.extra_json),
             CommitMark::Interrupted { note } => (
@@ -5221,6 +5333,14 @@ impl FinalizedTake {
                 Some(merge_extra_note(self.meta.extra_json.as_deref(), &note)),
             ),
         };
+        // Only a complete take is transcribed by itself: a salvaged one
+        // waits for the user. The intent is noted before the audio moves,
+        // so a crash before the commit below cannot lose it (#220).
+        let transcribe = self.meta.transcribe && status == CaptureStatus::Complete;
+        if transcribe {
+            store.note_pending_intent(&self.id)?;
+        }
+        store.promote_from_staging(&self.id)?;
         let record = CaptureRecord {
             id: self.id.clone(),
             created_utc: self.created_utc.clone(),
@@ -5236,9 +5356,6 @@ impl FinalizedTake {
             extra_json,
             secure_field: self.meta.secure_field,
         };
-        // Only a complete take is transcribed by itself: a salvaged one
-        // waits for the user.
-        let transcribe = self.meta.transcribe && record.status == CaptureStatus::Complete;
         store.commit_capture_superseding(&record, self.meta.supersedes_journal.as_deref(), transcribe)?;
         store.gc_staging()?;
         Ok(CommittedTake { record })

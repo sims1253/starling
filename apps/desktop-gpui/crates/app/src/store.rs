@@ -275,9 +275,20 @@ impl Drop for AudioHold {
         };
         match &self.on {
             HoldOn::Host(client) => {
+                // A connection that is gone took the hold with it. The
+                // release is written off this thread: a guard may drop on
+                // the UI thread, and the connection's writer may be busy
+                // (an import's upload) or stuck behind a host that stopped
+                // reading.
                 if let Some(client) = client.upgrade() {
-                    // A connection that is gone took the hold with it.
-                    let _ = client.store_unanswered(release);
+                    let spawned = std::thread::Builder::new()
+                        .name("starling-hold-release".to_string())
+                        .spawn(move || {
+                            let _ = client.store_unanswered(release);
+                        });
+                    if let Err(err) = spawned {
+                        eprintln!("Starling: an audio hold is kept until reconnect: {err}");
+                    }
                 }
             }
             #[cfg(test)]

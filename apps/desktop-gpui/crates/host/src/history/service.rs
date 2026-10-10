@@ -278,6 +278,26 @@ impl History {
                 self.changed();
                 Value::String(id)
             }
+            StoreRequest::Uploaded { upload } => {
+                let json = lock(&self.stashes)
+                    .get_mut(&caller.key())
+                    .and_then(|stash| stash.uploads.remove(&upload))
+                    .ok_or_else(|| StorageError::Invalid("nothing was uploaded to run".to_string()))?;
+                let inner: StoreRequest = serde_json::from_slice(&json).map_err(|err| {
+                    StorageError::Invalid(format!("the uploaded request is not one: {err}"))
+                })?;
+                if matches!(
+                    inner,
+                    StoreRequest::Uploaded { .. }
+                        | StoreRequest::Upload { .. }
+                        | StoreRequest::Fetch { .. }
+                ) {
+                    return Err(StorageError::Invalid(
+                        "an uploaded request cannot itself move uploads or answers".to_string(),
+                    ));
+                }
+                return self.run(caller, inner);
+            }
             StoreRequest::Fetch { blob, offset } => return self.fetch(caller, &blob, offset),
             StoreRequest::Discard { id } => {
                 if let Some(stash) = lock(&self.stashes).get_mut(&caller.key()) {

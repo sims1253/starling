@@ -113,6 +113,9 @@ pub enum StoreRequest {
     /// Stores the WAV uploaded as `upload` as a new take (`transcribe`:
     /// with the intent to transcribe it): the take's id.
     Import { upload: String, transcribe: bool },
+    /// Runs the request uploaded as `upload` (its JSON): one too large
+    /// for a frame, such as a proposal on a very long transcript.
+    Uploaded { upload: String },
     /// The next chunk of a kept answer, from byte `offset`.
     Fetch { blob: String, offset: u64 },
     /// Drops a kept answer or an upload this connection gave up on.
@@ -232,8 +235,48 @@ fn invalid(what: impl std::fmt::Display) -> StorageError {
 }
 
 impl<C: StoreCall> HistoryClient<C> {
+    /// Sends `request`, through an upload when it is too large for a
+    /// frame.
+    fn call(&self, request: StoreRequest) -> Result<StoreReply, StorageError> {
+        let plumbing = matches!(
+            request,
+            StoreRequest::Upload { .. }
+                | StoreRequest::Fetch { .. }
+                | StoreRequest::Discard { .. }
+                | StoreRequest::ReleaseHold { .. }
+        );
+        if !plumbing {
+            let json = serde_json::to_vec(&request)
+                .map_err(|err| invalid(format!("the request does not serialize: {err}")))?;
+            if json.len() > self.0.chunk_bytes() {
+                let upload = self.upload(&json)?;
+                return self.0.call(StoreRequest::Uploaded { upload });
+            }
+        }
+        self.0.call(request)
+    }
+
+    /// Uploads `bytes` in chunks; the upload's id.
+    fn upload(&self, bytes: &[u8]) -> Result<String, StorageError> {
+        let upload = starling_runtime::bus::new_id("up");
+        let mut offset = 0;
+        for part in bytes.chunks(self.0.chunk_bytes()) {
+            let sent = self.done(StoreRequest::Upload {
+                upload: upload.clone(),
+                offset: offset as u64,
+                data: base64::engine::general_purpose::STANDARD.encode(part),
+            });
+            if let Err(err) = sent {
+                let _ = self.0.call(StoreRequest::Discard { id: upload });
+                return Err(err);
+            }
+            offset += part.len();
+        }
+        Ok(upload)
+    }
+
     fn value<T: DeserializeOwned>(&self, request: StoreRequest) -> Result<T, StorageError> {
-        match self.0.call(request)? {
+        match self.call(request)? {
             StoreReply::Done { value } => serde_json::from_value(value)
                 .map_err(|err| invalid(format!("the recording service answered oddly: {err}"))),
             StoreReply::Large { blob, bytes } => {
@@ -251,7 +294,7 @@ impl<C: StoreCall> HistoryClient<C> {
     }
 
     fn bytes(&self, request: StoreRequest) -> Result<Option<Vec<u8>>, StorageError> {
-        match self.0.call(request)? {
+        match self.call(request)? {
             StoreReply::Done { value: Value::Null } => Ok(None),
             StoreReply::Bytes { blob, bytes } => self.fetch(&blob, bytes).map(Some),
             StoreReply::Failed { failure } => Err(failure.into()),
@@ -425,21 +468,7 @@ impl<C: StoreCall> HistoryClient<C> {
     /// Stores `wav` as a new take (`transcribe`: with the intent to
     /// transcribe it); the take's id.
     pub fn import(&self, wav: &[u8], transcribe: bool) -> Result<String, StorageError> {
-        let upload = starling_runtime::bus::new_id("up");
-        let chunk = self.0.chunk_bytes();
-        let mut offset = 0;
-        for part in wav.chunks(chunk) {
-            let sent = self.done(StoreRequest::Upload {
-                upload: upload.clone(),
-                offset: offset as u64,
-                data: base64::engine::general_purpose::STANDARD.encode(part),
-            });
-            if let Err(err) = sent {
-                let _ = self.0.call(StoreRequest::Discard { id: upload });
-                return Err(err);
-            }
-            offset += part.len();
-        }
+        let upload = self.upload(wav)?;
         self.value(StoreRequest::Import { upload, transcribe })
     }
 

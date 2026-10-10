@@ -373,3 +373,50 @@ fn a_held_take_is_neither_compressed_nor_retired_until_released() {
     assert!(!other.audio_in_use(&id).unwrap());
     assert!(matches!(store.hold_audio("c_missing"), Err(StoreV2Error::NotFound(_))));
 }
+
+/// #220: a crash between a take's promotion and its metadata commit (or
+/// just before the promotion) loses neither the take nor its intent to
+/// transcribe it — reconcile adopts it with the intent. A take whose
+/// commit carried none gets none.
+#[test]
+fn a_commit_cut_off_by_a_crash_keeps_its_intent() {
+    for promoted in [true, false] {
+        for wanted in [true, false] {
+            let dir = TempDir::new().expect("tempdir");
+            let id = {
+                let store = store_in(&dir);
+                let mut meta = TakeMeta::for_device("test-device");
+                meta.transcribe = wanted;
+                let mut take = store.begin_take(meta).expect("begin take");
+                take.append_and_seal(&ramp(400)).expect("append");
+                let finalized = take.finalize().expect("finalize");
+                // What commit_marked does up to the crash.
+                if wanted {
+                    store.note_pending_intent(&finalized.id).expect("note");
+                }
+                if promoted {
+                    store.promote_from_staging(&finalized.id).expect("promote");
+                }
+                finalized.id
+            };
+            let mut store = store_in(&dir);
+            let report = store.reconcile().expect("reconcile");
+            assert!(store.get_capture(&id).unwrap().is_some(), "{report:?}");
+            assert_eq!(
+                store.transcription_wanted(&id).unwrap(),
+                wanted,
+                "promoted: {promoted}, wanted: {wanted}"
+            );
+            assert!(!store.pending_intent(&id).unwrap(), "the note is done with");
+        }
+    }
+}
+
+#[test]
+fn a_noted_intent_whose_save_never_moved_any_audio_is_cleared() {
+    let dir = TempDir::new().expect("tempdir");
+    let mut store = store_in(&dir);
+    store.note_pending_intent("c_never_saved").unwrap();
+    store.reconcile().expect("reconcile");
+    assert!(!store.pending_intent("c_never_saved").unwrap());
+}

@@ -207,6 +207,38 @@ fn answers_and_uploads_larger_than_a_frame_go_in_chunks() {
     host.shutdown();
 }
 
+/// A write too large for one frame (a proposal on a very long
+/// transcript) goes up in parts and lands whole.
+#[test]
+fn a_request_larger_than_a_frame_goes_up_in_parts() {
+    let root = tempfile::tempdir().unwrap();
+    let mut host = serve(
+        config(root.path(), FakeCaptureSource::new(Vec::new())).with_max_frame_bytes(16 * 1024),
+    )
+    .expect("host serves");
+    let (id, attempt) = transcribed(root.path(), 1600, "raw words");
+    let client = connect(&host);
+    let history = HistoryClient(&client);
+    history.start_processing_doc(&id, &attempt, "raw words").unwrap();
+    let text = "a long proposal ".repeat(4096);
+    let proposal = ProposalRow {
+        request_id: "p_long".into(),
+        base_revision: 1,
+        text: text.clone(),
+        status: RowStatus::Proposed,
+        label: "test".into(),
+        failure: None,
+        stop_to_result_ms: None,
+        origin: None,
+    };
+    history.save_proposal(&id, &proposal).expect("saved in parts");
+    let doc = history.processing_doc(&id).unwrap().expect("doc");
+    assert_eq!(doc.proposals.len(), 1);
+    assert_eq!(doc.proposals[0].text, text);
+    drop(client);
+    host.shutdown();
+}
+
 #[test]
 fn an_import_with_its_intent_is_due_for_transcription() {
     let root = tempfile::tempdir().unwrap();

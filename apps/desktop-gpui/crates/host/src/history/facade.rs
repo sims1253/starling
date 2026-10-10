@@ -634,6 +634,13 @@ impl Facade {
                     continue;
                 }
             };
+            // A take started recording while this one was encoded: its
+            // FLAC is not published now (the next pass encodes it again).
+            if paused() {
+                prepared.discard();
+                report.paused = true;
+                return Ok(report);
+            }
             // The guard must drop before the arms: a failure locks again.
             let committed = lock_v2(&self.0).commit_compression(prepared);
             match committed {
@@ -1670,6 +1677,35 @@ mod tests {
         assert!(upkeep.summary().is_none());
         let wav = store.audio_wav(&saved.id).expect("load").expect("present");
         assert_eq!(*wav, *original, "still the journal, untouched");
+    }
+
+    /// A take that starts recording while another is being encoded: the
+    /// encode is not published, its temporary is gone, and the next pass
+    /// compresses it.
+    #[test]
+    fn a_take_starting_mid_encode_keeps_that_compression_unpublished() {
+        let store = v2_store("upkeep-paused-mid-encode");
+        let saved = store.save_capture(wav_of(&[0.1f32; 32_000])).expect("save");
+        let asked = std::sync::atomic::AtomicUsize::new(0);
+        // Asked before the encode (not yet recording), then before the
+        // publish (recording).
+        let upkeep = store
+            .audio_upkeep(store_v2::RetentionPolicy::default, || {
+                asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 1
+            })
+            .expect("upkeep");
+        assert!(upkeep.paused);
+        assert_eq!(upkeep.compressed, 0);
+        let audio = lock_v2(&store.0).root().join("audio");
+        let names: Vec<String> = std::fs::read_dir(&audio)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec![format!("{}.sj", saved.id)], "only the journal: {names:?}");
+        let upkeep = store
+            .audio_upkeep(store_v2::RetentionPolicy::default, || false)
+            .expect("upkeep");
+        assert_eq!(upkeep.compressed, 1);
     }
 
     #[test]

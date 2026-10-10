@@ -162,6 +162,41 @@ fn a_recovered_complete_take_is_due_for_transcription_and_a_cut_one_is_not() {
     assert!(!store.transcription_wanted("j_stopped").unwrap());
 }
 
+/// #220: a pass that sealed a cut-short journal and died before adopting
+/// it leaves a journal that looks finished; the next pass still treats it
+/// as cut short — no transcription intent, the "closed while recording"
+/// note.
+#[test]
+fn a_cut_journal_sealed_by_a_pass_that_died_still_reads_as_cut() {
+    let dir = TempDir::new().expect("tempdir");
+    let mut store = store_in(&dir);
+    let tree = journals(&dir);
+    let path = {
+        let mut writer =
+            JournalWriter::create_named(&tree, "j_cut".to_string(), 16_000).expect("writer");
+        writer.append_frames(&ramp(4_800, 1)).expect("append");
+        writer.write_boundary().expect("boundary");
+        writer.path().to_path_buf()
+    };
+    // The earlier pass: noted, sealed, then the process died.
+    store.note_recovery_seal("j_cut").expect("note");
+    let parsed = read_journal(&path).expect("read");
+    assert!(!parsed.finalized);
+    seal_recovered_journal(&path, &parsed).expect("seal");
+    drop(parsed);
+    assert!(read_journal(&path).expect("read").finalized, "it looks finished now");
+    age(&path, old());
+
+    let report = store
+        .recover_capture_journals_where(&tree, |_| true, true)
+        .expect("scan");
+    assert_eq!(report.recovered.len(), 1, "{report:?}");
+    assert!(!store.transcription_wanted("j_cut").unwrap(), "a cut take waits for the user");
+    let note = store.get_capture("j_cut").unwrap().unwrap().recovery_note().expect("note");
+    assert!(note.contains("while this take was recording"), "{note}");
+    assert!(!store.recovery_sealed("j_cut").unwrap(), "the note is done with");
+}
+
 #[test]
 fn a_freshly_finished_journal_is_left_for_its_save_then_recovered_whole() {
     let dir = TempDir::new().expect("tempdir");

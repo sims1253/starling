@@ -1375,6 +1375,25 @@ fn connection_reader(
                     Frame::TakeTap { take, from } => {
                         shared.takes.tap(&state, take, from);
                     }
+                    // Releases are answered here, never refused by a full
+                    // queue: a hold or a kept answer must not outlive what
+                    // asked for it.
+                    Frame::Store {
+                        req,
+                        request:
+                            request @ (crate::history::StoreRequest::ReleaseHold { .. }
+                            | crate::history::StoreRequest::Discard { .. }),
+                    } if shared.history.is_some() => {
+                        let reply = shared
+                            .history
+                            .as_ref()
+                            .expect("checked")
+                            .handle(&*state, request);
+                        if state.try_deliver(Frame::Stored { req, reply }).is_err() {
+                            state.close();
+                            break;
+                        }
+                    }
                     Frame::Store { req, request } => {
                         let refused = match &shared.store_jobs {
                             Some(jobs) => crate::history::submit(
