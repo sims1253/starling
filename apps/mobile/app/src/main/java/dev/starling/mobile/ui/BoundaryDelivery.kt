@@ -101,11 +101,12 @@ object BoundaryDelivery {
         anchored: Boolean = true,
     ): Result {
         // An empty text has no boundary; nothing is read for it. It is only
-        // written to replace the take's own composing region: with none, an
-        // empty commit would replace the user's selection, and nothing is
-        // left to write.
+        // written to replace the take's own composing region, and only while
+        // that region is still known to be there ([anchored], from
+        // [emptyCommitSafe]): otherwise an empty commit would replace the
+        // user's selection, and nothing is written.
         if (raw.isEmpty()) {
-            val committed = composing.isNullOrEmpty() || connection.commitText(raw, 1)
+            val committed = composing.isNullOrEmpty() || !anchored || connection.commitText(raw, 1)
             return Result(committed, raw, emptyList(), null)
         }
         val read = when {
@@ -128,6 +129,15 @@ object BoundaryDelivery {
      */
     fun cursorAtComposingEnd(selStart: Int, selEnd: Int, candidatesStart: Int, candidatesEnd: Int): Boolean =
         candidatesStart < 0 || candidatesEnd < 0 || (selStart == selEnd && selEnd == candidatesEnd)
+
+    /**
+     * Whether an empty commit could only clear the take's composing region:
+     * the editor reports the region with the cursor at its end, or reports
+     * none and nothing is selected. With a selection and no region (the
+     * editor dropped it), the empty commit would delete the selected text.
+     */
+    fun emptyCommitSafe(selStart: Int, selEnd: Int, candidatesStart: Int, candidatesEnd: Int): Boolean =
+        selStart == selEnd && cursorAtComposingEnd(selStart, selEnd, candidatesStart, candidatesEnd)
 
     /** The rules applied to [raw] without writing anything, for live composing text. */
     fun adjust(raw: String, context: InsertionBoundary.Context?, verbatim: Boolean): String =

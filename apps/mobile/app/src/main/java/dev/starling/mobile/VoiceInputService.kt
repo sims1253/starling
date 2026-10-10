@@ -132,6 +132,9 @@ class VoiceInputService : InputMethodService() {
     /** From the editor's last selection update: the cursor is at the end of the composing region. */
     private var cursorAtComposingEnd = true
 
+    /** From the same callback: an empty commit could only clear the take's region (see [BoundaryDelivery.emptyCommitSafe]). */
+    private var emptyCommitSafe = true
+
     private val catalog: ModeCatalog by lazy { application.modeCatalog }
 
     override fun onCreate() {
@@ -203,6 +206,7 @@ class VoiceInputService : InputMethodService() {
     override fun onStartInput(attribute: EditorInfo?, restarting: Boolean) {
         super.onStartInput(attribute, restarting)
         cursorAtComposingEnd = true
+        emptyCommitSafe = true
         val field = EditorField.from(attribute)
         editorField = field
         val connection = currentInputConnection
@@ -265,6 +269,7 @@ class VoiceInputService : InputMethodService() {
     ) {
         super.onUpdateSelection(oldSelStart, oldSelEnd, newSelStart, newSelEnd, candidatesStart, candidatesEnd)
         cursorAtComposingEnd = BoundaryDelivery.cursorAtComposingEnd(newSelStart, newSelEnd, candidatesStart, candidatesEnd)
+        emptyCommitSafe = BoundaryDelivery.emptyCommitSafe(newSelStart, newSelEnd, candidatesStart, candidatesEnd)
     }
 
     /**
@@ -768,7 +773,7 @@ class VoiceInputService : InputMethodService() {
             text,
             verbatim,
             composing = current.composedText.takeIf { current.composing },
-            anchored = !current.composing || cursorAtComposingEnd,
+            anchored = !current.composing || if (text.isEmpty()) emptyCommitSafe else cursorAtComposingEnd,
         )
         if (result.skipped == BoundaryDelivery.Skip.UNREADABLE || result.skipped == BoundaryDelivery.Skip.CURSOR_MOVED) {
             // The reason only; the field's text is never logged.

@@ -258,6 +258,32 @@ class BoundaryDeliveryTest {
     }
 
     @Test
+    fun anEmptyTextWritesNothingOnceTheRegionIsGone() {
+        // The editor dropped the region and the user selected "WORLD": an
+        // empty commit would delete it.
+        val connection = FakeConnection("Hello WORLD today", cursor = 6, selectionEnd = 11)
+        val result = BoundaryDelivery.deliver(
+            connection,
+            field(imeOptions = EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING),
+            "",
+            verbatim = false,
+            composing = " next",
+            anchored = BoundaryDelivery.emptyCommitSafe(6, 11, -1, -1),
+        )
+        assertTrue(result.committed)
+        assertTrue(connection.commits.isEmpty())
+        assertEquals("Hello WORLD today", connection.text)
+    }
+
+    @Test
+    fun anEmptyCommitIsSafeOnlyWithoutASelectionOrAtTheRegionEnd() {
+        assertTrue(BoundaryDelivery.emptyCommitSafe(9, 9, 4, 9))
+        assertTrue(BoundaryDelivery.emptyCommitSafe(9, 9, -1, -1))
+        assertFalse(BoundaryDelivery.emptyCommitSafe(6, 11, -1, -1))
+        assertFalse(BoundaryDelivery.emptyCommitSafe(15, 15, 4, 9))
+    }
+
+    @Test
     fun theTakesOwnComposingRegionIsNotTheBoundary() {
         // The live text " fox jum" is composing at the cursor; the boundary is
         // where it starts.
