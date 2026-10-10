@@ -1,12 +1,13 @@
 //! The scripted [`FakeBackend`] (feature `test-doubles`): focus,
 //! identity and failures under test control, with no X server or
-//! Windows session.
+//! Windows session; and the scripted field reader [`FakeFields`].
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::{
-    format_ref, insertion_guards, merge_excluded_pids, BackendKind, InsertError, InsertReceipt,
-    InsertionBackend, TargetCheck, TargetSnapshot, EVIDENCE_SYNTHETIC_KEYS,
+    format_ref, insertion_guards, merge_excluded_pids, BackendKind, FieldAnchor, FieldReader,
+    InsertError, InsertReceipt, InsertionBackend, Surrounding, SurroundingText, TargetCheck,
+    TargetSnapshot, EVIDENCE_SYNTHETIC_KEYS,
 };
 
 /// One scripted focused target.
@@ -66,6 +67,8 @@ struct State {
     /// Every key `insert_guarded` sent, in arrival order, as one field
     /// would receive them.
     field: String,
+    /// What the backend's own `surrounding_text` answers.
+    surrounding: Surrounding,
 }
 
 /// Runs before each character `insert_guarded` types, with its index.
@@ -117,6 +120,7 @@ impl FakeBackend {
                 key_hook: None,
                 insertions: Vec::new(),
                 field: String::new(),
+                surrounding: Surrounding::Unsupported,
             }),
             excluded_pids: merge_excluded_pids(excluded_pids),
         }
@@ -195,6 +199,11 @@ impl FakeBackend {
     /// caller sees mid-typing.
     pub fn on_key(&self, hook: impl Fn(usize) + Send + Sync + 'static) {
         self.state().key_hook = Some(Arc::new(hook));
+    }
+
+    /// What the backend itself reports as surrounding text from now on.
+    pub fn set_surrounding(&self, surrounding: Surrounding) {
+        self.state().surrounding = surrounding;
     }
 
     /// The `(target_ref, text)` pairs `insert` accepted, in order.
@@ -282,6 +291,10 @@ impl InsertionBackend for FakeBackend {
         })
     }
 
+    fn surrounding_text(&self, _target: &TargetSnapshot) -> Surrounding {
+        self.state().surrounding.clone()
+    }
+
     fn insert(&self, target: &TargetSnapshot, text: &str) -> Result<InsertReceipt, InsertError> {
         self.insert_guarded(target, text, &|| None)
     }
@@ -339,6 +352,114 @@ impl InsertionBackend for FakeBackend {
         Ok(InsertReceipt {
             evidence: EVIDENCE_SYNTHETIC_KEYS,
         })
+    }
+}
+
+/// The scripted field reader: one focused field at a time, a text
+/// field (`before`) or a password field, located like AT-SPI does and
+/// read only while it is still the focused one.
+#[derive(Default)]
+pub struct FakeFields {
+    state: Mutex<FieldsState>,
+}
+
+#[derive(Default)]
+struct FieldsState {
+    /// The focused field and what it holds before the caret; `None`
+    /// before: a password field.
+    focused: Option<(FieldAnchor, Option<String>)>,
+    next_path: u32,
+    locates: usize,
+    /// Reads that returned a field's text.
+    text_reads: usize,
+}
+
+impl FakeFields {
+    pub fn new() -> FakeFields {
+        FakeFields::default()
+    }
+
+    fn state(&self) -> MutexGuard<'_, FieldsState> {
+        self.state.lock().expect("fake fields state")
+    }
+
+    fn focus(&self, before: Option<&str>) {
+        let mut state = self.state();
+        state.next_path += 1;
+        let anchor = FieldAnchor {
+            bus_name: ":1.42".to_string(),
+            path: format!("/org/a11y/atspi/accessible/{}", state.next_path),
+            pid: 4213,
+        };
+        state.focused = Some((anchor, before.map(str::to_string)));
+    }
+
+    /// A new text field takes focus, holding `before` before its caret.
+    /// Fields located earlier are no longer read.
+    pub fn focus_text(&self, before: &str) {
+        self.focus(Some(before));
+    }
+
+    /// A password field takes focus.
+    pub fn focus_password(&self) {
+        self.focus(None);
+    }
+
+    /// The focused text field's text before the caret changes (typing).
+    pub fn set_before(&self, before: &str) {
+        if let Some((_, Some(text))) = self.state().focused.as_mut() {
+            *text = before.to_string();
+        }
+    }
+
+    /// Nothing is focused any more.
+    pub fn blur(&self) {
+        self.state().focused = None;
+    }
+
+    pub fn locates(&self) -> usize {
+        self.state().locates
+    }
+
+    /// How many reads returned a field's text.
+    pub fn text_reads(&self) -> usize {
+        self.state().text_reads
+    }
+}
+
+impl FieldReader for FakeFields {
+    fn locate(&self, _target: &TargetSnapshot) -> Option<FieldAnchor> {
+        let mut state = self.state();
+        state.locates += 1;
+        state.focused.as_ref().map(|(anchor, _)| anchor.clone())
+    }
+
+    fn read(&self, _target: &TargetSnapshot, field: &FieldAnchor) -> Surrounding {
+        let mut state = self.state();
+        let before = match &state.focused {
+            Some((anchor, _)) if anchor != field => return Surrounding::Unsupported,
+            None => return Surrounding::Unsupported,
+            Some((_, None)) => return Surrounding::Protected,
+            Some((_, Some(before))) => before.clone(),
+        };
+        state.text_reads += 1;
+        Surrounding::Text(SurroundingText {
+            before,
+            after: String::new(),
+            selection: None,
+        })
+    }
+}
+
+/// Lets one reader be shared between an [`crate::Inserter`] and the test
+/// scripting it.
+impl FieldReader for Arc<FakeFields> {
+    fn locate(&self, target: &TargetSnapshot) -> Option<FieldAnchor> {
+        (**self).locate(target)
+    }
+
+    fn read(&self, target: &TargetSnapshot, field: &FieldAnchor) -> Surrounding {
+        (**self).read(target, field)
     }
 }
 

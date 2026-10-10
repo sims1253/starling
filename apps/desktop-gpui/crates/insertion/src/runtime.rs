@@ -15,18 +15,20 @@
 //!   detected there (including part-way through typing) becomes
 //!   `delivery.failed{reason: target_changed | partial_delivery}`.
 //! - `surrounding_text` is `Text` only where a backend reports it, and
-//!   `Unsupported` otherwise. No backend here can tell a secure or
-//!   incognito field yet, so none answers `Protected`; one that can (the
-//!   IBus engine) must refuse before reading.
+//!   `Unsupported` otherwise; a backend's password field is
+//!   `Protected(Secure)`. No backend here reports text yet. The app's own
+//!   delivery also reads the field it located over AT-SPI when the take
+//!   started (`Inserter::locate_field`); a ref carries no such anchor, so
+//!   this adapter never reads one.
 
 use std::sync::Arc;
 
 use starling_runtime::machine::delivery::{
-    DeliveryAdapter, InsertEvidence, InsertionFailure, Revalidation, SurroundingRead,
-    SurroundingText,
+    DeliveryAdapter, InsertEvidence, InsertionFailure, ProtectedField, Revalidation,
+    SurroundingRead, SurroundingText,
 };
 
-use crate::{Inserter, InsertionBackend, TargetCheck, TargetSnapshot};
+use crate::{Inserter, InsertionBackend, Surrounding, TargetCheck, TargetSnapshot};
 
 pub struct InsertionDeliveryAdapter {
     inserter: Arc<Inserter>,
@@ -126,16 +128,17 @@ impl DeliveryAdapter for InsertionDeliveryAdapter {
     }
 
     fn surrounding_text(&self, target_ref: &str) -> SurroundingRead {
-        let Ok((snapshot, backend)) = self.resolve(target_ref) else {
+        let Ok((snapshot, _)) = self.resolve(target_ref) else {
             return SurroundingRead::Unsupported;
         };
-        match backend.surrounding_text(&snapshot) {
-            Ok(Some(text)) => SurroundingRead::Text(SurroundingText {
+        match self.inserter.surrounding_text(&snapshot, None) {
+            Surrounding::Text(text) => SurroundingRead::Text(SurroundingText {
                 before: text.before,
                 after: text.after,
                 showing_hint: false,
             }),
-            Ok(None) | Err(_) => SurroundingRead::Unsupported,
+            Surrounding::Protected => SurroundingRead::Protected(ProtectedField::Secure),
+            Surrounding::Unsupported => SurroundingRead::Unsupported,
         }
     }
 }
@@ -164,6 +167,30 @@ mod tests {
         assert_eq!(
             adapter.surrounding_text("not a ref"),
             SurroundingRead::Unsupported
+        );
+    }
+
+    #[test]
+    fn a_backends_text_is_passed_on_and_its_password_field_is_protected() {
+        let (fake, adapter) = session();
+        let target = fake.capture().unwrap();
+        fake.set_surrounding(crate::Surrounding::Text(crate::SurroundingText {
+            before: "The quick".to_string(),
+            after: "dog".to_string(),
+            selection: None,
+        }));
+        assert_eq!(
+            adapter.surrounding_text(&target.target_ref),
+            SurroundingRead::Text(SurroundingText {
+                before: "The quick".to_string(),
+                after: "dog".to_string(),
+                showing_hint: false,
+            })
+        );
+        fake.set_surrounding(crate::Surrounding::Protected);
+        assert_eq!(
+            adapter.surrounding_text(&target.target_ref),
+            SurroundingRead::Protected(ProtectedField::Secure)
         );
     }
 
