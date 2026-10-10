@@ -159,7 +159,7 @@ struct Transcript {
     std::optional<std::vector<TimedWord>> words;
     Transcript() = default;
     Transcript(std::string t) : text(std::move(t)) {}
-    Transcript(const char* t) : text(t) {}
+    Transcript(const char* t) : text(t ? t : "") {}
     Transcript(std::string t, std::optional<std::vector<TimedWord>> w)
         : text(std::move(t)), words(std::move(w)) {}
 };

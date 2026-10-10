@@ -325,8 +325,8 @@ take's first audio; audio positions are seconds into the take.
   holds `unfinalized_s` (the audio past the committed boundary at
   commit), `t0_ms`, `t1_ms` and `totals`. `calls` lists each call
   with `kind`, `start_s`, `end_s`, `t0_ms`, `t1_ms` and `result`
-  (`ok`, `reused`, `busy`, `timed_out` or `preempted`). A call that produced
-  committed text (not a preview) on an engine with word timestamps (Parakeet)
+  (`ok`, `reused`, `busy`, `timed_out` or `preempted`). A call that can
+  contribute committed text (not a preview) on an engine with word timestamps (Parakeet)
   also has `words`: `[{"w":…,"start":…,"end":…}]`, the decode's words with
   the take seconds each was heard at. It holds at most 20,000
   entries. `calls_dropped` counts later calls, which still enter

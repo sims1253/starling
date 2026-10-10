@@ -1052,9 +1052,11 @@ def test_real_stream_word_times(host: str, port: int, tr: TestResults,
             tr.check(f"ws {c['kind']} lists word times", False, str(c)[:300])
             continue
         starts = [w["start"] for w in words]
-        tr.check(f"ws {c['kind']} words are the take's words",
-                 " ".join(w["w"] for w in words).split() == final.get("text", "").split()
-                 or len(committed) > 1, str(words)[:300])
+        # One decode over the whole take: its words are the final text.
+        if len(committed) == 1:
+            tr.check(f"ws {c['kind']} words are the take's words",
+                     " ".join(w["w"] for w in words).split() == final.get("text", "").split(),
+                     str(words)[:300])
         tr.check(f"ws {c['kind']} word times ordered and inside the call's audio",
                  starts == sorted(starts)
                  # a last token may predict up to 4 frames (0.32 s) past the audio

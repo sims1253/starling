@@ -25,15 +25,17 @@ std::string detokenize(const std::vector<std::string>& pieces,
 
 // A word of detokenize()'s text and the encoder frames it was heard at
 // (issue #357): text bytes [begin, end), from the frame of its first token to
-// the end (frame + duration) of its last. Words are the whitespace-separated
-// runs of the text, so they split exactly as the text does.
+// the latest end (frame + duration) of its tokens. Words are the
+// whitespace-separated runs of the text, so they split exactly as the text
+// does.
 struct WordFrames {
     size_t begin = 0, end = 0;
     int32_t first_frame = 0, end_frame = 0;
 };
 
 // detokenize(pieces, ids) into `text`, and its words. `frames` and
-// `durations` are parallel to `ids` (tdt.hpp TdtTiming).
+// `durations` are parallel to `ids` (tdt.hpp TdtTiming); when they are not,
+// `text` is still set and the word list is empty.
 std::vector<WordFrames> word_frames(const std::vector<std::string>& pieces,
                                     const std::vector<int32_t>& ids,
                                     const std::vector<int32_t>& frames,

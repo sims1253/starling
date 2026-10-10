@@ -308,7 +308,7 @@ char * starling_ggml_transcribe_pcm_words(starling_ggml_ctx * ctx,
             // plain transcript, *n_words = -1.
             return starling_ggml_transcribe_pcm(ctx, samples, n, sample_rate);
         }
-        // The shared 16 kHz guard of starling_ggml_transcribe_pcm.
+        // The same 16 kHz guard as starling_ggml_transcribe_pcm.
         if (sample_rate != 0 && sample_rate != 16000) {
             char msg[128];
             std::snprintf(msg, sizeof(msg), d->rate_error_fmt, sample_rate);

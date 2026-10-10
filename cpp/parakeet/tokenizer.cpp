@@ -70,7 +70,7 @@ std::vector<WordFrames> word_frames(const std::vector<std::string>& pieces,
     text = detokenize_owned(pieces, ids, &owner);
     std::vector<WordFrames> words;
     if (frames.size() != ids.size() || durations.size() != ids.size()) return words;
-    // Words split on whitespace, as the stream session splits the text.
+    // Words split on whitespace, as the stream session's split_words does.
     auto space = [&](size_t i) { return std::isspace((unsigned char)text[i]) != 0; };
     for (size_t i = 0; i < text.size();) {
         if (space(i)) { ++i; continue; }

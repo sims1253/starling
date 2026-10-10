@@ -20,6 +20,7 @@
 #include <cmath>
 #include <tuple>
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -394,6 +395,10 @@ std::string fixture_seconds(int64_t samples) {
 // A fixture word "word@start-end" (seconds).
 TimedWord fixture_timed(const std::string& token) {
     const size_t at = token.rfind('@');
+    if (at == std::string::npos) {
+        std::fprintf(stderr, "fixture word without '@': %s\n", token.c_str());
+        std::abort();
+    }
     const std::string times = token.substr(at + 1);
     const size_t dash = times.find('-');
     const std::string start = times.substr(0, dash);
@@ -413,7 +418,7 @@ Transcript fixture_transcript(const std::vector<std::string>& tokens) {
 }
 
 int64_t nearest_sample(double seconds) {
-    return static_cast<int64_t>(std::floor(seconds * 16000.0 + 0.5));
+    return std::llround(seconds * 16000.0);
 }
 
 // tstitch: the chunker's timed stitch over the given shared audio; no shared

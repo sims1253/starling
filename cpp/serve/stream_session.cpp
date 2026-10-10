@@ -229,6 +229,8 @@ std::optional<std::pair<int, int>> stitch_timed(
     const int n = static_cast<int>(committed.size());
     const int m = static_cast<int>(new_words.size());
     std::vector<std::string> a, b;
+    a.reserve(committed.size());
+    b.reserve(new_words.size());
     for (const auto& w : committed) a.push_back(norm_word(w));
     for (const auto& w : new_words) b.push_back(norm_word(w));
     // Start difference of a matching pair, or -1.

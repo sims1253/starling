@@ -623,9 +623,10 @@ def test_redecode_needs_audio_before_the_boundary_to_be_kept():
 def _timed_tx(answers: dict):
     """A transcriber answering by (call kind, window start in s) with
     "word@start-end ..." scripts (times from the window start)."""
+    cs_ref: list = []  # the caller appends its ChunkStreamer
+
     def tx(window: np.ndarray):
         return _transcript(answers[(cs_ref[0].call_kind, cs_ref[0].call_start / SR)].split())
-    cs_ref: list = []
     return tx, cs_ref
 
 

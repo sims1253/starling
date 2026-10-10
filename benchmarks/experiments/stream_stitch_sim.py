@@ -151,6 +151,7 @@ class Transcriber:
         url = self._server().base.replace("http://", "ws://") + "/stream?trace=1"
         n = len(pcm) // 2
         for _ in range(50):
+            msg = {}
             with connect(url, max_size=None, ping_interval=None, open_timeout=30) as ws:
                 ws.send(pcm)
                 ws.send(json.dumps({"type": "commit"}))
@@ -164,14 +165,14 @@ class Transcriber:
                 raise RuntimeError(f"stream window failed: {msg}")
         else:
             raise RuntimeError("stream window: server stayed busy")
-        for call in msg["trace"]["calls"]:
+        for call in msg.get("trace", {}).get("calls", []):
             if (call["kind"] in ("flush_tail", "flush_window") and call["start_s"] == 0
                     and abs(call["end_s"] - n / SAMPLE_RATE) < 0.001
                     and call["result"] in ("ok", "reused")):
                 words = call.get("words")
                 return {"text": " ".join(w["w"] for w in words) if words is not None
                         else msg["text"], "words": words}
-        raise RuntimeError(f"stream window: no decode of the whole window in {msg['trace']}")
+        raise RuntimeError(f"stream window: no decode of the whole window in {msg.get('trace')}")
 
     def close(self) -> None:
         if self.server is not None:

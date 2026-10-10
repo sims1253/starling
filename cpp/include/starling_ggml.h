@@ -40,7 +40,9 @@ extern "C" {
 //   9 — added STARLING_GGML_QWEN3_06 (Qwen/Qwen3-ASR-0.6B-hf; served by the
 //       QWEN3 engine — same architecture, dims come from GGUF metadata).
 // Additions that leave every existing entry point unchanged keep the version
-// (starling_ggml_transcribe_pcm_words, issue #357).
+// (starling_ggml_transcribe_pcm_words, issue #357): a caller loading the
+// library at run time probes for such a symbol (dlsym) instead of checking
+// the version.
 #define STARLING_GGML_ABI_VERSION 9
 
 // ABI / build introspection --------------------------------------------------

@@ -398,17 +398,28 @@ char * starling_ggml_parakeet_decode_words(void * handle, const float * pcm, int
                                            starling_ggml_word ** words_out,
                                            int64_t * n_words_out,
                                            const char ** err_out) {
+    if (words_out) *words_out = nullptr;
+    if (n_words_out) *n_words_out = -1;
     auto* c = static_cast<ParakeetCtx*>(handle);
     if (!c) { if (err_out) *err_out = "null parakeet handle"; return nullptr; }
+    if (!words_out || !n_words_out) {
+        if (err_out) *err_out = "null words out-parameter";
+        return nullptr;
+    }
     std::vector<int32_t> ids;
     starling::ggml::parakeet::TdtTiming timing;
     if (!parakeet_full_decode(c, pcm, n, ids, err_out, &timing)) return nullptr;
+    // A decode path that recorded no step times (out of step with the ids)
+    // gives the plain text, *n_words = -1, never a 0-word list for words.
+    const bool timed_ok = timing.frame.size() == ids.size()
+                       && timing.duration.size() == ids.size();
     std::string text;
     const auto words = starling::ggml::parakeet::word_frames(
         c->cfg.tokenizer_pieces, ids, timing.frame, timing.duration, text);
     const double frame_s = (double)c->cfg.hop_length * kEncoderSubsampling
                          / (double)c->cfg.sample_rate;
     char* out = (char*)std::malloc(text.size() + 1);
+    // At least one element: malloc(0) may return NULL.
     auto* timed = (starling_ggml_word*)std::malloc(
         std::max<size_t>(words.size(), 1) * sizeof(starling_ggml_word));
     if (!out || !timed) {
@@ -424,6 +435,10 @@ char * starling_ggml_parakeet_decode_words(void * handle, const float * pcm, int
         timed[i].text_end = (int32_t)words[i].end;
         timed[i].start_s = (float)(words[i].first_frame * frame_s);
         timed[i].end_s = (float)(words[i].end_frame * frame_s);
+    }
+    if (!timed_ok) {
+        std::free(timed);
+        return out;
     }
     *words_out = timed;
     *n_words_out = (int64_t)words.size();
