@@ -66,7 +66,7 @@ if (releaseSigning != null) {
 }
 
 // Contract data shared with the Python oracles and the Rust ports
-// (packages/contracts/mode-routing). The JVM tests replay its fixtures in
+// (packages/contracts/mode-routing, insertion-boundary). The JVM tests replay its fixtures in
 // place; the runtime tables ship as assets, copied at build time, so the
 // app and every other port read one copy.
 val contractsDir = layout.projectDirectory.dir("../../../packages/contracts")
@@ -105,6 +105,8 @@ androidComponents {
 tasks.withType<Test>().configureEach {
     systemProperty("starling.contracts", contractsDir.asFile.absolutePath)
     inputs.dir(contractsDir.dir("mode-routing")).withPropertyName("contracts").withPathSensitivity(PathSensitivity.RELATIVE)
+    inputs.dir(contractsDir.dir("insertion-boundary")).withPropertyName("boundaryContract")
+        .withPathSensitivity(PathSensitivity.RELATIVE)
 }
 
 android {

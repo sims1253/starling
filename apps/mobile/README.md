@@ -22,10 +22,27 @@ Starling Voice Input keyboard. The keyboard shows a transcript first; it only
 calls `InputConnection.commitText` after the user taps **Insert transcript** —
 except while a live stream is running, where growing partials are shown as
 composing text (the Android dictation idiom) and the final text is committed
-once, on Stop, into the field the recording started in. The keyboard does not
-read surrounding editor text or selection context; the field's declared
+once, on Stop, into the field the recording started in. The field's declared
 attributes (package, id, input type, hint) are compared in memory only, to
-recognize the same field after a screen lock or app switch. An editor
+recognize the same field after a screen lock or app switch.
+
+Every write follows the insertion-boundary rules
+(`packages/contracts/insertion-boundary/`, #341): right before the one
+`commitText`, the keyboard reads the text before the cursor
+(`getTextBeforeCursor`, 128 characters; no rule needs the text after it, so
+that is never read) and
+adds a leading space or lowercases the first letter when the text continues
+a sentence; live composing text gets the same boundary. Words are never
+changed, code-looking first words keep their case, and a field showing only
+its hint reads as empty (an `InputConnection` reports content, never the
+placeholder). Password and incognito fields
+(`IME_FLAG_NO_PERSONALIZED_LEARNING`) are never read, verbatim modes write
+the text as recognized, and a field that does not report its text gets it as
+dictated (the status says so, and says when the cursor left the live text
+instead). The text read is used for this
+decision only; it is not stored or sent anywhere. An adjusted insertion is
+kept on the recording as a derived revision ("Inserted with boundary fixes"
+in Saved recordings); the transcript itself stays as recognized. An editor
 target generation and connection identity check prevents a late network
 response from being inserted into a field that has changed.
 
@@ -220,7 +237,8 @@ StarlingTiming` logs stop→raw and stop→processed per take for device
 measurements. A mode that asks for a model step runs rules only (and says so,
 also under battery saver). The draft, routing and rules are Kotlin ports
 (`processing/`) that replay the same fixtures as the Python oracles and the
-desktop's Rust ports. The draft lives in memory: the raw recording is in
+desktop's Rust ports; so does the insertion-boundary port
+(`processing/InsertionBoundary.kt`). The draft lives in memory: the raw recording is in
 Saved recordings as always, but edits are lost if Android kills the keyboard.
 
 ### Live streaming and its fallback

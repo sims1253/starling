@@ -147,6 +147,10 @@
     <string name="revision_source_on_device">this device</string>
     <string name="revision_source_server">server</string>
     <string name="revision_source_unknown">unknown model</string>
+    <string name="derived_heading">Inserted with boundary fixes:</string>
+    <string name="derived_line">%1$s · %2$s: “%3$s”</string>
+    <string name="derived_leading_space">leading space</string>
+    <string name="derived_first_letter_case">lowercase first letter</string>
     <string name="delete_recording">Delete</string>
     <string name="delete_recording_title">Delete recording?</string>
     <string name="delete_recording_message">This removes the WAV and its raw transcript from this device. This action cannot be undone.</string>
@@ -162,6 +166,12 @@
     <string name="keyboard_sending">Saved privately. Transcribing…</string>
     <string name="keyboard_ready_to_insert">Transcript ready. Tap Insert transcript.</string>
     <string name="keyboard_inserted">Transcript inserted.</string>
+    <string name="keyboard_boundary_unread">The field did not share its text, so spacing and capitals were not adjusted.</string>
+    <string name="keyboard_boundary_cursor_moved">The cursor left the live text, so spacing and capitals were not adjusted.</string>
+    <string name="keyboard_derived_unsaved">Its adjusted form could not be saved to Saved recordings.</string>
+    <string name="keyboard_inserted_unrecorded">Transcript inserted, but its adjusted form could not be saved to Saved recordings.</string>
+    <string name="keyboard_inserted_unadjusted">Transcript inserted as dictated: the field did not share its text, so spacing and capitals were not adjusted.</string>
+    <string name="keyboard_inserted_cursor_moved">Transcript inserted as dictated: the cursor left the live text, so spacing and capitals were not adjusted.</string>
     <string name="keyboard_target_changed">The take was dictated in another field. It is kept in Starling; copy it, or record again for this field.</string>
     <string name="keyboard_target_changed_private">The take was dictated in another, private field. It is not kept; copy it now or record again.</string>
     <string name="keyboard_transcription_failed_private">Transcription failed. Takes in private fields are not kept; record again.</string>

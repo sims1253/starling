@@ -34,6 +34,7 @@ import androidx.core.view.WindowInsetsCompat
 import dev.starling.mobile.audio.AudioCapture
 import dev.starling.mobile.audio.AudioChunkListener
 import dev.starling.mobile.audio.CaptureResult
+import dev.starling.mobile.data.DerivedRevision
 import dev.starling.mobile.data.Recording
 import dev.starling.mobile.data.RecordingStatus
 import dev.starling.mobile.data.TranscriptionProvenance
@@ -41,17 +42,19 @@ import dev.starling.mobile.engine.ModelLifetime
 import dev.starling.mobile.network.StreamEvent
 import dev.starling.mobile.network.StreamSession
 import dev.starling.mobile.network.TranscriptionEngine
+import dev.starling.mobile.processing.InsertionBoundary
 import dev.starling.mobile.processing.ModeCatalog
 import dev.starling.mobile.processing.Mode
 import dev.starling.mobile.processing.RegionKind
 import dev.starling.mobile.processing.StagedTake
 import dev.starling.mobile.storage.DiskLevel
+import dev.starling.mobile.ui.BoundaryDelivery
 import dev.starling.mobile.ui.EditorField
 import dev.starling.mobile.ui.InputTargetGuard
 
 /**
- * Lightweight voice keyboard. It never reads surrounding editor text. Two
- * text paths exist, both guarded by the editor target the take is bound to:
+ * Lightweight voice keyboard. Two text paths exist, both guarded by the
+ * editor target the take is bound to:
  *
  * - **Live streaming** (on-device engine or Starling server): while
  *   recording, growing partial transcripts are shown through
@@ -77,6 +80,14 @@ import dev.starling.mobile.ui.InputTargetGuard
  * Private fields ([EditorField.sensitive]: passwords, incognito) dictate an
  * ephemeral take that never shows up in the history and is deleted as soon
  * as it settles.
+ *
+ * Every write into a field follows the insertion-boundary rules (#341,
+ * [BoundaryDelivery]): the text around the cursor is read right before the
+ * write and decides the leading space and the case of the first letter.
+ * That text is used for the decision only, never stored or sent anywhere;
+ * private fields are never read, and verbatim modes write the text as
+ * recognized. An adjusted delivery is recorded on the take as a derived
+ * revision; the transcript stays as recognized.
  *
  * Modes (#302) come from [ModeCatalog]. Direct mode is the flow above. A
  * staged mode ([StagedTake]) never writes while it records: Stop leaves an
@@ -117,6 +128,12 @@ class VoiceInputService : InputMethodService() {
 
     /** The one take this keyboard follows, from Record until it is settled. */
     private var take: Take? = null
+
+    /** From the editor's last selection update: the cursor is at the end of the composing region. */
+    private var cursorAtComposingEnd = true
+
+    /** From the same callback: an empty commit could only clear the take's region (see [BoundaryDelivery.emptyCommitSafe]). */
+    private var emptyCommitSafe = true
 
     private val catalog: ModeCatalog by lazy { application.modeCatalog }
 
@@ -188,6 +205,8 @@ class VoiceInputService : InputMethodService() {
 
     override fun onStartInput(attribute: EditorInfo?, restarting: Boolean) {
         super.onStartInput(attribute, restarting)
+        cursorAtComposingEnd = true
+        emptyCommitSafe = true
         val field = EditorField.from(attribute)
         editorField = field
         val connection = currentInputConnection
@@ -210,6 +229,9 @@ class VoiceInputService : InputMethodService() {
                 if (previous != null) current.explicitOnly = true
                 current.target = null
                 current.composing = false
+                // The old field's text is not kept past its region.
+                current.composedText = null
+                current.liveBoundary = null
                 current.liveInField = false
                 if (connection != null && field != null && current.field.sameFieldAs(field)) attach(current)
             }
@@ -231,6 +253,23 @@ class VoiceInputService : InputMethodService() {
         application.preloadOnDeviceModel()
         renderModelState(application.modelLifetime.state())
         switchKeyboardButton?.visibility = if (offersKeyboardSwitch()) View.VISIBLE else View.GONE
+    }
+
+    /**
+     * The composing region and the cursor move independently; the boundary
+     * of a live take is only known while the cursor is at the region's end.
+     */
+    override fun onUpdateSelection(
+        oldSelStart: Int,
+        oldSelEnd: Int,
+        newSelStart: Int,
+        newSelEnd: Int,
+        candidatesStart: Int,
+        candidatesEnd: Int,
+    ) {
+        super.onUpdateSelection(oldSelStart, oldSelEnd, newSelStart, newSelEnd, candidatesStart, candidatesEnd)
+        cursorAtComposingEnd = BoundaryDelivery.cursorAtComposingEnd(newSelStart, newSelEnd, candidatesStart, candidatesEnd)
+        emptyCommitSafe = BoundaryDelivery.emptyCommitSafe(newSelStart, newSelEnd, candidatesStart, candidatesEnd)
     }
 
     /**
@@ -451,6 +490,7 @@ class VoiceInputService : InputMethodService() {
                 }
                 var shown = event.text
                 var holdBack = false
+                var verbatim = current.mode.behavior == VERBATIM
                 if (!current.sensitive) {
                     val routed = catalog.route(event.text, current.mode, secure = false)
                     val routedMode = routed.mode?.let(catalog::mode)
@@ -468,7 +508,10 @@ class VoiceInputService : InputMethodService() {
                     // A phrase that keeps the take direct ("literal …") is
                     // never composed; neither are words that may still
                     // become one.
-                    if (routed.prefixSpanCodepoints != null) shown = routed.payload
+                    if (routed.prefixSpanCodepoints != null) {
+                        shown = routed.payload
+                        if (!current.manualLocked && routedMode != null) verbatim = routedMode.behavior == VERBATIM
+                    }
                     holdBack = catalog.couldBecomePhrase(event.text, current.mode)
                     // From a possible "Starling, …" delimiter on, nothing is
                     // composed: an instruction never reaches the field, even
@@ -485,8 +528,16 @@ class VoiceInputService : InputMethodService() {
                     // replaces the composing region entirely. An empty text
                     // without a region of ours would replace the selection.
                     if (current.composing || shown.isNotEmpty()) {
-                        connection.setComposingText(shown, 1)
-                        current.composing = shown.isNotEmpty()
+                        // The boundary is read once, when the region starts:
+                        // after that the field's text before it is the
+                        // region's own.
+                        if (!current.composing) {
+                            current.liveBoundary = if (verbatim) null else BoundaryDelivery.context(connection, current.field)
+                        }
+                        val composed = BoundaryDelivery.adjust(shown, current.liveBoundary, verbatim)
+                        connection.setComposingText(composed, 1)
+                        current.composing = composed.isNotEmpty()
+                        current.composedText = composed
                     }
                 } else {
                     // No composing region (held back, detached, or a field
@@ -509,6 +560,9 @@ class VoiceInputService : InputMethodService() {
      * unchanged.
      */
     private fun clearComposingText(current: Take) {
+        // The boundary goes with the region, even one already lost.
+        current.composedText = null
+        current.liveBoundary = null
         if (!current.composing) return
         current.composing = false
         val target = current.target ?: return
@@ -631,6 +685,7 @@ class VoiceInputService : InputMethodService() {
             }
             return
         }
+        current.verbatim = current.mode.behavior == VERBATIM
         if (!current.sensitive) {
             val routed = catalog.route(text, current.mode, secure = false)
             val routedMode = if (current.manualLocked) current.mode else routed.mode?.let(catalog::mode) ?: current.mode
@@ -650,6 +705,7 @@ class VoiceInputService : InputMethodService() {
                 return
             }
             text = routed.payload
+            current.verbatim = routedMode.behavior == VERBATIM
         }
         val target = current.target
         val connection = currentInputConnection
@@ -661,9 +717,13 @@ class VoiceInputService : InputMethodService() {
             // (or, with none left, inserts at the cursor) and finishes it.
             // An empty final with no region of ours writes nothing: an empty
             // commit would replace whatever the user has selected.
-            if ((text.isEmpty() && !current.composing) || connection.commitText(text, 1)) {
-                current.composing = false
-                endTake(current, R.string.keyboard_inserted, shown = text.takeUnless { current.sensitive })
+            if (text.isEmpty() && !current.composing) {
+                endTake(current, R.string.keyboard_inserted)
+                return
+            }
+            val delivered = commitTake(current, connection, text, current.verbatim)
+            if (delivered != null) {
+                endTake(current, insertedStatus(current, delivered), shown = delivered.text.takeUnless { current.sensitive })
                 return
             }
         }
@@ -686,11 +746,72 @@ class VoiceInputService : InputMethodService() {
         }
         // Reached only from the explicit Insert button, into the field the
         // take was dictated in. A refused commit keeps the text for Copy.
-        if (!connection.commitText(text, 1)) {
+        val delivered = commitTake(current, connection, text, current.verbatim)
+        if (delivered == null) {
             renderTake()
             return
         }
-        endTake(current, R.string.keyboard_inserted, shown = text.takeUnless { current.sensitive })
+        endTake(current, insertedStatus(current, delivered), shown = delivered.text.takeUnless { current.sensitive })
+    }
+
+    /**
+     * The one commitText of a delivery: the boundary rules (#341) applied
+     * from the field's text read right before it, replacing the take's own
+     * composing region when it has one. An adjusted delivery is recorded on
+     * the take's recording as a derived revision. Null when the editor
+     * refused the text.
+     */
+    private fun commitTake(
+        current: Take,
+        connection: InputConnection,
+        text: String,
+        verbatim: Boolean,
+    ): BoundaryDelivery.Result? {
+        val result = BoundaryDelivery.deliver(
+            connection,
+            current.field,
+            text,
+            verbatim,
+            composing = current.composedText.takeIf { current.composing },
+            anchored = !current.composing || if (text.isEmpty()) emptyCommitSafe else cursorAtComposingEnd,
+        )
+        if (result.skipped == BoundaryDelivery.Skip.UNREADABLE || result.skipped == BoundaryDelivery.Skip.CURSOR_MOVED) {
+            // The reason only; the field's text is never logged.
+            runCatching { Log.i(BOUNDARY_TAG, "take ${current.recording.id}: boundary not applied (${result.skipped})") }
+        }
+        if (!result.committed) return null
+        current.composing = false
+        current.composedText = null
+        current.liveBoundary = null
+        if (result.changes.isNotEmpty() && !current.sensitive) {
+            // The text is in the field either way; a failed write only
+            // means the history lacks the derived revision, and says so.
+            current.derivedUnsaved = runCatching {
+                application.recordings.addDerived(
+                    current.recording.id,
+                    DerivedRevision(
+                        text = result.text,
+                        derivedFrom = text,
+                        provenance = DerivedRevision.INSERTION_BOUNDARY,
+                        changes = result.changes.map { it.kind },
+                        createdAtMillis = System.currentTimeMillis(),
+                    ),
+                )
+            }.isFailure
+        }
+        return result
+    }
+
+    /**
+     * A field that did not report its text, or a cursor that left the live
+     * text, got the text as dictated, and an adjustment the history could not
+     * keep is reported; the status says which.
+     */
+    private fun insertedStatus(current: Take, result: BoundaryDelivery.Result): Int = when {
+        current.derivedUnsaved -> R.string.keyboard_inserted_unrecorded
+        result.skipped == BoundaryDelivery.Skip.UNREADABLE -> R.string.keyboard_inserted_unadjusted
+        result.skipped == BoundaryDelivery.Skip.CURSOR_MOVED -> R.string.keyboard_inserted_cursor_moved
+        else -> R.string.keyboard_inserted
     }
 
     /** The take's field is gone; the user can still take the text along. */
@@ -726,20 +847,26 @@ class VoiceInputService : InputMethodService() {
             statusView?.setText(R.string.staging_nothing_to_insert)
             return
         }
-        val text = staged.deliveryText()
-        if (!connection.commitText(text, 1)) {
+        val delivered = commitTake(current, connection, staged.deliveryText(), staged.mode.behavior == VERBATIM)
+        if (delivered == null) {
             // The editor refused the text: the draft stays, and nothing is
             // pressed — a Send now would submit whatever the field held.
             renderTake()
             statusView?.setText(R.string.staging_insert_failed)
             return
         }
-        val status = if (staged.mode.delivery == INSERT_ENTER && !pressEditorAction(connection)) {
-            R.string.staging_no_action
+        if (staged.mode.delivery == INSERT_ENTER && !pressEditorAction(connection)) {
+            // Both outcomes are reported: no action, and how the boundary went.
+            val boundary = when {
+                current.derivedUnsaved -> getString(R.string.keyboard_derived_unsaved)
+                delivered.skipped == BoundaryDelivery.Skip.UNREADABLE -> getString(R.string.keyboard_boundary_unread)
+                delivered.skipped == BoundaryDelivery.Skip.CURSOR_MOVED -> getString(R.string.keyboard_boundary_cursor_moved)
+                else -> null
+            }
+            endTake(current, R.string.staging_no_action, detail = boundary, shown = delivered.text)
         } else {
-            R.string.keyboard_inserted
+            endTake(current, insertedStatus(current, delivered), shown = delivered.text)
         }
-        endTake(current, status, shown = text)
     }
 
     /**
@@ -1111,6 +1238,7 @@ class VoiceInputService : InputMethodService() {
         const val VERBATIM = "verbatim"
         const val INSERT_ENTER = "insert_enter"
         const val TIMING_TAG = "StarlingTiming"
+        const val BOUNDARY_TAG = "StarlingBoundary"
     }
 
     /**
@@ -1140,6 +1268,21 @@ class VoiceInputService : InputMethodService() {
 
         /** Whether the take owns an established (non-empty) composing region in [target]. */
         var composing = false
+
+        /** The text of that composing region, as last written. */
+        var composedText: String? = null
+
+        /**
+         * The text around the cursor when the composing region started, for
+         * the boundary of the live text (#341). In memory only, never stored.
+         */
+        var liveBoundary: InsertionBoundary.Context? = null
+
+        /** The final's mode is verbatim: its delivery skips the boundary rules. */
+        var verbatim = false
+
+        /** The delivered boundary adjustment could not be saved as a derived revision. */
+        var derivedUnsaved = false
 
         /**
          * The take lost its original connection; it never writes into a

@@ -46,6 +46,28 @@ data class TranscriptRevision(
 )
 
 /**
+ * Text delivered into a field that differs from the text it came from: the
+ * insertion-boundary adjustment (#341, a leading space or a lowercased first
+ * letter). It never replaces a revision or the raw transcript, and holds no
+ * text of the field itself.
+ */
+data class DerivedRevision(
+    /** The text that was delivered. */
+    val text: String,
+    /** The text it was derived from: the transcript, or a draft's delivered view. */
+    val derivedFrom: String,
+    /** What derived it; [INSERTION_BOUNDARY] today. */
+    val provenance: String,
+    /** The contract kinds of the rules that fired, in rule order. */
+    val changes: List<String>,
+    val createdAtMillis: Long,
+) {
+    companion object {
+        const val INSERTION_BOUNDARY = "insertion-boundary"
+    }
+}
+
+/**
  * The audio of a capture that did not end with a clean Stop (the process
  * died, the microphone failed, the disk filled up) and was recovered from
  * the partial WAV. [recoveredSeconds] is every sample found in the file;
@@ -107,4 +129,6 @@ data class Recording(
      * and its files go once the reader is done (or at the next start).
      */
     val deleted: Boolean = false,
+    /** Delivered variants of the text, oldest first; none of them is [rawTranscript]. */
+    val derived: List<DerivedRevision> = emptyList(),
 )

@@ -10,9 +10,10 @@ The raw recognition text is never edited: the runtime delivers the
 adjustment as a separate revision derived from the raw one (`provenance:
 "insertion-boundary"`).
 
-The Python oracle (`tests/insertion_boundary.py`) and the Rust port
-(`starling-processing`'s `boundary` module) both replay
-`fixtures/boundary-cases.json`.
+The Python oracle (`tests/insertion_boundary.py`), the Rust port
+(`starling-processing`'s `boundary` module) and the Kotlin port in the
+Android keyboard (`apps/mobile`, `processing/InsertionBoundary.kt`) all
+replay `fixtures/boundary-cases.json`.
 
 ## Inputs and outputs
 
@@ -25,6 +26,11 @@ Output: the adjusted text plus the rules that fired, each `leading_space` or
 A fixture change's `detail` is an explanation for readers, not compared.
 
 ## Rules
+
+"Whitespace" below is Unicode `White_Space` (Rust's `char::is_whitespace`):
+the no-break spaces and NEL are whitespace; the information separators
+U+001C–U+001F, which Python's `str.isspace` and Java's
+`Character.isWhitespace` also count, are not.
 
 1. **Verbatim.** `verbatim: true` → no changes at all.
 2. **Hint text.** `showing_hint: true` means the field shows only its
@@ -106,6 +112,25 @@ sent to any processing provider.
   delivers that; a stale adjustment is never delivered. A target that
   stops reporting text by apply time gets the requested text unchanged.
 
+## Delivery (Android keyboard)
+
+- The keyboard (`ui/BoundaryDelivery.kt`) reads `getTextBeforeCursor` right
+  before its single `commitText` and passes `after` as `""`: no v1 rule
+  reads it, so the text after the cursor is never requested. Password
+  variations and `IME_FLAG_NO_PERSONALIZED_LEARNING` fields are never read,
+  and verbatim modes skip the read. `showing_hint` is never set there: an
+  `InputConnection` reports the editor's content, never its placeholder,
+  so a field showing its hint already reads as `""`.
+- Live composing text gets the boundary read when the composing region
+  starts; the final re-reads, with the take's own composing text cut from
+  the text before the cursor. When the cursor has left that region (the
+  editor's `onUpdateSelection` candidates span, or the suffix no longer
+  matching), the boundary is unknown and the text goes in unchanged; the
+  status tells this apart from a field that did not report its text.
+- An adjusted delivery is stored on the recording as a derived revision
+  (`provenance: "insertion-boundary"`, the rule kinds, the text it was
+  derived from); the transcript and its revisions are not edited.
+
 ## Files
 
 | File | Role |
@@ -116,4 +141,5 @@ sent to any processing provider.
 ```
 uv run python -m pytest tests/test_insertion_boundary.py -q
 cd apps/desktop-gpui && cargo test -p starling-processing --test boundary_conformance
+cd apps/mobile && ./gradlew :app:testDebugUnitTest --tests '*InsertionBoundaryConformanceTest'
 ```

@@ -335,6 +335,58 @@
   },
   {
     "schema_version": 1,
+    "case_id": "no-break-space-is-whitespace",
+    "description": "U+00A0 is Unicode White_Space: no extra space, the sentence still continues",
+    "before": "Hello ",
+    "after": "",
+    "raw": "World",
+    "verbatim": false,
+    "expected_text": "world",
+    "expected_changes": [
+      {
+        "kind": "first_letter_case",
+        "detail": "previous non-whitespace 'o' continues the sentence"
+      }
+    ]
+  },
+  {
+    "schema_version": 1,
+    "case_id": "information-separator-before-is-not-whitespace",
+    "description": "U+001F (like U+001C-U+001E) is a control character, not Unicode White_Space: a space is added, and as non-alphanumeric it keeps the case",
+    "before": "word\u001f",
+    "after": "",
+    "raw": "Next",
+    "verbatim": false,
+    "expected_text": " Next",
+    "expected_changes": [
+      {
+        "kind": "leading_space",
+        "detail": "previous character U+001F is not whitespace or an opening bracket/quote"
+      }
+    ]
+  },
+  {
+    "schema_version": 1,
+    "case_id": "information-separator-raw-is-not-whitespace",
+    "description": "raw starting with U+001C does not start with whitespace: the space is added and the first cased letter follows the sentence",
+    "before": "word",
+    "after": "",
+    "raw": "\u001cNext",
+    "verbatim": false,
+    "expected_text": " \u001cnext",
+    "expected_changes": [
+      {
+        "kind": "leading_space",
+        "detail": "previous character 'd' is not whitespace or an opening bracket/quote"
+      },
+      {
+        "kind": "first_letter_case",
+        "detail": "previous non-whitespace 'd' continues the sentence"
+      }
+    ]
+  },
+  {
+    "schema_version": 1,
     "case_id": "camel-case-protected",
     "description": "camelCase identifier keeps its case",
     "before": "Use",

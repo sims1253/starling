@@ -13,4 +13,7 @@ object Contracts {
     fun modeRouting(name: String): String = File(dir, "mode-routing/$name").readText(Charsets.UTF_8)
 
     fun fixture(name: String): String = modeRouting("fixtures/$name")
+
+    fun insertionBoundaryFixture(name: String): String =
+        File(dir, "insertion-boundary/fixtures/$name").readText(Charsets.UTF_8)
 }
