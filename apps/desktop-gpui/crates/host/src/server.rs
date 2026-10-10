@@ -276,9 +276,7 @@ impl HostHandle {
         for (_, state) in &conn_threads {
             state.close();
         }
-        for (thread, _) in conn_threads {
-            let _ = thread.join();
-        }
+        let conn_states = join_conn_threads(conn_threads);
 
         let threads = self
             .threads
@@ -288,6 +286,23 @@ impl HostHandle {
             .collect::<Vec<_>>();
         for thread in threads {
             let _ = thread.join();
+        }
+        // A connection the accept thread admitted while the drain above
+        // ran (it stops at its next look at the flag) is closed and
+        // joined too, now that nothing admits another.
+        let late = lock_registry(&self.shared.conn_threads)
+            .drain(..)
+            .collect::<Vec<_>>();
+        for (_, state) in &late {
+            state.close();
+        }
+        let late_states = join_conn_threads(late);
+        // Joined: every connection's own handles are closed. Its state
+        // may outlive this host (the take feed, the transcriber and the
+        // broker name windows); its last transport handle must not —
+        // on Windows it would keep the pipe name bound for a successor.
+        for state in conn_states.iter().chain(&late_states) {
+            state.release_transport();
         }
 
         // Connections are closed and the accept thread is down. Now stop
@@ -400,7 +415,12 @@ pub(crate) struct ConnState {
     app: AtomicBool,
     /// A handle to the connection for immediate shutdown of both
     /// directions (the reader owns the original; the writer a clone).
-    closer: Box<dyn TransportConn>,
+    /// Taken (closed) once the connection's threads are gone: the state
+    /// itself outlives the connection wherever a take or transcription
+    /// still names its window, and on Windows an open server handle —
+    /// even of a disconnected instance — keeps the pipe name bound, so
+    /// a successor would probe this host as a live foreign server.
+    closer: Mutex<Option<Box<dyn TransportConn>>>,
 }
 
 /// What connection readers hand to the agent broker, each with the
@@ -447,7 +467,17 @@ impl ConnState {
     /// say (a slow consumer, a peer that is already gone).
     fn close(&self) {
         self.mark_closed();
-        let _ = self.closer.shutdown_both();
+        if let Some(closer) = lock_registry(&self.closer).as_ref() {
+            let _ = closer.shutdown_both();
+        }
+    }
+
+    /// Closes the connection's last host-side handle. Only once its
+    /// reader and writer have exited (they own the others): from then
+    /// on nothing is left to shut down, and an `Arc` of this state held
+    /// elsewhere pins no transport.
+    fn release_transport(&self) {
+        drop(lock_registry(&self.closer).take());
     }
 
     /// How full this connection's outbound queue is: `(queued,
@@ -864,7 +894,7 @@ fn accept_loop(
                     unregistered: AtomicBool::new(false),
                     agent: AtomicBool::new(false),
                     app: AtomicBool::new(shared.grants_app_role()),
-                    closer,
+                    closer: Mutex::new(Some(closer)),
                 });
 
                 // Spawn failures are survived, not fatal: a transient
@@ -911,7 +941,7 @@ fn accept_loop(
                 // clients (a crashlooping renderer reconnecting once a
                 // second must not grow it forever).
                 let mut threads = lock_registry(&shared.conn_threads);
-                threads.retain(|(thread, _)| !thread.is_finished());
+                reap_conn_threads(&mut threads);
                 threads.push((reader, Arc::clone(&state)));
                 threads.push((writer, Arc::clone(&state)));
             }
@@ -924,6 +954,32 @@ fn accept_loop(
             }
         }
     }
+}
+
+/// Drops the pairs whose threads exited, releasing the transport of
+/// every connection with no thread left (see
+/// [`ConnState::release_transport`]).
+fn reap_conn_threads(threads: &mut Vec<(JoinHandle<()>, Arc<ConnState>)>) {
+    let (finished, running): (Vec<_>, Vec<_>) = threads
+        .drain(..)
+        .partition(|(thread, _)| thread.is_finished());
+    for (_, state) in &finished {
+        if !running.iter().any(|(_, live)| Arc::ptr_eq(live, state)) {
+            state.release_transport();
+        }
+    }
+    *threads = running;
+}
+
+/// Joins connection threads, handing back their states.
+fn join_conn_threads(threads: Vec<(JoinHandle<()>, Arc<ConnState>)>) -> Vec<Arc<ConnState>> {
+    threads
+        .into_iter()
+        .map(|(thread, state)| {
+            let _ = thread.join();
+            state
+        })
+        .collect()
 }
 
 fn spawn_conn_thread(
