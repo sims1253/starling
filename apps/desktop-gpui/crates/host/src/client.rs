@@ -57,6 +57,10 @@ use crate::platform::{self, TransportConn};
 /// above any healthy machine's answer time.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long a store request waits for its answer: it may wait behind
+/// others, and an import or an export encodes a whole take.
+const STORE_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// The reader's read-poll slice: an idle connection wakes this often so
 /// the event backlog can flush the moment the application makes room
 /// (platforms whose transport cannot poll — see
@@ -171,6 +175,10 @@ pub enum TakeWire {
         state: crate::frame::TranscriptionState,
         yours: bool,
     },
+    /// A pass of the host's history audio upkeep (see [`Frame::Upkeep`]).
+    Upkeep { report: String, retired: bool },
+    /// The history list changed (see [`Frame::HistoryChanged`]).
+    HistoryChanged,
 }
 
 /// The host's answer to a [`HostClient::ask_user`].
@@ -182,11 +190,13 @@ pub struct AskResultWire {
 
 /// What came back for a registered request.
 enum Reply {
-    /// The receipt plus the `seq` the host routed the command under.
-    Receipt(Result<Receipt, Rejection>, Option<u64>),
+    /// The receipt plus the `seq` the host routed the command under, and
+    /// what holds the microphone for a refused `capture.start`.
+    Receipt(Result<Receipt, Rejection>, Option<u64>, Option<crate::frame::TakeBusy>),
     Snapshot(Value),
     AgentWelcome(String),
     TakeWatching(Option<HostRecovery>),
+    Stored(crate::history::StoreReply),
 }
 
 /// Why a client call failed.
@@ -199,7 +209,7 @@ pub enum ClientError {
     },
     #[error("the connection closed: {0}")]
     Closed(String),
-    #[error("no reply within {REPLY_TIMEOUT:?}")]
+    #[error("no reply in time")]
     Timeout,
     #[error("protocol violation from the host: {0}")]
     Protocol(String),
@@ -344,6 +354,38 @@ impl HostClient {
         corr: Option<&str>,
         command: Command,
     ) -> Result<(Receipt, Option<u64>), ClientError> {
+        let (result, seq, _) = self.send_answered(corr, command)?;
+        result.map(|receipt| (receipt, seq)).map_err(ClientError::Rejected)
+    }
+
+    /// [`Self::send`], with what holds the microphone when the host
+    /// refused a `capture.start` because another take does (see
+    /// [`crate::frame::TakeBusy`]).
+    pub fn send_reporting_busy(
+        &self,
+        corr: Option<&str>,
+        command: Command,
+    ) -> Result<Receipt, (ClientError, Option<crate::frame::TakeBusy>)> {
+        match self.send_answered(corr, command) {
+            Ok((Ok(receipt), _, _)) => Ok(receipt),
+            Ok((Err(rejection), _, busy)) => Err((ClientError::Rejected(rejection), busy)),
+            Err(err) => Err((err, None)),
+        }
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn send_answered(
+        &self,
+        corr: Option<&str>,
+        command: Command,
+    ) -> Result<
+        (
+            Result<Receipt, Rejection>,
+            Option<u64>,
+            Option<crate::frame::TakeBusy>,
+        ),
+        ClientError,
+    > {
         let mut envelope = serde_json::Map::new();
         envelope.insert("v".into(), Value::from(1u64));
         envelope.insert("id".into(), Value::from(new_id("cmd")));
@@ -353,11 +395,9 @@ impl HostClient {
         }
         envelope.insert("type".into(), Value::from(command.type_name()));
         envelope.insert("payload".into(), command.payload_value());
-        match self.exchange(Frame::Command {
+        self.exchange_answered(Frame::Command {
             envelope: Value::Object(envelope),
-        })? {
-            (receipt, seq) => Ok((receipt, seq)),
-        }
+        })
     }
 
     /// Sends a raw envelope — the envelope-level path (client-owned `id`,
@@ -384,14 +424,32 @@ impl HostClient {
                 Reply::Receipt(..) => Err(ClientError::Protocol(
                     "snapshot request answered by a receipt".to_string(),
                 )),
-                Reply::AgentWelcome(_) | Reply::TakeWatching(_) => Err(ClientError::Protocol(
-                    "snapshot request answered by an agent welcome or watch reply".to_string(),
-                )),
+                Reply::AgentWelcome(_) | Reply::TakeWatching(_) | Reply::Stored(_) => {
+                    Err(ClientError::Protocol(
+                        "snapshot request answered by another reply".to_string(),
+                    ))
+                }
             },
         )
     }
 
     fn exchange(&self, frame: Frame) -> Result<(Receipt, Option<u64>), ClientError> {
+        let (result, seq, _) = self.exchange_answered(frame)?;
+        result.map(|receipt| (receipt, seq)).map_err(ClientError::Rejected)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn exchange_answered(
+        &self,
+        frame: Frame,
+    ) -> Result<
+        (
+            Result<Receipt, Rejection>,
+            Option<u64>,
+            Option<crate::frame::TakeBusy>,
+        ),
+        ClientError,
+    > {
         let id = match &frame {
             Frame::Command { envelope } => envelope
                 .get("id")
@@ -405,15 +463,13 @@ impl HostClient {
             }
         };
         self.exchange_reply(frame, id, |reply| match reply {
-            Reply::Receipt(result, seq) => result
-                .map_err(ClientError::Rejected)
-                .map(|receipt| (receipt, seq)),
+            Reply::Receipt(result, seq, busy) => Ok((result, seq, busy)),
             Reply::Snapshot(_) => Err(ClientError::Protocol(
                 "command answered by a snapshot".to_string(),
             )),
-            Reply::AgentWelcome(_) | Reply::TakeWatching(_) => Err(ClientError::Protocol(
-                "command answered by an agent welcome or watch reply".to_string(),
-            )),
+            Reply::AgentWelcome(_) | Reply::TakeWatching(_) | Reply::Stored(_) => Err(
+                ClientError::Protocol("command answered by another reply".to_string()),
+            ),
         })
     }
 
@@ -421,6 +477,16 @@ impl HostClient {
         &self,
         frame: impl Into<Frame>,
         id: String,
+        interpret: impl FnOnce(Reply) -> Result<T, ClientError>,
+    ) -> Result<T, ClientError> {
+        self.exchange_reply_within(frame, id, REPLY_TIMEOUT, interpret)
+    }
+
+    fn exchange_reply_within<T>(
+        &self,
+        frame: impl Into<Frame>,
+        id: String,
+        timeout: Duration,
         interpret: impl FnOnce(Reply) -> Result<T, ClientError>,
     ) -> Result<T, ClientError> {
         let frame = frame.into();
@@ -445,7 +511,7 @@ impl HostClient {
         }
         let result = (|| {
             self.write_frame(&frame)?;
-            match rx.recv_timeout(REPLY_TIMEOUT) {
+            match rx.recv_timeout(timeout) {
                 Ok(reply) => interpret(reply),
                 Err(RecvError::Timeout) => Err(ClientError::Timeout),
                 // The reader delivered nothing and the reply channel is
@@ -491,10 +557,47 @@ impl HostClient {
         let req = new_id("watch");
         self.exchange_reply(Frame::TakeWatch { req: req.clone() }, req, |reply| match reply {
             Reply::TakeWatching(recovery) => Ok(recovery),
-            Reply::Receipt(..) | Reply::Snapshot(_) | Reply::AgentWelcome(_) => Err(
-                ClientError::Protocol("take watch answered by another reply".to_string()),
-            ),
+            Reply::Receipt(..) | Reply::Snapshot(_) | Reply::AgentWelcome(_) | Reply::Stored(_) => {
+                Err(ClientError::Protocol(
+                    "take watch answered by another reply".to_string(),
+                ))
+            }
         })
+    }
+
+    /// Sends a store request whose answer nobody waits for (it is dropped
+    /// on arrival): a release that must not block its caller.
+    pub fn store_unanswered(&self, request: crate::history::StoreRequest) -> Result<(), ClientError> {
+        self.send_unanswered(Frame::Store {
+            req: new_id("store"),
+            request,
+        })
+    }
+
+    /// Asks the host's store (see [`crate::history`]); the typed side is
+    /// [`crate::history::HistoryClient`].
+    pub fn store(
+        &self,
+        request: crate::history::StoreRequest,
+    ) -> Result<crate::history::StoreReply, ClientError> {
+        let req = new_id("store");
+        self.exchange_reply_within(
+            Frame::Store {
+                req: req.clone(),
+                request,
+            },
+            req,
+            STORE_TIMEOUT,
+            |reply| match reply {
+                Reply::Stored(reply) => Ok(reply),
+                Reply::Receipt(..)
+                | Reply::Snapshot(_)
+                | Reply::AgentWelcome(_)
+                | Reply::TakeWatching(_) => Err(ClientError::Protocol(
+                    "store request answered by another reply".to_string(),
+                )),
+            },
+        )
     }
 
     /// Streams `take`'s audio from sample `from` on (see
@@ -562,11 +665,12 @@ impl HostClient {
             req,
             |reply| match reply {
                 Reply::AgentWelcome(client) => Ok(client),
-                Reply::Receipt(..) | Reply::Snapshot(_) | Reply::TakeWatching(_) => {
-                    Err(ClientError::Protocol(
-                        "agent hello answered by a receipt, snapshot or watch reply".to_string(),
-                    ))
-                }
+                Reply::Receipt(..)
+                | Reply::Snapshot(_)
+                | Reply::TakeWatching(_)
+                | Reply::Stored(_) => Err(ClientError::Protocol(
+                    "agent hello answered by another reply".to_string(),
+                )),
             },
         )
     }
@@ -722,8 +826,13 @@ fn client_reader(
                 let conn = reader.into_inner();
                 reader = FrameReader::new(conn, cap.max(HELLO_PHASE_CAP));
             }
-            Ok(Frame::Receipt { req, seq, result }) => {
-                deliver(&pending, &req, Reply::Receipt(result, seq));
+            Ok(Frame::Receipt {
+                req,
+                seq,
+                result,
+                busy,
+            }) => {
+                deliver(&pending, &req, Reply::Receipt(result, seq, busy));
             }
             Ok(Frame::Snapshot { req, snapshot }) => {
                 deliver(&pending, &req, Reply::Snapshot(snapshot));
@@ -734,13 +843,18 @@ fn client_reader(
             Ok(Frame::TakeWatching { req, recovery }) => {
                 deliver(&pending, &req, Reply::TakeWatching(recovery));
             }
+            Ok(Frame::Stored { req, reply }) => {
+                deliver(&pending, &req, Reply::Stored(reply));
+            }
             Ok(
                 frame @ (Frame::LiveTake { .. }
                 | Frame::TakeStartFailed { .. }
                 | Frame::TakePersisted { .. }
                 | Frame::HostNotice { .. }
                 | Frame::LiveText { .. }
-                | Frame::Transcription { .. }),
+                | Frame::Transcription { .. }
+                | Frame::Upkeep { .. }
+                | Frame::HistoryChanged),
             ) => {
                 let wire = match take_wire(frame) {
                     Ok(wire) => wire,
@@ -834,7 +948,8 @@ fn client_reader(
                 | Frame::TakeTap { .. }
                 | Frame::TakeAdopt { .. }
                 | Frame::Transcribe { .. }
-                | Frame::TranscribeDue { .. },
+                | Frame::TranscribeDue { .. }
+                | Frame::Store { .. },
             ) => {
                 fail("host sent a client frame".to_string());
                 break;
@@ -950,6 +1065,8 @@ fn take_wire(frame: Frame) -> Result<TakeWire, String> {
             state,
             yours,
         },
+        Frame::Upkeep { report, retired } => TakeWire::Upkeep { report, retired },
+        Frame::HistoryChanged => TakeWire::HistoryChanged,
         other => return Err(format!("{other:?} is not a take frame")),
     })
 }
@@ -989,4 +1106,21 @@ trait Detach {
 
 impl Detach for std::thread::JoinHandle<()> {
     fn detach(self) {}
+}
+
+impl crate::history::StoreCall for HostClient {
+    fn call(
+        &self,
+        request: crate::history::StoreRequest,
+    ) -> Result<crate::history::StoreReply, starling_dictation::storage::StorageError> {
+        self.store(request).map_err(|err| {
+            starling_dictation::storage::StorageError::Io(std::io::Error::other(format!(
+                "Starling's recording service did not answer ({err})"
+            )))
+        })
+    }
+
+    fn chunk_bytes(&self) -> usize {
+        crate::history::chunk_bytes(usize::try_from(self.info.max_frame_bytes).unwrap_or(usize::MAX))
+    }
 }

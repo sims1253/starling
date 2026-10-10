@@ -6,8 +6,10 @@
 //! tree, so killing the app never costs a take and a second app window
 //! is just another client. The host also transcribes the takes it
 //! stores: live text while a take records, the transcript once it is
-//! stored, the retries the app asks for. The app keeps what needs its
-//! window — the activation machine, the live view, staging, delivery.
+//! stored, the retries the app asks for — and its store is the app's: the
+//! history the app shows and changes goes through the same connection
+//! ([`crate::store`]). The app keeps what needs its window — the
+//! activation machine, the live view, staging, delivery.
 //!
 //! [`HostLink`] owns the connection on its own thread: it connects to the
 //! host serving the default data root, starts one when nothing serves
@@ -28,7 +30,7 @@ use starling_runtime::machine::capture::LiveTakeStatus;
 use starling_runtime::protocol::Command;
 use starling_runtime_host::client::{EventWire, HostClient, TakeWire};
 use starling_runtime_host::frame::{
-    HostRecovery, LivePartial, TakeOwner, TranscribeWith, TranscriptionState,
+    HostRecovery, LivePartial, TakeBusy, TakeOwner, TranscribeWith, TranscriptionState,
 };
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
@@ -79,11 +81,13 @@ pub(crate) enum HostUpdate {
     /// A runtime event the UI acts on (`capture.error`).
     Event(EventWire),
     /// A command for `take` was not carried out (refused by the runtime,
-    /// or no connection to send it on).
+    /// or no connection to send it on). `busy`: a refused start, and what
+    /// holds the microphone.
     Refused {
         take: String,
         command: &'static str,
         reason: String,
+        busy: Option<TakeBusy>,
     },
 }
 
@@ -114,6 +118,10 @@ pub(crate) enum TakeUpdate {
         orphan: bool,
     },
     Notice(HostRecovery),
+    /// What a pass of the host's history audio upkeep did.
+    Upkeep { report: String, retired: bool },
+    /// Another window (or this one) changed the history list.
+    HistoryChanged,
     /// A recording take's live text, or why it stopped.
     LiveText {
         take: String,
@@ -148,6 +156,7 @@ pub(crate) struct HostLink {
     commands: std::sync::mpsc::Sender<Outgoing>,
     stop: Arc<AtomicBool>,
     relaunch: Arc<AtomicBool>,
+    current: Arc<Mutex<Option<Arc<HostClient>>>>,
 }
 
 enum Outgoing {
@@ -187,6 +196,7 @@ impl HostLink {
                     .name("starling-host-commands".to_string())
                     .spawn({
                         let tx = tx.clone();
+                        let current = Arc::clone(&current);
                         move || command_loop(outgoing, current, tx)
                     })
             });
@@ -202,6 +212,7 @@ impl HostLink {
                 commands,
                 stop,
                 relaunch,
+                current,
             },
             rx,
         )
@@ -241,6 +252,12 @@ impl HostLink {
         });
     }
 
+    /// The connection the link holds now (`None` while it has none), as
+    /// the app's store reaches the host through it.
+    pub(crate) fn connection(&self) -> Arc<Mutex<Option<Arc<HostClient>>>> {
+        Arc::clone(&self.current)
+    }
+
     /// Starts the recording service again after the link gave up on it.
     pub(crate) fn retry(&self) {
         self.relaunch.store(true, Ordering::SeqCst);
@@ -270,15 +287,19 @@ fn command_loop(
             Outgoing::Command { take, command } => {
                 let name = command_name(&command);
                 let result = match client {
-                    Some(client) => client.send(Some(&take), command).map(|_| ()).map_err(|err| err.to_string()),
-                    None => Err("not connected to the recording service".to_string()),
+                    Some(client) => client
+                        .send_reporting_busy(Some(&take), command)
+                        .map(|_| ())
+                        .map_err(|(err, busy)| (err.to_string(), busy)),
+                    None => Err(("not connected to the recording service".to_string(), None)),
                 };
-                if let Err(reason) = result {
+                if let Err((reason, busy)) = result {
                     if tx
                         .send(HostUpdate::Refused {
                             take,
                             command: name,
                             reason,
+                            busy,
                         })
                         .is_err()
                     {
@@ -299,6 +320,7 @@ fn command_loop(
                             take,
                             command: "take.adopt",
                             reason,
+                            busy: None,
                         })
                         .is_err()
                     {
@@ -330,6 +352,7 @@ fn command_loop(
                             take: req,
                             command: "transcribe",
                             reason,
+                            busy: None,
                         })
                         .is_err()
                     {
@@ -546,6 +569,8 @@ fn route(frame: TakeWire) -> TakeUpdate {
             orphan,
         },
         TakeWire::Notice(recovery) => TakeUpdate::Notice(recovery),
+        TakeWire::Upkeep { report, retired } => TakeUpdate::Upkeep { report, retired },
+        TakeWire::HistoryChanged => TakeUpdate::HistoryChanged,
         TakeWire::LiveText {
             take,
             partial,

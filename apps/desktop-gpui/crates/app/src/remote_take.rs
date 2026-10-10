@@ -18,14 +18,14 @@
 //! the host into history (nothing is typed: the window it was meant for
 //! is gone).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui::Context;
 use starling_runtime::protocol::Command;
 use starling_runtime_host::client::HostClient;
-use starling_runtime_host::frame::{LivePartial, TakeOwner, TranscriptionState};
+use starling_runtime_host::frame::{LivePartial, TakeBusy, TakeOwner, TranscriptionState};
 use starling_runtime_host::live::stream::Partial;
 
 use crate::activation::{CancelReason, TakeId};
@@ -66,13 +66,24 @@ pub(crate) struct HostState {
     pub(crate) lost_take_on: Option<u32>,
     /// The pid of the host the last connection went to.
     pub(crate) client_pid: Option<u32>,
-    /// The exact transcript (attempt id and text) this window's own take
-    /// delivers and stages, while it does: never a later result another
-    /// window asked for.
-    pub(crate) own_results: HashMap<String, (Option<String>, String)>,
+    /// The exact transcript (attempt id and text) this window's own takes
+    /// deliver and stage — never a later result another window asked
+    /// for — newest last. Kept past the result's arrival: a staged take's
+    /// Insert may come much later ([`OWN_RESULTS_KEPT`] of them).
+    pub(crate) own_results: VecDeque<OwnResult>,
     /// The live text the host sent with an adoption still being
     /// confirmed, shown once the take is this window's.
     pub(crate) claimed_text: Option<(Option<LivePartial>, Option<String>)>,
+}
+
+/// How many of this window's own results are remembered.
+const OWN_RESULTS_KEPT: usize = 32;
+
+/// One own take's transcript ([`HostState::own_results`]).
+pub(crate) struct OwnResult {
+    stored_id: String,
+    attempt: Option<String>,
+    text: String,
 }
 
 /// What the window says when the service went away with its take.
@@ -145,14 +156,20 @@ fn partial_of(live: LivePartial) -> Partial {
     }
 }
 
-/// What a refused second start says: another window (or app) records.
-fn start_refusal(reason: &str) -> String {
-    if reason.contains("capture.start illegal in") {
-        "Another Starling window is recording right now. Stop that recording first, then start \
-         a new one."
-            .to_string()
-    } else {
-        format!("The recording could not start: {reason}")
+/// What a refused start says, from what the host says holds the
+/// microphone.
+fn start_refusal(busy: Option<TakeBusy>, reason: &str) -> String {
+    match busy {
+        Some(TakeBusy::Recording { yours: false }) => "Another Starling window is recording \
+             right now. Stop that recording first, then start a new one."
+            .to_string(),
+        Some(TakeBusy::Recording { yours: true }) => "This window's previous recording is still \
+             running. Stop it first, then start a new one."
+            .to_string(),
+        Some(TakeBusy::Saving) => "The previous recording is still being saved. Start again in a \
+             moment."
+            .to_string(),
+        None => format!("The recording could not start: {reason}"),
     }
 }
 
@@ -164,9 +181,12 @@ impl StarlingApp {
             Ok(endpoint) => endpoint,
             Err(err) => {
                 self.host.down = Some(err.clone());
+                self.store_error = Some(format!(
+                    "Starling's recording service has no place to run ({err})."
+                ));
                 self.error = Some(format!(
-                    "Starling's recording service has no place to run ({err}); recording is \
-                     unavailable."
+                    "Starling's recording service has no place to run ({err}); recording and \
+                     history are unavailable."
                 ));
                 return;
             }
@@ -186,6 +206,8 @@ impl StarlingApp {
         cx: &mut Context<Self>,
     ) {
         let (link, mut updates) = HostLink::start(endpoint, launch);
+        // The store is the host's, through this link's connection.
+        self.store = Some(crate::store::Store::through(link.connection()));
         self.host.link = Some(link);
         self.host.down = Some("connecting".to_string());
         cx.spawn(async move |this, cx| {
@@ -246,6 +268,7 @@ impl StarlingApp {
                     crate::upload::add_recovery_messages(self, recovery.problems, recovery.notice);
                 }
                 self.refresh_history(cx);
+                self.ask_upkeep(false, cx);
             }
             HostUpdate::Disconnected {
                 reason,
@@ -278,8 +301,11 @@ impl StarlingApp {
                 take,
                 command,
                 reason,
+                busy,
             } => match command {
-                "capture.start" => self.take_start_failed(&take, None, start_refusal(&reason), cx),
+                "capture.start" => {
+                    self.take_start_failed(&take, None, start_refusal(busy, &reason), cx)
+                }
                 "take.adopt" => {
                     // Asked again on the next tick while it is unowned.
                     if let Some((_, asked_at)) = self
@@ -442,7 +468,6 @@ impl StarlingApp {
         if let Some(lease) = self.playback_lease.take() {
             self.playback.handle().end(lease);
         }
-        self.audio_upkeep.set_recording(false);
         self.live_partial.clear();
         self.levels = vec![0.06; 52];
         self.delivery_take_stopped();
@@ -549,6 +574,8 @@ impl StarlingApp {
                 crate::upload::add_recovery_messages(self, recovery.problems, recovery.notice);
                 self.refresh_history(cx);
             }
+            TakeUpdate::Upkeep { report, retired } => self.upkeep_reported(report, retired, cx),
+            TakeUpdate::HistoryChanged => self.refresh_history(cx),
             TakeUpdate::LiveText {
                 take,
                 partial,
@@ -697,7 +724,6 @@ impl StarlingApp {
         if let Some(lease) = self.playback_lease.take() {
             self.playback.handle().end(lease);
         }
-        self.audio_upkeep.set_recording(false);
         self.delivery_take_stopped();
         self.retire_staging(cx);
         if let Some(take) = self.recording_take.take() {
@@ -767,7 +793,6 @@ impl StarlingApp {
         };
         self.recorder = Some(LiveCapture::new(take));
         self.recording_take = Some(activation);
-        self.audio_upkeep.set_recording(true);
         self.live_partial.clear();
         self.stream_degradation = None;
         if self.staged_mode() {
@@ -973,10 +998,20 @@ impl StarlingApp {
         yours: bool,
         cx: &mut Context<Self>,
     ) {
-        let request = req
-            .as_ref()
-            .and_then(|req| self.host.requests.remove(req))
-            .filter(|request| request.stored_id == stored_id);
+        // A request answered for another take is not this one's: it stays
+        // (with its hold) for the frames that are.
+        let request = match req.as_ref() {
+            Some(req)
+                if self
+                    .host
+                    .requests
+                    .get(req)
+                    .is_some_and(|request| request.stored_id == stored_id) =>
+            {
+                self.host.requests.remove(req)
+            }
+            _ => None,
+        };
         let offer = request.as_ref().is_some_and(|request| request.offer);
         let own_job = req.is_none();
         match state {
@@ -1037,6 +1072,11 @@ impl StarlingApp {
                 match state {
                     TranscriptionState::Completed { kept_earlier, text } => {
                         let Some(store) = self.store.clone() else {
+                            // Nowhere to read the take back from: nothing
+                            // is typed or staged for it here.
+                            if own {
+                                self.no_transcript_here(&stored_id, cx);
+                            }
                             return;
                         };
                         cx.spawn(async move |this, cx| {
@@ -1060,11 +1100,8 @@ impl StarlingApp {
                                 // went when it was asked for).
                                 let recovers = offer && app.staging_failed_for(&stored_id);
                                 if own || recovers {
-                                    app.host
-                                        .own_results
-                                        .insert(stored_id.clone(), (attempt, text.clone()));
+                                    app.remember_own_result(&stored_id, attempt, text.clone());
                                     app.after_transcription(stored_id.clone(), cx);
-                                    app.host.own_results.remove(&stored_id);
                                 } else {
                                     app.after_other_result(stored_id.clone(), cx);
                                 }
@@ -1116,24 +1153,45 @@ impl StarlingApp {
         }
     }
 
+    /// Remembers take `id`'s own result, replacing an earlier one.
+    fn remember_own_result(&mut self, id: &str, attempt: Option<String>, text: String) {
+        self.forget_own_result(id);
+        if self.host.own_results.len() >= OWN_RESULTS_KEPT {
+            self.host.own_results.pop_front();
+        }
+        self.host.own_results.push_back(OwnResult {
+            stored_id: id.to_string(),
+            attempt,
+            text,
+        });
+    }
+
+    /// Take `id` delivers or stages nothing more of its own here.
+    pub(crate) fn forget_own_result(&mut self, id: &str) {
+        self.host.own_results.retain(|own| own.stored_id != id);
+    }
+
+    fn own(&self, id: &str) -> Option<&OwnResult> {
+        self.host.own_results.iter().find(|own| own.stored_id == id)
+    }
+
     /// The transcript stored take `id` delivers here: its own result's
-    /// text while that is being delivered (a later result another window
-    /// asked for must not be typed in its place).
+    /// text (a later result another window asked for must not be typed in
+    /// its place).
     pub(crate) fn own_result(&self, id: &str) -> Option<String> {
-        self.host.own_results.get(id).map(|(_, text)| text.clone())
+        self.own(id).map(|own| own.text.clone())
     }
 
     /// [`Self::own_result`] with the attempt that produced it.
     pub(crate) fn own_result_attempt(&self, id: &str) -> Option<(String, String)> {
-        self.host
-            .own_results
-            .get(id)
-            .and_then(|(attempt, text)| attempt.clone().map(|attempt| (attempt, text.clone())))
+        self.own(id)
+            .and_then(|own| own.attempt.clone().map(|attempt| (attempt, own.text.clone())))
     }
 
     /// No transcript will come for stored take `id` in this window:
     /// nothing is typed or processed for it.
     fn no_transcript_here(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.forget_own_result(id);
         self.stop_instants.remove(id);
         self.forget_delivery(id);
         self.staging_transcription_failed(id, cx);
@@ -1182,14 +1240,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_refused_second_start_says_another_window_records() {
-        let told = start_refusal(
-            "command capture.start illegal in Recording: capture.start is not legal",
-        );
+    fn a_refused_start_says_what_holds_the_microphone() {
+        let reason = "the runtime refused the command: capture.start illegal in Recording";
+        let told = start_refusal(Some(TakeBusy::Recording { yours: false }), reason);
         assert!(told.contains("Another Starling window is recording"), "{told}");
         assert!(!told.contains("illegal"));
+        let told = start_refusal(Some(TakeBusy::Saving), reason);
+        assert!(told.contains("still being saved"), "{told}");
+        // The wording of the rejection decides nothing.
         assert_eq!(
-            start_refusal("not connected to the recording service"),
+            start_refusal(None, reason),
+            format!("The recording could not start: {reason}")
+        );
+        assert_eq!(
+            start_refusal(None, "not connected to the recording service"),
             "The recording could not start: not connected to the recording service"
         );
     }

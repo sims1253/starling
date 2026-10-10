@@ -43,7 +43,6 @@ impl StarlingApp {
         let Some(live) = self.recorder.take() else {
             return;
         };
-        self.audio_upkeep.set_recording(false);
         self.live_partial.clear();
         // Storage-fault honesty (I1 phase 2): a journal fault that froze
         // acknowledgment is surfaced.
@@ -130,7 +129,6 @@ impl StarlingApp {
         // when there is no live text for it.
         self.stream_degradation = None;
         self.recorder = Some(crate::host_link::LiveCapture::new(take.clone()));
-        self.audio_upkeep.set_recording(true);
         self.playback_lease = playback_lease;
         self.elapsed_ms = 0.0;
         self.levels = vec![0.06; 52];
@@ -173,7 +171,6 @@ impl StarlingApp {
         let Some(live) = self.recorder.take() else {
             return;
         };
-        self.audio_upkeep.set_recording(false);
         self.live_partial.clear();
         self.stream_degradation = None;
         self.levels = vec![0.06; 52];
@@ -1706,6 +1703,57 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// #220 step C: the window's history goes through the host — an
+    /// import stored and transcribed there, the list, archiving, the
+    /// audio export reads and a delete — and comes back after the host
+    /// restarts. The window opens no store of its own.
+    #[gpui::test]
+    fn history_imports_and_deletes_go_through_the_host(cx: &mut gpui::TestAppContext) {
+        let root = scratch("host-history");
+        let fixtures = Store::at_test_root(&root);
+        let (server, served) = fake_server(vec![Reply::Text("imported words")]);
+        let mut host = host_at(&root, Vec::new(), std::time::Duration::from_secs(20), server);
+        let app = app_on_host(cx, &fixtures, &host, server);
+        app.update(cx, |app, cx| app.save_import(one_second_wav(), cx));
+        settle(cx, "the import transcribed", |cx| {
+            app.read_with(cx, |app, _| {
+                app.sessions.iter().any(|session| {
+                    session.transcript.as_ref().map(|t| t.text.as_str()) == Some("imported words")
+                }) && app.host.awaiting.is_empty()
+            })
+        });
+        assert_eq!(*served.lock().unwrap(), 1, "the host transcribed it once");
+        let id = app.read_with(cx, |app, _| app.selected_id.clone()).expect("selected");
+
+        app.update(cx, |app, cx| app.toggle_archival_selected(cx));
+        settle(cx, "the take archived", |cx| {
+            app.read_with(cx, |app, _| app.selected().is_some_and(|take| take.archival))
+        });
+        let store = app.read_with(cx, |app, _| app.store.clone()).expect("the host's store");
+        let wav = store.audio_wav(&id).expect("wav").expect("present");
+        assert_eq!(*wav, *one_second_wav());
+        assert!(store.audio_flac(&id).unwrap().unwrap().starts_with(b"fLaC"));
+
+        // A host restart: the history comes back with the connection.
+        host.shutdown();
+        let mut host = host_at(&root, Vec::new(), std::time::Duration::from_secs(20), server);
+        settle(cx, "the reconnect", |cx| app.read_with(cx, |app, _| app.host.client.is_some()));
+        app.update(cx, |app, _| app.sessions.clear());
+        app.update(cx, |app, cx| app.refresh_history(cx));
+        settle(cx, "the history again", |cx| {
+            app.read_with(cx, |app, _| app.sessions.iter().any(|session| session.id == id))
+        });
+
+        assert!(app.update(cx, |app, cx| app.remove_session(id.clone(), cx)));
+        settle(cx, "the take deleted", |cx| {
+            app.read_with(cx, |app, _| app.sessions.iter().all(|session| session.id != id))
+        });
+        assert!(fixtures.list().unwrap().is_empty(), "deleted in the store");
+        drop(app);
+        host.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[gpui::test]
     fn recording_is_refused_while_the_service_cannot_be_reached(cx: &mut gpui::TestAppContext) {
         let root = scratch("host-down");
@@ -1889,6 +1937,79 @@ mod tests {
         settle(cx, "the own take typed", |_| !fake.insertions().is_empty());
         assert_eq!(fake.insertions()[0].1, "my own");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Another window changed the history: this one reloads its list.
+    #[gpui::test]
+    fn another_windows_history_change_reloads_the_list(cx: &mut gpui::TestAppContext) {
+        let root = scratch("frames-history-changed");
+        let store = Store::at_test_root(&root);
+        let (app, _) = window_with_typing(cx, &store);
+        let id = transcribed(&store, "stored elsewhere");
+        assert!(app.read_with(cx, |app, _| app.sessions.is_empty()));
+        frame(&app, cx, TakeUpdate::HistoryChanged);
+        settle(cx, "the list reloaded", |cx| {
+            app.read_with(cx, |app, _| app.sessions.iter().any(|session| session.id == id))
+        });
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A frame that pairs this window's request with another take does
+    /// not consume the request: the frames for its own take still find
+    /// it (and its offer).
+    #[gpui::test]
+    fn a_request_answered_for_another_take_is_kept_for_its_own(cx: &mut gpui::TestAppContext) {
+        let root = scratch("frames-request-mismatch");
+        let store = Store::at_test_root(&root);
+        let id = transcribed(&store, "the retried words");
+        let other = transcribed(&store, "another take");
+        let (app, _) = window_with_typing(cx, &store);
+        app.update(cx, |app, _| {
+            app.host.requests.insert(
+                "tr_mine".to_string(),
+                crate::remote_take::Request {
+                    stored_id: id.clone(),
+                    _hold: None,
+                    offer: true,
+                },
+            );
+        });
+        frame(&app, cx, completed_with(&other, Some("tr_mine"), true, "another take"));
+        assert!(
+            app.read_with(cx, |app, _| app.host.requests.contains_key("tr_mine")),
+            "the request waits for its own take's frames"
+        );
+        frame(&app, cx, completed_with(&id, Some("tr_mine"), true, "the retried words"));
+        settle(cx, "the retry offered", |cx| {
+            app.read_with(cx, |app, _| app.delivery.recovery.is_some())
+        });
+        assert!(app.read_with(cx, |app, _| app.host.requests.is_empty()));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A window with no store to read its own take back from lets go of
+    /// it when the transcript arrives: nothing stays bound or busy.
+    #[gpui::test]
+    fn a_window_without_a_store_lets_go_of_its_own_take(cx: &mut gpui::TestAppContext) {
+        let fake = Arc::new(FakeBackend::new());
+        fake.focus(FakeTarget::named("Editor", "notes.txt"));
+        let inserter = Arc::new(Inserter::with_backends(vec![Box::new(fake.clone())]));
+        let app = cx.new(|cx| {
+            let mut app = StarlingApp::for_test(None, cx);
+            app.delivery = DeliveryState::new(inserter, InsertionSettings::default());
+            app
+        });
+        own_take(&app, cx, "c_lost");
+        app.update(cx, |app, _| {
+            app.active_ids.insert("c_lost".to_string());
+        });
+        frame(&app, cx, completed_with("c_lost", None, true, "words"));
+        app.read_with(cx, |app, _| {
+            assert!(app.host.awaiting.is_empty());
+            assert!(!app.delivers("c_lost"), "nothing is typed for it later");
+            assert!(!app.is_active("c_lost"));
+        });
+        assert!(fake.insertions().is_empty());
     }
 
     /// A disconnect lets go of the takes this window waited for: they are

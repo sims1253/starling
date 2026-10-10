@@ -365,6 +365,57 @@ fn a_second_window_cannot_end_a_take_its_live_owner_records() {
     host.shutdown();
 }
 
+/// A refused start says what holds the microphone, typed in its receipt
+/// (#220): another connection's take, the connection's own, or nothing
+/// the feed knows of.
+#[test]
+fn a_refused_start_says_what_holds_the_microphone() {
+    use starling_runtime_host::client::ClientError;
+    use starling_runtime_host::frame::TakeBusy;
+    let root = tempfile::tempdir().unwrap();
+    let source = FakeCaptureSource::new(vec![FakeTakeScript::clean(), FakeTakeScript::clean()]);
+    let mut host = serve(config(root.path(), source)).expect("host serves");
+    let owner = connect(&host);
+    owner.take_watch().unwrap();
+    start(&owner, "take-mine");
+    let mut seen = Vec::new();
+    until_take(&owner, "a live tick", &mut seen, is_live_tick("take-mine"));
+    let other = connect(&host);
+    other.take_watch().unwrap();
+    let again = || Command::CaptureStart {
+        policy: "push-to-talk".into(),
+    };
+    for (client, take, yours) in [(&other, "take-theirs", false), (&owner, "take-again", true)] {
+        match client.send_reporting_busy(Some(take), again()) {
+            Err((ClientError::Rejected(_), busy)) => {
+                assert_eq!(busy, Some(TakeBusy::Recording { yours }), "{take}")
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+    // A refusal for any other reason names nothing: the plain send path
+    // is unchanged.
+    match other.send(Some("take-theirs"), again()) {
+        Err(ClientError::Rejected(rejection)) => assert!(
+            matches!(
+                rejection,
+                starling_runtime::machine::Rejection::IllegalInState { .. }
+            ),
+            "{rejection:?}"
+        ),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    stop(&owner, "take-mine");
+    until_take(&owner, "the stored row", &mut seen, is_persisted("take-mine"));
+    // Free again: the other window's start is taken.
+    other
+        .send_reporting_busy(Some("take-theirs"), again())
+        .expect("a start once the microphone is free");
+    drop(owner);
+    drop(other);
+    host.shutdown();
+}
+
 fn host_capture_state(client: &HostClient) -> String {
     client.snapshot().unwrap()["capture"]["state"]
         .as_str()

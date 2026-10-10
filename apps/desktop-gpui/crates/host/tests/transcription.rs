@@ -21,6 +21,9 @@ use starling_runtime_host::{serve, HostConfig, HostHandle};
 
 #[path = "common/fake_engine.rs"]
 mod fake_engine;
+#[cfg(unix)]
+#[path = "common/reaped.rs"]
+mod reaped;
 use fake_engine::{FakeEngine, Reply, StreamMode};
 
 fn config(root: &Path, scripts: Vec<FakeTakeScript>, engine: &FakeEngine) -> HostConfig {
@@ -393,6 +396,43 @@ fn a_take_left_waiting_by_a_dead_host_is_transcribed_once_by_the_next() {
     assert_eq!(completed_attempts(root.path(), &claimed).len(), 1);
 }
 
+/// A take that stopped but whose host died before storing it (its journal
+/// finalized, its commit never made) comes back at the next start and is
+/// transcribed there, as its own commit would have had it.
+#[test]
+fn a_take_stopped_but_not_stored_when_its_host_died_is_transcribed_by_the_next() {
+    let root = tempfile::tempdir().unwrap();
+    let id = {
+        let scratch = tempfile::tempdir().unwrap();
+        let store = StoreV2::open(scratch.path()).unwrap();
+        let mut take = store.begin_take(TakeMeta::for_device("test-device")).unwrap();
+        let id = take.id().to_string();
+        take.append_frames(&vec![0.1f32; 16_000]).unwrap();
+        take.finalize().unwrap();
+        let journals = root.path().join("journals");
+        std::fs::create_dir_all(&journals).unwrap();
+        let path = journals.join(format!("{id}.sj"));
+        std::fs::rename(scratch.path().join("staging").join(format!("{id}.sj")), &path).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(120))
+            .unwrap();
+        id
+    };
+    let engine = FakeEngine::start(vec![Reply::Text("recovered words".into())], StreamMode::Refuse);
+    let mut host = serve(config(root.path(), Vec::new(), &engine)).expect("serves");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while completed_attempts(root.path(), &id).is_empty() {
+        assert!(Instant::now() < deadline, "the recovered take was not transcribed");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    host.shutdown();
+    assert_eq!(completed_attempts(root.path(), &id), vec!["recovered words"]);
+    assert_eq!(engine.batch_requests(), 1);
+}
+
 /// Two windows on one host that dies mid-transcription: the take is
 /// transcribed once by the next host, never by a window.
 #[test]
@@ -461,17 +501,19 @@ fn a_host_process_killed_mid_transcription_leaves_the_take_to_the_next_one() {
         take.finalize().unwrap().commit_marked(&mut store, CommitMark::Complete).unwrap().record.id
     };
     let spawn = || {
-        ProcessCommand::new(HOST_BIN)
-            .arg("--root")
-            .arg(&root)
-            .arg("--runtime-dir")
-            .arg(&runtime_dir)
-            .env("XDG_CONFIG_HOME", &config_home)
-            .env("XDG_DATA_HOME", scratch.path().join("data"))
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("host binary spawns")
+        reaped::Reaped(
+            ProcessCommand::new(HOST_BIN)
+                .arg("--root")
+                .arg(&root)
+                .arg("--runtime-dir")
+                .arg(&runtime_dir)
+                .env("XDG_CONFIG_HOME", &config_home)
+                .env("XDG_DATA_HOME", scratch.path().join("data"))
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("host binary spawns"),
+        )
     };
     let wait_for = |what: &str, done: &dyn Fn() -> bool| {
         let deadline = Instant::now() + Duration::from_secs(20);

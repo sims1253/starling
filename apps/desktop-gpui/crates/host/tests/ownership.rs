@@ -10,6 +10,7 @@
 // takeover, a squatting listener, a non-socket file at the endpoint) —
 // those are gated individually; the pipe namespace has no residue.
 
+use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -18,6 +19,10 @@ use starling_runtime::provider::FakeProvider;
 use starling_runtime::testing::FakeCaptureSource;
 use starling_runtime_host::client::HostClient;
 use starling_runtime_host::{serve, HostConfig, HostError};
+
+#[path = "common/reaped.rs"]
+mod reaped;
+use reaped::Reaped;
 
 /// The built binary (cargo provides the path for bin targets in
 /// integration tests).
@@ -172,17 +177,19 @@ fn a_second_host_binary_reports_already_running_and_exits_zero() {
     // Bounded: a regression that makes the second host *block* (instead
     // of reporting already-running and exiting) must fail this test at
     // the deadline, not hang the suite until the job timeout.
-    let mut child = Command::new(BIN)
-        // Never the user's real engine settings/dirs in a test.
-        .args(["--engine", "none"])
-        .arg("--root")
-        .arg(root.path())
-        .arg("--runtime-dir")
-        .arg(root.path().join("endpoints"))
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("second host runs");
+    let mut child = Reaped(
+        Command::new(BIN)
+            // Never the user's real engine settings/dirs in a test.
+            .args(["--engine", "none"])
+            .arg("--root")
+            .arg(root.path())
+            .arg("--runtime-dir")
+            .arg(root.path().join("endpoints"))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("second host runs"),
+    );
     let deadline = Instant::now() + Duration::from_secs(15);
     let status = loop {
         match child.try_wait().expect("try_wait the second host") {
@@ -195,14 +202,14 @@ fn a_second_host_binary_reports_already_running_and_exits_zero() {
             None => std::thread::sleep(Duration::from_millis(25)),
         }
     };
-    let output = child.wait_with_output().expect("drain the pipes");
+    let (mut stdout, mut stderr) = (String::new(), String::new());
+    child.stdout.take().expect("piped").read_to_string(&mut stdout).expect("drain stdout");
+    child.stderr.take().expect("piped").read_to_string(&mut stderr).expect("drain stderr");
 
     assert!(
         status.success(),
-        "a live owner means client mode, not failure: {}",
-        String::from_utf8_lossy(&output.stderr)
+        "a live owner means client mode, not failure: {stderr}"
     );
-    let stdout = String::from_utf8_lossy(&output.stdout);
     let status: serde_json::Value = serde_json::from_str(stdout.trim())
         .unwrap_or_else(|err| panic!("stdout is one JSON line ({stdout:?}): {err}"));
     assert_eq!(status["status"], "already-running");

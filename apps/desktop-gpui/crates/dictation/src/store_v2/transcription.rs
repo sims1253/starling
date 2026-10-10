@@ -406,9 +406,10 @@ impl StoreV2 {
 
 impl StoreV2 {
     /// Refuses `what` on a connection a caller holds a transaction on: the
-    /// claim and the settle each run their own top-level transaction, whose
+    /// claim, the settle and a recognition start each run their own
+    /// top-level transaction, whose
     /// commit (or failure-path ROLLBACK) would otherwise end the caller's.
-    fn refuse_open_transaction(&self, what: &str) -> Result<(), StoreV2Error> {
+    pub(super) fn refuse_open_transaction(&self, what: &str) -> Result<(), StoreV2Error> {
         if self.conn.is_autocommit() {
             Ok(())
         } else {

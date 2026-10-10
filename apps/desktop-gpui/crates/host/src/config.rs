@@ -64,6 +64,10 @@ pub struct HostConfig {
     pub orphan_grace: Duration,
     /// How long a transcription waits for an engine to serve.
     pub engine_wait: Duration,
+    /// When the history audio upkeep first runs after startup, and how
+    /// often after that ([`crate::history::History::upkeep_loop`]).
+    pub upkeep_first: Duration,
+    pub upkeep_interval: Duration,
     /// The agent allowlist file (see [`crate::agent::Allowlist`]).
     /// `None` or a missing file denies every agent client; a malformed
     /// file refuses startup.
@@ -102,6 +106,8 @@ impl HostConfig {
             engine: EngineChoice::None,
             orphan_grace: crate::takes::DEFAULT_ORPHAN_GRACE,
             engine_wait: crate::transcribe::DEFAULT_ENGINE_WAIT,
+            upkeep_first: crate::history::UPKEEP_FIRST,
+            upkeep_interval: crate::history::UPKEEP_INTERVAL,
             agent_allowlist: None,
             #[cfg(feature = "test-support")]
             insecure_test_app_role: false,
@@ -171,6 +177,13 @@ impl HostConfig {
 
     /// Overrides how long an unfollowed take records before the host
     /// stops it.
+    /// Overrides when the history audio upkeep runs.
+    pub fn with_upkeep(mut self, first: Duration, interval: Duration) -> Self {
+        self.upkeep_first = first;
+        self.upkeep_interval = interval;
+        self
+    }
+
     pub fn with_orphan_grace(mut self, grace: Duration) -> Self {
         self.orphan_grace = grace;
         self

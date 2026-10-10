@@ -947,28 +947,14 @@ fn write_download_exclusive(
 impl StarlingApp {
     pub fn new(started: Instant, diagnostics: bool, cx: &mut Context<Self>) -> Self {
         let settings = Settings::load_or_default();
-        // D14: storage v2 is THE store, opened unconditionally. An open
-        // failure is a hard, honest startup error — there is no other
-        // backend to fall back to and no flag to clear; the cause must be
-        // fixed and the app restarted.
-        let (store, store_error) = match Store::open() {
-            Ok(store) => (Some(store), None),
-            Err(err) => (
-                None,
-                Some(format!(
-                    "Could not open the recording store (storage v2): {err}. There is no \
-                     fallback store — fix the cause and restart. Until then, new recordings are \
-                     kept in memory only and can be downloaded from the unsaved list."
-                )),
-            ),
-        };
-
+        // #220: the store is the runtime host's; the app reaches it once
+        // it follows the host (`init`).
         Self::with_dependencies(
             started,
             diagnostics,
             settings,
-            store,
-            store_error,
+            None,
+            None,
             Player::new().ok(),
             cx,
         )
@@ -1190,17 +1176,9 @@ impl StarlingApp {
     }
 
     pub fn init(&mut self, cx: &mut Context<Self>) {
-        if let Some(store) = self.store.clone() {
-            cx.spawn(async move |this, cx| {
-                // Startup recovery runs in the recording service, which
-                // owns the store (#220): it reports what it found when this
-                // window connects.
-                refresh_sessions(&this, &store, cx).await;
-                // #342: compression and retention.
-                this.update(cx, |app, cx| app.start_audio_upkeep(cx)).ok();
-            })
-            .detach();
-        }
+        // The history loads once the host is connected: startup recovery
+        // runs in the host, which owns the store (#220), and reports what
+        // it found when this window connects.
         self.start_host_link(cx);
         self.watch_playback_notices(cx);
         match self.engine_settings.mode {
@@ -2108,6 +2086,7 @@ impl StarlingApp {
         // Delete during processing: the job is cancelled and its draft
         // deleted, so a late result lands nowhere.
         self.drop_processing(&id);
+        self.forget_own_result(&id);
         self.deleting_ids.insert(id.clone());
         cx.spawn(async move |this, cx| {
             let deleted = {

@@ -71,7 +71,7 @@ pub enum StorageError {
 /// drawer need — never the WAV bytes. Audio loads lazily per record on
 /// demand (open/play/transcribe), so a listing never pulls the full history
 /// into memory.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct SessionSummary {
     pub id: String,
     pub created_at: String,
@@ -110,7 +110,7 @@ pub struct SessionSummary {
 
 /// One completed transcript of a take: which attempt produced it, with
 /// what, and when.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TakeResult {
     pub attempt_id: String,
     /// The attempt's [`BackendLabel`] string.
@@ -125,7 +125,7 @@ pub struct TakeResult {
 /// reason it failed, never deleted — the underlying evidence stays exactly
 /// where it is until the user decides, and every read of that record
 /// surfaces `reason` instead of a generic error.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct DamagedRecord {
     pub id: String,
     pub reason: String,
@@ -175,7 +175,8 @@ impl std::fmt::Display for BackendLabel {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 #[allow(clippy::large_enum_variant, reason = "#363: `model_label` on the summary pushed the variant size difference over clippy's 200-byte lint; the split is the point — a damaged record carries only an id and a reason, so the shapes are deliberate, not boxed to please the lint")]
 pub enum ListedRecord {
     Session(SessionSummary),
