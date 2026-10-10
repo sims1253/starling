@@ -465,7 +465,7 @@ impl ConnState {
 
     /// Ends both directions immediately. For paths with nothing left to
     /// say (a slow consumer, a peer that is already gone).
-    fn close(&self) {
+    pub(crate) fn close(&self) {
         self.mark_closed();
         if let Some(closer) = lock_registry(&self.closer).as_ref() {
             let _ = closer.shutdown_both();

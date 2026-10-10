@@ -89,6 +89,11 @@ const FRAMES_PER_TICK: usize = 4;
 /// Finished takes whose audio stays readable for taps still catching up.
 const ENDED_KEEP: usize = 4;
 
+/// Most frames one connection may be owed. A connection that stopped
+/// reading is a slow consumer: past this it is closed (its owed frames
+/// go with it), as the event pump evicts one — it resyncs on reconnect.
+const MAX_OWED_PER_CONN: usize = 64;
+
 /// What a `capture.start` failure's detail carries when the host's own
 /// capture source produced it (see [`crate::capture`]).
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -988,12 +993,22 @@ impl CaptureObserver for TakeHub {
 }
 
 /// Sends `frame` to `conn` now, or — when its queue is full, or frames
-/// owed to it wait already — after those, in order.
+/// owed to it wait already — after those, in order. A connection owed
+/// [`MAX_OWED_PER_CONN`] frames already is closed instead.
 fn deliver_owed(owed: &mut Vec<(Arc<ConnState>, Frame)>, conn: &Arc<ConnState>, frame: Frame) {
-    let behind = owed.iter().any(|(owed_to, _)| Arc::ptr_eq(owed_to, conn));
-    if behind || conn.try_deliver(frame.clone()).is_err() {
-        owed.push((Arc::clone(conn), frame));
+    let behind = owed
+        .iter()
+        .filter(|(owed_to, _)| Arc::ptr_eq(owed_to, conn))
+        .count();
+    if behind == 0 && conn.try_deliver(frame.clone()).is_ok() {
+        return;
     }
+    if behind >= MAX_OWED_PER_CONN {
+        conn.close();
+        owed.retain(|(owed_to, _)| !Arc::ptr_eq(owed_to, conn));
+        return;
+    }
+    owed.push((Arc::clone(conn), frame));
 }
 
 /// The feed's tick thread body.
@@ -1052,5 +1067,38 @@ mod tests {
             )),
             "{frames:?}"
         );
+    }
+
+    /// A watcher that never reads is not owed frames forever: past the
+    /// bound it is closed and what it was owed is dropped, while the
+    /// window acting on the results keeps getting them.
+    #[test]
+    fn a_watcher_that_never_reads_is_closed_not_owed_without_bound() {
+        let hub = TakeHub::new(Duration::from_secs(60));
+        let (acting, acting_inbound) = ConnState::for_test(16);
+        let (stalled, _stalled_inbound) = ConnState::for_test(2);
+        hub.watch(&acting, "w1".into()).unwrap();
+        hub.watch(&stalled, "w2".into()).unwrap();
+        while stalled
+            .try_deliver(Frame::GetSnapshot { req: "fill".into() })
+            .is_ok()
+        {}
+        drained(&acting_inbound);
+        for round in 0..(MAX_OWED_PER_CONN + 8) {
+            hub.transcription(
+                &format!("stored-{round}"),
+                None,
+                Some("tr"),
+                None,
+                TranscriptionState::Refused {
+                    message: "busy".into(),
+                },
+                Some(&acting),
+            );
+            assert!(drained(&acting_inbound).len() == 1, "the acting window hears it");
+        }
+        assert!(stalled.closed.load(Ordering::SeqCst), "the stalled watcher was closed");
+        let owed = lock_registry(&hub.state).owed.len();
+        assert!(owed <= MAX_OWED_PER_CONN, "{owed} frames owed");
     }
 }
