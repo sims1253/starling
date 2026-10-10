@@ -2065,15 +2065,17 @@ impl StoreV2 {
         // recorded at 16 kHz), and a copy no longer proven is kept. Swept
         // before quarantine, whose deleted takes' audio may be the proof.
         let superseded = self.root.join("journals").join(SUPERSEDED_SUBDIR);
-        let unproven = self.unproven_superseded_journals(&superseded);
+        // An allowlist, not a keep-set: a journal the proof scan did not
+        // see (a failed or partial directory read) is never swept.
+        let proven = self.proven_superseded_journals(&superseded);
         self.sweep_tree(
             &superseded,
             "journal",
             SUPERSEDED_TOMBSTONE_PREFIX,
-            &unproven,
+            &|path: &Path| !proven.contains(path),
             &mut report,
         )?;
-        let none = HashSet::new();
+        let none = |_: &Path| false;
         self.sweep_tree(&self.root.join(QUARANTINE_DIR), "capture", "", &none, &mut report)?;
         self.sweep_tree(
             &self.root.join(LEGACY_DELETED_SUBPATH),
@@ -2085,10 +2087,11 @@ impl StoreV2 {
         Ok(report)
     }
 
-    /// The journals in `superseded/` (#356) no take's audio, read back
-    /// now, still proves a copy of ([`Self::journal_copy`]): the sweep
-    /// keeps them. A numbered name (`<id>.<n>.sj`) is proven as `<id>`.
-    fn unproven_superseded_journals(&self, dir: &Path) -> HashSet<PathBuf> {
+    /// The journals in `superseded/` (#356) a take's audio, read back
+    /// now, still proves a copy of ([`Self::journal_copy`]): only these
+    /// may be swept. A numbered name (`<id>.<n>.sj`) is proven as `<id>`.
+    /// A failed directory read proves nothing, so nothing is swept.
+    fn proven_superseded_journals(&self, dir: &Path) -> HashSet<PathBuf> {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return HashSet::new();
         };
@@ -2102,13 +2105,12 @@ impl StoreV2 {
                     Some((id, n)) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => id,
                     _ => stem,
                 };
-                let proven = read_journal(path).ok().is_some_and(|parsed| {
+                read_journal(path).ok().is_some_and(|parsed| {
                     matches!(
                         self.journal_copy(id, &parsed.samples, parsed.sample_rate),
                         Ok(JournalCopy::Stored | JournalCopy::Deleted)
                     )
-                });
-                !proven
+                })
             })
             .collect()
     }
@@ -2117,7 +2119,7 @@ impl StoreV2 {
     /// kind rows get: `capture` for v2 quarantine, `journal` for the
     /// legacy v1 tree; `stamp_prefix` goes before each file's id in its
     /// stamp, so a tree of copies never deadens the id of a live take;
-    /// the files in `keep` are left in place).
+    /// the files `keep` accepts are left in place).
     ///
     /// Per file, the ordering is **stamp, then unlink**: the `tombstones`
     /// UPSERT (retention `'swept'`) is committed before the bytes are
@@ -2138,7 +2140,7 @@ impl StoreV2 {
         dir: &Path,
         kind: &str,
         stamp_prefix: &str,
-        keep: &HashSet<PathBuf>,
+        keep: &dyn Fn(&Path) -> bool,
         report: &mut SweepReport,
     ) -> Result<(), StoreV2Error> {
         let Ok(entries) = std::fs::read_dir(dir) else {
@@ -2178,7 +2180,7 @@ impl StoreV2 {
                     .push((name, "not a regular file".to_string()));
                 continue;
             }
-            if keep.contains(&path) {
+            if keep(&path) {
                 report.retained.push((
                     name,
                     "no stored take is proven to hold this journal's audio any more".to_string(),
