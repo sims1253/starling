@@ -18,8 +18,9 @@ import java.util.UUID
  * when a response arrives and makes an interrupted write recoverable: the
  * previous metadata file remains in place until the replacement is complete.
  */
-class RecordingStore(context: Context) {
-    private val directory = File(context.applicationContext.filesDir, "recordings")
+class RecordingStore internal constructor(private val directory: File) {
+    constructor(context: Context) : this(File(context.applicationContext.filesDir, "recordings"))
+
     private val lock = Any()
 
     init {
@@ -27,20 +28,27 @@ class RecordingStore(context: Context) {
             throw IOException("Unable to create private recording directory")
         }
         sweepOrphanedTemporaries()
+        sweepEphemeral()
     }
 
-    fun create(): Recording = synchronized(lock) {
+    /**
+     * [ephemeral] marks a take from a private field: it is hidden from
+     * [list] and is the caller's to [delete] once the take settles.
+     */
+    fun create(ephemeral: Boolean = false): Recording = synchronized(lock) {
         val id = UUID.randomUUID().toString()
         val recording = Recording(
             id = id,
             createdAtMillis = System.currentTimeMillis(),
             wavName = "$id.wav",
             status = RecordingStatus.RECORDING,
+            ephemeral = ephemeral,
         )
         save(recording)
         recording
     }
 
+    /** The history: every recording except ephemeral ones. */
     fun list(): List<Recording> = synchronized(lock) {
         directory.listFiles { file -> file.isFile && file.name.endsWith(".json") }
             .orEmpty()
@@ -52,6 +60,7 @@ class RecordingStore(context: Context) {
                     }
                 }.getOrNull()
             }
+            .filterNot { it.ephemeral }
             .sortedByDescending { it.createdAtMillis }
     }
 
@@ -132,9 +141,12 @@ class RecordingStore(context: Context) {
         val audio = File(directory, "$id.wav")
         val partial = File(directory, "$id.wav.part")
         val temporary = File(directory, ".$id.json.tmp")
-        val failures = listOf(metadata, audio, partial, temporary)
+        // Metadata goes last: until every payload file is gone it stays,
+        // so an interrupted or failed delete (of an ephemeral take, too) is
+        // found and finished again on the next open.
+        val failures = listOf(audio, partial, temporary)
             .filter { it.exists() && !it.delete() }
-        if (failures.isNotEmpty()) {
+        if (failures.isNotEmpty() || (metadata.exists() && !metadata.delete())) {
             throw IOException("Unable to delete recording files")
         }
     }
@@ -156,6 +168,20 @@ class RecordingStore(context: Context) {
         }?.forEach { file -> file.delete() }
     }
 
+    /**
+     * An ephemeral take still on disk at open time outlived the process that
+     * dictated it (the store is opened once, at process start, before any
+     * capture). Its field was private, so it is deleted rather than offered
+     * for retry.
+     */
+    private fun sweepEphemeral() {
+        directory.listFiles { file -> file.isFile && file.name.endsWith(".json") }
+            ?.forEach { file ->
+                val id = runCatching { decode(file) }.getOrNull()?.takeIf { it.ephemeral }?.id
+                if (id != null) runCatching { delete(id) }
+            }
+    }
+
     private fun save(recording: Recording) {
         val target = metadataFile(recording.id)
         val temporary = File(directory, ".${recording.id}.json.tmp")
@@ -169,6 +195,7 @@ class RecordingStore(context: Context) {
             .put("raw_transcript", recording.rawTranscript ?: JSONObject.NULL)
             .put("error_message", recording.errorMessage ?: JSONObject.NULL)
             .put("provenance", recording.provenance?.name ?: JSONObject.NULL)
+            .put("ephemeral", recording.ephemeral)
 
         FileOutputStream(temporary).use { output ->
             output.write(json.toString().toByteArray(Charsets.UTF_8))
@@ -201,6 +228,7 @@ class RecordingStore(context: Context) {
                 ?.let { value ->
                     runCatching { TranscriptionProvenance.valueOf(value) }.getOrNull()
                 },
+            ephemeral = json.optBoolean("ephemeral", false),
         )
     }
 

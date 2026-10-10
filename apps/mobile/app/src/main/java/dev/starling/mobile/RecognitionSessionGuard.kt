@@ -9,8 +9,7 @@ import dev.starling.mobile.data.Recording
  * the live session, what ends it, how its stopped capture settles (committed
  * for upload, kept locally without upload, or marked failed), and whether a
  * terminal error is delivered. Pure Kotlin in the guard-class shape of
- * InputTargetGuard and RequestGenerationGuard so every transition is
- * unit-testable on the JVM; the service applies the returned decisions
+ * InputTargetGuard so every transition is unit-testable on the JVM; the service applies the returned decisions
  * against the recordings store and the host keyboard's callback.
  */
 class RecognitionSessionGuard<T : Any> {

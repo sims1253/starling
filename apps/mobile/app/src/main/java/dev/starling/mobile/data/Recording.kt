@@ -34,4 +34,10 @@ data class Recording(
     val errorMessage: String? = null,
     val attempts: Int = 0,
     val provenance: TranscriptionProvenance? = null,
+    /**
+     * A take dictated into a private field (password, incognito). It never
+     * appears in the history, and the keyboard deletes it as soon as the
+     * take settles; any left behind by a crash are deleted on the next start.
+     */
+    val ephemeral: Boolean = false,
 )

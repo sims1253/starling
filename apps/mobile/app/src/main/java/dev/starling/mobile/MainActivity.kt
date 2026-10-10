@@ -6,6 +6,7 @@ import android.app.AlertDialog
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.provider.OpenableColumns
 import android.util.Log
@@ -133,6 +134,30 @@ class MainActivity : Activity() {
         recordingMessage.text = getString(R.string.ready_to_record)
         refreshOnDeviceStatus()
         refreshRecordings()
+        if (savedInstanceState == null) handleKeyboardRequest(intent)
+    }
+
+    /**
+     * The voice keyboard cannot show a permission dialog, so it opens this
+     * screen to ask for the microphone (and, on Android 13+, the take
+     * notification that carries Stop). The keyboard opens it in a task of
+     * its own, so once the microphone is allowed that task closes and the
+     * user is back in the field they were dictating into.
+     */
+    private fun handleKeyboardRequest(intent: Intent?) {
+        if (intent?.action != ACTION_REQUEST_MICROPHONE) return
+        // The keyboard decides whether notifications are asked: once only, so
+        // a refusal is not asked again on a later microphone hand-off.
+        val askNotifications = intent.getBooleanExtra(EXTRA_ASK_NOTIFICATIONS, false)
+        val missing = buildList {
+            add(Manifest.permission.RECORD_AUDIO)
+            if (Build.VERSION.SDK_INT >= 33 && askNotifications) add(Manifest.permission.POST_NOTIFICATIONS)
+        }.filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
+        if (missing.isEmpty()) {
+            finishAndRemoveTask()
+            return
+        }
+        requestPermissions(missing.toTypedArray(), REQUEST_KEYBOARD_MICROPHONE)
     }
 
     override fun onResume() {
@@ -605,6 +630,16 @@ class MainActivity : Activity() {
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == REQUEST_KEYBOARD_MICROPHONE) {
+            // Back to the field as soon as the microphone is allowed; the
+            // notification answer, whatever it is, does not hold that up.
+            if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+                finishAndRemoveTask()
+            } else {
+                recordingMessage.setText(R.string.microphone_permission_required)
+            }
+            return
+        }
         if (requestCode != REQUEST_RECORD_AUDIO || !awaitingPermission) return
         awaitingPermission = false
         if (grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED) {
@@ -714,6 +749,11 @@ class MainActivity : Activity() {
         private const val TAG = "MainActivity"
         private const val REQUEST_RECORD_AUDIO = 4001
         private const val REQUEST_IMPORT_MODEL = 4002
+        private const val REQUEST_KEYBOARD_MICROPHONE = 4003
+
+        /** The voice keyboard asks for the microphone through this screen. */
+        const val ACTION_REQUEST_MICROPHONE = "dev.starling.mobile.action.REQUEST_MICROPHONE"
+        const val EXTRA_ASK_NOTIFICATIONS = "dev.starling.mobile.extra.ASK_NOTIFICATIONS"
         // Decimal megabytes, as Hugging Face and file managers show sizes.
         private const val MB = 1_000_000L
 

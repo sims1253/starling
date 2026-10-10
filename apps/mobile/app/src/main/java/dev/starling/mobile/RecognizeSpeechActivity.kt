@@ -4,12 +4,14 @@ import android.Manifest
 import android.app.Activity
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import android.speech.RecognizerIntent
 import android.text.method.ScrollingMovementMethod
 import android.view.View
 import android.widget.Button
 import android.widget.TextView
+import android.window.OnBackInvokedDispatcher
 import dev.starling.mobile.audio.AudioCapture
 import dev.starling.mobile.audio.AudioChunkListener
 import dev.starling.mobile.audio.CaptureResult
@@ -53,6 +55,9 @@ class RecognizeSpeechActivity : Activity() {
 
     private var activeRecording: Recording? = null
 
+    /** Whether the microphone capture is running; instrumented tests branch on it. */
+    internal val capturing: Boolean get() = activeRecording != null
+
     // Read by the capture worker through the chunk listener.
     @Volatile
     private var streamSession: StreamSession? = null
@@ -85,6 +90,13 @@ class RecognizeSpeechActivity : Activity() {
 
         doneButton.setOnClickListener { if (activeRecording != null) stopAndTranscribe() else finish() }
         cancelButton.setOnClickListener { cancel() }
+        if (Build.VERSION.SDK_INT >= 33) {
+            // The activity opts in to OnBackInvokedCallback (manifest), so
+            // system Back and the predictive-back gesture on Android 14+
+            // arrive here; Android 13 ignores the per-activity opt-in and,
+            // like older releases, uses onBackPressed below.
+            onBackInvokedDispatcher.registerOnBackInvokedCallback(OnBackInvokedDispatcher.PRIORITY_DEFAULT) { cancel() }
+        }
         setResult(RESULT_CANCELED)
         // The popup records at once; loading now also covers the time a
         // permission prompt is on screen.
