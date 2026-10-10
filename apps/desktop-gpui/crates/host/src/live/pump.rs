@@ -306,6 +306,11 @@ impl<C: StreamClient> PumpCore<C> {
         }
         self.shown_words = words.len();
         if let Some(hook) = self.on_update.as_ref() {
+            // The app shows what it is handed: this is the trace's
+            // `display` (the window applies it within a frame).
+            if let Some(trace) = self.trace.as_ref() {
+                trace.displayed(&partial);
+            }
             hook(PumpUpdate::Partial(partial.clone()));
         }
         self.partials.send_replace(Some(partial));

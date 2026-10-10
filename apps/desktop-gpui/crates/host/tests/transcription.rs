@@ -418,3 +418,82 @@ fn two_windows_and_a_host_shut_down_mid_transcription_still_transcribe_once() {
     next.shutdown();
     assert_eq!(completed_attempts(root.path(), &id), vec!["once"]);
 }
+
+/// The host **process** killed (SIGKILL — no shutdown runs) while it
+/// transcribes a take: the next host process transcribes the take once,
+/// and the dead host's attempt reads failed, never as a second result.
+/// Unix: the host binary finds its settings through `XDG_CONFIG_HOME`.
+#[cfg(unix)]
+#[test]
+fn a_host_process_killed_mid_transcription_leaves_the_take_to_the_next_one() {
+    use std::process::{Command as ProcessCommand, Stdio};
+    const HOST_BIN: &str = env!("CARGO_BIN_EXE_starling-runtime-host");
+
+    let scratch = tempfile::tempdir().unwrap();
+    let root = scratch.path().join("root");
+    let runtime_dir = scratch.path().join("run");
+    let engine = FakeEngine::start(
+        vec![Reply::Held("never".into()), Reply::Text("once".into())],
+        StreamMode::Refuse,
+    );
+    // The desktop settings the host binary follows: the user's own server.
+    let config_home = scratch.path().join("config");
+    std::fs::create_dir_all(config_home.join("starling-gpui")).unwrap();
+    let mut settings = starling_dictation::settings::Settings::default_settings();
+    settings.engine.mode = starling_dictation::settings::EngineMode::Manual;
+    settings.endpoint = engine.endpoint();
+    settings.model = "fake-model".to_string();
+    std::fs::write(
+        config_home.join("starling-gpui").join("settings.json"),
+        serde_json::to_vec(&settings).unwrap(),
+    )
+    .unwrap();
+    // A take stored for transcription that no host has claimed yet.
+    let id = {
+        let mut store = StoreV2::open(&root).unwrap();
+        let mut meta = TakeMeta::for_device("test-device");
+        meta.transcribe = true;
+        let mut take = store.begin_take(meta).unwrap();
+        take.append_and_seal(&vec![0.1f32; 16_000]).unwrap();
+        take.finalize().unwrap().commit_marked(&mut store, CommitMark::Complete).unwrap().record.id
+    };
+    let spawn = || {
+        ProcessCommand::new(HOST_BIN)
+            .arg("--root")
+            .arg(&root)
+            .arg("--runtime-dir")
+            .arg(&runtime_dir)
+            .env("XDG_CONFIG_HOME", &config_home)
+            .env("XDG_DATA_HOME", scratch.path().join("data"))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("host binary spawns")
+    };
+    let wait_for = |what: &str, done: &dyn Fn() -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !done() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+
+    let mut first = spawn();
+    wait_for("the first host's request", &|| engine.batch_requests() == 1);
+    first.kill().expect("killed");
+    first.wait().expect("reaped");
+
+    let mut second = spawn();
+    wait_for("the transcript", &|| !completed_attempts(&root, &id).is_empty());
+    second.kill().expect("killed");
+    second.wait().expect("reaped");
+    engine.release();
+
+    assert_eq!(completed_attempts(&root, &id), vec!["once"], "transcribed once");
+    let store = StoreV2::open(&root).unwrap();
+    let attempts = store.attempts_for(&id).unwrap();
+    assert_eq!(attempts.len(), 2, "the dead host's attempt and the one that finished");
+    assert!(attempts.iter().any(|attempt| attempt.status == "failed"));
+    assert!(!store.transcription_wanted(&id).unwrap());
+    assert_eq!(engine.batch_requests(), 2);
+}

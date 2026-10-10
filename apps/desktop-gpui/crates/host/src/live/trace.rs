@@ -19,7 +19,7 @@ const TRACE_BACKLOG: usize = 1024;
 /// lines are appended to. One JSON object per line, tagged with the take
 /// and `ms` since it started: `start` (with the wall clock), every server frame (`partial`
 /// with the server's `covered_s`/`audio_s`, `final` with its stop path),
-/// every preview the UI applied (`display`), `stream_failed`, `reconnect`,
+/// every preview handed to the app (`display`), `stream_failed`, `reconnect`,
 /// `replay_released` and `stop`. Partial age at display is
 /// `display.ms - 1000 * covered_s`, measured from the take's start rather
 /// than the microphone's.
@@ -183,7 +183,7 @@ impl StreamTrace {
         }
     }
 
-    /// A preview the UI applied.
+    /// A preview handed to the app to show.
     pub fn displayed(&self, partial: &Partial) {
         self.log(
             "display",
