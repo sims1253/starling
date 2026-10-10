@@ -111,6 +111,11 @@ pub struct Settings {
     /// of the file.
     #[serde(default, deserialize_with = "lenient_insertion")]
     pub insertion: InsertionSettings,
+    /// How early and how often `/stream` sends live previews (#357). An
+    /// unreadable subsection loads its defaults and never costs the rest
+    /// of the file.
+    #[serde(default, deserialize_with = "lenient_live_preview")]
+    pub live_preview: LivePreviewSettings,
 }
 
 /// Retention limits for one class of history audio (#342). `None` is no
@@ -309,6 +314,69 @@ fn lenient_insertion_value(value: serde_json::Value) -> InsertionSettings {
             defaults.allow_unverified
         }),
     }
+}
+
+/// The live preview cadence the app asks `/stream` for (#357): the audio
+/// a take needs before its first preview, and the least time between
+/// previews. `None` sends nothing and leaves the server's own default.
+/// Servers that predate the parameters ignore them.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct LivePreviewSettings {
+    pub min_partial_seconds: Option<f64>,
+    pub partial_interval_seconds: Option<f64>,
+}
+
+/// The longest first-preview minimum or interval the app asks for; a
+/// hand-edited value above it is clamped.
+pub const MAX_PREVIEW_CADENCE_SECONDS: f64 = 30.0;
+
+impl LivePreviewSettings {
+    /// 1 s before the first preview, then one every 0.5 s: measured on the
+    /// notebook against the coalescing server (#424), where it keeps
+    /// inference at about half of real time and shows text after ~1.2 s
+    /// instead of ~5.4 s.
+    pub const FAST: LivePreviewSettings = LivePreviewSettings {
+        min_partial_seconds: Some(1.0),
+        partial_interval_seconds: Some(0.5),
+    };
+    /// Whatever the server is configured with.
+    pub const SERVER: LivePreviewSettings = LivePreviewSettings {
+        min_partial_seconds: None,
+        partial_interval_seconds: None,
+    };
+
+    /// The values to send: finite, nonnegative and at most
+    /// [`MAX_PREVIEW_CADENCE_SECONDS`]; anything else is left to the
+    /// server.
+    pub fn effective(&self) -> (Option<f64>, Option<f64>) {
+        let valid = |value: Option<f64>| {
+            value
+                .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
+                .map(|seconds| seconds.min(MAX_PREVIEW_CADENCE_SECONDS))
+        };
+        (
+            valid(self.min_partial_seconds),
+            valid(self.partial_interval_seconds),
+        )
+    }
+}
+
+impl Default for LivePreviewSettings {
+    fn default() -> Self {
+        LivePreviewSettings::FAST
+    }
+}
+
+fn lenient_live_preview<'de, D>(deserializer: D) -> Result<LivePreviewSettings, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = <serde_json::Value as serde::Deserialize>::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).unwrap_or_else(|err| {
+        eprintln!("Unreadable live preview settings; using the defaults: {err}");
+        LivePreviewSettings::default()
+    }))
 }
 
 impl Default for PlaybackSettings {
@@ -516,6 +584,7 @@ impl Settings {
             feedback: FeedbackSettings::default(),
             storage: StorageSettings::default(),
             insertion: InsertionSettings::default(),
+            live_preview: LivePreviewSettings::default(),
         }
     }
 
@@ -815,6 +884,7 @@ mod tests {
                 auto_insert: false,
                 allow_unverified: true,
             },
+            live_preview: LivePreviewSettings::SERVER,
         };
 
         settings.save(&path).expect("save");
@@ -1343,6 +1413,45 @@ mod tests {
             );
             assert_eq!(loaded.endpoint, "http://10.0.0.5:8181", "{insertion}");
         }
+    }
+
+    #[test]
+    fn live_preview_settings_load_leniently() {
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("settings.json");
+        let load = |live: &str| {
+            std::fs::write(
+                &path,
+                format!(
+                    r#"{{"endpoint":"http://10.0.0.5:8181","model":"m","expectedTerms":[]{live}}}"#
+                ),
+            )
+            .expect("write");
+            Settings::load(&path)
+        };
+        assert_eq!(load("").live_preview, LivePreviewSettings::FAST);
+        assert_eq!(
+            load(r#","livePreview":{"minPartialSeconds":null,"partialIntervalSeconds":null}"#)
+                .live_preview,
+            LivePreviewSettings::SERVER
+        );
+        assert_eq!(
+            load(r#","livePreview":{"minPartialSeconds":2}"#).live_preview,
+            LivePreviewSettings {
+                min_partial_seconds: Some(2.0),
+                partial_interval_seconds: Some(0.5),
+            }
+        );
+        let loaded = load(r#","livePreview":{"minPartialSeconds":"soon"}"#);
+        assert_eq!(loaded.live_preview, LivePreviewSettings::default());
+        assert_eq!(loaded.endpoint, "http://10.0.0.5:8181");
+        // Out-of-range values are left to the server or clamped.
+        let odd = LivePreviewSettings {
+            min_partial_seconds: Some(-1.0),
+            partial_interval_seconds: Some(600.0),
+        };
+        assert_eq!(odd.effective(), (None, Some(MAX_PREVIEW_CADENCE_SECONDS)));
+        assert_eq!(LivePreviewSettings::FAST.effective(), (Some(1.0), Some(0.5)));
     }
 
     #[test]

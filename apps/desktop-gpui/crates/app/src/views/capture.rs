@@ -184,6 +184,17 @@ pub fn render_capture(
                     .child(app.live_partial.clone()),
             )
         })
+        // Live text going quiet mid-take is explained while it is quiet,
+        // not only beside the saved take.
+        .when_some(app.stream_degradation.clone().filter(|_| recording), |pane, reason| {
+            pane.child(
+                div()
+                    .max_w(px(620.))
+                    .text_size(px(13.))
+                    .text_color(theme::MUTED)
+                    .child(reason),
+            )
+        })
         .child(render_import_button(cx))
         .children(render_banner(app, cx))
         // The error banner holds the bottom: words that did not reach

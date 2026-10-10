@@ -370,7 +370,13 @@ impl StarlingApp {
         self.end_playback_lease();
         if let Some(handle) = self.recorder.take() {
             self.audio_upkeep.set_recording(false);
-            let mut stream = self.live_stream.take();
+            // The worker stops before the recorder does, so `stop` below
+            // returns exactly the samples after the drained ones.
+            let pumped = self.finish_stream_pump();
+            let mut stream = pumped.stream;
+            if let Some(reason) = pumped.degradation {
+                self.stream_degradation = Some(reason);
+            }
             // The binding resolved at START leaves with the take (#363);
             // a stop without one (not a normal path) resolves fresh
             // rather than transcribing against nothing.
@@ -379,8 +385,8 @@ impl StarlingApp {
                 .take()
                 .unwrap_or_else(|| self.resolve_take_target());
             self.live_partial.clear();
-            let streamed_samples = std::mem::take(&mut self.streamed_samples);
-            let sent_samples = std::mem::take(&mut self.stream_sent_samples);
+            let streamed_samples = pumped.samples;
+            let sent_samples = pumped.sent;
             // G03: clipping is measured on the raw captured samples (before
             // the attenuation-only auto gain), so an already-clipped source
             // stays visible even when its attenuated copy peaks below
@@ -420,8 +426,8 @@ impl StarlingApp {
                 Ok(mut take) => {
                     // `sent_samples` indexes device-rate samples of the
                     // spliced layout (drained stream prefix + journal
-                    // tail) — the same units the render loop advanced it
-                    // in, so the remainder slice below lines up exactly.
+                    // tail) — the same units the stream worker advanced
+                    // it in, so the remainder slice below lines up exactly.
                     take.audio.samples.splice(0..0, streamed_samples);
                     // Streaming requires a finalized, fault-free journal:
                     // production captures always journal (see the start
@@ -623,8 +629,6 @@ impl StarlingApp {
                     } else {
                         self.retire_staging(cx);
                     }
-                    self.streamed_samples.clear();
-                    self.stream_sent_samples = 0;
                     self.stream_degradation = None;
                     // #363: the take's endpoint/model binding resolves at
                     // START and travels with the take — a model switch or
@@ -643,14 +647,11 @@ impl StarlingApp {
                         // A URL-shape failure is deterministic, so it gets the
                         // same visible degradation note as a mid-recording
                         // death instead of a silent `.ok()` downgrade.
-                        match LiveStream::start(target.endpoint()) {
-                            Ok(stream) => self.live_stream = Some(stream),
-                            Err(reason) => {
-                                self.stream_degradation = Some(format!(
-                                    "Live transcription is unavailable ({reason}); the recording \
-                                     will be uploaded in full after you stop."
-                                ));
-                            }
+                        if let Err(reason) = self.start_stream_pump(&handle, target.endpoint(), cx) {
+                            self.stream_degradation = Some(format!(
+                                "Live transcription is unavailable ({reason}); the recording \
+                                 will be uploaded in full after you stop."
+                            ));
                         }
                     }
                     self.active_take = Some(target);
@@ -710,11 +711,9 @@ impl StarlingApp {
         self.audio_upkeep.set_recording(false);
         // The stream and the engine lease leave with the take: nothing
         // is transcribed.
-        self.live_stream = None;
+        let streamed_samples = self.finish_stream_pump().samples;
         self.active_take = None;
         self.live_partial.clear();
-        let streamed_samples = std::mem::take(&mut self.streamed_samples);
-        self.stream_sent_samples = 0;
         // Read before `stop` consumes the handle: a stop that hands back
         // no audio still rebuilds the drained prefix at the take's own
         // device rate.

@@ -7,6 +7,7 @@ mod delivery;
 mod drawer;
 mod feedback;
 mod history;
+mod live_preview;
 pub(crate) mod microphone;
 pub(crate) mod overlay;
 mod settings;

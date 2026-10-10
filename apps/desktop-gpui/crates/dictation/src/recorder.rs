@@ -1005,6 +1005,31 @@ struct JournalIdentity {
     rate: u32,
 }
 
+/// Drains a live take from any thread; see [`RecorderHandle::tap`].
+#[derive(Clone)]
+pub struct CaptureTap {
+    shared: Arc<Shared>,
+}
+
+impl CaptureTap {
+    /// [`RecorderHandle::drain_chunks`].
+    pub fn drain_chunks(&self) -> Vec<Vec<f32>> {
+        let mut guard = self.shared.lock_consumer();
+        self.shared.drain_ring(&mut guard);
+        let chunk = guard.take_pending();
+        if chunk.is_empty() {
+            Vec::new()
+        } else {
+            vec![chunk]
+        }
+    }
+
+    /// [`RecorderHandle::acknowledged_samples`].
+    pub fn acknowledged_samples(&self) -> u64 {
+        self.shared.durable_ack.load(Ordering::Acquire)
+    }
+}
+
 /// Live microphone capture handle returned by [`start_recording`].
 pub struct RecorderHandle {
     shared: Arc<Shared>,
@@ -1140,13 +1165,18 @@ impl RecorderHandle {
     /// empty `Ok`, never [`RecorderError::Empty`], because the take was
     /// captured; it is just already in your hands.
     pub fn drain_chunks(&self) -> Vec<Vec<f32>> {
-        let mut guard = self.shared.lock_consumer();
-        self.shared.drain_ring(&mut guard);
-        let chunk = guard.take_pending();
-        if chunk.is_empty() {
-            Vec::new()
-        } else {
-            vec![chunk]
+        self.tap().drain_chunks()
+    }
+
+    /// A handle for draining this take from another thread (the handle
+    /// itself owns the device stream and stays where it was opened). It
+    /// shares the one handout watermark with [`Self::drain_chunks`] and
+    /// [`Self::stop`], so whatever the tap drained is exactly what `stop`
+    /// no longer returns. Stop draining through the tap before calling
+    /// `stop`.
+    pub fn tap(&self) -> CaptureTap {
+        CaptureTap {
+            shared: Arc::clone(&self.shared),
         }
     }
 
@@ -2275,6 +2305,31 @@ mod tests {
         collected.extend_from_slice(&take.audio.samples);
         assert_eq!(collected.len(), 1_000, "exact sample count");
         assert_eq!(collected, data, "drained + pending reassemble the take");
+    }
+
+    #[test]
+    fn a_tap_drains_from_another_thread_and_stop_returns_the_rest() {
+        // #357: the live stream drains through a tap on its own thread
+        // while the handle stays on the UI thread. Both share the one
+        // handout watermark, so the tap's chunks and stop's pending span
+        // reassemble the take.
+        let shared = test_shared(4_096);
+        let mut callback = CallbackState::new(1);
+        let handle = test_handle(Arc::clone(&shared), 16_000);
+        let data: Vec<f32> = (0..600u32).map(|i| i as f32 * 0.0001).collect();
+        for block in data[..400].chunks(100) {
+            callback.process(block, &shared);
+        }
+        let tap = handle.tap();
+        let drained = std::thread::spawn(move || tap.drain_chunks().concat())
+            .join()
+            .expect("tap thread");
+        assert_eq!(drained, data[..400]);
+        for block in data[400..].chunks(100) {
+            callback.process(block, &shared);
+        }
+        let take = handle.stop().expect("stop after a tap drain");
+        assert_eq!(take.audio.samples, data[400..]);
     }
 
     #[test]
