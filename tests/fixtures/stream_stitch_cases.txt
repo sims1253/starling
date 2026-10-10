@@ -194,3 +194,19 @@ tx redecode 7.5 12 a16 a17 a18 a19 a20 a21 a22 a23 a24 b1 b2 b3 b4 b5 b6
 tx flush_tail 16.5 7.5 b5 b6 c1 c2 c3 c4 c5 c6 c7 c8 c9 c10 c11 c12
 = a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 a14 a15 a16 a17 a18 a19 a20 a21 a22 a23 a24 b1 b2 b3 b4 b5 b6 c1 c2 c3 c4 c5 c6 c7 c8 c9 c10 c11 c12
 calls flush_window@0+12 flush_window@9+12 redecode@7.5+12 flush_tail@16.5+7.5
+
+stream repeated_text_with_a_disagreement 12 3
+audio 24 0.1
+tx flush_window 0 12 one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three
+tx flush_window 9 12 different two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three
+tx flush_tail 18 6 one two three one two three one two three one two three one two three one two three
+= one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three
+calls flush_window@0+12 flush_window@9+12 flush_tail@18+6
+
+stream repeated_text_overlap_shorter_than_its_period 4 1
+audio 7 0.1
+tx flush_window 0 4 one two three one two three one two
+tx flush_window 3 4 one two three one two three one two
+tx flush_tail 6 1 one two
+= one two three one two three one two three one two three one two
+calls flush_window@0+4 flush_window@3+4 flush_tail@6+1

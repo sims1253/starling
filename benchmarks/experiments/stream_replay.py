@@ -158,21 +158,24 @@ def locate_errors(batch_text: str, final_text: str, utterances: list[dict] | Non
     utterance spans) and whether it falls into a window overlap (between the
     next commitment's start and the current one's end, +-1 s) or elsewhere.
     A commitment is a ``window``/``flush_window``/``flush_tail`` call with
-    the ``redecode`` calls right after it; the trace does not say which
-    candidate was kept, so a commitment spans all of them and the label errs
-    toward ``overlap`` there.
+    the ``redecode`` calls right after it and its retries (a later committing
+    call at the same start, after a busy re-decode); the trace does not say
+    which candidate was kept, so a commitment spans all of them and the
+    label errs toward ``overlap`` there.
     """
     b, f = normalize(batch_text), normalize(final_text)
     times = _word_times(b, reference, utterances or [])
-    commitments: list[list[float]] = []
+    commitments: list[list[float]] = []  # [start, end, nominal start]
     for c in calls:
         if c.get("result", "ok") not in ("ok", "reused"):
             continue
-        if c.get("kind") in ("window", "flush_window", "flush_tail"):
-            commitments.append([c["start_s"], c["end_s"]])
-        elif c.get("kind") == "redecode" and commitments:
-            commitments[-1] = [min(commitments[-1][0], c["start_s"]),
-                               max(commitments[-1][1], c["end_s"])]
+        kind = c.get("kind")
+        if kind in ("window", "flush_window", "flush_tail") and not (
+                commitments and commitments[-1][2] == c["start_s"]):
+            commitments.append([c["start_s"], c["end_s"], c["start_s"]])
+        elif kind in ("window", "flush_window", "flush_tail", "redecode") and commitments:
+            commitments[-1][:2] = [min(commitments[-1][0], c["start_s"]),
+                                   max(commitments[-1][1], c["end_s"])]
     commitments.sort()
     overlaps = [(nxt[0], cur[1]) for cur, nxt in zip(commitments, commitments[1:])
                 if nxt[0] < cur[1]]

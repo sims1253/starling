@@ -24,10 +24,11 @@ namespace starling::serve {
 // re-decoded window that starts earlier shares more audio). Matches score
 // +2, mismatches and gaps -1; committed words before the suffix and new
 // words after the prefix are free, so a common phrase far from the boundary
-// cannot win and drop the words between. When the chosen alignment is a
-// perfect run over periodic words ("one two three one two three ...") and
-// `expected_overlap` (words the shared audio should hold; -1: unknown) is
-// smaller, it is shortened by whole periods to the length closest to it.
+// cannot win and drop the words between. When the chosen alignment is one
+// diagonal over committed words that repeat with some period ("one two
+// three one two three ...") and `expected_overlap` (words the shared audio
+// should hold; -1: unknown) is smaller, it is shortened by whole periods to
+// the length closest to it.
 // The cut is the middle matched word: committed up to and including it,
 // then new_words after it. Without an alignment scoring at least
 // kStitchMinScore the two are concatenated.

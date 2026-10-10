@@ -68,14 +68,15 @@ def stitch_words(
     so a common phrase ("of the") far from the boundary cannot win and drop
     the words between (issue #357: one such match dropped 30 words).
 
-    Repeated text ("one two three one two three ...") aligns perfectly at
+    Repeated text ("one two three one two three ...") aligns equally well at
     every multiple of its period, and the longest alignment wins the score.
-    When the chosen alignment is such a perfect run over periodic words and
+    When the chosen alignment is one diagonal (no gap after its first
+    column) over committed words that repeat with some period, and
     ``expected_overlap`` (how many words the shared audio should hold, the
     caller's estimate from the windows' voiced audio) is smaller, the
-    alignment is shortened by whole periods to the length closest to it, so
-    the repetitions outside the shared audio survive. Alignments with any
-    mismatch or gap are never changed by the estimate.
+    diagonal is shortened by whole periods to the length closest to it, so
+    the repetitions outside the shared audio survive. Other alignments are
+    never changed by the estimate.
 
     The cut is the middle matched word of the alignment, where both windows
     hold the most context: ``committed`` up to and including it, then
@@ -120,6 +121,7 @@ def stitch_words(
     if best < _STITCH_MIN_SCORE:
         return list(committed) + list(new)
     pairs = []
+    diagonal = True  # no gap between the path's first and last column
     i, j = n, best_j
     while i > 0 and j > 0:
         same = a[i - 1] == b[j - 1]
@@ -128,22 +130,28 @@ def stitch_words(
                 pairs.append((i - 1, j - 1))
             i, j = i - 1, j - 1
         elif d[i][j] == d[i - 1][j] + _STITCH_GAP:
+            diagonal = False
             i -= 1
         else:
+            diagonal = False
             j -= 1
     pairs.reverse()
-    length = len(pairs)
-    if (expected_overlap is not None and length > expected_overlap
-            and best == _STITCH_MATCH * length and pairs[0][1] == 0
-            and pairs[0][0] + length == n):
-        # A perfect run: tail[i0 + t] == head[t] for every t. Over periodic
-        # words it also aligns from i0 + k * period; keep the k whose length
-        # is closest to the estimate (the smallest k on a tie).
-        period = _period(a[pairs[0][0]:])
+    # The path starts at tail row i (free) with j new words before it
+    # (gaps); it is the diagonal (i + t, j + t) for t < n - i.
+    length = n - i
+    if diagonal and expected_overlap is not None and length > expected_overlap:
+        # Over committed words with a period, the same diagonal also aligns
+        # from row i + k * period; keep the k whose length is closest to the
+        # estimate (the smallest k on a tie) and has a matched word.
+        period = _period(a[i:])
         if period:
-            k = min(range(length // period),
-                    key=lambda k: abs(length - k * period - expected_overlap))
-            pairs = [(pairs[0][0] + k * period + t, t) for t in range(length - k * period)]
+            ks = [k for k in range((length - 1) // period + 1)
+                  if any(a[i + k * period + t] == b[j + t]
+                         for t in range(length - k * period))]
+            k = min(ks, key=lambda k: abs(length - k * period - expected_overlap))
+            row = i + k * period
+            pairs = [(row + t, j + t) for t in range(length - k * period)
+                     if a[row + t] == b[j + t]]
     ci, cj = pairs[(len(pairs) - 1) // 2]
     keep = len(committed) - len(tail) + ci + 1
     return list(committed[:keep]) + list(new[cj + 1:])

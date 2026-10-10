@@ -192,6 +192,16 @@ class LocateErrorsTest(unittest.TestCase):
                                "one two three four", first)
         self.assertEqual((out["spans"][0]["where"], out["spans"][0]["overlap_s"]),
                          ("window", None))
+        # A window retried after a busy re-decode is the same commitment.
+        retried = [{"kind": "window", "start_s": 0.0, "end_s": 12.0},
+                   {"kind": "window", "start_s": 9.0, "end_s": 21.0},
+                   {"kind": "redecode", "start_s": 7.5, "end_s": 19.5, "result": "busy"},
+                   {"kind": "window", "start_s": 9.0, "end_s": 21.0},
+                   {"kind": "redecode", "start_s": 7.5, "end_s": 19.5}]
+        out = sr.locate_errors("one two three four", "one three four",
+                               [{"text": "one two three four", "start_s": 13.0, "end_s": 17.0}],
+                               "one two three four", retried)
+        self.assertEqual((out["spans"][0]["t_s"], out["spans"][0]["where"]), (14.5, "window"))
 
     def test_duplicated_run_and_far_errors(self):
         out = sr.locate_errors(self.REF, "One, two two three four five six seven eight",
