@@ -713,13 +713,13 @@ impl StarlingApp {
         cx.notify();
     }
 
-    /// A direct take's transcript landed: type its text into the
-    /// captured target, once.
     /// Whether take `id`'s text still goes somewhere when it is ready.
     pub(crate) fn delivers(&self, id: &str) -> bool {
         self.delivery.by_take.contains_key(id)
     }
 
+    /// A direct take's transcript landed: type its text into the
+    /// captured target, once.
     pub(crate) fn deliver_finished_take(&mut self, id: &str, cx: &mut Context<Self>) {
         let Some(capture) = self.delivery.by_take.remove(id) else {
             return;
