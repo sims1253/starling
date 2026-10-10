@@ -166,9 +166,16 @@ pub fn render_capture(
                         .text_size(px(13.))
                         .line_height(px(13. * 1.65))
                         .text_color(theme::MUTED)
+                        // #220: takes record in Starling's recording
+                        // service; while it is not reachable, say so.
                         .child(
-                            "Your recording is saved locally, sent only to your selected server, \
-                             and shown exactly as the model returned it.",
+                            app.host_unavailable()
+                                .filter(|_| !recording)
+                                .unwrap_or_else(|| {
+                                    "Your recording is saved locally, sent only to your selected \
+                                     server, and shown exactly as the model returned it."
+                                        .to_string()
+                                }),
                         ),
                 ),
         )
@@ -615,6 +622,16 @@ fn render_banner(app: &mut StarlingApp, cx: &mut Context<StarlingApp>) -> Option
                 message,
                 "Audio is kept up to the last point the capture journal confirmed on disk.",
                 |app: &mut StarlingApp| app.recovery_notice = None,
+                cx,
+            ));
+        }
+        if let Some(message) = app.service_notice.clone() {
+            return Some(quality_banner(
+                "Recording kept",
+                message,
+                "Starling's recording service keeps a take going while this window is closed \
+                 or restarting.",
+                |app: &mut StarlingApp| app.service_notice = None,
                 cx,
             ));
         }

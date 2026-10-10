@@ -74,6 +74,7 @@ take. The engine log and state live under the engine state directory below.
 Data locations (all created on demand):
 
 - store (sqlite, audio journals, quarantine): `~/.local/share/starling-gpui/`
+- recording service log: `~/.local/share/starling-gpui/runtime-host.log`
 - settings: `~/.config/starling-gpui/settings.json`
 - downloaded models: `~/.local/share/starling-gpui/models/`
 - engine state (registry, spawn lock): `~/.local/share/starling-gpui/engine/`
@@ -121,11 +122,24 @@ same recording; earlier results stay listed and an empty answer never replaces
 real text. A retried transcript is never typed into another app: it is offered
 for Copy, or Paste last into the field you pick.
 
-How much survives a crash: the journal aims to confirm audio on disk every
-250 ms (or 64 KiB) — a slow disk stretches that. If Starling is killed or
-crashes while recording, the next launch adopts the journal as an interrupted
-take holding everything up to the last confirmed point, and the drawer shows
-how much that is. Audio after it (normally the last moment before the crash,
+Takes are recorded by Starling's recording service, not by the window
+(#220): the same executable, started by the app as `starling-gpui
+--runtime-host` when none is running, owns the store, the journals and the
+microphone while a take records. Closing, killing or crashing the window does
+not stop a take. A window that opens within 20 seconds picks the running take
+up (it shows as listening, its live text replays from the start, and it stops
+as usual; nothing is typed into another app for it). After 20 seconds with no
+window the service stops the take and stores it, and the next window to open
+transcribes it into history. A second Starling window is just another client
+of the same service. The service stops by itself a minute after the last
+window closed and nothing is recording or being saved; its log is
+`~/.local/share/starling-gpui/runtime-host.log`.
+
+How much survives a crash of the service itself: the journal aims to confirm
+audio on disk every 250 ms (or 64 KiB) — a slow disk stretches that. If the
+service is killed or crashes while recording, its next start adopts the
+journal as an interrupted take holding everything up to the last confirmed
+point, and the drawer shows how much that is. Audio after it (normally the last moment before the crash,
 plus anything still in the capture buffer) is lost; an unconfirmed partial
 write at the end is discarded and noted, never joined. A take whose app
 stopped after the recording ended but before it was saved comes back complete

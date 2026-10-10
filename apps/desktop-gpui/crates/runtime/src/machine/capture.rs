@@ -2301,7 +2301,7 @@ impl CaptureActor {
 
     /// `Interrupted → Recovering → Persisted` (journal replay): re-publish
     /// the salvaged boundary of a take this runtime holds. On-disk journal
-    /// recovery of *previous* processes remains the app's startup scan
+    /// recovery of *previous* processes is the host's startup recovery
     /// (I1/I2); this path serves same-process interrupted takes.
     fn handle_recover(&mut self, take_id: &str) {
         if self.core.state() != "Interrupted" {

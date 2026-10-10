@@ -13,6 +13,7 @@ use starling_runtime::machine::capture::{CaptureConfig, V2CaptureStore};
 use starling_runtime::protocol::Command;
 use starling_runtime::testing::{FakeCaptureSource, FakeTakeScript};
 use starling_runtime_host::client::{HostClient, TakeWire};
+use starling_runtime_host::frame::TakeOwner;
 use starling_runtime_host::{serve, HostConfig, HostHandle};
 
 fn config(root: &Path, source: Arc<FakeCaptureSource>) -> HostConfig {
@@ -124,9 +125,9 @@ fn a_tapping_app_gets_every_sample_then_the_end_then_the_stored_row() {
     app.take_tap("take-a", 0).unwrap();
     let mut seen = Vec::new();
     let tick = until_take(&app, "a live tick", &mut seen, is_live_tick("take-a"));
-    let TakeWire::Live { rate, owned, .. } = tick else { unreachable!() };
+    let TakeWire::Live { rate, owner, .. } = tick else { unreachable!() };
     assert_eq!(rate, 16_000);
-    assert!(owned, "the starting connection owns the take");
+    assert_eq!(owner, TakeOwner::You, "the starting connection owns the take");
     std::thread::sleep(Duration::from_millis(200));
     stop(&app, "take-a");
     let end = until_take(&app, "the end", &mut seen, is_end("take-a"));
@@ -216,12 +217,12 @@ fn an_app_that_reconnects_mid_take_adopts_it_and_replays_it_from_the_start() {
     let mut seen = Vec::new();
     let tick = until_take(&relaunched, "the running take", &mut seen, is_live_tick("take-r"));
     assert!(
-        matches!(tick, TakeWire::Live { owned: false, .. }),
+        matches!(tick, TakeWire::Live { owner: TakeOwner::Nobody, .. }),
         "its owner is gone: {tick:?}"
     );
     relaunched.take_tap("take-r", 0).unwrap();
     let owned = until_take(&relaunched, "owned after tapping", &mut seen, |frame| {
-        matches!(frame, TakeWire::Live { take, owned: true, ended: None, .. } if take == "take-r")
+        matches!(frame, TakeWire::Live { take, owner: TakeOwner::You, ended: None, .. } if take == "take-r")
     });
     assert!(matches!(owned, TakeWire::Live { .. }));
     stop(&relaunched, "take-r");
@@ -248,7 +249,7 @@ fn a_second_window_sees_a_take_its_live_owner_records_as_owned() {
     start(&owner, "take-s");
     let mut seen = Vec::new();
     let tick = until_take(&second, "the owner's take", &mut seen, is_live_tick("take-s"));
-    assert!(matches!(tick, TakeWire::Live { owned: true, .. }), "{tick:?}");
+    assert!(matches!(tick, TakeWire::Live { owner: TakeOwner::Another, .. }), "{tick:?}");
     // The second window tapping (to show levels) does not take it over:
     // the owner still stops it and gets a non-orphan stored row.
     second.take_tap("take-s", 0).unwrap();
@@ -294,5 +295,39 @@ fn a_host_with_a_client_is_not_idle() {
         assert!(Instant::now() < deadline, "the host never went idle");
         std::thread::sleep(Duration::from_millis(20));
     }
+    host.shutdown();
+}
+
+#[test]
+fn of_two_windows_adopting_an_unowned_take_only_the_first_tap_gets_it() {
+    let root = tempfile::tempdir().unwrap();
+    let source = FakeCaptureSource::new(vec![FakeTakeScript::clean()]);
+    let mut host = serve(config(root.path(), source)).expect("host serves");
+    {
+        let gone = connect(&host);
+        start(&gone, "take-race");
+        let mut seen = Vec::new();
+        gone.take_watch().unwrap();
+        until_take(&gone, "a live tick", &mut seen, is_live_tick("take-race"));
+    }
+    let first = connect(&host);
+    first.take_watch().unwrap();
+    let second = connect(&host);
+    second.take_watch().unwrap();
+    let mut seen = Vec::new();
+    let tick = until_take(&second, "the unowned take", &mut seen, is_live_tick("take-race"));
+    assert!(matches!(tick, TakeWire::Live { owner: TakeOwner::Nobody, .. }), "{tick:?}");
+    first.take_tap("take-race", 0).unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    second.take_tap("take-race", 0).unwrap();
+    let mine = until_take(&first, "the first tap's ownership", &mut Vec::new(), |frame| {
+        matches!(frame, TakeWire::Live { owner: TakeOwner::You, ended: None, .. })
+    });
+    assert!(matches!(mine, TakeWire::Live { .. }));
+    until_take(&second, "the second tap sees another owner", &mut Vec::new(), |frame| {
+        matches!(frame, TakeWire::Live { owner: TakeOwner::Another, ended: None, .. })
+    });
+    drop(first);
+    drop(second);
     host.shutdown();
 }

@@ -34,7 +34,7 @@ use std::time::{Duration, Instant};
 
 use gpui::Context;
 use serde_json::{Value, json};
-use starling_dictation::recorder::{CaptureTap, RecorderHandle};
+use starling_dictation::recorder::CaptureTap;
 use tokio::sync::watch;
 
 use crate::app::StarlingApp;
@@ -481,11 +481,14 @@ impl<C> Drop for StreamPump<C> {
 
 impl StarlingApp {
     /// Opens the take's live stream at `endpoint` and starts its worker on
-    /// `handle`'s audio, with the cadence from the settings. An error is
-    /// the reason no live text will show; the take records regardless.
+    /// the take's `feed` (its audio as the recording service sends it,
+    /// #220) at the device `rate`, with the cadence from the settings. An
+    /// error is the reason no live text will show; the take records
+    /// regardless.
     pub(crate) fn start_stream_pump(
         &mut self,
-        handle: &RecorderHandle,
+        feed: Arc<crate::host_link::TakeFeed>,
+        rate: u32,
         endpoint: &str,
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
@@ -497,8 +500,8 @@ impl StarlingApp {
         let stream = LiveStream::start(endpoint, &options)?;
         let endpoint = endpoint.to_string();
         let (pump, live) = StreamPump::start(
-            Box::new(handle.tap()),
-            handle.sample_rate(),
+            Box::new(feed),
+            rate,
             stream,
             Box::new(move || LiveStream::start(&endpoint, &options)),
             trace.clone(),

@@ -1,6 +1,6 @@
-//! The client side of the host's IPC: what the GPUI app and the Electron
-//! comparison adapter will hold (E17 §1 Mode B — "the UI is a
-//! projection: commands in, events + snapshots out").
+//! The client side of the host's IPC: what the GPUI app holds (E17 §1
+//! Mode B — "the UI is a projection: commands in, events + snapshots
+//! out"; #220).
 //!
 //! The wire is [`crate::frame`] — every application payload is the I3
 //! envelope; receipts carry the runtime's own
@@ -130,15 +130,16 @@ pub enum UiWire {
 #[derive(Debug, Clone, PartialEq)]
 pub enum TakeWire {
     /// A recording take's tick, or its end (`ended`: the final sample
-    /// count). `audio` is `(start index, samples)` for a tapping
-    /// connection.
+    /// count; `kept`: a [`TakeWire::Persisted`] follows). `audio` is
+    /// `(start index, samples)` for a tapping connection.
     Live {
         take: String,
         rate: u32,
         status: Option<starling_runtime::machine::capture::LiveTakeStatus>,
         audio: Option<(u64, Vec<f32>)>,
-        owned: bool,
+        owner: crate::frame::TakeOwner,
         ended: Option<u64>,
+        kept: bool,
     },
     StartFailed {
         take: String,
@@ -829,8 +830,9 @@ fn take_wire(frame: Frame) -> Result<TakeWire, String> {
             rate,
             status,
             audio,
-            owned,
+            owner,
             ended,
+            kept,
         } => TakeWire::Live {
             take,
             rate,
@@ -839,8 +841,9 @@ fn take_wire(frame: Frame) -> Result<TakeWire, String> {
                 Some(audio) => Some((audio.start, audio.decode()?)),
                 None => None,
             },
-            owned,
+            owner,
             ended,
+            kept,
         },
         Frame::TakeStartFailed {
             take,

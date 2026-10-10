@@ -9,7 +9,7 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use starling_dictation::{
-    audio, recorder,
+    audio,
     storage::{
         self, DamagedRecord, ListedRecord, SessionStatus, SessionSummary, TranscriptionResult,
     },
@@ -340,95 +340,14 @@ impl Store {
         Ok(Some(Arc::new(flac)))
     }
 
-    /// Persists a finished take: the recorder's journal is adopted as the
-    /// v2 audio evidence when it is finalized and fault-free (moved, never
-    /// re-encoded); otherwise the take is written from its encoded WAV
-    /// through the full §4 protocol. A faulted journal holds only the
-    /// audio before its fault while the in-memory take kept recording
-    /// (#356), so adopting it would drop the words after the fault. The
-    /// stored duration is derived from the samples themselves, never the
-    /// caller's wall clock. Returns the record id and the WAV any
-    /// transcription must run on: when the journal was adopted that is
-    /// the *stored* audio (the evidence every retry loads), so the first
-    /// transcript and its retries can never disagree.
-    pub(crate) fn save_capture(
-        &self,
-        wav: Arc<Vec<u8>>,
-        journal: Option<&recorder::JournalReport>,
-    ) -> Result<SavedTake, storage::StorageError> {
-        let adopted = {
-            let mut store = lock_v2(&self.0);
-            try_adopt(&mut store, journal.filter(|report| adoptable(report)), None)
-        };
-        if let Ok(Some(id)) = adopted {
-            // A failure to load what was just committed would be odd, but
-            // the take is saved either way — fall back to the caller's WAV
-            // rather than failing the save over the transcript source.
-            let wav = self.audio_wav(&id).ok().flatten().unwrap_or(wav);
-            return Ok(SavedTake { id, wav });
-        }
-        // No journal evidence — or a journal-level failure (the store
-        // itself is typically healthy): the fully encoded WAV is in hand,
-        // so the take is stored from it; a journal problem never costs the
-        // audio.
+    /// Persists an imported take from its encoded WAV through the full §4
+    /// protocol (#220: recorded takes are stored by the recording service,
+    /// never here). The stored duration is derived from the samples
+    /// themselves. Returns the record id and the WAV to transcribe.
+    pub(crate) fn save_capture(&self, wav: Arc<Vec<u8>>) -> Result<SavedTake, storage::StorageError> {
         let pcm = decode_wav(&wav)?;
-        let id = self
-            .save_pcm_take(pcm, store_v2::CommitMark::Complete, journal)
-            .map_err(|err| join_adopt_failure(adopted, err))?;
-        self.supersede_journal(journal, &id);
+        let id = self.save_pcm_take(pcm, store_v2::CommitMark::Complete)?;
         Ok(SavedTake { id, wav })
-    }
-
-    /// Persists a salvaged take as interrupted-but-usable with `note`
-    /// stating exactly what survived (I1 phase 2). The interruption is
-    /// written *with* the take: on the journal path adoption carries the
-    /// note and the status is forced under the same guard; on the WAV path
-    /// the row is committed already-interrupted in one transaction — there
-    /// is no separate status update a crash could skip (R34).
-    pub(crate) fn save_interrupted_capture(
-        &self,
-        wav: Arc<Vec<u8>>,
-        journal: Option<&recorder::JournalReport>,
-        note: &str,
-    ) -> Result<String, storage::StorageError> {
-        let adopted = {
-            let mut store = lock_v2(&self.0);
-            let adopted = try_adopt(
-                &mut store,
-                journal.filter(|report| adoptable(report)),
-                Some(note),
-            );
-            if let Ok(Some(id)) = &adopted {
-                // A salvaged take is interrupted no matter what its journal
-                // looked like (R34): the QuiesceTimeout path carries an
-                // already-finalized journal — the writer's exit path closed
-                // it — which adoption alone marks Complete. Interrupted-ness
-                // derives from the salvage, not the journal's finalized-ness.
-                // The note itself is already stored by the adoption (merged
-                // with any torn-tail wording under `extra_json.recovery`), so
-                // this only forces the status — passing no note keeps that
-                // combined wording intact.
-                store
-                    .update_capture_status(id, CaptureStatus::Interrupted, None)
-                    .map_err(v2_err)?;
-                return Ok(id.clone());
-            }
-            adopted
-        };
-        // Fall-through WAV path (no journal, or an unusable one — see
-        // [`try_adopt`]).
-        let pcm = decode_wav(&wav)?;
-        let id = self
-            .save_pcm_take(
-                pcm,
-                store_v2::CommitMark::Interrupted {
-                    note: note.to_string(),
-                },
-                journal,
-            )
-            .map_err(|err| join_adopt_failure(adopted, err))?;
-        self.supersede_journal(journal, &id);
-        Ok(id)
     }
 
     /// Marks a transcription attempt as started on the record. `backend`
@@ -753,98 +672,18 @@ impl Store {
         Ok(report)
     }
 
-    /// The startup recovery pass: reconcile journals against the metadata
-    /// rows (§4), fail recognition attempts still marked started by a
-    /// previous run, and bring back takes left in the recorder's tree
-    /// (#356). The three repairs are independent, so all always run — a
-    /// reconciliation failure must not strand records stuck in
-    /// "Transcribing" or hide a recovered take, and vice versa; the
-    /// failures of the first two combine in [`StartupRecovery::failure`].
-    pub(crate) fn startup_recovery(&self) -> StartupRecovery {
-        /// The note a stale recognition attempt gets at startup — same
-        /// wording as the v1 "stuck in Transcribing" fix.
-        const STALE_ATTEMPT_NOTE: &str =
-            "Interrupted before the server returned a transcript. Your audio is ready to retry.";
-        let (reconciled, staled) = {
-            let mut store = lock_v2(&self.0);
-            (
-                store.reconcile(),
-                store.interrupt_stale_attempts(STALE_ATTEMPT_NOTE),
-            )
-        };
-        let (journals, notice, recheck) = match self.recover_capture_journals(|_| true) {
-            Ok(recovery) => (
-                recovery.problems(),
-                recovery.recovered_summary(),
-                recovery.deferred,
-            ),
-            Err(err) => (
-                format!("Could not scan for interrupted recordings: {err}"),
-                String::new(),
-                Vec::new(),
-            ),
-        };
-        let (summary, failure) = match (reconciled.map_err(v2_err), staled.map_err(v2_err)) {
-            (Ok(report), Ok(_)) => (
-                if report.has_findings() {
-                    report.summary()
-                } else {
-                    String::new()
-                },
-                None,
-            ),
-            (Err(reconcile_err), Err(stale_err)) => (
-                String::new(),
-                Some(storage::StorageError::Invalid(format!(
-                    "{reconcile_err}; {stale_err}"
-                ))),
-            ),
-            (Err(err), Ok(_)) | (Ok(_), Err(err)) => (String::new(), Some(err)),
-        };
-        StartupRecovery {
-            summary: [summary, journals]
-                .into_iter()
-                .filter(|part| !part.is_empty())
-                .collect::<Vec<_>>()
-                .join(" "),
-            notice,
-            recheck,
-            failure,
-        }
-    }
-
-    /// The recorder-tree half of startup recovery (#356), also run once
-    /// more when the startup pass left a just-finished journal to a save
-    /// that may still have been under way.
-    /// `wanted` picks the journal ids to consider: everything at startup,
-    /// only the ones startup deferred on the second look — a take that
-    /// started recording since belongs to this launch, not to recovery.
-    pub(crate) fn recover_capture_journals(
-        &self,
-        wanted: impl Fn(&str) -> bool,
-    ) -> Result<store_v2::JournalRecovery, storage::StorageError> {
-        let mut store = lock_v2(&self.0);
-        let dir = capture_journals_dir(&store);
-        store.recover_capture_journals_where(&dir, wanted).map_err(v2_err)
-    }
-
     /// Write a take from decoded PCM through the §4 protocol with the
     /// guard held only for the cheap steps — minting the staging journal
     /// and the metadata commit. The bulk journal writes and fsyncs run
     /// through the take's own writer, off the shared handle, so one long
-    /// take's save cannot pin every other store call behind it. The
-    /// commit names the recorder `journal` the take is stored in place
-    /// of, so a crash before that journal is moved aside cannot bring it
-    /// back as a second copy (#356).
+    /// take's save cannot pin every other store call behind it.
     fn save_pcm_take(
         &self,
         pcm: audio::PcmAudio,
         mark: store_v2::CommitMark,
-        journal: Option<&recorder::JournalReport>,
     ) -> Result<String, storage::StorageError> {
         let rate = pcm.sample_rate;
-        let mut meta = store_v2::TakeMeta::for_device("");
-        meta.supersedes_journal = journal.map(|report| report.id.clone());
+        let meta = store_v2::TakeMeta::for_device("");
         let mut take = {
             let store = lock_v2(&self.0);
             store.begin_take_at_rate(rate, meta)
@@ -856,51 +695,6 @@ impl Store {
         let committed = finalized.commit_marked(&mut store, mark).map_err(v2_err)?;
         Ok(committed.record.id)
     }
-
-    /// The take was stored from its WAV as `id`: a journal it left in the
-    /// recorder's tree is moved aside so startup recovery does not adopt
-    /// it as a second, partial copy (#356) — but only once the stored
-    /// audio, read back, holds every sample the journal confirmed
-    /// ([`store_v2::supersede_journal_held_by`]). Otherwise, or on a
-    /// failure here (only logged), the journal stays for recovery, which
-    /// runs the same proof: a duplicate at worst, never audio lost.
-    fn supersede_journal(&self, journal: Option<&recorder::JournalReport>, id: &str) {
-        let Some(report) = journal else {
-            return;
-        };
-        // Both reads run off the shared handle: only the path needs it.
-        let stored = lock_v2(&self.0).audio_journal_path(id);
-        let moved =
-            stored.and_then(|stored| store_v2::supersede_journal_held_by(&report.path, &stored));
-        match moved {
-            Ok(true) => {}
-            Ok(false) => eprintln!(
-                "Kept the capture journal {} in place: take {id} does not provably hold all of \
-                 its audio, so startup recovery will bring it back as an interrupted take",
-                report.path.display()
-            ),
-            Err(err) => eprintln!(
-                "Could not move the superseded capture journal {} aside: {err}",
-                report.path.display()
-            ),
-        }
-    }
-}
-
-/// What [`Store::startup_recovery`] found.
-#[derive(Debug)]
-pub(crate) struct StartupRecovery {
-    /// What went wrong, for the error banner; empty when nothing did.
-    pub summary: String,
-    /// Takes brought back from the recorder's tree, for a notice; empty
-    /// when there were none.
-    pub notice: String,
-    /// Journals in the recorder's tree left to a live writer or save:
-    /// look at these again once [`store_v2::FINALIZED_ADOPTION_GRACE`]
-    /// has passed.
-    pub recheck: Vec<String>,
-    /// Reconciliation or the stale-attempt repair failed.
-    pub failure: Option<storage::StorageError>,
 }
 
 /// A [`Store::pin_audio`] guard. Dropping it takes the store lock: never
@@ -1021,69 +815,11 @@ impl UpkeepReport {
     }
 }
 
-/// What a persisted take hands back to the pipeline: the record id, and
-/// the WAV any transcription of it must run on. When the recorder's
-/// journal was adopted, that is the stored audio — the evidence every
-/// retry loads — so the first transcript and later retries transcribe the
-/// same bytes ([`Store::save_capture`]).
+/// What a persisted import hands back to the pipeline: the record id,
+/// and the WAV its transcription runs on.
 pub(crate) struct SavedTake {
     pub(crate) id: String,
     pub(crate) wav: Arc<Vec<u8>>,
-}
-
-/// Try to adopt the recorder's journal into v2. `Ok(Some(id))` — adopted,
-/// with `note` (the salvage note) riding along when given. `Ok(None)` — no
-/// journal to adopt. `Err(reason)` — adoption failed (an unreadable
-/// source, a destination conflict, I/O or database trouble), and that is
-/// **never fatal to the save**: the caller still holds the fully encoded
-/// WAV and stores the take from it instead, so a journal-level problem
-/// cannot cost the audio. `reason` resurfaces only if the WAV write also
-/// fails (see [`join_adopt_failure`]). This includes
-/// [`StoreV2Error::NoVerifiedSamples`] — a header-only journal from a
-/// writer that faulted before its first boundary — which is the common
-/// no-evidence case, not a fault.
-fn try_adopt(
-    store: &mut StoreV2,
-    journal: Option<&recorder::JournalReport>,
-    note: Option<&str>,
-) -> Result<Option<String>, String> {
-    let Some(report) = journal else {
-        return Ok(None);
-    };
-    match store.adopt_journal(&report.path, note) {
-        Ok(record) => Ok(Some(record.id)),
-        Err(err) => Err(err.to_string()),
-    }
-}
-
-/// Whether a recorder journal may become the take's stored audio: only a
-/// finalized journal without a fault holds the whole take (#356).
-fn adoptable(report: &recorder::JournalReport) -> bool {
-    report.finalized && report.fault.is_none()
-}
-
-
-/// The recorder's live-capture tree beside the store
-/// ([`starling_dictation::journal::default_journals_root`] for the
-/// default store root).
-pub(crate) fn capture_journals_dir(store: &StoreV2) -> std::path::PathBuf {
-    store.root().join("journals")
-}
-
-/// Fold a journal-adoption failure into a later WAV-path failure: the take
-/// was stored from neither, and the surfaced error must say both — the WAV
-/// error alone would hide the adoption trouble that forced the fall-back.
-fn join_adopt_failure(
-    adopted: Result<Option<String>, String>,
-    wav_err: storage::StorageError,
-) -> storage::StorageError {
-    match adopted {
-        Ok(_) => wav_err,
-        Err(reason) => storage::StorageError::Invalid(format!(
-            "journal adoption failed ({reason}); storing the take from its encoded WAV \
-             failed too: {wav_err}"
-        )),
-    }
 }
 
 /// Decode the caller's canonical WAV — pure CPU work done *outside* the
@@ -1326,6 +1062,15 @@ mod tests {
         Arc::new(audio::encode_wav_16k(&pcm).expect("encode wav"))
     }
 
+    fn wav_of(samples: &[f32]) -> Arc<Vec<u8>> {
+        let pcm = audio::PcmAudio {
+            samples: samples.to_vec(),
+            sample_rate: 16_000,
+            channels: 1,
+        };
+        Arc::new(audio::encode_wav_16k(&pcm).expect("encode wav"))
+    }
+
     fn transcript(text: &str) -> TranscriptionResult {
         TranscriptionResult {
             text: text.to_string(),
@@ -1547,7 +1292,7 @@ mod tests {
     // ---- the facade over a real v2 store (daily path) ------------------
 
     fn transcribed(store: &Store, text: &str) -> String {
-        let id = store.save_capture(tiny_wav(160), None).expect("save").id;
+        let id = store.save_capture(tiny_wav(160)).expect("save").id;
         store.mark_attempt(&id, "starling:parakeet").expect("begin");
         store.save_transcript(&id, transcript(text)).expect("transcript");
         id
@@ -1556,7 +1301,7 @@ mod tests {
     /// `transcribed` with an explicit backend label (#363): the label the
     /// summary must hand back unchanged.
     fn transcribed_on(store: &Store, text: &str, backend: &str) -> String {
-        let id = store.save_capture(tiny_wav(160), None).expect("save").id;
+        let id = store.save_capture(tiny_wav(160)).expect("save").id;
         store.mark_attempt(&id, backend).expect("begin");
         store.save_transcript(&id, transcript(text)).expect("transcript");
         id
@@ -1733,7 +1478,7 @@ mod tests {
         let wav = tiny_wav(300);
 
         // Save (no journal: the WAV path through the §4 protocol).
-        let saved = store.save_capture(wav.clone(), None).expect("save");
+        let saved = store.save_capture(wav.clone()).expect("save");
         let id = saved.id;
         assert!(store.exists(&id).expect("exists"));
         // The WAV path hands the caller's own bytes back as the transcript
@@ -1788,94 +1533,11 @@ mod tests {
         assert!(store.audio_wav(&id).expect("missing id").is_none());
     }
 
-    /// A journal the recorder finalized before handing it over — the
-    /// QuiesceTimeout salvage shape (the writer's exit path closes the
-    /// journal even when the device never quiesced). Built through a
-    /// scratch store's public take protocol: `begin_take` + `finalize`
-    /// leaves the finished journal in the scratch root's `staging/`, the
-    /// same on-disk shape the recorder produces.
-    fn finalized_journal(tag: &str, samples: &[f32]) -> recorder::JournalReport {
-        let root = scratch_dir(tag);
-        let scratch = StoreV2::open(root.join("scratch")).expect("scratch store");
-        let mut take = scratch
-            .begin_take(store_v2::TakeMeta::for_device("test"))
-            .expect("begin take");
-        take.append_frames(samples).expect("append");
-        take.write_boundary().expect("boundary");
-        let finalized = take.finalize().expect("finalize");
-        recorder::JournalReport {
-            path: root
-                .join("scratch")
-                .join("staging")
-                .join(format!("{}.sj", finalized.id)),
-            id: finalized.id,
-            sample_rate: finalized.sample_rate,
-            acknowledged_samples: finalized.total_samples,
-            finalized: true,
-            fault: None,
-            liveness: Default::default(),
-        }
-    }
-
-    #[test]
-    fn a_quiesce_salvaged_take_with_a_finalized_journal_is_still_interrupted() {
-        // R34 regression: adoption alone marks a finalized, intact journal
-        // Complete — but a take saved through the salvage path is
-        // interrupted regardless, exactly as the v1 mark did, and its
-        // salvage note must surface.
-        let store = v2_store("quiesce-salvage");
-        let samples: Vec<f32> = (0..120).map(|i| (i % 31) as f32 * 0.002).collect();
-        let report = finalized_journal("quiesce-salvage-src", &samples);
-
-        let id = store
-            .save_interrupted_capture(
-                tiny_wav(120),
-                Some(&report),
-                "all captured samples were salvaged and kept as this interrupted recording",
-            )
-            .expect("salvaged save");
-
-        // The journal moved in and became the stored audio.
-        assert!(!report.path.exists());
-        assert!(
-            lock_v2(&store.0)
-                .load_audio(&id)
-                .expect("audio")
-                .finalized
-        );
-
-        // The listing shows the take as interrupted with its note — not
-        // "Captured" with the note invisible.
-        let summary = summary_of(&store, &id);
-        assert_eq!(summary.status, SessionStatus::Interrupted);
-        let last_error = summary.last_error.expect("the salvage note surfaces");
-        assert!(last_error.contains("salvaged and kept"), "{last_error}");
-    }
-
-    #[test]
-    fn a_cleanly_stopped_take_with_a_finalized_journal_stays_captured() {
-        // The mirror of the R34 fix: forcing interrupted-ness belongs to
-        // the salvage path only — a normal completion that adopts a
-        // finalized journal stays a complete take.
-        let store = v2_store("clean-adopt");
-        let samples: Vec<f32> = (0..90).map(|i| (i % 17) as f32 * 0.003).collect();
-        let report = finalized_journal("clean-adopt-src", &samples);
-
-        let id = store
-            .save_capture(tiny_wav(90), Some(&report))
-            .expect("clean save")
-            .id;
-
-        let summary = summary_of(&store, &id);
-        assert_eq!(summary.status, SessionStatus::Captured);
-        assert_eq!(summary.last_error, None);
-    }
-
     #[test]
     fn a_missing_v2_audio_surfaces_its_error_instead_of_falling_back() {
         let store = v2_store("degrade");
         let id = store
-            .save_capture(tiny_wav(50), None)
+            .save_capture(tiny_wav(50))
             .expect("save")
             .id;
 
@@ -1894,62 +1556,6 @@ mod tests {
             }
             other => panic!("expected a surfaced error, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn startup_recovery_reports_and_repairs_on_v2() {
-        let root = scratch_dir("recovery");
-        let owner = reopen_v2(&root);
-        let id = owner
-            .save_capture(tiny_wav(80), None)
-            .expect("save")
-            .id;
-        // A recognition attempt left "started" by a previous run — #213:
-        // that run's attempt markers died with its process, so the owner
-        // store is dropped to simulate the crash.
-        owner
-            .mark_attempt(&id, "starling:parakeet")
-            .expect("begin");
-        drop(owner);
-
-        let store = reopen_v2(&root);
-        let summary = store.startup_recovery().summary;
-        assert!(summary.is_empty(), "a healthy store has nothing to say");
-
-        // After the pass the stale attempt is failed, ready to retry.
-        assert_eq!(session_status(&store, &id), SessionStatus::Failed);
-        assert!(transcript_text(&store, &id).is_none());
-    }
-
-    #[test]
-    fn startup_recovery_spares_an_attempt_a_live_instance_still_owns() {
-        // #213: two instances, one transcribing. The second instance's
-        // startup sweep must not flip the first instance's in-flight
-        // attempt to Failed — the phantom-failure defect.
-        let root = scratch_dir("recovery-live-owner");
-        let owner = reopen_v2(&root);
-        let id = owner
-            .save_capture(tiny_wav(80), None)
-            .expect("save")
-            .id;
-        owner
-            .mark_attempt(&id, "starling:parakeet")
-            .expect("begin");
-
-        let sweeper = reopen_v2(&root);
-        let summary = sweeper.startup_recovery().summary;
-        assert!(summary.is_empty(), "nothing to report while the owner lives");
-        assert_eq!(
-            session_status(&sweeper, &id),
-            SessionStatus::Transcribing,
-            "the live owner's attempt is not stale"
-        );
-
-        // The owner still settles its attempt afterwards.
-        owner
-            .save_transcript(&id, transcript("owned"))
-            .expect("the owner finishes");
-        assert_eq!(session_status(&sweeper, &id), SessionStatus::Transcribed);
     }
 
     #[test]
@@ -1979,29 +1585,6 @@ mod tests {
     }
 
     #[test]
-    fn an_adopted_take_transcribes_the_stored_audio_not_the_caller_wav() {
-        // The adopted journal is the stored evidence every retry loads. A
-        // faulted writer can leave the journal shorter than the in-memory
-        // take, so the first transcript must run on the stored bytes too —
-        // otherwise attempt one and its retry transcribe different audio.
-        let store = v2_store("adopt-consistent");
-        let samples: Vec<f32> = (0..120).map(|i| (i % 23) as f32 * 0.004).collect();
-        let report = finalized_journal("adopt-consistent-src", &samples);
-
-        // The caller's WAV carries more samples than the journal does.
-        let saved = store
-            .save_capture(tiny_wav(300), Some(&report))
-            .expect("adopting save");
-
-        let decoded = audio::decode_pcm16_wav(&saved.wav).expect("decode");
-        assert_eq!(decoded.samples.len(), 120, "the stored journal's samples");
-        // And exactly what a retry loads, so the two can never diverge.
-        let reloaded = store.audio_wav(&saved.id).expect("reload").expect("present");
-        let reloaded = audio::decode_pcm16_wav(&reloaded).expect("decode");
-        assert_eq!(reloaded.samples, decoded.samples);
-    }
-
-    #[test]
     fn upkeep_compresses_and_a_retry_sends_the_same_request_wav() {
         // #342 acceptance: a retried take from FLAC produces the same
         // request audio as from the journal.
@@ -2009,10 +1592,7 @@ mod tests {
         let samples: Vec<f32> = (0..32_000)
             .map(|i| ((i as f32 * 0.05).sin() * 0.3) + ((i % 7) as f32 * 0.001))
             .collect();
-        let report = finalized_journal("upkeep-flac-src", &samples);
-        let saved = store
-            .save_capture(tiny_wav(32_000), Some(&report))
-            .expect("adopting save");
+        let saved = store.save_capture(wav_of(&samples)).expect("save");
         let before = store.audio_wav(&saved.id).expect("load").expect("present");
         assert_eq!(*before, *saved.wav, "the first transcription's audio");
 
@@ -2036,10 +1616,7 @@ mod tests {
     #[test]
     fn upkeep_stops_when_a_take_starts_recording() {
         let store = v2_store("upkeep-paused");
-        let report = finalized_journal("upkeep-paused-src", &vec![0.1f32; 32_000]);
-        let saved = store
-            .save_capture(tiny_wav(32_000), Some(&report))
-            .expect("adopting save");
+        let saved = store.save_capture(wav_of(&[0.1f32; 32_000])).expect("save");
         let mut policy = store_v2::RetentionPolicy::default();
         policy.grace = std::time::Duration::ZERO;
         policy.include_referenced = true;
@@ -2064,10 +1641,7 @@ mod tests {
     #[test]
     fn a_failed_compression_commit_leaves_the_store_usable() {
         let store = v2_store("upkeep-commit-fails");
-        let report = finalized_journal("upkeep-commit-fails-src", &vec![0.1f32; 32_000]);
-        let saved = store
-            .save_capture(tiny_wav(32_000), Some(&report))
-            .expect("adopting save");
+        let saved = store.save_capture(wav_of(&[0.1f32; 32_000])).expect("save");
         // A directory where the FLAC goes: the publish's rename fails.
         let flac = lock_v2(&store.0)
             .root()
@@ -2338,277 +1912,12 @@ mod tests {
         assert!(err.to_string().contains("retention policy"), "{err}");
     }
 
-    #[test]
-    fn an_unusable_journal_still_saves_the_take_from_its_wav() {
-        // An adoption failure is a journal-level problem; the store is
-        // healthy and the fully encoded WAV is in hand. The save must not
-        // abort (that would drop the take into the memory-only stash) — it
-        // falls through to the WAV path.
-        let store = v2_store("adopt-fallback");
-        let junk_root = scratch_dir("adopt-fallback-junk");
-        let junk_path = junk_root.join("j_unreadable.sj");
-        std::fs::write(&junk_path, b"not a journal at all").expect("write junk journal");
-        let report = recorder::JournalReport {
-            path: junk_path.clone(),
-            id: "j_unreadable".to_string(),
-            sample_rate: 16_000,
-            acknowledged_samples: 0,
-            finalized: true,
-            fault: None,
-            liveness: Default::default(),
-        };
-
-        let saved = store
-            .save_capture(tiny_wav(90), Some(&report))
-            .expect("the take is saved from its WAV");
-
-        assert_ne!(saved.id, "j_unreadable", "a fresh take, not the journal id");
-        let decoded = audio::decode_pcm16_wav(&saved.wav).expect("decode");
-        assert_eq!(decoded.samples.len(), 90);
-        let summary = summary_of(&store, &saved.id);
-        assert_eq!(summary.status, SessionStatus::Captured);
-        // The unusable journal is kept where it is (#356): nothing proves
-        // the stored take holds what it does, so it never joins the
-        // superseded journals the retention sweep removes.
-        assert!(junk_path.exists());
-        assert!(!junk_root.join(store_v2::SUPERSEDED_SUBDIR).exists());
-    }
-
-    #[test]
-    fn a_wav_path_salvage_lands_interrupted_with_its_note() {
-        // The no-journal salvage path: the interruption and its note are
-        // committed with the take (one transaction — R34 leaves no crash
-        // window between "saved" and "marked").
-        let store = v2_store("wav-salvage");
-        let id = store
-            .save_interrupted_capture(tiny_wav(60), None, "kept from memory after the fault")
-            .expect("salvage save");
-
-        let summary = summary_of(&store, &id);
-        assert_eq!(summary.status, SessionStatus::Interrupted);
-        let last_error = summary.last_error.expect("the salvage note surfaces");
-        assert!(last_error.contains("kept from memory"), "{last_error}");
-        // The audio is playable: the stored take round-trips.
-        let loaded = store.audio_wav(&id).expect("audio").expect("present");
-        let decoded = audio::decode_pcm16_wav(&loaded).expect("decode");
-        assert_eq!(decoded.samples.len(), 60);
-    }
-
-    #[test]
-    fn startup_recovery_repairs_stale_attempts_even_when_reconciliation_fails() {
-        // The two startup repairs are independent: a reconciliation failure
-        // must not leave records stuck in "Transcribing" from a previous
-        // run — the stale-attempt repair runs anyway and the reconcile
-        // error still surfaces.
-        let root = scratch_dir("reconcile-fail");
-        let owner = reopen_v2(&root);
-        let stuck = owner
-            .save_capture(tiny_wav(70), None)
-            .expect("save")
-            .id;
-        owner
-            .mark_attempt(&stuck, "starling:parakeet")
-            .expect("begin");
-
-        // Sabotage reconciliation only: a tombstoned capture whose journal
-        // was resurrected under audio/ while its quarantine destination is
-        // a directory — the tombstone-completion rename cannot succeed, so
-        // reconcile errors while the rest of the store stays healthy.
-        let doomed = owner
-            .save_capture(tiny_wav(30), None)
-            .expect("save")
-            .id;
-        owner.delete(&doomed).expect("delete");
-        drop(owner); // the previous run crashed with the attempt in flight
-
-        let store = reopen_v2(&root);
-        {
-            let inner = lock_v2(&store.0);
-            let audio = inner.root().join("audio").join(format!("{doomed}.sj"));
-            let quarantine = inner.root().join("quarantine").join(format!("{doomed}.sj"));
-            std::fs::copy(&quarantine, &audio).expect("resurrect the journal");
-            std::fs::remove_file(&quarantine).expect("clear the destination");
-            std::fs::create_dir(&quarantine).expect("the destination is now a directory");
-        }
-
-        assert!(
-            store.startup_recovery().failure.is_some(),
-            "the sabotaged reconciliation must surface its error"
-        );
-        // …but the stale attempt was still repaired: the stuck take is
-        // retryable (failed with its note), not still "Transcribing".
-        assert_eq!(session_status(&store, &stuck), SessionStatus::Failed);
-        let summary = summary_of(&store, &stuck);
-        let last_error = summary.last_error.expect("the stale-attempt note");
-        assert!(last_error.contains("ready to retry"), "{last_error}");
-    }
-
     // ---- #356: durable audio, retries, recovery --------------------------
-
-    /// A journal the recorder left behind when its app died mid-take: the
-    /// samples up to `confirmed` sit under a fsynced boundary, the rest
-    /// were written after it and never confirmed. Placed in the store's
-    /// capture-journal tree under `id`.
-    fn killed_journal(store: &Store, id: &str, confirmed: &[f32], unconfirmed: &[f32]) -> std::path::PathBuf {
-        let scratch = scratch_dir("killed-src");
-        let writer_store = StoreV2::open(&scratch).expect("scratch store");
-        let mut take = writer_store
-            .begin_take(store_v2::TakeMeta::for_device("test"))
-            .expect("begin");
-        take.append_frames(confirmed).expect("append");
-        take.write_boundary().expect("boundary");
-        take.append_frames(unconfirmed).expect("tail");
-        let staged = scratch.join("staging").join(format!("{}.sj", take.id()));
-        drop(take);
-        let tree = capture_journals_dir(&lock_v2(&store.0));
-        std::fs::create_dir_all(&tree).expect("journals tree");
-        let path = tree.join(format!("{id}.sj"));
-        std::fs::rename(&staged, &path).expect("place journal");
-        path
-    }
-
-    #[test]
-    fn a_faulted_journal_is_not_adopted_and_the_whole_take_is_kept() {
-        // A journal that faulted mid-take holds only the audio before the
-        // fault; the in-memory take kept recording. The take is stored
-        // whole from its WAV, and the partial journal — the WAV's first
-        // samples — is moved aside: kept, but never recovered later as a
-        // second, shorter take.
-        let store = v2_store("faulted-journal");
-        let samples: Vec<f32> = (0..120).map(|i| (i % 97) as f32 * 0.001).collect();
-        let mut report = finalized_journal("faulted-journal-src", &samples);
-        report.fault = Some("The capture journal failed: No space left on device".to_string());
-
-        let saved = store
-            .save_capture(tiny_wav(300), Some(&report))
-            .expect("save");
-
-        assert_ne!(saved.id, report.id, "stored from the WAV, not the journal");
-        // The commit names the journal it replaces: a crash before the move
-        // aside below cannot bring the journal back as a second take.
-        assert_eq!(
-            lock_v2(&store.0)
-                .journal_superseded_by(&report.id)
-                .expect("read"),
-            Some(saved.id.clone())
-        );
-        let stored = store.audio_wav(&saved.id).expect("load").expect("present");
-        assert_eq!(audio::decode_pcm16_wav(&stored).expect("decode").samples.len(), 300);
-        assert!(!report.path.exists());
-        assert!(report
-            .path
-            .parent()
-            .unwrap()
-            .join(store_v2::SUPERSEDED_SUBDIR)
-            .join(format!("{}.sj", report.id))
-            .exists());
-
-        // The salvage path follows the same rule.
-        let mut report = finalized_journal("faulted-salvage-src", &samples);
-        report.fault = Some("fsync failed".to_string());
-        let id = store
-            .save_interrupted_capture(tiny_wav(300), Some(&report), "kept from memory")
-            .expect("salvage");
-        let stored = store.audio_wav(&id).expect("load").expect("present");
-        assert_eq!(audio::decode_pcm16_wav(&stored).expect("decode").samples.len(), 300);
-        assert!(!report.path.exists());
-
-        // A journal the stored take does not provably hold — here audio
-        // the WAV lacks — stays for startup recovery: a duplicate at
-        // worst, never audio lost.
-        let other: Vec<f32> = (0..120).map(|i| (i % 23) as f32 * 0.004).collect();
-        let mut report = finalized_journal("faulted-unproven-src", &other);
-        report.fault = Some("fsync failed".to_string());
-        store.save_capture(tiny_wav(300), Some(&report)).expect("save");
-        assert!(report.path.exists(), "kept in place");
-        assert!(!report
-            .path
-            .parent()
-            .unwrap()
-            .join(store_v2::SUPERSEDED_SUBDIR)
-            .exists());
-    }
-
-    #[test]
-    fn a_failed_save_leaves_the_journal_for_the_next_launch() {
-        // Disk trouble at stop: neither the journal (faulted) nor the WAV
-        // can be stored. The journal stays in the recorder's tree, and the
-        // next launch recovers what it confirmed.
-        let root = scratch_dir("failed-save");
-        let store = reopen_v2(&root);
-        let confirmed: Vec<f32> = (0..16_000).map(|i| (i % 41) as f32 * 0.002).collect();
-        let path = killed_journal(&store, "j_full_disk", &confirmed, &[0.1; 400]);
-        let report = recorder::JournalReport {
-            path: path.clone(),
-            id: "j_full_disk".to_string(),
-            sample_rate: 16_000,
-            acknowledged_samples: 16_000,
-            finalized: false,
-            fault: Some("The capture journal failed: No space left on device".to_string()),
-            liveness: Default::default(),
-        };
-        // The store's own staging tree cannot be written.
-        let staging = root.join("v2").join("staging");
-        std::fs::remove_dir_all(&staging).expect("clear staging");
-        std::fs::write(&staging, b"in the way").expect("block staging");
-
-        assert!(store.save_capture(tiny_wav(20_000), Some(&report)).is_err());
-        assert!(path.exists(), "the journal is not moved aside when nothing was stored");
-
-        std::fs::remove_file(&staging).expect("unblock");
-        drop(store);
-        let relaunched = reopen_v2(&root);
-        let summary = relaunched.startup_recovery().notice;
-        assert!(summary.contains("Recovered 1 recording"), "{summary}");
-        let take = summary_of(&relaunched, "j_full_disk");
-        assert_eq!(take.status, SessionStatus::Interrupted);
-        assert_eq!(take.duration_ms, Some(1000.0));
-    }
-
-    #[test]
-    fn a_take_killed_mid_recording_is_listed_playable_exportable_and_retryable() {
-        let root = scratch_dir("killed-relaunch");
-        let store = reopen_v2(&root);
-        let confirmed: Vec<f32> = (0..24_000).map(|i| ((i as f32) * 0.01).sin() * 0.2).collect();
-        killed_journal(&store, "j_killed", &confirmed, &[0.05; 640]);
-        drop(store);
-
-        let store = reopen_v2(&root);
-        let summary = store.startup_recovery().notice;
-        assert!(summary.contains("Recovered 1 recording"), "{summary}");
-
-        let take = summary_of(&store, "j_killed");
-        assert_eq!(take.status, SessionStatus::Interrupted);
-        assert!(take.interrupted);
-        assert_eq!(take.duration_ms, Some(1500.0));
-        assert_eq!(take.confirmed_ms, Some(1500.0), "everything kept is confirmed");
-        let note = take.last_error.expect("the recovery note surfaces");
-        assert!(note.contains("Recovered 1.5 s"), "{note}");
-
-        // Playable / WAV and FLAC export: the same samples either way.
-        let wav = store.audio_wav("j_killed").expect("wav").expect("present");
-        let wav_samples = audio::decode_pcm16_wav(&wav).expect("decode").samples;
-        let flac = store.audio_flac("j_killed").expect("flac").expect("present");
-        let flac_samples = starling_dictation::flac::decode(std::io::Cursor::new(&*flac))
-            .expect("decode flac");
-        assert_eq!(flac_samples.len(), wav_samples.len());
-        assert_eq!(
-            flac_samples,
-            audio::request_pcm16(&wav_samples, 16_000).expect("pcm16")
-        );
-
-        // Retryable, and it stays an interrupted take with its history.
-        store.mark_attempt("j_killed", "engine:a").expect("begin");
-        store.save_transcript("j_killed", transcript("recovered words")).expect("finish");
-        let take = summary_of(&store, "j_killed");
-        assert_eq!(take.status, SessionStatus::Transcribed);
-        assert!(take.interrupted, "the take's own history survives its retry");
-    }
 
     #[test]
     fn a_retry_adds_a_result_and_never_replaces_an_earlier_one() {
         let store = v2_store("retry-adds");
-        let id = store.save_capture(tiny_wav(160), None).expect("save").id;
+        let id = store.save_capture(tiny_wav(160)).expect("save").id;
         store.mark_attempt(&id, "engine:model-a").expect("begin");
         store.save_transcript(&id, transcript("first words")).expect("first");
         store.mark_attempt(&id, "openai:whisper").expect("retry");
@@ -2645,7 +1954,7 @@ mod tests {
     #[test]
     fn an_empty_retry_never_replaces_a_real_transcript() {
         let store = v2_store("empty-retry");
-        let id = store.save_capture(tiny_wav(160), None).expect("save").id;
+        let id = store.save_capture(tiny_wav(160)).expect("save").id;
         store.mark_attempt(&id, "engine:model-a").expect("begin");
         store.save_transcript(&id, transcript("real words")).expect("first");
         store.mark_attempt(&id, "engine:model-b").expect("retry");
@@ -2663,7 +1972,7 @@ mod tests {
         );
 
         // A take whose only result is empty still shows it as such.
-        let only = store.save_capture(tiny_wav(160), None).expect("save").id;
+        let only = store.save_capture(tiny_wav(160)).expect("save").id;
         store.mark_attempt(&only, "engine:model-b").expect("begin");
         store.save_transcript(&only, transcript("")).expect("empty");
         assert_eq!(summary_of(&store, &only).transcript.expect("shown").text, "");
@@ -2676,7 +1985,7 @@ mod tests {
         // take; afterwards the retry's request audio is byte-identical
         // whether it reads the journal or the FLAC.
         let store = v2_store("retry-pin");
-        let id = store.save_capture(tiny_wav(32_000), None).expect("save").id;
+        let id = store.save_capture(tiny_wav(32_000)).expect("save").id;
         let before = store.audio_wav(&id).expect("load").expect("present");
         let pin = store.pin_audio(&id);
         let report = store

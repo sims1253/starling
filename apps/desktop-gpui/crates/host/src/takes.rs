@@ -23,9 +23,11 @@
 //!
 //! Each take has an **owner**: the connection whose `capture.start`
 //! opened it, or the one that tapped it after its owner was gone.
-//! Status ticks say whether the owner is still connected (`owned`), so a
-//! second app window never takes over a take another live window
-//! records — it only adopts one whose owner died.
+//! Each tick tells its connection whose take it is ([`TakeOwner`]: the
+//! connection itself, another live one, or nobody), so a second app
+//! window never takes over a take another live window records — it only
+//! adopts one whose owner died, and of two windows racing to adopt, the
+//! one whose tap arrives second sees the take is another's.
 //!
 //! A take outlives its app (the renderer-kill acceptance): when no
 //! connection watches a recording take for [`HostConfig::orphan_grace`],
@@ -34,10 +36,13 @@
 //! **orphan**: one watching connection — the first, or the next to watch
 //! — receives its [`Frame::TakePersisted`] with `orphan: true`, and
 //! transcribes it. An app that reconnects while the take still records
-//! sees its status ticks (`owned: false`) and adopts it.
+//! sees its status ticks (`owner: nobody`) and adopts it.
 //!
 //! Agent asks (`ask_*` corrs) are the broker's business: their takes are
-//! not part of this feed.
+//! not part of this feed, and agent connections may not follow it. Any
+//! other connection may — like every command, the feed is open to the
+//! user's own processes (peer-credential auth), which can already read
+//! the journals and the store on disk; it grants no access they lack.
 //!
 //! [`HostConfig::orphan_grace`]: crate::config::HostConfig::orphan_grace
 
@@ -53,7 +58,7 @@ use starling_runtime::protocol::Command;
 use starling_runtime::RuntimeClient;
 
 use crate::agent::ASK_PREFIX;
-use crate::frame::{Frame, HostRecovery, TakeAudio};
+use crate::frame::{Frame, HostRecovery, TakeAudio, TakeOwner};
 use crate::server::{lock_registry, ConnState};
 
 /// How often watching connections hear about a recording take.
@@ -156,6 +161,15 @@ fn alive(owner: &Option<Arc<ConnState>>) -> bool {
     owner
         .as_ref()
         .is_some_and(|conn| !conn.closed.load(Ordering::SeqCst))
+}
+
+/// Whose take it is, as `conn` sees it.
+fn owner_for(owner: &Option<Arc<ConnState>>, conn: &Arc<ConnState>) -> TakeOwner {
+    match owner {
+        Some(owner) if Arc::ptr_eq(owner, conn) => TakeOwner::You,
+        _ if alive(owner) => TakeOwner::Another,
+        _ => TakeOwner::Nobody,
+    }
 }
 
 impl TakeHub {
@@ -329,7 +343,7 @@ fn serve_watcher(
 ) {
     let conn = Arc::clone(&watcher.conn);
     if let Some(live) = live {
-        let owned = alive(&live.owner);
+        let owner = owner_for(&live.owner, &conn);
         let tapped = watcher
             .tap
             .as_mut()
@@ -351,8 +365,9 @@ fn serve_watcher(
                         status: first.then(|| status.cloned()).flatten(),
                         audio: (!samples.is_empty())
                             .then(|| TakeAudio::encode(tap.cursor, &samples)),
-                        owned,
+                        owner,
                         ended: None,
+                        kept: false,
                     };
                     if conn.try_deliver(frame).is_err() {
                         break;
@@ -371,8 +386,9 @@ fn serve_watcher(
                         rate: live.rate,
                         status: status.cloned(),
                         audio: None,
-                        owned,
+                        owner,
                         ended: None,
+                        kept: false,
                     });
                 }
             }
@@ -392,8 +408,9 @@ fn serve_watcher(
             rate: 0,
             status: None,
             audio: None,
-            owned: false,
+            owner: TakeOwner::Nobody,
             ended: Some(tap.cursor),
+            kept: false,
         });
         watcher.tap = None;
         for frame in std::mem::take(&mut watcher.after_tap) {
@@ -420,8 +437,9 @@ fn serve_watcher(
             rate: done.rate,
             status: None,
             audio: Some(TakeAudio::encode(start as u64, &samples[start..end])),
-            owned: alive(&done.owner),
+            owner: owner_for(&done.owner, &conn),
             ended: None,
+            kept: false,
         };
         if conn.try_deliver(frame).is_err() {
             return;
@@ -436,8 +454,9 @@ fn serve_watcher(
                 rate: done.rate,
                 status: None,
                 audio: None,
-                owned: alive(&done.owner),
+                owner: owner_for(&done.owner, &conn),
                 ended: Some(samples.len() as u64),
+                kept: done.record.is_some(),
             })
             .is_ok()
     {
@@ -514,7 +533,6 @@ impl CaptureObserver for TakeHub {
                 (record.map(|record| record.sample_rate).unwrap_or(0), None)
             }
         };
-        let owned = alive(&owner);
         if record.is_some() {
             state.persisting += 1;
         }
@@ -522,7 +540,7 @@ impl CaptureObserver for TakeHub {
         state.ended.push_back(Ended {
             take: corr.to_string(),
             rate,
-            owner,
+            owner: owner.clone(),
             record: record.cloned(),
         });
         while state.ended.len() > ENDED_KEEP {
@@ -540,8 +558,9 @@ impl CaptureObserver for TakeHub {
                 rate,
                 status: None,
                 audio: None,
-                owned,
+                owner: owner_for(&owner, &watcher.conn),
                 ended: Some(total),
+                kept: record.is_some(),
             });
         }
     }

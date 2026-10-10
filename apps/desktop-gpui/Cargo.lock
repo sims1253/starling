@@ -5775,6 +5775,8 @@ dependencies = [
  "starling-dictation",
  "starling-insertion",
  "starling-processing",
+ "starling-runtime",
+ "starling-runtime-host",
  "tempfile",
  "tokio",
  "tokio-tungstenite",

@@ -302,6 +302,25 @@ impl StarlingApp {
         }
     }
 
+    /// The take behind staging `token` was stored without a transcript
+    /// (#220: the recording service kept it as interrupted).
+    pub(crate) fn staging_ended_without_transcript(&mut self, token: u64, cx: &mut Context<Self>) {
+        if let Some(staging) = self.staging_mut(token) {
+            if matches!(
+                staging.phase,
+                StagingPhase::Recording | StagingPhase::Finishing
+            ) {
+                staging.phase = StagingPhase::Failed;
+                staging.notice = Some(
+                    "The recording ended without a transcript. The text \
+                     here is not saved; copy it before closing the panel."
+                        .to_string(),
+                );
+                cx.notify();
+            }
+        }
+    }
+
     /// The take was cancelled (#221): nothing will be transcribed. A
     /// draft the user typed into stays on screen (interrupted, with the
     /// notice to copy it) and its token is returned, so the cancel path
@@ -1276,7 +1295,7 @@ mod tests {
         })
         .unwrap();
         let id = store
-            .save_capture(std::sync::Arc::new(wav), None)
+            .save_capture(std::sync::Arc::new(wav))
             .unwrap()
             .id;
         let attempt = transcribe(store, &id, "raw");

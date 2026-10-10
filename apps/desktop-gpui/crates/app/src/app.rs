@@ -23,7 +23,6 @@ use starling_dictation::{
     fidelity::{self, TranscriptAnalysisOptions},
     playback::{platform_backend, PlaybackAttenuation, PlaybackLease, PlaybackNotice},
     player::Player,
-    recorder::RecorderHandle,
     settings::{
         ActivationMode, DictationSettings, EngineMode, EngineSettings, FeedbackSettings,
         InsertionSettings, LivePreviewSettings, MicrophoneSettings, OverlayMode, PlaybackMode,
@@ -505,6 +504,9 @@ pub struct StarlingApp {
     pub(crate) take_notice: Option<String>,
     /// Takes startup recovery brought back (#356): shown until dismissed.
     pub(crate) recovery_notice: Option<String>,
+    /// A take the recording service kept while this window was gone
+    /// (#220): picked up mid-take, or stored and now transcribed.
+    pub(crate) service_notice: Option<String>,
     /// The latest playback-attenuation notice. Its own slot: the take
     /// lifecycle clears `error` and `take_notice` on every start/stop.
     pub(crate) playback_notice: Option<PlaybackNotice>,
@@ -548,7 +550,12 @@ pub struct StarlingApp {
     /// replaced; watchers capture the value at spawn time.
     pub playback_generation: u64,
 
-    pub recorder: Option<RecorderHandle>,
+    /// The take the recording service records for this window (#220),
+    /// as its status ticks and audio feed describe it.
+    pub(crate) recorder: Option<crate::host_link::LiveCapture>,
+    /// The connection to the recording service and the takes this window
+    /// stopped or cancelled until they are stored (#220).
+    pub(crate) host: crate::remote_take::HostState,
     /// The take's live stream worker (#357) and its generation, which
     /// previews still arriving from an earlier take's worker do not match.
     pub(crate) stream_pump: Option<crate::stream_pump::StreamPump<crate::live_stream::LiveStream>>,
@@ -1152,11 +1159,13 @@ impl StarlingApp {
             key_interceptor: None,
             take_notice: None,
             recovery_notice: None,
+            service_notice: None,
             playback_notice: None,
             correction_chain: None,
             playing_id: None,
             playback_generation: 0,
             recorder: None,
+            host: Default::default(),
             stream_pump: None,
             stream_generation: 0,
             stream_trace: None,
@@ -1195,27 +1204,16 @@ impl StarlingApp {
     pub fn init(&mut self, cx: &mut Context<Self>) {
         if let Some(store) = self.store.clone() {
             cx.spawn(async move |this, cx| {
-                // Startup recovery, v2 (§4): reconcile journals against the
-                // metadata rows and fail recognition attempts a previous
-                // run left "started" (the "stuck in Transcribing" fix —
-                // same note, same outcome). Findings surface through the
-                // error banner; recovery is never a reason to abort
-                // startup.
-                let recovered = {
-                    let store = store.clone();
-                    cx.background_spawn(async move { store.startup_recovery() }).await
-                };
-                let recheck = crate::upload::show_startup_recovery(&this, recovered, cx);
-
+                // Startup recovery runs in the recording service, which
+                // owns the store (#220): it reports what it found when this
+                // window connects.
                 refresh_sessions(&this, &store, cx).await;
-                // #342: compression and retention after recovery settled.
+                // #342: compression and retention.
                 this.update(cx, |app, cx| app.start_audio_upkeep(cx)).ok();
-                if !recheck.is_empty() {
-                    crate::upload::recheck_capture_journals(&this, &store, recheck, cx).await;
-                }
             })
             .detach();
         }
+        self.start_host_link(cx);
         self.watch_playback_notices(cx);
         match self.engine_settings.mode {
             // #362: in builtin mode the connection indicator derives from
@@ -2567,7 +2565,7 @@ impl Render for StarlingApp {
 
         // The overlay is placed in this window's scale (#221).
         self.overlay.scale = window.scale_factor();
-        if let Some(handle) = self.recorder.as_mut() {
+        if let Some(handle) = self.recorder.as_ref() {
             let window_samples = handle.latest_window(1024);
             let magnitudes = fft::magnitude_spectrum(&window_samples);
             self.levels = fft::waveform_levels(&magnitudes, 52);

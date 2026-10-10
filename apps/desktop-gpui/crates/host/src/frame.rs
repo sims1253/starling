@@ -209,17 +209,20 @@ pub enum Frame {
     /// through the take's end (a reconnecting app replays from 0).
     TakeTap { take: String, from: u64 },
     /// One tick of a take the host records: its health while it records,
-    /// audio for a tapping connection, whether the connection that owns
-    /// the take is still connected, and `ended` — the take's final sample
+    /// audio for a tapping connection, who owns the take as this
+    /// connection sees it, and `ended` — the take's final sample
     /// count — once it stopped (for a tapping connection, after the last
-    /// of its audio).
+    /// of its audio). With `ended`, `kept` says whether the take kept
+    /// anything — a [`Frame::TakePersisted`] follows exactly when it did.
     LiveTake {
         take: String,
         rate: u32,
         status: Option<starling_runtime::machine::capture::LiveTakeStatus>,
         audio: Option<TakeAudio>,
-        owned: bool,
+        owner: TakeOwner,
         ended: Option<u64>,
+        #[serde(default)]
+        kept: bool,
     },
     /// A `capture.start` could not open the microphone: the input
     /// problem, when the host could classify it, and what to show.
@@ -242,6 +245,20 @@ pub enum Frame {
     /// Something the host's recovery found after the app started
     /// watching (a journal it looked at again later).
     HostNotice { recovery: HostRecovery },
+}
+
+/// Who owns a take, as the receiving connection sees it: the connection
+/// whose `capture.start` opened it (or that adopted it after its owner
+/// was gone).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TakeOwner {
+    /// This connection.
+    You,
+    /// Another live connection.
+    Another,
+    /// No live connection: an app may adopt it.
+    Nobody,
 }
 
 /// A slice of a take's audio on the wire: mono f32 little-endian samples,
@@ -536,8 +553,9 @@ mod tests {
                 rate: 48_000,
                 status: None,
                 audio: Some(TakeAudio::encode(3, &[0.5, -0.25])),
-                owned: true,
+                owner: TakeOwner::You,
                 ended: Some(5),
+                kept: true,
             },
             Frame::TakePersisted {
                 take: "take-1".into(),

@@ -31,8 +31,16 @@
 //!   gate and drives the existing capture/jobs path.
 //! - [`mcp`] — the MCP stdio server behind the `mcp-dictation` binary,
 //!   bridging `tools/call` onto [`agent`]'s ask frames.
-//! - [`client`] — the client library the GPUI app will hold (the
-//!   Electron comparison app has since been removed from the tree).
+//! - [`client`] — the client library the GPUI app holds (#220).
+//! - [`takes`] — the take feed: the app's projection of the takes this
+//!   host records (status, audio, stored rows, orphans), beside the
+//!   envelope like the ask frames.
+//! - [`capture`] — the production capture source (the desktop settings'
+//!   microphone, journaled, disk-watched).
+//! - [`recovery`] — owner-side startup recovery beyond reconcile (stale
+//!   attempts, the recorder's journal tree).
+//! - [`cli`] — the command line, shared by this crate's binary and the
+//!   app's `--runtime-host`.
 //!
 //! # Worker supervision boundary (recorded precisely)
 //!
@@ -56,16 +64,19 @@
 //!   leases the active engine per job. The sidecar's `--parent-pid` is
 //!   the host, so it dies with the host, never with a renderer.
 //!
-//! # What remains outside this crate (the consuming increments)
+//! # What the app holds and what remains (#220)
 //!
-//! The GPUI app (`crates/app`) does not hold a [`client::HostClient`]
-//! yet — it still talks to `starling-dictation` directly (recorder,
-//! uploads, its own engine manager), and the switchover is its own
-//! increment: the client library here is that surface, and the engine
-//! supervisor it would hand over already runs here and shares the app's
-//! sidecar through the engine registry in the meantime. The Electron
-//! comparison app the design names as a second client has been removed
-//! from the tree, so there is no second adapter to switch.
+//! The GPUI app (`crates/app`) is a client: it starts this host from its
+//! own executable when none serves (`starling-gpui --runtime-host`),
+//! records every take through the capture machine and the take feed,
+//! and never opens a recorder, a journal or the store lease itself. It
+//! still transcribes its takes (uploads, the live stream, retries) and
+//! writes their attempt rows through its own store handle — a store
+//! client, the multi-process shape storage v2 is built for — and runs
+//! its own engine manager; the host it starts runs with `--engine
+//! none`. Moving transcription, store writes and the engine into the
+//! host are the next increments. The Electron comparison app the design
+//! names as a second client has been removed from the tree.
 
 pub mod agent;
 pub mod auth;
