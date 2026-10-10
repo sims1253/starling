@@ -33,17 +33,16 @@
 //! connection watches a recording take for [`HostConfig::orphan_grace`],
 //! the hub stops it itself — the take is finalized and stored like any
 //! other. A take that is stored after its owner is gone is an
-//! **orphan**: one watching connection — the first, or the next to watch
-//! — receives its [`Frame::TakePersisted`] with `orphan: true`, and
-//! transcribes it. An app that reconnects while the take still records
-//! sees its status ticks (`owner: nobody`) and adopts it.
+//! **orphan** (`orphan: true` on its [`Frame::TakePersisted`]). An app
+//! that reconnects while the take still records sees its status ticks
+//! (`owner: nobody`) and adopts it ([`Frame::TakeAdopt`]).
 //!
-//! A stored take an app has to transcribe stays the host's until that
-//! app says it handled it ([`Frame::TakeHandled`]): its owner's, or the
-//! orphan's one app. If that app goes away first, the take is handed to
-//! the next one as an orphan. Until then its id is kept in
-//! [`UNCLAIMED_FILE`], so neither the host's idle exit nor a crash of
-//! either side forgets it.
+//! The host transcribes every take it stores ([`crate::transcribe`]):
+//! watchers hear each take stored, its live text while it records
+//! ([`Frame::LiveText`]) and its transcription ([`Frame::Transcription`]).
+//! A frame the connection it is for has to act on (the owner's stored
+//! row, the result its window delivers) waits for room in its queue
+//! rather than being dropped.
 //!
 //! Agent asks (`ask_*` corrs) are the broker's business: their takes are
 //! not part of this feed, and agent connections may not follow it. Any
@@ -104,20 +103,7 @@ pub struct TakeHub {
     /// The host's transcriber, told about every take (#220).
     transcriber: OnceLock<TranscriberLink>,
     orphan_grace: Duration,
-    /// Where pending takes are kept across host restarts (the data
-    /// root's [`UNCLAIMED_FILE`]); `None` keeps them in memory only.
-    unclaimed_file: Option<std::path::PathBuf>,
-    /// The [`HubState::pending_gen`] last written to `unclaimed_file`, and
-    /// whether the last write failed; the lock serializes the writes,
-    /// which run outside the hub's lock.
-    saved_gen: Mutex<(u64, bool)>,
 }
-
-/// The pending-takes file in the data root: the stored ids of takes an
-/// app still has to transcribe, until one says it did — a host that
-/// exits idle (or is killed) before any app handled them must not forget
-/// them.
-pub const UNCLAIMED_FILE: &str = "unclaimed-takes.json";
 
 #[derive(Default)]
 struct HubState {
@@ -126,12 +112,6 @@ struct HubState {
     live: Option<Live>,
     ended: VecDeque<Ended>,
     watchers: Vec<Watcher>,
-    /// Stored takes an app has to hear about, until it did (and, for one
-    /// it has to transcribe, until it said it handled it).
-    pending: Vec<Pending>,
-    /// The durable part of `pending` changed since it was last written.
-    pending_dirty: bool,
-    pending_gen: u64,
     /// Startup recovery's findings until an app hears them.
     recovery: Option<HostRecovery>,
     /// A `capture.start` still opening its device, and who sent it: it
@@ -147,55 +127,6 @@ struct HubState {
     /// Frames the connection they are for has to get (a transcription
     /// result it acts on), waiting for room in its queue.
     owed: Vec<(Arc<ConnState>, Frame)>,
-}
-
-/// A stored take an app has to hear about.
-struct Pending {
-    /// A [`Frame::TakePersisted`].
-    frame: Frame,
-    /// The connection it is for: its owner, or the app an orphan was
-    /// handed to. `None` until an app watches.
-    offered: Option<Arc<ConnState>>,
-    /// The frame went out to `offered` (or waits behind its tap; an
-    /// owner that does not watch is sent nothing — it holds the take
-    /// until it goes away).
-    sent: bool,
-    /// Apps that handed it back (they cannot transcribe it): it goes to
-    /// another.
-    declined: Vec<Arc<ConnState>>,
-}
-
-impl Pending {
-    fn take(&self) -> &str {
-        match &self.frame {
-            Frame::TakePersisted { take, .. } => take,
-            _ => "",
-        }
-    }
-
-    /// The take the app has to transcribe: kept until it says it handled
-    /// it, and durably. Anything else is done once it went out.
-    fn stored_id(&self) -> Option<&str> {
-        handling_id(&self.frame)
-    }
-
-    fn pending(frame: Frame, offered: Option<Arc<ConnState>>, sent: bool) -> Pending {
-        Pending {
-            frame,
-            offered,
-            sent,
-            declined: Vec::new(),
-        }
-    }
-
-    /// Hands the take to whichever app comes next, as an orphan.
-    fn reoffer(&mut self) {
-        self.offered = None;
-        self.sent = false;
-        if let Frame::TakePersisted { orphan, .. } = &mut self.frame {
-            *orphan = true;
-        }
-    }
 }
 
 struct Live {
@@ -270,86 +201,13 @@ fn owner_for(owner: &Option<Arc<ConnState>>, conn: &Arc<ConnState>) -> TakeOwner
 }
 
 impl TakeHub {
-    pub fn new(orphan_grace: Duration, unclaimed_file: Option<std::path::PathBuf>) -> Arc<TakeHub> {
-        let mut state = HubState::default();
-        if let Some(path) = &unclaimed_file {
-            state.pending = load_unclaimed(path);
-        }
+    pub fn new(orphan_grace: Duration) -> Arc<TakeHub> {
         Arc::new(TakeHub {
-            state: Mutex::new(state),
+            state: Mutex::new(HubState::default()),
             client: OnceLock::new(),
             transcriber: OnceLock::new(),
             orphan_grace,
-            unclaimed_file,
-            saved_gen: Mutex::new((0, false)),
         })
-    }
-
-    /// Adds a stored take for an app and hands it out if it can.
-    fn add_pending(state: &mut HubState, pending: Pending) {
-        state.pending_dirty |= pending.stored_id().is_some();
-        state.pending.push(pending);
-        offer_pending(state);
-    }
-
-    /// Writes the pending takes' ids if they changed — outside the hub's
-    /// lock, so a slow disk never holds up the capture actor's callbacks.
-    fn save_pending(&self) {
-        let Some(path) = &self.unclaimed_file else {
-            return;
-        };
-        let (ids, generation) = {
-            let mut state = lock_registry(&self.state);
-            if !state.pending_dirty {
-                return;
-            }
-            state.pending_dirty = false;
-            state.pending_gen += 1;
-            let ids: Vec<String> = state
-                .pending
-                .iter()
-                .filter_map(|pending| pending.stored_id().map(str::to_string))
-                .collect();
-            (ids, state.pending_gen)
-        };
-        let mut saved = lock_registry(&self.saved_gen);
-        if saved.0 >= generation {
-            // A newer snapshot is on disk already.
-            return;
-        }
-        let result = if ids.is_empty() {
-            match std::fs::remove_file(path) {
-                Err(err) if err.kind() != std::io::ErrorKind::NotFound => Err(err),
-                _ => Ok(()),
-            }
-        } else {
-            let tmp = path.with_extension("json.tmp");
-            serde_json::to_vec(&ids)
-                .map_err(std::io::Error::other)
-                .and_then(|bytes| std::fs::write(&tmp, bytes))
-                .and_then(|()| std::fs::rename(&tmp, path))
-        };
-        match result {
-            Ok(()) => {
-                if saved.1 {
-                    eprintln!("starling-runtime-host: recorded pending takes again");
-                }
-                *saved = (generation, false);
-            }
-            Err(err) => {
-                // Tried again on the next tick (said once, not per tick).
-                if !saved.1 {
-                    eprintln!(
-                        "starling-runtime-host: could not record pending takes in {}: {err}; \
-                         retrying",
-                        path.display()
-                    );
-                }
-                saved.1 = true;
-                drop(saved);
-                lock_registry(&self.state).pending_dirty = true;
-            }
-        }
     }
 
     /// The runtime the hub stops orphaned takes through (set once the
@@ -361,11 +219,6 @@ impl TakeHub {
     /// The transcriber the hub tells about takes (set once it started).
     pub(crate) fn attach_transcriber(&self, link: TranscriberLink) {
         let _ = self.transcriber.set(link);
-    }
-
-    /// Whether the host transcribes its takes itself.
-    pub(crate) fn transcribes(&self) -> bool {
-        self.transcriber.get().is_some()
     }
 
     /// The live take's newest preview (or why live text stopped): to every
@@ -399,10 +252,11 @@ impl TakeHub {
     }
 
     /// Where the transcription of stored take `stored_id` stands: to every
-    /// watcher (and to `owner` when it does not watch). The one it is for
-    /// — `owner` while it lives, else the first watching app — gets it
-    /// whatever its queue says (it waits for room); a full queue only
-    /// costs anyone else a refresh.
+    /// watcher (and to a requesting `owner` that does not watch). The one
+    /// it is for — `owner` while it lives (a take's owner only while it
+    /// watches), else the first watching app — gets it whatever its queue
+    /// says (it waits for room); a full queue only costs anyone else a
+    /// refresh.
     pub(crate) fn transcription(
         &self,
         stored_id: &str,
@@ -413,8 +267,17 @@ impl TakeHub {
         owner: Option<&Arc<ConnState>>,
     ) {
         let mut state = lock_registry(&self.state);
+        // A recorded take's owner acts on it while it follows the feed (a
+        // command-only owner cannot show anything); a requester always.
         let recipient = owner
             .filter(|owner| !owner.closed.load(Ordering::SeqCst))
+            .filter(|owner| {
+                take.is_none()
+                    || state
+                        .watchers
+                        .iter()
+                        .any(|watcher| Arc::ptr_eq(&watcher.conn, owner))
+            })
             .cloned()
             .or_else(|| state.watchers.first().map(|watcher| Arc::clone(&watcher.conn)));
         let frame = |yours: bool| Frame::Transcription {
@@ -539,45 +402,8 @@ impl TakeHub {
                 taps: Vec::new(),
             });
         }
-        // The takes nobody has go to an app now.
-        offer_pending(&mut state);
         state.orphaned_since = None;
         Ok(())
-    }
-
-    /// An app handled the stored take `stored_id`: it is no longer the
-    /// host's to offer. (Whichever connection says so — an app that
-    /// reconnected answers for the take on its new one.)
-    pub(crate) fn handled(&self, stored_id: &str) {
-        {
-            let mut state = lock_registry(&self.state);
-            let before = state.pending.len();
-            state
-                .pending
-                .retain(|pending| pending.stored_id() != Some(stored_id));
-            if state.pending.len() == before {
-                return;
-            }
-            state.pending_dirty = true;
-        }
-        self.save_pending();
-    }
-
-    /// `conn` cannot transcribe the stored take `stored_id`: it goes to
-    /// another app (or waits for one).
-    pub(crate) fn handed_back(&self, conn: &Arc<ConnState>, stored_id: &str) {
-        let mut state = lock_registry(&self.state);
-        for pending in state.pending.iter_mut().filter(|pending| {
-            pending.stored_id() == Some(stored_id)
-                && pending
-                    .offered
-                    .as_ref()
-                    .is_some_and(|offered| Arc::ptr_eq(offered, conn))
-        }) {
-            pending.reoffer();
-            pending.declined.push(Arc::clone(conn));
-        }
-        offer_pending(&mut state);
     }
 
     /// Whether `conn` may stop or cancel take `corr` (`None`: whatever
@@ -710,13 +536,9 @@ impl TakeHub {
         let mut orphan_stop = None;
         {
             let mut state = lock_registry(&self.state);
-            // A watcher that went away takes nothing with it: what it held
-            // behind its taps is pending until an app handles it, and a
-            // pending take whose app is gone goes to the next one.
             state
                 .watchers
                 .retain(|watcher| !watcher.conn.closed.load(Ordering::SeqCst));
-            offer_pending(&mut state);
             state.owed.retain(|(conn, frame)| {
                 !conn.closed.load(Ordering::SeqCst) && conn.try_deliver(frame.clone()).is_err()
             });
@@ -770,62 +592,7 @@ impl TakeHub {
                 );
             }
         }
-        self.save_pending();
     }
-}
-
-/// The stored id of a [`Frame::TakePersisted`] an app has to transcribe
-/// (stored complete), if it is one.
-fn handling_id(frame: &Frame) -> Option<&str> {
-    match frame {
-        Frame::TakePersisted {
-            stored_id: Some(id),
-            interrupted: false,
-            error: None,
-            ..
-        } => Some(id),
-        _ => None,
-    }
-}
-
-/// Hands every pending take to its app: one whose app went away (or that
-/// has none yet) to the first watcher, as an orphan; one not sent yet
-/// (its app's queue was full) again. A take only to be heard about is
-/// done once it went out.
-fn offer_pending(state: &mut HubState) {
-    let HubState {
-        pending, watchers, ..
-    } = state;
-    pending.retain_mut(|pending| {
-        if pending
-            .offered
-            .as_ref()
-            .is_some_and(|conn| conn.closed.load(Ordering::SeqCst))
-        {
-            pending.reoffer();
-        }
-        pending
-            .declined
-            .retain(|conn| !conn.closed.load(Ordering::SeqCst));
-        if pending.offered.is_none() {
-            pending.offered = watchers
-                .iter()
-                .map(|watcher| &watcher.conn)
-                .find(|conn| !pending.declined.iter().any(|declined| Arc::ptr_eq(declined, conn)))
-                .cloned();
-        }
-        if let (Some(conn), false) = (pending.offered.as_ref(), pending.sent) {
-            let take = pending.take().to_string();
-            pending.sent = match watchers
-                .iter_mut()
-                .find(|watcher| Arc::ptr_eq(&watcher.conn, conn))
-            {
-                Some(watcher) => watcher.deliver_after_tap(&take, pending.frame.clone()),
-                None => conn.try_deliver(pending.frame.clone()).is_ok(),
-            };
-        }
-        !(pending.sent && pending.stored_id().is_none())
-    });
 }
 
 /// One watcher's share of a tick.
@@ -1157,86 +924,20 @@ impl CaptureObserver for TakeHub {
                 error,
                 orphan,
             };
-            if self.transcribes() {
-                // The host transcribes it: every window hears it is in
-                // history, and its owner (which binds its delivery to the
-                // stored row) whatever its queue says.
-                let HubState {
-                    watchers, owed, ..
-                } = &mut *state;
-                for watcher in watchers.iter_mut() {
-                    let theirs = owner
-                        .as_ref()
-                        .is_some_and(|owner| Arc::ptr_eq(&watcher.conn, owner));
-                    if !watcher.deliver_after_tap(corr, frame.clone()) && theirs {
-                        owed.push((Arc::clone(&watcher.conn), frame.clone()));
-                    }
-                }
-                return;
-            }
-            // The connection the take is for: its owner while it lives,
-            // else (an orphan) exactly one app — the first watching one,
-            // or the next to watch. An owner that only sends commands
-            // (no app) is sent nothing; once it goes away an app gets
-            // the take as an orphan, unless it said it handled it.
-            let owner_watches = owner.as_ref().is_some_and(|owner| {
-                state
-                    .watchers
-                    .iter()
-                    .any(|watcher| Arc::ptr_eq(&watcher.conn, owner))
-            });
-            if !orphan {
-                // Every other window hears the take is in history (a
-                // full queue only costs that window a history refresh).
-                for watcher in state.watchers.iter_mut() {
-                    let theirs = owner
-                        .as_ref()
-                        .is_some_and(|owner| Arc::ptr_eq(&watcher.conn, owner));
-                    if !theirs {
-                        let _ = watcher.deliver_after_tap(corr, frame.clone());
-                    }
+            // Every window hears it is in history, and its owner (which
+            // binds its delivery to the stored row) whatever its queue
+            // says; the host transcribes it.
+            let HubState {
+                watchers, owed, ..
+            } = &mut *state;
+            for watcher in watchers.iter_mut() {
+                let theirs = owner
+                    .as_ref()
+                    .is_some_and(|owner| Arc::ptr_eq(&watcher.conn, owner));
+                if !watcher.deliver_after_tap(corr, frame.clone()) && theirs {
+                    owed.push((Arc::clone(&watcher.conn), frame.clone()));
                 }
             }
-            let held_by_owner = !orphan && !owner_watches;
-            if orphan || owner_watches || handling_id(&frame).is_some() {
-                Self::add_pending(
-                    &mut state,
-                    Pending::pending(frame, owner.filter(|_| !orphan), held_by_owner),
-                );
-            }
-        }
-        self.save_pending();
-    }
-}
-
-/// The pending takes a previous host left (see [`UNCLAIMED_FILE`]).
-fn load_unclaimed(path: &std::path::Path) -> Vec<Pending> {
-    let Ok(bytes) = std::fs::read(path) else {
-        return Vec::new();
-    };
-    match serde_json::from_slice::<Vec<String>>(&bytes) {
-        Ok(ids) => ids
-            .into_iter()
-            .map(|id| {
-                Pending::pending(
-                    Frame::TakePersisted {
-                        take: id.clone(),
-                        stored_id: Some(id),
-                        interrupted: false,
-                        error: None,
-                        orphan: true,
-                    },
-                    None,
-                    false,
-                )
-            })
-            .collect(),
-        Err(err) => {
-            eprintln!(
-                "starling-runtime-host: ignoring unreadable {}: {err}",
-                path.display()
-            );
-            Vec::new()
         }
     }
 }

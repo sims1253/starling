@@ -1,7 +1,8 @@
 //! A scripted transcription server for the host's suites: OpenAI-style
 //! batch uploads (`POST /v1/audio/transcriptions`) and the native
 //! `/stream` WebSocket, each answered from a script. Anything else (a
-//! health probe) answers `{"status":"ok"}`.
+//! health probe) answers `{"status":"ok"}`. Suites use what they need.
+#![allow(dead_code)]
 
 use std::collections::VecDeque;
 use std::io::{Read, Write};
@@ -13,7 +14,6 @@ use tokio_tungstenite::tungstenite::{self, Message};
 
 /// One batch request's answer.
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub enum Reply {
     Text(String),
     Status(&'static str),

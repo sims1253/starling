@@ -62,9 +62,6 @@ pub struct HostConfig {
     /// How long a recording take may go without any app following it
     /// before the host stops and stores it itself (see [`crate::takes`]).
     pub orphan_grace: Duration,
-    /// Whether the host transcribes the takes it stores, and stored takes
-    /// apps ask it to (see [`crate::transcribe`]).
-    pub transcribe: bool,
     /// How long a transcription waits for an engine to serve.
     pub engine_wait: Duration,
     /// The agent allowlist file (see [`crate::agent::Allowlist`]).
@@ -104,7 +101,6 @@ impl HostConfig {
             settings_poll: crate::engine::DEFAULT_SETTINGS_POLL,
             engine: EngineChoice::None,
             orphan_grace: crate::takes::DEFAULT_ORPHAN_GRACE,
-            transcribe: false,
             engine_wait: crate::transcribe::DEFAULT_ENGINE_WAIT,
             agent_allowlist: None,
             #[cfg(feature = "test-support")]
@@ -165,12 +161,6 @@ impl HostConfig {
                 ..Default::default()
             });
         Ok(config)
-    }
-
-    /// The host transcribes its takes itself.
-    pub fn with_transcription(mut self) -> Self {
-        self.transcribe = true;
-        self
     }
 
     /// Overrides how long a transcription waits for an engine.

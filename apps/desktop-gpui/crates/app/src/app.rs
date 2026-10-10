@@ -376,10 +376,6 @@ pub struct StarlingApp {
     /// Keeps the quit hook (engine shutdown) registered for the entity's
     /// lifetime — a dropped `Subscription` unsubscribes.
     quit_hook: Option<Subscription>,
-    /// The current recording's endpoint/model binding (#363): resolved
-    /// when recording starts, taken when it stops, and carried with the
-    /// take so a model switch mid-take cannot move it.
-    pub(crate) active_take: Option<crate::upload::TakeTarget>,
 
     pub endpoint: String,
     pub model: String,
@@ -556,12 +552,8 @@ pub struct StarlingApp {
     /// The connection to the recording service and the takes this window
     /// stopped or cancelled until they are stored (#220).
     pub(crate) host: crate::remote_take::HostState,
-    /// The take's live stream worker (#357) and its generation, which
-    /// previews still arriving from an earlier take's worker do not match.
-    pub(crate) stream_pump: Option<starling_runtime_host::live::pump::StreamPump<starling_runtime_host::live::stream::LiveStream>>,
-    pub(crate) stream_generation: u64,
-    pub(crate) stream_trace: Option<std::sync::Arc<starling_runtime_host::live::trace::StreamTrace>>,
-    /// The preview cadence takes ask `/stream` for (#357).
+    /// The preview cadence takes ask `/stream` for (#357; the recording
+    /// service reads it from the settings at each take's start).
     pub(crate) live_preview: LivePreviewSettings,
     pub(crate) draft_live_preview: LivePreviewSettings,
     /// The live line a direct-mode take shows while recording.
@@ -1080,7 +1072,6 @@ impl StarlingApp {
             microphone_settings: settings.microphone.clone(),
             mic: crate::mic::MicState::default(),
             quit_hook: None,
-            active_take: None,
             endpoint,
             model,
             expected_terms_input: terms_input,
@@ -1166,9 +1157,6 @@ impl StarlingApp {
             playback_generation: 0,
             recorder: None,
             host: Default::default(),
-            stream_pump: None,
-            stream_generation: 0,
-            stream_trace: None,
             live_preview: settings.live_preview,
             draft_live_preview: settings.live_preview,
             live_partial: String::new(),

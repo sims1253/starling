@@ -25,7 +25,6 @@ use fake_engine::{FakeEngine, Reply, StreamMode};
 
 fn config(root: &Path, scripts: Vec<FakeTakeScript>, engine: &FakeEngine) -> HostConfig {
     let mut config = HostConfig::new(root, root.join("endpoints"))
-        .with_transcription()
         .with_engine(EngineChoice::Manual {
             endpoint: engine.endpoint(),
             model: "fake-model".to_string(),

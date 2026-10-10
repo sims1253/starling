@@ -73,14 +73,18 @@
 //! The GPUI app (`crates/app`) is a client: it starts this host from its
 //! own executable when none serves (`starling-gpui --runtime-host`),
 //! records every take through the capture machine and the take feed,
-//! and never opens a recorder, a journal or the store lease itself. It
-//! still transcribes its takes (uploads, the live stream, retries) and
-//! writes their attempt rows through its own store handle — a store
-//! client, the multi-process shape storage v2 is built for — and runs
-//! its own engine manager; the host it starts runs with `--engine
-//! none`. Moving transcription, store writes and the engine into the
-//! host are the next increments. The Electron comparison app the design
-//! names as a second client has been removed from the tree.
+//! and never opens a recorder, a journal or the store lease itself. The
+//! host transcribes the takes it stores ([`transcribe`]): live text while
+//! a take records, the transcript once it is stored, retries the app asks
+//! for; the app renders them and delivers its own take's text, which
+//! needs its window. The app still reads history, writes imports and
+//! processing results through its own store handle — a store client, the
+//! multi-process shape storage v2 is built for — and runs the engine
+//! manager its settings drive; this host attaches to the same engine
+//! (see [`engine`]). Moving the remaining store work and the engine
+//! manager into the host are the next increments. The Electron comparison
+//! app the design names as a second client has been removed from the
+//! tree.
 
 pub mod agent;
 pub mod auth;

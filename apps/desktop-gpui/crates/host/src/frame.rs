@@ -89,7 +89,7 @@ impl TransportErrorCode {
 /// - client → host: [`Frame::Command`], [`Frame::GetSnapshot`],
 ///   [`Frame::AgentHello`], [`Frame::AskUser`], [`Frame::AskCancel`],
 ///   [`Frame::PromptAck`], [`Frame::PromptDone`], [`Frame::TakeWatch`],
-///   [`Frame::TakeTap`], [`Frame::TakeHandled`], [`Frame::TakeAdopt`],
+///   [`Frame::TakeTap`], [`Frame::TakeAdopt`],
 ///   [`Frame::Transcribe`]
 /// - host → client: [`Frame::Hello`], [`Frame::Receipt`], [`Frame::Event`],
 ///   [`Frame::Snapshot`], [`Frame::TransportError`], [`Frame::Bye`],
@@ -209,17 +209,6 @@ pub enum Frame {
     /// Stream `take`'s audio to this connection from sample `from` on,
     /// through the take's end (a reconnecting app replays from 0).
     TakeTap { take: String, from: u64 },
-    /// The app handled the stored take `stored_id` it was handed (a
-    /// [`Frame::TakePersisted`] it had to transcribe): the host stops
-    /// offering it. Until then the take stays the host's to hand out — to
-    /// the next app if this one goes away first. `handed_back`: the app
-    /// could not transcribe it (no store, unreadable audio); the host
-    /// hands it to another app instead.
-    TakeHandled {
-        stored_id: String,
-        #[serde(default)]
-        handed_back: bool,
-    },
     /// One tick of a take the host records: its health while it records,
     /// audio for a tapping connection, who owns the take as this
     /// connection sees it, and `ended` — the take's final sample
@@ -249,8 +238,8 @@ pub enum Frame {
     },
     /// A take's persist finished. `stored_id` is the history row;
     /// `orphan` marks a take that ended with no app following it (the
-    /// host stopped it, or its app was gone): the one app it is sent to
-    /// transcribes it.
+    /// host stopped it, or its app was gone). The host transcribes a
+    /// complete take itself ([`Frame::Transcription`] follows).
     TakePersisted {
         take: String,
         stored_id: Option<String>,
@@ -651,10 +640,6 @@ mod tests {
             Frame::TakeTap {
                 take: "take-1".into(),
                 from: 0,
-            },
-            Frame::TakeHandled {
-                stored_id: "j_1".into(),
-                handed_back: false,
             },
             Frame::LiveTake {
                 take: "take-1".into(),

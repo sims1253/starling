@@ -17,7 +17,6 @@ mod shortcut;
 mod slider;
 mod staging;
 mod store;
-mod stream_pump;
 mod system_check;
 mod theme;
 mod upkeep;

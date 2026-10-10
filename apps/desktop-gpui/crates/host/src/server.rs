@@ -587,10 +587,7 @@ pub fn serve(config: HostConfig) -> Result<HostHandle, HostError> {
         &startup_reconciliation,
         reconcile_error,
     );
-    let takes = crate::takes::TakeHub::new(
-        config.orphan_grace,
-        Some(config.data_root.join(crate::takes::UNCLAIMED_FILE)),
-    );
+    let takes = crate::takes::TakeHub::new(config.orphan_grace);
     takes.set_recovery(startup_recovery.recovery);
 
     // 2. The endpoint.
@@ -651,7 +648,7 @@ pub fn serve(config: HostConfig) -> Result<HostHandle, HostError> {
     let engine = crate::engine::attach(config.engine, &mut runtime_config);
     // The host transcribes its takes (#220): every take an app records is
     // stored with the intent to transcribe it, in its own commit.
-    let transcriber = if config.transcribe {
+    let transcriber = {
         runtime_config
             .capture_store
             .transcribe_takes(Arc::new(|take: &starling_runtime::machine::capture::TakeRecord| {
@@ -678,8 +675,6 @@ pub fn serve(config: HostConfig) -> Result<HostHandle, HostError> {
                 None
             }
         }
-    } else {
-        None
     };
     let (runtime, client) = starling_runtime::Runtime::start(runtime_config);
     takes.attach(client.clone());
@@ -1187,7 +1182,6 @@ fn connection_reader(
                     // microphone only through asks.
                     Frame::TakeWatch { .. }
                     | Frame::TakeTap { .. }
-                    | Frame::TakeHandled { .. }
                     | Frame::TakeAdopt { .. }
                     | Frame::Transcribe { .. }
                         if state.is_agent() =>
@@ -1245,16 +1239,6 @@ fn connection_reader(
                             });
                         }
                     },
-                    Frame::TakeHandled {
-                        stored_id,
-                        handed_back,
-                    } => {
-                        if handed_back {
-                            shared.takes.handed_back(&state, &stored_id);
-                        } else {
-                            shared.takes.handled(&stored_id);
-                        }
-                    }
                     Frame::GetSnapshot { req } => {
                         let snapshot = shared.client.snapshot();
                         let value = serde_json::to_value(&snapshot)

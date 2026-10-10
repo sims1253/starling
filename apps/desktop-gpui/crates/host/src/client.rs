@@ -506,24 +506,6 @@ impl HostClient {
         })
     }
 
-    /// Tells the host this app handled the stored take `stored_id` it
-    /// was handed (see [`Frame::TakeHandled`]).
-    pub fn take_handled(&self, stored_id: &str) -> Result<(), ClientError> {
-        self.send_unanswered(Frame::TakeHandled {
-            stored_id: stored_id.to_string(),
-            handed_back: false,
-        })
-    }
-
-    /// Hands the stored take `stored_id` back: this app cannot
-    /// transcribe it, another should.
-    pub fn take_handed_back(&self, stored_id: &str) -> Result<(), ClientError> {
-        self.send_unanswered(Frame::TakeHandled {
-            stored_id: stored_id.to_string(),
-            handed_back: true,
-        })
-    }
-
     /// Takes on running take `take` if its owner is gone, without its
     /// audio (see [`Frame::TakeAdopt`]).
     pub fn take_adopt(&self, take: &str) -> Result<(), ClientError> {
@@ -842,7 +824,6 @@ fn client_reader(
                 | Frame::AgentHello { .. }
                 | Frame::TakeWatch { .. }
                 | Frame::TakeTap { .. }
-                | Frame::TakeHandled { .. }
                 | Frame::TakeAdopt { .. }
                 | Frame::Transcribe { .. },
             ) => {
