@@ -1343,9 +1343,9 @@ class StreamSession:
 
     def _tx(self, window: np.ndarray) -> Optional[str]:
         """Transcribe one window to text; ``None`` if the server is busy/cancelled."""
-        # Every chunker window starts at its boundary (full windows, the
-        # preview tail and the flush tail alike).
-        abs_start = self.trimmed_samples + self.chunker.boundary
+        # The chunker records where each call's audio starts (a re-decode
+        # starts before the boundary, issue #357).
+        abs_start = self.trimmed_samples + self.chunker.call_start
         t0 = self.trace.now_ms()
         # A running preview is cancelled when required work queues behind it
         # (issue #357; mirrors the native CallAbortScope). The backends poll
@@ -1411,24 +1411,25 @@ class StreamSession:
     def _maybe_trim_samples(self) -> None:
         """Drop the chunker's committed prefix from the rolling buffer.
 
-        ``ChunkStreamer.boundary`` is the sample index up to which audio is fully
-        finalized (advanced only at whole-window boundaries). Everything below it
-        is dead weight we keep re-copying on every append and re-passing to the
-        chunker. Trimming it keeps the buffer (and per-append ``concatenate`` cost)
-        bounded over a long dictation.
+        ``ChunkStreamer.retain_from`` is the first sample the chunker may still
+        read: the finalized boundary (advanced only at whole-window boundaries)
+        minus the audio a re-decode may reach before it (issue #357).
+        Everything below it is dead weight we keep re-copying on every append
+        and re-passing to the chunker. Trimming it keeps the buffer (and
+        per-append ``concatenate`` cost) bounded over a long dictation.
 
-        Index-shift invariant: after we drop the first ``boundary`` samples, the
-        chunker's absolute ``boundary`` index points into dropped territory, so we
-        reset ``chunker.boundary = 0``. The chunker then sees the trimmed array as
-        fresh from index 0, and its committed-text state stays consistent because
-        audio before ``boundary`` was already stitched into ``committed`` -- it is
-        never read again. We only trim once the prefix is substantial (>= 1s and
-        a meaningful fraction of the buffer) to avoid trimming on every tiny chunk.
+        Index-shift invariant: after we drop the first ``b`` samples,
+        ``chunker.rebase(b)`` moves its boundary back by ``b``, so it indexes
+        the trimmed array; audio before the trimmed point was already stitched
+        into ``committed`` and is never read again. We only trim once the
+        prefix is substantial (>= 1s and a meaningful fraction of the buffer)
+        to avoid trimming on every tiny chunk.
         """
         chunker = self.chunker
         if chunker is None:
             return
-        b = chunker.boundary
+        # Keep the audio a re-decode may still read before the boundary.
+        b = chunker.retain_from
         if b <= 0 or b >= len(self.samples):
             return
         if b < STREAM_TRIM_MIN_SAMPLES and b < len(self.samples) // 2:

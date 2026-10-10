@@ -14,9 +14,11 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <iterator>
 #include <limits>
 #include <stdexcept>
 #include <thread>
+#include <utility>
 
 namespace starling::serve {
 
@@ -98,81 +100,167 @@ std::string join_words(const std::vector<std::string>& words) {
     return out;
 }
 
-// Find the longest common substring (in terms of word index runs) between
-// a[0..na) and b[0..nb). This is the C++ equivalent of
-// difflib.SequenceMatcher.find_longest_match(). Returns {a_start, b_start, size}.
-struct Match { int a_start; int b_start; int size; };
-
-static Match find_longest_match(
-    const std::vector<std::string>& a, int a_lo, int a_hi,
-    const std::vector<std::string>& b, int b_lo, int b_hi) {
-    // O((a_hi-a_lo)*(b_hi-b_lo)) — fine for max_overlap=24.
-    int best_i = a_lo, best_j = b_lo, best_k = 0;
-    // b2j: map from word to list of positions in b (within [b_lo, b_hi)).
-    // Simple approach: for each starting position in a, extend in b.
-    int na = a_hi - a_lo;
-    int nb = b_hi - b_lo;
-    // dp approach: longest common extension from each (i,j) pair.
-    // dp[i][j] = length of the longest common run ending at a[a_lo+i], b[b_lo+j].
-    std::vector<std::vector<int>> dp(na + 1, std::vector<int>(nb + 1, 0));
-    for (int i = 1; i <= na; ++i) {
-        for (int j = 1; j <= nb; ++j) {
-            // Empty keys never participate in a match (issue #118 defense in
-            // depth): words that normalize to "" (pure punctuation like "--")
-            // would otherwise align as runs and drop unrelated boundary words.
-            if (!a[a_lo + i - 1].empty() && a[a_lo + i - 1] == b[b_lo + j - 1]) {
-                dp[i][j] = dp[i-1][j-1] + 1;
-                if (dp[i][j] > best_k) {
-                    best_k = dp[i][j];
-                    best_i = a_lo + i - best_k;
-                    best_j = b_lo + j - best_k;
-                }
-            }
-        }
-    }
-    return {best_i, best_j, best_k};
-}
+// Overlap alignment scores (issue #357; _STITCH_* in stream_chunk.py). The
+// empty alignment scores 0; two matched words at the very edges score 4,
+// three matches around four unmatched committed words score 2 (rejected).
+constexpr int kStitchMatch = 2;
+constexpr int kStitchMismatch = -1;
+constexpr int kStitchGap = -1;
+constexpr int kStitchMinScore = 3;
 
 std::vector<std::string> stitch_words(
     const std::vector<std::string>& committed,
     const std::vector<std::string>& new_words,
-    int max_overlap,
-    int min_match) {
+    int max_overlap) {
     if (committed.empty()) return new_words;
     if (new_words.empty()) return committed;
 
     // tail = last max_overlap words of committed; head = first max_overlap of new.
-    int tail_start = static_cast<int>(committed.size()) - max_overlap;
-    if (tail_start < 0) tail_start = 0;
-    int head_end = std::min(max_overlap, static_cast<int>(new_words.size()));
-
-    // Normalize for matching.
-    std::vector<std::string> a_norm, b_norm;
+    const int tail_start =
+        std::max(0, static_cast<int>(committed.size()) - max_overlap);
+    const int head_end = std::min(max_overlap, static_cast<int>(new_words.size()));
+    // Normalized keys. An empty key (pure punctuation like "--") never
+    // matches (issue #118 defense in depth): runs of them would align
+    // unrelated boundary words.
+    std::vector<std::string> a, b;
     for (int i = tail_start; i < static_cast<int>(committed.size()); ++i)
-        a_norm.push_back(norm_word(committed[i]));
-    for (int i = 0; i < head_end; ++i)
-        b_norm.push_back(norm_word(new_words[i]));
+        a.push_back(norm_word(committed[i]));
+    for (int i = 0; i < head_end; ++i) b.push_back(norm_word(new_words[i]));
+    const int n = static_cast<int>(a.size());
+    const int m = static_cast<int>(b.size());
+    auto same = [&](int i, int j) { return !a[i].empty() && a[i] == b[j]; };
 
-    Match m = find_longest_match(
-        a_norm, 0, static_cast<int>(a_norm.size()),
-        b_norm, 0, static_cast<int>(b_norm.size()));
-
-    if (m.size >= min_match) {
-        // keep = committed up to the end of the matched run in committed.
-        // The matched run in committed starts at tail_start + m.a_start,
-        // length m.size.
-        int keep = tail_start + m.a_start + m.size;
-        int start = m.b_start + m.size;  // new words after the matched run.
-        std::vector<std::string> result(committed.begin(),
-                                        committed.begin() + keep);
-        result.insert(result.end(),
-                      new_words.begin() + start, new_words.end());
+    // d[i][j]: best score of aligning a[i0, i) (any i0 <= i) with b[0, j).
+    std::vector<std::vector<int>> d(n + 1, std::vector<int>(m + 1, 0));
+    for (int j = 1; j <= m; ++j) d[0][j] = d[0][j - 1] + kStitchGap;
+    for (int i = 1; i <= n; ++i) {
+        for (int j = 1; j <= m; ++j) {
+            const int diag = d[i - 1][j - 1]
+                + (same(i - 1, j - 1) ? kStitchMatch : kStitchMismatch);
+            d[i][j] = std::max({diag, d[i - 1][j] + kStitchGap,
+                                d[i][j - 1] + kStitchGap});
+        }
+    }
+    // The suffix runs to the end of the tail; the prefix may end anywhere
+    // (the smallest end column wins a tie).
+    int best_j = 0, best = 0;
+    for (int j = 1; j <= m; ++j) {
+        if (d[n][j] > best) {
+            best = d[n][j];
+            best_j = j;
+        }
+    }
+    if (best < kStitchMinScore) {
+        std::vector<std::string> result = committed;
+        result.insert(result.end(), new_words.begin(), new_words.end());
         return result;
     }
-    // No match: concatenate.
-    std::vector<std::string> result = committed;
-    result.insert(result.end(), new_words.begin(), new_words.end());
+    std::vector<std::pair<int, int>> pairs;  // matched (tail, head) words
+    for (int i = n, j = best_j; i > 0 && j > 0;) {
+        const bool eq = same(i - 1, j - 1);
+        if (d[i][j] == d[i - 1][j - 1] + (eq ? kStitchMatch : kStitchMismatch)) {
+            if (eq) pairs.emplace_back(i - 1, j - 1);
+            --i;
+            --j;
+        } else if (d[i][j] == d[i - 1][j] + kStitchGap) {
+            --i;
+        } else {
+            --j;
+        }
+    }
+    std::reverse(pairs.begin(), pairs.end());
+    const auto [ci, cj] = pairs[(pairs.size() - 1) / 2];
+    std::vector<std::string> result(committed.begin(),
+                                    committed.begin() + tail_start + ci + 1);
+    result.insert(result.end(), new_words.begin() + cj + 1, new_words.end());
     return result;
+}
+
+// ---- window plausibility (issue #357) --------------------------------------
+
+namespace {
+constexpr int kVadFramesPerSecond = 50;
+constexpr double kVadFloorPercentile = 0.1;
+constexpr double kVadFloorMaxDb = -45.0;
+constexpr double kVadMarginDb = 15.0;
+constexpr double kVadMinDb = -60.0;
+}  // namespace
+
+int max_plausible_words(double seconds) {
+    return static_cast<int>(seconds * kMaxWordsPerSecond) + kMaxWordsSlack;
+}
+
+double voiced_seconds(const float* samples, int64_t n, int sample_rate) {
+    const int frame = sample_rate / kVadFramesPerSecond;
+    const int64_t count = frame > 0 ? n / frame : 0;
+    if (count == 0) return 0.0;
+    std::vector<double> db(static_cast<size_t>(count));
+    for (int64_t f = 0; f < count; ++f) {
+        double sum = 0.0;
+        for (int k = 0; k < frame; ++k) {
+            const double x = samples[f * frame + k];
+            sum += x * x;
+        }
+        db[f] = 10.0 * std::log10(sum / frame + 1e-10);
+    }
+    std::vector<double> sorted = db;
+    std::sort(sorted.begin(), sorted.end());
+    const double floor = std::min(
+        sorted[static_cast<size_t>(kVadFloorPercentile * (count - 1))], kVadFloorMaxDb);
+    const double threshold = std::max(floor + kVadMarginDb, kVadMinDb);
+    int64_t voiced = 0;
+    for (double v : db) voiced += v > threshold;
+    return static_cast<double>(voiced) * frame / sample_rate;
+}
+
+std::vector<std::string> collapse_repeats(const std::vector<std::string>& words,
+                                          int max_repeats, int max_n) {
+    std::vector<std::string> keys;
+    keys.reserve(words.size());
+    for (const auto& w : words) keys.push_back(norm_word(w));
+    const size_t len = words.size();
+    // How many times keys[i, i+n) repeats back to back from i.
+    auto run = [&](size_t i, size_t n) {
+        size_t reps = 1;
+        while (i + (reps + 1) * n <= len
+               && std::equal(keys.begin() + i, keys.begin() + i + n,
+                             keys.begin() + i + reps * n)) {
+            ++reps;
+        }
+        return reps;
+    };
+    std::vector<std::string> out;
+    size_t i = 0;
+    while (i < len) {
+        size_t best_n = 0, best_reps = 0;
+        for (size_t n = 1; n <= static_cast<size_t>(max_n); ++n) {
+            if (i + n * (max_repeats + 1) > len) break;
+            const size_t reps = run(i, n);
+            if (reps > static_cast<size_t>(max_repeats)
+                && reps * n > best_reps * best_n) {
+                best_n = n;
+                best_reps = reps;
+            }
+        }
+        if (best_n) {
+            out.insert(out.end(), words.begin() + i,
+                       words.begin() + i + max_repeats * best_n);
+            i += best_reps * best_n;
+        } else {
+            out.push_back(words[i]);
+            ++i;
+        }
+    }
+    return out;
+}
+
+std::vector<std::string> suppress_loops(const std::vector<std::string>& words,
+                                        double seconds) {
+    const size_t bound = static_cast<size_t>(std::max(0, max_plausible_words(seconds)));
+    if (words.size() <= bound) return words;
+    std::vector<std::string> out = collapse_repeats(words);
+    if (out.size() > bound) out.resize(bound);
+    return out;
 }
 
 // ---- ChunkStreamer --------------------------------------------------------
@@ -303,7 +391,8 @@ ChunkStreamer::ChunkStreamer(int sample_rate, double chunk_seconds,
       advance_(1),
       min_(0),
       partial_interval_(0.0),
-      max_overlap_words_(0) {
+      max_overlap_words_(0),
+      lookback_(0) {
     // Validate the whole configuration before deriving anything, then build
     // the members in dependency order (issue #146). The old member-init list
     // computed advance_ from the unclamped overlap_: a negative overlap was
@@ -332,6 +421,9 @@ ChunkStreamer::ChunkStreamer(int sample_rate, double chunk_seconds,
     min_ = static_cast<int>(min_seconds * sample_rate);
     partial_interval_ = partial_interval;
     max_overlap_words_ = std::max(8, static_cast<int>(overlap_seconds * 6) + 6);
+    lookback_ = static_cast<int>(
+        *std::max_element(std::begin(kRedecodeShifts), std::end(kRedecodeShifts))
+        * overlap_);
 }
 
 std::vector<std::string> ChunkStreamer::stitched(
@@ -352,16 +444,101 @@ void ChunkStreamer::commit(const std::vector<std::string>& new_words) {
     frozen_ = std::max(frozen_, reachable);
 }
 
+double ChunkStreamer::min_rate() const {
+    if (rates_.empty()) return kMinWordsPerVoicedSecond;
+    std::vector<double> sorted = rates_;
+    std::sort(sorted.begin(), sorted.end());
+    return std::max(kMinWordsPerVoicedSecond,
+                    kRelativeMinRate * sorted[(sorted.size() - 1) / 2]);
+}
+
+int ChunkStreamer::verdict(size_t words, double seconds, double voiced) const {
+    if (words > static_cast<size_t>(std::max(0, max_plausible_words(seconds)))) return 2;
+    if (voiced >= kMinVoicedSeconds && static_cast<double>(words) < min_rate() * voiced)
+        return 1;
+    return 0;
+}
+
+std::optional<std::vector<std::string>> ChunkStreamer::decode_committed(
+    const std::vector<float>& samples, int64_t start, int64_t end,
+    const char* kind, const TranscribeFn& tx) {
+    // An implausible result (too sparse for its voiced audio, or a loop) is
+    // decoded again from the earlier starts in kRedecodeShifts until one is
+    // plausible: a full window moves back whole (the next window's overlap
+    // still covers its end), or ends earlier where the buffer holds no audio
+    // before it (the take's first window); the flush tail grows backwards up
+    // to one window (nothing else covers its end). A candidate replaces the
+    // current one when it is plausible and the current one loops, or when it
+    // is denser by kRedecodeMinGain. A busy re-decode keeps the best so far.
+    call_kind_ = kind;
+    auto text = tx(samples.data() + start, end - start);
+    if (!text.has_value()) return std::nullopt;
+    const std::vector<std::string> words = split_words(*text);
+    const double voiced = voiced_seconds(samples.data() + start, end - start, sr_);
+    const int first = verdict(words.size(), static_cast<double>(end - start) / sr_, voiced);
+    std::vector<std::string> best = words;
+    int best_verdict = first;
+    int64_t best_a = start, best_z = end;
+    double best_voiced = voiced;
+    bool replaced = false;
+    std::vector<std::pair<int64_t, int64_t>> tried{{start, end}};
+    const bool full = end - start == chunk_;
+    for (double shift : kRedecodeShifts) {
+        if (first == 0 || best_verdict == 0) break;
+        const int64_t back = static_cast<int64_t>(shift * overlap_);
+        int64_t a, z;
+        if (full) {
+            a = start >= back ? start - back : start;
+            z = end - back;
+        } else {
+            a = std::max<int64_t>({start - back, end - chunk_, 0});
+            z = end;
+        }
+        if (a >= z || (!full && a >= start)
+            || std::find(tried.begin(), tried.end(), std::make_pair(a, z)) != tried.end())
+            continue;
+        tried.emplace_back(a, z);
+        call_kind_ = "redecode";
+        auto alt = tx(samples.data() + a, z - a);
+        if (!alt.has_value()) break;
+        std::vector<std::string> cand = split_words(*alt);
+        const double v_voiced = voiced_seconds(samples.data() + a, z - a, sr_);
+        const int v = verdict(cand.size(), static_cast<double>(z - a) / sr_, v_voiced);
+        bool better = false;
+        if (v != 2 && best_verdict == 2) {
+            better = true;
+        } else if (v != 2) {
+            better = static_cast<double>(cand.size()) * std::max(best_voiced, 1e-9)
+                     >= kRedecodeMinGain * static_cast<double>(best.size())
+                            * std::max(v_voiced, 1e-9);
+        }
+        if (better) {
+            best = std::move(cand);
+            best_verdict = v;
+            best_a = a;
+            best_z = z;
+            best_voiced = v_voiced;
+            replaced = true;
+        }
+    }
+    if (replaced) ++redecodes_;
+    if (best_verdict == 2) {
+        best = suppress_loops(best, static_cast<double>(best_z - best_a) / sr_);
+    } else if (best_voiced >= kMinVoicedSeconds) {
+        rates_.push_back(static_cast<double>(best.size()) / best_voiced);
+        if (rates_.size() > kRateHistory) rates_.erase(rates_.begin());
+    }
+    return best;
+}
+
 bool ChunkStreamer::finalize_full_windows(
     const std::vector<float>& samples, const TranscribeFn& tx, bool flushing) {
     bool did = false;
     while (static_cast<int64_t>(samples.size()) - boundary_ >= chunk_) {
-        int64_t start = boundary_;
-        int64_t len = chunk_;
-        call_kind_ = flushing ? "flush_window" : "window";
-        auto text = tx(samples.data() + start, len);
-        if (!text.has_value()) break;  // busy → stop, boundary unchanged
-        commit(split_words(*text));
+        auto words = decode_committed(samples, boundary_, boundary_ + chunk_,
+                                      flushing ? "flush_window" : "window", tx);
+        if (!words.has_value()) break;  // busy → stop, boundary unchanged
+        commit(*words);
         boundary_ += advance_;
         did = true;
     }
@@ -427,7 +604,10 @@ std::optional<std::string> ChunkStreamer::step(
     last_preview_cost_ = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - t0).count();
     emit_due_ = false;
-    return join_words(stitched(split_words(*text)));
+    // A preview is shown as decoded (no re-decode: the next one replaces
+    // it), but never with a decoding loop in it (issue #357).
+    return join_words(stitched(suppress_loops(
+        split_words(*text), static_cast<double>(tail_len) / sr_)));
 }
 
 std::optional<std::string> ChunkStreamer::flush(
@@ -441,10 +621,11 @@ std::optional<std::string> ChunkStreamer::flush(
         // validated at construction, but the transcriber contract (a
         // nonempty window inside the buffer) is enforced here regardless.
         if (tail_len > 0 && tail_len < chunk_) {
-            call_kind_ = "flush_tail";
-            auto text = tx(samples.data() + boundary_, tail_len);
-            if (text.has_value()) {
-                commit(split_words(*text));
+            auto words = decode_committed(samples, boundary_,
+                                          static_cast<int64_t>(samples.size()),
+                                          "flush_tail", tx);
+            if (words.has_value()) {
+                commit(*words);
                 boundary_ = static_cast<int64_t>(samples.size());
                 emit_due_ = false;
                 return join_words(committed_);
@@ -465,6 +646,8 @@ void ChunkStreamer::reset() {
     emit_due_ = false;
     last_preview_cost_ = 0.0;
     coalesced_ = 0;
+    redecodes_ = 0;
+    rates_.clear();
     call_kind_ = "window";
 }
 
@@ -618,7 +801,8 @@ AppendOutcome StreamSession::append_wav(const std::string& bytes) {
 
 void StreamSession::maybe_trim_samples() {
     if (!chunker_) return;
-    int64_t b = chunker_->boundary();
+    // Keep the audio a re-decode may still read before the boundary.
+    int64_t b = chunker_->retain_from();
     if (b <= 0 || b >= static_cast<int64_t>(samples_.size())) return;
     if (b < kStreamTrimMinSamples
         && b < static_cast<int64_t>(samples_.size()) / 2) return;
@@ -899,12 +1083,12 @@ void StreamSession::mark_take_start() {
 
 namespace {
 const char* const kCallKinds[] = {
-    "window", "preview", "flush_window", "flush_tail"};
+    "window", "preview", "flush_window", "flush_tail", "redecode"};
 }
 
 void StreamSession::record_call(const StreamCall& c) {
     totals_.add(c);
-    for (size_t k = 0; k < 4; ++k)
+    for (size_t k = 0; k < std::size(kCallKinds); ++k)
         if (std::string(c.kind) == kCallKinds[k]) by_kind_[k].add(c);
     if (flushing_) flush_totals_.add(c);
     const std::string r = c.result;
@@ -958,7 +1142,7 @@ std::string StreamSession::trace_partial_json() const {
 
 std::string StreamSession::trace_final_json() const {
     std::string by_kind = "{";
-    for (size_t k = 0; k < 4; ++k) {
+    for (size_t k = 0; k < std::size(kCallKinds); ++k) {
         if (k) by_kind += ",";
         by_kind += "\"" + std::string(kCallKinds[k]) + "\":"
                  + totals_json(by_kind_[k]);

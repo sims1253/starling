@@ -236,6 +236,34 @@ def test_stream_trace_ledger(server, monkeypatch, chunk_seconds):
     assert trace["covered_s"] == 1.0
 
 
+def test_stream_trace_records_redecode_spans(server, monkeypatch):
+    # A loud 4 s window that decodes to one word is decoded again from an
+    # earlier start (issue #357); the ledger records that call as "redecode"
+    # with its real span, before the window's boundary.
+    server.config.stream_chunk_seconds = 4
+    server.config.stream_overlap_seconds = 2
+    monkeypatch.setattr(server, "_run_queued_sync", _transcribe_hello)
+    loud = np.full(S.SAMPLE_RATE, 8000, dtype=np.int16).tobytes()
+    with TestClient(S.create_app(server=server, load_on_startup=False)) as client:
+        with client.websocket_connect('/stream?trace=1&min_partial_seconds=100') as ws:
+            for _ in range(7):
+                ws.send_bytes(loud)
+            ws.send_json({"type": "commit"})
+            msg = ws.receive_json()
+            while msg["type"] != "final":
+                msg = ws.receive_json()
+    trace = msg["trace"]
+    spans = [(c["kind"], c["start_s"], c["end_s"]) for c in trace["calls"]]
+    # Windows at 0 and 2 s (advance 2 s), each tried again from 1 s
+    # earlier (half the overlap) where the buffer holds that audio, else
+    # ending 1 s earlier; the 3 s flush tail grows back toward one window.
+    assert spans[:2] == [("window", 0.0, 4.0), ("redecode", 0.0, 3.0)]
+    assert ("window", 2.0, 6.0) in spans and ("redecode", 1.0, 5.0) in spans
+    assert ("flush_tail", 4.0, 7.0) in spans and ("redecode", 3.0, 7.0) in spans
+    assert trace["by_kind"]["redecode"]["calls"] == sum(k == "redecode" for k, _, _ in spans)
+    assert msg["duration_s"] == 7.0
+
+
 # ---------------------------------------------------------------------------
 # Preview cadence and coalescing (issue #357).
 # ---------------------------------------------------------------------------
