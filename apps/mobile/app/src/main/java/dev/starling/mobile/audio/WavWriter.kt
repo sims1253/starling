@@ -89,6 +89,9 @@ internal class WavWriter(
         if (closed) return
         check(dataBytes <= maxDataBytes) { EXCEEDED_MESSAGE }
         try {
+            // A write the disk refused part-way (ENOSPC) may have left a torn
+            // chunk past the counted payload; the WAV ends at the last whole one.
+            if (output.length() != WAV_HEADER_SIZE + dataBytes) output.setLength(WAV_HEADER_SIZE + dataBytes)
             output.fd.sync()
             output.seek(0)
             output.write(header(dataBytes))
@@ -122,6 +125,9 @@ internal class WavWriter(
 
         /** Whether a writer of this process still has [file] open. */
         fun isOpen(file: File): Boolean = file.absolutePath in open
+
+        /** Whether any capture of this process is writing (audio upkeep waits for it). */
+        fun anyOpen(): Boolean = open.isNotEmpty()
 
         /** The 44-byte PCM16 mono 16 kHz header for a payload of [dataBytes]. */
         fun header(dataBytes: Long): ByteArray {

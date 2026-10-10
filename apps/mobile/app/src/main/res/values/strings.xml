@@ -59,6 +59,54 @@
     <string name="recording_finalize_error">Could not finalize the private WAV recording. It was retained for inspection.</string>
     <string name="recording_already_stopped">Recording was already stopped.</string>
     <string name="recording_capped">Recording stopped at the 2-hour limit. Transcribing the captured audio…</string>
+    <string name="disk_full_refused">Storage is almost full (%1$d MB free). Free up space on the phone to record.</string>
+    <string name="disk_low_warning">Storage is low: about %1$d minutes of recording fit before Starling has to stop.</string>
+    <string name="recording_stopped_low_disk">Storage is almost full, so the recording stopped. Everything up to that point is saved; free up space to record again.</string>
+    <string name="history_audio_heading">History audio</string>
+    <string name="history_audio_intro">Finished recordings are kept losslessly compressed (FLAC): retries send exactly the audio the first transcription did. Nothing is removed unless you set a limit; a limit removes audio only and keeps transcripts, and never touches recordings from the last day, ones still transcribing, or ones that never got a transcript.</string>
+    <string name="history_audio_archival_intro">Archived recordings (Archive on a recording) follow their own limits. They are kept as FLAC too; a smaller lossy archival format is not available yet.</string>
+    <string name="retention_age_label">Remove audio older than</string>
+    <string name="retention_size_label">Keep at most</string>
+    <string name="retention_archival_age_label">Remove archived audio older than</string>
+    <string name="retention_archival_size_label">Keep at most, archived</string>
+    <string name="retention_save_error">Could not save the history audio limits.</string>
+    <string name="retention_last_cleanup">Last cleanup: %1$s</string>
+    <string name="cleanup_paused">paused while a take records</string>
+    <string name="cleanup_over_limit">the %1$s size limit is still exceeded by %2$d MB</string>
+    <string name="retention_class_standard">standard</string>
+    <string name="retention_class_archival">archival</string>
+    <string name="audio_removed_note">Audio removed by your retention policy on %1$s; the transcript is kept.</string>
+    <string name="archive_recording">Archive</string>
+    <string name="unarchive_recording">Unarchive</string>
+    <string name="archived_mark">archival</string>
+    <string-array name="retention_age_choices">
+        <item>Keep</item>
+        <item>30 days</item>
+        <item>90 days</item>
+        <item>1 year</item>
+    </string-array>
+    <string-array name="retention_size_choices">
+        <item>No limit</item>
+        <item>1 GB</item>
+        <item>5 GB</item>
+        <item>20 GB</item>
+    </string-array>
+    <plurals name="cleanup_compressed">
+        <item quantity="one">compressed %1$d recording losslessly (saved %2$d MB)</item>
+        <item quantity="other">compressed %1$d recordings losslessly (saved %2$d MB)</item>
+    </plurals>
+    <plurals name="cleanup_removed">
+        <item quantity="one">removed the audio of %1$d recording (%2$d MB); transcripts are kept</item>
+        <item quantity="other">removed the audio of %1$d recordings (%2$d MB); transcripts are kept</item>
+    </plurals>
+    <plurals name="cleanup_untranscribed">
+        <item quantity="one">kept %1$d due recording that never got a transcript</item>
+        <item quantity="other">kept %1$d due recordings that never got a transcript</item>
+    </plurals>
+    <plurals name="cleanup_failures">
+        <item quantity="one">%1$d recording could not be compressed and stays as it is</item>
+        <item quantity="other">%1$d recordings could not be compressed and stay as they are</item>
+    </plurals>
     <string name="microphone_permission_required">Microphone permission is required to record.</string>
     <string name="recordings_heading">Saved recordings</string>
     <string name="no_recordings">No recordings yet.</string>

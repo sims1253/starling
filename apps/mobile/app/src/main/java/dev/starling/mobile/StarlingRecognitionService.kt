@@ -20,6 +20,7 @@ import dev.starling.mobile.network.BackendConfig
 import dev.starling.mobile.network.StreamEvent
 import dev.starling.mobile.network.StreamSession
 import dev.starling.mobile.network.TranscriptionEngine
+import dev.starling.mobile.storage.DiskLevel
 import java.util.concurrent.TimeUnit
 
 /**
@@ -62,6 +63,11 @@ class StarlingRecognitionService : RecognitionService() {
         // Finishing a still-live session here is defensive only: the framework
         // answers a second start with ERROR_RECOGNIZER_BUSY without calling us.
         sessions.expire()?.let(::endSession)
+        // Free space first (#342): no take starts that the disk cannot hold.
+        if (application.diskBeforeTake()?.level == DiskLevel.CRITICAL) {
+            sessions.deliver(callback) { it.error(SpeechRecognizer.ERROR_CLIENT) }
+            return
+        }
         val recording = runCatching { application.recordings.create() }.getOrElse {
             sessions.deliver(callback) { it.error(SpeechRecognizer.ERROR_CLIENT) }
             return
@@ -92,6 +98,9 @@ class StarlingRecognitionService : RecognitionService() {
             onChunk = session?.let { streaming ->
                 AudioChunkListener { bytes, count -> streaming.onAudio(bytes, count) }
             },
+            // The capture ended itself (low storage, the two-hour cap):
+            // finish the session like the host's stopListening.
+            onEnded = { if (sessions.isLive(callback)) sessions.stopListening(callback)?.let(::endSession) },
         )
         if (error != null) {
             session?.close()

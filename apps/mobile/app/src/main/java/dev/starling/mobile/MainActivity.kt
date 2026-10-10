@@ -15,12 +15,14 @@ import android.view.Gravity
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
+import android.widget.AdapterView
 import android.widget.Button
 import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.RadioButton
 import android.widget.RadioGroup
+import android.widget.Spinner
 import android.widget.TextView
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
@@ -30,6 +32,7 @@ import dev.starling.mobile.audio.CaptureResult
 import dev.starling.mobile.audio.WavWriter
 import dev.starling.mobile.data.Recording
 import dev.starling.mobile.data.RecordingStatus
+import dev.starling.mobile.data.RetentionClass
 import dev.starling.mobile.data.TranscriptRevision
 import dev.starling.mobile.data.TranscriptSource
 import dev.starling.mobile.data.TranscriptionProvenance
@@ -42,6 +45,11 @@ import dev.starling.mobile.network.EndpointValidation
 import dev.starling.mobile.network.StreamEvent
 import dev.starling.mobile.network.StreamSession
 import dev.starling.mobile.network.TranscriptionEngine
+import dev.starling.mobile.storage.AudioUpkeep
+import dev.starling.mobile.storage.ClassLimits
+import dev.starling.mobile.storage.DiskLevel
+import dev.starling.mobile.storage.DiskPolicy
+import dev.starling.mobile.storage.HoldReason
 import java.text.DateFormat
 import java.util.Date
 import kotlin.concurrent.thread
@@ -62,6 +70,7 @@ class MainActivity : Activity() {
     private lateinit var liveTranscript: TextView
     private lateinit var recordButton: Button
     private lateinit var recordingsContainer: LinearLayout
+    private lateinit var retentionReport: TextView
 
     private val capture = AudioCapture()
     private val application by lazy { starlingApplication() }
@@ -117,6 +126,8 @@ class MainActivity : Activity() {
         liveTranscript = findViewById(R.id.live_transcript)
         recordButton = findViewById(R.id.record_button)
         recordingsContainer = findViewById(R.id.recordings_container)
+        retentionReport = findViewById(R.id.retention_report)
+        bindRetentionLimits()
 
         val config = application.backendSettings.load()
         endpointInput.setText(config.endpoint)
@@ -192,10 +203,14 @@ class MainActivity : Activity() {
     override fun onStart() {
         super.onStart()
         application.modelDownloads.addListener(downloadListener)
+        // A cleanup can remove or compress audio while this screen shows it.
+        application.audioUpkeep.onReport = upkeepListener
+        renderUpkeepReport()
     }
 
     override fun onStop() {
         application.modelDownloads.removeListener(downloadListener)
+        if (application.audioUpkeep.onReport === upkeepListener) application.audioUpkeep.onReport = null
         // A backgrounded Activity should never keep the microphone open. The
         // finalized file stays in app-private storage and can be retried later.
         if (activeRecording != null) stopAndQueueRecording()
@@ -254,6 +269,89 @@ class MainActivity : Activity() {
         if (activeRecording != null) stopAndQueueRecording()
         super.onDestroy()
     }
+
+    private val upkeepListener: (AudioUpkeep.Report) -> Unit = {
+        runOnUiThread {
+            if (!isDestroyed && !isFinishing) {
+                renderUpkeepReport()
+                refreshRecordings()
+            }
+        }
+    }
+
+    /**
+     * The history-audio limits (#342), saved as soon as one changes. A
+     * spinner reports its initial selection too; that matches what is
+     * stored and saves nothing.
+     */
+    private fun bindRetentionLimits() {
+        val policy = application.storageSettings.load()
+        RetentionClass.entries.forEach { retentionClass ->
+            val (ageId, sizeId) = when (retentionClass) {
+                RetentionClass.STANDARD -> R.id.retention_standard_age to R.id.retention_standard_size
+                RetentionClass.ARCHIVAL -> R.id.retention_archival_age to R.id.retention_archival_size
+            }
+            val age = findViewById<Spinner>(ageId)
+            val size = findViewById<Spinner>(sizeId)
+            val limits = policy.limits(retentionClass)
+            age.setSelection(AGE_CHOICES.indexOf(limits.maxAgeDays).coerceAtLeast(0), false)
+            size.setSelection(SIZE_CHOICES_MB.indexOf(limits.maxTotalMb).coerceAtLeast(0), false)
+            val listener = object : AdapterView.OnItemSelectedListener {
+                override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
+                    val chosen = ClassLimits(
+                        maxAgeDays = AGE_CHOICES[age.selectedItemPosition],
+                        maxTotalMb = SIZE_CHOICES_MB[size.selectedItemPosition],
+                    )
+                    if (chosen == application.storageSettings.load().limits(retentionClass)) return
+                    runCatching { application.storageSettings.save(retentionClass, chosen) }
+                        .onSuccess { application.audioUpkeep.schedule() }
+                        .onFailure { recordingMessage.setText(R.string.retention_save_error) }
+                }
+
+                override fun onNothingSelected(parent: AdapterView<*>?) = Unit
+            }
+            age.onItemSelectedListener = listener
+            size.onItemSelectedListener = listener
+        }
+    }
+
+    /** What the last history-audio cleanup did, in one line (the desktop's wording). */
+    private fun renderUpkeepReport() {
+        val report = application.audioUpkeep.lastReport
+        val parts = buildList {
+            if (report == null) return@buildList
+            if (report.compressed > 0) {
+                add(resources.getQuantityString(R.plurals.cleanup_compressed, report.compressed, report.compressed, mbCeil(report.savedBytes)))
+            }
+            val removed = report.retention.removed.size
+            if (removed > 0) {
+                add(resources.getQuantityString(R.plurals.cleanup_removed, removed, removed, mbCeil(report.retention.removedBytes)))
+            }
+            val untranscribed = report.retention.held.count { it.reason == HoldReason.UNTRANSCRIBED }
+            if (untranscribed > 0) {
+                add(resources.getQuantityString(R.plurals.cleanup_untranscribed, untranscribed, untranscribed))
+            }
+            report.retention.overLimit.forEach { (retentionClass, bytes) ->
+                add(getString(R.string.cleanup_over_limit, retentionClassName(retentionClass), mbCeil(bytes)))
+            }
+            if (report.failures > 0) {
+                add(resources.getQuantityString(R.plurals.cleanup_failures, report.failures, report.failures))
+            }
+            if (report.paused && isNotEmpty()) add(getString(R.string.cleanup_paused))
+        }
+        retentionReport.visibility = if (parts.isEmpty()) View.GONE else View.VISIBLE
+        retentionReport.text = getString(
+            R.string.retention_last_cleanup,
+            parts.joinToString("; ").replaceFirstChar { it.uppercase() },
+        )
+    }
+
+    private fun retentionClassName(retentionClass: RetentionClass): String = getString(
+        when (retentionClass) {
+            RetentionClass.STANDARD -> R.string.retention_class_standard
+            RetentionClass.ARCHIVAL -> R.string.retention_class_archival
+        },
+    )
 
     private fun saveEndpoint(): BackendConfig? {
         val config = currentConfig() ?: return null
@@ -498,6 +596,12 @@ class MainActivity : Activity() {
 
     private fun beginCapture() {
         awaitingPermission = false
+        // Free space first (#342): no take starts that the disk cannot hold.
+        val disk = application.diskBeforeTake()
+        if (disk?.level == DiskLevel.CRITICAL) {
+            recordingMessage.text = getString(R.string.disk_full_refused, mb(disk.availableBytes))
+            return
+        }
         val recording = runCatching { application.recordings.create() }.getOrElse {
             recordingMessage.text = getString(R.string.recording_storage_error)
             return
@@ -517,6 +621,9 @@ class MainActivity : Activity() {
             this,
             savedAudio,
             onChunk = session?.let { streaming -> AudioChunkListener { bytes, count -> streaming.onAudio(bytes, count) } },
+            // The capture ended itself (low storage, the two-hour cap):
+            // settle it like Stop.
+            onEnded = { if (activeRecording === recording) stopAndQueueRecording() },
         )
         if (error != null) {
             session?.close()
@@ -537,6 +644,10 @@ class MainActivity : Activity() {
                 else -> R.string.streaming_connecting
             },
         )
+        if (disk?.level == DiskLevel.LOW) {
+            recordingMessage.append("\n")
+            recordingMessage.append(getString(R.string.disk_low_warning, DiskPolicy.DEFAULT.minutesLeft(disk.availableBytes)))
+        }
     }
 
     /**
@@ -595,15 +706,23 @@ class MainActivity : Activity() {
                     return
                 }
                 val config = application.backendSettings.load()
+                // Why a take that ended by itself stopped stays on screen
+                // through its transcription.
+                val notice = when {
+                    result.stoppedForLowDisk -> getString(R.string.recording_stopped_low_disk)
+                    result.cappedAtLimit -> getString(R.string.recording_capped)
+                    else -> null
+                }
+                val settled: (Recording) -> Unit = { onTranscriptionSettled(it, notice) }
                 // With a live session, commit the stream and store its final
                 // transcript; the coordinator falls back to this same batch
                 // upload of the saved WAV whenever the stream failed.
                 val queued = if (session != null) {
-                    application.transcription.finishStreaming(session, finalized.id, config, ::onTranscriptionSettled)
+                    application.transcription.finishStreaming(session, finalized.id, config, settled)
                 } else {
-                    application.transcription.transcribe(finalized.id, config, ::onTranscriptionSettled)
+                    application.transcription.transcribe(finalized.id, config, settled)
                 }
-                if (queued) updateRecordingViews { recordingMessage.setText(R.string.sending_recording) }
+                if (queued) updateRecordingViews { recordingMessage.text = notice ?: getString(R.string.sending_recording) }
                 updateRecordingViews { refreshRecordings() }
             }
             is CaptureResult.Failed -> {
@@ -627,7 +746,7 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun onTranscriptionSettled(completed: Recording) {
+    private fun onTranscriptionSettled(completed: Recording, notice: String? = null) {
         // The Activity may have been destroyed (for example by a rotation)
         // while the request was in flight; the store settlement already ran.
         if (isDestroyed || isFinishing) return
@@ -641,6 +760,7 @@ class MainActivity : Activity() {
             // has while the recording waits for a retry.
             recordingMessage.setText(R.string.transcription_failed_retry)
         }
+        notice?.let { recordingMessage.append("\n"); recordingMessage.append(it) }
         refreshRecordings()
     }
 
@@ -700,6 +820,8 @@ class MainActivity : Activity() {
         val title = row.findViewById<TextView>(R.id.recording_title)
         val status = row.findViewById<TextView>(R.id.recording_status)
         val recoveryView = row.findViewById<TextView>(R.id.recording_recovery)
+        val removedView = row.findViewById<TextView>(R.id.recording_audio_removed)
+        val archive = row.findViewById<Button>(R.id.archive_recording_button)
         val transcript = row.findViewById<TextView>(R.id.recording_transcript)
         val revisionsView = row.findViewById<TextView>(R.id.recording_revisions)
         val play = row.findViewById<Button>(R.id.play_recording_button)
@@ -735,6 +857,10 @@ class MainActivity : Activity() {
             status.append(" · ")
             status.append(revisionSource(latest))
         }
+        if (recording.retentionClass == RetentionClass.ARCHIVAL) {
+            status.append(" · ")
+            status.append(getString(R.string.archived_mark))
+        }
         recording.errorMessage?.let {
             status.append(" — ")
             status.append(it)
@@ -768,7 +894,25 @@ class MainActivity : Activity() {
             )
         }
 
-        val hasAudio = recording.status != RecordingStatus.RECORDING && application.recordings.audioFile(recording).isFile
+        // Only the audio goes when the retention policy removes it (#342).
+        val removal = recording.audioRemoved
+        removedView.visibility = if (removal == null) View.GONE else View.VISIBLE
+        removedView.text = removal?.let {
+            getString(R.string.audio_removed_note, DateFormat.getDateInstance(DateFormat.MEDIUM).format(Date(it.atMillis)))
+        }
+        archive.visibility = if (removal == null && recording.status != RecordingStatus.RECORDING) View.VISIBLE else View.GONE
+        archive.setText(
+            if (recording.retentionClass == RetentionClass.ARCHIVAL) R.string.unarchive_recording else R.string.archive_recording,
+        )
+        archive.setOnClickListener {
+            val target = if (recording.retentionClass == RetentionClass.ARCHIVAL) RetentionClass.STANDARD else RetentionClass.ARCHIVAL
+            runCatching { application.recordings.setRetentionClass(recording.id, target) }
+            application.audioUpkeep.schedule()
+            refreshRecordings()
+        }
+
+        val hasAudio = recording.status != RecordingStatus.RECORDING && removal == null &&
+            application.recordings.audioFile(recording).isFile
         play.visibility = if (hasAudio) View.VISIBLE else View.GONE
         play.setText(if (playingId == recording.id) R.string.stop_playback else R.string.play_recording)
         play.setOnClickListener { togglePlayback(recording) }
@@ -879,7 +1023,9 @@ class MainActivity : Activity() {
         // player, and a released or replaced player's callbacks do nothing.
         val player = MediaPlayer()
         val queued = runCatching {
-            player.setDataSource(application.recordings.audioFile(recording).absolutePath)
+            // Opened under the store lock: a compression that publishes
+            // meanwhile unlinks the WAV, but an open file keeps playing.
+            application.recordings.openAudio(recording.id).stream.use { player.setDataSource(it.fd) }
             player.setOnPreparedListener { if (this.player === it) it.start() }
             player.setOnCompletionListener {
                 if (this.player !== it) return@setOnCompletionListener
@@ -914,13 +1060,14 @@ class MainActivity : Activity() {
 
     /** Saves a copy of the recording's audio wherever the user picks (Storage Access Framework). */
     private fun exportRecording(recording: Recording) {
+        // The audio as it is stored: FLAC once compressed (#342), else WAV.
         val audio = application.recordings.audioFile(recording)
         val stamp = java.text.SimpleDateFormat("yyyyMMdd-HHmmss", java.util.Locale.US).format(Date(recording.createdAtMillis))
         pendingExportId = recording.id
         startActivityForResult(
             Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
                 addCategory(Intent.CATEGORY_OPENABLE)
-                type = "audio/wav"
+                type = if (audio.extension == "flac") "audio/flac" else "audio/wav"
                 putExtra(Intent.EXTRA_TITLE, "starling-$stamp.${audio.extension}")
             },
             REQUEST_EXPORT_RECORDING,
@@ -936,8 +1083,8 @@ class MainActivity : Activity() {
         val resolver = contentResolver
         thread {
             val exported = runCatching {
-                val audio = application.recordings.audioFile(application.recordings.get(id))
-                resolver.openOutputStream(uri, "w")!!.use { output -> audio.inputStream().use { it.copyTo(output) } }
+                val audio = application.recordings.openAudio(id).stream
+                resolver.openOutputStream(uri, "w")!!.use { output -> audio.use { it.copyTo(output) } }
             }.onFailure { Log.w(TAG, "recording export failed", it) }.isSuccess
             runOnUiThread {
                 if (isDestroyed || isFinishing) return@runOnUiThread
@@ -962,6 +1109,14 @@ class MainActivity : Activity() {
 
         /** Bytes to decimal MB, rounded to nearest like Hugging Face's listing. */
         private fun mb(bytes: Long): Int = ((bytes + MB / 2) / MB).toInt()
+
+        /** Bytes to MiB rounded up, as the desktop's cleanup summary counts. */
+        private fun mbCeil(bytes: Long): Int = ((bytes + MIB - 1) / MIB).toInt()
+        private const val MIB = 1024L * 1024
+
+        /** The retention spinners' choices, in their string-array order; null is no limit. */
+        private val AGE_CHOICES = listOf(null, 30, 90, 365)
+        private val SIZE_CHOICES_MB = listOf(null, 1024L, 5 * 1024L, 20 * 1024L)
 
         /** 612.4 s as "10:12". */
         private fun clock(seconds: Double): String {

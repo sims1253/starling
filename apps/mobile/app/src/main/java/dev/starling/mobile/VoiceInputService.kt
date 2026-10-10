@@ -45,6 +45,8 @@ import dev.starling.mobile.processing.ModeCatalog
 import dev.starling.mobile.processing.Mode
 import dev.starling.mobile.processing.RegionKind
 import dev.starling.mobile.processing.StagedTake
+import dev.starling.mobile.storage.DiskLevel
+import dev.starling.mobile.storage.DiskPolicy
 import dev.starling.mobile.ui.EditorField
 import dev.starling.mobile.ui.InputTargetGuard
 
@@ -311,6 +313,12 @@ class VoiceInputService : InputMethodService() {
         // A private field gets the default mode: its route is blocked, so no
         // phrase, rule or processing ever applies there.
         val mode = continuing?.mode ?: if (sensitive) catalog.mode(null) else selectedMode()
+        // Free space first (#342): no take starts that the disk cannot hold.
+        val disk = application.diskBeforeTake()
+        if (disk?.level == DiskLevel.CRITICAL) {
+            statusView?.text = getString(R.string.disk_full_refused, (disk.availableBytes / 1_000_000).toInt())
+            return
+        }
         val recording = runCatching { application.recordings.create(ephemeral = sensitive) }.getOrElse {
             statusView?.setText(R.string.recording_storage_error)
             return
@@ -371,6 +379,9 @@ class VoiceInputService : InputMethodService() {
                 else -> R.string.keyboard_streaming
             },
         )
+        if (disk?.level == DiskLevel.LOW) {
+            statusView?.text = getString(R.string.disk_low_warning, DiskPolicy.DEFAULT.minutesLeft(disk.availableBytes))
+        }
     }
 
     /**
@@ -542,7 +553,11 @@ class VoiceInputService : InputMethodService() {
                 }
                 if (take === current) {
                     statusView?.setText(
-                        if (result.cappedAtLimit) R.string.recording_capped else R.string.keyboard_sending,
+                        when {
+                            result.stoppedForLowDisk -> R.string.recording_stopped_low_disk
+                            result.cappedAtLimit -> R.string.recording_capped
+                            else -> R.string.keyboard_sending
+                        },
                     )
                 }
                 val config = application.backendSettings.load()

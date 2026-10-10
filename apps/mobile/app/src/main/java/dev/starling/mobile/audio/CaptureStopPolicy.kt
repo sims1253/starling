@@ -53,15 +53,16 @@ object CaptureStopPolicy {
      * The result of a capture whose worker has exited: a worker error wins
      * so the failure is surfaced; otherwise the finalized WAV is reported
      * with its exact duration, including the at-cap case that must be
-     * committed like a normal completion.
+     * committed like a normal completion, and the low-disk stop (#342).
      */
-    fun settle(error: String?, bytes: Long, cappedAtLimit: Boolean): CaptureResult =
+    fun settle(error: String?, bytes: Long, cappedAtLimit: Boolean, stoppedForLowDisk: Boolean = false): CaptureResult =
         if (error != null) {
             CaptureResult.Failed(error)
         } else {
             CaptureResult.Completed(
                 durationSeconds = bytes.toDouble() / (WavWriter.SAMPLE_RATE * WavWriter.BYTES_PER_SAMPLE),
                 cappedAtLimit = cappedAtLimit,
+                stoppedForLowDisk = stoppedForLowDisk,
             )
         }
 }
