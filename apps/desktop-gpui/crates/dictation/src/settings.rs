@@ -102,6 +102,68 @@ pub struct Settings {
     /// subsection loads its defaults and never the rest of the file.
     #[serde(default, deserialize_with = "lenient_feedback")]
     pub feedback: FeedbackSettings,
+    /// History audio retention (#342). Off by default; an unreadable
+    /// subsection loads off and never costs the rest of the file.
+    #[serde(default, deserialize_with = "lenient_storage")]
+    pub storage: StorageSettings,
+}
+
+/// Retention limits for one class of history audio (#342). `None` is no
+/// limit.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct RetentionLimits {
+    /// Remove the audio of takes older than this many days.
+    pub max_age_days: Option<u32>,
+    /// Keep at most this many megabytes (MiB) of the class's audio,
+    /// newest first.
+    pub max_total_mb: Option<u64>,
+}
+
+/// The storage subsection of the settings file (#342): retention limits
+/// per class, all off by default. Finalized takes are kept as lossless
+/// FLAC regardless — that is not a setting.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct StorageSettings {
+    pub standard: RetentionLimits,
+    pub archival: RetentionLimits,
+    /// Also remove audio that documents or correction records reference.
+    pub include_referenced: bool,
+}
+
+impl StorageSettings {
+    /// The store-side policy these settings describe.
+    pub fn retention_policy(&self) -> crate::store_v2::RetentionPolicy {
+        let limits = |limits: RetentionLimits| crate::store_v2::ClassLimits {
+            max_age_days: limits.max_age_days,
+            max_total_bytes: limits
+                .max_total_mb
+                .map(|mb| mb.saturating_mul(1024 * 1024)),
+        };
+        let mut policy = crate::store_v2::RetentionPolicy {
+            include_referenced: self.include_referenced,
+            ..Default::default()
+        };
+        policy
+            .limits
+            .insert(crate::store_v2::STANDARD_CLASS.to_string(), limits(self.standard));
+        policy
+            .limits
+            .insert(crate::store_v2::ARCHIVAL_CLASS.to_string(), limits(self.archival));
+        policy
+    }
+}
+
+fn lenient_storage<'de, D>(deserializer: D) -> Result<StorageSettings, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = <serde_json::Value as serde::Deserialize>::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).unwrap_or_else(|err| {
+        eprintln!("Unreadable storage settings; retention stays off: {err}");
+        StorageSettings::default()
+    }))
 }
 
 /// Which microphone takes record from. Only the user changes this: a take
@@ -390,6 +452,7 @@ impl Settings {
             microphone: MicrophoneSettings::default(),
             playback: PlaybackSettings::default(),
             feedback: FeedbackSettings::default(),
+            storage: StorageSettings::default(),
         }
     }
 
@@ -679,6 +742,7 @@ mod tests {
                 cues: true,
                 cue_volume_percent: 35,
             },
+            storage: StorageSettings::default(),
         };
 
         settings.save(&path).expect("save");
@@ -1090,6 +1154,63 @@ mod tests {
             assert_eq!(loaded.endpoint, "http://10.0.0.5:8181", "{playback}");
             assert_eq!(loaded.model, "m", "{playback}");
         }
+    }
+
+    #[test]
+    fn storage_settings_are_off_by_default_and_load_leniently() {
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("settings.json");
+        let load = |storage: &str| {
+            std::fs::write(
+                &path,
+                format!(r#"{{"endpoint":"http://10.0.0.5:8181","model":"m","expectedTerms":[]{storage}}}"#),
+            )
+            .expect("write");
+            Settings::load(&path)
+        };
+        let fresh = load("");
+        assert_eq!(fresh.storage, StorageSettings::default());
+        assert!(!fresh.storage.retention_policy().is_active());
+        for storage in [
+            r#","storage":null"#,
+            r#","storage":{"standard":{"maxAgeDays":"thirty"}}"#,
+        ] {
+            let loaded = load(storage);
+            assert_eq!(loaded.storage, StorageSettings::default(), "{storage}");
+            assert_eq!(loaded.model, "m", "{storage}");
+        }
+        let set = load(r#","storage":{"standard":{"maxAgeDays":90},"archival":{"maxTotalMb":512}}"#);
+        assert_eq!(set.storage.standard.max_age_days, Some(90));
+        assert_eq!(set.storage.archival.max_total_mb, Some(512));
+        assert!(!set.storage.include_referenced);
+        let policy = set.storage.retention_policy();
+        assert!(policy.is_active());
+        assert_eq!(
+            policy.limits[crate::store_v2::ARCHIVAL_CLASS].max_total_bytes,
+            Some(512 * 1024 * 1024)
+        );
+        assert_eq!(policy.grace, crate::store_v2::DEFAULT_RETENTION_GRACE);
+    }
+
+    #[test]
+    fn storage_settings_roundtrip() {
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("settings.json");
+        let settings = Settings {
+            storage: StorageSettings {
+                standard: RetentionLimits {
+                    max_age_days: Some(365),
+                    max_total_mb: Some(4096),
+                },
+                archival: RetentionLimits::default(),
+                include_referenced: true,
+            },
+            ..Settings::default_settings()
+        };
+        settings.save(&path).expect("save");
+        let raw = std::fs::read_to_string(&path).expect("read");
+        assert!(raw.contains("\"maxAgeDays\": 365"), "{raw}");
+        assert_eq!(Settings::load(&path), settings);
     }
 
     #[test]
