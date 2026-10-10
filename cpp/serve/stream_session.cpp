@@ -707,9 +707,10 @@ TranscribeFn StreamSession::active_tx() {
             if (preempt_ && std::strcmp(call.kind, "preview") == 0) {
                 // A preview overtaken by required work stops at the engine's
                 // next checkpoint (issue #357). A result that completes after
-                // the predicate fired (past the last checkpoint, or an engine
-                // without checkpoints) is discarded the same way: the work
-                // queued behind it supersedes it.
+                // required work queued (past the last checkpoint, e.g. in the
+                // TDT decoder, or an engine without checkpoints) is discarded
+                // the same way: the work queued behind it supersedes it, so it
+                // is neither published nor kept for exact-tail reuse.
                 starling::ggml::CallAbortScope abort_scope(
                     [](void* self) {
                         auto* s = static_cast<StreamSession*>(self);
@@ -717,7 +718,7 @@ TranscribeFn StreamSession::active_tx() {
                     },
                     this);
                 result = inner(p, n);
-                preempted = abort_scope.fired();
+                preempted = abort_scope.fired() || preempt_();
                 if (preempted) result.reset();
             } else {
                 result = inner(p, n);

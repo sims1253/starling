@@ -289,8 +289,8 @@ and the server never drops audio. When more than 32 MiB or 4096 frames
 are queued, the server stops reading from the socket until the worker
 catches up. A `ping` is answered after every earlier frame has been
 processed, as before. If a frame cannot be written to the client (the
-peer is gone or stalled past the write timeout), the worker stops and
-further frames are discarded until the connection closes.
+peer is gone or stalled past the write timeout), the server closes the
+connection and the worker stops.
 
 **Stream instrumentation** (issue #226): connect to `/stream?trace=1` and
 every partial and final carries an extra `"trace"` object. Clients that do

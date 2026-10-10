@@ -1212,6 +1212,20 @@ def _wav_bytes_to_float32(data: bytes) -> tuple[np.ndarray, int]:
     return samples, framerate
 
 
+def _frame_samples(data: bytes) -> int:
+    """Mono 16 kHz samples a binary /stream frame adds (StreamSession.append_wav):
+    two bytes per raw PCM16 sample; a WAV frame's frame count, resampled to
+    16 kHz (any width or channel count). 0 for a WAV that will be refused."""
+    if data[:4] != b"RIFF" or data[8:12] != b"WAVE":
+        return len(data) // 2
+    try:
+        with wave.open(io.BytesIO(data), "rb") as wf:
+            frames, rate = wf.getnframes(), wf.getframerate()
+    except (wave.Error, EOFError, ValueError):
+        return 0
+    return math.ceil(frames * SAMPLE_RATE / rate) if rate > 0 else 0
+
+
 def _pcm16_bytes_to_float32(data: bytes) -> np.ndarray:
     if len(data) == 0:
         return np.zeros(0, dtype=np.float32)
@@ -1797,10 +1811,7 @@ def create_app(
                 return 0, 0, 0
             kind, payload = item
             if kind == "bytes":
-                # PCM16 samples; a WAV frame's 44-byte header is not audio.
-                audio = len(payload) - min(44, len(payload)) if payload[:4] == b"RIFF" \
-                    else len(payload)
-                return audio // 2, 0, 0
+                return _frame_samples(payload), 0, 0
             command = _command(payload)
             return 0, int(command == "reset"), int(command == "commit")
 

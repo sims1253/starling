@@ -464,6 +464,26 @@ def test_stream_empty_commit_reports_committed_stop(server):
     assert stop["t0_ms"] == 0.0 and stop["t1_ms"] == 0.0
 
 
+def test_frame_samples_follow_the_decoded_audio():
+    import io
+    import wave
+
+    def wav(rate, channels, width, frames):
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as w:
+            w.setnchannels(channels)
+            w.setsampwidth(width)
+            w.setframerate(rate)
+            w.writeframes(b"\x00" * frames * channels * width)
+        return buf.getvalue()
+
+    assert S._frame_samples(b"\x00" * 3200) == 1600                # raw PCM16
+    assert S._frame_samples(wav(16000, 1, 1, 6400)) == 6400        # 0.4 s mono 8-bit
+    assert S._frame_samples(wav(16000, 2, 2, 3200)) == 3200        # 0.2 s stereo PCM16
+    assert S._frame_samples(wav(8000, 1, 2, 1600)) == 3200         # resampled to 16 kHz
+    assert S._frame_samples(b"RIFF\x00\x00\x00\x00WAVEjunk") == 0  # refused
+
+
 def test_preempt_event_latches_its_predicate():
     state = {"go": False}
     ev = S._PreemptEvent(lambda: state["go"])

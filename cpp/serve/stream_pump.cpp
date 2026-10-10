@@ -1,8 +1,8 @@
 // stream_pump.cpp — WS /stream worker: queue, drain, coalesce (issue #357).
 
 #include "stream_pump.hpp"
+#include "audio.hpp"
 
-#include <algorithm>
 #include <chrono>
 #include <sstream>
 #include <utility>
@@ -102,12 +102,7 @@ void StreamPump::push(Event ev) {
     if (closed_) return;
     if (ev.kind == Kind::Audio) {
         pending_bytes_ += ev.bytes.size();
-        // PCM16 samples; a WAV frame's 44-byte header is not audio. An
-        // estimate is enough: it only decides whether to cancel a preview.
-        const bool wav = ev.bytes.size() >= 12 && ev.bytes.compare(0, 4, "RIFF") == 0;
-        const size_t audio = wav ? ev.bytes.size() - std::min<size_t>(44, ev.bytes.size())
-                                 : ev.bytes.size();
-        pending_samples_ += static_cast<int64_t>(audio / 2);
+        pending_samples_ += frame_samples(ev.bytes);
     } else if (ev.kind == Kind::Commit) {
         if (pending_commits_++ == 0) samples_before_commit_ = pending_samples_;
     } else if (ev.kind == Kind::Reset) {
@@ -116,6 +111,21 @@ void StreamPump::push(Event ev) {
     if (ev.kind != Kind::Ping) ++pending_work_;
     queue_.push_back(std::move(ev));
     cv_.notify_one();
+}
+
+int64_t StreamPump::frame_samples(const std::string& bytes) {
+    // What append_wav/append_pcm will add: raw PCM16 is two bytes per
+    // sample; a WAV frame is decoded (any format or channel count) and
+    // counts only at 16 kHz, the one rate the session accepts.
+    if (bytes.size() >= 12 && bytes.compare(0, 4, "RIFF") == 0
+        && bytes.compare(8, 4, "WAVE") == 0) {
+        std::vector<float> decoded;
+        int sr = 0;
+        if (!audio::wav_bytes_to_float32(bytes, decoded, sr) || sr != kSampleRate)
+            return 0;
+        return static_cast<int64_t>(decoded.size());
+    }
+    return static_cast<int64_t>(bytes.size() / 2);
 }
 
 void StreamPump::send(const std::string& frame) {

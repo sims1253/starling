@@ -519,10 +519,12 @@ static void test_stream_session_busy_retry() {
     CHECK_NEAR(session.buffered_seconds(), 1.5);
 }
 
-// Build a minimal mono PCM16 RIFF/WAVE container around raw little-endian
-// sample bytes (the same shape audio_parser_test's make_wav produces;
-// StreamSession decodes it via audio::wav_bytes_to_float32).
-static std::string make_wav_bytes(int sample_rate, const std::string& pcm) {
+// Build a minimal PCM RIFF/WAVE container (mono 16-bit unless told
+// otherwise) around raw little-endian sample bytes (the same shape
+// audio_parser_test's make_wav produces; StreamSession decodes it via
+// audio::wav_bytes_to_float32).
+static std::string make_wav_bytes(int sample_rate, const std::string& pcm,
+                                  int channels = 1, int bits = 16) {
     auto le32 = [](uint32_t v) {
         std::string s(4, '\0');
         s[0] = static_cast<char>(v & 0xff);
@@ -544,11 +546,12 @@ static std::string make_wav_bytes(int sample_rate, const std::string& pcm) {
     h += "fmt ";
     h += le32(16);       // fmt chunk size
     h += le16(1);        // PCM
-    h += le16(1);        // mono
+    const uint32_t block = static_cast<uint32_t>(channels * bits / 8);
+    h += le16(static_cast<uint16_t>(channels));
     h += le32(static_cast<uint32_t>(sample_rate));
-    h += le32(static_cast<uint32_t>(sample_rate) * 2);  // byte rate
-    h += le16(2);        // block align
-    h += le16(16);       // bits per sample
+    h += le32(static_cast<uint32_t>(sample_rate) * block);  // byte rate
+    h += le16(static_cast<uint16_t>(block));                // block align
+    h += le16(static_cast<uint16_t>(bits));                 // bits per sample
     h += "data";
     h += le32(data_size);
     h += pcm;
@@ -1828,6 +1831,62 @@ static void test_pump_preview_finishing_after_preempt_is_discarded() {
     }
 }
 
+static void test_pump_frame_samples_follow_the_decoded_audio() {
+    // The preempt bookkeeping counts what the session will append.
+    CHECK_EQ(StreamPump::frame_samples(std::string(3200, '\0')), 1600);  // raw PCM16
+    // 0.4 s of mono 8-bit: 6400 samples from 6400 bytes.
+    CHECK_EQ(StreamPump::frame_samples(make_wav_bytes(16000, std::string(6400, '\x80'), 1, 8)),
+             6400);
+    // 0.2 s of stereo PCM16: 3200 mono samples from 12800 bytes.
+    CHECK_EQ(StreamPump::frame_samples(make_wav_bytes(16000, std::string(12800, '\0'), 2, 16)),
+             3200);
+    // An 8 kHz WAV is refused by the session: nothing to count.
+    CHECK_EQ(StreamPump::frame_samples(make_wav_bytes(8000, std::string(3200, '\0'))), 0);
+}
+
+static void test_pump_late_preempt_without_checkpoint_is_discarded() {
+    // Required work queues while the preview is past its last checkpoint
+    // (it never polls the hook, like the TDT decoder): the result that
+    // completes is checked against the predicate once more and discarded.
+    PumpFixture fx;
+    std::atomic<int> previews{0};
+    std::mutex gate_mu;
+    std::condition_variable gate_cv;
+    bool release = false;
+    fx.session.set_transcribe_fn([&](const float*, int64_t n)
+                                     -> std::optional<std::string> {
+        if (std::strcmp(fx.session.chunker()->call_kind(), "preview") == 0) {
+            previews.fetch_add(1);
+            std::unique_lock<std::mutex> lk(gate_mu);
+            gate_cv.wait(lk, [&] { return release; });
+            return std::string("stale preview");
+        }
+        return std::string("w") + std::to_string(n);
+    });
+    StreamPump::Options opt;
+    opt.trace = true;
+    StreamPump pump(fx.session, opt, fx.sender());
+    pump.push_audio(pcm_for_range(0, 9600));
+    wait_until(previews, 1);
+    pump.push_audio(pcm_for_range(9600, 3200));
+    pump.push_commit();
+    {
+        std::lock_guard<std::mutex> lk(gate_mu);
+        release = true;
+    }
+    gate_cv.notify_all();
+    const size_t fin = fx.wait_for("\"type\":\"final\"");
+    CHECK(fin != SIZE_MAX);
+    pump.drain();
+    CHECK(fx.count("stale") == 0);
+    std::lock_guard<std::mutex> lk(fx.mu);
+    if (fin != SIZE_MAX) {
+        CHECK(fx.sent[fin].find("\"text\":\"w12800\"") != std::string::npos);
+        CHECK(fx.sent[fin].find("\"preempted\":1") != std::string::npos);
+        CHECK(fx.sent[fin].find("\"path\":\"tail\"") != std::string::npos);
+    }
+}
+
 static void test_pump_commit_without_new_audio_reuses_running_preview() {
     // Stop with no audio after the preview started: the preview is exactly
     // the flush tail, so it is not cancelled and the final reuses it.
@@ -2295,6 +2354,8 @@ int main() {
     test_pump_stop_preempts_running_preview();
     test_pump_commit_without_new_audio_reuses_running_preview();
     test_pump_preview_finishing_after_preempt_is_discarded();
+    test_pump_late_preempt_without_checkpoint_is_discarded();
+    test_pump_frame_samples_follow_the_decoded_audio();
     test_pump_window_audio_preempts_running_preview();
     test_pump_reset_preempts_running_preview();
     test_pump_empty_commit_reports_committed_stop();

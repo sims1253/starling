@@ -67,6 +67,10 @@ public:
     // (including the step owed for earlier audio), as with the former
     // synchronous loop.
     void push_ping();
+    // Mono 16 kHz samples a binary frame adds to the session (0 for a WAV
+    // the session refuses): the preempt bookkeeping's audio estimate.
+    static int64_t frame_samples(const std::string& bytes);
+
     // True once close() ran or a send failed.
     bool is_closed();
     // Stop the worker after its current step (the engine calls of one
