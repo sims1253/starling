@@ -1891,6 +1891,69 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// A disconnect lets go of the takes this window waited for: they are
+    /// transcribed into history without it, and none stays busy here.
+    #[gpui::test]
+    fn a_disconnect_leaves_no_waiting_take_busy(cx: &mut gpui::TestAppContext) {
+        let root = scratch("frames-disconnect");
+        let store = Store::at_test_root(&root);
+        let id = transcribed(&store, "later");
+        let (app, _) = window_with_typing(cx, &store);
+        own_take(&app, cx, &id);
+        app.update(cx, |app, cx| {
+            app.active_ids.insert(id.clone());
+            app.host_update(
+                HostUpdate::Disconnected {
+                    reason: "gone".to_string(),
+                    gave_up: false,
+                    host_gone: false,
+                },
+                cx,
+            );
+        });
+        app.read_with(cx, |app, _| {
+            assert!(!app.is_active(&id), "Retry and Delete work again");
+            assert!(app.host.awaiting.is_empty());
+            assert!(!app.delivers(&id), "nothing is typed for it later");
+        });
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A staging panel whose transcription failed keeps its edits; a retry
+    /// the user asks for rebases them — never typed.
+    #[gpui::test]
+    fn an_asked_for_retry_recovers_a_failed_staging_panel(cx: &mut gpui::TestAppContext) {
+        let root = scratch("frames-staging-retry");
+        let store = Store::at_test_root(&root);
+        let id = transcribed(&store, "the retried words");
+        let (app, fake) = window_with_typing(cx, &store);
+        app.update(cx, |app, cx| {
+            app.begin_staging(cx);
+            let token = app.stop_staging().expect("a staging");
+            app.bind_staging(token, &id);
+            app.staging_transcription_failed(&id, cx);
+            assert!(app.staging_failed_for(&id));
+            app.host.requests.insert(
+                "tr_here".to_string(),
+                crate::remote_take::Request {
+                    stored_id: id.clone(),
+                    _hold: None,
+                    offer: true,
+                },
+            );
+        });
+        frame(&app, cx, completed_with(&id, Some("tr_here"), true, "the retried words"));
+        settle(cx, "the panel rebased", |cx| {
+            app.read_with(cx, |app, _| !app.staging_failed_for(&id))
+        });
+        assert_eq!(
+            app.read_with(cx, |app, _| app.staged_text_for(&id)).as_deref(),
+            Some("the retried words")
+        );
+        assert!(fake.insertions().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// The live text the host sends with an adoption shows once the take
     /// is this window's (it arrives before the confirming tick).
     #[gpui::test]

@@ -349,6 +349,7 @@ impl StarlingApp {
             }
         }
         for id in std::mem::take(&mut self.host.awaiting) {
+            self.active_ids.remove(&id);
             self.no_transcript_here(&id, cx);
         }
         for id in std::mem::take(&mut self.host.transcribing) {
@@ -1048,7 +1049,12 @@ impl StarlingApp {
                                 // delivered and staged, with exactly its
                                 // text; anything else this window acts on
                                 // is processed and, if it asked, offered.
-                                if own {
+                                // A retry this window asked for recovers a
+                                // staging panel that failed with its edits
+                                // kept (staged: never typed — its delivery
+                                // went when it was asked for).
+                                let recovers = offer && app.staging_failed_for(&stored_id);
+                                if own || recovers {
                                     app.host
                                         .own_results
                                         .insert(stored_id.clone(), (attempt, text));

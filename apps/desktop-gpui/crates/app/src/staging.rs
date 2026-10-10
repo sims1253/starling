@@ -146,6 +146,19 @@ impl StarlingApp {
             .find(|staging| staging.token == token)
     }
 
+    /// Whether take `id`'s staging panel failed with its draft kept: a
+    /// successful retry the user asks for rebases it.
+    pub(crate) fn staging_failed_for(&self, id: &str) -> bool {
+        self.staging
+            .iter()
+            .chain(self.background_stagings.iter())
+            .any(|staging| {
+                staging.take_id.as_deref() == Some(id)
+                    && staging.phase == StagingPhase::Failed
+                    && staging.live.is_some()
+            })
+    }
+
     pub(crate) fn staging_token_for(&self, id: &str) -> Option<u64> {
         self.staging
             .iter()
