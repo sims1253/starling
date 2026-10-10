@@ -2648,19 +2648,97 @@ mod tests {
         other.mark_attempt(&id, "openai:fake-model").expect("attempt");
         let (server, served) = fake_server(vec![Reply::Text("a second transcript")]);
         let app = app_on_host(cx, &store, &host, server);
-        settle(cx, "the host to hear it handled", |_| unclaimed(&root).is_empty());
+        settle(cx, "the orphan offered here", |cx| {
+            app.read_with(cx, |app, _| app.host.handling.contains(&id))
+        });
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        cx.run_until_parked();
         assert_eq!(*served.lock().unwrap(), 0, "left to the app transcribing it");
+        assert_eq!(unclaimed(&root), vec![id.clone()], "the host's until that app settles it");
         other.save_transcript(&id, words("the other app's words")).expect("transcript");
-        settle(cx, "the other app's transcript here", |cx| {
+        settle(cx, "the other app's transcript here, and the host told", |cx| {
             cx.executor().advance_clock(crate::remote_take::FOREIGN_POLL);
-            app.read_with(cx, |app, _| {
-                app.sessions
+            unclaimed(&root).is_empty()
+                && app.read_with(cx, |app, _| {
+                    app.sessions
+                        .first()
+                        .and_then(|take| take.transcript.as_ref())
+                        .is_some_and(|transcript| transcript.text == "the other app's words")
+                })
+        });
+        assert_eq!(*served.lock().unwrap(), 0);
+        drop(app);
+        host.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[gpui::test]
+    fn an_orphan_whose_transcribing_app_goes_away_is_transcribed_here(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = scratch("host-orphan-gone");
+        let store = Store::at_test_root(&root);
+        let mut host = host_at(&root, vec![scripted_take()], std::time::Duration::from_millis(200));
+        let id = orphan_on(&host, &store);
+        let other = Store::at_test_root(&root);
+        other.mark_attempt(&id, "openai:fake-model").expect("attempt");
+        let (server, served) = fake_server(vec![Reply::Text("transcribed here")]);
+        let app = app_on_host(cx, &store, &host, server);
+        settle(cx, "the orphan offered here", |cx| {
+            app.read_with(cx, |app, _| app.host.handling.contains(&id))
+        });
+        // The other app dies before its result: its marker goes with it.
+        drop(other);
+        settle(cx, "the orphan transcribed here", |cx| {
+            cx.executor().advance_clock(crate::remote_take::FOREIGN_POLL);
+            unclaimed(&root).is_empty()
+                && records(&store)
                     .first()
                     .and_then(|take| take.transcript.as_ref())
-                    .is_some_and(|transcript| transcript.text == "the other app's words")
+                    .is_some_and(|transcript| transcript.text == "transcribed here")
+        });
+        assert_eq!(*served.lock().unwrap(), 1, "transcribed once");
+        drop(app);
+        host.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[gpui::test]
+    fn a_take_a_window_without_history_recorded_goes_to_one_with_history(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = scratch("host-no-store");
+        let store = Store::at_test_root(&root);
+        let mut host = host_at(&root, vec![scripted_take()], std::time::Duration::from_secs(20));
+        let (server, served) = fake_server(vec![Reply::Text("kept by the other window")]);
+        let socket = host.socket_path().to_path_buf();
+        let storeless = cx.new(|cx| {
+            let mut app = StarlingApp::for_test(None, cx);
+            app.endpoint = format!("http://{server}");
+            app.model = "fake-model".to_string();
+            app.follow_host(socket, crate::host_link::Launch::Never, cx);
+            app
+        });
+        settle(cx, "the connection", |cx| {
+            storeless.read_with(cx, |app, _| app.host.client.is_some())
+        });
+        let with_history = app_on_host(cx, &store, &host, server);
+        click(&storeless, cx);
+        settle(cx, "listening", |cx| {
+            storeless.read_with(cx, |app, _| {
+                app.activation.readiness() == Some(crate::activation::Readiness::Listening)
             })
         });
-        drop(app);
+        click(&storeless, cx);
+        settle(cx, "the take transcribed by the window with history", |_| {
+            records(&store)
+                .first()
+                .and_then(|take| take.transcript.as_ref())
+                .is_some_and(|transcript| transcript.text == "kept by the other window")
+        });
+        assert_eq!(*served.lock().unwrap(), 1);
+        drop(storeless);
+        drop(with_history);
         host.shutdown();
         let _ = std::fs::remove_dir_all(&root);
     }

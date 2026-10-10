@@ -1038,12 +1038,12 @@ impl StarlingApp {
                 // holds the whole take; otherwise the stored take is
                 // uploaded in full.
                 let stream = stream.filter(|_| complete);
+                // Acknowledged to the host once its transcription ends.
+                self.host.handling.insert(id.clone());
                 let Some(store) = self.store.clone() else {
                     self.take_handed_back(&id);
                     return;
                 };
-                // Acknowledged to the host once its transcription ends.
-                self.host.handling.insert(id.clone());
                 let load_id = id.clone();
                 cx.spawn(async move |this, cx| {
                     let (stream, wav) = cx
@@ -1115,8 +1115,9 @@ impl StarlingApp {
     /// A take the host stored while no app followed it: transcribed into
     /// history, never typed (no window's delivery is bound to it). One
     /// that already has a transcript (its app went before telling the
-    /// host), or that another live app is transcribing, is acknowledged
-    /// instead of transcribed again.
+    /// host) is acknowledged instead; one another live app is still
+    /// transcribing is watched, and acknowledged once that app settled it
+    /// — or transcribed here if that app goes away first.
     fn transcribe_orphan(&mut self, id: String, cx: &mut Context<Self>) {
         let Some(store) = self.store.clone() else {
             if let Some(link) = &self.host.link {
@@ -1128,45 +1129,60 @@ impl StarlingApp {
         // cannot be read here stays the host's for the next window.
         self.host.handling.insert(id.clone());
         cx.spawn(async move |this, cx| {
-            let (progress, wav) = {
-                let store = store.clone();
-                let id = id.clone();
-                cx.background_spawn(async move {
-                    let progress = store.recognition(&id);
-                    let wav = matches!(progress, Ok(Recognition::Due)).then(|| store.audio_wav(&id));
-                    (progress, wav)
-                })
-                .await
-            };
-            match (progress, wav) {
-                (Ok(Recognition::Due), Some(Ok(Some(wav)))) => {
-                    this.update(cx, |app, cx| {
-                        app.service_notice = Some(
-                            "A recording that was still running when Starling closed was saved; \
-                             it is being transcribed into your history."
-                                .to_string(),
-                        );
-                        let target = app.resolve_take_target();
-                        app.transcribe_with_stream(id, wav, None, target, None, false, cx);
+            let mut every = FOREIGN_POLL;
+            loop {
+                let (progress, wav) = {
+                    let store = store.clone();
+                    let id = id.clone();
+                    cx.background_spawn(async move {
+                        let progress = store.recognition(&id);
+                        let wav =
+                            matches!(progress, Ok(Recognition::Due)).then(|| store.audio_wav(&id));
+                        (progress, wav)
                     })
-                    .ok();
-                }
-                (progress, wav) => {
-                    this.update(cx, |app, cx| match (progress, wav) {
-                        // Transcribed already; or deleted from history:
-                        // nothing is left to do.
-                        (Ok(Recognition::Done), _) | (_, Some(Ok(None))) => app.take_handled(&id),
-                        // Another app's job settles it; this window's
-                        // history follows.
-                        (Ok(Recognition::InFlight), _) => {
-                            app.take_handled(&id);
-                            app.follow_foreign_take(id.clone(), cx);
+                    .await
+                };
+                match (progress, wav) {
+                    (Ok(Recognition::Due), Some(Ok(Some(wav)))) => {
+                        this.update(cx, |app, cx| {
+                            app.service_notice = Some(
+                                "A recording that was still running when Starling closed was \
+                                 saved; it is being transcribed into your history."
+                                    .to_string(),
+                            );
+                            let target = app.resolve_take_target();
+                            app.transcribe_with_stream(id, wav, None, target, None, false, cx);
+                        })
+                        .ok();
+                        return;
+                    }
+                    (Ok(Recognition::InFlight), _) => {
+                        // Still the host's until that app settles it; a
+                        // window that closes meanwhile hands it on.
+                        refresh_sessions(&this, &store, cx).await;
+                        let following = this
+                            .update(cx, |app, _| app.host.handling.contains(&id))
+                            .unwrap_or(false);
+                        if !following {
+                            return;
                         }
-                        // Back to the host for another try.
-                        _ => app.take_handed_back(&id),
-                    })
-                    .ok();
-                    refresh_sessions(&this, &store, cx).await
+                        cx.background_executor().timer(every).await;
+                        every = (every * 2).min(FOREIGN_POLL_MAX);
+                    }
+                    (progress, wav) => {
+                        this.update(cx, |app, _| match (progress, wav) {
+                            // Transcribed already; or deleted from
+                            // history: nothing is left to do.
+                            (Ok(Recognition::Done), _) | (_, Some(Ok(None))) => {
+                                app.take_handled(&id)
+                            }
+                            // Back to the host for another try.
+                            _ => app.take_handed_back(&id),
+                        })
+                        .ok();
+                        refresh_sessions(&this, &store, cx).await;
+                        return;
+                    }
                 }
             }
         })

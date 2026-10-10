@@ -4443,14 +4443,14 @@ impl StoreV2 {
             return Err(StoreV2Error::NotFound(capture_id.to_string()));
         };
 
-        let changed = match outcome {
+        let written = match outcome {
             RecognitionOutcome::Completed { text, extra_json } => self.conn.execute(
                 "UPDATE recognition_attempts
                  SET text = ?1, partial_or_final = 'final', status = 'completed',
                      extra_json = COALESCE(?2, extra_json)
                  WHERE id = ?3 AND status = 'started'",
                 params![text, extra_json, attempt_id],
-            )?,
+            ),
             RecognitionOutcome::Failed { message } => {
                 let extra = serde_json::json!({ "error": message });
                 self.conn.execute(
@@ -4458,7 +4458,18 @@ impl StoreV2 {
                      SET status = 'failed', extra_json = ?1
                      WHERE id = ?2 AND status = 'started'",
                     params![extra.to_string(), attempt_id],
-                )?
+                )
+            }
+        };
+        let changed = match written {
+            Ok(changed) => changed,
+            Err(err) => {
+                // The settle could not be written (a full disk): nothing
+                // works on the attempt any more, so it must not read as
+                // in flight (#220) — the stale sweep, or another window,
+                // takes it from here.
+                self.release_attempt_lock(&attempt_id);
+                return Err(err.into());
             }
         };
         if changed == 0 {
@@ -7508,6 +7519,28 @@ mod tests {
             Err(StoreV2Error::NotFound(_)) => {}
             other => panic!("expected NotFound, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_settle_the_database_refuses_no_longer_reads_as_in_flight() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut store = store_in(&dir);
+        let id = committed_take(&mut store, &ramp(30, 0)).record.id.clone();
+        let attempt = store.begin_recognition(&id, "starling", None).expect("begin");
+        assert!(store.attempt_owned(&attempt));
+        store
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER refuse_settles BEFORE UPDATE ON recognition_attempts
+                 BEGIN SELECT RAISE(ABORT, 'disk full'); END;",
+            )
+            .expect("trigger");
+        assert!(
+            store
+                .finish_recognition(&id, RecognitionOutcome::Failed { message: "server" })
+                .is_err()
+        );
+        assert!(!store.attempt_owned(&attempt), "nothing works on it any more");
     }
 
     #[test]
