@@ -573,8 +573,17 @@ const SECRET_QUERY_KEYS: &[&str] = &[
 /// the scheme any run of `/` or `\` is skipped (`http:///u:p@h` and
 /// `http:/u:p@h` still carry userinfo), and without a scheme followed
 /// by a slash the authority starts at the very beginning (`http:u:p@h`
-/// is userinfo too, so the conservative reading covers it).
+/// is userinfo too, so the conservative reading covers it). The text is
+/// first normalized as that parser does — leading and trailing control
+/// characters and spaces trimmed, embedded tabs and newlines removed —
+/// so ` http://u:p@h` or `?to\tken=` cannot hide a credential from it.
 fn redact_endpoint(endpoint: &str) -> String {
+    let normalized: String = endpoint
+        .trim_matches(|c: char| c <= ' ')
+        .chars()
+        .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
+        .collect();
+    let endpoint = normalized.as_str();
     let authority_start = scheme_end(endpoint)
         .filter(|&at| endpoint[at..].starts_with(['/', '\\']))
         .map_or(0, |at| {
@@ -1049,6 +1058,16 @@ mod tests {
                 "http:\\\\***@example.com\\v1",
             ),
             ("http:user:secret@example.com", "***@example.com"),
+            // Normalized as the client's URL parser normalizes.
+            (
+                " http://user:secret@example.com\n",
+                "http://***@example.com",
+            ),
+            ("ht\ttp://user:secret@example.com", "http://***@example.com"),
+            (
+                "http://example.com/?to\tken=secret",
+                "http://example.com/?token=***",
+            ),
             // Percent-encoded keys are classified decoded.
             (
                 "http://example.com/?%74oken=secret&api_%6bey=k&%zz=1",
@@ -1078,6 +1097,10 @@ mod tests {
         assert_eq!(
             manual_label("http://example.com/?api_key=abc"),
             "manual:http://example.com/?api_key=***"
+        );
+        assert_eq!(
+            manual_label("http://example.com/?to\tken=abc"),
+            "manual:http://example.com/?token=***"
         );
     }
 
