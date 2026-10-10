@@ -252,8 +252,9 @@ class AudioCapture(
                 null
             } else {
                 stopRequested = true
-                // An explicit stop is never reported as a low-disk one.
-                lowDisk.close(takeToken)
+                // An explicit stop is never reported as a low-disk one,
+                // unless the take had already ended by itself for low disk.
+                lowDisk.cancel(takeToken)
                 state = State.STOPPING
                 stopCallbacks.add(onSettled)
                 recorder to worker

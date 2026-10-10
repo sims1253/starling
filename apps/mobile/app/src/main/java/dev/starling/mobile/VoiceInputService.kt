@@ -46,7 +46,6 @@ import dev.starling.mobile.processing.Mode
 import dev.starling.mobile.processing.RegionKind
 import dev.starling.mobile.processing.StagedTake
 import dev.starling.mobile.storage.DiskLevel
-import dev.starling.mobile.storage.DiskPolicy
 import dev.starling.mobile.ui.EditorField
 import dev.starling.mobile.ui.InputTargetGuard
 
@@ -381,13 +380,7 @@ class VoiceInputService : InputMethodService() {
                 else -> R.string.keyboard_streaming
             },
         )
-        showDiskWarning(
-            if (disk?.level == DiskLevel.LOW) {
-                getString(R.string.disk_low_warning, DiskPolicy.DEFAULT.minutesLeft(disk.availableBytes))
-            } else {
-                null
-            },
-        )
+        showDiskWarning(application.diskWarning(disk))
     }
 
     /** The low-storage warning of the running take, on its own line; null hides it. */

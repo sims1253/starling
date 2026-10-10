@@ -22,6 +22,7 @@ import dev.starling.mobile.processing.ProfilesDocument
 import dev.starling.mobile.processing.SpokenCommands
 import dev.starling.mobile.processing.SpokenInstructions
 import dev.starling.mobile.storage.AudioUpkeep
+import dev.starling.mobile.storage.DiskLevel
 import dev.starling.mobile.storage.DiskPolicy
 import dev.starling.mobile.storage.DiskReading
 import dev.starling.mobile.storage.FreeSpaceProbe
@@ -151,6 +152,17 @@ class StarlingApplication : Application() {
      */
     fun diskBeforeTake(): DiskReading? =
         DiskPolicy.DEFAULT.check(FreeSpaceProbe.current, File(filesDir, "recordings"))
+
+    /**
+     * What a starting take says about [disk] (from [diskBeforeTake]): the
+     * low-space estimate, the desktop's "can't check" note when the space
+     * could not be measured, or null when there is room.
+     */
+    fun diskWarning(disk: DiskReading?): String? = when {
+        disk == null -> getString(R.string.disk_unchecked_warning)
+        disk.level == DiskLevel.LOW -> getString(R.string.disk_low_warning, DiskPolicy.DEFAULT.minutesLeft(disk.availableBytes))
+        else -> null
+    }
 
     /**
      * Debug-build device-test hooks (#356), driven over `adb shell run-as`:

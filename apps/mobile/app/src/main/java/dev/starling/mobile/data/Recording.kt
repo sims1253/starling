@@ -102,4 +102,9 @@ data class Recording(
     val retentionClass: RetentionClass = RetentionClass.STANDARD,
     /** Set once the retention policy removed the audio. */
     val audioRemoved: AudioRemoval? = null,
+    /**
+     * Deleted by the user while a reader held its audio: hidden everywhere,
+     * and its files go once the reader is done (or at the next start).
+     */
+    val deleted: Boolean = false,
 )

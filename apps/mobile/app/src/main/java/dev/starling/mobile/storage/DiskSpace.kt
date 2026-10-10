@@ -16,11 +16,20 @@ fun interface FreeSpaceProbe {
     fun availableBytes(directory: File): Long
 
     companion object {
-        /** `statvfs`'s f_bavail (File.usableSpace) of the nearest existing directory. */
-        val SYSTEM = FreeSpaceProbe { directory ->
+        /**
+         * `statvfs`'s f_bavail (File.usableSpace) of the nearest existing
+         * directory. File.usableSpace answers a failed statvfs with 0, so 0
+         * reads as unmeasurable, not as a full disk: the take starts with the
+         * "can't check" warning, and a disk that is really full stops it at
+         * its first refused write (ENOSPC).
+         */
+        val SYSTEM = FreeSpaceProbe { directory -> measure(directory, File::getUsableSpace) }
+
+        internal fun measure(directory: File, usableSpace: (File) -> Long): Long {
             val existing = generateSequence(directory.absoluteFile) { it.parentFile }.firstOrNull(File::isDirectory)
                 ?: throw IOException("No directory to measure above ${directory.path}")
-            existing.usableSpace
+            return usableSpace(existing).takeIf { it > 0 }
+                ?: throw IOException("Free space unavailable for ${existing.path}")
         }
 
         /**

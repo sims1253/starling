@@ -60,6 +60,7 @@
     <string name="recording_already_stopped">Recording was already stopped.</string>
     <string name="recording_capped">Recording stopped at the 2-hour limit. Transcribing the captured audio…</string>
     <string name="disk_full_refused">Storage is almost full (%1$d MB free). Free up space on the phone to record.</string>
+    <string name="disk_unchecked_warning">Can\'t check free disk space.</string>
     <string name="disk_low_warning">Storage is low: about %1$d minutes of recording fit before Starling has to stop.</string>
     <string name="recording_stopped_low_disk">Storage is almost full, so the recording stopped. Everything up to that point is saved; free up space to record again.</string>
     <string name="history_audio_heading">History audio</string>

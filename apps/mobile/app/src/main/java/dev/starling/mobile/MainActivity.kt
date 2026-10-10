@@ -48,7 +48,6 @@ import dev.starling.mobile.network.TranscriptionEngine
 import dev.starling.mobile.storage.AudioUpkeep
 import dev.starling.mobile.storage.ClassLimits
 import dev.starling.mobile.storage.DiskLevel
-import dev.starling.mobile.storage.DiskPolicy
 import dev.starling.mobile.storage.HoldReason
 import dev.starling.mobile.storage.StorageSettings
 import java.text.DateFormat
@@ -670,9 +669,9 @@ class MainActivity : Activity() {
                 else -> R.string.streaming_connecting
             },
         )
-        if (disk?.level == DiskLevel.LOW) {
+        application.diskWarning(disk)?.let { warning ->
             recordingMessage.append("\n")
-            recordingMessage.append(getString(R.string.disk_low_warning, DiskPolicy.DEFAULT.minutesLeft(disk.availableBytes)))
+            recordingMessage.append(warning)
         }
     }
 
@@ -1112,14 +1111,7 @@ class MainActivity : Activity() {
         thread {
             val exported = runCatching {
                 resolver.openOutputStream(uri, "w")!!.use { output ->
-                    if (flac) {
-                        // Compression only ever goes from WAV to FLAC.
-                        application.recordings.openAudio(id).stream.use { it.copyTo(output) }
-                    } else {
-                        // Named .wav: the request WAV, byte for byte the
-                        // original even if upkeep compressed the take since.
-                        application.recordings.withRequestAudio(id) { wav -> wav.inputStream().use { it.copyTo(output) } }
-                    }
+                    application.recordings.exportAudio(id, flac, output)
                 }
             }.onFailure { Log.w(TAG, "recording export failed", it) }.isSuccess
             runOnUiThread {

@@ -410,4 +410,117 @@ class RecordingStoreAtRestTest {
         assertArrayEquals(WavWriter.header(pcm.size.toLong()) + pcm, requestAudio(reopened, recording.id))
         assertEquals(recovered.recovery, reopened.get(recording.id).recovery)
     }
+
+    /**
+     * A delete while a transcription or export reads the take: it is gone
+     * for everyone else at once, and the files the reader holds stay until
+     * it is done. Neither the decoded request WAV nor the FLAC behind it is
+     * unlinked mid-read.
+     */
+    @Test
+    fun aDeleteDuringARequestReadWaitsForTheReader() {
+        val store = RecordingStore(storeDir())
+        val take = committedTake(store)
+        val expected = requestAudio(store, take.id)
+        store.compressAudio(take.id)
+
+        val read = store.withRequestAudio(take.id) { request ->
+            store.delete(take.id)
+            assertTrue(store.list().none { it.id == take.id })
+            try {
+                store.get(take.id)
+                fail("a deleted take was still readable")
+            } catch (_: IOException) {
+            }
+            // The attempt's result cannot bring it back.
+            try {
+                store.markTranscribed(take.id, "late")
+                fail("a deleted take took a transcript")
+            } catch (_: IOException) {
+            }
+            // Nor does playback or an export open it again.
+            try {
+                store.openAudio(take.id).stream.close()
+                fail("a deleted take opened for playback")
+            } catch (_: IOException) {
+            }
+            try {
+                store.exportAudio(take.id, flac = true, output = java.io.ByteArrayOutputStream())
+                fail("a deleted take was exported")
+            } catch (_: IOException) {
+            }
+            assertTrue(request.isFile && flac(take.id).isFile)
+            request.readBytes()
+        }
+
+        assertArrayEquals(expected, read)
+        assertEquals(emptyList<String>(), storeDir().list().orEmpty().toList())
+    }
+
+    @Test
+    fun aDeleteOfAPinnedWavTakeWaitsForTheLastPin() {
+        val store = RecordingStore(storeDir())
+        val take = committedTake(store)
+        val first = store.pin(take.id)
+        val second = store.pin(take.id)
+        store.delete(take.id)
+        assertTrue(wav(take.id).isFile)
+        assertEquals(emptyList<String>(), store.compressionCandidates())
+        first.close()
+        assertTrue(wav(take.id).isFile)
+        second.close()
+        assertEquals(emptyList<String>(), storeDir().list().orEmpty().toList())
+    }
+
+    @Test
+    fun aCommitCannotBringBackATakeDeletedWhilePinned() {
+        val store = RecordingStore(storeDir())
+        val recording = store.create()
+        WavWriter(store.partialFile(recording)).apply {
+            write(speech, speech.size)
+            finish()
+        }
+        store.pin(recording.id)
+        store.delete(recording.id)
+        try {
+            store.commitAudio(recording, speech.size / 32_000.0)
+            fail("a deleted take was committed")
+        } catch (_: IOException) {
+        }
+        assertEquals(emptyList<Recording>(), store.list())
+        // The process dies with the pin held: the next open finishes the delete.
+        RecordingStore(storeDir())
+        assertEquals(emptyList<String>(), storeDir().list().orEmpty().toList())
+    }
+
+    @Test
+    fun aDeleteHeldBackByAReaderIsFinishedAtTheNextOpen() {
+        val store = RecordingStore(storeDir())
+        val take = committedTake(store)
+        store.pin(take.id)
+        store.delete(take.id)
+        // The process dies before the reader is done.
+        val reopened = RecordingStore(storeDir())
+        assertEquals(emptyList<Recording>(), reopened.list())
+        assertEquals(emptyList<String>(), storeDir().list().orEmpty().toList())
+    }
+
+    @Test
+    fun anExportTakesItsFormatAndItsBytesTogether() {
+        val store = RecordingStore(storeDir())
+        val take = committedTake(store)
+        val expected = requestAudio(store, take.id)
+        // Named .flac while the take is still a WAV: refused, never WAV bytes under that name.
+        try {
+            store.exportAudio(take.id, flac = true, output = java.io.ByteArrayOutputStream())
+            fail("WAV bytes were exported as FLAC")
+        } catch (_: IOException) {
+        }
+        store.compressAudio(take.id)
+        val asFlac = java.io.ByteArrayOutputStream().also { store.exportAudio(take.id, flac = true, output = it) }
+        assertArrayEquals(flac(take.id).readBytes(), asFlac.toByteArray())
+        // Named .wav before the compression: still the original WAV.
+        val asWav = java.io.ByteArrayOutputStream().also { store.exportAudio(take.id, flac = false, output = it) }
+        assertArrayEquals(expected, asWav.toByteArray())
+    }
 }

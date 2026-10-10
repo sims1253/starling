@@ -359,4 +359,60 @@ class RetentionTest {
         assertFalse(hasAudio(old))
         assertNotNull(store.get(old.id).audioRemoved)
     }
+
+    /**
+     * A retention removal lands between a settle's verify and its unlink,
+     * and storage refuses both its unlink and the take-back (the disk is
+     * full): the take stays stamped with both files. The settle must not
+     * unlink the WAV (leaving the FLAC alone on a removed take); the next
+     * open finishes the removal.
+     */
+    @Test
+    fun aSettleLeavesATakeRetentionStampedMeanwhileToTheRemoval() {
+        var refuseWav = true
+        var refuseRemoval = false
+        val store = RecordingStore(
+            storeDir(),
+            unlink = { file ->
+                when {
+                    refuseWav && file.name.endsWith(".wav") -> false
+                    refuseRemoval && file.name.endsWith(".flac") -> {
+                        // The take-back save cannot write its temporary either.
+                        File(storeDir(), ".${file.name.removeSuffix(".flac")}.json.tmp").mkdir()
+                        false
+                    }
+                    else -> file.delete()
+                }
+            },
+            clock = { now },
+        )
+        val old = take(store, ageDays = 40.0)
+        assertTrue((store.compressAudio(old.id) as RecordingStore.Compression.Compressed).wavKept)
+        refuseWav = false
+        val wav = File(storeDir(), "${old.id}.wav")
+        val flac = File(storeDir(), "${old.id}.flac")
+
+        var interleaved = false
+        val waiting = store.settleAtRest(stop = {
+            if (!interleaved) {
+                interleaved = true
+                refuseRemoval = true
+                try {
+                    store.applyRetention(Gate(policy(standard = ClassLimits(maxAgeDays = 30))))
+                    fail("the take-back did not fail")
+                } catch (_: IOException) {
+                }
+                refuseRemoval = false
+            }
+            false
+        })
+
+        assertEquals(0, waiting)
+        assertNotNull(store.get(old.id).audioRemoved)
+        assertTrue(wav.isFile && flac.isFile)
+        File(storeDir(), ".${old.id}.json.tmp").delete()
+        val reopened = RecordingStore(storeDir()) { now }
+        assertFalse(hasAudio(old))
+        assertNotNull(reopened.get(old.id).audioRemoved)
+    }
 }

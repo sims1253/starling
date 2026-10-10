@@ -20,7 +20,6 @@ import dev.starling.mobile.network.BackendConfig
 import dev.starling.mobile.network.StreamEvent
 import dev.starling.mobile.network.StreamSession
 import dev.starling.mobile.storage.DiskLevel
-import dev.starling.mobile.storage.DiskPolicy
 
 /**
  * The `ACTION_RECOGNIZE_SPEECH` popup (E22): apps that ask the system for
@@ -183,9 +182,9 @@ class RecognizeSpeechActivity : Activity() {
         streamSession = session
         val loading = session != null && application.isOnDeviceModelLoading(config)
         statusView.setText(if (loading) R.string.recognize_listening_loading else R.string.recognize_listening)
-        if (disk?.level == DiskLevel.LOW) {
+        application.diskWarning(disk)?.let { warning ->
             statusView.append("\n")
-            statusView.append(getString(R.string.disk_low_warning, DiskPolicy.DEFAULT.minutesLeft(disk.availableBytes)))
+            statusView.append(warning)
         }
     }
 

@@ -23,7 +23,6 @@ import dev.starling.mobile.network.StreamEvent
 import dev.starling.mobile.network.StreamSession
 import dev.starling.mobile.network.TranscriptionEngine
 import dev.starling.mobile.storage.DiskLevel
-import dev.starling.mobile.storage.DiskPolicy
 import java.util.concurrent.TimeUnit
 
 /**
@@ -77,9 +76,7 @@ class StarlingRecognitionService : RecognitionService() {
             sessions.deliver(callback) { it.error(RecognitionSessionGuard.DISK_FULL_ERROR) }
             return
         }
-        if (disk?.level == DiskLevel.LOW) {
-            toast(getString(R.string.disk_low_warning, DiskPolicy.DEFAULT.minutesLeft(disk.availableBytes)))
-        }
+        application.diskWarning(disk)?.let(::toast)
         val recording = runCatching { application.recordings.create() }.getOrElse {
             sessions.deliver(callback) { it.error(SpeechRecognizer.ERROR_CLIENT) }
             return

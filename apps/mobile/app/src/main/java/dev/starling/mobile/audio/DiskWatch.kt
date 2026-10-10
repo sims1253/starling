@@ -64,10 +64,28 @@ internal class LowDiskStop {
         return current
     }
 
-    /** Ends the take [token]; its raises are refused from now on. */
+    /**
+     * The take [token] has ended (its worker exited); its raises are
+     * refused from now on, and a raise it already took stays readable for
+     * the settlement.
+     */
     @Synchronized
     fun close(token: Long) {
         if (token == current) open = false
+    }
+
+    /**
+     * An explicit stop of the still running take [token]: it closes the
+     * take and withdraws a raise not yet acted on, so the stop is never
+     * reported as a low-disk one. A take that already ended by itself
+     * (closed by its worker) keeps its reason.
+     */
+    @Synchronized
+    fun cancel(token: Long) {
+        if (isOpen(token)) {
+            open = false
+            raised = false
+        }
     }
 
     @Synchronized

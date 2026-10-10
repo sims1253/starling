@@ -180,4 +180,38 @@ class DiskSpaceTest {
         stop.begin()
         assertFalse(stop.raised)
     }
+
+    @Test
+    fun anExplicitStopIsNeverALowDiskStop() {
+        val stop = LowDiskStop()
+        // The watch raised, and the user stopped before the take acted on it.
+        val take = stop.begin()
+        assertTrue(stop.raise(take))
+        stop.cancel(take)
+        assertFalse(stop.raised)
+        assertFalse(stop.raise(take))
+        // A take that already ended for low disk keeps the reason when its owner stops it to settle.
+        val ended = stop.begin()
+        assertTrue(stop.raise(ended))
+        stop.close(ended)
+        stop.cancel(ended)
+        assertTrue(stop.raised)
+        // A stop of an earlier take changes nothing for the running one.
+        val running = stop.begin()
+        assertTrue(stop.raise(running))
+        stop.cancel(ended)
+        assertTrue(stop.raised)
+    }
+
+    @Test
+    fun aStatThatAnswersZeroIsUnmeasuredNotAFullDisk() {
+        // File.usableSpace answers a failed statvfs with 0.
+        val failed = FreeSpaceProbe { directory -> FreeSpaceProbe.measure(directory) { 0L } }
+        assertEquals(null, DiskPolicy.DEFAULT.check(failed, folder.root))
+        val measured = FreeSpaceProbe { directory -> FreeSpaceProbe.measure(directory) { 100 * mib } }
+        assertEquals(DiskLevel.CRITICAL, DiskPolicy.DEFAULT.check(measured, folder.root)?.level)
+        // In a take, an unmeasured disk keeps recording.
+        val watch = DiskWatch(failed, folder.root, DiskPolicy.DEFAULT, intervalMillis = 0, clock = { 0L })
+        assertFalse(watch.critical())
+    }
 }

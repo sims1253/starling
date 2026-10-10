@@ -177,6 +177,9 @@ class FlacTest {
             .map { File(it, "flac") }.firstOrNull(File::canExecute)
         assumeTrue("flac is not installed", tool != null)
         val pcm = WavPcm.decodePcm16(repoFile("tests/fixtures/2086-149220-0033.wav"))!!.pcm
+        // Its last block is short: STREAMINFO's 4096/4096 block sizes are a
+        // fixed-size stream, whose minimum leaves the last block out (RFC 9639, 8.2).
+        assertTrue((pcm.size / 2) % Flac.BLOCK_SIZE != 0)
         val encoded = encode(pcm)
         val raw = File(folder.root, "decoded.raw")
         val process = ProcessBuilder(

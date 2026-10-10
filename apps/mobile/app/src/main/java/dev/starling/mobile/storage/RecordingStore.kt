@@ -75,6 +75,10 @@ class RecordingStore internal constructor(
     // until then every reader uses the WAV, the original.
     private val unsettled = LinkedHashSet<String>()
 
+    // Guarded by [lock]: takes deleted while pinned; their files go when
+    // the last pin is released ([delete]).
+    private val deferredDeletes = HashSet<String>()
+
     /** Test hook: runs at the named step of [compressAudio] (see [CompressionStep]). */
     internal var compressionHook: ((CompressionStep) -> Unit)? = null
 
@@ -83,7 +87,7 @@ class RecordingStore internal constructor(
             throw IOException("Unable to create private recording directory")
         }
         sweepOrphanedTemporaries()
-        sweepEphemeral()
+        sweepDeleted()
         recoverInterrupted()
         reconcileAtRest()
     }
@@ -115,8 +119,10 @@ class RecordingStore internal constructor(
     fun get(id: String): Recording = synchronized(lock) {
         requireValidId(id)
         val file = metadataFile(id)
-        if (!file.isFile) throw IOException("Recording is no longer available")
-        return decode(file)
+        if (!file.isFile) throw IOException(NO_LONGER_AVAILABLE)
+        val recording = decode(file)
+        if (recording.deleted) throw IOException(NO_LONGER_AVAILABLE)
+        return recording
     }
 
     fun partialFile(recording: Recording): File = File(directory, "${recording.id}.wav.part")
@@ -125,22 +131,27 @@ class RecordingStore internal constructor(
      * The take's audio at rest: the FLAC once compressed, else the WAV.
      * While a take holds both (until [settleAtRest]), the WAV.
      */
-    fun audioFile(recording: Recording): File =
+    fun audioFile(recording: Recording): File = synchronized(lock) {
         wavFile(recording.id).takeIf(File::isFile) ?: flacFile(recording.id).takeIf(File::isFile) ?: wavFile(recording.id)
+    }
 
     private fun wavFile(id: String): File = File(directory, "$id.wav")
 
     private fun flacFile(id: String): File = File(directory, "$id.flac")
 
-    /** Atomically promotes the completed WAV from its partial file. */
+    /**
+     * Atomically promotes the completed WAV from its partial file. The
+     * metadata is read again: a take deleted meanwhile stays deleted.
+     */
     fun commitAudio(recording: Recording, durationSeconds: Double): Recording = synchronized(lock) {
-        val partial = partialFile(recording)
+        val current = get(recording.id)
+        val partial = partialFile(current)
         if (!isFinalizedWav(partial)) {
             throw IOException("Recording did not produce a complete WAV")
         }
-        move(partial, wavFile(recording.id))
+        move(partial, wavFile(current.id))
         syncDirectory()
-        val updated = recording.copy(
+        val updated = current.copy(
             status = RecordingStatus.PENDING,
             durationSeconds = durationSeconds,
             errorMessage = null,
@@ -207,14 +218,36 @@ class RecordingStore internal constructor(
         }
     }
 
-    /** Deletion is only called by an explicit user action. */
+    /**
+     * Deletion is only called by an explicit user action. A take a
+     * transcription or export is reading (pinned) is deleted at once for
+     * everyone else: its metadata is marked [Recording.deleted], so it is
+     * hidden and a crash cannot bring it back, and its files go when the
+     * last pin is released (or at the next open), never under the reader.
+     */
     fun delete(id: String) = synchronized(lock) {
         requireValidId(id)
+        if ((pins[id] ?: 0) > 0) {
+            val metadata = metadataFile(id)
+            val recording = if (metadata.isFile) decode(metadata) else null
+            if (recording != null && !recording.deleted) save(recording.copy(deleted = true))
+            deferredDeletes += id
+            return@synchronized
+        }
+        removeFiles(id)
+    }
+
+    /** Removes every file of [id], its metadata last. Caller holds [lock]; nothing pins [id]. */
+    private fun removeFiles(id: String) {
         val metadata = metadataFile(id)
         val partial = File(directory, "$id.wav.part")
         val unrecognized = File(directory, "$id.wav.unrecognized")
         val temporary = File(directory, ".$id.json.tmp")
-        val temporaries = directory.listFiles { file -> file.name.startsWith(".$id.") }.orEmpty().toList()
+        // A decoded request WAV belongs to its reader, which deletes it;
+        // nothing reads this take now, so none is live, but never sweep one.
+        val temporaries = directory.listFiles { file ->
+            file.name.startsWith(".$id.") && !file.name.endsWith(REQUEST_SUFFIX)
+        }.orEmpty().toList()
         generation++
         // Metadata goes last: until every payload file is gone it stays,
         // so an interrupted or failed delete (of an ephemeral take, too) is
@@ -247,7 +280,14 @@ class RecordingStore internal constructor(
             if (open.getAndSet(false)) {
                 synchronized(lock) {
                     val left = (pins[id] ?: 1) - 1
-                    if (left > 0) pins[id] = left else pins.remove(id)
+                    if (left > 0) {
+                        pins[id] = left
+                    } else {
+                        pins.remove(id)
+                        // The reader is done: a delete it held back goes
+                        // now; one that fails is finished at the next open.
+                        if (deferredDeletes.remove(id)) runCatching { removeFiles(id) }
+                    }
                 }
             }
         }
@@ -289,16 +329,36 @@ class RecordingStore internal constructor(
         }
     }
 
+    /**
+     * Writes the take's audio for an export named `.flac` ([flac]) or
+     * `.wav`: the stored FLAC, or the request WAV ([withRequestAudio]),
+     * byte for byte the original even if the take was compressed since the
+     * name was chosen. A `.flac` export takes its format and its bytes from
+     * one [openAudio], so it never holds WAV bytes: it throws instead.
+     */
+    fun exportAudio(id: String, flac: Boolean, output: OutputStream) {
+        if (!flac) {
+            withRequestAudio(id) { wav -> wav.inputStream().use { it.copyTo(output) } }
+            return
+        }
+        val stored = openAudio(id)
+        stored.stream.use { stream ->
+            if (!stored.flac) throw IOException("The recording audio is not stored as FLAC")
+            stream.copyTo(output)
+        }
+    }
+
     /** The take's audio at rest, opened (for playback and export); [flac] says which format it is. */
     class StoredAudio(val stream: FileInputStream, val flac: Boolean)
 
     /**
      * Opens the take's audio at rest under the store lock, so a compression
      * that publishes meanwhile cannot pull the file from under the caller:
-     * an open stream keeps reading a file that is unlinked later.
+     * an open stream keeps reading a file that is unlinked later. A take
+     * deleted while a reader holds its files opens no new stream.
      */
     fun openAudio(id: String): StoredAudio = synchronized(lock) {
-        requireValidId(id)
+        get(id)
         val wav = wavFile(id)
         if (wav.isFile) return StoredAudio(FileInputStream(wav), flac = false)
         StoredAudio(FileInputStream(flacFile(id)), flac = true)
@@ -630,7 +690,7 @@ class RecordingStore internal constructor(
     private fun allRecordings(): List<Recording> =
         directory.listFiles { file -> file.isFile && file.name.endsWith(".json") }
             .orEmpty()
-            .mapNotNull { file -> runCatching { decode(file) }.getOrNull() }
+            .mapNotNull { file -> runCatching { decode(file) }.getOrNull()?.takeUnless { it.deleted } }
 
     /**
      * At open, after [recoverInterrupted]: finishes what a crash left of
@@ -673,7 +733,12 @@ class RecordingStore internal constructor(
             val same = runCatching { verifyAgainstWav(flac, wav) }.isSuccess &&
                 runCatching { hasOwnHeader(wav) }.getOrDefault(false)
             synchronized(lock) {
+                val recording = runCatching { get(id) }.getOrNull()
                 when {
+                    // Deleted, or stamped by a retention removal: its files are
+                    // the delete's or the removal's to finish (the next open
+                    // finishes an unlink a removal left), never settled.
+                    recording == null || recording.audioRemoved != null -> unsettled -= id
                     // A delete or a retention removal settled it meanwhile.
                     !wav.isFile || !flac.isFile -> unsettled -= id
                     (pins[id] ?: 0) > 0 || stop() -> Unit
@@ -774,12 +839,13 @@ class RecordingStore internal constructor(
      * An ephemeral take still on disk at open time outlived the process that
      * dictated it (the store is opened once, at process start, before any
      * capture). Its field was private, so it is deleted rather than offered
-     * for retry.
+     * for retry. A take the user deleted while it was being read lost its
+     * process before its files went; they go now.
      */
-    private fun sweepEphemeral() {
+    private fun sweepDeleted() {
         directory.listFiles { file -> file.isFile && file.name.endsWith(".json") }
             ?.forEach { file ->
-                val id = runCatching { decode(file) }.getOrNull()?.takeIf { it.ephemeral }?.id
+                val id = runCatching { decode(file) }.getOrNull()?.takeIf { it.ephemeral || it.deleted }?.id
                 if (id != null) runCatching { delete(id) }
             }
     }
@@ -803,6 +869,7 @@ class RecordingStore internal constructor(
             .put("recovery", recording.recovery?.let(::encodeRecovery) ?: JSONObject.NULL)
             .put("retention_class", recording.retentionClass.key)
             .put("audio_removed", recording.audioRemoved?.let(::encodeRemoval) ?: JSONObject.NULL)
+            .put("deleted", recording.deleted)
 
         FileOutputStream(temporary).use { output ->
             output.write(json.toString().toByteArray(Charsets.UTF_8))
@@ -871,6 +938,7 @@ class RecordingStore internal constructor(
                 ?.let { key -> RetentionClass.entries.firstOrNull { it.key == key } }
                 ?: RetentionClass.STANDARD,
             audioRemoved = json.optJSONObject("audio_removed")?.let(::decodeRemoval),
+            deleted = json.optBoolean("deleted", false),
         )
     }
 
@@ -1122,6 +1190,7 @@ class RecordingStore internal constructor(
         private const val WAV_HEADER_BYTES = 44L
         private const val FLAC_TEMP_SUFFIX = ".flac.tmp"
         private const val REQUEST_SUFFIX = ".request.wav"
+        private const val NO_LONGER_AVAILABLE = "Recording is no longer available"
         private const val DAY_MILLIS = 24L * 60 * 60 * 1000
         private val UUID_PATTERN = Regex("[0-9a-fA-F-]{36}")
 
