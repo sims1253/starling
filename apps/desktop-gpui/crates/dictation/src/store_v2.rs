@@ -2036,8 +2036,11 @@ impl StoreV2 {
     /// that unlinks deliberately-deleted content. Policy (frozen, §4):
     /// a confirmed delete quarantines the journal and tombstones the row;
     /// the bytes stay on disk, recoverable, until this sweep is called.
-    /// Nothing here runs automatically: no read path, no reconcile, no
+    /// The store itself never calls it: no read path, no reconcile, no
     /// open ever sweeps (that is the never-delete-until-swept contract).
+    /// The desktop app calls it on every audio upkeep pass
+    /// (`crates/app/src/store.rs`, `audio_upkeep`), so deleted audio is
+    /// removed within about one upkeep interval of the delete (#342).
     ///
     /// What it sweeps, per tree:
     ///
