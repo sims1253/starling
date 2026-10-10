@@ -98,6 +98,10 @@ struct Script {
     bind_nothing: bool,
     /// The dialog never answers.
     bind_hangs: bool,
+    /// Right after a successful bind, the user removes the shortcut.
+    remove_after_bind: bool,
+    /// The desktop closes each session right after creating it.
+    close_after_create: bool,
     registered: Vec<String>,
     sessions: Vec<String>,
     closed: Vec<String>,
@@ -152,6 +156,19 @@ fn shortcut_entries(trigger: Option<&str>) -> ShortcutList {
 }
 
 /// The same list as a results-dict value.
+async fn close(connection: &zbus::Connection, session: &str) {
+    connection
+        .emit_signal(
+            None::<&str>,
+            session,
+            "org.freedesktop.portal.Session",
+            "Closed",
+            &(HashMap::<&str, Value>::new(),),
+        )
+        .await
+        .expect("emit Closed");
+}
+
 fn shortcut_list(trigger: Option<&str>) -> Value<'static> {
     Value::from(shortcut_entries(trigger))
 }
@@ -192,12 +209,15 @@ impl FakeGlobalShortcuts {
             HashMap::from([("session_handle", Value::from(session.clone()))]),
         )
         .await;
+        if self.0.lock().unwrap().close_after_create {
+            close(connection, &session).await;
+        }
         OwnedObjectPath::try_from(request).unwrap()
     }
 
     async fn bind_shortcuts(
         &self,
-        _session: ObjectPath<'_>,
+        session: ObjectPath<'_>,
         shortcuts: Vec<(String, HashMap<String, OwnedValue>)>,
         _parent_window: String,
         options: HashMap<String, OwnedValue>,
@@ -210,7 +230,7 @@ impl FakeGlobalShortcuts {
             .find(|(id, _)| id == "record")
             .and_then(|(_, info)| info.get("preferred_trigger"))
             .and_then(|value| String::try_from(value.clone()).ok());
-        let (code, trigger, nothing, hangs) = {
+        let (code, trigger, nothing, hangs, remove) = {
             let mut script = self.0.lock().unwrap();
             script.preferred.push(preferred);
             (
@@ -218,8 +238,10 @@ impl FakeGlobalShortcuts {
                 script.bound_trigger.clone(),
                 script.bind_nothing,
                 script.bind_hangs,
+                script.remove_after_bind,
             )
         };
+        let session = session.to_string();
         if hangs {
             return OwnedObjectPath::try_from(request).unwrap();
         }
@@ -237,6 +259,19 @@ impl FakeGlobalShortcuts {
                     HashMap::new()
                 };
                 respond(&connection, &reply_path, code, results).await;
+                if remove {
+                    // Back to back with the response.
+                    connection
+                        .emit_signal(
+                            None::<&str>,
+                            PATH,
+                            INTERFACE,
+                            "ShortcutsChanged",
+                            &(ObjectPath::try_from(session.as_str()).unwrap(), ShortcutList::new()),
+                        )
+                        .await
+                        .unwrap();
+                }
             });
         });
         OwnedObjectPath::try_from(request).unwrap()
@@ -743,6 +778,118 @@ fn losing_the_bus_mid_hold_releases_and_reports_it() {
         matches!(status, PortalStatus::Unavailable(_))
     });
     assert!(matches!(events[..], [GlobalEvent::Pressed(_), GlobalEvent::Released(_)]), "{events:?}");
+}
+
+#[test]
+fn a_session_closed_while_the_dialog_is_open_ends_the_wait() {
+    let bus = private_bus!();
+    let (portal, script) = fake_portal(
+        &bus,
+        Script {
+            bind_hangs: true,
+            ..bound_script()
+        },
+    );
+    let mut client = PortalShortcuts::spawn(Some(bus.address.clone()), None, &shortcut("F9"));
+    let mut events = Vec::new();
+    wait_for(&mut client, &mut events, "needs setup", |status, _| status.can_set_up());
+    client.set_up(&shortcut("F9"));
+    wait_for(&mut client, &mut events, "binding", |status, _| *status == PortalStatus::Binding);
+    let session = script.lock().unwrap().sessions[0].clone();
+    portal
+        .emit_signal(
+            None::<&str>,
+            session.as_str(),
+            "org.freedesktop.portal.Session",
+            "Closed",
+            &(HashMap::<&str, Value>::new(),),
+        )
+        .unwrap();
+    wait_for(&mut client, &mut events, "lost", |status, _| {
+        matches!(status, PortalStatus::Lost { reason, .. } if reason.contains("closed"))
+    });
+    // The worker is free again: a new set-up binds in a new session.
+    script.lock().unwrap().bind_hangs = false;
+    client.set_up(&shortcut("F9"));
+    wait_for(&mut client, &mut events, "bound", |status, _| status.is_bound());
+    assert_eq!(script.lock().unwrap().sessions.len(), 2);
+}
+
+#[test]
+fn a_removal_right_after_the_bind_response_is_not_lost() {
+    let bus = private_bus!();
+    let (_portal, _script) = fake_portal(
+        &bus,
+        Script {
+            remove_after_bind: true,
+            ..bound_script()
+        },
+    );
+    let mut client = PortalShortcuts::spawn(Some(bus.address.clone()), None, &shortcut("F9"));
+    let mut events = Vec::new();
+    wait_for(&mut client, &mut events, "needs setup", |status, _| status.can_set_up());
+    client.set_up(&shortcut("F9"));
+    wait_for(&mut client, &mut events, "removed", |status, _| {
+        matches!(status, PortalStatus::Lost { reason, .. } if reason.contains("removed"))
+    });
+    std::thread::sleep(Duration::from_millis(100));
+    while client.next_event().is_some() {}
+    assert!(!client.is_bound(), "{:?}", client.status());
+}
+
+#[test]
+fn a_session_closed_right_after_creation_is_not_used() {
+    let bus = private_bus!();
+    let (_portal, script) = fake_portal(
+        &bus,
+        Script {
+            close_after_create: true,
+            ..bound_script()
+        },
+    );
+    let mut client = PortalShortcuts::spawn(Some(bus.address.clone()), None, &shortcut("F9"));
+    let mut events = Vec::new();
+    // Depending on whether `Closed` is handled before CreateSession's
+    // caller looks: the session is refused outright, or it ends right
+    // after and the worker waits for set-up. Never bound on it.
+    wait_for(&mut client, &mut events, "settled", |status, _| {
+        matches!(status, PortalStatus::Unavailable(reason) if reason.contains("closed it"))
+            || matches!(status, PortalStatus::NeedsSetup { .. })
+    });
+    assert!(script.lock().unwrap().preferred.is_empty());
+    if client.status().can_set_up() {
+        script.lock().unwrap().close_after_create = false;
+        client.set_up(&shortcut("F9"));
+        wait_for(&mut client, &mut events, "bound", |status, _| status.is_bound());
+        // The bind went to a fresh session, not the closed one.
+        assert_eq!(script.lock().unwrap().sessions.len(), 2);
+    }
+}
+
+#[test]
+fn losing_the_bus_during_the_dialog_leaves_it_unavailable() {
+    let mut bus = private_bus!();
+    let (_portal, _script) = fake_portal(
+        &bus,
+        Script {
+            bind_hangs: true,
+            ..bound_script()
+        },
+    );
+    let mut client = PortalShortcuts::spawn(Some(bus.address.clone()), None, &shortcut("F9"));
+    let mut events = Vec::new();
+    wait_for(&mut client, &mut events, "needs setup", |status, _| status.can_set_up());
+    client.set_up(&shortcut("F9"));
+    wait_for(&mut client, &mut events, "binding", |status, _| *status == PortalStatus::Binding);
+    let _ = bus.child.kill();
+    let _ = bus.child.wait();
+    wait_for(&mut client, &mut events, "unavailable", |status, _| {
+        matches!(status, PortalStatus::Unavailable(_))
+    });
+    std::thread::sleep(Duration::from_millis(200));
+    while client.next_event().is_some() {}
+    // Nothing overwrote it with a state that offers set-up again.
+    assert!(matches!(client.status(), PortalStatus::Unavailable(_)), "{:?}", client.status());
 }
 
 // ---- Through the real xdg-desktop-portal frontend ---------------------------

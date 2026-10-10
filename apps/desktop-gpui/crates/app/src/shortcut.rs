@@ -394,6 +394,15 @@ pub(crate) enum GlobalEvent {
     Escape(Instant),
 }
 
+impl GlobalEvent {
+    /// When the event was received.
+    pub(crate) fn at(self) -> Instant {
+        match self {
+            GlobalEvent::Pressed(at) | GlobalEvent::Released(at) | GlobalEvent::Escape(at) => at,
+        }
+    }
+}
+
 /// One physical press from one source: which of the X11 grab's events go
 /// to the machine once the desktop portal may own the shortcut. While the
 /// portal holds a binding, the grab's presses are dropped — but a press

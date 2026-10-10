@@ -571,6 +571,13 @@ pub(crate) fn finish_hint(latch: Option<Latch>, shortcut: &str) -> Option<String
 
 // ---- App glue -------------------------------------------------------------
 
+/// A system-wide input before it is judged: the X11 grab's raw event
+/// (classified when processed), or a portal edge.
+enum SystemInput {
+    Grab(crate::shortcut::RawEvent),
+    Portal(GlobalEvent),
+}
+
 impl StarlingApp {
     /// Takes ownership of the system-wide shortcut registrations (#221),
     /// registers the configured shortcut, and starts the loop that feeds
@@ -671,29 +678,45 @@ impl StarlingApp {
             portal.poll();
             portal.is_bound()
         });
-        while let Some(shortcuts) = self.global_shortcuts.as_mut() {
-            let Some(raw) = shortcuts.next_raw() else {
-                break;
-            };
-            let Some(event) = shortcuts.classify(raw) else {
-                continue;
-            };
-            if !self.system_event_is_ours(event) {
-                continue;
-            }
-            let Some(shortcuts) = self.global_shortcuts.as_mut() else {
-                break;
-            };
-            if !shortcuts.gate.admit(event, portal_bound) {
-                continue;
-            }
-            self.system_event(event, cx);
+        // Both sources in the order they were received (each is already
+        // in order; the sort is stable), so a portal press never lands
+        // after an X11 Escape that came later. X11 events are still
+        // classified only when processed: an earlier event in the batch
+        // may have swapped the shortcut or released the Escape grabs.
+        let mut received: Vec<(Instant, SystemInput)> = Vec::new();
+        while let Some(raw) = self.global_shortcuts.as_mut().and_then(|s| s.next_raw()) {
+            received.push((raw.2, SystemInput::Grab(raw)));
         }
         // The portal's edges are never the focused window's own keys seen
         // twice (the desktop consumes a bound shortcut), so no focus
         // filter applies; a desktop that also forwards them to the
         // Starling window is covered by the machine's repeat rule.
         while let Some(event) = self.portal_shortcuts.as_mut().and_then(|p| p.next_event()) {
+            received.push((event.at(), SystemInput::Portal(event)));
+        }
+        received.sort_by_key(|(at, _)| *at);
+        for (_, input) in received {
+            let event = match input {
+                SystemInput::Portal(event) => event,
+                SystemInput::Grab(raw) => {
+                    let Some(shortcuts) = self.global_shortcuts.as_ref() else {
+                        continue;
+                    };
+                    let Some(event) = shortcuts.classify(raw) else {
+                        continue;
+                    };
+                    if !self.system_event_is_ours(event) {
+                        continue;
+                    }
+                    let Some(shortcuts) = self.global_shortcuts.as_mut() else {
+                        continue;
+                    };
+                    if !shortcuts.gate.admit(event, portal_bound) {
+                        continue;
+                    }
+                    event
+                }
+            };
             self.system_event(event, cx);
         }
         if self
