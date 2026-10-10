@@ -4,6 +4,7 @@ import android.content.Context
 import dev.starling.mobile.audio.WavWriter
 import dev.starling.mobile.data.AudioRemoval
 import dev.starling.mobile.data.CaptureRecovery
+import dev.starling.mobile.data.DerivedRevision
 import dev.starling.mobile.data.Recording
 import dev.starling.mobile.data.RecordingStatus
 import dev.starling.mobile.data.RetentionClass
@@ -216,6 +217,14 @@ class RecordingStore internal constructor(
                 revisions = it.revisions + TranscriptRevision(rawTranscript, provenance, source, model, clock()),
             )
         }
+    }
+
+    /**
+     * Records text that was delivered in a form derived from the take's text
+     * (#341). The transcript and its revisions stay as they are.
+     */
+    fun addDerived(id: String, revision: DerivedRevision): Recording = synchronized(lock) {
+        update(id) { it.copy(derived = it.derived + revision) }
     }
 
     /**
@@ -882,6 +891,7 @@ class RecordingStore internal constructor(
             .put("retention_class", recording.retentionClass.key)
             .put("audio_removed", recording.audioRemoved?.let(::encodeRemoval) ?: JSONObject.NULL)
             .put("deleted", recording.deleted)
+            .put("derived", JSONArray(recording.derived.map(::encodeDerived)))
 
         FileOutputStream(temporary).use { output ->
             output.write(json.toString().toByteArray(Charsets.UTF_8))
@@ -951,6 +961,9 @@ class RecordingStore internal constructor(
                 ?: RetentionClass.STANDARD,
             audioRemoved = json.optJSONObject("audio_removed")?.let(::decodeRemoval),
             deleted = json.optBoolean("deleted", false),
+            derived = json.optJSONArray("derived")
+                ?.let { array -> (0 until array.length()).mapNotNull { decodeDerived(array.getJSONObject(it)) } }
+                .orEmpty(),
         )
     }
 
@@ -977,6 +990,24 @@ class RecordingStore internal constructor(
             provenance = TranscriptionProvenance.valueOf(json.getString("provenance")),
             source = json.optionalString("source")?.let { runCatching { TranscriptSource.valueOf(it) }.getOrNull() },
             model = json.optionalString("model"),
+            createdAtMillis = json.getLong("created_at_ms"),
+        )
+    }.getOrNull()
+
+    private fun encodeDerived(revision: DerivedRevision): JSONObject = JSONObject()
+        .put("text", revision.text)
+        .put("derived_from", revision.derivedFrom)
+        .put("provenance", revision.provenance)
+        .put("changes", JSONArray(revision.changes))
+        .put("created_at_ms", revision.createdAtMillis)
+
+    private fun decodeDerived(json: JSONObject): DerivedRevision? = runCatching {
+        val changes = json.getJSONArray("changes")
+        DerivedRevision(
+            text = json.getString("text"),
+            derivedFrom = json.getString("derived_from"),
+            provenance = json.getString("provenance"),
+            changes = (0 until changes.length()).map(changes::getString),
             createdAtMillis = json.getLong("created_at_ms"),
         )
     }.getOrNull()

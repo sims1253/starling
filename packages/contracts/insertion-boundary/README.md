@@ -10,9 +10,10 @@ The raw recognition text is never edited: the runtime delivers the
 adjustment as a separate revision derived from the raw one (`provenance:
 "insertion-boundary"`).
 
-The Python oracle (`tests/insertion_boundary.py`) and the Rust port
-(`starling-processing`'s `boundary` module) both replay
-`fixtures/boundary-cases.json`.
+The Python oracle (`tests/insertion_boundary.py`), the Rust port
+(`starling-processing`'s `boundary` module) and the Kotlin port in the
+Android keyboard (`apps/mobile`, `processing/InsertionBoundary.kt`) all
+replay `fixtures/boundary-cases.json`.
 
 ## Inputs and outputs
 
@@ -106,6 +107,21 @@ sent to any processing provider.
   delivers that; a stale adjustment is never delivered. A target that
   stops reporting text by apply time gets the requested text unchanged.
 
+## Delivery (Android keyboard)
+
+- The keyboard (`ui/BoundaryDelivery.kt`) reads `getTextBeforeCursor` and
+  `getTextAfterCursor` right before its single `commitText`; password
+  variations and `IME_FLAG_NO_PERSONALIZED_LEARNING` fields are never read,
+  and verbatim modes skip the read. A field whose whole text equals its
+  `EditorInfo.hintText` is `showing_hint`.
+- Live composing text gets the boundary read when the composing region
+  starts; the final re-reads, with the take's own composing text cut from
+  the text before the cursor (when the cursor has left that region, the
+  boundary is unknown and the text goes in unchanged).
+- An adjusted delivery is stored on the recording as a derived revision
+  (`provenance: "insertion-boundary"`, the rule kinds, the text it was
+  derived from); the transcript and its revisions are not edited.
+
 ## Files
 
 | File | Role |
@@ -116,4 +132,5 @@ sent to any processing provider.
 ```
 uv run python -m pytest tests/test_insertion_boundary.py -q
 cd apps/desktop-gpui && cargo test -p starling-processing --test boundary_conformance
+cd apps/mobile && ./gradlew :app:testDebugUnitTest --tests '*InsertionBoundaryConformanceTest'
 ```

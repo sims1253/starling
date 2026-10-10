@@ -905,19 +905,42 @@ class MainActivity : Activity() {
             transcript.visibility = View.GONE
         }
         // Retries add results; the earlier ones stay with the recording.
+        // Text inserted in an adjusted form (#341) is listed beside them;
+        // the transcript above stays as recognized.
         val earlier = recording.revisions.dropLast(1)
-        revisionsView.visibility = if (earlier.isEmpty()) View.GONE else View.VISIBLE
-        revisionsView.text = earlier.reversed().joinToString(
-            separator = "\n",
-            prefix = getString(R.string.revisions_heading) + "\n",
-        ) { revision ->
-            getString(
-                R.string.revision_line,
-                DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT).format(Date(revision.createdAtMillis)),
-                revisionSource(revision),
-                revision.text,
-            )
-        }
+        val time = DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT)
+        val sections = listOfNotNull(
+            earlier.takeIf { it.isNotEmpty() }?.reversed()?.joinToString(
+                separator = "\n",
+                prefix = getString(R.string.revisions_heading) + "\n",
+            ) { revision ->
+                getString(
+                    R.string.revision_line,
+                    time.format(Date(revision.createdAtMillis)),
+                    revisionSource(revision),
+                    revision.text,
+                )
+            },
+            recording.derived.takeIf { it.isNotEmpty() }?.reversed()?.joinToString(
+                separator = "\n",
+                prefix = getString(R.string.derived_heading) + "\n",
+            ) { derived ->
+                getString(
+                    R.string.derived_line,
+                    time.format(Date(derived.createdAtMillis)),
+                    derived.changes.joinToString(", ") { change ->
+                        when (change) {
+                            "leading_space" -> getString(R.string.derived_leading_space)
+                            "first_letter_case" -> getString(R.string.derived_first_letter_case)
+                            else -> change
+                        }
+                    },
+                    derived.text,
+                )
+            },
+        )
+        revisionsView.visibility = if (sections.isEmpty()) View.GONE else View.VISIBLE
+        revisionsView.text = sections.joinToString("\n")
 
         // Only the audio goes when the retention policy removes it (#342).
         val removal = recording.audioRemoved

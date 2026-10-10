@@ -1,6 +1,7 @@
 package dev.starling.mobile
 
 import dev.starling.mobile.audio.WavWriter
+import dev.starling.mobile.data.DerivedRevision
 import dev.starling.mobile.data.RecordingStatus
 import dev.starling.mobile.data.TranscriptSource
 import dev.starling.mobile.data.TranscriptionProvenance
@@ -455,5 +456,27 @@ class RecordingStoreRecoveryTest {
         val reopened = RecordingStore(storeDir()).get(id)
         assertEquals("new text", reopened.rawTranscript)
         assertEquals(listOf("old text", "new text"), reopened.revisions.map { it.text })
+    }
+
+    @Test
+    fun aBoundaryAdjustedDeliveryIsADerivedRevisionBesideTheTranscript() {
+        val store = RecordingStore(storeDir())
+        val recording = store.create()
+        store.markTranscribed(recording.id, "Fox jumps")
+        store.addDerived(
+            recording.id,
+            DerivedRevision(" fox jumps", "Fox jumps", DerivedRevision.INSERTION_BOUNDARY, listOf("leading_space", "first_letter_case"), 5_000L),
+        )
+
+        val reopened = RecordingStore(storeDir()).get(recording.id)
+        // The transcript and its revisions are byte-for-byte as recognized.
+        assertEquals("Fox jumps", reopened.rawTranscript)
+        assertEquals(listOf("Fox jumps"), reopened.revisions.map { it.text })
+        val derived = reopened.derived.single()
+        assertEquals(" fox jumps", derived.text)
+        assertEquals("Fox jumps", derived.derivedFrom)
+        assertEquals(DerivedRevision.INSERTION_BOUNDARY, derived.provenance)
+        assertEquals(listOf("leading_space", "first_letter_case"), derived.changes)
+        assertEquals(5_000L, derived.createdAtMillis)
     }
 }
