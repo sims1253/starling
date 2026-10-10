@@ -1548,8 +1548,10 @@ impl StarlingApp {
                 .await
             };
             this.update(cx, |app, cx| match loaded {
-                // Superseded by a newer choice: the pin drops, nothing runs.
-                _ if app.retry_seq != seq => {}
+                // Superseded by a newer choice, or the take was deleted
+                // while its audio loaded: the pin drops, nothing runs.
+                _ if app.retry_seq != seq
+                    || !app.sessions.iter().any(|session| session.id == id) => {}
                 Ok(Some((wav, pin))) => match with {
                     RetryWith::Current => {
                         let target = app.resolve_take_target();
@@ -1560,7 +1562,7 @@ impl StarlingApp {
                         app.retry_on(id, wav, target, pin, cx);
                     }
                     RetryWith::Model(model_id) => {
-                        app.retry_after_switch(id, model_id, wav, pin, cx);
+                        app.retry_after_switch(id, model_id, seq, wav, pin, cx);
                     }
                 },
                 Ok(None) => {
@@ -1585,6 +1587,7 @@ impl StarlingApp {
         &mut self,
         id: String,
         model_id: String,
+        seq: u64,
         wav: Arc<Vec<u8>>,
         pin: AudioPin,
         cx: &mut Context<Self>,
@@ -1607,6 +1610,7 @@ impl StarlingApp {
         let pending = PendingRetry {
             take_id: id.clone(),
             model_id: model_id.clone(),
+            seq,
         };
         self.pending_retry = Some(pending.clone());
         cx.notify();
@@ -1749,6 +1753,9 @@ pub(crate) struct RetryChoice {
 pub(crate) struct PendingRetry {
     pub take_id: String,
     pub model_id: String,
+    /// The request's `retry_seq`: a newer request for the same take and
+    /// model is a different wait.
+    pub seq: u64,
 }
 
 /// Where an engine switch a retry waits on stands.
@@ -1824,13 +1831,50 @@ pub(crate) fn request_timeout_ms(wav_bytes: usize) -> u64 {
     (BASE_MS + audio_ms).min(MAX_MS)
 }
 
-/// The second look at the recorder's tree (#356): a journal the startup
-/// pass left to a save that may have been under way is recovered once
-/// that save would long have finished, in this launch rather than the
-/// next.
+/// Surfaces what startup recovery found: problems in the error banner,
+/// takes brought back in a notice. Returns the journal ids to look at
+/// again (see [`recheck_capture_journals`]).
+pub(crate) fn show_startup_recovery(
+    this: &WeakEntity<StarlingApp>,
+    recovery: crate::store::StartupRecovery,
+    cx: &mut AsyncApp,
+) -> Vec<String> {
+    let crate::store::StartupRecovery {
+        summary,
+        notice,
+        recheck,
+        failure,
+    } = recovery;
+    let error = [
+        failure.map(|err| format!("Could not recover interrupted recordings: {err}")),
+        (!summary.is_empty()).then_some(summary),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(" ");
+    this.update(cx, |app, cx| {
+        if !error.is_empty() {
+            app.error = Some(error);
+        }
+        if !notice.is_empty() {
+            app.recovery_notice = Some(notice);
+        }
+        cx.notify();
+    })
+    .ok();
+    recheck
+}
+
+/// The second look at the recorder's tree (#356): journals the startup
+/// pass left to a writer or a save that may have been under way are
+/// recovered once that save would long have finished, in this launch
+/// rather than the next. Only those ids: a take this launch started
+/// recording since is never a recovery candidate.
 pub(crate) async fn recheck_capture_journals(
     this: &WeakEntity<StarlingApp>,
     store: &Store,
+    ids: Vec<String>,
     cx: &mut AsyncApp,
 ) {
     cx.background_executor()
@@ -1838,8 +1882,10 @@ pub(crate) async fn recheck_capture_journals(
         .await;
     let recovered = {
         let store = store.clone();
-        cx.background_spawn(async move { store.recover_capture_journals() })
-            .await
+        cx.background_spawn(async move {
+            store.recover_capture_journals(|id| ids.iter().any(|wanted| wanted == id))
+        })
+        .await
     };
     let (problems, notice) = match recovered {
         Ok(recovery) => (recovery.problems(), recovery.recovered_summary()),
@@ -2531,6 +2577,36 @@ mod tests {
             offered,
             Some((Failure::Retried, "second words".to_string(), None))
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A take deleted while its retry's audio loads is not retried: no
+    /// attempt, and its audio is not stashed back as "unsaved".
+    #[gpui::test]
+    fn a_take_deleted_while_its_retry_loads_is_left_deleted(cx: &mut gpui::TestAppContext) {
+        let root = scratch("deleted-mid-load");
+        let store = Store::at_test_root(&root);
+        let id = store.save_capture(one_second_wav(), None).expect("save").id;
+        let (addr, served) = fake_server(vec![Reply::Text("never")]);
+        let app = cx.new(|cx| {
+            let mut app = StarlingApp::for_test(Some(store.clone()), cx);
+            app.endpoint = format!("http://{addr}");
+            app.apply_sessions(store.list().expect("list"));
+            app.selected_id = Some(id.clone());
+            app
+        });
+        app.update(cx, |app, cx| {
+            app.retry_selected_with(RetryWith::Server, cx);
+            // The confirmed delete lands before the load finishes.
+            store.delete(&id).expect("delete");
+            app.apply_sessions(store.list().expect("list"));
+        });
+        cx.run_until_parked();
+        assert_eq!(*served.lock().unwrap(), 0, "nothing was sent");
+        app.read_with(cx, |app, _| {
+            assert!(app.unsaved.is_empty(), "the deleted audio is not resurrected");
+            assert!(!app.active_ids.contains(&id));
+        });
         let _ = std::fs::remove_dir_all(&root);
     }
 

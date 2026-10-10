@@ -133,10 +133,31 @@ impl FileSink {
         let _ = crate::store_v2::try_flock_exclusive(&file);
         // A hard link publishes the name atomically and fails on anything
         // already there (a file or a planted symlink) — `create_new`
-        // semantics for the real name.
-        let linked = std::fs::hard_link(&creating, &path);
-        let _ = std::fs::remove_file(&creating);
-        linked?;
+        // semantics for the real name. A filesystem without hard links
+        // (FAT/exFAT) gets a rename after an existence check instead:
+        // the check-to-rename window is the only thing lost there.
+        let published = match std::fs::hard_link(&creating, &path) {
+            Ok(()) => {
+                // Published; a leftover scratch name is only clutter.
+                let _ = std::fs::remove_file(&creating);
+                Ok(())
+            }
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Err(err),
+            Err(_) => match std::fs::symlink_metadata(&path) {
+                Ok(_) => Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("journal {} already exists", path.display()),
+                )),
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                    std::fs::rename(&creating, &path)
+                }
+                Err(err) => Err(err),
+            },
+        };
+        if let Err(err) = published {
+            let _ = std::fs::remove_file(&creating);
+            return Err(err);
+        }
         // The header write that follows fsyncs the directory, making the
         // rename durable with it.
         Ok((Self { file, dir: dir.to_path_buf() }, path))

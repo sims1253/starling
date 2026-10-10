@@ -3709,6 +3709,17 @@ impl StoreV2 {
         &mut self,
         journals_dir: &Path,
     ) -> Result<JournalRecovery, StoreV2Error> {
+        self.recover_capture_journals_where(journals_dir, |_| true)
+    }
+
+    /// [`Self::recover_capture_journals`] limited to the journal ids
+    /// `wanted` accepts — a second look at the ones an earlier pass
+    /// deferred, without making candidates of takes recorded since.
+    pub fn recover_capture_journals_where(
+        &mut self,
+        journals_dir: &Path,
+        wanted: impl Fn(&str) -> bool,
+    ) -> Result<JournalRecovery, StoreV2Error> {
         let mut report = JournalRecovery::default();
         let Ok(entries) = std::fs::read_dir(journals_dir) else {
             return Ok(report);
@@ -3729,7 +3740,7 @@ impl StoreV2 {
             else {
                 continue;
             };
-            if !is_safe_path_component(&id) {
+            if !is_safe_path_component(&id) || !wanted(&id) {
                 continue;
             }
             // The probe's handle keeps the lock through the adoption, so

@@ -1205,37 +1205,13 @@ impl StarlingApp {
                     let store = store.clone();
                     cx.background_spawn(async move { store.startup_recovery() }).await
                 };
-                let mut recheck = false;
-                match recovered {
-                    Ok(recovery) => {
-                        recheck = recovery.recheck;
-                        this.update(cx, |app, cx| {
-                            if !recovery.summary.is_empty() {
-                                app.error = Some(recovery.summary);
-                            }
-                            if !recovery.notice.is_empty() {
-                                app.recovery_notice = Some(recovery.notice);
-                            }
-                            cx.notify();
-                        })
-                        .ok();
-                    }
-                    Err(err) => {
-                        this.update(cx, |app, cx| {
-                            app.error = Some(format!(
-                                "Could not recover interrupted recordings: {err}"
-                            ));
-                            cx.notify();
-                        })
-                        .ok();
-                    }
-                }
+                let recheck = crate::upload::show_startup_recovery(&this, recovered, cx);
 
                 refresh_sessions(&this, &store, cx).await;
                 // #342: compression and retention after recovery settled.
                 this.update(cx, |app, cx| app.start_audio_upkeep(cx)).ok();
-                if recheck {
-                    crate::upload::recheck_capture_journals(&this, &store, cx).await;
+                if !recheck.is_empty() {
+                    crate::upload::recheck_capture_journals(&this, &store, recheck, cx).await;
                 }
             })
             .detach();

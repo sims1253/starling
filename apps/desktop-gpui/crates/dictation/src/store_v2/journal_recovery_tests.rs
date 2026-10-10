@@ -255,3 +255,29 @@ fn the_retention_sweep_empties_superseded_journals() {
     assert_eq!(report.swept.len(), 1, "{report:?}");
     assert!(!tree.join(SUPERSEDED_SUBDIR).join("j_partial.sj").exists());
 }
+
+#[test]
+fn a_second_look_considers_only_the_journals_it_is_asked_about() {
+    // The delayed recheck must not make a candidate of a take recorded
+    // since startup (its journal may have lost its lock to a fault while
+    // capture continues in memory).
+    let dir = TempDir::new().expect("tempdir");
+    let mut store = store_in(&dir);
+    let tree = journals(&dir);
+    for id in ["j_deferred", "j_recorded_since"] {
+        let path = {
+            let mut writer =
+                JournalWriter::create_named(&tree, id.to_string(), 16_000).expect("writer");
+            writer.append_frames(&ramp(1_600, 0)).expect("append");
+            writer.write_boundary().expect("boundary");
+            writer.path().to_path_buf()
+        };
+        age(&path, old());
+    }
+    let report = store
+        .recover_capture_journals_where(&tree, |id| id == "j_deferred")
+        .expect("scan");
+    assert_eq!(report.recovered.len(), 1, "{report:?}");
+    assert_eq!(report.recovered[0].id, "j_deferred");
+    assert!(tree.join("j_recorded_since.sj").exists());
+}

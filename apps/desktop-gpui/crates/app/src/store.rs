@@ -736,13 +736,13 @@ impl Store {
     }
 
     /// The startup recovery pass: reconcile journals against the metadata
-    /// rows (§4), then fail recognition attempts still marked started by a
-    /// previous run. Returns a user-facing summary string, empty when
-    /// there was nothing to report. The two repairs are independent
-    /// (journal state vs. recognition-attempt rows), so both always run —
-    /// a reconciliation failure must not strand records stuck in
-    /// "Transcribing", and vice versa; when both fail the errors combine.
-    pub(crate) fn startup_recovery(&self) -> Result<StartupRecovery, storage::StorageError> {
+    /// rows (§4), fail recognition attempts still marked started by a
+    /// previous run, and bring back takes left in the recorder's tree
+    /// (#356). The three repairs are independent, so all always run — a
+    /// reconciliation failure must not strand records stuck in
+    /// "Transcribing" or hide a recovered take, and vice versa; the
+    /// failures of the first two combine in [`StartupRecovery::failure`].
+    pub(crate) fn startup_recovery(&self) -> StartupRecovery {
         /// The note a stale recognition attempt gets at startup — same
         /// wording as the v1 "stuck in Transcribing" fix.
         const STALE_ATTEMPT_NOTE: &str =
@@ -754,54 +754,60 @@ impl Store {
                 store.interrupt_stale_attempts(STALE_ATTEMPT_NOTE),
             )
         };
-        // #356: takes whose app stopped mid-recording (or between stop and
-        // save) are still journals in the recorder's tree; they come back
-        // as interrupted takes. Independent of the two repairs above.
-        let (journals, notice, recheck) = match self.recover_capture_journals() {
+        let (journals, notice, recheck) = match self.recover_capture_journals(|_| true) {
             Ok(recovery) => (
                 recovery.problems(),
                 recovery.recovered_summary(),
-                !recovery.deferred.is_empty(),
+                recovery.deferred,
             ),
             Err(err) => (
                 format!("Could not scan for interrupted recordings: {err}"),
                 String::new(),
-                false,
+                Vec::new(),
             ),
         };
-        match (reconciled.map_err(v2_err), staled.map_err(v2_err)) {
-            (Ok(report), Ok(_)) => {
-                let summary = if report.has_findings() {
+        let (summary, failure) = match (reconciled.map_err(v2_err), staled.map_err(v2_err)) {
+            (Ok(report), Ok(_)) => (
+                if report.has_findings() {
                     report.summary()
                 } else {
                     String::new()
-                };
-                Ok(StartupRecovery {
-                    summary: [summary, journals]
-                        .into_iter()
-                        .filter(|part| !part.is_empty())
-                        .collect::<Vec<_>>()
-                        .join(" "),
-                    notice,
-                    recheck,
-                })
-            }
-            (Err(reconcile_err), Err(stale_err)) => Err(storage::StorageError::Invalid(format!(
-                "{reconcile_err}; {stale_err}"
-            ))),
-            (Err(err), Ok(_)) | (Ok(_), Err(err)) => Err(err),
+                },
+                None,
+            ),
+            (Err(reconcile_err), Err(stale_err)) => (
+                String::new(),
+                Some(storage::StorageError::Invalid(format!(
+                    "{reconcile_err}; {stale_err}"
+                ))),
+            ),
+            (Err(err), Ok(_)) | (Ok(_), Err(err)) => (String::new(), Some(err)),
+        };
+        StartupRecovery {
+            summary: [summary, journals]
+                .into_iter()
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>()
+                .join(" "),
+            notice,
+            recheck,
+            failure,
         }
     }
 
     /// The recorder-tree half of startup recovery (#356), also run once
     /// more when the startup pass left a just-finished journal to a save
     /// that may still have been under way.
+    /// `wanted` picks the journal ids to consider: everything at startup,
+    /// only the ones startup deferred on the second look — a take that
+    /// started recording since belongs to this launch, not to recovery.
     pub(crate) fn recover_capture_journals(
         &self,
+        wanted: impl Fn(&str) -> bool,
     ) -> Result<store_v2::JournalRecovery, storage::StorageError> {
         let mut store = lock_v2(&self.0);
         let dir = capture_journals_dir(&store);
-        store.recover_capture_journals(&dir).map_err(v2_err)
+        store.recover_capture_journals_where(&dir, wanted).map_err(v2_err)
     }
 
     /// Write a take from decoded PCM through the §4 protocol with the
@@ -836,9 +842,12 @@ pub(crate) struct StartupRecovery {
     /// Takes brought back from the recorder's tree, for a notice; empty
     /// when there were none.
     pub notice: String,
-    /// The recorder's tree held journals left to a live writer or save:
-    /// look again once [`store_v2::FINALIZED_ADOPTION_GRACE`] has passed.
-    pub recheck: bool,
+    /// Journals in the recorder's tree left to a live writer or save:
+    /// look at these again once [`store_v2::FINALIZED_ADOPTION_GRACE`]
+    /// has passed.
+    pub recheck: Vec<String>,
+    /// Reconciliation or the stale-attempt repair failed.
+    pub failure: Option<storage::StorageError>,
 }
 
 /// A [`Store::pin_audio`] guard. Dropping it takes the store lock: never
@@ -1841,7 +1850,7 @@ mod tests {
         drop(owner);
 
         let store = reopen_v2(&root);
-        let summary = store.startup_recovery().expect("recovery").summary;
+        let summary = store.startup_recovery().summary;
         assert!(summary.is_empty(), "a healthy store has nothing to say");
 
         // After the pass the stale attempt is failed, ready to retry.
@@ -1865,7 +1874,7 @@ mod tests {
             .expect("begin");
 
         let sweeper = reopen_v2(&root);
-        let summary = sweeper.startup_recovery().expect("recovery").summary;
+        let summary = sweeper.startup_recovery().summary;
         assert!(summary.is_empty(), "nothing to report while the owner lives");
         assert_eq!(
             session_status(&sweeper, &id),
@@ -2234,7 +2243,7 @@ mod tests {
         }
 
         assert!(
-            store.startup_recovery().is_err(),
+            store.startup_recovery().failure.is_some(),
             "the sabotaged reconciliation must surface its error"
         );
         // …but the stale attempt was still repaired: the stuck take is
@@ -2335,7 +2344,7 @@ mod tests {
         std::fs::remove_file(&staging).expect("unblock");
         drop(store);
         let relaunched = reopen_v2(&root);
-        let summary = relaunched.startup_recovery().expect("recovery").notice;
+        let summary = relaunched.startup_recovery().notice;
         assert!(summary.contains("Recovered 1 recording"), "{summary}");
         let take = summary_of(&relaunched, "j_full_disk");
         assert_eq!(take.status, SessionStatus::Interrupted);
@@ -2351,7 +2360,7 @@ mod tests {
         drop(store);
 
         let store = reopen_v2(&root);
-        let summary = store.startup_recovery().expect("recovery").notice;
+        let summary = store.startup_recovery().notice;
         assert!(summary.contains("Recovered 1 recording"), "{summary}");
 
         let take = summary_of(&store, "j_killed");
