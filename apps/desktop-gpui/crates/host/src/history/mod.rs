@@ -250,10 +250,25 @@ impl<C: StoreCall> HistoryClient<C> {
                 .map_err(|err| invalid(format!("the request does not serialize: {err}")))?;
             if json.len() > self.0.chunk_bytes() {
                 let upload = self.upload(&json)?;
-                return self.0.call(StoreRequest::Uploaded { upload });
+                return self.consume(upload, |upload| StoreRequest::Uploaded { upload });
             }
         }
         self.0.call(request)
+    }
+
+    /// Sends the request that consumes `upload`; when it fails (the host
+    /// may not have taken it), the upload is dropped rather than left
+    /// holding one of the connection's upload slots.
+    fn consume(
+        &self,
+        upload: String,
+        request: impl FnOnce(String) -> StoreRequest,
+    ) -> Result<StoreReply, StorageError> {
+        let reply = self.0.call(request(upload.clone()));
+        if !matches!(reply, Ok(ref reply) if !matches!(reply, StoreReply::Failed { .. })) {
+            let _ = self.0.call(StoreRequest::Discard { id: upload });
+        }
+        reply
     }
 
     /// Uploads `bytes` in chunks; the upload's id.
@@ -276,7 +291,12 @@ impl<C: StoreCall> HistoryClient<C> {
     }
 
     fn value<T: DeserializeOwned>(&self, request: StoreRequest) -> Result<T, StorageError> {
-        match self.call(request)? {
+        let reply = self.call(request)?;
+        self.value_of(reply)
+    }
+
+    fn value_of<T: DeserializeOwned>(&self, reply: StoreReply) -> Result<T, StorageError> {
+        match reply {
             StoreReply::Done { value } => serde_json::from_value(value)
                 .map_err(|err| invalid(format!("the recording service answered oddly: {err}"))),
             StoreReply::Large { blob, bytes } => {
@@ -469,7 +489,8 @@ impl<C: StoreCall> HistoryClient<C> {
     /// transcribe it); the take's id.
     pub fn import(&self, wav: &[u8], transcribe: bool) -> Result<String, StorageError> {
         let upload = self.upload(wav)?;
-        self.value(StoreRequest::Import { upload, transcribe })
+        let reply = self.consume(upload, |upload| StoreRequest::Import { upload, transcribe })?;
+        self.value_of(reply)
     }
 
     /// The latest upkeep report; `run`: a pass runs now.

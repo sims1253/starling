@@ -2500,6 +2500,17 @@ impl StoreV2 {
         &mut self,
         prepared: PreparedCompression,
     ) -> Result<CompressionOutcome, StoreV2Error> {
+        self.commit_compression_unless(prepared, || false)
+    }
+
+    /// [`Self::commit_compression`] that publishes nothing when `stop`
+    /// says so once the write lock is held (a take started recording
+    /// while the publish waited for it): skipped, its temporary removed.
+    pub fn commit_compression_unless(
+        &mut self,
+        prepared: PreparedCompression,
+        stop: impl Fn() -> bool,
+    ) -> Result<CompressionOutcome, StoreV2Error> {
         let skip = |reason: &str| {
             let _ = std::fs::remove_file(&prepared.temp);
             Ok(CompressionOutcome::Skipped(reason.to_string()))
@@ -2509,6 +2520,9 @@ impl StoreV2 {
         // no other connection can retire, delete or start a transcription
         // of the take in between.
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        if stop() {
+            return skip("a take started recording");
+        }
         if self.get_capture(id)?.is_none() {
             return skip("the take was deleted while it was being compressed");
         }

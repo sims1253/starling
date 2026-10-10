@@ -634,15 +634,15 @@ impl Facade {
                     continue;
                 }
             };
-            // A take started recording while this one was encoded: its
-            // FLAC is not published now (the next pass encodes it again).
-            if paused() {
-                prepared.discard();
+            // A take that started recording while this one was encoded, or
+            // while its publish waited for the store: its FLAC is not
+            // published now (the next pass encodes it again).
+            // The guard must drop before the arms: a failure locks again.
+            let committed = lock_v2(&self.0).commit_compression_unless(prepared, &paused);
+            if matches!(committed, Ok(CompressionOutcome::Skipped(_))) && paused() {
                 report.paused = true;
                 return Ok(report);
             }
-            // The guard must drop before the arms: a failure locks again.
-            let committed = lock_v2(&self.0).commit_compression(prepared);
             match committed {
                 Ok(CompressionOutcome::Compressed {
                     journal_bytes,

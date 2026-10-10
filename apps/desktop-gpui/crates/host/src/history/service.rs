@@ -425,6 +425,22 @@ impl History {
         }
     }
 
+    /// Releases `caller`'s hold `hold` without waiting for the store: what
+    /// a connection reader does when the workers cannot take the release.
+    pub(crate) fn release_later(&self, caller: &dyn Caller, hold: &str) {
+        let released = lock(&self.stashes)
+            .get_mut(&caller.key())
+            .and_then(|stash| stash.holds.remove(hold));
+        if let Some(released) = released {
+            if let Err(err) = std::thread::Builder::new()
+                .name("starling-host-release".to_string())
+                .spawn(move || drop(released))
+            {
+                eprintln!("starling-runtime-host: releasing an audio hold inline: {err}");
+            }
+        }
+    }
+
     /// Drops what `caller` was handed: kept answers, uploads, and its
     /// audio holds (released).
     pub(crate) fn caller_gone(&self, caller: &dyn Caller) {
@@ -639,5 +655,85 @@ impl StoreCall for LocalHistory {
 
     fn chunk_bytes(&self) -> usize {
         self.history.chunk
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::history::{HistoryClient, StoreFailureKind};
+
+    fn wav(samples: usize) -> Vec<u8> {
+        starling_dictation::audio::encode_wav_16k(&starling_dictation::audio::PcmAudio {
+            samples: (0..samples).map(|i| (i % 50) as f32 * 0.01).collect(),
+            sample_rate: 16_000,
+            channels: 1,
+        })
+        .expect("wav")
+    }
+
+    /// A hold the workers could not take is released anyway, off the
+    /// caller's thread: the take compresses again.
+    #[test]
+    fn a_hold_released_later_lets_upkeep_compress_the_take() {
+        let root = tempfile::tempdir().unwrap();
+        let local = LocalHistory::open(root.path()).unwrap();
+        let history = HistoryClient(&local);
+        let id = history.import(&wav(32_000), false).unwrap();
+        let hold = history.hold_audio(&id).unwrap();
+        let pass = || {
+            local
+                .history()
+                .facade()
+                .audio_upkeep(RetentionPolicy::default, || false)
+                .unwrap()
+                .compressed
+        };
+        assert_eq!(pass(), 0, "held");
+        local.history().release_later(&Local, &hold);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while pass() == 0 {
+            assert!(Instant::now() < deadline, "the hold was never released");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// A store connection that refuses whatever consumes an upload, as a
+    /// host with a full queue does.
+    struct Refusing<'a>(&'a LocalHistory);
+
+    impl StoreCall for Refusing<'_> {
+        fn call(&self, request: StoreRequest) -> Result<StoreReply, StorageError> {
+            match request {
+                StoreRequest::Import { .. } | StoreRequest::Uploaded { .. } => {
+                    Ok(StoreReply::Failed {
+                        failure: StoreFailure {
+                            kind: StoreFailureKind::Io,
+                            message: "busy".to_string(),
+                        },
+                    })
+                }
+                other => self.0.call(other),
+            }
+        }
+
+        fn chunk_bytes(&self) -> usize {
+            4096
+        }
+    }
+
+    /// An upload whose import or request was refused does not keep one of
+    /// the connection's upload slots.
+    #[test]
+    fn a_refused_consumer_drops_its_upload() {
+        let root = tempfile::tempdir().unwrap();
+        let local = LocalHistory::open(root.path()).unwrap();
+        let refusing = HistoryClient(Refusing(&local));
+        for _ in 0..MAX_UPLOADS + 2 {
+            assert!(refusing.import(&wav(8_000), false).is_err());
+            assert!(refusing.record_insight("c_x", "e", "k", "t", &"x".repeat(8192)).is_err());
+        }
+        assert!(local.history().stashes.lock().unwrap().values().all(|stash| stash.uploads.is_empty()));
+        HistoryClient(&local).import(&wav(8_000), false).expect("slots are free");
     }
 }

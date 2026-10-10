@@ -1375,14 +1375,13 @@ fn connection_reader(
                     Frame::TakeTap { take, from } => {
                         shared.takes.tap(&state, take, from);
                     }
-                    // Releases are answered here, never refused by a full
-                    // queue: a hold or a kept answer must not outlive what
-                    // asked for it.
+                    // Dropping what a connection was handed is never
+                    // refused by a full queue: a kept answer is dropped
+                    // here (it touches no store), a hold the workers cannot
+                    // take is released in the background.
                     Frame::Store {
                         req,
-                        request:
-                            request @ (crate::history::StoreRequest::ReleaseHold { .. }
-                            | crate::history::StoreRequest::Discard { .. }),
+                        request: request @ crate::history::StoreRequest::Discard { .. },
                     } if shared.history.is_some() => {
                         let reply = shared
                             .history
@@ -1405,11 +1404,25 @@ fn connection_reader(
                                 },
                             )
                             .err()
-                            .map(|job| {
+                            .and_then(|job| match (&job.request, &shared.history) {
                                 (
+                                    crate::history::StoreRequest::ReleaseHold { hold },
+                                    Some(history),
+                                ) => {
+                                    history.release_later(&*state, hold);
+                                    let reply = crate::history::StoreReply::Done {
+                                        value: serde_json::Value::Null,
+                                    };
+                                    let req = job.req;
+                                    if state.try_deliver(Frame::Stored { req, reply }).is_err() {
+                                        state.close();
+                                    }
+                                    None
+                                }
+                                _ => Some((
                                     job.req,
                                     "Starling's recording service is busy; try again in a moment.",
-                                )
+                                )),
                             }),
                             None => Some((
                                 req,
