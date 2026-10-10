@@ -544,8 +544,13 @@ impl StarlingApp {
     ) {
         let model_id = pending.model_id.clone();
         // Activation requests count per host: only this host's reports
-        // say anything about this one.
-        let host = self.host.client.as_ref().map(|client| client.info.pid);
+        // say anything about this one (its lease id, unlike a pid, is
+        // never another host's).
+        let host = self
+            .host
+            .client
+            .as_ref()
+            .map(|client| client.info.owner_id.clone());
         cx.spawn(async move |this, cx| {
             let mut job = Some((with, pin));
             // Since when no engine report is in hand (the connection
@@ -587,7 +592,9 @@ impl StarlingApp {
                     let progress = if app.engine_status.is_none() {
                         let since = *unreported_since.get_or_insert_with(Instant::now);
                         unreported_progress(since.elapsed(), app.engine_unavailable())
-                    } else if app.host.client.as_ref().map(|client| client.info.pid) != host {
+                    } else if app.host.client.as_ref().map(|client| &client.info.owner_id)
+                        != host.as_ref()
+                    {
                         SwitchProgress::Failed(
                             "the recording service restarted while the model loaded.".to_string(),
                         )
@@ -1471,6 +1478,7 @@ mod tests {
             assert!(app.engine_status.is_none());
             assert!(app.engine_snapshot().is_none());
             assert_eq!(app.connection, crate::app::Connection::Offline);
+            assert_eq!(crate::views::connection_label(app), "OFFLINE");
         });
         drop(app);
         let _ = std::fs::remove_dir_all(&root);

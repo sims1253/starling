@@ -1011,7 +1011,16 @@ fn engine_worker(
     pending: &AtomicUsize,
 ) {
     while let Ok(job) = jobs.recv() {
-        let reply = engine.handle(job.request);
+        // A request that panics is refused and the worker carries on: a
+        // dead worker would leave `pending` counting it (and every
+        // request queued behind it), and no retire would get past that.
+        let reply =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| engine.handle(job.request)))
+                .unwrap_or_else(|_| crate::engine::EngineReply::Refused {
+                    message:
+                        "The engine could not carry out this request (it failed unexpectedly)."
+                            .to_string(),
+                });
         pending.fetch_sub(1, Ordering::SeqCst);
         if job
             .conn
@@ -1375,7 +1384,7 @@ fn connection_reader(
                         | Frame::AskUser { .. }
                         | Frame::Engine { .. }
                 );
-                let _admitted = if admits_work {
+                let admitted = if admits_work {
                     let admitted = shared
                         .admission
                         .read()
@@ -1605,6 +1614,10 @@ fn connection_reader(
                             state.close();
                             break;
                         }
+                        // The watch is registered (a retire sees it); the
+                        // status read below admits nothing, and may wait
+                        // on an engine starting — a retire must not.
+                        drop(admitted);
                         // The engine as it stands; changes follow, in order
                         // (read and queued under the feed's own lock). A
                         // window that misses this would wait for the next
@@ -1638,11 +1651,16 @@ fn connection_reader(
                             (_, _) => Err(req),
                         };
                         if let Err(req) = queued {
-                            let reply = crate::engine::EngineReply::Refused {
-                                message: "This Starling recording service runs without a \
-                                          transcription engine."
-                                    .to_string(),
+                            // An engine with no queue: the host is shutting
+                            // down (its worker's queue went first).
+                            let message = if shared.engine.is_some() {
+                                "Starling's recording service is shutting down.".to_string()
+                            } else {
+                                "This Starling recording service runs without a \
+                                 transcription engine."
+                                    .to_string()
                             };
+                            let reply = crate::engine::EngineReply::Refused { message };
                             if state.try_deliver(Frame::EngineReply { req, reply }).is_err() {
                                 state.close();
                                 break;

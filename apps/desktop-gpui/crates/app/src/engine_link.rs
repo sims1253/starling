@@ -44,7 +44,11 @@ impl StarlingApp {
     /// Has the host's engine follow the committed engine settings now
     /// (mode, backend, the user's server). The host only acts on what
     /// changed. Without a connection the settings file — which the
-    /// caller persists — carries them to the host.
+    /// caller persists — carries them to the host: a running host's
+    /// settings watcher applies the fields it changed within a poll, and
+    /// its push supersedes (by revision) a reconnect status read before
+    /// that. Resending this window's whole intent on reconnect instead
+    /// would undo what another window changed meanwhile.
     pub(crate) fn configure_engine(&mut self, cx: &mut Context<Self>) {
         let request = EngineRequest::Configure {
             intent: self.engine_intent(),
@@ -230,17 +234,19 @@ impl StarlingApp {
             .and_then(|status| status.snapshot.clone())
     }
 
-    /// Why no built-in engine state can be shown: it cannot run, or the
-    /// recording service has not reported it.
+    /// Why no built-in engine state can be shown: it cannot run, the
+    /// recording service is not connected, or it has not reported it.
     pub(crate) fn engine_unavailable(&self) -> String {
         match &self.engine_status {
             Some(status) => status
                 .unavailable
                 .clone()
                 .unwrap_or_else(|| "The built-in engine is not available.".to_string()),
-            None => "The built-in engine runs in Starling's recording service, which has not \
-                     reported it yet."
-                .to_string(),
+            None => self.host_unavailable().unwrap_or_else(|| {
+                "The built-in engine runs in Starling's recording service, which has not \
+                 reported it yet."
+                    .to_string()
+            }),
         }
     }
 

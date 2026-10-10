@@ -1220,8 +1220,13 @@ fn a_download_over_the_socket_reports_its_progress() {
         })
         .expect("answered");
     assert!(matches!(reply, EngineReply::Done { .. }), "{reply:?}");
-    let progress = until_engine(&app, "download progress", |status| {
-        matches!(install(status), Some(InstallState::Downloading { done, total }) if done > 0 && done < total)
+    // Progress from the first half: the delete below must not race the
+    // download's last chunks on a loaded machine.
+    let progress = until_engine(&app, "early download progress", |status| {
+        matches!(
+            install(status),
+            Some(InstallState::Downloading { done, total }) if done > 0 && done * 2 < total
+        )
     });
     assert!(matches!(
         install(&progress),
