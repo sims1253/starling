@@ -3,14 +3,15 @@
 //!
 //! # Which field
 //!
-//! [`AtspiReader::locate`] runs when a target is captured. It looks for
-//! the one application on the accessibility bus that owns the target (its
-//! pid, where the backend knows it; X11) or, without a pid (Wayland), the
-//! only application with an active window, and in its active window for
-//! the object with `STATE_FOCUSED`: through `Collection.GetMatches` where
-//! the toolkit implements it, else a walk of the showing tree with a node
-//! and time budget. Two candidates, or none, find nothing: a guess could
-//! name another app's field. Excluded pids (always Starling) never count.
+//! [`AtspiReader::locate`] runs when a target is captured. Among the
+//! applications on the accessibility bus that may own the target (its
+//! pid, where the backend knows it, X11; any, without one, Wayland) it
+//! needs exactly one active window, and in it exactly one object with
+//! `STATE_FOCUSED`: through `Collection.GetMatches` where the toolkit
+//! implements it, else a walk of the showing tree with a node and time
+//! budget. Two candidates, none, or a call that fails on the way find
+//! nothing: a guess could name another app's field. Excluded pids (always
+//! Starling) never count.
 //!
 //! [`AtspiReader::read`] reads only that object, and only while it is
 //! still focused, editable and owned by the same process (and, where the
@@ -195,38 +196,34 @@ impl AtspiReader {
         bus: &Bus<'_>,
         target_pid: Option<u32>,
     ) -> zbus::Result<Option<FieldAnchor>> {
-        let mut found: Option<FieldAnchor> = None;
+        // Every eligible active window first, so one that cannot be
+        // searched never hands the answer to another. Any failed call
+        // ends the search without an answer (an error here).
+        let mut active: Vec<(String, OwnedObjectPath, u32)> = Vec::new();
         for (app, app_path) in bus.children(REGISTRY, ROOT_PATH)? {
-            // An application that went away meanwhile is simply skipped.
-            let Ok(pid) = bus.pid(&app) else { continue };
+            let pid = bus.pid(&app)?;
             if self.excluded_pids.contains(&pid) || target_pid.is_some_and(|target| target != pid) {
                 continue;
             }
-            let Ok(windows) = bus.children(&app, app_path.as_str()) else {
-                continue;
-            };
-            for (window_app, window) in windows {
-                let active = bus
-                    .states(&window_app, window.as_str())
-                    .is_ok_and(|states| states.has(STATE_ACTIVE));
-                if window_app != app || !active {
-                    continue;
+            for (window_app, window) in bus.children(&app, app_path.as_str())? {
+                if window_app == app && bus.states(&app, window.as_str())?.has(STATE_ACTIVE) {
+                    active.push((app.clone(), window, pid));
                 }
-                let Ok(Some(path)) = bus.focused_in(&window_app, window.as_str()) else {
-                    continue;
-                };
-                if found.is_some() {
-                    log::debug!("AT-SPI: more than one focused field; reading none");
-                    return Ok(None);
-                }
-                found = Some(FieldAnchor {
-                    bus_name: window_app.clone(),
-                    path: path.to_string(),
-                    pid,
-                });
             }
         }
-        Ok(found)
+        let [(app, window, pid)] = active.as_slice() else {
+            if !active.is_empty() {
+                log::debug!("AT-SPI: more than one active window; reading none");
+            }
+            return Ok(None);
+        };
+        Ok(bus
+            .focused_in(app, window.as_str())?
+            .map(|path| FieldAnchor {
+                bus_name: app.clone(),
+                path: path.to_string(),
+                pid: *pid,
+            }))
     }
 
     fn read_on(
@@ -430,8 +427,9 @@ impl Bus<'_> {
     /// Depth-first through showing objects, within [`WALK_NODES`] and
     /// [`WALK_TIME`]; descendants of a `MANAGES_DESCENDANTS` container
     /// (long lists and tables) are not walked. The whole showing tree is
-    /// walked, so a second focused object is seen: then, or over budget,
-    /// there is no answer.
+    /// walked, focused objects' children included, so a second focused
+    /// object is seen: then, over budget, or when a call fails (a part of
+    /// the tree unseen), there is no answer.
     fn walk_for_focus(&self, name: &str, window: &str) -> zbus::Result<Option<OwnedObjectPath>> {
         let deadline = Instant::now() + WALK_TIME;
         let mut stack: Vec<Object> = self.children(name, window)?;
@@ -446,24 +444,21 @@ impl Bus<'_> {
             if owner != name {
                 continue;
             }
-            let Ok(states) = self.states(&owner, path.as_str()) else {
-                continue;
-            };
-            if states.has(STATE_FOCUSED) {
-                if found.is_some() {
+            let states = self.states(&owner, path.as_str())?;
+            if !states.has(STATE_SHOWING) || states.has(STATE_MANAGES_DESCENDANTS) {
+                if states.has(STATE_FOCUSED) && found.replace(path).is_some() {
                     log::debug!("AT-SPI: more than one focused object; reading none");
                     return Ok(None);
                 }
-                found = Some(path);
                 continue;
             }
-            if !states.has(STATE_SHOWING) || states.has(STATE_MANAGES_DESCENDANTS) {
-                continue;
+            let children = self.children(&owner, path.as_str())?;
+            if states.has(STATE_FOCUSED) && found.replace(path).is_some() {
+                log::debug!("AT-SPI: more than one focused object; reading none");
+                return Ok(None);
             }
-            if let Ok(children) = self.children(&owner, path.as_str()) {
-                // Reversed, so the first child is walked first.
-                stack.extend(children.into_iter().rev());
-            }
+            // Reversed, so the first child is walked first.
+            stack.extend(children.into_iter().rev());
         }
         Ok(found)
     }
