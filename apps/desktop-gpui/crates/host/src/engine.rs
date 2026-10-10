@@ -680,6 +680,11 @@ impl EngineHost {
                 }
             }
             EngineRequest::Retry => {
+                // Held from the look at the state to the restart: a mode
+                // switch the settings watcher makes in between must not
+                // be overwritten by a restart meant for an engine that
+                // could not run.
+                let _one = lock(&self.transitions);
                 let retry_unavailable = {
                     let state = lock(&self.state);
                     match &*state {
@@ -705,7 +710,7 @@ impl EngineHost {
                     endpoint: String::new(),
                     model: String::new(),
                 };
-                match self.transition(&intent, Fields::CONFIGURE) {
+                match self.transition_held(&intent, Fields::CONFIGURE) {
                     Ok(()) => done(self),
                     Err(message) => refused(message),
                 }
@@ -773,6 +778,11 @@ impl EngineHost {
     /// engine cannot run (its data directory does not resolve).
     fn transition(&self, intent: &EngineIntent, fields: Fields) -> Result<(), String> {
         let _one = lock(&self.transitions);
+        self.transition_held(intent, fields)
+    }
+
+    /// [`Self::transition`], for a caller already holding `transitions`.
+    fn transition_held(&self, intent: &EngineIntent, fields: Fields) -> Result<(), String> {
         let mut state = lock(&self.state);
         match intent.mode {
             EngineMode::Builtin => match &mut *state {

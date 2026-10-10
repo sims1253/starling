@@ -348,9 +348,12 @@ pub struct StarlingApp {
     /// a status pushed meanwhile may predate them, so its settings are
     /// not adopted.
     pub(crate) engine_configuring: usize,
-    /// The settings revision this window's last answered `Configure`
-    /// left the host at: an older status's settings are not adopted.
-    pub(crate) engine_revision: u64,
+    /// The settings revision this window's answered `Configure`s left
+    /// each host at (by lease id): a status from the connected host older
+    /// than its entry is not adopted. Kept per host, as revisions count
+    /// per host and an answer can arrive before the window has taken in
+    /// the connection to the host that gave it.
+    pub(crate) engine_revisions: std::collections::HashMap<String, u64>,
     /// The model this window asked the engine to switch to: once it
     /// serves, this window persists it as the active model.
     pub(crate) engine_activating: Option<String>,
@@ -1014,7 +1017,7 @@ impl StarlingApp {
             root_focus: cx.focus_handle(),
             engine_status: None,
             engine_configuring: 0,
-            engine_revision: 0,
+            engine_revisions: std::collections::HashMap::new(),
             engine_activating: None,
             engine_settings,
             draft_engine_mode,

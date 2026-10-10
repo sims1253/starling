@@ -70,23 +70,17 @@ impl StarlingApp {
         cx: &mut Context<Self>,
     ) {
         self.engine_configuring = self.engine_configuring.saturating_sub(1);
-        // Revisions count per host: only one from the host this window
-        // is connected to now says anything about its statuses. That is
-        // the host that answered, not the one connected when the request
-        // was made — a request queued across a reconnect lands on the
-        // new host, and its revision is the new host's.
-        let current = self
-            .host
-            .client
-            .as_ref()
-            .map(|client| client.info.owner_id.as_str());
+        // Recorded for the host that answered, not the one connected when
+        // the request was made: a request queued across a reconnect lands
+        // on the new host, and its revision is the new host's — possibly
+        // before this window has taken in that connection.
         match reply {
-            Ok(EngineReply::Done { revision } | EngineReply::Activating { revision, .. })
-                if host.is_some() && host.as_deref() == current =>
-            {
-                self.engine_revision = self.engine_revision.max(revision);
+            Ok(EngineReply::Done { revision } | EngineReply::Activating { revision, .. }) => {
+                if let Some(host) = host {
+                    let floor = self.engine_revisions.entry(host).or_default();
+                    *floor = (*floor).max(revision);
+                }
             }
-            Ok(EngineReply::Done { .. } | EngineReply::Activating { .. }) => {}
             Ok(EngineReply::Refused { message }) => self.error = Some(message),
             Err(message) => self.error = Some(message),
         }
@@ -152,13 +146,31 @@ impl StarlingApp {
         .detach();
     }
 
-    /// A new connection to the recording service: its engine's settings
-    /// revisions start over. Relies on `link_loop` reporting
-    /// `HostUpdate::Connected` before `follow()` forwards the connection's
-    /// first frame, so the new host's revision-0 status is never read
-    /// against the old host's revision.
+    /// A new connection to the recording service: only its host's
+    /// revisions matter from now on (one answered before this connection
+    /// was taken in is kept). Statuses need no host of their own: the
+    /// link reports `HostUpdate::Connected` before `follow()` forwards the
+    /// connection's first frame, so every status read after this is the
+    /// connected host's.
     pub(crate) fn engine_connected(&mut self) {
-        self.engine_revision = 0;
+        let host = self
+            .host
+            .client
+            .as_ref()
+            .map(|client| client.info.owner_id.clone());
+        self.engine_revisions
+            .retain(|answered, _| Some(answered) == host.as_ref());
+    }
+
+    /// The revision this window's answered `Configure`s left the
+    /// connected host at (0 when none did).
+    pub(crate) fn engine_revision(&self) -> u64 {
+        self.host
+            .client
+            .as_ref()
+            .and_then(|client| self.engine_revisions.get(&client.info.owner_id))
+            .copied()
+            .unwrap_or(0)
     }
 
     /// The connection to the recording service is gone, and its engine
@@ -211,7 +223,7 @@ impl StarlingApp {
         // In manual mode the indicator is this window's own probe of the
         // server: a server (or mode) taken over from the host is probed.
         let mut probe = false;
-        if self.engine_configuring == 0 && status.revision >= self.engine_revision {
+        if self.engine_configuring == 0 && status.revision >= self.engine_revision() {
             if self.engine_settings.mode != status.mode {
                 if self.draft_engine_mode == self.engine_settings.mode {
                     self.draft_engine_mode = status.mode;
