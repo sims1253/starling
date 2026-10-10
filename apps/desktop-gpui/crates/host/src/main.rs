@@ -288,9 +288,15 @@ fn main() {
     host.shutdown();
     // Print (and flush) before setting the flag: on a console close the
     // OS ends the process as soon as the handler's wait sees `STOPPED`,
-    // so a line written after it could be lost.
-    println!("{}", serde_json::json!({ "status": "stopped" }));
-    let _ = std::io::Write::flush(&mut std::io::stdout());
+    // so a line written after it could be lost. The write is fallible:
+    // stdout may already be gone on a console close, and a panicking
+    // `println!` would never set the flag.
+    {
+        use std::io::Write;
+        let mut stdout = std::io::stdout().lock();
+        let _ = writeln!(stdout, "{}", serde_json::json!({ "status": "stopped" }));
+        let _ = stdout.flush();
+    }
     STOPPED.store(true, Ordering::SeqCst);
 }
 
