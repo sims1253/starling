@@ -113,6 +113,7 @@ impl WaylandBackend {
         keyboard: &ZwpVirtualKeyboardV1,
         segment: &[char],
         delivered: &mut usize,
+        stop: &dyn Fn() -> Option<InsertError>,
     ) -> Result<(), InsertError> {
         let mut distinct: Vec<char> = Vec::new();
         for character in segment {
@@ -135,6 +136,9 @@ impl WaylandBackend {
                 .position(|known| known == character)
                 .expect("every segment character is in its keymap") as u32;
             let key = FIRST_EVDEV_KEY + index;
+            if let Some(error) = stop() {
+                return Err(error);
+            }
             keyboard.key(self.now_ms(), key, KEY_PRESSED);
             // Counted once its press went out: from here on it may land.
             *delivered += 1;
@@ -180,8 +184,22 @@ impl InsertionBackend for WaylandBackend {
     }
 
     fn insert(&self, target: &TargetSnapshot, text: &str) -> Result<InsertReceipt, InsertError> {
+        self.insert_guarded(target, text, &|| None)
+    }
+
+    /// The only check typing here can have: `stop` is asked again after
+    /// waiting for the lock and before every key.
+    fn insert_guarded(
+        &self,
+        target: &TargetSnapshot,
+        text: &str,
+        stop: &dyn Fn() -> Option<InsertError>,
+    ) -> Result<InsertReceipt, InsertError> {
         insertion_guards(text, target.pid, &self.excluded_pids)?;
         let _insert_lock = INSERT_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(error) = stop() {
+            return Err(error);
+        }
         let mut session = Session::open()?;
         let keyboard =
             session
@@ -191,7 +209,7 @@ impl InsertionBackend for WaylandBackend {
         let mut delivered = 0;
         let mut typed = Ok(());
         for segment in distinct_segments(&characters, KEYMAP_CHARS) {
-            typed = self.type_segment(&mut session, &keyboard, segment, &mut delivered);
+            typed = self.type_segment(&mut session, &keyboard, segment, &mut delivered, stop);
             if typed.is_err() {
                 break;
             }

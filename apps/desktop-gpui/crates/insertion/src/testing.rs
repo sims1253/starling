@@ -2,7 +2,7 @@
 //! identity and failures under test control, with no X server or
 //! Windows session.
 
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::{
     format_ref, insertion_guards, merge_excluded_pids, BackendKind, InsertError, InsertReceipt,
@@ -54,8 +54,12 @@ struct State {
     insert_behavior: InsertBehavior,
     revalidate_failure: Option<InsertError>,
     verifies_target: bool,
+    key_hook: Option<KeyHook>,
     insertions: Vec<(String, String)>,
 }
+
+/// Runs before each character `insert_guarded` types, with its index.
+type KeyHook = Arc<dyn Fn(usize) + Send + Sync>;
 
 impl State {
     fn current_ref(&self) -> Option<String> {
@@ -96,6 +100,7 @@ impl FakeBackend {
                 insert_behavior: InsertBehavior::Type,
                 revalidate_failure: None,
                 verifies_target: true,
+                key_hook: None,
                 insertions: Vec::new(),
             }),
             excluded_pids: merge_excluded_pids(excluded_pids),
@@ -146,6 +151,13 @@ impl FakeBackend {
     /// the callers' gating.
     pub fn set_verifies_target(&self, verifies: bool) {
         self.state().verifies_target = verifies;
+    }
+
+    /// Run `hook` with each character's index before `insert_guarded`
+    /// checks its `stop` for that character: lets a test change what the
+    /// caller sees mid-typing.
+    pub fn on_key(&self, hook: impl Fn(usize) + Send + Sync + 'static) {
+        self.state().key_hook = Some(Arc::new(hook));
     }
 
     /// The `(target_ref, text)` pairs `insert` accepted, in order.
@@ -211,7 +223,36 @@ impl InsertionBackend for FakeBackend {
     }
 
     fn insert(&self, target: &TargetSnapshot, text: &str) -> Result<InsertReceipt, InsertError> {
+        self.insert_guarded(target, text, &|| None)
+    }
+
+    /// Checks `stop` before every character, like the Wayland backend;
+    /// the text is recorded only when every character went out.
+    fn insert_guarded(
+        &self,
+        target: &TargetSnapshot,
+        text: &str,
+        stop: &dyn Fn() -> Option<InsertError>,
+    ) -> Result<InsertReceipt, InsertError> {
         insertion_guards(text, target.pid, &self.excluded_pids)?;
+        let hook = self.state().key_hook.clone();
+        let total_chars = text.chars().count();
+        for index in 0..total_chars {
+            if let Some(hook) = &hook {
+                hook(index);
+            }
+            match stop() {
+                None => {}
+                Some(error) if index == 0 => return Err(error),
+                Some(error) => {
+                    return Err(InsertError::PartialDelivery {
+                        delivered_chars: index,
+                        total_chars,
+                        cause: Box::new(error),
+                    })
+                }
+            }
+        }
         match self.revalidate(target)? {
             TargetCheck::Same => {}
             TargetCheck::Changed { expected, actual } => {

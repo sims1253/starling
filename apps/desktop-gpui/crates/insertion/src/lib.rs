@@ -286,6 +286,22 @@ pub trait InsertionBackend: Send + Sync {
     }
     /// Type `text` into `target`, following the crate rules above.
     fn insert(&self, target: &TargetSnapshot, text: &str) -> Result<InsertReceipt, InsertError>;
+    /// [`insert`](Self::insert), stopping as soon as `stop` returns an
+    /// error: the caller can see what the backend cannot (Starling's own
+    /// window taking focus, on Wayland). The default checks once before
+    /// typing; a backend that types key by key checks before every key
+    /// and reports what already went out as a partial delivery.
+    fn insert_guarded(
+        &self,
+        target: &TargetSnapshot,
+        text: &str,
+        stop: &dyn Fn() -> Option<InsertError>,
+    ) -> Result<InsertReceipt, InsertError> {
+        if let Some(error) = stop() {
+            return Err(error);
+        }
+        self.insert(target, text)
+    }
 }
 
 /// The ordered backends of a session. The first available backend
@@ -360,14 +376,17 @@ impl Inserter {
             .is_some_and(|backend| backend.verifies_target())
     }
 
-    /// Type `text` into `target` through the backend of its scheme.
+    /// Type `text` into `target` through the backend of its scheme,
+    /// stopping when `stop` says so (see
+    /// [`InsertionBackend::insert_guarded`]).
     pub fn insert(
         &self,
         target: &TargetSnapshot,
         text: &str,
+        stop: &dyn Fn() -> Option<InsertError>,
     ) -> Result<InsertReceipt, InsertError> {
         match self.backend_for(target) {
-            Some(backend) => backend.insert(target, text),
+            Some(backend) => backend.insert_guarded(target, text, stop),
             None => Err(InsertError::Unavailable {
                 reason: format!("no {} backend in this session", target.backend.scheme()),
             }),
@@ -431,6 +450,14 @@ impl<T: InsertionBackend + ?Sized> InsertionBackend for std::sync::Arc<T> {
     }
     fn insert(&self, target: &TargetSnapshot, text: &str) -> Result<InsertReceipt, InsertError> {
         (**self).insert(target, text)
+    }
+    fn insert_guarded(
+        &self,
+        target: &TargetSnapshot,
+        text: &str,
+        stop: &dyn Fn() -> Option<InsertError>,
+    ) -> Result<InsertReceipt, InsertError> {
+        (**self).insert_guarded(target, text, stop)
     }
 }
 

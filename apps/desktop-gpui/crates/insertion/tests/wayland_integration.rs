@@ -63,6 +63,22 @@ fn wayland_types_unicode_into_a_gtk_entry() {
     let receipt = backend.insert(&target, text).expect("typed");
     assert_eq!(receipt.evidence, EVIDENCE_SYNTHETIC_KEYS);
 
+    // A caller's stop ends typing before the next key: once after the
+    // lock, then once per key, so the fifth check stops after three keys.
+    let checks = std::cell::Cell::new(0);
+    let stop = || {
+        checks.set(checks.get() + 1);
+        (checks.get() >= 5).then_some(InsertError::TargetIsStarling)
+    };
+    assert_eq!(
+        backend.insert_guarded(&target, " stopped", &stop),
+        Err(InsertError::PartialDelivery {
+            delivered_chars: 3,
+            total_chars: 8,
+            cause: Box::new(InsertError::TargetIsStarling),
+        })
+    );
+
     std::thread::sleep(Duration::from_millis(300));
     let pressed = Command::new("wtype")
         .args(["-k", "Return"])
@@ -83,5 +99,5 @@ fn wayland_types_unicode_into_a_gtk_entry() {
         .unwrap()
         .read_to_string(&mut out)
         .unwrap();
-    assert_eq!(out.trim_end_matches('\n'), text);
+    assert_eq!(out.trim_end_matches('\n'), format!("{text} st"));
 }

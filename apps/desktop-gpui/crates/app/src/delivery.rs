@@ -33,6 +33,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use gpui::{AppContext, ClipboardItem, Context};
@@ -202,6 +203,10 @@ pub(crate) struct DeliveryState {
     /// Bumped on every focus change of Starling's window, so only the
     /// settle timer of the latest focus loss fires Paste last.
     focus_changes: u64,
+    /// Whether Starling's window has focus, for typing off the UI thread:
+    /// an insert stops before its next key once it turns true (Wayland
+    /// cannot tell that Starling's window took focus; Starling can).
+    own_focus: Arc<AtomicBool>,
 }
 
 impl DeliveryState {
@@ -214,6 +219,7 @@ impl DeliveryState {
             recovery: None,
             generation: 0,
             focus_changes: 0,
+            own_focus: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -328,10 +334,18 @@ impl StarlingApp {
         cx: &mut Context<Self>,
     ) {
         let inserter = self.delivery.inserter.clone();
+        let own_focus = self.delivery.own_focus.clone();
         let typed_text = text.clone();
         cx.spawn(async move |this, cx| {
             let result = cx
-                .background_spawn(async move { inserter.insert(&target, &typed_text) })
+                .background_spawn(async move {
+                    let stop = || {
+                        own_focus
+                            .load(Ordering::SeqCst)
+                            .then_some(InsertError::TargetIsStarling)
+                    };
+                    inserter.insert(&target, &typed_text, &stop)
+                })
                 .await;
             this.update(cx, |app, cx| {
                 app.insert_finished(id, text, paste, result, cx)
@@ -436,6 +450,7 @@ impl StarlingApp {
     /// Starling's window gained or lost focus.
     pub(crate) fn delivery_window_activation(&mut self, active: bool, cx: &mut Context<Self>) {
         self.delivery.focus_changes += 1;
+        self.delivery.own_focus.store(active, Ordering::SeqCst);
         if active {
             return;
         }
@@ -726,6 +741,58 @@ mod tests {
             assert_eq!(recovery.take_id, "take-2");
             assert_eq!(recovery.title(), "Not inserted: keys were held");
             assert!(recovery.explanation().contains("Control"));
+        });
+    }
+
+    #[gpui::test]
+    fn typing_stops_when_starlings_window_takes_focus(cx: &mut gpui::TestAppContext) {
+        let opted_in = InsertionSettings {
+            allow_unverified: true,
+            ..on()
+        };
+        let (app, fake) = app_with(cx, opted_in);
+        fake.set_verifies_target(false);
+        fake.focus(FakeTarget::named("Editor", "notes.txt"));
+        // Focus comes to Starling while the insert is still queued.
+        app.update(cx, |app, cx| {
+            app.delivery_take_started();
+            let capture = app.delivery_take_stopped();
+            app.bind_delivery(capture, "take-1");
+            app.sessions.push(session("take-1", "Hello there."));
+            app.deliver_finished_take("take-1", cx);
+            app.window_focus.push((Instant::now(), true));
+            app.delivery_window_activation(true, cx);
+        });
+        cx.run_until_parked();
+        assert!(fake.insertions().is_empty());
+        assert_eq!(
+            failure(&app, cx),
+            Some(Failure::Insert(InsertError::TargetIsStarling))
+        );
+
+        // And mid-typing: what went out is reported as a partial delivery.
+        let (app, fake) = app_with(cx, opted_in);
+        fake.set_verifies_target(false);
+        fake.focus(FakeTarget::named("Editor", "notes.txt"));
+        let own_focus = app.read_with(cx, |app, _| app.delivery.own_focus.clone());
+        fake.on_key(move |index| {
+            if index == 5 {
+                own_focus.store(true, Ordering::SeqCst);
+            }
+        });
+        take(&app, cx, "take-1", "Hello there.", |_| {});
+        assert!(fake.insertions().is_empty());
+        app.read_with(cx, |app, _| {
+            let recovery = app.delivery.recovery.as_ref().unwrap();
+            assert_eq!(
+                recovery.failure,
+                Failure::Insert(InsertError::PartialDelivery {
+                    delivered_chars: 5,
+                    total_chars: 12,
+                    cause: Box::new(InsertError::TargetIsStarling),
+                })
+            );
+            assert_eq!(recovery.title(), "Inserted only in part");
         });
     }
 
