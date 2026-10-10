@@ -27,9 +27,10 @@ CASES_PATH = (
 # opening.
 OPENING = set("([{\"'“‘„«「『【（")
 
-# Punctuation that continues a sentence (besides alphanumerics). Sentence
-# enders are deliberately absent: the case is kept after them.
-CONTINUING = set(",;:)]}”’»」』】）》")
+# Punctuation that continues a sentence (besides alphanumerics), incl. the
+# Arabic comma and semicolon. Sentence enders are deliberately absent: the
+# case is kept after them.
+CONTINUING = set(",;:)]}”’»」』】）》،؛")
 
 # Han, kana and CJK punctuation: no space between two of them. Hangul is
 # absent on purpose (Korean separates words with spaces).
@@ -78,10 +79,16 @@ def _protected_token(raw: str) -> bool:
     return len(letters) >= 2 and all(c.isupper() for c in letters)  # ALL-CAPS
 
 
-def adjust(before: str, raw: str, verbatim: bool) -> tuple[str, list[str]]:
-    """The adjusted text and the kinds of the rules that fired, in order."""
+def adjust(
+    before: str, raw: str, verbatim: bool, showing_hint: bool = False
+) -> tuple[str, list[str]]:
+    """The adjusted text and the kinds of the rules that fired, in order.
+    ``showing_hint``: the field shows only its placeholder, so ``before`` is
+    hint text and the field is treated as empty."""
     if verbatim or not raw:
         return raw, []
+    if showing_hint:
+        before = ""
     text, changes = raw, []
 
     if (

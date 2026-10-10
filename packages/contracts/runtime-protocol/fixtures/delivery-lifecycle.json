@@ -1,6 +1,6 @@
 {
   "machine": "delivery",
-  "description": "Happy path and cancel: prepare -> prepared -> apply (target revalidated: Prepared -> Revalidating) -> submittedUnconfirmed -> confirmed with an explicit evidence level; then a second delivery cancelled while Prepared.",
+  "description": "Happy path and cancel: prepare -> prepared -> apply (target revalidated: Prepared -> Revalidating) -> submittedUnconfirmed -> confirmed with an explicit evidence level; then a second delivery, prepared with the explicit raw boundary bypass, cancelled while Prepared.",
   "initial": "Idle",
   "schema_valid": true,
   "replay": "ok",
@@ -57,7 +57,7 @@
       "corr": "dlv-2",
       "seq": 1,
       "type": "delivery.prepare",
-      "payload": { "revisionId": "rev-42", "targetRef": "notes" }
+      "payload": { "revisionId": "rev-42", "targetRef": "notes", "boundary": "raw" }
     },
     {
       "v": 1,

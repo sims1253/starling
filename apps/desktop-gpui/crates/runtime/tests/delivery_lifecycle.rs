@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use starling_runtime::bus::EventSub;
 use starling_runtime::channel::RecvError;
-use starling_runtime::protocol::{Command, Event, Revision};
+use starling_runtime::protocol::{BoundaryPolicy, Command, Event, Revision};
 use starling_runtime::{Runtime, RuntimeConfig};
 
 fn revision(rev_id: &str, text: &str) -> Revision {
@@ -74,6 +74,7 @@ fn delivery_prepared_reaches_the_live_event_stream_and_the_stub_refuses_to_confi
             Command::DeliveryPrepare {
                 revision_id: "rev-1".into(),
                 target_ref: "some-editor-target".into(),
+                boundary: BoundaryPolicy::Adjust,
             },
         )
         .expect("prepare accepted");
@@ -113,6 +114,7 @@ fn a_prepare_against_an_unknown_revision_is_refused_without_events() {
         Command::DeliveryPrepare {
             revision_id: "rev-never".into(),
             target_ref: "some-editor-target".into(),
+            boundary: BoundaryPolicy::Adjust,
         },
     ) {
         Err(starling_runtime::machine::Rejection::UnknownRevision { revision_id }) => {

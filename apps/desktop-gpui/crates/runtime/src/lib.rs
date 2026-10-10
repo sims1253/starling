@@ -71,7 +71,9 @@ use machine::capture::{
 };
 use machine::context::{ContextActor, ContextMsg, ContextProvider, RouteFreezer, StubContextProvider};
 use machine::delivery::{DeliveryActor, DeliveryMsg, DeliveryAdapter, StubDeliveryAdapter};
-use machine::docs::{DocsActor, DocsMsg, DocumentStore, MemoryDocumentStore, RevisionRegistry};
+use machine::docs::{
+    DerivedRevisions, DocsActor, DocsMsg, DocumentStore, MemoryDocumentStore, RevisionRegistry,
+};
 use machine::jobs::{JobsActor, JobsMsg, JobsSnapshot};
 use machine::{MachineView, Receipt, Rejection};
 use protocol::{Command, Event, JobLimits};
@@ -375,6 +377,7 @@ impl Runtime {
             Arc::clone(&bus),
             Arc::clone(&views.delivery),
             Arc::clone(&revisions),
+            DerivedRevisions::new(docs_tx.clone()),
             Arc::clone(&config.delivery_adapter),
         );
         handles.push(spawn("starling-delivery", move || delivery_actor.run()));

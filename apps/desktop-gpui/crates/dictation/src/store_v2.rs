@@ -1576,6 +1576,21 @@ impl StoreV2 {
         Ok(())
     }
 
+    /// The document that holds revision `rev_id`; `Ok(None)` when no
+    /// document does. Revision ids are unique across documents (the
+    /// primary key), so a writer checks ownership before claiming one.
+    pub fn revision_document(&self, rev_id: &str) -> Result<Option<String>, StoreV2Error> {
+        validate_document_id(rev_id)?;
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT doc_id FROM revisions WHERE rev_id = ?1",
+                params![rev_id],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
     /// Loads one document and its revisions (insertion order). `Ok(None)`
     /// for a document this root has never stored. Revisions of a missing
     /// document cannot exist (the foreign key), so there is no

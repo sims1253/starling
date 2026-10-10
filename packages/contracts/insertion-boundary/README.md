@@ -17,7 +17,8 @@ The Python oracle (`tests/insertion_boundary.py`) and the Rust port
 ## Inputs and outputs
 
 Inputs: `before` (text immediately before the insertion point), `after`
-(text immediately after it), `raw` (the dictated text) and `verbatim`.
+(text immediately after it), `showing_hint` (optional, default `false`),
+`raw` (the dictated text) and `verbatim`.
 
 Output: the adjusted text plus the rules that fired, each `leading_space` or
 `first_letter_case`. When no rule fires, the output is byte-for-byte `raw`.
@@ -26,7 +27,10 @@ A fixture change's `detail` is an explanation for readers, not compared.
 ## Rules
 
 1. **Verbatim.** `verbatim: true` → no changes at all.
-2. **Leading space.** Prepend one U+0020 iff all hold:
+2. **Hint text.** `showing_hint: true` means the field shows only its
+   placeholder (Android's `isShowingHintText`): `before` and `after` are
+   hint text, and the field is treated as empty (`before` reads as `""`).
+3. **Leading space.** Prepend one U+0020 iff all hold:
    - `before` is non-empty;
    - its last character is neither whitespace nor in the opening set
      `( [ { " ' “ ‘ „ « 「 『 【 （` (straight `"` and `'` are ambiguous at an
@@ -36,7 +40,7 @@ A fixture change's `detail` is an explanation for readers, not compared.
      Han, kana or CJK punctuation (U+3000–30FF, 31F0–31FF, 3400–4DBF,
      4E00–9FFF, F900–FAFF, FF01–FF0F, FF1A–FF20, FF5B–FF9F, 20000–3FFFF).
      Hangul is not in the set: Korean is spaced like Latin text.
-3. **First-letter case.** Take the first cased character of `raw`; if it has
+4. **First-letter case.** Take the first cased character of `raw`; if it has
    a lowercase mapping different from itself, replace it with its **full**
    lowercase mapping (`İ` → `i̇`, Python `str.lower()` semantics), iff all
    hold:
@@ -44,12 +48,13 @@ A fixture change's `detail` is an explanation for readers, not compared.
    - `before`'s trailing whitespace contains no `\n` or `\r` (a new line
      behaves like the start of a field);
    - `before`'s last non-whitespace character is alphanumeric or one of
-     `, ; : ) ] } ” ’ » 」 』 】 ） 》`. Sentence enders (`. ! ? … 。 ！ ？`)
-     and the opening set keep the case.
+     `, ; : ) ] } ” ’ » 」 』 】 ） 》 ، ؛` (the last two are the Arabic comma
+     and semicolon). Sentence enders (`. ! ? … 。 ！ ？ ؟ ।`) and the opening
+     set keep the case.
 
    If the first cased character is already lowercase, nothing changes:
    later capitals are never touched.
-4. **Trailing.** Never. The end of `raw` is not modified whatever `after`
+5. **Trailing.** Never. The end of `raw` is not modified whatever `after`
    contains; `after` is part of the contract so future rules have pinned
    data.
 
@@ -61,18 +66,45 @@ all-uppercase with at least two letters (`NASA`); or is the English pronoun
 `I`, alone or followed by a non-alphanumeric character (`I,` `I.` `I'm`
 `I’ll`).
 
-Scripts without case (CJK, Arabic, Hebrew) never get a case change.
-Processing is on logical text: no reordering,
-no normalization.
+Scripts without case (CJK, Arabic, Hebrew, Devanagari) never get a case
+change. Processing is on logical text (right-to-left text included): no
+reordering, no normalization.
 
 ## Security
 
 Surrounding text is read only where the platform exposes it without extra
 permissions, and **never** for secure/password fields or fields marked
 incognito (`IME_FLAG_NO_PERSONALIZED_LEARNING`); enforcing that is the
-adapter's duty (`DeliveryAdapter::surrounding_text`). The text is used for
-this decision only: it is not stored in history and not sent to any
-processing provider.
+adapter's duty (`DeliveryAdapter::surrounding_text`, which answers
+`SurroundingRead::Protected` for such fields without reading them). The
+text is used for this decision only: it is not stored in history and not
+sent to any processing provider.
+
+## Delivery (desktop runtime)
+
+- The adjusted text is a revision derived from the requested one: id
+  `{revId}:boundary-{space|case|space-case}`, `provenance:
+  "insertion-boundary"`, slot `derived` in `docs.get`, persisted in
+  storage v2 (`disposition: "derived"`, `sources_json.derivedFrom`). It
+  never advances the document head; the requested revision is not edited.
+- A derived id is always a legal `msgId` (at most 128 bytes). When
+  `{revId}:boundary-{rules}` would be longer (a `revId` over 108 bytes
+  with `space-case`), the runtime emits
+  `{revId prefix}.{digest}:boundary-{rules}`: `digest` is the 64-bit
+  FNV-1a hash of the full unshortened id as 16 lowercase hex digits, and
+  the prefix is the first `128 - 17 - len(":boundary-{rules}")` bytes of
+  `revId`. (The runtime also bounds a rule list too long to keep whole,
+  `{prefix of the full id}.{digest}`; today's three rule lists never
+  need it.) See `delivery::derived_id`.
+- `delivery.prepare{boundary}` chooses: `adjust` (default) applies the
+  rules where the target reports surrounding text; `raw` is the explicit
+  bypass that delivers the requested revision unchanged; `verbatim` is a
+  verbatim mode's flag and disables every rule. Neither `raw` nor
+  `verbatim` reads the surrounding text.
+- The surrounding text is read at prepare and again at apply. If it
+  changed in between, apply re-derives from the requested revision and
+  delivers that; a stale adjustment is never delivered. A target that
+  stops reporting text by apply time gets the requested text unchanged.
 
 ## Files
 

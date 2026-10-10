@@ -22,9 +22,16 @@
 //! `report_divergence`) and outrun by the session state: v1 defines no
 //! docs failure event, so the machine keeps its in-memory truth and the
 //! divergence surfaces at the next hydration.
+//!
+//! Derived revisions (#341): the delivery machine registers the text it
+//! delivers after the insertion-boundary rules adjusted it through
+//! [`DerivedRevisions`]. A derived revision is stored and served like any
+//! other (`slot: "derived"`, `derivedFrom` naming its source) but never
+//! moves the head, and its source revision is never edited.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde_json::{json, Value};
 
@@ -45,6 +52,9 @@ pub enum RevisionSlot {
     Committed,
     /// A conflict candidate retained for explicit user choice.
     Preserved,
+    /// Delivery-time text derived from another revision (the
+    /// insertion-boundary rules, #341). Never the head.
+    Derived,
 }
 
 impl RevisionSlot {
@@ -53,6 +63,7 @@ impl RevisionSlot {
         match self {
             RevisionSlot::Committed => "committed",
             RevisionSlot::Preserved => "preserved",
+            RevisionSlot::Derived => "derived",
         }
     }
 
@@ -63,6 +74,7 @@ impl RevisionSlot {
         match text {
             "preserved" => RevisionSlot::Preserved,
             "committed" => RevisionSlot::Committed,
+            "derived" => RevisionSlot::Derived,
             other => {
                 eprintln!("documents machine: unknown disposition {other:?}, read as committed");
                 RevisionSlot::Committed
@@ -71,10 +83,29 @@ impl RevisionSlot {
     }
 }
 
-#[derive(Debug, Clone)]
-struct StoredRevision {
-    revision: Revision,
-    slot: RevisionSlot,
+/// One revision of a document with its slot; `derived_from` names the
+/// source of a [`RevisionSlot::Derived`] revision.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredRevision {
+    pub revision: Revision,
+    pub slot: RevisionSlot,
+    pub derived_from: Option<String>,
+}
+
+impl StoredRevision {
+    fn new(revision: Revision, slot: RevisionSlot) -> StoredRevision {
+        StoredRevision {
+            revision,
+            slot,
+            derived_from: None,
+        }
+    }
+
+    /// Whether `delivery.prepare` may name it: heads and derived
+    /// revisions are deliverable, preserved candidates are not.
+    fn deliverable(&self) -> bool {
+        self.slot != RevisionSlot::Preserved
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -85,8 +116,9 @@ struct DocumentRecord {
     revisions: Vec<StoredRevision>,
 }
 
-/// Committed heads the delivery service may prepare against
-/// (`{docId → revision}`), runtime-owned.
+/// The revisions the delivery service may prepare against — committed
+/// heads and derived revisions — keyed by revision id (`{revId → (docId,
+/// revision)}`), runtime-owned and written only by the document service.
 pub type RevisionRegistry = Arc<Mutex<HashMap<String, (String, Revision)>>>;
 
 /// A document's durable state as [`DocumentStore::load_document`] returns
@@ -96,7 +128,7 @@ pub struct StoredDocument {
     pub name: String,
     pub head_revision: u64,
     pub turn_seq: u32,
-    pub revisions: Vec<(Revision, RevisionSlot)>,
+    pub revisions: Vec<StoredRevision>,
 }
 
 /// The persistence seam for documents and revisions: the write-through
@@ -120,6 +152,24 @@ pub trait DocumentStore: Send + Sync {
     ) -> Result<(), String> {
         self.upsert_document(doc_id, name, head_revision, turn_seq)?;
         self.store_revision(doc_id, revision, RevisionSlot::Committed)
+    }
+    /// Stores a revision derived from `derived_from` (#341). Never moves
+    /// the head. The default keeps the slot and drops the link.
+    fn store_derived(
+        &self,
+        doc_id: &str,
+        revision: &Revision,
+        derived_from: &str,
+    ) -> Result<(), String> {
+        let _ = derived_from;
+        self.store_revision(doc_id, revision, RevisionSlot::Derived)
+    }
+    /// The document durably holding revision `rev_id`, also one this
+    /// session never hydrated. The default answers "none" (the in-memory
+    /// store has no durable state beyond the session's documents).
+    fn revision_owner(&self, rev_id: &str) -> Result<Option<String>, String> {
+        let _ = rev_id;
+        Ok(None)
     }
     fn bump_turn(&self, doc_id: &str, turn_seq: u32) -> Result<(), String>;
     /// One document's durable rows; `Ok(None)` when this store has never
@@ -187,10 +237,10 @@ impl DocumentStore for MemoryDocumentStore {
 /// The storage-v2 documents store (I5 wiring, issue #220): the I3 seam
 /// over `StoreV2`'s `documents`/`revisions` tables. `sources_json`
 /// carries the I3 [`Revision`] provenance the §4 schema has no column
-/// for — `sourceAttemptIds` + `instructionTemplateId` as one JSON
-/// object, parsed back defensively on load (a missing or malformed
-/// object reads as empty provenance, never as a row that cannot be
-/// served).
+/// for — `sourceAttemptIds` + `instructionTemplateId` (+ `derivedFrom`
+/// for a derived revision) as one JSON object, parsed back defensively on
+/// load (a missing or malformed object reads as empty provenance, never
+/// as a row that cannot be served).
 pub struct V2DocumentStore {
     store: Mutex<StoreV2>,
 }
@@ -204,27 +254,30 @@ impl V2DocumentStore {
     }
 
     /// The §4 provenance encoding of an I3 revision.
-    fn sources_json(revision: &Revision) -> String {
-        json!({
+    fn sources_json(revision: &Revision, derived_from: Option<&str>) -> String {
+        let mut sources = json!({
             "attempts": revision.source_attempt_ids,
             "instructionTemplateId": revision.instruction_template_id,
-        })
-        .to_string()
+        });
+        if let Some(source) = derived_from {
+            sources["derivedFrom"] = json!(source);
+        }
+        sources.to_string()
     }
 
     /// Parses [`Self::sources_json`] back; unknown shapes (a newer
     /// writer's vocabulary) degrade to empty provenance rather than
     /// failing the document.
-    fn parse_sources(text: Option<&str>) -> (Vec<String>, String) {
+    fn parse_sources(text: Option<&str>) -> (Vec<String>, String, Option<String>) {
         let Some(text) = text else {
-            return (Vec::new(), String::new());
+            return (Vec::new(), String::new(), None);
         };
         let Ok(value) = serde_json::from_str::<Value>(text) else {
             eprintln!(
                 "documents machine: unparsable sources_json ({} bytes), provenance lost",
                 text.len()
             );
-            return (Vec::new(), String::new());
+            return (Vec::new(), String::new(), None);
         };
         let attempts = value
             .get("attempts")
@@ -242,15 +295,24 @@ impl V2DocumentStore {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        (attempts, template)
+        let derived_from = value
+            .get("derivedFrom")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        (attempts, template, derived_from)
     }
 
-    fn revision_row(doc_id: &str, revision: &Revision, slot: RevisionSlot) -> RevisionRow {
+    fn revision_row(
+        doc_id: &str,
+        revision: &Revision,
+        slot: RevisionSlot,
+        derived_from: Option<&str>,
+    ) -> RevisionRow {
         RevisionRow {
             rev_id: revision.rev_id.clone(),
             doc_id: doc_id.to_string(),
             base_revision: Some(revision.base_revision),
-            sources_json: Some(Self::sources_json(revision)),
+            sources_json: Some(Self::sources_json(revision, derived_from)),
             text: revision.text.clone(),
             status: revision.status.clone(),
             provenance: Some(revision.provenance.clone()),
@@ -258,11 +320,11 @@ impl V2DocumentStore {
         }
     }
 
-    fn row_to_stored(row: &RevisionRow) -> (Revision, RevisionSlot) {
-        let (source_attempt_ids, instruction_template_id) =
+    fn row_to_stored(row: &RevisionRow) -> StoredRevision {
+        let (source_attempt_ids, instruction_template_id, derived_from) =
             Self::parse_sources(row.sources_json.as_deref());
-        (
-            Revision {
+        StoredRevision {
+            revision: Revision {
                 rev_id: row.rev_id.clone(),
                 base_revision: row.base_revision.unwrap_or(0),
                 source_attempt_ids,
@@ -271,8 +333,9 @@ impl V2DocumentStore {
                 status: row.status.clone(),
                 provenance: row.provenance.clone().unwrap_or_default(),
             },
-            RevisionSlot::from_disposition(row.disposition.as_deref().unwrap_or("committed")),
-        )
+            slot: RevisionSlot::from_disposition(row.disposition.as_deref().unwrap_or("committed")),
+            derived_from,
+        }
     }
 }
 
@@ -297,7 +360,20 @@ impl DocumentStore for V2DocumentStore {
         revision: &Revision,
         slot: RevisionSlot,
     ) -> Result<(), String> {
-        let row = Self::revision_row(doc_id, revision, slot);
+        let row = Self::revision_row(doc_id, revision, slot, None);
+        self.store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .store_document_revision(&row)
+            .map_err(|err| err.to_string())
+    }
+    fn store_derived(
+        &self,
+        doc_id: &str,
+        revision: &Revision,
+        derived_from: &str,
+    ) -> Result<(), String> {
+        let row = Self::revision_row(doc_id, revision, RevisionSlot::Derived, Some(derived_from));
         self.store
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -312,11 +388,18 @@ impl DocumentStore for V2DocumentStore {
         turn_seq: u32,
         revision: &Revision,
     ) -> Result<(), String> {
-        let row = Self::revision_row(doc_id, revision, RevisionSlot::Committed);
+        let row = Self::revision_row(doc_id, revision, RevisionSlot::Committed, None);
         self.store
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .commit_document_head(name, head_revision, turn_seq, &row)
+            .map_err(|err| err.to_string())
+    }
+    fn revision_owner(&self, rev_id: &str) -> Result<Option<String>, String> {
+        self.store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .revision_document(rev_id)
             .map_err(|err| err.to_string())
     }
     fn bump_turn(&self, doc_id: &str, turn_seq: u32) -> Result<(), String> {
@@ -357,7 +440,60 @@ fn report_store_failure(operation: &str, doc: &str, detail: String) {
 /// Messages the document actor receives.
 pub enum DocsMsg {
     Command(Inbound),
+    /// The delivery machine registering a derived revision (#341);
+    /// replies once it is in the document and the registry.
+    RecordDerived {
+        doc_id: String,
+        derived_from: String,
+        revision: Revision,
+        reply: crate::channel::Sender<Result<(), Rejection>>,
+    },
     Shutdown,
+}
+
+/// The delivery actor's handle onto the document service for derived
+/// revisions (#341): the only way delivery adds a revision, so a derived
+/// revision is served by `docs.get` and persisted like any other.
+#[derive(Clone)]
+pub struct DerivedRevisions {
+    inbox: crate::channel::Sender<DocsMsg>,
+}
+
+impl DerivedRevisions {
+    pub fn new(inbox: crate::channel::Sender<DocsMsg>) -> DerivedRevisions {
+        DerivedRevisions { inbox }
+    }
+
+    /// Registers `revision`, derived from `derived_from`, in `doc_id`.
+    /// Re-registering an identical revision is a no-op;
+    /// [`Rejection::RevisionIdTaken`] when a different revision already
+    /// holds the id. Bounded wait: a busy document service answers
+    /// [`Rejection::InboxFull`] (retryable; a late registration is the
+    /// same idempotent write).
+    pub fn record(
+        &self,
+        doc_id: &str,
+        derived_from: &str,
+        revision: Revision,
+    ) -> Result<(), Rejection> {
+        let (tx, rx) = crate::channel::bounded(1);
+        self.inbox
+            .try_send(DocsMsg::RecordDerived {
+                doc_id: doc_id.to_string(),
+                derived_from: derived_from.to_string(),
+                revision,
+                reply: tx,
+            })
+            .map_err(|err| match err {
+                crate::channel::TrySendError::Full(_) => Rejection::InboxFull,
+                crate::channel::TrySendError::Closed(_) => Rejection::Closed,
+            })?;
+        match rx.recv_timeout(Duration::from_millis(2_000)) {
+            Ok(result) => result,
+            Err(crate::channel::RecvError::Timeout) => Err(Rejection::InboxFull),
+            Err(crate::channel::RecvError::Closed) => Err(Rejection::Closed),
+        }
+    }
 }
 
 /// The document service actor.
@@ -394,6 +530,14 @@ impl DocsActor {
         loop {
             match self.inbox.recv() {
                 Ok(DocsMsg::Command(inbound)) => self.handle_command(inbound),
+                Ok(DocsMsg::RecordDerived {
+                    doc_id,
+                    derived_from,
+                    revision,
+                    reply,
+                }) => {
+                    let _ = reply.try_send(self.record_derived(doc_id, derived_from, revision));
+                }
                 Ok(DocsMsg::Shutdown) | Err(crate::channel::RecvError::Closed) => break,
                 Err(crate::channel::RecvError::Timeout) => {
                     unreachable!("recv has no timeout")
@@ -426,8 +570,8 @@ impl DocsActor {
         }
         match self.store.load_document(doc_id) {
             Ok(Some(stored)) => {
-                // Re-publish the durable committed revisions so
-                // delivery.prepare resolves them after a restart (the
+                // Re-publish the durable committed and derived revisions
+                // so delivery.prepare resolves them after a restart (the
                 // registry is the delivery actor's only lookup source).
                 self.revisions
                     .lock()
@@ -436,9 +580,12 @@ impl DocsActor {
                         stored
                             .revisions
                             .iter()
-                            .filter(|(_, slot)| *slot == RevisionSlot::Committed)
-                            .map(|(revision, _)| {
-                                (revision.rev_id.clone(), (doc_id.to_string(), revision.clone()))
+                            .filter(|stored| stored.deliverable())
+                            .map(|stored| {
+                                (
+                                    stored.revision.rev_id.clone(),
+                                    (doc_id.to_string(), stored.revision.clone()),
+                                )
                             }),
                     );
                 self.documents.insert(
@@ -447,11 +594,7 @@ impl DocsActor {
                         name: stored.name,
                         head_revision: stored.head_revision,
                         turn_seq: stored.turn_seq,
-                        revisions: stored
-                            .revisions
-                            .into_iter()
-                            .map(|(revision, slot)| StoredRevision { revision, slot })
-                            .collect(),
+                        revisions: stored.revisions,
                     },
                 );
             }
@@ -482,6 +625,13 @@ impl DocsActor {
                 expected_base,
                 new_revision,
             } => {
+                // A held revision id is never written again: neither the
+                // head nor a conflict candidate may replace its row.
+                self.hydrate(&doc_id);
+                if let Some(rejection) = self.claimed(&doc_id, &new_revision.rev_id) {
+                    let _ = reply.try_send(Err(rejection));
+                    return;
+                }
                 match self.core.commit_command("docs.updateHead", Some(corr.clone())) {
                     Ok(_) => {
                         let _ = reply.try_send(Ok(Receipt::Accepted));
@@ -573,10 +723,10 @@ impl DocsActor {
             record.head_revision = new_head;
             let mut committed = revision.clone();
             committed.base_revision = actual;
-            record.revisions.push(StoredRevision {
-                revision: committed.clone(),
-                slot: RevisionSlot::Committed,
-            });
+            record.revisions.push(StoredRevision::new(
+                committed.clone(),
+                RevisionSlot::Committed,
+            ));
             if let Err(detail) =
                 self.store
                     .commit_head(&doc_id, &record.name, new_head, record.turn_seq, &committed)
@@ -616,13 +766,13 @@ impl DocsActor {
             candidate.base_revision = expected_base;
             // The candidate is retained for explicit user choice — the
             // conflict persists until the user acts.
-            record.revisions.push(StoredRevision {
-                revision: candidate,
-                slot: RevisionSlot::Preserved,
-            });
+            record.revisions.push(StoredRevision::new(
+                candidate.clone(),
+                RevisionSlot::Preserved,
+            ));
             if let Err(detail) = self
                 .store
-                .store_revision(&doc_id, &revision, RevisionSlot::Preserved)
+                .store_revision(&doc_id, &candidate, RevisionSlot::Preserved)
             {
                 report_store_failure("store_revision(preserved)", &doc_id, detail);
             }
@@ -635,6 +785,90 @@ impl DocsActor {
                 },
                 &corr,
             );
+        }
+    }
+
+    /// Adds a derived revision to its source's document without touching
+    /// the head or the machine state (no v1 command or event models it).
+    /// Ids are unique across documents, preserved candidates and documents
+    /// this session never hydrated included: an identical revision under
+    /// the id is the same derivation again, anything else is an unrelated
+    /// revision that must not be replaced.
+    fn record_derived(
+        &mut self,
+        doc_id: String,
+        derived_from: String,
+        revision: Revision,
+    ) -> Result<(), Rejection> {
+        self.hydrate(&doc_id);
+        if let Some((held_doc, stored)) = self.held(&revision.rev_id) {
+            let same = held_doc == doc_id
+                && stored.slot == RevisionSlot::Derived
+                && stored.derived_from.as_deref() == Some(derived_from.as_str())
+                && stored.revision == revision;
+            return if same {
+                Ok(())
+            } else {
+                Err(Rejection::RevisionIdTaken {
+                    revision_id: revision.rev_id,
+                })
+            };
+        }
+        if let Some(rejection) = self.claimed(&doc_id, &revision.rev_id) {
+            return Err(rejection);
+        }
+        let Some(record) = self.documents.get_mut(&doc_id) else {
+            return Err(Rejection::UnknownRevision {
+                revision_id: derived_from,
+            });
+        };
+        if let Err(detail) = self.store.store_derived(&doc_id, &revision, &derived_from) {
+            report_store_failure("store_derived", &doc_id, detail);
+        }
+        record.revisions.push(StoredRevision {
+            revision: revision.clone(),
+            slot: RevisionSlot::Derived,
+            derived_from: Some(derived_from),
+        });
+        self.revisions
+            .lock()
+            .expect("revision registry lock")
+            .insert(revision.rev_id.clone(), (doc_id, revision));
+        Ok(())
+    }
+
+    /// The hydrated document and stored revision holding `rev_id`.
+    fn held(&self, rev_id: &str) -> Option<(&str, &StoredRevision)> {
+        self.documents.iter().find_map(|(doc_id, record)| {
+            record
+                .revisions
+                .iter()
+                .find(|stored| stored.revision.rev_id == rev_id)
+                .map(|stored| (doc_id.as_str(), stored))
+        })
+    }
+
+    /// Why `rev_id` cannot be claimed by a new revision: a hydrated
+    /// document or the durable store already holds it (also a document
+    /// this session never loaded), or the store could not say whether one
+    /// does — the write it would guard replaces a same-document row.
+    fn claimed(&self, doc_id: &str, rev_id: &str) -> Option<Rejection> {
+        if self.held(rev_id).is_some() {
+            return Some(Rejection::RevisionIdTaken {
+                revision_id: rev_id.to_string(),
+            });
+        }
+        match self.store.revision_owner(rev_id) {
+            Ok(None) => None,
+            Ok(Some(_)) => Some(Rejection::RevisionIdTaken {
+                revision_id: rev_id.to_string(),
+            }),
+            Err(detail) => {
+                report_store_failure("revision_owner", doc_id, detail);
+                Some(Rejection::RevisionIdUnverified {
+                    revision_id: rev_id.to_string(),
+                })
+            }
         }
     }
 
@@ -651,16 +885,17 @@ impl DocsActor {
                     .skip(start)
                     .take(DOCS_PAGE_SIZE)
                     .map(|stored| {
-                        json!({
+                        let mut view = json!({
                             "revId": stored.revision.rev_id,
                             "baseRevision": stored.revision.base_revision,
-                            "slot": match stored.slot {
-                                RevisionSlot::Committed => "committed",
-                                RevisionSlot::Preserved => "preserved",
-                            },
+                            "slot": stored.slot.as_disposition(),
                             "text": stored.revision.text,
                             "provenance": stored.revision.provenance,
-                        })
+                        });
+                        if let Some(source) = &stored.derived_from {
+                            view["derivedFrom"] = json!(source);
+                        }
+                        view
                     })
                     .collect();
                 json!({
