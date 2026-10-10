@@ -1184,9 +1184,10 @@ impl StoreV2 {
     }
 
     /// Inserts a `recognition_attempts` row, stamped with its creation
-    /// time (the summary's updated-at source).
+    /// time (the summary's updated-at source). A savepoint, so it nests
+    /// inside [`Self::begin_recognition`]'s write-locked transaction.
     pub fn insert_attempt(&mut self, attempt: &AttemptRecord) -> Result<(), StoreV2Error> {
-        let tx = self.conn.transaction()?;
+        let tx = self.conn.savepoint()?;
         tx.execute(
             "INSERT INTO recognition_attempts(
                 id, capture_id, backend, model_hash, language, options_json, text,
@@ -2394,7 +2395,20 @@ impl StoreV2 {
         policy: &RetentionPolicy,
         now: time::OffsetDateTime,
     ) -> Result<RetentionReport, StoreV2Error> {
+        self.apply_live_retention_policy(|| policy.clone(), now)
+    }
+
+    /// [`Self::apply_retention_policy`] for a policy the user may change
+    /// while the run goes: `current` is read at the start and again
+    /// under the write lock before each removal; when it no longer
+    /// matches, the run stops ([`RetentionReport::policy_changed`]).
+    pub fn apply_live_retention_policy(
+        &mut self,
+        current: impl Fn() -> RetentionPolicy,
+        now: time::OffsetDateTime,
+    ) -> Result<RetentionReport, StoreV2Error> {
         let mut report = RetentionReport::default();
+        let policy = &current();
         if !policy.is_active() {
             return Ok(report);
         }
@@ -2438,6 +2452,26 @@ impl StoreV2 {
                 // lock: another connection cannot start a transcription,
                 // add a revision or a correction record in between.
                 let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+                if current() != *policy {
+                    report.policy_changed = true;
+                    return Ok(report);
+                }
+                // Moved to another class (or deleted) since the walk read
+                // it: those limits decide, on their own walk.
+                let still_here = self
+                    .conn
+                    .query_row(
+                        "SELECT 1 FROM captures WHERE id = ?1 AND retention_class = ?2",
+                        params![id, class],
+                        |_| Ok(()),
+                    )
+                    .optional()?
+                    .is_some();
+                if !still_here {
+                    drop(tx);
+                    kept_bytes -= bytes;
+                    continue;
+                }
                 if let Some(hold) = self.retention_hold(&id, &created_utc, &grace_cutoff, policy)? {
                     drop(tx);
                     report.held.push(HeldAudio {
@@ -2469,12 +2503,12 @@ impl StoreV2 {
         Ok(report)
     }
 
-    /// [`Self::apply_retention_policy`] as of the current time.
+    /// [`Self::apply_live_retention_policy`] as of the current time.
     pub fn apply_retention_policy_now(
         &mut self,
-        policy: &RetentionPolicy,
+        current: impl Fn() -> RetentionPolicy,
     ) -> Result<RetentionReport, StoreV2Error> {
-        self.apply_retention_policy(policy, time::OffsetDateTime::now_utc())
+        self.apply_live_retention_policy(current, time::OffsetDateTime::now_utc())
     }
 
     /// Why a due take keeps its audio, if it does.
@@ -3538,8 +3572,40 @@ impl StoreV2 {
         backend: &str,
         options_json: Option<&str>,
     ) -> Result<String, StoreV2Error> {
+        // The checks and the insert hold the database's write lock: the
+        // retention policy (#342), on this connection or another, either
+        // sees this attempt and keeps the audio, or retired it first and
+        // the attempt is refused — never an attempt on removed audio.
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let begun = self
+            .begin_recognition_locked(capture_id, backend, options_json)
+            .and_then(|id| match self.conn.execute_batch("COMMIT") {
+                Ok(()) => Ok(id),
+                Err(err) => {
+                    self.release_attempt_lock(&id);
+                    Err(err.into())
+                }
+            });
+        if begun.is_err() {
+            let _ = self.conn.execute_batch("ROLLBACK");
+        }
+        begun
+    }
+
+    fn begin_recognition_locked(
+        &mut self,
+        capture_id: &str,
+        backend: &str,
+        options_json: Option<&str>,
+    ) -> Result<String, StoreV2Error> {
         if self.get_capture(capture_id)?.is_none() {
             return Err(StoreV2Error::NotFound(capture_id.to_string()));
+        }
+        if let Some(utc) = self.audio_retired_utc(capture_id)? {
+            return Err(StoreV2Error::Invalid(format!(
+                "the audio of capture {capture_id} was removed by the retention policy on \
+                 {utc}; it cannot be transcribed again"
+            )));
         }
         let id = format!("a_{}", uuid::Uuid::new_v4().simple());
         self.hold_attempt_lock(&id)?;
@@ -4364,6 +4430,10 @@ pub struct RetentionReport {
     /// `(class, bytes)` a size limit is still exceeded by after the run
     /// (held takes count toward their class).
     pub over_limit: Vec<(String, u64)>,
+    /// The policy changed while the run went (the user saved other
+    /// limits): it stopped before removing anything the new policy may
+    /// not want removed. The caller runs again with the new one.
+    pub policy_changed: bool,
 }
 
 /// One take whose audio the policy removed.

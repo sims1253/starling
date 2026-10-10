@@ -900,3 +900,89 @@ fn retention_decides_after_a_peer_connection_commits() {
     assert_eq!(held(&report, &id), Some(HoldReason::InUse));
     assert_eq!(store.audio_at_rest(&id).expect("state"), AudioAtRest::Journal);
 }
+
+#[test]
+fn retired_audio_is_never_transcribed_again() {
+    // A retry that loaded the audio just before the policy removed it
+    // (another instance's sweep) cannot start its attempt.
+    let dir = TempDir::new().expect("tempdir");
+    let mut store = store_in(&dir);
+    let id = aged_take(&mut store, 90, 16_000);
+    let report = store
+        .apply_retention_policy(&policy(STANDARD_CLASS, age(30)), time::OffsetDateTime::now_utc())
+        .expect("apply");
+    assert_eq!(retired_ids(&report), vec![id.clone()]);
+    let err = store
+        .begin_recognition(&id, "engine:test", None)
+        .expect_err("refused");
+    assert!(err.to_string().contains("retention policy"), "{err}");
+    assert!(
+        store
+            .attempts_for(&id)
+            .expect("attempts")
+            .iter()
+            .all(|attempt| attempt.status != "started"),
+        "no attempt row was left behind"
+    );
+}
+
+#[test]
+fn a_policy_changed_mid_run_stops_before_removing_more() {
+    let dir = TempDir::new().expect("tempdir");
+    let mut store = store_in(&dir);
+    let older = aged_take(&mut store, 120, 16_000);
+    let old = aged_take(&mut store, 90, 16_000);
+    let limited = policy(STANDARD_CLASS, age(30));
+    // The user lifts the limit right after the first removal.
+    let reads = std::cell::Cell::new(0);
+    let report = store
+        .apply_live_retention_policy(
+            || {
+                reads.set(reads.get() + 1);
+                if reads.get() <= 2 {
+                    limited.clone()
+                } else {
+                    RetentionPolicy::default()
+                }
+            },
+            time::OffsetDateTime::now_utc(),
+        )
+        .expect("apply");
+    assert!(report.policy_changed);
+    // Walked newest first: `old` went under the limit as it stood then.
+    assert_eq!(retired_ids(&report), vec![old]);
+    assert_eq!(store.audio_at_rest(&older).expect("state"), AudioAtRest::Journal);
+}
+
+#[test]
+fn a_class_change_by_a_peer_mid_run_is_respected() {
+    // A peer moves a due take into an unlimited class while the sweep
+    // waits for the write lock: the take is not removed.
+    let dir = TempDir::new().expect("tempdir");
+    let mut store = store_in(&dir);
+    let id = aged_take(&mut store, 90, 16_000);
+    let peer = Connection::open(store.root().join(DB_FILE)).expect("peer");
+    peer.busy_timeout(std::time::Duration::from_secs(5))
+        .expect("busy timeout");
+    peer.execute_batch("BEGIN IMMEDIATE").expect("peer write lock");
+    peer.execute(
+        "UPDATE captures SET retention_class = ?2 WHERE id = ?1",
+        params![id, ARCHIVAL_CLASS],
+    )
+    .expect("peer class change");
+
+    let sweeper = std::thread::spawn(move || {
+        let report = store
+            .apply_retention_policy(
+                &policy(STANDARD_CLASS, age(30)),
+                time::OffsetDateTime::now_utc(),
+            )
+            .expect("apply");
+        (store, report)
+    });
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    peer.execute_batch("COMMIT").expect("peer commit");
+    let (store, report) = sweeper.join().expect("sweeper");
+    assert!(report.retired.is_empty(), "{report:?}");
+    assert_eq!(store.audio_at_rest(&id).expect("state"), AudioAtRest::Journal);
+}

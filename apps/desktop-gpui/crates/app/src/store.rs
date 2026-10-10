@@ -654,8 +654,9 @@ impl Store {
     /// it is off). The guard covers only the cheap steps — listing the
     /// candidates, each publish, the policy run — never an encode, so a
     /// long take's compression does not pin every other store call.
-    /// `policy` is read under the guard right before the policy run, so
-    /// a limit the user lifted while the pass compressed is not applied.
+    /// `policy` is read under the guard when the policy run starts and
+    /// again before each removal, so a limit the user lifted meanwhile is
+    /// not applied (the run stops; the app runs again).
     pub(crate) fn audio_upkeep(
         &self,
         policy: impl Fn() -> RetentionPolicy,
@@ -684,9 +685,8 @@ impl Store {
                 Err(err) => report.failures.push((job.id.clone(), err.to_string())),
             }
         }
-        let mut store = lock_v2(&self.0);
-        report.retention = store
-            .apply_retention_policy_now(&policy())
+        report.retention = lock_v2(&self.0)
+            .apply_retention_policy_now(policy)
             .map_err(v2_err)?;
         Ok(report)
     }
