@@ -656,19 +656,27 @@ impl Store {
     /// long take's compression does not pin every other store call.
     /// `policy` is read under the guard when the policy run starts and
     /// again before each removal, so a limit the user lifted meanwhile is
-    /// not applied (the run stops; the app runs again).
-    pub(crate) fn audio_upkeep(
+    /// not applied (the run stops; the app runs again). `paused` is asked
+    /// before each compression and before the policy run: when it says
+    /// yes (a take started recording), the pass ends there.
+    pub(crate) fn audio_upkeep<P: std::borrow::Borrow<RetentionPolicy>>(
         &self,
-        policy: impl Fn() -> RetentionPolicy,
+        policy: impl Fn() -> P,
+        paused: impl Fn() -> bool,
     ) -> Result<UpkeepReport, storage::StorageError> {
         let mut report = UpkeepReport::default();
         let jobs = lock_v2(&self.0)
             .compression_candidates(usize::MAX)
             .map_err(v2_err)?;
         for job in jobs {
+            if paused() {
+                report.paused = true;
+                return Ok(report);
+            }
             let prepared = match store_v2::prepare_compression(&job) {
                 Ok(prepared) => prepared,
                 Err(err) => {
+                    lock_v2(&self.0).note_compression_failure(&job.id);
                     report.failures.push((job.id.clone(), err.to_string()));
                     continue;
                 }
@@ -682,8 +690,15 @@ impl Store {
                     report.saved_bytes += journal_bytes.saturating_sub(flac_bytes);
                 }
                 Ok(CompressionOutcome::Skipped(_)) => {}
-                Err(err) => report.failures.push((job.id.clone(), err.to_string())),
+                Err(err) => {
+                    lock_v2(&self.0).note_compression_failure(&job.id);
+                    report.failures.push((job.id.clone(), err.to_string()));
+                }
             }
+        }
+        if paused() {
+            report.paused = true;
+            return Ok(report);
         }
         report.retention = lock_v2(&self.0)
             .apply_retention_policy_now(policy)
@@ -772,6 +787,8 @@ pub(crate) struct UpkeepReport {
     /// stay journals and are tried again next pass.
     pub failures: Vec<(String, String)>,
     pub retention: store_v2::RetentionReport,
+    /// A take started recording and the pass stopped early.
+    pub paused: bool,
 }
 
 impl UpkeepReport {
@@ -830,9 +847,14 @@ impl UpkeepReport {
                 plural(self.failures.len())
             ));
         }
+        if self.paused && !parts.is_empty() {
+            parts.push("paused while a take records".to_string());
+        }
         (!parts.is_empty()).then(|| {
             let mut text = parts.join("; ");
-            text[..1].make_ascii_uppercase();
+            if let Some(first) = text.get_mut(..1) {
+                first.make_ascii_uppercase();
+            }
             format!("{text}.")
         })
     }
@@ -1797,7 +1819,7 @@ mod tests {
         assert_eq!(*before, *saved.wav, "the first transcription's audio");
 
         let upkeep = store
-            .audio_upkeep(store_v2::RetentionPolicy::default)
+            .audio_upkeep(store_v2::RetentionPolicy::default, || false)
             .expect("upkeep");
         assert_eq!(upkeep.compressed, 1);
         assert!(upkeep.saved_bytes > 0);
@@ -1807,10 +1829,47 @@ mod tests {
         assert_eq!(*after, *before);
         // A second pass finds nothing to do.
         let again = store
-            .audio_upkeep(store_v2::RetentionPolicy::default)
+            .audio_upkeep(store_v2::RetentionPolicy::default, || false)
             .expect("upkeep");
         assert_eq!(again.compressed, 0);
         assert!(again.summary().is_none());
+    }
+
+    #[test]
+    fn upkeep_stops_when_a_take_starts_recording() {
+        let store = v2_store("upkeep-paused");
+        let report = finalized_journal("upkeep-paused-src", &vec![0.1f32; 32_000]);
+        let saved = store
+            .save_capture(tiny_wav(32_000), Some(&report))
+            .expect("adopting save");
+        let mut policy = store_v2::RetentionPolicy::default();
+        policy.grace = std::time::Duration::ZERO;
+        policy.include_referenced = true;
+        policy.limits.insert(
+            store_v2::STANDARD_CLASS.to_string(),
+            store_v2::ClassLimits {
+                max_age_days: Some(0),
+                max_total_bytes: None,
+            },
+        );
+        let upkeep = store
+            .audio_upkeep(|| policy.clone(), || true)
+            .expect("upkeep");
+        assert!(upkeep.paused);
+        assert_eq!(upkeep.compressed, 0);
+        assert!(upkeep.retention.retired.is_empty());
+        assert!(upkeep.summary().is_none());
+        let wav = store.audio_wav(&saved.id).expect("load").expect("present");
+        assert_eq!(*wav, *saved.wav, "still the journal, untouched");
+    }
+
+    #[test]
+    fn a_summary_never_slices_inside_a_character() {
+        let report = UpkeepReport {
+            failures: vec![("c_x".to_string(), "unreadable".to_string())],
+            ..UpkeepReport::default()
+        };
+        assert!(report.summary().expect("summary").starts_with("1 recording"));
     }
 
     #[test]
@@ -1830,12 +1889,12 @@ mod tests {
         policy
             .limits
             .insert(store_v2::STANDARD_CLASS.to_string(), expired);
-        let upkeep = store.audio_upkeep(|| policy.clone()).expect("upkeep");
+        let upkeep = store.audio_upkeep(|| policy.clone(), || false).expect("upkeep");
         assert!(upkeep.retention.retired.is_empty());
         policy
             .limits
             .insert(store_v2::ARCHIVAL_CLASS.to_string(), expired);
-        let upkeep = store.audio_upkeep(|| policy.clone()).expect("upkeep");
+        let upkeep = store.audio_upkeep(|| policy.clone(), || false).expect("upkeep");
         assert_eq!(upkeep.retention.retired.len(), 1);
         store.set_archival(&id, false).expect("unarchive");
         assert!(!summary_of(&store, &id).archival);
@@ -1855,11 +1914,11 @@ mod tests {
             },
         );
         let pin = store.pin_audio(&id);
-        let upkeep = store.audio_upkeep(|| policy.clone()).expect("upkeep");
+        let upkeep = store.audio_upkeep(|| policy.clone(), || false).expect("upkeep");
         assert!(upkeep.retention.retired.is_empty());
         assert!(store.audio_wav(&id).expect("load").is_some());
         drop(pin);
-        let upkeep = store.audio_upkeep(|| policy.clone()).expect("upkeep");
+        let upkeep = store.audio_upkeep(|| policy.clone(), || false).expect("upkeep");
         assert_eq!(upkeep.retention.retired.len(), 1);
     }
 
@@ -1876,7 +1935,7 @@ mod tests {
                 max_total_bytes: None,
             },
         );
-        let upkeep = store.audio_upkeep(|| policy.clone()).expect("upkeep");
+        let upkeep = store.audio_upkeep(|| policy.clone(), || false).expect("upkeep");
         assert_eq!(upkeep.retention.retired.len(), 1);
         assert!(
             upkeep.summary().expect("summary").contains("removed the audio of 1 recording"),

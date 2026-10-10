@@ -650,6 +650,7 @@ fn writer_loop<S: JournalSink>(
 ) {
     // The first free-space check runs on the first tick.
     let mut next_disk_check = Instant::now();
+    let mut probe_failed = false;
     loop {
         {
             let mut guard = shared.lock_consumer();
@@ -657,7 +658,13 @@ fn writer_loop<S: JournalSink>(
         }
         journal_boundary_step(&shared, &mut journal);
         if let Some(watch) = disk.as_ref() {
-            disk_watch_step(&shared, &mut journal, watch, &mut next_disk_check);
+            disk_watch_step(
+                &shared,
+                &mut journal,
+                watch,
+                &mut next_disk_check,
+                &mut probe_failed,
+            );
         }
         if shared.stopping.load(Ordering::Acquire) {
             {
@@ -791,12 +798,15 @@ fn journal_failed<S: JournalSink>(
 /// sealed up to everything appended so far with a boundary right away —
 /// while there is still room for that record — so the take is fully
 /// acknowledged and recoverable whatever happens before the stop lands.
-/// A probe that cannot answer leaves the last reading in place.
+/// A probe that cannot answer leaves the last reading in place and is
+/// logged once per take; a journal write that hits a full disk still
+/// stops the take ([`journal_failed`]).
 fn disk_watch_step<S: JournalSink>(
     shared: &Shared,
     journal: &mut Option<JournalWriter<S>>,
     watch: &DiskWatch,
     next_check: &mut Instant,
+    probe_failed: &mut bool,
 ) {
     let Some(writer) = journal.as_mut() else {
         return;
@@ -809,8 +819,14 @@ fn disk_watch_step<S: JournalSink>(
     let Some(dir) = writer.path().parent() else {
         return;
     };
-    let Ok(reading) = watch.policy.check(watch.probe.as_ref(), dir) else {
-        return;
+    let reading = match watch.policy.check(watch.probe.as_ref(), dir) {
+        Ok(reading) => reading,
+        Err(err) => {
+            if !std::mem::replace(probe_failed, true) {
+                eprintln!("Free-space check of {dir:?} failed: {err}");
+            }
+            return;
+        }
     };
     // Seal before publishing: whoever sees the critical reading sees
     // every sample appended so far already acknowledged.

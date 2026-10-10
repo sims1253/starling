@@ -1014,18 +1014,17 @@ fn retention_decides_after_a_peer_connection_commits() {
     )
     .expect("peer attempt");
 
-    let sweeper = std::thread::spawn(move || {
-        let report = store
-            .apply_retention_policy(
-                &policy(STANDARD_CLASS, age(30)),
-                time::OffsetDateTime::now_utc(),
-            )
-            .expect("apply");
-        (store, report)
-    });
-    std::thread::sleep(std::time::Duration::from_millis(300));
-    peer.execute_batch("COMMIT").expect("peer commit");
-    let (store, report) = sweeper.join().expect("sweeper");
+    // Runs after the walk has read the due take and before the sweep
+    // asks for the write lock.
+    store.before_retention_lock = Some(TestHook(Box::new(move || {
+        peer.execute_batch("COMMIT").expect("peer commit");
+    })));
+    let report = store
+        .apply_retention_policy(
+            &policy(STANDARD_CLASS, age(30)),
+            time::OffsetDateTime::now_utc(),
+        )
+        .expect("apply");
     assert!(report.retired.is_empty(), "{report:?}");
     assert_eq!(held(&report, &id), Some(HoldReason::InUse));
     assert_eq!(
@@ -1069,16 +1068,24 @@ fn a_policy_changed_mid_run_stops_before_removing_more() {
     let older = aged_take(&mut store, 120, 16_000);
     let old = aged_take(&mut store, 90, 16_000);
     let limited = policy(STANDARD_CLASS, age(30));
-    // The user lifts the limit right after the first removal.
-    let reads = std::cell::Cell::new(0);
+    // The user lifts the limit as soon as the first removal is visible.
+    let peer = Connection::open(store.root().join(DB_FILE)).expect("peer");
     let report = store
         .apply_live_retention_policy(
             || {
-                reads.set(reads.get() + 1);
-                if reads.get() <= 2 {
-                    limited.clone()
-                } else {
+                let removed_one = peer
+                    .query_row(
+                        "SELECT 1 FROM tombstones WHERE kind = 'audio' LIMIT 1",
+                        [],
+                        |_| Ok(()),
+                    )
+                    .optional()
+                    .expect("peer read")
+                    .is_some();
+                if removed_one {
                     RetentionPolicy::default()
+                } else {
+                    limited.clone()
                 }
             },
             time::OffsetDateTime::now_utc(),
@@ -1111,18 +1118,17 @@ fn a_class_change_by_a_peer_mid_run_is_respected() {
     )
     .expect("peer class change");
 
-    let sweeper = std::thread::spawn(move || {
-        let report = store
-            .apply_retention_policy(
-                &policy(STANDARD_CLASS, age(30)),
-                time::OffsetDateTime::now_utc(),
-            )
-            .expect("apply");
-        (store, report)
-    });
-    std::thread::sleep(std::time::Duration::from_millis(300));
-    peer.execute_batch("COMMIT").expect("peer commit");
-    let (store, report) = sweeper.join().expect("sweeper");
+    // Runs after the walk has read the due take and before the sweep
+    // asks for the write lock.
+    store.before_retention_lock = Some(TestHook(Box::new(move || {
+        peer.execute_batch("COMMIT").expect("peer commit");
+    })));
+    let report = store
+        .apply_retention_policy(
+            &policy(STANDARD_CLASS, age(30)),
+            time::OffsetDateTime::now_utc(),
+        )
+        .expect("apply");
     assert!(report.retired.is_empty(), "{report:?}");
     assert_eq!(
         store.audio_at_rest(&id).expect("state"),
@@ -1151,24 +1157,23 @@ fn a_size_limit_recounts_after_a_peer_moves_a_newer_take_away() {
     )
     .expect("peer class change");
 
-    let sweeper = std::thread::spawn(move || {
-        let report = store
-            .apply_retention_policy(
-                &policy(
-                    STANDARD_CLASS,
-                    ClassLimits {
-                        max_age_days: None,
-                        max_total_bytes: Some(limit),
-                    },
-                ),
-                time::OffsetDateTime::now_utc(),
-            )
-            .expect("apply");
-        (store, report)
-    });
-    std::thread::sleep(std::time::Duration::from_millis(300));
-    peer.execute_batch("COMMIT").expect("peer commit");
-    let (store, report) = sweeper.join().expect("sweeper");
+    // Runs after the walk has read the due take and before the sweep
+    // asks for the write lock.
+    store.before_retention_lock = Some(TestHook(Box::new(move || {
+        peer.execute_batch("COMMIT").expect("peer commit");
+    })));
+    let report = store
+        .apply_retention_policy(
+            &policy(
+                STANDARD_CLASS,
+                ClassLimits {
+                    max_age_days: None,
+                    max_total_bytes: Some(limit),
+                },
+            ),
+            time::OffsetDateTime::now_utc(),
+        )
+        .expect("apply");
     assert!(report.retired.is_empty(), "{report:?}");
     assert!(report.over_limit.is_empty(), "{report:?}");
     assert_eq!(
@@ -1204,24 +1209,23 @@ fn a_take_a_peer_moved_away_is_never_removed_later_in_the_walk() {
     )
     .expect("peer class change");
 
-    let sweeper = std::thread::spawn(move || {
-        let report = store
-            .apply_retention_policy(
-                &policy(
-                    STANDARD_CLASS,
-                    ClassLimits {
-                        max_age_days: None,
-                        max_total_bytes: Some(limit),
-                    },
-                ),
-                time::OffsetDateTime::now_utc(),
-            )
-            .expect("apply");
-        (store, report)
-    });
-    std::thread::sleep(std::time::Duration::from_millis(300));
-    peer.execute_batch("COMMIT").expect("peer commit");
-    let (store, report) = sweeper.join().expect("sweeper");
+    // Runs after the walk has read the due take and before the sweep
+    // asks for the write lock.
+    store.before_retention_lock = Some(TestHook(Box::new(move || {
+        peer.execute_batch("COMMIT").expect("peer commit");
+    })));
+    let report = store
+        .apply_retention_policy(
+            &policy(
+                STANDARD_CLASS,
+                ClassLimits {
+                    max_age_days: None,
+                    max_total_bytes: Some(limit),
+                },
+            ),
+            time::OffsetDateTime::now_utc(),
+        )
+        .expect("apply");
     assert_eq!(retired_ids(&report), vec![middle]);
     assert_eq!(
         store.audio_at_rest(&oldest).expect("state"),
@@ -1233,15 +1237,21 @@ fn a_take_a_peer_moved_away_is_never_removed_later_in_the_walk() {
     );
 }
 
-#[test]
-fn a_peer_compression_mid_sweep_is_counted_at_its_new_size() {
-    // The sweep counted a newer take as its journal; a peer then
-    // compresses it. With the FLAC's size the class fits, so the older
-    // take keeps its audio.
-    let dir = TempDir::new().expect("tempdir");
-    let mut store = store_in(&dir);
-    let older = aged_take(&mut store, 120, 16_000);
-    let newer = aged_take(&mut store, 90, 16_000);
+/// Two takes for the compression races: `older` and `newer` are both
+/// journals, `newer` has a verified FLAC prepared, and the size limit is
+/// exactly `newer`'s FLAC plus `older`'s journal — so the class fits once
+/// `newer` is counted at its FLAC's size, and is over the limit while it
+/// is counted at its journal's.
+struct CompressionRace {
+    older: String,
+    newer: String,
+    prepared: PreparedCompression,
+    limit: u64,
+}
+
+fn compression_race(store: &mut StoreV2) -> CompressionRace {
+    let older = aged_take(store, 120, 16_000);
+    let newer = aged_take(store, 90, 16_000);
     let job = store
         .compression_candidates(10)
         .expect("candidates")
@@ -1251,64 +1261,248 @@ fn a_peer_compression_mid_sweep_is_counted_at_its_new_size() {
     let prepared = prepare_compression(&job).expect("prepare");
     let limit = prepared.flac_bytes + store.audio_bytes(&older);
     assert!(store.audio_bytes(&newer) + store.audio_bytes(&older) > limit);
-    let (journal, flac) = (store.audio_path(&newer), store.flac_path(&newer));
-    // The peer compressor holds the write lock across its publish, as
-    // `commit_compression` does.
+    CompressionRace {
+        older,
+        newer,
+        prepared,
+        limit,
+    }
+}
+
+fn size_limit(limit: u64) -> RetentionPolicy {
+    policy(
+        STANDARD_CLASS,
+        ClassLimits {
+            max_age_days: None,
+            max_total_bytes: Some(limit),
+        },
+    )
+}
+
+#[test]
+fn a_peer_compression_mid_sweep_is_counted_at_its_new_size() {
+    // The sweep counted the newer take as its journal; a peer then
+    // compresses it, holding the write lock across its publish as
+    // `commit_compression` does. With the FLAC's size the class fits, so
+    // the older take keeps its audio.
+    let dir = TempDir::new().expect("tempdir");
+    let mut store = store_in(&dir);
+    let race = compression_race(&mut store);
+    let (journal, flac) = (store.audio_path(&race.newer), store.flac_path(&race.newer));
     let peer = Connection::open(store.root().join(DB_FILE)).expect("peer");
     peer.busy_timeout(std::time::Duration::from_secs(5))
         .expect("busy timeout");
-    peer.execute_batch("BEGIN IMMEDIATE")
-        .expect("peer write lock");
-
-    let sweeper = std::thread::spawn(move || {
-        let report = store
-            .apply_retention_policy(
-                &policy(
-                    STANDARD_CLASS,
-                    ClassLimits {
-                        max_age_days: None,
-                        max_total_bytes: Some(limit),
-                    },
-                ),
-                time::OffsetDateTime::now_utc(),
-            )
-            .expect("apply");
-        (store, report)
-    });
-    std::thread::sleep(std::time::Duration::from_millis(300));
-    std::fs::rename(&prepared.temp, &flac).expect("publish");
-    std::fs::remove_file(&journal).expect("journal unlink");
-    peer.execute(
-        "INSERT INTO meta(key, value) VALUES ('audio_generation', '1')
-         ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1",
-        [],
-    )
-    .expect("generation bump");
-    peer.execute_batch("COMMIT").expect("peer commit");
-    let (store, report) = sweeper.join().expect("sweeper");
+    let temp = race.prepared.temp.clone();
+    store.before_retention_lock = Some(TestHook(Box::new(move || {
+        peer.execute_batch("BEGIN IMMEDIATE")
+            .expect("peer write lock");
+        std::fs::rename(&temp, &flac).expect("publish");
+        std::fs::remove_file(&journal).expect("journal unlink");
+        peer.execute_batch("COMMIT").expect("peer commit");
+    })));
+    let report = store
+        .apply_retention_policy(&size_limit(race.limit), time::OffsetDateTime::now_utc())
+        .expect("apply");
     assert!(report.retired.is_empty(), "{report:?}");
+    assert!(report.over_limit.is_empty(), "{report:?}");
     assert_eq!(
-        store.audio_at_rest(&older).expect("state"),
+        store.audio_at_rest(&race.older).expect("state"),
         AudioAtRest::Journal
     );
     assert_eq!(
-        store.audio_at_rest(&newer).expect("state"),
+        store.audio_at_rest(&race.newer).expect("state"),
         AudioAtRest::Flac
     );
 }
 
 #[test]
-fn a_compression_bumps_the_audio_generation_other_connections_see() {
+fn a_compression_whose_transaction_rolled_back_is_counted_at_its_files() {
+    // A peer's compression publishes the FLAC and unlinks the journal,
+    // then its transaction rolls back (a failed commit): the files
+    // changed and no commit says so. The sweep must still count the
+    // newer take at its FLAC's size: the class total is exactly the
+    // limit, and the older take keeps its audio.
     let dir = TempDir::new().expect("tempdir");
     let mut store = store_in(&dir);
-    let id = take_at(&mut store, 16_000, &speechy(16_000, 3));
+    let race = compression_race(&mut store);
+    let (journal, flac) = (store.audio_path(&race.newer), store.flac_path(&race.newer));
     let peer = Connection::open(store.root().join(DB_FILE)).expect("peer");
-    let version = |conn: &Connection| -> i64 {
-        conn.query_row("PRAGMA data_version", [], |row| row.get(0))
-            .expect("version")
+    let temp = race.prepared.temp.clone();
+    store.before_retention_lock = Some(TestHook(Box::new(move || {
+        peer.execute_batch("BEGIN IMMEDIATE")
+            .expect("peer write lock");
+        std::fs::rename(&temp, &flac).expect("publish");
+        std::fs::remove_file(&journal).expect("journal unlink");
+        peer.execute_batch("ROLLBACK").expect("peer rollback");
+    })));
+    let report = store
+        .apply_retention_policy(&size_limit(race.limit), time::OffsetDateTime::now_utc())
+        .expect("apply");
+    assert!(report.retired.is_empty(), "{report:?}");
+    assert!(report.over_limit.is_empty(), "{report:?}");
+    assert_eq!(
+        store.audio_at_rest(&race.older).expect("state"),
+        AudioAtRest::Journal
+    );
+    assert_eq!(files(&store, &race.newer), (false, true));
+}
+
+#[test]
+fn a_compressor_that_died_after_publishing_is_counted_at_its_flac() {
+    // The peer compressor dies after the FLAC's rename, before its journal
+    // unlink and its commit: both files are on disk, nothing committed.
+    // The FLAC counts (the smaller of the two), so the class fits; the
+    // next reconcile completes the compression.
+    let dir = TempDir::new().expect("tempdir");
+    let mut store = store_in(&dir);
+    let race = compression_race(&mut store);
+    let flac = store.flac_path(&race.newer);
+    let peer = Connection::open(store.root().join(DB_FILE)).expect("peer");
+    let temp = race.prepared.temp.clone();
+    store.before_retention_lock = Some(TestHook(Box::new(move || {
+        peer.execute_batch("BEGIN IMMEDIATE")
+            .expect("peer write lock");
+        std::fs::rename(&temp, &flac).expect("publish");
+        // The process dies: its connection closes without a commit.
+        drop(peer);
+    })));
+    let report = store
+        .apply_retention_policy(&size_limit(race.limit), time::OffsetDateTime::now_utc())
+        .expect("apply");
+    assert!(report.retired.is_empty(), "{report:?}");
+    assert_eq!(
+        store.audio_at_rest(&race.older).expect("state"),
+        AudioAtRest::Journal
+    );
+    assert_eq!(files(&store, &race.newer), (true, true));
+    let reconciled = store.reconcile().expect("reconcile");
+    assert_eq!(reconciled.completed_compressions, vec![race.newer.clone()]);
+    assert_eq!(files(&store, &race.newer), (false, true));
+}
+
+#[test]
+fn a_compression_that_shrank_a_take_mid_sweep_still_lets_a_real_excess_go() {
+    // The re-measure removes only what is no longer due: when the class is
+    // over the limit even at the FLAC's size, the older take still goes.
+    let dir = TempDir::new().expect("tempdir");
+    let mut store = store_in(&dir);
+    let race = compression_race(&mut store);
+    let (journal, flac) = (store.audio_path(&race.newer), store.flac_path(&race.newer));
+    let temp = race.prepared.temp.clone();
+    store.before_retention_lock = Some(TestHook(Box::new(move || {
+        std::fs::rename(&temp, &flac).expect("publish");
+        std::fs::remove_file(&journal).expect("journal unlink");
+    })));
+    let report = store
+        .apply_retention_policy(
+            &size_limit(race.limit - 1),
+            time::OffsetDateTime::now_utc(),
+        )
+        .expect("apply");
+    assert_eq!(retired_ids(&report), vec![race.older]);
+}
+
+/// A policy whose drop records whether `id`'s retirement is already
+/// visible to another connection.
+struct ObservedPolicy<'a> {
+    policy: RetentionPolicy,
+    peer: &'a Connection,
+    id: &'a str,
+    seen: &'a std::cell::RefCell<Vec<bool>>,
+}
+
+impl std::borrow::Borrow<RetentionPolicy> for ObservedPolicy<'_> {
+    fn borrow(&self) -> &RetentionPolicy {
+        &self.policy
+    }
+}
+
+impl Drop for ObservedPolicy<'_> {
+    fn drop(&mut self) {
+        let retired = self
+            .peer
+            .query_row(
+                "SELECT 1 FROM tombstones WHERE id = ?1",
+                params![format!("{AUDIO_TOMBSTONE_PREFIX}{}", self.id)],
+                |_| Ok(()),
+            )
+            .optional()
+            .expect("peer read")
+            .is_some();
+        self.seen.borrow_mut().push(retired);
+    }
+}
+
+#[test]
+fn the_policy_read_before_a_removal_is_held_until_the_removal_commits() {
+    // A caller whose policy value holds the lock on its settings makes a
+    // change to them wait until the removal it was checked for is
+    // committed: the value is dropped only after the stamp is visible.
+    let dir = TempDir::new().expect("tempdir");
+    let mut store = store_in(&dir);
+    let id = aged_take(&mut store, 90, 16_000);
+    let peer = Connection::open(store.root().join(DB_FILE)).expect("peer");
+    let seen = std::cell::RefCell::new(Vec::new());
+    let limited = policy(STANDARD_CLASS, age(30));
+    let report = store
+        .apply_live_retention_policy(
+            || ObservedPolicy {
+                policy: limited.clone(),
+                peer: &peer,
+                id: &id,
+                seen: &seen,
+            },
+            time::OffsetDateTime::now_utc(),
+        )
+        .expect("apply");
+    assert_eq!(retired_ids(&report), vec![id.clone()]);
+    // The start-of-run read, then the read for the removal.
+    assert_eq!(*seen.borrow(), vec![false, true]);
+}
+
+#[test]
+fn a_delete_waits_for_the_write_lock_before_moving_any_file() {
+    // A compression on another connection publishes under the write lock;
+    // a delete that moved files without it could quarantine the journal
+    // and miss the FLAC published a moment later.
+    let dir = TempDir::new().expect("tempdir");
+    let mut store = store_in(&dir);
+    let id = take_at(&mut store, 16_000, &speechy(16_000, 5));
+    let peer = Connection::open(store.root().join(DB_FILE)).expect("peer");
+    peer.execute_batch("BEGIN IMMEDIATE")
+        .expect("peer write lock");
+    store
+        .conn
+        .busy_timeout(std::time::Duration::from_millis(50))
+        .expect("short busy timeout");
+    assert!(store.delete_capture(&id).is_err());
+    assert_eq!(files(&store, &id), (true, false));
+    assert!(store.get_capture(&id).expect("row").is_some());
+    peer.execute_batch("ROLLBACK").expect("peer rollback");
+    store.delete_capture(&id).expect("delete");
+    assert_eq!(files(&store, &id), (false, false));
+    assert!(store.get_capture(&id).expect("row").is_none());
+}
+
+#[test]
+fn a_take_that_keeps_failing_to_compress_stops_being_offered() {
+    let dir = TempDir::new().expect("tempdir");
+    let mut store = store_in(&dir);
+    let id = take_at(&mut store, 16_000, &speechy(16_000, 7));
+    let offered = |store: &StoreV2| {
+        store
+            .compression_candidates(10)
+            .expect("candidates")
+            .iter()
+            .any(|job| job.id == id)
     };
-    let before = version(&peer);
-    compressed(store.compress_audio(&id).expect("compress"));
-    assert_ne!(version(&peer), before);
-    assert_eq!(files(&store, &id), (false, true));
+    for _ in 1..COMPRESSION_ATTEMPTS {
+        store.note_compression_failure(&id);
+        assert!(offered(&store));
+    }
+    store.note_compression_failure(&id);
+    assert!(!offered(&store));
+    // A new instance (the next launch) tries again.
+    drop(store);
+    assert!(offered(&store_in(&dir)));
 }

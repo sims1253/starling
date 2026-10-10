@@ -72,6 +72,10 @@ pub fn encode(samples: &[i16]) -> Result<Vec<u8>, FlacError> {
     Ok(sink.as_slice().to_vec())
 }
 
+/// The most samples [`decode`] reserves up front from STREAMINFO's count
+/// (ten minutes at 16 kHz); a longer take grows the buffer as it decodes.
+const MAX_RESERVED_SAMPLES: u64 = 10 * 60 * STARLING_SAMPLE_RATE as u64;
+
 /// Decode a FLAC stream written by [`encode`]: 16 kHz mono 16-bit only.
 /// Frame CRCs are checked by the decoder; the sample count and the
 /// STREAMINFO MD5 signature are checked here, so a damaged file is an
@@ -88,7 +92,10 @@ pub fn decode(reader: impl Read) -> Result<Vec<i16>, FlacError> {
             bits: info.bits_per_sample,
         });
     }
-    let mut samples = Vec::with_capacity(info.samples.unwrap_or(0) as usize);
+    // The declared count is only checked after decoding: a damaged header
+    // must not size the allocation.
+    let reserve = info.samples.unwrap_or(0).min(MAX_RESERVED_SAMPLES);
+    let mut samples = Vec::with_capacity(reserve as usize);
     let mut md5 = Md5::new();
     for sample in reader.samples() {
         let sample = sample.map_err(|err| FlacError::Decode(err.to_string()))?;
@@ -231,5 +238,20 @@ mod tests {
         let floats: Vec<f32> = decoded.iter().map(|&q| pcm16_to_f32(q)).collect();
         let rebuilt = encode_wav_16k_parts(&floats, STARLING_SAMPLE_RATE, 1).expect("rebuilt");
         assert_eq!(rebuilt, direct);
+    }
+
+    #[test]
+    fn a_header_declaring_a_huge_count_is_an_error_not_an_allocation() {
+        let mut bytes = encode(&noise(8_192, 11)).expect("encode");
+        // STREAMINFO's 36-bit total sample count: the low bits of the
+        // big-endian u64 at offset 18 ("fLaC", block header, 10 bytes of
+        // block and frame sizes).
+        let mut packed = u64::from_be_bytes(bytes[18..26].try_into().expect("8 bytes"));
+        packed |= (1u64 << 36) - 1;
+        bytes[18..26].copy_from_slice(&packed.to_be_bytes());
+        match decode(bytes.as_slice()) {
+            Err(FlacError::Mismatch(reason)) => assert!(reason.contains("declares"), "{reason}"),
+            other => panic!("expected a count mismatch, got {other:?}"),
+        }
     }
 }

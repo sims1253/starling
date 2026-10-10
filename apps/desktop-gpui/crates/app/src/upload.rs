@@ -369,6 +369,7 @@ impl StarlingApp {
         // Playback comes back when recording stops, not after transcription.
         self.end_playback_lease();
         if let Some(handle) = self.recorder.take() {
+            self.audio_upkeep.set_recording(false);
             let mut stream = self.live_stream.take();
             // The binding resolved at START leaves with the take (#363);
             // a stop without one (not a normal path) resolves fresh
@@ -648,6 +649,7 @@ impl StarlingApp {
                     self.active_take = Some(target);
                     let handle_rate = handle.sample_rate();
                     self.recorder = Some(handle);
+                    self.audio_upkeep.set_recording(true);
                     self.playback_lease = playback_lease;
                     self.elapsed_ms = 0.0;
                     self.levels = vec![0.06; 52];
@@ -693,6 +695,7 @@ impl StarlingApp {
         let Some(handle) = self.recorder.take() else {
             return;
         };
+        self.audio_upkeep.set_recording(false);
         // The stream and the engine lease leave with the take: nothing
         // is transcribed.
         self.live_stream = None;

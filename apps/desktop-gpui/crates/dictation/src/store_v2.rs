@@ -170,6 +170,10 @@ const FLAC_TEMP_EXT: &str = "flac-tmp";
 /// compressor's temp (create → verify → rename, seconds even for an
 /// hour-long take) is always younger.
 const FLAC_TEMP_GRACE: std::time::Duration = std::time::Duration::from_secs(600);
+/// Failed compressions of one take before this instance stops offering it
+/// (#342): a journal that cannot be compressed is not re-encoded on every
+/// upkeep pass. The next launch tries it again.
+const COMPRESSION_ATTEMPTS: u32 = 3;
 /// Tombstone ids of audio the retention policy removed are
 /// `audio:<captureId>` (kind `audio`): the take's row stays, only its
 /// audio is gone. The prefix keeps them out of the capture-id space, so
@@ -668,6 +672,24 @@ pub struct StoreV2 {
     /// compression nor retention acts in between. In-process only —
     /// another process's take is protected once its attempt row exists.
     audio_pins: HashMap<String, usize>,
+    /// Takes whose compression failed in this instance: id → failures.
+    /// At [`COMPRESSION_ATTEMPTS`] the take is no longer a candidate.
+    compression_failures: HashMap<String, u32>,
+    /// Runs once, in [`Self::apply_live_retention_policy`], after the walk
+    /// has read a due take and before the removal takes the write lock:
+    /// where a peer's commit or file change lands in the race tests.
+    #[cfg(test)]
+    before_retention_lock: Option<TestHook>,
+}
+
+#[cfg(test)]
+struct TestHook(Box<dyn FnOnce() + Send>);
+
+#[cfg(test)]
+impl std::fmt::Debug for TestHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TestHook")
+    }
 }
 
 /// The lease this process holds: the owner id and the flocked lease file
@@ -805,6 +827,9 @@ impl StoreV2 {
             lease: None,
             lease_ttl: LEASE_HEARTBEAT_TTL,
             audio_pins: HashMap::new(),
+            compression_failures: HashMap::new(),
+            #[cfg(test)]
+            before_retention_lock: None,
         })
     }
 
@@ -1933,6 +1958,12 @@ impl StoreV2 {
             return Ok(());
         }
 
+        // The database's write lock is taken before any file moves: a
+        // compression on another connection publishes its FLAC under that
+        // lock, so it either finishes first (and the FLAC is quarantined
+        // here) or sees the take gone and publishes nothing.
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+
         // 1. Tombstone: the quarantine rename is the commit point.
         self.quarantine_audio(id)?;
 
@@ -1948,7 +1979,6 @@ impl StoreV2 {
             let rows = stmt.query_map(params![id], |row| row.get::<_, String>(0))?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
-        let tx = self.conn.transaction()?;
         tx.execute(
             "INSERT OR REPLACE INTO tombstones(id, kind, deleted_utc, retention)
              VALUES (?1, 'capture', ?2, 'quarantined')",
@@ -2111,6 +2141,13 @@ impl StoreV2 {
         *self.audio_pins.entry(id.to_string()).or_default() += 1;
     }
 
+    /// Count a failed compression of `id` (its prepare or its commit); at
+    /// [`COMPRESSION_ATTEMPTS`] failures [`Self::compression_candidates`]
+    /// stops offering it until the store is opened again.
+    pub fn note_compression_failure(&mut self, id: &str) {
+        *self.compression_failures.entry(id.to_string()).or_default() += 1;
+    }
+
     /// Release one [`Self::pin_audio`] (a release without a pin does
     /// nothing).
     pub fn unpin_audio(&mut self, id: &str) {
@@ -2176,6 +2213,9 @@ impl StoreV2 {
             if !is_safe_path_component(&id) || rate == 0 || self.audio_pins.contains_key(&id) {
                 continue;
             }
+            if self.compression_failures.get(&id).copied().unwrap_or(0) >= COMPRESSION_ATTEMPTS {
+                continue;
+            }
             // Shorter than FLAC's minimum block at 16 kHz: stays a journal.
             if frames.saturating_mul(u64::from(STARLING_SAMPLE_RATE)) / u64::from(rate)
                 < flac::MIN_SAMPLES as u64
@@ -2231,20 +2271,16 @@ impl StoreV2 {
             ))
         })?;
         sync_dir(&self.root.join(AUDIO_DIR))?;
-        // The FLAC is durable and verified: the journal may go — still
-        // under the lock, with a generation bump, so a retention run on
-        // another connection sees the sizes changed and counts again.
+        // The FLAC is durable and verified: the journal may go, still
+        // under the lock. Nothing in the database records the change, so
+        // a retention run never learns of it from a commit: it measures
+        // the files under the lock instead.
         match std::fs::remove_file(&journal) {
             Ok(()) => {}
             Err(err) if err.kind() == io::ErrorKind::NotFound => {}
             Err(err) => return Err(err.into()),
         }
         sync_dir(&self.root.join(AUDIO_DIR))?;
-        self.conn.execute(
-            "INSERT INTO meta(key, value) VALUES ('audio_generation', '1')
-             ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1",
-            [],
-        )?;
         tx.commit()?;
         Ok(CompressionOutcome::Compressed {
             journal_bytes: prepared.journal_bytes,
@@ -2412,13 +2448,17 @@ impl StoreV2 {
     /// while the run goes: `current` is read at the start and again
     /// under the write lock before each removal; when it no longer
     /// matches, the run stops ([`RetentionReport::policy_changed`]).
-    pub fn apply_live_retention_policy(
+    /// What `current` returns before a removal is kept until that
+    /// removal's stamp commits, so a caller whose value holds a lock on
+    /// its settings makes a change to them wait for the removal, and the
+    /// next check sees the change.
+    pub fn apply_live_retention_policy<P: std::borrow::Borrow<RetentionPolicy>>(
         &mut self,
-        current: impl Fn() -> RetentionPolicy,
+        current: impl Fn() -> P,
         now: time::OffsetDateTime,
     ) -> Result<RetentionReport, StoreV2Error> {
         let mut report = RetentionReport::default();
-        let policy = &current();
+        let policy = &current().borrow().clone();
         if !policy.is_active() {
             return Ok(report);
         }
@@ -2464,33 +2504,49 @@ impl StoreV2 {
                 let Some(reason) = due else {
                     continue;
                 };
+                #[cfg(test)]
+                if let Some(hook) = self.before_retention_lock.take() {
+                    (hook.0)();
+                }
                 // The hold check and the stamp share the database's write
                 // lock: another connection cannot start a transcription,
                 // add a revision or a correction record in between.
                 let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
-                if current() != *policy {
+                let live = current();
+                if live.borrow() != policy {
                     report.policy_changed = true;
                     return Ok(report);
                 }
                 // Another connection committed since the walk looked: takes
-                // may have moved to another class, been deleted, retired or
-                // compressed (which bumps a generation for this). Recount
-                // what this class still holds before deciding.
+                // may have moved to another class, been deleted or retired.
+                // Drop what this class no longer holds before deciding.
                 let version = self.data_version()?;
                 if version != seen_version {
                     seen_version = version;
-                    let mut recounted = Vec::with_capacity(counted.len());
-                    for (counted_id, _) in counted.drain(..) {
+                    let mut still_held = Vec::with_capacity(counted.len());
+                    for (counted_id, bytes) in counted.drain(..) {
                         if self.in_retention_class(&counted_id, class)?
                             && self.audio_retired_utc(&counted_id)?.is_none()
                         {
-                            let bytes = self.audio_bytes(&counted_id);
-                            recounted.push((counted_id, bytes));
+                            still_held.push((counted_id, bytes));
                         }
                     }
-                    counted = recounted;
-                    kept_bytes = counted.iter().map(|(_, bytes)| bytes).sum();
+                    counted = still_held;
                 }
+                // Sizes are measured again, now, under the lock. Files
+                // change without a commit to announce it: a compression
+                // publishes its FLAC and unlinks the journal, and a crash
+                // or failed commit after that leaves the files changed and
+                // the database not. A size counted during the walk may be
+                // too large, and removing by it removes audio the limit
+                // does not require removing. An age limit needs only the
+                // candidate's own size.
+                for (counted_id, bytes) in counted.iter_mut() {
+                    if reason == RetireReason::Size || *counted_id == id {
+                        *bytes = self.audio_bytes(counted_id);
+                    }
+                }
+                kept_bytes = counted.iter().map(|(_, bytes)| bytes).sum();
                 // Moved to another class, deleted or retired since the walk
                 // read it: those limits decide, on their own walk. Under a
                 // size limit the recount may also show the class fits now.
@@ -2507,6 +2563,9 @@ impl StoreV2 {
                     continue;
                 }
                 let bytes = counted[index].1;
+                if bytes == 0 {
+                    continue;
+                }
                 let still_due = match reason {
                     RetireReason::Age => true,
                     RetireReason::Size => {
@@ -2526,8 +2585,9 @@ impl StoreV2 {
                     });
                     continue;
                 }
-                self.stamp_audio_retired(&id)?;
+                self.stamp_audio_retired(&id, now)?;
                 tx.commit()?;
+                drop(live);
                 self.unlink_audio(&id)?;
                 kept_bytes -= bytes;
                 counted.retain(|(counted_id, _)| *counted_id != id);
@@ -2540,6 +2600,7 @@ impl StoreV2 {
                 });
             }
             if let Some(max) = limits.max_total_bytes {
+                let kept_bytes: u64 = counted.iter().map(|(id, _)| self.audio_bytes(id)).sum();
                 if kept_bytes > max {
                     report.over_limit.push((class.clone(), kept_bytes - max));
                 }
@@ -2569,9 +2630,9 @@ impl StoreV2 {
     }
 
     /// [`Self::apply_live_retention_policy`] as of the current time.
-    pub fn apply_retention_policy_now(
+    pub fn apply_retention_policy_now<P: std::borrow::Borrow<RetentionPolicy>>(
         &mut self,
-        current: impl Fn() -> RetentionPolicy,
+        current: impl Fn() -> P,
     ) -> Result<RetentionReport, StoreV2Error> {
         self.apply_live_retention_policy(current, time::OffsetDateTime::now_utc())
     }
@@ -2631,12 +2692,12 @@ impl StoreV2 {
     }
 
     /// Stamp `id`'s audio as retired; [`Self::unlink_audio`] follows.
-    fn stamp_audio_retired(&self, id: &str) -> Result<(), StoreV2Error> {
+    fn stamp_audio_retired(&self, id: &str, now: time::OffsetDateTime) -> Result<(), StoreV2Error> {
         self.conn.execute(
             "INSERT INTO tombstones(id, kind, deleted_utc, retention)
              VALUES (?1, 'audio', ?2, 'swept')
              ON CONFLICT(id) DO NOTHING",
-            params![format!("{AUDIO_TOMBSTONE_PREFIX}{id}"), now_iso()],
+            params![format!("{AUDIO_TOMBSTONE_PREFIX}{id}"), iso_utc(now)],
         )?;
         Ok(())
     }

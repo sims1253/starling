@@ -1352,6 +1352,7 @@ impl StarlingApp {
     /// through the error banner like any other save.
     fn spawn_settings_save(&self, path: PathBuf, cx: &mut Context<Self>) {
         let settings = self.committed_settings();
+        let storage = settings.storage;
         let sequence = SETTINGS_SAVE_SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
         cx.spawn(async move |this, cx| {
             let saved = cx
@@ -1365,22 +1366,26 @@ impl StarlingApp {
                     ) {
                         // A newer document has already been written; this
                         // older one must not land after it.
-                        return Ok(());
+                        return Ok(false);
                     }
                     let saved = settings.save(&path);
                     if saved.is_ok() {
                         SETTINGS_SAVE_WRITTEN.store(sequence, Ordering::Relaxed);
                     }
-                    saved
+                    saved.map(|()| true)
                 })
                 .await;
-            if let Err(err) = saved {
-                this.update(cx, |app, cx| {
+            this.update(cx, |app, cx| match saved {
+                // #342: retention limits take effect only once the file
+                // that holds them is written.
+                Ok(true) => app.storage_settings_saved(sequence, storage, cx),
+                Ok(false) => {}
+                Err(err) => {
                     app.error = Some(format!("Could not save settings: {err}"));
                     cx.notify();
-                })
-                .ok();
-            }
+                }
+            })
+            .ok();
         })
         .detach();
     }
@@ -1945,7 +1950,7 @@ impl StarlingApp {
             cue_volume_percent: self.draft_cue_volume.read(cx).value(),
         };
         self.sync_overlay(cx);
-        self.commit_storage_draft(cx);
+        self.commit_storage_draft();
 
         // R11: an unresolvable config directory is surfaced, not swallowed —
         // settings must not silently land in the current working directory.
