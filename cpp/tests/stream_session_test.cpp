@@ -4,10 +4,16 @@
 // StreamSession buffer management against expected behavior from the
 // Python reference (src/starling/stream_chunk.py).
 
+#include "serve/stream_pump.hpp"
 #include "serve/stream_session.hpp"
 #include "serve/server.hpp"
 
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
+#include <mutex>
+#include <thread>
 #include <cstdio>
 #include <cmath>
 #include <algorithm>
@@ -207,9 +213,10 @@ static void test_chunk_streamer_basic() {
     auto result = cs.step(samples, 1.0, tx);
     CHECK(result.has_value());
     CHECK(cs.boundary() == 12000);  // advance = 16000 - 4000 = 12000
-    // Exactly one transcribe: the window finalize. The 0.25 s tail is below
-    // min_ (0.5 s) so no partial attempt is made on it.
-    CHECK(call_count == 1);
+    // Two transcribes: the window finalize, then a preview of the 0.25 s
+    // overlap tail. The first-partial minimum (0.5 s) gates the take, not
+    // the tail (issue #357), and the take already holds 1 s.
+    CHECK(call_count == 2);
 }
 
 static void test_chunk_streamer_partial() {
@@ -340,15 +347,17 @@ static void test_model_mapping() {
 // rebase() keeps the boundary valid after the session drops `dropped` samples
 // from the front of its buffer (the PR #9 review fix; previously untested).
 static void test_chunk_streamer_rebase() {
-    ChunkStreamer cs(16000, 1.0, 0.25, 0.5, 0.0);
+    // First-partial minimum 100 s: previews never run, so every transcribe
+    // below is a window and the offsets are the point of the test.
+    ChunkStreamer cs(16000, 1.0, 0.25, 100.0, 0.0);
     TranscribeFn tx = [](const float*, int64_t) -> std::optional<std::string> {
         return "w";
     };
 
     // Finalize two windows: boundary 0 -> 12000 -> 24000. The first step
-    // emits the stitched text; the second is a no-op (the 6000-sample tail
-    // is below the 8000-sample partial minimum) and returns nullopt — both
-    // returns are checked, not discarded.
+    // emits the stitched text; the second is a no-op (no new window, and
+    // previews are off) and returns nullopt — both returns are checked, not
+    // discarded.
     std::vector<float> samples(30000, 0.0f);
     CHECK(cs.step(samples, 1.0, tx).has_value());
     CHECK(!cs.step(samples, 2.0, tx).has_value());
@@ -412,6 +421,9 @@ static std::string pcm_for_range(int64_t start, int64_t n) {
 static void test_stream_session_buffer_trim() {
     StarlingServer server(test_cfg());
     StreamSession session(&server);
+    // Previews off (100 s first-partial minimum): every transcribe below is a
+    // window or the flush tail, and their offsets are the point of the test.
+    session.set_preview_policy(100.0, 0.0);
 
     // Record the first sample + length of every transcribe call.
     std::vector<std::pair<int16_t, int64_t>> calls;
@@ -1124,6 +1136,9 @@ static void test_tail_reuse_survives_overlap_rebasing() {
     // sample (position-encoded audio).
     StarlingServer server(test_cfg());
     StreamSession session(&server);
+    // First partial at 2.6 s of take audio: the 2.5 s step below only
+    // commits windows, and the first preview follows the trim.
+    session.set_preview_policy(2.6, 0.0);
     std::vector<std::pair<int16_t, int64_t>> calls;  // first sample, length
     TranscribeFn tx = [&](const float* p, int64_t n)
                           -> std::optional<std::string> {
@@ -1139,7 +1154,7 @@ static void test_tail_reuse_survives_overlap_rebasing() {
     CHECK_NEAR(session.buffered_seconds(), 2.5);
 
     // The next append trims the 36000 finalized samples and rebases; then
-    // top the live buffer up to the 0.5 s partial minimum.
+    // top the take up past the 2.6 s first-partial minimum.
     session.append_pcm(pcm_for_range(40000, 1600));
     CHECK_NEAR(session.live_seconds(), 0.35);  // 5600 live after the trim
     session.append_pcm(pcm_for_range(41600, 2400));
@@ -1283,7 +1298,9 @@ static void test_chunk_streamer_windows_stay_in_range() {
     CHECK(partial.has_value());
     auto final_text = cs.flush(samples, tx);
     CHECK(final_text.has_value());
-    CHECK(calls == 4);  // three 12 s windows + the 3 s flush tail
+    // Three 12 s windows, a preview of the 3 s overlap tail (the take is past
+    // the 5 s first-partial minimum), and the 3 s flush tail.
+    CHECK(calls == 5);
 }
 
 static void test_chunk_streamer_never_transcribes_empty_window() {
@@ -1317,6 +1334,622 @@ static void test_stream_session_rejects_invalid_window_config() {
         threw = true;
     }
     CHECK(threw);
+}
+
+// ---- stream call ledger (issue #226) ----------------------------------------
+// The ledger records every transcribe call with its kind and the absolute
+// audio span it covered, so overlap and repeated previews are visible and the
+// stop-time work can be checked against the unfinalized tail.
+
+static void test_trace_ledger_kinds_and_spans() {
+    StarlingServer server(test_cfg());
+    StreamSession session(&server);
+    session.set_transcribe_fn([](const float*, int64_t) -> std::optional<std::string> {
+        return std::string("w");
+    });
+
+    // 2.5 s: three full windows (advance 12000) and a preview of the
+    // 4000-sample tail.
+    session.append_pcm(pcm_for_range(0, 40000));
+    CHECK(session.stream_step(1.0).has_value());
+    // 6000 more samples: a 10000-sample tail preview.
+    session.append_pcm(pcm_for_range(40000, 6000));
+    CHECK(session.stream_step(2.0).has_value());
+
+    const auto& calls = session.calls();
+    CHECK(calls.size() == 5);
+    if (calls.size() == 5) {
+        const int64_t starts[] = {0, 12000, 24000, 36000, 36000};
+        const int64_t lens[] = {16000, 16000, 16000, 4000, 10000};
+        for (size_t i = 0; i < 5; ++i) {
+            CHECK(std::string(calls[i].kind) == (i < 3 ? "window" : "preview"));
+            CHECK(calls[i].abs_start == starts[i]);
+            CHECK(calls[i].length == lens[i]);
+            CHECK(std::string(calls[i].result) == "ok");
+            CHECK(calls[i].t1_ms >= calls[i].t0_ms);
+        }
+    }
+    // Overlap and repeated previews count as work: 62000 engine samples for
+    // 46000 recorded.
+    CHECK(session.totals().engine_calls == 5);
+    CHECK(session.totals().engine_samples == 62000);
+
+    // Stop with no new audio: the preview's exact result answers the tail.
+    auto final_ = session.stream_flush();
+    CHECK(final_.has_value());
+    CHECK(std::string(session.final_path()) == "reused");
+    CHECK(session.flush_totals().engine_calls == 0);
+    CHECK(session.flush_totals().reused == 1);
+    const std::string tj = session.trace_final_json();
+    CHECK(tj.find("\"path\":\"reused\"") != std::string::npos);
+    CHECK(tj.find("\"unfinalized_s\":0.625") != std::string::npos);
+    CHECK(tj.find("\"kind\":\"flush_tail\",\"start_s\":2.250,\"end_s\":2.875")
+          != std::string::npos);
+    CHECK(session.trace_partial_json().find("\"covered_s\":2.875")
+          != std::string::npos);
+
+    session.reset();
+    CHECK(session.calls().empty());
+    CHECK(session.totals().calls == 0);
+    CHECK(std::string(session.final_path()).empty());
+}
+
+static void test_trace_new_final_samples_run_the_tail() {
+    StarlingServer server(test_cfg());
+    StreamSession session(&server);
+    session.set_transcribe_fn([](const float*, int64_t) -> std::optional<std::string> {
+        return std::string("w");
+    });
+    session.append_pcm(pcm_for_range(0, 11200));
+    CHECK(session.stream_step(1.0).has_value());  // preview [0, 11200)
+    // Samples arriving after the latest preview must be finalized: the stale
+    // preview is never the final.
+    session.append_pcm(pcm_for_range(11200, 800));
+    CHECK(session.stream_flush().has_value());
+    CHECK(std::string(session.final_path()) == "tail");
+    CHECK(session.flush_totals().engine_calls == 1);
+    CHECK(session.flush_totals().engine_samples == 12000);
+    const auto& last = session.calls().back();
+    CHECK(std::string(last.kind) == "flush_tail");
+    CHECK(last.abs_start == 0 && last.length == 12000);
+}
+
+static void test_trace_flush_bounded_by_tail_not_take() {
+    // A 60 s take streamed in 0.1 s frames: the work after commit covers only
+    // the unfinalized remainder (less than one window), never the take.
+    StarlingServer server(test_cfg());
+    StreamSession session(&server);
+    session.set_transcribe_fn([](const float*, int64_t) -> std::optional<std::string> {
+        return std::string("w");
+    });
+    const int64_t frame = 1600, total = 60 * 16000;
+    double now = 0.0;
+    for (int64_t at = 0; at < total; at += frame) {
+        session.append_pcm(pcm_for_range(at, frame));
+        session.stream_step(now += 0.1);
+    }
+    session.append_pcm(pcm_for_range(total, 500));  // new final samples
+    CHECK(session.stream_flush().has_value());
+    CHECK(std::string(session.final_path()) == "tail");
+    CHECK(session.flush_totals().engine_samples < 16000);
+    CHECK(session.flush_totals().engine_calls == 1);
+    CHECK(session.totals().engine_samples > total);  // overlap + previews
+    for (const auto& c : session.calls()) {
+        CHECK(c.length <= 16000);
+        CHECK(c.abs_start + c.length <= total + 500);
+    }
+}
+
+// ---- preview cadence and coalescing (issue #357) -----------------------------
+
+static void test_preview_minimum_gates_the_take_not_the_tail() {
+    ChunkStreamer cs(16000, 1.0, 0.25, 0.5, 0.0);
+    std::vector<int64_t> lens;
+    TranscribeFn tx = [&](const float*, int64_t n) -> std::optional<std::string> {
+        lens.push_back(n);
+        return std::string("w");
+    };
+    std::vector<float> samples(7999, 0.0f);
+    CHECK(!cs.step(samples, 1.0, tx).has_value());  // take below 0.5 s
+    CHECK(lens.empty());
+    samples.resize(8000);
+    CHECK(cs.step(samples, 2.0, tx).has_value());   // first partial
+    CHECK(lens.size() == 1 && lens.back() == 8000);
+    // After a window commit the tail is the 0.25 s overlap, below the
+    // minimum, yet still previewed: the commit never stalls previews.
+    samples.resize(16000 + 1600);
+    lens.clear();
+    CHECK(cs.step(samples, 3.0, tx).has_value());
+    CHECK(lens.size() == 2);
+    if (lens.size() == 2) {
+        CHECK(lens[0] == 16000);
+        CHECK(lens[1] == 16000 + 1600 - 12000);
+    }
+}
+
+static void test_preview_coalesced_when_newer_audio_is_queued() {
+    ChunkStreamer cs(16000, 1.0, 0.25, 0.5, 0.0);
+    std::vector<int64_t> lens;
+    TranscribeFn tx = [&](const float*, int64_t n) -> std::optional<std::string> {
+        lens.push_back(n);
+        return std::string("w x");
+    };
+    bool pending = true;
+    PendingFn newer = [&] { return pending; };
+    // A full window plus tail with newer audio queued: the window commits
+    // (required work), the preview is skipped.
+    std::vector<float> samples(20000, 0.0f);
+    CHECK(!cs.step(samples, 1.0, tx, newer).has_value());
+    CHECK(lens.size() == 1 && lens[0] == 16000);
+    CHECK(cs.boundary() == 12000);
+    CHECK(cs.coalesced_previews() == 1);
+    // The newer audio arrives; nothing is queued now. This step previews
+    // the newest tail and carries the owed committed-text update along.
+    samples.resize(22000);
+    pending = false;
+    auto out = cs.step(samples, 1.1, tx, newer);
+    CHECK(out.has_value());
+    CHECK(lens.size() == 2 && lens[1] == 10000);
+    // The flush still covers every sample.
+    CHECK(cs.flush(samples, tx).has_value());
+    CHECK(lens.back() == 22000 - 12000);
+}
+
+static void test_window_commit_does_not_force_a_throttled_preview() {
+    // A 10 s interval: a window commit inside it emits the committed text
+    // at once but does not decode the tail (the preview duty bound holds).
+    ChunkStreamer cs(16000, 1.0, 0.25, 0.5, 10.0);
+    std::vector<int64_t> lens;
+    TranscribeFn tx = [&](const float*, int64_t n) -> std::optional<std::string> {
+        lens.push_back(n);
+        return std::string("w x");
+    };
+    std::vector<float> samples(8000, 0.0f);
+    CHECK(cs.step(samples, 20.0, tx).has_value());  // first preview
+    CHECK(lens.size() == 1 && lens[0] == 8000);
+    samples.resize(20000);
+    auto out = cs.step(samples, 21.0, tx);
+    CHECK(out == std::optional<std::string>("w x"));  // committed text only
+    CHECK(lens.size() == 2 && lens[1] == 16000);
+    samples.resize(21000);
+    CHECK(!cs.step(samples, 21.5, tx).has_value());  // still throttled
+    CHECK(lens.size() == 2);
+    CHECK(cs.step(samples, 30.0, tx).has_value());   // interval over
+    CHECK(lens.size() == 3 && lens[2] == 21000 - 12000);
+}
+
+static void test_preview_interval_adapts_to_preview_cost() {
+    // A 30 ms preview with a zero interval: previews may take at most half
+    // of wall time, so the next one waits >= 60 ms after the last started.
+    ChunkStreamer cs(16000, 1.0, 0.25, 0.1, 0.0);
+    int calls = 0;
+    TranscribeFn tx = [&](const float*, int64_t) -> std::optional<std::string> {
+        ++calls;
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        return std::string("w");
+    };
+    std::vector<float> samples(4000, 0.0f);
+    CHECK(cs.step(samples, 10.0, tx).has_value());
+    CHECK(calls == 1);
+    CHECK(cs.effective_interval() >= 0.06);
+    CHECK(cs.effective_interval() < 1.0);
+    samples.resize(5000);
+    CHECK(!cs.step(samples, 10.01, tx).has_value());  // throttled
+    CHECK(calls == 1);
+    CHECK(cs.step(samples, 10.001 + cs.effective_interval(), tx).has_value());
+    CHECK(calls == 2);
+    cs.reset();
+    CHECK(cs.effective_interval() == 0.0);
+}
+
+static void test_preview_policy_validation() {
+    CHECK(preview_policy_error(16000, 1.0, 0.5).empty());
+    CHECK(preview_policy_error(16000, 0.0, 0.0).empty());
+    CHECK(!preview_policy_error(16000, -1.0, 0.5).empty());
+    CHECK(!preview_policy_error(16000, 1.0, -0.5).empty());
+    CHECK(!preview_policy_error(16000, std::nan(""), 0.5).empty());
+    CHECK(!preview_policy_error(16000, 1.0, INFINITY).empty());
+    CHECK(!preview_policy_error(16000, 1e9, 0.5).empty());
+    ChunkStreamer cs(16000, 1.0, 0.25, 0.5, 0.0);
+    bool threw = false;
+    try { cs.set_preview_policy(-1.0, 0.0); } catch (const std::invalid_argument&) { threw = true; }
+    CHECK(threw);
+    cs.set_preview_policy(2.0, 0.25);
+    CHECK_NEAR(cs.min_preview_seconds(), 2.0);
+    CHECK_NEAR(cs.preview_interval(), 0.25);
+}
+
+static void test_preview_policy_is_not_result_provenance() {
+    // The cadence decides when a window is transcribed, not what the engine
+    // returns: changing it keeps the exact-tail entry.
+    TailFixture fx;
+    const std::string id = fx.session.engine_identity();
+    fx.prime();
+    fx.session.set_preview_policy(3.0, 1.0);
+    CHECK(fx.session.engine_identity() == id);
+    CHECK(fx.session.stream_flush() == std::optional<std::string>("alpha beta"));
+    CHECK(fx.engine_calls == 1);
+}
+
+// ---- StreamPump (issue #357) ---------------------------------------------------
+// The pump runs the session on its own worker; these tests drive it like the
+// WS transport does and read back the frames it sends.
+
+struct PumpFixture {
+    StarlingServer server;
+    StreamSession session;
+    std::mutex mu;
+    std::vector<std::string> sent;
+    std::condition_variable sent_cv;
+    std::vector<std::pair<int64_t, int64_t>> windows;  // (abs start, length)
+
+    explicit PumpFixture(ServerConfig cfg = test_cfg())
+        : server(cfg), session(&server) {}
+
+    StreamPump::SendFn sender() {
+        return [this](const std::string& m) {
+            std::lock_guard<std::mutex> lk(mu);
+            sent.push_back(m);
+            sent_cv.notify_all();
+        };
+    }
+    // Wait until a frame containing `needle` arrives; returns its index.
+    size_t wait_for(const std::string& needle) {
+        std::unique_lock<std::mutex> lk(mu);
+        size_t found = SIZE_MAX;
+        sent_cv.wait_for(lk, std::chrono::seconds(10), [&] {
+            for (size_t i = 0; i < sent.size(); ++i)
+                if (sent[i].find(needle) != std::string::npos) { found = i; return true; }
+            return false;
+        });
+        return found;
+    }
+    size_t count(const std::string& needle) {
+        std::lock_guard<std::mutex> lk(mu);
+        size_t n = 0;
+        for (const auto& m : sent) n += m.find(needle) != std::string::npos;
+        return n;
+    }
+};
+
+// Decode the absolute start of a position-encoded window (pcm_for_range).
+static int64_t window_start(const float* p, int64_t hint) {
+    int64_t v = static_cast<int64_t>(std::lround(p[0] * 32768.0f)) + 15000;
+    return hint - (hint % 30000) + v;  // exact while windows start < 30000
+}
+
+static void test_pump_stop_during_inference_finalizes_all_audio() {
+    PumpFixture fx;
+    std::mutex gate_mu;
+    std::condition_variable gate_cv;
+    bool release = false;
+    std::atomic<int> in_preview{0};
+    fx.session.set_transcribe_fn([&](const float* p, int64_t n)
+                                     -> std::optional<std::string> {
+        {
+            std::lock_guard<std::mutex> lk(fx.mu);
+            fx.windows.emplace_back(window_start(p, 0), n);
+        }
+        if (in_preview.fetch_add(1) == 0) {  // block the first preview
+            std::unique_lock<std::mutex> lk(gate_mu);
+            gate_cv.wait(lk, [&] { return release; });
+        }
+        return std::string("w") + std::to_string(n);
+    });
+    StreamPump::Options opt;
+    opt.trace = true;
+    StreamPump pump(fx.session, opt, fx.sender());
+    pump.push_audio(pcm_for_range(0, 9600));      // 0.6 s: preview starts
+    while (in_preview.load() == 0) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    // Stop arrives while that preview is running, after more audio.
+    pump.push_audio(pcm_for_range(9600, 3200));
+    pump.push_commit();
+    {
+        std::lock_guard<std::mutex> lk(gate_mu);
+        release = true;
+    }
+    gate_cv.notify_all();
+    const size_t fin = fx.wait_for("\"type\":\"final\"");
+    CHECK(fin != SIZE_MAX);
+    pump.drain();
+    std::lock_guard<std::mutex> lk(fx.mu);
+    // The stale preview never becomes the final: the flush transcribed the
+    // whole 12800-sample tail, including the audio sent during inference.
+    CHECK(fx.windows.size() == 2);
+    if (fx.windows.size() == 2) {
+        CHECK(fx.windows[0].second == 9600);
+        CHECK(fx.windows[1].first == 0 && fx.windows[1].second == 12800);
+    }
+    if (fin != SIZE_MAX) {
+        CHECK(fx.sent[fin].find("\"text\":\"w12800\"") != std::string::npos);
+        CHECK(fx.sent[fin].find("\"duration_s\":0.8") != std::string::npos);
+        CHECK(fx.sent[fin].find("\"path\":\"tail\"") != std::string::npos);
+        CHECK(fin == fx.sent.size() - 1);
+    }
+}
+
+static void test_pump_coalesces_previews_and_keeps_every_sample() {
+    // A slow engine (20 ms per call) fed a 3 s burst of 0.05 s frames: the
+    // worker drains whatever queued during each call, so it previews far
+    // fewer times than frames arrive, and the final covers every sample.
+    PumpFixture fx;
+    std::atomic<int> previews{0};
+    fx.session.set_transcribe_fn([&](const float*, int64_t n)
+                                     -> std::optional<std::string> {
+        if (n < 16000) previews.fetch_add(1);
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        return std::string("w");
+    });
+    StreamPump::Options opt;
+    opt.trace = true;
+    StreamPump pump(fx.session, opt, fx.sender());
+    const int frames = 60, frame = 800;
+    for (int i = 0; i < frames; ++i)
+        pump.push_audio(pcm_for_range(static_cast<int64_t>(i) * frame, frame));
+    pump.push_commit();
+    const size_t fin = fx.wait_for("\"type\":\"final\"");
+    CHECK(fin != SIZE_MAX);
+    CHECK(previews.load() < frames / 4);
+    std::lock_guard<std::mutex> lk(fx.mu);
+    if (fin != SIZE_MAX) {
+        CHECK(fx.sent[fin].find("\"duration_s\":3") != std::string::npos);
+        CHECK(fx.sent[fin].find("\"audio_s\":3.000") != std::string::npos);
+        CHECK(fx.sent[fin].find("\"covered_s\":3.000") != std::string::npos);
+    }
+}
+
+static void test_pump_ping_follows_earlier_audio() {
+    PumpFixture fx;
+    fx.session.set_transcribe_fn([](const float*, int64_t) -> std::optional<std::string> {
+        return std::string("hello");
+    });
+    StreamPump pump(fx.session, {}, fx.sender());
+    pump.push_audio(pcm_for_range(0, 11200));
+    pump.push_ping();
+    const size_t pong = fx.wait_for("\"type\":\"pong\"");
+    CHECK(pong != SIZE_MAX);
+    std::lock_guard<std::mutex> lk(fx.mu);
+    CHECK(fx.sent.size() == 2);
+    if (fx.sent.size() == 2) {
+        CHECK(fx.sent[0].find("\"type\":\"partial\"") != std::string::npos);
+        CHECK(fx.sent[0].find("trace") == std::string::npos);  // opt-in only
+        CHECK(pong == 1);
+    }
+}
+
+static void test_pump_backpressure_never_drops_audio() {
+    // A 3200-byte queue bound and a slow engine: the transport blocks
+    // instead of dropping, and the final still covers all audio.
+    PumpFixture fx;
+    fx.session.set_transcribe_fn([](const float*, int64_t) -> std::optional<std::string> {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        return std::string("w");
+    });
+    StreamPump::Options opt;
+    opt.max_pending_bytes = 3200;
+    StreamPump pump(fx.session, opt, fx.sender());
+    for (int i = 0; i < 40; ++i) pump.push_audio(pcm_for_range(i * 1600, 1600));
+    pump.push_commit();
+    const size_t fin = fx.wait_for("\"type\":\"final\"");
+    CHECK(fin != SIZE_MAX);
+    std::lock_guard<std::mutex> lk(fx.mu);
+    if (fin != SIZE_MAX)
+        CHECK(fx.sent[fin].find("\"duration_s\":4") != std::string::npos);
+}
+
+static void test_pump_reset_discards_queued_take() {
+    PumpFixture fx;
+    std::atomic<int> calls{0};
+    fx.session.set_transcribe_fn([&](const float*, int64_t) -> std::optional<std::string> {
+        calls.fetch_add(1);
+        return std::string("w");
+    });
+    StreamPump pump(fx.session, {}, fx.sender());
+    pump.push_audio(pcm_for_range(0, 11200));
+    pump.push_reset();
+    pump.push_commit();
+    CHECK(fx.wait_for("\"type\":\"final\"") != SIZE_MAX);
+    pump.drain();
+    CHECK(fx.count("reset_ack") == 1);
+    CHECK(fx.count("\"duration_s\":0}") == 1);  // nothing left after the reset
+    // If the audio and the reset landed in one batch, no preview ran at all.
+    CHECK(calls.load() <= 1);
+}
+
+static void test_pump_ping_does_not_coalesce_the_preview() {
+    // A ping queued while a window commits carries no audio: the preview of
+    // the newest tail still runs (it would otherwise stay owed until more
+    // audio arrived), and the pong follows it.
+    PumpFixture fx;
+    StreamPump* pump_ptr = nullptr;
+    std::atomic<int> previews{0};
+    fx.session.set_transcribe_fn([&](const float*, int64_t n)
+                                     -> std::optional<std::string> {
+        if (n == 16000) pump_ptr->push_ping();  // arrives during the commit
+        else previews.fetch_add(1);
+        return std::string("w");
+    });
+    StreamPump pump(fx.session, {}, fx.sender());
+    pump_ptr = &pump;
+    pump.push_audio(pcm_for_range(0, 17600));
+    const size_t pong = fx.wait_for("\"type\":\"pong\"");
+    CHECK(pong != SIZE_MAX);
+    pump.drain();
+    CHECK(previews.load() == 1);
+    CHECK(fx.session.chunker()->coalesced_previews() == 0);
+    std::lock_guard<std::mutex> lk(fx.mu);
+    CHECK(pong == 1 && fx.sent[0].find("\"type\":\"partial\"") != std::string::npos);
+}
+
+static void test_pump_backlog_commits_windows_before_the_cap() {
+    // A 3 s live-buffer cap and 6 s of audio queued behind a blocked
+    // preview: the worker commits (and trims) each full window as the
+    // backlog is appended, so the backlog never trips the cap.
+    ServerConfig cfg = test_cfg();
+    cfg.max_stream_seconds = 3.0;
+    PumpFixture fx(cfg);
+    std::mutex gate_mu;
+    std::condition_variable gate_cv;
+    bool release = false;
+    std::atomic<int> calls{0};
+    fx.session.set_transcribe_fn([&](const float*, int64_t)
+                                     -> std::optional<std::string> {
+        if (calls.fetch_add(1) == 0) {
+            std::unique_lock<std::mutex> lk(gate_mu);
+            gate_cv.wait(lk, [&] { return release; });
+        }
+        return std::string("w");
+    });
+    StreamPump pump(fx.session, {}, fx.sender());
+    pump.push_audio(pcm_for_range(0, 8000));  // 0.5 s: the preview blocks
+    while (calls.load() == 0) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    for (int i = 0; i < 22; ++i)
+        pump.push_audio(pcm_for_range(8000 + static_cast<int64_t>(i) * 4000, 4000));
+    pump.push_commit();
+    {
+        std::lock_guard<std::mutex> lk(gate_mu);
+        release = true;
+    }
+    gate_cv.notify_all();
+    const size_t fin = fx.wait_for("\"type\":\"final\"");
+    CHECK(fin != SIZE_MAX);
+    pump.drain();
+    CHECK(fx.count("\"type\":\"error\"") == 0);
+    CHECK(!fx.session.overflowed());
+    std::lock_guard<std::mutex> lk(fx.mu);
+    if (fin != SIZE_MAX)
+        CHECK(fx.sent[fin].find("\"duration_s\":6") != std::string::npos);
+}
+
+static void test_pump_event_bound_blocks_control_frames() {
+    // The event bound covers control frames too: with room for one queued
+    // event and the worker busy, a second ping waits instead of growing
+    // the queue, and every ping is still answered.
+    PumpFixture fx;
+    std::mutex gate_mu;
+    std::condition_variable gate_cv;
+    bool release = false;
+    std::atomic<int> calls{0};
+    fx.session.set_transcribe_fn([&](const float*, int64_t)
+                                     -> std::optional<std::string> {
+        if (calls.fetch_add(1) == 0) {
+            std::unique_lock<std::mutex> lk(gate_mu);
+            gate_cv.wait(lk, [&] { return release; });
+        }
+        return std::string("w");
+    });
+    StreamPump::Options opt;
+    opt.max_pending_events = 1;
+    StreamPump pump(fx.session, opt, fx.sender());
+    pump.push_audio(pcm_for_range(0, 8000));
+    while (calls.load() == 0) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    pump.push_ping();  // fills the queue
+    std::atomic<bool> second_queued{false};
+    std::thread t([&] { pump.push_ping(); second_queued = true; });
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    CHECK(!second_queued.load());
+    {
+        std::lock_guard<std::mutex> lk(gate_mu);
+        release = true;
+    }
+    gate_cv.notify_all();
+    t.join();
+    CHECK(second_queued.load());
+    pump.drain();
+    CHECK(fx.count("\"type\":\"pong\"") == 2);
+}
+
+// A pump fixture whose first engine call blocks until release(), so a test
+// can queue a whole batch behind it.
+struct GatedEngine {
+    std::mutex mu;
+    std::condition_variable cv;
+    bool released = false;
+    std::atomic<int> calls{0};
+    std::atomic<int> previews{0};  // calls shorter than a window
+    TranscribeFn fn() {
+        return [this](const float*, int64_t n) -> std::optional<std::string> {
+            if (n < 16000) previews.fetch_add(1);
+            if (calls.fetch_add(1) == 0) {
+                std::unique_lock<std::mutex> lk(mu);
+                cv.wait(lk, [&] { return released; });
+            }
+            return std::string("w");
+        };
+    }
+    void wait_first() {
+        while (calls.load() == 0) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    void release() {
+        { std::lock_guard<std::mutex> lk(mu); released = true; }
+        cv.notify_all();
+    }
+};
+
+static void test_pump_ping_preview_coalesced_by_later_batch_audio() {
+    // Batch [audio, ping, audio, ping]: the first ping's preview would miss
+    // the audio queued behind it, so only the last ping previews. The worker
+    // is held in its first send (not in the engine, whose cost would stretch
+    // the preview interval) while the batch queues.
+    PumpFixture fx;
+    std::atomic<int> previews{0};
+    fx.session.set_transcribe_fn([&](const float*, int64_t n) -> std::optional<std::string> {
+        if (n < 16000) previews.fetch_add(1);
+        return std::string("w");
+    });
+    std::mutex gate_mu;
+    std::condition_variable gate_cv;
+    bool released = false;
+    std::atomic<bool> in_send{false};
+    auto inner = fx.sender();
+    StreamPump pump(fx.session, {}, [&](const std::string& m) {
+        if (!in_send.exchange(true)) {
+            std::unique_lock<std::mutex> lk(gate_mu);
+            gate_cv.wait(lk, [&] { return released; });
+        }
+        inner(m);
+    });
+    pump.push_audio(pcm_for_range(0, 8000));  // preview, then the send blocks
+    while (!in_send.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    pump.push_audio(pcm_for_range(8000, 1600));
+    pump.push_ping();
+    pump.push_audio(pcm_for_range(9600, 1600));
+    pump.push_ping();
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));  // past the interval
+    {
+        std::lock_guard<std::mutex> lk(gate_mu);
+        released = true;
+    }
+    gate_cv.notify_all();
+    pump.drain();
+    CHECK(fx.count("\"type\":\"pong\"") == 2);
+    CHECK(previews.load() == 2);  // the first one + one for the whole batch
+    CHECK(fx.session.chunker()->coalesced_previews() == 1);
+}
+
+static void test_pump_ping_after_rejected_frame_sends_no_partial() {
+    // Batch [valid audio, odd-length frame, ping]: the refused frame ends
+    // partials for the take, so the ping only answers with a pong.
+    PumpFixture fx;
+    GatedEngine eng;
+    fx.session.set_transcribe_fn(eng.fn());
+    StreamPump pump(fx.session, {}, fx.sender());
+    pump.push_audio(pcm_for_range(0, 8000));  // preview blocks
+    eng.wait_first();
+    pump.push_audio(pcm_for_range(8000, 1600));
+    pump.push_audio(std::string(3, '\0'));    // odd PCM length
+    pump.push_ping();
+    eng.release();
+    pump.drain();
+    CHECK(eng.calls.load() == 1);
+    std::lock_guard<std::mutex> lk(fx.mu);
+    size_t err = SIZE_MAX;
+    for (size_t i = 0; i < fx.sent.size(); ++i)
+        if (fx.sent[i].find("\"type\":\"error\"") != std::string::npos) { err = i; break; }
+    CHECK(err != SIZE_MAX);
+    for (size_t i = err; i < fx.sent.size() && err != SIZE_MAX; ++i)
+        CHECK(fx.sent[i].find("\"type\":\"partial\"") == std::string::npos);
+    CHECK(!fx.sent.empty() && fx.sent.back() == "{\"type\":\"pong\"}");
 }
 
 // ---- main -----------------------------------------------------------------
@@ -1364,6 +1997,25 @@ int main() {
     test_chunk_streamer_never_transcribes_empty_window();
     test_stream_session_rejects_invalid_window_config();
     test_model_mapping();
+    test_trace_ledger_kinds_and_spans();
+    test_trace_new_final_samples_run_the_tail();
+    test_trace_flush_bounded_by_tail_not_take();
+    test_preview_minimum_gates_the_take_not_the_tail();
+    test_preview_coalesced_when_newer_audio_is_queued();
+    test_window_commit_does_not_force_a_throttled_preview();
+    test_preview_interval_adapts_to_preview_cost();
+    test_preview_policy_validation();
+    test_preview_policy_is_not_result_provenance();
+    test_pump_stop_during_inference_finalizes_all_audio();
+    test_pump_coalesces_previews_and_keeps_every_sample();
+    test_pump_ping_follows_earlier_audio();
+    test_pump_backpressure_never_drops_audio();
+    test_pump_reset_discards_queued_take();
+    test_pump_ping_does_not_coalesce_the_preview();
+    test_pump_backlog_commits_windows_before_the_cap();
+    test_pump_event_bound_blocks_control_frames();
+    test_pump_ping_preview_coalesced_by_later_batch_audio();
+    test_pump_ping_after_rejected_frame_sends_no_partial();
 
     std::printf("stream_session_test: %d/%d passed\n", g_passed, g_tests);
     return g_passed == g_tests ? 0 : 1;

@@ -123,6 +123,18 @@ STREAM_TRIM_MIN_SAMPLES: int = SAMPLE_RATE
 bounding per-append ``np.concatenate`` copying and RAM. 1 second of audio.
 """
 
+STREAM_QUEUE_MAX_FRAMES: int = 1024
+"""Bound on WS /stream frames received but not yet processed (issue #357).
+
+A full queue pauses receiving (TCP backpressure); audio is never dropped.
+"""
+
+STREAM_QUEUE_MAX_BYTES: int = 32 * 1024 * 1024
+"""Bound on WS /stream audio bytes received but not yet taken by the worker
+(issue #357; ``max_pending_bytes`` in cpp/serve/stream_pump.hpp). A single
+larger frame is still admitted when nothing else is queued.
+"""
+
 # Supported model slugs -> (backend class, display name, gpu-lock model label).
 # Built lazily as backend classes are defined below.
 MODEL_SLUGS = ("granite", "parakeet", "parakeet_unified", "moss", "qwen3", "qwen3_06", "ark", "ark06", "cohere", "higgs", "audex", "voxtral")
@@ -1244,9 +1256,24 @@ class StreamSession:
     # Machine-readable code for the rejection that invalidated the take
     # ("malformed_wav", "odd_pcm_length"). Empty unless take_invalid.
     invalid_reason: str = ""
+    # Per-take call ledger (issue #226): every transcribe call with its kind,
+    # absolute audio span, timing and result. Reported only to clients that
+    # ask for it (``trace=1`` on the /stream URL).
+    trace: Any = None
+    # Preview cadence for this connection (issue #357): the first-partial
+    # minimum and the preview interval, defaulting to the server flags.
+    min_partial_seconds: float = -1.0
+    partial_interval_seconds: float = -1.0
 
     def __post_init__(self) -> None:
+        from .stream_chunk import StreamTrace
+
+        self.trace = StreamTrace(SAMPLE_RATE)
         cfg = self.server.config
+        if self.min_partial_seconds < 0:
+            self.min_partial_seconds = cfg.min_chunk_seconds
+        if self.partial_interval_seconds < 0:
+            self.partial_interval_seconds = cfg.partial_interval_seconds
         if getattr(cfg, "stream_chunk_seconds", 0.0) and cfg.stream_chunk_seconds > 0:
             from .stream_chunk import ChunkStreamer
 
@@ -1260,21 +1287,47 @@ class StreamSession:
 
     def _tx(self, window: np.ndarray) -> Optional[str]:
         """Transcribe one window to text; ``None`` if the server is busy/cancelled."""
+        # Every chunker window starts at its boundary (full windows, the
+        # preview tail and the flush tail alike).
+        abs_start = self.trimmed_samples + self.chunker.boundary
+        t0 = self.trace.now_ms()
         try:
             res = self.server._run_queued_sync(
                 np.ascontiguousarray(window, dtype=np.float32), None, streaming=True
             )
         except (_Busy, _Cancelled):
+            self.trace.record(self.chunker.call_kind, abs_start, len(window), t0,
+                              self.trace.now_ms(), "busy")
             return None
+        self.trace.record(self.chunker.call_kind, abs_start, len(window), t0,
+                          self.trace.now_ms(), "ok")
         return res.text
 
-    def stream_step(self, now: float) -> Optional[str]:
-        """Advance the chunked stream; returns text to emit as a partial, or None."""
-        return self.chunker.step(self.samples, now, self._tx)
+    def set_preview_policy(self, min_seconds: float, interval_seconds: float) -> None:
+        """Per-connection preview cadence; ``ValueError`` when invalid."""
+        from .stream_chunk import preview_policy_error
+
+        error = preview_policy_error(sample_rate=SAMPLE_RATE, min_seconds=min_seconds,
+                                     interval_seconds=interval_seconds)
+        if error is not None:
+            raise ValueError(error)
+        self.min_partial_seconds = float(min_seconds)
+        self.partial_interval_seconds = float(interval_seconds)
+        if self.chunker is not None:
+            self.chunker.set_preview_policy(min_seconds, interval_seconds)
+
+    def stream_step(self, now: float, newer_pending=None) -> Optional[str]:  # noqa: ANN001
+        """Advance the chunked stream; returns text to emit as a partial, or None.
+
+        ``newer_pending`` coalesces obsolete previews (ChunkStreamer.step).
+        """
+        return self.chunker.step(self.samples, now, self._tx, newer_pending)
 
     def stream_flush(self) -> str:
         """Finalize all buffered audio (on commit) and return the full text."""
+        self.trace.begin_flush(len(self.samples) - self.chunker.boundary)
         text = self.chunker.flush(self.samples, self._tx)
+        self.trace.end_flush(text is not None)
         if text is None:
             raise _Busy("stream commit incomplete; retry with buffered audio retained")
         return text
@@ -1306,7 +1359,7 @@ class StreamSession:
             return
         self.samples = np.ascontiguousarray(self.samples[b:], dtype=np.float32)
         self.trimmed_samples += b
-        chunker.boundary = 0
+        chunker.rebase(b)
 
     def append_pcm(self, pcm16_bytes: bytes) -> AppendOutcome:
         if self.take_invalid:
@@ -1326,6 +1379,7 @@ class StreamSession:
         s = _pcm16_bytes_to_float32(pcm16_bytes)
         if s.size > 0:
             self.samples = np.concatenate([self.samples, s]) if self.samples.size else s
+            self.trace.mark_take_start()
         self._maybe_trim_samples()
         return AppendOutcome.ACCEPTED
 
@@ -1356,6 +1410,7 @@ class StreamSession:
             s = _resample_audio(s, sr, SAMPLE_RATE)
         if s.size > 0:
             self.samples = np.concatenate([self.samples, s]) if self.samples.size else s
+            self.trace.mark_take_start()
         self._maybe_trim_samples()
         return AppendOutcome.ACCEPTED
 
@@ -1376,9 +1431,9 @@ class StreamSession:
         return len(self.samples) / SAMPLE_RATE
 
     def should_emit_partial(self, now: float) -> bool:
-        if self.live_seconds < self.server.config.min_chunk_seconds:
+        if self.live_seconds < self.min_partial_seconds:
             return False
-        if (now - self.last_partial_ts) < self.server.config.partial_interval_seconds:
+        if (now - self.last_partial_ts) < self.partial_interval_seconds:
             return False
         return True
 
@@ -1388,12 +1443,39 @@ class StreamSession:
         self.trimmed_samples = 0
         self.take_invalid = False
         self.invalid_reason = ""
+        self.trace.reset()
         if self.chunker is not None:
             self.chunker.reset()
 
-    def transcribe_current_sync(self) -> TranscribeResult:
+    def transcribe_current_sync(self, kind: str = "preview") -> TranscribeResult:
+        """Whole-buffer transcription (``stream_chunk_seconds == 0``): a
+        ``preview`` while recording, the ``full_take`` on commit."""
         snapshot = self.samples.copy()
-        return self.server._run_queued_sync(snapshot, None)
+        t0 = self.trace.now_ms()
+        try:
+            res = self.server._run_queued_sync(snapshot, None)
+        except (_Busy, _Cancelled):
+            self.trace.record(kind, 0, len(snapshot), t0, self.trace.now_ms(), "busy")
+            raise
+        self.trace.record(kind, 0, len(snapshot), t0, self.trace.now_ms(), "ok")
+        return res
+
+    def commit_full_take_sync(self) -> TranscribeResult:
+        """Commit in whole-buffer mode: one labeled full-take transcription."""
+        self.trace.begin_flush(len(self.samples))
+        try:
+            res = self.transcribe_current_sync("full_take")
+        except BaseException:
+            self.trace.end_flush(False)
+            raise
+        self.trace.end_flush(True, full_take=True)
+        return res
+
+    def trace_partial(self) -> dict:
+        return self.trace.partial_json(self.trimmed_samples + len(self.samples), self.chunker)
+
+    def trace_final(self) -> dict:
+        return self.trace.final_json(self.trimmed_samples + len(self.samples), self.chunker)
 
 
 def _ws_append_error(outcome: AppendOutcome, session: StreamSession) -> str:
@@ -1602,20 +1684,211 @@ def create_app(
     async def _stream(ws):  # noqa: ANN001
         await ws.accept()
         sess = StreamSession(server=server)
+        # Opt-in stream instrumentation (issue #226): ``trace=1`` on the
+        # /stream URL attaches a "trace" object to partials and finals.
+        trace = ws.query_params.get("trace") == "1"
+        # Per-connection preview cadence (issue #357); invalid values end the
+        # connection with an error frame (mirrors cpp/serve/main.cpp).
+        try:
+            sess.set_preview_policy(
+                float(ws.query_params.get("min_partial_seconds", sess.min_partial_seconds)),
+                float(ws.query_params.get("partial_interval_seconds",
+                                          sess.partial_interval_seconds)),
+            )
+        except ValueError as exc:
+            await ws.send_json({"type": "error", "message": f"invalid stream parameter: {exc}"})
+            await ws.close()
+            return
         # Sent once when a binary frame is refused (malformed WAV, odd PCM
         # length); re-armed on reset so a fresh dictation gets a fresh error
-        # if it is refused. Mirrors reject_error_sent in cpp/serve/main.cpp.
+        # if it is refused. Mirrors reject_error_sent in cpp/serve/stream_pump.cpp.
         reject_error_sent = False
+        # The receive task only queues frames; this coroutine drains every
+        # queued frame before each streaming step, so previews track the
+        # newest audio and obsolete ones are skipped (issue #357). The queue
+        # is bounded: a full queue pauses receiving (backpressure), never
+        # drops audio. ``None`` marks the disconnect.
+        queue: asyncio.Queue = asyncio.Queue(maxsize=STREAM_QUEUE_MAX_FRAMES)
+        # Queued items that make a preview obsolete: audio, a commit or reset
+        # (which end or discard the take) and the disconnect. A ping or an
+        # unrecognized message carries no audio and does not (mirrors
+        # pending_work_ in cpp/serve/stream_pump.cpp).
+        pending_work = 0
+        # Queued audio bytes not yet taken by the worker; above
+        # STREAM_QUEUE_MAX_BYTES the receiver waits for ``space``.
+        pending_bytes = 0
+        space = asyncio.Event()
+
+        def _ends_preview(text: str) -> bool:
+            try:
+                cmd = json.loads(text)
+            except json.JSONDecodeError:
+                return False
+            return isinstance(cmd, dict) and cmd.get("type") in ("commit", "reset")
+
+        async def enqueue(item, work: bool) -> None:  # noqa: ANN001
+            nonlocal pending_work, pending_bytes
+            if item is not None and item[0] == "bytes":
+                size = len(item[1])
+                while pending_bytes and pending_bytes + size > STREAM_QUEUE_MAX_BYTES:
+                    space.clear()
+                    await space.wait()
+                pending_bytes += size
+            if work:
+                pending_work += 1
+            await queue.put((item, work))
+
+        async def receive() -> None:
+            try:
+                while True:
+                    msg = await ws.receive()
+                    if msg["type"] == "websocket.disconnect":
+                        break
+                    text_msg = msg.get("text")
+                    if text_msg is not None:
+                        await enqueue(("text", text_msg), _ends_preview(text_msg))
+                    elif msg.get("bytes"):
+                        await enqueue(("bytes", msg["bytes"]), True)
+            except WebSocketDisconnect:
+                pass
+            except Exception:  # transport failure: handled like a disconnect
+                log.exception("WS /stream receive failed")
+            # Not in ``finally``: when the handler exits it cancels this task,
+            # and a cancelled receiver must not block on a full queue that
+            # nobody drains any more.
+            await enqueue(None, True)
+
+        async def send_partial(text: str, segments: list) -> None:
+            partial = {
+                "type": "partial",
+                "text": text,
+                "segments": segments,
+                "start_s": 0.0,
+                "end_s": sess.buffered_seconds,
+            }
+            if trace:
+                partial["trace"] = sess.trace_partial()
+            await ws.send_json(partial)
+
+        async def step(coalesce_preview: bool = False) -> None:
+            """``coalesce_preview``: commit due windows but skip the preview
+            (more queued audio follows in the same batch)."""
+            await asyncio.to_thread(server._ensure_loaded)
+            now = time.monotonic()
+            if sess.chunker is not None:
+                # Chunked path: finalize full windows + emit committed+tail.
+                # ChunkStreamer handles throttling, coalescing and busy
+                # (-> None) itself.
+                text = await asyncio.to_thread(
+                    sess.stream_step, now,
+                    lambda: coalesce_preview or pending_work > 0)
+                if text is not None:
+                    sess.last_partial_ts = now
+                    await send_partial(text, [{"text": text, "start_s": 0.0,
+                                               "end_s": sess.buffered_seconds}])
+            elif (sess.should_emit_partial(now) and not coalesce_preview
+                  and pending_work == 0):
+                try:
+                    result = await asyncio.to_thread(sess.transcribe_current_sync)
+                except (_Busy, _Cancelled):
+                    return
+                sess.last_partial_ts = now
+                await send_partial(result.text, result.segments)
+
+        async def commit() -> bool:
+            """Finalize the take; True when a final was sent."""
+            # An invalidated take (a rejected binary frame) holds incomplete
+            # audio: committing it as an ordinary successful final would
+            # silently miss speech, so the commit is refused and the client
+            # falls back to its authoritative local recording after a reset
+            # (issue #173). The busy-retry path below is untouched: it
+            # retains VALID audio, while this path refuses INVALID audio.
+            if sess.take_invalid:
+                await ws.send_json(
+                    {
+                        "type": "error",
+                        "message": f"take invalidated ({sess.invalid_reason}); reset and resend",
+                    }
+                )
+                return False
+            if sess.buffered_seconds > 0.0:
+                await asyncio.to_thread(server._ensure_loaded)
+                try:
+                    if sess.chunker is not None:
+                        text = await asyncio.to_thread(sess.stream_flush)
+                        result = TranscribeResult(
+                            text=text,
+                            segments=[{"text": text, "start_s": 0.0,
+                                       "end_s": sess.buffered_seconds}],
+                            duration_s=sess.buffered_seconds,
+                        )
+                    else:
+                        result = await asyncio.to_thread(sess.commit_full_take_sync)
+                except _Busy:
+                    await ws.send_json({"type": "error", "message": "server busy"})
+                    return False
+                except _Cancelled:
+                    await ws.send_json({"type": "error", "message": "cancelled"})
+                    return False
+            else:
+                result = TranscribeResult(text="")
+            final = {
+                "type": "final",
+                "text": result.text,
+                "segments": result.segments,
+                "duration_s": round(sess.buffered_seconds, 3),
+            }
+            if trace:
+                final["trace"] = sess.trace_final()
+            await ws.send_json(final)
+            sess.reset()
+            return True
+
         log.info("WS /stream client connected")
+        receiver = asyncio.create_task(receive())
         try:
             while True:
-                msg = await ws.receive()
-                if msg["type"] == "websocket.disconnect":
-                    break
-                text_msg = msg.get("text")
-                if text_msg is not None:
+                batch = [await queue.get()]
+                while not queue.empty():
+                    batch.append(queue.get_nowait())
+                # The batch is taken: its audio no longer counts against the
+                # receiver's byte budget (as in the native pump). Only the
+                # taken bytes: a frame still waiting for queue space keeps
+                # its reservation.
+                pending_bytes -= sum(len(item[1]) for item, _ in batch
+                                     if item is not None and item[0] == "bytes")
+                space.set()
+                need_step = False
+                for idx, (item, work) in enumerate(batch):
+                    if item is None:
+                        return
+                    kind, payload = item
+                    if work:
+                        pending_work -= 1
+                    if kind == "bytes":
+                        # append_wav itself sniffs RIFF/WAVE vs raw PCM16. A
+                        # refused frame is reported once as an error frame,
+                        # and the session stops accepting audio until it is
+                        # reset (issue #173, mirroring the native policy).
+                        outcome = sess.append_wav(payload)
+                        if outcome is AppendOutcome.ACCEPTED:
+                            need_step = True
+                            # Catching up on a backlog: commit each full
+                            # window as soon as it is buffered, so finalized
+                            # audio is trimmed before the rest of the batch
+                            # is appended. Only the preview waits.
+                            chunker = sess.chunker
+                            if (chunker is not None and idx + 1 < len(batch)
+                                    and len(sess.samples) - chunker.boundary >= chunker.chunk):
+                                await step(coalesce_preview=True)
+                        elif not reject_error_sent:
+                            reject_error_sent = True
+                            await ws.send_json(
+                                {"type": "error", "message": _ws_append_error(outcome, sess)}
+                            )
+                        continue
                     try:
-                        cmd = json.loads(text_msg)
+                        cmd = json.loads(payload)
                     except json.JSONDecodeError:
                         await ws.send_json({"type": "error", "message": "bad json"})
                         continue
@@ -1624,122 +1897,30 @@ def create_app(
                         continue
                     mtype = cmd.get("type")
                     if mtype == "commit":
-                        # An invalidated take (a rejected binary frame) holds
-                        # incomplete audio: committing it as an ordinary
-                        # successful final would silently miss speech, so the
-                        # commit is refused and the client falls back to its
-                        # authoritative local recording after a reset
-                        # (issue #173). The busy-retry path below is untouched:
-                        # it retains VALID audio, while this path refuses
-                        # INVALID audio.
-                        if sess.take_invalid:
-                            await ws.send_json(
-                                {
-                                    "type": "error",
-                                    "message": (
-                                        f"take invalidated ({sess.invalid_reason});"
-                                        " reset and resend"
-                                    ),
-                                }
-                            )
-                            continue
-                        if sess.buffered_seconds > 0.0:
-                            await asyncio.to_thread(server._ensure_loaded)
-                            try:
-                                if sess.chunker is not None:
-                                    text = await asyncio.to_thread(sess.stream_flush)
-                                    result = TranscribeResult(
-                                        text=text,
-                                        segments=[{"text": text, "start_s": 0.0,
-                                                   "end_s": sess.buffered_seconds}],
-                                        duration_s=sess.buffered_seconds,
-                                    )
-                                else:
-                                    result = await asyncio.to_thread(sess.transcribe_current_sync)
-                            except _Busy:
-                                await ws.send_json({"type": "error", "message": "server busy"})
-                                continue
-                            except _Cancelled:
-                                await ws.send_json({"type": "error", "message": "cancelled"})
-                                continue
-                        else:
-                            result = TranscribeResult(text="")
-                        await ws.send_json(
-                            {
-                                "type": "final",
-                                "text": result.text,
-                                "segments": result.segments,
-                                "duration_s": round(sess.buffered_seconds, 3),
-                            }
-                        )
-                        sess.reset()
-                        # reset() re-enables audio; re-arm the one-shot error
-                        # frame with it.
-                        reject_error_sent = False
-                        continue
+                        # The flush covers every frame appended so far.
+                        need_step = False
+                        if await commit():
+                            # reset() re-enables audio; re-arm the one-shot
+                            # error frame with it.
+                            reject_error_sent = False
                     elif mtype == "ping":
+                        # In order: the pong follows the step owed for
+                        # earlier audio.
+                        if need_step and not sess.take_invalid:
+                            await step()
+                        need_step = False
                         await ws.send_json({"type": "pong"})
-                        continue
                     elif mtype == "reset":
+                        need_step = False
                         sess.reset()
                         reject_error_sent = False
                         await ws.send_json({"type": "reset_ack"})
-                        continue
                     else:
                         await ws.send_json({"type": "error", "message": f"unknown type {mtype!r}"})
-                        continue
-
-                bdata = msg.get("bytes")
-                if not bdata:
-                    continue
-                # append_wav itself sniffs RIFF/WAVE vs raw PCM16. A refused
-                # frame is reported once as an error frame, and the session
-                # stops accepting audio until it is reset (issue #173,
-                # mirroring the native frame-validity policy).
-                outcome = sess.append_wav(bdata)
-                if outcome is not AppendOutcome.ACCEPTED:
-                    if not reject_error_sent:
-                        reject_error_sent = True
-                        await ws.send_json(
-                            {"type": "error", "message": _ws_append_error(outcome, sess)}
-                        )
-                    continue
-
-                await asyncio.to_thread(server._ensure_loaded)
-                now = time.monotonic()
-                if sess.chunker is not None:
-                    # Chunked path: finalize full windows + emit committed+tail.
-                    # ChunkStreamer handles throttling and busy (-> None) itself.
-                    text = await asyncio.to_thread(sess.stream_step, now)
-                    if text is not None:
-                        sess.last_partial_ts = now
-                        await ws.send_json(
-                            {
-                                "type": "partial",
-                                "text": text,
-                                "segments": [{"text": text, "start_s": 0.0,
-                                              "end_s": sess.buffered_seconds}],
-                                "start_s": 0.0,
-                                "end_s": sess.buffered_seconds,
-                            }
-                        )
-                elif sess.should_emit_partial(now):
-                    try:
-                        result = await asyncio.to_thread(sess.transcribe_current_sync)
-                    except _Busy:
-                        continue
-                    except _Cancelled:
-                        continue
-                    sess.last_partial_ts = now
-                    await ws.send_json(
-                        {
-                            "type": "partial",
-                            "text": result.text,
-                            "segments": result.segments,
-                            "start_s": 0.0,
-                            "end_s": sess.buffered_seconds,
-                        }
-                    )
+                # A frame refused later in the batch ends partials for this
+                # take, as it did frame by frame before.
+                if need_step and not sess.take_invalid:
+                    await step()
         except WebSocketDisconnect:
             log.info("WS /stream client disconnected")
         except Exception as exc:  # pragma: no cover - defensive
@@ -1749,6 +1930,8 @@ def create_app(
             except Exception:
                 pass
         finally:
+            receiver.cancel()
+            await asyncio.gather(receiver, return_exceptions=True)
             try:
                 await ws.close()
             except Exception:

@@ -184,6 +184,176 @@ def test_stream_valid_invalid_valid_sequence(server, monkeypatch):
             assert final["duration_s"] == .5
 
 
+# ---------------------------------------------------------------------------
+# Opt-in stream instrumentation (issue #226): ``trace=1`` attaches the call
+# ledger; without it the frames are unchanged.
+# ---------------------------------------------------------------------------
+def test_stream_trace_is_opt_in(server, monkeypatch):
+    monkeypatch.setattr(server, "_run_queued_sync", _transcribe_hello)
+    half = np.zeros(S.SAMPLE_RATE // 2, dtype=np.int16).tobytes()
+    with TestClient(S.create_app(server=server, load_on_startup=False)) as client:
+        with client.websocket_connect('/stream') as ws:
+            ws.send_bytes(half)
+            assert "trace" not in ws.receive_json()
+            ws.send_json({"type": "commit"})
+            assert "trace" not in ws.receive_json()
+
+
+@pytest.mark.parametrize("chunk_seconds", [0, 1])
+def test_stream_trace_ledger(server, monkeypatch, chunk_seconds):
+    server.config.stream_chunk_seconds = chunk_seconds
+    monkeypatch.setattr(server, "_run_queued_sync", _transcribe_hello)
+    half = np.zeros(S.SAMPLE_RATE // 2, dtype=np.int16).tobytes()
+    with TestClient(S.create_app(server=server, load_on_startup=False)) as client:
+        with client.websocket_connect('/stream?trace=1') as ws:
+            ws.send_bytes(half)
+            partial = ws.receive_json()
+            assert partial["trace"]["audio_s"] == .5
+            assert partial["trace"]["covered_s"] == .5
+            assert partial["trace"]["totals"]["engine_calls"] == 1
+            ws.send_bytes(half)  # new final samples after the preview
+            assert ws.receive_json()["type"] == "partial"
+            ws.send_json({"type": "commit"})
+            trace = ws.receive_json()["trace"]
+    calls = trace["calls"]
+    if chunk_seconds:
+        # 1.0 s buffered: the second step finalizes one full window and
+        # previews the 0.25 s past the boundary (advance 0.75 s); the stop
+        # flushes only that tail.
+        assert [c["kind"] for c in calls] == [
+            "preview", "window", "preview", "flush_tail"]
+        assert trace["by_kind"]["window"]["engine_audio_s"] == 1.0
+        assert trace["stop"]["path"] == "tail"
+        assert trace["stop"]["unfinalized_s"] == .25
+        assert trace["stop"]["totals"]["engine_audio_s"] == .25
+        assert calls[-1] == {**calls[-1], "kind": "flush_tail",
+                             "start_s": .75, "end_s": 1.0, "result": "ok"}
+    else:
+        # Whole-buffer mode re-transcribes the take: labeled, never "tail".
+        assert [c["kind"] for c in calls] == ["preview", "preview", "full_take"]
+        assert trace["stop"]["path"] == "full_take"
+        assert calls[-1]["kind"] == "full_take"
+        assert trace["stop"]["totals"]["engine_audio_s"] == 1.0
+    assert trace["covered_s"] == 1.0
+
+
+# ---------------------------------------------------------------------------
+# Preview cadence and coalescing (issue #357).
+# ---------------------------------------------------------------------------
+def test_stream_per_connection_preview_cadence(server, monkeypatch):
+    monkeypatch.setattr(server, "_run_queued_sync", _transcribe_hello)
+    half = np.zeros(S.SAMPLE_RATE // 2, dtype=np.int16).tobytes()
+    with TestClient(S.create_app(server=server, load_on_startup=False)) as client:
+        with client.websocket_connect('/stream?min_partial_seconds=0.75&trace=1') as ws:
+            ws.send_bytes(half)  # 0.5 s: below this connection's minimum
+            ws.send_json({"type": "ping"})
+            assert ws.receive_json() == {"type": "pong"}
+            ws.send_bytes(half)
+            partial = ws.receive_json()
+            assert partial["type"] == "partial"
+            assert partial["trace"]["preview"]["min_s"] == .75
+            assert partial["trace"]["preview"]["interval_s"] == 0
+
+
+@pytest.mark.parametrize("query", ["min_partial_seconds=-1", "partial_interval_seconds=nan",
+                                   "min_partial_seconds=abc"])
+def test_stream_invalid_cadence_is_refused(server, query):
+    from starlette.websockets import WebSocketDisconnect
+
+    with TestClient(S.create_app(server=server, load_on_startup=False)) as client:
+        with client.websocket_connect(f'/stream?{query}') as ws:
+            error = ws.receive_json()
+            assert error["type"] == "error"
+            assert error["message"].startswith("invalid stream parameter")
+            with pytest.raises(WebSocketDisconnect):
+                ws.receive_json()
+
+
+def test_stream_burst_coalesces_previews_and_keeps_audio(server, monkeypatch):
+    import time as _time
+
+    server.config.stream_chunk_seconds = 1
+    lens = []
+
+    def slow(samples, rid, **kwargs):
+        lens.append(len(samples))
+        _time.sleep(0.02)
+        return S.TranscribeResult(text="w")
+
+    monkeypatch.setattr(server, "_run_queued_sync", slow)
+    frame = np.zeros(S.SAMPLE_RATE // 20, dtype=np.int16).tobytes()  # 50 ms
+    with TestClient(S.create_app(server=server, load_on_startup=False)) as client:
+        with client.websocket_connect('/stream?trace=1') as ws:
+            for _ in range(60):
+                ws.send_bytes(frame)
+            ws.send_json({"type": "commit"})
+            while (msg := ws.receive_json())["type"] != "final":
+                assert msg["type"] == "partial"
+    previews = [n for n in lens if n < S.SAMPLE_RATE]
+    assert len(previews) < 30
+    assert msg["duration_s"] == 3.0
+    assert msg["trace"]["covered_s"] == 3.0
+    assert msg["trace"]["audio_s"] == 3.0
+
+
+@pytest.mark.parametrize("message,reply", [({"type": "ping"}, "pong"),
+                                           ({"type": "bogus"}, "error")])
+def test_stream_ping_does_not_coalesce_the_preview(server, monkeypatch, message, reply):
+    # A ping (or an unrecognized message) queued while a window commits
+    # carries no audio: the preview of the newest tail still runs, and the
+    # reply follows it.
+    import time as _time
+
+    server.config.stream_chunk_seconds = 1
+    lens = []
+
+    def slow_window(samples, rid, **kwargs):
+        lens.append(len(samples))
+        if len(samples) == S.SAMPLE_RATE:
+            _time.sleep(0.3)  # the ping arrives during the window commit
+        return S.TranscribeResult(text="w")
+
+    monkeypatch.setattr(server, "_run_queued_sync", slow_window)
+    audio = np.zeros(S.SAMPLE_RATE * 11 // 10, dtype=np.int16).tobytes()  # 1.1 s
+    with TestClient(S.create_app(server=server, load_on_startup=False)) as client:
+        with client.websocket_connect('/stream?min_partial_seconds=0.5'
+                                      '&partial_interval_seconds=0') as ws:
+            ws.send_bytes(audio)
+            _time.sleep(0.1)
+            ws.send_json(message)
+            types = []
+            while (msg := ws.receive_json())["type"] != reply:
+                types.append(msg["type"])
+    assert "partial" in types
+    assert [n for n in lens if n < S.SAMPLE_RATE] != []
+
+
+def test_stream_tiny_queue_bounds_keep_every_frame(server, monkeypatch):
+    # Queue and byte budgets smaller than the burst, with a slow engine: the
+    # receiver waits for space (frames blocked on a full queue keep their
+    # byte reservation) and the final still covers every frame.
+    import time as _time
+
+    server.config.stream_chunk_seconds = 1
+    monkeypatch.setattr(S, "STREAM_QUEUE_MAX_FRAMES", 2)
+    frame = np.zeros(S.SAMPLE_RATE // 10, dtype=np.int16).tobytes()  # 100 ms
+    monkeypatch.setattr(S, "STREAM_QUEUE_MAX_BYTES", 3 * len(frame))
+
+    def slow(samples, rid, **kwargs):
+        _time.sleep(0.01)
+        return S.TranscribeResult(text="w")
+
+    monkeypatch.setattr(server, "_run_queued_sync", slow)
+    with TestClient(S.create_app(server=server, load_on_startup=False)) as client:
+        with client.websocket_connect('/stream') as ws:
+            for _ in range(40):
+                ws.send_bytes(frame)
+            ws.send_json({"type": "commit"})
+            while (msg := ws.receive_json())["type"] != "final":
+                assert msg["type"] == "partial"
+    assert msg["duration_s"] == 4.0
+
+
 def test_lifespan_owns_eager_load(server):
     app = S.create_app(server=server)
     assert server.test_loads == []

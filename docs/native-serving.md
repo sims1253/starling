@@ -250,6 +250,73 @@ receive JSON messages:
 - `{"type":"pong"}`: in response to `{"type":"ping"}`
 - `{"type":"reset_ack"}`: in response to `{"type":"reset"}`
 
+**Preview cadence** (issue #357): the window geometry
+(`--stream-chunk-seconds`, `--stream-overlap-seconds`) decides what is
+committed. The cadence decides only when the live tail is previewed.
+`--min-chunk-seconds` is the first-partial minimum for the whole take;
+it does not gate the tail. Once the take holds that much audio, every
+nonempty tail is previewed, including the overlap right after a window
+commit. `--partial-interval-seconds` is the minimum gap between previews.
+The server stretches it so that previews use at most half of wall time:
+the next preview waits at least twice as long as the last one took.
+A window commit inside that gap sends the committed text at once, without
+previewing the tail.
+That bound adapts to slow models and devices without a per-device preset.
+A client can set the cadence for one connection with query parameters:
+`/stream?min_partial_seconds=1&partial_interval_seconds=0.5`. Invalid
+values get an `invalid stream parameter` error frame, and the server
+closes the connection. The cadence never changes which audio is committed
+or finalized.
+
+**Coalescing** (issue #357): the connection's read loop only queues frames.
+One worker per connection appends every queued frame before each step.
+Each preview therefore covers all audio received so far. If more audio,
+a `commit` or a `reset` arrives while full windows are being committed,
+the server skips that preview and previews the newer audio next. A `ping`
+does not skip a preview. When the worker catches up on a backlog, it
+commits each full window as soon as it is appended, so the backlog alone
+does not hit the buffer cap. Window commits and finalization always run,
+and the server never drops audio. When more than 32 MiB or 4096 frames
+are queued, the server stops reading from the socket until the worker
+catches up. A `ping` is answered after every earlier frame has been
+processed, as before.
+
+**Stream instrumentation** (issue #226): connect to `/stream?trace=1` and
+every partial and final carries an extra `"trace"` object. Clients that do
+not ask get the frames above unchanged. Times are milliseconds since the
+take's first audio; audio positions are seconds into the take.
+
+- Partial: `{"v":1,"t_ms":…,"audio_s":…,"covered_s":…,"totals":{…},"preview":{…}}`.
+  `audio_s` is the audio received so far, and `covered_s` is the end of
+  the audio that the text reflects. `preview` holds the connection's
+  `min_s`, `interval_s`, the current `effective_interval_s` and the
+  number of `coalesced` previews. `totals` holds `calls`,
+  `engine_calls`, `engine_audio_s`, `engine_ms`, `reused` and `busy`.
+  `engine_audio_s` counts window overlap and each repeated preview, so
+  `engine_audio_s / audio_s` is the inference work per recorded second.
+  `engine_ms` is the wall time of each transcribe call. It includes a lazy
+  model load on the first call and, in Granite chunk-fairness mode, the
+  wait for the serial queue; other modes answer `busy` instead of waiting.
+  The trace starts a commit's `stop` section when the worker begins the
+  flush, so a commit that waits behind a running preview is not counted
+  there. The client's own stop-to-final time includes that wait.
+- Final: the same fields, plus `by_kind` totals for `window` (full windows
+  while recording), `preview` (live tail), `flush_window` and `flush_tail`
+  (work after commit). It also has `stop`, `calls` and `calls_dropped`.
+  `stop` covers the commit's own work. `path` is `tail` (the engine
+  transcribed only the unfinalized remainder), `reused` (the exact
+  tail result answered it) or `committed` (nothing was left). The
+  Python server labels its whole-buffer mode `full_take`. `stop` also
+  holds `unfinalized_s` (the audio past the committed boundary at
+  commit), `t0_ms`, `t1_ms` and `totals`. `calls` lists each call
+  with `kind`, `start_s`, `end_s`, `t0_ms`, `t1_ms` and `result`
+  (`ok`, `reused`, `busy` or `timed_out`). It holds at most 20,000
+  entries. `calls_dropped` counts later calls, which still enter
+  the totals.
+
+`benchmarks/experiments/stream_replay.py` uses this to replay workload takes
+at microphone pace and to report latency, work and stop-time metrics.
+
 **Buffer cap** (`--max-stream-seconds`, default 60 s): a binary frame that
 would push the session's live audio buffer past the cap is refused. The
 server emits one error frame:
@@ -321,6 +388,7 @@ cpp/serve/
 ├── main.cpp            — CLI parsing, lifecycle, HTTP/WS transport (cpp-httplib)
 ├── server.hpp/.cpp     — StarlingServer: model lifecycle, serial queue, transcribe
 ├── stream_session.hpp/.cpp — Rolling buffer + ChunkStreamer (port of Python logic)
+├── stream_pump.hpp/.cpp — WS /stream worker: frame queue, drain, preview coalescing
 └── audio.hpp/.cpp      — WAV/PCM decoding (dr_wav) + multipart extraction
 ```
 

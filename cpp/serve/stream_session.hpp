@@ -7,6 +7,7 @@
 #include "server.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -45,6 +46,18 @@ std::string norm_word(const std::string& word);
 // std::nullopt if the transcriber is busy (should retry without advancing state).
 using TranscribeFn = std::function<std::optional<std::string>(const float*, int64_t)>;
 
+// Asked right before a preview would start: true when newer audio (or a
+// control message) is already queued behind the current step, so the
+// preview would be obsolete before it finished (issue #357).
+using PendingFn = std::function<bool()>;
+
+// Preview cadence bound (issue #357): the effective preview interval is
+// at least the latest preview's engine time divided by this duty, so on a
+// slow model or device previews take at most this fraction of wall time
+// instead of running back to back. Window and finalization work is never
+// throttled.
+constexpr double kMaxPreviewDuty = 0.5;
+
 // ---- stream window config validation (issue #146) ---------------------------
 // Strict numeric parse for CLI flags: the whole string must be one finite
 // number. std::stod/std::stoi alone accept partial parses ("3abc" -> 3) and
@@ -81,20 +94,39 @@ enum class AppendOutcome {
     TakeInvalid,   // refused: the take was already invalidated
 };
 
+// Validate a preview cadence (issue #357): finite, nonnegative, and a
+// minimum whose sample count fits the counters. Empty string when valid.
+std::string preview_policy_error(int sample_rate, double min_seconds,
+                                 double interval_seconds);
+
 // ChunkStreamer: rolling fixed-window overlapping-chunk transcription state.
 // Direct port of ChunkStreamer from src/starling/stream_chunk.py.
 // Throws std::invalid_argument when the window configuration is invalid
 // (see stream_window_config_error; chunk_seconds must be positive here).
+//
+// The window geometry (chunk/overlap) decides what is committed; the
+// preview cadence (min_seconds/partial_interval) only decides when the live
+// tail is previewed (issue #357). `min_seconds` is the take's first-partial
+// minimum: once the take holds that much audio, every nonempty tail is
+// eligible, including the overlap right after a window commit.
 class ChunkStreamer {
 public:
     ChunkStreamer(int sample_rate, double chunk_seconds, double overlap_seconds,
                   double min_seconds, double partial_interval);
 
+    // Replace the preview cadence (per connection); throws
+    // std::invalid_argument on an invalid policy (preview_policy_error).
+    void set_preview_policy(double min_seconds, double interval_seconds);
+
     // Advance streaming state for the current buffer. Finalizes any full
-    // windows, then (throttled) transcribes the live tail for a responsive
-    // partial. Returns the full text to emit, or std::nullopt.
+    // windows (always), then (throttled) transcribes the live tail for a
+    // responsive partial. When `newer_pending` reports queued audio right
+    // before the preview, the preview is skipped (coalesced): the next step
+    // previews the newer audio instead, and a pending committed-text update
+    // is carried over to it. Returns the full text to emit, or std::nullopt.
     std::optional<std::string> step(const std::vector<float>& samples,
-                                     double now, const TranscribeFn& tx);
+                                     double now, const TranscribeFn& tx,
+                                     const PendingFn& newer_pending = nullptr);
 
     // Finalize all remaining audio (on commit) and return the full text.
     // After bounded busy retries, returns nullopt; retain audio and retry commit.
@@ -118,10 +150,35 @@ public:
     // with the shifted samples_ buffer.
     void rebase(int64_t dropped) {
         boundary_ = std::max<int64_t>(0, boundary_ - dropped);
+        rebased_ += dropped;
     }
 
+    // A full window is waiting to be committed (the next step commits it).
+    bool full_window_pending(size_t n_samples) const {
+        return static_cast<int64_t>(n_samples) - boundary_ >= chunk_;
+    }
+
+    // Previews skipped because newer audio was already queued.
+    int64_t coalesced_previews() const { return coalesced_; }
+    double min_preview_seconds() const {
+        return static_cast<double>(min_) / sr_;
+    }
+    double preview_interval() const { return partial_interval_; }
+    // The interval actually applied: the configured one, stretched so the
+    // latest preview's engine time is at most kMaxPreviewDuty of it.
+    double effective_interval() const {
+        return std::max(partial_interval_, last_preview_cost_ / kMaxPreviewDuty);
+    }
+
+    // Why the transcribe call in flight was made (issue #226): "window" (a
+    // full window committed while recording), "preview" (the live tail),
+    // "flush_window" / "flush_tail" (finalization on commit). Set before
+    // every transcribe call; the session's call ledger reads it.
+    const char* call_kind() const { return call_kind_; }
+
 private:
-    bool finalize_full_windows(const std::vector<float>& samples, const TranscribeFn& tx);
+    bool finalize_full_windows(const std::vector<float>& samples,
+                               const TranscribeFn& tx, bool flushing);
     // committed_ with `new_words` stitched onto its unfrozen tail.
     std::vector<std::string> stitched(const std::vector<std::string>& new_words) const;
     // Stitches `new_words` into committed_ and advances frozen_.
@@ -138,7 +195,41 @@ private:
     std::vector<std::string> committed_;
     int64_t frozen_ = 0;    // leading committed_ words stitching never touches
     int64_t boundary_ = 0;  // sample index; audio before this is finalized
+    int64_t rebased_ = 0;   // samples dropped before index 0 (rebase())
     double last_emit_ = 0.0;
+    bool emit_due_ = false;          // a commit changed the text, not yet emitted
+    double last_preview_cost_ = 0.0; // seconds, latest successful preview
+    int64_t coalesced_ = 0;
+    const char* call_kind_ = "window";
+};
+
+// ---- stream call ledger (issue #226) ----------------------------------------
+// One transcribe call made by a streaming take: why it ran, which original
+// audio it covered (absolute take sample indices, stable across buffer
+// trims), when it started and ended (ms since the take's first audio), and
+// how it ended. Overlapping windows and repeated previews of the same audio
+// each appear, so the ledger shows the real inference work per recorded
+// second instead of the batch throughput of one pass.
+struct StreamCall {
+    const char* kind = "";    // ChunkStreamer::call_kind()
+    int64_t abs_start = 0;    // first sample covered
+    int64_t length = 0;       // samples covered
+    double t0_ms = 0.0;       // call start, ms since the take's first audio
+    double t1_ms = 0.0;       // call end
+    // "ok" (engine ran), "reused" (exact-tail reuse; engine not called),
+    // "busy" (engine busy or cancelled; state not advanced), "timed_out".
+    const char* result = "";
+};
+
+// Per-kind totals over a take (engine calls only; reused calls cost nothing).
+struct StreamCallTotals {
+    int64_t calls = 0;          // every call, whatever its result
+    int64_t engine_calls = 0;   // result "ok" (the engine produced text)
+    int64_t engine_samples = 0; // audio the engine transcribed, overlap included
+    double engine_ms = 0.0;     // wall time of those engine calls
+    int64_t reused = 0;
+    int64_t busy = 0;           // busy, cancelled and timed-out calls
+    void add(const StreamCall& c);
 };
 
 // StreamSession: per-connection rolling audio buffer + streaming state.
@@ -185,8 +276,21 @@ public:
     // required before more audio. Empty for transient busy responses.
     const std::string& terminal_error() const { return terminal_error_; }
 
-    // Advance the chunked stream; returns text to emit as a partial, or nullopt.
-    std::optional<std::string> stream_step(double now);
+    // Advance the chunked stream; returns text to emit as a partial, or
+    // nullopt. `newer_pending` coalesces obsolete previews (ChunkStreamer::step).
+    std::optional<std::string> stream_step(double now,
+                                           const PendingFn& newer_pending = nullptr);
+
+    // Per-connection preview cadence (issue #357); throws
+    // std::invalid_argument when invalid. No-op in whole-buffer mode.
+    void set_preview_policy(double min_seconds, double interval_seconds) {
+        if (chunker_) chunker_->set_preview_policy(min_seconds, interval_seconds);
+    }
+    const ChunkStreamer* chunker() const { return chunker_.get(); }
+    // The buffer holds a full window that the next stream_step commits.
+    bool full_window_pending() const {
+        return chunker_ && chunker_->full_window_pending(samples_.size());
+    }
 
     // The chunker's stable word count (ChunkStreamer::stable_words); 0 in
     // the legacy whole-buffer mode, where every partial is a fresh guess.
@@ -241,6 +345,34 @@ public:
     // (the engine was not invoked). Observability for tests and for reporting
     // inference calls avoided, separately from any latency claims.
     int64_t tail_cache_hits() const { return tail_cache_hits_; }
+
+    // ---- stream instrumentation (issue #226) --------------------------------
+    // Opt-in per-take metadata for WS clients that ask for it (`trace=1` on
+    // the /stream URL); the default wire contract carries none of it. Times
+    // are steady-clock ms since the take's first accepted audio.
+    //
+    // trace_partial_json(): the object attached to a partial — received
+    // audio, the end of the audio the text reflects (`covered_s`), and the
+    // running inference totals.
+    // trace_final_json(): the object attached to the final — totals per call
+    // kind, the stop section (work done after commit, bounded by the
+    // unfinalized tail on the healthy path) and the call ledger.
+    std::string trace_partial_json() const;
+    std::string trace_final_json() const;
+    // The ledger itself (bounded; see kMaxStreamCalls) and its totals.
+    const std::vector<StreamCall>& calls() const { return calls_; }
+    const StreamCallTotals& totals() const { return totals_; }
+    // Totals of the calls made by the latest stream_flush().
+    const StreamCallTotals& flush_totals() const { return flush_totals_; }
+    // How the latest stream_flush() produced its text: "tail" (the engine
+    // finalized only the unfinalized remainder), "reused" (the exact-tail
+    // result answered it), "committed" (nothing was left to finalize).
+    const char* final_path() const { return final_path_; }
+
+    // Ledger bound: a 10-minute take at a 0.5 s preview cadence makes ~1300
+    // calls; beyond this, calls still count in the totals but are dropped
+    // from the list (reported as `calls_dropped`).
+    static constexpr size_t kMaxStreamCalls = 20000;
 
 private:
     void maybe_trim_samples();
@@ -320,6 +452,25 @@ private:
     StreamTailKey tail_key_;      // key of the retained result (iff tail_valid_)
     std::string tail_text_;       // the raw window result ("" is a success)
     int64_t tail_cache_hits_ = 0; // calls answered from the retained entry
+
+    // ---- stream instrumentation (issue #226) --------------------------------
+    double take_ms() const;       // ms since take_t0_ (0 before any audio)
+    std::string trace_preview_json() const;  // ",\"preview\":{...}" or ""
+    void mark_take_start();       // latch take_t0_ on the first audio
+    void record_call(const StreamCall& c);
+    bool take_started_ = false;
+    std::chrono::steady_clock::time_point take_t0_{};
+    std::vector<StreamCall> calls_;
+    int64_t calls_dropped_ = 0;
+    StreamCallTotals totals_;
+    StreamCallTotals by_kind_[4];  // window, preview, flush_window, flush_tail
+    StreamCallTotals flush_totals_;
+    bool flushing_ = false;       // stream_flush() in progress
+    int64_t covered_end_ = 0;     // abs end of the latest successful call
+    double flush_t0_ms_ = -1.0;   // latest stream_flush() start (-1: none)
+    double flush_t1_ms_ = -1.0;
+    int64_t flush_unfinalized_ = 0;  // samples past the boundary at flush start
+    const char* final_path_ = "";
 };
 
 } // namespace starling::serve

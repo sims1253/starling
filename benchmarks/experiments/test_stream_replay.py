@@ -1,0 +1,129 @@
+"""Paced streaming replay metrics and threshold checks (issues #226, #357).
+
+Hermetic: synthetic event logs only, no server, no websockets package.
+"""
+
+from __future__ import annotations
+
+import sys
+import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import stream_replay as sr  # noqa: E402
+
+
+def _log(partials, final, *, duration_s=4.0, frame_s=0.5, commit_at=4.1):
+    """An event log with frames sent on schedule from t=100."""
+    t0 = 100.0
+    n = int(duration_s / frame_s)
+    sends = [(t0 + (i + 1) * frame_s, int((i + 1) * frame_s * sr.SAMPLE_RATE))
+             for i in range(n)]
+    events = [(t0 + t, {"type": "partial", **m}) for t, m in partials]
+    events.append((t0 + final[0], {"type": "final", **final[1]}))
+    return {"t_start": t0, "sends": sends, "events": events,
+            "commits": [t0 + commit_at], "busy_commit_retries": 0,
+            "samples": int(duration_s * sr.SAMPLE_RATE)}
+
+
+FINAL_TRACE = {"totals": {"engine_calls": 5, "engine_audio_s": 8.0, "engine_ms": 400.0,
+                          "busy": 0, "reused": 1},
+               "by_kind": {}, "stop": {"path": "tail", "unfinalized_s": 1.0,
+                                       "totals": {"engine_audio_s": 1.0, "engine_ms": 50.0}}}
+
+
+class WerTest(unittest.TestCase):
+    def test_normalized_word_errors(self):
+        self.assertEqual(sr.wer("Hello, World", "hello world"), 0.0)
+        self.assertAlmostEqual(sr.wer("a b c d", "a x c"), 0.5)
+        self.assertEqual(sr.wer("", ""), 0.0)
+        self.assertEqual(sr.wer("", "x"), 1.0)
+
+
+class TakeMetricsTest(unittest.TestCase):
+    def test_age_backlog_first_partial_and_stop(self):
+        log = _log(
+            partials=[
+                (1.2, {"text": "", "stable_words": 0, "trace": {"covered_s": 1.0}}),
+                (2.3, {"text": "hello there", "stable_words": 1,
+                       "trace": {"covered_s": 2.0}}),
+                (3.6, {"text": "hello there you", "stable_words": 1,
+                       "trace": {"covered_s": 3.0}}),
+            ],
+            final=(4.4, {"text": "hello there you", "duration_s": 4.0,
+                         "trace": FINAL_TRACE}),
+        )
+        m = sr.take_metrics(log, "hello there you", "hello there you")
+        self.assertEqual(m["first_partial"]["wall_s"], 2.3)
+        self.assertEqual(m["first_partial"]["audio_sent_s"], 2.0)
+        # Ages: 200 ms, 300 ms, 600 ms.
+        self.assertAlmostEqual(m["partial_age_ms"]["p50"], 300.0, places=6)
+        self.assertAlmostEqual(m["partial_age_ms"]["max"], 600.0, places=6)
+        # At t=3.6 the sender had sent 3.5 s; 3.0 s reflected.
+        self.assertAlmostEqual(m["backlog_s"]["max"], 0.5, places=6)
+        self.assertEqual(m["stop_to_final_ms"], 300.0)
+        self.assertTrue(m["audio_complete"])
+        self.assertEqual(m["work"]["engine_audio_per_audio_s"], 2.0)
+        self.assertEqual(m["stop"]["path"], "tail")
+        self.assertEqual(m["stable_violations"], 0)
+        self.assertEqual(m["wer_final_vs_ref"], 0.0)
+
+    def test_stable_prefix_violation_and_incomplete_audio(self):
+        log = _log(
+            partials=[(2.3, {"text": "hello their", "stable_words": 2,
+                             "trace": {"covered_s": 2.0}})],
+            final=(4.4, {"text": "hello there", "duration_s": 3.5, "trace": FINAL_TRACE}),
+        )
+        m = sr.take_metrics(log, "hello there", None)
+        self.assertEqual(m["stable_violations"], 1)
+        self.assertFalse(m["audio_complete"])
+        self.assertIsNone(m["wer_final_vs_batch"])
+
+    def test_missing_final_is_a_failure(self):
+        log = _log(partials=[], final=(4.4, {"text": "x", "duration_s": 4.0}))
+        log["events"] = []
+        self.assertEqual(sr.take_metrics(log, "x", None)["failed"], "no final")
+
+    def test_stop_latency_counts_busy_commit_retries(self):
+        log = _log(partials=[], final=(4.4, {"text": "x", "duration_s": 4.0,
+                                             "trace": FINAL_TRACE}))
+        log["commits"].append(100.0 + 4.35)  # a busy commit, then a retry
+        self.assertEqual(sr.take_metrics(log, "x", None)["stop_to_final_ms"], 300.0)
+
+
+class AggregateTest(unittest.TestCase):
+    def test_a_take_without_partials_has_no_first_partial_latency(self):
+        with_partial = _log(
+            partials=[(1.2, {"text": "hi", "stable_words": 0, "trace": {"covered_s": 1.0}})],
+            final=(4.4, {"text": "hi", "duration_s": 4.0, "trace": FINAL_TRACE}))
+        without = _log(partials=[], final=(4.4, {"text": "hi", "duration_s": 4.0,
+                                                 "trace": FINAL_TRACE}))
+        runs = []
+        for log in (with_partial, without):
+            m = sr.take_metrics(log, "hi", "hi")
+            m.update({"take": "short"})
+            runs.append(m)
+        agg = sr._aggregate(runs)["short"]
+        self.assertEqual(agg["first_partial_missing"], 1)
+        self.assertIsNone(agg["first_partial_wall_s_median"])
+        self.assertEqual(sr._aggregate(runs[:1])["short"]["first_partial_wall_s_median"], 1.2)
+
+
+class CheckTest(unittest.TestCase):
+    def test_rules(self):
+        base = {"aggregate": {"short": {"a": 10.0, "b": 0.1, "c": True}}}
+        cand = {"aggregate": {"short": {"a": 12.0, "b": 0.12, "c": False}}}
+        rules = {"rules": [
+            {"take": "short", "metric": "a", "max_vs_baseline_ratio": 1.1},
+            {"take": "short", "metric": "b", "max_vs_baseline_delta": 0.05},
+            {"take": "short", "metric": "c", "equals": True},
+            {"take": "short", "metric": "a", "max": 15},
+            {"take": "long", "metric": "a", "max": 1},
+        ]}
+        verdicts = [r["pass"] for r in sr.check(rules, base, cand)]
+        self.assertEqual(verdicts, [False, True, False, True, False])
+
+
+if __name__ == "__main__":
+    unittest.main()

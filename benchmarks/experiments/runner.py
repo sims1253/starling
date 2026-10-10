@@ -206,6 +206,9 @@ class ArmServer:
                 "--model", self.model_slug,
                 "--gguf", os.path.expandvars(model) if model else "/dev/null",
                 "--port", str(port),
+                # Extra server flags (e.g. stream cadence); provenance-recorded
+                # by the caller.
+                *[os.path.expandvars(str(x)) for x in arm.get("args", [])],
             ]
         try:
             self.proc = subprocess.Popen(

@@ -323,7 +323,9 @@ def test_chunkstreamer_windows_stay_in_range():
 
     assert cs.step(samples, 1.0, tx) is not None
     assert cs.flush(samples, tx) is not None
-    assert calls == [12 * SR, 12 * SR, 12 * SR, 3 * SR]
+    # Three windows, a preview of the 3 s overlap tail (the take is past the
+    # 5 s first-partial minimum, issue #357), and the 3 s flush tail.
+    assert calls == [12 * SR, 12 * SR, 12 * SR, 3 * SR, 3 * SR]
 
 
 def test_chunkstreamer_never_transcribes_empty_window():
@@ -389,3 +391,106 @@ def test_server_stream_flags_reject_non_finite_and_junk():
             _validated_stream_args([flag, "inf"])
         with pytest.raises(SystemExit):
             _validated_stream_args([flag, "3abc"])
+
+
+# --------------------------------------------------------------------------- #
+# preview cadence and coalescing (issue #357; lockstep with the C++ tests)
+# --------------------------------------------------------------------------- #
+def _small(**kw):
+    cfg = dict(sample_rate=SR, chunk_seconds=1.0, overlap_seconds=0.25,
+               min_seconds=0.5, partial_interval_seconds=0.0)
+    cfg.update(kw)
+    return ChunkStreamer(**cfg)
+
+
+def test_preview_minimum_gates_the_take_not_the_tail():
+    cs = _small()
+    lens: list[int] = []
+
+    def tx(window):
+        lens.append(len(window))
+        return "w"
+
+    assert cs.step(np.zeros(7999, np.float32), 1.0, tx) is None
+    assert lens == []
+    assert cs.step(np.zeros(8000, np.float32), 2.0, tx) is not None
+    assert lens == [8000]
+    # After the window commit the tail is the 0.25 s overlap, below the
+    # minimum, yet still previewed.
+    lens.clear()
+    assert cs.step(np.zeros(16000 + 1600, np.float32), 3.0, tx) is not None
+    assert lens == [16000, 16000 + 1600 - 12000]
+
+
+def test_preview_coalesced_when_newer_audio_is_queued():
+    cs = _small()
+    lens: list[int] = []
+
+    def tx(window):
+        lens.append(len(window))
+        return "w x"
+
+    pending = [True]
+    assert cs.step(np.zeros(20000, np.float32), 1.0, tx, lambda: pending[0]) is None
+    assert lens == [16000] and cs.boundary == 12000 and cs.coalesced == 1
+    pending[0] = False
+    # The next step previews the newest tail and carries the owed update.
+    assert cs.step(np.zeros(22000, np.float32), 1.1, tx, lambda: pending[0]) is not None
+    assert lens == [16000, 10000]
+    assert cs.flush(np.zeros(22000, np.float32), tx) is not None
+    assert lens[-1] == 22000 - 12000
+
+
+def test_window_commit_does_not_force_a_throttled_preview():
+    # A window commit inside the interval emits the committed text at once
+    # but does not decode the tail (the preview duty bound holds).
+    cs = _small(partial_interval_seconds=10.0)
+    lens: list[int] = []
+
+    def tx(window):
+        lens.append(len(window))
+        return "w x"
+
+    assert cs.step(np.zeros(8000, np.float32), 20.0, tx) is not None
+    assert lens == [8000]
+    assert cs.step(np.zeros(20000, np.float32), 21.0, tx) == "w x"
+    assert lens == [8000, 16000]
+    assert cs.step(np.zeros(21000, np.float32), 21.5, tx) is None
+    assert cs.step(np.zeros(21000, np.float32), 30.0, tx) is not None
+    assert lens == [8000, 16000, 21000 - 12000]
+
+
+def test_preview_interval_adapts_to_preview_cost():
+    import time as _time
+
+    cs = _small(min_seconds=0.1)
+    calls = []
+
+    def tx(window):
+        calls.append(len(window))
+        _time.sleep(0.03)
+        return "w"
+
+    assert cs.step(np.zeros(4000, np.float32), 10.0, tx) is not None
+    assert 0.06 <= cs.effective_interval < 1.0
+    assert cs.step(np.zeros(5000, np.float32), 10.01, tx) is None
+    assert cs.step(np.zeros(5000, np.float32), 10.001 + cs.effective_interval, tx) is not None
+    assert len(calls) == 2
+    cs.reset()
+    assert cs.effective_interval == 0.0
+
+
+def test_preview_policy_validation():
+    from starling.stream_chunk import preview_policy_error
+
+    ok = dict(sample_rate=SR, min_seconds=1.0, interval_seconds=0.5)
+    assert preview_policy_error(**ok) is None
+    for bad in ({"min_seconds": -1.0}, {"interval_seconds": -0.5},
+                {"min_seconds": float("nan")}, {"interval_seconds": float("inf")},
+                {"min_seconds": 1e9}):
+        assert preview_policy_error(**{**ok, **bad}) is not None
+    cs = _small()
+    with pytest.raises(ValueError):
+        cs.set_preview_policy(-1.0, 0.0)
+    cs.set_preview_policy(2.0, 0.25)
+    assert cs.min == 2 * SR and cs.partial_interval == 0.25
