@@ -132,6 +132,19 @@ fn degradation(reason: &str) -> String {
     )
 }
 
+/// What the worker tells a listener as it happens ([`UpdateHook`]).
+#[derive(Debug, Clone, PartialEq)]
+pub enum PumpUpdate {
+    /// The newest preview to show.
+    Partial(Partial),
+    /// Live text stopped for the rest of the take, and why.
+    Degraded(String),
+}
+
+/// Called on the worker's thread with every [`PumpUpdate`]; it must not
+/// block (Stop joins that thread).
+pub type UpdateHook = Arc<dyn Fn(PumpUpdate) + Send + Sync>;
+
 /// The take's live updates, for the UI.
 pub struct Live {
     /// The newest preview to show.
@@ -184,6 +197,7 @@ struct PumpCore<C> {
     replay: Option<Replay>,
     partials: watch::Sender<Option<Partial>>,
     degraded: watch::Sender<Option<String>>,
+    on_update: Option<UpdateHook>,
     trace: Option<Arc<StreamTrace>>,
     /// Set by [`StreamPump::finish`]; a step checks it between frames.
     stop: Arc<AtomicBool>,
@@ -291,6 +305,9 @@ impl<C: StreamClient> PumpCore<C> {
             self.stable_prefix = words[..stable].iter().map(|word| word.to_string()).collect();
         }
         self.shown_words = words.len();
+        if let Some(hook) = self.on_update.as_ref() {
+            hook(PumpUpdate::Partial(partial.clone()));
+        }
         self.partials.send_replace(Some(partial));
     }
 
@@ -311,6 +328,9 @@ impl<C: StreamClient> PumpCore<C> {
             self.retry_at = None;
             self.degradation = Some(degradation(&reason));
             // Explained while the take still records, not only at stop.
+            if let (Some(hook), Some(reason)) = (self.on_update.as_ref(), self.degradation.as_ref()) {
+                hook(PumpUpdate::Degraded(reason.clone()));
+            }
             self.degraded.send_replace(self.degradation.clone());
         }
     }
@@ -380,7 +400,8 @@ pub struct StreamPump<C> {
 
 impl<C: StreamClient> StreamPump<C> {
     /// Starts pumping `tap` (captured at `rate`) into `stream`; `connect`
-    /// opens a replacement connection after a failure. An error is why the
+    /// opens a replacement connection after a failure; `on_update` hears
+    /// every preview and degradation as it happens. An error is why the
     /// worker could not start; the take records regardless.
     pub fn start(
         tap: Box<dyn AudioTap>,
@@ -388,6 +409,7 @@ impl<C: StreamClient> StreamPump<C> {
         stream: C,
         connect: Connect<C>,
         trace: Option<Arc<StreamTrace>>,
+        on_update: Option<UpdateHook>,
     ) -> Result<(Self, Live), String> {
         let (partials, previews) = watch::channel(None);
         let (degraded, degradation) = watch::channel(None);
@@ -409,6 +431,7 @@ impl<C: StreamClient> StreamPump<C> {
             replay: None,
             partials,
             degraded,
+            on_update,
             trace: trace.clone(),
             stop: Arc::clone(&stop),
         }));
@@ -654,6 +677,7 @@ mod tests {
             replay: None,
             partials,
             degraded: watch::channel(None).0,
+            on_update: None,
             trace: None,
             stop: Arc::new(AtomicBool::new(false)),
         };
@@ -680,6 +704,7 @@ mod tests {
             16_000,
             stream.clone(),
             Box::new(|| Err("unused".into())),
+            None,
             None,
         )
         .expect("the worker starts");
@@ -789,6 +814,7 @@ mod tests {
             16_000,
             stream.clone(),
             Box::new(|| Err("unused".into())),
+            None,
             None,
         )
         .expect("the worker starts");

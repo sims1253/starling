@@ -35,6 +35,8 @@
 //! - [`takes`] — the take feed: the app's projection of the takes this
 //!   host records (status, audio, stored rows, orphans), beside the
 //!   envelope like the ask frames.
+//! - [`transcribe`] — transcription in the host: live text while a take
+//!   records, its transcript once stored, and retries apps ask for.
 //! - [`capture`] — the production capture source (the desktop settings'
 //!   microphone, journaled, disk-watched).
 //! - [`recovery`] — owner-side startup recovery beyond reconcile (stale
@@ -95,6 +97,7 @@ pub mod platform;
 pub mod recovery;
 pub mod server;
 pub mod takes;
+pub mod transcribe;
 
 pub use config::{default_data_root, HostConfig};
 pub use server::{serve, HostError, HostHandle};

@@ -498,6 +498,87 @@ impl EngineHost {
         }
     }
 
+    /// The target a take starting now binds to (#363), when something
+    /// serves now: a lease on the ready engine, or the manual server.
+    /// `None` when nothing does yet (the take records anyway; its
+    /// transcription waits for an engine, [`Self::wait_target`]).
+    pub fn bind_now(&self) -> Option<Target> {
+        match &*lock(&self.state) {
+            EngineState::Builtin { manager, .. } => manager.lease().map(Target::from_lease),
+            EngineState::Manual { endpoint, model } => Target::manual(endpoint, model).ok(),
+        }
+    }
+
+    /// Waits up to `wait` (cancel-aware) for a target serving `want`
+    /// other than the engine `avoid` names (one a request just failed
+    /// against). The error is why there is none: a sentence for the
+    /// take's history.
+    pub fn wait_target(
+        &self,
+        want: &Want,
+        wait: Duration,
+        cancel: &CancelToken,
+        avoid: Option<&(String, u32)>,
+    ) -> Result<Target, String> {
+        let deadline = Instant::now() + wait;
+        loop {
+            if cancel.is_cancelled() {
+                return Err("The transcription was cancelled.".to_string());
+            }
+            let (manager, stopped) = match &*lock(&self.state) {
+                EngineState::Builtin {
+                    manager, stopped, ..
+                } => (manager.clone(), Arc::clone(stopped)),
+                EngineState::Manual { endpoint, model } => {
+                    return match want {
+                        Want::Current => Target::manual(endpoint, model).map_err(|err| {
+                            format!("Your server's endpoint in Settings is not usable: {err}")
+                        }),
+                        Want::Model(_) => Err("The built-in engine is off (Settings → Engine                                                uses your own server)."
+                            .to_string()),
+                    };
+                }
+            };
+            if stopped.load(Ordering::SeqCst) {
+                return Err(not_ready_sentence());
+            }
+            let mut avoiding = false;
+            if let Some(lease) = manager.lease() {
+                let wanted = match want {
+                    Want::Current => true,
+                    Want::Model(model_id) => lease.model_id() == model_id,
+                };
+                let identity = (lease.endpoint().to_string(), lease.pid());
+                if wanted && avoid != Some(&identity) {
+                    return Ok(Target::from_lease(lease));
+                }
+                avoiding = wanted;
+            }
+            let phase = manager.snapshot().phase;
+            // A failed engine or a missing model will not fix itself while
+            // this waits (both need the user).
+            if matches!(phase, EnginePhase::NoModel | EnginePhase::Failed(_))
+                || Instant::now() >= deadline
+            {
+                return Err(match want {
+                    Want::Model(model_id) if !matches!(phase, EnginePhase::NoModel) => format!(
+                        "The built-in engine did not start serving {model_id} in time."
+                    ),
+                    _ => not_ready_sentence(),
+                });
+            }
+            std::thread::sleep(if avoiding { AVOID_POLL } else { READY_POLL });
+        }
+    }
+
+    /// Counts one request on whatever serves now, for as long as the
+    /// guard lives: a switch away from the built-in engine waits (bounded)
+    /// for it before stopping the engine under it.
+    pub fn request_guard(&self) -> RequestGuard {
+        let slot = lock(&self.provider.current);
+        RequestGuard(slot.in_flight.as_ref().map(InFlight::on))
+    }
+
     /// Marks the host as shutting down (see `closing`). The host calls
     /// this before it joins the settings watcher.
     pub fn begin_shutdown(&self) {
@@ -520,6 +601,77 @@ impl EngineHost {
             manager.shutdown();
         }
     }
+}
+
+/// What a transcription asks the engine for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Want {
+    /// Whatever serves now.
+    Current,
+    /// The built-in engine serving this model.
+    Model(String),
+}
+
+/// Where one transcription goes (#220, #363): the endpoint and model it
+/// is sent to, the label its attempt row carries, and — on the built-in
+/// engine — the lease that keeps that engine serving until the target is
+/// dropped (a model switch drains it instead of cutting it off).
+pub struct Target {
+    pub endpoint: String,
+    pub model: String,
+    /// The attempt row's backend label (`engine:<model id>`,
+    /// `openai:<model>`).
+    pub backend: String,
+    pub builtin: bool,
+    lease: Option<EngineLease>,
+}
+
+impl Target {
+    /// The user's own server; an error when the endpoint is not usable.
+    pub fn manual(endpoint: &str, model: &str) -> Result<Target, ClientError> {
+        StarlingClient::new(endpoint, model)?;
+        Ok(Target {
+            endpoint: endpoint.to_string(),
+            model: model.to_string(),
+            backend: starling_dictation::storage::BackendLabel::OpenAi {
+                model: model.to_string(),
+            }
+            .to_string(),
+            builtin: false,
+            lease: None,
+        })
+    }
+
+    fn from_lease(lease: EngineLease) -> Target {
+        Target {
+            endpoint: lease.endpoint().to_string(),
+            model: lease.slug().to_string(),
+            backend: starling_dictation::storage::BackendLabel::Engine {
+                model_id: lease.model_id().to_string(),
+            }
+            .to_string(),
+            builtin: true,
+            lease: Some(lease),
+        }
+    }
+
+    /// The built-in engine this target holds (`(endpoint, pid)`), for a
+    /// retry that must not land on it again.
+    pub fn engine(&self) -> Option<(String, u32)> {
+        self.lease
+            .as_ref()
+            .map(|lease| (lease.endpoint().to_string(), lease.pid()))
+    }
+}
+
+/// [`EngineHost::request_guard`]'s count.
+pub struct RequestGuard(#[allow(dead_code)] Option<InFlight>);
+
+/// Why a transcription found no engine.
+fn not_ready_sentence() -> String {
+    "The built-in engine is not ready; the recording is saved — pick a model in Settings, or \
+     retry once the engine is ready."
+        .to_string()
 }
 
 /// The manual provider for `endpoint`/`model` and the label that goes

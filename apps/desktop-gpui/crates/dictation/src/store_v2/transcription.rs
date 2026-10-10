@@ -266,15 +266,24 @@ impl StoreV2 {
     }
 
     /// The captures still waiting to be transcribed that nobody live is
-    /// transcribing, oldest intent first: what a host starting up (or
-    /// rechecking) claims.
-    pub fn transcriptions_due(&self) -> Result<Vec<String>, StoreV2Error> {
+    /// transcribing, oldest intent first, and asked for at least `aged`
+    /// ago: what a host starting up (`Duration::ZERO`: all of them) or
+    /// rechecking (leaving takes it is about to transcribe anyway) claims.
+    pub fn transcriptions_due(
+        &self,
+        aged: std::time::Duration,
+    ) -> Result<Vec<String>, StoreV2Error> {
+        let cutoff = crate::storage::iso_utc(
+            time::OffsetDateTime::now_utc()
+                - time::Duration::try_from(aged).unwrap_or(time::Duration::ZERO),
+        );
         let mut stmt = self.conn.prepare(
             "SELECT i.capture_id, i.attempt_id, a.status FROM transcription_intents i
              LEFT JOIN recognition_attempts a ON a.id = i.attempt_id
+             WHERE i.requested_utc <= ?1
              ORDER BY i.requested_utc, i.capture_id",
         )?;
-        let rows = stmt.query_map([], |row| {
+        let rows = stmt.query_map(params![cutoff], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, Option<String>>(1)?,

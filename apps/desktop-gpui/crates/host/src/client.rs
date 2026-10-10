@@ -140,6 +140,8 @@ pub enum TakeWire {
         owner: crate::frame::TakeOwner,
         ended: Option<u64>,
         kept: bool,
+        /// The take's newest samples, for the owner's level meter.
+        meter: Option<Vec<f32>>,
     },
     StartFailed {
         take: String,
@@ -154,6 +156,21 @@ pub enum TakeWire {
         orphan: bool,
     },
     Notice(HostRecovery),
+    /// A recording take's live text (see [`Frame::LiveText`]).
+    LiveText {
+        take: String,
+        partial: Option<crate::frame::LivePartial>,
+        degraded: Option<String>,
+    },
+    /// A stored take's transcription (see [`Frame::Transcription`]).
+    Transcription {
+        stored_id: String,
+        take: Option<String>,
+        req: Option<String>,
+        attempt: Option<String>,
+        state: crate::frame::TranscriptionState,
+        yours: bool,
+    },
 }
 
 /// The host's answer to a [`HostClient::ask_user`].
@@ -507,6 +524,29 @@ impl HostClient {
         })
     }
 
+    /// Takes on running take `take` if its owner is gone, without its
+    /// audio (see [`Frame::TakeAdopt`]).
+    pub fn take_adopt(&self, take: &str) -> Result<(), ClientError> {
+        self.send_unanswered(Frame::TakeAdopt {
+            take: take.to_string(),
+        })
+    }
+
+    /// Asks the host to transcribe stored take `stored_id` with `with`;
+    /// [`TakeWire::Transcription`] frames carrying `req` follow.
+    pub fn transcribe(
+        &self,
+        req: &str,
+        stored_id: &str,
+        with: crate::frame::TranscribeWith,
+    ) -> Result<(), ClientError> {
+        self.send_unanswered(Frame::Transcribe {
+            req: req.to_string(),
+            stored_id: stored_id.to_string(),
+            with,
+        })
+    }
+
     pub fn recv_take_timeout(&self, timeout: Duration) -> Result<TakeWire, RecvError> {
         self.takes.recv_timeout(timeout)
     }
@@ -708,7 +748,9 @@ fn client_reader(
                 frame @ (Frame::LiveTake { .. }
                 | Frame::TakeStartFailed { .. }
                 | Frame::TakePersisted { .. }
-                | Frame::HostNotice { .. }),
+                | Frame::HostNotice { .. }
+                | Frame::LiveText { .. }
+                | Frame::Transcription { .. }),
             ) => {
                 let wire = match take_wire(frame) {
                     Ok(wire) => wire,
@@ -800,7 +842,9 @@ fn client_reader(
                 | Frame::AgentHello { .. }
                 | Frame::TakeWatch { .. }
                 | Frame::TakeTap { .. }
-                | Frame::TakeHandled { .. },
+                | Frame::TakeHandled { .. }
+                | Frame::TakeAdopt { .. }
+                | Frame::Transcribe { .. },
             ) => {
                 fail("host sent a client frame".to_string());
                 break;
@@ -852,6 +896,7 @@ fn take_wire(frame: Frame) -> Result<TakeWire, String> {
             owner,
             ended,
             kept,
+            meter,
         } => TakeWire::Live {
             take,
             rate,
@@ -863,6 +908,10 @@ fn take_wire(frame: Frame) -> Result<TakeWire, String> {
             owner,
             ended,
             kept,
+            meter: match meter {
+                Some(meter) => Some(meter.decode()?),
+                None => None,
+            },
         },
         Frame::TakeStartFailed {
             take,
@@ -887,6 +936,30 @@ fn take_wire(frame: Frame) -> Result<TakeWire, String> {
             orphan,
         },
         Frame::HostNotice { recovery } => TakeWire::Notice(recovery),
+        Frame::LiveText {
+            take,
+            partial,
+            degraded,
+        } => TakeWire::LiveText {
+            take,
+            partial,
+            degraded,
+        },
+        Frame::Transcription {
+            stored_id,
+            take,
+            req,
+            attempt,
+            state,
+            yours,
+        } => TakeWire::Transcription {
+            stored_id,
+            take,
+            req,
+            attempt,
+            state,
+            yours,
+        },
         other => return Err(format!("{other:?} is not a take frame")),
     })
 }

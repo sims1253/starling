@@ -153,6 +153,8 @@ pub struct HostHandle {
     watch_stop: Arc<AtomicBool>,
     startup_reconciliation: ReconciliationReport,
     takes: Arc<crate::takes::TakeHub>,
+    /// The host's transcriber (`None` unless the config asks for it).
+    transcriber: Option<Arc<crate::transcribe::Transcriber>>,
     done: AtomicBool,
 }
 
@@ -177,7 +179,13 @@ impl HostHandle {
     /// connected, no take recording or being stored, no job queued or
     /// running.
     pub fn idle(&self) -> bool {
-        if self.shared.live_connections.load(Ordering::SeqCst) > 0 || self.takes.busy() {
+        if self.shared.live_connections.load(Ordering::SeqCst) > 0
+            || self.takes.busy()
+            || self
+                .transcriber
+                .as_ref()
+                .is_some_and(|transcriber| transcriber.busy())
+        {
             return false;
         }
         let snapshot = self.shared.client.snapshot();
@@ -287,6 +295,12 @@ impl HostHandle {
         if let Some(runtime) = self.runtime.take() {
             runtime.shutdown();
         }
+        // Transcriptions hold engine leases: they stop before the engine
+        // does (a take whose transcription was cut off stays due in the
+        // store for the next host).
+        if let Some(transcriber) = self.transcriber.take() {
+            transcriber.shutdown();
+        }
         // Close work the transport still has in flight (Windows'
         // lingering pipe disconnects hold handles that keep the endpoint
         // name bound) finishes before ownership is released, so a
@@ -349,6 +363,8 @@ pub struct HostShared {
     pub(crate) broker: Sender<BrokerMsg>,
     /// The app's take feed (see [`crate::takes`]).
     pub(crate) takes: Arc<crate::takes::TakeHub>,
+    /// The host's transcriber, when it transcribes.
+    transcriber: Option<crate::transcribe::TranscriberLink>,
     /// The lease-holding store: owner-side repairs run on it.
     lease: Arc<Mutex<StoreV2>>,
     agent_allowlist: Allowlist,
@@ -633,6 +649,38 @@ pub fn serve(config: HostConfig) -> Result<HostHandle, HostError> {
         .runtime
         .with_capture_observer(Arc::clone(&takes) as Arc<dyn starling_runtime::machine::capture::CaptureObserver>);
     let engine = crate::engine::attach(config.engine, &mut runtime_config);
+    // The host transcribes its takes (#220): every take an app records is
+    // stored with the intent to transcribe it, in its own commit.
+    let transcriber = if config.transcribe {
+        runtime_config
+            .capture_store
+            .transcribe_takes(Arc::new(|take: &starling_runtime::machine::capture::TakeRecord| {
+                !take.id.starts_with(crate::agent::ASK_PREFIX)
+            }));
+        match crate::transcribe::Transcriber::start(
+            crate::transcribe::TranscriberConfig {
+                data_root: config.data_root.clone(),
+                settings_path: config.settings_path.clone(),
+                engine: engine.clone(),
+                engine_wait: config.engine_wait,
+            },
+            Arc::clone(&takes),
+        ) {
+            Ok(transcriber) => {
+                takes.attach_transcriber(transcriber.link());
+                Some(Arc::new(transcriber))
+            }
+            Err(err) => {
+                eprintln!(
+                    "starling-runtime-host: the transcriber could not start ({err}); takes are \
+                     stored and transcribed at the next start"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
     let (runtime, client) = starling_runtime::Runtime::start(runtime_config);
     takes.attach(client.clone());
     let events = client.subscribe();
@@ -651,6 +699,7 @@ pub fn serve(config: HostConfig) -> Result<HostHandle, HostError> {
         live_connections: AtomicUsize::new(0),
         broker: broker_tx,
         takes: Arc::clone(&takes),
+        transcriber: transcriber.as_ref().map(|transcriber| transcriber.link()),
         lease: Arc::clone(&lease),
         agent_allowlist,
         #[cfg(feature = "test-support")]
@@ -736,6 +785,7 @@ pub fn serve(config: HostConfig) -> Result<HostHandle, HostError> {
         watch_stop,
         startup_reconciliation,
         takes,
+        transcriber,
         done: AtomicBool::new(false),
     })
 }
@@ -1135,7 +1185,11 @@ fn connection_reader(
                     }
                     // The take feed is the app's; agents reach the
                     // microphone only through asks.
-                    Frame::TakeWatch { .. } | Frame::TakeTap { .. } | Frame::TakeHandled { .. }
+                    Frame::TakeWatch { .. }
+                    | Frame::TakeTap { .. }
+                    | Frame::TakeHandled { .. }
+                    | Frame::TakeAdopt { .. }
+                    | Frame::Transcribe { .. }
                         if state.is_agent() =>
                     {
                         terminate(
@@ -1168,6 +1222,29 @@ fn connection_reader(
                     Frame::TakeTap { take, from } => {
                         shared.takes.tap(&state, take, from);
                     }
+                    Frame::TakeAdopt { take } => {
+                        shared.takes.adopt(&state, &take);
+                    }
+                    Frame::Transcribe {
+                        req,
+                        stored_id,
+                        with,
+                    } => match &shared.transcriber {
+                        Some(transcriber) => transcriber.request(&state, req, stored_id, with),
+                        None => {
+                            let _ = state.try_deliver(Frame::Transcription {
+                                stored_id,
+                                take: None,
+                                req: Some(req),
+                                attempt: None,
+                                state: crate::frame::TranscriptionState::Refused {
+                                    message: "This recording service does not transcribe."
+                                        .to_string(),
+                                },
+                                yours: true,
+                            });
+                        }
+                    },
                     Frame::TakeHandled {
                         stored_id,
                         handed_back,
@@ -1212,7 +1289,9 @@ fn connection_reader(
                     | Frame::LiveTake { .. }
                     | Frame::TakeStartFailed { .. }
                     | Frame::TakePersisted { .. }
-                    | Frame::HostNotice { .. } => {
+                    | Frame::HostNotice { .. }
+                    | Frame::LiveText { .. }
+                    | Frame::Transcription { .. } => {
                         terminate(
                             &state,
                             TransportErrorCode::ProtocolViolation,

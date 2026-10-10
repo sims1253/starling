@@ -65,8 +65,11 @@ use starling_runtime::protocol::Command;
 use starling_runtime::RuntimeClient;
 
 use crate::agent::ASK_PREFIX;
-use crate::frame::{Frame, HostRecovery, TakeAudio, TakeOwner};
+use crate::frame::{
+    Frame, HostRecovery, LivePartial, TakeAudio, TakeOwner, TranscriptionState, METER_SAMPLES,
+};
 use crate::server::{lock_registry, ConnState};
+use crate::transcribe::TranscriberLink;
 
 /// How often watching connections hear about a recording take.
 pub const TICK: Duration = Duration::from_millis(50);
@@ -98,6 +101,8 @@ pub(crate) struct StartFailure {
 pub struct TakeHub {
     state: Mutex<HubState>,
     client: OnceLock<RuntimeClient>,
+    /// The host's transcriber, told about every take (#220).
+    transcriber: OnceLock<TranscriberLink>,
     orphan_grace: Duration,
     /// Where pending takes are kept across host restarts (the data
     /// root's [`UNCLAIMED_FILE`]); `None` keeps them in memory only.
@@ -139,6 +144,9 @@ struct HubState {
     /// Takes whose persist has not reported yet, with their owner (the
     /// `ended` cache is bounded; this is not, and shrinks per persist).
     persisting: Vec<(String, Option<Arc<ConnState>>)>,
+    /// Frames the connection they are for has to get (a transcription
+    /// result it acts on), waiting for room in its queue.
+    owed: Vec<(Arc<ConnState>, Frame)>,
 }
 
 /// A stored take an app has to hear about.
@@ -195,6 +203,9 @@ struct Live {
     rate: u32,
     monitor: Option<Arc<dyn LiveTakeMonitor>>,
     owner: Option<Arc<ConnState>>,
+    /// The take's newest live text, for an app that adopts it.
+    text: Option<LivePartial>,
+    degraded: Option<String>,
 }
 
 struct Ended {
@@ -267,6 +278,7 @@ impl TakeHub {
         Arc::new(TakeHub {
             state: Mutex::new(state),
             client: OnceLock::new(),
+            transcriber: OnceLock::new(),
             orphan_grace,
             unclaimed_file,
             saved_gen: Mutex::new((0, false)),
@@ -344,6 +356,125 @@ impl TakeHub {
     /// runtime started; the hub exists before it, as its observer).
     pub(crate) fn attach(&self, client: RuntimeClient) {
         let _ = self.client.set(client);
+    }
+
+    /// The transcriber the hub tells about takes (set once it started).
+    pub(crate) fn attach_transcriber(&self, link: TranscriberLink) {
+        let _ = self.transcriber.set(link);
+    }
+
+    /// Whether the host transcribes its takes itself.
+    pub(crate) fn transcribes(&self) -> bool {
+        self.transcriber.get().is_some()
+    }
+
+    /// The live take's newest preview (or why live text stopped): to every
+    /// watcher, and kept for one that adopts the take later. A watcher
+    /// whose queue is full misses this one; the next preview holds the
+    /// whole text again.
+    pub(crate) fn live_text(
+        &self,
+        take: &str,
+        partial: Option<LivePartial>,
+        degraded: Option<String>,
+    ) {
+        let mut state = lock_registry(&self.state);
+        if let Some(live) = state.live.as_mut().filter(|live| live.take == take) {
+            if partial.is_some() {
+                live.text = partial.clone();
+            }
+            if degraded.is_some() {
+                live.degraded = degraded.clone();
+            }
+        }
+        for watcher in &state.watchers {
+            if has_room(&watcher.conn) {
+                let _ = watcher.conn.try_deliver(Frame::LiveText {
+                    take: take.to_string(),
+                    partial: partial.clone(),
+                    degraded: degraded.clone(),
+                });
+            }
+        }
+    }
+
+    /// Where the transcription of stored take `stored_id` stands: to every
+    /// watcher (and to `owner` when it does not watch). The one it is for
+    /// — `owner` while it lives, else the first watching app — gets it
+    /// whatever its queue says (it waits for room); a full queue only
+    /// costs anyone else a refresh.
+    pub(crate) fn transcription(
+        &self,
+        stored_id: &str,
+        take: Option<&str>,
+        req: Option<&str>,
+        attempt: Option<&str>,
+        transcription: TranscriptionState,
+        owner: Option<&Arc<ConnState>>,
+    ) {
+        let mut state = lock_registry(&self.state);
+        let recipient = owner
+            .filter(|owner| !owner.closed.load(Ordering::SeqCst))
+            .cloned()
+            .or_else(|| state.watchers.first().map(|watcher| Arc::clone(&watcher.conn)));
+        let frame = |yours: bool| Frame::Transcription {
+            stored_id: stored_id.to_string(),
+            take: take.map(str::to_string),
+            req: req.map(str::to_string),
+            attempt: attempt.map(str::to_string),
+            state: transcription.clone(),
+            yours,
+        };
+        let HubState {
+            watchers, owed, ..
+        } = &mut *state;
+        let mut reached = false;
+        for watcher in watchers.iter_mut() {
+            let yours = recipient
+                .as_ref()
+                .is_some_and(|recipient| Arc::ptr_eq(recipient, &watcher.conn));
+            reached |= yours;
+            let delivered = match take {
+                Some(take) => watcher.deliver_after_tap(take, frame(yours)),
+                None => watcher.conn.try_deliver(frame(yours)).is_ok(),
+            };
+            if yours && !delivered {
+                owed.push((Arc::clone(&watcher.conn), frame(true)));
+            }
+        }
+        if let (Some(recipient), false) = (recipient, reached) {
+            if recipient.try_deliver(frame(true)).is_err() {
+                owed.push((recipient, frame(true)));
+            }
+        }
+    }
+
+    /// `conn` takes on running take `take` if its owner is gone (an app
+    /// that came back), and hears its latest live text.
+    pub(crate) fn adopt(&self, conn: &Arc<ConnState>, take: &str) {
+        let mut state = lock_registry(&self.state);
+        if let Some(live) = state.live.as_mut().filter(|live| live.take == take) {
+            if !alive(&live.owner) {
+                live.owner = Some(Arc::clone(conn));
+            }
+            if live.text.is_some() || live.degraded.is_some() {
+                let _ = conn.try_deliver(Frame::LiveText {
+                    take: take.to_string(),
+                    partial: live.text.clone(),
+                    degraded: live.degraded.clone(),
+                });
+            }
+        }
+        if let Some(done) = state.ended.iter_mut().find(|done| done.take == take) {
+            if !alive(&done.owner) {
+                done.owner = Some(Arc::clone(conn));
+            }
+        }
+        if let Some((_, owner)) = state.persisting.iter_mut().find(|(known, _)| known == take) {
+            if !alive(owner) {
+                *owner = Some(Arc::clone(conn));
+            }
+        }
     }
 
     /// Startup recovery's findings, for the first app that watches.
@@ -586,6 +717,9 @@ impl TakeHub {
                 .watchers
                 .retain(|watcher| !watcher.conn.closed.load(Ordering::SeqCst));
             offer_pending(&mut state);
+            state.owed.retain(|(conn, frame)| {
+                !conn.closed.load(Ordering::SeqCst) && conn.try_deliver(frame.clone()).is_err()
+            });
             let HubState {
                 live,
                 ended,
@@ -725,6 +859,7 @@ fn serve_watcher(
                         owner,
                         ended: None,
                         kept: false,
+                        meter: None,
                     };
                     if conn.try_deliver(frame).is_err() {
                         break;
@@ -736,8 +871,13 @@ fn serve_watcher(
                     }
                 }
             }
-            _ => {
+            (_, monitor) => {
                 if has_room(&conn) {
+                    // The owner's level meter: the newest samples.
+                    let meter = monitor.filter(|_| owner == TakeOwner::You).map(|monitor| {
+                        let from = monitor.sample_count().saturating_sub(METER_SAMPLES);
+                        TakeAudio::encode(from as u64, &monitor.samples_from(from, METER_SAMPLES))
+                    });
                     let _ = conn.try_deliver(Frame::LiveTake {
                         take: live.take.clone(),
                         rate: live.rate,
@@ -746,6 +886,7 @@ fn serve_watcher(
                         owner,
                         ended: None,
                         kept: false,
+                        meter,
                     });
                 }
             }
@@ -789,6 +930,7 @@ fn serve_finished_tap(conn: &Arc<ConnState>, tap: &mut Tap, ended: &VecDeque<End
                 owner: TakeOwner::Nobody,
                 ended: Some(tap.cursor),
                 kept: false,
+                meter: None,
             })
             .is_ok();
     };
@@ -815,6 +957,7 @@ fn serve_finished_tap(conn: &Arc<ConnState>, tap: &mut Tap, ended: &VecDeque<End
             owner,
             ended: None,
             kept: false,
+            meter: None,
         };
         if conn.try_deliver(frame).is_err() {
             return false;
@@ -832,6 +975,7 @@ fn serve_finished_tap(conn: &Arc<ConnState>, tap: &mut Tap, ended: &VecDeque<End
                 owner,
                 ended: Some(samples.len() as u64),
                 kept: done.record.is_some(),
+                meter: None,
             })
             .is_ok()
 }
@@ -874,10 +1018,15 @@ impl CaptureObserver for TakeHub {
         state.live = Some(Live {
             take: corr.to_string(),
             rate,
-            monitor,
+            monitor: monitor.clone(),
             owner,
+            text: None,
+            degraded: None,
         });
         state.orphaned_since = None;
+        if let Some(transcriber) = self.transcriber.get() {
+            transcriber.started(corr, monitor);
+        }
     }
 
     fn take_start_failed(&self, corr: &str, detail: &str) {
@@ -904,6 +1053,9 @@ impl CaptureObserver for TakeHub {
     fn take_ended(&self, corr: &str, record: Option<&Arc<TakeRecord>>) {
         if is_agent_take(corr) {
             return;
+        }
+        if let Some(transcriber) = self.transcriber.get() {
+            transcriber.ended(corr, record.cloned());
         }
         let mut state = lock_registry(&self.state);
         let (rate, owner) = match state.live.take() {
@@ -956,6 +1108,7 @@ impl CaptureObserver for TakeHub {
                 owner: owner_for(&owner, &watcher.conn),
                 ended: Some(total),
                 kept: record.is_some(),
+                meter: None,
             });
         }
     }
@@ -987,6 +1140,16 @@ impl CaptureObserver for TakeHub {
                 Ok(id) => (id, None),
                 Err(err) => (None, Some(err)),
             };
+            if let Some(transcriber) = self.transcriber.get() {
+                // Only a complete take is transcribed: an interrupted one
+                // waits for the user, a failed store has nothing to read.
+                let complete = record.status != TakeStatus::Interrupted && error.is_none();
+                transcriber.persisted(
+                    corr,
+                    stored_id.clone().filter(|_| complete),
+                    owner.clone(),
+                );
+            }
             let frame = Frame::TakePersisted {
                 take: corr.to_string(),
                 stored_id,
@@ -994,6 +1157,23 @@ impl CaptureObserver for TakeHub {
                 error,
                 orphan,
             };
+            if self.transcribes() {
+                // The host transcribes it: every window hears it is in
+                // history, and its owner (which binds its delivery to the
+                // stored row) whatever its queue says.
+                let HubState {
+                    watchers, owed, ..
+                } = &mut *state;
+                for watcher in watchers.iter_mut() {
+                    let theirs = owner
+                        .as_ref()
+                        .is_some_and(|owner| Arc::ptr_eq(&watcher.conn, owner));
+                    if !watcher.deliver_after_tap(corr, frame.clone()) && theirs {
+                        owed.push((Arc::clone(&watcher.conn), frame.clone()));
+                    }
+                }
+                return;
+            }
             // The connection the take is for: its owner while it lives,
             // else (an orphan) exactly one app — the first watching one,
             // or the next to watch. An owner that only sends commands

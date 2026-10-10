@@ -48,7 +48,7 @@ fn a_take_stored_to_be_transcribed_is_claimed_once_and_settled_for_good() {
     let mut store = store_in(&dir);
     let id = stored(&mut store, true, CommitMark::Complete);
     assert!(store.transcription_wanted(&id).unwrap());
-    assert_eq!(store.transcriptions_due().unwrap(), vec![id.clone()]);
+    assert_eq!(store.transcriptions_due(std::time::Duration::ZERO).unwrap(), vec![id.clone()]);
 
     let attempt = claimed(store.claim_transcription(&id, "engine:test", None).unwrap());
     assert_eq!(
@@ -56,7 +56,7 @@ fn a_take_stored_to_be_transcribed_is_claimed_once_and_settled_for_good() {
         TranscriptionClaim::Held,
         "one claim per take"
     );
-    assert!(store.transcriptions_due().unwrap().is_empty(), "a live claim is not due");
+    assert!(store.transcriptions_due(std::time::Duration::ZERO).unwrap().is_empty(), "a live claim is not due");
 
     store
         .finish_attempt_transcript(&attempt, &transcript("hello"))
@@ -82,7 +82,7 @@ fn a_failed_attempt_ends_the_intent_too() {
         .finish_attempt(&attempt, RecognitionOutcome::Failed { message: "engine away" })
         .expect("settle");
     assert!(!store.transcription_wanted(&id).unwrap());
-    assert!(store.transcriptions_due().unwrap().is_empty());
+    assert!(store.transcriptions_due(std::time::Duration::ZERO).unwrap().is_empty());
 }
 
 #[test]
@@ -104,7 +104,7 @@ fn only_complete_takes_asked_for_carry_an_intent() {
             TranscriptionClaim::NotWanted
         );
     }
-    assert!(store.transcriptions_due().unwrap().is_empty());
+    assert!(store.transcriptions_due(std::time::Duration::ZERO).unwrap().is_empty());
 }
 
 #[test]
@@ -117,7 +117,7 @@ fn a_claim_whose_claimant_died_is_taken_over_and_transcribed_once() {
     drop(first);
 
     let mut second = store_in(&dir);
-    assert_eq!(second.transcriptions_due().unwrap(), vec![id.clone()]);
+    assert_eq!(second.transcriptions_due(std::time::Duration::ZERO).unwrap(), vec![id.clone()]);
     let attempt = claimed(second.claim_transcription(&id, "engine:test", None).unwrap());
     assert_ne!(attempt, abandoned);
     second
@@ -151,7 +151,7 @@ fn of_two_live_claimants_only_one_gets_the_take() {
         first.claim_transcription(&id, "engine:test", None).unwrap(),
         TranscriptionClaim::Held
     );
-    assert!(first.transcriptions_due().unwrap().is_empty());
+    assert!(first.transcriptions_due(std::time::Duration::ZERO).unwrap().is_empty());
     second
         .finish_attempt_transcript(&attempt, &transcript("one"))
         .unwrap();
@@ -196,7 +196,7 @@ fn a_deleted_take_has_nothing_left_to_transcribe() {
         store.finish_attempt_transcript(&attempt, &transcript("late")),
         Err(StoreV2Error::NotFound(_))
     ));
-    assert!(store.transcriptions_due().unwrap().is_empty());
+    assert!(store.transcriptions_due(std::time::Duration::ZERO).unwrap().is_empty());
 }
 
 #[test]
@@ -233,9 +233,24 @@ fn an_import_can_ask_for_its_transcription_after_it_is_stored() {
     let id = stored(&mut store, false, CommitMark::Complete);
     store.request_transcription(&id).expect("request");
     store.request_transcription(&id).expect("asking twice is one intent");
-    assert_eq!(store.transcriptions_due().unwrap(), vec![id.clone()]);
+    assert_eq!(store.transcriptions_due(std::time::Duration::ZERO).unwrap(), vec![id.clone()]);
     assert!(matches!(
         store.request_transcription("c_missing"),
         Err(StoreV2Error::NotFound(_))
     ));
+}
+
+#[test]
+fn a_recheck_leaves_intents_younger_than_it_asks_for() {
+    let dir = TempDir::new().expect("tempdir");
+    let mut store = store_in(&dir);
+    let id = stored(&mut store, true, CommitMark::Complete);
+    assert!(store
+        .transcriptions_due(std::time::Duration::from_secs(60))
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        store.transcriptions_due(std::time::Duration::ZERO).unwrap(),
+        vec![id]
+    );
 }

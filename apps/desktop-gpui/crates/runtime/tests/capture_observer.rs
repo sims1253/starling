@@ -326,6 +326,6 @@ fn a_clean_take_is_stored_with_the_intent_to_transcribe_it() {
     assert!(store.transcription_wanted(&stored[0]).unwrap(), "the clean take");
     assert!(!store.transcription_wanted(&stored[1]).unwrap(), "the cancelled take");
     assert!(!store.transcription_wanted(&stored[2]).unwrap(), "a take it was not told about");
-    assert_eq!(store.transcriptions_due().unwrap(), vec![stored[0].clone()]);
+    assert_eq!(store.transcriptions_due(Duration::ZERO).unwrap(), vec![stored[0].clone()]);
     runtime.shutdown();
 }

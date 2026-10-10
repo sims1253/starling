@@ -37,6 +37,7 @@ impl StarlingApp {
             stream,
             Box::new(move || LiveStream::start(&endpoint, &options)),
             trace.clone(),
+            None,
         )?;
         let Live {
             mut previews,

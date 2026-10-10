@@ -453,7 +453,9 @@ fn follow(
         }
         match client.recv_take_timeout(Duration::from_millis(20)) {
             Ok(frame) => {
-                let update = route(frame, feeds, client);
+                let Some(update) = route(frame, feeds, client) else {
+                    continue;
+                };
                 if tx.send(HostUpdate::Take(update)).is_err() {
                     return "the app is closing".to_string();
                 }
@@ -475,8 +477,8 @@ fn route(
     frame: TakeWire,
     feeds: &Mutex<HashMap<String, Arc<TakeFeed>>>,
     client: &HostClient,
-) -> TakeUpdate {
-    match frame {
+) -> Option<TakeUpdate> {
+    Some(match frame {
         TakeWire::Live {
             take,
             rate,
@@ -485,6 +487,7 @@ fn route(
             owner,
             ended,
             kept,
+            ..
         } => {
             let feed = lock(feeds).get(&take).cloned();
             if let Some(feed) = feed {
@@ -530,7 +533,8 @@ fn route(
             orphan,
         },
         TakeWire::Notice(recovery) => TakeUpdate::Notice(recovery),
-    }
+        TakeWire::LiveText { .. } | TakeWire::Transcription { .. } => return None,
+    })
 }
 
 /// Connects to the host at `endpoint`, starting one first when nothing
