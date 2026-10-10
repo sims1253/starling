@@ -250,14 +250,42 @@ receive JSON messages:
 - `{"type":"pong"}`: in response to `{"type":"ping"}`
 - `{"type":"reset_ack"}`: in response to `{"type":"reset"}`
 
+**Preview cadence** (issue #357): the window geometry
+(`--stream-chunk-seconds`, `--stream-overlap-seconds`) decides what is
+committed. The cadence decides only when the live tail is previewed.
+`--min-chunk-seconds` is the first-partial minimum for the whole take;
+it does not gate the tail. Once the take holds that much audio, every
+nonempty tail is previewed, including the overlap right after a window
+commit. `--partial-interval-seconds` is the minimum gap between previews.
+The server stretches it so that previews use at most half of wall time:
+the next preview waits at least twice as long as the last one took.
+That bound adapts to slow models and devices without a per-device preset.
+A client can set the cadence for one connection with query parameters:
+`/stream?min_partial_seconds=1&partial_interval_seconds=0.5`. Invalid
+values get an `invalid stream parameter` error frame, and the server
+closes the connection. The cadence never changes which audio is committed
+or finalized.
+
+**Coalescing** (issue #357): the connection's read loop only queues frames.
+One worker per connection appends every queued frame before each step.
+Each preview therefore covers all audio received so far. If more audio
+or a control message arrives while full windows are being committed, the
+server skips that preview and previews the newer audio next. Window
+commits and finalization always run, and the server never drops audio.
+When more than 32 MiB of frames are queued, the server stops reading
+from the socket until the worker catches up. A `ping` is answered after
+every earlier frame has been processed, as before.
+
 **Stream instrumentation** (issue #226): connect to `/stream?trace=1` and
 every partial and final carries an extra `"trace"` object. Clients that do
 not ask get the frames above unchanged. Times are milliseconds since the
 take's first audio; audio positions are seconds into the take.
 
-- Partial: `{"v":1,"t_ms":…,"audio_s":…,"covered_s":…,"totals":{…}}`.
+- Partial: `{"v":1,"t_ms":…,"audio_s":…,"covered_s":…,"totals":{…},"preview":{…}}`.
   `audio_s` is the audio received so far, and `covered_s` is the end of
-  the audio that the text reflects. `totals` holds `calls`,
+  the audio that the text reflects. `preview` holds the connection's
+  `min_s`, `interval_s`, the current `effective_interval_s` and the
+  number of `coalesced` previews. `totals` holds `calls`,
   `engine_calls`, `engine_audio_s`, `engine_ms`, `reused` and `busy`.
   `engine_audio_s` counts window overlap and each repeated preview, so
   `engine_audio_s / audio_s` is the inference work per recorded second.
@@ -349,6 +377,7 @@ cpp/serve/
 ├── main.cpp            — CLI parsing, lifecycle, HTTP/WS transport (cpp-httplib)
 ├── server.hpp/.cpp     — StarlingServer: model lifecycle, serial queue, transcribe
 ├── stream_session.hpp/.cpp — Rolling buffer + ChunkStreamer (port of Python logic)
+├── stream_pump.hpp/.cpp — WS /stream worker: frame queue, drain, preview coalescing
 └── audio.hpp/.cpp      — WAV/PCM decoding (dr_wav) + multipart extraction
 ```
 

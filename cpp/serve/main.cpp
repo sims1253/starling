@@ -11,6 +11,7 @@
 #define CPPHTTPLIB_THREAD_POOL_ENQUEUE 1
 
 #include "server.hpp"
+#include "stream_pump.hpp"
 #include "stream_session.hpp"
 #include "audio.hpp"
 #include "starling_ggml.h"
@@ -262,45 +263,6 @@ static std::string json_escape(const std::string& s) {
         }
     }
     return out;
-}
-
-// ---- WS /stream binary-frame rejection --------------------------------------
-// Describe a refused binary audio frame as a structured WS error frame,
-// mirroring the buffer-cap error style. A refused frame invalidates the take
-// (or trips the buffer cap); the session then ignores audio until reset.
-static std::string ws_append_error(serve::AppendOutcome outcome,
-                                   const serve::StreamSession& session,
-                                   double max_stream_seconds) {
-    std::ostringstream ss;
-    ss << "{\"type\":\"error\",\"message\":\"";
-    switch (outcome) {
-    case serve::AppendOutcome::MalformedWav:
-        ss << "malformed WAV frame rejected; audio ignored until reset";
-        break;
-    case serve::AppendOutcome::RateMismatch:
-        ss << "WAV sample rate mismatch: expected " << serve::kSampleRate
-           << "; audio ignored until reset";
-        break;
-    case serve::AppendOutcome::OddPcmLength:
-        ss << "odd-length PCM frame rejected (split sample);"
-           << " audio ignored until reset";
-        break;
-    case serve::AppendOutcome::Overflowed:
-        ss << "stream buffer limit reached (" << max_stream_seconds
-           << " s live buffer); audio ignored until reset";
-        break;
-    case serve::AppendOutcome::TakeInvalid:
-        // Only reached on a frame AFTER the invalidating one (whose own
-        // outcome carried the reason); repeat that reason, not a generic.
-        // invalid_reason_ is an internal [a-z_] code: safe to embed raw.
-        ss << "take invalidated (" << session.invalid_reason()
-           << "); audio ignored until reset";
-        break;
-    case serve::AppendOutcome::Accepted:
-        break;
-    }
-    ss << "\"}";
-    return ss.str();
 }
 
 // ---- flat JSON string-field extraction (POST /normalize) ------------------
@@ -1048,19 +1010,47 @@ int main(int argc, char** argv) {
         });
 
     // ---- WS /stream ----
+    // This thread only reads frames; a StreamPump worker owns the session
+    // and every engine call, draining all queued frames before each step so
+    // previews track the newest audio (issue #357).
     svr.WebSocket("/stream",
         [&server, &cfg](const httplib::Request& req,
                         httplib::ws::WebSocket& ws) {
             serve::StreamSession session(server.get());
+            serve::StreamPump::Options opt;
             // Opt-in stream instrumentation (issue #226): `trace=1` on the
             // /stream URL attaches a "trace" object to partials and finals.
             // Without it the frames are unchanged.
-            const bool trace = req.has_param("trace")
+            opt.trace = req.has_param("trace")
                 && req.get_param_value("trace") == "1";
-            // Sent once when a binary frame is refused (buffer cap, malformed
-            // WAV, sample-rate mismatch, odd PCM length); re-armed on reset
-            // so a fresh dictation gets a fresh error if it is refused.
-            bool reject_error_sent = false;
+            opt.max_stream_seconds = cfg.max_stream_seconds;
+            // Per-connection preview cadence (issue #357): the first-partial
+            // minimum and the preview interval, defaulting to the server
+            // flags. Invalid values end the connection with an error frame.
+            {
+                double min_s = cfg.min_chunk_seconds;
+                double interval_s = cfg.partial_interval;
+                std::string err;
+                for (auto [name, dst] : {std::pair{"min_partial_seconds", &min_s},
+                                         std::pair{"partial_interval_seconds", &interval_s}}) {
+                    if (!req.has_param(name)) continue;
+                    auto v = serve::parse_double_strict(req.get_param_value(name));
+                    if (!v) { err = std::string(name) + " must be a number"; break; }
+                    *dst = *v;
+                }
+                if (err.empty())
+                    err = serve::preview_policy_error(serve::kSampleRate, min_s,
+                                                      interval_s);
+                if (!err.empty()) {
+                    ws.send("{\"type\":\"error\",\"message\":\"invalid stream "
+                            "parameter: " + json_escape(err) + "\"}");
+                    ws.close();
+                    return;
+                }
+                session.set_preview_policy(min_s, interval_s);
+            }
+            serve::StreamPump pump(session, opt,
+                                   [&ws](const std::string& m) { ws.send(m); });
             std::fprintf(stderr, "[starling-serve] WS /stream client connected\n");
 
             std::string msg;
@@ -1094,126 +1084,28 @@ int main(int argc, char** argv) {
                     }
 
                     if (type == "commit") {
-                        // An invalidated take (a rejected binary frame) holds
-                        // incomplete audio: committing it as an ordinary
-                        // successful final would silently miss speech, so the
-                        // commit is refused and the client falls back to its
-                        // authoritative local WAV after a reset (issue #145).
-                        // The busy-retry path below is untouched: it retains
-                        // VALID audio, while this path refuses INVALID audio.
-                        if (session.take_invalid()) {
-                            std::ostringstream ss;
-                            ss << "{\"type\":\"error\",\"message\":\"take "
-                               << "invalidated (" << session.invalid_reason()
-                               << "); reset and resend\"}";
-                            ws.send(ss.str());
-                            continue;
-                        }
-                        double dur = session.buffered_seconds();
-                        std::string text;
-                        if (dur > 0.0) {
-                            auto final = session.stream_flush();
-                            if (!final.has_value()) {
-                                ws.send(session.terminal_error().empty()
-                                    ? "{\"type\":\"error\",\"message\":\"server busy\"}"
-                                    : "{\"type\":\"error\",\"message\":\"request timed out\"}");
-                                continue;
-                            }
-                            text = *final;
-                        }
-                        std::string safe_text = json_escape(text);
-                        std::ostringstream ss;
-                        ss << "{\"type\":\"final\",\"text\":\""
-                           << safe_text << "\",\"segments\":[{\"text\":\""
-                           << safe_text << "\",\"start_s\":0.0,\"end_s\":"
-                           << dur << "}],\"duration_s\":" << dur;
-                        if (trace) ss << ",\"trace\":" << session.trace_final_json();
-                        ss << "}";
-                        ws.send(ss.str());
-                        session.reset();
-                        // reset() re-enables audio (clears the buffer cap and
-                        // any take invalidation); re-arm the one-shot error
-                        // frame with it.
-                        reject_error_sent = false;
-                        continue;
+                        pump.push_commit();
                     } else if (type == "ping") {
-                        ws.send("{\"type\":\"pong\"}");
-                        continue;
+                        pump.push_ping();
                     } else if (type == "reset") {
-                        session.reset();
-                        reject_error_sent = false;
-                        ws.send("{\"type\":\"reset_ack\"}");
-                        continue;
+                        pump.push_reset();
                     } else {
                         std::ostringstream ss;
                         ss << "{\"type\":\"error\",\"message\":\"unknown type '"
                            << json_escape(type) << "'\"}";
                         ws.send(ss.str());
-                        continue;
                     }
+                    continue;
                 }
 
                 if (rr == httplib::ws::ReadResult::Binary) {
-                    // Audio data. Enforce the per-connection buffer cap
-                    // (--max-stream-seconds) and the frame-validity policy
-                    // (issue #145): a refused frame is reported once as an
-                    // error frame, and the session stops accepting audio
-                    // until it is reset.
-                    serve::AppendOutcome outcome = serve::AppendOutcome::Accepted;
-                    if (!session.overflowed() && !session.take_invalid()) {
-                        if (msg.size() >= 12 && msg.substr(0, 4) == "RIFF"
-                            && msg.substr(8, 4) == "WAVE") {
-                            outcome = session.append_wav(msg);
-                        } else {
-                            outcome = session.append_pcm(msg);
-                        }
-                    } else if (session.take_invalid()) {
-                        outcome = serve::AppendOutcome::TakeInvalid;
-                    } else {
-                        outcome = serve::AppendOutcome::Overflowed;
-                    }
-                    if (outcome != serve::AppendOutcome::Accepted) {
-                        if (!reject_error_sent) {
-                            reject_error_sent = true;
-                            ws.send(ws_append_error(
-                                outcome, session, cfg.max_stream_seconds));
-                        }
-                        continue;
-                    }
-
-                    double now = static_cast<double>(
-                        std::chrono::duration_cast<std::chrono::milliseconds>(
-                            std::chrono::steady_clock::now().time_since_epoch()
-                        ).count()) / 1000.0;
-
-                    // stream_step runs after EVERY accepted binary frame —
-                    // including audio-less no-ops (an empty payload is
-                    // Accepted): those duplicate snapshots of an unchanged
-                    // buffer are answered by the session's exact-tail reuse
-                    // instead of re-running the engine.
-                    auto text_opt = session.stream_step(now);
-                    if (!session.terminal_error().empty()) {
-                        if (!reject_error_sent) {
-                            reject_error_sent = true;
-                            ws.send("{\"type\":\"error\",\"message\":\"request timed out\"}");
-                        }
-                        continue;
-                    }
-                    if (text_opt.has_value()) {
-                        std::string safe_text = json_escape(*text_opt);
-                        double dur = session.buffered_seconds();
-                        std::ostringstream ss;
-                        ss << "{\"type\":\"partial\",\"text\":\""
-                           << safe_text << "\",\"segments\":[{\"text\":\""
-                           << safe_text << "\",\"start_s\":0.0,\"end_s\":"
-                           << dur << "}],\"start_s\":0.0,\"end_s\":" << dur
-                           << ",\"stable_words\":" << session.stable_words();
-                        if (trace) ss << ",\"trace\":" << session.trace_partial_json();
-                        ss << "}";
-                        ws.send(ss.str());
-                    }
+                    pump.push_audio(std::move(msg));
+                    msg.clear();
                 }
             }
+            // The worker finishes its current engine call and exits before
+            // the socket goes away.
+            pump.close();
             std::fprintf(stderr,
                 "[starling-serve] WS /stream client disconnected\n");
         });

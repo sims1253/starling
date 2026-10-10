@@ -178,11 +178,12 @@ if(STARLING_GGML_TESTS)
     endif()
 
     # The stream_session_test needs the serve sources (server.cpp,
-    # stream_session.cpp, audio.cpp) + cpp-httplib's header path.
+    # stream_session.cpp, stream_pump.cpp, audio.cpp) + cpp-httplib's header path.
     if(test_name STREQUAL "stream_session_test")
       target_sources(${test_name} PRIVATE
           ${STARLING_REPO_ROOT}/cpp/serve/server.cpp
           ${STARLING_REPO_ROOT}/cpp/serve/stream_session.cpp
+          ${STARLING_REPO_ROOT}/cpp/serve/stream_pump.cpp
           ${STARLING_REPO_ROOT}/cpp/serve/audio.cpp)
       target_include_directories(${test_name} PRIVATE
           ${STARLING_REPO_ROOT}/cpp/include
@@ -350,6 +351,7 @@ if(STARLING_SERVE)
       ${STARLING_REPO_ROOT}/cpp/serve/main.cpp
       ${STARLING_REPO_ROOT}/cpp/serve/server.cpp
       ${STARLING_REPO_ROOT}/cpp/serve/stream_session.cpp
+      ${STARLING_REPO_ROOT}/cpp/serve/stream_pump.cpp
       ${STARLING_REPO_ROOT}/cpp/serve/audio.cpp)
 
   add_executable(starling-serve
@@ -383,6 +385,7 @@ if(STARLING_GGML_TESTS)
     ${STARLING_REPO_ROOT}/cpp/serve/main.cpp
     ${STARLING_REPO_ROOT}/cpp/serve/server.cpp
     ${STARLING_REPO_ROOT}/cpp/serve/stream_session.cpp
+    ${STARLING_REPO_ROOT}/cpp/serve/stream_pump.cpp
     ${STARLING_REPO_ROOT}/cpp/serve/audio.cpp
     ${CMAKE_CURRENT_LIST_DIR}/tests/fixture_engine.cpp)
   target_include_directories(starling-serve-contract-fixture PRIVATE

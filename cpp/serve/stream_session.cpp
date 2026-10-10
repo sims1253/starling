@@ -271,6 +271,26 @@ std::string stream_window_config_error(int sample_rate, double chunk_seconds,
     return "";
 }
 
+std::string preview_policy_error(int sample_rate, double min_seconds,
+                                 double interval_seconds) {
+    if (!std::isfinite(min_seconds) || !std::isfinite(interval_seconds))
+        return "preview cadence must be finite";
+    if (min_seconds < 0.0 || interval_seconds < 0.0)
+        return "preview cadence must be nonnegative";
+    if (sample_rate <= 0
+        || min_seconds > static_cast<double>(std::numeric_limits<int>::max())
+                             / sample_rate)
+        return "first-partial minimum too large";
+    return "";
+}
+
+void ChunkStreamer::set_preview_policy(double min_seconds, double interval_seconds) {
+    const std::string err = preview_policy_error(sr_, min_seconds, interval_seconds);
+    if (!err.empty()) throw std::invalid_argument(err);
+    min_ = static_cast<int>(min_seconds * sr_);
+    partial_interval_ = interval_seconds;
+}
+
 ChunkStreamer::ChunkStreamer(int sample_rate, double chunk_seconds,
                              double overlap_seconds, double min_seconds,
                              double partial_interval)
@@ -346,32 +366,54 @@ bool ChunkStreamer::finalize_full_windows(
 }
 
 std::optional<std::string> ChunkStreamer::step(
-    const std::vector<float>& samples, double now, const TranscribeFn& tx) {
-    bool finalized = finalize_full_windows(samples, tx, false);
+    const std::vector<float>& samples, double now, const TranscribeFn& tx,
+    const PendingFn& newer_pending) {
+    // Window commits are required work: never throttled, never coalesced.
+    if (finalize_full_windows(samples, tx, false)) emit_due_ = true;
+    // Committed text the client has not seen yet (or nothing).
+    auto committed_update = [this]() -> std::optional<std::string> {
+        if (!emit_due_) return std::nullopt;
+        emit_due_ = false;
+        return join_words(committed_);
+    };
 
-    int64_t tail_len = static_cast<int64_t>(samples.size()) - boundary_;
+    const int64_t tail_len = static_cast<int64_t>(samples.size()) - boundary_;
     if (tail_len >= chunk_) {  // a full window is still waiting for a retry
-        return finalized ? std::optional<std::string>(join_words(committed_))
-                         : std::nullopt;
+        return committed_update();
     }
-    bool throttled = (now - last_emit_) < partial_interval_;
-    if (!finalized && (throttled || tail_len < min_)) {
+    // Preview eligibility depends on the take, not on the tail: the tail
+    // shrinks to the overlap after every window commit, and gating it on the
+    // first-partial minimum stalled previews for (min - overlap) seconds
+    // after each commit (issue #357).
+    const bool eligible = tail_len > 0
+        && rebased_ + static_cast<int64_t>(samples.size()) >= min_;
+    const bool throttled = (now - last_emit_) < effective_interval();
+    if (!emit_due_ && (throttled || !eligible)) {
+        return std::nullopt;
+    }
+    if (eligible && newer_pending && newer_pending()) {
+        // Newer audio is already queued: this preview would be stale before
+        // it finished. Skip it; the next step previews the newer audio and
+        // carries any committed-text update along (emit_due_ stays set).
+        ++coalesced_;
         return std::nullopt;
     }
     last_emit_ = now;
 
-    if (tail_len > 0 && tail_len >= min_) {
+    if (eligible) {
         call_kind_ = "preview";
+        const auto t0 = std::chrono::steady_clock::now();
         auto text = tx(samples.data() + boundary_, tail_len);
         if (!text.has_value()) {
             // Busy on the tail.
-            return finalized ? std::optional<std::string>(join_words(committed_))
-                             : std::nullopt;
+            return committed_update();
         }
+        last_preview_cost_ = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - t0).count();
+        emit_due_ = false;
         return join_words(stitched(split_words(*text)));
     }
-    return finalized ? std::optional<std::string>(join_words(committed_))
-                     : std::nullopt;
+    return committed_update();
 }
 
 std::optional<std::string> ChunkStreamer::flush(
@@ -390,6 +432,7 @@ std::optional<std::string> ChunkStreamer::flush(
             if (text.has_value()) {
                 commit(split_words(*text));
                 boundary_ = static_cast<int64_t>(samples.size());
+                emit_due_ = false;
                 return join_words(committed_);
             }
         }
@@ -403,7 +446,11 @@ void ChunkStreamer::reset() {
     committed_.clear();
     frozen_ = 0;
     boundary_ = 0;
+    rebased_ = 0;
     last_emit_ = 0.0;
+    emit_due_ = false;
+    last_preview_cost_ = 0.0;
+    coalesced_ = 0;
     call_kind_ = "window";
 }
 
@@ -423,7 +470,9 @@ StreamSession::StreamSession(StarlingServer* server) : server_(server) {
     // that can change a raw window result. The native server fixes the model
     // slug + gguf artifact (which encodes the quantization) per process and
     // selected backend after load (compile-time family before a lazy load);
-    // the window/overlap policy shapes the very windows being keyed.
+    // the window/overlap policy shapes the very windows being keyed. The
+    // preview cadence is not part of it: it decides when a window is
+    // transcribed, never what the engine returns for it (issue #357).
     // std::to_string(double) is fixed-point, so the
     // string is deterministic. There is no language/normalization parameter
     // on the native streaming path (nothing extra to key on); a hypothetical
@@ -431,9 +480,7 @@ StreamSession::StreamSession(StarlingServer* server) : server_(server) {
     engine_id_ = cfg.model_slug + "|" + cfg.gguf_path + "|"
                + server_->backend_identity() + "|chunk="
                + std::to_string(cfg.stream_chunk_seconds)
-               + "|overlap=" + std::to_string(cfg.stream_overlap_seconds)
-               + "|min=" + std::to_string(cfg.min_chunk_seconds)
-               + "|partial=" + std::to_string(cfg.partial_interval);
+               + "|overlap=" + std::to_string(cfg.stream_overlap_seconds);
 }
 
 TranscribeFn StreamSession::make_transcribe_fn(RequestContext* ctx) {
@@ -683,12 +730,13 @@ void StreamSession::set_engine_identity(std::string id) {
     wrapped_tx_ = nullptr;  // the cached wrapper snapshots the old identity
 }
 
-std::optional<std::string> StreamSession::stream_step(double now) {
+std::optional<std::string> StreamSession::stream_step(
+    double now, const PendingFn& newer_pending) {
     if (!chunker_) return std::nullopt;
     if (!terminal_error_.empty()) return std::nullopt;
     TranscribeFn tx = active_tx();
     try {
-        return chunker_->step(samples_, now, tx);
+        return chunker_->step(samples_, now, tx, newer_pending);
     } catch (const StreamQueueTimeout&) {
         terminal_error_ = "request timed out";
         take_invalid_ = true;
@@ -839,12 +887,21 @@ std::string totals_json(const StreamCallTotals& t) {
 
 } // namespace
 
+std::string StreamSession::trace_preview_json() const {
+    if (!chunker_) return "";
+    return ",\"preview\":{\"min_s\":" + fmt3(chunker_->min_preview_seconds())
+         + ",\"interval_s\":" + fmt3(chunker_->preview_interval())
+         + ",\"effective_interval_s\":" + fmt3(chunker_->effective_interval())
+         + ",\"coalesced\":" + std::to_string(chunker_->coalesced_previews())
+         + "}";
+}
+
 std::string StreamSession::trace_partial_json() const {
     return "{\"v\":1,\"t_ms\":" + fmt3(take_ms())
          + ",\"audio_s\":" + seconds(trimmed_samples_
                                         + static_cast<int64_t>(samples_.size()))
          + ",\"covered_s\":" + seconds(covered_end_)
-         + ",\"totals\":" + totals_json(totals_) + "}";
+         + ",\"totals\":" + totals_json(totals_) + trace_preview_json() + "}";
 }
 
 std::string StreamSession::trace_final_json() const {
@@ -871,7 +928,7 @@ std::string StreamSession::trace_final_json() const {
          + ",\"audio_s\":" + seconds(trimmed_samples_
                                         + static_cast<int64_t>(samples_.size()))
          + ",\"covered_s\":" + seconds(covered_end_)
-         + ",\"totals\":" + totals_json(totals_)
+         + ",\"totals\":" + totals_json(totals_) + trace_preview_json()
          + ",\"by_kind\":" + by_kind
          + ",\"stop\":{\"path\":\"" + final_path_
          + "\",\"t0_ms\":" + fmt3(flush_t0_ms_)

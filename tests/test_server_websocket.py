@@ -237,6 +237,65 @@ def test_stream_trace_ledger(server, monkeypatch, chunk_seconds):
     assert trace["covered_s"] == 1.0
 
 
+# ---------------------------------------------------------------------------
+# Preview cadence and coalescing (issue #357).
+# ---------------------------------------------------------------------------
+def test_stream_per_connection_preview_cadence(server, monkeypatch):
+    monkeypatch.setattr(server, "_run_queued_sync", _transcribe_hello)
+    half = np.zeros(S.SAMPLE_RATE // 2, dtype=np.int16).tobytes()
+    with TestClient(S.create_app(server=server, load_on_startup=False)) as client:
+        with client.websocket_connect('/stream?min_partial_seconds=0.75&trace=1') as ws:
+            ws.send_bytes(half)  # 0.5 s: below this connection's minimum
+            ws.send_json({"type": "ping"})
+            assert ws.receive_json() == {"type": "pong"}
+            ws.send_bytes(half)
+            partial = ws.receive_json()
+            assert partial["type"] == "partial"
+            assert partial["trace"]["preview"]["min_s"] == .75
+            assert partial["trace"]["preview"]["interval_s"] == 0
+
+
+@pytest.mark.parametrize("query", ["min_partial_seconds=-1", "partial_interval_seconds=nan",
+                                   "min_partial_seconds=abc"])
+def test_stream_invalid_cadence_is_refused(server, query):
+    from starlette.websockets import WebSocketDisconnect
+
+    with TestClient(S.create_app(server=server, load_on_startup=False)) as client:
+        with client.websocket_connect(f'/stream?{query}') as ws:
+            error = ws.receive_json()
+            assert error["type"] == "error"
+            assert error["message"].startswith("invalid stream parameter")
+            with pytest.raises(WebSocketDisconnect):
+                ws.receive_json()
+
+
+def test_stream_burst_coalesces_previews_and_keeps_audio(server, monkeypatch):
+    import time as _time
+
+    server.config.stream_chunk_seconds = 1
+    lens = []
+
+    def slow(samples, rid, **kwargs):
+        lens.append(len(samples))
+        _time.sleep(0.02)
+        return S.TranscribeResult(text="w")
+
+    monkeypatch.setattr(server, "_run_queued_sync", slow)
+    frame = np.zeros(S.SAMPLE_RATE // 20, dtype=np.int16).tobytes()  # 50 ms
+    with TestClient(S.create_app(server=server, load_on_startup=False)) as client:
+        with client.websocket_connect('/stream?trace=1') as ws:
+            for _ in range(60):
+                ws.send_bytes(frame)
+            ws.send_json({"type": "commit"})
+            while (msg := ws.receive_json())["type"] != "final":
+                assert msg["type"] == "partial"
+    previews = [n for n in lens if n < S.SAMPLE_RATE]
+    assert len(previews) < 30
+    assert msg["duration_s"] == 3.0
+    assert msg["trace"]["covered_s"] == 3.0
+    assert msg["trace"]["audio_s"] == 3.0
+
+
 def test_lifespan_owns_eager_load(server):
     app = S.create_app(server=server)
     assert server.test_loads == []

@@ -75,9 +75,33 @@ def stitch_words(
 # skipped without advancing state.
 TranscribeFn = Callable[[np.ndarray], Optional[str]]
 
+# Asked right before a preview would start: True when newer audio (or a
+# control message) is already queued, so the preview would be obsolete before
+# it finished (issue #357).
+PendingFn = Callable[[], bool]
+
 # Largest sample count the chunk counters hold; kept in lockstep with the int
 # counters of the C++ port (cpp/serve/stream_session.cpp).
 _MAX_SAMPLES = 2**31 - 1
+
+# Preview cadence bound (issue #357; kMaxPreviewDuty in the C++ port): the
+# effective preview interval is at least the latest preview's engine time
+# divided by this duty, so previews take at most this fraction of wall time
+# on a slow model or device. Window and finalization work is never throttled.
+MAX_PREVIEW_DUTY = 0.5
+
+
+def preview_policy_error(
+    *, sample_rate: int, min_seconds: float, interval_seconds: float
+) -> Optional[str]:
+    """Validate a preview cadence (issue #357); ``None`` when valid."""
+    if not (math.isfinite(min_seconds) and math.isfinite(interval_seconds)):
+        return "preview cadence must be finite"
+    if min_seconds < 0 or interval_seconds < 0:
+        return "preview cadence must be nonnegative"
+    if int(sample_rate) <= 0 or min_seconds > _MAX_SAMPLES / int(sample_rate):
+        return "first-partial minimum too large"
+    return None
 
 
 def stream_window_config_error(
@@ -141,6 +165,13 @@ class ChunkStreamer:
     Raises ``ValueError`` when the window configuration is invalid (see
     :func:`stream_window_config_error`; ``chunk_seconds`` must be positive
     here — 0 selects the legacy whole-buffer mode and never builds a chunker).
+
+    The window geometry (chunk/overlap) decides what is committed; the
+    preview cadence (``min_seconds``/``partial_interval_seconds``) only
+    decides when the live tail is previewed (issue #357). ``min_seconds`` is
+    the take's first-partial minimum: once the take holds that much audio,
+    every nonempty tail is eligible, including the overlap right after a
+    window commit.
     """
 
     def __init__(
@@ -185,12 +216,36 @@ class ChunkStreamer:
 
         self.committed: list[str] = []
         self.boundary = 0          # sample index; audio before this is finalized
+        self.rebased = 0           # samples dropped before index 0 (rebase())
         self.last_emit = 0.0
+        self.emit_due = False      # a commit changed the text, not yet emitted
+        self.last_preview_cost = 0.0  # seconds, latest successful preview
+        self.coalesced = 0         # previews skipped for newer queued audio
         # Why the transcribe call in flight was made (issue #226): "window",
         # "preview", "flush_window" or "flush_tail". Set before every call;
         # the session's call ledger reads it (lockstep with call_kind() in
         # cpp/serve/stream_session.hpp).
         self.call_kind = "window"
+
+    def set_preview_policy(self, min_seconds: float, interval_seconds: float) -> None:
+        """Replace the preview cadence (per connection); ``ValueError`` if invalid."""
+        error = preview_policy_error(sample_rate=self.sr, min_seconds=min_seconds,
+                                     interval_seconds=interval_seconds)
+        if error is not None:
+            raise ValueError(error)
+        self.min = int(min_seconds * self.sr)
+        self.partial_interval = float(interval_seconds)
+
+    @property
+    def effective_interval(self) -> float:
+        """The configured interval, stretched so the latest preview's engine
+        time is at most ``MAX_PREVIEW_DUTY`` of it."""
+        return max(self.partial_interval, self.last_preview_cost / MAX_PREVIEW_DUTY)
+
+    def rebase(self, dropped: int) -> None:
+        """Follow the session dropping ``dropped`` finalized samples."""
+        self.boundary = max(0, self.boundary - dropped)
+        self.rebased += dropped
 
     # ------------------------------------------------------------------ #
     def _finalize_full_windows(
@@ -212,35 +267,63 @@ class ChunkStreamer:
             did = True
         return did
 
-    def step(self, samples: np.ndarray, now: float, tx: TranscribeFn) -> Optional[str]:
+    def _committed_update(self) -> Optional[str]:
+        """Committed text the client has not seen yet, or ``None``."""
+        if not self.emit_due:
+            return None
+        self.emit_due = False
+        return " ".join(self.committed)
+
+    def step(
+        self,
+        samples: np.ndarray,
+        now: float,
+        tx: TranscribeFn,
+        newer_pending: Optional[PendingFn] = None,
+    ) -> Optional[str]:
         """Advance streaming state for the current buffer.
 
-        Finalizes any full windows, then (throttled) transcribes the live tail
-        for a responsive partial.  Returns the full text to emit, or ``None`` if
-        nothing should be emitted this tick.
+        Finalizes any full windows (always), then (throttled) transcribes the
+        live tail for a responsive partial.  When ``newer_pending`` reports
+        queued audio right before the preview, the preview is skipped
+        (coalesced): the next step previews the newer audio instead, carrying
+        any committed-text update along.  Returns the full text to emit, or
+        ``None`` if nothing should be emitted this tick.
         """
-        finalized = self._finalize_full_windows(samples, tx)
+        # Window commits are required work: never throttled, never coalesced.
+        if self._finalize_full_windows(samples, tx):
+            self.emit_due = True
 
         tail_len = len(samples) - self.boundary
         if tail_len >= self.chunk:  # a full window is still waiting for a retry
-            return " ".join(self.committed) if finalized else None
-        throttled = (now - self.last_emit) < self.partial_interval
-        # emit if we just finalized, or the (throttled) live tail is long enough
-        if not finalized and (throttled or tail_len < self.min):
+            return self._committed_update()
+        # Eligibility depends on the take, not on the tail: the tail shrinks
+        # to the overlap after every window commit, and gating it on the
+        # first-partial minimum stalled previews after each commit (#357).
+        # Never hand the transcriber an empty window (issue #146).
+        eligible = tail_len > 0 and self.rebased + len(samples) >= self.min
+        throttled = (now - self.last_emit) < self.effective_interval
+        if not self.emit_due and (throttled or not eligible):
+            return None
+        if eligible and newer_pending is not None and newer_pending():
+            # Newer audio is already queued: this preview would be stale
+            # before it finished. The next step previews the newer audio.
+            self.coalesced += 1
             return None
         self.last_emit = now
 
-        # emit committed + the live tail (transcribed only if long enough);
-        # never hand the transcriber an empty window (issue #146)
-        if tail_len > 0 and tail_len >= self.min:
+        if eligible:
             self.call_kind = "preview"
+            t0 = time.monotonic()
             text = tx(samples[self.boundary :])
             if text is None:  # busy on the tail
-                return " ".join(self.committed) if finalized else None
+                return self._committed_update()
+            self.last_preview_cost = time.monotonic() - t0
+            self.emit_due = False
             return " ".join(stitch_words(
                 self.committed, text.split(), max_overlap=self.max_overlap_words
             ))
-        return " ".join(self.committed) if finalized else None
+        return self._committed_update()
 
     def flush(self, samples: np.ndarray, tx: TranscribeFn) -> Optional[str]:
         """Commit all audio, or return ``None`` if bounded retries stay busy.
@@ -264,6 +347,7 @@ class ChunkStreamer:
                         self.committed, text.split(), max_overlap=self.max_overlap_words
                     )
                     self.boundary = len(samples)
+                    self.emit_due = False
                     return " ".join(self.committed)
             if attempt + 1 < _FLUSH_MAX_RETRIES:
                 time.sleep(_FLUSH_BACKOFF_SECONDS)
@@ -272,7 +356,11 @@ class ChunkStreamer:
     def reset(self) -> None:
         self.committed = []
         self.boundary = 0
+        self.rebased = 0
         self.last_emit = 0.0
+        self.emit_due = False
+        self.last_preview_cost = 0.0
+        self.coalesced = 0
         self.call_kind = "window"
 
 
@@ -393,19 +481,27 @@ class StreamTrace:
                 "engine_ms": round(t.engine_ms, 3), "reused": t.reused,
                 "busy": t.busy}
 
-    def partial_json(self, audio_samples: int) -> dict:
-        return {"v": 1, "t_ms": round(self.now_ms(), 3),
-                "audio_s": self._seconds(audio_samples),
-                "covered_s": self._seconds(self.covered_end),
-                "totals": self._totals_json(self.totals)}
+    def partial_json(self, audio_samples: int, chunker: Optional["ChunkStreamer"] = None) -> dict:
+        out = {"v": 1, "t_ms": round(self.now_ms(), 3),
+               "audio_s": self._seconds(audio_samples),
+               "covered_s": self._seconds(self.covered_end),
+               "totals": self._totals_json(self.totals)}
+        if chunker is not None:
+            out["preview"] = {
+                "min_s": round(chunker.min / chunker.sr, 3),
+                "interval_s": round(chunker.partial_interval, 3),
+                "effective_interval_s": round(chunker.effective_interval, 3),
+                "coalesced": chunker.coalesced,
+            }
+        return out
 
-    def final_json(self, audio_samples: int) -> dict:
+    def final_json(self, audio_samples: int, chunker: Optional["ChunkStreamer"] = None) -> dict:
         # full_take only exists on the Python whole-buffer path; listed only
         # when used so the chunked shape matches the native server.
         by_kind = {k: self._totals_json(t) for k, t in self.by_kind.items()
                    if k != "full_take" or t.calls}
         return {
-            **self.partial_json(audio_samples),
+            **self.partial_json(audio_samples, chunker),
             "by_kind": by_kind,
             "stop": {"path": self.final_path,
                      "t0_ms": round(self.flush_t0_ms, 3),
