@@ -145,6 +145,14 @@ class MainActivity : Activity() {
         refreshOnDeviceStatus()
         refreshRecordings()
         if (savedInstanceState == null) handleKeyboardRequest(intent)
+        // The document picker can outlive this instance (rotation, process
+        // recreation); its result must still find the recording to export.
+        pendingExportId = savedInstanceState?.getString(STATE_PENDING_EXPORT)
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        pendingExportId?.let { outState.putString(STATE_PENDING_EXPORT, it) }
     }
 
     /**
@@ -899,7 +907,10 @@ class MainActivity : Activity() {
     }
 
     private fun finishExport(uri: Uri) {
-        val id = pendingExportId ?: return
+        val id = pendingExportId ?: run {
+            recordingMessage.setText(R.string.export_error)
+            return
+        }
         pendingExportId = null
         val resolver = contentResolver
         thread {
@@ -920,6 +931,7 @@ class MainActivity : Activity() {
         private const val REQUEST_IMPORT_MODEL = 4002
         private const val REQUEST_KEYBOARD_MICROPHONE = 4003
         private const val REQUEST_EXPORT_RECORDING = 4004
+        private const val STATE_PENDING_EXPORT = "pending_export_id"
 
         /** The voice keyboard asks for the microphone through this screen. */
         const val ACTION_REQUEST_MICROPHONE = "dev.starling.mobile.action.REQUEST_MICROPHONE"

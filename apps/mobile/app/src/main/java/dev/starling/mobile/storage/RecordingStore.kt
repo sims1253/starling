@@ -1,6 +1,8 @@
 package dev.starling.mobile.storage
 
 import android.content.Context
+import android.system.Os
+import android.system.OsConstants
 import dev.starling.mobile.audio.WavWriter
 import dev.starling.mobile.data.CaptureRecovery
 import dev.starling.mobile.data.Recording
@@ -98,6 +100,7 @@ class RecordingStore internal constructor(
         if (!partial.renameTo(destination)) {
             throw IOException("Unable to finalize the recording audio")
         }
+        syncDirectory()
         val updated = recording.copy(
             status = RecordingStatus.PENDING,
             durationSeconds = durationSeconds,
@@ -139,7 +142,9 @@ class RecordingStore internal constructor(
 
     /**
      * Stores a successful transcript as a new revision; earlier revisions
-     * (from the first attempt or other models) are kept.
+     * (from the first attempt or other models) are kept. An empty result
+     * never displaces an earlier non-empty one: that attempt is recorded as
+     * failed ([NO_SPEECH_ON_RETRY]) and the earlier transcript stays current.
      */
     fun markTranscribed(
         id: String,
@@ -150,6 +155,9 @@ class RecordingStore internal constructor(
     ): Recording = synchronized(lock) {
         // Deliberately do not trim, normalize, or otherwise clean this value.
         update(id) {
+            if (rawTranscript.isBlank() && it.revisions.any { revision -> revision.text.isNotBlank() }) {
+                return@update it.copy(status = RecordingStatus.FAILED, errorMessage = NO_SPEECH_ON_RETRY)
+            }
             it.copy(
                 status = RecordingStatus.TRANSCRIBED,
                 rawTranscript = rawTranscript,
@@ -232,6 +240,24 @@ class RecordingStore internal constructor(
         if (!temporary.renameTo(target)) {
             throw IOException("Unable to commit recording metadata")
         }
+        syncDirectory()
+    }
+
+    /**
+     * Makes this directory's renames durable (the file data is synced by
+     * each writer), so after a power loss the metadata and audio renames
+     * are on storage in the order they were made. Best effort: unit tests
+     * on the JVM have no android.system.
+     */
+    private fun syncDirectory() {
+        runCatching {
+            val fd = Os.open(directory.path, OsConstants.O_RDONLY, 0)
+            try {
+                Os.fsync(fd)
+            } finally {
+                Os.close(fd)
+            }
+        }
     }
 
     private fun decode(file: File): Recording {
@@ -308,7 +334,8 @@ class RecordingStore internal constructor(
                 if (recording.ephemeral) return@forEach
                 val audioMissing = !audioFile(recording).exists() && partialFile(recording).exists()
                 when {
-                    recording.status == RecordingStatus.RECORDING || audioMissing -> runCatching {
+                    recording.status == RecordingStatus.RECORDING || audioMissing ||
+                        recording.errorMessage == UNRECOVERED_CAPTURE -> runCatching {
                         salvageLocked(
                             recording,
                             recording.recovery?.reason
@@ -316,11 +343,13 @@ class RecordingStore internal constructor(
                                 ?: INTERRUPTED_CAPTURE,
                         )
                     }.onFailure {
-                        // Storage refused the repair: the partial WAV stays
-                        // untouched, the row says so instead of "recording",
-                        // and the next open tries again (the audio is missing).
+                        // Storage refused the repair or a rename: the row says
+                        // so instead of "recording", and the next open tries
+                        // again. A recovery note already saved is kept, since
+                        // the header it was measured from may be repaired now.
                         runCatching {
-                            save(recording.copy(status = RecordingStatus.FAILED, errorMessage = UNRECOVERED_CAPTURE))
+                            val current = runCatching { decode(file) }.getOrDefault(recording)
+                            save(current.copy(status = RecordingStatus.FAILED, errorMessage = UNRECOVERED_CAPTURE))
                         }
                     }
                     recording.status == RecordingStatus.TRANSCRIBING -> runCatching {
@@ -345,6 +374,13 @@ class RecordingStore internal constructor(
         val destination = audioFile(recording)
         val partial = partialFile(recording)
         var recovery = recording.recovery
+        if (WavWriter.isOpen(partial)) {
+            // A capture of this process still holds the file (its worker
+            // outlived the stop). Nothing is moved under it; the next start
+            // recovers it like any interrupted capture.
+            return recording.copy(status = RecordingStatus.FAILED, errorMessage = UNRECOVERED_CAPTURE)
+                .also(::save)
+        }
         if (partial.isFile) {
             val measured = measurePartial(partial)
             if (measured != null) {
@@ -361,6 +397,7 @@ class RecordingStore internal constructor(
                     throw IOException("Unable to replace the recording audio")
                 }
                 if (!partial.renameTo(destination)) throw IOException("Unable to recover the recording audio")
+                syncDirectory()
             } else {
                 // A header without a single sample: nothing to keep.
                 partial.delete()
@@ -455,7 +492,8 @@ class RecordingStore internal constructor(
 
         const val INTERRUPTED_CAPTURE = "The recording was interrupted: the app or the phone stopped while it was recording."
         const val UNRECOVERED_CAPTURE =
-            "The recording was interrupted and its audio could not be recovered yet; Starling tries again at the next start."
+            "The recording's audio could not be recovered yet; Starling tries again the next time it starts."
+        const val NO_SPEECH_ON_RETRY = "This attempt recognized no speech; the earlier result is kept."
         const val INTERRUPTED_TRANSCRIPTION =
             "Transcription was interrupted when the app stopped. The audio is saved; retry it."
     }

@@ -469,7 +469,9 @@ class AudioCapture {
     companion object {
         /**
          * How often a capture's written audio is fsynced and recorded in the
-         * WAV header: the most a power loss or OS crash can take back.
+         * WAV header. A target, not a bound: what a power loss or OS crash
+         * can take back is everything after the last checkpoint that
+         * actually completed (see WavWriter).
          */
         const val CHECKPOINT_INTERVAL_MILLIS = 1_000L
 

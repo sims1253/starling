@@ -219,4 +219,69 @@ class RecordingStoreRecoveryTest {
         assertEquals(3, reopened.attempts)
         assertTrue(File(storeDir(), reopened.wavName).isFile)
     }
+
+    @Test
+    fun salvageNeverTouchesAWavAWriterOfThisProcessStillHolds() {
+        val store = RecordingStore(storeDir())
+        val recording = store.create()
+        val partial = store.partialFile(recording)
+        // A worker that outlived its stop (CaptureStopPolicy.ZOMBIE_RESULT).
+        val zombie = WavWriter(partial)
+        zombie.write(pcm(second), second)
+
+        val settled = store.salvageCapture(recording.id, "The microphone did not stop cleanly")
+
+        assertEquals(RecordingStatus.FAILED, settled.status)
+        assertEquals(RecordingStore.UNRECOVERED_CAPTURE, settled.errorMessage)
+        assertTrue(partial.isFile)
+        assertFalse(store.audioFile(recording).exists())
+        // It keeps writing into its own file, which nobody moved.
+        zombie.write(pcm(second), second)
+        zombie.finish()
+
+        val recovered = RecordingStore(storeDir()).get(recording.id)
+        assertEquals(RecordingStatus.PENDING, recovered.status)
+        assertEquals(2.0, recovered.recovery!!.recoveredSeconds, 1e-9)
+    }
+
+    @Test
+    fun aFailedPromotionKeepsTheFirstNoteAndIsRetriedAtTheNextOpen() {
+        val first = RecordingStore(storeDir())
+        val recording = first.create()
+        killedCapture(first.partialFile(recording), written = 3 * second, confirmed = 2 * second)
+        // A non-empty directory where the WAV belongs cannot be replaced.
+        val blocker = File(storeDir(), recording.wavName).apply { mkdirs() }
+        File(blocker, "x").writeBytes(ByteArray(1))
+
+        val failed = RecordingStore(storeDir()).get(recording.id)
+
+        assertEquals(RecordingStatus.FAILED, failed.status)
+        assertEquals(RecordingStore.UNRECOVERED_CAPTURE, failed.errorMessage)
+        assertEquals(2.0, failed.recovery!!.confirmedSeconds, 1e-9)
+
+        blocker.deleteRecursively()
+        val recovered = RecordingStore(storeDir()).get(recording.id)
+
+        assertEquals(RecordingStatus.PENDING, recovered.status)
+        assertEquals(RecordingStore.INTERRUPTED_CAPTURE, recovered.recovery!!.reason)
+        assertEquals(3.0, recovered.recovery!!.recoveredSeconds, 1e-9)
+        // Measured from the repaired header this time, but the first note wins.
+        assertEquals(2.0, recovered.recovery!!.confirmedSeconds, 1e-9)
+    }
+
+    @Test
+    fun anEmptyRetryNeverDisplacesAnEarlierTranscript() {
+        val store = RecordingStore(storeDir())
+        val recording = store.create()
+
+        // A first attempt that hears nothing is still its result.
+        assertEquals(RecordingStatus.TRANSCRIBED, store.markTranscribed(recording.id, "").status)
+        store.markTranscribed(recording.id, "hello")
+        val retried = store.markTranscribed(recording.id, " ")
+
+        assertEquals(RecordingStatus.FAILED, retried.status)
+        assertEquals(RecordingStore.NO_SPEECH_ON_RETRY, retried.errorMessage)
+        assertEquals("hello", retried.rawTranscript)
+        assertEquals(listOf("", "hello"), retried.revisions.map { it.text })
+    }
 }

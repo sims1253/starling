@@ -3,6 +3,7 @@ package dev.starling.mobile.audio
 import java.io.File
 import java.io.RandomAccessFile
 import java.nio.ByteBuffer
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Writes little-endian mono PCM16 at 16 kHz with a finalized RIFF header.
@@ -13,12 +14,19 @@ import java.nio.ByteBuffer
  * file and then records the confirmed payload size in the header, so after
  * a power loss or OS crash the header names the samples that were on
  * storage. The header write itself is synced by the next checkpoint, so
- * the recorded boundary lags the last write by up to two intervals.
- * [finish] writes the final header and fsyncs it before closing, so a
- * finished WAV is durable as a whole.
+ * the recorded boundary trails the last write by about two intervals
+ * when storage keeps up (a slow or failing fsync holds it back further: it
+ * is always the last size that was actually synced). [finish] syncs the
+ * payload before it writes the final header, then syncs that, so a
+ * finished WAV is durable as a whole and an interrupted finish never
+ * claims unsynced samples.
+ *
+ * While a writer is open its file is in [isOpen]: recovery
+ * (RecordingStore) never repairs or moves a file a capture of this process
+ * may still write, even a capture whose worker outlived its stop.
  */
 internal class WavWriter(
-    file: File,
+    private val file: File,
     private val maxDataBytes: Long = MAX_DATA_BYTES,
 ) {
     private val output = RandomAccessFile(file, "rw")
@@ -30,6 +38,8 @@ internal class WavWriter(
     // Serializes [checkpoint] with [finish]: both write the header, and a
     // checkpoint must never touch a closed descriptor.
     private val headerLock = Any()
+
+    @Volatile
     private var closed = false
 
     init {
@@ -37,6 +47,7 @@ internal class WavWriter(
         // A valid header with an empty payload from the start: a capture that
         // dies before its first checkpoint is still recognizably this app's WAV.
         output.write(header(0))
+        open.add(file.absolutePath)
     }
 
     /** Bytes of PCM written so far. */
@@ -67,12 +78,17 @@ internal class WavWriter(
         if (closed) return
         check(dataBytes <= maxDataBytes) { EXCEEDED_MESSAGE }
         try {
+            output.fd.sync()
             output.seek(0)
             output.write(header(dataBytes))
             output.fd.sync()
         } finally {
             closed = true
-            output.close()
+            try {
+                output.close()
+            } finally {
+                open.remove(file.absolutePath)
+            }
         }
     }
 
@@ -90,6 +106,11 @@ internal class WavWriter(
          */
         const val MAX_DATA_BYTES: Long = Int.MAX_VALUE.toLong() - (WAV_HEADER_SIZE - 8)
         private const val EXCEEDED_MESSAGE = "The recording exceeded the maximum WAV size"
+
+        private val open: MutableSet<String> = ConcurrentHashMap.newKeySet()
+
+        /** Whether a writer of this process still has [file] open. */
+        fun isOpen(file: File): Boolean = file.absolutePath in open
 
         /** The 44-byte PCM16 mono 16 kHz header for a payload of [dataBytes]. */
         fun header(dataBytes: Long): ByteArray {
