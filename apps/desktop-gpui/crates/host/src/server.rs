@@ -410,6 +410,11 @@ pub struct HostShared {
     /// whoever runs the host shuts it down ([`HostHandle::retire_requested`]),
     /// and no new work (or app) is taken on meanwhile.
     pub(crate) retire: AtomicBool,
+    /// An agent's ask has the microphone open or its take in hand. Set by
+    /// the broker under `admission` before it starts the capture (the
+    /// runtime answers a start before its capture view shows it), so a
+    /// retire's idle check sees it.
+    pub(crate) ask_capturing: AtomicBool,
     /// Work-admitting frames hold this for reading while they check
     /// `retire` and hand their work on; a retire takes it for writing
     /// while it checks the host idles and commits. So no work slips in
@@ -812,6 +817,7 @@ pub fn serve(config: HostConfig) -> Result<HostHandle, HostError> {
         engine_pending: AtomicUsize::new(0),
         build: config.build.clone(),
         retire: AtomicBool::new(false),
+        ask_capturing: AtomicBool::new(false),
         admission: std::sync::RwLock::new(()),
         history: history.clone(),
         store_jobs,
@@ -1057,7 +1063,10 @@ fn retire_answer(
     let busy = |reason: &str| RetireAnswer::Busy {
         reason: reason.to_string(),
     };
-    if shared.takes.records() || capture_active(&shared.client) {
+    if shared.takes.records()
+        || capture_active(&shared.client)
+        || shared.ask_capturing.load(Ordering::SeqCst)
+    {
         return busy("a recording is being made or saved");
     }
     let snapshot = shared.client.snapshot();
