@@ -471,7 +471,7 @@ fn a_replacement_cut_short_before_its_commit_still_replaces_a_shorter_journal() 
     // the replacement's staging journal into the take, and the recorder's
     // partial journal is not adopted beside it.
     let dir = TempDir::new().expect("tempdir");
-    let mut store = store_in(&dir);
+    let store = store_in(&dir);
     let tree = journals(&dir);
     let path = faulted_journal(&tree, "j_mid_save", &ramp(1_600, 0));
     let staged = die_while_storing_in_place_of(&store, "j_mid_save", &ramp(4_800, 0));
@@ -492,7 +492,7 @@ fn a_replacement_holding_less_than_the_journal_replaces_nothing() {
     // Cut short with less audio than the recorder confirmed: both stay
     // takes — a duplicate the user can delete beats audio lost.
     let dir = TempDir::new().expect("tempdir");
-    let mut store = store_in(&dir);
+    let store = store_in(&dir);
     let tree = journals(&dir);
     faulted_journal(&tree, "j_longer", &ramp(4_800, 0));
     die_while_storing_in_place_of(&store, "j_longer", &ramp(800, 0));
