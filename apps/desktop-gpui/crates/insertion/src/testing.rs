@@ -53,6 +53,7 @@ struct State {
     destroyed_ref: Option<String>,
     insert_behavior: InsertBehavior,
     revalidate_failure: Option<InsertError>,
+    verifies_target: bool,
     insertions: Vec<(String, String)>,
 }
 
@@ -94,6 +95,7 @@ impl FakeBackend {
                 destroyed_ref: None,
                 insert_behavior: InsertBehavior::Type,
                 revalidate_failure: None,
+                verifies_target: true,
                 insertions: Vec::new(),
             }),
             excluded_pids: merge_excluded_pids(excluded_pids),
@@ -139,6 +141,13 @@ impl FakeBackend {
         self.state().revalidate_failure = error;
     }
 
+    /// Behave like a backend without target identity (Wayland): only
+    /// [`InsertionBackend::verifies_target`] changes, so tests can drive
+    /// the callers' gating.
+    pub fn set_verifies_target(&self, verifies: bool) {
+        self.state().verifies_target = verifies;
+    }
+
     /// The `(target_ref, text)` pairs `insert` accepted, in order.
     pub fn insertions(&self) -> Vec<(String, String)> {
         self.state().insertions.clone()
@@ -148,6 +157,10 @@ impl FakeBackend {
 impl InsertionBackend for FakeBackend {
     fn kind(&self) -> BackendKind {
         BackendKind::Fake
+    }
+
+    fn verifies_target(&self) -> bool {
+        self.state().verifies_target
     }
 
     fn availability(&self) -> Result<(), InsertError> {

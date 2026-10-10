@@ -5789,6 +5789,8 @@ dependencies = [
  "log",
  "starling-insertion",
  "starling-runtime",
+ "wayland-client",
+ "wayland-scanner",
  "windows-sys 0.59.0",
  "x11rb",
 ]

@@ -2,7 +2,8 @@
 //! `runtime`). The host wires it with
 //! `RuntimeConfig::with_delivery_adapter`.
 //!
-//! - `prepare` only parses the ref and requires its backend; the binding
+//! - `prepare` only parses the ref and requires its backend, refusing a
+//!   backend that cannot verify targets (Wayland); the binding
 //!   target check happens inside `insert`, immediately before typing. The
 //!   compare token is a digest of the ref, so a token/ref mismatch
 //!   conflicts at apply without a live check.
@@ -45,6 +46,9 @@ impl InsertionDeliveryAdapter {
             .inserter
             .backend_for(&snapshot)
             .ok_or("no_backend_for_ref")?;
+        if !backend.verifies_target() {
+            return Err("unverifiable_target");
+        }
         Ok((snapshot, backend))
     }
 }
@@ -147,6 +151,20 @@ mod tests {
         // No X11 backend in this session, and garbage.
         assert!(adapter.prepare("x11:1:2:3").is_err());
         assert!(adapter.prepare("not-a-ref").is_err());
+    }
+
+    #[test]
+    fn prepare_refuses_a_backend_that_cannot_verify_its_targets() {
+        let (fake, adapter) = session();
+        let target = fake.capture().unwrap();
+        fake.set_verifies_target(false);
+        let refused = adapter.prepare(&target.target_ref).unwrap_err();
+        assert!(refused.contains("unverifiable_target"), "{refused}");
+        assert_eq!(
+            failure_reason(adapter.insert("d1", &target.target_ref, "hello")),
+            "unverifiable_target"
+        );
+        assert!(fake.insertions().is_empty());
     }
 
     #[test]

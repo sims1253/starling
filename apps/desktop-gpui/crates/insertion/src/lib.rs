@@ -25,8 +25,13 @@
 //!
 //! A [`TargetSnapshot`]'s identity is its `target_ref`, a
 //! process-independent safeToken string (`x11:<active>:<focus>[:<pid>]`,
-//! `win:<hwnd>:<focus>:<pid>`, `fake:...`; ids in hex), so the runtime
-//! host can revalidate a ref the app captured.
+//! `win:<hwnd>:<focus>:<pid>`, `wl:<capture>:0`, `fake:...`; ids in hex),
+//! so the runtime host can revalidate a ref the app captured.
+//!
+//! A backend whose protocol cannot identify the focused target (Wayland)
+//! reports [`InsertionBackend::verifies_target`] `false`: its refs carry
+//! no identity and its `revalidate` cannot see a change, so callers must
+//! gate on it.
 
 use std::fmt;
 use std::time::{Duration, Instant};
@@ -37,6 +42,8 @@ pub mod runtime;
 pub mod testing;
 #[cfg(windows)]
 pub mod windows;
+#[cfg(target_os = "linux")]
+pub mod wayland;
 #[cfg(target_os = "linux")]
 pub mod x11;
 
@@ -51,6 +58,8 @@ const MODIFIER_POLL_INTERVAL: Duration = Duration::from_millis(20);
 pub enum BackendKind {
     X11,
     Windows,
+    /// Wayland's virtual keyboard: no target identity.
+    Wayland,
     /// The scripted test double (feature `test-doubles`).
     Fake,
 }
@@ -61,12 +70,18 @@ impl BackendKind {
         match self {
             BackendKind::X11 => "x11",
             BackendKind::Windows => "win",
+            BackendKind::Wayland => "wl",
             BackendKind::Fake => "fake",
         }
     }
 
     fn from_scheme(scheme: &str) -> Option<Self> {
-        [BackendKind::X11, BackendKind::Windows, BackendKind::Fake]
+        [
+            BackendKind::X11,
+            BackendKind::Windows,
+            BackendKind::Wayland,
+            BackendKind::Fake,
+        ]
             .into_iter()
             .find(|kind| kind.scheme() == scheme)
     }
@@ -247,6 +262,13 @@ impl std::error::Error for InsertError {}
 /// delivery actor, which has no async runtime.
 pub trait InsertionBackend: Send + Sync {
     fn kind(&self) -> BackendKind;
+    /// Whether `capture` identifies the target and `revalidate` can see
+    /// it change. `false` (Wayland) means a ref only says "whatever is
+    /// focused when the keys arrive"; callers must not present such a
+    /// delivery as checked.
+    fn verifies_target(&self) -> bool {
+        true
+    }
     /// `Err(InsertError::Unavailable)` when this backend cannot run in the
     /// current session. Never touches a target.
     fn availability(&self) -> Result<(), InsertError>;
@@ -285,8 +307,10 @@ impl Inserter {
     /// app.
     pub fn with_excluded_pids(excluded: Vec<u32>) -> Inserter {
         #[cfg(target_os = "linux")]
-        let backends: Vec<Box<dyn InsertionBackend>> =
-            vec![Box::new(x11::X11Backend::with_excluded_pids(excluded))];
+        let backends: Vec<Box<dyn InsertionBackend>> = vec![
+            Box::new(x11::X11Backend::with_excluded_pids(excluded.clone())),
+            Box::new(wayland::WaylandBackend::with_excluded_pids(excluded)),
+        ];
         #[cfg(windows)]
         let backends: Vec<Box<dyn InsertionBackend>> = vec![Box::new(
             windows::WindowsBackend::with_excluded_pids(excluded),
@@ -318,6 +342,13 @@ impl Inserter {
         Err(first_blocker.unwrap_or(InsertError::Unavailable {
             reason: "no insertion backend exists for this platform".to_string(),
         }))
+    }
+
+    /// Whether the backend serving `target` can verify it (see
+    /// [`InsertionBackend::verifies_target`]); `false` without one.
+    pub fn verifies(&self, target: &TargetSnapshot) -> bool {
+        self.backend_for(target)
+            .is_some_and(|backend| backend.verifies_target())
     }
 
     pub fn backend_for(&self, target: &TargetSnapshot) -> Option<&dyn InsertionBackend> {
@@ -356,6 +387,9 @@ impl Inserter {
 impl<T: InsertionBackend + ?Sized> InsertionBackend for std::sync::Arc<T> {
     fn kind(&self) -> BackendKind {
         (**self).kind()
+    }
+    fn verifies_target(&self) -> bool {
+        (**self).verifies_target()
     }
     fn availability(&self) -> Result<(), InsertError> {
         (**self).availability()
@@ -609,6 +643,7 @@ mod tests {
             (BackendKind::X11, 0x600001, 0x600002, Some(4213)),
             (BackendKind::Windows, 0x00060418, 0x00090c2e, Some(8)),
             (BackendKind::Fake, 1, 1, None),
+            (BackendKind::Wayland, 3, 0, None),
             (BackendKind::X11, u32::MAX, 1, None),
         ] {
             let reference = format_ref(kind, active, focus, pid);
