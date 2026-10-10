@@ -9,7 +9,10 @@
 //! can never both run it. Settling the claimed attempt
 //! ([`StoreV2::finish_attempt`]) ends the intent in the same transaction,
 //! completed or failed: a failure is recorded with the take, and a retry
-//! is the user's explicit choice.
+//! is the user's explicit choice. A request made while the take is
+//! claimed ([`StoreV2::request_transcription`]) is not folded into the
+//! running attempt: settling that attempt leaves the intent unclaimed and
+//! due again, so the newer request is transcribed in its own right.
 //!
 //! A claimant that dies leaves its attempt `started` with its in-flight
 //! marker released (#213). The next claim finds that attempt unowned,
@@ -58,6 +61,7 @@ impl StoreV2 {
         backend: &str,
         options_json: Option<&str>,
     ) -> Result<TranscriptionClaim, StoreV2Error> {
+        self.refuse_open_transaction("claim a transcription")?;
         let claimed = self.claim_in_transaction(capture_id, backend, options_json);
         if !self.conn.is_autocommit() {
             if let Err(err) = self.conn.execute_batch("ROLLBACK") {
@@ -170,7 +174,10 @@ impl StoreV2 {
         )
         .and_then(|()| {
             tx.execute(
-                "UPDATE transcription_intents SET attempt_id = ?1 WHERE capture_id = ?2",
+                // The claim answers every request made so far, a re-request
+                // a dead claimant left pending included.
+                "UPDATE transcription_intents SET attempt_id = ?1, rerequested_utc = NULL
+                 WHERE capture_id = ?2",
                 params![attempt_id, capture_id],
             )
             .map(|_| ())
@@ -196,14 +203,17 @@ impl StoreV2 {
 
     /// Settles attempt `attempt_id` — exactly that one, whichever other
     /// attempts its capture has in flight — and ends the capture's
-    /// transcription intent if this attempt held it, in one transaction.
-    /// [`StoreV2Error::NotFound`] when the attempt is gone (its capture
-    /// was deleted) or no longer in flight.
+    /// transcription intent if this attempt held it, in one transaction —
+    /// unless the take was asked for again while this attempt ran: then
+    /// the intent is left unclaimed and due. [`StoreV2Error::NotFound`]
+    /// when the attempt is gone (its capture was deleted) or no longer in
+    /// flight.
     pub fn finish_attempt(
         &mut self,
         attempt_id: &str,
         outcome: RecognitionOutcome<'_>,
     ) -> Result<(), StoreV2Error> {
+        self.refuse_open_transaction("settle a recognition attempt")?;
         let settled = self.finish_attempt_in_transaction(attempt_id, outcome);
         if !self.conn.is_autocommit() {
             if let Err(err) = self.conn.execute_batch("ROLLBACK") {
@@ -244,7 +254,14 @@ impl StoreV2 {
             return Err(StoreV2Error::NotFound(attempt_id.to_string()));
         }
         tx.execute(
-            "DELETE FROM transcription_intents WHERE attempt_id = ?1",
+            "DELETE FROM transcription_intents
+             WHERE attempt_id = ?1 AND rerequested_utc IS NULL",
+            params![attempt_id],
+        )?;
+        tx.execute(
+            "UPDATE transcription_intents
+             SET attempt_id = NULL, requested_utc = rerequested_utc, rerequested_utc = NULL
+             WHERE attempt_id = ?1",
             params![attempt_id],
         )?;
         tx.commit()?;
@@ -326,14 +343,20 @@ impl StoreV2 {
     /// Records the intent to transcribe an already stored capture (an
     /// import, or a take stored before it could be asked for): what a
     /// commit with [`super::TakeMeta::transcribe`] does in its own
-    /// transaction. A capture that has an intent keeps it.
+    /// transaction. A capture whose intent nobody has claimed yet keeps
+    /// it (asking twice is one transcription); one asked for again while
+    /// an attempt holds it is transcribed again once that attempt settles.
+    /// Any stored take may be asked for, an interrupted one included: its
+    /// audio is what was kept, and transcribing it is the asker's call.
     pub fn request_transcription(&mut self, capture_id: &str) -> Result<(), StoreV2Error> {
         if self.get_capture(capture_id)?.is_none() {
             return Err(StoreV2Error::NotFound(capture_id.to_string()));
         }
         self.conn.execute(
             "INSERT INTO transcription_intents(capture_id, requested_utc) VALUES (?1, ?2)
-             ON CONFLICT(capture_id) DO NOTHING",
+             ON CONFLICT(capture_id) DO UPDATE
+             SET rerequested_utc = COALESCE(rerequested_utc, excluded.requested_utc)
+             WHERE attempt_id IS NOT NULL",
             params![capture_id, now_iso()],
         )?;
         Ok(())
@@ -378,6 +401,21 @@ impl StoreV2 {
             }
         }
         Ok(false)
+    }
+}
+
+impl StoreV2 {
+    /// Refuses `what` on a connection a caller holds a transaction on: the
+    /// claim and the settle each run their own top-level transaction, whose
+    /// commit (or failure-path ROLLBACK) would otherwise end the caller's.
+    fn refuse_open_transaction(&self, what: &str) -> Result<(), StoreV2Error> {
+        if self.conn.is_autocommit() {
+            Ok(())
+        } else {
+            Err(StoreV2Error::Invalid(format!(
+                "cannot {what} inside an open transaction"
+            )))
+        }
     }
 }
 

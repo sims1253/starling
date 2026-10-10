@@ -241,6 +241,59 @@ fn an_import_can_ask_for_its_transcription_after_it_is_stored() {
 }
 
 #[test]
+fn a_request_made_while_an_attempt_runs_outlives_that_attempt() {
+    let dir = TempDir::new().expect("tempdir");
+    let mut store = store_in(&dir);
+    let id = stored(&mut store, false, CommitMark::Complete);
+    store.request_transcription(&id).expect("request");
+    let first = claimed(store.claim_transcription(&id, "engine:first", None).unwrap());
+    store.request_transcription(&id).expect("asked again while claimed");
+    store.request_transcription(&id).expect("and once more: still one more");
+    assert!(
+        store.transcriptions_due(std::time::Duration::ZERO).unwrap().is_empty(),
+        "the running attempt still holds the take"
+    );
+    store
+        .finish_attempt_transcript(&first, &transcript("first"))
+        .unwrap();
+    assert!(store.transcription_wanted(&id).unwrap(), "the newer request stays");
+    assert_eq!(store.transcriptions_due(std::time::Duration::ZERO).unwrap(), vec![id.clone()]);
+    let second = claimed(store.claim_transcription(&id, "engine:second", None).unwrap());
+    assert_ne!(first, second);
+    store
+        .finish_attempt_transcript(&second, &transcript("second"))
+        .unwrap();
+    assert!(!store.transcription_wanted(&id).unwrap(), "both requests are answered");
+    assert_eq!(
+        store.claim_transcription(&id, "engine:third", None).unwrap(),
+        TranscriptionClaim::NotWanted
+    );
+}
+
+#[test]
+fn a_claim_and_a_settle_refuse_to_run_inside_a_callers_transaction() {
+    let dir = TempDir::new().expect("tempdir");
+    let mut store = store_in(&dir);
+    let id = stored(&mut store, true, CommitMark::Complete);
+    let attempt = claimed(store.claim_transcription(&id, "engine:test", None).unwrap());
+    store.conn.execute_batch("BEGIN").unwrap();
+    assert!(matches!(
+        store.claim_transcription(&id, "engine:test", None),
+        Err(StoreV2Error::Invalid(_))
+    ));
+    assert!(matches!(
+        store.finish_attempt_transcript(&attempt, &transcript("done")),
+        Err(StoreV2Error::Invalid(_))
+    ));
+    assert!(!store.conn.is_autocommit(), "the caller's transaction is left open");
+    store.conn.execute_batch("ROLLBACK").unwrap();
+    store
+        .finish_attempt_transcript(&attempt, &transcript("done"))
+        .expect("settles once the caller is done");
+    assert!(!store.transcription_wanted(&id).unwrap());
+}
+
+#[test]
 fn a_recheck_leaves_intents_younger_than_it_asks_for() {
     let dir = TempDir::new().expect("tempdir");
     let mut store = store_in(&dir);

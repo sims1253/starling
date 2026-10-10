@@ -260,8 +260,9 @@ struct Job {
     req: Option<String>,
     /// The audio hold a request takes when the host accepts it: the take
     /// is kept from every process's upkeep until its attempt starts, even
-    /// once the window that asked is gone.
-    hold: Option<String>,
+    /// once the window that asked is gone. Released wherever the job ends,
+    /// run or dropped unrun.
+    hold: Option<HeldAudio>,
     /// Who the result is for: the take's owner or the requester.
     owner: Option<Arc<ConnState>>,
     source: Source,
@@ -379,7 +380,10 @@ impl Coordinator {
                     return;
                 }
                 let hold = match self.jobs.store().hold_audio(&stored_id) {
-                    Ok(hold) => Some(hold),
+                    Ok(hold) => Some(HeldAudio {
+                        store: Arc::clone(&self.jobs.store),
+                        hold,
+                    }),
                     // A take that is gone is refused when the job runs.
                     Err(StoreV2Error::NotFound(_)) => None,
                     Err(err) => {
@@ -431,7 +435,18 @@ impl Coordinator {
 
     /// A take started: bind its engine and open its live stream.
     fn take_started(&mut self, take: String, monitor: Option<Arc<dyn LiveTakeMonitor>>) {
-        let target = self.jobs.engine.as_ref().and_then(|engine| engine.bind_now());
+        let bound = match &self.jobs.engine {
+            Some(engine) => engine.bind_now(),
+            None => Err(
+                "No transcription engine is set up for Starling's recording service, so this \
+                 recording shows no live text. It is saved either way."
+                    .to_string(),
+            ),
+        };
+        let (target, unbound) = match bound {
+            Ok(target) => (Some(target), None),
+            Err(notice) => (None, Some(notice)),
+        };
         let mut state = LiveState {
             target,
             pump: None,
@@ -451,16 +466,7 @@ impl Coordinator {
                     ),
                 }
             }
-            (None, _) => self.jobs.hub.live_text(
-                &take,
-                None,
-                Some(
-                    "The built-in engine is not ready, so this recording shows no live text. It \
-                     is saved either way, and transcribed after you stop once the engine is \
-                     ready."
-                        .to_string(),
-                ),
-            ),
+            (None, _) => self.jobs.hub.live_text(&take, None, unbound),
             (Some(_), None) => {}
         }
         self.live.insert(take, state);
@@ -602,9 +608,20 @@ impl Coordinator {
             let context = self.jobs.clone();
             let link = self.link.clone();
             let token = cancel.clone();
+            // The thread takes the job from here once it runs: a thread
+            // that cannot be started leaves it to be answered.
+            let slot = Arc::new(Mutex::new(Some(job)));
+            let handed = Arc::clone(&slot);
             let spawned = std::thread::Builder::new()
                 .name(format!("starling-transcribe-{stored_id}"))
                 .spawn(move || {
+                    let taken = handed
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .take();
+                    let Some(job) = taken else {
+                        return;
+                    };
                     let stored_id = job.stored_id.clone();
                     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         context.run(job, &token)
@@ -627,8 +644,15 @@ impl Coordinator {
                 Err(err) => {
                     eprintln!(
                         "starling-runtime-host: no thread for the transcription of {stored_id} \
-                         ({err}); it is retried later"
+                         ({err})"
                     );
+                    let job = slot
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .take();
+                    if let Some(job) = job {
+                        self.jobs.not_started(job, &err.to_string());
+                    }
                     return;
                 }
             }
@@ -744,6 +768,32 @@ impl JobContext {
         }
     }
 
+    /// Answers `job`, which never ran: its requester, or the window its
+    /// take was recorded in, hears that it did not start, and its audio
+    /// hold goes with it. A stored intent is untouched (nothing claimed
+    /// it), so the take stays due for the next look.
+    fn not_started(&self, job: Job, reason: &str) {
+        let message = match &job.source {
+            Source::Request(_) => format!(
+                "The transcription could not be started ({reason}). The recording is unchanged."
+            ),
+            Source::Take { .. } => format!(
+                "The transcription could not be started ({reason}); the recording is saved and \
+                 transcribed when Starling next looks for waiting recordings."
+            ),
+            // Asked for because it waits: it still does.
+            Source::Due => return,
+        };
+        self.publish(
+            &job.stored_id,
+            job.take.as_deref(),
+            job.req.as_deref(),
+            None,
+            TranscriptionState::Refused { message },
+            job.owner.as_ref(),
+        );
+    }
+
     /// Runs `job`; its last frame comes back to be published once the job
     /// is retired (a client that hears it may ask again at once).
     fn run(&self, job: Job, cancel: &CancelToken) -> Option<FinalFrame> {
@@ -792,11 +842,9 @@ impl JobContext {
         } = job;
         // Released however the job ends: past this point its attempt (or
         // nothing at all) holds the audio.
-        let _hold = hold.map(|hold| HeldAudio {
-            store: Arc::clone(&self.store),
-            hold,
-        });
+        let _hold = hold;
         let retry = matches!(source, Source::Request(_));
+        let own_take = matches!(source, Source::Take { .. });
         // What the job runs on, should its engine go away mid-request.
         let want = match &source {
             Source::Request(TranscribeWith::Model { model_id }) => Want::Model(model_id.clone()),
@@ -855,19 +903,19 @@ impl JobContext {
         let begun = if retry && !wanted {
             self.store()
                 .begin_recognition(&stored_id, &backend, None)
-                .map(Some)
+                .map(Ok)
         } else {
             self.store()
                 .claim_transcription(&stored_id, &backend, None)
                 .map(|claim| match claim {
-                    TranscriptionClaim::Claimed { attempt_id } => Some(attempt_id),
+                    TranscriptionClaim::Claimed { attempt_id } => Ok(attempt_id),
                     // Transcribed already, or another claimant has it.
-                    TranscriptionClaim::NotWanted | TranscriptionClaim::Held => None,
+                    other => Err(other),
                 })
         };
         let attempt = match begun {
-            Ok(Some(attempt)) => attempt,
-            Ok(None) if retry => {
+            Ok(Ok(attempt)) => attempt,
+            Ok(Err(_)) if retry => {
                 publish(
                     None,
                     TranscriptionState::Refused {
@@ -876,7 +924,26 @@ impl JobContext {
                 );
                 return;
             }
-            Ok(None) => return,
+            // The window that recorded the take waits for its end: one
+            // that has nothing to run still says so (the take was deleted
+            // while its job was queued, or stored without the intent).
+            Ok(Err(claim)) if own_take => {
+                let gone = matches!(self.store().get_capture(&stored_id), Ok(None));
+                let state = match claim {
+                    _ if gone => TranscriptionState::Gone,
+                    TranscriptionClaim::Held => TranscriptionState::Refused {
+                        message: "This recording is being transcribed already.".to_string(),
+                    },
+                    _ => TranscriptionState::Refused {
+                        message: "This recording has nothing waiting to be transcribed; retry \
+                                  it to transcribe it."
+                            .to_string(),
+                    },
+                };
+                publish(None, state);
+                return;
+            }
+            Ok(Err(_)) => return,
             Err(StoreV2Error::NotFound(_)) => {
                 publish(None, TranscriptionState::Gone);
                 return;
@@ -1080,6 +1147,120 @@ pub fn request_timeout_ms(wav_bytes: usize) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use starling_dictation::store_v2::{CommitMark, TakeMeta};
+
+    fn context(root: &std::path::Path) -> JobContext {
+        JobContext {
+            store: Arc::new(Mutex::new(StoreV2::open(root).expect("store"))),
+            engine: None,
+            engine_wait: Duration::ZERO,
+            hub: TakeHub::new(Duration::from_secs(60)),
+        }
+    }
+
+    fn stored(context: &JobContext, transcribe: bool) -> String {
+        let mut store = context.store();
+        let mut meta = TakeMeta::for_device("test");
+        meta.transcribe = transcribe;
+        let mut take = store.begin_take(meta).expect("begin");
+        take.append_and_seal(&vec![0.1f32; 16_000]).expect("append");
+        take.finalize()
+            .expect("finalize")
+            .commit_marked(&mut store, CommitMark::Complete)
+            .expect("commit")
+            .record
+            .id
+    }
+
+    fn own_take_job(stored_id: &str, owner: &Arc<ConnState>) -> Job {
+        Job {
+            stored_id: stored_id.to_string(),
+            take: Some("take-1".to_string()),
+            req: None,
+            hold: None,
+            owner: Some(Arc::clone(owner)),
+            source: Source::Take {
+                target: None,
+                stream: None,
+            },
+        }
+    }
+
+    fn compressible(context: &JobContext, stored_id: &str) -> bool {
+        context
+            .store()
+            .compression_candidates(usize::MAX)
+            .expect("candidates")
+            .iter()
+            .any(|job| job.id == stored_id)
+    }
+
+    /// The window that recorded a take waits for its end; a job with
+    /// nothing to claim still ends it.
+    #[test]
+    fn a_take_job_with_nothing_to_claim_still_ends_the_wait() {
+        let root = tempfile::tempdir().unwrap();
+        let context = context(root.path());
+        let (owner, _inbound) = ConnState::for_test(16);
+
+        let unwanted = stored(&context, false);
+        let last = context
+            .run(own_take_job(&unwanted, &owner), &CancelToken::new())
+            .expect("a final frame");
+        assert!(
+            matches!(&last.state, TranscriptionState::Refused { .. }),
+            "{:?}",
+            last.state
+        );
+
+        // Deleted while its job was queued: the cascade took the intent.
+        let deleted = stored(&context, true);
+        context.store().delete_capture(&deleted).expect("delete");
+        let last = context
+            .run(own_take_job(&deleted, &owner), &CancelToken::new())
+            .expect("a final frame");
+        assert_eq!(last.state, TranscriptionState::Gone);
+    }
+
+    /// A request whose job never started is answered, and its audio hold
+    /// goes with it.
+    #[test]
+    fn a_request_that_cannot_start_is_answered_and_lets_its_audio_go() {
+        let root = tempfile::tempdir().unwrap();
+        let context = context(root.path());
+        let stored_id = stored(&context, false);
+        let hold = context.store().hold_audio(&stored_id).expect("hold");
+        assert!(!compressible(&context, &stored_id), "held");
+        let (requester, inbound) = ConnState::for_test(16);
+        context.not_started(
+            Job {
+                stored_id: stored_id.clone(),
+                take: None,
+                req: Some("r_1".to_string()),
+                hold: Some(HeldAudio {
+                    store: Arc::clone(&context.store),
+                    hold,
+                }),
+                owner: Some(Arc::clone(&requester)),
+                source: Source::Request(TranscribeWith::Current),
+            },
+            "no threads left",
+        );
+        let frame = inbound.try_recv().expect("the requester hears it");
+        assert!(
+            matches!(
+                &frame,
+                crate::frame::Frame::Transcription {
+                    req: Some(req),
+                    yours: true,
+                    state: TranscriptionState::Refused { message },
+                    ..
+                } if req == "r_1" && message.contains("unchanged")
+            ),
+            "{frame:?}"
+        );
+        assert!(compressible(&context, &stored_id), "the hold is released");
+    }
 
     #[test]
     fn long_takes_get_a_longer_but_bounded_request_timeout() {

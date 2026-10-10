@@ -330,7 +330,8 @@ CREATE TABLE IF NOT EXISTS journal_supersessions (
 CREATE TABLE IF NOT EXISTS transcription_intents (
     capture_id    TEXT PRIMARY KEY REFERENCES captures(id) ON DELETE CASCADE,
     requested_utc TEXT NOT NULL,
-    attempt_id    TEXT
+    attempt_id    TEXT,
+    rerequested_utc TEXT
 );
 CREATE TABLE IF NOT EXISTS audio_holds (
     id          TEXT PRIMARY KEY,

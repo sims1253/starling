@@ -500,16 +500,31 @@ impl EngineHost {
 
     /// The target a take starting now binds to (#363), when something
     /// serves now: a lease on the ready engine, or the manual server.
-    /// `None` when nothing does yet (the take records anyway; its
-    /// transcription waits for an engine, [`Self::wait_target`]).
-    pub fn bind_now(&self) -> Option<Target> {
+    /// When nothing does (the take records anyway; its transcription
+    /// waits for an engine, [`Self::wait_target`]) the error is the
+    /// recording window's notice: what serves no live text, and why.
+    pub fn bind_now(&self) -> Result<Target, String> {
         match &*lock(&self.state) {
             EngineState::Builtin {
                 manager, in_flight, ..
             } => manager
                 .lease()
-                .map(|lease| Target::from_lease(lease, in_flight)),
-            EngineState::Manual { endpoint, model } => Target::manual(endpoint, model).ok(),
+                .map(|lease| Target::from_lease(lease, in_flight))
+                .ok_or_else(|| {
+                    "The built-in engine is not ready, so this recording shows no live text. It \
+                     is saved either way, and transcribed after you stop once the engine is \
+                     ready."
+                        .to_string()
+                }),
+            EngineState::Manual { endpoint, model } => {
+                Target::manual(endpoint, model).map_err(|err| {
+                    format!(
+                        "Your server's endpoint in Settings is not usable ({err}), so this \
+                         recording shows no live text. It is saved either way; fix the endpoint \
+                         and retry it."
+                    )
+                })
+            }
         }
     }
 
@@ -1450,6 +1465,11 @@ mod tests {
         )
         .expect("manual mode attaches");
         assert_eq!(host.label(), "unconfigured");
+        // A take started now hears that its server is the problem, not a
+        // built-in engine the user did not choose.
+        let notice = host.bind_now().err().expect("nothing serves");
+        assert!(notice.contains("Your server's endpoint"), "{notice}");
+        assert!(!notice.contains("built-in"), "{notice}");
 
         // The follow path keeps the same honesty: another unusable
         // endpoint (a scheme the client rejects) stays unconfigured.
