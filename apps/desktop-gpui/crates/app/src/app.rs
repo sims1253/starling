@@ -26,14 +26,13 @@ use starling_dictation::{
     recorder::RecorderHandle,
     settings::{
         ActivationMode, DictationSettings, EngineMode, EngineSettings, FeedbackSettings,
-        InsertionSettings, MicrophoneSettings, OverlayMode, PlaybackMode, PlaybackSettings,
-        ProcessingSettings, Settings, DEFAULT_SHORTCUT,
+        InsertionSettings, LivePreviewSettings, MicrophoneSettings, OverlayMode, PlaybackMode,
+        PlaybackSettings, ProcessingSettings, Settings, DEFAULT_SHORTCUT,
     },
     storage::{DamagedRecord, ListedRecord, SessionSummary},
 };
 
 use crate::{input::TextField, store::Store, theme, upload::refresh_sessions, views};
-use crate::live_stream::LiveStream;
 use crate::processing::{self, Providers, TakeProcessing};
 use starling_processing::staging::Draft;
 use starling_processing::CancelToken;
@@ -541,7 +540,14 @@ pub struct StarlingApp {
     pub playback_generation: u64,
 
     pub recorder: Option<RecorderHandle>,
-    pub(crate) live_stream: Option<LiveStream>,
+    /// The take's live stream worker (#357) and its generation, which
+    /// previews still arriving from an earlier take's worker do not match.
+    pub(crate) stream_pump: Option<crate::stream_pump::StreamPump<crate::live_stream::LiveStream>>,
+    pub(crate) stream_generation: u64,
+    pub(crate) stream_trace: Option<std::sync::Arc<crate::stream_pump::StreamTrace>>,
+    /// The preview cadence takes ask `/stream` for (#357).
+    pub(crate) live_preview: LivePreviewSettings,
+    pub(crate) draft_live_preview: LivePreviewSettings,
     /// The live line a direct-mode take shows while recording.
     pub(crate) live_partial: String,
     /// The staging panel (#297) and stagings whose transcript is still
@@ -553,8 +559,6 @@ pub struct StarlingApp {
     /// The latest request wins: retiring a panel asks for the root, and
     /// the panel that replaces it in the same frame asks for its editor.
     pub(crate) pending_focus: Option<PendingFocus>,
-    pub(crate) streamed_samples: Vec<f32>,
-    pub(crate) stream_sent_samples: usize,
     /// Set when live streaming died mid-recording: the partial view going
     /// quiet must be explainable, so the stop path folds this into the
     /// capture warning shown beside the saved take.
@@ -1138,14 +1142,16 @@ impl StarlingApp {
             playing_id: None,
             playback_generation: 0,
             recorder: None,
-            live_stream: None,
+            stream_pump: None,
+            stream_generation: 0,
+            stream_trace: None,
+            live_preview: settings.live_preview,
+            draft_live_preview: settings.live_preview,
             live_partial: String::new(),
             staging: None,
             background_stagings: Vec::new(),
             next_staging_token: 0,
             pending_focus: None,
-            streamed_samples: Vec::new(),
-            stream_sent_samples: 0,
             stream_degradation: None,
             levels: vec![0.06; 52],
             elapsed_ms: 0.0,
@@ -1347,6 +1353,7 @@ impl StarlingApp {
             feedback: self.feedback,
             storage: self.audio_upkeep.settings,
             insertion: self.delivery.settings,
+            live_preview: self.live_preview,
         };
         settings.set_expected_terms_input(&self.expected_terms_input);
         settings
@@ -1738,6 +1745,7 @@ impl StarlingApp {
         self.draft_double_tap = self.dictation_settings.double_tap_hands_free;
         self.dictation_draft_error = None;
         self.draft_playback_mode = self.playback_settings.during_recording;
+        self.draft_live_preview = self.live_preview;
         self.draft_lower_level.update(cx, |slider, cx| {
             slider.set_value(self.playback_settings.lower_level_percent, cx);
         });
@@ -1965,6 +1973,7 @@ impl StarlingApp {
             .set_config(crate::activation::ActivationConfig::from_settings(&self.dictation_settings));
 
         // Applies from the next take on.
+        self.live_preview = self.draft_live_preview;
         self.playback_settings = PlaybackSettings {
             during_recording: self.draft_playback_mode,
             lower_level_percent: self.draft_lower_level.read(cx).value(),
@@ -2542,73 +2551,7 @@ impl Render for StarlingApp {
 
         // The overlay is placed in this window's scale (#221).
         self.overlay.scale = window.scale_factor();
-        let mut staged_partial = None;
         if let Some(handle) = self.recorder.as_mut() {
-            if let Some(stream) = self.live_stream.as_ref() {
-                let mut stream_failed = false;
-                for chunk in handle.drain_chunks() {
-                    self.streamed_samples.extend(chunk);
-                }
-                let quantum = crate::live_stream::exact_input_quantum(handle.sample_rate());
-                let acknowledged = (handle.acknowledged_samples() as usize)
-                    .min(self.streamed_samples.len()) / quantum * quantum;
-                // Bound each frame's encode to ~250 ms of audio (~sub-
-                // millisecond of encode work). In steady state the delta
-                // is a few frames' worth, but a stall (an occluded window
-                // pausing renders, a slow journal flush) can accumulate a
-                // large acknowledged span; catching up in a single frame
-                // would encode that span on the UI thread. The residue
-                // goes out on later frames, and the stop path sends
-                // whatever is still unsent.
-                let per_frame_cap =
-                    (handle.sample_rate() as usize).max(1) / 4 / quantum * quantum;
-                let target = acknowledged.min(self.stream_sent_samples + per_frame_cap);
-                if target > self.stream_sent_samples {
-                    if let Ok(wav) = starling_dictation::audio::encode_wav_16k_parts(
-                        &self.streamed_samples[self.stream_sent_samples..target],
-                        handle.sample_rate(), 1
-                    ) {
-                        if stream.send_audio(wav) {
-                            self.stream_sent_samples = target;
-                        } else if stream.is_closed() {
-                            self.stream_degradation = Some(
-                                "Live transcription stopped mid-recording (stream closed). \
-                                 The full recording will still be transcribed after you stop."
-                                    .to_string(),
-                            );
-                            stream_failed = true;
-                        }
-                        // else: the bounded command channel is momentarily
-                        // full — backpressure, not death. The unsent span
-                        // stays and the next frame retries it.
-                    } else {
-                        self.stream_degradation = Some(
-                            "Live transcription stopped mid-recording (audio could not be \
-                             encoded for streaming). The full recording will still be \
-                             transcribed after you stop."
-                                .to_string(),
-                        );
-                        stream_failed = true;
-                    }
-                }
-                match stream.poll_partial() {
-                    Ok(Some(partial)) if self.staging.is_some() => {
-                        staged_partial = Some(partial);
-                    }
-                    Ok(Some(partial)) => self.live_partial = partial.text,
-                    Err(reason) => {
-                        self.stream_degradation = Some(format!(
-                            "Live transcription stopped mid-recording ({reason}). The full \
-                             recording will still be transcribed after you stop."
-                        ));
-                        stream_failed = true;
-                    }
-                    Ok(None) => {}
-                }
-                if stream_failed {
-                    self.live_stream = None;
-                }
-            }
             let window_samples = handle.latest_window(1024);
             let magnitudes = fft::magnitude_spectrum(&window_samples);
             self.levels = fft::waveform_levels(&magnitudes, 52);
@@ -2616,9 +2559,6 @@ impl Render for StarlingApp {
             window.request_animation_frame();
         }
         self.tick_mic_check(window);
-        if let Some(partial) = staged_partial {
-            self.staging_partial(partial, cx);
-        }
 
         match self.pending_focus.take() {
             Some(PendingFocus::Staging) => match self.staging.as_ref() {

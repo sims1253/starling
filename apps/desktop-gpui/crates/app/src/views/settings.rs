@@ -40,6 +40,7 @@ pub fn render_settings_modal(
     let dictation_section = render_dictation_section(app, cx);
     let playback_section = render_playback_section(app, cx);
     let feedback_section = crate::views::feedback::render_feedback_section(app, cx);
+    let live_preview_section = crate::views::live_preview::render_live_preview_section(app, cx);
     let storage_section = crate::views::storage::render_storage_section(app, cx);
     let insertion_section = crate::views::delivery::render_insertion_section(app, cx);
 
@@ -174,6 +175,7 @@ pub fn render_settings_modal(
         .child(microphone_section)
         .child(playback_section)
         .child(feedback_section)
+        .child(live_preview_section)
         .child(storage_section)
         .child(insertion_section)
         .child(processing_section)
@@ -1332,14 +1334,14 @@ pub(super) fn choice_row(
         )
 }
 
-pub(super) fn helper(text: &'static str) -> Div {
+pub(super) fn helper(text: impl Into<SharedString>) -> Div {
     div()
         .mt(px(2.))
         .text_size(px(10.))
         .font_weight(FontWeight::NORMAL)
         .line_height(px(10. * 1.5))
         .text_color(theme::SETTINGS_HELPER)
-        .child(text)
+        .child(text.into())
 }
 
 #[cfg(test)]

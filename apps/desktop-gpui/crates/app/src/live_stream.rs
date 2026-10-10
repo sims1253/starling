@@ -1,4 +1,5 @@
 //! Recording-scoped WebSocket client for the native /stream protocol.
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
@@ -6,6 +7,8 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
 use starling_dictation::storage::{TranscriptionResult, TranscriptionSegment};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
+
+use crate::stream_pump::{StreamClient, StreamTrace};
 
 enum Command {
     Audio(Vec<u8>),
@@ -15,12 +18,26 @@ enum Command {
 /// One partial: the whole running transcript and how many of its leading
 /// words the server will never change (0 from a server that predates the
 /// field, which makes the whole text one live segment).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Partial {
     pub text: String,
     /// Not clamped here (an out-of-range count saturates); the segmenter
     /// clamps it to the text's word count.
     pub stable_words: usize,
+    /// Where the audio this text reflects ends, in seconds into the take
+    /// (`trace.covered_s`); only on a traced connection.
+    pub covered_s: Option<f64>,
+}
+
+/// What a take asks `/stream` for besides audio.
+#[derive(Clone, Default)]
+pub(crate) struct StreamOptions {
+    /// The first-preview minimum and the preview interval in seconds;
+    /// `None` leaves the server's default (#357).
+    pub cadence: (Option<f64>, Option<f64>),
+    /// Asks for the server's call ledger (`trace=1`) and logs the take's
+    /// stream timeline (#226).
+    pub trace: Option<Arc<StreamTrace>>,
 }
 
 pub(crate) enum Event {
@@ -53,6 +70,28 @@ pub(crate) fn stream_url(endpoint: &str) -> Result<String, String> {
     Ok(format!("{scheme}{rest}/stream"))
 }
 
+/// [`stream_url`] with the take's query: the preview cadence and the
+/// trace switch. A server that predates a parameter ignores it.
+pub(crate) fn stream_request_url(endpoint: &str, options: &StreamOptions) -> Result<String, String> {
+    let mut query = Vec::new();
+    let (min, interval) = options.cadence;
+    if let Some(seconds) = min {
+        query.push(format!("min_partial_seconds={seconds}"));
+    }
+    if let Some(seconds) = interval {
+        query.push(format!("partial_interval_seconds={seconds}"));
+    }
+    if options.trace.is_some() {
+        query.push("trace=1".to_string());
+    }
+    let url = stream_url(endpoint)?;
+    Ok(if query.is_empty() {
+        url
+    } else {
+        format!("{url}?{}", query.join("&"))
+    })
+}
+
 /// A whole input quantum maps to a whole count of 16 kHz output samples.
 /// Cutting live WAV frames on this boundary avoids cumulative duration drift
 /// when the device runs at 44.1 kHz.
@@ -68,8 +107,9 @@ pub(crate) fn exact_input_quantum(rate: u32) -> usize {
 }
 
 impl LiveStream {
-    pub(crate) fn start(endpoint: &str) -> Result<Self, String> {
-        let url = stream_url(endpoint)?;
+    pub(crate) fn start(endpoint: &str, options: &StreamOptions) -> Result<Self, String> {
+        let url = stream_request_url(endpoint, options)?;
+        let trace = options.trace.clone();
         let (commands, mut command_rx) = tokio::sync::mpsc::channel(64);
         let (event_tx, events) = mpsc::channel();
         std::thread::spawn(move || {
@@ -110,7 +150,12 @@ impl LiveStream {
                                     // None) stays skipped: the permissive
                                     // parse above is what decides what is
                                     // fatal, not this loop.
-                                    Some(Ok(Message::Text(text))) => parse_message(text.as_ref()),
+                                    Some(Ok(Message::Text(text))) => {
+                                        if let Some(trace) = trace.as_ref() {
+                                            trace.received(text.as_ref());
+                                        }
+                                        parse_message(text.as_ref())
+                                    }
                                     Some(Ok(Message::Close(_))) | None => Some(Event::Error("Stream closed before final transcript".into())),
                                     Some(Err(err)) => Some(Event::Error(err.to_string())),
                                     _ => None,
@@ -175,6 +220,20 @@ impl LiveStream {
     }
 }
 
+impl StreamClient for LiveStream {
+    fn send_audio(&self, wav: Vec<u8>) -> bool {
+        LiveStream::send_audio(self, wav)
+    }
+
+    fn is_closed(&self) -> bool {
+        LiveStream::is_closed(self)
+    }
+
+    fn poll_partial(&self) -> Result<Option<Partial>, String> {
+        LiveStream::poll_partial(self)
+    }
+}
+
 fn parse_message(text: &str) -> Option<Event> {
     let payload: Value = serde_json::from_str(text).ok()?;
     match payload.get("type").and_then(Value::as_str) {
@@ -192,6 +251,10 @@ fn parse_message(text: &str) -> Option<Event> {
                         .get("stable_words")
                         .and_then(Value::as_u64)
                         .map_or(0, |count| usize::try_from(count).unwrap_or(usize::MAX)),
+                    covered_s: payload
+                        .get("trace")
+                        .and_then(|trace| trace.get("covered_s"))
+                        .and_then(Value::as_f64),
                 })
             }),
         Some("error") => Some(Event::Error(
@@ -246,6 +309,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_take_query_carries_the_cadence_and_trace_only_when_set() {
+        let endpoint = "http://127.0.0.1:8181/v1";
+        assert_eq!(
+            stream_request_url(endpoint, &StreamOptions::default()).unwrap(),
+            "ws://127.0.0.1:8181/stream"
+        );
+        let fast = StreamOptions {
+            cadence: (Some(1.0), Some(0.5)),
+            trace: None,
+        };
+        assert_eq!(
+            stream_request_url(endpoint, &fast).unwrap(),
+            "ws://127.0.0.1:8181/stream?min_partial_seconds=1&partial_interval_seconds=0.5"
+        );
+        let interval_only = StreamOptions {
+            cadence: (None, Some(2.0)),
+            trace: Some(Arc::new(StreamTrace::discard())),
+        };
+        assert_eq!(
+            stream_request_url(endpoint, &interval_only).unwrap(),
+            "ws://127.0.0.1:8181/stream?partial_interval_seconds=2&trace=1"
+        );
+    }
+
+    #[test]
     fn stream_endpoint_and_final_contract() {
         assert_eq!(
             stream_url("https://starling.local:8181").unwrap(),
@@ -264,13 +352,18 @@ mod tests {
                 partial,
                 Partial {
                     text: "a b c".into(),
-                    stable_words: 2
+                    stable_words: 2,
+                    covered_s: None,
                 }
             ),
             _ => panic!("expected partial"),
         }
         match parse_message(r#"{"type":"partial","text":"a b"}"#) {
             Some(Event::Partial(partial)) => assert_eq!(partial.stable_words, 0),
+            _ => panic!("expected partial"),
+        }
+        match parse_message(r#"{"type":"partial","text":"a","trace":{"covered_s":1.25}}"#) {
+            Some(Event::Partial(partial)) => assert_eq!(partial.covered_s, Some(1.25)),
             _ => panic!("expected partial"),
         }
         assert_eq!(exact_input_quantum(44_100), 441);
