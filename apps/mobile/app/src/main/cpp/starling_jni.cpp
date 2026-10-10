@@ -5,6 +5,7 @@
 // the malloc'd buffer is released here).
 #include <jni.h>
 
+#include "runtime/call_abort.hpp"
 #include "starling_ggml.h"
 
 namespace {
@@ -20,6 +21,43 @@ jstring toJString(JNIEnv* env, const char* value, bool owned) {
     starling_ggml_free_string(const_cast<char*>(value));
   }
   return result;
+}
+
+// The Java cancel predicate of one transcribeCancellable call, polled by the
+// engine at its checkpoints (call_abort.hpp) on the calling thread, so the
+// call's JNIEnv is valid. A predicate that throws counts as "keep going".
+struct JavaCancel {
+  JNIEnv* env;
+  jobject cancel;
+  jmethodID requested;
+};
+
+bool javaCancelRequested(void* user) {
+  auto* c = static_cast<JavaCancel*>(user);
+  const jboolean requested = c->env->CallBooleanMethod(c->cancel, c->requested);
+  if (c->env->ExceptionCheck()) {
+    c->env->ExceptionClear();
+    return false;
+  }
+  return requested == JNI_TRUE;
+}
+
+jstring transcribe(JNIEnv* env, jlong handle, jfloatArray samples,
+                   jint sample_rate) {
+  if (handle == 0) {
+    return nullptr;
+  }
+  const jsize length = env->GetArrayLength(samples);
+  jfloat* body = env->GetFloatArrayElements(samples, nullptr);
+  if (body == nullptr) {
+    return nullptr;
+  }
+  char* text = starling_ggml_transcribe_pcm(
+      reinterpret_cast<starling_ggml_ctx*>(handle), body, length,
+      sample_rate);
+  // The engine never mutates the buffer; skip the copy-back.
+  env->ReleaseFloatArrayElements(samples, body, JNI_ABORT);
+  return toJString(env, text, /* owned = */ true);
 }
 
 }  // namespace
@@ -45,20 +83,22 @@ Java_dev_starling_mobile_engine_StarlingNative_load(JNIEnv* env, jclass,
 extern "C" JNIEXPORT jstring JNICALL
 Java_dev_starling_mobile_engine_StarlingNative_transcribe(
     JNIEnv* env, jclass, jlong handle, jfloatArray samples, jint sample_rate) {
-  if (handle == 0) {
-    return nullptr;
+  return transcribe(env, handle, samples, sample_rate);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_dev_starling_mobile_engine_StarlingNative_transcribeCancellable(
+    JNIEnv* env, jclass, jlong handle, jfloatArray samples, jint sample_rate,
+    jobject cancel) {
+  jclass type = env->GetObjectClass(cancel);
+  jmethodID requested = env->GetMethodID(type, "requested", "()Z");
+  env->DeleteLocalRef(type);
+  if (requested == nullptr) {
+    return nullptr;  // NoSuchMethodError is pending for the caller.
   }
-  const jsize length = env->GetArrayLength(samples);
-  jfloat* body = env->GetFloatArrayElements(samples, nullptr);
-  if (body == nullptr) {
-    return nullptr;
-  }
-  char* text = starling_ggml_transcribe_pcm(
-      reinterpret_cast<starling_ggml_ctx*>(handle), body, length,
-      sample_rate);
-  // The engine never mutates the buffer; skip the copy-back.
-  env->ReleaseFloatArrayElements(samples, body, JNI_ABORT);
-  return toJString(env, text, /* owned = */ true);
+  JavaCancel state{env, cancel, requested};
+  starling::ggml::CallAbortScope scope(javaCancelRequested, &state);
+  return transcribe(env, handle, samples, sample_rate);
 }
 
 extern "C" JNIEXPORT void JNICALL

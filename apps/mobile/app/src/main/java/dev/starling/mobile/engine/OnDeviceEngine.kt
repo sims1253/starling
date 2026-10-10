@@ -629,12 +629,32 @@ class OnDeviceEngine(
     override fun loadedModelName(): String? = synchronized(lock) { loadedFile?.name }
 
     /** One live-stream window of 16 kHz mono samples. Blocking. */
-    override fun transcribeWindow(samples: FloatArray): OnDeviceStreamSession.WindowResult = synchronized(lock) {
+    override fun transcribeWindow(samples: FloatArray): OnDeviceStreamSession.WindowResult =
+        transcribeLive(samples, cancel = null)
+
+    /** A live-tail preview that stops at the engine's next checkpoint once [cancel] holds. Blocking. */
+    override fun transcribePreview(samples: FloatArray, cancel: () -> Boolean): OnDeviceStreamSession.WindowResult =
+        transcribeLive(samples, StarlingNative.Cancel(cancel))
+
+    private fun transcribeLive(
+        samples: FloatArray,
+        cancel: StarlingNative.Cancel?,
+    ): OnDeviceStreamSession.WindowResult = synchronized(lock) {
         usingLocked {
             ensureLoadedLocked()?.let { return OnDeviceStreamSession.WindowResult.Failed(it) }
-            val text = awake { StarlingNative.transcribe(handle, samples, ChunkStreamer.SAMPLE_RATE) }
+            val text = awake {
+                if (cancel == null) {
+                    StarlingNative.transcribe(handle, samples, ChunkStreamer.SAMPLE_RATE)
+                } else {
+                    StarlingNative.transcribeCancellable(handle, samples, ChunkStreamer.SAMPLE_RATE, cancel)
+                }
+            }
             if (text == null) {
                 val error = StarlingNative.lastError(handle)
+                // Stopped on request: nothing failed, and the model stays.
+                if (cancel != null && error == StarlingNative.CANCELLED_ERROR) {
+                    return OnDeviceStreamSession.WindowResult.Cancelled
+                }
                 error?.let(observer::engineFailed)
                 if (error != null && ModelLifetime.isDriverFailure(error)) {
                     releaseDriverFailureLocked(error)

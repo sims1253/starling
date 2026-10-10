@@ -58,6 +58,15 @@ class OnDeviceStreamSession(
         /** Transcribes one window of 16 kHz mono samples. */
         fun transcribeWindow(samples: FloatArray): WindowResult
 
+        /**
+         * Transcribes a preview of the live tail that the session may stop
+         * needing mid-call: the engine stops at its next checkpoint once
+         * [cancel] holds and answers [WindowResult.Cancelled]. An engine
+         * without checkpoints finishes the call; the session then discards
+         * a result that completed after [cancel] fired.
+         */
+        fun transcribePreview(samples: FloatArray, cancel: () -> Boolean): WindowResult = transcribeWindow(samples)
+
         /** The model a successful [prepare] pinned to this session, for the transcript's record. */
         fun loadedModelName(): String? = null
 
@@ -73,6 +82,9 @@ class OnDeviceStreamSession(
         /** [model]: the model that transcribed this window, when the engine knows it. */
         data class Text(val text: String, val model: String? = null) : WindowResult
         data class Failed(val reason: String) : WindowResult
+
+        /** A preview stopped because the session no longer needed it; not a failure. */
+        data object Cancelled : WindowResult
     }
 
     /**
@@ -102,8 +114,11 @@ class OnDeviceStreamSession(
     private var buffer = FloatArray(INITIAL_BUFFER_SAMPLES)
     private var size = 0
     private var base = 0L
+    // Volatile as well: a running preview's cancel predicate reads it unlocked.
+    @Volatile
     private var captured = 0L
     private var openBacklog: Backlog? = null
+    @Volatile
     private var inputEnded = false
     // Written under [lock]; volatile so the engine can poll it from prepare().
     @Volatile
@@ -261,13 +276,28 @@ class OnDeviceStreamSession(
         val windowModels = LinkedHashSet<String>()
         // Absolute sample index of the current snapshot's first sample, for the trace.
         var snapshotBase = 0L
+        // Whether the last step's preview was preempted (see [previewObsolete]).
+        var preempted = false
         val tx = ChunkStreamer.Transcriber { samples, start, length, kind ->
             // The snapshot is exactly the live tail, so a window that spans all
             // of it (every flush, most partials) is passed without a copy.
             val window = if (start == 0 && length == samples.size) samples else samples.copyOfRange(start, start + length)
             val t0 = clock()
-            val result = runCatching { engine.transcribeWindow(window) }
-                .getOrElse { WindowResult.Failed(it.message ?: it::class.java.simpleName) }
+            var obsolete = false
+            val result = runCatching {
+                if (kind == ChunkStreamer.CallKind.PREVIEW) {
+                    // The preview starts at the window boundary.
+                    val end = snapshotBase + start + length
+                    val windowEnd = snapshotBase + start + streamer.windowSamples
+                    engine.transcribePreview(window) { obsolete || previewObsolete(end, windowEnd).also { obsolete = it } }
+                } else {
+                    engine.transcribeWindow(window)
+                }
+            }.getOrElse { WindowResult.Failed(it.message ?: it::class.java.simpleName) }
+            // A preview that completed after it became obsolete (past the
+            // engine's last checkpoint) is discarded like a cancelled one:
+            // its audio stays buffered for the window or flush that follows.
+            val outcome = if (obsolete && result is WindowResult.Text) WindowResult.Cancelled else result
             trace?.call(
                 StreamTrace.Call(
                     kind,
@@ -275,16 +305,24 @@ class OnDeviceStreamSession(
                     length,
                     t0,
                     clock(),
-                    if (result is WindowResult.Text) StreamTrace.RESULT_OK else StreamTrace.RESULT_FAILED,
+                    when (outcome) {
+                        is WindowResult.Text -> StreamTrace.RESULT_OK
+                        is WindowResult.Failed -> StreamTrace.RESULT_FAILED
+                        WindowResult.Cancelled -> StreamTrace.RESULT_PREEMPTED
+                    },
                 ),
             )
-            when (result) {
+            when (outcome) {
                 is WindowResult.Text -> {
-                    result.model?.let(windowModels::add)
-                    result.text
+                    outcome.model?.let(windowModels::add)
+                    outcome.text
                 }
                 is WindowResult.Failed -> {
-                    windowFailure = result.reason
+                    windowFailure = outcome.reason
+                    null
+                }
+                WindowResult.Cancelled -> {
+                    preempted = true
                     null
                 }
             }
@@ -309,10 +347,25 @@ class OnDeviceStreamSession(
             }
             steppedSize = snapshotSize
             windowFailure = null
+            preempted = false
 
             if (ending) {
                 trace?.flushing((snapshotSize - streamer.boundary).toLong())
+                val tailStart = snapshotBase + streamer.boundary
                 val text = streamer.flush(snapshot, snapshotSize, tx)
+                if (streamer.flushReusedTail) {
+                    val now = clock()
+                    trace?.call(
+                        StreamTrace.Call(
+                            ChunkStreamer.CallKind.FLUSH_TAIL,
+                            tailStart,
+                            (snapshotBase + snapshotSize - tailStart).toInt(),
+                            now,
+                            now,
+                            StreamTrace.RESULT_REUSED,
+                        ),
+                    )
+                }
                 lock.withLock {
                     if (text != null) {
                         settleLocked(CommitOutcome.Final(text, windowModels.joinToString(", ").ifEmpty { model }))
@@ -340,12 +393,28 @@ class OnDeviceStreamSession(
                 events(StreamEvent.Partial(partial))
             }
             steppedSize -= trimFinalized()
-            // Throttle: a step that transcribed nothing new must not spin.
-            if (partial == null && !behind) sleepQuietly(STEP_BACKOFF_MILLIS)
+            // Throttle: a step that transcribed nothing new must not spin. A
+            // preempted preview gave way to work that is already waiting.
+            if (partial == null && !behind && !preempted) sleepQuietly(STEP_BACKOFF_MILLIS)
         }
     }
 
     private fun behindLocked(): Boolean = base + size < captured
+
+    /**
+     * Polled by the engine while a preview of the audio up to absolute sample
+     * [end] runs (on the worker thread, without the lock): true once required
+     * work is waiting behind it, so Stop and window commits never wait for a
+     * preview (#357, as the native server does since #428). That is Stop
+     * with audio the preview does not cover, a full window ending at
+     * [windowEnd] already captured, or a closed session. Stop with no newer
+     * audio lets the preview finish: it is exactly the tail the flush
+     * needs, and [ChunkStreamer.flush] reuses it.
+     */
+    private fun previewObsolete(end: Long, windowEnd: Long): Boolean {
+        val captured = captured
+        return closed || (inputEnded && captured > end) || captured >= windowEnd
+    }
 
     /**
      * Reads saved audio the buffer is missing back into it, in order, up to

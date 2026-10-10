@@ -12,7 +12,9 @@ package dev.starling.mobile.engine
  * - between windows, the live tail (at least [minSeconds] long, at most one
  *   window) is transcribed at most every [partialIntervalSeconds] for a
  *   responsive partial that is never committed;
- * - [flush] finalizes whatever remains on stop.
+ * - [flush] finalizes whatever remains on stop, reusing the last partial's
+ *   transcription when it covered exactly the remaining tail (the native
+ *   server's exact-tail reuse).
  *
  * One divergence from the server: a null from the [Transcriber] means the
  * on-device engine failed, not "busy, retry later". The session abandons the
@@ -54,6 +56,15 @@ class ChunkStreamer(
     private val maxOverlapWords: Int
     private var committed: List<String> = emptyList()
     private var lastEmit = Double.NEGATIVE_INFINITY
+
+    // The last successful preview: `samples[start until start + length]`
+    // transcribed to [text]. Valid while no window was finalized since.
+    private class Tail(var start: Int, val length: Int, val text: String)
+    private var lastTail: Tail? = null
+
+    /** Whether the last [flush] reused the last preview instead of transcribing the tail. */
+    var flushReusedTail: Boolean = false
+        private set
 
     /** Samples in one window: a buffer that holds this much always lets [catchUp] progress. */
     val windowSamples: Int
@@ -99,6 +110,7 @@ class ChunkStreamer(
             // interval; a step that merely finalized a window must not delay
             // the next partial.
             lastEmit = now
+            lastTail = Tail(boundary, tailLength, text)
             return join(ChunkedTranscription.stitchWords(committed, split(text), maxOverlapWords))
         }
         return committedText
@@ -114,13 +126,18 @@ class ChunkStreamer(
 
     /** Finalizes all remaining audio; the full text, or null when the engine failed. */
     fun flush(samples: FloatArray, size: Int, tx: Transcriber): String? {
+        flushReusedTail = false
         finalizeFullWindows(samples, size, tx, CallKind.FLUSH_WINDOW)
         val tailLength = size - boundary
         if (tailLength == 0) return join(committed)
         // A full window still in the tail means finalizeFullWindows stopped on
         // an engine failure (it never advances past a failed window).
         if (tailLength >= chunk) return null
-        val text = tx.transcribe(samples, boundary, tailLength, CallKind.FLUSH_TAIL) ?: return null
+        // The same samples (the buffer only grows at its end) through the
+        // same engine: the preview's text is what the flush would produce.
+        val reuse = lastTail?.takeIf { it.start == boundary && it.length == tailLength }
+        flushReusedTail = reuse != null
+        val text = reuse?.text ?: tx.transcribe(samples, boundary, tailLength, CallKind.FLUSH_TAIL) ?: return null
         committed = ChunkedTranscription.stitchWords(committed, split(text), maxOverlapWords)
         boundary = size
         return join(committed)
@@ -129,6 +146,10 @@ class ChunkStreamer(
     /** Shifts the boundary after [dropped] finalized samples left the front of the buffer. */
     fun rebase(dropped: Int) {
         boundary = maxOf(0, boundary - dropped)
+        lastTail?.let { tail ->
+            tail.start -= dropped
+            if (tail.start < 0) lastTail = null
+        }
     }
 
     private fun finalizeFullWindows(samples: FloatArray, size: Int, tx: Transcriber, kind: CallKind): Boolean {
@@ -137,6 +158,7 @@ class ChunkStreamer(
             val text = tx.transcribe(samples, boundary, chunk, kind) ?: break
             committed = ChunkedTranscription.stitchWords(committed, split(text), maxOverlapWords)
             boundary += advance
+            lastTail = null
             did = true
         }
         return did

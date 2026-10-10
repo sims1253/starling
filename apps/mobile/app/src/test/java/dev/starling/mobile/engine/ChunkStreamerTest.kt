@@ -1,7 +1,9 @@
 package dev.starling.mobile.engine
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
@@ -86,6 +88,79 @@ class ChunkStreamerTest {
 
         assertEquals((0 until 16).joinToString(" ") { "w$it" }, streamer.flush(samples, 70, tail))
         assertEquals(listOf(0 to 70), tail.calls)
+    }
+
+    @Test
+    fun callsAreLabelledWithTheirKind() {
+        val streamer = streamer()
+        val tx = ScriptedTranscriber(rate) { "w$it" }
+        val samples = FloatArray(300)
+        streamer.step(samples, 130, now = 0.0, tx = tx)
+        streamer.flush(samples, 250, tx)
+
+        assertEquals(
+            listOf(
+                ChunkStreamer.CallKind.WINDOW,
+                ChunkStreamer.CallKind.PREVIEW,
+                ChunkStreamer.CallKind.FLUSH_WINDOW,
+                ChunkStreamer.CallKind.FLUSH_TAIL,
+            ),
+            tx.kinds,
+        )
+    }
+
+    @Test
+    fun flushReusesAPreviewOfExactlyTheRemainingTail() {
+        val streamer = streamer()
+        val tx = ScriptedTranscriber(rate) { "w$it" }
+        val samples = FloatArray(300)
+        assertEquals("w0 w1 w2 w3", streamer.step(samples, 40, now = 0.0, tx = tx))
+
+        assertEquals("w0 w1 w2 w3", streamer.flush(samples, 40, tx))
+        assertTrue(streamer.flushReusedTail)
+        assertEquals(listOf(0 to 40), tx.calls)
+    }
+
+    @Test
+    fun newFinalSamplesAreTranscribedInsteadOfReusingThePreview() {
+        val streamer = streamer()
+        val tx = ScriptedTranscriber(rate) { "w$it" }
+        val samples = FloatArray(300)
+        streamer.step(samples, 40, now = 0.0, tx = tx)
+
+        assertEquals("w0 w1 w2 w3 w4", streamer.flush(samples, 50, tx))
+        assertFalse(streamer.flushReusedTail)
+        assertEquals(listOf(0 to 40, 0 to 50), tx.calls)
+    }
+
+    @Test
+    fun aPreviewIsNotReusedOnceAWindowWasFinalizedAfterIt() {
+        val streamer = streamer()
+        val tx = ScriptedTranscriber(rate) { "w$it" }
+        val samples = FloatArray(300)
+        // Preview [0, 30); the flush finalizes [0, 120) and its tail [90, 120)
+        // has the old preview's length but different audio.
+        streamer.step(samples, 30, now = 0.0, tx = tx)
+        streamer.flush(samples, 120, tx)
+
+        assertFalse(streamer.flushReusedTail)
+        assertEquals(listOf(0 to 30, 0 to 120, 90 to 30), tx.calls)
+    }
+
+    @Test
+    fun aRebasedPreviewOfTheTailIsStillReused() {
+        val streamer = streamer()
+        val tx = ScriptedTranscriber(rate) { "w$it" }
+        val samples = FloatArray(300)
+        // Window [0, 120) finalizes and the tail [90, 130) is previewed; the
+        // owner then drops the 90 finalized samples.
+        streamer.step(samples, 130, now = 0.0, tx = tx)
+        streamer.rebase(90)
+        tx.calls.clear()
+
+        streamer.flush(samples, 40, tx)
+        assertTrue(streamer.flushReusedTail)
+        assertEquals(emptyList<Pair<Int, Int>>(), tx.calls)
     }
 
     @Test
