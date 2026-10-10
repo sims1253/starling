@@ -133,12 +133,6 @@ pub(crate) fn render_recovery(
     )
 }
 
-/// Whether insertion here goes through Wayland's virtual keyboard, which
-/// cannot verify the target.
-fn wayland_session() -> bool {
-    cfg!(target_os = "linux") && std::env::var_os("WAYLAND_DISPLAY").is_some()
-}
-
 /// "After a take" in the settings dialog.
 pub(crate) fn render_insertion_section(app: &StarlingApp, cx: &mut Context<StarlingApp>) -> Div {
     let draft = app.draft_insertion;
@@ -183,9 +177,9 @@ pub(crate) fn render_insertion_section(app: &StarlingApp, cx: &mut Context<Starl
             cx.notify();
         }))
     });
-    let note = if wayland_session() {
-        "This is a Wayland session: typing uses the compositor's virtual keyboard (wlroots, \
-         niri, COSMIC; not GNOME or KDE), and the target window cannot be verified."
+    let note = if app.insertion_unverifiable {
+        "Typing here uses the Wayland compositor's virtual keyboard (wlroots, niri, COSMIC; \
+         not GNOME or KDE), and the target window cannot be verified."
     } else {
         "The target window is checked again right before every part of the text is typed."
     };

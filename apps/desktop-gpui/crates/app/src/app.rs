@@ -525,6 +525,9 @@ pub struct StarlingApp {
     /// (#221), and the settings dialog's draft of its settings.
     pub(crate) delivery: crate::delivery::DeliveryState,
     pub(crate) draft_insertion: InsertionSettings,
+    /// Whether this session types where the target cannot be verified
+    /// (Wayland's virtual keyboard), asked when the settings dialog opens.
+    pub(crate) insertion_unverifiable: bool,
     pub playing_id: Option<String>,
     /// Identifies the current playback so poll-watchers can detect that they
     /// are stale (G04). Bumped whenever playback starts, stops, or is
@@ -1112,6 +1115,7 @@ impl StarlingApp {
                 settings.insertion,
             ),
             draft_insertion: settings.insertion,
+            insertion_unverifiable: false,
             shortcut,
             pending_shortcut: None,
             window_focus: Vec::new(),
@@ -1736,6 +1740,7 @@ impl StarlingApp {
         });
         self.audio_upkeep.draft = self.audio_upkeep.settings;
         self.draft_insertion = self.delivery.settings;
+        self.insertion_unverifiable = self.delivery.inserter.session_verifies() == Some(false);
         cx.notify();
     }
 

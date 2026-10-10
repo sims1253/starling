@@ -106,9 +106,9 @@ pub struct Settings {
     /// subsection loads off and never costs the rest of the file.
     #[serde(default, deserialize_with = "lenient_storage")]
     pub storage: StorageSettings,
-    /// Typing finished takes into the app they were dictated into
-    /// (#221). An unreadable subsection loads its defaults and never the
-    /// rest of the file.
+    /// Type finished takes into the app they were dictated in (#221). An
+    /// unreadable subsection loads its defaults without costing the rest
+    /// of the file.
     #[serde(default, deserialize_with = "lenient_insertion")]
     pub insertion: InsertionSettings,
 }
@@ -262,7 +262,10 @@ where
     }))
 }
 
-/// The insertion subsection of the settings file (#221).
+/// The insertion subsection of the settings file (#221). Typing is on by
+/// default, also when the subsection is missing or unreadable: it is what
+/// a take is for. It only types into the window the take started in, and
+/// where that window cannot be checked, only with `allow_unverified`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct InsertionSettings {
@@ -1283,6 +1286,18 @@ mod tests {
     }
 
     #[test]
+    fn insertion_settings_read_back_what_serde_writes() {
+        // The lenient reader names the keys itself; a non-default value
+        // in every field keeps it in step with the serialized names.
+        let written = InsertionSettings {
+            auto_insert: !InsertionSettings::default().auto_insert,
+            allow_unverified: !InsertionSettings::default().allow_unverified,
+        };
+        let value = serde_json::to_value(written).expect("serialize");
+        assert_eq!(lenient_insertion_value(value), written);
+    }
+
+    #[test]
     fn insertion_settings_load_leniently() {
         let temp = TempDir::new().expect("tempdir");
         let path = temp.path().join("settings.json");
@@ -1296,9 +1311,8 @@ mod tests {
             .expect("write");
             Settings::load(&path)
         };
+        // Missing subsection: the defaults (typing on, unverified off).
         assert_eq!(load("").insertion, InsertionSettings::default());
-        assert!(load("").insertion.auto_insert);
-        assert!(!load("").insertion.allow_unverified);
         assert_eq!(
             load(r#","insertion":{"autoInsert":false}"#).insertion,
             InsertionSettings {

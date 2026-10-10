@@ -377,6 +377,16 @@ impl Inserter {
         }))
     }
 
+    /// Whether the backend that would capture now can verify its targets
+    /// (see [`InsertionBackend::verifies_target`]); `None` when no backend
+    /// is available. Asks each backend's availability, so a round trip.
+    pub fn session_verifies(&self) -> Option<bool> {
+        self.backends
+            .iter()
+            .find(|backend| backend.availability().is_ok())
+            .map(|backend| backend.verifies_target())
+    }
+
     /// Whether the backend serving `target` can verify it (see
     /// [`InsertionBackend::verifies_target`]); `false` without one.
     pub fn verifies(&self, target: &TargetSnapshot) -> bool {

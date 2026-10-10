@@ -25,6 +25,7 @@
 
 use std::io::Write;
 use std::os::fd::AsFd;
+use std::os::unix::fs::OpenOptionsExt;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, PoisonError};
 use std::time::Instant;
@@ -168,6 +169,7 @@ impl InsertionBackend for WaylandBackend {
         let capture = CAPTURES
             .fetch_add(1, Ordering::Relaxed)
             .wrapping_add(1)
+            // Never 0: a ref with a 0 id does not parse.
             .max(1);
         Ok(TargetSnapshot {
             backend: BackendKind::Wayland,
@@ -353,10 +355,13 @@ fn keymap_file(keymap: &str) -> Result<std::fs::File, InsertError> {
         std::process::id(),
         FILES.fetch_add(1, Ordering::Relaxed)
     ));
+    // Owner-only: the keymap lists the characters being typed, and the
+    // `temp_dir` fallback is shared with other users.
     let mut file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create_new(true)
+        .mode(0o600)
         .open(&path)
         .map_err(failed)?;
     let _ = std::fs::remove_file(&path);
@@ -369,6 +374,7 @@ fn keymap_file(keymap: &str) -> Result<std::fs::File, InsertError> {
 /// Splits `characters` so each segment has at most `max_distinct`
 /// distinct characters.
 fn distinct_segments(characters: &[char], max_distinct: usize) -> Vec<&[char]> {
+    debug_assert!(max_distinct > 0, "a segment holds at least one character");
     let mut segments = Vec::new();
     let mut start = 0;
     let mut seen: Vec<char> = Vec::new();
