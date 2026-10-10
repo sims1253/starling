@@ -782,11 +782,15 @@ impl StarlingApp {
     pub(crate) fn after_transcription(&mut self, id: String, cx: &mut Context<Self>) {
         // A staged take rebases its draft instead (#297).
         if self.staged_transcript(&id, cx) {
+            self.deliver_finished_take(&id, cx);
             return;
         }
         self.processing.remove(&id);
         self.drafts.remove(&id);
         self.processing_loading.remove(&id);
+        // The raw transcript is the take's text; processing results
+        // arrive later as proposals, never typed by themselves.
+        self.deliver_finished_take(&id, cx);
         if self.mode_processes() {
             self.process_take(id, cx);
         } else {

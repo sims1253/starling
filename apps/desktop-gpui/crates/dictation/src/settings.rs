@@ -106,6 +106,11 @@ pub struct Settings {
     /// subsection loads off and never costs the rest of the file.
     #[serde(default, deserialize_with = "lenient_storage")]
     pub storage: StorageSettings,
+    /// Typing finished takes into the app they were dictated into
+    /// (#221). An unreadable subsection loads its defaults and never the
+    /// rest of the file.
+    #[serde(default, deserialize_with = "lenient_insertion")]
+    pub insertion: InsertionSettings,
 }
 
 /// Retention limits for one class of history audio (#342). `None` is no
@@ -254,6 +259,39 @@ where
     Ok(serde_json::from_value(value).unwrap_or_else(|err| {
         eprintln!("Unreadable playback settings; using the defaults: {err}");
         PlaybackSettings::default()
+    }))
+}
+
+/// The insertion subsection of the settings file (#221).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct InsertionSettings {
+    /// Type a finished take into the window that had focus when it
+    /// started. Off: the take only lands in Starling (copy it from there).
+    pub auto_insert: bool,
+    /// Also type where the target window cannot be verified (Wayland's
+    /// virtual keyboard types into whatever has focus when the text is
+    /// ready). Opt-in.
+    pub allow_unverified: bool,
+}
+
+impl Default for InsertionSettings {
+    fn default() -> Self {
+        Self {
+            auto_insert: true,
+            allow_unverified: false,
+        }
+    }
+}
+
+fn lenient_insertion<'de, D>(deserializer: D) -> Result<InsertionSettings, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = <serde_json::Value as serde::Deserialize>::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).unwrap_or_else(|err| {
+        eprintln!("Unreadable insertion settings; using the defaults: {err}");
+        InsertionSettings::default()
     }))
 }
 
@@ -453,6 +491,7 @@ impl Settings {
             playback: PlaybackSettings::default(),
             feedback: FeedbackSettings::default(),
             storage: StorageSettings::default(),
+            insertion: InsertionSettings::default(),
         }
     }
 
@@ -743,6 +782,10 @@ mod tests {
                 cue_volume_percent: 35,
             },
             storage: StorageSettings::default(),
+            insertion: InsertionSettings {
+                auto_insert: false,
+                allow_unverified: true,
+            },
         };
 
         settings.save(&path).expect("save");
@@ -1211,6 +1254,37 @@ mod tests {
         let raw = std::fs::read_to_string(&path).expect("read");
         assert!(raw.contains("\"maxAgeDays\": 365"), "{raw}");
         assert_eq!(Settings::load(&path), settings);
+    }
+
+    #[test]
+    fn insertion_settings_load_leniently() {
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("settings.json");
+        let load = |insertion: &str| {
+            std::fs::write(
+                &path,
+                format!(
+                    r#"{{"endpoint":"http://10.0.0.5:8181","model":"m","expectedTerms":[]{insertion}}}"#
+                ),
+            )
+            .expect("write");
+            Settings::load(&path)
+        };
+        assert_eq!(load("").insertion, InsertionSettings::default());
+        assert!(load("").insertion.auto_insert);
+        assert!(!load("").insertion.allow_unverified);
+        assert_eq!(
+            load(r#","insertion":{"autoInsert":false}"#).insertion,
+            InsertionSettings {
+                auto_insert: false,
+                allow_unverified: false,
+            }
+        );
+        for insertion in [r#","insertion":null"#, r#","insertion":{"autoInsert":"yes"}"#] {
+            let loaded = load(insertion);
+            assert_eq!(loaded.insertion, InsertionSettings::default(), "{insertion}");
+            assert_eq!(loaded.endpoint, "http://10.0.0.5:8181", "{insertion}");
+        }
     }
 
     #[test]

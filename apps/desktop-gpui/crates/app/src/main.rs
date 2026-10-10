@@ -4,6 +4,7 @@ mod activation;
 mod app;
 mod assets;
 mod cues;
+mod delivery;
 mod editor;
 mod input;
 mod live_stream;

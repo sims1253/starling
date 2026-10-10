@@ -12,6 +12,7 @@ gpui = "0.2.2"
 global-hotkey = "0.7"
 starling-dictation = { path = "../dictation" }
 starling-processing = { path = "../processing" }
+starling-insertion = { path = "../insertion" }
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 dirs = "6"
 unicode-segmentation = "1"
@@ -35,3 +36,4 @@ raw-window-handle = "0.6"
 [dev-dependencies]
 gpui = { version = "0.2.2", features = ["test-support"] }
 tempfile = "3"
+starling-insertion = { path = "../insertion", features = ["test-doubles"] }

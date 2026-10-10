@@ -560,6 +560,11 @@ fn unsaved_footer_line(count: usize) -> String {
 
 fn render_banner(app: &mut StarlingApp, cx: &mut Context<StarlingApp>) -> Option<impl IntoElement> {
     if app.error.is_none() && app.unsaved.is_empty() {
+        // Words that did not reach their window (#221) outrank every
+        // other notice.
+        if let Some(recovery) = crate::views::delivery::render_recovery(app, cx) {
+            return Some(recovery);
+        }
         // Two independent ephemeral notices share this slot; the capture
         // warning outranks a one-off export rename (banner_notice in
         // `app.rs` is the tested form of that priority).

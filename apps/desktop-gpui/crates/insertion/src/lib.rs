@@ -40,10 +40,10 @@ use std::time::{Duration, Instant};
 pub mod runtime;
 #[cfg(any(test, feature = "test-doubles"))]
 pub mod testing;
-#[cfg(windows)]
-pub mod windows;
 #[cfg(target_os = "linux")]
 pub mod wayland;
+#[cfg(windows)]
+pub mod windows;
 #[cfg(target_os = "linux")]
 pub mod x11;
 
@@ -82,8 +82,8 @@ impl BackendKind {
             BackendKind::Wayland,
             BackendKind::Fake,
         ]
-            .into_iter()
-            .find(|kind| kind.scheme() == scheme)
+        .into_iter()
+        .find(|kind| kind.scheme() == scheme)
     }
 }
 
@@ -349,6 +349,20 @@ impl Inserter {
     pub fn verifies(&self, target: &TargetSnapshot) -> bool {
         self.backend_for(target)
             .is_some_and(|backend| backend.verifies_target())
+    }
+
+    /// Type `text` into `target` through the backend of its scheme.
+    pub fn insert(
+        &self,
+        target: &TargetSnapshot,
+        text: &str,
+    ) -> Result<InsertReceipt, InsertError> {
+        match self.backend_for(target) {
+            Some(backend) => backend.insert(target, text),
+            None => Err(InsertError::Unavailable {
+                reason: format!("no {} backend in this session", target.backend.scheme()),
+            }),
+        }
     }
 
     pub fn backend_for(&self, target: &TargetSnapshot) -> Option<&dyn InsertionBackend> {

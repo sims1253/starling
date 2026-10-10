@@ -38,7 +38,12 @@ use crate::{
     InsertionBackend, TargetCheck, TargetSnapshot, EVIDENCE_SYNTHETIC_KEYS,
 };
 
-#[allow(non_upper_case_globals, non_camel_case_types, missing_docs, clippy::all)]
+#[allow(
+    non_upper_case_globals,
+    non_camel_case_types,
+    missing_docs,
+    clippy::all
+)]
 mod protocol {
     use wayland_client;
     use wayland_client::protocol::*;
@@ -156,7 +161,10 @@ impl InsertionBackend for WaylandBackend {
     /// Only checks the protocol is there: what is focused cannot be read.
     fn capture(&self) -> Result<TargetSnapshot, InsertError> {
         Session::open()?;
-        let capture = CAPTURES.fetch_add(1, Ordering::Relaxed).wrapping_add(1).max(1);
+        let capture = CAPTURES
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1)
+            .max(1);
         Ok(TargetSnapshot {
             backend: BackendKind::Wayland,
             target_ref: format_ref(BackendKind::Wayland, capture, 0, None),
@@ -175,11 +183,10 @@ impl InsertionBackend for WaylandBackend {
         insertion_guards(text, target.pid, &self.excluded_pids)?;
         let _insert_lock = INSERT_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
         let mut session = Session::open()?;
-        let keyboard = session.manager.create_virtual_keyboard(
-            &session.seat,
-            &session.queue.handle(),
-            (),
-        );
+        let keyboard =
+            session
+                .manager
+                .create_virtual_keyboard(&session.seat, &session.queue.handle(), ());
         let characters: Vec<char> = text.chars().collect();
         let mut delivered = 0;
         let mut typed = Ok(());
@@ -298,7 +305,10 @@ fn keymap_for(characters: &[char]) -> String {
     for (index, character) in characters.iter().enumerate() {
         let keycode = first + index as u32;
         keycodes.push_str(&format!("<K{index}> = {keycode};\n"));
-        symbols.push_str(&format!("key <K{index}> {{[ 0x{:x} ]}};\n", keysym(*character)));
+        symbols.push_str(&format!(
+            "key <K{index}> {{[ 0x{:x} ]}};\n",
+            keysym(*character)
+        ));
     }
     format!(
         "xkb_keymap {{\n\

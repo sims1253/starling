@@ -178,6 +178,20 @@ impl StarlingApp {
         }
     }
 
+    /// The text a staged take delivers (#221): its draft as it stands,
+    /// with the user's edits.
+    pub(crate) fn staged_text_for(&self, id: &str) -> Option<String> {
+        let staging = self
+            .staging
+            .iter()
+            .chain(self.background_stagings.iter())
+            .find(|staging| staging.take_id.as_deref() == Some(id))?;
+        match &staging.live {
+            Some(draft) => Some(draft.text()),
+            None => self.drafts.get(id).map(Draft::text),
+        }
+    }
+
     /// Whether the visible staging panel shows this take.
     pub(crate) fn staging_shows(&self, id: &str) -> bool {
         self.staging
@@ -1227,6 +1241,56 @@ mod tests {
             )
             .unwrap();
         store.latest_raw(id).unwrap().unwrap().0
+    }
+
+    #[gpui::test]
+    fn a_staged_take_delivers_the_draft_with_the_users_edits(cx: &mut gpui::TestAppContext) {
+        use starling_insertion::testing::{FakeBackend, FakeTarget};
+        let root = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::at_test_root(root.path());
+        let fake = std::sync::Arc::new(FakeBackend::new());
+        fake.focus(FakeTarget::named("Editor", "notes.txt"));
+        let inserter = starling_insertion::Inserter::with_backends(vec![Box::new(fake.clone())]);
+        let app = cx.new(|cx| {
+            let mut app = StarlingApp::for_test(Some(store.clone()), cx);
+            app.delivery = crate::delivery::DeliveryState::new(
+                std::sync::Arc::new(inserter),
+                Default::default(),
+            );
+            app
+        });
+        let (id, _) = saved_take(&store);
+        transcribe(&store, &id, "hello world");
+        app.update(cx, |app, cx| {
+            assert!(app.staged_mode());
+            app.delivery_take_started();
+            app.begin_staging(cx);
+            let token = app.staging.as_ref().unwrap().token;
+            app.apply_staging_edit(
+                token,
+                &TextEdit {
+                    start: 0,
+                    end: 0,
+                    text: "Note:".into(),
+                },
+                cx,
+            );
+            app.stop_staging();
+            let capture = app.delivery_take_stopped();
+            app.bind_staging(token, &id);
+            app.bind_delivery(capture, &id);
+            app.apply_sessions(store.list().unwrap());
+            app.after_transcription(id.clone(), cx);
+        });
+        cx.run_until_parked();
+        let typed = fake.insertions();
+        assert_eq!(typed.len(), 1);
+        assert!(typed[0].1.starts_with("Note:"), "{typed:?}");
+        assert!(typed[0].1.ends_with("hello world"), "{typed:?}");
+        app.read_with(cx, |app, _| {
+            assert!(app.delivery.recovery.is_none());
+            assert_eq!(app.visible_staging_draft().unwrap().text(), typed[0].1);
+        });
     }
 
     #[gpui::test]

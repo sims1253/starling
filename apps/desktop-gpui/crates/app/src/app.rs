@@ -26,8 +26,8 @@ use starling_dictation::{
     recorder::RecorderHandle,
     settings::{
         ActivationMode, DictationSettings, EngineMode, EngineSettings, FeedbackSettings,
-        MicrophoneSettings, OverlayMode, PlaybackMode, PlaybackSettings, ProcessingSettings,
-        Settings, DEFAULT_SHORTCUT,
+        InsertionSettings, MicrophoneSettings, OverlayMode, PlaybackMode, PlaybackSettings,
+        ProcessingSettings, Settings, DEFAULT_SHORTCUT,
     },
     storage::{DamagedRecord, ListedRecord, SessionSummary},
 };
@@ -521,6 +521,10 @@ pub struct StarlingApp {
     pub(crate) draft_cue_volume: Entity<crate::slider::LevelSlider>,
     /// History audio compression and retention (#342).
     pub(crate) audio_upkeep: crate::upkeep::AudioUpkeep,
+    /// Typing finished takes into the window they were dictated into
+    /// (#221), and the settings dialog's draft of its settings.
+    pub(crate) delivery: crate::delivery::DeliveryState,
+    pub(crate) draft_insertion: InsertionSettings,
     pub playing_id: Option<String>,
     /// Identifies the current playback so poll-watchers can detect that they
     /// are stale (G04). Bumped whenever playback starts, stops, or is
@@ -1103,6 +1107,11 @@ impl StarlingApp {
             draft_cues: settings.feedback.cues,
             draft_cue_volume,
             audio_upkeep: crate::upkeep::AudioUpkeep::new(settings.storage),
+            delivery: crate::delivery::DeliveryState::new(
+                Arc::new(starling_insertion::Inserter::for_this_session()),
+                settings.insertion,
+            ),
+            draft_insertion: settings.insertion,
             shortcut,
             pending_shortcut: None,
             window_focus: Vec::new(),
@@ -1325,6 +1334,7 @@ impl StarlingApp {
             playback: self.playback_settings,
             feedback: self.feedback,
             storage: self.audio_upkeep.settings,
+            insertion: self.delivery.settings,
         };
         settings.set_expected_terms_input(&self.expected_terms_input);
         settings
@@ -1725,6 +1735,7 @@ impl StarlingApp {
             slider.set_value(self.feedback.cue_volume_percent, cx);
         });
         self.audio_upkeep.draft = self.audio_upkeep.settings;
+        self.draft_insertion = self.delivery.settings;
         cx.notify();
     }
 
@@ -1951,6 +1962,9 @@ impl StarlingApp {
         };
         self.sync_overlay(cx);
         self.commit_storage_draft();
+        // From the next delivery on; a take already running keeps its
+        // capture and follows the new setting when it finishes.
+        self.delivery.settings = self.draft_insertion;
 
         // R11: an unresolvable config directory is surfaced, not swallowed —
         // settings must not silently land in the current working directory.

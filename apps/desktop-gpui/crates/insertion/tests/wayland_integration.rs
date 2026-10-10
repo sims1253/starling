@@ -21,17 +21,22 @@ use starling_insertion::wayland::WaylandBackend;
 use starling_insertion::{InsertError, InsertionBackend, EVIDENCE_SYNTHETIC_KEYS};
 
 fn enabled() -> bool {
-    std::env::var_os("STARLING_WAYLAND_IT").is_some() && std::env::var_os("WAYLAND_DISPLAY").is_some()
+    std::env::var_os("STARLING_WAYLAND_IT").is_some()
+        && std::env::var_os("WAYLAND_DISPLAY").is_some()
 }
 
 #[test]
 fn wayland_types_unicode_into_a_gtk_entry() {
     if !enabled() {
-        eprintln!("skipped: set STARLING_WAYLAND_IT=1 and WAYLAND_DISPLAY (a disposable compositor)");
+        eprintln!(
+            "skipped: set STARLING_WAYLAND_IT=1 and WAYLAND_DISPLAY (a disposable compositor)"
+        );
         return;
     }
     let backend = WaylandBackend::new();
-    backend.availability().expect("the compositor offers virtual keyboards");
+    backend
+        .availability()
+        .expect("the compositor offers virtual keyboards");
 
     let mut dialog = Command::new("zenity")
         .args(["--entry", "--title=starling-it", "--text=type here"])
@@ -45,7 +50,11 @@ fn wayland_types_unicode_into_a_gtk_entry() {
     std::thread::sleep(Duration::from_millis(2500));
 
     let target = backend.capture().unwrap();
-    assert!(target.target_ref.starts_with("wl:"), "{}", target.target_ref);
+    assert!(
+        target.target_ref.starts_with("wl:"),
+        "{}",
+        target.target_ref
+    );
     let text = "Café, naïve 😀 – 42 ÄÖÜ ß!";
     assert_eq!(
         backend.insert(&target, "never\nEnter"),
@@ -68,6 +77,11 @@ fn wayland_types_unicode_into_a_gtk_entry() {
         std::thread::sleep(Duration::from_millis(50));
     }
     let mut out = String::new();
-    dialog.stdout.take().unwrap().read_to_string(&mut out).unwrap();
+    dialog
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut out)
+        .unwrap();
     assert_eq!(out.trim_end_matches('\n'), text);
 }

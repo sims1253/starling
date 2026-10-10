@@ -5773,6 +5773,7 @@ dependencies = [
  "serde",
  "serde_json",
  "starling-dictation",
+ "starling-insertion",
  "starling-processing",
  "tempfile",
  "tokio",
