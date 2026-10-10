@@ -173,6 +173,15 @@ impl StarlingApp {
             }
             if let Some((endpoint, model)) = &status.server {
                 if (&self.endpoint, &self.model) != (endpoint, model) {
+                    // Untouched dialog drafts follow too, or a later Save
+                    // in this window would send the old server back.
+                    if self.draft_endpoint.read(cx).value() == self.endpoint {
+                        self.draft_endpoint
+                            .update(cx, |field, cx| field.set_value(endpoint, cx));
+                    }
+                    if self.draft_model.read(cx).value() == self.model {
+                        self.draft_model.update(cx, |field, cx| field.set_value(model, cx));
+                    }
                     self.endpoint = endpoint.clone();
                     self.model = model.clone();
                     probe = true;

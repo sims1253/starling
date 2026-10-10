@@ -1391,10 +1391,11 @@ mod tests {
             app.configure_engine(cx);
         });
         settle(cx, "the second window in manual mode", |cx| {
-            second.read_with(cx, |app, _| {
+            second.read_with(cx, |app, cx| {
                 app.engine_settings.mode == EngineMode::Manual
                     && app.draft_engine_mode == EngineMode::Manual
                     && app.endpoint == "http://127.0.0.1:9"
+                    && app.draft_endpoint.read(cx).value() == "http://127.0.0.1:9"
                     && app.engine_snapshot().is_none()
             })
         });

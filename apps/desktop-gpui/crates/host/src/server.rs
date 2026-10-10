@@ -727,7 +727,11 @@ pub fn serve(config: HostConfig) -> Result<HostHandle, HostError> {
     let mut runtime_config = config
         .runtime
         .with_capture_observer(Arc::clone(&takes) as Arc<dyn starling_runtime::machine::capture::CaptureObserver>);
-    let engine = crate::engine::attach(config.engine, &mut runtime_config);
+    let engine = crate::engine::attach_with_paths(
+        config.engine,
+        config.engine_paths.clone(),
+        &mut runtime_config,
+    );
     // The host transcribes its takes (#220): every take an app records is
     // stored with the intent to transcribe it, in its own commit.
     let transcriber = {
@@ -1593,9 +1597,18 @@ fn connection_reader(
                             Some(engine) => engine.status(),
                             None => crate::engine::EngineStatus::without_engine(),
                         };
-                        let _ = state.try_deliver(Frame::EngineState {
-                            status: Box::new(status),
-                        });
+                        // A window that misses this would wait for the next
+                        // change: a full queue closes the connection
+                        // instead, and the reconnect brings it.
+                        if state
+                            .try_deliver(Frame::EngineState {
+                                status: Box::new(status),
+                            })
+                            .is_err()
+                        {
+                            state.close();
+                            break;
+                        }
                     }
                     Frame::Engine { req, request } => {
                         let queued = match (&shared.engine, &*lock_registry(&shared.engine_jobs)) {
