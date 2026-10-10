@@ -97,6 +97,17 @@ def battery_snapshot() -> dict:
     return fields
 
 
+def cool_down(max_battery_c: float, limit_s: float) -> float:
+    """Waits until the battery is at most ``max_battery_c`` and thermal status is 0; seconds waited."""
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < limit_s:
+        temp = battery_snapshot().get("temperature")
+        if temp is not None and int(temp) / 10.0 <= max_battery_c and thermal_snapshot()["status"] == 0:
+            break
+        time.sleep(15)
+    return round(time.monotonic() - t0, 1)
+
+
 def push_workload(workload: Path, manifest: dict, takes: list[str]) -> None:
     adb("shell", "mkdir", "-p", STAGING)
     run_as("mkdir", "-p", "files/debug/stream-workload")
@@ -162,14 +173,16 @@ def aggregate(runs: list[dict]) -> dict:
             return {"n": len(vals), "p50": _pct(vals, .5), "p95": _pct(vals, .95),
                     "max": max(vals) if vals else None}
 
-        a["finish_to_final_ms_median"] = statistics.median(
-            [r["finish_to_final_ms"] for r in ok if r["finish_to_final_ms"] is not None] or [0]) if ok else None
+        def med(values: list):
+            vals = [v for v in values if v is not None]
+            return statistics.median(vals) if vals else None
+
+        a["finish_to_final_ms_median"] = med([r["finish_to_final_ms"] for r in ok])
         a["stop_to_final_ms"] = dist([r["stop_to_final_ms"] for r in ok])
         a["finish_to_final_ms"] = dist([r["finish_to_final_ms"] for r in ok])
         a["stop_to_delivered_ms"] = dist([r["stop_to_delivered_ms"] for r in ok])
         a["first_partial_wall_s"] = dist([(r.get("first_partial") or {}).get("wall_s") for r in ok])
-        a["app_cpu_per_audio_s_median"] = statistics.median(
-            [r["app_cpu_per_audio_s"] for r in ok if r["app_cpu_per_audio_s"] is not None] or [0]) if ok else None
+        a["app_cpu_per_audio_s_median"] = med([r["app_cpu_per_audio_s"] for r in ok])
         a["thermal_status_max"] = max(
             [max((r.get("thermal_before") or {}).get("status", -1),
                  (r.get("thermal_after") or {}).get("status", -1)) for r in ok], default=None)
@@ -196,6 +209,7 @@ def run(args: argparse.Namespace) -> dict:
     for repeat in range(args.repeats):
         if repeat and args.cooldown:
             time.sleep(args.cooldown)
+        cooled_s = cool_down(args.cool_to, args.cool_limit) if args.cool_to else 0.0
         env_before = {"thermal": thermal_snapshot(), "battery": battery_snapshot()}
         print(f"[{args.label}] repeat {repeat}: {','.join(takes)} "
               f"({args.min} s / {args.interval} s, warmup={args.warmup}) thermal {env_before['thermal']}",
@@ -204,6 +218,7 @@ def run(args: argparse.Namespace) -> dict:
         instrument(args.label, repeat, takes, args)
         env_after = {"thermal": thermal_snapshot(), "battery": battery_snapshot()}
         repeats_env.append({"repeat": repeat, "wall_s": round(time.monotonic() - t0, 1),
+                            "cooled_s": cooled_s,
                             "before": env_before, "after": env_after})
         for name in takes:
             raw = run_as("cat", f"files/debug/stream-runs/{args.label}/r{repeat}-{name}.json")
@@ -226,7 +241,7 @@ def run(args: argparse.Namespace) -> dict:
             "device": device,
             "model": args.model,
             "cadence": {"min_partial_seconds": args.min, "partial_interval_seconds": args.interval},
-            "warmup": args.warmup, "batch": args.batch,
+            "warmup": args.warmup, "batch": args.batch, "cool_to_c": args.cool_to,
             "workload_manifest_sha256": sha256_file(manifest_path),
             "repeats": repeats_env,
         },
@@ -249,6 +264,10 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--warmup", action=argparse.BooleanOptionalAction, default=True)
     r.add_argument("--batch", action=argparse.BooleanOptionalAction, default=True)
     r.add_argument("--cooldown", type=float, default=0.0, help="seconds between repeats")
+    r.add_argument("--cool-to", type=float, default=None,
+                   help="before each repeat, wait until the battery is at most this many degrees C "
+                        "and thermal status is 0")
+    r.add_argument("--cool-limit", type=float, default=1200.0, help="longest cool-down wait (s)")
     r.add_argument("--timeout", type=float, default=3600.0)
     r.add_argument("--keep-traces", type=Path, default=None)
     r.add_argument("--label", required=True)
