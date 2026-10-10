@@ -111,6 +111,10 @@
         <item quantity="one">kept %1$d due recording that never got a transcript</item>
         <item quantity="other">kept %1$d due recordings that never got a transcript</item>
     </plurals>
+    <plurals name="cleanup_remove_failures">
+        <item quantity="one">could not remove the audio of %1$d due recording; it is kept and tried again later</item>
+        <item quantity="other">could not remove the audio of %1$d due recordings; they are kept and tried again later</item>
+    </plurals>
     <plurals name="cleanup_failures">
         <item quantity="one">%1$d recording could not be compressed and stays as it is</item>
         <item quantity="other">%1$d recordings could not be compressed and stay as they are</item>

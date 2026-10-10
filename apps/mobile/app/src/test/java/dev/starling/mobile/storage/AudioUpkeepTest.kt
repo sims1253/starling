@@ -163,6 +163,23 @@ class AudioUpkeepTest {
         assertEquals(expected, settings.withPolicy { it.limits(RetentionClass.STANDARD) })
         // And memory is put back, so a later read cannot pick the failed values up.
         assertEquals(mapOf("storage.standard.maxAgeDays" to 365L), preferences.values)
+        // Even with the put-back's commit failing too (failCommits holds), the
+        // policy in force is what a fresh read of the preferences finds.
+        assertEquals(StorageSettings(preferences).load(), settings.load())
+    }
+
+    @Test
+    fun theStrictestLimitsRoundTrip() {
+        val preferences = FakePreferences()
+        val settings = StorageSettings(preferences)
+        val strictest = ClassLimits(maxAgeDays = 0, maxTotalMb = 0)
+        // The policy save returns, and the one a later launch reads, is the
+        // one saved: 0 is "keep nothing", not "no limit".
+        assertEquals(strictest, settings.save(RetentionClass.STANDARD, strictest).limits(RetentionClass.STANDARD))
+        assertEquals(strictest, StorageSettings(preferences).load().limits(RetentionClass.STANDARD))
+        assertTrue(settings.load().isActive)
+        // An absent key is still no limit.
+        assertEquals(ClassLimits(), settings.load().limits(RetentionClass.ARCHIVAL))
     }
 
     @Test

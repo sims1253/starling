@@ -99,6 +99,30 @@ class FlacTest {
         assertTrue("${file.length()} of ${pcm.size}", file.length() < pcm.size * 0.65)
     }
 
+    /**
+     * Forms our encoder never writes but a file from elsewhere may hold,
+     * decoded against the PCM they were made from. The fixtures are samples
+     * 16000 until 26000 of the LibriSpeech fixture, written by reference
+     * libFLAC 1.5.0 (`flac -8 --no-padding --no-seektable`, raw 16 kHz mono
+     * s16le input): `lpc-order12.flac` as they are, LPC subframes of orders
+     * 11 and 12; `wasted-bits3.flac` with the low 3 bits of every sample
+     * cleared, the same LPC subframes with 3 wasted bits.
+     */
+    @Test
+    fun referenceEncodedLpcAndWastedBitsDecodeSampleExact() {
+        val speech = WavPcm.decodePcm16(repoFile("tests/fixtures/2086-149220-0033.wav"))!!.pcm
+        val slice = speech.copyOfRange(16_000 * 2, 26_000 * 2)
+        val cleared = slice.copyOf().also { bytes -> for (i in bytes.indices step 2) bytes[i] = (bytes[i].toInt() and 0xF8).toByte() }
+        for ((name, expected) in listOf("lpc-order12.flac" to slice, "wasted-bits3.flac" to cleared)) {
+            val flac = requireNotNull(javaClass.getResourceAsStream("/flac/$name")) { "$name is missing" }.use { it.readBytes() }
+            val decoded = ByteArrayOutputStream()
+            val info = Flac.decode(ByteArrayInputStream(flac), decoded)
+            assertArrayEquals(name, expected, decoded.toByteArray())
+            assertEquals(name, 10_000L, info.totalSamples)
+            assertEquals(name, 16_000, info.sampleRate)
+        }
+    }
+
     @Test
     fun edgeCasesRoundTrip() {
         val random = Random(342)

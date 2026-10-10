@@ -94,7 +94,7 @@ class RecordingStoreAtRestTest {
     }
 
     @Test
-    fun aCrashBetweenThePublishAndTheUnlinkKeepsTheFlacOnTheNextOpen() {
+    fun aCrashBetweenThePublishAndTheUnlinkKeepsTheFlacOnceSettledAfterTheOpen() {
         val store = RecordingStore(storeDir())
         val take = committedTake(store)
         val expected = requestAudio(store, take.id)
@@ -110,9 +110,85 @@ class RecordingStoreAtRestTest {
 
         val reopened = RecordingStore(storeDir())
 
+        // The open decodes nothing (it runs in Application.onCreate): both
+        // files stay, and every reader uses the WAV, the original.
+        assertTrue(wav(take.id).isFile && flac(take.id).isFile)
+        assertArrayEquals(expected, requestAudio(reopened, take.id))
+        assertFalse(reopened.openAudio(take.id).run { stream.close(); flac })
+        assertEquals(wav(take.id), reopened.audioFile(take))
+        assertEquals(emptyList<String>(), reopened.compressionCandidates())
+
+        // The upkeep thread settles it.
+        assertEquals(0, reopened.settleAtRest())
         assertFalse(wav(take.id).exists())
         assertTrue(flac(take.id).isFile)
         assertArrayEquals(expected, requestAudio(reopened, take.id))
+    }
+
+    @Test
+    fun aPinnedTakeIsSettledOnlyOnceItIsReleased() {
+        val store = RecordingStore(storeDir())
+        val take = committedTake(store)
+        store.compressionHook = { step -> if (step == RecordingStore.CompressionStep.PUBLISHED) throw IllegalStateException("killed") }
+        runCatching { store.compressAudio(take.id) }
+        val reopened = RecordingStore(storeDir())
+
+        val pin = reopened.pin(take.id)
+        // A retry reading the WAV keeps it.
+        assertEquals(1, reopened.settleAtRest())
+        assertTrue(wav(take.id).isFile && flac(take.id).isFile)
+        pin.close()
+        assertEquals(0, reopened.settleAtRest())
+        assertFalse(wav(take.id).exists())
+    }
+
+    @Test
+    fun aFailedSyncAfterThePublishKeepsTheWavUntilSettled() {
+        var failSync = false
+        val store = RecordingStore(
+            storeDir(),
+            syncDir = { if (failSync) throw IOException("injected fsync failure") },
+        )
+        val take = committedTake(store)
+        val expected = requestAudio(store, take.id)
+        // The rename landed, but whether it is durable is unknown: the WAV stays.
+        failSync = true
+        val outcome = store.compressAudio(take.id) as RecordingStore.Compression.Compressed
+        assertTrue(outcome.wavKept)
+        assertTrue(wav(take.id).isFile && flac(take.id).isFile)
+        assertArrayEquals(expected, requestAudio(store, take.id))
+        // Settling waits for a sync that works.
+        assertEquals(1, store.settleAtRest())
+        assertTrue(wav(take.id).isFile)
+        failSync = false
+        assertEquals(0, store.settleAtRest())
+        assertFalse(wav(take.id).exists())
+        assertArrayEquals(expected, requestAudio(store, take.id))
+    }
+
+    @Test
+    fun aWavStorageWillNotUnlinkAfterThePublishStaysUntilSettled() {
+        var refuse = true
+        val store = RecordingStore(
+            storeDir(),
+            unlink = { file -> if (refuse && file.name.endsWith(".wav")) false else file.delete() },
+        )
+        val take = committedTake(store)
+        val expected = requestAudio(store, take.id)
+
+        // The FLAC is published: the take is compressed, nothing saved yet.
+        val outcome = store.compressAudio(take.id) as RecordingStore.Compression.Compressed
+        assertTrue(outcome.wavKept)
+        assertTrue(wav(take.id).isFile && flac(take.id).isFile)
+        assertArrayEquals(expected, requestAudio(store, take.id))
+        assertEquals(emptyList<String>(), store.compressionCandidates())
+        // Still refused: it waits; then the unlink goes through.
+        assertEquals(1, store.settleAtRest())
+        assertTrue(wav(take.id).isFile)
+        refuse = false
+        assertEquals(0, store.settleAtRest())
+        assertFalse(wav(take.id).exists())
+        assertArrayEquals(expected, requestAudio(store, take.id))
     }
 
     @Test
@@ -127,6 +203,7 @@ class RecordingStoreAtRestTest {
         flac(take.id).writeBytes(damaged)
 
         val reopened = RecordingStore(storeDir())
+        assertEquals(0, reopened.settleAtRest())
 
         assertTrue(wav(take.id).isFile)
         assertFalse(flac(take.id).exists())
@@ -147,6 +224,7 @@ class RecordingStoreAtRestTest {
         flac(take.id).writeBytes(damaged)
 
         val reopened = RecordingStore(storeDir())
+        assertEquals(0, reopened.settleAtRest())
 
         assertTrue(wav(take.id).isFile)
         assertFalse(flac(take.id).exists())

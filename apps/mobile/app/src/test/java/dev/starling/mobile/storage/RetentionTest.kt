@@ -327,4 +327,36 @@ class RetentionTest {
         assertEquals(flacBytes, report.removedBytes)
         assertFalse(hasAudio(old))
     }
+
+    @Test
+    fun anUnlinkStorageRefusesIsReportedAndTheTakeKeepsItsAudio() {
+        var refuse = true
+        val stuck = mutableSetOf<String>()
+        val store = RecordingStore(
+            storeDir(),
+            unlink = { file -> if (refuse && file.name.substringBefore('.') in stuck) false else file.delete() },
+        ) { now }
+        val older = take(store, ageDays = 60.0)
+        val old = take(store, ageDays = 40.0)
+        stuck += old.id
+        val gate = Gate(policy(standard = ClassLimits(maxAgeDays = 30)))
+
+        val report = store.applyRetention(gate)
+
+        // The refused one is reported, not counted as removed, and the run
+        // goes on to the next due take instead of trying it again.
+        assertEquals(listOf(older.id), report.removed.map { it.id })
+        assertEquals(listOf(old.id), report.failed.map { it.id })
+        assertTrue(hasAudio(old))
+        assertEquals(null, store.get(old.id).audioRemoved)
+        assertNotNull(store.get(older.id).audioRemoved)
+        assertEquals(RetireReason.AGE, report.failed.single().reason)
+        // A later run tries again.
+        refuse = false
+        val retried = store.applyRetention(gate)
+        assertEquals(listOf(old.id), retried.removed.map { it.id })
+        assertEquals(emptyList<RemovedAudio>(), retried.failed)
+        assertFalse(hasAudio(old))
+        assertNotNull(store.get(old.id).audioRemoved)
+    }
 }

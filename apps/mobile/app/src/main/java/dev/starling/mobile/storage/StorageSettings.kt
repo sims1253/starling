@@ -61,11 +61,13 @@ class StorageSettings internal constructor(private val preferences: SharedPrefer
     )
 
     /**
-     * A stored limit; anything unreadable, not positive or past [max] is no
-     * limit (a huge value must never wrap into a tiny one).
+     * A stored limit; anything absent, unreadable, negative or past [max] is
+     * no limit (a huge value must never wrap into a tiny one). 0 is a limit,
+     * the strictest, as on the desktop.
      */
     private fun stored(key: String, max: Long): Long? =
-        runCatching { preferences.getLong(key, 0L) }.getOrNull()?.takeIf { it in 1..max }
+        runCatching { if (preferences.contains(key)) preferences.getLong(key, -1L) else null }
+            .getOrNull()?.takeIf { it in 0..max }
 
     companion object {
         private const val PREFS_NAME = "storage_settings"

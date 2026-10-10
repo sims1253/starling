@@ -102,6 +102,7 @@ class VoiceInputService : InputMethodService() {
     private var statusView: TextView? = null
     private var transcriptView: TextView? = null
     private var modelStatusView: TextView? = null
+    private var diskWarningView: TextView? = null
     private var modeChip: Button? = null
     private var modePicker: HorizontalScrollView? = null
     private var modeList: LinearLayout? = null
@@ -142,6 +143,7 @@ class VoiceInputService : InputMethodService() {
         statusView = view.findViewById(R.id.keyboard_status)
         transcriptView = view.findViewById(R.id.keyboard_transcript)
         modelStatusView = view.findViewById(R.id.keyboard_model_status)
+        diskWarningView = view.findViewById(R.id.keyboard_disk_warning)
         modeChip = view.findViewById(R.id.keyboard_mode_chip)
         modePicker = view.findViewById(R.id.keyboard_mode_picker)
         modeList = view.findViewById(R.id.keyboard_mode_list)
@@ -379,9 +381,20 @@ class VoiceInputService : InputMethodService() {
                 else -> R.string.keyboard_streaming
             },
         )
-        if (disk?.level == DiskLevel.LOW) {
-            statusView?.text = getString(R.string.disk_low_warning, DiskPolicy.DEFAULT.minutesLeft(disk.availableBytes))
-        }
+        showDiskWarning(
+            if (disk?.level == DiskLevel.LOW) {
+                getString(R.string.disk_low_warning, DiskPolicy.DEFAULT.minutesLeft(disk.availableBytes))
+            } else {
+                null
+            },
+        )
+    }
+
+    /** The low-storage warning of the running take, on its own line; null hides it. */
+    private fun showDiskWarning(text: String?) {
+        val view = diskWarningView ?: return
+        view.text = text
+        view.visibility = if (text == null) View.GONE else View.VISIBLE
     }
 
     /**
@@ -521,6 +534,7 @@ class VoiceInputService : InputMethodService() {
         current.capturing = false
         current.awaitingFinal = true
         current.stoppedAtNanos = System.nanoTime()
+        showDiskWarning(null)
         val session = current.session
         current.session = null
         renderTake()

@@ -89,6 +89,8 @@ data class RetentionReport(
     val policyChanged: Boolean = false,
     /** The caller's stop condition (a take started recording) ended the run. */
     val stopped: Boolean = false,
+    /** Due takes whose audio storage refused to unlink: they keep it, unstamped, for a later run. */
+    val failed: List<RemovedAudio> = emptyList(),
 ) {
     val removedBytes: Long get() = removed.sumOf { it.bytes }
 }

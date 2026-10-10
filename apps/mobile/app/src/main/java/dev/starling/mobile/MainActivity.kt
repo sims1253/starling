@@ -303,9 +303,13 @@ class MainActivity : Activity() {
             size.setSelection(SIZE_CHOICES_MB.indexOf(limits.maxTotalMb).coerceAtLeast(0), false)
             val listener = object : AdapterView.OnItemSelectedListener {
                 override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
+                    // INVALID_POSITION (nothing selected) chooses nothing.
+                    val agePosition = age.selectedItemPosition
+                    val sizePosition = size.selectedItemPosition
+                    if (agePosition !in AGE_CHOICES.indices || sizePosition !in SIZE_CHOICES_MB.indices) return
                     val chosen = ClassLimits(
-                        maxAgeDays = AGE_CHOICES[age.selectedItemPosition],
-                        maxTotalMb = SIZE_CHOICES_MB[size.selectedItemPosition],
+                        maxAgeDays = AGE_CHOICES[agePosition],
+                        maxTotalMb = SIZE_CHOICES_MB[sizePosition],
                     )
                     if (chosen == application.storageSettings.load().limits(retentionClass)) return
                     runCatching { application.storageSettings.save(retentionClass, chosen) }
@@ -349,6 +353,10 @@ class MainActivity : Activity() {
             }
             report.retention.overLimit.forEach { (retentionClass, bytes) ->
                 add(getString(R.string.cleanup_over_limit, retentionClassName(retentionClass), mbCeil(bytes)))
+            }
+            val undeleted = report.retention.failed.size
+            if (undeleted > 0) {
+                add(resources.getQuantityString(R.plurals.cleanup_remove_failures, undeleted, undeleted))
             }
             if (report.failures > 0) {
                 add(resources.getQuantityString(R.plurals.cleanup_failures, report.failures, report.failures))

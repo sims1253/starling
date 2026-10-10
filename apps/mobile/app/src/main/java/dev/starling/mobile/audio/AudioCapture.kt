@@ -80,10 +80,11 @@ class AudioCapture(
     private var cappedAtLimit = false
     private var state = State.IDLE
 
-    // Set by the checkpoint thread (critical free space) or the capture
+    // Raised by the disk watch thread (critical free space) or the capture
     // thread (a write refused for lack of space); ends the capture loop.
-    @Volatile
-    private var lowDisk = false
+    // Tied to the take: [takeToken] is the running take's, guarded by [lock].
+    private val lowDisk = LowDiskStop()
+    private var takeToken = 0L
 
     // Guarded by [lock]: completion callbacks of stop() calls that are
     // still waiting for the worker, and whether a background task for the
@@ -152,11 +153,20 @@ class AudioCapture(
         cappedAtLimit = false
         writerBytes = 0
         stopRequested = false
-        lowDisk = false
+        val token = lowDisk.begin()
+        takeToken = token
         state = State.RECORDING
-        worker = Thread({ captureLoop(audioRecord, wavWriter, bufferSize, onChunk, onEnded) }, "starling-audio-capture")
-            .also { it.start() }
-        startCheckpoints(wavWriter, DiskWatch(diskProbe, outputFile.absoluteFile.parentFile ?: outputFile, diskPolicy))
+        startCheckpoints(wavWriter)
+        val diskWatch = startDiskWatch(
+            DiskWatch(diskProbe, outputFile.absoluteFile.parentFile ?: outputFile, diskPolicy),
+            lowDisk,
+            token,
+            CHECKPOINT_INTERVAL_MILLIS,
+        )
+        worker = Thread(
+            { captureLoop(audioRecord, wavWriter, bufferSize, onChunk, onEnded, token, diskWatch) },
+            "starling-audio-capture",
+        ).also { it.start() }
         null
     }
 
@@ -195,11 +205,11 @@ class AudioCapture(
      * The durability checkpoints of one capture (see [WavWriter.checkpoint]):
      * every [CHECKPOINT_INTERVAL_MILLIS] the written audio is fsynced and its
      * size recorded in the header, off the capture thread so a slow flush
-     * can never make the microphone overrun. The free space ([diskWatch])
-     * is watched on a thread of its own, so a stalled flush cannot keep a
-     * filling disk from stopping the take. Both end with the writer.
+     * can never make the microphone overrun. The free space is watched on a
+     * thread of its own ([startDiskWatch]), so a stalled flush cannot keep a
+     * filling disk from stopping the take. Both end with the take.
      */
-    private fun startCheckpoints(wavWriter: WavWriter, diskWatch: DiskWatch) {
+    private fun startCheckpoints(wavWriter: WavWriter) {
         Thread({
             try {
                 while (true) {
@@ -213,16 +223,6 @@ class AudioCapture(
                 // Daemon; nothing to clean up.
             }
         }, "starling-audio-checkpoint").apply { isDaemon = true }.start()
-        Thread({
-            try {
-                while (!wavWriter.isClosed) {
-                    Thread.sleep(CHECKPOINT_INTERVAL_MILLIS)
-                    if (!wavWriter.isClosed && !stopRequested && diskWatch.critical()) lowDisk = true
-                }
-            } catch (_: InterruptedException) {
-                // Daemon; nothing to clean up.
-            }
-        }, "starling-disk-watch").apply { isDaemon = true }.start()
     }
 
     /**
@@ -252,6 +252,8 @@ class AudioCapture(
                 null
             } else {
                 stopRequested = true
+                // An explicit stop is never reported as a low-disk one.
+                lowDisk.close(takeToken)
                 state = State.STOPPING
                 stopCallbacks.add(onSettled)
                 recorder to worker
@@ -402,7 +404,7 @@ class AudioCapture(
     }
 
     private fun workerOutcome(): CaptureResult = synchronized(lock) {
-        CaptureStopPolicy.settle(workerError, writerBytes, cappedAtLimit, lowDisk)
+        CaptureStopPolicy.settle(workerError, writerBytes, cappedAtLimit, lowDisk.raised)
     }
 
     /**
@@ -434,11 +436,13 @@ class AudioCapture(
         bufferSize: Int,
         onChunk: AudioChunkListener?,
         onEnded: (() -> Unit)?,
+        token: Long,
+        diskWatch: Thread,
     ) {
         val buffer = ByteArray(bufferSize)
         var bytesWritten = 0L
         try {
-            while (!stopRequested && !lowDisk) {
+            while (!stopRequested && !lowDisk.raised) {
                 val count = audioRecord.read(buffer, buffer.size)
                 when {
                     count > 0 -> {
@@ -471,13 +475,16 @@ class AudioCapture(
             if (DiskWatch.isOutOfSpace(exception)) {
                 // The disk filled between checks: end like a low-space stop.
                 // finish() trims a torn chunk, so the WAV stays complete.
-                lowDisk = true
+                lowDisk.raise(token)
             } else if (!stopRequested) {
                 synchronized(lock) {
                     workerError = exception.message ?: "Microphone capture failed"
                 }
             }
         } finally {
+            // The take is over: its watch can no longer stop anything.
+            lowDisk.close(token)
+            diskWatch.interrupt()
             synchronized(lock) { writerBytes = bytesWritten }
             try {
                 wavWriter.finish()

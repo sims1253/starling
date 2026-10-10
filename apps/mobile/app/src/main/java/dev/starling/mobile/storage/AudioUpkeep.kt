@@ -5,8 +5,9 @@ import java.util.concurrent.Executor
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * History-audio upkeep (#342): compresses finished takes to FLAC and then
- * applies the retention policy, one pass at a time on [executor]. The app
+ * History-audio upkeep (#342): settles takes left with both a WAV and a
+ * FLAC ([RecordingStore.settleAtRest]), compresses finished takes to FLAC
+ * and then applies the retention policy, one pass at a time on [executor]. The app
  * schedules a pass after start, every 15 minutes, after each transcription
  * attempt and after the storage settings change. A pass does not start
  * while a take records ([recording]: any capture of this process writing),
@@ -34,7 +35,7 @@ class AudioUpkeep(
         /** Nothing worth telling the user. */
         val isEmpty: Boolean
             get() = compressed == 0 && failures == 0 && retention.removed.isEmpty() &&
-                retention.held.isEmpty() && retention.overLimit.isEmpty()
+                retention.held.isEmpty() && retention.overLimit.isEmpty() && retention.failed.isEmpty()
     }
 
     /** The last pass that did or found something; null until one did. */
@@ -67,6 +68,9 @@ class AudioUpkeep(
         var saved = 0L
         var failures = 0
         var paused = false
+        // Takes a crash (or a refused unlink) left with both files, settled
+        // here rather than at open: the check decodes the whole take.
+        store.settleAtRest()
         for (id in store.compressionCandidates()) {
             if ((compressionFailures[id] ?: 0) >= MAX_COMPRESSION_ATTEMPTS) continue
             if (recording()) {
@@ -77,7 +81,8 @@ class AudioUpkeep(
                 val outcome = store.compressAudio(id)
                 if (outcome is RecordingStore.Compression.Compressed) {
                     compressed++
-                    saved += outcome.wavBytes - outcome.flacBytes
+                    // A WAV storage kept saves nothing yet.
+                    if (!outcome.wavKept) saved += outcome.wavBytes - outcome.flacBytes
                 }
             } catch (exception: Exception) {
                 compressionFailures[id] = (compressionFailures[id] ?: 0) + 1

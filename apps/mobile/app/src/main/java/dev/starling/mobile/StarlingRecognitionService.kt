@@ -11,6 +11,7 @@ import android.os.Looper
 import android.speech.RecognitionService
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
+import android.util.Log
 import android.widget.Toast
 import dev.starling.mobile.audio.AudioCapture
 import dev.starling.mobile.audio.AudioChunkListener
@@ -67,11 +68,13 @@ class StarlingRecognitionService : RecognitionService() {
         sessions.expire()?.let(::endSession)
         // Free space first (#342): no take starts that the disk cannot hold.
         // The service has no screen of its own; the host keyboard gets the
-        // error, and the reason shows as a toast.
+        // error (RecognitionSessionGuard.DISK_FULL_ERROR), and the reason
+        // shows as a toast and in the log.
         val disk = application.diskBeforeTake()
         if (disk?.level == DiskLevel.CRITICAL) {
+            runCatching { Log.w(TAG, "refused a take: ${disk.availableBytes} bytes free, below the stop threshold") }
             toast(getString(R.string.disk_full_refused, (disk.availableBytes / 1_000_000).toInt()))
-            sessions.deliver(callback) { it.error(SpeechRecognizer.ERROR_CLIENT) }
+            sessions.deliver(callback) { it.error(RecognitionSessionGuard.DISK_FULL_ERROR) }
             return
         }
         if (disk?.level == DiskLevel.LOW) {
@@ -180,6 +183,14 @@ class StarlingRecognitionService : RecognitionService() {
     ) {
         when (val settlement = sessions.settle(ending, result)) {
             is RecognitionSessionGuard.Settlement.Transcribe -> {
+                // Storage ran nearly full and the take stopped itself (#342).
+                // What was said up to then is complete and still goes to the
+                // host as its result, so no error ends the session; the
+                // toast says why the recording stopped early.
+                if (settlement.stoppedForLowDisk) {
+                    runCatching { Log.w(TAG, "a take stopped early: storage is nearly full") }
+                    toast(getString(R.string.recording_stopped_low_disk))
+                }
                 // The WAV is finalized and durable before any network use.
                 val finalized = runCatching {
                     application.recordings.commitAudio(settlement.recording, settlement.durationSeconds)
@@ -271,6 +282,7 @@ class StarlingRecognitionService : RecognitionService() {
     }
 
     companion object {
+        private const val TAG = "StarlingRecognition"
         private val MAX_LISTEN_MILLIS = TimeUnit.MINUTES.toMillis(1)
     }
 }

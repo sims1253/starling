@@ -3,7 +3,9 @@ package dev.starling.mobile.storage
 import dev.starling.mobile.audio.CaptureResult
 import dev.starling.mobile.audio.CaptureStopPolicy
 import dev.starling.mobile.audio.DiskWatch
+import dev.starling.mobile.audio.LowDiskStop
 import dev.starling.mobile.audio.WavWriter
+import dev.starling.mobile.audio.startDiskWatch
 import dev.starling.mobile.data.RecordingStatus
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
@@ -15,6 +17,8 @@ import org.junit.rules.TemporaryFolder
 import java.io.File
 import java.io.IOException
 import java.io.RandomAccessFile
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 
 /** #342: free-space thresholds, the in-take watch and a clean, recoverable low-disk stop. */
 class DiskSpaceTest {
@@ -118,5 +122,62 @@ class DiskSpaceTest {
         assertEquals(RecordingStatus.PENDING, committed.status)
         val audio = store.withRequestAudio(recording.id) { it.readBytes() }
         assertArrayEquals(WavWriter.header(chunk.size.toLong()) + chunk, audio)
+    }
+
+    @Test
+    fun aDelayedProbeFromAnEndedTakeCannotStopTheNextOne() {
+        val stop = LowDiskStop()
+        val probing = CountDownLatch(1)
+        val answer = CountDownLatch(1)
+        // The first take's probe stalls until the next take is running, then reads a full disk.
+        // Like statvfs it cannot be interrupted.
+        val first = stop.begin()
+        val stalled = DiskWatch(
+            probe = {
+                probing.countDown()
+                var interrupted = false
+                while (true) {
+                    try {
+                        answer.await()
+                        break
+                    } catch (_: InterruptedException) {
+                        interrupted = true
+                    }
+                }
+                if (interrupted) Thread.currentThread().interrupt()
+                1 * mib
+            },
+            directory = folder.root,
+            policy = DiskPolicy.DEFAULT,
+            intervalMillis = 0,
+        )
+        val firstWatch = startDiskWatch(stalled, stop, first, tickMillis = 1)
+        assertTrue(probing.await(5, TimeUnit.SECONDS))
+        // The take ends (cancelling its watch) and the next one starts while the probe is out.
+        stop.close(first)
+        firstWatch.interrupt()
+        val second = stop.begin()
+        answer.countDown()
+        firstWatch.join(5_000)
+        assertFalse(firstWatch.isAlive)
+        assertFalse(stop.raised)
+        assertTrue(stop.isOpen(second))
+        assertFalse(stop.raise(first))
+        assertFalse(stop.raised)
+
+        // The running take's own watch still stops it.
+        val full = DiskWatch({ 1 * mib }, folder.root, DiskPolicy.DEFAULT, intervalMillis = 0)
+        val secondWatch = startDiskWatch(full, stop, second, tickMillis = 1)
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+        while (!stop.raised && System.nanoTime() < deadline) Thread.sleep(1)
+        assertTrue(stop.raised)
+        // Ending the take ends its watch; the reason stays readable for the settlement.
+        stop.close(second)
+        secondWatch.join(5_000)
+        assertFalse(secondWatch.isAlive)
+        assertTrue(stop.raised)
+        // The next take starts clear.
+        stop.begin()
+        assertFalse(stop.raised)
     }
 }

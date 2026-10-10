@@ -305,9 +305,12 @@ class AudioRetentionDeviceTest {
         val config = app.backendSettings.load().copy(engine = TranscriptionEngine.ON_DEVICE)
         val started = System.nanoTime()
         assertTrue(app.transcription.transcribe(id, config) { settled = it; latch.countDown() })
-        assertTrue(latch.await(30, TimeUnit.MINUTES))
-        Log.i(TAG, "transcription ${settled!!.status} in ${(System.nanoTime() - started) / 1_000_000} ms ${settled!!.errorMessage ?: ""}")
-        return settled!!
+        // Phase-gated (never in CI): an on-device run of a long take, model
+        // load included, on a phone; the same bound as DurableAudioDeviceTest.
+        assertTrue("the transcription did not settle within 30 minutes", latch.await(30, TimeUnit.MINUTES))
+        val result = requireNotNull(settled) { "the transcription settled without a recording" }
+        Log.i(TAG, "transcription ${result.status} in ${(System.nanoTime() - started) / 1_000_000} ms ${result.errorMessage ?: ""}")
+        return result
     }
 
     private fun play(file: File) {

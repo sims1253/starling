@@ -5,6 +5,7 @@ import android.app.Activity
 import android.content.ComponentName
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.os.ParcelFileDescriptor
 import android.speech.RecognizerIntent
 import android.view.KeyEvent
 import android.widget.Button
@@ -112,13 +113,20 @@ class RecognizeSpeechActivityTest {
         ActivityScenario.launchActivityForResult<RecognizeSpeechActivity>(recognizeIntent()).use { scenario ->
             assumeTrue("no microphone on this emulator", listening(scenario))
             // The key goes to the focused window; the dialog gets focus a
-            // moment after it is resumed.
+            // moment after it is resumed. A system dialog can hold the focus
+            // instead: CI emulators often boot with "System UI isn't
+            // responding" (SystemUI failed to complete startup) on screen.
+            // Dismissing system dialogs leaves the popup alone.
             val instrumentation = InstrumentationRegistry.getInstrumentation()
             val deadline = System.currentTimeMillis() + 10_000
             var focused = false
+            var polls = 0
             while (!focused && System.currentTimeMillis() < deadline) {
                 scenario.onActivity { focused = it.hasWindowFocus() }
-                if (!focused) Thread.sleep(100)
+                if (!focused) {
+                    if (polls++ % 10 == 0) closeSystemDialogs()
+                    Thread.sleep(100)
+                }
             }
             assertTrue("the popup never got window focus", focused)
             instrumentation.sendKeyDownUpSync(KeyEvent.KEYCODE_BACK)
@@ -126,5 +134,12 @@ class RecognizeSpeechActivityTest {
             assertEquals(Activity.RESULT_CANCELED, result.resultCode)
             assertTrue(result.resultData?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS).isNullOrEmpty())
         }
+    }
+
+    private fun closeSystemDialogs() {
+        InstrumentationRegistry.getInstrumentation().uiAutomation
+            .executeShellCommand("am broadcast -a android.intent.action.CLOSE_SYSTEM_DIALOGS")
+            .let { ParcelFileDescriptor.AutoCloseInputStream(it) }
+            .use { it.readBytes() }
     }
 }
