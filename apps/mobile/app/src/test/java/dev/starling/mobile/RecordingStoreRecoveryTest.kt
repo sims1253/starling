@@ -14,6 +14,7 @@ import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
 import java.io.File
+import java.io.IOException
 
 /** #356: audio outlives the capture, the process and every inference outcome. */
 class RecordingStoreRecoveryTest {
@@ -58,11 +59,11 @@ class RecordingStoreRecoveryTest {
     }
 
     @Test
-    fun aTornTrailingByteIsDroppedAndAnUnreadableHeaderConfirmsNothing() {
+    fun aTornTrailingByteIsDroppedAndAnUncheckpointedHeaderConfirmsNothing() {
         val first = RecordingStore(storeDir())
         val recording = first.create()
-        // Not a header this app wrote, plus half a sample at the end.
-        first.partialFile(recording).writeBytes(ByteArray(44) + pcm(second + 1))
+        // Killed before its first checkpoint, with half a sample at the end.
+        killedCapture(first.partialFile(recording), written = second + 1, confirmed = 0)
 
         val recovered = RecordingStore(storeDir()).get(recording.id)
 
@@ -70,6 +71,147 @@ class RecordingStoreRecoveryTest {
         assertEquals(1.0, recovered.recovery!!.recoveredSeconds, 1e-9)
         assertEquals(0.0, recovered.recovery!!.confirmedSeconds, 1e-9)
         assertEquals(44L + second, File(storeDir(), recovered.wavName).length())
+    }
+
+    @Test
+    fun aPartialThatIsNotThisAppsWavIsKeptAsideUnchangedAndNotTakenForAudio() {
+        val first = RecordingStore(storeDir())
+        val zeros = first.create()
+        val foreign = first.create()
+        val zeroBytes = ByteArray(44) + pcm(second)
+        first.partialFile(zeros).writeBytes(zeroBytes)
+        // A RIFF/WAVE header, but not 16 kHz mono PCM16.
+        val foreignBytes = WavWriter.header(second.toLong()).also { it[24] = 0x44; it[25] = 0xac.toByte() } + pcm(second)
+        first.partialFile(foreign).writeBytes(foreignBytes)
+
+        val reopened = RecordingStore(storeDir())
+
+        for ((recording, bytes) in listOf(zeros to zeroBytes, foreign to foreignBytes)) {
+            val failed = reopened.get(recording.id)
+            assertEquals(RecordingStatus.FAILED, failed.status)
+            assertEquals(RecordingStore.UNRECOGNIZED_CAPTURE, failed.errorMessage)
+            assertNull(failed.recovery)
+            assertFalse(reopened.audioFile(recording).exists())
+            assertFalse(reopened.partialFile(recording).exists())
+            assertArrayEquals(bytes, File(storeDir(), "${recording.id}.wav.unrecognized").readBytes())
+        }
+        // Settled: another open changes nothing.
+        val again = RecordingStore(storeDir())
+        assertEquals(RecordingStore.UNRECOGNIZED_CAPTURE, again.get(zeros.id).errorMessage)
+        assertArrayEquals(zeroBytes, File(storeDir(), "${zeros.id}.wav.unrecognized").readBytes())
+
+        again.delete(zeros.id)
+        assertFalse(File(storeDir(), "${zeros.id}.wav.unrecognized").exists())
+    }
+
+    @Test
+    fun aFailedSetAsideKeepsTheUnrecognizedPartialAndIsRetriedAtTheNextOpen() {
+        val first = RecordingStore(storeDir())
+        val recording = first.create()
+        val bytes = pcm(44 + second)
+        first.partialFile(recording).writeBytes(bytes)
+        val aside = File(storeDir(), "${recording.id}.wav.unrecognized")
+
+        val failed = RecordingStore(storeDir(), move = { _, _ -> throw IOException("injected rename failure") })
+            .get(recording.id)
+
+        assertEquals(RecordingStatus.FAILED, failed.status)
+        assertEquals(RecordingStore.UNRECOVERED_CAPTURE, failed.errorMessage)
+        assertArrayEquals(bytes, first.partialFile(recording).readBytes())
+        assertFalse(aside.exists())
+
+        val settled = RecordingStore(storeDir()).get(recording.id)
+        assertEquals(RecordingStore.UNRECOGNIZED_CAPTURE, settled.errorMessage)
+        assertArrayEquals(bytes, aside.readBytes())
+    }
+
+    @Test
+    fun anUnrecognizedPartialNeverReplacesOneAlreadySetAside() {
+        val first = RecordingStore(storeDir())
+        val recording = first.create()
+        val earlier = pcm(100)
+        val aside = File(storeDir(), "${recording.id}.wav.unrecognized").apply { writeBytes(earlier) }
+        val bytes = pcm(44 + second)
+        first.partialFile(recording).writeBytes(bytes)
+
+        val failed = RecordingStore(storeDir()).get(recording.id)
+
+        assertEquals(RecordingStatus.FAILED, failed.status)
+        assertEquals(RecordingStore.UNRECOVERED_CAPTURE, failed.errorMessage)
+        assertArrayEquals(earlier, aside.readBytes())
+        assertArrayEquals(bytes, first.partialFile(recording).readBytes())
+    }
+
+    @Test
+    fun anUnrecognizedPartialBesideAPromotedWavLeavesTheRecordingItsAudio() {
+        val first = RecordingStore(storeDir())
+        val recording = first.create()
+        File(storeDir(), recording.wavName).writeBytes(WavWriter.header(second.toLong()) + pcm(second))
+        first.partialFile(recording).writeBytes(pcm(44 + second))
+
+        val recovered = RecordingStore(storeDir()).get(recording.id)
+
+        assertEquals(RecordingStatus.PENDING, recovered.status)
+        assertEquals(1.0, recovered.durationSeconds, 1e-9)
+        assertTrue(File(storeDir(), "${recording.id}.wav.unrecognized").isFile)
+        assertFalse(first.partialFile(recording).exists())
+    }
+
+    @Test
+    fun headerSizesThatDisagreeConfirmNothing() {
+        val first = RecordingStore(storeDir())
+        val recording = first.create()
+        // A torn checkpoint: the data size of one write, the RIFF size of another.
+        val header = WavWriter.header(2L * second).also { torn ->
+            WavWriter.header(second.toLong()).copyInto(torn, destinationOffset = 4, startIndex = 4, endIndex = 8)
+        }
+        first.partialFile(recording).writeBytes(header + pcm(3 * second))
+
+        val recovered = RecordingStore(storeDir()).get(recording.id)
+
+        assertEquals(RecordingStatus.PENDING, recovered.status)
+        assertEquals(3.0, recovered.recovery!!.recoveredSeconds, 1e-9)
+        assertEquals(0.0, recovered.recovery!!.confirmedSeconds, 1e-9)
+    }
+
+    @Test
+    fun aFailedPromotionNeverCostsTheAudioAlreadyInPlace() {
+        val first = RecordingStore(storeDir())
+        val recording = first.create()
+        val audio = File(storeDir(), recording.wavName)
+        val existing = WavWriter.header(second.toLong()) + pcm(second)
+        audio.writeBytes(existing)
+        killedCapture(first.partialFile(recording), written = 3 * second, confirmed = 2 * second)
+
+        val failing = RecordingStore(storeDir(), move = { _, _ -> throw IOException("injected rename failure") })
+        val failed = failing.get(recording.id)
+
+        assertEquals(RecordingStatus.FAILED, failed.status)
+        assertEquals(RecordingStore.UNRECOVERED_CAPTURE, failed.errorMessage)
+        assertArrayEquals(existing, audio.readBytes())
+        assertEquals(44L + 3 * second, failing.partialFile(recording).length())
+
+        // The next open replaces the audio in one rename.
+        val recovered = RecordingStore(storeDir()).get(recording.id)
+        assertEquals(RecordingStatus.PENDING, recovered.status)
+        assertEquals(3.0, recovered.durationSeconds, 1e-9)
+        assertEquals(2.0, recovered.recovery!!.confirmedSeconds, 1e-9)
+        assertEquals(44L + 3 * second, audio.length())
+        assertFalse(first.partialFile(recording).exists())
+    }
+
+    @Test
+    fun aCaptureCutOffWhileWritingItsFirstHeaderHasNothingToKeep() {
+        val first = RecordingStore(storeDir())
+        val recording = first.create()
+        first.partialFile(recording).writeBytes(WavWriter.header(0).copyOf(20))
+
+        val failed = RecordingStore(storeDir()).get(recording.id)
+
+        assertEquals(RecordingStatus.FAILED, failed.status)
+        assertEquals(RecordingStore.INTERRUPTED_CAPTURE, failed.errorMessage)
+        assertFalse(first.partialFile(recording).exists())
+        assertFalse(File(storeDir(), "${recording.id}.wav.unrecognized").exists())
     }
 
     @Test

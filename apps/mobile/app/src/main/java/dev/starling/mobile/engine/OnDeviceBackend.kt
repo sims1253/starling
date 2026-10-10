@@ -21,6 +21,9 @@ class OnDeviceBackend(private val engine: OnDeviceEngine) {
             )
         }
 
+    /** The model a transcription without an explicit one uses; null when none is installed. */
+    fun activeModelName(): String? = runCatching { engine.activeModelName() }.getOrNull()
+
     /**
      * Starts live on-device transcription for a capture that is about to
      * begin, or null when no model is imported (the recording then goes

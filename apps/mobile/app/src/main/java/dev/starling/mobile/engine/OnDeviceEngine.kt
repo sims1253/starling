@@ -643,7 +643,7 @@ class OnDeviceEngine(
                     "the on-device engine returned an error: ${error ?: "unknown error"}",
                 )
             }
-            OnDeviceStreamSession.WindowResult.Text(text)
+            OnDeviceStreamSession.WindowResult.Text(text, loadedFile?.name)
         }
     }
 

@@ -66,7 +66,8 @@ class OnDeviceStreamSession(
     }
 
     sealed interface WindowResult {
-        data class Text(val text: String) : WindowResult
+        /** [model]: the model that transcribed this window, when the engine knows it. */
+        data class Text(val text: String, val model: String? = null) : WindowResult
         data class Failed(val reason: String) : WindowResult
     }
 
@@ -246,13 +247,19 @@ class OnDeviceStreamSession(
         var steppedSize = -1
         var lastPartial: String? = null
         var windowFailure: String? = null
+        // The models that transcribed windows: a driver failure voids the
+        // pin, and the reload may pick up another active model mid-take.
+        val windowModels = LinkedHashSet<String>()
         val tx = ChunkStreamer.Transcriber { samples, start, length ->
             // The snapshot is exactly the live tail, so a window that spans all
             // of it (every flush, most partials) is passed without a copy.
             val window = if (start == 0 && length == samples.size) samples else samples.copyOfRange(start, start + length)
             when (val result = runCatching { engine.transcribeWindow(window) }
                 .getOrElse { WindowResult.Failed(it.message ?: it::class.java.simpleName) }) {
-                is WindowResult.Text -> result.text
+                is WindowResult.Text -> {
+                    result.model?.let(windowModels::add)
+                    result.text
+                }
                 is WindowResult.Failed -> {
                     windowFailure = result.reason
                     null
@@ -283,7 +290,7 @@ class OnDeviceStreamSession(
                 val text = streamer.flush(snapshot, snapshotSize, tx)
                 lock.withLock {
                     if (text != null) {
-                        settleLocked(CommitOutcome.Final(text, model))
+                        settleLocked(CommitOutcome.Final(text, windowModels.joinToString(", ").ifEmpty { model }))
                     } else {
                         failLocked(windowFailure ?: "the on-device engine failed", bufferLimitReached = false)
                     }

@@ -89,6 +89,43 @@ class OnDeviceStreamSessionTest {
     }
 
     @Test
+    fun theFinalNamesEveryModelThatTranscribedItsWindows() {
+        val calls = AtomicInteger()
+        // A driver failure voided the pin after the first window and the
+        // reload picked up another active model.
+        val engine = object : OnDeviceStreamSession.LiveEngine {
+            override fun prepare(cancelled: () -> Boolean): String? = null
+            override fun loadedModelName(): String = "a.gguf"
+            override fun transcribeWindow(samples: FloatArray) = OnDeviceStreamSession.WindowResult.Text(
+                "w",
+                if (calls.incrementAndGet() == 1) "a.gguf" else "b.gguf",
+            )
+        }
+        val session = session(engine)
+        awaitEvent { it == StreamEvent.Live }
+        val chunk = pcm(1.0)
+        session.onAudio(chunk, chunk.size)
+        awaitEvent { it is StreamEvent.Partial }
+        session.onAudio(chunk, chunk.size)
+
+        assertEquals("a.gguf, b.gguf", (session.finish() as CommitOutcome.Final).model)
+    }
+
+    @Test
+    fun withoutPerWindowModelsTheFinalNamesThePreparedModel() {
+        val engine = object : OnDeviceStreamSession.LiveEngine {
+            override fun prepare(cancelled: () -> Boolean): String? = null
+            override fun loadedModelName(): String = "a.gguf"
+            override fun transcribeWindow(samples: FloatArray) = OnDeviceStreamSession.WindowResult.Text("w")
+        }
+        val session = session(engine)
+        val chunk = pcm(1.0)
+        session.onAudio(chunk, chunk.size)
+
+        assertEquals("a.gguf", (session.finish() as CommitOutcome.Final).model)
+    }
+
+    @Test
     fun aModelThatCannotLoadInterruptsTheStreamAndFallsBack() {
         val session = session(FakeEngine(loadError = "no model"))
 

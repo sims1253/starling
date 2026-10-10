@@ -33,6 +33,7 @@ import java.util.UUID
  */
 class RecordingStore internal constructor(
     private val directory: File,
+    private val move: (File, File) -> Unit = Durability::replace,
     private val clock: () -> Long = System::currentTimeMillis,
 ) {
     constructor(context: Context) : this(File(context.applicationContext.filesDir, "recordings"))
@@ -91,13 +92,7 @@ class RecordingStore internal constructor(
         if (!isFinalizedWav(partial)) {
             throw IOException("Recording did not produce a complete WAV")
         }
-        val destination = audioFile(recording)
-        if (destination.exists() && !destination.delete()) {
-            throw IOException("Unable to replace the recording audio")
-        }
-        if (!partial.renameTo(destination)) {
-            throw IOException("Unable to finalize the recording audio")
-        }
+        move(partial, audioFile(recording))
         syncDirectory()
         val updated = recording.copy(
             status = RecordingStatus.PENDING,
@@ -172,11 +167,12 @@ class RecordingStore internal constructor(
         val metadata = metadataFile(id)
         val audio = File(directory, "$id.wav")
         val partial = File(directory, "$id.wav.part")
+        val unrecognized = File(directory, "$id.wav.unrecognized")
         val temporary = File(directory, ".$id.json.tmp")
         // Metadata goes last: until every payload file is gone it stays,
         // so an interrupted or failed delete (of an ephemeral take, too) is
         // found and finished again on the next open.
-        val failures = listOf(audio, partial, temporary)
+        val failures = listOf(audio, partial, unrecognized, temporary)
             .filter { it.exists() && !it.delete() }
         if (failures.isNotEmpty() || (metadata.exists() && !metadata.delete())) {
             throw IOException("Unable to delete recording files")
@@ -374,8 +370,11 @@ class RecordingStore internal constructor(
      * recording made PENDING. A repeat keeps the first note's (smaller)
      * confirmed size, since by then the header it was read from is repaired.
      * A WAV already promoted without a note is a clean Stop whose metadata
-     * commit was cut off, so it is not marked as recovered. Caller holds
-     * [lock].
+     * commit was cut off, so it is not marked as recovered. The promotion
+     * replaces the destination in one rename, so no step leaves the
+     * recording without the audio it had. A partial that is not this app's
+     * WAV is neither repaired nor deleted: it is set aside unchanged and the
+     * recording is FAILED with [UNRECOGNIZED_CAPTURE]. Caller holds [lock].
      */
     private fun salvageLocked(recording: Recording, reason: String): Recording {
         val destination = audioFile(recording)
@@ -389,60 +388,88 @@ class RecordingStore internal constructor(
                 .also(::save)
         }
         if (partial.isFile) {
-            val measured = measurePartial(partial)
-            if (measured != null) {
-                val (dataBytes, confirmedBytes) = measured
-                val confirmed = seconds(confirmedBytes)
-                recovery = CaptureRecovery(
-                    reason = recovery?.reason ?: reason,
-                    recoveredSeconds = seconds(dataBytes),
-                    confirmedSeconds = recovery?.confirmedSeconds?.let { minOf(it, confirmed) } ?: confirmed,
-                )
-                save(recording.copy(recovery = recovery))
-                repairPartial(partial, dataBytes)
-                if (destination.exists() && !destination.delete()) {
-                    throw IOException("Unable to replace the recording audio")
+            when (val measured = measurePartial(partial)) {
+                is PartialContent.Audio -> {
+                    val confirmed = seconds(measured.confirmedBytes)
+                    recovery = CaptureRecovery(
+                        reason = recovery?.reason ?: reason,
+                        recoveredSeconds = seconds(measured.dataBytes),
+                        confirmedSeconds = recovery?.confirmedSeconds?.let { minOf(it, confirmed) } ?: confirmed,
+                    )
+                    save(recording.copy(recovery = recovery))
+                    repairPartial(partial, measured.dataBytes)
+                    move(partial, destination)
+                    syncDirectory()
                 }
-                if (!partial.renameTo(destination)) throw IOException("Unable to recover the recording audio")
-                syncDirectory()
-            } else {
                 // A header without a single sample: nothing to keep.
-                partial.delete()
+                PartialContent.Empty -> partial.delete()
+                PartialContent.Unrecognized -> {
+                    val aside = unrecognizedFile(recording)
+                    // Never replaced: whatever was set aside before is kept too.
+                    if (aside.exists()) throw IOException("Unable to set aside the unrecognized recording audio")
+                    // Its bytes may still be only in the page cache of the
+                    // process that died; they are on storage before the
+                    // recording says they are kept.
+                    RandomAccessFile(partial, "rw").use { it.fd.sync() }
+                    move(partial, aside)
+                    syncDirectory()
+                }
             }
         }
         val dataBytes = finalizedDataBytes(destination)
-        val salvaged = if (dataBytes != null && dataBytes > 0) {
-            recording.copy(
+        val salvaged = when {
+            dataBytes != null && dataBytes > 0 -> recording.copy(
                 status = RecordingStatus.PENDING,
                 durationSeconds = seconds(dataBytes),
                 errorMessage = null,
                 recovery = recovery,
             )
-        } else {
-            recording.copy(status = RecordingStatus.FAILED, errorMessage = reason, recovery = null)
+            unrecognizedFile(recording).exists() ->
+                recording.copy(status = RecordingStatus.FAILED, errorMessage = UNRECOGNIZED_CAPTURE, recovery = null)
+            else -> recording.copy(status = RecordingStatus.FAILED, errorMessage = reason, recovery = null)
         }
         save(salvaged)
         return salvaged
     }
 
+    private sealed interface PartialContent {
+        /**
+         * The whole-sample payload size, and the part of it the capture had
+         * confirmed on storage (the size its last header checkpoint
+         * recorded, see WavWriter.checkpoint).
+         */
+        data class Audio(val dataBytes: Long, val confirmedBytes: Long) : PartialContent
+
+        /** This app's header, or the start of it, without a single sample. */
+        object Empty : PartialContent
+
+        /** Not a WAV this app wrote: nothing in it can be read as its audio. */
+        object Unrecognized : PartialContent
+    }
+
     /**
-     * The whole-sample payload size of a partial WAV, and the part of it the
-     * capture had confirmed on storage (the size its last header checkpoint
-     * recorded, see WavWriter.checkpoint); null when it holds no audio.
+     * What a partial WAV holds. WavWriter syncs a complete header before any
+     * audio, so a partial whose header is not this app's (16 kHz mono PCM16)
+     * is not taken for audio.
      */
-    private fun measurePartial(partial: File): Pair<Long, Long>? = RandomAccessFile(partial, "r").use { file ->
+    private fun measurePartial(partial: File): PartialContent = RandomAccessFile(partial, "r").use { file ->
         val length = file.length()
-        if (length <= WAV_HEADER_BYTES) return null
-        val dataBytes = minOf(length - WAV_HEADER_BYTES, WavWriter.MAX_DATA_BYTES) and 1L.inv()
-        if (dataBytes <= 0) return null
-        val header = ByteArray(WAV_HEADER_BYTES.toInt())
+        val header = ByteArray(minOf(length, WAV_HEADER_BYTES).toInt())
         file.readFully(header)
-        val confirmed = if (isPcmHeader(header)) {
-            (littleEndianInt(header, 40).toLong() and 0xffffffffL).coerceAtMost(dataBytes)
-        } else {
-            0L
+        if (length < WAV_HEADER_BYTES) {
+            // Cut off while WavWriter wrote its first header.
+            val started = header.contentEquals(WavWriter.header(0).copyOf(header.size))
+            return if (started) PartialContent.Empty else PartialContent.Unrecognized
         }
-        dataBytes to confirmed
+        if (!isOwnHeader(header)) return PartialContent.Unrecognized
+        val dataBytes = minOf(length - WAV_HEADER_BYTES, WavWriter.MAX_DATA_BYTES) and 1L.inv()
+        if (dataBytes <= 0) return PartialContent.Empty
+        val headerData = littleEndianInt(header, 40).toLong() and 0xffffffffL
+        val riffSize = littleEndianInt(header, 4).toLong() and 0xffffffffL
+        // Both sizes come from one checkpoint write; sizes that disagree
+        // (a torn write) confirm nothing.
+        val confirmed = if (riffSize == headerData + WAV_HEADER_BYTES - 8) headerData.coerceAtMost(dataBytes) else 0L
+        PartialContent.Audio(dataBytes, confirmed)
     }
 
     /** Makes a partial WAV a valid one over its first [dataBytes] of payload, and syncs it. */
@@ -453,10 +480,14 @@ class RecordingStore internal constructor(
         file.fd.sync()
     }
 
-    private fun isPcmHeader(header: ByteArray): Boolean =
-        header.copyOfRange(0, 4).contentEquals("RIFF".toByteArray(Charsets.US_ASCII)) &&
-            header.copyOfRange(8, 12).contentEquals("WAVE".toByteArray(Charsets.US_ASCII)) &&
-            header.copyOfRange(36, 40).contentEquals("data".toByteArray(Charsets.US_ASCII))
+    /**
+     * A RIFF/WAVE header with this app's format chunk and a data chunk; the
+     * two size fields (bytes 4..8 and 40..44) may hold anything.
+     */
+    private fun isOwnHeader(header: ByteArray): Boolean {
+        val expected = WavWriter.header(0)
+        return (0 until 4).all { header[it] == expected[it] } && (8 until 40).all { header[it] == expected[it] }
+    }
 
     /** The payload size of a finalized WAV, or null when [file] is not one. */
     private fun finalizedDataBytes(file: File): Long? =
@@ -489,6 +520,9 @@ class RecordingStore internal constructor(
 
     private fun metadataFile(id: String): File = File(directory, "$id.json")
 
+    /** Where a partial that is not this app's WAV is kept, unchanged, until the recording is deleted. */
+    private fun unrecognizedFile(recording: Recording): File = File(directory, "${recording.id}.wav.unrecognized")
+
     private fun requireValidId(id: String) {
         require(UUID_PATTERN.matches(id)) { "Invalid recording id" }
     }
@@ -500,6 +534,9 @@ class RecordingStore internal constructor(
         const val INTERRUPTED_CAPTURE = "The recording was interrupted: the app or the phone stopped while it was recording."
         const val UNRECOVERED_CAPTURE =
             "The recording's audio could not be recovered yet; Starling tries again the next time it starts."
+        const val UNRECOGNIZED_CAPTURE =
+            "The recording did not finish cleanly, and its partial audio is not a WAV Starling recognizes, " +
+                "so no audio could be recovered. The file is kept unchanged until this recording is deleted."
         const val NO_SPEECH_ON_RETRY = "This attempt recognized no speech; the earlier result is kept."
         const val INTERRUPTED_TRANSCRIPTION =
             "Transcription was interrupted when the app stopped. The audio is saved; retry it."

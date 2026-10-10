@@ -5,6 +5,8 @@ import android.system.Os
 import android.system.OsConstants
 import java.io.File
 import java.io.IOException
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
 
 internal object Durability {
     private val ON_ANDROID = System.getProperty("java.vm.name") == "Dalvik"
@@ -26,5 +28,15 @@ internal object Durability {
         } catch (exception: ErrnoException) {
             throw IOException("Unable to sync ${directory.name}", exception)
         }
+    }
+
+    /**
+     * Renames [source] to [target] in one step (rename(2)), replacing a file
+     * already there: at every moment [target] is the old file or the new
+     * one, never missing. Throws when the rename fails, leaving both as they
+     * were. Callers sync the directory afterwards.
+     */
+    fun replace(source: File, target: File) {
+        Files.move(source.toPath(), target.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
     }
 }

@@ -131,7 +131,7 @@ class TranscriptionCoordinator(
                                 outcome.text,
                                 TranscriptionProvenance.LIVE_STREAM,
                                 source(config),
-                                outcome.model ?: remoteModel(config),
+                                model(outcome.model, config),
                             )
                         }.getOrElse {
                             store.markFailed(id, "Transcript was received but could not be saved")
@@ -177,7 +177,7 @@ class TranscriptionCoordinator(
                     result.rawTranscript,
                     TranscriptionProvenance.BATCH_UPLOAD,
                     source(config),
-                    result.model ?: remoteModel(config),
+                    model(result.model, config),
                 )
             }.getOrElse {
                 store.markFailed(queued.id, "Transcript was received but could not be saved")
@@ -217,6 +217,16 @@ class TranscriptionCoordinator(
                 }
         }
 
+    /**
+     * The model a result names, else the configured one: an on-device
+     * stream may not report the model it ran, and the transcript's record
+     * still names one.
+     */
+    private fun model(reported: String?, config: BackendConfig): String? = reported ?: when (config.engine) {
+        TranscriptionEngine.ON_DEVICE -> config.onDeviceModel ?: onDevice.activeModelName()
+        TranscriptionEngine.REMOTE -> config.model
+    }
+
     private fun callbackFailure(id: String, message: String, callback: (Recording) -> Unit) {
         val failed = runCatching { store.markFailed(id, message) }.getOrNull()
         if (failed != null) {
@@ -229,9 +239,6 @@ class TranscriptionCoordinator(
             TranscriptionEngine.ON_DEVICE -> TranscriptSource.ON_DEVICE
             TranscriptionEngine.REMOTE -> TranscriptSource.SERVER
         }
-
-        private fun remoteModel(config: BackendConfig): String? =
-            config.model.takeIf { config.engine == TranscriptionEngine.REMOTE }
 
         /**
          * Remote configurations attempt `WS /stream` and fall back to batch

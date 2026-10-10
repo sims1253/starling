@@ -874,17 +874,29 @@ class MainActivity : Activity() {
             refreshRecordings()
             return
         }
+        // Prepared off the main thread (a long WAV must not stall it). The
+        // row offers Stop at once; a tap while preparing releases the
+        // player, and a released or replaced player's callbacks do nothing.
         val player = MediaPlayer()
-        val started = runCatching {
+        val queued = runCatching {
             player.setDataSource(application.recordings.audioFile(recording).absolutePath)
+            player.setOnPreparedListener { if (this.player === it) it.start() }
             player.setOnCompletionListener {
+                if (this.player !== it) return@setOnCompletionListener
                 stopPlayback()
                 refreshRecordings()
             }
-            player.prepare()
-            player.start()
+            player.setOnErrorListener { failed, _, _ ->
+                if (this.player === failed) {
+                    stopPlayback()
+                    recordingMessage.setText(R.string.playback_error)
+                    refreshRecordings()
+                }
+                true
+            }
+            player.prepareAsync()
         }.isSuccess
-        if (!started) {
+        if (!queued) {
             player.release()
             recordingMessage.setText(R.string.playback_error)
             return
