@@ -1,8 +1,10 @@
 package dev.starling.mobile.data
 
 /**
- * A recording is kept on disk until the user explicitly deletes it. The raw
- * transcript returned by Starling is stored verbatim in [rawTranscript].
+ * A recording is kept on disk until the user explicitly deletes it; only
+ * a retention limit the user set can remove its audio (#342), and then
+ * the recording and its transcripts stay. The raw transcript returned by
+ * Starling is stored verbatim in [rawTranscript].
  */
 enum class RecordingStatus {
     RECORDING,
@@ -57,6 +59,25 @@ data class CaptureRecovery(
     val confirmedSeconds: Double,
 )
 
+/**
+ * Which retention limits govern a take's audio (#342). Archival takes
+ * follow their own limits; they are still kept losslessly (no lossy
+ * archival format yet).
+ */
+enum class RetentionClass(val key: String) {
+    STANDARD("standard"),
+    ARCHIVAL("archival"),
+}
+
+/** Which retention limit made a take's audio due. */
+enum class RetireReason { AGE, SIZE }
+
+/**
+ * The retention policy removed this take's audio (#342); the take, its
+ * transcripts and revisions stay.
+ */
+data class AudioRemoval(val atMillis: Long, val reason: RetireReason)
+
 data class Recording(
     val id: String,
     val createdAtMillis: Long,
@@ -78,4 +99,12 @@ data class Recording(
     val revisions: List<TranscriptRevision> = emptyList(),
     /** Set when the audio was recovered from an interrupted capture. */
     val recovery: CaptureRecovery? = null,
+    val retentionClass: RetentionClass = RetentionClass.STANDARD,
+    /** Set once the retention policy removed the audio. */
+    val audioRemoved: AudioRemoval? = null,
+    /**
+     * Deleted by the user while a reader held its audio: hidden everywhere,
+     * and its files go once the reader is done (or at the next start).
+     */
+    val deleted: Boolean = false,
 )

@@ -5,6 +5,7 @@ import dev.starling.mobile.audio.CaptureResult
 import dev.starling.mobile.data.Recording
 import dev.starling.mobile.data.RecordingStatus
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
@@ -34,6 +35,24 @@ class RecognitionSessionGuardTest {
             CaptureResult.Completed(2.5),
         ) as RecognitionSessionGuard.Settlement.Transcribe
         assertEquals(2.5, settlement.durationSeconds, 0.0)
+    }
+
+    @Test
+    fun aTakeStoppedForLowDiskIsStillTranscribedAndDelivered() {
+        val guard = RecognitionSessionGuard<Any>()
+        guard.begin(recording(), owner)
+        // The capture ended itself; the service finishes it like a stop.
+        val ending = guard.stopListening(owner) as RecognitionSessionGuard.Ending.Finalize
+        val settlement = guard.settle(
+            ending,
+            CaptureResult.Completed(4.0, stoppedForLowDisk = true),
+        ) as RecognitionSessionGuard.Settlement.Transcribe
+        assertTrue(settlement.stoppedForLowDisk)
+        assertEquals(4.0, settlement.durationSeconds, 0.0)
+        val ordinary = guard.settle(ending, CaptureResult.Completed(4.0)) as RecognitionSessionGuard.Settlement.Transcribe
+        assertFalse(ordinary.stoppedForLowDisk)
+        // A take refused for lack of space is an audio (recording) error.
+        assertEquals(SpeechRecognizer.ERROR_AUDIO, RecognitionSessionGuard.DISK_FULL_ERROR)
     }
 
     @Test

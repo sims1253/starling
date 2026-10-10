@@ -8,6 +8,8 @@ import android.media.MediaRecorder
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import dev.starling.mobile.storage.DiskPolicy
+import dev.starling.mobile.storage.FreeSpaceProbe
 import java.io.File
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.LinkedBlockingQueue
@@ -20,10 +22,14 @@ sealed interface CaptureResult {
      * when it ended at the maximum recording duration instead of an explicit
      * stop: the audio is valid up to the cap and must be committed through
      * the normal completed path so it stays transcribable.
+     * [stoppedForLowDisk] is true when the capture ended itself because
+     * storage ran nearly full (#342): the WAV is just as complete and is
+     * committed the same way; the owner tells the user why it stopped.
      */
     data class Completed(
         val durationSeconds: Double,
         val cappedAtLimit: Boolean = false,
+        val stoppedForLowDisk: Boolean = false,
     ) : CaptureResult
     data class Failed(val message: String) : CaptureResult
     data object AlreadyStopped : CaptureResult
@@ -52,8 +58,17 @@ fun interface AudioChunkListener {
  * the capture, its stop choreography, or the two-hour cap. An optional
  * `onEnded` runs on the main thread when the microphone ends without a
  * stop() request, so the owner can stop() and settle it.
+ *
+ * While a take runs its free space is checked every
+ * [DiskPolicy.IN_TAKE_INTERVAL_MILLIS] through [diskProbe] (#342). Below
+ * the stop threshold, or when a write fails for lack of space, the capture
+ * ends itself like at the two-hour cap: the WAV is finalized and stop()
+ * reports [CaptureResult.Completed] with `stoppedForLowDisk`.
  */
-class AudioCapture {
+class AudioCapture(
+    private val diskProbe: FreeSpaceProbe = FreeSpaceProbe.current,
+    private val diskPolicy: DiskPolicy = DiskPolicy.DEFAULT,
+) {
     private val lock = Any()
 
     @Volatile
@@ -64,6 +79,12 @@ class AudioCapture {
     private var workerError: String? = null
     private var cappedAtLimit = false
     private var state = State.IDLE
+
+    // Raised by the disk watch thread (critical free space) or the capture
+    // thread (a write refused for lack of space); ends the capture loop.
+    // Tied to the take: [takeToken] is the running take's, guarded by [lock].
+    private val lowDisk = LowDiskStop()
+    private var takeToken = 0L
 
     // Guarded by [lock]: completion callbacks of stop() calls that are
     // still waiting for the worker, and whether a background task for the
@@ -132,10 +153,20 @@ class AudioCapture {
         cappedAtLimit = false
         writerBytes = 0
         stopRequested = false
+        val token = lowDisk.begin()
+        takeToken = token
         state = State.RECORDING
-        worker = Thread({ captureLoop(audioRecord, wavWriter, bufferSize, onChunk, onEnded) }, "starling-audio-capture")
-            .also { it.start() }
         startCheckpoints(wavWriter)
+        val diskWatch = startDiskWatch(
+            DiskWatch(diskProbe, outputFile.absoluteFile.parentFile ?: outputFile, diskPolicy),
+            lowDisk,
+            token,
+            CHECKPOINT_INTERVAL_MILLIS,
+        )
+        worker = Thread(
+            { captureLoop(audioRecord, wavWriter, bufferSize, onChunk, onEnded, token, diskWatch) },
+            "starling-audio-capture",
+        ).also { it.start() }
         null
     }
 
@@ -174,7 +205,9 @@ class AudioCapture {
      * The durability checkpoints of one capture (see [WavWriter.checkpoint]):
      * every [CHECKPOINT_INTERVAL_MILLIS] the written audio is fsynced and its
      * size recorded in the header, off the capture thread so a slow flush
-     * can never make the microphone overrun. Ends with the writer.
+     * can never make the microphone overrun. The free space is watched on a
+     * thread of its own ([startDiskWatch]), so a stalled flush cannot keep a
+     * filling disk from stopping the take. Both end with the take.
      */
     private fun startCheckpoints(wavWriter: WavWriter) {
         Thread({
@@ -219,6 +252,9 @@ class AudioCapture {
                 null
             } else {
                 stopRequested = true
+                // An explicit stop is never reported as a low-disk one,
+                // unless the take had already ended by itself for low disk.
+                lowDisk.cancel(takeToken)
                 state = State.STOPPING
                 stopCallbacks.add(onSettled)
                 recorder to worker
@@ -243,11 +279,10 @@ class AudioCapture {
             }
         }
 
-        val (error, bytes, capped) = workerOutcome()
         if (captureThread?.isAlive != true) {
             // The worker exited: settle inline on the calling thread,
             // exactly like the synchronous stop this replaces.
-            finishSettlement(CaptureStopPolicy.settle(error, bytes, capped), fromEscalation = false)
+            finishSettlement(workerOutcome(), fromEscalation = false)
             return
         }
 
@@ -280,8 +315,7 @@ class AudioCapture {
             // The worker exited on its own after stop() armed this task,
             // so nobody else will settle the capture or deliver the
             // pending callbacks.
-            val (error, bytes, capped) = workerOutcome()
-            finishSettlement(CaptureStopPolicy.settle(error, bytes, capped), fromEscalation = true)
+            finishSettlement(workerOutcome(), fromEscalation = true)
             return
         }
 
@@ -307,7 +341,6 @@ class AudioCapture {
             }
         }
 
-        val (error, bytes, capped) = workerOutcome()
         if (captureThread.isAlive) {
             // Keep STOPPING and the worker reference while a device refuses
             // to unblock. A subsequent stop can continue waiting, and start()
@@ -321,7 +354,7 @@ class AudioCapture {
             deliver(callbacks, CaptureStopPolicy.ZOMBIE_RESULT, fromEscalation = true)
             return
         }
-        finishSettlement(CaptureStopPolicy.settle(error, bytes, capped), fromEscalation = true)
+        finishSettlement(workerOutcome(), fromEscalation = true)
     }
 
     /**
@@ -371,8 +404,8 @@ class AudioCapture {
         }
     }
 
-    private fun workerOutcome(): Triple<String?, Long, Boolean> = synchronized(lock) {
-        Triple(workerError, writerBytes, cappedAtLimit)
+    private fun workerOutcome(): CaptureResult = synchronized(lock) {
+        CaptureStopPolicy.settle(workerError, writerBytes, cappedAtLimit, lowDisk.raised)
     }
 
     /**
@@ -404,11 +437,13 @@ class AudioCapture {
         bufferSize: Int,
         onChunk: AudioChunkListener?,
         onEnded: (() -> Unit)?,
+        token: Long,
+        diskWatch: Thread,
     ) {
         val buffer = ByteArray(bufferSize)
         var bytesWritten = 0L
         try {
-            while (!stopRequested) {
+            while (!stopRequested && !lowDisk.endIfRaised(token)) {
                 val count = audioRecord.read(buffer, buffer.size)
                 when {
                     count > 0 -> {
@@ -438,12 +473,19 @@ class AudioCapture {
                 }
             }
         } catch (exception: Exception) {
-            if (!stopRequested) {
+            if (DiskWatch.isOutOfSpace(exception)) {
+                // The disk filled between checks: end like a low-space stop.
+                // finish() trims a torn chunk, so the WAV stays complete.
+                lowDisk.endIfRaised(token, outOfSpace = true)
+            } else if (!stopRequested) {
                 synchronized(lock) {
                     workerError = exception.message ?: "Microphone capture failed"
                 }
             }
         } finally {
+            // The take is over: its watch can no longer stop anything.
+            lowDisk.close(token)
+            diskWatch.interrupt()
             synchronized(lock) { writerBytes = bytesWritten }
             try {
                 wavWriter.finish()
@@ -458,7 +500,7 @@ class AudioCapture {
                 // It may already have been stopped by stop().
             }
             audioRecord.release()
-            // The microphone ended on its own (read error, two-hour cap):
+            // The microphone ended on its own (read error, two-hour cap, low disk):
             // the owner still has to stop() to collect the outcome.
             if (!stopRequested && onEnded != null) mainHandler.post(onEnded)
         }

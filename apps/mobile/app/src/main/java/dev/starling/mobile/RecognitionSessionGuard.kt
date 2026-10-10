@@ -29,8 +29,17 @@ class RecognitionSessionGuard<T : Any> {
 
     /** How the stopped capture of an ended session settles. */
     sealed interface Settlement {
-        /** Commit the WAV and upload it; deliver the transcript when it returns. */
-        data class Transcribe(val recording: Recording, val durationSeconds: Double) : Settlement
+        /**
+         * Commit the WAV and upload it; deliver the transcript when it
+         * returns. [stoppedForLowDisk]: the take ended itself because storage
+         * ran nearly full (#342). It is still complete and still delivered
+         * as the result, never as an error; the service says why it stopped.
+         */
+        data class Transcribe(
+            val recording: Recording,
+            val durationSeconds: Double,
+            val stoppedForLowDisk: Boolean = false,
+        ) : Settlement
 
         /** Commit the WAV locally; the audio stays and nothing further happens. */
         data class Keep(val recording: Recording, val durationSeconds: Double) : Settlement
@@ -70,7 +79,7 @@ class RecognitionSessionGuard<T : Any> {
     fun settle(ending: Ending<T>, result: CaptureResult): Settlement = when (ending) {
         is Ending.Finalize -> when (result) {
             is CaptureResult.Completed ->
-                Settlement.Transcribe(ending.session.recording, result.durationSeconds)
+                Settlement.Transcribe(ending.session.recording, result.durationSeconds, result.stoppedForLowDisk)
             is CaptureResult.Failed ->
                 Settlement.Fail(ending.session.recording.id, result.message, SpeechRecognizer.ERROR_CLIENT)
             CaptureResult.AlreadyStopped -> Settlement.Empty(SpeechRecognizer.ERROR_CLIENT)
@@ -104,5 +113,15 @@ class RecognitionSessionGuard<T : Any> {
         val current = session ?: return null
         session = null
         return ending(current)
+    }
+
+    companion object {
+        /**
+         * The error a take refused for lack of storage gets (#342):
+         * ERROR_AUDIO, "audio recording error". The platform has no storage
+         * error, the recording is what cannot be made, and it is the class
+         * the RECOGNIZE_SPEECH popup reports (RESULT_AUDIO_ERROR).
+         */
+        const val DISK_FULL_ERROR = SpeechRecognizer.ERROR_AUDIO
     }
 }

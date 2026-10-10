@@ -45,6 +45,7 @@ import dev.starling.mobile.processing.ModeCatalog
 import dev.starling.mobile.processing.Mode
 import dev.starling.mobile.processing.RegionKind
 import dev.starling.mobile.processing.StagedTake
+import dev.starling.mobile.storage.DiskLevel
 import dev.starling.mobile.ui.EditorField
 import dev.starling.mobile.ui.InputTargetGuard
 
@@ -100,6 +101,7 @@ class VoiceInputService : InputMethodService() {
     private var statusView: TextView? = null
     private var transcriptView: TextView? = null
     private var modelStatusView: TextView? = null
+    private var diskWarningView: TextView? = null
     private var modeChip: Button? = null
     private var modePicker: HorizontalScrollView? = null
     private var modeList: LinearLayout? = null
@@ -140,6 +142,7 @@ class VoiceInputService : InputMethodService() {
         statusView = view.findViewById(R.id.keyboard_status)
         transcriptView = view.findViewById(R.id.keyboard_transcript)
         modelStatusView = view.findViewById(R.id.keyboard_model_status)
+        diskWarningView = view.findViewById(R.id.keyboard_disk_warning)
         modeChip = view.findViewById(R.id.keyboard_mode_chip)
         modePicker = view.findViewById(R.id.keyboard_mode_picker)
         modeList = view.findViewById(R.id.keyboard_mode_list)
@@ -311,6 +314,12 @@ class VoiceInputService : InputMethodService() {
         // A private field gets the default mode: its route is blocked, so no
         // phrase, rule or processing ever applies there.
         val mode = continuing?.mode ?: if (sensitive) catalog.mode(null) else selectedMode()
+        // Free space first (#342): no take starts that the disk cannot hold.
+        val disk = application.diskBeforeTake()
+        if (disk?.level == DiskLevel.CRITICAL) {
+            statusView?.text = getString(R.string.disk_full_refused, (disk.availableBytes / 1_000_000).toInt())
+            return
+        }
         val recording = runCatching { application.recordings.create(ephemeral = sensitive) }.getOrElse {
             statusView?.setText(R.string.recording_storage_error)
             return
@@ -371,6 +380,14 @@ class VoiceInputService : InputMethodService() {
                 else -> R.string.keyboard_streaming
             },
         )
+        showDiskWarning(application.diskWarning(disk))
+    }
+
+    /** The low-storage warning of the running take, on its own line; null hides it. */
+    private fun showDiskWarning(text: String?) {
+        val view = diskWarningView ?: return
+        view.text = text
+        view.visibility = if (text == null) View.GONE else View.VISIBLE
     }
 
     /**
@@ -510,6 +527,7 @@ class VoiceInputService : InputMethodService() {
         current.capturing = false
         current.awaitingFinal = true
         current.stoppedAtNanos = System.nanoTime()
+        showDiskWarning(null)
         val session = current.session
         current.session = null
         renderTake()
@@ -542,7 +560,11 @@ class VoiceInputService : InputMethodService() {
                 }
                 if (take === current) {
                     statusView?.setText(
-                        if (result.cappedAtLimit) R.string.recording_capped else R.string.keyboard_sending,
+                        when {
+                            result.stoppedForLowDisk -> R.string.recording_stopped_low_disk
+                            result.cappedAtLimit -> R.string.recording_capped
+                            else -> R.string.keyboard_sending
+                        },
                     )
                 }
                 val config = application.backendSettings.load()

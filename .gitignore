@@ -27,6 +27,8 @@ golden/
 !tests/fixtures/2086-149220-0033.wav
 # ...and its copy bundled into the Android e2e test APK.
 !apps/mobile/app/src/androidTest/assets/librispeech-2086-149220-0033.wav
+# ...and two tiny reference-encoded FLAC slices of it for the decoder tests.
+!apps/mobile/app/src/test/resources/flac/*.flac
 
 # regenerable benchmark corpora (downloaded + cached on first run)
 tests/fixtures/leaderboard_corpus/

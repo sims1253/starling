@@ -11,6 +11,8 @@ import android.os.Looper
 import android.speech.RecognitionService
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
+import android.util.Log
+import android.widget.Toast
 import dev.starling.mobile.audio.AudioCapture
 import dev.starling.mobile.audio.AudioChunkListener
 import dev.starling.mobile.audio.CaptureResult
@@ -20,6 +22,7 @@ import dev.starling.mobile.network.BackendConfig
 import dev.starling.mobile.network.StreamEvent
 import dev.starling.mobile.network.StreamSession
 import dev.starling.mobile.network.TranscriptionEngine
+import dev.starling.mobile.storage.DiskLevel
 import java.util.concurrent.TimeUnit
 
 /**
@@ -62,6 +65,18 @@ class StarlingRecognitionService : RecognitionService() {
         // Finishing a still-live session here is defensive only: the framework
         // answers a second start with ERROR_RECOGNIZER_BUSY without calling us.
         sessions.expire()?.let(::endSession)
+        // Free space first (#342): no take starts that the disk cannot hold.
+        // The service has no screen of its own; the host keyboard gets the
+        // error (RecognitionSessionGuard.DISK_FULL_ERROR), and the reason
+        // shows as a toast and in the log.
+        val disk = application.diskBeforeTake()
+        if (disk?.level == DiskLevel.CRITICAL) {
+            runCatching { Log.w(TAG, "refused a take: ${disk.availableBytes} bytes free, below the stop threshold") }
+            toast(getString(R.string.disk_full_refused, (disk.availableBytes / 1_000_000).toInt()))
+            sessions.deliver(callback) { it.error(RecognitionSessionGuard.DISK_FULL_ERROR) }
+            return
+        }
+        application.diskWarning(disk)?.let(::toast)
         val recording = runCatching { application.recordings.create() }.getOrElse {
             sessions.deliver(callback) { it.error(SpeechRecognizer.ERROR_CLIENT) }
             return
@@ -92,6 +107,9 @@ class StarlingRecognitionService : RecognitionService() {
             onChunk = session?.let { streaming ->
                 AudioChunkListener { bytes, count -> streaming.onAudio(bytes, count) }
             },
+            // The capture ended itself (low storage, the two-hour cap):
+            // finish the session like the host's stopListening.
+            onEnded = { if (sessions.isLive(callback)) sessions.stopListening(callback)?.let(::endSession) },
         )
         if (error != null) {
             session?.close()
@@ -162,6 +180,14 @@ class StarlingRecognitionService : RecognitionService() {
     ) {
         when (val settlement = sessions.settle(ending, result)) {
             is RecognitionSessionGuard.Settlement.Transcribe -> {
+                // Storage ran nearly full and the take stopped itself (#342).
+                // What was said up to then is complete and still goes to the
+                // host as its result, so no error ends the session; the
+                // toast says why the recording stopped early.
+                if (settlement.stoppedForLowDisk) {
+                    runCatching { Log.w(TAG, "a take stopped early: storage is nearly full") }
+                    toast(getString(R.string.recording_stopped_low_disk))
+                }
                 // The WAV is finalized and durable before any network use.
                 val finalized = runCatching {
                     application.recordings.commitAudio(settlement.recording, settlement.durationSeconds)
@@ -248,7 +274,12 @@ class StarlingRecognitionService : RecognitionService() {
         }
     }
 
+    private fun toast(text: String) {
+        runCatching { Toast.makeText(this, text, Toast.LENGTH_LONG).show() }
+    }
+
     companion object {
+        private const val TAG = "StarlingRecognition"
         private val MAX_LISTEN_MILLIS = TimeUnit.MINUTES.toMillis(1)
     }
 }

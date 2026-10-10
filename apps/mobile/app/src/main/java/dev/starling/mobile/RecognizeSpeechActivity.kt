@@ -19,6 +19,7 @@ import dev.starling.mobile.data.Recording
 import dev.starling.mobile.network.BackendConfig
 import dev.starling.mobile.network.StreamEvent
 import dev.starling.mobile.network.StreamSession
+import dev.starling.mobile.storage.DiskLevel
 
 /**
  * The `ACTION_RECOGNIZE_SPEECH` popup (E22): apps that ask the system for
@@ -143,6 +144,16 @@ class RecognizeSpeechActivity : Activity() {
         // A permission grant can land after Cancel already finished the
         // dialog; never open the microphone behind a dead dialog.
         if (isFinishing || isDestroyed || resultDelivered) return
+        // Free space first (#342): no take starts that the disk cannot hold.
+        val disk = application.diskBeforeTake()
+        if (disk?.level == DiskLevel.CRITICAL) {
+            deliver(
+                RecognizeSpeechOutcome.Outcome(RecognizerIntent.RESULT_AUDIO_ERROR),
+                null,
+                getString(R.string.disk_full_refused, (disk.availableBytes / 1_000_000).toInt()),
+            )
+            return
+        }
         val recording = runCatching { application.recordings.create() }.getOrElse {
             deliver(RecognizeSpeechOutcome.Outcome(RecognizerIntent.RESULT_CLIENT_ERROR), R.string.recording_storage_error)
             return
@@ -158,6 +169,8 @@ class RecognizeSpeechActivity : Activity() {
             this,
             savedAudio,
             onChunk = session?.let { streaming -> AudioChunkListener { bytes, count -> streaming.onAudio(bytes, count) } },
+            // The capture ended itself (low storage, the two-hour cap): Done.
+            onEnded = { if (activeRecording === recording) stopAndTranscribe() },
         )
         if (error != null) {
             session?.close()
@@ -169,6 +182,10 @@ class RecognizeSpeechActivity : Activity() {
         streamSession = session
         val loading = session != null && application.isOnDeviceModelLoading(config)
         statusView.setText(if (loading) R.string.recognize_listening_loading else R.string.recognize_listening)
+        application.diskWarning(disk)?.let { warning ->
+            statusView.append("\n")
+            statusView.append(warning)
+        }
     }
 
     private fun onStreamEvent(event: StreamEvent) {
@@ -213,6 +230,7 @@ class RecognizeSpeechActivity : Activity() {
             return
         }
         val completed = result as CaptureResult.Completed
+        if (completed.stoppedForLowDisk) statusView.setText(R.string.recording_stopped_low_disk)
         // The WAV is finalized and durable before any transcription.
         val finalized = runCatching {
             application.recordings.commitAudio(recording, completed.durationSeconds)

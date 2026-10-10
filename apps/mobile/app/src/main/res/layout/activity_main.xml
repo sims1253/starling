@@ -249,6 +249,102 @@
             android:layout_height="wrap_content"
             android:orientation="vertical" />
 
+        <!-- History audio (#342): retention limits per class, all off by
+             default, and what the last cleanup did. -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="18dp"
+            android:text="@string/history_audio_heading"
+            android:textColor="@color/starling_ink"
+            android:textSize="18sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:text="@string/history_audio_intro"
+            android:textColor="@color/starling_muted"
+            android:textSize="14sp" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:labelFor="@+id/retention_standard_age"
+            android:text="@string/retention_age_label"
+            android:textColor="@color/starling_ink"
+            android:textSize="14sp" />
+
+        <Spinner
+            android:id="@+id/retention_standard_age"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:entries="@array/retention_age_choices" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:labelFor="@+id/retention_standard_size"
+            android:text="@string/retention_size_label"
+            android:textColor="@color/starling_ink"
+            android:textSize="14sp" />
+
+        <Spinner
+            android:id="@+id/retention_standard_size"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:entries="@array/retention_size_choices" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:text="@string/history_audio_archival_intro"
+            android:textColor="@color/starling_muted"
+            android:textSize="14sp" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:labelFor="@+id/retention_archival_age"
+            android:text="@string/retention_archival_age_label"
+            android:textColor="@color/starling_ink"
+            android:textSize="14sp" />
+
+        <Spinner
+            android:id="@+id/retention_archival_age"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:entries="@array/retention_age_choices" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:labelFor="@+id/retention_archival_size"
+            android:text="@string/retention_archival_size_label"
+            android:textColor="@color/starling_ink"
+            android:textSize="14sp" />
+
+        <Spinner
+            android:id="@+id/retention_archival_size"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:entries="@array/retention_size_choices" />
+
+        <TextView
+            android:id="@+id/retention_report"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:textColor="@color/starling_muted"
+            android:textSize="13sp"
+            android:visibility="gone" />
+
         <View
             android:layout_width="match_parent"
             android:layout_height="1dp"

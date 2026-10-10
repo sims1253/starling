@@ -21,7 +21,13 @@ import dev.starling.mobile.processing.ModeCatalog
 import dev.starling.mobile.processing.ProfilesDocument
 import dev.starling.mobile.processing.SpokenCommands
 import dev.starling.mobile.processing.SpokenInstructions
+import dev.starling.mobile.storage.AudioUpkeep
+import dev.starling.mobile.storage.DiskLevel
+import dev.starling.mobile.storage.DiskPolicy
+import dev.starling.mobile.storage.DiskReading
+import dev.starling.mobile.storage.FreeSpaceProbe
 import dev.starling.mobile.storage.RecordingStore
+import dev.starling.mobile.storage.StorageSettings
 import java.io.File
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -41,6 +47,10 @@ class StarlingApplication : Application() {
     lateinit var modelDownloads: ModelDownloadController
         private set
     lateinit var modelLifetime: ModelLifetime
+        private set
+    lateinit var storageSettings: StorageSettings
+        private set
+    lateinit var audioUpkeep: AudioUpkeep
         private set
 
     /**
@@ -77,6 +87,18 @@ class StarlingApplication : Application() {
         super.onCreate()
         recordings = RecordingStore(this)
         backendSettings = BackendSettings(this)
+        storageSettings = StorageSettings(this)
+        audioUpkeep = AudioUpkeep(
+            recordings,
+            storageSettings,
+            Executors.newSingleThreadExecutor { runnable ->
+                Thread(runnable, "starling-audio-upkeep").apply {
+                    isDaemon = true
+                    priority = Thread.MIN_PRIORITY
+                }
+            },
+            onFailure = { t -> runCatching { Log.w(TAG, "history audio upkeep failed", t) } },
+        )
         onDeviceEngine = OnDeviceEngine(
             File(filesDir, "models"),
             memoryGate = ::memoryGate,
@@ -105,8 +127,41 @@ class StarlingApplication : Application() {
             backendSettings,
             OnDeviceBackend(onDeviceEngine),
             injectedFailure = if (BuildConfig.DEBUG) ::debugInjectedFailure else { -> null },
+            onAttemptSettled = audioUpkeep::schedule,
         )
-        if (BuildConfig.DEBUG) PcmSource.debugSource = ::debugTestMicrophone
+        if (BuildConfig.DEBUG) {
+            PcmSource.debugSource = ::debugTestMicrophone
+            FreeSpaceProbe.debugOverride = FreeSpaceProbe { directory -> debugFreeSpace() ?: FreeSpaceProbe.SYSTEM.availableBytes(directory) }
+        }
+        scheduleAudioUpkeep()
+    }
+
+    /**
+     * History-audio upkeep (#342) now and every 15 minutes while the
+     * process lives; it also runs after each transcription attempt and
+     * after the storage settings change.
+     */
+    private fun scheduleAudioUpkeep() {
+        audioUpkeep.schedule()
+        mainHandler.postDelayed(::scheduleAudioUpkeep, AudioUpkeep.INTERVAL_MILLIS)
+    }
+
+    /**
+     * The free space before a take starts, for every entry point (#342):
+     * null when it cannot be measured, which never blocks recording.
+     */
+    fun diskBeforeTake(): DiskReading? =
+        DiskPolicy.DEFAULT.check(FreeSpaceProbe.current, File(filesDir, "recordings"))
+
+    /**
+     * What a starting take says about [disk] (from [diskBeforeTake]): the
+     * low-space estimate, the desktop's "can't check" note when the space
+     * could not be measured, or null when there is room.
+     */
+    fun diskWarning(disk: DiskReading?): String? = when {
+        disk == null -> getString(R.string.disk_unchecked_warning)
+        disk.level == DiskLevel.LOW -> getString(R.string.disk_low_warning, DiskPolicy.DEFAULT.minutesLeft(disk.availableBytes))
+        else -> null
     }
 
     /**
@@ -114,11 +169,18 @@ class StarlingApplication : Application() {
      * `files/debug/test-mic.wav` (16 kHz mono PCM16) replaces the
      * microphone for every capture that starts while it exists, looped at
      * real-time pace; `files/debug/fail-transcription` makes every
-     * transcription attempt fail after Stop. Release builds never read them.
+     * transcription attempt fail after Stop; `files/debug/free-space-mb`
+     * holding a number stands in for the free space (#342), so the
+     * low-space warning, refusal and in-take stop can be driven. Release
+     * builds never read them.
      */
     private fun debugTestMicrophone(): PcmSource? =
         File(filesDir, "debug/test-mic.wav").takeIf(File::isFile)?.let(LoopingWavSource::fromWav)
             ?.also { runCatching { Log.i(TAG, "debug: capturing from files/debug/test-mic.wav") } }
+
+    private fun debugFreeSpace(): Long? =
+        File(filesDir, "debug/free-space-mb").takeIf(File::isFile)
+            ?.let { runCatching { it.readText().trim().toLong() * 1024 * 1024 }.getOrNull() }
 
     private fun debugInjectedFailure(): String? =
         if (File(filesDir, "debug/fail-transcription").exists()) "Injected transcription failure (debug test hook)" else null

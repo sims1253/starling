@@ -1,6 +1,8 @@
 package dev.starling.mobile.audio
 
 import java.io.File
+import java.io.IOException
+import java.io.RandomAccessFile
 import java.nio.file.Files
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
@@ -123,6 +125,32 @@ class WavWriterTest {
             for (offset in 44 until bytes.size step chunk.size) {
                 assertArrayEquals(chunk, bytes.copyOfRange(offset, offset + chunk.size))
             }
+        } finally {
+            file.delete()
+            directory.delete()
+        }
+    }
+
+    @Test
+    fun aFileShorterThanItsWrittenPayloadIsNeverPaddedWithSilence() {
+        val directory = Files.createTempDirectory("starling-wav-test").toFile()
+        val file = File(directory, "short.wav.part")
+        try {
+            val payload = byteArrayOf(1, 0, 2, 0, 3, 0, 4, 0)
+            val writer = WavWriter(file)
+            writer.write(payload, payload.size)
+            // Storage lost the tail (five bytes left: two whole samples and half of one).
+            RandomAccessFile(file, "rw").use { it.setLength(44L + 5) }
+
+            val error = assertThrows(IOException::class.java) { writer.finish() }
+
+            assertEquals(WavWriter.SHORT_MESSAGE, error.message)
+            assertTrue(writer.isClosed)
+            val bytes = file.readBytes()
+            assertEquals(44 + 4, bytes.size)
+            assertEquals(4, littleEndianInt(bytes, 40))
+            assertEquals(36 + 4, littleEndianInt(bytes, 4))
+            assertArrayEquals(payload.copyOf(4), bytes.copyOfRange(44, bytes.size))
         } finally {
             file.delete()
             directory.delete()

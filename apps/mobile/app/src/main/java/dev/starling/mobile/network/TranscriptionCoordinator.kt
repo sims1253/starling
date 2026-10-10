@@ -9,6 +9,7 @@ import dev.starling.mobile.data.TranscriptionProvenance
 import dev.starling.mobile.engine.OnDeviceBackend
 import dev.starling.mobile.storage.RecordingStore
 import java.io.File
+import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -19,6 +20,11 @@ import java.util.concurrent.Executors
  * adds a transcript revision and a failure leaves the audio and earlier
  * revisions as they were (#356).
  *
+ * Every attempt reads the audio through RecordingStore.withRequestAudio
+ * (#342): the same request WAV whether the take is still a WAV or already
+ * FLAC, and pinned while the attempt uses it. [onAttemptSettled] runs on
+ * the worker after each attempt (the app schedules audio upkeep there).
+ *
  * [injectedFailure] is a debug-build test hook (StarlingApplication): when
  * it returns a reason, every attempt fails with it after Stop, as an engine
  * or server failure would, so device tests can exercise retry and recovery.
@@ -28,6 +34,7 @@ class TranscriptionCoordinator(
     private val settings: BackendSettings,
     private val onDevice: OnDeviceBackend,
     private val injectedFailure: () -> String? = { null },
+    private val onAttemptSettled: () -> Unit = {},
 ) {
     private val executor: ExecutorService = Executors.newCachedThreadPool { runnable ->
         Thread(runnable, "starling-transcription").apply { isDaemon = true }
@@ -61,6 +68,7 @@ class TranscriptionCoordinator(
                 mainHandler.post { callback(completed) }
             } finally {
                 activeIds.remove(id)
+                runCatching(onAttemptSettled)
             }
         }
         return true
@@ -145,6 +153,7 @@ class TranscriptionCoordinator(
                 mainHandler.post { callback(completed) }
             } finally {
                 activeIds.remove(id)
+                runCatching(onAttemptSettled)
                 // Safeguard: the session this worker was handed must never
                 // outlive it, whatever finish() returned — close() settles
                 // and drops the socket, and is a no-op when the client
@@ -163,12 +172,16 @@ class TranscriptionCoordinator(
     }
 
     private fun transcribeAudio(queued: Recording, config: BackendConfig): Recording {
-        val audioFile = store.audioFile(queued)
         val injected = injectedFailure()
-        val result = when {
-            injected != null -> InferenceResult.Failure(injected, false)
-            config.engine == TranscriptionEngine.ON_DEVICE -> onDevice.transcribe(audioFile, config)
-            else -> client.transcribe(audioFile, config)
+        val result = if (injected != null) {
+            InferenceResult.Failure(injected, false)
+        } else {
+            transcribeStoredAudio(store, queued.id) { audioFile ->
+                when (config.engine) {
+                    TranscriptionEngine.ON_DEVICE -> onDevice.transcribe(audioFile, config)
+                    TranscriptionEngine.REMOTE -> client.transcribe(audioFile, config)
+                }
+            }
         }
         return when (result) {
             is InferenceResult.Success -> runCatching {
@@ -248,4 +261,26 @@ class TranscriptionCoordinator(
         internal fun streamingEligible(config: BackendConfig): Boolean =
             config.engine == TranscriptionEngine.REMOTE
     }
+}
+
+/**
+ * One attempt of [transcribe] on the take's request audio
+ * (RecordingStore.withRequestAudio). Missing, removed or damaged audio
+ * fails the attempt as not retryable (the row says why); an I/O failure of
+ * the engine or the network is retryable like any other transient one.
+ */
+internal fun transcribeStoredAudio(
+    store: RecordingStore,
+    id: String,
+    transcribe: (File) -> InferenceResult,
+): InferenceResult = try {
+    store.withRequestAudio(id) { audioFile ->
+        try {
+            transcribe(audioFile)
+        } catch (exception: IOException) {
+            InferenceResult.Failure(exception.message ?: "The transcription request failed", true)
+        }
+    }
+} catch (exception: IOException) {
+    InferenceResult.Failure(exception.message ?: "The recording audio could not be read", false)
 }
