@@ -740,8 +740,27 @@ impl StarlingApp {
             return;
         }
         let Some(id) = stored_id else {
-            // Stored, but the host could not name the row: it is in
-            // history all the same.
+            // The host could not confirm which row the take landed in
+            // (its commit outcome was unreadable): nothing is transcribed
+            // or typed against a guess. Whatever landed is in history.
+            let staging = match kind {
+                FinishKind::Transcribe {
+                    staging, stopped_at, ..
+                } => {
+                    self.overlay.model.save_failed(stopped_at, Instant::now());
+                    self.error = Some(
+                        "The recording was saved, but Starling could not confirm which history \
+                         entry holds it, so it was not transcribed. Find it in your history and \
+                         transcribe it from there."
+                            .to_string(),
+                    );
+                    staging
+                }
+                FinishKind::Cancel { staging, .. } => staging,
+            };
+            if let Some(token) = staging {
+                self.staging_ended_without_transcript(token, cx);
+            }
             self.refresh_history(cx);
             return;
         };

@@ -357,7 +357,13 @@ impl TakeHub {
         let mut state = lock_registry(&self.state);
         state.starters.retain(|(known, _)| known != corr);
         state.starters.push_back((corr.to_string(), Arc::clone(conn)));
-        if state.live.is_none() {
+        // A start that arrives while another is still opening its device
+        // is refused by the machine; it must not take over that ownership.
+        let acquiring_alive = state
+            .acquiring
+            .as_ref()
+            .is_some_and(|(_, starter)| !starter.closed.load(Ordering::SeqCst));
+        if state.live.is_none() && !acquiring_alive {
             state.acquiring = Some((corr.to_string(), Arc::clone(conn)));
         }
         while state.starters.len() > ENDED_KEEP {
