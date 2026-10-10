@@ -399,9 +399,10 @@ fn a_journal_whose_take_was_stored_in_its_place_is_moved_aside_not_adopted() {
         writer.path().to_path_buf()
     };
     age(&leftover, old());
-    store.conn.execute("DELETE FROM captures", []).expect("delete rows");
+    store.delete_capture(&stored).expect("delete");
     let report = store.recover_capture_journals(&tree).expect("rescan");
     assert!(report.recovered.is_empty(), "{report:?}");
+    assert_eq!(report.superseded, vec!["j_saved".to_string()]);
     assert_eq!(capture_count(&store), 0);
 }
 
@@ -428,6 +429,97 @@ fn a_journal_already_adopted_is_moved_aside_when_its_old_name_comes_back() {
     assert!(report.recovered.is_empty() && report.failed.is_empty(), "{report:?}");
     assert_eq!(report.superseded, vec!["j_adopted".to_string()]);
     assert!(!path.exists());
+    assert_eq!(capture_count(&store), 1);
+
+    // Deleted since: a copy of its journal never brings it back.
+    store.delete_capture("j_adopted").expect("delete");
+    std::fs::copy(
+        tree.join(SUPERSEDED_SUBDIR).join("j_adopted.sj"),
+        &path,
+    )
+    .expect("name comes back again");
+    age(&path, old());
+    store.reconcile().expect("reconcile");
+    let report = store.recover_capture_journals(&tree).expect("rescan");
+    assert!(report.recovered.is_empty(), "{report:?}");
+    assert_eq!(capture_count(&store), 0);
+}
+
+/// A replacement save in progress: its staging journal holds `samples`
+/// when the process dies, before its commit.
+fn die_while_storing_in_place_of(store: &StoreV2, journal_id: &str, samples: &[f32]) -> String {
+    let mut meta = TakeMeta::for_device("");
+    meta.supersedes_journal = Some(journal_id.to_string());
+    let mut take = store.begin_take_at_rate(16_000, meta).expect("begin");
+    take.append_and_seal(samples).expect("append");
+    take.id().to_string()
+}
+
+fn faulted_journal(tree: &Path, id: &str, samples: &[f32]) -> PathBuf {
+    let mut writer = JournalWriter::create_named(tree, id.to_string(), 16_000).expect("writer");
+    writer.append_frames(samples).expect("append");
+    writer.write_boundary().expect("boundary");
+    let path = writer.path().to_path_buf();
+    drop(writer);
+    age(&path, old());
+    path
+}
+
+#[test]
+fn a_replacement_cut_short_before_its_commit_still_replaces_a_shorter_journal() {
+    // The app died while storing the take from memory: reconcile turns
+    // the replacement's staging journal into the take, and the recorder's
+    // partial journal is not adopted beside it.
+    let dir = TempDir::new().expect("tempdir");
+    let mut store = store_in(&dir);
+    let tree = journals(&dir);
+    let path = faulted_journal(&tree, "j_mid_save", &ramp(1_600, 0));
+    let staged = die_while_storing_in_place_of(&store, "j_mid_save", &ramp(4_800, 0));
+    drop(store);
+
+    let mut store = store_in(&dir);
+    store.reconcile().expect("reconcile");
+    assert!(store.get_capture(&staged).expect("read").is_some(), "the replacement is the take");
+    let report = store.recover_capture_journals(&tree).expect("scan");
+    assert!(report.recovered.is_empty(), "{report:?}");
+    assert_eq!(report.superseded, vec!["j_mid_save".to_string()]);
+    assert!(!path.exists());
+    assert_eq!(capture_count(&store), 1, "one take, not two");
+}
+
+#[test]
+fn a_replacement_holding_less_than_the_journal_replaces_nothing() {
+    // Cut short with less audio than the recorder confirmed: both stay
+    // takes — a duplicate the user can delete beats audio lost.
+    let dir = TempDir::new().expect("tempdir");
+    let mut store = store_in(&dir);
+    let tree = journals(&dir);
+    faulted_journal(&tree, "j_longer", &ramp(4_800, 0));
+    die_while_storing_in_place_of(&store, "j_longer", &ramp(800, 0));
+    drop(store);
+
+    let mut store = store_in(&dir);
+    store.reconcile().expect("reconcile");
+    let report = store.recover_capture_journals(&tree).expect("scan");
+    assert_eq!(report.recovered.len(), 1, "{report:?}");
+    assert_eq!(store.load_audio("j_longer").expect("audio").samples.len(), 4_800);
+    assert_eq!(capture_count(&store), 2);
+}
+
+#[test]
+fn a_replacement_that_never_stored_replaces_nothing() {
+    // The save from memory failed and rolled back: the journal is the
+    // take's only copy and is recovered.
+    let dir = TempDir::new().expect("tempdir");
+    let mut store = store_in(&dir);
+    let tree = journals(&dir);
+    faulted_journal(&tree, "j_only_copy", &ramp(1_600, 0));
+    let staged = die_while_storing_in_place_of(&store, "j_only_copy", &ramp(4_800, 0));
+    assert!(store.discard_staging(&staged).expect("roll back"));
+    assert_eq!(store.journal_superseded_by("j_only_copy").expect("read"), None);
+
+    let report = store.recover_capture_journals(&tree).expect("scan");
+    assert_eq!(report.recovered.len(), 1, "{report:?}");
     assert_eq!(capture_count(&store), 1);
 }
 
@@ -466,14 +558,20 @@ fn creation_scratch_no_writer_holds_is_swept() {
     // A writer died between creating its scratch name and publishing it.
     let stale = tree.join("j_died.sj.creating");
     std::fs::write(&stale, b"").expect("stale scratch");
+    age(&stale, old());
     // A writer is creating one right now: its lock is held.
     let busy = tree.join("j_busy.sj.creating");
     let holder = File::create(&busy).expect("busy scratch");
     assert_eq!(try_flock_exclusive(&holder).expect("lock"), FlockEvidence::Free);
+    age(&busy, old());
+    // Just created, its creator about to lock it: not touched either.
+    let fresh = tree.join("j_fresh.sj.creating");
+    std::fs::write(&fresh, b"").expect("fresh scratch");
 
     let report = store.recover_capture_journals(&tree).expect("scan");
     assert!(report.failed.is_empty(), "{report:?}");
     assert!(!stale.exists(), "the stale scratch name is gone");
     assert!(busy.exists(), "a held one is left to its writer");
+    assert!(fresh.exists(), "a fresh one is left to its creator");
     drop(holder);
 }

@@ -989,6 +989,21 @@ impl StoreV2 {
         meta: TakeMeta,
     ) -> Result<V2Take, StoreV2Error> {
         validate_capture_id(&id)?;
+        if let Some(journal_id) = &meta.supersedes_journal {
+            // Before any recoverable sample exists (#356): a crash from
+            // here on leaves a staging journal reconcile turns into this
+            // take, and the recorder journal must already be named as
+            // replaced by it. Until that take is stored the record counts
+            // for nothing ([`Self::journal_superseded_by`]).
+            // A replacement already stored keeps its claim.
+            self.conn.execute(
+                "INSERT INTO journal_supersessions(journal_id, capture_id) VALUES (?1, ?2)
+                 ON CONFLICT(journal_id) DO UPDATE SET capture_id = excluded.capture_id
+                 WHERE NOT EXISTS (SELECT 1 FROM captures c
+                                   WHERE c.id = journal_supersessions.capture_id)",
+                params![journal_id, id],
+            )?;
+        }
         std::fs::create_dir_all(self.root.join(STAGING_DIR))?;
         let writer =
             JournalWriter::create_named(&self.root.join(STAGING_DIR), id, sample_rate)?;
@@ -1065,8 +1080,8 @@ impl StoreV2 {
         )?;
         if let Some(journal_id) = supersedes_journal {
             tx.execute(
-                "INSERT OR IGNORE INTO journal_supersessions(journal_id, capture_id)
-                 VALUES (?1, ?2)",
+                "INSERT INTO journal_supersessions(journal_id, capture_id) VALUES (?1, ?2)
+                 ON CONFLICT(journal_id) DO UPDATE SET capture_id = excluded.capture_id",
                 params![journal_id, record.id],
             )?;
         }
@@ -2972,19 +2987,6 @@ impl StoreV2 {
                         report.deferred_to_live_owner.push(id);
                         continue;
                     }
-                    if self.journal_superseded_by(&id)?.is_some() {
-                        // A recorder journal whose adoption moved it here
-                        // and then failed to commit; the take was stored
-                        // from its samples in its place (#356). Kept with
-                        // the other superseded journals, not offered as a
-                        // second copy.
-                        move_journal_aside(
-                            &path,
-                            &self.root.join("journals").join(SUPERSEDED_SUBDIR),
-                        )?;
-                        report.superseded_journals.push(id);
-                        continue;
-                    }
                     let parsed = match read_journal(&path) {
                         Ok(parsed) => parsed,
                         Err(err) => {
@@ -2994,6 +2996,24 @@ impl StoreV2 {
                     };
                     if parsed.samples.is_empty() {
                         report.empty_journals.push(id);
+                        continue;
+                    }
+                    if self.replaced_by_stored_take(
+                        &id,
+                        parsed.samples.len() as u64,
+                        parsed.sample_rate,
+                    )? {
+                        // A recorder journal whose adoption moved it here
+                        // and then failed to commit; the take was stored
+                        // from its samples in its place (#356). Kept with
+                        // the other superseded journals, not offered as a
+                        // second copy.
+                        drop(parsed);
+                        move_journal_aside(
+                            &path,
+                            &self.root.join("journals").join(SUPERSEDED_SUBDIR),
+                        )?;
+                        report.superseded_journals.push(id);
                         continue;
                     }
                     let note = if parsed.finalized {
@@ -3724,16 +3744,68 @@ impl StoreV2 {
     }
 
     /// The take stored in place of recorder journal `journal_id`
-    /// ([`TakeMeta::supersedes_journal`]), if one was (#356).
+    /// ([`TakeMeta::supersedes_journal`]), if one was (#356): its row is
+    /// committed, or it was stored and then deliberately deleted. A
+    /// replacement whose save never committed replaces nothing — the
+    /// journal is then still the take's only stored copy.
     pub fn journal_superseded_by(&self, journal_id: &str) -> Result<Option<String>, StoreV2Error> {
         Ok(self
             .conn
             .query_row(
-                "SELECT capture_id FROM journal_supersessions WHERE journal_id = ?1",
+                "SELECT s.capture_id FROM journal_supersessions s
+                 WHERE s.journal_id = ?1
+                   AND (EXISTS (SELECT 1 FROM captures c WHERE c.id = s.capture_id)
+                        OR EXISTS (SELECT 1 FROM tombstones t WHERE t.id = s.capture_id))",
                 params![journal_id],
                 |row| row.get(0),
             )
             .optional()?)
+    }
+
+    /// Whether recorder journal `journal_id`, holding `samples` verified
+    /// samples at `rate`, is replaced by a stored take (#356): one that
+    /// was deleted since, or one holding at least as much audio. A
+    /// replacement a crash cut short (reconcile recovered its torn
+    /// staging journal) replaces nothing longer than itself — both stay.
+    fn replaced_by_stored_take(
+        &self,
+        journal_id: &str,
+        samples: u64,
+        rate: u32,
+    ) -> Result<bool, StoreV2Error> {
+        let found: Option<(Option<i64>, Option<u32>, bool)> = self
+            .conn
+            .query_row(
+                "SELECT c.frame_count, c.actual_rate,
+                        EXISTS (SELECT 1 FROM tombstones t WHERE t.id = s.capture_id)
+                 FROM journal_supersessions s
+                 LEFT JOIN captures c ON c.id = s.capture_id
+                 WHERE s.journal_id = ?1",
+                params![journal_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        Ok(match found {
+            None => false,
+            Some((_, _, true)) => true,
+            Some((Some(frames), Some(stored_rate), false)) => {
+                // Durations compared exactly in integers, with 10 ms of
+                // slack for the resampling a WAV save goes through.
+                let stored = u128::from(frames.max(0) as u64) * u128::from(rate);
+                let journal = u128::from(samples) * u128::from(stored_rate);
+                stored + u128::from(rate) * u128::from(stored_rate) / 100 >= journal
+            }
+            Some(_) => false,
+        })
+    }
+
+    /// Whether `id` was deliberately deleted (or its audio retired).
+    fn is_tombstoned(&self, id: &str) -> Result<bool, StoreV2Error> {
+        Ok(self
+            .conn
+            .query_row("SELECT 1 FROM tombstones WHERE id = ?1", params![id], |_| Ok(()))
+            .optional()?
+            .is_some())
     }
 
     /// Startup recovery of the recorder's live-capture tree (#356):
@@ -3759,10 +3831,11 @@ impl StoreV2 {
     ///
     /// A journal whose take is already stored — the save committed it in
     /// the journal's place, or adopted it, and the app stopped before the
-    /// journal left the tree — is moved into `superseded/` instead of
-    /// becoming a second copy. A `*.sj.creating` scratch name no writer
-    /// holds is removed: it is an extra name of a published journal, or
-    /// an empty file whose writer died before publishing it.
+    /// journal left the tree — or was stored and then deleted is moved
+    /// into `superseded/` instead of becoming a take again. A stale
+    /// `*.sj.creating` scratch name no writer holds is removed: it is an
+    /// extra name of a published journal, or an empty file whose writer
+    /// died before publishing it.
     ///
     /// A file that is not a readable journal is renamed to
     /// `<name>.unrecognized` beside itself — kept, never repaired or
@@ -3817,12 +3890,15 @@ impl StoreV2 {
             if !is_safe_path_component(&id) || !wanted(&id) {
                 continue;
             }
-            // Only a free lock says no writer is mid-create; the header is
-            // written after publishing, so the scratch name never holds
-            // audio a published journal does not.
-            let free = File::open(&path).ok().is_some_and(|file| {
-                matches!(try_flock_exclusive(&file), Ok(FlockEvidence::Free))
-            });
+            // Only a free lock on a name nobody has touched for a while
+            // says no writer is mid-create (the creator locks a moment
+            // after creating it); the header is written after publishing,
+            // so the scratch name never holds audio a published journal
+            // does not.
+            let free = modified_age(&path).is_some_and(|age| age >= FINALIZED_ADOPTION_GRACE)
+                && File::open(&path).ok().is_some_and(|file| {
+                    matches!(try_flock_exclusive(&file), Ok(FlockEvidence::Free))
+                });
             if free {
                 match std::fs::remove_file(&path) {
                     Ok(()) => {
@@ -3870,22 +3946,6 @@ impl StoreV2 {
                 report.deferred.push(id);
                 continue;
             }
-            // Stored in this journal's place already: the app stopped
-            // between that commit and moving the journal aside.
-            match self.journal_superseded_by(&id) {
-                Ok(None) => {}
-                Ok(Some(_)) => {
-                    match supersede_capture_journal(&path) {
-                        Ok(()) => report.superseded.push(id),
-                        Err(err) => report.failed.push((id, err.to_string())),
-                    }
-                    continue;
-                }
-                Err(err) => {
-                    report.failed.push((id, err.to_string()));
-                    continue;
-                }
-            }
             let parsed = match read_journal(&path) {
                 Ok(parsed) => parsed,
                 Err(journal::JournalReadError::NotAJournal(reason)) => {
@@ -3907,13 +3967,27 @@ impl StoreV2 {
             if parsed.samples.is_empty() {
                 continue;
             }
-            // Adopted already, its move out of the tree undone by a power
-            // loss: the stored take holds exactly these samples.
-            match self.get_capture(&id) {
-                Ok(Some(existing))
-                    if existing.journal_hash
-                        == format!("{:016x}", samples_hash(&parsed.samples)) =>
+            // Already a take, or deliberately not one: stored in this
+            // journal's place (the app stopped between that commit and
+            // moving the journal aside), adopted with its move out of the
+            // tree undone by a power loss, or adopted and since deleted.
+            let stored = (|| -> Result<bool, StoreV2Error> {
+                if self.is_tombstoned(&id)?
+                    || self.replaced_by_stored_take(
+                        &id,
+                        parsed.samples.len() as u64,
+                        parsed.sample_rate,
+                    )?
                 {
+                    return Ok(true);
+                }
+                Ok(self.get_capture(&id)?.is_some_and(|existing| {
+                    existing.journal_hash == format!("{:016x}", samples_hash(&parsed.samples))
+                }))
+            })();
+            match stored {
+                Ok(false) => {}
+                Ok(true) => {
                     drop(parsed);
                     match supersede_capture_journal(&path) {
                         Ok(()) => report.superseded.push(id),
@@ -3921,7 +3995,6 @@ impl StoreV2 {
                     }
                     continue;
                 }
-                Ok(_) => {}
                 Err(err) => {
                     report.failed.push((id, err.to_string()));
                     continue;
