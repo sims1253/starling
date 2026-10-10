@@ -44,6 +44,17 @@ class CallAttempt internal constructor(private val clock: () -> Long) {
         if (stopReason == null) stopReason = reason
     }
 
+    /**
+     * Stops the attempt only while it still waits for the engine; false
+     * when the engine started it already (it then runs on its budget).
+     */
+    @Synchronized
+    internal fun giveUpWaiting(reason: String): Boolean {
+        if (startedAt != NOT_STARTED) return false
+        stop(reason)
+        return true
+    }
+
     private companion object {
         const val NOT_STARTED = Long.MIN_VALUE
     }
@@ -56,23 +67,23 @@ class CallAttempt internal constructor(private val clock: () -> Long) {
  *
  * [run] runs the engine call on a thread of its own and waits for it. The
  * attempt is stopped when, after the engine started it, it runs past its
- * budget ([budgetMillis], scaled by the audio length), or when one native
- * call of the engine runs longer than [nativeCallLimitMillis]
- * ([nativeCallAgeMillis] is the age of the call in progress; native calls
- * are bounded windows of at most ~32 s of audio, or a model load). The
- * stop goes through the engine's cooperative cancel; a call that does not
- * return within [graceMillis] after it is abandoned: the attempt fails at
- * once and whatever the call still returns is dropped, never stored. A
- * call that returns within the grace is not abandoned and its result
- * stands: a transcript that completed just past the budget is the same
- * audio's correct text, and dropping it would only make the user redo
- * the work.
+ * budget ([budgetMillis], scaled by the audio length). The stop goes
+ * through the engine's cooperative cancel; a call that does not return
+ * within [graceMillis] after it is abandoned: the attempt fails at once
+ * and whatever the call still returns is dropped, never stored. A call
+ * that returns within the grace is not abandoned and its result stands: a
+ * transcript that completed just past the budget is the same audio's
+ * correct text, and dropping it would only make the user redo the work.
  *
  * An attempt still waiting for the engine (another call holds it) is not
  * timed: a long transcription ahead of it is legitimate. It gives up only
- * when the engine is stuck, i.e. its call in progress is over the limit;
- * that is also checked before an attempt is started at all, so retries on
- * a wedged engine fail fast instead of queueing behind it.
+ * when the engine is stuck, i.e. the other call's native call in progress
+ * has run longer than [nativeCallLimitMillis] ([nativeCallAgeMillis] is its
+ * age; native calls are bounded windows of at most ~32 s of audio, or a
+ * model load). That is also checked before an attempt is started at all,
+ * so retries on a wedged engine fail fast instead of queueing behind it.
+ * Once the engine started an attempt, every native call in progress is
+ * the attempt's own, and only its budget bounds it.
  */
 class BoundedTranscription(
     private val nativeCallAgeMillis: () -> Long,
@@ -109,18 +120,15 @@ class BoundedTranscription(
                     if (now - stopped >= graceMillis) return InferenceResult.Failure(ABANDONED, true)
                     continue
                 }
-                val startedAt = attempt.startedAt()
-                val reason = when {
-                    startedAt == null -> if (engineStuck()) ENGINE_STUCK else null
-                    // Only one native call runs at a time, under the engine lock
-                    // this attempt holds: the stuck call is its own.
-                    engineStuck() -> NO_PROGRESS
-                    now - startedAt > budgetMillis -> timedOut(budgetMillis)
-                    else -> null
-                } ?: continue
-                attempt.stop(reason)
-                // Not started (the engine never got to it) and now never will.
-                if (attempt.startedAt() == null) return InferenceResult.Failure(reason, true)
+                // Sampled before the attempt's own start is checked: a stuck
+                // call seen while the attempt still waits is another one's.
+                // Given up, it never starts.
+                if (engineStuck() && attempt.giveUpWaiting(ENGINE_STUCK)) {
+                    return InferenceResult.Failure(ENGINE_STUCK, true)
+                }
+                val startedAt = attempt.startedAt() ?: continue
+                if (now - startedAt <= budgetMillis) continue
+                attempt.stop(timedOut(budgetMillis))
                 stoppedAt = now
             }
         } catch (_: InterruptedException) {
@@ -182,8 +190,6 @@ class BoundedTranscription(
                 "The recording is kept; retry to transcribe it again."
         }
 
-        const val NO_PROGRESS = "The on-device model stopped making progress and the transcription was stopped. " +
-            "The recording is kept; retry to transcribe it again."
         const val ABANDONED = "The on-device model stopped responding. The recording is kept; restart Starling " +
             "to transcribe on this device again, or retry with a server."
         const val ENGINE_STUCK = "The on-device model is stuck on an earlier call. The recording is kept; restart " +

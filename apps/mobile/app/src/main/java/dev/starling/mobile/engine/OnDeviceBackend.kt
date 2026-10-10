@@ -20,7 +20,7 @@ class OnDeviceBackend(
     private val engine: OnDeviceEngine,
     private val bound: BoundedTranscription = BoundedTranscription(engine::nativeCallAgeMillis),
 ) {
-    fun transcribe(audioFile: File, config: BackendConfig): InferenceResult =
+    fun transcribe(audioFile: File, config: BackendConfig): InferenceResult = runCatching {
         bound.run(BoundedTranscription.budgetFor(audioFile.length())) { attempt ->
             runCatching { engine.transcribe(audioFile, config.onDeviceModel, attempt) }.getOrElse {
                 InferenceResult.Failure(
@@ -29,6 +29,16 @@ class OnDeviceBackend(
                 )
             }
         }
+    }.getOrElse {
+        // The bound itself failed (no thread for the call, an interrupt):
+        // nothing is wrong with the recording, so it stays retryable.
+        if (it is InterruptedException) Thread.currentThread().interrupt()
+        InferenceResult.Failure(
+            "The on-device transcription could not run (${it.message ?: it::class.java.simpleName}). " +
+                "The recording is kept; retry to transcribe it again.",
+            true,
+        )
+    }
 
     /** The model a transcription without an explicit one uses; null when none is installed. */
     fun activeModelName(): String? = runCatching { engine.activeModelName() }.getOrNull()

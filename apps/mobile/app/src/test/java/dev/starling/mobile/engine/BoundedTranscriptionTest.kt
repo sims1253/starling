@@ -2,7 +2,9 @@ package dev.starling.mobile.engine
 
 import dev.starling.mobile.audio.WavWriter
 import dev.starling.mobile.data.RecordingStatus
+import dev.starling.mobile.network.BackendConfig
 import dev.starling.mobile.network.InferenceResult
+import dev.starling.mobile.network.TranscriptionEngine
 import dev.starling.mobile.network.transcribeStoredAudio
 import dev.starling.mobile.storage.RecordingStore
 import org.junit.Assert.assertEquals
@@ -13,6 +15,7 @@ import org.junit.Test
 import org.junit.rules.TemporaryFolder
 import java.io.File
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
@@ -113,14 +116,26 @@ class BoundedTranscriptionTest {
         assertTrue(result.message.contains("The recording is kept"))
     }
 
+    /**
+     * The native-call limit tells a waiting attempt that another call is
+     * stuck; an attempt's own native call, however long, runs on its budget.
+     */
     @Test
-    fun aNativeCallOverTheLimitIsStoppedBeforeTheBudget() {
+    fun anAttemptsOwnLongNativeCallRunsOnItsBudget() {
         val engine = FakeEngine()
-        val result = bound(engine, nativeCallLimitMillis = 50).run(budgetMillis = 60_000) { attempt ->
+        val result = bound(engine, nativeCallLimitMillis = 20).run(budgetMillis = 60_000) { attempt ->
+            engine.transcribe(attempt) { engine.cooperative(it, millis = 200) }
+        }
+        assertFalse(engine.cancelled.get())
+        assertEquals(InferenceResult.Success("slow but done"), result)
+
+        val overBudget = bound(engine, nativeCallLimitMillis = 20).run(budgetMillis = 100) { attempt ->
             engine.transcribe(attempt) { engine.cooperative(it) }
         }
         assertTrue(engine.cancelled.get())
-        assertEquals(InferenceResult.Failure(BoundedTranscription.NO_PROGRESS, true), result)
+        overBudget as InferenceResult.Failure
+        assertTrue(overBudget.retryable)
+        assertTrue(overBudget.message, overBudget.message.startsWith("On-device transcription did not finish within"))
     }
 
     /**
@@ -293,6 +308,38 @@ class BoundedTranscriptionTest {
             bound(engine).run(budgetMillis = 10_000) { throw OutOfMemoryError("decode") }
         }.exceptionOrNull()
         assertTrue(thrown is OutOfMemoryError)
+    }
+
+    /**
+     * OnDeviceBackend.transcribe never throws: a bound that cannot run the
+     * call at all fails the recording retryable, with its audio kept.
+     */
+    @Test
+    fun theBackendSettlesABoundThatThrows() {
+        val audio = File(folder.root, "take.wav").apply { writeBytes(ByteArray(44)) }
+        val backend = OnDeviceBackend(
+            OnDeviceEngine(folder.newFolder("models")),
+            BoundedTranscription(
+                nativeCallAgeMillis = { 0L },
+                spawn = { throw RejectedExecutionException("no thread") },
+            ),
+        )
+
+        val result = backend.transcribe(audio, BackendConfig("", false, engine = TranscriptionEngine.ON_DEVICE))
+
+        result as InferenceResult.Failure
+        assertTrue(result.retryable)
+        assertTrue(result.message, result.message.contains("no thread"))
+        assertTrue(result.message.contains("The recording is kept"))
+        assertTrue(audio.exists())
+    }
+
+    @Test
+    fun anAttemptTheEngineStartedIsNotGivenUpAsWaiting() {
+        val attempt = CallAttempt { 0L }
+        assertTrue(attempt.start())
+        assertFalse(attempt.giveUpWaiting("stuck"))
+        assertFalse(attempt.cancelRequested())
     }
 
     @Test
