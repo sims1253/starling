@@ -34,8 +34,8 @@ import java.util.concurrent.TimeUnit
  *              played back, and retranscribed with each installed model
  *
  * Opt-in: `am instrument -e durable <phase> [-e minutes N]
- * [-e killedBytes B -e killedConfirmedBytes C] ...`, the last two (verify)
- * being the partial WAV's payload size and header data size the host read
+ * [-e killedBytes B -e killedConfirmedBytes C] ...`, the last two (required
+ * by verify) being the partial WAV's payload size and header data size the host read
  * after the kill.
  */
 @RunWith(AndroidJUnit4::class)
@@ -119,10 +119,12 @@ class DurableAudioDeviceTest {
                 // Measured by the host on the partial WAV after the kill
                 // (its size and header data size), so recovery is checked
                 // against what the dead process left, not against itself.
-                arguments.getString("killedBytes")?.toInt()?.let { assertEquals(it, pcm.size) }
-                arguments.getString("killedConfirmedBytes")?.toInt()?.let {
-                    assertEquals(it / 32_000.0, recovery.confirmedSeconds, 1e-6)
-                }
+                val killedBytes = arguments.getString("killedBytes")?.toInt()
+                    ?: throw AssertionError("pass -e killedBytes (the partial WAV's size - 44 after the kill)")
+                val killedConfirmedBytes = arguments.getString("killedConfirmedBytes")?.toInt()
+                    ?: throw AssertionError("pass -e killedConfirmedBytes (its header's data size after the kill)")
+                assertEquals(killedBytes, pcm.size)
+                assertEquals(killedConfirmedBytes / 32_000.0, recovery.confirmedSeconds, 1e-6)
             }
             // Every recovered sample is the test microphone's, in order.
             assertEquals(restored.durationSeconds, pcm.size / 32_000.0, 1e-6)
