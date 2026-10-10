@@ -96,8 +96,8 @@ flag runs a warmup at startup; omit the square brackets when using it.
 | `--granite-chunk-fairness` | off | Opt in to one FIFO turn per Granite chunk; requires `--model granite` |
 | `--stream-chunk-seconds <s>` | `12.0` | Fixed WS stream window |
 | `--stream-overlap-seconds <s>` | `3.0` | Overlap between windows |
-| `--min-chunk-seconds <s>` | `5.0` | Min audio before first partial |
-| `--partial-interval-seconds <s>` | `3.0` | Min gap between partials |
+| `--min-chunk-seconds <s>` | `1.0` | Min audio before first partial |
+| `--partial-interval-seconds <s>` | `0.5` | Min gap between partials |
 | `--max-stream-seconds <s>` | `60.0` | Per-WS-connection LIVE buffer cap in s (0 = unlimited); see `WS /stream` |
 | `--version` | n/a | Print version + ABI + backend, exit |
 | `--abi-version` | n/a | Print ABI version integer, exit |

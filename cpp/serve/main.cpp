@@ -96,8 +96,8 @@ static void usage(const char* prog) {
         "Streaming:\n"
         "  --stream-chunk-seconds <s>    Fixed stream window (default 12.0)\n"
         "  --stream-overlap-seconds <s>  Overlap between windows (default 3.0)\n"
-        "  --min-chunk-seconds <s>       Min audio before first partial (default 5.0)\n"
-        "  --partial-interval-seconds <s> Min gap between partials (default 3.0)\n"
+        "  --min-chunk-seconds <s>       Min audio before first partial (default 1.0)\n"
+        "  --partial-interval-seconds <s> Min gap between partials (default 0.5)\n"
         "  --max-stream-seconds <s>      Per-connection audio buffer cap in s\n"
         "                     (0 = unlimited, default 60). A frame that would\n"
         "                     exceed it is rejected with an error frame and the\n"
@@ -147,8 +147,8 @@ struct Args {
     double max_stream_seconds = 60.0;
     double stream_chunk = 12.0;
     double stream_overlap = 3.0;
-    double min_chunk = 5.0;
-    double partial_interval = 3.0;
+    double min_chunk = serve::kDefaultMinChunk;
+    double partial_interval = serve::kDefaultPartialInt;
     bool show_version = false;
     bool show_abi = false;
     bool show_help = false;
