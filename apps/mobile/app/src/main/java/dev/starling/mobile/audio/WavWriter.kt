@@ -2,20 +2,45 @@ package dev.starling.mobile.audio
 
 import java.io.File
 import java.io.RandomAccessFile
+import java.nio.ByteBuffer
 
-/** Writes little-endian mono PCM16 at 16 kHz with a finalized RIFF header. */
+/**
+ * Writes little-endian mono PCM16 at 16 kHz with a finalized RIFF header.
+ *
+ * Crash durability (#356): every [write] goes straight to the file (no
+ * user-space buffer), so a killed process leaves every chunk the capture
+ * wrote. [checkpoint], called periodically from another thread, fsyncs the
+ * file and then records the confirmed payload size in the header, so after
+ * a power loss or OS crash the header names the samples that were on
+ * storage. The header write itself is synced by the next checkpoint, so
+ * the recorded boundary lags the last write by up to two intervals.
+ * [finish] writes the final header and fsyncs it before closing, so a
+ * finished WAV is durable as a whole.
+ */
 internal class WavWriter(
     file: File,
     private val maxDataBytes: Long = MAX_DATA_BYTES,
 ) {
     private val output = RandomAccessFile(file, "rw")
+
+    // Written by the capture thread only; read by [checkpoint] from another.
+    @Volatile
     private var dataBytes = 0L
+
+    // Serializes [checkpoint] with [finish]: both write the header, and a
+    // checkpoint must never touch a closed descriptor.
+    private val headerLock = Any()
     private var closed = false
 
     init {
         output.setLength(0)
-        output.seek(WAV_HEADER_SIZE.toLong())
+        // A valid header with an empty payload from the start: a capture that
+        // dies before its first checkpoint is still recognizably this app's WAV.
+        output.write(header(0))
     }
+
+    /** Bytes of PCM written so far. */
+    val writtenBytes: Long get() = dataBytes
 
     fun write(bytes: ByteArray, count: Int) {
         check(!closed) { "WAV writer is closed" }
@@ -24,44 +49,31 @@ internal class WavWriter(
         dataBytes += count
     }
 
-    fun finish() {
+    /**
+     * Makes everything written so far durable and records it in the header
+     * (a positional write, so it never moves the capture thread's offset).
+     * Returns the confirmed payload size, or -1 once the writer is closed.
+     * Safe to call from any thread while [write] runs.
+     */
+    fun checkpoint(): Long = synchronized(headerLock) {
+        if (closed) return -1
+        val confirmed = dataBytes
+        output.fd.sync()
+        output.channel.write(ByteBuffer.wrap(header(confirmed)), 0)
+        confirmed
+    }
+
+    fun finish() = synchronized(headerLock) {
         if (closed) return
         check(dataBytes <= maxDataBytes) { EXCEEDED_MESSAGE }
         try {
             output.seek(0)
-            output.writeAscii("RIFF")
-            output.writeIntLittleEndian((WAV_HEADER_SIZE - 8 + dataBytes).toInt())
-            output.writeAscii("WAVE")
-            output.writeAscii("fmt ")
-            output.writeIntLittleEndian(16)
-            output.writeShortLittleEndian(1) // PCM
-            output.writeShortLittleEndian(1) // mono
-            output.writeIntLittleEndian(SAMPLE_RATE)
-            output.writeIntLittleEndian(SAMPLE_RATE * CHANNELS * BYTES_PER_SAMPLE)
-            output.writeShortLittleEndian(CHANNELS * BYTES_PER_SAMPLE)
-            output.writeShortLittleEndian(BITS_PER_SAMPLE)
-            output.writeAscii("data")
-            output.writeIntLittleEndian(dataBytes.toInt())
+            output.write(header(dataBytes))
+            output.fd.sync()
         } finally {
             closed = true
             output.close()
         }
-    }
-
-    private fun RandomAccessFile.writeAscii(value: String) {
-        write(value.toByteArray(Charsets.US_ASCII))
-    }
-
-    private fun RandomAccessFile.writeIntLittleEndian(value: Int) {
-        write(value and 0xff)
-        write(value ushr 8 and 0xff)
-        write(value ushr 16 and 0xff)
-        write(value ushr 24 and 0xff)
-    }
-
-    private fun RandomAccessFile.writeShortLittleEndian(value: Int) {
-        write(value and 0xff)
-        write(value ushr 8 and 0xff)
     }
 
     companion object {
@@ -78,5 +90,24 @@ internal class WavWriter(
          */
         const val MAX_DATA_BYTES: Long = Int.MAX_VALUE.toLong() - (WAV_HEADER_SIZE - 8)
         private const val EXCEEDED_MESSAGE = "The recording exceeded the maximum WAV size"
+
+        /** The 44-byte PCM16 mono 16 kHz header for a payload of [dataBytes]. */
+        fun header(dataBytes: Long): ByteArray {
+            val header = ByteBuffer.allocate(WAV_HEADER_SIZE).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+            header.put("RIFF".toByteArray(Charsets.US_ASCII))
+            header.putInt((WAV_HEADER_SIZE - 8 + dataBytes).toInt())
+            header.put("WAVE".toByteArray(Charsets.US_ASCII))
+            header.put("fmt ".toByteArray(Charsets.US_ASCII))
+            header.putInt(16)
+            header.putShort(1) // PCM
+            header.putShort(CHANNELS.toShort())
+            header.putInt(SAMPLE_RATE)
+            header.putInt(SAMPLE_RATE * CHANNELS * BYTES_PER_SAMPLE)
+            header.putShort((CHANNELS * BYTES_PER_SAMPLE).toShort())
+            header.putShort(BITS_PER_SAMPLE.toShort())
+            header.put("data".toByteArray(Charsets.US_ASCII))
+            header.putInt(dataBytes.toInt())
+            return header.array()
+        }
     }
 }

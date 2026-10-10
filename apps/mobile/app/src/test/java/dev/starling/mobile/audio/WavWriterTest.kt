@@ -61,6 +61,40 @@ class WavWriterTest {
         }
     }
 
+    @Test
+    fun startsWithAValidEmptyHeaderAndCheckpointsRecordTheConfirmedSize() {
+        val directory = Files.createTempDirectory("starling-wav-test").toFile()
+        val file = File(directory, "checkpointed.wav.part")
+        try {
+            val writer = WavWriter(file)
+            // Killed before the first sample: still this app's (empty) WAV.
+            assertArrayEquals(WavWriter.header(0), file.readBytes())
+
+            val first = byteArrayOf(1, 0, 2, 0)
+            writer.write(first, first.size)
+            assertEquals(first.size.toLong(), writer.checkpoint())
+            val second = byteArrayOf(3, 0, 4, 0, 5, 0)
+            writer.write(second, second.size)
+
+            // A process killed now leaves every written chunk; the header
+            // names what the last checkpoint confirmed, and the checkpoint
+            // did not move the append position.
+            val bytes = file.readBytes()
+            assertEquals(44 + first.size + second.size, bytes.size)
+            assertEquals(first.size, littleEndianInt(bytes, 40))
+            assertArrayEquals(first + second, bytes.copyOfRange(44, bytes.size))
+
+            writer.finish()
+            assertEquals(-1L, writer.checkpoint())
+            val finished = file.readBytes()
+            assertEquals(first.size + second.size, littleEndianInt(finished, 40))
+            assertEquals(44 + first.size + second.size, finished.size)
+        } finally {
+            file.delete()
+            directory.delete()
+        }
+    }
+
     private fun WavWriter.useAndFinish(payload: ByteArray) {
         write(payload, payload.size)
         finish()

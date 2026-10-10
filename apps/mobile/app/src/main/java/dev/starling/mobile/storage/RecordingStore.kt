@@ -1,9 +1,14 @@
 package dev.starling.mobile.storage
 
 import android.content.Context
+import dev.starling.mobile.audio.WavWriter
+import dev.starling.mobile.data.CaptureRecovery
 import dev.starling.mobile.data.Recording
 import dev.starling.mobile.data.RecordingStatus
+import dev.starling.mobile.data.TranscriptRevision
+import dev.starling.mobile.data.TranscriptSource
 import dev.starling.mobile.data.TranscriptionProvenance
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
@@ -17,8 +22,19 @@ import java.util.UUID
  * Each item has its own metadata file. This avoids rewriting a single index
  * when a response arrives and makes an interrupted write recoverable: the
  * previous metadata file remains in place until the replacement is complete.
+ *
+ * Audio outlives inference (#356): nothing here deletes audio except an
+ * explicit [delete]. The store is opened once per process, before any
+ * capture, so at open every capture the last process left unfinished is
+ * recovered from its partial WAV ([recoverInterrupted]), and a transcription
+ * it left running is marked failed and retryable. Recovery runs only there,
+ * never on [list] or [get], so it cannot touch a WAV a capture of this
+ * process is still writing.
  */
-class RecordingStore internal constructor(private val directory: File) {
+class RecordingStore internal constructor(
+    private val directory: File,
+    private val clock: () -> Long = System::currentTimeMillis,
+) {
     constructor(context: Context) : this(File(context.applicationContext.filesDir, "recordings"))
 
     private val lock = Any()
@@ -29,6 +45,7 @@ class RecordingStore internal constructor(private val directory: File) {
         }
         sweepOrphanedTemporaries()
         sweepEphemeral()
+        recoverInterrupted()
     }
 
     /**
@@ -39,7 +56,7 @@ class RecordingStore internal constructor(private val directory: File) {
         val id = UUID.randomUUID().toString()
         val recording = Recording(
             id = id,
-            createdAtMillis = System.currentTimeMillis(),
+            createdAtMillis = clock(),
             wavName = "$id.wav",
             status = RecordingStatus.RECORDING,
             ephemeral = ephemeral,
@@ -52,14 +69,7 @@ class RecordingStore internal constructor(private val directory: File) {
     fun list(): List<Recording> = synchronized(lock) {
         directory.listFiles { file -> file.isFile && file.name.endsWith(".json") }
             .orEmpty()
-            .mapNotNull { file ->
-                runCatching {
-                    val decoded = decode(file)
-                    recoverFinalizedAudio(decoded).also { recovered ->
-                        if (recovered != decoded) runCatching { save(recovered) }
-                    }
-                }.getOrNull()
-            }
+            .mapNotNull { file -> runCatching { decode(file) }.getOrNull() }
             .filterNot { it.ephemeral }
             .sortedByDescending { it.createdAtMillis }
     }
@@ -68,10 +78,7 @@ class RecordingStore internal constructor(private val directory: File) {
         requireValidId(id)
         val file = metadataFile(id)
         if (!file.isFile) throw IOException("Recording is no longer available")
-        val decoded = decode(file)
-        return recoverFinalizedAudio(decoded).also { recovered ->
-            if (recovered != decoded) runCatching { save(recovered) }
-        }
+        return decode(file)
     }
 
     fun partialFile(recording: Recording): File = File(directory, "${recording.id}.wav.part")
@@ -100,6 +107,18 @@ class RecordingStore internal constructor(private val directory: File) {
         updated
     }
 
+    /**
+     * Settles a capture that did not complete cleanly (the microphone
+     * failed, the disk filled up, the WAV could not be committed): whatever
+     * audio its partial WAV holds becomes the recording, PENDING and marked
+     * with a [CaptureRecovery] so it never reads as a complete take. Without
+     * any audio the recording is FAILED with [message].
+     */
+    fun salvageCapture(id: String, message: String): Recording = synchronized(lock) {
+        requireValidId(id)
+        salvageLocked(get(id), message)
+    }
+
     fun markFailed(id: String, message: String): Recording = synchronized(lock) {
         update(id) { it.copy(status = RecordingStatus.FAILED, errorMessage = message) }
     }
@@ -118,10 +137,16 @@ class RecordingStore internal constructor(private val directory: File) {
         }
     }
 
+    /**
+     * Stores a successful transcript as a new revision; earlier revisions
+     * (from the first attempt or other models) are kept.
+     */
     fun markTranscribed(
         id: String,
         rawTranscript: String,
         provenance: TranscriptionProvenance = TranscriptionProvenance.BATCH_UPLOAD,
+        source: TranscriptSource? = null,
+        model: String? = null,
     ): Recording = synchronized(lock) {
         // Deliberately do not trim, normalize, or otherwise clean this value.
         update(id) {
@@ -130,6 +155,7 @@ class RecordingStore internal constructor(private val directory: File) {
                 rawTranscript = rawTranscript,
                 errorMessage = null,
                 provenance = provenance,
+                revisions = it.revisions + TranscriptRevision(rawTranscript, provenance, source, model, clock()),
             )
         }
     }
@@ -196,6 +222,8 @@ class RecordingStore internal constructor(private val directory: File) {
             .put("error_message", recording.errorMessage ?: JSONObject.NULL)
             .put("provenance", recording.provenance?.name ?: JSONObject.NULL)
             .put("ephemeral", recording.ephemeral)
+            .put("revisions", JSONArray(recording.revisions.map(::encodeRevision)))
+            .put("recovery", recording.recovery?.let(::encodeRecovery) ?: JSONObject.NULL)
 
         FileOutputStream(temporary).use { output ->
             output.write(json.toString().toByteArray(Charsets.UTF_8))
@@ -229,27 +257,169 @@ class RecordingStore internal constructor(private val directory: File) {
                     runCatching { TranscriptionProvenance.valueOf(value) }.getOrNull()
                 },
             ephemeral = json.optBoolean("ephemeral", false),
+            revisions = json.optJSONArray("revisions")
+                ?.let { array -> (0 until array.length()).mapNotNull { decodeRevision(array.getJSONObject(it)) } }
+                .orEmpty(),
+            recovery = json.optJSONObject("recovery")?.let(::decodeRecovery),
         )
     }
 
+    private fun encodeRevision(revision: TranscriptRevision): JSONObject = JSONObject()
+        .put("text", revision.text)
+        .put("provenance", revision.provenance.name)
+        .put("source", revision.source?.name ?: JSONObject.NULL)
+        .put("model", revision.model ?: JSONObject.NULL)
+        .put("created_at_ms", revision.createdAtMillis)
+
+    private fun decodeRevision(json: JSONObject): TranscriptRevision? = runCatching {
+        TranscriptRevision(
+            text = json.getString("text"),
+            provenance = TranscriptionProvenance.valueOf(json.getString("provenance")),
+            source = json.optionalString("source")?.let { runCatching { TranscriptSource.valueOf(it) }.getOrNull() },
+            model = json.optionalString("model"),
+            createdAtMillis = json.getLong("created_at_ms"),
+        )
+    }.getOrNull()
+
+    private fun encodeRecovery(recovery: CaptureRecovery): JSONObject = JSONObject()
+        .put("reason", recovery.reason)
+        .put("recovered_s", recovery.recoveredSeconds)
+        .put("confirmed_s", recovery.confirmedSeconds)
+
+    private fun decodeRecovery(json: JSONObject): CaptureRecovery = CaptureRecovery(
+        reason = json.getString("reason"),
+        recoveredSeconds = json.optDouble("recovered_s", 0.0),
+        confirmedSeconds = json.optDouble("confirmed_s", 0.0),
+    )
+
     /**
-     * Recover the narrow crash window between audio promotion and metadata
-     * commit. A process can leave a finalized WAV beside RECORDING metadata;
-     * make it PENDING so the UI exposes Retry on the next read. A finalized
-     * partial WAV is also promoted after a process exit before commitAudio.
+     * At open, before any capture of this process: settles what the previous
+     * process left unfinished. A capture that never reached commitAudio (the
+     * process was killed, the phone powered off) is recovered from its
+     * partial WAV; a recording whose audio was promoted but whose metadata
+     * still said RECORDING (the crash window inside commitAudio) becomes
+     * PENDING as it was; a transcription that was running is failed with an
+     * explanation, so the row offers Retry instead of claiming progress.
      */
-    private fun recoverFinalizedAudio(recording: Recording): Recording {
-        if (recording.status != RecordingStatus.RECORDING) return recording
-        val destination = audioFile(recording)
-        if (isFinalizedWav(destination)) {
-            return recording.copy(status = RecordingStatus.PENDING, errorMessage = null)
-        }
-        val partial = partialFile(recording)
-        if (!isFinalizedWav(partial)) return recording
-        if (destination.exists() && !destination.delete()) return recording
-        if (!partial.renameTo(destination)) return recording
-        return recording.copy(status = RecordingStatus.PENDING, errorMessage = null)
+    private fun recoverInterrupted() {
+        directory.listFiles { file -> file.isFile && file.name.endsWith(".json") }
+            ?.forEach { file ->
+                val recording = runCatching { decode(file) }.getOrNull() ?: return@forEach
+                if (recording.ephemeral) return@forEach
+                val audioMissing = !audioFile(recording).exists() && partialFile(recording).exists()
+                when {
+                    recording.status == RecordingStatus.RECORDING || audioMissing -> runCatching {
+                        salvageLocked(
+                            recording,
+                            recording.recovery?.reason
+                                ?: recording.errorMessage?.takeIf { it != UNRECOVERED_CAPTURE }
+                                ?: INTERRUPTED_CAPTURE,
+                        )
+                    }.onFailure {
+                        // Storage refused the repair: the partial WAV stays
+                        // untouched, the row says so instead of "recording",
+                        // and the next open tries again (the audio is missing).
+                        runCatching {
+                            save(recording.copy(status = RecordingStatus.FAILED, errorMessage = UNRECOVERED_CAPTURE))
+                        }
+                    }
+                    recording.status == RecordingStatus.TRANSCRIBING -> runCatching {
+                        save(recording.copy(status = RecordingStatus.FAILED, errorMessage = INTERRUPTED_TRANSCRIPTION))
+                    }
+                }
+            }
     }
+
+    /**
+     * Turns whatever audio a capture left into the recording (see
+     * [salvageCapture]). The order makes a crash at any step safe to repeat:
+     * the partial WAV is measured, the recovery note is saved, and only then
+     * is the WAV's header repaired and synced, the WAV promoted and the
+     * recording made PENDING. A repeat keeps the first note's (smaller)
+     * confirmed size, since by then the header it was read from is repaired.
+     * A WAV already promoted without a note is a clean Stop whose metadata
+     * commit was cut off, so it is not marked as recovered. Caller holds
+     * [lock].
+     */
+    private fun salvageLocked(recording: Recording, reason: String): Recording {
+        val destination = audioFile(recording)
+        val partial = partialFile(recording)
+        var recovery = recording.recovery
+        if (partial.isFile) {
+            val measured = measurePartial(partial)
+            if (measured != null) {
+                val (dataBytes, confirmedBytes) = measured
+                val confirmed = seconds(confirmedBytes)
+                recovery = CaptureRecovery(
+                    reason = recovery?.reason ?: reason,
+                    recoveredSeconds = seconds(dataBytes),
+                    confirmedSeconds = recovery?.confirmedSeconds?.let { minOf(it, confirmed) } ?: confirmed,
+                )
+                save(recording.copy(recovery = recovery))
+                repairPartial(partial, dataBytes)
+                if (destination.exists() && !destination.delete()) {
+                    throw IOException("Unable to replace the recording audio")
+                }
+                if (!partial.renameTo(destination)) throw IOException("Unable to recover the recording audio")
+            } else {
+                // A header without a single sample: nothing to keep.
+                partial.delete()
+            }
+        }
+        val dataBytes = finalizedDataBytes(destination)
+        val salvaged = if (dataBytes != null && dataBytes > 0) {
+            recording.copy(
+                status = RecordingStatus.PENDING,
+                durationSeconds = seconds(dataBytes),
+                errorMessage = null,
+                recovery = recovery,
+            )
+        } else {
+            recording.copy(status = RecordingStatus.FAILED, errorMessage = reason, recovery = null)
+        }
+        save(salvaged)
+        return salvaged
+    }
+
+    /**
+     * The whole-sample payload size of a partial WAV, and the part of it the
+     * capture had confirmed on storage (the size its last header checkpoint
+     * recorded, see WavWriter.checkpoint); null when it holds no audio.
+     */
+    private fun measurePartial(partial: File): Pair<Long, Long>? = RandomAccessFile(partial, "r").use { file ->
+        val length = file.length()
+        if (length <= WAV_HEADER_BYTES) return null
+        val dataBytes = minOf(length - WAV_HEADER_BYTES, WavWriter.MAX_DATA_BYTES) and 1L.inv()
+        if (dataBytes <= 0) return null
+        val header = ByteArray(WAV_HEADER_BYTES.toInt())
+        file.readFully(header)
+        val confirmed = if (isPcmHeader(header)) {
+            (littleEndianInt(header, 40).toLong() and 0xffffffffL).coerceAtMost(dataBytes)
+        } else {
+            0L
+        }
+        dataBytes to confirmed
+    }
+
+    /** Makes a partial WAV a valid one over its first [dataBytes] of payload, and syncs it. */
+    private fun repairPartial(partial: File, dataBytes: Long) = RandomAccessFile(partial, "rw").use { file ->
+        file.setLength(WAV_HEADER_BYTES + dataBytes)
+        file.seek(0)
+        file.write(WavWriter.header(dataBytes))
+        file.fd.sync()
+    }
+
+    private fun isPcmHeader(header: ByteArray): Boolean =
+        header.copyOfRange(0, 4).contentEquals("RIFF".toByteArray(Charsets.US_ASCII)) &&
+            header.copyOfRange(8, 12).contentEquals("WAVE".toByteArray(Charsets.US_ASCII)) &&
+            header.copyOfRange(36, 40).contentEquals("data".toByteArray(Charsets.US_ASCII))
+
+    /** The payload size of a finalized WAV, or null when [file] is not one. */
+    private fun finalizedDataBytes(file: File): Long? =
+        if (isFinalizedWav(file)) file.length() - WAV_HEADER_BYTES else null
+
+    private fun seconds(dataBytes: Long): Double =
+        dataBytes.toDouble() / (WavWriter.SAMPLE_RATE * WavWriter.BYTES_PER_SAMPLE)
 
     private fun isFinalizedWav(file: File): Boolean = runCatching {
         if (!file.isFile || file.length() < WAV_HEADER_BYTES) return false
@@ -282,5 +452,11 @@ class RecordingStore internal constructor(private val directory: File) {
     companion object {
         private const val WAV_HEADER_BYTES = 44L
         private val UUID_PATTERN = Regex("[0-9a-fA-F-]{36}")
+
+        const val INTERRUPTED_CAPTURE = "The recording was interrupted: the app or the phone stopped while it was recording."
+        const val UNRECOVERED_CAPTURE =
+            "The recording was interrupted and its audio could not be recovered yet; Starling tries again at the next start."
+        const val INTERRUPTED_TRANSCRIPTION =
+            "Transcription was interrupted when the app stopped. The audio is saved; retry it."
     }
 }

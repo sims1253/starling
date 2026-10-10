@@ -24,6 +24,15 @@
         android:textSize="13sp" />
 
     <TextView
+        android:id="@+id/recording_recovery"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="3dp"
+        android:textColor="@color/starling_muted"
+        android:textSize="13sp"
+        android:visibility="gone" />
+
+    <TextView
         android:id="@+id/recording_transcript"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
@@ -32,12 +41,36 @@
         android:textIsSelectable="true"
         android:textSize="15sp" />
 
+    <TextView
+        android:id="@+id/recording_revisions"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:textColor="@color/starling_muted"
+        android:textIsSelectable="true"
+        android:textSize="13sp"
+        android:visibility="gone" />
+
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:gravity="end"
         style="?android:attr/buttonBarStyle"
         android:orientation="horizontal">
+
+        <Button
+            android:id="@+id/play_recording_button"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            style="?android:attr/buttonBarButtonStyle"
+            android:text="@string/play_recording" />
+
+        <Button
+            android:id="@+id/export_recording_button"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            style="?android:attr/buttonBarButtonStyle"
+            android:text="@string/export_recording" />
 
         <Button
             android:id="@+id/retry_recording_button"

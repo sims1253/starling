@@ -13,8 +13,8 @@ import java.io.File
  * client does, not crash the caller.
  */
 class OnDeviceBackend(private val engine: OnDeviceEngine) {
-    fun transcribe(audioFile: File, @Suppress("UNUSED_PARAMETER") config: BackendConfig): InferenceResult =
-        runCatching { engine.transcribe(audioFile) }.getOrElse {
+    fun transcribe(audioFile: File, config: BackendConfig): InferenceResult =
+        runCatching { engine.transcribe(audioFile, config.onDeviceModel) }.getOrElse {
             InferenceResult.Failure(
                 "The on-device engine could not run: ${it.message ?: it::class.java.simpleName}",
                 false,

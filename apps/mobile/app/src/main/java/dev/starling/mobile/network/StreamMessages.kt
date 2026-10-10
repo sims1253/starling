@@ -119,8 +119,11 @@ sealed interface StreamEvent {
  * [Fallback] so the caller retries with the durable WAV.
  */
 sealed interface CommitOutcome {
-    /** The server finalized the buffered audio; verbatim transcript. */
-    data class Final(val text: String) : CommitOutcome
+    /**
+     * The session finalized the buffered audio; verbatim transcript. [model]
+     * is the on-device model file that produced it; null for a server stream.
+     */
+    data class Final(val text: String, val model: String? = null) : CommitOutcome
 
     /** The stream is unusable; transcribe the saved WAV through the batch path. */
     data class Fallback(val reason: String) : CommitOutcome

@@ -5,6 +5,7 @@ import android.app.Activity
 import android.app.AlertDialog
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.media.MediaPlayer
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -28,10 +29,13 @@ import dev.starling.mobile.audio.AudioChunkListener
 import dev.starling.mobile.audio.CaptureResult
 import dev.starling.mobile.data.Recording
 import dev.starling.mobile.data.RecordingStatus
+import dev.starling.mobile.data.TranscriptRevision
+import dev.starling.mobile.data.TranscriptSource
 import dev.starling.mobile.data.TranscriptionProvenance
 import dev.starling.mobile.engine.ModelCatalog
 import dev.starling.mobile.engine.OnDeviceEngine
 import dev.starling.mobile.network.BackendConfig
+import dev.starling.mobile.network.BackendSettings
 import dev.starling.mobile.network.EndpointPolicy
 import dev.starling.mobile.network.EndpointValidation
 import dev.starling.mobile.network.StreamEvent
@@ -62,6 +66,12 @@ class MainActivity : Activity() {
     private val application by lazy { starlingApplication() }
     private var activeRecording: Recording? = null
     private var awaitingPermission = false
+
+    // Playback of one saved recording at a time, and the recording an
+    // export document is being picked for.
+    private var player: MediaPlayer? = null
+    private var playingId: String? = null
+    private var pendingExportId: String? = null
 
     // Written on the main thread. Read by the capture worker through the
     // chunk listener, so a stop that nulls it racing an escalated worker is
@@ -180,6 +190,7 @@ class MainActivity : Activity() {
         // A backgrounded Activity should never keep the microphone open. The
         // finalized file stays in app-private storage and can be retried later.
         if (activeRecording != null) stopAndQueueRecording()
+        stopPlayback()
         super.onStop()
     }
 
@@ -279,6 +290,11 @@ class MainActivity : Activity() {
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == REQUEST_EXPORT_RECORDING) {
+            val target = data?.data
+            if (resultCode == RESULT_OK && target != null) finishExport(target) else pendingExportId = null
+            return
+        }
         if (requestCode != REQUEST_IMPORT_MODEL || resultCode != RESULT_OK) return
         val uri: Uri = data?.data ?: run {
             onDeviceStatus.setText(R.string.on_device_file_missing)
@@ -495,7 +511,7 @@ class MainActivity : Activity() {
         )
         if (error != null) {
             session?.close()
-            runCatching { application.recordings.markFailed(recording.id, error) }
+            runCatching { application.recordings.salvageCapture(recording.id, error) }
             recordingMessage.text = error
             refreshRecordings()
             return
@@ -560,7 +576,9 @@ class MainActivity : Activity() {
                     application.recordings.commitAudio(recording, result.durationSeconds)
                 }.getOrElse {
                     session?.close()
-                    application.recordings.markFailed(recording.id, "Unable to finalize the private WAV recording")
+                    runCatching {
+                        application.recordings.salvageCapture(recording.id, "Unable to finalize the private WAV recording")
+                    }
                     updateRecordingViews {
                         recordingMessage.setText(R.string.recording_finalize_error)
                         refreshRecordings()
@@ -584,7 +602,7 @@ class MainActivity : Activity() {
                 // stale live partial go with it.
                 session?.close()
                 updateRecordingViews { liveTranscript.visibility = View.GONE }
-                runCatching { application.recordings.markFailed(recording.id, result.message) }
+                runCatching { application.recordings.salvageCapture(recording.id, result.message) }
                 updateRecordingViews {
                     recordingMessage.text = result.message
                     refreshRecordings()
@@ -672,14 +690,18 @@ class MainActivity : Activity() {
     private fun bindRecordingRow(row: View, recording: Recording) {
         val title = row.findViewById<TextView>(R.id.recording_title)
         val status = row.findViewById<TextView>(R.id.recording_status)
+        val recoveryView = row.findViewById<TextView>(R.id.recording_recovery)
         val transcript = row.findViewById<TextView>(R.id.recording_transcript)
+        val revisionsView = row.findViewById<TextView>(R.id.recording_revisions)
+        val play = row.findViewById<Button>(R.id.play_recording_button)
+        val export = row.findViewById<Button>(R.id.export_recording_button)
         val retry = row.findViewById<Button>(R.id.retry_recording_button)
         val delete = row.findViewById<Button>(R.id.delete_recording_button)
 
         title.text = DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT)
             .format(Date(recording.createdAtMillis))
         status.text = when (recording.status) {
-            RecordingStatus.RECORDING -> getString(R.string.status_interrupted)
+            RecordingStatus.RECORDING -> getString(R.string.status_recording)
             RecordingStatus.PENDING -> getString(R.string.status_pending)
             RecordingStatus.TRANSCRIBING -> getString(R.string.status_transcribing)
             RecordingStatus.TRANSCRIBED -> getString(
@@ -691,6 +713,21 @@ class MainActivity : Activity() {
             )
             RecordingStatus.FAILED -> getString(R.string.status_failed)
         }
+        val latest = recording.revisions.lastOrNull()
+        if (recording.status == RecordingStatus.TRANSCRIBED && latest != null) {
+            status.append(" · ")
+            status.append(revisionSource(latest))
+        }
+        recording.errorMessage?.let {
+            status.append(" — ")
+            status.append(it)
+        }
+        // A recovered take is never presented as a complete one.
+        val recovery = recording.recovery
+        recoveryView.visibility = if (recovery == null) View.GONE else View.VISIBLE
+        recoveryView.text = recovery?.let {
+            getString(R.string.recovery_note, clock(it.recoveredSeconds), clock(it.confirmedSeconds), it.reason)
+        }
         if (recording.rawTranscript != null) {
             transcript.visibility = View.VISIBLE
             // The exact server text is shown and retained. There is no cleanup
@@ -699,44 +736,49 @@ class MainActivity : Activity() {
         } else {
             transcript.visibility = View.GONE
         }
-        recording.errorMessage?.let {
-            status.append(" — ")
-            status.append(it)
+        // Retries add results; the earlier ones stay with the recording.
+        val earlier = recording.revisions.dropLast(1)
+        revisionsView.visibility = if (earlier.isEmpty()) View.GONE else View.VISIBLE
+        revisionsView.text = earlier.reversed().joinToString(
+            separator = "\n",
+            prefix = getString(R.string.revisions_heading) + "\n",
+        ) { revision ->
+            getString(
+                R.string.revision_line,
+                DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT).format(Date(revision.createdAtMillis)),
+                revisionSource(revision),
+                revision.text,
+            )
         }
+
+        val hasAudio = recording.status != RecordingStatus.RECORDING && application.recordings.audioFile(recording).isFile
+        play.visibility = if (hasAudio) View.VISIBLE else View.GONE
+        play.setText(if (playingId == recording.id) R.string.stop_playback else R.string.play_recording)
+        play.setOnClickListener { togglePlayback(recording) }
+        export.visibility = if (hasAudio) View.VISIBLE else View.GONE
+        export.setOnClickListener { exportRecording(recording) }
 
         // Retry is hidden while a transcription for this recording is still
         // in flight, so a double tap cannot queue a second request. A
         // TRANSCRIBING row without an active request (for example after a
-        // process restart) still offers Retry to recover it.
-        retry.visibility = if ((recording.status == RecordingStatus.PENDING ||
-            recording.status == RecordingStatus.FAILED ||
-            recording.status == RecordingStatus.TRANSCRIBING) &&
+        // process restart) still offers Retry to recover it. A transcribed
+        // recording can be transcribed again (another model, say); that adds
+        // a result instead of replacing the current one.
+        retry.visibility = if (recording.status != RecordingStatus.RECORDING &&
+            hasAudio &&
             !application.transcription.isActive(recording.id)
         ) View.VISIBLE else View.GONE
-        retry.setOnClickListener {
-            val config = application.backendSettings.load()
-            val queued = application.transcription.transcribe(recording.id, config) {
-                // The Activity may have been destroyed (for example by a
-                // rotation) while the request was in flight.
-                if (isDestroyed || isFinishing) return@transcribe
-                recordingMessage.setText(
-                    if (it.status == RecordingStatus.TRANSCRIBED) {
-                        R.string.transcription_saved
-                    } else {
-                        R.string.transcription_failed_retry
-                    },
-                )
-                refreshRecordings()
-            }
-            if (queued) recordingMessage.setText(R.string.sending_recording)
-            refreshRecordings()
-        }
+        retry.setText(
+            if (recording.status == RecordingStatus.TRANSCRIBED) R.string.retranscribe_recording else R.string.retry_recording,
+        )
+        retry.setOnClickListener { chooseRetryTarget(recording) }
         delete.setOnClickListener {
             AlertDialog.Builder(this)
                 .setTitle(R.string.delete_recording_title)
                 .setMessage(R.string.delete_recording_message)
                 .setNegativeButton(android.R.string.cancel, null)
                 .setPositiveButton(R.string.delete_recording) { _, _ ->
+                    if (playingId == recording.id) stopPlayback()
                     runCatching { application.recordings.delete(recording.id) }
                         .onSuccess { refreshRecordings() }
                         .onFailure { recordingMessage.setText(R.string.delete_recording_error) }
@@ -745,11 +787,139 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun revisionSource(revision: TranscriptRevision): String {
+        val where = when (revision.source) {
+            TranscriptSource.ON_DEVICE -> getString(R.string.revision_source_on_device)
+            TranscriptSource.SERVER -> getString(R.string.revision_source_server)
+            null -> null
+        }
+        return listOfNotNull(where, revision.model).joinToString(": ")
+            .ifEmpty { getString(R.string.revision_source_unknown) }
+    }
+
+    /**
+     * Retry, or transcribe again, with the configured engine or any other
+     * installed model (#356). The same saved audio is sent every time; the
+     * choice applies to this attempt only and changes no setting.
+     */
+    private fun chooseRetryTarget(recording: Recording) {
+        val config = application.backendSettings.load()
+        val onDevice = application.onDeviceEngine.installedModels()
+            .sortedByDescending { it.active }
+            .map { model ->
+                getString(R.string.retry_with_on_device, modelDisplayName(model)) to
+                    config.copy(engine = TranscriptionEngine.ON_DEVICE, onDeviceModel = model.name)
+            }
+        // A server is offered once one is configured (or it is the engine).
+        val serverConfigured = config.engine == TranscriptionEngine.REMOTE ||
+            config.endpoint != BackendSettings.DEFAULT_ENDPOINT
+        val server = if (serverConfigured && config.model.isNotBlank() &&
+            EndpointPolicy.validate(config.endpoint, config.allowTrustedLanHttp) is EndpointValidation.Valid
+        ) {
+            listOf(getString(R.string.retry_with_server, config.model) to config.copy(engine = TranscriptionEngine.REMOTE))
+        } else {
+            emptyList()
+        }
+        val options = if (config.engine == TranscriptionEngine.REMOTE) server + onDevice else onDevice + server
+        if (options.size <= 1) {
+            retryRecording(recording, options.firstOrNull()?.second ?: config)
+            return
+        }
+        AlertDialog.Builder(this)
+            .setTitle(R.string.retry_with_title)
+            .setItems(options.map { it.first }.toTypedArray()) { _, which -> retryRecording(recording, options[which].second) }
+            .setNegativeButton(android.R.string.cancel, null)
+            .show()
+    }
+
+    private fun retryRecording(recording: Recording, config: BackendConfig) {
+        val queued = application.transcription.transcribe(recording.id, config) {
+            // The Activity may have been destroyed (for example by a
+            // rotation) while the request was in flight.
+            if (isDestroyed || isFinishing) return@transcribe
+            recordingMessage.setText(
+                if (it.status == RecordingStatus.TRANSCRIBED) {
+                    R.string.transcription_saved
+                } else {
+                    R.string.transcription_failed_retry
+                },
+            )
+            refreshRecordings()
+        }
+        if (queued) recordingMessage.setText(R.string.sending_recording)
+        refreshRecordings()
+    }
+
+    private fun togglePlayback(recording: Recording) {
+        val playing = playingId == recording.id
+        stopPlayback()
+        if (playing) {
+            refreshRecordings()
+            return
+        }
+        val player = MediaPlayer()
+        val started = runCatching {
+            player.setDataSource(application.recordings.audioFile(recording).absolutePath)
+            player.setOnCompletionListener {
+                stopPlayback()
+                refreshRecordings()
+            }
+            player.prepare()
+            player.start()
+        }.isSuccess
+        if (!started) {
+            player.release()
+            recordingMessage.setText(R.string.playback_error)
+            return
+        }
+        this.player = player
+        playingId = recording.id
+        refreshRecordings()
+    }
+
+    private fun stopPlayback() {
+        player?.let { runCatching { it.stop() }; it.release() }
+        player = null
+        playingId = null
+    }
+
+    /** Saves a copy of the recording's audio wherever the user picks (Storage Access Framework). */
+    private fun exportRecording(recording: Recording) {
+        val audio = application.recordings.audioFile(recording)
+        val stamp = java.text.SimpleDateFormat("yyyyMMdd-HHmmss", java.util.Locale.US).format(Date(recording.createdAtMillis))
+        pendingExportId = recording.id
+        startActivityForResult(
+            Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+                addCategory(Intent.CATEGORY_OPENABLE)
+                type = "audio/wav"
+                putExtra(Intent.EXTRA_TITLE, "starling-$stamp.${audio.extension}")
+            },
+            REQUEST_EXPORT_RECORDING,
+        )
+    }
+
+    private fun finishExport(uri: Uri) {
+        val id = pendingExportId ?: return
+        pendingExportId = null
+        val resolver = contentResolver
+        thread {
+            val exported = runCatching {
+                val audio = application.recordings.audioFile(application.recordings.get(id))
+                resolver.openOutputStream(uri, "w")!!.use { output -> audio.inputStream().use { it.copyTo(output) } }
+            }.onFailure { Log.w(TAG, "recording export failed", it) }.isSuccess
+            runOnUiThread {
+                if (isDestroyed || isFinishing) return@runOnUiThread
+                recordingMessage.setText(if (exported) R.string.export_done else R.string.export_error)
+            }
+        }
+    }
+
     companion object {
         private const val TAG = "MainActivity"
         private const val REQUEST_RECORD_AUDIO = 4001
         private const val REQUEST_IMPORT_MODEL = 4002
         private const val REQUEST_KEYBOARD_MICROPHONE = 4003
+        private const val REQUEST_EXPORT_RECORDING = 4004
 
         /** The voice keyboard asks for the microphone through this screen. */
         const val ACTION_REQUEST_MICROPHONE = "dev.starling.mobile.action.REQUEST_MICROPHONE"
@@ -759,5 +929,11 @@ class MainActivity : Activity() {
 
         /** Bytes to decimal MB, rounded to nearest like Hugging Face's listing. */
         private fun mb(bytes: Long): Int = ((bytes + MB / 2) / MB).toInt()
+
+        /** 612.4 s as "10:12". */
+        private fun clock(seconds: Double): String {
+            val whole = seconds.toLong()
+            return "%d:%02d".format(whole / 60, whole % 60)
+        }
     }
 }

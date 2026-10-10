@@ -11,7 +11,8 @@ import java.util.UUID
 import java.util.concurrent.TimeUnit
 
 sealed interface InferenceResult {
-    data class Success(val rawTranscript: String) : InferenceResult
+    /** [model] names what produced the text (the on-device model file); null when the caller knows it. */
+    data class Success(val rawTranscript: String, val model: String? = null) : InferenceResult
     data class Failure(val message: String, val retryable: Boolean) : InferenceResult
 }
 

@@ -4,6 +4,7 @@ import android.os.Handler
 import android.os.Looper
 import dev.starling.mobile.data.Recording
 import dev.starling.mobile.data.RecordingStatus
+import dev.starling.mobile.data.TranscriptSource
 import dev.starling.mobile.data.TranscriptionProvenance
 import dev.starling.mobile.engine.OnDeviceBackend
 import dev.starling.mobile.storage.RecordingStore
@@ -12,11 +13,21 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
-/** Uploads only after local audio finalization and persists every outcome. */
+/**
+ * Uploads only after local audio finalization and persists every outcome.
+ * Every attempt, first or retry, transcribes the same saved audio; a success
+ * adds a transcript revision and a failure leaves the audio and earlier
+ * revisions as they were (#356).
+ *
+ * [injectedFailure] is a debug-build test hook (StarlingApplication): when
+ * it returns a reason, every attempt fails with it after Stop, as an engine
+ * or server failure would, so device tests can exercise retry and recovery.
+ */
 class TranscriptionCoordinator(
     private val store: RecordingStore,
     private val settings: BackendSettings,
     private val onDevice: OnDeviceBackend,
+    private val injectedFailure: () -> String? = { null },
 ) {
     private val executor: ExecutorService = Executors.newCachedThreadPool { runnable ->
         Thread(runnable, "starling-transcription").apply { isDaemon = true }
@@ -111,10 +122,20 @@ class TranscriptionCoordinator(
         executor.execute {
             try {
                 val completed = settleOrFail(id) { when (val outcome = session.finish()) {
-                    is CommitOutcome.Final -> runCatching {
-                        store.markTranscribed(id, outcome.text, TranscriptionProvenance.LIVE_STREAM)
-                    }.getOrElse {
-                        store.markFailed(id, "Transcript was received but could not be saved")
+                    is CommitOutcome.Final -> if (injectedFailure() != null) {
+                        transcribeAudio(queued, config)
+                    } else {
+                        runCatching {
+                            store.markTranscribed(
+                                id,
+                                outcome.text,
+                                TranscriptionProvenance.LIVE_STREAM,
+                                source(config),
+                                outcome.model ?: remoteModel(config),
+                            )
+                        }.getOrElse {
+                            store.markFailed(id, "Transcript was received but could not be saved")
+                        }
                     }
                     is CommitOutcome.Fallback ->
                         // The stream is unusable; the durable WAV is the
@@ -143,14 +164,21 @@ class TranscriptionCoordinator(
 
     private fun transcribeAudio(queued: Recording, config: BackendConfig): Recording {
         val audioFile = store.audioFile(queued)
-        val result = if (config.engine == TranscriptionEngine.ON_DEVICE) {
-            onDevice.transcribe(audioFile, config)
-        } else {
-            client.transcribe(audioFile, config)
+        val injected = injectedFailure()
+        val result = when {
+            injected != null -> InferenceResult.Failure(injected, false)
+            config.engine == TranscriptionEngine.ON_DEVICE -> onDevice.transcribe(audioFile, config)
+            else -> client.transcribe(audioFile, config)
         }
         return when (result) {
             is InferenceResult.Success -> runCatching {
-                store.markTranscribed(queued.id, result.rawTranscript)
+                store.markTranscribed(
+                    queued.id,
+                    result.rawTranscript,
+                    TranscriptionProvenance.BATCH_UPLOAD,
+                    source(config),
+                    result.model ?: remoteModel(config),
+                )
             }.getOrElse {
                 store.markFailed(queued.id, "Transcript was received but could not be saved")
             }
@@ -197,6 +225,14 @@ class TranscriptionCoordinator(
     }
 
     companion object {
+        private fun source(config: BackendConfig): TranscriptSource = when (config.engine) {
+            TranscriptionEngine.ON_DEVICE -> TranscriptSource.ON_DEVICE
+            TranscriptionEngine.REMOTE -> TranscriptSource.SERVER
+        }
+
+        private fun remoteModel(config: BackendConfig): String? =
+            config.model.takeIf { config.engine == TranscriptionEngine.REMOTE }
+
         /**
          * Remote configurations attempt `WS /stream` and fall back to batch
          * transcription if the endpoint does not support live dictation.

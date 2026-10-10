@@ -54,6 +54,9 @@ class OnDeviceStreamSession(
         /** Transcribes one window of 16 kHz mono samples. */
         fun transcribeWindow(samples: FloatArray): WindowResult
 
+        /** The model a successful [prepare] pinned to this session, for the transcript's record. */
+        fun loadedModelName(): String? = null
+
         /**
          * Brackets a session so the engine never unloads the model a live
          * recording uses; [prepared] tells whether [prepare] succeeded.
@@ -235,6 +238,7 @@ class OnDeviceStreamSession(
             return
         }
         prepared = true
+        val model = runCatching { engine.loadedModelName() }.getOrNull()
         // Closed or already failed (e.g. the buffer cap) while the model loaded.
         if (lock.withLock { closed || failure != null }) return
         events(StreamEvent.Live)
@@ -279,7 +283,7 @@ class OnDeviceStreamSession(
                 val text = streamer.flush(snapshot, snapshotSize, tx)
                 lock.withLock {
                     if (text != null) {
-                        settleLocked(CommitOutcome.Final(text))
+                        settleLocked(CommitOutcome.Final(text, model))
                     } else {
                         failLocked(windowFailure ?: "the on-device engine failed", bufferLimitReached = false)
                     }
