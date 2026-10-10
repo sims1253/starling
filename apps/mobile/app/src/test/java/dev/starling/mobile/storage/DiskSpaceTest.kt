@@ -19,6 +19,8 @@ import java.io.IOException
 import java.io.RandomAccessFile
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 
 /** #342: free-space thresholds, the in-take watch and a clean, recoverable low-disk stop. */
 class DiskSpaceTest {
@@ -61,22 +63,22 @@ class DiskSpaceTest {
         // Asked every second by the checkpoint thread; probed every five.
         for (second in 1..4) {
             clock = second * 1_000L
-            assertFalse(watch.critical())
+            assertEquals(null, watch.poll())
         }
         assertEquals(0, probes)
         clock = 5_000
-        assertFalse(watch.critical())
+        assertEquals(DiskLevel.OK, watch.poll()?.level)
         assertEquals(1, probes)
         // The disk fills: the next probe stops the take, not the one in between.
         free = 100 * mib
         clock = 9_000
-        assertFalse(watch.critical())
+        assertEquals(null, watch.poll())
         clock = 10_000
-        assertTrue(watch.critical())
+        assertEquals(DiskLevel.CRITICAL, watch.poll()?.level)
         assertEquals(2, probes)
         // A probe that fails keeps the take running.
         val failing = DiskWatch({ throw IOException("gone") }, folder.root, DiskPolicy.DEFAULT, 0, { clock })
-        assertFalse(failing.critical())
+        assertEquals(null, failing.poll())
     }
 
     @Test
@@ -236,6 +238,98 @@ class DiskSpaceTest {
         assertEquals(DiskLevel.CRITICAL, DiskPolicy.DEFAULT.check(measured, folder.root)?.level)
         // In a take, an unmeasured disk keeps recording.
         val watch = DiskWatch(failed, folder.root, DiskPolicy.DEFAULT, intervalMillis = 0, clock = { 0L })
-        assertFalse(watch.critical())
+        assertEquals(null, watch.poll())
+    }
+
+    /**
+     * A take whose free space drops below the warning threshold is warned
+     * once, with the minutes left, and keeps recording; only the stop
+     * threshold ends it.
+     */
+    @Test
+    fun aRunningTakeIsWarnedOnceWhenSpaceRunsLowAndKeepsRecording() {
+        val stop = LowDiskStop()
+        val take = stop.begin()
+        val free = AtomicLong(2048 * mib)
+        val warnings = mutableListOf<Long>()
+        val watch = startDiskWatch(
+            DiskWatch({ free.get() }, folder.root, DiskPolicy.DEFAULT, intervalMillis = 0),
+            stop,
+            take,
+            tickMillis = 1,
+            onLow = { reading -> synchronized(warnings) { warnings += DiskPolicy.DEFAULT.minutesLeft(reading.availableBytes) } },
+        )
+        free.set(128 * mib + 10 * 1_920_000L)
+        awaitUntil { synchronized(warnings) { warnings.isNotEmpty() } }
+        // Still low on every later probe: no second warning, no stop.
+        free.set(128 * mib + 5 * 1_920_000L)
+        Thread.sleep(50)
+        assertEquals(listOf(10L), synchronized(warnings) { warnings.toList() })
+        assertFalse(stop.raised)
+        assertTrue(stop.isOpen(take))
+        // Below the floor the take stops, without another warning.
+        free.set(100 * mib)
+        awaitUntil { stop.raised }
+        stop.close(take)
+        watch.join(5_000)
+        assertFalse(watch.isAlive)
+        assertEquals(listOf(10L), warnings)
+    }
+
+    @Test
+    fun aTakeThatStartedLowIsNotWarnedAgain() {
+        val stop = LowDiskStop()
+        val warned = stop.begin(warned = true)
+        assertFalse(stop.warn(warned))
+        // The next take, started with room, gets its one warning.
+        val next = stop.begin()
+        assertTrue(stop.warn(next))
+        assertFalse(stop.warn(next))
+    }
+
+    @Test
+    fun aLateLowReadingNeverWarnsAnotherTake() {
+        val stop = LowDiskStop()
+        val first = stop.begin()
+        stop.close(first)
+        assertFalse(stop.warn(first))
+        val second = stop.begin()
+        assertFalse(stop.warn(first))
+        // A stopped take is warned no more either.
+        stop.cancel(second)
+        assertFalse(stop.warn(second))
+    }
+
+    @Test
+    fun anUnmeasurableDiskNeitherWarnsNorStops() {
+        val stop = LowDiskStop()
+        val take = stop.begin()
+        val probes = AtomicInteger()
+        val warnings = AtomicInteger()
+        val watch = startDiskWatch(
+            DiskWatch(
+                { probes.incrementAndGet(); throw IOException("statvfs failed") },
+                folder.root,
+                DiskPolicy.DEFAULT,
+                intervalMillis = 0,
+            ),
+            stop,
+            take,
+            tickMillis = 1,
+            onLow = { warnings.incrementAndGet() },
+        )
+        awaitUntil { probes.get() >= 3 }
+        stop.close(take)
+        watch.join(5_000)
+        assertEquals(0, warnings.get())
+        assertFalse(stop.raised)
+    }
+
+    private fun awaitUntil(condition: () -> Boolean) {
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+        while (!condition()) {
+            assertTrue("timed out", System.nanoTime() < deadline)
+            Thread.sleep(1)
+        }
     }
 }

@@ -2,6 +2,7 @@ package dev.starling.mobile.audio
 
 import dev.starling.mobile.storage.DiskLevel
 import dev.starling.mobile.storage.DiskPolicy
+import dev.starling.mobile.storage.DiskReading
 import dev.starling.mobile.storage.FreeSpaceProbe
 import java.io.File
 import java.io.IOException
@@ -9,8 +10,8 @@ import java.io.IOException
 /**
  * The free-space watch of one running take (#342): asked once a second by
  * a thread of its own (a stalled checkpoint fsync must not hold it up), it probes [directory] every
- * [intervalMillis] and says whether the take has to stop. A failing probe
- * never stops a take.
+ * [intervalMillis] and hands back the reading, from which the take is
+ * warned or stopped. A failing probe never stops a take.
  */
 internal class DiskWatch(
     private val probe: FreeSpaceProbe,
@@ -22,11 +23,12 @@ internal class DiskWatch(
 ) {
     private var nextCheck = clock() + intervalMillis
 
-    fun critical(): Boolean {
+    /** The reading when a probe is due and answers; null otherwise. */
+    fun poll(): DiskReading? {
         val now = clock()
-        if (now < nextCheck) return false
+        if (now < nextCheck) return null
         nextCheck = now + intervalMillis
-        return policy.check(probe, directory)?.level == DiskLevel.CRITICAL
+        return policy.check(probe, directory)
     }
 
     companion object {
@@ -46,22 +48,39 @@ internal class DiskWatch(
  * [begin] opens a take and returns its token; only a raise carrying the
  * current, still open token sets the flag. A watcher whose probe returns
  * after its take ended (and maybe after the next one began) is refused, so
- * a late reading can never stop a different recording.
+ * a late reading can never stop (or warn) a different recording.
  */
 internal class LowDiskStop {
     private var current = 0L
     private var open = false
+    private var warned = false
 
     @Volatile
     var raised = false
         private set
 
+    /**
+     * Opens the next take; [warned] when its start already showed the
+     * low-space warning, which a take gives once.
+     */
     @Synchronized
-    fun begin(): Long {
+    fun begin(warned: Boolean = false): Long {
         current++
         open = true
         raised = false
+        this.warned = warned
         return current
+    }
+
+    /**
+     * Claims the low-space warning of the running take [token]: true once
+     * per take, false when it was given already or the take is over.
+     */
+    @Synchronized
+    fun warn(token: Long): Boolean {
+        if (!isOpen(token) || warned) return false
+        warned = true
+        return true
     }
 
     /**
@@ -117,21 +136,30 @@ internal class LowDiskStop {
 
 /**
  * Starts the watch thread of take [token]: every [tickMillis] it asks
- * [watch] and raises [stop] for that take on a critical reading. It ends
- * when the take closes, and at once when interrupted (the capture
+ * [watch], raises [stop] for that take on a critical reading and calls
+ * [onLow] (on this thread) with the first low one, unless the take's
+ * start already warned. A low reading never stops the take. The thread
+ * ends when the take closes, and at once when interrupted (the capture
  * interrupts it as the take ends); a probe still in flight then is refused
- * by [LowDiskStop.raise].
+ * by [LowDiskStop.raise] and [LowDiskStop.warn].
  */
 internal fun startDiskWatch(
     watch: DiskWatch,
     stop: LowDiskStop,
     token: Long,
     tickMillis: Long,
+    onLow: (DiskReading) -> Unit = {},
 ): Thread = Thread({
     try {
         while (stop.isOpen(token)) {
             Thread.sleep(tickMillis)
-            if (stop.isOpen(token) && watch.critical()) stop.raise(token)
+            if (!stop.isOpen(token)) break
+            val reading = watch.poll() ?: continue
+            when (reading.level) {
+                DiskLevel.CRITICAL -> stop.raise(token)
+                DiskLevel.LOW -> if (stop.warn(token)) runCatching { onLow(reading) }
+                DiskLevel.OK -> Unit
+            }
         }
     } catch (_: InterruptedException) {
         // Cancelled with its take; nothing to clean up.

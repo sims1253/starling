@@ -383,6 +383,13 @@ class VoiceInputService : InputMethodService() {
             // A microphone that ends by itself settles like Stop, which also
             // releases the foreground hold.
             onEnded = { if (take?.recording === recording) stopTake() },
+            diskWarned = application.diskWarnedAtStart(disk),
+            onDiskLow = { minutes ->
+                val current = take
+                if (current?.recording === recording && current.capturing) {
+                    showDiskWarning(application.diskLowDuringTake(minutes))
+                }
+            },
         )
         if (error != null) {
             session?.close()

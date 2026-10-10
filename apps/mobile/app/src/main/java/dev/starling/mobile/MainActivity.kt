@@ -77,6 +77,11 @@ class MainActivity : Activity() {
     private var activeRecording: Recording? = null
     private var awaitingPermission = false
 
+    // The running take's status line and its free-space warning (#342),
+    // kept under whatever status the take shows; null when there is none.
+    private var takeStatus = ""
+    private var diskNotice: String? = null
+
     // Playback of one saved recording at a time, and the recording an
     // export document is being picked for.
     private var player: MediaPlayer? = null
@@ -649,6 +654,13 @@ class MainActivity : Activity() {
             // The capture ended itself (low storage, the two-hour cap):
             // settle it like Stop.
             onEnded = { if (activeRecording === recording) stopAndQueueRecording() },
+            diskWarned = application.diskWarnedAtStart(disk),
+            onDiskLow = { minutes ->
+                if (activeRecording === recording) {
+                    diskNotice = application.diskLowDuringTake(minutes)
+                    showRecordingStatus(takeStatus)
+                }
+            },
         )
         if (error != null) {
             session?.close()
@@ -662,17 +674,22 @@ class MainActivity : Activity() {
         recordButton.setText(R.string.stop_and_transcribe)
         liveTranscript.visibility = View.GONE
         liveTranscript.text = null
-        recordingMessage.setText(
-            when {
-                session == null -> R.string.recording_now
-                application.isOnDeviceModelLoading(config) -> R.string.streaming_loading
-                else -> R.string.streaming_connecting
-            },
+        diskNotice = application.diskWarning(disk)
+        showRecordingStatus(
+            getString(
+                when {
+                    session == null -> R.string.recording_now
+                    application.isOnDeviceModelLoading(config) -> R.string.streaming_loading
+                    else -> R.string.streaming_connecting
+                },
+            ),
         )
-        application.diskWarning(disk)?.let { warning ->
-            recordingMessage.append("\n")
-            recordingMessage.append(warning)
-        }
+    }
+
+    /** [status] of the running take, with its free-space warning on the next line. */
+    private fun showRecordingStatus(status: String) {
+        takeStatus = status
+        recordingMessage.text = listOfNotNull(status, diskNotice).joinToString("\n")
     }
 
     /**
@@ -683,21 +700,22 @@ class MainActivity : Activity() {
     private fun onStreamEvent(event: StreamEvent) {
         if (isDestroyed || isFinishing) return
         when (event) {
-            StreamEvent.Live -> recordingMessage.setText(R.string.streaming_live)
+            StreamEvent.Live -> showRecordingStatus(getString(R.string.streaming_live))
             is StreamEvent.Partial -> {
                 liveTranscript.visibility = View.VISIBLE
                 // The server's partial is a growing transcript of the whole
                 // session so far, so it replaces the previous text.
                 liveTranscript.text = event.text
             }
-            is StreamEvent.Interrupted -> recordingMessage.text =
-                getString(R.string.streaming_interrupted, event.reason)
+            is StreamEvent.Interrupted ->
+                showRecordingStatus(getString(R.string.streaming_interrupted, event.reason))
         }
     }
 
     private fun stopAndQueueRecording() {
         val recording = activeRecording ?: return
         activeRecording = null
+        diskNotice = null
         val session = streamSession
         streamSession = null
         recordButton.setText(R.string.start_recording)
