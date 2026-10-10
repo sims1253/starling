@@ -411,8 +411,10 @@ fn link_loop(
             return;
         }
         // The connection, or the service itself? A service that went away
-        // took any take it was recording with it.
-        let host_gone = !starling_dictation::engine::registry::process_alive(client.info.pid);
+        // took any take it was recording with it. A killed host this app
+        // started reads alive until its reaper collected it: give it a
+        // moment.
+        let host_gone = host_exited(client.info.pid);
         eprintln!("Starling: the recording service connection ended: {reason}");
         if tx
             .send(HostUpdate::Disconnected {
@@ -424,6 +426,21 @@ fn link_loop(
         {
             return;
         }
+    }
+}
+
+/// Whether host process `pid` is gone, allowing up to a second for an
+/// exiting one to be reaped.
+fn host_exited(pid: u32) -> bool {
+    let until = Instant::now() + Duration::from_secs(1);
+    loop {
+        if !starling_dictation::engine::registry::process_alive(pid) {
+            return true;
+        }
+        if Instant::now() >= until {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 

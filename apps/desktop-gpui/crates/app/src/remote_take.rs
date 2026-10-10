@@ -61,7 +61,17 @@ pub(crate) struct HostState {
     /// Transcriptions this window asked for, by request, holding their
     /// take's audio until the host started them (#342).
     pub(crate) requests: HashMap<String, Request>,
+    /// The host a live take was let go of on a lost connection (its pid):
+    /// a reconnect that finds another host corrects what the window said.
+    pub(crate) lost_take_on: Option<u32>,
+    /// The pid of the host the last connection went to.
+    pub(crate) client_pid: Option<u32>,
 }
+
+/// What the window says when the service went away with its take.
+const SERVICE_STOPPED: &str = "Starling's recording service stopped while recording. It is \
+     starting again; the audio it had saved is recovered into your history as an interrupted \
+     recording.";
 
 /// A transcription this window asked the host for.
 pub(crate) struct Request {
@@ -211,6 +221,16 @@ impl StarlingApp {
     pub(crate) fn host_update(&mut self, update: HostUpdate, cx: &mut Context<Self>) {
         match update {
             HostUpdate::Connected { client, recovery } => {
+                // The connection was lost mid-take, and this is another
+                // host: the take did not carry on.
+                if self
+                    .host
+                    .lost_take_on
+                    .take()
+                    .is_some_and(|pid| pid != client.info.pid)
+                {
+                    self.error = Some(SERVICE_STOPPED.to_string());
+                }
                 self.host.client = Some(client);
                 self.host.down = None;
                 self.host.gave_up = false;
@@ -224,6 +244,7 @@ impl StarlingApp {
                 gave_up,
                 host_gone,
             } => {
+                self.host.client_pid = self.host.client.as_ref().map(|client| client.info.pid);
                 self.host.client = None;
                 self.host.down = Some(reason);
                 self.host.gave_up = gave_up;
@@ -295,11 +316,11 @@ impl StarlingApp {
     fn let_go_of_takes(&mut self, host_gone: bool, cx: &mut Context<Self>) {
         if self.recorder.take().is_some() {
             self.end_live_take_locally(cx);
+            self.host.lost_take_on = (!host_gone)
+                .then(|| self.host.client_pid)
+                .flatten();
             self.error = Some(if host_gone {
-                "Starling's recording service stopped while recording. It is starting again; \
-                 the audio it had saved is recovered into your history as an interrupted \
-                 recording."
-                    .to_string()
+                SERVICE_STOPPED.to_string()
             } else {
                 "Lost the connection to Starling's recording service. The recording continues \
                  there and comes back here once the connection does."
