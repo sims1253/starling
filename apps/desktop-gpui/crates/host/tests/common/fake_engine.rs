@@ -156,7 +156,7 @@ impl FakeEngine {
                             "text": partial,
                             "stable_words": 1,
                         });
-                        let _ = socket.send(Message::Text(preview.to_string().into()));
+                        let _ = socket.send(Message::Text(preview.to_string()));
                     }
                 }
                 Ok(Message::Text(text)) if text.contains("commit") => {
@@ -165,7 +165,7 @@ impl FakeEngine {
                         "text": final_text,
                         "segments": [],
                     });
-                    let _ = socket.send(Message::Text(done.to_string().into()));
+                    let _ = socket.send(Message::Text(done.to_string()));
                     let _ = socket.flush();
                     let _ = socket.close(None);
                     return;

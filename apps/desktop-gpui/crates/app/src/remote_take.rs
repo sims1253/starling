@@ -283,14 +283,12 @@ impl StarlingApp {
                         *asked_at = Instant::now() - REASK;
                     }
                 }
-                "transcribe" => {
-                    // `take` is the request: nothing was attempted.
-                    if self.host.requests.remove(&take).is_some() {
-                        self.error = Some(format!(
-                            "Could not ask Starling's recording service to transcribe the \
-                             recording ({reason}). The recording is unchanged."
-                        ));
-                    }
+                // `take` is the request: nothing was attempted.
+                "transcribe" if self.host.requests.remove(&take).is_some() => {
+                    self.error = Some(format!(
+                        "Could not ask Starling's recording service to transcribe the \
+                         recording ({reason}). The recording is unchanged."
+                    ));
                 }
                 // A stop or cancel that was refused is asked again while
                 // the take still records (see `take_update`).
@@ -316,9 +314,7 @@ impl StarlingApp {
     fn let_go_of_takes(&mut self, host_gone: bool, cx: &mut Context<Self>) {
         if self.recorder.take().is_some() {
             self.end_live_take_locally(cx);
-            self.host.lost_take_on = (!host_gone)
-                .then(|| self.host.client_pid)
-                .flatten();
+            self.host.lost_take_on = (!host_gone).then_some(self.host.client_pid).flatten();
             self.error = Some(if host_gone {
                 SERVICE_STOPPED.to_string()
             } else {
