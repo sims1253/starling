@@ -991,7 +991,9 @@ fn the_portal_vanishing_during_the_dialog_ends_the_wait() {
         &mut client,
         &mut events,
         "lost",
-        |status, _| matches!(status, PortalStatus::Lost { reason, .. } if reason.contains("portal stopped")),
+        // The hanging Bind call can fail with NoReply before the bus
+        // reports the portal's name gone; either way the wait ends Lost.
+        |status, _| matches!(status, PortalStatus::Lost { .. }),
     );
 }
 
