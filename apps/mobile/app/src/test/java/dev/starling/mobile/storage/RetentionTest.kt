@@ -267,6 +267,54 @@ class RetentionTest {
         assertEquals(emptyList<String>(), reopened.compressionCandidates())
     }
 
+    /**
+     * A partial that was not this app's WAV is kept aside as
+     * `.wav.unrecognized` (#356): never compressed, never counted toward a
+     * size limit and never removed by one; only Delete removes it.
+     */
+    @Test
+    fun unrecognizedAudioIsNeitherCompressedCountedNorRemoved() {
+        val first = store()
+        now -= 40 * day
+        val foreign = first.create()
+        val mixed = first.create()
+        now += 40 * day
+        val foreignBytes = WavWriter.header(mib.toLong()).also { it[24] = 0x44; it[25] = 0xac.toByte() } + ByteArray(mib) { 3 }
+        first.partialFile(foreign).writeBytes(foreignBytes)
+        // A clean Stop whose metadata commit was cut off, beside an earlier
+        // foreign partial set aside for the same take.
+        WavWriter(first.partialFile(mixed)).apply { write(ByteArray(mib), mib); finish() }
+        assertTrue(first.partialFile(mixed).renameTo(File(storeDir(), "${mixed.id}.wav")))
+        val mixedAside = File(storeDir(), "${mixed.id}.wav.unrecognized").apply { writeBytes(foreignBytes) }
+
+        val store = RecordingStore(storeDir()) { now }
+        val foreignAside = File(storeDir(), "${foreign.id}.wav.unrecognized")
+        assertEquals(RecordingStore.UNRECOGNIZED_CAPTURE, store.get(foreign.id).errorMessage)
+        assertTrue(foreignAside.isFile)
+        store.markTranscribed(mixed.id, "text")
+
+        // Only the mixed take's WAV is compressed; its aside file stays as is.
+        assertEquals(listOf(mixed.id), store.compressionCandidates())
+        assertTrue(store.compressAudio(mixed.id) is RecordingStore.Compression.Compressed)
+        assertTrue(store.compressAudio(foreign.id) is RecordingStore.Compression.Skipped)
+        val mixedFlac = File(storeDir(), "${mixed.id}.flac").length()
+
+        // A size limit the unrecognized bytes alone would exceed: they are not counted.
+        val sized = store.applyRetention(Gate(policy(standard = ClassLimits(maxTotalMb = 1))))
+        assertEquals(RetentionReport(), sized)
+        // An age limit removes the mixed take's FLAC, never either aside file.
+        val aged = store.applyRetention(Gate(policy(standard = ClassLimits(maxAgeDays = 30))))
+        assertEquals(listOf(RemovedAudio(mixed.id, RetentionClass.STANDARD, mixedFlac, RetireReason.AGE)), aged.removed)
+        assertTrue(foreignAside.readBytes().contentEquals(foreignBytes))
+        assertTrue(mixedAside.readBytes().contentEquals(foreignBytes))
+        // A reopen keeps them too; Delete is what removes them.
+        RecordingStore(storeDir()) { now }.apply {
+            delete(foreign.id)
+            delete(mixed.id)
+        }
+        assertFalse(foreignAside.exists() || mixedAside.exists())
+    }
+
     @Test
     fun compressedTakesAreRemovedByTheirFlacSize() {
         val store = store()

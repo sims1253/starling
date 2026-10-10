@@ -398,6 +398,9 @@ class RecordingStore internal constructor(
                 recording.status != RecordingStatus.FAILED -> "in use"
             recording.errorMessage == UNRECOVERED_CAPTURE || partial.exists() || WavWriter.isOpen(partial) ->
                 "not finalized"
+            // A partial that was not this app's WAV is kept aside exactly as
+            // found (`.wav.unrecognized`); it is never compressed.
+            recording.errorMessage == UNRECOGNIZED_CAPTURE -> "unrecognized"
             (pins[recording.id] ?: 0) > 0 -> "in use"
             !publishing && recording.id in compressing -> "compressing"
             flacFile(recording.id).exists() -> "compressed"
@@ -433,7 +436,9 @@ class RecordingStore internal constructor(
      * run, [RetentionReport.policyChanged]), [stop] is asked (a take
      * started, [RetentionReport.stopped]), and the class is walked again
      * with every size measured from the files now. The order is stamp,
-     * then unlink; the next open finishes an unlink a crash cut off.
+     * then unlink; the next open finishes an unlink a crash cut off. Only
+     * the WAV and the FLAC go: a `.wav.unrecognized` file is neither counted
+     * nor removed ([audioBytes]).
      */
     fun applyRetention(gate: PolicyGate, stop: () -> Boolean = { false }): RetentionReport {
         val policy = gate.withPolicy { it }
@@ -553,7 +558,13 @@ class RecordingStore internal constructor(
         else -> null
     }
 
-    /** The bytes of a take's audio at rest (both files during a compression's publish). */
+    /**
+     * The bytes of a take's audio at rest (both files during a compression's
+     * publish). A `.wav.unrecognized` file is excluded on purpose: it is not
+     * audio the app can play or transcribe, retention never removes it (only
+     * [delete] does), so counting it would make a size limit remove other
+     * takes' audio for bytes it can never free.
+     */
     private fun audioBytes(id: String): Long =
         listOf(wavFile(id), flacFile(id)).filter(File::isFile).sumOf(File::length)
 
