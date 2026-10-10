@@ -59,6 +59,9 @@ pub struct HostConfig {
     /// leaves `runtime.provider` as configured — tests inject doubles
     /// there.
     pub engine: EngineChoice,
+    /// How long a recording take may go without any app following it
+    /// before the host stops and stores it itself (see [`crate::takes`]).
+    pub orphan_grace: Duration,
     /// The agent allowlist file (see [`crate::agent::Allowlist`]).
     /// `None` or a missing file denies every agent client; a malformed
     /// file refuses startup.
@@ -95,6 +98,7 @@ impl HostConfig {
             settings_path: None,
             settings_poll: crate::engine::DEFAULT_SETTINGS_POLL,
             engine: EngineChoice::None,
+            orphan_grace: crate::takes::DEFAULT_ORPHAN_GRACE,
             agent_allowlist: None,
             #[cfg(feature = "test-support")]
             insecure_test_app_role: false,
@@ -138,11 +142,29 @@ impl HostConfig {
         let documents = starling_runtime::machine::docs::V2DocumentStore::open(&data_root)
             .map_err(|err| format!("documents store at {} will not open: {err}", data_root.display()))?;
         let mut config = HostConfig::new(&data_root, &runtime_dir);
+        // The recorder journals into the tree beside the store the host
+        // recovers from (#220: the app no longer opens takes itself), on
+        // the microphone the desktop settings choose.
+        let settings_path = starling_dictation::settings::Settings::default_path().ok();
         config.runtime = config
             .runtime
             .with_capture_store(Arc::new(store))
-            .with_document_store(Arc::new(documents));
+            .with_document_store(Arc::new(documents))
+            .with_capture_source(Arc::new(crate::capture::SettingsCaptureSource::new(
+                settings_path,
+            )))
+            .with_capture_config(starling_runtime::machine::capture::CaptureConfig {
+                journals_dir: crate::recovery::journals_dir(&data_root),
+                ..Default::default()
+            });
         Ok(config)
+    }
+
+    /// Overrides how long an unfollowed take records before the host
+    /// stops it.
+    pub fn with_orphan_grace(mut self, grace: Duration) -> Self {
+        self.orphan_grace = grace;
+        self
     }
 
     /// Overrides the peer-auth policy (tests inject stand-ins for a

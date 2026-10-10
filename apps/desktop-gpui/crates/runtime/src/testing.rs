@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use starling_dictation::recorder::{CaptureGap, CapturedTake, RecorderError, RecorderFault};
 
-use crate::machine::capture::{CaptureSession, CaptureSource};
+use crate::machine::capture::{CaptureSession, CaptureSource, LiveTakeMonitor, LiveTakeStatus};
 use crate::provider::FakeJob;
 
 /// How a scripted fake session behaves.
@@ -79,6 +79,58 @@ impl FakeTakeScript {
 struct FakeSession {
     script: FakeTakeScript,
     started: Instant,
+    /// The sample count the stop handed back, once it ran: the monitor
+    /// stops there, like a real recorder whose device closed.
+    stopped_at: Arc<std::sync::OnceLock<u64>>,
+}
+
+/// The fake take as the host's take feed sees it: the same deterministic
+/// samples the stop hands back, by index.
+struct FakeMonitor {
+    script: FakeTakeScript,
+    started: Instant,
+    stopped_at: Arc<std::sync::OnceLock<u64>>,
+}
+
+impl FakeMonitor {
+    fn produced(&self) -> u64 {
+        self.stopped_at
+            .get()
+            .copied()
+            .unwrap_or_else(|| elapsed_samples(&self.script, self.started))
+    }
+}
+
+impl LiveTakeMonitor for FakeMonitor {
+    fn sample_rate(&self) -> u32 {
+        self.script.sample_rate
+    }
+    fn samples_from(&self, from: usize, max: usize) -> Vec<f32> {
+        let count = self.sample_count();
+        let samples = fake_samples(&self.script, count as u64);
+        let start = from.min(samples.len());
+        let end = start.saturating_add(max).min(samples.len());
+        samples[start..end].to_vec()
+    }
+    fn sample_count(&self) -> usize {
+        (self.produced().min(self.script.sample_cap)) as usize
+    }
+    fn status(&self) -> LiveTakeStatus {
+        LiveTakeStatus {
+            captured: self.produced(),
+            acknowledged: captured_ack(&self.script, self.started),
+            clip_ratio: 0.0,
+            stalled_ms: Some(0),
+            elapsed_ms: self.started.elapsed().as_millis() as u64,
+            fault: match &self.script.error_after {
+                Some((delay, fault)) if self.started.elapsed() >= *delay => Some(fault.clone()),
+                _ => None,
+            },
+            disk: None,
+            disk_probe_failing: false,
+            route: None,
+        }
+    }
 }
 
 impl CaptureSession for FakeSession {
@@ -113,8 +165,16 @@ impl CaptureSession for FakeSession {
     fn latest_window(&self, n: usize) -> Vec<f32> {
         vec![self.script.amplitude; n.min(2048)]
     }
+    fn monitor(&self) -> Option<Arc<dyn LiveTakeMonitor>> {
+        Some(Arc::new(FakeMonitor {
+            script: self.script.clone(),
+            started: self.started,
+            stopped_at: Arc::clone(&self.stopped_at),
+        }))
+    }
     fn stop(self: Box<Self>) -> Result<CapturedTake, RecorderError> {
         let produced = elapsed_samples(&self.script, self.started);
+        let _ = self.stopped_at.set(produced.max(1));
         match &self.script.stop {
             FakeStop::Clean {
                 journal_id,
@@ -235,6 +295,7 @@ impl CaptureSource for FakeCaptureSource {
         Ok(Box::new(FakeSession {
             script,
             started: Instant::now(),
+            stopped_at: Arc::default(),
         }))
     }
 }

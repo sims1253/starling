@@ -1,0 +1,608 @@
+//! The take feed (#220): the app's projection of the takes this host
+//! records.
+//!
+//! The app starts and stops takes with the v1 `capture.*` commands like
+//! any client; the I3 events say what the machine did. What the app
+//! needs beyond them — the take's health while it records (input route,
+//! stall, disk, fault), its audio for live transcription, and which
+//! history row it landed in — rides these host-level frames, the same
+//! way the agent ask frames ride beside the envelope:
+//!
+//! - [`Frame::TakeWatch`]: the connection follows the feed. Every
+//!   watching connection gets a [`Frame::LiveTake`] status tick every
+//!   [`TICK`] while a take records, one `ended` frame when it stops,
+//!   [`Frame::TakeStartFailed`] and [`Frame::TakePersisted`].
+//! - [`Frame::TakeTap`]: the connection also wants the take's audio from
+//!   a sample index on. The hub reads it from the recorder without
+//!   taking it from the stop handshake ([`LiveTakeMonitor`]), then from
+//!   the finished take's record, and sends the final `ended` frame only
+//!   after the last sample — so the app's live stream can finish the
+//!   take exactly. Audio waits for room: it never takes more than a
+//!   quarter of a connection's queue, so events and receipts are never
+//!   crowded out (a slow consumer would be closed).
+//!
+//! Each take has an **owner**: the connection whose `capture.start`
+//! opened it, or the one that tapped it after its owner was gone.
+//! Status ticks say whether the owner is still connected (`owned`), so a
+//! second app window never takes over a take another live window
+//! records — it only adopts one whose owner died.
+//!
+//! A take outlives its app (the renderer-kill acceptance): when no
+//! connection watches a recording take for [`HostConfig::orphan_grace`],
+//! the hub stops it itself — the take is finalized and stored like any
+//! other. A take that is stored after its owner is gone is an
+//! **orphan**: one watching connection — the first, or the next to watch
+//! — receives its [`Frame::TakePersisted`] with `orphan: true`, and
+//! transcribes it. An app that reconnects while the take still records
+//! sees its status ticks (`owned: false`) and adopts it.
+//!
+//! Agent asks (`ask_*` corrs) are the broker's business: their takes are
+//! not part of this feed.
+//!
+//! [`HostConfig::orphan_grace`]: crate::config::HostConfig::orphan_grace
+
+use std::collections::VecDeque;
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+use starling_runtime::machine::capture::{
+    CaptureObserver, LiveTakeMonitor, TakeRecord, TakeStatus,
+};
+use starling_runtime::protocol::Command;
+use starling_runtime::RuntimeClient;
+
+use crate::agent::ASK_PREFIX;
+use crate::frame::{Frame, HostRecovery, TakeAudio};
+use crate::server::{lock_registry, ConnState};
+
+/// How often watching connections hear about a recording take.
+pub const TICK: Duration = Duration::from_millis(50);
+
+/// The default for [`crate::config::HostConfig::orphan_grace`]: long
+/// enough for an app that crashed to be relaunched and adopt its take,
+/// short enough that a microphone nobody watches does not stay open.
+pub const DEFAULT_ORPHAN_GRACE: Duration = Duration::from_secs(20);
+
+/// The most samples one audio frame carries (a second at 48 kHz: 256 KB
+/// of base64, well under the default frame cap).
+const FRAME_SAMPLES: usize = 48_000;
+
+/// The most audio frames one connection gets per tick: a replay after a
+/// reconnect catches up at up to 80 s of audio per second.
+const FRAMES_PER_TICK: usize = 4;
+
+/// Finished takes whose audio stays readable for taps still catching up.
+const ENDED_KEEP: usize = 4;
+
+/// What a `capture.start` failure's detail carries when the host's own
+/// capture source produced it (see [`crate::capture`]).
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct StartFailure {
+    pub problem: Option<starling_dictation::microphone::InputProblem>,
+    pub message: String,
+}
+
+pub struct TakeHub {
+    state: Mutex<HubState>,
+    client: OnceLock<RuntimeClient>,
+    orphan_grace: Duration,
+}
+
+#[derive(Default)]
+struct HubState {
+    /// The connection that sent each recent `capture.start`, by corr.
+    starters: VecDeque<(String, Arc<ConnState>)>,
+    live: Option<Live>,
+    ended: VecDeque<Ended>,
+    watchers: Vec<Watcher>,
+    /// Persisted takes no app followed, for the next connection to watch.
+    unclaimed: Vec<Frame>,
+    /// Startup recovery's findings until an app hears them.
+    recovery: Option<HostRecovery>,
+    /// Since when the live take has had no watcher.
+    orphaned_since: Option<Instant>,
+    /// Takes the hub stopped itself (orphaned).
+    orphan_stopped: Vec<String>,
+    /// Takes whose persist has not reported yet.
+    persisting: usize,
+}
+
+struct Live {
+    take: String,
+    rate: u32,
+    monitor: Option<Arc<dyn LiveTakeMonitor>>,
+    owner: Option<Arc<ConnState>>,
+}
+
+struct Ended {
+    take: String,
+    rate: u32,
+    owner: Option<Arc<ConnState>>,
+    /// Everything the take kept; `None` when it kept nothing.
+    record: Option<Arc<TakeRecord>>,
+}
+
+struct Watcher {
+    conn: Arc<ConnState>,
+    tap: Option<Tap>,
+    /// Frames held until the tap's `ended` went out: a tapping app hears
+    /// its take stored only after the last of its audio.
+    after_tap: Vec<Frame>,
+}
+
+impl Watcher {
+    /// Sends `frame` now, or after the tap on `take` finished.
+    fn deliver_after_tap(&mut self, take: &str, frame: Frame) -> bool {
+        if self.tap.as_ref().is_some_and(|tap| tap.take == take) {
+            self.after_tap.push(frame);
+            true
+        } else {
+            self.conn.try_deliver(frame).is_ok()
+        }
+    }
+}
+
+struct Tap {
+    take: String,
+    cursor: u64,
+}
+
+fn is_agent_take(corr: &str) -> bool {
+    corr.starts_with(ASK_PREFIX)
+}
+
+fn alive(owner: &Option<Arc<ConnState>>) -> bool {
+    owner
+        .as_ref()
+        .is_some_and(|conn| !conn.closed.load(Ordering::SeqCst))
+}
+
+impl TakeHub {
+    pub fn new(orphan_grace: Duration) -> Arc<TakeHub> {
+        Arc::new(TakeHub {
+            state: Mutex::new(HubState::default()),
+            client: OnceLock::new(),
+            orphan_grace,
+        })
+    }
+
+    /// The runtime the hub stops orphaned takes through (set once the
+    /// runtime started; the hub exists before it, as its observer).
+    pub(crate) fn attach(&self, client: RuntimeClient) {
+        let _ = self.client.set(client);
+    }
+
+    /// Startup recovery's findings, for the first app that watches.
+    pub(crate) fn set_recovery(&self, recovery: HostRecovery) {
+        if recovery.notice.is_empty() && recovery.problems.is_empty() {
+            return;
+        }
+        lock_registry(&self.state).recovery = Some(recovery);
+    }
+
+    /// A later recovery finding: to every watcher, or kept for the next.
+    pub(crate) fn notice(&self, recovery: HostRecovery) {
+        if recovery.notice.is_empty() && recovery.problems.is_empty() {
+            return;
+        }
+        let mut state = lock_registry(&self.state);
+        let mut told = false;
+        for watcher in &state.watchers {
+            told |= watcher
+                .conn
+                .try_deliver(Frame::HostNotice {
+                    recovery: recovery.clone(),
+                })
+                .is_ok();
+        }
+        if !told {
+            let merged = match state.recovery.take() {
+                Some(earlier) => HostRecovery {
+                    notice: join(&earlier.notice, &recovery.notice),
+                    problems: join(&earlier.problems, &recovery.problems),
+                },
+                None => recovery,
+            };
+            state.recovery = Some(merged);
+        }
+    }
+
+    /// Whether a take records or is still being stored.
+    pub fn busy(&self) -> bool {
+        let state = lock_registry(&self.state);
+        state.live.is_some() || state.persisting > 0
+    }
+
+    /// `conn` follows the feed from now on.
+    pub(crate) fn watch(&self, conn: &Arc<ConnState>, req: String) -> Result<(), ()> {
+        let mut state = lock_registry(&self.state);
+        let recovery = state.recovery.take();
+        conn.try_deliver(Frame::TakeWatching { req, recovery })?;
+        if !state.watchers.iter().any(|watcher| Arc::ptr_eq(&watcher.conn, conn)) {
+            state.watchers.push(Watcher {
+                conn: Arc::clone(conn),
+                tap: None,
+                after_tap: Vec::new(),
+            });
+        }
+        // The takes nobody followed go to this app, and only to it.
+        for frame in std::mem::take(&mut state.unclaimed) {
+            let _ = conn.try_deliver(frame);
+        }
+        state.orphaned_since = None;
+        Ok(())
+    }
+
+    /// `conn` sent `capture.start` for `corr`: it owns that take.
+    pub(crate) fn starting(&self, corr: &str, conn: &Arc<ConnState>) {
+        if is_agent_take(corr) {
+            return;
+        }
+        let mut state = lock_registry(&self.state);
+        state.starters.retain(|(known, _)| known != corr);
+        state.starters.push_back((corr.to_string(), Arc::clone(conn)));
+        while state.starters.len() > ENDED_KEEP {
+            state.starters.pop_front();
+        }
+    }
+
+    /// `conn` wants `take`'s audio from sample `from` on. Tapping a take
+    /// whose owner is gone adopts it.
+    pub(crate) fn tap(&self, conn: &Arc<ConnState>, take: String, from: u64) {
+        let mut state = lock_registry(&self.state);
+        if let Some(live) = state.live.as_mut().filter(|live| live.take == take) {
+            if !alive(&live.owner) {
+                live.owner = Some(Arc::clone(conn));
+            }
+        }
+        if let Some(done) = state.ended.iter_mut().find(|done| done.take == take) {
+            if !alive(&done.owner) {
+                done.owner = Some(Arc::clone(conn));
+            }
+        }
+        if let Some(watcher) = state
+            .watchers
+            .iter_mut()
+            .find(|watcher| Arc::ptr_eq(&watcher.conn, conn))
+        {
+            watcher.tap = Some(Tap { take, cursor: from });
+        }
+    }
+
+    /// One feed tick: status and audio out, closed watchers dropped, an
+    /// orphaned take stopped once its grace ran out.
+    pub(crate) fn tick(&self) {
+        let mut orphan_stop = None;
+        {
+            let mut state = lock_registry(&self.state);
+            state
+                .watchers
+                .retain(|watcher| !watcher.conn.closed.load(Ordering::SeqCst));
+            let HubState {
+                live,
+                ended,
+                watchers,
+                orphaned_since,
+                orphan_stopped,
+                ..
+            } = &mut *state;
+            let status = live
+                .as_ref()
+                .and_then(|live| live.monitor.as_ref().map(|monitor| monitor.status()));
+            for watcher in watchers.iter_mut() {
+                serve_watcher(watcher, live.as_ref(), status.as_ref(), ended);
+            }
+            match live {
+                Some(live) if watchers.is_empty() => {
+                    let since = *orphaned_since.get_or_insert_with(Instant::now);
+                    if since.elapsed() >= self.orphan_grace
+                        && !orphan_stopped.contains(&live.take)
+                    {
+                        orphan_stopped.push(live.take.clone());
+                        orphan_stop = Some(live.take.clone());
+                    }
+                }
+                _ => *orphaned_since = None,
+            }
+        }
+        // Outside the lock: the actor calls back into the hub.
+        if let (Some(take), Some(client)) = (orphan_stop, self.client.get()) {
+            eprintln!(
+                "starling-runtime-host: no app has followed take {take} for {:?}; \
+                 stopping and storing it",
+                self.orphan_grace
+            );
+            if let Err(err) = client.send(Some(&take), Command::CaptureStop { drain: Some(true) }) {
+                eprintln!("starling-runtime-host: stopping orphaned take {take} failed: {err}");
+            }
+        }
+    }
+}
+
+/// One watcher's share of a tick.
+fn serve_watcher(
+    watcher: &mut Watcher,
+    live: Option<&Live>,
+    status: Option<&starling_runtime::machine::capture::LiveTakeStatus>,
+    ended: &VecDeque<Ended>,
+) {
+    let conn = Arc::clone(&watcher.conn);
+    if let Some(live) = live {
+        let owned = alive(&live.owner);
+        let tapped = watcher
+            .tap
+            .as_mut()
+            .filter(|tap| tap.take == live.take);
+        match (tapped, live.monitor.as_ref()) {
+            (Some(tap), Some(monitor)) => {
+                let mut first = true;
+                for _ in 0..FRAMES_PER_TICK {
+                    if !has_room(&conn) {
+                        break;
+                    }
+                    let samples = monitor.samples_from(tap.cursor as usize, FRAME_SAMPLES);
+                    if samples.is_empty() && !first {
+                        break;
+                    }
+                    let frame = Frame::LiveTake {
+                        take: live.take.clone(),
+                        rate: live.rate,
+                        status: first.then(|| status.cloned()).flatten(),
+                        audio: (!samples.is_empty())
+                            .then(|| TakeAudio::encode(tap.cursor, &samples)),
+                        owned,
+                        ended: None,
+                    };
+                    if conn.try_deliver(frame).is_err() {
+                        break;
+                    }
+                    tap.cursor += samples.len() as u64;
+                    first = false;
+                    if samples.len() < FRAME_SAMPLES {
+                        break;
+                    }
+                }
+            }
+            _ => {
+                if has_room(&conn) {
+                    let _ = conn.try_deliver(Frame::LiveTake {
+                        take: live.take.clone(),
+                        rate: live.rate,
+                        status: status.cloned(),
+                        audio: None,
+                        owned,
+                        ended: None,
+                    });
+                }
+            }
+        }
+    }
+    // A tap on a finished take: the rest of its audio, then the end.
+    let Some(tap) = watcher.tap.as_mut() else {
+        return;
+    };
+    if live.is_some_and(|live| live.take == tap.take) {
+        return;
+    }
+    let Some(done) = ended.iter().find(|done| done.take == tap.take) else {
+        // Nothing known by that name (long gone, or never ours): end it.
+        let _ = conn.try_deliver(Frame::LiveTake {
+            take: tap.take.clone(),
+            rate: 0,
+            status: None,
+            audio: None,
+            owned: false,
+            ended: Some(tap.cursor),
+        });
+        watcher.tap = None;
+        for frame in std::mem::take(&mut watcher.after_tap) {
+            let _ = conn.try_deliver(frame);
+        }
+        return;
+    };
+    let samples: &[f32] = done
+        .record
+        .as_ref()
+        .map(|record| record.samples.as_slice())
+        .unwrap_or(&[]);
+    for _ in 0..FRAMES_PER_TICK {
+        if !has_room(&conn) {
+            return;
+        }
+        let start = (tap.cursor as usize).min(samples.len());
+        if start >= samples.len() {
+            break;
+        }
+        let end = (start + FRAME_SAMPLES).min(samples.len());
+        let frame = Frame::LiveTake {
+            take: done.take.clone(),
+            rate: done.rate,
+            status: None,
+            audio: Some(TakeAudio::encode(start as u64, &samples[start..end])),
+            owned: alive(&done.owner),
+            ended: None,
+        };
+        if conn.try_deliver(frame).is_err() {
+            return;
+        }
+        tap.cursor = end as u64;
+    }
+    if (tap.cursor as usize) >= samples.len()
+        && has_room(&conn)
+        && conn
+            .try_deliver(Frame::LiveTake {
+                take: done.take.clone(),
+                rate: done.rate,
+                status: None,
+                audio: None,
+                owned: alive(&done.owner),
+                ended: Some(samples.len() as u64),
+            })
+            .is_ok()
+    {
+        watcher.tap = None;
+        for frame in std::mem::take(&mut watcher.after_tap) {
+            let _ = conn.try_deliver(frame);
+        }
+    }
+}
+
+/// Audio and status wait for room: they may use at most a quarter of the
+/// connection's queue, so events and receipts always fit.
+fn has_room(conn: &ConnState) -> bool {
+    let (queued, capacity) = conn.outbound_depth();
+    queued < capacity / 4
+}
+
+fn join(first: &str, second: &str) -> String {
+    match (first.is_empty(), second.is_empty()) {
+        (true, _) => second.to_string(),
+        (_, true) => first.to_string(),
+        _ => format!("{first} {second}"),
+    }
+}
+
+impl CaptureObserver for TakeHub {
+    fn take_started(&self, corr: &str, monitor: Option<Arc<dyn LiveTakeMonitor>>) {
+        if is_agent_take(corr) {
+            return;
+        }
+        let mut state = lock_registry(&self.state);
+        let rate = monitor.as_ref().map(|monitor| monitor.sample_rate()).unwrap_or(0);
+        let owner = state
+            .starters
+            .iter()
+            .find(|(known, _)| known == corr)
+            .map(|(_, conn)| Arc::clone(conn));
+        state.live = Some(Live {
+            take: corr.to_string(),
+            rate,
+            monitor,
+            owner,
+        });
+        state.orphaned_since = None;
+    }
+
+    fn take_start_failed(&self, corr: &str, detail: &str) {
+        if is_agent_take(corr) {
+            return;
+        }
+        let (problem, message) = match serde_json::from_str::<StartFailure>(detail) {
+            Ok(failure) => (failure.problem, failure.message),
+            Err(_) => (None, detail.to_string()),
+        };
+        let state = lock_registry(&self.state);
+        for watcher in &state.watchers {
+            let _ = watcher.conn.try_deliver(Frame::TakeStartFailed {
+                take: corr.to_string(),
+                problem: problem.clone(),
+                message: message.clone(),
+            });
+        }
+    }
+
+    fn take_ended(&self, corr: &str, record: Option<&Arc<TakeRecord>>) {
+        if is_agent_take(corr) {
+            return;
+        }
+        let mut state = lock_registry(&self.state);
+        let (rate, owner) = match state.live.take() {
+            Some(live) if live.take == corr => (live.rate, live.owner),
+            other => {
+                state.live = other;
+                (record.map(|record| record.sample_rate).unwrap_or(0), None)
+            }
+        };
+        let owned = alive(&owner);
+        if record.is_some() {
+            state.persisting += 1;
+        }
+        state.ended.retain(|done| done.take != corr);
+        state.ended.push_back(Ended {
+            take: corr.to_string(),
+            rate,
+            owner,
+            record: record.cloned(),
+        });
+        while state.ended.len() > ENDED_KEEP {
+            state.ended.pop_front();
+        }
+        // Watchers that do not tap this take hear the end now; a tap
+        // hears it after its last sample (the tick).
+        let total = record.map(|record| record.samples.len() as u64).unwrap_or(0);
+        for watcher in &state.watchers {
+            if watcher.tap.as_ref().is_some_and(|tap| tap.take == corr) {
+                continue;
+            }
+            let _ = watcher.conn.try_deliver(Frame::LiveTake {
+                take: corr.to_string(),
+                rate,
+                status: None,
+                audio: None,
+                owned,
+                ended: Some(total),
+            });
+        }
+    }
+
+    fn take_persisted(
+        &self,
+        corr: &str,
+        record: &Arc<TakeRecord>,
+        stored: Result<Option<String>, String>,
+    ) {
+        if is_agent_take(corr) {
+            return;
+        }
+        let mut state = lock_registry(&self.state);
+        state.persisting = state.persisting.saturating_sub(1);
+        let stopped_here = match state.orphan_stopped.iter().position(|take| take == corr) {
+            Some(index) => {
+                state.orphan_stopped.remove(index);
+                true
+            }
+            None => false,
+        };
+        let owner_alive = state
+            .ended
+            .iter()
+            .find(|done| done.take == corr)
+            .is_some_and(|done| alive(&done.owner));
+        let orphan = stopped_here || !owner_alive;
+        let (stored_id, error) = match stored {
+            Ok(id) => (id, None),
+            Err(err) => (None, Some(err)),
+        };
+        let frame = Frame::TakePersisted {
+            take: corr.to_string(),
+            stored_id,
+            interrupted: record.status == TakeStatus::Interrupted,
+            error,
+            orphan,
+        };
+        if !orphan {
+            for watcher in state.watchers.iter_mut() {
+                watcher.deliver_after_tap(corr, frame.clone());
+            }
+            return;
+        }
+        // An orphan goes to exactly one app: the first watching one, or
+        // the next to watch.
+        let delivered = state
+            .watchers
+            .first_mut()
+            .is_some_and(|watcher| watcher.deliver_after_tap(corr, frame.clone()));
+        if !delivered {
+            state.unclaimed.push(frame);
+        }
+    }
+}
+
+/// The feed's tick thread body.
+pub(crate) fn tick_loop(hub: Arc<TakeHub>, shared: Arc<crate::server::HostShared>) {
+    while !shared.shutdown.load(Ordering::SeqCst) {
+        hub.tick();
+        std::thread::sleep(TICK);
+    }
+}

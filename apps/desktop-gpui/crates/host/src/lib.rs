@@ -69,6 +69,8 @@
 
 pub mod agent;
 pub mod auth;
+pub mod capture;
+pub mod cli;
 pub mod client;
 pub mod config;
 pub mod engine;
@@ -76,7 +78,9 @@ pub mod frame;
 pub mod limits;
 pub mod mcp;
 pub mod platform;
+pub mod recovery;
 pub mod server;
+pub mod takes;
 
 pub use config::{default_data_root, HostConfig};
 pub use server::{serve, HostError, HostHandle};

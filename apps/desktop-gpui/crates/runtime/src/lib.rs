@@ -66,8 +66,8 @@ use std::thread::JoinHandle;
 
 use bus::{EventBus, EventSub};
 use machine::capture::{
-    CaptureActor, CaptureConfig, CaptureMsg, CaptureSource, CaptureStore, DeviceCaptureSource,
-    InMemoryCaptureStore, TakeRegistry,
+    CaptureActor, CaptureConfig, CaptureMsg, CaptureObserver, CaptureSource, CaptureStore,
+    DeviceCaptureSource, InMemoryCaptureStore, NoCaptureObserver, TakeRegistry,
 };
 use machine::context::{ContextActor, ContextMsg, ContextProvider, RouteFreezer, StubContextProvider};
 use machine::delivery::{DeliveryActor, DeliveryMsg, DeliveryAdapter, StubDeliveryAdapter};
@@ -122,6 +122,9 @@ pub struct RuntimeConfig {
     /// explicit root; a root-less embedder uses
     /// [`default_capture_store`]).
     pub capture_store: Arc<dyn CaptureStore>,
+    /// Who hears about takes beyond the event stream (#220: the host's
+    /// take feed). Nobody by default.
+    pub capture_observer: Arc<dyn CaptureObserver>,
     /// The documents persistence seam. The default is the in-memory
     /// store (test construction stays side-effect-free, same philosophy
     /// as `capture_store`); the I5 wiring (issue #220) overrides it with
@@ -149,6 +152,7 @@ impl Default for RuntimeConfig {
             processor: Arc::new(provider::UnconfiguredProcessor),
             capture_source: Arc::new(DeviceCaptureSource),
             capture_store: InMemoryCaptureStore::new(),
+            capture_observer: Arc::new(NoCaptureObserver),
             document_store: MemoryDocumentStore::new(),
             delivery_adapter: StubDeliveryAdapter::new(),
             context_provider: StubContextProvider::new(),
@@ -178,6 +182,12 @@ impl RuntimeConfig {
     /// Overrides the capture persistence store.
     pub fn with_capture_store(mut self, store: Arc<dyn CaptureStore>) -> Self {
         self.capture_store = store;
+        self
+    }
+
+    /// Overrides the capture observer.
+    pub fn with_capture_observer(mut self, observer: Arc<dyn CaptureObserver>) -> Self {
+        self.capture_observer = observer;
         self
     }
 
@@ -347,6 +357,7 @@ impl Runtime {
             Arc::clone(&registry),
             config.capture.clone(),
             freezer,
+            Arc::clone(&config.capture_observer),
         );
         handles.push(spawn("starling-capture", move || capture_actor.run()));
 

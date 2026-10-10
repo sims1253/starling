@@ -272,7 +272,7 @@ pub enum RecorderError {
 /// heuristic let such a take continue from a dead microphone until the
 /// stop handshake failed). [`RecorderFault::is_fatal`] is the decision
 /// the capture UI and the runtime actor both need.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RecorderFault {
     /// The audio device or stream failed: capture is no longer live.
     /// Fatal to the take.
@@ -1039,6 +1039,111 @@ impl CaptureTap {
     }
 }
 
+/// A read-only view of a live take from another thread (#220: the runtime
+/// host serves a take's audio and health to its app over IPC while the
+/// capture actor owns the handle). Unlike [`CaptureTap`] it never moves
+/// the handout watermark: [`Self::samples_from`] copies, so the handle's
+/// `stop` still returns the whole take.
+#[derive(Clone)]
+pub struct CaptureMonitor {
+    shared: Arc<Shared>,
+    sample_rate: u32,
+    started_at: Instant,
+    route: Option<InputRoute>,
+}
+
+impl CaptureMonitor {
+    /// The take's samples from index `from` on (capture order, the same
+    /// indices `stop` would return them at), at most `max` of them.
+    /// Samples a [`CaptureTap`] or [`RecorderHandle::drain_chunks`] already
+    /// handed out are still readable: the consumer keeps the whole take.
+    pub fn samples_from(&self, from: usize, max: usize) -> Vec<f32> {
+        let mut guard = self.shared.lock_consumer();
+        self.shared.drain_ring(&mut guard);
+        let start = from.min(guard.samples.len());
+        let end = start.saturating_add(max).min(guard.samples.len());
+        guard.samples[start..end].to_vec()
+    }
+
+    /// How many samples the take holds so far (the bound for
+    /// [`Self::samples_from`]).
+    pub fn sample_count(&self) -> usize {
+        let mut guard = self.shared.lock_consumer();
+        self.shared.drain_ring(&mut guard);
+        guard.samples.len()
+    }
+
+    /// [`RecorderHandle::sample_rate`].
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    /// [`RecorderHandle::input_route`].
+    pub fn input_route(&self) -> Option<&InputRoute> {
+        self.route.as_ref()
+    }
+
+    /// [`RecorderHandle::elapsed`].
+    pub fn elapsed(&self) -> Duration {
+        self.started_at.elapsed()
+    }
+
+    /// [`RecorderHandle::captured_sample_count`].
+    pub fn captured_sample_count(&self) -> u64 {
+        self.shared.written_seq.load(Ordering::Acquire)
+    }
+
+    /// [`RecorderHandle::acknowledged_samples`].
+    pub fn acknowledged_samples(&self) -> u64 {
+        self.shared.durable_ack.load(Ordering::Acquire)
+    }
+
+    /// [`RecorderHandle::source_clip_ratio`].
+    pub fn source_clip_ratio(&self) -> f64 {
+        self.shared.clip.ratio()
+    }
+
+    /// [`RecorderHandle::input_stalled_for`].
+    pub fn input_stalled_for(&self) -> Option<Duration> {
+        let mut guard = self.shared.lock_consumer();
+        self.shared.drain_ring(&mut guard);
+        guard.last_advance.map(|at| at.elapsed())
+    }
+
+    /// [`RecorderHandle::capture_fault`].
+    pub fn capture_fault(&self) -> Option<RecorderFault> {
+        let guard = self.shared.lock_consumer();
+        guard
+            .stream_error
+            .clone()
+            .map(RecorderFault::Device)
+            .or_else(|| guard.journal_fault.clone().map(RecorderFault::Journal))
+    }
+
+    /// [`RecorderHandle::disk_reading`].
+    pub fn disk_reading(&self) -> Option<DiskReading> {
+        disk_reading_of(&self.shared)
+    }
+
+    /// [`RecorderHandle::disk_probe_failing`].
+    pub fn disk_probe_failing(&self) -> bool {
+        self.shared.disk_level.load(Ordering::Acquire) == DISK_PROBE_FAILING
+    }
+}
+
+fn disk_reading_of(shared: &Shared) -> Option<DiskReading> {
+    let level = match shared.disk_level.load(Ordering::Acquire) {
+        DISK_OK => DiskLevel::Ok,
+        DISK_LOW => DiskLevel::Low,
+        DISK_CRITICAL => DiskLevel::Critical,
+        _ => return None,
+    };
+    Some(DiskReading {
+        available: shared.disk_available.load(Ordering::Relaxed),
+        level,
+    })
+}
+
 /// Live microphone capture handle returned by [`start_recording`].
 pub struct RecorderHandle {
     shared: Arc<Shared>,
@@ -1111,16 +1216,7 @@ impl RecorderHandle {
     /// first probe answered and while the probe fails
     /// ([`Self::disk_probe_failing`]).
     pub fn disk_reading(&self) -> Option<DiskReading> {
-        let level = match self.shared.disk_level.load(Ordering::Acquire) {
-            DISK_OK => DiskLevel::Ok,
-            DISK_LOW => DiskLevel::Low,
-            DISK_CRITICAL => DiskLevel::Critical,
-            _ => return None,
-        };
-        Some(DiskReading {
-            available: self.shared.disk_available.load(Ordering::Relaxed),
-            level,
-        })
+        disk_reading_of(&self.shared)
     }
 
     /// Whether the latest free-space probe failed (#342): the disk is not
@@ -1186,6 +1282,16 @@ impl RecorderHandle {
     pub fn tap(&self) -> CaptureTap {
         CaptureTap {
             shared: Arc::clone(&self.shared),
+        }
+    }
+
+    /// A read-only view of this take for another thread (#220).
+    pub fn monitor(&self) -> CaptureMonitor {
+        CaptureMonitor {
+            shared: Arc::clone(&self.shared),
+            sample_rate: self.sample_rate,
+            started_at: self.started_at,
+            route: self.route.clone(),
         }
     }
 
@@ -2317,6 +2423,37 @@ mod tests {
         collected.extend_from_slice(&take.audio.samples);
         assert_eq!(collected.len(), 1_000, "exact sample count");
         assert_eq!(collected, data, "drained + pending reassemble the take");
+    }
+
+    #[test]
+    fn a_monitor_reads_the_take_without_taking_it_from_stop() {
+        // #220: the host reads a live take's audio for its app while the
+        // capture actor still owns the handle; the reads copy, so stop
+        // returns the whole take, and a read past the end is empty.
+        let shared = test_shared(4_096);
+        let mut callback = CallbackState::new(1);
+        let handle = test_handle(Arc::clone(&shared), 16_000);
+        let monitor = handle.monitor();
+        let data: Vec<f32> = (0..600u32).map(|i| i as f32 * 0.0001).collect();
+        let mut read = Vec::new();
+        for block in data.chunks(150) {
+            callback.process(block, &shared);
+            read.extend(monitor.samples_from(read.len(), 100));
+            read.extend(monitor.samples_from(read.len(), usize::MAX));
+        }
+        assert_eq!(read, data, "cursor reads reassemble the take");
+        assert_eq!(monitor.sample_count(), 600);
+        assert_eq!(monitor.captured_sample_count(), 600);
+        assert_eq!(monitor.sample_rate(), 16_000);
+        assert!(monitor.samples_from(600, 10).is_empty());
+        assert!(monitor.samples_from(9_999, 10).is_empty());
+        // A tap drain moves the handout watermark; the monitor still sees
+        // the drained prefix.
+        let drained: Vec<f32> = handle.tap().drain_chunks().concat();
+        assert_eq!(drained, data);
+        assert_eq!(monitor.samples_from(0, 3), data[..3].to_vec());
+        let take = handle.stop().expect("stop");
+        assert!(take.audio.samples.is_empty(), "the tap already took them");
     }
 
     #[test]

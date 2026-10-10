@@ -111,7 +111,7 @@ impl Default for DiskPolicy {
 }
 
 /// How the free space compares with a [`DiskPolicy`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DiskLevel {
     Ok,
     Low,
@@ -119,7 +119,7 @@ pub enum DiskLevel {
 }
 
 /// One free-space reading.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DiskReading {
     pub available: u64,
     pub level: DiskLevel,

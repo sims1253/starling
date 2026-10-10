@@ -88,11 +88,17 @@ impl TransportErrorCode {
 /// Direction rules (enforced by both sides):
 /// - client → host: [`Frame::Command`], [`Frame::GetSnapshot`],
 ///   [`Frame::AgentHello`], [`Frame::AskUser`], [`Frame::AskCancel`],
-///   [`Frame::PromptAck`], [`Frame::PromptDone`]
+///   [`Frame::PromptAck`], [`Frame::PromptDone`], [`Frame::TakeWatch`],
+///   [`Frame::TakeTap`]
 /// - host → client: [`Frame::Hello`], [`Frame::Receipt`], [`Frame::Event`],
 ///   [`Frame::Snapshot`], [`Frame::TransportError`], [`Frame::Bye`],
 ///   [`Frame::AgentWelcome`], [`Frame::AskResult`], [`Frame::ShowPrompt`],
-///   [`Frame::HidePrompt`]
+///   [`Frame::HidePrompt`], [`Frame::TakeWatching`], [`Frame::LiveTake`],
+///   [`Frame::TakeStartFailed`], [`Frame::TakePersisted`],
+///   [`Frame::HostNotice`]
+///
+/// The take frames (#220) are host-level like the ask frames: the app's
+/// projection of the take the host records (see [`crate::takes`]).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Frame {
@@ -189,6 +195,95 @@ pub enum Frame {
     /// The user finished speaking: stop, transcribe, answer. Counts
     /// only from the connection whose ack opened the gate.
     PromptDone { req: String },
+    /// The app following the take feed on this connection: live take
+    /// status, persisted takes, start failures and host notices. Answered
+    /// by [`Frame::TakeWatching`] under the same `req`.
+    TakeWatch { req: String },
+    /// The host's acceptance of [`Frame::TakeWatch`], carrying what this
+    /// host's startup recovery found if no app has heard it yet.
+    TakeWatching {
+        req: String,
+        recovery: Option<HostRecovery>,
+    },
+    /// Stream `take`'s audio to this connection from sample `from` on,
+    /// through the take's end (a reconnecting app replays from 0).
+    TakeTap { take: String, from: u64 },
+    /// One tick of a take the host records: its health while it records,
+    /// audio for a tapping connection, whether the connection that owns
+    /// the take is still connected, and `ended` — the take's final sample
+    /// count — once it stopped (for a tapping connection, after the last
+    /// of its audio).
+    LiveTake {
+        take: String,
+        rate: u32,
+        status: Option<starling_runtime::machine::capture::LiveTakeStatus>,
+        audio: Option<TakeAudio>,
+        owned: bool,
+        ended: Option<u64>,
+    },
+    /// A `capture.start` could not open the microphone: the input
+    /// problem, when the host could classify it, and what to show.
+    TakeStartFailed {
+        take: String,
+        problem: Option<starling_dictation::microphone::InputProblem>,
+        message: String,
+    },
+    /// A take's persist finished. `stored_id` is the history row;
+    /// `orphan` marks a take that ended with no app following it (the
+    /// host stopped it, or its app was gone): the one app it is sent to
+    /// transcribes it.
+    TakePersisted {
+        take: String,
+        stored_id: Option<String>,
+        interrupted: bool,
+        error: Option<String>,
+        orphan: bool,
+    },
+    /// Something the host's recovery found after the app started
+    /// watching (a journal it looked at again later).
+    HostNotice { recovery: HostRecovery },
+}
+
+/// A slice of a take's audio on the wire: mono f32 little-endian samples,
+/// base64, starting at sample index `start` of the take.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TakeAudio {
+    pub start: u64,
+    pub samples: String,
+}
+
+impl TakeAudio {
+    pub fn encode(start: u64, samples: &[f32]) -> TakeAudio {
+        use base64::Engine;
+        let bytes: Vec<u8> = samples.iter().flat_map(|sample| sample.to_le_bytes()).collect();
+        TakeAudio {
+            start,
+            samples: base64::engine::general_purpose::STANDARD.encode(bytes),
+        }
+    }
+
+    pub fn decode(&self) -> Result<Vec<f32>, String> {
+        use base64::Engine;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&self.samples)
+            .map_err(|err| format!("take audio is not base64: {err}"))?;
+        if bytes.len() % 4 != 0 {
+            return Err(format!("take audio has {} bytes, not whole samples", bytes.len()));
+        }
+        Ok(bytes
+            .chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .collect())
+    }
+}
+
+/// What the host's startup recovery found, for the app to show: takes it
+/// brought back (`notice`) and what went wrong (`problems`); either may
+/// be empty.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostRecovery {
+    pub notice: String,
+    pub problems: String,
 }
 
 /// The outcome of an [`Frame::AskUser`].
@@ -367,6 +462,19 @@ mod tests {
     }
 
     #[test]
+    fn take_audio_round_trips_exactly() {
+        let samples = [0.0, 1.0, -1.0, 0.123_456_79, f32::MIN_POSITIVE];
+        let audio = TakeAudio::encode(7, &samples);
+        assert_eq!(audio.start, 7);
+        assert_eq!(audio.decode().unwrap(), samples.to_vec());
+        let torn = TakeAudio {
+            start: 0,
+            samples: "AAA=".into(),
+        };
+        assert!(torn.decode().is_err(), "a partial sample is refused");
+    }
+
+    #[test]
     fn frames_round_trip_through_the_wire() {
         let frames = vec![
             command_frame("push-to-talk"),
@@ -410,6 +518,33 @@ mod tests {
             },
             Frame::Bye {
                 reason: "shutdown".into(),
+            },
+            Frame::TakeWatch { req: "w-1".into() },
+            Frame::TakeWatching {
+                req: "w-1".into(),
+                recovery: Some(HostRecovery {
+                    notice: "Recovered 1 take.".into(),
+                    problems: String::new(),
+                }),
+            },
+            Frame::TakeTap {
+                take: "take-1".into(),
+                from: 0,
+            },
+            Frame::LiveTake {
+                take: "take-1".into(),
+                rate: 48_000,
+                status: None,
+                audio: Some(TakeAudio::encode(3, &[0.5, -0.25])),
+                owned: true,
+                ended: Some(5),
+            },
+            Frame::TakePersisted {
+                take: "take-1".into(),
+                stored_id: Some("j_1".into()),
+                interrupted: false,
+                error: None,
+                orphan: true,
             },
         ];
         for frame in frames {

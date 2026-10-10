@@ -32,7 +32,7 @@ pub struct InputDevice {
 }
 
 /// Why a take opened the device it did.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RouteReason {
     /// No preferred device: the take follows the system default.
     FollowingDefault,
@@ -48,7 +48,7 @@ pub enum RouteReason {
 
 /// The input a take actually opened, beside the preference it was
 /// resolved from.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct InputRoute {
     /// The preferred device name at the time the take started (`None`:
     /// follow the system default).
@@ -175,7 +175,7 @@ pub(crate) fn open_input(
 /// kind has its own explanation and recovery ([`InputProblem::message`],
 /// [`InputProblem::recovery`]); they must never collapse into one generic
 /// "microphone error".
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum InputProblem {
     /// There is no capture device to open.
     NoDevice { detail: String },
