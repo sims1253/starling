@@ -12,6 +12,7 @@
 #include "parakeet/mel.hpp"
 #include "parakeet/pos_enc.hpp"
 #include "parakeet/tokenizer.hpp"
+#include "runtime/call_abort.hpp"
 
 #include "ggml.h"
 
@@ -98,7 +99,10 @@ struct ParakeetEngine::Impl {
     bool record(int T, Rec& r, std::string& err);
     bool run_encoder(const std::vector<float>& feats, int T, std::vector<float>& enc_out,
                      int& Tp, std::string& err);
-    std::vector<int32_t> tdt_greedy(const std::vector<float>& enc_proj, int T);
+    // Sets *aborted (and returns early) when the caller cancels the call
+    // (ggml::call_abort_requested, checked once per encoder frame).
+    std::vector<int32_t> tdt_greedy(const std::vector<float>& enc_proj, int T,
+                                    bool* aborted = nullptr);
 
     vk::Ref R(Arena::Id id) const { return ar.ref(id); }
     vk::Ref Ropt(int id) const { return id >= 0 ? ar.ref((Arena::Id)id) : vk::Ref(); }
@@ -636,7 +640,8 @@ bool ParakeetEngine::Impl::run_encoder(const std::vector<float>& feats, int T,
 // Serial greedy TDT decode, mirroring pk::tdt_greedy (emits every step's
 // token including blanks). The prediction network runs only after a
 // non-blank emission; its joint projection is cached with it.
-std::vector<int32_t> ParakeetEngine::Impl::tdt_greedy(const std::vector<float>& enc_proj, int T) {
+std::vector<int32_t> ParakeetEngine::Impl::tdt_greedy(const std::vector<float>& enc_proj, int T,
+                                                      bool* aborted) {
     const uint32_t PL = (uint32_t)w_ih.size();
     const int blank = (int)cfg.blank_id;
     const int max_symbols = (int)cfg.max_symbols;
@@ -689,6 +694,10 @@ std::vector<int32_t> ParakeetEngine::Impl::tdt_greedy(const std::vector<float>& 
     int t = 0;
     auto tpt = std::chrono::steady_clock::now();
     while (t < T) {
+        if (aborted && ggml::call_abort_requested()) {
+            *aborted = true;
+            return {};
+        }
         int symbols_added = 0, skip = 0;
         bool need_loop = true;
         while (need_loop && symbols_added < max_symbols) {
@@ -767,16 +776,32 @@ bool ParakeetEngine::decode_ids(const float* pcm, size_t n, std::vector<int32_t>
     } hold(I.gemv2);
     const bool timing = env_on("STARLING_FAST_TIMING");
     const auto t0 = std::chrono::steady_clock::now();
+    // A cancelled call (ggml::call_abort_requested) stops at the next stage
+    // boundary or decoder frame; the recorded encoder submission itself is
+    // not interruptible.
+    auto aborted = [&] {
+        if (!ggml::call_abort_requested()) return false;
+        err = ggml::kCallAbortedError;
+        return true;
+    };
+    if (aborted()) return false;
     std::vector<float> feats;
     int T = 0;
     I.fmel->compute(pcm, n, feats, T);
     const double t_mel = ms_since(t0);
     if (env_on("STARLING_FAST_MEL_CHECK")) check_mel(I.mel, pcm, n, feats, T);
+    if (aborted()) return false;
     std::vector<float> enc;
     int Tp = 0;
     if (!I.run_encoder(feats, T, enc, Tp, err)) return false;
     const double t_enc = ms_since(t0);
-    ids = I.tdt_greedy(enc, Tp);
+    if (aborted()) return false;
+    bool decode_aborted = false;
+    ids = I.tdt_greedy(enc, Tp, &decode_aborted);
+    if (decode_aborted) {
+        err = ggml::kCallAbortedError;
+        return false;
+    }
     if (timing)
         std::fprintf(stderr, "[fast-parakeet] audio=%.2fs mel=%.1fms encoder=%.1fms decode=%.1fms total=%.1fms (T=%d Tp=%d)\n",
                      n / 16000.0, t_mel, t_enc - t_mel, ms_since(t0) - t_enc, ms_since(t0), T, Tp);

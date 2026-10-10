@@ -17,6 +17,7 @@
 #include "runtime/graph.hpp"
 #include "runtime/backend.hpp"
 #include "runtime/audio_io.hpp"
+#include "runtime/call_abort.hpp"
 
 #include "starling_ggml.h"
 
@@ -277,6 +278,14 @@ static bool parakeet_full_decode(ParakeetCtx* c,
         return true;
     }
 #endif
+    // A cancelled call (call_abort_requested, issue #357) stops at the next
+    // stage boundary or encoder graph slice (ReplayGraph::compute).
+    auto aborted = [&] {
+        if (!starling::ggml::call_abort_requested()) return false;
+        report_error(err_out, starling::ggml::kCallAbortedError);
+        return true;
+    };
+    if (aborted()) return false;
     using Clock = std::chrono::steady_clock;
     const char* timing_env = std::getenv("STARLING_PARAKEET_TIMING");
     const bool timing = timing_env && std::strcmp(timing_env, "1") == 0;
@@ -296,12 +305,15 @@ static bool parakeet_full_decode(ParakeetCtx* c,
         return false;
     }
 
+    if (aborted()) return false;
     // 2. encoder + joint.enc projection -> feat-major [640, T'].
     const auto t_mel = Clock::now();
     std::vector<float> enc_feat;
     int Tp = 0;
     try {
         if (!c->encoder->encode(feats, (int)c->mel_const.n_mels, T_mel, enc_feat, Tp)) {
+            // A cancelled call also stops between encoder graph slices.
+            if (aborted()) return false;
             if (err_out) *err_out = "encoder graph failed";
             return false;
         }
@@ -319,6 +331,7 @@ static bool parakeet_full_decode(ParakeetCtx* c,
     std::vector<float>& enc_proj = enc_feat;
     (void)H;
 
+    if (aborted()) return false;
     // 4. serial TDT greedy decode -> id stream (incl. blanks).
     try {
         ids = starling::ggml::parakeet::tdt_greedy(

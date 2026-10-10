@@ -10,6 +10,7 @@
 // the public ggml.h on this pinned ggml version, no internal header needed).
 
 #include "backend.hpp"
+#include "call_abort.hpp"
 #include "cpu_repack.hpp"
 
 #include "graph.hpp"
@@ -915,6 +916,16 @@ void ReplayGraph::readback_async_then_sync(Backend::Impl* impl,
     }
 }
 
+namespace {
+// Cancellable replay (issue #357): a graph this large (the encoders; decode
+// steps are far smaller) runs in kAbortSlices views with a sync between
+// them when the caller installed a call_abort scope, so a cancelled call
+// stops after the current slice instead of the whole graph. Without a scope
+// the single-submit fast path is unchanged.
+constexpr int kAbortSliceMinNodes = 1024;
+constexpr int kAbortSlices = 4;
+} // namespace
+
 bool ReplayGraph::compute(std::vector<float>& out) {
     // Match the CPU build/loader lock through execution and readback so a
     // different graph cannot repack a weight while this one reads it.
@@ -932,7 +943,19 @@ bool ReplayGraph::compute(std::vector<float>& out) {
     const bool any_gate = t_on || tr_on;
     const int64_t t_gc0 = any_gate ? ggml_time_us() : 0;
     bool ok;
-    if (!need_sched_) {
+    if (!need_sched_ && t_call_abort && gf_->n_nodes >= kAbortSliceMinNodes) {
+        ok = true;
+        for (int k = 0; ok && k < kAbortSlices; ++k) {
+            const int i0 = static_cast<int>((int64_t)gf_->n_nodes * k / kAbortSlices);
+            const int i1 = static_cast<int>((int64_t)gf_->n_nodes * (k + 1) / kAbortSlices);
+            ggml_cgraph view = ggml_graph_view(gf_, i0, i1);
+            ok = (ggml_backend_graph_compute_async(impl->backend, &view) == GGML_STATUS_SUCCESS);
+            if (ok && k + 1 < kAbortSlices) {
+                ggml_backend_synchronize(impl->backend);
+                if (call_abort_requested()) return false;  // nothing read back
+            }
+        }
+    } else if (!need_sched_) {
         ok = (ggml_backend_graph_compute_async(impl->backend, gf_) == GGML_STATUS_SUCCESS);
     } else {
         ok = (ggml_backend_sched_graph_compute(impl->sched, gf_) == GGML_STATUS_SUCCESS);
