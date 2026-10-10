@@ -4,14 +4,41 @@
     android:layout_height="@dimen/keyboard_height"
     android:background="@color/starling_surface"
     android:orientation="vertical"
-    android:padding="16dp">
+    android:paddingStart="16dp"
+    android:paddingTop="10dp"
+    android:paddingEnd="16dp"
+    android:paddingBottom="10dp">
 
-    <TextView
-        android:id="@+id/keyboard_status"
+    <!-- The mode chip: tap (or long-press Record) for the mode picker. -->
+    <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:textColor="@color/starling_muted"
-        android:textSize="13sp" />
+        android:gravity="center_vertical"
+        android:orientation="horizontal">
+
+        <Button
+            android:id="@+id/keyboard_mode_chip"
+            style="?android:attr/buttonBarButtonStyle"
+            android:layout_width="wrap_content"
+            android:layout_height="36dp"
+            android:layout_marginEnd="8dp"
+            android:minWidth="0dp"
+            android:paddingStart="8dp"
+            android:paddingEnd="8dp"
+            android:textAllCaps="false"
+            android:textSize="13sp" />
+
+        <TextView
+            android:id="@+id/keyboard_status"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:accessibilityLiveRegion="polite"
+            android:ellipsize="end"
+            android:maxLines="3"
+            android:textColor="@color/starling_muted"
+            android:textSize="13sp" />
+    </LinearLayout>
 
     <!-- Where the on-device model stands (loading, failed); hidden when
          it is ready or the server engine is selected. -->
@@ -27,12 +54,60 @@
         android:textSize="12sp"
         android:visibility="gone" />
 
+    <!-- The mode picker: one chip per mode, shown on demand. -->
+    <HorizontalScrollView
+        android:id="@+id/keyboard_mode_picker"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:scrollbars="none"
+        android:visibility="gone">
+
+        <LinearLayout
+            android:id="@+id/keyboard_mode_list"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal" />
+    </HorizontalScrollView>
+
+    <!-- Why the take looks the way it does ("matched 'draft mode' at the
+         start"), with the one action that undoes it. -->
+    <LinearLayout
+        android:id="@+id/keyboard_decision_row"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:visibility="gone">
+
+        <TextView
+            android:id="@+id/keyboard_decision"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:ellipsize="end"
+            android:maxLines="2"
+            android:textColor="@color/starling_muted"
+            android:textSize="12sp" />
+
+        <Button
+            android:id="@+id/keyboard_decision_undo"
+            style="?android:attr/buttonBarButtonStyle"
+            android:layout_width="wrap_content"
+            android:layout_height="36dp"
+            android:minWidth="0dp"
+            android:text="@string/staging_that_was_literal"
+            android:textAllCaps="false"
+            android:textSize="13sp" />
+    </LinearLayout>
+
     <!-- The keyboard keeps a fixed height, so long transcripts scroll
-         instead of pushing the buttons off the view. -->
+         instead of pushing the buttons off the view. In a draft, tapping a
+         word selects it for Delete word. -->
     <ScrollView
+        android:id="@+id/keyboard_transcript_scroll"
         android:layout_width="match_parent"
         android:layout_height="0dp"
-        android:layout_marginTop="6dp"
+        android:layout_marginTop="4dp"
         android:layout_weight="1"
         android:fillViewport="true"
         android:scrollbars="none">
@@ -42,25 +117,64 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:textColor="@color/starling_ink"
-            android:textSize="15sp"
+            android:textSize="16sp"
             android:visibility="gone" />
     </ScrollView>
 
+    <!-- Draft tools: raw recovery, word deletion, discard. -->
     <LinearLayout
+        android:id="@+id/keyboard_draft_tools"
+        style="?android:attr/buttonBarStyle"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_marginTop="6dp"
+        android:orientation="horizontal"
+        android:visibility="gone">
+
+        <Button
+            android:id="@+id/keyboard_view_toggle"
+            style="?android:attr/buttonBarButtonStyle"
+            android:layout_width="0dp"
+            android:layout_height="40dp"
+            android:layout_weight="1"
+            android:textAllCaps="false"
+            android:textSize="13sp" />
+
+        <Button
+            android:id="@+id/keyboard_delete_word"
+            style="?android:attr/buttonBarButtonStyle"
+            android:layout_width="0dp"
+            android:layout_height="40dp"
+            android:layout_weight="1"
+            android:text="@string/staging_delete_word"
+            android:textAllCaps="false"
+            android:textSize="13sp" />
+
+        <Button
+            android:id="@+id/keyboard_discard"
+            style="?android:attr/buttonBarButtonStyle"
+            android:layout_width="0dp"
+            android:layout_height="40dp"
+            android:layout_weight="1"
+            android:text="@string/staging_discard"
+            android:textAllCaps="false"
+            android:textSize="13sp" />
+    </LinearLayout>
+
+    <LinearLayout
         style="?android:attr/buttonBarStyle"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="2dp"
         android:orientation="horizontal">
 
         <!-- Back to the typing keyboard the user came from; hidden when
              there is no other keyboard to switch to. -->
         <Button
             android:id="@+id/keyboard_switch_button"
+            style="?android:attr/buttonBarButtonStyle"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:layout_marginEnd="8dp"
-            style="?android:attr/buttonBarButtonStyle"
             android:contentDescription="@string/keyboard_switch_description"
             android:minWidth="48dp"
             android:text="@string/keyboard_switch_label"
@@ -68,30 +182,30 @@
 
         <Button
             android:id="@+id/keyboard_record_button"
+            style="?android:attr/buttonBarButtonStyle"
             android:layout_width="0dp"
             android:layout_height="wrap_content"
             android:layout_weight="1"
-            style="?android:attr/buttonBarButtonStyle"
             android:text="@string/keyboard_record" />
 
         <Button
             android:id="@+id/keyboard_insert_button"
+            style="?android:attr/buttonBarButtonStyle"
             android:layout_width="0dp"
             android:layout_height="wrap_content"
             android:layout_marginStart="8dp"
             android:layout_weight="1"
-            style="?android:attr/buttonBarButtonStyle"
             android:text="@string/keyboard_insert"
             android:visibility="gone" />
 
         <!-- The take's field is gone; its text can only be copied. -->
         <Button
             android:id="@+id/keyboard_copy_button"
+            style="?android:attr/buttonBarButtonStyle"
             android:layout_width="0dp"
             android:layout_height="wrap_content"
             android:layout_marginStart="8dp"
             android:layout_weight="1"
-            style="?android:attr/buttonBarButtonStyle"
             android:text="@string/keyboard_copy"
             android:visibility="gone" />
     </LinearLayout>

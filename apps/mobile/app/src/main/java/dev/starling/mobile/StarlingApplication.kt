@@ -15,6 +15,10 @@ import dev.starling.mobile.network.BackendConfig
 import dev.starling.mobile.network.BackendSettings
 import dev.starling.mobile.network.TranscriptionCoordinator
 import dev.starling.mobile.network.TranscriptionEngine
+import dev.starling.mobile.processing.ModeCatalog
+import dev.starling.mobile.processing.ProfilesDocument
+import dev.starling.mobile.processing.SpokenCommands
+import dev.starling.mobile.processing.SpokenInstructions
 import dev.starling.mobile.storage.RecordingStore
 import java.io.File
 import java.util.concurrent.ExecutorService
@@ -36,6 +40,22 @@ class StarlingApplication : Application() {
         private set
     lateinit var modelLifetime: ModelLifetime
         private set
+
+    /**
+     * The keyboard's modes and the rules step (#302), from the app's assets:
+     * the built-in profiles document and the contract tables shared with
+     * the desktop. Loaded on first use; a broken asset is a build error the
+     * unit tests catch, so a failure here is not recovered from.
+     */
+    val modeCatalog: ModeCatalog by lazy {
+        fun asset(name: String) = assets.open(name).use { it.readBytes().toString(Charsets.UTF_8) }
+        val commands = SpokenCommands(asset("contracts/spoken-commands.json"))
+        ModeCatalog(
+            ProfilesDocument.parse(asset("modes/android-profiles.json")),
+            commands,
+            SpokenInstructions(asset("contracts/spoken-instructions.json"), commands),
+        )
+    }
 
     private val mainHandler = Handler(Looper.getMainLooper())
 
