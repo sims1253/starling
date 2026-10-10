@@ -18,6 +18,9 @@ stitcher is judged on many boundary placements instead of one.
 Reports per take and offset the final-vs-batch WER and the omissions and
 duplications located in the take (``stream_replay.locate_errors``). The
 native server stitches identically (tests/test_stream_chunk.py parity).
+At an offset inside an utterance, that utterance's whole text stays in the
+reference, so reference WER there counts the cut-off words; batch WER of the
+same cropped audio is the like-for-like comparison.
 """
 
 from __future__ import annotations

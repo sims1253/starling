@@ -424,10 +424,13 @@ fixture, `tests/fixtures/stream_stitch_cases.txt`):
   cut is the middle matched word. With no alignment scoring 3 or more (a
   pause in the overlap, or a window that dropped those words) the texts are
   concatenated. Repeated text ("one two three one two three ...") aligns
-  equally well at every multiple of its period; a gap-free alignment over
-  committed words that repeat is shortened by whole periods to the number of
-  words the shared audio should hold (each window's share of its voiced audio
-  in the overlap). The engine exposes no
+  equally well at every multiple of its period; an alignment over committed
+  words that repeat is shortened by whole periods to the number of words the
+  shared audio should hold (each window's share of its voiced audio in the
+  overlap). Not covered: periodic text faster than about 4.6 words/s whose
+  window is re-decoded from 0.75 x the overlap earlier shares more words
+  with the committed text than the 24 committed words searched, and can
+  repeat some of them. The engine exposes no
   word timestamps, so the alignment works on words only; it is the same for
   every model.
 - Parakeet sometimes stops emitting partway through a window, or returns

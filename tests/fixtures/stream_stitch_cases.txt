@@ -210,3 +210,11 @@ tx flush_window 3 4 one two three one two three one two
 tx flush_tail 6 1 one two
 = one two three one two three one two three one two three one two
 calls flush_window@0+4 flush_window@3+4 flush_tail@6+1
+
+stream repeated_text_with_an_insertion 12 3
+audio 24 0.1
+tx flush_window 0 12 one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three
+tx flush_window 9 12 one extra two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three
+tx flush_tail 18 6 one two three one two three one two three one two three one two three one two three
+= one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three
+calls flush_window@0+12 flush_window@9+12 flush_tail@18+6

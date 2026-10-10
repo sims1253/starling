@@ -159,30 +159,28 @@ std::vector<std::string> stitch_words(
         return result;
     }
     std::vector<std::pair<int, int>> pairs;  // matched (tail, head) words
-    bool diagonal = true;  // no gap between the path's first and last column
-    int i = n, j = best_j;
-    while (i > 0 && j > 0) {
+    int i = n;
+    for (int j = best_j; i > 0 && j > 0;) {
         const bool eq = same(i - 1, j - 1);
         if (d[i][j] == d[i - 1][j - 1] + (eq ? kStitchMatch : kStitchMismatch)) {
             if (eq) pairs.emplace_back(i - 1, j - 1);
             --i;
             --j;
         } else if (d[i][j] == d[i - 1][j] + kStitchGap) {
-            diagonal = false;
             --i;
         } else {
-            diagonal = false;
             --j;
         }
     }
     std::reverse(pairs.begin(), pairs.end());
-    // The path starts at tail row i (free) with j new words before it
-    // (gaps); it is the diagonal (i + t, j + t) for t < n - i.
+    // The alignment covers tail rows i..n-1.
     const int length = n - i;
-    if (diagonal && expected_overlap >= 0.0 && length > expected_overlap) {
-        // Over committed words with a period, the same diagonal also aligns
-        // from row i + k * period; keep the k whose length is closest to the
-        // estimate (the smallest k on a tie) and has a matched word.
+    if (expected_overlap >= 0.0 && length > expected_overlap) {
+        // Over committed words with a period, every matched pair also matches
+        // one period further on: the alignment can start k periods later
+        // (pairs moved past the tail drop out). Keep the k whose length is
+        // closest to the estimate and that keeps a pair (the smallest k on a
+        // tie).
         int period = 0;
         for (int p = 1; p <= length / 2 && !period; ++p) {
             bool periodic = true;
@@ -191,21 +189,17 @@ std::vector<std::string> stitch_words(
             if (periodic) period = p;
         }
         if (period) {
-            int best_k = -1;
-            for (int k = 0; k <= (length - 1) / period; ++k) {
-                bool matched = false;
-                for (int t = 0; t < length - k * period && !matched; ++t)
-                    matched = same(i + k * period + t, j + t);
-                if (matched
-                    && (best_k < 0
-                        || std::abs(length - k * period - expected_overlap)
-                               < std::abs(length - best_k * period - expected_overlap)))
+            int best_k = 0;
+            for (int k = 1; k <= (length - 1) / period; ++k) {
+                if (pairs[0].first + k * period < n
+                    && std::abs(length - k * period - expected_overlap)
+                           < std::abs(length - best_k * period - expected_overlap))
                     best_k = k;
             }
-            const int row = i + best_k * period;
-            pairs.clear();
-            for (int t = 0; t < length - best_k * period; ++t)
-                if (same(row + t, j + t)) pairs.emplace_back(row + t, j + t);
+            std::vector<std::pair<int, int>> moved;
+            for (const auto& [r, c] : pairs)
+                if (r + best_k * period < n) moved.emplace_back(r + best_k * period, c);
+            pairs = std::move(moved);
         }
     }
     const auto [ci, cj] = pairs[(pairs.size() - 1) / 2];
