@@ -7,6 +7,7 @@
 #include "server.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -120,8 +121,15 @@ public:
         boundary_ = std::max<int64_t>(0, boundary_ - dropped);
     }
 
+    // Why the transcribe call in flight was made (issue #226): "window" (a
+    // full window committed while recording), "preview" (the live tail),
+    // "flush_window" / "flush_tail" (finalization on commit). Set before
+    // every transcribe call; the session's call ledger reads it.
+    const char* call_kind() const { return call_kind_; }
+
 private:
-    bool finalize_full_windows(const std::vector<float>& samples, const TranscribeFn& tx);
+    bool finalize_full_windows(const std::vector<float>& samples,
+                               const TranscribeFn& tx, bool flushing);
     // committed_ with `new_words` stitched onto its unfrozen tail.
     std::vector<std::string> stitched(const std::vector<std::string>& new_words) const;
     // Stitches `new_words` into committed_ and advances frozen_.
@@ -139,6 +147,36 @@ private:
     int64_t frozen_ = 0;    // leading committed_ words stitching never touches
     int64_t boundary_ = 0;  // sample index; audio before this is finalized
     double last_emit_ = 0.0;
+    const char* call_kind_ = "window";
+};
+
+// ---- stream call ledger (issue #226) ----------------------------------------
+// One transcribe call made by a streaming take: why it ran, which original
+// audio it covered (absolute take sample indices, stable across buffer
+// trims), when it started and ended (ms since the take's first audio), and
+// how it ended. Overlapping windows and repeated previews of the same audio
+// each appear, so the ledger shows the real inference work per recorded
+// second instead of the batch throughput of one pass.
+struct StreamCall {
+    const char* kind = "";    // ChunkStreamer::call_kind()
+    int64_t abs_start = 0;    // first sample covered
+    int64_t length = 0;       // samples covered
+    double t0_ms = 0.0;       // call start, ms since the take's first audio
+    double t1_ms = 0.0;       // call end
+    // "ok" (engine ran), "reused" (exact-tail reuse; engine not called),
+    // "busy" (engine busy or cancelled; state not advanced), "timed_out".
+    const char* result = "";
+};
+
+// Per-kind totals over a take (engine calls only; reused calls cost nothing).
+struct StreamCallTotals {
+    int64_t calls = 0;          // every call, whatever its result
+    int64_t engine_calls = 0;   // result "ok" (the engine produced text)
+    int64_t engine_samples = 0; // audio the engine transcribed, overlap included
+    double engine_ms = 0.0;     // wall time of those engine calls
+    int64_t reused = 0;
+    int64_t busy = 0;           // busy, cancelled and timed-out calls
+    void add(const StreamCall& c);
 };
 
 // StreamSession: per-connection rolling audio buffer + streaming state.
@@ -242,6 +280,34 @@ public:
     // inference calls avoided, separately from any latency claims.
     int64_t tail_cache_hits() const { return tail_cache_hits_; }
 
+    // ---- stream instrumentation (issue #226) --------------------------------
+    // Opt-in per-take metadata for WS clients that ask for it (`trace=1` on
+    // the /stream URL); the default wire contract carries none of it. Times
+    // are steady-clock ms since the take's first accepted audio.
+    //
+    // trace_partial_json(): the object attached to a partial — received
+    // audio, the end of the audio the text reflects (`covered_s`), and the
+    // running inference totals.
+    // trace_final_json(): the object attached to the final — totals per call
+    // kind, the stop section (work done after commit, bounded by the
+    // unfinalized tail on the healthy path) and the call ledger.
+    std::string trace_partial_json() const;
+    std::string trace_final_json() const;
+    // The ledger itself (bounded; see kMaxStreamCalls) and its totals.
+    const std::vector<StreamCall>& calls() const { return calls_; }
+    const StreamCallTotals& totals() const { return totals_; }
+    // Totals of the calls made by the latest stream_flush().
+    const StreamCallTotals& flush_totals() const { return flush_totals_; }
+    // How the latest stream_flush() produced its text: "tail" (the engine
+    // finalized only the unfinalized remainder), "reused" (the exact-tail
+    // result answered it), "committed" (nothing was left to finalize).
+    const char* final_path() const { return final_path_; }
+
+    // Ledger bound: a 10-minute take at a 0.5 s preview cadence makes ~1300
+    // calls; beyond this, calls still count in the totals but are dropped
+    // from the list (reported as `calls_dropped`).
+    static constexpr size_t kMaxStreamCalls = 20000;
+
 private:
     void maybe_trim_samples();
 
@@ -320,6 +386,24 @@ private:
     StreamTailKey tail_key_;      // key of the retained result (iff tail_valid_)
     std::string tail_text_;       // the raw window result ("" is a success)
     int64_t tail_cache_hits_ = 0; // calls answered from the retained entry
+
+    // ---- stream instrumentation (issue #226) --------------------------------
+    double take_ms() const;       // ms since take_t0_ (0 before any audio)
+    void mark_take_start();       // latch take_t0_ on the first audio
+    void record_call(const StreamCall& c);
+    bool take_started_ = false;
+    std::chrono::steady_clock::time_point take_t0_{};
+    std::vector<StreamCall> calls_;
+    int64_t calls_dropped_ = 0;
+    StreamCallTotals totals_;
+    StreamCallTotals by_kind_[4];  // window, preview, flush_window, flush_tail
+    StreamCallTotals flush_totals_;
+    bool flushing_ = false;       // stream_flush() in progress
+    int64_t covered_end_ = 0;     // abs end of the latest successful call
+    double flush_t0_ms_ = -1.0;   // latest stream_flush() start (-1: none)
+    double flush_t1_ms_ = -1.0;
+    int64_t flush_unfinalized_ = 0;  // samples past the boundary at flush start
+    const char* final_path_ = "";
 };
 
 } // namespace starling::serve

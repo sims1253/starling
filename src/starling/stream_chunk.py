@@ -186,14 +186,22 @@ class ChunkStreamer:
         self.committed: list[str] = []
         self.boundary = 0          # sample index; audio before this is finalized
         self.last_emit = 0.0
+        # Why the transcribe call in flight was made (issue #226): "window",
+        # "preview", "flush_window" or "flush_tail". Set before every call;
+        # the session's call ledger reads it (lockstep with call_kind() in
+        # cpp/serve/stream_session.hpp).
+        self.call_kind = "window"
 
     # ------------------------------------------------------------------ #
-    def _finalize_full_windows(self, samples: np.ndarray, tx: TranscribeFn) -> bool:
+    def _finalize_full_windows(
+        self, samples: np.ndarray, tx: TranscribeFn, *, flushing: bool = False
+    ) -> bool:
         """Finalize every complete window at the current boundary. Returns True
         if at least one window was committed."""
         did = False
         while (len(samples) - self.boundary) >= self.chunk:
             window = samples[self.boundary : self.boundary + self.chunk]
+            self.call_kind = "flush_window" if flushing else "window"
             text = tx(window)
             if text is None:  # busy/cancelled -> stop; boundary unchanged for retry
                 break
@@ -225,6 +233,7 @@ class ChunkStreamer:
         # emit committed + the live tail (transcribed only if long enough);
         # never hand the transcriber an empty window (issue #146)
         if tail_len > 0 and tail_len >= self.min:
+            self.call_kind = "preview"
             text = tx(samples[self.boundary :])
             if text is None:  # busy on the tail
                 return " ".join(self.committed) if finalized else None
@@ -240,7 +249,7 @@ class ChunkStreamer:
         and retry commit after ``None``; only a string result is final.
         """
         for attempt in range(_FLUSH_MAX_RETRIES):
-            self._finalize_full_windows(samples, tx)
+            self._finalize_full_windows(samples, tx, flushing=True)
             tail = samples[self.boundary :]
             if len(tail) == 0:
                 return " ".join(self.committed)
@@ -248,6 +257,7 @@ class ChunkStreamer:
             # validated at construction, but the transcriber contract (a
             # nonempty window) is enforced here regardless.
             if 0 < len(tail) < self.chunk:
+                self.call_kind = "flush_tail"
                 text = tx(tail)
                 if text is not None:
                     self.committed = stitch_words(
@@ -263,3 +273,148 @@ class ChunkStreamer:
         self.committed = []
         self.boundary = 0
         self.last_emit = 0.0
+        self.call_kind = "window"
+
+
+# --------------------------------------------------------------------------- #
+# Stream call ledger (issue #226)
+# --------------------------------------------------------------------------- #
+# Kept in lockstep with StreamCall / trace_*_json() in
+# cpp/serve/stream_session.cpp: same kinds, results and JSON field names.
+
+_LEDGER_KINDS = ("window", "preview", "flush_window", "flush_tail", "full_take")
+# A 10-minute take at a 0.5 s preview cadence makes ~1300 calls; beyond this
+# bound calls still count in the totals but are dropped from the list.
+MAX_STREAM_CALLS = 20000
+
+
+class _Totals:
+    """Running totals over calls (engine calls only cost work; reused is free)."""
+
+    __slots__ = ("calls", "engine_calls", "engine_samples", "engine_ms", "reused", "busy")
+
+    def __init__(self) -> None:
+        self.calls = self.engine_calls = self.engine_samples = 0
+        self.engine_ms = 0.0
+        self.reused = self.busy = 0
+
+    def add(self, length: int, t0_ms: float, t1_ms: float, result: str) -> None:
+        self.calls += 1
+        if result == "ok":
+            self.engine_calls += 1
+            self.engine_samples += length
+            self.engine_ms += t1_ms - t0_ms
+        elif result == "reused":
+            self.reused += 1
+        else:  # busy, cancelled, timed out
+            self.busy += 1
+
+
+class StreamTrace:
+    """Per-take record of every transcribe call a streaming session made.
+
+    Each call carries why it ran (``kind``), the original audio it covered
+    (absolute take sample indices, stable across buffer trims), when it
+    started and ended (ms since the take's first audio) and how it ended
+    (``ok`` / ``reused`` / ``busy`` / ``timed_out``).  Overlapping windows and
+    repeated previews each appear, so the ledger shows the inference work per
+    recorded second rather than one batch pass.
+    """
+
+    def __init__(self, sample_rate: int) -> None:
+        self.sr = int(sample_rate)
+        self.reset()
+
+    def reset(self) -> None:
+        self.t0: Optional[float] = None
+        self.calls: list[tuple] = []
+        self.calls_dropped = 0
+        self.totals = _Totals()
+        self.by_kind = {k: _Totals() for k in _LEDGER_KINDS}
+        self.flush_totals = _Totals()
+        self.flushing = False
+        self.covered_end = 0
+        self.flush_t0_ms = -1.0
+        self.flush_t1_ms = -1.0
+        self.flush_unfinalized = 0
+        self.final_path = ""
+
+    def mark_take_start(self) -> None:
+        if self.t0 is None:
+            self.t0 = time.monotonic()
+
+    def now_ms(self) -> float:
+        return 0.0 if self.t0 is None else (time.monotonic() - self.t0) * 1000.0
+
+    def record(self, kind: str, abs_start: int, length: int, t0_ms: float,
+               t1_ms: float, result: str) -> None:
+        abs_start, length = int(abs_start), int(length)
+        self.totals.add(length, t0_ms, t1_ms, result)
+        self.by_kind[kind].add(length, t0_ms, t1_ms, result)
+        if self.flushing:
+            self.flush_totals.add(length, t0_ms, t1_ms, result)
+        if result in ("ok", "reused"):
+            self.covered_end = max(self.covered_end, abs_start + length)
+        if len(self.calls) < MAX_STREAM_CALLS:
+            self.calls.append((kind, abs_start, length, t0_ms, t1_ms, result))
+        else:
+            self.calls_dropped += 1
+
+    def begin_flush(self, unfinalized: int) -> None:
+        """Open the stop section; it covers this flush only (a busy flush is
+        retried by a later commit, which opens a fresh section)."""
+        self.flushing = True
+        self.flush_totals = _Totals()
+        self.flush_t0_ms = self.now_ms()
+        self.flush_t1_ms = -1.0
+        self.flush_unfinalized = int(unfinalized)
+        self.final_path = ""
+
+    def end_flush(self, ok: bool, *, full_take: bool = False) -> None:
+        self.flushing = False
+        self.flush_t1_ms = self.now_ms()
+        if not ok:
+            return
+        if full_take:
+            self.final_path = "full_take"
+        elif self.flush_totals.engine_calls:
+            self.final_path = "tail"
+        elif self.flush_totals.reused:
+            self.final_path = "reused"
+        else:
+            self.final_path = "committed"
+
+    def _seconds(self, samples: int) -> float:
+        return round(samples / self.sr, 3)
+
+    def _totals_json(self, t: _Totals) -> dict:
+        return {"calls": t.calls, "engine_calls": t.engine_calls,
+                "engine_audio_s": self._seconds(t.engine_samples),
+                "engine_ms": round(t.engine_ms, 3), "reused": t.reused,
+                "busy": t.busy}
+
+    def partial_json(self, audio_samples: int) -> dict:
+        return {"v": 1, "t_ms": round(self.now_ms(), 3),
+                "audio_s": self._seconds(audio_samples),
+                "covered_s": self._seconds(self.covered_end),
+                "totals": self._totals_json(self.totals)}
+
+    def final_json(self, audio_samples: int) -> dict:
+        # full_take only exists on the Python whole-buffer path; listed only
+        # when used so the chunked shape matches the native server.
+        by_kind = {k: self._totals_json(t) for k, t in self.by_kind.items()
+                   if k != "full_take" or t.calls}
+        return {
+            **self.partial_json(audio_samples),
+            "by_kind": by_kind,
+            "stop": {"path": self.final_path,
+                     "t0_ms": round(self.flush_t0_ms, 3),
+                     "t1_ms": round(self.flush_t1_ms, 3),
+                     "unfinalized_s": self._seconds(self.flush_unfinalized),
+                     "totals": self._totals_json(self.flush_totals)},
+            "calls_dropped": self.calls_dropped,
+            "calls": [{"kind": k, "start_s": self._seconds(a),
+                       "end_s": self._seconds(a + n), "t0_ms": round(t0, 3),
+                       "t1_ms": round(t1, 3), "result": r}
+                      for k, a, n, t0, t1, r in self.calls],
+        }

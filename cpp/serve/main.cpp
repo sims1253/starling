@@ -1049,9 +1049,14 @@ int main(int argc, char** argv) {
 
     // ---- WS /stream ----
     svr.WebSocket("/stream",
-        [&server, &cfg](const httplib::Request&,
+        [&server, &cfg](const httplib::Request& req,
                         httplib::ws::WebSocket& ws) {
             serve::StreamSession session(server.get());
+            // Opt-in stream instrumentation (issue #226): `trace=1` on the
+            // /stream URL attaches a "trace" object to partials and finals.
+            // Without it the frames are unchanged.
+            const bool trace = req.has_param("trace")
+                && req.get_param_value("trace") == "1";
             // Sent once when a binary frame is refused (buffer cap, malformed
             // WAV, sample-rate mismatch, odd PCM length); re-armed on reset
             // so a fresh dictation gets a fresh error if it is refused.
@@ -1121,7 +1126,9 @@ int main(int argc, char** argv) {
                         ss << "{\"type\":\"final\",\"text\":\""
                            << safe_text << "\",\"segments\":[{\"text\":\""
                            << safe_text << "\",\"start_s\":0.0,\"end_s\":"
-                           << dur << "}],\"duration_s\":" << dur << "}";
+                           << dur << "}],\"duration_s\":" << dur;
+                        if (trace) ss << ",\"trace\":" << session.trace_final_json();
+                        ss << "}";
                         ws.send(ss.str());
                         session.reset();
                         // reset() re-enables audio (clears the buffer cap and
@@ -1200,7 +1207,9 @@ int main(int argc, char** argv) {
                            << safe_text << "\",\"segments\":[{\"text\":\""
                            << safe_text << "\",\"start_s\":0.0,\"end_s\":"
                            << dur << "}],\"start_s\":0.0,\"end_s\":" << dur
-                           << ",\"stable_words\":" << session.stable_words() << "}";
+                           << ",\"stable_words\":" << session.stable_words();
+                        if (trace) ss << ",\"trace\":" << session.trace_partial_json();
+                        ss << "}";
                         ws.send(ss.str());
                     }
                 }

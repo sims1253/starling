@@ -184,6 +184,59 @@ def test_stream_valid_invalid_valid_sequence(server, monkeypatch):
             assert final["duration_s"] == .5
 
 
+# ---------------------------------------------------------------------------
+# Opt-in stream instrumentation (issue #226): ``trace=1`` attaches the call
+# ledger; without it the frames are unchanged.
+# ---------------------------------------------------------------------------
+def test_stream_trace_is_opt_in(server, monkeypatch):
+    monkeypatch.setattr(server, "_run_queued_sync", _transcribe_hello)
+    half = np.zeros(S.SAMPLE_RATE // 2, dtype=np.int16).tobytes()
+    with TestClient(S.create_app(server=server, load_on_startup=False)) as client:
+        with client.websocket_connect('/stream') as ws:
+            ws.send_bytes(half)
+            assert "trace" not in ws.receive_json()
+            ws.send_json({"type": "commit"})
+            assert "trace" not in ws.receive_json()
+
+
+@pytest.mark.parametrize("chunk_seconds", [0, 1])
+def test_stream_trace_ledger(server, monkeypatch, chunk_seconds):
+    server.config.stream_chunk_seconds = chunk_seconds
+    monkeypatch.setattr(server, "_run_queued_sync", _transcribe_hello)
+    half = np.zeros(S.SAMPLE_RATE // 2, dtype=np.int16).tobytes()
+    with TestClient(S.create_app(server=server, load_on_startup=False)) as client:
+        with client.websocket_connect('/stream?trace=1') as ws:
+            ws.send_bytes(half)
+            partial = ws.receive_json()
+            assert partial["trace"]["audio_s"] == .5
+            assert partial["trace"]["covered_s"] == .5
+            assert partial["trace"]["totals"]["engine_calls"] == 1
+            ws.send_bytes(half)  # new final samples after the preview
+            assert ws.receive_json()["type"] == "partial"
+            ws.send_json({"type": "commit"})
+            trace = ws.receive_json()["trace"]
+    calls = trace["calls"]
+    if chunk_seconds:
+        # 1.0 s buffered: the second step finalizes one full window and
+        # previews the 0.25 s past the boundary (advance 0.75 s); the stop
+        # flushes only that tail.
+        assert [c["kind"] for c in calls] == [
+            "preview", "window", "preview", "flush_tail"]
+        assert trace["by_kind"]["window"]["engine_audio_s"] == 1.0
+        assert trace["stop"]["path"] == "tail"
+        assert trace["stop"]["unfinalized_s"] == .25
+        assert trace["stop"]["totals"]["engine_audio_s"] == .25
+        assert calls[-1] == {**calls[-1], "kind": "flush_tail",
+                             "start_s": .75, "end_s": 1.0, "result": "ok"}
+    else:
+        # Whole-buffer mode re-transcribes the take: labeled, never "tail".
+        assert [c["kind"] for c in calls] == ["preview", "preview", "full_take"]
+        assert trace["stop"]["path"] == "full_take"
+        assert calls[-1]["kind"] == "full_take"
+        assert trace["stop"]["totals"]["engine_audio_s"] == 1.0
+    assert trace["covered_s"] == 1.0
+
+
 def test_lifespan_owns_eager_load(server):
     app = S.create_app(server=server)
     assert server.test_loads == []

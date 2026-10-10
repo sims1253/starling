@@ -250,6 +250,34 @@ receive JSON messages:
 - `{"type":"pong"}`: in response to `{"type":"ping"}`
 - `{"type":"reset_ack"}`: in response to `{"type":"reset"}`
 
+**Stream instrumentation** (issue #226): connect to `/stream?trace=1` and
+every partial and final carries an extra `"trace"` object. Clients that do
+not ask get the frames above unchanged. Times are milliseconds since the
+take's first audio; audio positions are seconds into the take.
+
+- Partial: `{"v":1,"t_ms":…,"audio_s":…,"covered_s":…,"totals":{…}}`.
+  `audio_s` is the audio received so far, and `covered_s` is the end of
+  the audio that the text reflects. `totals` holds `calls`,
+  `engine_calls`, `engine_audio_s`, `engine_ms`, `reused` and `busy`.
+  `engine_audio_s` counts window overlap and each repeated preview, so
+  `engine_audio_s / audio_s` is the inference work per recorded second.
+- Final: the same fields, plus `by_kind` totals for `window` (full windows
+  while recording), `preview` (live tail), `flush_window` and `flush_tail`
+  (work after commit). It also has `stop`, `calls` and `calls_dropped`.
+  `stop` covers the commit's own work. `path` is `tail` (the engine
+  transcribed only the unfinalized remainder), `reused` (the exact
+  tail result answered it) or `committed` (nothing was left). The
+  Python server labels its whole-buffer mode `full_take`. `stop` also
+  holds `unfinalized_s` (the audio past the committed boundary at
+  commit), `t0_ms`, `t1_ms` and `totals`. `calls` lists each call
+  with `kind`, `start_s`, `end_s`, `t0_ms`, `t1_ms` and `result`
+  (`ok`, `reused`, `busy` or `timed_out`). It holds at most 20,000
+  entries. `calls_dropped` counts later calls, which still enter
+  the totals.
+
+`benchmarks/experiments/stream_replay.py` uses this to replay workload takes
+at microphone pace and to report latency, work and stop-time metrics.
+
 **Buffer cap** (`--max-stream-seconds`, default 60 s): a binary frame that
 would push the session's live audio buffer past the cap is refused. The
 server emits one error frame:

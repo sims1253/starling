@@ -330,11 +330,12 @@ void ChunkStreamer::commit(const std::vector<std::string>& new_words) {
 }
 
 bool ChunkStreamer::finalize_full_windows(
-    const std::vector<float>& samples, const TranscribeFn& tx) {
+    const std::vector<float>& samples, const TranscribeFn& tx, bool flushing) {
     bool did = false;
     while (static_cast<int64_t>(samples.size()) - boundary_ >= chunk_) {
         int64_t start = boundary_;
         int64_t len = chunk_;
+        call_kind_ = flushing ? "flush_window" : "window";
         auto text = tx(samples.data() + start, len);
         if (!text.has_value()) break;  // busy → stop, boundary unchanged
         commit(split_words(*text));
@@ -346,7 +347,7 @@ bool ChunkStreamer::finalize_full_windows(
 
 std::optional<std::string> ChunkStreamer::step(
     const std::vector<float>& samples, double now, const TranscribeFn& tx) {
-    bool finalized = finalize_full_windows(samples, tx);
+    bool finalized = finalize_full_windows(samples, tx, false);
 
     int64_t tail_len = static_cast<int64_t>(samples.size()) - boundary_;
     if (tail_len >= chunk_) {  // a full window is still waiting for a retry
@@ -360,6 +361,7 @@ std::optional<std::string> ChunkStreamer::step(
     last_emit_ = now;
 
     if (tail_len > 0 && tail_len >= min_) {
+        call_kind_ = "preview";
         auto text = tx(samples.data() + boundary_, tail_len);
         if (!text.has_value()) {
             // Busy on the tail.
@@ -376,13 +378,14 @@ std::optional<std::string> ChunkStreamer::flush(
     const std::vector<float>& samples, const TranscribeFn& tx) {
     constexpr int kMaxRetries = 5;
     for (int attempt = 0; attempt < kMaxRetries; ++attempt) {
-        finalize_full_windows(samples, tx);
+        finalize_full_windows(samples, tx, true);
         int64_t tail_len = static_cast<int64_t>(samples.size()) - boundary_;
         if (tail_len == 0) return join_words(committed_);
         // Guard the tail's sign as well (issue #146): the window geometry is
         // validated at construction, but the transcriber contract (a
         // nonempty window inside the buffer) is enforced here regardless.
         if (tail_len > 0 && tail_len < chunk_) {
+            call_kind_ = "flush_tail";
             auto text = tx(samples.data() + boundary_, tail_len);
             if (text.has_value()) {
                 commit(split_words(*text));
@@ -401,6 +404,7 @@ void ChunkStreamer::reset() {
     frozen_ = 0;
     boundary_ = 0;
     last_emit_ = 0.0;
+    call_kind_ = "window";
 }
 
 // ---- StreamSession --------------------------------------------------------
@@ -496,6 +500,7 @@ AppendOutcome StreamSession::append_pcm(const std::string& bytes) {
         samples_[old + i] = static_cast<float>(src[i]) / 32768.0f;
     }
     ++audio_rev_;  // any appended audio invalidates exact-tail reuse (S11)
+    mark_take_start();
     maybe_trim_samples();
     return AppendOutcome::Accepted;
 }
@@ -544,6 +549,7 @@ AppendOutcome StreamSession::append_wav(const std::string& bytes) {
         samples_.resize(old + decoded.size());
         std::copy(decoded.begin(), decoded.end(), samples_.begin() + old);
         ++audio_rev_;  // any appended audio invalidates exact-tail reuse (S11)
+        mark_take_start();
     }
     maybe_trim_samples();
     return AppendOutcome::Accepted;
@@ -622,11 +628,30 @@ TranscribeFn StreamSession::active_tx() {
         // noise next to the inference it keys; accepted as-is.
         key.engine_id = engine_id;
         key.tx_gen = tx_gen;
+        StreamCall call;
+        call.kind = chunker_ ? chunker_->call_kind() : "window";
+        call.abs_start = key.abs_start;
+        call.length = n;
+        call.t0_ms = take_ms();
         if (tail_valid_ && tail_key_ == key) {
             ++tail_cache_hits_;
+            call.t1_ms = call.t0_ms;
+            call.result = "reused";
+            record_call(call);
             return tail_text_;  // exact-input reuse: engine not called
         }
-        std::optional<std::string> result = inner(p, n);
+        std::optional<std::string> result;
+        try {
+            result = inner(p, n);
+        } catch (const StreamQueueTimeout&) {
+            call.t1_ms = take_ms();
+            call.result = "timed_out";
+            record_call(call);
+            throw;
+        }
+        call.t1_ms = take_ms();
+        call.result = result.has_value() ? "ok" : "busy";
+        record_call(call);
         if (result.has_value()) {
             // Retain exactly one entry: this success replaces any previous
             // one (bounded: one entry per session, never a growing cache).
@@ -677,15 +702,33 @@ std::optional<std::string> StreamSession::stream_flush() {
     if (!chunker_) return "";
     if (!terminal_error_.empty()) return std::nullopt;
     TranscribeFn tx = active_tx();
+    // The stop section of the trace covers THIS flush only (a busy flush is
+    // retried by a later commit, which starts a fresh section).
+    flush_totals_ = StreamCallTotals{};
+    flush_t0_ms_ = take_ms();
+    flush_t1_ms_ = -1.0;
+    flush_unfinalized_ =
+        static_cast<int64_t>(samples_.size()) - chunker_->boundary();
+    final_path_ = "";
+    flushing_ = true;
+    std::optional<std::string> out;
     try {
-        return chunker_->flush(samples_, tx);
+        out = chunker_->flush(samples_, tx);
     } catch (const StreamQueueTimeout&) {
         terminal_error_ = "request timed out";
         take_invalid_ = true;
         invalid_reason_ = "request_timed_out";
         invalidate_tail_result();
-        return std::nullopt;
+        out = std::nullopt;
     }
+    flushing_ = false;
+    flush_t1_ms_ = take_ms();
+    if (out.has_value()) {
+        final_path_ = flush_totals_.engine_calls > 0 ? "tail"
+                    : flush_totals_.reused > 0       ? "reused"
+                                                     : "committed";
+    }
+    return out;
 }
 
 void StreamSession::reset() {
@@ -706,6 +749,18 @@ void StreamSession::reset() {
     // one without an intervening append.
     ++audio_rev_;
     invalidate_tail_result();
+    take_started_ = false;
+    calls_.clear();
+    calls_dropped_ = 0;
+    totals_ = StreamCallTotals{};
+    for (auto& t : by_kind_) t = StreamCallTotals{};
+    flush_totals_ = StreamCallTotals{};
+    flushing_ = false;
+    covered_end_ = 0;
+    flush_t0_ms_ = -1.0;
+    flush_t1_ms_ = -1.0;
+    flush_unfinalized_ = 0;
+    final_path_ = "";
 }
 
 double StreamSession::buffered_seconds() const {
@@ -714,6 +769,117 @@ double StreamSession::buffered_seconds() const {
 
 double StreamSession::live_seconds() const {
     return static_cast<double>(samples_.size()) / kSampleRate;
+}
+
+// ---- stream instrumentation (issue #226) -----------------------------------
+
+void StreamCallTotals::add(const StreamCall& c) {
+    ++calls;
+    const std::string r = c.result;
+    if (r == "ok") {
+        ++engine_calls;
+        engine_samples += c.length;
+        engine_ms += c.t1_ms - c.t0_ms;
+    } else if (r == "reused") {
+        ++reused;
+    } else {
+        ++busy;
+    }
+}
+
+double StreamSession::take_ms() const {
+    if (!take_started_) return 0.0;
+    return std::chrono::duration<double, std::milli>(
+               std::chrono::steady_clock::now() - take_t0_).count();
+}
+
+void StreamSession::mark_take_start() {
+    if (take_started_) return;
+    take_started_ = true;
+    take_t0_ = std::chrono::steady_clock::now();
+}
+
+namespace {
+const char* const kCallKinds[] = {
+    "window", "preview", "flush_window", "flush_tail"};
+}
+
+void StreamSession::record_call(const StreamCall& c) {
+    totals_.add(c);
+    for (size_t k = 0; k < 4; ++k)
+        if (std::string(c.kind) == kCallKinds[k]) by_kind_[k].add(c);
+    if (flushing_) flush_totals_.add(c);
+    const std::string r = c.result;
+    if (r == "ok" || r == "reused")
+        covered_end_ = std::max(covered_end_, c.abs_start + c.length);
+    if (calls_.size() < kMaxStreamCalls) calls_.push_back(c);
+    else ++calls_dropped_;
+}
+
+namespace {
+
+std::string fmt3(double v) {
+    char buf[64];
+    std::snprintf(buf, sizeof buf, "%.3f", v);
+    return buf;
+}
+
+std::string seconds(int64_t samples) {
+    return fmt3(static_cast<double>(samples) / kSampleRate);
+}
+
+std::string totals_json(const StreamCallTotals& t) {
+    return "{\"calls\":" + std::to_string(t.calls)
+         + ",\"engine_calls\":" + std::to_string(t.engine_calls)
+         + ",\"engine_audio_s\":" + seconds(t.engine_samples)
+         + ",\"engine_ms\":" + fmt3(t.engine_ms)
+         + ",\"reused\":" + std::to_string(t.reused)
+         + ",\"busy\":" + std::to_string(t.busy) + "}";
+}
+
+} // namespace
+
+std::string StreamSession::trace_partial_json() const {
+    return "{\"v\":1,\"t_ms\":" + fmt3(take_ms())
+         + ",\"audio_s\":" + seconds(trimmed_samples_
+                                        + static_cast<int64_t>(samples_.size()))
+         + ",\"covered_s\":" + seconds(covered_end_)
+         + ",\"totals\":" + totals_json(totals_) + "}";
+}
+
+std::string StreamSession::trace_final_json() const {
+    std::string by_kind = "{";
+    for (size_t k = 0; k < 4; ++k) {
+        if (k) by_kind += ",";
+        by_kind += "\"" + std::string(kCallKinds[k]) + "\":"
+                 + totals_json(by_kind_[k]);
+    }
+    by_kind += "}";
+    std::string list = "[";
+    for (size_t i = 0; i < calls_.size(); ++i) {
+        const auto& c = calls_[i];
+        if (i) list += ",";
+        list += "{\"kind\":\"" + std::string(c.kind)
+              + "\",\"start_s\":" + seconds(c.abs_start)
+              + ",\"end_s\":" + seconds(c.abs_start + c.length)
+              + ",\"t0_ms\":" + fmt3(c.t0_ms)
+              + ",\"t1_ms\":" + fmt3(c.t1_ms)
+              + ",\"result\":\"" + c.result + "\"}";
+    }
+    list += "]";
+    return "{\"v\":1,\"t_ms\":" + fmt3(take_ms())
+         + ",\"audio_s\":" + seconds(trimmed_samples_
+                                        + static_cast<int64_t>(samples_.size()))
+         + ",\"covered_s\":" + seconds(covered_end_)
+         + ",\"totals\":" + totals_json(totals_)
+         + ",\"by_kind\":" + by_kind
+         + ",\"stop\":{\"path\":\"" + final_path_
+         + "\",\"t0_ms\":" + fmt3(flush_t0_ms_)
+         + ",\"t1_ms\":" + fmt3(flush_t1_ms_)
+         + ",\"unfinalized_s\":" + seconds(flush_unfinalized_)
+         + ",\"totals\":" + totals_json(flush_totals_) + "}"
+         + ",\"calls_dropped\":" + std::to_string(calls_dropped_)
+         + ",\"calls\":" + list + "}";
 }
 
 } // namespace starling::serve

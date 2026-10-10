@@ -1319,6 +1319,109 @@ static void test_stream_session_rejects_invalid_window_config() {
     CHECK(threw);
 }
 
+// ---- stream call ledger (issue #226) ----------------------------------------
+// The ledger records every transcribe call with its kind and the absolute
+// audio span it covered, so overlap and repeated previews are visible and the
+// stop-time work can be checked against the unfinalized tail.
+
+static void test_trace_ledger_kinds_and_spans() {
+    StarlingServer server(test_cfg());
+    StreamSession session(&server);
+    session.set_transcribe_fn([](const float*, int64_t) -> std::optional<std::string> {
+        return std::string("w");
+    });
+
+    // 2.5 s: three full windows (advance 12000), the 4000-sample tail is
+    // below the 8000-sample preview minimum.
+    session.append_pcm(pcm_for_range(0, 40000));
+    CHECK(session.stream_step(1.0).has_value());
+    // 6000 more samples: a 10000-sample tail preview.
+    session.append_pcm(pcm_for_range(40000, 6000));
+    CHECK(session.stream_step(2.0).has_value());
+
+    const auto& calls = session.calls();
+    CHECK(calls.size() == 4);
+    if (calls.size() == 4) {
+        const int64_t starts[] = {0, 12000, 24000, 36000};
+        const int64_t lens[] = {16000, 16000, 16000, 10000};
+        for (size_t i = 0; i < 4; ++i) {
+            CHECK(std::string(calls[i].kind) == (i < 3 ? "window" : "preview"));
+            CHECK(calls[i].abs_start == starts[i]);
+            CHECK(calls[i].length == lens[i]);
+            CHECK(std::string(calls[i].result) == "ok");
+            CHECK(calls[i].t1_ms >= calls[i].t0_ms);
+        }
+    }
+    // Overlap counts as work: 58000 engine samples for 46000 recorded.
+    CHECK(session.totals().engine_calls == 4);
+    CHECK(session.totals().engine_samples == 58000);
+
+    // Stop with no new audio: the preview's exact result answers the tail.
+    auto final_ = session.stream_flush();
+    CHECK(final_.has_value());
+    CHECK(std::string(session.final_path()) == "reused");
+    CHECK(session.flush_totals().engine_calls == 0);
+    CHECK(session.flush_totals().reused == 1);
+    const std::string tj = session.trace_final_json();
+    CHECK(tj.find("\"path\":\"reused\"") != std::string::npos);
+    CHECK(tj.find("\"unfinalized_s\":0.625") != std::string::npos);
+    CHECK(tj.find("\"kind\":\"flush_tail\",\"start_s\":2.250,\"end_s\":2.875")
+          != std::string::npos);
+    CHECK(session.trace_partial_json().find("\"covered_s\":2.875")
+          != std::string::npos);
+
+    session.reset();
+    CHECK(session.calls().empty());
+    CHECK(session.totals().calls == 0);
+    CHECK(std::string(session.final_path()).empty());
+}
+
+static void test_trace_new_final_samples_run_the_tail() {
+    StarlingServer server(test_cfg());
+    StreamSession session(&server);
+    session.set_transcribe_fn([](const float*, int64_t) -> std::optional<std::string> {
+        return std::string("w");
+    });
+    session.append_pcm(pcm_for_range(0, 11200));
+    CHECK(session.stream_step(1.0).has_value());  // preview [0, 11200)
+    // Samples arriving after the latest preview must be finalized: the stale
+    // preview is never the final.
+    session.append_pcm(pcm_for_range(11200, 800));
+    CHECK(session.stream_flush().has_value());
+    CHECK(std::string(session.final_path()) == "tail");
+    CHECK(session.flush_totals().engine_calls == 1);
+    CHECK(session.flush_totals().engine_samples == 12000);
+    const auto& last = session.calls().back();
+    CHECK(std::string(last.kind) == "flush_tail");
+    CHECK(last.abs_start == 0 && last.length == 12000);
+}
+
+static void test_trace_flush_bounded_by_tail_not_take() {
+    // A 60 s take streamed in 0.1 s frames: the work after commit covers only
+    // the unfinalized remainder (less than one window), never the take.
+    StarlingServer server(test_cfg());
+    StreamSession session(&server);
+    session.set_transcribe_fn([](const float*, int64_t) -> std::optional<std::string> {
+        return std::string("w");
+    });
+    const int64_t frame = 1600, total = 60 * 16000;
+    double now = 0.0;
+    for (int64_t at = 0; at < total; at += frame) {
+        session.append_pcm(pcm_for_range(at, frame));
+        session.stream_step(now += 0.1);
+    }
+    session.append_pcm(pcm_for_range(total, 500));  // new final samples
+    CHECK(session.stream_flush().has_value());
+    CHECK(std::string(session.final_path()) == "tail");
+    CHECK(session.flush_totals().engine_samples < 16000);
+    CHECK(session.flush_totals().engine_calls == 1);
+    CHECK(session.totals().engine_samples > total);  // overlap + previews
+    for (const auto& c : session.calls()) {
+        CHECK(c.length <= 16000);
+        CHECK(c.abs_start + c.length <= total + 500);
+    }
+}
+
 // ---- main -----------------------------------------------------------------
 int main() {
     test_stitch_basic();
@@ -1364,6 +1467,9 @@ int main() {
     test_chunk_streamer_never_transcribes_empty_window();
     test_stream_session_rejects_invalid_window_config();
     test_model_mapping();
+    test_trace_ledger_kinds_and_spans();
+    test_trace_new_final_samples_run_the_tail();
+    test_trace_flush_bounded_by_tail_not_take();
 
     std::printf("stream_session_test: %d/%d passed\n", g_passed, g_tests);
     return g_passed == g_tests ? 0 : 1;
