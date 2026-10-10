@@ -14,11 +14,16 @@
 //! - The seam has no conflict channel out of `insert`: a target change
 //!   detected there (including part-way through typing) becomes
 //!   `delivery.failed{reason: target_changed | partial_delivery}`.
+//! - `surrounding_text` is `Text` only where a backend reports it, and
+//!   `Unsupported` otherwise. No backend here can tell a secure or
+//!   incognito field yet, so none answers `Protected`; one that can (the
+//!   IBus engine) must refuse before reading.
 
 use std::sync::Arc;
 
 use starling_runtime::machine::delivery::{
-    DeliveryAdapter, InsertEvidence, InsertionFailure, Revalidation,
+    DeliveryAdapter, InsertEvidence, InsertionFailure, Revalidation, SurroundingRead,
+    SurroundingText,
 };
 
 use crate::{Inserter, InsertionBackend, TargetCheck, TargetSnapshot};
@@ -119,6 +124,20 @@ impl DeliveryAdapter for InsertionDeliveryAdapter {
     fn describe(&self) -> String {
         format!("starling-insertion ({})", self.inserter.describe())
     }
+
+    fn surrounding_text(&self, target_ref: &str) -> SurroundingRead {
+        let Ok((snapshot, backend)) = self.resolve(target_ref) else {
+            return SurroundingRead::Unsupported;
+        };
+        match backend.surrounding_text(&snapshot) {
+            Ok(Some(text)) => SurroundingRead::Text(SurroundingText {
+                before: text.before,
+                after: text.after,
+                showing_hint: false,
+            }),
+            Ok(None) | Err(_) => SurroundingRead::Unsupported,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -132,6 +151,20 @@ mod tests {
         fake.focus(FakeTarget::named("Notes", "Meeting notes"));
         let inserter = Inserter::with_backends(vec![Box::new(fake.clone())]);
         (fake, InsertionDeliveryAdapter::new(Arc::new(inserter)))
+    }
+
+    #[test]
+    fn surrounding_text_is_unsupported_where_no_backend_reports_it() {
+        let (fake, adapter) = session();
+        let target = fake.capture().unwrap();
+        assert_eq!(
+            adapter.surrounding_text(&target.target_ref),
+            SurroundingRead::Unsupported
+        );
+        assert_eq!(
+            adapter.surrounding_text("not a ref"),
+            SurroundingRead::Unsupported
+        );
     }
 
     fn failure_reason(result: Result<InsertEvidence, InsertionFailure>) -> String {
