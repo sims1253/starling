@@ -448,6 +448,17 @@ pub enum DocsMsg {
         revision: Revision,
         reply: crate::channel::Sender<Result<(), Rejection>>,
     },
+    /// Test-only: the actor says it is `holding`, then takes no message
+    /// until `release` answers or closes, so its inbox can be filled
+    /// deterministically ([`crate::Runtime::hold_document_service`]).
+    #[cfg(any(test, feature = "test-doubles"))]
+    Hold {
+        holding: crate::channel::Sender<()>,
+        release: crate::channel::Receiver<()>,
+    },
+    /// Test-only: does nothing; fills a held actor's inbox.
+    #[cfg(any(test, feature = "test-doubles"))]
+    Filler,
     Shutdown,
 }
 
@@ -538,6 +549,13 @@ impl DocsActor {
                 }) => {
                     let _ = reply.try_send(self.record_derived(doc_id, derived_from, revision));
                 }
+                #[cfg(any(test, feature = "test-doubles"))]
+                Ok(DocsMsg::Hold { holding, release }) => {
+                    let _ = holding.try_send(());
+                    let _ = release.recv();
+                }
+                #[cfg(any(test, feature = "test-doubles"))]
+                Ok(DocsMsg::Filler) => {}
                 Ok(DocsMsg::Shutdown) | Err(crate::channel::RecvError::Closed) => break,
                 Err(crate::channel::RecvError::Timeout) => {
                     unreachable!("recv has no timeout")

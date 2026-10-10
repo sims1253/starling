@@ -280,6 +280,9 @@ pub struct Runtime {
     bus: Arc<EventBus>,
     views: SharedViews,
     frozen_routes: machine::context::FrozenRoutes,
+    /// The document actor's inbox, for [`Runtime::hold_document_service`].
+    #[cfg(any(test, feature = "test-doubles"))]
+    docs: channel::Sender<DocsMsg>,
 }
 
 #[derive(Clone)]
@@ -400,7 +403,10 @@ impl Runtime {
             inbox: router_rx,
             capture: capture_tx,
             context: context_tx,
+            #[cfg(not(any(test, feature = "test-doubles")))]
             docs: docs_tx,
+            #[cfg(any(test, feature = "test-doubles"))]
+            docs: docs_tx.clone(),
             delivery: delivery_tx,
             jobs: jobs_tx,
             bus: Arc::clone(&bus),
@@ -414,6 +420,8 @@ impl Runtime {
             bus,
             views: views.clone(),
             frozen_routes,
+            #[cfg(any(test, feature = "test-doubles"))]
+            docs: docs_tx,
         };
         let client = RuntimeClient {
             router: runtime.router.clone(),
@@ -434,6 +442,25 @@ impl Runtime {
         snapshot_of(&self.views, &self.frozen_routes)
     }
 
+    /// Test-only: stops the document service and fills its inbox, so
+    /// every send to it is refused as busy until the hold is dropped.
+    #[cfg(any(test, feature = "test-doubles"))]
+    pub fn hold_document_service(&self) -> DocumentServiceHold {
+        let (holding_tx, holding) = channel::bounded(1);
+        let (release, release_rx) = channel::bounded(1);
+        self.docs
+            .try_send(DocsMsg::Hold {
+                holding: holding_tx,
+                release: release_rx,
+            })
+            .unwrap_or_else(|_| panic!("the document service inbox is not free"));
+        holding
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the document service holds");
+        while self.docs.try_send(DocsMsg::Filler).is_ok() {}
+        DocumentServiceHold { _release: release }
+    }
+
     /// Shuts the runtime down and joins the machine threads.
     pub fn shutdown(self) {
         let _ = self.router.try_send(RouterMsg::Shutdown);
@@ -442,6 +469,13 @@ impl Runtime {
             let _ = handle.join();
         }
     }
+}
+
+/// A held document service ([`Runtime::hold_document_service`]); dropping
+/// it lets the service drain its inbox again.
+#[cfg(any(test, feature = "test-doubles"))]
+pub struct DocumentServiceHold {
+    _release: channel::Sender<()>,
 }
 
 fn spawn<F>(name: &str, run: F) -> JoinHandle<()>
