@@ -363,4 +363,13 @@ class StagedTakeTest {
         take.backToRaw()
         assertEquals("hello new line again", take.draft.rawText())
     }
+
+    @Test
+    fun aCaptureIntoAnEmptiedDraftGetsNoLeadingSpace() {
+        val take = take()
+        take.dictate(final = "hello")
+        take.deleteWord()
+        take.dictate(final = "again", attempt = "a-2")
+        assertEquals("again", take.deliveryText())
+    }
 }

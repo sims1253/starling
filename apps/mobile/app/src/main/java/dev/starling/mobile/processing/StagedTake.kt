@@ -117,11 +117,12 @@ class StagedTake(
         proposal = null
         selection = null
         segment += 1
-        // The separator is part of the raw recognition too, so it follows
-        // the text either view ends in: a processed line break still needs
-        // a space after the raw "new line".
-        fun open(text: String) = text.isEmpty() || text.last().isWhitespace()
-        separator = if (open(draft.text()) && open(draft.rawText())) "" else " "
+        // The separator is part of the raw recognition too: a processed line
+        // break still needs a space after the raw "new line". An empty draft
+        // gets none, whatever was deleted from it.
+        val text = draft.text()
+        fun open(end: String) = end.isEmpty() || end.last().isWhitespace()
+        separator = if (text.isEmpty() || (open(text) && open(draft.rawText()))) "" else " "
     }
 
     fun partial(text: String) {
