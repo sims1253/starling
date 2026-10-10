@@ -179,9 +179,19 @@ class LocateErrorsTest(unittest.TestCase):
         (span,) = out["spans"]
         self.assertEqual(span["omitted"], "five six")
         # "five" is spread over 10-14 s: 10.5 s, inside the overlap of the
-        # window with the re-decode (a candidate counts; previews do not).
+        # window with the tail commitment, which spans its re-decode from
+        # 7.5 s (previews do not count).
         self.assertEqual((span["t_s"], span["where"], span["overlap_s"]),
                          (10.5, "overlap", [7.5, 12.0]))
+        # Candidates of one commitment do not overlap each other: a first
+        # window re-decoded shorter leaves 2.5 s outside any overlap.
+        first = [{"kind": "window", "start_s": 0.0, "end_s": 12.0},
+                 {"kind": "redecode", "start_s": 0.0, "end_s": 10.5}]
+        out = sr.locate_errors("one two three four", "one three four",
+                               [{"text": "one two three four", "start_s": 0.0, "end_s": 10.0}],
+                               "one two three four", first)
+        self.assertEqual((out["spans"][0]["where"], out["spans"][0]["overlap_s"]),
+                         ("window", None))
 
     def test_duplicated_run_and_far_errors(self):
         out = sr.locate_errors(self.REF, "One, two two three four five six seven eight",

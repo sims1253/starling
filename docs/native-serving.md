@@ -423,8 +423,12 @@ fixture, `tests/fixtures/stream_stitch_cases.txt`):
   phrase away from the boundary cannot win and drop the words between. The
   cut is the middle matched word. With no alignment scoring 3 or more (a
   pause in the overlap, or a window that dropped those words) the texts are
-  concatenated. The engine exposes no word timestamps, so the alignment works
-  on words only; it is the same for every model.
+  concatenated. Repeated text ("one two three one two three ...") aligns
+  perfectly at every multiple of its period; such an alignment is shortened
+  by whole periods to the number of words the shared audio should hold (each
+  window's share of its voiced audio in the overlap). The engine exposes no
+  word timestamps, so the alignment works on words only; it is the same for
+  every model.
 - Parakeet sometimes stops emitting partway through a window, or returns
   nothing for a window full of speech, while the same audio decodes fine one
   second later. A committed window or flush tail is therefore checked against

@@ -29,13 +29,21 @@ def _norm(word: str) -> str:
     return _WORD_NORM.sub("", word.lower())
 
 
-# Overlap alignment scores (issue #357; kStitch* in the C++ port).
+# Overlap alignment scores (issue #357; kStitch* in the C++ port). The empty
+# alignment scores 0; two matched words at the very edges score 4, three
+# matches around four unmatched committed words score 2 (rejected).
 _STITCH_MATCH = 2
 _STITCH_MISMATCH = -1
 _STITCH_GAP = -1
-# The empty alignment scores 0; two matched words at the very edges score 4,
-# three matches around four unmatched committed words score 2 (rejected).
 _STITCH_MIN_SCORE = 3
+
+
+def _period(keys: list[str]) -> int:
+    """Smallest p <= len/2 with keys[k] == keys[k + p] for every k, else 0."""
+    for p in range(1, len(keys) // 2 + 1):
+        if all(keys[k] == keys[k + p] for k in range(len(keys) - p)):
+            return p
+    return 0
 
 
 def stitch_words(
@@ -44,26 +52,37 @@ def stitch_words(
     *,
     max_overlap: int = 24,
     max_head: Optional[int] = None,
+    expected_overlap: Optional[float] = None,
 ) -> list[str]:
     """Append ``new`` to ``committed``, deduping the overlapping boundary words.
 
     The two texts come from windows that share some audio, so the words the
     windows agree on sit at the END of ``committed`` and the START of
-    ``new``. This aligns a suffix of ``committed``'s last ``max_overlap`` words
-    with a prefix of ``new``'s first ``max_head`` words (default
+    ``new``. This aligns a suffix of ``committed``'s last ``max_overlap``
+    words with a prefix of ``new``'s first ``max_head`` words (default
     ``max_overlap``; a re-decoded window that starts earlier shares more
-    audio, and its words before the committed tail align as gaps) (match
-    +2, mismatch and gap -1; words left out on the committed side before the suffix and on
-    the new side after the prefix are free). Every committed word after the
-    aligned suffix's start and every new word before the prefix's end costs a
-    gap, so a common phrase ("of the") far from the boundary cannot win the
-    alignment and drop the words between (issue #357: one such match dropped
-    30 words). The cut is the middle matched word of the alignment, where
-    both windows hold the most context: ``committed`` up to and including
-    it, then ``new`` after it, so each overlap word is taken from exactly one
-    side. Without an alignment scoring at least ``_STITCH_MIN_SCORE`` (no
-    shared words: a pause in the overlap, or a window that dropped them) the
-    two are concatenated.
+    audio, and its words before the committed tail align as gaps). Matches
+    score +2, mismatches and gaps -1; committed words before the suffix and
+    new words after the prefix are free. Every committed word after the
+    suffix's start and every new word before the prefix's end costs a gap,
+    so a common phrase ("of the") far from the boundary cannot win and drop
+    the words between (issue #357: one such match dropped 30 words).
+
+    Repeated text ("one two three one two three ...") aligns perfectly at
+    every multiple of its period, and the longest alignment wins the score.
+    When the chosen alignment is such a perfect run over periodic words and
+    ``expected_overlap`` (how many words the shared audio should hold, the
+    caller's estimate from the windows' voiced audio) is smaller, the
+    alignment is shortened by whole periods to the length closest to it, so
+    the repetitions outside the shared audio survive. Alignments with any
+    mismatch or gap are never changed by the estimate.
+
+    The cut is the middle matched word of the alignment, where both windows
+    hold the most context: ``committed`` up to and including it, then
+    ``new`` after it, so each overlap word is taken from exactly one side.
+    Without an alignment scoring at least _STITCH_MIN_SCORE (no shared
+    words: a pause in the overlap, or a window that dropped them) the two
+    are concatenated.
 
     Kept in lockstep with ``stitch_words`` in cpp/serve/stream_session.cpp,
     including the tie-breaking.
@@ -113,6 +132,18 @@ def stitch_words(
         else:
             j -= 1
     pairs.reverse()
+    length = len(pairs)
+    if (expected_overlap is not None and length > expected_overlap
+            and best == _STITCH_MATCH * length and pairs[0][1] == 0
+            and pairs[0][0] + length == n):
+        # A perfect run: tail[i0 + t] == head[t] for every t. Over periodic
+        # words it also aligns from i0 + k * period; keep the k whose length
+        # is closest to the estimate (the smallest k on a tie).
+        period = _period(a[pairs[0][0]:])
+        if period:
+            k = min(range(length // period),
+                    key=lambda k: abs(length - k * period - expected_overlap))
+            pairs = [(pairs[0][0] + k * period + t, t) for t in range(length - k * period)]
     ci, cj = pairs[(len(pairs) - 1) // 2]
     keep = len(committed) - len(tail) + ci + 1
     return list(committed[:keep]) + list(new[cj + 1:])
@@ -163,17 +194,36 @@ def max_plausible_words(seconds: float) -> int:
     return int(seconds * MAX_WORDS_PER_SECOND) + _MAX_WORDS_SLACK
 
 
-def voiced_seconds(samples: np.ndarray, sample_rate: int) -> float:
-    """Seconds of ``samples`` loud enough to be speech (see _VAD_*)."""
+def voiced_frames(samples: np.ndarray, sample_rate: int) -> np.ndarray:
+    """Per 20 ms frame of ``samples``: loud enough to be speech (see _VAD_*)."""
     frame = sample_rate // _VAD_FRAMES_PER_SECOND
     count = len(samples) // frame if frame > 0 else 0
     if count == 0:
-        return 0.0
+        return np.zeros(0, dtype=bool)
     x = np.asarray(samples[: count * frame], dtype=np.float64).reshape(count, frame)
     db = 10.0 * np.log10(np.mean(x * x, axis=1) + 1e-10)
     floor = min(float(np.sort(db)[int(_VAD_FLOOR_PERCENTILE * (count - 1))]), _VAD_FLOOR_MAX_DB)
     threshold = max(floor + _VAD_MARGIN_DB, _VAD_MIN_DB)
-    return float(np.count_nonzero(db > threshold)) * frame / sample_rate
+    return db > threshold
+
+
+def voiced_seconds(samples: np.ndarray, sample_rate: int) -> float:
+    """Seconds of ``samples`` loud enough to be speech (see _VAD_*)."""
+    frame = sample_rate // _VAD_FRAMES_PER_SECOND
+    return float(np.count_nonzero(voiced_frames(samples, sample_rate))) * frame / sample_rate
+
+
+def _expected_words(words: int, flags: np.ndarray, start: int, lo: int, hi: int,
+                    frame: int) -> Optional[float]:
+    """How many of a decode's ``words`` fall in buffer[lo:hi): its share of
+    the decode's voiced frames (those starting in [lo, hi)). ``None``
+    without voiced frames: the audio cannot place the words."""
+    total = int(np.count_nonzero(flags))
+    if total == 0:
+        return None
+    first = max(0, -(-(lo - start) // frame))
+    last = max(first, -(-(hi - start) // frame))
+    return words * int(np.count_nonzero(flags[first:last])) / total
 
 
 def _repeat_run(keys: list[str], i: int, n: int) -> int:
@@ -375,6 +425,10 @@ class ChunkStreamer:
         self.frozen = 0
         # Words per voiced second of the latest committed windows.
         self.rates: list[float] = []
+        # The latest committed decode: (voiced frame flags, buffer start,
+        # length, word count); its share of speech in a later overlap
+        # predicts how many committed words that overlap holds.
+        self.last: Optional[tuple[np.ndarray, int, int, int]] = None
         self.boundary = 0          # sample index; audio before this is finalized
         self.rebased = 0           # samples dropped before index 0 (rebase())
         self.last_emit = 0.0
@@ -425,18 +479,38 @@ class ChunkStreamer:
         """Follow the session dropping ``dropped`` finalized samples."""
         self.boundary = max(0, self.boundary - dropped)
         self.rebased += dropped
+        if self.last is not None:
+            flags, start, length, count = self.last
+            self.last = (flags, start - dropped, length, count)
 
     # ------------------------------------------------------------------ #
-    def _stitched(self, words: list[str]) -> list[str]:
-        """``committed`` with ``words`` stitched onto its unfrozen tail."""
+    def _stitched(self, words: list[str], start: int, end: int,
+                  flags: np.ndarray) -> list[str]:
+        """``committed`` with ``words`` (decoded from buffer[start:end], with
+        those voiced ``flags``) stitched onto its unfrozen tail. Each side's
+        share of speech in the audio both decodes heard predicts how many
+        of its words the overlap holds."""
+        expected = None
+        if self.last is not None:
+            last_flags, last_start, last_len, last_count = self.last
+            lo, hi = max(start, last_start), min(end, last_start + last_len)
+            if hi > lo:
+                frame = max(1, self.sr // _VAD_FRAMES_PER_SECOND)
+                both = [e for e in (_expected_words(last_count, last_flags, last_start,
+                                                    lo, hi, frame),
+                                    _expected_words(len(words), flags, start, lo, hi, frame))
+                        if e is not None]
+                if both:
+                    expected = sum(both) / len(both)
         tail = stitch_words(self.committed[self.frozen:], words,
                             max_overlap=self.max_overlap_words,
-                            max_head=self.max_head_words)
+                            max_head=self.max_head_words, expected_overlap=expected)
         return self.committed[: self.frozen] + tail
 
-    def _commit(self, words: list[str]) -> None:
-        self.committed = self._stitched(words)
+    def _commit(self, words: list[str], start: int, end: int, flags: np.ndarray) -> None:
+        self.committed = self._stitched(words, start, end, flags)
         self.frozen = max(self.frozen, len(self.committed) - self.max_overlap_words)
+        self.last = (flags, start, end - start, len(words))
 
     def _tx(self, samples: np.ndarray, start: int, end: int, kind: str,
             tx: TranscribeFn) -> Optional[str]:
@@ -459,18 +533,20 @@ class ChunkStreamer:
             return 1
         return 0
 
-    def _decode_committed(self, samples: np.ndarray, start: int, end: int, kind: str,
-                          tx: TranscribeFn) -> Optional[tuple[list[str], int]]:
-        """Words of samples[start:end] for the committed text and where the
-        audio they come from ends, or ``None`` when the engine is busy. An implausible result (too sparse for its
+    def _decode_committed(
+        self, samples: np.ndarray, start: int, end: int, kind: str, tx: TranscribeFn
+    ) -> Optional[tuple[list[str], tuple[int, int], np.ndarray]]:
+        """Words of samples[start:end] for the committed text, the span of
+        the audio they come from and its voiced frames, or ``None`` when the
+        engine is busy. An implausible result (too sparse for its
         voiced audio, or a loop) is decoded again from the earlier starts in
         REDECODE_SHIFTS, until one is plausible: a full window moves
         back whole (the next window's overlap still covers its end), or
         ends earlier where the buffer holds no audio before it (the take's
         first window); the flush tail grows backwards up to one window
         (nothing else covers its end). A candidate replaces the current one
-        when it is plausible and the current one loops, or when it is denser
-        by _REDECODE_MIN_GAIN. A busy re-decode keeps the best so far if it is
+        when it is plausible and the current one is not, or when neither is
+        plausible, it does not loop and it is denser by _REDECODE_MIN_GAIN. A busy re-decode keeps the best so far if it is
         plausible, and otherwise leaves the window pending (``None``): the
         audio stays in the buffer for a retry instead of committing text
         known to be wrong."""
@@ -478,9 +554,12 @@ class ChunkStreamer:
         if text is None:
             return None
         words = text.split()
-        voiced = voiced_seconds(samples[start:end], self.sr)
+        frame = max(1, self.sr // _VAD_FRAMES_PER_SECOND)
+        flags = voiced_frames(samples[start:end], self.sr)
+        voiced = float(np.count_nonzero(flags)) * frame / self.sr
         verdict = self._verdict(words, (end - start) / self.sr, voiced)
         best, best_verdict, best_span, best_voiced = words, verdict, (start, end), voiced
+        best_flags = flags
         tried = {(start, end)}
         full = end - start == self.chunk
         for shift in REDECODE_SHIFTS if verdict else ():
@@ -498,17 +577,19 @@ class ChunkStreamer:
                     return None
                 break
             cand = text.split()
-            v_voiced = voiced_seconds(samples[a:z], self.sr)
+            v_flags = voiced_frames(samples[a:z], self.sr)
+            v_voiced = float(np.count_nonzero(v_flags)) * frame / self.sr
             v = self._verdict(cand, (z - a) / self.sr, v_voiced)
-            if v != 2 and best_verdict == 2:
+            if v == 0 or (v == 1 and best_verdict == 2):
                 better = True
-            elif v != 2:
+            elif v == 1:
                 better = (len(cand) * max(best_voiced, 1e-9)
                           >= _REDECODE_MIN_GAIN * len(best) * max(v_voiced, 1e-9))
             else:
                 better = False
             if better:
                 best, best_verdict, best_span, best_voiced = cand, v, (a, z), v_voiced
+                best_flags = v_flags
             if best_verdict == 0:
                 break
         if best is not words:
@@ -517,7 +598,7 @@ class ChunkStreamer:
             best = suppress_loops(best, (best_span[1] - best_span[0]) / self.sr)
         elif best_voiced >= _MIN_VOICED_SECONDS:
             self.rates = (self.rates + [len(best) / best_voiced])[-_RATE_HISTORY:]
-        return best, best_span[1]
+        return best, best_span, best_flags
 
     def _finalize_full_windows(
         self, samples: np.ndarray, tx: TranscribeFn, *, flushing: bool = False
@@ -531,8 +612,8 @@ class ChunkStreamer:
                 samples, self.boundary, end, "flush_window" if flushing else "window", tx)
             if got is None:  # busy/cancelled -> stop; boundary unchanged for retry
                 break
-            words, used_end = got
-            self._commit(words)
+            words, (used_start, used_end), flags = got
+            self._commit(words, used_start, used_end, flags)
             # The next window overlaps the audio the committed text came
             # from by the full overlap, also when a re-decode ended earlier.
             self.boundary += self.advance - (end - used_end)
@@ -604,7 +685,9 @@ class ChunkStreamer:
         self.emit_due = False
         # A preview is shown as decoded (no re-decode: the next one replaces
         # it), but never with a decoding loop in it (issue #357).
-        return " ".join(self._stitched(suppress_loops(text.split(), tail_len / self.sr)))
+        return " ".join(self._stitched(suppress_loops(text.split(), tail_len / self.sr),
+                                       self.boundary, len(samples),
+                                       voiced_frames(samples[self.boundary:], self.sr)))
 
     def flush(self, samples: np.ndarray, tx: TranscribeFn) -> Optional[str]:
         """Commit all audio, or return ``None`` if bounded retries stay busy.
@@ -624,7 +707,8 @@ class ChunkStreamer:
                 got = self._decode_committed(samples, self.boundary, len(samples),
                                              "flush_tail", tx)
                 if got is not None:
-                    self._commit(got[0])
+                    words, (used_start, used_end), flags = got
+                    self._commit(words, used_start, used_end, flags)
                     self.boundary = len(samples)
                     self.emit_due = False
                     return " ".join(self.committed)
@@ -636,6 +720,7 @@ class ChunkStreamer:
         self.committed = []
         self.frozen = 0
         self.rates = []
+        self.last = None
         self.boundary = 0
         self.rebased = 0
         self.last_emit = 0.0

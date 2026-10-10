@@ -21,12 +21,16 @@ namespace starling::serve {
 // Append `new_words` to `committed`, deduping the overlapping boundary words
 // (issue #357). Aligns a suffix of committed's last `max_overlap` words with a
 // prefix of new_words' first `max_head` words (default max_overlap; a
-// re-decoded window that starts earlier shares more audio) (match +2,
-// mismatch and gap -1; committed words before the suffix and new words after
-// the prefix are free), so a common phrase far from the boundary cannot win and drop the
-// words between. The cut is the middle matched word: committed up to and
-// including it, then new_words after it. Without an alignment scoring at
-// least kStitchMinScore the two are concatenated.
+// re-decoded window that starts earlier shares more audio). Matches score
+// +2, mismatches and gaps -1; committed words before the suffix and new
+// words after the prefix are free, so a common phrase far from the boundary
+// cannot win and drop the words between. When the chosen alignment is a
+// perfect run over periodic words ("one two three one two three ...") and
+// `expected_overlap` (words the shared audio should hold; -1: unknown) is
+// smaller, it is shortened by whole periods to the length closest to it.
+// The cut is the middle matched word: committed up to and including it,
+// then new_words after it. Without an alignment scoring at least
+// kStitchMinScore the two are concatenated.
 //
 // Port of stitch_words() from src/starling/stream_chunk.py, tie-breaking
 // included.
@@ -34,7 +38,8 @@ std::vector<std::string> stitch_words(
     const std::vector<std::string>& committed,
     const std::vector<std::string>& new_words,
     int max_overlap = 24,
-    int max_head = -1);
+    int max_head = -1,
+    double expected_overlap = -1.0);
 
 // ---- window plausibility (issue #357) ---------------------------------------
 // Parakeet sometimes stops emitting partway through a window, or emits
@@ -67,6 +72,8 @@ int max_plausible_words(double seconds);
 // span's quiet floor (its 10th-percentile frame, at most -45 dBFS) and over
 // -60 dBFS.
 double voiced_seconds(const float* samples, int64_t n, int sample_rate);
+// The same measure per 20 ms frame (1 = voiced).
+std::vector<uint8_t> voiced_frames(const float* samples, int64_t n, int sample_rate);
 // Words of a decode over `seconds` of audio with a decoding loop removed:
 // unchanged within max_plausible_words(), so real repeated speech is never
 // touched. Longer text has its longest back-to-back run of one phrase
@@ -212,6 +219,8 @@ public:
     void rebase(int64_t dropped) {
         boundary_ = std::max<int64_t>(0, boundary_ - dropped);
         rebased_ += dropped;
+        last_.start -= dropped;
+        last_.end -= dropped;
     }
 
     // A full window is waiting to be committed (the next step commits it).
@@ -244,21 +253,29 @@ public:
 private:
     bool finalize_full_windows(const std::vector<float>& samples,
                                const TranscribeFn& tx, bool flushing);
-    // Words of samples[start, end) for the committed text and the end of
-    // the audio they come from, re-decoded when implausible (see
-    // stream_chunk.py _decode_committed); nullopt when the engine is busy
-    // before a plausible result is in hand.
-    std::optional<std::pair<std::vector<std::string>, int64_t>> decode_committed(
+    // One decode kept for the committed text: its words, the buffer span
+    // of its audio and that audio's voiced frames.
+    struct Decoded {
+        std::vector<std::string> words;
+        int64_t start = 0, end = 0;
+        std::vector<uint8_t> flags;
+    };
+    // Words of samples[start, end) for the committed text, re-decoded when
+    // implausible (see stream_chunk.py _decode_committed); nullopt when the
+    // engine is busy before a plausible result is in hand.
+    std::optional<Decoded> decode_committed(
         const std::vector<float>& samples, int64_t start, int64_t end,
         const char* kind, const TranscribeFn& tx);
     // Words per voiced second below which a window dropped speech.
     double min_rate() const;
     // 0 plausible, 1 sparse (dropped speech), 2 a decoding loop.
     int verdict(size_t words, double seconds, double voiced) const;
-    // committed_ with `new_words` stitched onto its unfrozen tail.
-    std::vector<std::string> stitched(const std::vector<std::string>& new_words) const;
-    // Stitches `new_words` into committed_ and advances frozen_.
-    void commit(const std::vector<std::string>& new_words);
+    // committed_ with d.words stitched onto its unfrozen tail; each side's
+    // share of speech in the audio both decodes heard predicts how many of
+    // its words the overlap holds.
+    std::vector<std::string> stitched(const Decoded& d) const;
+    // Stitches d into committed_, advances frozen_ and remembers d.
+    void commit(const Decoded& d);
 
     int sr_;
     int chunk_;           // chunk size in samples
@@ -280,6 +297,12 @@ private:
     int64_t coalesced_ = 0;
     int64_t redecodes_ = 0;
     std::vector<double> rates_;  // words per voiced second, latest windows
+    // The latest committed decode (its words are only counted).
+    struct {
+        bool valid = false;
+        int64_t start = 0, end = 0, words = 0;
+        std::vector<uint8_t> flags;
+    } last_;
     const char* call_kind_ = "window";
 };
 

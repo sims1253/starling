@@ -156,20 +156,26 @@ def locate_errors(batch_text: str, final_text: str, utterances: list[dict] | Non
     final inserts (``duplicated`` when the inserted run repeats the words
     right before or after it), its estimated audio time (from the workload's
     utterance spans) and whether it falls into a window overlap (between the
-    next committing call's start and the current one's end, from the trace's
-    ``window``/``flush_window``/``flush_tail``/``redecode`` spans, +-1 s) or
-    elsewhere. The trace does not say which re-decode candidate was kept, so
-    every candidate counts and the label errs toward ``overlap``.
+    next commitment's start and the current one's end, +-1 s) or elsewhere.
+    A commitment is a ``window``/``flush_window``/``flush_tail`` call with
+    the ``redecode`` calls right after it; the trace does not say which
+    candidate was kept, so a commitment spans all of them and the label errs
+    toward ``overlap`` there.
     """
     b, f = normalize(batch_text), normalize(final_text)
     times = _word_times(b, reference, utterances or [])
-    committing = sorted((c for c in calls
-                         if c.get("kind") in ("window", "flush_window", "flush_tail",
-                                              "redecode")
-                         and c.get("result", "ok") in ("ok", "reused")),
-                        key=lambda c: c["start_s"])
-    overlaps = [(nxt["start_s"], cur["end_s"]) for cur, nxt in zip(committing, committing[1:])
-                if nxt["start_s"] < cur["end_s"]]
+    commitments: list[list[float]] = []
+    for c in calls:
+        if c.get("result", "ok") not in ("ok", "reused"):
+            continue
+        if c.get("kind") in ("window", "flush_window", "flush_tail"):
+            commitments.append([c["start_s"], c["end_s"]])
+        elif c.get("kind") == "redecode" and commitments:
+            commitments[-1] = [min(commitments[-1][0], c["start_s"]),
+                               max(commitments[-1][1], c["end_s"])]
+    commitments.sort()
+    overlaps = [(nxt[0], cur[1]) for cur, nxt in zip(commitments, commitments[1:])
+                if nxt[0] < cur[1]]
     spans, run = [], []
     last_b = None  # the batch word before the current run
     for op in align(b, f) + [("eq", None, None)]:
