@@ -129,6 +129,9 @@ class VoiceInputService : InputMethodService() {
     /** The one take this keyboard follows, from Record until it is settled. */
     private var take: Take? = null
 
+    /** From the editor's last selection update: the cursor is at the end of the composing region. */
+    private var cursorAtComposingEnd = true
+
     private val catalog: ModeCatalog by lazy { application.modeCatalog }
 
     override fun onCreate() {
@@ -199,6 +202,7 @@ class VoiceInputService : InputMethodService() {
 
     override fun onStartInput(attribute: EditorInfo?, restarting: Boolean) {
         super.onStartInput(attribute, restarting)
+        cursorAtComposingEnd = true
         val field = EditorField.from(attribute)
         editorField = field
         val connection = currentInputConnection
@@ -242,6 +246,22 @@ class VoiceInputService : InputMethodService() {
         application.preloadOnDeviceModel()
         renderModelState(application.modelLifetime.state())
         switchKeyboardButton?.visibility = if (offersKeyboardSwitch()) View.VISIBLE else View.GONE
+    }
+
+    /**
+     * The composing region and the cursor move independently; the boundary
+     * of a live take is only known while the cursor is at the region's end.
+     */
+    override fun onUpdateSelection(
+        oldSelStart: Int,
+        oldSelEnd: Int,
+        newSelStart: Int,
+        newSelEnd: Int,
+        candidatesStart: Int,
+        candidatesEnd: Int,
+    ) {
+        super.onUpdateSelection(oldSelStart, oldSelEnd, newSelStart, newSelEnd, candidatesStart, candidatesEnd)
+        cursorAtComposingEnd = BoundaryDelivery.cursorAtComposingEnd(newSelStart, newSelEnd, candidatesStart, candidatesEnd)
     }
 
     /**
@@ -744,6 +764,7 @@ class VoiceInputService : InputMethodService() {
             text,
             verbatim,
             composing = current.composedText.takeIf { current.composing },
+            anchored = !current.composing || cursorAtComposingEnd,
         )
         if (!result.committed) return null
         current.composing = false
@@ -819,12 +840,13 @@ class VoiceInputService : InputMethodService() {
             statusView?.setText(R.string.staging_insert_failed)
             return
         }
-        val status = if (staged.mode.delivery == INSERT_ENTER && !pressEditorAction(connection)) {
-            R.string.staging_no_action
+        if (staged.mode.delivery == INSERT_ENTER && !pressEditorAction(connection)) {
+            // Both outcomes are reported: no action, and an unsaved derived revision.
+            val unsaved = getString(R.string.keyboard_derived_unsaved).takeIf { current.derivedUnsaved }
+            endTake(current, R.string.staging_no_action, detail = unsaved, shown = delivered.text)
         } else {
-            insertedStatus(current, delivered)
+            endTake(current, insertedStatus(current, delivered), shown = delivered.text)
         }
-        endTake(current, status, shown = delivered.text)
     }
 
     /**

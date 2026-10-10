@@ -117,8 +117,9 @@ sent to any processing provider.
   so a field showing its hint already reads as `""`.
 - Live composing text gets the boundary read when the composing region
   starts; the final re-reads, with the take's own composing text cut from
-  the text before the cursor (when the cursor has left that region, the
-  boundary is unknown and the text goes in unchanged).
+  the text before the cursor. When the cursor has left that region (the
+  editor's `onUpdateSelection` candidates span, or the suffix no longer
+  matching), the boundary is unknown and the text goes in unchanged.
 - An adjusted delivery is stored on the recording as a derived revision
   (`provenance: "insertion-boundary"`, the rule kinds, the text it was
   derived from); the transcript and its revisions are not edited.

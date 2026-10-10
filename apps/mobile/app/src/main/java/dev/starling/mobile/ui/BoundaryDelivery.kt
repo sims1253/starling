@@ -73,6 +73,8 @@ object BoundaryDelivery {
         raw: String,
         verbatim: Boolean,
         composing: String? = null,
+        /** False when the boundary is known to be lost (see [cursorAtComposingEnd]): nothing is read. */
+        anchored: Boolean = true,
     ): Result {
         // An empty text has no boundary; nothing is read for it.
         if (raw.isEmpty()) return Result(connection.commitText(raw, 1), raw, emptyList(), null)
@@ -81,12 +83,21 @@ object BoundaryDelivery {
             verbatim -> Skip.VERBATIM
             else -> null
         }
-        val context = if (skipped == null) context(connection, field, composing) else null
+        val context = if (skipped == null && anchored) context(connection, field, composing) else null
         val adjusted = context?.let { InsertionBoundary.adjust(raw, it, verbatim = false) }
             ?: InsertionBoundary.Adjustment(raw, emptyList())
         val committed = connection.commitText(adjusted.text, 1)
         return Result(committed, adjusted.text, adjusted.changes, skipped ?: Skip.UNREADABLE.takeIf { context == null })
     }
+
+    /**
+     * Whether the cursor still sits at the end of the composing region, from
+     * the editor's last `onUpdateSelection`: only then does the text before
+     * the cursor end with the region. An editor that reports no region
+     * (`-1`) leaves it to [context]'s suffix check.
+     */
+    fun cursorAtComposingEnd(selStart: Int, selEnd: Int, candidatesStart: Int, candidatesEnd: Int): Boolean =
+        candidatesStart < 0 || candidatesEnd < 0 || (selStart == selEnd && selEnd == candidatesEnd)
 
     /** The rules applied to [raw] without writing anything, for live composing text. */
     fun adjust(raw: String, context: InsertionBoundary.Context?, verbatim: Boolean): String =

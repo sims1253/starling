@@ -282,4 +282,31 @@ class BoundaryDeliveryTest {
         val context = BoundaryDelivery.context(connection, field())!!
         assertEquals(BoundaryDelivery.WINDOW, context.before.length)
     }
+
+    @Test
+    fun aLostComposingAnchorDeliversUnchangedWithoutReading() {
+        // "word next. next": the take composes the first " next", the cursor
+        // sits after the second; the suffix alone would match.
+        val connection = FakeConnection("word next. next")
+        val result = BoundaryDelivery.deliver(
+            connection,
+            field(),
+            "Next",
+            verbatim = false,
+            composing = " next",
+            anchored = BoundaryDelivery.cursorAtComposingEnd(15, 15, 4, 9),
+        )
+        assertEquals(0, connection.reads)
+        assertEquals("Next", result.text)
+        assertEquals(BoundaryDelivery.Skip.UNREADABLE, result.skipped)
+    }
+
+    @Test
+    fun theCursorAtTheComposingEndIsAnchored() {
+        assertTrue(BoundaryDelivery.cursorAtComposingEnd(9, 9, 4, 9))
+        assertFalse(BoundaryDelivery.cursorAtComposingEnd(15, 15, 4, 9))
+        assertFalse(BoundaryDelivery.cursorAtComposingEnd(4, 9, 4, 9))
+        // No region reported: the suffix check decides.
+        assertTrue(BoundaryDelivery.cursorAtComposingEnd(15, 15, -1, -1))
+    }
 }

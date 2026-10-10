@@ -1,6 +1,8 @@
 package dev.starling.mobile
 
 import android.text.InputType
+import android.text.Selection
+import android.view.inputmethod.BaseInputConnection
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputConnection
 import android.widget.EditText
@@ -10,6 +12,7 @@ import androidx.test.platform.app.InstrumentationRegistry
 import dev.starling.mobile.ui.BoundaryDelivery
 import dev.starling.mobile.ui.EditorField
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -75,6 +78,29 @@ class BoundaryDeliveryDeviceTest {
         assertEquals("The quick brown fox jum", text(editor))
         deliver(editor, "Fox jumps", composing = " fox jum")
         assertEquals("The quick brown fox jumps", text(editor))
+    }
+
+    @Test
+    fun aCursorMovedOffTheComposingRegionLosesTheAnchor() {
+        // The take composes " next" after "word"; the user then taps after a
+        // later " next". The suffix still matches, the editor's span does not.
+        val editor = editor("word")
+        onMain {
+            editor.connection.setComposingText(" next", 1)
+            editor.view.append(". next")
+            editor.view.setSelection(editor.view.text.length)
+            val text = editor.view.text
+            fun anchored() = BoundaryDelivery.cursorAtComposingEnd(
+                Selection.getSelectionStart(text),
+                Selection.getSelectionEnd(text),
+                BaseInputConnection.getComposingSpanStart(text),
+                BaseInputConnection.getComposingSpanEnd(text),
+            )
+            assertEquals("word next. next", text.toString())
+            assertFalse(anchored())
+            editor.view.setSelection(9)
+            assertTrue(anchored())
+        }
     }
 
     @Test
