@@ -31,7 +31,7 @@ use starling_processing::staging::{Attempt, Draft, Outcome, RegionKind};
 
 use crate::app::{PendingFocus, StarlingApp};
 use crate::editor::{EditorEvent, StagingEditor, TextEdit};
-use crate::live_stream::Partial;
+use starling_runtime_host::live::stream::Partial;
 use crate::processing::{Decision, ProcessingState, TakeProcessing, draft_from_doc};
 use crate::store::{ProcessingDoc, ProposalRow};
 

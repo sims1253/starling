@@ -15,7 +15,7 @@ use starling_dictation::{
 };
 
 use crate::app::{HealthCheckPurpose, StarlingApp, UnsavedWav};
-use crate::live_stream::LiveStream;
+use starling_runtime_host::live::stream::LiveStream;
 use crate::store::{AudioPin, Store};
 
 /// A take's endpoint/model binding (#363), resolved once at the moment

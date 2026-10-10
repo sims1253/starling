@@ -41,6 +41,8 @@
 //!   attempts, the recorder's journal tree).
 //! - [`cli`] — the command line, shared by this crate's binary and the
 //!   app's `--runtime-host`.
+//! - [`live`] — live transcription while a take records: the `/stream`
+//!   client and the worker pumping the take's audio into it.
 //!
 //! # Worker supervision boundary (recorded precisely)
 //!
@@ -87,6 +89,7 @@ pub mod config;
 pub mod engine;
 pub mod frame;
 pub mod limits;
+pub mod live;
 pub mod mcp;
 pub mod platform;
 pub mod recovery;

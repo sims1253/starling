@@ -34,8 +34,8 @@ use starling_runtime_host::frame::TakeOwner;
 use crate::activation::{CancelReason, TakeId};
 use crate::app::StarlingApp;
 use crate::host_link::{HostLink, HostUpdate, LiveCapture, TakeFeed, TakeUpdate};
-use crate::live_stream::LiveStream;
-use crate::stream_pump::Handoff;
+use starling_runtime_host::live::pump::Handoff;
+use starling_runtime_host::live::stream::LiveStream;
 use crate::store::Recognition;
 use crate::upload::{TakeTarget, refresh_sessions};
 

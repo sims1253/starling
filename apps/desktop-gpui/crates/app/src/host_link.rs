@@ -32,7 +32,7 @@ use starling_runtime_host::client::{EventWire, HostClient, TakeWire};
 use starling_runtime_host::frame::{HostRecovery, TakeOwner};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
-use crate::stream_pump::AudioTap;
+use starling_runtime_host::live::pump::AudioTap;
 
 /// How long a host this app started stays up with nothing to do.
 const HOST_IDLE_EXIT: Duration = Duration::from_secs(60);
@@ -770,7 +770,7 @@ impl TakeFeed {
     }
 }
 
-impl AudioTap for Arc<TakeFeed> {
+impl AudioTap for TakeFeed {
     fn drain(&self) -> Vec<f32> {
         let mut state = lock(&self.state);
         let drained = state.samples[state.drained..].to_vec();

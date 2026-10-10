@@ -8,7 +8,6 @@ mod delivery;
 mod editor;
 mod host_link;
 mod input;
-mod live_stream;
 mod mic;
 mod overlay;
 mod portal;

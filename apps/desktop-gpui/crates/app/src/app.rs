@@ -558,9 +558,9 @@ pub struct StarlingApp {
     pub(crate) host: crate::remote_take::HostState,
     /// The take's live stream worker (#357) and its generation, which
     /// previews still arriving from an earlier take's worker do not match.
-    pub(crate) stream_pump: Option<crate::stream_pump::StreamPump<crate::live_stream::LiveStream>>,
+    pub(crate) stream_pump: Option<starling_runtime_host::live::pump::StreamPump<starling_runtime_host::live::stream::LiveStream>>,
     pub(crate) stream_generation: u64,
-    pub(crate) stream_trace: Option<std::sync::Arc<crate::stream_pump::StreamTrace>>,
+    pub(crate) stream_trace: Option<std::sync::Arc<starling_runtime_host::live::trace::StreamTrace>>,
     /// The preview cadence takes ask `/stream` for (#357).
     pub(crate) live_preview: LivePreviewSettings,
     pub(crate) draft_live_preview: LivePreviewSettings,
