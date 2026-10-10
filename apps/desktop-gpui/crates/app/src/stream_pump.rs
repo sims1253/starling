@@ -552,8 +552,11 @@ impl StreamTrace {
             map.insert("take".into(), self.take.clone().into());
             map.insert("ms".into(), ms.into());
         }
+        // One write per line: every take appends to the same file through
+        // its own handle, and a take's final can land during the next take.
+        let line = format!("{fields}\n");
         if let Ok(mut out) = self.out.lock() {
-            let _ = writeln!(out, "{fields}");
+            let _ = out.write_all(line.as_bytes());
         }
     }
 
@@ -940,9 +943,11 @@ mod tests {
         let audio = speech(0, 16_000 * 60);
         tap.capture(&audio);
         tap.acknowledge_all();
+        let deadline = Instant::now() + Duration::from_secs(5);
         while stream.0.lock().unwrap().sends_started == 0 && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(1));
         }
+        assert!(stream.0.lock().unwrap().sends_started > 0, "a send is in flight");
         let stopped = Instant::now();
         let handoff = pump.finish();
         // Only the frame in flight finishes; a step without the stop check
