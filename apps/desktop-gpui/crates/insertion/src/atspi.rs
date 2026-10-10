@@ -124,7 +124,9 @@ impl AtspiReader {
                 let address = match std::env::var("AT_SPI_BUS_ADDRESS") {
                     Ok(address) if !address.is_empty() => address,
                     _ => {
-                        let session = Connection::session()?;
+                        let session = zbus::blocking::connection::Builder::session()?
+                            .method_timeout(CALL_TIMEOUT)
+                            .build()?;
                         let reply = session.call_method(
                             Some("org.a11y.Bus"),
                             "/org/a11y/bus",
@@ -427,11 +429,14 @@ impl Bus<'_> {
 
     /// Depth-first through showing objects, within [`WALK_NODES`] and
     /// [`WALK_TIME`]; descendants of a `MANAGES_DESCENDANTS` container
-    /// (long lists and tables) are not walked.
+    /// (long lists and tables) are not walked. The whole showing tree is
+    /// walked, so a second focused object is seen: then, or over budget,
+    /// there is no answer.
     fn walk_for_focus(&self, name: &str, window: &str) -> zbus::Result<Option<OwnedObjectPath>> {
         let deadline = Instant::now() + WALK_TIME;
         let mut stack: Vec<Object> = self.children(name, window)?;
         let mut visited = 0;
+        let mut found = None;
         while let Some((owner, path)) = stack.pop() {
             visited += 1;
             if visited > WALK_NODES || Instant::now() > deadline {
@@ -445,7 +450,12 @@ impl Bus<'_> {
                 continue;
             };
             if states.has(STATE_FOCUSED) {
-                return Ok(Some(path));
+                if found.is_some() {
+                    log::debug!("AT-SPI: more than one focused object; reading none");
+                    return Ok(None);
+                }
+                found = Some(path);
+                continue;
             }
             if !states.has(STATE_SHOWING) || states.has(STATE_MANAGES_DESCENDANTS) {
                 continue;
@@ -455,7 +465,7 @@ impl Bus<'_> {
                 stack.extend(children.into_iter().rev());
             }
         }
-        Ok(None)
+        Ok(found)
     }
 }
 

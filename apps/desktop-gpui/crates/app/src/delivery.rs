@@ -83,15 +83,23 @@ fn typing_budget(text: &str) -> Duration {
 pub(crate) struct Capture {
     pub target: Result<TargetSnapshot, InsertError>,
     pub at: Instant,
-    /// The target's focused field, once the capture worker located it
+    /// The target's focused field, once the capture worker looked for it
     /// (after the capture's answer, so never within its budget).
     pub field: FieldSlot,
     /// The mode the take was dictated in.
     pub mode: &'static ModeEntry,
 }
 
-/// Where a capture's focused field is, set by the capture worker.
-pub(crate) type FieldSlot = Arc<std::sync::OnceLock<FieldAnchor>>;
+/// Where a capture's focused field is: set by the capture worker once it
+/// looked, `None` when it found none (or not in time).
+pub(crate) type FieldSlot = Arc<std::sync::OnceLock<Option<FieldAnchor>>>;
+
+/// How long after the capture's answer the field may be located: focus
+/// moving to another field of the same window in between could not be
+/// told apart, so a later answer is not taken. Also how long typing waits
+/// for a lookup still running (a Paste last types right after its
+/// capture).
+const LOCATE_BUDGET: Duration = Duration::from_millis(250);
 
 /// What the insertion-boundary rules made of a delivered text (#341).
 #[derive(Clone, Debug, PartialEq)]
@@ -104,7 +112,8 @@ pub(crate) struct Adjusted {
 /// The text to type for `text` at `target`: adjusted by the
 /// insertion-boundary rules where the field located at capture reports
 /// its text before the caret. Nothing is read for a verbatim delivery.
-/// Blocking (a field read is an accessibility-bus round trip).
+/// Blocking: waits up to [`LOCATE_BUDGET`] for a lookup still running,
+/// and a field read is an accessibility-bus round trip.
 fn boundary_text(
     inserter: &Inserter,
     target: &TargetSnapshot,
@@ -115,7 +124,12 @@ fn boundary_text(
     if verbatim {
         return None;
     }
-    let Surrounding::Text(surrounding) = inserter.surrounding_text(target, field.get()) else {
+    let waited_until = Instant::now() + LOCATE_BUDGET;
+    while field.get().is_none() && Instant::now() < waited_until {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let anchor = field.get().and_then(Option::as_ref);
+    let Surrounding::Text(surrounding) = inserter.surrounding_text(target, anchor) else {
         return None;
     };
     let context = BoundaryContext {
@@ -160,6 +174,9 @@ const MAX_ABANDONED_CAPTURES: usize = 2;
 #[derive(Default)]
 pub(crate) struct CaptureWorkers {
     state: Mutex<Workers>,
+    /// A field lookup is running: at most one is ever out, so an
+    /// accessibility bus that stopped answering costs one thread.
+    locating: Arc<AtomicBool>,
 }
 
 #[derive(Default)]
@@ -247,6 +264,7 @@ fn bounded_capture_after(
     };
     let (sender, receiver) = mpsc::channel();
     let guard = CaptureGuard(workers.clone(), id);
+    let locating = workers.locating.clone();
     let spawned = std::thread::Builder::new()
         .name("starling-capture".into())
         .spawn(move || {
@@ -257,10 +275,16 @@ fn bounded_capture_after(
             drop(guard);
             let located = target.as_ref().ok().cloned();
             let _ = sender.send((target, answered));
-            if let (Some(slot), Some(target)) = (locate, located) {
-                if let Some(field) = inserter.locate_field(&target) {
-                    let _ = slot.set(field);
-                }
+            if let Some(slot) = locate {
+                let field = located.and_then(|target| {
+                    if locating.swap(true, Ordering::SeqCst) {
+                        return None;
+                    }
+                    let _lookup = OutGuard(locating);
+                    let field = inserter.locate_field(&target)?;
+                    (answered.elapsed() <= LOCATE_BUDGET).then_some(field)
+                });
+                let _ = slot.set(field);
             }
         });
     if let Err(error) = spawned {
@@ -882,7 +906,11 @@ impl StarlingApp {
         let typed_text = text.clone();
         let mode = capture.mode;
         let field = capture.field.clone();
-        let verbatim = crate::processing::delivers_verbatim(mode, &text);
+        // Routed on the transcript, not on `text`: processing may have
+        // dropped the spoken override that made the take verbatim.
+        let transcript = self.transcript_for(&id);
+        let verbatim =
+            crate::processing::delivers_verbatim(mode, transcript.as_deref().unwrap_or(&text));
         let previous = self.delivery.last_insert.take();
         // The adjusted text is at most a space longer.
         let budget = typing_budget(&text) + Duration::from_millis(20);
@@ -977,6 +1005,19 @@ impl StarlingApp {
             }
         }
         cx.notify();
+    }
+
+    /// Take `id`'s own transcript (a retry's own result first), before
+    /// any processing.
+    fn transcript_for(&self, id: &str) -> Option<String> {
+        self.own_result(id).or_else(|| {
+            self.sessions
+                .iter()
+                .find(|session| session.id == id)?
+                .transcript
+                .as_ref()
+                .map(|transcript| transcript.text.clone())
+        })
     }
 
     /// Stores an adjusted delivery as a revision derived from `source`
@@ -1831,7 +1872,7 @@ mod tests {
             vec![starling_runtime_host::history::BoundaryRevision {
                 text: " fox jumps.".to_string(),
                 source_text: "Fox jumps.".to_string(),
-                derived_from: Some(1),
+                derived_from: Some(format!("{id}#h1")),
                 changes: vec!["leading_space".into(), "first_letter_case".into()],
             }]
         );
@@ -1904,6 +1945,42 @@ mod tests {
             assert!(boundary.is_empty(), "{id}: {boundary:?}");
         }
         let _ = app;
+    }
+
+    /// A field found later than [`LOCATE_BUDGET`] after the capture is
+    /// not taken: focus may have moved to another field of the window.
+    #[gpui::test]
+    fn a_field_located_too_late_is_not_read(cx: &mut gpui::TestAppContext) {
+        let (app, fake, fields) = app_with_fields(cx, None, "clean-local");
+        fields.focus_text("The quick brown");
+        fields.set_locate_delay(LOCATE_BUDGET * 2);
+        located_take(&app, cx, "take-1", "Fox jumps.", true, || {});
+        assert_eq!(fields.locates(), 1);
+        assert_eq!(fields.text_reads(), 0);
+        assert_eq!(fake.insertions()[0].1, "Fox jumps.");
+    }
+
+    /// Verbatim follows the transcript's routing, also when the text
+    /// delivered (a processed draft) no longer carries the override.
+    #[gpui::test]
+    fn a_take_routed_verbatim_stays_verbatim_after_processing(cx: &mut gpui::TestAppContext) {
+        let (app, fake, fields) = app_with_fields(cx, None, "clean-local");
+        fields.focus_text("The quick brown");
+        app.update(cx, |app, _| {
+            app.delivery_take_started();
+            let capture = app.delivery_take_stopped();
+            app.bind_delivery(capture, "take-1");
+            app.sessions.push(session("take-1", "literal Fox jumps."));
+        });
+        field_located(&app, cx, "take-1");
+        app.update(cx, |app, cx| {
+            let capture = app.delivery.by_take.remove("take-1").unwrap();
+            let target = capture.target.clone().unwrap();
+            app.spawn_insert("take-1".into(), target, "Fox jumps.".into(), &capture, None, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(fields.text_reads(), 0);
+        assert_eq!(fake.insertions()[0].1, "Fox jumps.");
     }
 
     #[gpui::test]

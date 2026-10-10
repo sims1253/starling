@@ -428,6 +428,15 @@ fn a_toolkit_without_collection_is_walked() {
 }
 
 #[test]
+fn a_walk_that_finds_two_focused_objects_locates_none() {
+    let bus = private_bus!();
+    let gtk4 = app(&bus, &[ROLE_ENTRY, ROLE_ENTRY], false);
+    gtk4.fields[1].focus(true);
+    let _registry = registry(&bus, &[&gtk4]);
+    assert_eq!(reader(&bus).locate(&target(Some(std::process::id()))), None);
+}
+
+#[test]
 fn a_password_field_is_protected_and_never_read() {
     let bus = private_bus!();
     let app = app(&bus, &[ROLE_PASSWORD_TEXT], true);

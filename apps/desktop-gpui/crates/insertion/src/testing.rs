@@ -370,6 +370,8 @@ struct FieldsState {
     focused: Option<(FieldAnchor, Option<String>)>,
     next_path: u32,
     locates: usize,
+    /// How long `locate` takes, like a big accessibility tree.
+    locate_delay: std::time::Duration,
     /// Reads that returned a field's text.
     text_reads: usize,
 }
@@ -417,6 +419,11 @@ impl FakeFields {
         self.state().focused = None;
     }
 
+    /// Make `locate` take `delay` before it answers.
+    pub fn set_locate_delay(&self, delay: std::time::Duration) {
+        self.state().locate_delay = delay;
+    }
+
     pub fn locates(&self) -> usize {
         self.state().locates
     }
@@ -429,6 +436,10 @@ impl FakeFields {
 
 impl FieldReader for FakeFields {
     fn locate(&self, _target: &TargetSnapshot) -> Option<FieldAnchor> {
+        let delay = self.state().locate_delay;
+        if !delay.is_zero() {
+            std::thread::sleep(delay);
+        }
         let mut state = self.state();
         state.locates += 1;
         state.focused.as_ref().map(|(anchor, _)| anchor.clone())
