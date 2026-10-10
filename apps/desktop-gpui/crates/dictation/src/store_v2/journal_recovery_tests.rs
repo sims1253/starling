@@ -1,0 +1,218 @@
+//! Startup recovery of the recorder's live-capture tree (#356): takes
+//! whose app stopped mid-recording, or between stop and save, come back
+//! as interrupted takes with their confirmed audio; live and freshly
+//! finished journals are left to their owners; nothing is deleted.
+
+use super::*;
+use tempfile::TempDir;
+
+fn store_in(dir: &TempDir) -> StoreV2 {
+    StoreV2::open(dir.path().join("v2")).expect("open v2 store")
+}
+
+fn journals(dir: &TempDir) -> PathBuf {
+    let tree = dir.path().join("v2").join("journals");
+    std::fs::create_dir_all(&tree).expect("journals tree");
+    tree
+}
+
+fn ramp(len: usize, offset: u32) -> Vec<f32> {
+    (0..len)
+        .map(|i| ((offset as usize + i) % 997) as f32 * 0.0001)
+        .collect()
+}
+
+/// Backdate a file so it reads as written `age` ago.
+fn age(path: &Path, age: std::time::Duration) {
+    let file = OpenOptions::new().write(true).open(path).expect("open");
+    file.set_modified(std::time::SystemTime::now() - age)
+        .expect("set mtime");
+}
+
+fn old() -> std::time::Duration {
+    FINALIZED_ADOPTION_GRACE + std::time::Duration::from_secs(5)
+}
+
+#[test]
+fn a_take_killed_mid_recording_comes_back_with_its_confirmed_audio() {
+    let dir = TempDir::new().expect("tempdir");
+    let mut store = store_in(&dir);
+    let tree = journals(&dir);
+    let confirmed = ramp(32_000, 0);
+    let path = {
+        let mut writer =
+            JournalWriter::create_named(&tree, "j_killed".to_string(), 16_000).expect("writer");
+        writer.append_frames(&confirmed).expect("append");
+        writer.write_boundary().expect("boundary");
+        // Written after the last boundary: never confirmed, and torn off
+        // by the kill.
+        writer.append_frames(&ramp(800, 7)).expect("tail");
+        writer.path().to_path_buf()
+        // The writer drops here without a trailer: the process died.
+    };
+
+    let report = store.recover_capture_journals(&tree).expect("scan");
+    assert_eq!(report.recovered.len(), 1, "{report:?}");
+    assert!(report.failed.is_empty() && report.deferred.is_empty(), "{report:?}");
+    assert_eq!(report.recovered[0].samples, 32_000);
+    assert!(!path.exists(), "the journal moved into the store");
+
+    let record = store.get_capture("j_killed").expect("row").expect("present");
+    assert_eq!(record.status, CaptureStatus::Interrupted);
+    // Everything recovered is confirmed: the ack watermark is the whole
+    // recovered take, never more.
+    assert_eq!(record.frame_count, 32_000);
+    assert_eq!(record.ack_sample_index, 32_000);
+    let note = record.recovery_note().expect("note");
+    assert!(note.contains("Recovered 2.0 s"), "{note}");
+    assert!(note.contains("confirmed on disk"), "{note}");
+    assert!(note.contains("discarded"), "the torn tail is named: {note}");
+
+    // Playable/exportable: the stored audio is exactly the confirmed
+    // samples.
+    let audio = store.load_audio("j_killed").expect("audio");
+    assert_eq!(audio.samples, confirmed);
+
+    // Retryable: a recognition attempt starts and settles on it.
+    store
+        .begin_recognition("j_killed", "engine:test", None)
+        .expect("retry begins");
+    store
+        .finish_recognition(
+            "j_killed",
+            RecognitionOutcome::Completed {
+                text: "words",
+                extra_json: None,
+            },
+        )
+        .expect("retry finishes");
+
+    // A second launch finds nothing left to recover.
+    let again = store.recover_capture_journals(&tree).expect("rescan");
+    assert!(again.recovered.is_empty(), "{again:?}");
+}
+
+#[test]
+fn a_journal_still_being_written_is_left_to_its_writer() {
+    let dir = TempDir::new().expect("tempdir");
+    let mut store = store_in(&dir);
+    let tree = journals(&dir);
+    let mut writer =
+        JournalWriter::create_named(&tree, "j_live".to_string(), 16_000).expect("writer");
+    writer.append_frames(&ramp(1_600, 0)).expect("append");
+    writer.write_boundary().expect("boundary");
+    let path = writer.path().to_path_buf();
+    // Even an old file is live while its writer holds it.
+    age(&path, old());
+
+    let report = store.recover_capture_journals(&tree).expect("scan");
+    assert_eq!(report.deferred, vec!["j_live".to_string()]);
+    assert!(report.recovered.is_empty());
+    assert!(path.exists(), "a live take's journal is never touched");
+    assert!(store.get_capture("j_live").expect("read").is_none());
+
+    // Once the writer is gone, the next launch recovers it.
+    drop(writer);
+    let report = store.recover_capture_journals(&tree).expect("rescan");
+    assert_eq!(report.recovered.len(), 1, "{report:?}");
+}
+
+#[test]
+fn a_freshly_finished_journal_is_left_for_its_save_then_recovered_whole() {
+    let dir = TempDir::new().expect("tempdir");
+    let mut store = store_in(&dir);
+    let tree = journals(&dir);
+    let samples = ramp(4_800, 3);
+    let path = {
+        let mut writer =
+            JournalWriter::create_named(&tree, "j_stopped".to_string(), 16_000).expect("writer");
+        writer.append_frames(&samples).expect("append");
+        writer.finalize().expect("finalize");
+        writer.path().to_path_buf()
+    };
+
+    // Just stopped: a live instance may be saving it right now.
+    let report = store.recover_capture_journals(&tree).expect("scan");
+    assert_eq!(report.deferred, vec!["j_stopped".to_string()]);
+    assert!(path.exists());
+
+    // Still there a while later: its app stopped between stop and save.
+    age(&path, old());
+    let report = store.recover_capture_journals(&tree).expect("rescan");
+    assert_eq!(report.recovered.len(), 1, "{report:?}");
+    let record = store.get_capture("j_stopped").expect("row").expect("present");
+    assert_eq!(record.status, CaptureStatus::Interrupted);
+    let note = record.recovery_note().expect("note");
+    assert!(note.contains("complete recording (0.3 s)"), "{note}");
+    assert_eq!(store.load_audio("j_stopped").expect("audio").samples, samples);
+    assert!(report.summary().contains("Recovered 1 recording"), "{}", report.summary());
+}
+
+#[test]
+fn unreadable_and_empty_files_are_kept_and_other_entries_ignored() {
+    let dir = TempDir::new().expect("tempdir");
+    let mut store = store_in(&dir);
+    let tree = journals(&dir);
+    std::fs::write(tree.join("j_junk.sj"), b"not a journal at all").expect("junk");
+    std::fs::write(tree.join("notes.txt"), b"hand-dropped").expect("stray");
+    std::fs::create_dir_all(tree.join("deleted")).expect("legacy tombstones");
+    std::fs::write(tree.join("deleted").join("j_gone.sj"), b"tombstoned").expect("gone");
+    // Header only: the take died before its first boundary.
+    let empty = {
+        let writer =
+            JournalWriter::create_named(&tree, "j_empty".to_string(), 16_000).expect("writer");
+        writer.path().to_path_buf()
+    };
+    age(&empty, old());
+
+    let report = store.recover_capture_journals(&tree).expect("scan");
+    assert!(report.recovered.is_empty(), "{report:?}");
+    assert_eq!(report.unrecognized.len(), 1, "{report:?}");
+    assert!(!tree.join("j_junk.sj").exists());
+    assert_eq!(
+        std::fs::read(tree.join("j_junk.sj.unrecognized")).expect("kept aside"),
+        b"not a journal at all"
+    );
+    assert!(empty.exists(), "an empty journal stays where it is");
+    assert!(tree.join("notes.txt").exists());
+    assert!(tree.join("deleted").join("j_gone.sj").exists());
+    assert!(report.summary().contains(".unrecognized"), "{}", report.summary());
+
+    // The aside file is not rescanned.
+    let again = store.recover_capture_journals(&tree).expect("rescan");
+    assert!(again.unrecognized.is_empty(), "{again:?}");
+}
+
+#[test]
+fn a_superseded_journal_is_kept_but_never_recovered_twice() {
+    let dir = TempDir::new().expect("tempdir");
+    let mut store = store_in(&dir);
+    let tree = journals(&dir);
+    let path = {
+        let mut writer =
+            JournalWriter::create_named(&tree, "j_faulted".to_string(), 16_000).expect("writer");
+        writer.append_frames(&ramp(1_600, 0)).expect("append");
+        writer.write_boundary().expect("boundary");
+        writer.path().to_path_buf()
+    };
+    age(&path, old());
+
+    supersede_capture_journal(&path).expect("supersede");
+    assert!(!path.exists());
+    assert!(tree.join(SUPERSEDED_SUBDIR).join("j_faulted.sj").exists());
+    // Superseding what is already gone is fine.
+    supersede_capture_journal(&path).expect("idempotent");
+
+    let report = store.recover_capture_journals(&tree).expect("scan");
+    assert!(report.recovered.is_empty(), "{report:?}");
+}
+
+#[test]
+fn a_missing_journal_tree_is_nothing_to_recover() {
+    let dir = TempDir::new().expect("tempdir");
+    let mut store = store_in(&dir);
+    let report = store
+        .recover_capture_journals(&dir.path().join("no-such-tree"))
+        .expect("scan");
+    assert!(report.recovered.is_empty() && report.summary().is_empty());
+}

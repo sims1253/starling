@@ -120,6 +120,14 @@ impl FileSink {
             .write(true)
             .create_new(true)
             .open(&path)?;
+        // The writer's liveness signal (#356): the startup scan of the
+        // recorder's tree ([`crate::store_v2::StoreV2::recover_capture_journals`])
+        // never adopts a journal whose lock is held — that take is still
+        // being recorded, by this process or another. The OS drops the
+        // lock with the handle, so a killed writer leaves it free.
+        // Best-effort: without a lock the scan falls back on the file's
+        // age.
+        let _ = crate::store_v2::try_flock_exclusive(&file);
         Ok((Self { file, dir: dir.to_path_buf() }, path))
     }
 }

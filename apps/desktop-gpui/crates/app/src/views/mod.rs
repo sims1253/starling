@@ -4,7 +4,7 @@
 
 mod capture;
 mod delivery;
-mod drawer;
+pub(crate) mod drawer;
 mod feedback;
 mod history;
 mod live_preview;

@@ -739,6 +739,19 @@ impl V2CaptureStore {
             };
             return Err(chained_with_rollback(err, rollback));
         }
+        drop(store);
+        // #356: the take is stored from its samples; a journal it left in
+        // the recorder's tree must not come back as a second, partial take
+        // at the next startup recovery. Kept, never deleted.
+        if let Some(report) = &take.journal {
+            if let Err(err) = starling_dictation::store_v2::supersede_capture_journal(&report.path) {
+                report_divergence(format!(
+                    "the stored take's capture journal {} could not be moved aside ({err}); \
+                     startup recovery may list it as an interrupted copy",
+                    report.path.display()
+                ));
+            }
+        }
         Ok(())
     }
 }

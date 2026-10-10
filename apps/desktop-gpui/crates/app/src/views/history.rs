@@ -120,6 +120,9 @@ fn row_data(app: &StarlingApp, session: &SessionSummary) -> RowData {
                 // I1 phase 2: recovered from a journal / salvaged after a
                 // quiesce timeout — the audio is here and retryable.
                 "Recovered. Retry available".to_string()
+            } else if session.status == SessionStatus::Transcribed {
+                // #356: an empty answer is a result, not a pending send.
+                "Empty transcript. Retry available".to_string()
             } else {
                 "Sending to server…".to_string()
             }
@@ -135,6 +138,10 @@ fn row_data(app: &StarlingApp, session: &SessionSummary) -> RowData {
     }
     if session.archival {
         meta.push_str(" · archival");
+    }
+    // #356: the take's own interruption stays visible after a retry.
+    if session.interrupted && session.status != SessionStatus::Interrupted {
+        meta.push_str(" · interrupted");
     }
 
     RowData {

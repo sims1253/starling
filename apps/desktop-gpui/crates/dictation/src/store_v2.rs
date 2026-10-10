@@ -3562,7 +3562,38 @@ impl StoreV2 {
         source: impl AsRef<Path>,
         note: Option<&str>,
     ) -> Result<CaptureRecord, StoreV2Error> {
-        let source = source.as_ref();
+        self.adopt_journal_with(source.as_ref(), None, |facts| {
+            let recovery_note = match (facts.torn_tail_bytes, facts.was_finalized) {
+                (torn, _) if torn > 0 => Some(format!(
+                    "Adopted from a capture journal whose last {torn} bytes were an \
+                     unfinished write; they were discarded (gap flagged, never joined)."
+                )),
+                (_, false) => Some(
+                    "Adopted from a capture journal that was never finalized; audio up \
+                     to the last verified boundary was kept."
+                        .to_string(),
+                ),
+                (_, true) => None,
+            };
+            [note.map(str::to_string), recovery_note]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+    }
+
+    /// The body of [`Self::adopt_journal`]: `note` words the row's
+    /// recovery note from what the verified read found (an empty note
+    /// stores none), and `status`, when set, is the row's status in the
+    /// same commit — otherwise a torn or unfinalized journal lands
+    /// interrupted and a sealed one complete.
+    fn adopt_journal_with(
+        &mut self,
+        source: &Path,
+        status: Option<CaptureStatus>,
+        note: impl FnOnce(&AdoptedJournal) -> String,
+    ) -> Result<CaptureRecord, StoreV2Error> {
         let id = source
             .file_stem()
             .and_then(|stem| stem.to_str())
@@ -3609,25 +3640,13 @@ impl StoreV2 {
         std::fs::rename(source, &destination)?;
         sync_dir(&self.root.join(AUDIO_DIR))?;
 
-        let recovery_note = match (torn_tail_bytes, was_finalized) {
-            (torn, _) if torn > 0 => Some(format!(
-                "Adopted from a capture journal whose last {torn} bytes were an \
-                 unfinished write; they were discarded (gap flagged, never joined)."
-            )),
-            (_, false) => Some(
-                "Adopted from a capture journal that was never finalized; audio up \
-                 to the last verified boundary was kept."
-                    .to_string(),
-            ),
-            (_, true) => None,
-        };
-        let note = [note.map(str::to_string), recovery_note]
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>()
-            .join(" ");
-
         let count = parsed.samples.len() as u64;
+        let note = note(&AdoptedJournal {
+            samples: count,
+            sample_rate: parsed.sample_rate,
+            torn_tail_bytes,
+            was_finalized,
+        });
         let record = CaptureRecord {
             id: id.clone(),
             created_utc: now_iso(),
@@ -3638,17 +3657,133 @@ impl StoreV2 {
             frame_count: count,
             ack_sample_index: count,
             journal_hash: format!("{:016x}", samples_hash(&parsed.samples)),
-            status: if torn_tail_bytes > 0 || !was_finalized {
+            status: status.unwrap_or(if torn_tail_bytes > 0 || !was_finalized {
                 CaptureStatus::Interrupted
             } else {
                 CaptureStatus::Complete
-            },
+            }),
             retention_class: "standard".to_string(),
             extra_json: (!note.is_empty()).then(|| merge_extra_note(None, &note)),
             secure_field: false,
         };
         self.commit_capture(&record)?;
         Ok(record)
+    }
+
+    /// Startup recovery of the recorder's live-capture tree (#356):
+    /// `journals_dir` is where takes journal while they record
+    /// ([`crate::journal::default_journals_root`]). A journal still there
+    /// at startup belongs to a take whose app stopped before saving it —
+    /// killed or crashed mid-recording, or between stop and save — and is
+    /// adopted into history as an interrupted take whose note says what
+    /// survived. [`Self::reconcile`] covers only the store's own trees;
+    /// this is the recorder's half.
+    ///
+    /// What is left alone:
+    ///
+    /// - a journal whose writer lock is held: a live take, recording in
+    ///   this process or another (the writer holds the lock for the
+    ///   file's lifetime; the OS frees it when the writer dies);
+    /// - a finalized journal written in the last
+    ///   [`FINALIZED_ADOPTION_GRACE`]: its take may be between stop and
+    ///   save in a live instance, which adopts it itself — a later launch
+    ///   recovers it if not;
+    /// - a journal with no verified samples (nothing to recover);
+    /// - `deleted/`, `superseded/` and anything not named `*.sj`.
+    ///
+    /// A file that is not a readable journal is renamed to
+    /// `<name>.unrecognized` beside itself — kept, never repaired or
+    /// deleted, and not rescanned. A failed adoption leaves the journal in
+    /// place for the next launch. Never deletes anything.
+    pub fn recover_capture_journals(
+        &mut self,
+        journals_dir: &Path,
+    ) -> Result<JournalRecovery, StoreV2Error> {
+        let mut report = JournalRecovery::default();
+        let Ok(entries) = std::fs::read_dir(journals_dir) else {
+            return Ok(report);
+        };
+        let mut paths: Vec<PathBuf> = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.is_file() && path.extension().and_then(|ext| ext.to_str()) == Some("sj")
+            })
+            .collect();
+        paths.sort();
+        for path in paths {
+            let Some(id) = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            if !is_safe_path_component(&id) {
+                continue;
+            }
+            // The probe's handle keeps the lock through the adoption, so
+            // a second instance scanning at the same moment sees it held.
+            let lock = match File::open(&path) {
+                Ok(file) => file,
+                Err(err) => {
+                    report.failed.push((id, err.to_string()));
+                    continue;
+                }
+            };
+            let free = match try_flock_exclusive(&lock) {
+                Ok(FlockEvidence::Free) => true,
+                Ok(FlockEvidence::Held) | Err(_) => false,
+                // No lock primitive: an unfinalized journal nobody has
+                // written to for a while has no writer.
+                Ok(FlockEvidence::Unknown) => modified_age(&path)
+                    .is_some_and(|age| age >= FINALIZED_ADOPTION_GRACE),
+            };
+            if !free {
+                report.deferred.push(id);
+                continue;
+            }
+            let parsed = match read_journal(&path) {
+                Ok(parsed) => parsed,
+                Err(journal::JournalReadError::NotAJournal(reason)) => {
+                    let aside = path.with_extension("sj.unrecognized");
+                    match std::fs::rename(&path, &aside) {
+                        Ok(()) => {
+                            let _ = sync_dir(journals_dir);
+                            report.unrecognized.push((id, reason));
+                        }
+                        Err(err) => report.failed.push((id, err.to_string())),
+                    }
+                    continue;
+                }
+                Err(err) => {
+                    report.failed.push((id, err.to_string()));
+                    continue;
+                }
+            };
+            if parsed.samples.is_empty() {
+                continue;
+            }
+            if parsed.finalized
+                && modified_age(&path).is_none_or(|age| age < FINALIZED_ADOPTION_GRACE)
+            {
+                report.deferred.push(id);
+                continue;
+            }
+            drop(parsed);
+            match self.adopt_journal_with(&path, Some(CaptureStatus::Interrupted), |facts| {
+                recovered_journal_note(facts)
+            }) {
+                Ok(record) => report.recovered.push(RecoveredJournal {
+                    id,
+                    samples: record.frame_count,
+                    sample_rate: record.actual_rate,
+                }),
+                Err(err) => report.failed.push((id, err.to_string())),
+            }
+            drop(lock);
+        }
+        Ok(report)
     }
 
     /// Saves an encoded WAV as a new capture through the full §4 crash
@@ -4097,6 +4232,143 @@ impl StoreV2 {
                 let _ = std::fs::remove_file(&path);
             }
         }
+    }
+}
+
+/// How long a finalized journal in the recorder's tree is left to the
+/// instance that may still be saving it before startup recovery adopts
+/// it ([`StoreV2::recover_capture_journals`]). A live save adopts within
+/// seconds of the stop.
+pub const FINALIZED_ADOPTION_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// What the verified read of an adopted journal found.
+struct AdoptedJournal {
+    samples: u64,
+    sample_rate: u32,
+    torn_tail_bytes: u64,
+    was_finalized: bool,
+}
+
+/// The note a take recovered from the recorder's tree carries: how much
+/// audio came back, and the durability boundary it came back to.
+fn recovered_journal_note(facts: &AdoptedJournal) -> String {
+    let seconds = facts.samples as f64 / f64::from(facts.sample_rate.max(1));
+    if facts.was_finalized && facts.torn_tail_bytes == 0 {
+        return format!(
+            "Starling closed after this take stopped but before it was saved. The complete \
+             recording ({seconds:.1} s) was recovered."
+        );
+    }
+    let mut note = format!(
+        "Starling closed while this take was recording. Recovered {seconds:.1} s: everything \
+         the capture journal had confirmed on disk. The journal confirms audio at least every \
+         quarter second, so the last moment before Starling closed is missing."
+    );
+    if facts.torn_tail_bytes > 0 {
+        note.push_str(&format!(
+            " An unconfirmed write of {} bytes at the end was discarded (gap flagged, never \
+             joined).",
+            facts.torn_tail_bytes
+        ));
+    }
+    note
+}
+
+/// How long ago `path` was last written; `None` when the filesystem
+/// cannot say (or the clock runs behind the file).
+fn modified_age(path: &Path) -> Option<std::time::Duration> {
+    let modified = std::fs::metadata(path).and_then(|meta| meta.modified()).ok()?;
+    std::time::SystemTime::now().duration_since(modified).ok()
+}
+
+/// Move a recorder journal whose take was stored another way (from its
+/// in-memory WAV, after the journal faulted or could not be adopted)
+/// into `superseded/` beside it (#356): kept — journals are never
+/// deleted outside the retention sweep — but no longer a take startup
+/// recovery would adopt a second time. A journal already gone is fine.
+pub fn supersede_capture_journal(path: &Path) -> Result<(), StoreV2Error> {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+        return Ok(());
+    };
+    if !path.exists() {
+        return Ok(());
+    }
+    let aside = dir.join(SUPERSEDED_SUBDIR);
+    std::fs::create_dir_all(&aside)?;
+    std::fs::rename(path, aside.join(name))?;
+    sync_dir(dir)?;
+    sync_dir(&aside)?;
+    Ok(())
+}
+
+/// Where [`supersede_capture_journal`] keeps journals, under the
+/// recorder's tree.
+pub const SUPERSEDED_SUBDIR: &str = "superseded";
+
+/// What [`StoreV2::recover_capture_journals`] did.
+#[derive(Debug, Default)]
+pub struct JournalRecovery {
+    /// Takes adopted into history as interrupted.
+    pub recovered: Vec<RecoveredJournal>,
+    /// Journals left for a live writer, or for the instance that may
+    /// still be saving them.
+    pub deferred: Vec<String>,
+    /// Files that are not readable journals, renamed aside: `(id, why)`.
+    pub unrecognized: Vec<(String, String)>,
+    /// Journals that could not be adopted this time: `(id, why)`. They
+    /// stay where they are for the next launch.
+    pub failed: Vec<(String, String)>,
+}
+
+/// One take [`StoreV2::recover_capture_journals`] brought back.
+#[derive(Debug, Clone)]
+pub struct RecoveredJournal {
+    pub id: String,
+    /// Verified samples recovered — all of them confirmed on disk.
+    pub samples: u64,
+    pub sample_rate: u32,
+}
+
+impl JournalRecovery {
+    /// One line for the startup banner; empty when there is nothing to
+    /// say.
+    pub fn summary(&self) -> String {
+        let plural = |count: usize| if count == 1 { "" } else { "s" };
+        let mut parts = Vec::new();
+        let recovered = self.recovered.len();
+        if recovered > 0 {
+            parts.push(format!(
+                "Recovered {recovered} recording{} Starling was still recording or saving when \
+                 it closed; {} in your history as interrupted, ready to play, export or \
+                 transcribe.",
+                plural(recovered),
+                if recovered == 1 { "it is" } else { "they are" }
+            ));
+        }
+        if !self.failed.is_empty() {
+            let reasons: Vec<String> = self
+                .failed
+                .iter()
+                .map(|(id, why)| format!("{id}: {why}"))
+                .collect();
+            parts.push(format!(
+                "{} interrupted recording{} could not be recovered yet and stay on disk for the \
+                 next launch ({}).",
+                self.failed.len(),
+                plural(self.failed.len()),
+                reasons.join("; ")
+            ));
+        }
+        if !self.unrecognized.is_empty() {
+            parts.push(format!(
+                "{} file{} in the capture journal folder {} not a readable recording; kept \
+                 aside as .unrecognized.",
+                self.unrecognized.len(),
+                plural(self.unrecognized.len()),
+                if self.unrecognized.len() == 1 { "is" } else { "are" }
+            ));
+        }
+        parts.join(" ")
     }
 }
 
@@ -4691,7 +4963,7 @@ fn validate_document_id(id: &str) -> Result<(), StoreV2Error> {
 
 /// What one marker probe learned about its flock (#213 review).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum FlockEvidence {
+pub(crate) enum FlockEvidence {
     /// The probe acquired the exclusive lock itself (releasing it with the
     /// handle): no live owner anywhere — the OS frees the lock when the
     /// owning process dies.
@@ -4739,7 +5011,7 @@ fn read_recorded_pid(file: &mut File) -> Option<u32> {
 /// it when the owning process dies, which is what makes a leftover marker
 /// file after a crash harmless.
 #[cfg(unix)]
-fn try_flock_exclusive(file: &File) -> io::Result<FlockEvidence> {
+pub(crate) fn try_flock_exclusive(file: &File) -> io::Result<FlockEvidence> {
     use std::os::fd::AsRawFd;
     // SAFETY: flock(2) on an fd this caller owns and keeps open for the
     // lock's lifetime; no close or hand-off happens here.
@@ -4762,7 +5034,7 @@ fn try_flock_exclusive(file: &File) -> io::Result<FlockEvidence> {
 /// locking the record's own bytes would stop every prober from reading
 /// the identity it needs.
 #[cfg(windows)]
-fn try_flock_exclusive(file: &File) -> io::Result<FlockEvidence> {
+pub(crate) fn try_flock_exclusive(file: &File) -> io::Result<FlockEvidence> {
     Ok(if windows_lock::try_lock(file)? {
         FlockEvidence::Free
     } else {
@@ -4774,7 +5046,7 @@ fn try_flock_exclusive(file: &File) -> io::Result<FlockEvidence> {
 /// probe answers [`FlockEvidence::Unknown`] and the marker's recorded PID
 /// decides ownership instead (see [`attempt_owned_from`]).
 #[cfg(not(any(unix, windows)))]
-fn try_flock_exclusive(_file: &File) -> io::Result<FlockEvidence> {
+pub(crate) fn try_flock_exclusive(_file: &File) -> io::Result<FlockEvidence> {
     Ok(FlockEvidence::Unknown)
 }
 
@@ -5474,6 +5746,9 @@ fn lease_alive_from(
 
 #[cfg(test)]
 mod at_rest_tests;
+
+#[cfg(test)]
+mod journal_recovery_tests;
 
 #[cfg(test)]
 mod tests {

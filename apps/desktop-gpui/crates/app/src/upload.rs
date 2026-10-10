@@ -990,7 +990,9 @@ impl StarlingApp {
                             app.bind_staging(token, &saved.id);
                         }
                         app.bind_delivery(delivery, &saved.id);
-                        app.transcribe_with_stream(saved.id, saved.wav, stream, target, None, cx);
+                        app.transcribe_with_stream(
+                            saved.id, saved.wav, stream, target, None, false, cx,
+                        );
                     })
                     .ok();
                 }
@@ -1104,22 +1106,24 @@ impl StarlingApp {
         self.error = Some(message.to_string());
     }
 
-    /// `pin` holds a retried take's audio until its attempt is marked
-    /// started (#342).
-    pub fn transcribe(
+    /// Transcribe a saved take again on `target` (#356): a new attempt
+    /// beside the earlier ones, never typed into an editor — the take's
+    /// own delivery is gone with its first job, and a retried transcript
+    /// is offered for Copy / Paste last instead. `pin` holds the take's
+    /// audio until the attempt is marked started (#342).
+    fn retry_on(
         &mut self,
         id: String,
         wav: Arc<Vec<u8>>,
-        pin: Option<AudioPin>,
+        target: TakeTarget,
+        pin: AudioPin,
         cx: &mut Context<Self>,
     ) {
-        // A retry is a new job: it resolves a fresh target at the moment
-        // it starts (#363) — the engine may serve a different model now,
-        // or the user may have switched to their own server.
-        let target = self.resolve_take_target();
-        self.transcribe_with_stream(id, wav, None, target, pin, cx);
+        self.forget_delivery(&id);
+        self.transcribe_with_stream(id, wav, None, target, Some(pin), true, cx);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn transcribe_with_stream(
         &mut self,
         id: String,
@@ -1127,6 +1131,7 @@ impl StarlingApp {
         stream: Option<LiveStream>,
         mut target: TakeTarget,
         pin: Option<AudioPin>,
+        retry: bool,
         cx: &mut Context<Self>,
     ) {
         if self.active_ids.contains(&id) {
@@ -1202,7 +1207,9 @@ impl StarlingApp {
                             let client = if unready {
                                 Err(ClientError::Input(engine_not_ready_message()))
                             } else {
-                                StarlingClient::new(&endpoint, &model)
+                                StarlingClient::new(&endpoint, &model).and_then(|client| {
+                                    client.with_timeout_ms(request_timeout_ms(wav.len()))
+                                })
                             }?;
                             // The stream failure reason is kept (and logged
                             // when the batch fallback also fails): silently
@@ -1428,7 +1435,10 @@ impl StarlingApp {
             // follows as a proposal (#295).
             if transcribed {
                 this.update(cx, |app, cx| {
-                    app.after_transcription(id, cx);
+                    app.after_transcription(id.clone(), cx);
+                    if retry {
+                        app.offer_retried_text(&id, cx);
+                    }
                 })
                 .ok();
             }
@@ -1488,11 +1498,34 @@ impl StarlingApp {
         .detach();
     }
 
+    /// Retry the selected take with whatever the app transcribes with
+    /// now (#363: a retry resolves a fresh target when it starts).
     pub fn retry_selected(&mut self, cx: &mut Context<Self>) {
+        self.retry_selected_with(RetryWith::Current, cx);
+    }
+
+    /// Retry the selected take with `with` (#356), from its stored audio:
+    /// no re-recording, and a success adds a result beside the earlier
+    /// ones.
+    pub(crate) fn retry_selected_with(&mut self, with: RetryWith, cx: &mut Context<Self>) {
         let Some(session) = self.selected() else {
             return;
         };
         let id = session.id.clone();
+        if self.active_ids.contains(&id) {
+            return;
+        }
+        self.retry_menu = None;
+        // A newer choice replaces a retry still waiting for its model.
+        self.pending_retry = None;
+        if with == RetryWith::Server && self.endpoint.trim().is_empty() {
+            self.error = Some(
+                "No server is set up: add its endpoint in Settings → Engine, then retry."
+                    .to_string(),
+            );
+            cx.notify();
+            return;
+        }
         // G02: history holds metadata only — fetch this one recording's
         // audio on demand (a damaged record surfaces its reason here).
         let Some(store) = self.store.clone() else {
@@ -1500,7 +1533,8 @@ impl StarlingApp {
         };
         cx.spawn(async move |this, cx| {
             // #342: pinned from before the load until the retry's attempt
-            // is marked started, so upkeep cannot remove the audio between.
+            // is marked started, so upkeep cannot remove the audio between
+            // — including while the engine switches to the retry's model.
             let loaded = {
                 let store = store.clone();
                 let id = id.clone();
@@ -1513,9 +1547,19 @@ impl StarlingApp {
                 .await
             };
             this.update(cx, |app, cx| match loaded {
-                Ok(Some((wav, pin))) => {
-                    app.transcribe(id, wav, Some(pin), cx);
-                }
+                Ok(Some((wav, pin))) => match with {
+                    RetryWith::Current => {
+                        let target = app.resolve_take_target();
+                        app.retry_on(id, wav, target, pin, cx);
+                    }
+                    RetryWith::Server => {
+                        let target = TakeTarget::manual(app.endpoint.clone(), app.model.clone());
+                        app.retry_on(id, wav, target, pin, cx);
+                    }
+                    RetryWith::Model(model_id) => {
+                        app.retry_after_switch(id, model_id, wav, pin, cx);
+                    }
+                },
                 Ok(None) => {
                     app.error = Some(format!("Recording {id} was not found."));
                     cx.notify();
@@ -1529,6 +1573,246 @@ impl StarlingApp {
         })
         .detach();
     }
+
+    /// Retry on an installed built-in model (#356): the engine switches
+    /// to it the way Settings would (it stays the active model), and the
+    /// retry runs once that model serves. Nothing is attempted — and the
+    /// take is untouched — when the switch does not happen.
+    fn retry_after_switch(
+        &mut self,
+        id: String,
+        model_id: String,
+        wav: Arc<Vec<u8>>,
+        pin: AudioPin,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(engine) = self.engine.clone() else {
+            self.error = Some(
+                "The built-in engine is off (Settings → Engine uses your own server), so this \
+                 model cannot transcribe. The recording is unchanged."
+                    .to_string(),
+            );
+            cx.notify();
+            return;
+        };
+        let serving = engine.lease().filter(|lease| lease.model_id() == model_id);
+        if let Some(lease) = serving {
+            self.retry_on(id, wav, TakeTarget::from_lease(lease), pin, cx);
+            return;
+        }
+        engine.activate(&model_id);
+        let pending = PendingRetry {
+            take_id: id.clone(),
+            model_id: model_id.clone(),
+        };
+        self.pending_retry = Some(pending.clone());
+        cx.notify();
+        let instance = self.engine_instance;
+        let started = Instant::now();
+        cx.spawn(async move |this, cx| {
+            let mut job = Some((wav, pin));
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(250))
+                    .await;
+                let done = this.update(cx, |app, cx| {
+                    if app.pending_retry.as_ref() != Some(&pending)
+                        || app.engine_instance != instance
+                    {
+                        // Replaced by another choice, or the engine itself
+                        // was replaced (a mode switch): this wait is over.
+                        return true;
+                    }
+                    match switch_progress(&engine.snapshot(), &model_id, started.elapsed()) {
+                        SwitchProgress::Waiting => false,
+                        SwitchProgress::Ready => {
+                            let Some(lease) =
+                                engine.lease().filter(|lease| lease.model_id() == model_id)
+                            else {
+                                return false;
+                            };
+                            app.pending_retry = None;
+                            if let Some((wav, pin)) = job.take() {
+                                app.retry_on(
+                                    pending.take_id.clone(),
+                                    wav,
+                                    TakeTarget::from_lease(lease),
+                                    pin,
+                                    cx,
+                                );
+                            }
+                            true
+                        }
+                        SwitchProgress::Failed(reason) => {
+                            app.pending_retry = None;
+                            app.error = Some(format!(
+                                "Could not retry with {}: {reason} The recording is unchanged.",
+                                crate::views::drawer::provenance_label(&format!(
+                                    "engine:{model_id}"
+                                ))
+                            ));
+                            cx.notify();
+                            true
+                        }
+                    }
+                });
+                if done.unwrap_or(true) {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// What a retry can run on right now (#356), for the drawer: every
+    /// installed built-in model (the active one first) and the server
+    /// from Settings when one is set up.
+    pub(crate) fn retry_choices(&self) -> Vec<RetryChoice> {
+        let mut choices = Vec::new();
+        if let Some(snapshot) = self.engine.as_ref().map(|engine| engine.snapshot()) {
+            let mut models: Vec<_> = snapshot
+                .models
+                .iter()
+                .filter(|model| {
+                    model.install == starling_dictation::engine::InstallState::Installed
+                })
+                .collect();
+            models.sort_by_key(|model| !model.active);
+            for model in models {
+                choices.push(RetryChoice {
+                    label: if model.active {
+                        format!("{} (current)", model.label)
+                    } else {
+                        model.label.clone()
+                    },
+                    with: RetryWith::Model(model.id.clone()),
+                    switches_engine: !model.active,
+                });
+            }
+        }
+        if !self.endpoint.trim().is_empty() {
+            let model = if self.model.trim().is_empty() {
+                "default model".to_string()
+            } else {
+                self.model.clone()
+            };
+            choices.push(RetryChoice {
+                label: format!("{model} (your server)"),
+                with: RetryWith::Server,
+                switches_engine: false,
+            });
+        }
+        choices
+    }
+
+    /// Opens or closes the drawer's "Retry with" choices for `id`.
+    pub(crate) fn toggle_retry_menu(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.retry_menu = match self.retry_menu.as_deref() {
+            Some(open) if open == id => None,
+            _ => Some(id.to_string()),
+        };
+        cx.notify();
+    }
+}
+
+/// What a retry transcribes with (#356).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RetryWith {
+    /// Whatever the app transcribes with now.
+    Current,
+    /// An installed built-in model; the engine switches to it first.
+    Model(String),
+    /// The server from Settings (endpoint + model), in either mode.
+    Server,
+}
+
+/// One "Retry with" entry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RetryChoice {
+    pub label: String,
+    pub with: RetryWith,
+    /// Choosing it makes this model the engine's active one.
+    pub switches_engine: bool,
+}
+
+/// A retry waiting for the engine to serve its model.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PendingRetry {
+    pub take_id: String,
+    pub model_id: String,
+}
+
+/// Where an engine switch a retry waits on stands.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SwitchProgress {
+    Waiting,
+    Ready,
+    /// The switch will not happen; the sentence says why.
+    Failed(String),
+}
+
+/// How long a retry waits for its model before giving up. Covers a
+/// download-free load of the largest catalog model with room to spare.
+const RETRY_SWITCH_CAP: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+/// How long the engine may show no sign of the requested switch before
+/// the request counts as not taken (the command is asynchronous).
+const RETRY_SWITCH_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Read an engine snapshot for a retry waiting on `model_id`.
+pub(crate) fn switch_progress(
+    snapshot: &starling_dictation::engine::EngineSnapshot,
+    model_id: &str,
+    waited: std::time::Duration,
+) -> SwitchProgress {
+    use starling_dictation::engine::{EnginePhase, SwapDecision};
+    let serving = snapshot
+        .active
+        .as_ref()
+        .is_some_and(|active| active.model_id == model_id);
+    if serving && snapshot.phase == EnginePhase::Ready && snapshot.switch.is_none() {
+        return SwitchProgress::Ready;
+    }
+    if waited >= RETRY_SWITCH_CAP {
+        return SwitchProgress::Failed("the model did not finish loading in time.".to_string());
+    }
+    if let Some(SwapDecision::Refused { .. }) = snapshot.pending_decision {
+        return SwitchProgress::Failed(
+            "there is not enough free memory to load that model.".to_string(),
+        );
+    }
+    if let Some(switch) = &snapshot.switch {
+        return if switch.target_model_id == model_id {
+            SwitchProgress::Waiting
+        } else {
+            SwitchProgress::Failed("another model switch replaced it.".to_string())
+        };
+    }
+    if let EnginePhase::Failed(failure) = &snapshot.phase {
+        return SwitchProgress::Failed(format!("{failure}"));
+    }
+    if serving || waited < RETRY_SWITCH_GRACE {
+        // Loading, warming, restarting — or the command is not picked up
+        // yet.
+        return SwitchProgress::Waiting;
+    }
+    SwitchProgress::Failed(
+        snapshot
+            .last_error
+            .clone()
+            .unwrap_or_else(|| "the engine did not switch to it.".to_string()),
+    )
+}
+
+/// The request timeout for one upload (#356): the client's 180 s
+/// default, plus the take's own length, capped at the client's 10-minute
+/// limit — a long take is not timed out by a budget sized for short
+/// ones, and a hung engine still fails in bounded time.
+pub(crate) fn request_timeout_ms(wav_bytes: usize) -> u64 {
+    const BASE_MS: u64 = 180_000;
+    const MAX_MS: u64 = 600_000;
+    // 16 kHz mono PCM16: 32 000 bytes a second, after the 44-byte header.
+    let audio_ms = (wav_bytes.saturating_sub(44) as u64) / 32;
+    (BASE_MS + audio_ms).min(MAX_MS)
 }
 
 pub(crate) async fn refresh_sessions(
@@ -1860,5 +2144,370 @@ mod tests {
         assert!(message.contains("transcript could not be saved"), "{message}");
         assert!(message.contains("audio is kept"), "{message}");
         assert!(message.contains("discard"), "{message}");
+    }
+
+    // ---- #356: retries, engine faults, focus safety ----------------------
+
+    use std::io::{Read, Write};
+    use std::net::{SocketAddr, TcpListener, TcpStream};
+    use std::sync::Mutex;
+
+    use starling_dictation::engine::{
+        ActiveEngineView, EngineFailure, EnginePhase, EngineSnapshot, SwapDecision, SwitchStage,
+        SwitchView,
+    };
+    use starling_dictation::settings::InsertionSettings;
+    use starling_dictation::storage::{ListedRecord, SessionStatus, SessionSummary};
+    use starling_insertion::testing::{FakeBackend, FakeTarget};
+    use starling_insertion::Inserter;
+
+    use crate::delivery::{DeliveryState, Failure};
+
+    fn snapshot(active: Option<&str>, phase: EnginePhase) -> EngineSnapshot {
+        EngineSnapshot {
+            backend: None,
+            phase,
+            active: active.map(|model_id| ActiveEngineView {
+                model_id: model_id.to_string(),
+                endpoint: "http://127.0.0.1:1".to_string(),
+                pid: 1,
+                owned: true,
+                device: None,
+            }),
+            switch: None,
+            pending_decision: None,
+            last_switch: None,
+            models: Vec::new(),
+            notices: Vec::new(),
+            last_error: None,
+        }
+    }
+
+    fn switching_to(model_id: &str) -> Option<SwitchView> {
+        Some(SwitchView {
+            target_model_id: model_id.to_string(),
+            stage: SwitchStage::Loading,
+            started: Instant::now(),
+        })
+    }
+
+    #[test]
+    fn a_retry_waits_for_its_model_and_gives_up_honestly() {
+        let secs = std::time::Duration::from_secs;
+        // Serving the model: go.
+        assert_eq!(
+            switch_progress(&snapshot(Some("b"), EnginePhase::Ready), "b", secs(1)),
+            SwitchProgress::Ready
+        );
+        // The switch to it is running, or the command is not picked up yet.
+        let mut loading = snapshot(Some("a"), EnginePhase::Ready);
+        loading.switch = switching_to("b");
+        assert_eq!(switch_progress(&loading, "b", secs(30)), SwitchProgress::Waiting);
+        assert_eq!(
+            switch_progress(&snapshot(Some("a"), EnginePhase::Ready), "b", secs(1)),
+            SwitchProgress::Waiting
+        );
+        assert_eq!(
+            switch_progress(&snapshot(Some("b"), EnginePhase::Loading), "b", secs(30)),
+            SwitchProgress::Waiting
+        );
+        // Everything else ends the wait with a reason.
+        let mut replaced = snapshot(Some("a"), EnginePhase::Ready);
+        replaced.switch = switching_to("c");
+        assert!(matches!(switch_progress(&replaced, "b", secs(5)), SwitchProgress::Failed(_)));
+        let mut refused = snapshot(Some("a"), EnginePhase::Ready);
+        refused.pending_decision = Some(SwapDecision::Refused {
+            needed: 2,
+            available: 1,
+        });
+        assert!(matches!(
+            switch_progress(&refused, "b", secs(1)),
+            SwitchProgress::Failed(reason) if reason.contains("memory")
+        ));
+        assert!(matches!(
+            switch_progress(
+                &snapshot(None, EnginePhase::Failed(EngineFailure::LoadFailed("bad file".into()))),
+                "b",
+                secs(5)
+            ),
+            SwitchProgress::Failed(_)
+        ));
+        let mut ignored = snapshot(Some("a"), EnginePhase::Ready);
+        ignored.last_error = Some("the model file failed verification".to_string());
+        assert_eq!(
+            switch_progress(&ignored, "b", secs(5)),
+            SwitchProgress::Failed("the model file failed verification".to_string())
+        );
+        assert!(matches!(
+            switch_progress(&loading, "b", RETRY_SWITCH_CAP),
+            SwitchProgress::Failed(_)
+        ));
+    }
+
+    #[test]
+    fn long_takes_get_a_longer_but_bounded_request_timeout() {
+        assert_eq!(request_timeout_ms(44), 180_000);
+        // Ten seconds of 16 kHz PCM16.
+        assert_eq!(request_timeout_ms(44 + 320_000), 190_000);
+        // A ten-minute take: the client's own ceiling.
+        assert_eq!(request_timeout_ms(44 + 600 * 32_000), 600_000);
+    }
+
+    /// What the fake transcription server does with one request.
+    enum Reply {
+        Status(&'static str),
+        /// Reads the request and hangs up without an answer — a crashed
+        /// engine.
+        HangUp,
+        Text(&'static str),
+    }
+
+    /// A transcription server scripted per request; anything else (the
+    /// health probe a transport failure prompts) answers without using up
+    /// a reply.
+    fn fake_server(replies: Vec<Reply>) -> (SocketAddr, Arc<Mutex<usize>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let served = Arc::new(Mutex::new(0usize));
+        let count = served.clone();
+        let mut replies = std::collections::VecDeque::from(replies);
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let mut stream = stream;
+                let path = read_request(&mut stream);
+                if path != "/v1/audio/transcriptions" {
+                    // Health probes after a transport failure.
+                    respond(&mut stream, "200 OK", r#"{"status":"ok"}"#);
+                    continue;
+                }
+                *count.lock().unwrap() += 1;
+                match replies.pop_front() {
+                    Some(Reply::Status(status)) => respond(&mut stream, status, r#"{"error":"boom"}"#),
+                    Some(Reply::HangUp) | None => drop(stream),
+                    Some(Reply::Text(text)) => {
+                        respond(&mut stream, "200 OK", &format!(r#"{{"text":"{text}"}}"#))
+                    }
+                }
+            }
+        });
+        (addr, served)
+    }
+
+    fn read_request(stream: &mut TcpStream) -> String {
+        let mut buffer = Vec::new();
+        let mut chunk = [0u8; 8192];
+        let head_end = loop {
+            let read = stream.read(&mut chunk).unwrap_or(0);
+            if read == 0 {
+                return String::new();
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+            if let Some(at) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+                break at;
+            }
+        };
+        let head = String::from_utf8_lossy(&buffer[..head_end]).to_string();
+        let length = head
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0);
+        // The multipart upload streams: a chunked body ends with its
+        // zero-length chunk.
+        let chunked = head.to_ascii_lowercase().contains("transfer-encoding: chunked");
+        let mut body = buffer[head_end + 4..].to_vec();
+        loop {
+            let complete = if chunked {
+                body.ends_with(b"0\r\n\r\n")
+            } else {
+                body.len() >= length
+            };
+            if complete {
+                break;
+            }
+            let read = stream.read(&mut chunk).unwrap_or(0);
+            if read == 0 {
+                break;
+            }
+            body.extend_from_slice(&chunk[..read]);
+        }
+        head.split_whitespace().nth(1).unwrap_or_default().to_string()
+    }
+
+    fn respond(stream: &mut TcpStream, status: &str, body: &str) {
+        let _ = write!(
+            stream,
+            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
+             connection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let _ = stream.flush();
+    }
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("starling-356-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+        dir
+    }
+
+    fn one_second_wav() -> Arc<Vec<u8>> {
+        let pcm = audio::PcmAudio {
+            samples: (0..16_000).map(|i| ((i as f32) * 0.02).sin() * 0.2).collect(),
+            sample_rate: 16_000,
+            channels: 1,
+        };
+        Arc::new(audio::encode_wav_16k(&pcm).expect("wav"))
+    }
+
+    fn summary(store: &Store, id: &str) -> SessionSummary {
+        store
+            .list()
+            .expect("list")
+            .into_iter()
+            .find_map(|record| match record {
+                ListedRecord::Session(summary) if summary.id == id => Some(summary),
+                _ => None,
+            })
+            .expect("listed")
+    }
+
+    fn retry(app: &gpui::Entity<StarlingApp>, cx: &mut gpui::TestAppContext, with: RetryWith) {
+        app.update(cx, |app, cx| app.retry_selected_with(with, cx));
+        cx.run_until_parked();
+    }
+
+    /// The engine-client fault matrix on a saved take (#356): an error
+    /// status, a server that hangs up mid-request (a crashed engine), and
+    /// an empty answer each keep the audio and the take's history; a
+    /// successful retry adds a result beside the earlier one, and nothing
+    /// is ever typed into another app — the text is offered for Copy /
+    /// Paste last instead.
+    #[gpui::test]
+    fn engine_faults_keep_the_take_and_a_retry_adds_a_result_without_typing(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = scratch("faults");
+        let store = Store::at_test_root(&root);
+        let wav = one_second_wav();
+        let id = store.save_capture(wav.clone(), None).expect("save").id;
+        let stored = store.audio_wav(&id).expect("load").expect("present");
+        store.mark_attempt(&id, "engine:model-a").expect("begin");
+        store
+            .save_transcript(
+                &id,
+                storage::TranscriptionResult {
+                    text: "first words".to_string(),
+                    segments: Vec::new(),
+                    duration_seconds: None,
+                    request_id: None,
+                },
+            )
+            .expect("first");
+
+        let (addr, served) = fake_server(vec![
+            Reply::Status("500 Internal Server Error"),
+            Reply::HangUp,
+            Reply::Text(" "),
+            Reply::Text("second words"),
+        ]);
+        let fake = Arc::new(FakeBackend::new());
+        fake.focus(FakeTarget::named("Editor", "notes.txt"));
+        let inserter = Arc::new(Inserter::with_backends(vec![Box::new(fake.clone())]));
+        let app = cx.new(|cx| {
+            let mut app = StarlingApp::for_test(Some(store.clone()), cx);
+            app.endpoint = format!("http://{addr}");
+            app.model = "fake-model".to_string();
+            app.delivery = DeliveryState::new(inserter, InsertionSettings::default());
+            app.apply_sessions(store.list().expect("list"));
+            app.selected_id = Some(id.clone());
+            // The take was dictated into the editor: its first delivery
+            // capture is still bound, the shape a retry must never use.
+            app.delivery_take_started();
+            let capture = app.delivery_take_stopped();
+            app.bind_delivery(capture, &id);
+            app
+        });
+
+        let audio_intact = |store: &Store| {
+            assert_eq!(*store.audio_wav(&id).expect("load").expect("present"), *stored);
+        };
+
+        // An HTTP error: a failed attempt, the earlier transcript stays.
+        retry(&app, cx, RetryWith::Server);
+        let take = summary(&store, &id);
+        assert_eq!(take.status, SessionStatus::Failed);
+        assert_eq!(take.transcript.as_ref().expect("kept").text, "first words");
+        assert!(app.read_with(cx, |app, _| app.error.is_some()));
+        audio_intact(&store);
+
+        // The engine dies mid-request.
+        retry(&app, cx, RetryWith::Server);
+        let take = summary(&store, &id);
+        assert_eq!(take.status, SessionStatus::Failed);
+        assert_eq!(take.attempt_count, 3);
+        audio_intact(&store);
+
+        // An empty answer is kept as a result, never shown over words.
+        retry(&app, cx, RetryWith::Server);
+        let take = summary(&store, &id);
+        assert_eq!(take.transcript.as_ref().expect("kept").text, "first words");
+        assert_eq!(take.results.len(), 2);
+
+        // A real answer: a new result, attached to the same recording.
+        retry(&app, cx, RetryWith::Server);
+        let take = summary(&store, &id);
+        assert_eq!(take.status, SessionStatus::Transcribed);
+        assert_eq!(take.transcript.as_ref().expect("shown").text, "second words");
+        assert_eq!(take.model_label.as_deref(), Some("openai:fake-model"));
+        let texts: Vec<_> = take.results.iter().map(|result| result.text.trim()).collect();
+        assert_eq!(texts, vec!["first words", "", "second words"]);
+        audio_intact(&store);
+        assert_eq!(*served.lock().unwrap(), 4);
+
+        // Focus safety: nothing was typed; the text waits for an explicit
+        // Copy or Paste last.
+        assert!(fake.insertions().is_empty(), "{:?}", fake.insertions());
+        let offered = app.read_with(cx, |app, _| {
+            app.delivery
+                .recovery
+                .as_ref()
+                .map(|recovery| (recovery.failure.clone(), recovery.text.clone(), recovery.armed))
+        });
+        assert_eq!(
+            offered,
+            Some((Failure::Retried, "second words".to_string(), None))
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A retry with the server when none is set up does nothing to the
+    /// take and says what to do.
+    #[gpui::test]
+    fn a_retry_without_a_server_leaves_the_take_alone(cx: &mut gpui::TestAppContext) {
+        let root = scratch("no-server");
+        let store = Store::at_test_root(&root);
+        let id = store.save_capture(one_second_wav(), None).expect("save").id;
+        let app = cx.new(|cx| {
+            let mut app = StarlingApp::for_test(Some(store.clone()), cx);
+            app.endpoint = String::new();
+            app.apply_sessions(store.list().expect("list"));
+            app.selected_id = Some(id.clone());
+            app
+        });
+        retry(&app, cx, RetryWith::Server);
+        assert_eq!(summary(&store, &id).attempt_count, 0);
+        let error = app.read_with(cx, |app, _| app.error.clone()).expect("explained");
+        assert!(error.contains("No server"), "{error}");
+        // No built-in engine runs in manual mode: a model choice says so.
+        retry(&app, cx, RetryWith::Model("parakeet".to_string()));
+        assert_eq!(summary(&store, &id).attempt_count, 0);
+        let error = app.read_with(cx, |app, _| app.error.clone()).expect("explained");
+        assert!(error.contains("recording is unchanged"), "{error}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
