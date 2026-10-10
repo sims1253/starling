@@ -2049,6 +2049,87 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// A retry's offer holds exactly that retry's words, even when a later
+    /// retry another window asked for is the take's history head by the
+    /// time this window has refreshed.
+    #[gpui::test]
+    fn a_retry_offers_its_own_words_not_a_later_head(cx: &mut gpui::TestAppContext) {
+        let root = scratch("frames-retry-own-words");
+        let store = Store::at_test_root(&root);
+        let id = transcribed(&store, "my retry");
+        store.mark_attempt(&id, "openai:other").expect("attempt");
+        store
+            .save_transcript(
+                &id,
+                storage::TranscriptionResult {
+                    text: "their later retry".to_string(),
+                    segments: Vec::new(),
+                    duration_seconds: None,
+                    request_id: None,
+                },
+            )
+            .expect("later retry");
+        let (app, fake) = window_with_typing(cx, &store);
+        app.update(cx, |app, _| {
+            app.host.requests.insert(
+                "tr_mine".to_string(),
+                crate::remote_take::Request {
+                    stored_id: id.clone(),
+                    _hold: None,
+                    offer: true,
+                },
+            );
+        });
+        frame(&app, cx, completed_with(&id, Some("tr_mine"), true, "my retry"));
+        settle(cx, "the offer", |cx| app.read_with(cx, |app, _| app.delivery.recovery.is_some()));
+        let offered = app.read_with(cx, |app, _| {
+            app.delivery.recovery.as_ref().map(|recovery| recovery.text.clone())
+        });
+        assert_eq!(offered.as_deref(), Some("my retry"));
+        assert!(fake.insertions().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The host refusing a window's own take's transcription (its claim
+    /// failed) ends the wait: Retry and Delete work again, nothing is
+    /// typed for it later — unless another job on the take still runs.
+    #[gpui::test]
+    fn a_refused_own_transcription_leaves_the_take_idle(cx: &mut gpui::TestAppContext) {
+        let root = scratch("frames-refused-own");
+        let store = Store::at_test_root(&root);
+        let id = transcribed(&store, "never");
+        let busy = transcribed(&store, "still running");
+        let (app, _) = window_with_typing(cx, &store);
+        for take in [&id, &busy] {
+            own_take(&app, cx, take);
+            app.update(cx, |app, _| {
+                app.active_ids.insert(take.clone());
+            });
+        }
+        app.update(cx, |app, _| {
+            app.host.transcribing.insert(busy.clone());
+        });
+        let refused = |stored_id: &str| TakeUpdate::Transcription {
+            stored_id: stored_id.to_string(),
+            take: None,
+            req: None,
+            attempt: None,
+            state: TranscriptionState::Refused {
+                message: "The recording could not be claimed.".to_string(),
+            },
+            yours: true,
+        };
+        frame(&app, cx, refused(&id));
+        frame(&app, cx, refused(&busy));
+        app.read_with(cx, |app, _| {
+            assert!(!app.is_active(&id), "Retry and Delete work again");
+            assert!(!app.delivers(&id), "nothing is typed for it later");
+            assert!(app.is_active(&busy), "a job on it still runs");
+            assert!(app.host.awaiting.is_empty());
+        });
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// Live text from the host lands in the running take's live line; a
     /// preview for a take that is not running here is ignored, and a
     /// degradation says why live text stopped.

@@ -480,6 +480,22 @@ impl ConnState {
         drop(lock_registry(&self.closer).take());
     }
 
+    /// A connection with no transport, for the feed's unit tests: what
+    /// is delivered to it lands in the returned receiver.
+    #[cfg(test)]
+    pub(crate) fn for_test(capacity: usize) -> (Arc<ConnState>, Receiver<Frame>) {
+        let (outbound, inbound) = bounded(capacity);
+        let state = Arc::new(ConnState {
+            outbound,
+            closed: AtomicBool::new(false),
+            unregistered: AtomicBool::new(false),
+            agent: AtomicBool::new(false),
+            app: AtomicBool::new(true),
+            closer: Mutex::new(None),
+        });
+        (state, inbound)
+    }
+
     /// How full this connection's outbound queue is: `(queued,
     /// capacity)`.
     pub(crate) fn outbound_depth(&self) -> (usize, usize) {

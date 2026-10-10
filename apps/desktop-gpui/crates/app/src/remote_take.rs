@@ -1013,6 +1013,11 @@ impl StarlingApp {
                     self.error = Some(message);
                 }
                 if own_job && self.host.awaiting.remove(&stored_id) {
+                    // Its wait ends here: the take stays busy only while
+                    // a job on it still runs.
+                    if !self.host.transcribing.contains(&stored_id) {
+                        self.active_ids.remove(&stored_id);
+                    }
                     self.no_transcript_here(&stored_id, cx);
                 }
                 self.refresh_history(cx);
@@ -1057,14 +1062,14 @@ impl StarlingApp {
                                 if own || recovers {
                                     app.host
                                         .own_results
-                                        .insert(stored_id.clone(), (attempt, text));
+                                        .insert(stored_id.clone(), (attempt, text.clone()));
                                     app.after_transcription(stored_id.clone(), cx);
                                     app.host.own_results.remove(&stored_id);
                                 } else {
                                     app.after_other_result(stored_id.clone(), cx);
                                 }
                                 if offer {
-                                    app.offer_retried_text(&stored_id, cx);
+                                    app.offer_retried_text(&stored_id, &text, cx);
                                 }
                             })
                             .ok();

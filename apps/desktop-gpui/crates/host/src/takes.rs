@@ -254,9 +254,10 @@ impl TakeHub {
     /// Where the transcription of stored take `stored_id` stands: to every
     /// watcher (and to a requesting `owner` that does not watch). The one
     /// it is for — `owner` while it lives (a take's owner only while it
-    /// watches), else the first watching app — gets it whatever its queue
-    /// says (it waits for room); a full queue only costs anyone else a
-    /// refresh.
+    /// watches), else the first watching app — acts on it. Every watcher
+    /// gets it whatever its queue says (it waits for room, in order): a
+    /// window that saw the transcription start shows the take busy until
+    /// it hears the end, and nothing else would tell it.
     pub(crate) fn transcription(
         &self,
         stored_id: &str,
@@ -301,10 +302,7 @@ impl TakeHub {
                 Some(take) if watcher.tapping(take) => {
                     watcher.deliver_after_tap(take, frame(yours));
                 }
-                _ if yours => deliver_owed(owed, &watcher.conn, frame(true)),
-                _ => {
-                    let _ = watcher.conn.try_deliver(frame(false));
-                }
+                _ => deliver_owed(owed, &watcher.conn, frame(yours)),
             }
         }
         if let (Some(recipient), false) = (recipient, reached) {
@@ -1003,5 +1001,56 @@ pub(crate) fn tick_loop(hub: Arc<TakeHub>, shared: Arc<crate::server::HostShared
     while !shared.shutdown.load(Ordering::SeqCst) {
         hub.tick();
         std::thread::sleep(TICK);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn drained(inbound: &starling_runtime::channel::Receiver<Frame>) -> Vec<Frame> {
+        std::iter::from_fn(|| inbound.try_recv().ok()).collect()
+    }
+
+    /// A window that is not the one to act on a transcription still hears
+    /// how it ended when its queue was full at the time: it showed the take
+    /// busy since the start, and nothing else would clear that.
+    #[test]
+    fn a_watcher_with_a_full_queue_still_hears_the_transcription_end() {
+        let hub = TakeHub::new(Duration::from_secs(60));
+        let (acting, _acting_inbound) = ConnState::for_test(16);
+        let (other, other_inbound) = ConnState::for_test(2);
+        hub.watch(&acting, "w1".into()).unwrap();
+        hub.watch(&other, "w2".into()).unwrap();
+        // The other window's queue is full.
+        while other
+            .try_deliver(Frame::GetSnapshot { req: "fill".into() })
+            .is_ok()
+        {}
+        hub.transcription(
+            "stored",
+            None,
+            None,
+            None,
+            TranscriptionState::Completed {
+                text: "words".into(),
+                kept_earlier: false,
+            },
+            Some(&acting),
+        );
+        drained(&other_inbound);
+        hub.tick();
+        let frames = drained(&other_inbound);
+        assert!(
+            frames.iter().any(|frame| matches!(
+                frame,
+                Frame::Transcription {
+                    yours: false,
+                    state: TranscriptionState::Completed { .. },
+                    ..
+                }
+            )),
+            "{frames:?}"
+        );
     }
 }
