@@ -83,6 +83,9 @@ class MainActivity : Activity() {
     private var playingId: String? = null
     private var pendingExportId: String? = null
 
+    // The format the export document was named for; it is what gets written.
+    private var pendingExportFlac = false
+
     // Written on the main thread. Read by the capture worker through the
     // chunk listener, so a stop that nulls it racing an escalated worker is
     // still safe: a stale session simply ignores the audio once finished.
@@ -160,11 +163,13 @@ class MainActivity : Activity() {
         // The document picker can outlive this instance (rotation, process
         // recreation); its result must still find the recording to export.
         pendingExportId = savedInstanceState?.getString(STATE_PENDING_EXPORT)
+        pendingExportFlac = savedInstanceState?.getBoolean(STATE_PENDING_EXPORT_FLAC) ?: false
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
         super.onSaveInstanceState(outState)
         pendingExportId?.let { outState.putString(STATE_PENDING_EXPORT, it) }
+        outState.putBoolean(STATE_PENDING_EXPORT_FLAC, pendingExportFlac)
     }
 
     /**
@@ -305,7 +310,13 @@ class MainActivity : Activity() {
                     if (chosen == application.storageSettings.load().limits(retentionClass)) return
                     runCatching { application.storageSettings.save(retentionClass, chosen) }
                         .onSuccess { application.audioUpkeep.schedule() }
-                        .onFailure { recordingMessage.setText(R.string.retention_save_error) }
+                        .onFailure {
+                            // Show the limits still in force.
+                            val kept = application.storageSettings.load().limits(retentionClass)
+                            age.setSelection(AGE_CHOICES.indexOf(kept.maxAgeDays).coerceAtLeast(0), false)
+                            size.setSelection(SIZE_CHOICES_MB.indexOf(kept.maxTotalMb).coerceAtLeast(0), false)
+                            recordingMessage.setText(R.string.retention_save_error)
+                        }
                 }
 
                 override fun onNothingSelected(parent: AdapterView<*>?) = Unit
@@ -327,9 +338,14 @@ class MainActivity : Activity() {
             if (removed > 0) {
                 add(resources.getQuantityString(R.plurals.cleanup_removed, removed, removed, mbCeil(report.retention.removedBytes)))
             }
-            val untranscribed = report.retention.held.count { it.reason == HoldReason.UNTRANSCRIBED }
-            if (untranscribed > 0) {
-                add(resources.getQuantityString(R.plurals.cleanup_untranscribed, untranscribed, untranscribed))
+            // Every due take that kept its audio, by why.
+            for ((reason, plural) in listOf(
+                HoldReason.RECENT to R.plurals.cleanup_recent,
+                HoldReason.IN_USE to R.plurals.cleanup_in_use,
+                HoldReason.UNTRANSCRIBED to R.plurals.cleanup_untranscribed,
+            )) {
+                val held = report.retention.held.count { it.reason == reason }
+                if (held > 0) add(resources.getQuantityString(plural, held, held))
             }
             report.retention.overLimit.forEach { (retentionClass, bytes) ->
                 add(getString(R.string.cleanup_over_limit, retentionClassName(retentionClass), mbCeil(bytes)))
@@ -1064,10 +1080,11 @@ class MainActivity : Activity() {
         val audio = application.recordings.audioFile(recording)
         val stamp = java.text.SimpleDateFormat("yyyyMMdd-HHmmss", java.util.Locale.US).format(Date(recording.createdAtMillis))
         pendingExportId = recording.id
+        pendingExportFlac = audio.extension == "flac"
         startActivityForResult(
             Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
                 addCategory(Intent.CATEGORY_OPENABLE)
-                type = if (audio.extension == "flac") "audio/flac" else "audio/wav"
+                type = if (pendingExportFlac) "audio/flac" else "audio/wav"
                 putExtra(Intent.EXTRA_TITLE, "starling-$stamp.${audio.extension}")
             },
             REQUEST_EXPORT_RECORDING,
@@ -1080,11 +1097,20 @@ class MainActivity : Activity() {
             return
         }
         pendingExportId = null
+        val flac = pendingExportFlac
         val resolver = contentResolver
         thread {
             val exported = runCatching {
-                val audio = application.recordings.openAudio(id).stream
-                resolver.openOutputStream(uri, "w")!!.use { output -> audio.use { it.copyTo(output) } }
+                resolver.openOutputStream(uri, "w")!!.use { output ->
+                    if (flac) {
+                        // Compression only ever goes from WAV to FLAC.
+                        application.recordings.openAudio(id).stream.use { it.copyTo(output) }
+                    } else {
+                        // Named .wav: the request WAV, byte for byte the
+                        // original even if upkeep compressed the take since.
+                        application.recordings.withRequestAudio(id) { wav -> wav.inputStream().use { it.copyTo(output) } }
+                    }
+                }
             }.onFailure { Log.w(TAG, "recording export failed", it) }.isSuccess
             runOnUiThread {
                 if (isDestroyed || isFinishing) return@runOnUiThread
@@ -1100,6 +1126,7 @@ class MainActivity : Activity() {
         private const val REQUEST_KEYBOARD_MICROPHONE = 4003
         private const val REQUEST_EXPORT_RECORDING = 4004
         private const val STATE_PENDING_EXPORT = "pending_export_id"
+        private const val STATE_PENDING_EXPORT_FLAC = "pending_export_flac"
 
         /** The voice keyboard asks for the microphone through this screen. */
         const val ACTION_REQUEST_MICROPHONE = "dev.starling.mobile.action.REQUEST_MICROPHONE"

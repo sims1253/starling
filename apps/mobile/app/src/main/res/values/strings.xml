@@ -99,6 +99,14 @@
         <item quantity="one">removed the audio of %1$d recording (%2$d MB); transcripts are kept</item>
         <item quantity="other">removed the audio of %1$d recordings (%2$d MB); transcripts are kept</item>
     </plurals>
+    <plurals name="cleanup_recent">
+        <item quantity="one">kept %1$d due recording from the last day</item>
+        <item quantity="other">kept %1$d due recordings from the last day</item>
+    </plurals>
+    <plurals name="cleanup_in_use">
+        <item quantity="one">kept %1$d due recording a transcription is using</item>
+        <item quantity="other">kept %1$d due recordings a transcription is using</item>
+    </plurals>
     <plurals name="cleanup_untranscribed">
         <item quantity="one">kept %1$d due recording that never got a transcript</item>
         <item quantity="other">kept %1$d due recordings that never got a transcript</item>

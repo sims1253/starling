@@ -34,7 +34,7 @@ class AudioUpkeep(
         /** Nothing worth telling the user. */
         val isEmpty: Boolean
             get() = compressed == 0 && failures == 0 && retention.removed.isEmpty() &&
-                retention.held.none { it.reason == HoldReason.UNTRANSCRIBED } && retention.overLimit.isEmpty()
+                retention.held.isEmpty() && retention.overLimit.isEmpty()
     }
 
     /** The last pass that did or found something; null until one did. */

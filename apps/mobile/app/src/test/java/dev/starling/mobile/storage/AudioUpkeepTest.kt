@@ -8,10 +8,12 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
 import java.io.File
+import java.io.IOException
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import kotlin.concurrent.thread
@@ -140,7 +142,59 @@ class AudioUpkeepTest {
         assertEquals(setOf("storage.standard.maxTotalMb"), preferences.values.keys)
         // Anything unreadable is no limit.
         preferences.values["storage.standard.maxAgeDays"] = -3L
-        assertEquals(null, settings.load().limits(RetentionClass.STANDARD).maxAgeDays)
+        assertEquals(ClassLimits(maxTotalMb = 1024), StorageSettings(preferences).load().limits(RetentionClass.STANDARD))
+    }
+
+    @Test
+    fun aFailedSaveLeavesTheEarlierPolicyInForce() {
+        val preferences = FakePreferences()
+        val settings = StorageSettings(preferences)
+        settings.save(RetentionClass.STANDARD, ClassLimits(maxAgeDays = 365))
+        // Android's SharedPreferences takes the values in memory, then the
+        // write to storage fails and commit() says false.
+        preferences.failCommits = true
+        try {
+            settings.save(RetentionClass.STANDARD, ClassLimits(maxAgeDays = 30, maxTotalMb = 1024))
+            fail("a failed save succeeded")
+        } catch (_: IOException) {
+        }
+        val expected = ClassLimits(maxAgeDays = 365)
+        assertEquals(expected, settings.load().limits(RetentionClass.STANDARD))
+        assertEquals(expected, settings.withPolicy { it.limits(RetentionClass.STANDARD) })
+        // And memory is put back, so a later read cannot pick the failed values up.
+        assertEquals(mapOf("storage.standard.maxAgeDays" to 365L), preferences.values)
+    }
+
+    @Test
+    fun hugeStoredLimitsAreNoLimitRatherThanWrappingAround() {
+        val preferences = FakePreferences()
+        preferences.values["storage.standard.maxAgeDays"] = 4_294_967_296L
+        preferences.values["storage.standard.maxTotalMb"] = 1L shl 43
+        preferences.values["storage.archival.maxAgeDays"] = ClassLimits.MAX_AGE_DAYS.toLong()
+        preferences.values["storage.archival.maxTotalMb"] = ClassLimits.MAX_TOTAL_MB
+        val policy = StorageSettings(preferences).load()
+        assertEquals(ClassLimits(), policy.limits(RetentionClass.STANDARD))
+        val archival = policy.limits(RetentionClass.ARCHIVAL)
+        assertEquals(ClassLimits.MAX_AGE_DAYS, archival.maxAgeDays)
+        assertTrue(archival.maxTotalBytes!! > 0)
+    }
+
+    @Test
+    fun aPassThatOnlyHeldTakesIsReported() {
+        val store = store()
+        val old = take(store, ageDays = 40.0)
+        val pin = store.pin(old.id)
+        val gate = object : PolicyGate {
+            override fun <T> withPolicy(block: (RetentionPolicy) -> T): T =
+                block(RetentionPolicy(mapOf(RetentionClass.STANDARD to ClassLimits(maxAgeDays = 30))))
+        }
+        val upkeep = AudioUpkeep(store, gate, Runnable::run, recording = { false })
+
+        val report = upkeep.runPass()
+
+        assertEquals(HoldReason.IN_USE, report.retention.held.single().reason)
+        assertEquals(report, upkeep.lastReport)
+        pin.close()
     }
 
     @Test
@@ -171,6 +225,7 @@ class AudioUpkeepTest {
     /** Just enough SharedPreferences for StorageSettings (longs only). */
     private class FakePreferences : SharedPreferences {
         val values = LinkedHashMap<String, Long>()
+        var failCommits = false
 
         override fun getLong(key: String, defValue: Long): Long = values[key] ?: defValue
         override fun contains(key: String): Boolean = key in values
@@ -193,7 +248,7 @@ class AudioUpkeepTest {
             override fun commit(): Boolean {
                 removes.forEach(values::remove)
                 values.putAll(puts)
-                return true
+                return !failCommits
             }
             override fun apply() {
                 commit()

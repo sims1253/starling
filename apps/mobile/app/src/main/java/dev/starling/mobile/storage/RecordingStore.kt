@@ -604,7 +604,15 @@ class RecordingStore internal constructor(
                                 comparing.requireExhausted()
                             }
                         }.isSuccess
-                        if (same && hasOwnHeader(wav)) wav.delete() else flac.delete()
+                        if (same && hasOwnHeader(wav)) {
+                            // The FLAC's rename may not be durable yet (the
+                            // crash may have come before the publish's sync):
+                            // make it so before the WAV goes.
+                            syncDirectory()
+                            wav.delete()
+                        } else {
+                            flac.delete()
+                        }
                         syncDirectory()
                     }
                 }

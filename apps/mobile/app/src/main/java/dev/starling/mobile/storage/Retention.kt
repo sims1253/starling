@@ -12,8 +12,21 @@ data class ClassLimits(
     val maxAgeDays: Int? = null,
     val maxTotalMb: Long? = null,
 ) {
+    init {
+        require(maxAgeDays == null || maxAgeDays in 0..MAX_AGE_DAYS) { "Age limit out of range" }
+        require(maxTotalMb == null || maxTotalMb in 0..MAX_TOTAL_MB) { "Size limit out of range" }
+    }
+
     val isActive: Boolean get() = maxAgeDays != null || maxTotalMb != null
     val maxTotalBytes: Long? get() = maxTotalMb?.let { it * 1024 * 1024 }
+
+    companion object {
+        /** A thousand years; the age arithmetic stays far from overflow. */
+        const val MAX_AGE_DAYS = 365_000
+
+        /** The largest MiB count whose byte count fits a Long. */
+        const val MAX_TOTAL_MB = Long.MAX_VALUE / (1024 * 1024)
+    }
 }
 
 /**

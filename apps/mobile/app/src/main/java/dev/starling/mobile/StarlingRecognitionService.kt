@@ -11,6 +11,7 @@ import android.os.Looper
 import android.speech.RecognitionService
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
+import android.widget.Toast
 import dev.starling.mobile.audio.AudioCapture
 import dev.starling.mobile.audio.AudioChunkListener
 import dev.starling.mobile.audio.CaptureResult
@@ -21,6 +22,7 @@ import dev.starling.mobile.network.StreamEvent
 import dev.starling.mobile.network.StreamSession
 import dev.starling.mobile.network.TranscriptionEngine
 import dev.starling.mobile.storage.DiskLevel
+import dev.starling.mobile.storage.DiskPolicy
 import java.util.concurrent.TimeUnit
 
 /**
@@ -64,9 +66,16 @@ class StarlingRecognitionService : RecognitionService() {
         // answers a second start with ERROR_RECOGNIZER_BUSY without calling us.
         sessions.expire()?.let(::endSession)
         // Free space first (#342): no take starts that the disk cannot hold.
-        if (application.diskBeforeTake()?.level == DiskLevel.CRITICAL) {
+        // The service has no screen of its own; the host keyboard gets the
+        // error, and the reason shows as a toast.
+        val disk = application.diskBeforeTake()
+        if (disk?.level == DiskLevel.CRITICAL) {
+            toast(getString(R.string.disk_full_refused, (disk.availableBytes / 1_000_000).toInt()))
             sessions.deliver(callback) { it.error(SpeechRecognizer.ERROR_CLIENT) }
             return
+        }
+        if (disk?.level == DiskLevel.LOW) {
+            toast(getString(R.string.disk_low_warning, DiskPolicy.DEFAULT.minutesLeft(disk.availableBytes)))
         }
         val recording = runCatching { application.recordings.create() }.getOrElse {
             sessions.deliver(callback) { it.error(SpeechRecognizer.ERROR_CLIENT) }
@@ -255,6 +264,10 @@ class StarlingRecognitionService : RecognitionService() {
             }
             sessions.deliver(ending.session.owner) { it.error(errorCode) }
         }
+    }
+
+    private fun toast(text: String) {
+        runCatching { Toast.makeText(this, text, Toast.LENGTH_LONG).show() }
     }
 
     companion object {
