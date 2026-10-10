@@ -448,11 +448,11 @@ impl StarlingApp {
 /// The take's stream timeline (#226), on when `STARLING_STREAM_TRACE` is
 /// set: `1` or `stderr` writes to stderr, anything else is a file the
 /// lines are appended to. One JSON object per line, `ms` since the take
-/// started: `start`, every server frame (`partial` with the server's
-/// `covered_s`/`audio_s`, `final` with its stop path), every preview the
-/// UI applied (`display`), `stream_failed`, `reconnect` and `stop`. Partial
-/// age at display is `display.ms - 1000 * covered_s`, measured from the
-/// take's start rather than the microphone's.
+/// started: `start` (with the wall clock), every server frame (`partial`
+/// with the server's `covered_s`/`audio_s`, `final` with its stop path),
+/// every preview the UI applied (`display`), `stream_failed`, `reconnect`
+/// and `stop`. Partial age at display is `display.ms - 1000 * covered_s`,
+/// measured from the take's start rather than the microphone's.
 pub(crate) struct StreamTrace {
     started: Instant,
     out: Mutex<Box<dyn Write + Send>>,
@@ -480,7 +480,11 @@ impl StreamTrace {
             started: Instant::now(),
             out: Mutex::new(out),
         };
-        trace.log("start", json!({}));
+        // Wall time too, to line the take up with outside events.
+        let unix_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_millis() as u64);
+        trace.log("start", json!({ "unix_ms": unix_ms }));
         Some(Arc::new(trace))
     }
 
