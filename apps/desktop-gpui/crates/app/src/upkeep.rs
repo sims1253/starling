@@ -1,8 +1,10 @@
 //! History audio upkeep (#342): settled takes are compressed to lossless
-//! FLAC and the user's retention limits (off by default) are applied, in
-//! the background — after startup recovery, then on a slow timer, and
-//! right after the settings are saved. Never while a take records: a
-//! pass does not start then, and a running one stops at its next step.
+//! FLAC, the user's retention limits (off by default) are applied, and
+//! the retention sweep removes deleted takes' audio and superseded
+//! recorder journals for good, in the background — after startup
+//! recovery, then on a slow timer, and right after the settings are
+//! saved. Never while a take records: a pass does not start then, and a
+//! running one stops at its next step.
 
 use std::borrow::Borrow;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -143,6 +145,14 @@ impl StarlingApp {
                 .unwrap_or_default()
             {
                 eprintln!("Could not compress the audio of {id}: {reason}");
+            }
+            if let Ok(report) = &outcome {
+                for file in &report.sweep.swept {
+                    eprintln!("Swept {} {} ({} bytes)", file.kind, file.id, file.bytes);
+                }
+                for (name, reason) in &report.sweep.retained {
+                    eprintln!("Kept {name} at the retention sweep: {reason}");
+                }
             }
             this.update(cx, |app, cx| {
                 app.audio_upkeep.running = false;

@@ -677,15 +677,24 @@ impl Store {
     }
 
     /// History audio upkeep (#342): replace every settled journal with
-    /// its verified FLAC, then apply the retention policy (nothing while
-    /// it is off). The guard covers only the cheap steps — listing the
-    /// candidates, each publish, the policy run — never an encode, so a
-    /// long take's compression does not pin every other store call.
+    /// its verified FLAC, apply the retention policy (nothing while it is
+    /// off), then run the retention sweep. The guard covers only the
+    /// cheap steps — listing the candidates, each publish, the policy
+    /// run, the sweep — never an encode, so a long take's compression
+    /// does not pin every other store call.
     /// `policy` is read under the guard when the policy run starts and
     /// again before each removal, so a limit the user lifted meanwhile is
     /// not applied (the run stops; the app runs again). `paused` is asked
     /// before each compression and before each removal: when it says yes
-    /// (a take started recording), the pass ends there.
+    /// (a take started recording), the pass ends there; the sweep asks it
+    /// too, before each file it removes.
+    ///
+    /// The sweep runs on every pass, retention limits or not: it removes
+    /// for good the audio of takes the user deleted (there is no undo for
+    /// a delete, so no grace period — the next pass after the delete) and
+    /// the recorder journals proven to be copies of a stored take (#356).
+    /// Audio a reader still pins and journals no longer proven copies
+    /// stay, with the reason in the report.
     pub(crate) fn audio_upkeep<P: std::borrow::Borrow<RetentionPolicy>>(
         &self,
         policy: impl Fn() -> P,
@@ -733,6 +742,14 @@ impl Store {
             .apply_retention_policy_now(policy, &paused)
             .map_err(v2_err)?;
         report.paused = report.retention.stopped;
+        if report.paused || paused() {
+            report.paused = true;
+            return Ok(report);
+        }
+        report.sweep = lock_v2(&self.0)
+            .sweep_retention_until(&paused)
+            .map_err(v2_err)?;
+        report.paused = report.sweep.stopped;
         Ok(report)
     }
 
@@ -908,6 +925,8 @@ pub(crate) struct UpkeepReport {
     /// stay journals and are tried again next pass.
     pub failures: Vec<(String, String)>,
     pub retention: store_v2::RetentionReport,
+    /// Deleted and superseded audio removed for good, and what stayed.
+    pub sweep: store_v2::SweepReport,
     /// A take started recording and the pass stopped early.
     pub paused: bool,
 }
@@ -959,6 +978,27 @@ impl UpkeepReport {
             parts.push(format!(
                 "the {class} size limit is still exceeded by {} MB",
                 mb(*bytes)
+            ));
+        }
+        let swept = self.sweep.swept.len();
+        if swept > 0 {
+            parts.push(format!(
+                "permanently removed {swept} deleted or duplicate audio file{} ({} MB)",
+                plural(swept),
+                mb(self.sweep.swept_bytes)
+            ));
+        }
+        let mut retained: Vec<(&str, usize)> = Vec::new();
+        for (_, reason) in &self.sweep.retained {
+            match retained.iter_mut().find(|(seen, _)| *seen == reason.as_str()) {
+                Some((_, count)) => *count += 1,
+                None => retained.push((reason, 1)),
+            }
+        }
+        for (reason, count) in retained {
+            parts.push(format!(
+                "left {count} entr{} in the deleted-audio folders: {reason}",
+                if count == 1 { "y" } else { "ies" }
             ));
         }
         if !self.failures.is_empty() {
@@ -2140,6 +2180,133 @@ mod tests {
         drop(pin);
         let upkeep = store.audio_upkeep(|| policy.clone(), || false).expect("upkeep");
         assert_eq!(upkeep.retention.retired.len(), 1);
+    }
+
+    #[test]
+    fn upkeep_sweeps_deleted_audio_and_proven_duplicate_journals() {
+        let store = v2_store("upkeep-sweep");
+        let root = lock_v2(&store.0).root().to_path_buf();
+        // A take the user deleted: its audio waits in quarantine.
+        let deleted = store.save_capture(tiny_wav(200), None).expect("save").id;
+        store.delete(&deleted).expect("delete");
+        let quarantined = root.join("quarantine").join(format!("{deleted}.sj"));
+        assert!(quarantined.exists());
+        // A faulted recorder journal the stored take provably holds.
+        let samples: Vec<f32> = (0..120).map(|i| (i % 97) as f32 * 0.001).collect();
+        let path = killed_journal(&store, "j_proven", &samples, &[]);
+        let report = recorder::JournalReport {
+            path,
+            id: "j_proven".to_string(),
+            sample_rate: 16_000,
+            acknowledged_samples: samples.len() as u64,
+            finalized: true,
+            fault: Some("fsync failed".to_string()),
+            liveness: Default::default(),
+        };
+        store.save_capture(tiny_wav(300), Some(&report)).expect("save");
+        let superseded = capture_journals_dir(&lock_v2(&store.0)).join(store_v2::SUPERSEDED_SUBDIR);
+        let proven = superseded.join("j_proven.sj");
+        assert!(proven.exists());
+        // A journal under superseded/ that no stored take holds.
+        let path = killed_journal(&store, "j_unproven", &samples, &[]);
+        let unproven = superseded.join("j_unproven.sj");
+        std::fs::rename(&path, &unproven).expect("place journal");
+
+        // Nothing is swept while a take records.
+        let upkeep = store
+            .audio_upkeep(store_v2::RetentionPolicy::default, || true)
+            .expect("upkeep");
+        assert!(upkeep.paused);
+        assert!(upkeep.sweep.swept.is_empty() && upkeep.sweep.retained.is_empty());
+        assert!(quarantined.exists() && proven.exists() && unproven.exists());
+
+        // The next pass removes both copies; the unproven journal stays.
+        let upkeep = store
+            .audio_upkeep(store_v2::RetentionPolicy::default, || false)
+            .expect("upkeep");
+        let mut swept: Vec<&str> = upkeep.sweep.swept.iter().map(|file| file.id.as_str()).collect();
+        swept.sort();
+        let mut expected = vec![deleted.as_str(), "j_proven"];
+        expected.sort();
+        assert_eq!(swept, expected, "{upkeep:?}");
+        assert!(upkeep.sweep.swept_bytes > 0);
+        assert!(!quarantined.exists() && !proven.exists());
+        assert!(unproven.exists());
+        assert_eq!(upkeep.sweep.retained.len(), 1, "{upkeep:?}");
+        assert_eq!(upkeep.sweep.retained[0].0, "j_unproven.sj");
+        assert!(upkeep.sweep.retained[0].1.contains("proven"));
+        let summary = upkeep.summary().expect("summary");
+        assert!(
+            summary.contains("permanently removed 2 deleted or duplicate audio files"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("left 1 entry in the deleted-audio folders: no stored take"),
+            "{summary}"
+        );
+    }
+
+    #[test]
+    fn a_deleted_take_read_before_the_delete_is_swept_once_the_read_ends() {
+        let store = v2_store("upkeep-sweep-pin");
+        let id = store.save_capture(tiny_wav(32_000), None).expect("save").id;
+        let upkeep = store
+            .audio_upkeep(store_v2::RetentionPolicy::default, || false)
+            .expect("upkeep");
+        assert_eq!(upkeep.compressed, 1, "{upkeep:?}");
+        // Two reads overlap the delete: the FLAC stays until both end.
+        let first = store.pin_audio(&id);
+        let second = store.pin_audio(&id);
+        store.delete(&id).expect("delete");
+        let quarantined = lock_v2(&store.0)
+            .root()
+            .join("quarantine")
+            .join(format!("{id}.flac"));
+        assert!(quarantined.exists());
+        for pin in [first, second] {
+            let upkeep = store
+                .audio_upkeep(store_v2::RetentionPolicy::default, || false)
+                .expect("upkeep");
+            assert!(upkeep.sweep.swept.is_empty(), "{upkeep:?}");
+            assert_eq!(upkeep.sweep.retained.len(), 1, "{upkeep:?}");
+            assert!(upkeep.sweep.retained[0].1.contains("still being read"));
+            assert!(quarantined.exists());
+            drop(pin);
+        }
+        let upkeep = store
+            .audio_upkeep(store_v2::RetentionPolicy::default, || false)
+            .expect("upkeep");
+        assert_eq!(upkeep.sweep.swept.len(), 1, "{upkeep:?}");
+        assert_eq!(upkeep.sweep.swept[0].id, id);
+        assert!(!quarantined.exists());
+    }
+
+    #[test]
+    fn a_take_starting_to_record_stops_the_sweep_before_its_next_removal() {
+        let store = v2_store("upkeep-sweep-paused");
+        let root = lock_v2(&store.0).root().to_path_buf();
+        let quarantined: Vec<std::path::PathBuf> = (0..2)
+            .map(|_| {
+                let id = store.save_capture(tiny_wav(200), None).expect("save").id;
+                store.delete(&id).expect("delete");
+                root.join("quarantine").join(format!("{id}.sj"))
+            })
+            .collect();
+        // Recording starts as soon as the sweep removed its first file.
+        let upkeep = store
+            .audio_upkeep(store_v2::RetentionPolicy::default, || {
+                quarantined.iter().any(|path| !path.exists())
+            })
+            .expect("upkeep");
+        assert!(upkeep.paused && upkeep.sweep.stopped, "{upkeep:?}");
+        assert_eq!(upkeep.sweep.swept.len(), 1, "{upkeep:?}");
+        assert_eq!(quarantined.iter().filter(|path| path.exists()).count(), 1);
+        // The next pass finishes the job.
+        let upkeep = store
+            .audio_upkeep(store_v2::RetentionPolicy::default, || false)
+            .expect("upkeep");
+        assert_eq!(upkeep.sweep.swept.len(), 1, "{upkeep:?}");
+        assert!(quarantined.iter().all(|path| !path.exists()));
     }
 
     #[test]
