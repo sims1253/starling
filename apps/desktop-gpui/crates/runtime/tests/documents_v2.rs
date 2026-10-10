@@ -278,7 +278,13 @@ fn delivery_prepares_a_revision_committed_before_the_restart() {
     let (runtime, client) = boot(root.path());
     let events = client.subscribe();
     client
-        .send(Some("doc-2"), Command::DocsGet { doc_id: "notes".into(), page: 0 })
+        .send(
+            Some("doc-2"),
+            Command::DocsGet {
+                doc_id: "notes".into(),
+                page: 0,
+            },
+        )
         .expect("get serves the durable document");
     client
         .send(
@@ -291,5 +297,206 @@ fn delivery_prepares_a_revision_committed_before_the_restart() {
         )
         .expect("prepare resolves the durable revision");
     until(&events, "delivery.prepared", Duration::from_secs(5));
+    runtime.shutdown();
+}
+
+/// A held revision id — a committed head or a preserved conflict
+/// candidate — is never written again by `docs.updateHead`, whether the
+/// new revision would commit or conflict, and whether the holding
+/// document is loaded or only durable.
+#[test]
+fn update_head_never_rewrites_a_held_revision_id() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let update = |doc_id: &str, expected_base: u64, rev_id: &str| Command::DocsUpdateHead {
+        doc_id: doc_id.into(),
+        expected_base,
+        new_revision: revision(rev_id, expected_base, "Replaced."),
+    };
+    let taken = |rev_id: &str| {
+        Err(starling_runtime::machine::Rejection::RevisionIdTaken {
+            revision_id: rev_id.into(),
+        })
+    };
+    let original = |rows: &[(String, String, String)]| {
+        assert_eq!(
+            rows,
+            [
+                ("rev-1".into(), "committed".into(), "First head.".into()),
+                (
+                    "rev-raced".into(),
+                    "preserved".into(),
+                    "Stale candidate.".into()
+                ),
+            ]
+        );
+    };
+
+    {
+        let (runtime, client) = boot(root.path());
+        let events = client.subscribe();
+        client
+            .send(
+                Some("doc"),
+                Command::DocsUpdateHead {
+                    doc_id: "notes".into(),
+                    expected_base: 0,
+                    new_revision: revision("rev-1", 0, "First head."),
+                },
+            )
+            .expect("first update accepted");
+        until(&events, "docs.headUpdated", Duration::from_secs(5));
+        client
+            .send(
+                Some("doc"),
+                Command::DocsUpdateHead {
+                    doc_id: "notes".into(),
+                    expected_base: 0,
+                    new_revision: revision("rev-raced", 0, "Stale candidate."),
+                },
+            )
+            .expect("stale update answered");
+        until(&events, "docs.headConflict", Duration::from_secs(5));
+
+        for rev_id in ["rev-1", "rev-raced"] {
+            // Would commit, would conflict, another document.
+            assert_eq!(
+                client.send(Some("doc"), update("notes", 1, rev_id)),
+                taken(rev_id)
+            );
+            assert_eq!(
+                client.send(Some("doc"), update("notes", 0, rev_id)),
+                taken(rev_id)
+            );
+            assert_eq!(
+                client.send(Some("doc"), update("other", 0, rev_id)),
+                taken(rev_id)
+            );
+        }
+        let view = match client
+            .send(
+                Some("doc"),
+                Command::DocsGet {
+                    doc_id: "notes".into(),
+                    page: 0,
+                },
+            )
+            .expect("docs.get served")
+        {
+            Receipt::Served(view) => view,
+            other => panic!("docs.get answered {other:?}"),
+        };
+        assert_eq!(view["headRevision"], 1, "{view}");
+        let rows: Vec<(String, String, String)> = view["revisions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                (
+                    row["revId"].as_str().unwrap().into(),
+                    row["slot"].as_str().unwrap().into(),
+                    row["text"].as_str().unwrap().into(),
+                )
+            })
+            .collect();
+        original(&rows);
+        runtime.shutdown();
+    }
+
+    // Restarted, the holding document never loaded: the durable owner
+    // refuses the id.
+    {
+        let (runtime, client) = boot(root.path());
+        for rev_id in ["rev-1", "rev-raced"] {
+            assert_eq!(
+                client.send(Some("doc"), update("other", 0, rev_id)),
+                taken(rev_id)
+            );
+        }
+        runtime.shutdown();
+    }
+
+    let store = starling_dictation::store_v2::StoreV2::open(root.path()).expect("store reopens");
+    let document = store.get_document("notes").unwrap().expect("document row");
+    assert_eq!(document.head_revision, 1);
+    let rows: Vec<(String, String, String)> = document
+        .revisions
+        .iter()
+        .map(|row| {
+            (
+                row.rev_id.clone(),
+                row.disposition.clone().unwrap_or_default(),
+                row.text.clone(),
+            )
+        })
+        .collect();
+    original(&rows);
+    assert!(store.get_document("other").unwrap().is_none());
+}
+
+/// A store that cannot answer who holds a revision id: the id may belong
+/// to a document this session never loaded, so nothing is written.
+#[test]
+fn an_unverifiable_revision_id_is_refused_without_writing() {
+    use starling_runtime::machine::docs::{DocumentStore, MemoryDocumentStore, RevisionSlot};
+
+    struct OwnerUnknown(std::sync::Arc<MemoryDocumentStore>);
+    impl DocumentStore for OwnerUnknown {
+        fn upsert_document(
+            &self,
+            doc_id: &str,
+            name: &str,
+            head: u64,
+            turn: u32,
+        ) -> Result<(), String> {
+            self.0.upsert_document(doc_id, name, head, turn)
+        }
+        fn store_revision(
+            &self,
+            doc_id: &str,
+            revision: &Revision,
+            slot: RevisionSlot,
+        ) -> Result<(), String> {
+            self.0.store_revision(doc_id, revision, slot)
+        }
+        fn revision_owner(&self, _rev_id: &str) -> Result<Option<String>, String> {
+            Err("disk unavailable".to_string())
+        }
+        fn bump_turn(&self, doc_id: &str, turn_seq: u32) -> Result<(), String> {
+            self.0.bump_turn(doc_id, turn_seq)
+        }
+        fn describe(&self) -> String {
+            "owner-unknown (tests)".to_string()
+        }
+    }
+
+    let store = OwnerUnknown(MemoryDocumentStore::new());
+    let (runtime, client) =
+        Runtime::start(RuntimeConfig::default().with_document_store(std::sync::Arc::new(store)));
+    assert_eq!(
+        client.send(
+            Some("doc"),
+            Command::DocsUpdateHead {
+                doc_id: "notes".into(),
+                expected_base: 0,
+                new_revision: revision("rev-1", 0, "First head."),
+            },
+        ),
+        Err(starling_runtime::machine::Rejection::RevisionIdUnverified {
+            revision_id: "rev-1".into()
+        })
+    );
+    match client
+        .send(
+            Some("doc"),
+            Command::DocsGet {
+                doc_id: "notes".into(),
+                page: 0,
+            },
+        )
+        .expect("docs.get served")
+    {
+        Receipt::Served(view) => assert_eq!(view["found"], false, "{view}"),
+        other => panic!("docs.get answered {other:?}"),
+    }
     runtime.shutdown();
 }

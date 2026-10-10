@@ -385,9 +385,13 @@ pub enum Rejection {
     UnknownJob { job_id: String },
     /// The named revision does not exist (delivery.prepare).
     UnknownRevision { revision_id: String },
-    /// delivery.prepare would register its boundary-adjusted revision
-    /// under an id an unrelated revision already holds.
+    /// A new revision names an id another revision already holds
+    /// (`docs.updateHead`, or the boundary-adjusted revision
+    /// delivery.prepare would register).
     RevisionIdTaken { revision_id: String },
+    /// The durable store could not say whether a revision id is free;
+    /// nothing was written (retryable).
+    RevisionIdUnverified { revision_id: String },
     /// The named delivery does not exist or is not in the required state.
     UnknownDelivery { delivery_id: String },
     /// The machine's bounded inbox is full; retry.
@@ -425,6 +429,9 @@ impl std::fmt::Display for Rejection {
             }
             Rejection::RevisionIdTaken { revision_id } => {
                 write!(f, "revision id {revision_id:?} is taken by an unrelated revision")
+            }
+            Rejection::RevisionIdUnverified { revision_id } => {
+                write!(f, "could not verify that revision id {revision_id:?} is free; retry")
             }
             Rejection::UnknownDelivery { delivery_id } => {
                 write!(f, "unknown delivery {delivery_id:?}")
@@ -549,6 +556,10 @@ mod tests {
             (
                 Rejection::RevisionIdTaken { revision_id: "rev-1".into() },
                 serde_json::json!({ "RevisionIdTaken": { "revision_id": "rev-1" } }),
+            ),
+            (
+                Rejection::RevisionIdUnverified { revision_id: "rev-1".into() },
+                serde_json::json!({ "RevisionIdUnverified": { "revision_id": "rev-1" } }),
             ),
             (
                 Rejection::UnknownDelivery { delivery_id: "d-1".into() },

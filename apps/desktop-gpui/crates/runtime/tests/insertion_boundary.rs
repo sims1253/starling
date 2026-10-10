@@ -511,6 +511,34 @@ fn apply_rechecks_the_boundary_and_target_after_registering() {
     session.runtime.shutdown();
 }
 
+/// A derivation prepare already recorded is delivered as is: apply reads
+/// the boundary once and does not wait on the document service, so the
+/// target is revalidated only once.
+#[test]
+fn apply_delivers_the_derivation_prepare_recorded_without_waiting() {
+    let mut session = Session::start(ScriptedAdapter::new());
+    session.commit("notes", "rev-1", "Fox jumps");
+    let delivery = session.prepare("rev-1", "mid-sentence");
+    let reads = session.adapter.reads();
+    // A second revalidation would report a conflict.
+    session
+        .adapter
+        .queued_revalidations
+        .lock()
+        .unwrap()
+        .extend([
+            Revalidation::Unchanged,
+            Revalidation::Changed {
+                expected: "mid-sentence".into(),
+                actual: "elsewhere".into(),
+            },
+        ]);
+    assert_eq!(session.apply(delivery).type_name(), "delivery.confirmed");
+    assert_eq!(session.adapter.reads(), reads + 1);
+    assert_eq!(session.adapter.inserted().last().unwrap(), " fox jumps");
+    session.runtime.shutdown();
+}
+
 #[test]
 fn protected_and_hint_only_fields_are_never_adjusted() {
     let adapter = ScriptedAdapter::new();
@@ -670,4 +698,99 @@ fn derived_revisions_persist_in_storage_v2_and_the_context_does_not() {
     for row in &document.revisions {
         assert!(!format!("{row:?}").contains("Zanzibar"), "{row:?}");
     }
+}
+
+/// A recorded derived revision's id is never written again through
+/// `docs.updateHead` — neither as a new head nor as a conflict candidate,
+/// in its own document or another — so the delivered text stays the
+/// recorded one in memory, in storage and after a restart.
+#[test]
+fn update_head_never_rewrites_a_derived_revision() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let config = || {
+        let store = V2DocumentStore::open(root.path()).expect("v2 document store opens");
+        RuntimeConfig::default().with_document_store(Arc::new(store))
+    };
+    let update = |doc_id: &str, expected_base: u64| Command::DocsUpdateHead {
+        doc_id: doc_id.into(),
+        expected_base,
+        new_revision: Revision {
+            rev_id: "r:boundary-space".to_string(),
+            base_revision: expected_base,
+            source_attempt_ids: vec!["att-9".to_string()],
+            instruction_template_id: "tpl-none".to_string(),
+            text: "Replaced".to_string(),
+            status: "candidate".to_string(),
+            provenance: "recognition".to_string(),
+        },
+    };
+    let taken = Err(Rejection::RevisionIdTaken {
+        revision_id: "r:boundary-space".into(),
+    });
+    let recorded = vec![
+        (
+            "r".to_string(),
+            "committed".to_string(),
+            "Next one".to_string(),
+            None,
+        ),
+        derived("r:boundary-space", " Next one", "r"),
+    ];
+
+    let mut session = Session::start_with(config(), ScriptedAdapter::new());
+    session.commit("notes", "r", "Next one");
+    assert_eq!(session.deliver("r", "after-period"), " Next one");
+    session.seen.clear();
+    // As the next head, as a stale-base conflict candidate, and in
+    // another document.
+    assert_eq!(session.client.send(Some("doc"), update("notes", 1)), taken);
+    assert_eq!(session.client.send(Some("doc"), update("notes", 0)), taken);
+    assert_eq!(session.client.send(Some("doc"), update("other", 0)), taken);
+    // The machine was left untouched: the next update commits normally.
+    let mut next = match update("notes", 1) {
+        Command::DocsUpdateHead { new_revision, .. } => new_revision,
+        _ => unreachable!(),
+    };
+    next.rev_id = "r-2".to_string();
+    session
+        .client
+        .send(
+            Some("doc"),
+            Command::DocsUpdateHead {
+                doc_id: "notes".into(),
+                expected_base: 1,
+                new_revision: next,
+            },
+        )
+        .expect("updateHead accepted");
+    session.until("docs.headUpdated");
+    assert!(
+        !session
+            .seen
+            .iter()
+            .any(|event| event.type_name() == "docs.headConflict"),
+        "{:?}",
+        session.seen
+    );
+    let view = session.docs_get("notes");
+    assert_eq!(view["headRevision"], 2, "{view}");
+    assert_eq!(revisions(&view)[..2], recorded[..]);
+    assert_eq!(session.docs_get("other")["found"], false);
+    assert_eq!(session.deliver("r:boundary-space", "plain"), " Next one");
+    session.runtime.shutdown();
+
+    // After a restart, also while the holding document is not loaded.
+    let session = Session::start_with(config(), ScriptedAdapter::new());
+    assert_eq!(session.client.send(Some("doc"), update("other", 0)), taken);
+    assert_eq!(session.client.send(Some("doc"), update("notes", 2)), taken);
+    assert_eq!(revisions(&session.docs_get("notes"))[..2], recorded[..]);
+    session.runtime.shutdown();
+
+    let store = StoreV2::open(root.path()).expect("store reopens");
+    let document = store.get_document("notes").unwrap().expect("document row");
+    let row = &document.revisions[1];
+    assert_eq!(row.rev_id, "r:boundary-space");
+    assert_eq!(row.text, " Next one");
+    assert_eq!(row.disposition.as_deref(), Some("derived"));
+    assert!(store.get_document("other").unwrap().is_none());
 }

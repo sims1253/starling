@@ -625,6 +625,13 @@ impl DocsActor {
                 expected_base,
                 new_revision,
             } => {
+                // A held revision id is never written again: neither the
+                // head nor a conflict candidate may replace its row.
+                self.hydrate(&doc_id);
+                if let Some(rejection) = self.claimed(&doc_id, &new_revision.rev_id) {
+                    let _ = reply.try_send(Err(rejection));
+                    return;
+                }
                 match self.core.commit_command("docs.updateHead", Some(corr.clone())) {
                     Ok(_) => {
                         let _ = reply.try_send(Ok(Receipt::Accepted));
@@ -759,12 +766,13 @@ impl DocsActor {
             candidate.base_revision = expected_base;
             // The candidate is retained for explicit user choice — the
             // conflict persists until the user acts.
-            record
-                .revisions
-                .push(StoredRevision::new(candidate, RevisionSlot::Preserved));
+            record.revisions.push(StoredRevision::new(
+                candidate.clone(),
+                RevisionSlot::Preserved,
+            ));
             if let Err(detail) = self
                 .store
-                .store_revision(&doc_id, &revision, RevisionSlot::Preserved)
+                .store_revision(&doc_id, &candidate, RevisionSlot::Preserved)
             {
                 report_store_failure("store_revision(preserved)", &doc_id, detail);
             }
@@ -793,15 +801,8 @@ impl DocsActor {
         revision: Revision,
     ) -> Result<(), Rejection> {
         self.hydrate(&doc_id);
-        let held = self.documents.iter().find_map(|(held_doc, record)| {
-            record
-                .revisions
-                .iter()
-                .find(|stored| stored.revision.rev_id == revision.rev_id)
-                .map(|stored| (held_doc, stored))
-        });
-        if let Some((held_doc, stored)) = held {
-            let same = *held_doc == doc_id
+        if let Some((held_doc, stored)) = self.held(&revision.rev_id) {
+            let same = held_doc == doc_id
                 && stored.slot == RevisionSlot::Derived
                 && stored.derived_from.as_deref() == Some(derived_from.as_str())
                 && stored.revision == revision;
@@ -813,16 +814,8 @@ impl DocsActor {
                 })
             };
         }
-        // Every hydrated document was checked above, so a durable owner is
-        // a document this session has not loaded (or a row it could not).
-        match self.store.revision_owner(&revision.rev_id) {
-            Ok(None) => {}
-            Ok(Some(_)) => {
-                return Err(Rejection::RevisionIdTaken {
-                    revision_id: revision.rev_id,
-                })
-            }
-            Err(detail) => report_store_failure("revision_owner", &doc_id, detail),
+        if let Some(rejection) = self.claimed(&doc_id, &revision.rev_id) {
+            return Err(rejection);
         }
         let Some(record) = self.documents.get_mut(&doc_id) else {
             return Err(Rejection::UnknownRevision {
@@ -842,6 +835,41 @@ impl DocsActor {
             .expect("revision registry lock")
             .insert(revision.rev_id.clone(), (doc_id, revision));
         Ok(())
+    }
+
+    /// The hydrated document and stored revision holding `rev_id`.
+    fn held(&self, rev_id: &str) -> Option<(&str, &StoredRevision)> {
+        self.documents.iter().find_map(|(doc_id, record)| {
+            record
+                .revisions
+                .iter()
+                .find(|stored| stored.revision.rev_id == rev_id)
+                .map(|stored| (doc_id.as_str(), stored))
+        })
+    }
+
+    /// Why `rev_id` cannot be claimed by a new revision: a hydrated
+    /// document or the durable store already holds it (also a document
+    /// this session never loaded), or the store could not say whether one
+    /// does — the write it would guard replaces a same-document row.
+    fn claimed(&self, doc_id: &str, rev_id: &str) -> Option<Rejection> {
+        if self.held(rev_id).is_some() {
+            return Some(Rejection::RevisionIdTaken {
+                revision_id: rev_id.to_string(),
+            });
+        }
+        match self.store.revision_owner(rev_id) {
+            Ok(None) => None,
+            Ok(Some(_)) => Some(Rejection::RevisionIdTaken {
+                revision_id: rev_id.to_string(),
+            }),
+            Err(detail) => {
+                report_store_failure("revision_owner", doc_id, detail);
+                Some(Rejection::RevisionIdUnverified {
+                    revision_id: rev_id.to_string(),
+                })
+            }
+        }
     }
 
     /// The `docs.get` view: document head + one page of revisions (page 0
