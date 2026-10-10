@@ -15,8 +15,9 @@
 //!
 //! A connection that fails mid-take is reopened a bounded number of times
 //! and the whole take so far is replayed to it, since a new server session
-//! starts empty. Its previews stay hidden until they hold as many words as
-//! the last one shown, so the staging draft does not step back while the
+//! starts empty. Its previews stay hidden until they repeat the words the
+//! draft already made final and hold as many words as the last one shown,
+//! so the draft neither steps back nor shifts its word indices while the
 //! server catches up. The seam is kept small for #220, which moves this
 //! worker into the runtime host.
 
@@ -45,6 +46,9 @@ const RECONNECT_DELAY: Duration = Duration::from_millis(500);
 /// journal flush, or a replay after a reconnect, goes out as a run of
 /// frames the bounded command channel can push back on.
 const MAX_FRAME_SECONDS: usize = 1;
+/// The most frames one step sends, so a long catch-up still polls
+/// previews and notices a stop between runs of frames.
+const MAX_FRAMES_PER_STEP: usize = 4;
 
 /// The connection the worker sends audio on and polls previews from.
 pub(crate) trait StreamClient: Send + 'static {
@@ -132,10 +136,16 @@ struct PumpCore<C> {
     degradation: Option<String>,
     /// Words in the newest preview handed to the UI.
     shown_words: usize,
-    /// A replayed connection's previews stay hidden below this many words.
-    replay_floor: usize,
+    /// The longest stable prefix handed to the UI: the words the staging
+    /// draft has made final.
+    stable_prefix: Vec<String>,
+    /// After a reconnect: previews stay hidden until one repeats
+    /// `stable_prefix` word for word and holds at least `shown_words`.
+    replaying: bool,
     partials: watch::Sender<Option<Partial>>,
     trace: Option<Arc<StreamTrace>>,
+    /// Set by [`StreamPump::finish`]; a step checks it between frames.
+    stop: Arc<AtomicBool>,
 }
 
 impl<C: StreamClient> PumpCore<C> {
@@ -157,8 +167,9 @@ impl<C: StreamClient> PumpCore<C> {
     }
 
     /// Sends acknowledged audio past the connection's watermark, up to
-    /// [`MAX_FRAME_SECONDS`] per message, until it is all queued or the
-    /// connection pushes back.
+    /// [`MAX_FRAME_SECONDS`] per message and [`MAX_FRAMES_PER_STEP`]
+    /// messages, until it is all queued, the connection pushes back or the
+    /// take stops.
     fn send_acknowledged(&mut self) -> Result<(), Failure> {
         let Some(stream) = self.stream.as_ref() else {
             return Ok(());
@@ -170,7 +181,12 @@ impl<C: StreamClient> PumpCore<C> {
             / quantum
             * quantum;
         let frame = ((self.rate as usize).max(1) * MAX_FRAME_SECONDS / quantum).max(1) * quantum;
-        while self.sent < acknowledged {
+        for _ in 0..MAX_FRAMES_PER_STEP {
+            // A stop does not wait for a catch-up: what is unsent goes out
+            // with the stop path's remainder, off the UI thread.
+            if self.sent >= acknowledged || self.stop.load(Ordering::Acquire) {
+                break;
+            }
             let end = acknowledged.min(self.sent + frame);
             let wav = starling_dictation::audio::encode_wav_16k_parts(
                 &self.samples[self.sent..end],
@@ -192,12 +208,29 @@ impl<C: StreamClient> PumpCore<C> {
     }
 
     fn show(&mut self, partial: Partial) {
-        let words = partial.text.split_ascii_whitespace().count();
-        if words < self.replay_floor {
-            return;
+        let words: Vec<&str> = partial.text.split_ascii_whitespace().collect();
+        if self.replaying {
+            // The draft keeps its word indices across the reconnect: a
+            // replayed preview that disagrees with the words it already
+            // made final, or that has not caught up yet, would misplace
+            // the user's edits. The final settles the take either way.
+            let caught_up = words.len() >= self.shown_words
+                && words
+                    .iter()
+                    .zip(&self.stable_prefix)
+                    .filter(|(word, known)| *word == known)
+                    .count()
+                    == self.stable_prefix.len();
+            if !caught_up {
+                return;
+            }
+            self.replaying = false;
         }
-        self.replay_floor = 0;
-        self.shown_words = words;
+        let stable = partial.stable_words.min(words.len());
+        if stable > self.stable_prefix.len() {
+            self.stable_prefix = words[..stable].iter().map(|word| word.to_string()).collect();
+        }
+        self.shown_words = words.len();
         self.partials.send_replace(Some(partial));
     }
 
@@ -233,7 +266,7 @@ impl<C: StreamClient> PumpCore<C> {
                 // A new session starts empty: the whole take goes again.
                 self.stream = Some(stream);
                 self.sent = 0;
-                self.replay_floor = self.shown_words;
+                self.replaying = true;
             }
             Err(reason) => self.fail(Failure::Stream(reason), now),
         }
@@ -282,6 +315,7 @@ impl<C: StreamClient> StreamPump<C> {
         trace: Option<Arc<StreamTrace>>,
     ) -> (Self, watch::Receiver<Option<Partial>>) {
         let (partials, receiver) = watch::channel(None);
+        let stop = Arc::new(AtomicBool::new(false));
         let core = Arc::new(Mutex::new(PumpCore {
             tap,
             rate,
@@ -295,11 +329,12 @@ impl<C: StreamClient> StreamPump<C> {
             last_failure: None,
             degradation: None,
             shown_words: 0,
-            replay_floor: 0,
+            stable_prefix: Vec::new(),
+            replaying: false,
             partials,
             trace: trace.clone(),
+            stop: Arc::clone(&stop),
         }));
-        let stop = Arc::new(AtomicBool::new(false));
         let thread = {
             let core = Arc::clone(&core);
             let stop = Arc::clone(&stop);
@@ -528,18 +563,35 @@ impl StreamTrace {
                     "audio_s": field("audio_s"),
                 }),
             ),
-            Some("final") => self.log(
-                "final",
-                json!({
-                    "words": words,
-                    "audio_s": field("audio_s"),
-                    "stop": field("stop").map(|stop| json!({
-                        "path": stop.get("path"),
-                        "unfinalized_s": stop.get("unfinalized_s"),
-                    })),
-                    "totals": field("totals"),
-                }),
-            ),
+            Some("final") => {
+                // The stop's own calls, with their audio spans, show
+                // whether the stop decoded only the tail.
+                let stop = field("stop");
+                let stop_t0 = stop
+                    .as_ref()
+                    .and_then(|stop| stop.get("t0_ms"))
+                    .and_then(Value::as_f64);
+                let stop_calls: Vec<Value> = field("calls")
+                    .and_then(|calls| calls.as_array().cloned())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|call| {
+                        let t0 = call.get("t0_ms").and_then(Value::as_f64);
+                        matches!((t0, stop_t0), (Some(t0), Some(stop_t0)) if t0 >= stop_t0)
+                    })
+                    .collect();
+                self.log(
+                    "final",
+                    json!({
+                        "words": words,
+                        "audio_s": field("audio_s"),
+                        "stop": stop,
+                        "stop_calls": stop_calls,
+                        "by_kind": field("by_kind"),
+                        "totals": field("totals"),
+                    }),
+                )
+            }
             Some("error") => self.log("error", json!({ "message": payload.get("message") })),
             _ => {}
         }
@@ -710,9 +762,11 @@ mod tests {
             last_failure: None,
             degradation: None,
             shown_words: 0,
-            replay_floor: 0,
+            stable_prefix: Vec::new(),
+            replaying: false,
             partials,
             trace: None,
+            stop: Arc::new(AtomicBool::new(false)),
         };
         (core, receiver)
     }
@@ -832,6 +886,53 @@ mod tests {
     }
 
     #[test]
+    fn nothing_reaches_the_ui_after_finish_and_a_catch_up_does_not_delay_it() {
+        // The real thread: a preview published before Stop is the last
+        // one; after `finish` the channel is closed, so a preview the
+        // server sends later can never be shown (the app's generation
+        // check covers one still queued in the foreground task).
+        let tap = FakeTap::default();
+        let stream = FakeStream::default();
+        let (pump, mut previews) = StreamPump::start(
+            Box::new(tap.clone()),
+            16_000,
+            stream.clone(),
+            Box::new(|| Err("unused".into())),
+            None,
+        );
+        stream.preview("before stop", 0);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !previews.has_changed().unwrap() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(shown(&mut previews).as_deref(), Some("before stop"));
+        // A long stall is acknowledged at once: a minute of audio to catch
+        // up on when Stop lands.
+        let audio = speech(0, 16_000 * 60);
+        tap.capture(&audio);
+        tap.acknowledge_all();
+        let stopped = Instant::now();
+        let handoff = pump.finish();
+        assert!(
+            stopped.elapsed() < Duration::from_millis(500),
+            "stop waited {:?} for the catch-up",
+            stopped.elapsed()
+        );
+        stream.preview("after stop", 0);
+        std::thread::sleep(TICK * 4);
+        assert!(previews.has_changed().is_err(), "the worker is gone");
+        assert_eq!(previews.borrow().as_ref().map(|p| p.text.as_str()), Some("before stop"));
+        // Whatever the catch-up had not sent goes out as the remainder.
+        let mut take = handoff.samples;
+        take.extend(tap.stop());
+        assert_eq!(take, audio);
+        assert!(handoff.sent < audio.len());
+        let live = handoff.stream.unwrap();
+        assert!(live.send_audio(encode_wav_16k_parts(&take[handoff.sent..], 16_000, 1).unwrap()));
+        assert_eq!(live.audio(), expected(&audio));
+    }
+
+    #[test]
     fn a_dropped_connection_is_reopened_and_the_take_replayed() {
         let tap = FakeTap::default();
         let first = FakeStream::default();
@@ -856,6 +957,10 @@ mod tests {
         assert_eq!(first.audio(), expected(&audio[..20_000]));
         // Catching up: a shorter preview would step the draft back.
         second.preview("one two", 0);
+        core.step(start + RECONNECT_DELAY);
+        assert_eq!(shown(&mut previews), None);
+        // Nor may one that moves the words the draft already made final.
+        second.preview("zero one two three four five", 3);
         core.step(start + RECONNECT_DELAY);
         assert_eq!(shown(&mut previews), None);
         second.preview("one two three four five", 3);
