@@ -1521,14 +1521,31 @@ mod tests {
                 40,
                 "the answer from before the connection"
             );
-            assert!(
-                !app.engine_revisions.contains_key("an-older-host"),
-                "another host's revision is let go"
-            );
         });
         drop(app);
         host.shutdown();
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Another host's answer to this window's `Configure` does not have
+    /// the window adopt the status in hand: it is the connected host's,
+    /// from before the change, and would undo it.
+    #[gpui::test]
+    fn another_hosts_configure_answer_keeps_the_settings_just_sent(cx: &mut gpui::TestAppContext) {
+        use starling_runtime_host::engine::{EngineReply, EngineStatus};
+        let app = cx.new(|cx| StarlingApp::for_test(None, cx));
+        app.update(cx, |app, cx| {
+            app.engine_settings.mode = starling_dictation::settings::EngineMode::Builtin;
+            app.engine_settings.backend_override = Some("cpu".to_string());
+            app.engine_status = Some(EngineStatus::without_engine());
+            app.engine_configuring = 1;
+            app.configure_answered(
+                Some("the-next-host".to_string()),
+                Ok(EngineReply::Done { revision: 3 }),
+                cx,
+            );
+            assert_eq!(app.engine_settings.backend_override.as_deref(), Some("cpu"));
+        });
     }
 
     /// An activation the host never takes on leaves nothing waiting: a

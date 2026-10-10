@@ -352,7 +352,8 @@ pub struct StarlingApp {
     /// each host at (by lease id): a status from the connected host older
     /// than its entry is not adopted. Kept per host, as revisions count
     /// per host and an answer can arrive before the window has taken in
-    /// the connection to the host that gave it.
+    /// the connection to the host that gave it; never pruned (one entry
+    /// per host instance this window configured).
     pub(crate) engine_revisions: std::collections::HashMap<String, u64>,
     /// The model this window asked the engine to switch to: once it
     /// serves, this window persists it as the active model.

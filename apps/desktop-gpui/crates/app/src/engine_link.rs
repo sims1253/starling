@@ -74,6 +74,12 @@ impl StarlingApp {
         // the request was made: a request queued across a reconnect lands
         // on the new host, and its revision is the new host's — possibly
         // before this window has taken in that connection.
+        let connected = self
+            .host
+            .client
+            .as_ref()
+            .map(|client| client.info.owner_id.as_str());
+        let elsewhere = host.is_some() && host.as_deref() != connected;
         match reply {
             Ok(EngineReply::Done { revision } | EngineReply::Activating { revision, .. }) => {
                 if let Some(host) = host {
@@ -85,8 +91,10 @@ impl StarlingApp {
             Err(message) => self.error = Some(message),
         }
         // Statuses that arrived while this was out were not adopted:
-        // the newest one is, now that nothing of this window's is.
-        if self.engine_configuring == 0 {
+        // the newest one is, now that nothing of this window's is — unless
+        // another host answered, whose status (after this change) is still
+        // to come: the one in hand is the connected host's.
+        if self.engine_configuring == 0 && !elsewhere {
             if let Some(status) = self.engine_status.clone() {
                 self.adopt_engine_settings(&status, cx);
             }
@@ -146,24 +154,11 @@ impl StarlingApp {
         .detach();
     }
 
-    /// A new connection to the recording service: only its host's
-    /// revisions matter from now on (one answered before this connection
-    /// was taken in is kept). Statuses need no host of their own: the
-    /// link reports `HostUpdate::Connected` before `follow()` forwards the
-    /// connection's first frame, so every status read after this is the
-    /// connected host's.
-    pub(crate) fn engine_connected(&mut self) {
-        let host = self
-            .host
-            .client
-            .as_ref()
-            .map(|client| client.info.owner_id.clone());
-        self.engine_revisions
-            .retain(|answered, _| Some(answered) == host.as_ref());
-    }
-
     /// The revision this window's answered `Configure`s left the
-    /// connected host at (0 when none did).
+    /// connected host at (0 when none did). Statuses need no host of
+    /// their own: the link reports `HostUpdate::Connected` before
+    /// `follow()` forwards the connection's first frame, so every status
+    /// read is the connected host's.
     pub(crate) fn engine_revision(&self) -> u64 {
         self.host
             .client
