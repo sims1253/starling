@@ -117,6 +117,12 @@ impl TranscriberLink {
         });
     }
 
+    /// Recovery brought back stored takes `ids`: those waiting to be
+    /// transcribed are queued now rather than at a later look.
+    pub(crate) fn recovered(&self, ids: Vec<String>) {
+        self.send(Msg::Recovered { ids });
+    }
+
     pub(crate) fn request(
         &self,
         conn: &Arc<ConnState>,
@@ -160,6 +166,9 @@ enum Msg {
     JobDone {
         stored_id: String,
         last: Option<FinalFrame>,
+    },
+    Recovered {
+        ids: Vec<String>,
     },
     Shutdown,
 }
@@ -338,6 +347,20 @@ impl Coordinator {
         match msg {
             Msg::Started { take, monitor } => self.take_started(take, monitor),
             Msg::Ended { take, record } => self.take_ended(&take, record),
+            // A take without the intent is not claimed: its job ends
+            // quietly.
+            Msg::Recovered { ids } => {
+                for stored_id in ids {
+                    self.enqueue(Job {
+                        stored_id,
+                        take: None,
+                        req: None,
+                        hold: None,
+                        owner: None,
+                        source: Source::Due,
+                    });
+                }
+            }
             Msg::Persisted {
                 take,
                 stored_id,

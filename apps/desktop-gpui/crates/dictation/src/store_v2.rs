@@ -1081,8 +1081,9 @@ impl StoreV2 {
 
     /// [`Self::commit_capture`] that also records, in the same
     /// transaction, the recorder journal the take is stored in place of
-    /// ([`TakeMeta::supersedes_journal`]) and, for a complete take, the
-    /// intent to transcribe it ([`TakeMeta::transcribe`]).
+    /// ([`TakeMeta::supersedes_journal`]) and, when `transcribe` (the
+    /// callers set it only for a take whose audio is complete), the intent
+    /// to transcribe it ([`TakeMeta::transcribe`]).
     fn commit_capture_superseding(
         &mut self,
         record: &CaptureRecord,
@@ -1119,7 +1120,7 @@ impl StoreV2 {
                 params![journal_id, record.id],
             )?;
         }
-        if transcribe && record.status == CaptureStatus::Complete {
+        if transcribe {
             tx.execute(
                 "INSERT INTO transcription_intents(capture_id, requested_utc) VALUES (?1, ?2)",
                 params![record.id, now_iso()],
@@ -3857,7 +3858,10 @@ impl StoreV2 {
     /// recovery note from what the verified read found (an empty note
     /// stores none), and `status`, when set, is the row's status in the
     /// same commit — otherwise a torn or unfinalized journal lands
-    /// interrupted and a sealed one complete.
+    /// interrupted and a sealed one complete. `transcribe` records the
+    /// intent to transcribe the take only when the journal itself is
+    /// complete (sealed by its recorder, nothing torn), whatever status
+    /// the row gets.
     fn adopt_journal_with(
         &mut self,
         source: &Path,
@@ -3951,7 +3955,8 @@ impl StoreV2 {
             extra_json: (!note.is_empty()).then(|| merge_extra_note(None, &note)),
             secure_field: false,
         };
-        self.commit_capture_superseding(&record, None, transcribe)?;
+        let complete = was_finalized && torn_tail_bytes == 0;
+        self.commit_capture_superseding(&record, None, transcribe && complete)?;
         Ok(record)
     }
 
@@ -4158,16 +4163,23 @@ impl StoreV2 {
         &mut self,
         journals_dir: &Path,
     ) -> Result<JournalRecovery, StoreV2Error> {
-        self.recover_capture_journals_where(journals_dir, |_| true)
+        self.recover_capture_journals_where(journals_dir, |_| true, false)
     }
 
     /// [`Self::recover_capture_journals`] limited to the journal ids
     /// `wanted` accepts — a second look at the ones an earlier pass
     /// deferred, without making candidates of takes recorded since.
+    /// `transcribe_complete`: a journal its recorder finalized cleanly —
+    /// a take that stopped but whose process died before storing it — is
+    /// adopted with the intent to transcribe it (#220), in the same
+    /// commit, as its own store would have done. A journal cut short by
+    /// the crash never is: what to do with a partial take is the user's
+    /// call.
     pub fn recover_capture_journals_where(
         &mut self,
         journals_dir: &Path,
         wanted: impl Fn(&str) -> bool,
+        transcribe_complete: bool,
     ) -> Result<JournalRecovery, StoreV2Error> {
         let mut report = JournalRecovery::default();
         // No tree yet is nothing to recover; any other failure to list it
@@ -4333,7 +4345,7 @@ impl StoreV2 {
                     continue;
                 }
             };
-            match self.adopt_journal_as(&path, as_id, Some(CaptureStatus::Interrupted), false, |facts| {
+            match self.adopt_journal_as(&path, as_id, Some(CaptureStatus::Interrupted), transcribe_complete, |facts| {
                 recovered_journal_note(facts)
             }) {
                 Ok(record) => report.recovered.push(RecoveredJournal {
@@ -5224,11 +5236,10 @@ impl FinalizedTake {
             extra_json,
             secure_field: self.meta.secure_field,
         };
-        store.commit_capture_superseding(
-            &record,
-            self.meta.supersedes_journal.as_deref(),
-            self.meta.transcribe,
-        )?;
+        // Only a complete take is transcribed by itself: a salvaged one
+        // waits for the user.
+        let transcribe = self.meta.transcribe && record.status == CaptureStatus::Complete;
+        store.commit_capture_superseding(&record, self.meta.supersedes_journal.as_deref(), transcribe)?;
         store.gc_staging()?;
         Ok(CommittedTake { record })
     }

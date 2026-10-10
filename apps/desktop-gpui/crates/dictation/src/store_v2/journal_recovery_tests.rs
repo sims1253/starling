@@ -117,6 +117,51 @@ fn a_journal_still_being_written_is_left_to_its_writer() {
     assert_eq!(report.recovered.len(), 1, "{report:?}");
 }
 
+/// #220: a take that stopped but whose process died before storing it is
+/// recovered with the intent to transcribe it — when the caller asks for
+/// that — and a take cut short by the crash never is.
+#[test]
+fn a_recovered_complete_take_is_due_for_transcription_and_a_cut_one_is_not() {
+    let dir = TempDir::new().expect("tempdir");
+    let mut store = store_in(&dir);
+    let tree = journals(&dir);
+    let stopped = {
+        let mut writer =
+            JournalWriter::create_named(&tree, "j_stopped".to_string(), 16_000).expect("writer");
+        writer.append_frames(&ramp(4_800, 3)).expect("append");
+        writer.finalize().expect("finalize");
+        writer.path().to_path_buf()
+    };
+    age(&stopped, old());
+    {
+        let mut writer =
+            JournalWriter::create_named(&tree, "j_killed".to_string(), 16_000).expect("writer");
+        writer.append_frames(&ramp(4_800, 5)).expect("append");
+        writer.write_boundary().expect("boundary");
+    }
+    let report = store
+        .recover_capture_journals_where(&tree, |_| true, true)
+        .expect("scan");
+    assert_eq!(report.recovered.len(), 2, "{report:?}");
+    assert!(store.transcription_wanted("j_stopped").unwrap());
+    assert!(!store.transcription_wanted("j_killed").unwrap());
+
+    // Without the ask, neither is.
+    let dir = TempDir::new().expect("tempdir");
+    let mut store = store_in(&dir);
+    let tree = journals(&dir);
+    let stopped = {
+        let mut writer =
+            JournalWriter::create_named(&tree, "j_stopped".to_string(), 16_000).expect("writer");
+        writer.append_frames(&ramp(4_800, 3)).expect("append");
+        writer.finalize().expect("finalize");
+        writer.path().to_path_buf()
+    };
+    age(&stopped, old());
+    store.recover_capture_journals(&tree).expect("scan");
+    assert!(!store.transcription_wanted("j_stopped").unwrap());
+}
+
 #[test]
 fn a_freshly_finished_journal_is_left_for_its_save_then_recovered_whole() {
     let dir = TempDir::new().expect("tempdir");
@@ -294,7 +339,7 @@ fn a_second_look_considers_only_the_journals_it_is_asked_about() {
         age(&path, old());
     }
     let report = store
-        .recover_capture_journals_where(&tree, |id| id == "j_deferred")
+        .recover_capture_journals_where(&tree, |id| id == "j_deferred", false)
         .expect("scan");
     assert_eq!(report.recovered.len(), 1, "{report:?}");
     assert_eq!(report.recovered[0].id, "j_deferred");

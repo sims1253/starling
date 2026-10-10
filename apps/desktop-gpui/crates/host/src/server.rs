@@ -853,7 +853,14 @@ pub fn serve(config: HostConfig) -> Result<HostHandle, HostError> {
         },
         {
             let takes = Arc::clone(&takes);
-            move |found| takes.notice(found)
+            let transcriber = transcriber.as_ref().map(|transcriber| transcriber.link());
+            move |found, recovered| {
+                takes.notice(found);
+                // A take it brought back may be due for transcription.
+                if let Some(transcriber) = transcriber {
+                    transcriber.recovered(recovered);
+                }
+            }
         },
     ));
     // The settings follower (#220): while the host serves, engine

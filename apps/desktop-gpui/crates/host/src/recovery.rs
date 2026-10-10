@@ -9,7 +9,10 @@
 //! ([`crate::takes::TakeHub::set_recovery`]): problems for the error
 //! banner, brought-back takes for a notice. Journals the first pass left
 //! to a save that may have been under way get a second look once that
-//! save would long have finished ([`recheck_later`]).
+//! save would long have finished ([`recheck_later`]). A take that had
+//! stopped — its journal finalized — when its host died before storing it
+//! comes back with the intent to transcribe it, as its own commit would
+//! have written: the transcriber takes it from there.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -52,7 +55,7 @@ pub fn recover(
     if let Err(err) = store.interrupt_stale_attempts(STALE_ATTEMPT_NOTE) {
         problems.push(format!("Could not recover interrupted recordings: {err}"));
     }
-    let (notice, recheck) = match store.recover_capture_journals_where(journals, |_| true) {
+    let (notice, recheck) = match store.recover_capture_journals_where(journals, |_| true, true) {
         Ok(recovery) => {
             let found = recovery.problems();
             if !found.is_empty() {
@@ -80,17 +83,25 @@ pub fn recover(
 
 /// The second look (#356): only the deferred ids, once a save that may
 /// have been under way at startup would long have finished — a take this
-/// host started recording since is never a recovery candidate.
-pub fn recheck(store: &mut StoreV2, journals: &Path, ids: &[String]) -> HostRecovery {
-    match store.recover_capture_journals_where(journals, |id| ids.iter().any(|wanted| wanted == id)) {
-        Ok(recovery) => HostRecovery {
-            notice: recovery.recovered_summary(),
-            problems: recovery.problems(),
-        },
-        Err(err) => HostRecovery {
-            notice: String::new(),
-            problems: format!("Could not scan for interrupted recordings: {err}"),
-        },
+/// host started recording since is never a recovery candidate. Also the
+/// ids of the takes it brought back.
+pub fn recheck(store: &mut StoreV2, journals: &Path, ids: &[String]) -> (HostRecovery, Vec<String>) {
+    let wanted = |id: &str| ids.iter().any(|wanted| wanted == id);
+    match store.recover_capture_journals_where(journals, wanted, true) {
+        Ok(recovery) => (
+            HostRecovery {
+                notice: recovery.recovered_summary(),
+                problems: recovery.problems(),
+            },
+            recovery.recovered.into_iter().map(|take| take.id).collect(),
+        ),
+        Err(err) => (
+            HostRecovery {
+                notice: String::new(),
+                problems: format!("Could not scan for interrupted recordings: {err}"),
+            },
+            Vec::new(),
+        ),
     }
 }
 
@@ -99,8 +110,8 @@ pub const RECHECK_AFTER: Duration = Duration::from_secs(2);
 
 /// Runs [`recheck`] on its own thread after
 /// [`FINALIZED_ADOPTION_GRACE`] (+ [`RECHECK_AFTER`]) and hands the
-/// findings to `report`; `None` when there is nothing to look at (or no
-/// thread). The thread gives up as soon as `stopping` says the host is
+/// findings and the recovered takes' ids to `report`; `None` when there
+/// is nothing to look at (or no thread). The thread gives up as soon as `stopping` says the host is
 /// shutting down, and never starts the scan after that: its caller joins
 /// it before releasing the lease.
 pub fn recheck_later(
@@ -108,7 +119,7 @@ pub fn recheck_later(
     journals: PathBuf,
     ids: Vec<String>,
     stopping: impl Fn() -> bool + Send + 'static,
-    report: impl FnOnce(HostRecovery) + Send + 'static,
+    report: impl FnOnce(HostRecovery, Vec<String>) + Send + 'static,
 ) -> Option<std::thread::JoinHandle<()>> {
     if ids.is_empty() {
         return None;
@@ -123,14 +134,14 @@ pub fn recheck_later(
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
-            let found = {
+            let (found, recovered) = {
                 let mut store = store.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                 if stopping() {
                     return;
                 }
                 recheck(&mut store, &journals, &ids)
             };
-            report(found);
+            report(found, recovered);
         });
     match spawned {
         Ok(thread) => Some(thread),
@@ -240,6 +251,60 @@ mod tests {
         assert!(found.recheck.is_empty());
         let record = owner.get_capture("j_killed").unwrap().expect("the recovered take");
         assert_eq!(record.frame_count, 24_000, "exactly what was confirmed");
+    }
+
+    /// A journal its recorder finalized: a take that stopped, placed in
+    /// `journals` as `id` and backdated past the adoption grace (its host
+    /// died before storing it, a while ago).
+    fn stopped_journal(journals: &Path, samples: &[f32], aged: bool) -> String {
+        let scratch = tempfile::tempdir().unwrap();
+        let writer = StoreV2::open(scratch.path()).expect("scratch store");
+        let mut take = writer.begin_take(TakeMeta::for_device("test")).expect("begin");
+        let id = take.id().to_string();
+        take.append_frames(samples).expect("append");
+        take.finalize().expect("finalize");
+        std::fs::create_dir_all(journals).expect("journals tree");
+        let path = journals.join(format!("{id}.sj"));
+        std::fs::rename(scratch.path().join("staging").join(format!("{id}.sj")), &path)
+            .expect("place journal");
+        if aged {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .expect("open")
+                .set_modified(
+                    std::time::SystemTime::now() - FINALIZED_ADOPTION_GRACE - Duration::from_secs(5),
+                )
+                .expect("backdate");
+        }
+        id
+    }
+
+    #[test]
+    fn a_take_stopped_before_it_was_stored_comes_back_due_for_transcription() {
+        let root = tempfile::tempdir().unwrap();
+        let journals = journals_dir(root.path());
+        let stopped = stopped_journal(&journals, &[0.1; 8_000], true);
+        killed_journal(&journals, "j_killed", &[0.2; 8_000], &[]);
+        let fresh = stopped_journal(&journals, &[0.3; 8_000], false);
+        let mut owner = StoreV2::open(root.path()).unwrap();
+        let found = recover(&mut owner, &journals, &ReconciliationReport::default(), None);
+        assert!(found.recovery.notice.contains("Recovered 2 recordings"), "{}", found.recovery.notice);
+        assert!(owner.transcription_wanted(&stopped).unwrap(), "a complete take is due");
+        assert!(!owner.transcription_wanted("j_killed").unwrap(), "a cut take waits for the user");
+        // Just stopped: left for a save that may be under way, then looked
+        // at again — and due too, with its id handed on.
+        assert_eq!(found.recheck, vec![fresh.clone()]);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(journals.join(format!("{fresh}.sj")))
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - FINALIZED_ADOPTION_GRACE - Duration::from_secs(5))
+            .unwrap();
+        let (again, recovered) = recheck(&mut owner, &journals, &found.recheck);
+        assert!(again.notice.contains("Recovered 1 recording"), "{}", again.notice);
+        assert_eq!(recovered, vec![fresh.clone()]);
+        assert!(owner.transcription_wanted(&fresh).unwrap());
     }
 
     #[test]
