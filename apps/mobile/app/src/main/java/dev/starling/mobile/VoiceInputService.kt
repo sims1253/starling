@@ -940,11 +940,14 @@ class VoiceInputService : InputMethodService() {
         return kept
     }
 
-    /** A private take is deleted outright; any other failure stays retryable. */
+    /**
+     * A private take is deleted outright; any other keeps whatever audio it
+     * captured, retryable in Starling (RecordingStore.salvageCapture).
+     */
     private fun discardOrFail(recording: Recording, sensitive: Boolean, message: String) {
         runCatching {
             if (sensitive) application.recordings.delete(recording.id)
-            else application.recordings.markFailed(recording.id, message)
+            else application.recordings.salvageCapture(recording.id, message)
         }
     }
 

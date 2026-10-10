@@ -5,6 +5,7 @@ import java.nio.file.Files
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertThrows
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class WavWriterTest {
@@ -55,6 +56,73 @@ class WavWriterTest {
             assertEquals("RIFF", bytes.copyOfRange(0, 4).toString(Charsets.US_ASCII))
             assertEquals(payload.size, littleEndianInt(bytes, 40))
             assertArrayEquals(payload, bytes.copyOfRange(44, bytes.size))
+        } finally {
+            file.delete()
+            directory.delete()
+        }
+    }
+
+    @Test
+    fun startsWithAValidEmptyHeaderAndCheckpointsRecordTheConfirmedSize() {
+        val directory = Files.createTempDirectory("starling-wav-test").toFile()
+        val file = File(directory, "checkpointed.wav.part")
+        try {
+            val writer = WavWriter(file)
+            // Killed before the first sample: still this app's (empty) WAV.
+            assertArrayEquals(WavWriter.header(0), file.readBytes())
+
+            val first = byteArrayOf(1, 0, 2, 0)
+            writer.write(first, first.size)
+            assertEquals(first.size.toLong(), writer.checkpoint())
+            val second = byteArrayOf(3, 0, 4, 0, 5, 0)
+            writer.write(second, second.size)
+
+            // A process killed now leaves every written chunk; the header
+            // names what the last checkpoint confirmed, and the checkpoint
+            // did not move the append position.
+            val bytes = file.readBytes()
+            assertEquals(44 + first.size + second.size, bytes.size)
+            assertEquals(first.size, littleEndianInt(bytes, 40))
+            assertArrayEquals(first + second, bytes.copyOfRange(44, bytes.size))
+
+            writer.finish()
+            assertEquals(-1L, writer.checkpoint())
+            val finished = file.readBytes()
+            assertEquals(first.size + second.size, littleEndianInt(finished, 40))
+            assertEquals(44 + first.size + second.size, finished.size)
+        } finally {
+            file.delete()
+            directory.delete()
+        }
+    }
+
+    @Test
+    fun checkpointsDuringWritesNeverCorruptThePayload() {
+        val directory = Files.createTempDirectory("starling-wav-test").toFile()
+        val file = File(directory, "concurrent.wav.part")
+        try {
+            val writer = WavWriter(file)
+            val chunk = ByteArray(320) { (it % 127).toByte() }
+            val confirmed = mutableListOf<Long>()
+            val checkpointer = Thread {
+                while (true) {
+                    val size = writer.checkpoint()
+                    if (size < 0) break
+                    confirmed += size
+                }
+            }.apply { start() }
+            repeat(2_000) { writer.write(chunk, chunk.size) }
+            writer.finish()
+            checkpointer.join()
+
+            assertTrue(WavWriter.isOpen(file).not())
+            assertEquals(confirmed.sorted(), confirmed)
+            val bytes = file.readBytes()
+            assertEquals(44 + 2_000 * chunk.size, bytes.size)
+            assertEquals(2_000 * chunk.size, littleEndianInt(bytes, 40))
+            for (offset in 44 until bytes.size step chunk.size) {
+                assertArrayEquals(chunk, bytes.copyOfRange(offset, offset + chunk.size))
+            }
         } finally {
             file.delete()
             directory.delete()

@@ -95,7 +95,7 @@ class StarlingRecognitionService : RecognitionService() {
         )
         if (error != null) {
             session?.close()
-            runCatching { application.recordings.markFailed(recording.id, error) }
+            runCatching { application.recordings.salvageCapture(recording.id, error) }
             sessions.deliver(callback) { it.error(SpeechRecognizer.ERROR_CLIENT) }
             return
         }
@@ -168,6 +168,9 @@ class StarlingRecognitionService : RecognitionService() {
                 }.getOrNull()
                 if (finalized == null) {
                     session?.close()
+                    runCatching {
+                        application.recordings.salvageCapture(settlement.recording.id, "Unable to finalize the private WAV recording")
+                    }
                     sessions.deliver(ending.session.owner) { it.error(SpeechRecognizer.ERROR_CLIENT) }
                     return
                 }
@@ -190,11 +193,15 @@ class StarlingRecognitionService : RecognitionService() {
                 session?.close()
                 runCatching {
                     application.recordings.commitAudio(settlement.recording, settlement.durationSeconds)
+                }.onFailure {
+                    runCatching {
+                        application.recordings.salvageCapture(settlement.recording.id, "Unable to finalize the private WAV recording")
+                    }
                 }
             }
             is RecognitionSessionGuard.Settlement.Fail -> {
                 session?.close()
-                runCatching { application.recordings.markFailed(settlement.recordingId, settlement.message) }
+                runCatching { application.recordings.salvageCapture(settlement.recordingId, settlement.message) }
                 settlement.errorCode?.let { code ->
                     sessions.deliver(ending.session.owner) { it.error(code) }
                 }

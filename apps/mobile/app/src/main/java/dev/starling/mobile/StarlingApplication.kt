@@ -8,6 +8,8 @@ import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
 import android.util.Log
+import dev.starling.mobile.audio.LoopingWavSource
+import dev.starling.mobile.audio.PcmSource
 import dev.starling.mobile.engine.ModelLifetime
 import dev.starling.mobile.engine.OnDeviceBackend
 import dev.starling.mobile.engine.OnDeviceEngine
@@ -102,8 +104,24 @@ class StarlingApplication : Application() {
             recordings,
             backendSettings,
             OnDeviceBackend(onDeviceEngine),
+            injectedFailure = if (BuildConfig.DEBUG) ::debugInjectedFailure else { -> null },
         )
+        if (BuildConfig.DEBUG) PcmSource.debugSource = ::debugTestMicrophone
     }
+
+    /**
+     * Debug-build device-test hooks (#356), driven over `adb shell run-as`:
+     * `files/debug/test-mic.wav` (16 kHz mono PCM16) replaces the
+     * microphone for every capture that starts while it exists, looped at
+     * real-time pace; `files/debug/fail-transcription` makes every
+     * transcription attempt fail after Stop. Release builds never read them.
+     */
+    private fun debugTestMicrophone(): PcmSource? =
+        File(filesDir, "debug/test-mic.wav").takeIf(File::isFile)?.let(LoopingWavSource::fromWav)
+            ?.also { runCatching { Log.i(TAG, "debug: capturing from files/debug/test-mic.wav") } }
+
+    private fun debugInjectedFailure(): String? =
+        if (File(filesDir, "debug/fail-transcription").exists()) "Injected transcription failure (debug test hook)" else null
 
     /**
      * Resource budget for the on-device model (E13): the resident model is

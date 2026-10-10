@@ -625,6 +625,9 @@ class OnDeviceEngine(
         usingLocked { ensureLoadedLocked(model) }
     }
 
+    /** The model file a prepared live session is using. */
+    override fun loadedModelName(): String? = synchronized(lock) { loadedFile?.name }
+
     /** One live-stream window of 16 kHz mono samples. Blocking. */
     override fun transcribeWindow(samples: FloatArray): OnDeviceStreamSession.WindowResult = synchronized(lock) {
         usingLocked {
@@ -640,7 +643,7 @@ class OnDeviceEngine(
                     "the on-device engine returned an error: ${error ?: "unknown error"}",
                 )
             }
-            OnDeviceStreamSession.WindowResult.Text(text)
+            OnDeviceStreamSession.WindowResult.Text(text, loadedFile?.name)
         }
     }
 
@@ -701,15 +704,18 @@ class OnDeviceEngine(
     }
 
     /**
-     * Blocking transcription of a finalized WAV recording. A GPU driver
-     * failure, in the load's warmup or mid-transcription, has freed the
-     * model; it is retried once, and the reload falls back to the CPU engine.
+     * Blocking transcription of a finalized WAV recording, with the active
+     * model or the installed model named [modelName] (a retry with another
+     * model; the active selection does not change). A GPU driver failure, in
+     * the load's warmup or mid-transcription, has freed the model; it is
+     * retried once, and the reload falls back to the CPU engine. A success
+     * names the model file that produced it.
      */
-    fun transcribe(audioFile: File): InferenceResult = synchronized(lock) {
+    fun transcribe(audioFile: File, modelName: String? = null): InferenceResult = synchronized(lock) {
         usingLocked {
-            val result = transcribeLocked(audioFile)
+            val result = transcribeLocked(audioFile, modelName)
             if (result is InferenceResult.Failure && ModelLifetime.isDriverFailure(result.message)) {
-                transcribeLocked(audioFile)
+                transcribeLocked(audioFile, modelName)
             } else {
                 result
             }
@@ -717,8 +723,23 @@ class OnDeviceEngine(
     }
 
     /** Caller holds [lock] inside [usingLocked]. */
-    private fun transcribeLocked(audioFile: File): InferenceResult {
-        ensureLoadedLocked()?.let { return InferenceResult.Failure(it, false) }
+    private fun transcribeLocked(audioFile: File, modelName: String?): InferenceResult {
+        val requested = if (modelName == null) {
+            activeModelFile()
+        } else {
+            installedFile(modelName)
+                ?: return InferenceResult.Failure("The model $modelName is no longer installed.", false)
+        }
+        ensureLoadedLocked(requested)?.let { return InferenceResult.Failure(it, false) }
+        // A live take keeps its model loaded (see ensureLoadedLocked); a
+        // retry that asked for another one must not silently use it.
+        if (modelName != null && loadedFile != requested) {
+            return InferenceResult.Failure(
+                "The model $modelName cannot be loaded while a recording is using ${loadedFile?.name}; " +
+                    "retry once it has finished.",
+                false,
+            )
+        }
 
         val decoded = WavPcm.decodeMonoFloat(audioFile)
             ?: return InferenceResult.Failure("The recording audio could not be decoded.", false)
@@ -752,7 +773,7 @@ class OnDeviceEngine(
         }
         // A single window is the direct path; joining would only normalize.
         val text = if (texts.size == 1) texts[0] else ChunkedTranscription.joinTexts(texts)
-        return InferenceResult.Success(text)
+        return InferenceResult.Success(text, loadedFile?.name)
     }
 
     /**

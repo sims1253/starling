@@ -161,7 +161,7 @@ class RecognizeSpeechActivity : Activity() {
         )
         if (error != null) {
             session?.close()
-            runCatching { application.recordings.markFailed(recording.id, error) }
+            runCatching { application.recordings.salvageCapture(recording.id, error) }
             deliver(RecognizeSpeechOutcome.Outcome(RecognizerIntent.RESULT_AUDIO_ERROR), null, error)
             return
         }
@@ -208,7 +208,7 @@ class RecognizeSpeechActivity : Activity() {
         RecognizeSpeechOutcome.captureEnded(result)?.let { failed ->
             session?.close()
             val message = (result as? CaptureResult.Failed)?.message
-            if (message != null) runCatching { application.recordings.markFailed(recording.id, message) }
+            if (message != null) runCatching { application.recordings.salvageCapture(recording.id, message) }
             deliver(failed, R.string.recognize_failed, message)
             return
         }
@@ -218,7 +218,7 @@ class RecognizeSpeechActivity : Activity() {
             application.recordings.commitAudio(recording, completed.durationSeconds)
         }.getOrElse {
             session?.close()
-            runCatching { application.recordings.markFailed(recording.id, "Unable to finalize the private WAV recording") }
+            runCatching { application.recordings.salvageCapture(recording.id, "Unable to finalize the private WAV recording") }
             deliver(RecognizeSpeechOutcome.Outcome(RecognizerIntent.RESULT_CLIENT_ERROR), R.string.recording_finalize_error)
             return
         }
@@ -252,8 +252,13 @@ class RecognizeSpeechActivity : Activity() {
                 when (result) {
                     is CaptureResult.Completed ->
                         runCatching { application.recordings.commitAudio(recording, result.durationSeconds) }
+                            .onFailure {
+                                runCatching {
+                                    application.recordings.salvageCapture(recording.id, "Unable to finalize the private WAV recording")
+                                }
+                            }
                     is CaptureResult.Failed ->
-                        runCatching { application.recordings.markFailed(recording.id, result.message) }
+                        runCatching { application.recordings.salvageCapture(recording.id, result.message) }
                     CaptureResult.AlreadyStopped -> Unit
                 }
             }

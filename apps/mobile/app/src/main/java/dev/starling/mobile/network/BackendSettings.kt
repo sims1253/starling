@@ -9,6 +9,11 @@ data class BackendConfig(
     val allowTrustedLanHttp: Boolean,
     val model: String = "parakeet",
     val engine: TranscriptionEngine = TranscriptionEngine.REMOTE,
+    /**
+     * An installed on-device model to use instead of the active one (a
+     * retry with another model). Never persisted; null uses the active model.
+     */
+    val onDeviceModel: String? = null,
 )
 
 enum class TranscriptionEngine {

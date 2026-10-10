@@ -7,12 +7,27 @@ import java.io.RandomAccessFile
 object WavPcm {
     data class Decoded(val sampleRate: Int, val samples: FloatArray)
 
+    /** The PCM16 little-endian payload of a mono WAV, byte for byte. */
+    class Pcm16(val sampleRate: Int, val pcm: ByteArray)
+
     /**
      * Mono float32 samples in [-1, 1] from a PCM16 WAV file, or null when the
      * file is not a decodable PCM16 WAVE. The app writes 16 kHz mono; the
      * sample rate is returned so the caller can reject anything else.
      */
-    fun decodeMonoFloat(file: File): Decoded? = runCatching {
+    fun decodeMonoFloat(file: File): Decoded? {
+        val decoded = decodePcm16(file) ?: return null
+        val pcm = decoded.pcm
+        val samples = FloatArray(pcm.size / 2) { index ->
+            val low = pcm[index * 2].toInt() and 0xff
+            val high = pcm[index * 2 + 1].toInt() and 0xff
+            ((high shl 8) or low).toShort() / 32768f
+        }
+        return Decoded(decoded.sampleRate, samples)
+    }
+
+    /** Like [decodeMonoFloat], but the samples stay PCM16 bytes. */
+    fun decodePcm16(file: File): Pcm16? = runCatching {
         RandomAccessFile(file, "r").use { input ->
             val length = input.length()
             if (length < HEADER_BYTES) return null
@@ -55,15 +70,10 @@ object WavPcm {
                 return null
             }
 
-            val pcm = ByteArray(dataRange.second.toInt())
+            val pcm = ByteArray((dataRange.second and 1L.inv()).toInt())
             input.seek(dataRange.first)
             input.readFully(pcm)
-            val samples = FloatArray(pcm.size / 2) { index ->
-                val low = pcm[index * 2].toInt() and 0xff
-                val high = pcm[index * 2 + 1].toInt() and 0xff
-                ((high shl 8) or low).toShort() / 32768f
-            }
-            Decoded(sampleRate, samples)
+            Pcm16(sampleRate, pcm)
         }
     }.getOrNull()
 

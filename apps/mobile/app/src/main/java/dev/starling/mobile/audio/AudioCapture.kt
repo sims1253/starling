@@ -58,7 +58,7 @@ class AudioCapture {
 
     @Volatile
     private var stopRequested = false
-    private var recorder: AudioRecord? = null
+    private var recorder: PcmSource? = null
     private var worker: Thread? = null
     private var writer: WavWriter? = null
     private var workerError: String? = null
@@ -87,39 +87,24 @@ class AudioCapture {
             return@synchronized "A recording is already stopping"
         }
 
-        val minBuffer = AudioRecord.getMinBufferSize(
-            WavWriter.SAMPLE_RATE,
-            AudioFormat.CHANNEL_IN_MONO,
-            AudioFormat.ENCODING_PCM_16BIT,
-        )
-        if (minBuffer <= 0) return@synchronized "This device does not support 16 kHz microphone capture"
+        // Debug builds may stand a test WAV in for the microphone
+        // (PcmSource.debugSource); release builds always open the mic.
+        val testSource = PcmSource.debugSource?.invoke()
+        val bufferSize: Int
+        val audioRecord: PcmSource
+        if (testSource != null) {
+            bufferSize = WavWriter.SAMPLE_RATE / 2
+            audioRecord = testSource
+        } else {
+            val minBuffer = AudioRecord.getMinBufferSize(
+                WavWriter.SAMPLE_RATE,
+                AudioFormat.CHANNEL_IN_MONO,
+                AudioFormat.ENCODING_PCM_16BIT,
+            )
+            if (minBuffer <= 0) return@synchronized "This device does not support 16 kHz microphone capture"
 
-        val bufferSize = maxOf(minBuffer * 2, WavWriter.SAMPLE_RATE / 2)
-        val audioRecord = try {
-            val builder = AudioRecord.Builder()
-                .setAudioSource(MediaRecorder.AudioSource.VOICE_RECOGNITION)
-                .setAudioFormat(
-                    AudioFormat.Builder()
-                        .setSampleRate(WavWriter.SAMPLE_RATE)
-                        .setChannelMask(AudioFormat.CHANNEL_IN_MONO)
-                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                        .build(),
-                )
-                .setBufferSizeInBytes(bufferSize)
-            if (Build.VERSION.SDK_INT >= 31) {
-                // Mic attribution via a context needs API 31; below it the
-                // capture stays self-attributed as it always was.
-                builder.setContext(context)
-            }
-            builder.build()
-        } catch (_: IllegalArgumentException) {
-            return@synchronized "Unable to initialize the microphone"
-        } catch (_: SecurityException) {
-            return@synchronized "Unable to initialize the microphone"
-        }
-        if (audioRecord.state != AudioRecord.STATE_INITIALIZED) {
-            audioRecord.release()
-            return@synchronized "Unable to initialize the microphone"
+            bufferSize = maxOf(minBuffer * 2, WavWriter.SAMPLE_RATE / 2)
+            audioRecord = openMicrophone(context, bufferSize) ?: return@synchronized "Unable to initialize the microphone"
         }
 
         val wavWriter = try {
@@ -130,7 +115,7 @@ class AudioCapture {
         }
 
         try {
-            audioRecord.startRecording()
+            audioRecord.start()
         } catch (_: IllegalStateException) {
             wavWriter.finish()
             audioRecord.release()
@@ -150,7 +135,61 @@ class AudioCapture {
         state = State.RECORDING
         worker = Thread({ captureLoop(audioRecord, wavWriter, bufferSize, onChunk, onEnded) }, "starling-audio-capture")
             .also { it.start() }
+        startCheckpoints(wavWriter)
         null
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun openMicrophone(context: Context, bufferSize: Int): PcmSource? {
+        val audioRecord = try {
+            val builder = AudioRecord.Builder()
+                .setAudioSource(MediaRecorder.AudioSource.VOICE_RECOGNITION)
+                .setAudioFormat(
+                    AudioFormat.Builder()
+                        .setSampleRate(WavWriter.SAMPLE_RATE)
+                        .setChannelMask(AudioFormat.CHANNEL_IN_MONO)
+                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                        .build(),
+                )
+                .setBufferSizeInBytes(bufferSize)
+            if (Build.VERSION.SDK_INT >= 31) {
+                // Mic attribution via a context needs API 31; below it the
+                // capture stays self-attributed as it always was.
+                builder.setContext(context)
+            }
+            builder.build()
+        } catch (_: IllegalArgumentException) {
+            return null
+        } catch (_: SecurityException) {
+            return null
+        }
+        if (audioRecord.state != AudioRecord.STATE_INITIALIZED) {
+            audioRecord.release()
+            return null
+        }
+        return MicrophoneSource(audioRecord)
+    }
+
+    /**
+     * The durability checkpoints of one capture (see [WavWriter.checkpoint]):
+     * every [CHECKPOINT_INTERVAL_MILLIS] the written audio is fsynced and its
+     * size recorded in the header, off the capture thread so a slow flush
+     * can never make the microphone overrun. Ends with the writer.
+     */
+    private fun startCheckpoints(wavWriter: WavWriter) {
+        Thread({
+            try {
+                while (true) {
+                    Thread.sleep(CHECKPOINT_INTERVAL_MILLIS)
+                    // A failed flush (storage error) is retried next interval;
+                    // the capture itself reports write failures.
+                    val confirmed = runCatching { wavWriter.checkpoint() }.getOrNull()
+                    if (confirmed != null && confirmed < 0) return@Thread
+                }
+            } catch (_: InterruptedException) {
+                // Daemon; nothing to clean up.
+            }
+        }, "starling-audio-checkpoint").apply { isDaemon = true }.start()
     }
 
     /**
@@ -360,7 +399,7 @@ class AudioCapture {
     private var writerBytes: Long = 0
 
     private fun captureLoop(
-        audioRecord: AudioRecord,
+        audioRecord: PcmSource,
         wavWriter: WavWriter,
         bufferSize: Int,
         onChunk: AudioChunkListener?,
@@ -370,7 +409,7 @@ class AudioCapture {
         var bytesWritten = 0L
         try {
             while (!stopRequested) {
-                val count = audioRecord.read(buffer, 0, buffer.size, AudioRecord.READ_BLOCKING)
+                val count = audioRecord.read(buffer, buffer.size)
                 when {
                     count > 0 -> {
                         wavWriter.write(buffer, count)
@@ -428,6 +467,14 @@ class AudioCapture {
     private enum class State { IDLE, RECORDING, STOPPING }
 
     companion object {
+        /**
+         * How often a capture's written audio is fsynced and recorded in the
+         * WAV header. A target, not a bound: what a power loss or OS crash
+         * can take back is everything after the last checkpoint that
+         * actually completed (see WavWriter).
+         */
+        const val CHECKPOINT_INTERVAL_MILLIS = 1_000L
+
         /**
          * How long the single stop-executor thread may idle before it
          * exits. Escalated stops are rare, so between captures the
