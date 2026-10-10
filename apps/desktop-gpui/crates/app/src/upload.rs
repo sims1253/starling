@@ -519,6 +519,7 @@ impl StarlingApp {
                     Ok(EngineReply::Refused { message }) | Err(message) => message,
                     Ok(EngineReply::Done { .. }) => "the engine did not switch to it.".to_string(),
                 };
+                app.activation_ended(&pending.model_id);
                 app.pending_retry = None;
                 app.error = Some(format!(
                     "Could not retry with {}: {refusal} The recording is unchanged.",
@@ -559,6 +560,7 @@ impl StarlingApp {
                         // The engine was switched off in Settings while the
                         // model loaded: it will not load for this retry,
                         // and its audio is released.
+                        app.activation_ended(&model_id);
                         app.pending_retry = None;
                         app.error = Some(format!(
                             "The retry with {} was cancelled: the engine changed in \
@@ -600,6 +602,7 @@ impl StarlingApp {
                             true
                         }
                         SwitchProgress::Failed(reason) => {
+                            app.activation_ended(&model_id);
                             app.pending_retry = None;
                             app.error = Some(format!(
                                 "Could not retry with {}: {reason} The recording is unchanged.",
@@ -1403,6 +1406,45 @@ mod tests {
         drop((first, second));
         host.shutdown();
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #220: a lost connection to the recording service takes its
+    /// engine's state with it — no stale snapshot keeps reading as the
+    /// engine the window can use.
+    #[gpui::test]
+    fn a_lost_host_connection_forgets_the_engine_it_reported(cx: &mut gpui::TestAppContext) {
+        let root = scratch("engine-lost");
+        let store = Store::at_test_root(&root);
+        let id = store.save_capture(one_second_wav()).expect("save").id;
+        let (mut host, app) = idle_engine_app(cx, &root, &store, &id);
+        settle(cx, "the engine reported", |cx| {
+            app.read_with(cx, |app, _| app.engine_snapshot().is_some())
+        });
+        host.shutdown();
+        settle(cx, "the connection lost", |cx| {
+            app.read_with(cx, |app, _| app.host.client.is_none())
+        });
+        app.read_with(cx, |app, _| {
+            assert!(app.engine_status.is_none());
+            assert!(app.engine_snapshot().is_none());
+            assert_eq!(app.connection, crate::app::Connection::Offline);
+        });
+        drop(app);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An activation the host never takes on leaves nothing waiting: a
+    /// later Ready for that model (another window's switch) is not this
+    /// window's to persist.
+    #[gpui::test]
+    fn an_activation_that_never_ran_is_not_waited_for(cx: &mut gpui::TestAppContext) {
+        let app = cx.new(|cx| StarlingApp::for_test(None, cx));
+        app.update(cx, |app, cx| app.engine_activate("model-b", cx));
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.engine_activating, None);
+            assert!(app.error.is_some(), "the refusal is shown");
+        });
     }
 
     /// A "Retry with your server" click with no server set up says so

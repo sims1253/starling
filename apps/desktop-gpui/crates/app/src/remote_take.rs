@@ -288,6 +288,7 @@ impl StarlingApp {
                 self.host.gave_up = gave_up;
                 self.host.down_plain = plain;
                 self.host.claiming = None;
+                self.engine_disconnected();
                 self.let_go_of_takes(host_gone, cx);
             }
             HostUpdate::Take(update) => self.take_update(update, cx),

@@ -8,14 +8,18 @@
 //! same code agree and any change to it differs. The app crate is not
 //! part of it: the app binary runs the host as `--runtime-host`, and a
 //! change only to the app's own code leaves the host it runs (and its
-//! wire) as it was. `built` orders two different stamps: the time this
-//! script last ran, which is when the hashed sources last changed.
+//! wire) as it was. This script is hashed too: a change to what it
+//! hashes is a new build. `built` orders two different stamps: the time
+//! this script last ran, which is when the hashed sources last changed.
+//! A file that cannot be read fails the build: a stamp that skipped it
+//! could equal one of different code.
 
 use std::path::{Path, PathBuf};
 
 fn main() {
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("cargo sets it"));
     let watched = [
+        manifest.join("build.rs"),
         manifest.join("src"),
         manifest.join("Cargo.toml"),
         manifest.join("../runtime/src"),
@@ -43,16 +47,22 @@ fn main() {
 
 /// Folds `path` (a file, or a directory walked in name order) into
 /// `hash`: each file's path relative to the manifest, then its bytes.
+/// Panics (failing the build) on anything it cannot read.
 fn fold(hash: &mut Fnv, base: &Path, path: &Path) {
+    let unreadable = |err: std::io::Error| -> ! {
+        panic!("build stamp: cannot read {}: {err}", path.display())
+    };
     if path.is_dir() {
         let mut entries: Vec<PathBuf> = std::fs::read_dir(path)
-            .map(|dir| dir.filter_map(|entry| entry.ok().map(|entry| entry.path())).collect())
-            .unwrap_or_default();
+            .unwrap_or_else(|err| unreadable(err))
+            .map(|entry| entry.map(|entry| entry.path()).unwrap_or_else(|err| unreadable(err)))
+            .collect();
         entries.sort();
         for entry in entries {
             fold(hash, base, &entry);
         }
-    } else if let Ok(bytes) = std::fs::read(path) {
+    } else {
+        let bytes = std::fs::read(path).unwrap_or_else(|err| unreadable(err));
         let name = path.strip_prefix(base).unwrap_or(path);
         hash.write(name.to_string_lossy().as_bytes());
         hash.write(&[0]);

@@ -460,7 +460,10 @@ fn link_loop(
         }
         let may_launch = failed_launches < LAUNCH_ATTEMPTS;
         let launch_now = if may_launch { launch.clone() } else { Launch::Never };
-        let connected = connect_or_launch(&endpoint, &launch_now, &mine).and_then(|client| {
+        // An older host stepping aside is waited for only while the app
+        // neither closes nor asks to start the service again.
+        let cancelled = || stop.load(Ordering::SeqCst) || relaunch.load(Ordering::SeqCst);
+        let connected = connect_or_launch(&endpoint, &launch_now, &mine, &cancelled).and_then(|client| {
             let recovery = client.take_watch_as(&mine).map_err(|err| {
                 LinkError::Failed(format!("the recording service did not answer: {err}"))
             })?;
@@ -699,21 +702,22 @@ enum LinkError {
 
 /// Connects to the host at `endpoint`, starting one first when nothing
 /// serves there (and `launch` allows it), and settles the version
-/// handshake with it as an app of build `mine`.
+/// handshake with it as an app of build `mine` (an older host stepping
+/// aside is waited for until `cancelled`).
 fn connect_or_launch(
     endpoint: &Path,
     launch: &Launch,
     mine: &BuildStamp,
+    cancelled: &dyn Fn() -> bool,
 ) -> Result<HostClient, LinkError> {
+    let stopped = |info: &starling_runtime_host::client::HostInfo| host_stopped(info, cancelled);
     match launch {
-        Launch::SelfAsHost { log } => {
-            connect_versioned(endpoint, mine, || launch_self(log), host_stopped)
-        }
+        Launch::SelfAsHost { log } => connect_versioned(endpoint, mine, || launch_self(log), stopped),
         Launch::Never => connect_versioned(
             endpoint,
             mine,
             || Err("the recording service is not running".to_string()),
-            host_stopped,
+            stopped,
         ),
     }
 }
@@ -727,11 +731,12 @@ const RETIRE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Whether the host `info` describes has exited (allowing it
 /// [`RETIRE_TIMEOUT`] to finish its shutdown — its engine stops on the
-/// way).
-fn host_stopped(info: &starling_runtime_host::client::HostInfo) -> bool {
+/// way). `false` at once when `cancelled`: the app closing (or asking for
+/// a new start) does not wait out an older host's shutdown.
+fn host_stopped(info: &starling_runtime_host::client::HostInfo, cancelled: &dyn Fn() -> bool) -> bool {
     let until = Instant::now() + RETIRE_TIMEOUT;
     while starling_dictation::engine::registry::process_alive(info.pid) {
-        if Instant::now() >= until {
+        if cancelled() || Instant::now() >= until {
             return false;
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -1020,6 +1025,27 @@ impl LiveCapture {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The wait for an older host to stop gives up as soon as the app
+    /// closes or asks for a new start, not after the retire timeout.
+    #[test]
+    fn waiting_for_an_older_host_to_stop_ends_when_cancelled() {
+        let alive = starling_runtime_host::client::HostInfo {
+            protocol: 0,
+            owner_id: String::new(),
+            pid: std::process::id(),
+            max_frame_bytes: 0,
+            rate_max: 0,
+            rate_window_ms: 0,
+            build: None,
+        };
+        let started = Instant::now();
+        assert!(!host_stopped(&alive, &|| true));
+        assert!(started.elapsed() < Duration::from_secs(1), "{:?}", started.elapsed());
+        let cancel_at = Instant::now() + Duration::from_millis(200);
+        assert!(!host_stopped(&alive, &|| Instant::now() >= cancel_at));
+        assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+    }
 
     fn scratch(tag: &str) -> PathBuf {
         // Short: the host's socket path lives under it.

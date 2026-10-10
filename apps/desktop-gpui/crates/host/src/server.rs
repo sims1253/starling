@@ -401,6 +401,9 @@ pub struct HostShared {
     /// wait in (one at a time: a mode switch may drain for seconds).
     engine: Option<Arc<crate::engine::EngineHost>>,
     engine_jobs: Mutex<Option<std::sync::mpsc::Sender<EngineJob>>>,
+    /// Engine requests queued or running: work in hand a retire waits
+    /// for (a switch may drain for seconds, its window already gone).
+    engine_pending: AtomicUsize,
     /// This host's build (see [`crate::version`]).
     build: crate::version::BuildStamp,
     /// Set when a newer app asked this host to step aside and it agreed:
@@ -806,6 +809,7 @@ pub fn serve(config: HostConfig) -> Result<HostHandle, HostError> {
         transcriber_work: transcriber.clone(),
         engine: engine.clone(),
         engine_jobs: Mutex::new(None),
+        engine_pending: AtomicUsize::new(0),
         build: config.build.clone(),
         retire: AtomicBool::new(false),
         admission: std::sync::RwLock::new(()),
@@ -843,7 +847,8 @@ pub fn serve(config: HostConfig) -> Result<HostHandle, HostError> {
         *lock_registry(&shared.engine_jobs) = Some(jobs);
         threads.push(spawn("starling-host-engine", {
             let engine = Arc::clone(engine);
-            move || engine_worker(engine, queue)
+            let shared = Arc::clone(&shared);
+            move || engine_worker(engine, queue, &shared.engine_pending)
         }));
         threads.push(spawn("starling-host-engine-feed", {
             let engine = Arc::clone(engine);
@@ -992,13 +997,16 @@ const ENGINE_FEED_POLL: Duration = Duration::from_millis(200);
 /// The engine worker: carries out the app's engine requests one at a
 /// time (a mode switch may drain in-flight recognitions for seconds; the
 /// connection threads never wait on it) and answers each. Ends when the
-/// queue's sender is dropped at shutdown.
+/// queue's sender is dropped at shutdown. `pending` counts each request
+/// from its queueing until it was carried out.
 fn engine_worker(
     engine: Arc<crate::engine::EngineHost>,
     jobs: std::sync::mpsc::Receiver<EngineJob>,
+    pending: &AtomicUsize,
 ) {
     while let Ok(job) = jobs.recv() {
         let reply = engine.handle(job.request);
+        pending.fetch_sub(1, Ordering::SeqCst);
         if job
             .conn
             .try_deliver(Frame::EngineReply { req: job.req, reply })
@@ -1061,6 +1069,9 @@ fn retire_answer(
         || snapshot.jobs.waiting > 0
     {
         return busy("a recording is being transcribed");
+    }
+    if shared.engine_pending.load(Ordering::SeqCst) > 0 {
+        return busy("a change to the transcription engine is being made");
     }
     if shared.takes.watchers_besides(conn) > 0 {
         return busy("a Starling window of the running version is still open");
@@ -1600,14 +1611,21 @@ fn connection_reader(
                         }
                     }
                     Frame::Engine { req, request } => {
+                        // Counted before it is queued, under admission: a
+                        // retire either refused it or sees it.
                         let queued = match (&shared.engine, &*lock_registry(&shared.engine_jobs)) {
-                            (Some(_), Some(jobs)) => jobs
-                                .send(EngineJob {
+                            (Some(_), Some(jobs)) => {
+                                shared.engine_pending.fetch_add(1, Ordering::SeqCst);
+                                jobs.send(EngineJob {
                                     conn: Arc::clone(&state),
                                     req,
                                     request,
                                 })
-                                .map_err(|job| job.0.req),
+                                .map_err(|job| {
+                                    shared.engine_pending.fetch_sub(1, Ordering::SeqCst);
+                                    job.0.req
+                                })
+                            }
                             (_, _) => Err(req),
                         };
                         if let Err(req) = queued {

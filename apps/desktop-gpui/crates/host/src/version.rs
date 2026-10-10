@@ -33,15 +33,18 @@ impl BuildStamp {
     pub fn current() -> BuildStamp {
         BuildStamp {
             id: env!("STARLING_HOST_BUILD_ID").to_string(),
-            built: env!("STARLING_HOST_BUILT").parse().unwrap_or(0),
+            built: env!("STARLING_HOST_BUILT")
+                .parse()
+                .expect("the build script stamps the build time as a number"),
         }
     }
 
     /// Whether `self` is an older build than `other` (a different build
-    /// built earlier). Two different builds from the same second order
-    /// neither way.
+    /// built earlier). Two different builds from the same second order by
+    /// id, so of any two different builds exactly one is the older: the
+    /// handshake always settles which one serves.
     pub fn older_than(&self, other: &BuildStamp) -> bool {
-        self.id != other.id && self.built < other.built
+        self.id != other.id && (self.built, &self.id) < (other.built, &other.id)
     }
 }
 
@@ -99,5 +102,13 @@ mod tests {
         assert!(a.older_than(&newer));
         assert!(!newer.older_than(&a));
         assert_ne!(a, newer);
+        let same_second = BuildStamp {
+            id: "another".into(),
+            built: 3,
+        };
+        assert!(
+            same_second.older_than(&newer) != newer.older_than(&same_second),
+            "two builds of one second still settle which is older"
+        );
     }
 }

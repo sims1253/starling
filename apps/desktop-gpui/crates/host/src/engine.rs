@@ -712,7 +712,10 @@ impl EngineHost {
             }
             other => {
                 // The rest only need the manager; it is cloned out so a
-                // delete's file work never holds the state lock.
+                // delete's file work never holds the state lock. A
+                // transition waits for them (and they for it): none acts
+                // on a manager a mode switch is shutting down.
+                let _one = lock(&self.transitions);
                 let manager = match &*lock(&self.state) {
                     EngineState::Builtin { manager, .. } => manager.clone(),
                     other_state => return refused(not_running(other_state)),

@@ -119,6 +119,16 @@ impl StarlingApp {
         self.engine_revision = 0;
     }
 
+    /// The connection to the recording service is gone, and its engine
+    /// with it as far as this window knows: no stale snapshot keeps
+    /// reading as serving until a new connection reports the engine.
+    pub(crate) fn engine_disconnected(&mut self) {
+        self.engine_status = None;
+        if self.engine_settings.mode == EngineMode::Builtin {
+            self.connection = Connection::Offline;
+        }
+    }
+
     /// The host reported its engine (on connect, and on every change).
     pub(crate) fn engine_status_update(&mut self, status: EngineStatus, cx: &mut Context<Self>) {
         self.adopt_engine_settings(&status, cx);
@@ -267,12 +277,34 @@ impl StarlingApp {
     /// Download-if-needed then switch to a model (#363).
     pub fn engine_activate(&mut self, id: &str, cx: &mut Context<Self>) {
         self.engine_activating = Some(id.to_string());
-        self.engine_request(
+        let model_id = id.to_string();
+        self.send_engine_request(
             EngineRequest::Activate {
                 model_id: id.to_string(),
             },
             cx,
+            move |app, reply, cx| {
+                match reply {
+                    Ok(EngineReply::Done { .. } | EngineReply::Activating { .. }) => {}
+                    Ok(EngineReply::Refused { message }) | Err(message) => {
+                        // No switch of this window's runs: a later Ready
+                        // for the model (another window's doing) is not
+                        // this window's to persist.
+                        app.activation_ended(&model_id);
+                        app.error = Some(message);
+                    }
+                }
+                cx.notify();
+            },
         );
+    }
+
+    /// The activation of `model_id` this window asked for will not come:
+    /// it stops waiting for it (unless it asked for another since).
+    pub(crate) fn activation_ended(&mut self, model_id: &str) {
+        if self.engine_activating.as_deref() == Some(model_id) {
+            self.engine_activating = None;
+        }
     }
 
     /// Delete a model's files; the engine refuses active/switching/

@@ -1059,12 +1059,14 @@ fn a_backend_change_over_the_socket_reloads_the_engine_live() {
     host.shutdown();
 }
 
-/// #220: the user's own server, set in the app, serves the host's jobs
-/// at once; switching back to the built-in engine starts it again on the
-/// host's own paths.
+/// #220: the user's own server, set in the app, transcribes the host's
+/// takes at once; switching back to the built-in engine starts it again
+/// on the host's own paths.
 #[test]
-fn a_manual_endpoint_configured_over_the_socket_serves_jobs() {
+fn a_manual_endpoint_configured_over_the_socket_transcribes_takes() {
     use fake_engine::{FakeEngine, Reply, StreamMode};
+    use starling_runtime_host::client::TakeWire;
+    use starling_runtime_host::frame::TranscriptionState;
     let Some(fixture) = fixture() else { return };
     let root = tempfile::tempdir().unwrap();
     let config = engine_config(root.path(), Some(&fixture));
@@ -1095,10 +1097,24 @@ fn a_manual_endpoint_configured_over_the_socket_serves_jobs() {
     assert!(host.engine().is_none(), "the built-in engine is gone");
     wait_until_gone(&first.endpoint, "the built-in engine outlived the switch to manual");
 
-    record_and_submit(&app, "take_manual", "job_manual");
-    let outcome = job_outcome(&app, "job_manual");
-    assert_eq!(outcome.type_name(), "jobs.completed", "{}", outcome.payload());
-    assert_eq!(server.batch_requests(), 1, "the job went to the user's server");
+    // The host's own transcription of the take, the one every app take
+    // gets (a `jobs.submit` beside it would be a second request: only
+    // the agent's asks, which the host does not transcribe, use one).
+    app.send(Some("take_manual"), Command::CaptureStart { policy: "push-to-talk".into() })
+        .expect("start accepted");
+    until_take(&app, "a status tick", |frame| {
+        matches!(frame, TakeWire::Live { status: Some(_), .. })
+    });
+    app.send(Some("take_manual"), Command::CaptureStop { drain: Some(true) })
+        .expect("stop accepted");
+    let done = until_take(&app, "its transcription", |frame| {
+        matches!(frame, TakeWire::Transcription { req: None, state, .. } if state.is_final())
+    });
+    assert!(
+        matches!(&done, TakeWire::Transcription { state: TranscriptionState::Completed { text, .. }, .. } if text == "from my server"),
+        "{done:?}"
+    );
+    assert_eq!(server.batch_requests(), 1, "the take went to the user's server, once");
 
     // Back to the built-in engine.
     let reply = app
@@ -1110,6 +1126,7 @@ fn a_manual_endpoint_configured_over_the_socket_serves_jobs() {
     until_engine(&app, "the built-in engine serving again", |status| {
         status.mode == EngineMode::Builtin && serving(status, MODEL_ID)
     });
+    assert_eq!(server.batch_requests(), 1, "nothing transcribed the take again");
     drop(app);
     host.shutdown();
 }

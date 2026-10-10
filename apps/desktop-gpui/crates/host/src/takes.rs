@@ -109,6 +109,11 @@ pub struct TakeHub {
     /// The host's transcriber, told about every take (#220).
     transcriber: OnceLock<TranscriberLink>,
     orphan_grace: Duration,
+    /// Held while an engine status is read and handed out, so each
+    /// connection gets them in the order they were read. Not the
+    /// registry lock: reading a status can wait on an engine starting,
+    /// and the take feed must not wait with it.
+    engine_order: Mutex<()>,
 }
 
 #[derive(Default)]
@@ -213,6 +218,7 @@ impl TakeHub {
             client: OnceLock::new(),
             transcriber: OnceLock::new(),
             orphan_grace,
+            engine_order: Mutex::new(()),
         })
     }
 
@@ -410,15 +416,16 @@ impl TakeHub {
 
     /// The host's engine changed: every watching app renders the new
     /// status. `false` when a watcher's queue was full and it missed it
-    /// (the caller sends it again). The status is read under the feed's
-    /// lock, like [`Self::engine_state_to`]'s: each connection gets them
-    /// in the order they were read, never an older one after a newer.
+    /// (the caller sends it again). The status is read in turn with
+    /// [`Self::engine_state_to`]'s: each connection gets them in the
+    /// order they were read, never an older one after a newer.
     pub(crate) fn engine_state(
         &self,
         status: impl FnOnce() -> crate::engine::EngineStatus,
     ) -> bool {
-        let state = lock_registry(&self.state);
+        let _ordered = lock_registry(&self.engine_order);
         let status = status();
+        let state = lock_registry(&self.state);
         let mut all = true;
         for watcher in &state.watchers {
             if watcher.conn.closed.load(Ordering::SeqCst) {
@@ -441,7 +448,7 @@ impl TakeHub {
         conn: &Arc<ConnState>,
         status: impl FnOnce() -> crate::engine::EngineStatus,
     ) -> bool {
-        let _ordered = lock_registry(&self.state);
+        let _ordered = lock_registry(&self.engine_order);
         conn.try_deliver(Frame::EngineState {
             status: Box::new(status()),
         })
