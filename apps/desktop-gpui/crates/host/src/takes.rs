@@ -139,27 +139,34 @@ struct Ended {
 
 struct Watcher {
     conn: Arc<ConnState>,
-    tap: Option<Tap>,
-    /// Frames held until the tap's `ended` went out: a tapping app hears
-    /// its take stored only after the last of its audio.
-    after_tap: Vec<Frame>,
+    /// One per take: a finished take's tap keeps catching up after the
+    /// app started its next take.
+    taps: Vec<Tap>,
 }
 
 impl Watcher {
     /// Sends `frame` now, or after the tap on `take` finished.
     fn deliver_after_tap(&mut self, take: &str, frame: Frame) -> bool {
-        if self.tap.as_ref().is_some_and(|tap| tap.take == take) {
-            self.after_tap.push(frame);
-            true
-        } else {
-            self.conn.try_deliver(frame).is_ok()
+        match self.taps.iter_mut().find(|tap| tap.take == take) {
+            Some(tap) => {
+                tap.held.push(frame);
+                true
+            }
+            None => self.conn.try_deliver(frame).is_ok(),
         }
+    }
+
+    fn tapping(&self, take: &str) -> bool {
+        self.taps.iter().any(|tap| tap.take == take)
     }
 }
 
 struct Tap {
     take: String,
     cursor: u64,
+    /// Frames held until this tap's `ended` went out: a tapping app hears
+    /// its take stored only after the last of its audio.
+    held: Vec<Frame>,
 }
 
 fn is_agent_take(corr: &str) -> bool {
@@ -294,15 +301,17 @@ impl TakeHub {
         if !state.watchers.iter().any(|watcher| Arc::ptr_eq(&watcher.conn, conn)) {
             state.watchers.push(Watcher {
                 conn: Arc::clone(conn),
-                tap: None,
-                after_tap: Vec::new(),
+                taps: Vec::new(),
             });
         }
         // The takes nobody followed go to this app, and only to it.
         let unclaimed = std::mem::take(&mut state.unclaimed);
         if !unclaimed.is_empty() {
+            // One that cannot be queued stays for the next app.
             for frame in unclaimed {
-                let _ = conn.try_deliver(frame);
+                if let Err(()) = conn.try_deliver(frame.clone()) {
+                    state.unclaimed.push(frame);
+                }
             }
             self.save_unclaimed(&state);
         }
@@ -310,12 +319,17 @@ impl TakeHub {
         Ok(())
     }
 
-    /// Whether `conn` may stop or cancel take `corr`: not while another
-    /// live connection owns it (a second window must not end, and then
-    /// transcribe, a take another window records).
-    pub(crate) fn may_end(&self, corr: &str, conn: &Arc<ConnState>) -> bool {
+    /// Whether `conn` may stop or cancel take `corr` (`None`: whatever
+    /// take is current): not while another live connection owns it (a
+    /// second window must not end, and then transcribe, a take another
+    /// window records).
+    pub(crate) fn may_end(&self, corr: Option<&str>, conn: &Arc<ConnState>) -> bool {
         let state = lock_registry(&self.state);
-        match state.live.as_ref().filter(|live| live.take == corr) {
+        match state
+            .live
+            .as_ref()
+            .filter(|live| corr.is_none_or(|corr| live.take == corr))
+        {
             Some(live) => owner_for(&live.owner, conn) != TakeOwner::Another,
             None => true,
         }
@@ -353,7 +367,12 @@ impl TakeHub {
             .iter_mut()
             .find(|watcher| Arc::ptr_eq(&watcher.conn, conn))
         {
-            watcher.tap = Some(Tap { take, cursor: from });
+            watcher.taps.retain(|tap| tap.take != take);
+            watcher.taps.push(Tap {
+                take,
+                cursor: from,
+                held: Vec::new(),
+            });
         }
     }
 
@@ -364,31 +383,43 @@ impl TakeHub {
         {
             let mut state = lock_registry(&self.state);
             // A watcher that went away with a stored-row notice still held
-            // behind its tap: its app is gone, so the take is an orphan
-            // for the next app.
+            // behind its tap: if it owned that take, its app is gone and
+            // the take is an orphan for the next app. Another watcher's
+            // copy is just dropped — the owner has its own.
             let (closed, open): (Vec<Watcher>, Vec<Watcher>) =
                 std::mem::take(&mut state.watchers)
                     .into_iter()
                     .partition(|watcher| watcher.conn.closed.load(Ordering::SeqCst));
             state.watchers = open;
             for watcher in closed {
-                for frame in watcher.after_tap {
-                    if let Frame::TakePersisted {
-                        take,
-                        stored_id,
-                        interrupted,
-                        error,
-                        ..
-                    } = frame
-                    {
-                        let orphan = Frame::TakePersisted {
+                for tap in watcher.taps {
+                    let owned = state.ended.iter().any(|done| {
+                        done.take == tap.take
+                            && done
+                                .owner
+                                .as_ref()
+                                .is_some_and(|owner| Arc::ptr_eq(owner, &watcher.conn))
+                    });
+                    for frame in tap.held {
+                        if let Frame::TakePersisted {
                             take,
                             stored_id,
                             interrupted,
                             error,
-                            orphan: true,
-                        };
-                        self.keep_unclaimed(&mut state, orphan);
+                            orphan,
+                        } = frame
+                        {
+                            if owned || orphan {
+                                let orphan = Frame::TakePersisted {
+                                    take,
+                                    stored_id,
+                                    interrupted,
+                                    error,
+                                    orphan: true,
+                                };
+                                self.keep_unclaimed(&mut state, orphan);
+                            }
+                        }
                     }
                 }
             }
@@ -452,10 +483,7 @@ fn serve_watcher(
     let conn = Arc::clone(&watcher.conn);
     if let Some(live) = live {
         let owner = owner_for(&live.owner, &conn);
-        let tapped = watcher
-            .tap
-            .as_mut()
-            .filter(|tap| tap.take == live.take);
+        let tapped = watcher.taps.iter_mut().find(|tap| tap.take == live.take);
         match (tapped, live.monitor.as_ref()) {
             (Some(tap), Some(monitor)) => {
                 let mut first = true;
@@ -502,38 +530,49 @@ fn serve_watcher(
             }
         }
     }
-    // A tap on a finished take: the rest of its audio, then the end.
-    let Some(tap) = watcher.tap.as_mut() else {
-        return;
-    };
-    if live.is_some_and(|live| live.take == tap.take) {
-        return;
-    }
+    // Taps on finished takes: the rest of their audio, then the end, then
+    // what was held for after it.
+    let live_take = live.map(|live| live.take.as_str());
+    watcher.taps.retain_mut(|tap| {
+        if Some(tap.take.as_str()) == live_take {
+            return true;
+        }
+        let finished = serve_finished_tap(&conn, tap, ended);
+        if finished {
+            for frame in std::mem::take(&mut tap.held) {
+                let _ = conn.try_deliver(frame);
+            }
+        }
+        !finished
+    });
+}
+
+/// Sends a finished take's remaining audio to a tap; `true` once its end
+/// went out.
+fn serve_finished_tap(conn: &Arc<ConnState>, tap: &mut Tap, ended: &VecDeque<Ended>) -> bool {
     let Some(done) = ended.iter().find(|done| done.take == tap.take) else {
         // Nothing known by that name (long gone, or never ours): end it.
-        let _ = conn.try_deliver(Frame::LiveTake {
-            take: tap.take.clone(),
-            rate: 0,
-            status: None,
-            audio: None,
-            owner: TakeOwner::Nobody,
-            ended: Some(tap.cursor),
-            kept: false,
-        });
-        watcher.tap = None;
-        for frame in std::mem::take(&mut watcher.after_tap) {
-            let _ = conn.try_deliver(frame);
-        }
-        return;
+        return conn
+            .try_deliver(Frame::LiveTake {
+                take: tap.take.clone(),
+                rate: 0,
+                status: None,
+                audio: None,
+                owner: TakeOwner::Nobody,
+                ended: Some(tap.cursor),
+                kept: false,
+            })
+            .is_ok();
     };
     let samples: &[f32] = done
         .record
         .as_ref()
         .map(|record| record.samples.as_slice())
         .unwrap_or(&[]);
+    let owner = owner_for(&done.owner, conn);
     for _ in 0..FRAMES_PER_TICK {
-        if !has_room(&conn) {
-            return;
+        if !has_room(conn) {
+            return false;
         }
         let start = (tap.cursor as usize).min(samples.len());
         if start >= samples.len() {
@@ -545,34 +584,28 @@ fn serve_watcher(
             rate: done.rate,
             status: None,
             audio: Some(TakeAudio::encode(start as u64, &samples[start..end])),
-            owner: owner_for(&done.owner, &conn),
+            owner,
             ended: None,
             kept: false,
         };
         if conn.try_deliver(frame).is_err() {
-            return;
+            return false;
         }
         tap.cursor = end as u64;
     }
-    if (tap.cursor as usize) >= samples.len()
-        && has_room(&conn)
+    (tap.cursor as usize) >= samples.len()
+        && has_room(conn)
         && conn
             .try_deliver(Frame::LiveTake {
                 take: done.take.clone(),
                 rate: done.rate,
                 status: None,
                 audio: None,
-                owner: owner_for(&done.owner, &conn),
+                owner,
                 ended: Some(samples.len() as u64),
                 kept: done.record.is_some(),
             })
             .is_ok()
-    {
-        watcher.tap = None;
-        for frame in std::mem::take(&mut watcher.after_tap) {
-            let _ = conn.try_deliver(frame);
-        }
-    }
 }
 
 /// Audio and status wait for room: they may use at most a quarter of the
@@ -658,7 +691,7 @@ impl CaptureObserver for TakeHub {
         // hears it after its last sample (the tick).
         let total = record.map(|record| record.samples.len() as u64).unwrap_or(0);
         for watcher in &state.watchers {
-            if watcher.tap.as_ref().is_some_and(|tap| tap.take == corr) {
+            if watcher.tapping(corr) {
                 continue;
             }
             let _ = watcher.conn.try_deliver(Frame::LiveTake {

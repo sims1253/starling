@@ -988,35 +988,34 @@ fn connection_reader(
                             .get("corr")
                             .and_then(serde_json::Value::as_str)
                             .map(str::to_string);
-                        if let Some(corr) = corr.as_deref() {
-                            if kind == "capture.start" {
+                        if kind == "capture.start" {
+                            if let Some(corr) = corr.as_deref() {
                                 shared.takes.starting(corr, &state);
                             }
-                            if (kind == "capture.stop" || kind == "capture.abort")
-                                && !shared.takes.may_end(corr, &state)
-                            {
-                                let id = envelope
-                                    .get("id")
-                                    .and_then(serde_json::Value::as_str)
-                                    .unwrap_or_default()
-                                    .to_string();
-                                let refusal = Frame::Receipt {
-                                    req: id,
-                                    seq: None,
-                                    result: Err(Rejection::IllegalInState {
-                                        command: kind,
-                                        state: "Recording".to_string(),
-                                        detail: format!(
-                                            "take {corr:?} belongs to another connection"
-                                        ),
-                                    }),
-                                };
-                                if state.try_deliver(refusal).is_err() {
-                                    state.close();
-                                    break;
-                                }
-                                continue;
+                        }
+                        if (kind == "capture.stop" || kind == "capture.abort")
+                            && !shared.takes.may_end(corr.as_deref(), &state)
+                        {
+                            let id = envelope
+                                .get("id")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or_default()
+                                .to_string();
+                            let refusal = Frame::Receipt {
+                                req: id,
+                                seq: None,
+                                result: Err(Rejection::IllegalInState {
+                                    command: kind,
+                                    state: "Recording".to_string(),
+                                    detail: "the current take belongs to another connection"
+                                        .to_string(),
+                                }),
+                            };
+                            if state.try_deliver(refusal).is_err() {
+                                state.close();
+                                break;
                             }
+                            continue;
                         }
                         if handle_command(&shared, &state, &mut envelope).is_err() {
                             break;

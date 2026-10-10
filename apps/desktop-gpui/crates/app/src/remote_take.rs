@@ -294,8 +294,9 @@ impl StarlingApp {
                 link.forget(take);
             }
         };
-        if ended || owner == TakeOwner::Another {
-            // It ended, or another window got it first.
+        if owner == TakeOwner::Another || (ended && owner == TakeOwner::Nobody) {
+            // Another window got it first, or it ended unowned (the host
+            // hands it over as an orphan once stored).
             forget(self, &take);
             return;
         }
@@ -313,12 +314,13 @@ impl StarlingApp {
             return;
         }
         self.host.claiming = None;
-        if self.recorder.is_none() && !self.activation.is_active() {
+        if !ended && self.recorder.is_none() && !self.activation.is_active() {
             self.adopt_take(take, rate, status, cx);
             return;
         }
-        // This window started a take of its own meanwhile, so it cannot
-        // show this one: stop it and transcribe it into history.
+        // It is ours but cannot be shown live — it already ended, or this
+        // window started a take of its own meanwhile: finish it and
+        // transcribe it into history (its end and stored row follow).
         let Some(link) = &self.host.link else {
             return;
         };
@@ -404,8 +406,12 @@ impl StarlingApp {
                     .as_ref()
                     .is_some_and(|(claimed, _)| *claimed == take)
                 {
-                    self.claim_update(take, rate, status, owner, ended.is_some(), cx);
-                    return;
+                    self.claim_update(take.clone(), rate, status.clone(), owner, ended.is_some(), cx);
+                    // A claimed take that had already ended is finishing
+                    // now: this same frame's end belongs to it.
+                    if self.finishing_index(&take).is_none() {
+                        return;
+                    }
                 }
                 if let Some(index) = self.finishing_index(&take) {
                     match ended {
@@ -525,6 +531,23 @@ impl StarlingApp {
         let Some(take) = self.recording_take else {
             return;
         };
+        let healthy = self
+            .recorder
+            .as_ref()
+            .is_some_and(|live| !live.capture_fault().is_some_and(|fault| fault.is_fatal()));
+        if healthy {
+            // Stopped cleanly elsewhere (a stop an earlier window of this
+            // app sent before it went away): finish it like any stop.
+            self.recording_take = None;
+            self.activation.ended(take);
+            self.stop_recording(take, cx);
+            if !self.overlay.model.is_saving() {
+                self.overlay.model.take_cancelled(Instant::now());
+            }
+            self.cue_take_ended(take, cx);
+            self.sync_overlay(cx);
+            return;
+        }
         if !self.note_live_interruption() {
             let device = self
                 .recorder

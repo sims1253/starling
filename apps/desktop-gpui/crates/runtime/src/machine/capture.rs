@@ -472,6 +472,10 @@ impl CaptureStore for InMemoryCaptureStore {
 /// of take detail.
 pub struct V2CaptureStore {
     store: Mutex<StoreV2>,
+    /// The row each committed take landed in, until [`CaptureStore::stored_id`]
+    /// asks (#220): the commit knows it exactly, where a lookup by the
+    /// take's capture id could find another row that holds that id.
+    committed: Mutex<HashMap<String, String>>,
 }
 
 /// Report a post-commit (or rollback) divergence that must not change
@@ -506,11 +510,25 @@ fn report_status_flip_failure(id: &str, err: impl std::fmt::Display) {
     ));
 }
 
+fn committed_key(take: &TakeRecord) -> String {
+    format!("{}\u{0}{}", take.id, take.capture_id)
+}
+
 impl V2CaptureStore {
+    /// Remembers the row `take` was committed to, for
+    /// [`CaptureStore::stored_id`].
+    fn note_stored(&self, take: &TakeRecord, id: &str) {
+        self.committed
+            .lock()
+            .expect("committed ids lock")
+            .insert(committed_key(take), id.to_string());
+    }
+
     pub fn open(root: impl Into<PathBuf>) -> Result<Self, String> {
         let store = StoreV2::open(root).map_err(|err| err.to_string())?;
         Ok(V2CaptureStore {
             store: Mutex::new(store),
+            committed: Mutex::new(HashMap::new()),
         })
     }
 
@@ -601,6 +619,7 @@ impl V2CaptureStore {
                             report_status_flip_failure(&record.id, err);
                         }
                     }
+                    self.note_stored(take, &record.id);
                     return Ok(());
                 }
                 Some((report, Err(err))) => {
@@ -653,6 +672,7 @@ impl V2CaptureStore {
                                         ));
                                     }
                                 }
+                                self.note_stored(take, &existing.id);
                                 return Ok(());
                             }
                         }
@@ -800,6 +820,7 @@ impl V2CaptureStore {
                     // normal-path traffic for operators keying on it.
                     drop(store);
                     self.supersede_stored_take_journal(take, &staged_id);
+                    self.note_stored(take, &staged_id);
                     return Ok(());
                 }
                 Err(read_err) => {
@@ -868,6 +889,7 @@ impl V2CaptureStore {
         }
         drop(store);
         self.supersede_stored_take_journal(take, &staged_id);
+        self.note_stored(take, &staged_id);
         Ok(())
     }
 
@@ -956,11 +978,25 @@ impl CaptureStore for V2CaptureStore {
     /// path names the journal it replaces (`supersedes_journal`), so either
     /// way the take's capture id finds its row.
     fn stored_id(&self, take: &TakeRecord) -> Option<String> {
-        let store = self.store.lock().expect("v2 store lock");
-        if let Ok(Some(record)) = store.get_capture(&take.capture_id) {
-            return Some(record.id);
+        if let Some(id) = self
+            .committed
+            .lock()
+            .expect("committed ids lock")
+            .remove(&committed_key(take))
+        {
+            return Some(id);
         }
-        store.journal_superseded_by(&take.capture_id).ok().flatten()
+        // A commit whose outcome it could not read back: a replacement
+        // row names the journal it replaced; only then the journal's own.
+        let store = self.store.lock().expect("v2 store lock");
+        if let Ok(Some(id)) = store.journal_superseded_by(&take.capture_id) {
+            return Some(id);
+        }
+        store
+            .get_capture(&take.capture_id)
+            .ok()
+            .flatten()
+            .map(|record| record.id)
     }
 }
 

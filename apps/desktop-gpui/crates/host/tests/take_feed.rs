@@ -344,8 +344,13 @@ fn a_second_window_cannot_end_a_take_its_live_owner_records() {
     until_take(&owner, "a live tick", &mut seen, is_live_tick("take-mine"));
     let other = connect(&host);
     other.take_watch().unwrap();
-    for command in [Command::CaptureStop { drain: Some(true) }, Command::CaptureAbort] {
-        match other.send(Some("take-mine"), command) {
+    for (corr, command) in [
+        (Some("take-mine"), Command::CaptureStop { drain: Some(true) }),
+        (Some("take-mine"), Command::CaptureAbort),
+        (None, Command::CaptureStop { drain: Some(true) }),
+        (None, Command::CaptureAbort),
+    ] {
+        match other.send(corr, command) {
             Err(starling_runtime_host::client::ClientError::Rejected(rejection)) => {
                 assert!(format!("{rejection:?}").contains("another connection"), "{rejection:?}");
             }
@@ -434,6 +439,51 @@ fn an_app_watching_fails_the_attempts_a_dead_app_left_started() {
     let store = starling_dictation::store_v2::StoreV2::open(root.path()).unwrap();
     let attempts = store.attempts_for(&id).unwrap();
     assert_ne!(attempts.last().unwrap().status, "started", "{attempts:?}");
+    drop(app);
+    host.shutdown();
+}
+
+#[test]
+fn starting_the_next_take_does_not_cut_off_the_last_ones_tail() {
+    let root = tempfile::tempdir().unwrap();
+    // A first take long enough that its replay takes several ticks.
+    let long = FakeTakeScript {
+        samples_per_second: 2_000_000,
+        sample_cap: 1_500_000,
+        ..FakeTakeScript::clean()
+    };
+    let source = FakeCaptureSource::new(vec![long, FakeTakeScript::clean()]);
+    let mut host = serve(config(root.path(), source)).expect("host serves");
+    let app = connect(&host);
+    app.take_watch().unwrap();
+    start(&app, "take-one");
+    let mut seen = Vec::new();
+    until_take(&app, "the first take", &mut seen, is_live_tick("take-one"));
+    std::thread::sleep(Duration::from_millis(900));
+    stop(&app, "take-one");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while host_capture_state(&app) != "Persisted" {
+        assert!(Instant::now() < deadline, "the first take was never stored");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // What the feed said before tapping (the end every watcher hears).
+    std::thread::sleep(Duration::from_millis(100));
+    while app.try_recv_take().is_ok() {}
+    // Replay the first take, and start and tap the second one at once.
+    app.take_tap("take-one", 0).unwrap();
+    start(&app, "take-two");
+    app.take_tap("take-two", 0).unwrap();
+    let mut seen = Vec::new();
+    let end = until_take(&app, "the first take's end", &mut seen, is_end("take-one"));
+    let TakeWire::Live { ended: Some(total), .. } = end else { unreachable!() };
+    assert!(total > 200_000, "a long take: {total}");
+    assert_eq!(audio_of(&seen, "take-one").len() as u64, total, "every sample, then the end");
+    assert!(
+        seen.iter().any(|frame| matches!(frame, TakeWire::Live { take, audio: Some(_), .. } if take == "take-two")),
+        "the second take's audio flowed meanwhile"
+    );
+    stop(&app, "take-two");
+    until_take(&app, "the second take's row", &mut seen, is_persisted("take-two"));
     drop(app);
     host.shutdown();
 }
