@@ -275,8 +275,7 @@ fn the_retention_sweep_empties_superseded_journals() {
 #[test]
 fn a_second_look_considers_only_the_journals_it_is_asked_about() {
     // The delayed recheck must not make a candidate of a take recorded
-    // since startup (its journal may have lost its lock to a fault while
-    // capture continues in memory).
+    // since startup: that take is this launch's own to save.
     let dir = TempDir::new().expect("tempdir");
     let mut store = store_in(&dir);
     let tree = journals(&dir);
@@ -305,4 +304,176 @@ fn an_unreadable_journal_folder_is_an_error_not_an_empty_one() {
     let not_a_dir = dir.path().join("journals-file");
     std::fs::write(&not_a_dir, b"in the way").expect("file");
     assert!(store.recover_capture_journals(&not_a_dir).is_err());
+}
+
+/// Store a take from samples in place of recorder journal `journal_id`,
+/// the way the app's and the runtime's save-from-memory paths do.
+fn store_in_place_of(store: &mut StoreV2, journal_id: &str, samples: &[f32]) -> String {
+    let mut meta = TakeMeta::for_device("");
+    meta.supersedes_journal = Some(journal_id.to_string());
+    let mut take = store.begin_take_at_rate(16_000, meta).expect("begin");
+    take.append_and_seal(samples).expect("append");
+    take.finalize()
+        .expect("finalize")
+        .commit_marked(store, CommitMark::Complete)
+        .expect("commit")
+        .record
+        .id
+}
+
+fn capture_count(store: &StoreV2) -> i64 {
+    store
+        .conn
+        .query_row("SELECT COUNT(*) FROM captures", [], |row| row.get(0))
+        .expect("count")
+}
+
+#[test]
+fn a_faulted_take_keeps_its_journal_locked_until_it_is_stored() {
+    // The writer goes on a journal fault while the take records on in
+    // memory: its lock must stay, or another instance's startup scan
+    // adopts the partial journal as a second take.
+    let dir = TempDir::new().expect("tempdir");
+    let mut store = store_in(&dir);
+    let tree = journals(&dir);
+    let mut writer =
+        JournalWriter::create_named(&tree, "j_faulted_live".to_string(), 16_000).expect("writer");
+    writer.append_frames(&ramp(1_600, 0)).expect("append");
+    writer.write_boundary().expect("boundary");
+    let path = writer.path().to_path_buf();
+    let liveness = writer.liveness();
+    let saving = liveness.clone();
+    drop(writer);
+    age(&path, old());
+
+    let report = store.recover_capture_journals(&tree).expect("scan");
+    assert_eq!(report.deferred, vec!["j_faulted_live".to_string()], "{report:?}");
+    assert!(path.exists());
+
+    // One clone let go is not the take stored: every holder counts.
+    drop(liveness);
+    let report = store.recover_capture_journals(&tree).expect("rescan");
+    assert_eq!(report.deferred, vec!["j_faulted_live".to_string()], "{report:?}");
+
+    // Released by its save (or its process gone): recoverable again.
+    saving.release();
+    let report = store.recover_capture_journals(&tree).expect("rescan");
+    assert_eq!(report.recovered.len(), 1, "{report:?}");
+}
+
+#[test]
+fn a_journal_whose_take_was_stored_in_its_place_is_moved_aside_not_adopted() {
+    // The app stored the take from memory and died before moving the
+    // recorder's journal aside: the next launch finishes the move.
+    let dir = TempDir::new().expect("tempdir");
+    let mut store = store_in(&dir);
+    let tree = journals(&dir);
+    let path = {
+        let mut writer =
+            JournalWriter::create_named(&tree, "j_saved".to_string(), 16_000).expect("writer");
+        writer.append_frames(&ramp(1_600, 0)).expect("append");
+        writer.write_boundary().expect("boundary");
+        writer.path().to_path_buf()
+    };
+    age(&path, old());
+    let stored = store_in_place_of(&mut store, "j_saved", &ramp(4_800, 0));
+    assert_eq!(
+        store.journal_superseded_by("j_saved").expect("read"),
+        Some(stored.clone())
+    );
+
+    let report = store.recover_capture_journals(&tree).expect("scan");
+    assert!(report.recovered.is_empty(), "{report:?}");
+    assert_eq!(report.superseded, vec!["j_saved".to_string()]);
+    assert!(report.summary().is_empty(), "housekeeping: {}", report.summary());
+    assert!(!path.exists());
+    assert!(tree.join(SUPERSEDED_SUBDIR).join("j_saved.sj").exists());
+    assert_eq!(capture_count(&store), 1, "one take, not two");
+
+    // Deleting the take does not bring a leftover journal back either.
+    let leftover = {
+        let mut writer =
+            JournalWriter::create_named(&tree, "j_saved".to_string(), 16_000).expect("writer");
+        writer.append_frames(&ramp(800, 0)).expect("append");
+        writer.write_boundary().expect("boundary");
+        writer.path().to_path_buf()
+    };
+    age(&leftover, old());
+    store.conn.execute("DELETE FROM captures", []).expect("delete rows");
+    let report = store.recover_capture_journals(&tree).expect("rescan");
+    assert!(report.recovered.is_empty(), "{report:?}");
+    assert_eq!(capture_count(&store), 0);
+}
+
+#[test]
+fn a_journal_already_adopted_is_moved_aside_when_its_old_name_comes_back() {
+    // A power loss can undo the adoption's move out of the tree while the
+    // committed row survives: the stored take already holds the samples.
+    let dir = TempDir::new().expect("tempdir");
+    let mut store = store_in(&dir);
+    let tree = journals(&dir);
+    let samples = ramp(3_200, 9);
+    let path = {
+        let mut writer =
+            JournalWriter::create_named(&tree, "j_adopted".to_string(), 16_000).expect("writer");
+        writer.append_frames(&samples).expect("append");
+        writer.finalize().expect("finalize");
+        writer.path().to_path_buf()
+    };
+    store.adopt_journal(&path, None).expect("adopt");
+    std::fs::copy(store.audio_path("j_adopted"), &path).expect("name comes back");
+    age(&path, old());
+
+    let report = store.recover_capture_journals(&tree).expect("scan");
+    assert!(report.recovered.is_empty() && report.failed.is_empty(), "{report:?}");
+    assert_eq!(report.superseded, vec!["j_adopted".to_string()]);
+    assert!(!path.exists());
+    assert_eq!(capture_count(&store), 1);
+}
+
+#[test]
+fn an_adoption_left_in_audio_without_a_row_is_not_a_second_take() {
+    // Adoption moved the journal into audio/ and its commit failed; the
+    // take was then stored from memory in its place. Reconcile must not
+    // turn the moved journal into an orphan session beside it.
+    let dir = TempDir::new().expect("tempdir");
+    let mut store = store_in(&dir);
+    let tree = journals(&dir);
+    let audio = dir.path().join("v2").join(AUDIO_DIR);
+    std::fs::create_dir_all(&audio).expect("audio dir");
+    {
+        let mut writer =
+            JournalWriter::create_named(&audio, "j_half_adopted".to_string(), 16_000)
+                .expect("writer");
+        writer.append_frames(&ramp(1_600, 0)).expect("append");
+        writer.finalize().expect("finalize");
+    }
+    store_in_place_of(&mut store, "j_half_adopted", &ramp(4_800, 0));
+
+    let report = store.reconcile().expect("reconcile");
+    assert!(report.orphan_sessions.is_empty(), "{report:?}");
+    assert_eq!(report.superseded_journals, vec!["j_half_adopted".to_string()]);
+    assert!(!audio.join("j_half_adopted.sj").exists());
+    assert!(tree.join(SUPERSEDED_SUBDIR).join("j_half_adopted.sj").exists());
+    assert_eq!(capture_count(&store), 1);
+}
+
+#[test]
+fn creation_scratch_no_writer_holds_is_swept() {
+    let dir = TempDir::new().expect("tempdir");
+    let mut store = store_in(&dir);
+    let tree = journals(&dir);
+    // A writer died between creating its scratch name and publishing it.
+    let stale = tree.join("j_died.sj.creating");
+    std::fs::write(&stale, b"").expect("stale scratch");
+    // A writer is creating one right now: its lock is held.
+    let busy = tree.join("j_busy.sj.creating");
+    let holder = File::create(&busy).expect("busy scratch");
+    assert_eq!(try_flock_exclusive(&holder).expect("lock"), FlockEvidence::Free);
+
+    let report = store.recover_capture_journals(&tree).expect("scan");
+    assert!(report.failed.is_empty(), "{report:?}");
+    assert!(!stale.exists(), "the stale scratch name is gone");
+    assert!(busy.exists(), "a held one is left to its writer");
+    drop(holder);
 }

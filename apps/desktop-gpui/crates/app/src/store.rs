@@ -373,7 +373,7 @@ impl Store {
         // audio.
         let pcm = decode_wav(&wav)?;
         let id = self
-            .save_pcm_take(pcm, store_v2::CommitMark::Complete)
+            .save_pcm_take(pcm, store_v2::CommitMark::Complete, journal)
             .map_err(|err| join_adopt_failure(adopted, err))?;
         supersede_journal(journal);
         Ok(SavedTake { id, wav })
@@ -424,6 +424,7 @@ impl Store {
                 store_v2::CommitMark::Interrupted {
                     note: note.to_string(),
                 },
+                journal,
             )
             .map_err(|err| join_adopt_failure(adopted, err))?;
         supersede_journal(journal);
@@ -814,16 +815,22 @@ impl Store {
     /// guard held only for the cheap steps — minting the staging journal
     /// and the metadata commit. The bulk journal writes and fsyncs run
     /// through the take's own writer, off the shared handle, so one long
-    /// take's save cannot pin every other store call behind it.
+    /// take's save cannot pin every other store call behind it. The
+    /// commit names the recorder `journal` the take is stored in place
+    /// of, so a crash before that journal is moved aside cannot bring it
+    /// back as a second copy (#356).
     fn save_pcm_take(
         &self,
         pcm: audio::PcmAudio,
         mark: store_v2::CommitMark,
+        journal: Option<&recorder::JournalReport>,
     ) -> Result<String, storage::StorageError> {
         let rate = pcm.sample_rate;
+        let mut meta = store_v2::TakeMeta::for_device("");
+        meta.supersedes_journal = journal.map(|report| report.id.clone());
         let mut take = {
             let store = lock_v2(&self.0);
-            store.begin_take_at_rate(rate, store_v2::TakeMeta::for_device(""))
+            store.begin_take_at_rate(rate, meta)
         }
         .map_err(v2_err)?;
         take.append_and_seal(&pcm.samples).map_err(v2_err)?;
@@ -988,8 +995,8 @@ fn adoptable(report: &recorder::JournalReport) -> bool {
 
 /// The take was stored from its WAV: a journal it left in the recorder's
 /// tree is moved aside so startup recovery does not adopt it as a second,
-/// partial copy (#356). A failure here costs nothing but that duplicate,
-/// so it is only logged.
+/// partial copy (#356). A failure here is only logged: the take's commit
+/// names the journal, so recovery moves it aside instead.
 fn supersede_journal(journal: Option<&recorder::JournalReport>) {
     if let Some(report) = journal {
         if let Err(err) = store_v2::supersede_capture_journal(&report.path) {
@@ -1751,6 +1758,7 @@ mod tests {
             acknowledged_samples: finalized.total_samples,
             finalized: true,
             fault: None,
+            liveness: Default::default(),
         }
     }
 
@@ -2165,6 +2173,7 @@ mod tests {
             acknowledged_samples: 0,
             finalized: true,
             fault: None,
+            liveness: Default::default(),
         };
 
         let saved = store
@@ -2294,6 +2303,14 @@ mod tests {
             .expect("save");
 
         assert_ne!(saved.id, report.id, "stored from the WAV, not the journal");
+        // The commit names the journal it replaces: a crash before the move
+        // aside below cannot bring the journal back as a second take.
+        assert_eq!(
+            lock_v2(&store.0)
+                .journal_superseded_by(&report.id)
+                .expect("read"),
+            Some(saved.id.clone())
+        );
         let stored = store.audio_wav(&saved.id).expect("load").expect("present");
         assert_eq!(audio::decode_pcm16_wav(&stored).expect("decode").samples.len(), 300);
         assert!(!report.path.exists());
@@ -2332,6 +2349,7 @@ mod tests {
             acknowledged_samples: 16_000,
             finalized: false,
             fault: Some("The capture journal failed: No space left on device".to_string()),
+            liveness: Default::default(),
         };
         // The store's own staging tree cannot be written.
         let staging = root.join("v2").join("staging");

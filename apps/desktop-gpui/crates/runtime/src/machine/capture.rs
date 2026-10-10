@@ -566,6 +566,10 @@ impl V2CaptureStore {
         // the take's samples through the §4 protocol.
         let mut meta = TakeMeta::for_device(take.device.clone());
         meta.policy = take.policy.clone();
+        // #356: the commit names the recorder journal this take replaces,
+        // so a crash before that journal is moved aside cannot bring it
+        // back as a second copy at the next startup recovery.
+        meta.supersedes_journal = take.journal.as_ref().map(|report| report.id.clone());
         let mut extra = serde_json::json!({
             "takeCorr": take.id,
             "captureId": take.capture_id,
@@ -800,12 +804,26 @@ fn chained_with_rollback(error: String, rollback: Option<String>) -> String {
     }
 }
 
+/// #356: the take's journal lock was held from its creation through the
+/// commit, so no other instance's startup recovery adopted the journal of
+/// a take this process was still storing. The commit has answered; the
+/// registry may keep the record for the session, but not the lock.
+fn release_take_journal(take: &TakeRecord) {
+    if let Some(report) = &take.journal {
+        report.liveness.release();
+    }
+}
+
 impl CaptureStore for V2CaptureStore {
     fn commit_take(&self, take: &TakeRecord) -> Result<(), String> {
-        self.commit(take, CaptureStatus::Complete, None)
+        let committed = self.commit(take, CaptureStatus::Complete, None);
+        release_take_journal(take);
+        committed
     }
     fn mark_interrupted(&self, take: &TakeRecord, note: &str) -> Result<(), String> {
-        self.commit(take, CaptureStatus::Interrupted, Some(note))
+        let committed = self.commit(take, CaptureStatus::Interrupted, Some(note));
+        release_take_journal(take);
+        committed
     }
     fn describe(&self) -> String {
         "storage-v2".to_string()

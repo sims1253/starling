@@ -49,6 +49,7 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Extension of journal files under the journals root.
@@ -107,8 +108,43 @@ pub(crate) trait JournalSink: Send {
 /// overwritten: a journal is source evidence, there is deliberately no
 /// truncate path.
 pub(crate) struct FileSink {
-    file: std::fs::File,
+    /// Shared with the take's [`JournalLiveness`]: the handle, and the
+    /// lock on it, outlive this sink while the take is unsaved.
+    file: Arc<std::fs::File>,
     dir: PathBuf,
+}
+
+/// Keeps a take's journal lock held after its writer is gone (#356): the
+/// writer is dropped when journaling faults or the take stops, while the
+/// take itself still waits — recording on in memory, or being saved. The
+/// lock is the startup scan's only proof of a live owner, so it stays
+/// held until whoever stores the take releases it (or drops every clone),
+/// and another instance never adopts the journal of a take this process
+/// still holds. Empty for takes without a journal file.
+#[derive(Clone, Default)]
+pub struct JournalLiveness(Option<Arc<Mutex<Option<Arc<std::fs::File>>>>>);
+
+impl JournalLiveness {
+    /// Let the lock go: the take is stored, or will not be. The file
+    /// closes once the writer is gone too.
+    pub fn release(&self) {
+        if let Some(slot) = &self.0 {
+            slot.lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+        }
+    }
+}
+
+impl std::fmt::Debug for JournalLiveness {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let held = self.0.as_ref().is_some_and(|slot| {
+            slot.lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_some()
+        });
+        f.write_str(if held { "JournalLiveness(held)" } else { "JournalLiveness(released)" })
+    }
 }
 
 impl FileSink {
@@ -119,8 +155,10 @@ impl FileSink {
         // The writer's liveness signal (#356): the startup scan of the
         // recorder's tree ([`crate::store_v2::StoreV2::recover_capture_journals`])
         // never adopts a journal whose lock is held — that take is still
-        // being recorded, by this process or another. The OS drops the
-        // lock with the handle, so a killed writer leaves it free. The
+        // being recorded or saved, by this process or another (the take's
+        // [`JournalLiveness`] keeps the handle past the writer until the
+        // take is stored). The OS drops the lock with the handle, so a
+        // killed writer leaves it free. The
         // file is created and locked under a name the scan ignores and
         // only then renamed into place, so the scan never sees an
         // unlocked live journal. Best-effort: a filesystem that cannot
@@ -169,14 +207,20 @@ impl FileSink {
         }
         // The header write that follows fsyncs the directory, making the
         // rename durable with it.
-        Ok((Self { file, dir: dir.to_path_buf() }, path))
+        Ok((
+            Self {
+                file: Arc::new(file),
+                dir: dir.to_path_buf(),
+            },
+            path,
+        ))
     }
 }
 
 impl JournalSink for FileSink {
     fn append(&mut self, bytes: &[u8]) -> io::Result<()> {
         use std::io::Write;
-        self.file.write_all(bytes)
+        (&*self.file).write_all(bytes)
     }
 
     fn sync(&mut self) -> io::Result<()> {
@@ -375,6 +419,12 @@ impl JournalWriter<FileSink> {
     ) -> io::Result<Self> {
         let (sink, path) = FileSink::create(dir, &id)?;
         Self::over_sink(sink, id, path, sample_rate)
+    }
+
+    /// A hold on this journal's file and its liveness lock that outlives
+    /// the writer ([`JournalLiveness`]).
+    pub fn liveness(&self) -> JournalLiveness {
+        JournalLiveness(Some(Arc::new(Mutex::new(Some(Arc::clone(&self.sink.file))))))
     }
 }
 

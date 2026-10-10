@@ -2134,6 +2134,7 @@ fn real_journal(samples: &[f32]) -> (JournalReport, tempfile::TempDir) {
             acknowledged_samples: finalized.total_samples,
             finalized: true,
             fault: None,
+            liveness: Default::default(),
         },
         scratch,
     )
@@ -2410,6 +2411,7 @@ fn v2_store_falls_back_to_the_samples_protocol_without_journal_evidence() {
         acknowledged_samples: 0,
         finalized: false,
         fault: Some("journal write failed".to_string()),
+        liveness: Default::default(),
     };
     store
         .mark_interrupted(

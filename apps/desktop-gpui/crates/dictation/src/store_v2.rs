@@ -36,7 +36,7 @@
 //! [`SCHEMA_VERSION`] in `meta`): `captures`, `recognition_attempts`,
 //! `context_snapshots`, `mode_decisions`, `documents`/`revisions`,
 //! `deliveries`, `insight_events`, `correction_records`, `tombstones`,
-//! `meta`. This core implements the
+//! `journal_supersessions`, `meta`. This core implements the
 //! captures/attempts/tombstones/meta surfaces plus the
 //! documents/revisions surface (I5, issue #220:
 //! [`StoreV2::upsert_document`] and friends — the documents machine's
@@ -105,8 +105,9 @@ use crate::storage::{is_safe_path_component, iso_utc, now_iso};
 /// is refused at open. v2 added `recognition_attempts.created_utc` (the
 /// real updated-at source for the summaries); v3 added `insight_events`
 /// (#294: per-job processing latency, recorded for Insights #308); v4
-/// added `correction_records` and `captures.secure_field`.
-pub const SCHEMA_VERSION: u32 = 4;
+/// added `correction_records` and `captures.secure_field`; v5 added
+/// `journal_supersessions` (#356).
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// WAL checkpoint policy (D11): run `PRAGMA wal_checkpoint(PASSIVE)` after
 /// every N metadata commits. Default 64 — frequent enough that the WAL
@@ -314,6 +315,10 @@ CREATE TABLE IF NOT EXISTS tombstones (
     kind        TEXT NOT NULL,
     deleted_utc TEXT NOT NULL,
     retention   TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS journal_supersessions (
+    journal_id TEXT PRIMARY KEY,
+    capture_id TEXT NOT NULL
 );
 ";
 
@@ -612,6 +617,10 @@ pub struct TakeMeta {
     /// Captured against a secure/incognito input: correction records are
     /// never written for it.
     pub secure_field: bool,
+    /// The recorder journal this take is stored in place of (#356): its
+    /// id is recorded in the take's commit, so a journal the save did not
+    /// get to move aside is never adopted as a second copy.
+    pub supersedes_journal: Option<String>,
 }
 
 impl TakeMeta {
@@ -624,6 +633,7 @@ impl TakeMeta {
             retention_class: "standard".to_string(),
             extra_json: None,
             secure_field: false,
+            supersedes_journal: None,
         }
     }
 }
@@ -1019,6 +1029,17 @@ impl StoreV2 {
     /// committed with `synchronous=FULL`, then the WAL checkpoint per
     /// policy. Returning `Ok` is the durable ack.
     pub fn commit_capture(&mut self, record: &CaptureRecord) -> Result<(), StoreV2Error> {
+        self.commit_capture_superseding(record, None)
+    }
+
+    /// [`Self::commit_capture`] that also records, in the same
+    /// transaction, the recorder journal the take is stored in place of
+    /// ([`TakeMeta::supersedes_journal`]).
+    fn commit_capture_superseding(
+        &mut self,
+        record: &CaptureRecord,
+        supersedes_journal: Option<&str>,
+    ) -> Result<(), StoreV2Error> {
         let tx = self.conn.transaction()?;
         tx.execute(
             "INSERT INTO captures(
@@ -1042,6 +1063,13 @@ impl StoreV2 {
                 record.secure_field,
             ],
         )?;
+        if let Some(journal_id) = supersedes_journal {
+            tx.execute(
+                "INSERT OR IGNORE INTO journal_supersessions(journal_id, capture_id)
+                 VALUES (?1, ?2)",
+                params![journal_id, record.id],
+            )?;
+        }
         tx.commit()?;
 
         self.commits_since_checkpoint += 1;
@@ -2944,6 +2972,19 @@ impl StoreV2 {
                         report.deferred_to_live_owner.push(id);
                         continue;
                     }
+                    if self.journal_superseded_by(&id)?.is_some() {
+                        // A recorder journal whose adoption moved it here
+                        // and then failed to commit; the take was stored
+                        // from its samples in its place (#356). Kept with
+                        // the other superseded journals, not offered as a
+                        // second copy.
+                        move_journal_aside(
+                            &path,
+                            &self.root.join("journals").join(SUPERSEDED_SUBDIR),
+                        )?;
+                        report.superseded_journals.push(id);
+                        continue;
+                    }
                     let parsed = match read_journal(&path) {
                         Ok(parsed) => parsed,
                         Err(err) => {
@@ -3644,11 +3685,13 @@ impl StoreV2 {
 
         std::fs::create_dir_all(self.root.join(AUDIO_DIR))?;
         let destination = self.audio_path(&id);
+        std::fs::rename(source, &destination)?;
+        // Durable on both sides: a source name that came back after a
+        // power loss would be offered to recovery beside the stored take.
+        sync_dir(&self.root.join(AUDIO_DIR))?;
         if let Some(parent) = source.parent() {
             sync_dir(parent)?;
         }
-        std::fs::rename(source, &destination)?;
-        sync_dir(&self.root.join(AUDIO_DIR))?;
 
         let count = parsed.samples.len() as u64;
         let note = note(&AdoptedJournal {
@@ -3680,6 +3723,19 @@ impl StoreV2 {
         Ok(record)
     }
 
+    /// The take stored in place of recorder journal `journal_id`
+    /// ([`TakeMeta::supersedes_journal`]), if one was (#356).
+    pub fn journal_superseded_by(&self, journal_id: &str) -> Result<Option<String>, StoreV2Error> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT capture_id FROM journal_supersessions WHERE journal_id = ?1",
+                params![journal_id],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
     /// Startup recovery of the recorder's live-capture tree (#356):
     /// `journals_dir` is where takes journal while they record
     /// ([`crate::journal::default_journals_root`]). A journal still there
@@ -3700,6 +3756,13 @@ impl StoreV2 {
     ///   recovers it if not;
     /// - a journal with no verified samples (nothing to recover);
     /// - `deleted/`, `superseded/` and anything not named `*.sj`.
+    ///
+    /// A journal whose take is already stored — the save committed it in
+    /// the journal's place, or adopted it, and the app stopped before the
+    /// journal left the tree — is moved into `superseded/` instead of
+    /// becoming a second copy. A `*.sj.creating` scratch name no writer
+    /// holds is removed: it is an extra name of a published journal, or
+    /// an empty file whose writer died before publishing it.
     ///
     /// A file that is not a readable journal is renamed to
     /// `<name>.unrecognized` beside itself — kept, never repaired or
@@ -3732,11 +3795,44 @@ impl StoreV2 {
             .collect::<Result<Vec<_>, _>>()?
             .into_iter()
             .map(|entry| entry.path())
-            .filter(|path| {
-                path.is_file() && path.extension().and_then(|ext| ext.to_str()) == Some("sj")
-            })
+            .filter(|path| path.is_file())
             .collect();
         paths.sort();
+        let (paths, scratch): (Vec<PathBuf>, Vec<PathBuf>) = paths
+            .into_iter()
+            .filter(|path| {
+                let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("");
+                name.ends_with(".sj") || name.ends_with(".sj.creating")
+            })
+            .partition(|path| path.extension().and_then(|ext| ext.to_str()) == Some("sj"));
+        for path in scratch {
+            let Some(id) = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.strip_suffix(".sj.creating"))
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            if !is_safe_path_component(&id) || !wanted(&id) {
+                continue;
+            }
+            // Only a free lock says no writer is mid-create; the header is
+            // written after publishing, so the scratch name never holds
+            // audio a published journal does not.
+            let free = File::open(&path).ok().is_some_and(|file| {
+                matches!(try_flock_exclusive(&file), Ok(FlockEvidence::Free))
+            });
+            if free {
+                match std::fs::remove_file(&path) {
+                    Ok(()) => {
+                        let _ = sync_dir(journals_dir);
+                    }
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                    Err(err) => report.failed.push((id, err.to_string())),
+                }
+            }
+        }
         for path in paths {
             let Some(id) = path
                 .file_stem()
@@ -3760,14 +3856,35 @@ impl StoreV2 {
             let free = match try_flock_exclusive(&lock) {
                 Ok(FlockEvidence::Free) => true,
                 Ok(FlockEvidence::Held) | Err(_) => false,
-                // No lock primitive: an unfinalized journal nobody has
-                // written to for a while has no writer.
+                // No lock primitive (only targets that are neither unix
+                // nor windows; a unix filesystem that cannot lock answers
+                // with an error, read as held): an unfinalized journal
+                // nobody has written to for a while has no writer. A live
+                // take writes a boundary at least every quarter second
+                // while samples arrive, and its stall watch stops a take
+                // whose input goes quiet.
                 Ok(FlockEvidence::Unknown) => modified_age(&path)
                     .is_some_and(|age| age >= FINALIZED_ADOPTION_GRACE),
             };
             if !free {
                 report.deferred.push(id);
                 continue;
+            }
+            // Stored in this journal's place already: the app stopped
+            // between that commit and moving the journal aside.
+            match self.journal_superseded_by(&id) {
+                Ok(None) => {}
+                Ok(Some(_)) => {
+                    match supersede_capture_journal(&path) {
+                        Ok(()) => report.superseded.push(id),
+                        Err(err) => report.failed.push((id, err.to_string())),
+                    }
+                    continue;
+                }
+                Err(err) => {
+                    report.failed.push((id, err.to_string()));
+                    continue;
+                }
             }
             let parsed = match read_journal(&path) {
                 Ok(parsed) => parsed,
@@ -3789,6 +3906,26 @@ impl StoreV2 {
             };
             if parsed.samples.is_empty() {
                 continue;
+            }
+            // Adopted already, its move out of the tree undone by a power
+            // loss: the stored take holds exactly these samples.
+            match self.get_capture(&id) {
+                Ok(Some(existing))
+                    if existing.journal_hash
+                        == format!("{:016x}", samples_hash(&parsed.samples)) =>
+                {
+                    drop(parsed);
+                    match supersede_capture_journal(&path) {
+                        Ok(()) => report.superseded.push(id),
+                        Err(err) => report.failed.push((id, err.to_string())),
+                    }
+                    continue;
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    report.failed.push((id, err.to_string()));
+                    continue;
+                }
             }
             if parsed.finalized
                 && modified_age(&path).is_none_or(|age| age < FINALIZED_ADOPTION_GRACE)
@@ -4316,14 +4453,21 @@ fn modified_age(path: &Path) -> Option<std::time::Duration> {
 /// A name already taken in `superseded/` gets a numbered one: the kept
 /// journal there is never replaced.
 pub fn supersede_capture_journal(path: &Path) -> Result<(), StoreV2Error> {
+    let Some(dir) = path.parent() else {
+        return Ok(());
+    };
+    move_journal_aside(path, &dir.join(SUPERSEDED_SUBDIR))
+}
+
+/// [`supersede_capture_journal`] into a chosen `aside` directory.
+fn move_journal_aside(path: &Path, aside: &Path) -> Result<(), StoreV2Error> {
     let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
         return Ok(());
     };
     if !path.exists() {
         return Ok(());
     }
-    let aside = dir.join(SUPERSEDED_SUBDIR);
-    std::fs::create_dir_all(&aside)?;
+    std::fs::create_dir_all(aside)?;
     let stem = path.file_stem().unwrap_or(name).to_string_lossy().to_string();
     let mut attempt = 0u32;
     loop {
@@ -4341,7 +4485,7 @@ pub fn supersede_capture_journal(path: &Path) -> Result<(), StoreV2Error> {
         attempt += 1;
     }
     sync_dir(dir)?;
-    sync_dir(&aside)?;
+    sync_dir(aside)?;
     Ok(())
 }
 
@@ -4404,6 +4548,9 @@ pub struct JournalRecovery {
     /// Journals that could not be adopted this time: `(id, why)`. They
     /// stay where they are for the next launch.
     pub failed: Vec<(String, String)>,
+    /// Journals whose take was already stored: moved into `superseded/`.
+    /// Housekeeping, not a finding.
+    pub superseded: Vec<String>,
 }
 
 /// One take [`StoreV2::recover_capture_journals`] brought back.
@@ -4591,7 +4738,7 @@ impl FinalizedTake {
             extra_json,
             secure_field: self.meta.secure_field,
         };
-        store.commit_capture(&record)?;
+        store.commit_capture_superseding(&record, self.meta.supersedes_journal.as_deref())?;
         store.gc_staging()?;
         Ok(CommittedTake { record })
     }
@@ -4696,6 +4843,11 @@ pub struct ReconciliationReport {
     /// Takes whose retention removal was stamped but not yet unlinked:
     /// the unlink was finished (#342). Housekeeping, not a finding.
     pub completed_retirements: Vec<String>,
+    /// Recorder journals left in `audio/` by an adoption whose commit
+    /// failed, after the take was stored from its samples instead:
+    /// moved to `journals/superseded/` (#356). Housekeeping, not a
+    /// finding.
+    pub superseded_journals: Vec<String>,
     /// In-flight ids (staging journals, orphan candidates) a live foreign
     /// lease owner claimed: this run was a client (§4 ownership) and left
     /// them for the owner's own reconcile. Informational — a deferral is

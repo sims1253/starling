@@ -136,6 +136,7 @@ impl CaptureSession for FakeSession {
                         acknowledged_samples: ack,
                         finalized: true,
                         fault: None,
+                        liveness: Default::default(),
                     }),
                     device_fault: None,
                 })
@@ -157,6 +158,7 @@ impl CaptureSession for FakeSession {
                         acknowledged_samples: salvaged,
                         finalized: true,
                         fault: None,
+                        liveness: Default::default(),
                     }),
                 })
             }

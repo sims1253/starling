@@ -1913,16 +1913,26 @@ pub(crate) fn show_startup_recovery(
     .collect::<Vec<_>>()
     .join(" ");
     this.update(cx, |app, cx| {
-        if !error.is_empty() {
-            app.error = Some(error);
-        }
-        if !notice.is_empty() {
-            app.recovery_notice = Some(notice);
-        }
+        add_recovery_messages(app, error, notice);
         cx.notify();
     })
     .ok();
     recheck
+}
+
+/// Show what a recovery pass found beside whatever the banners already
+/// say: the pass runs while the app is in use, and an error or notice
+/// the user has not seen yet is never replaced by it.
+fn add_recovery_messages(app: &mut StarlingApp, error: String, notice: String) {
+    fn joined(existing: Option<String>, added: String) -> Option<String> {
+        match existing {
+            _ if added.is_empty() => existing,
+            Some(existing) if !existing.is_empty() => Some(format!("{existing} {added}")),
+            _ => Some(added),
+        }
+    }
+    app.error = joined(app.error.take(), error);
+    app.recovery_notice = joined(app.recovery_notice.take(), notice);
 }
 
 /// The second look at the recorder's tree (#356): journals the startup
@@ -1957,12 +1967,7 @@ pub(crate) async fn recheck_capture_journals(
         return;
     }
     this.update(cx, |app, cx| {
-        if !problems.is_empty() {
-            app.error = Some(problems);
-        }
-        if !notice.is_empty() {
-            app.recovery_notice = Some(notice);
-        }
+        add_recovery_messages(app, problems, notice);
         cx.notify();
     })
     .ok();
@@ -2721,6 +2726,37 @@ mod tests {
             assert!(!app.active_ids.contains(&id));
         });
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The delayed recovery pass lands while the app is in use: what it
+    /// found joins the banners, never replaces an error or notice the
+    /// user has not seen yet.
+    #[gpui::test]
+    fn a_recovery_pass_adds_to_the_banners_it_finds(cx: &mut gpui::TestAppContext) {
+        let app = cx.new(|cx| StarlingApp::for_test(None, cx));
+        app.update(cx, |app, _| {
+            app.error = Some("The save failed.".to_string());
+            add_recovery_messages(
+                app,
+                "1 recording could not be recovered.".to_string(),
+                String::new(),
+            );
+            assert_eq!(
+                app.error.as_deref(),
+                Some("The save failed. 1 recording could not be recovered.")
+            );
+            assert!(app.recovery_notice.is_none());
+            add_recovery_messages(app, String::new(), "Recovered 1 recording.".to_string());
+            add_recovery_messages(app, String::new(), "Recovered 2 recordings.".to_string());
+            assert_eq!(
+                app.recovery_notice.as_deref(),
+                Some("Recovered 1 recording. Recovered 2 recordings.")
+            );
+            assert_eq!(
+                app.error.as_deref(),
+                Some("The save failed. 1 recording could not be recovered.")
+            );
+        });
     }
 
     /// Settings switching the engine off while a retry waits for its
