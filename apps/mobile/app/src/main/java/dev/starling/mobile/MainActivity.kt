@@ -50,6 +50,7 @@ import dev.starling.mobile.storage.ClassLimits
 import dev.starling.mobile.storage.DiskLevel
 import dev.starling.mobile.storage.DiskPolicy
 import dev.starling.mobile.storage.HoldReason
+import dev.starling.mobile.storage.StorageSettings
 import java.text.DateFormat
 import java.util.Date
 import kotlin.concurrent.thread
@@ -307,11 +308,12 @@ class MainActivity : Activity() {
                     val agePosition = age.selectedItemPosition
                     val sizePosition = size.selectedItemPosition
                     if (agePosition !in AGE_CHOICES.indices || sizePosition !in SIZE_CHOICES_MB.indices) return
+                    val stored = application.storageSettings.load().limits(retentionClass)
                     val chosen = ClassLimits(
-                        maxAgeDays = AGE_CHOICES[agePosition],
-                        maxTotalMb = SIZE_CHOICES_MB[sizePosition],
+                        maxAgeDays = StorageSettings.chosenLimit(AGE_CHOICES, agePosition, stored.maxAgeDays),
+                        maxTotalMb = StorageSettings.chosenLimit(SIZE_CHOICES_MB, sizePosition, stored.maxTotalMb),
                     )
-                    if (chosen == application.storageSettings.load().limits(retentionClass)) return
+                    if (chosen == stored) return
                     runCatching { application.storageSettings.save(retentionClass, chosen) }
                         .onSuccess { application.audioUpkeep.schedule() }
                         .onFailure {

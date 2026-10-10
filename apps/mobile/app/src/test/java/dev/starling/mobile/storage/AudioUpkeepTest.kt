@@ -169,6 +169,18 @@ class AudioUpkeepTest {
     }
 
     @Test
+    fun aStoredLimitTheChoicesDoNotOfferIsKeptUntilAnotherIsChosen() {
+        val ages = listOf(null, 30, 90, 365)
+        // Shown as "no limit" (position 0): showing the screen keeps the 0.
+        assertEquals(0, StorageSettings.chosenLimit(ages, 0, 0))
+        assertEquals(7, StorageSettings.chosenLimit(ages, 0, 7))
+        // An offered value, or another position, is what was chosen.
+        assertEquals(null, StorageSettings.chosenLimit(ages, 0, 30))
+        assertEquals(null, StorageSettings.chosenLimit(ages, 0, null))
+        assertEquals(90, StorageSettings.chosenLimit(ages, 2, 0))
+    }
+
+    @Test
     fun theStrictestLimitsRoundTrip() {
         val preferences = FakePreferences()
         val settings = StorageSettings(preferences)

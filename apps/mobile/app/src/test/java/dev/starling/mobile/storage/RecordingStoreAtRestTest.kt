@@ -126,6 +126,40 @@ class RecordingStoreAtRestTest {
     }
 
     @Test
+    fun settlingPausesForARecordingAndADeleteNeverLeavesAnUnsettledFlacAlone() {
+        var refuseFlac = false
+        val store = RecordingStore(
+            storeDir(),
+            unlink = { file -> if (refuseFlac && file.name.endsWith(".flac")) false else file.delete() },
+        )
+        val take = committedTake(store)
+        val expected = requestAudio(store, take.id)
+        store.compressionHook = { step -> if (step == RecordingStore.CompressionStep.PUBLISHED) throw IllegalStateException("killed") }
+        runCatching { store.compressAudio(take.id) }
+        val reopened = RecordingStore(
+            storeDir(),
+            unlink = { file -> if (refuseFlac && file.name.endsWith(".flac")) false else file.delete() },
+        )
+
+        // A take started recording: nothing is settled.
+        assertEquals(1, reopened.settleAtRest(stop = { true }))
+        assertTrue(wav(take.id).isFile && flac(take.id).isFile)
+        // A delete whose FLAC unlink is refused keeps the WAV too.
+        refuseFlac = true
+        try {
+            reopened.delete(take.id)
+            fail("a refused delete succeeded")
+        } catch (_: IOException) {
+        }
+        assertTrue(wav(take.id).isFile && flac(take.id).isFile)
+        assertArrayEquals(expected, requestAudio(reopened, take.id))
+        refuseFlac = false
+        reopened.delete(take.id)
+        assertFalse(wav(take.id).exists() || flac(take.id).exists())
+        assertEquals(0, reopened.settleAtRest())
+    }
+
+    @Test
     fun aPinnedTakeIsSettledOnlyOnceItIsReleased() {
         val store = RecordingStore(storeDir())
         val take = committedTake(store)

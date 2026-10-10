@@ -70,7 +70,7 @@ class AudioUpkeep(
         var paused = false
         // Takes a crash (or a refused unlink) left with both files, settled
         // here rather than at open: the check decodes the whole take.
-        store.settleAtRest()
+        store.settleAtRest(stop = recording)
         for (id in store.compressionCandidates()) {
             if ((compressionFailures[id] ?: 0) >= MAX_COMPRESSION_ATTEMPTS) continue
             if (recording()) {

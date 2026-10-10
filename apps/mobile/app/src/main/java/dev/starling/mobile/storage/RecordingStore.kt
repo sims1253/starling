@@ -218,11 +218,14 @@ class RecordingStore internal constructor(
         generation++
         // Metadata goes last: until every payload file is gone it stays,
         // so an interrupted or failed delete (of an ephemeral take, too) is
-        // found and finished again on the next open.
-        val failures = (listOf(wavFile(id), flacFile(id), partial, unrecognized, temporary) + temporaries)
+        // found and finished again on the next open. The audio goes like a
+        // retention removal, FLAC first: a FLAC that stays keeps its WAV,
+        // so an unsettled FLAC is never left alone.
+        val audioGone = unlinkAudio(id)
+        val failures = (listOf(partial, unrecognized, temporary) + temporaries)
             .filter { it.exists() && !it.delete() }
         if (!wavFile(id).exists() || !flacFile(id).exists()) unsettled -= id
-        if (failures.isNotEmpty() || (metadata.exists() && !metadata.delete())) {
+        if (!audioGone || failures.isNotEmpty() || (metadata.exists() && !metadata.delete())) {
             throw IOException("Unable to delete recording files")
         }
     }
@@ -657,11 +660,14 @@ class RecordingStore internal constructor(
      * off the lock: when the FLAC is exactly the WAV's audio the WAV goes,
      * otherwise the FLAC does (the WAV is the original). A take that is
      * pinned meanwhile is left for the next call, and so is one whose
-     * unlink storage refuses. Returns how many takes still wait.
+     * unlink storage refuses. [stop] (a take started recording) ends the
+     * call before the next take and before any unlink. Returns how many
+     * takes still wait.
      */
-    fun settleAtRest(): Int {
+    fun settleAtRest(stop: () -> Boolean = { false }): Int {
         val waiting = synchronized(lock) { unsettled.filter { (pins[it] ?: 0) == 0 } }
         for (id in waiting) {
+            if (stop()) break
             val wav = wavFile(id)
             val flac = flacFile(id)
             val same = runCatching { verifyAgainstWav(flac, wav) }.isSuccess &&
@@ -670,7 +676,7 @@ class RecordingStore internal constructor(
                 when {
                     // A delete or a retention removal settled it meanwhile.
                     !wav.isFile || !flac.isFile -> unsettled -= id
-                    (pins[id] ?: 0) > 0 -> Unit
+                    (pins[id] ?: 0) > 0 || stop() -> Unit
                     else -> {
                         val settled = runCatching {
                             if (same) {

@@ -75,5 +75,14 @@ class StorageSettings internal constructor(private val preferences: SharedPrefer
         fun ageKey(retentionClass: RetentionClass) = "storage.${retentionClass.key}.maxAgeDays"
 
         fun sizeKey(retentionClass: RetentionClass) = "storage.${retentionClass.key}.maxTotalMb"
+
+        /**
+         * The limit a settings choice at [position] stands for. A stored
+         * limit the [choices] do not offer (0, or a value saved elsewhere)
+         * shows as the first choice, "no limit"; while that stays selected the
+         * stored limit is kept, so showing the screen never changes it.
+         */
+        fun <T> chosenLimit(choices: List<T?>, position: Int, stored: T?): T? =
+            if (position == 0 && stored !in choices) stored else choices[position]
     }
 }
