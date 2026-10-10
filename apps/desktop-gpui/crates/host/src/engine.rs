@@ -568,10 +568,22 @@ const SECRET_QUERY_KEYS: &[&str] = &[
 /// `***`. Plain string surgery rather than a URL parse — the text that
 /// most needs redacting is the endpoint that did not validate (the
 /// client rejects userinfo outright), and it may not parse at all.
+///
+/// The authority is found the way a lenient URL parser finds it: after
+/// the scheme any run of `/` or `\` is skipped (`http:///u:p@h` and
+/// `http:/u:p@h` still carry userinfo), and without a scheme followed
+/// by a slash the authority starts at the very beginning (`http:u:p@h`
+/// is userinfo too, so the conservative reading covers it).
 fn redact_endpoint(endpoint: &str) -> String {
-    let authority_start = endpoint.find("://").map_or(0, |at| at + 3);
+    let authority_start = scheme_end(endpoint)
+        .filter(|&at| endpoint[at..].starts_with(['/', '\\']))
+        .map_or(0, |at| {
+            at + endpoint[at..]
+                .find(|c| c != '/' && c != '\\')
+                .unwrap_or(endpoint.len() - at)
+        });
     let authority_end = endpoint[authority_start..]
-        .find(['/', '?', '#'])
+        .find(['/', '\\', '?', '#'])
         .map_or(endpoint.len(), |at| authority_start + at);
     let mut out = String::with_capacity(endpoint.len());
     out.push_str(&endpoint[..authority_start]);
@@ -610,8 +622,40 @@ fn redact_endpoint(endpoint: &str) -> String {
     out
 }
 
+/// Just past `scheme:` when `endpoint` starts with one
+/// (`ALPHA *( ALPHA / DIGIT / "+" / "-" / "." ) ":"`).
+fn scheme_end(endpoint: &str) -> Option<usize> {
+    let colon = endpoint.find(':')?;
+    let scheme = &endpoint[..colon];
+    let mut chars = scheme.chars();
+    let valid = chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+    valid.then_some(colon + 1)
+}
+
+/// Classifies the percent-decoded key: `%74oken` is `token` to the
+/// server, so it is to the redactor too.
 fn is_secret_key(key: &str) -> bool {
-    let key = key.to_ascii_lowercase();
+    let bytes = key.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        let hex = bytes
+            .get(at + 1..at + 3)
+            .and_then(|hex| std::str::from_utf8(hex).ok())
+            .and_then(|hex| u8::from_str_radix(hex, 16).ok());
+        match (bytes[at], hex) {
+            (b'%', Some(byte)) => {
+                decoded.push(byte);
+                at += 3;
+            }
+            (byte, _) => {
+                decoded.push(byte);
+                at += 1;
+            }
+        }
+    }
+    let key = String::from_utf8_lossy(&decoded).to_ascii_lowercase();
     SECRET_QUERY_KEYS.iter().any(|secret| key.contains(secret))
 }
 
@@ -991,6 +1035,25 @@ mod tests {
             // The last `@` ends the userinfo; an `@` in the path is not one.
             ("http://a@b:c@example.com/x@y", "http://***@example.com/x@y"),
             ("user:pw@example.com:8181", "***@example.com:8181"),
+            // Authorities a lenient URL parser still finds.
+            (
+                "http:///user:secret@example.com/v1",
+                "http:///***@example.com/v1",
+            ),
+            (
+                "http:/user:secret@example.com/v1",
+                "http:/***@example.com/v1",
+            ),
+            (
+                "http:\\\\u:p@example.com\\v1",
+                "http:\\\\***@example.com\\v1",
+            ),
+            ("http:user:secret@example.com", "***@example.com"),
+            // Percent-encoded keys are classified decoded.
+            (
+                "http://example.com/?%74oken=secret&api_%6bey=k&%zz=1",
+                "http://example.com/?%74oken=***&api_%6bey=***&%zz=1",
+            ),
             (
                 "http://example.com/v1?model=small&access_token=abc&X-Api-Key=k&sig=s",
                 "http://example.com/v1?model=small&access_token=***&X-Api-Key=***&sig=***",
