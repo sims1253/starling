@@ -459,6 +459,16 @@ impl Activation {
         }
     }
 
+    /// The disk under `take`'s journal is nearly full (#342): finish it
+    /// now, exactly like a stop the user asked for, so it is saved while
+    /// there is room. A stale id does nothing.
+    pub(crate) fn storage_full(&mut self, take: TakeId) -> Vec<Effect> {
+        match self.phase {
+            Phase::Active { take: active, .. } if active == take => self.finish(),
+            _ => Vec::new(),
+        }
+    }
+
     /// The recorder reported captured samples for `take`.
     pub(crate) fn samples_arrived(&mut self, take: TakeId) -> Vec<Effect> {
         match &mut self.phase {
@@ -1244,6 +1254,29 @@ mod tests {
         );
         assert!(!machine.is_active());
         assert_eq!(machine.input_lost(take), Vec::new(), "already ended");
+    }
+
+    #[test]
+    fn a_full_disk_finishes_only_its_own_take_like_a_normal_stop() {
+        // #342: the take is saved and transcribed, not cancelled.
+        let t0 = Instant::now();
+        let mut machine = machine(ActivationMode::Toggle, false);
+        let take = start_listening(&mut machine, t0);
+        assert_eq!(machine.storage_full(take + 1), Vec::new(), "a stale id does nothing");
+        assert!(machine.is_active());
+        assert_eq!(machine.storage_full(take), vec![Effect::Finish(take)]);
+        assert!(!machine.is_active());
+        assert_eq!(machine.storage_full(take), Vec::new(), "already ended");
+
+        // Before any audio arrived there is nothing to save.
+        let effects = machine.click(t0);
+        let Some(Effect::Start(starting)) = effects.first().cloned() else {
+            panic!("no start: {effects:?}");
+        };
+        assert_eq!(
+            machine.storage_full(starting),
+            vec![Effect::Cancel(starting, CancelReason::NoAudioYet)]
+        );
     }
 
     #[test]

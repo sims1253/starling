@@ -92,6 +92,9 @@ pub struct SessionSummary {
     /// Always `None` on v2 rows (the capture id *is* the journal linkage);
     /// kept in the shape the UI consumes.
     pub journal_id: Option<String>,
+    /// The take is in the archival retention class (#342): its audio
+    /// follows the archival limits instead of the standard ones.
+    pub archival: bool,
 }
 
 /// One damaged record as the listing reports it (G02): flagged with the
@@ -158,9 +161,16 @@ pub enum ListedRecord {
 /// RFC3339 UTC with exactly 3 subsecond digits (JS `Date.toISOString()`):
 /// `2026-09-15T12:34:56.789Z`.
 pub fn now_iso() -> String {
-    OffsetDateTime::now_utc()
+    iso_utc(OffsetDateTime::now_utc())
+}
+
+/// `at` in the [`now_iso`] shape. Stored timestamps all share it, so
+/// they order correctly as plain strings (the retention cutoffs compare
+/// that way, #342).
+pub fn iso_utc(at: OffsetDateTime) -> String {
+    at.to_offset(time::UtcOffset::UTC)
         .format(RFC3339_MILLIS)
-        .expect("current time formats as RFC3339 with milliseconds")
+        .expect("a UTC time formats as RFC3339 with milliseconds")
 }
 
 /// Whether `id` is safe to join onto a filesystem path as one component:

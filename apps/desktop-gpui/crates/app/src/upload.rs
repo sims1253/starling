@@ -8,6 +8,7 @@ use gpui::{AppContext, AsyncApp, Context, PathPromptOptions, WeakEntity};
 use starling_dictation::{
     audio,
     client::{ClientError, StarlingClient},
+    disk::{self, DiskLevel},
     engine::EngineLease,
     journal,
     recorder,
@@ -18,7 +19,11 @@ use starling_dictation::{
 use crate::app::{HealthCheckPurpose, StarlingApp, UnsavedWav};
 use crate::live_stream::LiveStream;
 use crate::mic::Interruption;
-use crate::store::Store;
+use crate::store::{AudioPin, Store};
+
+/// The capture rate a pre-start disk estimate assumes (the device rate
+/// is only known once the microphone opened).
+const PREFERRED_RATE_FOR_ESTIMATES: u32 = 48_000;
 
 /// A take's endpoint/model binding (#363), resolved once at the moment
 /// the take starts and carried with it to the end of its transcription
@@ -364,6 +369,7 @@ impl StarlingApp {
         // Playback comes back when recording stops, not after transcription.
         self.end_playback_lease();
         if let Some(handle) = self.recorder.take() {
+            self.audio_upkeep.set_recording(false);
             let mut stream = self.live_stream.take();
             // The binding resolved at START leaves with the take (#363);
             // a stop without one (not a normal path) resolves fresh
@@ -577,9 +583,27 @@ impl StarlingApp {
             // per-take file; only fsynced-boundary samples are
             // acknowledged (see recorder::start_recording_with_journal).
             let journals_root = journal::default_journals_root();
+            // #342: no take starts on a disk too full to keep it; a low
+            // disk starts with a warning. A probe that cannot answer
+            // never blocks recording.
+            let disk_watch = disk::DiskWatch::system();
+            let disk_reading = disk_watch
+                .policy
+                .check(disk_watch.probe.as_ref(), &journals_root)
+                .ok();
+            if let Some(reading) = disk_reading.filter(|reading| reading.level == DiskLevel::Critical)
+            {
+                if let Some(lease) = playback_lease {
+                    self.playback.handle().end(lease);
+                }
+                self.error = disk_watch.policy.warning(reading, PREFERRED_RATE_FOR_ESTIMATES);
+                cx.notify();
+                return false;
+            }
             match recorder::start_capture(recorder::CaptureRequest {
                 journals_dir: Some(&journals_root),
                 preferred_device: self.microphone_settings.preferred_device.as_deref(),
+                disk_watch: Some(disk_watch.clone()),
             }) {
                 Ok(handle) => {
                     self.mic.problem = None;
@@ -623,11 +647,18 @@ impl StarlingApp {
                         }
                     }
                     self.active_take = Some(target);
+                    let handle_rate = handle.sample_rate();
                     self.recorder = Some(handle);
+                    self.audio_upkeep.set_recording(true);
                     self.playback_lease = playback_lease;
                     self.elapsed_ms = 0.0;
                     self.levels = vec![0.06; 52];
-                    self.capture_warning = None;
+                    self.capture_warning = disk_reading.and_then(|reading| {
+                        disk_watch.policy.warning(reading, handle_rate)
+                    });
+                    self.mic.disk_warned = self.capture_warning.is_some();
+                    self.mic.disk_low_warning = self.capture_warning.clone();
+                    self.mic.disk_unchecked = false;
                     cx.notify();
                     true
                 }
@@ -666,6 +697,7 @@ impl StarlingApp {
         let Some(handle) = self.recorder.take() else {
             return;
         };
+        self.audio_upkeep.set_recording(false);
         // The stream and the engine lease leave with the take: nothing
         // is transcribed.
         self.live_stream = None;
@@ -947,7 +979,7 @@ impl StarlingApp {
                         if let Some(token) = staging {
                             app.bind_staging(token, &saved.id);
                         }
-                        app.transcribe_with_stream(saved.id, saved.wav, stream, target, cx);
+                        app.transcribe_with_stream(saved.id, saved.wav, stream, target, None, cx);
                     })
                     .ok();
                 }
@@ -1061,12 +1093,20 @@ impl StarlingApp {
         self.error = Some(message.to_string());
     }
 
-    pub fn transcribe(&mut self, id: String, wav: Arc<Vec<u8>>, cx: &mut Context<Self>) {
+    /// `pin` holds a retried take's audio until its attempt is marked
+    /// started (#342).
+    pub fn transcribe(
+        &mut self,
+        id: String,
+        wav: Arc<Vec<u8>>,
+        pin: Option<AudioPin>,
+        cx: &mut Context<Self>,
+    ) {
         // A retry is a new job: it resolves a fresh target at the moment
         // it starts (#363) — the engine may serve a different model now,
         // or the user may have switched to their own server.
         let target = self.resolve_take_target();
-        self.transcribe_with_stream(id, wav, None, target, cx);
+        self.transcribe_with_stream(id, wav, None, target, pin, cx);
     }
 
     fn transcribe_with_stream(
@@ -1075,6 +1115,7 @@ impl StarlingApp {
         wav: Arc<Vec<u8>>,
         stream: Option<LiveStream>,
         mut target: TakeTarget,
+        pin: Option<AudioPin>,
         cx: &mut Context<Self>,
     ) {
         if self.active_ids.contains(&id) {
@@ -1128,8 +1169,13 @@ impl StarlingApp {
                 let id = id.clone();
                 let backend = backend.clone();
                 let store = store_for_job.clone();
-                cx.background_spawn(async move { store.mark_attempt(&id, &backend) })
-                    .await
+                cx.background_spawn(async move {
+                    let marked = store.mark_attempt(&id, &backend);
+                    // The started attempt holds the audio from here on.
+                    drop(pin);
+                    marked
+                })
+                .await
             };
             match marked {
                 Ok(_) => {
@@ -1439,14 +1485,22 @@ impl StarlingApp {
             return;
         };
         cx.spawn(async move |this, cx| {
+            // #342: pinned from before the load until the retry's attempt
+            // is marked started, so upkeep cannot remove the audio between.
             let loaded = {
                 let store = store.clone();
                 let id = id.clone();
-                cx.background_spawn(async move { store.audio_wav(&id) }).await
+                cx.background_spawn(async move {
+                    let pin = store.pin_audio(&id);
+                    store
+                        .audio_wav(&id)
+                        .map(|wav| wav.map(|wav| (wav, pin)))
+                })
+                .await
             };
             this.update(cx, |app, cx| match loaded {
-                Ok(Some(wav)) => {
-                    app.transcribe(id, wav, cx);
+                Ok(Some((wav, pin))) => {
+                    app.transcribe(id, wav, Some(pin), cx);
                 }
                 Ok(None) => {
                     app.error = Some(format!("Recording {id} was not found."));

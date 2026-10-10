@@ -133,6 +133,9 @@ fn row_data(app: &StarlingApp, session: &SessionSummary) -> RowData {
     if session.attempt_count > 1 {
         meta.push_str(&format!(" · {} attempts", session.attempt_count));
     }
+    if session.archival {
+        meta.push_str(" · archival");
+    }
 
     RowData {
         id: session.id.clone(),

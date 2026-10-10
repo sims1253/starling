@@ -8,3 +8,13 @@ members = [
     "crates/insertion",
 ]
 resolver = "2"
+
+# The FLAC codec (#342) runs over whole takes — tens of millions of
+# samples for a long one. Unoptimized it takes minutes, in debug builds
+# of the app and in the store's fidelity tests alike.
+[profile.dev.package.flacenc]
+opt-level = 3
+[profile.dev.package.claxon]
+opt-level = 3
+[profile.dev.package.md-5]
+opt-level = 3

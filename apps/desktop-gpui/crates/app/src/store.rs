@@ -14,8 +14,9 @@ use starling_dictation::{
         self, DamagedRecord, ListedRecord, SessionStatus, SessionSummary, TranscriptionResult,
     },
     store_v2::{
-        self, AttemptRecord, CaptureRecord, CaptureStatus, ListedCapture, RecognitionOutcome,
-        RevisionRow, StoreV2, StoreV2Error,
+        self, AttemptRecord, AudioAtRest, CaptureRecord, CaptureStatus, CompressionOutcome,
+        HoldReason, ListedCapture, RecognitionOutcome, RetentionPolicy, RevisionRow, StoreV2,
+        StoreV2Error,
     },
 };
 
@@ -292,6 +293,8 @@ impl Store {
     /// listing, playback, deletes, and the transcription job's
     /// exists-checks are never pinned behind one load.
     pub(crate) fn audio_wav(&self, id: &str) -> Result<Option<Arc<Vec<u8>>>, storage::StorageError> {
+        // #342: upkeep neither compresses nor retires the take mid-read.
+        let _pin = self.pin_audio(id);
         let path = {
             let store = lock_v2(&self.0);
             match store.audio_journal_path(id) {
@@ -420,6 +423,18 @@ impl Store {
         let mut store = lock_v2(&self.0);
         store
             .finish_recognition(id, RecognitionOutcome::Failed { message })
+            .map_err(v2_err)
+    }
+
+    /// Move a take into the archival retention class or back (#342).
+    pub(crate) fn set_archival(&self, id: &str, archival: bool) -> Result<(), storage::StorageError> {
+        let class = if archival {
+            store_v2::ARCHIVAL_CLASS
+        } else {
+            store_v2::STANDARD_CLASS
+        };
+        lock_v2(&self.0)
+            .set_retention_class(id, class)
             .map_err(v2_err)
     }
 
@@ -624,6 +639,76 @@ impl Store {
         store.correction_records_for(id).map_err(v2_err)
     }
 
+    /// Pin `id`'s audio until the returned guard drops (#342): upkeep
+    /// neither compresses nor retires it meanwhile.
+    pub(crate) fn pin_audio(&self, id: &str) -> AudioPin {
+        lock_v2(&self.0).pin_audio(id);
+        AudioPin {
+            store: Arc::clone(&self.0),
+            id: id.to_string(),
+        }
+    }
+
+    /// History audio upkeep (#342): replace every settled journal with
+    /// its verified FLAC, then apply the retention policy (nothing while
+    /// it is off). The guard covers only the cheap steps — listing the
+    /// candidates, each publish, the policy run — never an encode, so a
+    /// long take's compression does not pin every other store call.
+    /// `policy` is read under the guard when the policy run starts and
+    /// again before each removal, so a limit the user lifted meanwhile is
+    /// not applied (the run stops; the app runs again). `paused` is asked
+    /// before each compression and before each removal: when it says yes
+    /// (a take started recording), the pass ends there.
+    pub(crate) fn audio_upkeep<P: std::borrow::Borrow<RetentionPolicy>>(
+        &self,
+        policy: impl Fn() -> P,
+        paused: impl Fn() -> bool,
+    ) -> Result<UpkeepReport, storage::StorageError> {
+        let mut report = UpkeepReport::default();
+        let jobs = lock_v2(&self.0)
+            .compression_candidates(usize::MAX)
+            .map_err(v2_err)?;
+        for job in jobs {
+            if paused() {
+                report.paused = true;
+                return Ok(report);
+            }
+            let prepared = match store_v2::prepare_compression(&job) {
+                Ok(prepared) => prepared,
+                Err(err) => {
+                    lock_v2(&self.0).note_compression_failure(&job.id);
+                    report.failures.push((job.id.clone(), err.to_string()));
+                    continue;
+                }
+            };
+            // The guard must drop before the arms: a failure locks again.
+            let committed = lock_v2(&self.0).commit_compression(prepared);
+            match committed {
+                Ok(CompressionOutcome::Compressed {
+                    journal_bytes,
+                    flac_bytes,
+                }) => {
+                    report.compressed += 1;
+                    report.saved_bytes += journal_bytes.saturating_sub(flac_bytes);
+                }
+                Ok(CompressionOutcome::Skipped(_)) => {}
+                Err(err) => {
+                    lock_v2(&self.0).note_compression_failure(&job.id);
+                    report.failures.push((job.id.clone(), err.to_string()));
+                }
+            }
+        }
+        if paused() {
+            report.paused = true;
+            return Ok(report);
+        }
+        report.retention = lock_v2(&self.0)
+            .apply_retention_policy_now(policy, &paused)
+            .map_err(v2_err)?;
+        report.paused = report.retention.stopped;
+        Ok(report)
+    }
+
     /// The startup recovery pass: reconcile journals against the metadata
     /// rows (§4), then fail recognition attempts still marked started by a
     /// previous run. Returns a user-facing summary string, empty when
@@ -680,6 +765,101 @@ impl Store {
         let mut store = lock_v2(&self.0);
         let committed = finalized.commit_marked(&mut store, mark).map_err(v2_err)?;
         Ok(committed.record.id)
+    }
+}
+
+/// A [`Store::pin_audio`] guard. Dropping it takes the store lock: never
+/// drop one while holding that lock.
+pub(crate) struct AudioPin {
+    store: Arc<Mutex<StoreV2>>,
+    id: String,
+}
+
+impl Drop for AudioPin {
+    fn drop(&mut self) {
+        lock_v2(&self.store).unpin_audio(&self.id);
+    }
+}
+
+/// What one [`Store::audio_upkeep`] pass did.
+#[derive(Debug, Default)]
+pub(crate) struct UpkeepReport {
+    pub compressed: usize,
+    pub saved_bytes: u64,
+    /// `(id, reason)` for journals that could not be compressed; they
+    /// stay journals and are tried again next pass.
+    pub failures: Vec<(String, String)>,
+    pub retention: store_v2::RetentionReport,
+    /// A take started recording and the pass stopped early.
+    pub paused: bool,
+}
+
+impl UpkeepReport {
+    /// One line for the settings dialog; `None` when nothing happened.
+    pub(crate) fn summary(&self) -> Option<String> {
+        let mb = |bytes: u64| bytes.div_ceil(1024 * 1024);
+        let plural = |count: usize| if count == 1 { "" } else { "s" };
+        let mut parts = Vec::new();
+        if self.compressed > 0 {
+            parts.push(format!(
+                "compressed {} recording{} losslessly (saved {} MB)",
+                self.compressed,
+                plural(self.compressed),
+                mb(self.saved_bytes)
+            ));
+        }
+        let retired = self.retention.retired.len();
+        if retired > 0 {
+            parts.push(format!(
+                "removed the audio of {retired} recording{} ({} MB); transcripts are kept",
+                plural(retired),
+                mb(self.retention.retired_bytes)
+            ));
+        }
+        let count = |wanted: fn(&HoldReason) -> bool| {
+            self.retention
+                .held
+                .iter()
+                .filter(|held| wanted(&held.reason))
+                .count()
+        };
+        let referenced = count(|reason| matches!(reason, HoldReason::Referenced { .. }));
+        if referenced > 0 {
+            parts.push(format!(
+                "kept {referenced} due recording{} that documents or corrections use",
+                plural(referenced)
+            ));
+        }
+        let untranscribed = count(|reason| matches!(reason, HoldReason::Untranscribed));
+        if untranscribed > 0 {
+            parts.push(format!(
+                "kept {untranscribed} due recording{} that never got a transcript",
+                plural(untranscribed)
+            ));
+        }
+        for (class, bytes) in &self.retention.over_limit {
+            parts.push(format!(
+                "the {class} size limit is still exceeded by {} MB",
+                mb(*bytes)
+            ));
+        }
+        if !self.failures.is_empty() {
+            parts.push(format!(
+                "{} recording{} could not be compressed and stay as they are",
+                self.failures.len(),
+                plural(self.failures.len())
+            ));
+        }
+        if self.paused && !parts.is_empty() {
+            parts.push("paused while a take records".to_string());
+        }
+        (!parts.is_empty()).then(|| {
+            let mut text = parts.join("; ");
+            if let Some(first) = text.get_mut(..1) {
+                first.make_ascii_uppercase();
+            }
+            format!("{text}.")
+        })
     }
 }
 
@@ -779,7 +959,14 @@ fn list_v2(store: &StoreV2) -> Result<Vec<ListedRecord>, storage::StorageError> 
                         .get(&listing.record.id)
                         .cloned()
                         .unwrap_or_default();
-                    ListedRecord::Session(v2_summary(&listing.record, &listing.problems, &attempts))
+                    let mut problems = listing.problems;
+                    if let AudioAtRest::Retired { utc } = &listing.audio {
+                        problems.push(format!(
+                            "Audio removed by your retention policy on {}; the transcript is kept.",
+                            utc.get(..10).unwrap_or(utc)
+                        ));
+                    }
+                    ListedRecord::Session(v2_summary(&listing.record, &problems, &attempts))
                 }
                 ListedCapture::Damaged(damaged) => {
                     ListedRecord::Damaged(DamagedRecord {
@@ -884,6 +1071,7 @@ pub(crate) fn v2_summary(
         // The capture id *is* the journal linkage in v2; there is no
         // separate v1 journal to point at.
         journal_id: None,
+        archival: record.retention_class == store_v2::ARCHIVAL_CLASS,
     }
 }
 
@@ -1616,6 +1804,216 @@ mod tests {
         let reloaded = store.audio_wav(&saved.id).expect("reload").expect("present");
         let reloaded = audio::decode_pcm16_wav(&reloaded).expect("decode");
         assert_eq!(reloaded.samples, decoded.samples);
+    }
+
+    #[test]
+    fn upkeep_compresses_and_a_retry_sends_the_same_request_wav() {
+        // #342 acceptance: a retried take from FLAC produces the same
+        // request audio as from the journal.
+        let store = v2_store("upkeep-flac");
+        let samples: Vec<f32> = (0..32_000)
+            .map(|i| ((i as f32 * 0.05).sin() * 0.3) + ((i % 7) as f32 * 0.001))
+            .collect();
+        let report = finalized_journal("upkeep-flac-src", &samples);
+        let saved = store
+            .save_capture(tiny_wav(32_000), Some(&report))
+            .expect("adopting save");
+        let before = store.audio_wav(&saved.id).expect("load").expect("present");
+        assert_eq!(*before, *saved.wav, "the first transcription's audio");
+
+        let upkeep = store
+            .audio_upkeep(store_v2::RetentionPolicy::default, || false)
+            .expect("upkeep");
+        assert_eq!(upkeep.compressed, 1);
+        assert!(upkeep.saved_bytes > 0);
+        assert!(upkeep.retention.retired.is_empty(), "retention is off");
+        assert!(upkeep.summary().expect("summary").starts_with("Compressed 1 recording"));
+        let after = store.audio_wav(&saved.id).expect("load").expect("present");
+        assert_eq!(*after, *before);
+        // A second pass finds nothing to do.
+        let again = store
+            .audio_upkeep(store_v2::RetentionPolicy::default, || false)
+            .expect("upkeep");
+        assert_eq!(again.compressed, 0);
+        assert!(again.summary().is_none());
+    }
+
+    #[test]
+    fn upkeep_stops_when_a_take_starts_recording() {
+        let store = v2_store("upkeep-paused");
+        let report = finalized_journal("upkeep-paused-src", &vec![0.1f32; 32_000]);
+        let saved = store
+            .save_capture(tiny_wav(32_000), Some(&report))
+            .expect("adopting save");
+        let mut policy = store_v2::RetentionPolicy::default();
+        policy.grace = std::time::Duration::ZERO;
+        policy.include_referenced = true;
+        policy.limits.insert(
+            store_v2::STANDARD_CLASS.to_string(),
+            store_v2::ClassLimits {
+                max_age_days: Some(0),
+                max_total_bytes: None,
+            },
+        );
+        let upkeep = store
+            .audio_upkeep(|| policy.clone(), || true)
+            .expect("upkeep");
+        assert!(upkeep.paused);
+        assert_eq!(upkeep.compressed, 0);
+        assert!(upkeep.retention.retired.is_empty());
+        assert!(upkeep.summary().is_none());
+        let wav = store.audio_wav(&saved.id).expect("load").expect("present");
+        assert_eq!(*wav, *saved.wav, "still the journal, untouched");
+    }
+
+    #[test]
+    fn a_failed_compression_commit_leaves_the_store_usable() {
+        let store = v2_store("upkeep-commit-fails");
+        let report = finalized_journal("upkeep-commit-fails-src", &vec![0.1f32; 32_000]);
+        let saved = store
+            .save_capture(tiny_wav(32_000), Some(&report))
+            .expect("adopting save");
+        // A directory where the FLAC goes: the publish's rename fails.
+        let flac = lock_v2(&store.0)
+            .root()
+            .join("audio")
+            .join(format!("{}.flac", saved.id));
+        std::fs::create_dir_all(flac.join("blocker")).expect("blocking directory");
+        let (done, finished) = std::sync::mpsc::channel();
+        let worker = store.clone();
+        std::thread::spawn(move || {
+            let upkeep = worker
+                .audio_upkeep(store_v2::RetentionPolicy::default, || false)
+                .expect("upkeep");
+            let candidates = lock_v2(&worker.0)
+                .compression_candidates(10)
+                .expect("candidates")
+                .len();
+            done.send((upkeep, candidates)).expect("send");
+        });
+        let (upkeep, candidates) = finished
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("upkeep returned and the store is still usable");
+        assert_eq!(upkeep.compressed, 0);
+        assert_eq!(upkeep.failures.len(), 1, "{upkeep:?}");
+        assert_eq!(candidates, 1, "one failure does not give up yet");
+    }
+
+    #[test]
+    fn upkeep_stops_removing_once_a_take_starts_recording() {
+        let store = v2_store("upkeep-paused-mid-run");
+        let id = transcribed(&store, "a take past its limit");
+        let mut policy = store_v2::RetentionPolicy::default();
+        policy.grace = std::time::Duration::ZERO;
+        policy.limits.insert(
+            store_v2::STANDARD_CLASS.to_string(),
+            store_v2::ClassLimits {
+                max_age_days: Some(0),
+                max_total_bytes: None,
+            },
+        );
+        // A take starts recording right after the policy run began.
+        let recording = std::sync::atomic::AtomicBool::new(false);
+        let upkeep = store
+            .audio_upkeep(
+                || {
+                    recording.store(true, std::sync::atomic::Ordering::SeqCst);
+                    policy.clone()
+                },
+                || recording.load(std::sync::atomic::Ordering::SeqCst),
+            )
+            .expect("upkeep");
+        assert!(upkeep.paused);
+        assert!(upkeep.retention.retired.is_empty(), "{upkeep:?}");
+        assert!(store.audio_wav(&id).expect("load").is_some());
+    }
+
+    #[test]
+    fn a_summary_never_slices_inside_a_character() {
+        let report = UpkeepReport {
+            failures: vec![("c_x".to_string(), "unreadable".to_string())],
+            ..UpkeepReport::default()
+        };
+        assert!(report.summary().expect("summary").starts_with("1 recording"));
+    }
+
+    #[test]
+    fn archiving_a_take_moves_it_under_the_archival_limits() {
+        let store = v2_store("upkeep-archive");
+        let id = transcribed(&store, "an archived take");
+        assert!(!summary_of(&store, &id).archival);
+        store.set_archival(&id, true).expect("archive");
+        assert!(summary_of(&store, &id).archival);
+        // A standard-only limit no longer reaches it; the archival one does.
+        let mut policy = store_v2::RetentionPolicy::default();
+        policy.grace = std::time::Duration::ZERO;
+        let expired = store_v2::ClassLimits {
+            max_age_days: Some(0),
+            max_total_bytes: None,
+        };
+        policy
+            .limits
+            .insert(store_v2::STANDARD_CLASS.to_string(), expired);
+        let upkeep = store.audio_upkeep(|| policy.clone(), || false).expect("upkeep");
+        assert!(upkeep.retention.retired.is_empty());
+        policy
+            .limits
+            .insert(store_v2::ARCHIVAL_CLASS.to_string(), expired);
+        let upkeep = store.audio_upkeep(|| policy.clone(), || false).expect("upkeep");
+        assert_eq!(upkeep.retention.retired.len(), 1);
+        store.set_archival(&id, false).expect("unarchive");
+        assert!(!summary_of(&store, &id).archival);
+    }
+
+    #[test]
+    fn a_pinned_take_keeps_its_audio_until_the_pin_drops() {
+        let store = v2_store("upkeep-pin");
+        let id = transcribed(&store, "pinned");
+        let mut policy = store_v2::RetentionPolicy::default();
+        policy.grace = std::time::Duration::ZERO;
+        policy.limits.insert(
+            store_v2::STANDARD_CLASS.to_string(),
+            store_v2::ClassLimits {
+                max_age_days: Some(0),
+                max_total_bytes: None,
+            },
+        );
+        let pin = store.pin_audio(&id);
+        let upkeep = store.audio_upkeep(|| policy.clone(), || false).expect("upkeep");
+        assert!(upkeep.retention.retired.is_empty());
+        assert!(store.audio_wav(&id).expect("load").is_some());
+        drop(pin);
+        let upkeep = store.audio_upkeep(|| policy.clone(), || false).expect("upkeep");
+        assert_eq!(upkeep.retention.retired.len(), 1);
+    }
+
+    #[test]
+    fn retired_audio_is_explained_and_the_transcript_stays() {
+        let store = v2_store("upkeep-retire");
+        let id = transcribed(&store, "keep this text");
+        let mut policy = store_v2::RetentionPolicy::default();
+        policy.grace = std::time::Duration::ZERO;
+        policy.limits.insert(
+            store_v2::STANDARD_CLASS.to_string(),
+            store_v2::ClassLimits {
+                max_age_days: Some(0),
+                max_total_bytes: None,
+            },
+        );
+        let upkeep = store.audio_upkeep(|| policy.clone(), || false).expect("upkeep");
+        assert_eq!(upkeep.retention.retired.len(), 1);
+        assert!(
+            upkeep.summary().expect("summary").contains("removed the audio of 1 recording"),
+            "{:?}",
+            upkeep.summary()
+        );
+        let summary = summary_of(&store, &id);
+        assert_eq!(summary.status, SessionStatus::Transcribed);
+        assert_eq!(transcript_text(&store, &id).as_deref(), Some("keep this text"));
+        let note = summary.last_error.expect("note");
+        assert!(note.contains("retention policy"), "{note}");
+        let err = store.audio_wav(&id).expect_err("no audio left");
+        assert!(err.to_string().contains("retention policy"), "{err}");
     }
 
     #[test]

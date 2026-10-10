@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use gpui::{AppContext, Context, Window};
 use starling_dictation::client::StarlingClient;
+use starling_dictation::disk::DiskLevel;
 use starling_dictation::microphone::{
     self, InputDevice, InputProblem, InputRoute, SettingsPage, SignalLevel,
 };
@@ -243,7 +244,32 @@ pub(crate) struct MicState {
     /// When the live take's input last carried sound; `None` until it
     /// first does.
     pub(crate) last_sound_at: Option<Instant>,
+    /// The live take already showed its low-disk warning (#342), so a
+    /// dismissed warning is not raised again on every poll.
+    pub(crate) disk_warned: bool,
+    /// The low-disk warning text the live take shows, so a critical stop
+    /// can drop it instead of joining a prediction that already came true.
+    pub(crate) disk_low_warning: Option<String>,
+    /// The live take shows [`DISK_UNCHECKED_NOTE`] (#342) because the
+    /// free-space probe is failing.
+    pub(crate) disk_unchecked: bool,
 }
+
+/// `warning` without the take's low-disk warning `low`: once the take
+/// stopped for a full disk, "minutes left before Starling stops a take"
+/// contradicts the stop note. Other warnings the stop set are kept.
+fn without_low_disk_warning(warning: Option<String>, low: Option<String>) -> Option<String> {
+    let (Some(warning), Some(low)) = (warning.clone(), low) else {
+        return warning;
+    };
+    let rest = warning.replace(low.as_str(), "");
+    let rest = rest.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!rest.is_empty()).then_some(rest)
+}
+
+/// Shown, without stopping the take, while the free-space probe fails
+/// (#342); a journal write that finds the disk full still stops it.
+const DISK_UNCHECKED_NOTE: &str = "Can't check free disk space.";
 
 /// Candidate commands that open the OS sound (or microphone privacy)
 /// settings, tried in order. Linux has no single entry point: the common
@@ -400,6 +426,64 @@ impl StarlingApp {
         }
     }
 
+    /// The live take's free-space reading (#342): a low disk warns once;
+    /// a critical one stops the take the normal way — finalized, saved
+    /// and transcribed — while there is still room to do that, and says
+    /// why.
+    fn watch_take_disk(&mut self, take: crate::activation::TakeId, cx: &mut Context<Self>) {
+        let Some(handle) = self.recorder.as_ref() else {
+            return;
+        };
+        let probe_failing = handle.disk_probe_failing();
+        if probe_failing != self.mic.disk_unchecked {
+            self.mic.disk_unchecked = probe_failing;
+            self.capture_warning =
+                with_disk_unchecked_note(self.capture_warning.take(), probe_failing);
+            cx.notify();
+        }
+        let Some(reading) = handle.disk_reading() else {
+            return;
+        };
+        let rate = handle.sample_rate();
+        let policy = starling_dictation::disk::DiskPolicy::default();
+        match reading.level {
+            DiskLevel::Ok => {}
+            DiskLevel::Low => {
+                if !self.mic.disk_warned {
+                    self.mic.disk_warned = true;
+                    self.capture_warning = policy.warning(reading, rate);
+                    self.mic.disk_low_warning = self.capture_warning.clone();
+                    cx.notify();
+                }
+            }
+            DiskLevel::Critical => {
+                self.activation_input(|machine| machine.storage_full(take), cx);
+                // The stop above ran synchronously and set the take's own
+                // warnings; this joins them. It never claims the take was
+                // saved — saving is still under way, and a failure there
+                // (or a journal fault) reports itself through `error`.
+                let note = if reading.available == 0 {
+                    "Recording stopped because the disk is full. Free up space before recording \
+                     again."
+                        .to_string()
+                } else {
+                    format!(
+                        "Recording stopped because the disk is almost full ({} MB free). Free \
+                         up space before recording again.",
+                        reading.available / (1024 * 1024)
+                    )
+                };
+                let low = self.mic.disk_low_warning.take();
+                let existing = without_low_disk_warning(self.capture_warning.take(), low);
+                self.capture_warning = Some(match existing {
+                    Some(existing) => format!("{note} {existing}"),
+                    None => note,
+                });
+                cx.notify();
+            }
+        }
+    }
+
     /// Records why the running take lost its input, if it did; `true`
     /// when the take must end as interrupted.
     pub(crate) fn note_live_interruption(&mut self) -> bool {
@@ -494,6 +578,7 @@ impl StarlingApp {
         self.cue_take_starting();
         self.mic.check = Some(
             match recorder::start_capture(CaptureRequest {
+                disk_watch: None,
                 journals_dir: None,
                 preferred_device: self.draft_microphone.as_deref(),
             }) {
@@ -645,6 +730,8 @@ impl StarlingApp {
         if let Some(take) = self.recording_take {
             if self.note_live_interruption() {
                 self.activation_input(|machine| machine.input_lost(take), cx);
+            } else {
+                self.watch_take_disk(take, cx);
             }
         }
         let stop_check = match self.mic.check.as_ref() {
@@ -673,9 +760,69 @@ impl StarlingApp {
     }
 }
 
+/// The capture warning with [`DISK_UNCHECKED_NOTE`] leading it while
+/// `failing`, and without it once the probe answers again.
+fn with_disk_unchecked_note(warning: Option<String>, failing: bool) -> Option<String> {
+    let rest = warning.and_then(|text| match text.strip_prefix(DISK_UNCHECKED_NOTE) {
+        Some(rest) => Some(rest.trim_start().to_string()).filter(|rest| !rest.is_empty()),
+        None => Some(text),
+    });
+    match (failing, rest) {
+        (true, Some(rest)) => Some(format!("{DISK_UNCHECKED_NOTE} {rest}")),
+        (true, None) => Some(DISK_UNCHECKED_NOTE.to_string()),
+        (false, rest) => rest,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_critical_stop_drops_the_low_disk_prediction_but_keeps_other_warnings() {
+        let low = "Disk space is low (900 MB free): about 3 minutes of recording left.";
+        assert_eq!(
+            without_low_disk_warning(Some(low.to_string()), Some(low.to_string())),
+            None
+        );
+        assert_eq!(
+            without_low_disk_warning(
+                Some(format!("Input is clipping. {low}")),
+                Some(low.to_string())
+            ),
+            Some("Input is clipping.".to_string())
+        );
+        assert_eq!(
+            without_low_disk_warning(Some("Input is clipping.".to_string()), None),
+            Some("Input is clipping.".to_string())
+        );
+    }
+
+    #[test]
+    fn the_disk_unchecked_note_joins_and_leaves_the_capture_warning() {
+        assert_eq!(
+            with_disk_unchecked_note(None, true).as_deref(),
+            Some(DISK_UNCHECKED_NOTE)
+        );
+        let joined = with_disk_unchecked_note(Some("Clipping.".to_string()), true);
+        assert_eq!(
+            joined.as_deref(),
+            Some("Can't check free disk space. Clipping.")
+        );
+        assert_eq!(
+            with_disk_unchecked_note(joined.clone(), true),
+            joined,
+            "never doubled"
+        );
+        assert_eq!(
+            with_disk_unchecked_note(joined, false).as_deref(),
+            Some("Clipping.")
+        );
+        assert_eq!(
+            with_disk_unchecked_note(Some(DISK_UNCHECKED_NOTE.to_string()), false),
+            None
+        );
+    }
 
     fn device(name: &str, is_default: bool) -> InputDevice {
         InputDevice {

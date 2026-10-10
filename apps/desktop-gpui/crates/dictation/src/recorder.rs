@@ -46,13 +46,14 @@
 //! WAV-encode time, driven by the UI layer — not here.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, StreamTrait};
 
+use crate::disk::{DiskLevel, DiskReading, DiskWatch};
 use crate::journal::{FileSink, JournalSink, JournalWriter};
 use crate::microphone::{self, InputProblem, InputRoute};
 
@@ -444,7 +445,21 @@ struct Shared {
     /// `stream.play()` failure teardown in `start_on_device` also
     /// sets it directly; no callback ever ran there.
     stopping: AtomicBool,
+    /// The writer task's last free-space reading for the journal's disk
+    /// (#342): [`DISK_UNKNOWN`] until a [`DiskWatch`] probed, then a
+    /// [`DiskLevel`] code, with the bytes available beside it — or
+    /// [`DISK_PROBE_FAILING`] while the probe cannot answer.
+    disk_level: AtomicU8,
+    disk_available: AtomicU64,
 }
+
+/// `Shared::disk_level` codes.
+const DISK_UNKNOWN: u8 = 0;
+const DISK_OK: u8 = 1;
+const DISK_LOW: u8 = 2;
+const DISK_CRITICAL: u8 = 3;
+/// The latest probe failed: whatever was read before is stale.
+const DISK_PROBE_FAILING: u8 = 4;
 
 /// Ring slot count for a device rate: [`CAPTURE_RING_SECONDS`] worth of
 /// samples rounded to the nearest power of two (the wrap arithmetic needs
@@ -491,6 +506,8 @@ impl Shared {
             consumer: Mutex::new(ConsumerState::default()),
             wake: Condvar::new(),
             stopping: AtomicBool::new(false),
+            disk_level: AtomicU8::new(DISK_UNKNOWN),
+            disk_available: AtomicU64::new(0),
         }
     }
 
@@ -629,13 +646,29 @@ fn panic_message(join_err: Box<dyn std::any::Any + Send>) -> String {
 /// ([`Shared::record_stream_error`]) never wait on storage. The journal
 /// writer is owned solely by this task, so unlocking around its I/O
 /// introduces no journal-side race.
-fn writer_loop<S: JournalSink>(shared: Arc<Shared>, mut journal: Option<JournalWriter<S>>) {
+fn writer_loop<S: JournalSink>(
+    shared: Arc<Shared>,
+    mut journal: Option<JournalWriter<S>>,
+    disk: Option<DiskWatch>,
+) {
+    // The first free-space check runs on the first tick.
+    let mut next_disk_check = Instant::now();
+    let mut probe_failed = false;
     loop {
         {
             let mut guard = shared.lock_consumer();
             shared.drain_ring(&mut guard);
         }
         journal_boundary_step(&shared, &mut journal);
+        if let Some(watch) = disk.as_ref() {
+            disk_watch_step(
+                &shared,
+                &mut journal,
+                watch,
+                &mut next_disk_check,
+                &mut probe_failed,
+            );
+        }
         if shared.stopping.load(Ordering::Acquire) {
             {
                 let mut guard = shared.lock_consumer();
@@ -729,15 +762,98 @@ fn journal_boundary_step<S: JournalSink>(
         shared.durable_ack.store(acknowledged_samples, Ordering::Release);
     }
     if let Some(err) = fault {
-        let frozen = shared.durable_ack.load(Ordering::Acquire);
-        let mut guard = shared.lock_consumer();
-        guard.journal_fault = Some(format!(
-            "The capture journal failed: {err}. Recording continues, but acknowledged \
-             samples are frozen at {frozen} — newly captured audio is not being made durable."
-        ));
-        drop(guard);
-        *journal = None;
+        journal_failed(shared, journal, err);
     }
+}
+
+/// A journal write or fsync failed mid-take: record the fault, drop the
+/// journal, and leave acknowledgment frozen at the last good boundary.
+/// A full disk (#342) also publishes a critical free-space reading, so
+/// the UI stops the take as it would on a probe's warning — the disk
+/// filled faster than the watch looked, and nothing probes it after the
+/// journal is gone.
+fn journal_failed<S: JournalSink>(
+    shared: &Shared,
+    journal: &mut Option<JournalWriter<S>>,
+    err: std::io::Error,
+) {
+    if matches!(
+        err.kind(),
+        std::io::ErrorKind::StorageFull | std::io::ErrorKind::QuotaExceeded
+    ) {
+        shared.disk_available.store(0, Ordering::Relaxed);
+        shared.disk_level.store(DISK_CRITICAL, Ordering::Release);
+    }
+    let frozen = shared.durable_ack.load(Ordering::Acquire);
+    let mut guard = shared.lock_consumer();
+    guard.journal_fault = Some(format!(
+        "The capture journal failed: {err}. Recording continues, but acknowledged \
+         samples are frozen at {frozen} — newly captured audio is not being made durable."
+    ));
+    drop(guard);
+    *journal = None;
+}
+
+/// The in-take free-space check (#342): every `watch.interval`, probe
+/// the journal's directory and publish the reading for the UI, which
+/// warns on [`DiskLevel::Low`] and stops the take on
+/// [`DiskLevel::Critical`]. On a critical reading the journal is also
+/// sealed up to everything appended so far with a boundary right away —
+/// while there is still room for that record — so the take is fully
+/// acknowledged and recoverable whatever happens before the stop lands.
+/// A probe that cannot answer replaces the last reading with
+/// [`DISK_PROBE_FAILING`] (a critical reading stays: that take is being
+/// stopped) and is logged once per take; a journal write that hits a full
+/// disk still stops the take ([`journal_failed`]).
+fn disk_watch_step<S: JournalSink>(
+    shared: &Shared,
+    journal: &mut Option<JournalWriter<S>>,
+    watch: &DiskWatch,
+    next_check: &mut Instant,
+    probe_failed: &mut bool,
+) {
+    let Some(writer) = journal.as_mut() else {
+        return;
+    };
+    let now = Instant::now();
+    if now < *next_check {
+        return;
+    }
+    *next_check = now + watch.interval;
+    let Some(dir) = writer.path().parent() else {
+        return;
+    };
+    let reading = match watch.policy.check(watch.probe.as_ref(), dir) {
+        Ok(reading) => reading,
+        Err(err) => {
+            if !std::mem::replace(probe_failed, true) {
+                eprintln!("Free-space check of {dir:?} failed: {err}");
+            }
+            if shared.disk_level.load(Ordering::Acquire) != DISK_CRITICAL {
+                shared
+                    .disk_level
+                    .store(DISK_PROBE_FAILING, Ordering::Release);
+            }
+            return;
+        }
+    };
+    // Seal before publishing: whoever sees the critical reading sees
+    // every sample appended so far already acknowledged.
+    if reading.level == DiskLevel::Critical && writer.total_samples() > 0 {
+        match writer.write_boundary() {
+            Ok(acknowledged) => shared.durable_ack.store(acknowledged, Ordering::Release),
+            Err(err) => journal_failed(shared, journal, err),
+        }
+    }
+    shared
+        .disk_available
+        .store(reading.available, Ordering::Relaxed);
+    let code = match reading.level {
+        DiskLevel::Ok => DISK_OK,
+        DiskLevel::Low => DISK_LOW,
+        DiskLevel::Critical => DISK_CRITICAL,
+    };
+    shared.disk_level.store(code, Ordering::Release);
 }
 
 /// The stop-path journal work: append anything the final drain added, then
@@ -954,6 +1070,30 @@ impl RecorderHandle {
     /// stays at the last fsynced value — 0 if there never was one.
     pub fn acknowledged_samples(&self) -> u64 {
         self.shared.durable_ack.load(Ordering::Acquire)
+    }
+
+    /// The latest free-space reading for the journal's disk (#342), when
+    /// the take runs with a [`DiskWatch`] and a journal; `None` before the
+    /// first probe answered and while the probe fails
+    /// ([`Self::disk_probe_failing`]).
+    pub fn disk_reading(&self) -> Option<DiskReading> {
+        let level = match self.shared.disk_level.load(Ordering::Acquire) {
+            DISK_OK => DiskLevel::Ok,
+            DISK_LOW => DiskLevel::Low,
+            DISK_CRITICAL => DiskLevel::Critical,
+            _ => return None,
+        };
+        Some(DiskReading {
+            available: self.shared.disk_available.load(Ordering::Relaxed),
+            level,
+        })
+    }
+
+    /// Whether the latest free-space probe failed (#342): the disk is not
+    /// being watched right now, so no earlier reading can be trusted. A
+    /// journal write that hits a full disk still reads as critical.
+    pub fn disk_probe_failing(&self) -> bool {
+        self.shared.disk_level.load(Ordering::Acquire) == DISK_PROBE_FAILING
     }
 
     /// Gap spans where ring overflow dropped samples, in capture order.
@@ -1207,12 +1347,13 @@ pub fn start_recording_with_journal(
     start_capture(CaptureRequest {
         journals_dir: Some(journals_dir),
         preferred_device: None,
+        disk_watch: None,
     })
     .map_err(RecorderError::from)
 }
 
 /// What a capture opens.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct CaptureRequest<'a> {
     /// Journal the take here (see [`start_recording_with_journal`]);
     /// `None` captures in memory only.
@@ -1223,6 +1364,9 @@ pub struct CaptureRequest<'a> {
     /// [`RecorderHandle::input_route`]; the preference is never rewritten
     /// here.
     pub preferred_device: Option<&'a str>,
+    /// Watch the journal disk's free space during the take (#342; see
+    /// [`RecorderHandle::disk_reading`]). Only meaningful with a journal.
+    pub disk_watch: Option<DiskWatch>,
 }
 
 /// A capture that could not start, classified so the UI can explain a
@@ -1247,13 +1391,14 @@ impl From<StartError> for RecorderError {
 pub fn start_capture(request: CaptureRequest<'_>) -> Result<RecorderHandle, StartError> {
     let (device, route) = microphone::open_input(request.preferred_device)
         .map_err(|problem| StartError { problem, route: None })?;
-    start_on_device(&device, route, request.journals_dir)
+    start_on_device(&device, route, request.journals_dir, request.disk_watch)
 }
 
 fn start_on_device(
     device: &cpal::Device,
     route: InputRoute,
     journals_dir: Option<&Path>,
+    disk_watch: Option<DiskWatch>,
 ) -> Result<RecorderHandle, StartError> {
     let fail = |problem: InputProblem| StartError {
         problem,
@@ -1302,7 +1447,7 @@ fn start_on_device(
         .name("starling-capture-writer".to_string())
         .spawn({
             let shared = Arc::clone(&shared);
-            move || writer_loop(shared, journal)
+            move || writer_loop(shared, journal, disk_watch)
         })
         .map_err(|err| {
             fail(InputProblem::Failed {
@@ -1516,7 +1661,7 @@ mod tests {
     ) -> JoinHandle<()> {
         std::thread::Builder::new()
             .name("test-capture-writer".to_string())
-            .spawn(move || writer_loop(shared, journal))
+            .spawn(move || writer_loop(shared, journal, None))
             .expect("spawn writer")
     }
 
@@ -2777,6 +2922,7 @@ mod tests {
         let handle = start_capture(CaptureRequest {
             journals_dir: None,
             preferred_device: Some("starling-test: no such microphone"),
+            disk_watch: None,
         })
         .expect("a missing preferred device falls back to the default");
         let fallback = handle.input_route().expect("route").clone();
@@ -2818,5 +2964,249 @@ mod tests {
             "unexpected device sample rate {}",
             audio.sample_rate
         );
+    }
+
+    // ---- free-space watch (#342) ------------------------------------
+
+    /// A probe the test moves through free-space states.
+    struct FakeProbe(Arc<AtomicU64>, Arc<AtomicBool>);
+
+    impl crate::disk::FreeSpaceProbe for FakeProbe {
+        fn available_bytes(&self, _path: &Path) -> std::io::Result<u64> {
+            if self.1.load(Ordering::Acquire) {
+                return Err(std::io::Error::other("probe unavailable"));
+            }
+            Ok(self.0.load(Ordering::Acquire))
+        }
+    }
+
+    fn watched_handle(
+        shared: Arc<Shared>,
+        dir: &Path,
+        available: Arc<AtomicU64>,
+        failing: Arc<AtomicBool>,
+    ) -> RecorderHandle {
+        let writer = JournalWriter::<FileSink>::create(dir, 16_000).expect("create journal");
+        let identity = JournalIdentity {
+            id: writer.id().to_string(),
+            path: writer.path().to_path_buf(),
+            rate: writer.sample_rate(),
+        };
+        let watch = DiskWatch {
+            probe: Arc::new(FakeProbe(available, failing)),
+            policy: crate::disk::DiskPolicy {
+                warn_below: 1_000_000,
+                stop_below: 100_000,
+            },
+            interval: Duration::from_millis(5),
+        };
+        let writer_thread = std::thread::Builder::new()
+            .name("test-capture-writer".to_string())
+            .spawn({
+                let shared = Arc::clone(&shared);
+                move || writer_loop(shared, Some(writer), Some(watch))
+            })
+            .expect("spawn writer");
+        RecorderHandle {
+            shared,
+            stream: None,
+            writer: Some(writer_thread),
+            sample_rate: 16_000,
+            started_at: Instant::now(),
+            quiesce_timeout: Duration::from_millis(500),
+            journal: Some(identity),
+            route: None,
+        }
+    }
+
+    #[test]
+    fn a_filling_disk_warns_then_seals_the_take_for_a_clean_stop() {
+        let dir = TempDir::new().expect("tempdir");
+        let available = Arc::new(AtomicU64::new(50_000_000));
+        let failing = Arc::new(AtomicBool::new(false));
+        let shared = test_shared(65_536);
+        let handle = watched_handle(
+            Arc::clone(&shared),
+            dir.path(),
+            Arc::clone(&available),
+            Arc::clone(&failing),
+        );
+        let mut callback = CallbackState::new(1);
+        let first: Vec<f32> = (0..4_000u32).map(|i| i as f32 * 0.00001).collect();
+        callback.process(&first, &shared);
+        let reading = wait_until(|| handle.disk_reading(), |reading| reading.is_some());
+        assert_eq!(reading.map(|reading| reading.level), Some(DiskLevel::Ok));
+
+        // Low: a warning, recording goes on.
+        available.store(500_000, Ordering::Release);
+        let reading = wait_until(
+            || handle.disk_reading(),
+            |reading| reading.is_some_and(|reading| reading.level == DiskLevel::Low),
+        );
+        assert_eq!(reading.map(|reading| reading.available), Some(500_000));
+
+        // Critical: every sample appended so far is acknowledged by the
+        // time the reading is visible, without waiting for the cadence.
+        let second: Vec<f32> = (0..3_000u32).map(|i| -(i as f32) * 0.00001).collect();
+        callback.process(&second, &shared);
+        wait_until(|| shared.lock_consumer().journaled, |journaled| *journaled == 7_000);
+        available.store(10_000, Ordering::Release);
+        wait_until(
+            || handle.disk_reading(),
+            |reading| reading.is_some_and(|reading| reading.level == DiskLevel::Critical),
+        );
+        assert_eq!(handle.acknowledged_samples(), 7_000);
+        assert_eq!(handle.capture_fault(), None);
+
+        // The app's clean stop: the journal finalizes with the whole take.
+        let take = handle.stop().expect("clean stop");
+        let report = take.journal.expect("journal");
+        assert!(report.finalized);
+        assert_eq!(report.fault, None);
+        let parsed = crate::journal::read_journal(&report.path).expect("journal");
+        assert_eq!(parsed.samples.len(), 7_000);
+        assert!(parsed.finalized);
+    }
+
+    #[test]
+    fn an_unanswering_disk_probe_never_invents_a_reading() {
+        let dir = TempDir::new().expect("tempdir");
+        let shared = test_shared(8_192);
+        let handle = watched_handle(
+            Arc::clone(&shared),
+            dir.path(),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicBool::new(true)),
+        );
+        let mut callback = CallbackState::new(1);
+        callback.process(&[0.1; 1_000], &shared);
+        wait_until(|| handle.acknowledged_samples(), |acked| *acked == 1_000);
+        assert_eq!(handle.disk_reading(), None);
+        assert!(wait_until(
+            || handle.disk_probe_failing(),
+            |failing| *failing
+        ));
+        assert!(handle.stop().expect("stop").journal.expect("journal").finalized);
+        // Without a watch there is never a reading either.
+        let plain = test_handle(test_shared(1_024), 16_000);
+        assert_eq!(plain.disk_reading(), None);
+        assert!(!plain.disk_probe_failing());
+    }
+
+    #[test]
+    fn a_failing_disk_probe_retracts_the_last_reading_until_it_answers_again() {
+        let dir = TempDir::new().expect("tempdir");
+        let available = Arc::new(AtomicU64::new(500_000));
+        let failing = Arc::new(AtomicBool::new(false));
+        let shared = test_shared(8_192);
+        let handle = test_handle(Arc::clone(&shared), 16_000);
+        let mut journal =
+            Some(JournalWriter::<FileSink>::create(dir.path(), 16_000).expect("create journal"));
+        let watch = DiskWatch {
+            probe: Arc::new(FakeProbe(Arc::clone(&available), Arc::clone(&failing))),
+            policy: crate::disk::DiskPolicy {
+                warn_below: 1_000_000,
+                stop_below: 100_000,
+            },
+            interval: Duration::ZERO,
+        };
+        let mut probe_failed = false;
+        let mut step = || {
+            disk_watch_step(
+                &shared,
+                &mut journal,
+                &watch,
+                &mut Instant::now(),
+                &mut probe_failed,
+            )
+        };
+
+        step();
+        let low = Some(DiskReading {
+            available: 500_000,
+            level: DiskLevel::Low,
+        });
+        assert_eq!(handle.disk_reading(), low);
+        assert!(!handle.disk_probe_failing());
+
+        // The probe stops answering: the low reading is no longer offered.
+        failing.store(true, Ordering::Release);
+        step();
+        assert_eq!(handle.disk_reading(), None);
+        assert!(handle.disk_probe_failing());
+
+        // It answers again: a fresh reading replaces the failing state.
+        failing.store(false, Ordering::Release);
+        step();
+        assert_eq!(handle.disk_reading(), low);
+        assert!(!handle.disk_probe_failing());
+
+        // A critical reading outlasts a later probe failure: that take is
+        // being stopped.
+        available.store(10_000, Ordering::Release);
+        step();
+        failing.store(true, Ordering::Release);
+        step();
+        assert_eq!(
+            handle.disk_reading().map(|reading| reading.level),
+            Some(DiskLevel::Critical)
+        );
+        assert!(!handle.disk_probe_failing());
+    }
+
+    /// A sink that accepts the header, then runs out of space.
+    struct FullDiskSink {
+        full: Arc<AtomicBool>,
+    }
+
+    impl JournalSink for FullDiskSink {
+        fn append(&mut self, _bytes: &[u8]) -> std::io::Result<()> {
+            if self.full.load(Ordering::Acquire) {
+                return Err(std::io::Error::from(std::io::ErrorKind::StorageFull));
+            }
+            Ok(())
+        }
+
+        fn sync(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn sync_parent_dir(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_journal_write_that_finds_the_disk_full_reads_as_critical() {
+        // #342: the disk filled between two free-space probes (or no
+        // watch runs at all). The failed write itself must make the UI
+        // stop the take: after it nothing probes the dropped journal.
+        let full = Arc::new(AtomicBool::new(false));
+        let writer = JournalWriter::over_sink(
+            FullDiskSink {
+                full: Arc::clone(&full),
+            },
+            "j_full".to_string(),
+            PathBuf::from("full-disk-sink-has-no-file.sj"),
+            16_000,
+        )
+        .expect("writer over the full-disk sink");
+        let shared = test_shared(32_768);
+        let handle = journaled_test_handle(Arc::clone(&shared), writer, 16_000);
+        assert_eq!(handle.disk_reading(), None);
+        full.store(true, Ordering::Release);
+        let mut callback = CallbackState::new(1);
+        callback.process(&[0.1; 2_000], &shared);
+        let reading = wait_until(|| handle.disk_reading(), |reading| reading.is_some());
+        assert_eq!(
+            reading,
+            Some(DiskReading {
+                available: 0,
+                level: DiskLevel::Critical,
+            })
+        );
+        assert!(handle.capture_fault().is_some(), "the journal fault is surfaced too");
+        let take = handle.stop().expect("the in-memory take survives");
+        assert_eq!(take.audio.samples.len(), 2_000);
     }
 }

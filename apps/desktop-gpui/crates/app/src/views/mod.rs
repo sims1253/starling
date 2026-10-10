@@ -10,6 +10,7 @@ pub(crate) mod microphone;
 pub(crate) mod overlay;
 mod settings;
 pub(crate) mod staging;
+mod storage;
 mod topbar;
 
 pub use capture::render_capture;
