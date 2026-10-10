@@ -26,6 +26,7 @@ same cropped audio is the like-for-like comparison.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import io
 import json
 import statistics
@@ -36,10 +37,7 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-# --src replays another checkout's stitcher (e.g. the base revision).
-_SRC = next((a.split("=", 1)[1] for a in sys.argv if a.startswith("--src=")),
-            str(Path(__file__).resolve().parents[2] / "src"))
-sys.path.insert(0, _SRC)
+_DEFAULT_SRC = Path(__file__).resolve().parents[2] / "src"
 
 from runner import ArmServer, _free_port  # noqa: E402
 from stream_replay import SAMPLE_RATE, _batch_bytes, _read_pcm, locate_errors, wer  # noqa: E402
@@ -55,32 +53,66 @@ def _wav(pcm: bytes) -> bytes:
     return buf.getvalue()
 
 
+def _file_digest(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()[:16]
+
+
+def use_stitcher(src: Path) -> None:
+    """Import starling.stream_chunk from ``src`` (e.g. the base revision's
+    checkout), refusing to run with another copy already imported."""
+    src = src.resolve()
+    sys.path.insert(0, str(src))
+    import starling.stream_chunk as stream_chunk
+
+    if not Path(stream_chunk.__file__).resolve().is_relative_to(src):
+        raise SystemExit(f"--src {src}: starling.stream_chunk already imported "
+                         f"from {stream_chunk.__file__}")
+
+
 class Transcriber:
-    """Window texts by (take, first sample, length), from the cache or a
-    lazily started server."""
+    """Window texts by (engine, audio), from the cache or a lazily started
+    server. A cache entry is keyed on everything its text depends on: the
+    server binary, the model file, the model slug and server arguments
+    (their content hashes, not paths) and the window's samples, so a cache
+    reused with another build, model or workload misses instead of
+    returning another engine's or another recording's text."""
+
+    SERVER_ARGS: list[str] = []
 
     def __init__(self, args: argparse.Namespace):
         self.args = args
         self.cache: dict = json.loads(args.cache.read_text()) if args.cache.exists() else {}
         self.server = None
         self.misses = 0
+        self.engine = hashlib.sha256(json.dumps({
+            "binary": _file_digest(args.binary), "model": _file_digest(args.model),
+            "model_slug": args.model_slug, "args": self.SERVER_ARGS,
+        }, sort_keys=True).encode()).hexdigest()[:16]
 
-    def text(self, take: str, pcm: bytes, start: int, length: int) -> str:
-        key = f"{take}:{start}:{length}"
+    def key(self, pcm: bytes, start: int, length: int) -> str:
+        span = pcm[2 * start:2 * (start + length)]
+        return f"{self.engine}:{hashlib.sha256(span).hexdigest()[:24]}:{length}"
+
+    def text(self, pcm: bytes, start: int, length: int) -> str:
+        key = self.key(pcm, start, length)
         if key not in self.cache:
-            if self.server is None:
-                if not self.args.binary:
-                    raise SystemExit(f"window {key} not cached; pass --binary/--model")
-                arm = {"binary": str(self.args.binary), "model": str(self.args.model),
-                       "model_slug": self.args.model_slug, "args": []}
-                self.server = ArmServer(arm, self.args.port or _free_port(),
-                                        self.args.cache.with_suffix(".log"))
-                self.server.wait_healthy(300)
-            self.cache[key], _ = _batch_bytes(self.server.base,
-                                              _wav(pcm[2 * start:2 * (start + length)]),
-                                              self.args.model_slug, 300)
+            self.cache[key] = self.transcribe(_wav(pcm[2 * start:2 * (start + length)]))
             self.misses += 1
         return self.cache[key]
+
+    def transcribe(self, wav: bytes) -> str:
+        if self.server is None:
+            arm = {"binary": str(self.args.binary), "model": str(self.args.model),
+                   "model_slug": self.args.model_slug, "args": self.SERVER_ARGS}
+            self.server = ArmServer(arm, self.args.port or _free_port(),
+                                    self.args.cache.with_suffix(".log"))
+            self.server.wait_healthy(300)
+        text, _ = _batch_bytes(self.server.base, wav, self.args.model_slug, 300)
+        return text
 
     def close(self) -> None:
         if self.server is not None:
@@ -105,10 +137,10 @@ def replay_take(name: str, take: dict, pcm: bytes, offset: int, tr: Transcriber,
         start = (window.__array_interface__["data"][0] - base) // 4
         calls.append({"kind": cs.call_kind, "start_s": start / SAMPLE_RATE,
                       "end_s": (start + len(window)) / SAMPLE_RATE})
-        return tr.text(name, pcm, offset + start, len(window))
+        return tr.text(pcm, offset + start, len(window))
 
     final = cs.flush(samples, tx)
-    batch = tr.text(name, pcm, offset, len(samples))
+    batch = tr.text(pcm, offset, len(samples))
     # Utterance spans move with the offset; words cut off at the start are
     # in neither text.
     shift = offset / SAMPLE_RATE
@@ -129,8 +161,10 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--workload", type=Path, required=True)
     ap.add_argument("--cache", type=Path, required=True)
-    ap.add_argument("--binary", type=Path)
-    ap.add_argument("--model", type=Path)
+    ap.add_argument("--binary", type=Path, required=True,
+                    help="server for cache misses; its hash is part of every cache key")
+    ap.add_argument("--model", type=Path, required=True,
+                    help="model file; its hash is part of every cache key")
     ap.add_argument("--model-slug", default="parakeet")
     ap.add_argument("--port", type=int, default=0)
     ap.add_argument("--takes", default="short,medium,long")
@@ -138,10 +172,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--chunk-seconds", type=float, default=12.0)
     ap.add_argument("--overlap-seconds", type=float, default=3.0)
     ap.add_argument("--out", type=Path, help="write every replay as JSON")
-    ap.add_argument("--src", help="src/ directory whose starling.stream_chunk to replay "
-                    "(--src=PATH; default: this checkout)")
+    ap.add_argument("--src", type=Path, default=_DEFAULT_SRC,
+                    help="src/ directory whose starling.stream_chunk to replay "
+                    "(default: this checkout)")
     ap.add_argument("-v", "--verbose", action="store_true", help="print each error span")
     args = ap.parse_args(argv)
+    use_stitcher(args.src)
     manifest = json.loads((args.workload / "manifest.json").read_text())
     tr = Transcriber(args)
     rows = []
