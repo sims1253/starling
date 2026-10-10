@@ -36,7 +36,7 @@
 //! [`SCHEMA_VERSION`] in `meta`): `captures`, `recognition_attempts`,
 //! `context_snapshots`, `mode_decisions`, `documents`/`revisions`,
 //! `deliveries`, `insight_events`, `correction_records`, `tombstones`,
-//! `journal_supersessions`, `meta`. This core implements the
+//! `journal_supersessions`, `transcription_intents`, `meta`. This core implements the
 //! captures/attempts/tombstones/meta surfaces plus the
 //! documents/revisions surface (I5, issue #220:
 //! [`StoreV2::upsert_document`] and friends — the documents machine's
@@ -106,8 +106,9 @@ use crate::storage::{is_safe_path_component, iso_utc, now_iso};
 /// real updated-at source for the summaries); v3 added `insight_events`
 /// (#294: per-job processing latency, recorded for Insights #308); v4
 /// added `correction_records` and `captures.secure_field`; v5 added
-/// `journal_supersessions` (#356).
-pub const SCHEMA_VERSION: u32 = 5;
+/// `journal_supersessions` (#356); v6 added `transcription_intents`
+/// (#220).
+pub const SCHEMA_VERSION: u32 = 6;
 
 /// WAL checkpoint policy (D11): run `PRAGMA wal_checkpoint(PASSIVE)` after
 /// every N metadata commits. Default 64 — frequent enough that the WAL
@@ -325,6 +326,11 @@ CREATE TABLE IF NOT EXISTS journal_supersessions (
     journal_id TEXT PRIMARY KEY,
     capture_id TEXT NOT NULL,
     pending_passes INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS transcription_intents (
+    capture_id    TEXT PRIMARY KEY REFERENCES captures(id) ON DELETE CASCADE,
+    requested_utc TEXT NOT NULL,
+    attempt_id    TEXT
 );
 ";
 
@@ -627,6 +633,11 @@ pub struct TakeMeta {
     /// id is recorded in the take's commit, so a journal the save did not
     /// get to move aside is never adopted as a second copy.
     pub supersedes_journal: Option<String>,
+    /// The take is to be transcribed (#220): a complete commit records
+    /// that intent in its own transaction (see
+    /// [`StoreV2::claim_transcription`]), so a crash right after the
+    /// commit cannot leave the take stored but forgotten.
+    pub transcribe: bool,
 }
 
 impl TakeMeta {
@@ -640,6 +651,7 @@ impl TakeMeta {
             extra_json: None,
             secure_field: false,
             supersedes_journal: None,
+            transcribe: false,
         }
     }
 }
@@ -1056,16 +1068,18 @@ impl StoreV2 {
     /// committed with `synchronous=FULL`, then the WAL checkpoint per
     /// policy. Returning `Ok` is the durable ack.
     pub fn commit_capture(&mut self, record: &CaptureRecord) -> Result<(), StoreV2Error> {
-        self.commit_capture_superseding(record, None)
+        self.commit_capture_superseding(record, None, false)
     }
 
     /// [`Self::commit_capture`] that also records, in the same
     /// transaction, the recorder journal the take is stored in place of
-    /// ([`TakeMeta::supersedes_journal`]).
+    /// ([`TakeMeta::supersedes_journal`]) and, for a complete take, the
+    /// intent to transcribe it ([`TakeMeta::transcribe`]).
     fn commit_capture_superseding(
         &mut self,
         record: &CaptureRecord,
         supersedes_journal: Option<&str>,
+        transcribe: bool,
     ) -> Result<(), StoreV2Error> {
         let tx = self.conn.transaction()?;
         tx.execute(
@@ -1095,6 +1109,12 @@ impl StoreV2 {
                 "INSERT INTO journal_supersessions(journal_id, capture_id) VALUES (?1, ?2)
                  ON CONFLICT(journal_id) DO UPDATE SET capture_id = excluded.capture_id",
                 params![journal_id, record.id],
+            )?;
+        }
+        if transcribe && record.status == CaptureStatus::Complete {
+            tx.execute(
+                "INSERT INTO transcription_intents(capture_id, requested_utc) VALUES (?1, ?2)",
+                params![record.id, now_iso()],
             )?;
         }
         tx.commit()?;
@@ -2320,8 +2340,9 @@ impl StoreV2 {
     }
 
     /// Whether `id`'s audio is in use: pinned by a caller of this
-    /// instance, or a recognition attempt on it is in flight (#356). Its
-    /// audio is never compressed or retired under it.
+    /// instance, a recognition attempt on it is in flight (#356), or it
+    /// still waits to be transcribed (#220). Its audio is never
+    /// compressed or retired under it.
     fn audio_in_use(&self, id: &str) -> Result<bool, StoreV2Error> {
         if self.audio_pins.contains_key(id) {
             return Ok(true);
@@ -2330,6 +2351,7 @@ impl StoreV2 {
             .conn
             .query_row(
                 "SELECT 1 FROM recognition_attempts WHERE capture_id = ?1 AND status = 'started'
+                 UNION ALL SELECT 1 FROM transcription_intents WHERE capture_id = ?1
                  LIMIT 1",
                 params![id],
                 |_| Ok(()),
@@ -2352,6 +2374,8 @@ impl StoreV2 {
                 "SELECT id, actual_rate, frame_count FROM captures c
                  WHERE NOT EXISTS (SELECT 1 FROM recognition_attempts a
                                    WHERE a.capture_id = c.id AND a.status = 'started')
+                   AND NOT EXISTS (SELECT 1 FROM transcription_intents i
+                                   WHERE i.capture_id = c.id)
                    AND NOT EXISTS (SELECT 1 FROM tombstones t
                                    WHERE t.id = ?1 || c.id AND t.kind = 'audio')
                  ORDER BY created_utc, id",
@@ -3784,7 +3808,19 @@ impl StoreV2 {
         source: impl AsRef<Path>,
         note: Option<&str>,
     ) -> Result<CaptureRecord, StoreV2Error> {
-        self.adopt_journal_with(source.as_ref(), None, |facts| {
+        self.adopt_journal_transcribed(source, note, false)
+    }
+
+    /// [`Self::adopt_journal`], recording the intent to transcribe the
+    /// take in the same commit when `transcribe` is set and the journal
+    /// lands complete ([`TakeMeta::transcribe`]).
+    pub fn adopt_journal_transcribed(
+        &mut self,
+        source: impl AsRef<Path>,
+        note: Option<&str>,
+        transcribe: bool,
+    ) -> Result<CaptureRecord, StoreV2Error> {
+        self.adopt_journal_with(source.as_ref(), None, transcribe, |facts| {
             let recovery_note = match (facts.torn_tail_bytes, facts.was_finalized) {
                 (torn, _) if torn > 0 => Some(format!(
                     "Adopted from a capture journal whose last {torn} bytes were an \
@@ -3814,6 +3850,7 @@ impl StoreV2 {
         &mut self,
         source: &Path,
         status: Option<CaptureStatus>,
+        transcribe: bool,
         note: impl FnOnce(&AdoptedJournal) -> String,
     ) -> Result<CaptureRecord, StoreV2Error> {
         let id = source
@@ -3826,7 +3863,7 @@ impl StoreV2 {
                 ))
             })?
             .to_string();
-        self.adopt_journal_as(source, id, status, note)
+        self.adopt_journal_as(source, id, status, transcribe, note)
     }
 
     /// [`Self::adopt_journal_with`] under capture id `id`.
@@ -3835,6 +3872,7 @@ impl StoreV2 {
         source: &Path,
         id: String,
         status: Option<CaptureStatus>,
+        transcribe: bool,
         note: impl FnOnce(&AdoptedJournal) -> String,
     ) -> Result<CaptureRecord, StoreV2Error> {
         validate_capture_id(&id)?;
@@ -3901,7 +3939,7 @@ impl StoreV2 {
             extra_json: (!note.is_empty()).then(|| merge_extra_note(None, &note)),
             secure_field: false,
         };
-        self.commit_capture(&record)?;
+        self.commit_capture_superseding(&record, None, transcribe)?;
         Ok(record)
     }
 
@@ -4283,7 +4321,7 @@ impl StoreV2 {
                     continue;
                 }
             };
-            match self.adopt_journal_as(&path, as_id, Some(CaptureStatus::Interrupted), |facts| {
+            match self.adopt_journal_as(&path, as_id, Some(CaptureStatus::Interrupted), false, |facts| {
                 recovered_journal_note(facts)
             }) {
                 Ok(record) => report.recovered.push(RecoveredJournal {
@@ -5171,7 +5209,11 @@ impl FinalizedTake {
             extra_json,
             secure_field: self.meta.secure_field,
         };
-        store.commit_capture_superseding(&record, self.meta.supersedes_journal.as_deref())?;
+        store.commit_capture_superseding(
+            &record,
+            self.meta.supersedes_journal.as_deref(),
+            self.meta.transcribe,
+        )?;
         store.gc_staging()?;
         Ok(CommittedTake { record })
     }
@@ -6434,8 +6476,14 @@ fn lease_alive_from(
 // Tests.
 // ---------------------------------------------------------------------------
 
+mod transcription;
+pub use transcription::TranscriptionClaim;
+
 #[cfg(test)]
 mod at_rest_tests;
+
+#[cfg(test)]
+mod transcription_tests;
 
 #[cfg(test)]
 mod journal_recovery_tests;
