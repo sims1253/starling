@@ -17,6 +17,8 @@ struct Case {
     case_id: String,
     before: String,
     after: String,
+    #[serde(default)]
+    showing_hint: bool,
     raw: String,
     verbatim: bool,
     expected_text: String,
@@ -42,6 +44,7 @@ fn replays_every_pinned_case() {
             &BoundaryContext {
                 before: &case.before,
                 after: &case.after,
+                showing_hint: case.showing_hint,
             },
             &BoundaryOptions {
                 verbatim: case.verbatim,

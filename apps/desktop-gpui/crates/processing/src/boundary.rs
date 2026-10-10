@@ -18,6 +18,10 @@ pub struct BoundaryContext<'a> {
     pub before: &'a str,
     /// Text immediately after the insertion point.
     pub after: &'a str,
+    /// The field shows only its placeholder (Android's
+    /// `isShowingHintText`): `before` and `after` are hint text and the
+    /// field is treated as empty.
+    pub showing_hint: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -57,10 +61,11 @@ const OPENING: [char; 13] = [
     '(', '[', '{', '"', '\'', '“', '‘', '„', '«', '「', '『', '【', '（',
 ];
 
-/// Punctuation that continues a sentence (besides alphanumerics). Sentence
-/// enders are deliberately absent: the case is kept after them.
-const CONTINUING: [char; 14] = [
-    ',', ';', ':', ')', ']', '}', '”', '’', '»', '」', '』', '】', '）', '》',
+/// Punctuation that continues a sentence (besides alphanumerics), incl.
+/// the Arabic comma and semicolon. Sentence enders are deliberately
+/// absent: the case is kept after them.
+const CONTINUING: [char; 16] = [
+    ',', ';', ':', ')', ']', '}', '”', '’', '»', '」', '』', '】', '）', '》', '،', '؛',
 ];
 
 /// Han, kana and CJK punctuation: no space between two of them. Hangul is
@@ -89,8 +94,9 @@ pub fn adjust(raw: &str, ctx: &BoundaryContext<'_>, opts: &BoundaryOptions) -> B
     if opts.verbatim || raw.is_empty() {
         return BoundaryAdjustment { text, changes };
     }
+    let before = if ctx.showing_hint { "" } else { ctx.before };
 
-    if let (Some(last_before), Some(first_raw)) = (ctx.before.chars().last(), raw.chars().next()) {
+    if let (Some(last_before), Some(first_raw)) = (before.chars().last(), raw.chars().next()) {
         if !first_raw.is_whitespace()
             && !last_before.is_whitespace()
             && !OPENING.contains(&last_before)
@@ -101,7 +107,7 @@ pub fn adjust(raw: &str, ctx: &BoundaryContext<'_>, opts: &BoundaryOptions) -> B
         }
     }
 
-    if continues_sentence(ctx.before) && !first_token_is_protected(raw) {
+    if continues_sentence(before) && !first_token_is_protected(raw) {
         // Only the first cased character is considered: if it is already
         // lowercase, later capitals are left alone.
         if let Some((index, ch)) = text.char_indices().find(|&(_, ch)| is_cased(ch)) {
@@ -168,7 +174,10 @@ mod tests {
     fn adjust_after(before: &str, raw: &str) -> BoundaryAdjustment {
         adjust(
             raw,
-            &BoundaryContext { before, after: "" },
+            &BoundaryContext {
+                before,
+                ..BoundaryContext::default()
+            },
             &BoundaryOptions::default(),
         )
     }

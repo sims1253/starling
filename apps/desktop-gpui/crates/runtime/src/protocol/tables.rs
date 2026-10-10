@@ -534,6 +534,7 @@ mod tests {
             Command::DeliveryPrepare {
                 revision_id: "r".into(),
                 target_ref: "t".into(),
+                boundary: crate::protocol::BoundaryPolicy::Adjust,
             },
             Command::DeliveryApply {
                 delivery_id: "d".into(),

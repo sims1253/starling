@@ -23,6 +23,30 @@
   },
   {
     "schema_version": 1,
+    "case_id": "hint-text-field-is-empty",
+    "description": "a field showing only its placeholder is treated as empty: no space, casing kept",
+    "before": "Search notes",
+    "after": "",
+    "showing_hint": true,
+    "raw": "Hello",
+    "verbatim": false,
+    "expected_text": "Hello",
+    "expected_changes": []
+  },
+  {
+    "schema_version": 1,
+    "case_id": "hint-text-field-mid-sentence-hint",
+    "description": "hint text that looks mid-sentence still reads as an empty field",
+    "before": "Type a message,",
+    "after": "",
+    "showing_hint": true,
+    "raw": "Fox jumps",
+    "verbatim": false,
+    "expected_text": "Fox jumps",
+    "expected_changes": []
+  },
+  {
+    "schema_version": 1,
     "case_id": "mid-sentence-lowercase",
     "description": "letter before the cursor: leading space plus lowercase",
     "before": "The quick brown",
@@ -254,6 +278,20 @@
     "expected_text": " this",
     "expected_changes": [
       { "kind": "leading_space", "detail": "previous character 'e' is not whitespace or an opening bracket/quote" }
+    ]
+  },
+  {
+    "schema_version": 1,
+    "case_id": "before-existing-period-raw-keeps-its-end",
+    "description": "a period after the cursor: the dictated text's own period stays (no trailing change)",
+    "before": "Hello",
+    "after": ".",
+    "raw": "World.",
+    "verbatim": false,
+    "expected_text": " world.",
+    "expected_changes": [
+      { "kind": "leading_space", "detail": "previous character 'o' is not whitespace or an opening bracket/quote" },
+      { "kind": "first_letter_case", "detail": "previous non-whitespace 'o' continues the sentence" }
     ]
   },
   {
@@ -514,6 +552,72 @@
     "expected_text": " مرحبا بالعالم",
     "expected_changes": [
       { "kind": "leading_space", "detail": "previous character 't' is not whitespace or an opening bracket/quote" }
+    ]
+  },
+  {
+    "schema_version": 1,
+    "case_id": "rtl-hebrew-after-hebrew",
+    "description": "Hebrew after Hebrew: logical-order space, no case in the script",
+    "before": "שלום",
+    "after": "",
+    "raw": "עולם",
+    "verbatim": false,
+    "expected_text": " עולם",
+    "expected_changes": [
+      { "kind": "leading_space", "detail": "previous character 'ם' is not whitespace or an opening bracket/quote" }
+    ]
+  },
+  {
+    "schema_version": 1,
+    "case_id": "rtl-arabic-question-mark-ends-sentence",
+    "description": "the Arabic question mark ends a sentence: Latin text after it keeps its capital",
+    "before": "كيف حالك؟",
+    "after": "",
+    "raw": "Next step",
+    "verbatim": false,
+    "expected_text": " Next step",
+    "expected_changes": [
+      { "kind": "leading_space", "detail": "previous character '؟' is not whitespace or an opening bracket/quote" }
+    ]
+  },
+  {
+    "schema_version": 1,
+    "case_id": "rtl-arabic-comma-continues",
+    "description": "the Arabic comma continues the sentence like ','",
+    "before": "مرحبا،",
+    "after": "",
+    "raw": "World",
+    "verbatim": false,
+    "expected_text": " world",
+    "expected_changes": [
+      { "kind": "leading_space", "detail": "previous character '،' is not whitespace or an opening bracket/quote" },
+      { "kind": "first_letter_case", "detail": "previous non-whitespace '،' continues the sentence" }
+    ]
+  },
+  {
+    "schema_version": 1,
+    "case_id": "devanagari-no-case",
+    "description": "Devanagari has no case and separates words with spaces",
+    "before": "नमस्ते",
+    "after": "",
+    "raw": "दुनिया",
+    "verbatim": false,
+    "expected_text": " दुनिया",
+    "expected_changes": [
+      { "kind": "leading_space", "detail": "previous character 'े' is not whitespace or an opening bracket/quote" }
+    ]
+  },
+  {
+    "schema_version": 1,
+    "case_id": "devanagari-danda-ends-sentence",
+    "description": "the danda ends a sentence: the next capital is kept",
+    "before": "ठीक है।",
+    "after": "",
+    "raw": "Next",
+    "verbatim": false,
+    "expected_text": " Next",
+    "expected_changes": [
+      { "kind": "leading_space", "detail": "previous character '।' is not whitespace or an opening bracket/quote" }
     ]
   },
   {

@@ -332,6 +332,22 @@ pub struct Revision {
     pub provenance: String,
 }
 
+/// `delivery.prepare.boundary` (#341): whether delivery may apply the
+/// insertion-boundary rules. Absent on the wire means [`Adjust`].
+///
+/// [`Adjust`]: BoundaryPolicy::Adjust
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BoundaryPolicy {
+    /// Apply the rules where the target reports surrounding text.
+    #[default]
+    Adjust,
+    /// The user's explicit bypass: deliver the revision's text unchanged.
+    Raw,
+    /// The take's mode is verbatim: every rule is off.
+    Verbatim,
+}
+
 /// `jobs.rejected.reason` — the one enumerated rejection vocabulary in v1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -429,10 +445,11 @@ pub enum Command {
     DocsAppendTurn { doc_id: String, take_ref: String },
     /// `docs.get{docId, page}` — served via snapshot, no v1 event.
     DocsGet { doc_id: String, page: u32 },
-    /// `delivery.prepare{revisionId, targetRef}`.
+    /// `delivery.prepare{revisionId, targetRef, boundary?}`.
     DeliveryPrepare {
         revision_id: String,
         target_ref: String,
+        boundary: BoundaryPolicy,
     },
     /// `delivery.apply{deliveryId}` — user-initiated only.
     DeliveryApply { delivery_id: String },
@@ -541,6 +558,8 @@ struct DeliveryPrepareP {
     revision_id: String,
     #[serde(rename = "targetRef")]
     target_ref: String,
+    #[serde(default)]
+    boundary: BoundaryPolicy,
 }
 
 #[derive(Deserialize)]
@@ -639,7 +658,18 @@ impl Command {
             Command::DeliveryPrepare {
                 revision_id,
                 target_ref,
-            } => json!({ "revisionId": revision_id, "targetRef": target_ref }),
+                boundary,
+            } => match boundary {
+                // The default stays off the wire (absent means adjust).
+                BoundaryPolicy::Adjust => {
+                    json!({ "revisionId": revision_id, "targetRef": target_ref })
+                }
+                _ => json!({
+                    "revisionId": revision_id,
+                    "targetRef": target_ref,
+                    "boundary": boundary,
+                }),
+            },
             Command::DeliveryApply { delivery_id } => json!({ "deliveryId": delivery_id }),
             Command::DeliveryCancel { delivery_id } => match delivery_id {
                 Some(id) => json!({ "deliveryId": id }),
@@ -727,6 +757,7 @@ impl Command {
                 Ok(Command::DeliveryPrepare {
                     revision_id: parsed.revision_id,
                     target_ref: parsed.target_ref,
+                    boundary: parsed.boundary,
                 })
             }
             "delivery.apply" => Ok(Command::DeliveryApply {
@@ -1178,6 +1209,34 @@ mod tests {
         assert_eq!(parsed, command);
         assert_eq!(parsed.type_name(), "docs.updateHead");
         assert_eq!(parsed.machine(), "docs");
+    }
+
+    #[test]
+    fn delivery_prepare_boundary_defaults_to_adjust_and_round_trips() {
+        let bare = serde_json::json!({ "revisionId": "rev-1", "targetRef": "t" });
+        let parsed = Command::from_parts("delivery.prepare", &bare).expect("bare prepare");
+        assert_eq!(
+            parsed,
+            Command::DeliveryPrepare {
+                revision_id: "rev-1".into(),
+                target_ref: "t".into(),
+                boundary: BoundaryPolicy::Adjust,
+            }
+        );
+        // The default stays off the wire, so v1 fixtures round-trip as is.
+        assert_eq!(parsed.payload_value(), bare);
+        for (policy, wire) in [(BoundaryPolicy::Raw, "raw"), (BoundaryPolicy::Verbatim, "verbatim")] {
+            let command = Command::DeliveryPrepare {
+                revision_id: "rev-1".into(),
+                target_ref: "t".into(),
+                boundary: policy,
+            };
+            let payload = command.payload_value();
+            assert_eq!(payload["boundary"], wire);
+            assert_eq!(Command::from_parts("delivery.prepare", &payload), Ok(command));
+        }
+        let unknown = serde_json::json!({ "revisionId": "r", "targetRef": "t", "boundary": "off" });
+        assert!(Command::from_parts("delivery.prepare", &unknown).is_err());
     }
 
     #[test]

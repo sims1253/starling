@@ -157,8 +157,11 @@ defines no v1 event (served via snapshot/correlation response).
 `Prepared → Revalidating → SubmittedUnconfirmed → Confirmed | Failed{reason}
 | Conflict{targetChanged} | Cancelled`, plus the pre-delivery `Idle`.
 
-`delivery.prepare{revisionId, targetRef}` resolves via
-`delivery.prepared{deliveryId, compareToken}`; `delivery.apply{deliveryId}`
+`delivery.prepare{revisionId, targetRef, boundary?}` resolves via
+`delivery.prepared{deliveryId, compareToken}`. `boundary` (`adjust` when
+absent, `raw`, `verbatim`) says whether the insertion-boundary rules
+(`../insertion-boundary/`) may adjust the text; `raw` is the explicit bypass
+and `verbatim` a verbatim mode's flag. `delivery.apply{deliveryId}`
 revalidates target identity/range/version immediately before apply
 (`Prepared → Revalidating`), then `delivery.submittedUnconfirmed`, then
 `delivery.confirmed{evidenceLevel}` — synthetic key acceptance is not proof

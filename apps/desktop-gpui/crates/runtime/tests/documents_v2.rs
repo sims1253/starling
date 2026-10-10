@@ -13,7 +13,7 @@ use starling_runtime::bus::EventSub;
 use starling_runtime::channel::RecvError;
 use starling_runtime::machine::docs::V2DocumentStore;
 use starling_runtime::machine::Receipt;
-use starling_runtime::protocol::{Command, Event, Revision};
+use starling_runtime::protocol::{BoundaryPolicy, Command, Event, Revision};
 use starling_runtime::{Runtime, RuntimeConfig};
 
 fn revision(rev_id: &str, base: u64, text: &str) -> Revision {
@@ -286,6 +286,7 @@ fn delivery_prepares_a_revision_committed_before_the_restart() {
             Command::DeliveryPrepare {
                 revision_id: "rev-durable".into(),
                 target_ref: "some-editor-target".into(),
+                boundary: BoundaryPolicy::Adjust,
             },
         )
         .expect("prepare resolves the durable revision");

@@ -25,7 +25,7 @@ use starling_runtime::machine::context::ContextProvider;
 use starling_runtime::machine::delivery::{
     DeliveryAdapter, InsertEvidence, InsertionFailure, Revalidation,
 };
-use starling_runtime::protocol::{Command, Revision, Span, TargetSnapshotData};
+use starling_runtime::protocol::{BoundaryPolicy, Command, Revision, Span, TargetSnapshotData};
 use starling_runtime::provider::FakeProvider;
 use starling_runtime::testing::FakeCaptureSource;
 use starling_runtime_host::client::{ClientError, EventWire, HostClient};
@@ -266,6 +266,7 @@ fn prepare(client: &HostClient, revision_id: &str, target: &Path) -> (String, St
             Command::DeliveryPrepare {
                 revision_id: revision_id.to_string(),
                 target_ref: target.display().to_string(),
+                boundary: BoundaryPolicy::Adjust,
             },
         )
         .expect("prepare accepted");
@@ -488,6 +489,7 @@ fn prepare_alone_never_inserts_and_unknown_revisions_are_refused() {
         Command::DeliveryPrepare {
             revision_id: "rev-never-committed".into(),
             target_ref: target.display().to_string(),
+            boundary: BoundaryPolicy::Adjust,
         },
     ) {
         Err(ClientError::Rejected(

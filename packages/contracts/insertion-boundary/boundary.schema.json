@@ -21,6 +21,7 @@
     "description": { "type": "string", "minLength": 1 },
     "before": { "type": "string" },
     "after": { "type": "string" },
+    "showing_hint": { "type": "boolean" },
     "raw": { "type": "string" },
     "verbatim": { "type": "boolean" },
     "expected_text": { "type": "string" },

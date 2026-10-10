@@ -295,6 +295,7 @@ mod tests {
                 Command::DeliveryPrepare {
                     revision_id: "rev-1".into(),
                     target_ref: target.target_ref.clone(),
+                    boundary: Default::default(),
                 },
             )
             .unwrap();

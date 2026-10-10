@@ -808,6 +808,14 @@
           },
           "targetRef": {
             "$ref": "#/$defs/safeToken"
+          },
+          "boundary": {
+            "description": "Insertion-boundary rules (#341): adjust (default when absent) applies them where the target reports surrounding text; raw is the explicit bypass that delivers the revision unchanged; verbatim is a verbatim mode's flag and disables every rule.",
+            "enum": [
+              "adjust",
+              "raw",
+              "verbatim"
+            ]
           }
         },
         "required": [

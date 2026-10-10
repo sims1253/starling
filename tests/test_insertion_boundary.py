@@ -37,7 +37,9 @@ def test_case(doc: dict) -> None:
         errors += [f"jsonschema: {e.message}" for e in validator.iter_errors(doc)]
     assert not errors, errors
 
-    text, changes = oracle.adjust(doc["before"], doc["raw"], doc["verbatim"])
+    text, changes = oracle.adjust(
+        doc["before"], doc["raw"], doc["verbatim"], doc.get("showing_hint", False)
+    )
     assert text == doc["expected_text"]
     assert changes == [change["kind"] for change in doc["expected_changes"]]
 
