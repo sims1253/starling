@@ -172,10 +172,11 @@ object InsertionBoundary {
 
     /**
      * Unicode White_Space. `Character.isWhitespace` leaves out the no-break
-     * spaces (which `isSpaceChar` has) and NEL.
+     * spaces (which `isSpaceChar` has) and NEL, and counts the information
+     * separators U+001C–U+001F, which are control characters.
      */
     private fun isWhitespace(cp: Int): Boolean =
-        Character.isWhitespace(cp) || Character.isSpaceChar(cp) || cp == 0x85
+        (Character.isWhitespace(cp) && cp !in 0x1C..0x1F) || Character.isSpaceChar(cp) || cp == 0x85
 
     /** Alphabetic or Numeric, like Rust's `char::is_alphanumeric`. */
     private fun isAlphanumeric(cp: Int): Boolean = Character.isAlphabetic(cp) || when (Character.getType(cp)) {

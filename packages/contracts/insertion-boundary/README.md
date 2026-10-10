@@ -27,6 +27,11 @@ A fixture change's `detail` is an explanation for readers, not compared.
 
 ## Rules
 
+"Whitespace" below is Unicode `White_Space` (Rust's `char::is_whitespace`):
+the no-break spaces and NEL are whitespace; the information separators
+U+001C–U+001F, which Python's `str.isspace` and Java's
+`Character.isWhitespace` also count, are not.
+
 1. **Verbatim.** `verbatim: true` → no changes at all.
 2. **Hint text.** `showing_hint: true` means the field shows only its
    placeholder (Android's `isShowingHintText`): `before` and `after` are
@@ -109,8 +114,9 @@ sent to any processing provider.
 
 ## Delivery (Android keyboard)
 
-- The keyboard (`ui/BoundaryDelivery.kt`) reads `getTextBeforeCursor` and
-  `getTextAfterCursor` right before its single `commitText`; password
+- The keyboard (`ui/BoundaryDelivery.kt`) reads `getTextBeforeCursor` right
+  before its single `commitText` and passes `after` as `""`: no v1 rule
+  reads it, so the text after the cursor is never requested. Password
   variations and `IME_FLAG_NO_PERSONALIZED_LEARNING` fields are never read,
   and verbatim modes skip the read. `showing_hint` is never set there: an
   `InputConnection` reports the editor's content, never its placeholder,
@@ -119,7 +125,8 @@ sent to any processing provider.
   starts; the final re-reads, with the take's own composing text cut from
   the text before the cursor. When the cursor has left that region (the
   editor's `onUpdateSelection` candidates span, or the suffix no longer
-  matching), the boundary is unknown and the text goes in unchanged.
+  matching), the boundary is unknown and the text goes in unchanged; the
+  status tells this apart from a field that did not report its text.
 - An adjusted delivery is stored on the recording as a derived revision
   (`provenance: "insertion-boundary"`, the rule kinds, the text it was
   derived from); the transcript and its revisions are not edited.

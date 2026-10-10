@@ -47,6 +47,35 @@ NO_SPACE_SCRIPTS = (
 )
 
 
+# "Whitespace" is Unicode White_Space (Rust's `char::is_whitespace`).
+# `str.isspace` also counts the information separators U+001C-U+001F,
+# which are control characters, not white space.
+_INFORMATION_SEPARATORS = set("\x1c\x1d\x1e\x1f")
+
+
+def _is_space(ch: str) -> bool:
+    return ch.isspace() and ch not in _INFORMATION_SEPARATORS
+
+
+def _rstrip(text: str) -> str:
+    end = len(text)
+    while end and _is_space(text[end - 1]):
+        end -= 1
+    return text[:end]
+
+
+def _first_token(raw: str) -> str | None:
+    start = 0
+    while start < len(raw) and _is_space(raw[start]):
+        start += 1
+    if start == len(raw):
+        return None
+    end = start
+    while end < len(raw) and not _is_space(raw[end]):
+        end += 1
+    return raw[start:end]
+
+
 def _no_space_boundary(ch: str) -> bool:
     return any(low <= ch <= high for low, high in NO_SPACE_SCRIPTS)
 
@@ -56,7 +85,7 @@ def _is_cased(ch: str) -> bool:
 
 
 def _continues_sentence(before: str) -> bool:
-    trimmed = before.rstrip()
+    trimmed = _rstrip(before)
     if not trimmed:
         return False
     trailing = before[len(trimmed) :]
@@ -65,10 +94,9 @@ def _continues_sentence(before: str) -> bool:
 
 
 def _protected_token(raw: str) -> bool:
-    parts = raw.split()
-    if not parts:
+    token = _first_token(raw)
+    if token is None:
         return False
-    token = parts[0]
     if any(c in token for c in "_/\\@#") or token.startswith("www."):
         return True
     if token[0] == "I" and not token[1:2].isalnum():
@@ -93,8 +121,8 @@ def adjust(
 
     if (
         before
-        and not raw[0].isspace()
-        and not before[-1].isspace()
+        and not _is_space(raw[0])
+        and not _is_space(before[-1])
         and before[-1] not in OPENING
         and not (_no_space_boundary(before[-1]) and _no_space_boundary(raw[0]))
     ):
