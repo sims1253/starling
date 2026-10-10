@@ -454,6 +454,16 @@ impl Inserter {
         }
     }
 
+    /// The text around the insertion point of `field`, the field located
+    /// at `target`'s capture, through the field reader only: never what
+    /// is focused now unless it is that field. Blocking.
+    pub fn read_field(&self, target: &TargetSnapshot, field: &FieldAnchor) -> Surrounding {
+        match &self.fields {
+            Some(fields) => fields.read(target, field),
+            None => Surrounding::Unsupported,
+        }
+    }
+
     /// Capture through the first available backend. When none is
     /// available, the first backend's reason is returned.
     pub fn capture(&self) -> Result<TargetSnapshot, InsertError> {

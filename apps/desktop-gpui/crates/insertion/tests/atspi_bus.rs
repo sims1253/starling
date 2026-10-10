@@ -159,6 +159,9 @@ struct Text {
     caret: Arc<Mutex<i32>>,
     selection: Arc<Mutex<Option<(i32, i32)>>>,
     text_calls: Arc<AtomicUsize>,
+    /// Where the caret moves while the next `GetText` is answered (the
+    /// user typing on).
+    caret_moves: Arc<Mutex<Option<i32>>>,
 }
 
 #[zbus::interface(name = "org.a11y.atspi.Text")]
@@ -178,6 +181,9 @@ impl Text {
 
     fn get_text(&self, start: i32, end: i32) -> String {
         self.text_calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(caret) = self.caret_moves.lock().unwrap().take() {
+            *self.caret.lock().unwrap() = caret;
+        }
         let content = self.content.lock().unwrap();
         let end = if end < 0 { i32::MAX } else { end };
         content
@@ -196,6 +202,7 @@ struct Field {
     caret: Arc<Mutex<i32>>,
     selection: Arc<Mutex<Option<(i32, i32)>>>,
     text_calls: Arc<AtomicUsize>,
+    caret_moves: Arc<Mutex<Option<i32>>>,
 }
 
 impl Field {
@@ -249,6 +256,7 @@ fn app(bus: &PrivateBus, roles: &[u32], collection: bool) -> App {
             caret: Arc::new(Mutex::new(0)),
             selection: Arc::new(Mutex::new(None)),
             text_calls: Arc::new(AtomicUsize::new(0)),
+            caret_moves: Arc::default(),
         };
         server
             .at(
@@ -268,6 +276,7 @@ fn app(bus: &PrivateBus, roles: &[u32], collection: bool) -> App {
                     caret: field.caret.clone(),
                     selection: field.selection.clone(),
                     text_calls: field.text_calls.clone(),
+                    caret_moves: field.caret_moves.clone(),
                 },
             )
             .unwrap();
@@ -411,6 +420,22 @@ fn reads_up_to_128_characters_before_the_caret_of_the_located_field() {
     assert_eq!(read.before.chars().count(), 128);
     assert!(read.before.ends_with("äEnde"));
     assert_eq!(read.after, "", "the text after the caret is never read");
+}
+
+#[test]
+fn a_caret_that_moves_during_the_read_reads_nothing() {
+    let bus = private_bus!();
+    let gtk3 = app(&bus, &[ROLE_ENTRY], true);
+    let _registry = registry(&bus, &[&gtk3]);
+    let reader = reader(&bus);
+    let here = target(Some(std::process::id()));
+    let field = reader.locate(&here).expect("the focused field");
+
+    gtk3.fields[0].set_text("Meet me at noon", 15);
+    *gtk3.fields[0].caret_moves.lock().unwrap() = Some(7);
+    assert_eq!(reader.read(&here, &field), Surrounding::Unsupported);
+    // Read again, the caret holding still.
+    assert_eq!(reader.read(&here, &field), before("Meet me"));
 }
 
 #[test]

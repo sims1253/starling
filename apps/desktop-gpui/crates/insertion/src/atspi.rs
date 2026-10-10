@@ -158,7 +158,9 @@ impl AtspiReader {
     }
 
     /// Runs `body` on the connection; a failure drops it, so the next
-    /// call reconnects (the bus or the registry may have restarted).
+    /// call reconnects (the bus or the registry may have restarted). An
+    /// error an application answered with says nothing about the bus,
+    /// and keeps it.
     fn with_bus<T>(&self, body: impl FnOnce(&Bus<'_>) -> zbus::Result<T>) -> Option<T> {
         let connection = {
             let mut slot = self
@@ -178,6 +180,10 @@ impl AtspiReader {
         };
         match body(&Bus(&connection)) {
             Ok(value) => Some(value),
+            Err(error @ zbus::Error::MethodError(..)) => {
+                log::debug!("AT-SPI call failed: {error}");
+                None
+            }
             Err(error) => {
                 log::debug!("AT-SPI call failed: {error}");
                 *self
@@ -260,6 +266,12 @@ impl AtspiReader {
         }
         let start = insertion.saturating_sub(BEFORE_CHARS as i32).max(0);
         let before: String = bus.call(name, path, TEXT, "GetText", &(start, insertion))?;
+        // The calls are separate: a caret that moved, or focus that left,
+        // meanwhile makes the text stale.
+        let caret_after: i32 = bus.property(name, path, TEXT, "CaretOffset")?;
+        if caret_after != caret || !bus.states(name, path)?.has(STATE_FOCUSED) {
+            return Ok(Surrounding::Unsupported);
+        }
         Ok(Surrounding::Text(SurroundingText {
             before: last_chars(&before, BEFORE_CHARS).to_string(),
             after: String::new(),

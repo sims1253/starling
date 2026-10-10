@@ -57,6 +57,13 @@ pub struct BoundaryRevision {
 /// The provenance of a [`BoundaryRevision`]'s row.
 const BOUNDARY_PROVENANCE: &str = "insertion-boundary";
 
+/// Whether `row` is a boundary adjustment: a derived revision the
+/// boundary rules stored, not one another feature derived.
+fn is_boundary_row(row: &RevisionRow) -> bool {
+    row.disposition.as_deref() == Some("derived")
+        && row.provenance.as_deref() == Some(BOUNDARY_PROVENANCE)
+}
+
 /// A boundary row's `sources_json`; `derivedFrom` is the key the
 /// runtime's document store reads a derived revision's source from.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -230,7 +237,7 @@ impl ProcessingDoc {
         let boundary = document
             .revisions
             .iter()
-            .filter(|row| row.disposition.as_deref() == Some("derived"))
+            .filter(|row| is_boundary_row(row))
             .filter_map(|row| {
                 let sources: BoundarySources =
                     serde_json::from_str(row.sources_json.as_deref()?).ok()?;
@@ -553,7 +560,7 @@ impl Facade {
         let count = document
             .revisions
             .iter()
-            .filter(|row| row.disposition.as_deref() == Some("derived"))
+            .filter(|row| is_boundary_row(row))
             .count();
         // The latest committed head holding exactly the delivered text.
         let derived_from = (1..=document.head_revision)
@@ -569,12 +576,18 @@ impl Facade {
             rev_id: format!("{id}#b{}", count + 1),
             doc_id: id.to_string(),
             base_revision: Some(document.head_revision),
-            sources_json: serde_json::to_string(&BoundarySources {
-                derived_from,
-                source_text: source_text.to_string(),
-                changes: changes.to_vec(),
-            })
-            .ok(),
+            // The only record of the source and the rules: never stored
+            // without it.
+            sources_json: Some(
+                serde_json::to_string(&BoundarySources {
+                    derived_from,
+                    source_text: source_text.to_string(),
+                    changes: changes.to_vec(),
+                })
+                .map_err(|error| {
+                    storage::StorageError::Invalid(format!("boundary sources: {error}"))
+                })?,
+            ),
             text: text.to_string(),
             status: "derived".to_string(),
             provenance: Some(BOUNDARY_PROVENANCE.to_string()),
@@ -1612,6 +1625,51 @@ mod tests {
             store.record_boundary_revision(&id, "Fox jumps", " fox jumps", &changes),
             Err(storage::StorageError::NotFound(_))
         ));
+    }
+
+    /// Only rows the boundary rules stored read as boundary adjustments,
+    /// and only they are counted for the next one's id.
+    #[test]
+    fn a_derived_revision_of_another_feature_is_no_boundary_adjustment() {
+        let store = v2_store("boundary-provenance");
+        let id = transcribed(&store, "Fox jumps");
+        let changes = vec!["leading_space".to_string()];
+        store
+            .record_boundary_revision(&id, "Fox jumps", " Fox jumps", &changes)
+            .expect("record");
+        let foreign = RevisionRow {
+            rev_id: format!("{id}#x1"),
+            doc_id: id.clone(),
+            base_revision: Some(1),
+            sources_json: Some(
+                serde_json::json!({"derivedFrom": null, "sourceText": "Fox jumps", "changes": []})
+                    .to_string(),
+            ),
+            text: "elsewhere".to_string(),
+            status: "derived".to_string(),
+            provenance: Some("another-feature".to_string()),
+            disposition: Some("derived".to_string()),
+        };
+        lock_v2(&store.0)
+            .store_document_revision(&foreign)
+            .expect("foreign row");
+        store
+            .record_boundary_revision(&id, "Fox jumps", " fox jumps", &changes)
+            .expect("record");
+
+        let doc = store.processing_doc(&id).expect("load").expect("doc");
+        let typed: Vec<&str> = doc.boundary.iter().map(|row| row.text.as_str()).collect();
+        assert_eq!(typed, [" Fox jumps", " fox jumps"]);
+        let ids: Vec<String> = lock_v2(&store.0)
+            .get_document(&id)
+            .expect("document")
+            .expect("document")
+            .revisions
+            .into_iter()
+            .map(|row| row.rev_id)
+            .filter(|rev_id| rev_id.contains("#b"))
+            .collect();
+        assert_eq!(ids, [format!("{id}#b1"), format!("{id}#b2")]);
     }
 
     /// Recording a boundary adjustment never starts a document over: a
