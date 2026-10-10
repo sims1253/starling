@@ -315,7 +315,8 @@ take's first audio; audio positions are seconds into the take.
   counted there. The client's own stop-to-final time includes that wait.
 - Final: the same fields, plus `by_kind` totals for `window` (full windows
   while recording), `preview` (live tail), `flush_window` and `flush_tail`
-  (work after commit). It also has `stop`, `calls` and `calls_dropped`.
+  (work after commit) and `redecode` (a committed window or flush tail
+  decoded again from an earlier start; see "Stitching" below). It also has `stop`, `calls` and `calls_dropped`.
   `stop` covers the commit's own work. `path` is `tail` (the engine
   transcribed only the unfinalized remainder), `reused` (the exact
   tail result answered it) or `committed` (nothing was left, including
@@ -332,7 +333,10 @@ take's first audio; audio positions are seconds into the take.
 at microphone pace and to report latency, work and stop-time metrics.
 
 **Buffer cap** (`--max-stream-seconds`, default 60 s): a binary frame that
-would push the session's live audio buffer past the cap is refused. The
+would push the session's live audio buffer past the cap is refused. The cap
+counts the audio past the committed boundary. The session also keeps up to
+0.75 x the overlap before that boundary (2.25 s by default) for re-decodes;
+that audio is not counted, so memory is bounded by the cap plus it. The
 server emits one error frame:
 
 ```json
@@ -408,9 +412,56 @@ cpp/serve/
 
 The C++ and Python streaming sessions use fixed overlapping windows, including
 during busy retries. Successful windows advance the committed boundary;
-incomplete commits preserve the remaining audio for a later retry. Transcript
-stitching uses matching words rather than timestamps, so disagreements between
-neighboring windows can still omit or duplicate words.
+incomplete commits preserve the remaining audio for a later retry.
+
+**Stitching** (issue #357; the two servers share the code paths and a parity
+fixture, `tests/fixtures/stream_stitch_cases.txt`):
+
+- Neighboring windows are joined by aligning a suffix of the committed words
+  with a prefix of the new window's words (match +2, mismatch and gap -1).
+  Committed words between the aligned run and the end cost a gap, so a common
+  phrase away from the boundary cannot win and drop the words between. The
+  cut is the middle matched word. With no alignment scoring 3 or more (a
+  pause in the overlap, or a window that dropped those words) the texts are
+  concatenated. Repeated text ("one two three one two three ...") aligns
+  equally well at every multiple of its period; an alignment over committed
+  words that repeat is shortened by whole periods to the number of words the
+  shared audio should hold (each window's share of its voiced audio in the
+  overlap). Not covered: in a re-decoded window, the shared audio (the
+  overlap plus the shift) can hold more words than the 24 committed words
+  searched: above about 5.3 words/s for the 1.5 s shift, 6.4 for 0.75 s and
+  4.6 for 2.25 s (default 3 s overlap). Ordinary text still aligns, but
+  exactly periodic text can then repeat up to the words outside the search.
+  Searching more committed words would delay `stable_words` for every take,
+  and words alone cannot tell a shared repetition from a newly spoken one.
+  The engine exposes no
+  word timestamps, so the alignment works on words only; it is the same for
+  every model.
+- Parakeet sometimes stops emitting partway through a window, or returns
+  nothing for a window full of speech, while the same audio decodes fine one
+  second later. A committed window or flush tail is therefore checked against
+  its audio. It is implausible when it has fewer than 1.25 words per voiced
+  second (or fewer than 0.6 x the take's median over its last 16 windows)
+  over at least 2 s of voiced audio, or more words than 7 per second plus 4
+  (a decoding loop). An implausible window is decoded again from 0.5, 0.25
+  and 0.75 x the overlap earlier (a full window moves back whole, or ends
+  earlier at the take's start; the flush tail grows backwards up to one
+  window) until a result is plausible. A plausible candidate replaces an
+  implausible result; between two sparse results the candidate must be
+  1.25 x denser, and a sparse one replaces a loop. The next window then starts
+  one overlap before the end of the audio the kept text came from. If a
+  re-decode finds the engine busy before a plausible result is in hand, the
+  window stays pending, like a busy window, instead of committing text known
+  to be wrong. "Voiced" is 20 ms frames 15 dB
+  above the span's quiet floor and above -60 dBFS.
+- Text over the word bound has its longest back-to-back repeated phrase cut
+  to two copies, one run at a time, only until it fits, and is cut at the
+  bound if it still does not. A committed window whose every re-decode loops
+  gets this; text within the bound is not touched, so real repeated speech
+  survives in the final. Previews (never re-decoded, replaced by the next one)
+  get it too, and additionally have any phrase repeated back to back more
+  than three times (8 words or more) cut to two copies, so a decoding loop
+  never reaches the client.
 With opt-in Granite chunk fairness, a blocking queue timeout ends the current
 take with `request timed out`; it is not retried as `server busy`. Reset the
 stream before sending more audio.

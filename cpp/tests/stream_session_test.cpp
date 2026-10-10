@@ -14,6 +14,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <mutex>
+#include <random>
 #include <thread>
 #include <cstdio>
 #include <cmath>
@@ -92,13 +93,14 @@ static void test_stitch_no_match() {
 }
 
 static void test_stitch_punctuation() {
-    // Punctuation should be stripped for matching (min_match=2 needs 2+ words).
+    // Punctuation is stripped for matching: "the world." and "the world,"
+    // align, and the cut is the middle (lower) matched word, so the overlap
+    // after it comes from the new window (issue #357).
     auto r = stitch_words({"hello", "the", "world."}, {"the", "world,", "foo"});
-    // "the world." and "the world," normalize to "the world" → dedup (size=2 >= min_match).
-    CHECK(r.size() == 4);  // ["hello", "the", "world.", "foo"]
+    CHECK(r.size() == 4);  // ["hello", "the", "world,", "foo"]
     CHECK(r[0] == "hello");
     CHECK(r[1] == "the");
-    CHECK(r[2] == "world.");
+    CHECK(r[2] == "world,");
     CHECK(r[3] == "foo");
 }
 
@@ -278,46 +280,209 @@ static void test_chunk_streamer_unicode_boundary() {
 // The stable prefix is a promise to streaming clients (#297): the first
 // stable_words() words of every later partial and of the final never change.
 static void test_chunk_streamer_stable_prefix_never_changes() {
-    // chunk 1 s, overlap 0.25 s: max_overlap_words = 8.
-    ChunkStreamer cs(16000, 1.0, 0.25, 0.5, 0.0);
-    int call = 0;
-    // Window 1 commits twelve words (a0..a3 frozen). Window 2 re-hears the
-    // two words right after the frozen prefix and little else, so the
-    // stitch keeps only up to them and the text shrinks to seven words.
-    // Window 3 then aligns on "a1 a2": a plain stitch over the last eight
-    // words would keep a0..a2 and drop the frozen "a3".
-    TranscribeFn tx = [&](const float*, int64_t) -> std::optional<std::string> {
-        ++call;
-        switch (call) {
-            case 1: return std::string("a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11");
-            case 2: return std::string("a4 a5 b0");
-            case 3: return std::string("a1 a2 c0 c1");
-            default: return std::string("d0 d1 d2 d3 d4 d5 d6 d7 d8 d9");
+    // Randomized: windows drawn from a three-word vocabulary make the
+    // overlap alignment match, shrink and cut at every possible place;
+    // whatever it does, the promised prefix must survive every later
+    // partial and the final.
+    std::mt19937 rng(357);
+    for (int take = 0; take < 200; ++take) {
+        // chunk 1 s, overlap 0.25 s: max_overlap_words = 8.
+        ChunkStreamer cs(16000, 1.0, 0.25, 0.5, 0.0);
+        TranscribeFn tx = [&](const float*, int64_t) -> std::optional<std::string> {
+            const int n = static_cast<int>(rng() % 10);
+            std::string text;
+            for (int i = 0; i < n; ++i) text += "w" + std::to_string(rng() % 3) + " ";
+            return text;
+        };
+        std::vector<std::string> prefix;
+        int64_t stable = 0;
+        auto check = [&](const std::optional<std::string>& text) {
+            CHECK(cs.stable_words() >= stable);
+            if (!text) return;
+            auto words = split_words(*text);
+            CHECK(static_cast<int64_t>(words.size()) >= cs.stable_words());
+            for (size_t i = 0; i < prefix.size() && i < words.size(); ++i)
+                CHECK(words[i] == prefix[i]);
+            stable = cs.stable_words();
+            prefix.assign(words.begin(), words.begin() + stable);
+        };
+        std::vector<float> samples;
+        for (int step = 1; step <= 8; ++step) {
+            samples.resize(static_cast<size_t>(12000 * step + 4000), 0.0f);
+            check(cs.step(samples, static_cast<double>(step), tx));
         }
-    };
-    std::vector<std::string> prefix;
-    int64_t stable = 0;
-    std::vector<float> samples;
-    auto check = [&](const std::optional<std::string>& text) {
-        CHECK(cs.stable_words() >= stable);
-        if (!text) return;
-        auto words = split_words(*text);
-        CHECK(static_cast<int64_t>(words.size()) >= cs.stable_words());
-        for (size_t i = 0; i < prefix.size() && i < words.size(); ++i) {
-            CHECK(words[i] == prefix[i]);
-        }
-        stable = cs.stable_words();
-        prefix.assign(words.begin(), words.begin() + stable);
-    };
-    for (int step = 1; step <= 5; ++step) {
-        samples.resize(static_cast<size_t>(12000 * step + 4000), 0.0f);
-        check(cs.step(samples, static_cast<double>(step), tx));
+        check(cs.flush(samples, tx));
+        cs.reset();
+        CHECK(cs.stable_words() == 0);
     }
-    check(cs.flush(samples, tx));
-    CHECK(stable >= 4);
-    CHECK(prefix.size() >= 4 && prefix[3] == "a3");
-    cs.reset();
-    CHECK(cs.stable_words() == 0);
+}
+
+// ---- stitch parity fixture (issue #357) ------------------------------------
+// tests/fixtures/stream_stitch_cases.txt is replayed here and by
+// tests/test_stream_chunk.py; the native stitcher, loop suppression and
+// re-decode must give every expected line the Python port gives.
+namespace {
+struct FixtureCase {
+    std::string op, name;
+    std::vector<std::string> args;
+    std::vector<std::string> committed, fresh, expect, calls;
+    std::vector<double> audio;
+    struct Tx { std::string kind, start, length, text; };
+    std::vector<Tx> tx;
+};
+
+std::vector<FixtureCase> load_fixture_cases() {
+    std::vector<FixtureCase> cases;
+    const std::string path =
+        std::string(STARLING_REPO_ROOT) + "/tests/fixtures/stream_stitch_cases.txt";
+    FILE* f = std::fopen(path.c_str(), "rb");
+    CHECK(f != nullptr);
+    if (!f) return cases;
+    std::string text;
+    char buf[4096];
+    for (size_t n; (n = std::fread(buf, 1, sizeof buf, f)) > 0;) text.append(buf, n);
+    std::fclose(f);
+    size_t pos = 0;
+    while (pos < text.size()) {
+        size_t eol = text.find('\n', pos);
+        if (eol == std::string::npos) eol = text.size();
+        auto words = split_words(text.substr(pos, eol - pos));
+        pos = eol + 1;
+        if (words.empty() || words[0][0] == '#') continue;
+        const std::string tag = words[0];
+        std::vector<std::string> rest(words.begin() + 1, words.end());
+        if (tag == "stitch" || tag == "suppress" || tag == "preview" || tag == "stream") {
+            FixtureCase c;
+            c.op = tag;
+            c.name = rest.empty() ? "" : rest[0];
+            c.args = rest;
+            cases.push_back(c);
+        } else if (cases.empty()) {
+            CHECK(false);
+        } else if (tag == "<") {
+            cases.back().committed = rest;
+        } else if (tag == ">") {
+            cases.back().fresh = rest;
+        } else if (tag == "=") {
+            cases.back().expect = rest;
+        } else if (tag == "audio") {
+            for (const auto& w : rest) cases.back().audio.push_back(std::stod(w));
+        } else if (tag == "tx" && rest.size() >= 3) {
+            std::vector<std::string> t(rest.begin() + 3, rest.end());
+            cases.back().tx.push_back({rest[0], rest[1], rest[2], join_words(t)});
+        } else if (tag == "calls") {
+            cases.back().calls = rest;
+        } else {
+            CHECK(false);
+        }
+    }
+    return cases;
+}
+
+int64_t fixture_samples(const std::string& seconds) {
+    return std::llround(std::stod(seconds) * 16000.0);
+}
+
+std::string fixture_seconds(int64_t samples) {
+    char buf[32];
+    std::snprintf(buf, sizeof buf, "%g", static_cast<double>(samples) / 16000.0);
+    return buf;
+}
+}  // namespace
+
+static void test_stitch_fixture_cases() {
+    const auto cases = load_fixture_cases();
+    CHECK(cases.size() >= 15);
+    for (const auto& c : cases) {
+        if (c.op == "stitch") {
+            const bool ok = stitch_words(c.committed, c.fresh) == c.expect;
+            if (!ok) std::fprintf(stderr, "stitch case %s differs\n", c.name.c_str());
+            CHECK(ok);
+        } else if (c.op == "suppress") {
+            const bool ok = suppress_loops(c.committed, std::stod(c.args.at(1))) == c.expect;
+            if (!ok) std::fprintf(stderr, "suppress case %s differs\n", c.name.c_str());
+            CHECK(ok);
+        } else if (c.op == "preview") {
+            const bool ok =
+                suppress_preview_loops(c.committed, std::stod(c.args.at(1))) == c.expect;
+            if (!ok) std::fprintf(stderr, "preview case %s differs\n", c.name.c_str());
+            CHECK(ok);
+        } else {
+            std::vector<float> samples;
+            for (size_t i = 0; i + 1 < c.audio.size(); i += 2)
+                samples.insert(samples.end(),
+                               static_cast<size_t>(std::llround(c.audio[i] * 16000.0)),
+                               static_cast<float>(c.audio[i + 1]));
+            ChunkStreamer cs(16000, std::stod(c.args.at(1)), std::stod(c.args.at(2)),
+                             0.0, 0.0);
+            std::vector<std::string> calls;
+            std::vector<bool> used(c.tx.size(), false);
+            bool scripted = true;
+            TranscribeFn tx = [&](const float* p, int64_t n) -> std::optional<std::string> {
+                const int64_t start = p - samples.data();
+                calls.push_back(std::string(cs.call_kind()) + "@" + fixture_seconds(start)
+                                + "+" + fixture_seconds(n));
+                // A matching line answers once if another matching line
+                // follows it; "BUSY" answers busy.
+                std::vector<size_t> hits;
+                for (size_t k = 0; k < c.tx.size(); ++k) {
+                    const auto& t = c.tx[k];
+                    if (!used[k] && (t.kind == "*" || t.kind == cs.call_kind())
+                        && (t.start == "*" || fixture_samples(t.start) == start)
+                        && (t.length == "*" || fixture_samples(t.length) == n))
+                        hits.push_back(k);
+                }
+                if (hits.empty()) {
+                    scripted = false;
+                    return std::string();
+                }
+                if (hits.size() > 1) used[hits[0]] = true;
+                if (c.tx[hits[0]].text == "BUSY") return std::nullopt;
+                return c.tx[hits[0]].text;
+            };
+            auto final_text = cs.flush(samples, tx);
+            const bool ok = scripted && final_text.has_value()
+                && split_words(*final_text) == c.expect && calls == c.calls;
+            if (!ok) {
+                std::fprintf(stderr, "stream case %s differs: %s\n  calls:", c.name.c_str(),
+                             final_text ? final_text->c_str() : "(none)");
+                for (const auto& k : calls) std::fprintf(stderr, " %s", k.c_str());
+                std::fprintf(stderr, "\n");
+            }
+            CHECK(ok);
+        }
+    }
+}
+
+// ---- window plausibility and loops (issue #357) ----------------------------
+static void test_voiced_seconds() {
+    std::vector<float> x(2 * 16000, 0.0f);
+    CHECK_NEAR(voiced_seconds(x.data(), static_cast<int64_t>(x.size()), 16000), 0.0);
+    x.insert(x.end(), 3 * 16000, 0.1f);
+    x.insert(x.end(), 2 * 16000, 0.0f);
+    CHECK_NEAR(voiced_seconds(x.data(), static_cast<int64_t>(x.size()), 16000), 3.0);
+    std::vector<float> faint(2 * 16000, 1e-4f);  // below -60 dBFS
+    CHECK_NEAR(voiced_seconds(faint.data(), static_cast<int64_t>(faint.size()), 16000), 0.0);
+    std::vector<float> speech(2 * 16000, 0.05f);  // its own floor is capped
+    CHECK_NEAR(voiced_seconds(speech.data(), static_cast<int64_t>(speech.size()), 16000), 2.0);
+    CHECK_NEAR(voiced_seconds(x.data(), 100, 16000), 0.0);
+    CHECK(max_plausible_words(12.0) == 88);
+    CHECK((suppress_loops({"Again,", "again", "again.", "again", "again"}, 0.0)
+           == std::vector<std::string>{"Again,", "again"}));
+}
+
+static void test_preview_never_shows_a_loop() {
+    // A 900-word looping preview (seen live, PR #430) is cut to what its
+    // audio can hold.
+    ChunkStreamer cs(16000, 12.0, 3.0, 0.0, 0.0);
+    std::vector<float> samples(6 * 16000, 0.0f);
+    std::string loop;
+    for (int i = 0; i < 225; ++i) loop += "a little bit of ";
+    TranscribeFn tx = [&](const float*, int64_t) -> std::optional<std::string> {
+        return loop;
+    };
+    auto text = cs.step(samples, 1.0, tx);
+    CHECK(text.has_value() && *text == "a little bit of a little bit of");
 }
 
 // ---- model slug mapping tests ---------------------------------------------
@@ -444,10 +609,11 @@ static void test_stream_session_buffer_trim() {
     CHECK_NEAR(session.live_seconds(), 2.5);   // nothing trimmed yet
 
     // The next append triggers the trim: boundary (36000) >= kStreamTrimMin
-    // (16000), so the first 36000 samples drop and the chunker rebases.
+    // (16000), so the samples before the re-decode lookback (0.75 x the
+    // 4000-sample overlap, issue #357) drop and the chunker rebases.
     session.append_pcm(pcm_for_range(40000, 1600));
     CHECK_NEAR(session.buffered_seconds(), 2.6);  // 41600 samples total
-    CHECK_NEAR(session.live_seconds(), 0.35);     // 5600 live after trim
+    CHECK_NEAR(session.live_seconds(), 0.5375);   // 5600 + 3000 kept
 
     // Rebase correctness: top up the live buffer to exactly one window and
     // step. The window must be samples[0..16000) of the TRIMMED buffer, i.e.
@@ -1157,10 +1323,11 @@ static void test_tail_reuse_survives_overlap_rebasing() {
     CHECK(calls.size() == 3);
     CHECK_NEAR(session.buffered_seconds(), 2.5);
 
-    // The next append trims the 36000 finalized samples and rebases; then
-    // top the take up past the 2.6 s first-partial minimum.
+    // The next append trims the finalized samples before the 3000-sample
+    // re-decode lookback and rebases; then top the take up past the 2.6 s
+    // first-partial minimum.
     session.append_pcm(pcm_for_range(40000, 1600));
-    CHECK_NEAR(session.live_seconds(), 0.35);  // 5600 live after the trim
+    CHECK_NEAR(session.live_seconds(), 0.5375);  // 5600 + 3000 kept
     session.append_pcm(pcm_for_range(41600, 2400));
 
     // Preview on the rebased tail: live [0, 8000) = absolute [36000, 44000).
@@ -2344,6 +2511,79 @@ static void test_pump_ping_after_rejected_frame_sends_no_partial() {
 }
 
 // ---- main -----------------------------------------------------------------
+static void test_session_ledger_records_redecode_spans() {
+    // Loud 4 s windows that decode to one word are decoded again from 1 s
+    // earlier (half the 2 s overlap); the session keeps that audio when it
+    // trims, and the ledger records each call's absolute span.
+    ServerConfig cfg = test_cfg();
+    cfg.stream_chunk_seconds = 4.0;
+    cfg.stream_overlap_seconds = 2.0;
+    StarlingServer server(cfg);
+    StreamSession session(&server);
+    session.set_preview_policy(100.0, 0.0);
+    std::vector<std::pair<int64_t, int64_t>> seen;  // first sample value, length
+    session.set_transcribe_fn([&](const float* p, int64_t n) -> std::optional<std::string> {
+        seen.emplace_back(static_cast<int64_t>(std::lround(p[0] * 32768.0f)), n);
+        return std::string("hello");
+    });
+    // Each second of audio carries its index as the sample value, so a
+    // call's first sample tells which second it starts in.
+    for (int sec = 0; sec < 7; ++sec) {
+        std::vector<int16_t> pcm(16000, static_cast<int16_t>(4000 + sec));
+        session.append_pcm(std::string(reinterpret_cast<const char*>(pcm.data()),
+                                       pcm.size() * sizeof(int16_t)));
+        session.stream_step(static_cast<double>(sec));
+    }
+    CHECK(session.stream_flush().has_value());
+    // The first window has no audio before it: its re-decode ends 1 s
+    // earlier. Later ones start before their window, in audio the session
+    // kept when it trimmed.
+    const auto& calls = session.calls();
+    CHECK(calls.size() >= 2 && std::string(calls[0].kind) == "window"
+          && calls[0].abs_start == 0 && calls[0].length == 4 * 16000
+          && std::string(calls[1].kind) == "redecode" && calls[1].abs_start == 0
+          && calls[1].length == 3 * 16000);
+    int moved_back = 0;
+    for (size_t i = 1; i < calls.size(); ++i) {
+        const std::string prev = calls[i - 1].kind;
+        if (std::string(calls[i].kind) == "redecode"
+            && (prev == "window" || prev == "flush_tail") && calls[i - 1].abs_start > 0
+            && calls[i].abs_start < calls[i - 1].abs_start) {
+            ++moved_back;
+            CHECK(calls[i].abs_start + calls[i].length
+                  <= calls[i - 1].abs_start + calls[i - 1].length);
+        }
+    }
+    CHECK(moved_back > 0);
+    // The ledger's spans are the audio the transcriber saw.
+    CHECK(seen.size() == session.calls().size());
+    for (size_t i = 0; i < seen.size() && i < session.calls().size(); ++i) {
+        CHECK(seen[i].first == 4000 + session.calls()[i].abs_start / 16000);
+        CHECK(seen[i].second == session.calls()[i].length);
+    }
+    CHECK(session.trace_final_json().find("\"redecode\":{\"calls\":") != std::string::npos);
+}
+
+static void test_cap_does_not_count_the_redecode_lookback() {
+    // A cap just over one window (1 s windows, 0.25 s overlap) keeps
+    // committing: the 0.1875 s kept before the boundary for re-decodes
+    // (issue #357) is not counted against it.
+    ServerConfig cfg = test_cfg();
+    cfg.max_stream_seconds = 1.1;
+    StarlingServer server(cfg);
+    StreamSession session(&server);
+    session.set_transcribe_fn([](const float*, int64_t) -> std::optional<std::string> {
+        return std::string("w");
+    });
+    for (int i = 0; i < 50; ++i) {
+        CHECK(session.append_pcm(pcm_for_range(i * 1600, 1600)) == AppendOutcome::Accepted);
+        session.stream_step(static_cast<double>(i));
+    }
+    CHECK(!session.overflowed());
+    CHECK(session.live_seconds() > session.unfinalized_seconds());
+    CHECK(session.unfinalized_seconds() <= 1.1);
+}
+
 int main() {
     test_stitch_basic();
     test_stitch_empty();
@@ -2360,6 +2600,11 @@ int main() {
     test_chunk_streamer_unicode_boundary();
     test_chunk_streamer_rebase();
     test_chunk_streamer_stable_prefix_never_changes();
+    test_stitch_fixture_cases();
+    test_voiced_seconds();
+    test_preview_never_shows_a_loop();
+    test_session_ledger_records_redecode_spans();
+    test_cap_does_not_count_the_redecode_lookback();
     test_stream_session_buffer_trim();
     test_stream_session_busy_retry();
     test_stream_session_append_rejection();

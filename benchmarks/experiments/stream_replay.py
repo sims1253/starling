@@ -18,7 +18,12 @@ capturing — commits at the end, and records what a dictating user sees:
 - stop-to-final wall time, the server's stop path (``tail``/``reused``/
   ``committed``/``full_take``) and the audio the stop actually transcribed,
 - WER of the final against the reference and against the batch
-  (``/v1/audio/transcriptions``) result of the same server process.
+  (``/v1/audio/transcriptions``) result of the same server process, and
+  where the final departs from that batch text: omitted, inserted and
+  duplicated words, each span placed in the take and labeled ``overlap``
+  when it sits at a window boundary (``locate_errors``, issue #357),
+- looping partials: previews holding one phrase repeated back to back at
+  least four times (a decoding loop; issue #357).
 
 Each repeat starts a fresh server process (runner.ArmServer). The first
 take of a process is ``cold`` unless ``--warmup`` sends one batch request
@@ -86,6 +91,160 @@ def wer(ref: str, hyp: str) -> float:
             cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (rw != hw))
         prev = cur
     return prev[-1] / len(r)
+
+
+def align(ref: list[str], hyp: list[str]) -> list[tuple[str, int | None, int | None]]:
+    """Word-level Levenshtein alignment: ``(op, ref index, hyp index)`` with
+    ``op`` one of ``eq``, ``sub``, ``del`` (ref word missing from hyp) and
+    ``ins`` (hyp word not in ref), in order."""
+    n, m = len(ref), len(hyp)
+    d = [[0] * (m + 1) for _ in range(n + 1)]
+    for i in range(n + 1):
+        d[i][0] = i
+    for j in range(m + 1):
+        d[0][j] = j
+    for i in range(1, n + 1):
+        row, prev, rw = d[i], d[i - 1], ref[i - 1]
+        for j in range(1, m + 1):
+            row[j] = min(prev[j] + 1, row[j - 1] + 1, prev[j - 1] + (rw != hyp[j - 1]))
+    ops: list[tuple[str, int | None, int | None]] = []
+    i, j = n, m
+    while i or j:
+        if i and j and d[i][j] == d[i - 1][j - 1] + (ref[i - 1] != hyp[j - 1]):
+            ops.append(("eq" if ref[i - 1] == hyp[j - 1] else "sub", i - 1, j - 1))
+            i, j = i - 1, j - 1
+        elif i and d[i][j] == d[i - 1][j] + 1:
+            ops.append(("del", i - 1, None))
+            i -= 1
+        else:
+            ops.append(("ins", None, j - 1))
+            j -= 1
+    return ops[::-1]
+
+
+def _word_times(words: list[str], reference: str, utterances: list[dict]) -> list[float]:
+    """Estimated audio time (s) of each word: aligned to the reference, whose
+    words are spread evenly over their utterance's span; unaligned words take
+    their neighbor's time."""
+    ref_t: list[float] = []
+    for u in utterances:
+        uw = normalize(u["text"])
+        for k in range(len(uw)):
+            ref_t.append(u["start_s"] + (k + 0.5) / len(uw) * (u["end_s"] - u["start_s"]))
+    r = normalize(reference)
+    if len(ref_t) != len(r):  # a manifest whose spans do not cover the reference
+        return [0.0] * len(words)
+    times: list[float | None] = [None] * len(words)
+    for op, i, j in align(r, words):
+        if j is not None and i is not None:
+            times[j] = ref_t[i]
+    last = 0.0
+    for k, t in enumerate(times):
+        if t is None:
+            times[k] = last
+        else:
+            last = t
+    return times  # type: ignore[return-value]
+
+
+def locate_errors(batch_text: str, final_text: str, utterances: list[dict] | None,
+                  reference: str, calls: list[dict]) -> dict:
+    """Where the streaming final departs from the batch text of the same audio.
+
+    Aligns the two word by word and groups consecutive differences into
+    spans. Each span reports the batch words the final omits, the words the
+    final inserts (``duplicated`` when the inserted run repeats the words
+    right before or after it), its estimated audio time (from the workload's
+    utterance spans) and whether it falls into a window overlap (between the
+    next commitment's start and the current one's end, +-1 s) or elsewhere.
+    A commitment is a ``window``/``flush_window``/``flush_tail`` call with
+    the ``redecode`` calls right after it and its retries (a later committing
+    call at the same start, after a busy re-decode); the trace does not say
+    which candidate was kept, so a commitment spans all of them and the
+    label errs toward ``overlap`` there.
+    """
+    b, f = normalize(batch_text), normalize(final_text)
+    times = _word_times(b, reference, utterances or [])
+    commitments: list[list[float]] = []  # [start, end, nominal start]
+    for c in calls:
+        if c.get("result", "ok") not in ("ok", "reused"):
+            continue
+        kind = c.get("kind")
+        if kind in ("window", "flush_window", "flush_tail") and not (
+                commitments and commitments[-1][2] == c["start_s"]):
+            commitments.append([c["start_s"], c["end_s"], c["start_s"]])
+        elif kind in ("window", "flush_window", "flush_tail", "redecode") and commitments:
+            commitments[-1][:2] = [min(commitments[-1][0], c["start_s"]),
+                                   max(commitments[-1][1], c["end_s"])]
+    commitments.sort()
+    overlaps = [(nxt[0], cur[1]) for cur, nxt in zip(commitments, commitments[1:])
+                if nxt[0] < cur[1]]
+    spans, run = [], []
+    last_b = None  # the batch word before the current run
+    for op in align(b, f) + [("eq", None, None)]:
+        if op[0] != "eq":
+            run.append(op)
+            continue
+        if not run:
+            last_b = op[1]
+            continue
+        omitted = [b[i] for o, i, _ in run if o == "del"]
+        inserted_idx = [j for o, _, j in run if o == "ins"]
+        inserted = [f[j] for j in inserted_idx]
+        subs = sum(1 for o, _, _ in run if o == "sub")
+        dup = False
+        if inserted:
+            j0, j1 = inserted_idx[0], inserted_idx[-1] + 1
+            n = j1 - j0
+            dup = (j1 - j0 == len(inserted)
+                   and (f[j0 - n:j0] == f[j0:j1] or f[j1:j1 + n] == f[j0:j1]))
+        bi = [i for _, i, _ in run if i is not None]
+        if bi:
+            t = times[bi[0]]
+        else:  # pure insertion: the batch word before it
+            t = times[last_b] if last_b is not None else 0.0
+        near = min(overlaps, key=lambda o: max(o[0] - t, t - o[1], 0.0), default=None)
+        dist = None if near is None else max(near[0] - t, t - near[1], 0.0)
+        spans.append({"t_s": round(t, 2),
+                      "where": "overlap" if dist is not None and dist <= 1.0 else "window",
+                      "overlap_s": None if near is None else [round(near[0], 2), round(near[1], 2)],
+                      "omitted": " ".join(omitted), "inserted": " ".join(inserted),
+                      "duplicated": dup, "substituted": subs})
+        run = []
+        last_b = op[1]
+    return {
+        "omitted_words": sum(len(s["omitted"].split()) for s in spans),
+        "inserted_words": sum(len(s["inserted"].split()) for s in spans),
+        "duplicated_words": sum(len(s["inserted"].split()) for s in spans if s["duplicated"]),
+        "substituted_words": sum(s["substituted"] for s in spans),
+        "overlap_spans": sum(1 for s in spans if s["where"] == "overlap"),
+        "spans": spans,
+    }
+
+
+# A preview loop: a phrase of up to _LOOP_MAX_N words repeated back to back
+# at least _LOOP_MIN_REPEATS times, covering at least _LOOP_MIN_WORDS words.
+_LOOP_MAX_N = 8
+_LOOP_MIN_REPEATS = 4
+_LOOP_MIN_WORDS = 8
+
+
+def longest_loop(words: list[str]) -> int:
+    """Words covered by the longest back-to-back repeat run that counts as a
+    loop (see _LOOP_*), 0 when there is none."""
+    best = 0
+    for n in range(1, _LOOP_MAX_N + 1):
+        i = 0
+        while i + n <= len(words):
+            reps = 1
+            while words[i + reps * n:i + (reps + 1) * n] == words[i:i + n]:
+                reps += 1
+            if reps >= _LOOP_MIN_REPEATS and reps * n >= _LOOP_MIN_WORDS:
+                best = max(best, reps * n)
+                i += reps * n
+            else:
+                i += 1
+    return best
 
 
 def _pct(values: list[float], q: float) -> float | None:
@@ -176,8 +335,10 @@ def replay(ws_url: str, pcm: bytes, frame_ms: float, timeout_s: float) -> dict:
             "samples": len(pcm) // 2}
 
 
-def take_metrics(log: dict, reference: str, batch_text: str | None) -> dict:
-    """Reduce one replay's event log to the reported metrics."""
+def take_metrics(log: dict, reference: str, batch_text: str | None,
+                 utterances: list[dict] | None = None) -> dict:
+    """Reduce one replay's event log to the reported metrics; ``utterances``
+    (the workload's spans) place final-vs-batch differences in the take."""
     t0 = log["t_start"]
     send_t = [t for t, _ in log["sends"]]
     send_n = [n for _, n in log["sends"]]
@@ -195,6 +356,7 @@ def take_metrics(log: dict, reference: str, batch_text: str | None) -> dict:
 
     ages, backlogs, first = [], [], None
     revisions, prev_text, stable_violations = 0, None, 0
+    looping, longest = 0, 0
     final_words = final["text"].split()
     for t, m in partials:
         tr = m.get("trace") or {}
@@ -213,6 +375,10 @@ def take_metrics(log: dict, reference: str, batch_text: str | None) -> dict:
         sw = int(m.get("stable_words", 0))
         if sw and m["text"].split()[:sw] != final_words[:sw]:
             stable_violations += 1
+        loop = longest_loop(normalize(m["text"]))
+        if loop:
+            looping += 1
+            longest = max(longest, loop)
 
     # One partial without `covered_s` makes the run's age and backlog
     # unmeasured: statistics over the measured rest would look complete.
@@ -234,6 +400,8 @@ def take_metrics(log: dict, reference: str, batch_text: str | None) -> dict:
         "partials": len(partials),
         "revisions_per_min": round(revisions / (duration / 60.0), 2) if duration else None,
         "stable_violations": stable_violations,
+        "looping_partials": looping,
+        "longest_partial_loop_words": longest,
         "partial_age_ms": {"n": len(ages), "p50": _pct(ages, .5), "p95": _pct(ages, .95),
                            "max": max(ages) if ages else None},
         "backlog_s": {"n": len(backlogs), "p50": _pct(backlogs, .5),
@@ -260,17 +428,26 @@ def take_metrics(log: dict, reference: str, batch_text: str | None) -> dict:
         "wer_batch_vs_ref": None if batch_text is None else round(wer(reference, batch_text), 4),
         "wer_final_vs_batch": None if batch_text is None else round(wer(batch_text, final["text"]), 4),
         "final_text": final["text"],
+        "batch_text": batch_text,
     })
+    if batch_text is not None:
+        out["vs_batch"] = locate_errors(batch_text, final["text"], utterances, reference,
+                                        trace.get("calls") or [])
     return out
 
 
 def _batch(base: str, wav: Path, model_slug: str, timeout_s: float) -> tuple[str, float]:
+    return _batch_bytes(base, wav.read_bytes(), model_slug, timeout_s, wav.name)
+
+
+def _batch_bytes(base: str, wav: bytes, model_slug: str, timeout_s: float,
+                 filename: str = "take.wav") -> tuple[str, float]:
     boundary = uuid.uuid4().hex
     body = b"".join([
         f"--{boundary}\r\n".encode(), b'Content-Disposition: form-data; name="model"\r\n\r\n',
         model_slug.encode(), f"\r\n--{boundary}\r\n".encode(),
-        f'Content-Disposition: form-data; name="file"; filename="{wav.name}"\r\n'.encode(),
-        b"Content-Type: audio/wav\r\n\r\n", wav.read_bytes(), f"\r\n--{boundary}--\r\n".encode(),
+        f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'.encode(),
+        b"Content-Type: audio/wav\r\n\r\n", wav, f"\r\n--{boundary}--\r\n".encode(),
     ])
     req = urllib.request.Request(f"{base}/v1/audio/transcriptions", data=body, method="POST",
                                  headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
@@ -311,6 +488,13 @@ def _aggregate(runs: list[dict]) -> dict:
             "backlog_s_max": max_all([r["backlog_s"]["max"] for r in ok]),
             "revisions_per_min_median": med([r["revisions_per_min"] for r in ok]),
             "stable_violations_total": sum(r["stable_violations"] for r in ok),
+            "looping_partials_total": sum(r.get("looping_partials", 0) for r in ok),
+            "omitted_vs_batch_median": med_all([(r.get("vs_batch") or {}).get("omitted_words")
+                                                for r in ok]),
+            "inserted_vs_batch_median": med_all([(r.get("vs_batch") or {}).get("inserted_words")
+                                                 for r in ok]),
+            "duplicated_vs_batch_median": med_all([(r.get("vs_batch") or {}).get(
+                "duplicated_words") for r in ok]),
             "engine_audio_per_audio_s_median":
                 med_all([r["work"]["engine_audio_per_audio_s"] for r in ok]),
             "engine_wall_per_audio_s_median":
@@ -366,13 +550,20 @@ def run(args: argparse.Namespace) -> dict:
                 batch_text, batch_ms = _batch(server.base, args.workload / t["wav"],
                                               args.model_slug, args.timeout)
                 state, log = logs[name]
-                m = take_metrics(log, t["reference"], batch_text)
+                m = take_metrics(log, t["reference"], batch_text, t.get("utterances"))
                 m.update({"take": name, "repeat": repeat, "state": state,
                           "batch_ms": round(batch_ms, 1), "server_load_s": round(load_s, 2)})
                 runs.append(m)
                 print(json.dumps({k: m.get(k) for k in (
                     "take", "first_partial", "partial_age_ms", "stop_to_final_ms",
-                    "wer_final_vs_ref", "wer_final_vs_batch")}), flush=True)
+                    "wer_final_vs_ref", "wer_final_vs_batch", "looping_partials")}), flush=True)
+                vb = m.get("vs_batch") or {}
+                print(f"  vs batch: omitted {vb.get('omitted_words')} inserted "
+                      f"{vb.get('inserted_words')} duplicated {vb.get('duplicated_words')}",
+                      flush=True)
+                for span in vb.get("spans", []):
+                    if span["omitted"] or span["inserted"]:
+                        print("   ", json.dumps(span), flush=True)
         finally:
             server.stop()
     return {

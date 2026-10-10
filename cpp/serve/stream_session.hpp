@@ -1,7 +1,8 @@
 // stream_session.hpp — real-time streaming dictation session.
 //
-// Fixed-length overlapping windows bound each transcription call. Word matching
-// reduces overlap duplication but cannot guarantee agreement across windows.
+// Fixed-length overlapping windows bound each transcription call. Neighboring
+// windows are joined by aligning the words of their shared audio, and a window
+// whose text is implausible for its audio is decoded again (issue #357).
 #pragma once
 
 #include "server.hpp"
@@ -17,18 +18,77 @@
 
 namespace starling::serve {
 
-// Append `new_words` to `committed`, deduping the overlapping boundary words.
-// Looks at the last/first `max_overlap` words of each side (the shared region)
-// and aligns the longest common run there. If no run of >= min_match words is
-// found, the two are simply concatenated (rare; a duplicated word reads better
-// than a dropped one for dictation).
+// Append `new_words` to `committed`, deduping the overlapping boundary words
+// (issue #357). Aligns a suffix of committed's last `max_overlap` words with a
+// prefix of new_words' first `max_head` words (default max_overlap; a
+// re-decoded window that starts earlier shares more audio). Matches score
+// +2, mismatches and gaps -1; committed words before the suffix and new
+// words after the prefix are free, so a common phrase far from the boundary
+// cannot win and drop the words between. When the committed words of the
+// chosen alignment repeat with some period ("one two three one two three
+// ...") and `expected_overlap` (words the shared audio should hold; -1:
+// unknown) is smaller, the alignment starts whole periods later, at the
+// length closest to it.
+// The cut is the middle matched word: committed up to and including it,
+// then new_words after it. Without an alignment scoring at least
+// kStitchMinScore the two are concatenated.
 //
-// This is a direct port of stitch_words() from src/starling/stream_chunk.py.
+// Port of stitch_words() from src/starling/stream_chunk.py, tie-breaking
+// included.
 std::vector<std::string> stitch_words(
     const std::vector<std::string>& committed,
     const std::vector<std::string>& new_words,
     int max_overlap = 24,
-    int min_match = 2);
+    int max_head = -1,
+    double expected_overlap = -1.0);
+
+// ---- window plausibility (issue #357) ---------------------------------------
+// Parakeet sometimes stops emitting partway through a window, or emits
+// nothing for a window full of speech, while a window shifted by a second
+// transcribes the same audio; a transducer can also loop on a phrase. A
+// committed window is therefore checked against its audio and, when
+// implausible, decoded again from the earlier starts in kRedecodeShifts.
+// Constants and rules are those of src/starling/stream_chunk.py.
+
+// More words than this per second (plus kMaxWordsSlack) is a decoding loop.
+constexpr double kMaxWordsPerSecond = 7.0;
+constexpr int kMaxWordsSlack = 4;
+// Fewer words per voiced second than this, or than kRelativeMinRate of the
+// take's median over its last kRateHistory committed windows, over at least
+// kMinVoicedSeconds of voiced audio, marks a window that dropped speech.
+constexpr double kMinWordsPerVoicedSecond = 1.25;
+constexpr double kRelativeMinRate = 0.6;
+constexpr size_t kRateHistory = 16;
+constexpr double kMinVoicedSeconds = 2.0;
+// Earlier starts tried for an implausible window, in order, as fractions of
+// the window overlap (1.5, 0.75 and 2.25 s at the default 3 s): below one
+// overlap, a window moved back still overlaps the next one.
+constexpr double kRedecodeShifts[] = {0.5, 0.25, 0.75};
+// A sparse window is replaced only by a candidate this much denser.
+constexpr double kRedecodeMinGain = 1.25;
+
+// Most words `seconds` of audio can hold; more is a decoding loop.
+int max_plausible_words(double seconds);
+// Seconds of audio loud enough to be speech: 20 ms frames 15 dB over the
+// span's quiet floor (its 10th-percentile frame, at most -45 dBFS) and over
+// -60 dBFS.
+double voiced_seconds(const float* samples, int64_t n, int sample_rate);
+// The same measure per 20 ms frame (1 = voiced).
+std::vector<uint8_t> voiced_frames(const float* samples, int64_t n, int sample_rate);
+// Words of a decode over `seconds` of audio with a decoding loop removed:
+// unchanged within max_plausible_words(), so real repeated speech is never
+// touched. Longer text has its longest back-to-back run of one phrase
+// (1..max_n words) cut to max_repeats copies, one run at a time, only until
+// it fits; what still does not fit is cut at the bound.
+std::vector<std::string> suppress_loops(const std::vector<std::string>& words,
+                                        double seconds, int max_repeats = 2,
+                                        int max_n = 8);
+// suppress_loops() for a preview, which also cuts every phrase repeated
+// back to back more than 3 times (covering 8 or more words) to two copies,
+// within the bound too: a preview never becomes the final, so a phrase said
+// four times shows twice for a moment while a decoding loop never shows.
+std::vector<std::string> suppress_preview_loops(const std::vector<std::string>& words,
+                                                double seconds, int max_n = 8);
 
 // Split a string on whitespace into words (matching Python's str.split()).
 std::vector<std::string> split_words(const std::string& s);
@@ -141,8 +201,16 @@ public:
 
     void reset();
 
-    // The sample index up to which audio is fully finalized (for buffer trimming).
+    // The sample index up to which audio is fully finalized.
     int64_t boundary() const { return boundary_; }
+    // The first buffer sample the streamer may still read (a re-decode
+    // reaches the largest kRedecodeShifts fraction of the overlap before the
+    // boundary); the session may trim everything before it.
+    int64_t retain_from() const {
+        return std::max<int64_t>(0, boundary_ - lookback_);
+    }
+    // Committed windows and flush tails replaced by a re-decode.
+    int64_t redecodes() const { return redecodes_; }
 
     // How many leading words of every text this streamer returns from now
     // on are fixed: no later window, tail or flush can change them. Only
@@ -158,6 +226,8 @@ public:
     void rebase(int64_t dropped) {
         boundary_ = std::max<int64_t>(0, boundary_ - dropped);
         rebased_ += dropped;
+        last_.start -= dropped;
+        last_.end -= dropped;
     }
 
     // A full window is waiting to be committed (the next step commits it).
@@ -182,17 +252,37 @@ public:
 
     // Why the transcribe call in flight was made (issue #226): "window" (a
     // full window committed while recording), "preview" (the live tail),
-    // "flush_window" / "flush_tail" (finalization on commit). Set before
+    // "flush_window" / "flush_tail" (finalization on commit), "redecode" (a
+    // committed window or flush tail decoded again, issue #357). Set before
     // every transcribe call; the session's call ledger reads it.
     const char* call_kind() const { return call_kind_; }
 
 private:
     bool finalize_full_windows(const std::vector<float>& samples,
                                const TranscribeFn& tx, bool flushing);
-    // committed_ with `new_words` stitched onto its unfrozen tail.
-    std::vector<std::string> stitched(const std::vector<std::string>& new_words) const;
-    // Stitches `new_words` into committed_ and advances frozen_.
-    void commit(const std::vector<std::string>& new_words);
+    // One decode kept for the committed text: its words, the buffer span
+    // of its audio and that audio's voiced frames.
+    struct Decoded {
+        std::vector<std::string> words;
+        int64_t start = 0, end = 0;
+        std::vector<uint8_t> flags;
+    };
+    // Words of samples[start, end) for the committed text, re-decoded when
+    // implausible (see stream_chunk.py _decode_committed); nullopt when the
+    // engine is busy before a plausible result is in hand.
+    std::optional<Decoded> decode_committed(
+        const std::vector<float>& samples, int64_t start, int64_t end,
+        const char* kind, const TranscribeFn& tx);
+    // Words per voiced second below which a window dropped speech.
+    double min_rate() const;
+    // 0 plausible, 1 sparse (dropped speech), 2 a decoding loop.
+    int verdict(size_t words, double seconds, double voiced) const;
+    // committed_ with d.words stitched onto its unfrozen tail; each side's
+    // share of speech in the audio both decodes heard predicts how many of
+    // its words the overlap holds.
+    std::vector<std::string> stitched(const Decoded& d) const;
+    // Stitches d into committed_, advances frozen_ and remembers d.
+    void commit(const Decoded& d);
 
     int sr_;
     int chunk_;           // chunk size in samples
@@ -201,6 +291,8 @@ private:
     int min_;             // minimum samples for a partial
     double partial_interval_;
     int max_overlap_words_;
+    int lookback_;        // samples kept before the boundary for re-decodes
+    int max_head_words_;  // new words searched when stitching
 
     std::vector<std::string> committed_;
     int64_t frozen_ = 0;    // leading committed_ words stitching never touches
@@ -210,6 +302,14 @@ private:
     bool emit_due_ = false;          // a commit changed the text, not yet emitted
     double last_preview_cost_ = 0.0; // seconds, latest successful preview
     int64_t coalesced_ = 0;
+    int64_t redecodes_ = 0;
+    std::vector<double> rates_;  // words per voiced second, latest windows
+    // The latest committed decode (its words are only counted).
+    struct {
+        bool valid = false;
+        int64_t start = 0, end = 0, words = 0;
+        std::vector<uint8_t> flags;
+    } last_;
     const char* call_kind_ = "window";
 };
 
@@ -266,9 +366,10 @@ public:
 
     // True when a frame exceeded the per-connection buffer cap
     // (config.max_stream_seconds): the frame was refused and every further
-    // append is a no-op until reset(). The cap bounds the LIVE rolling
-    // buffer (memory): finalized windows are trimmed from the buffer, so
-    // long dictation sessions without commits keep memory bounded without
+    // append is a no-op until reset(). The cap bounds the audio past the
+    // committed boundary (unfinalized_seconds()): finalized windows are
+    // trimmed from the buffer, apart from the re-decode lookback, so long
+    // dictation sessions without commits keep memory bounded without
     // tripping the cap. The WS layer reports overflow to the client as an
     // error frame.
     bool overflowed() const { return overflow_; }
@@ -327,6 +428,10 @@ public:
 
     double buffered_seconds() const;
     double live_seconds() const;
+    // Audio past the committed boundary: what the buffer cap counts. The
+    // audio kept before the boundary for re-decodes (issue #357) is not
+    // counted, so a cap that held one window still does.
+    double unfinalized_seconds() const;
 
     // Build the chunked-streaming transcribe callback.
     TranscribeFn make_transcribe_fn(RequestContext* ctx);
@@ -490,7 +595,7 @@ private:
     std::vector<StreamCall> calls_;
     int64_t calls_dropped_ = 0;
     StreamCallTotals totals_;
-    StreamCallTotals by_kind_[4];  // window, preview, flush_window, flush_tail
+    StreamCallTotals by_kind_[5];  // window, preview, flush_window, flush_tail, redecode
     StreamCallTotals flush_totals_;
     bool flushing_ = false;       // stream_flush() in progress
     int64_t covered_end_ = 0;     // abs end of the latest successful call

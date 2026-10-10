@@ -1,0 +1,239 @@
+# Streaming stitch parity cases (issue #357), replayed by
+# tests/test_stream_chunk.py (Python) and cpp/tests/stream_session_test.cpp
+# (native): both must produce every expected line exactly.
+#
+# stitch <name>            stitch_words(committed, new) with max_overlap 24
+#   < committed words      (a bare "<" or ">" is an empty side)
+#   > new words
+#   = expected words
+# suppress <name> <seconds>   suppress_loops(words, seconds)
+#   < words
+#   = expected words
+# preview <name> <seconds>    suppress_preview_loops(words, seconds)
+#   < words
+#   = expected words
+# stream <name> <chunk_s> <overlap_s>   ChunkStreamer.flush over synthetic audio
+#   audio <seconds> <amplitude> ...     constant-amplitude segments, 16 kHz
+#   tx <kind> <start_s> <length_s> <text...>   the transcriber's answer for a
+#                                       call (kind "*" = any); "tx * * * <text>"
+#                                       answers every other call. A matching
+#                                       line answers once if another matching
+#                                       line follows it; text BUSY answers
+#                                       busy (no text)
+#   = expected final words
+#   calls <kind>@<start_s>+<length_s> ...      every transcribe call, in order
+
+stitch agreeing_overlap
+< he tells us that at this festive season of the year
+> season of the year with christmas and roast beef
+= he tells us that at this festive season of the year with christmas and roast beef
+
+stitch overlap_cut_in_the_middle
+< one two three four five six seven
+> three four five six seven eight nine
+= one two three four five six seven eight nine
+
+stitch disagreeing_cut_off_edges
+< season of the year with christmas and roast bee
+> ear with christmas and roast beef looming before us
+= season of the year with christmas and roast beef looming before us
+
+stitch common_phrase_far_from_the_boundary
+< mister quilter is the apostle of the middle classes and we are glad to welcome his gospel nor is mister quilter's manner less interesting than his matter.
+> He tells us that at this festive season of the year, with Christmas and roast
+= mister quilter is the apostle of the middle classes and we are glad to welcome his gospel nor is mister quilter's manner less interesting than his matter. He tells us that at this festive season of the year, with Christmas and roast
+
+stitch repeated_phrase_spanning_the_boundary
+< replied the new king. I hope he doesn't work too hard, said Shaggy.
+> He doesn't work at all. In fact, there's nothing he can do
+= replied the new king. I hope he doesn't work too hard, said Shaggy. He doesn't work at all. In fact, there's nothing he can do
+
+stitch pause_in_the_overlap
+< less interesting than his matter.
+> He tells us that at this
+= less interesting than his matter. He tells us that at this
+
+stitch empty_new_window
+< keep these words
+>
+= keep these words
+
+stitch empty_committed
+<
+> first words
+= first words
+
+stitch single_word_windows
+< yes
+> yes
+= yes yes
+
+stitch punctuation_never_matches
+< -- ;;
+> .. ,, word
+= -- ;; .. ,, word
+
+suppress loop_in_a_preview 12
+< and then a little bit of a little bit of a little bit of a little bit of a little bit of a little bit of a little bit of a little bit of a little bit of a little bit of a little bit of a little bit of a little bit of a little bit of a little bit of a little bit of a little bit of a little bit of a little bit of a little bit of a little bit of a little bit of a little bit of a so on
+= and then a little bit of a little bit of a so on
+
+suppress real_repetition_within_bound 2
+< no no no no no I said no
+= no no no no no I said no
+
+suppress real_repetition_beside_a_loop 12
+< no no no no no I said la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la
+= no no no no no I said la la
+
+preview loop_within_the_bound 12
+< then a little bit of a little bit of a little bit of a little bit of a little bit of a little bit of a so on
+= then a little bit of a little bit of a so on
+
+preview short_or_rare_repeats_stay 12
+< no no no no I said no no no yes yes yes and then
+= no no no no I said no no no yes yes yes and then
+
+suppress over_bound_without_repeats 1
+< w1 w2 w3 w4 w5 w6 w7 w8 w9 w10 w11 w12 w13 w14 w15
+= w1 w2 w3 w4 w5 w6 w7 w8 w9 w10 w11
+
+stream healthy_windows 12 3
+audio 24 0.1
+tx flush_window 0 12 one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty twentyone twentytwo twentythree twentyfour
+tx flush_window 9 12 twentyone twentytwo twentythree twentyfour b1 b2 b3 b4 b5 b6 b7 b8 b9 b10 b11 b12 b13 b14 b15 b16 b17 b18 b19 b20
+tx flush_tail 18 6 b17 b18 b19 b20 c1 c2 c3 c4 c5 c6 c7 c8
+= one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty twentyone twentytwo twentythree twentyfour b1 b2 b3 b4 b5 b6 b7 b8 b9 b10 b11 b12 b13 b14 b15 b16 b17 b18 b19 b20 c1 c2 c3 c4 c5 c6 c7 c8
+calls flush_window@0+12 flush_window@9+12 flush_tail@18+6
+
+stream window_dropped_speech_is_decoded_again 12 3
+audio 24 0.1
+tx flush_window 0 12 a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 a14 a15 a16 a17 a18 a19 a20 a21 a22 a23 a24
+tx flush_window 9 12 a19 a20
+tx redecode 7.5 12 a17 a18 a19 a20 a21 a22 b1 b2 b3 b4 b5 b6 b7 b8 b9 b10 b11 b12 b13 b14 b15 b16 b17 b18 b19
+tx flush_tail 16.5 7.5 b13 b14 b15 b16 b17 b18 b19 c1 c2 c3 c4 c5 c6 c7 c8
+= a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 a14 a15 a16 a17 a18 a19 a20 a21 a22 b1 b2 b3 b4 b5 b6 b7 b8 b9 b10 b11 b12 b13 b14 b15 b16 b17 b18 b19 c1 c2 c3 c4 c5 c6 c7 c8
+calls flush_window@0+12 flush_window@9+12 redecode@7.5+12 flush_tail@16.5+7.5
+
+stream every_candidate_sparse_keeps_the_densest 12 3
+audio 24 0.1
+tx flush_window 0 12 a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 a14 a15 a16 a17 a18 a19 a20 a21 a22 a23 a24
+tx flush_window 9 12 x1
+tx redecode 7.5 12 x1 x2 x3
+tx redecode 8.25 12 x1 x2
+tx redecode 6.75 12 x1 x2 x3 x4
+tx flush_tail 15.75 8.25 c1 c2 c3 c4 c5 c6 c7 c8 c9 c10 c11 c12
+= a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 a14 a15 a16 a17 a18 a19 a20 a21 a22 a23 a24 x1 x2 x3 x4 c1 c2 c3 c4 c5 c6 c7 c8 c9 c10 c11 c12
+calls flush_window@0+12 flush_window@9+12 redecode@7.5+12 redecode@8.25+12 redecode@6.75+12 flush_tail@15.75+8.25
+
+stream silence_is_not_sparse 12 3
+audio 24 0
+tx * * * hm
+= hm hm hm
+calls flush_window@0+12 flush_window@9+12 flush_tail@18+6
+
+stream first_window_ends_earlier 12 3
+audio 14 0.1
+tx flush_window 0 12 a1
+tx redecode 0 10.5 a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 a14 a15 a16 a17 a18 a19 a20
+tx flush_tail 7.5 6.5 a17 a18 a19 a20 b1 b2 b3 b4 b5 b6 b7 b8
+= a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 a14 a15 a16 a17 a18 a19 a20 b1 b2 b3 b4 b5 b6 b7 b8
+calls flush_window@0+12 redecode@0+10.5 flush_tail@7.5+6.5
+
+stream loop_window_is_decoded_again 12 3
+audio 24 0.1
+tx flush_window 0 12 a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 a14 a15 a16 a17 a18 a19 a20 a21 a22 a23 a24
+tx flush_window 9 12 la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la la
+tx redecode 7.5 12 a17 a18 a19 a20 a21 a22 b1 b2 b3 b4 b5 b6 b7 b8 b9 b10 b11 b12 b13 b14 b15 b16 b17 b18 b19
+tx flush_tail 16.5 7.5 b13 b14 b15 b16 b17 b18 b19 c1 c2 c3 c4 c5 c6 c7 c8
+= a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 a14 a15 a16 a17 a18 a19 a20 a21 a22 b1 b2 b3 b4 b5 b6 b7 b8 b9 b10 b11 b12 b13 b14 b15 b16 b17 b18 b19 c1 c2 c3 c4 c5 c6 c7 c8
+calls flush_window@0+12 flush_window@9+12 redecode@7.5+12 flush_tail@16.5+7.5
+
+stream flush_tail_grows_backwards 12 3
+audio 16 0.1
+tx flush_window 0 12 a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 a14 a15 a16 a17 a18 a19 a20 a21 a22 a23 a24
+tx flush_tail 9 7 x
+tx redecode 7.5 8.5 a19 a20 a21 a22 a23 a24 b1 b2 b3 b4 b5 b6 b7 b8 b9 b10 b11 b12
+= a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 a14 a15 a16 a17 a18 a19 a20 a21 a22 a23 a24 b1 b2 b3 b4 b5 b6 b7 b8 b9 b10 b11 b12
+calls flush_window@0+12 flush_tail@9+7 redecode@7.5+8.5
+
+stream fast_speech_recovered_far_back 12 3
+audio 24 0.1
+tx flush_window 0 12 w0 w1 w2 w3 w4 w5 w6 w7 w8 w9 w10 w11 w12 w13 w14 w15 w16 w17 w18 w19 w20 w21 w22 w23 w24 w25 w26 w27 w28 w29 w30 w31 w32 w33 w34 w35 w36 w37 w38 w39 w40 w41 w42 w43 w44 w45 w46 w47 w48 w49 w50 w51 w52 w53 w54 w55 w56 w57 w58 w59 w60 w61 w62 w63 w64 w65 w66 w67 w68 w69 w70 w71 w72 w73 w74 w75 w76 w77 w78 w79 w80 w81 w82 w83
+tx flush_window 9 12 w70
+tx redecode 7.5 12 w70
+tx redecode 8.25 12 w60
+tx redecode 6.75 12 w48 w49 w50 w51 w52 w53 w54 w55 w56 w57 w58 w59 w60 w61 w62 w63 w64 w65 w66 w67 w68 w69 w70 w71 w72 w73 w74 w75 w76 w77 w78 w79 w80 w81 w82 w83 w84 w85 w86 w87 w88 w89 w90 w91 w92 w93 w94 w95 w96 w97 w98 w99 w100 w101 w102 w103 w104 w105 w106 w107 w108 w109 w110 w111 w112 w113 w114 w115 w116 w117 w118 w119 w120 w121 w122 w123 w124 w125 w126 w127 w128 w129 w130 w131
+tx flush_tail 15.75 8.25 w111 w112 w113 w114 w115 w116 w117 w118 w119 w120 w121 w122 w123 w124 w125 w126 w127 w128 w129 w130 w131 w132 w133 w134 w135 w136 w137 w138 w139 w140 w141 w142 w143 w144 w145 w146 w147 w148 w149 w150 w151 w152 w153 w154 w155 w156 w157 w158 w159 w160 w161 w162 w163 w164 w165 w166 w167
+= w0 w1 w2 w3 w4 w5 w6 w7 w8 w9 w10 w11 w12 w13 w14 w15 w16 w17 w18 w19 w20 w21 w22 w23 w24 w25 w26 w27 w28 w29 w30 w31 w32 w33 w34 w35 w36 w37 w38 w39 w40 w41 w42 w43 w44 w45 w46 w47 w48 w49 w50 w51 w52 w53 w54 w55 w56 w57 w58 w59 w60 w61 w62 w63 w64 w65 w66 w67 w68 w69 w70 w71 w72 w73 w74 w75 w76 w77 w78 w79 w80 w81 w82 w83 w84 w85 w86 w87 w88 w89 w90 w91 w92 w93 w94 w95 w96 w97 w98 w99 w100 w101 w102 w103 w104 w105 w106 w107 w108 w109 w110 w111 w112 w113 w114 w115 w116 w117 w118 w119 w120 w121 w122 w123 w124 w125 w126 w127 w128 w129 w130 w131 w132 w133 w134 w135 w136 w137 w138 w139 w140 w141 w142 w143 w144 w145 w146 w147 w148 w149 w150 w151 w152 w153 w154 w155 w156 w157 w158 w159 w160 w161 w162 w163 w164 w165 w166 w167
+calls flush_window@0+12 flush_window@9+12 redecode@7.5+12 redecode@8.25+12 redecode@6.75+12 flush_tail@15.75+8.25
+
+stream slow_speech_next_window_keeps_the_overlap 12 3
+audio 30 0.1
+tx flush_window 0 12 u0 u1 u2 u3 u4 u5 u6 u7 u8 u9 u10 u11 u12 u13 u14 u15 u16 u17
+tx flush_window 9 12 u14
+tx redecode 7.5 12 u14
+tx redecode 8.25 12 u14
+tx redecode 6.75 12 u11 u12 u13 u14 u15 u16 u17 u18 u19 u20 u21 u22 u23 u24 u25 u26 u27 u28
+tx flush_window 15.75 12 u24 u25 u26 u27 u28 u29 u30 u31 u32 u33 u34 u35 u36 u37 u38 u39 u40 u41
+tx flush_tail 24.75 5.25 u38 u39 u40 u41 u42 u43 u44
+= u0 u1 u2 u3 u4 u5 u6 u7 u8 u9 u10 u11 u12 u13 u14 u15 u16 u17 u18 u19 u20 u21 u22 u23 u24 u25 u26 u27 u28 u29 u30 u31 u32 u33 u34 u35 u36 u37 u38 u39 u40 u41 u42 u43 u44
+calls flush_window@0+12 flush_window@9+12 redecode@7.5+12 redecode@8.25+12 redecode@6.75+12 flush_window@15.75+12 flush_tail@24.75+5.25
+
+stream busy_redecode_leaves_the_window_pending 12 3
+audio 24 0.1
+tx flush_window 0 12 w0 w1 w2 w3 w4 w5 w6 w7 w8 w9 w10 w11 w12 w13 w14 w15 w16 w17 w18 w19 w20 w21 w22 w23 w24 w25 w26 w27 w28 w29 w30 w31 w32 w33 w34 w35 w36 w37 w38 w39 w40 w41 w42 w43 w44 w45 w46 w47 w48 w49 w50 w51 w52 w53 w54 w55 w56 w57 w58 w59 w60 w61 w62 w63 w64 w65 w66 w67 w68 w69 w70 w71 w72 w73 w74 w75 w76 w77 w78 w79 w80 w81 w82 w83
+tx flush_window 9 12 w70
+tx redecode 7.5 12 BUSY
+tx redecode 7.5 12 w53 w54 w55 w56 w57 w58 w59 w60 w61 w62 w63 w64 w65 w66 w67 w68 w69 w70 w71 w72 w73 w74 w75 w76 w77 w78 w79 w80 w81 w82 w83 w84 w85 w86 w87 w88 w89 w90 w91 w92 w93 w94 w95 w96 w97 w98 w99 w100 w101 w102 w103 w104 w105 w106 w107 w108 w109 w110 w111 w112 w113 w114 w115 w116 w117 w118 w119 w120 w121 w122 w123 w124 w125 w126 w127 w128 w129 w130 w131 w132 w133 w134 w135 w136
+tx flush_tail 16.5 7.5 w116 w117 w118 w119 w120 w121 w122 w123 w124 w125 w126 w127 w128 w129 w130 w131 w132 w133 w134 w135 w136 w137 w138 w139 w140 w141 w142 w143 w144 w145 w146 w147 w148 w149 w150 w151 w152 w153 w154 w155 w156 w157 w158 w159 w160 w161 w162 w163 w164 w165 w166 w167
+= w0 w1 w2 w3 w4 w5 w6 w7 w8 w9 w10 w11 w12 w13 w14 w15 w16 w17 w18 w19 w20 w21 w22 w23 w24 w25 w26 w27 w28 w29 w30 w31 w32 w33 w34 w35 w36 w37 w38 w39 w40 w41 w42 w43 w44 w45 w46 w47 w48 w49 w50 w51 w52 w53 w54 w55 w56 w57 w58 w59 w60 w61 w62 w63 w64 w65 w66 w67 w68 w69 w70 w71 w72 w73 w74 w75 w76 w77 w78 w79 w80 w81 w82 w83 w84 w85 w86 w87 w88 w89 w90 w91 w92 w93 w94 w95 w96 w97 w98 w99 w100 w101 w102 w103 w104 w105 w106 w107 w108 w109 w110 w111 w112 w113 w114 w115 w116 w117 w118 w119 w120 w121 w122 w123 w124 w125 w126 w127 w128 w129 w130 w131 w132 w133 w134 w135 w136 w137 w138 w139 w140 w141 w142 w143 w144 w145 w146 w147 w148 w149 w150 w151 w152 w153 w154 w155 w156 w157 w158 w159 w160 w161 w162 w163 w164 w165 w166 w167
+calls flush_window@0+12 flush_window@9+12 redecode@7.5+12 flush_window@9+12 redecode@7.5+12 flush_tail@16.5+7.5
+
+stream repeated_text_aligns_over_the_shared_audio_only 12 3
+audio 24 0.1
+tx flush_window 0 12 one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three
+tx flush_window 9 12 one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three
+tx flush_tail 18 6 one two three one two three one two three one two three one two three one two three
+= one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three
+calls flush_window@0+12 flush_window@9+12 flush_tail@18+6
+
+stream plausible_redecode_beats_a_sparse_window 12 3
+audio 24 0.1
+tx flush_window 0 12 a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 a14 a15 a16 a17 a18 a19 a20 a21 a22 a23 a24
+tx flush_window 9 12 a19 a20 a21 a22 a23 a24 b1 b2 b3 b4 b5 b6 b7 b8
+tx redecode 7.5 12 a16 a17 a18 a19 a20 a21 a22 a23 a24 b1 b2 b3 b4 b5 b6
+tx flush_tail 16.5 7.5 b5 b6 c1 c2 c3 c4 c5 c6 c7 c8 c9 c10 c11 c12
+= a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 a14 a15 a16 a17 a18 a19 a20 a21 a22 a23 a24 b1 b2 b3 b4 b5 b6 c1 c2 c3 c4 c5 c6 c7 c8 c9 c10 c11 c12
+calls flush_window@0+12 flush_window@9+12 redecode@7.5+12 flush_tail@16.5+7.5
+
+stream repeated_text_with_a_disagreement 12 3
+audio 24 0.1
+tx flush_window 0 12 one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three
+tx flush_window 9 12 different two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three
+tx flush_tail 18 6 one two three one two three one two three one two three one two three one two three
+= one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three
+calls flush_window@0+12 flush_window@9+12 flush_tail@18+6
+
+stream repeated_text_overlap_shorter_than_its_period 4 1
+audio 7 0.1
+tx flush_window 0 4 one two three one two three one two
+tx flush_window 3 4 one two three one two three one two
+tx flush_tail 6 1 one two
+= one two three one two three one two three one two three one two
+calls flush_window@0+4 flush_window@3+4 flush_tail@6+1
+
+stream repeated_text_with_an_insertion 12 3
+audio 24 0.1
+tx flush_window 0 12 one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three
+tx flush_window 9 12 one extra two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three
+tx flush_tail 18 6 one two three one two three one two three one two three one two three one two three
+= one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three one two three
+calls flush_window@0+12 flush_window@9+12 flush_tail@18+6
+
+stream repeated_text_with_punctuation 12 3
+audio 24 0.1
+tx flush_window 0 12 one -- two three one -- two three one -- two three one -- two three one -- two three one -- two three one -- two three one -- two three one -- two three
+tx flush_window 9 12 one -- two three one -- two three one -- two three one -- two three one -- two three one -- two three one -- two three one -- two three one -- two three
+tx flush_tail 18 6 one -- two three one -- two three one -- two three one -- two three one --
+= one -- two three one -- two three one -- two three one -- two three one -- two three one -- two three one -- two three one -- two three one -- two three one -- two three one -- two three one -- two three one -- two three one -- two three one -- two three one -- two three one -- two three one -- two three one --
+calls flush_window@0+12 flush_window@9+12 flush_tail@18+6

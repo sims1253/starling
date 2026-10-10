@@ -190,6 +190,10 @@ if(STARLING_GGML_TESTS)
           ${STARLING_REPO_ROOT}/cpp/serve)
       find_package(Threads REQUIRED)
       target_link_libraries(${test_name} PRIVATE Threads::Threads)
+      # Replays tests/fixtures/stream_stitch_cases.txt (parity with the
+      # Python stitcher, issue #357).
+      target_compile_definitions(${test_name} PRIVATE
+          STARLING_REPO_ROOT="${STARLING_REPO_ROOT}")
     endif()
 
     # The audio_parser_test covers the pure WAV/multipart parsers in

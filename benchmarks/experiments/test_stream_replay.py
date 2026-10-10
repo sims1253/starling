@@ -163,6 +163,77 @@ class AggregateTest(unittest.TestCase):
         self.assertEqual(sr._aggregate(runs[:1])["short"]["first_partial_wall_s_median"], 1.2)
 
 
+class LocateErrorsTest(unittest.TestCase):
+    UTTS = [{"text": "one two three four", "start_s": 0.0, "end_s": 4.0},
+            {"text": "five six seven eight", "start_s": 10.0, "end_s": 14.0}]
+    REF = "one two three four five six seven eight"
+    CALLS = [{"kind": "window", "start_s": 0.0, "end_s": 12.0, "result": "ok"},
+             {"kind": "preview", "start_s": 9.0, "end_s": 11.0, "result": "ok"},
+             {"kind": "flush_tail", "start_s": 9.0, "end_s": 14.0, "result": "ok"},
+             {"kind": "redecode", "start_s": 7.5, "end_s": 14.0, "result": "ok"}]
+
+    def test_omission_placed_in_the_take(self):
+        out = sr.locate_errors(self.REF, "one two three four seven eight", self.UTTS,
+                               self.REF, self.CALLS)
+        self.assertEqual((out["omitted_words"], out["inserted_words"]), (2, 0))
+        (span,) = out["spans"]
+        self.assertEqual(span["omitted"], "five six")
+        # "five" is spread over 10-14 s: 10.5 s, inside the overlap of the
+        # window with the tail commitment, which spans its re-decode from
+        # 7.5 s (previews do not count).
+        self.assertEqual((span["t_s"], span["where"], span["overlap_s"]),
+                         (10.5, "overlap", [7.5, 12.0]))
+        # Candidates of one commitment do not overlap each other: a first
+        # window re-decoded shorter leaves 2.5 s outside any overlap.
+        first = [{"kind": "window", "start_s": 0.0, "end_s": 12.0},
+                 {"kind": "redecode", "start_s": 0.0, "end_s": 10.5}]
+        out = sr.locate_errors("one two three four", "one three four",
+                               [{"text": "one two three four", "start_s": 0.0, "end_s": 10.0}],
+                               "one two three four", first)
+        self.assertEqual((out["spans"][0]["where"], out["spans"][0]["overlap_s"]),
+                         ("window", None))
+        # A window retried after a busy re-decode is the same commitment.
+        retried = [{"kind": "window", "start_s": 0.0, "end_s": 12.0},
+                   {"kind": "window", "start_s": 9.0, "end_s": 21.0},
+                   {"kind": "redecode", "start_s": 7.5, "end_s": 19.5, "result": "busy"},
+                   {"kind": "window", "start_s": 9.0, "end_s": 21.0},
+                   {"kind": "redecode", "start_s": 7.5, "end_s": 19.5}]
+        out = sr.locate_errors("one two three four", "one three four",
+                               [{"text": "one two three four", "start_s": 13.0, "end_s": 17.0}],
+                               "one two three four", retried)
+        self.assertEqual((out["spans"][0]["t_s"], out["spans"][0]["where"]), (14.5, "window"))
+
+    def test_duplicated_run_and_far_errors(self):
+        out = sr.locate_errors(self.REF, "One, two two three four five six seven eight",
+                               self.UTTS, self.REF, self.CALLS)
+        self.assertEqual((out["inserted_words"], out["duplicated_words"]), (1, 1))
+        self.assertEqual(out["spans"][0]["where"], "window")  # 1.5 s: far from 9-12 s
+        out = sr.locate_errors(self.REF, "one two three four five six seven eight nine",
+                               self.UTTS, self.REF, self.CALLS)
+        self.assertEqual((out["inserted_words"], out["duplicated_words"]), (1, 0))
+        self.assertEqual(sr.locate_errors(self.REF, self.REF, self.UTTS, self.REF,
+                                          self.CALLS)["spans"], [])
+
+    def test_take_metrics_reports_vs_batch_and_loops(self):
+        loop = "a little bit of " * 5
+        log = _log(partials=[(1.2, {"text": "hello " + loop, "trace": {"covered_s": 1.0}}),
+                             (2.3, {"text": "hello there", "trace": {"covered_s": 2.0}})],
+                   final=(4.4, {"text": "hello there", "duration_s": 4.0, "trace": FINAL_TRACE}))
+        m = sr.take_metrics(log, "hello there you", "hello there you",
+                            [{"text": "hello there you", "start_s": 0.0, "end_s": 3.0}])
+        self.assertEqual(m["vs_batch"]["omitted_words"], 1)
+        self.assertEqual((m["looping_partials"], m["longest_partial_loop_words"]), (1, 20))
+        agg = sr._aggregate([{**m, "take": "short"}])["short"]
+        self.assertEqual((agg["omitted_vs_batch_median"], agg["looping_partials_total"]), (1, 1))
+        self.assertIsNone(sr._aggregate([{**sr.take_metrics(log, "hello", None),
+                                          "take": "x"}])["x"]["omitted_vs_batch_median"])
+
+    def test_longest_loop_needs_four_repeats(self):
+        self.assertEqual(sr.longest_loop("a b a b a b a b c".split()), 8)
+        self.assertEqual(sr.longest_loop("no no no no no".split()), 0)  # under 8 words
+        self.assertEqual(sr.longest_loop("x y z x y z x y z".split()), 0)  # three repeats
+
+
 class CheckTest(unittest.TestCase):
     def test_rules(self):
         prov = {"provenance": {"workload_manifest_sha256": "w1"}}

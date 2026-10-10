@@ -1,0 +1,1197 @@
+{
+ "version": 1,
+ "label": "stitch-base-default",
+ "provenance": {
+  "repo_revision": "0a0885bef96a69bf78b121c8e491598bc893c9bc",
+  "binary": "/home/m0hawk/.t3/worktrees/starling/m8-357-stitch-base/build-base/starling-serve",
+  "binary_sha256": "6314e940bec037f2ea7edc33a7471fcd6cc97a3359e739581ec04ebf00b2366c",
+  "model": "/home/m0hawk/Documents/starling/models/parakeet-tdt-0.6b-v3-q8_0.gguf",
+  "model_sha256": "fff8a2595dc78cc37f165cb889f61bec65598021d5ce8ced2431abacadcb8fef",
+  "model_slug": "parakeet",
+  "server_args": [],
+  "query": "trace=1",
+  "frame_ms": 100.0,
+  "warmup": true,
+  "runtime": {
+   "hardware": "AMD Ryzen 5 PRO 5650U with Radeon Graphics",
+   "driver": "unavailable"
+  },
+  "workload_manifest_sha256": "73d9d403b71ade2ed662a4cecd4861f8bc08958c4473bf358354e21525270264",
+  "env": {}
+ },
+ "runs": [
+  {
+   "duration_s": 10.4,
+   "errors": [],
+   "busy_commit_retries": 0,
+   "first_partial": {
+    "wall_s": 1.188,
+    "audio_sent_s": 1.1,
+    "covered_s": 1.0
+   },
+   "partials": 10,
+   "revisions_per_min": 57.69,
+   "stable_violations": 0,
+   "looping_partials": 0,
+   "longest_partial_loop_words": 0,
+   "partial_age_ms": {
+    "n": 10,
+    "p50": 392.38556899363175,
+    "p95": 836.5355022462608,
+    "max": 863.7457579970942
+   },
+   "backlog_s": {
+    "n": 10,
+    "p50": 0.3500000000000001,
+    "p95": 0.7549999999999994,
+    "max": 0.7999999999999998
+   },
+   "stop_to_final_ms": 1066.0,
+   "final_duration_s": 10.4,
+   "audio_complete": true,
+   "work": {
+    "engine_calls": 11,
+    "engine_audio_per_audio_s": 5.038,
+    "engine_wall_per_audio_s": 0.5192,
+    "busy_calls": 0,
+    "reused_calls": 0,
+    "preempted_calls": 0,
+    "by_kind": {
+     "window": {
+      "calls": 0,
+      "engine_calls": 0,
+      "engine_audio_s": 0.0,
+      "engine_ms": 0.0,
+      "reused": 0,
+      "busy": 0,
+      "preempted": 0,
+      "preempted_ms": 0.0
+     },
+     "preview": {
+      "calls": 10,
+      "engine_calls": 10,
+      "engine_audio_s": 42.0,
+      "engine_ms": 4374.178,
+      "reused": 0,
+      "busy": 0,
+      "preempted": 0,
+      "preempted_ms": 0.0
+     },
+     "flush_window": {
+      "calls": 0,
+      "engine_calls": 0,
+      "engine_audio_s": 0.0,
+      "engine_ms": 0.0,
+      "reused": 0,
+      "busy": 0,
+      "preempted": 0,
+      "preempted_ms": 0.0
+     },
+     "flush_tail": {
+      "calls": 1,
+      "engine_calls": 1,
+      "engine_audio_s": 10.4,
+      "engine_ms": 1025.101,
+      "reused": 0,
+      "busy": 0,
+      "preempted": 0,
+      "preempted_ms": 0.0
+     }
+    }
+   },
+   "stop": {
+    "path": "tail",
+    "unfinalized_s": 10.4,
+    "engine_audio_s": 10.4,
+    "engine_ms": 1025.101
+   },
+   "wer_final_vs_ref": 0.0,
+   "wer_batch_vs_ref": 0.0,
+   "wer_final_vs_batch": 0.0,
+   "final_text": "He has grave doubts whether Sir Frederick Leighton's work is really Greek after all, and can discover in it but little of Rocky Ithaca.",
+   "batch_text": "He has grave doubts whether Sir Frederick Leighton's work is really Greek after all, and can discover in it but little of Rocky Ithaca.",
+   "vs_batch": {
+    "omitted_words": 0,
+    "inserted_words": 0,
+    "duplicated_words": 0,
+    "substituted_words": 0,
+    "overlap_spans": 0,
+    "spans": []
+   },
+   "take": "short",
+   "repeat": 0,
+   "state": "warm",
+   "batch_ms": 656.5,
+   "server_load_s": 1.32
+  },
+  {
+   "duration_s": 66.355,
+   "errors": [],
+   "busy_commit_retries": 0,
+   "first_partial": {
+    "wall_s": 1.336,
+    "audio_sent_s": 1.3,
+    "covered_s": 1.0
+   },
+   "partials": 60,
+   "revisions_per_min": 44.31,
+   "stable_violations": 0,
+   "looping_partials": 0,
+   "longest_partial_loop_words": 0,
+   "partial_age_ms": {
+    "n": 60,
+    "p50": 499.14527899818495,
+    "p95": 703.9114788032747,
+    "max": 973.3709329957492
+   },
+   "backlog_s": {
+    "n": 60,
+    "p50": 0.4000000000000057,
+    "p95": 0.6999999999999995,
+    "max": 0.9000000000000004
+   },
+   "stop_to_final_ms": 626.0,
+   "final_duration_s": 66.355,
+   "audio_complete": true,
+   "work": {
+    "engine_calls": 61,
+    "engine_audio_per_audio_s": 7.063,
+    "engine_wall_per_audio_s": 0.4703,
+    "busy_calls": 0,
+    "reused_calls": 0,
+    "preempted_calls": 3,
+    "by_kind": {
+     "window": {
+      "calls": 7,
+      "engine_calls": 7,
+      "engine_audio_s": 84.0,
+      "engine_ms": 4708.633,
+      "reused": 0,
+      "busy": 0,
+      "preempted": 0,
+      "preempted_ms": 0.0
+     },
+     "preview": {
+      "calls": 56,
+      "engine_calls": 53,
+      "engine_audio_s": 381.3,
+      "engine_ms": 24832.332,
+      "reused": 0,
+      "busy": 0,
+      "preempted": 3,
+      "preempted_ms": 1388.291
+     },
+     "flush_window": {
+      "calls": 0,
+      "engine_calls": 0,
+      "engine_audio_s": 0.0,
+      "engine_ms": 0.0,
+      "reused": 0,
+      "busy": 0,
+      "preempted": 0,
+      "preempted_ms": 0.0
+     },
+     "flush_tail": {
+      "calls": 1,
+      "engine_calls": 1,
+      "engine_audio_s": 3.355,
+      "engine_ms": 277.066,
+      "reused": 0,
+      "busy": 0,
+      "preempted": 0,
+      "preempted_ms": 0.0
+     }
+    }
+   },
+   "stop": {
+    "path": "tail",
+    "unfinalized_s": 3.355,
+    "engine_audio_s": 3.355,
+    "engine_ms": 277.066
+   },
+   "wer_final_vs_ref": 0.1523,
+   "wer_batch_vs_ref": 0.0331,
+   "wer_final_vs_batch": 0.1333,
+   "final_text": "mister Quilter is the apostle of the middle classes, and we are glad to welcome his gospel. Nor is mister Quilter's manner less interesting than his matter. Beef looming before us, similes drawn from eating and its results occur most readily to the mind. He has grave doubts whether Sir Frederick Leighton's work is really Greek. after all, and can discover in it but little of Rocky Ithaca. Linnell's pictures are a sort of upguards and atom paintings, and Mason's exquisite idols are as national as a jingo poem. Mr Burkett Foster's landscapes smile at one much in the same way that Mr Carker used to flash his teeth. And mister John Collier gives his sitter a cheerful slap on the back, before he says, like a shampooer in a Turkish bath, Next man.",
+   "batch_text": "mister Quilter is the apostle of the middle classes, and we are glad to welcome his gospel. Nor is mister Quilter's manner less interesting than his matter. He tells us that at this festive season of the year, with Christmas and roast beef looming before us, similes drawn from eating and its results occur most readily to the mind. He has grave doubts whether Sir Frederick Leighton's work is really Greek after all, and can discover in it but little of Rocky Ithaca. Linnell's pictures are a sort of up guards an atom paintings, and Mason's exquisite idols are as national as a jingo poem. mister Burkett Foster's landscapes smile at one much in the same way that mister Carker used to flash his teeth. And mister John Collier gives his sitter a cheerful slap on the back, before he says, like a shampooer in a Turkish bath, Next Man",
+   "vs_batch": {
+    "omitted_words": 16,
+    "inserted_words": 0,
+    "duplicated_words": 0,
+    "substituted_words": 4,
+    "overlap_spans": 3,
+    "spans": [
+     {
+      "t_s": 12.57,
+      "where": "overlap",
+      "overlap_s": [
+       9.0,
+       12.0
+      ],
+      "omitted": "he tells us that at this festive season of the year with christmas and roast",
+      "inserted": "",
+      "duplicated": false,
+      "substituted": 0
+     },
+     {
+      "t_s": 39.15,
+      "where": "overlap",
+      "overlap_s": [
+       36.0,
+       39.0
+      ],
+      "omitted": "up",
+      "inserted": "",
+      "duplicated": false,
+      "substituted": 2
+     },
+     {
+      "t_s": 46.5,
+      "where": "overlap",
+      "overlap_s": [
+       45.0,
+       48.0
+      ],
+      "omitted": "",
+      "inserted": "",
+      "duplicated": false,
+      "substituted": 1
+     },
+     {
+      "t_s": 52.12,
+      "where": "window",
+      "overlap_s": [
+       54.0,
+       57.0
+      ],
+      "omitted": "",
+      "inserted": "",
+      "duplicated": false,
+      "substituted": 1
+     }
+    ]
+   },
+   "take": "medium",
+   "repeat": 0,
+   "state": "warm",
+   "batch_ms": 3583.9,
+   "server_load_s": 1.32
+  },
+  {
+   "duration_s": 366.915,
+   "errors": [],
+   "busy_commit_retries": 0,
+   "first_partial": {
+    "wall_s": 1.151,
+    "audio_sent_s": 1.1,
+    "covered_s": 1.0
+   },
+   "partials": 337,
+   "revisions_per_min": 39.25,
+   "stable_violations": 0,
+   "looping_partials": 1,
+   "longest_partial_loop_words": 380,
+   "partial_age_ms": {
+    "n": 337,
+    "p50": 495.97789899416966,
+    "p95": 747.7252405980835,
+    "max": 1001.0828079975909
+   },
+   "backlog_s": {
+    "n": 337,
+    "p50": 0.4000000000000341,
+    "p95": 0.6999999999999886,
+    "max": 1.0
+   },
+   "stop_to_final_ms": 471.2,
+   "final_duration_s": 366.915,
+   "audio_complete": true,
+   "work": {
+    "engine_calls": 338,
+    "engine_audio_per_audio_s": 7.461,
+    "engine_wall_per_audio_s": 0.4656,
+    "busy_calls": 0,
+    "reused_calls": 0,
+    "preempted_calls": 15,
+    "by_kind": {
+     "window": {
+      "calls": 40,
+      "engine_calls": 40,
+      "engine_audio_s": 480.0,
+      "engine_ms": 27133.961,
+      "reused": 0,
+      "busy": 0,
+      "preempted": 0,
+      "preempted_ms": 0.0
+     },
+     "preview": {
+      "calls": 312,
+      "engine_calls": 297,
+      "engine_audio_s": 2250.8,
+      "engine_ms": 137052.301,
+      "reused": 0,
+      "busy": 0,
+      "preempted": 15,
+      "preempted_ms": 6237.727
+     },
+     "flush_window": {
+      "calls": 0,
+      "engine_calls": 0,
+      "engine_audio_s": 0.0,
+      "engine_ms": 0.0,
+      "reused": 0,
+      "busy": 0,
+      "preempted": 0,
+      "preempted_ms": 0.0
+     },
+     "flush_tail": {
+      "calls": 1,
+      "engine_calls": 1,
+      "engine_audio_s": 6.915,
+      "engine_ms": 412.32,
+      "reused": 0,
+      "busy": 0,
+      "preempted": 0,
+      "preempted_ms": 0.0
+     }
+    }
+   },
+   "stop": {
+    "path": "tail",
+    "unfinalized_s": 6.915,
+    "engine_audio_s": 6.915,
+    "engine_ms": 412.32
+   },
+   "wer_final_vs_ref": 0.1717,
+   "wer_batch_vs_ref": 0.0422,
+   "wer_final_vs_batch": 0.1419,
+   "final_text": "mister Quilter is the apostle of the year, with Christmas and roast beef looming before us, similes drawn from eating and its results occur most readily to the mind. He has grave doubts whether Sir Frederick Leighton's work is really Greek after all, and can discover in it but little of Rocky Ithaca. Linnell's pictures are a sort of up guards and atom paintings, and Mason's exquisite idols are as national as a jingo poem. Mr Burkett Foster's landscapes smile at one much in the same way that Mr Carker used to flash his teeth. And Mr John Collier gives his sitter a cheerful slap on the back, before he says, like a shampooer in a Turkish bath, Next man. It is obviously unnecessary for us to point out how luminous these criticisms are, how delicate in expression. On the general principles of art, mister Quilter writes with equal lucidity. Painting, he tells us, is of a different quality to mathematics, and finish in art is adding more fact. Fact. As for etchings, they are of two kinds, British and foreign. He laments most bitterly the divorce that has been made between decorative art and what we usually call pictures, makes a customary appeal to the Last Judgment and reminds us that in the great days of art Michelangelo was the furnishing upholsterer near the fire, and the ornaments Fred brought home from India on the mantle board. In fact, he is quite severe on Mr Ruskin for not recognizing that a picture should denote the frailty of man, and remarks with pleasing courtesy and felicitous grace that many phases of feeling. Only, unfortunately, his own work never does get good. Mr. Quilter has missed his chance, for he has failed even to make himself the tupper of painting. By Harry Quilter, M.A. Because you are sleeping instead of conquering, the lovely rose He has gone and gone for good, answered Polychrome, who had managed to squeeze into the room beside the dragon, and had witnessed the occurrences with much interest. I have remained a prisoner only because I wished to be one. and burst the stout chains as easily as if they had been threads. The little girl had been asleep, but she heard the raps and opened the door. The king has fled in disgrace, and your friends are asking for you. I begged Ruggedot long ago to send him away, but he would not do so. I also offered to help your brother to escape, but he would not go. He eats and sleeps very steadily, replied the new king. I hope he doesn't work at all. In fact, there's nothing he can do in these dominions as well as our gnomes, whose numbers are so great that it worries us to keep them all busy. Not exactly, returned. Calico. Where is my brother now? inquired Shaggy. In the metal forest. Where is that? The Metal Forest is in the great domed cavern, the largest in all our dominions, replied calico. Calico hesitated. However, if we look sharp, we may be able to discover one of these secret ways. Funny, remarked Betsy thoughtfully. I don't believe Anne knew any magic, or she'd have worked it before. I do not know, confessed Shaggy. True, agreed Calico. Calico went to the big gong and then sat in the throne, wearing Ruggeda's discarded ruby crown, and holding in his hand the scepter which Ruggedaud had so often thrown at his head. A man said to the universe, Sir, I exist. Sweat covered Brian's body, trickling into the tight loin cloth that was the only garment he wore. The cut on his chest still dripping blood, the ache of his overstrained eyes, even the soaring arena around him with the thousands of spectators. were trivialities not worth thinking about.",
+   "batch_text": "Mr Quilter is the apostle of the middle classes, and we are glad to welcome his gospel. Nor is mister Quilter's manner less interesting than his matter. He tells us that at this festive season of the year, with Christmas and roast beef looming before us, similes drawn from eating and its results occur most readily to the mind. He has grave doubts whether Sir Frederick Leighton's work is really Greek after all, and can discover in it but little of Rocky Ithaca. Linnell's pictures are a sort of up guards and atom paintings, and Mason's exquisite idols are as national as a jingo poem. Mr Burkett Foster's landscapes smile at one much in the same way that Mr. Carker used to flash his teeth. And Mr John Collier gives his sitter a cheerful slap on the back, before he says, like a shampooer in a Turkish bath, Next Man. It is obviously unnecessary for us to point out how luminous these criticisms are, how delicate in expression. On the general principles of art, Mr Quilter writes with equal lucidity. Painting, he tells us, is of a different quality to mathematics, and finish in art is adding more fact. As for etchings, they are of two kinds, British and foreign. He laments most bitterly the divorce that has been made between decorative art and what we usually call pictures, makes a customary appeal to the last judgment and reminds us that in the great days of art Michelangelo was the furnishing upholsterer. Near the fire, and the ornaments Fred brought home from India on the mantle board. In fact, he is quite severe on Mr Ruskin for not recognizing that a picture should denote the frailty of man, and remarks with pleasing courtesy and felicitous grace that many phases of feeling. Only, unfortunately, his own work never does get good. Mr Quilter has missed his chance, for he has failed even to make himself the tupper of painting. By Harry Quilter, M.A. Because you were sleeping instead of conquering, the lovely rose princess has become a fiddle without a bow, while poor Shaggy sits there a cooing dove. He has gone and gone for good, answered Polychrome, who had managed to squeeze into the room beside the dragon, and had witnessed the occurrences with much interest. I have remained a prisoner only because I wished to be one. And with this he stepped forward and burst the stout chains as easily as if they had been threads. The little girl had been asleep, but she heard the raps and opened the door. The king is fled in disgrace, and your friends are asking for you. I begged Ruggedo long ago to send him away, but he would not do so. I also offered to help your brother to escape, but he would not go. He eats and sleeps very steadily, replied the new king. I hope he doesn't work too hard, said Shaggy. He doesn't work at all. In fact, there is nothing he can do in these dominions as well as our gnomes, whose numbers are so great that it worries us to keep them all busy. Not exactly, returned Calico. Where is my brother now? inquired Shaggy. In the metal forest. Where is that? The Metal Forest is in the great domed cavern, the largest in all our dominions, replied Calico. Calico hesitated. However, if we look sharp, we may be able to discover one of these secret ways. Oh no, I'm quite sure he didn't. That's funny, remarked Betsy thoughtfully. I don't believe Anne knew any magic, or she'd have worked it before. I do not know, confessed Shaggy. True, agreed Calico. Calico went to the big gong and pounded on it just as Rugdo used to do, but no one answered the summons. Having returned to the royal cavern, Calico first pounded the gong, and then sat in the throne, wearing Rugado's discarded ruby crown, and holding in his hand the scepter which Ruggedo had so often thrown at his head. A man said to the universe, Sir, I exist. Sweat covered Brian's body, trickling into the tight loin cloth that was the only garment he wore. The cut on his chest, still dripping blood, the ache of his overstrained eyes, even the soaring arena around him with the thousands of spectators, were trivialities not worth thinking about.",
+   "vs_batch": {
+    "omitted_words": 95,
+    "inserted_words": 1,
+    "duplicated_words": 1,
+    "substituted_words": 8,
+    "overlap_spans": 7,
+    "spans": [
+     {
+      "t_s": 0.17,
+      "where": "window",
+      "overlap_s": [
+       9.0,
+       12.0
+      ],
+      "omitted": "",
+      "inserted": "",
+      "duplicated": false,
+      "substituted": 1
+     },
+     {
+      "t_s": 1.89,
+      "where": "window",
+      "overlap_s": [
+       9.0,
+       12.0
+      ],
+      "omitted": "of the middle classes and we are glad to welcome his gospel nor is mister quilter's manner less interesting than his matter he tells us that at this festive season",
+      "inserted": "",
+      "duplicated": false,
+      "substituted": 0
+     },
+     {
+      "t_s": 78.47,
+      "where": "window",
+      "overlap_s": [
+       81.0,
+       84.0
+      ],
+      "omitted": "",
+      "inserted": "",
+      "duplicated": false,
+      "substituted": 1
+     },
+     {
+      "t_s": 90.26,
+      "where": "overlap",
+      "overlap_s": [
+       90.0,
+       93.0
+      ],
+      "omitted": "",
+      "inserted": "fact",
+      "duplicated": true,
+      "substituted": 0
+     },
+     {
+      "t_s": 161.77,
+      "where": "overlap",
+      "overlap_s": [
+       162.0,
+       165.0
+      ],
+      "omitted": "",
+      "inserted": "",
+      "duplicated": false,
+      "substituted": 1
+     },
+     {
+      "t_s": 165.12,
+      "where": "overlap",
+      "overlap_s": [
+       162.0,
+       165.0
+      ],
+      "omitted": "princess has become a fiddle without a bow while poor shaggy sits there a cooing dove",
+      "inserted": "",
+      "duplicated": false,
+      "substituted": 0
+     },
+     {
+      "t_s": 195.31,
+      "where": "window",
+      "overlap_s": [
+       198.0,
+       201.0
+      ],
+      "omitted": "and with this he stepped forward",
+      "inserted": "",
+      "duplicated": false,
+      "substituted": 0
+     },
+     {
+      "t_s": 210.04,
+      "where": "overlap",
+      "overlap_s": [
+       207.0,
+       210.0
+      ],
+      "omitted": "",
+      "inserted": "",
+      "duplicated": false,
+      "substituted": 1
+     },
+     {
+      "t_s": 215.21,
+      "where": "overlap",
+      "overlap_s": [
+       216.0,
+       219.0
+      ],
+      "omitted": "",
+      "inserted": "",
+      "duplicated": false,
+      "substituted": 1
+     },
+     {
+      "t_s": 229.74,
+      "where": "window",
+      "overlap_s": [
+       225.0,
+       228.0
+      ],
+      "omitted": "he doesn't work too hard said shaggy",
+      "inserted": "",
+      "duplicated": false,
+      "substituted": 0
+     },
+     {
+      "t_s": 243.29,
+      "where": "overlap",
+      "overlap_s": [
+       243.0,
+       246.0
+      ],
+      "omitted": "there",
+      "inserted": "",
+      "duplicated": false,
+      "substituted": 1
+     },
+     {
+      "t_s": 292.51,
+      "where": "window",
+      "overlap_s": [
+       288.0,
+       291.0
+      ],
+      "omitted": "oh no i'm quite sure he didn't that's",
+      "inserted": "",
+      "duplicated": false,
+      "substituted": 0
+     },
+     {
+      "t_s": 313.94,
+      "where": "window",
+      "overlap_s": [
+       315.0,
+       318.0
+      ],
+      "omitted": "gong and pounded on it just as rugdo used to do but no one answered the summons having returned to the royal cavern calico first pounded the",
+      "inserted": "",
+      "duplicated": false,
+      "substituted": 0
+     },
+     {
+      "t_s": 327.2,
+      "where": "overlap",
+      "overlap_s": [
+       324.0,
+       327.0
+      ],
+      "omitted": "",
+      "inserted": "",
+      "duplicated": false,
+      "substituted": 1
+     },
+     {
+      "t_s": 331.77,
+      "where": "window",
+      "overlap_s": [
+       333.0,
+       336.0
+      ],
+      "omitted": "",
+      "inserted": "",
+      "duplicated": false,
+      "substituted": 1
+     }
+    ]
+   },
+   "take": "long",
+   "repeat": 0,
+   "state": "warm",
+   "batch_ms": 37599.2,
+   "server_load_s": 1.32
+  },
+  {
+   "duration_s": 10.4,
+   "errors": [],
+   "busy_commit_retries": 0,
+   "first_partial": {
+    "wall_s": 1.156,
+    "audio_sent_s": 1.1,
+    "covered_s": 1.0
+   },
+   "partials": 12,
+   "revisions_per_min": 69.23,
+   "stable_violations": 0,
+   "looping_partials": 0,
+   "longest_partial_loop_words": 0,
+   "partial_age_ms": {
+    "n": 12,
+    "p50": 337.5102234967926,
+    "p95": 483.1721213929995,
+    "max": 519.9262079913751
+   },
+   "backlog_s": {
+    "n": 12,
+    "p50": 0.2999999999999998,
+    "p95": 0.4450000000000001,
+    "max": 0.5
+   },
+   "stop_to_final_ms": 670.2,
+   "final_duration_s": 10.4,
+   "audio_complete": true,
+   "work": {
+    "engine_calls": 13,
+    "engine_audio_per_audio_s": 6.298,
+    "engine_wall_per_audio_s": 0.4798,
+    "busy_calls": 0,
+    "reused_calls": 0,
+    "preempted_calls": 1,
+    "by_kind": {
+     "window": {
+      "calls": 0,
+      "engine_calls": 0,
+      "engine_audio_s": 0.0,
+      "engine_ms": 0.0,
+      "reused": 0,
+      "busy": 0,
+      "preempted": 0,
+      "preempted_ms": 0.0
+     },
+     "preview": {
+      "calls": 13,
+      "engine_calls": 12,
+      "engine_audio_s": 55.1,
+      "engine_ms": 3920.191,
+      "reused": 0,
+      "busy": 0,
+      "preempted": 1,
+      "preempted_ms": 429.606
+     },
+     "flush_window": {
+      "calls": 0,
+      "engine_calls": 0,
+      "engine_audio_s": 0.0,
+      "engine_ms": 0.0,
+      "reused": 0,
+      "busy": 0,
+      "preempted": 0,
+      "preempted_ms": 0.0
+     },
+     "flush_tail": {
+      "calls": 1,
+      "engine_calls": 1,
+      "engine_audio_s": 10.4,
+      "engine_ms": 640.036,
+      "reused": 0,
+      "busy": 0,
+      "preempted": 0,
+      "preempted_ms": 0.0
+     }
+    }
+   },
+   "stop": {
+    "path": "tail",
+    "unfinalized_s": 10.4,
+    "engine_audio_s": 10.4,
+    "engine_ms": 640.036
+   },
+   "wer_final_vs_ref": 0.0,
+   "wer_batch_vs_ref": 0.0,
+   "wer_final_vs_batch": 0.0,
+   "final_text": "He has grave doubts whether Sir Frederick Leighton's work is really Greek after all, and can discover in it but little of Rocky Ithaca.",
+   "batch_text": "He has grave doubts whether Sir Frederick Leighton's work is really Greek after all, and can discover in it but little of Rocky Ithaca.",
+   "vs_batch": {
+    "omitted_words": 0,
+    "inserted_words": 0,
+    "duplicated_words": 0,
+    "substituted_words": 0,
+    "overlap_spans": 0,
+    "spans": []
+   },
+   "take": "short",
+   "repeat": 1,
+   "state": "warm",
+   "batch_ms": 677.8,
+   "server_load_s": 0.91
+  },
+  {
+   "duration_s": 66.355,
+   "errors": [],
+   "busy_commit_retries": 0,
+   "first_partial": {
+    "wall_s": 1.149,
+    "audio_sent_s": 1.1,
+    "covered_s": 1.0
+   },
+   "partials": 63,
+   "revisions_per_min": 46.12,
+   "stable_violations": 0,
+   "looping_partials": 0,
+   "longest_partial_loop_words": 0,
+   "partial_age_ms": {
+    "n": 63,
+    "p50": 491.03950500284554,
+    "p95": 751.2786262035661,
+    "max": 1082.2083300008671
+   },
+   "backlog_s": {
+    "n": 63,
+    "p50": 0.40000000000000213,
+    "p95": 0.7000000000000025,
+    "max": 1.0
+   },
+   "stop_to_final_ms": 599.4,
+   "final_duration_s": 66.355,
+   "audio_complete": true,
+   "work": {
+    "engine_calls": 64,
+    "engine_audio_per_audio_s": 7.37,
+    "engine_wall_per_audio_s": 0.4728,
+    "busy_calls": 0,
+    "reused_calls": 0,
+    "preempted_calls": 3,
+    "by_kind": {
+     "window": {
+      "calls": 7,
+      "engine_calls": 7,
+      "engine_audio_s": 84.0,
+      "engine_ms": 4787.395,
+      "reused": 0,
+      "busy": 0,
+      "preempted": 0,
+      "preempted_ms": 0.0
+     },
+     "preview": {
+      "calls": 59,
+      "engine_calls": 56,
+      "engine_audio_s": 401.7,
+      "engine_ms": 25157.037,
+      "reused": 0,
+      "busy": 0,
+      "preempted": 3,
+      "preempted_ms": 1177.782
+     },
+     "flush_window": {
+      "calls": 0,
+      "engine_calls": 0,
+      "engine_audio_s": 0.0,
+      "engine_ms": 0.0,
+      "reused": 0,
+      "busy": 0,
+      "preempted": 0,
+      "preempted_ms": 0.0
+     },
+     "flush_tail": {
+      "calls": 1,
+      "engine_calls": 1,
+      "engine_audio_s": 3.355,
+      "engine_ms": 250.753,
+      "reused": 0,
+      "busy": 0,
+      "preempted": 0,
+      "preempted_ms": 0.0
+     }
+    }
+   },
+   "stop": {
+    "path": "tail",
+    "unfinalized_s": 3.355,
+    "engine_audio_s": 3.355,
+    "engine_ms": 250.753
+   },
+   "wer_final_vs_ref": 0.1523,
+   "wer_batch_vs_ref": 0.0331,
+   "wer_final_vs_batch": 0.1333,
+   "final_text": "mister Quilter is the apostle of the middle classes, and we are glad to welcome his gospel. Nor is mister Quilter's manner less interesting than his matter. Beef looming before us, similes drawn from eating and its results occur most readily to the mind. He has grave doubts whether Sir Frederick Leighton's work is really Greek. after all, and can discover in it but little of Rocky Ithaca. Linnell's pictures are a sort of upguards and atom paintings, and Mason's exquisite idols are as national as a jingo poem. Mr Burkett Foster's landscapes smile at one much in the same way that Mr Carker used to flash his teeth. And mister John Collier gives his sitter a cheerful slap on the back, before he says, like a shampooer in a Turkish bath, Next man.",
+   "batch_text": "mister Quilter is the apostle of the middle classes, and we are glad to welcome his gospel. Nor is mister Quilter's manner less interesting than his matter. He tells us that at this festive season of the year, with Christmas and roast beef looming before us, similes drawn from eating and its results occur most readily to the mind. He has grave doubts whether Sir Frederick Leighton's work is really Greek after all, and can discover in it but little of Rocky Ithaca. Linnell's pictures are a sort of up guards an atom paintings, and Mason's exquisite idols are as national as a jingo poem. mister Burkett Foster's landscapes smile at one much in the same way that mister Carker used to flash his teeth. And mister John Collier gives his sitter a cheerful slap on the back, before he says, like a shampooer in a Turkish bath, Next Man",
+   "vs_batch": {
+    "omitted_words": 16,
+    "inserted_words": 0,
+    "duplicated_words": 0,
+    "substituted_words": 4,
+    "overlap_spans": 3,
+    "spans": [
+     {
+      "t_s": 12.57,
+      "where": "overlap",
+      "overlap_s": [
+       9.0,
+       12.0
+      ],
+      "omitted": "he tells us that at this festive season of the year with christmas and roast",
+      "inserted": "",
+      "duplicated": false,
+      "substituted": 0
+     },
+     {
+      "t_s": 39.15,
+      "where": "overlap",
+      "overlap_s": [
+       36.0,
+       39.0
+      ],
+      "omitted": "up",
+      "inserted": "",
+      "duplicated": false,
+      "substituted": 2
+     },
+     {
+      "t_s": 46.5,
+      "where": "overlap",
+      "overlap_s": [
+       45.0,
+       48.0
+      ],
+      "omitted": "",
+      "inserted": "",
+      "duplicated": false,
+      "substituted": 1
+     },
+     {
+      "t_s": 52.12,
+      "where": "window",
+      "overlap_s": [
+       54.0,
+       57.0
+      ],
+      "omitted": "",
+      "inserted": "",
+      "duplicated": false,
+      "substituted": 1
+     }
+    ]
+   },
+   "take": "medium",
+   "repeat": 1,
+   "state": "warm",
+   "batch_ms": 3633.6,
+   "server_load_s": 0.91
+  },
+  {
+   "duration_s": 366.915,
+   "errors": [],
+   "busy_commit_retries": 0,
+   "first_partial": {
+    "wall_s": 1.14,
+    "audio_sent_s": 1.1,
+    "covered_s": 1.0
+   },
+   "partials": 322,
+   "revisions_per_min": 40.23,
+   "stable_violations": 0,
+   "looping_partials": 1,
+   "longest_partial_loop_words": 220,
+   "partial_age_ms": {
+    "n": 322,
+    "p50": 494.3714464970981,
+    "p95": 800.6132029011496,
+    "max": 1201.4854369990644
+   },
+   "backlog_s": {
+    "n": 322,
+    "p50": 0.4000000000000341,
+    "p95": 0.8000000000000107,
+    "max": 1.1999999999999886
+   },
+   "stop_to_final_ms": 447.5,
+   "final_duration_s": 366.915,
+   "audio_complete": true,
+   "work": {
+    "engine_calls": 323,
+    "engine_audio_per_audio_s": 7.113,
+    "engine_wall_per_audio_s": 0.4661,
+    "busy_calls": 0,
+    "reused_calls": 0,
+    "preempted_calls": 25,
+    "by_kind": {
+     "window": {
+      "calls": 40,
+      "engine_calls": 40,
+      "engine_audio_s": 480.0,
+      "engine_ms": 27510.071,
+      "reused": 0,
+      "busy": 0,
+      "preempted": 0,
+      "preempted_ms": 0.0
+     },
+     "preview": {
+      "calls": 307,
+      "engine_calls": 282,
+      "engine_audio_s": 2122.9,
+      "engine_ms": 131935.673,
+      "reused": 0,
+      "busy": 0,
+      "preempted": 25,
+      "preempted_ms": 11155.459
+     },
+     "flush_window": {
+      "calls": 0,
+      "engine_calls": 0,
+      "engine_audio_s": 0.0,
+      "engine_ms": 0.0,
+      "reused": 0,
+      "busy": 0,
+      "preempted": 0,
+      "preempted_ms": 0.0
+     },
+     "flush_tail": {
+      "calls": 1,
+      "engine_calls": 1,
+      "engine_audio_s": 6.915,
+      "engine_ms": 428.65,
+      "reused": 0,
+      "busy": 0,
+      "preempted": 0,
+      "preempted_ms": 0.0
+     }
+    }
+   },
+   "stop": {
+    "path": "tail",
+    "unfinalized_s": 6.915,
+    "engine_audio_s": 6.915,
+    "engine_ms": 428.65
+   },
+   "wer_final_vs_ref": 0.1717,
+   "wer_batch_vs_ref": 0.0422,
+   "wer_final_vs_batch": 0.1419,
+   "final_text": "mister Quilter is the apostle of the year, with Christmas and roast beef looming before us, similes drawn from eating and its results occur most readily to the mind. He has grave doubts whether Sir Frederick Leighton's work is really Greek after all, and can discover in it but little of Rocky Ithaca. Linnell's pictures are a sort of up guards and atom paintings, and Mason's exquisite idols are as national as a jingo poem. Mr Burkett Foster's landscapes smile at one much in the same way that Mr Carker used to flash his teeth. And Mr John Collier gives his sitter a cheerful slap on the back, before he says, like a shampooer in a Turkish bath, Next man. It is obviously unnecessary for us to point out how luminous these criticisms are, how delicate in expression. On the general principles of art, mister Quilter writes with equal lucidity. Painting, he tells us, is of a different quality to mathematics, and finish in art is adding more fact. Fact. As for etchings, they are of two kinds, British and foreign. He laments most bitterly the divorce that has been made between decorative art and what we usually call pictures, makes a customary appeal to the Last Judgment and reminds us that in the great days of art Michelangelo was the furnishing upholsterer near the fire, and the ornaments Fred brought home from India on the mantle board. In fact, he is quite severe on Mr Ruskin for not recognizing that a picture should denote the frailty of man, and remarks with pleasing courtesy and felicitous grace that many phases of feeling. Only, unfortunately, his own work never does get good. Mr. Quilter has missed his chance, for he has failed even to make himself the tupper of painting. By Harry Quilter, M.A. Because you are sleeping instead of conquering, the lovely rose He has gone and gone for good, answered Polychrome, who had managed to squeeze into the room beside the dragon, and had witnessed the occurrences with much interest. I have remained a prisoner only because I wished to be one. and burst the stout chains as easily as if they had been threads. The little girl had been asleep, but she heard the raps and opened the door. The king has fled in disgrace, and your friends are asking for you. I begged Ruggedot long ago to send him away, but he would not do so. I also offered to help your brother to escape, but he would not go. He eats and sleeps very steadily, replied the new king. I hope he doesn't work at all. In fact, there's nothing he can do in these dominions as well as our gnomes, whose numbers are so great that it worries us to keep them all busy. Not exactly, returned. Calico. Where is my brother now? inquired Shaggy. In the metal forest. Where is that? The Metal Forest is in the great domed cavern, the largest in all our dominions, replied calico. Calico hesitated. However, if we look sharp, we may be able to discover one of these secret ways. Funny, remarked Betsy thoughtfully. I don't believe Anne knew any magic, or she'd have worked it before. I do not know, confessed Shaggy. True, agreed Calico. Calico went to the big gong and then sat in the throne, wearing Ruggeda's discarded ruby crown, and holding in his hand the scepter which Ruggedaud had so often thrown at his head. A man said to the universe, Sir, I exist. Sweat covered Brian's body, trickling into the tight loin cloth that was the only garment he wore. The cut on his chest still dripping blood, the ache of his overstrained eyes, even the soaring arena around him with the thousands of spectators. were trivialities not worth thinking about.",
+   "batch_text": "Mr Quilter is the apostle of the middle classes, and we are glad to welcome his gospel. Nor is mister Quilter's manner less interesting than his matter. He tells us that at this festive season of the year, with Christmas and roast beef looming before us, similes drawn from eating and its results occur most readily to the mind. He has grave doubts whether Sir Frederick Leighton's work is really Greek after all, and can discover in it but little of Rocky Ithaca. Linnell's pictures are a sort of up guards and atom paintings, and Mason's exquisite idols are as national as a jingo poem. Mr Burkett Foster's landscapes smile at one much in the same way that Mr. Carker used to flash his teeth. And Mr John Collier gives his sitter a cheerful slap on the back, before he says, like a shampooer in a Turkish bath, Next Man. It is obviously unnecessary for us to point out how luminous these criticisms are, how delicate in expression. On the general principles of art, Mr Quilter writes with equal lucidity. Painting, he tells us, is of a different quality to mathematics, and finish in art is adding more fact. As for etchings, they are of two kinds, British and foreign. He laments most bitterly the divorce that has been made between decorative art and what we usually call pictures, makes a customary appeal to the last judgment and reminds us that in the great days of art Michelangelo was the furnishing upholsterer. Near the fire, and the ornaments Fred brought home from India on the mantle board. In fact, he is quite severe on Mr Ruskin for not recognizing that a picture should denote the frailty of man, and remarks with pleasing courtesy and felicitous grace that many phases of feeling. Only, unfortunately, his own work never does get good. Mr Quilter has missed his chance, for he has failed even to make himself the tupper of painting. By Harry Quilter, M.A. Because you were sleeping instead of conquering, the lovely rose princess has become a fiddle without a bow, while poor Shaggy sits there a cooing dove. He has gone and gone for good, answered Polychrome, who had managed to squeeze into the room beside the dragon, and had witnessed the occurrences with much interest. I have remained a prisoner only because I wished to be one. And with this he stepped forward and burst the stout chains as easily as if they had been threads. The little girl had been asleep, but she heard the raps and opened the door. The king is fled in disgrace, and your friends are asking for you. I begged Ruggedo long ago to send him away, but he would not do so. I also offered to help your brother to escape, but he would not go. He eats and sleeps very steadily, replied the new king. I hope he doesn't work too hard, said Shaggy. He doesn't work at all. In fact, there is nothing he can do in these dominions as well as our gnomes, whose numbers are so great that it worries us to keep them all busy. Not exactly, returned Calico. Where is my brother now? inquired Shaggy. In the metal forest. Where is that? The Metal Forest is in the great domed cavern, the largest in all our dominions, replied Calico. Calico hesitated. However, if we look sharp, we may be able to discover one of these secret ways. Oh no, I'm quite sure he didn't. That's funny, remarked Betsy thoughtfully. I don't believe Anne knew any magic, or she'd have worked it before. I do not know, confessed Shaggy. True, agreed Calico. Calico went to the big gong and pounded on it just as Rugdo used to do, but no one answered the summons. Having returned to the royal cavern, Calico first pounded the gong, and then sat in the throne, wearing Rugado's discarded ruby crown, and holding in his hand the scepter which Ruggedo had so often thrown at his head. A man said to the universe, Sir, I exist. Sweat covered Brian's body, trickling into the tight loin cloth that was the only garment he wore. The cut on his chest, still dripping blood, the ache of his overstrained eyes, even the soaring arena around him with the thousands of spectators, were trivialities not worth thinking about.",
+   "vs_batch": {
+    "omitted_words": 95,
+    "inserted_words": 1,
+    "duplicated_words": 1,
+    "substituted_words": 8,
+    "overlap_spans": 7,
+    "spans": [
+     {
+      "t_s": 0.17,
+      "where": "window",
+      "overlap_s": [
+       9.0,
+       12.0
+      ],
+      "omitted": "",
+      "inserted": "",
+      "duplicated": false,
+      "substituted": 1
+     },
+     {
+      "t_s": 1.89,
+      "where": "window",
+      "overlap_s": [
+       9.0,
+       12.0
+      ],
+      "omitted": "of the middle classes and we are glad to welcome his gospel nor is mister quilter's manner less interesting than his matter he tells us that at this festive season",
+      "inserted": "",
+      "duplicated": false,
+      "substituted": 0
+     },
+     {
+      "t_s": 78.47,
+      "where": "window",
+      "overlap_s": [
+       81.0,
+       84.0
+      ],
+      "omitted": "",
+      "inserted": "",
+      "duplicated": false,
+      "substituted": 1
+     },
+     {
+      "t_s": 90.26,
+      "where": "overlap",
+      "overlap_s": [
+       90.0,
+       93.0
+      ],
+      "omitted": "",
+      "inserted": "fact",
+      "duplicated": true,
+      "substituted": 0
+     },
+     {
+      "t_s": 161.77,
+      "where": "overlap",
+      "overlap_s": [
+       162.0,
+       165.0
+      ],
+      "omitted": "",
+      "inserted": "",
+      "duplicated": false,
+      "substituted": 1
+     },
+     {
+      "t_s": 165.12,
+      "where": "overlap",
+      "overlap_s": [
+       162.0,
+       165.0
+      ],
+      "omitted": "princess has become a fiddle without a bow while poor shaggy sits there a cooing dove",
+      "inserted": "",
+      "duplicated": false,
+      "substituted": 0
+     },
+     {
+      "t_s": 195.31,
+      "where": "window",
+      "overlap_s": [
+       198.0,
+       201.0
+      ],
+      "omitted": "and with this he stepped forward",
+      "inserted": "",
+      "duplicated": false,
+      "substituted": 0
+     },
+     {
+      "t_s": 210.04,
+      "where": "overlap",
+      "overlap_s": [
+       207.0,
+       210.0
+      ],
+      "omitted": "",
+      "inserted": "",
+      "duplicated": false,
+      "substituted": 1
+     },
+     {
+      "t_s": 215.21,
+      "where": "overlap",
+      "overlap_s": [
+       216.0,
+       219.0
+      ],
+      "omitted": "",
+      "inserted": "",
+      "duplicated": false,
+      "substituted": 1
+     },
+     {
+      "t_s": 229.74,
+      "where": "window",
+      "overlap_s": [
+       225.0,
+       228.0
+      ],
+      "omitted": "he doesn't work too hard said shaggy",
+      "inserted": "",
+      "duplicated": false,
+      "substituted": 0
+     },
+     {
+      "t_s": 243.29,
+      "where": "overlap",
+      "overlap_s": [
+       243.0,
+       246.0
+      ],
+      "omitted": "there",
+      "inserted": "",
+      "duplicated": false,
+      "substituted": 1
+     },
+     {
+      "t_s": 292.51,
+      "where": "window",
+      "overlap_s": [
+       288.0,
+       291.0
+      ],
+      "omitted": "oh no i'm quite sure he didn't that's",
+      "inserted": "",
+      "duplicated": false,
+      "substituted": 0
+     },
+     {
+      "t_s": 313.94,
+      "where": "window",
+      "overlap_s": [
+       315.0,
+       318.0
+      ],
+      "omitted": "gong and pounded on it just as rugdo used to do but no one answered the summons having returned to the royal cavern calico first pounded the",
+      "inserted": "",
+      "duplicated": false,
+      "substituted": 0
+     },
+     {
+      "t_s": 327.2,
+      "where": "overlap",
+      "overlap_s": [
+       324.0,
+       327.0
+      ],
+      "omitted": "",
+      "inserted": "",
+      "duplicated": false,
+      "substituted": 1
+     },
+     {
+      "t_s": 331.77,
+      "where": "window",
+      "overlap_s": [
+       333.0,
+       336.0
+      ],
+      "omitted": "",
+      "inserted": "",
+      "duplicated": false,
+      "substituted": 1
+     }
+    ]
+   },
+   "take": "long",
+   "repeat": 1,
+   "state": "warm",
+   "batch_ms": 36873.2,
+   "server_load_s": 0.91
+  }
+ ],
+ "aggregate": {
+  "short": {
+   "runs": 2,
+   "failed": 0,
+   "audio_complete_all": true,
+   "first_partial_missing": 0,
+   "first_partial_wall_s_median": 1.172,
+   "first_partial_wall_s_max": 1.188,
+   "partial_age_ms_p50_median": 364.9478962452122,
+   "partial_age_ms_p95_median": 659.8538118196301,
+   "partial_age_ms_max": 863.7457579970942,
+   "backlog_s_max": 0.7999999999999998,
+   "revisions_per_min_median": 63.46,
+   "stable_violations_total": 0,
+   "looping_partials_total": 0,
+   "omitted_vs_batch_median": 0.0,
+   "inserted_vs_batch_median": 0.0,
+   "duplicated_vs_batch_median": 0.0,
+   "engine_audio_per_audio_s_median": 5.668,
+   "engine_wall_per_audio_s_median": 0.4995,
+   "stop_to_final_ms_median": 868.1,
+   "stop_to_final_ms_max": 1066.0,
+   "stop_engine_audio_s_max": 10.4,
+   "stop_paths": [
+    "tail"
+   ],
+   "wer_final_vs_ref_median": 0.0,
+   "wer_batch_vs_ref_median": 0.0,
+   "wer_final_vs_batch_median": 0.0
+  },
+  "medium": {
+   "runs": 2,
+   "failed": 0,
+   "audio_complete_all": true,
+   "first_partial_missing": 0,
+   "first_partial_wall_s_median": 1.2425000000000002,
+   "first_partial_wall_s_max": 1.336,
+   "partial_age_ms_p50_median": 495.09239200051525,
+   "partial_age_ms_p95_median": 727.5950525034204,
+   "partial_age_ms_max": 1082.2083300008671,
+   "backlog_s_max": 1.0,
+   "revisions_per_min_median": 45.215,
+   "stable_violations_total": 0,
+   "looping_partials_total": 0,
+   "omitted_vs_batch_median": 16.0,
+   "inserted_vs_batch_median": 0.0,
+   "duplicated_vs_batch_median": 0.0,
+   "engine_audio_per_audio_s_median": 7.2165,
+   "engine_wall_per_audio_s_median": 0.47155,
+   "stop_to_final_ms_median": 612.7,
+   "stop_to_final_ms_max": 626.0,
+   "stop_engine_audio_s_max": 3.355,
+   "stop_paths": [
+    "tail"
+   ],
+   "wer_final_vs_ref_median": 0.1523,
+   "wer_batch_vs_ref_median": 0.0331,
+   "wer_final_vs_batch_median": 0.1333
+  },
+  "long": {
+   "runs": 2,
+   "failed": 0,
+   "audio_complete_all": true,
+   "first_partial_missing": 0,
+   "first_partial_wall_s_median": 1.1455,
+   "first_partial_wall_s_max": 1.151,
+   "partial_age_ms_p50_median": 495.17467274563387,
+   "partial_age_ms_p95_median": 774.1692217496166,
+   "partial_age_ms_max": 1201.4854369990644,
+   "backlog_s_max": 1.1999999999999886,
+   "revisions_per_min_median": 39.739999999999995,
+   "stable_violations_total": 0,
+   "looping_partials_total": 2,
+   "omitted_vs_batch_median": 95.0,
+   "inserted_vs_batch_median": 1.0,
+   "duplicated_vs_batch_median": 1.0,
+   "engine_audio_per_audio_s_median": 7.287000000000001,
+   "engine_wall_per_audio_s_median": 0.46585,
+   "stop_to_final_ms_median": 459.35,
+   "stop_to_final_ms_max": 471.2,
+   "stop_engine_audio_s_max": 6.915,
+   "stop_paths": [
+    "tail"
+   ],
+   "wer_final_vs_ref_median": 0.1717,
+   "wer_batch_vs_ref_median": 0.0422,
+   "wer_final_vs_batch_median": 0.1419
+  }
+ }
+}

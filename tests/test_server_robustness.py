@@ -220,12 +220,17 @@ def test_wav_bytes_to_float32_raises_on_truncated_body() -> None:
 class _FakeChunker:
     """A controllable stand-in for ChunkStreamer used by StreamSession trim tests.
 
-    Exposes what StreamSession._maybe_trim_samples uses: ``boundary``
-    (read) and ``rebase`` (which moves it with the trimmed prefix).
+    Exposes what StreamSession._maybe_trim_samples uses: ``retain_from``
+    (read; the boundary here) and ``rebase`` (which moves the boundary with
+    the trimmed prefix).
     """
 
     def __init__(self, boundary: int = 0) -> None:
         self.boundary = boundary
+
+    @property
+    def retain_from(self) -> int:  # no re-decode lookback in these tests
+        return self.boundary
 
     def rebase(self, dropped: int) -> None:
         self.boundary = max(0, self.boundary - dropped)

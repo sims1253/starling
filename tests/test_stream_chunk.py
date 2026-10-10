@@ -9,10 +9,21 @@ verifies the reconstructed transcript equals the ground truth despite overlap.
 
 from __future__ import annotations
 
+from pathlib import Path
+from typing import Optional
+
 import numpy as np
 import pytest
 
-from starling.stream_chunk import ChunkStreamer, stitch_words, stream_window_config_error
+from starling.stream_chunk import (
+    ChunkStreamer,
+    max_plausible_words,
+    stitch_words,
+    stream_window_config_error,
+    suppress_loops,
+    suppress_preview_loops,
+    voiced_seconds,
+)
 
 SR = 16000
 
@@ -34,9 +45,11 @@ def test_stitch_empty_sides():
 
 
 def test_stitch_normalizes_case_and_punctuation():
-    # 2-word overlap "hello world" vs "Hello World." -> deduped by normalization
+    # 2-word overlap "hello world" vs "Hello World." -> deduped by
+    # normalization; the cut is the middle (lower) matched word, so the
+    # overlap after it comes from the new window (issue #357).
     out = stitch_words(["say", "hello", "world."], ["Hello", "World", "again"])
-    assert out == ["say", "hello", "world.", "again"]
+    assert out == ["say", "hello", "World", "again"]
 
 
 def test_stitch_non_ascii_words_survive_and_dedupe():
@@ -312,20 +325,24 @@ def test_chunkstreamer_windows_stay_in_range():
     # buffer holds its own indices, so window[0] is the absolute start).
     cs = ChunkStreamer(**_cfg(min_seconds=5.0, partial_interval_seconds=0.0))
     samples = np.arange(30 * SR, dtype=np.float32)
-    calls: list[int] = []
+    calls: list[tuple[str, int]] = []
 
     def tx(window):
         assert 0 < len(window) <= cs.chunk
         start = int(window[0])
         assert 0 <= start and start + len(window) <= len(samples)
-        calls.append(len(window))
+        assert start == cs.call_start
+        calls.append((cs.call_kind, len(window)))
         return "w"
 
     assert cs.step(samples, 1.0, tx) is not None
     assert cs.flush(samples, tx) is not None
     # Three windows, a preview of the 3 s overlap tail (the take is past the
-    # 5 s first-partial minimum, issue #357), and the 3 s flush tail.
-    assert calls == [12 * SR, 12 * SR, 12 * SR, 3 * SR, 3 * SR]
+    # 5 s first-partial minimum, issue #357), and the 3 s flush tail. The
+    # audio is loud and each window says one word, so every window is also
+    # decoded again (issue #357); those calls stay in range too.
+    assert [n for k, n in calls if k != "redecode"] == [12 * SR, 12 * SR, 12 * SR, 3 * SR, 3 * SR]
+    assert any(k == "redecode" for k, _ in calls)
 
 
 def test_chunkstreamer_never_transcribes_empty_window():
@@ -524,3 +541,148 @@ def test_preview_policy_validation():
         cs.set_preview_policy(-1.0, 0.0)
     cs.set_preview_policy(2.0, 0.25)
     assert cs.min == 2 * SR and cs.partial_interval == 0.25
+
+
+# ---- window plausibility and loops (issue #357) -------------------------------
+
+
+def test_voiced_seconds_counts_loud_frames_only():
+    silence = np.zeros(2 * SR, dtype=np.float32)
+    loud = np.full(3 * SR, 0.1, dtype=np.float32)
+    assert voiced_seconds(silence, SR) == 0.0
+    assert voiced_seconds(loud, SR) == 3.0
+    assert voiced_seconds(np.concatenate([silence, loud, silence]), SR) == 3.0
+    # Below -60 dBFS is never speech, whatever the floor.
+    assert voiced_seconds(np.full(2 * SR, 1e-4, dtype=np.float32), SR) == 0.0
+    # A span of continuous speech is not its own floor (floor <= -45 dBFS).
+    assert voiced_seconds(np.full(2 * SR, 0.05, dtype=np.float32), SR) == 2.0
+    assert voiced_seconds(np.zeros(100, dtype=np.float32), SR) == 0.0
+
+
+def test_suppress_loops_collapses_only_what_does_not_fit():
+    # Within the bound (7 words/s + 4) nothing changes, repeats included.
+    assert suppress_loops("no no no no no".split(), 1.0) == "no no no no no".split()
+    # Over it, the longest run goes first, and only until the text fits:
+    # the real "no no no no no" survives next to a loop.
+    words = "no no no no no I said".split() + ["la"] * 100
+    assert suppress_loops(words, 2.0) == "no no no no no I said la la".split()
+    loop = "so a little bit of a little bit of a little bit of a little bit of it".split()
+    assert suppress_loops(loop, 0.5) == "so a little bit of a little".split()  # bound 7
+    # Punctuation and case do not hide a loop.
+    assert suppress_loops("Again, again again. again again".split(), 0.0) == ["Again,", "again"]
+    # No repeats left: cut at the bound.
+    assert suppress_loops([f"w{i}" for i in range(30)], 1.0) == [f"w{i}" for i in range(11)]
+    assert suppress_loops([], 0.0) == []
+
+
+def test_max_plausible_words_bounds_a_window():
+    assert max_plausible_words(12.0) == 88
+    assert max_plausible_words(0.0) == 4
+
+
+def test_preview_never_shows_a_loop():
+    # A 900-word looping preview (seen live on the long take, PR #430) is
+    # cut to what its audio can hold; the next preview is not affected.
+    cs = ChunkStreamer(**_cfg(min_seconds=0.0, partial_interval_seconds=0.0))
+    samples = np.zeros(6 * SR, dtype=np.float32)
+    loop = "a little bit of " * 225
+    text = cs.step(samples, 1.0, lambda w: loop)
+    assert text == "a little bit of a little bit of"
+    assert len(text.split()) <= max_plausible_words(6.0)
+
+
+def test_real_repetition_in_a_window_survives():
+    # Repeated speech within what the audio can hold is never collapsed.
+    cs = ChunkStreamer(**_cfg(min_seconds=0.0, partial_interval_seconds=0.0))
+    samples = np.full(2 * SR, 0.1, dtype=np.float32)
+    said = "no no no no no I said no"
+    assert cs.step(samples, 1.0, lambda w: said) == said
+    assert cs.flush(samples, lambda w: said) == said
+
+
+def test_redecode_needs_audio_before_the_boundary_to_be_kept():
+    # The buffer may drop audio only before retain_from: the boundary minus
+    # the largest re-decode shift (0.75 x the 3 s overlap).
+    cs = ChunkStreamer(**_cfg())
+    assert cs.lookback == int(2.25 * SR)
+    assert cs.retain_from == 0
+    cs.boundary = 9 * SR
+    assert cs.retain_from == 9 * SR - cs.lookback
+
+
+# ---- stitch parity fixture (issue #357) --------------------------------------
+
+_CASES = Path(__file__).resolve().parent / "fixtures" / "stream_stitch_cases.txt"
+
+
+def _parse_cases() -> list[dict]:
+    """Blocks of tests/fixtures/stream_stitch_cases.txt (format in its header)."""
+    cases: list[dict] = []
+    for raw in _CASES.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        tag, _, rest = line.partition(" ")
+        if tag in ("stitch", "suppress", "preview", "stream"):
+            cases.append({"op": tag, "args": rest.split(), "tx": []})
+        elif tag in ("<", ">", "="):
+            cases[-1][tag] = rest.split()
+        elif tag == "audio":
+            cases[-1]["audio"] = [float(x) for x in rest.split()]
+        elif tag == "tx":
+            kind, start, length, *text = rest.split()
+            cases[-1]["tx"].append((kind, start, length, " ".join(text)))
+        elif tag == "calls":
+            cases[-1]["calls"] = rest.split()
+        else:
+            raise AssertionError(f"bad fixture line: {raw!r}")
+    return cases
+
+
+def _seconds(sample: int) -> str:
+    return f"{sample / SR:g}"
+
+
+def _replay_stream(case: dict) -> tuple[list[str], list[str]]:
+    chunk_s, overlap_s = (float(x) for x in case["args"][1:3])
+    audio = case["audio"]
+    samples = np.concatenate([np.full(int(round(audio[i] * SR)), audio[i + 1], dtype=np.float32)
+                              for i in range(0, len(audio), 2)])
+    cs = ChunkStreamer(sample_rate=SR, chunk_seconds=chunk_s, overlap_seconds=overlap_s,
+                       min_seconds=0.0, partial_interval_seconds=0.0)
+    calls: list[str] = []
+
+    used: set[int] = set()
+
+    def tx(window: np.ndarray) -> Optional[str]:
+        start, n = cs.call_start, len(window)
+        calls.append(f"{cs.call_kind}@{_seconds(start)}+{_seconds(n)}")
+        hits = [k for k, (kind, a, length, _) in enumerate(case["tx"])
+                if k not in used and kind in ("*", cs.call_kind)
+                and (a == "*" or int(round(float(a) * SR)) == start)
+                and (length == "*" or int(round(float(length) * SR)) == n)]
+        assert hits, f"no scripted text for {calls[-1]}"
+        if len(hits) > 1:
+            used.add(hits[0])
+        text = case["tx"][hits[0]][3]
+        return None if text == "BUSY" else text
+
+    final = cs.flush(samples, tx)
+    assert final is not None
+    return final.split(), calls
+
+
+@pytest.mark.parametrize("case", _parse_cases(), ids=lambda c: f"{c['op']}-{c['args'][0]}")
+def test_stitch_fixture_case(case):
+    # The native server replays the same file (stream_session_test.cpp,
+    # test_stitch_fixture_cases); both must match every expected line.
+    if case["op"] == "stitch":
+        assert stitch_words(case.get("<", []), case.get(">", [])) == case["="]
+    elif case["op"] == "suppress":
+        assert suppress_loops(case["<"], float(case["args"][1])) == case["="]
+    elif case["op"] == "preview":
+        assert suppress_preview_loops(case["<"], float(case["args"][1])) == case["="]
+    else:
+        final, calls = _replay_stream(case)
+        assert final == case["="]
+        assert calls == case["calls"]
