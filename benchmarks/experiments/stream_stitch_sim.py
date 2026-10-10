@@ -117,11 +117,10 @@ class Transcriber:
 
     def window(self, pcm: bytes, start: int, length: int):
         """The window's text, with its word timestamps under --words (a
-        ``Transcript``) unless --no-times."""
+        ``(text, ((word, start, end), ...))`` pair, made a ``Transcript`` by
+        replay_take) unless --no-times."""
         if not self.words:
             return self.text(pcm, start, length)
-        from starling.stream_chunk import TimedWord, Transcript
-
         key = "words:" + self.key(pcm, start, length)
         if key not in self.cache:
             self.cache[key] = self.stream_words(pcm[2 * start:2 * (start + length)])
@@ -129,8 +128,7 @@ class Transcriber:
         got = self.cache[key]
         if self.no_times or got["words"] is None:
             return got["text"]
-        return Transcript(got["text"], tuple(TimedWord(w["w"], w["start"], w["end"])
-                                             for w in got["words"]))
+        return got["text"], tuple((w["w"], w["start"], w["end"]) for w in got["words"])
 
     def _server(self):
         if self.server is None:
@@ -187,7 +185,7 @@ def replay_take(name: str, take: dict, pcm: bytes, offset: int, tr: Transcriber,
     # numpy (and the stitcher) only for a real replay: the CI harness
     # imports this module without them.
     import numpy as np
-    from starling.stream_chunk import ChunkStreamer
+    from starling.stream_chunk import ChunkStreamer, TimedWord, Transcript
 
     x = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
     samples = x[offset:]
@@ -197,11 +195,14 @@ def replay_take(name: str, take: dict, pcm: bytes, offset: int, tr: Transcriber,
                        overlap_seconds=args.overlap_seconds, min_seconds=0.0,
                        partial_interval_seconds=0.0)
 
-    def tx(window: "np.ndarray") -> str:
+    def tx(window: "np.ndarray") -> "str | Transcript":
         start = (window.__array_interface__["data"][0] - base) // 4
         calls.append({"kind": cs.call_kind, "start_s": start / SAMPLE_RATE,
                       "end_s": (start + len(window)) / SAMPLE_RATE})
-        return tr.window(pcm, offset + start, len(window))
+        got = tr.window(pcm, offset + start, len(window))
+        if isinstance(got, str):
+            return got
+        return Transcript(got[0], tuple(TimedWord(*w) for w in got[1]))
 
     final = cs.flush(samples, tx)
     batch = tr.text(pcm, offset, len(samples))

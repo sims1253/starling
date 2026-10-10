@@ -25,6 +25,15 @@ static char* echo(const char* text) {
 char* starling_ggml_transcribe_pcm(starling_ggml_ctx*, const float*, int64_t, int) {
     return echo(u8"5. Keep auth.\n6. I'd prefer to never merge this.\n7. I like orange, err, yellow.\n8. A. Agreed. caf\u00e9 \U0001F399");
 }
+// No word timestamps from the fixture: the plain transcript, *n_words = -1,
+// like every engine but Parakeet (issue #357).
+char* starling_ggml_transcribe_pcm_words(starling_ggml_ctx* ctx, const float* samples, int64_t n,
+                                         int sample_rate, starling_ggml_word** words, int64_t* n_words) {
+    if (words) *words = nullptr;
+    if (n_words) *n_words = -1;
+    return starling_ggml_transcribe_pcm(ctx, samples, n, sample_rate);
+}
+void starling_ggml_free_words(starling_ggml_word* words) { std::free(words); }
 // Echo the transcript back: the /normalize contract tests pin the JSON
 // transport decoding (raw UTF-8 vs \u escapes) byte-for-byte against the
 // engine input, without a real text model (issue #123).

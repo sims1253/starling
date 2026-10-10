@@ -782,7 +782,7 @@ bool ParakeetEngine::decode_ids(const float* pcm, size_t n, std::vector<int32_t>
         explicit Hold(cpu::GemvHelper& h) : g(h) { g.hold(true); }
         ~Hold() { g.hold(false); }
     } hold(I.gemv2);
-    const bool timing = env_on("STARLING_FAST_TIMING");
+    const bool print_timing = env_on("STARLING_FAST_TIMING");
     const auto t0 = std::chrono::steady_clock::now();
     // A cancelled call (ggml::call_abort_requested) stops at the next stage
     // boundary or decoder frame; the recorded encoder submission itself is
@@ -810,7 +810,7 @@ bool ParakeetEngine::decode_ids(const float* pcm, size_t n, std::vector<int32_t>
         err = ggml::kCallAbortedError;
         return false;
     }
-    if (timing)
+    if (print_timing)
         std::fprintf(stderr, "[fast-parakeet] audio=%.2fs mel=%.1fms encoder=%.1fms decode=%.1fms total=%.1fms (T=%d Tp=%d)\n",
                      n / 16000.0, t_mel, t_enc - t_mel, ms_since(t0) - t_enc, ms_since(t0), T, Tp);
     return true;

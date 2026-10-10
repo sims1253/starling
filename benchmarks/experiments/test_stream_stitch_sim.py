@@ -88,12 +88,9 @@ class WordsTest(unittest.TestCase):
         return self.Fake(args)
 
     def test_windows_carry_word_times(self):
-        sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
-        from starling.stream_chunk import TimedWord, Transcript
-
         pcm = bytes(64)
         got = self.transcriber(words=True).window(pcm, 0, 16)
-        self.assertEqual(got, Transcript("a b", (TimedWord("a", 0.1, 0.2), TimedWord("b", 0.4, 0.6))))
+        self.assertEqual(got, ("a b", (("a", 0.1, 0.2), ("b", 0.4, 0.6))))
         self.assertEqual(self.transcriber(words=True, no_times=True).window(pcm, 0, 16), "a b")
 
     def test_words_mode_is_another_engine(self):
