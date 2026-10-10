@@ -25,12 +25,27 @@ class ChunkStreamer(
     sampleRate: Int = SAMPLE_RATE,
     chunkSeconds: Double = CHUNK_SECONDS,
     overlapSeconds: Double = OVERLAP_SECONDS,
-    minSeconds: Double = MIN_SECONDS,
-    private val partialIntervalSeconds: Double = PARTIAL_INTERVAL_SECONDS,
+    val minSeconds: Double = MIN_SECONDS,
+    val partialIntervalSeconds: Double = PARTIAL_INTERVAL_SECONDS,
 ) {
-    /** Transcribes `samples[start until start + length]`; null when the engine failed. */
+    /** Why the streamer transcribes audio; named like the server's call ledger kinds. */
+    enum class CallKind(val label: String) {
+        /** A full window committed while recording (or while catching up). */
+        WINDOW("window"),
+
+        /** The live tail, for a partial that is never committed. */
+        PREVIEW("preview"),
+
+        /** A full window committed by [flush]. */
+        FLUSH_WINDOW("flush_window"),
+
+        /** The remaining tail committed by [flush]. */
+        FLUSH_TAIL("flush_tail"),
+    }
+
+    /** Transcribes `samples[start until start + length]` for [kind]; null when the engine failed. */
     fun interface Transcriber {
-        fun transcribe(samples: FloatArray, start: Int, length: Int): String?
+        fun transcribe(samples: FloatArray, start: Int, length: Int, kind: CallKind): String?
     }
 
     private val chunk: Int
@@ -69,7 +84,7 @@ class ChunkStreamer(
      * as a partial, or null when there is nothing new to show.
      */
     fun step(samples: FloatArray, size: Int, now: Double, tx: Transcriber): String? {
-        val finalized = finalizeFullWindows(samples, size, tx)
+        val finalized = finalizeFullWindows(samples, size, tx, CallKind.WINDOW)
         val committedText: String? = if (finalized) join(committed) else null
 
         val tailLength = size - boundary
@@ -79,7 +94,7 @@ class ChunkStreamer(
         if (!finalized && (throttled || tailLength < min)) return null
 
         if (tailLength > 0 && tailLength >= min) {
-            val text = tx.transcribe(samples, boundary, tailLength) ?: return committedText
+            val text = tx.transcribe(samples, boundary, tailLength, CallKind.PREVIEW) ?: return committedText
             // Only a successful tail transcription starts the throttle
             // interval; a step that merely finalized a window must not delay
             // the next partial.
@@ -95,17 +110,17 @@ class ChunkStreamer(
      * the committed text when a window was finalized, else null.
      */
     fun catchUp(samples: FloatArray, size: Int, tx: Transcriber): String? =
-        if (finalizeFullWindows(samples, size, tx)) join(committed) else null
+        if (finalizeFullWindows(samples, size, tx, CallKind.WINDOW)) join(committed) else null
 
     /** Finalizes all remaining audio; the full text, or null when the engine failed. */
     fun flush(samples: FloatArray, size: Int, tx: Transcriber): String? {
-        finalizeFullWindows(samples, size, tx)
+        finalizeFullWindows(samples, size, tx, CallKind.FLUSH_WINDOW)
         val tailLength = size - boundary
         if (tailLength == 0) return join(committed)
         // A full window still in the tail means finalizeFullWindows stopped on
         // an engine failure (it never advances past a failed window).
         if (tailLength >= chunk) return null
-        val text = tx.transcribe(samples, boundary, tailLength) ?: return null
+        val text = tx.transcribe(samples, boundary, tailLength, CallKind.FLUSH_TAIL) ?: return null
         committed = ChunkedTranscription.stitchWords(committed, split(text), maxOverlapWords)
         boundary = size
         return join(committed)
@@ -116,10 +131,10 @@ class ChunkStreamer(
         boundary = maxOf(0, boundary - dropped)
     }
 
-    private fun finalizeFullWindows(samples: FloatArray, size: Int, tx: Transcriber): Boolean {
+    private fun finalizeFullWindows(samples: FloatArray, size: Int, tx: Transcriber, kind: CallKind): Boolean {
         var did = false
         while (size - boundary >= chunk) {
-            val text = tx.transcribe(samples, boundary, chunk) ?: break
+            val text = tx.transcribe(samples, boundary, chunk, kind) ?: break
             committed = ChunkedTranscription.stitchWords(committed, split(text), maxOverlapWords)
             boundary += advance
             did = true

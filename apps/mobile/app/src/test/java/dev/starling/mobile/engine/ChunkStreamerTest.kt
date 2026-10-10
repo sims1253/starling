@@ -17,8 +17,11 @@ class ChunkStreamerTest {
         val calls = mutableListOf<Pair<Int, Int>>()
         var failing = false
 
-        override fun transcribe(samples: FloatArray, start: Int, length: Int): String? {
+        val kinds = mutableListOf<ChunkStreamer.CallKind>()
+
+        override fun transcribe(samples: FloatArray, start: Int, length: Int, kind: ChunkStreamer.CallKind): String? {
             calls += start to length
+            kinds += kind
             if (failing) return null
             return (start / rate until (start + length) / rate).joinToString(" ") { wordsPerSecond(it) }
         }

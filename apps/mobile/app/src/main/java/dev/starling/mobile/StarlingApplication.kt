@@ -13,6 +13,8 @@ import dev.starling.mobile.audio.PcmSource
 import dev.starling.mobile.engine.ModelLifetime
 import dev.starling.mobile.engine.OnDeviceBackend
 import dev.starling.mobile.engine.OnDeviceEngine
+import dev.starling.mobile.engine.StreamDebug
+import dev.starling.mobile.engine.StreamTrace
 import dev.starling.mobile.network.BackendConfig
 import dev.starling.mobile.network.BackendSettings
 import dev.starling.mobile.network.TranscriptionCoordinator
@@ -132,6 +134,8 @@ class StarlingApplication : Application() {
         if (BuildConfig.DEBUG) {
             PcmSource.debugSource = ::debugTestMicrophone
             FreeSpaceProbe.debugOverride = FreeSpaceProbe { directory -> debugFreeSpace() ?: FreeSpaceProbe.SYSTEM.availableBytes(directory) }
+            StreamDebug.cadence = ::debugStreamCadence
+            StreamDebug.traceSink = { trace -> if (File(filesDir, "debug/stream-trace").exists()) debugWriteTrace(trace) }
         }
         scheduleAudioUpkeep()
     }
@@ -171,7 +175,11 @@ class StarlingApplication : Application() {
      * real-time pace; `files/debug/fail-transcription` makes every
      * transcription attempt fail after Stop; `files/debug/free-space-mb`
      * holding a number stands in for the free space (#342), so the
-     * low-space warning, refusal and in-take stop can be driven. Release
+     * low-space warning, refusal and in-take stop can be driven;
+     * `files/debug/stream-cadence` holding "<min> <interval>" (seconds)
+     * overrides the on-device preview cadence, and while
+     * `files/debug/stream-trace` exists every on-device live session writes
+     * its call ledger to `files/debug/stream-traces/` (#226/#357). Release
      * builds never read them.
      */
     private fun debugTestMicrophone(): PcmSource? =
@@ -181,6 +189,23 @@ class StarlingApplication : Application() {
     private fun debugFreeSpace(): Long? =
         File(filesDir, "debug/free-space-mb").takeIf(File::isFile)
             ?.let { runCatching { it.readText().trim().toLong() * 1024 * 1024 }.getOrNull() }
+
+    private fun debugStreamCadence(): Pair<Double, Double>? =
+        File(filesDir, "debug/stream-cadence").takeIf(File::isFile)?.let { file ->
+            runCatching {
+                val (min, interval) = file.readText().trim().split(Regex("\\s+")).map(String::toDouble)
+                min to interval
+            }.getOrNull()
+        }
+
+    private fun debugWriteTrace(trace: StreamTrace) {
+        runCatching {
+            val dir = File(filesDir, "debug/stream-traces").apply { mkdirs() }
+            val json = trace.toJson()
+            File(dir, "${System.currentTimeMillis()}.json").writeText(json.toString())
+            Log.i(TAG, "debug: stream trace with ${json.getJSONArray("events").length()} events written")
+        }.onFailure { Log.w(TAG, "debug: stream trace not written", it) }
+    }
 
     private fun debugInjectedFailure(): String? =
         if (File(filesDir, "debug/fail-transcription").exists()) "Injected transcription failure (debug test hook)" else null

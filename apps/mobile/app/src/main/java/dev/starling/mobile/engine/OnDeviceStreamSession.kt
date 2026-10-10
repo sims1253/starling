@@ -32,6 +32,9 @@ import kotlin.concurrent.withLock
  * As with the server stream, the saved WAV stays the source of truth: any
  * engine failure interrupts the stream, and [finish] answers
  * [CommitOutcome.Fallback] so the batch path transcribes the WAV.
+ *
+ * A [trace] (debug builds only, see [StreamDebug]) records every engine
+ * call, capture chunk, partial and the stop path for the #226 measurements.
  */
 class OnDeviceStreamSession(
     private val engine: LiveEngine,
@@ -40,6 +43,7 @@ class OnDeviceStreamSession(
     private val clock: () -> Double = { System.nanoTime() / 1e9 },
     private val maxLiveSamples: Int = MAX_LIVE_SECONDS * ChunkStreamer.SAMPLE_RATE,
     private val backlog: (() -> Backlog)? = null,
+    private val trace: StreamTrace? = null,
 ) : StreamSession {
     /** The engine surface the session needs; [OnDeviceEngine] in production. */
     interface LiveEngine {
@@ -155,6 +159,7 @@ class OnDeviceStreamSession(
                 return
             }
             captured += samples
+            trace?.audio(captured, samples)
             changed.signalAll()
         }
     }
@@ -194,6 +199,7 @@ class OnDeviceStreamSession(
     }
 
     override fun finish(): CommitOutcome {
+        trace?.stopRequested()
         lock.withLock {
             inputEnded = true
             changed.signalAll()
@@ -229,16 +235,19 @@ class OnDeviceStreamSession(
             }
             engine.liveSessionEnded(prepared)
             emitInterruption()
+            trace?.let { runCatching { it.complete() } }
         }
     }
 
     private fun runLoop() {
+        val prepareStarted = clock()
         val loadError = runCatching { engine.prepare { closed } }.getOrElse { it.message ?: it::class.java.simpleName }
         if (loadError != null) {
             lock.withLock { failLocked(loadError, bufferLimitReached = false) }
             return
         }
         prepared = true
+        trace?.prepared(prepareStarted)
         val model = runCatching { engine.loadedModelName() }.getOrNull()
         // Closed or already failed (e.g. the buffer cap) while the model loaded.
         if (lock.withLock { closed || failure != null }) return
@@ -250,12 +259,26 @@ class OnDeviceStreamSession(
         // The models that transcribed windows: a driver failure voids the
         // pin, and the reload may pick up another active model mid-take.
         val windowModels = LinkedHashSet<String>()
-        val tx = ChunkStreamer.Transcriber { samples, start, length ->
+        // Absolute sample index of the current snapshot's first sample, for the trace.
+        var snapshotBase = 0L
+        val tx = ChunkStreamer.Transcriber { samples, start, length, kind ->
             // The snapshot is exactly the live tail, so a window that spans all
             // of it (every flush, most partials) is passed without a copy.
             val window = if (start == 0 && length == samples.size) samples else samples.copyOfRange(start, start + length)
-            when (val result = runCatching { engine.transcribeWindow(window) }
-                .getOrElse { WindowResult.Failed(it.message ?: it::class.java.simpleName) }) {
+            val t0 = clock()
+            val result = runCatching { engine.transcribeWindow(window) }
+                .getOrElse { WindowResult.Failed(it.message ?: it::class.java.simpleName) }
+            trace?.call(
+                StreamTrace.Call(
+                    kind,
+                    snapshotBase + start,
+                    length,
+                    t0,
+                    clock(),
+                    if (result is WindowResult.Text) StreamTrace.RESULT_OK else StreamTrace.RESULT_FAILED,
+                ),
+            )
+            when (result) {
                 is WindowResult.Text -> {
                     result.model?.let(windowModels::add)
                     result.text
@@ -282,11 +305,13 @@ class OnDeviceStreamSession(
                 ending = inputEnded && !behind
                 snapshot = buffer.copyOf(size)
                 snapshotSize = size
+                snapshotBase = base
             }
             steppedSize = snapshotSize
             windowFailure = null
 
             if (ending) {
+                trace?.flushing((snapshotSize - streamer.boundary).toLong())
                 val text = streamer.flush(snapshot, snapshotSize, tx)
                 lock.withLock {
                     if (text != null) {
@@ -311,6 +336,7 @@ class OnDeviceStreamSession(
             }
             if (partial != null && partial != lastPartial) {
                 lastPartial = partial
+                trace?.partial(partial)
                 events(StreamEvent.Partial(partial))
             }
             steppedSize -= trimFinalized()
@@ -415,6 +441,7 @@ class OnDeviceStreamSession(
     private fun settleLocked(result: CommitOutcome) {
         if (outcome != null) return
         outcome = result
+        trace?.settled((result as? CommitOutcome.Final)?.text, (result as? CommitOutcome.Fallback)?.reason)
         settled.countDown()
     }
 
