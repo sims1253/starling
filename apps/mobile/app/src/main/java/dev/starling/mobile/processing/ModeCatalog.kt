@@ -47,12 +47,11 @@ class ModeCatalog(
      */
     fun couldBecomePhrase(partial: String, startMode: Mode): Boolean {
         if (!startMode.allowSpokenOverrides) return false
-        val words = partial.trim().split(WHITESPACE).filter(String::isNotEmpty)
-            .map { it.trimEnd(':').lowercase() }
+        val words = pySplit(partial).map { it.trimEnd(':').lowercase() }
         if (words.isEmpty()) return false
         val phrases = profiles.profiles.flatMap { it.aliases } + LITERAL
         return phrases.any { phrase ->
-            val target = phrase.trim().lowercase().split(WHITESPACE)
+            val target = pySplit(phrase.lowercase())
             words.size < target.size && target.subList(0, words.size) == words
         }
     }
@@ -82,6 +81,5 @@ class ModeCatalog(
 
     companion object {
         private const val LITERAL = "literal"
-        private val WHITESPACE = Regex("\\s+")
     }
 }

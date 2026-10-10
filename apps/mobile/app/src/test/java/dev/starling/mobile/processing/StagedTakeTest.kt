@@ -136,16 +136,6 @@ class StagedTakeTest {
     }
 
     @Test
-    fun deliveryIsExactlyOncePerRevisionAndTarget() {
-        val take = take()
-        take.dictate(final = "hello")
-        take.deliveryText()
-        assertTrue(take.deliver("d-1", "field-7"))
-        assertFalse(take.deliver("d-2", "field-7"))
-        assertFalse(take.deliver("d-1", "field-8"))
-    }
-
-    @Test
     fun aPhraseCanBeHeldBackWhileItIsStillBeingSpoken() {
         val direct = catalog.mode("direct")
         assertTrue(catalog.couldBecomePhrase("Draft", direct))
@@ -362,5 +352,15 @@ class StagedTakeTest {
         assertTrue(take.canRevertToRaw)
         take.backToRaw()
         assertEquals("one two", take.displayText())
+    }
+
+    @Test
+    fun aCaptureAfterAProcessedLineBreakKeepsItsRawWordsApart() {
+        val take = take()
+        take.dictate(final = "hello new line")
+        take.dictate(final = "again", attempt = "a-2")
+        assertEquals("hello\nagain", take.displayText())
+        take.backToRaw()
+        assertEquals("hello new line again", take.draft.rawText())
     }
 }

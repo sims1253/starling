@@ -35,7 +35,7 @@
             android:layout_weight="1"
             android:accessibilityLiveRegion="polite"
             android:ellipsize="end"
-            android:maxLines="2"
+            android:maxLines="3"
             android:textColor="@color/starling_muted"
             android:textSize="13sp" />
     </LinearLayout>

@@ -117,8 +117,11 @@ class StagedTake(
         proposal = null
         selection = null
         segment += 1
-        val text = draft.text()
-        separator = if (text.isEmpty() || text.last().isWhitespace()) "" else " "
+        // The separator is part of the raw recognition too, so it follows
+        // the text either view ends in: a processed line break still needs
+        // a space after the raw "new line".
+        fun open(text: String) = text.isEmpty() || text.last().isWhitespace()
+        separator = if (open(draft.text()) && open(draft.rawText())) "" else " "
     }
 
     fun partial(text: String) {
@@ -335,13 +338,6 @@ class StagedTake(
         takeProcessedIntoDraft()
         return draft.payloadText()
     }
-
-    /**
-     * Records one delivery for [targetDigest] (the editor binding); false
-     * when this revision was already delivered there.
-     */
-    fun deliver(deliveryId: String, targetDigest: String): Boolean =
-        draft.deliver(deliveryId, targetDigest) == Outcome.DELIVERED
 
     /**
      * The user edited the text on screen: processing runs again, and the

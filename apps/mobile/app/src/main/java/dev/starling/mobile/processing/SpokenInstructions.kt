@@ -88,12 +88,6 @@ class SpokenInstructions(tableJson: String, private val commands: SpokenCommands
         return null
     }
 
-    /** Removes a leading delimiter token from an instruction region's text; anything else is returned unchanged. */
-    fun stripDelimiter(instruction: String): String {
-        val first = tokens(instruction).firstOrNull() ?: return instruction
-        if (core(instruction.substring(first.first, first.second)) !in matchTokens) return instruction
-        return trimWhitespace(instruction.substring(first.second))
-    }
 
     private companion object {
         /**

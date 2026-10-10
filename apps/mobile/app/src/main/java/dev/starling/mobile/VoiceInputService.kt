@@ -47,7 +47,6 @@ import dev.starling.mobile.processing.RegionKind
 import dev.starling.mobile.processing.StagedTake
 import dev.starling.mobile.ui.EditorField
 import dev.starling.mobile.ui.InputTargetGuard
-import java.util.UUID
 
 /**
  * Lightweight voice keyboard. It never reads surrounding editor text. Two
@@ -713,9 +712,6 @@ class VoiceInputService : InputMethodService() {
             statusView?.setText(R.string.staging_insert_failed)
             return
         }
-        // The delivery record of the inserted revision; the take ends here,
-        // so no tap or callback can insert it twice.
-        staged.deliver(UUID.randomUUID().toString(), "${target.generation}")
         val status = if (staged.mode.delivery == INSERT_ENTER && !pressEditorAction(connection)) {
             R.string.staging_no_action
         } else {
@@ -834,7 +830,8 @@ class VoiceInputService : InputMethodService() {
                 current.manualLocked = true
                 current.staged?.switchMode(mode)
             }
-            current.capturing -> {
+            // A stopped direct take whose final is still on its way switches too.
+            current.capturing || current.awaitingFinal -> {
                 current.mode = mode
                 current.manualLocked = true
                 if (mode.processingDelivery == STAGED) {

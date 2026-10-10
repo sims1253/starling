@@ -135,7 +135,7 @@
     <string name="staging_no_action">Inserted. This field has no send action, so nothing was pressed.</string>
     <string name="staging_matched_phrase">Matched “%1$s” at the start: %2$s mode.</string>
     <string name="staging_matched_literal">“literal” at the start: the rest is kept exactly as spoken.</string>
-    <string name="staging_instruction">Instruction “%1$s” needs a text model, which this device does not have yet; it is left out of the draft.</string>
+    <string name="staging_instruction">Left out, no text model yet: instruction “%1$s”</string>
     <string name="staging_word_selected">Word selected. Delete it, or tap Record and say what replaces it.</string>
     <string name="staging_say_replacement">Say what replaces the selected word, then tap Stop.</string>
     <string name="staging_replacing">Replacing with: %1$s</string>
@@ -144,7 +144,7 @@
     <string name="staging_replaced">Word replaced. Edit more, or Insert.</string>
     <string name="staging_wait">The last recording is still on its way into the draft.</string>
     <string name="staging_insert_failed">The field did not accept the text; the draft is kept and nothing was sent.</string>
-    <string name="staging_segment_failed">This recording could not be transcribed; it stays in Starling for retry. The draft keeps its earlier text.</string>
+    <string name="staging_segment_failed">Not transcribed; the audio stays in Starling for retry. The draft keeps its earlier text.</string>
     <string name="staging_power_saver">Battery saver: rules only.</string>
     <string name="staging_no_model">This mode asks for a text model the phone does not have yet; rules only.</string>
     <string name="staging_action_send">send</string>

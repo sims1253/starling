@@ -127,7 +127,10 @@ class SpokenCommands(tableJson: String) {
 
         var out = prefix
         var pos = 0
-        var skipWs = false
+        // A prefix ending in a line break or bullet still drops the
+        // whitespace that follows it, as one pass over both would.
+        var skipWs = prefix.endsWith('\n') ||
+            prefix.removeSuffix("- ").let { it != prefix && (it.isEmpty() || it.endsWith('\n')) }
         var i = 0
         while (i < spans.size) {
             val (start, end) = spans[i]
