@@ -294,6 +294,36 @@ fn a_claim_and_a_settle_refuse_to_run_inside_a_callers_transaction() {
 }
 
 #[test]
+fn a_recognition_start_refuses_to_run_inside_a_callers_transaction() {
+    let dir = TempDir::new().expect("tempdir");
+    let mut store = store_in(&dir);
+    let id = stored(&mut store, false, CommitMark::Complete);
+    store.conn.execute_batch("BEGIN").unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE captures SET retention_class = 'archival' WHERE id = ?1",
+            rusqlite::params![id],
+        )
+        .unwrap();
+    assert!(matches!(
+        store.begin_recognition(&id, "engine:test", None),
+        Err(StoreV2Error::Invalid(_))
+    ));
+    assert!(!store.conn.is_autocommit(), "the caller's transaction is left open");
+    store.conn.execute_batch("COMMIT").unwrap();
+    assert_eq!(
+        store.get_capture(&id).unwrap().expect("stored").retention_class,
+        "archival",
+        "the caller's own write survived the refusal"
+    );
+    assert!(store.attempts_for(&id).unwrap().is_empty());
+    store
+        .begin_recognition(&id, "engine:test", None)
+        .expect("starts once the caller is done");
+}
+
+#[test]
 fn a_recheck_leaves_intents_younger_than_it_asks_for() {
     let dir = TempDir::new().expect("tempdir");
     let mut store = store_in(&dir);

@@ -1144,6 +1144,7 @@ fn connection_reader(
                                     detail: "the current take belongs to another connection"
                                         .to_string(),
                                 }),
+                                busy: None,
                             };
                             if state.try_deliver(refusal).is_err() {
                                 state.close();
@@ -1491,6 +1492,7 @@ fn handle_command(
                 req: id,
                 seq: None,
                 result: Err(refusal),
+                busy: None,
             })
             .map(|()| false)
             .map_err(|()| state.close());
@@ -1526,13 +1528,24 @@ fn handle_command(
         .and_then(serde_json::Value::as_u64);
     // The envelope is consumed here (nothing reads it after); moving it
     // avoids a full JSON deep-clone on the per-command hot path.
+    let starts = envelope.get("type").and_then(serde_json::Value::as_str) == Some("capture.start");
+    let corr = corr.filter(|_| starts);
     let result = shared.client.send_raw(std::mem::take(envelope));
     let accepted = result.is_ok();
+    // A refused start says what holds the microphone (#220).
+    let busy = match &result {
+        Err(Rejection::IllegalInState {
+            state: machine_state,
+            ..
+        }) if starts => shared.takes.busy_for(state, corr.as_deref(), machine_state),
+        _ => None,
+    };
     if state
         .try_deliver(Frame::Receipt {
             req: id,
             seq,
             result,
+            busy,
         })
         .is_err()
     {

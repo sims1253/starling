@@ -28,7 +28,7 @@ use starling_runtime::machine::capture::LiveTakeStatus;
 use starling_runtime::protocol::Command;
 use starling_runtime_host::client::{EventWire, HostClient, TakeWire};
 use starling_runtime_host::frame::{
-    HostRecovery, LivePartial, TakeOwner, TranscribeWith, TranscriptionState,
+    HostRecovery, LivePartial, TakeBusy, TakeOwner, TranscribeWith, TranscriptionState,
 };
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
@@ -79,11 +79,13 @@ pub(crate) enum HostUpdate {
     /// A runtime event the UI acts on (`capture.error`).
     Event(EventWire),
     /// A command for `take` was not carried out (refused by the runtime,
-    /// or no connection to send it on).
+    /// or no connection to send it on). `busy`: a refused start, and what
+    /// holds the microphone.
     Refused {
         take: String,
         command: &'static str,
         reason: String,
+        busy: Option<TakeBusy>,
     },
 }
 
@@ -270,15 +272,19 @@ fn command_loop(
             Outgoing::Command { take, command } => {
                 let name = command_name(&command);
                 let result = match client {
-                    Some(client) => client.send(Some(&take), command).map(|_| ()).map_err(|err| err.to_string()),
-                    None => Err("not connected to the recording service".to_string()),
+                    Some(client) => client
+                        .send_reporting_busy(Some(&take), command)
+                        .map(|_| ())
+                        .map_err(|(err, busy)| (err.to_string(), busy)),
+                    None => Err(("not connected to the recording service".to_string(), None)),
                 };
-                if let Err(reason) = result {
+                if let Err((reason, busy)) = result {
                     if tx
                         .send(HostUpdate::Refused {
                             take,
                             command: name,
                             reason,
+                            busy,
                         })
                         .is_err()
                     {
@@ -299,6 +305,7 @@ fn command_loop(
                             take,
                             command: "take.adopt",
                             reason,
+                            busy: None,
                         })
                         .is_err()
                     {
@@ -330,6 +337,7 @@ fn command_loop(
                             take: req,
                             command: "transcribe",
                             reason,
+                            busy: None,
                         })
                         .is_err()
                     {

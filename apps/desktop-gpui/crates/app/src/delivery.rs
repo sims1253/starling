@@ -1031,7 +1031,13 @@ impl StarlingApp {
             return;
         };
         self.overlay_insert_unarmed();
-        let Some(text) = self.staged_text_for(&id).or_else(|| self.head_text(&id)) else {
+        // The draft, else exactly the take's own result: never whatever a
+        // later retry put in history.
+        let Some(text) = self
+            .staged_text_for(&id)
+            .or_else(|| self.own_result(&id))
+            .or_else(|| self.head_text(&id))
+        else {
             cx.notify();
             return;
         };

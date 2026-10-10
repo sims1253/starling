@@ -65,7 +65,8 @@ use starling_runtime::RuntimeClient;
 
 use crate::agent::ASK_PREFIX;
 use crate::frame::{
-    Frame, HostRecovery, LivePartial, TakeAudio, TakeOwner, TranscriptionState, METER_SAMPLES,
+    Frame, HostRecovery, LivePartial, TakeAudio, TakeBusy, TakeOwner, TranscriptionState,
+    METER_SAMPLES,
 };
 use crate::server::{lock_registry, ConnState};
 use crate::transcribe::TranscriberLink;
@@ -382,6 +383,38 @@ impl TakeHub {
     pub fn busy(&self) -> bool {
         let state = lock_registry(&self.state);
         state.live.is_some() || !state.persisting.is_empty()
+    }
+
+    /// What holds the microphone when `conn`'s `capture.start` for take
+    /// `corr` was refused in capture state `machine_state` (see
+    /// [`TakeBusy`]); `None` when no take does — the machine refused it
+    /// for another reason. That start's own registration
+    /// ([`TakeHub::starting`]) is not what holds it.
+    pub(crate) fn busy_for(
+        &self,
+        conn: &ConnState,
+        corr: Option<&str>,
+        machine_state: &str,
+    ) -> Option<TakeBusy> {
+        match machine_state {
+            "Draining" => return Some(TakeBusy::Saving),
+            "Acquiring" | "Recording" => {}
+            _ => return None,
+        }
+        let state = lock_registry(&self.state);
+        let yours = |owner: &Arc<ConnState>| std::ptr::eq(Arc::as_ptr(owner), conn);
+        let refused = corr.unwrap_or(starling_runtime::machine::capture::ANON_TAKE);
+        let owner = match &state.live {
+            Some(live) => live.owner.as_ref(),
+            None => state
+                .acquiring
+                .as_ref()
+                .filter(|(take, starter)| !(take == refused && yours(starter)))
+                .map(|(_, starter)| starter),
+        };
+        Some(TakeBusy::Recording {
+            yours: owner.is_some_and(yours),
+        })
     }
 
     /// `conn` follows the feed from now on.

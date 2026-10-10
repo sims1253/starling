@@ -4393,6 +4393,9 @@ impl StoreV2 {
         backend: &str,
         options_json: Option<&str>,
     ) -> Result<String, StoreV2Error> {
+        // Its own transaction, never a caller's: the failure path's
+        // ROLLBACK below would end that one too.
+        self.refuse_open_transaction("begin a recognition attempt")?;
         // The checks and the insert hold the database's write lock: the
         // retention policy (#342), on this connection or another, either
         // sees this attempt and keeps the audio, or retired it first and

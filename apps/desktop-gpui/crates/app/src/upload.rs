@@ -1891,6 +1891,64 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// A frame that pairs this window's request with another take does
+    /// not consume the request: the frames for its own take still find
+    /// it (and its offer).
+    #[gpui::test]
+    fn a_request_answered_for_another_take_is_kept_for_its_own(cx: &mut gpui::TestAppContext) {
+        let root = scratch("frames-request-mismatch");
+        let store = Store::at_test_root(&root);
+        let id = transcribed(&store, "the retried words");
+        let other = transcribed(&store, "another take");
+        let (app, _) = window_with_typing(cx, &store);
+        app.update(cx, |app, _| {
+            app.host.requests.insert(
+                "tr_mine".to_string(),
+                crate::remote_take::Request {
+                    stored_id: id.clone(),
+                    _hold: None,
+                    offer: true,
+                },
+            );
+        });
+        frame(&app, cx, completed_with(&other, Some("tr_mine"), true, "another take"));
+        assert!(
+            app.read_with(cx, |app, _| app.host.requests.contains_key("tr_mine")),
+            "the request waits for its own take's frames"
+        );
+        frame(&app, cx, completed_with(&id, Some("tr_mine"), true, "the retried words"));
+        settle(cx, "the retry offered", |cx| {
+            app.read_with(cx, |app, _| app.delivery.recovery.is_some())
+        });
+        assert!(app.read_with(cx, |app, _| app.host.requests.is_empty()));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A window with no store to read its own take back from lets go of
+    /// it when the transcript arrives: nothing stays bound or busy.
+    #[gpui::test]
+    fn a_window_without_a_store_lets_go_of_its_own_take(cx: &mut gpui::TestAppContext) {
+        let fake = Arc::new(FakeBackend::new());
+        fake.focus(FakeTarget::named("Editor", "notes.txt"));
+        let inserter = Arc::new(Inserter::with_backends(vec![Box::new(fake.clone())]));
+        let app = cx.new(|cx| {
+            let mut app = StarlingApp::for_test(None, cx);
+            app.delivery = DeliveryState::new(inserter, InsertionSettings::default());
+            app
+        });
+        own_take(&app, cx, "c_lost");
+        app.update(cx, |app, _| {
+            app.active_ids.insert("c_lost".to_string());
+        });
+        frame(&app, cx, completed_with("c_lost", None, true, "words"));
+        app.read_with(cx, |app, _| {
+            assert!(app.host.awaiting.is_empty());
+            assert!(!app.delivers("c_lost"), "nothing is typed for it later");
+            assert!(!app.is_active("c_lost"));
+        });
+        assert!(fake.insertions().is_empty());
+    }
+
     /// A disconnect lets go of the takes this window waited for: they are
     /// transcribed into history without it, and none stays busy here.
     #[gpui::test]

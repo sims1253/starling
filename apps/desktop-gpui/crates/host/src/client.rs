@@ -182,8 +182,9 @@ pub struct AskResultWire {
 
 /// What came back for a registered request.
 enum Reply {
-    /// The receipt plus the `seq` the host routed the command under.
-    Receipt(Result<Receipt, Rejection>, Option<u64>),
+    /// The receipt plus the `seq` the host routed the command under, and
+    /// what holds the microphone for a refused `capture.start`.
+    Receipt(Result<Receipt, Rejection>, Option<u64>, Option<crate::frame::TakeBusy>),
     Snapshot(Value),
     AgentWelcome(String),
     TakeWatching(Option<HostRecovery>),
@@ -344,6 +345,38 @@ impl HostClient {
         corr: Option<&str>,
         command: Command,
     ) -> Result<(Receipt, Option<u64>), ClientError> {
+        let (result, seq, _) = self.send_answered(corr, command)?;
+        result.map(|receipt| (receipt, seq)).map_err(ClientError::Rejected)
+    }
+
+    /// [`Self::send`], with what holds the microphone when the host
+    /// refused a `capture.start` because another take does (see
+    /// [`crate::frame::TakeBusy`]).
+    pub fn send_reporting_busy(
+        &self,
+        corr: Option<&str>,
+        command: Command,
+    ) -> Result<Receipt, (ClientError, Option<crate::frame::TakeBusy>)> {
+        match self.send_answered(corr, command) {
+            Ok((Ok(receipt), _, _)) => Ok(receipt),
+            Ok((Err(rejection), _, busy)) => Err((ClientError::Rejected(rejection), busy)),
+            Err(err) => Err((err, None)),
+        }
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn send_answered(
+        &self,
+        corr: Option<&str>,
+        command: Command,
+    ) -> Result<
+        (
+            Result<Receipt, Rejection>,
+            Option<u64>,
+            Option<crate::frame::TakeBusy>,
+        ),
+        ClientError,
+    > {
         let mut envelope = serde_json::Map::new();
         envelope.insert("v".into(), Value::from(1u64));
         envelope.insert("id".into(), Value::from(new_id("cmd")));
@@ -353,11 +386,9 @@ impl HostClient {
         }
         envelope.insert("type".into(), Value::from(command.type_name()));
         envelope.insert("payload".into(), command.payload_value());
-        match self.exchange(Frame::Command {
+        self.exchange_answered(Frame::Command {
             envelope: Value::Object(envelope),
-        })? {
-            (receipt, seq) => Ok((receipt, seq)),
-        }
+        })
     }
 
     /// Sends a raw envelope — the envelope-level path (client-owned `id`,
@@ -392,6 +423,22 @@ impl HostClient {
     }
 
     fn exchange(&self, frame: Frame) -> Result<(Receipt, Option<u64>), ClientError> {
+        let (result, seq, _) = self.exchange_answered(frame)?;
+        result.map(|receipt| (receipt, seq)).map_err(ClientError::Rejected)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn exchange_answered(
+        &self,
+        frame: Frame,
+    ) -> Result<
+        (
+            Result<Receipt, Rejection>,
+            Option<u64>,
+            Option<crate::frame::TakeBusy>,
+        ),
+        ClientError,
+    > {
         let id = match &frame {
             Frame::Command { envelope } => envelope
                 .get("id")
@@ -405,9 +452,7 @@ impl HostClient {
             }
         };
         self.exchange_reply(frame, id, |reply| match reply {
-            Reply::Receipt(result, seq) => result
-                .map_err(ClientError::Rejected)
-                .map(|receipt| (receipt, seq)),
+            Reply::Receipt(result, seq, busy) => Ok((result, seq, busy)),
             Reply::Snapshot(_) => Err(ClientError::Protocol(
                 "command answered by a snapshot".to_string(),
             )),
@@ -722,8 +767,13 @@ fn client_reader(
                 let conn = reader.into_inner();
                 reader = FrameReader::new(conn, cap.max(HELLO_PHASE_CAP));
             }
-            Ok(Frame::Receipt { req, seq, result }) => {
-                deliver(&pending, &req, Reply::Receipt(result, seq));
+            Ok(Frame::Receipt {
+                req,
+                seq,
+                result,
+                busy,
+            }) => {
+                deliver(&pending, &req, Reply::Receipt(result, seq, busy));
             }
             Ok(Frame::Snapshot { req, snapshot }) => {
                 deliver(&pending, &req, Reply::Snapshot(snapshot));

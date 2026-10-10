@@ -138,6 +138,11 @@ pub enum Frame {
         req: String,
         seq: Option<u64>,
         result: Result<Receipt, Rejection>,
+        /// For a refused `capture.start`: what holds the microphone, as
+        /// the take feed sees it (#220) — what the app tells the user,
+        /// never read out of the rejection's wording.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        busy: Option<TakeBusy>,
     },
     /// An event envelope pushed to every live connection.
     Event { envelope: Value },
@@ -290,6 +295,18 @@ pub enum Frame {
         state: TranscriptionState,
         yours: bool,
     },
+}
+
+/// Why a `capture.start` was refused while another take holds the
+/// microphone ([`Frame::Receipt`]'s `busy`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TakeBusy {
+    /// A take records or is opening the microphone; `yours`: this
+    /// connection started (or adopted) it.
+    Recording { yours: bool },
+    /// The previous take has stopped and is still being stored.
+    Saving,
 }
 
 /// What a [`Frame::Transcribe`] transcribes with.
@@ -606,6 +623,7 @@ mod tests {
                 req: "cmd_1".into(),
                 seq: Some(7),
                 result: Ok(Receipt::Accepted),
+                busy: None,
             },
             Frame::Receipt {
                 req: "cmd_2".into(),
@@ -615,6 +633,17 @@ mod tests {
                     state: "Idle".into(),
                     detail: "not legal from Idle".into(),
                 }),
+                busy: None,
+            },
+            Frame::Receipt {
+                req: "cmd_3".into(),
+                seq: None,
+                result: Err(Rejection::IllegalInState {
+                    command: "capture.start".into(),
+                    state: "Recording".into(),
+                    detail: "not legal from Recording".into(),
+                }),
+                busy: Some(TakeBusy::Recording { yours: false }),
             },
             Frame::Event {
                 envelope: serde_json::json!({

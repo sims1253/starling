@@ -1480,6 +1480,68 @@ mod tests {
         assert_eq!(fake.insertions().len(), 1);
     }
 
+    /// #220: a staged take's Insert types the text its own transcription
+    /// produced, even when a retry another window asked for is the take's
+    /// newest result in history by then.
+    #[gpui::test]
+    fn a_staged_insert_types_the_takes_own_result_not_a_later_retry(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use starling_insertion::testing::{FakeBackend, FakeTarget};
+        let root = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::at_test_root(root.path());
+        let fake = std::sync::Arc::new(FakeBackend::new());
+        fake.focus(FakeTarget::named("Editor", "notes.txt"));
+        let inserter = starling_insertion::Inserter::with_backends(vec![Box::new(fake.clone())]);
+        let app = cx.new(|cx| {
+            let mut app = StarlingApp::for_test(Some(store.clone()), cx);
+            app.delivery = crate::delivery::DeliveryState::new(
+                std::sync::Arc::new(inserter),
+                Default::default(),
+            );
+            app
+        });
+        let (id, _) = saved_take(&store);
+        let own = transcribe(&store, &id, "my own words");
+        transcribe(&store, &id, "somebody else's retry");
+        app.update(cx, |app, cx| {
+            app.delivery_take_started();
+            app.begin_staging(cx);
+            let token = app.staging.as_ref().unwrap().token;
+            app.stop_staging();
+            let capture = app.delivery_take_stopped();
+            app.bind_staging(token, &id);
+            app.bind_delivery(capture, &id);
+            app.host.awaiting.insert(id.clone());
+            app.apply_sessions(store.list().unwrap());
+            app.host_update(
+                crate::host_link::HostUpdate::Take(crate::host_link::TakeUpdate::Transcription {
+                    stored_id: id.clone(),
+                    take: None,
+                    req: None,
+                    attempt: Some(own.clone()),
+                    state: starling_runtime_host::frame::TranscriptionState::Completed {
+                        text: "my own words".to_string(),
+                        kept_earlier: false,
+                    },
+                    yours: true,
+                }),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.staging.as_ref().unwrap().phase, StagingPhase::Ready);
+            assert_eq!(app.staged_text_for(&id).as_deref(), Some("my own words"));
+        });
+        starling_focus(&app, cx, true);
+        press_insert(&app, cx);
+        starling_focus(&app, cx, false);
+        let typed = fake.insertions();
+        assert_eq!(typed.len(), 1, "{typed:?}");
+        assert_eq!(typed[0].1, "my own words");
+    }
+
     #[gpui::test]
     fn a_staged_insert_into_a_changed_window_keeps_the_text(cx: &mut gpui::TestAppContext) {
         use starling_insertion::InsertError;

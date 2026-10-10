@@ -2108,6 +2108,7 @@ impl StarlingApp {
         // Delete during processing: the job is cancelled and its draft
         // deleted, so a late result lands nowhere.
         self.drop_processing(&id);
+        self.forget_own_result(&id);
         self.deleting_ids.insert(id.clone());
         cx.spawn(async move |this, cx| {
             let deleted = {
