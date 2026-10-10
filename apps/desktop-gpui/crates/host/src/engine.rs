@@ -584,13 +584,15 @@ fn redact_endpoint(endpoint: &str) -> String {
         .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
         .collect();
     let endpoint = normalized.as_str();
-    let authority_start = scheme_end(endpoint)
+    // Authority slashes are skipped with or without a scheme, so a
+    // scheme-relative `//user:secret@host` is redacted too.
+    let after_scheme = scheme_end(endpoint)
         .filter(|&at| endpoint[at..].starts_with(['/', '\\']))
-        .map_or(0, |at| {
-            at + endpoint[at..]
-                .find(|c| c != '/' && c != '\\')
-                .unwrap_or(endpoint.len() - at)
-        });
+        .unwrap_or(0);
+    let authority_start = after_scheme
+        + endpoint[after_scheme..]
+            .find(|c| c != '/' && c != '\\')
+            .unwrap_or(endpoint.len() - after_scheme);
     let authority_end = endpoint[authority_start..]
         .find(['/', '\\', '?', '#'])
         .map_or(endpoint.len(), |at| authority_start + at);
@@ -1089,6 +1091,9 @@ mod tests {
                 "http://example.com/?flag&password",
                 "http://example.com/?flag&password",
             ),
+            // Scheme-relative endpoints still have an authority.
+            ("//user:secret@example.com/v1", "//***@example.com/v1"),
+            ("\\\\user:secret@example.com", "\\\\***@example.com"),
             ("not a url", "not a url"),
             ("", ""),
         ] {
