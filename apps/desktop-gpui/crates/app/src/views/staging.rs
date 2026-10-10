@@ -85,6 +85,7 @@ pub fn render_staging_panel(
         .take_id
         .as_deref()
         .and_then(|id| app.staged_insert(id));
+    let insert_enabled = app.staging_insert_enabled();
 
     let status = match phase {
         StagingPhase::Recording => {
@@ -297,14 +298,9 @@ pub fn render_staging_panel(
             .child(if copied { "Copied" } else { "Copy" }),
         )
         .children(insert.map(|insert| {
-            let enabled = match insert {
-                StagedInsert::Ready => ready && !text.is_empty(),
-                StagedInsert::Waiting => true,
-                StagedInsert::Typing | StagedInsert::Inserted => false,
-            };
             panel_button(
                 "staging-insert",
-                !enabled,
+                !insert_enabled,
                 cx.listener(|this, _, _window, cx| this.insert_staging(cx)),
             )
             .child(match insert {

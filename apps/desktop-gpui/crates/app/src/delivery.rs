@@ -39,7 +39,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
 use gpui::{AppContext, ClipboardItem, Context, Task};
@@ -82,48 +82,109 @@ impl Drop for OutGuard {
     }
 }
 
+/// How long a capture worker the display has not answered keeps later
+/// captures waiting. Past it the worker is abandoned (its answer would be
+/// refused by the cutoff anyway) and the next capture tries a fresh
+/// connection.
+const STUCK_CAPTURE: Duration = Duration::from_secs(5);
+/// At most this many abandoned capture workers are ever out: a display
+/// that answers no connection at all does not cost a thread per take.
+const MAX_ABANDONED_CAPTURES: usize = 2;
+
+/// The capture workers out (see [`bounded_capture`]).
+#[derive(Default)]
+pub(crate) struct CaptureWorkers {
+    state: Mutex<Workers>,
+}
+
+#[derive(Default)]
+struct Workers {
+    next: u64,
+    /// The worker the latest capture waited for, and when it started.
+    current: Option<(u64, Instant)>,
+    abandoned: Vec<u64>,
+}
+
+impl CaptureWorkers {
+    /// Registers a new worker, or says why none may start: the current
+    /// one is younger than `stuck_after`, or too many were abandoned.
+    fn start(&self, stuck_after: Duration) -> Option<u64> {
+        let mut workers = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some((id, started)) = workers.current {
+            if started.elapsed() < stuck_after || workers.abandoned.len() >= MAX_ABANDONED_CAPTURES
+            {
+                return None;
+            }
+            workers.abandoned.push(id);
+        }
+        workers.next += 1;
+        let id = workers.next;
+        workers.current = Some((id, Instant::now()));
+        Some(id)
+    }
+
+    fn finish(&self, id: u64) {
+        let mut workers = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if workers.current.is_some_and(|(current, _)| current == id) {
+            workers.current = None;
+        }
+        workers.abandoned.retain(|&abandoned| abandoned != id);
+    }
+}
+
+/// Ends a capture worker's registration when it ends, also by a panic: a
+/// worker left registered would refuse later ones.
+struct CaptureGuard(Arc<CaptureWorkers>, u64);
+
+impl Drop for CaptureGuard {
+    fn drop(&mut self) {
+        self.0.finish(self.1);
+    }
+}
+
 /// The inserter's capture on a worker thread, waited for at most
 /// [`CAPTURE_BUDGET`]: a stuck display cannot freeze the UI thread, and an
 /// answer that comes later is not taken (focus may have moved by then).
-/// `out` is set while a worker is out; one the display never answered
-/// is not joined by more. The cutoff is absolute: an answer the worker
+/// One the display never answered is not joined by more until it is
+/// [`STUCK_CAPTURE`] old. The cutoff is absolute: an answer the worker
 /// had after it is refused even when the UI thread, itself late, finds it
 /// already waiting.
 fn bounded_capture(
     inserter: Arc<Inserter>,
-    out: &Arc<AtomicBool>,
+    workers: &Arc<CaptureWorkers>,
 ) -> Result<TargetSnapshot, InsertError> {
-    bounded_capture_after(inserter, out, || {})
+    bounded_capture_after(inserter, workers, STUCK_CAPTURE, || {})
 }
 
-/// [`bounded_capture`], running `stall` between starting the worker and
-/// waiting for it: tests stand in a descheduled UI thread with it.
+/// [`bounded_capture`] with the stuck-worker limit given, running `stall`
+/// between starting the worker and waiting for it: tests stand in a
+/// descheduled UI thread with it.
 fn bounded_capture_after(
     inserter: Arc<Inserter>,
-    out: &Arc<AtomicBool>,
+    workers: &Arc<CaptureWorkers>,
+    stuck_after: Duration,
     stall: impl FnOnce(),
 ) -> Result<TargetSnapshot, InsertError> {
     let deadline = Instant::now() + CAPTURE_BUDGET;
-    if out.swap(true, Ordering::SeqCst) {
+    let Some(id) = workers.start(stuck_after) else {
         return Err(InsertError::Unavailable {
             reason: "the display has not answered an earlier focus check".to_string(),
         });
-    }
+    };
     let (sender, receiver) = mpsc::channel();
-    let worker_out = out.clone();
+    let guard = CaptureGuard(workers.clone(), id);
     let spawned = std::thread::Builder::new()
         .name("starling-capture".into())
         .spawn(move || {
-            let worker = OutGuard(worker_out);
             let target = inserter.capture();
             let answered = Instant::now();
-            // Cleared before the answer, so the next capture never sees
+            // Finished before the answer, so the next capture never sees
             // an answered worker as out.
-            drop(worker);
+            drop(guard);
             let _ = sender.send((target, answered));
         });
     if let Err(error) = spawned {
-        out.store(false, Ordering::SeqCst);
+        // The closure, and the guard in it, are dropped with the error.
         return Err(InsertError::Unavailable {
             reason: format!("cannot start the focus check: {error}"),
         });
@@ -384,8 +445,8 @@ pub(crate) struct DeliveryState {
     /// The latest insert. The next one waits for it, so inserts type in
     /// the order they were started, one at a time.
     last_insert: Option<Task<()>>,
-    /// A capture worker is out (see [`bounded_capture`]).
-    capture_out: Arc<AtomicBool>,
+    /// The capture workers out (see [`bounded_capture`]).
+    capture_out: Arc<CaptureWorkers>,
     /// The overlay window has focus. It never should, but on Wayland the
     /// compositor decides (see `overlay.rs`), so delivery counts it as
     /// Starling's own window. `overlay_gained` is when it last took focus.
@@ -1391,6 +1452,10 @@ mod tests {
         cx.executor().advance_clock(PASTE_SETTLE);
         cx.run_until_parked();
         assert_eq!(fake.field(), "Hello there.");
+
+        // An overlay focus before a take's capture says nothing about it.
+        take(&app, cx, "take-2", " Again.", |_| {});
+        assert_eq!(fake.field(), "Hello there. Again.");
     }
 
     /// An overlay window that goes away without reporting its focus loss
@@ -1942,12 +2007,12 @@ mod tests {
     fn a_capture_answered_after_the_cutoff_is_refused_though_waiting() {
         let (fake, inserter) = fake_session();
         fake.focus(FakeTarget::named("Editor", "notes.txt"));
-        let out = Arc::new(AtomicBool::new(false));
+        let out = Arc::default();
         let descheduled = || std::thread::sleep(CAPTURE_BUDGET * 3);
-        let prompt = bounded_capture_after(inserter.clone(), &out, descheduled);
+        let prompt = bounded_capture_after(inserter.clone(), &out, STUCK_CAPTURE, descheduled);
         assert!(prompt.is_ok(), "{prompt:?}");
         fake.set_capture_delay(CAPTURE_BUDGET * 3 / 2);
-        let late = bounded_capture_after(inserter, &out, descheduled);
+        let late = bounded_capture_after(inserter, &out, STUCK_CAPTURE, descheduled);
         assert!(
             matches!(late, Err(InsertError::Unavailable { .. })),
             "{late:?}"
@@ -1960,7 +2025,7 @@ mod tests {
     fn a_panicked_capture_worker_does_not_block_later_captures() {
         let (fake, inserter) = fake_session();
         fake.focus(FakeTarget::named("Editor", "notes.txt"));
-        let out = Arc::new(AtomicBool::new(false));
+        let out = Arc::default();
         fake.set_capture_panics(true);
         let panicked = bounded_capture(inserter.clone(), &out);
         assert!(
@@ -1970,6 +2035,41 @@ mod tests {
         fake.set_capture_panics(false);
         let next = bounded_capture(inserter, &out);
         assert!(next.is_ok(), "{next:?}");
+    }
+
+    /// A capture worker the display never answers holds later captures
+    /// off only until it is stuck: then a fresh one may try, while the
+    /// number of abandoned workers stays bounded.
+    #[test]
+    fn a_stuck_capture_worker_is_abandoned_within_a_bound() {
+        let (fake, inserter) = fake_session();
+        fake.focus(FakeTarget::named("Editor", "notes.txt"));
+        let stuck = CAPTURE_BUDGET * 2;
+        let capture =
+            |out: &Arc<CaptureWorkers>| bounded_capture_after(inserter.clone(), out, stuck, || {});
+        let refused = |result: Result<TargetSnapshot, InsertError>| {
+            matches!(&result, Err(InsertError::Unavailable { reason })
+                if reason.contains("earlier focus check"))
+        };
+
+        let out = Arc::default();
+        fake.set_capture_delay(Duration::from_secs(2));
+        assert!(capture(&out).is_err());
+        // Still young: the next capture waits for it.
+        assert!(refused(capture(&out)));
+        // Stuck: abandoned, and a fresh worker answers.
+        std::thread::sleep(stuck);
+        fake.set_capture_delay(Duration::ZERO);
+        assert!(capture(&out).is_ok());
+
+        // A display that answers nothing costs a bounded number of threads.
+        let out = Arc::default();
+        fake.set_capture_delay(Duration::from_secs(2));
+        for _ in 0..=MAX_ABANDONED_CAPTURES {
+            assert!(!refused(capture(&out)));
+            std::thread::sleep(stuck);
+        }
+        assert!(refused(capture(&out)));
     }
 
     /// Opening Settings again while a session check is unanswered starts

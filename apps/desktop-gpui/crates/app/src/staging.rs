@@ -1032,10 +1032,39 @@ impl StarlingApp {
         cx.notify();
     }
 
+    /// Whether the panel's Insert acts now, for its button and its
+    /// shortcut alike: a ready, non-empty draft can be inserted, and a
+    /// pressed Insert can be cancelled.
+    pub(crate) fn staging_insert_enabled(&self) -> bool {
+        let Some(staging) = self.staging.as_ref() else {
+            return false;
+        };
+        let Some(id) = staging.take_id.as_deref() else {
+            return false;
+        };
+        match self.staged_insert(id) {
+            Some(crate::delivery::StagedInsert::Ready) => {
+                staging.phase == StagingPhase::Ready
+                    && self
+                        .visible_staging_draft()
+                        .is_some_and(|draft| !draft.text().is_empty())
+            }
+            Some(crate::delivery::StagedInsert::Waiting) => true,
+            _ => false,
+        }
+    }
+
     /// "Insert" (or Secondary+Shift+Enter): the ready draft goes into the
     /// window the take started in (`insert_staged`, #221).
     pub(crate) fn insert_staging(&mut self, cx: &mut Context<Self>) {
-        let Some((token, id)) = self.ready_staging() else {
+        if !self.staging_insert_enabled() {
+            return;
+        }
+        let Some((token, id)) = self
+            .staging
+            .as_ref()
+            .and_then(|staging| Some((staging.token, staging.take_id.clone()?)))
+        else {
             return;
         };
         // The stored text follows what is typed.
@@ -1467,6 +1496,36 @@ mod tests {
         app.update(cx, |app, cx| app.finish_staging(cx));
         cx.run_until_parked();
         assert_eq!(staged_insert_state(&app, cx, &id), None);
+    }
+
+    /// The shortcut acts only when the button would: an emptied draft
+    /// arms no Insert.
+    #[gpui::test]
+    fn the_insert_shortcut_follows_the_button(cx: &mut gpui::TestAppContext) {
+        use crate::delivery::StagedInsert;
+        let (_root, app, fake, id) = staged_insert_take(cx, Default::default(), |_| {});
+        starling_focus(&app, cx, true);
+        app.update(cx, |app, cx| {
+            let token = app.staging.as_ref().unwrap().token;
+            let end = app.visible_staging_draft().unwrap().text().chars().count();
+            app.apply_staging_edit(
+                token,
+                &TextEdit {
+                    start: 0,
+                    end,
+                    text: String::new(),
+                },
+                cx,
+            );
+            assert!(!app.staging_insert_enabled());
+        });
+        press_insert(&app, cx);
+        assert_eq!(
+            staged_insert_state(&app, cx, &id),
+            Some(StagedInsert::Ready)
+        );
+        starling_focus(&app, cx, false);
+        assert!(fake.insertions().is_empty());
     }
 
     /// The overlay asks for the switch while a pressed Insert waits, and
