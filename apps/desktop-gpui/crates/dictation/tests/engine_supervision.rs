@@ -21,21 +21,13 @@ fn stage_dying_engine(root: &std::path::Path) -> std::path::PathBuf {
     // The fake answers with the CURRENTLY expected ABI (bumping
     // EXPECTED_ENGINE_ABI must not break this success-path fixture) and an
     // older version string, so probing passes and serving dies.
-    std::fs::write(
+    write_executable(
         &engine,
-        format!(
+        &format!(
             "#!/bin/sh\ncase \"$1\" in\n  --version)\n    printf 'starling-serve 0.1.0\\nabi-version: {}\\nbackend: cpu\\nsupported-models: parakeet s1\\n'\n    exit 0\n    ;;\n  *) exit 1 ;;\nesac\n",
             starling_dictation::engine::EXPECTED_ENGINE_ABI
         ),
-    )
-    .expect("write dying engine");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut permissions = std::fs::metadata(&engine).expect("stat").permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&engine, permissions).expect("chmod");
-    }
+    );
     let sha = starling_dictation::engine::bundle::sha256_file(&engine).expect("hash");
     std::fs::write(
         dir.join("SHA256SUMS.txt"),

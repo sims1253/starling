@@ -56,8 +56,7 @@ pub fn stage_engine_dir(root: &Path, fixture: &Path) -> PathBuf {
     let dir = root.join("engines");
     std::fs::create_dir_all(&dir).expect("create engines dir");
     let engine = dir.join("starling-serve-cpu");
-    std::fs::copy(fixture, &engine).expect("copy fixture");
-    make_executable(&engine);
+    copy_executable(fixture, &engine);
     let sha = sha256_file(&engine).expect("hash staged engine");
     std::fs::write(
         dir.join("SHA256SUMS.txt"),
@@ -92,14 +91,12 @@ pub fn stage_delayed_engine_dir(
     let engine = dir.join("starling-serve-cpu");
     // Single-quoted for sh, with embedded quotes closed, escaped, reopened.
     let quoted = format!("'{}'", fixture.display().to_string().replace('\'', r"'\''"));
-    std::fs::write(
+    write_executable(
         &engine,
-        format!(
+        &format!(
             "#!/bin/sh\ncase \"$*\" in *{slow_arg}*) sleep {delay_secs} ;; esac\nexec {quoted} \"$@\"\n"
         ),
-    )
-    .expect("write delayed engine");
-    make_executable(&engine);
+    );
     let sha = sha256_file(&engine).expect("hash staged engine");
     std::fs::write(
         dir.join("SHA256SUMS.txt"),
@@ -109,16 +106,50 @@ pub fn stage_delayed_engine_dir(
     dir
 }
 
+/// Writes `script` to `path` as an executable. A `sh` child writes the
+/// file, never a descriptor in this process: tests run on parallel
+/// threads, and a sibling test's spawn that forks while such a
+/// descriptor is open copies it into a child holding it until that
+/// child execs. Exec'ing the engine in that window fails with ETXTBSY
+/// ("Text file busy"), under any name it was renamed to.
 #[cfg(unix)]
-fn make_executable(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let mut permissions = std::fs::metadata(path).expect("stat").permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(path, permissions).expect("chmod");
+pub fn write_executable(path: &Path, script: &str) {
+    let mut writer = std::process::Command::new("sh")
+        .args(["-c", "cat > \"$0\" && chmod 755 \"$0\""])
+        .arg(path)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn sh");
+    writer
+        .stdin
+        .take()
+        .expect("sh stdin")
+        .write_all(script.as_bytes())
+        .expect("write engine");
+    assert!(writer.wait().expect("wait for sh").success(), "write engine");
 }
 
 #[cfg(not(unix))]
-fn make_executable(_path: &Path) {}
+pub fn write_executable(path: &Path, script: &str) {
+    std::fs::write(path, script).expect("write engine");
+}
+
+/// Copies an executable with `cp`, for the reason [`write_executable`]
+/// gives.
+#[cfg(unix)]
+fn copy_executable(from: &Path, to: &Path) {
+    let status = std::process::Command::new("cp")
+        .arg(from)
+        .arg(to)
+        .status()
+        .expect("spawn cp");
+    assert!(status.success(), "copy fixture");
+}
+
+#[cfg(not(unix))]
+fn copy_executable(from: &Path, to: &Path) {
+    std::fs::copy(from, to).expect("copy fixture");
+}
 
 /// A catalog entry served by [`spawn_model_server`]. The slug is always
 /// `parakeet` (the fixture serves it); the id and file differ per model.
