@@ -192,12 +192,14 @@ def stitch_timed(
 
     A committed word and a new word are the same when their keys match and
     their starts are at most ``tolerance`` apart. The most such pairs in
-    order (a longest common subsequence) form the alignment, so text a
-    window repeats elsewhere ("one two one two") or a common word far from
-    the boundary cannot match, and a single shared word is enough. The cut
-    is the pair closest to ``center`` (the middle of the shared audio, where
-    both windows have the most context; the earlier pair on a tie):
-    ``committed`` up to and including it, then ``new`` after it.
+    order (a longest common subsequence; among those, the smallest total
+    start difference, so a word said several times in a row pairs with the
+    same occurrence) form the alignment, so text a window repeats elsewhere
+    ("one two one two") or a common word far from the boundary cannot match,
+    and a single shared word is enough. The cut is the pair closest to
+    ``center`` (the middle of the shared audio, where both windows have the
+    most context; the earlier pair on a tie): ``committed`` up to and
+    including it, then ``new`` after it.
 
     Kept in lockstep with ``stitch_timed`` in cpp/serve/stream_session.cpp,
     including the tie-breaking.
@@ -206,22 +208,39 @@ def stitch_timed(
     a = [_norm(w) for w in committed]
     b = [_norm(w) for w in new]
 
-    def same(i: int, j: int) -> bool:
-        return bool(a[i]) and a[i] == b[j] and abs(committed_starts[i] - new_starts[j]) <= tolerance
+    def gap(i: int, j: int) -> Optional[int]:
+        """Start difference of a matching pair, or None."""
+        if not a[i] or a[i] != b[j]:
+            return None
+        diff = abs(committed_starts[i] - new_starts[j])
+        return diff if diff <= tolerance else None
 
-    # d[i][j]: most pairs between committed[:i] and new[:j].
-    d = [[0] * (m + 1) for _ in range(n + 1)]
+    def better(x: tuple[int, int], y: tuple[int, int]) -> bool:
+        """More pairs, then a smaller total start difference."""
+        return x[0] > y[0] or (x[0] == y[0] and x[1] < y[1])
+
+    # d[i][j]: (most pairs, their least total start difference) between
+    # committed[:i] and new[:j].
+    d = [[(0, 0)] * (m + 1) for _ in range(n + 1)]
     for i in range(1, n + 1):
         for j in range(1, m + 1):
-            d[i][j] = max(d[i - 1][j], d[i][j - 1],
-                          d[i - 1][j - 1] + 1 if same(i - 1, j - 1) else 0)
+            cell = d[i - 1][j]
+            if better(d[i][j - 1], cell):
+                cell = d[i][j - 1]
+            g = gap(i - 1, j - 1)
+            if g is not None:
+                diag = (d[i - 1][j - 1][0] + 1, d[i - 1][j - 1][1] + g)
+                if better(diag, cell):
+                    cell = diag
+            d[i][j] = cell
     pairs = []
     i, j = n, m
     while i > 0 and j > 0:
-        if same(i - 1, j - 1) and d[i][j] == d[i - 1][j - 1] + 1:
+        g = gap(i - 1, j - 1)
+        if g is not None and d[i][j] == (d[i - 1][j - 1][0] + 1, d[i - 1][j - 1][1] + g):
             pairs.append((i - 1, j - 1))
             i, j = i - 1, j - 1
-        elif d[i - 1][j] >= d[i][j - 1]:
+        elif d[i][j] == d[i - 1][j]:
             i -= 1
         else:
             j -= 1

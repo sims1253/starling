@@ -67,8 +67,10 @@ constexpr double kStitchTimeToleranceSeconds = 0.3;
 // word was heard by both windows. A committed and a new word are the same
 // when their norm_word() keys match (nonempty) and their starts are at most
 // `tolerance` apart; the most such pairs in order (a longest common
-// subsequence) form the alignment, so text repeated elsewhere or a common
-// word far from the boundary cannot match and one shared word is enough.
+// subsequence; among those, the smallest total start difference, so a word
+// said several times in a row pairs with the same occurrence) form the
+// alignment, so text repeated elsewhere or a common word far from the
+// boundary cannot match and one shared word is enough.
 // The cut is the pair closest to `center` (the middle of the shared audio;
 // the earlier pair on a tie). Port of stitch_timed() in stream_chunk.py.
 std::optional<std::pair<int, int>> stitch_timed(

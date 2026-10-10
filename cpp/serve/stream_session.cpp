@@ -229,20 +229,37 @@ std::optional<std::pair<int, int>> stitch_timed(
     std::vector<std::string> a, b;
     for (const auto& w : committed) a.push_back(norm_word(w));
     for (const auto& w : new_words) b.push_back(norm_word(w));
-    auto same = [&](int i, int j) {
-        return !a[i].empty() && a[i] == b[j]
-            && std::llabs(committed_starts[i] - new_starts[j]) <= tolerance;
+    // Start difference of a matching pair, or -1.
+    auto gap = [&](int i, int j) -> int64_t {
+        if (a[i].empty() || a[i] != b[j]) return -1;
+        const int64_t diff = std::llabs(committed_starts[i] - new_starts[j]);
+        return diff <= tolerance ? diff : -1;
     };
-    // d[i][j]: most pairs between committed[0, i) and new_words[0, j).
-    std::vector<std::vector<int>> d(n + 1, std::vector<int>(m + 1, 0));
-    for (int i = 1; i <= n; ++i)
-        for (int j = 1; j <= m; ++j)
-            d[i][j] = std::max({d[i - 1][j], d[i][j - 1],
-                                same(i - 1, j - 1) ? d[i - 1][j - 1] + 1 : 0});
+    // (pairs, total start difference): more pairs, then a smaller total.
+    using Score = std::pair<int, int64_t>;
+    auto better = [](const Score& x, const Score& y) {
+        return x.first > y.first || (x.first == y.first && x.second < y.second);
+    };
+    // d[i][j]: the best score between committed[0, i) and new_words[0, j).
+    std::vector<std::vector<Score>> d(n + 1, std::vector<Score>(m + 1, Score{0, 0}));
+    for (int i = 1; i <= n; ++i) {
+        for (int j = 1; j <= m; ++j) {
+            Score cell = d[i - 1][j];
+            if (better(d[i][j - 1], cell)) cell = d[i][j - 1];
+            const int64_t g = gap(i - 1, j - 1);
+            if (g >= 0) {
+                const Score diag{d[i - 1][j - 1].first + 1, d[i - 1][j - 1].second + g};
+                if (better(diag, cell)) cell = diag;
+            }
+            d[i][j] = cell;
+        }
+    }
     std::optional<std::pair<int, int>> cut;
     int64_t best = 0;
     for (int i = n, j = m; i > 0 && j > 0;) {
-        if (same(i - 1, j - 1) && d[i][j] == d[i - 1][j - 1] + 1) {
+        const int64_t g = gap(i - 1, j - 1);
+        if (g >= 0
+            && d[i][j] == Score{d[i - 1][j - 1].first + 1, d[i - 1][j - 1].second + g}) {
             // Walking back: an equally close earlier pair replaces a later
             // one (the earlier pair wins a tie).
             const int64_t dist =
@@ -253,7 +270,7 @@ std::optional<std::pair<int, int>> stitch_timed(
             }
             --i;
             --j;
-        } else if (d[i - 1][j] >= d[i][j - 1]) {
+        } else if (d[i][j] == d[i - 1][j]) {
             --i;
         } else {
             --j;

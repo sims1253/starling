@@ -120,7 +120,7 @@ jobs:
             audex_loader_guard_test granite_stage_test granite_ctc_argmax_test \
             granite_ctc_proposer_test granite_ctc_entry_test model_lifetime_test \
             starling-quantize \
-            parakeet_compact_engine_test s1_quant_loader_test \
+            parakeet_compact_engine_test parakeet_word_frames_test s1_quant_loader_test \
             voxtral_encoder_test voxtral_engine_test voxtral_loader_guard_test \
             trace_schema_test trace_off_test granite_trace_test serve_trace_test \
             granite_fairness_test \
@@ -140,6 +140,7 @@ jobs:
       - name: C++ unit tests (serve logic, no GPU/model)
         run: |
           ./build/stream_session_test
+          ./build/parakeet_word_frames_test
           ./build/audio_parser_test
           ./build/replay_graph_support_test
           ./build/moss-preview-copy-test
