@@ -202,6 +202,22 @@ class RecordingStoreAtRestTest {
     }
 
     @Test
+    fun aTakeIsCompressedByOneCompressionAtATime() {
+        val store = RecordingStore(storeDir())
+        val take = committedTake(store)
+        var second: RecordingStore.Compression? = null
+        store.compressionHook = { step ->
+            if (step == RecordingStore.CompressionStep.ENCODED && second == null) {
+                second = store.compressAudio(take.id)
+            }
+        }
+
+        assertTrue(store.compressAudio(take.id) is RecordingStore.Compression.Compressed)
+        assertEquals(RecordingStore.Compression.Skipped("compressing"), second)
+        assertEquals(emptyList<String>(), store.compressionCandidates())
+    }
+
+    @Test
     fun aDeleteDuringTheEncodeLeavesNothingBehind() {
         val store = RecordingStore(storeDir())
         val take = committedTake(store)

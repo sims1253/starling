@@ -67,7 +67,8 @@ class DurableAudioDeviceTest {
         val settled = transcribe(recording.id, null)
         Log.i(TAG, "record: after stop ${settled.status} — ${settled.errorMessage}")
         assertEquals(RecordingStatus.FAILED, settled.status)
-        assertTrue(app.recordings.audioFile(settled).length() > 44 + 32_000L * 60 * minutes * 0.99)
+        // Measured as the request audio: upkeep may already have made it FLAC (#342).
+        assertTrue(app.recordings.withRequestAudio(settled.id) { it.length() } > 44 + 32_000L * 60 * minutes * 0.99)
     }
 
     @Test
@@ -101,7 +102,8 @@ class DurableAudioDeviceTest {
                     "error=${restored.errorMessage} recovery=${restored.recovery}",
             )
             val audio = app.recordings.audioFile(restored)
-            val pcm = WavPcm.decodePcm16(audio)!!.pcm
+            // The request audio, whether the take is still WAV or FLAC by now (#342).
+            val pcm = app.recordings.withRequestAudio(id) { WavPcm.decodePcm16(it)!!.pcm }
             if (key == "record-id") {
                 // Failed after Stop; an earlier verify run may have retried it.
                 assertEquals(

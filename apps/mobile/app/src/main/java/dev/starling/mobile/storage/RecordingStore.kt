@@ -61,6 +61,10 @@ class RecordingStore internal constructor(
     private val pins = HashMap<String, Int>()
     private var generation = 0L
 
+    // Guarded by [lock]: takes a compression is encoding right now. A second
+    // compression of the same take would write the same temporary.
+    private val compressing = HashSet<String>()
+
     /** Test hook: runs at the named step of [compressAudio] (see [CompressionStep]). */
     internal var compressionHook: ((CompressionStep) -> Unit)? = null
 
@@ -320,8 +324,17 @@ class RecordingStore internal constructor(
         val wavBytes = synchronized(lock) {
             val recording = runCatching { get(id) }.getOrElse { return Compression.Skipped("deleted") }
             compressionBlocker(recording)?.let { return Compression.Skipped(it) }
+            compressing += id
             wav.length()
         }
+        try {
+            return encodeAndPublish(id, wav, wavBytes)
+        } finally {
+            synchronized(lock) { compressing -= id }
+        }
+    }
+
+    private fun encodeAndPublish(id: String, wav: File, wavBytes: Long): Compression {
         val dataBytes = wavBytes - WAV_HEADER_BYTES
         val temporary = File(directory, ".$id$FLAC_TEMP_SUFFIX")
         try {
@@ -348,7 +361,7 @@ class RecordingStore internal constructor(
             val blocker = when {
                 recording == null -> "deleted"
                 wav.length() != wavBytes -> "changed"
-                else -> compressionBlocker(recording)
+                else -> compressionBlocker(recording, publishing = true)
             }
             if (blocker != null) {
                 temporary.delete()
@@ -369,8 +382,12 @@ class RecordingStore internal constructor(
         }
     }
 
-    /** Why [recording] cannot be compressed now; null when it can. Caller holds [lock]. */
-    private fun compressionBlocker(recording: Recording): String? {
+    /**
+     * Why [recording] cannot be compressed now; null when it can. The
+     * compression [publishing] it is the one in [compressing]. Caller holds
+     * [lock].
+     */
+    private fun compressionBlocker(recording: Recording, publishing: Boolean = false): String? {
         val wav = wavFile(recording.id)
         val partial = partialFile(recording)
         return when {
@@ -382,6 +399,7 @@ class RecordingStore internal constructor(
             recording.errorMessage == UNRECOVERED_CAPTURE || partial.exists() || WavWriter.isOpen(partial) ->
                 "not finalized"
             (pins[recording.id] ?: 0) > 0 -> "in use"
+            !publishing && recording.id in compressing -> "compressing"
             flacFile(recording.id).exists() -> "compressed"
             // Only the app's own finalized WAV, whose header the request WAV
             // rebuilds byte for byte.
