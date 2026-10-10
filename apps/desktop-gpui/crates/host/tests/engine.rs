@@ -597,11 +597,12 @@ fn a_torn_settings_write_keeps_the_last_engine_choice() {
     host.shutdown();
 }
 
-/// #220: the watcher starts with no `last`, so a change between the
-/// startup load (which resolved the host's initial engine choice) and
-/// the watcher's start is applied at its first poll. The startup
-/// choice here names the old endpoint while the file already names a
-/// new one — exactly that gap — and the host converges to the file.
+/// #220: a change between the startup load (which resolved the host's
+/// initial engine choice) and the watcher's start is not frozen out: the
+/// host reads the file once more before it accepts a connection — the
+/// baseline its watcher compares with — and converges to it. The startup
+/// choice here names the old endpoint while the file already names a new
+/// one, exactly that gap.
 #[test]
 fn a_change_before_the_watcher_starts_is_still_applied() {
     let root = tempfile::tempdir().unwrap();
@@ -611,8 +612,8 @@ fn a_change_before_the_watcher_starts_is_still_applied() {
     let mut settings = Settings::default_settings();
     settings.engine.mode = EngineMode::Manual;
     settings.endpoint = "http://127.0.0.1:8181".into();
-    // …and what it says by the time the watcher first polls: the user
-    // moved the manual endpoint while the host was starting.
+    // …and what it says by the time the host serves: the user moved the
+    // manual endpoint while the host was starting.
     settings.endpoint = "http://127.0.0.1:9196".into();
     settings.save(&path).unwrap();
 
@@ -628,19 +629,9 @@ fn a_change_before_the_watcher_starts_is_still_applied() {
     let mut host = serve(host_setup).expect("host serves");
     assert_eq!(
         host.engine_label(),
-        "manual:http://127.0.0.1:8181",
-        "the startup choice serves first"
+        "manual:http://127.0.0.1:9196",
+        "the file's newer choice serves before any app connects"
     );
-
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while host.engine_label() != "manual:http://127.0.0.1:9196" {
-        assert!(
-            Instant::now() < deadline,
-            "the pre-watcher change was never applied (still {})",
-            host.engine_label()
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
     host.shutdown();
 }
 
@@ -1331,6 +1322,12 @@ fn hosts_and_apps_of_different_builds_settle_who_serves() {
         std::thread::sleep(Duration::from_millis(50));
     }
     assert!(host.retire_requested(), "whoever runs the host is told to stop it");
+    // Committed: no new work is taken on until it has stopped.
+    let late = connect(host.socket_path());
+    let refused = late
+        .send(Some("take_late"), Command::CaptureStart { policy: "push-to-talk".into() })
+        .expect_err("a retiring host takes on no new take");
+    assert!(refused.to_string().contains("stepping aside"), "{refused}");
     host.shutdown();
 
     // A newer host and an older app: refused, with what to do.

@@ -161,9 +161,19 @@ pub(crate) enum Launch {
 /// so a take's stop or abort can never overtake its start.
 pub(crate) struct HostLink {
     commands: std::sync::mpsc::Sender<Outgoing>,
+    /// The engine requests, in the order the app made them, on a thread
+    /// of their own: one can wait seconds (a switch away from the
+    /// built-in engine drains) and must not hold a take's commands up.
+    engine: std::sync::mpsc::Sender<EngineCall>,
     stop: Arc<AtomicBool>,
     relaunch: Arc<AtomicBool>,
     current: Arc<Mutex<Option<Arc<HostClient>>>>,
+}
+
+/// One engine request and where its answer goes.
+struct EngineCall {
+    request: starling_runtime_host::engine::EngineRequest,
+    reply: tokio::sync::oneshot::Sender<Result<starling_runtime_host::engine::EngineReply, String>>,
 }
 
 enum Outgoing {
@@ -189,6 +199,7 @@ impl HostLink {
         let relaunch = Arc::new(AtomicBool::new(false));
         let current: Arc<Mutex<Option<Arc<HostClient>>>> = Arc::default();
         let (commands, outgoing) = std::sync::mpsc::channel();
+        let (engine, engine_calls) = std::sync::mpsc::channel();
         let spawned = std::thread::Builder::new()
             .name("starling-host-link".to_string())
             .spawn({
@@ -206,6 +217,14 @@ impl HostLink {
                         let current = Arc::clone(&current);
                         move || command_loop(outgoing, current, tx)
                     })
+            })
+            .and_then(|_| {
+                std::thread::Builder::new()
+                    .name("starling-host-engine".to_string())
+                    .spawn({
+                        let current = Arc::clone(&current);
+                        move || engine_loop(engine_calls, current)
+                    })
             });
         if let Err(err) = spawned {
             let _ = tx.send(HostUpdate::Disconnected {
@@ -218,6 +237,7 @@ impl HostLink {
         (
             HostLink {
                 commands,
+                engine,
                 stop,
                 relaunch,
                 current,
@@ -258,6 +278,19 @@ impl HostLink {
         let _ = self.commands.send(Outgoing::TranscribeDue {
             stored_id: stored_id.to_string(),
         });
+    }
+
+    /// Asks the host's engine, after every engine request made before
+    /// it; the answer (or why there is none, as a sentence) arrives on
+    /// the returned channel.
+    pub(crate) fn engine(
+        &self,
+        request: starling_runtime_host::engine::EngineRequest,
+    ) -> tokio::sync::oneshot::Receiver<Result<starling_runtime_host::engine::EngineReply, String>>
+    {
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        let _ = self.engine.send(EngineCall { request, reply });
+        answer
     }
 
     /// The connection the link holds now (`None` while it has none), as
@@ -369,6 +402,27 @@ fn command_loop(
                 }
             }
         }
+    }
+}
+
+/// Sends the app's engine requests one by one on the current connection.
+fn engine_loop(
+    calls: std::sync::mpsc::Receiver<EngineCall>,
+    current: Arc<Mutex<Option<Arc<HostClient>>>>,
+) {
+    while let Ok(call) = calls.recv() {
+        let client = lock(&current).clone();
+        let answer = match client {
+            Some(client) => client.engine(call.request).map_err(|err| {
+                format!("Starling's recording service did not answer about the engine ({err}).")
+            }),
+            None => Err(
+                "Starling's recording service is not connected, so the engine cannot be changed \
+                 right now."
+                    .to_string(),
+            ),
+        };
+        let _ = call.reply.send(answer);
     }
 }
 

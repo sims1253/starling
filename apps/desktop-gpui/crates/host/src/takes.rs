@@ -409,15 +409,23 @@ impl TakeHub {
     }
 
     /// The host's engine changed: every watching app renders the new
-    /// status (dropped for one whose queue is full — the next change, or
-    /// its reconnect, brings it up to date).
-    pub(crate) fn engine_state(&self, status: &crate::engine::EngineStatus) {
+    /// status. `false` when a watcher's queue was full and it missed it
+    /// (the caller sends it again).
+    pub(crate) fn engine_state(&self, status: &crate::engine::EngineStatus) -> bool {
         let state = lock_registry(&self.state);
+        let mut all = true;
         for watcher in &state.watchers {
-            let _ = watcher.conn.try_deliver(Frame::EngineState {
-                status: Box::new(status.clone()),
-            });
+            if watcher.conn.closed.load(Ordering::SeqCst) {
+                continue;
+            }
+            all &= watcher
+                .conn
+                .try_deliver(Frame::EngineState {
+                    status: Box::new(status.clone()),
+                })
+                .is_ok();
         }
+        all
     }
 
     /// How many live apps besides `conn` follow the feed.

@@ -24,6 +24,8 @@ fn main() {
         manifest.join("../dictation/Cargo.toml"),
         manifest.join("../processing/src"),
         manifest.join("../processing/Cargo.toml"),
+        // The contracts the processing crate compiles in (`include_str!`).
+        manifest.join("../../../../packages/contracts/mode-routing"),
         manifest.join("../../Cargo.lock"),
     ];
     let mut hash = Fnv::new();

@@ -266,6 +266,7 @@ impl StarlingApp {
                     self.error = Some(SERVICE_STOPPED.to_string());
                 }
                 self.host.client = Some(client);
+                self.engine_connected();
                 self.host.down = None;
                 self.host.gave_up = false;
                 self.host.down_plain = false;

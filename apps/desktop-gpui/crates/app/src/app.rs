@@ -351,6 +351,8 @@ pub struct StarlingApp {
     /// The settings revision this window's last answered `Configure`
     /// left the host at: an older status's settings are not adopted.
     pub(crate) engine_revision: u64,
+    /// Bumped on every new host connection: revisions count per host.
+    pub(crate) engine_epoch: u64,
     /// The model this window asked the engine to switch to: once it
     /// serves, this window persists it as the active model.
     pub(crate) engine_activating: Option<String>,
@@ -1015,6 +1017,7 @@ impl StarlingApp {
             engine_status: None,
             engine_configuring: 0,
             engine_revision: 0,
+            engine_epoch: 0,
             engine_activating: None,
             engine_settings,
             draft_engine_mode,

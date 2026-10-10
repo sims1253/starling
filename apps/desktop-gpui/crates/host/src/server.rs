@@ -405,8 +405,13 @@ pub struct HostShared {
     build: crate::version::BuildStamp,
     /// Set when a newer app asked this host to step aside and it agreed:
     /// whoever runs the host shuts it down ([`HostHandle::retire_requested`]),
-    /// and no new app is watched meanwhile.
+    /// and no new work (or app) is taken on meanwhile.
     retire: AtomicBool,
+    /// Work-admitting frames hold this for reading while they check
+    /// `retire` and hand their work on; a retire takes it for writing
+    /// while it checks the host idles and commits. So no work slips in
+    /// between the idle check and the commit, and none is taken on after.
+    admission: std::sync::RwLock<()>,
     /// The app's history (#220), and the queue its requests wait in;
     /// `None` when the history store would not open.
     history: Option<Arc<crate::history::History>>,
@@ -799,6 +804,7 @@ pub fn serve(config: HostConfig) -> Result<HostHandle, HostError> {
         engine_jobs: Mutex::new(None),
         build: config.build.clone(),
         retire: AtomicBool::new(false),
+        admission: std::sync::RwLock::new(()),
         history: history.clone(),
         store_jobs,
         lease: Arc::clone(&lease),
@@ -899,6 +905,20 @@ pub fn serve(config: HostConfig) -> Result<HostHandle, HostError> {
             }
         },
     ));
+    // The settings file as it is now is the watcher's baseline, read
+    // before any connection is accepted: an engine request applied
+    // before the watcher's first poll must not be undone by that poll
+    // reading a file that has not changed since (it carries over only
+    // what the file changed). Anything the file changed since the
+    // startup load is applied here.
+    if let (Some(engine), Some(settings_path)) = (&engine, config.settings_path.as_ref()) {
+        if let Some(settings) = std::fs::read(settings_path)
+            .ok()
+            .and_then(|bytes| starling_dictation::settings::Settings::from_json_bytes(&bytes))
+        {
+            engine.follow_file(crate::engine::EngineIntent::from_settings(&settings));
+        }
+    }
     // The app's engine requests and the engine feed (#220) ride with the
     // host's threads: shutdown drops the queue and joins both before the
     // engine stops.
@@ -994,8 +1014,11 @@ fn engine_feed(engine: Arc<crate::engine::EngineHost>, shared: Arc<HostShared>) 
         if last == Some(generation) {
             continue;
         }
-        last = Some(generation);
-        shared.takes.engine_state(&engine.status());
+        // A watcher whose queue was full missed it: try again next look
+        // (the others get it twice, which costs nothing).
+        if shared.takes.engine_state(&engine.status()) {
+            last = Some(generation);
+        }
     }
 }
 
@@ -1021,7 +1044,7 @@ fn retire_answer(
     let busy = |reason: &str| RetireAnswer::Busy {
         reason: reason.to_string(),
     };
-    if shared.takes.busy() || capture_active(&shared.client) {
+    if shared.takes.records() || capture_active(&shared.client) {
         return busy("a recording is being made or saved");
     }
     let snapshot = shared.client.snapshot();
@@ -1312,6 +1335,38 @@ fn connection_reader(
                     );
                     break;
                 }
+                // Work a retiring host must not take on: refused once it
+                // committed to stepping aside, and admitted under the
+                // admission lock (see `HostShared::admission`).
+                let admits_work = matches!(
+                    frame,
+                    Frame::Command { .. }
+                        | Frame::Transcribe { .. }
+                        | Frame::TranscribeDue { .. }
+                        | Frame::TakeAdopt { .. }
+                        | Frame::TakeTap { .. }
+                        | Frame::Store { .. }
+                        | Frame::AskUser { .. }
+                        | Frame::Engine { .. }
+                );
+                let _admitted = if admits_work {
+                    let admitted = shared
+                        .admission
+                        .read()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if shared.retire.load(Ordering::SeqCst) {
+                        terminate(
+                            &state,
+                            TransportErrorCode::ShuttingDown,
+                            "the recording service is stepping aside for a newer version"
+                                .to_string(),
+                        );
+                        break;
+                    }
+                    Some(admitted)
+                } else {
+                    None
+                };
                 match frame {
                     // Agents reach the microphone only through asks.
                     Frame::Command { .. } if state.is_agent() => {
@@ -1566,7 +1621,20 @@ fn connection_reader(
                         }
                     }
                     Frame::Retire { req, build } => {
-                        let answer = retire_answer(&shared, &state, &build);
+                        // Checked and committed with admission held: work
+                        // admitted before is visible to the check, work
+                        // after it is refused.
+                        let answer = {
+                            let _exclusive = shared
+                                .admission
+                                .write()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            let answer = retire_answer(&shared, &state, &build);
+                            if answer == crate::version::RetireAnswer::Retiring {
+                                shared.retire.store(true, Ordering::SeqCst);
+                            }
+                            answer
+                        };
                         let retiring = answer == crate::version::RetireAnswer::Retiring;
                         let delivered = state
                             .try_deliver(Frame::RetireReply { req, answer })
@@ -1577,7 +1645,6 @@ fn connection_reader(
                                  to step aside; stopping",
                                 build.id, shared.build.id
                             );
-                            shared.retire.store(true, Ordering::SeqCst);
                         }
                         if !delivered {
                             state.close();
