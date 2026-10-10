@@ -43,9 +43,9 @@ pub enum FlacError {
     Mismatch(String),
 }
 
-/// Shortest audio [`encode`] accepts: a FLAC stream holding fewer
-/// samples than the format's minimum block size is refused by the
-/// decoder, so such a take (a millisecond) simply stays a journal.
+/// Shortest audio [`encode`] accepts: the format's 16-sample minimum
+/// block size. Only a stream's last frame may be shorter, so a take
+/// below it (a millisecond) is not worth a FLAC file and stays a journal.
 pub const MIN_SAMPLES: usize = 16;
 
 /// Encode 16 kHz mono PCM16 samples as a FLAC stream. Fewer than
@@ -343,9 +343,23 @@ mod tests {
         ))
     }
 
-    /// Every frame header of a stream [`encode`] wrote, in order. Each is
-    /// found as the next CRC-valid header carrying the next frame number,
-    /// so a sync pattern inside compressed data cannot pass for one.
+    /// One step of the CRC-16 (polynomial 0x8005) that closes a FLAC frame.
+    fn crc16(crc: u16, byte: u8) -> u16 {
+        let mut crc = crc ^ (u16::from(byte) << 8);
+        for _ in 0..8 {
+            crc = if crc & 0x8000 != 0 {
+                (crc << 1) ^ 0x8005
+            } else {
+                crc << 1
+            };
+        }
+        crc
+    }
+
+    /// Every frame header of a stream [`encode`] wrote, in order. Frames
+    /// are walked boundary to boundary: a frame ends at the first point
+    /// where the bytes so far are followed by their own CRC-16 and then by
+    /// the end of the stream or another valid header.
     fn frame_headers(bytes: &[u8]) -> Vec<FrameHeader> {
         assert_eq!(&bytes[..4], b"fLaC");
         let mut at = 4;
@@ -357,14 +371,26 @@ mod tests {
                 break;
             }
         }
-        let mut headers: Vec<FrameHeader> = Vec::new();
-        while let Some(found) = (at..bytes.len()).find_map(|offset| {
-            frame_header_at(bytes, offset)
-                .filter(|header| header.1 == headers.len() as u64)
-                .map(|header| (offset, header))
-        }) {
-            headers.push(found.1);
-            at = found.0 + 1;
+        let mut headers = Vec::new();
+        while at < bytes.len() {
+            let header =
+                frame_header_at(bytes, at).unwrap_or_else(|| panic!("no frame header at {at}"));
+            headers.push(header);
+            let mut crc = 0u16;
+            let mut end = None;
+            for offset in at..bytes.len().saturating_sub(1) {
+                let footer = u16::from_be_bytes([bytes[offset], bytes[offset + 1]]);
+                // A header is at least 6 bytes, CRC-8 included.
+                if offset >= at + 6
+                    && footer == crc
+                    && (offset + 2 == bytes.len() || frame_header_at(bytes, offset + 2).is_some())
+                {
+                    end = Some(offset + 2);
+                    break;
+                }
+                crc = crc16(crc, bytes[offset]);
+            }
+            at = end.unwrap_or_else(|| panic!("frame at {at} has no CRC-16 footer"));
         }
         headers
     }
