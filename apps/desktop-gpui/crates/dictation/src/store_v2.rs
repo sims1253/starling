@@ -4660,6 +4660,14 @@ impl StoreV2 {
     /// liveness signal must not manufacture an interruption — the same
     /// rule the Electron reference applies when the lock manager cannot
     /// answer.
+    /// Whether a live process (this one included) still owns `started`
+    /// attempt `attempt_id` — its cross-process marker is held (#213).
+    /// A window offered a take another process is transcribing (#220)
+    /// leaves it to that process.
+    pub fn attempt_owned(&self, attempt_id: &str) -> bool {
+        self.attempt_is_owned(attempt_id)
+    }
+
     fn attempt_is_owned(&self, attempt_id: &str) -> bool {
         if self.attempt_locks.contains_key(attempt_id) {
             return true;

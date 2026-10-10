@@ -990,8 +990,14 @@ impl StarlingApp {
             this.update(cx, |app, cx| {
                 app.active_ids.remove(&id);
                 // Transcribed or its failure recorded: a take the host
-                // handed this window is handled.
-                app.take_handled(&id);
+                // handed this window is handled. A failure history could
+                // not record leaves the take unsettled: it goes back to
+                // the host, which keeps it for the next try.
+                if history_failure.is_some() {
+                    app.take_handed_back(&id);
+                } else {
+                    app.take_handled(&id);
+                }
                 if !transcribed {
                     // No processing will run for this take, and nothing
                     // is typed for it: a retry is a new, explicit job.
@@ -2563,6 +2569,134 @@ mod tests {
             app.read_with(cx, |app, _| app.service_notice.clone())
                 .is_some_and(|notice| notice.contains("still running when Starling closed"))
         );
+        drop(app);
+        host.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A take the host stores with no app following it; its stored id.
+    fn orphan_on(host: &starling_runtime_host::HostHandle, store: &Store) -> String {
+        {
+            let gone = starling_runtime_host::client::HostClient::connect(host.socket_path())
+                .expect("connect");
+            gone.send(
+                Some("take_orphaned"),
+                starling_runtime::protocol::Command::CaptureStart {
+                    policy: "push-to-talk".into(),
+                },
+            )
+            .expect("start");
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Some(take) = records(store).first() {
+                return take.id.clone();
+            }
+            assert!(Instant::now() < deadline, "the host never stored the orphan");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// The stored takes the host still holds for an app to transcribe.
+    fn unclaimed(root: &std::path::Path) -> Vec<String> {
+        std::fs::read(root.join(starling_runtime_host::takes::UNCLAIMED_FILE))
+            .map(|bytes| serde_json::from_slice(&bytes).expect("unclaimed list"))
+            .unwrap_or_default()
+    }
+
+    fn words(text: &str) -> storage::TranscriptionResult {
+        storage::TranscriptionResult {
+            text: text.to_string(),
+            segments: Vec::new(),
+            duration_seconds: None,
+            request_id: None,
+        }
+    }
+
+    #[gpui::test]
+    fn an_orphan_transcribed_before_its_app_told_the_host_is_not_transcribed_again(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = scratch("host-orphan-done");
+        let store = Store::at_test_root(&root);
+        let mut host = host_at(&root, vec![scripted_take()], std::time::Duration::from_millis(200));
+        let id = orphan_on(&host, &store);
+        // An app transcribed it and went before its acknowledgement did.
+        store.mark_attempt(&id, "openai:fake-model").expect("attempt");
+        store.save_transcript(&id, words("already here")).expect("transcript");
+        assert_eq!(unclaimed(&root), vec![id.clone()]);
+        let (server, served) = fake_server(vec![Reply::Text("a second transcript")]);
+        let app = app_on_host(cx, &store, &host, server);
+        settle(cx, "the host to hear it handled", |_| unclaimed(&root).is_empty());
+        assert_eq!(*served.lock().unwrap(), 0, "not transcribed again");
+        assert_eq!(records(&store)[0].attempt_count, 1);
+        drop(app);
+        host.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[gpui::test]
+    fn an_orphan_another_app_is_still_transcribing_is_left_to_it(cx: &mut gpui::TestAppContext) {
+        let root = scratch("host-orphan-busy");
+        let store = Store::at_test_root(&root);
+        let mut host = host_at(&root, vec![scripted_take()], std::time::Duration::from_millis(200));
+        let id = orphan_on(&host, &store);
+        // Another app (its own store handle) is transcribing it; its
+        // connection to the host is gone (a host restart) but it is not.
+        let other = Store::at_test_root(&root);
+        other.mark_attempt(&id, "openai:fake-model").expect("attempt");
+        let (server, served) = fake_server(vec![Reply::Text("a second transcript")]);
+        let app = app_on_host(cx, &store, &host, server);
+        settle(cx, "the host to hear it handled", |_| unclaimed(&root).is_empty());
+        assert_eq!(*served.lock().unwrap(), 0, "left to the app transcribing it");
+        other.save_transcript(&id, words("the other app's words")).expect("transcript");
+        settle(cx, "the other app's transcript here", |cx| {
+            cx.executor().advance_clock(crate::remote_take::FOREIGN_POLL);
+            app.read_with(cx, |app, _| {
+                app.sessions
+                    .first()
+                    .and_then(|take| take.transcript.as_ref())
+                    .is_some_and(|transcript| transcript.text == "the other app's words")
+            })
+        });
+        drop(app);
+        host.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[gpui::test]
+    fn a_failure_history_could_not_record_leaves_the_take_with_the_host(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = scratch("host-unrecorded");
+        let store = Store::at_test_root(&root);
+        let mut host = host_at(&root, vec![scripted_take()], std::time::Duration::from_secs(20));
+        let (server, served) = fake_server(vec![Reply::Status("500 Internal Server Error")]);
+        let app = app_on_host(cx, &store, &host, server);
+        // The disk refuses the failure's write (as a full disk would).
+        rusqlite::Connection::open(root.join("starling.db"))
+            .expect("db")
+            .execute_batch(
+                "CREATE TRIGGER refuse_failures BEFORE UPDATE ON recognition_attempts
+                 WHEN NEW.status = 'failed' BEGIN SELECT RAISE(ABORT, 'disk full'); END;",
+            )
+            .expect("trigger");
+        click(&app, cx);
+        settle(cx, "listening", |cx| {
+            app.read_with(cx, |app, _| {
+                app.activation.readiness() == Some(crate::activation::Readiness::Listening)
+            })
+        });
+        click(&app, cx);
+        settle(cx, "the failed job", |cx| {
+            *served.lock().unwrap() == 1
+                && app.read_with(cx, |app, _| app.active_ids.is_empty() && app.host.handling.is_empty())
+        });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        cx.run_until_parked();
+        let id = records(&store).first().expect("stored").id.clone();
+        assert_eq!(unclaimed(&root), vec![id], "still the host's to hand out again");
         drop(app);
         host.shutdown();
         let _ = std::fs::remove_dir_all(&root);

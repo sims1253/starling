@@ -46,3 +46,4 @@ gpui = { version = "0.2.2", features = ["test-support"] }
 tempfile = "3"
 starling-insertion = { path = "../insertion", features = ["test-doubles"] }
 starling-runtime = { path = "../runtime", features = ["test-doubles"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }

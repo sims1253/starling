@@ -5770,6 +5770,7 @@ dependencies = [
  "global-hotkey",
  "gpui",
  "raw-window-handle",
+ "rusqlite",
  "serde",
  "serde_json",
  "starling-dictation",

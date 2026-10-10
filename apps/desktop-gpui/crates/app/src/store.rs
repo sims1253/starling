@@ -225,6 +225,17 @@ fn v2_err(err: StoreV2Error) -> storage::StorageError {
     }
 }
 
+/// See [`Store::recognition`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Recognition {
+    /// Nothing transcribed it, and nothing alive is transcribing it.
+    Due,
+    /// A live process (another app, or this one) is transcribing it.
+    InFlight,
+    /// It has a transcript.
+    Done,
+}
+
 /// Lock the shared v2 handle (a poisoned lock is recovered: the SQLite
 /// connection is still consistent after a panic between statements).
 pub(crate) fn lock_v2(handle: &Arc<Mutex<StoreV2>>) -> MutexGuard<'_, StoreV2> {
@@ -284,14 +295,30 @@ impl Store {
         let Some(record) = store.get_capture(id).map_err(v2_err)? else {
             return Ok(false);
         };
-        let attempts = store
-            .attempts_grouped_by_capture(&[id.to_string()])
-            .map_err(v2_err)?;
-        let summary = v2_summary(&record, &[], attempts.get(id).map_or(&[][..], Vec::as_slice));
+        let attempts = store.attempts_for(id).map_err(v2_err)?;
+        let summary = v2_summary(&record, &[], &attempts);
         Ok(matches!(
             summary.status,
             SessionStatus::Captured | SessionStatus::Transcribing
         ))
+    }
+
+    /// Where stored take `id`'s transcription stands, across processes:
+    /// what a window the host offers the take decides by (#220), since an
+    /// app that transcribed it may have gone before telling the host.
+    pub(crate) fn recognition(&self, id: &str) -> Result<Recognition, storage::StorageError> {
+        let store = lock_v2(&self.0);
+        let attempts = store.attempts_for(id).map_err(v2_err)?;
+        if attempts.iter().any(|attempt| attempt.is_final_transcript()) {
+            return Ok(Recognition::Done);
+        }
+        if attempts
+            .iter()
+            .any(|attempt| attempt.status == "started" && store.attempt_owned(&attempt.id))
+        {
+            return Ok(Recognition::InFlight);
+        }
+        Ok(Recognition::Due)
     }
 
     /// Metadata-only listing (G02): readable records as summaries, damaged

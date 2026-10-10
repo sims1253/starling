@@ -36,6 +36,7 @@ use crate::app::StarlingApp;
 use crate::host_link::{HostLink, HostUpdate, LiveCapture, TakeFeed, TakeUpdate};
 use crate::live_stream::LiveStream;
 use crate::stream_pump::Handoff;
+use crate::store::Recognition;
 use crate::upload::{TakeTarget, refresh_sessions};
 
 /// How often a stop or cancel the host has not acted on is asked again.
@@ -47,10 +48,10 @@ const REASK: Duration = Duration::from_secs(1);
 const HANDLED_KEEP: usize = 64;
 
 /// How often another window's stored take is looked up again while that
-/// window transcribes it, and for how long at most: the host tells only
-/// the transcribing window when it is done.
+/// window transcribes it (the host tells only the transcribing window
+/// when it is done): first, and the cap it doubles up to.
 pub(crate) const FOREIGN_POLL: Duration = Duration::from_secs(2);
-const FOREIGN_WAIT: Duration = Duration::from_secs(600);
+const FOREIGN_POLL_MAX: Duration = Duration::from_secs(30);
 
 /// The app's side of the host connection.
 #[derive(Default)]
@@ -553,9 +554,12 @@ impl StarlingApp {
             return;
         };
         cx.spawn(async move |this, cx| {
-            let deadline = Instant::now() + FOREIGN_WAIT;
-            while Instant::now() < deadline {
-                cx.background_executor().timer(FOREIGN_POLL).await;
+            // As long as it is pending and this window is open: a job may
+            // take many minutes (a stream's wait, then a long batch).
+            let mut every = FOREIGN_POLL;
+            loop {
+                cx.background_executor().timer(every).await;
+                every = (every * 2).min(FOREIGN_POLL_MAX);
                 let pending = {
                     let store = store.clone();
                     let id = id.clone();
@@ -595,8 +599,10 @@ impl StarlingApp {
     /// This window cannot transcribe stored take `id` (no store, its
     /// audio unreadable here): the host hands it to another window — or
     /// to this one again after a reconnect.
-    fn take_handed_back(&mut self, id: &str) {
-        self.host.handling.remove(id);
+    pub(crate) fn take_handed_back(&mut self, id: &str) {
+        if !self.host.handling.remove(id) {
+            return;
+        }
         if let Some(link) = &self.host.link {
             link.handed_back(id);
         }
@@ -1107,7 +1113,10 @@ impl StarlingApp {
     }
 
     /// A take the host stored while no app followed it: transcribed into
-    /// history, never typed (no window's delivery is bound to it).
+    /// history, never typed (no window's delivery is bound to it). One
+    /// that already has a transcript (its app went before telling the
+    /// host), or that another live app is transcribing, is acknowledged
+    /// instead of transcribed again.
     fn transcribe_orphan(&mut self, id: String, cx: &mut Context<Self>) {
         let Some(store) = self.store.clone() else {
             if let Some(link) = &self.host.link {
@@ -1115,32 +1124,44 @@ impl StarlingApp {
             }
             return;
         };
-        self.service_notice = Some(
-            "A recording that was still running when Starling closed was saved; it is being \
-             transcribed into your history."
-                .to_string(),
-        );
         // Acknowledged to the host once its transcription ends; one that
         // cannot be read here stays the host's for the next window.
         self.host.handling.insert(id.clone());
         cx.spawn(async move |this, cx| {
-            let wav = {
+            let (progress, wav) = {
                 let store = store.clone();
                 let id = id.clone();
-                cx.background_spawn(async move { store.audio_wav(&id) }).await
+                cx.background_spawn(async move {
+                    let progress = store.recognition(&id);
+                    let wav = matches!(progress, Ok(Recognition::Due)).then(|| store.audio_wav(&id));
+                    (progress, wav)
+                })
+                .await
             };
-            match wav {
-                Ok(Some(wav)) => {
+            match (progress, wav) {
+                (Ok(Recognition::Due), Some(Ok(Some(wav)))) => {
                     this.update(cx, |app, cx| {
+                        app.service_notice = Some(
+                            "A recording that was still running when Starling closed was saved; \
+                             it is being transcribed into your history."
+                                .to_string(),
+                        );
                         let target = app.resolve_take_target();
                         app.transcribe_with_stream(id, wav, None, target, None, false, cx);
                     })
                     .ok();
                 }
-                gone => {
-                    this.update(cx, |app, _| match gone {
-                        // Deleted from history: nothing is left to do.
-                        Ok(None) => app.take_handled(&id),
+                (progress, wav) => {
+                    this.update(cx, |app, cx| match (progress, wav) {
+                        // Transcribed already; or deleted from history:
+                        // nothing is left to do.
+                        (Ok(Recognition::Done), _) | (_, Some(Ok(None))) => app.take_handled(&id),
+                        // Another app's job settles it; this window's
+                        // history follows.
+                        (Ok(Recognition::InFlight), _) => {
+                            app.take_handled(&id);
+                            app.follow_foreign_take(id.clone(), cx);
+                        }
                         // Back to the host for another try.
                         _ => app.take_handed_back(&id),
                     })
