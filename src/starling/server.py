@@ -1852,8 +1852,11 @@ def create_app(
                 while not queue.empty():
                     batch.append(queue.get_nowait())
                 # The batch is taken: its audio no longer counts against the
-                # receiver's byte budget (as in the native pump).
-                pending_bytes = 0
+                # receiver's byte budget (as in the native pump). Only the
+                # taken bytes: a frame still waiting for queue space keeps
+                # its reservation.
+                pending_bytes -= sum(len(item[1]) for item, _ in batch
+                                     if item is not None and item[0] == "bytes")
                 space.set()
                 need_step = False
                 for idx, (item, work) in enumerate(batch):

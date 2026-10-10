@@ -328,6 +328,32 @@ def test_stream_ping_does_not_coalesce_the_preview(server, monkeypatch, message,
     assert [n for n in lens if n < S.SAMPLE_RATE] != []
 
 
+def test_stream_tiny_queue_bounds_keep_every_frame(server, monkeypatch):
+    # Queue and byte budgets smaller than the burst, with a slow engine: the
+    # receiver waits for space (frames blocked on a full queue keep their
+    # byte reservation) and the final still covers every frame.
+    import time as _time
+
+    server.config.stream_chunk_seconds = 1
+    monkeypatch.setattr(S, "STREAM_QUEUE_MAX_FRAMES", 2)
+    frame = np.zeros(S.SAMPLE_RATE // 10, dtype=np.int16).tobytes()  # 100 ms
+    monkeypatch.setattr(S, "STREAM_QUEUE_MAX_BYTES", 3 * len(frame))
+
+    def slow(samples, rid, **kwargs):
+        _time.sleep(0.01)
+        return S.TranscribeResult(text="w")
+
+    monkeypatch.setattr(server, "_run_queued_sync", slow)
+    with TestClient(S.create_app(server=server, load_on_startup=False)) as client:
+        with client.websocket_connect('/stream') as ws:
+            for _ in range(40):
+                ws.send_bytes(frame)
+            ws.send_json({"type": "commit"})
+            while (msg := ws.receive_json())["type"] != "final":
+                assert msg["type"] == "partial"
+    assert msg["duration_s"] == 4.0
+
+
 def test_lifespan_owns_eager_load(server):
     app = S.create_app(server=server)
     assert server.test_loads == []
