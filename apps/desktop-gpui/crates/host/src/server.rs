@@ -409,12 +409,12 @@ pub struct HostShared {
     /// Set when a newer app asked this host to step aside and it agreed:
     /// whoever runs the host shuts it down ([`HostHandle::retire_requested`]),
     /// and no new work (or app) is taken on meanwhile.
-    retire: AtomicBool,
+    pub(crate) retire: AtomicBool,
     /// Work-admitting frames hold this for reading while they check
     /// `retire` and hand their work on; a retire takes it for writing
     /// while it checks the host idles and commits. So no work slips in
     /// between the idle check and the commit, and none is taken on after.
-    admission: std::sync::RwLock<()>,
+    pub(crate) admission: std::sync::RwLock<()>,
     /// The app's history (#220), and the queue its requests wait in;
     /// `None` when the history store would not open.
     history: Option<Arc<crate::history::History>>,

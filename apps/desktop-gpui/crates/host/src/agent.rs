@@ -734,6 +734,21 @@ impl Broker {
                     self.cancel_live(reason, detail);
                     return;
                 }
+                // Opening the microphone is work a retiring host must
+                // not take on: checked and started under admission, so a
+                // retire either sees the recording or is seen here.
+                let shared = Arc::clone(&self.shared);
+                let _admitted = shared
+                    .admission
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if shared.retire.load(Ordering::SeqCst) {
+                    self.fail_live(
+                        "shutting_down",
+                        "the recording service is stepping aside for a newer version".to_string(),
+                    );
+                    return;
+                }
                 let command = Command::CaptureStart {
                     policy: "push-to-talk".to_string(),
                 };

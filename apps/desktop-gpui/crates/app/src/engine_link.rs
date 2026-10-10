@@ -113,7 +113,10 @@ impl StarlingApp {
     }
 
     /// A new connection to the recording service: its engine's settings
-    /// revisions start over.
+    /// revisions start over. Relies on `link_loop` reporting
+    /// `HostUpdate::Connected` before `follow()` forwards the connection's
+    /// first frame, so the new host's revision-0 status is never read
+    /// against the old host's revision.
     pub(crate) fn engine_connected(&mut self) {
         self.engine_epoch += 1;
         self.engine_revision = 0;
