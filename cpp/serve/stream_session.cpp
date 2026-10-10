@@ -239,9 +239,10 @@ std::vector<uint8_t> voiced_frames(const float* samples, int64_t n, int sample_r
         db[f] = 10.0 * std::log10(sum / frame + 1e-10);
     }
     std::vector<double> sorted = db;
-    std::sort(sorted.begin(), sorted.end());
-    const double floor = std::min(
-        sorted[static_cast<size_t>(kVadFloorPercentile * (count - 1))], kVadFloorMaxDb);
+    const auto nth = sorted.begin()
+        + static_cast<std::ptrdiff_t>(kVadFloorPercentile * (count - 1));
+    std::nth_element(sorted.begin(), nth, sorted.end());
+    const double floor = std::min(*nth, kVadFloorMaxDb);
     const double threshold = std::max(floor + kVadMarginDb, kVadMinDb);
     for (int64_t f = 0; f < count; ++f) flags[f] = db[f] > threshold;
     return flags;
