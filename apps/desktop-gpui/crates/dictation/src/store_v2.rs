@@ -323,7 +323,8 @@ CREATE TABLE IF NOT EXISTS tombstones (
 );
 CREATE TABLE IF NOT EXISTS journal_supersessions (
     journal_id TEXT PRIMARY KEY,
-    capture_id TEXT NOT NULL
+    capture_id TEXT NOT NULL,
+    pending_passes INTEGER NOT NULL DEFAULT 0
 );
 ";
 
@@ -2058,28 +2059,65 @@ impl StoreV2 {
     /// tombstone trees — is untouched by construction.
     pub fn sweep_retention(&mut self) -> Result<SweepReport, StoreV2Error> {
         let mut report = SweepReport::default();
-        self.sweep_tree(&self.root.join(QUARANTINE_DIR), "capture", "", &mut report)?;
+        // Recorder journals a stored take provably holds (#356): a copy
+        // of audio history already kept whole. Proven again first — the
+        // take may have changed since (compression resamples a take not
+        // recorded at 16 kHz), and a copy no longer proven is kept. Swept
+        // before quarantine, whose deleted takes' audio may be the proof.
+        let superseded = self.root.join("journals").join(SUPERSEDED_SUBDIR);
+        let unproven = self.unproven_superseded_journals(&superseded);
+        self.sweep_tree(
+            &superseded,
+            "journal",
+            SUPERSEDED_TOMBSTONE_PREFIX,
+            &unproven,
+            &mut report,
+        )?;
+        let none = HashSet::new();
+        self.sweep_tree(&self.root.join(QUARANTINE_DIR), "capture", "", &none, &mut report)?;
         self.sweep_tree(
             &self.root.join(LEGACY_DELETED_SUBPATH),
             "journal",
             "",
-            &mut report,
-        )?;
-        // Recorder journals a stored take provably holds (#356): a copy
-        // of audio history already kept whole.
-        self.sweep_tree(
-            &self.root.join("journals").join(SUPERSEDED_SUBDIR),
-            "journal",
-            SUPERSEDED_TOMBSTONE_PREFIX,
+            &none,
             &mut report,
         )?;
         Ok(report)
     }
 
+    /// The journals in `superseded/` (#356) no take's audio, read back
+    /// now, still proves a copy of ([`Self::journal_copy`]): the sweep
+    /// keeps them. A numbered name (`<id>.<n>.sj`) is proven as `<id>`.
+    fn unproven_superseded_journals(&self, dir: &Path) -> HashSet<PathBuf> {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return HashSet::new();
+        };
+        entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("sj"))
+            .filter(|path| {
+                let stem = path.file_stem().and_then(|stem| stem.to_str()).unwrap_or("");
+                let id = match stem.rsplit_once('.') {
+                    Some((id, n)) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => id,
+                    _ => stem,
+                };
+                let proven = read_journal(path).ok().is_some_and(|parsed| {
+                    matches!(
+                        self.journal_copy(id, &parsed.samples, parsed.sample_rate),
+                        Ok(JournalCopy::Stored | JournalCopy::Deleted)
+                    )
+                });
+                !proven
+            })
+            .collect()
+    }
+
     /// Sweep one tombstone tree into `report` (`kind` is the tombstone
     /// kind rows get: `capture` for v2 quarantine, `journal` for the
     /// legacy v1 tree; `stamp_prefix` goes before each file's id in its
-    /// stamp, so a tree of copies never deadens the id of a live take).
+    /// stamp, so a tree of copies never deadens the id of a live take;
+    /// the files in `keep` are left in place).
     ///
     /// Per file, the ordering is **stamp, then unlink**: the `tombstones`
     /// UPSERT (retention `'swept'`) is committed before the bytes are
@@ -2100,6 +2138,7 @@ impl StoreV2 {
         dir: &Path,
         kind: &str,
         stamp_prefix: &str,
+        keep: &HashSet<PathBuf>,
         report: &mut SweepReport,
     ) -> Result<(), StoreV2Error> {
         let Ok(entries) = std::fs::read_dir(dir) else {
@@ -2137,6 +2176,13 @@ impl StoreV2 {
                 report
                     .retained
                     .push((name, "not a regular file".to_string()));
+                continue;
+            }
+            if keep.contains(&path) {
+                report.retained.push((
+                    name,
+                    "no stored take is proven to hold this journal's audio any more".to_string(),
+                ));
                 continue;
             }
             let bytes = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
@@ -3891,6 +3937,21 @@ impl StoreV2 {
         )
     }
 
+    /// Count one more recovery pass that left recorder journal `id` to its
+    /// uncommitted replacement; the passes so far, this one included.
+    fn pending_pass(&self, id: &str) -> Result<u32, StoreV2Error> {
+        self.conn.execute(
+            "UPDATE journal_supersessions SET pending_passes = pending_passes + 1
+             WHERE journal_id = ?1",
+            params![id],
+        )?;
+        Ok(self.conn.query_row(
+            "SELECT pending_passes FROM journal_supersessions WHERE journal_id = ?1",
+            params![id],
+            |row| row.get(0),
+        )?)
+    }
+
     /// The capture id startup recovery adopts recorder journal `id` as:
     /// its own, unless a take, its audio or a tombstone already holds that
     /// name — then the first free `<id>-recovered[-n]`.
@@ -3965,7 +4026,9 @@ impl StoreV2 {
     /// less is adopted (a duplicate the user can delete beats audio
     /// lost). A journal whose replacement awaits a reconcile that has not
     /// committed it is deferred: reconcile runs first, and adopting the
-    /// journal now would leave both once it does. A stale
+    /// journal now would leave both once it does — but only for
+    /// [`PENDING_REPLACEMENT_PASSES`] passes, so a reconcile that keeps
+    /// failing never keeps the take hidden. A stale
     /// `*.sj.creating` scratch name no writer holds is removed: it is an
     /// extra name of a published journal, or an empty file whose writer
     /// died before publishing it.
@@ -4111,9 +4174,16 @@ impl StoreV2 {
                 Ok(JournalCopy::Deleted) => Some(DELETED_SUBDIR),
                 Ok(JournalCopy::Pending) => {
                     // Its replacement awaits a reconcile that has not
-                    // committed it yet: adopting now would leave both.
-                    report.deferred.push(id);
-                    continue;
+                    // committed it yet: adopting now would leave both. A
+                    // reconcile that keeps failing is waited out only for
+                    // a few passes — then the journal is adopted, a
+                    // possible duplicate rather than a take kept hidden.
+                    if self.pending_pass(&id).is_ok_and(|passes| passes <= PENDING_REPLACEMENT_PASSES)
+                    {
+                        report.deferred.push(id);
+                        continue;
+                    }
+                    None
                 }
                 Err(err) => {
                     report.failed.push((id, err.to_string()));
@@ -4794,6 +4864,11 @@ fn rename_noreplace(from: &Path, to: &Path) -> io::Result<bool> {
         Err(err) => Err(err),
     }
 }
+
+/// How many recovery passes leave a recorder journal to a replacement
+/// reconcile has not committed (#356) before adopting it anyway: two
+/// launches' worth (each runs a startup scan and a later recheck).
+const PENDING_REPLACEMENT_PASSES: u32 = 4;
 
 /// Where [`supersede_journal_held_by`] keeps journals, under the
 /// recorder's tree.

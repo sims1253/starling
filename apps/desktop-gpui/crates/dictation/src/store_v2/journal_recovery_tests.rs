@@ -926,3 +926,55 @@ fn a_journal_whose_namesake_take_lost_its_audio_comes_back_under_a_fresh_name() 
     assert!(store.get_capture("j_namesake").expect("read").is_some(), "the row stays");
     assert!(!path.exists());
 }
+
+// --- #356 review round 8 ---
+
+#[test]
+fn a_superseded_copy_the_take_no_longer_proves_is_kept_by_the_sweep() {
+    // Proven when moved aside; then compression keeps the 48 kHz take as
+    // 16 kHz request audio, and the same-rate proof no longer holds: the
+    // copy stays.
+    let dir = TempDir::new().expect("tempdir");
+    let mut store = store_in(&dir);
+    let tree = journals(&dir);
+    let samples = ramp(4_800, 4);
+    let path = {
+        let mut writer =
+            JournalWriter::create_named(&tree, "j_48k".to_string(), 48_000).expect("writer");
+        writer.append_frames(&samples).expect("append");
+        writer.finalize().expect("finalize");
+        writer.path().to_path_buf()
+    };
+    store.adopt_journal(&path, None).expect("adopt");
+    std::fs::copy(store.audio_path("j_48k"), &path).expect("name comes back");
+    age(&path, old());
+    let report = store.recover_capture_journals(&tree).expect("scan");
+    assert_eq!(report.superseded, vec!["j_48k".to_string()], "{report:?}");
+
+    assert!(store.compress_audio("j_48k").is_ok());
+    assert_eq!(store.load_audio("j_48k").expect("audio").sample_rate, 16_000);
+    let report = store.sweep_retention().expect("sweep");
+    assert!(report.swept.is_empty(), "{report:?}");
+    assert_eq!(report.retained.len(), 1, "{report:?}");
+    let kept = tree.join(SUPERSEDED_SUBDIR).join("j_48k.sj");
+    assert_eq!(read_audio_journal(&kept).expect("kept whole").samples, samples);
+}
+
+#[test]
+fn a_reconcile_that_keeps_failing_holds_the_journal_back_only_a_few_passes() {
+    let dir = TempDir::new().expect("tempdir");
+    let mut store = store_in(&dir);
+    let tree = journals(&dir);
+    let confirmed = ramp(1_600, 0);
+    let journal = faulted_journal(&tree, "j_stuck", &confirmed);
+    die_while_storing_in_place_of(&store, "j_stuck", &ramp(4_800, 0));
+
+    // No reconcile commits the replacement, pass after pass.
+    for _ in 0..PENDING_REPLACEMENT_PASSES {
+        let report = store.recover_capture_journals(&tree).expect("scan");
+        assert_eq!(report.deferred, vec!["j_stuck".to_string()], "{report:?}");
+        assert!(journal.exists());
+    }
+    let report = store.recover_capture_journals(&tree).expect("scan");
+    adopted_whole(&store, &report, "j_stuck", &confirmed);
+}
