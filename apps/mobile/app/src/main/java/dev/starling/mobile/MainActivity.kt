@@ -137,17 +137,12 @@ class MainActivity : Activity() {
         if (savedInstanceState == null) handleKeyboardRequest(intent)
     }
 
-    override fun onNewIntent(intent: Intent) {
-        super.onNewIntent(intent)
-        setIntent(intent)
-        handleKeyboardRequest(intent)
-    }
-
     /**
      * The voice keyboard cannot show a permission dialog, so it opens this
      * screen to ask for the microphone (and, on Android 13+, the take
-     * notification that carries Stop). Once granted, the screen closes and
-     * the user is back in the field they were dictating into.
+     * notification that carries Stop). The keyboard opens it in a task of
+     * its own, so once the microphone is allowed that task closes and the
+     * user is back in the field they were dictating into.
      */
     private fun handleKeyboardRequest(intent: Intent?) {
         if (intent?.action != ACTION_REQUEST_MICROPHONE) return
@@ -159,7 +154,7 @@ class MainActivity : Activity() {
             if (Build.VERSION.SDK_INT >= 33 && askNotifications) add(Manifest.permission.POST_NOTIFICATIONS)
         }.filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
         if (missing.isEmpty()) {
-            recordingMessage.setText(R.string.keyboard_permission_granted)
+            finishAndRemoveTask()
             return
         }
         requestPermissions(missing.toTypedArray(), REQUEST_KEYBOARD_MICROPHONE)
@@ -639,7 +634,7 @@ class MainActivity : Activity() {
             // Back to the field as soon as the microphone is allowed; the
             // notification answer, whatever it is, does not hold that up.
             if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
-                finish()
+                finishAndRemoveTask()
             } else {
                 recordingMessage.setText(R.string.microphone_permission_required)
             }

@@ -49,7 +49,9 @@ fun interface AudioChunkListener {
  * pass their own context, or one created for the recognition client they
  * act for. An optional [AudioChunkListener] observes the same PCM chunks the
  * worker writes to the WAV; it exists for live streaming and cannot affect
- * the capture, its stop choreography, or the two-hour cap.
+ * the capture, its stop choreography, or the two-hour cap. An optional
+ * `onEnded` runs on the main thread when the microphone ends without a
+ * stop() request, so the owner can stop() and settle it.
  */
 class AudioCapture {
     private val lock = Any()
@@ -79,6 +81,7 @@ class AudioCapture {
         context: Context,
         outputFile: File,
         onChunk: AudioChunkListener? = null,
+        onEnded: (() -> Unit)? = null,
     ): String? = synchronized(lock) {
         if (state != State.IDLE || worker?.isAlive == true) {
             return@synchronized "A recording is already stopping"
@@ -145,7 +148,7 @@ class AudioCapture {
         writerBytes = 0
         stopRequested = false
         state = State.RECORDING
-        worker = Thread({ captureLoop(audioRecord, wavWriter, bufferSize, onChunk) }, "starling-audio-capture")
+        worker = Thread({ captureLoop(audioRecord, wavWriter, bufferSize, onChunk, onEnded) }, "starling-audio-capture")
             .also { it.start() }
         null
     }
@@ -361,6 +364,7 @@ class AudioCapture {
         wavWriter: WavWriter,
         bufferSize: Int,
         onChunk: AudioChunkListener?,
+        onEnded: (() -> Unit)?,
     ) {
         val buffer = ByteArray(bufferSize)
         var bytesWritten = 0L
@@ -415,6 +419,9 @@ class AudioCapture {
                 // It may already have been stopped by stop().
             }
             audioRecord.release()
+            // The microphone ended on its own (read error, two-hour cap):
+            // the owner still has to stop() to collect the outcome.
+            if (!stopRequested && onEnded != null) mainHandler.post(onEnded)
         }
     }
 

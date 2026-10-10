@@ -92,8 +92,9 @@ class RecognizeSpeechActivity : Activity() {
         cancelButton.setOnClickListener { cancel() }
         if (Build.VERSION.SDK_INT >= 33) {
             // The activity opts in to OnBackInvokedCallback (manifest), so
-            // system Back and the predictive-back gesture on Android 13+
-            // arrive here; onBackPressed below covers older releases.
+            // system Back and the predictive-back gesture on Android 14+
+            // arrive here; Android 13 ignores the per-activity opt-in and,
+            // like older releases, uses onBackPressed below.
             onBackInvokedDispatcher.registerOnBackInvokedCallback(OnBackInvokedDispatcher.PRIORITY_DEFAULT) { cancel() }
         }
         setResult(RESULT_CANCELED)
