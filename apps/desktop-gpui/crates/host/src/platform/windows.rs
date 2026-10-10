@@ -859,7 +859,7 @@ impl Drop for OwnedHandle {
 /// instances still bound. A count, not a list of join handles: every
 /// finisher waits for *all* lingers, so two hosts shutting down in one
 /// process can never take each other's work and return early.
-static PENDING_LINGERS: AtomicUsize = AtomicUsize::new(0);
+static LINGERS: LingerBudget = LingerBudget::new(MAX_PENDING_LINGERS);
 
 /// Upper bound on [`finish_pending_closes`]: one linger's own bound
 /// (the [`DISCONNECT_LINGER`] wait, the disconnect, then the bounded
@@ -867,10 +867,19 @@ static PENDING_LINGERS: AtomicUsize = AtomicUsize::new(0);
 /// always outlives its lingers — never the other way around.
 const LINGER_DRAIN: Duration = Duration::from_secs(4);
 
-/// Counts one linger in [`PENDING_LINGERS`] for exactly as long as it
+/// A count of lingers in flight with a hard cap. The host uses the one
+/// process-wide [`LINGERS`]; a value rather than bare statics so the
+/// cap's own test can exhaust a private budget without starving the
+/// lingers of tests running beside it.
+struct LingerBudget {
+    pending: AtomicUsize,
+    max: usize,
+}
+
+/// Counts one linger in its [`LingerBudget`] for exactly as long as it
 /// lives — moved into the linger's closure, so it is released when the
 /// linger finishes *or* when a failed spawn drops the closure unrun.
-struct LingerGuard;
+struct LingerGuard<'a>(&'a LingerBudget);
 
 /// Most lingering disconnects allowed in flight at once, process-wide.
 /// Each linger costs two short-lived threads for up to
@@ -881,20 +890,31 @@ struct LingerGuard;
 /// once — the pre-linger behaviour, final frames lost for that peer only.
 const MAX_PENDING_LINGERS: usize = 32;
 
-impl LingerGuard {
+impl LingerBudget {
+    const fn new(max: usize) -> LingerBudget {
+        LingerBudget {
+            pending: AtomicUsize::new(0),
+            max,
+        }
+    }
+
     /// Reserves one linger slot, or `None` when the budget is spent.
-    fn try_new() -> Option<LingerGuard> {
-        if PENDING_LINGERS.fetch_add(1, Ordering::SeqCst) >= MAX_PENDING_LINGERS {
-            PENDING_LINGERS.fetch_sub(1, Ordering::SeqCst);
+    fn try_reserve(&self) -> Option<LingerGuard<'_>> {
+        if self.pending.fetch_add(1, Ordering::SeqCst) >= self.max {
+            self.pending.fetch_sub(1, Ordering::SeqCst);
             return None;
         }
-        Some(LingerGuard)
+        Some(LingerGuard(self))
+    }
+
+    fn pending(&self) -> usize {
+        self.pending.load(Ordering::SeqCst)
     }
 }
 
-impl Drop for LingerGuard {
+impl Drop for LingerGuard<'_> {
     fn drop(&mut self) {
-        PENDING_LINGERS.fetch_sub(1, Ordering::SeqCst);
+        self.0.pending.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -909,10 +929,10 @@ impl Drop for LingerGuard {
 /// still bound — the report is what makes that diagnosable).
 pub fn finish_pending_closes() {
     let deadline = Instant::now() + LINGER_DRAIN;
-    while PENDING_LINGERS.load(Ordering::SeqCst) > 0 && Instant::now() < deadline {
+    while LINGERS.pending() > 0 && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
     }
-    let pending = PENDING_LINGERS.load(Ordering::SeqCst);
+    let pending = LINGERS.pending();
     if pending > 0 {
         eprintln!(
             "starling-runtime-host: {pending} pipe disconnect(s) still in flight after \
@@ -946,7 +966,7 @@ const FLUSH_CANCEL_GRACE: Duration = Duration::from_millis(250);
 /// its lease while this process's handles still keep the old pipe name
 /// bound.
 fn schedule_disconnect(handle: HANDLE) -> io::Result<()> {
-    let Some(guard) = LingerGuard::try_new() else {
+    let Some(guard) = LINGERS.try_reserve() else {
         // Linger budget spent (see MAX_PENDING_LINGERS): disconnect now.
         // SAFETY: a live server instance handle owned by the caller.
         unsafe {
@@ -1357,16 +1377,25 @@ mod tests {
 
     /// The linger budget is a hard cap: past it a close gets no linger
     /// slot (it disconnects at once), and a released slot is reusable.
+    /// A private budget of the production size: exhausting the
+    /// process-wide one would starve lingers of tests running beside
+    /// this one, and their releases would race the exact counts here.
     #[test]
     fn the_linger_budget_caps_concurrent_lingers() {
+        let budget = LingerBudget::new(MAX_PENDING_LINGERS);
         let mut held = Vec::new();
-        while let Some(guard) = LingerGuard::try_new() {
+        while let Some(guard) = budget.try_reserve() {
             held.push(guard);
             assert!(held.len() <= MAX_PENDING_LINGERS, "the budget did not cap");
         }
-        assert!(LingerGuard::try_new().is_none());
+        assert_eq!(held.len(), MAX_PENDING_LINGERS);
+        assert_eq!(budget.pending(), MAX_PENDING_LINGERS);
+        assert!(budget.try_reserve().is_none());
+        assert_eq!(budget.pending(), MAX_PENDING_LINGERS, "a refusal leaks no slot");
         held.pop();
-        assert!(LingerGuard::try_new().is_some(), "a released slot is reusable");
+        assert!(budget.try_reserve().is_some(), "a released slot is reusable");
+        drop(held);
+        assert_eq!(budget.pending(), 0, "every guard gives its slot back");
     }
 
     #[test]

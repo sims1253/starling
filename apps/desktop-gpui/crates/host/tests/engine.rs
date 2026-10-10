@@ -378,7 +378,7 @@ fn a_host_that_is_a_client_never_starts_an_engine() {
 /// host first). A job submitted right then hits the dead engine; it must
 /// still complete — the provider retries once on whatever engine the
 /// supervisors bring back (a restart or the host's takeover).
-#[cfg(unix)] // the abrupt kill is a signal; the fixture is unix-built
+#[cfg(unix)] // the abrupt kill is a signal
 #[test]
 fn a_job_survives_the_attached_engine_dying_abruptly() {
     let Some(fixture) = fixture() else { return };

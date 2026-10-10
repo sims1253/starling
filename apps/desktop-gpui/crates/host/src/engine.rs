@@ -532,16 +532,87 @@ fn manual_slot(endpoint: &str, model: &str) -> (Arc<dyn TranscriptionProvider>, 
         Ok(provider) => (Arc::new(provider), manual_label(endpoint)),
         Err(err) => {
             eprintln!(
-                "starling-runtime-host: manual engine endpoint {endpoint:?} is unusable \
-                 ({err}); transcription stays unconfigured (reporting engine: unconfigured)"
+                "starling-runtime-host: manual engine endpoint {:?} is unusable \
+                 ({err}); transcription stays unconfigured (reporting engine: unconfigured)",
+                redact_endpoint(endpoint)
             );
             (Arc::new(UnconfiguredProvider), "unconfigured".to_string())
         }
     }
 }
 
+/// The label goes to stdout (the launcher's `owner` line) and to every
+/// client's status, so it carries the redacted endpoint too.
 fn manual_label(endpoint: &str) -> String {
-    format!("manual:{endpoint}")
+    format!("manual:{}", redact_endpoint(endpoint))
+}
+
+/// Query keys whose values read as credentials, matched as substrings
+/// of the lower-cased key (`access_token`, `X-Api-Key`, `sig`, …).
+/// Over-matching only costs a `***` in a log line.
+const SECRET_QUERY_KEYS: &[&str] = &[
+    "token",
+    "key",
+    "secret",
+    "password",
+    "passwd",
+    "pwd",
+    "auth",
+    "sig",
+    "credential",
+    "session",
+];
+
+/// `endpoint` as it may be echoed (stderr, the status label): userinfo
+/// (`user:pass@`) and the values of token-like query parameters become
+/// `***`. Plain string surgery rather than a URL parse — the text that
+/// most needs redacting is the endpoint that did not validate (the
+/// client rejects userinfo outright), and it may not parse at all.
+fn redact_endpoint(endpoint: &str) -> String {
+    let authority_start = endpoint.find("://").map_or(0, |at| at + 3);
+    let authority_end = endpoint[authority_start..]
+        .find(['/', '?', '#'])
+        .map_or(endpoint.len(), |at| authority_start + at);
+    let mut out = String::with_capacity(endpoint.len());
+    out.push_str(&endpoint[..authority_start]);
+    let authority = &endpoint[authority_start..authority_end];
+    match authority.rfind('@') {
+        Some(at) => {
+            out.push_str("***");
+            out.push_str(&authority[at..]);
+        }
+        None => out.push_str(authority),
+    }
+    let rest = &endpoint[authority_end..];
+    let Some(query_start) = rest.find('?') else {
+        out.push_str(rest);
+        return out;
+    };
+    // A `?` after a `#` is fragment text, not a query.
+    if rest.find('#').is_some_and(|hash| hash < query_start) {
+        out.push_str(rest);
+        return out;
+    }
+    out.push_str(&rest[..=query_start]);
+    let query_and_fragment = &rest[query_start + 1..];
+    let query_end = query_and_fragment
+        .find('#')
+        .unwrap_or(query_and_fragment.len());
+    let pairs: Vec<String> = query_and_fragment[..query_end]
+        .split('&')
+        .map(|pair| match pair.split_once('=') {
+            Some((key, _)) if is_secret_key(key) => format!("{key}=***"),
+            _ => pair.to_string(),
+        })
+        .collect();
+    out.push_str(&pairs.join("&"));
+    out.push_str(&query_and_fragment[query_end..]);
+    out
+}
+
+fn is_secret_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    SECRET_QUERY_KEYS.iter().any(|secret| key.contains(secret))
 }
 
 /// Spawns the host's settings watcher (#220): polls `path`'s bytes
@@ -906,6 +977,45 @@ mod tests {
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || "_.:+-".contains(c)));
         }
+    }
+
+    #[test]
+    fn echoed_endpoints_redact_userinfo_and_token_params() {
+        for (endpoint, echoed) in [
+            ("http://127.0.0.1:8181", "http://127.0.0.1:8181"),
+            (
+                "https://user:hunter2@example.com:8443/v1",
+                "https://***@example.com:8443/v1",
+            ),
+            ("http://token@example.com", "http://***@example.com"),
+            // The last `@` ends the userinfo; an `@` in the path is not one.
+            ("http://a@b:c@example.com/x@y", "http://***@example.com/x@y"),
+            ("user:pw@example.com:8181", "***@example.com:8181"),
+            (
+                "http://example.com/v1?model=small&access_token=abc&X-Api-Key=k&sig=s",
+                "http://example.com/v1?model=small&access_token=***&X-Api-Key=***&sig=***",
+            ),
+            (
+                "http://u:p@example.com?token=abc#frag",
+                "http://***@example.com?token=***#frag",
+            ),
+            (
+                "http://example.com/#a?token=x",
+                "http://example.com/#a?token=x",
+            ),
+            (
+                "http://example.com/?flag&password",
+                "http://example.com/?flag&password",
+            ),
+            ("not a url", "not a url"),
+            ("", ""),
+        ] {
+            assert_eq!(redact_endpoint(endpoint), echoed, "{endpoint}");
+        }
+        assert_eq!(
+            manual_label("http://example.com/?api_key=abc"),
+            "manual:http://example.com/?api_key=***"
+        );
     }
 
     #[test]
