@@ -180,6 +180,11 @@ const COMPRESSION_ATTEMPTS: u32 = 3;
 /// audio is gone. The prefix keeps them out of the capture-id space, so
 /// reconcile's dead set never mistakes one for a deleted take.
 const AUDIO_TOMBSTONE_PREFIX: &str = "audio:";
+/// Prefix of the stamps the retention sweep leaves for the recorder
+/// journals it removes from `journals/superseded/` (#356): a copy of a
+/// take still kept, never a deleted id — a bare stamp would read as one
+/// to reconcile and kill a live take adopted under the journal's name.
+const SUPERSEDED_TOMBSTONE_PREFIX: &str = "superseded:";
 
 /// The retention class every take starts in.
 pub const STANDARD_CLASS: &str = "standard";
@@ -2034,11 +2039,13 @@ impl StoreV2 {
     ///   [`Self::reconcile`]);
     /// - `journals/deleted/` — the v1 journal tree's tombstones (R21),
     ///   left behind by the deleted v1 store, still awaiting this sweep,
-    ///   and recorder journals of takes the user deleted (#356);
-    /// - `journals/superseded/` — recorder journals a stored take was
-    ///   proven, by reading its audio back, to hold every sample of
-    ///   (#356, [`supersede_journal_held_by`]) — nothing unproven is ever
-    ///   moved there.
+    ///   and recorder journals of takes the user deleted, whose ids are
+    ///   tombstoned already (#356);
+    /// - `journals/superseded/` — recorder journals a stored (or
+    ///   delete-quarantined) take was proven, by reading its audio back,
+    ///   to hold every sample of (#356, [`supersede_journal_held_by`]) —
+    ///   nothing unproven is ever moved there. Their stamps carry
+    ///   [`SUPERSEDED_TOMBSTONE_PREFIX`]: a copy's removal deadens no id.
     ///
     /// Bookkeeping: per file, the `tombstones` row is stamped
     /// `retention = 'swept'` **before** the bytes are unlinked (a
@@ -2051,10 +2058,11 @@ impl StoreV2 {
     /// tombstone trees — is untouched by construction.
     pub fn sweep_retention(&mut self) -> Result<SweepReport, StoreV2Error> {
         let mut report = SweepReport::default();
-        self.sweep_tree(&self.root.join(QUARANTINE_DIR), "capture", &mut report)?;
+        self.sweep_tree(&self.root.join(QUARANTINE_DIR), "capture", "", &mut report)?;
         self.sweep_tree(
             &self.root.join(LEGACY_DELETED_SUBPATH),
             "journal",
+            "",
             &mut report,
         )?;
         // Recorder journals a stored take provably holds (#356): a copy
@@ -2062,6 +2070,7 @@ impl StoreV2 {
         self.sweep_tree(
             &self.root.join("journals").join(SUPERSEDED_SUBDIR),
             "journal",
+            SUPERSEDED_TOMBSTONE_PREFIX,
             &mut report,
         )?;
         Ok(report)
@@ -2069,7 +2078,8 @@ impl StoreV2 {
 
     /// Sweep one tombstone tree into `report` (`kind` is the tombstone
     /// kind rows get: `capture` for v2 quarantine, `journal` for the
-    /// legacy v1 tree).
+    /// legacy v1 tree; `stamp_prefix` goes before each file's id in its
+    /// stamp, so a tree of copies never deadens the id of a live take).
     ///
     /// Per file, the ordering is **stamp, then unlink**: the `tombstones`
     /// UPSERT (retention `'swept'`) is committed before the bytes are
@@ -2089,6 +2099,7 @@ impl StoreV2 {
         &mut self,
         dir: &Path,
         kind: &str,
+        stamp_prefix: &str,
         report: &mut SweepReport,
     ) -> Result<(), StoreV2Error> {
         let Ok(entries) = std::fs::read_dir(dir) else {
@@ -2144,7 +2155,7 @@ impl StoreV2 {
                 "INSERT INTO tombstones(id, kind, deleted_utc, retention)
                  VALUES (?1, ?2, ?3, 'swept')
                  ON CONFLICT(id) DO UPDATE SET retention = 'swept'",
-                params![id, kind, now_iso()],
+                params![format!("{stamp_prefix}{id}"), kind, now_iso()],
             )?;
             // 2. Only now may the bytes go.
             match std::fs::remove_file(&path) {
@@ -3051,8 +3062,7 @@ impl StoreV2 {
     /// journal whose adoption failed to commit after the take was stored
     /// from memory in its place, and that take's audio is read back
     /// holding every sample of it (#356): then it is moved to
-    /// `journals/superseded/` (or `journals/deleted/`, the take since
-    /// deleted). A replacement that is itself still rowless here is
+    /// `journals/superseded/`. A replacement that is itself still rowless here is
     /// waited for when `may_wait` (`Ok(true)`); otherwise unproven means
     /// a row of its own.
     fn reconcile_orphan_audio(
@@ -3703,6 +3713,17 @@ impl StoreV2 {
                 ))
             })?
             .to_string();
+        self.adopt_journal_as(source, id, status, note)
+    }
+
+    /// [`Self::adopt_journal_with`] under capture id `id`.
+    fn adopt_journal_as(
+        &mut self,
+        source: &Path,
+        id: String,
+        status: Option<CaptureStatus>,
+        note: impl FnOnce(&AdoptedJournal) -> String,
+    ) -> Result<CaptureRecord, StoreV2Error> {
         validate_capture_id(&id)?;
         if self.get_capture(&id)?.is_some() || self.audio_path(&id).exists() {
             return Err(StoreV2Error::Invalid(format!(
@@ -3819,9 +3840,12 @@ impl StoreV2 {
                 },
             );
         }
-        // This very recording was adopted and then deleted: recorder
-        // journal ids are never reused, so the name is the deleted take.
-        if self.is_tombstoned(journal_id)? {
+        // This very recording was adopted and then deleted by the user:
+        // recorder journal ids are never reused, and only a capture
+        // delete leaves a bare `capture` tombstone on one (the sweep
+        // stamps its copies under a prefix). An adoption now would only
+        // be deleted again by reconcile, the id being dead to it.
+        if self.is_deleted_capture(journal_id)? {
             return Ok(JournalCopy::Deleted);
         }
         let replacement: Option<String> = self
@@ -3839,7 +3863,7 @@ impl StoreV2 {
             // Deleted since: only its quarantined audio, until swept,
             // proves the journal a copy of what the user deleted.
             return Ok(if held_at(self.quarantine_path(&replacement)) {
-                JournalCopy::Deleted
+                JournalCopy::Stored
             } else {
                 JournalCopy::Unproven
             });
@@ -3865,6 +3889,41 @@ impl StoreV2 {
                 JournalCopy::Unproven
             },
         )
+    }
+
+    /// The capture id startup recovery adopts recorder journal `id` as:
+    /// its own, unless a take, its audio or a tombstone already holds that
+    /// name — then the first free `<id>-recovered[-n]`.
+    fn fresh_adoption_id(&self, id: &str) -> Result<String, StoreV2Error> {
+        let mut attempt = 0u32;
+        loop {
+            let candidate = match attempt {
+                0 => id.to_string(),
+                1 => format!("{id}-recovered"),
+                n => format!("{id}-recovered-{n}"),
+            };
+            if self.get_capture(&candidate)?.is_none()
+                && !self.has_audio(&candidate)
+                && !self.staging_path(&candidate).exists()
+                && !self.is_tombstoned(&candidate)?
+            {
+                return Ok(candidate);
+            }
+            attempt += 1;
+        }
+    }
+
+    /// Whether capture `id` itself was deleted (a `capture` tombstone).
+    fn is_deleted_capture(&self, id: &str) -> Result<bool, StoreV2Error> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT 1 FROM tombstones WHERE id = ?1 AND kind = 'capture'",
+                params![id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
     }
 
     /// Whether `id` was deliberately deleted (or its audio retired).
@@ -4077,11 +4136,21 @@ impl StoreV2 {
                 continue;
             }
             drop(parsed);
-            match self.adopt_journal_with(&path, Some(CaptureStatus::Interrupted), |facts| {
+            // A take already under the journal's name whose audio does not
+            // hold it (lost, damaged, retired) keeps its row; the journal
+            // comes back beside it under a fresh name.
+            let as_id = match self.fresh_adoption_id(&id) {
+                Ok(as_id) => as_id,
+                Err(err) => {
+                    report.failed.push((id, err.to_string()));
+                    continue;
+                }
+            };
+            match self.adopt_journal_as(&path, as_id, Some(CaptureStatus::Interrupted), |facts| {
                 recovered_journal_note(facts)
             }) {
                 Ok(record) => report.recovered.push(RecoveredJournal {
-                    id,
+                    id: record.id,
                     samples: record.frame_count,
                     sample_rate: record.actual_rate,
                 }),
@@ -4593,9 +4662,10 @@ fn modified_age(path: &Path) -> Option<std::time::Duration> {
 enum JournalCopy {
     /// Nowhere proven: the journal may be the only copy.
     Unproven,
-    /// A stored take's audio holds every confirmed sample.
+    /// A take's audio, read back — stored, or quarantined by a delete —
+    /// holds every confirmed sample.
     Stored,
-    /// A take the user deleted holds them (or is this very recording).
+    /// This very recording was adopted and then deleted by the user.
     Deleted,
     /// A replacement reconcile has not committed yet holds them.
     Pending,
@@ -4604,19 +4674,23 @@ enum JournalCopy {
 /// Whether `stored` — a take's audio as read back from disk — holds
 /// every confirmed sample of a recorder journal (`samples` at `rate`) as
 /// a prefix, at the same rate (#356). Samples are compared as the 16-bit
-/// request PCM the store keeps audio as at rest (#342): a stored sample
-/// matches the journal's when it quantizes the same, directly or after
-/// the PCM16 WAV round trip a save from the in-memory take goes through.
-/// Anything less — another rate, fewer samples, one differing sample —
-/// proves nothing.
+/// request PCM the store keeps audio as at rest (#342), the whole prefix
+/// through one path: every stored sample quantizes as the journal's, or
+/// every one as the journal's after the PCM16 WAV round trip a save from
+/// the in-memory take goes through — never a mix of the two. Anything
+/// less — another rate, fewer samples, one differing sample — proves
+/// nothing.
 fn holds_journal(stored: &JournalAudio, samples: &[f32], rate: u32) -> bool {
+    let through = |path: fn(i16) -> i16| {
+        samples
+            .iter()
+            .zip(&stored.samples)
+            .all(|(&sample, &kept)| pcm16(kept) == path(pcm16(sample)))
+    };
     stored.sample_rate == rate
         && stored.samples.len() >= samples.len()
-        && samples.iter().zip(&stored.samples).all(|(&sample, &kept)| {
-            let request = pcm16(sample);
-            let kept = pcm16(kept);
-            kept == request || kept == pcm16(f32::from(request) / 32_768.0)
-        })
+        && (through(|request| request)
+            || through(|request| pcm16(f32::from(request) / 32_768.0)))
 }
 
 /// Move recorder journal `journal` into `superseded/` beside it once the
@@ -4725,8 +4799,9 @@ fn rename_noreplace(from: &Path, to: &Path) -> io::Result<bool> {
 /// recorder's tree.
 pub const SUPERSEDED_SUBDIR: &str = "superseded";
 
-/// Where startup recovery keeps the recorder journals of deleted takes,
-/// under the recorder's tree (swept like the takes' own audio).
+/// Where startup recovery keeps the recorder journals of takes the user
+/// deleted — the journal's own id carries the capture tombstone — under
+/// the recorder's tree (swept like the takes' own audio).
 const DELETED_SUBDIR: &str = "deleted";
 
 /// What [`StoreV2::recover_capture_journals`] did.
@@ -4745,8 +4820,8 @@ pub struct JournalRecovery {
     /// Journals whose take was already stored: moved into `superseded/`.
     /// Housekeeping, not a finding.
     pub superseded: Vec<String>,
-    /// Journals of takes the user deleted: moved into `deleted/`.
-    /// Housekeeping, not a finding.
+    /// Journals of takes adopted under their own name and since deleted
+    /// by the user: moved into `deleted/`. Housekeeping, not a finding.
     pub deleted: Vec<String>,
 }
 
@@ -5043,8 +5118,7 @@ pub struct ReconciliationReport {
     /// Recorder journals left in `audio/` by an adoption whose commit
     /// failed, after the take was stored from its samples instead and
     /// read back holding all of them: moved to `journals/superseded/`
-    /// (`journals/deleted/` when that take was deleted since) (#356).
-    /// Housekeeping, not a finding.
+    /// (#356). Housekeeping, not a finding.
     pub superseded_journals: Vec<String>,
     /// In-flight ids (staging journals, orphan candidates) a live foreign
     /// lease owner claimed: this run was a client (§4 ownership) and left
