@@ -270,8 +270,14 @@ impl DeliveryActor {
                     unreachable!("recv has no timeout")
                 }
             }
-            *self.view.lock().expect("delivery view lock") = self.snapshot_view();
+            self.publish_view();
         }
+    }
+
+    /// Called before every bus emit too, so a client reacting to an
+    /// event never reads a snapshot behind it.
+    fn publish_view(&self) {
+        *self.view.lock().expect("delivery view lock") = self.snapshot_view();
     }
 
     /// The aggregate view: the most recent delivery's machine state (v1
@@ -301,6 +307,7 @@ impl DeliveryActor {
         };
         match state.core.emit_event(event.type_name(), None) {
             Ok(_) => {
+                self.publish_view();
                 let _ = self.bus.emit(event, Some(corr));
             }
             Err(violation) => state.core.record_violation(violation),
@@ -425,7 +432,8 @@ impl DeliveryActor {
                             delivery_id: delivery_id.clone(),
                             compare_token: token.clone(),
                         };
-                        let _ = self.bus.emit(event, Some(&corr));
+                        // Registered (and published) before the event, so
+                        // the snapshot already shows the new delivery.
                         self.deliveries.insert(
                             delivery_id.clone(),
                             DeliveryState {
@@ -439,6 +447,8 @@ impl DeliveryActor {
                             },
                         );
                         self.order.push(delivery_id);
+                        self.publish_view();
+                        let _ = self.bus.emit(event, Some(&corr));
                     }
                     Err(violation) => core.record_violation(violation),
                 }

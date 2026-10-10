@@ -1278,10 +1278,13 @@ impl CaptureActor {
     /// Every machine emission goes through the core first: an illegal
     /// event is never sent (the stream stays oracle-legal), and the
     /// violation is recorded in the snapshot instead of being absorbed.
+    /// The view is published before the event reaches the bus, so a
+    /// client reacting to the event never reads a snapshot behind it.
     fn emit(&mut self, event: Event, corr: &str) {
         let fatal = matches!(&event, Event::CaptureError { fatal, .. } if *fatal);
         match self.core.emit_event(event.type_name(), Some(fatal)) {
             Ok(_) => {
+                self.publish_view();
                 let _ = self.bus.emit(event, Some(corr));
             }
             Err(violation) => {
