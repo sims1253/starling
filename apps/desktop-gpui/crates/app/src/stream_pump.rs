@@ -139,9 +139,13 @@ struct PumpCore<C> {
     /// The longest stable prefix handed to the UI: the words the staging
     /// draft has made final.
     stable_prefix: Vec<String>,
-    /// After a reconnect: previews stay hidden until one repeats
-    /// `stable_prefix` word for word and holds at least `shown_words`.
+    /// After a reconnect: previews that do not repeat `stable_prefix` word
+    /// for word stay hidden, until the new session calls those words
+    /// stable itself.
     replaying: bool,
+    /// After a reconnect: previews stay hidden until one holds at least
+    /// `shown_words`.
+    catching_up: bool,
     partials: watch::Sender<Option<Partial>>,
     trace: Option<Arc<StreamTrace>>,
     /// Set by [`StreamPump::finish`]; a step checks it between frames.
@@ -214,17 +218,15 @@ impl<C: StreamClient> PumpCore<C> {
             // replayed preview that disagrees with the words it already
             // made final, or that has not caught up yet, would misplace
             // the user's edits. The final settles the take either way.
-            let caught_up = words.len() >= self.shown_words
-                && words
-                    .iter()
-                    .zip(&self.stable_prefix)
-                    .filter(|(word, known)| *word == known)
-                    .count()
-                    == self.stable_prefix.len();
-            if !caught_up {
+            let agrees = words.len() >= self.stable_prefix.len()
+                && words.iter().zip(&self.stable_prefix).all(|(word, known)| word == known);
+            if !agrees || (self.catching_up && words.len() < self.shown_words) {
                 return;
             }
-            self.replaying = false;
+            self.catching_up = false;
+            if partial.stable_words >= self.stable_prefix.len() {
+                self.replaying = false;
+            }
         }
         let stable = partial.stable_words.min(words.len());
         if stable > self.stable_prefix.len() {
@@ -267,6 +269,7 @@ impl<C: StreamClient> PumpCore<C> {
                 self.stream = Some(stream);
                 self.sent = 0;
                 self.replaying = true;
+                self.catching_up = true;
             }
             Err(reason) => self.fail(Failure::Stream(reason), now),
         }
@@ -331,6 +334,7 @@ impl<C: StreamClient> StreamPump<C> {
             shown_words: 0,
             stable_prefix: Vec::new(),
             replaying: false,
+            catching_up: false,
             partials,
             trace: trace.clone(),
             stop: Arc::clone(&stop),
@@ -482,13 +486,16 @@ impl StarlingApp {
 
 /// The take's stream timeline (#226), on when `STARLING_STREAM_TRACE` is
 /// set: `1` or `stderr` writes to stderr, anything else is a file the
-/// lines are appended to. One JSON object per line, `ms` since the take
-/// started: `start` (with the wall clock), every server frame (`partial`
+/// lines are appended to. One JSON object per line, tagged with the take
+/// and `ms` since it started: `start` (with the wall clock), every server frame (`partial`
 /// with the server's `covered_s`/`audio_s`, `final` with its stop path),
 /// every preview the UI applied (`display`), `stream_failed`, `reconnect`
 /// and `stop`. Partial age at display is `display.ms - 1000 * covered_s`,
 /// measured from the take's start rather than the microphone's.
 pub(crate) struct StreamTrace {
+    /// Tags every line: a take's `final` can land after the next take
+    /// started.
+    take: String,
     started: Instant,
     out: Mutex<Box<dyn Write + Send>>,
 }
@@ -511,14 +518,20 @@ impl StreamTrace {
                 }
             },
         };
-        let trace = StreamTrace {
-            started: Instant::now(),
-            out: Mutex::new(out),
-        };
         // Wall time too, to line the take up with outside events.
         let unix_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |since| since.as_millis() as u64);
+        static TAKES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let trace = StreamTrace {
+            take: format!(
+                "{}-{}",
+                std::process::id(),
+                TAKES.fetch_add(1, Ordering::Relaxed)
+            ),
+            started: Instant::now(),
+            out: Mutex::new(out),
+        };
         trace.log("start", json!({ "unix_ms": unix_ms }));
         Some(Arc::new(trace))
     }
@@ -526,6 +539,7 @@ impl StreamTrace {
     #[cfg(test)]
     pub(crate) fn discard() -> StreamTrace {
         StreamTrace {
+            take: "test".into(),
             started: Instant::now(),
             out: Mutex::new(Box::new(std::io::sink())),
         }
@@ -535,6 +549,7 @@ impl StreamTrace {
         let ms = (self.started.elapsed().as_secs_f64() * 10_000.0).round() / 10.0;
         if let Value::Object(map) = &mut fields {
             map.insert("ev".into(), event.into());
+            map.insert("take".into(), self.take.clone().into());
             map.insert("ms".into(), ms.into());
         }
         if let Ok(mut out) = self.out.lock() {
@@ -670,6 +685,9 @@ mod tests {
         closed: bool,
         /// Frames accepted before the channel reports itself full.
         capacity: Option<usize>,
+        /// How long each send takes, and how many have started.
+        send_delay: Option<Duration>,
+        sends_started: usize,
     }
 
     #[derive(Clone, Default)]
@@ -696,6 +714,14 @@ mod tests {
 
     impl StreamClient for FakeStream {
         fn send_audio(&self, wav: Vec<u8>) -> bool {
+            let delay = {
+                let mut session = self.0.lock().unwrap();
+                session.sends_started += 1;
+                session.send_delay
+            };
+            if let Some(delay) = delay {
+                std::thread::sleep(delay);
+            }
             let mut session = self.0.lock().unwrap();
             if session.closed || session.capacity.is_some_and(|cap| session.frames.len() >= cap) {
                 return false;
@@ -764,6 +790,7 @@ mod tests {
             shown_words: 0,
             stable_prefix: Vec::new(),
             replaying: false,
+            catching_up: false,
             partials,
             trace: None,
             stop: Arc::new(AtomicBool::new(false)),
@@ -907,17 +934,26 @@ mod tests {
         }
         assert_eq!(shown(&mut previews).as_deref(), Some("before stop"));
         // A long stall is acknowledged at once: a minute of audio to catch
-        // up on when Stop lands.
+        // up on, at a slow 300 ms per frame, when Stop lands mid-send.
+        let delay = Duration::from_millis(300);
+        stream.0.lock().unwrap().send_delay = Some(delay);
         let audio = speech(0, 16_000 * 60);
         tap.capture(&audio);
         tap.acknowledge_all();
+        while stream.0.lock().unwrap().sends_started == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
         let stopped = Instant::now();
         let handoff = pump.finish();
+        // Only the frame in flight finishes; a step without the stop check
+        // would send MAX_FRAMES_PER_STEP of them first.
         assert!(
-            stopped.elapsed() < Duration::from_millis(500),
+            stopped.elapsed() < delay * 3,
             "stop waited {:?} for the catch-up",
             stopped.elapsed()
         );
+        assert!(stream.0.lock().unwrap().sends_started <= 2);
+        stream.0.lock().unwrap().send_delay = None;
         stream.preview("after stop", 0);
         std::thread::sleep(TICK * 4);
         assert!(previews.has_changed().is_err(), "the worker is gone");
@@ -963,9 +999,19 @@ mod tests {
         second.preview("zero one two three four five", 3);
         core.step(start + RECONNECT_DELAY);
         assert_eq!(shown(&mut previews), None);
-        second.preview("one two three four five", 3);
+        // Caught up, but the new session does not vouch for "one two" yet:
+        // a later revision of those words stays hidden too.
+        second.preview("one two three four five", 0);
         core.step(start + RECONNECT_DELAY);
         assert_eq!(shown(&mut previews).as_deref(), Some("one two three four five"));
+        second.preview("zero one two three four five", 0);
+        core.step(start + RECONNECT_DELAY);
+        assert_eq!(shown(&mut previews), None);
+        // Once it calls them stable itself, its previews flow as usual.
+        second.preview("one two three four five six", 2);
+        core.step(start + RECONNECT_DELAY);
+        assert_eq!(shown(&mut previews).as_deref(), Some("one two three four five six"));
+        assert!(!core.replaying);
         let handoff = core.handoff();
         assert_eq!(handoff.sent, audio.len());
         assert!(handoff.stream.is_some() && handoff.degradation.is_none());
