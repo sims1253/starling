@@ -63,7 +63,16 @@ pub fn encode(samples: &[i16]) -> Result<Vec<u8>, FlacError> {
     let widened: Vec<i32> = samples.iter().map(|&sample| i32::from(sample)).collect();
     let source =
         flacenc::source::MemSource::from_samples(&widened, 1, 16, STARLING_SAMPLE_RATE as usize);
-    let stream = flacenc::encode_with_fixed_block_size(&config, source, config.block_size)
+    let mut stream = flacenc::encode_with_fixed_block_size(&config, source, config.block_size)
+        .map_err(|err| FlacError::Encode(err.to_string()))?;
+    // flacenc folds the short last frame into STREAMINFO's minimum block
+    // size. In a fixed-blocksize stream the minimum excludes the last
+    // block and equals the maximum (RFC 9639 §8.2); with them unequal,
+    // libFLAC (`flac -t`) maps frame numbers to the wrong sample numbers
+    // and warns on every frame.
+    stream
+        .stream_info_mut()
+        .set_block_sizes(config.block_size, config.block_size)
         .map_err(|err| FlacError::Encode(err.to_string()))?;
     let mut sink = flacenc::bitsink::ByteSink::new();
     stream
@@ -252,6 +261,183 @@ mod tests {
         match decode(bytes.as_slice()) {
             Err(FlacError::Mismatch(reason)) => assert!(reason.contains("declares"), "{reason}"),
             other => panic!("expected a count mismatch, got {other:?}"),
+        }
+    }
+
+    /// Lengths around the 4096-sample block: shorter than one block, an
+    /// exact multiple, and a short last frame.
+    fn block_edge_cases() -> Vec<Vec<i16>> {
+        [MIN_SAMPLES, 100, 4_096, 8_192, 70_001]
+            .into_iter()
+            .map(|len| {
+                (0..len)
+                    .map(|i| ((i as f64 * 0.0863).sin() * 20_000.0).round() as i16)
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// CRC-8 (polynomial 0x07) that closes a FLAC frame header.
+    fn crc8(bytes: &[u8]) -> u8 {
+        bytes.iter().fold(0u8, |mut crc, &byte| {
+            crc ^= byte;
+            for _ in 0..8 {
+                crc = if crc & 0x80 != 0 {
+                    (crc << 1) ^ 0x07
+                } else {
+                    crc << 1
+                };
+            }
+            crc
+        })
+    }
+
+    /// One parsed frame header: (variable-blocking flag, coded frame or
+    /// sample number, block size).
+    type FrameHeader = (bool, u64, usize);
+
+    /// Parse a 16 kHz mono 16-bit frame header at `at`; `None` unless the
+    /// sync code, the fixed fields and the header CRC-8 all match.
+    fn frame_header_at(bytes: &[u8], at: usize) -> Option<FrameHeader> {
+        let header = bytes.get(at..)?;
+        if header.len() < 6 || header[0] != 0xFF || header[1] & 0xFE != 0xF8 {
+            return None;
+        }
+        // 16 kHz rate code; mono, 16 bits, reserved bit clear.
+        if header[2] & 0x0F != 0x05 || header[3] != 0x08 {
+            return None;
+        }
+        let lead = header[4].leading_ones() as usize;
+        let (mut number, len) = match lead {
+            0 => (u64::from(header[4]), 1),
+            2..=7 => (u64::from(header[4] & (0x7F >> lead)), lead),
+            _ => return None,
+        };
+        for &byte in header.get(5..4 + len)? {
+            if byte & 0xC0 != 0x80 {
+                return None;
+            }
+            number = (number << 6) | u64::from(byte & 0x3F);
+        }
+        let mut end = 4 + len;
+        let block_size = match header[2] >> 4 {
+            1 => 192,
+            tag @ 2..=5 => 576 << (tag - 2),
+            6 => {
+                end += 1;
+                usize::from(*header.get(end - 1)?) + 1
+            }
+            7 => {
+                end += 2;
+                usize::from(u16::from_be_bytes(
+                    header.get(end - 2..end)?.try_into().ok()?,
+                )) + 1
+            }
+            tag @ 8..=15 => 256 << (tag - 8),
+            _ => return None,
+        };
+        (crc8(&header[..end]) == *header.get(end)?).then_some((
+            header[1] & 1 == 1,
+            number,
+            block_size,
+        ))
+    }
+
+    /// Every frame header of a stream [`encode`] wrote, in order. Each is
+    /// found as the next CRC-valid header carrying the next frame number,
+    /// so a sync pattern inside compressed data cannot pass for one.
+    fn frame_headers(bytes: &[u8]) -> Vec<FrameHeader> {
+        assert_eq!(&bytes[..4], b"fLaC");
+        let mut at = 4;
+        loop {
+            let last = bytes[at] & 0x80 != 0;
+            let len = u32::from_be_bytes([0, bytes[at + 1], bytes[at + 2], bytes[at + 3]]);
+            at += 4 + len as usize;
+            if last {
+                break;
+            }
+        }
+        let mut headers: Vec<FrameHeader> = Vec::new();
+        while let Some(found) = (at..bytes.len()).find_map(|offset| {
+            frame_header_at(bytes, offset)
+                .filter(|header| header.1 == headers.len() as u64)
+                .map(|header| (offset, header))
+        }) {
+            headers.push(found.1);
+            at = found.0 + 1;
+        }
+        headers
+    }
+
+    #[test]
+    fn frame_headers_number_a_fixed_blocksize_stream() {
+        for samples in block_edge_cases() {
+            let bytes = encode(&samples).expect("encode");
+            let len = samples.len();
+            // STREAMINFO min and max block size (after "fLaC" and the
+            // 4-byte block header): equal, so the stream is fixed-blocksize.
+            assert_eq!(&bytes[8..12], &[0x10, 0x00, 0x10, 0x00], "{len} samples");
+            let headers = frame_headers(&bytes);
+            assert_eq!(headers.len(), len.div_ceil(4_096), "{len} samples");
+            let mut decoded = 0;
+            for (index, &(variable, number, block_size)) in headers.iter().enumerate() {
+                assert!(
+                    !variable,
+                    "{len} samples: frame {index} is variable-blocking"
+                );
+                assert_eq!(number, index as u64, "{len} samples");
+                let expected = (len - index * 4_096).min(4_096);
+                assert_eq!(block_size, expected, "{len} samples: frame {index}");
+                decoded += block_size;
+            }
+            assert_eq!(decoded, len);
+        }
+    }
+
+    #[test]
+    fn the_reference_decoder_reads_our_output_without_warnings() {
+        use std::process::Command;
+        if Command::new("flac").arg("--version").output().is_err() {
+            eprintln!("skipping: the reference `flac` tool is not installed");
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        for samples in block_edge_cases() {
+            let len = samples.len();
+            let path = dir.path().join(format!("{len}.flac"));
+            std::fs::write(&path, encode(&samples).expect("encode")).expect("write");
+            // `-w` turns every warning, frame numbering included, into a
+            // failed exit.
+            let test = Command::new("flac")
+                .args(["-t", "-s", "-w"])
+                .arg(&path)
+                .output()
+                .expect("flac -t");
+            let stderr = String::from_utf8_lossy(&test.stderr);
+            assert!(test.status.success(), "flac -t, {len} samples: {stderr}");
+            assert!(
+                !stderr.contains("WARNING"),
+                "flac -t, {len} samples: {stderr}"
+            );
+
+            let decode = Command::new("flac")
+                .args(["-d", "-c", "-s", "-w", "--force-raw-format"])
+                .args(["--endian=little", "--sign=signed"])
+                .arg(&path)
+                .output()
+                .expect("flac -d");
+            let stderr = String::from_utf8_lossy(&decode.stderr);
+            assert!(decode.status.success(), "flac -d, {len} samples: {stderr}");
+            assert!(
+                !stderr.contains("WARNING"),
+                "flac -d, {len} samples: {stderr}"
+            );
+            let decoded: Vec<i16> = decode
+                .stdout
+                .chunks_exact(2)
+                .map(|pair| i16::from_le_bytes([pair[0], pair[1]]))
+                .collect();
+            assert_eq!(decoded, samples, "flac -d, {len} samples");
         }
     }
 }
