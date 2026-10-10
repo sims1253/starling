@@ -688,9 +688,11 @@ mod dbus {
                     let configurable = self.configurable;
                     let status = match response_body::<ShortcutResults>(message) {
                         Ok((RESPONSE_SUCCESS, results)) => {
+                            let live = self.session.as_ref() == Some(session);
                             match find_ours(results.shortcuts.as_deref().unwrap_or_default()) {
-                                // Bound in a session that is still live.
-                                Some(Some(trigger)) if self.session.as_ref() == Some(session) => {
+                                // The session closed meanwhile (already said).
+                                Some(_) if !live => None,
+                                Some(Some(trigger)) => {
                                     self.bound = true;
                                     self.accepted = true;
                                     Some(PortalStatus::Bound {
@@ -698,11 +700,15 @@ mod dbus {
                                         configurable,
                                     })
                                 }
-                                // The session closed meanwhile (already said).
-                                Some(Some(_)) => None,
-                                // No entry, or one without keys (as at start
-                                // and in `ShortcutsChanged`): nothing fires.
-                                Some(None) | None => Some(PortalStatus::Declined { configurable }),
+                                // An entry without keys (as at start and in
+                                // `ShortcutsChanged`): nothing fires yet, but
+                                // the desktop took it, so keys assigned later
+                                // in its settings arrive as `ShortcutsChanged`.
+                                Some(None) => {
+                                    self.accepted = true;
+                                    Some(PortalStatus::Declined { configurable })
+                                }
+                                None => Some(PortalStatus::Declined { configurable }),
                             }
                         }
                         Ok((RESPONSE_CANCELLED, _)) => {

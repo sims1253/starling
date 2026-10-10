@@ -654,10 +654,10 @@ fn binding_nothing_reads_as_declined() {
 }
 
 #[test]
-fn a_bind_that_assigns_no_keys_reads_as_declined() {
+fn a_bind_that_assigns_no_keys_reads_as_declined_until_keys_arrive() {
     let bus = private_bus!();
     // The entry comes back, but without keys (a desktop's placeholder).
-    let (_portal, _script) = fake_portal(
+    let (portal, script) = fake_portal(
         &bus,
         Script {
             bound_trigger: None,
@@ -674,6 +674,27 @@ fn a_bind_that_assigns_no_keys_reads_as_declined() {
         matches!(status, PortalStatus::Declined { .. })
     });
     assert!(!client.bound_at(Instant::now()));
+    // Keys assigned afterwards in the desktop's settings bind it.
+    let session = script.lock().unwrap().sessions.last().cloned().unwrap();
+    portal
+        .emit_signal(
+            None::<&str>,
+            PATH,
+            INTERFACE,
+            "ShortcutsChanged",
+            &(
+                ObjectPath::try_from(session.as_str()).unwrap(),
+                shortcut_entries(Some("Meta+D")),
+            ),
+        )
+        .unwrap();
+    wait_for(&mut client, &mut events, "bound", |status, _| {
+        status.is_bound()
+    });
+    emit(&portal, "Activated", &session, "record");
+    wait_for(&mut client, &mut events, "press", |_, events| {
+        !events.is_empty()
+    });
 }
 
 #[test]
