@@ -2,7 +2,10 @@
 //! the in-window key matcher, and the system-wide registration.
 //!
 //! Two sources feed the activation machine, and one physical press is
-//! taken from only one of them. The system-wide one (`global-hotkey`: X11
+//! taken from only one of them. On native Wayland a third one comes first:
+//! the desktop's GlobalShortcuts portal (`crate::portal`), which the user
+//! binds once in the desktop's own dialog; while it holds a binding, the
+//! X11 grab's presses are dropped. The system-wide one (`global-hotkey`: X11
 //! key grab, Windows `RegisterHotKey`, macOS Carbon hot keys) consumes the
 //! key wherever its grab matches, so the window never sees that press;
 //! the window's own key events cover the rest (no registration, an X11
@@ -162,6 +165,102 @@ impl Shortcut {
     pub(crate) fn works_in_window(&self) -> bool {
         self.window_key.is_some()
     }
+
+    /// The shortcut in the XDG shortcuts-spec notation the GlobalShortcuts
+    /// portal takes as `preferred_trigger` (`CTRL+SHIFT+space`, `F9`):
+    /// modifiers, then the key's xkb keysym name. `None` for a key with no
+    /// keysym mapped here; the desktop's dialog then asks for one.
+    pub(crate) fn xdg_trigger(&self) -> Option<String> {
+        let key = xkb_keysym(self.hotkey.key)?;
+        let mods = self.hotkey.mods;
+        let mut parts: Vec<String> = Vec::new();
+        for (modifier, name) in [
+            (Modifiers::CONTROL, "CTRL"),
+            (Modifiers::ALT, "ALT"),
+            (Modifiers::SHIFT, "SHIFT"),
+            (Modifiers::SUPER, "LOGO"),
+        ] {
+            if mods.contains(modifier) {
+                parts.push(name.to_string());
+            }
+        }
+        parts.push(key);
+        Some(parts.join("+"))
+    }
+}
+
+/// The xkb keysym name of a key, as the shortcuts spec writes triggers.
+fn xkb_keysym(code: Code) -> Option<String> {
+    use Code::*;
+    let name = match code {
+        Space => "space",
+        Enter => "Return",
+        Tab => "Tab",
+        Backspace => "BackSpace",
+        Delete => "Delete",
+        Insert => "Insert",
+        Home => "Home",
+        End => "End",
+        PageUp => "Page_Up",
+        PageDown => "Page_Down",
+        ArrowUp => "Up",
+        ArrowDown => "Down",
+        ArrowLeft => "Left",
+        ArrowRight => "Right",
+        Backquote => "grave",
+        Minus => "minus",
+        Equal => "equal",
+        BracketLeft => "bracketleft",
+        BracketRight => "bracketright",
+        Backslash => "backslash",
+        Semicolon => "semicolon",
+        Quote => "apostrophe",
+        Comma => "comma",
+        Period => "period",
+        Slash => "slash",
+        Pause => "Pause",
+        PrintScreen => "Print",
+        ScrollLock => "Scroll_Lock",
+        CapsLock => "Caps_Lock",
+        NumLock => "Num_Lock",
+        ContextMenu => "Menu",
+        NumpadAdd => "KP_Add",
+        NumpadSubtract => "KP_Subtract",
+        NumpadMultiply => "KP_Multiply",
+        NumpadDivide => "KP_Divide",
+        NumpadDecimal => "KP_Decimal",
+        NumpadEnter => "KP_Enter",
+        NumpadEqual => "KP_Equal",
+        AudioVolumeMute => "XF86AudioMute",
+        AudioVolumeUp => "XF86AudioRaiseVolume",
+        AudioVolumeDown => "XF86AudioLowerVolume",
+        MediaPlayPause => "XF86AudioPlay",
+        MediaStop => "XF86AudioStop",
+        MediaTrackNext => "XF86AudioNext",
+        MediaTrackPrevious => "XF86AudioPrev",
+        _ => {
+            let label = key_label(code);
+            if let Some(digit) = label.strip_prefix("Numpad") {
+                return (digit.len() == 1 && digit.chars().all(|c| c.is_ascii_digit()))
+                    .then(|| format!("KP_{digit}"));
+            }
+            // Letters, digits and F1–F24: the keysym is the lowercase
+            // letter, the digit, or `F9` as is.
+            let letter_or_digit =
+                label.len() == 1 && label.chars().all(|c| c.is_ascii_alphanumeric());
+            let function = label.starts_with('F')
+                && label.len() > 1
+                && label[1..].chars().all(|c| c.is_ascii_digit());
+            return if letter_or_digit {
+                Some(label.to_ascii_lowercase())
+            } else if function {
+                Some(label)
+            } else {
+                None
+            };
+        }
+    };
+    Some(name.to_string())
 }
 
 /// Whether an in-window key-down is the Escape that cancels a take. Any
@@ -770,7 +869,13 @@ pub(crate) fn wayland_session() -> bool {
 }
 
 /// What the settings dialog says about where the shortcut works.
-pub(crate) fn reach_note(registered: &Result<(), String>, shortcut: &Shortcut) -> String {
+/// `portal_bound` is whether the desktop's GlobalShortcuts portal holds a
+/// binding (native Wayland); the portal's own line says which keys.
+pub(crate) fn reach_note(
+    registered: &Result<(), String>,
+    shortcut: &Shortcut,
+    portal_bound: bool,
+) -> String {
     let wayland = wayland_session();
     let in_window = if shortcut.works_in_window() {
         "It always works while the Starling window is focused."
@@ -778,12 +883,16 @@ pub(crate) fn reach_note(registered: &Result<(), String>, shortcut: &Shortcut) -
         "This key has no in-window fallback, so it works only where the system-wide shortcut does."
     };
     match registered {
+        _ if wayland && portal_bound => format!(
+            "Wayland session: your desktop delivers its shortcut for Starling in every app, \
+             press and release included, so hold to talk works everywhere. {in_window}"
+        ),
         Err(reason) => format!(
             "The system-wide shortcut could not be registered ({reason}). {in_window}"
         ),
         Ok(()) if wayland => format!(
-            "Wayland session: the system-wide shortcut reaches Starling only while an X11 \
-             (XWayland) app is focused; the desktop portal is not supported yet. {in_window}"
+            "Wayland session: until the desktop shortcut below is set up, the system-wide \
+             shortcut reaches Starling only while an X11 (XWayland) app is focused. {in_window}"
         ),
         Ok(()) => format!("Registered system-wide. {in_window}"),
     }
@@ -928,6 +1037,23 @@ mod tests {
                 HANDLER_INSTALLED.store(false, Ordering::SeqCst);
             }
         }
+    }
+
+    #[test]
+    fn the_portal_trigger_uses_shortcuts_spec_names() {
+        let trigger = |text: &str| Shortcut::parse(text).unwrap().xdg_trigger();
+        let ctrl = if cfg!(target_os = "macos") { "LOGO" } else { "CTRL" };
+        assert_eq!(
+            trigger(starling_dictation::settings::DEFAULT_SHORTCUT).as_deref(),
+            Some(format!("{ctrl}+SHIFT+space").as_str())
+        );
+        assert_eq!(trigger("F9").as_deref(), Some("F9"));
+        assert_eq!(trigger("Alt+D").as_deref(), Some("ALT+d"));
+        assert_eq!(trigger("Super+Shift+Slash").as_deref(), Some("SHIFT+LOGO+slash"));
+        assert_eq!(trigger("Ctrl+7").as_deref(), Some("CTRL+7"));
+        assert_eq!(trigger("Ctrl+Numpad1").as_deref(), Some("CTRL+KP_1"));
+        assert_eq!(trigger("Pause").as_deref(), Some("Pause"));
+        assert_eq!(trigger("Ctrl+PageDown").as_deref(), Some("CTRL+Page_Down"));
     }
 
     #[test]

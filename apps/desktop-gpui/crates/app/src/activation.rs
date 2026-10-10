@@ -591,6 +591,7 @@ impl StarlingApp {
         if let Err(reason) = &self.shortcut_registration {
             eprintln!("Global shortcut unavailable: {reason}");
         }
+        self.portal_shortcuts = crate::portal::PortalShortcuts::start_for_session(&self.shortcut);
         self.install_key_interceptor(cx);
         cx.spawn(async move |this, cx| {
             // 20 ms while a take runs or the key is held; the idle
@@ -660,32 +661,58 @@ impl StarlingApp {
     /// (window keys, the record button, opening or closing Settings), so a
     /// UI input never overtakes a system-wide one that happened first.
     pub(crate) fn flush_system_events(&mut self, cx: &mut Context<Self>) {
-        loop {
-            let Some(shortcuts) = self.global_shortcuts.as_mut() else {
-                return;
-            };
+        // One physical press from one source: while the desktop's portal
+        // holds a binding it is the system-wide shortcut, and the X11
+        // grab's presses (an XWayland app focused) are dropped. Its Escape
+        // grabs still cancel.
+        let portal_bound = self
+            .portal_shortcuts
+            .as_ref()
+            .is_some_and(|portal| portal.is_bound());
+        while let Some(shortcuts) = self.global_shortcuts.as_mut() {
             let Some(raw) = shortcuts.next_raw() else {
-                return;
+                break;
             };
             let Some(event) = shortcuts.classify(raw) else {
                 continue;
             };
-            if !self.system_event_is_ours(event) {
+            if !self.system_event_is_ours(event)
+                || (portal_bound && !matches!(event, GlobalEvent::Escape(_)))
+            {
                 continue;
             }
-            if self.settings_open && matches!(event, GlobalEvent::Pressed(_)) {
-                self.note_shortcut_in_dialog(cx);
-            }
-            let may_start = !self.settings_open;
-            self.activation_input(
-                |machine| match event {
-                    GlobalEvent::Pressed(at) => machine.press(at, may_start),
-                    GlobalEvent::Released(at) => machine.release(at),
-                    GlobalEvent::Escape(_) => machine.escape(),
-                },
-                cx,
-            );
+            self.system_event(event, cx);
         }
+        // The portal's edges are never the focused window's own keys seen
+        // twice (the desktop consumes a bound shortcut), so no focus
+        // filter applies; a desktop that also forwards them to the
+        // Starling window is covered by the machine's repeat rule.
+        while let Some(event) = self.portal_shortcuts.as_mut().and_then(|p| p.next_event()) {
+            self.system_event(event, cx);
+        }
+        if self
+            .portal_shortcuts
+            .as_mut()
+            .is_some_and(|portal| portal.take_status_changed())
+        {
+            cx.notify();
+        }
+    }
+
+    /// One system-wide event into the machine.
+    fn system_event(&mut self, event: GlobalEvent, cx: &mut Context<Self>) {
+        if self.settings_open && matches!(event, GlobalEvent::Pressed(_)) {
+            self.note_shortcut_in_dialog(cx);
+        }
+        let may_start = !self.settings_open;
+        self.activation_input(
+            |machine| match event {
+                GlobalEvent::Pressed(at) => machine.press(at, may_start),
+                GlobalEvent::Released(at) => machine.release(at),
+                GlobalEvent::Escape(_) => machine.escape(),
+            },
+            cx,
+        );
     }
 
     /// In-window presses go through a keystroke interceptor: it runs
@@ -895,7 +922,7 @@ impl StarlingApp {
             .global_shortcuts
             .as_mut()
             .map(|shortcuts| shortcuts.set_record(&shortcut));
-        match outcome {
+        let applied = match outcome {
             Some(Err(reason)) => Err(reason),
             Some(Ok(())) => {
                 self.shortcut_registration = Ok(());
@@ -910,7 +937,13 @@ impl StarlingApp {
                 self.activation.reset_key();
                 Ok(())
             }
+        };
+        // A desktop portal binding is offered the new keys too (the
+        // desktop may keep the ones the user picked in its dialog).
+        if let (Ok(()), Some(portal)) = (&applied, self.portal_shortcuts.as_ref()) {
+            portal.rebind(&self.shortcut);
         }
+        applied
     }
 
     /// Escape is grabbed system-wide exactly while a take is active.

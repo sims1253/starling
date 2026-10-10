@@ -12,6 +12,7 @@ pub(crate) mod overlay;
 mod settings;
 pub(crate) mod staging;
 mod storage;
+mod system_check;
 mod topbar;
 
 pub use capture::render_capture;

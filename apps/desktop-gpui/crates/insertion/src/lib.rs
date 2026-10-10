@@ -443,6 +443,16 @@ impl Inserter {
         })
     }
 
+    /// Each backend's availability, in capture order (setup diagnostics).
+    /// Blocking like [`InsertionBackend::availability`]: X11 opens a
+    /// display connection, so call it off the UI thread.
+    pub fn availability(&self) -> Vec<(BackendKind, Result<(), InsertError>)> {
+        self.backends
+            .iter()
+            .map(|backend| (backend.kind(), backend.availability()))
+            .collect()
+    }
+
     pub fn describe(&self) -> String {
         if self.backends.is_empty() {
             "no insertion backend on this platform".to_string()
@@ -660,6 +670,21 @@ mod tests {
             && token
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':' | '+' | '-'))
+    }
+
+    #[test]
+    fn availability_reports_every_backend_in_order() {
+        let ready = std::sync::Arc::new(FakeBackend::new());
+        let blocked = std::sync::Arc::new(FakeBackend::new());
+        blocked.set_availability(Err(InsertError::Unavailable {
+            reason: "no display".into(),
+        }));
+        let inserter = Inserter::with_backends(vec![Box::new(blocked), Box::new(ready)]);
+        let report = inserter.availability();
+        assert_eq!(report.len(), 2);
+        assert_eq!(report[0].0, BackendKind::Fake);
+        assert!(matches!(report[0].1, Err(InsertError::Unavailable { .. })));
+        assert_eq!(report[1].1, Ok(()));
     }
 
     #[test]

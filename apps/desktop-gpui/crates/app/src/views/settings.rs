@@ -1099,7 +1099,8 @@ fn render_dictation_section(app: &mut StarlingApp, cx: &mut Context<StarlingApp>
         }))
     });
 
-    let reach = crate::shortcut::reach_note(&app.shortcut_registration, &app.shortcut);
+    let portal_bound = app.portal_shortcuts.as_ref().is_some_and(|portal| portal.is_bound());
+    let reach = crate::shortcut::reach_note(&app.shortcut_registration, &app.shortcut, portal_bound);
     let mut field = field_label("Recording shortcut")
         .child(app.draft_shortcut.clone())
         .child(helper(
@@ -1145,6 +1146,8 @@ fn render_dictation_section(app: &mut StarlingApp, cx: &mut Context<StarlingApp>
                 .line_height(px(10. * 1.55))
                 .child(reach),
         )
+        .children(crate::views::system_check::render_desktop_shortcut(app, cx))
+        .children(crate::views::system_check::render_system_check(app, cx))
 }
 
 /// "During recording" (#361).
