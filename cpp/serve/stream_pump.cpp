@@ -91,6 +91,9 @@ StreamPump::~StreamPump() {
 }
 
 void StreamPump::push(Event ev) {
+    // Counted before taking the lock: a WAV frame is decoded to count it,
+    // and the worker must not wait on that.
+    const int64_t samples = ev.kind == Kind::Audio ? frame_samples(ev.bytes) : 0;
     std::unique_lock<std::mutex> lk(mu_);
     // Bounded queue, never dropping: wait for space (backpressure).
     space_cv_.wait(lk, [&] {
@@ -102,7 +105,7 @@ void StreamPump::push(Event ev) {
     if (closed_) return;
     if (ev.kind == Kind::Audio) {
         pending_bytes_ += ev.bytes.size();
-        pending_samples_ += frame_samples(ev.bytes);
+        pending_samples_ += samples;
     } else if (ev.kind == Kind::Commit) {
         if (pending_commits_++ == 0) samples_before_commit_ = pending_samples_;
     } else if (ev.kind == Kind::Reset) {
