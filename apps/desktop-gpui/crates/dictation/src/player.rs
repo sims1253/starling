@@ -57,6 +57,9 @@ struct Inner {
     /// Wakes the playback watcher when a new sink is published. The sender
     /// disconnects when the player drops, telling the watcher to exit.
     watcher_wake: mpsc::SyncSender<()>,
+    /// Start/stop cues still playing (#221), so a new take can silence
+    /// them before its microphone opens.
+    cues: Mutex<Vec<rodio::Sink>>,
     /// Disconnects when the player drops, telling the owner thread to exit
     /// (which ends playback and releases the device).
     _shutdown: mpsc::Sender<()>,
@@ -118,6 +121,7 @@ impl Player {
                 handle,
                 state,
                 watcher_wake,
+                cues: Mutex::new(Vec::new()),
                 _shutdown: shutdown_tx,
             }),
         })
@@ -159,8 +163,8 @@ impl Player {
     }
 
     /// Plays a short sound (a start/stop cue, #221) at `volume` (1.0 is the
-    /// file's own level) on its own detached sink, alongside whatever is
-    /// playing: the current playback is neither replaced nor tracked.
+    /// file's own level) on its own sink, alongside whatever is playing:
+    /// the current playback is neither replaced nor stopped.
     pub fn play_cue(&self, wav: &[u8], volume: f32) -> Result<(), PlayerError> {
         let source = rodio::Decoder::new(Cursor::new(wav.to_vec()))
             .map_err(|err| PlayerError(format!("Could not decode WAV: {err}")))?;
@@ -168,8 +172,17 @@ impl Player {
             .map_err(|err| PlayerError(format!("Could not start playback: {err}")))?;
         sink.set_volume(volume);
         sink.append(source);
-        sink.detach();
+        let mut cues = self.inner.cues.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        cues.retain(|cue| !cue.empty());
+        cues.push(sink);
         Ok(())
+    }
+
+    /// Silences any cue still playing. Safe to call when none is.
+    pub fn stop_cues(&self) {
+        for cue in self.inner.cues.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).drain(..) {
+            cue.stop();
+        }
     }
 
     /// Stops the current playback, if any. Safe to call when idle.

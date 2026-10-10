@@ -8,15 +8,20 @@
 //! - **The stop cue closes what the start cue opened.** It plays only
 //!   for a take whose start cue played, only after its capture has
 //!   stopped (so it is never recorded into that take), and never once a
-//!   newer take has started (whose microphone could hear it).
-//! - **Attenuation (#361) does not swallow them.** With a cue to play,
-//!   lowering or muting playback waits until the start cue has played,
-//!   and the stop cue waits until the restore has been carried out
-//!   ([`PlaybackHandle::settled`](starling_dictation::playback::PlaybackHandle::settled)).
+//!   newer take has started (whose microphone could hear it). A cue still
+//!   sounding when a take starts is silenced before its microphone opens.
+//! - **Attenuation (#361) does not swallow them.** Each cue waits until
+//!   playback is as the user left it
+//!   ([`PlaybackHandle::settled`](starling_dictation::playback::PlaybackHandle::settled):
+//!   an earlier take's restore has been carried out and worked), and with
+//!   a start cue to play, lowering or muting waits until it has played. A
+//!   cue that cannot get there within [`SETTLE_LIMIT`] is dropped, and a
+//!   dropped start cue drops its stop cue.
 //!
 //! The start cue plays while the microphone is open: through speakers
 //! it can be heard in the first ~0.15 s of the take, which is where a
-//! take is silent anyway. Headphones keep it out entirely.
+//! take is silent anyway. Headphones keep it out entirely. Keeping it out
+//! of the captured audio itself would take the recorder's cooperation.
 //!
 //! The tones are synthesized once, in memory; there are no sound files.
 
@@ -35,7 +40,7 @@ const SAMPLE_RATE: u32 = 44_100;
 const TONE: Duration = Duration::from_millis(60);
 const PAUSE: Duration = Duration::from_millis(20);
 
-/// How long the stop cue waits at most for playback to be restored;
+/// How long a cue waits at most for playback to be as the user left it;
 /// past it the cue is dropped.
 const SETTLE_LIMIT: Duration = Duration::from_millis(1500);
 
@@ -134,6 +139,8 @@ pub(crate) fn attenuation_waits_for_cue(feedback: &FeedbackSettings, mode: Playb
 /// Which cues may play, take by take. Pure.
 #[derive(Debug, Default)]
 pub(crate) struct CueGate {
+    /// The take whose start cue waits for playback to settle.
+    starting: Option<TakeId>,
     /// The take whose start cue played and whose stop cue has not.
     announced: Option<TakeId>,
     /// An ended take whose stop cue waits for playback to be restored.
@@ -141,21 +148,42 @@ pub(crate) struct CueGate {
 }
 
 impl CueGate {
-    /// A take started recording: a stop cue still waiting for the
-    /// previous take is dropped, since this take's microphone is open.
+    /// A take is about to open its microphone: cues still waiting for an
+    /// earlier take are dropped.
     pub(crate) fn started(&mut self) {
+        self.starting = None;
         self.announced = None;
         self.stop_pending = None;
     }
 
     /// `take` reported its first samples while `active` is the live take.
-    /// Returns whether to play the start cue.
+    /// Returns whether a start cue is due once playback settles.
     pub(crate) fn listening(
         &mut self,
         take: TakeId,
         active: Option<TakeId>,
         enabled: bool,
     ) -> bool {
+        if !enabled || active != Some(take) {
+            return false;
+        }
+        self.starting = Some(take);
+        true
+    }
+
+    /// Playback settled for `take`'s start cue (`enabled` is false when it
+    /// did not settle in time or cues were turned off). Returns whether to
+    /// play it now: only while `take` is still the live take.
+    pub(crate) fn start_settled(
+        &mut self,
+        take: TakeId,
+        active: Option<TakeId>,
+        enabled: bool,
+    ) -> bool {
+        if self.starting != Some(take) {
+            return false;
+        }
+        self.starting = None;
         if !enabled || active != Some(take) {
             return false;
         }
@@ -166,6 +194,9 @@ impl CueGate {
     /// `take` stopped recording (finished or cancelled). Returns whether a
     /// stop cue is due once playback settles.
     pub(crate) fn ended(&mut self, take: TakeId) -> bool {
+        if self.starting == Some(take) {
+            self.starting = None;
+        }
         if self.announced != Some(take) {
             return false;
         }
@@ -197,39 +228,54 @@ impl StarlingApp {
         }
     }
 
-    /// A take started recording.
-    pub(crate) fn cue_take_started(&mut self) {
+    /// A take is about to open its microphone: no cue may sound into it.
+    pub(crate) fn cue_take_starting(&mut self) {
         self.cue_gate.started();
+        if let Some(player) = self.player.as_ref() {
+            player.stop_cues();
+        }
     }
 
-    /// The take's first samples arrived: the start cue, then (when it
-    /// waited for the cue) the attenuation.
+    /// The take's first samples arrived: the start cue once playback has
+    /// settled, then (when it waited for the cue) the attenuation.
     pub(crate) fn cue_listening(&mut self, take: TakeId, cx: &mut Context<Self>) {
-        let play = self
+        let due = self
             .cue_gate
             .listening(take, self.recording_take, self.feedback.cues);
-        if play {
-            self.play_cue(Cue::Start, self.feedback.cue_volume_percent);
-        }
-        // No lease on the live take: its attenuation waits for this cue.
-        if self.playback_lease.is_some() || self.recording_take != Some(take) {
-            return;
-        }
-        if !play {
+        if !due {
             // Cues were turned off mid-take: nothing to wait for.
             self.begin_deferred_attenuation(take);
             return;
         }
+        let settled = self.playback.handle().settled();
         cx.spawn(async move |this, cx| {
-            Timer::after(cue_length()).await;
+            let restored = cx
+                .background_spawn(async move { settled.recv_timeout(SETTLE_LIMIT) == Ok(true) })
+                .await;
+            let played = this
+                .update(cx, |app, _| {
+                    let enabled = app.feedback.cues && restored;
+                    let play = app
+                        .cue_gate
+                        .start_settled(take, app.recording_take, enabled);
+                    if play {
+                        app.play_cue(Cue::Start, app.feedback.cue_volume_percent);
+                    }
+                    play
+                })
+                .unwrap_or(false);
+            if played {
+                Timer::after(cue_length()).await;
+            }
             this.update(cx, |app, _| app.begin_deferred_attenuation(take))
                 .ok();
         })
         .detach();
     }
 
-    /// The start cue has played: attenuation that waited for it begins,
-    /// if `take` is still recording and nothing began it already.
+    /// The start cue has played (or will not): attenuation that waited for
+    /// it begins, if `take` is still recording and nothing began it
+    /// already.
     fn begin_deferred_attenuation(&mut self, take: TakeId) {
         if self.recording_take == Some(take) && self.playback_lease.is_none() {
             self.playback_lease = Some(self.playback.handle().begin(&self.playback_settings));
@@ -264,14 +310,22 @@ impl StarlingApp {
         .detach();
     }
 
-    /// The settings dialog's preview: both cues at the draft volume.
+    /// The settings dialog's preview: both cues at the draft volume. Not
+    /// while a take records: its microphone would hear them.
     pub(crate) fn preview_cues(&mut self, cx: &mut Context<Self>) {
+        if self.recording_take.is_some() {
+            return;
+        }
         let volume = self.draft_cue_volume.read(cx).value();
         self.play_cue(Cue::Start, volume);
         cx.spawn(async move |this, cx| {
             Timer::after(cue_length() + Duration::from_millis(250)).await;
-            this.update(cx, |app, _| app.play_cue(Cue::Stop, volume))
-                .ok();
+            this.update(cx, |app, _| {
+                if app.recording_take.is_none() {
+                    app.play_cue(Cue::Stop, volume);
+                }
+            })
+            .ok();
         })
         .detach();
     }
@@ -281,17 +335,27 @@ impl StarlingApp {
 mod tests {
     use super::*;
 
+    /// Take `take` is live, reached readiness, and its start cue played.
+    fn heard(gate: &mut CueGate, take: TakeId) {
+        gate.started();
+        assert!(gate.listening(take, Some(take), true));
+        assert!(gate.start_settled(take, Some(take), true));
+    }
+
     #[test]
     fn the_start_cue_plays_once_and_only_for_the_live_take() {
         let mut gate = CueGate::default();
         gate.started();
         assert!(gate.listening(1, Some(1), true));
+        assert!(gate.start_settled(1, Some(1), true));
+        assert!(!gate.start_settled(1, Some(1), true), "played once");
         // A late callback from an older take, or one with no live take.
         assert!(!gate.listening(0, Some(1), true));
         assert!(!gate.listening(2, None, true));
         // Disabled cues never play.
         let mut gate = CueGate::default();
         assert!(!gate.listening(1, Some(1), false));
+        assert!(!gate.start_settled(1, Some(1), true));
         assert!(!gate.ended(1), "no start cue, no stop cue");
     }
 
@@ -308,10 +372,45 @@ mod tests {
     }
 
     #[test]
-    fn the_stop_cue_follows_a_heard_start_once_playback_settled() {
+    fn a_take_that_ends_while_its_start_cue_waits_plays_neither_cue() {
         let mut gate = CueGate::default();
         gate.started();
         assert!(gate.listening(1, Some(1), true));
+        // Cancelled before playback settled.
+        assert!(!gate.ended(1));
+        assert!(!gate.start_settled(1, None, true));
+        assert!(!gate.settled(1, None, true));
+    }
+
+    #[test]
+    fn a_start_cue_that_cannot_settle_is_dropped_with_its_stop_cue() {
+        // An earlier take's restore did not finish in time (or failed):
+        // the cue would play into a muted output.
+        let mut gate = CueGate::default();
+        gate.started();
+        assert!(gate.listening(1, Some(1), true));
+        assert!(!gate.start_settled(1, Some(1), false));
+        assert!(!gate.ended(1));
+    }
+
+    #[test]
+    fn the_start_cue_waits_for_its_own_take_only() {
+        // Take 1's settle arrives after take 2 started: neither plays
+        // take 1's cue, and take 2's own cue still can.
+        let mut gate = CueGate::default();
+        gate.started();
+        assert!(gate.listening(1, Some(1), true));
+        gate.started();
+        assert!(!gate.start_settled(1, Some(2), true));
+        assert!(gate.listening(2, Some(2), true));
+        assert!(!gate.start_settled(1, Some(2), true));
+        assert!(gate.start_settled(2, Some(2), true));
+    }
+
+    #[test]
+    fn the_stop_cue_follows_a_heard_start_once_playback_settled() {
+        let mut gate = CueGate::default();
+        heard(&mut gate, 1);
         assert!(gate.ended(1));
         assert!(!gate.ended(1), "ending twice is one stop cue");
         assert!(gate.settled(1, None, true));
@@ -322,8 +421,7 @@ mod tests {
     fn a_cancelled_take_that_was_heard_still_closes_with_the_stop_cue() {
         // The microphone opened (the start cue said so) and has closed.
         let mut gate = CueGate::default();
-        gate.started();
-        assert!(gate.listening(4, Some(4), true));
+        heard(&mut gate, 4);
         assert!(gate.ended(4));
         assert!(gate.settled(4, None, true));
     }
@@ -331,14 +429,12 @@ mod tests {
     #[test]
     fn a_rapid_re_press_drops_the_previous_stop_cue() {
         let mut gate = CueGate::default();
-        gate.started();
-        assert!(gate.listening(1, Some(1), true));
+        heard(&mut gate, 1);
         assert!(gate.ended(1));
         // Take 2 starts before take 1's playback settled: its microphone
         // would hear the stop cue.
-        gate.started();
+        heard(&mut gate, 2);
         assert!(!gate.settled(1, Some(2), true));
-        assert!(gate.listening(2, Some(2), true));
         // Even if take 2 already ended, take 1's stale settle stays quiet.
         assert!(gate.ended(2));
         assert!(!gate.settled(1, None, true));
@@ -348,14 +444,12 @@ mod tests {
     #[test]
     fn a_stop_cue_is_skipped_when_a_take_is_live_or_cues_were_turned_off() {
         let mut gate = CueGate::default();
-        gate.started();
-        assert!(gate.listening(1, Some(1), true));
+        heard(&mut gate, 1);
         assert!(gate.ended(1));
         assert!(!gate.settled(1, Some(2), true));
 
         let mut gate = CueGate::default();
-        gate.started();
-        assert!(gate.listening(1, Some(1), true));
+        heard(&mut gate, 1);
         assert!(gate.ended(1));
         assert!(!gate.settled(1, None, false));
     }

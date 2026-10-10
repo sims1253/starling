@@ -803,10 +803,10 @@ impl StarlingApp {
         for effect in effects {
             match effect {
                 Effect::Start(take) => {
+                    self.cue_take_starting();
                     if self.start_recording(cx) {
                         self.recording_take = Some(take);
-                        self.overlay.model.take_started(Instant::now());
-                        self.cue_take_started();
+                        self.overlay_take_started();
                     } else {
                         self.activation.start_failed(take);
                     }

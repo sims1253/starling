@@ -21,11 +21,13 @@
 //!   the compositor decides where the overlay goes, whether it floats,
 //!   and whether it takes focus. The window's app id is
 //!   [`OVERLAY_APP_ID`] so a compositor rule can float it unfocused.
-//! - **Windows**: gpui makes a `WS_EX_TOOLWINDOW` pop-up, without
-//!   `WS_EX_TOPMOST` or `WS_EX_NOACTIVATE`: other windows can cover it and
-//!   clicking it (Cancel) can activate it. **macOS**: a pop-up-level
+//! - **Windows**: gpui makes a `WS_EX_TOOLWINDOW` pop-up; the overlay adds
+//!   `WS_EX_TOPMOST` and `WS_EX_NOACTIVATE` itself
+//!   ([`keep_on_top_without_focus`]) so it stays above other windows and a
+//!   click on Cancel does not activate it. **macOS**: a pop-up-level
 //!   window. Both open on the primary display (no pointer lookup here);
-//!   neither was run for this change.
+//!   neither was run for this change (the Windows part is compile-checked
+//!   only).
 
 use std::time::{Duration, Instant};
 
@@ -136,9 +138,6 @@ pub(crate) struct Pipeline {
 #[derive(Debug)]
 pub(crate) struct OverlayModel {
     follow: Follow,
-    /// The session id of the take on the overlay once its save landed;
-    /// kept through the terminal linger.
-    take_id: Option<String>,
     /// A terminal phase and when it was entered.
     terminal: Option<(OverlayPhase, Instant)>,
     delivery: DeliveryStatus,
@@ -149,7 +148,6 @@ impl OverlayModel {
     pub(crate) fn new(now: Instant) -> Self {
         Self {
             follow: Follow::None,
-            take_id: None,
             terminal: None,
             delivery: DeliveryStatus::Idle,
             delivery_since: now,
@@ -159,7 +157,6 @@ impl OverlayModel {
     /// A new take started: whatever the overlay showed is replaced.
     pub(crate) fn take_started(&mut self, now: Instant) {
         self.follow = Follow::None;
-        self.take_id = None;
         self.terminal = None;
         self.delivery = DeliveryStatus::Idle;
         self.delivery_since = now;
@@ -188,7 +185,6 @@ impl OverlayModel {
     pub(crate) fn take_saved(&mut self, stopped_at: Instant, id: &str) {
         if self.follow == Follow::Saving(stopped_at) {
             self.follow = Follow::Take(id.to_string());
-            self.take_id = Some(id.to_string());
         }
     }
 
@@ -206,12 +202,6 @@ impl OverlayModel {
             Follow::Take(id) => Some(id),
             _ => None,
         }
-    }
-
-    /// The session id of the take the overlay shows, once saved — also
-    /// while its terminal phase lingers. `None` while it records or saves.
-    pub(crate) fn take_id(&self) -> Option<&str> {
-        self.take_id.as_deref()
     }
 
     pub(crate) fn set_delivery(&mut self, status: DeliveryStatus, now: Instant) {
@@ -416,6 +406,9 @@ pub(crate) struct Overlay {
     generation: u64,
     /// The main window's scale factor, for placing on X11.
     pub(crate) scale: f32,
+    /// The staging draft of the take on the overlay (staged dictation):
+    /// the live text shows that draft and no other.
+    pub(crate) staging_token: Option<u64>,
 }
 
 impl Overlay {
@@ -428,6 +421,7 @@ impl Overlay {
             opening: None,
             generation: 0,
             scale: 1.,
+            staging_token: None,
         }
     }
 
@@ -446,6 +440,17 @@ impl StarlingApp {
     pub(crate) fn set_delivery_status(&mut self, status: DeliveryStatus, cx: &mut Context<Self>) {
         self.overlay.model.set_delivery(status, Instant::now());
         self.sync_overlay(cx);
+    }
+
+    /// A take started recording: the overlay follows it, and its staging
+    /// draft when it has one.
+    pub(crate) fn overlay_take_started(&mut self) {
+        self.overlay.model.take_started(Instant::now());
+        self.overlay.staging_token = self
+            .staging
+            .as_ref()
+            .filter(|staging| staging.phase == crate::staging::StagingPhase::Recording)
+            .map(|staging| staging.token);
     }
 
     /// The followed take's pipeline, as far as the app knows it.
@@ -597,6 +602,10 @@ impl StarlingApp {
                 }
                 match opened {
                     Ok(window) if current => {
+                        #[cfg(target_os = "windows")]
+                        window
+                            .update(cx, |_, window, _| keep_on_top_without_focus(window))
+                            .ok();
                         this.overlay.window = Some(window);
                         this.overlay.window_mode = mode;
                     }
@@ -614,6 +623,44 @@ impl StarlingApp {
             .ok();
         })
         .detach();
+    }
+}
+
+/// gpui's Windows pop-up is neither topmost nor non-activating: adds both,
+/// so the overlay stays above the app being dictated into and clicking it
+/// never takes that app's focus.
+#[cfg(target_os = "windows")]
+fn keep_on_top_without_focus(window: &gpui::Window) {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos, GWL_EXSTYLE, HWND_TOPMOST,
+        SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, WS_EX_NOACTIVATE, WS_EX_TOPMOST,
+    };
+    let Ok(handle) = window.window_handle() else {
+        return;
+    };
+    let RawWindowHandle::Win32(handle) = handle.as_raw() else {
+        return;
+    };
+    let hwnd = HWND(handle.hwnd.get() as *mut core::ffi::c_void);
+    // SAFETY: `hwnd` is the live overlay window, owned by this thread.
+    unsafe {
+        let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        SetWindowLongPtrW(
+            hwnd,
+            GWL_EXSTYLE,
+            style | (WS_EX_NOACTIVATE.0 | WS_EX_TOPMOST.0) as isize,
+        );
+        let _ = SetWindowPos(
+            hwnd,
+            Some(HWND_TOPMOST),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        );
     }
 }
 
@@ -703,24 +750,6 @@ mod tests {
             Some(OverlayPhase::Ready)
         );
         assert_eq!(model.phase(None, idle(), false, t1 + TERMINAL_LINGER), None);
-    }
-
-    #[test]
-    fn the_take_id_is_known_from_the_save_through_the_linger() {
-        let t0 = Instant::now();
-        let mut model = OverlayModel::new(t0);
-        model.take_started(t0);
-        model.take_finished(t0);
-        assert_eq!(model.take_id(), None, "not saved yet");
-        model.take_saved(t0, "take-1");
-        assert_eq!(model.take_id(), Some("take-1"));
-        assert_eq!(
-            model.phase(None, idle(), false, t0),
-            Some(OverlayPhase::Ready)
-        );
-        assert_eq!(model.take_id(), Some("take-1"), "still shown");
-        model.take_started(t0);
-        assert_eq!(model.take_id(), None);
     }
 
     #[test]

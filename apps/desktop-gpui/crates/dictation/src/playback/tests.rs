@@ -592,6 +592,20 @@ fn a_restore_that_keeps_failing_tells_the_user() {
     assert_eq!(notices.len(), 1);
     assert_eq!(notices[0].kind, NoticeKind::RestoreFailed);
     assert!(notices[0].message.contains("speakers"), "{notices:?}");
+    // The cues (#221) are not played into the still-muted output.
+    assert!(!handle.settled().recv().unwrap());
+}
+
+#[test]
+fn settled_says_whether_playback_is_as_the_user_left_it() {
+    let (backend, _service, handle) = start();
+    assert!(handle.settled().recv().unwrap(), "nothing attenuated");
+    let lease = handle.begin(&mute());
+    assert!(!handle.settled().recv().unwrap(), "muted");
+    *backend.failing_applies.lock().unwrap() = RESTORE_ATTEMPTS - 1;
+    handle.end(lease);
+    assert!(handle.settled().recv().unwrap(), "restored after retries");
+    assert!(!backend.device("speakers").muted);
 }
 
 #[test]
