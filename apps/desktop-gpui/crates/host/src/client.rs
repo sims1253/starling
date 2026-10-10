@@ -1,6 +1,6 @@
-//! The client side of the host's IPC: what the GPUI app and the Electron
-//! comparison adapter will hold (E17 §1 Mode B — "the UI is a
-//! projection: commands in, events + snapshots out").
+//! The client side of the host's IPC: what the GPUI app holds (E17 §1
+//! Mode B — "the UI is a projection: commands in, events + snapshots
+//! out"; #220).
 //!
 //! The wire is [`crate::frame`] — every application payload is the I3
 //! envelope; receipts carry the runtime's own
@@ -49,7 +49,7 @@ use starling_runtime::channel::{bounded, Receiver, RecvError, Sender, TrySendErr
 use starling_runtime::machine::{Receipt, Rejection};
 use starling_runtime::protocol::Command;
 
-use crate::frame::{encode, AskOutcome, Frame, FrameError, FrameReader};
+use crate::frame::{encode, AskOutcome, Frame, FrameError, FrameReader, HostRecovery};
 use crate::platform::{self, TransportConn};
 
 /// How long a send waits for its receipt. Receipts are issued at command
@@ -126,6 +126,36 @@ pub enum UiWire {
     },
 }
 
+/// One take-feed frame (#220, see [`crate::takes`]), audio decoded.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TakeWire {
+    /// A recording take's tick, or its end (`ended`: the final sample
+    /// count; `kept`: a [`TakeWire::Persisted`] follows). `audio` is
+    /// `(start index, samples)` for a tapping connection.
+    Live {
+        take: String,
+        rate: u32,
+        status: Option<starling_runtime::machine::capture::LiveTakeStatus>,
+        audio: Option<(u64, Vec<f32>)>,
+        owner: crate::frame::TakeOwner,
+        ended: Option<u64>,
+        kept: bool,
+    },
+    StartFailed {
+        take: String,
+        problem: Option<starling_dictation::microphone::InputProblem>,
+        message: String,
+    },
+    Persisted {
+        take: String,
+        stored_id: Option<String>,
+        interrupted: bool,
+        error: Option<String>,
+        orphan: bool,
+    },
+    Notice(HostRecovery),
+}
+
 /// The host's answer to a [`HostClient::ask_user`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct AskResultWire {
@@ -139,6 +169,7 @@ enum Reply {
     Receipt(Result<Receipt, Rejection>, Option<u64>),
     Snapshot(Value),
     AgentWelcome(String),
+    TakeWatching(Option<HostRecovery>),
 }
 
 /// Why a client call failed.
@@ -176,6 +207,7 @@ pub struct HostClient {
     closer: Box<dyn TransportConn>,
     pending: Arc<Mutex<HashMap<String, Sender<Reply>>>>,
     events: Receiver<EventWire>,
+    takes: Receiver<TakeWire>,
     ui: Receiver<UiWire>,
     asks: Receiver<AskResultWire>,
     closed: Arc<AtomicBool>,
@@ -212,6 +244,7 @@ impl HostClient {
         let closed = Arc::new(AtomicBool::new(false));
         let close_reason: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let (event_tx, events) = bounded(4096);
+        let (take_tx, takes) = bounded(4096);
         let (ui_tx, ui) = bounded(64);
         let (ask_tx, asks) = bounded(64);
         let (hello_tx, hello_rx) = bounded::<Result<HostInfo, String>>(1);
@@ -227,6 +260,7 @@ impl HostClient {
                         conn,
                         pending,
                         event_tx,
+                        take_tx,
                         ui_tx,
                         ask_tx,
                         hello_tx,
@@ -269,6 +303,7 @@ impl HostClient {
             closer,
             pending,
             events,
+            takes,
             ui,
             asks,
             closed,
@@ -332,8 +367,8 @@ impl HostClient {
                 Reply::Receipt(..) => Err(ClientError::Protocol(
                     "snapshot request answered by a receipt".to_string(),
                 )),
-                Reply::AgentWelcome(_) => Err(ClientError::Protocol(
-                    "snapshot request answered by an agent welcome".to_string(),
+                Reply::AgentWelcome(_) | Reply::TakeWatching(_) => Err(ClientError::Protocol(
+                    "snapshot request answered by an agent welcome or watch reply".to_string(),
                 )),
             },
         )
@@ -359,8 +394,8 @@ impl HostClient {
             Reply::Snapshot(_) => Err(ClientError::Protocol(
                 "command answered by a snapshot".to_string(),
             )),
-            Reply::AgentWelcome(_) => Err(ClientError::Protocol(
-                "command answered by an agent welcome".to_string(),
+            Reply::AgentWelcome(_) | Reply::TakeWatching(_) => Err(ClientError::Protocol(
+                "command answered by an agent welcome or watch reply".to_string(),
             )),
         })
     }
@@ -431,6 +466,55 @@ impl HostClient {
         self.events.try_recv()
     }
 
+    // The take feed (#220): the app follows the takes the host records.
+
+    /// Follows the take feed on this connection; returns what the host's
+    /// startup recovery found, when no app has heard it yet.
+    pub fn take_watch(&self) -> Result<Option<HostRecovery>, ClientError> {
+        let req = new_id("watch");
+        self.exchange_reply(Frame::TakeWatch { req: req.clone() }, req, |reply| match reply {
+            Reply::TakeWatching(recovery) => Ok(recovery),
+            Reply::Receipt(..) | Reply::Snapshot(_) | Reply::AgentWelcome(_) => Err(
+                ClientError::Protocol("take watch answered by another reply".to_string()),
+            ),
+        })
+    }
+
+    /// Streams `take`'s audio from sample `from` on (see
+    /// [`TakeWire::Live`]); tapping a take whose owner is gone adopts it.
+    pub fn take_tap(&self, take: &str, from: u64) -> Result<(), ClientError> {
+        self.send_unanswered(Frame::TakeTap {
+            take: take.to_string(),
+            from,
+        })
+    }
+
+    /// Tells the host this app handled the stored take `stored_id` it
+    /// was handed (see [`Frame::TakeHandled`]).
+    pub fn take_handled(&self, stored_id: &str) -> Result<(), ClientError> {
+        self.send_unanswered(Frame::TakeHandled {
+            stored_id: stored_id.to_string(),
+            handed_back: false,
+        })
+    }
+
+    /// Hands the stored take `stored_id` back: this app cannot
+    /// transcribe it, another should.
+    pub fn take_handed_back(&self, stored_id: &str) -> Result<(), ClientError> {
+        self.send_unanswered(Frame::TakeHandled {
+            stored_id: stored_id.to_string(),
+            handed_back: true,
+        })
+    }
+
+    pub fn recv_take_timeout(&self, timeout: Duration) -> Result<TakeWire, RecvError> {
+        self.takes.recv_timeout(timeout)
+    }
+
+    pub fn try_recv_take(&self) -> Result<TakeWire, RecvError> {
+        self.takes.try_recv()
+    }
+
     // An agent connection sends `agent_hello` then asks; an app
     // connection receives prompts and answers them.
 
@@ -448,9 +532,11 @@ impl HostClient {
             req,
             |reply| match reply {
                 Reply::AgentWelcome(client) => Ok(client),
-                Reply::Receipt(..) | Reply::Snapshot(_) => Err(ClientError::Protocol(
-                    "agent hello answered by a receipt or snapshot".to_string(),
-                )),
+                Reply::Receipt(..) | Reply::Snapshot(_) | Reply::TakeWatching(_) => {
+                    Err(ClientError::Protocol(
+                        "agent hello answered by a receipt, snapshot or watch reply".to_string(),
+                    ))
+                }
             },
         )
     }
@@ -543,6 +629,7 @@ fn client_reader(
     conn: Box<dyn TransportConn>,
     pending: Arc<Mutex<HashMap<String, Sender<Reply>>>>,
     events: Sender<EventWire>,
+    takes: Sender<TakeWire>,
     ui: Sender<UiWire>,
     asks: Sender<AskResultWire>,
     hello: Sender<Result<HostInfo, String>>,
@@ -569,11 +656,14 @@ fn client_reader(
     // pull the next frame off the socket, and receipts/snapshots answer
     // through their own per-request channels.
     let mut backlog: VecDeque<EventWire> = VecDeque::new();
+    // The take feed's own backlog, same posture: never park the reader.
+    let mut take_backlog: VecDeque<TakeWire> = VecDeque::new();
     loop {
         // An idle read-poll timeout is the flush tick: events must move
         // the moment the application drains, not only when the host says
         // something else.
         flush_backlog(&events, &mut backlog);
+        flush_backlog(&takes, &mut take_backlog);
         match reader.read_frame() {
             Ok(Frame::Hello {
                 protocol,
@@ -610,6 +700,32 @@ fn client_reader(
             }
             Ok(Frame::AgentWelcome { req, client }) => {
                 deliver(&pending, &req, Reply::AgentWelcome(client));
+            }
+            Ok(Frame::TakeWatching { req, recovery }) => {
+                deliver(&pending, &req, Reply::TakeWatching(recovery));
+            }
+            Ok(
+                frame @ (Frame::LiveTake { .. }
+                | Frame::TakeStartFailed { .. }
+                | Frame::TakePersisted { .. }
+                | Frame::HostNotice { .. }),
+            ) => {
+                let wire = match take_wire(frame) {
+                    Ok(wire) => wire,
+                    Err(detail) => {
+                        fail(format!("host sent a malformed take frame: {detail}"));
+                        break;
+                    }
+                };
+                take_backlog.push_back(wire);
+                flush_backlog(&takes, &mut take_backlog);
+                if take_backlog.len() > EVENT_BACKLOG_CAP {
+                    fail(format!(
+                        "take feed undrained past the {EVENT_BACKLOG_CAP}-frame backlog cap; \
+                         reconnect and watch again"
+                    ));
+                    break;
+                }
             }
             // Ask results and prompt frames are rare; a full channel
             // means the owner stopped draining, so the connection fails
@@ -678,7 +794,14 @@ fn client_reader(
                 fail(format!("host said goodbye: {reason}"));
                 break;
             }
-            Ok(Frame::Command { .. } | Frame::GetSnapshot { .. } | Frame::AgentHello { .. }) => {
+            Ok(
+                Frame::Command { .. }
+                | Frame::GetSnapshot { .. }
+                | Frame::AgentHello { .. }
+                | Frame::TakeWatch { .. }
+                | Frame::TakeTap { .. }
+                | Frame::TakeHandled { .. },
+            ) => {
                 fail("host sent a client frame".to_string());
                 break;
             }
@@ -718,9 +841,59 @@ fn client_reader(
     }
 }
 
-/// Moves backlog into the event channel while there is room; never
-/// parks. A dropped receiver clears the backlog (the client is gone).
-fn flush_backlog(events: &Sender<EventWire>, backlog: &mut VecDeque<EventWire>) {
+/// A take-feed frame with its audio decoded.
+fn take_wire(frame: Frame) -> Result<TakeWire, String> {
+    Ok(match frame {
+        Frame::LiveTake {
+            take,
+            rate,
+            status,
+            audio,
+            owner,
+            ended,
+            kept,
+        } => TakeWire::Live {
+            take,
+            rate,
+            status,
+            audio: match audio {
+                Some(audio) => Some((audio.start, audio.decode()?)),
+                None => None,
+            },
+            owner,
+            ended,
+            kept,
+        },
+        Frame::TakeStartFailed {
+            take,
+            problem,
+            message,
+        } => TakeWire::StartFailed {
+            take,
+            problem,
+            message,
+        },
+        Frame::TakePersisted {
+            take,
+            stored_id,
+            interrupted,
+            error,
+            orphan,
+        } => TakeWire::Persisted {
+            take,
+            stored_id,
+            interrupted,
+            error,
+            orphan,
+        },
+        Frame::HostNotice { recovery } => TakeWire::Notice(recovery),
+        other => return Err(format!("{other:?} is not a take frame")),
+    })
+}
+
+/// Moves backlog into a channel while there is room; never parks. A
+/// dropped receiver clears the backlog (the client is gone).
+fn flush_backlog<T>(events: &Sender<T>, backlog: &mut VecDeque<T>) {
     while let Some(event) = backlog.pop_front() {
         match events.try_send(event) {
             Ok(()) => {}

@@ -95,6 +95,14 @@ pub fn bounded<T>(capacity: usize) -> (Sender<T>, Receiver<T>) {
 }
 
 impl<T> Sender<T> {
+    /// How full the queue is: `(queued, capacity)`. A producer that can
+    /// wait (the host's take feed, #220) backs off on this before
+    /// `try_send` would refuse a more urgent sender.
+    pub fn depth(&self) -> (usize, usize) {
+        let state = self.chan.queue.lock().expect("channel mutex poisoned");
+        (state.items.len(), state.capacity)
+    }
+
     /// Enqueues `value` if the queue has room; never blocks.
     pub fn try_send(&self, value: T) -> Result<(), TrySendError<T>> {
         let mut state = self.chan.queue.lock().expect("channel mutex poisoned");

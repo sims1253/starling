@@ -2348,18 +2348,21 @@ fn a_retry_against_a_row_holding_different_audio_stores_the_real_take() {
     let (journal, _scratch) = real_journal(&first);
     let id = journal.id.clone();
 
-    store
-        .commit_take(&take_record(&id, &first, Some(journal.clone())))
-        .expect("first commit adopts");
+    let first_take = take_record(&id, &first, Some(journal.clone()));
+    store.commit_take(&first_take).expect("first commit adopts");
+    assert_eq!(store.stored_id(&first_take).as_deref(), Some(id.as_str()));
 
     // A different journal under the SAME id — the stem proves nothing
     // about content.
     let second: Vec<f32> = (0..90).map(|i| (i % 23) as f32 * 0.007).collect();
     let (stale, _stale_scratch) = journal_as(&id, &second, dir.path());
 
+    let second_take = take_record(&id, &second, Some(stale));
     store
-        .commit_take(&take_record(&id, &second, Some(stale)))
+        .commit_take(&second_take)
         .expect("the take is stored from its samples");
+    let second_stored = store.stored_id(&second_take).expect("the commit names its row");
+    assert_ne!(second_stored, id, "#220: never the occupant of the journal id");
 
     let inner = starling_dictation::store_v2::StoreV2::open(dir.path()).expect("reopen");
     let rows = inner.list_records(0, 10).expect("list");
@@ -2384,6 +2387,7 @@ fn a_retry_against_a_row_holding_different_audio_stores_the_real_take() {
         .expect("the fallback row");
     let audio = inner.load_audio(&fallback.id).expect("fallback audio");
     assert_eq!(audio.samples, second, "this take's real audio is stored");
+    assert_eq!(second_stored, fallback.id, "the stored id is this take's row");
     let extra = fallback.extra_json.as_deref().unwrap_or_default();
     assert!(
         extra.contains("journalAdoptionError") && extra.contains("journal hash mismatch"),

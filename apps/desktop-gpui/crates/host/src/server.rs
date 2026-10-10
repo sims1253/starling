@@ -42,7 +42,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use starling_dictation::store_v2::{
-    LeaseAcquisition, ReconciliationReport, StoreV2, StoreV2Error, LEASE_HEARTBEAT_TTL,
+    LeaseAcquisition, ReconciliationReport, StoreV2, LEASE_HEARTBEAT_TTL,
 };
 use starling_runtime::bus::EventSub;
 use starling_runtime::channel::{bounded, Receiver, Sender, TrySendError};
@@ -123,11 +123,6 @@ pub enum HostError {
     },
     #[error("preparing the endpoint directory {0:?}: {1}")]
     RuntimeDir(PathBuf, String),
-    #[error("reconciling storage v2 at {root:?} after taking the lease failed: {source}")]
-    Reconcile {
-        root: PathBuf,
-        source: StoreV2Error,
-    },
     /// The agent allowlist exists but will not load (fail closed).
     #[error("the agent allowlist {path:?} will not load: {source}")]
     Allowlist {
@@ -157,6 +152,7 @@ pub struct HostHandle {
     /// threads (joined before the engine stops, never after it).
     watch_stop: Arc<AtomicBool>,
     startup_reconciliation: ReconciliationReport,
+    takes: Arc<crate::takes::TakeHub>,
     done: AtomicBool,
 }
 
@@ -175,6 +171,21 @@ impl HostHandle {
     /// report is the normal case.
     pub fn startup_reconciliation(&self) -> &ReconciliationReport {
         &self.startup_reconciliation
+    }
+
+    /// Whether the host has nothing to do (#220's idle exit): no client
+    /// connected, no take recording or being stored, no job queued or
+    /// running.
+    pub fn idle(&self) -> bool {
+        if self.shared.live_connections.load(Ordering::SeqCst) > 0 || self.takes.busy() {
+            return false;
+        }
+        let snapshot = self.shared.client.snapshot();
+        let capture_settled = matches!(
+            snapshot.capture.state.as_str(),
+            "Idle" | "Persisted" | "Interrupted"
+        );
+        capture_settled && snapshot.jobs.active == 0 && snapshot.jobs.waiting == 0
     }
 
     /// The engine manager this host supervises right now, when it runs
@@ -336,6 +347,10 @@ pub struct HostShared {
     live_connections: AtomicUsize,
     /// The agent broker's inbox (see [`crate::agent`]).
     pub(crate) broker: Sender<BrokerMsg>,
+    /// The app's take feed (see [`crate::takes`]).
+    pub(crate) takes: Arc<crate::takes::TakeHub>,
+    /// The lease-holding store: owner-side repairs run on it.
+    lease: Arc<Mutex<StoreV2>>,
     agent_allowlist: Allowlist,
     #[cfg(feature = "test-support")]
     insecure_test_app_role: bool,
@@ -355,7 +370,7 @@ impl HostShared {
 
 pub(crate) struct ConnState {
     outbound: Sender<Frame>,
-    closed: AtomicBool,
+    pub(crate) closed: AtomicBool,
     /// Set exactly once by `unregister` (the reader's exit path, also
     /// armed as a panic guard) so the live-connection count is
     /// decremented once per admission even if the reader panics.
@@ -417,6 +432,12 @@ impl ConnState {
     fn close(&self) {
         self.mark_closed();
         let _ = self.closer.shutdown_both();
+    }
+
+    /// How full this connection's outbound queue is: `(queued,
+    /// capacity)`.
+    pub(crate) fn outbound_depth(&self) -> (usize, usize) {
+        self.outbound.depth()
     }
 
     /// Offers a frame to this connection's writer. `Err` when the
@@ -499,7 +520,11 @@ pub fn serve(config: HostConfig) -> Result<HostHandle, HostError> {
     //     sees our lease as a live foreign owner and correctly defers).
     //     A crashed predecessor's interrupted takes are salvaged, and the
     //     report is surfaced (logged here, held on the handle for
-    //     status).
+    //     status). A reconcile that fails does not keep the host from
+    //     serving (#220: the app records through it): the failure is
+    //     surfaced to the app like the app surfaced it when it ran
+    //     recovery itself, and the rest of recovery still runs.
+    let mut reconcile_error = None;
     let startup_reconciliation = match lease
         .lock()
         // Poison-tolerant like the registries: the only other locker
@@ -511,11 +536,12 @@ pub fn serve(config: HostConfig) -> Result<HostHandle, HostError> {
     {
         Ok(report) => report,
         Err(source) => {
-            release_lease_now(&lease);
-            return Err(HostError::Reconcile {
-                root: config.data_root.clone(),
-                source,
-            });
+            eprintln!(
+                "starling-runtime-host: reconciling storage v2 at {} failed: {source}",
+                config.data_root.display()
+            );
+            reconcile_error = Some(format!("Could not recover interrupted recordings: {source}"));
+            ReconciliationReport::default()
         }
     };
     if startup_reconciliation.has_findings() {
@@ -533,6 +559,23 @@ pub fn serve(config: HostConfig) -> Result<HostHandle, HostError> {
             startup_reconciliation.unreadable.len(),
         );
     }
+
+    // 1c. The rest of startup recovery (#220, from the app): attempts a
+    //     previous run left started, takes a killed process left in the
+    //     recorder's journal tree (#356). The app hears the findings
+    //     through the take feed.
+    let journals = config.runtime.capture.journals_dir.clone();
+    let startup_recovery = crate::recovery::recover(
+        &mut lease.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
+        &journals,
+        &startup_reconciliation,
+        reconcile_error,
+    );
+    let takes = crate::takes::TakeHub::new(
+        config.orphan_grace,
+        Some(config.data_root.join(crate::takes::UNCLAIMED_FILE)),
+    );
+    takes.set_recovery(startup_recovery.recovery);
 
     // 2. The endpoint.
     if let Err(err) = platform::ensure_runtime_dir(&config.runtime_dir) {
@@ -586,9 +629,12 @@ pub fn serve(config: HostConfig) -> Result<HostHandle, HostError> {
     //    from here on). The engine starts only now — after the lease and
     //    the endpoint are this process's — so a host that turns out to
     //    be a client never spawns a sidecar.
-    let mut runtime_config = config.runtime;
+    let mut runtime_config = config
+        .runtime
+        .with_capture_observer(Arc::clone(&takes) as Arc<dyn starling_runtime::machine::capture::CaptureObserver>);
     let engine = crate::engine::attach(config.engine, &mut runtime_config);
     let (runtime, client) = starling_runtime::Runtime::start(runtime_config);
+    takes.attach(client.clone());
     let events = client.subscribe();
 
     let (broker_tx, broker_rx) = bounded(BROKER_INBOX);
@@ -604,6 +650,8 @@ pub fn serve(config: HostConfig) -> Result<HostHandle, HostError> {
         conn_threads: Mutex::new(Vec::new()),
         live_connections: AtomicUsize::new(0),
         broker: broker_tx,
+        takes: Arc::clone(&takes),
+        lease: Arc::clone(&lease),
         agent_allowlist,
         #[cfg(feature = "test-support")]
         insecure_test_app_role: config.insecure_test_app_role,
@@ -633,6 +681,27 @@ pub fn serve(config: HostConfig) -> Result<HostHandle, HostError> {
         let shared = Arc::clone(&shared);
         move || lease_heartbeat(lease, shared)
     }));
+    threads.push(spawn("starling-host-takes", {
+        let takes = Arc::clone(&takes);
+        let shared = Arc::clone(&shared);
+        move || crate::takes::tick_loop(takes, shared)
+    }));
+    // The recheck rides with the host's threads too: shutdown joins it
+    // before the lease is released, so it never touches a store a
+    // successor owns.
+    threads.extend(crate::recovery::recheck_later(
+        Arc::clone(&lease),
+        journals,
+        startup_recovery.recheck,
+        {
+            let shared = Arc::clone(&shared);
+            move || shared.shutdown.load(Ordering::SeqCst)
+        },
+        {
+            let takes = Arc::clone(&takes);
+            move |found| takes.notice(found)
+        },
+    ));
     // The settings follower (#220): while the host serves, engine
     // changes in the settings file apply to it. The watcher rides with
     // the host's threads, so shutdown joins it before the runtime and
@@ -666,6 +735,7 @@ pub fn serve(config: HostConfig) -> Result<HostHandle, HostError> {
         engine,
         watch_stop,
         startup_reconciliation,
+        takes,
         done: AtomicBool::new(false),
     })
 }
@@ -918,8 +988,62 @@ fn connection_reader(
                         break;
                     }
                     Frame::Command { mut envelope } => {
-                        if handle_command(&shared, &state, &mut envelope).is_err() {
-                            break;
+                        // The connection that starts a take owns it in
+                        // the take feed, and only it ends the take while
+                        // it is connected.
+                        let kind = envelope
+                            .get("type")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        let corr = envelope
+                            .get("corr")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string);
+                        // A start without a corr records under the
+                        // runtime's anonymous take id: it is owned too.
+                        let owned_as = (kind == "capture.start").then(|| {
+                            corr.clone().unwrap_or_else(|| {
+                                starling_runtime::machine::capture::ANON_TAKE.to_string()
+                            })
+                        });
+                        let registered = owned_as
+                            .as_deref()
+                            .is_some_and(|take| shared.takes.starting(take, &state));
+                        if (kind == "capture.stop" || kind == "capture.abort")
+                            && !shared.takes.may_end(corr.as_deref(), &state)
+                        {
+                            let id = envelope
+                                .get("id")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or_default()
+                                .to_string();
+                            let refusal = Frame::Receipt {
+                                req: id,
+                                seq: None,
+                                result: Err(Rejection::IllegalInState {
+                                    command: kind,
+                                    state: "Recording".to_string(),
+                                    detail: "the current take belongs to another connection"
+                                        .to_string(),
+                                }),
+                            };
+                            if state.try_deliver(refusal).is_err() {
+                                state.close();
+                                break;
+                            }
+                            continue;
+                        }
+                        match handle_command(&shared, &state, &mut envelope) {
+                            Err(()) => break,
+                            Ok(false) if registered => {
+                                // Refused: no take opens, so the
+                                // connection owns nothing by it.
+                                if let Some(take) = owned_as.as_deref() {
+                                    shared.takes.start_refused(take, &state);
+                                }
+                            }
+                            Ok(_) => {}
                         }
                     }
                     // The agent ask surface. A full broker refuses new
@@ -1009,6 +1133,51 @@ fn connection_reader(
                             ask_id: req,
                         });
                     }
+                    // The take feed is the app's; agents reach the
+                    // microphone only through asks.
+                    Frame::TakeWatch { .. } | Frame::TakeTap { .. } | Frame::TakeHandled { .. }
+                        if state.is_agent() =>
+                    {
+                        terminate(
+                            &state,
+                            TransportErrorCode::ProtocolViolation,
+                            "agent connections cannot follow the take feed".to_string(),
+                        );
+                        break;
+                    }
+                    Frame::TakeWatch { req } => {
+                        // An app (re)connected: attempts a dead app left
+                        // "started" are failed now, ready to retry — a
+                        // live app's attempts are protected by their
+                        // markers (#213). Startup ran the same repair.
+                        if let Err(err) = shared
+                            .lease
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .interrupt_stale_attempts(crate::recovery::STALE_ATTEMPT_NOTE)
+                        {
+                            eprintln!(
+                                "starling-runtime-host: failing stale transcription attempts: {err}"
+                            );
+                        }
+                        if shared.takes.watch(&state, req).is_err() {
+                            state.close();
+                            break;
+                        }
+                    }
+                    Frame::TakeTap { take, from } => {
+                        shared.takes.tap(&state, take, from);
+                    }
+                    Frame::TakeHandled {
+                        stored_id,
+                        handed_back,
+                    } => {
+                        if handed_back {
+                            shared.takes.handed_back(&state, &stored_id);
+                        } else {
+                            shared.takes.handled(&stored_id);
+                        }
+                    }
                     Frame::GetSnapshot { req } => {
                         let snapshot = shared.client.snapshot();
                         let value = serde_json::to_value(&snapshot)
@@ -1038,7 +1207,12 @@ fn connection_reader(
                     | Frame::AgentWelcome { .. }
                     | Frame::AskResult { .. }
                     | Frame::ShowPrompt { .. }
-                    | Frame::HidePrompt { .. } => {
+                    | Frame::HidePrompt { .. }
+                    | Frame::TakeWatching { .. }
+                    | Frame::LiveTake { .. }
+                    | Frame::TakeStartFailed { .. }
+                    | Frame::TakePersisted { .. }
+                    | Frame::HostNotice { .. } => {
                         terminate(
                             &state,
                             TransportErrorCode::ProtocolViolation,
@@ -1134,12 +1308,13 @@ impl Drop for UnregisterOnDrop<'_> {
 /// frame. The envelope is the I3 wire form; when the client left `seq`
 /// out, the host assigns it from the runtime's own frontier (see
 /// `RuntimeClient::assign_seq`) so a reconnecting client cannot collide
-/// with stream positions a dead connection consumed.
+/// with stream positions a dead connection consumed. `Ok(true)` when the
+/// runtime accepted the command.
 fn handle_command(
     shared: &HostShared,
     state: &ConnState,
     envelope: &mut serde_json::Value,
-) -> Result<(), ()> {
+) -> Result<bool, ()> {
     // Shape first: the receipt is keyed by the envelope's string `id`,
     // so an envelope without one could never be answered — the command
     // would execute while the client sat out its reply timeout. Refuse
@@ -1176,6 +1351,7 @@ fn handle_command(
                 seq: None,
                 result: Err(refusal),
             })
+            .map(|()| false)
             .map_err(|()| state.close());
     }
     let client_supplied_seq = envelope
@@ -1210,6 +1386,7 @@ fn handle_command(
     // The envelope is consumed here (nothing reads it after); moving it
     // avoids a full JSON deep-clone on the per-command hot path.
     let result = shared.client.send_raw(std::mem::take(envelope));
+    let accepted = result.is_ok();
     if state
         .try_deliver(Frame::Receipt {
             req: id,
@@ -1229,7 +1406,7 @@ fn handle_command(
         state.close();
         return Err(());
     }
-    Ok(())
+    Ok(accepted)
 }
 
 /// One connection's outbound side: serialized writes from the bounded

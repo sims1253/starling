@@ -13,6 +13,10 @@ global-hotkey = "0.7"
 starling-dictation = { path = "../dictation" }
 starling-processing = { path = "../processing" }
 starling-insertion = { path = "../insertion" }
+# #220: the app is a client of the per-user runtime host, and runs it
+# (`starling-gpui --runtime-host`).
+starling-runtime = { path = "../runtime" }
+starling-runtime-host = { path = "../host" }
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 dirs = "6"
 unicode-segmentation = "1"
@@ -41,3 +45,5 @@ raw-window-handle = "0.6"
 gpui = { version = "0.2.2", features = ["test-support"] }
 tempfile = "3"
 starling-insertion = { path = "../insertion", features = ["test-doubles"] }
+starling-runtime = { path = "../runtime", features = ["test-doubles"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }

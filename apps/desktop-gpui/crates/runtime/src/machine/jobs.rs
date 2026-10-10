@@ -91,6 +91,10 @@ struct Job {
     /// When the job was admitted (the transform result's `queued_ms`).
     queued_at: Instant,
     capture_ref: String,
+    /// The take a recognition job runs on, held from admission: the take
+    /// registry keeps only the newest takes (#220), and an accepted job
+    /// must not lose its audio to a later take's eviction while it waits.
+    audio: Option<Arc<TakeRecord>>,
     route: String,
     #[allow(dead_code)]
     budget: String,
@@ -371,12 +375,13 @@ impl JobsActor {
             return;
         }
         // 2. The submit must reference a take this runtime captured.
-        if !self
+        let audio = self
             .registry
             .lock()
             .expect("take registry lock")
-            .contains_key(&capture_ref)
-        {
+            .get(&capture_ref)
+            .cloned();
+        if audio.is_none() {
             let _ = reply.try_send(Err(Rejection::UnknownCaptureRef { capture_ref }));
             return;
         }
@@ -412,6 +417,7 @@ impl JobsActor {
             kind: JobKind::Recognition,
             queued_at: Instant::now(),
             capture_ref,
+            audio,
             route,
             budget,
             core,
@@ -491,6 +497,7 @@ impl JobsActor {
             // registry: a transform may run on a take captured before a
             // restart, and it reads no audio.
             capture_ref: request.capture_id.clone(),
+            audio: None,
             route: request.provider.route.clone(),
             budget: String::new(),
             kind: JobKind::Transform(request),
@@ -736,13 +743,15 @@ impl JobsActor {
             // observably sits there while the worker runs — the shape the
             // #210 storm test gates on), and a load failure comes back as
             // `WorkerReport::LoadFailed`.
-            let record = {
-                let registry = self.registry.lock().expect("take registry lock");
-                self.jobs
-                    .get(&job_id)
-                    .map(|job| job.capture_ref.clone())
-                    .and_then(|capture_ref| registry.get(&capture_ref).cloned())
-            };
+            let record = self.jobs.get(&job_id).and_then(|job| {
+                job.audio.clone().or_else(|| {
+                    self.registry
+                        .lock()
+                        .expect("take registry lock")
+                        .get(&job.capture_ref)
+                        .cloned()
+                })
+            });
             // Per-job core advances to `Recognizing` at dispatch, BEFORE
             // the worker spawns (the projection observably sits there while
             // the worker runs — the shape the #210 storm test gates on). If

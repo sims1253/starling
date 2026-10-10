@@ -1593,7 +1593,7 @@ mod tests {
         })
         .unwrap();
         let id = store
-            .save_capture(std::sync::Arc::new(wav), None)
+            .save_capture(std::sync::Arc::new(wav))
             .unwrap()
             .id;
         store.mark_attempt(&id, "test").unwrap();

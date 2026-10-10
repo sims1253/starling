@@ -118,6 +118,9 @@ pub(crate) enum Interruption {
     DeviceFailed(String),
     /// The device stopped delivering samples without reporting an error.
     Stalled(Duration),
+    /// The recording service ended the take on its own (#220) without a
+    /// fault this window saw.
+    Ended,
 }
 
 impl Interruption {
@@ -130,6 +133,7 @@ impl Interruption {
                 "{device} stopped delivering audio mid-recording (nothing for {:.0} s)",
                 for_.as_secs_f32()
             ),
+            Interruption::Ended => format!("{device} stopped recording mid-take"),
         }
     }
 }
@@ -379,18 +383,50 @@ fn open_system_settings(privacy: bool) -> Result<(), String> {
     ))
 }
 
-/// The device a recorder captures from, for messages.
-pub(crate) fn device_name(handle: &RecorderHandle) -> String {
+/// What the input-health checks read: the check's own recorder, or the
+/// live take the recording service records (#220).
+pub(crate) trait InputHealth {
+    fn input_route(&self) -> Option<&InputRoute>;
+    fn input_stalled_for(&self) -> Option<Duration>;
+    fn capture_fault(&self) -> Option<RecorderFault>;
+}
+
+impl InputHealth for RecorderHandle {
+    fn input_route(&self) -> Option<&InputRoute> {
+        RecorderHandle::input_route(self)
+    }
+    fn input_stalled_for(&self) -> Option<Duration> {
+        RecorderHandle::input_stalled_for(self)
+    }
+    fn capture_fault(&self) -> Option<RecorderFault> {
+        RecorderHandle::capture_fault(self)
+    }
+}
+
+impl InputHealth for crate::host_link::LiveCapture {
+    fn input_route(&self) -> Option<&InputRoute> {
+        crate::host_link::LiveCapture::input_route(self)
+    }
+    fn input_stalled_for(&self) -> Option<Duration> {
+        crate::host_link::LiveCapture::input_stalled_for(self)
+    }
+    fn capture_fault(&self) -> Option<RecorderFault> {
+        crate::host_link::LiveCapture::capture_fault(self)
+    }
+}
+
+/// The device a take captures from, for messages.
+pub(crate) fn device_name(handle: &impl InputHealth) -> String {
     handle
         .input_route()
         .map(|route| route.device.clone())
         .unwrap_or_else(|| "The microphone".to_string())
 }
 
-/// The interruption a live recorder is under. A stall only counts once
+/// The interruption a live take is under. A stall only counts once
 /// audio has arrived: a take that never delivered is the activation
 /// machine's start stall (`activation::START_STALL`), not a lost input.
-fn live_interruption(handle: &RecorderHandle) -> Option<Interruption> {
+fn live_interruption(handle: &impl InputHealth) -> Option<Interruption> {
     let stalled_for = handle.input_stalled_for().unwrap_or_default();
     take_interruption(handle.capture_fault().as_ref(), stalled_for)
 }

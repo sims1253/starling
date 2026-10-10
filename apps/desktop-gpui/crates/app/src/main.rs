@@ -6,12 +6,14 @@ mod assets;
 mod cues;
 mod delivery;
 mod editor;
+mod host_link;
 mod input;
 mod live_stream;
 mod mic;
 mod overlay;
 mod portal;
 mod processing;
+mod remote_take;
 mod shortcut;
 mod slider;
 mod staging;
@@ -33,6 +35,13 @@ use gpui::{
 use crate::app::StarlingApp;
 
 fn main() {
+    // #220: the same executable is the recording service. The app starts
+    // it as `starling-gpui --runtime-host …` (see `host_link`), so app and
+    // service are always one build; nothing below runs in that process.
+    let mut args = std::env::args().skip(1);
+    if args.next().as_deref() == Some("--runtime-host") {
+        std::process::exit(starling_runtime_host::cli::run(args.collect()));
+    }
     let started = Instant::now();
     let diagnostics = std::env::var("STARLING_DIAGNOSTICS")
         .map(|value| value == "1")

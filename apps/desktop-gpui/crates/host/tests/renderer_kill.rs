@@ -340,7 +340,9 @@ fn a_renderer_killed_with_a_command_in_flight_costs_only_the_receipt() {
     // Wait until the host has observably routed the command, then kill —
     // no fixed sleep guessing at the reader.
     let probe = connect_with_retry(&socket);
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // Generous: loaded Windows CI runners have missed 5 s here (routing,
+    // not timing, is what this waits for).
+    let deadline = Instant::now() + Duration::from_secs(30);
     while probe.snapshot().expect("probe snapshot")["jobs"]["limits"]["maxQueued"] != 3 {
         assert!(Instant::now() < deadline, "the renderer's command was never routed");
         std::thread::sleep(Duration::from_millis(20));
@@ -428,6 +430,62 @@ fn a_renderer_process_killed_mid_take_leaves_a_durable_take_and_a_serving_host()
     }
 
     drop(successor);
+    host.shutdown();
+}
+
+/// #220: a renderer killed mid-take and never relaunched. The host keeps
+/// recording only for the orphan grace, then stops and stores the take
+/// itself; the next app to follow the take feed is handed the stored take
+/// (`orphan`) to transcribe — the take is never left recording with no
+/// app, and never lost.
+#[test]
+fn a_take_whose_renderer_never_returns_is_stored_by_the_host_for_the_next_app() {
+    let root = tempfile::tempdir().unwrap();
+    let config = kill_config(
+        root.path(),
+        FakeCaptureSource::new(vec![FakeTakeScript::clean()]),
+        FakeProvider::new(vec![]),
+    )
+    .with_orphan_grace(Duration::from_millis(300));
+    let mut host = serve(config).expect("host serves");
+    let socket = host.socket_path().to_path_buf();
+
+    let mut renderer = spawn_double_take(&socket, "take", "take_orphan");
+    renderer.wait_ready(&socket);
+    renderer.kill();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let store = starling_dictation::store_v2::StoreV2::open(root.path()).expect("store opens");
+        if store.list_records(0, 10).expect("list").total == 1 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the host never stored the orphaned take");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let next = connect_with_retry(&socket);
+    next.take_watch().expect("watching");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match next.recv_take_timeout(Duration::from_millis(50)) {
+            Ok(starling_runtime_host::client::TakeWire::Persisted {
+                take,
+                stored_id,
+                orphan,
+                interrupted,
+                ..
+            }) => {
+                assert_eq!(take, "take_orphan");
+                assert!(orphan && !interrupted, "handed over as a complete orphan");
+                assert!(stored_id.is_some(), "with its history row");
+                break;
+            }
+            Ok(_) => {}
+            Err(_) => assert!(Instant::now() < deadline, "the next app was never handed the take"),
+        }
+    }
+    drop(next);
     host.shutdown();
 }
 

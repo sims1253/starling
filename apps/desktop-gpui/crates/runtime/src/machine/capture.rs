@@ -82,6 +82,9 @@ use crate::protocol::{Command, Event, SampleGap};
 
 use super::context::RouteFreezer;
 
+/// The take id a `capture.*` command without a `corr` acts on.
+pub const ANON_TAKE: &str = "take-anon";
+
 /// How a take ended — the persistence-facing counterpart of the machine's
 /// `Persisted` state (a `Persisted` take may reference a `complete` or an
 /// `interrupted` storage row; an interrupted row is still a committed row).
@@ -176,6 +179,12 @@ pub trait CaptureSession: Send {
     fn latest_window(&self, n: usize) -> Vec<f32>;
     /// The §3 R09 stop handshake.
     fn stop(self: Box<Self>) -> Result<CapturedTake, RecorderError>;
+    /// A read-only view of the take another thread may poll while the
+    /// actor owns the session (#220: the host's take feed). `None` when
+    /// the source offers none.
+    fn monitor(&self) -> Option<Arc<dyn LiveTakeMonitor>> {
+        None
+    }
 }
 
 /// How the actor acquires devices. Production wraps
@@ -183,6 +192,95 @@ pub trait CaptureSession: Send {
 pub trait CaptureSource: Send + Sync {
     fn start(&self, journals_dir: &Path, policy: &str) -> Result<Box<dyn CaptureSession>, String>;
 }
+
+/// A live take as another thread sees it (#220): its audio, read by
+/// index without taking it from the stop handshake, and its health.
+/// Shared with the host's take feed, which serves both to the app.
+pub trait LiveTakeMonitor: Send + Sync {
+    fn sample_rate(&self) -> u32;
+    /// Samples from index `from` on, at most `max` of them, in the order
+    /// the stop handshake returns them.
+    fn samples_from(&self, from: usize, max: usize) -> Vec<f32>;
+    /// How many samples [`Self::samples_from`] can reach so far.
+    fn sample_count(&self) -> usize;
+    fn status(&self) -> LiveTakeStatus;
+}
+
+/// A live take's health at one moment (#220): what the app shows while a
+/// take records and what its watchdogs decide on.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct LiveTakeStatus {
+    /// Samples the device has delivered (the sequence frontier).
+    pub captured: u64,
+    /// Samples the journal made durable.
+    pub acknowledged: u64,
+    pub clip_ratio: f64,
+    /// How long the input has delivered nothing; `None` before the first
+    /// sample.
+    pub stalled_ms: Option<u64>,
+    pub elapsed_ms: u64,
+    pub fault: Option<RecorderFault>,
+    pub disk: Option<starling_dictation::disk::DiskReading>,
+    pub disk_probe_failing: bool,
+    pub route: Option<starling_dictation::microphone::InputRoute>,
+}
+
+impl LiveTakeMonitor for starling_dictation::recorder::CaptureMonitor {
+    fn sample_rate(&self) -> u32 {
+        starling_dictation::recorder::CaptureMonitor::sample_rate(self)
+    }
+    fn samples_from(&self, from: usize, max: usize) -> Vec<f32> {
+        starling_dictation::recorder::CaptureMonitor::samples_from(self, from, max)
+    }
+    fn sample_count(&self) -> usize {
+        starling_dictation::recorder::CaptureMonitor::sample_count(self)
+    }
+    fn status(&self) -> LiveTakeStatus {
+        LiveTakeStatus {
+            captured: self.captured_sample_count(),
+            acknowledged: self.acknowledged_samples(),
+            clip_ratio: self.source_clip_ratio(),
+            stalled_ms: self
+                .input_stalled_for()
+                .map(|stalled| stalled.as_millis() as u64),
+            elapsed_ms: self.elapsed().as_millis() as u64,
+            fault: self.capture_fault(),
+            disk: self.disk_reading(),
+            disk_probe_failing: self.disk_probe_failing(),
+            route: self.input_route().cloned(),
+        }
+    }
+}
+
+/// Hooks for whoever serves takes beyond the event stream (#220: the
+/// host's take feed to its app). Called on the capture actor's thread
+/// (and [`Self::take_persisted`] on the actor too, once the persist
+/// report lands), so implementations must return promptly.
+pub trait CaptureObserver: Send + Sync {
+    /// A take opened its device.
+    fn take_started(&self, _corr: &str, _monitor: Option<Arc<dyn LiveTakeMonitor>>) {}
+    /// A `capture.start` could not open the device; `detail` is the
+    /// source's error text.
+    fn take_start_failed(&self, _corr: &str, _detail: &str) {}
+    /// The take stopped recording, for any reason. `record` holds
+    /// everything it kept (its persist follows), `None` when there was
+    /// nothing to keep.
+    fn take_ended(&self, _corr: &str, _record: Option<&Arc<TakeRecord>>) {}
+    /// The take's persist finished: the stored row's id when the store
+    /// could name it, or why the commit failed.
+    fn take_persisted(
+        &self,
+        _corr: &str,
+        _record: &Arc<TakeRecord>,
+        _stored: Result<Option<String>, String>,
+    ) {
+    }
+}
+
+/// The default: nobody beyond the event stream.
+pub struct NoCaptureObserver;
+
+impl CaptureObserver for NoCaptureObserver {}
 
 struct RecorderSession {
     handle: RecorderHandle,
@@ -223,6 +321,15 @@ impl CaptureSession for RecorderSession {
     fn stop(self: Box<Self>) -> Result<CapturedTake, RecorderError> {
         self.handle.stop()
     }
+    fn monitor(&self) -> Option<Arc<dyn LiveTakeMonitor>> {
+        Some(Arc::new(self.handle.monitor()))
+    }
+}
+
+/// A session over a recorder the caller opened (a host source that
+/// resolves the user's microphone settings itself, #220).
+pub fn recorder_session(handle: RecorderHandle) -> Box<dyn CaptureSession> {
+    Box::new(RecorderSession { handle })
 }
 
 /// The production source: the hardened recorder with its per-take durable
@@ -276,6 +383,14 @@ pub trait CaptureStore: Send + Sync {
     fn mark_interrupted(&self, take: &TakeRecord, note: &str) -> Result<(), String>;
     /// A label for snapshots and diagnostics.
     fn describe(&self) -> String;
+    /// The id of the stored row a committed `take` landed in, when the
+    /// store can name it (#220: the app transcribes the stored take).
+    /// Asked once per commit, right after it: an implementation may hand
+    /// the id out once (a second ask answers `None`, which does not mean
+    /// the take was never committed).
+    fn stored_id(&self, _take: &TakeRecord) -> Option<String> {
+        None
+    }
 }
 
 /// In-memory store (tests, and runtimes started without a data root).
@@ -363,6 +478,10 @@ impl CaptureStore for InMemoryCaptureStore {
 /// of take detail.
 pub struct V2CaptureStore {
     store: Mutex<StoreV2>,
+    /// The row each committed take landed in, until [`CaptureStore::stored_id`]
+    /// asks (#220): the commit knows it exactly, where a lookup by the
+    /// take's capture id could find another row that holds that id.
+    committed: Mutex<HashMap<String, String>>,
 }
 
 /// Report a post-commit (or rollback) divergence that must not change
@@ -397,11 +516,25 @@ fn report_status_flip_failure(id: &str, err: impl std::fmt::Display) {
     ));
 }
 
+fn committed_key(take: &TakeRecord) -> String {
+    format!("{}\u{0}{}", take.id, take.capture_id)
+}
+
 impl V2CaptureStore {
+    /// Remembers the row `take` was committed to, for
+    /// [`CaptureStore::stored_id`].
+    fn note_stored(&self, take: &TakeRecord, id: &str) {
+        self.committed
+            .lock()
+            .expect("committed ids lock")
+            .insert(committed_key(take), id.to_string());
+    }
+
     pub fn open(root: impl Into<PathBuf>) -> Result<Self, String> {
         let store = StoreV2::open(root).map_err(|err| err.to_string())?;
         Ok(V2CaptureStore {
             store: Mutex::new(store),
+            committed: Mutex::new(HashMap::new()),
         })
     }
 
@@ -492,6 +625,7 @@ impl V2CaptureStore {
                             report_status_flip_failure(&record.id, err);
                         }
                     }
+                    self.note_stored(take, &record.id);
                     return Ok(());
                 }
                 Some((report, Err(err))) => {
@@ -544,6 +678,7 @@ impl V2CaptureStore {
                                         ));
                                     }
                                 }
+                                self.note_stored(take, &existing.id);
                                 return Ok(());
                             }
                         }
@@ -691,6 +826,7 @@ impl V2CaptureStore {
                     // normal-path traffic for operators keying on it.
                     drop(store);
                     self.supersede_stored_take_journal(take, &staged_id);
+                    self.note_stored(take, &staged_id);
                     return Ok(());
                 }
                 Err(read_err) => {
@@ -759,6 +895,7 @@ impl V2CaptureStore {
         }
         drop(store);
         self.supersede_stored_take_journal(take, &staged_id);
+        self.note_stored(take, &staged_id);
         Ok(())
     }
 
@@ -843,6 +980,18 @@ impl CaptureStore for V2CaptureStore {
     fn describe(&self) -> String {
         "storage-v2".to_string()
     }
+    /// The adoption path keys the row by the journal's id; the samples
+    /// path names the journal it replaces (`supersedes_journal`), so either
+    /// way the take's capture id finds its row.
+    /// Only what the commit itself recorded: a commit whose outcome it
+    /// could not read back names nothing, rather than a row that merely
+    /// holds the same journal id (another take's audio). Handed out once.
+    fn stored_id(&self, take: &TakeRecord) -> Option<String> {
+        self.committed
+            .lock()
+            .expect("committed ids lock")
+            .remove(&committed_key(take))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -909,6 +1058,9 @@ pub struct PersistReport {
     corr: String,
     record: Arc<TakeRecord>,
     result: Result<(), String>,
+    /// The stored row's id, when the commit succeeded and the store could
+    /// name it ([`CaptureStore::stored_id`]).
+    stored: Option<String>,
     follow: PersistFollow,
     epoch: u64,
 }
@@ -1178,6 +1330,10 @@ fn salvage_take(live: LiveTake) -> Option<SalvagedTake> {
     salvage_outcome(facts, outcome)
 }
 
+/// How many finished takes the registry keeps for jobs to load by
+/// `captureRef` (the newest; older ones are in the store).
+pub const REGISTRY_TAKES: usize = 16;
+
 /// The capture actor's configuration.
 #[derive(Clone)]
 pub struct CaptureConfig {
@@ -1222,6 +1378,10 @@ pub struct CaptureActor {
     registry: TakeRegistry,
     config: CaptureConfig,
     freezer: RouteFreezer,
+    observer: Arc<dyn CaptureObserver>,
+    /// Registered take ids, oldest first: the registry keeps the newest
+    /// [`REGISTRY_TAKES`] (each holds its take's whole audio).
+    registered: std::collections::VecDeque<String>,
     take: Option<LiveTake>,
     /// The corr of the take the machine is currently working (set at
     /// `capture.start`, advanced by every new take). A persist report
@@ -1257,6 +1417,7 @@ impl CaptureActor {
         registry: TakeRegistry,
         config: CaptureConfig,
         freezer: RouteFreezer,
+        observer: Arc<dyn CaptureObserver>,
     ) -> CaptureActor {
         CaptureActor {
             inbox,
@@ -1269,6 +1430,8 @@ impl CaptureActor {
             registry,
             config,
             freezer,
+            observer,
+            registered: std::collections::VecDeque::new(),
             take: None,
             take_epoch: 0,
             pending_persists: Vec::new(),
@@ -1376,9 +1539,24 @@ impl CaptureActor {
                 return;
             }
         }
-        let corr = corr.unwrap_or_else(|| "take-anon".to_string());
+        let corr = corr.unwrap_or_else(|| ANON_TAKE.to_string());
         match command {
             Command::CaptureStart { policy } => {
+                // A take that ended `Interrupted` (a lost device, a failed
+                // store commit) is already salvaged and registered: once
+                // nothing of it is still persisting, the next start settles
+                // the machine back to `Idle` through the internal edge a
+                // failed device open takes (#211) — otherwise one fault
+                // would refuse every later take for the runtime's lifetime
+                // (#220: the long-lived host).
+                if self.core.state() == "Interrupted"
+                    && self.take.is_none()
+                    && self.pending_persists.is_empty()
+                {
+                    if let Err(violation) = self.core.advance_internal("Idle") {
+                        self.core.record_violation(violation);
+                    }
+                }
                 match self.core.commit_command("capture.start", Some(corr.clone())) {
                     Ok(_) => {
                         let _ = reply.try_send(Ok(Receipt::Accepted));
@@ -1465,6 +1643,7 @@ impl CaptureActor {
                 self.take_epoch += 1;
                 let device = "default-input".to_string();
                 let rate = session.sample_rate();
+                self.observer.take_started(&corr, session.monitor());
                 self.emit(
                     Event::CaptureStarted {
                         device: device.clone(),
@@ -1484,7 +1663,8 @@ impl CaptureActor {
                     device,
                 });
             }
-            Err(_message) => {
+            Err(message) => {
+                self.observer.take_start_failed(&corr, &message);
                 // Fatal open failure from Acquiring -> Interrupted (fixture
                 // take_9's device_open_failed), then the runtime-internal
                 // settle edge back to Idle: the failure killed the take
@@ -1615,6 +1795,39 @@ impl CaptureActor {
         let clip = live.session.source_clip_ratio();
         let outcome = live.session.stop();
         match outcome {
+            Ok(captured) if captured.device_fault.is_some() => {
+                // The device failed after the last poll saw it healthy:
+                // what the stop handed back is kept, but as an
+                // interrupted take — never presented as complete.
+                let fault = captured.device_fault.clone().unwrap_or_default();
+                self.emit(
+                    Event::CaptureError {
+                        code: "device_fault_on_stop".into(),
+                        fatal: false,
+                    },
+                    &corr,
+                );
+                let salvaged = salvage_outcome(facts, Ok(captured))
+                    .expect("a stop that handed back audio always salvages it");
+                if let Some(gap) = salvaged.tail_gap {
+                    self.emit(
+                        Event::CaptureGap {
+                            start_sample: gap.start_sample,
+                            end_sample: gap.end_sample,
+                        },
+                        &corr,
+                    );
+                }
+                self.hand_off_persist(
+                    salvaged.record,
+                    corr,
+                    PersistIntent::Interrupted(format!(
+                        "The microphone failed as the take stopped ({fault}); everything it \
+                         captured was kept as this interrupted recording."
+                    )),
+                    PersistFollow::QuiesceStop,
+                );
+            }
             Ok(captured) => {
                 let journal = captured.journal.clone();
                 let capture_id = journal
@@ -1700,6 +1913,7 @@ impl CaptureActor {
                 );
             }
             Err(RecorderError::Empty) => {
+                self.observer.take_ended(&corr, None);
                 self.emit(
                     Event::CaptureError {
                         code: "empty_capture".into(),
@@ -1773,6 +1987,7 @@ impl CaptureActor {
     ) {
         let epoch = self.take_epoch;
         let record = Arc::new(record);
+        self.observer.take_ended(&corr, Some(&record));
         let worker_record = Arc::clone(&record);
         let worker_intent = intent.clone();
         let store = Arc::clone(&self.store);
@@ -1798,6 +2013,10 @@ impl CaptureActor {
                         panic_message(&payload),
                     )),
                 };
+                let stored = match &result {
+                    Ok(()) => store.stored_id(&worker_record),
+                    Err(_) => None,
+                };
                 // The Result is already surfaced inside (stderr on a
                 // closed inbox); the worker can do nothing further.
                 let _ = deliver_persist_report(
@@ -1806,6 +2025,7 @@ impl CaptureActor {
                         corr: worker_corr,
                         record: worker_record,
                         result,
+                        stored,
                         follow,
                         epoch,
                     },
@@ -1818,11 +2038,16 @@ impl CaptureActor {
                     PersistIntent::Commit => self.store.commit_take(&record),
                     PersistIntent::Interrupted(note) => self.store.mark_interrupted(&record, note),
                 };
+                let stored = match &result {
+                    Ok(()) => self.store.stored_id(&record),
+                    Err(_) => None,
+                };
                 // The worker never existed, so this handle is the only one.
                 self.handle_persist(PersistReport {
                     corr,
                     record,
                     result,
+                    stored,
                     follow,
                     epoch,
                 });
@@ -1865,11 +2090,17 @@ impl CaptureActor {
             corr,
             record,
             result,
+            stored,
             follow,
             epoch,
         } = report;
         self.pending_persists
             .retain(|pending| pending != &(epoch, corr.clone()));
+        self.observer.take_persisted(
+            &corr,
+            &record,
+            result.clone().map(|()| stored),
+        );
         // A failed clean-stop commit is not persisted: the record the
         // registry keeps says Interrupted (source preserved), stale or
         // not — the flip is record data, not an emission, so it happens
@@ -2061,7 +2292,11 @@ impl CaptureActor {
             return;
         };
         let corr = live.corr.clone();
-        if let Some(salvaged) = salvage_take(live) {
+        let salvaged = salvage_take(live);
+        if salvaged.is_none() {
+            self.observer.take_ended(&corr, None);
+        }
+        if let Some(salvaged) = salvaged {
             let note = if salvaged.audio_preserved {
                 "Take aborted by user; captured samples kept as an interrupted recording."
                     .to_string()
@@ -2126,6 +2361,7 @@ impl CaptureActor {
                 );
             }
             None => {
+                self.observer.take_ended(&corr, None);
                 // Nothing salvageable: the fatal error is the whole story,
                 // and the take's route freeze must not outlive it.
                 self.emit(
@@ -2143,7 +2379,7 @@ impl CaptureActor {
 
     /// `Interrupted → Recovering → Persisted` (journal replay): re-publish
     /// the salvaged boundary of a take this runtime holds. On-disk journal
-    /// recovery of *previous* processes remains the app's startup scan
+    /// recovery of *previous* processes is the host's startup recovery
     /// (I1/I2); this path serves same-process interrupted takes.
     fn handle_recover(&mut self, take_id: &str) {
         if self.core.state() != "Interrupted" {
@@ -2195,12 +2431,20 @@ impl CaptureActor {
         );
     }
 
-    fn register(&self, record: Arc<TakeRecord>) {
+    fn register(&mut self, record: Arc<TakeRecord>) {
         let id = record.id.clone();
-        self.registry
-            .lock()
-            .expect("take registry lock")
-            .insert(id, record);
+        let mut registry = self.registry.lock().expect("take registry lock");
+        registry.insert(id.clone(), record);
+        // Each record holds its take's whole audio; a long-lived host
+        // (#220) must not keep every take it ever recorded. The newest
+        // stay for jobs that load audio by `captureRef`.
+        self.registered.retain(|known| known != &id);
+        self.registered.push_back(id);
+        while self.registered.len() > REGISTRY_TAKES {
+            if let Some(oldest) = self.registered.pop_front() {
+                registry.remove(&oldest);
+            }
+        }
     }
 }
 

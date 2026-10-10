@@ -484,6 +484,29 @@ impl Activation {
         }
     }
 
+    /// A take the recording service still records after this app lost
+    /// it (#220: the app restarted or reconnected mid-take) becomes the
+    /// active take: latched — no held key belongs to it — and already
+    /// listening. It stops like any latched take. `None` while another
+    /// take is active.
+    pub(crate) fn adopt(&mut self, now: Instant) -> Option<TakeId> {
+        if self.is_active() {
+            return None;
+        }
+        self.last_take += 1;
+        let take = self.last_take;
+        self.phase = Phase::Active {
+            take,
+            readiness: Readiness::Listening,
+            latch: Latch::Latched,
+            config: self.config,
+            started_at: now,
+            pressed_at: now,
+            tap_deadline: None,
+        };
+        Some(take)
+    }
+
     /// Starting `take` failed: nothing is recording, nothing is announced.
     pub(crate) fn start_failed(&mut self, take: TakeId) {
         self.ended(take);
@@ -852,7 +875,7 @@ impl StarlingApp {
     /// Readiness tracks real audio: listening is announced once the
     /// running take's recorder has captured samples, not when the
     /// shortcut fired.
-    fn check_readiness(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn check_readiness(&mut self, cx: &mut Context<Self>) {
         if self.activation.readiness() != Some(Readiness::Starting) {
             return;
         }
@@ -911,6 +934,15 @@ impl StarlingApp {
                 Effect::Listening(take) => self.cue_listening(take, cx),
             }
         }
+        self.activation_settled(cx);
+    }
+
+    /// What follows any change of the active take — through the machine's
+    /// effects or outside them (#220: a take adopted from, or ended by, the
+    /// recording service): the Escape grab follows the machine, a shortcut
+    /// saved mid-take takes over once no take is active, and the overlay
+    /// catches up.
+    pub(crate) fn activation_settled(&mut self, cx: &mut Context<Self>) {
         // Escape cleanup is queued first, so a deferred swap below never
         // holds it back.
         self.sync_escape_grab();
