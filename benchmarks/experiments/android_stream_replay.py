@@ -267,6 +267,10 @@ def merge(label: str, parts: list[dict]) -> dict:
     keys = ("client", "device", "model", "cadence", "warmup", "batch", "cool_to_c",
             "workload_manifest_sha256")
     first = parts[0]["provenance"]
+    for p in parts:
+        # Each part is one repeat (its runs share one repeat number).
+        if len(p["provenance"]["repeats"]) != 1:
+            raise RunnerError(f"{p['label']}: merge takes single-repeat results (run --repeats 1)")
     for p in parts[1:]:
         if any(p["provenance"].get(k) != first.get(k) for k in keys):
             raise RunnerError(f"{p['label']}: different configuration than {parts[0]['label']}")

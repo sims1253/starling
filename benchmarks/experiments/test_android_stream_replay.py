@@ -89,6 +89,10 @@ class MergeTest(unittest.TestCase):
         self.assertEqual([r["repeat"] for r in merged["runs"]], [0, 1])
         self.assertEqual(merged["aggregate"]["short"]["runs"], 2)
 
+    def test_multi_repeat_parts_are_refused(self):
+        with self.assertRaises(asr.RunnerError):
+            asr.merge("all", [self._part("a", repeats=[{"repeat": 0}, {"repeat": 1}]), self._part("b")])
+
     def test_parts_from_another_device_or_batch_setting_are_refused(self):
         for change in ({"device": {"model": "Pixel 8"}}, {"batch": False}):
             with self.assertRaises(asr.RunnerError):

@@ -17,9 +17,11 @@ package dev.starling.mobile.engine
  *   server's exact-tail reuse).
  *
  * One divergence from the server: a null from the [Transcriber] means the
- * on-device engine failed, not "busy, retry later". The session abandons the
- * stream on the first failure (the saved WAV then goes through the batch
- * path), so [flush] makes a single attempt instead of bounded busy retries.
+ * on-device engine failed, not "busy, retry later", or that the session
+ * cancelled a preview it no longer needs (Stop brought newer audio). The
+ * session abandons the stream on the first failure (the saved WAV then goes
+ * through the batch path), so [flush] makes a single attempt instead of
+ * bounded busy retries; a cancelled preview just yields no partial.
  *
  * Not thread-safe; the owning session drives it from one worker thread.
  */
@@ -45,7 +47,10 @@ class ChunkStreamer(
         FLUSH_TAIL("flush_tail"),
     }
 
-    /** Transcribes `samples[start until start + length]` for [kind]; null when the engine failed. */
+    /**
+     * Transcribes `samples[start until start + length]` for [kind]; null when
+     * the engine failed or (previews only) the session cancelled the call.
+     */
     fun interface Transcriber {
         fun transcribe(samples: FloatArray, start: Int, length: Int, kind: CallKind): String?
     }
