@@ -3,6 +3,7 @@ package dev.starling.mobile
 import dev.starling.mobile.audio.WavWriter
 import dev.starling.mobile.data.DerivedRevision
 import dev.starling.mobile.data.RecordingStatus
+import dev.starling.mobile.data.RetentionClass
 import dev.starling.mobile.data.TranscriptSource
 import dev.starling.mobile.data.TranscriptionProvenance
 import dev.starling.mobile.storage.RecordingStore
@@ -13,6 +14,8 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
+import org.json.JSONArray
+import org.json.JSONObject
 import org.junit.rules.TemporaryFolder
 import java.io.File
 import java.io.IOException
@@ -478,5 +481,45 @@ class RecordingStoreRecoveryTest {
         assertEquals(DerivedRevision.INSERTION_BOUNDARY, derived.provenance)
         assertEquals(listOf("leading_space", "first_letter_case"), derived.changes)
         assertEquals(5_000L, derived.createdAtMillis)
+    }
+
+    @Test
+    fun aDerivedRevisionKeepsEveryOtherFieldAndNeverResurrectsADeletedTake() {
+        val store = RecordingStore(storeDir())
+        val recording = store.create()
+        store.markTranscribed(recording.id, "Fox jumps")
+        store.setRetentionClass(recording.id, RetentionClass.ARCHIVAL)
+        val revision = DerivedRevision(" fox jumps", "Fox jumps", DerivedRevision.INSERTION_BOUNDARY, listOf("leading_space"), 5_000L)
+        // A field another writer set (#342) survives the derived write.
+        store.addDerived(recording.id, revision)
+        assertEquals(RetentionClass.ARCHIVAL, store.get(recording.id).retentionClass)
+
+        // Deleted while a reader holds it: the take stays deleted.
+        val pin = store.pin(recording.id)
+        store.delete(recording.id)
+        assertTrue(runCatching { store.addDerived(recording.id, revision) }.isFailure)
+        assertTrue(store.list().none { it.id == recording.id })
+        pin.close()
+        assertTrue(RecordingStore(storeDir()).list().none { it.id == recording.id })
+    }
+
+    @Test
+    fun aDamagedDerivedEntryIsSkippedWithoutHidingTheRecording() {
+        val store = RecordingStore(storeDir())
+        val recording = store.create()
+        store.markTranscribed(recording.id, "Fox jumps")
+        store.addDerived(
+            recording.id,
+            DerivedRevision(" fox jumps", "Fox jumps", DerivedRevision.INSERTION_BOUNDARY, listOf("leading_space"), 5_000L),
+        )
+        val metadata = File(storeDir(), "${recording.id}.json")
+        val json = JSONObject(metadata.readText())
+        val derived = json.getJSONArray("derived")
+        json.put("derived", JSONArray().put(JSONObject.NULL).put(7).put("text").put(JSONObject()).put(derived.get(0)))
+        metadata.writeText(json.toString())
+
+        val reopened = RecordingStore(storeDir())
+        assertEquals(listOf(recording.id), reopened.list().map { it.id })
+        assertEquals(listOf(" fox jumps"), reopened.get(recording.id).derived.map { it.text })
     }
 }

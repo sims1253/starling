@@ -28,8 +28,9 @@ recognize the same field after a screen lock or app switch.
 
 Every write follows the insertion-boundary rules
 (`packages/contracts/insertion-boundary/`, #341): right before the one
-`commitText`, the keyboard reads the text around the cursor
-(`getTextBeforeCursor`/`getTextAfterCursor`, 128 characters each way) and
+`commitText`, the keyboard reads the text before the cursor
+(`getTextBeforeCursor`, 128 characters; no rule needs the text after it, so
+that is never read) and
 adds a leading space or lowercases the first letter when the text continues
 a sentence; live composing text gets the same boundary. Words are never
 changed, code-looking first words keep their case, and a field showing only
@@ -37,7 +38,8 @@ its hint reads as empty (an `InputConnection` reports content, never the
 placeholder). Password and incognito fields
 (`IME_FLAG_NO_PERSONALIZED_LEARNING`) are never read, verbatim modes write
 the text as recognized, and a field that does not report its text gets it as
-dictated (the status says so). The surrounding text is used for this
+dictated (the status says so, and says when the cursor left the live text
+instead). The text read is used for this
 decision only; it is not stored or sent anywhere. An adjusted insertion is
 kept on the recording as a derived revision ("Inserted with boundary fixes"
 in Saved recordings); the transcript itself stays as recognized. An editor

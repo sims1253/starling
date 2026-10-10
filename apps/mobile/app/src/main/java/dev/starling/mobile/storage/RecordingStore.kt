@@ -221,7 +221,9 @@ class RecordingStore internal constructor(
 
     /**
      * Records text that was delivered in a form derived from the take's text
-     * (#341). The transcript and its revisions stay as they are.
+     * (#341). The transcript and its revisions stay as they are. The
+     * metadata is read again under the lock, so every other field is kept
+     * and a take deleted meanwhile stays deleted (this throws instead).
      */
     fun addDerived(id: String, revision: DerivedRevision): Recording = synchronized(lock) {
         update(id) { it.copy(derived = it.derived + revision) }
@@ -962,7 +964,8 @@ class RecordingStore internal constructor(
             audioRemoved = json.optJSONObject("audio_removed")?.let(::decodeRemoval),
             deleted = json.optBoolean("deleted", false),
             derived = json.optJSONArray("derived")
-                ?.let { array -> (0 until array.length()).mapNotNull { decodeDerived(array.getJSONObject(it)) } }
+                // A damaged entry is skipped; the take and its other entries stay.
+                ?.let { array -> (0 until array.length()).mapNotNull { array.optJSONObject(it)?.let(::decodeDerived) } }
                 .orEmpty(),
         )
     }

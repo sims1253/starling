@@ -6,17 +6,18 @@ import dev.starling.mobile.processing.InsertionBoundary
 /**
  * One delivery of dictated text into the focused field with the
  * insertion-boundary rules (#341): the leading space and the case of the
- * first letter follow the text around the cursor, read from the field right
+ * first letter follow the text before the cursor, read from the field right
  * before the single `commitText`.
  *
- * The surrounding text is read for this decision only; nothing here keeps
- * it, logs it or hands it on. Private fields ([EditorField.sensitive]:
+ * Only what the rules need is read: no v1 rule looks past the insertion
+ * point, so the text after the cursor is never requested. What is read
+ * serves this decision only; nothing here keeps it, logs it or hands it on. Private fields ([EditorField.sensitive]:
  * passwords, incognito) are never read, and verbatim modes skip the read:
  * both get their text unchanged, as does a field that does not report its
  * text.
  */
 object BoundaryDelivery {
-    /** Characters read on each side of the cursor; the rules only need the end of the text before it. */
+    /** Characters read before the boundary; the rules only need the end of that text. */
     const val WINDOW = 128
 
     /** Why the rules were not applied. */
@@ -27,8 +28,17 @@ object BoundaryDelivery {
         /** A verbatim mode: no rule applies. */
         VERBATIM,
 
-        /** The field did not report the text around the cursor. */
+        /**
+         * The field did not report the text before the cursor (it answered
+         * null, or cut its answer short of the take's own composing text).
+         */
         UNREADABLE,
+
+        /**
+         * The cursor left the take's composing region, so the text before it
+         * no longer ends where the region starts. The field read fine.
+         */
+        CURSOR_MOVED,
     }
 
     data class Result(
@@ -41,12 +51,18 @@ object BoundaryDelivery {
         val skipped: Skip?,
     )
 
+    /** The boundary as read, or why it is unknown. */
+    private sealed interface Read {
+        data class Known(val context: InsertionBoundary.Context) : Read
+
+        data class Unknown(val reason: Skip) : Read
+    }
+
     /**
-     * The text around the cursor, or null when the field does not report it.
-     * [composing] is the take's own composing text, with the cursor at its
-     * end: the boundary is where that region starts, so it is cut from the
-     * text before the cursor. If the field no longer ends there (the cursor
-     * moved), the boundary is unknown.
+     * The text before the boundary, or null when it is unknown (see
+     * [Skip.UNREADABLE], [Skip.CURSOR_MOVED]). [composing] is the take's own
+     * composing text, with the cursor at its end: the boundary is where that
+     * region starts, so it is cut from the text before the cursor.
      *
      * A field showing only its hint needs no detection here: an
      * InputConnection reports the editor's content, never its placeholder,
@@ -56,11 +72,19 @@ object BoundaryDelivery {
      */
     fun context(connection: InputConnection, field: EditorField, composing: String? = null): InsertionBoundary.Context? {
         if (field.sensitive) return null
-        val own = composing.orEmpty()
-        val beforeCursor = connection.getTextBeforeCursor(WINDOW + own.length, 0)?.toString() ?: return null
-        val after = connection.getTextAfterCursor(WINDOW, 0)?.toString() ?: return null
-        if (!beforeCursor.endsWith(own)) return null
-        return InsertionBoundary.Context(beforeCursor.dropLast(own.length), after)
+        return (read(connection, composing.orEmpty()) as? Read.Known)?.context
+    }
+
+    private fun read(connection: InputConnection, own: String): Read {
+        val beforeCursor = connection.getTextBeforeCursor(WINDOW + own.length, 0)?.toString()
+            ?: return Read.Unknown(Skip.UNREADABLE)
+        if (beforeCursor.endsWith(own)) {
+            // No rule reads the text after the boundary; it is not requested.
+            return Read.Known(InsertionBoundary.Context(beforeCursor.dropLast(own.length), after = ""))
+        }
+        // An answer shorter than the region itself was cut by the editor; a
+        // full-length one that does not end with it means the cursor moved.
+        return Read.Unknown(if (beforeCursor.length < own.length) Skip.UNREADABLE else Skip.CURSOR_MOVED)
     }
 
     /**
@@ -76,18 +100,24 @@ object BoundaryDelivery {
         /** False when the boundary is known to be lost (see [cursorAtComposingEnd]): nothing is read. */
         anchored: Boolean = true,
     ): Result {
-        // An empty text has no boundary; nothing is read for it.
-        if (raw.isEmpty()) return Result(connection.commitText(raw, 1), raw, emptyList(), null)
-        val skipped = when {
-            field.sensitive -> Skip.PROTECTED
-            verbatim -> Skip.VERBATIM
-            else -> null
+        // An empty text has no boundary; nothing is read for it. It is only
+        // written to replace the take's own composing region: with none, an
+        // empty commit would replace the user's selection, and nothing is
+        // left to write.
+        if (raw.isEmpty()) {
+            val committed = composing.isNullOrEmpty() || connection.commitText(raw, 1)
+            return Result(committed, raw, emptyList(), null)
         }
-        val context = if (skipped == null && anchored) context(connection, field, composing) else null
-        val adjusted = context?.let { InsertionBoundary.adjust(raw, it, verbatim = false) }
+        val read = when {
+            field.sensitive -> Read.Unknown(Skip.PROTECTED)
+            verbatim -> Read.Unknown(Skip.VERBATIM)
+            !anchored -> Read.Unknown(Skip.CURSOR_MOVED)
+            else -> read(connection, composing.orEmpty())
+        }
+        val adjusted = (read as? Read.Known)?.let { InsertionBoundary.adjust(raw, it.context, verbatim = false) }
             ?: InsertionBoundary.Adjustment(raw, emptyList())
         val committed = connection.commitText(adjusted.text, 1)
-        return Result(committed, adjusted.text, adjusted.changes, skipped ?: Skip.UNREADABLE.takeIf { context == null })
+        return Result(committed, adjusted.text, adjusted.changes, (read as? Read.Unknown)?.reason)
     }
 
     /**

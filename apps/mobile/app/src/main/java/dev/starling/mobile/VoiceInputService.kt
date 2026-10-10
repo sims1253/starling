@@ -225,6 +225,9 @@ class VoiceInputService : InputMethodService() {
                 if (previous != null) current.explicitOnly = true
                 current.target = null
                 current.composing = false
+                // The old field's text is not kept past its region.
+                current.composedText = null
+                current.liveBoundary = null
                 current.liveInField = false
                 if (connection != null && field != null && current.field.sameFieldAs(field)) attach(current)
             }
@@ -552,10 +555,11 @@ class VoiceInputService : InputMethodService() {
      * unchanged.
      */
     private fun clearComposingText(current: Take) {
-        if (!current.composing) return
-        current.composing = false
+        // The boundary goes with the region, even one already lost.
         current.composedText = null
         current.liveBoundary = null
+        if (!current.composing) return
+        current.composing = false
         val target = current.target ?: return
         val connection = currentInputConnection
         if (targetGuard.isCurrent(target, connection)) {
@@ -766,6 +770,10 @@ class VoiceInputService : InputMethodService() {
             composing = current.composedText.takeIf { current.composing },
             anchored = !current.composing || cursorAtComposingEnd,
         )
+        if (result.skipped == BoundaryDelivery.Skip.UNREADABLE || result.skipped == BoundaryDelivery.Skip.CURSOR_MOVED) {
+            // The reason only; the field's text is never logged.
+            runCatching { Log.i(BOUNDARY_TAG, "take ${current.recording.id}: boundary not applied (${result.skipped})") }
+        }
         if (!result.committed) return null
         current.composing = false
         current.composedText = null
@@ -790,12 +798,14 @@ class VoiceInputService : InputMethodService() {
     }
 
     /**
-     * A field that did not report its text got the text as dictated, and an
-     * adjustment the history could not keep is reported; the status says so.
+     * A field that did not report its text, or a cursor that left the live
+     * text, got the text as dictated, and an adjustment the history could not
+     * keep is reported; the status says which.
      */
     private fun insertedStatus(current: Take, result: BoundaryDelivery.Result): Int = when {
         current.derivedUnsaved -> R.string.keyboard_inserted_unrecorded
         result.skipped == BoundaryDelivery.Skip.UNREADABLE -> R.string.keyboard_inserted_unadjusted
+        result.skipped == BoundaryDelivery.Skip.CURSOR_MOVED -> R.string.keyboard_inserted_cursor_moved
         else -> R.string.keyboard_inserted
     }
 
@@ -845,6 +855,7 @@ class VoiceInputService : InputMethodService() {
             val boundary = when {
                 current.derivedUnsaved -> getString(R.string.keyboard_derived_unsaved)
                 delivered.skipped == BoundaryDelivery.Skip.UNREADABLE -> getString(R.string.keyboard_boundary_unread)
+                delivered.skipped == BoundaryDelivery.Skip.CURSOR_MOVED -> getString(R.string.keyboard_boundary_cursor_moved)
                 else -> null
             }
             endTake(current, R.string.staging_no_action, detail = boundary, shown = delivered.text)
@@ -1222,6 +1233,7 @@ class VoiceInputService : InputMethodService() {
         const val VERBATIM = "verbatim"
         const val INSERT_ENTER = "insert_enter"
         const val TIMING_TAG = "StarlingTiming"
+        const val BOUNDARY_TAG = "StarlingBoundary"
     }
 
     /**

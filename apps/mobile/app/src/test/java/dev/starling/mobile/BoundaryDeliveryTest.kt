@@ -34,19 +34,19 @@ class BoundaryDeliveryTest {
         /** An editor that does not share its text answers null. */
         val readable: Boolean = true,
         val accepts: Boolean = true,
+        /** An editor that caps its answers at this many characters. */
+        val readLimit: Int = Int.MAX_VALUE,
     ) : InputConnection {
         var reads = 0
         val commits = mutableListOf<String>()
 
         override fun getTextBeforeCursor(n: Int, flags: Int): CharSequence? {
             reads++
-            return if (readable) text.substring(maxOf(0, cursor - n), cursor) else null
+            return if (readable) text.substring(maxOf(0, cursor - minOf(n, readLimit)), cursor) else null
         }
 
-        override fun getTextAfterCursor(n: Int, flags: Int): CharSequence? {
-            reads++
-            return if (readable) text.substring(selectionEnd, minOf(text.length, selectionEnd + n)) else null
-        }
+        // No rule reads past the boundary, so the text after the cursor is never asked for.
+        override fun getTextAfterCursor(n: Int, flags: Int): CharSequence = unexpected()
 
         override fun commitText(text: CharSequence, newCursorPosition: Int): Boolean {
             commits += text.toString()
@@ -236,9 +236,22 @@ class BoundaryDeliveryTest {
     }
 
     @Test
-    fun anEmptyTextIsCommittedWithoutReading() {
-        val connection = FakeConnection("word")
+    fun anEmptyTextWithoutARegionWritesNothing() {
+        // An empty commit would replace the user's selection.
+        val connection = FakeConnection("Hello WORLD today", cursor = 6, selectionEnd = 11)
         val result = deliver(connection, "")
+        assertTrue(result.committed)
+        assertEquals(0, connection.reads)
+        assertTrue(connection.commits.isEmpty())
+        assertEquals("Hello WORLD today", connection.text)
+        assertNull(result.skipped)
+    }
+
+    @Test
+    fun anEmptyTextReplacesTheTakesOwnRegionWithoutReading() {
+        val connection = FakeConnection("word next")
+        val result = BoundaryDelivery.deliver(connection, field(), "", verbatim = false, composing = " next")
+        assertTrue(result.committed)
         assertEquals(0, connection.reads)
         assertEquals("", connection.commits.single())
         assertNull(result.skipped)
@@ -258,6 +271,15 @@ class BoundaryDeliveryTest {
     @Test
     fun aCursorThatLeftTheComposingRegionLeavesTheBoundaryUnknown() {
         val connection = FakeConnection("The quick brown fox jum and more", cursor = 32)
+        val result = BoundaryDelivery.deliver(connection, field(), "Fox jumps", verbatim = false, composing = " fox jum")
+        assertEquals("Fox jumps", result.text)
+        assertEquals(BoundaryDelivery.Skip.CURSOR_MOVED, result.skipped)
+    }
+
+    @Test
+    fun aReadCutShortOfTheRegionIsUnreadableNotAMovedCursor() {
+        // The editor caps its answer below the composing text's own length.
+        val connection = FakeConnection("The quick brown fox jum", readLimit = 4)
         val result = BoundaryDelivery.deliver(connection, field(), "Fox jumps", verbatim = false, composing = " fox jum")
         assertEquals("Fox jumps", result.text)
         assertEquals(BoundaryDelivery.Skip.UNREADABLE, result.skipped)
@@ -298,7 +320,7 @@ class BoundaryDeliveryTest {
         )
         assertEquals(0, connection.reads)
         assertEquals("Next", result.text)
-        assertEquals(BoundaryDelivery.Skip.UNREADABLE, result.skipped)
+        assertEquals(BoundaryDelivery.Skip.CURSOR_MOVED, result.skipped)
     }
 
     @Test
