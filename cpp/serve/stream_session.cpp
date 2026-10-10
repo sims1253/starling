@@ -237,24 +237,27 @@ std::optional<std::pair<int, int>> stitch_timed(
         const int64_t diff = std::llabs(committed_starts[i] - new_starts[j]);
         return diff <= tolerance ? diff : -1;
     };
-    // (pairs, pairs inside [lo, hi), total start difference).
+    // (pairs inside [lo, hi), pairs, total start difference).
     struct Score {
-        int pairs = 0, inside = 0;
+        int inside = 0, pairs = 0;
         int64_t diff = 0;
         bool operator==(const Score& o) const {
-            return pairs == o.pairs && inside == o.inside && diff == o.diff;
+            return inside == o.inside && pairs == o.pairs && diff == o.diff;
         }
     };
-    auto with_pair = [&](const Score& s, int i, int j, int64_t g) {
-        const bool inside = lo <= committed_starts[i] && committed_starts[i] < hi
-                         && lo <= new_starts[j] && new_starts[j] < hi;
-        return Score{s.pairs + 1, s.inside + (inside ? 1 : 0), s.diff + g};
+    auto with_pair = [&](Score s, int i, int j, int64_t g) {
+        if (lo <= committed_starts[i] && committed_starts[i] < hi
+            && lo <= new_starts[j] && new_starts[j] < hi)
+            ++s.inside;
+        ++s.pairs;
+        s.diff += g;
+        return s;
     };
-    // More pairs, then more pairs inside the shared audio, then a smaller
+    // More pairs inside the shared audio, then more pairs, then a smaller
     // total start difference.
     auto better = [](const Score& x, const Score& y) {
-        if (x.pairs != y.pairs) return x.pairs > y.pairs;
         if (x.inside != y.inside) return x.inside > y.inside;
+        if (x.pairs != y.pairs) return x.pairs > y.pairs;
         return x.diff < y.diff;
     };
     // d[i][j]: the best score between committed[0, i) and new_words[0, j).

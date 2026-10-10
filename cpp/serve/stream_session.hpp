@@ -67,11 +67,13 @@ constexpr double kStitchTimeToleranceSeconds = 0.3;
 // new_words[skip:], or nullopt when no word was heard by both windows (or
 // they share no audio). A committed and a new word are the same when their
 // norm_word() keys match (nonempty) and their starts are at most `tolerance`
-// apart. The alignment is the most such pairs in order (a longest common
-// subsequence); among those, the one with the most pairs inside [lo, hi)
-// (a word only one window heard cannot pair), then the smallest total start
-// difference, so a word said several times in a row pairs with the same
-// occurrence. Text repeated elsewhere or a common word far from the
+// apart. The alignment is the sequence of such pairs in order with the
+// most pairs inside [lo, hi) (both words starting there), then the most
+// pairs in all (a word at the edge that one window heard just past it still
+// counts), then the smallest total start difference. So pairs only one
+// window can have heard never outweigh the ones both did, and a word said
+// several times in a row pairs with the same occurrence. Text repeated
+// elsewhere or a common word far from the
 // boundary cannot match and one shared word is enough. The cut is the pair
 // closest to the middle of [lo, hi) (the earlier pair on a tie). Port of
 // stitch_timed() in stream_chunk.py.

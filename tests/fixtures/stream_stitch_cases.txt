@@ -371,3 +371,14 @@ tx flush_window 0 12 say@11-11.2 yes@11.84-11.95
 tx flush_tail 12 1 yes@0.08-0.3 done@0.4-0.7
 = say yes yes done
 calls flush_window@0+12 flush_tail@12+1
+
+# pairs both windows heard outweigh more pairs that only one could have heard
+tstitch rapid_repeats_short_overlap 11.48 12
+< say@11-11.2 yes@11.36-11.5 yes@11.6-11.74 yes@11.84-11.98
+> yes@11.56-11.7 yes@11.8-11.94 yes@12.04-12.18 yes@12.28-12.42 done@12.6-12.9
+= say yes yes yes yes yes done
+
+tstitch rapid_repeats_long_run 9 12
+< say@5-5.2 yes@6-6.14 yes@6.24-6.38 yes@6.48-6.62 yes@6.72-6.86 yes@6.96-7.10 yes@7.2-7.34 yes@7.44-7.58 yes@7.68-7.82 yes@7.92-8.06 yes@8.16-8.30 yes@8.4-8.54 yes@8.64-8.78 yes@8.88-9.02 yes@9.12-9.26 yes@9.36-9.50 yes@9.6-9.74 yes@9.84-9.98 yes@10.08-10.22 yes@10.32-10.46 yes@10.56-10.70 yes@10.8-10.94 yes@11.04-11.18 yes@11.28-11.42 yes@11.52-11.66 yes@11.76-11.90
+> yes@9.16-9.30 yes@9.40-9.54 yes@9.64-9.78 yes@9.88-10.02 yes@10.12-10.26 yes@10.36-10.50 yes@10.60-10.74 yes@10.84-10.98 yes@11.08-11.22 yes@11.32-11.46 yes@11.56-11.70 yes@11.80-11.94 yes@12.04-12.18 yes@12.28-12.42 yes@12.52-12.66 yes@12.76-12.90 yes@13.00-13.14 yes@13.24-13.38 yes@13.48-13.62 done@13.8-14
+= say yes yes yes yes yes yes yes yes yes yes yes yes yes yes yes yes yes yes yes yes yes yes yes yes yes yes yes yes yes yes yes yes done

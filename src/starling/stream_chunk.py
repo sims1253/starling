@@ -193,11 +193,13 @@ def stitch_timed(
     no word was heard by both windows (or they share no audio).
 
     A committed word and a new word are the same when their keys match and
-    their starts are at most ``tolerance`` apart. The alignment is the most
-    such pairs in order (a longest common subsequence); among those, the one
-    with the most pairs inside the shared audio (a word only one window
-    heard cannot pair), then the smallest total start difference, so a word
-    said several times in a row pairs with the same occurrence. Text a
+    their starts are at most ``tolerance`` apart. The alignment is the
+    sequence of such pairs in order with the most pairs inside the shared
+    audio (both words starting in ``[lo, hi)``), then the most pairs in all
+    (a word at the edge of the shared audio that one window heard just past
+    it still counts), then the smallest total start difference. So pairs
+    only one window can have heard never outweigh the ones both did, and a
+    word said several times in a row pairs with the same occurrence. Text a
     window repeats elsewhere ("one two one two") or a common word far from
     the boundary cannot match, and a single shared word is enough. The cut
     is the pair closest to the middle of the shared audio (where both
@@ -221,19 +223,21 @@ def stitch_timed(
         diff = abs(committed_starts[i] - new_starts[j])
         return diff if diff <= tolerance else None
 
-    def pair_score(i: int, j: int, g: int) -> tuple[int, int, int]:
-        inside = lo <= committed_starts[i] < hi and lo <= new_starts[j] < hi
-        return (1, int(inside), g)
+    Score = tuple[int, int, int]
 
-    def add(x: tuple[int, int, int], y: tuple[int, int, int]) -> tuple[int, int, int]:
+    def pair_score(i: int, j: int, g: int) -> Score:
+        inside = lo <= committed_starts[i] < hi and lo <= new_starts[j] < hi
+        return (int(inside), 1, g)
+
+    def add(x: Score, y: Score) -> Score:
         return (x[0] + y[0], x[1] + y[1], x[2] + y[2])
 
-    def better(x: tuple[int, int, int], y: tuple[int, int, int]) -> bool:
-        """More pairs, then more pairs inside the shared audio, then a
+    def better(x: Score, y: Score) -> bool:
+        """More pairs inside the shared audio, then more pairs, then a
         smaller total start difference."""
         return (x[0], x[1], -x[2]) > (y[0], y[1], -y[2])
 
-    # d[i][j]: the best (pairs, pairs inside, total start difference)
+    # d[i][j]: the best (pairs inside, pairs, total start difference)
     # between committed[:i] and new[:j].
     d = [[(0, 0, 0)] * (m + 1) for _ in range(n + 1)]
     for i in range(1, n + 1):

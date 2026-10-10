@@ -425,19 +425,24 @@ fixture, `tests/fixtures/stream_stitch_cases.txt`):
   at its last token's frame plus duration), neighboring windows are joined at
   a word both heard at the same time: a committed word and a new word are the
   same when they match after normalization and start at most 0.3 s apart.
-  The most such pairs in order form the alignment (among equals: the most
-  pairs inside the shared audio, then the smallest total start difference,
-  so a word said several times in a row pairs with the same occurrence), and
+  The alignment is the sequence of such pairs in order with the most pairs
+  inside the shared audio, then the most pairs in all (a word at its edge
+  that one window heard just past it), then the smallest total start
+  difference (so pairs only one window can have heard never outweigh the
+  ones both did, and a word said several times in a row pairs with the same
+  occurrence), and
   the cut is the pair nearest the middle of the shared audio: committed
   words up to and including it, then the new words after it. One shared word is enough, so a
   word repeated exactly at the boundary is no longer kept twice, and a
   repetition elsewhere in the text cannot match, so periodic text is not
   shortened or repeated. Without a shared word (a pause in the overlap), or
   without shared audio (`--stream-overlap-seconds 0`), the texts are
-  concatenated. Not covered: a word repeated faster than the windows'
-  timing agrees (about every 0.3 s or less, e.g. "yes yes yes yes") with no
-  other shared word near it can still pair one repetition off and lose or
-  repeat it; the times alone cannot tell the occurrences apart. On the replay workload (q8_0, notebook), the same
+  concatenated. Not covered: one word repeated back to back faster than the
+  windows' timing agrees ("yes yes yes yes" at about 3 or more per second),
+  with no other shared word near the cut, can pair one repetition off and
+  lose or repeat it; the times alone cannot tell the occurrences apart. On
+  synthetic runs with the measured offsets, that happens for about 2 % of
+  window placements at 4 repetitions per second, 1 % at 3, and none at 2.5. On the replay workload (q8_0, notebook), the same
   word in two overlapping windows starts 0.04-0.28 s apart in the middle of
   the overlap and up to 0.52 s apart at a window's edge, where the cut is not
   made.
