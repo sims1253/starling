@@ -1777,12 +1777,11 @@ def create_app(
         pending_bytes = 0
         space = asyncio.Event()
         # For preempt_preview(): queued audio samples (estimated from the
-        # frame size), resets and commits, the audio queued ahead of the
-        # first commit, and the disconnect (mirrors cpp/serve/stream_pump.cpp).
+        # frame size), resets and commits, and the disconnect (mirrors
+        # cpp/serve/stream_pump.cpp).
         pending_samples = 0
         pending_resets = 0
         pending_commits = 0
-        samples_before_commit = 0
         disconnected = False
 
         def _command(text: str) -> Optional[str]:
@@ -1807,11 +1806,11 @@ def create_app(
 
         def preempt_preview() -> bool:
             """Polled from the worker thread inside a running preview."""
-            if disconnected or pending_resets:
-                return True
-            # A commit after newer audio: the flush decodes that audio anyway.
-            # A commit with no newer audio lets the preview finish.
-            if pending_commits and samples_before_commit:
+            # A commit always preempts here: the flush decodes the tail anyway
+            # (the native server lets an unchanged-tail preview finish because
+            # its exact-tail reuse turns it into the final; this server has no
+            # such reuse).
+            if disconnected or pending_resets or pending_commits:
                 return True
             # Queued audio that completes a window supersedes the preview.
             to_window = sess.samples_to_next_window()
@@ -1822,7 +1821,7 @@ def create_app(
 
         async def enqueue(item, work: bool) -> None:  # noqa: ANN001
             nonlocal pending_work, pending_bytes, pending_samples, pending_resets
-            nonlocal pending_commits, samples_before_commit, disconnected
+            nonlocal pending_commits, disconnected
             if item is not None and item[0] == "bytes":
                 size = len(item[1])
                 while pending_bytes and pending_bytes + size > STREAM_QUEUE_MAX_BYTES:
@@ -1832,8 +1831,6 @@ def create_app(
             if item is None:
                 disconnected = True
             samples, resets, commits = _preempt_counts(item)
-            if commits and pending_commits == 0:
-                samples_before_commit = pending_samples
             pending_samples += samples
             pending_resets += resets
             pending_commits += commits
@@ -1969,9 +1966,6 @@ def create_app(
                     pending_samples -= samples
                     pending_resets -= resets
                     pending_commits -= commits
-                    samples_before_commit = max(0, samples_before_commit - samples)
-                if not pending_commits:
-                    samples_before_commit = 0
                 need_step = False
                 for idx, (item, work) in enumerate(batch):
                     if item is None:

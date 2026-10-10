@@ -147,8 +147,8 @@ struct Args {
     double max_stream_seconds = 60.0;
     double stream_chunk = 12.0;
     double stream_overlap = 3.0;
-    double min_chunk = serve::kDefaultMinChunk;
-    double partial_interval = serve::kDefaultPartialInt;
+    double min_chunk = 1.0;
+    double partial_interval = 0.5;
     bool show_version = false;
     bool show_abi = false;
     bool show_help = false;
@@ -1054,7 +1054,10 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "[starling-serve] WS /stream client connected\n");
 
             std::string msg;
-            while (ws.is_open()) {
+            // A pump closed by a failed send (the peer stopped reading)
+            // ends the connection at the next frame, so the client sees the
+            // close instead of an open socket that ignores its audio.
+            while (ws.is_open() && !pump.is_closed()) {
                 auto rr = ws.read(msg);
                 if (rr == httplib::ws::ReadResult::Fail) break;
                 // Every received message counts as activity so the idle

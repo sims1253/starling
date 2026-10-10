@@ -400,9 +400,10 @@ def test_stream_stop_preempts_running_preview(server, monkeypatch):
     assert msg["trace"]["stop"]["path"] == "tail"
 
 
-def test_stream_commit_without_new_audio_lets_preview_finish(server, monkeypatch):
-    # Stop with no audio after the preview started: the preview is exactly
-    # the flush tail, so it is not cancelled.
+def test_stream_commit_without_new_audio_preempts_preview(server, monkeypatch):
+    # Stop with no audio after the preview started: this server has no
+    # exact-tail reuse (the native one lets the preview finish and reuses
+    # it), so the preview is cancelled and the flush decodes the tail once.
     import threading
 
     started = threading.Event()
@@ -430,8 +431,9 @@ def test_stream_commit_without_new_audio_lets_preview_finish(server, monkeypatch
             while (msg := ws.receive_json())["type"] != "final":
                 pass
     assert msg["text"] == "w9600"
-    assert msg["trace"]["totals"]["preempted"] == 0
-    assert calls[0] == ("preview", 9600)
+    assert msg["trace"]["totals"]["preempted"] == 1
+    assert calls == [("preview", 9600), ("other", 9600)]
+    assert msg["trace"]["stop"]["path"] == "tail"
 
 
 def test_stream_reset_preempts_running_preview(server, monkeypatch):

@@ -917,12 +917,12 @@ void ReplayGraph::readback_async_then_sync(Backend::Impl* impl,
 }
 
 namespace {
-// Cancellable replay (issue #357): a graph this large (the encoders; decode
-// steps are far smaller) runs in kAbortSlices views with a sync between
-// them when the caller installed a call_abort scope, so a cancelled call
-// stops after the current slice instead of the whole graph. Without a scope
-// the single-submit fast path is unchanged.
-constexpr int kAbortSliceMinNodes = 1024;
+// Cancellable replay (issue #357): an abortable graph (set_abortable; the
+// encoder) runs in kAbortSlices views with a sync between them when the
+// caller installed a call_abort scope, so a cancelled call stops after the
+// current slice instead of the whole graph. Small graphs are not worth the
+// syncs. Without a scope the single-submit fast path is unchanged.
+constexpr int kAbortSliceMinNodes = 256;
 constexpr int kAbortSlices = 4;
 } // namespace
 
@@ -943,7 +943,7 @@ bool ReplayGraph::compute(std::vector<float>& out) {
     const bool any_gate = t_on || tr_on;
     const int64_t t_gc0 = any_gate ? ggml_time_us() : 0;
     bool ok;
-    if (!need_sched_ && t_call_abort && gf_->n_nodes >= kAbortSliceMinNodes) {
+    if (!need_sched_ && abortable_ && t_call_abort && gf_->n_nodes >= kAbortSliceMinNodes) {
         ok = true;
         for (int k = 0; ok && k < kAbortSlices; ++k) {
             const int i0 = static_cast<int>((int64_t)gf_->n_nodes * k / kAbortSlices);

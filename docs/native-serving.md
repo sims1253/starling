@@ -277,13 +277,13 @@ the server skips that preview and previews the newer audio next. A `ping`
 does not skip a preview. A preview that is already running is cancelled
 when required work queues behind it: a `reset`, a `commit` after newer
 audio, or queued audio that completes a window. The Parakeet engine stops
-at its next checkpoint (between pipeline stages, between four slices of
-the encoder graph, or between decoder frames), and the audio stays in the
-buffer for the work that follows. A `commit` with no newer audio lets the
-preview finish: its result is the exact tail, and the flush reuses it.
-Engines without checkpoints finish the preview. When the worker catches up
-on a backlog, it
-commits each full window as soon as it is appended, so the backlog alone
+at its next checkpoint (between pipeline stages and between four slices of
+the encoder graph; the fast Vulkan engine also between decoder frames),
+and the audio stays in the buffer for the work that follows. Engines
+without checkpoints finish the preview; its result is discarded all the
+same. A `commit` with no newer audio lets the preview finish: its result
+is the exact tail, and the flush reuses it. When the worker catches up on
+a backlog, it commits each full window as soon as it is appended, so the backlog alone
 does not hit the buffer cap. Window commits and finalization always run,
 and the server never drops audio. When more than 32 MiB or 4096 frames
 are queued, the server stops reading from the socket until the worker

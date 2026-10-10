@@ -221,6 +221,12 @@ public:
     // Recompute + read the output tensor's f32 contents into `out`.
     bool compute(std::vector<float>& out);
 
+    // Let a cancelled call (call_abort.hpp) stop this graph between slices
+    // (issue #357). Only for graphs whose caller treats a false compute()
+    // as "cancelled" when call_abort_requested() is set, never as a reason
+    // to fall back to another path (the TDT multistep decoder does).
+    void set_abortable(bool on) { abortable_ = on; }
+
     // Recompute + read the output AND every capture registered during build
     // (into the caller's stable dst vectors). Used by the decode loop to pull
     // new per-layer state out of each replayed step.
@@ -253,6 +259,7 @@ private:
     std::vector<const void*> input_hosts_;
     std::vector<std::pair<ggml_tensor*, std::vector<float>*>> captures_;
     bool need_sched_ = false;
+    bool abortable_ = false;
     ggml_gallocr_t galloc_ = nullptr;
 
     bool alloc_internal();

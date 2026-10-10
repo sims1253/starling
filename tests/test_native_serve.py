@@ -928,7 +928,24 @@ def test_real_websocket_flow(host: str, port: int, tr: TestResults,
         async with websockets.connect(uri, max_size=None) as ws:
             frames: list[dict] = []
 
-            for off in range(0, len(pcm), chunk):
+            # Real-time pace until a nonempty partial arrives, then the rest
+            # at once: a burst followed by a commit lets the commit preempt
+            # every preview (the final supersedes them), so partials are
+            # checked before it.
+            off = 0
+            while off < len(pcm) and not any(
+                    f.get("text", "").strip() for f in frames):
+                await ws.send(pcm[off: off + chunk])
+                off += chunk
+                frame_end = time.monotonic() + 0.5
+                while (left := frame_end - time.monotonic()) > 0:
+                    try:
+                        msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=left))
+                    except asyncio.TimeoutError:
+                        break
+                    if msg.get("type") == "partial":
+                        frames.append(msg)
+            for off in range(off, len(pcm), chunk):
                 await ws.send(pcm[off: off + chunk])
             sent = len(samples) / 16000.0
             await ws.send(json.dumps({"type": "commit"}))
@@ -952,7 +969,7 @@ def test_real_websocket_flow(host: str, port: int, tr: TestResults,
                      f"frames={[f.get('type') for f in frames]}")
             if partials:
                 tr.check("ws partial has non-empty text",
-                         len(partials[-1].get("text", "").strip()) > 0,
+                         any(p.get("text", "").strip() for p in partials),
                          str(partials[-1])[:200])
 
             tr.check("ws commit → final", final.get("type") == "final",

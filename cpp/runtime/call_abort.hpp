@@ -5,8 +5,9 @@
 // the synchronous engine call. Engines poll call_abort_requested() at their
 // natural checkpoints (between pipeline stages, encoder graph slices and
 // decoder steps) and return a "cancelled" error when it fires, leaving no
-// partial state behind. Engines without checkpoints simply finish the call; the caller
-// must handle both outcomes.
+// partial state behind. Engines without checkpoints simply finish the call;
+// the caller decides what a result that completes after the abort fired is
+// worth.
 //
 // The hook is thread-local: the C engine call is synchronous, so the
 // serving thread's scope is the engine's scope (the same convention as

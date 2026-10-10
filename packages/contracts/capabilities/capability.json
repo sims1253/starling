@@ -145,11 +145,11 @@
         "cli_flag": "--stream-overlap-seconds"
       },
       "min_seconds_before_first_partial": {
-        "value": 5.0,
+        "value": 1.0,
         "cli_flag": "--min-chunk-seconds"
       },
       "min_seconds_between_partials": {
-        "value": 3.0,
+        "value": 0.5,
         "cli_flag": "--partial-interval-seconds"
       },
       "overlap_dedup": "word-match-at-boundary"

@@ -1792,6 +1792,42 @@ static void test_pump_stop_preempts_running_preview() {
     for (const auto& m : fx.sent) CHECK(m.find("stale") == std::string::npos);
 }
 
+static void test_pump_preview_finishing_after_preempt_is_discarded() {
+    // An engine without checkpoints (or past its last one): the preview
+    // completes although the preempt predicate fired. Its result is stale
+    // and is discarded like a cancelled one.
+    PumpFixture fx;
+    std::atomic<int> previews{0};
+    fx.session.set_transcribe_fn([&](const float*, int64_t n)
+                                     -> std::optional<std::string> {
+        if (std::strcmp(fx.session.chunker()->call_kind(), "preview") == 0) {
+            previews.fetch_add(1);
+            const auto t0 = std::chrono::steady_clock::now();
+            while (!starling::ggml::call_abort_requested()
+                   && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(10))
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            return std::string("stale preview");  // finishes anyway
+        }
+        return std::string("w") + std::to_string(n);
+    });
+    StreamPump::Options opt;
+    opt.trace = true;
+    StreamPump pump(fx.session, opt, fx.sender());
+    pump.push_audio(pcm_for_range(0, 9600));
+    wait_until(previews, 1);
+    pump.push_audio(pcm_for_range(9600, 3200));
+    pump.push_commit();
+    const size_t fin = fx.wait_for("\"type\":\"final\"");
+    CHECK(fin != SIZE_MAX);
+    pump.drain();
+    CHECK(fx.count("stale") == 0);
+    std::lock_guard<std::mutex> lk(fx.mu);
+    if (fin != SIZE_MAX) {
+        CHECK(fx.sent[fin].find("\"text\":\"w12800\"") != std::string::npos);
+        CHECK(fx.sent[fin].find("\"preempted\":1") != std::string::npos);
+    }
+}
+
 static void test_pump_commit_without_new_audio_reuses_running_preview() {
     // Stop with no audio after the preview started: the preview is exactly
     // the flush tail, so it is not cancelled and the final reuses it.
@@ -2258,6 +2294,7 @@ int main() {
     test_window_decode_time_counts_toward_the_preview_gap();
     test_pump_stop_preempts_running_preview();
     test_pump_commit_without_new_audio_reuses_running_preview();
+    test_pump_preview_finishing_after_preempt_is_discarded();
     test_pump_window_audio_preempts_running_preview();
     test_pump_reset_preempts_running_preview();
     test_pump_empty_commit_reports_committed_stop();
