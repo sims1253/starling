@@ -126,6 +126,7 @@ pub(crate) enum TakeUpdate {
         stored_id: String,
         take: Option<String>,
         req: Option<String>,
+        attempt: Option<String>,
         state: TranscriptionState,
         yours: bool,
     },
@@ -558,13 +559,14 @@ fn route(frame: TakeWire) -> TakeUpdate {
             stored_id,
             take,
             req,
+            attempt,
             state,
             yours,
-            ..
         } => TakeUpdate::Transcription {
             stored_id,
             take,
             req,
+            attempt,
             state,
             yours,
         },

@@ -10,7 +10,7 @@ use starling_dictation::{audio, recorder, storage};
 use starling_runtime_host::frame::TranscribeWith;
 
 use crate::app::{StarlingApp, UnsavedWav};
-use crate::store::{AudioPin, Store};
+use crate::store::{AudioHold, Store};
 
 impl StarlingApp {
     /// The on-screen record button: a toggle in every activation mode,
@@ -247,13 +247,14 @@ impl StarlingApp {
     /// `with` (#220): a new attempt beside the earlier ones, never typed
     /// into an editor — the take's own delivery is gone with its first
     /// job; a retried transcript (`offer`) is offered for Copy / Paste
-    /// last instead. `pin` holds the take's audio until the service's
-    /// attempt does (#342). `false` when the service cannot be asked.
+    /// last instead. `hold` keeps the take's audio from every process's
+    /// upkeep until the service's attempt does (#342). `false` when the
+    /// service cannot be asked.
     pub(crate) fn ask_host_to_transcribe(
         &mut self,
         id: String,
         with: TranscribeWith,
-        pin: Option<AudioPin>,
+        hold: Option<AudioHold>,
         offer: bool,
         cx: &mut Context<Self>,
     ) -> bool {
@@ -273,7 +274,7 @@ impl StarlingApp {
             req,
             crate::remote_take::Request {
                 stored_id: id.clone(),
-                _pin: pin,
+                _hold: hold,
                 offer,
             },
         );
@@ -411,20 +412,32 @@ impl StarlingApp {
             return;
         };
         cx.spawn(async move |this, cx| {
-            // #342: pinned from before the check until the service's
+            // #342: held from before the check until the service's
             // attempt holds the audio — including while the engine
-            // switches to the retry's model.
-            let pin = {
+            // switches to the retry's model — against every process's
+            // upkeep (#220: the attempt starts in the service).
+            let hold = {
                 let store = store.clone();
                 let id = id.clone();
-                cx.background_spawn(async move { store.pin_audio(&id) }).await
+                cx.background_spawn(async move { store.hold_audio(&id) }).await
             };
             this.update(cx, |app, cx| {
                 // Superseded by a newer choice, or the take was deleted
-                // meanwhile: the pin drops, nothing runs.
+                // meanwhile: the hold drops, nothing runs.
                 if app.retry_seq != seq || app.retry_target_gone(&id) {
                     return;
                 }
+                let pin = match hold {
+                    Ok(hold) => hold,
+                    Err(err) => {
+                        app.error = Some(format!(
+                            "The recording could not be kept for the retry ({err}); it is \
+                             unchanged."
+                        ));
+                        cx.notify();
+                        return;
+                    }
+                };
                 match with {
                     RetryWith::Current => {
                         app.ask_host_to_transcribe(id, TranscribeWith::Current, Some(pin), true, cx);
@@ -454,7 +467,7 @@ impl StarlingApp {
         id: String,
         model_id: String,
         seq: u64,
-        pin: AudioPin,
+        pin: AudioHold,
         cx: &mut Context<Self>,
     ) {
         let Some(engine) = self.engine.clone() else {
@@ -1766,6 +1779,7 @@ mod tests {
             stored_id: stored_id.to_string(),
             take: None,
             req: req.map(str::to_string),
+            attempt: None,
             state: TranscriptionState::Completed {
                 text: text.to_string(),
                 kept_earlier: false,
@@ -1831,6 +1845,7 @@ mod tests {
                 stored_id: id.clone(),
                 take: None,
                 req: Some("tr_elsewhere".to_string()),
+                attempt: None,
                 state: TranscriptionState::Refused {
                     message: "This recording is being transcribed already.".to_string(),
                 },
@@ -1843,6 +1858,26 @@ mod tests {
         frame(&app, cx, completed_with(&id, None, true, "mine at last"));
         settle(cx, "the own take typed", |_| !fake.insertions().is_empty());
         assert_eq!(fake.insertions()[0].1, "mine at last");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A retry another window asked for, handed to this window to act on
+    /// (its asker went away), is processed here but never typed — even
+    /// while this window's own take of it still waits for its result.
+    #[gpui::test]
+    fn a_retry_handed_to_this_window_is_never_typed(cx: &mut gpui::TestAppContext) {
+        let root = scratch("frames-handed-retry");
+        let store = Store::at_test_root(&root);
+        let id = transcribed(&store, "their retry");
+        let (app, fake) = window_with_typing(cx, &store);
+        own_take(&app, cx, &id);
+        frame(&app, cx, completed_with(&id, Some("tr_gone"), true, "their retry"));
+        cx.run_until_parked();
+        assert!(fake.insertions().is_empty(), "{:?}", fake.insertions());
+        assert!(app.read_with(cx, |app, _| app.host.awaiting.contains(&id)), "still waiting");
+        frame(&app, cx, completed_with(&id, None, true, "my own"));
+        settle(cx, "the own take typed", |_| !fake.insertions().is_empty());
+        assert_eq!(fake.insertions()[0].1, "my own");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1929,7 +1964,7 @@ mod tests {
                 "tr_1".to_string(),
                 crate::remote_take::Request {
                     stored_id: id.clone(),
-                    _pin: None,
+                    _hold: None,
                     offer: true,
                 },
             );

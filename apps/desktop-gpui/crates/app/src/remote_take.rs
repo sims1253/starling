@@ -31,7 +31,7 @@ use starling_runtime_host::live::stream::Partial;
 use crate::activation::{CancelReason, TakeId};
 use crate::app::{HealthCheckPurpose, StarlingApp};
 use crate::host_link::{HostLink, HostUpdate, LiveCapture, TakeUpdate};
-use crate::store::AudioPin;
+use crate::store::AudioHold;
 use crate::upload::refresh_sessions;
 
 /// How often a stop or cancel the host has not acted on is asked again.
@@ -66,9 +66,10 @@ pub(crate) struct HostState {
     pub(crate) lost_take_on: Option<u32>,
     /// The pid of the host the last connection went to.
     pub(crate) client_pid: Option<u32>,
-    /// The exact transcript this window's own take delivers, while it is
-    /// delivered: never a later result another window asked for.
-    pub(crate) own_results: HashMap<String, String>,
+    /// The exact transcript (attempt id and text) this window's own take
+    /// delivers and stages, while it does: never a later result another
+    /// window asked for.
+    pub(crate) own_results: HashMap<String, (Option<String>, String)>,
     /// The live text the host sent with an adoption still being
     /// confirmed, shown once the take is this window's.
     pub(crate) claimed_text: Option<(Option<LivePartial>, Option<String>)>,
@@ -82,8 +83,9 @@ const SERVICE_STOPPED: &str = "Starling's recording service stopped while record
 /// A transcription this window asked the host for.
 pub(crate) struct Request {
     pub(crate) stored_id: String,
-    /// Held (never read) until the host's attempt holds the audio.
-    pub(crate) _pin: Option<AudioPin>,
+    /// Held (never read) until the host's attempt holds the audio: any
+    /// process's upkeep leaves it alone meanwhile.
+    pub(crate) _hold: Option<AudioHold>,
     /// A retry: its transcript is offered for Copy / Paste last.
     pub(crate) offer: bool,
 }
@@ -572,9 +574,10 @@ impl StarlingApp {
                 stored_id,
                 take,
                 req,
+                attempt,
                 state,
                 yours,
-            } => self.transcription_update(stored_id, take, req, state, yours, cx),
+            } => self.transcription_update(stored_id, take, req, attempt, state, yours, cx),
         }
     }
 
@@ -958,11 +961,13 @@ impl StarlingApp {
     /// window that recorded it, with exactly that result's text; a
     /// request's result (a retry, an import) is offered to the window that
     /// asked, never typed, and never touches the take's own delivery.
+    #[allow(clippy::too_many_arguments)]
     fn transcription_update(
         &mut self,
         stored_id: String,
         take: Option<String>,
         req: Option<String>,
+        attempt: Option<String>,
         state: TranscriptionState,
         yours: bool,
         cx: &mut Context<Self>,
@@ -980,7 +985,7 @@ impl StarlingApp {
                     self.host.requests.insert(
                         req.clone(),
                         Request {
-                            _pin: None,
+                            _hold: None,
                             ..request
                         },
                     );
@@ -1039,11 +1044,19 @@ impl StarlingApp {
                                 return;
                             }
                             this.update(cx, |app, cx| {
+                                // Only the take's own transcription is
+                                // delivered and staged, with exactly its
+                                // text; anything else this window acts on
+                                // is processed and, if it asked, offered.
                                 if own {
-                                    app.host.own_results.insert(stored_id.clone(), text);
+                                    app.host
+                                        .own_results
+                                        .insert(stored_id.clone(), (attempt, text));
+                                    app.after_transcription(stored_id.clone(), cx);
+                                    app.host.own_results.remove(&stored_id);
+                                } else {
+                                    app.after_other_result(stored_id.clone(), cx);
                                 }
-                                app.after_transcription(stored_id.clone(), cx);
-                                app.host.own_results.remove(&stored_id);
                                 if offer {
                                     app.offer_retried_text(&stored_id, cx);
                                 }
@@ -1096,7 +1109,15 @@ impl StarlingApp {
     /// text while that is being delivered (a later result another window
     /// asked for must not be typed in its place).
     pub(crate) fn own_result(&self, id: &str) -> Option<String> {
-        self.host.own_results.get(id).cloned()
+        self.host.own_results.get(id).map(|(_, text)| text.clone())
+    }
+
+    /// [`Self::own_result`] with the attempt that produced it.
+    pub(crate) fn own_result_attempt(&self, id: &str) -> Option<(String, String)> {
+        self.host
+            .own_results
+            .get(id)
+            .and_then(|(attempt, text)| attempt.clone().map(|attempt| (attempt, text.clone())))
     }
 
     /// No transcript will come for stored take `id` in this window:

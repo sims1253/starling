@@ -570,14 +570,20 @@ impl StarlingApp {
         self.drafts.remove(id);
         self.processing_loading.remove(id);
 
+        // The take's own result, when its transcription named it (#220):
+        // not whatever result history shows by the time this runs.
+        let own = self.own_result_attempt(id);
         let id = id.to_string();
         cx.spawn(async move |this, cx| {
             let prepared = {
                 let id = id.clone();
                 cx.background_spawn(async move {
-                    let (attempt_id, raw) = store.latest_raw(&id)?.ok_or_else(|| {
-                        starling_dictation::storage::StorageError::NotFound(id.clone())
-                    })?;
+                    let (attempt_id, raw) = match own {
+                        Some(own) => own,
+                        None => store.latest_raw(&id)?.ok_or_else(|| {
+                            starling_dictation::storage::StorageError::NotFound(id.clone())
+                        })?,
+                    };
                     let mut doc = store.start_processing_doc(&id, &attempt_id, &raw)?;
                     if let Some(text) = edited.filter(|text| *text != doc.head_text) {
                         let revision = doc.head_revision + 1;

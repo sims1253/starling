@@ -529,13 +529,35 @@ impl EngineHost {
             if cancel.is_cancelled() {
                 return Err("The transcription was cancelled.".to_string());
             }
-            let (manager, stopped, in_flight) = match &*lock(&self.state) {
+            // The lease is taken, and counted, under the state lock: a
+            // switch away from the built-in engine either happened first
+            // (and this sees the manual state) or sees this request in the
+            // drain it waits on before stopping the engine.
+            let (manager, found, avoiding) = match &*lock(&self.state) {
                 EngineState::Builtin {
                     manager,
                     stopped,
                     in_flight,
                     ..
-                } => (manager.clone(), Arc::clone(stopped), Arc::clone(in_flight)),
+                } => {
+                    if stopped.load(Ordering::SeqCst) {
+                        return Err(not_ready_sentence());
+                    }
+                    let mut avoiding = false;
+                    let mut found = None;
+                    if let Some(lease) = manager.lease() {
+                        let wanted = match want {
+                            Want::Current => true,
+                            Want::Model(model_id) => lease.model_id() == model_id,
+                        };
+                        let identity = (lease.endpoint().to_string(), lease.pid());
+                        if wanted && avoid != Some(&identity) {
+                            found = Some(Target::from_lease(lease, in_flight));
+                        }
+                        avoiding = wanted;
+                    }
+                    (manager.clone(), found, avoiding)
+                }
                 EngineState::Manual { endpoint, model } => {
                     return match want {
                         Want::Current => Target::manual(endpoint, model).map_err(|err| {
@@ -546,20 +568,8 @@ impl EngineHost {
                     };
                 }
             };
-            if stopped.load(Ordering::SeqCst) {
-                return Err(not_ready_sentence());
-            }
-            let mut avoiding = false;
-            if let Some(lease) = manager.lease() {
-                let wanted = match want {
-                    Want::Current => true,
-                    Want::Model(model_id) => lease.model_id() == model_id,
-                };
-                let identity = (lease.endpoint().to_string(), lease.pid());
-                if wanted && avoid != Some(&identity) {
-                    return Ok(Target::from_lease(lease, &in_flight));
-                }
-                avoiding = wanted;
+            if let Some(target) = found {
+                return Ok(target);
             }
             let phase = manager.snapshot().phase;
             // A failed engine or a missing model will not fix itself while

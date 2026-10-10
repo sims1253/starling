@@ -806,6 +806,21 @@ impl StarlingApp {
         }
     }
 
+    /// A new raw transcript of take `id` that is not this window's own
+    /// take's (#220: a retry, an import, a take another window left): its
+    /// processing runs, nothing is delivered and no staging draft is
+    /// touched — those belong to the take's own transcription.
+    pub(crate) fn after_other_result(&mut self, id: String, cx: &mut Context<Self>) {
+        self.processing.remove(&id);
+        self.drafts.remove(&id);
+        self.processing_loading.remove(&id);
+        if self.mode_processes() {
+            self.process_take(id, cx);
+        } else {
+            cx.notify();
+        }
+    }
+
     /// Loads a take's stored processing state (on selection). While it
     /// loads, [`Self::head_text`] does not guess.
     pub(crate) fn load_processing(&mut self, id: String, cx: &mut Context<Self>) {

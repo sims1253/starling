@@ -16,6 +16,11 @@
 //! fails it as interrupted and claims the take afresh, so a crash costs
 //! the attempt, never the transcription; a claim a live process holds is
 //! left to it.
+//!
+//! An **audio hold** ([`StoreV2::hold_audio`]) keeps a take's audio from
+//! being compressed or retired by any process until it is released or
+//! its holder is gone: what a retry asked for in one process needs before
+//! another process starts its attempt.
 
 use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 
@@ -332,6 +337,47 @@ impl StoreV2 {
             params![capture_id, now_iso()],
         )?;
         Ok(())
+    }
+}
+
+impl StoreV2 {
+    /// Holds capture `capture_id`'s audio for this process until
+    /// [`Self::release_audio_hold`] (or this process exits): no process's
+    /// upkeep compresses or retires it meanwhile. Returns the hold's id.
+    pub fn hold_audio(&mut self, capture_id: &str) -> Result<String, StoreV2Error> {
+        if self.get_capture(capture_id)?.is_none() {
+            return Err(StoreV2Error::NotFound(capture_id.to_string()));
+        }
+        let id = format!("h_{}", uuid::Uuid::new_v4().simple());
+        self.conn.execute(
+            "INSERT INTO audio_holds(id, capture_id, holder_pid, created_utc)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![id, capture_id, std::process::id(), now_iso()],
+        )?;
+        Ok(id)
+    }
+
+    /// Ends hold `hold_id` (a release of an unknown hold does nothing).
+    pub fn release_audio_hold(&mut self, hold_id: &str) -> Result<(), StoreV2Error> {
+        self.conn
+            .execute("DELETE FROM audio_holds WHERE id = ?1", params![hold_id])?;
+        Ok(())
+    }
+
+    /// Whether a live process holds capture `capture_id`'s audio. A hold
+    /// whose holder is gone counts for nothing.
+    pub(super) fn audio_held(&self, capture_id: &str) -> Result<bool, StoreV2Error> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT holder_pid FROM audio_holds WHERE capture_id = ?1")?;
+        let pids = stmt.query_map(params![capture_id], |row| row.get::<_, i64>(0))?;
+        for pid in pids {
+            let pid = pid?;
+            if u32::try_from(pid).is_ok_and(super::process_is_alive) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 }
 

@@ -599,6 +599,16 @@ impl Store {
         store.correction_records_for(id).map_err(v2_err)
     }
 
+    /// Hold `id`'s audio against every process's upkeep until the guard
+    /// drops (#220: a retry the recording service has not started yet).
+    pub(crate) fn hold_audio(&self, id: &str) -> Result<AudioHold, storage::StorageError> {
+        let hold = lock_v2(&self.0).hold_audio(id).map_err(v2_err)?;
+        Ok(AudioHold {
+            store: Arc::clone(&self.0),
+            id: hold,
+        })
+    }
+
     /// Pin `id`'s audio until the returned guard drops (#342): upkeep
     /// neither compresses nor retires it meanwhile.
     pub(crate) fn pin_audio(&self, id: &str) -> AudioPin {
@@ -710,6 +720,24 @@ impl Store {
         let mut store = lock_v2(&self.0);
         let committed = finalized.commit_marked(&mut store, mark).map_err(v2_err)?;
         Ok(committed.record.id)
+    }
+}
+
+/// A [`Store::hold_audio`] guard: the take's audio is kept from every
+/// process's upkeep until it drops. Dropping it takes the store lock:
+/// never drop one while holding that lock.
+pub(crate) struct AudioHold {
+    store: Arc<Mutex<StoreV2>>,
+    id: String,
+}
+
+impl Drop for AudioHold {
+    fn drop(&mut self) {
+        if let Err(err) = lock_v2(&self.store).release_audio_hold(&self.id) {
+            // Left for its holder's exit to void (a hold whose holder is
+            // gone counts for nothing).
+            eprintln!("Starling: releasing an audio hold failed: {err}");
+        }
     }
 }
 

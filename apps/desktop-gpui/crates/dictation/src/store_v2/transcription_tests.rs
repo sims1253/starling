@@ -254,3 +254,39 @@ fn a_recheck_leaves_intents_younger_than_it_asks_for() {
         vec![id]
     );
 }
+
+#[test]
+fn a_held_take_is_neither_compressed_nor_retired_until_released() {
+    let dir = TempDir::new().expect("tempdir");
+    let mut store = store_in(&dir);
+    let mut take = store.begin_take(TakeMeta::for_device("test-device")).expect("begin take");
+    take.append_and_seal(&ramp(32_000)).expect("append");
+    let id = take.finish(&mut store).expect("commit").record.id;
+    // The hold is seen by another handle (another process's upkeep).
+    let other = store_in(&dir);
+    let candidates = |store: &StoreV2| {
+        store
+            .compression_candidates(usize::MAX)
+            .unwrap()
+            .into_iter()
+            .map(|job| job.id)
+            .collect::<Vec<_>>()
+    };
+    assert!(candidates(&other).contains(&id));
+    let hold = store.hold_audio(&id).expect("hold");
+    assert!(!candidates(&other).contains(&id), "held: not compressed");
+    assert!(other.audio_in_use(&id).unwrap(), "held: not retired");
+    store.release_audio_hold(&hold).expect("release");
+    assert!(candidates(&other).contains(&id));
+    assert!(!other.audio_in_use(&id).unwrap());
+    // A hold left by a process that is gone counts for nothing.
+    other
+        .conn
+        .execute(
+            "INSERT INTO audio_holds(id, capture_id, holder_pid, created_utc) VALUES ('h_dead', ?1, ?2, 'x')",
+            rusqlite::params![id, i64::from(u32::MAX - 7)],
+        )
+        .unwrap();
+    assert!(!other.audio_in_use(&id).unwrap());
+    assert!(matches!(store.hold_audio("c_missing"), Err(StoreV2Error::NotFound(_))));
+}

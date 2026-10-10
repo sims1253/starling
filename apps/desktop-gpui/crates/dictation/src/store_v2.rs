@@ -106,8 +106,8 @@ use crate::storage::{is_safe_path_component, iso_utc, now_iso};
 /// real updated-at source for the summaries); v3 added `insight_events`
 /// (#294: per-job processing latency, recorded for Insights #308); v4
 /// added `correction_records` and `captures.secure_field`; v5 added
-/// `journal_supersessions` (#356); v6 added `transcription_intents`
-/// (#220).
+/// `journal_supersessions` (#356); v6 added `transcription_intents` and
+/// `audio_holds` (#220).
 pub const SCHEMA_VERSION: u32 = 6;
 
 /// WAL checkpoint policy (D11): run `PRAGMA wal_checkpoint(PASSIVE)` after
@@ -331,6 +331,12 @@ CREATE TABLE IF NOT EXISTS transcription_intents (
     capture_id    TEXT PRIMARY KEY REFERENCES captures(id) ON DELETE CASCADE,
     requested_utc TEXT NOT NULL,
     attempt_id    TEXT
+);
+CREATE TABLE IF NOT EXISTS audio_holds (
+    id          TEXT PRIMARY KEY,
+    capture_id  TEXT NOT NULL REFERENCES captures(id) ON DELETE CASCADE,
+    holder_pid  INTEGER NOT NULL,
+    created_utc TEXT NOT NULL
 );
 ";
 
@@ -2341,10 +2347,10 @@ impl StoreV2 {
 
     /// Whether `id`'s audio is in use: pinned by a caller of this
     /// instance, a recognition attempt on it is in flight (#356), or it
-    /// still waits to be transcribed (#220). Its audio is never
-    /// compressed or retired under it.
+    /// still waits to be transcribed or a live process holds it (#220).
+    /// Its audio is never compressed or retired under it.
     fn audio_in_use(&self, id: &str) -> Result<bool, StoreV2Error> {
-        if self.audio_pins.contains_key(id) {
+        if self.audio_pins.contains_key(id) || self.audio_held(id)? {
             return Ok(true);
         }
         Ok(self
@@ -2394,7 +2400,11 @@ impl StoreV2 {
             if jobs.len() >= limit {
                 break;
             }
-            if !is_safe_path_component(&id) || rate == 0 || self.audio_pins.contains_key(&id) {
+            if !is_safe_path_component(&id)
+                || rate == 0
+                || self.audio_pins.contains_key(&id)
+                || self.audio_held(&id)?
+            {
                 continue;
             }
             if self.compression_failures.get(&id).copied().unwrap_or(0) >= COMPRESSION_ATTEMPTS {
@@ -5870,7 +5880,7 @@ mod windows_lock {
 /// Whether the process `pid` is still alive (#213 review) — the fallback
 /// ownership signal wherever the flock cannot answer.
 #[cfg(unix)]
-fn process_is_alive(pid: u32) -> bool {
+pub(crate) fn process_is_alive(pid: u32) -> bool {
     // SAFETY: kill(2) with signal 0 performs existence and permission
     // checks only — no signal is ever delivered.
     if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
@@ -5887,7 +5897,7 @@ fn process_is_alive(pid: u32) -> bool {
 /// process. A query that fails on an opened process is not proof of
 /// death — presumed alive, never break what cannot be proven dead.
 #[cfg(windows)]
-fn process_is_alive(pid: u32) -> bool {
+pub(crate) fn process_is_alive(pid: u32) -> bool {
     use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ACCESS_DENIED};
     use windows_sys::Win32::System::Threading::{
         GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -5923,7 +5933,7 @@ fn process_is_alive(pid: u32) -> bool {
 /// Electron reference accepts without a lock manager; unix keeps the
 /// full cross-process guarantee via flock.
 #[cfg(not(any(unix, windows)))]
-fn process_is_alive(_pid: u32) -> bool {
+pub(crate) fn process_is_alive(_pid: u32) -> bool {
     false
 }
 
