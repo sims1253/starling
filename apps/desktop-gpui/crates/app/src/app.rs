@@ -559,9 +559,11 @@ pub struct StarlingApp {
     /// The latest request wins: retiring a panel asks for the root, and
     /// the panel that replaces it in the same frame asks for its editor.
     pub(crate) pending_focus: Option<PendingFocus>,
-    /// Set when live streaming died mid-recording: the partial view going
-    /// quiet must be explainable, so the stop path folds this into the
-    /// capture warning shown beside the saved take.
+    /// Set when live streaming is unavailable or died mid-recording: the
+    /// partial view going quiet must be explainable, so it shows while the
+    /// take records (the worker reports a mid-take death as it happens)
+    /// and the stop path folds it into the capture warning shown beside
+    /// the saved take.
     pub(crate) stream_degradation: Option<String>,
     pub levels: Vec<f32>,
     pub elapsed_ms: f64,

@@ -18,11 +18,16 @@
 //! starts empty. Its previews stay hidden until they repeat the words the
 //! draft already made final and hold as many words as the last one shown,
 //! so the draft neither steps back nor shifts its word indices while the
-//! server catches up. The seam is kept small for #220, which moves this
-//! worker into the runtime host.
+//! server catches up. The hold is bounded: a session that keeps
+//! transcribing those words differently, has heard everything the old one
+//! had, or is still behind after the replay plus [`REPLAY_GRACE`] gets its
+//! previews shown again. The draft's segmenter still keeps the words it
+//! made final and the user's edits, and flags the divergence. The seam is
+//! kept small for #220, which moves this worker into the runtime host.
 
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -49,6 +54,16 @@ const MAX_FRAME_SECONDS: usize = 1;
 /// The most frames one step sends, so a long catch-up still polls
 /// previews and notices a stop between runs of frames.
 const MAX_FRAMES_PER_STEP: usize = 4;
+/// Replayed previews that reach past the draft's final words yet
+/// contradict them before the hold gives up: the new session hears those
+/// words differently, and waiting longer will not change that.
+const REPLAY_DISAGREEMENTS: usize = 3;
+/// How long past real time a replay may take to catch up before the hold
+/// gives up: a server slower than that cannot keep live text going anyway.
+const REPLAY_GRACE: Duration = Duration::from_secs(10);
+/// Trace lines queued for the writer before new ones are dropped (and
+/// counted): a stalled trace sink must not hold up the UI or the stream.
+const TRACE_BACKLOG: usize = 1024;
 
 /// The connection the worker sends audio on and polls previews from.
 pub(crate) trait StreamClient: Send + 'static {
@@ -114,6 +129,27 @@ fn degradation(reason: &str) -> String {
     )
 }
 
+/// The take's live updates, for the UI.
+pub(crate) struct Live {
+    /// The newest preview to show.
+    pub previews: watch::Receiver<Option<Partial>>,
+    /// Why live text stopped for the rest of the take, once it has.
+    pub degradation: watch::Receiver<Option<String>>,
+}
+
+/// After a reconnect: the new session's previews are held back while it
+/// replays the take (see the module docs).
+struct Replay {
+    /// How much of the take the lost sessions had heard, in seconds: the
+    /// draft's words come from no more than this.
+    heard_s: f64,
+    /// Until a preview holds at least `shown_words`.
+    catching_up: bool,
+    /// Previews that reached past the draft's final words but disagreed.
+    disagreements: usize,
+    deadline: Instant,
+}
+
 /// Why a step dropped the connection.
 enum Failure {
     /// The audio itself cannot be streamed: no reconnect helps.
@@ -140,13 +176,11 @@ struct PumpCore<C> {
     /// draft has made final.
     stable_prefix: Vec<String>,
     /// After a reconnect: previews that do not repeat `stable_prefix` word
-    /// for word stay hidden, until the new session calls those words
-    /// stable itself.
-    replaying: bool,
-    /// After a reconnect: previews stay hidden until one holds at least
-    /// `shown_words`.
-    catching_up: bool,
+    /// for word, or hold fewer than `shown_words`, stay hidden until the
+    /// new session calls those words stable itself (or the hold gives up).
+    replay: Option<Replay>,
     partials: watch::Sender<Option<Partial>>,
+    degraded: watch::Sender<Option<String>>,
     trace: Option<Arc<StreamTrace>>,
     /// Set by [`StreamPump::finish`]; a step checks it between frames.
     stop: Arc<AtomicBool>,
@@ -164,7 +198,7 @@ impl<C: StreamClient> PumpCore<C> {
             None => Ok(None),
         };
         match polled {
-            Ok(Some(partial)) => self.show(partial),
+            Ok(Some(partial)) => self.show(partial, now),
             Ok(None) => {}
             Err(reason) => self.fail(Failure::Stream(reason), now),
         }
@@ -211,21 +245,42 @@ impl<C: StreamClient> PumpCore<C> {
         Ok(())
     }
 
-    fn show(&mut self, partial: Partial) {
+    fn show(&mut self, partial: Partial, now: Instant) {
         let words: Vec<&str> = partial.text.split_ascii_whitespace().collect();
-        if self.replaying {
+        if let Some(replay) = self.replay.as_mut() {
             // The draft keeps its word indices across the reconnect: a
             // replayed preview that disagrees with the words it already
             // made final, or that has not caught up yet, would misplace
             // the user's edits. The final settles the take either way.
-            let agrees = words.len() >= self.stable_prefix.len()
-                && words.iter().zip(&self.stable_prefix).all(|(word, known)| word == known);
-            if !agrees || (self.catching_up && words.len() < self.shown_words) {
-                return;
-            }
-            self.catching_up = false;
-            if partial.stable_words >= self.stable_prefix.len() {
-                self.replaying = false;
+            let reaches = words.len() >= self.stable_prefix.len();
+            let agrees =
+                reaches && words.iter().zip(&self.stable_prefix).all(|(word, known)| word == known);
+            if agrees && !(replay.catching_up && words.len() < self.shown_words) {
+                replay.catching_up = false;
+                if partial.stable_words >= self.stable_prefix.len() {
+                    self.replay = None;
+                }
+            } else {
+                if reaches && !agrees {
+                    replay.disagreements += 1;
+                }
+                let release = if replay.disagreements >= REPLAY_DISAGREEMENTS {
+                    "the new session transcribes the draft's final words differently"
+                } else if partial.covered_s.is_some_and(|covered| covered >= replay.heard_s) {
+                    "the new session has heard as much as the old one"
+                } else if now >= replay.deadline {
+                    "the replay did not catch up in time"
+                } else {
+                    return;
+                };
+                // Better moving live text than none for the rest of the
+                // take: the segmenter keeps final words and edits in place
+                // and flags the divergence. The reason goes to the trace
+                // only: no I/O on this thread, which Stop joins.
+                self.replay = None;
+                if let Some(trace) = self.trace.as_ref() {
+                    trace.log("replay_released", json!({ "reason": release }));
+                }
             }
         }
         let stable = partial.stable_words.min(words.len());
@@ -252,6 +307,8 @@ impl<C: StreamClient> PumpCore<C> {
         } else {
             self.retry_at = None;
             self.degradation = Some(degradation(&reason));
+            // Explained while the take still records, not only at stop.
+            self.degraded.send_replace(self.degradation.clone());
         }
     }
 
@@ -266,10 +323,22 @@ impl<C: StreamClient> PumpCore<C> {
                     trace.log("reconnect", json!({ "replay_s": self.seconds(self.samples.len()) }));
                 }
                 // A new session starts empty: the whole take goes again.
+                // A session lost mid-replay had heard no more than the one
+                // before it.
+                let heard_s = self
+                    .replay
+                    .as_ref()
+                    .map_or(0.0, |replay| replay.heard_s)
+                    .max(self.seconds(self.sent));
+                let replay_s = Duration::from_secs_f64(self.seconds(self.samples.len()));
                 self.stream = Some(stream);
                 self.sent = 0;
-                self.replaying = true;
-                self.catching_up = true;
+                self.replay = Some(Replay {
+                    heard_s,
+                    catching_up: true,
+                    disagreements: 0,
+                    deadline: now + replay_s + REPLAY_GRACE,
+                });
             }
             Err(reason) => self.fail(Failure::Stream(reason), now),
         }
@@ -308,16 +377,17 @@ pub(crate) struct StreamPump<C> {
 
 impl<C: StreamClient> StreamPump<C> {
     /// Starts pumping `tap` (captured at `rate`) into `stream`; `connect`
-    /// opens a replacement connection after a failure. The receiver holds
-    /// the newest preview to show.
+    /// opens a replacement connection after a failure. An error is why the
+    /// worker could not start; the take records regardless.
     pub(crate) fn start(
         tap: Box<dyn AudioTap>,
         rate: u32,
         stream: C,
         connect: Connect<C>,
         trace: Option<Arc<StreamTrace>>,
-    ) -> (Self, watch::Receiver<Option<Partial>>) {
-        let (partials, receiver) = watch::channel(None);
+    ) -> Result<(Self, Live), String> {
+        let (partials, previews) = watch::channel(None);
+        let (degraded, degradation) = watch::channel(None);
         let stop = Arc::new(AtomicBool::new(false));
         let core = Arc::new(Mutex::new(PumpCore {
             tap,
@@ -333,9 +403,9 @@ impl<C: StreamClient> StreamPump<C> {
             degradation: None,
             shown_words: 0,
             stable_prefix: Vec::new(),
-            replaying: false,
-            catching_up: false,
+            replay: None,
             partials,
+            degraded,
             trace: trace.clone(),
             stop: Arc::clone(&stop),
         }));
@@ -352,17 +422,20 @@ impl<C: StreamClient> StreamPump<C> {
                         std::thread::park_timeout(TICK);
                     }
                 })
-                .ok()
+                .map_err(|err| format!("the stream worker could not start: {err}"))?
         };
-        (
+        Ok((
             StreamPump {
                 core,
                 stop,
-                thread,
+                thread: Some(thread),
                 trace,
             },
-            receiver,
-        )
+            Live {
+                previews,
+                degradation,
+            },
+        ))
     }
 
     /// Stops the worker after its current step and hands the take back.
@@ -423,29 +496,48 @@ impl StarlingApp {
         };
         let stream = LiveStream::start(endpoint, &options)?;
         let endpoint = endpoint.to_string();
-        let (pump, mut previews) = StreamPump::start(
+        let (pump, live) = StreamPump::start(
             Box::new(handle.tap()),
             handle.sample_rate(),
             stream,
             Box::new(move || LiveStream::start(&endpoint, &options)),
             trace.clone(),
-        );
+        )?;
+        let Live {
+            mut previews,
+            mut degradation,
+        } = live;
         self.stream_generation = self.stream_generation.wrapping_add(1);
         let generation = self.stream_generation;
         self.stream_pump = Some(pump);
         self.stream_trace = trace;
         // A foreground task, not a render callback: it runs while the
         // main window is minimized or covered. It ends when the worker
-        // does (the sender drops with it).
+        // does (the senders drop with it).
         cx.spawn(async move |this, cx| {
-            while previews.changed().await.is_ok() {
-                let Some(partial) = previews.borrow_and_update().clone() else {
-                    continue;
+            loop {
+                let applied = tokio::select! {
+                    biased;
+                    changed = previews.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                        let Some(partial) = previews.borrow_and_update().clone() else {
+                            continue;
+                        };
+                        this.update(cx, |app, cx| app.show_stream_partial(generation, partial, cx))
+                    }
+                    changed = degradation.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                        let Some(reason) = degradation.borrow_and_update().clone() else {
+                            continue;
+                        };
+                        this.update(cx, |app, cx| app.stream_degraded(generation, reason, cx))
+                    }
                 };
-                let shown = this.update(cx, |app, cx| {
-                    app.show_stream_partial(generation, partial, cx);
-                });
-                if shown.is_err() {
+                if applied.is_err() {
                     break;
                 }
             }
@@ -473,6 +565,15 @@ impl StarlingApp {
         }
     }
 
+    /// Live text stopped for the rest of the running take: say why now.
+    fn stream_degraded(&mut self, generation: u64, reason: String, cx: &mut Context<Self>) {
+        if generation != self.stream_generation || self.stream_pump.is_none() {
+            return;
+        }
+        self.stream_degradation = Some(reason);
+        cx.notify();
+    }
+
     /// Stops the take's worker and hands its audio and connection to the
     /// stop path; empty when the take had no stream.
     pub(crate) fn finish_stream_pump(&mut self) -> Handoff<LiveStream> {
@@ -489,15 +590,22 @@ impl StarlingApp {
 /// lines are appended to. One JSON object per line, tagged with the take
 /// and `ms` since it started: `start` (with the wall clock), every server frame (`partial`
 /// with the server's `covered_s`/`audio_s`, `final` with its stop path),
-/// every preview the UI applied (`display`), `stream_failed`, `reconnect`
-/// and `stop`. Partial age at display is `display.ms - 1000 * covered_s`,
-/// measured from the take's start rather than the microphone's.
+/// every preview the UI applied (`display`), `stream_failed`, `reconnect`,
+/// `replay_released` and `stop`. Partial age at display is
+/// `display.ms - 1000 * covered_s`, measured from the take's start rather
+/// than the microphone's.
+///
+/// Lines are written by the take's own writer thread: the UI thread and
+/// the stream's reader only queue them, so a slow or stalled sink cannot
+/// freeze the window. A full queue drops lines; the next line written
+/// carries how many (`dropped`).
 pub(crate) struct StreamTrace {
     /// Tags every line: a take's `final` can land after the next take
     /// started.
     take: String,
     started: Instant,
-    out: Mutex<Box<dyn Write + Send>>,
+    lines: SyncSender<String>,
+    dropped: AtomicU64,
 }
 
 impl StreamTrace {
@@ -522,27 +630,47 @@ impl StreamTrace {
         let unix_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |since| since.as_millis() as u64);
-        static TAKES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let trace = StreamTrace {
-            take: format!(
-                "{}-{}",
-                std::process::id(),
-                TAKES.fetch_add(1, Ordering::Relaxed)
-            ),
-            started: Instant::now(),
-            out: Mutex::new(out),
-        };
+        static TAKES: AtomicU64 = AtomicU64::new(0);
+        let take = format!(
+            "{}-{}",
+            std::process::id(),
+            TAKES.fetch_add(1, Ordering::Relaxed)
+        );
+        // No writer, no trace: saying so on stderr from the UI thread
+        // could wait behind an earlier take's stalled stderr writer.
+        let trace = StreamTrace::writing_to(take, out, TRACE_BACKLOG).ok()?;
         trace.log("start", json!({ "unix_ms": unix_ms }));
         Some(Arc::new(trace))
     }
 
+    /// A trace whose lines `out` receives on its own thread, at most
+    /// `backlog` of them waiting. The thread ends once the trace and its
+    /// queued lines are gone.
+    fn writing_to(
+        take: String,
+        mut out: Box<dyn Write + Send>,
+        backlog: usize,
+    ) -> std::io::Result<StreamTrace> {
+        let (lines, queued) = std::sync::mpsc::sync_channel::<String>(backlog);
+        std::thread::Builder::new()
+            .name("starling-stream-trace".into())
+            .spawn(move || {
+                for line in queued {
+                    let _ = out.write_all(line.as_bytes());
+                }
+            })?;
+        Ok(StreamTrace {
+            take,
+            started: Instant::now(),
+            lines,
+            dropped: AtomicU64::new(0),
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn discard() -> StreamTrace {
-        StreamTrace {
-            take: "test".into(),
-            started: Instant::now(),
-            out: Mutex::new(Box::new(std::io::sink())),
-        }
+        StreamTrace::writing_to("test".into(), Box::new(std::io::sink()), TRACE_BACKLOG)
+            .expect("a trace writer thread")
     }
 
     pub(crate) fn log(&self, event: &str, mut fields: Value) {
@@ -552,11 +680,22 @@ impl StreamTrace {
             map.insert("take".into(), self.take.clone().into());
             map.insert("ms".into(), ms.into());
         }
+        let dropped = self.dropped.swap(0, Ordering::Relaxed);
+        if dropped > 0
+            && let Value::Object(map) = &mut fields
+        {
+            map.insert("dropped".into(), dropped.into());
+        }
         // One write per line: every take appends to the same file through
         // its own handle, and a take's final can land during the next take.
         let line = format!("{fields}\n");
-        if let Ok(mut out) = self.out.lock() {
-            let _ = out.write_all(line.as_bytes());
+        match self.lines.try_send(line) {
+            Ok(()) => {}
+            // This line and the ones it was to report are lost.
+            Err(TrySendError::Full(_)) => {
+                self.dropped.fetch_add(dropped + 1, Ordering::Relaxed);
+            }
+            Err(TrySendError::Disconnected(_)) => {}
         }
     }
 
@@ -698,10 +837,14 @@ mod tests {
 
     impl FakeStream {
         fn preview(&self, text: &str, stable_words: usize) {
+            self.preview_covering(text, stable_words, None);
+        }
+
+        fn preview_covering(&self, text: &str, stable_words: usize, covered_s: Option<f64>) {
             self.0.lock().unwrap().previews.push_back(Ok(Partial {
                 text: text.into(),
                 stable_words,
-                covered_s: None,
+                covered_s,
             }));
         }
 
@@ -792,9 +935,9 @@ mod tests {
             degradation: None,
             shown_words: 0,
             stable_prefix: Vec::new(),
-            replaying: false,
-            catching_up: false,
+            replay: None,
             partials,
+            degraded: watch::channel(None).0,
             trace: None,
             stop: Arc::new(AtomicBool::new(false)),
         };
@@ -816,13 +959,15 @@ mod tests {
         // thread alone moves audio out and previews in.
         let tap = FakeTap::default();
         let stream = FakeStream::default();
-        let (pump, mut previews) = StreamPump::start(
+        let (pump, live) = StreamPump::start(
             Box::new(tap.clone()),
             16_000,
             stream.clone(),
             Box::new(|| Err("unused".into())),
             None,
-        );
+        )
+        .expect("the worker starts");
+        let mut previews = live.previews;
         let audio = speech(0, 40_000);
         tap.capture(&audio);
         tap.acknowledge_all();
@@ -923,13 +1068,15 @@ mod tests {
         // check covers one still queued in the foreground task).
         let tap = FakeTap::default();
         let stream = FakeStream::default();
-        let (pump, mut previews) = StreamPump::start(
+        let (pump, live) = StreamPump::start(
             Box::new(tap.clone()),
             16_000,
             stream.clone(),
             Box::new(|| Err("unused".into())),
             None,
-        );
+        )
+        .expect("the worker starts");
+        let mut previews = live.previews;
         stream.preview("before stop", 0);
         let deadline = Instant::now() + Duration::from_secs(5);
         while !previews.has_changed().unwrap() && Instant::now() < deadline {
@@ -1016,10 +1163,182 @@ mod tests {
         second.preview("one two three four five six", 2);
         core.step(start + RECONNECT_DELAY);
         assert_eq!(shown(&mut previews).as_deref(), Some("one two three four five six"));
-        assert!(!core.replaying);
+        assert!(core.replay.is_none());
         let handoff = core.handoff();
         assert_eq!(handoff.sent, audio.len());
         assert!(handoff.stream.is_some() && handoff.degradation.is_none());
+    }
+
+    /// A core whose first session showed `one two three four` (two of them
+    /// final) from 20 000 samples, then dropped; the second session has
+    /// the replay. Returns the time of the reconnect.
+    fn reconnected(
+        tap: &FakeTap,
+        first: &FakeStream,
+        second: &FakeStream,
+    ) -> (PumpCore<FakeStream>, watch::Receiver<Option<Partial>>, Instant) {
+        let (mut core, mut previews) = core(tap, first, vec![second.clone()]);
+        let start = Instant::now();
+        tap.capture(&speech(0, 20_000));
+        tap.acknowledge_all();
+        first.preview("one two three four", 2);
+        core.step(start);
+        assert_eq!(shown(&mut previews).as_deref(), Some("one two three four"));
+        first.0.lock().unwrap().closed = true;
+        tap.capture(&speech(20_000, 12_000));
+        tap.acknowledge_all();
+        core.step(start);
+        let reconnect = start + RECONNECT_DELAY;
+        core.step(reconnect);
+        assert!(core.replay.is_some());
+        (core, previews, reconnect)
+    }
+
+    #[test]
+    fn a_replay_that_keeps_contradicting_the_final_words_is_shown_again() {
+        let tap = FakeTap::default();
+        let (first, second) = (FakeStream::default(), FakeStream::default());
+        let (mut core, mut previews, at) = reconnected(&tap, &first, &second);
+        // Lagging previews do not count against the session.
+        for _ in 0..REPLAY_DISAGREEMENTS {
+            second.preview("one", 0);
+            core.step(at);
+            assert_eq!(shown(&mut previews), None);
+        }
+        for _ in 1..REPLAY_DISAGREEMENTS {
+            second.preview("won two three four five", 0);
+            core.step(at);
+            assert_eq!(shown(&mut previews), None);
+        }
+        // The new session hears "one" as "won" every time: rather than no
+        // live text for the rest of the take, its previews show again (the
+        // draft's segmenter keeps its final words and flags the change).
+        second.preview("won two three four five six", 0);
+        core.step(at);
+        assert_eq!(shown(&mut previews).as_deref(), Some("won two three four five six"));
+        assert!(core.replay.is_none());
+        second.preview("won two three", 0);
+        core.step(at);
+        assert_eq!(shown(&mut previews).as_deref(), Some("won two three"));
+    }
+
+    #[test]
+    fn a_replay_that_has_heard_the_old_sessions_audio_is_shown_again() {
+        let tap = FakeTap::default();
+        let (first, second) = (FakeStream::default(), FakeStream::default());
+        let (mut core, mut previews, at) = reconnected(&tap, &first, &second);
+        // The first session had 20 000 samples (1.25 s) when it dropped.
+        second.preview_covering("one two", 0, Some(1.0));
+        core.step(at);
+        assert_eq!(shown(&mut previews), None, "still replaying");
+        // Having heard all of it, a shorter text is the new session's own
+        // reading, not lag.
+        second.preview_covering("one two three", 1, Some(1.25));
+        core.step(at);
+        assert_eq!(shown(&mut previews).as_deref(), Some("one two three"));
+        assert!(core.replay.is_none());
+    }
+
+    #[test]
+    fn a_replay_that_never_catches_up_is_shown_again_after_its_deadline() {
+        let tap = FakeTap::default();
+        let (first, second) = (FakeStream::default(), FakeStream::default());
+        let (mut core, mut previews, at) = reconnected(&tap, &first, &second);
+        // The take was 2 s long at the reconnect.
+        let deadline = at + Duration::from_secs(2) + REPLAY_GRACE;
+        second.preview("one", 0);
+        core.step(deadline - TICK);
+        assert_eq!(shown(&mut previews), None);
+        second.preview("one two", 0);
+        core.step(deadline);
+        assert_eq!(shown(&mut previews).as_deref(), Some("one two"));
+        assert!(core.replay.is_none());
+    }
+
+    #[test]
+    fn a_stalled_trace_sink_drops_lines_instead_of_blocking() {
+        /// A sink that blocks every write until the gate opens, and keeps
+        /// what it was given.
+        struct Gated(Arc<(Mutex<bool>, std::sync::Condvar)>, Arc<Mutex<Vec<u8>>>);
+        impl Write for Gated {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                let (open, opened) = &*self.0;
+                let mut open = open.lock().unwrap();
+                while !*open {
+                    open = opened.wait(open).unwrap();
+                }
+                self.1.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        /// Opens the gate when dropped, so a failing assertion cannot
+        /// leave the writer blocked.
+        struct Opens(Arc<(Mutex<bool>, std::sync::Condvar)>);
+        impl Drop for Opens {
+            fn drop(&mut self) {
+                *self.0.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+                self.0.1.notify_all();
+            }
+        }
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let opens = Opens(Arc::clone(&gate));
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let trace = Arc::new(
+            StreamTrace::writing_to(
+                "test".into(),
+                Box::new(Gated(Arc::clone(&gate), Arc::clone(&written))),
+                4,
+            )
+            .unwrap(),
+        );
+        // With the sink stalled, 100 lines are logged without waiting on
+        // it (a blocking log would never finish while the gate is shut).
+        let (done, finished) = std::sync::mpsc::channel();
+        {
+            let trace = Arc::clone(&trace);
+            std::thread::spawn(move || {
+                for line in 0..100 {
+                    trace.log("display", json!({ "line": line }));
+                }
+                let _ = done.send(());
+            });
+        }
+        assert!(
+            finished.recv_timeout(Duration::from_secs(10)).is_ok(),
+            "logging waited on the sink"
+        );
+        drop(opens);
+        // The queue may still be full for a moment: a stop that is dropped
+        // too is counted on the next one.
+        let mut logged = 100;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            trace.log("stop", json!({}));
+            logged += 1;
+            if trace.dropped.load(Ordering::Relaxed) == 0 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the writer never drained");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        drop(trace);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !String::from_utf8_lossy(&written.lock().unwrap()).contains("\"stop\"")
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let text = String::from_utf8(written.lock().unwrap().clone()).unwrap();
+        let lines: Vec<Value> = text.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+        let stop = lines.last().unwrap();
+        assert_eq!(stop["ev"], "stop");
+        // Every line is either written or counted on a later one.
+        let dropped: u64 = lines.iter().filter_map(|line| line["dropped"].as_u64()).sum();
+        assert!(dropped > 0);
+        assert_eq!(lines.len() as u64 + dropped, logged);
     }
 
     #[test]
@@ -1027,6 +1346,7 @@ mod tests {
         let tap = FakeTap::default();
         let stream = FakeStream::default();
         let (mut core, _) = core(&tap, &stream, Vec::new());
+        let mut degradation = core.degraded.subscribe();
         let start = Instant::now();
         tap.capture(&speech(0, 8_000));
         tap.acknowledge_all();
@@ -1034,9 +1354,13 @@ mod tests {
         core.step(start);
         // Every reopen is refused; after the last one live text gives up.
         for attempt in 1..=RECONNECTS {
+            assert!(!degradation.has_changed().unwrap(), "a reconnect is still pending");
             core.step(start + RECONNECT_DELAY * attempt);
         }
         assert!(core.retry_at.is_none());
+        // The UI hears it while the take still records.
+        assert!(degradation.has_changed().unwrap());
+        assert!(degradation.borrow_and_update().as_deref().unwrap().contains("refused"));
         let handoff = core.handoff();
         assert!(handoff.stream.is_none());
         assert_eq!(handoff.samples.len(), 8_000, "the drained audio stays");
