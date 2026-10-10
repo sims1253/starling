@@ -128,7 +128,6 @@ enum Msg {
     },
     Shutdown,
     /// Answered once every earlier message is handled.
-    #[cfg(test)]
     Flush(Sender<()>),
 }
 
@@ -199,14 +198,19 @@ impl PlaybackHandle {
         self.shared.state().notices.drain(..).collect()
     }
 
+    /// Answers once every request sent before it was handled, including
+    /// an `end`'s restore (retries and all): the start/stop cues (#221)
+    /// wait on it so they are not played into a lowered or muted output.
+    /// Disconnects without an answer once the service has shut down.
+    pub fn settled(&self) -> Receiver<()> {
+        let (tx, rx) = mpsc::channel();
+        let _ = self.shared.tx.send(Msg::Flush(tx));
+        rx
+    }
+
     #[cfg(test)]
     fn flush(&self) {
-        let (tx, rx) = mpsc::channel();
-        self.shared
-            .tx
-            .send(Msg::Flush(tx))
-            .expect("service running");
-        rx.recv().expect("service flushed");
+        self.settled().recv().expect("service flushed");
     }
 }
 
@@ -398,7 +402,6 @@ impl Worker {
                 Msg::Begin { epoch, settings } => self.begin(epoch, settings),
                 Msg::End { epoch } => self.end(epoch),
                 Msg::Shutdown => break,
-                #[cfg(test)]
                 Msg::Flush(done) => {
                     let _ = done.send(());
                 }

@@ -158,6 +158,20 @@ impl Player {
         Ok(())
     }
 
+    /// Plays a short sound (a start/stop cue, #221) at `volume` (1.0 is the
+    /// file's own level) on its own detached sink, alongside whatever is
+    /// playing: the current playback is neither replaced nor tracked.
+    pub fn play_cue(&self, wav: &[u8], volume: f32) -> Result<(), PlayerError> {
+        let source = rodio::Decoder::new(Cursor::new(wav.to_vec()))
+            .map_err(|err| PlayerError(format!("Could not decode WAV: {err}")))?;
+        let sink = rodio::Sink::try_new(&self.inner.handle)
+            .map_err(|err| PlayerError(format!("Could not start playback: {err}")))?;
+        sink.set_volume(volume);
+        sink.append(source);
+        sink.detach();
+        Ok(())
+    }
+
     /// Stops the current playback, if any. Safe to call when idle.
     pub fn stop(&self) {
         self.inner.state.epoch.fetch_add(1, Ordering::Relaxed);

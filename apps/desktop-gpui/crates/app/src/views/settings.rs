@@ -39,6 +39,7 @@ pub fn render_settings_modal(
     let microphone_section = crate::views::microphone::render_microphone_section(app, cx);
     let dictation_section = render_dictation_section(app, cx);
     let playback_section = render_playback_section(app, cx);
+    let feedback_section = crate::views::feedback::render_feedback_section(app, cx);
 
     let card = div()
         .id("settings-card")
@@ -170,6 +171,7 @@ pub fn render_settings_modal(
         .child(dictation_section)
         .child(microphone_section)
         .child(playback_section)
+        .child(feedback_section)
         .child(processing_section)
         .child(
             div()
@@ -1265,7 +1267,7 @@ fn render_playback_section(app: &mut StarlingApp, cx: &mut Context<StarlingApp>)
 /// One selectable row: a radio dot, a name, and a description. A
 /// disabled row carries no pointer or hover affordance — there is
 /// nothing to click.
-fn choice_row(
+pub(super) fn choice_row(
     id: SharedString,
     selected: bool,
     name: &'static str,
@@ -1300,7 +1302,10 @@ fn choice_row(
                 .when(selected, |dot| dot.bg(theme::SETTINGS_INK)),
         )
         .child(
+            // Shrinks to the row so a long description wraps.
             div()
+                .flex_1()
+                .min_w_0()
                 .flex()
                 .flex_col()
                 .gap(px(3.))
@@ -1320,9 +1325,10 @@ fn choice_row(
         )
 }
 
-fn helper(text: &'static str) -> Div {
+pub(super) fn helper(text: &'static str) -> Div {
     div()
         .mt(px(2.))
+        .text_size(px(10.))
         .font_weight(FontWeight::NORMAL)
         .line_height(px(10. * 1.5))
         .text_color(theme::SETTINGS_HELPER)

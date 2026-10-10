@@ -98,6 +98,10 @@ pub struct Settings {
     /// its defaults (off) and never the rest of the file.
     #[serde(default, deserialize_with = "lenient_playback")]
     pub playback: PlaybackSettings,
+    /// The dictation overlay and start/stop cues (#221). An unreadable
+    /// subsection loads its defaults and never the rest of the file.
+    #[serde(default, deserialize_with = "lenient_feedback")]
+    pub feedback: FeedbackSettings,
 }
 
 /// Which microphone takes record from. Only the user changes this: a take
@@ -205,6 +209,53 @@ impl PlaybackSettings {
     pub fn effective_lower_percent(&self) -> u32 {
         self.lower_level_percent.min(100).into()
     }
+}
+
+/// Which dictation overlay shows while a take runs (#221). An unknown
+/// value (a file from a newer build) loads as `Minimal`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum OverlayMode {
+    /// No overlay window; the main window still shows the take.
+    Hidden,
+    /// The status strip plus the live transcript, read-only.
+    LiveText,
+    /// A small status strip: phase, input level, microphone, Cancel.
+    #[default]
+    #[serde(other)]
+    Minimal,
+}
+
+/// The feedback subsection of the settings file: the overlay and the
+/// optional start/stop cues (off unless chosen).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct FeedbackSettings {
+    pub overlay: OverlayMode,
+    pub cues: bool,
+    #[serde(deserialize_with = "clamped_percent")]
+    pub cue_volume_percent: u8,
+}
+
+impl Default for FeedbackSettings {
+    fn default() -> Self {
+        Self {
+            overlay: OverlayMode::default(),
+            cues: false,
+            cue_volume_percent: 60,
+        }
+    }
+}
+
+fn lenient_feedback<'de, D>(deserializer: D) -> Result<FeedbackSettings, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = <serde_json::Value as serde::Deserialize>::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).unwrap_or_else(|err| {
+        eprintln!("Unreadable feedback settings; using the defaults: {err}");
+        FeedbackSettings::default()
+    }))
 }
 
 impl Default for DictationSettings {
@@ -338,6 +389,7 @@ impl Settings {
             dictation: DictationSettings::default(),
             microphone: MicrophoneSettings::default(),
             playback: PlaybackSettings::default(),
+            feedback: FeedbackSettings::default(),
         }
     }
 
@@ -622,6 +674,11 @@ mod tests {
                 preferred_device: Some("USB Mic".to_string()),
             },
             playback: PlaybackSettings::default(),
+            feedback: FeedbackSettings {
+                overlay: OverlayMode::LiveText,
+                cues: true,
+                cue_volume_percent: 35,
+            },
         };
 
         settings.save(&path).expect("save");
@@ -644,6 +701,8 @@ mod tests {
         assert_eq!(value["engine"]["activeModel"], "parakeet-v3-q8");
         assert_eq!(value["engine"]["backendOverride"], "cpu");
         assert_eq!(value["microphone"]["preferredDevice"], "USB Mic");
+        assert_eq!(value["feedback"]["overlay"], "liveText");
+        assert_eq!(value["feedback"]["cueVolumePercent"], 35);
     }
 
     #[test]
@@ -1048,6 +1107,34 @@ mod tests {
         let raw = std::fs::read_to_string(&path).expect("read");
         assert!(raw.contains("\"duringRecording\": \"lower\""), "{raw}");
         assert_eq!(Settings::load(&path), settings);
+    }
+
+    #[test]
+    fn feedback_settings_load_leniently() {
+        let load = |feedback: &str| {
+            Settings::from_json_bytes(
+                format!(r#"{{"endpoint":"http://10.0.0.5:8181","model":"m","expectedTerms":[]{feedback}}}"#)
+                    .as_bytes(),
+            )
+            .expect("settings parse")
+        };
+        let defaults = load("").feedback;
+        assert_eq!(defaults, FeedbackSettings::default());
+        assert_eq!(defaults.overlay, OverlayMode::Minimal);
+        assert!(!defaults.cues, "cues are opt-in");
+
+        let chosen = load(r#","feedback":{"overlay":"hidden","cues":true,"cueVolumePercent":140}"#);
+        assert_eq!(chosen.feedback.overlay, OverlayMode::Hidden);
+        assert!(chosen.feedback.cues);
+        assert_eq!(chosen.feedback.cue_volume_percent, 100);
+        let unknown = load(r#","feedback":{"overlay":"bubble"}"#);
+        assert_eq!(unknown.feedback.overlay, OverlayMode::Minimal);
+
+        for feedback in [r#","feedback":null"#, r#","feedback":{"cues":"yes"}"#] {
+            let loaded = load(feedback);
+            assert_eq!(loaded.feedback, FeedbackSettings::default(), "{feedback}");
+            assert_eq!(loaded.endpoint, "http://10.0.0.5:8181", "{feedback}");
+        }
     }
 
     #[test]

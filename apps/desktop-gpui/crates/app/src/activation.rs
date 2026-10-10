@@ -754,6 +754,7 @@ impl StarlingApp {
         self.flush_system_events(cx);
         self.activation_input(|machine| machine.tick(Instant::now()), cx);
         self.poll_microphone(cx);
+        self.sync_overlay(cx);
         if self.activation.is_active()
             || self.activation.key_is_down()
             || self.mic_check_recording()
@@ -804,6 +805,8 @@ impl StarlingApp {
                 Effect::Start(take) => {
                     if self.start_recording(cx) {
                         self.recording_take = Some(take);
+                        self.overlay.model.take_started(Instant::now());
+                        self.cue_take_started();
                     } else {
                         self.activation.start_failed(take);
                     }
@@ -819,15 +822,23 @@ impl StarlingApp {
                         } else {
                             self.stop_recording(take, cx);
                         }
+                        // A stop that did not lead to a save (the device
+                        // failed, the stop itself failed) ends like a cancel.
+                        if !self.overlay.model.is_saving() {
+                            self.overlay.model.take_cancelled(Instant::now());
+                        }
+                        self.cue_take_ended(take, cx);
                     }
                 }
                 Effect::Cancel(take, reason) => {
                     if self.recording_take == Some(take) {
                         self.recording_take = None;
                         self.cancel_recording(take, reason, cx);
+                        self.overlay.model.take_cancelled(Instant::now());
+                        self.cue_take_ended(take, cx);
                     }
                 }
-                Effect::Listening(_) => {}
+                Effect::Listening(take) => self.cue_listening(take, cx),
             }
         }
         // Escape cleanup is queued first, so a deferred swap below never
@@ -851,6 +862,7 @@ impl StarlingApp {
                 }
             }
         }
+        self.sync_overlay(cx);
         cx.notify();
     }
 

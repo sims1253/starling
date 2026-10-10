@@ -433,6 +433,7 @@ impl StarlingApp {
                     // The journal itself becomes the stored audio (adopted
                     // by the facade).
                     let journal_report = take.journal.clone();
+                    self.overlay.model.take_finished(stopped_at);
                     cx.notify();
                     cx.spawn(async move |this, cx| {
                         let encoded = cx
@@ -482,6 +483,7 @@ impl StarlingApp {
                             }
                             (Err(err), _) => {
                                 this.update(cx, |app, cx| {
+                                    app.overlay.model.save_failed(stopped_at, Instant::now());
                                     app.error = Some(err.to_string());
                                     if let Some(token) = staging {
                                         app.staging_save_failed(token, cx);
@@ -562,8 +564,14 @@ impl StarlingApp {
     pub(crate) fn start_recording(&mut self, cx: &mut Context<Self>) -> bool {
         self.error = None;
         self.take_notice = None;
-        // Attenuation begins with the attempt, before the microphone opens.
-        let playback_lease = self.playback.handle().begin(&self.playback_settings);
+        // Attenuation begins with the attempt, before the microphone opens
+        // — unless a start cue is due, which it would swallow: then it
+        // begins once the cue has played (`cues.rs`).
+        let playback_lease = (!crate::cues::attenuation_waits_for_cue(
+            &self.feedback,
+            self.playback_settings.during_recording,
+        ))
+        .then(|| self.playback.handle().begin(&self.playback_settings));
         {
             // I1 phase 2: production captures journal to the durable
             // per-take file; only fsynced-boundary samples are
@@ -616,7 +624,7 @@ impl StarlingApp {
                     }
                     self.active_take = Some(target);
                     self.recorder = Some(handle);
-                    self.playback_lease = Some(playback_lease);
+                    self.playback_lease = playback_lease;
                     self.elapsed_ms = 0.0;
                     self.levels = vec![0.06; 52];
                     self.capture_warning = None;
@@ -624,7 +632,9 @@ impl StarlingApp {
                     true
                 }
                 Err(err) => {
-                    self.playback.handle().end(playback_lease);
+                    if let Some(lease) = playback_lease {
+                        self.playback.handle().end(lease);
+                    }
                     let text = format!("{} {}", err.problem.message(), err.problem.recovery());
                     self.report_input_problem(err.problem, text);
                     cx.notify();
@@ -908,6 +918,9 @@ impl StarlingApp {
             if let Some(token) = staging {
                 self.staging_save_failed(token, cx);
             }
+            if let Some(stopped_at) = stopped_at {
+                self.overlay.model.save_failed(stopped_at, Instant::now());
+            }
             cx.notify();
             return;
         };
@@ -929,6 +942,7 @@ impl StarlingApp {
                         // caller's WAV otherwise.
                         if let Some(stopped_at) = stopped_at {
                             app.stop_instants.insert(saved.id.clone(), stopped_at);
+                            app.overlay.model.take_saved(stopped_at, &saved.id);
                         }
                         if let Some(token) = staging {
                             app.bind_staging(token, &saved.id);
@@ -944,6 +958,9 @@ impl StarlingApp {
                         ));
                         if let Some(token) = staging {
                             app.staging_save_failed(token, cx);
+                        }
+                        if let Some(stopped_at) = stopped_at {
+                            app.overlay.model.save_failed(stopped_at, Instant::now());
                         }
                         cx.notify();
                     })
