@@ -90,13 +90,14 @@ impl TransportErrorCode {
 ///   [`Frame::AgentHello`], [`Frame::AskUser`], [`Frame::AskCancel`],
 ///   [`Frame::PromptAck`], [`Frame::PromptDone`], [`Frame::TakeWatch`],
 ///   [`Frame::TakeTap`], [`Frame::TakeAdopt`],
-///   [`Frame::Transcribe`], [`Frame::TranscribeDue`]
+///   [`Frame::Transcribe`], [`Frame::TranscribeDue`], [`Frame::Store`]
 /// - host → client: [`Frame::Hello`], [`Frame::Receipt`], [`Frame::Event`],
 ///   [`Frame::Snapshot`], [`Frame::TransportError`], [`Frame::Bye`],
 ///   [`Frame::AgentWelcome`], [`Frame::AskResult`], [`Frame::ShowPrompt`],
 ///   [`Frame::HidePrompt`], [`Frame::TakeWatching`], [`Frame::LiveTake`],
 ///   [`Frame::TakeStartFailed`], [`Frame::TakePersisted`],
-///   [`Frame::HostNotice`], [`Frame::LiveText`], [`Frame::Transcription`]
+///   [`Frame::HostNotice`], [`Frame::LiveText`], [`Frame::Transcription`],
+///   [`Frame::Stored`], [`Frame::Upkeep`]
 ///
 /// The take frames (#220) are host-level like the ask frames: the app's
 /// projection of the take the host records (see [`crate::takes`]).
@@ -295,6 +296,22 @@ pub enum Frame {
         state: TranscriptionState,
         yours: bool,
     },
+    /// The app asking the host's store (#220): its history, a take's
+    /// audio, imports, processing documents (see [`crate::history`]).
+    /// Answered by [`Frame::Stored`] under the same `req`.
+    Store {
+        req: String,
+        request: crate::history::StoreRequest,
+    },
+    /// The answer to [`Frame::Store`] `req`.
+    Stored {
+        req: String,
+        reply: crate::history::StoreReply,
+    },
+    /// What a pass of the host's history audio upkeep did, for watching
+    /// apps' storage settings; `retired`: audio was removed, so the
+    /// history list changed.
+    Upkeep { report: String, retired: bool },
 }
 
 /// Why a `capture.start` was refused while another take holds the
@@ -704,6 +721,24 @@ mod tests {
             },
             Frame::TranscribeDue {
                 stored_id: "j_1".into(),
+            },
+            Frame::Store {
+                req: "s_1".into(),
+                request: crate::history::StoreRequest::Audio {
+                    id: "j_1".into(),
+                    format: crate::history::AudioFormat::Flac,
+                },
+            },
+            Frame::Stored {
+                req: "s_1".into(),
+                reply: crate::history::StoreReply::Bytes {
+                    blob: "blob_1".into(),
+                    bytes: 42,
+                },
+            },
+            Frame::Upkeep {
+                report: "Compressed 1 recording losslessly (saved 1 MB).".into(),
+                retired: false,
             },
             Frame::LiveText {
                 take: "take-1".into(),

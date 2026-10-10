@@ -43,7 +43,6 @@ impl StarlingApp {
         let Some(live) = self.recorder.take() else {
             return;
         };
-        self.audio_upkeep.set_recording(false);
         self.live_partial.clear();
         // Storage-fault honesty (I1 phase 2): a journal fault that froze
         // acknowledgment is surfaced.
@@ -130,7 +129,6 @@ impl StarlingApp {
         // when there is no live text for it.
         self.stream_degradation = None;
         self.recorder = Some(crate::host_link::LiveCapture::new(take.clone()));
-        self.audio_upkeep.set_recording(true);
         self.playback_lease = playback_lease;
         self.elapsed_ms = 0.0;
         self.levels = vec![0.06; 52];
@@ -173,7 +171,6 @@ impl StarlingApp {
         let Some(live) = self.recorder.take() else {
             return;
         };
-        self.audio_upkeep.set_recording(false);
         self.live_partial.clear();
         self.stream_degradation = None;
         self.levels = vec![0.06; 52];
@@ -1702,6 +1699,57 @@ mod tests {
         assert_eq!(*served.lock().unwrap(), 1, "transcribed once");
         drop(first);
         drop(second);
+        host.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #220 step C: the window's history goes through the host — an
+    /// import stored and transcribed there, the list, archiving, the
+    /// audio export reads and a delete — and comes back after the host
+    /// restarts. The window opens no store of its own.
+    #[gpui::test]
+    fn history_imports_and_deletes_go_through_the_host(cx: &mut gpui::TestAppContext) {
+        let root = scratch("host-history");
+        let fixtures = Store::at_test_root(&root);
+        let (server, served) = fake_server(vec![Reply::Text("imported words")]);
+        let mut host = host_at(&root, Vec::new(), std::time::Duration::from_secs(20), server);
+        let app = app_on_host(cx, &fixtures, &host, server);
+        app.update(cx, |app, cx| app.save_import(one_second_wav(), cx));
+        settle(cx, "the import transcribed", |cx| {
+            app.read_with(cx, |app, _| {
+                app.sessions.iter().any(|session| {
+                    session.transcript.as_ref().map(|t| t.text.as_str()) == Some("imported words")
+                }) && app.host.awaiting.is_empty()
+            })
+        });
+        assert_eq!(*served.lock().unwrap(), 1, "the host transcribed it once");
+        let id = app.read_with(cx, |app, _| app.selected_id.clone()).expect("selected");
+
+        app.update(cx, |app, cx| app.toggle_archival_selected(cx));
+        settle(cx, "the take archived", |cx| {
+            app.read_with(cx, |app, _| app.selected().is_some_and(|take| take.archival))
+        });
+        let store = app.read_with(cx, |app, _| app.store.clone()).expect("the host's store");
+        let wav = store.audio_wav(&id).expect("wav").expect("present");
+        assert_eq!(*wav, *one_second_wav());
+        assert!(store.audio_flac(&id).unwrap().unwrap().starts_with(b"fLaC"));
+
+        // A host restart: the history comes back with the connection.
+        host.shutdown();
+        let mut host = host_at(&root, Vec::new(), std::time::Duration::from_secs(20), server);
+        settle(cx, "the reconnect", |cx| app.read_with(cx, |app, _| app.host.client.is_some()));
+        app.update(cx, |app, _| app.sessions.clear());
+        app.update(cx, |app, cx| app.refresh_history(cx));
+        settle(cx, "the history again", |cx| {
+            app.read_with(cx, |app, _| app.sessions.iter().any(|session| session.id == id))
+        });
+
+        assert!(app.update(cx, |app, cx| app.remove_session(id.clone(), cx)));
+        settle(cx, "the take deleted", |cx| {
+            app.read_with(cx, |app, _| app.sessions.iter().all(|session| session.id != id))
+        });
+        assert!(fixtures.list().unwrap().is_empty(), "deleted in the store");
+        drop(app);
         host.shutdown();
         let _ = std::fs::remove_dir_all(&root);
     }

@@ -379,6 +379,26 @@ impl TakeHub {
         }
     }
 
+    /// Whether a take opens the microphone, records, or is still being
+    /// stored: the history audio upkeep waits (#342).
+    pub(crate) fn records(&self) -> bool {
+        let state = lock_registry(&self.state);
+        state.acquiring.is_some() || state.live.is_some() || !state.persisting.is_empty()
+    }
+
+    /// What a pass of the history audio upkeep did, for every watching
+    /// app's storage settings (dropped for one whose queue is full: the
+    /// latest report is also asked for on connect).
+    pub(crate) fn upkeep(&self, report: &str, retired: bool) {
+        let state = lock_registry(&self.state);
+        for watcher in &state.watchers {
+            let _ = watcher.conn.try_deliver(Frame::Upkeep {
+                report: report.to_string(),
+                retired,
+            });
+        }
+    }
+
     /// Whether a take records or is still being stored.
     pub fn busy(&self) -> bool {
         let state = lock_registry(&self.state);

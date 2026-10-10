@@ -37,6 +37,8 @@
 //!   envelope like the ask frames.
 //! - [`transcribe`] — transcription in the host: live text while a take
 //!   records, its transcript once stored, and retries apps ask for.
+//! - [`history`] — the app's history: every store read and write the app
+//!   makes, as requests this host answers, and the history audio upkeep.
 //! - [`capture`] — the production capture source (the desktop settings'
 //!   microphone, journaled, disk-watched).
 //! - [`recovery`] — owner-side startup recovery beyond reconcile (stale
@@ -77,14 +79,15 @@
 //! host transcribes the takes it stores ([`transcribe`]): live text while
 //! a take records, the transcript once it is stored, retries the app asks
 //! for; the app renders them and delivers its own take's text, which
-//! needs its window. The app still reads history, writes imports and
-//! processing results through its own store handle — a store client, the
-//! multi-process shape storage v2 is built for — and runs the engine
+//! needs its window. The app's history — the list, audio for playback
+//! and export, imports, deletes, retention classes, retry holds,
+//! processing documents and correction records — is a set of requests
+//! this host answers ([`history`]); the app opens no store. History audio
+//! upkeep runs here on the host's schedule. The app still runs the engine
 //! manager its settings drive; this host attaches to the same engine
-//! (see [`engine`]). Moving the remaining store work and the engine
-//! manager into the host are the next increments. The Electron comparison
-//! app the design names as a second client has been removed from the
-//! tree.
+//! (see [`engine`]). Moving the engine manager into the host is a later
+//! increment. The Electron comparison app the design names as a second
+//! client has been removed from the tree.
 
 pub mod agent;
 pub mod auth;
@@ -94,6 +97,7 @@ pub mod client;
 pub mod config;
 pub mod engine;
 pub mod frame;
+pub mod history;
 pub mod limits;
 pub mod live;
 pub mod mcp;

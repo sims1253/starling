@@ -547,7 +547,8 @@ pub struct DocumentRow {
 ///   the proposal (nor the raw).
 ///
 /// A proposal the user never decides on records nothing.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CorrectionDecision {
     Accepted,
     Rejected,
@@ -583,7 +584,7 @@ impl CorrectionDecision {
 /// row per take per processing request; a revised decision updates it
 /// ([`StoreV2::upsert_correction_record`]). Rows cascade with their
 /// capture.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CorrectionRecord {
     pub capture_id: String,
     /// The processing request whose proposal this row is about.

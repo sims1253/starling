@@ -181,9 +181,12 @@ impl StarlingApp {
             Ok(endpoint) => endpoint,
             Err(err) => {
                 self.host.down = Some(err.clone());
+                self.store_error = Some(format!(
+                    "Starling's recording service has no place to run ({err})."
+                ));
                 self.error = Some(format!(
-                    "Starling's recording service has no place to run ({err}); recording is \
-                     unavailable."
+                    "Starling's recording service has no place to run ({err}); recording and \
+                     history are unavailable."
                 ));
                 return;
             }
@@ -203,6 +206,8 @@ impl StarlingApp {
         cx: &mut Context<Self>,
     ) {
         let (link, mut updates) = HostLink::start(endpoint, launch);
+        // The store is the host's, through this link's connection.
+        self.store = Some(crate::store::Store::through(link.connection()));
         self.host.link = Some(link);
         self.host.down = Some("connecting".to_string());
         cx.spawn(async move |this, cx| {
@@ -263,6 +268,7 @@ impl StarlingApp {
                     crate::upload::add_recovery_messages(self, recovery.problems, recovery.notice);
                 }
                 self.refresh_history(cx);
+                self.ask_upkeep(false, cx);
             }
             HostUpdate::Disconnected {
                 reason,
@@ -462,7 +468,6 @@ impl StarlingApp {
         if let Some(lease) = self.playback_lease.take() {
             self.playback.handle().end(lease);
         }
-        self.audio_upkeep.set_recording(false);
         self.live_partial.clear();
         self.levels = vec![0.06; 52];
         self.delivery_take_stopped();
@@ -569,6 +574,7 @@ impl StarlingApp {
                 crate::upload::add_recovery_messages(self, recovery.problems, recovery.notice);
                 self.refresh_history(cx);
             }
+            TakeUpdate::Upkeep { report, retired } => self.upkeep_reported(report, retired, cx),
             TakeUpdate::LiveText {
                 take,
                 partial,
@@ -717,7 +723,6 @@ impl StarlingApp {
         if let Some(lease) = self.playback_lease.take() {
             self.playback.handle().end(lease);
         }
-        self.audio_upkeep.set_recording(false);
         self.delivery_take_stopped();
         self.retire_staging(cx);
         if let Some(take) = self.recording_take.take() {
@@ -787,7 +792,6 @@ impl StarlingApp {
         };
         self.recorder = Some(LiveCapture::new(take));
         self.recording_take = Some(activation);
-        self.audio_upkeep.set_recording(true);
         self.live_partial.clear();
         self.stream_degradation = None;
         if self.staged_mode() {

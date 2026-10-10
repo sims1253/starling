@@ -380,6 +380,10 @@ pub struct HostShared {
     pub(crate) takes: Arc<crate::takes::TakeHub>,
     /// The host's transcriber, when it transcribes.
     transcriber: Option<crate::transcribe::TranscriberLink>,
+    /// The app's history (#220), and the queue its requests wait in;
+    /// `None` when the history store would not open.
+    history: Option<Arc<crate::history::History>>,
+    store_jobs: Option<std::sync::mpsc::SyncSender<crate::history::StoreJob>>,
     /// The lease-holding store: owner-side repairs run on it.
     lease: Arc<Mutex<StoreV2>>,
     agent_allowlist: Allowlist,
@@ -722,6 +726,28 @@ pub fn serve(config: HostConfig) -> Result<HostHandle, HostError> {
             }
         }
     };
+    // The app's history store (#220): its reads, writes and audio upkeep
+    // run here, on a handle of their own.
+    let history = match crate::history::Facade::open(&config.data_root) {
+        Ok(facade) => Some(Arc::new(crate::history::History::new(
+            facade,
+            config.max_frame_bytes,
+        ))),
+        Err(err) => {
+            eprintln!(
+                "starling-runtime-host: the history store would not open ({err}); the app's \
+                 history is unavailable until the next start"
+            );
+            None
+        }
+    };
+    let (store_jobs, store_queue) = match &history {
+        Some(_) => {
+            let (jobs, queue) = crate::history::store_queue();
+            (Some(jobs), Some(queue))
+        }
+        None => (None, None),
+    };
     let (runtime, client) = starling_runtime::Runtime::start(runtime_config);
     takes.attach(client.clone());
     let events = client.subscribe();
@@ -741,6 +767,8 @@ pub fn serve(config: HostConfig) -> Result<HostHandle, HostError> {
         broker: broker_tx,
         takes: Arc::clone(&takes),
         transcriber: transcriber.as_ref().map(|transcriber| transcriber.link()),
+        history: history.clone(),
+        store_jobs,
         lease: Arc::clone(&lease),
         agent_allowlist,
         #[cfg(feature = "test-support")]
@@ -776,6 +804,42 @@ pub fn serve(config: HostConfig) -> Result<HostHandle, HostError> {
         let shared = Arc::clone(&shared);
         move || crate::takes::tick_loop(takes, shared)
     }));
+    // The history store's workers and audio upkeep ride with the host's
+    // threads: shutdown joins them before the lease is released.
+    if let (Some(history), Some(queue)) = (&history, store_queue) {
+        threads.extend(crate::history::start_workers(Arc::clone(history), queue, {
+            let shared = Arc::clone(&shared);
+            move || shared.shutdown.load(Ordering::SeqCst)
+        }));
+        threads.push(spawn("starling-host-upkeep", {
+            let history = Arc::clone(history);
+            let shared = Arc::clone(&shared);
+            let settings = config.settings_path.clone();
+            let (first, interval) = (config.upkeep_first, config.upkeep_interval);
+            move || {
+                history.upkeep_loop(
+                    first,
+                    interval,
+                    // The user's limits as the settings file says now.
+                    || {
+                        settings
+                            .as_deref()
+                            .map(|path| {
+                                starling_dictation::settings::Settings::load(path)
+                                    .storage
+                                    .retention_policy()
+                            })
+                            .unwrap_or_default()
+                    },
+                    // Any take, an agent's ask included: the microphone's
+                    // take is never slowed by upkeep.
+                    || shared.takes.records() || capture_active(&shared.client),
+                    |report, retired| shared.takes.upkeep(report, retired),
+                    || shared.shutdown.load(Ordering::SeqCst),
+                )
+            }
+        }));
+    }
     // The recheck rides with the host's threads too: shutdown joins it
     // before the lease is released, so it never touches a store a
     // successor owns.
@@ -829,6 +893,15 @@ pub fn serve(config: HostConfig) -> Result<HostHandle, HostError> {
         transcriber,
         done: AtomicBool::new(false),
     })
+}
+
+/// Whether the capture machine has a take open (opening the device,
+/// recording or draining).
+fn capture_active(client: &RuntimeClient) -> bool {
+    matches!(
+        client.snapshot().capture.state.as_str(),
+        "Acquiring" | "Recording" | "Draining"
+    )
 }
 
 /// Locks one of the host's registry mutexes, tolerating poison: a
@@ -1258,6 +1331,7 @@ fn connection_reader(
                     | Frame::TakeAdopt { .. }
                     | Frame::Transcribe { .. }
                     | Frame::TranscribeDue { .. }
+                    | Frame::Store { .. }
                         if state.is_agent() =>
                     {
                         terminate(
@@ -1289,6 +1363,42 @@ fn connection_reader(
                     }
                     Frame::TakeTap { take, from } => {
                         shared.takes.tap(&state, take, from);
+                    }
+                    Frame::Store { req, request } => {
+                        let refused = match &shared.store_jobs {
+                            Some(jobs) => crate::history::submit(
+                                jobs,
+                                crate::history::StoreJob {
+                                    conn: Arc::clone(&state),
+                                    req,
+                                    request,
+                                },
+                            )
+                            .err()
+                            .map(|job| {
+                                (
+                                    job.req,
+                                    "Starling's recording service is busy; try again in a moment.",
+                                )
+                            }),
+                            None => Some((
+                                req,
+                                "Starling's history store did not open in the recording service; \
+                                 see its log.",
+                            )),
+                        };
+                        if let Some((req, message)) = refused {
+                            let reply = crate::history::StoreReply::Failed {
+                                failure: crate::history::StoreFailure {
+                                    kind: crate::history::StoreFailureKind::Io,
+                                    message: message.to_string(),
+                                },
+                            };
+                            if state.try_deliver(Frame::Stored { req, reply }).is_err() {
+                                state.close();
+                                break;
+                            }
+                        }
                     }
                     Frame::TakeAdopt { take } => {
                         shared.takes.adopt(&state, &take);
@@ -1354,7 +1464,9 @@ fn connection_reader(
                     | Frame::TakePersisted { .. }
                     | Frame::HostNotice { .. }
                     | Frame::LiveText { .. }
-                    | Frame::Transcription { .. } => {
+                    | Frame::Transcription { .. }
+                    | Frame::Stored { .. }
+                    | Frame::Upkeep { .. } => {
                         terminate(
                             &state,
                             TransportErrorCode::ProtocolViolation,
@@ -1430,6 +1542,11 @@ impl UnregisterOnDrop<'_> {
             lock_registry(&self.shared.conns)
                 .retain(|registered| !Arc::ptr_eq(registered, self.state));
             self.shared.live_connections.fetch_sub(1, Ordering::SeqCst);
+            // What the store kept for it (answers, uploads, audio holds)
+            // goes with it.
+            if let Some(history) = &self.shared.history {
+                history.caller_gone(&**self.state);
+            }
             // The broker cancels any ask this connection asked or
             // acked; it must not be dropped on a full inbox.
             let _ = self.shared.broker.send_blocking(BrokerMsg::ConnGone {
