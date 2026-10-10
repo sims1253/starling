@@ -247,9 +247,24 @@ pub(crate) struct MicState {
     /// The live take already showed its low-disk warning (#342), so a
     /// dismissed warning is not raised again on every poll.
     pub(crate) disk_warned: bool,
+    /// The low-disk warning text the live take shows, so a critical stop
+    /// can drop it instead of joining a prediction that already came true.
+    pub(crate) disk_low_warning: Option<String>,
     /// The live take shows [`DISK_UNCHECKED_NOTE`] (#342) because the
     /// free-space probe is failing.
     pub(crate) disk_unchecked: bool,
+}
+
+/// `warning` without the take's low-disk warning `low`: once the take
+/// stopped for a full disk, "minutes left before Starling stops a take"
+/// contradicts the stop note. Other warnings the stop set are kept.
+fn without_low_disk_warning(warning: Option<String>, low: Option<String>) -> Option<String> {
+    let (Some(warning), Some(low)) = (warning.clone(), low) else {
+        return warning;
+    };
+    let rest = warning.replace(low.as_str(), "");
+    let rest = rest.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!rest.is_empty()).then_some(rest)
 }
 
 /// Shown, without stopping the take, while the free-space probe fails
@@ -437,6 +452,7 @@ impl StarlingApp {
                 if !self.mic.disk_warned {
                     self.mic.disk_warned = true;
                     self.capture_warning = policy.warning(reading, rate);
+                    self.mic.disk_low_warning = self.capture_warning.clone();
                     cx.notify();
                 }
             }
@@ -457,7 +473,9 @@ impl StarlingApp {
                         reading.available / (1024 * 1024)
                     )
                 };
-                self.capture_warning = Some(match self.capture_warning.take() {
+                let low = self.mic.disk_low_warning.take();
+                let existing = without_low_disk_warning(self.capture_warning.take(), low);
+                self.capture_warning = Some(match existing {
                     Some(existing) => format!("{note} {existing}"),
                     None => note,
                 });
@@ -759,6 +777,26 @@ fn with_disk_unchecked_note(warning: Option<String>, failing: bool) -> Option<St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_critical_stop_drops_the_low_disk_prediction_but_keeps_other_warnings() {
+        let low = "Disk space is low (900 MB free): about 3 minutes of recording left.";
+        assert_eq!(
+            without_low_disk_warning(Some(low.to_string()), Some(low.to_string())),
+            None
+        );
+        assert_eq!(
+            without_low_disk_warning(
+                Some(format!("Input is clipping. {low}")),
+                Some(low.to_string())
+            ),
+            Some("Input is clipping.".to_string())
+        );
+        assert_eq!(
+            without_low_disk_warning(Some("Input is clipping.".to_string()), None),
+            Some("Input is clipping.".to_string())
+        );
+    }
 
     #[test]
     fn the_disk_unchecked_note_joins_and_leaves_the_capture_warning() {
