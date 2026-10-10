@@ -52,3 +52,5 @@ add_subdirectory(${STARLING_NATIVE_DIR} starling_native)
 
 add_library(starling_jni SHARED starling_jni.cpp)
 target_link_libraries(starling_jni PRIVATE starling_ggml)
+# runtime/call_abort.hpp: the cooperative cancel of one engine call.
+target_include_directories(starling_jni PRIVATE ${STARLING_REPO_ROOT}/cpp)

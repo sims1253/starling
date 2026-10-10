@@ -108,6 +108,14 @@ class OnDeviceEngine(
 
     private var handle: Long = 0L
 
+    // Counts model loads (written under [lock]): a live session reuses a
+    // preview only while the load that produced it is still resident.
+    // [residentGeneration] is the resident load's number, -1 when none;
+    // volatile so a session at Stop never waits for another take's call.
+    private var loadGeneration = 0L
+    @Volatile
+    private var residentGeneration = -1L
+
     /** The model file [handle] was loaded from; a different active model forces a reload. */
     private var loadedFile: File? = null
     private var loadError: String? = null
@@ -533,6 +541,8 @@ class OnDeviceEngine(
         }
         handle = loaded
         loadedFile = modelFile
+        loadGeneration++
+        residentGeneration = loadGeneration
         loadError = null
         // Absorb lazy graph construction before the first real request,
         // mirroring starling-serve's warmup.
@@ -625,16 +635,38 @@ class OnDeviceEngine(
         usingLocked { ensureLoadedLocked(model) }
     }
 
+    override fun loadGeneration(): Long = residentGeneration
+
     /** The model file a prepared live session is using. */
     override fun loadedModelName(): String? = synchronized(lock) { loadedFile?.name }
 
     /** One live-stream window of 16 kHz mono samples. Blocking. */
-    override fun transcribeWindow(samples: FloatArray): OnDeviceStreamSession.WindowResult = synchronized(lock) {
+    override fun transcribeWindow(samples: FloatArray): OnDeviceStreamSession.WindowResult =
+        transcribeLive(samples, cancel = null)
+
+    /** A live-tail preview that stops at the engine's next checkpoint once [cancel] holds. Blocking. */
+    override fun transcribePreview(samples: FloatArray, cancel: () -> Boolean): OnDeviceStreamSession.WindowResult =
+        transcribeLive(samples, StarlingNative.Cancel(cancel))
+
+    private fun transcribeLive(
+        samples: FloatArray,
+        cancel: StarlingNative.Cancel?,
+    ): OnDeviceStreamSession.WindowResult = synchronized(lock) {
         usingLocked {
             ensureLoadedLocked()?.let { return OnDeviceStreamSession.WindowResult.Failed(it) }
-            val text = awake { StarlingNative.transcribe(handle, samples, ChunkStreamer.SAMPLE_RATE) }
+            val text = awake {
+                if (cancel == null) {
+                    StarlingNative.transcribe(handle, samples, ChunkStreamer.SAMPLE_RATE)
+                } else {
+                    StarlingNative.transcribeCancellable(handle, samples, ChunkStreamer.SAMPLE_RATE, cancel)
+                }
+            }
             if (text == null) {
                 val error = StarlingNative.lastError(handle)
+                // Stopped on request: nothing failed, and the model stays.
+                if (cancel != null && error == StarlingNative.CANCELLED_ERROR) {
+                    return OnDeviceStreamSession.WindowResult.Cancelled
+                }
                 error?.let(observer::engineFailed)
                 if (error != null && ModelLifetime.isDriverFailure(error)) {
                     releaseDriverFailureLocked(error)
@@ -643,7 +675,7 @@ class OnDeviceEngine(
                     "the on-device engine returned an error: ${error ?: "unknown error"}",
                 )
             }
-            OnDeviceStreamSession.WindowResult.Text(text, loadedFile?.name)
+            OnDeviceStreamSession.WindowResult.Text(text, loadedFile?.name, loadGeneration)
         }
     }
 
@@ -798,6 +830,7 @@ class OnDeviceEngine(
             awake { StarlingNative.free(handle) }
             handle = 0L
             loadedFile = null
+            residentGeneration = -1L
             loadError = null
             observer.unloaded()
         }

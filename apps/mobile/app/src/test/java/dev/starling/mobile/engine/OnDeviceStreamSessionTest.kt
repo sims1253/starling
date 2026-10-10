@@ -384,6 +384,247 @@ class OnDeviceStreamSessionTest {
         assertTrue(session.finish() is CommitOutcome.Fallback)
     }
 
+    /**
+     * An engine whose windows answer "n<samples>" (so the final names the
+     * audio it covered) and whose previews run [preview] with the session's
+     * cancel predicate, as a native call polling its checkpoints would.
+     */
+    /**
+     * Previews come from [preview]; with [tracksLoads] the engine reports
+     * [generation] as its load and stamps previews that do not name one.
+     */
+    private class PreviewEngine(
+        private val tracksLoads: Boolean = true,
+        private val preview: (cancel: () -> Boolean) -> OnDeviceStreamSession.WindowResult,
+    ) : OnDeviceStreamSession.LiveEngine {
+        val windows = CopyOnWriteArrayList<Int>()
+        val previews = CopyOnWriteArrayList<Int>()
+        val previewStarted = java.util.concurrent.Semaphore(0)
+
+        @Volatile
+        var generation = 1L
+
+        override fun prepare(cancelled: () -> Boolean): String? = null
+
+        override fun loadGeneration(): Long =
+            if (tracksLoads) generation else OnDeviceStreamSession.LiveEngine.UNKNOWN_GENERATION
+
+        override fun transcribeWindow(samples: FloatArray): OnDeviceStreamSession.WindowResult {
+            windows += samples.size
+            return OnDeviceStreamSession.WindowResult.Text("n${samples.size}")
+        }
+
+        override fun transcribePreview(samples: FloatArray, cancel: () -> Boolean): OnDeviceStreamSession.WindowResult {
+            previews += samples.size
+            previewStarted.release()
+            val result = preview(cancel)
+            val unstamped = result is OnDeviceStreamSession.WindowResult.Text &&
+                result.generation == OnDeviceStreamSession.LiveEngine.UNKNOWN_GENERATION
+            return if (tracksLoads && unstamped) {
+                (result as OnDeviceStreamSession.WindowResult.Text).copy(generation = generation)
+            } else {
+                result
+            }
+        }
+    }
+
+    /** Polls [cancel] like an engine checkpoint loop; Cancelled once it holds. */
+    private fun untilCancelled(cancel: () -> Boolean): OnDeviceStreamSession.WindowResult {
+        val deadline = System.nanoTime() + 5_000_000_000L
+        while (System.nanoTime() < deadline) {
+            if (cancel()) return OnDeviceStreamSession.WindowResult.Cancelled
+            Thread.sleep(2)
+        }
+        throw AssertionError("the preview was never cancelled")
+    }
+
+    private fun tracedSession(engine: OnDeviceStreamSession.LiveEngine, trace: StreamTrace) =
+        OnDeviceStreamSession(
+            engine = engine,
+            events = { events += it },
+            streamer = ChunkStreamer(minSeconds = 1.0, partialIntervalSeconds = 0.0),
+            trace = trace,
+        ).start()
+
+    private fun stopTrace(trace: StreamTrace) =
+        trace.toJson().getJSONArray("events").let { it.getJSONArray(it.length() - 1) }
+            .getJSONObject(1).getJSONObject("trace").getJSONObject("stop")
+
+    @Test
+    fun stopDuringAPreviewCancelsItAndTheFlushCoversTheNewerAudio() {
+        val engine = PreviewEngine(preview = ::untilCancelled)
+        val trace = StreamTrace()
+        val session = tracedSession(engine, trace)
+        val second = pcm(1.0)
+        session.onAudio(second, second.size)
+        assertTrue(engine.previewStarted.tryAcquire(5, TimeUnit.SECONDS))
+        val half = pcm(0.5)
+        session.onAudio(half, half.size)
+
+        // Stop with audio the running preview does not cover: the preview
+        // gives way and the flush transcribes the whole 1.5 s tail.
+        assertEquals(CommitOutcome.Final("n24000"), session.finish())
+        assertEquals(listOf(16_000), engine.previews)
+        assertEquals(listOf(24_000), engine.windows)
+        assertFalse(events.any { it is StreamEvent.Partial })
+        assertEquals(
+            listOf(StreamTrace.RESULT_PREEMPTED, StreamTrace.RESULT_OK),
+            trace.calls().map { it.result },
+        )
+        assertEquals(StreamTrace.PATH_TAIL, stopTrace(trace).getString("path"))
+    }
+
+    @Test
+    fun stopWithNoNewerAudioLetsThePreviewFinishAndReusesItAsTheFinal() {
+        val release = CountDownLatch(1)
+        var cancelSeen = false
+        val engine = PreviewEngine { cancel ->
+            // Stop arrives while this preview runs; it must not be cancelled.
+            while (!release.await(2, TimeUnit.MILLISECONDS)) cancelSeen = cancelSeen || cancel()
+            OnDeviceStreamSession.WindowResult.Text("p")
+        }
+        val trace = StreamTrace()
+        val session = tracedSession(engine, trace)
+        val second = pcm(1.0)
+        session.onAudio(second, second.size)
+        assertTrue(engine.previewStarted.tryAcquire(5, TimeUnit.SECONDS))
+
+        val outcome = java.util.concurrent.atomic.AtomicReference<CommitOutcome>()
+        val stopper = Thread { outcome.set(session.finish()) }.apply { start() }
+        while (trace.toJson().getJSONArray("commits").length() == 0) Thread.sleep(2)
+        Thread.sleep(50)
+        release.countDown()
+        stopper.join(5_000)
+
+        assertFalse(cancelSeen)
+        assertEquals(CommitOutcome.Final("p"), outcome.get())
+        // The unchanged tail was never transcribed a second time.
+        assertEquals(emptyList<Int>(), engine.windows)
+        assertEquals(StreamTrace.PATH_REUSED, stopTrace(trace).getString("path"))
+        assertEquals(StreamTrace.RESULT_REUSED, trace.calls().last().result)
+    }
+
+    @Test
+    fun aCompletedWindowLetsTheRunningPreviewFinishAndShowsIt() {
+        val release = CountDownLatch(1)
+        var cancelSeen = false
+        val first = java.util.concurrent.atomic.AtomicBoolean(true)
+        val engine = PreviewEngine { cancel ->
+            if (first.getAndSet(false)) {
+                while (!release.await(2, TimeUnit.MILLISECONDS)) cancelSeen = cancelSeen || cancel()
+                OnDeviceStreamSession.WindowResult.Text("p")
+            } else {
+                OnDeviceStreamSession.WindowResult.Text("tail")
+            }
+        }
+        val session = tracedSession(engine, StreamTrace())
+        val second = pcm(1.0)
+        session.onAudio(second, second.size)
+        assertTrue(engine.previewStarted.tryAcquire(5, TimeUnit.SECONDS))
+
+        // The rest of the first 12 s window arrives while the preview runs:
+        // the preview still completes and is shown, then the window commits.
+        val rest = pcm(11.0)
+        session.onAudio(rest, rest.size)
+        Thread.sleep(50)
+        release.countDown()
+
+        awaitEvent { it == StreamEvent.Partial("p") }
+        awaitEvent { it is StreamEvent.Partial && it.text.startsWith("n192000") }
+        assertFalse(cancelSeen)
+        assertEquals(listOf(12 * ChunkStreamer.SAMPLE_RATE), engine.windows.take(1))
+        assertTrue(session.finish() is CommitOutcome.Final)
+    }
+
+    @Test
+    fun aPreviewThatCompletesAfterItBecameObsoleteIsDiscarded() {
+        // An engine past its last checkpoint: it notices nothing and returns
+        // text for audio the take has outgrown.
+        val engine = PreviewEngine { cancel ->
+            while (!cancel()) Thread.sleep(2)
+            OnDeviceStreamSession.WindowResult.Text("stale")
+        }
+        val trace = StreamTrace()
+        val session = tracedSession(engine, trace)
+        val second = pcm(1.0)
+        session.onAudio(second, second.size)
+        assertTrue(engine.previewStarted.tryAcquire(5, TimeUnit.SECONDS))
+        val half = pcm(0.5)
+        session.onAudio(half, half.size)
+
+        assertEquals(CommitOutcome.Final("n24000"), session.finish())
+        assertFalse(events.any { it == StreamEvent.Partial("stale") })
+        assertEquals(StreamTrace.RESULT_PREEMPTED, trace.calls().first().result)
+    }
+
+    @Test
+    fun aPreviewFromAnEngineWithoutCheckpointsIsDiscardedOnceStopHasNewerAudio() {
+        // The engine never polls the cancel predicate: the session must still
+        // see, once the call returns, that Stop brought audio it does not cover.
+        val release = CountDownLatch(1)
+        val engine = PreviewEngine {
+            release.await(5, TimeUnit.SECONDS)
+            OnDeviceStreamSession.WindowResult.Text("stale")
+        }
+        val trace = StreamTrace()
+        val session = tracedSession(engine, trace)
+        val second = pcm(1.0)
+        session.onAudio(second, second.size)
+        assertTrue(engine.previewStarted.tryAcquire(5, TimeUnit.SECONDS))
+        val half = pcm(0.5)
+        session.onAudio(half, half.size)
+
+        val outcome = java.util.concurrent.atomic.AtomicReference<CommitOutcome>()
+        val stopper = Thread { outcome.set(session.finish()) }.apply { start() }
+        while (trace.toJson().getJSONArray("commits").length() == 0) Thread.sleep(2)
+        release.countDown()
+        stopper.join(5_000)
+
+        assertEquals(CommitOutcome.Final("n24000"), outcome.get())
+        assertFalse(events.any { it is StreamEvent.Partial })
+        assertEquals(StreamTrace.RESULT_PREEMPTED, trace.calls().first().result)
+    }
+
+    @Test
+    fun aPreviewFromAnEarlierModelLoadIsNotReused() {
+        val engine = PreviewEngine { OnDeviceStreamSession.WindowResult.Text("p", generation = 1) }
+        engine.generation = 1
+        val session = tracedSession(engine, StreamTrace())
+        val second = pcm(1.0)
+        session.onAudio(second, second.size)
+        awaitEvent { it == StreamEvent.Partial("p") }
+
+        // A driver failure elsewhere reloaded the engine before Stop.
+        engine.generation = 2
+        assertEquals(CommitOutcome.Final("n16000"), session.finish())
+        assertEquals(listOf(16_000), engine.windows)
+    }
+
+    @Test
+    fun anEngineThatDoesNotTrackItsLoadsNeverReusesAPreview() {
+        val engine = PreviewEngine(tracksLoads = false) { OnDeviceStreamSession.WindowResult.Text("p") }
+        val session = tracedSession(engine, StreamTrace())
+        val second = pcm(1.0)
+        session.onAudio(second, second.size)
+        awaitEvent { it == StreamEvent.Partial("p") }
+
+        assertEquals(CommitOutcome.Final("n16000"), session.finish())
+        assertEquals(listOf(16_000), engine.windows)
+    }
+
+    @Test
+    fun unknownGenerationsOnBothSidesAreNotTheSameLoad() {
+        val engine = PreviewEngine { OnDeviceStreamSession.WindowResult.Text("p") }
+        engine.generation = OnDeviceStreamSession.LiveEngine.UNKNOWN_GENERATION
+        val session = tracedSession(engine, StreamTrace())
+        val second = pcm(1.0)
+        session.onAudio(second, second.size)
+        awaitEvent { it == StreamEvent.Partial("p") }
+
+        assertEquals(CommitOutcome.Final("n16000"), session.finish())
+        assertEquals(listOf(16_000), engine.windows)
+    }
+
     private companion object {
         /** Sample value step per second of test audio; distinct and exact in PCM16. */
         const val SECOND_STEP = 100

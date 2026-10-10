@@ -1,0 +1,242 @@
+{
+ "version": 1,
+ "label": "cold-base11-r0",
+ "provenance": {
+  "repo_revision": "4bdbf3b0c4e9ccafb93a38a3a08e14e074fd86fe",
+  "client": "android-on-device",
+  "device": {
+   "model": "Pixel 10 Pro",
+   "fingerprint": "google/blazer/blazer:17/CP3A.261005.005/16271449:user/release-keys",
+   "soc": "Tensor G5"
+  },
+  "model": "parakeet-tdt-0.6b-v3-q4_k_m-shrink16.gguf",
+  "cadence": {
+   "min_partial_seconds": 1.0,
+   "partial_interval_seconds": 1.0
+  },
+  "warmup": false,
+  "batch": false,
+  "cool_to_c": 33.0,
+  "workload_manifest_sha256": "73d9d403b71ade2ed662a4cecd4861f8bc08958c4473bf358354e21525270264",
+  "repeats": [
+   {
+    "repeat": 0,
+    "wall_s": 15.4,
+    "cooled_s": 121.9,
+    "cool_met": false,
+    "before": {
+     "thermal": {
+      "status": 1,
+      "soc_therm": 41.2,
+      "VIRTUAL-SKIN": 38.3,
+      "battery": 38.4,
+      "BIG": 44.0,
+      "MID": 43.0,
+      "LITTLE": 43.0
+     },
+     "battery": {
+      "status": "3",
+      "level": "35",
+      "temperature": "395",
+      "ac_powered": "false",
+      "usb_powered": "false"
+     }
+    },
+    "after": {
+     "thermal": {
+      "status": 1,
+      "soc_therm": 43.4,
+      "VIRTUAL-SKIN": 38.0,
+      "battery": 38.4,
+      "BIG": 50.0,
+      "MID": 50.0,
+      "LITTLE": 50.0
+     },
+     "battery": {
+      "status": "3",
+      "level": "35",
+      "temperature": "384",
+      "ac_powered": "false",
+      "usb_powered": "false"
+     }
+    }
+   }
+  ]
+ },
+ "runs": [
+  {
+   "duration_s": 10.4,
+   "errors": [],
+   "busy_commit_retries": 0,
+   "first_partial": {
+    "wall_s": 4.486,
+    "audio_sent_s": 4.25,
+    "covered_s": 3.5
+   },
+   "partials": 6,
+   "revisions_per_min": 34.62,
+   "stable_violations": 0,
+   "partial_age_ms": {
+    "n": 6,
+    "p50": 1248.2868755032541,
+    "p95": 1594.1019100064295,
+    "max": 1643.2670860085636
+   },
+   "backlog_s": {
+    "n": 6,
+    "p50": 1.0750000000000002,
+    "p95": 1.25,
+    "max": 1.25
+   },
+   "stop_to_final_ms": 2439.6,
+   "final_duration_s": 10.4,
+   "audio_complete": true,
+   "work": {
+    "engine_calls": 7,
+    "engine_audio_per_audio_s": 4.654,
+    "engine_wall_per_audio_s": 0.8658,
+    "busy_calls": 0,
+    "reused_calls": 0,
+    "preempted_calls": 0,
+    "by_kind": {
+     "window": {
+      "calls": 0,
+      "engine_calls": 0,
+      "engine_audio_s": 0,
+      "engine_ms": 0,
+      "reused": 0,
+      "busy": 0,
+      "failed": 0,
+      "preempted": 0,
+      "preempted_ms": 0
+     },
+     "preview": {
+      "calls": 6,
+      "engine_calls": 6,
+      "engine_audio_s": 38,
+      "engine_ms": 7058.2366460294,
+      "reused": 0,
+      "busy": 0,
+      "failed": 0,
+      "preempted": 0,
+      "preempted_ms": 0
+     },
+     "flush_window": {
+      "calls": 0,
+      "engine_calls": 0,
+      "engine_audio_s": 0,
+      "engine_ms": 0,
+      "reused": 0,
+      "busy": 0,
+      "failed": 0,
+      "preempted": 0,
+      "preempted_ms": 0
+     },
+     "flush_tail": {
+      "calls": 1,
+      "engine_calls": 1,
+      "engine_audio_s": 10.4,
+      "engine_ms": 1945.785991003504,
+      "reused": 0,
+      "busy": 0,
+      "failed": 0,
+      "preempted": 0,
+      "preempted_ms": 0
+     }
+    }
+   },
+   "stop": {
+    "path": "tail",
+    "unfinalized_s": 10.4,
+    "engine_audio_s": 10.4,
+    "engine_ms": 1945.785991003504
+   },
+   "wer_final_vs_ref": 0.0,
+   "wer_batch_vs_ref": null,
+   "wer_final_vs_batch": null,
+   "final_text": "He has grave doubts whether Sir Frederick Leighton's work is really Greek after all, and can discover in it but little of Rocky Ithaca.",
+   "take": "short",
+   "repeat": 0,
+   "state": "cold",
+   "model": "parakeet-tdt-0.6b-v3-q4_k_m-shrink16.gguf",
+   "finish_to_final_ms": 2390.0,
+   "stop_to_delivered_ms": 2451.7,
+   "prepare_ms": 3569.546878017718,
+   "fallback": null,
+   "final_status": "TRANSCRIBED",
+   "final_provenance": "LIVE_STREAM",
+   "batch_ms": null,
+   "app_cpu_per_audio_s": 2.3692,
+   "thermal_before": {
+    "status": 1,
+    "headroom_10s": 0.7738487124443054,
+    "battery_temp_c": 40.1,
+    "plugged": 0
+   },
+   "thermal_after": {
+    "status": 1,
+    "headroom_10s": 0.767190158367157,
+    "battery_temp_c": 38.4,
+    "plugged": 0
+   }
+  }
+ ],
+ "aggregate": {
+  "short": {
+   "runs": 1,
+   "failed": 0,
+   "audio_complete_all": true,
+   "first_partial_missing": 0,
+   "first_partial_wall_s_median": 4.486,
+   "first_partial_wall_s_max": 4.486,
+   "partial_age_ms_p50_median": 1248.2868755032541,
+   "partial_age_ms_p95_median": 1594.1019100064295,
+   "partial_age_ms_max": 1643.2670860085636,
+   "backlog_s_max": 1.25,
+   "revisions_per_min_median": 34.62,
+   "stable_violations_total": 0,
+   "engine_audio_per_audio_s_median": 4.654,
+   "engine_wall_per_audio_s_median": 0.8658,
+   "stop_to_final_ms_median": 2439.6,
+   "stop_to_final_ms_max": 2439.6,
+   "stop_engine_audio_s_max": 10.4,
+   "stop_paths": [
+    "tail"
+   ],
+   "wer_final_vs_ref_median": 0.0,
+   "wer_batch_vs_ref_median": null,
+   "wer_final_vs_batch_median": null,
+   "finish_to_final_ms_median": 2390.0,
+   "stop_to_final_ms": {
+    "n": 1,
+    "p50": 2439.6,
+    "p95": 2439.6,
+    "max": 2439.6
+   },
+   "finish_to_final_ms": {
+    "n": 1,
+    "p50": 2390.0,
+    "p95": 2390.0,
+    "max": 2390.0
+   },
+   "stop_to_delivered_ms": {
+    "n": 1,
+    "p50": 2451.7,
+    "p95": 2451.7,
+    "max": 2451.7
+   },
+   "first_partial_wall_s": {
+    "n": 1,
+    "p50": 4.486,
+    "p95": 4.486,
+    "max": 4.486
+   },
+   "app_cpu_per_audio_s_median": 2.3692,
+   "thermal_status_max": 1,
+   "battery_temp_c_max": 38.4,
+   "states": [
+    "cold"
+   ]
+  }
+ }
+}

@@ -36,10 +36,14 @@ class OnDeviceBackend(private val engine: OnDeviceEngine) {
      */
     fun beginStreaming(savedAudio: File? = null, events: (StreamEvent) -> Unit): StreamSession? =
         if (engine.hasModel()) {
+            // StreamDebug's cadence override and trace are debug-build only.
+            val streamer = StreamDebug.streamer()
             OnDeviceStreamSession(
                 engine,
                 events,
+                streamer = streamer,
                 backlog = savedAudio?.let { file -> { SavedAudioBacklog(file) } },
+                trace = StreamDebug.trace(streamer),
             ).start()
         } else {
             null

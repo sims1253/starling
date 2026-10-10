@@ -32,6 +32,9 @@ import kotlin.concurrent.withLock
  * As with the server stream, the saved WAV stays the source of truth: any
  * engine failure interrupts the stream, and [finish] answers
  * [CommitOutcome.Fallback] so the batch path transcribes the WAV.
+ *
+ * A [trace] (debug builds only, see [StreamDebug]) records every engine
+ * call, capture chunk, partial and the stop path for the #226 measurements.
  */
 class OnDeviceStreamSession(
     private val engine: LiveEngine,
@@ -40,6 +43,7 @@ class OnDeviceStreamSession(
     private val clock: () -> Double = { System.nanoTime() / 1e9 },
     private val maxLiveSamples: Int = MAX_LIVE_SECONDS * ChunkStreamer.SAMPLE_RATE,
     private val backlog: (() -> Backlog)? = null,
+    private val trace: StreamTrace? = null,
 ) : StreamSession {
     /** The engine surface the session needs; [OnDeviceEngine] in production. */
     interface LiveEngine {
@@ -54,6 +58,23 @@ class OnDeviceStreamSession(
         /** Transcribes one window of 16 kHz mono samples. */
         fun transcribeWindow(samples: FloatArray): WindowResult
 
+        /**
+         * Transcribes a preview of the live tail that the session may stop
+         * needing mid-call: the engine stops at its next checkpoint once
+         * [cancel] holds and answers [WindowResult.Cancelled]. An engine
+         * without checkpoints finishes the call; the session then discards
+         * a result that completed after [cancel] fired.
+         */
+        fun transcribePreview(samples: FloatArray, cancel: () -> Boolean): WindowResult = transcribeWindow(samples)
+
+        /**
+         * Identifies the engine's current model load; [WindowResult.Text.generation]
+         * names the load that produced a result. Results of an earlier load
+         * are never reused, and neither is anything while either side is
+         * [UNKNOWN_GENERATION] (an engine that does not track its loads).
+         */
+        fun loadGeneration(): Long = UNKNOWN_GENERATION
+
         /** The model a successful [prepare] pinned to this session, for the transcript's record. */
         fun loadedModelName(): String? = null
 
@@ -63,12 +84,27 @@ class OnDeviceStreamSession(
          */
         fun liveSessionStarted() = Unit
         fun liveSessionEnded(prepared: Boolean) = Unit
+
+        companion object {
+            /** No known model load: a preview stamped with it is never reused. */
+            const val UNKNOWN_GENERATION = Long.MIN_VALUE
+        }
     }
 
     sealed interface WindowResult {
-        /** [model]: the model that transcribed this window, when the engine knows it. */
-        data class Text(val text: String, val model: String? = null) : WindowResult
+        /**
+         * [model]: the model that transcribed this window, when the engine
+         * knows it; [generation]: the engine load that produced it ([LiveEngine.loadGeneration]).
+         */
+        data class Text(
+            val text: String,
+            val model: String? = null,
+            val generation: Long = LiveEngine.UNKNOWN_GENERATION,
+        ) : WindowResult
         data class Failed(val reason: String) : WindowResult
+
+        /** A preview stopped because the session no longer needed it; not a failure. */
+        data object Cancelled : WindowResult
     }
 
     /**
@@ -98,8 +134,11 @@ class OnDeviceStreamSession(
     private var buffer = FloatArray(INITIAL_BUFFER_SAMPLES)
     private var size = 0
     private var base = 0L
+    // Volatile as well: a running preview's cancel predicate reads it unlocked.
+    @Volatile
     private var captured = 0L
     private var openBacklog: Backlog? = null
+    @Volatile
     private var inputEnded = false
     // Written under [lock]; volatile so the engine can poll it from prepare().
     @Volatile
@@ -155,6 +194,7 @@ class OnDeviceStreamSession(
                 return
             }
             captured += samples
+            trace?.audio(captured)
             changed.signalAll()
         }
     }
@@ -194,6 +234,7 @@ class OnDeviceStreamSession(
     }
 
     override fun finish(): CommitOutcome {
+        trace?.stopRequested()
         lock.withLock {
             inputEnded = true
             changed.signalAll()
@@ -229,16 +270,19 @@ class OnDeviceStreamSession(
             }
             engine.liveSessionEnded(prepared)
             emitInterruption()
+            trace?.let { runCatching { it.complete() } }
         }
     }
 
     private fun runLoop() {
+        val prepareStarted = clock()
         val loadError = runCatching { engine.prepare { closed } }.getOrElse { it.message ?: it::class.java.simpleName }
         if (loadError != null) {
             lock.withLock { failLocked(loadError, bufferLimitReached = false) }
             return
         }
         prepared = true
+        trace?.prepared(prepareStarted)
         val model = runCatching { engine.loadedModelName() }.getOrNull()
         // Closed or already failed (e.g. the buffer cap) while the model loaded.
         if (lock.withLock { closed || failure != null }) return
@@ -250,18 +294,59 @@ class OnDeviceStreamSession(
         // The models that transcribed windows: a driver failure voids the
         // pin, and the reload may pick up another active model mid-take.
         val windowModels = LinkedHashSet<String>()
-        val tx = ChunkStreamer.Transcriber { samples, start, length ->
+        // Absolute sample index of the current snapshot's first sample, for the trace.
+        var snapshotBase = 0L
+        // Whether the last step's preview was preempted (see [previewObsolete]).
+        var preempted = false
+        // The engine load that produced the last successful preview.
+        var previewGeneration = LiveEngine.UNKNOWN_GENERATION
+        val tx = ChunkStreamer.Transcriber { samples, start, length, kind ->
             // The snapshot is exactly the live tail, so a window that spans all
             // of it (every flush, most partials) is passed without a copy.
             val window = if (start == 0 && length == samples.size) samples else samples.copyOfRange(start, start + length)
-            when (val result = runCatching { engine.transcribeWindow(window) }
-                .getOrElse { WindowResult.Failed(it.message ?: it::class.java.simpleName) }) {
+            val t0 = clock()
+            val preview = kind == ChunkStreamer.CallKind.PREVIEW
+            val end = snapshotBase + start + length
+            var obsolete = false
+            val result = runCatching {
+                if (preview) {
+                    engine.transcribePreview(window) { obsolete || previewObsolete(end).also { obsolete = it } }
+                } else {
+                    engine.transcribeWindow(window)
+                }
+            }.getOrElse { WindowResult.Failed(it.message ?: it::class.java.simpleName) }
+            // A preview that became obsolete after the engine's last
+            // checkpoint (or on an engine without checkpoints) is discarded
+            // like a cancelled one: its audio stays buffered for the window
+            // or flush that follows.
+            if (preview && !obsolete) obsolete = previewObsolete(end)
+            val outcome = if (obsolete && result is WindowResult.Text) WindowResult.Cancelled else result
+            trace?.call(
+                StreamTrace.Call(
+                    kind,
+                    snapshotBase + start,
+                    length,
+                    t0,
+                    clock(),
+                    when (outcome) {
+                        is WindowResult.Text -> StreamTrace.RESULT_OK
+                        is WindowResult.Failed -> StreamTrace.RESULT_FAILED
+                        WindowResult.Cancelled -> StreamTrace.RESULT_PREEMPTED
+                    },
+                ),
+            )
+            when (outcome) {
                 is WindowResult.Text -> {
-                    result.model?.let(windowModels::add)
-                    result.text
+                    outcome.model?.let(windowModels::add)
+                    if (preview) previewGeneration = outcome.generation
+                    outcome.text
                 }
                 is WindowResult.Failed -> {
-                    windowFailure = result.reason
+                    windowFailure = outcome.reason
+                    null
+                }
+                WindowResult.Cancelled -> {
+                    preempted = true
                     null
                 }
             }
@@ -282,12 +367,35 @@ class OnDeviceStreamSession(
                 ending = inputEnded && !behind
                 snapshot = buffer.copyOf(size)
                 snapshotSize = size
+                snapshotBase = base
             }
             steppedSize = snapshotSize
             windowFailure = null
+            preempted = false
 
             if (ending) {
-                val text = streamer.flush(snapshot, snapshotSize, tx)
+                trace?.flushing((snapshotSize - streamer.boundary).toLong())
+                val tailStart = snapshotBase + streamer.boundary
+                // The streamer's last preview is reusable only if the model
+                // that made it is still the loaded one (a driver failure
+                // elsewhere can reload the engine mid-take); an engine that
+                // does not track its loads never gets the reuse.
+                val sameEngine = previewGeneration != LiveEngine.UNKNOWN_GENERATION &&
+                    runCatching { engine.loadGeneration() }.getOrNull() == previewGeneration
+                val text = streamer.flush(snapshot, snapshotSize, tx, reuseTail = sameEngine)
+                if (streamer.flushReusedTail) {
+                    val now = clock()
+                    trace?.call(
+                        StreamTrace.Call(
+                            ChunkStreamer.CallKind.FLUSH_TAIL,
+                            tailStart,
+                            (snapshotBase + snapshotSize - tailStart).toInt(),
+                            now,
+                            now,
+                            StreamTrace.RESULT_REUSED,
+                        ),
+                    )
+                }
                 lock.withLock {
                     if (text != null) {
                         settleLocked(CommitOutcome.Final(text, windowModels.joinToString(", ").ifEmpty { model }))
@@ -311,15 +419,35 @@ class OnDeviceStreamSession(
             }
             if (partial != null && partial != lastPartial) {
                 lastPartial = partial
+                trace?.partial(partial)
                 events(StreamEvent.Partial(partial))
             }
             steppedSize -= trimFinalized()
-            // Throttle: a step that transcribed nothing new must not spin.
-            if (partial == null && !behind) sleepQuietly(STEP_BACKOFF_MILLIS)
+            // Throttle: a step that transcribed nothing new must not spin. A
+            // preempted preview gave way to work that is already waiting.
+            if (partial == null && !behind && !preempted) sleepQuietly(STEP_BACKOFF_MILLIS)
         }
     }
 
     private fun behindLocked(): Boolean = base + size < captured
+
+    /**
+     * Polled by the engine while a preview of the audio up to absolute sample
+     * [end] runs (on the worker thread, without the lock): true once Stop
+     * brought audio the preview does not cover, or the session closed, so
+     * Stop never waits for a preview it cannot use (#357, as the native
+     * server does since #428). Stop with no newer audio lets the preview
+     * finish: it is exactly the tail the flush needs, and
+     * [ChunkStreamer.flush] reuses it.
+     *
+     * Unlike the server, a completed window does not preempt the preview:
+     * on the Pixel's fast engine the GPU encoder submission (most of a
+     * call) cannot be interrupted, so cancelling there mostly threw away a
+     * nearly finished partial. Measured on the Pixel 10 Pro: 10-17 % fewer
+     * partials on the 6 min take and 5-7 % older p95 partials, for no
+     * stop-time gain.
+     */
+    private fun previewObsolete(end: Long): Boolean = closed || (inputEnded && captured > end)
 
     /**
      * Reads saved audio the buffer is missing back into it, in order, up to
@@ -415,6 +543,7 @@ class OnDeviceStreamSession(
     private fun settleLocked(result: CommitOutcome) {
         if (outcome != null) return
         outcome = result
+        trace?.settled((result as? CommitOutcome.Final)?.text, (result as? CommitOutcome.Fallback)?.reason)
         settled.countDown()
     }
 

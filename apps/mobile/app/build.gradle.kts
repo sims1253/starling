@@ -16,6 +16,14 @@ val starlingVersionCode = providers.gradleProperty("starlingVersionCode").orElse
     raw.toIntOrNull()?.takeIf { it > 0 }
         ?: throw GradleException("starlingVersionCode must be an integer in 1..${Int.MAX_VALUE}: $raw")
 }
+// The commit a debug APK is built from, so on-device measurements (#357)
+// record which build they ran; "unknown" outside a git checkout.
+val starlingGitSha = runCatching {
+    providers.exec {
+        commandLine("git", "rev-parse", "HEAD")
+        isIgnoreExitValue = true
+    }.standardOutput.asText.get().trim()
+}.getOrNull()?.takeIf { Regex("[0-9a-f]{40}").matches(it) } ?: "unknown"
 
 // arm64 codegen target of the native engine. The default runs on every
 // mainstream arm64 phone core since 2018; `-PstarlingArmArch=armv8.2-a+dotprod+fp16+i8mm`
@@ -168,6 +176,7 @@ android {
         // uninstall (and wipe) the app someone actually uses.
         debug {
             applicationIdSuffix = ".debug"
+            buildConfigField("String", "GIT_SHA", "\"$starlingGitSha\"")
         }
         release {
             if (starlingExperimental) {
