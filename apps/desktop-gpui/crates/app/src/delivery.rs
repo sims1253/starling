@@ -71,15 +71,38 @@ pub(crate) struct Capture {
     pub at: Instant,
 }
 
+/// Clears a worker's "out" flag when the worker ends, also by a panic:
+/// a flag left set would refuse every later worker.
+struct OutGuard(Arc<AtomicBool>);
+
+impl Drop for OutGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
 /// The inserter's capture on a worker thread, waited for at most
 /// [`CAPTURE_BUDGET`]: a stuck display cannot freeze the UI thread, and an
 /// answer that comes later is not taken (focus may have moved by then).
 /// `out` is set while a worker is out; one the display never answered
-/// is not joined by more.
+/// is not joined by more. The cutoff is absolute: an answer the worker
+/// had after it is refused even when the UI thread, itself late, finds it
+/// already waiting.
 fn bounded_capture(
     inserter: Arc<Inserter>,
     out: &Arc<AtomicBool>,
 ) -> Result<TargetSnapshot, InsertError> {
+    bounded_capture_after(inserter, out, || {})
+}
+
+/// [`bounded_capture`], running `stall` between starting the worker and
+/// waiting for it: tests stand in a descheduled UI thread with it.
+fn bounded_capture_after(
+    inserter: Arc<Inserter>,
+    out: &Arc<AtomicBool>,
+    stall: impl FnOnce(),
+) -> Result<TargetSnapshot, InsertError> {
+    let deadline = Instant::now() + CAPTURE_BUDGET;
     if out.swap(true, Ordering::SeqCst) {
         return Err(InsertError::Unavailable {
             reason: "the display has not answered an earlier focus check".to_string(),
@@ -90,11 +113,13 @@ fn bounded_capture(
     let spawned = std::thread::Builder::new()
         .name("starling-capture".into())
         .spawn(move || {
+            let worker = OutGuard(worker_out);
             let target = inserter.capture();
+            let answered = Instant::now();
             // Cleared before the answer, so the next capture never sees
             // an answered worker as out.
-            worker_out.store(false, Ordering::SeqCst);
-            let _ = sender.send(target);
+            drop(worker);
+            let _ = sender.send((target, answered));
         });
     if let Err(error) = spawned {
         out.store(false, Ordering::SeqCst);
@@ -102,11 +127,25 @@ fn bounded_capture(
             reason: format!("cannot start the focus check: {error}"),
         });
     }
-    receiver.recv_timeout(CAPTURE_BUDGET).unwrap_or_else(|_| {
-        Err(InsertError::Unavailable {
+    stall();
+    // A channel hands over a waiting answer before it looks at the
+    // timeout, so the answer's own time decides.
+    match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        Ok((target, answered)) if answered <= deadline => target,
+        _ => Err(InsertError::Unavailable {
             reason: "the display did not say in time which window has focus".to_string(),
-        })
-    })
+        }),
+    }
+}
+
+/// Whether the Paste last or Insert armed at `armed_at` (on the executor's
+/// clock) is past [`PASTE_ARM_TIMEOUT`], whether or not its expiry timer
+/// has run.
+fn arming_expired(armed_at: Instant, cx: &Context<StarlingApp>) -> bool {
+    cx.background_executor()
+        .now()
+        .saturating_duration_since(armed_at)
+        >= PASTE_ARM_TIMEOUT
 }
 
 /// The stop check of one insert: Starling's window took focus, or the
@@ -339,6 +378,9 @@ pub(crate) struct DeliveryState {
     last_insert: Option<Task<()>>,
     /// A capture worker is out (see [`bounded_capture`]).
     capture_out: Arc<AtomicBool>,
+    /// A settings session check is out (see
+    /// [`StarlingApp::check_session_verifies`]).
+    session_check_out: Arc<AtomicBool>,
     /// An insert is out on the background executor. One given up as
     /// stalled may never return; later inserts are refused rather than
     /// queued behind it on the insertion lock, so at most one worker is
@@ -361,6 +403,7 @@ impl DeliveryState {
             own_focus: Arc::default(),
             last_insert: None,
             capture_out: Arc::default(),
+            session_check_out: Arc::default(),
             insert_out: Arc::default(),
         }
     }
@@ -397,6 +440,53 @@ impl StarlingApp {
             bounded_capture(self.delivery.inserter.clone(), &self.delivery.capture_out)
         };
         Capture { target, at }
+    }
+
+    /// New insertion settings, from the next delivery on. Copy only
+    /// disarms a pressed Insert, which would otherwise type on the next
+    /// focus loss.
+    pub(crate) fn set_insertion_settings(&mut self, settings: InsertionSettings) {
+        self.delivery.settings = settings;
+        if !settings.auto_insert {
+            self.disarm_staged_insert();
+        }
+    }
+
+    /// Asks off the UI thread whether this session types where the target
+    /// cannot be verified, for the settings note. At most one check is
+    /// out, on its own thread: one a backend never answers is not joined
+    /// by more, and the note keeps the last answer meanwhile.
+    pub(crate) fn check_session_verifies(&mut self, cx: &mut Context<Self>) {
+        let out = self.delivery.session_check_out.clone();
+        if out.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let inserter = self.delivery.inserter.clone();
+        let (sender, answer) = tokio::sync::oneshot::channel();
+        let worker_out = out.clone();
+        let spawned = std::thread::Builder::new()
+            .name("starling-session-check".into())
+            .spawn(move || {
+                let worker = OutGuard(worker_out);
+                let verifies = inserter.session_verifies();
+                drop(worker);
+                let _ = sender.send(verifies);
+            });
+        if spawned.is_err() {
+            out.store(false, Ordering::SeqCst);
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let Ok(verifies) = answer.await else {
+                return;
+            };
+            this.update(cx, |app, cx| {
+                app.insertion_unverifiable = verifies == Some(false);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// A take started: capture where its text goes, before anything can
@@ -507,9 +597,8 @@ impl StarlingApp {
                 let abandoned = Arc::new(AtomicBool::new(false));
                 let stop = insert_stop(had_focus, abandoned.clone());
                 let typing = cx.background_spawn(async move {
-                    let result = inserter.insert(&target, &typed_text, &stop);
-                    out.store(false, Ordering::SeqCst);
-                    result
+                    let _worker = OutGuard(out);
+                    inserter.insert(&target, &typed_text, &stop)
                 });
                 let timer = cx.background_executor().timer(budget);
                 match futures_util::future::select(typing, timer).await {
@@ -604,7 +693,7 @@ impl StarlingApp {
             cx.notify();
             return;
         }
-        let armed_at = Instant::now();
+        let armed_at = cx.background_executor().now();
         recovery.armed = Some(armed_at);
         // One text waits for the next window at a time.
         self.disarm_staged_insert();
@@ -677,7 +766,7 @@ impl StarlingApp {
             recovery.armed = None;
         }
         self.disarm_staged_insert();
-        let armed_at = Instant::now();
+        let armed_at = cx.background_executor().now();
         self.delivery.staged_armed = Some(ArmedInsert {
             take_id: id.to_string(),
             capture,
@@ -725,6 +814,13 @@ impl StarlingApp {
             .is_some_and(|armed| armed.armed_at == armed_at);
         // Back in Starling before the focus settled: stay armed.
         if !armed || self.starling_focused() {
+            return;
+        }
+        // The expiry timer may not have run yet, and copy only may have
+        // been chosen since the press.
+        if arming_expired(armed_at, cx) || !self.delivery.settings.auto_insert {
+            self.disarm_staged_insert();
+            cx.notify();
             return;
         }
         let Some(ArmedInsert {
@@ -836,6 +932,13 @@ impl StarlingApp {
         if !still_armed || self.starling_focused() {
             return;
         }
+        if arming_expired(armed_at, cx) {
+            if let Some(recovery) = self.delivery.recovery.as_mut() {
+                recovery.armed = None;
+            }
+            cx.notify();
+            return;
+        }
         let capture = self.capture_now();
         let generation = self.delivery.generation;
         let Some(recovery) = self.delivery.recovery.as_mut() else {
@@ -865,6 +968,27 @@ impl StarlingApp {
             }
         }
         cx.notify();
+    }
+}
+
+#[cfg(test)]
+impl StarlingApp {
+    /// Moves the armed Paste last and Insert `by` into the past, as if
+    /// the UI thread had been too busy to run their expiry timers: those
+    /// no longer match them, so only the fire-time check is left.
+    pub(crate) fn backdate_armings(&mut self, by: Duration) {
+        let back = |at: &mut Instant| *at = at.checked_sub(by).expect("an earlier instant");
+        if let Some(armed) = self.delivery.staged_armed.as_mut() {
+            back(&mut armed.armed_at);
+        }
+        if let Some(at) = self
+            .delivery
+            .recovery
+            .as_mut()
+            .and_then(|recovery| recovery.armed.as_mut())
+        {
+            back(at);
+        }
     }
 }
 
@@ -1392,6 +1516,33 @@ mod tests {
         assert!(fake.insertions().is_empty());
     }
 
+    /// A settle that runs after an armed Paste last expired, before its
+    /// expiry timer got to run, types nothing.
+    #[gpui::test]
+    fn an_expired_paste_never_fires_ahead_of_its_timer(cx: &mut gpui::TestAppContext) {
+        let (app, fake) = app_with(cx, on());
+        fake.focus(FakeTarget::named("Editor", "notes.txt"));
+        take(&app, cx, "take-1", "Hello there.", |_| {
+            fake.destroy_target()
+        });
+        app.update(cx, |app, cx| {
+            app.window_focus.push((Instant::now(), true));
+            app.toggle_paste_last(cx);
+            app.backdate_armings(PASTE_ARM_TIMEOUT);
+        });
+        fake.focus(FakeTarget::named("Chat", "Message"));
+        app.update(cx, |app, cx| {
+            app.window_focus.push((Instant::now(), false));
+            app.delivery_window_activation(false, cx);
+        });
+        cx.executor().advance_clock(PASTE_SETTLE);
+        cx.run_until_parked();
+        assert!(fake.insertions().is_empty());
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.delivery.recovery.as_ref().unwrap().armed, None);
+        });
+    }
+
     #[gpui::test]
     fn a_dismissed_notice_ignores_a_late_paste_result(cx: &mut gpui::TestAppContext) {
         let (app, fake) = app_with(cx, on());
@@ -1513,6 +1664,75 @@ mod tests {
         std::thread::sleep(CAPTURE_BUDGET * 4);
         take(&app, cx, "take-3", "Third.", |_| {});
         assert_eq!(fake.field(), "Third.");
+    }
+
+    /// The cutoff is absolute: an answer had in time is taken even when
+    /// the UI thread comes for it late, and one had after the cutoff is
+    /// refused even though it is already waiting.
+    #[test]
+    fn a_capture_answered_after_the_cutoff_is_refused_though_waiting() {
+        let (fake, inserter) = fake_session();
+        fake.focus(FakeTarget::named("Editor", "notes.txt"));
+        let out = Arc::new(AtomicBool::new(false));
+        let descheduled = || std::thread::sleep(CAPTURE_BUDGET * 3);
+        let prompt = bounded_capture_after(inserter.clone(), &out, descheduled);
+        assert!(prompt.is_ok(), "{prompt:?}");
+        fake.set_capture_delay(CAPTURE_BUDGET * 3 / 2);
+        let late = bounded_capture_after(inserter, &out, descheduled);
+        assert!(
+            matches!(late, Err(InsertError::Unavailable { .. })),
+            "{late:?}"
+        );
+    }
+
+    /// A capture worker that panics fails its capture and does not keep
+    /// refusing the ones after it.
+    #[test]
+    fn a_panicked_capture_worker_does_not_block_later_captures() {
+        let (fake, inserter) = fake_session();
+        fake.focus(FakeTarget::named("Editor", "notes.txt"));
+        let out = Arc::new(AtomicBool::new(false));
+        fake.set_capture_panics(true);
+        let panicked = bounded_capture(inserter.clone(), &out);
+        assert!(
+            matches!(panicked, Err(InsertError::Unavailable { .. })),
+            "{panicked:?}"
+        );
+        fake.set_capture_panics(false);
+        let next = bounded_capture(inserter, &out);
+        assert!(next.is_ok(), "{next:?}");
+    }
+
+    /// Opening Settings again while a session check is unanswered starts
+    /// no second one; the note keeps the last answer until it returns.
+    #[gpui::test]
+    fn an_unanswered_session_check_is_not_joined_by_more(cx: &mut gpui::TestAppContext) {
+        let (app, fake) = app_with(cx, on());
+        let unverifiable = |app: &gpui::Entity<StarlingApp>, cx: &mut gpui::TestAppContext| {
+            app.read_with(cx, |app, _| app.insertion_unverifiable)
+        };
+        fake.set_verifies_target(false);
+        fake.set_availability_delay(Duration::from_millis(200));
+        app.update(cx, |app, cx| {
+            app.check_session_verifies(cx);
+            app.check_session_verifies(cx);
+            app.check_session_verifies(cx);
+        });
+        cx.run_until_parked();
+        assert!(!unverifiable(&app, cx));
+        std::thread::sleep(Duration::from_millis(600));
+        cx.run_until_parked();
+        assert_eq!(fake.availability_checks(), 1);
+        assert!(unverifiable(&app, cx));
+
+        // Once answered, the next opening asks again.
+        fake.set_availability_delay(Duration::ZERO);
+        fake.set_verifies_target(true);
+        app.update(cx, |app, cx| app.check_session_verifies(cx));
+        std::thread::sleep(Duration::from_millis(200));
+        cx.run_until_parked();
+        assert_eq!(fake.availability_checks(), 2);
+        assert!(!unverifiable(&app, cx));
     }
 
     #[gpui::test]

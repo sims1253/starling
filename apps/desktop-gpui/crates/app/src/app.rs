@@ -1743,18 +1743,7 @@ impl StarlingApp {
         self.draft_insertion = self.delivery.settings;
         // A display round trip: off the UI thread, so a compositor that
         // stopped answering cannot freeze the dialog.
-        let inserter = self.delivery.inserter.clone();
-        cx.spawn(async move |this, cx| {
-            let unverifiable = cx
-                .background_spawn(async move { inserter.session_verifies() == Some(false) })
-                .await;
-            this.update(cx, |app, cx| {
-                app.insertion_unverifiable = unverifiable;
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
+        self.check_session_verifies(cx);
         cx.notify();
     }
 
@@ -1983,7 +1972,7 @@ impl StarlingApp {
         self.commit_storage_draft();
         // From the next delivery on; a take already running keeps its
         // capture and follows the new setting when it finishes.
-        self.delivery.settings = self.draft_insertion;
+        self.set_insertion_settings(self.draft_insertion);
 
         // R11: an unresolvable config directory is surfaced, not swallowed —
         // settings must not silently land in the current working directory.

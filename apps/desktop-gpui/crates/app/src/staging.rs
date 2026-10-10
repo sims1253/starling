@@ -1469,6 +1469,43 @@ mod tests {
         assert_eq!(staged_insert_state(&app, cx, &id), None);
     }
 
+    /// A pressed Insert types nothing once it expired, even before its
+    /// expiry timer ran, nor once copy only was chosen.
+    #[gpui::test]
+    fn a_pressed_insert_types_nothing_once_expired_or_copy_only(cx: &mut gpui::TestAppContext) {
+        use crate::delivery::{PASTE_ARM_TIMEOUT, StagedInsert};
+        let (_root, app, fake, id) = staged_insert_take(cx, Default::default(), |_| {});
+        starling_focus(&app, cx, true);
+        press_insert(&app, cx);
+        app.update(cx, |app, _| app.backdate_armings(PASTE_ARM_TIMEOUT));
+        starling_focus(&app, cx, false);
+        assert!(fake.insertions().is_empty());
+        assert_eq!(
+            staged_insert_state(&app, cx, &id),
+            Some(StagedInsert::Ready)
+        );
+
+        // Switching to copy only disarms it.
+        let copy_only = starling_dictation::settings::InsertionSettings {
+            auto_insert: false,
+            ..Default::default()
+        };
+        starling_focus(&app, cx, true);
+        press_insert(&app, cx);
+        app.update(cx, |app, _| app.set_insertion_settings(copy_only));
+        assert_eq!(staged_insert_state(&app, cx, &id), None);
+        starling_focus(&app, cx, false);
+        assert!(fake.insertions().is_empty());
+
+        // And firing asks the setting again.
+        app.update(cx, |app, _| app.set_insertion_settings(Default::default()));
+        starling_focus(&app, cx, true);
+        press_insert(&app, cx);
+        app.update(cx, |app, _| app.delivery.settings = copy_only);
+        starling_focus(&app, cx, false);
+        assert!(fake.insertions().is_empty());
+    }
+
     /// Where the target cannot be checked (Wayland), the window the user
     /// switches to after Insert receives the draft, as with Paste last.
     #[gpui::test]

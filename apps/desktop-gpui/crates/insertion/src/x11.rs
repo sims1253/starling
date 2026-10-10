@@ -260,8 +260,8 @@ impl InsertionBackend for X11Backend {
         self.insert_guarded(target, text, &|| None)
     }
 
-    /// Checks `stop` before every chunk and, after each key's checks,
-    /// right before its key-down.
+    /// Checks `stop` before every chunk and, after each key's checks and
+    /// its Shift, right before its key-down.
     fn insert_guarded(
         &self,
         target: &TargetSnapshot,
@@ -1076,6 +1076,11 @@ impl X11Backend {
                 pressed
                     .press(shift)
                     .map_err(|e| BeforeKeydown(reply_error(e)))?;
+                // Shift's key-down waits for the server too; dropping
+                // `pressed` releases it.
+                if let Some(error) = stop() {
+                    return Err(BeforeKeydown(error));
+                }
             }
             // A refused key-down did not happen; a transport failure may
             // have delivered it.

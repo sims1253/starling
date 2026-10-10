@@ -56,6 +56,11 @@ struct State {
     verifies_target: bool,
     /// How long `capture` takes, like a display slow to answer.
     capture_delay: std::time::Duration,
+    /// How long `availability` takes, and how often it was asked.
+    availability_delay: std::time::Duration,
+    availability_checks: usize,
+    /// `capture` panics, like a backend with a bug.
+    capture_panics: bool,
     key_hook: Option<KeyHook>,
     insertions: Vec<(String, String)>,
     /// Every key `insert_guarded` sent, in arrival order, as one field
@@ -106,6 +111,9 @@ impl FakeBackend {
                 revalidate_failure: None,
                 verifies_target: true,
                 capture_delay: std::time::Duration::ZERO,
+                availability_delay: std::time::Duration::ZERO,
+                availability_checks: 0,
+                capture_panics: false,
                 key_hook: None,
                 insertions: Vec::new(),
                 field: String::new(),
@@ -166,6 +174,22 @@ impl FakeBackend {
         self.state().capture_delay = delay;
     }
 
+    /// Make `capture` panic (after its delay) until called with `false`.
+    pub fn set_capture_panics(&self, panics: bool) {
+        self.state().capture_panics = panics;
+    }
+
+    /// Make `availability` take `delay` before it answers, like a
+    /// display that connects but is slow to reply.
+    pub fn set_availability_delay(&self, delay: std::time::Duration) {
+        self.state().availability_delay = delay;
+    }
+
+    /// How many times `availability` was asked.
+    pub fn availability_checks(&self) -> usize {
+        self.state().availability_checks
+    }
+
     /// Run `hook` with each character's index before `insert_guarded`
     /// checks its `stop` for that character: lets a test change what the
     /// caller sees mid-typing.
@@ -196,6 +220,14 @@ impl InsertionBackend for FakeBackend {
     }
 
     fn availability(&self) -> Result<(), InsertError> {
+        let delay = {
+            let mut state = self.state();
+            state.availability_checks += 1;
+            state.availability_delay
+        };
+        if !delay.is_zero() {
+            std::thread::sleep(delay);
+        }
         self.state().availability.clone()
     }
 
@@ -205,6 +237,10 @@ impl InsertionBackend for FakeBackend {
             std::thread::sleep(delay);
         }
         let state = self.state();
+        if state.capture_panics {
+            drop(state);
+            panic!("fake backend: capture panicked");
+        }
         let (Some(target), Some(target_ref)) = (state.focus.clone(), state.current_ref()) else {
             return Err(InsertError::Rejected {
                 reason: "no window has input focus".to_string(),
