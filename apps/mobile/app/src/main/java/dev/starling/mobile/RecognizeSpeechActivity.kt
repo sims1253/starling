@@ -177,7 +177,7 @@ class RecognizeSpeechActivity : Activity() {
             onEnded = { if (activeRecording === recording) stopAndTranscribe() },
             diskWarned = application.diskWarnedAtStart(disk),
             onDiskLow = { minutes ->
-                if (activeRecording === recording) {
+                if (!isDestroyed && !isFinishing && activeRecording === recording) {
                     diskNotice = application.diskLowDuringTake(minutes)
                     showListeningStatus(takeStatus)
                 }
