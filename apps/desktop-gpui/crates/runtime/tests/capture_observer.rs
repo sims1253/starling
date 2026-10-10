@@ -196,3 +196,75 @@ fn a_device_that_will_not_open_reports_the_sources_reason() {
     );
     runtime.shutdown();
 }
+
+#[test]
+fn a_take_that_ended_interrupted_does_not_refuse_the_next_one() {
+    // #220: the host runs for hours; a lost device on one take must not
+    // leave the machine refusing every later capture.start.
+    let root = tempfile::tempdir().unwrap();
+    let observer = Arc::new(Recording::default());
+    let lost = FakeTakeScript {
+        stop: FakeStop::DeviceError("the device went away".into()),
+        ..FakeTakeScript::clean()
+    };
+    let (runtime, client) =
+        runtime(root.path(), vec![lost, FakeTakeScript::clean()], Arc::clone(&observer));
+    let events = runtime.subscribe();
+    client
+        .send(Some("t4"), Command::CaptureStart { policy: "push-to-talk".into() })
+        .unwrap();
+    until(&events, "started", |m| m.type_name() == "capture.started");
+    client
+        .send(Some("t4"), Command::CaptureStop { drain: Some(true) })
+        .unwrap();
+    until(&events, "the fatal error", |m| {
+        m.type_name() == "capture.error" && m.to_value()["payload"]["fatal"] == true
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while runtime.snapshot().capture.state != "Interrupted" {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    client
+        .send(Some("t5"), Command::CaptureStart { policy: "push-to-talk".into() })
+        .expect("the next take is accepted");
+    until(&events, "the next take started", |m| {
+        m.type_name() == "capture.started" && m.corr.as_deref() == Some("t5")
+    });
+    runtime.shutdown();
+}
+
+#[test]
+fn a_stop_that_reports_a_failed_device_keeps_the_take_as_interrupted() {
+    let root = tempfile::tempdir().unwrap();
+    let observer = Arc::new(Recording::default());
+    let faulted = FakeTakeScript {
+        stop: FakeStop::FaultedClean {
+            journal_id: "j_fault".into(),
+            fault: "stream error".into(),
+        },
+        ..FakeTakeScript::clean()
+    };
+    let (runtime, client) = runtime(root.path(), vec![faulted], Arc::clone(&observer));
+    let events = runtime.subscribe();
+    client
+        .send(Some("t6"), Command::CaptureStart { policy: "push-to-talk".into() })
+        .unwrap();
+    until(&events, "progress", |m| m.type_name() == "capture.progress");
+    client
+        .send(Some("t6"), Command::CaptureStop { drain: Some(true) })
+        .unwrap();
+    until(&events, "stopped", |m| m.type_name() == "capture.stopped");
+    let seen = wait_for(&observer, 3);
+    let Some(Seen::Persisted { stored: Ok(Some(id)), .. }) = seen.get(2) else {
+        panic!("expected a stored row: {seen:?}");
+    };
+    let store = starling_dictation::store_v2::StoreV2::open(root.path()).unwrap();
+    let record = store.get_capture(id).unwrap().expect("stored");
+    assert_eq!(
+        record.status,
+        starling_dictation::store_v2::CaptureStatus::Interrupted,
+        "never presented as complete"
+    );
+    runtime.shutdown();
+}

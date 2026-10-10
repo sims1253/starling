@@ -1062,6 +1062,25 @@ mod tests {
         Arc::new(audio::encode_wav_16k(&pcm).expect("encode wav"))
     }
 
+    /// A recorder journal a killed take left: `samples` under a fsynced
+    /// boundary, placed in `root`'s journal tree as `id`.
+    fn killed_journal(root: &std::path::Path, id: &str, samples: &[f32]) -> std::path::PathBuf {
+        let scratch = scratch_dir("killed-src");
+        let writer = StoreV2::open(&scratch).expect("scratch store");
+        let mut take = writer
+            .begin_take(store_v2::TakeMeta::for_device("test"))
+            .expect("begin");
+        take.append_frames(samples).expect("append");
+        take.write_boundary().expect("boundary");
+        let staged = scratch.join("staging").join(format!("{}.sj", take.id()));
+        drop(take);
+        let tree = root.join("journals");
+        std::fs::create_dir_all(&tree).expect("journals tree");
+        let path = tree.join(format!("{id}.sj"));
+        std::fs::rename(&staged, &path).expect("place journal");
+        path
+    }
+
     fn wav_of(samples: &[f32]) -> Arc<Vec<u8>> {
         let pcm = audio::PcmAudio {
             samples: samples.to_vec(),
@@ -1761,28 +1780,35 @@ mod tests {
         let store = v2_store("upkeep-sweep");
         let root = lock_v2(&store.0).root().to_path_buf();
         // A take the user deleted: its audio waits in quarantine.
-        let deleted = store.save_capture(tiny_wav(200), None).expect("save").id;
+        let deleted = store.save_capture(tiny_wav(200)).expect("save").id;
         store.delete(&deleted).expect("delete");
         let quarantined = root.join("quarantine").join(format!("{deleted}.sj"));
         assert!(quarantined.exists());
-        // A faulted recorder journal the stored take provably holds.
+        // A faulted recorder journal a stored take provably holds, moved
+        // aside the way the recording service does when it stores a take
+        // from memory in its place (#220).
         let samples: Vec<f32> = (0..120).map(|i| (i % 97) as f32 * 0.001).collect();
-        let path = killed_journal(&store, "j_proven", &samples, &[]);
-        let report = recorder::JournalReport {
-            path,
-            id: "j_proven".to_string(),
-            sample_rate: 16_000,
-            acknowledged_samples: samples.len() as u64,
-            finalized: true,
-            fault: Some("fsync failed".to_string()),
-            liveness: Default::default(),
+        let path = killed_journal(&root, "j_proven", &samples);
+        let replacement = {
+            let mut meta = store_v2::TakeMeta::for_device("");
+            meta.supersedes_journal = Some("j_proven".to_string());
+            let pcm = decode_wav(&tiny_wav(300)).expect("decode");
+            let mut v2 = lock_v2(&store.0);
+            let mut take = v2.begin_take_at_rate(16_000, meta).expect("begin");
+            take.append_and_seal(&pcm.samples).expect("append");
+            let committed = take
+                .finalize()
+                .expect("finalize")
+                .commit_marked(&mut v2, store_v2::CommitMark::Complete)
+                .expect("commit");
+            v2.audio_journal_path(&committed.record.id).expect("stored path")
         };
-        store.save_capture(tiny_wav(300), Some(&report)).expect("save");
-        let superseded = capture_journals_dir(&lock_v2(&store.0)).join(store_v2::SUPERSEDED_SUBDIR);
+        assert!(store_v2::supersede_journal_held_by(&path, &replacement).expect("move aside"));
+        let superseded = root.join("journals").join(store_v2::SUPERSEDED_SUBDIR);
         let proven = superseded.join("j_proven.sj");
         assert!(proven.exists());
         // A journal under superseded/ that no stored take holds.
-        let path = killed_journal(&store, "j_unproven", &samples, &[]);
+        let path = killed_journal(&root, "j_unproven", &samples);
         let unproven = superseded.join("j_unproven.sj");
         std::fs::rename(&path, &unproven).expect("place journal");
 
@@ -1823,7 +1849,7 @@ mod tests {
     #[test]
     fn a_deleted_take_read_before_the_delete_is_swept_once_the_read_ends() {
         let store = v2_store("upkeep-sweep-pin");
-        let id = store.save_capture(tiny_wav(32_000), None).expect("save").id;
+        let id = store.save_capture(tiny_wav(32_000)).expect("save").id;
         let upkeep = store
             .audio_upkeep(store_v2::RetentionPolicy::default, || false)
             .expect("upkeep");
@@ -1861,7 +1887,7 @@ mod tests {
         let root = lock_v2(&store.0).root().to_path_buf();
         let quarantined: Vec<std::path::PathBuf> = (0..2)
             .map(|_| {
-                let id = store.save_capture(tiny_wav(200), None).expect("save").id;
+                let id = store.save_capture(tiny_wav(200)).expect("save").id;
                 store.delete(&id).expect("delete");
                 root.join("quarantine").join(format!("{id}.sj"))
             })

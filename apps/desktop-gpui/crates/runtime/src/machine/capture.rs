@@ -1512,6 +1512,21 @@ impl CaptureActor {
         let corr = corr.unwrap_or_else(|| "take-anon".to_string());
         match command {
             Command::CaptureStart { policy } => {
+                // A take that ended `Interrupted` (a lost device, a failed
+                // store commit) is already salvaged and registered: once
+                // nothing of it is still persisting, the next start settles
+                // the machine back to `Idle` through the internal edge a
+                // failed device open takes (#211) — otherwise one fault
+                // would refuse every later take for the runtime's lifetime
+                // (#220: the long-lived host).
+                if self.core.state() == "Interrupted"
+                    && self.take.is_none()
+                    && self.pending_persists.is_empty()
+                {
+                    if let Err(violation) = self.core.advance_internal("Idle") {
+                        self.core.record_violation(violation);
+                    }
+                }
                 match self.core.commit_command("capture.start", Some(corr.clone())) {
                     Ok(_) => {
                         let _ = reply.try_send(Ok(Receipt::Accepted));
@@ -1750,6 +1765,39 @@ impl CaptureActor {
         let clip = live.session.source_clip_ratio();
         let outcome = live.session.stop();
         match outcome {
+            Ok(captured) if captured.device_fault.is_some() => {
+                // The device failed after the last poll saw it healthy:
+                // what the stop handed back is kept, but as an
+                // interrupted take — never presented as complete.
+                let fault = captured.device_fault.clone().unwrap_or_default();
+                self.emit(
+                    Event::CaptureError {
+                        code: "device_fault_on_stop".into(),
+                        fatal: false,
+                    },
+                    &corr,
+                );
+                let salvaged = salvage_outcome(facts, Ok(captured))
+                    .expect("a stop that handed back audio always salvages it");
+                if let Some(gap) = salvaged.tail_gap {
+                    self.emit(
+                        Event::CaptureGap {
+                            start_sample: gap.start_sample,
+                            end_sample: gap.end_sample,
+                        },
+                        &corr,
+                    );
+                }
+                self.hand_off_persist(
+                    salvaged.record,
+                    corr,
+                    PersistIntent::Interrupted(format!(
+                        "The microphone failed as the take stopped ({fault}); everything it \
+                         captured was kept as this interrupted recording."
+                    )),
+                    PersistFollow::QuiesceStop,
+                );
+            }
             Ok(captured) => {
                 let journal = captured.journal.clone();
                 let capture_id = journal

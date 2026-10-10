@@ -629,6 +629,8 @@ pub(crate) struct LiveCapture {
     pub status: Option<LiveTakeStatus>,
     /// Whether the host has confirmed the take is recording.
     pub confirmed: bool,
+    /// Whether this window asked for the take's audio.
+    pub tapped: bool,
     started_at: Instant,
 }
 
@@ -639,6 +641,7 @@ impl LiveCapture {
             feed,
             status: None,
             confirmed: false,
+            tapped: false,
             started_at: Instant::now(),
         }
     }

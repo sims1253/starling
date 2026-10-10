@@ -50,6 +50,9 @@ pub enum FakeStop {
     Empty,
     /// A device error on stop.
     DeviceError(String),
+    /// A stop that hands back the take but reports the device failed
+    /// just before it (`CapturedTake::device_fault`).
+    FaultedClean { journal_id: String, fault: String },
 }
 
 impl Default for FakeTakeScript {
@@ -220,6 +223,26 @@ impl CaptureSession for FakeSession {
                         fault: None,
                         liveness: Default::default(),
                     }),
+                })
+            }
+            FakeStop::FaultedClean { journal_id, fault } => {
+                let count = produced.max(1);
+                Ok(CapturedTake {
+                    audio: starling_dictation::audio::PcmAudio {
+                        samples: fake_samples(&self.script, count),
+                        sample_rate: self.script.sample_rate,
+                        channels: 1,
+                    },
+                    journal: Some(starling_dictation::recorder::JournalReport {
+                        id: journal_id.clone(),
+                        path: std::path::PathBuf::from(format!("/tmp/fake/{journal_id}.sj")),
+                        sample_rate: self.script.sample_rate,
+                        acknowledged_samples: count,
+                        finalized: true,
+                        fault: None,
+                        liveness: Default::default(),
+                    }),
+                    device_fault: Some(fault.clone()),
                 })
             }
             FakeStop::Empty => Err(RecorderError::Empty),

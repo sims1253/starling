@@ -331,3 +331,109 @@ fn of_two_windows_adopting_an_unowned_take_only_the_first_tap_gets_it() {
     drop(second);
     host.shutdown();
 }
+
+#[test]
+fn a_second_window_cannot_end_a_take_its_live_owner_records() {
+    let root = tempfile::tempdir().unwrap();
+    let source = FakeCaptureSource::new(vec![FakeTakeScript::clean()]);
+    let mut host = serve(config(root.path(), source)).expect("host serves");
+    let owner = connect(&host);
+    owner.take_watch().unwrap();
+    start(&owner, "take-mine");
+    let mut seen = Vec::new();
+    until_take(&owner, "a live tick", &mut seen, is_live_tick("take-mine"));
+    let other = connect(&host);
+    other.take_watch().unwrap();
+    for command in [Command::CaptureStop { drain: Some(true) }, Command::CaptureAbort] {
+        match other.send(Some("take-mine"), command) {
+            Err(starling_runtime_host::client::ClientError::Rejected(rejection)) => {
+                assert!(format!("{rejection:?}").contains("another connection"), "{rejection:?}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+    assert_eq!(host_capture_state(&owner), "Recording", "the take records on");
+    stop(&owner, "take-mine");
+    until_take(&owner, "the stored row", &mut seen, is_persisted("take-mine"));
+    drop(owner);
+    drop(other);
+    host.shutdown();
+}
+
+fn host_capture_state(client: &HostClient) -> String {
+    client.snapshot().unwrap()["capture"]["state"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+#[test]
+fn an_orphan_no_app_claimed_survives_the_host_exiting() {
+    let root = tempfile::tempdir().unwrap();
+    let source = FakeCaptureSource::new(vec![FakeTakeScript::clean()]);
+    let config_a = config(root.path(), source).with_orphan_grace(Duration::from_millis(200));
+    let mut host = serve(config_a).expect("host serves");
+    {
+        let gone = connect(&host);
+        start(&gone, "take-later");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !host_settled(root.path()) || !host.idle() {
+        assert!(Instant::now() < deadline, "the host never stored the orphan");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // The host goes away (idle exit) before any app returns.
+    host.shutdown();
+    drop(host);
+    let mut host = serve(config(root.path(), FakeCaptureSource::new(vec![]))).expect("serves again");
+    let app = connect(&host);
+    app.take_watch().unwrap();
+    let mut seen = Vec::new();
+    let persisted = until_take(&app, "the remembered orphan", &mut seen, |frame| {
+        matches!(frame, TakeWire::Persisted { orphan: true, .. })
+    });
+    let TakeWire::Persisted { stored_id: Some(id), .. } = persisted else {
+        panic!("{persisted:?}");
+    };
+    let store = starling_dictation::store_v2::StoreV2::open(root.path()).unwrap();
+    assert!(store.get_capture(&id).unwrap().is_some());
+    assert!(
+        !root.path().join(starling_runtime_host::takes::UNCLAIMED_FILE).exists(),
+        "handed over, so no longer remembered"
+    );
+    drop(app);
+    host.shutdown();
+}
+
+#[test]
+fn an_app_watching_fails_the_attempts_a_dead_app_left_started() {
+    let root = tempfile::tempdir().unwrap();
+    let id = {
+        let mut store = starling_dictation::store_v2::StoreV2::open(root.path()).unwrap();
+        let wav = starling_dictation::audio::encode_wav_16k(&starling_dictation::audio::PcmAudio {
+            samples: vec![0.1; 1600],
+            sample_rate: 16_000,
+            channels: 1,
+        })
+        .unwrap();
+        store
+            .save_wav_capture(&wav, starling_dictation::store_v2::TakeMeta::for_device("t"))
+            .unwrap()
+            .record
+            .id
+    };
+    let mut host = serve(config(root.path(), FakeCaptureSource::new(vec![]))).expect("serves");
+    // An app process transcribing the take dies with its attempt started.
+    {
+        let mut dead_app = starling_dictation::store_v2::StoreV2::open(root.path()).unwrap();
+        dead_app.begin_recognition(&id, "engine:test", None).unwrap();
+    }
+    let app = connect(&host);
+    app.take_watch().unwrap();
+    let store = starling_dictation::store_v2::StoreV2::open(root.path()).unwrap();
+    let attempts = store.attempts_for(&id).unwrap();
+    assert_ne!(attempts.last().unwrap().status, "started", "{attempts:?}");
+    drop(app);
+    host.shutdown();
+}

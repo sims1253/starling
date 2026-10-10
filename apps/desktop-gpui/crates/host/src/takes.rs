@@ -92,7 +92,16 @@ pub struct TakeHub {
     state: Mutex<HubState>,
     client: OnceLock<RuntimeClient>,
     orphan_grace: Duration,
+    /// Where unclaimed orphans are kept across host restarts (the data
+    /// root's [`UNCLAIMED_FILE`]); `None` keeps them in memory only.
+    unclaimed_file: Option<std::path::PathBuf>,
 }
+
+/// The unclaimed-orphans file in the data root: the stored ids of takes
+/// the host finished with no app following, until an app is handed them
+/// — a host that exits idle (or is killed) before any app returns must
+/// not forget to have them transcribed.
+pub const UNCLAIMED_FILE: &str = "unclaimed-takes.json";
 
 #[derive(Default)]
 struct HubState {
@@ -173,12 +182,61 @@ fn owner_for(owner: &Option<Arc<ConnState>>, conn: &Arc<ConnState>) -> TakeOwner
 }
 
 impl TakeHub {
-    pub fn new(orphan_grace: Duration) -> Arc<TakeHub> {
+    pub fn new(orphan_grace: Duration, unclaimed_file: Option<std::path::PathBuf>) -> Arc<TakeHub> {
+        let mut state = HubState::default();
+        if let Some(path) = &unclaimed_file {
+            state.unclaimed = load_unclaimed(path);
+        }
         Arc::new(TakeHub {
-            state: Mutex::new(HubState::default()),
+            state: Mutex::new(state),
             client: OnceLock::new(),
             orphan_grace,
+            unclaimed_file,
         })
+    }
+
+    /// Queues `frame` (a [`Frame::TakePersisted`]) for the next app to
+    /// watch, durably.
+    fn keep_unclaimed(&self, state: &mut HubState, frame: Frame) {
+        state.unclaimed.push(frame);
+        self.save_unclaimed(state);
+    }
+
+    fn save_unclaimed(&self, state: &HubState) {
+        let Some(path) = &self.unclaimed_file else {
+            return;
+        };
+        let ids: Vec<&str> = state
+            .unclaimed
+            .iter()
+            .filter_map(|frame| match frame {
+                Frame::TakePersisted {
+                    stored_id: Some(id),
+                    interrupted: false,
+                    error: None,
+                    ..
+                } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        let result = if ids.is_empty() {
+            match std::fs::remove_file(path) {
+                Err(err) if err.kind() != std::io::ErrorKind::NotFound => Err(err),
+                _ => Ok(()),
+            }
+        } else {
+            let tmp = path.with_extension("json.tmp");
+            serde_json::to_vec(&ids)
+                .map_err(std::io::Error::other)
+                .and_then(|bytes| std::fs::write(&tmp, bytes))
+                .and_then(|()| std::fs::rename(&tmp, path))
+        };
+        if let Err(err) = result {
+            eprintln!(
+                "starling-runtime-host: could not record unclaimed takes in {}: {err}",
+                path.display()
+            );
+        }
     }
 
     /// The runtime the hub stops orphaned takes through (set once the
@@ -241,11 +299,26 @@ impl TakeHub {
             });
         }
         // The takes nobody followed go to this app, and only to it.
-        for frame in std::mem::take(&mut state.unclaimed) {
-            let _ = conn.try_deliver(frame);
+        let unclaimed = std::mem::take(&mut state.unclaimed);
+        if !unclaimed.is_empty() {
+            for frame in unclaimed {
+                let _ = conn.try_deliver(frame);
+            }
+            self.save_unclaimed(&state);
         }
         state.orphaned_since = None;
         Ok(())
+    }
+
+    /// Whether `conn` may stop or cancel take `corr`: not while another
+    /// live connection owns it (a second window must not end, and then
+    /// transcribe, a take another window records).
+    pub(crate) fn may_end(&self, corr: &str, conn: &Arc<ConnState>) -> bool {
+        let state = lock_registry(&self.state);
+        match state.live.as_ref().filter(|live| live.take == corr) {
+            Some(live) => owner_for(&live.owner, conn) != TakeOwner::Another,
+            None => true,
+        }
     }
 
     /// `conn` sent `capture.start` for `corr`: it owns that take.
@@ -290,9 +363,35 @@ impl TakeHub {
         let mut orphan_stop = None;
         {
             let mut state = lock_registry(&self.state);
-            state
-                .watchers
-                .retain(|watcher| !watcher.conn.closed.load(Ordering::SeqCst));
+            // A watcher that went away with a stored-row notice still held
+            // behind its tap: its app is gone, so the take is an orphan
+            // for the next app.
+            let (closed, open): (Vec<Watcher>, Vec<Watcher>) =
+                std::mem::take(&mut state.watchers)
+                    .into_iter()
+                    .partition(|watcher| watcher.conn.closed.load(Ordering::SeqCst));
+            state.watchers = open;
+            for watcher in closed {
+                for frame in watcher.after_tap {
+                    if let Frame::TakePersisted {
+                        take,
+                        stored_id,
+                        interrupted,
+                        error,
+                        ..
+                    } = frame
+                    {
+                        let orphan = Frame::TakePersisted {
+                            take,
+                            stored_id,
+                            interrupted,
+                            error,
+                            orphan: true,
+                        };
+                        self.keep_unclaimed(&mut state, orphan);
+                    }
+                }
+            }
             let HubState {
                 live,
                 ended,
@@ -328,7 +427,16 @@ impl TakeHub {
                 self.orphan_grace
             );
             if let Err(err) = client.send(Some(&take), Command::CaptureStop { drain: Some(true) }) {
-                eprintln!("starling-runtime-host: stopping orphaned take {take} failed: {err}");
+                eprintln!(
+                    "starling-runtime-host: stopping orphaned take {take} failed ({err}); \
+                     retrying in a second"
+                );
+                // Never leave the microphone open on a refused stop: ask
+                // again a second from now.
+                let mut state = lock_registry(&self.state);
+                state.orphan_stopped.retain(|stopped| stopped != &take);
+                state.orphaned_since = Instant::now()
+                    .checked_sub(self.orphan_grace.saturating_sub(Duration::from_secs(1)));
             }
         }
     }
@@ -613,7 +721,33 @@ impl CaptureObserver for TakeHub {
             .first_mut()
             .is_some_and(|watcher| watcher.deliver_after_tap(corr, frame.clone()));
         if !delivered {
-            state.unclaimed.push(frame);
+            self.keep_unclaimed(&mut state, frame);
+        }
+    }
+}
+
+/// The unclaimed orphans a previous host left (see [`UNCLAIMED_FILE`]).
+fn load_unclaimed(path: &std::path::Path) -> Vec<Frame> {
+    let Ok(bytes) = std::fs::read(path) else {
+        return Vec::new();
+    };
+    match serde_json::from_slice::<Vec<String>>(&bytes) {
+        Ok(ids) => ids
+            .into_iter()
+            .map(|id| Frame::TakePersisted {
+                take: id.clone(),
+                stored_id: Some(id),
+                interrupted: false,
+                error: None,
+                orphan: true,
+            })
+            .collect(),
+        Err(err) => {
+            eprintln!(
+                "starling-runtime-host: ignoring unreadable {}: {err}",
+                path.display()
+            );
+            Vec::new()
         }
     }
 }

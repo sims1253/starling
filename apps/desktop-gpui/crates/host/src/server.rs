@@ -349,6 +349,8 @@ pub struct HostShared {
     pub(crate) broker: Sender<BrokerMsg>,
     /// The app's take feed (see [`crate::takes`]).
     pub(crate) takes: Arc<crate::takes::TakeHub>,
+    /// The lease-holding store: owner-side repairs run on it.
+    lease: Arc<Mutex<StoreV2>>,
     agent_allowlist: Allowlist,
     #[cfg(feature = "test-support")]
     insecure_test_app_role: bool,
@@ -569,7 +571,10 @@ pub fn serve(config: HostConfig) -> Result<HostHandle, HostError> {
         &startup_reconciliation,
         reconcile_error,
     );
-    let takes = crate::takes::TakeHub::new(config.orphan_grace);
+    let takes = crate::takes::TakeHub::new(
+        config.orphan_grace,
+        Some(config.data_root.join(crate::takes::UNCLAIMED_FILE)),
+    );
     takes.set_recovery(startup_recovery.recovery);
 
     // 2. The endpoint.
@@ -646,6 +651,7 @@ pub fn serve(config: HostConfig) -> Result<HostHandle, HostError> {
         live_connections: AtomicUsize::new(0),
         broker: broker_tx,
         takes: Arc::clone(&takes),
+        lease: Arc::clone(&lease),
         agent_allowlist,
         #[cfg(feature = "test-support")]
         insecure_test_app_role: config.insecure_test_app_role,
@@ -971,14 +977,45 @@ fn connection_reader(
                     }
                     Frame::Command { mut envelope } => {
                         // The connection that starts a take owns it in
-                        // the take feed.
-                        if envelope.get("type").and_then(serde_json::Value::as_str)
-                            == Some("capture.start")
-                        {
-                            if let Some(corr) =
-                                envelope.get("corr").and_then(serde_json::Value::as_str)
-                            {
+                        // the take feed, and only it ends the take while
+                        // it is connected.
+                        let kind = envelope
+                            .get("type")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        let corr = envelope
+                            .get("corr")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string);
+                        if let Some(corr) = corr.as_deref() {
+                            if kind == "capture.start" {
                                 shared.takes.starting(corr, &state);
+                            }
+                            if (kind == "capture.stop" || kind == "capture.abort")
+                                && !shared.takes.may_end(corr, &state)
+                            {
+                                let id = envelope
+                                    .get("id")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or_default()
+                                    .to_string();
+                                let refusal = Frame::Receipt {
+                                    req: id,
+                                    seq: None,
+                                    result: Err(Rejection::IllegalInState {
+                                        command: kind,
+                                        state: "Recording".to_string(),
+                                        detail: format!(
+                                            "take {corr:?} belongs to another connection"
+                                        ),
+                                    }),
+                                };
+                                if state.try_deliver(refusal).is_err() {
+                                    state.close();
+                                    break;
+                                }
+                                continue;
                             }
                         }
                         if handle_command(&shared, &state, &mut envelope).is_err() {
@@ -1083,6 +1120,20 @@ fn connection_reader(
                         break;
                     }
                     Frame::TakeWatch { req } => {
+                        // An app (re)connected: attempts a dead app left
+                        // "started" are failed now, ready to retry — a
+                        // live app's attempts are protected by their
+                        // markers (#213). Startup ran the same repair.
+                        if let Err(err) = shared
+                            .lease
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .interrupt_stale_attempts(crate::recovery::STALE_ATTEMPT_NOTE)
+                        {
+                            eprintln!(
+                                "starling-runtime-host: failing stale transcription attempts: {err}"
+                            );
+                        }
                         if shared.takes.watch(&state, req).is_err() {
                             state.close();
                             break;

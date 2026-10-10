@@ -47,6 +47,10 @@ pub(crate) struct HostState {
     /// The live take's stream waits for the take's device rate, which the
     /// host's first tick brings: the endpoint it will open.
     pub(crate) stream_endpoint: Option<String>,
+    /// A running take with no live owner this window asked for (by
+    /// tapping it), and when: it is adopted only once the host says it is
+    /// this window's — of two windows asking, only one gets it.
+    pub(crate) claiming: Option<(String, Instant)>,
 }
 
 /// A take this window stopped or cancelled, until the host stored it.
@@ -193,6 +197,7 @@ impl StarlingApp {
             HostUpdate::Disconnected { reason } => {
                 self.host.client = None;
                 self.host.down = Some(reason);
+                self.host.claiming = None;
                 self.let_go_of_takes(cx);
             }
             HostUpdate::Take(update) => self.take_update(update, cx),
@@ -273,6 +278,68 @@ impl StarlingApp {
         }
     }
 
+    /// A tick for the take this window asked for.
+    fn claim_update(
+        &mut self,
+        take: String,
+        rate: u32,
+        status: Option<starling_runtime::machine::capture::LiveTakeStatus>,
+        owner: TakeOwner,
+        ended: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let forget = |app: &mut StarlingApp, take: &str| {
+            app.host.claiming = None;
+            if let Some(link) = &app.host.link {
+                link.forget(take);
+            }
+        };
+        if ended || owner == TakeOwner::Another {
+            // It ended, or another window got it first.
+            forget(self, &take);
+            return;
+        }
+        if owner == TakeOwner::Nobody {
+            // The tap has not landed yet (or was lost to a reconnect):
+            // ask again now and then.
+            if let Some((_, asked_at)) = self.host.claiming.as_mut() {
+                if asked_at.elapsed() >= REASK {
+                    *asked_at = Instant::now();
+                    if let Some(link) = &self.host.link {
+                        link.tap(&take, 0);
+                    }
+                }
+            }
+            return;
+        }
+        self.host.claiming = None;
+        if self.recorder.is_none() && !self.activation.is_active() {
+            self.adopt_take(take, rate, status, cx);
+            return;
+        }
+        // This window started a take of its own meanwhile, so it cannot
+        // show this one: stop it and transcribe it into history.
+        let Some(link) = &self.host.link else {
+            return;
+        };
+        let feed = link.feed(&take);
+        let target = self.resolve_take_target();
+        let finishing = FinishingTake::new(
+            take.clone(),
+            self.activation.last_started(),
+            feed,
+            Handoff::default(),
+            FinishKind::Transcribe {
+                target,
+                stopped_at: Instant::now(),
+                staging: None,
+                delivery: None,
+            },
+        );
+        self.host_command(&take, finishing.command());
+        self.host.finishing.push(finishing);
+    }
+
     /// Another window holds the take this window adopted: it is theirs.
     fn lose_live_take(&mut self, cx: &mut Context<Self>) {
         if let Some(live) = self.recorder.take() {
@@ -331,6 +398,15 @@ impl StarlingApp {
                         self.live_take_ended_elsewhere(cx);
                     }
                 }
+                if self
+                    .host
+                    .claiming
+                    .as_ref()
+                    .is_some_and(|(claimed, _)| *claimed == take)
+                {
+                    self.claim_update(take, rate, status, owner, ended.is_some(), cx);
+                    return;
+                }
                 if let Some(index) = self.finishing_index(&take) {
                     match ended {
                         Some(total) => {
@@ -344,9 +420,15 @@ impl StarlingApp {
                 if ended.is_none()
                     && owner == TakeOwner::Nobody
                     && self.recorder.is_none()
+                    && self.host.claiming.is_none()
                     && !self.activation.is_active()
                 {
-                    self.adopt_take(take, rate, status, cx);
+                    // Ask for it; adopt it once it is ours.
+                    if let Some(link) = &self.host.link {
+                        link.feed(&take);
+                        link.tap(&take, 0);
+                        self.host.claiming = Some((take, Instant::now()));
+                    }
                 }
             }
             TakeUpdate::StartFailed {
@@ -420,8 +502,11 @@ impl StarlingApp {
         };
         if first {
             live.confirmed = true;
-            if let Some(link) = &self.host.link {
-                link.tap(take, 0);
+            if !live.tapped {
+                live.tapped = true;
+                if let Some(link) = &self.host.link {
+                    link.tap(take, 0);
+                }
             }
             if let Some(endpoint) = self.host.stream_endpoint.take() {
                 let feed = Arc::clone(&live.feed);
@@ -501,7 +586,10 @@ impl StarlingApp {
             return;
         };
         let feed = link.feed(&take);
-        self.recorder = Some(LiveCapture::new(take.clone(), feed));
+        let mut live = LiveCapture::new(take.clone(), feed);
+        // Claiming already asked for its audio from the start.
+        live.tapped = true;
+        self.recorder = Some(live);
         self.recording_take = Some(activation);
         self.audio_upkeep.set_recording(true);
         self.live_partial.clear();
@@ -784,7 +872,7 @@ impl StarlingApp {
     ) {
         let finishing = FinishingTake::new(live.take.clone(), activation, Arc::clone(&live.feed), handoff, kind);
         self.host_command(&live.take, finishing.command());
-        if !live.confirmed {
+        if !live.tapped {
             // Never confirmed, so never tapped: tap now so the end still
             // arrives after the last sample.
             if let Some(link) = &self.host.link {
