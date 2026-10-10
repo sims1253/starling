@@ -1394,6 +1394,7 @@ mod tests {
             second.read_with(cx, |app, _| {
                 app.engine_settings.mode == EngineMode::Manual
                     && app.draft_engine_mode == EngineMode::Manual
+                    && app.endpoint == "http://127.0.0.1:9"
                     && app.engine_snapshot().is_none()
             })
         });

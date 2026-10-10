@@ -16,8 +16,10 @@
 
 use serde::{Deserialize, Serialize};
 
-/// One build of the host, as the handshake compares it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// One build of the host, as the handshake compares it. Two stamps are
+/// equal when their code is (`id`): the same code built twice — another
+/// feature set, a rebuild — is the same build to the handshake.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BuildStamp {
     /// Equal for two builds of the same code.
     pub id: String,
@@ -43,6 +45,14 @@ impl BuildStamp {
     }
 }
 
+impl PartialEq for BuildStamp {
+    fn eq(&self, other: &BuildStamp) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Eq for BuildStamp {}
+
 /// How a host answered an app asking it to step aside
 /// ([`crate::frame::Frame::Retire`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -64,4 +74,30 @@ pub fn older_app_refusal() -> String {
     "This Starling window is from an older version than the Starling recording service that is \
      running. Close this window and start Starling again."
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stamps_compare_by_code_and_order_by_build_time() {
+        let a = BuildStamp {
+            id: "same".into(),
+            built: 1,
+        };
+        let rebuilt = BuildStamp {
+            id: "same".into(),
+            built: 2,
+        };
+        let newer = BuildStamp {
+            id: "other".into(),
+            built: 3,
+        };
+        assert_eq!(a, rebuilt, "the same code built twice is one build");
+        assert!(!a.older_than(&rebuilt));
+        assert!(a.older_than(&newer));
+        assert!(!newer.older_than(&a));
+        assert_ne!(a, newer);
+    }
 }

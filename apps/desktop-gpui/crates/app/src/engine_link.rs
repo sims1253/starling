@@ -111,6 +111,9 @@ impl StarlingApp {
         // The settings another window (or a hand edit) gave the engine
         // become this window's committed ones — unless this window's own
         // change may not have reached the host yet.
+        // In manual mode the indicator is this window's own probe of the
+        // server: a server (or mode) taken over from the host is probed.
+        let mut probe = false;
         if self.engine_configuring == 0 && status.revision >= self.engine_revision {
             if self.engine_settings.mode != status.mode {
                 if self.draft_engine_mode == self.engine_settings.mode {
@@ -118,8 +121,17 @@ impl StarlingApp {
                 }
                 if status.mode == EngineMode::Builtin {
                     self.retire_manual_probe();
+                } else {
+                    probe = true;
                 }
                 self.engine_settings.mode = status.mode;
+            }
+            if let Some((endpoint, model)) = &status.server {
+                if (&self.endpoint, &self.model) != (endpoint, model) {
+                    self.endpoint = endpoint.clone();
+                    self.model = model.clone();
+                    probe = true;
+                }
             }
             if status.mode == EngineMode::Builtin {
                 let backend = status.backend_override.map(|backend| backend.as_str().to_string());
@@ -151,6 +163,14 @@ impl StarlingApp {
             }
         }
         self.engine_status = Some(status);
+        if probe {
+            self.connection = Connection::Checking;
+            self.check_health(
+                crate::app::HealthCheckPurpose::Live,
+                self.endpoint.clone(),
+                cx,
+            );
+        }
         if self.engine_settings.mode == EngineMode::Builtin {
             self.connection = match self.engine_snapshot() {
                 Some(snapshot) => views::engine_status_view(&snapshot).connection,

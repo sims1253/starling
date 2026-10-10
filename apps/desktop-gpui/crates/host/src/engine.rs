@@ -246,6 +246,9 @@ pub struct EngineStatus {
     pub mode: EngineMode,
     /// The built-in engine's CPU/automatic choice (builtin mode).
     pub backend_override: Option<Backend>,
+    /// The user's server and model the host transcribes with (manual
+    /// mode): what every window's Settings show.
+    pub server: Option<(String, String)>,
     /// What serves (`builtin`, `manual:<endpoint>` redacted,
     /// `unconfigured`, `unavailable`, `none`).
     pub label: String,
@@ -265,6 +268,7 @@ impl EngineStatus {
         EngineStatus {
             mode: EngineMode::Builtin,
             backend_override: None,
+            server: None,
             label: "none".to_string(),
             snapshot: None,
             unavailable: Some(
@@ -591,14 +595,16 @@ impl EngineHost {
             } => EngineStatus {
                 mode: EngineMode::Builtin,
                 backend_override: *backend_override,
+                server: None,
                 label,
                 snapshot: Some(manager.snapshot()),
                 unavailable: None,
                 revision,
             },
-            EngineState::Manual { .. } => EngineStatus {
+            EngineState::Manual { endpoint, model } => EngineStatus {
                 mode: EngineMode::Manual,
                 backend_override: None,
+                server: Some((endpoint.clone(), model.clone())),
                 label,
                 snapshot: None,
                 unavailable: None,
@@ -611,6 +617,7 @@ impl EngineHost {
             } => EngineStatus {
                 mode: EngineMode::Builtin,
                 backend_override: *backend_override,
+                server: None,
                 label,
                 snapshot: None,
                 unavailable: Some(reason.clone()),

@@ -389,7 +389,11 @@ impl StarlingApp {
             self.active_ids.remove(&id);
         }
         self.host.requests.clear();
-        self.refresh_history(cx);
+        // No history reload here: the history is the host's, and with the
+        // connection gone it cannot answer (the reload would only put "not
+        // reachable" in the banner — and stay there through a long wait,
+        // such as an older version's service finishing its work). The
+        // next connection reloads it.
     }
 
     /// A tick for the take this window asked for.
