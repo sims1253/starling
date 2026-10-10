@@ -654,6 +654,29 @@ fn binding_nothing_reads_as_declined() {
 }
 
 #[test]
+fn a_bind_that_assigns_no_keys_reads_as_declined() {
+    let bus = private_bus!();
+    // The entry comes back, but without keys (a desktop's placeholder).
+    let (_portal, _script) = fake_portal(
+        &bus,
+        Script {
+            bound_trigger: None,
+            ..bound_script()
+        },
+    );
+    let mut client = PortalShortcuts::spawn(Some(bus.address.clone()), None, &shortcut("F9"));
+    let mut events = Vec::new();
+    wait_for(&mut client, &mut events, "needs setup", |status, _| {
+        status.can_set_up()
+    });
+    client.set_up(&shortcut("F9"));
+    wait_for(&mut client, &mut events, "declined", |status, _| {
+        matches!(status, PortalStatus::Declined { .. })
+    });
+    assert!(!client.bound_at(Instant::now()));
+}
+
+#[test]
 fn a_session_closed_mid_hold_releases_the_shortcut() {
     let bus = private_bus!();
     let (portal, script) = fake_portal(

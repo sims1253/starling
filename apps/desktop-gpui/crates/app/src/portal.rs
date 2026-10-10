@@ -690,17 +690,19 @@ mod dbus {
                         Ok((RESPONSE_SUCCESS, results)) => {
                             match find_ours(results.shortcuts.as_deref().unwrap_or_default()) {
                                 // Bound in a session that is still live.
-                                Some(trigger) if self.session.as_ref() == Some(session) => {
+                                Some(Some(trigger)) if self.session.as_ref() == Some(session) => {
                                     self.bound = true;
                                     self.accepted = true;
                                     Some(PortalStatus::Bound {
-                                        trigger,
+                                        trigger: Some(trigger),
                                         configurable,
                                     })
                                 }
                                 // The session closed meanwhile (already said).
-                                Some(_) => None,
-                                None => Some(PortalStatus::Declined { configurable }),
+                                Some(Some(_)) => None,
+                                // No entry, or one without keys (as at start
+                                // and in `ShortcutsChanged`): nothing fires.
+                                Some(None) | None => Some(PortalStatus::Declined { configurable }),
                             }
                         }
                         Ok((RESPONSE_CANCELLED, _)) => {

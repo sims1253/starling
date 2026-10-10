@@ -332,11 +332,13 @@ fn wayland_shortcut_line(facts: &Facts, portal_status: Option<&PortalStatus>) ->
             TOPIC,
             Verdict::Missing,
             format!("{summary} Starling could not use it: {reason}."),
-            Some(
-                "Restart Starling after updating xdg-desktop-portal; versions before 1.19 \
-                 cannot identify apps that are not sandboxed."
-                    .to_string(),
-            ),
+            Some(if reason.contains("1.19") {
+                "Update xdg-desktop-portal to 1.19 or newer, then restart Starling.".to_string()
+            } else {
+                "Check that xdg-desktop-portal and your desktop's backend are running \
+                 (`systemctl --user status xdg-desktop-portal`), then restart Starling."
+                    .to_string()
+            }),
         ),
         Some(status) if status.can_set_up() => line(
             TOPIC,
@@ -539,10 +541,12 @@ fn audio_line(audio: Option<&Result<AudioFacts, String>>) -> CheckLine {
                     .to_string(),
             ),
         ),
+        // Capture still works through ALSA directly; the microphone line
+        // says whether any device is visible.
         (false, false) => line(
             TOPIC,
-            Verdict::Missing,
-            "Neither PipeWire nor PulseAudio answers.",
+            Verdict::Limited,
+            "Neither PipeWire nor PulseAudio answers: capture uses ALSA devices directly.",
             Some(
                 "Start the sound server: `systemctl --user start pipewire pipewire-pulse` (or \
                  `pulseaudio --start`)."
@@ -1149,6 +1153,30 @@ mod tests {
     }
 
     #[test]
+    fn an_unusable_portal_gets_advice_for_its_reason() {
+        let fix = |reason: &str| {
+            let status = PortalStatus::Unavailable(reason.to_string());
+            find(
+                &check(&healthy_kde(), Some(&status)),
+                "System-wide shortcut",
+            )
+            .fix
+            .clone()
+            .unwrap()
+        };
+        assert!(
+            fix(
+                "this xdg-desktop-portal cannot identify Starling (its host app registry needs \
+                 version 1.19 or newer)"
+            )
+            .starts_with("Update xdg-desktop-portal to 1.19")
+        );
+        let other = fix("the desktop portal did not answer");
+        assert!(other.contains("systemctl --user status"), "{other}");
+        assert!(!other.contains("1.19"));
+    }
+
+    #[test]
     fn a_portal_waiting_for_setup_points_at_the_button() {
         let lines = check(
             &healthy_kde(),
@@ -1313,7 +1341,9 @@ mod tests {
         facts.atspi = Some(Err("org.a11y.Bus does not answer".to_string()));
         let lines = check(&facts, None);
         let audio = find(&lines, "Sound server");
-        assert_eq!(audio.verdict, Verdict::Missing);
+        // ALSA still captures without a sound server.
+        assert_eq!(audio.verdict, Verdict::Limited);
+        assert!(audio.summary.contains("ALSA"));
         assert!(
             audio
                 .fix
@@ -1383,7 +1413,7 @@ mod tests {
         facts.audio = Some(Ok(AudioFacts::default()));
         let text = report(&check(&facts, None));
         assert_eq!(text.lines().filter(|line| line.starts_with('[')).count(), 7);
-        assert!(text.contains("[missing] Sound server: Neither PipeWire nor PulseAudio answers."));
+        assert!(text.contains("[limited] Sound server: Neither PipeWire nor PulseAudio answers"));
         assert!(text.contains("        fix: Start the sound server"));
     }
 
