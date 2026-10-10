@@ -725,6 +725,43 @@ fn shortcut_changes_follow_the_desktop() {
             [GlobalEvent::Pressed(_), GlobalEvent::Released(_)]
         ),
         "{events:?}"
+    ); // Restored in the desktop's settings: bound again, edges flow.
+    changed(Some("Meta+R"));
+    wait_for(
+        &mut client,
+        &mut events,
+        "restored",
+        |status, _| matches!(status, PortalStatus::Bound { trigger: Some(t), .. } if t == "Meta+R"),
+    );
+    emit(&portal, "Activated", &session, "record");
+    wait_for(
+        &mut client,
+        &mut events,
+        "press after restore",
+        |_, events| events.len() >= 3,
+    );
+    // A keyless placeholder (bindings cleared) is no binding: released.
+    portal
+        .emit_signal(
+            None::<&str>,
+            PATH,
+            INTERFACE,
+            "ShortcutsChanged",
+            &(
+                ObjectPath::try_from(session.as_str()).unwrap(),
+                shortcut_entries(None),
+            ),
+        )
+        .unwrap();
+    wait_for(
+        &mut client,
+        &mut events,
+        "keyless",
+        |status, _| matches!(status, PortalStatus::Lost { reason, .. } if reason.contains("no longer assign")),
+    );
+    assert!(
+        matches!(events[3..], [GlobalEvent::Released(_)]),
+        "{events:?}"
     );
 }
 

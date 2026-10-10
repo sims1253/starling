@@ -593,6 +593,9 @@ mod dbus {
     struct Live {
         session: Option<OwnedObjectPath>,
         bound: bool,
+        /// A bind succeeded in the live session: its `ShortcutsChanged`
+        /// are followed from then on, through removal and restoration.
+        accepted: bool,
         configurable: bool,
         pending: Option<Pending>,
         /// The bus connection ended: nothing more is published.
@@ -689,6 +692,7 @@ mod dbus {
                                 // Bound in a session that is still live.
                                 Some(trigger) if self.session.as_ref() == Some(session) => {
                                     self.bound = true;
+                                    self.accepted = true;
                                     Some(PortalStatus::Bound {
                                         trigger,
                                         configurable,
@@ -773,32 +777,39 @@ mod dbus {
                 else {
                     return;
                 };
-                if live.session.as_ref() != Some(&session) || !live.bound {
+                if live.session.as_ref() != Some(&session) || !live.accepted {
                     return;
                 }
                 let configurable = live.configurable;
-                match find_ours(&entries) {
-                    Some(trigger) => live.publish(
-                        out,
-                        PortalStatus::Bound {
-                            trigger,
-                            configurable,
-                        },
-                    ),
-                    None => {
-                        // The user removed it in the desktop's settings.
-                        let _ = out.send(PortalSignal::SessionEnded(Instant::now()));
-                        live.bound = false;
-                        live.publish(
+                let reason = match find_ours(&entries) {
+                    Some(Some(trigger)) => {
+                        // Bound, rebound to other keys, or restored after
+                        // a removal.
+                        live.bound = true;
+                        return live.publish(
                             out,
-                            PortalStatus::Lost {
-                                reason: "the shortcut was removed in the desktop's settings"
-                                    .to_string(),
+                            PortalStatus::Bound {
+                                trigger: Some(trigger),
                                 configurable,
                             },
                         );
                     }
+                    // An entry without keys is what a desktop lists once
+                    // its bindings were cleared (GNOME keeps placeholders),
+                    // not a binding.
+                    Some(None) => "the desktop's settings no longer assign keys to it",
+                    None => "the shortcut was removed in the desktop's settings",
+                };
+                if std::mem::take(&mut live.bound) {
+                    let _ = out.send(PortalSignal::SessionEnded(Instant::now()));
                 }
+                live.publish(
+                    out,
+                    PortalStatus::Lost {
+                        reason: reason.to_string(),
+                        configurable,
+                    },
+                );
             }
             (SESSION_INTERFACE, "Closed") => {
                 let ours =
@@ -1306,6 +1317,7 @@ mod dbus {
                 let mut live = lock(&self.live);
                 live.session = Some(predicted);
                 live.bound = false;
+                live.accepted = false;
             }
             self.bind_attempted = false;
             let outcome = self
