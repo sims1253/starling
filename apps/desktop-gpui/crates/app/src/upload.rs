@@ -1871,10 +1871,20 @@ mod tests {
         let id = transcribed(&store, "their retry");
         let (app, fake) = window_with_typing(cx, &store);
         own_take(&app, cx, &id);
+        app.update(cx, |app, _| {
+            app.drafts.insert(
+                id.clone(),
+                starling_processing::staging::Draft::new("d", &id),
+            );
+        });
         frame(&app, cx, completed_with(&id, Some("tr_gone"), true, "their retry"));
         cx.run_until_parked();
         assert!(fake.insertions().is_empty(), "{:?}", fake.insertions());
         assert!(app.read_with(cx, |app, _| app.host.awaiting.contains(&id)), "still waiting");
+        assert!(
+            app.read_with(cx, |app, _| app.drafts.contains_key(&id)),
+            "the own take's draft is left alone"
+        );
         frame(&app, cx, completed_with(&id, None, true, "my own"));
         settle(cx, "the own take typed", |_| !fake.insertions().is_empty());
         assert_eq!(fake.insertions()[0].1, "my own");

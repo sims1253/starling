@@ -811,6 +811,16 @@ impl StarlingApp {
     /// processing runs, nothing is delivered and no staging draft is
     /// touched — those belong to the take's own transcription.
     pub(crate) fn after_other_result(&mut self, id: String, cx: &mut Context<Self>) {
+        // A take this window still stages, delivers or waits for is its
+        // own transcription's: its draft, document and Insert stay as they
+        // are (history shows the new result beside it).
+        if self.staging_token_for(&id).is_some()
+            || self.delivers(&id)
+            || self.host.awaiting.contains(&id)
+        {
+            cx.notify();
+            return;
+        }
         self.processing.remove(&id);
         self.drafts.remove(&id);
         self.processing_loading.remove(&id);
@@ -887,6 +897,19 @@ impl StarlingApp {
     /// spoken phrase overrides the active mode for this take only. A job
     /// already running for the take is superseded and cancelled.
     pub(crate) fn process_take(&mut self, id: String, cx: &mut Context<Self>) {
+        self.process_take_on(id, None, cx);
+    }
+
+    /// [`Self::process_take`] on raw attempt `raw` (`(attempt id, text)`)
+    /// rather than the take's latest transcript: a staged take is
+    /// processed on the result its draft was rebased on (#220), whatever
+    /// another window's retry put in history since.
+    pub(crate) fn process_take_on(
+        &mut self,
+        id: String,
+        raw: Option<(String, String)>,
+        cx: &mut Context<Self>,
+    ) {
         let Some(store) = self.store.clone() else {
             return;
         };
@@ -918,9 +941,12 @@ impl StarlingApp {
                 let store = store.clone();
                 let id = id.clone();
                 cx.background_spawn(async move {
-                    let (attempt_id, raw) = store
-                        .latest_raw(&id)?
-                        .ok_or_else(|| storage::StorageError::NotFound(id.clone()))?;
+                    let (attempt_id, raw) = match raw {
+                        Some(raw) => raw,
+                        None => store
+                            .latest_raw(&id)?
+                            .ok_or_else(|| storage::StorageError::NotFound(id.clone()))?,
+                    };
                     store.start_processing_doc(&id, &attempt_id, &raw)
                 })
                 .await

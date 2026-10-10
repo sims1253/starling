@@ -146,7 +146,7 @@ impl StarlingApp {
             .find(|staging| staging.token == token)
     }
 
-    fn staging_token_for(&self, id: &str) -> Option<u64> {
+    pub(crate) fn staging_token_for(&self, id: &str) -> Option<u64> {
         self.staging
             .iter()
             .chain(self.background_stagings.iter())
@@ -706,7 +706,7 @@ impl StarlingApp {
         }
         let id = id.to_string();
         if self.mode_processes() {
-            self.process_take(id, cx);
+            self.process_take_on(id.clone(), Some((doc.raw_attempt_id, doc.raw_text)), cx);
         } else {
             self.stop_instants.remove(&id);
         }

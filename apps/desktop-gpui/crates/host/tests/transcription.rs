@@ -271,10 +271,13 @@ fn a_retry_adds_a_result_for_the_window_that_asked() {
     let frame = until_take(&asker, "the blank retry", &mut theirs, |frame| {
         matches!(frame, TakeWire::Transcription { req: Some(req), state, .. } if req == "r_2" && state.is_final())
     });
-    assert!(matches!(
-        frame,
-        TakeWire::Transcription { state: TranscriptionState::Completed { kept_earlier: true, .. }, .. }
-    ));
+    assert!(
+        matches!(
+            frame,
+            TakeWire::Transcription { state: TranscriptionState::Completed { kept_earlier: true, .. }, .. }
+        ),
+        "{frame:?}"
+    );
     assert_eq!(completed_attempts(root.path(), &id), vec!["first", "second", " "]);
     host.shutdown();
 }
@@ -558,4 +561,57 @@ fn an_import_asked_for_is_transcribed_once() {
     assert_eq!(completed_attempts(root.path(), &id), vec!["imported"]);
     assert_eq!(engine.batch_requests(), 1, "transcribed once");
     assert!(!StoreV2::open(root.path()).unwrap().transcription_wanted(&id).unwrap());
+}
+
+/// A retry the host accepted but has not started (both job slots busy)
+/// keeps its take's audio from every process's upkeep — also once the
+/// window that asked is gone.
+#[test]
+fn a_queued_retry_holds_its_audio_after_its_window_left() {
+    let root = tempfile::tempdir().unwrap();
+    let ids: Vec<String> = {
+        let mut store = StoreV2::open(root.path()).unwrap();
+        (0..3)
+            .map(|_| {
+                let mut take = store.begin_take(TakeMeta::for_device("t")).unwrap();
+                take.append_and_seal(&vec![0.1f32; 32_000]).unwrap();
+                take.finalize().unwrap().commit_marked(&mut store, CommitMark::Complete).unwrap().record.id
+            })
+            .collect()
+    };
+    let held = FakeEngine::start(
+        vec![Reply::Held("a".into()), Reply::Held("b".into()), Reply::Held("c".into())],
+        StreamMode::Refuse,
+    );
+    let mut host = serve(config(root.path(), Vec::new(), &held)).expect("serves");
+    let with = TranscribeWith::Server {
+        endpoint: held.endpoint(),
+        model: "fake-model".into(),
+    };
+    {
+        let asker = watching(&host);
+        for (index, id) in ids.iter().enumerate() {
+            asker.transcribe(&format!("r_{index}"), id, with.clone()).unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while held.batch_requests() < 2 {
+            assert!(Instant::now() < deadline, "the first two retries did not start");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    // Another process's upkeep would compress (or retire) any of them now.
+    let other = StoreV2::open(root.path()).unwrap();
+    let candidates: Vec<String> = other
+        .compression_candidates(usize::MAX)
+        .unwrap()
+        .into_iter()
+        .map(|job| job.id)
+        .collect();
+    for id in &ids {
+        assert!(!candidates.contains(id), "{id} is in use (running or queued)");
+    }
+    drop(other);
+    held.release();
+    host.shutdown();
 }

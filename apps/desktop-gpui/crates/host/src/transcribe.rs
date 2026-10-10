@@ -159,6 +159,7 @@ enum Msg {
     },
     JobDone {
         stored_id: String,
+        last: Option<FinalFrame>,
     },
     Shutdown,
 }
@@ -257,6 +258,10 @@ struct Job {
     stored_id: String,
     take: Option<String>,
     req: Option<String>,
+    /// The audio hold a request takes when the host accepts it: the take
+    /// is kept from every process's upkeep until its attempt starts, even
+    /// once the window that asked is gone.
+    hold: Option<String>,
     /// Who the result is for: the take's owner or the requester.
     owner: Option<Arc<ConnState>>,
     source: Source,
@@ -349,6 +354,7 @@ impl Coordinator {
                     stored_id,
                     take: Some(take),
                     req: None,
+                    hold: None,
                     owner,
                     source: Source::Take { target, stream },
                 });
@@ -372,10 +378,23 @@ impl Coordinator {
                     );
                     return;
                 }
+                let hold = match self.jobs.store().hold_audio(&stored_id) {
+                    Ok(hold) => Some(hold),
+                    // A take that is gone is refused when the job runs.
+                    Err(StoreV2Error::NotFound(_)) => None,
+                    Err(err) => {
+                        eprintln!(
+                            "starling-runtime-host: could not hold {stored_id}'s audio for its \
+                             retry: {err}"
+                        );
+                        None
+                    }
+                };
                 self.queue.push_back(Job {
                     stored_id,
                     take: None,
                     req: Some(req),
+                    hold,
                     owner: Some(conn),
                     source: Source::Request(with),
                 });
@@ -387,12 +406,23 @@ impl Coordinator {
                 stored_id,
                 take: None,
                 req: None,
+                hold: None,
                 owner: Some(conn),
                 source: Source::Due,
             }),
-            Msg::JobDone { stored_id } => {
+            Msg::JobDone { stored_id, last } => {
                 if let Some((thread, _)) = self.running.remove(&stored_id) {
                     let _ = thread.join();
+                }
+                if let Some(last) = last {
+                    self.jobs.publish(
+                        &last.stored_id,
+                        last.take.as_deref(),
+                        last.req.as_deref(),
+                        last.attempt.as_deref(),
+                        last.state,
+                        last.owner.as_ref(),
+                    );
                 }
             }
             Msg::Shutdown => {}
@@ -555,6 +585,7 @@ impl Coordinator {
                 stored_id,
                 take: None,
                 req: None,
+                hold: None,
                 owner: None,
                 source: Source::Due,
             });
@@ -584,7 +615,10 @@ impl Coordinator {
                              it is retried when the host next starts"
                         );
                     }
-                    link.send(Msg::JobDone { stored_id });
+                    link.send(Msg::JobDone {
+                        stored_id,
+                        last: outcome.ok().flatten(),
+                    });
                 });
             match spawned {
                 Ok(thread) => {
@@ -622,6 +656,17 @@ impl AudioTap for MonitorTap {
     }
 }
 
+/// A job's last frame, published by the coordinator once the job is
+/// retired.
+struct FinalFrame {
+    stored_id: String,
+    take: Option<String>,
+    req: Option<String>,
+    owner: Option<Arc<ConnState>>,
+    attempt: Option<String>,
+    state: TranscriptionState,
+}
+
 /// What a running transcription shares.
 #[derive(Clone)]
 struct JobContext {
@@ -629,6 +674,26 @@ struct JobContext {
     engine: Option<Arc<EngineHost>>,
     engine_wait: Duration,
     hub: Arc<TakeHub>,
+}
+
+/// A request's audio hold, released when its job is done with it.
+struct HeldAudio {
+    store: Arc<Mutex<StoreV2>>,
+    hold: String,
+}
+
+impl Drop for HeldAudio {
+    fn drop(&mut self) {
+        let released = self
+            .store
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .release_audio_hold(&self.hold);
+        if let Err(err) = released {
+            // Void once this host exits (its holder is gone).
+            eprintln!("starling-runtime-host: releasing an audio hold failed: {err}");
+        }
+    }
 }
 
 /// How a recognition failed: the sentence history keeps, and whether the
@@ -679,24 +744,58 @@ impl JobContext {
         }
     }
 
-    fn run(&self, job: Job, cancel: &CancelToken) {
-        let Job {
+    /// Runs `job`; its last frame comes back to be published once the job
+    /// is retired (a client that hears it may ask again at once).
+    fn run(&self, job: Job, cancel: &CancelToken) -> Option<FinalFrame> {
+        let (stored_id, take, req, owner) = (
+            job.stored_id.clone(),
+            job.take.clone(),
+            job.req.clone(),
+            job.owner.clone(),
+        );
+        let last = std::cell::RefCell::new(None);
+        self.run_job(job, cancel, &|attempt: Option<&str>, state: TranscriptionState| {
+            if state.is_final() {
+                *last.borrow_mut() = Some((attempt.map(str::to_string), state));
+            } else {
+                self.publish(
+                    &stored_id,
+                    take.as_deref(),
+                    req.as_deref(),
+                    attempt,
+                    state,
+                    owner.as_ref(),
+                );
+            }
+        });
+        last.into_inner().map(|(attempt, state)| FinalFrame {
             stored_id,
             take,
             req,
             owner,
+            attempt,
+            state,
+        })
+    }
+
+    fn run_job(
+        &self,
+        job: Job,
+        cancel: &CancelToken,
+        publish: &dyn Fn(Option<&str>, TranscriptionState),
+    ) {
+        let Job {
+            stored_id,
+            hold,
             source,
+            ..
         } = job;
-        let publish = |attempt: Option<&str>, state: TranscriptionState| {
-            self.publish(
-                &stored_id,
-                take.as_deref(),
-                req.as_deref(),
-                attempt,
-                state,
-                owner.as_ref(),
-            )
-        };
+        // Released however the job ends: past this point its attempt (or
+        // nothing at all) holds the audio.
+        let _hold = hold.map(|hold| HeldAudio {
+            store: Arc::clone(&self.store),
+            hold,
+        });
         let retry = matches!(source, Source::Request(_));
         // What the job runs on, should its engine go away mid-request.
         let want = match &source {
