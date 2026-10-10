@@ -27,6 +27,7 @@ import androidx.core.view.WindowInsetsCompat
 import dev.starling.mobile.audio.AudioCapture
 import dev.starling.mobile.audio.AudioChunkListener
 import dev.starling.mobile.audio.CaptureResult
+import dev.starling.mobile.audio.WavWriter
 import dev.starling.mobile.data.Recording
 import dev.starling.mobile.data.RecordingStatus
 import dev.starling.mobile.data.TranscriptRevision
@@ -709,7 +710,15 @@ class MainActivity : Activity() {
         title.text = DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT)
             .format(Date(recording.createdAtMillis))
         status.text = when (recording.status) {
-            RecordingStatus.RECORDING -> getString(R.string.status_recording)
+            // Live only while a capture of this process holds its WAV; one
+            // whose settlement failed (say, the disk was full) says so.
+            RecordingStatus.RECORDING -> getString(
+                if (WavWriter.isOpen(application.recordings.partialFile(recording))) {
+                    R.string.status_recording
+                } else {
+                    R.string.status_unsettled
+                },
+            )
             RecordingStatus.PENDING -> getString(R.string.status_pending)
             RecordingStatus.TRANSCRIBING -> getString(R.string.status_transcribing)
             RecordingStatus.TRANSCRIBED -> getString(

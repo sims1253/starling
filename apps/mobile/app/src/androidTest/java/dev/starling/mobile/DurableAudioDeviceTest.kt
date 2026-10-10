@@ -9,9 +9,9 @@ import dev.starling.mobile.audio.AudioCapture
 import dev.starling.mobile.audio.CaptureResult
 import dev.starling.mobile.data.Recording
 import dev.starling.mobile.data.RecordingStatus
+import dev.starling.mobile.engine.WavPcm
 import dev.starling.mobile.network.TranscriptionEngine
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Assume.assumeTrue
 import org.junit.Test
@@ -85,23 +85,39 @@ class DurableAudioDeviceTest {
         File(debugDir, "fail-transcription").delete()
         val models = app.onDeviceEngine.installedModels().map { it.name }
         Log.i(TAG, "verify: installed models $models")
+        // Retry with the same and with another model.
+        assertTrue("install at least two on-device models", models.size >= 2)
+        val source = WavPcm.decodePcm16(File(debugDir, "test-mic.wav"))!!.pcm
 
         for (key in listOf("record-id", "interrupt-id")) {
-            val id = File(debugDir, key).takeIf(File::isFile)?.readText() ?: continue
+            val id = File(debugDir, key).readText()
             val restored = app.recordings.get(id)
             Log.i(
                 TAG,
                 "verify $key: status=${restored.status} duration=${restored.durationSeconds} " +
                     "error=${restored.errorMessage} recovery=${restored.recovery}",
             )
+            val audio = app.recordings.audioFile(restored)
+            val pcm = WavPcm.decodePcm16(audio)!!.pcm
             if (key == "record-id") {
                 assertEquals(RecordingStatus.FAILED, restored.status)
+                assertTrue(restored.durationSeconds >= 600.0)
             } else {
                 assertEquals(RecordingStatus.PENDING, restored.status)
-                assertNotNull(restored.recovery)
+                val recovery = restored.recovery!!
+                assertEquals(pcm.size / 32_000.0, recovery.recoveredSeconds, 1e-6)
+                assertTrue(recovery.confirmedSeconds <= recovery.recoveredSeconds)
+                // The watermark trails the last write by about two checkpoints.
+                assertTrue(recovery.recoveredSeconds - recovery.confirmedSeconds < 5.0)
             }
+            // Every recovered sample is the test microphone's, in order.
+            assertEquals(restored.durationSeconds, pcm.size / 32_000.0, 1e-6)
+            for (i in pcm.indices) {
+                if (pcm[i] != source[i % source.size]) throw AssertionError("$key: sample byte $i differs from the source")
+            }
+            Log.i(TAG, "verify $key: ${pcm.size} PCM bytes match the looped source")
             assertTrue(restored in app.recordings.list())
-            play(app.recordings.audioFile(restored))
+            play(audio)
 
             var revisions = 0
             for (model in models) {

@@ -63,6 +63,7 @@
     <string name="recordings_heading">Saved recordings</string>
     <string name="no_recordings">No recordings yet.</string>
     <string name="status_recording">Recording now</string>
+    <string name="status_unsettled">Interrupted; its audio is recovered the next time Starling starts</string>
     <string name="status_pending">Saved; waiting to transcribe</string>
     <string name="status_transcribing">Transcribing (automatic retries may be in progress)</string>
     <string name="status_transcribed">Raw transcript</string>

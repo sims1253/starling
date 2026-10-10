@@ -1,6 +1,7 @@
 package dev.starling.mobile.storage
 
 import android.content.Context
+import android.system.ErrnoException
 import android.system.Os
 import android.system.OsConstants
 import dev.starling.mobile.audio.WavWriter
@@ -246,17 +247,21 @@ class RecordingStore internal constructor(
     /**
      * Makes this directory's renames durable (the file data is synced by
      * each writer), so after a power loss the metadata and audio renames
-     * are on storage in the order they were made. Best effort: unit tests
-     * on the JVM have no android.system.
+     * are on storage in the order they were made. A failed sync throws, so
+     * nothing that relies on the rename (a header repair after its recovery
+     * note) runs. JVM unit tests have no android.system and skip it.
      */
     private fun syncDirectory() {
-        runCatching {
+        if (!ON_ANDROID) return
+        try {
             val fd = Os.open(directory.path, OsConstants.O_RDONLY, 0)
             try {
                 Os.fsync(fd)
             } finally {
                 Os.close(fd)
             }
+        } catch (exception: ErrnoException) {
+            throw IOException("Unable to sync the recordings directory", exception)
         }
     }
 
@@ -488,6 +493,7 @@ class RecordingStore internal constructor(
 
     companion object {
         private const val WAV_HEADER_BYTES = 44L
+        private val ON_ANDROID = System.getProperty("java.vm.name") == "Dalvik"
         private val UUID_PATTERN = Regex("[0-9a-fA-F-]{36}")
 
         const val INTERRUPTED_CAPTURE = "The recording was interrupted: the app or the phone stopped while it was recording."
