@@ -23,6 +23,7 @@
 
 #include "joint.hpp"
 #include "prediction.hpp"
+#include "tdt.hpp"
 
 #include <cstdint>
 #include <optional>
@@ -41,6 +42,9 @@ namespace starling::ggml::parakeet {
 //   durations: TDT duration classes (e.g. [0,1,2,3,4]).
 //   blank_id:  blank token id (= vocab_size).
 //   max_symbols: cap on consecutive dur-0 emits at a single frame.
+//   timing:    when set, receives each emitted step's frame and duration
+//              (the frame advance; tdt.hpp TdtTiming). Left partial when the
+//              path is unavailable; the caller's fallback resets it.
 //
 // Returns the emitted token id stream INCLUDING blanks (matches the serial
 // tdt_greedy output byte-for-byte) on success, or std::nullopt if the multistep
@@ -49,6 +53,6 @@ std::optional<std::vector<int32_t>> tdt_greedy_multistep(
     const PredictionNet& pred, const Joint& joint,
     const std::vector<float>& enc_proj, int T,
     const std::vector<int32_t>& durations,
-    int blank_id, int max_symbols);
+    int blank_id, int max_symbols, TdtTiming* timing = nullptr);
 
 } // namespace starling::ggml::parakeet

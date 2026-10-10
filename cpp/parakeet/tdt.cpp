@@ -47,7 +47,8 @@ std::vector<int32_t> tdt_greedy(const PredictionNet& pred, const Joint& joint,
                                 const std::vector<float>& enc_proj,
                                 int T, int H,
                                 const std::vector<int32_t>& durations,
-                                int blank_id, int max_symbols) {
+                                int blank_id, int max_symbols,
+                                TdtTiming* timing) {
     assert((int)enc_proj.size() == (size_t)T * H);
     assert(!durations.empty());
     (void)H;
@@ -68,8 +69,9 @@ std::vector<int32_t> tdt_greedy(const PredictionNet& pred, const Joint& joint,
             int v = std::atoi(e); if (v > 0) kstep_max_t = v;
         }
         if (T <= kstep_max_t) {
+            if (timing) *timing = TdtTiming{};
             auto ms = tdt_greedy_multistep(pred, joint, enc_proj, T, durations,
-                                           blank_id, max_symbols);
+                                           blank_id, max_symbols, timing);
             if (ms.has_value()) return std::move(*ms);
             // nullopt -> fall through to the byte-exact serial loop.
         }
@@ -89,6 +91,7 @@ std::vector<int32_t> tdt_greedy(const PredictionNet& pred, const Joint& joint,
     bool g_valid = false;            // cached-g reuse across non-emit steps
 
     std::vector<int32_t> hyp;        // emitted id stream (INCLUDING blanks)
+    if (timing) *timing = TdtTiming{};
 
     // GPU fast path: drive each inner step with ONE fused prediction-LSTM +
     // joint + argmax graph (one host<-device sync per step) instead of two
@@ -134,6 +137,10 @@ std::vector<int32_t> tdt_greedy(const PredictionNet& pred, const Joint& joint,
 
             // Emit k EVERY step, including blank — matches the golden _ids.pt.
             hyp.push_back((int32_t)k);
+            if (timing) {
+                timing->frame.push_back(t);
+                timing->duration.push_back(skip);
+            }
 
             // Commit state + last_token ONLY when k != blank.
             if (k != blank_id) {

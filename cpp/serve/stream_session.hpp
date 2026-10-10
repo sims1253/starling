@@ -1,8 +1,10 @@
 // stream_session.hpp — real-time streaming dictation session.
 //
 // Fixed-length overlapping windows bound each transcription call. Neighboring
-// windows are joined by aligning the words of their shared audio, and a window
-// whose text is implausible for its audio is decoded again (issue #357).
+// windows are joined at a word both heard at the same time when the engine
+// gives word timestamps, otherwise by aligning the words of their shared
+// audio, and a window whose text is implausible for its audio is decoded
+// again (issue #357).
 #pragma once
 
 #include "server.hpp"
@@ -14,6 +16,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace starling::serve {
@@ -41,6 +44,39 @@ std::vector<std::string> stitch_words(
     int max_overlap = 24,
     int max_head = -1,
     double expected_overlap = -1.0);
+
+// The cut stitch_words() makes: {keep, skip} for committed[:keep] +
+// new_words[skip:]. Port of stitch_cut() in stream_chunk.py.
+std::pair<int, int> stitch_cut(
+    const std::vector<std::string>& committed,
+    const std::vector<std::string>& new_words,
+    int max_overlap = 24,
+    int max_head = -1,
+    double expected_overlap = -1.0);
+
+// Two windows heard the same word when its keys match and their starts are
+// at most this far apart (issue #357). A TDT word starts at the encoder
+// frame (80 ms) that emitted its first token. On the replay workload the
+// same word in two overlapping windows starts 0.04-0.28 s apart in the
+// middle of the overlap, where the cut is made, and up to 0.52 s apart at a
+// window's edge.
+constexpr double kStitchTimeToleranceSeconds = 0.3;
+
+// The cut from word start times (any common unit, e.g. take samples):
+// {keep, skip} for committed[:keep] + new_words[skip:], or nullopt when no
+// word was heard by both windows. A committed and a new word are the same
+// when their norm_word() keys match (nonempty) and their starts are at most
+// `tolerance` apart; the most such pairs in order (a longest common
+// subsequence) form the alignment, so text repeated elsewhere or a common
+// word far from the boundary cannot match and one shared word is enough.
+// The cut is the pair closest to `center` (the middle of the shared audio;
+// the earlier pair on a tie). Port of stitch_timed() in stream_chunk.py.
+std::optional<std::pair<int, int>> stitch_timed(
+    const std::vector<std::string>& committed,
+    const std::vector<int64_t>& committed_starts,
+    const std::vector<std::string>& new_words,
+    const std::vector<int64_t>& new_starts,
+    int64_t center, int64_t tolerance);
 
 // ---- window plausibility (issue #357) ---------------------------------------
 // Parakeet sometimes stops emitting partway through a window, or emits
@@ -89,6 +125,13 @@ std::vector<std::string> suppress_loops(const std::vector<std::string>& words,
 // four times shows twice for a moment while a decoding loop never shows.
 std::vector<std::string> suppress_preview_loops(const std::vector<std::string>& words,
                                                 double seconds, int max_n = 8);
+// Indices of the words suppress_loops() / suppress_preview_loops() keep, in
+// order (word timestamps follow the words they belong to).
+std::vector<size_t> suppress_loops_kept(const std::vector<std::string>& words,
+                                        double seconds, int max_repeats = 2,
+                                        int max_n = 8);
+std::vector<size_t> suppress_preview_loops_kept(const std::vector<std::string>& words,
+                                                double seconds, int max_n = 8);
 
 // Split a string on whitespace into words (matching Python's str.split()).
 std::vector<std::string> split_words(const std::string& s);
@@ -102,9 +145,23 @@ std::string join_words(const std::vector<std::string>& words);
 // the key is deterministic per word and identical across chunk boundaries.
 std::string norm_word(const std::string& word);
 
-// Transcribe function: takes a window of mono float32 samples, returns text or
-// std::nullopt if the transcriber is busy (should retry without advancing state).
-using TranscribeFn = std::function<std::optional<std::string>(const float*, int64_t)>;
+// A window's text and, when the engine gives them, its words with the
+// seconds from the window start each was heard at (issue #357). The words
+// are split_words(text), in order. Implicit from a plain string (no times).
+struct Transcript {
+    std::string text;
+    std::optional<std::vector<TimedWord>> words;
+    Transcript() = default;
+    Transcript(std::string t) : text(std::move(t)) {}
+    Transcript(const char* t) : text(t) {}
+    Transcript(std::string t, std::optional<std::vector<TimedWord>> w)
+        : text(std::move(t)), words(std::move(w)) {}
+};
+
+// Transcribe function: takes a window of mono float32 samples, returns its
+// transcript or std::nullopt if the transcriber is busy (should retry without
+// advancing state).
+using TranscribeFn = std::function<std::optional<Transcript>(const float*, int64_t)>;
 
 // Asked right before a preview would start: true when newer audio (or a
 // control message) is already queued behind the current step, so the
@@ -260,13 +317,22 @@ public:
 private:
     bool finalize_full_windows(const std::vector<float>& samples,
                                const TranscribeFn& tx, bool flushing);
-    // One decode kept for the committed text: its words, the buffer span
-    // of its audio and that audio's voiced frames.
+    // Where a word was heard, in take samples (buffer index + rebased_).
+    using Span = std::pair<int64_t, int64_t>;
+    // One decode kept for the committed text: its words and their spans
+    // (nullopt without word times), the buffer span of its audio and that
+    // audio's voiced frames.
     struct Decoded {
         std::vector<std::string> words;
+        std::optional<std::vector<Span>> spans;
         int64_t start = 0, end = 0;
         std::vector<uint8_t> flags;
+        // Only the words at `kept`.
+        void keep(const std::vector<size_t>& kept);
     };
+    // Words of samples[start, end) and their spans, or nullopt when busy.
+    std::optional<Decoded> decode(const std::vector<float>& samples, int64_t start,
+                                  int64_t end, const char* kind, const TranscribeFn& tx);
     // Words of samples[start, end) for the committed text, re-decoded when
     // implausible (see stream_chunk.py _decode_committed); nullopt when the
     // engine is busy before a plausible result is in hand.
@@ -277,10 +343,13 @@ private:
     double min_rate() const;
     // 0 plausible, 1 sparse (dropped speech), 2 a decoding loop.
     int verdict(size_t words, double seconds, double voiced) const;
-    // committed_ with d.words stitched onto its unfrozen tail; each side's
-    // share of speech in the audio both decodes heard predicts how many of
-    // its words the overlap holds.
-    std::vector<std::string> stitched(const Decoded& d) const;
+    // committed_ and its spans with d.words stitched onto its unfrozen
+    // tail: by time when both sides have word times (stitch_timed; without
+    // a shared word the two are concatenated), otherwise by words
+    // (stitch_cut), where each side's share of speech in the audio both
+    // decodes heard predicts how many of its words the overlap holds.
+    std::pair<std::vector<std::string>, std::vector<std::optional<Span>>>
+    stitched(const Decoded& d) const;
     // Stitches d into committed_, advances frozen_ and remembers d.
     void commit(const Decoded& d);
 
@@ -293,8 +362,12 @@ private:
     int max_overlap_words_;
     int lookback_;        // samples kept before the boundary for re-decodes
     int max_head_words_;  // new words searched when stitching
+    int64_t time_tolerance_;  // kStitchTimeToleranceSeconds in samples
 
     std::vector<std::string> committed_;
+    // Where each committed word was heard (take samples), or nullopt when
+    // its engine gave no times.
+    std::vector<std::optional<Span>> spans_;
     int64_t frozen_ = 0;    // leading committed_ words stitching never touches
     int64_t boundary_ = 0;  // sample index; audio before this is finalized
     int64_t rebased_ = 0;   // samples dropped before index 0 (rebase())
@@ -330,6 +403,10 @@ struct StreamCall {
     // "busy" (engine busy or cancelled; state not advanced), "timed_out",
     // "preempted" (a preview cancelled mid-call for waiting required work).
     const char* result = "";
+    // The decode's words and their times (seconds from abs_start), for
+    // calls that produce committed text and whose engine gives word
+    // timestamps (issue #357; traced as `words`).
+    std::optional<std::vector<TimedWord>> words;
 };
 
 // Per-kind totals over a take (engine calls only; reused calls cost nothing).
@@ -582,7 +659,7 @@ private:
     std::string engine_id_;       // identity snapshot (see set_engine_identity)
     bool tail_valid_ = false;     // retained entry below is meaningful
     StreamTailKey tail_key_;      // key of the retained result (iff tail_valid_)
-    std::string tail_text_;       // the raw window result ("" is a success)
+    Transcript tail_result_;      // the raw window result ("" is a success)
     int64_t tail_cache_hits_ = 0; // calls answered from the retained entry
 
     // ---- stream instrumentation (issue #226) --------------------------------

@@ -1006,6 +1006,64 @@ def test_real_websocket_flow(host: str, port: int, tr: TestResults,
         tr.check("ws flow test completed", False, str(e))
 
 
+def test_real_stream_word_times(host: str, port: int, tr: TestResults,
+                                samples: np.ndarray):
+    """WS /stream?trace=1 (issue #357): every committed decode of a Parakeet
+    take lists its words with the take time each was heard at, in order and
+    inside the audio; previews list none."""
+    try:
+        import asyncio
+        import websockets
+    except ImportError:
+        tr.check("websockets module available", False, "not installed")
+        return
+    pcm = pcm16_bytes(samples)
+    seconds = len(samples) / 16000.0
+
+    async def run() -> dict:
+        async with websockets.connect(f"ws://{host}:{port}/stream?trace=1",
+                                      max_size=None) as ws:
+            await ws.send(pcm)
+            await ws.send(json.dumps({"type": "commit"}))
+            deadline = time.monotonic() + 60.0
+            while True:
+                msg = json.loads(await asyncio.wait_for(
+                    ws.recv(), timeout=max(0.1, deadline - time.monotonic())))
+                if msg == {"type": "error", "message": "server busy"}:
+                    await asyncio.sleep(0.05)
+                    await ws.send(json.dumps({"type": "commit"}))
+                    continue
+                if msg.get("type") != "partial":
+                    return msg
+
+    try:
+        final = asyncio.run(run())
+    except Exception as e:
+        tr.check("ws word-times take completed", False, str(e))
+        return
+    calls = final.get("trace", {}).get("calls", [])
+    committed = [c for c in calls if c["kind"] != "preview" and c["result"] in ("ok", "reused")]
+    tr.check("ws trace lists committed decodes", len(committed) >= 1, str(calls)[:300])
+    tr.check("ws previews list no words",
+             all("words" not in c for c in calls if c["kind"] == "preview"), str(calls)[:300])
+    for c in committed:
+        words = c.get("words")
+        if words is None:
+            tr.check(f"ws {c['kind']} lists word times", False, str(c)[:300])
+            continue
+        starts = [w["start"] for w in words]
+        tr.check(f"ws {c['kind']} words are the take's words",
+                 " ".join(w["w"] for w in words).split() == final.get("text", "").split()
+                 or len(committed) > 1, str(words)[:300])
+        tr.check(f"ws {c['kind']} word times ordered and inside the call's audio",
+                 starts == sorted(starts)
+                 # a last token may predict up to 4 frames (0.32 s) past the audio
+                 and all(c["start_s"] <= w["start"] <= w["end"] <= c["end_s"] + 0.4
+                         for w in words)
+                 and c["end_s"] <= seconds + 0.01,
+                 str(words)[:300])
+
+
 def test_real_idle_timeout_not_firing(binary: Path, model: str, gguf: str,
                                       tr: TestResults, samples: np.ndarray):
     """--idle-timeout must NOT fire during an active WS session (issue #22)."""
@@ -1179,6 +1237,8 @@ def main():
                 print("\nTesting WebSocket streaming with real audio:")
                 test_real_websocket_flow(args.host, args.port, tr, samples,
                                          expected)
+                if args.model == "parakeet":
+                    test_real_stream_word_times(args.host, args.port, tr, samples)
                 test_real_queue_timeout(args.binary, args.model, str(gguf),
                                         tr, anchor)
                 test_real_idle_timeout_not_firing(args.binary, args.model,

@@ -2,6 +2,7 @@
 // The oracle uses scalar F32 LSTM/joint math, not ggml dequantization or graphs.
 #include "parakeet/prediction.hpp"
 #include "parakeet/joint.hpp"
+#include "parakeet/tdt.hpp"
 #include "runtime/backend.hpp"
 #include "runtime/cpu_repack.hpp"
 #include "runtime/graph.hpp"
@@ -225,6 +226,43 @@ void exercise(int rows) {
         };
         check(token_argmax == winner(0, VOCAB + 1), "token argmax");
         check(duration_argmax == winner(VOCAB + 1, VOCAB + 1 + DURATIONS), "duration argmax");
+    }
+    // Decode timing (issue #357): the same id stream with and without it,
+    // one frame and duration per step, each step at the frame its
+    // predecessor advanced to (plus one after max_symbols steps on a frame),
+    // inside the encoder output.
+    {
+        constexpr int T = 24, max_symbols = 3;
+        std::vector<float> enc_proj((size_t)T * H);
+        for (int t = 0; t < T; ++t)
+            for (int i = 0; i < H; ++i)
+                enc_proj[(size_t)t * H + i] = ((i * 5 + t * 11) % 37 - 18) / 48.f;
+        TdtTiming timing;
+        const auto ids = tdt_greedy(pred, joint, enc_proj, T, H, cfg.tdt_durations,
+                                    VOCAB, max_symbols, &timing);
+        check(ids == tdt_greedy(pred, joint, enc_proj, T, H, cfg.tdt_durations, VOCAB,
+                                max_symbols),
+              "timing leaves the decode unchanged");
+        check(timing.frame.size() == ids.size() && timing.duration.size() == ids.size(),
+              "one frame and duration per step");
+        check(!ids.empty() && timing.frame[0] == 0, "the decode starts at frame 0");
+        // Steps on one frame run until a positive duration or max_symbols
+        // steps, which also moves one frame on.
+        int on_frame = 0;
+        for (size_t i = 0; i < ids.size(); ++i) {
+            check(timing.frame[i] >= 0 && timing.frame[i] < T, "step frame inside the audio");
+            check(std::find(cfg.tdt_durations.begin(), cfg.tdt_durations.end(),
+                            timing.duration[i]) != cfg.tdt_durations.end(),
+                  "step duration from the duration table");
+            ++on_frame;
+            const int next = timing.frame[i] + timing.duration[i] + (on_frame == max_symbols);
+            if (i + 1 < ids.size())
+                check(timing.frame[i + 1] == next, "each step reads the frame its predecessor advanced to");
+            else
+                check(next >= T, "the last step reaches the end");
+            if (timing.duration[i] > 0 || on_frame == max_symbols) on_frame = 0;
+        }
+        std::printf("rows=%d: %zu decode steps over %d frames\n", rows, ids.size(), T);
     }
     // CI sets this only on runners whose IQ4_NL repack kernel is pinned by
     // cpu_repack_test; a developer CPU without that kernel still runs the

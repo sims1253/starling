@@ -6,7 +6,11 @@ re-decodes, the tail at stop) and on the stitcher. This runs the Python
 ``ChunkStreamer`` over a workload take exactly as a commit would and answers
 its transcribe calls from a cache of window texts; a missing window is
 transcribed through a server's batch endpoint (the same samples the stream
-path decodes) and added to the cache. Each take is also replayed from later
+path decodes) and added to the cache. With ``--words`` the windows carry the
+engine's word timestamps (issue #357): a missing window is streamed to the
+server's ``/stream?trace=1`` and its words are read from the trace, and the
+stitcher deduplicates by time; ``--words`` with ``--no-times`` replays the
+same cached windows without their times (the text-only stitcher). Each take is also replayed from later
 starting offsets (``--offsets``), which moves every window boundary, so a
 stitcher is judged on many boundary placements instead of one.
 
@@ -81,15 +85,22 @@ class Transcriber:
     returning another engine's or another recording's text."""
 
     SERVER_ARGS: list[str] = []
+    # --words: one stream window covers any replayed window, so the stream's
+    # first decode is the window's raw text (never a re-decode of it).
+    WORDS_SERVER_ARGS: list[str] = ["--stream-chunk-seconds", "60"]
 
     def __init__(self, args: argparse.Namespace):
         self.args = args
         self.cache: dict = json.loads(args.cache.read_text()) if args.cache.exists() else {}
         self.server = None
         self.misses = 0
+        self.words = getattr(args, "words", False)
+        self.no_times = getattr(args, "no_times", False)
+        self.server_args = self.WORDS_SERVER_ARGS if self.words else self.SERVER_ARGS
         self.engine = hashlib.sha256(json.dumps({
             "binary": _file_digest(args.binary), "model": _file_digest(args.model),
-            "model_slug": args.model_slug, "args": self.SERVER_ARGS,
+            "model_slug": args.model_slug, "args": self.server_args,
+            **({"words": True} if self.words else {}),
         }, sort_keys=True).encode()).hexdigest()[:16]
 
     def key(self, pcm: bytes, start: int, length: int) -> str:
@@ -101,17 +112,68 @@ class Transcriber:
         if key not in self.cache:
             self.cache[key] = self.transcribe(_wav(pcm[2 * start:2 * (start + length)]))
             self.misses += 1
-        return self.cache[key]
+        got = self.cache[key]
+        return got if isinstance(got, str) else got["text"]
 
-    def transcribe(self, wav: bytes) -> str:
+    def window(self, pcm: bytes, start: int, length: int):
+        """The window's text, with its word timestamps under --words (a
+        ``Transcript``) unless --no-times."""
+        if not self.words:
+            return self.text(pcm, start, length)
+        from starling.stream_chunk import TimedWord, Transcript
+
+        key = "words:" + self.key(pcm, start, length)
+        if key not in self.cache:
+            self.cache[key] = self.stream_words(pcm[2 * start:2 * (start + length)])
+            self.misses += 1
+        got = self.cache[key]
+        if self.no_times or got["words"] is None:
+            return got["text"]
+        return Transcript(got["text"], tuple(TimedWord(w["w"], w["start"], w["end"])
+                                             for w in got["words"]))
+
+    def _server(self):
         if self.server is None:
             arm = {"binary": str(self.args.binary), "model": str(self.args.model),
-                   "model_slug": self.args.model_slug, "args": self.SERVER_ARGS}
+                   "model_slug": self.args.model_slug, "args": self.server_args}
             self.server = ArmServer(arm, self.args.port or _free_port(),
                                     self.args.cache.with_suffix(".log"))
             self.server.wait_healthy(300)
-        text, _ = _batch_bytes(self.server.base, wav, self.args.model_slug, 300)
+        return self.server
+
+    def transcribe(self, wav: bytes) -> str:
+        text, _ = _batch_bytes(self._server().base, wav, self.args.model_slug, 300)
         return text
+
+    def stream_words(self, pcm: bytes) -> dict:
+        """Text and words of the first decode of ``pcm`` streamed as one take
+        (the trace's first committed call over the whole window)."""
+        from websockets.sync.client import connect
+
+        url = self._server().base.replace("http://", "ws://") + "/stream?trace=1"
+        n = len(pcm) // 2
+        for _ in range(50):
+            with connect(url, max_size=None, ping_interval=None, open_timeout=30) as ws:
+                ws.send(pcm)
+                ws.send(json.dumps({"type": "commit"}))
+                for raw in ws:
+                    msg = json.loads(raw)
+                    if msg.get("type") in ("final", "error"):
+                        break
+            if msg.get("type") == "final":
+                break
+            if msg.get("message") != "server busy":
+                raise RuntimeError(f"stream window failed: {msg}")
+        else:
+            raise RuntimeError("stream window: server stayed busy")
+        for call in msg["trace"]["calls"]:
+            if (call["kind"] in ("flush_tail", "flush_window") and call["start_s"] == 0
+                    and abs(call["end_s"] - n / SAMPLE_RATE) < 0.001
+                    and call["result"] in ("ok", "reused")):
+                words = call.get("words")
+                return {"text": " ".join(w["w"] for w in words) if words is not None
+                        else msg["text"], "words": words}
+        raise RuntimeError(f"stream window: no decode of the whole window in {msg['trace']}")
 
     def close(self) -> None:
         if self.server is not None:
@@ -139,7 +201,7 @@ def replay_take(name: str, take: dict, pcm: bytes, offset: int, tr: Transcriber,
         start = (window.__array_interface__["data"][0] - base) // 4
         calls.append({"kind": cs.call_kind, "start_s": start / SAMPLE_RATE,
                       "end_s": (start + len(window)) / SAMPLE_RATE})
-        return tr.text(pcm, offset + start, len(window))
+        return tr.window(pcm, offset + start, len(window))
 
     final = cs.flush(samples, tx)
     batch = tr.text(pcm, offset, len(samples))
@@ -177,6 +239,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--src", type=Path, default=_DEFAULT_SRC,
                     help="src/ directory whose starling.stream_chunk to replay "
                     "(default: this checkout)")
+    ap.add_argument("--words", action="store_true",
+                    help="windows with word timestamps, read from the server's stream trace")
+    ap.add_argument("--no-times", action="store_true",
+                    help="with --words: replay the same windows without their timestamps")
     ap.add_argument("-v", "--verbose", action="store_true", help="print each error span")
     args = ap.parse_args(argv)
     use_stitcher(args.src)

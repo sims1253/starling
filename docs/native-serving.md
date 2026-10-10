@@ -325,7 +325,10 @@ take's first audio; audio positions are seconds into the take.
   holds `unfinalized_s` (the audio past the committed boundary at
   commit), `t0_ms`, `t1_ms` and `totals`. `calls` lists each call
   with `kind`, `start_s`, `end_s`, `t0_ms`, `t1_ms` and `result`
-  (`ok`, `reused`, `busy`, `timed_out` or `preempted`). It holds at most 20,000
+  (`ok`, `reused`, `busy`, `timed_out` or `preempted`). A call that produced
+  committed text (not a preview) on an engine with word timestamps (Parakeet)
+  also has `words`: `[{"w":…,"start":…,"end":…}]`, the decode's words with
+  the take seconds each was heard at. It holds at most 20,000
   entries. `calls_dropped` counts later calls, which still enter
   the totals.
 
@@ -417,7 +420,23 @@ incomplete commits preserve the remaining audio for a later retry.
 **Stitching** (issue #357; the two servers share the code paths and a parity
 fixture, `tests/fixtures/stream_stitch_cases.txt`):
 
-- Neighboring windows are joined by aligning a suffix of the committed words
+- With word timestamps (Parakeet: the TDT decoder's frame for each token,
+  80 ms per encoder frame; a word starts at its first token's frame and ends
+  at its last token's frame plus duration), neighboring windows are joined at
+  a word both heard at the same time: a committed word and a new word are the
+  same when they match after normalization and start at most 0.3 s apart.
+  The most such pairs in order form the alignment, and the cut is the pair
+  nearest the middle of the shared audio: committed words up to and
+  including it, then the new words after it. One shared word is enough, so a
+  word repeated exactly at the boundary is no longer kept twice, and a
+  repetition elsewhere in the text cannot match, so periodic text is not
+  shortened or repeated. Without a shared word (a pause in the overlap) the
+  texts are concatenated. On the replay workload (q8_0, notebook), the same
+  word in two overlapping windows starts 0.04-0.28 s apart in the middle of
+  the overlap and up to 0.52 s apart at a window's edge, where the cut is not
+  made.
+- Without word timestamps on both sides (other engines, the Python server),
+  neighboring windows are joined by aligning a suffix of the committed words
   with a prefix of the new window's words (match +2, mismatch and gap -1).
   Committed words between the aligned run and the end cost a gap, so a common
   phrase away from the boundary cannot win and drop the words between. The
@@ -433,10 +452,9 @@ fixture, `tests/fixtures/stream_stitch_cases.txt`):
   4.6 for 2.25 s (default 3 s overlap). Ordinary text still aligns, but
   exactly periodic text can then repeat up to the words outside the search.
   Searching more committed words would delay `stable_words` for every take,
-  and words alone cannot tell a shared repetition from a newly spoken one.
-  The engine exposes no
-  word timestamps, so the alignment works on words only; it is the same for
-  every model.
+  and words alone cannot tell a shared repetition from a newly spoken one;
+  the timed join above has neither limit. A single word shared at the
+  boundary is not deduplicated (an alignment needs two).
 - Parakeet sometimes stops emitting partway through a window, or returns
   nothing for a window full of speech, while the same audio decodes fine one
   second later. A committed window or flush tail is therefore checked against

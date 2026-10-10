@@ -14,11 +14,13 @@
 #include <cmath>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <iterator>
 #include <limits>
 #include <stdexcept>
 #include <thread>
+#include <tuple>
 #include <utility>
 
 namespace starling::serve {
@@ -115,8 +117,21 @@ std::vector<std::string> stitch_words(
     int max_overlap,
     int max_head,
     double expected_overlap) {
-    if (committed.empty()) return new_words;
-    if (new_words.empty()) return committed;
+    const auto [keep, skip] =
+        stitch_cut(committed, new_words, max_overlap, max_head, expected_overlap);
+    std::vector<std::string> result(committed.begin(), committed.begin() + keep);
+    result.insert(result.end(), new_words.begin() + skip, new_words.end());
+    return result;
+}
+
+std::pair<int, int> stitch_cut(
+    const std::vector<std::string>& committed,
+    const std::vector<std::string>& new_words,
+    int max_overlap,
+    int max_head,
+    double expected_overlap) {
+    const int concatenated = static_cast<int>(committed.size());
+    if (committed.empty() || new_words.empty()) return {concatenated, 0};
 
     // tail = last max_overlap words of committed; head = first max_head of new.
     const int tail_start =
@@ -154,11 +169,7 @@ std::vector<std::string> stitch_words(
             best_j = j;
         }
     }
-    if (best < kStitchMinScore) {
-        std::vector<std::string> result = committed;
-        result.insert(result.end(), new_words.begin(), new_words.end());
-        return result;
-    }
+    if (best < kStitchMinScore) return {concatenated, 0};
     std::vector<std::pair<int, int>> pairs;  // matched (tail, head) words
     int i = n;
     for (int j = best_j; i > 0 && j > 0;) {
@@ -204,10 +215,51 @@ std::vector<std::string> stitch_words(
         }
     }
     const auto [ci, cj] = pairs[(pairs.size() - 1) / 2];
-    std::vector<std::string> result(committed.begin(),
-                                    committed.begin() + tail_start + ci + 1);
-    result.insert(result.end(), new_words.begin() + cj + 1, new_words.end());
-    return result;
+    return {tail_start + ci + 1, cj + 1};
+}
+
+std::optional<std::pair<int, int>> stitch_timed(
+    const std::vector<std::string>& committed,
+    const std::vector<int64_t>& committed_starts,
+    const std::vector<std::string>& new_words,
+    const std::vector<int64_t>& new_starts,
+    int64_t center, int64_t tolerance) {
+    const int n = static_cast<int>(committed.size());
+    const int m = static_cast<int>(new_words.size());
+    std::vector<std::string> a, b;
+    for (const auto& w : committed) a.push_back(norm_word(w));
+    for (const auto& w : new_words) b.push_back(norm_word(w));
+    auto same = [&](int i, int j) {
+        return !a[i].empty() && a[i] == b[j]
+            && std::llabs(committed_starts[i] - new_starts[j]) <= tolerance;
+    };
+    // d[i][j]: most pairs between committed[0, i) and new_words[0, j).
+    std::vector<std::vector<int>> d(n + 1, std::vector<int>(m + 1, 0));
+    for (int i = 1; i <= n; ++i)
+        for (int j = 1; j <= m; ++j)
+            d[i][j] = std::max({d[i - 1][j], d[i][j - 1],
+                                same(i - 1, j - 1) ? d[i - 1][j - 1] + 1 : 0});
+    std::optional<std::pair<int, int>> cut;
+    int64_t best = 0;
+    for (int i = n, j = m; i > 0 && j > 0;) {
+        if (same(i - 1, j - 1) && d[i][j] == d[i - 1][j - 1] + 1) {
+            // Walking back: an equally close earlier pair replaces a later
+            // one (the earlier pair wins a tie).
+            const int64_t dist =
+                std::llabs(committed_starts[i - 1] + new_starts[j - 1] - 2 * center);
+            if (!cut || dist <= best) {
+                best = dist;
+                cut = std::make_pair(i, j);
+            }
+            --i;
+            --j;
+        } else if (d[i - 1][j] >= d[i][j - 1]) {
+            --i;
+        } else {
+            --j;
+        }
+    }
+    return cut;
 }
 
 // ---- window plausibility (issue #357) --------------------------------------
@@ -300,7 +352,8 @@ std::array<size_t, 3> longest_repeat(const std::vector<std::string>& keys,
 }
 
 // Cut a run found by longest_repeat() to `keep` copies, in words and keys.
-void cut_run(std::vector<std::string>& words, std::vector<std::string>& keys,
+template <class Word>
+void cut_run(std::vector<Word>& words, std::vector<std::string>& keys,
              const std::array<size_t, 3>& run, size_t keep) {
     const auto from = static_cast<std::ptrdiff_t>(run[0] + keep * run[1]);
     const auto to = static_cast<std::ptrdiff_t>(run[0] + run[2] * run[1]);
@@ -321,11 +374,12 @@ constexpr size_t kPreviewLoopMaxRepeats = 3;
 constexpr size_t kPreviewLoopMinWords = 8;
 }  // namespace
 
-std::vector<std::string> suppress_loops(const std::vector<std::string>& words,
+std::vector<size_t> suppress_loops_kept(const std::vector<std::string>& words,
                                         double seconds, int max_repeats, int max_n) {
     const size_t bound = static_cast<size_t>(std::max(0, max_plausible_words(seconds)));
-    std::vector<std::string> out = words;
-    std::vector<std::string> keys = norm_keys(out);
+    std::vector<size_t> out(words.size());
+    for (size_t i = 0; i < out.size(); ++i) out[i] = i;
+    std::vector<std::string> keys = norm_keys(words);
     const size_t reps_max = static_cast<size_t>(std::max(0, max_repeats));
     while (out.size() > bound) {
         const auto run = longest_repeat(keys, reps_max, static_cast<size_t>(max_n));
@@ -336,16 +390,38 @@ std::vector<std::string> suppress_loops(const std::vector<std::string>& words,
     return out;
 }
 
-std::vector<std::string> suppress_preview_loops(const std::vector<std::string>& words,
+std::vector<size_t> suppress_preview_loops_kept(const std::vector<std::string>& words,
                                                 double seconds, int max_n) {
-    std::vector<std::string> out = suppress_loops(words, seconds, 2, max_n);
-    std::vector<std::string> keys = norm_keys(out);
+    std::vector<size_t> out = suppress_loops_kept(words, seconds, 2, max_n);
+    std::vector<std::string> keys;
+    keys.reserve(out.size());
+    for (size_t i : out) keys.push_back(norm_word(words[i]));
     for (;;) {
         const auto run = longest_repeat(keys, kPreviewLoopMaxRepeats,
                                         static_cast<size_t>(max_n));
         if (!run[1] || run[1] * run[2] < kPreviewLoopMinWords) return out;
         cut_run(out, keys, run, 2);
     }
+}
+
+namespace {
+std::vector<std::string> kept_words(const std::vector<std::string>& words,
+                                    const std::vector<size_t>& kept) {
+    std::vector<std::string> out;
+    out.reserve(kept.size());
+    for (size_t i : kept) out.push_back(words[i]);
+    return out;
+}
+}  // namespace
+
+std::vector<std::string> suppress_loops(const std::vector<std::string>& words,
+                                        double seconds, int max_repeats, int max_n) {
+    return kept_words(words, suppress_loops_kept(words, seconds, max_repeats, max_n));
+}
+
+std::vector<std::string> suppress_preview_loops(const std::vector<std::string>& words,
+                                                double seconds, int max_n) {
+    return kept_words(words, suppress_preview_loops_kept(words, seconds, max_n));
 }
 
 // ---- ChunkStreamer --------------------------------------------------------
@@ -478,7 +554,8 @@ ChunkStreamer::ChunkStreamer(int sample_rate, double chunk_seconds,
       partial_interval_(0.0),
       max_overlap_words_(0),
       lookback_(0),
-      max_head_words_(0) {
+      max_head_words_(0),
+      time_tolerance_(0) {
     // Validate the whole configuration before deriving anything, then build
     // the members in dependency order (issue #146). The old member-init list
     // computed advance_ from the unclamped overlap_: a negative overlap was
@@ -513,39 +590,99 @@ ChunkStreamer::ChunkStreamer(int sample_rate, double chunk_seconds,
     // A re-decoded window starts up to the lookback earlier and shares that
     // much more audio with the committed text (issue #357).
     max_head_words_ = 2 * max_overlap_words_;
+    time_tolerance_ = static_cast<int64_t>(kStitchTimeToleranceSeconds * sample_rate);
 }
 
-std::vector<std::string> ChunkStreamer::stitched(const Decoded& d) const {
-    double expected = -1.0;  // mean of the two sides' estimates
-    if (last_.valid) {
+void ChunkStreamer::Decoded::keep(const std::vector<size_t>& kept) {
+    words = kept_words(words, kept);
+    if (!spans) return;
+    std::vector<Span> out;
+    out.reserve(kept.size());
+    for (size_t i : kept) out.push_back((*spans)[i]);
+    spans = std::move(out);
+}
+
+namespace {
+// `seconds` as the nearest sample count (_to_samples() in stream_chunk.py).
+int64_t to_samples(double seconds, int sample_rate) {
+    return static_cast<int64_t>(std::floor(seconds * sample_rate + 0.5));
+}
+}  // namespace
+
+std::optional<ChunkStreamer::Decoded> ChunkStreamer::decode(
+    const std::vector<float>& samples, int64_t start, int64_t end, const char* kind,
+    const TranscribeFn& tx) {
+    call_kind_ = kind;
+    auto got = tx(samples.data() + start, end - start);
+    if (!got.has_value()) return std::nullopt;
+    Decoded d{split_words(got->text), std::nullopt, start, end,
+              voiced_frames(samples.data() + start, end - start, sr_)};
+    if (got->words && got->words->size() == d.words.size()) {
+        const int64_t base = rebased_ + start;
+        std::vector<Span> spans;
+        spans.reserve(d.words.size());
+        for (size_t i = 0; i < d.words.size(); ++i) {
+            const auto& w = (*got->words)[i];
+            if (w.word != d.words[i]) break;
+            spans.emplace_back(base + to_samples(w.start, sr_), base + to_samples(w.end, sr_));
+        }
+        if (spans.size() == d.words.size()) d.spans = std::move(spans);
+    }
+    return d;
+}
+
+std::pair<std::vector<std::string>, std::vector<std::optional<ChunkStreamer::Span>>>
+ChunkStreamer::stitched(const Decoded& d) const {
+    // Stitch against the unfrozen tail only: the frozen prefix was already
+    // reported stable, so no cut may reach into it.
+    const std::vector<std::string> tail(committed_.begin() + frozen_, committed_.end());
+    const std::vector<std::optional<Span>> tail_spans(spans_.begin() + frozen_, spans_.end());
+    std::optional<std::pair<int, int>> cut;
+    const bool tail_timed = std::all_of(tail_spans.begin(), tail_spans.end(),
+                                        [](const auto& sp) { return sp.has_value(); });
+    if (d.spans && last_.valid && tail_timed) {
         const int64_t lo = std::max(d.start, last_.start);
         const int64_t hi = std::min(d.end, last_.end);
-        if (hi > lo) {
-            const int64_t frame = std::max(1, sr_ / 50);
-            double sum = 0.0;
-            int count = 0;
-            for (double e : {expected_words(last_.words, last_.flags, last_.start, lo, hi, frame),
-                             expected_words(static_cast<int64_t>(d.words.size()), d.flags,
-                                            d.start, lo, hi, frame)}) {
-                if (e >= 0.0) {
-                    sum += e;
-                    ++count;
-                }
-            }
-            if (count) expected = sum / count;
-        }
+        std::vector<int64_t> tail_starts, new_starts;
+        for (const auto& sp : tail_spans) tail_starts.push_back(sp->first);
+        for (const auto& sp : *d.spans) new_starts.push_back(sp.first);
+        cut = stitch_timed(tail, tail_starts, d.words, new_starts,
+                           (2 * rebased_ + lo + hi) / 2, time_tolerance_);
+        if (!cut) cut = std::make_pair(static_cast<int>(tail.size()), 0);
     }
-    // Stitch against the unfrozen tail only: the frozen prefix was already
-    // reported stable, so no alignment may cut into it.
-    std::vector<std::string> tail(committed_.begin() + frozen_, committed_.end());
-    tail = stitch_words(tail, d.words, max_overlap_words_, max_head_words_, expected);
-    std::vector<std::string> result(committed_.begin(), committed_.begin() + frozen_);
-    result.insert(result.end(), tail.begin(), tail.end());
-    return result;
+    if (!cut) {
+        double expected = -1.0;  // mean of the two sides' estimates
+        if (last_.valid) {
+            const int64_t lo = std::max(d.start, last_.start);
+            const int64_t hi = std::min(d.end, last_.end);
+            if (hi > lo) {
+                const int64_t frame = std::max(1, sr_ / 50);
+                double sum = 0.0;
+                int count = 0;
+                for (double e : {expected_words(last_.words, last_.flags, last_.start, lo, hi, frame),
+                                 expected_words(static_cast<int64_t>(d.words.size()), d.flags,
+                                                d.start, lo, hi, frame)}) {
+                    if (e >= 0.0) {
+                        sum += e;
+                        ++count;
+                    }
+                }
+                if (count) expected = sum / count;
+            }
+        }
+        cut = stitch_cut(tail, d.words, max_overlap_words_, max_head_words_, expected);
+    }
+    const auto [keep, skip] = *cut;
+    std::vector<std::string> words(committed_.begin(), committed_.begin() + frozen_ + keep);
+    words.insert(words.end(), d.words.begin() + skip, d.words.end());
+    std::vector<std::optional<Span>> spans(spans_.begin(), spans_.begin() + frozen_ + keep);
+    for (size_t i = static_cast<size_t>(skip); i < d.words.size(); ++i)
+        spans.push_back(d.spans ? std::optional<Span>((*d.spans)[i]) : std::nullopt);
+    return {std::move(words), std::move(spans)};
 }
 
 void ChunkStreamer::commit(const Decoded& d) {
-    committed_ = stitched(d);
+    std::tie(committed_, spans_) = stitched(d);
     const int64_t reachable =
         static_cast<int64_t>(committed_.size()) - max_overlap_words_;
     frozen_ = std::max(frozen_, reachable);
@@ -590,11 +727,9 @@ std::optional<ChunkStreamer::Decoded> ChunkStreamer::decode_committed(
         return static_cast<double>(std::count(flags.begin(), flags.end(), uint8_t{1}))
                * frame / sr_;
     };
-    call_kind_ = kind;
-    auto text = tx(samples.data() + start, end - start);
-    if (!text.has_value()) return std::nullopt;
-    Decoded best{split_words(*text), start, end,
-                 voiced_frames(samples.data() + start, end - start, sr_)};
+    auto got = decode(samples, start, end, kind, tx);
+    if (!got.has_value()) return std::nullopt;
+    Decoded best = std::move(*got);
     double best_voiced = voiced_of(best.flags);
     const int first = verdict(best.words.size(), static_cast<double>(end - start) / sr_,
                               best_voiced);
@@ -617,13 +752,12 @@ std::optional<ChunkStreamer::Decoded> ChunkStreamer::decode_committed(
             || std::find(tried.begin(), tried.end(), std::make_pair(a, z)) != tried.end())
             continue;
         tried.emplace_back(a, z);
-        call_kind_ = "redecode";
-        auto alt = tx(samples.data() + a, z - a);
+        auto alt = decode(samples, a, z, "redecode", tx);
         if (!alt.has_value()) {
             if (best_verdict != 0) return std::nullopt;
             break;
         }
-        Decoded cand{split_words(*alt), a, z, voiced_frames(samples.data() + a, z - a, sr_)};
+        Decoded cand = std::move(*alt);
         const double v_voiced = voiced_of(cand.flags);
         const int v = verdict(cand.words.size(), static_cast<double>(z - a) / sr_, v_voiced);
         bool better = false;
@@ -643,7 +777,8 @@ std::optional<ChunkStreamer::Decoded> ChunkStreamer::decode_committed(
     }
     if (replaced) ++redecodes_;
     if (best_verdict == 2) {
-        best.words = suppress_loops(best.words, static_cast<double>(best.end - best.start) / sr_);
+        best.keep(suppress_loops_kept(best.words,
+                                      static_cast<double>(best.end - best.start) / sr_));
     } else if (best_voiced >= kMinVoicedSeconds) {
         rates_.push_back(static_cast<double>(best.words.size()) / best_voiced);
         if (rates_.size() > kRateHistory) rates_.erase(rates_.begin());
@@ -717,10 +852,9 @@ std::optional<std::string> ChunkStreamer::step(
     }
     last_emit_ = now;
 
-    call_kind_ = "preview";
     const auto t0 = std::chrono::steady_clock::now();
-    auto text = tx(samples.data() + boundary_, tail_len);
-    if (!text.has_value()) {
+    auto got = decode(samples, boundary_, static_cast<int64_t>(samples.size()), "preview", tx);
+    if (!got.has_value()) {
         // Busy on the tail.
         return committed_update();
     }
@@ -729,10 +863,8 @@ std::optional<std::string> ChunkStreamer::step(
     emit_due_ = false;
     // A preview is shown as decoded (no re-decode: the next one replaces
     // it), but never with a decoding loop in it (issue #357).
-    const int64_t n = static_cast<int64_t>(samples.size());
-    return join_words(stitched(Decoded{
-        suppress_preview_loops(split_words(*text), static_cast<double>(tail_len) / sr_),
-        boundary_, n, voiced_frames(samples.data() + boundary_, tail_len, sr_)}));
+    got->keep(suppress_preview_loops_kept(got->words, static_cast<double>(tail_len) / sr_));
+    return join_words(stitched(*got).first);
 }
 
 std::optional<std::string> ChunkStreamer::flush(
@@ -764,6 +896,7 @@ std::optional<std::string> ChunkStreamer::flush(
 
 void ChunkStreamer::reset() {
     committed_.clear();
+    spans_.clear();
     frozen_ = 0;
     boundary_ = 0;
     rebased_ = 0;
@@ -808,7 +941,7 @@ StreamSession::StreamSession(StarlingServer* server) : server_(server) {
 
 TranscribeFn StreamSession::make_transcribe_fn(RequestContext* ctx) {
     return [this, ctx](const float* samples, int64_t n)
-               -> std::optional<std::string> {
+               -> std::optional<Transcript> {
         std::string err;
         // In Granite fairness mode, a stream takes a FIFO ticket so an upload
         // yields after its current chunk. The default retry-on-busy contract
@@ -829,7 +962,7 @@ TranscribeFn StreamSession::make_transcribe_fn(RequestContext* ctx) {
             // Other errors: also treat as busy (non-fatal in streaming).
             return std::nullopt;
         }
-        return result.text;
+        return Transcript(std::move(result.text), std::move(result.words));
     };
 }
 
@@ -982,7 +1115,7 @@ TranscribeFn StreamSession::active_tx() {
     std::string engine_id = engine_id_;
     wrapped_tx_ = [this, inner = std::move(inner), tx_gen,
             engine_id = std::move(engine_id)](const float* p, int64_t n)
-               -> std::optional<std::string> {
+               -> std::optional<Transcript> {
         StreamTailKey key;
         // p always points into samples_ (the chunker passes
         // samples.data() + boundary); with the trimmed prefix this is the
@@ -1004,14 +1137,18 @@ TranscribeFn StreamSession::active_tx() {
         call.abs_start = key.abs_start;
         call.length = n;
         call.t0_ms = take_ms();
+        // Calls that produce committed text keep their word times in the
+        // ledger (the trace's `words`, issue #357).
+        const bool committing = std::strcmp(call.kind, "preview") != 0;
         if (tail_valid_ && tail_key_ == key) {
             ++tail_cache_hits_;
             call.t1_ms = call.t0_ms;
             call.result = "reused";
+            if (committing) call.words = tail_result_.words;
             record_call(call);
-            return tail_text_;  // exact-input reuse: engine not called
+            return tail_result_;  // exact-input reuse: engine not called
         }
-        std::optional<std::string> result;
+        std::optional<Transcript> result;
         bool preempted = false;
         try {
             if (preempt_ && std::strcmp(call.kind, "preview") == 0) {
@@ -1041,13 +1178,14 @@ TranscribeFn StreamSession::active_tx() {
         }
         call.t1_ms = take_ms();
         call.result = result.has_value() ? "ok" : preempted ? "preempted" : "busy";
+        if (committing && result.has_value()) call.words = result->words;
         record_call(call);
         if (result.has_value()) {
             // Retain exactly one entry: this success replaces any previous
             // one (bounded: one entry per session, never a growing cache).
             tail_valid_ = true;
             tail_key_ = key;
-            tail_text_ = *result;
+            tail_result_ = *result;
         }
         return result;
     };
@@ -1060,7 +1198,7 @@ TranscribeFn StreamSession::active_tx() {
 
 void StreamSession::invalidate_tail_result() {
     tail_valid_ = false;
-    tail_text_.clear();
+    tail_result_ = Transcript{};
     tail_key_ = StreamTailKey{};
 }
 
@@ -1243,6 +1381,40 @@ std::string seconds(int64_t samples) {
     return fmt3(static_cast<double>(samples) / kSampleRate);
 }
 
+// A word as a JSON string body (words hold no whitespace, but may hold
+// quotes, backslashes or other control bytes).
+std::string json_escape(const std::string& s) {
+    std::string out;
+    for (char c : s) {
+        if (c == '"' || c == '\\') {
+            out += '\\';
+            out += c;
+        } else if (static_cast<unsigned char>(c) < 0x20) {
+            char buf[8];
+            std::snprintf(buf, sizeof buf, "\\u%04x", static_cast<unsigned char>(c));
+            out += buf;
+        } else {
+            out += c;
+        }
+    }
+    return out;
+}
+
+// ",\"words\":[{\"w\":...,\"start\":s,\"end\":s},...]" (take seconds) for a
+// call with word times, else "".
+std::string words_json(const StreamCall& c) {
+    if (!c.words) return "";
+    const double t0 = static_cast<double>(c.abs_start) / kSampleRate;
+    std::string out = ",\"words\":[";
+    for (size_t i = 0; i < c.words->size(); ++i) {
+        const auto& w = (*c.words)[i];
+        if (i) out += ",";
+        out += "{\"w\":\"" + json_escape(w.word) + "\",\"start\":" + fmt3(t0 + w.start)
+             + ",\"end\":" + fmt3(t0 + w.end) + "}";
+    }
+    return out + "]";
+}
+
 std::string totals_json(const StreamCallTotals& t) {
     return "{\"calls\":" + std::to_string(t.calls)
          + ",\"engine_calls\":" + std::to_string(t.engine_calls)
@@ -1290,7 +1462,7 @@ std::string StreamSession::trace_final_json() const {
               + ",\"end_s\":" + seconds(c.abs_start + c.length)
               + ",\"t0_ms\":" + fmt3(c.t0_ms)
               + ",\"t1_ms\":" + fmt3(c.t1_ms)
-              + ",\"result\":\"" + c.result + "\"}";
+              + ",\"result\":\"" + c.result + "\"" + words_json(c) + "}";
     }
     list += "]";
     return "{\"v\":1,\"t_ms\":" + fmt3(take_ms())

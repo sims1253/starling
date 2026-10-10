@@ -665,7 +665,7 @@ std::optional<std::vector<int32_t>> tdt_greedy_multistep(
     const PredictionNet& pred, const Joint& joint,
     const std::vector<float>& enc_proj, int T,
     const std::vector<int32_t>& durations,
-    int blank_id, int max_symbols) {
+    int blank_id, int max_symbols, TdtTiming* timing) {
     if (!global_backend().is_gpu()) return std::nullopt;      // caller falls back to serial
     if (T <= 0 || durations.empty()) return std::nullopt;
     const bool dbg = tdt_kstep_debug();
@@ -720,6 +720,13 @@ std::optional<std::vector<int32_t>> tdt_greedy_multistep(
     std::vector<int32_t> hyp;
     hyp.push_back(k0);          // STARLING: emit EVERY token, including blank.
     int frame0 = durations[(size_t)d0];
+    // Each step reads the frame the previous one advanced to (step 0 reads
+    // frame 0); its duration is the advance to its own post-step frame.
+    int32_t step_frame = frame0;
+    if (timing) {
+        timing->frame.push_back(0);
+        timing->duration.push_back(frame0);
+    }
     if (dbg) std::fprintf(stderr, "[tdt_multistep] step0 k0=%d d0=%d frame0=%d T=%d\n", k0, d0, frame0, T);
     if (frame0 >= T) return hyp;       // step 0 finished the utterance (success)
 
@@ -866,6 +873,11 @@ std::optional<std::vector<int32_t>> tdt_greedy_multistep(
         bool finished = false;
         for (int j = 0; j < K; ++j) {
             hyp.push_back(tokens[j]);
+            if (timing) {
+                timing->frame.push_back(step_frame);
+                timing->duration.push_back((int32_t)frames_f[j] - step_frame);
+            }
+            step_frame = (int32_t)frames_f[j];
             if ((int)frames_f[j] >= T) { finished = true; break; }
         }
         if (finished) break;

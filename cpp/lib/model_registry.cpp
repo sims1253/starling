@@ -23,6 +23,9 @@ void * starling_ggml_parakeet_load(const char * gguf_path, const char ** err_out
 void   starling_ggml_parakeet_free(void * handle);
 char * starling_ggml_parakeet_decode(void * handle, const float * pcm, int64_t n,
                                      const char ** err_out);
+char * starling_ggml_parakeet_decode_words(void * handle, const float * pcm, int64_t n,
+                                           starling_ggml_word ** words, int64_t * n_words,
+                                           const char ** err_out);
 void * starling_ggml_moss_load(const char * gguf_path, const char ** err_out);
 void   starling_ggml_moss_free(void * handle);
 char * starling_ggml_moss_decode(void * handle, const float * pcm, int64_t n,
@@ -80,7 +83,9 @@ constexpr ModelDescriptor kRegistry[] = {
       starling_ggml_parakeet_decode,
       "starling_ggml_transcribe_pcm: parakeet expects 16 kHz, got %d",
       /*rate_error_in_ctx=*/false,
-      "transcribe failed" },
+      "transcribe failed",
+      /*normalize_fn=*/nullptr,
+      starling_ggml_parakeet_decode_words },
     { STARLING_GGML_MOSS, "moss",
       starling_ggml_moss_load, starling_ggml_moss_free,
       starling_ggml_moss_decode,

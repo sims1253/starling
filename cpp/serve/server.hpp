@@ -33,6 +33,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -92,8 +93,19 @@ struct ServerConfig {
 enum class Phase { Unloaded, Loading, Ready, Busy };
 
 // ---- transcribe result ----------------------------------------------------
+// A word of a transcript and when the engine heard it, in seconds from the
+// start of the transcribed audio (issue #357).
+struct TimedWord {
+    std::string word;
+    double start = 0.0;
+    double end = 0.0;
+};
+
 struct TranscribeResult {
     std::string text;
+    // The text's whitespace-separated words with their times, when the
+    // engine gives word timestamps (Parakeet); nullopt otherwise.
+    std::optional<std::vector<TimedWord>> words;
 };
 
 // ---- request context (for cancellation) ----------------------------------
