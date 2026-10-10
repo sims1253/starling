@@ -54,7 +54,7 @@ use std::time::{Duration, Instant};
 use cpal::traits::{DeviceTrait, StreamTrait};
 
 use crate::disk::{DiskLevel, DiskReading, DiskWatch};
-use crate::journal::{FileSink, JournalSink, JournalWriter};
+use crate::journal::{FileSink, JournalLiveness, JournalSink, JournalWriter};
 use crate::microphone::{self, InputProblem, InputRoute};
 
 /// Sample rate requested from the microphone. Devices that cannot capture
@@ -207,6 +207,10 @@ pub struct JournalReport {
     /// Why journaling degraded, when a write/fsync failed: capture kept
     /// running in memory, but acknowledged samples stopped advancing.
     pub fault: Option<String>,
+    /// Holds the journal's liveness lock until the take is stored (#356):
+    /// whoever saves the take releases it once the journal is adopted or
+    /// moved aside — dropping every clone releases it too.
+    pub liveness: JournalLiveness,
 }
 
 /// A cleanly stopped take: the audio, plus the journal that mirrors it.
@@ -771,7 +775,9 @@ fn journal_boundary_step<S: JournalSink>(
 /// A full disk (#342) also publishes a critical free-space reading, so
 /// the UI stops the take as it would on a probe's warning — the disk
 /// filled faster than the watch looked, and nothing probes it after the
-/// journal is gone.
+/// journal is gone. The writer goes, but not the journal's lock: the
+/// take's [`JournalLiveness`] holds it until the take is stored, so no
+/// startup scan adopts the partial journal of a take still recording.
 fn journal_failed<S: JournalSink>(
     shared: &Shared,
     journal: &mut Option<JournalWriter<S>>,
@@ -1003,6 +1009,9 @@ struct JournalIdentity {
     id: String,
     path: PathBuf,
     rate: u32,
+    /// Held from the journal's creation, through a fault that drops the
+    /// writer mid-take, until the take's report is stored (#356).
+    liveness: JournalLiveness,
 }
 
 /// Drains a live take from any thread; see [`RecorderHandle::tap`].
@@ -1202,6 +1211,7 @@ impl RecorderHandle {
             acknowledged_samples: self.shared.durable_ack.load(Ordering::Acquire),
             finalized: guard.journal_finalized,
             fault: guard.journal_fault.clone(),
+            liveness: identity.liveness.clone(),
         })
     }
 
@@ -1452,6 +1462,7 @@ fn start_on_device(
                 id: writer.id().to_string(),
                 path: writer.path().to_path_buf(),
                 rate: writer.sample_rate(),
+                liveness: writer.liveness(),
             };
             (Some(writer), Some(identity))
         }
@@ -1705,6 +1716,7 @@ mod tests {
             id: writer.id().to_string(),
             path: writer.path().to_path_buf(),
             rate: writer.sample_rate(),
+            liveness: JournalLiveness::default(),
         };
         let writer_thread = spawn_writer_with(Arc::clone(&shared), Some(writer));
         RecorderHandle {
@@ -3046,6 +3058,7 @@ mod tests {
             id: writer.id().to_string(),
             path: writer.path().to_path_buf(),
             rate: writer.sample_rate(),
+            liveness: writer.liveness(),
         };
         let watch = DiskWatch {
             probe: Arc::new(FakeProbe(available, failing)),
@@ -3072,6 +3085,49 @@ mod tests {
             journal: Some(identity),
             route: None,
         }
+    }
+
+    /// A journal fault drops the writer while the take records on in
+    /// memory; the journal's lock stays with the take — through the stop,
+    /// in its report — until whoever stores it lets go (#356).
+    #[test]
+    fn a_journal_fault_drops_the_writer_but_not_the_takes_lock() {
+        use crate::store_v2::{try_flock_exclusive, FlockEvidence};
+        let dir = TempDir::new().expect("tempdir");
+        let shared = test_shared(65_536);
+        let handle = watched_handle(
+            Arc::clone(&shared),
+            dir.path(),
+            Arc::new(AtomicU64::new(50_000_000)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let path = handle.journal.as_ref().expect("journaled").path.clone();
+        let probe = || {
+            let file = std::fs::File::open(&path).expect("open journal");
+            try_flock_exclusive(&file).expect("probe")
+        };
+        // The fault, as the writer task meets it.
+        let mut journal =
+            Some(JournalWriter::<FileSink>::create(dir.path(), 16_000).expect("other"));
+        let other = journal.as_ref().expect("writer").path().to_path_buf();
+        let other_liveness = journal.as_ref().expect("writer").liveness();
+        journal_failed(&shared, &mut journal, std::io::Error::other("fsync failed"));
+        assert!(journal.is_none(), "the writer is gone");
+        let other_probe = std::fs::File::open(&other).expect("open");
+        assert_eq!(try_flock_exclusive(&other_probe).expect("probe"), FlockEvidence::Held);
+        other_liveness.release();
+        assert_eq!(try_flock_exclusive(&other_probe).expect("probe"), FlockEvidence::Free);
+
+        // Through the stop: the writer finalized and exited, the report
+        // still holds the lock.
+        let samples: Vec<f32> = (0..4_000u32).map(|i| i as f32 * 0.00001).collect();
+        CallbackState::new(1).process(&samples, &shared);
+        assert_eq!(probe(), FlockEvidence::Held);
+        let take = handle.stop().expect("stop");
+        let report = take.journal.expect("report");
+        assert_eq!(probe(), FlockEvidence::Held, "held until the take is stored");
+        report.liveness.release();
+        assert_eq!(probe(), FlockEvidence::Free);
     }
 
     #[test]

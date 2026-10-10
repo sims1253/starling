@@ -68,17 +68,41 @@ pub fn render_drawer(
 
     let mut actions = div().flex().flex_row().items_center().gap(px(7.));
 
-    if session.status != SessionStatus::Transcribed && !active {
+    // #356: any saved take can be transcribed again, with the same or
+    // another model, from its stored audio; a success adds a result.
+    let pending_switch = app
+        .pending_retry
+        .as_ref()
+        .filter(|pending| pending.take_id == session.id)
+        .map(|pending| provenance_label(&format!("engine:{}", pending.model_id)));
+    let menu_open = app.retry_menu.as_deref() == Some(session.id.as_str()) && !active;
+    // The choices snapshot the engine: read only for an open menu, or at
+    // the click that decides whether one opens.
+    let retry_choices = if menu_open {
+        app.retry_choices()
+    } else {
+        Vec::new()
+    };
+    if !active {
+        let menu_id = session.id.clone();
         actions = actions.child(
             action_button(
                 "drawer-retry",
                 false,
-                cx.listener(|this, _, _window, cx| {
-                    this.retry_selected(cx);
+                cx.listener(move |this, _, _window, cx| {
+                    if this.retry_choices().is_empty() {
+                        this.retry_selected(cx);
+                    } else {
+                        this.toggle_retry_menu(&menu_id, cx);
+                    }
                 }),
             )
             .child(icon("icons/refresh.svg", 16., theme::PAPER_INK))
-            .child("Retry"),
+            .child(if session.status == SessionStatus::Transcribed {
+                "Transcribe again"
+            } else {
+                "Retry"
+            }),
         );
     }
 
@@ -92,6 +116,18 @@ pub fn render_drawer(
         )
         .child(icon("icons/file-audio.svg", 16., theme::PAPER_INK))
         .child(if wav_saved { "Saved" } else { "WAV" }),
+    );
+
+    // #356: the same samples, losslessly compressed.
+    actions = actions.child(
+        action_button(
+            "drawer-flac",
+            false,
+            cx.listener(|this, _, _window, cx| {
+                this.export_audio_as(true, cx);
+            }),
+        )
+        .child("FLAC"),
     );
 
     let copy_disabled = transcript.is_none();
@@ -168,6 +204,61 @@ pub fn render_drawer(
         .px(px(27.))
         .pt(px(19.))
         .pb(px(20.));
+
+    if menu_open {
+        body = body.child(retry_menu(&retry_choices, cx));
+    }
+
+    if let Some(model) = pending_switch {
+        body = body.child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.))
+                .mb(px(10.))
+                .text_size(px(11.))
+                .text_color(theme::PROCESSING)
+                .child(spinner("drawer-switch-spinner", 14., theme::PROCESSING))
+                .child(format!(
+                    "Loading {model} to transcribe this recording again… The recording and its \
+                     earlier results are unchanged."
+                )),
+        );
+    }
+
+    // #356: a take that ended without a clean stop says so, with how much
+    // came back and how much of that the journal had confirmed on disk —
+    // whatever its transcription attempts did since.
+    if session.interrupted {
+        let seconds = |ms: Option<f64>| ms.map(|ms| format!("{:.1} s", ms / 1000.0));
+        let mut line = "Interrupted recording".to_string();
+        if let Some(kept) = seconds(session.duration_ms) {
+            line.push_str(&format!(" · {kept} kept"));
+        }
+        if let Some(confirmed) = seconds(session.confirmed_ms) {
+            line.push_str(&format!(" · {confirmed} confirmed on disk"));
+        }
+        body = body.child(
+            div()
+                .mb(px(4.))
+                .font(theme::mono_font())
+                .text_size(px(9.))
+                .text_color(theme::AMBER_DEEP)
+                .child(line),
+        );
+        if session.status == SessionStatus::Interrupted {
+            if let Some(note) = session.last_error.clone() {
+                body = body.child(
+                    div()
+                        .mb(px(10.))
+                        .text_size(px(11.))
+                        .text_color(theme::PAPER_SUBTLE)
+                        .child(note),
+                );
+            }
+        }
+    }
 
     if has_player {
         let play_id = session.id.clone();
@@ -265,6 +356,10 @@ pub fn render_drawer(
         if let Some(block) = processing_block(app, &session.id, transcript_scale, cx) {
             body = body.child(block);
         }
+    }
+
+    if let Some(block) = earlier_results(&session.results, cx) {
+        body = body.child(block);
     }
 
     let mut drawer = div()
@@ -549,8 +644,146 @@ fn processing_block(
     Some(block.child(buttons))
 }
 
+/// The "Retry with" choices (#356): one button per installed model and
+/// the server from Settings. Choosing another built-in model switches
+/// the engine to it, the way Settings would.
+fn retry_menu(
+    choices: &[crate::upload::RetryChoice],
+    cx: &mut Context<StarlingApp>,
+) -> gpui::Stateful<Div> {
+    let mut buttons = div().flex().flex_row().flex_wrap().items_center().gap(px(7.));
+    for (index, choice) in choices.iter().enumerate() {
+        let with = choice.with.clone();
+        buttons = buttons.child(
+            action_button(
+                ("retry-choice", index),
+                false,
+                cx.listener(move |this, _, _window, cx| {
+                    this.retry_selected_with(with.clone(), cx);
+                }),
+            )
+            .child(choice.label.clone()),
+        );
+    }
+    let mut menu = div()
+        .id("retry-menu")
+        .flex_shrink_0()
+        .flex()
+        .flex_col()
+        .gap(px(7.))
+        .mb(px(14.))
+        .pb(px(12.))
+        .border_b_1()
+        .border_color(theme::PAPER_LINE_SOFT)
+        .child(
+            div()
+                .font(theme::mono_font())
+                .text_size(px(10.))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(theme::PAPER_EYEBROW)
+                .child("TRANSCRIBE AGAIN WITH"),
+        )
+        .child(buttons);
+    let mut note = "Uses the saved audio; earlier results are kept beside the new one, and \
+                    nothing is typed into another app."
+        .to_string();
+    if choices.iter().any(|choice| choice.switches_engine) {
+        note.push_str(" Another built-in model becomes the engine's active model.");
+    }
+    menu = menu.child(
+        div()
+            .text_size(px(10.))
+            .text_color(theme::PAPER_SUBTLE)
+            .child(note),
+    );
+    menu
+}
+
+/// Every transcript the take has besides the one shown (#356), newest
+/// first, each with what produced it and its own Copy.
+fn earlier_results(
+    results: &[starling_dictation::storage::TakeResult],
+    cx: &mut Context<StarlingApp>,
+) -> Option<gpui::Stateful<Div>> {
+    let others: Vec<_> = results.iter().rev().filter(|result| !result.shown).collect();
+    if others.is_empty() {
+        return None;
+    }
+    let mut block = div()
+        .id("earlier-results")
+        .flex_shrink_0()
+        .flex()
+        .flex_col()
+        .gap(px(9.))
+        .mt(px(16.))
+        .pt(px(12.))
+        .border_t_1()
+        .border_color(theme::PAPER_LINE_SOFT)
+        .child(
+            div()
+                .font(theme::mono_font())
+                .text_size(px(10.))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(theme::PAPER_EYEBROW)
+                .child("OTHER RESULTS FOR THIS RECORDING"),
+        );
+    for (index, result) in others.into_iter().enumerate() {
+        let when = result
+            .created_at
+            .as_deref()
+            .and_then(|utc| utc.get(..16))
+            .map(|utc| format!(" · {}", utc.replace('T', " ")))
+            .unwrap_or_default();
+        let text = result.text.clone();
+        block = block.child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(4.))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .text_size(px(10.))
+                                .text_color(theme::PAPER_SUBTLE)
+                                .child(format!("{}{when}", provenance_label(&result.backend))),
+                        )
+                        .child(
+                            action_button(
+                                ("earlier-copy", index),
+                                text.trim().is_empty(),
+                                cx.listener(move |_this, _, _window, cx| {
+                                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                        text.clone(),
+                                    ));
+                                }),
+                            )
+                            .child("Copy"),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .line_height(px(12. * 1.45))
+                        .text_color(theme::PAPER_INK)
+                        .opacity(0.75)
+                        .child(if result.text.trim().is_empty() {
+                            "(empty transcript)".to_string()
+                        } else {
+                            result.text.clone()
+                        }),
+                ),
+        );
+    }
+    Some(block)
+}
+
 fn action_button(
-    id: &'static str,
+    id: impl Into<gpui::ElementId>,
     disabled: bool,
     on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
 ) -> gpui::Stateful<Div> {

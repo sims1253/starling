@@ -49,6 +49,7 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Extension of journal files under the journals root.
@@ -107,8 +108,43 @@ pub(crate) trait JournalSink: Send {
 /// overwritten: a journal is source evidence, there is deliberately no
 /// truncate path.
 pub(crate) struct FileSink {
-    file: std::fs::File,
+    /// Shared with the take's [`JournalLiveness`]: the handle, and the
+    /// lock on it, outlive this sink while the take is unsaved.
+    file: Arc<std::fs::File>,
     dir: PathBuf,
+}
+
+/// Keeps a take's journal lock held after its writer is gone (#356): the
+/// writer is dropped when journaling faults or the take stops, while the
+/// take itself still waits — recording on in memory, or being saved. The
+/// lock is the startup scan's only proof of a live owner, so it stays
+/// held until whoever stores the take releases it (or drops every clone),
+/// and another instance never adopts the journal of a take this process
+/// still holds. Empty for takes without a journal file.
+#[derive(Clone, Default)]
+pub struct JournalLiveness(Option<Arc<Mutex<Option<Arc<std::fs::File>>>>>);
+
+impl JournalLiveness {
+    /// Let the lock go: the take is stored, or will not be. The file
+    /// closes once the writer is gone too.
+    pub fn release(&self) {
+        if let Some(slot) = &self.0 {
+            slot.lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+        }
+    }
+}
+
+impl std::fmt::Debug for JournalLiveness {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let held = self.0.as_ref().is_some_and(|slot| {
+            slot.lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_some()
+        });
+        f.write_str(if held { "JournalLiveness(held)" } else { "JournalLiveness(released)" })
+    }
 }
 
 impl FileSink {
@@ -116,18 +152,75 @@ impl FileSink {
     fn create(dir: &Path, id: &str) -> io::Result<(Self, PathBuf)> {
         std::fs::create_dir_all(dir)?;
         let path = dir.join(format!("{id}.{JOURNAL_EXT}"));
+        // The writer's liveness signal (#356): the startup scan of the
+        // recorder's tree ([`crate::store_v2::StoreV2::recover_capture_journals`])
+        // never adopts a journal whose lock is held — that take is still
+        // being recorded or saved, by this process or another (the take's
+        // [`JournalLiveness`] keeps the handle past the writer until the
+        // take is stored). The OS drops the lock with the handle, so a
+        // killed writer leaves it free. The
+        // file is created and locked under a name the scan ignores and
+        // only then renamed into place, so the scan never sees an
+        // unlocked live journal. Best-effort: a filesystem that cannot
+        // lock answers the scan's probe with an error too, which the scan
+        // reads as held; without a lock primitive at all it falls back on
+        // the file's age. Creation does not fail on it — staging journals
+        // share this path, and a save must not depend on file locks.
+        let creating = dir.join(format!("{id}.{JOURNAL_EXT}.creating"));
         let file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(&path)?;
-        Ok((Self { file, dir: dir.to_path_buf() }, path))
+            .open(&creating)?;
+        if let Err(err) = crate::store_v2::try_flock_exclusive(&file) {
+            eprintln!(
+                "STARLING journal {} has no liveness lock ({err}); startup recovery leaves it \
+                 for as long as its lock cannot be checked",
+                path.display()
+            );
+        }
+        // A hard link publishes the name atomically and fails on anything
+        // already there (a file or a planted symlink) — `create_new`
+        // semantics for the real name. A filesystem without hard links
+        // (FAT/exFAT) gets a rename after an existence check instead:
+        // the check-to-rename window is the only thing lost there.
+        let published = match std::fs::hard_link(&creating, &path) {
+            Ok(()) => {
+                // Published; a leftover scratch name is only clutter.
+                let _ = std::fs::remove_file(&creating);
+                Ok(())
+            }
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Err(err),
+            Err(_) => match std::fs::symlink_metadata(&path) {
+                Ok(_) => Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("journal {} already exists", path.display()),
+                )),
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                    std::fs::rename(&creating, &path)
+                }
+                Err(err) => Err(err),
+            },
+        };
+        if let Err(err) = published {
+            let _ = std::fs::remove_file(&creating);
+            return Err(err);
+        }
+        // The header write that follows fsyncs the directory, making the
+        // rename durable with it.
+        Ok((
+            Self {
+                file: Arc::new(file),
+                dir: dir.to_path_buf(),
+            },
+            path,
+        ))
     }
 }
 
 impl JournalSink for FileSink {
     fn append(&mut self, bytes: &[u8]) -> io::Result<()> {
         use std::io::Write;
-        self.file.write_all(bytes)
+        (&*self.file).write_all(bytes)
     }
 
     fn sync(&mut self) -> io::Result<()> {
@@ -326,6 +419,12 @@ impl JournalWriter<FileSink> {
     ) -> io::Result<Self> {
         let (sink, path) = FileSink::create(dir, &id)?;
         Self::over_sink(sink, id, path, sample_rate)
+    }
+
+    /// A hold on this journal's file and its liveness lock that outlives
+    /// the writer ([`JournalLiveness`]).
+    pub fn liveness(&self) -> JournalLiveness {
+        JournalLiveness(Some(Arc::new(Mutex::new(Some(Arc::clone(&self.sink.file))))))
     }
 }
 

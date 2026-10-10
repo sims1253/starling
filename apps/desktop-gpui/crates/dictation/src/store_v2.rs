@@ -36,7 +36,7 @@
 //! [`SCHEMA_VERSION`] in `meta`): `captures`, `recognition_attempts`,
 //! `context_snapshots`, `mode_decisions`, `documents`/`revisions`,
 //! `deliveries`, `insight_events`, `correction_records`, `tombstones`,
-//! `meta`. This core implements the
+//! `journal_supersessions`, `meta`. This core implements the
 //! captures/attempts/tombstones/meta surfaces plus the
 //! documents/revisions surface (I5, issue #220:
 //! [`StoreV2::upsert_document`] and friends — the documents machine's
@@ -93,7 +93,7 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 
-use crate::audio::{decode_pcm16_wav, pcm16_to_f32, request_pcm16, STARLING_SAMPLE_RATE};
+use crate::audio::{decode_pcm16_wav, pcm16, pcm16_to_f32, request_pcm16, STARLING_SAMPLE_RATE};
 use crate::flac;
 use crate::journal::{
     self, JournalWriter, read_journal, samples_hash, seal_recovered_journal, sync_dir,
@@ -105,8 +105,9 @@ use crate::storage::{is_safe_path_component, iso_utc, now_iso};
 /// is refused at open. v2 added `recognition_attempts.created_utc` (the
 /// real updated-at source for the summaries); v3 added `insight_events`
 /// (#294: per-job processing latency, recorded for Insights #308); v4
-/// added `correction_records` and `captures.secure_field`.
-pub const SCHEMA_VERSION: u32 = 4;
+/// added `correction_records` and `captures.secure_field`; v5 added
+/// `journal_supersessions` (#356).
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// WAL checkpoint policy (D11): run `PRAGMA wal_checkpoint(PASSIVE)` after
 /// every N metadata commits. Default 64 — frequent enough that the WAL
@@ -179,6 +180,11 @@ const COMPRESSION_ATTEMPTS: u32 = 3;
 /// audio is gone. The prefix keeps them out of the capture-id space, so
 /// reconcile's dead set never mistakes one for a deleted take.
 const AUDIO_TOMBSTONE_PREFIX: &str = "audio:";
+/// Prefix of the stamps the retention sweep leaves for the recorder
+/// journals it removes from `journals/superseded/` (#356): a copy of a
+/// take still kept, never a deleted id — a bare stamp would read as one
+/// to reconcile and kill a live take adopted under the journal's name.
+const SUPERSEDED_TOMBSTONE_PREFIX: &str = "superseded:";
 
 /// The retention class every take starts in.
 pub const STANDARD_CLASS: &str = "standard";
@@ -314,6 +320,11 @@ CREATE TABLE IF NOT EXISTS tombstones (
     kind        TEXT NOT NULL,
     deleted_utc TEXT NOT NULL,
     retention   TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS journal_supersessions (
+    journal_id TEXT PRIMARY KEY,
+    capture_id TEXT NOT NULL,
+    pending_passes INTEGER NOT NULL DEFAULT 0
 );
 ";
 
@@ -612,6 +623,10 @@ pub struct TakeMeta {
     /// Captured against a secure/incognito input: correction records are
     /// never written for it.
     pub secure_field: bool,
+    /// The recorder journal this take is stored in place of (#356): its
+    /// id is recorded in the take's commit, so a journal the save did not
+    /// get to move aside is never adopted as a second copy.
+    pub supersedes_journal: Option<String>,
 }
 
 impl TakeMeta {
@@ -624,6 +639,7 @@ impl TakeMeta {
             retention_class: "standard".to_string(),
             extra_json: None,
             secure_field: false,
+            supersedes_journal: None,
         }
     }
 }
@@ -979,6 +995,21 @@ impl StoreV2 {
         meta: TakeMeta,
     ) -> Result<V2Take, StoreV2Error> {
         validate_capture_id(&id)?;
+        if let Some(journal_id) = &meta.supersedes_journal {
+            // Before any recoverable sample exists (#356): a crash from
+            // here on leaves a staging journal reconcile turns into this
+            // take, and the recorder journal must already be named as
+            // replaced by it. Until that take is stored the record counts
+            // for nothing ([`Self::journal_superseded_by`]).
+            // A replacement already stored keeps its claim.
+            self.conn.execute(
+                "INSERT INTO journal_supersessions(journal_id, capture_id) VALUES (?1, ?2)
+                 ON CONFLICT(journal_id) DO UPDATE SET capture_id = excluded.capture_id
+                 WHERE NOT EXISTS (SELECT 1 FROM captures c
+                                   WHERE c.id = journal_supersessions.capture_id)",
+                params![journal_id, id],
+            )?;
+        }
         std::fs::create_dir_all(self.root.join(STAGING_DIR))?;
         let writer =
             JournalWriter::create_named(&self.root.join(STAGING_DIR), id, sample_rate)?;
@@ -1019,6 +1050,17 @@ impl StoreV2 {
     /// committed with `synchronous=FULL`, then the WAL checkpoint per
     /// policy. Returning `Ok` is the durable ack.
     pub fn commit_capture(&mut self, record: &CaptureRecord) -> Result<(), StoreV2Error> {
+        self.commit_capture_superseding(record, None)
+    }
+
+    /// [`Self::commit_capture`] that also records, in the same
+    /// transaction, the recorder journal the take is stored in place of
+    /// ([`TakeMeta::supersedes_journal`]).
+    fn commit_capture_superseding(
+        &mut self,
+        record: &CaptureRecord,
+        supersedes_journal: Option<&str>,
+    ) -> Result<(), StoreV2Error> {
         let tx = self.conn.transaction()?;
         tx.execute(
             "INSERT INTO captures(
@@ -1042,6 +1084,13 @@ impl StoreV2 {
                 record.secure_field,
             ],
         )?;
+        if let Some(journal_id) = supersedes_journal {
+            tx.execute(
+                "INSERT INTO journal_supersessions(journal_id, capture_id) VALUES (?1, ?2)
+                 ON CONFLICT(journal_id) DO UPDATE SET capture_id = excluded.capture_id",
+                params![journal_id, record.id],
+            )?;
+        }
         tx.commit()?;
 
         self.commits_since_checkpoint += 1;
@@ -1990,7 +2039,14 @@ impl StoreV2 {
     ///   ([`Self::delete_capture`], interrupted deletes completed by
     ///   [`Self::reconcile`]);
     /// - `journals/deleted/` — the v1 journal tree's tombstones (R21),
-    ///   left behind by the deleted v1 store, still awaiting this sweep.
+    ///   left behind by the deleted v1 store, still awaiting this sweep,
+    ///   and recorder journals of takes the user deleted, whose ids are
+    ///   tombstoned already (#356);
+    /// - `journals/superseded/` — recorder journals a stored (or
+    ///   delete-quarantined) take was proven, by reading its audio back,
+    ///   to hold every sample of (#356, [`supersede_journal_held_by`]) —
+    ///   nothing unproven is ever moved there. Their stamps carry
+    ///   [`SUPERSEDED_TOMBSTONE_PREFIX`]: a copy's removal deadens no id.
     ///
     /// Bookkeeping: per file, the `tombstones` row is stamped
     /// `retention = 'swept'` **before** the bytes are unlinked (a
@@ -2003,18 +2059,67 @@ impl StoreV2 {
     /// tombstone trees — is untouched by construction.
     pub fn sweep_retention(&mut self) -> Result<SweepReport, StoreV2Error> {
         let mut report = SweepReport::default();
-        self.sweep_tree(&self.root.join(QUARANTINE_DIR), "capture", &mut report)?;
+        // Recorder journals a stored take provably holds (#356): a copy
+        // of audio history already kept whole. Proven again first — the
+        // take may have changed since (compression resamples a take not
+        // recorded at 16 kHz), and a copy no longer proven is kept. Swept
+        // before quarantine, whose deleted takes' audio may be the proof.
+        let superseded = self.root.join("journals").join(SUPERSEDED_SUBDIR);
+        // An allowlist, not a keep-set: a journal the proof scan did not
+        // see (a failed or partial directory read) is never swept.
+        let proven = self.proven_superseded_journals(&superseded);
+        self.sweep_tree(
+            &superseded,
+            "journal",
+            SUPERSEDED_TOMBSTONE_PREFIX,
+            &|path: &Path| !proven.contains(path),
+            &mut report,
+        )?;
+        let none = |_: &Path| false;
+        self.sweep_tree(&self.root.join(QUARANTINE_DIR), "capture", "", &none, &mut report)?;
         self.sweep_tree(
             &self.root.join(LEGACY_DELETED_SUBPATH),
             "journal",
+            "",
+            &none,
             &mut report,
         )?;
         Ok(report)
     }
 
+    /// The journals in `superseded/` (#356) a take's audio, read back
+    /// now, still proves a copy of ([`Self::journal_copy`]): only these
+    /// may be swept. A numbered name (`<id>.<n>.sj`) is proven as `<id>`.
+    /// A failed directory read proves nothing, so nothing is swept.
+    fn proven_superseded_journals(&self, dir: &Path) -> HashSet<PathBuf> {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return HashSet::new();
+        };
+        entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("sj"))
+            .filter(|path| {
+                let stem = path.file_stem().and_then(|stem| stem.to_str()).unwrap_or("");
+                let id = match stem.rsplit_once('.') {
+                    Some((id, n)) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => id,
+                    _ => stem,
+                };
+                read_journal(path).ok().is_some_and(|parsed| {
+                    matches!(
+                        self.journal_copy(id, &parsed.samples, parsed.sample_rate),
+                        Ok(JournalCopy::Stored | JournalCopy::Deleted)
+                    )
+                })
+            })
+            .collect()
+    }
+
     /// Sweep one tombstone tree into `report` (`kind` is the tombstone
     /// kind rows get: `capture` for v2 quarantine, `journal` for the
-    /// legacy v1 tree).
+    /// legacy v1 tree; `stamp_prefix` goes before each file's id in its
+    /// stamp, so a tree of copies never deadens the id of a live take;
+    /// the files `keep` accepts are left in place).
     ///
     /// Per file, the ordering is **stamp, then unlink**: the `tombstones`
     /// UPSERT (retention `'swept'`) is committed before the bytes are
@@ -2034,6 +2139,8 @@ impl StoreV2 {
         &mut self,
         dir: &Path,
         kind: &str,
+        stamp_prefix: &str,
+        keep: &dyn Fn(&Path) -> bool,
         report: &mut SweepReport,
     ) -> Result<(), StoreV2Error> {
         let Ok(entries) = std::fs::read_dir(dir) else {
@@ -2073,6 +2180,13 @@ impl StoreV2 {
                     .push((name, "not a regular file".to_string()));
                 continue;
             }
+            if keep(&path) {
+                report.retained.push((
+                    name,
+                    "no stored take is proven to hold this journal's audio any more".to_string(),
+                ));
+                continue;
+            }
             let bytes = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
             let id = path
                 .file_stem()
@@ -2089,7 +2203,7 @@ impl StoreV2 {
                 "INSERT INTO tombstones(id, kind, deleted_utc, retention)
                  VALUES (?1, ?2, ?3, 'swept')
                  ON CONFLICT(id) DO UPDATE SET retention = 'swept'",
-                params![id, kind, now_iso()],
+                params![format!("{stamp_prefix}{id}"), kind, now_iso()],
             )?;
             // 2. Only now may the bytes go.
             match std::fs::remove_file(&path) {
@@ -2881,6 +2995,7 @@ impl StoreV2 {
             // intact, so the temporary is only scratch.
             self.remove_stale_flac_temps();
         }
+        let mut awaiting_replacement = Vec::new();
         for id in audio_ids_in(&self.root.join(AUDIO_DIR)) {
             if !is_safe_path_component(&id) {
                 report.unreadable.push((
@@ -2934,51 +3049,16 @@ impl StoreV2 {
                         report.deferred_to_live_owner.push(id);
                         continue;
                     }
-                    let parsed = match read_journal(&path) {
-                        Ok(parsed) => parsed,
-                        Err(err) => {
-                            report.unreadable.push((id, err.to_string()));
-                            continue;
-                        }
-                    };
-                    if parsed.samples.is_empty() {
-                        report.empty_journals.push(id);
-                        continue;
+                    if self.reconcile_orphan_audio(&id, true, &mut report)? {
+                        awaiting_replacement.push(id);
                     }
-                    let note = if parsed.finalized {
-                        "Recovered from a take that finished cleanly but was never \
-                         committed to the library (crash between finalize and the \
-                         metadata commit)."
-                            .to_string()
-                    } else if parsed.torn_tail_bytes > 0 {
-                        format!(
-                            "Recovered from an orphaned journal with a torn tail of {} \
-                             bytes (gap flagged, never joined).",
-                            parsed.torn_tail_bytes
-                        )
-                    } else {
-                        "Recovered from an orphaned journal.".to_string()
-                    };
-                    let record = CaptureRecord {
-                        id: id.clone(),
-                        created_utc: now_iso(),
-                        tz: local_tz_label(),
-                        device: String::new(),
-                        actual_rate: parsed.sample_rate,
-                        policy: "default".to_string(),
-                        frame_count: parsed.samples.len() as u64,
-                        ack_sample_index: parsed.samples.len() as u64,
-                        journal_hash: format!("{:016x}", samples_hash(&parsed.samples)),
-                        status: CaptureStatus::Interrupted,
-                        retention_class: "standard".to_string(),
-                        extra_json: Some(merge_extra_note(None, &note)),
-                        // The take's marker never reached disk: exclude it.
-                        secure_field: true,
-                    };
-                    self.commit_capture(&record)?;
-                    report.orphan_sessions.push(id);
                 }
             }
+        }
+        // Recorder journals whose replacement was itself among the orphans
+        // above: committed by now, so the proof can be read.
+        for id in awaiting_replacement {
+            self.reconcile_orphan_audio(&id, false, &mut report)?;
         }
 
         // --- rows whose audio is gone ---
@@ -3023,6 +3103,83 @@ impl StoreV2 {
         }
 
         Ok(report)
+    }
+
+    /// Reconcile's answer to finalized audio `id` in `audio/` without a
+    /// row: an interrupted row linked to it — unless it is a recorder
+    /// journal whose adoption failed to commit after the take was stored
+    /// from memory in its place, and that take's audio is read back
+    /// holding every sample of it (#356): then it is moved to
+    /// `journals/superseded/`. A replacement that is itself still rowless here is
+    /// waited for when `may_wait` (`Ok(true)`); otherwise unproven means
+    /// a row of its own.
+    fn reconcile_orphan_audio(
+        &mut self,
+        id: &str,
+        may_wait: bool,
+        report: &mut ReconciliationReport,
+    ) -> Result<bool, StoreV2Error> {
+        let id = id.to_string();
+        let path = self.audio_path(&id);
+        let parsed = match read_journal(&path) {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                report.unreadable.push((id, err.to_string()));
+                return Ok(false);
+            }
+        };
+        if parsed.samples.is_empty() {
+            report.empty_journals.push(id);
+            return Ok(false);
+        }
+        let aside = match self.journal_copy(&id, &parsed.samples, parsed.sample_rate)? {
+            JournalCopy::Unproven => None,
+            JournalCopy::Pending if may_wait => return Ok(true),
+            JournalCopy::Pending => None,
+            JournalCopy::Stored => Some(SUPERSEDED_SUBDIR),
+            JournalCopy::Deleted => Some(DELETED_SUBDIR),
+        };
+        if let Some(aside) = aside {
+            // Kept with the recorder's other journals of stored or
+            // deleted takes, not offered as a second copy.
+            drop(parsed);
+            move_journal_aside(&path, &self.root.join("journals").join(aside))?;
+            report.superseded_journals.push(id);
+            return Ok(false);
+        }
+        let note = if parsed.finalized {
+            "Recovered from a take that finished cleanly but was never \
+             committed to the library (crash between finalize and the \
+             metadata commit)."
+                .to_string()
+        } else if parsed.torn_tail_bytes > 0 {
+            format!(
+                "Recovered from an orphaned journal with a torn tail of {} \
+                 bytes (gap flagged, never joined).",
+                parsed.torn_tail_bytes
+            )
+        } else {
+            "Recovered from an orphaned journal.".to_string()
+        };
+        let record = CaptureRecord {
+            id: id.clone(),
+            created_utc: now_iso(),
+            tz: local_tz_label(),
+            device: String::new(),
+            actual_rate: parsed.sample_rate,
+            policy: "default".to_string(),
+            frame_count: parsed.samples.len() as u64,
+            ack_sample_index: parsed.samples.len() as u64,
+            journal_hash: format!("{:016x}", samples_hash(&parsed.samples)),
+            status: CaptureStatus::Interrupted,
+            retention_class: "standard".to_string(),
+            extra_json: Some(merge_extra_note(None, &note)),
+            // The take's marker never reached disk: exclude it.
+            secure_field: true,
+        };
+        self.commit_capture(&record)?;
+        report.orphan_sessions.push(id);
+        Ok(false)
     }
 
     /// Finish a tombstoned id: remove any row, move any live journal (in
@@ -3562,7 +3719,38 @@ impl StoreV2 {
         source: impl AsRef<Path>,
         note: Option<&str>,
     ) -> Result<CaptureRecord, StoreV2Error> {
-        let source = source.as_ref();
+        self.adopt_journal_with(source.as_ref(), None, |facts| {
+            let recovery_note = match (facts.torn_tail_bytes, facts.was_finalized) {
+                (torn, _) if torn > 0 => Some(format!(
+                    "Adopted from a capture journal whose last {torn} bytes were an \
+                     unfinished write; they were discarded (gap flagged, never joined)."
+                )),
+                (_, false) => Some(
+                    "Adopted from a capture journal that was never finalized; audio up \
+                     to the last verified boundary was kept."
+                        .to_string(),
+                ),
+                (_, true) => None,
+            };
+            [note.map(str::to_string), recovery_note]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+    }
+
+    /// The body of [`Self::adopt_journal`]: `note` words the row's
+    /// recovery note from what the verified read found (an empty note
+    /// stores none), and `status`, when set, is the row's status in the
+    /// same commit — otherwise a torn or unfinalized journal lands
+    /// interrupted and a sealed one complete.
+    fn adopt_journal_with(
+        &mut self,
+        source: &Path,
+        status: Option<CaptureStatus>,
+        note: impl FnOnce(&AdoptedJournal) -> String,
+    ) -> Result<CaptureRecord, StoreV2Error> {
         let id = source
             .file_stem()
             .and_then(|stem| stem.to_str())
@@ -3573,6 +3761,17 @@ impl StoreV2 {
                 ))
             })?
             .to_string();
+        self.adopt_journal_as(source, id, status, note)
+    }
+
+    /// [`Self::adopt_journal_with`] under capture id `id`.
+    fn adopt_journal_as(
+        &mut self,
+        source: &Path,
+        id: String,
+        status: Option<CaptureStatus>,
+        note: impl FnOnce(&AdoptedJournal) -> String,
+    ) -> Result<CaptureRecord, StoreV2Error> {
         validate_capture_id(&id)?;
         if self.get_capture(&id)?.is_some() || self.audio_path(&id).exists() {
             return Err(StoreV2Error::Invalid(format!(
@@ -3603,31 +3802,21 @@ impl StoreV2 {
 
         std::fs::create_dir_all(self.root.join(AUDIO_DIR))?;
         let destination = self.audio_path(&id);
+        std::fs::rename(source, &destination)?;
+        // Durable on both sides: a source name that came back after a
+        // power loss would be offered to recovery beside the stored take.
+        sync_dir(&self.root.join(AUDIO_DIR))?;
         if let Some(parent) = source.parent() {
             sync_dir(parent)?;
         }
-        std::fs::rename(source, &destination)?;
-        sync_dir(&self.root.join(AUDIO_DIR))?;
-
-        let recovery_note = match (torn_tail_bytes, was_finalized) {
-            (torn, _) if torn > 0 => Some(format!(
-                "Adopted from a capture journal whose last {torn} bytes were an \
-                 unfinished write; they were discarded (gap flagged, never joined)."
-            )),
-            (_, false) => Some(
-                "Adopted from a capture journal that was never finalized; audio up \
-                 to the last verified boundary was kept."
-                    .to_string(),
-            ),
-            (_, true) => None,
-        };
-        let note = [note.map(str::to_string), recovery_note]
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>()
-            .join(" ");
 
         let count = parsed.samples.len() as u64;
+        let note = note(&AdoptedJournal {
+            samples: count,
+            sample_rate: parsed.sample_rate,
+            torn_tail_bytes,
+            was_finalized,
+        });
         let record = CaptureRecord {
             id: id.clone(),
             created_utc: now_iso(),
@@ -3638,17 +3827,410 @@ impl StoreV2 {
             frame_count: count,
             ack_sample_index: count,
             journal_hash: format!("{:016x}", samples_hash(&parsed.samples)),
-            status: if torn_tail_bytes > 0 || !was_finalized {
+            status: status.unwrap_or(if torn_tail_bytes > 0 || !was_finalized {
                 CaptureStatus::Interrupted
             } else {
                 CaptureStatus::Complete
-            },
+            }),
             retention_class: "standard".to_string(),
             extra_json: (!note.is_empty()).then(|| merge_extra_note(None, &note)),
             secure_field: false,
         };
         self.commit_capture(&record)?;
         Ok(record)
+    }
+
+    /// The take stored in place of recorder journal `journal_id`
+    /// ([`TakeMeta::supersedes_journal`]), if one was (#356): its row is
+    /// committed, or it was stored and then deliberately deleted. A
+    /// replacement whose save never committed replaces nothing — the
+    /// journal is then still the take's only stored copy.
+    pub fn journal_superseded_by(&self, journal_id: &str) -> Result<Option<String>, StoreV2Error> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT s.capture_id FROM journal_supersessions s
+                 WHERE s.journal_id = ?1
+                   AND (EXISTS (SELECT 1 FROM captures c WHERE c.id = s.capture_id)
+                        OR EXISTS (SELECT 1 FROM tombstones t WHERE t.id = s.capture_id))",
+                params![journal_id],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Where else recorder journal `journal_id`'s confirmed `samples` (at
+    /// `rate`) are kept, as proven by reading that copy's audio from disk
+    /// (#356) — never by row metadata. A copy that is missing, unreadable,
+    /// shorter, at another rate or different in any sample proves
+    /// nothing, and neither does a deleted replacement whose audio the
+    /// sweep already removed: the journal may then be the only copy, and
+    /// is adopted (a duplicate the user can delete beats audio lost).
+    fn journal_copy(
+        &self,
+        journal_id: &str,
+        samples: &[f32],
+        rate: u32,
+    ) -> Result<JournalCopy, StoreV2Error> {
+        let held_at = |path: PathBuf| {
+            read_audio_journal(&path).is_ok_and(|stored| holds_journal(&stored, samples, rate))
+        };
+        // Adopted under its own name, with its move out of the recorder's
+        // tree undone by a power loss.
+        if self.get_capture(journal_id)?.is_some() {
+            return Ok(
+                if self.audio_retired_utc(journal_id)?.is_none()
+                    && held_at(self.audio_path(journal_id))
+                {
+                    JournalCopy::Stored
+                } else {
+                    JournalCopy::Unproven
+                },
+            );
+        }
+        // This very recording was adopted and then deleted by the user:
+        // recorder journal ids are never reused, and only a capture
+        // delete leaves a bare `capture` tombstone on one (the sweep
+        // stamps its copies under a prefix). An adoption now would only
+        // be deleted again by reconcile, the id being dead to it.
+        if self.is_deleted_capture(journal_id)? {
+            return Ok(JournalCopy::Deleted);
+        }
+        let replacement: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT capture_id FROM journal_supersessions WHERE journal_id = ?1",
+                params![journal_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(replacement) = replacement else {
+            return Ok(JournalCopy::Unproven);
+        };
+        if self.is_tombstoned(&replacement)? {
+            // Deleted since: only its quarantined audio, until swept,
+            // proves the journal a copy of what the user deleted.
+            return Ok(if held_at(self.quarantine_path(&replacement)) {
+                JournalCopy::Stored
+            } else {
+                JournalCopy::Unproven
+            });
+        }
+        if self.get_capture(&replacement)?.is_some() {
+            return Ok(
+                if self.audio_retired_utc(&replacement)?.is_none()
+                    && held_at(self.audio_path(&replacement))
+                {
+                    JournalCopy::Stored
+                } else {
+                    JournalCopy::Unproven
+                },
+            );
+        }
+        // Not committed: reconcile turns its staging journal, or its audio
+        // left in `audio/` without a row, into the take.
+        Ok(
+            if held_at(self.staging_path(&replacement)) || held_at(self.audio_path(&replacement))
+            {
+                JournalCopy::Pending
+            } else {
+                JournalCopy::Unproven
+            },
+        )
+    }
+
+    /// Count one more recovery pass that left recorder journal `id` to its
+    /// uncommitted replacement; the passes so far, this one included.
+    fn pending_pass(&self, id: &str) -> Result<u32, StoreV2Error> {
+        self.conn.execute(
+            "UPDATE journal_supersessions SET pending_passes = pending_passes + 1
+             WHERE journal_id = ?1",
+            params![id],
+        )?;
+        Ok(self.conn.query_row(
+            "SELECT pending_passes FROM journal_supersessions WHERE journal_id = ?1",
+            params![id],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// The capture id startup recovery adopts recorder journal `id` as:
+    /// its own, unless a take, its audio or a tombstone already holds that
+    /// name — then the first free `<id>-recovered[-n]`.
+    fn fresh_adoption_id(&self, id: &str) -> Result<String, StoreV2Error> {
+        let mut attempt = 0u32;
+        loop {
+            let candidate = match attempt {
+                0 => id.to_string(),
+                1 => format!("{id}-recovered"),
+                n => format!("{id}-recovered-{n}"),
+            };
+            if self.get_capture(&candidate)?.is_none()
+                && !self.has_audio(&candidate)
+                && !self.staging_path(&candidate).exists()
+                && !self.is_tombstoned(&candidate)?
+            {
+                return Ok(candidate);
+            }
+            attempt += 1;
+        }
+    }
+
+    /// Whether capture `id` itself was deleted (a `capture` tombstone).
+    fn is_deleted_capture(&self, id: &str) -> Result<bool, StoreV2Error> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT 1 FROM tombstones WHERE id = ?1 AND kind = 'capture'",
+                params![id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    /// Whether `id` was deliberately deleted (or its audio retired).
+    fn is_tombstoned(&self, id: &str) -> Result<bool, StoreV2Error> {
+        Ok(self
+            .conn
+            .query_row("SELECT 1 FROM tombstones WHERE id = ?1", params![id], |_| Ok(()))
+            .optional()?
+            .is_some())
+    }
+
+    /// Startup recovery of the recorder's live-capture tree (#356):
+    /// `journals_dir` is where takes journal while they record
+    /// ([`crate::journal::default_journals_root`]). A journal still there
+    /// at startup belongs to a take whose app stopped before saving it —
+    /// killed or crashed mid-recording, or between stop and save — and is
+    /// adopted into history as an interrupted take whose note says what
+    /// survived. [`Self::reconcile`] covers only the store's own trees;
+    /// this is the recorder's half.
+    ///
+    /// What is left alone:
+    ///
+    /// - a journal whose writer lock is held: a live take, recording in
+    ///   this process or another (the writer holds the lock for the
+    ///   file's lifetime; the OS frees it when the writer dies);
+    /// - a finalized journal written in the last
+    ///   [`FINALIZED_ADOPTION_GRACE`]: its take may be between stop and
+    ///   save in a live instance, which adopts it itself — a later launch
+    ///   recovers it if not;
+    /// - a journal with no verified samples (nothing to recover);
+    /// - `deleted/`, `superseded/` and anything not named `*.sj`.
+    ///
+    /// A journal whose take is already stored — the save committed it in
+    /// the journal's place, or adopted it, and the app stopped before the
+    /// journal left the tree — is moved into `superseded/` instead of
+    /// becoming a take again, and one whose take was deleted since into
+    /// `deleted/`; but only once that take's audio, read back from disk,
+    /// holds every confirmed sample of the journal at its rate. Anything
+    /// less is adopted (a duplicate the user can delete beats audio
+    /// lost). A journal whose replacement awaits a reconcile that has not
+    /// committed it is deferred: reconcile runs first, and adopting the
+    /// journal now would leave both once it does — but only for
+    /// [`PENDING_REPLACEMENT_PASSES`] passes, so a reconcile that keeps
+    /// failing never keeps the take hidden. A stale
+    /// `*.sj.creating` scratch name no writer holds is removed: it is an
+    /// extra name of a published journal, or an empty file whose writer
+    /// died before publishing it.
+    ///
+    /// A file that is not a readable journal is renamed to
+    /// `<name>.unrecognized` beside itself — kept, never repaired or
+    /// deleted, and not rescanned. A failed adoption leaves the journal in
+    /// place for the next launch. Never deletes anything.
+    pub fn recover_capture_journals(
+        &mut self,
+        journals_dir: &Path,
+    ) -> Result<JournalRecovery, StoreV2Error> {
+        self.recover_capture_journals_where(journals_dir, |_| true)
+    }
+
+    /// [`Self::recover_capture_journals`] limited to the journal ids
+    /// `wanted` accepts — a second look at the ones an earlier pass
+    /// deferred, without making candidates of takes recorded since.
+    pub fn recover_capture_journals_where(
+        &mut self,
+        journals_dir: &Path,
+        wanted: impl Fn(&str) -> bool,
+    ) -> Result<JournalRecovery, StoreV2Error> {
+        let mut report = JournalRecovery::default();
+        // No tree yet is nothing to recover; any other failure to list it
+        // must surface, never read as "no interrupted recordings".
+        let entries = match std::fs::read_dir(journals_dir) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(report),
+            Err(err) => return Err(err.into()),
+        };
+        let mut paths: Vec<PathBuf> = entries
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(|entry| entry.path())
+            .filter(|path| path.is_file())
+            .collect();
+        paths.sort();
+        let (paths, scratch): (Vec<PathBuf>, Vec<PathBuf>) = paths
+            .into_iter()
+            .filter(|path| {
+                let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("");
+                name.ends_with(".sj") || name.ends_with(".sj.creating")
+            })
+            .partition(|path| path.extension().and_then(|ext| ext.to_str()) == Some("sj"));
+        for path in scratch {
+            let Some(id) = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.strip_suffix(".sj.creating"))
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            if !is_safe_path_component(&id) || !wanted(&id) {
+                continue;
+            }
+            // Only a free lock on a name nobody has touched for a while
+            // says no writer is mid-create (the creator locks a moment
+            // after creating it); the header is written after publishing,
+            // so the scratch name never holds audio a published journal
+            // does not.
+            let free = modified_age(&path).is_some_and(|age| age >= FINALIZED_ADOPTION_GRACE)
+                && File::open(&path).ok().is_some_and(|file| {
+                    matches!(try_flock_exclusive(&file), Ok(FlockEvidence::Free))
+                });
+            if free {
+                match std::fs::remove_file(&path) {
+                    Ok(()) => {
+                        let _ = sync_dir(journals_dir);
+                    }
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                    Err(err) => report.failed.push((id, err.to_string())),
+                }
+            }
+        }
+        for path in paths {
+            let Some(id) = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            if !is_safe_path_component(&id) || !wanted(&id) {
+                continue;
+            }
+            // The probe's handle keeps the lock through the adoption, so
+            // a second instance scanning at the same moment sees it held.
+            let lock = match File::open(&path) {
+                Ok(file) => file,
+                Err(err) => {
+                    report.failed.push((id, err.to_string()));
+                    continue;
+                }
+            };
+            let free = match try_flock_exclusive(&lock) {
+                Ok(FlockEvidence::Free) => true,
+                Ok(FlockEvidence::Held) | Err(_) => false,
+                // No lock primitive (only targets that are neither unix
+                // nor windows; a unix filesystem that cannot lock answers
+                // with an error, read as held): an unfinalized journal
+                // nobody has written to for a while has no writer. A live
+                // take writes a boundary at least every quarter second
+                // while samples arrive, and its stall watch stops a take
+                // whose input goes quiet.
+                Ok(FlockEvidence::Unknown) => modified_age(&path)
+                    .is_some_and(|age| age >= FINALIZED_ADOPTION_GRACE),
+            };
+            if !free {
+                report.deferred.push(id);
+                continue;
+            }
+            let parsed = match read_journal(&path) {
+                Ok(parsed) => parsed,
+                Err(journal::JournalReadError::NotAJournal(reason)) => {
+                    let aside = path.with_extension("sj.unrecognized");
+                    match std::fs::rename(&path, &aside) {
+                        Ok(()) => {
+                            let _ = sync_dir(journals_dir);
+                            report.unrecognized.push((id, reason));
+                        }
+                        Err(err) => report.failed.push((id, err.to_string())),
+                    }
+                    continue;
+                }
+                Err(err) => {
+                    report.failed.push((id, err.to_string()));
+                    continue;
+                }
+            };
+            if parsed.samples.is_empty() {
+                continue;
+            }
+            // Already a take, or deliberately not one: stored in this
+            // journal's place (the app stopped between that commit and
+            // moving the journal aside), adopted with its move out of the
+            // tree undone by a power loss, or since deleted — each only
+            // once that copy's audio is read back holding all of this.
+            let aside = match self.journal_copy(&id, &parsed.samples, parsed.sample_rate) {
+                Ok(JournalCopy::Unproven) => None,
+                Ok(JournalCopy::Stored) => Some(SUPERSEDED_SUBDIR),
+                Ok(JournalCopy::Deleted) => Some(DELETED_SUBDIR),
+                Ok(JournalCopy::Pending) => {
+                    // Its replacement awaits a reconcile that has not
+                    // committed it yet: adopting now would leave both. A
+                    // reconcile that keeps failing is waited out only for
+                    // a few passes — then the journal is adopted, a
+                    // possible duplicate rather than a take kept hidden.
+                    if self.pending_pass(&id).is_ok_and(|passes| passes <= PENDING_REPLACEMENT_PASSES)
+                    {
+                        report.deferred.push(id);
+                        continue;
+                    }
+                    None
+                }
+                Err(err) => {
+                    report.failed.push((id, err.to_string()));
+                    continue;
+                }
+            };
+            if let Some(aside) = aside {
+                drop(parsed);
+                match move_journal_aside(&path, &journals_dir.join(aside)) {
+                    Ok(()) if aside == SUPERSEDED_SUBDIR => report.superseded.push(id),
+                    Ok(()) => report.deleted.push(id),
+                    Err(err) => report.failed.push((id, err.to_string())),
+                }
+                continue;
+            }
+            if parsed.finalized
+                && modified_age(&path).is_none_or(|age| age < FINALIZED_ADOPTION_GRACE)
+            {
+                report.deferred.push(id);
+                continue;
+            }
+            drop(parsed);
+            // A take already under the journal's name whose audio does not
+            // hold it (lost, damaged, retired) keeps its row; the journal
+            // comes back beside it under a fresh name.
+            let as_id = match self.fresh_adoption_id(&id) {
+                Ok(as_id) => as_id,
+                Err(err) => {
+                    report.failed.push((id, err.to_string()));
+                    continue;
+                }
+            };
+            match self.adopt_journal_as(&path, as_id, Some(CaptureStatus::Interrupted), |facts| {
+                recovered_journal_note(facts)
+            }) {
+                Ok(record) => report.recovered.push(RecoveredJournal {
+                    id: record.id,
+                    samples: record.frame_count,
+                    sample_rate: record.actual_rate,
+                }),
+                Err(err) => report.failed.push((id, err.to_string())),
+            }
+            drop(lock);
+        }
+        Ok(report)
     }
 
     /// Saves an encoded WAV as a new capture through the full §4 crash
@@ -4100,6 +4682,291 @@ impl StoreV2 {
     }
 }
 
+/// How long a finalized journal in the recorder's tree is left to the
+/// instance that may still be saving it before startup recovery adopts
+/// it ([`StoreV2::recover_capture_journals`]). A live save adopts within
+/// seconds of the stop.
+pub const FINALIZED_ADOPTION_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// What the verified read of an adopted journal found.
+struct AdoptedJournal {
+    samples: u64,
+    sample_rate: u32,
+    torn_tail_bytes: u64,
+    was_finalized: bool,
+}
+
+/// The note a take recovered from the recorder's tree carries: how much
+/// audio came back, and the durability boundary it came back to.
+fn recovered_journal_note(facts: &AdoptedJournal) -> String {
+    let seconds = facts.samples as f64 / f64::from(facts.sample_rate.max(1));
+    if facts.was_finalized && facts.torn_tail_bytes == 0 {
+        return format!(
+            "Starling closed after this take stopped but before it was saved. The complete \
+             recording ({seconds:.1} s) was recovered."
+        );
+    }
+    let mut note = format!(
+        "Starling closed while this take was recording. Recovered {seconds:.1} s: everything \
+         the capture journal had confirmed on disk. Audio after its last confirmation is \
+         missing — normally only the last moment, as the journal confirms about every quarter \
+         second while the disk keeps up."
+    );
+    if facts.torn_tail_bytes > 0 {
+        note.push_str(&format!(
+            " An unconfirmed write of {} bytes at the end was discarded (gap flagged, never \
+             joined).",
+            facts.torn_tail_bytes
+        ));
+    }
+    note
+}
+
+/// How long ago `path` was last written; `None` when the filesystem
+/// cannot say (or the clock runs behind the file).
+fn modified_age(path: &Path) -> Option<std::time::Duration> {
+    let modified = std::fs::metadata(path).and_then(|meta| meta.modified()).ok()?;
+    std::time::SystemTime::now().duration_since(modified).ok()
+}
+
+/// Where else a recorder journal's confirmed audio is kept (#356,
+/// [`StoreV2::journal_copy`]).
+enum JournalCopy {
+    /// Nowhere proven: the journal may be the only copy.
+    Unproven,
+    /// A take's audio, read back — stored, or quarantined by a delete —
+    /// holds every confirmed sample.
+    Stored,
+    /// This very recording was adopted and then deleted by the user.
+    Deleted,
+    /// A replacement reconcile has not committed yet holds them.
+    Pending,
+}
+
+/// Whether `stored` — a take's audio as read back from disk — holds
+/// every confirmed sample of a recorder journal (`samples` at `rate`) as
+/// a prefix, at the same rate (#356). Samples are compared as the 16-bit
+/// request PCM the store keeps audio as at rest (#342), the whole prefix
+/// through one path: every stored sample quantizes as the journal's, or
+/// every one as the journal's after the PCM16 WAV round trip a save from
+/// the in-memory take goes through — never a mix of the two. Anything
+/// less — another rate, fewer samples, one differing sample — proves
+/// nothing.
+fn holds_journal(stored: &JournalAudio, samples: &[f32], rate: u32) -> bool {
+    let through = |path: fn(i16) -> i16| {
+        samples
+            .iter()
+            .zip(&stored.samples)
+            .all(|(&sample, &kept)| pcm16(kept) == path(pcm16(sample)))
+    };
+    stored.sample_rate == rate
+        && stored.samples.len() >= samples.len()
+        && (through(|request| request)
+            || through(|request| pcm16(f32::from(request) / 32_768.0)))
+}
+
+/// Move recorder journal `journal` into `superseded/` beside it once the
+/// take stored in its place — whose audio is at `stored` (its journal or
+/// FLAC, [`StoreV2::audio_journal_path`]) — is proven to hold every
+/// confirmed sample ([`holds_journal`]). `Ok(true)` when moved; kept,
+/// since journals are never deleted outside the retention sweep, which
+/// only ever finds proven copies there. Anything unproven — the stored
+/// audio unreadable, shorter, at another rate — leaves the journal where
+/// it is, for startup recovery to adopt as an interrupted take: a
+/// duplicate the user can delete beats audio lost. A journal already
+/// gone is fine. A name already taken in `superseded/` gets a numbered
+/// one: the kept journal there is never replaced.
+pub fn supersede_journal_held_by(journal: &Path, stored: &Path) -> Result<bool, StoreV2Error> {
+    let parsed = match read_journal(journal) {
+        Ok(parsed) => parsed,
+        Err(journal::JournalReadError::Io(err)) if err.kind() == io::ErrorKind::NotFound => {
+            return Ok(false);
+        }
+        Err(err) => return Err(StoreV2Error::Invalid(err.to_string())),
+    };
+    let held = read_audio_journal(stored)
+        .is_ok_and(|stored| holds_journal(&stored, &parsed.samples, parsed.sample_rate));
+    drop(parsed);
+    let Some(dir) = journal.parent().filter(|_| held) else {
+        return Ok(false);
+    };
+    move_journal_aside(journal, &dir.join(SUPERSEDED_SUBDIR))?;
+    Ok(true)
+}
+
+/// Move `path` into the `aside` directory, never replacing a kept file.
+fn move_journal_aside(path: &Path, aside: &Path) -> Result<(), StoreV2Error> {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+        return Ok(());
+    };
+    if !path.exists() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(aside)?;
+    let stem = path.file_stem().unwrap_or(name).to_string_lossy().to_string();
+    let mut attempt = 0u32;
+    loop {
+        let destination = if attempt == 0 {
+            aside.join(name)
+        } else {
+            aside.join(format!("{stem}.{attempt}.sj"))
+        };
+        // One atomic move that never replaces what is already kept: no
+        // instant has the journal under both names (recovery would offer
+        // the tree's copy, sharing the kept one's bytes).
+        if rename_noreplace(path, &destination)? {
+            break;
+        }
+        attempt += 1;
+    }
+    sync_dir(dir)?;
+    sync_dir(aside)?;
+    Ok(())
+}
+
+/// Rename `from` to `to` unless `to` exists: `Ok(false)` when the name is
+/// taken. Linux (glibc) asks the kernel for it atomically
+/// (`RENAME_NOREPLACE`); a filesystem or platform without that checks
+/// first — only [`move_journal_aside`] writes in `superseded/` and
+/// `deleted/`, so the check-to-rename window has no competing writer in
+/// practice.
+fn rename_noreplace(from: &Path, to: &Path) -> io::Result<bool> {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let from_c = CString::new(from.as_os_str().as_bytes())?;
+        let to_c = CString::new(to.as_os_str().as_bytes())?;
+        // SAFETY: two NUL-terminated paths that outlive the call.
+        let renamed = unsafe {
+            libc::renameat2(
+                libc::AT_FDCWD,
+                from_c.as_ptr(),
+                libc::AT_FDCWD,
+                to_c.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        if renamed == 0 {
+            return Ok(true);
+        }
+        let error = io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::EEXIST) => return Ok(false),
+            // No RENAME_NOREPLACE on this filesystem or kernel.
+            Some(libc::EINVAL) | Some(libc::ENOSYS) => {}
+            _ => return Err(error),
+        }
+    }
+    match std::fs::symlink_metadata(to) {
+        Ok(_) => Ok(false),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            std::fs::rename(from, to).map(|()| true)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// How many recovery passes leave a recorder journal to a replacement
+/// reconcile has not committed (#356) before adopting it anyway: two
+/// launches' worth (each runs a startup scan and a later recheck).
+const PENDING_REPLACEMENT_PASSES: u32 = 4;
+
+/// Where [`supersede_journal_held_by`] keeps journals, under the
+/// recorder's tree.
+pub const SUPERSEDED_SUBDIR: &str = "superseded";
+
+/// Where startup recovery keeps the recorder journals of takes the user
+/// deleted — the journal's own id carries the capture tombstone — under
+/// the recorder's tree (swept like the takes' own audio).
+const DELETED_SUBDIR: &str = "deleted";
+
+/// What [`StoreV2::recover_capture_journals`] did.
+#[derive(Debug, Default)]
+pub struct JournalRecovery {
+    /// Takes adopted into history as interrupted.
+    pub recovered: Vec<RecoveredJournal>,
+    /// Journals left for a live writer, or for the instance that may
+    /// still be saving them.
+    pub deferred: Vec<String>,
+    /// Files that are not readable journals, renamed aside: `(id, why)`.
+    pub unrecognized: Vec<(String, String)>,
+    /// Journals that could not be adopted this time: `(id, why)`. They
+    /// stay where they are for the next launch.
+    pub failed: Vec<(String, String)>,
+    /// Journals whose take was already stored: moved into `superseded/`.
+    /// Housekeeping, not a finding.
+    pub superseded: Vec<String>,
+    /// Journals of takes adopted under their own name and since deleted
+    /// by the user: moved into `deleted/`. Housekeeping, not a finding.
+    pub deleted: Vec<String>,
+}
+
+/// One take [`StoreV2::recover_capture_journals`] brought back.
+#[derive(Debug, Clone)]
+pub struct RecoveredJournal {
+    pub id: String,
+    /// Verified samples recovered — all of them confirmed on disk.
+    pub samples: u64,
+    pub sample_rate: u32,
+}
+
+impl JournalRecovery {
+    /// Everything this pass has to say; empty when nothing.
+    pub fn summary(&self) -> String {
+        [self.recovered_summary(), self.problems()]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// What came back, for a notice; empty when nothing did.
+    pub fn recovered_summary(&self) -> String {
+        let recovered = self.recovered.len();
+        if recovered == 0 {
+            return String::new();
+        }
+        format!(
+            "Recovered {recovered} recording{} Starling was still recording or saving when it \
+             closed; {} in your history as interrupted, ready to play, export or transcribe.",
+            if recovered == 1 { "" } else { "s" },
+            if recovered == 1 { "it is" } else { "they are" }
+        )
+    }
+
+    /// What could not be recovered or read, for the error banner; empty
+    /// when nothing went wrong.
+    pub fn problems(&self) -> String {
+        let plural = |count: usize| if count == 1 { "" } else { "s" };
+        let mut parts = Vec::new();
+        if !self.failed.is_empty() {
+            let reasons: Vec<String> = self
+                .failed
+                .iter()
+                .map(|(id, why)| format!("{id}: {why}"))
+                .collect();
+            parts.push(format!(
+                "{} interrupted recording{} could not be recovered yet and stay on disk for the \
+                 next launch ({}).",
+                self.failed.len(),
+                plural(self.failed.len()),
+                reasons.join("; ")
+            ));
+        }
+        if !self.unrecognized.is_empty() {
+            parts.push(format!(
+                "{} file{} in the capture journal folder {} not a readable recording; kept \
+                 aside as .unrecognized.",
+                self.unrecognized.len(),
+                plural(self.unrecognized.len()),
+                if self.unrecognized.len() == 1 { "is" } else { "are" }
+            ));
+        }
+        parts.join(" ")
+    }
+}
+
 /// How one recognition attempt ended ([`StoreV2::finish_recognition`]).
 #[derive(Debug, Clone, Copy)]
 pub enum RecognitionOutcome<'a> {
@@ -4220,7 +5087,7 @@ impl FinalizedTake {
             extra_json,
             secure_field: self.meta.secure_field,
         };
-        store.commit_capture(&record)?;
+        store.commit_capture_superseding(&record, self.meta.supersedes_journal.as_deref())?;
         store.gc_staging()?;
         Ok(CommittedTake { record })
     }
@@ -4325,6 +5192,11 @@ pub struct ReconciliationReport {
     /// Takes whose retention removal was stamped but not yet unlinked:
     /// the unlink was finished (#342). Housekeeping, not a finding.
     pub completed_retirements: Vec<String>,
+    /// Recorder journals left in `audio/` by an adoption whose commit
+    /// failed, after the take was stored from its samples instead and
+    /// read back holding all of them: moved to `journals/superseded/`
+    /// (#356). Housekeeping, not a finding.
+    pub superseded_journals: Vec<String>,
     /// In-flight ids (staging journals, orphan candidates) a live foreign
     /// lease owner claimed: this run was a client (§4 ownership) and left
     /// them for the owner's own reconcile. Informational — a deferral is
@@ -4691,7 +5563,7 @@ fn validate_document_id(id: &str) -> Result<(), StoreV2Error> {
 
 /// What one marker probe learned about its flock (#213 review).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum FlockEvidence {
+pub(crate) enum FlockEvidence {
     /// The probe acquired the exclusive lock itself (releasing it with the
     /// handle): no live owner anywhere — the OS frees the lock when the
     /// owning process dies.
@@ -4739,7 +5611,7 @@ fn read_recorded_pid(file: &mut File) -> Option<u32> {
 /// it when the owning process dies, which is what makes a leftover marker
 /// file after a crash harmless.
 #[cfg(unix)]
-fn try_flock_exclusive(file: &File) -> io::Result<FlockEvidence> {
+pub(crate) fn try_flock_exclusive(file: &File) -> io::Result<FlockEvidence> {
     use std::os::fd::AsRawFd;
     // SAFETY: flock(2) on an fd this caller owns and keeps open for the
     // lock's lifetime; no close or hand-off happens here.
@@ -4762,7 +5634,7 @@ fn try_flock_exclusive(file: &File) -> io::Result<FlockEvidence> {
 /// locking the record's own bytes would stop every prober from reading
 /// the identity it needs.
 #[cfg(windows)]
-fn try_flock_exclusive(file: &File) -> io::Result<FlockEvidence> {
+pub(crate) fn try_flock_exclusive(file: &File) -> io::Result<FlockEvidence> {
     Ok(if windows_lock::try_lock(file)? {
         FlockEvidence::Free
     } else {
@@ -4774,7 +5646,7 @@ fn try_flock_exclusive(file: &File) -> io::Result<FlockEvidence> {
 /// probe answers [`FlockEvidence::Unknown`] and the marker's recorded PID
 /// decides ownership instead (see [`attempt_owned_from`]).
 #[cfg(not(any(unix, windows)))]
-fn try_flock_exclusive(_file: &File) -> io::Result<FlockEvidence> {
+pub(crate) fn try_flock_exclusive(_file: &File) -> io::Result<FlockEvidence> {
     Ok(FlockEvidence::Unknown)
 }
 
@@ -5474,6 +6346,9 @@ fn lease_alive_from(
 
 #[cfg(test)]
 mod at_rest_tests;
+
+#[cfg(test)]
+mod journal_recovery_tests;
 
 #[cfg(test)]
 mod tests {

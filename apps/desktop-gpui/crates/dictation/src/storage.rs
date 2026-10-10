@@ -95,6 +95,30 @@ pub struct SessionSummary {
     /// The take is in the archival retention class (#342): its audio
     /// follows the archival limits instead of the standard ones.
     pub archival: bool,
+    /// The take itself ended without a clean stop (#356) — recovered at
+    /// startup or salvaged — whatever its recognition attempts did since.
+    /// `status` reports the attempts; this keeps the take's own history.
+    pub interrupted: bool,
+    /// How much of the audio the capture journal confirmed on disk (its
+    /// acknowledged-sample watermark), when the rate is known.
+    pub confirmed_ms: Option<f64>,
+    /// Every completed transcript of the take, oldest first (#356): a
+    /// retry adds one, nothing replaces one. `transcript` is the one the
+    /// take shows.
+    pub results: Vec<TakeResult>,
+}
+
+/// One completed transcript of a take: which attempt produced it, with
+/// what, and when.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TakeResult {
+    pub attempt_id: String,
+    /// The attempt's [`BackendLabel`] string.
+    pub backend: String,
+    pub text: String,
+    pub created_at: Option<String>,
+    /// This is the transcript the take shows.
+    pub shown: bool,
 }
 
 /// One damaged record as the listing reports it (G02): flagged with the

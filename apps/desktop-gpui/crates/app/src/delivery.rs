@@ -241,6 +241,9 @@ pub(crate) enum Failure {
     /// The target cannot be verified, and Starling's own window had focus
     /// since the capture: the original target cannot be assumed.
     FocusMovedThroughStarling,
+    /// The text is a retried take's (#356): it is never typed by itself
+    /// — the editor the take was dictated into may have moved on.
+    Retried,
 }
 
 impl Failure {
@@ -256,6 +259,7 @@ impl Failure {
             Failure::Stalled => "Not inserted: typing stalled",
             Failure::EarlierTypingStuck => "Not inserted: earlier typing is stuck",
             Failure::UnverifiedOff => "Not inserted: the target cannot be checked",
+            Failure::Retried => "Retried: not typed anywhere",
             Failure::Insert(_) => "Not inserted",
         }
     }
@@ -364,6 +368,12 @@ impl Recovery {
             Failure::Stalled => {
                 "Typing did not finish in time: the display stopped answering. Some of the text \
                  may already be in the window; check it before pasting again."
+                    .to_string()
+            }
+            Failure::Retried => {
+                "This transcript comes from a retry, so it was not typed anywhere: the window \
+                 you dictated into may hold other text by now. Copy it, or press Paste last \
+                 and click into the field it belongs in."
                     .to_string()
             }
             Failure::EarlierTypingStuck => {
@@ -685,6 +695,22 @@ impl StarlingApp {
             self.delivery.staged_armed = None;
             self.overlay_insert_unarmed();
         }
+    }
+
+    /// A retried take's transcript landed (#356): it is never typed by
+    /// itself. With typing on, the notice offers Copy and an explicit
+    /// Paste last; with copy-only delivery the drawer's Copy is the way.
+    /// A take whose staging panel is open keeps its panel's own Insert.
+    pub(crate) fn offer_retried_text(&mut self, id: &str, cx: &mut Context<Self>) {
+        if !self.delivery.settings.auto_insert || self.staging_shows(id) {
+            return;
+        }
+        let Some(text) = self.head_text(id).filter(|text| !text.trim().is_empty()) else {
+            return;
+        };
+        self.delivery
+            .replace_recovery(Some(Recovery::new(id, text, Failure::Retried)));
+        cx.notify();
     }
 
     /// A direct take's transcript landed: type its text into the
@@ -1259,6 +1285,9 @@ mod tests {
             model_label: None,
             journal_id: None,
             archival: false,
+            interrupted: false,
+            confirmed_ms: None,
+            results: Vec::new(),
         }
     }
 

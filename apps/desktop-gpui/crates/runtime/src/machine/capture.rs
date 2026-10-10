@@ -461,8 +461,15 @@ impl V2CaptureStore {
         let mut adoption_error = None;
         {
             let mut store = self.store.lock().expect("v2 store lock");
+            // #356: a faulted or unfinalized journal holds only the audio
+            // before its fault, while the take's samples kept everything;
+            // it is adopted only when the samples are all there is.
             let adoption = match &take.journal {
-                Some(report) if report.path.exists() => {
+                Some(report)
+                    if report.path.exists()
+                        && ((report.finalized && report.fault.is_none())
+                            || take.samples.is_empty()) =>
+                {
                     Some((report, store.adopt_journal(&report.path, note)))
                 }
                 _ => None,
@@ -559,6 +566,10 @@ impl V2CaptureStore {
         // the take's samples through the §4 protocol.
         let mut meta = TakeMeta::for_device(take.device.clone());
         meta.policy = take.policy.clone();
+        // #356: the commit names the recorder journal this take replaces,
+        // so a crash before that journal is moved aside cannot bring it
+        // back as a second copy at the next startup recovery.
+        meta.supersedes_journal = take.journal.as_ref().map(|report| report.id.clone());
         let mut extra = serde_json::json!({
             "takeCorr": take.id,
             "captureId": take.capture_id,
@@ -678,6 +689,8 @@ impl V2CaptureStore {
                     // A successfully recorded note is the normal sub-path,
                     // not divergence — the channel stays free of
                     // normal-path traffic for operators keying on it.
+                    drop(store);
+                    self.supersede_stored_take_journal(take, &staged_id);
                     return Ok(());
                 }
                 Err(read_err) => {
@@ -686,6 +699,11 @@ impl V2CaptureStore {
                          read back ({read_err}) — the commit's outcome is unknown; reconcile \
                          will surface whatever landed"
                     ));
+                    // Whatever landed came from the samples, whose sealed
+                    // journal reconcile surfaces: the recorder's journal
+                    // is no second copy to offer.
+                    drop(store);
+                    self.supersede_stored_take_journal(take, &staged_id);
                     return Ok(());
                 }
                 Ok(None) => {}
@@ -739,7 +757,40 @@ impl V2CaptureStore {
             };
             return Err(chained_with_rollback(err, rollback));
         }
+        drop(store);
+        self.supersede_stored_take_journal(take, &staged_id);
         Ok(())
+    }
+
+    /// #356: a take stored from its samples as `staged_id` (every exit
+    /// that answers Ok on the samples path) leaves no journal in the
+    /// recorder's tree to come back as a second, partial take at the next
+    /// startup recovery — once its stored audio, read back, holds every
+    /// sample the journal confirmed. Kept, never deleted; a journal not
+    /// provably held stays for recovery (a duplicate at worst, never
+    /// audio lost).
+    fn supersede_stored_take_journal(&self, take: &TakeRecord, staged_id: &str) {
+        let Some(report) = &take.journal else {
+            return;
+        };
+        // The reads run off the lock: only the path needs it.
+        let stored = self.store.lock().expect("v2 store lock").audio_journal_path(staged_id);
+        let moved = stored.and_then(|stored| {
+            starling_dictation::store_v2::supersede_journal_held_by(&report.path, &stored)
+        });
+        match moved {
+            Ok(true) => {}
+            Ok(false) => report_divergence(format!(
+                "the capture journal {} was kept in place: take {staged_id} does not provably \
+                 hold all of its audio, so startup recovery will list it as an interrupted copy",
+                report.path.display()
+            )),
+            Err(err) => report_divergence(format!(
+                "the stored take's capture journal {} could not be moved aside ({err}); \
+                 startup recovery may list it as an interrupted copy",
+                report.path.display()
+            )),
+        }
     }
 }
 
@@ -768,12 +819,26 @@ fn chained_with_rollback(error: String, rollback: Option<String>) -> String {
     }
 }
 
+/// #356: the take's journal lock was held from its creation through the
+/// commit, so no other instance's startup recovery adopted the journal of
+/// a take this process was still storing. The commit has answered; the
+/// registry may keep the record for the session, but not the lock.
+fn release_take_journal(take: &TakeRecord) {
+    if let Some(report) = &take.journal {
+        report.liveness.release();
+    }
+}
+
 impl CaptureStore for V2CaptureStore {
     fn commit_take(&self, take: &TakeRecord) -> Result<(), String> {
-        self.commit(take, CaptureStatus::Complete, None)
+        let committed = self.commit(take, CaptureStatus::Complete, None);
+        release_take_journal(take);
+        committed
     }
     fn mark_interrupted(&self, take: &TakeRecord, note: &str) -> Result<(), String> {
-        self.commit(take, CaptureStatus::Interrupted, Some(note))
+        let committed = self.commit(take, CaptureStatus::Interrupted, Some(note));
+        release_take_journal(take);
+        committed
     }
     fn describe(&self) -> String {
         "storage-v2".to_string()

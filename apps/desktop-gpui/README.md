@@ -107,6 +107,35 @@ The app uses `GET /v1/models`, streams live recording chunks through
 if the stream fails. The model list supplies the topbar's model name. Batch
 transcription returns `{text}` and echoes a request ID in the response header.
 
+## Recordings survive failures
+
+Every take is written to a capture journal on disk from its first samples
+(`~/.local/share/starling-gpui/journals/`), independently of the engine,
+the network and processing (#356). Transcription failing in any way — model
+not loaded, engine crash or OOM, timeout, an error or empty answer, a model
+switch, a lost connection — keeps the take in history with its audio; the
+drawer plays it, exports it as WAV or lossless FLAC, and transcribes it again
+with the current model, another installed built-in model (the engine switches
+to it), or your own server. Each successful retry adds a result attached to the
+same recording; earlier results stay listed and an empty answer never replaces
+real text. A retried transcript is never typed into another app: it is offered
+for Copy, or Paste last into the field you pick.
+
+How much survives a crash: the journal aims to confirm audio on disk every
+250 ms (or 64 KiB) — a slow disk stretches that. If Starling is killed or
+crashes while recording, the next launch adopts the journal as an interrupted
+take holding everything up to the last confirmed point, and the drawer shows
+how much that is. Audio after it (normally the last moment before the crash,
+plus anything still in the capture buffer) is lost; an unconfirmed partial
+write at the end is discarded and noted, never joined. A take whose app
+stopped after the recording ended but before it was saved comes back complete
+(a journal finished less than a minute before launch is left to a save that
+may still be running and picked up a minute later). If the journal itself fails mid-take (a full disk), recording
+continues in memory and the whole take is saved from memory at stop; if that
+save fails too, the take stays downloadable from the unsaved banner and its
+journal is recovered at the next launch up to the failure. A journal whose
+take was saved from memory is kept under `journals/superseded/`.
+
 ## Staging panel
 
 In a staged mode (every built-in mode), the take's transcript appears in an

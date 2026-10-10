@@ -2134,6 +2134,7 @@ fn real_journal(samples: &[f32]) -> (JournalReport, tempfile::TempDir) {
             acknowledged_samples: finalized.total_samples,
             finalized: true,
             fault: None,
+            liveness: Default::default(),
         },
         scratch,
     )
@@ -2188,6 +2189,39 @@ fn v2_store_forces_interrupted_on_a_salvaged_adopted_take() {
     assert_eq!(record.status, starling_dictation::store_v2::CaptureStatus::Interrupted);
     let note = record.recovery_note().expect("the salvage note");
     assert!(note.contains("salvaged take was kept"), "{note}");
+}
+
+#[test]
+fn a_faulted_journal_is_not_adopted_over_the_takes_fuller_samples() {
+    // #356: a journal that faulted mid-take holds only the audio before
+    // the fault; the take's samples kept recording. The take is stored
+    // from its samples, and the partial journal is moved aside (kept)
+    // so startup recovery does not offer it as a second take.
+    let dir = tempfile::tempdir().expect("v2 store temp dir");
+    let store = V2CaptureStore::open(dir.path()).expect("v2 store opens");
+    let samples: Vec<f32> = (0..400).map(|i| (i % 29) as f32 * 0.003).collect();
+    let (mut journal, scratch) = real_journal(&samples[..150]);
+    journal.fault = Some("The capture journal failed: No space left on device".to_string());
+
+    store
+        .commit_take(&take_record("take_faulted", &samples, Some(journal.clone())))
+        .expect("commit");
+
+    let inner = starling_dictation::store_v2::StoreV2::open(dir.path()).expect("reopen");
+    assert!(inner.get_capture(&journal.id).expect("read").is_none(), "not adopted");
+    let rows = inner.list_records(0, 10).expect("list");
+    assert_eq!(rows.total, 1);
+    let starling_dictation::store_v2::ListedCapture::Capture(listing) = &rows.records[0] else {
+        panic!("expected a readable capture, got {:?}", rows.records[0]);
+    };
+    assert_eq!(listing.record.frame_count, 400, "the whole take");
+    assert!(!journal.path.exists());
+    assert!(scratch
+        .path()
+        .join("staging")
+        .join(starling_dictation::store_v2::SUPERSEDED_SUBDIR)
+        .join(format!("{}.sj", journal.id))
+        .exists());
 }
 
 /// A real journal renamed to a caller-chosen id at `dest` (on the same
@@ -2377,6 +2411,7 @@ fn v2_store_falls_back_to_the_samples_protocol_without_journal_evidence() {
         acknowledged_samples: 0,
         finalized: false,
         fault: Some("journal write failed".to_string()),
+        liveness: Default::default(),
     };
     store
         .mark_interrupted(

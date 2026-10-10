@@ -4,7 +4,7 @@
 
 mod capture;
 mod delivery;
-mod drawer;
+pub(crate) mod drawer;
 mod feedback;
 mod history;
 mod live_preview;
@@ -282,6 +282,7 @@ mod tests {
             models,
             notices: Vec::new(),
             last_error: None,
+            activations_handled: 0,
         }
     }
 

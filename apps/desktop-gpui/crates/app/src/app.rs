@@ -435,6 +435,13 @@ pub struct StarlingApp {
     pub damaged: Vec<DamagedRecord>,
     pub selected_id: Option<String>,
     pub active_ids: HashSet<String>,
+    /// The take whose "Retry with" choices the drawer shows (#356).
+    pub(crate) retry_menu: Option<String>,
+    /// A retry waiting for the engine to switch to its model (#356).
+    pub(crate) pending_retry: Option<crate::upload::PendingRetry>,
+    /// Bumped by every retry request: only the newest acts once its
+    /// audio has loaded.
+    pub(crate) retry_seq: u64,
     pub error: Option<String>,
     pub capture_warning: Option<String>,
     /// Ephemeral one-off export notice (G05: a renamed export is surfaced,
@@ -496,6 +503,8 @@ pub struct StarlingApp {
     /// What happened to a take that was cancelled (Escape, a microphone
     /// that never delivered audio): shown until dismissed.
     pub(crate) take_notice: Option<String>,
+    /// Takes startup recovery brought back (#356): shown until dismissed.
+    pub(crate) recovery_notice: Option<String>,
     /// The latest playback-attenuation notice. Its own slot: the take
     /// lifecycle clears `error` and `take_notice` on every start/stop.
     pub(crate) playback_notice: Option<PlaybackNotice>,
@@ -1096,6 +1105,9 @@ impl StarlingApp {
             damaged: Vec::new(),
             selected_id: None,
             active_ids: HashSet::new(),
+            retry_menu: None,
+            pending_retry: None,
+            retry_seq: 0,
             unsaved: Vec::new(),
             confirm_discard_for: None,
             copied: None,
@@ -1139,6 +1151,7 @@ impl StarlingApp {
             system_check: Default::default(),
             key_interceptor: None,
             take_notice: None,
+            recovery_notice: None,
             playback_notice: None,
             correction_chain: None,
             playing_id: None,
@@ -1192,29 +1205,14 @@ impl StarlingApp {
                     let store = store.clone();
                     cx.background_spawn(async move { store.startup_recovery() }).await
                 };
-                match recovered {
-                    Ok(summary) if !summary.is_empty() => {
-                        this.update(cx, |app, cx| {
-                            app.error = Some(summary);
-                            cx.notify();
-                        })
-                        .ok();
-                    }
-                    Ok(_) => {}
-                    Err(err) => {
-                        this.update(cx, |app, cx| {
-                            app.error = Some(format!(
-                                "Could not recover interrupted recordings: {err}"
-                            ));
-                            cx.notify();
-                        })
-                        .ok();
-                    }
-                }
+                let recheck = crate::upload::show_startup_recovery(&this, recovered, cx);
 
                 refresh_sessions(&this, &store, cx).await;
                 // #342: compression and retention after recovery settled.
                 this.update(cx, |app, cx| app.start_audio_upkeep(cx)).ok();
+                if !recheck.is_empty() {
+                    crate::upload::recheck_capture_journals(&this, &store, recheck, cx).await;
+                }
             })
             .detach();
         }
@@ -2210,12 +2208,19 @@ impl StarlingApp {
     }
 
     pub fn export_audio(&mut self, cx: &mut Context<Self>) {
+        self.export_audio_as(false, cx);
+    }
+
+    /// Export the selected take's audio as WAV, or as lossless FLAC
+    /// (#356) — the same samples either way.
+    pub fn export_audio_as(&mut self, flac: bool, cx: &mut Context<Self>) {
         let Some(session) = self.selected() else {
             return;
         };
         let name = format!(
-            "starling-{}.wav",
-            session.created_at.replace([':', '.'], "-")
+            "starling-{}.{}",
+            session.created_at.replace([':', '.'], "-"),
+            if flac { "flac" } else { "wav" }
         );
         let id = session.id.clone();
         // G02: history holds metadata only — fetch this one recording's
@@ -2227,11 +2232,20 @@ impl StarlingApp {
             let loaded = {
                 let store = store.clone();
                 let id = id.clone();
-                cx.background_spawn(async move { store.audio_wav(&id) }).await
+                cx.background_spawn(async move {
+                    if flac {
+                        store.audio_flac(&id)
+                    } else {
+                        store.audio_wav(&id)
+                    }
+                })
+                .await
             };
             this.update(cx, |app, cx| match loaded {
                 Ok(Some(wav)) => {
-                    app.write_download(name, wav, Some(id), true, cx);
+                    // The drawer's "Saved" flag belongs to its WAV button.
+                    let saved_for = (!flac).then(|| id.clone());
+                    app.write_download(name, wav, saved_for, true, cx);
                 }
                 Ok(None) => {
                     app.error = Some(format!("Recording {id} was not found."));
@@ -2878,6 +2892,9 @@ mod tests {
             model_label: None,
             journal_id: None,
             archival: false,
+            interrupted: false,
+            confirmed_ms: None,
+            results: Vec::new(),
         }
     }
 

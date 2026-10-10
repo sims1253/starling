@@ -273,6 +273,11 @@ pub struct EngineSnapshot {
     pub models: Vec<ModelView>,
     pub notices: Vec<String>,
     pub last_error: Option<String>,
+    /// The newest [`EngineManager::activate`] request the supervisor has
+    /// taken up. From then on `switch`, `pending_decision` and
+    /// `last_error` answer that request or a later intent; before, they
+    /// are left over from earlier ones.
+    pub activations_handled: u64,
 }
 
 /// A take's hold on the engine that serves it (#363 step 3): requests
@@ -434,6 +439,10 @@ pub(crate) struct SharedState {
     pub deleting: HashSet<String>,
     pub notices: Vec<String>,
     pub last_error: Option<String>,
+    /// The id the next `activate` request gets (ids start at 1).
+    pub next_activation: u64,
+    /// See [`EngineSnapshot::activations_handled`].
+    pub activations_handled: u64,
     pub backend_override: Option<Backend>,
     /// Recent crashes (time, stderr tail) for the loop policy.
     pub crashes: Vec<(Instant, String)>,
@@ -467,6 +476,8 @@ impl SharedState {
             deleting: HashSet::new(),
             notices: Vec::new(),
             last_error: None,
+            next_activation: 1,
+            activations_handled: 0,
             backend_override,
             crashes: Vec::new(),
             last_active_model: None,
@@ -533,7 +544,7 @@ pub(crate) struct SwitchState {
 }
 
 enum Command {
-    Activate(String),
+    Activate { model_id: String, request: u64 },
     Download(String),
     CancelDownload(String),
     ConfirmDrainSwap,
@@ -711,12 +722,20 @@ impl EngineManager {
     /// Download-if-needed, verify, then switch to `model_id` (see the
     /// module docs for the switch protocol). A running switch is
     /// cancelled first; rapid repeated switches leave exactly one owned
-    /// sidecar.
-    pub fn activate(&self, model_id: &str) {
-        let _ = self
-            .inner
-            .cmd_tx
-            .send(Command::Activate(model_id.to_string()));
+    /// sidecar. Returns the request's id, which
+    /// [`EngineSnapshot::activations_handled`] reaches once the switch is
+    /// under way.
+    pub fn activate(&self, model_id: &str) -> u64 {
+        // Ids are handed out and sent under the state lock, so the
+        // supervisor takes requests up in id order.
+        let mut state = self.inner.lock();
+        let request = state.next_activation;
+        state.next_activation += 1;
+        let _ = self.inner.cmd_tx.send(Command::Activate {
+            model_id: model_id.to_string(),
+            request,
+        });
+        request
     }
 
     /// Answers a pending [`SwapDecision::NeedsDrain`].
@@ -871,6 +890,7 @@ fn build_snapshot(state: &SharedState, catalog: &[CatalogEntry]) -> EngineSnapsh
             .collect(),
         notices: state.notices.clone(),
         last_error: state.last_error.clone(),
+        activations_handled: state.activations_handled,
     }
 }
 
@@ -982,12 +1002,12 @@ impl Supervisor {
     fn handle(&mut self, command: Command) {
         match command {
             Command::Shutdown => {}
-            Command::Activate(model_id) => {
+            Command::Activate { model_id, request } => {
                 if self.inner.shutdown.load(Ordering::Acquire) {
                     return;
                 }
                 let superseded = self.begin_intent();
-                self.start_switch(model_id, SwitchKind::Activate, superseded);
+                self.start_switch(model_id, SwitchKind::Activate, superseded, Some(request));
             }
             Command::Download(model_id) => self.start_download(model_id),
             Command::CancelDownload(model_id) => {
@@ -1071,7 +1091,7 @@ impl Supervisor {
                             .as_ref()
                             .map(|engine| engine.model_id.clone());
                         if let Some(model_id) = active {
-                            self.start_switch(model_id, SwitchKind::Reload, superseded);
+                            self.start_switch(model_id, SwitchKind::Reload, superseded, None);
                         }
                     }
                 }
@@ -1091,8 +1111,16 @@ impl Supervisor {
     }
 
     /// Registers and spawns a switch worker for the intent begun with
-    /// [`Supervisor::begin_intent`].
-    fn start_switch(&mut self, model_id: String, kind: SwitchKind, superseded: Arc<AtomicBool>) {
+    /// [`Supervisor::begin_intent`]. `activation` is the id of the
+    /// `activate` request it serves, recorded in the same update that
+    /// clears the previous switch's decision and error.
+    fn start_switch(
+        &mut self,
+        model_id: String,
+        kind: SwitchKind,
+        superseded: Arc<AtomicBool>,
+        activation: Option<u64>,
+    ) {
         self.switch_token += 1;
         let token = self.switch_token;
         let cancel = Arc::new(AtomicBool::new(false));
@@ -1101,6 +1129,9 @@ impl Supervisor {
             let mut state = self.inner.lock();
             state.pending_decision = None;
             state.last_error = None;
+            if let Some(request) = activation {
+                state.activations_handled = request;
+            }
             state.switch = Some(SwitchState {
                 token,
                 target: model_id.clone(),
@@ -2970,6 +3001,39 @@ mod tests {
             next_attach_poll: Instant::now(),
             switch_token: 0,
         }
+    }
+
+    /// An activation is taken up in the same update that clears the
+    /// previous switch's outcome: a reader never sees its id beside a
+    /// refusal or error left over from before it (#356).
+    #[test]
+    fn taking_up_an_activation_clears_the_previous_outcome_with_its_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut supervisor = idle_supervisor(dir.path());
+        {
+            let mut state = supervisor.inner.lock();
+            state.pending_decision = Some(SwapDecision::Refused {
+                needed: 2,
+                available: 1,
+            });
+            state.last_error = Some("an earlier switch failed".to_string());
+        }
+        let before = build_snapshot(&supervisor.inner.lock(), &supervisor.inner.catalog);
+        assert_eq!(before.activations_handled, 0);
+        supervisor.handle(Command::Activate {
+            model_id: "no-such-model".to_string(),
+            request: 7,
+        });
+        let after = build_snapshot(&supervisor.inner.lock(), &supervisor.inner.catalog);
+        assert_eq!(after.activations_handled, 7);
+        assert_eq!(after.pending_decision, None);
+        assert_ne!(after.last_error.as_deref(), Some("an earlier switch failed"));
+        // A reload is no activation: the id stays.
+        supervisor.cancel_current_switch();
+        let superseded = supervisor.inner.lock().supersede();
+        supervisor.start_switch("no-such-model".to_string(), SwitchKind::Reload, superseded, None);
+        assert_eq!(supervisor.inner.lock().activations_handled, 7);
+        supervisor.cancel_current_switch();
     }
 
     /// `tick` captured engine A, then a cutover installed B before A's
