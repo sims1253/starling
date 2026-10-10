@@ -391,10 +391,12 @@ pub(crate) struct DeliveryState {
     /// Starling's own window. `overlay_gained` is when it last took focus.
     overlay_active: bool,
     overlay_gained: Option<Instant>,
-    /// Inserts started and not finished, and the first failure among
-    /// them: the overlay says "Inserting…" until the last one ends.
+    /// Inserts started and not finished, the first failure among them,
+    /// and whether one landed: the overlay says "Inserting…" until the
+    /// last one ends.
     inserts_pending: usize,
     batch_failure: Option<&'static str>,
+    batch_delivered: bool,
     /// A settings session check is out (see
     /// [`StarlingApp::check_session_verifies`]).
     session_check_out: Arc<AtomicBool>,
@@ -424,6 +426,7 @@ impl DeliveryState {
             overlay_gained: None,
             inserts_pending: 0,
             batch_failure: None,
+            batch_delivered: false,
             session_check_out: Arc::default(),
             insert_out: Arc::default(),
         }
@@ -477,31 +480,39 @@ impl StarlingApp {
 
     /// An insert ended (`started`), or a delivery failed before typing.
     /// The overlay shows the outcome once no insert is left running; a
-    /// failure among them outranks the successes.
+    /// failure among them outranks the successes. `outcome` is `None` for
+    /// a Paste last whose notice was dismissed or replaced meanwhile: it
+    /// shows nowhere, so with nothing else to show the overlay goes idle.
     fn overlay_delivery_ended(
         &mut self,
         started: bool,
-        failure: Option<&Failure>,
+        outcome: Option<Result<(), &Failure>>,
         cx: &mut Context<Self>,
     ) {
         if started {
             self.delivery.inserts_pending = self.delivery.inserts_pending.saturating_sub(1);
         }
-        if let Some(failure) = failure {
-            self.delivery.batch_failure.get_or_insert(failure.title());
+        match outcome {
+            Some(Ok(())) => self.delivery.batch_delivered = true,
+            Some(Err(failure)) => {
+                self.delivery.batch_failure.get_or_insert(failure.title());
+            }
+            None => {}
         }
         if self.delivery.inserts_pending > 0 {
             return;
         }
+        let failure = self.delivery.batch_failure.take();
+        let delivered = std::mem::take(&mut self.delivery.batch_delivered);
         // A pressed Insert still waits: the switch it asks for comes first.
-        if self.delivery.staged_armed.is_some() {
-            self.delivery.batch_failure = None;
-            self.set_delivery_status(DeliveryStatus::Waiting, cx);
-            return;
-        }
-        let status = match self.delivery.batch_failure.take() {
-            Some(reason) => DeliveryStatus::Failed(reason.to_string()),
-            None => DeliveryStatus::Delivered,
+        let status = if self.delivery.staged_armed.is_some() {
+            DeliveryStatus::Waiting
+        } else if let Some(reason) = failure {
+            DeliveryStatus::Failed(reason.to_string())
+        } else if delivered {
+            DeliveryStatus::Delivered
+        } else {
+            DeliveryStatus::Idle
         };
         self.set_delivery_status(status, cx);
     }
@@ -632,7 +643,7 @@ impl StarlingApp {
         ) {
             Plan::Skip => {}
             Plan::Fail(failure) => {
-                self.overlay_delivery_ended(false, Some(&failure), cx);
+                self.overlay_delivery_ended(false, Some(Err(&failure)), cx);
                 self.delivery
                     .replace_recovery(Some(Recovery::new(id, text, failure)));
                 cx.notify();
@@ -705,7 +716,11 @@ impl StarlingApp {
         result: Result<starling_insertion::InsertReceipt, Failure>,
         cx: &mut Context<Self>,
     ) {
-        self.overlay_delivery_ended(true, result.as_ref().err(), cx);
+        // A Paste last for a notice dismissed or replaced meanwhile
+        // reports nowhere, the overlay included.
+        let superseded = paste.is_some_and(|generation| generation != self.delivery.generation);
+        let outcome = (!superseded).then(|| result.as_ref().map(drop));
+        self.overlay_delivery_ended(true, outcome, cx);
         // A staged take's Insert shows "Inserted"; after a failure, the
         // notice's Paste last is the retry.
         if result.is_ok() && self.staged_text_for(&id).is_some() {
@@ -935,7 +950,7 @@ impl StarlingApp {
         match plan(&capture, self.delivery.settings, verified, false, &text) {
             Plan::Skip => {}
             Plan::Fail(failure) => {
-                self.overlay_delivery_ended(false, Some(&failure), cx);
+                self.overlay_delivery_ended(false, Some(Err(&failure)), cx);
                 self.delivery
                     .replace_recovery(Some(Recovery::new(&id, text, failure)));
             }
@@ -1060,13 +1075,13 @@ impl StarlingApp {
             }
             Plan::Skip => {
                 let failure = Failure::Insert(InsertError::TargetIsStarling);
-                self.overlay_delivery_ended(false, Some(&failure), cx);
+                self.overlay_delivery_ended(false, Some(Err(&failure)), cx);
                 if let Some(recovery) = self.delivery.recovery.as_mut() {
                     recovery.failure = failure;
                 }
             }
             Plan::Fail(failure) => {
-                self.overlay_delivery_ended(false, Some(&failure), cx);
+                self.overlay_delivery_ended(false, Some(Err(&failure)), cx);
                 if let Some(recovery) = self.delivery.recovery.as_mut() {
                     recovery.failure = failure;
                 }
@@ -1743,6 +1758,31 @@ mod tests {
         cx.executor().advance_clock(PASTE_SETTLE);
         cx.run_until_parked();
         assert!(fake.insertions().is_empty());
+    }
+
+    /// A Paste last whose notice was dismissed while it typed shows its
+    /// outcome nowhere: the overlay goes idle rather than flash it.
+    #[gpui::test]
+    fn a_dismissed_paste_shows_no_outcome_in_the_overlay(cx: &mut gpui::TestAppContext) {
+        let (app, fake) = app_with(cx, on());
+        fake.focus(FakeTarget::named("Editor", "notes.txt"));
+        take(&app, cx, "take-1", "Hello there.", |_| {
+            fake.destroy_target()
+        });
+        app.update(cx, |app, cx| {
+            // A Paste last is typing when its notice is dismissed.
+            let generation = app.delivery.generation;
+            app.overlay_insert_started(cx);
+            app.dismiss_recovery(cx);
+            app.insert_finished(
+                "take-1".into(),
+                "Hello there.".into(),
+                Some(generation),
+                Err(Failure::Insert(InsertError::TargetGone)),
+                cx,
+            );
+            assert_eq!(app.overlay.model.delivery(), &DeliveryStatus::Idle);
+        });
     }
 
     /// A settle that runs after an armed Paste last expired, before its
