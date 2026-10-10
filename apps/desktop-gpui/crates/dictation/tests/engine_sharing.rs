@@ -273,3 +273,60 @@ fn an_attached_engine_is_not_counted_as_freeable_memory() {
         assert_eq!(count, 1, "B was never loaded next to A");
     }
 }
+
+/// #220: a backend change on an instance attached to another's sidecar
+/// does not start a second one beside it (a reload spawns unshared, so
+/// both would stay resident): the attached engine keeps serving, the
+/// instance says why, and the owner's sidecar stays the only one.
+#[test]
+fn a_backend_change_while_attached_starts_no_second_sidecar() {
+    let Some(fixture) = fixture() else { return };
+    let root = tempfile::tempdir().expect("tempdir");
+    let engine_dir = stage_engine_dir(root.path(), &fixture);
+    let models_dir = root.path().join("models");
+    let state_dir = root.path().join("state");
+
+    let bytes = model_bytes(9, 100_000);
+    let addr = spawn_model_server(vec![("g.gguf".to_string(), Arc::new(bytes.clone()))]);
+    let entry_g = entry("model-g", "g.gguf", addr, &bytes);
+    install(&models_dir, &entry_g, &bytes);
+    let catalog = vec![entry_g];
+
+    let owner = EngineManager::start(
+        config(&engine_dir, &models_dir, &state_dir, catalog.clone()),
+        Some("model-g".to_string()),
+    );
+    let original = wait_until(&owner, READY_TIMEOUT, |s| s.phase == EnginePhase::Ready)
+        .expect("owner Ready")
+        .active
+        .expect("owner active");
+    let attached = EngineManager::start(
+        config(&engine_dir, &models_dir, &state_dir, catalog),
+        Some("model-g".to_string()),
+    );
+    wait_until(&attached, READY_TIMEOUT, |s| {
+        s.phase == EnginePhase::Ready && s.active.as_ref().is_some_and(|a| !a.owned)
+    })
+    .expect("the second instance attaches");
+
+    attached.set_backend_override(Some(starling_dictation::engine::Backend::Cpu));
+    let told = wait_until(&attached, READY_TIMEOUT, |s| s.last_error.is_some())
+        .expect("the attached instance says why nothing reloaded");
+    assert!(
+        told.last_error.as_deref().unwrap_or("").contains("another Starling process"),
+        "{:?}",
+        told.last_error
+    );
+    // Long enough for a reload to have spawned and warmed.
+    std::thread::sleep(Duration::from_secs(2));
+    let after = attached.snapshot();
+    assert!(after.switch.is_none(), "no reload runs");
+    let active = after.active.expect("still serving");
+    assert!(!active.owned);
+    assert_eq!(active.pid, original.pid, "still the owner's sidecar");
+    if let Some(count) = count_engine_processes(engine_dir.to_str().unwrap()) {
+        assert_eq!(count, 1, "one sidecar, not two");
+    }
+    attached.shutdown();
+    owner.shutdown();
+}

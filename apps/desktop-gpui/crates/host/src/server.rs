@@ -196,6 +196,12 @@ impl HostHandle {
         capture_settled && snapshot.jobs.active == 0 && snapshot.jobs.waiting == 0
     }
 
+    /// Whether a newer app asked this host to step aside and it agreed
+    /// (see [`crate::version`]): whoever runs the host shuts it down now.
+    pub fn retire_requested(&self) -> bool {
+        self.shared.retire.load(Ordering::SeqCst)
+    }
+
     /// The engine manager this host supervises right now, when it runs
     /// one (builtin mode) — for status reporting and tests. A host that
     /// follows the settings file keeps this current while it serves: a
@@ -241,6 +247,9 @@ impl HostHandle {
         if let Some(engine) = &self.engine {
             engine.begin_shutdown();
         }
+        // The engine worker ends once its queue's last sender is gone
+        // (the connection threads only borrow this one).
+        lock_registry(&self.shared.engine_jobs).take();
 
         // Say goodbye and close every live connection first: writers
         // drain their queues (Bye included) before the senders drop.
@@ -385,6 +394,32 @@ pub struct HostShared {
     pub(crate) takes: Arc<crate::takes::TakeHub>,
     /// The host's transcriber, when it transcribes.
     transcriber: Option<crate::transcribe::TranscriberLink>,
+    /// The transcriber itself: whether it has work in hand (a retire
+    /// waits for it).
+    transcriber_work: Option<Arc<crate::transcribe::Transcriber>>,
+    /// The host's engine (#220), and the queue the app's engine requests
+    /// wait in (one at a time: a mode switch may drain for seconds).
+    engine: Option<Arc<crate::engine::EngineHost>>,
+    engine_jobs: Mutex<Option<std::sync::mpsc::Sender<EngineJob>>>,
+    /// Engine requests queued or running: work in hand a retire waits
+    /// for (a switch may drain for seconds, its window already gone).
+    engine_pending: AtomicUsize,
+    /// This host's build (see [`crate::version`]).
+    build: crate::version::BuildStamp,
+    /// Set when a newer app asked this host to step aside and it agreed:
+    /// whoever runs the host shuts it down ([`HostHandle::retire_requested`]),
+    /// and no new work (or app) is taken on meanwhile.
+    pub(crate) retire: AtomicBool,
+    /// An agent's ask has the microphone open or its take in hand. Set by
+    /// the broker under `admission` before it starts the capture (the
+    /// runtime answers a start before its capture view shows it), so a
+    /// retire's idle check sees it.
+    pub(crate) ask_capturing: AtomicBool,
+    /// Work-admitting frames hold this for reading while they check
+    /// `retire` and hand their work on; a retire takes it for writing
+    /// while it checks the host idles and commits. So no work slips in
+    /// between the idle check and the commit, and none is taken on after.
+    pub(crate) admission: std::sync::RwLock<()>,
     /// The app's history (#220), and the queue its requests wait in;
     /// `None` when the history store would not open.
     history: Option<Arc<crate::history::History>>,
@@ -700,7 +735,11 @@ pub fn serve(config: HostConfig) -> Result<HostHandle, HostError> {
     let mut runtime_config = config
         .runtime
         .with_capture_observer(Arc::clone(&takes) as Arc<dyn starling_runtime::machine::capture::CaptureObserver>);
-    let engine = crate::engine::attach(config.engine, &mut runtime_config);
+    let engine = crate::engine::attach_with_paths(
+        config.engine,
+        config.engine_paths.clone(),
+        &mut runtime_config,
+    );
     // The host transcribes its takes (#220): every take an app records is
     // stored with the intent to transcribe it, in its own commit.
     let transcriber = {
@@ -772,6 +811,14 @@ pub fn serve(config: HostConfig) -> Result<HostHandle, HostError> {
         broker: broker_tx,
         takes: Arc::clone(&takes),
         transcriber: transcriber.as_ref().map(|transcriber| transcriber.link()),
+        transcriber_work: transcriber.clone(),
+        engine: engine.clone(),
+        engine_jobs: Mutex::new(None),
+        engine_pending: AtomicUsize::new(0),
+        build: config.build.clone(),
+        retire: AtomicBool::new(false),
+        ask_capturing: AtomicBool::new(false),
+        admission: std::sync::RwLock::new(()),
         history: history.clone(),
         store_jobs,
         lease: Arc::clone(&lease),
@@ -783,6 +830,38 @@ pub fn serve(config: HostConfig) -> Result<HostHandle, HostError> {
     let watch_stop = Arc::new(AtomicBool::new(false));
 
     let mut threads = Vec::new();
+    // The settings file as it is now is the watcher's baseline, read
+    // before any connection is accepted: an engine request applied
+    // before the watcher's first poll must not be undone by that poll
+    // reading a file that has not changed since (it carries over only
+    // what the file changed). Anything the file changed since the
+    // startup load is applied here.
+    if let (Some(engine), Some(settings_path)) = (&engine, config.settings_path.as_ref()) {
+        if let Some(settings) = std::fs::read(settings_path)
+            .ok()
+            .and_then(|bytes| starling_dictation::settings::Settings::from_json_bytes(&bytes))
+        {
+            engine.follow_file(crate::engine::EngineIntent::from_settings(&settings));
+        }
+    }
+    // The app's engine requests and the engine feed (#220) ride with the
+    // host's threads: shutdown drops the queue and joins both before the
+    // engine stops. Both are ready (and the baseline read) before the
+    // first connection is accepted, so no app finds them missing.
+    if let Some(engine) = &engine {
+        let (jobs, queue) = std::sync::mpsc::channel();
+        *lock_registry(&shared.engine_jobs) = Some(jobs);
+        threads.push(spawn("starling-host-engine", {
+            let engine = Arc::clone(engine);
+            let shared = Arc::clone(&shared);
+            move || engine_worker(engine, queue, &shared.engine_pending)
+        }));
+        threads.push(spawn("starling-host-engine-feed", {
+            let engine = Arc::clone(engine);
+            let shared = Arc::clone(&shared);
+            move || engine_feed(engine, shared)
+        }));
+    }
     threads.push(spawn("starling-host-agent", {
         let shared = Arc::clone(&shared);
         move || broker_loop(shared, broker_rx)
@@ -909,6 +988,113 @@ pub fn serve(config: HostConfig) -> Result<HostHandle, HostError> {
         transcriber,
         done: AtomicBool::new(false),
     })
+}
+
+/// One app engine request waiting for the engine worker.
+pub(crate) struct EngineJob {
+    conn: Arc<ConnState>,
+    req: String,
+    request: crate::engine::EngineRequest,
+}
+
+/// How often the engine feed looks for a change to push.
+const ENGINE_FEED_POLL: Duration = Duration::from_millis(200);
+
+/// The engine worker: carries out the app's engine requests one at a
+/// time (a mode switch may drain in-flight recognitions for seconds; the
+/// connection threads never wait on it) and answers each. Ends when the
+/// queue's sender is dropped at shutdown. `pending` counts each request
+/// from its queueing until it was carried out.
+fn engine_worker(
+    engine: Arc<crate::engine::EngineHost>,
+    jobs: std::sync::mpsc::Receiver<EngineJob>,
+    pending: &AtomicUsize,
+) {
+    while let Ok(job) = jobs.recv() {
+        // A request that panics is refused and the worker carries on: a
+        // dead worker would leave `pending` counting it (and every
+        // request queued behind it), and no retire would get past that.
+        let reply =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| engine.handle(job.request)))
+                .unwrap_or_else(|_| crate::engine::EngineReply::Refused {
+                    message:
+                        "The engine could not carry out this request (it failed unexpectedly)."
+                            .to_string(),
+                });
+        pending.fetch_sub(1, Ordering::SeqCst);
+        if job
+            .conn
+            .try_deliver(Frame::EngineReply { req: job.req, reply })
+            .is_err()
+        {
+            job.conn.close();
+        }
+    }
+}
+
+/// The engine feed: every watching app hears the engine's status when it
+/// changes (a download's progress, a switch's stage, a mode change).
+fn engine_feed(engine: Arc<crate::engine::EngineHost>, shared: Arc<HostShared>) {
+    let mut last = None;
+    while !shared.shutdown.load(Ordering::SeqCst) {
+        std::thread::sleep(ENGINE_FEED_POLL);
+        let generation = engine.generation();
+        if last == Some(generation) {
+            continue;
+        }
+        // A watcher whose queue was full missed it: try again next look
+        // (the others get it twice, which costs nothing).
+        if shared.takes.engine_state(|| engine.status()) {
+            last = Some(generation);
+        }
+    }
+}
+
+/// Whether this host steps aside for an app of build `build` (see
+/// [`crate::version`]): only for a newer build, and only while it idles —
+/// no take recording or being stored, no transcription or job in hand,
+/// and no other window watching (it would lose its service mid-use).
+fn retire_answer(
+    shared: &HostShared,
+    conn: &Arc<ConnState>,
+    build: &crate::version::BuildStamp,
+) -> crate::version::RetireAnswer {
+    use crate::version::RetireAnswer;
+    if !shared.build.older_than(build) {
+        return RetireAnswer::Refused {
+            reason: if *build == shared.build {
+                "the recording service is the same version as this window".to_string()
+            } else {
+                crate::version::older_app_refusal()
+            },
+        };
+    }
+    let busy = |reason: &str| RetireAnswer::Busy {
+        reason: reason.to_string(),
+    };
+    if shared.takes.records()
+        || capture_active(&shared.client)
+        || shared.ask_capturing.load(Ordering::SeqCst)
+    {
+        return busy("a recording is being made or saved");
+    }
+    let snapshot = shared.client.snapshot();
+    if shared
+        .transcriber_work
+        .as_ref()
+        .is_some_and(|transcriber| transcriber.busy())
+        || snapshot.jobs.active > 0
+        || snapshot.jobs.waiting > 0
+    {
+        return busy("a recording is being transcribed");
+    }
+    if shared.engine_pending.load(Ordering::SeqCst) > 0 {
+        return busy("a change to the transcription engine is being made");
+    }
+    if shared.takes.watchers_besides(conn) > 0 {
+        return busy("a Starling window of the running version is still open");
+    }
+    RetireAnswer::Retiring
 }
 
 /// Whether the capture machine has a take open (opening the device,
@@ -1151,6 +1337,7 @@ fn connection_reader(
             max_frame_bytes: shared.max_frame_bytes as u64,
             rate_max: shared.command_rate.max,
             rate_window_ms: shared.command_rate.per.as_millis() as u64,
+            build: Some(shared.build.clone()),
         })
         .is_err()
     {
@@ -1182,6 +1369,39 @@ fn connection_reader(
                     );
                     break;
                 }
+                // Work a retiring host must not take on: refused once it
+                // committed to stepping aside, and admitted under the
+                // admission lock (see `HostShared::admission`).
+                let admits_work = matches!(
+                    frame,
+                    Frame::Command { .. }
+                        | Frame::TakeWatch { .. }
+                        | Frame::Transcribe { .. }
+                        | Frame::TranscribeDue { .. }
+                        | Frame::TakeAdopt { .. }
+                        | Frame::TakeTap { .. }
+                        | Frame::Store { .. }
+                        | Frame::AskUser { .. }
+                        | Frame::Engine { .. }
+                );
+                let admitted = if admits_work {
+                    let admitted = shared
+                        .admission
+                        .read()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if shared.retire.load(Ordering::SeqCst) {
+                        terminate(
+                            &state,
+                            TransportErrorCode::ShuttingDown,
+                            "the recording service is stepping aside for a newer version"
+                                .to_string(),
+                        );
+                        break;
+                    }
+                    Some(admitted)
+                } else {
+                    None
+                };
                 match frame {
                     // Agents reach the microphone only through asks.
                     Frame::Command { .. } if state.is_agent() => {
@@ -1348,6 +1568,8 @@ fn connection_reader(
                     | Frame::Transcribe { .. }
                     | Frame::TranscribeDue { .. }
                     | Frame::Store { .. }
+                    | Frame::Engine { .. }
+                    | Frame::Retire { .. }
                         if state.is_agent() =>
                     {
                         terminate(
@@ -1357,7 +1579,23 @@ fn connection_reader(
                         );
                         break;
                     }
-                    Frame::TakeWatch { req } => {
+                    Frame::TakeWatch { req, build } => {
+                        // Another build is not served (see
+                        // `crate::version`): an older app is told plainly
+                        // to restart, a newer one should have asked this
+                        // host to step aside first.
+                        if build.as_ref() != Some(&shared.build) {
+                            let detail = match &build {
+                                Some(app) if shared.build.older_than(app) => {
+                                    "The Starling recording service that is running is an older \
+                                     version than this window; it is replaced once it is idle."
+                                        .to_string()
+                                }
+                                _ => crate::version::older_app_refusal(),
+                            };
+                            terminate(&state, TransportErrorCode::VersionMismatch, detail);
+                            break;
+                        }
                         // An app (re)connected: attempts a dead app left
                         // "started" are failed now, ready to retry — a
                         // live app's attempts are protected by their
@@ -1373,6 +1611,89 @@ fn connection_reader(
                             );
                         }
                         if shared.takes.watch(&state, req).is_err() {
+                            state.close();
+                            break;
+                        }
+                        // The watch is registered (a retire sees it); the
+                        // status read below admits nothing, and may wait
+                        // on an engine starting — a retire must not.
+                        drop(admitted);
+                        // The engine as it stands; changes follow, in order
+                        // (read and queued under the feed's own lock). A
+                        // window that misses this would wait for the next
+                        // change: a full queue closes the connection
+                        // instead, and the reconnect brings it.
+                        let delivered = shared.takes.engine_state_to(&state, || match &shared.engine {
+                            Some(engine) => engine.status(),
+                            None => crate::engine::EngineStatus::without_engine(),
+                        });
+                        if !delivered {
+                            state.close();
+                            break;
+                        }
+                    }
+                    Frame::Engine { req, request } => {
+                        // Counted before it is queued, under admission: a
+                        // retire either refused it or sees it.
+                        let queued = match (&shared.engine, &*lock_registry(&shared.engine_jobs)) {
+                            (Some(_), Some(jobs)) => {
+                                shared.engine_pending.fetch_add(1, Ordering::SeqCst);
+                                jobs.send(EngineJob {
+                                    conn: Arc::clone(&state),
+                                    req,
+                                    request,
+                                })
+                                .map_err(|job| {
+                                    shared.engine_pending.fetch_sub(1, Ordering::SeqCst);
+                                    job.0.req
+                                })
+                            }
+                            (_, _) => Err(req),
+                        };
+                        if let Err(req) = queued {
+                            // An engine with no queue: the host is shutting
+                            // down (its worker's queue went first).
+                            let message = if shared.engine.is_some() {
+                                "Starling's recording service is shutting down.".to_string()
+                            } else {
+                                "This Starling recording service runs without a \
+                                 transcription engine."
+                                    .to_string()
+                            };
+                            let reply = crate::engine::EngineReply::Refused { message };
+                            if state.try_deliver(Frame::EngineReply { req, reply }).is_err() {
+                                state.close();
+                                break;
+                            }
+                        }
+                    }
+                    Frame::Retire { req, build } => {
+                        // Checked and committed with admission held: work
+                        // admitted before is visible to the check, work
+                        // after it is refused.
+                        let answer = {
+                            let _exclusive = shared
+                                .admission
+                                .write()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            let answer = retire_answer(&shared, &state, &build);
+                            if answer == crate::version::RetireAnswer::Retiring {
+                                shared.retire.store(true, Ordering::SeqCst);
+                            }
+                            answer
+                        };
+                        let retiring = answer == crate::version::RetireAnswer::Retiring;
+                        let delivered = state
+                            .try_deliver(Frame::RetireReply { req, answer })
+                            .is_ok();
+                        if retiring {
+                            eprintln!(
+                                "starling-runtime-host: a newer Starling ({}) asked this one ({}) \
+                                 to step aside; stopping",
+                                build.id, shared.build.id
+                            );
+                        }
+                        if !delivered {
                             state.close();
                             break;
                         }
@@ -1515,7 +1836,10 @@ fn connection_reader(
                     | Frame::Transcription { .. }
                     | Frame::Stored { .. }
                     | Frame::Upkeep { .. }
-                    | Frame::HistoryChanged => {
+                    | Frame::HistoryChanged
+                    | Frame::EngineReply { .. }
+                    | Frame::EngineState { .. }
+                    | Frame::RetireReply { .. } => {
                         terminate(
                             &state,
                             TransportErrorCode::ProtocolViolation,

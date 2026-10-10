@@ -61,6 +61,11 @@ const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 /// others, and an import or an export encodes a whole take.
 const STORE_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// How long an engine request waits for its answer: it may wait behind
+/// another, and a switch away from the built-in engine drains in-flight
+/// recognitions (bounded at 10 s) before it answers.
+const ENGINE_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// The reader's read-poll slice: an idle connection wakes this often so
 /// the event backlog can flush the moment the application makes room
 /// (platforms whose transport cannot poll — see
@@ -91,6 +96,9 @@ pub struct HostInfo {
     pub max_frame_bytes: u64,
     pub rate_max: u32,
     pub rate_window_ms: u64,
+    /// The host's build (`None`: a host from before the version
+    /// handshake; see [`crate::version`]).
+    pub build: Option<crate::version::BuildStamp>,
 }
 
 /// One event envelope off the wire (the I3 wire form; typed event
@@ -179,6 +187,8 @@ pub enum TakeWire {
     Upkeep { report: String, retired: bool },
     /// The history list changed (see [`Frame::HistoryChanged`]).
     HistoryChanged,
+    /// The host's engine as it stands now (see [`Frame::EngineState`]).
+    Engine(Box<crate::engine::EngineStatus>),
 }
 
 /// The host's answer to a [`HostClient::ask_user`].
@@ -197,6 +207,8 @@ enum Reply {
     AgentWelcome(String),
     TakeWatching(Option<HostRecovery>),
     Stored(crate::history::StoreReply),
+    Engine(crate::engine::EngineReply),
+    Retire(crate::version::RetireAnswer),
 }
 
 /// Why a client call failed.
@@ -424,7 +436,7 @@ impl HostClient {
                 Reply::Receipt(..) => Err(ClientError::Protocol(
                     "snapshot request answered by a receipt".to_string(),
                 )),
-                Reply::AgentWelcome(_) | Reply::TakeWatching(_) | Reply::Stored(_) => {
+                Reply::AgentWelcome(_) | Reply::TakeWatching(_) | Reply::Stored(_) | Reply::Engine(_) | Reply::Retire(_) => {
                     Err(ClientError::Protocol(
                         "snapshot request answered by another reply".to_string(),
                     ))
@@ -467,7 +479,11 @@ impl HostClient {
             Reply::Snapshot(_) => Err(ClientError::Protocol(
                 "command answered by a snapshot".to_string(),
             )),
-            Reply::AgentWelcome(_) | Reply::TakeWatching(_) | Reply::Stored(_) => Err(
+            Reply::AgentWelcome(_)
+            | Reply::TakeWatching(_)
+            | Reply::Stored(_)
+            | Reply::Engine(_)
+            | Reply::Retire(_) => Err(
                 ClientError::Protocol("command answered by another reply".to_string()),
             ),
         })
@@ -554,10 +570,28 @@ impl HostClient {
     /// Follows the take feed on this connection; returns what the host's
     /// startup recovery found, when no app has heard it yet.
     pub fn take_watch(&self) -> Result<Option<HostRecovery>, ClientError> {
+        self.take_watch_as(&crate::version::BuildStamp::current())
+    }
+
+    /// [`Self::take_watch`] as an app of build `build` (a host of another
+    /// build refuses it; see [`crate::version`]).
+    pub fn take_watch_as(
+        &self,
+        build: &crate::version::BuildStamp,
+    ) -> Result<Option<HostRecovery>, ClientError> {
         let req = new_id("watch");
-        self.exchange_reply(Frame::TakeWatch { req: req.clone() }, req, |reply| match reply {
+        let frame = Frame::TakeWatch {
+            req: req.clone(),
+            build: Some(build.clone()),
+        };
+        self.exchange_reply(frame, req, |reply| match reply {
             Reply::TakeWatching(recovery) => Ok(recovery),
-            Reply::Receipt(..) | Reply::Snapshot(_) | Reply::AgentWelcome(_) | Reply::Stored(_) => {
+            Reply::Receipt(..)
+            | Reply::Snapshot(_)
+            | Reply::AgentWelcome(_)
+            | Reply::Stored(_)
+            | Reply::Engine(_)
+            | Reply::Retire(_) => {
                 Err(ClientError::Protocol(
                     "take watch answered by another reply".to_string(),
                 ))
@@ -593,8 +627,64 @@ impl HostClient {
                 Reply::Receipt(..)
                 | Reply::Snapshot(_)
                 | Reply::AgentWelcome(_)
-                | Reply::TakeWatching(_) => Err(ClientError::Protocol(
+                | Reply::TakeWatching(_)
+                | Reply::Engine(_)
+                | Reply::Retire(_) => Err(ClientError::Protocol(
                     "store request answered by another reply".to_string(),
+                )),
+            },
+        )
+    }
+
+    /// Asks the host's engine (see [`crate::engine::EngineRequest`]).
+    pub fn engine(
+        &self,
+        request: crate::engine::EngineRequest,
+    ) -> Result<crate::engine::EngineReply, ClientError> {
+        let req = new_id("engine");
+        self.exchange_reply_within(
+            Frame::Engine {
+                req: req.clone(),
+                request,
+            },
+            req,
+            ENGINE_TIMEOUT,
+            |reply| match reply {
+                Reply::Engine(reply) => Ok(reply),
+                Reply::Receipt(..)
+                | Reply::Snapshot(_)
+                | Reply::AgentWelcome(_)
+                | Reply::TakeWatching(_)
+                | Reply::Stored(_)
+                | Reply::Retire(_) => Err(ClientError::Protocol(
+                    "engine request answered by another reply".to_string(),
+                )),
+            },
+        )
+    }
+
+    /// Asks the host to step aside for this app, of the newer build
+    /// `build` (see [`crate::version`]).
+    pub fn retire(
+        &self,
+        build: &crate::version::BuildStamp,
+    ) -> Result<crate::version::RetireAnswer, ClientError> {
+        let req = new_id("retire");
+        self.exchange_reply(
+            Frame::Retire {
+                req: req.clone(),
+                build: build.clone(),
+            },
+            req,
+            |reply| match reply {
+                Reply::Retire(answer) => Ok(answer),
+                Reply::Receipt(..)
+                | Reply::Snapshot(_)
+                | Reply::AgentWelcome(_)
+                | Reply::TakeWatching(_)
+                | Reply::Stored(_)
+                | Reply::Engine(_) => Err(ClientError::Protocol(
+                    "retire request answered by another reply".to_string(),
                 )),
             },
         )
@@ -668,7 +758,9 @@ impl HostClient {
                 Reply::Receipt(..)
                 | Reply::Snapshot(_)
                 | Reply::TakeWatching(_)
-                | Reply::Stored(_) => Err(ClientError::Protocol(
+                | Reply::Stored(_)
+                | Reply::Engine(_)
+                | Reply::Retire(_) => Err(ClientError::Protocol(
                     "agent hello answered by another reply".to_string(),
                 )),
             },
@@ -806,6 +898,7 @@ fn client_reader(
                 max_frame_bytes,
                 rate_max,
                 rate_window_ms,
+                build,
             }) => {
                 if hello_done {
                     fail("second hello".to_string());
@@ -819,6 +912,7 @@ fn client_reader(
                     max_frame_bytes,
                     rate_max,
                     rate_window_ms,
+                    build,
                 }));
                 // Between frames by construction (this one just decoded):
                 // rebuild the reader under the advertised cap.
@@ -846,6 +940,12 @@ fn client_reader(
             Ok(Frame::Stored { req, reply }) => {
                 deliver(&pending, &req, Reply::Stored(reply));
             }
+            Ok(Frame::EngineReply { req, reply }) => {
+                deliver(&pending, &req, Reply::Engine(reply));
+            }
+            Ok(Frame::RetireReply { req, answer }) => {
+                deliver(&pending, &req, Reply::Retire(answer));
+            }
             Ok(
                 frame @ (Frame::LiveTake { .. }
                 | Frame::TakeStartFailed { .. }
@@ -854,7 +954,8 @@ fn client_reader(
                 | Frame::LiveText { .. }
                 | Frame::Transcription { .. }
                 | Frame::Upkeep { .. }
-                | Frame::HistoryChanged),
+                | Frame::HistoryChanged
+                | Frame::EngineState { .. }),
             ) => {
                 let wire = match take_wire(frame) {
                     Ok(wire) => wire,
@@ -949,7 +1050,9 @@ fn client_reader(
                 | Frame::TakeAdopt { .. }
                 | Frame::Transcribe { .. }
                 | Frame::TranscribeDue { .. }
-                | Frame::Store { .. },
+                | Frame::Store { .. }
+                | Frame::Engine { .. }
+                | Frame::Retire { .. },
             ) => {
                 fail("host sent a client frame".to_string());
                 break;
@@ -1067,6 +1170,7 @@ fn take_wire(frame: Frame) -> Result<TakeWire, String> {
         },
         Frame::Upkeep { report, retired } => TakeWire::Upkeep { report, retired },
         Frame::HistoryChanged => TakeWire::HistoryChanged,
+        Frame::EngineState { status } => TakeWire::Engine(status),
         other => return Err(format!("{other:?} is not a take frame")),
     })
 }

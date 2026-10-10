@@ -72,11 +72,18 @@ const SHUTDOWN_JOIN: Duration = Duration::from_secs(5);
 #[derive(Clone)]
 pub(crate) struct TranscriberLink {
     tx: Sender<Msg>,
+    /// Messages sent and not yet handled: work handed over counts as the
+    /// transcriber's from the moment it is sent, not only once the
+    /// coordinator queued it (a host stepping aside must see it).
+    pending: Arc<AtomicUsize>,
 }
 
 impl TranscriberLink {
     fn send(&self, msg: Msg) {
-        let _ = self.tx.send(msg);
+        self.pending.fetch_add(1, Ordering::SeqCst);
+        if self.tx.send(msg).is_err() {
+            self.pending.fetch_sub(1, Ordering::SeqCst);
+        }
     }
 
     pub(crate) fn started(&self, take: &str, monitor: Option<Arc<dyn LiveTakeMonitor>>) {
@@ -201,7 +208,10 @@ impl Transcriber {
         let store = Arc::new(Mutex::new(StoreV2::open(&config.data_root)?));
         let (tx, rx) = std::sync::mpsc::channel();
         let busy = Arc::new(AtomicUsize::new(0));
-        let link = TranscriberLink { tx };
+        let link = TranscriberLink {
+            tx,
+            pending: Arc::new(AtomicUsize::new(0)),
+        };
         let coordinator = Coordinator {
             inbox: rx,
             link: link.clone(),
@@ -232,9 +242,10 @@ impl Transcriber {
         self.link.clone()
     }
 
-    /// Whether a transcription is queued or running.
+    /// Whether a transcription is queued or running, or asked for and
+    /// not yet queued.
     pub(crate) fn busy(&self) -> bool {
-        self.busy.load(Ordering::SeqCst) > 0
+        self.link.pending.load(Ordering::SeqCst) > 0 || self.busy.load(Ordering::SeqCst) > 0
     }
 
     /// Cancels running transcriptions (their takes stay due in the store
@@ -309,9 +320,13 @@ impl Coordinator {
         let mut next_scan = Instant::now() + RESCAN;
         loop {
             let wait = next_scan.saturating_duration_since(Instant::now());
+            let mut handled = false;
             match self.inbox.recv_timeout(wait) {
                 Ok(Msg::Shutdown) | Err(RecvTimeoutError::Disconnected) => break,
-                Ok(msg) => self.handle(msg),
+                Ok(msg) => {
+                    self.handle(msg);
+                    handled = true;
+                }
                 Err(RecvTimeoutError::Timeout) => {
                     self.rescan(RESCAN_AGED);
                     next_scan = Instant::now() + RESCAN;
@@ -320,6 +335,11 @@ impl Coordinator {
             self.dispatch();
             self.busy
                 .store(self.queue.len() + self.running.len(), Ordering::SeqCst);
+            // Counted in `busy` (when it made work) before it stops
+            // counting as pending: no gap where it is neither.
+            if handled {
+                self.link.pending.fetch_sub(1, Ordering::SeqCst);
+            }
         }
         self.queue.clear();
         self.live.clear();

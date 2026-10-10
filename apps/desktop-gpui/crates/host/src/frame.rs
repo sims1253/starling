@@ -66,6 +66,9 @@ pub enum TransportErrorCode {
     TooManyConnections,
     /// The host is shutting down; the connection was closed gracefully.
     ShuttingDown,
+    /// The app and the host are different builds and the host will not
+    /// serve this app (see [`crate::version`]); `detail` says what to do.
+    VersionMismatch,
 }
 
 impl TransportErrorCode {
@@ -79,6 +82,7 @@ impl TransportErrorCode {
             TransportErrorCode::SlowConsumer => "slow_consumer",
             TransportErrorCode::TooManyConnections => "too_many_connections",
             TransportErrorCode::ShuttingDown => "shutting_down",
+            TransportErrorCode::VersionMismatch => "version_mismatch",
         }
     }
 }
@@ -90,14 +94,16 @@ impl TransportErrorCode {
 ///   [`Frame::AgentHello`], [`Frame::AskUser`], [`Frame::AskCancel`],
 ///   [`Frame::PromptAck`], [`Frame::PromptDone`], [`Frame::TakeWatch`],
 ///   [`Frame::TakeTap`], [`Frame::TakeAdopt`],
-///   [`Frame::Transcribe`], [`Frame::TranscribeDue`], [`Frame::Store`]
+///   [`Frame::Transcribe`], [`Frame::TranscribeDue`], [`Frame::Store`],
+///   [`Frame::Engine`], [`Frame::Retire`]
 /// - host → client: [`Frame::Hello`], [`Frame::Receipt`], [`Frame::Event`],
 ///   [`Frame::Snapshot`], [`Frame::TransportError`], [`Frame::Bye`],
 ///   [`Frame::AgentWelcome`], [`Frame::AskResult`], [`Frame::ShowPrompt`],
 ///   [`Frame::HidePrompt`], [`Frame::TakeWatching`], [`Frame::LiveTake`],
 ///   [`Frame::TakeStartFailed`], [`Frame::TakePersisted`],
 ///   [`Frame::HostNotice`], [`Frame::LiveText`], [`Frame::Transcription`],
-///   [`Frame::Stored`], [`Frame::Upkeep`], [`Frame::HistoryChanged`]
+///   [`Frame::Stored`], [`Frame::Upkeep`], [`Frame::HistoryChanged`],
+///   [`Frame::EngineReply`], [`Frame::EngineState`], [`Frame::RetireReply`]
 ///
 /// The take frames (#220) are host-level like the ask frames: the app's
 /// projection of the take the host records (see [`crate::takes`]).
@@ -127,6 +133,10 @@ pub enum Frame {
         rate_max: u32,
         /// The rate window in milliseconds.
         rate_window_ms: u64,
+        /// The host's build (see [`crate::version`]); absent from hosts
+        /// that predate the handshake.
+        #[serde(default)]
+        build: Option<crate::version::BuildStamp>,
     },
     /// The receipt for the command envelope whose `id` was `req`. The
     /// result is the runtime's own `Result` serialization — an accepted
@@ -205,7 +215,13 @@ pub enum Frame {
     /// The app following the take feed on this connection: live take
     /// status, persisted takes, start failures and host notices. Answered
     /// by [`Frame::TakeWatching`] under the same `req`.
-    TakeWatch { req: String },
+    TakeWatch {
+        req: String,
+        /// The app's build: a host of another build refuses the watch
+        /// (`version_mismatch`) rather than serve it.
+        #[serde(default)]
+        build: Option<crate::version::BuildStamp>,
+    },
     /// The host's acceptance of [`Frame::TakeWatch`], carrying what this
     /// host's startup recovery found if no app has heard it yet.
     TakeWatching {
@@ -315,6 +331,35 @@ pub enum Frame {
     /// A connection deleted, imported or re-classed a take: the history
     /// list watching apps show changed.
     HistoryChanged,
+    /// The app driving the host's engine (#220): Settings → Engine's
+    /// actions and engine settings (see [`crate::engine::EngineRequest`]).
+    /// Answered by [`Frame::EngineReply`] under the same `req`.
+    Engine {
+        req: String,
+        request: crate::engine::EngineRequest,
+    },
+    /// The answer to [`Frame::Engine`] `req`.
+    EngineReply {
+        req: String,
+        reply: crate::engine::EngineReply,
+    },
+    /// The host's engine as watching apps render it: sent when an app
+    /// starts watching and whenever it changes (a download's progress,
+    /// a switch's stage, a mode change).
+    EngineState {
+        status: Box<crate::engine::EngineStatus>,
+    },
+    /// A newer app asking this host to step aside (see
+    /// [`crate::version`]). Answered by [`Frame::RetireReply`].
+    Retire {
+        req: String,
+        build: crate::version::BuildStamp,
+    },
+    /// The answer to [`Frame::Retire`] `req`.
+    RetireReply {
+        req: String,
+        answer: crate::version::RetireAnswer,
+    },
 }
 
 /// Why a `capture.start` was refused while another take holds the
@@ -638,6 +683,10 @@ mod tests {
                 max_frame_bytes: 1024,
                 rate_max: 16,
                 rate_window_ms: 1000,
+                build: Some(crate::version::BuildStamp {
+                    id: "0123456789abcdef".into(),
+                    built: 1_790_000_000,
+                }),
             },
             Frame::Receipt {
                 req: "cmd_1".into(),
@@ -683,7 +732,36 @@ mod tests {
             Frame::Bye {
                 reason: "shutdown".into(),
             },
-            Frame::TakeWatch { req: "w-1".into() },
+            Frame::TakeWatch {
+                req: "w-1".into(),
+                build: Some(crate::version::BuildStamp::current()),
+            },
+            Frame::Engine {
+                req: "e-1".into(),
+                request: crate::engine::EngineRequest::Activate {
+                    model_id: "parakeet".into(),
+                },
+            },
+            Frame::EngineReply {
+                req: "e-1".into(),
+                reply: crate::engine::EngineReply::Activating {
+                    request: 3,
+                    revision: 2,
+                },
+            },
+            Frame::EngineState {
+                status: Box::new(crate::engine::EngineStatus::without_engine()),
+            },
+            Frame::Retire {
+                req: "r-1".into(),
+                build: crate::version::BuildStamp::current(),
+            },
+            Frame::RetireReply {
+                req: "r-1".into(),
+                answer: crate::version::RetireAnswer::Busy {
+                    reason: "a take is recording".into(),
+                },
+            },
             Frame::TakeWatching {
                 req: "w-1".into(),
                 recovery: Some(HostRecovery {

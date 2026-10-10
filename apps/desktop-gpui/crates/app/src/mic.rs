@@ -431,37 +431,42 @@ fn live_interruption(handle: &impl InputHealth) -> Option<Interruption> {
     take_interruption(handle.capture_fault().as_ref(), stalled_for)
 }
 
-/// Where the microphone check sends its clip: the built-in engine's
-/// endpoint (its lease held until the check is done) or the server from
+/// Where the microphone check sends its clip: the endpoint the built-in
+/// engine serves on right now (the host's, #220 — a switch mid-check can
+/// cut the check off; it then fails and says so) or the server from
 /// Settings. Empty when no engine serves.
 pub(crate) struct CheckTarget {
     pub endpoint: String,
     pub model: String,
-    _lease: Option<starling_dictation::engine::EngineLease>,
 }
 
 impl StarlingApp {
     /// The microphone check's target, resolved now.
     pub(crate) fn check_target(&self) -> CheckTarget {
         match self.engine_settings.mode {
-            starling_dictation::settings::EngineMode::Builtin => {
-                match self.engine.as_ref().and_then(|engine| engine.lease()) {
-                    Some(lease) => CheckTarget {
-                        endpoint: lease.endpoint().to_string(),
-                        model: lease.slug().to_string(),
-                        _lease: Some(lease),
-                    },
-                    None => CheckTarget {
-                        endpoint: String::new(),
-                        model: String::new(),
-                        _lease: None,
-                    },
-                }
-            }
+            starling_dictation::settings::EngineMode::Builtin => self
+                .engine_snapshot()
+                .filter(|snapshot| snapshot.phase == starling_dictation::engine::EnginePhase::Ready)
+                .and_then(|snapshot| {
+                    let active = snapshot.active?;
+                    let slug = snapshot
+                        .models
+                        .iter()
+                        .find(|model| model.id == active.model_id)?
+                        .slug
+                        .clone();
+                    Some(CheckTarget {
+                        endpoint: active.endpoint,
+                        model: slug,
+                    })
+                })
+                .unwrap_or(CheckTarget {
+                    endpoint: String::new(),
+                    model: String::new(),
+                }),
             starling_dictation::settings::EngineMode::Manual => CheckTarget {
                 endpoint: self.endpoint.clone(),
                 model: self.model.clone(),
-                _lease: None,
             },
         }
     }

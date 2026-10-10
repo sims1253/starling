@@ -342,11 +342,13 @@ pub(crate) fn broker_loop(shared: Arc<HostShared>, inbox: Receiver<BrokerMsg>) {
             broker.on_event(message);
         }
         broker.tick();
+        broker.publish_capturing();
         match inbox.recv_timeout(POLL) {
             Ok(msg) => broker.on_msg(msg),
             Err(RecvError::Timeout) => {}
             Err(RecvError::Closed) => break,
         }
+        broker.publish_capturing();
     }
     broker.finish_all("the host is shutting down");
     drop(events);
@@ -370,6 +372,20 @@ struct Cleanup {
 }
 
 impl Broker {
+    /// Mirrors whether the live ask has the microphone or its take in
+    /// hand into [`crate::server::HostShared`]'s `ask_capturing`, for a
+    /// retire's idle check. Only the broker writes it.
+    fn publish_capturing(&self) {
+        let capturing = matches!(
+            self.live,
+            Some((
+                _,
+                Phase::Recording | Phase::Persisting | Phase::Transcribing { .. }
+            ))
+        );
+        self.shared.ask_capturing.store(capturing, Ordering::SeqCst);
+    }
+
     fn on_msg(&mut self, msg: BrokerMsg) {
         match msg {
             BrokerMsg::Ask {
@@ -734,6 +750,22 @@ impl Broker {
                     self.cancel_live(reason, detail);
                     return;
                 }
+                // Opening the microphone is work a retiring host must
+                // not take on: checked and flagged under admission, so a
+                // retire either sees the recording or is seen here.
+                let shared = Arc::clone(&self.shared);
+                let _admitted = shared
+                    .admission
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if shared.retire.load(Ordering::SeqCst) {
+                    self.fail_live(
+                        "shutting_down",
+                        "the recording service is stepping aside for a newer version".to_string(),
+                    );
+                    return;
+                }
+                shared.ask_capturing.store(true, Ordering::SeqCst);
                 let command = Command::CaptureStart {
                     policy: "push-to-talk".to_string(),
                 };

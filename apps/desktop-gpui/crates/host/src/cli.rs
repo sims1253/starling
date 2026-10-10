@@ -253,15 +253,13 @@ pub fn run(args: Vec<String>) -> i32 {
         };
         // An engine choice that cannot resolve (no user data directory)
         // must not cost a second launch its ownership answer: serve
-        // without an engine and say so, rather than exit before the
-        // lease ladder ran.
-        let choice = match EngineChoice::from_settings(&settings) {
-            Ok(engine) => engine,
-            Err(err) => {
-                eprintln!("starling-runtime-host: {err}; serving without an engine");
-                EngineChoice::None
-            }
-        };
+        // without a built-in engine and say so (the app shows why, and
+        // the user can still pick their own server), rather than exit
+        // before the lease ladder ran.
+        let choice = EngineChoice::from_settings(&settings);
+        if let EngineChoice::Unavailable { reason } = &choice {
+            eprintln!("starling-runtime-host: {reason}; the built-in engine cannot run");
+        }
         (choice, starling_dictation::settings::Settings::default_path().ok())
     };
 
@@ -323,7 +321,10 @@ pub fn run(args: Vec<String>) -> i32 {
     );
 
     let mut idle_since: Option<Instant> = None;
-    while !SHUTDOWN.load(Ordering::SeqCst) {
+    // A newer app that found this host idle asked it to step aside
+    // (`crate::version`): it stops like an idle exit, and that app starts
+    // its own.
+    while !SHUTDOWN.load(Ordering::SeqCst) && !host.retire_requested() {
         std::thread::sleep(Duration::from_millis(100));
         if let Some(limit) = exit_when_idle {
             if host.idle() {

@@ -32,6 +32,7 @@ use starling_runtime_host::client::{EventWire, HostClient, TakeWire};
 use starling_runtime_host::frame::{
     HostRecovery, LivePartial, TakeBusy, TakeOwner, TranscribeWith, TranscriptionState,
 };
+use starling_runtime_host::version::{BuildStamp, RetireAnswer};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 /// How long a host this app started stays up with nothing to do.
@@ -75,6 +76,9 @@ pub(crate) enum HostUpdate {
         reason: String,
         gave_up: bool,
         host_gone: bool,
+        /// `reason` is the whole sentence to show (a version mismatch:
+        /// it says what is going on and what to do).
+        plain: bool,
     },
     /// A take-feed frame.
     Take(TakeUpdate),
@@ -128,6 +132,9 @@ pub(crate) enum TakeUpdate {
         partial: Option<LivePartial>,
         degraded: Option<String>,
     },
+    /// The host's engine as it stands now (see
+    /// [`starling_runtime_host::frame::Frame::EngineState`]).
+    Engine(Box<starling_runtime_host::engine::EngineStatus>),
     /// Where a stored take's transcription stands (see
     /// [`starling_runtime_host::frame::Frame::Transcription`]).
     Transcription {
@@ -154,9 +161,29 @@ pub(crate) enum Launch {
 /// so a take's stop or abort can never overtake its start.
 pub(crate) struct HostLink {
     commands: std::sync::mpsc::Sender<Outgoing>,
+    /// The engine requests, in the order the app made them, on a thread
+    /// of their own: one can wait seconds (a switch away from the
+    /// built-in engine drains) and must not hold a take's commands up.
+    engine: std::sync::mpsc::Sender<EngineCall>,
     stop: Arc<AtomicBool>,
     relaunch: Arc<AtomicBool>,
     current: Arc<Mutex<Option<Arc<HostClient>>>>,
+}
+
+/// One engine request and where its answer goes.
+struct EngineCall {
+    request: starling_runtime_host::engine::EngineRequest,
+    reply: tokio::sync::oneshot::Sender<EngineAnswer>,
+}
+
+/// An engine request's answer (or why there is none, as a sentence),
+/// and which host gave it: the request goes to the connection the link
+/// holds when its turn comes, which may be a newer one than when it
+/// was made.
+pub(crate) struct EngineAnswer {
+    /// The answering host's lease id (`None` when no host was asked).
+    pub(crate) host: Option<String>,
+    pub(crate) reply: Result<starling_runtime_host::engine::EngineReply, String>,
 }
 
 enum Outgoing {
@@ -182,6 +209,7 @@ impl HostLink {
         let relaunch = Arc::new(AtomicBool::new(false));
         let current: Arc<Mutex<Option<Arc<HostClient>>>> = Arc::default();
         let (commands, outgoing) = std::sync::mpsc::channel();
+        let (engine, engine_calls) = std::sync::mpsc::channel();
         let spawned = std::thread::Builder::new()
             .name("starling-host-link".to_string())
             .spawn({
@@ -199,17 +227,27 @@ impl HostLink {
                         let current = Arc::clone(&current);
                         move || command_loop(outgoing, current, tx)
                     })
+            })
+            .and_then(|_| {
+                std::thread::Builder::new()
+                    .name("starling-host-engine".to_string())
+                    .spawn({
+                        let current = Arc::clone(&current);
+                        move || engine_loop(engine_calls, current)
+                    })
             });
         if let Err(err) = spawned {
             let _ = tx.send(HostUpdate::Disconnected {
                 reason: format!("the connection thread could not start: {err}"),
                 gave_up: true,
                 host_gone: false,
+                plain: false,
             });
         }
         (
             HostLink {
                 commands,
+                engine,
                 stop,
                 relaunch,
                 current,
@@ -250,6 +288,18 @@ impl HostLink {
         let _ = self.commands.send(Outgoing::TranscribeDue {
             stored_id: stored_id.to_string(),
         });
+    }
+
+    /// Asks the host's engine, after every engine request made before
+    /// it; the answer (or why there is none, as a sentence) arrives on
+    /// the returned channel.
+    pub(crate) fn engine(
+        &self,
+        request: starling_runtime_host::engine::EngineRequest,
+    ) -> tokio::sync::oneshot::Receiver<EngineAnswer> {
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        let _ = self.engine.send(EngineCall { request, reply });
+        answer
     }
 
     /// The connection the link holds now (`None` while it has none), as
@@ -364,6 +414,33 @@ fn command_loop(
     }
 }
 
+/// Sends the app's engine requests one by one on the current connection.
+fn engine_loop(
+    calls: std::sync::mpsc::Receiver<EngineCall>,
+    current: Arc<Mutex<Option<Arc<HostClient>>>>,
+) {
+    while let Ok(call) = calls.recv() {
+        let client = lock(&current).clone();
+        let answer = match client {
+            Some(client) => EngineAnswer {
+                host: Some(client.info.owner_id.clone()),
+                reply: client.engine(call.request).map_err(|err| {
+                    format!("Starling's recording service did not answer about the engine ({err}).")
+                }),
+            },
+            None => EngineAnswer {
+                host: None,
+                reply: Err(
+                    "Starling's recording service is not connected, so the engine cannot be \
+                     changed right now."
+                        .to_string(),
+                ),
+            },
+        };
+        let _ = call.reply.send(answer);
+    }
+}
+
 fn command_name(command: &Command) -> &'static str {
     match command {
         Command::CaptureStart { .. } => "capture.start",
@@ -389,6 +466,7 @@ fn link_loop(
     // that keeps failing is given up on, not repeated forever.
     let mut failed_launches = 0;
     let launches = matches!(launch, Launch::SelfAsHost { .. });
+    let mine = BuildStamp::current();
     while !stop.load(Ordering::SeqCst) {
         if relaunch.swap(false, Ordering::SeqCst) {
             failed_launches = 0;
@@ -397,15 +475,40 @@ fn link_loop(
         }
         let may_launch = failed_launches < LAUNCH_ATTEMPTS;
         let launch_now = if may_launch { launch.clone() } else { Launch::Never };
-        let connected = connect_or_launch(&endpoint, &launch_now).and_then(|client| {
-            let recovery = client
-                .take_watch()
-                .map_err(|err| format!("the recording service did not answer: {err}"))?;
+        // An older host stepping aside is waited for only while the app
+        // neither closes nor asks to start the service again.
+        let cancelled = || stop.load(Ordering::SeqCst) || relaunch.load(Ordering::SeqCst);
+        let connected = connect_or_launch(&endpoint, &launch_now, &mine, &cancelled).and_then(|client| {
+            let recovery = client.take_watch_as(&mine).map_err(|err| {
+                LinkError::Failed(format!("the recording service did not answer: {err}"))
+            })?;
             Ok((Arc::new(client), recovery))
         });
         let (client, recovery) = match connected {
             Ok(connected) => connected,
-            Err(reason) => {
+            // Another build serves (see `starling_runtime_host::version`):
+            // nothing to launch — wait for the older one to finish, or
+            // for the user to restart this older window.
+            Err(LinkError::Version(reason)) => {
+                if last_said.as_ref() != Some(&(reason.clone(), false)) {
+                    eprintln!("Starling: {reason}");
+                    if tx
+                        .send(HostUpdate::Disconnected {
+                            reason: reason.clone(),
+                            gave_up: false,
+                            host_gone: false,
+                            plain: true,
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                    last_said = Some((reason, false));
+                }
+                sleep_unless(&stop, &relaunch, VERSION_RETRY);
+                continue;
+            }
+            Err(LinkError::Failed(reason)) => {
                 if launches && may_launch {
                     failed_launches += 1;
                 }
@@ -420,6 +523,7 @@ fn link_loop(
                             reason: said.0.clone(),
                             gave_up,
                             host_gone: false,
+                            plain: false,
                         })
                         .is_err()
                     {
@@ -461,6 +565,7 @@ fn link_loop(
                 reason,
                 gave_up: false,
                 host_gone,
+                plain: false,
             })
             .is_err()
         {
@@ -580,6 +685,7 @@ fn route(frame: TakeWire) -> TakeUpdate {
             partial,
             degraded,
         },
+        TakeWire::Engine(status) => TakeUpdate::Engine(status),
         TakeWire::Transcription {
             stored_id,
             take,
@@ -598,14 +704,126 @@ fn route(frame: TakeWire) -> TakeUpdate {
     }
 }
 
+/// Why the link has no connection to offer.
+#[derive(Debug)]
+enum LinkError {
+    /// Reaching (or starting) the recording service failed.
+    Failed(String),
+    /// A recording service of another build serves, and this window
+    /// cannot use it yet — or, a newer one, at all. The sentence says
+    /// which, and what to do.
+    Version(String),
+}
+
 /// Connects to the host at `endpoint`, starting one first when nothing
-/// serves there (and `launch` allows it).
-fn connect_or_launch(endpoint: &Path, launch: &Launch) -> Result<HostClient, String> {
+/// serves there (and `launch` allows it), and settles the version
+/// handshake with it as an app of build `mine` (an older host stepping
+/// aside is waited for until `cancelled`).
+fn connect_or_launch(
+    endpoint: &Path,
+    launch: &Launch,
+    mine: &BuildStamp,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<HostClient, LinkError> {
+    let stopped = |info: &starling_runtime_host::client::HostInfo| host_stopped(info, cancelled);
     match launch {
-        Launch::SelfAsHost { log } => connect_or_start(endpoint, || launch_self(log)),
-        Launch::Never => HostClient::connect(endpoint)
-            .map_err(|err| format!("the recording service is not running ({err})")),
+        Launch::SelfAsHost { log } => connect_versioned(endpoint, mine, || launch_self(log), stopped),
+        Launch::Never => connect_versioned(
+            endpoint,
+            mine,
+            || Err("the recording service is not running".to_string()),
+            stopped,
+        ),
     }
+}
+
+/// How long a window waits between looks while a host of another build
+/// serves.
+const VERSION_RETRY: Duration = Duration::from_secs(2);
+
+/// How long an older host that agreed to step aside may take to stop.
+const RETIRE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Whether the host `info` describes has exited (allowing it
+/// [`RETIRE_TIMEOUT`] to finish its shutdown — its engine stops on the
+/// way). `false` at once when `cancelled`: the app closing (or asking for
+/// a new start) does not wait out an older host's shutdown.
+fn host_stopped(info: &starling_runtime_host::client::HostInfo, cancelled: &dyn Fn() -> bool) -> bool {
+    let until = Instant::now() + RETIRE_TIMEOUT;
+    while starling_dictation::engine::registry::process_alive(info.pid) {
+        if cancelled() || Instant::now() >= until {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    true
+}
+
+/// [`connect_or_start`], then the version handshake
+/// (`starling_runtime_host::version`): a host of this build is used; an
+/// older one is asked to step aside and, once `stopped` says it has gone,
+/// this window starts its own; a newer one is not used — this window is
+/// the one that is out of date.
+fn connect_versioned(
+    endpoint: &Path,
+    mine: &BuildStamp,
+    mut start: impl FnMut() -> Result<(), String>,
+    stopped: impl Fn(&starling_runtime_host::client::HostInfo) -> bool,
+) -> Result<HostClient, LinkError> {
+    // Twice at most: the older host, then the one this window starts.
+    for _ in 0..2 {
+        let client = connect_or_start(endpoint, &mut start).map_err(LinkError::Failed)?;
+        let Some(theirs) = client.info.build.clone() else {
+            // From before the handshake: it cannot be asked to stop.
+            return Err(LinkError::Version(
+                "An older version of Starling's recording service is still running. It stops \
+                 by itself about a minute after its last window closed; this window connects \
+                 then."
+                    .to_string(),
+            ));
+        };
+        if theirs == *mine {
+            return Ok(client);
+        }
+        if mine.older_than(&theirs) {
+            return Err(LinkError::Version(
+                starling_runtime_host::version::older_app_refusal(),
+            ));
+        }
+        match client.retire(mine) {
+            Ok(RetireAnswer::Retiring) => {
+                let info = client.info.clone();
+                drop(client);
+                eprintln!(
+                    "Starling: the recording service of an older build ({}) is stepping aside",
+                    theirs.id
+                );
+                if !stopped(&info) {
+                    return Err(LinkError::Version(
+                        "An older version of Starling's recording service is still stopping; \
+                         this window connects once it has."
+                            .to_string(),
+                    ));
+                }
+            }
+            Ok(RetireAnswer::Busy { reason }) => {
+                return Err(LinkError::Version(format!(
+                    "An older version of Starling's recording service is still running \
+                     ({reason}). This window connects once it is done; close the older \
+                     Starling window if one is open."
+                )));
+            }
+            Ok(RetireAnswer::Refused { reason }) => return Err(LinkError::Version(reason)),
+            Err(err) => {
+                return Err(LinkError::Failed(format!(
+                    "the recording service did not answer ({err})"
+                )))
+            }
+        }
+    }
+    Err(LinkError::Failed(
+        "the recording service was replaced while this window connected".to_string(),
+    ))
 }
 
 /// Connects to the host at `endpoint`, running `start` first when nothing
@@ -823,6 +1041,27 @@ impl LiveCapture {
 mod tests {
     use super::*;
 
+    /// The wait for an older host to stop gives up as soon as the app
+    /// closes or asks for a new start, not after the retire timeout.
+    #[test]
+    fn waiting_for_an_older_host_to_stop_ends_when_cancelled() {
+        let alive = starling_runtime_host::client::HostInfo {
+            protocol: 0,
+            owner_id: String::new(),
+            pid: std::process::id(),
+            max_frame_bytes: 0,
+            rate_max: 0,
+            rate_window_ms: 0,
+            build: None,
+        };
+        let started = Instant::now();
+        assert!(!host_stopped(&alive, &|| true));
+        assert!(started.elapsed() < Duration::from_secs(1), "{:?}", started.elapsed());
+        let cancel_at = Instant::now() + Duration::from_millis(200);
+        assert!(!host_stopped(&alive, &|| Instant::now() >= cancel_at));
+        assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+    }
+
     fn scratch(tag: &str) -> PathBuf {
         // Short: the host's socket path lives under it.
         let root = std::env::temp_dir().join(format!("sl-{tag}-{}", std::process::id()));
@@ -863,6 +1102,90 @@ mod tests {
         assert_eq!(launches.load(Ordering::SeqCst), 1, "started once");
         drop(client);
         serving.join().expect("host thread").shutdown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #220's version handshake, app side, over the real socket: a
+    /// window of a newer build finds an older host — told to wait while a
+    /// window of that version is open, then the idle host steps aside and
+    /// the window starts its own; an older window reaching that newer host
+    /// is told plainly to restart.
+    #[test]
+    fn a_newer_window_replaces_an_older_idle_host() {
+        use starling_runtime_host::{serve, HostConfig};
+        let root = scratch("ver");
+        let old = BuildStamp {
+            id: "an-older-build".to_string(),
+            built: 1,
+        };
+        let mine = BuildStamp::current();
+        let older = HostConfig::new(&root, root.join("endpoints")).with_build(old.clone());
+        let endpoint = older.socket_path();
+        let older_host = serve(older).expect("the older host serves");
+
+        // A window of the older version is open: the host keeps serving it.
+        let old_window = HostClient::connect(&endpoint).expect("connects");
+        old_window.take_watch_as(&old).expect("the older window is served");
+        match connect_versioned(&endpoint, &mine, || Err("not expected".to_string()), |_| true) {
+            Err(LinkError::Version(text)) => {
+                assert!(text.contains("connects once it is done"), "{text}")
+            }
+            other => panic!("the busy older host must not be replaced: {:?}", other.err()),
+        }
+        drop(old_window);
+
+        // Whoever runs the older host stops it once it agreed to step aside.
+        let (stopped_tx, stopped_rx) = std::sync::mpsc::channel();
+        let runner = std::thread::spawn(move || {
+            let mut host = older_host;
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while !host.retire_requested() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            host.shutdown();
+            let _ = stopped_tx.send(());
+        });
+        let newer: Arc<Mutex<Option<starling_runtime_host::HostHandle>>> = Arc::default();
+        let starts = std::sync::atomic::AtomicUsize::new(0);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let client = loop {
+            let result = connect_versioned(
+                &endpoint,
+                &mine,
+                || {
+                    starts.fetch_add(1, Ordering::SeqCst);
+                    let host = serve(HostConfig::new(&root, root.join("endpoints")))
+                        .map_err(|err| err.to_string())?;
+                    *lock(&newer) = Some(host);
+                    Ok(())
+                },
+                |_| stopped_rx.recv_timeout(Duration::from_secs(20)).is_ok(),
+            );
+            match result {
+                Ok(client) => break client,
+                // The older window's connection may still be closing.
+                Err(LinkError::Version(text)) if text.contains("connects once it is done") => {
+                    assert!(Instant::now() < deadline, "the idle older host never stepped aside");
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(other) => panic!("{other:?}"),
+            }
+        };
+        runner.join().expect("the older host's runner");
+        assert_eq!(client.info.build.as_ref(), Some(&mine), "this window's own build serves");
+        assert_eq!(starts.load(Ordering::SeqCst), 1, "started once");
+        client.take_watch_as(&mine).expect("watching");
+
+        // An older window reaching the newer host is refused, plainly.
+        match connect_versioned(&endpoint, &old, || Err("not expected".to_string()), |_| true) {
+            Err(LinkError::Version(text)) => {
+                assert!(text.contains("older version"), "{text}");
+                assert!(text.contains("start Starling again"), "{text}");
+            }
+            other => panic!("an older window must be refused: {:?}", other.err()),
+        }
+        drop(client);
+        lock(&newer).take().expect("the newer host").shutdown();
         let _ = std::fs::remove_dir_all(&root);
     }
 

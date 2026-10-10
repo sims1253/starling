@@ -487,10 +487,7 @@ fn render_engine_section(app: &mut StarlingApp, cx: &mut Context<StarlingApp>) -
 
     // No manager at all: the startup failure is the whole story.
     let Some(snapshot) = app.engine_snapshot() else {
-        let sentence = app
-            .engine_startup_error
-            .clone()
-            .unwrap_or_else(|| "The built-in engine is not available.".to_string());
+        let sentence = app.engine_unavailable();
         return section.child(engine_note(&sentence)).child(
             div()
                 .flex()

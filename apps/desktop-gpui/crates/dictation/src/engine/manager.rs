@@ -130,7 +130,7 @@ pub enum EngineError {
 }
 
 /// Installation state of one catalog entry, shown per model.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum InstallState {
     NotInstalled,
     Downloading {
@@ -146,7 +146,7 @@ pub enum InstallState {
 }
 
 /// The manager's lifecycle phase.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum EnginePhase {
     /// Probing/selecting the bundled backend.
     SelectingBackend,
@@ -165,7 +165,7 @@ pub enum EnginePhase {
 }
 
 /// Stages of an in-flight model switch.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum SwitchStage {
     Downloading {
         done: u64,
@@ -184,7 +184,7 @@ pub enum SwitchStage {
 }
 
 /// A pending memory decision surfaced to the user.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum SwapDecision {
     /// Both models fit only after the outgoing one is unloaded; the app
     /// asks "finish the current take, then switch?".
@@ -194,7 +194,7 @@ pub enum SwapDecision {
 }
 
 /// How a switch was carried out.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SwapMode {
     /// Both models were briefly resident.
     Rolling,
@@ -203,7 +203,7 @@ pub enum SwapMode {
 }
 
 /// Measurements recorded when a switch completes (#363 step 4).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SwitchReport {
     pub from: Option<String>,
     pub to: String,
@@ -217,7 +217,7 @@ pub struct SwitchReport {
 
 /// The chosen backend, its version, and (after load) the device the
 /// engine actually runs on.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct BackendSelectionView {
     pub backend: Backend,
     pub version: String,
@@ -227,7 +227,7 @@ pub struct BackendSelectionView {
 }
 
 /// The active engine as seen by the app.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ActiveEngineView {
     pub model_id: String,
     pub endpoint: String,
@@ -239,7 +239,7 @@ pub struct ActiveEngineView {
 }
 
 /// One catalog entry as seen by the app.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ModelView {
     pub id: String,
     pub label: String,
@@ -252,17 +252,20 @@ pub struct ModelView {
 }
 
 /// An in-flight switch as seen by the app.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SwitchView {
     pub target_model_id: String,
     pub stage: SwitchStage,
+    /// Process-local: a snapshot that crossed a process boundary (the
+    /// runtime host's engine state, #220) reads it as its arrival.
+    #[serde(skip, default = "Instant::now")]
     pub started: Instant,
 }
 
 /// The complete observable state; cheap to clone, refreshed by the
 /// supervisor and its workers, versioned by
 /// [`EngineManager::generation`].
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct EngineSnapshot {
     pub backend: Option<BackendSelectionView>,
     pub phase: EnginePhase,
@@ -1083,15 +1086,35 @@ impl Supervisor {
                     Ok(selection) => {
                         apply_selection(&self.inner, selection);
                         // Restart the active model on the new engine; the
-                        // old one drains (leases are honored).
+                        // old one drains (leases are honored). Ownership
+                        // is known here: startup and every launch run on
+                        // this thread, so the active engine is settled.
                         let active = self
                             .inner
                             .lock()
                             .active
                             .as_ref()
-                            .map(|engine| engine.model_id.clone());
-                        if let Some(model_id) = active {
-                            self.start_switch(model_id, SwitchKind::Reload, superseded, None);
+                            .map(|engine| (engine.model_id.clone(), engine.owned));
+                        match active {
+                            Some((model_id, true)) => {
+                                self.start_switch(model_id, SwitchKind::Reload, superseded, None);
+                            }
+                            // An attached engine is another process's: a
+                            // reload spawns unshared, so it would start a
+                            // second sidecar beside the owner's (two models
+                            // resident) — and stopping the owner's is not
+                            // ours to do. The new backend applies the next
+                            // time this manager brings an engine up itself
+                            // (the owner lets go, a model switch, a retry).
+                            Some((_, false)) => {
+                                self.inner.lock().set_last_error(
+                                    "The engine in use is run by another Starling process, so it \
+                                     keeps its backend; the new choice applies once Starling \
+                                     starts its own engine."
+                                        .to_string(),
+                                );
+                            }
+                            None => {}
                         }
                     }
                 }

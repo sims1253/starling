@@ -6,6 +6,7 @@ mod assets;
 mod cues;
 mod delivery;
 mod editor;
+mod engine_link;
 mod host_link;
 mod input;
 mod mic;
