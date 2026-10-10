@@ -386,6 +386,11 @@ pub(crate) struct DeliveryState {
     last_insert: Option<Task<()>>,
     /// A capture worker is out (see [`bounded_capture`]).
     capture_out: Arc<AtomicBool>,
+    /// The overlay window has focus. It never should, but on Wayland the
+    /// compositor decides (see `overlay.rs`), so delivery counts it as
+    /// Starling's own window. `overlay_gained` is when it last took focus.
+    overlay_active: bool,
+    overlay_gained: Option<Instant>,
     /// Inserts started and not finished, and the first failure among
     /// them: the overlay says "Inserting…" until the last one ends.
     inserts_pending: usize,
@@ -415,6 +420,8 @@ impl DeliveryState {
             own_focus: Arc::default(),
             last_insert: None,
             capture_out: Arc::default(),
+            overlay_active: false,
+            overlay_gained: None,
             inserts_pending: 0,
             batch_failure: None,
             session_check_out: Arc::default(),
@@ -430,17 +437,23 @@ impl DeliveryState {
 
 impl StarlingApp {
     /// Whether Starling's window has focus now.
+    /// Whether Starling's main window or its overlay has focus now.
     fn starling_focused(&self) -> bool {
-        self.window_focus.last().is_some_and(|(_, active)| *active)
+        self.window_focus.last().is_some_and(|(_, active)| *active) || self.delivery.overlay_active
     }
 
-    /// Whether Starling's window had focus at any point since `at`.
+    /// Whether Starling's main window or its overlay had focus at any
+    /// point since `at`.
     fn starling_focused_since(&self, at: Instant) -> bool {
         self.starling_focused()
             || self
                 .window_focus
                 .iter()
                 .any(|(changed, active)| *active && *changed >= at)
+            || self
+                .delivery
+                .overlay_gained
+                .is_some_and(|gained| gained >= at)
     }
 
     /// Captures the focused target now. Starling's own focus is decided
@@ -478,6 +491,12 @@ impl StarlingApp {
             self.delivery.batch_failure.get_or_insert(failure.title());
         }
         if self.delivery.inserts_pending > 0 {
+            return;
+        }
+        // A pressed Insert still waits: the switch it asks for comes first.
+        if self.delivery.staged_armed.is_some() {
+            self.delivery.batch_failure = None;
+            self.set_delivery_status(DeliveryStatus::Waiting, cx);
             return;
         }
         let status = match self.delivery.batch_failure.take() {
@@ -937,6 +956,26 @@ impl StarlingApp {
 
     /// Starling's window gained or lost focus.
     pub(crate) fn delivery_window_activation(&mut self, active: bool, cx: &mut Context<Self>) {
+        self.delivery_focus_changed(active || self.delivery.overlay_active, cx);
+    }
+
+    /// The overlay window gained or lost focus (a compositor may give it
+    /// focus on Wayland); it counts as Starling's own window, so focus
+    /// moving there never fires an armed Insert or Paste last into it.
+    pub(crate) fn delivery_overlay_activation(&mut self, active: bool, cx: &mut Context<Self>) {
+        if active == self.delivery.overlay_active {
+            return;
+        }
+        self.delivery.overlay_active = active;
+        if active {
+            self.delivery.overlay_gained = Some(Instant::now());
+        }
+        let main = self.window_focus.last().is_some_and(|(_, active)| *active);
+        self.delivery_focus_changed(active || main, cx);
+    }
+
+    /// Starling's windows together gained (`active`) or lost focus.
+    fn delivery_focus_changed(&mut self, active: bool, cx: &mut Context<Self>) {
         self.delivery.focus_changes += 1;
         self.delivery.own_focus.set(active);
         if active {
@@ -1263,6 +1302,80 @@ mod tests {
             status(&app, cx),
             DeliveryStatus::Failed("Not inserted: focus moved".into())
         );
+    }
+
+    /// A pressed Insert keeps the overlay asking for the switch when an
+    /// earlier insert ends meanwhile.
+    #[gpui::test]
+    fn a_waiting_insert_outlasts_an_earlier_inserts_outcome(cx: &mut gpui::TestAppContext) {
+        let (app, fake) = app_with(cx, on());
+        fake.focus(FakeTarget::named("Editor", "notes.txt"));
+        app.update(cx, |app, cx| {
+            app.delivery_take_started();
+            let capture = app.delivery_take_stopped();
+            app.bind_delivery(capture, "take-1");
+            app.sessions.push(session("take-1", "First."));
+            app.deliver_finished_take("take-1", cx);
+            app.delivery.staged_armed = Some(ArmedInsert {
+                take_id: "take-2".into(),
+                capture: captured(Err(InsertError::TargetGone)),
+                armed_at: Instant::now(),
+            });
+            app.set_delivery_status(DeliveryStatus::Waiting, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(fake.field(), "First.");
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.overlay.model.delivery(), &DeliveryStatus::Waiting);
+        });
+    }
+
+    /// Should a compositor give the overlay focus, it counts as
+    /// Starling's own window: a Wayland take is not typed after it, and
+    /// an armed Paste last waits for focus to leave it too.
+    #[gpui::test]
+    fn focus_on_the_overlay_is_starlings_own(cx: &mut gpui::TestAppContext) {
+        let opted_in = InsertionSettings {
+            allow_unverified: true,
+            ..on()
+        };
+        let (app, fake) = app_with(cx, opted_in);
+        fake.set_verifies_target(false);
+        fake.focus(FakeTarget::named("Editor", "notes.txt"));
+        app.update(cx, |app, cx| {
+            app.delivery_take_started();
+            let capture = app.delivery_take_stopped();
+            app.bind_delivery(capture, "take-1");
+            app.delivery_overlay_activation(true, cx);
+            app.delivery_overlay_activation(false, cx);
+            app.sessions.push(session("take-1", "Hello there."));
+            app.deliver_finished_take("take-1", cx);
+        });
+        cx.run_until_parked();
+        assert!(fake.insertions().is_empty());
+        assert_eq!(failure(&app, cx), Some(Failure::FocusMovedThroughStarling));
+
+        // Paste last, armed in the main window, which hands focus to the
+        // overlay: nothing is typed into the overlay.
+        app.update(cx, |app, cx| {
+            app.window_focus.push((Instant::now(), true));
+            app.toggle_paste_last(cx);
+            app.window_focus.push((Instant::now(), false));
+            app.delivery_window_activation(false, cx);
+            app.delivery_overlay_activation(true, cx);
+        });
+        cx.executor().advance_clock(PASTE_SETTLE * 2);
+        cx.run_until_parked();
+        assert!(fake.insertions().is_empty());
+        app.read_with(cx, |app, _| {
+            assert!(app.delivery.recovery.as_ref().unwrap().armed.is_some());
+        });
+
+        fake.focus(FakeTarget::named("Chat", "Message"));
+        app.update(cx, |app, cx| app.delivery_overlay_activation(false, cx));
+        cx.executor().advance_clock(PASTE_SETTLE);
+        cx.run_until_parked();
+        assert_eq!(fake.field(), "Hello there.");
     }
 
     #[gpui::test]

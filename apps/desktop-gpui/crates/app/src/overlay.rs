@@ -212,8 +212,14 @@ impl OverlayModel {
         }
     }
 
+    /// A new outcome (inserted, failed) shows for its full linger even
+    /// when it repeats the last one.
     pub(crate) fn set_delivery(&mut self, status: DeliveryStatus, now: Instant) {
-        if self.delivery != status {
+        let outcome = matches!(
+            status,
+            DeliveryStatus::Delivered | DeliveryStatus::Failed(_)
+        );
+        if self.delivery != status || outcome {
             self.delivery = status;
             self.delivery_since = now;
         }
@@ -542,6 +548,8 @@ impl StarlingApp {
                 .update(cx, |_, window, _| window.remove_window())
                 .ok();
         }
+        // A removed window reports no focus loss.
+        self.delivery_overlay_activation(false, cx);
     }
 
     fn open_overlay(&mut self, mode: OverlayMode, cx: &mut Context<Self>) {
@@ -608,8 +616,8 @@ impl StarlingApp {
             if !current {
                 return;
             }
-            let opened = cx.open_window(options, |_window, cx| {
-                cx.new(|cx| OverlayView::new(app, cx))
+            let opened = cx.open_window(options, |window, cx| {
+                cx.new(|cx| OverlayView::new(app, window, cx))
             });
             let kept = this.update(cx, |this, cx| {
                 let current = this.overlay.generation == generation;
@@ -628,6 +636,9 @@ impl StarlingApp {
                         window
                             .update(cx, |_, window, _| window.remove_window())
                             .ok();
+                        if this.overlay.window.is_none() {
+                            this.delivery_overlay_activation(false, cx);
+                        }
                     }
                     Err(err) => eprintln!("Could not open the dictation overlay: {err}"),
                 }
@@ -874,6 +885,13 @@ mod tests {
             Some(OverlayPhase::DeliveryFailed)
         );
         assert_eq!(model.phase(None, idle(), false, t1 + FAILURE_LINGER), None);
+        // The same failure again is a new outcome: it shows again.
+        let t2 = t1 + FAILURE_LINGER + ms(5);
+        model.set_delivery(DeliveryStatus::Failed("target closed".into()), t2);
+        assert_eq!(
+            model.phase(None, idle(), false, t2),
+            Some(OverlayPhase::DeliveryFailed)
+        );
 
         model.set_delivery(DeliveryStatus::Delivered, t1);
         assert_eq!(

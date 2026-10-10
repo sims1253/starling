@@ -142,16 +142,30 @@ impl StarlingApp {
 pub(crate) struct OverlayView {
     app: WeakEntity<StarlingApp>,
     _observe: Option<Subscription>,
+    _activation: Subscription,
 }
 
 impl OverlayView {
-    pub(crate) fn new(app: WeakEntity<StarlingApp>, cx: &mut Context<Self>) -> Self {
+    pub(crate) fn new(
+        app: WeakEntity<StarlingApp>,
+        window: &mut gpui::Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let observe = app
             .upgrade()
             .map(|app| cx.observe(&app, |_, _, cx| cx.notify()));
+        // Delivery counts the overlay as Starling's own window should a
+        // compositor give it focus (#221).
+        let activation = cx.observe_window_activation(window, |view, window, cx| {
+            let active = window.is_window_active();
+            view.app
+                .update(cx, |app, cx| app.delivery_overlay_activation(active, cx))
+                .ok();
+        });
         Self {
             app,
             _observe: observe,
+            _activation: activation,
         }
     }
 }
