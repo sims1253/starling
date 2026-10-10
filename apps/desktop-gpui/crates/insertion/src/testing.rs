@@ -54,6 +54,8 @@ struct State {
     insert_behavior: InsertBehavior,
     revalidate_failure: Option<InsertError>,
     verifies_target: bool,
+    /// How long `capture` takes, like a display slow to answer.
+    capture_delay: std::time::Duration,
     key_hook: Option<KeyHook>,
     insertions: Vec<(String, String)>,
     /// Every key `insert_guarded` sent, in arrival order, as one field
@@ -103,6 +105,7 @@ impl FakeBackend {
                 insert_behavior: InsertBehavior::Type,
                 revalidate_failure: None,
                 verifies_target: true,
+                capture_delay: std::time::Duration::ZERO,
                 key_hook: None,
                 insertions: Vec::new(),
                 field: String::new(),
@@ -157,6 +160,12 @@ impl FakeBackend {
         self.state().verifies_target = verifies;
     }
 
+    /// Make `capture` take `delay` before it answers (with the focus as
+    /// it is then).
+    pub fn set_capture_delay(&self, delay: std::time::Duration) {
+        self.state().capture_delay = delay;
+    }
+
     /// Run `hook` with each character's index before `insert_guarded`
     /// checks its `stop` for that character: lets a test change what the
     /// caller sees mid-typing.
@@ -191,6 +200,10 @@ impl InsertionBackend for FakeBackend {
     }
 
     fn capture(&self) -> Result<TargetSnapshot, InsertError> {
+        let delay = self.state().capture_delay;
+        if !delay.is_zero() {
+            std::thread::sleep(delay);
+        }
         let state = self.state();
         let (Some(target), Some(target_ref)) = (state.focus.clone(), state.current_ref()) else {
             return Err(InsertError::Rejected {

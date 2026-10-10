@@ -3,15 +3,21 @@
 //! ever coming forward.
 //!
 //! - **Capture at start.** `start_recording` captures the focused target
-//!   before anything else can move focus; the capture travels with the
-//!   take (`stop_recording` → the save → its store id).
-//! - **Deliver once, when the text is final.** When the take's transcript
-//!   lands, its text (the staged draft with the user's edits, or the raw
-//!   transcript) is typed into the captured target. The backend
+//!   before anything else can move focus. The capture is a display round
+//!   trip: it runs on a worker thread, and the UI thread waits at most
+//!   [`CAPTURE_BUDGET`] for it (a display that does not answer by then
+//!   counts as unavailable; a later answer could name a later window). The
+//!   capture travels with the take (`stop_recording` → the save → its store
+//!   id).
+//! - **Deliver once.** A direct take's raw transcript is typed into the
+//!   captured target when it lands. A staged take (#297) waits in its
+//!   panel: the user edits it, maybe runs a mode over it, and presses
+//!   Insert; the draft as it stands then is typed once focus leaves
+//!   Starling's window (the user switching back). The backend
 //!   revalidates the target immediately before typing and before every
 //!   chunk; nothing is ever submitted (control characters are refused, so
 //!   no Enter). A capture is consumed by its first delivery attempt: a
-//!   retried transcription never types again.
+//!   retried transcription or a second Insert never types again.
 //! - **Recovery.** Anything that keeps the text from landing (completely)
 //!   leaves a notice with the text, the specific reason, Copy, and Paste
 //!   last. Paste last types into a target captured anew, after the user
@@ -32,8 +38,8 @@
 //! captured `target_ref`.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use gpui::{AppContext, ClipboardItem, Context, Task};
@@ -48,6 +54,16 @@ pub(crate) const PASTE_ARM_TIMEOUT: Duration = Duration::from_secs(15);
 /// before it is captured (a window switcher may pass through first).
 pub(crate) const PASTE_SETTLE: Duration = Duration::from_millis(350);
 
+/// How long the UI thread waits for a capture's display round trip
+/// (normally well under a millisecond).
+pub(crate) const CAPTURE_BUDGET: Duration = Duration::from_millis(100);
+
+/// How long an insert may take before it is given up as stalled (a
+/// display that stopped answering), so the inserts after it still run.
+fn typing_budget(text: &str) -> Duration {
+    Duration::from_secs(10) + Duration::from_millis(20) * text.chars().count() as u32
+}
+
 /// What a take captured when it started.
 #[derive(Clone, Debug)]
 pub(crate) struct Capture {
@@ -55,10 +71,67 @@ pub(crate) struct Capture {
     pub at: Instant,
 }
 
+/// The inserter's capture on a worker thread, waited for at most
+/// [`CAPTURE_BUDGET`]: a stuck display cannot freeze the UI thread, and an
+/// answer that comes later is not taken (focus may have moved by then).
+/// `out` is set while a worker is out; one the display never answered
+/// is not joined by more.
+fn bounded_capture(
+    inserter: Arc<Inserter>,
+    out: &Arc<AtomicBool>,
+) -> Result<TargetSnapshot, InsertError> {
+    if out.swap(true, Ordering::SeqCst) {
+        return Err(InsertError::Unavailable {
+            reason: "the display has not answered an earlier focus check".to_string(),
+        });
+    }
+    let (sender, receiver) = mpsc::channel();
+    let worker_out = out.clone();
+    let spawned = std::thread::Builder::new()
+        .name("starling-capture".into())
+        .spawn(move || {
+            let target = inserter.capture();
+            // Cleared before the answer, so the next capture never sees
+            // an answered worker as out.
+            worker_out.store(false, Ordering::SeqCst);
+            let _ = sender.send(target);
+        });
+    if let Err(error) = spawned {
+        out.store(false, Ordering::SeqCst);
+        return Err(InsertError::Unavailable {
+            reason: format!("cannot start the focus check: {error}"),
+        });
+    }
+    receiver.recv_timeout(CAPTURE_BUDGET).unwrap_or_else(|_| {
+        Err(InsertError::Unavailable {
+            reason: "the display did not say in time which window has focus".to_string(),
+        })
+    })
+}
+
+/// The stop check of one insert: Starling's window took focus, or the
+/// insert overran its budget and was given up.
+fn insert_stop(
+    had_focus: impl Fn() -> bool + Send + 'static,
+    abandoned: Arc<AtomicBool>,
+) -> impl Fn() -> Option<InsertError> + Send + 'static {
+    move || {
+        if abandoned.load(Ordering::SeqCst) {
+            Some(InsertError::Unavailable {
+                reason: "typing stalled and was given up".to_string(),
+            })
+        } else {
+            had_focus().then_some(InsertError::TargetIsStarling)
+        }
+    }
+}
+
 /// Why text did not land (completely).
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Failure {
     Insert(InsertError),
+    /// Typing did not finish within its budget and was given up.
+    Stalled,
     /// The target cannot be verified here and the user has not opted in.
     UnverifiedOff,
     /// The target cannot be verified, and Starling's own window had focus
@@ -133,6 +206,7 @@ impl Recovery {
             Failure::Insert(InsertError::TargetGone) => "Not inserted: the window closed",
             Failure::Insert(InsertError::ModifiersHeld { .. }) => "Not inserted: keys were held",
             Failure::Insert(InsertError::Unavailable { .. }) => "Insertion unavailable",
+            Failure::Stalled => "Not inserted: typing stalled",
             Failure::UnverifiedOff => "Not inserted: the target cannot be checked",
             Failure::Insert(_) => "Not inserted",
         }
@@ -175,6 +249,11 @@ impl Recovery {
                  cannot be checked, so nothing was typed."
                     .to_string()
             }
+            Failure::Stalled => {
+                "Typing did not finish in time: the display stopped answering. Some of the text \
+                 may already be in the window; check it before pasting again."
+                    .to_string()
+            }
         }
     }
 
@@ -186,6 +265,23 @@ impl Recovery {
             Failure::UnverifiedOff | Failure::Insert(InsertError::Unavailable { .. })
         )
     }
+}
+
+/// Where a staged take's Insert stands, for its panel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StagedInsert {
+    Ready,
+    /// Pressed; types once focus leaves Starling's window.
+    Waiting,
+    Typing,
+    Inserted,
+}
+
+/// A pressed Insert waiting for focus to leave Starling's window.
+struct ArmedInsert {
+    take_id: String,
+    capture: Capture,
+    armed_at: Instant,
 }
 
 /// Starling's window focus as typing off the UI thread sees it (Wayland
@@ -221,8 +317,13 @@ pub(crate) struct DeliveryState {
     pub(crate) settings: InsertionSettings,
     /// The running take's capture.
     live: Option<Capture>,
-    /// Saved takes waiting for their transcript, by store id.
+    /// Saved takes waiting for their transcript (direct) or for Insert
+    /// (staged), by store id.
     by_take: HashMap<String, Capture>,
+    /// A staged take's pressed Insert.
+    staged_armed: Option<ArmedInsert>,
+    /// Staged takes whose Insert is typing (`false`) or typed (`true`).
+    staged_inserts: HashMap<String, bool>,
     pub(crate) recovery: Option<Recovery>,
     /// Bumped whenever the recovery is replaced or dismissed, so a late
     /// Paste last result lands only on the notice it was started from.
@@ -236,6 +337,13 @@ pub(crate) struct DeliveryState {
     /// The latest insert. The next one waits for it, so inserts type in
     /// the order they were started, one at a time.
     last_insert: Option<Task<()>>,
+    /// A capture worker is out (see [`bounded_capture`]).
+    capture_out: Arc<AtomicBool>,
+    /// An insert is out on the background executor. One given up as
+    /// stalled may never return; later inserts are refused rather than
+    /// queued behind it on the insertion lock, so at most one worker is
+    /// ever stuck.
+    insert_out: Arc<AtomicBool>,
 }
 
 impl DeliveryState {
@@ -245,11 +353,15 @@ impl DeliveryState {
             settings,
             live: None,
             by_take: HashMap::new(),
+            staged_armed: None,
+            staged_inserts: HashMap::new(),
             recovery: None,
             generation: 0,
             focus_changes: 0,
             own_focus: Arc::default(),
             last_insert: None,
+            capture_out: Arc::default(),
+            insert_out: Arc::default(),
         }
     }
 
@@ -274,14 +386,15 @@ impl StarlingApp {
                 .any(|(changed, active)| *active && *changed >= at)
     }
 
+    /// Captures the focused target now. Starling's own focus is decided
+    /// here: dictating into Starling itself. On Wayland only the app can
+    /// tell; elsewhere the backend refuses Starling's pid too.
     fn capture_now(&self) -> Capture {
         let at = Instant::now();
         let target = if self.starling_focused() {
-            // Dictating into Starling itself. On Wayland only the app can
-            // tell; elsewhere the backend refuses Starling's pid too.
             Err(InsertError::TargetIsStarling)
         } else {
-            self.delivery.inserter.capture()
+            bounded_capture(self.delivery.inserter.clone(), &self.delivery.capture_out)
         };
         Capture { target, at }
     }
@@ -293,6 +406,7 @@ impl StarlingApp {
         if let Some(recovery) = self.delivery.recovery.as_mut() {
             recovery.armed = None;
         }
+        self.disarm_staged_insert();
         self.delivery.live = self
             .delivery
             .settings
@@ -316,10 +430,19 @@ impl StarlingApp {
     /// delivered for it later (a retry is a new, explicit job).
     pub(crate) fn forget_delivery(&mut self, id: &str) {
         self.delivery.by_take.remove(id);
+        // A pressed Insert goes with its panel.
+        if self
+            .delivery
+            .staged_armed
+            .as_ref()
+            .is_some_and(|armed| armed.take_id == id)
+        {
+            self.delivery.staged_armed = None;
+        }
     }
 
-    /// The take's transcript landed: type its text into the captured
-    /// target, once.
+    /// A direct take's transcript landed: type its text into the
+    /// captured target, once.
     pub(crate) fn deliver_finished_take(&mut self, id: &str, cx: &mut Context<Self>) {
         let Some(capture) = self.delivery.by_take.remove(id) else {
             return;
@@ -354,7 +477,10 @@ impl StarlingApp {
 
     /// Types `text` into `target` off the UI thread, after every insert
     /// started before it finished. `paste` is the recovery generation a
-    /// Paste last runs for; `None` for the take's own delivery.
+    /// Paste last runs for; `None` for the take's own delivery. An insert
+    /// that overruns its [`typing_budget`] is reported as stalled and
+    /// stops before its next key should it ever resume, so one stuck
+    /// insert cannot hold up the ones after it.
     fn spawn_insert(
         &mut self,
         id: String,
@@ -367,16 +493,36 @@ impl StarlingApp {
         let had_focus = self.delivery.own_focus.had_focus_since_now();
         let typed_text = text.clone();
         let previous = self.delivery.last_insert.take();
+        let budget = typing_budget(&text);
+        let out = self.delivery.insert_out.clone();
         let insert = cx.spawn(async move |this, cx| {
             if let Some(previous) = previous {
                 previous.await;
             }
-            let result = cx
-                .background_spawn(async move {
-                    let stop = || had_focus().then_some(InsertError::TargetIsStarling);
-                    inserter.insert(&target, &typed_text, &stop)
-                })
-                .await;
+            let result = if out.swap(true, Ordering::SeqCst) {
+                Err(Failure::Insert(InsertError::Unavailable {
+                    reason: "an earlier insert is still waiting for the display".to_string(),
+                }))
+            } else {
+                let abandoned = Arc::new(AtomicBool::new(false));
+                let stop = insert_stop(had_focus, abandoned.clone());
+                let typing = cx.background_spawn(async move {
+                    let result = inserter.insert(&target, &typed_text, &stop);
+                    out.store(false, Ordering::SeqCst);
+                    result
+                });
+                let timer = cx.background_executor().timer(budget);
+                match futures_util::future::select(typing, timer).await {
+                    futures_util::future::Either::Left((result, _)) => {
+                        result.map_err(Failure::Insert)
+                    }
+                    futures_util::future::Either::Right(((), typing)) => {
+                        abandoned.store(true, Ordering::SeqCst);
+                        typing.detach();
+                        Err(Failure::Stalled)
+                    }
+                }
+            };
             this.update(cx, |app, cx| {
                 app.insert_finished(id, text, paste, result, cx)
             })
@@ -390,17 +536,21 @@ impl StarlingApp {
         id: String,
         text: String,
         paste: Option<u64>,
-        result: Result<starling_insertion::InsertReceipt, InsertError>,
+        result: Result<starling_insertion::InsertReceipt, Failure>,
         cx: &mut Context<Self>,
     ) {
+        // A staged take's Insert shows "Inserted"; after a failure, the
+        // notice's Paste last is the retry.
+        if result.is_ok() && self.staged_text_for(&id).is_some() {
+            self.delivery.staged_inserts.insert(id.clone(), true);
+        } else if paste.is_none() {
+            self.delivery.staged_inserts.remove(&id);
+        }
         match paste {
             None => {
-                if let Err(error) = result {
-                    self.delivery.replace_recovery(Some(Recovery::new(
-                        &id,
-                        text,
-                        Failure::Insert(error),
-                    )));
+                if let Err(failure) = result {
+                    self.delivery
+                        .replace_recovery(Some(Recovery::new(&id, text, failure)));
                 }
             }
             Some(generation) => {
@@ -410,10 +560,10 @@ impl StarlingApp {
                 }
                 match result {
                     Ok(_) => self.delivery.replace_recovery(None),
-                    Err(error) => {
+                    Err(failure) => {
                         if let Some(recovery) = self.delivery.recovery.as_mut() {
                             recovery.pasting = false;
-                            recovery.failure = Failure::Insert(error);
+                            recovery.failure = failure;
                         }
                     }
                 }
@@ -456,6 +606,8 @@ impl StarlingApp {
         }
         let armed_at = Instant::now();
         recovery.armed = Some(armed_at);
+        // One text waits for the next window at a time.
+        self.disarm_staged_insert();
         cx.spawn(async move |this, cx| {
             cx.background_executor().timer(PASTE_ARM_TIMEOUT).await;
             this.update(cx, |app, cx| {
@@ -472,9 +624,156 @@ impl StarlingApp {
         if !focused {
             // Armed from outside the window (a keyboard path, a test):
             // focus is already elsewhere.
-            self.schedule_paste_last(armed_at, cx);
+            self.after_focus_settles(armed_at, Self::fire_paste_last, cx);
         }
         cx.notify();
+    }
+
+    /// Where the staged take `id`'s Insert stands; `None` when there is
+    /// nothing to insert into (copy only, dictated into Starling, a
+    /// failure handed to the recovery notice, or a closed panel).
+    pub(crate) fn staged_insert(&self, id: &str) -> Option<StagedInsert> {
+        if let Some(&typed) = self.delivery.staged_inserts.get(id) {
+            return Some(if typed {
+                StagedInsert::Inserted
+            } else {
+                StagedInsert::Typing
+            });
+        }
+        if self
+            .delivery
+            .staged_armed
+            .as_ref()
+            .is_some_and(|armed| armed.take_id == id)
+        {
+            return Some(StagedInsert::Waiting);
+        }
+        let capture = self.delivery.by_take.get(id)?;
+        (self.delivery.settings.auto_insert
+            && !matches!(capture.target, Err(InsertError::TargetIsStarling)))
+        .then_some(StagedInsert::Ready)
+    }
+
+    /// "Insert" for the staged take `id` (#297): its draft goes into the
+    /// window the take started in, once. The panel is in Starling's
+    /// window, so the insert waits for focus to leave it (the user
+    /// switching back) and its settle; the target is then revalidated as
+    /// for a direct take. Pressing it again while it waits cancels; it
+    /// expires like Paste last.
+    pub(crate) fn insert_staged(&mut self, id: &str, cx: &mut Context<Self>) {
+        match self.staged_insert(id) {
+            Some(StagedInsert::Ready) => {}
+            Some(StagedInsert::Waiting) => {
+                self.disarm_staged_insert();
+                cx.notify();
+                return;
+            }
+            _ => return,
+        }
+        let Some(capture) = self.delivery.by_take.remove(id) else {
+            return;
+        };
+        if let Some(recovery) = self.delivery.recovery.as_mut() {
+            recovery.armed = None;
+        }
+        self.disarm_staged_insert();
+        let armed_at = Instant::now();
+        self.delivery.staged_armed = Some(ArmedInsert {
+            take_id: id.to_string(),
+            capture,
+            armed_at,
+        });
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(PASTE_ARM_TIMEOUT).await;
+            this.update(cx, |app, cx| {
+                if app
+                    .delivery
+                    .staged_armed
+                    .as_ref()
+                    .is_some_and(|armed| armed.armed_at == armed_at)
+                {
+                    app.disarm_staged_insert();
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+        if !self.starling_focused() {
+            self.after_focus_settles(armed_at, Self::fire_staged_insert, cx);
+        }
+        cx.notify();
+    }
+
+    /// A pressed Insert that has not typed goes back to waiting for a
+    /// press, if its panel is still there to press it.
+    fn disarm_staged_insert(&mut self) {
+        if let Some(armed) = self.delivery.staged_armed.take() {
+            if self.staging_shows(&armed.take_id) {
+                self.delivery.by_take.insert(armed.take_id, armed.capture);
+            }
+        }
+    }
+
+    /// The pressed Insert fires: the draft as it stands now goes into the
+    /// take's captured target.
+    fn fire_staged_insert(&mut self, armed_at: Instant, cx: &mut Context<Self>) {
+        let armed = self
+            .delivery
+            .staged_armed
+            .as_ref()
+            .is_some_and(|armed| armed.armed_at == armed_at);
+        // Back in Starling before the focus settled: stay armed.
+        if !armed || self.starling_focused() {
+            return;
+        }
+        let Some(ArmedInsert {
+            take_id: id,
+            capture,
+            ..
+        }) = self.delivery.staged_armed.take()
+        else {
+            return;
+        };
+        let Some(text) = self.staged_text_for(&id).or_else(|| self.head_text(&id)) else {
+            cx.notify();
+            return;
+        };
+        // Starling's window had focus: the Insert was pressed there. A
+        // verifiable target must still be the captured one. A target that
+        // was captured but cannot be checked (Wayland) says nothing about
+        // which window that was, so the window the user switched to after
+        // pressing Insert is captured and receives the text, as with Paste
+        // last. A failed capture is reported, never replaced.
+        let unverifiable = capture
+            .target
+            .as_ref()
+            .is_ok_and(|target| !self.delivery.inserter.verifies(target));
+        let capture = if unverifiable {
+            self.capture_now()
+        } else {
+            capture
+        };
+        let verified = self.verifiable(&capture);
+        match plan(&capture, self.delivery.settings, verified, false, &text) {
+            Plan::Skip => {}
+            Plan::Fail(failure) => {
+                self.delivery
+                    .replace_recovery(Some(Recovery::new(&id, text, failure)));
+            }
+            Plan::Insert(target) => {
+                self.delivery.staged_inserts.insert(id.clone(), false);
+                self.spawn_insert(id, target, text, None, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    fn verifiable(&self, capture: &Capture) -> bool {
+        capture
+            .target
+            .as_ref()
+            .is_ok_and(|target| self.delivery.inserter.verifies(target))
     }
 
     /// Starling's window gained or lost focus.
@@ -490,11 +789,26 @@ impl StarlingApp {
             .as_ref()
             .and_then(|recovery| recovery.armed)
         {
-            self.schedule_paste_last(armed_at, cx);
+            self.after_focus_settles(armed_at, Self::fire_paste_last, cx);
+        }
+        if let Some(armed_at) = self
+            .delivery
+            .staged_armed
+            .as_ref()
+            .map(|armed| armed.armed_at)
+        {
+            self.after_focus_settles(armed_at, Self::fire_staged_insert, cx);
         }
     }
 
-    fn schedule_paste_last(&mut self, armed_at: Instant, cx: &mut Context<Self>) {
+    /// Runs `fire` for the arming at `armed_at` once the current focus
+    /// settled, unless focus moved again meanwhile.
+    fn after_focus_settles(
+        &mut self,
+        armed_at: Instant,
+        fire: fn(&mut Self, Instant, &mut Context<Self>),
+        cx: &mut Context<Self>,
+    ) {
         let focus_changes = self.delivery.focus_changes;
         cx.spawn(async move |this, cx| {
             cx.background_executor().timer(PASTE_SETTLE).await;
@@ -502,7 +816,7 @@ impl StarlingApp {
                 // Focus moved again meanwhile: that move's own timer
                 // decides, after its full settle.
                 if app.delivery.focus_changes == focus_changes {
-                    app.fire_paste_last(armed_at, cx);
+                    fire(app, armed_at, cx);
                 }
             })
             .ok();
@@ -529,10 +843,7 @@ impl StarlingApp {
         };
         recovery.armed = None;
         let (id, text) = (recovery.take_id.clone(), recovery.text.clone());
-        let verified = capture
-            .target
-            .as_ref()
-            .is_ok_and(|target| self.delivery.inserter.verifies(target));
+        let verified = self.verifiable(&capture);
         // The capture is fresh: a focus change before it is the user's
         // choice, not a reason to refuse.
         match plan(&capture, self.delivery.settings, verified, false, &text) {
@@ -1097,7 +1408,7 @@ mod tests {
                 "take-1".into(),
                 "Hello there.".into(),
                 Some(generation),
-                Err(InsertError::TargetGone),
+                Err(Failure::Insert(InsertError::TargetGone)),
                 cx,
             );
             assert!(app.delivery.recovery.is_none());
@@ -1125,6 +1436,83 @@ mod tests {
         app.read_with(cx, |app, _| {
             assert!(app.delivery.recovery.as_ref().unwrap().copied)
         });
+    }
+
+    /// An insert that overran its budget is given up: should the display
+    /// ever answer again, it stops before its next key.
+    #[test]
+    fn a_given_up_insert_stops_before_its_next_key() {
+        let fake = FakeBackend::new();
+        fake.focus(FakeTarget::named("Editor", "notes.txt"));
+        let target = fake.capture().unwrap();
+        let abandoned = Arc::new(AtomicBool::new(false));
+        let stop = insert_stop(|| false, abandoned.clone());
+        fake.on_key(move |index| {
+            if index == 3 {
+                abandoned.store(true, Ordering::SeqCst);
+            }
+        });
+        let result = fake.insert_guarded(&target, "Hello there.", &stop);
+        assert!(
+            matches!(
+                result,
+                Err(InsertError::PartialDelivery {
+                    delivered_chars: 3,
+                    ..
+                })
+            ),
+            "{result:?}"
+        );
+        assert_eq!(fake.field(), "Hel");
+        let notice = Recovery::new("take-1", "Hello there.".into(), Failure::Stalled);
+        assert_eq!(notice.title(), "Not inserted: typing stalled");
+        assert!(
+            notice
+                .explanation()
+                .contains("check it before pasting again")
+        );
+    }
+
+    /// A display that answers the capture late counts as unavailable:
+    /// the UI thread does not wait for it, and the late answer could name
+    /// a window focused after the take started.
+    #[gpui::test]
+    fn a_capture_the_display_answers_late_is_unavailable(cx: &mut gpui::TestAppContext) {
+        let (app, fake) = app_with(cx, on());
+        fake.focus(FakeTarget::named("Editor", "notes.txt"));
+        fake.set_capture_delay(CAPTURE_BUDGET * 3);
+        take(&app, cx, "take-1", "Hello there.", |_| {});
+        assert!(fake.insertions().is_empty());
+        assert!(matches!(
+            failure(&app, cx),
+            Some(Failure::Insert(InsertError::Unavailable { .. }))
+        ));
+    }
+
+    /// A capture the display never answered is not joined by more
+    /// workers: the next one is refused until it returns.
+    #[gpui::test]
+    fn a_capture_still_out_refuses_the_next(cx: &mut gpui::TestAppContext) {
+        let (app, fake) = app_with(cx, on());
+        fake.focus(FakeTarget::named("Editor", "notes.txt"));
+        fake.set_capture_delay(CAPTURE_BUDGET * 3);
+        take(&app, cx, "take-1", "First.", |_| {});
+        fake.set_capture_delay(Duration::ZERO);
+        take(&app, cx, "take-2", "Second.", |_| {});
+        assert!(fake.insertions().is_empty());
+        app.read_with(cx, |app, _| {
+            let recovery = app.delivery.recovery.as_ref().unwrap();
+            assert_eq!(recovery.take_id, "take-2");
+            assert!(
+                recovery.explanation().contains("earlier focus check"),
+                "{}",
+                recovery.explanation()
+            );
+        });
+        // Once the late worker returns, captures work again.
+        std::thread::sleep(CAPTURE_BUDGET * 4);
+        take(&app, cx, "take-3", "Third.", |_| {});
+        assert_eq!(fake.field(), "Third.");
     }
 
     #[gpui::test]

@@ -178,8 +178,8 @@ impl StarlingApp {
         }
     }
 
-    /// The text a staged take delivers (#221): its draft as it stands,
-    /// with the user's edits.
+    /// The text a staged take inserts (#221): its draft as it stands,
+    /// with the user's edits and an accepted proposal.
     pub(crate) fn staged_text_for(&self, id: &str) -> Option<String> {
         let staging = self
             .staging
@@ -239,6 +239,10 @@ impl StarlingApp {
         let Some(staging) = self.staging.take() else {
             return;
         };
+        // Nothing can press its Insert any more (#221).
+        if let Some(id) = &staging.take_id {
+            self.forget_delivery(id);
+        }
         match staging.phase {
             StagingPhase::Ready => {
                 let token = staging.token;
@@ -377,6 +381,15 @@ impl StarlingApp {
                     self.finish_staging(cx);
                 }
             }
+            EditorEvent::Insert => {
+                if self
+                    .staging
+                    .as_ref()
+                    .is_some_and(|staging| staging.token == token)
+                {
+                    self.insert_staging(cx);
+                }
+            }
             EditorEvent::Leave => {
                 self.pending_focus = Some(PendingFocus::Root);
                 cx.notify();
@@ -470,6 +483,7 @@ impl StarlingApp {
 
     /// The take was deleted: its staging goes with it.
     pub(crate) fn drop_staging_for(&mut self, id: &str) {
+        self.forget_delivery(id);
         if self.staging_shows(id) {
             self.staging = None;
             self.pending_focus = Some(PendingFocus::Root);
@@ -958,6 +972,10 @@ impl StarlingApp {
         {
             return;
         }
+        // Done without Insert: the take stays in Starling (#221).
+        if let Some(id) = self.staging.as_ref().and_then(|s| s.take_id.clone()) {
+            self.forget_delivery(&id);
+        }
         if let Some(staging) = self.staging.as_mut() {
             if staging.phase == StagingPhase::Ready {
                 staging.close_when_saved = true;
@@ -1012,6 +1030,17 @@ impl StarlingApp {
         })
         .detach();
         cx.notify();
+    }
+
+    /// "Insert" (or Secondary+Shift+Enter): the ready draft goes into the
+    /// window the take started in (`insert_staged`, #221).
+    pub(crate) fn insert_staging(&mut self, cx: &mut Context<Self>) {
+        let Some((token, id)) = self.ready_staging() else {
+            return;
+        };
+        // The stored text follows what is typed.
+        self.persist_staging_now(token, cx);
+        self.insert_staged(&id, cx);
     }
 
     /// Runs the active mode on the staged take (after its transcript).
@@ -1243,20 +1272,30 @@ mod tests {
         store.latest_raw(id).unwrap().unwrap().0
     }
 
-    #[gpui::test]
-    fn a_staged_take_delivers_the_draft_with_the_users_edits(cx: &mut gpui::TestAppContext) {
+    /// A staged take with a fake insertion backend (`prepare`d first),
+    /// recorded while "Editor" had focus, edited during the take ("Note:"
+    /// in front), and transcribed as "hello world": its panel is ready.
+    fn staged_insert_take(
+        cx: &mut gpui::TestAppContext,
+        settings: starling_dictation::settings::InsertionSettings,
+        prepare: impl FnOnce(&starling_insertion::testing::FakeBackend),
+    ) -> (
+        tempfile::TempDir,
+        Entity<StarlingApp>,
+        std::sync::Arc<starling_insertion::testing::FakeBackend>,
+        String,
+    ) {
         use starling_insertion::testing::{FakeBackend, FakeTarget};
         let root = tempfile::tempdir().unwrap();
         let store = crate::store::Store::at_test_root(root.path());
         let fake = std::sync::Arc::new(FakeBackend::new());
         fake.focus(FakeTarget::named("Editor", "notes.txt"));
+        prepare(&fake);
         let inserter = starling_insertion::Inserter::with_backends(vec![Box::new(fake.clone())]);
         let app = cx.new(|cx| {
             let mut app = StarlingApp::for_test(Some(store.clone()), cx);
-            app.delivery = crate::delivery::DeliveryState::new(
-                std::sync::Arc::new(inserter),
-                Default::default(),
-            );
+            app.delivery =
+                crate::delivery::DeliveryState::new(std::sync::Arc::new(inserter), settings);
             app
         });
         let (id, _) = saved_take(&store);
@@ -1283,14 +1322,242 @@ mod tests {
             app.after_transcription(id.clone(), cx);
         });
         cx.run_until_parked();
+        app.read_with(cx, |app, _| {
+            assert_eq!(app.staging.as_ref().unwrap().phase, StagingPhase::Ready)
+        });
+        (root, app, fake, id)
+    }
+
+    /// Starling's window takes focus (the user is in the panel), or
+    /// leaves it, as the window would report it.
+    fn starling_focus(app: &Entity<StarlingApp>, cx: &mut gpui::TestAppContext, active: bool) {
+        app.update(cx, |app, cx| {
+            app.window_focus.push((std::time::Instant::now(), active));
+            app.delivery_window_activation(active, cx);
+        });
+        cx.executor().advance_clock(crate::delivery::PASTE_SETTLE);
+        cx.run_until_parked();
+    }
+
+    fn press_insert(app: &Entity<StarlingApp>, cx: &mut gpui::TestAppContext) {
+        app.update(cx, |app, cx| app.insert_staging(cx));
+        cx.run_until_parked();
+    }
+
+    fn staged_insert_state(
+        app: &Entity<StarlingApp>,
+        cx: &mut gpui::TestAppContext,
+        id: &str,
+    ) -> Option<crate::delivery::StagedInsert> {
+        app.read_with(cx, |app, _| app.staged_insert(id))
+    }
+
+    #[gpui::test]
+    fn a_staged_take_types_its_edited_draft_on_insert_only_once(cx: &mut gpui::TestAppContext) {
+        use crate::delivery::StagedInsert;
+        let (_root, app, fake, id) = staged_insert_take(cx, Default::default(), |_| {});
+        // The transcript landed: nothing is typed until Insert.
+        assert!(fake.insertions().is_empty());
+        assert_eq!(
+            staged_insert_state(&app, cx, &id),
+            Some(StagedInsert::Ready)
+        );
+
+        // An edit after the transcript is part of what Insert types.
+        starling_focus(&app, cx, true);
+        app.update(cx, |app, cx| {
+            let token = app.staging.as_ref().unwrap().token;
+            let end = app.visible_staging_draft().unwrap().text().chars().count();
+            app.apply_staging_edit(
+                token,
+                &TextEdit {
+                    start: end,
+                    end,
+                    text: " Thanks.".into(),
+                },
+                cx,
+            );
+        });
+        // Pressed in Starling's window: it waits for focus to leave.
+        press_insert(&app, cx);
+        cx.executor()
+            .advance_clock(crate::delivery::PASTE_SETTLE * 2);
+        cx.run_until_parked();
+        assert!(fake.insertions().is_empty());
+        assert_eq!(
+            staged_insert_state(&app, cx, &id),
+            Some(StagedInsert::Waiting)
+        );
+
+        starling_focus(&app, cx, false);
         let typed = fake.insertions();
         assert_eq!(typed.len(), 1);
         assert!(typed[0].1.starts_with("Note:"), "{typed:?}");
-        assert!(typed[0].1.ends_with("hello world"), "{typed:?}");
+        assert!(typed[0].1.ends_with("hello world Thanks."), "{typed:?}");
         app.read_with(cx, |app, _| {
             assert!(app.delivery.recovery.is_none());
             assert_eq!(app.visible_staging_draft().unwrap().text(), typed[0].1);
         });
+        assert_eq!(
+            staged_insert_state(&app, cx, &id),
+            Some(StagedInsert::Inserted)
+        );
+
+        // Insert is single-shot: pressing it again types nothing.
+        starling_focus(&app, cx, true);
+        press_insert(&app, cx);
+        starling_focus(&app, cx, false);
+        assert_eq!(fake.insertions().len(), 1);
+    }
+
+    #[gpui::test]
+    fn a_staged_insert_into_a_changed_window_keeps_the_text(cx: &mut gpui::TestAppContext) {
+        use starling_insertion::InsertError;
+        use starling_insertion::testing::FakeTarget;
+        let (_root, app, fake, id) = staged_insert_take(cx, Default::default(), |_| {});
+        starling_focus(&app, cx, true);
+        press_insert(&app, cx);
+        fake.focus(FakeTarget::named("Browser", "A tab"));
+        starling_focus(&app, cx, false);
+        assert!(fake.insertions().is_empty());
+        app.read_with(cx, |app, _| {
+            let recovery = app.delivery.recovery.as_ref().unwrap();
+            assert!(matches!(
+                recovery.failure,
+                crate::delivery::Failure::Insert(InsertError::TargetChanged { .. })
+            ));
+            assert_eq!(recovery.title(), "Not inserted: focus moved");
+            assert_eq!(
+                recovery.text,
+                app.visible_staging_draft().unwrap().text(),
+                "the notice keeps the draft for Copy and Paste last"
+            );
+        });
+        // The capture is spent; Paste last is the retry.
+        assert_eq!(staged_insert_state(&app, cx, &id), None);
+    }
+
+    #[gpui::test]
+    fn a_pressed_insert_cancels_on_a_second_press_and_expires(cx: &mut gpui::TestAppContext) {
+        use crate::delivery::{PASTE_ARM_TIMEOUT, StagedInsert};
+        let (_root, app, fake, id) = staged_insert_take(cx, Default::default(), |_| {});
+        starling_focus(&app, cx, true);
+        press_insert(&app, cx);
+        assert_eq!(
+            staged_insert_state(&app, cx, &id),
+            Some(StagedInsert::Waiting)
+        );
+        press_insert(&app, cx);
+        assert_eq!(
+            staged_insert_state(&app, cx, &id),
+            Some(StagedInsert::Ready)
+        );
+
+        press_insert(&app, cx);
+        cx.executor().advance_clock(PASTE_ARM_TIMEOUT);
+        cx.run_until_parked();
+        assert_eq!(
+            staged_insert_state(&app, cx, &id),
+            Some(StagedInsert::Ready)
+        );
+        starling_focus(&app, cx, false);
+        assert!(fake.insertions().is_empty());
+
+        // Done without Insert: the take stays in Starling.
+        app.update(cx, |app, cx| app.finish_staging(cx));
+        cx.run_until_parked();
+        assert_eq!(staged_insert_state(&app, cx, &id), None);
+    }
+
+    /// Where the target cannot be checked (Wayland), the window the user
+    /// switches to after Insert receives the draft, as with Paste last.
+    #[gpui::test]
+    fn an_unverifiable_staged_insert_types_where_the_user_switches(cx: &mut gpui::TestAppContext) {
+        use starling_insertion::testing::FakeTarget;
+        let opted_in = starling_dictation::settings::InsertionSettings {
+            allow_unverified: true,
+            ..Default::default()
+        };
+        let (_root, app, fake, _id) = staged_insert_take(cx, opted_in, |_| {});
+        fake.set_verifies_target(false);
+        starling_focus(&app, cx, true);
+        press_insert(&app, cx);
+        fake.focus(FakeTarget::named("Chat", "Message"));
+        starling_focus(&app, cx, false);
+        assert_eq!(fake.insertions().len(), 1);
+        assert!(fake.field().ends_with("hello world"), "{}", fake.field());
+    }
+
+    #[gpui::test]
+    fn closing_the_panel_drops_a_pressed_insert(cx: &mut gpui::TestAppContext) {
+        let (_root, app, fake, id) = staged_insert_take(cx, Default::default(), |_| {});
+        starling_focus(&app, cx, true);
+        press_insert(&app, cx);
+        app.update(cx, |app, cx| app.finish_staging(cx));
+        cx.run_until_parked();
+        starling_focus(&app, cx, false);
+        assert!(fake.insertions().is_empty());
+        assert_eq!(staged_insert_state(&app, cx, &id), None);
+    }
+
+    /// A take whose capture failed is reported on Insert, even where an
+    /// unverifiable backend would otherwise capture the window the user
+    /// switched to.
+    #[gpui::test]
+    fn a_failed_capture_is_reported_not_replaced_on_insert(cx: &mut gpui::TestAppContext) {
+        use starling_insertion::InsertError;
+        use starling_insertion::testing::FakeTarget;
+        let opted_in = starling_dictation::settings::InsertionSettings {
+            allow_unverified: true,
+            ..Default::default()
+        };
+        let (_root, app, fake, _id) = staged_insert_take(cx, opted_in, |fake| {
+            fake.set_capture_delay(crate::delivery::CAPTURE_BUDGET * 3);
+        });
+        fake.set_capture_delay(std::time::Duration::ZERO);
+        fake.set_verifies_target(false);
+        starling_focus(&app, cx, true);
+        press_insert(&app, cx);
+        fake.focus(FakeTarget::named("Chat", "Message"));
+        starling_focus(&app, cx, false);
+        assert!(fake.insertions().is_empty());
+        app.read_with(cx, |app, _| {
+            assert!(matches!(
+                app.delivery.recovery.as_ref().unwrap().failure,
+                crate::delivery::Failure::Insert(InsertError::Unavailable { .. })
+            ));
+        });
+    }
+
+    #[gpui::test]
+    fn a_direct_take_still_types_when_its_transcript_lands(cx: &mut gpui::TestAppContext) {
+        use starling_insertion::testing::{FakeBackend, FakeTarget};
+        let root = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::at_test_root(root.path());
+        let fake = std::sync::Arc::new(FakeBackend::new());
+        fake.focus(FakeTarget::named("Editor", "notes.txt"));
+        let inserter = starling_insertion::Inserter::with_backends(vec![Box::new(fake.clone())]);
+        let app = cx.new(|cx| {
+            let mut app = StarlingApp::for_test(Some(store.clone()), cx);
+            app.delivery = crate::delivery::DeliveryState::new(
+                std::sync::Arc::new(inserter),
+                Default::default(),
+            );
+            app
+        });
+        let (id, _) = saved_take(&store);
+        transcribe(&store, &id, "hello world");
+        app.update(cx, |app, cx| {
+            // No staging panel: the take is delivered directly.
+            app.delivery_take_started();
+            let capture = app.delivery_take_stopped();
+            app.bind_delivery(capture, &id);
+            app.apply_sessions(store.list().unwrap());
+            app.after_transcription(id.clone(), cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(fake.field(), "hello world");
+        assert_eq!(fake.insertions().len(), 1);
     }
 
     #[gpui::test]

@@ -140,9 +140,10 @@ pub(crate) fn render_insertion_section(app: &StarlingApp, cx: &mut Context<Starl
         SharedString::from("insertion-auto"),
         draft.auto_insert,
         "Insert into the app you dictated into",
-        "The finished text is typed into the window that had focus when the take started, \
-         without bringing Starling forward or pressing Enter. If that window changed, the text \
-         waits here.",
+        "Typed into the window that had focus when the take started, without pressing Enter. \
+         Direct takes are inserted as soon as their text is final. Staged takes wait in the \
+         draft panel: press Insert when you are ready and switch back. If that window changed, \
+         the text waits here.",
         true,
     )
     .on_click(cx.listener(|this, _, _window, cx| {
@@ -165,9 +166,10 @@ pub(crate) fn render_insertion_section(app: &StarlingApp, cx: &mut Context<Starl
         SharedString::from("insertion-unverified"),
         draft.allow_unverified,
         "Also type where the window cannot be checked",
-        "On Wayland, Starling cannot tell which window has focus: the text goes to whatever is \
-         focused when it is ready. Best effort; a take during which Starling's window was \
-         focused is never typed.",
+        "On Wayland, Starling cannot tell which window has focus: a direct take goes to whatever \
+         is focused when it is ready, and a staged take to the window you switch to after \
+         Insert. Best effort; a direct take during which Starling's window was focused is never \
+         typed.",
         enabled,
     )
     .when(!enabled, |row| row.opacity(0.5))

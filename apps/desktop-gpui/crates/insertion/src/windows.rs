@@ -141,6 +141,16 @@ impl InsertionBackend for WindowsBackend {
     }
 
     fn insert(&self, target: &TargetSnapshot, text: &str) -> Result<InsertReceipt, InsertError> {
+        self.insert_guarded(target, text, &|| None)
+    }
+
+    /// Checks `stop` before and after the target check of every chunk.
+    fn insert_guarded(
+        &self,
+        target: &TargetSnapshot,
+        text: &str,
+        stop: &dyn Fn() -> Option<InsertError>,
+    ) -> Result<InsertReceipt, InsertError> {
         insertion_guards(text, target.pid, &self.excluded_pids)?;
         let Some((_, active, _, _)) = parse_ref(&target.target_ref) else {
             return Err(InsertError::Rejected {
@@ -162,7 +172,14 @@ impl InsertionBackend for WindowsBackend {
         deliver_in_chunks(
             text.chars().count(),
             &segments,
-            || self.chunk_check(&target.target_ref),
+            || {
+                if let Some(error) = stop() {
+                    return Err(error);
+                }
+                self.chunk_check(&target.target_ref)?;
+                // The check can block: the caller may have given up.
+                stop().map_or(Ok(()), Err)
+            },
             |segment, ()| {
                 let events = chunks.next().expect("one chunk per segment");
                 if foreground_id() != active {

@@ -289,9 +289,10 @@ pub trait InsertionBackend: Send + Sync {
     fn insert(&self, target: &TargetSnapshot, text: &str) -> Result<InsertReceipt, InsertError>;
     /// [`insert`](Self::insert), stopping as soon as `stop` returns an
     /// error: the caller can see what the backend cannot (Starling's own
-    /// window taking focus, on Wayland). The default checks once before
-    /// typing; a backend that types key by key checks before every key
-    /// and reports what already went out as a partial delivery.
+    /// window taking focus, on Wayland; an insert given up as stalled).
+    /// The default checks once before typing; the platform backends check
+    /// before every chunk (X11, Windows) or key (Wayland) and report what
+    /// already went out as a partial delivery.
     fn insert_guarded(
         &self,
         target: &TargetSnapshot,

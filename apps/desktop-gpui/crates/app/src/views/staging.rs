@@ -4,6 +4,7 @@
 use gpui::{Context, Div, FontWeight, SharedString, Stateful, Window, div, prelude::*, px};
 
 use crate::app::StarlingApp;
+use crate::delivery::StagedInsert;
 use crate::processing::ProcessingState;
 use crate::staging::StagingPhase;
 use crate::theme;
@@ -80,6 +81,10 @@ pub fn render_staging_panel(
         .unwrap_or_default();
     let processing = app.staging_processing();
     let running = matches!(processing, Some((_, ProcessingState::Running)));
+    let insert = staging
+        .take_id
+        .as_deref()
+        .and_then(|id| app.staged_insert(id));
 
     let status = match phase {
         StagingPhase::Recording => {
@@ -133,6 +138,13 @@ pub fn render_staging_panel(
 
     if let Some(notice) = notice {
         panel = panel.child(note(notice, theme::AMBER));
+    }
+    if insert == Some(StagedInsert::Waiting) {
+        panel = panel.child(note(
+            "Now switch back to the window you dictated into: Starling types the draft there \
+             once its own window loses focus. Nothing is submitted.",
+            theme::MUTED,
+        ));
     }
 
     if let Some((label, state)) = processing {
@@ -284,6 +296,24 @@ pub fn render_staging_panel(
             )
             .child(if copied { "Copied" } else { "Copy" }),
         )
+        .children(insert.map(|insert| {
+            let enabled = match insert {
+                StagedInsert::Ready => ready && !text.is_empty(),
+                StagedInsert::Waiting => true,
+                StagedInsert::Typing | StagedInsert::Inserted => false,
+            };
+            panel_button(
+                "staging-insert",
+                !enabled,
+                cx.listener(|this, _, _window, cx| this.insert_staging(cx)),
+            )
+            .child(match insert {
+                StagedInsert::Ready => "Insert",
+                StagedInsert::Waiting => "Cancel insert",
+                StagedInsert::Typing => "Inserting…",
+                StagedInsert::Inserted => "Inserted",
+            })
+        }))
         .child(
             panel_button(
                 "staging-done",
@@ -296,10 +326,17 @@ pub fn render_staging_panel(
                 "Done"
             }),
         );
-    let hints = if cfg!(target_os = "macos") {
-        "⌥⌫ word · ⌘⇧K visual line · ⌥←/→ jump · ⌘Z undo · ⌘↩ done · Esc leave"
-    } else {
-        "Ctrl+⌫ word · Ctrl+Shift+K visual line · Ctrl+←/→ jump · Ctrl+Z undo · Ctrl+Enter done · Esc leave"
+    let hints = match (cfg!(target_os = "macos"), insert.is_some()) {
+        (true, false) => "⌥⌫ word · ⌘⇧K visual line · ⌥←/→ jump · ⌘Z undo · ⌘↩ done · Esc leave",
+        (true, true) => {
+            "⌥⌫ word · ⌘⇧K visual line · ⌥←/→ jump · ⌘Z undo · ⌘⇧↩ insert · ⌘↩ done · Esc leave"
+        }
+        (false, false) => {
+            "Ctrl+⌫ word · Ctrl+Shift+K visual line · Ctrl+←/→ jump · Ctrl+Z undo · Ctrl+Enter done · Esc leave"
+        }
+        (false, true) => {
+            "Ctrl+⌫ word · Ctrl+Shift+K visual line · Ctrl+←/→ jump · Ctrl+Z undo · Ctrl+Shift+Enter insert · Ctrl+Enter done · Esc leave"
+        }
     };
     panel = panel.child(
         div()
