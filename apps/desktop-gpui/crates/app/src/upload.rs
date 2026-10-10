@@ -1510,7 +1510,7 @@ impl StarlingApp {
             return;
         };
         let id = session.id.clone();
-        if self.active_ids.contains(&id) {
+        if self.active_ids.contains(&id) || self.is_deleting(&id) {
             return;
         }
         self.retry_menu = None;
@@ -1550,8 +1550,7 @@ impl StarlingApp {
             this.update(cx, |app, cx| match loaded {
                 // Superseded by a newer choice, or the take was deleted
                 // while its audio loaded: the pin drops, nothing runs.
-                _ if app.retry_seq != seq
-                    || !app.sessions.iter().any(|session| session.id == id) => {}
+                _ if app.retry_seq != seq || app.retry_target_gone(&id) => {}
                 Ok(Some((wav, pin))) => match with {
                     RetryWith::Current => {
                         let target = app.resolve_take_target();
@@ -1630,7 +1629,7 @@ impl StarlingApp {
                         // was replaced (a mode switch): this wait is over.
                         return true;
                     }
-                    if !app.sessions.iter().any(|session| session.id == pending.take_id) {
+                    if app.retry_target_gone(&pending.take_id) {
                         // Deleted while the model loaded: nothing to retry.
                         app.pending_retry = None;
                         cx.notify();
@@ -1716,6 +1715,13 @@ impl StarlingApp {
             });
         }
         choices
+    }
+
+    /// Whether a retry's take was deleted — confirmed (in flight) or
+    /// already gone from history — so the retry must not run: it would
+    /// only stash the deleted audio back as unsaved.
+    fn retry_target_gone(&self, id: &str) -> bool {
+        self.is_deleting(id) || !self.sessions.iter().any(|session| session.id == id)
     }
 
     /// Opens or closes the drawer's "Retry with" choices for `id`.
@@ -2597,9 +2603,10 @@ mod tests {
         });
         app.update(cx, |app, cx| {
             app.retry_selected_with(RetryWith::Server, cx);
-            // The confirmed delete lands before the load finishes.
+            // The confirmed delete is in flight when the load finishes:
+            // history still lists the take.
+            app.deleting_ids.insert(id.clone());
             store.delete(&id).expect("delete");
-            app.apply_sessions(store.list().expect("list"));
         });
         cx.run_until_parked();
         assert_eq!(*served.lock().unwrap(), 0, "nothing was sent");

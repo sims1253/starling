@@ -3721,11 +3721,16 @@ impl StoreV2 {
         wanted: impl Fn(&str) -> bool,
     ) -> Result<JournalRecovery, StoreV2Error> {
         let mut report = JournalRecovery::default();
-        let Ok(entries) = std::fs::read_dir(journals_dir) else {
-            return Ok(report);
+        // No tree yet is nothing to recover; any other failure to list it
+        // must surface, never read as "no interrupted recordings".
+        let entries = match std::fs::read_dir(journals_dir) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(report),
+            Err(err) => return Err(err.into()),
         };
         let mut paths: Vec<PathBuf> = entries
-            .flatten()
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
             .map(|entry| entry.path())
             .filter(|path| {
                 path.is_file() && path.extension().and_then(|ext| ext.to_str()) == Some("sj")

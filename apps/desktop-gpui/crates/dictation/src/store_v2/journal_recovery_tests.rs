@@ -281,3 +281,12 @@ fn a_second_look_considers_only_the_journals_it_is_asked_about() {
     assert_eq!(report.recovered[0].id, "j_deferred");
     assert!(tree.join("j_recorded_since.sj").exists());
 }
+
+#[test]
+fn an_unreadable_journal_folder_is_an_error_not_an_empty_one() {
+    let dir = TempDir::new().expect("tempdir");
+    let mut store = store_in(&dir);
+    let not_a_dir = dir.path().join("journals-file");
+    std::fs::write(&not_a_dir, b"in the way").expect("file");
+    assert!(store.recover_capture_journals(&not_a_dir).is_err());
+}
