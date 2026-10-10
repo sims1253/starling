@@ -2,7 +2,7 @@
 //! identity and failures under test control, with no X server or
 //! Windows session.
 
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::{
     format_ref, insertion_guards, merge_excluded_pids, BackendKind, InsertError, InsertReceipt,
@@ -53,8 +53,23 @@ struct State {
     destroyed_ref: Option<String>,
     insert_behavior: InsertBehavior,
     revalidate_failure: Option<InsertError>,
+    verifies_target: bool,
+    /// How long `capture` takes, like a display slow to answer.
+    capture_delay: std::time::Duration,
+    /// How long `availability` takes, and how often it was asked.
+    availability_delay: std::time::Duration,
+    availability_checks: usize,
+    /// `capture` panics, like a backend with a bug.
+    capture_panics: bool,
+    key_hook: Option<KeyHook>,
     insertions: Vec<(String, String)>,
+    /// Every key `insert_guarded` sent, in arrival order, as one field
+    /// would receive them.
+    field: String,
 }
+
+/// Runs before each character `insert_guarded` types, with its index.
+type KeyHook = Arc<dyn Fn(usize) + Send + Sync>;
 
 impl State {
     fn current_ref(&self) -> Option<String> {
@@ -94,7 +109,14 @@ impl FakeBackend {
                 destroyed_ref: None,
                 insert_behavior: InsertBehavior::Type,
                 revalidate_failure: None,
+                verifies_target: true,
+                capture_delay: std::time::Duration::ZERO,
+                availability_delay: std::time::Duration::ZERO,
+                availability_checks: 0,
+                capture_panics: false,
+                key_hook: None,
                 insertions: Vec::new(),
+                field: String::new(),
             }),
             excluded_pids: merge_excluded_pids(excluded_pids),
         }
@@ -139,9 +161,52 @@ impl FakeBackend {
         self.state().revalidate_failure = error;
     }
 
+    /// Behave like a backend without target identity (Wayland): only
+    /// [`InsertionBackend::verifies_target`] changes, so tests can drive
+    /// the callers' gating.
+    pub fn set_verifies_target(&self, verifies: bool) {
+        self.state().verifies_target = verifies;
+    }
+
+    /// Make `capture` take `delay` before it answers (with the focus as
+    /// it is then).
+    pub fn set_capture_delay(&self, delay: std::time::Duration) {
+        self.state().capture_delay = delay;
+    }
+
+    /// Make `capture` panic (after its delay) until called with `false`.
+    pub fn set_capture_panics(&self, panics: bool) {
+        self.state().capture_panics = panics;
+    }
+
+    /// Make `availability` take `delay` before it answers, like a
+    /// display that connects but is slow to reply.
+    pub fn set_availability_delay(&self, delay: std::time::Duration) {
+        self.state().availability_delay = delay;
+    }
+
+    /// How many times `availability` was asked.
+    pub fn availability_checks(&self) -> usize {
+        self.state().availability_checks
+    }
+
+    /// Run `hook` with each character's index before `insert_guarded`
+    /// checks its `stop` for that character: lets a test change what the
+    /// caller sees mid-typing.
+    pub fn on_key(&self, hook: impl Fn(usize) + Send + Sync + 'static) {
+        self.state().key_hook = Some(Arc::new(hook));
+    }
+
     /// The `(target_ref, text)` pairs `insert` accepted, in order.
     pub fn insertions(&self) -> Vec<(String, String)> {
         self.state().insertions.clone()
+    }
+
+    /// Every key sent so far, across inserts, in the order it arrived:
+    /// what a single field would hold, so overlapping inserts show up
+    /// mixed.
+    pub fn field(&self) -> String {
+        self.state().field.clone()
     }
 }
 
@@ -150,12 +215,32 @@ impl InsertionBackend for FakeBackend {
         BackendKind::Fake
     }
 
+    fn verifies_target(&self) -> bool {
+        self.state().verifies_target
+    }
+
     fn availability(&self) -> Result<(), InsertError> {
+        let delay = {
+            let mut state = self.state();
+            state.availability_checks += 1;
+            state.availability_delay
+        };
+        if !delay.is_zero() {
+            std::thread::sleep(delay);
+        }
         self.state().availability.clone()
     }
 
     fn capture(&self) -> Result<TargetSnapshot, InsertError> {
+        let delay = self.state().capture_delay;
+        if !delay.is_zero() {
+            std::thread::sleep(delay);
+        }
         let state = self.state();
+        if state.capture_panics {
+            drop(state);
+            panic!("fake backend: capture panicked");
+        }
         let (Some(target), Some(target_ref)) = (state.focus.clone(), state.current_ref()) else {
             return Err(InsertError::Rejected {
                 reason: "no window has input focus".to_string(),
@@ -198,6 +283,19 @@ impl InsertionBackend for FakeBackend {
     }
 
     fn insert(&self, target: &TargetSnapshot, text: &str) -> Result<InsertReceipt, InsertError> {
+        self.insert_guarded(target, text, &|| None)
+    }
+
+    /// Checks the target right before typing, then `stop` before every
+    /// character like the Wayland backend: a failed check types nothing,
+    /// a stop part-way is a partial delivery. The text is recorded only
+    /// when every character went out.
+    fn insert_guarded(
+        &self,
+        target: &TargetSnapshot,
+        text: &str,
+        stop: &dyn Fn() -> Option<InsertError>,
+    ) -> Result<InsertReceipt, InsertError> {
         insertion_guards(text, target.pid, &self.excluded_pids)?;
         match self.revalidate(target)? {
             TargetCheck::Same => {}
@@ -206,23 +304,41 @@ impl InsertionBackend for FakeBackend {
             }
             TargetCheck::Gone => return Err(InsertError::TargetGone),
         }
-        let mut state = self.state();
-        // The live pid decides ownership, like the real backends' checks.
-        let live_pid = state.focus.as_ref().and_then(|focus| focus.pid);
-        if live_pid.is_some_and(|pid| self.excluded_pids.contains(&pid)) {
-            return Err(InsertError::TargetIsStarling);
-        }
-        match state.insert_behavior.clone() {
-            InsertBehavior::Type => {
-                state
-                    .insertions
-                    .push((target.target_ref.clone(), text.to_string()));
-                Ok(InsertReceipt {
-                    evidence: EVIDENCE_SYNTHETIC_KEYS,
-                })
+        let (hook, behavior) = {
+            let state = self.state();
+            // The live pid decides ownership, like the real backends' checks.
+            let live_pid = state.focus.as_ref().and_then(|focus| focus.pid);
+            if live_pid.is_some_and(|pid| self.excluded_pids.contains(&pid)) {
+                return Err(InsertError::TargetIsStarling);
             }
-            InsertBehavior::FailWith(error) => Err(error),
+            (state.key_hook.clone(), state.insert_behavior.clone())
+        };
+        if let InsertBehavior::FailWith(error) = behavior {
+            return Err(error);
         }
+        let total_chars = text.chars().count();
+        for (index, character) in text.chars().enumerate() {
+            if let Some(hook) = &hook {
+                hook(index);
+            }
+            match stop() {
+                None => self.state().field.push(character),
+                Some(error) if index == 0 => return Err(error),
+                Some(error) => {
+                    return Err(InsertError::PartialDelivery {
+                        delivered_chars: index,
+                        total_chars,
+                        cause: Box::new(error),
+                    })
+                }
+            }
+        }
+        self.state()
+            .insertions
+            .push((target.target_ref.clone(), text.to_string()));
+        Ok(InsertReceipt {
+            evidence: EVIDENCE_SYNTHETIC_KEYS,
+        })
     }
 }
 

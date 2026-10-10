@@ -2,7 +2,8 @@
 //! `runtime`). The host wires it with
 //! `RuntimeConfig::with_delivery_adapter`.
 //!
-//! - `prepare` only parses the ref and requires its backend; the binding
+//! - `prepare` only parses the ref and requires its backend, refusing a
+//!   backend that cannot verify targets (Wayland); the binding
 //!   target check happens inside `insert`, immediately before typing. The
 //!   compare token is a digest of the ref, so a token/ref mismatch
 //!   conflicts at apply without a live check.
@@ -13,11 +14,16 @@
 //! - The seam has no conflict channel out of `insert`: a target change
 //!   detected there (including part-way through typing) becomes
 //!   `delivery.failed{reason: target_changed | partial_delivery}`.
+//! - `surrounding_text` is `Text` only where a backend reports it, and
+//!   `Unsupported` otherwise. No backend here can tell a secure or
+//!   incognito field yet, so none answers `Protected`; one that can (the
+//!   IBus engine) must refuse before reading.
 
 use std::sync::Arc;
 
 use starling_runtime::machine::delivery::{
-    DeliveryAdapter, InsertEvidence, InsertionFailure, Revalidation,
+    DeliveryAdapter, InsertEvidence, InsertionFailure, Revalidation, SurroundingRead,
+    SurroundingText,
 };
 
 use crate::{Inserter, InsertionBackend, TargetCheck, TargetSnapshot};
@@ -45,6 +51,9 @@ impl InsertionDeliveryAdapter {
             .inserter
             .backend_for(&snapshot)
             .ok_or("no_backend_for_ref")?;
+        if !backend.verifies_target() {
+            return Err("unverifiable_target");
+        }
         Ok((snapshot, backend))
     }
 }
@@ -100,9 +109,12 @@ impl DeliveryAdapter for InsertionDeliveryAdapter {
             reason: reason.to_string(),
             fallback_suggested: true,
         };
-        let (snapshot, backend) = self.resolve(target_ref).map_err(failure)?;
-        let receipt = backend
-            .insert(&snapshot, text)
+        let (snapshot, _) = self.resolve(target_ref).map_err(failure)?;
+        // Through the inserter, so it runs whole, never overlapping
+        // another insert through the same inserter.
+        let receipt = self
+            .inserter
+            .insert(&snapshot, text, &|| None)
             .map_err(|error| failure(error.code()))?;
         Ok(InsertEvidence {
             level: receipt.evidence.to_string(),
@@ -111,6 +123,20 @@ impl DeliveryAdapter for InsertionDeliveryAdapter {
 
     fn describe(&self) -> String {
         format!("starling-insertion ({})", self.inserter.describe())
+    }
+
+    fn surrounding_text(&self, target_ref: &str) -> SurroundingRead {
+        let Ok((snapshot, backend)) = self.resolve(target_ref) else {
+            return SurroundingRead::Unsupported;
+        };
+        match backend.surrounding_text(&snapshot) {
+            Ok(Some(text)) => SurroundingRead::Text(SurroundingText {
+                before: text.before,
+                after: text.after,
+                showing_hint: false,
+            }),
+            Ok(None) | Err(_) => SurroundingRead::Unsupported,
+        }
     }
 }
 
@@ -125,6 +151,20 @@ mod tests {
         fake.focus(FakeTarget::named("Notes", "Meeting notes"));
         let inserter = Inserter::with_backends(vec![Box::new(fake.clone())]);
         (fake, InsertionDeliveryAdapter::new(Arc::new(inserter)))
+    }
+
+    #[test]
+    fn surrounding_text_is_unsupported_where_no_backend_reports_it() {
+        let (fake, adapter) = session();
+        let target = fake.capture().unwrap();
+        assert_eq!(
+            adapter.surrounding_text(&target.target_ref),
+            SurroundingRead::Unsupported
+        );
+        assert_eq!(
+            adapter.surrounding_text("not a ref"),
+            SurroundingRead::Unsupported
+        );
     }
 
     fn failure_reason(result: Result<InsertEvidence, InsertionFailure>) -> String {
@@ -147,6 +187,20 @@ mod tests {
         // No X11 backend in this session, and garbage.
         assert!(adapter.prepare("x11:1:2:3").is_err());
         assert!(adapter.prepare("not-a-ref").is_err());
+    }
+
+    #[test]
+    fn prepare_refuses_a_backend_that_cannot_verify_its_targets() {
+        let (fake, adapter) = session();
+        let target = fake.capture().unwrap();
+        fake.set_verifies_target(false);
+        let refused = adapter.prepare(&target.target_ref).unwrap_err();
+        assert!(refused.contains("unverifiable_target"), "{refused}");
+        assert_eq!(
+            failure_reason(adapter.insert("d1", &target.target_ref, "hello")),
+            "unverifiable_target"
+        );
+        assert!(fake.insertions().is_empty());
     }
 
     #[test]

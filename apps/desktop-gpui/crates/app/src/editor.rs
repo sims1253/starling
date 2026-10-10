@@ -66,6 +66,7 @@ actions!(
         Cut,
         Paste,
         Submit,
+        InsertDraft,
         Leave,
     ]
 );
@@ -117,6 +118,7 @@ pub fn bind_keys(cx: &mut App) {
         gpui::KeyBinding::new("secondary-x", Cut, editor),
         gpui::KeyBinding::new("secondary-v", Paste, editor),
         gpui::KeyBinding::new("secondary-enter", Submit, editor),
+        gpui::KeyBinding::new("secondary-shift-enter", InsertDraft, editor),
         gpui::KeyBinding::new("escape", Leave, editor),
     ]);
 }
@@ -134,6 +136,8 @@ pub(crate) enum EditorEvent {
     Edit(TextEdit),
     /// Secondary+Enter: the user is done with the draft.
     Submit,
+    /// Secondary+Shift+Enter: type the draft where the take started.
+    Insert,
     /// Escape: hand focus back to the app.
     Leave,
 }
@@ -1198,6 +1202,7 @@ impl Render for StagingEditor {
                 }
             }))
             .on_action(cx.listener(|_, _: &Submit, _, cx| cx.emit(EditorEvent::Submit)))
+            .on_action(cx.listener(|_, _: &InsertDraft, _, cx| cx.emit(EditorEvent::Insert)))
             .on_action(cx.listener(|_, _: &Leave, _, cx| cx.emit(EditorEvent::Leave)))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))

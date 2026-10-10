@@ -71,6 +71,9 @@ pub(crate) enum OverlayPhase {
     Processing,
     /// The text is being inserted into the target (#220).
     Delivering,
+    /// A staged take's Insert was pressed: it types once focus leaves
+    /// Starling's window.
+    InsertWaiting,
     /// The take's transcript is in Starling.
     Ready,
     /// The text landed in the target.
@@ -95,6 +98,7 @@ impl OverlayPhase {
             OverlayPhase::Finishing => "Finishing recognition…",
             OverlayPhase::Processing => "Processing…",
             OverlayPhase::Delivering => "Inserting…",
+            OverlayPhase::InsertWaiting => "Switch to the window to insert",
             OverlayPhase::Ready => "Transcript ready in Starling",
             OverlayPhase::Delivered => "Inserted",
             OverlayPhase::DeliveryFailed => "Insert failed — your text is in Starling",
@@ -105,12 +109,12 @@ impl OverlayPhase {
 
 /// How delivering the take's text is going. Fed by the insertion path
 /// (`StarlingApp::set_delivery_status`); the overlay only displays it.
-/// Nothing feeds it yet: the insertion path (#220) lands separately.
-#[allow(dead_code)]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) enum DeliveryStatus {
     #[default]
     Idle,
+    /// A staged take's Insert waits for focus to leave Starling.
+    Waiting,
     Delivering,
     Delivered,
     /// Why it failed, in the user's words.
@@ -208,8 +212,14 @@ impl OverlayModel {
         }
     }
 
+    /// A new outcome (inserted, failed) shows for its full linger even
+    /// when it repeats the last one.
     pub(crate) fn set_delivery(&mut self, status: DeliveryStatus, now: Instant) {
-        if self.delivery != status {
+        let outcome = matches!(
+            status,
+            DeliveryStatus::Delivered | DeliveryStatus::Failed(_)
+        );
+        if self.delivery != status || outcome {
             self.delivery = status;
             self.delivery_since = now;
         }
@@ -235,8 +245,10 @@ impl OverlayModel {
             Some(Readiness::Listening) => return Some(OverlayPhase::Listening),
             None => {}
         }
-        if self.delivery == DeliveryStatus::Delivering {
-            return Some(OverlayPhase::Delivering);
+        match self.delivery {
+            DeliveryStatus::Delivering => return Some(OverlayPhase::Delivering),
+            DeliveryStatus::Waiting => return Some(OverlayPhase::InsertWaiting),
+            _ => {}
         }
         match &self.follow {
             Follow::Saving(_) => return Some(OverlayPhase::Finishing),
@@ -413,6 +425,9 @@ pub(crate) struct Overlay {
     /// The staging draft of the take on the overlay (staged dictation):
     /// the live text shows that draft and no other.
     pub(crate) staging_token: Option<u64>,
+    /// The compositor closed the overlay: it stays closed until the next
+    /// take rather than reopening at once.
+    pub(crate) dismissed: bool,
     /// The live text last shown for the take on the overlay, kept once
     /// its source is gone (the direct-mode partial is cleared at stop, a
     /// saved draft can be dismissed) until the next take.
@@ -430,6 +445,7 @@ impl Overlay {
             generation: 0,
             scale: 1.,
             staging_token: None,
+            dismissed: false,
             live_text: RefCell::default(),
         }
     }
@@ -445,7 +461,6 @@ impl Overlay {
 impl StarlingApp {
     /// What the insertion path reports about delivering the take's text
     /// (#220); the overlay shows it.
-    #[allow(dead_code)]
     pub(crate) fn set_delivery_status(&mut self, status: DeliveryStatus, cx: &mut Context<Self>) {
         self.overlay.model.set_delivery(status, Instant::now());
         self.sync_overlay(cx);
@@ -455,6 +470,7 @@ impl StarlingApp {
     /// draft when it has one.
     pub(crate) fn overlay_take_started(&mut self) {
         self.overlay.model.take_started(Instant::now());
+        self.overlay.dismissed = false;
         self.overlay.live_text.get_mut().clear();
         self.overlay.staging_token = self
             .staging
@@ -519,13 +535,37 @@ impl StarlingApp {
         if stale_window || stale_open {
             self.close_overlay(cx);
         }
-        if visible && self.overlay.window.is_none() && self.overlay.opening.is_none() {
+        if visible
+            && !self.overlay.dismissed
+            && self.overlay.window.is_none()
+            && self.overlay.opening.is_none()
+        {
             self.open_overlay(mode, cx);
         }
         if changed {
             if let Some(window) = self.overlay.window {
                 window.update(cx, |_, _, cx| cx.notify()).ok();
             }
+        }
+    }
+
+    /// An overlay window went away, closed here or by the compositor. A
+    /// closed window reports no focus loss: delivery forgets its focus
+    /// unless another overlay window is the one kept. The kept window
+    /// closed by the compositor is let go, and the next take opens a new
+    /// one.
+    pub(crate) fn overlay_window_released(
+        &mut self,
+        handle: AnyWindowHandle,
+        cx: &mut Context<Self>,
+    ) {
+        let kept = self.overlay.window.map(AnyWindowHandle::from);
+        if kept == Some(handle) {
+            self.overlay.window = None;
+            self.overlay.dismissed = true;
+        }
+        if kept.is_none() || kept == Some(handle) {
+            self.delivery_overlay_activation(false, cx);
         }
     }
 
@@ -537,6 +577,8 @@ impl StarlingApp {
                 .update(cx, |_, window, _| window.remove_window())
                 .ok();
         }
+        // A removed window reports no focus loss.
+        self.delivery_overlay_activation(false, cx);
     }
 
     fn open_overlay(&mut self, mode: OverlayMode, cx: &mut Context<Self>) {
@@ -603,8 +645,8 @@ impl StarlingApp {
             if !current {
                 return;
             }
-            let opened = cx.open_window(options, |_window, cx| {
-                cx.new(|cx| OverlayView::new(app, cx))
+            let opened = cx.open_window(options, |window, cx| {
+                cx.new(|cx| OverlayView::new(app, window, cx))
             });
             let kept = this.update(cx, |this, cx| {
                 let current = this.overlay.generation == generation;
@@ -623,6 +665,9 @@ impl StarlingApp {
                         window
                             .update(cx, |_, window, _| window.remove_window())
                             .ok();
+                        if this.overlay.window.is_none() {
+                            this.delivery_overlay_activation(false, cx);
+                        }
                     }
                     Err(err) => eprintln!("Could not open the dictation overlay: {err}"),
                 }
@@ -697,6 +742,32 @@ fn screen_is_x11() -> bool {
     cfg!(target_os = "linux")
         && std::env::var_os("WAYLAND_DISPLAY").is_none()
         && std::env::var_os("DISPLAY").is_some()
+}
+
+#[cfg(test)]
+mod window_tests {
+    use super::*;
+
+    /// An overlay the compositor closes is let go: the handle is cleared,
+    /// it stays closed for the take, and the next take may open one.
+    #[gpui::test]
+    fn a_compositor_closed_overlay_is_let_go(cx: &mut gpui::TestAppContext) {
+        let app = cx.new(|cx| StarlingApp::for_test(None, cx));
+        let weak = app.downgrade();
+        let overlay =
+            cx.add_window(|window, cx| crate::views::overlay::OverlayView::new(weak, window, cx));
+        app.update(cx, |app, _| app.overlay.window = Some(overlay));
+        overlay
+            .update(cx, |_, window, _| window.remove_window())
+            .unwrap();
+        cx.run_until_parked();
+        app.update(cx, |app, _| {
+            assert!(app.overlay.window.is_none());
+            assert!(app.overlay.dismissed);
+            app.overlay_take_started();
+            assert!(!app.overlay.dismissed);
+        });
+    }
 }
 
 #[cfg(test)]
@@ -847,6 +918,11 @@ mod tests {
         let mut model = OverlayModel::new(t0);
         model.take_finished(t0);
         model.take_saved(t0, "take-1");
+        model.set_delivery(DeliveryStatus::Waiting, t0);
+        assert_eq!(
+            model.phase(None, idle(), false, t0),
+            Some(OverlayPhase::InsertWaiting)
+        );
         model.set_delivery(DeliveryStatus::Delivering, t0);
         assert_eq!(
             model.phase(None, idle(), false, t0),
@@ -864,6 +940,13 @@ mod tests {
             Some(OverlayPhase::DeliveryFailed)
         );
         assert_eq!(model.phase(None, idle(), false, t1 + FAILURE_LINGER), None);
+        // The same failure again is a new outcome: it shows again.
+        let t2 = t1 + FAILURE_LINGER + ms(5);
+        model.set_delivery(DeliveryStatus::Failed("target closed".into()), t2);
+        assert_eq!(
+            model.phase(None, idle(), false, t2),
+            Some(OverlayPhase::DeliveryFailed)
+        );
 
         model.set_delivery(DeliveryStatus::Delivered, t1);
         assert_eq!(

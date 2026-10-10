@@ -3,6 +3,7 @@
 //! `apps/desktop/src/App.tsx` and the metrics in `styles.css`.
 
 mod capture;
+mod delivery;
 mod drawer;
 mod feedback;
 mod history;

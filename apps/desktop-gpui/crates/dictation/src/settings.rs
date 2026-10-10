@@ -106,6 +106,11 @@ pub struct Settings {
     /// subsection loads off and never costs the rest of the file.
     #[serde(default, deserialize_with = "lenient_storage")]
     pub storage: StorageSettings,
+    /// Type finished takes into the app they were dictated in (#221). An
+    /// unreadable subsection loads its defaults without costing the rest
+    /// of the file.
+    #[serde(default, deserialize_with = "lenient_insertion")]
+    pub insertion: InsertionSettings,
 }
 
 /// Retention limits for one class of history audio (#342). `None` is no
@@ -257,6 +262,55 @@ where
     }))
 }
 
+/// The insertion subsection of the settings file (#221). Typing is on by
+/// default, also when the subsection is missing or unreadable: it is what
+/// a take is for. It only types into the window the take started in, and
+/// where that window cannot be checked, only with `allow_unverified`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct InsertionSettings {
+    /// Type a finished take into the window that had focus when it
+    /// started. Off: the take only lands in Starling (copy it from there).
+    pub auto_insert: bool,
+    /// Also type where the target window cannot be verified (Wayland's
+    /// virtual keyboard types into whatever has focus when the text is
+    /// ready). Opt-in.
+    pub allow_unverified: bool,
+}
+
+impl Default for InsertionSettings {
+    fn default() -> Self {
+        Self {
+            auto_insert: true,
+            allow_unverified: false,
+        }
+    }
+}
+
+fn lenient_insertion<'de, D>(deserializer: D) -> Result<InsertionSettings, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = <serde_json::Value as serde::Deserialize>::deserialize(deserializer)?;
+    Ok(lenient_insertion_value(value))
+}
+
+/// Field by field, like [`lenient_dictation_value`]: a bad
+/// `allowUnverified` must never turn a chosen copy-only back into typing.
+fn lenient_insertion_value(value: serde_json::Value) -> InsertionSettings {
+    if !value.is_object() {
+        eprintln!("Unreadable insertion settings ({value}); using the defaults");
+        return InsertionSettings::default();
+    }
+    let defaults = InsertionSettings::default();
+    InsertionSettings {
+        auto_insert: lenient_field("insertion", &value, "autoInsert", || defaults.auto_insert),
+        allow_unverified: lenient_field("insertion", &value, "allowUnverified", || {
+            defaults.allow_unverified
+        }),
+    }
+}
+
 impl Default for PlaybackSettings {
     fn default() -> Self {
         Self {
@@ -332,7 +386,7 @@ impl Default for DictationSettings {
 
 /// Reads the `dictation` value without ever failing the whole file, and
 /// without ever discarding one field's bad value along with its readable
-/// ones: each field is read on its own ([`lenient_dictation_field`]), so
+/// ones: each field is read on its own ([`lenient_field`]), so
 /// `{"shortcut": 7, "activation": "hold"}` keeps the activation. An
 /// unknown `activation` string still resolves to `HoldOrToggle`
 /// (`serde(other)`), and a non-object (`5`, `null`) is all-defaults —
@@ -346,23 +400,24 @@ where
     Ok(lenient_dictation_value(value))
 }
 
-/// One field of the `dictation` object, read on its own: a value this
+/// One field of a `section` object, read on its own: a value this
 /// build cannot read (a wrong type) costs only that field, which falls
 /// back to `default` with the reason logged — the file's other choices
 /// survive. A missing key is simply the default, silently, exactly as
 /// `serde(default)` would have it.
-fn lenient_dictation_field<T: serde::de::DeserializeOwned>(
-    dictation: &serde_json::Value,
+fn lenient_field<T: serde::de::DeserializeOwned>(
+    section: &str,
+    object: &serde_json::Value,
     key: &str,
     default: impl FnOnce() -> T,
 ) -> T {
-    let Some(value) = dictation.get(key) else {
+    let Some(value) = object.get(key) else {
         return default();
     };
     match serde_json::from_value(value.clone()) {
         Ok(value) => value,
         Err(err) => {
-            eprintln!("Unreadable dictation field `{key}`; using its default: {err}");
+            eprintln!("Unreadable {section} field `{key}`; using its default: {err}");
             default()
         }
     }
@@ -377,9 +432,16 @@ fn lenient_dictation_value(value: serde_json::Value) -> DictationSettings {
         return DictationSettings::default();
     }
     DictationSettings {
-        shortcut: lenient_dictation_field(&value, "shortcut", || DEFAULT_SHORTCUT.to_string()),
-        activation: lenient_dictation_field(&value, "activation", ActivationMode::default),
-        double_tap_hands_free: lenient_dictation_field(&value, "doubleTapHandsFree", bool::default),
+        shortcut: lenient_field("dictation", &value, "shortcut", || {
+            DEFAULT_SHORTCUT.to_string()
+        }),
+        activation: lenient_field("dictation", &value, "activation", ActivationMode::default),
+        double_tap_hands_free: lenient_field(
+            "dictation",
+            &value,
+            "doubleTapHandsFree",
+            bool::default,
+        ),
     }
 }
 
@@ -453,6 +515,7 @@ impl Settings {
             playback: PlaybackSettings::default(),
             feedback: FeedbackSettings::default(),
             storage: StorageSettings::default(),
+            insertion: InsertionSettings::default(),
         }
     }
 
@@ -556,6 +619,8 @@ impl Settings {
         // Likewise the microphone choice: an unreadable sibling key must
         // not silently move recording to another device.
         let microphone_subtree = value.get("microphone").cloned();
+        // And copy-only must not silently turn back into typing (#221).
+        let insertion_subtree = value.get("insertion").cloned();
         let Ok(mut settings) = serde_json::from_value::<Settings>(value) else {
             // The same field-wise leniency as the `dictation` attribute:
             // an unreadable sibling key must not cost the user their
@@ -574,6 +639,9 @@ impl Settings {
                 .map(lenient_microphone_value)
                 .unwrap_or_default();
             fallback.dictation = dictation;
+            fallback.insertion = insertion_subtree
+                .map(lenient_insertion_value)
+                .unwrap_or_default();
             return Some(fallback);
         };
         if legacy_file {
@@ -743,6 +811,10 @@ mod tests {
                 cue_volume_percent: 35,
             },
             storage: StorageSettings::default(),
+            insertion: InsertionSettings {
+                auto_insert: false,
+                allow_unverified: true,
+            },
         };
 
         settings.save(&path).expect("save");
@@ -1211,6 +1283,66 @@ mod tests {
         let raw = std::fs::read_to_string(&path).expect("read");
         assert!(raw.contains("\"maxAgeDays\": 365"), "{raw}");
         assert_eq!(Settings::load(&path), settings);
+    }
+
+    #[test]
+    fn insertion_settings_read_back_what_serde_writes() {
+        // The lenient reader names the keys itself; a non-default value
+        // in every field keeps it in step with the serialized names.
+        let written = InsertionSettings {
+            auto_insert: !InsertionSettings::default().auto_insert,
+            allow_unverified: !InsertionSettings::default().allow_unverified,
+        };
+        let value = serde_json::to_value(written).expect("serialize");
+        assert_eq!(lenient_insertion_value(value), written);
+    }
+
+    #[test]
+    fn insertion_settings_load_leniently() {
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("settings.json");
+        let load = |insertion: &str| {
+            std::fs::write(
+                &path,
+                format!(
+                    r#"{{"endpoint":"http://10.0.0.5:8181","model":"m","expectedTerms":[]{insertion}}}"#
+                ),
+            )
+            .expect("write");
+            Settings::load(&path)
+        };
+        // Missing subsection: the defaults (typing on, unverified off).
+        assert_eq!(load("").insertion, InsertionSettings::default());
+        assert_eq!(
+            load(r#","insertion":{"autoInsert":false}"#).insertion,
+            InsertionSettings {
+                auto_insert: false,
+                allow_unverified: false,
+            }
+        );
+        // One unreadable field costs only that field: copy-only stays.
+        assert_eq!(
+            load(r#","insertion":{"autoInsert":false,"allowUnverified":"false"}"#).insertion,
+            InsertionSettings {
+                auto_insert: false,
+                allow_unverified: false,
+            }
+        );
+        // So does an unreadable sibling key that fails the whole file.
+        let fallback = load(r#","insertion":{"autoInsert":false},"engine":{"mode":7}"#);
+        assert!(!fallback.insertion.auto_insert);
+        for insertion in [
+            r#","insertion":null"#,
+            r#","insertion":{"autoInsert":"yes"}"#,
+        ] {
+            let loaded = load(insertion);
+            assert_eq!(
+                loaded.insertion,
+                InsertionSettings::default(),
+                "{insertion}"
+            );
+            assert_eq!(loaded.endpoint, "http://10.0.0.5:8181", "{insertion}");
+        }
     }
 
     #[test]

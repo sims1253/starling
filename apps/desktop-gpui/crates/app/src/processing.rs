@@ -780,13 +780,21 @@ impl StarlingApp {
     /// (a re-transcription) no longer applies, whether or not the mode
     /// processes the new one.
     pub(crate) fn after_transcription(&mut self, id: String, cx: &mut Context<Self>) {
-        // A staged take rebases its draft instead (#297).
+        // A staged take rebases its draft instead (#297), and is typed
+        // only when the user presses Insert in its panel.
         if self.staged_transcript(&id, cx) {
+            if !self.staging_shows(&id) {
+                // Its panel is closed: nothing can press Insert.
+                self.forget_delivery(&id);
+            }
             return;
         }
         self.processing.remove(&id);
         self.drafts.remove(&id);
         self.processing_loading.remove(&id);
+        // The raw transcript is the take's text; processing results
+        // arrive later as proposals, never typed by themselves.
+        self.deliver_finished_take(&id, cx);
         if self.mode_processes() {
             self.process_take(id, cx);
         } else {

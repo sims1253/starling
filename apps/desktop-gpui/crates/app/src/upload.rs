@@ -399,6 +399,8 @@ impl StarlingApp {
             let stopped_at = Instant::now();
             // The staging panel keeps its draft while the take is saved.
             let staging = self.stop_staging();
+            // Where the take's text goes (#221) travels with it too.
+            let delivery = self.delivery_take_stopped();
             match handle.stop() {
                 // The device failed after the last input check: the take
                 // was interrupted and is never transcribed as complete.
@@ -481,6 +483,7 @@ impl StarlingApp {
                                         stream,
                                         Some(stopped_at),
                                         staging,
+                                        delivery,
                                         target,
                                         cx,
                                     );
@@ -568,6 +571,9 @@ impl StarlingApp {
     /// opened (the reason is in the error banner). Only the activation
     /// machine calls this (an `Effect::Start`).
     pub(crate) fn start_recording(&mut self, cx: &mut Context<Self>) -> bool {
+        // Where the take's text goes (#221): captured first, before the
+        // microphone or anything else can move focus.
+        self.delivery_take_started();
         self.error = None;
         self.take_notice = None;
         // Attenuation begins with the attempt, before the microphone opens
@@ -593,6 +599,7 @@ impl StarlingApp {
                 .ok();
             if let Some(reading) = disk_reading.filter(|reading| reading.level == DiskLevel::Critical)
             {
+                self.delivery_take_stopped();
                 if let Some(lease) = playback_lease {
                     self.playback.handle().end(lease);
                 }
@@ -663,6 +670,7 @@ impl StarlingApp {
                     true
                 }
                 Err(err) => {
+                    self.delivery_take_stopped();
                     if let Some(lease) = playback_lease {
                         self.playback.handle().end(lease);
                     }
@@ -694,6 +702,8 @@ impl StarlingApp {
         cx: &mut Context<Self>,
     ) {
         self.end_playback_lease();
+        // A cancelled take delivers nothing (#221).
+        self.delivery_take_stopped();
         let Some(handle) = self.recorder.take() else {
             return;
         };
@@ -931,6 +941,7 @@ impl StarlingApp {
         stream: Option<LiveStream>,
         stopped_at: Option<Instant>,
         staging: Option<u64>,
+        delivery: Option<crate::delivery::Capture>,
         target: TakeTarget,
         cx: &mut Context<Self>,
     ) {
@@ -979,6 +990,7 @@ impl StarlingApp {
                         if let Some(token) = staging {
                             app.bind_staging(token, &saved.id);
                         }
+                        app.bind_delivery(delivery, &saved.id);
                         app.transcribe_with_stream(saved.id, saved.wav, stream, target, None, cx);
                     })
                     .ok();
@@ -1403,8 +1415,10 @@ impl StarlingApp {
             this.update(cx, |app, cx| {
                 app.active_ids.remove(&id);
                 if !transcribed {
-                    // No processing will run for this take.
+                    // No processing will run for this take, and nothing
+                    // is typed for it: a retry is a new, explicit job.
                     app.stop_instants.remove(&id);
+                    app.forget_delivery(&id);
                     app.staging_transcription_failed(&id, cx);
                 }
                 cx.notify();
@@ -1450,6 +1464,7 @@ impl StarlingApp {
                                 let target = app.resolve_take_target();
                                 app.save_and_transcribe(
                                     Arc::new(prepared.wav),
+                                    None,
                                     None,
                                     None,
                                     None,

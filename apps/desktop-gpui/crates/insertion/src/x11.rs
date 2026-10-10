@@ -257,6 +257,17 @@ impl InsertionBackend for X11Backend {
     }
 
     fn insert(&self, target: &TargetSnapshot, text: &str) -> Result<InsertReceipt, InsertError> {
+        self.insert_guarded(target, text, &|| None)
+    }
+
+    /// Checks `stop` before every chunk and, after each key's checks and
+    /// its Shift, right before its key-down.
+    fn insert_guarded(
+        &self,
+        target: &TargetSnapshot,
+        text: &str,
+        stop: &dyn Fn() -> Option<InsertError>,
+    ) -> Result<InsertReceipt, InsertError> {
         insertion_guards(text, target.pid, &self.excluded_pids)?;
         let _insert_lock = INSERT_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
         let session = Session::open()?;
@@ -292,9 +303,12 @@ impl InsertionBackend for X11Backend {
         let typed = deliver_in_chunks(
             text.chars().count(),
             &segments,
-            || self.chunk_check(&session, &target.target_ref),
+            || match stop() {
+                Some(error) => Err(error),
+                None => self.chunk_check(&session, &target.target_ref),
+            },
             |segment, state| {
-                self.type_segment(&session, &plans, &target.target_ref, &state, segment)
+                self.type_segment(&session, &plans, &target.target_ref, &state, segment, stop)
             },
         );
         with_restore_outcome(typed, remap.finish())
@@ -1002,9 +1016,11 @@ impl X11Backend {
         target_ref: &str,
         state: &KeyboardState,
         segment: &str,
+        stop: &dyn Fn() -> Option<InsertError>,
     ) -> Result<(), ChunkFailure> {
         for (typed, character) in segment.chars().enumerate() {
-            self.type_character(session, &plans[&character], target_ref, state, character)
+            let plan = &plans[&character];
+            self.type_character(session, plan, target_ref, state, character, stop)
                 .map_err(|failure| match failure {
                     CharFailure::BeforeKeydown(cause) => ChunkFailure {
                         delivered: typed,
@@ -1028,6 +1044,7 @@ impl X11Backend {
         target_ref: &str,
         state: &KeyboardState,
         character: char,
+        stop: &dyn Fn() -> Option<InsertError>,
     ) -> Result<(), CharFailure> {
         use CharFailure::{AfterKeydown, BeforeKeydown};
         let (keycode, shift) = match plan {
@@ -1050,10 +1067,20 @@ impl X11Backend {
             self.check_target(session, target_ref)
                 .map_err(BeforeKeydown)?;
             verify_mapping(session, character, plan).map_err(BeforeKeydown)?;
+            // The checks above can block on the server: the caller may
+            // have given up meanwhile.
+            if let Some(error) = stop() {
+                return Err(BeforeKeydown(error));
+            }
             if let Some(shift) = shift {
                 pressed
                     .press(shift)
                     .map_err(|e| BeforeKeydown(reply_error(e)))?;
+                // Shift's key-down waits for the server too; dropping
+                // `pressed` releases it.
+                if let Some(error) = stop() {
+                    return Err(BeforeKeydown(error));
+                }
             }
             // A refused key-down did not happen; a transport failure may
             // have delivered it.

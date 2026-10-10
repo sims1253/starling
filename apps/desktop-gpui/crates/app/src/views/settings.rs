@@ -41,6 +41,7 @@ pub fn render_settings_modal(
     let playback_section = render_playback_section(app, cx);
     let feedback_section = crate::views::feedback::render_feedback_section(app, cx);
     let storage_section = crate::views::storage::render_storage_section(app, cx);
+    let insertion_section = crate::views::delivery::render_insertion_section(app, cx);
 
     let card = div()
         .id("settings-card")
@@ -174,6 +175,7 @@ pub fn render_settings_modal(
         .child(playback_section)
         .child(feedback_section)
         .child(storage_section)
+        .child(insertion_section)
         .child(processing_section)
         .child(
             div()

@@ -142,16 +142,39 @@ impl StarlingApp {
 pub(crate) struct OverlayView {
     app: WeakEntity<StarlingApp>,
     _observe: Option<Subscription>,
+    _activation: Subscription,
+    _release: Subscription,
 }
 
 impl OverlayView {
-    pub(crate) fn new(app: WeakEntity<StarlingApp>, cx: &mut Context<Self>) -> Self {
+    pub(crate) fn new(
+        app: WeakEntity<StarlingApp>,
+        window: &mut gpui::Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let observe = app
             .upgrade()
             .map(|app| cx.observe(&app, |_, _, cx| cx.notify()));
+        // Delivery counts the overlay as Starling's own window should a
+        // compositor give it focus (#221).
+        let activation = cx.observe_window_activation(window, |view, window, cx| {
+            let active = window.is_window_active();
+            view.app
+                .update(cx, |app, cx| app.delivery_overlay_activation(active, cx))
+                .ok();
+        });
+        // A window the compositor closes reports no focus loss.
+        let handle = window.window_handle();
+        let release = cx.on_release(move |view, cx| {
+            view.app
+                .update(cx, |app, cx| app.overlay_window_released(handle, cx))
+                .ok();
+        });
         Self {
             app,
             _observe: observe,
+            _activation: activation,
+            _release: release,
         }
     }
 }
@@ -162,7 +185,8 @@ fn phase_color(phase: OverlayPhase) -> gpui::Rgba {
         OverlayPhase::StartingMic
         | OverlayPhase::Finishing
         | OverlayPhase::Processing
-        | OverlayPhase::Delivering => theme::AMBER,
+        | OverlayPhase::Delivering
+        | OverlayPhase::InsertWaiting => theme::AMBER,
         OverlayPhase::Ready | OverlayPhase::Delivered => theme::LIME,
         OverlayPhase::DeliveryFailed | OverlayPhase::Stopped => theme::CORAL,
     }
@@ -196,6 +220,7 @@ impl Render for OverlayView {
         let busy = !matches!(
             state.phase,
             OverlayPhase::Listening
+                | OverlayPhase::InsertWaiting
                 | OverlayPhase::Ready
                 | OverlayPhase::Delivered
                 | OverlayPhase::DeliveryFailed

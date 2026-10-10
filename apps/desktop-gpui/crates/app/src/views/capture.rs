@@ -186,6 +186,13 @@ pub fn render_capture(
         })
         .child(render_import_button(cx))
         .children(render_banner(app, cx))
+        // The error banner holds the bottom: words that did not reach
+        // their window (#221) wait at the top instead of behind it.
+        .children(if app.error.is_some() || !app.unsaved.is_empty() {
+            crate::views::delivery::render_recovery(app, true, cx)
+        } else {
+            None
+        })
 }
 
 fn render_recorder(
@@ -560,6 +567,11 @@ fn unsaved_footer_line(count: usize) -> String {
 
 fn render_banner(app: &mut StarlingApp, cx: &mut Context<StarlingApp>) -> Option<impl IntoElement> {
     if app.error.is_none() && app.unsaved.is_empty() {
+        // Words that did not reach their window (#221) outrank every
+        // other notice.
+        if let Some(recovery) = crate::views::delivery::render_recovery(app, false, cx) {
+            return Some(recovery);
+        }
         // Two independent ephemeral notices share this slot; the capture
         // warning outranks a one-off export rename (banner_notice in
         // `app.rs` is the tested form of that priority).

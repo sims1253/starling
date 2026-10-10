@@ -25,16 +25,24 @@
 //!
 //! A [`TargetSnapshot`]'s identity is its `target_ref`, a
 //! process-independent safeToken string (`x11:<active>:<focus>[:<pid>]`,
-//! `win:<hwnd>:<focus>:<pid>`, `fake:...`; ids in hex), so the runtime
-//! host can revalidate a ref the app captured.
+//! `win:<hwnd>:<focus>:<pid>`, `wl:<capture>:0`, `fake:...`; ids in hex),
+//! so the runtime host can revalidate a ref the app captured.
+//!
+//! A backend whose protocol cannot identify the focused target (Wayland)
+//! reports [`InsertionBackend::verifies_target`] `false`: its refs carry
+//! no identity and its `revalidate` cannot see a change, so callers must
+//! gate on it.
 
 use std::fmt;
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 #[cfg(feature = "runtime")]
 pub mod runtime;
 #[cfg(any(test, feature = "test-doubles"))]
 pub mod testing;
+#[cfg(target_os = "linux")]
+pub mod wayland;
 #[cfg(windows)]
 pub mod windows;
 #[cfg(target_os = "linux")]
@@ -51,6 +59,8 @@ const MODIFIER_POLL_INTERVAL: Duration = Duration::from_millis(20);
 pub enum BackendKind {
     X11,
     Windows,
+    /// Wayland's virtual keyboard: no target identity.
+    Wayland,
     /// The scripted test double (feature `test-doubles`).
     Fake,
 }
@@ -61,14 +71,20 @@ impl BackendKind {
         match self {
             BackendKind::X11 => "x11",
             BackendKind::Windows => "win",
+            BackendKind::Wayland => "wl",
             BackendKind::Fake => "fake",
         }
     }
 
     fn from_scheme(scheme: &str) -> Option<Self> {
-        [BackendKind::X11, BackendKind::Windows, BackendKind::Fake]
-            .into_iter()
-            .find(|kind| kind.scheme() == scheme)
+        [
+            BackendKind::X11,
+            BackendKind::Windows,
+            BackendKind::Wayland,
+            BackendKind::Fake,
+        ]
+        .into_iter()
+        .find(|kind| kind.scheme() == scheme)
     }
 }
 
@@ -247,6 +263,13 @@ impl std::error::Error for InsertError {}
 /// delivery actor, which has no async runtime.
 pub trait InsertionBackend: Send + Sync {
     fn kind(&self) -> BackendKind;
+    /// Whether `capture` identifies the target and `revalidate` can see
+    /// it change. `false` (Wayland) means a ref only says "whatever is
+    /// focused when the keys arrive"; callers must not present such a
+    /// delivery as checked.
+    fn verifies_target(&self) -> bool {
+        true
+    }
     /// `Err(InsertError::Unavailable)` when this backend cannot run in the
     /// current session. Never touches a target.
     fn availability(&self) -> Result<(), InsertError>;
@@ -264,6 +287,23 @@ pub trait InsertionBackend: Send + Sync {
     }
     /// Type `text` into `target`, following the crate rules above.
     fn insert(&self, target: &TargetSnapshot, text: &str) -> Result<InsertReceipt, InsertError>;
+    /// [`insert`](Self::insert), stopping as soon as `stop` returns an
+    /// error: the caller can see what the backend cannot (Starling's own
+    /// window taking focus, on Wayland; an insert given up as stalled).
+    /// The default checks once before typing; the platform backends check
+    /// before every chunk (X11, Windows) or key (Wayland) and report what
+    /// already went out as a partial delivery.
+    fn insert_guarded(
+        &self,
+        target: &TargetSnapshot,
+        text: &str,
+        stop: &dyn Fn() -> Option<InsertError>,
+    ) -> Result<InsertReceipt, InsertError> {
+        if let Some(error) = stop() {
+            return Err(error);
+        }
+        self.insert(target, text)
+    }
 }
 
 /// The ordered backends of a session. The first available backend
@@ -271,6 +311,10 @@ pub trait InsertionBackend: Send + Sync {
 /// scheme.
 pub struct Inserter {
     backends: Vec<Box<dyn InsertionBackend>>,
+    /// Held for a whole [`Inserter::insert`], whatever the backend: two
+    /// inserts typing at once would interleave in the target. Not every
+    /// backend serializes itself (Windows sends chunk by chunk).
+    insert_lock: Mutex<()>,
 }
 
 impl Inserter {
@@ -284,9 +328,20 @@ impl Inserter {
     /// app's pid so a ref the app captured is never typed back into the
     /// app.
     pub fn with_excluded_pids(excluded: Vec<u32>) -> Inserter {
+        // The session's own backend first, so when nothing is available
+        // its reason is the one reported (X11 always refuses on Wayland).
         #[cfg(target_os = "linux")]
-        let backends: Vec<Box<dyn InsertionBackend>> =
-            vec![Box::new(x11::X11Backend::with_excluded_pids(excluded))];
+        let backends: Vec<Box<dyn InsertionBackend>> = {
+            let x11: Box<dyn InsertionBackend> =
+                Box::new(x11::X11Backend::with_excluded_pids(excluded.clone()));
+            let wayland: Box<dyn InsertionBackend> =
+                Box::new(wayland::WaylandBackend::with_excluded_pids(excluded));
+            if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+                vec![wayland, x11]
+            } else {
+                vec![x11, wayland]
+            }
+        };
         #[cfg(windows)]
         let backends: Vec<Box<dyn InsertionBackend>> = vec![Box::new(
             windows::WindowsBackend::with_excluded_pids(excluded),
@@ -300,7 +355,10 @@ impl Inserter {
     }
 
     pub fn with_backends(backends: Vec<Box<dyn InsertionBackend>>) -> Inserter {
-        Inserter { backends }
+        Inserter {
+            backends,
+            insert_lock: Mutex::new(()),
+        }
     }
 
     /// Capture through the first available backend. When none is
@@ -318,6 +376,50 @@ impl Inserter {
         Err(first_blocker.unwrap_or(InsertError::Unavailable {
             reason: "no insertion backend exists for this platform".to_string(),
         }))
+    }
+
+    /// Whether the backend that would capture now can verify its targets
+    /// (see [`InsertionBackend::verifies_target`]); `None` when no backend
+    /// is available. Asks each backend's availability, so a round trip.
+    pub fn session_verifies(&self) -> Option<bool> {
+        self.backends
+            .iter()
+            .find(|backend| backend.availability().is_ok())
+            .map(|backend| backend.verifies_target())
+    }
+
+    /// Whether the backend serving `target` can verify it (see
+    /// [`InsertionBackend::verifies_target`]); `false` without one.
+    pub fn verifies(&self, target: &TargetSnapshot) -> bool {
+        self.backend_for(target)
+            .is_some_and(|backend| backend.verifies_target())
+    }
+
+    /// Type `text` into `target` through the backend of its scheme,
+    /// stopping when `stop` says so (see
+    /// [`InsertionBackend::insert_guarded`]). Inserts through one
+    /// `Inserter` run whole, one at a time; one waiting for another is
+    /// stopped by `stop` once its turn comes, before its first key. The
+    /// order waiting inserts get their turn in is unspecified: a caller
+    /// that needs an order issues them one after another.
+    pub fn insert(
+        &self,
+        target: &TargetSnapshot,
+        text: &str,
+        stop: &dyn Fn() -> Option<InsertError>,
+    ) -> Result<InsertReceipt, InsertError> {
+        match self.backend_for(target) {
+            Some(backend) => {
+                let _whole_insert = self
+                    .insert_lock
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                backend.insert_guarded(target, text, stop)
+            }
+            None => Err(InsertError::Unavailable {
+                reason: format!("no {} backend in this session", target.backend.scheme()),
+            }),
+        }
     }
 
     pub fn backend_for(&self, target: &TargetSnapshot) -> Option<&dyn InsertionBackend> {
@@ -357,6 +459,9 @@ impl<T: InsertionBackend + ?Sized> InsertionBackend for std::sync::Arc<T> {
     fn kind(&self) -> BackendKind {
         (**self).kind()
     }
+    fn verifies_target(&self) -> bool {
+        (**self).verifies_target()
+    }
     fn availability(&self) -> Result<(), InsertError> {
         (**self).availability()
     }
@@ -374,6 +479,14 @@ impl<T: InsertionBackend + ?Sized> InsertionBackend for std::sync::Arc<T> {
     }
     fn insert(&self, target: &TargetSnapshot, text: &str) -> Result<InsertReceipt, InsertError> {
         (**self).insert(target, text)
+    }
+    fn insert_guarded(
+        &self,
+        target: &TargetSnapshot,
+        text: &str,
+        stop: &dyn Fn() -> Option<InsertError>,
+    ) -> Result<InsertReceipt, InsertError> {
+        (**self).insert_guarded(target, text, stop)
     }
 }
 
@@ -609,6 +722,7 @@ mod tests {
             (BackendKind::X11, 0x600001, 0x600002, Some(4213)),
             (BackendKind::Windows, 0x00060418, 0x00090c2e, Some(8)),
             (BackendKind::Fake, 1, 1, None),
+            (BackendKind::Wayland, 3, 0, None),
             (BackendKind::X11, u32::MAX, 1, None),
         ] {
             let reference = format_ref(kind, active, focus, pid);
@@ -635,6 +749,39 @@ mod tests {
             assert!(parse_ref(bad).is_none(), "{bad:?} must not parse");
         }
         assert_eq!(parse_ref("x11:ABC:Def:7"), parse_ref("x11:abc:def:7"));
+    }
+
+    #[test]
+    fn overlapping_inserts_through_one_inserter_type_whole_texts() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{mpsc, Arc};
+        use std::thread;
+
+        let fake = Arc::new(FakeBackend::new());
+        fake.focus(crate::testing::FakeTarget::named("Editor", "notes.txt"));
+        let target = fake.capture().unwrap();
+        let inserter = Arc::new(Inserter::with_backends(vec![Box::new(fake.clone())]));
+        // The first insert pauses after its first key, long enough for the
+        // second to type all of its keys if it were let in.
+        let (paused, first_paused) = mpsc::channel();
+        let first_key = AtomicBool::new(true);
+        fake.on_key(move |index| {
+            if index == 1 && first_key.swap(false, Ordering::SeqCst) {
+                paused.send(()).unwrap();
+                thread::sleep(Duration::from_millis(200));
+            }
+        });
+        let spawn_insert = |text: &'static str| {
+            let (inserter, target) = (inserter.clone(), target.clone());
+            thread::spawn(move || inserter.insert(&target, text, &|| None).map(|_| ()))
+        };
+
+        let first = spawn_insert("aaaa");
+        first_paused.recv().unwrap();
+        let second = spawn_insert("bbbb");
+        assert_eq!(first.join().unwrap(), Ok(()));
+        assert_eq!(second.join().unwrap(), Ok(()));
+        assert_eq!(fake.field(), "aaaabbbb");
     }
 
     #[test]

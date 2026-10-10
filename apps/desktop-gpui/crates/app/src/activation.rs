@@ -622,6 +622,7 @@ impl StarlingApp {
         let subscription = cx.observe_window_activation(window, |app, window, cx| {
             let active = window.is_window_active();
             app.window_focus.push((Instant::now(), active));
+            app.delivery_window_activation(active, cx);
             if !active {
                 // Like every UI-thread input: system-wide events that came
                 // first (an Escape) are processed before the synthetic
