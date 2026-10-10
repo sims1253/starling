@@ -804,7 +804,17 @@ class MainActivity : Activity() {
             recordingMessage.setText(R.string.transcription_failed_retry)
         }
         notice?.let { recordingMessage.append("\n"); recordingMessage.append(it) }
+        keepTakeDiskNotice()
         refreshRecordings()
+    }
+
+    /**
+     * An earlier take's outcome replaces the message while the next take
+     * records; that take's free-space warning, given once (#342), stays.
+     */
+    private fun keepTakeDiskNotice() {
+        if (activeRecording == null) return
+        diskNotice?.let { recordingMessage.append("\n"); recordingMessage.append(it) }
     }
 
     /**
@@ -1071,6 +1081,7 @@ class MainActivity : Activity() {
                     R.string.transcription_failed_retry
                 },
             )
+            keepTakeDiskNotice()
             refreshRecordings()
         }
         if (queued) recordingMessage.setText(R.string.sending_recording)
