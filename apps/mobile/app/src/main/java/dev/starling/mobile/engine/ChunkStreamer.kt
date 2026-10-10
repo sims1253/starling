@@ -124,8 +124,12 @@ class ChunkStreamer(
     fun catchUp(samples: FloatArray, size: Int, tx: Transcriber): String? =
         if (finalizeFullWindows(samples, size, tx, CallKind.WINDOW)) join(committed) else null
 
-    /** Finalizes all remaining audio; the full text, or null when the engine failed. */
-    fun flush(samples: FloatArray, size: Int, tx: Transcriber): String? {
+    /**
+     * Finalizes all remaining audio; the full text, or null when the engine
+     * failed. [reuseTail] false forbids reusing the last preview (its engine
+     * is no longer the one transcribing).
+     */
+    fun flush(samples: FloatArray, size: Int, tx: Transcriber, reuseTail: Boolean = true): String? {
         flushReusedTail = false
         finalizeFullWindows(samples, size, tx, CallKind.FLUSH_WINDOW)
         val tailLength = size - boundary
@@ -135,7 +139,7 @@ class ChunkStreamer(
         if (tailLength >= chunk) return null
         // The same samples (the buffer only grows at its end) through the
         // same engine: the preview's text is what the flush would produce.
-        val reuse = lastTail?.takeIf { it.start == boundary && it.length == tailLength }
+        val reuse = lastTail?.takeIf { reuseTail && it.start == boundary && it.length == tailLength }
         flushReusedTail = reuse != null
         val text = reuse?.text ?: tx.transcribe(samples, boundary, tailLength, CallKind.FLUSH_TAIL) ?: return null
         committed = ChunkedTranscription.stitchWords(committed, split(text), maxOverlapWords)

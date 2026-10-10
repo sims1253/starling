@@ -135,7 +135,10 @@ def run_metrics(log: dict, take: dict) -> dict:
     marks = log.get("marks", {})
     # The user's Stop, not finish(): stopping the capture is part of the wait.
     finish_at = log["commits"][0] if log["commits"] else None
-    log = dict(log, commits=[marks.get("stop_pressed", finish_at)])
+    # Capture start: the earliest origin the chunks imply (what StreamTrace
+    # records since review round 1; older traces used the first chunk only).
+    t_start = min((t - n / 16000.0 for t, n in log["sends"]), default=log["t_start"])
+    log = dict(log, t_start=t_start, commits=[marks.get("stop_pressed", finish_at)])
     m = take_metrics(log, take["reference"], marks.get("batch_text"))
     finals = [t for t, e in log["events"] if e.get("type") in ("final", "error")]
     duration = log["samples"] / 16000.0

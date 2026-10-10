@@ -50,11 +50,15 @@ class StreamTrace(
     private var stopCallsFrom = Int.MAX_VALUE
     private val marks = JSONObject()
 
-    /** Capture thread: [total] samples delivered so far, the last [chunk] of them just now. */
-    fun audio(total: Long, chunk: Int) = synchronized(lock) {
+    /** Capture thread: [total] samples delivered so far, the latest just now. */
+    fun audio(total: Long) = synchronized(lock) {
         val now = clock()
-        // Sample 0 was captured one chunk before the first chunk arrived.
-        if (tStart.isNaN()) tStart = now - chunk.toDouble() / ChunkStreamer.SAMPLE_RATE
+        // Each chunk arrives no earlier than its last sample was captured,
+        // so the earliest implied origin over all chunks is the capture
+        // start (to within the least delivery delay); the first chunk alone
+        // would shift every age by its own delay.
+        val origin = now - total.toDouble() / ChunkStreamer.SAMPLE_RATE
+        if (tStart.isNaN() || origin < tStart) tStart = origin
         sends += now to total
     }
 

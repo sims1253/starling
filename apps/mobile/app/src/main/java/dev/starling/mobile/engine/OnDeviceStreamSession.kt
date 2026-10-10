@@ -67,6 +67,13 @@ class OnDeviceStreamSession(
          */
         fun transcribePreview(samples: FloatArray, cancel: () -> Boolean): WindowResult = transcribeWindow(samples)
 
+        /**
+         * Identifies the engine's current model load; [WindowResult.Text.generation]
+         * names the load that produced a result. Results of an earlier load
+         * are never reused.
+         */
+        fun loadGeneration(): Long = 0L
+
         /** The model a successful [prepare] pinned to this session, for the transcript's record. */
         fun loadedModelName(): String? = null
 
@@ -79,8 +86,11 @@ class OnDeviceStreamSession(
     }
 
     sealed interface WindowResult {
-        /** [model]: the model that transcribed this window, when the engine knows it. */
-        data class Text(val text: String, val model: String? = null) : WindowResult
+        /**
+         * [model]: the model that transcribed this window, when the engine
+         * knows it; [generation]: the engine load that produced it ([LiveEngine.loadGeneration]).
+         */
+        data class Text(val text: String, val model: String? = null, val generation: Long = 0L) : WindowResult
         data class Failed(val reason: String) : WindowResult
 
         /** A preview stopped because the session no longer needed it; not a failure. */
@@ -174,7 +184,7 @@ class OnDeviceStreamSession(
                 return
             }
             captured += samples
-            trace?.audio(captured, samples)
+            trace?.audio(captured)
             changed.signalAll()
         }
     }
@@ -278,25 +288,30 @@ class OnDeviceStreamSession(
         var snapshotBase = 0L
         // Whether the last step's preview was preempted (see [previewObsolete]).
         var preempted = false
+        // The engine load that produced the last successful preview.
+        var previewGeneration = Long.MIN_VALUE
         val tx = ChunkStreamer.Transcriber { samples, start, length, kind ->
             // The snapshot is exactly the live tail, so a window that spans all
             // of it (every flush, most partials) is passed without a copy.
             val window = if (start == 0 && length == samples.size) samples else samples.copyOfRange(start, start + length)
             val t0 = clock()
+            val preview = kind == ChunkStreamer.CallKind.PREVIEW
+            // The preview starts at the window boundary.
+            val end = snapshotBase + start + length
+            val windowEnd = snapshotBase + start + streamer.windowSamples
             var obsolete = false
             val result = runCatching {
-                if (kind == ChunkStreamer.CallKind.PREVIEW) {
-                    // The preview starts at the window boundary.
-                    val end = snapshotBase + start + length
-                    val windowEnd = snapshotBase + start + streamer.windowSamples
+                if (preview) {
                     engine.transcribePreview(window) { obsolete || previewObsolete(end, windowEnd).also { obsolete = it } }
                 } else {
                     engine.transcribeWindow(window)
                 }
             }.getOrElse { WindowResult.Failed(it.message ?: it::class.java.simpleName) }
-            // A preview that completed after it became obsolete (past the
-            // engine's last checkpoint) is discarded like a cancelled one:
-            // its audio stays buffered for the window or flush that follows.
+            // A preview that became obsolete after the engine's last
+            // checkpoint (or on an engine without checkpoints) is discarded
+            // like a cancelled one: its audio stays buffered for the window
+            // or flush that follows.
+            if (preview && !obsolete) obsolete = previewObsolete(end, windowEnd)
             val outcome = if (obsolete && result is WindowResult.Text) WindowResult.Cancelled else result
             trace?.call(
                 StreamTrace.Call(
@@ -315,6 +330,7 @@ class OnDeviceStreamSession(
             when (outcome) {
                 is WindowResult.Text -> {
                     outcome.model?.let(windowModels::add)
+                    if (preview) previewGeneration = outcome.generation
                     outcome.text
                 }
                 is WindowResult.Failed -> {
@@ -352,7 +368,11 @@ class OnDeviceStreamSession(
             if (ending) {
                 trace?.flushing((snapshotSize - streamer.boundary).toLong())
                 val tailStart = snapshotBase + streamer.boundary
-                val text = streamer.flush(snapshot, snapshotSize, tx)
+                // The streamer's last preview is reusable only if the model
+                // that made it is still the loaded one (a driver failure
+                // elsewhere can reload the engine mid-take).
+                val sameEngine = runCatching { engine.loadGeneration() }.getOrNull() == previewGeneration
+                val text = streamer.flush(snapshot, snapshotSize, tx, reuseTail = sameEngine)
                 if (streamer.flushReusedTail) {
                     val now = clock()
                     trace?.call(

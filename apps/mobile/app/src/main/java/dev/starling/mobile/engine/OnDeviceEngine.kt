@@ -108,6 +108,14 @@ class OnDeviceEngine(
 
     private var handle: Long = 0L
 
+    // Counts model loads (written under [lock]): a live session reuses a
+    // preview only while the load that produced it is still resident.
+    // [residentGeneration] is the resident load's number, -1 when none;
+    // volatile so a session at Stop never waits for another take's call.
+    private var loadGeneration = 0L
+    @Volatile
+    private var residentGeneration = -1L
+
     /** The model file [handle] was loaded from; a different active model forces a reload. */
     private var loadedFile: File? = null
     private var loadError: String? = null
@@ -533,6 +541,8 @@ class OnDeviceEngine(
         }
         handle = loaded
         loadedFile = modelFile
+        loadGeneration++
+        residentGeneration = loadGeneration
         loadError = null
         // Absorb lazy graph construction before the first real request,
         // mirroring starling-serve's warmup.
@@ -625,6 +635,8 @@ class OnDeviceEngine(
         usingLocked { ensureLoadedLocked(model) }
     }
 
+    override fun loadGeneration(): Long = residentGeneration
+
     /** The model file a prepared live session is using. */
     override fun loadedModelName(): String? = synchronized(lock) { loadedFile?.name }
 
@@ -663,7 +675,7 @@ class OnDeviceEngine(
                     "the on-device engine returned an error: ${error ?: "unknown error"}",
                 )
             }
-            OnDeviceStreamSession.WindowResult.Text(text, loadedFile?.name)
+            OnDeviceStreamSession.WindowResult.Text(text, loadedFile?.name, loadGeneration)
         }
     }
 
@@ -818,6 +830,7 @@ class OnDeviceEngine(
             awake { StarlingNative.free(handle) }
             handle = 0L
             loadedFile = null
+            residentGeneration = -1L
             loadError = null
             observer.unloaded()
         }

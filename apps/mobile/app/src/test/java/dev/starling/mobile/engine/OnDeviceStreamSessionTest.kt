@@ -396,7 +396,12 @@ class OnDeviceStreamSessionTest {
         val previews = CopyOnWriteArrayList<Int>()
         val previewStarted = java.util.concurrent.Semaphore(0)
 
+        @Volatile
+        var generation = 0L
+
         override fun prepare(cancelled: () -> Boolean): String? = null
+
+        override fun loadGeneration(): Long = generation
 
         override fun transcribeWindow(samples: FloatArray): OnDeviceStreamSession.WindowResult {
             windows += samples.size
@@ -525,6 +530,49 @@ class OnDeviceStreamSessionTest {
         assertEquals(CommitOutcome.Final("n24000"), session.finish())
         assertFalse(events.any { it == StreamEvent.Partial("stale") })
         assertEquals(StreamTrace.RESULT_PREEMPTED, trace.calls().first().result)
+    }
+
+    @Test
+    fun aPreviewFromAnEngineWithoutCheckpointsIsDiscardedOnceStopHasNewerAudio() {
+        // The engine never polls the cancel predicate: the session must still
+        // see, once the call returns, that Stop brought audio it does not cover.
+        val release = CountDownLatch(1)
+        val engine = PreviewEngine {
+            release.await(5, TimeUnit.SECONDS)
+            OnDeviceStreamSession.WindowResult.Text("stale")
+        }
+        val trace = StreamTrace()
+        val session = tracedSession(engine, trace)
+        val second = pcm(1.0)
+        session.onAudio(second, second.size)
+        assertTrue(engine.previewStarted.tryAcquire(5, TimeUnit.SECONDS))
+        val half = pcm(0.5)
+        session.onAudio(half, half.size)
+
+        val outcome = java.util.concurrent.atomic.AtomicReference<CommitOutcome>()
+        val stopper = Thread { outcome.set(session.finish()) }.apply { start() }
+        while (trace.toJson().getJSONArray("commits").length() == 0) Thread.sleep(2)
+        release.countDown()
+        stopper.join(5_000)
+
+        assertEquals(CommitOutcome.Final("n24000"), outcome.get())
+        assertFalse(events.any { it is StreamEvent.Partial })
+        assertEquals(StreamTrace.RESULT_PREEMPTED, trace.calls().first().result)
+    }
+
+    @Test
+    fun aPreviewFromAnEarlierModelLoadIsNotReused() {
+        val engine = PreviewEngine { OnDeviceStreamSession.WindowResult.Text("p", generation = 1) }
+        engine.generation = 1
+        val session = tracedSession(engine, StreamTrace())
+        val second = pcm(1.0)
+        session.onAudio(second, second.size)
+        awaitEvent { it == StreamEvent.Partial("p") }
+
+        // A driver failure elsewhere reloaded the engine before Stop.
+        engine.generation = 2
+        assertEquals(CommitOutcome.Final("n16000"), session.finish())
+        assertEquals(listOf(16_000), engine.windows)
     }
 
     private companion object {
