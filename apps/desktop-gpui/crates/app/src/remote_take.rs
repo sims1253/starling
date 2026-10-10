@@ -575,6 +575,7 @@ impl StarlingApp {
                 self.refresh_history(cx);
             }
             TakeUpdate::Upkeep { report, retired } => self.upkeep_reported(report, retired, cx),
+            TakeUpdate::HistoryChanged => self.refresh_history(cx),
             TakeUpdate::LiveText {
                 take,
                 partial,

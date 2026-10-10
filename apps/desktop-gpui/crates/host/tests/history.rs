@@ -330,6 +330,39 @@ fn archiving_a_take_changes_its_class() {
     host.shutdown();
 }
 
+/// Every watching window hears when another one changed the history
+/// list: an import, a retention class, a delete.
+#[test]
+fn other_windows_hear_that_the_history_changed() {
+    let root = tempfile::tempdir().unwrap();
+    let mut host = host_at(root.path());
+    let other = connect(&host);
+    other.take_watch().unwrap();
+    let client = connect(&host);
+    let history = HistoryClient(&client);
+    let heard = |what: &str| {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(Instant::now() < deadline, "no history change heard after {what}");
+            if let Ok(TakeWire::HistoryChanged) = other.recv_take_timeout(Duration::from_millis(20)) {
+                return;
+            }
+        }
+    };
+    let id = history.import(&wav(1600), false).unwrap();
+    heard("an import");
+    history.set_archival(&id, true).unwrap();
+    heard("archiving");
+    history.delete(&id).unwrap();
+    heard("a delete");
+    // Reads change nothing.
+    history.list().unwrap();
+    assert!(other.recv_take_timeout(Duration::from_millis(300)).is_err());
+    drop(client);
+    drop(other);
+    host.shutdown();
+}
+
 #[test]
 fn a_held_take_is_left_alone_until_released_or_its_connection_ends() {
     let root = tempfile::tempdir().unwrap();

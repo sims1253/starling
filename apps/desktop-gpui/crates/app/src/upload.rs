@@ -1939,6 +1939,21 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// Another window changed the history: this one reloads its list.
+    #[gpui::test]
+    fn another_windows_history_change_reloads_the_list(cx: &mut gpui::TestAppContext) {
+        let root = scratch("frames-history-changed");
+        let store = Store::at_test_root(&root);
+        let (app, _) = window_with_typing(cx, &store);
+        let id = transcribed(&store, "stored elsewhere");
+        assert!(app.read_with(cx, |app, _| app.sessions.is_empty()));
+        frame(&app, cx, TakeUpdate::HistoryChanged);
+        settle(cx, "the list reloaded", |cx| {
+            app.read_with(cx, |app, _| app.sessions.iter().any(|session| session.id == id))
+        });
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// A frame that pairs this window's request with another take does
     /// not consume the request: the frames for its own take still find
     /// it (and its offer).

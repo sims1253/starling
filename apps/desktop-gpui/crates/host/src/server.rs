@@ -807,6 +807,10 @@ pub fn serve(config: HostConfig) -> Result<HostHandle, HostError> {
     // The history store's workers and audio upkeep ride with the host's
     // threads: shutdown joins them before the lease is released.
     if let (Some(history), Some(queue)) = (&history, store_queue) {
+        history.on_change({
+            let takes = Arc::clone(&takes);
+            move || takes.history_changed()
+        });
         threads.extend(crate::history::start_workers(Arc::clone(history), queue, {
             let shared = Arc::clone(&shared);
             move || shared.shutdown.load(Ordering::SeqCst)
@@ -1473,7 +1477,8 @@ fn connection_reader(
                     | Frame::LiveText { .. }
                     | Frame::Transcription { .. }
                     | Frame::Stored { .. }
-                    | Frame::Upkeep { .. } => {
+                    | Frame::Upkeep { .. }
+                    | Frame::HistoryChanged => {
                         terminate(
                             &state,
                             TransportErrorCode::ProtocolViolation,

@@ -82,6 +82,9 @@ pub struct History {
     inline: usize,
     stashes: Mutex<HashMap<usize, Stash>>,
     upkeep: UpkeepState,
+    /// Told when a request changed the history list (see
+    /// [`History::on_change`]).
+    changed: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>>,
 }
 
 #[derive(Default)]
@@ -115,6 +118,19 @@ impl History {
             inline: max_frame_bytes.saturating_sub(4096).max(1),
             stashes: Mutex::new(HashMap::new()),
             upkeep: UpkeepState::default(),
+            changed: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// `changed` runs whenever a request changed the history list (a
+    /// delete, an import, a retention class): other windows show it.
+    pub fn on_change(&self, changed: impl Fn() + Send + Sync + 'static) {
+        let _ = self.changed.set(Box::new(changed));
+    }
+
+    fn changed(&self) {
+        if let Some(changed) = self.changed.get() {
+            changed();
         }
     }
 
@@ -207,10 +223,12 @@ impl History {
             )?)?,
             StoreRequest::Delete { id } => {
                 facade.delete(&id)?;
+                self.changed();
                 Value::Null
             }
             StoreRequest::SetArchival { id, archival } => {
                 facade.set_archival(&id, archival)?;
+                self.changed();
                 Value::Null
             }
             StoreRequest::HoldAudio { id } => {
@@ -256,7 +274,9 @@ impl History {
                     .get_mut(&caller.key())
                     .and_then(|stash| stash.uploads.remove(&upload))
                     .ok_or_else(|| StorageError::Invalid("nothing was uploaded to import".to_string()))?;
-                Value::String(facade.save_import(&wav, transcribe)?.id)
+                let id = facade.save_import(&wav, transcribe)?.id;
+                self.changed();
+                Value::String(id)
             }
             StoreRequest::Fetch { blob, offset } => return self.fetch(caller, &blob, offset),
             StoreRequest::Discard { id } => {

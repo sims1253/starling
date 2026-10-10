@@ -177,6 +177,8 @@ pub enum TakeWire {
     },
     /// A pass of the host's history audio upkeep (see [`Frame::Upkeep`]).
     Upkeep { report: String, retired: bool },
+    /// The history list changed (see [`Frame::HistoryChanged`]).
+    HistoryChanged,
 }
 
 /// The host's answer to a [`HostClient::ask_user`].
@@ -851,7 +853,8 @@ fn client_reader(
                 | Frame::HostNotice { .. }
                 | Frame::LiveText { .. }
                 | Frame::Transcription { .. }
-                | Frame::Upkeep { .. }),
+                | Frame::Upkeep { .. }
+                | Frame::HistoryChanged),
             ) => {
                 let wire = match take_wire(frame) {
                     Ok(wire) => wire,
@@ -1063,6 +1066,7 @@ fn take_wire(frame: Frame) -> Result<TakeWire, String> {
             yours,
         },
         Frame::Upkeep { report, retired } => TakeWire::Upkeep { report, retired },
+        Frame::HistoryChanged => TakeWire::HistoryChanged,
         other => return Err(format!("{other:?} is not a take frame")),
     })
 }

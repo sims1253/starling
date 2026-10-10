@@ -97,7 +97,7 @@ impl TransportErrorCode {
 ///   [`Frame::HidePrompt`], [`Frame::TakeWatching`], [`Frame::LiveTake`],
 ///   [`Frame::TakeStartFailed`], [`Frame::TakePersisted`],
 ///   [`Frame::HostNotice`], [`Frame::LiveText`], [`Frame::Transcription`],
-///   [`Frame::Stored`], [`Frame::Upkeep`]
+///   [`Frame::Stored`], [`Frame::Upkeep`], [`Frame::HistoryChanged`]
 ///
 /// The take frames (#220) are host-level like the ask frames: the app's
 /// projection of the take the host records (see [`crate::takes`]).
@@ -312,6 +312,9 @@ pub enum Frame {
     /// apps' storage settings; `retired`: audio was removed, so the
     /// history list changed.
     Upkeep { report: String, retired: bool },
+    /// A connection deleted, imported or re-classed a take: the history
+    /// list watching apps show changed.
+    HistoryChanged,
 }
 
 /// Why a `capture.start` was refused while another take holds the
@@ -740,6 +743,7 @@ mod tests {
                 report: "Compressed 1 recording losslessly (saved 1 MB).".into(),
                 retired: false,
             },
+            Frame::HistoryChanged,
             Frame::LiveText {
                 take: "take-1".into(),
                 partial: Some(LivePartial {

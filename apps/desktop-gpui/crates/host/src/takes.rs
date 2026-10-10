@@ -399,6 +399,15 @@ impl TakeHub {
         }
     }
 
+    /// The history list changed: every watching app reloads it (dropped
+    /// for one whose queue is full — it is far behind anyway).
+    pub(crate) fn history_changed(&self) {
+        let state = lock_registry(&self.state);
+        for watcher in &state.watchers {
+            let _ = watcher.conn.try_deliver(Frame::HistoryChanged);
+        }
+    }
+
     /// Whether a take records or is still being stored.
     pub fn busy(&self) -> bool {
         let state = lock_registry(&self.state);

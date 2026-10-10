@@ -120,6 +120,8 @@ pub(crate) enum TakeUpdate {
     Notice(HostRecovery),
     /// What a pass of the host's history audio upkeep did.
     Upkeep { report: String, retired: bool },
+    /// Another window (or this one) changed the history list.
+    HistoryChanged,
     /// A recording take's live text, or why it stopped.
     LiveText {
         take: String,
@@ -568,6 +570,7 @@ fn route(frame: TakeWire) -> TakeUpdate {
         },
         TakeWire::Notice(recovery) => TakeUpdate::Notice(recovery),
         TakeWire::Upkeep { report, retired } => TakeUpdate::Upkeep { report, retired },
+        TakeWire::HistoryChanged => TakeUpdate::HistoryChanged,
         TakeWire::LiveText {
             take,
             partial,
