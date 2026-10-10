@@ -169,6 +169,16 @@ class StarlingApplication : Application() {
     }
 
     /**
+     * What a running take says when its free space first drops below the
+     * warning threshold (#342); the take keeps recording until the stop
+     * threshold.
+     */
+    fun diskLowDuringTake(minutesLeft: Long): String = getString(R.string.disk_low_in_take, minutesLeft)
+
+    /** Whether a take that starts on [disk] already showed the low-space warning, which it gives once. */
+    fun diskWarnedAtStart(disk: DiskReading?): Boolean = disk?.level == DiskLevel.LOW
+
+    /**
      * Debug-build device-test hooks (#356), driven over `adb shell run-as`:
      * `files/debug/test-mic.wav` (16 kHz mono PCM16) replaces the
      * microphone for every capture that starts while it exists, looped at

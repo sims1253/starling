@@ -77,6 +77,11 @@ class MainActivity : Activity() {
     private var activeRecording: Recording? = null
     private var awaitingPermission = false
 
+    // The running take's status line and its free-space warning (#342),
+    // kept under whatever status the take shows; null when there is none.
+    private var takeStatus = ""
+    private var diskNotice: String? = null
+
     // Playback of one saved recording at a time, and the recording an
     // export document is being picked for.
     private var player: MediaPlayer? = null
@@ -156,7 +161,7 @@ class MainActivity : Activity() {
             // Download progress owns the status line while it runs.
             if (!application.modelDownloads.isRunning) refreshOnDeviceStatus()
         }
-        recordingMessage.text = getString(R.string.ready_to_record)
+        showMessage(getString(R.string.ready_to_record))
         refreshOnDeviceStatus()
         refreshRecordings()
         if (savedInstanceState == null) handleKeyboardRequest(intent)
@@ -320,7 +325,7 @@ class MainActivity : Activity() {
                             val kept = application.storageSettings.load().limits(retentionClass)
                             age.setSelection(AGE_CHOICES.indexOf(kept.maxAgeDays).coerceAtLeast(0), false)
                             size.setSelection(SIZE_CHOICES_MB.indexOf(kept.maxTotalMb).coerceAtLeast(0), false)
-                            recordingMessage.setText(R.string.retention_save_error)
+                            showMessage(getString(R.string.retention_save_error))
                         }
                 }
 
@@ -468,14 +473,14 @@ class MainActivity : Activity() {
                 when (result) {
                     is OnDeviceEngine.ImportResult.Imported -> {
                         refreshOnDeviceStatus()
-                        recordingMessage.setText(R.string.on_device_imported)
+                        showMessage(getString(R.string.on_device_imported))
                     }
                     is OnDeviceEngine.ImportResult.Rejected -> {
                         Log.w(TAG, "model import rejected at ${result.stage}: ${result.reason}")
                         // Keep the failure beside the Import button. A message
                         // in the recording section is off screen during import.
                         onDeviceStatus.text = result.reason
-                        recordingMessage.text = result.reason
+                        showMessage(result.reason)
                     }
                 }
             }
@@ -624,11 +629,11 @@ class MainActivity : Activity() {
         // Free space first (#342): no take starts that the disk cannot hold.
         val disk = application.diskBeforeTake()
         if (disk?.level == DiskLevel.CRITICAL) {
-            recordingMessage.text = getString(R.string.disk_full_refused, mb(disk.availableBytes))
+            showMessage(getString(R.string.disk_full_refused, mb(disk.availableBytes)))
             return
         }
         val recording = runCatching { application.recordings.create() }.getOrElse {
-            recordingMessage.text = getString(R.string.recording_storage_error)
+            showMessage(getString(R.string.recording_storage_error))
             return
         }
         // The live stream is an observer of the capture, never a gate on it:
@@ -649,11 +654,18 @@ class MainActivity : Activity() {
             // The capture ended itself (low storage, the two-hour cap):
             // settle it like Stop.
             onEnded = { if (activeRecording === recording) stopAndQueueRecording() },
+            diskWarned = application.diskWarnedAtStart(disk),
+            onDiskLow = { minutes ->
+                if (!isDestroyed && !isFinishing && activeRecording === recording) {
+                    diskNotice = application.diskLowDuringTake(minutes)
+                    showRecordingStatus(takeStatus)
+                }
+            },
         )
         if (error != null) {
             session?.close()
             runCatching { application.recordings.salvageCapture(recording.id, error) }
-            recordingMessage.text = error
+            showMessage(error)
             refreshRecordings()
             return
         }
@@ -662,17 +674,31 @@ class MainActivity : Activity() {
         recordButton.setText(R.string.stop_and_transcribe)
         liveTranscript.visibility = View.GONE
         liveTranscript.text = null
-        recordingMessage.setText(
-            when {
-                session == null -> R.string.recording_now
-                application.isOnDeviceModelLoading(config) -> R.string.streaming_loading
-                else -> R.string.streaming_connecting
-            },
+        diskNotice = application.diskWarning(disk)
+        showRecordingStatus(
+            getString(
+                when {
+                    session == null -> R.string.recording_now
+                    application.isOnDeviceModelLoading(config) -> R.string.streaming_loading
+                    else -> R.string.streaming_connecting
+                },
+            ),
         )
-        application.diskWarning(disk)?.let { warning ->
-            recordingMessage.append("\n")
-            recordingMessage.append(warning)
-        }
+    }
+
+    /** [status] of the running take, with its free-space warning on the next line. */
+    private fun showRecordingStatus(status: String) {
+        takeStatus = status
+        showMessage(status)
+    }
+
+    /**
+     * Every message of the recording section goes through here, so a
+     * running take's free-space warning (#342), given once, stays under
+     * whatever an earlier take's outcome, a retry or an error says.
+     */
+    private fun showMessage(message: CharSequence) {
+        recordingMessage.text = listOfNotNull(message, diskNotice).joinToString("\n")
     }
 
     /**
@@ -683,21 +709,22 @@ class MainActivity : Activity() {
     private fun onStreamEvent(event: StreamEvent) {
         if (isDestroyed || isFinishing) return
         when (event) {
-            StreamEvent.Live -> recordingMessage.setText(R.string.streaming_live)
+            StreamEvent.Live -> showRecordingStatus(getString(R.string.streaming_live))
             is StreamEvent.Partial -> {
                 liveTranscript.visibility = View.VISIBLE
                 // The server's partial is a growing transcript of the whole
                 // session so far, so it replaces the previous text.
                 liveTranscript.text = event.text
             }
-            is StreamEvent.Interrupted -> recordingMessage.text =
-                getString(R.string.streaming_interrupted, event.reason)
+            is StreamEvent.Interrupted ->
+                showRecordingStatus(getString(R.string.streaming_interrupted, event.reason))
         }
     }
 
     private fun stopAndQueueRecording() {
         val recording = activeRecording ?: return
         activeRecording = null
+        diskNotice = null
         val session = streamSession
         streamSession = null
         recordButton.setText(R.string.start_recording)
@@ -725,7 +752,7 @@ class MainActivity : Activity() {
                         application.recordings.salvageCapture(recording.id, "Unable to finalize the private WAV recording")
                     }
                     updateRecordingViews {
-                        recordingMessage.setText(R.string.recording_finalize_error)
+                        showMessage(getString(R.string.recording_finalize_error))
                         refreshRecordings()
                     }
                     return
@@ -747,7 +774,7 @@ class MainActivity : Activity() {
                 } else {
                     application.transcription.transcribe(finalized.id, config, settled)
                 }
-                if (queued) updateRecordingViews { recordingMessage.text = notice ?: getString(R.string.sending_recording) }
+                if (queued) updateRecordingViews { showMessage(notice ?: getString(R.string.sending_recording)) }
                 updateRecordingViews { refreshRecordings() }
             }
             is CaptureResult.Failed -> {
@@ -757,7 +784,7 @@ class MainActivity : Activity() {
                 updateRecordingViews { liveTranscript.visibility = View.GONE }
                 runCatching { application.recordings.salvageCapture(recording.id, result.message) }
                 updateRecordingViews {
-                    recordingMessage.text = result.message
+                    showMessage(result.message)
                     refreshRecordings()
                 }
             }
@@ -765,7 +792,7 @@ class MainActivity : Activity() {
                 session?.close()
                 updateRecordingViews {
                     liveTranscript.visibility = View.GONE
-                    recordingMessage.setText(R.string.recording_already_stopped)
+                    showMessage(getString(R.string.recording_already_stopped))
                 }
             }
         }
@@ -775,17 +802,17 @@ class MainActivity : Activity() {
         // The Activity may have been destroyed (for example by a rotation)
         // while the request was in flight; the store settlement already ran.
         if (isDestroyed || isFinishing) return
-        if (completed.status == RecordingStatus.TRANSCRIBED) {
+        val outcome = if (completed.status == RecordingStatus.TRANSCRIBED) {
             // The verbatim final is in the recordings list now; a leftover
             // live partial next to it could read as the final text.
             liveTranscript.visibility = View.GONE
-            recordingMessage.setText(R.string.transcription_saved)
+            getString(R.string.transcription_saved)
         } else {
             // Keep the last partial visible: it is the only text the user
             // has while the recording waits for a retry.
-            recordingMessage.setText(R.string.transcription_failed_retry)
+            getString(R.string.transcription_failed_retry)
         }
-        notice?.let { recordingMessage.append("\n"); recordingMessage.append(it) }
+        showMessage(listOfNotNull(outcome, notice).joinToString("\n"))
         refreshRecordings()
     }
 
@@ -808,7 +835,7 @@ class MainActivity : Activity() {
             if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
                 finishAndRemoveTask()
             } else {
-                recordingMessage.setText(R.string.microphone_permission_required)
+                showMessage(getString(R.string.microphone_permission_required))
             }
             return
         }
@@ -817,7 +844,7 @@ class MainActivity : Activity() {
         if (grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED) {
             beginCapture()
         } else {
-            recordingMessage.setText(R.string.microphone_permission_required)
+            showMessage(getString(R.string.microphone_permission_required))
         }
     }
 
@@ -990,7 +1017,7 @@ class MainActivity : Activity() {
                     if (playingId == recording.id) stopPlayback()
                     runCatching { application.recordings.delete(recording.id) }
                         .onSuccess { refreshRecordings() }
-                        .onFailure { recordingMessage.setText(R.string.delete_recording_error) }
+                        .onFailure { showMessage(getString(R.string.delete_recording_error)) }
                 }
                 .show()
         }
@@ -1046,16 +1073,18 @@ class MainActivity : Activity() {
             // The Activity may have been destroyed (for example by a
             // rotation) while the request was in flight.
             if (isDestroyed || isFinishing) return@transcribe
-            recordingMessage.setText(
-                if (it.status == RecordingStatus.TRANSCRIBED) {
-                    R.string.transcription_saved
-                } else {
-                    R.string.transcription_failed_retry
-                },
+            showMessage(
+                getString(
+                    if (it.status == RecordingStatus.TRANSCRIBED) {
+                        R.string.transcription_saved
+                    } else {
+                        R.string.transcription_failed_retry
+                    },
+                ),
             )
             refreshRecordings()
         }
-        if (queued) recordingMessage.setText(R.string.sending_recording)
+        if (queued) showMessage(getString(R.string.sending_recording))
         refreshRecordings()
     }
 
@@ -1083,7 +1112,7 @@ class MainActivity : Activity() {
             player.setOnErrorListener { failed, _, _ ->
                 if (this.player === failed) {
                     stopPlayback()
-                    recordingMessage.setText(R.string.playback_error)
+                    showMessage(getString(R.string.playback_error))
                     refreshRecordings()
                 }
                 true
@@ -1092,7 +1121,7 @@ class MainActivity : Activity() {
         }.isSuccess
         if (!queued) {
             player.release()
-            recordingMessage.setText(R.string.playback_error)
+            showMessage(getString(R.string.playback_error))
             return
         }
         this.player = player
@@ -1125,7 +1154,7 @@ class MainActivity : Activity() {
 
     private fun finishExport(uri: Uri) {
         val id = pendingExportId ?: run {
-            recordingMessage.setText(R.string.export_error)
+            showMessage(getString(R.string.export_error))
             return
         }
         pendingExportId = null
@@ -1139,7 +1168,7 @@ class MainActivity : Activity() {
             }.onFailure { Log.w(TAG, "recording export failed", it) }.isSuccess
             runOnUiThread {
                 if (isDestroyed || isFinishing) return@runOnUiThread
-                recordingMessage.setText(if (exported) R.string.export_done else R.string.export_error)
+                showMessage(getString(if (exported) R.string.export_done else R.string.export_error))
             }
         }
     }

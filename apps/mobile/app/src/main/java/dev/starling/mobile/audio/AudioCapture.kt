@@ -60,10 +60,13 @@ fun interface AudioChunkListener {
  * stop() request, so the owner can stop() and settle it.
  *
  * While a take runs its free space is checked every
- * [DiskPolicy.IN_TAKE_INTERVAL_MILLIS] through [diskProbe] (#342). Below
- * the stop threshold, or when a write fails for lack of space, the capture
- * ends itself like at the two-hour cap: the WAV is finalized and stop()
- * reports [CaptureResult.Completed] with `stoppedForLowDisk`.
+ * [DiskPolicy.IN_TAKE_INTERVAL_MILLIS] through [diskProbe] (#342). The
+ * first reading below the warning threshold calls `onDiskLow` on the main
+ * thread with the minutes left, once per take and never when the start
+ * already warned (`diskWarned`); the take keeps recording. Below the stop
+ * threshold, or when a write fails for lack of space, the capture ends
+ * itself like at the two-hour cap: the WAV is finalized and stop() reports
+ * [CaptureResult.Completed] with `stoppedForLowDisk`.
  */
 class AudioCapture(
     private val diskProbe: FreeSpaceProbe = FreeSpaceProbe.current,
@@ -103,6 +106,8 @@ class AudioCapture(
         outputFile: File,
         onChunk: AudioChunkListener? = null,
         onEnded: (() -> Unit)? = null,
+        diskWarned: Boolean = false,
+        onDiskLow: ((minutesLeft: Long) -> Unit)? = null,
     ): String? = synchronized(lock) {
         if (state != State.IDLE || worker?.isAlive == true) {
             return@synchronized "A recording is already stopping"
@@ -153,7 +158,7 @@ class AudioCapture(
         cappedAtLimit = false
         writerBytes = 0
         stopRequested = false
-        val token = lowDisk.begin()
+        val token = lowDisk.begin(warned = diskWarned)
         takeToken = token
         state = State.RECORDING
         startCheckpoints(wavWriter)
@@ -162,6 +167,12 @@ class AudioCapture(
             lowDisk,
             token,
             CHECKPOINT_INTERVAL_MILLIS,
+            onLow = { reading ->
+                val minutes = diskPolicy.minutesLeft(reading.availableBytes)
+                // A warning that reaches the main thread after the take
+                // ended (or was stopped) is dropped.
+                if (onDiskLow != null) mainHandler.post { if (lowDisk.isOpen(token)) onDiskLow(minutes) }
+            },
         )
         worker = Thread(
             { captureLoop(audioRecord, wavWriter, bufferSize, onChunk, onEnded, token, diskWatch) },

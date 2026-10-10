@@ -137,6 +137,13 @@ class OnDeviceEngine(
     // at one point never frees a model used since.
     private val useGeneration = AtomicLong()
 
+    // When the native call in progress started (System.nanoTime), or
+    // [NO_NATIVE_CALL]. Native calls run one at a time under [lock]; read
+    // without it, so a transcription waiting for the lock can tell a busy
+    // engine from a stuck one (#356).
+    @Volatile
+    private var nativeCallSince = NO_NATIVE_CALL
+
     fun hasModel(): Boolean = activeModelFile() != null
 
     fun modelSizeBytes(): Long = activeModelFile()?.length() ?: 0L
@@ -583,8 +590,30 @@ class OnDeviceEngine(
         }
     }
 
-    /** Runs one bounded native call with the CPU held awake (see [keepAwake]). */
-    private inline fun <T> awake(call: () -> T): T = keepAwake().use { call() }
+    /**
+     * Runs one bounded native call with the CPU held awake (see
+     * [keepAwake]), timed for [nativeCallAgeMillis]. A load frees a model
+     * that fails its warmup inside its own call; the outer call keeps the
+     * timing.
+     */
+    private inline fun <T> awake(call: () -> T): T = keepAwake().use {
+        val outermost = nativeCallSince == NO_NATIVE_CALL
+        if (outermost) nativeCallSince = System.nanoTime()
+        try {
+            call()
+        } finally {
+            if (outermost) nativeCallSince = NO_NATIVE_CALL
+        }
+    }
+
+    /**
+     * How long the native call in progress (load, transcription window,
+     * free) has been running; 0 when none is. Never takes the engine lock.
+     */
+    fun nativeCallAgeMillis(): Long {
+        val since = nativeCallSince
+        return if (since == NO_NATIVE_CALL) 0L else (System.nanoTime() - since) / 1_000_000
+    }
 
     /** Ends a use: a new generation, reported as idle when nothing else is using the model. Caller holds [lock]. */
     private fun reportIdleLocked() {
@@ -742,20 +771,29 @@ class OnDeviceEngine(
      * the load's warmup or mid-transcription, has freed the model; it is
      * retried once, and the reload falls back to the CPU engine. A success
      * names the model file that produced it.
+     *
+     * With an [attempt] (#356, [BoundedTranscription]) the call is started
+     * once it holds the engine, never when it was given up while waiting
+     * for it, and stops at the engine's next checkpoint once the attempt is
+     * stopped; the model stays loaded.
      */
-    fun transcribe(audioFile: File, modelName: String? = null): InferenceResult = synchronized(lock) {
-        usingLocked {
-            val result = transcribeLocked(audioFile, modelName)
-            if (result is InferenceResult.Failure && ModelLifetime.isDriverFailure(result.message)) {
-                transcribeLocked(audioFile, modelName)
-            } else {
-                result
+    fun transcribe(audioFile: File, modelName: String? = null, attempt: CallAttempt? = null): InferenceResult =
+        synchronized(lock) {
+            if (attempt != null && !attempt.start()) return attempt.stopped()
+            usingLocked {
+                val result = transcribeLocked(audioFile, modelName, attempt)
+                if (result is InferenceResult.Failure && ModelLifetime.isDriverFailure(result.message) &&
+                    attempt?.cancelRequested() != true
+                ) {
+                    transcribeLocked(audioFile, modelName, attempt)
+                } else {
+                    result
+                }
             }
         }
-    }
 
     /** Caller holds [lock] inside [usingLocked]. */
-    private fun transcribeLocked(audioFile: File, modelName: String?): InferenceResult {
+    private fun transcribeLocked(audioFile: File, modelName: String?, attempt: CallAttempt?): InferenceResult {
         val requested = if (modelName == null) {
             activeModelFile()
         } else {
@@ -786,15 +824,25 @@ class OnDeviceEngine(
         // quadratically with the recording length.
         val windows = ChunkedTranscription.planWindows(decoded.samples.size, decoded.sampleRate)
         val texts = ArrayList<String>(windows.size)
+        val cancel = attempt?.let { StarlingNative.Cancel(it::cancelRequested) }
         for (window in windows) {
+            if (attempt?.cancelRequested() == true) return attempt.stopped()
             val samples = if (window.start == 0 && window.endExclusive == decoded.samples.size) {
                 decoded.samples
             } else {
                 decoded.samples.copyOfRange(window.start, window.endExclusive)
             }
-            val text = awake { StarlingNative.transcribe(handle, samples, decoded.sampleRate) }
+            val text = awake {
+                if (cancel == null) {
+                    StarlingNative.transcribe(handle, samples, decoded.sampleRate)
+                } else {
+                    StarlingNative.transcribeCancellable(handle, samples, decoded.sampleRate, cancel)
+                }
+            }
             if (text == null) {
                 val error = StarlingNative.lastError(handle)
+                // Stopped by its attempt (#356): not an engine failure.
+                if (attempt != null && error == StarlingNative.CANCELLED_ERROR) return attempt.stopped()
                 error?.let(observer::engineFailed)
                 if (error != null && ModelLifetime.isDriverFailure(error)) {
                     releaseDriverFailureLocked(error)
@@ -841,6 +889,8 @@ class OnDeviceEngine(
 
         /** Name for a model imported without a usable file name. */
         const val DEFAULT_MODEL_NAME = "parakeet.gguf"
+
+        private const val NO_NATIVE_CALL = Long.MIN_VALUE
 
         /** How often a take waiting for a pinned model re-checks the selection. */
         private const val PIN_WAIT_SLICE_MILLIS = 1_000L

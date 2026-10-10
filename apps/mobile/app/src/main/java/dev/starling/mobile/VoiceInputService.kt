@@ -168,6 +168,8 @@ class VoiceInputService : InputMethodService() {
         draftTools = view.findViewById(R.id.keyboard_draft_tools)
         viewToggle = view.findViewById(R.id.keyboard_view_toggle)
         renderModelState(application.modelLifetime.state())
+        // A view recreated mid-take (rotation) shows the take's warning again.
+        showDiskWarning(take?.takeIf { it.capturing }?.diskNotice)
 
         recordButton?.setOnClickListener {
             if (take?.capturing == true) stopTake() else requestOrStartRecording()
@@ -383,6 +385,14 @@ class VoiceInputService : InputMethodService() {
             // A microphone that ends by itself settles like Stop, which also
             // releases the foreground hold.
             onEnded = { if (take?.recording === recording) stopTake() },
+            diskWarned = application.diskWarnedAtStart(disk),
+            onDiskLow = { minutes ->
+                val current = take
+                if (current?.recording === recording && current.capturing) {
+                    current.diskNotice = application.diskLowDuringTake(minutes)
+                    showDiskWarning(current.diskNotice)
+                }
+            },
         )
         if (error != null) {
             session?.close()
@@ -419,7 +429,8 @@ class VoiceInputService : InputMethodService() {
                 else -> R.string.keyboard_streaming
             },
         )
-        showDiskWarning(application.diskWarning(disk))
+        take?.diskNotice = application.diskWarning(disk)
+        showDiskWarning(take?.diskNotice)
     }
 
     /** The low-storage warning of the running take, on its own line; null hides it. */
@@ -581,6 +592,7 @@ class VoiceInputService : InputMethodService() {
         current.capturing = false
         current.awaitingFinal = true
         current.stoppedAtNanos = System.nanoTime()
+        current.diskNotice = null
         showDiskWarning(null)
         val session = current.session
         current.session = null
@@ -1256,6 +1268,9 @@ class VoiceInputService : InputMethodService() {
     ) {
         var capturing = true
         var session: StreamSession? = null
+
+        /** The free-space warning shown while it captures (#342); null when there is none. */
+        var diskNotice: String? = null
 
         /** The editor binding; null while the take's field is not focused. */
         var target: InputTargetGuard.Snapshot<InputConnection>? = null

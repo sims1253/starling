@@ -110,6 +110,14 @@ class StarlingRecognitionService : RecognitionService() {
             // The capture ended itself (low storage, the two-hour cap):
             // finish the session like the host's stopListening.
             onEnded = { if (sessions.isLive(callback)) sessions.stopListening(callback)?.let(::endSession) },
+            // The host keyboard owns the screen; the warning is a toast.
+            diskWarned = application.diskWarnedAtStart(disk),
+            onDiskLow = { minutes ->
+                if (sessions.isLive(callback)) {
+                    runCatching { Log.w(TAG, "storage is low during a take: about $minutes minutes left") }
+                    toast(application.diskLowDuringTake(minutes))
+                }
+            },
         )
         if (error != null) {
             session?.close()

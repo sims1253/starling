@@ -11,15 +11,34 @@ import java.io.File
  * settings. Never throws: the engine's first use loads the JNI library, and a
  * missing or broken native build must fail the recording the way the remote
  * client does, not crash the caller.
+ *
+ * Every transcription is bounded ([BoundedTranscription], #356): a model
+ * call that hangs fails the attempt, retryable and with the audio kept,
+ * and a result it returns after that is dropped.
  */
-class OnDeviceBackend(private val engine: OnDeviceEngine) {
-    fun transcribe(audioFile: File, config: BackendConfig): InferenceResult =
-        runCatching { engine.transcribe(audioFile, config.onDeviceModel) }.getOrElse {
-            InferenceResult.Failure(
-                "The on-device engine could not run: ${it.message ?: it::class.java.simpleName}",
-                false,
-            )
+class OnDeviceBackend(
+    private val engine: OnDeviceEngine,
+    private val bound: BoundedTranscription = BoundedTranscription(engine::nativeCallAgeMillis),
+) {
+    fun transcribe(audioFile: File, config: BackendConfig): InferenceResult = runCatching {
+        bound.run(BoundedTranscription.budgetFor(audioFile.length())) { attempt ->
+            runCatching { engine.transcribe(audioFile, config.onDeviceModel, attempt) }.getOrElse {
+                InferenceResult.Failure(
+                    "The on-device engine could not run: ${it.message ?: it::class.java.simpleName}",
+                    false,
+                )
+            }
         }
+    }.getOrElse {
+        // The bound itself failed (no thread for the call, an interrupt):
+        // nothing is wrong with the recording, so it stays retryable.
+        if (it is InterruptedException) Thread.currentThread().interrupt()
+        InferenceResult.Failure(
+            "The on-device transcription could not run (${it.message ?: it::class.java.simpleName}). " +
+                "The recording is kept; retry to transcribe it again.",
+            true,
+        )
+    }
 
     /** The model a transcription without an explicit one uses; null when none is installed. */
     fun activeModelName(): String? = runCatching { engine.activeModelName() }.getOrNull()

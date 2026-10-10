@@ -56,6 +56,10 @@ class RecognizeSpeechActivity : Activity() {
 
     private var activeRecording: Recording? = null
 
+    // The listening status and the take's free-space warning (#342) below it.
+    private var takeStatus = ""
+    private var diskNotice: String? = null
+
     /** Whether the microphone capture is running; instrumented tests branch on it. */
     internal val capturing: Boolean get() = activeRecording != null
 
@@ -171,6 +175,13 @@ class RecognizeSpeechActivity : Activity() {
             onChunk = session?.let { streaming -> AudioChunkListener { bytes, count -> streaming.onAudio(bytes, count) } },
             // The capture ended itself (low storage, the two-hour cap): Done.
             onEnded = { if (activeRecording === recording) stopAndTranscribe() },
+            diskWarned = application.diskWarnedAtStart(disk),
+            onDiskLow = { minutes ->
+                if (!isDestroyed && !isFinishing && activeRecording === recording) {
+                    diskNotice = application.diskLowDuringTake(minutes)
+                    showListeningStatus(takeStatus)
+                }
+            },
         )
         if (error != null) {
             session?.close()
@@ -181,17 +192,20 @@ class RecognizeSpeechActivity : Activity() {
         activeRecording = recording
         streamSession = session
         val loading = session != null && application.isOnDeviceModelLoading(config)
-        statusView.setText(if (loading) R.string.recognize_listening_loading else R.string.recognize_listening)
-        application.diskWarning(disk)?.let { warning ->
-            statusView.append("\n")
-            statusView.append(warning)
-        }
+        diskNotice = application.diskWarning(disk)
+        showListeningStatus(getString(if (loading) R.string.recognize_listening_loading else R.string.recognize_listening))
+    }
+
+    /** [status] of the running take, with its free-space warning on the next line. */
+    private fun showListeningStatus(status: String) {
+        takeStatus = status
+        statusView.text = listOfNotNull(status, diskNotice).joinToString("\n")
     }
 
     private fun onStreamEvent(event: StreamEvent) {
         if (isDestroyed || isFinishing) return
         when (event) {
-            StreamEvent.Live -> if (activeRecording != null) statusView.setText(R.string.recognize_listening)
+            StreamEvent.Live -> if (activeRecording != null) showListeningStatus(getString(R.string.recognize_listening))
             is StreamEvent.Partial -> {
                 partialView.visibility = View.VISIBLE
                 partialView.text = event.text
@@ -206,7 +220,7 @@ class RecognizeSpeechActivity : Activity() {
             // The stop path falls back to the batch transcription of the WAV;
             // the status must not keep claiming the model is loading.
             is StreamEvent.Interrupted -> if (activeRecording != null) {
-                statusView.text = getString(R.string.keyboard_stream_interrupted, event.reason)
+                showListeningStatus(getString(R.string.keyboard_stream_interrupted, event.reason))
             }
         }
     }
@@ -214,6 +228,7 @@ class RecognizeSpeechActivity : Activity() {
     private fun stopAndTranscribe() {
         val recording = activeRecording ?: return
         activeRecording = null
+        diskNotice = null
         val session = streamSession
         streamSession = null
         doneButton.isEnabled = false
