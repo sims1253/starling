@@ -47,6 +47,7 @@ use starling_dictation::settings::InsertionSettings;
 use starling_insertion::{InsertError, Inserter, TargetSnapshot};
 
 use crate::app::StarlingApp;
+use crate::overlay::DeliveryStatus;
 
 /// How long an armed Paste last waits for the window to lose focus.
 pub(crate) const PASTE_ARM_TIMEOUT: Duration = Duration::from_secs(15);
@@ -178,6 +179,23 @@ pub(crate) enum Failure {
     FocusMovedThroughStarling,
 }
 
+impl Failure {
+    /// The notice's title, and the overlay's line under its failure.
+    pub(crate) fn title(&self) -> &'static str {
+        match self {
+            Failure::Insert(InsertError::PartialDelivery { .. }) => "Inserted only in part",
+            Failure::Insert(InsertError::TargetChanged { .. })
+            | Failure::FocusMovedThroughStarling => "Not inserted: focus moved",
+            Failure::Insert(InsertError::TargetGone) => "Not inserted: the window closed",
+            Failure::Insert(InsertError::ModifiersHeld { .. }) => "Not inserted: keys were held",
+            Failure::Insert(InsertError::Unavailable { .. }) => "Insertion unavailable",
+            Failure::Stalled => "Not inserted: typing stalled",
+            Failure::UnverifiedOff => "Not inserted: the target cannot be checked",
+            Failure::Insert(_) => "Not inserted",
+        }
+    }
+}
+
 /// What to do with a capture and a text.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Plan {
@@ -238,17 +256,7 @@ impl Recovery {
     }
 
     pub(crate) fn title(&self) -> &'static str {
-        match &self.failure {
-            Failure::Insert(InsertError::PartialDelivery { .. }) => "Inserted only in part",
-            Failure::Insert(InsertError::TargetChanged { .. })
-            | Failure::FocusMovedThroughStarling => "Not inserted: focus moved",
-            Failure::Insert(InsertError::TargetGone) => "Not inserted: the window closed",
-            Failure::Insert(InsertError::ModifiersHeld { .. }) => "Not inserted: keys were held",
-            Failure::Insert(InsertError::Unavailable { .. }) => "Insertion unavailable",
-            Failure::Stalled => "Not inserted: typing stalled",
-            Failure::UnverifiedOff => "Not inserted: the target cannot be checked",
-            Failure::Insert(_) => "Not inserted",
-        }
+        self.failure.title()
     }
 
     /// The specific explanation the notice shows.
@@ -378,6 +386,10 @@ pub(crate) struct DeliveryState {
     last_insert: Option<Task<()>>,
     /// A capture worker is out (see [`bounded_capture`]).
     capture_out: Arc<AtomicBool>,
+    /// Inserts started and not finished, and the first failure among
+    /// them: the overlay says "Inserting…" until the last one ends.
+    inserts_pending: usize,
+    batch_failure: Option<&'static str>,
     /// A settings session check is out (see
     /// [`StarlingApp::check_session_verifies`]).
     session_check_out: Arc<AtomicBool>,
@@ -403,6 +415,8 @@ impl DeliveryState {
             own_focus: Arc::default(),
             last_insert: None,
             capture_out: Arc::default(),
+            inserts_pending: 0,
+            batch_failure: None,
             session_check_out: Arc::default(),
             insert_out: Arc::default(),
         }
@@ -440,6 +454,47 @@ impl StarlingApp {
             bounded_capture(self.delivery.inserter.clone(), &self.delivery.capture_out)
         };
         Capture { target, at }
+    }
+
+    /// An insert started: the overlay says so.
+    fn overlay_insert_started(&mut self, cx: &mut Context<Self>) {
+        self.delivery.inserts_pending += 1;
+        self.set_delivery_status(DeliveryStatus::Delivering, cx);
+    }
+
+    /// An insert ended (`started`), or a delivery failed before typing.
+    /// The overlay shows the outcome once no insert is left running; a
+    /// failure among them outranks the successes.
+    fn overlay_delivery_ended(
+        &mut self,
+        started: bool,
+        failure: Option<&Failure>,
+        cx: &mut Context<Self>,
+    ) {
+        if started {
+            self.delivery.inserts_pending = self.delivery.inserts_pending.saturating_sub(1);
+        }
+        if let Some(failure) = failure {
+            self.delivery.batch_failure.get_or_insert(failure.title());
+        }
+        if self.delivery.inserts_pending > 0 {
+            return;
+        }
+        let status = match self.delivery.batch_failure.take() {
+            Some(reason) => DeliveryStatus::Failed(reason.to_string()),
+            None => DeliveryStatus::Delivered,
+        };
+        self.set_delivery_status(status, cx);
+    }
+
+    /// A pressed Insert stopped waiting: the overlay no longer asks for
+    /// the switch (the next activation poll shows it).
+    fn overlay_insert_unarmed(&mut self) {
+        if *self.overlay.model.delivery() == DeliveryStatus::Waiting {
+            self.overlay
+                .model
+                .set_delivery(DeliveryStatus::Idle, Instant::now());
+        }
     }
 
     /// New insertion settings, from the next delivery on. Copy only
@@ -528,6 +583,7 @@ impl StarlingApp {
             .is_some_and(|armed| armed.take_id == id)
         {
             self.delivery.staged_armed = None;
+            self.overlay_insert_unarmed();
         }
     }
 
@@ -557,6 +613,7 @@ impl StarlingApp {
         ) {
             Plan::Skip => {}
             Plan::Fail(failure) => {
+                self.overlay_delivery_ended(false, Some(&failure), cx);
                 self.delivery
                     .replace_recovery(Some(Recovery::new(id, text, failure)));
                 cx.notify();
@@ -585,6 +642,7 @@ impl StarlingApp {
         let previous = self.delivery.last_insert.take();
         let budget = typing_budget(&text);
         let out = self.delivery.insert_out.clone();
+        self.overlay_insert_started(cx);
         let insert = cx.spawn(async move |this, cx| {
             if let Some(previous) = previous {
                 previous.await;
@@ -628,6 +686,7 @@ impl StarlingApp {
         result: Result<starling_insertion::InsertReceipt, Failure>,
         cx: &mut Context<Self>,
     ) {
+        self.overlay_delivery_ended(true, result.as_ref().err(), cx);
         // A staged take's Insert shows "Inserted"; after a failure, the
         // notice's Paste last is the retry.
         if result.is_ok() && self.staged_text_for(&id).is_some() {
@@ -772,6 +831,7 @@ impl StarlingApp {
             capture,
             armed_at,
         });
+        self.set_delivery_status(DeliveryStatus::Waiting, cx);
         cx.spawn(async move |this, cx| {
             cx.background_executor().timer(PASTE_ARM_TIMEOUT).await;
             this.update(cx, |app, cx| {
@@ -798,6 +858,7 @@ impl StarlingApp {
     /// press, if its panel is still there to press it.
     fn disarm_staged_insert(&mut self) {
         if let Some(armed) = self.delivery.staged_armed.take() {
+            self.overlay_insert_unarmed();
             if self.staging_shows(&armed.take_id) {
                 self.delivery.by_take.insert(armed.take_id, armed.capture);
             }
@@ -831,6 +892,7 @@ impl StarlingApp {
         else {
             return;
         };
+        self.overlay_insert_unarmed();
         let Some(text) = self.staged_text_for(&id).or_else(|| self.head_text(&id)) else {
             cx.notify();
             return;
@@ -854,6 +916,7 @@ impl StarlingApp {
         match plan(&capture, self.delivery.settings, verified, false, &text) {
             Plan::Skip => {}
             Plan::Fail(failure) => {
+                self.overlay_delivery_ended(false, Some(&failure), cx);
                 self.delivery
                     .replace_recovery(Some(Recovery::new(&id, text, failure)));
             }
@@ -957,11 +1020,14 @@ impl StarlingApp {
                 self.spawn_insert(id, target, text, Some(generation), cx);
             }
             Plan::Skip => {
+                let failure = Failure::Insert(InsertError::TargetIsStarling);
+                self.overlay_delivery_ended(false, Some(&failure), cx);
                 if let Some(recovery) = self.delivery.recovery.as_mut() {
-                    recovery.failure = Failure::Insert(InsertError::TargetIsStarling);
+                    recovery.failure = failure;
                 }
             }
             Plan::Fail(failure) => {
+                self.overlay_delivery_ended(false, Some(&failure), cx);
                 if let Some(recovery) = self.delivery.recovery.as_mut() {
                     recovery.failure = failure;
                 }
@@ -1164,6 +1230,39 @@ mod tests {
                 .to_vec()
         );
         assert_eq!(failure(&app, cx), None);
+    }
+
+    /// The overlay follows delivery: "Inserting…" until the last of
+    /// overlapping inserts ends, then the outcome; a failure says why.
+    #[gpui::test]
+    fn the_overlay_follows_delivery(cx: &mut gpui::TestAppContext) {
+        let (app, fake) = app_with(cx, on());
+        fake.focus(FakeTarget::named("Editor", "notes.txt"));
+        let status = |app: &gpui::Entity<StarlingApp>, cx: &mut gpui::TestAppContext| {
+            app.read_with(cx, |app, _| app.overlay.model.delivery().clone())
+        };
+        app.update(cx, |app, cx| {
+            for (id, text) in [("take-1", "First."), ("take-2", "Second.")] {
+                app.delivery_take_started();
+                let capture = app.delivery_take_stopped();
+                app.bind_delivery(capture, id);
+                app.sessions.push(session(id, text));
+            }
+            app.deliver_finished_take("take-1", cx);
+            app.deliver_finished_take("take-2", cx);
+        });
+        assert_eq!(status(&app, cx), DeliveryStatus::Delivering);
+        cx.run_until_parked();
+        assert_eq!(fake.field(), "First.Second.");
+        assert_eq!(status(&app, cx), DeliveryStatus::Delivered);
+
+        take(&app, cx, "take-3", "Third.", |_| {
+            fake.focus(FakeTarget::named("Browser", "A tab"));
+        });
+        assert_eq!(
+            status(&app, cx),
+            DeliveryStatus::Failed("Not inserted: focus moved".into())
+        );
     }
 
     #[gpui::test]

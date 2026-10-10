@@ -162,7 +162,8 @@ fn phase_color(phase: OverlayPhase) -> gpui::Rgba {
         OverlayPhase::StartingMic
         | OverlayPhase::Finishing
         | OverlayPhase::Processing
-        | OverlayPhase::Delivering => theme::AMBER,
+        | OverlayPhase::Delivering
+        | OverlayPhase::InsertWaiting => theme::AMBER,
         OverlayPhase::Ready | OverlayPhase::Delivered => theme::LIME,
         OverlayPhase::DeliveryFailed | OverlayPhase::Stopped => theme::CORAL,
     }
@@ -196,6 +197,7 @@ impl Render for OverlayView {
         let busy = !matches!(
             state.phase,
             OverlayPhase::Listening
+                | OverlayPhase::InsertWaiting
                 | OverlayPhase::Ready
                 | OverlayPhase::Delivered
                 | OverlayPhase::DeliveryFailed

@@ -1469,6 +1469,27 @@ mod tests {
         assert_eq!(staged_insert_state(&app, cx, &id), None);
     }
 
+    /// The overlay asks for the switch while a pressed Insert waits, and
+    /// follows its typing.
+    #[gpui::test]
+    fn the_overlay_follows_a_pressed_insert(cx: &mut gpui::TestAppContext) {
+        use crate::overlay::DeliveryStatus;
+        let (_root, app, fake, _id) = staged_insert_take(cx, Default::default(), |_| {});
+        let status = |app: &Entity<StarlingApp>, cx: &mut gpui::TestAppContext| {
+            app.read_with(cx, |app, _| app.overlay.model.delivery().clone())
+        };
+        starling_focus(&app, cx, true);
+        press_insert(&app, cx);
+        assert_eq!(status(&app, cx), DeliveryStatus::Waiting);
+        press_insert(&app, cx);
+        assert_eq!(status(&app, cx), DeliveryStatus::Idle);
+
+        press_insert(&app, cx);
+        starling_focus(&app, cx, false);
+        assert_eq!(fake.insertions().len(), 1);
+        assert_eq!(status(&app, cx), DeliveryStatus::Delivered);
+    }
+
     /// A pressed Insert types nothing once it expired, even before its
     /// expiry timer ran, nor once copy only was chosen.
     #[gpui::test]

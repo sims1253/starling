@@ -71,6 +71,9 @@ pub(crate) enum OverlayPhase {
     Processing,
     /// The text is being inserted into the target (#220).
     Delivering,
+    /// A staged take's Insert was pressed: it types once focus leaves
+    /// Starling's window.
+    InsertWaiting,
     /// The take's transcript is in Starling.
     Ready,
     /// The text landed in the target.
@@ -95,6 +98,7 @@ impl OverlayPhase {
             OverlayPhase::Finishing => "Finishing recognition…",
             OverlayPhase::Processing => "Processing…",
             OverlayPhase::Delivering => "Inserting…",
+            OverlayPhase::InsertWaiting => "Switch to the window to insert",
             OverlayPhase::Ready => "Transcript ready in Starling",
             OverlayPhase::Delivered => "Inserted",
             OverlayPhase::DeliveryFailed => "Insert failed — your text is in Starling",
@@ -105,12 +109,12 @@ impl OverlayPhase {
 
 /// How delivering the take's text is going. Fed by the insertion path
 /// (`StarlingApp::set_delivery_status`); the overlay only displays it.
-/// Nothing feeds it yet: the insertion path (#220) lands separately.
-#[allow(dead_code)]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) enum DeliveryStatus {
     #[default]
     Idle,
+    /// A staged take's Insert waits for focus to leave Starling.
+    Waiting,
     Delivering,
     Delivered,
     /// Why it failed, in the user's words.
@@ -235,8 +239,10 @@ impl OverlayModel {
             Some(Readiness::Listening) => return Some(OverlayPhase::Listening),
             None => {}
         }
-        if self.delivery == DeliveryStatus::Delivering {
-            return Some(OverlayPhase::Delivering);
+        match self.delivery {
+            DeliveryStatus::Delivering => return Some(OverlayPhase::Delivering),
+            DeliveryStatus::Waiting => return Some(OverlayPhase::InsertWaiting),
+            _ => {}
         }
         match &self.follow {
             Follow::Saving(_) => return Some(OverlayPhase::Finishing),
@@ -445,7 +451,6 @@ impl Overlay {
 impl StarlingApp {
     /// What the insertion path reports about delivering the take's text
     /// (#220); the overlay shows it.
-    #[allow(dead_code)]
     pub(crate) fn set_delivery_status(&mut self, status: DeliveryStatus, cx: &mut Context<Self>) {
         self.overlay.model.set_delivery(status, Instant::now());
         self.sync_overlay(cx);
@@ -847,6 +852,11 @@ mod tests {
         let mut model = OverlayModel::new(t0);
         model.take_finished(t0);
         model.take_saved(t0, "take-1");
+        model.set_delivery(DeliveryStatus::Waiting, t0);
+        assert_eq!(
+            model.phase(None, idle(), false, t0),
+            Some(OverlayPhase::InsertWaiting)
+        );
         model.set_delivery(DeliveryStatus::Delivering, t0);
         assert_eq!(
             model.phase(None, idle(), false, t0),
