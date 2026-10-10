@@ -286,12 +286,18 @@ fn main() {
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
     host.shutdown();
-    // Before the println: the console-close handler's bounded wait ends
-    // as soon as the flag is set, so the stop work must be accounted
-    // first — printing after it keeps the handler's remaining grace
-    // budget real.
+    // Print (and flush) before setting the flag: on a console close the
+    // OS ends the process as soon as the handler's wait sees `STOPPED`,
+    // so a line written after it could be lost. The write is fallible:
+    // stdout may already be gone on a console close, and a panicking
+    // `println!` would never set the flag.
+    {
+        use std::io::Write;
+        let mut stdout = std::io::stdout().lock();
+        let _ = writeln!(stdout, "{}", serde_json::json!({ "status": "stopped" }));
+        let _ = stdout.flush();
+    }
     STOPPED.store(true, Ordering::SeqCst);
-    println!("{}", serde_json::json!({ "status": "stopped" }));
 }
 
 fn value_of(args: &mut impl Iterator<Item = String>, flag: &str) -> std::path::PathBuf {

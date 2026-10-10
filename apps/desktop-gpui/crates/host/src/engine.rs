@@ -532,16 +532,145 @@ fn manual_slot(endpoint: &str, model: &str) -> (Arc<dyn TranscriptionProvider>, 
         Ok(provider) => (Arc::new(provider), manual_label(endpoint)),
         Err(err) => {
             eprintln!(
-                "starling-runtime-host: manual engine endpoint {endpoint:?} is unusable \
-                 ({err}); transcription stays unconfigured (reporting engine: unconfigured)"
+                "starling-runtime-host: manual engine endpoint {:?} is unusable \
+                 ({err}); transcription stays unconfigured (reporting engine: unconfigured)",
+                redact_endpoint(endpoint)
             );
             (Arc::new(UnconfiguredProvider), "unconfigured".to_string())
         }
     }
 }
 
+/// The label goes to stdout (the launcher's `owner` line) and to every
+/// client's status, so it carries the redacted endpoint too.
 fn manual_label(endpoint: &str) -> String {
-    format!("manual:{endpoint}")
+    format!("manual:{}", redact_endpoint(endpoint))
+}
+
+/// Query keys whose values read as credentials, matched as substrings
+/// of the lower-cased key (`access_token`, `X-Api-Key`, `sig`, …).
+/// Over-matching only costs a `***` in a log line.
+const SECRET_QUERY_KEYS: &[&str] = &[
+    "token",
+    "key",
+    "secret",
+    "password",
+    "passwd",
+    "pwd",
+    "auth",
+    "sig",
+    "credential",
+    "session",
+];
+
+/// `endpoint` as it may be echoed (stderr, the status label): userinfo
+/// (`user:pass@`) and the values of token-like query parameters become
+/// `***`. Plain string surgery rather than a URL parse — the text that
+/// most needs redacting is the endpoint that did not validate (the
+/// client rejects userinfo outright), and it may not parse at all.
+///
+/// The authority is found the way a lenient URL parser finds it: after
+/// the scheme any run of `/` or `\` is skipped (`http:///u:p@h` and
+/// `http:/u:p@h` still carry userinfo), and without a scheme followed
+/// by a slash the authority starts at the very beginning (`http:u:p@h`
+/// is userinfo too, so the conservative reading covers it). The text is
+/// first normalized as that parser does — leading and trailing control
+/// characters and spaces trimmed, embedded tabs and newlines removed —
+/// so ` http://u:p@h` or `?to\tken=` cannot hide a credential from it.
+fn redact_endpoint(endpoint: &str) -> String {
+    let normalized: String = endpoint
+        .trim_matches(|c: char| c <= ' ')
+        .chars()
+        .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
+        .collect();
+    let endpoint = normalized.as_str();
+    // Authority slashes are skipped with or without a scheme, so a
+    // scheme-relative `//user:secret@host` is redacted too.
+    let after_scheme = scheme_end(endpoint)
+        .filter(|&at| endpoint[at..].starts_with(['/', '\\']))
+        .unwrap_or(0);
+    let authority_start = after_scheme
+        + endpoint[after_scheme..]
+            .find(|c| c != '/' && c != '\\')
+            .unwrap_or(endpoint.len() - after_scheme);
+    let authority_end = endpoint[authority_start..]
+        .find(['/', '\\', '?', '#'])
+        .map_or(endpoint.len(), |at| authority_start + at);
+    let mut out = String::with_capacity(endpoint.len());
+    out.push_str(&endpoint[..authority_start]);
+    let authority = &endpoint[authority_start..authority_end];
+    match authority.rfind('@') {
+        Some(at) => {
+            out.push_str("***");
+            out.push_str(&authority[at..]);
+        }
+        None => out.push_str(authority),
+    }
+    let rest = &endpoint[authority_end..];
+    let Some(query_start) = rest.find('?') else {
+        out.push_str(rest);
+        return out;
+    };
+    // A `?` after a `#` is fragment text, not a query.
+    if rest.find('#').is_some_and(|hash| hash < query_start) {
+        out.push_str(rest);
+        return out;
+    }
+    out.push_str(&rest[..=query_start]);
+    let query_and_fragment = &rest[query_start + 1..];
+    let query_end = query_and_fragment
+        .find('#')
+        .unwrap_or(query_and_fragment.len());
+    let pairs: Vec<String> = query_and_fragment[..query_end]
+        .split('&')
+        .map(|pair| match pair.split_once('=') {
+            Some((key, _)) if is_secret_key(key) => format!("{key}=***"),
+            _ => pair.to_string(),
+        })
+        .collect();
+    out.push_str(&pairs.join("&"));
+    out.push_str(&query_and_fragment[query_end..]);
+    out
+}
+
+/// Just past `scheme:` when `endpoint` starts with one
+/// (`ALPHA *( ALPHA / DIGIT / "+" / "-" / "." ) ":"`).
+fn scheme_end(endpoint: &str) -> Option<usize> {
+    let colon = endpoint.find(':')?;
+    let scheme = &endpoint[..colon];
+    let mut chars = scheme.chars();
+    let valid = chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+    valid.then_some(colon + 1)
+}
+
+/// Classifies the percent-decoded key: `%74oken` is `token` to the
+/// server, so it is to the redactor too.
+fn is_secret_key(key: &str) -> bool {
+    let bytes = key.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        let hex = bytes
+            .get(at + 1..at + 3)
+            // Exactly two hex digits: `from_str_radix` alone would take
+            // a sign (`%+f`).
+            .filter(|hex| hex.iter().all(u8::is_ascii_hexdigit))
+            .and_then(|hex| std::str::from_utf8(hex).ok())
+            .and_then(|hex| u8::from_str_radix(hex, 16).ok());
+        match (bytes[at], hex) {
+            (b'%', Some(byte)) => {
+                decoded.push(byte);
+                at += 3;
+            }
+            (byte, _) => {
+                decoded.push(byte);
+                at += 1;
+            }
+        }
+    }
+    let key = String::from_utf8_lossy(&decoded).to_ascii_lowercase();
+    SECRET_QUERY_KEYS.iter().any(|secret| key.contains(secret))
 }
 
 /// Spawns the host's settings watcher (#220): polls `path`'s bytes
@@ -906,6 +1035,81 @@ mod tests {
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || "_.:+-".contains(c)));
         }
+    }
+
+    #[test]
+    fn echoed_endpoints_redact_userinfo_and_token_params() {
+        for (endpoint, echoed) in [
+            ("http://127.0.0.1:8181", "http://127.0.0.1:8181"),
+            (
+                "https://user:hunter2@example.com:8443/v1",
+                "https://***@example.com:8443/v1",
+            ),
+            ("http://token@example.com", "http://***@example.com"),
+            // The last `@` ends the userinfo; an `@` in the path is not one.
+            ("http://a@b:c@example.com/x@y", "http://***@example.com/x@y"),
+            ("user:pw@example.com:8181", "***@example.com:8181"),
+            // Authorities a lenient URL parser still finds.
+            (
+                "http:///user:secret@example.com/v1",
+                "http:///***@example.com/v1",
+            ),
+            (
+                "http:/user:secret@example.com/v1",
+                "http:/***@example.com/v1",
+            ),
+            (
+                "http:\\\\u:p@example.com\\v1",
+                "http:\\\\***@example.com\\v1",
+            ),
+            ("http:user:secret@example.com", "***@example.com"),
+            // Normalized as the client's URL parser normalizes.
+            (
+                " http://user:secret@example.com\n",
+                "http://***@example.com",
+            ),
+            ("ht\ttp://user:secret@example.com", "http://***@example.com"),
+            (
+                "http://example.com/?to\tken=secret",
+                "http://example.com/?token=***",
+            ),
+            // Percent-encoded keys are classified decoded.
+            (
+                "http://example.com/?%74oken=secret&api_%6bey=k&%zz=1",
+                "http://example.com/?%74oken=***&api_%6bey=***&%zz=1",
+            ),
+            (
+                "http://example.com/v1?model=small&access_token=abc&X-Api-Key=k&sig=s",
+                "http://example.com/v1?model=small&access_token=***&X-Api-Key=***&sig=***",
+            ),
+            (
+                "http://u:p@example.com?token=abc#frag",
+                "http://***@example.com?token=***#frag",
+            ),
+            (
+                "http://example.com/#a?token=x",
+                "http://example.com/#a?token=x",
+            ),
+            (
+                "http://example.com/?flag&password",
+                "http://example.com/?flag&password",
+            ),
+            // Scheme-relative endpoints still have an authority.
+            ("//user:secret@example.com/v1", "//***@example.com/v1"),
+            ("\\\\user:secret@example.com", "\\\\***@example.com"),
+            ("not a url", "not a url"),
+            ("", ""),
+        ] {
+            assert_eq!(redact_endpoint(endpoint), echoed, "{endpoint}");
+        }
+        assert_eq!(
+            manual_label("http://example.com/?api_key=abc"),
+            "manual:http://example.com/?api_key=***"
+        );
+        assert_eq!(
+            manual_label("http://example.com/?to\tken=abc"),
+            "manual:http://example.com/?token=***"
+        );
     }
 
     #[test]

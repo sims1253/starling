@@ -59,11 +59,9 @@ jobs:
   # lease/ownership tests over LockFileEx (#220 — their first Windows
   # run found heap corruption, a pipe I/O deadlock and a lease any
   # second host could break, none visible to `cargo check`). The
-  # engine suite's fixture-backed tests (the real starling-serve
-  # sidecar) skip here: the C++ contract fixture is not built on this
-  # runner (deliberate for this PR — see the notice step); the
-  # job-over-the-transport path itself stays covered by the ipc
-  # suite's FakeProvider tests.
+  # engine suite's fixture-backed tests drive the real starling-serve
+  # contract fixture, built here with MSVC like the ubuntu job builds
+  # it with gcc.
   windows-test:
     name: cargo test starling-runtime-host (windows)
     runs-on: windows-2025
@@ -72,17 +70,23 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      # Make the gap visible instead of hiding it in skipped test lines:
-      # the engine suite's fixture-backed tests need the C++ contract
-      # fixture, which this job does not build (a C++ toolchain lane is
-      # its own piece of work). Their own skip line still prints in the
-      # test output below (the fixture() helper).
-      - name: Note the engine fixture gap
-        run: 'echo "::notice::The fixture-backed engine tests (crates/host/tests/engine.rs) skip on this runner: the starling-serve contract fixture is not built here. The jobs-over-named-pipe path remains covered by the ipc suite FakeProvider tests."'
+          # ggml, for the contract fixture below.
+          submodules: recursive
       # One command per step: PowerShell only reports the last native
       # command's exit code, so a combined script could mask a failure.
+      # The runner's default generator is Visual Studio (multi-config),
+      # so the fixture lands in the Release\ subdirectory.
+      - name: Configure the engine contract fixture
+        run: cmake -S . -B build/native-cpu -A x64
+      - name: Build the engine contract fixture
+        run: cmake --build build/native-cpu --config Release --target starling-serve-contract-fixture
       - name: Test the host crate over the named pipe
         working-directory: apps/desktop-gpui
+        env:
+          STARLING_CONTRACT_BIN: ${{ github.workspace }}\build\native-cpu\Release\starling-serve-contract-fixture.exe
+          # A missing fixture fails the engine tests instead of letting
+          # them skip and pass vacuously.
+          STARLING_REQUIRE_CONTRACT_FIXTURE: "1"
         run: cargo test -p starling-runtime-host
       - name: Test the storage-v2 lease
         working-directory: apps/desktop-gpui
