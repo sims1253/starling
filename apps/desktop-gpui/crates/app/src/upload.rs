@@ -543,8 +543,14 @@ impl StarlingApp {
         cx: &mut Context<Self>,
     ) {
         let model_id = pending.model_id.clone();
+        // Activation requests count per host: only this host's reports
+        // say anything about this one.
+        let host = self.host.client.as_ref().map(|client| client.info.pid);
         cx.spawn(async move |this, cx| {
             let mut job = Some((with, pin));
+            // Since when no engine report is in hand (the connection
+            // dropped): the host may be switching all the same.
+            let mut unreported_since: Option<Instant> = None;
             loop {
                 cx.background_executor()
                     .timer(std::time::Duration::from_millis(250))
@@ -578,11 +584,21 @@ impl StarlingApp {
                         cx.notify();
                         return true;
                     }
-                    let progress = match app.engine_snapshot() {
-                        Some(snapshot) => {
-                            switch_progress(&snapshot, &model_id, request, started.elapsed())
+                    let progress = if app.engine_status.is_none() {
+                        let since = *unreported_since.get_or_insert_with(Instant::now);
+                        unreported_progress(since.elapsed(), app.engine_unavailable())
+                    } else if app.host.client.as_ref().map(|client| client.info.pid) != host {
+                        SwitchProgress::Failed(
+                            "the recording service restarted while the model loaded.".to_string(),
+                        )
+                    } else {
+                        unreported_since = None;
+                        match app.engine_snapshot() {
+                            Some(snapshot) => {
+                                switch_progress(&snapshot, &model_id, request, started.elapsed())
+                            }
+                            None => SwitchProgress::Failed(app.engine_unavailable()),
                         }
-                        None => SwitchProgress::Failed(app.engine_unavailable()),
                     };
                     match progress {
                         SwitchProgress::Waiting => false,
@@ -727,6 +743,21 @@ const RETRY_SWITCH_CAP: std::time::Duration = std::time::Duration::from_secs(10 
 /// command queue can be busy winding down an earlier switch) before the
 /// retry gives up.
 const RETRY_SWITCH_PICKUP: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long a retry's switch is waited for with no engine report in hand
+/// (a dropped connection reconnecting) before the retry gives up.
+const RETRY_UNREPORTED_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A retry's switch while no engine report is in hand, for `missing`:
+/// waited for a while (a reconnect brings the report), then given up on
+/// with `why`.
+pub(crate) fn unreported_progress(missing: std::time::Duration, why: String) -> SwitchProgress {
+    if missing < RETRY_UNREPORTED_WAIT {
+        SwitchProgress::Waiting
+    } else {
+        SwitchProgress::Failed(why)
+    }
+}
 
 /// Read an engine snapshot for a retry waiting on `model_id`, whose
 /// switch is the engine's activation `request`.
@@ -885,6 +916,18 @@ mod tests {
     fn handled(mut snapshot: EngineSnapshot, handled: u64) -> EngineSnapshot {
         snapshot.activations_handled = handled;
         snapshot
+    }
+
+    /// A dropped connection mid-switch is waited through (the host may
+    /// still be switching), for a while.
+    #[test]
+    fn a_retry_waits_through_a_missing_engine_report_for_a_while() {
+        let secs = std::time::Duration::from_secs;
+        assert_eq!(unreported_progress(secs(1), "gone".into()), SwitchProgress::Waiting);
+        assert_eq!(
+            unreported_progress(RETRY_UNREPORTED_WAIT, "gone".into()),
+            SwitchProgress::Failed("gone".into())
+        );
     }
 
     #[test]
