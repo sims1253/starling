@@ -534,16 +534,37 @@ mod tests {
         "./starling-serve-vulkan: error while loading shared libraries: libvulkan.so.1: cannot open shared object file: No such file or directory\n"
     }
 
+    /// Writes a fake engine script and marks it executable. A `sh` child
+    /// writes the file, never a descriptor in this process: tests run on
+    /// parallel threads, and a sibling test's spawn that forks while such
+    /// a descriptor is open copies it into a child holding it until that
+    /// child execs. Exec'ing the script in that window fails with ETXTBSY
+    /// ("Text file busy"), under any name it was renamed to.
     #[cfg(unix)]
-    fn make_executable(path: &Path) {
-        use std::os::unix::fs::PermissionsExt;
-        let mut permissions = std::fs::metadata(path).expect("stat").permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(path, permissions).expect("chmod");
+    fn write_executable(path: &Path, script: &str) {
+        use std::io::Write;
+        let mut writer = Command::new("sh")
+            .args(["-c", "cat > \"$0\" && chmod 755 \"$0\""])
+            .arg(path)
+            .stdin(Stdio::piped())
+            .spawn()
+            .expect("spawn sh");
+        writer
+            .stdin
+            .take()
+            .expect("sh stdin")
+            .write_all(script.as_bytes())
+            .expect("write engine");
+        assert!(
+            writer.wait().expect("wait for sh").success(),
+            "write engine"
+        );
     }
 
     #[cfg(not(unix))]
-    fn make_executable(_path: &Path) {}
+    fn write_executable(path: &Path, script: &str) {
+        std::fs::write(path, script).expect("write engine");
+    }
 
     #[test]
     fn parses_version_output() {
@@ -682,12 +703,10 @@ mod tests {
         // A script whose --version exits 127 naming libvulkan: the classic
         // "Vulkan build without the driver" case.
         let engine = dir.path().join("starling-serve-vulkan");
-        std::fs::write(
+        write_executable(
             &engine,
             "#!/bin/sh\necho 'error while loading shared libraries: libvulkan.so.1: cannot open' >&2\nexit 127\n",
-        )
-        .expect("write engine");
-        make_executable(&engine);
+        );
         let hex = crate::engine::bundle::sha256_file(&engine).expect("hash");
         std::fs::write(
             dir.path().join("engines.json"),
@@ -721,12 +740,10 @@ mod tests {
     fn select_backend_surfaces_abi_mismatch() {
         let dir = tempfile::tempdir().expect("tempdir");
         let engine = dir.path().join("starling-serve-cpu");
-        std::fs::write(
+        write_executable(
             &engine,
             "#!/bin/sh\necho 'starling-serve 0.1.0'\necho 'abi-version: 7'\necho 'backend: cpu'\n",
-        )
-        .expect("write engine");
-        make_executable(&engine);
+        );
         let hex = crate::engine::bundle::sha256_file(&engine).expect("hash");
         std::fs::write(
             dir.path().join("engines.json"),
@@ -758,15 +775,13 @@ mod tests {
         for backend in ["vulkan", "cpu"] {
             let name = format!("starling-serve-{backend}");
             let path = dir.join(&name);
-            std::fs::write(
+            write_executable(
                 &path,
-                format!(
+                &format!(
                     "#!/bin/sh\ncat <<'EOF'\nstarling-serve 1.2.3\nabi-version: {}\nbackend: {backend}\nsupported-models: parakeet\nEOF\n",
                     crate::engine::EXPECTED_ENGINE_ABI
                 ),
-            )
-            .expect("write engine");
-            make_executable(&path);
+            );
             let real = crate::engine::bundle::sha256_file(&path).expect("hash");
             let hex = if correct_sums { real } else { "0".repeat(64) };
             let sums_path = dir.join("SHA256SUMS.txt");
@@ -793,15 +808,13 @@ mod tests {
         // The ABI matches EXPECTED_ENGINE_ABI so the probe reaches the version
         // check this test exercises (an ABI mismatch would short-circuit to
         // AbiMismatch before the version comparison).
-        std::fs::write(
+        write_executable(
             &engine,
-            format!(
+            &format!(
                 "#!/bin/sh\necho 'starling-serve 0.9.0'; echo 'abi-version: {}'; echo 'backend: cpu'\n",
                 crate::engine::EXPECTED_ENGINE_ABI
             ),
-        )
-        .expect("write engine");
-        make_executable(&engine);
+        );
         match probe_engine(&engine, Some("1.0.0")) {
             Err(ProbeFailure::VersionMismatch { found, expected }) => {
                 assert_eq!(found, "0.9.0");
@@ -816,12 +829,10 @@ mod tests {
     fn probe_detects_abi_mismatch() {
         let dir = tempfile::tempdir().expect("tempdir");
         let engine = dir.path().join("engine");
-        std::fs::write(
+        write_executable(
             &engine,
             "#!/bin/sh\necho 'starling-serve 0.1.0'; echo 'abi-version: 7'; echo 'backend: cpu'\n",
-        )
-        .expect("write engine");
-        make_executable(&engine);
+        );
         match probe_engine(&engine, None) {
             Err(ProbeFailure::AbiMismatch { found, expected }) => {
                 assert_eq!(found, 7);
