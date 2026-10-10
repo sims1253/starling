@@ -5792,12 +5792,15 @@ name = "starling-insertion"
 version = "0.1.0"
 dependencies = [
  "log",
+ "serde",
  "starling-insertion",
  "starling-runtime",
+ "tempfile",
  "wayland-client",
  "wayland-scanner",
  "windows-sys 0.59.0",
  "x11rb",
+ "zbus",
 ]
 
 [[package]]

@@ -33,8 +33,8 @@ use starling_dictation::storage::{ListedRecord, StorageError};
 use starling_dictation::store_v2::{CorrectionDecision, CorrectionRecord};
 
 pub use facade::{
-    v2_summary, AudioHold, AudioPin, Facade, ProcessingDoc, ProposalOrigin, ProposalRow,
-    RowStatus, SavedTake, UpkeepReport,
+    v2_summary, AudioHold, AudioPin, BoundaryRevision, Facade, ProcessingDoc, ProposalOrigin,
+    ProposalRow, RowStatus, SavedTake, UpkeepReport,
 };
 pub use service::{History, LocalHistory, UPKEEP_FIRST, UPKEEP_INTERVAL};
 pub(crate) use service::{start_workers, store_queue, submit, StoreJob};
@@ -85,6 +85,13 @@ pub enum StoreRequest {
         kind: String,
         occurred_at: String,
         payload_json: String,
+    },
+    /// A delivery the insertion-boundary rules adjusted (#341).
+    RecordBoundaryRevision {
+        id: String,
+        source_text: String,
+        text: String,
+        changes: Vec<String>,
     },
     /// `bool`: `false` when the take is excluded (secure field).
     RecordCorrection { record: CorrectionRecord },
@@ -437,6 +444,21 @@ impl<C: StoreCall> HistoryClient<C> {
             kind: kind.to_string(),
             occurred_at: occurred_at.to_string(),
             payload_json: payload_json.to_string(),
+        })
+    }
+
+    pub fn record_boundary_revision(
+        &self,
+        id: &str,
+        source_text: &str,
+        text: &str,
+        changes: &[String],
+    ) -> Result<(), StorageError> {
+        self.done(StoreRequest::RecordBoundaryRevision {
+            id: id.to_string(),
+            source_text: source_text.to_string(),
+            text: text.to_string(),
+            changes: changes.to_vec(),
         })
     }
 

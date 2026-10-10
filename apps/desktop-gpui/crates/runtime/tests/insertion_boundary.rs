@@ -518,6 +518,47 @@ fn apply_rechecks_the_boundary_and_target_after_registering() {
     session.runtime.shutdown();
 }
 
+/// A busy document service is retried like a moving boundary: each
+/// refused registration reads the boundary again, and after the last
+/// attempt apply fails with `document_service_busy`, inserting nothing.
+/// Once the service drains, the next delivery registers and lands.
+#[test]
+fn apply_retries_a_busy_document_service_then_fails() {
+    let mut session = Session::start(ScriptedAdapter::new());
+    session.commit("notes", "rev-1", "Fox jumps");
+    // Nothing to derive at prepare, so prepare never waits on the service.
+    let delivery = session.prepare("rev-1", "field-start");
+
+    let hold = session.runtime.hold_document_service();
+    let reads = session.adapter.reads();
+    session.adapter.queue_befores(&[
+        "The quick brown",
+        "The quick brown",
+        "The quick brown",
+        "The quick brown",
+    ]);
+    assert_eq!(
+        session.apply(delivery),
+        Event::DeliveryFailed {
+            reason: "document_service_busy".into(),
+            fallback_suggested: true,
+        }
+    );
+    // The first read, then one more per refused registration.
+    assert_eq!(session.adapter.reads(), reads + 4, "read order drifted");
+    assert!(session.adapter.inserted().is_empty());
+
+    drop(hold);
+    assert_eq!(session.deliver("rev-1", "mid-sentence"), " fox jumps");
+    let view = session.docs_get("notes");
+    assert!(revisions(&view).contains(&derived(
+        "rev-1:boundary-space-case",
+        " fox jumps",
+        "rev-1"
+    )));
+    session.runtime.shutdown();
+}
+
 /// A derivation prepare already recorded is delivered as is: apply reads
 /// the boundary once and does not wait on the document service, so the
 /// target is revalidated only once.

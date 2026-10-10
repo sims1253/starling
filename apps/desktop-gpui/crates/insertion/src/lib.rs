@@ -37,6 +37,8 @@ use std::fmt;
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "linux")]
+pub mod atspi;
 #[cfg(feature = "runtime")]
 pub mod runtime;
 #[cfg(any(test, feature = "test-doubles"))]
@@ -115,6 +117,43 @@ pub struct SurroundingText {
     pub before: String,
     pub after: String,
     pub selection: Option<std::ops::Range<usize>>,
+}
+
+/// What reading a target's surrounding text found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Surrounding {
+    Text(SurroundingText),
+    /// Nothing reports it: no backend or field reader can, the field is
+    /// not the one captured any more, or a call failed.
+    Unsupported,
+    /// A password field: refused before any text was read.
+    Protected,
+}
+
+/// Where a target's focused text field was when the target was captured
+/// ([`FieldReader::locate`]). Not part of the target's identity: a field
+/// reader reads it only while it is still the focused field of that
+/// process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FieldAnchor {
+    /// The owning application's name on the accessibility bus.
+    pub bus_name: String,
+    /// The field's object path.
+    pub path: String,
+    pub pid: u32,
+}
+
+/// Finds and reads a target's focused text field where the typing
+/// backend cannot (AT-SPI on Linux, `atspi::AtspiReader`). Blocking,
+/// bounded calls: run it off the UI thread.
+pub trait FieldReader: Send + Sync {
+    /// The focused field of `target`'s application now, if exactly one
+    /// can be told.
+    fn locate(&self, target: &TargetSnapshot) -> Option<FieldAnchor>;
+    /// The text before the insertion point of `field`, while it is still
+    /// focused and owned by `target`'s process. A password field is
+    /// [`Surrounding::Protected`] without reading anything.
+    fn read(&self, target: &TargetSnapshot, field: &FieldAnchor) -> Surrounding;
 }
 
 /// What revalidating a snapshot found.
@@ -277,13 +316,12 @@ pub trait InsertionBackend: Send + Sync {
     /// nothing usable is focused.
     fn capture(&self) -> Result<TargetSnapshot, InsertError>;
     fn revalidate(&self, target: &TargetSnapshot) -> Result<TargetCheck, InsertError>;
-    /// Text around the target's cursor; `Ok(None)` when the backend
-    /// cannot report it.
-    fn surrounding_text(
-        &self,
-        _target: &TargetSnapshot,
-    ) -> Result<Option<SurroundingText>, InsertError> {
-        Ok(None)
+    /// Text around the target's cursor, where the backend's own protocol
+    /// reports it (none does yet: X11, Windows and the virtual keyboard
+    /// cannot see a field). A backend that can tell a password field
+    /// answers [`Surrounding::Protected`] before reading.
+    fn surrounding_text(&self, _target: &TargetSnapshot) -> Surrounding {
+        Surrounding::Unsupported
     }
     /// Type `text` into `target`, following the crate rules above.
     fn insert(&self, target: &TargetSnapshot, text: &str) -> Result<InsertReceipt, InsertError>;
@@ -320,6 +358,8 @@ pub struct BackendAvailability {
 /// scheme.
 pub struct Inserter {
     backends: Vec<Box<dyn InsertionBackend>>,
+    /// Reads fields the backends cannot (AT-SPI on Linux).
+    fields: Option<Box<dyn FieldReader>>,
     /// Held for a whole [`Inserter::insert`], whatever the backend: two
     /// inserts typing at once would interleave in the target. Not every
     /// backend serializes itself (Windows sends chunk by chunk).
@@ -339,6 +379,14 @@ impl Inserter {
     pub fn with_excluded_pids(excluded: Vec<u32>) -> Inserter {
         // The session's own backend first, so when nothing is available
         // its reason is the one reported (X11 always refuses on Wayland).
+        #[cfg(target_os = "linux")]
+        let fields: Option<Box<dyn FieldReader>> = Some(Box::new(atspi::AtspiReader::new(
+            merge_excluded_pids(excluded.clone()),
+        )));
+        // No Windows field reader: UI Automation's TextPattern would need
+        // COM bindings this crate does not carry.
+        #[cfg(not(target_os = "linux"))]
+        let fields: Option<Box<dyn FieldReader>> = None;
         #[cfg(target_os = "linux")]
         let backends: Vec<Box<dyn InsertionBackend>> = {
             let x11: Box<dyn InsertionBackend> =
@@ -360,13 +408,59 @@ impl Inserter {
             let _ = excluded;
             Vec::new()
         };
-        Inserter::with_backends(backends)
+        let mut inserter = Inserter::with_backends(backends);
+        inserter.fields = fields;
+        inserter
     }
 
     pub fn with_backends(backends: Vec<Box<dyn InsertionBackend>>) -> Inserter {
         Inserter {
             backends,
+            fields: None,
             insert_lock: Mutex::new(()),
+        }
+    }
+
+    /// Reads the fields the backends cannot through `fields`.
+    pub fn with_field_reader(mut self, fields: Box<dyn FieldReader>) -> Inserter {
+        self.fields = Some(fields);
+        self
+    }
+
+    /// The focused field of a target just captured, for
+    /// [`Inserter::surrounding_text`] later; `None` without a field
+    /// reader or when no single field can be told. Blocking.
+    pub fn locate_field(&self, target: &TargetSnapshot) -> Option<FieldAnchor> {
+        self.fields.as_ref()?.locate(target)
+    }
+
+    /// The text around `target`'s insertion point: the backend's own
+    /// report where it has one, else the field located at capture
+    /// (`field`) through the field reader. Blocking.
+    pub fn surrounding_text(
+        &self,
+        target: &TargetSnapshot,
+        field: Option<&FieldAnchor>,
+    ) -> Surrounding {
+        if let Some(backend) = self.backend_for(target) {
+            match backend.surrounding_text(target) {
+                Surrounding::Unsupported => {}
+                known => return known,
+            }
+        }
+        match (&self.fields, field) {
+            (Some(fields), Some(field)) => fields.read(target, field),
+            _ => Surrounding::Unsupported,
+        }
+    }
+
+    /// The text around the insertion point of `field`, the field located
+    /// at `target`'s capture, through the field reader only: never what
+    /// is focused now unless it is that field. Blocking.
+    pub fn read_field(&self, target: &TargetSnapshot, field: &FieldAnchor) -> Surrounding {
+        match &self.fields {
+            Some(fields) => fields.read(target, field),
+            None => Surrounding::Unsupported,
         }
     }
 
@@ -495,10 +589,7 @@ impl<T: InsertionBackend + ?Sized> InsertionBackend for std::sync::Arc<T> {
     fn revalidate(&self, target: &TargetSnapshot) -> Result<TargetCheck, InsertError> {
         (**self).revalidate(target)
     }
-    fn surrounding_text(
-        &self,
-        target: &TargetSnapshot,
-    ) -> Result<Option<SurroundingText>, InsertError> {
+    fn surrounding_text(&self, target: &TargetSnapshot) -> Surrounding {
         (**self).surrounding_text(target)
     }
     fn insert(&self, target: &TargetSnapshot, text: &str) -> Result<InsertReceipt, InsertError> {
@@ -684,6 +775,51 @@ mod tests {
             && token
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':' | '+' | '-'))
+    }
+
+    #[test]
+    fn surrounding_text_asks_the_backend_first_then_the_field_located_at_capture() {
+        use crate::testing::{FakeFields, FakeTarget};
+        let fake = std::sync::Arc::new(FakeBackend::new());
+        fake.focus(FakeTarget::named("Notes", "Meeting notes"));
+        let fields = std::sync::Arc::new(FakeFields::new());
+        let inserter = Inserter::with_backends(vec![Box::new(fake.clone())])
+            .with_field_reader(Box::new(fields.clone()));
+        let target = fake.capture().unwrap();
+
+        // Nothing focused to locate, and no anchor: nothing to read.
+        assert_eq!(inserter.locate_field(&target), None);
+        assert_eq!(
+            inserter.surrounding_text(&target, None),
+            Surrounding::Unsupported
+        );
+
+        fields.focus_text("The quick");
+        let field = inserter.locate_field(&target).expect("a focused field");
+        let text = |before: &str| {
+            Surrounding::Text(SurroundingText {
+                before: before.to_string(),
+                after: String::new(),
+                selection: None,
+            })
+        };
+        assert_eq!(
+            inserter.surrounding_text(&target, Some(&field)),
+            text("The quick")
+        );
+        // Another field took focus since: the located one is not read.
+        fields.focus_text("Elsewhere");
+        assert_eq!(
+            inserter.surrounding_text(&target, Some(&field)),
+            Surrounding::Unsupported
+        );
+        // A backend that reports the field itself wins.
+        fake.set_surrounding(Surrounding::Protected);
+        assert_eq!(
+            inserter.surrounding_text(&target, Some(&field)),
+            Surrounding::Protected
+        );
+        assert_eq!(fields.text_reads(), 1);
     }
 
     #[test]

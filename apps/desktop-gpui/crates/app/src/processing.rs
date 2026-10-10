@@ -34,7 +34,8 @@ use starling_dictation::storage::{self, now_iso};
 use starling_dictation::store_v2::{CorrectionDecision, CorrectionRecord};
 use starling_processing::CancelToken;
 use starling_processing::contract::{
-    ContextField, Failure, FailureReason, Locality, ModeEntry, ProcessingRoute, ProfilesDocument,
+    Behavior, ContextField, Failure, FailureReason, Locality, ModeEntry, ProcessingRoute,
+    ProfilesDocument,
     ProviderDecl, ProviderKind, ResultStatus, RouteBlock, Timing, TransformKind, TransformRequest,
     TransformResult, processing_route,
 };
@@ -140,6 +141,17 @@ fn route_take<'a>(doc: &'a ProfilesDocument, text: &str, active: &'a ModeEntry) 
         }
         _ => TakeRoute::Active,
     }
+}
+
+/// Whether a take dictated in `mode` goes into a field verbatim (#341):
+/// a verbatim mode turns the insertion-boundary rules off, also when a
+/// spoken override at the start of `text` routes the take to one.
+pub(crate) fn delivers_verbatim(mode: &'static ModeEntry, text: &str) -> bool {
+    let routed = match route_take(modes(), text, mode) {
+        TakeRoute::Override { mode, .. } => mode,
+        TakeRoute::Active | TakeRoute::Conflict(_) => mode,
+    };
+    routed.behavior == Behavior::Verbatim
 }
 
 pub(crate) fn s1_declaration() -> ProviderDecl {
@@ -1965,6 +1977,7 @@ mod tests {
             raw_text: "um clean".to_string(),
             proposals: vec![row.clone()],
             accepted_request: None,
+            boundary: Vec::new(),
         };
         let view = TakeProcessing::from_doc(&doc);
         assert_eq!(view.state, ProcessingState::Proposal { row, current: true });
@@ -1994,6 +2007,7 @@ mod tests {
                 origin: None,
             }],
             accepted_request: None,
+            boundary: Vec::new(),
         };
         assert!(matches!(
             TakeProcessing::from_doc(&doc).state,
