@@ -7,7 +7,8 @@
 //!
 //! ```text
 //! <root>/starling.db   SQLite (WAL) transactional metadata
-//! <root>/audio/        <captureId>.sj finalized sample journals
+//! <root>/audio/        <captureId>.sj finalized sample journals, or
+//!                      <captureId>.flac once compressed (#342)
 //! <root>/staging/      <captureId>.sj in-flight journals (§4 step 1)
 //! <root>/quarantine/   deliberately-deleted journals (R21 tombstones)
 //! <root>/attempt-locks/ <attemptId>.lock in-flight recognition markers (#213)
@@ -92,11 +93,12 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::{params, Connection, OptionalExtension};
 
-use crate::audio::decode_pcm16_wav;
+use crate::audio::{decode_pcm16_wav, pcm16_to_f32, request_pcm16, STARLING_SAMPLE_RATE};
+use crate::flac;
 use crate::journal::{
     self, JournalWriter, read_journal, samples_hash, seal_recovered_journal, sync_dir,
 };
-use crate::storage::{is_safe_path_component, now_iso};
+use crate::storage::{is_safe_path_component, iso_utc, now_iso};
 
 /// Schema version of `starling.db` this build writes and understands.
 /// Bump only with an additive migration path; a DB holding a higher value
@@ -161,6 +163,31 @@ const LEASE_SENTINEL_FILE: &str = ".lock";
 /// (never-delete-until-swept), but nothing writes into it anymore.
 const LEGACY_DELETED_SUBPATH: &str = "journals/deleted";
 const DB_FILE: &str = "starling.db";
+/// Extension of a FLAC encode in progress under `audio/` (#342): written,
+/// fsynced and verified there, then renamed onto `<id>.flac`.
+const FLAC_TEMP_EXT: &str = "flac-tmp";
+/// How old a FLAC temporary must be before reconcile removes it: a live
+/// compressor's temp (create → verify → rename, seconds even for an
+/// hour-long take) is always younger.
+const FLAC_TEMP_GRACE: std::time::Duration = std::time::Duration::from_secs(600);
+/// Tombstone ids of audio the retention policy removed are
+/// `audio:<captureId>` (kind `audio`): the take's row stays, only its
+/// audio is gone. The prefix keeps them out of the capture-id space, so
+/// reconcile's dead set never mistakes one for a deleted take.
+const AUDIO_TOMBSTONE_PREFIX: &str = "audio:";
+
+/// The retention class every take starts in.
+pub const STANDARD_CLASS: &str = "standard";
+/// The opt-in archival class (#342): its own retention limits. Lossy
+/// (Opus) archival encoding is not implemented — takes moved here stay
+/// lossless.
+pub const ARCHIVAL_CLASS: &str = "archival";
+
+/// Default [`RetentionPolicy::grace`]: no take younger than a day loses
+/// its audio to a retention limit, so a take whose transcription just
+/// failed always survives long enough to retry (#356).
+pub const DEFAULT_RETENTION_GRACE: std::time::Duration =
+    std::time::Duration::from_secs(24 * 60 * 60);
 
 /// The §4 schema, in one place. `CREATE ... IF NOT EXISTS` throughout so
 /// applying it to an existing same-version database is a no-op.
@@ -312,6 +339,8 @@ pub enum StoreV2Error {
     Storage(#[from] crate::storage::StorageError),
     #[error("audio error: {0}")]
     Audio(#[from] crate::audio::AudioFormatError),
+    #[error("{0}")]
+    Flac(#[from] crate::flac::FlacError),
 }
 
 /// Lifecycle status of a v2 capture row. Recognition progress lives in
@@ -839,6 +868,44 @@ impl StoreV2 {
 
     fn quarantine_path(&self, id: &str) -> PathBuf {
         self.root.join(QUARANTINE_DIR).join(format!("{id}.sj"))
+    }
+
+    /// A compressed take's audio (#342): `audio/<id>.flac`.
+    fn flac_path(&self, id: &str) -> PathBuf {
+        self.root.join(AUDIO_DIR).join(format!("{id}.{}", flac::FLAC_EXT))
+    }
+
+    fn quarantine_flac_path(&self, id: &str) -> PathBuf {
+        self.root
+            .join(QUARANTINE_DIR)
+            .join(format!("{id}.{}", flac::FLAC_EXT))
+    }
+
+    /// Whether `audio/` holds any audio for `id`, journal or FLAC.
+    fn has_audio(&self, id: &str) -> bool {
+        self.audio_path(id).exists() || self.flac_path(id).exists()
+    }
+
+    /// Move every audio file `id` has in `audio/` (journal and/or FLAC)
+    /// into `quarantine/` — a delete's tombstone commit point (R21).
+    fn quarantine_audio(&self, id: &str) -> Result<(), StoreV2Error> {
+        let mut moved = false;
+        for (from, to) in [
+            (self.audio_path(id), self.quarantine_path(id)),
+            (self.flac_path(id), self.quarantine_flac_path(id)),
+        ] {
+            if from.exists() {
+                std::fs::create_dir_all(self.root.join(QUARANTINE_DIR))?;
+                let _ = std::fs::remove_file(&to); // stale tombstone
+                std::fs::rename(&from, &to)?;
+                moved = true;
+            }
+        }
+        if moved {
+            sync_dir(&self.root.join(AUDIO_DIR))?;
+            sync_dir(&self.root.join(QUARANTINE_DIR))?;
+        }
+        Ok(())
     }
 
     // ------------------------------------------------------------------
@@ -1683,8 +1750,13 @@ impl StoreV2 {
                         }));
                         continue;
                     }
-                    let problems = self.audio_problems(&record);
-                    records.push(ListedCapture::Capture(CaptureListing { record, problems }));
+                    let audio = self.audio_at_rest(&id)?;
+                    let problems = self.audio_problems(&record, &audio);
+                    records.push(ListedCapture::Capture(CaptureListing {
+                        record,
+                        problems,
+                        audio,
+                    }));
                 }
                 Err(err) => records.push(ListedCapture::Damaged(DamagedCaptureV2 {
                     id,
@@ -1700,10 +1772,56 @@ impl StoreV2 {
         })
     }
 
+    /// What form a take's audio is kept in (#342): its journal, its
+    /// FLAC, removed by the retention policy, or missing. A retention
+    /// stamp wins over files still on disk — the policy's unlink follows
+    /// the stamp, and a crash between the two is finished by reconcile.
+    pub fn audio_at_rest(&self, id: &str) -> Result<AudioAtRest, StoreV2Error> {
+        if let Some(utc) = self.audio_retired_utc(id)? {
+            return Ok(AudioAtRest::Retired { utc });
+        }
+        Ok(if self.audio_path(id).exists() {
+            AudioAtRest::Journal
+        } else if self.flac_path(id).exists() {
+            AudioAtRest::Flac
+        } else {
+            AudioAtRest::Missing
+        })
+    }
+
+    /// When the retention policy removed `id`'s audio, if it did.
+    pub fn audio_retired_utc(&self, id: &str) -> Result<Option<String>, StoreV2Error> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT deleted_utc FROM tombstones WHERE id = ?1 AND kind = 'audio'",
+                params![format!("{AUDIO_TOMBSTONE_PREFIX}{id}")],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
     /// Bounded per-record audio check: the reasons a committed row cannot
-    /// currently be played back, without loading any samples.
-    fn audio_problems(&self, record: &CaptureRecord) -> Vec<String> {
-        let path = self.audio_path(&record.id);
+    /// currently be played back, without loading any samples. Audio the
+    /// retention policy removed is not a problem — the listing reports
+    /// it as [`AudioAtRest::Retired`].
+    fn audio_problems(&self, record: &CaptureRecord, audio: &AudioAtRest) -> Vec<String> {
+        let path = match audio {
+            AudioAtRest::Retired { .. } => return Vec::new(),
+            AudioAtRest::Flac => {
+                return match std::fs::File::open(self.flac_path(&record.id)).and_then(|mut file| {
+                    use std::io::Read;
+                    let mut magic = [0u8; 4];
+                    file.read_exact(&mut magic)?;
+                    Ok(magic)
+                }) {
+                    Ok(magic) if &magic == b"fLaC" => Vec::new(),
+                    Ok(_) => vec!["compressed audio does not start with the FLAC marker".to_string()],
+                    Err(err) => vec![format!("compressed audio: {err}")],
+                };
+            }
+            AudioAtRest::Journal | AudioAtRest::Missing => self.audio_path(&record.id),
+        };
         match std::fs::metadata(&path) {
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
                 vec!["audio journal is missing — the take was committed but its journal \
@@ -1739,18 +1857,32 @@ impl StoreV2 {
     /// file is gone. Deliberately split out so a caller sharing the store
     /// behind a lock can resolve the path under the guard and do the heavy
     /// read + verify + WAV encode (via [`read_audio_journal`]) without it.
+    ///
+    /// The path is the journal while one exists, else the take's FLAC
+    /// (#342); [`read_audio_journal`] reads either, and falls over to the
+    /// FLAC when compression replaced the journal between the two calls.
     pub fn audio_journal_path(&self, id: &str) -> Result<PathBuf, StoreV2Error> {
         validate_capture_id(id)?;
         if self.get_capture(id)?.is_none() {
             return Err(StoreV2Error::NotFound(id.to_string()));
         }
-        let path = self.audio_path(id);
-        if !path.exists() {
+        if let Some(utc) = self.audio_retired_utc(id)? {
             return Err(StoreV2Error::Invalid(format!(
-                "capture {id} has no audio journal on disk"
+                "the audio of capture {id} was removed by the retention policy on {utc}; \
+                 its transcript is kept"
             )));
         }
-        Ok(path)
+        let path = self.audio_path(id);
+        if path.exists() {
+            return Ok(path);
+        }
+        let flac = self.flac_path(id);
+        if flac.exists() {
+            return Ok(flac);
+        }
+        Err(StoreV2Error::Invalid(format!(
+            "capture {id} has no audio journal on disk"
+        )))
     }
 
     /// Lazily loads one take's audio (the G02 "load on demand" contract):
@@ -1770,7 +1902,7 @@ impl StoreV2 {
     /// `exists`) propagates instead of reading as "not promoted".
     pub fn audio_journal_exists(&self, id: &str) -> Result<bool, StoreV2Error> {
         validate_capture_id(id)?;
-        Ok(self.audio_path(id).try_exists()?)
+        Ok(self.audio_path(id).try_exists()? || self.flac_path(id).try_exists()?)
     }
 
     // ------------------------------------------------------------------
@@ -1789,20 +1921,12 @@ impl StoreV2 {
     pub fn delete_capture(&mut self, id: &str) -> Result<(), StoreV2Error> {
         validate_capture_id(id)?;
         let row = self.get_capture(id)?;
-        let audio = self.audio_path(id);
-        if row.is_none() && !audio.exists() {
+        if row.is_none() && !self.has_audio(id) {
             return Ok(());
         }
 
         // 1. Tombstone: the quarantine rename is the commit point.
-        if audio.exists() {
-            std::fs::create_dir_all(self.root.join(QUARANTINE_DIR))?;
-            let destination = self.quarantine_path(id);
-            let _ = std::fs::remove_file(&destination); // stale tombstone
-            std::fs::rename(&audio, &destination)?;
-            sync_dir(&self.root.join(AUDIO_DIR))?;
-            sync_dir(&self.root.join(QUARANTINE_DIR))?;
-        }
+        self.quarantine_audio(id)?;
 
         // 2. Row removal in the same transaction as the tombstone insert.
         // The capture's attempt ids are collected first: the DELETE
@@ -1907,13 +2031,14 @@ impl StoreV2 {
                 .and_then(|name| name.to_str())
                 .unwrap_or_default()
                 .to_string();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("sj") {
-                // Not a tombstoned journal (hand-dropped junk, a stray
-                // file): never-delete-until-swept cuts both ways — the
-                // sweep only removes what the tombstone semantics cover.
+            let ext = path.extension().and_then(|ext| ext.to_str());
+            if ext != Some("sj") && ext != Some(flac::FLAC_EXT) {
+                // Not tombstoned audio (hand-dropped junk, a stray file):
+                // never-delete-until-swept cuts both ways — the sweep
+                // only removes what the tombstone semantics cover.
                 report
                     .retained
-                    .push((name, "not a .sj journal".to_string()));
+                    .push((name, "not a .sj journal or .flac audio".to_string()));
                 continue;
             }
             if !path.is_file() {
@@ -1968,6 +2093,417 @@ impl StoreV2 {
     }
 
     // ------------------------------------------------------------------
+    // Lossless at-rest audio (#342).
+    // ------------------------------------------------------------------
+
+    /// Whether a recognition attempt on `id` is in flight — the take is
+    /// pinned (#356): its audio is never compressed or retired under it.
+    fn has_started_attempt(&self, id: &str) -> Result<bool, StoreV2Error> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT 1 FROM recognition_attempts WHERE capture_id = ?1 AND status = 'started'
+                 LIMIT 1",
+                params![id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    /// Up to `limit` committed takes still kept as journals that may be
+    /// compressed now, oldest first: not pinned by an in-flight attempt,
+    /// not removed by retention, and long enough to encode. Takes still
+    /// recording live in `staging/` (or the recorder's own journal tree)
+    /// and never appear here.
+    pub fn compression_candidates(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<CompressionJob>, StoreV2Error> {
+        let rows: Vec<(String, u32, u64)> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, actual_rate, frame_count FROM captures c
+                 WHERE NOT EXISTS (SELECT 1 FROM recognition_attempts a
+                                   WHERE a.capture_id = c.id AND a.status = 'started')
+                   AND NOT EXISTS (SELECT 1 FROM tombstones t
+                                   WHERE t.id = ?1 || c.id AND t.kind = 'audio')
+                 ORDER BY created_utc, id",
+            )?;
+            let rows = stmt.query_map(params![AUDIO_TOMBSTONE_PREFIX], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)? as u32,
+                    row.get::<_, i64>(2)? as u64,
+                ))
+            })?;
+            rows.collect::<Result<_, _>>()?
+        };
+        let mut jobs = Vec::new();
+        for (id, rate, frames) in rows {
+            if jobs.len() >= limit {
+                break;
+            }
+            if !is_safe_path_component(&id) || rate == 0 {
+                continue;
+            }
+            // Shorter than FLAC's minimum block at 16 kHz: stays a journal.
+            if frames.saturating_mul(u64::from(STARLING_SAMPLE_RATE)) / u64::from(rate)
+                < flac::MIN_SAMPLES as u64
+            {
+                continue;
+            }
+            let journal = self.audio_path(&id);
+            if journal.exists() {
+                jobs.push(CompressionJob { id, journal });
+            }
+        }
+        Ok(jobs)
+    }
+
+    /// Publish a [`prepare_compression`] result (#342): under the store,
+    /// re-check that the take is still live, unpinned and still a
+    /// journal; rename the verified FLAC onto `audio/<id>.flac` and fsync
+    /// the directory; only then remove the journal. A crash at any point
+    /// leaves the journal, or the complete FLAC, or both (reconcile
+    /// finishes that last shape) — never neither.
+    pub fn commit_compression(
+        &mut self,
+        prepared: PreparedCompression,
+    ) -> Result<CompressionOutcome, StoreV2Error> {
+        let skip = |reason: &str| {
+            let _ = std::fs::remove_file(&prepared.temp);
+            Ok(CompressionOutcome::Skipped(reason.to_string()))
+        };
+        let id = prepared.id.as_str();
+        if self.get_capture(id)?.is_none() {
+            return skip("the take was deleted while it was being compressed");
+        }
+        if self.audio_retired_utc(id)?.is_some() {
+            return skip("the retention policy removed the take's audio meanwhile");
+        }
+        if self.has_started_attempt(id)? {
+            return skip("a transcription of the take started meanwhile");
+        }
+        let journal = self.audio_path(id);
+        if journal != prepared.journal || !journal.exists() {
+            return skip("the take's journal is no longer in place");
+        }
+        let target = self.flac_path(id);
+        std::fs::rename(&prepared.temp, &target).map_err(|err| {
+            let _ = std::fs::remove_file(&prepared.temp);
+            StoreV2Error::Io(io::Error::new(
+                err.kind(),
+                format!("publishing compressed audio {target:?}: {err}"),
+            ))
+        })?;
+        sync_dir(&self.root.join(AUDIO_DIR))?;
+        // The FLAC is durable and verified: the journal may go.
+        match std::fs::remove_file(&journal) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
+        }
+        sync_dir(&self.root.join(AUDIO_DIR))?;
+        Ok(CompressionOutcome::Compressed {
+            journal_bytes: prepared.journal_bytes,
+            flac_bytes: prepared.flac_bytes,
+        })
+    }
+
+    /// [`Self::compression_candidates`] + [`prepare_compression`] +
+    /// [`Self::commit_compression`] for one take, holding the store
+    /// throughout. Callers sharing the store behind a lock run the
+    /// encode without it instead.
+    pub fn compress_audio(&mut self, id: &str) -> Result<CompressionOutcome, StoreV2Error> {
+        validate_capture_id(id)?;
+        let Some(job) = self
+            .compression_candidates(usize::MAX)?
+            .into_iter()
+            .find(|job| job.id == id)
+        else {
+            return Ok(CompressionOutcome::Skipped(
+                "not a journal that can be compressed now".to_string(),
+            ));
+        };
+        let prepared = prepare_compression(&job)?;
+        self.commit_compression(prepared)
+    }
+
+    /// Reconcile's half of the compression protocol: both `<id>.sj` and
+    /// `<id>.flac` exist, so a compression stopped after publishing the
+    /// FLAC. When the FLAC decodes to exactly the journal's request
+    /// PCM16 the journal is removed (the compression completes); anything
+    /// else keeps both — the journal stays authoritative — and is
+    /// reported. Nothing here ever removes the FLAC, so a peer that is
+    /// mid-commit can never be left with neither file.
+    fn finish_interrupted_compression(
+        &mut self,
+        id: &str,
+        report: &mut ReconciliationReport,
+    ) -> Result<(), StoreV2Error> {
+        let journal = self.audio_path(id);
+        let verified = read_journal(&journal)
+            .map_err(|err| err.to_string())
+            .and_then(|parsed| {
+                request_pcm16(&parsed.samples, parsed.sample_rate).map_err(|err| err.to_string())
+            })
+            .and_then(|expected| {
+                let file = File::open(self.flac_path(id)).map_err(|err| err.to_string())?;
+                let decoded =
+                    flac::decode(io::BufReader::new(file)).map_err(|err| err.to_string())?;
+                if decoded == expected {
+                    Ok(())
+                } else {
+                    Err("the compressed copy differs from the journal".to_string())
+                }
+            });
+        match verified {
+            Ok(()) => {
+                match std::fs::remove_file(&journal) {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                    Err(err) => return Err(err.into()),
+                }
+                sync_dir(&self.root.join(AUDIO_DIR))?;
+                report.completed_compressions.push(id.to_string());
+            }
+            Err(reason) => report.unreadable.push((
+                id.to_string(),
+                format!("interrupted compression left both files; the journal is kept: {reason}"),
+            )),
+        }
+        Ok(())
+    }
+
+    /// Remove FLAC temporaries under `audio/` older than
+    /// [`FLAC_TEMP_GRACE`] (best-effort: scratch, never evidence).
+    fn remove_stale_flac_temps(&self) {
+        let dir = self.root.join(AUDIO_DIR);
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return;
+        };
+        let mut removed = false;
+        for path in entries.flatten().map(|entry| entry.path()) {
+            if path.extension().and_then(|ext| ext.to_str()) != Some(FLAC_TEMP_EXT) {
+                continue;
+            }
+            let stale = std::fs::metadata(&path)
+                .and_then(|meta| meta.modified())
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|age| age >= FLAC_TEMP_GRACE);
+            if stale && std::fs::remove_file(&path).is_ok() {
+                removed = true;
+            }
+        }
+        if removed {
+            let _ = sync_dir(&dir);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Retention policy (#342): opt-in age and size limits per class.
+    // ------------------------------------------------------------------
+
+    /// Move a take into another retention class (e.g. [`ARCHIVAL_CLASS`]),
+    /// so that class's limits govern its audio from the next policy run.
+    pub fn set_retention_class(&mut self, id: &str, class: &str) -> Result<(), StoreV2Error> {
+        validate_capture_id(id)?;
+        if class.trim().is_empty() {
+            return Err(StoreV2Error::Invalid("retention class must not be empty".to_string()));
+        }
+        let changed = self.conn.execute(
+            "UPDATE captures SET retention_class = ?2 WHERE id = ?1",
+            params![id, class],
+        )?;
+        if changed == 0 {
+            return Err(StoreV2Error::NotFound(id.to_string()));
+        }
+        Ok(())
+    }
+
+    /// Bytes `id`'s audio occupies under `audio/` (journal and FLAC).
+    fn audio_bytes(&self, id: &str) -> u64 {
+        [self.audio_path(id), self.flac_path(id)]
+            .iter()
+            .filter_map(|path| std::fs::metadata(path).ok())
+            .map(|meta| meta.len())
+            .sum()
+    }
+
+    /// Apply the user's retention limits as of `now` — the one code path
+    /// that removes a committed take's audio without a delete. Off unless
+    /// [`RetentionPolicy::is_active`]; nothing calls it implicitly.
+    ///
+    /// Per class, takes are walked newest first. A take is due when it is
+    /// older than the class's age limit, or when it and every newer take
+    /// of the class together exceed the class's size limit. A due take is
+    /// held — and reported with the reason — when it is younger than the
+    /// policy's grace, pinned by an in-flight attempt, has never been
+    /// transcribed, or is referenced by a document revision or a
+    /// correction record (unless the policy includes referenced audio).
+    /// A held take still counts toward its class's size; whatever the
+    /// limit could not reach is reported in `over_limit`.
+    ///
+    /// Only the audio goes: the row, attempts, revisions and correction
+    /// records stay, and the take lists as [`AudioAtRest::Retired`].
+    /// Ordering is stamp, then unlink (the sweep's discipline): the
+    /// `audio:<id>` tombstone is committed first, so a crash before the
+    /// unlink leaves a take that already reads as retired and whose files
+    /// reconcile removes. Takes still recording are not rows yet and are
+    /// never considered.
+    pub fn apply_retention_policy(
+        &mut self,
+        policy: &RetentionPolicy,
+        now: time::OffsetDateTime,
+    ) -> Result<RetentionReport, StoreV2Error> {
+        let mut report = RetentionReport::default();
+        if !policy.is_active() {
+            return Ok(report);
+        }
+        let grace_cutoff = iso_utc(now - policy.grace);
+        for (class, limits) in &policy.limits {
+            if !limits.is_active() {
+                continue;
+            }
+            let age_cutoff = limits
+                .max_age_days
+                .map(|days| iso_utc(now - time::Duration::days(i64::from(days))));
+            let rows: Vec<(String, String)> = {
+                let mut stmt = self.conn.prepare(
+                    "SELECT id, created_utc FROM captures WHERE retention_class = ?1
+                     ORDER BY created_utc DESC, id DESC",
+                )?;
+                let rows = stmt.query_map(params![class], |row| Ok((row.get(0)?, row.get(1)?)))?;
+                rows.collect::<Result<_, _>>()?
+            };
+            let mut kept_bytes = 0u64;
+            for (id, created_utc) in rows {
+                if !is_safe_path_component(&id) || self.audio_retired_utc(&id)?.is_some() {
+                    continue;
+                }
+                let bytes = self.audio_bytes(&id);
+                if bytes == 0 {
+                    continue;
+                }
+                kept_bytes += bytes;
+                let due = if age_cutoff.as_ref().is_some_and(|cutoff| created_utc < *cutoff) {
+                    Some(RetireReason::Age)
+                } else if limits.max_total_bytes.is_some_and(|max| kept_bytes > max) {
+                    Some(RetireReason::Size)
+                } else {
+                    None
+                };
+                let Some(reason) = due else {
+                    continue;
+                };
+                if let Some(hold) = self.retention_hold(&id, &created_utc, &grace_cutoff, policy)? {
+                    report.held.push(HeldAudio {
+                        id,
+                        class: class.clone(),
+                        bytes,
+                        reason: hold,
+                    });
+                    continue;
+                }
+                self.retire_audio(&id)?;
+                kept_bytes -= bytes;
+                report.retired_bytes += bytes;
+                report.retired.push(RetiredAudio {
+                    id,
+                    class: class.clone(),
+                    bytes,
+                    reason,
+                });
+            }
+            if let Some(max) = limits.max_total_bytes {
+                if kept_bytes > max {
+                    report.over_limit.push((class.clone(), kept_bytes - max));
+                }
+            }
+        }
+        Ok(report)
+    }
+
+    /// Why a due take keeps its audio, if it does.
+    fn retention_hold(
+        &self,
+        id: &str,
+        created_utc: &str,
+        grace_cutoff: &str,
+        policy: &RetentionPolicy,
+    ) -> Result<Option<HoldReason>, StoreV2Error> {
+        if created_utc >= grace_cutoff {
+            return Ok(Some(HoldReason::Recent));
+        }
+        if self.has_started_attempt(id)? {
+            return Ok(Some(HoldReason::InUse));
+        }
+        let transcribed = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM recognition_attempts
+                 WHERE capture_id = ?1 AND status = 'completed' AND partial_or_final = 'final'
+                 LIMIT 1",
+                params![id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !transcribed {
+            return Ok(Some(HoldReason::Untranscribed));
+        }
+        if policy.include_referenced {
+            return Ok(None);
+        }
+        // A revision references the take when it lives in the take's own
+        // document (the app's processing document is keyed by the capture
+        // id) or names one of its attempts in its sources.
+        let revisions: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM revisions r
+             WHERE r.doc_id = ?1
+                OR EXISTS (SELECT 1 FROM recognition_attempts a
+                           WHERE a.capture_id = ?1
+                             AND instr(r.sources_json, '\"' || a.id || '\"') > 0)",
+            params![id],
+            |row| row.get(0),
+        )?;
+        let corrections: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM correction_records WHERE capture_id = ?1",
+            params![id],
+            |row| row.get(0),
+        )?;
+        Ok((revisions > 0 || corrections > 0).then_some(HoldReason::Referenced {
+            revisions: revisions as u32,
+            corrections: corrections as u32,
+        }))
+    }
+
+    /// Stamp `id`'s audio as retired, then unlink it.
+    fn retire_audio(&mut self, id: &str) -> Result<(), StoreV2Error> {
+        self.conn.execute(
+            "INSERT INTO tombstones(id, kind, deleted_utc, retention)
+             VALUES (?1, 'audio', ?2, 'swept')
+             ON CONFLICT(id) DO NOTHING",
+            params![format!("{AUDIO_TOMBSTONE_PREFIX}{id}"), now_iso()],
+        )?;
+        self.unlink_audio(id)
+    }
+
+    /// Unlink whatever audio `id` has under `audio/` (idempotent).
+    fn unlink_audio(&self, id: &str) -> Result<(), StoreV2Error> {
+        for path in [self.audio_path(id), self.flac_path(id)] {
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err.into()),
+            }
+        }
+        sync_dir(&self.root.join(AUDIO_DIR))?;
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
     // Recovery (§4 reconciliation).
     // ------------------------------------------------------------------
 
@@ -2007,7 +2543,7 @@ impl StoreV2 {
         // Tombstoned ids outrank everything (R21): the DB row and any file
         // under quarantine/ both mean "deliberately deleted".
         let mut dead: std::collections::HashSet<String> =
-            journal_ids_in(&self.root.join(QUARANTINE_DIR)).into_iter().collect();
+            audio_ids_in(&self.root.join(QUARANTINE_DIR)).into_iter().collect();
         {
             let mut stmt = self.conn.prepare("SELECT id FROM tombstones")?;
             let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
@@ -2015,6 +2551,12 @@ impl StoreV2 {
                 dead.insert(row?);
             }
         }
+        // Audio the retention policy removed (#342): the rows live on.
+        let retired: HashSet<String> = dead
+            .iter()
+            .filter_map(|id| id.strip_prefix(AUDIO_TOMBSTONE_PREFIX))
+            .map(str::to_string)
+            .collect();
 
         // --- staging side ---
         for id in journal_ids_in(&self.root.join(STAGING_DIR)) {
@@ -2123,7 +2665,12 @@ impl StoreV2 {
         }
 
         // --- audio side ---
-        for id in journal_ids_in(&self.root.join(AUDIO_DIR)) {
+        if !client_mode {
+            // Abandoned FLAC encodes (#342): the journal beside each is
+            // intact, so the temporary is only scratch.
+            self.remove_stale_flac_temps();
+        }
+        for id in audio_ids_in(&self.root.join(AUDIO_DIR)) {
             if !is_safe_path_component(&id) {
                 report.unreadable.push((
                     id,
@@ -2135,14 +2682,36 @@ impl StoreV2 {
                 self.complete_tombstoned(&id, &mut report)?;
                 continue;
             }
+            if retired.contains(&id) {
+                // The policy stamped the removal and crashed before the
+                // unlink: finish it.
+                self.unlink_audio(&id)?;
+                report.completed_retirements.push(id);
+                continue;
+            }
             let path = self.audio_path(&id);
             match self.get_capture(&id)? {
                 // Row with finalized audio: healthy, nothing to do.
                 Some(_) => {
-                    if !path.exists() {
-                        // Raced away between listing and now; nothing to do.
-                        continue;
+                    if path.exists() && self.flac_path(&id).exists() {
+                        // A compression stopped between publishing the
+                        // FLAC and removing the journal (or a peer is in
+                        // that window right now: defer to the owner).
+                        if client_mode {
+                            report.deferred_to_live_owner.push(id);
+                        } else {
+                            self.finish_interrupted_compression(&id, &mut report)?;
+                        }
                     }
+                }
+                None if !path.exists() => {
+                    // Compressed audio is only ever written for a
+                    // committed row; without one there is nothing to
+                    // adopt it into. Kept for a human to look at.
+                    report.unreadable.push((
+                        id,
+                        "compressed audio without a library row; kept in place".to_string(),
+                    ));
                 }
                 None => {
                     // Finalized audio with no row → orphan session:
@@ -2222,7 +2791,7 @@ impl StoreV2 {
                     // as-is rather than aborting the reconciliation.
                     continue;
                 }
-                if !self.audio_path(&id).exists() && status != "interrupted" {
+                if !self.has_audio(&id) && !retired.contains(&id) && status != "interrupted" {
                     missing_audio.push(id);
                 }
             }
@@ -2253,15 +2822,7 @@ impl StoreV2 {
         id: &str,
         report: &mut ReconciliationReport,
     ) -> Result<(), StoreV2Error> {
-        let audio = self.audio_path(id);
-        if audio.exists() {
-            std::fs::create_dir_all(self.root.join(QUARANTINE_DIR))?;
-            let destination = self.quarantine_path(id);
-            let _ = std::fs::remove_file(&destination);
-            std::fs::rename(&audio, &destination)?;
-            sync_dir(&self.root.join(AUDIO_DIR))?;
-            sync_dir(&self.root.join(QUARANTINE_DIR))?;
-        }
+        self.quarantine_audio(id)?;
         let staging = self.staging_path(id);
         if staging.exists() {
             std::fs::create_dir_all(self.root.join(QUARANTINE_DIR))?;
@@ -3416,6 +3977,22 @@ pub struct CaptureListing {
     /// Reasons the committed audio is currently unusable (missing file,
     /// bad header). Empty for a healthy take.
     pub problems: Vec<String>,
+    /// The form the audio is kept in (#342).
+    pub audio: AudioAtRest,
+}
+
+/// How a committed take's audio is kept (#342).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AudioAtRest {
+    /// The original sample journal (not compressed yet).
+    Journal,
+    /// Lossless FLAC of the take's request PCM16.
+    Flac,
+    /// Removed by the retention policy at `utc`; the row, transcripts,
+    /// revisions and correction records are kept.
+    Retired { utc: String },
+    /// Neither file exists and no retention stamp explains it.
+    Missing,
 }
 
 #[derive(Clone, Debug)]
@@ -3472,6 +4049,13 @@ pub struct ReconciliationReport {
     pub empty_journals: Vec<String>,
     /// `(id, reason)` for files that could not be parsed: kept in place.
     pub unreadable: Vec<(String, String)>,
+    /// Takes whose compression stopped after the FLAC was published:
+    /// the FLAC verified against the journal, and the journal was
+    /// removed (#342). Housekeeping, not a finding.
+    pub completed_compressions: Vec<String>,
+    /// Takes whose retention removal was stamped but not yet unlinked:
+    /// the unlink was finished (#342). Housekeeping, not a finding.
+    pub completed_retirements: Vec<String>,
     /// In-flight ids (staging journals, orphan candidates) a live foreign
     /// lease owner claimed: this run was a client (§4 ownership) and left
     /// them for the owner's own reconcile. Informational — a deferral is
@@ -3581,6 +4165,191 @@ pub struct SweptFile {
     /// `capture` (v2 `quarantine/`) or `journal` (legacy `journals/deleted/`).
     pub kind: String,
     pub bytes: u64,
+}
+
+/// A take whose journal may be replaced by FLAC (#342), from
+/// [`StoreV2::compression_candidates`].
+#[derive(Clone, Debug)]
+pub struct CompressionJob {
+    pub id: String,
+    journal: PathBuf,
+}
+
+/// A verified FLAC encode waiting under `audio/` as a temporary, ready
+/// for [`StoreV2::commit_compression`].
+#[derive(Debug)]
+pub struct PreparedCompression {
+    id: String,
+    journal: PathBuf,
+    temp: PathBuf,
+    journal_bytes: u64,
+    flac_bytes: u64,
+}
+
+impl PreparedCompression {
+    /// Abandon the encode: remove its temporary.
+    pub fn discard(self) {
+        let _ = std::fs::remove_file(&self.temp);
+    }
+}
+
+/// What one compression did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CompressionOutcome {
+    /// The journal was replaced by its FLAC.
+    Compressed { journal_bytes: u64, flac_bytes: u64 },
+    /// Nothing changed, and why.
+    Skipped(String),
+}
+
+/// The heavy, store-free half of compression (#342): read and verify the
+/// journal, derive its request PCM16 ([`request_pcm16`] — exactly what
+/// every transcription of the take receives), encode FLAC into a unique
+/// temporary beside the journal, fsync it, and decode it back from disk
+/// with the independent decoder, refusing anything that is not sample-
+/// identical. A caller sharing the store behind a lock runs this without
+/// the lock and hands the result to [`StoreV2::commit_compression`].
+/// On error, no temporary is left behind.
+pub fn prepare_compression(job: &CompressionJob) -> Result<PreparedCompression, StoreV2Error> {
+    let parsed = read_journal(&job.journal).map_err(|err| StoreV2Error::Invalid(err.to_string()))?;
+    if !parsed.finalized || parsed.torn_tail_bytes > 0 {
+        // Journals under audio/ are sealed by construction; anything else
+        // is evidence for a human, not input for an encoder.
+        return Err(StoreV2Error::Invalid(format!(
+            "journal {} is not sealed; it is kept as it is",
+            job.journal.display()
+        )));
+    }
+    let journal_bytes = std::fs::metadata(&job.journal)?.len();
+    let pcm = request_pcm16(&parsed.samples, parsed.sample_rate)?;
+    drop(parsed);
+    let encoded = flac::encode(&pcm)?;
+    let temp = job.journal.with_file_name(format!(
+        "{}.{}.{FLAC_TEMP_EXT}",
+        job.id,
+        uuid::Uuid::new_v4().simple()
+    ));
+    let written = (|| -> Result<(), StoreV2Error> {
+        use std::io::Write;
+        let mut file = OpenOptions::new().write(true).create_new(true).open(&temp)?;
+        file.write_all(&encoded)?;
+        file.sync_all()?;
+        drop(file);
+        let decoded = flac::decode(io::BufReader::new(File::open(&temp)?))?;
+        if decoded != pcm {
+            return Err(StoreV2Error::Invalid(format!(
+                "FLAC of capture {} did not decode to the journal's samples; the journal is kept",
+                job.id
+            )));
+        }
+        Ok(())
+    })();
+    if let Err(err) = written {
+        let _ = std::fs::remove_file(&temp);
+        return Err(err);
+    }
+    Ok(PreparedCompression {
+        id: job.id.clone(),
+        journal: job.journal.clone(),
+        temp,
+        journal_bytes,
+        flac_bytes: encoded.len() as u64,
+    })
+}
+
+/// Age and size limits for one retention class (#342). `None` is no
+/// limit; both `None` leaves the class alone.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ClassLimits {
+    pub max_age_days: Option<u32>,
+    pub max_total_bytes: Option<u64>,
+}
+
+impl ClassLimits {
+    pub fn is_active(&self) -> bool {
+        self.max_age_days.is_some() || self.max_total_bytes.is_some()
+    }
+}
+
+/// The user's retention policy (#342). The default is off: no class has
+/// a limit, and [`StoreV2::apply_retention_policy`] does nothing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RetentionPolicy {
+    /// Limits per retention class name ([`STANDARD_CLASS`],
+    /// [`ARCHIVAL_CLASS`], …).
+    pub limits: std::collections::BTreeMap<String, ClassLimits>,
+    /// Also remove audio a document revision or a correction record
+    /// references. Off unless the user agreed to it.
+    pub include_referenced: bool,
+    /// No take younger than this loses its audio.
+    pub grace: std::time::Duration,
+}
+
+impl Default for RetentionPolicy {
+    fn default() -> Self {
+        Self {
+            limits: std::collections::BTreeMap::new(),
+            include_referenced: false,
+            grace: DEFAULT_RETENTION_GRACE,
+        }
+    }
+}
+
+impl RetentionPolicy {
+    /// Whether any class has a limit.
+    pub fn is_active(&self) -> bool {
+        self.limits.values().any(ClassLimits::is_active)
+    }
+}
+
+/// What one [`StoreV2::apply_retention_policy`] run removed and held.
+#[derive(Debug, Default)]
+pub struct RetentionReport {
+    pub retired: Vec<RetiredAudio>,
+    pub retired_bytes: u64,
+    /// Due takes that kept their audio, with the reason.
+    pub held: Vec<HeldAudio>,
+    /// `(class, bytes)` a size limit is still exceeded by after the run
+    /// (held takes count toward their class).
+    pub over_limit: Vec<(String, u64)>,
+}
+
+/// One take whose audio the policy removed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetiredAudio {
+    pub id: String,
+    pub class: String,
+    pub bytes: u64,
+    pub reason: RetireReason,
+}
+
+/// Which limit made a take due.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetireReason {
+    Age,
+    Size,
+}
+
+/// One due take that kept its audio.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldAudio {
+    pub id: String,
+    pub class: String,
+    pub bytes: u64,
+    pub reason: HoldReason,
+}
+
+/// Why a due take keeps its audio.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HoldReason {
+    /// Younger than the policy's grace.
+    Recent,
+    /// A recognition attempt is in flight on it.
+    InUse,
+    /// No attempt ever produced a transcript: the audio is all there is.
+    Untranscribed,
+    /// Document revisions or correction records reference it.
+    Referenced { revisions: u32, corrections: u32 },
 }
 
 // ---------------------------------------------------------------------------
@@ -3874,14 +4643,75 @@ fn merge_extra_note(current: Option<&str>, note: &str) -> String {
 /// `path` — so a caller sharing the store behind a lock resolves the path
 /// via [`StoreV2::audio_journal_path`] under the guard and does this work
 /// without it.
+///
+/// A `.flac` path decodes the compressed take (#342). A journal that is
+/// gone by the time it is opened — compression replaced it with its
+/// verified FLAC after the caller resolved the path — falls over to that
+/// FLAC, so a read racing compression never fails.
 pub fn read_audio_journal(path: &Path) -> Result<JournalAudio, StoreV2Error> {
-    let parsed = read_journal(path).map_err(|err| StoreV2Error::Invalid(err.to_string()))?;
+    if path.extension().and_then(|ext| ext.to_str()) == Some(flac::FLAC_EXT) {
+        return read_flac_audio(path);
+    }
+    match read_journal(path) {
+        Ok(parsed) => Ok(JournalAudio {
+            sample_rate: parsed.sample_rate,
+            samples: parsed.samples,
+            finalized: parsed.finalized,
+            torn_tail_bytes: parsed.torn_tail_bytes,
+        }),
+        Err(journal::JournalReadError::Io(err)) if err.kind() == io::ErrorKind::NotFound => {
+            let compressed = path.with_extension(flac::FLAC_EXT);
+            if compressed.exists() {
+                read_flac_audio(&compressed)
+            } else {
+                Err(StoreV2Error::Invalid(err.to_string()))
+            }
+        }
+        Err(err) => Err(StoreV2Error::Invalid(err.to_string())),
+    }
+}
+
+/// Decode a compressed take into the shape a journal read returns: the
+/// request PCM16 at 16 kHz, mapped back through the exact inverse of the
+/// quantizer so re-encoding reproduces the same request WAV.
+fn read_flac_audio(path: &Path) -> Result<JournalAudio, StoreV2Error> {
+    let samples = File::open(path)
+        .map_err(StoreV2Error::from)
+        .and_then(|file| Ok(flac::decode(io::BufReader::new(file))?))
+        .map_err(|err| StoreV2Error::Invalid(format!("{}: {err}", path.display())))?;
     Ok(JournalAudio {
-        sample_rate: parsed.sample_rate,
-        samples: parsed.samples,
-        finalized: parsed.finalized,
-        torn_tail_bytes: parsed.torn_tail_bytes,
+        sample_rate: STARLING_SAMPLE_RATE,
+        samples: samples.into_iter().map(pcm16_to_f32).collect(),
+        finalized: true,
+        torn_tail_bytes: 0,
     })
+}
+
+/// Sorted, deduplicated stems of `.sj` journals and `.flac` audio under
+/// `dir` (missing dir = empty) — every id with audio in an `audio/` or
+/// `quarantine/` tree (#342).
+fn audio_ids_in(dir: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut ids: Vec<String> = entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            matches!(
+                path.extension().and_then(|ext| ext.to_str()),
+                Some("sj") | Some(flac::FLAC_EXT)
+            )
+        })
+        .filter_map(|path| {
+            path.file_stem()
+                .and_then(|stem| stem.to_str())
+                .map(str::to_string)
+        })
+        .collect();
+    ids.sort();
+    ids.dedup();
+    ids
 }
 
 /// Sorted `.sj` stems under `dir` (missing dir = empty).
@@ -4339,6 +5169,9 @@ fn lease_alive_from(
 // ---------------------------------------------------------------------------
 // Tests.
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod at_rest_tests;
 
 #[cfg(test)]
 mod tests {

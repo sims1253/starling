@@ -13,8 +13,18 @@ description = "Rust port of @starling/dictation: audio prep, transcription clien
 # (issue #235). Already in the tree via reqwest/hyper. `from_owner` needs
 # bytes >= 1.9.
 bytes = "1.9"
+# Lossless at-rest history audio (#342): flacenc encodes, claxon (an
+# independent implementation, the decoder rodio's own `flac` feature
+# uses) decodes and verifies every file before the journal it replaces
+# is removed; md-5 checks the FLAC STREAMINFO signature on every load.
+# All pure Rust, Apache-2.0 / MIT.
+claxon = "0.4.3"
 cpal = "0.15"
 dirs = "6"
+# No `par` (the store encodes one take at a time on a background
+# thread), no `serde`/`log`.
+flacenc = { version = "0.5.1", default-features = false }
+md-5 = "0.10.6"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }
 rodio = { version = "0.20", default-features = false, features = ["wav"] }

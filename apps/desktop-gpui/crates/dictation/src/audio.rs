@@ -273,6 +273,32 @@ fn pcm16(sample: f32) -> i16 {
     }
 }
 
+/// Inverse of the PCM16 quantizer: `pcm16(pcm16_to_f32(q)) == q` for
+/// every `q` (the asymmetric scales mirror `pcm16`'s, unlike
+/// [`decode_pcm16_wav`]'s uniform `/ 32768`). FLAC-stored takes (#342)
+/// decode through this, so a retry re-encodes the stored samples to the
+/// identical request WAV.
+pub fn pcm16_to_f32(sample: i16) -> f32 {
+    if sample < 0 {
+        f32::from(sample) / 32_768.0
+    } else {
+        f32::from(sample) / 32_767.0
+    }
+}
+
+/// The PCM16 payload [`encode_wav_16k_parts`] writes for mono input at
+/// `sample_rate` — the request audio every transcription of these
+/// samples receives, minus the RIFF header. Finalized takes are kept at
+/// rest as exactly these samples (FLAC, #342).
+pub fn request_pcm16(samples: &[f32], sample_rate: u32) -> Result<Vec<i16>, AudioFormatError> {
+    if sample_rate == STARLING_SAMPLE_RATE {
+        assert_pcm_parts(samples, sample_rate, 1)?;
+        return Ok(samples.iter().map(|&sample| pcm16(sample)).collect());
+    }
+    let samples = resample_to_16k_parts(samples, sample_rate, 1)?;
+    Ok(samples.iter().map(|&sample| pcm16(sample)).collect())
+}
+
 /// Encode arbitrary floating-point PCM as mono 16 kHz PCM16 WAV.
 pub fn encode_wav_16k(audio: &PcmAudio) -> Result<Vec<u8>, AudioFormatError> {
     encode_wav_16k_parts(&audio.samples, audio.sample_rate, audio.channels)

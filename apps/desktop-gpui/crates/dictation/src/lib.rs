@@ -9,6 +9,7 @@ pub mod client;
 pub mod engine;
 pub mod fft;
 pub mod fidelity;
+pub mod flac;
 pub mod journal;
 pub mod microphone;
 pub mod playback;
