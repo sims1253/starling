@@ -387,11 +387,11 @@ std::optional<std::string> ChunkStreamer::step(
     // after each commit (issue #357).
     const bool eligible = tail_len > 0
         && rebased_ + static_cast<int64_t>(samples.size()) >= min_;
+    // A window commit alone never forces a preview: the committed text is
+    // emitted at once, and the tail waits for the (cost-stretched) interval.
     const bool throttled = (now - last_emit_) < effective_interval();
-    if (!emit_due_ && (throttled || !eligible)) {
-        return std::nullopt;
-    }
-    if (eligible && newer_pending && newer_pending()) {
+    if (!eligible || throttled) return committed_update();
+    if (newer_pending && newer_pending()) {
         // Newer audio is already queued: this preview would be stale before
         // it finished. Skip it; the next step previews the newer audio and
         // carries any committed-text update along (emit_due_ stays set).
@@ -400,20 +400,17 @@ std::optional<std::string> ChunkStreamer::step(
     }
     last_emit_ = now;
 
-    if (eligible) {
-        call_kind_ = "preview";
-        const auto t0 = std::chrono::steady_clock::now();
-        auto text = tx(samples.data() + boundary_, tail_len);
-        if (!text.has_value()) {
-            // Busy on the tail.
-            return committed_update();
-        }
-        last_preview_cost_ = std::chrono::duration<double>(
-            std::chrono::steady_clock::now() - t0).count();
-        emit_due_ = false;
-        return join_words(stitched(split_words(*text)));
+    call_kind_ = "preview";
+    const auto t0 = std::chrono::steady_clock::now();
+    auto text = tx(samples.data() + boundary_, tail_len);
+    if (!text.has_value()) {
+        // Busy on the tail.
+        return committed_update();
     }
-    return committed_update();
+    last_preview_cost_ = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - t0).count();
+    emit_due_ = false;
+    return join_words(stitched(split_words(*text)));
 }
 
 std::optional<std::string> ChunkStreamer::flush(

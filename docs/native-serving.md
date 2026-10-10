@@ -259,6 +259,8 @@ nonempty tail is previewed, including the overlap right after a window
 commit. `--partial-interval-seconds` is the minimum gap between previews.
 The server stretches it so that previews use at most half of wall time:
 the next preview waits at least twice as long as the last one took.
+A window commit inside that gap sends the committed text at once, without
+previewing the tail.
 That bound adapts to slow models and devices without a per-device preset.
 A client can set the cadence for one connection with query parameters:
 `/stream?min_partial_seconds=1&partial_interval_seconds=0.5`. Invalid
@@ -268,13 +270,16 @@ or finalized.
 
 **Coalescing** (issue #357): the connection's read loop only queues frames.
 One worker per connection appends every queued frame before each step.
-Each preview therefore covers all audio received so far. If more audio
-or a control message arrives while full windows are being committed, the
-server skips that preview and previews the newer audio next. Window
-commits and finalization always run, and the server never drops audio.
-When more than 32 MiB of frames are queued, the server stops reading
-from the socket until the worker catches up. A `ping` is answered after
-every earlier frame has been processed, as before.
+Each preview therefore covers all audio received so far. If more audio,
+a `commit` or a `reset` arrives while full windows are being committed,
+the server skips that preview and previews the newer audio next. A `ping`
+does not skip a preview. When the worker catches up on a backlog, it
+commits each full window as soon as it is appended, so the backlog alone
+does not hit the buffer cap. Window commits and finalization always run,
+and the server never drops audio. When more than 32 MiB or 4096 frames
+are queued, the server stops reading from the socket until the worker
+catches up. A `ping` is answered after every earlier frame has been
+processed, as before.
 
 **Stream instrumentation** (issue #226): connect to `/stream?trace=1` and
 every partial and final carries an extra `"trace"` object. Clients that do
@@ -289,6 +294,12 @@ take's first audio; audio positions are seconds into the take.
   `engine_calls`, `engine_audio_s`, `engine_ms`, `reused` and `busy`.
   `engine_audio_s` counts window overlap and each repeated preview, so
   `engine_audio_s / audio_s` is the inference work per recorded second.
+  `engine_ms` is the wall time of each transcribe call. It includes a lazy
+  model load on the first call and, in Granite chunk-fairness mode, the
+  wait for the serial queue; other modes answer `busy` instead of waiting.
+  The trace starts a commit's `stop` section when the worker begins the
+  flush, so a commit that waits behind a running preview is not counted
+  there. The client's own stop-to-final time includes that wait.
 - Final: the same fields, plus `by_kind` totals for `window` (full windows
   while recording), `preview` (live tail), `flush_window` and `flush_tail`
   (work after commit). It also has `stop`, `calls` and `calls_dropped`.

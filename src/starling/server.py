@@ -1703,6 +1703,23 @@ def create_app(
         # is bounded: a full queue pauses receiving (backpressure), never
         # drops audio. ``None`` marks the disconnect.
         queue: asyncio.Queue = asyncio.Queue(maxsize=STREAM_QUEUE_MAX_FRAMES)
+        # Queued items other than pings: a ping carries no audio, so it does
+        # not make a preview obsolete (mirrors pending_work_ in
+        # cpp/serve/stream_pump.cpp).
+        pending_work = 0
+
+        def _is_ping(text: str) -> bool:
+            try:
+                cmd = json.loads(text)
+            except json.JSONDecodeError:
+                return False
+            return isinstance(cmd, dict) and cmd.get("type") == "ping"
+
+        async def enqueue(item) -> None:  # noqa: ANN001
+            nonlocal pending_work
+            if item is None or item[0] != "ping":
+                pending_work += 1
+            await queue.put(item)
 
         async def receive() -> None:
             try:
@@ -1710,14 +1727,19 @@ def create_app(
                     msg = await ws.receive()
                     if msg["type"] == "websocket.disconnect":
                         break
-                    if msg.get("text") is not None:
-                        await queue.put(("text", msg["text"]))
+                    text_msg = msg.get("text")
+                    if text_msg is not None:
+                        await enqueue(("ping" if _is_ping(text_msg) else "text", text_msg))
                     elif msg.get("bytes"):
-                        await queue.put(("bytes", msg["bytes"]))
+                        await enqueue(("bytes", msg["bytes"]))
             except WebSocketDisconnect:
                 pass
-            finally:
-                await queue.put(None)
+            except Exception:  # transport failure: handled like a disconnect
+                log.exception("WS /stream receive failed")
+            # Not in ``finally``: when the handler exits it cancels this task,
+            # and a cancelled receiver must not block on a full queue that
+            # nobody drains any more.
+            await enqueue(None)
 
         async def send_partial(text: str, segments: list) -> None:
             partial = {
@@ -1739,12 +1761,12 @@ def create_app(
                 # ChunkStreamer handles throttling, coalescing and busy
                 # (-> None) itself.
                 text = await asyncio.to_thread(sess.stream_step, now,
-                                               lambda: not queue.empty())
+                                               lambda: pending_work > 0)
                 if text is not None:
                     sess.last_partial_ts = now
                     await send_partial(text, [{"text": text, "start_s": 0.0,
                                                "end_s": sess.buffered_seconds}])
-            elif sess.should_emit_partial(now) and queue.empty():
+            elif sess.should_emit_partial(now) and pending_work == 0:
                 try:
                     result = await asyncio.to_thread(sess.transcribe_current_sync)
                 except (_Busy, _Cancelled):
@@ -1813,6 +1835,8 @@ def create_app(
                     if item is None:
                         return
                     kind, payload = item
+                    if kind != "ping":
+                        pending_work -= 1
                     if kind == "bytes":
                         # append_wav itself sniffs RIFF/WAVE vs raw PCM16. A
                         # refused frame is reported once as an error frame,
@@ -1871,6 +1895,7 @@ def create_app(
                 pass
         finally:
             receiver.cancel()
+            await asyncio.gather(receiver, return_exceptions=True)
             try:
                 await ws.close()
             except Exception:

@@ -1468,7 +1468,7 @@ static void test_preview_minimum_gates_the_take_not_the_tail() {
 }
 
 static void test_preview_coalesced_when_newer_audio_is_queued() {
-    ChunkStreamer cs(16000, 1.0, 0.25, 0.5, 10.0);  // 10 s interval
+    ChunkStreamer cs(16000, 1.0, 0.25, 0.5, 0.0);
     std::vector<int64_t> lens;
     TranscribeFn tx = [&](const float*, int64_t n) -> std::optional<std::string> {
         lens.push_back(n);
@@ -1483,21 +1483,39 @@ static void test_preview_coalesced_when_newer_audio_is_queued() {
     CHECK(lens.size() == 1 && lens[0] == 16000);
     CHECK(cs.boundary() == 12000);
     CHECK(cs.coalesced_previews() == 1);
-    // The newer audio arrives; nothing is queued now. Although the 10 s
-    // interval has not passed, the committed-text update is still owed, so
-    // this step previews the newest tail and emits.
+    // The newer audio arrives; nothing is queued now. This step previews
+    // the newest tail and carries the owed committed-text update along.
     samples.resize(22000);
     pending = false;
     auto out = cs.step(samples, 1.1, tx, newer);
     CHECK(out.has_value());
     CHECK(lens.size() == 2 && lens[1] == 10000);
-    // Owed update delivered: the next step is throttled again.
-    samples.resize(23000);
-    CHECK(!cs.step(samples, 1.2, tx, newer).has_value());
-    CHECK(lens.size() == 2);
     // The flush still covers every sample.
     CHECK(cs.flush(samples, tx).has_value());
-    CHECK(lens.back() == 23000 - 12000);
+    CHECK(lens.back() == 22000 - 12000);
+}
+
+static void test_window_commit_does_not_force_a_throttled_preview() {
+    // A 10 s interval: a window commit inside it emits the committed text
+    // at once but does not decode the tail (the preview duty bound holds).
+    ChunkStreamer cs(16000, 1.0, 0.25, 0.5, 10.0);
+    std::vector<int64_t> lens;
+    TranscribeFn tx = [&](const float*, int64_t n) -> std::optional<std::string> {
+        lens.push_back(n);
+        return std::string("w x");
+    };
+    std::vector<float> samples(8000, 0.0f);
+    CHECK(cs.step(samples, 20.0, tx).has_value());  // first preview
+    CHECK(lens.size() == 1 && lens[0] == 8000);
+    samples.resize(20000);
+    auto out = cs.step(samples, 21.0, tx);
+    CHECK(out == std::optional<std::string>("w x"));  // committed text only
+    CHECK(lens.size() == 2 && lens[1] == 16000);
+    samples.resize(21000);
+    CHECK(!cs.step(samples, 21.5, tx).has_value());  // still throttled
+    CHECK(lens.size() == 2);
+    CHECK(cs.step(samples, 30.0, tx).has_value());   // interval over
+    CHECK(lens.size() == 3 && lens[2] == 21000 - 12000);
 }
 
 static void test_preview_interval_adapts_to_preview_cost() {
@@ -1565,7 +1583,8 @@ struct PumpFixture {
     std::condition_variable sent_cv;
     std::vector<std::pair<int64_t, int64_t>> windows;  // (abs start, length)
 
-    PumpFixture() : server(test_cfg()), session(&server) {}
+    explicit PumpFixture(ServerConfig cfg = test_cfg())
+        : server(cfg), session(&server) {}
 
     StreamPump::SendFn sender() {
         return [this](const std::string& m) {
@@ -1737,6 +1756,109 @@ static void test_pump_reset_discards_queued_take() {
     CHECK(calls.load() <= 1);
 }
 
+static void test_pump_ping_does_not_coalesce_the_preview() {
+    // A ping queued while a window commits carries no audio: the preview of
+    // the newest tail still runs (it would otherwise stay owed until more
+    // audio arrived), and the pong follows it.
+    PumpFixture fx;
+    StreamPump* pump_ptr = nullptr;
+    std::atomic<int> previews{0};
+    fx.session.set_transcribe_fn([&](const float*, int64_t n)
+                                     -> std::optional<std::string> {
+        if (n == 16000) pump_ptr->push_ping();  // arrives during the commit
+        else previews.fetch_add(1);
+        return std::string("w");
+    });
+    StreamPump pump(fx.session, {}, fx.sender());
+    pump_ptr = &pump;
+    pump.push_audio(pcm_for_range(0, 17600));
+    const size_t pong = fx.wait_for("\"type\":\"pong\"");
+    CHECK(pong != SIZE_MAX);
+    pump.drain();
+    CHECK(previews.load() == 1);
+    CHECK(fx.session.chunker()->coalesced_previews() == 0);
+    std::lock_guard<std::mutex> lk(fx.mu);
+    CHECK(pong == 1 && fx.sent[0].find("\"type\":\"partial\"") != std::string::npos);
+}
+
+static void test_pump_backlog_commits_windows_before_the_cap() {
+    // A 3 s live-buffer cap and 6 s of audio queued behind a blocked
+    // preview: the worker commits (and trims) each full window as the
+    // backlog is appended, so the backlog never trips the cap.
+    ServerConfig cfg = test_cfg();
+    cfg.max_stream_seconds = 3.0;
+    PumpFixture fx(cfg);
+    std::mutex gate_mu;
+    std::condition_variable gate_cv;
+    bool release = false;
+    std::atomic<int> calls{0};
+    fx.session.set_transcribe_fn([&](const float*, int64_t)
+                                     -> std::optional<std::string> {
+        if (calls.fetch_add(1) == 0) {
+            std::unique_lock<std::mutex> lk(gate_mu);
+            gate_cv.wait(lk, [&] { return release; });
+        }
+        return std::string("w");
+    });
+    StreamPump pump(fx.session, {}, fx.sender());
+    pump.push_audio(pcm_for_range(0, 8000));  // 0.5 s: the preview blocks
+    while (calls.load() == 0) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    for (int i = 0; i < 22; ++i)
+        pump.push_audio(pcm_for_range(8000 + static_cast<int64_t>(i) * 4000, 4000));
+    pump.push_commit();
+    {
+        std::lock_guard<std::mutex> lk(gate_mu);
+        release = true;
+    }
+    gate_cv.notify_all();
+    const size_t fin = fx.wait_for("\"type\":\"final\"");
+    CHECK(fin != SIZE_MAX);
+    pump.drain();
+    CHECK(fx.count("\"type\":\"error\"") == 0);
+    CHECK(!fx.session.overflowed());
+    std::lock_guard<std::mutex> lk(fx.mu);
+    if (fin != SIZE_MAX)
+        CHECK(fx.sent[fin].find("\"duration_s\":6") != std::string::npos);
+}
+
+static void test_pump_event_bound_blocks_control_frames() {
+    // The event bound covers control frames too: with room for one queued
+    // event and the worker busy, a second ping waits instead of growing
+    // the queue, and every ping is still answered.
+    PumpFixture fx;
+    std::mutex gate_mu;
+    std::condition_variable gate_cv;
+    bool release = false;
+    std::atomic<int> calls{0};
+    fx.session.set_transcribe_fn([&](const float*, int64_t)
+                                     -> std::optional<std::string> {
+        if (calls.fetch_add(1) == 0) {
+            std::unique_lock<std::mutex> lk(gate_mu);
+            gate_cv.wait(lk, [&] { return release; });
+        }
+        return std::string("w");
+    });
+    StreamPump::Options opt;
+    opt.max_pending_events = 1;
+    StreamPump pump(fx.session, opt, fx.sender());
+    pump.push_audio(pcm_for_range(0, 8000));
+    while (calls.load() == 0) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    pump.push_ping();  // fills the queue
+    std::atomic<bool> second_queued{false};
+    std::thread t([&] { pump.push_ping(); second_queued = true; });
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    CHECK(!second_queued.load());
+    {
+        std::lock_guard<std::mutex> lk(gate_mu);
+        release = true;
+    }
+    gate_cv.notify_all();
+    t.join();
+    CHECK(second_queued.load());
+    pump.drain();
+    CHECK(fx.count("\"type\":\"pong\"") == 2);
+}
+
 // ---- main -----------------------------------------------------------------
 int main() {
     test_stitch_basic();
@@ -1787,6 +1909,7 @@ int main() {
     test_trace_flush_bounded_by_tail_not_take();
     test_preview_minimum_gates_the_take_not_the_tail();
     test_preview_coalesced_when_newer_audio_is_queued();
+    test_window_commit_does_not_force_a_throttled_preview();
     test_preview_interval_adapts_to_preview_cost();
     test_preview_policy_validation();
     test_preview_policy_is_not_result_provenance();
@@ -1795,6 +1918,9 @@ int main() {
     test_pump_ping_follows_earlier_audio();
     test_pump_backpressure_never_drops_audio();
     test_pump_reset_discards_queued_take();
+    test_pump_ping_does_not_coalesce_the_preview();
+    test_pump_backlog_commits_windows_before_the_cap();
+    test_pump_event_bound_blocks_control_frames();
 
     std::printf("stream_session_test: %d/%d passed\n", g_passed, g_tests);
     return g_passed == g_tests ? 0 : 1;

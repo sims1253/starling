@@ -91,16 +91,16 @@ StreamPump::~StreamPump() {
 
 void StreamPump::push(Event ev) {
     std::unique_lock<std::mutex> lk(mu_);
-    if (ev.kind == Kind::Audio) {
-        // Bounded queue, never dropping: wait for space (backpressure).
-        space_cv_.wait(lk, [&] {
-            return closed_ || pending_bytes_ == 0
-                || pending_bytes_ + ev.bytes.size() <= opt_.max_pending_bytes;
-        });
-        if (closed_) return;
-        pending_bytes_ += ev.bytes.size();
-    }
+    // Bounded queue, never dropping: wait for space (backpressure).
+    space_cv_.wait(lk, [&] {
+        if (closed_) return true;
+        if (queue_.size() >= opt_.max_pending_events) return false;
+        return ev.kind != Kind::Audio || pending_bytes_ == 0
+            || pending_bytes_ + ev.bytes.size() <= opt_.max_pending_bytes;
+    });
     if (closed_) return;
+    if (ev.kind == Kind::Audio) pending_bytes_ += ev.bytes.size();
+    if (ev.kind != Kind::Ping) ++pending_work_;
     queue_.push_back(std::move(ev));
     cv_.notify_one();
 }
@@ -120,6 +120,7 @@ void StreamPump::close() {
     closed_ = true;
     queue_.clear();
     pending_bytes_ = 0;
+    pending_work_ = 0;
     cv_.notify_all();
     space_cv_.notify_all();
     idle_cv_.notify_all();
@@ -136,11 +137,13 @@ bool StreamPump::is_closed() {
 }
 
 bool StreamPump::newer_pending() {
-    // Any queued event makes a preview obsolete: newer audio would not be in
-    // it, and a queued commit/reset ends or discards the take anyway. So
-    // does a closed connection.
+    // Queued audio makes a preview obsolete (it would not be in it), and a
+    // queued commit/reset ends or discards the take anyway. So does a
+    // closed connection. A ping does not: it carries no audio, and skipping
+    // the preview for it would leave the newest audio unpreviewed until
+    // more audio arrives.
     std::lock_guard<std::mutex> lk(mu_);
-    return closed_ || !queue_.empty();
+    return closed_ || pending_work_ > 0;
 }
 
 void StreamPump::run() {
@@ -154,16 +157,28 @@ void StreamPump::run() {
             if (closed_) return;
             batch.swap(queue_);
             pending_bytes_ = 0;
+            pending_work_ = 0;
             busy_ = true;
             space_cv_.notify_all();
         }
         // Append every queued frame first; one step then covers all of it.
         bool need_step = false;
-        for (Event& ev : batch) {
+        for (size_t i = 0; i < batch.size(); ++i) {
+            Event& ev = batch[i];
             if (is_closed()) return;  // the peer is gone: no more engine work
             switch (ev.kind) {
             case Kind::Audio:
-                if (handle_audio(ev.bytes)) need_step = true;
+                if (handle_audio(ev.bytes)) {
+                    need_step = true;
+                    // Catching up on a backlog: commit each full window as
+                    // soon as it is buffered, as the per-frame loop did, so
+                    // finalized audio is trimmed before the rest of the
+                    // batch is appended and the live-buffer cap
+                    // (--max-stream-seconds) is not tripped by the backlog
+                    // itself. Only the preview waits for the batch's end.
+                    if (i + 1 < batch.size() && session_.full_window_pending())
+                        step(/*coalesce_preview=*/true);
+                }
                 break;
             case Kind::Ping:
                 if (need_step) step();
@@ -216,13 +231,14 @@ bool StreamPump::handle_audio(const std::string& msg) {
     return outcome == AppendOutcome::Accepted;
 }
 
-void StreamPump::step() {
+void StreamPump::step(bool coalesce_preview) {
     // stream_step runs once per drained batch with an accepted frame —
     // including audio-less no-ops (an empty payload is Accepted): those
     // duplicate snapshots of an unchanged buffer are answered by the
     // session's exact-tail reuse instead of re-running the engine.
-    auto text_opt = session_.stream_step(steady_seconds(),
-                                         [this] { return newer_pending(); });
+    auto text_opt = session_.stream_step(
+        steady_seconds(),
+        [this, coalesce_preview] { return coalesce_preview || newer_pending(); });
     if (!session_.terminal_error().empty()) {
         if (!reject_error_sent_) {
             reject_error_sent_ = true;

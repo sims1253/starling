@@ -423,7 +423,7 @@ def test_preview_minimum_gates_the_take_not_the_tail():
 
 
 def test_preview_coalesced_when_newer_audio_is_queued():
-    cs = _small(partial_interval_seconds=10.0)
+    cs = _small()
     lens: list[int] = []
 
     def tx(window):
@@ -434,12 +434,30 @@ def test_preview_coalesced_when_newer_audio_is_queued():
     assert cs.step(np.zeros(20000, np.float32), 1.0, tx, lambda: pending[0]) is None
     assert lens == [16000] and cs.boundary == 12000 and cs.coalesced == 1
     pending[0] = False
-    # The owed committed-text update bypasses the 10 s interval.
+    # The next step previews the newest tail and carries the owed update.
     assert cs.step(np.zeros(22000, np.float32), 1.1, tx, lambda: pending[0]) is not None
     assert lens == [16000, 10000]
-    assert cs.step(np.zeros(23000, np.float32), 1.2, tx, lambda: pending[0]) is None
-    assert cs.flush(np.zeros(23000, np.float32), tx) is not None
-    assert lens[-1] == 23000 - 12000
+    assert cs.flush(np.zeros(22000, np.float32), tx) is not None
+    assert lens[-1] == 22000 - 12000
+
+
+def test_window_commit_does_not_force_a_throttled_preview():
+    # A window commit inside the interval emits the committed text at once
+    # but does not decode the tail (the preview duty bound holds).
+    cs = _small(partial_interval_seconds=10.0)
+    lens: list[int] = []
+
+    def tx(window):
+        lens.append(len(window))
+        return "w x"
+
+    assert cs.step(np.zeros(8000, np.float32), 20.0, tx) is not None
+    assert lens == [8000]
+    assert cs.step(np.zeros(20000, np.float32), 21.0, tx) == "w x"
+    assert lens == [8000, 16000]
+    assert cs.step(np.zeros(21000, np.float32), 21.5, tx) is None
+    assert cs.step(np.zeros(21000, np.float32), 30.0, tx) is not None
+    assert lens == [8000, 16000, 21000 - 12000]
 
 
 def test_preview_interval_adapts_to_preview_cost():

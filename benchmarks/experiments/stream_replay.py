@@ -209,7 +209,8 @@ def take_metrics(log: dict, reference: str, batch_text: str | None) -> dict:
                            "max": max(ages) if ages else None},
         "backlog_s": {"n": len(backlogs), "p50": _pct(backlogs, .5),
                       "p95": _pct(backlogs, .95), "max": max(backlogs) if backlogs else None},
-        "stop_to_final_ms": round((t_final - log["commits"][-1]) * 1000.0, 1),
+        # From the FIRST commit: busy retries are part of what the user waits.
+        "stop_to_final_ms": round((t_final - log["commits"][0]) * 1000.0, 1),
         "final_duration_s": final.get("duration_s"),
         "audio_complete": abs(float(final.get("duration_s", -1)) - duration) < 1e-3,
         "work": {

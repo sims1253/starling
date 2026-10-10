@@ -37,6 +37,9 @@ public:
         // Queued-but-unprocessed audio bound. Above it, push_audio() blocks
         // (a single larger frame is still admitted into an empty queue).
         size_t max_pending_bytes = 32u * 1024u * 1024u;
+        // Queued-but-unprocessed event bound (audio and control frames
+        // alike, so pings or empty frames cannot grow the queue either).
+        size_t max_pending_events = 4096;
     };
 
     // `session` must outlive the pump; it is only touched by the worker
@@ -75,7 +78,9 @@ private:
     bool is_closed();
     bool handle_audio(const std::string& bytes);  // true: accepted
     void handle_commit();
-    void step();
+    // `coalesce_preview`: commit due windows but skip the preview (more
+    // queued audio follows in the same batch).
+    void step(bool coalesce_preview = false);
 
     StreamSession& session_;
     Options opt_;
@@ -88,6 +93,7 @@ private:
     std::condition_variable idle_cv_;  // drain(): queue empty and idle
     std::deque<Event> queue_;
     size_t pending_bytes_ = 0;
+    size_t pending_work_ = 0;          // queued events other than pings
     bool closed_ = false;
     bool busy_ = false;                // worker is processing a batch
     std::thread worker_;

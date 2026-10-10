@@ -302,28 +302,28 @@ class ChunkStreamer:
         # first-partial minimum stalled previews after each commit (#357).
         # Never hand the transcriber an empty window (issue #146).
         eligible = tail_len > 0 and self.rebased + len(samples) >= self.min
+        # A window commit alone never forces a preview: the committed text is
+        # emitted at once, and the tail waits for the (cost-stretched) interval.
         throttled = (now - self.last_emit) < self.effective_interval
-        if not self.emit_due and (throttled or not eligible):
-            return None
-        if eligible and newer_pending is not None and newer_pending():
+        if not eligible or throttled:
+            return self._committed_update()
+        if newer_pending is not None and newer_pending():
             # Newer audio is already queued: this preview would be stale
             # before it finished. The next step previews the newer audio.
             self.coalesced += 1
             return None
         self.last_emit = now
 
-        if eligible:
-            self.call_kind = "preview"
-            t0 = time.monotonic()
-            text = tx(samples[self.boundary :])
-            if text is None:  # busy on the tail
-                return self._committed_update()
-            self.last_preview_cost = time.monotonic() - t0
-            self.emit_due = False
-            return " ".join(stitch_words(
-                self.committed, text.split(), max_overlap=self.max_overlap_words
-            ))
-        return self._committed_update()
+        self.call_kind = "preview"
+        t0 = time.monotonic()
+        text = tx(samples[self.boundary :])
+        if text is None:  # busy on the tail
+            return self._committed_update()
+        self.last_preview_cost = time.monotonic() - t0
+        self.emit_due = False
+        return " ".join(stitch_words(
+            self.committed, text.split(), max_overlap=self.max_overlap_words
+        ))
 
     def flush(self, samples: np.ndarray, tx: TranscribeFn) -> Optional[str]:
         """Commit all audio, or return ``None`` if bounded retries stay busy.

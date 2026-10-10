@@ -296,6 +296,35 @@ def test_stream_burst_coalesces_previews_and_keeps_audio(server, monkeypatch):
     assert msg["trace"]["audio_s"] == 3.0
 
 
+def test_stream_ping_does_not_coalesce_the_preview(server, monkeypatch):
+    # A ping queued while a window commits carries no audio: the preview of
+    # the newest tail still runs, and the pong follows it.
+    import time as _time
+
+    server.config.stream_chunk_seconds = 1
+    lens = []
+
+    def slow_window(samples, rid, **kwargs):
+        lens.append(len(samples))
+        if len(samples) == S.SAMPLE_RATE:
+            _time.sleep(0.3)  # the ping arrives during the window commit
+        return S.TranscribeResult(text="w")
+
+    monkeypatch.setattr(server, "_run_queued_sync", slow_window)
+    audio = np.zeros(S.SAMPLE_RATE * 11 // 10, dtype=np.int16).tobytes()  # 1.1 s
+    with TestClient(S.create_app(server=server, load_on_startup=False)) as client:
+        with client.websocket_connect('/stream?min_partial_seconds=0.5'
+                                      '&partial_interval_seconds=0') as ws:
+            ws.send_bytes(audio)
+            _time.sleep(0.1)
+            ws.send_json({"type": "ping"})
+            types = []
+            while (msg := ws.receive_json())["type"] != "pong":
+                types.append(msg["type"])
+    assert "partial" in types
+    assert [n for n in lens if n < S.SAMPLE_RATE] != []
+
+
 def test_lifespan_owns_eager_load(server):
     app = S.create_app(server=server)
     assert server.test_loads == []

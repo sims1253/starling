@@ -153,6 +153,11 @@ public:
         rebased_ += dropped;
     }
 
+    // A full window is waiting to be committed (the next step commits it).
+    bool full_window_pending(size_t n_samples) const {
+        return static_cast<int64_t>(n_samples) - boundary_ >= chunk_;
+    }
+
     // Previews skipped because newer audio was already queued.
     int64_t coalesced_previews() const { return coalesced_; }
     double min_preview_seconds() const {
@@ -282,6 +287,10 @@ public:
         if (chunker_) chunker_->set_preview_policy(min_seconds, interval_seconds);
     }
     const ChunkStreamer* chunker() const { return chunker_.get(); }
+    // The buffer holds a full window that the next stream_step commits.
+    bool full_window_pending() const {
+        return chunker_ && chunker_->full_window_pending(samples_.size());
+    }
 
     // The chunker's stable word count (ChunkStreamer::stable_words); 0 in
     // the legacy whole-buffer mode, where every partial is a fresh guess.
