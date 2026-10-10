@@ -110,7 +110,11 @@ class DurableAudioDeviceTest {
                 )
                 assertTrue(restored.durationSeconds >= 600.0)
             } else {
-                assertEquals(RecordingStatus.PENDING, restored.status)
+                // Interrupted; an earlier verify run may have retried it.
+                assertEquals(
+                    if (restored.revisions.isEmpty()) RecordingStatus.PENDING else RecordingStatus.TRANSCRIBED,
+                    restored.status,
+                )
                 val recovery = restored.recovery!!
                 assertEquals(pcm.size / 32_000.0, recovery.recoveredSeconds, 1e-6)
                 assertTrue(recovery.confirmedSeconds <= recovery.recoveredSeconds)

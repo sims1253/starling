@@ -284,4 +284,34 @@ class RecordingStoreRecoveryTest {
         assertEquals("hello", retried.rawTranscript)
         assertEquals(listOf("", "hello"), retried.revisions.map { it.text })
     }
+
+    @Test
+    fun aTranscriptSavedBeforeRevisionsSurvivesRetries() {
+        val id = "00000000-0000-4000-8000-000000000356"
+        storeDir().mkdirs()
+        // Metadata as written before revisions existed: no "revisions" key.
+        File(storeDir(), "$id.json").writeText(
+            """{"id":"$id","created_at_ms":500,"wav_name":"$id.wav","status":"TRANSCRIBED",""" +
+                """"duration_s":1.0,"attempts":1,"raw_transcript":"old text","error_message":null,""" +
+                """"provenance":"LIVE_STREAM","ephemeral":false}""",
+        )
+        File(storeDir(), "$id.wav").writeBytes(WavWriter.header(second.toLong()) + pcm(second))
+        val store = RecordingStore(storeDir()) { 2_000L }
+
+        val legacy = store.get(id).revisions.single()
+        assertEquals("old text", legacy.text)
+        assertEquals(TranscriptionProvenance.LIVE_STREAM, legacy.provenance)
+        assertNull(legacy.source)
+        assertNull(legacy.model)
+        assertEquals(500L, legacy.createdAtMillis)
+
+        val blank = store.markTranscribed(id, " ")
+        assertEquals(RecordingStatus.FAILED, blank.status)
+        assertEquals("old text", blank.rawTranscript)
+
+        store.markTranscribed(id, "new text", TranscriptionProvenance.BATCH_UPLOAD, TranscriptSource.SERVER, "parakeet")
+        val reopened = RecordingStore(storeDir()).get(id)
+        assertEquals("new text", reopened.rawTranscript)
+        assertEquals(listOf("old text", "new text"), reopened.revisions.map { it.text })
+    }
 }

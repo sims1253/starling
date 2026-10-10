@@ -258,23 +258,41 @@ class RecordingStore internal constructor(
         }.getOrElse { RecordingStatus.FAILED }
         val wavName = json.getString("wav_name")
         require(wavName == "$id.wav") { "Invalid recording audio name" }
+        val createdAtMillis = json.getLong("created_at_ms")
+        val rawTranscript = json.optionalString("raw_transcript")
+        val provenance = json.optionalString("provenance")
+            ?.let { value ->
+                runCatching { TranscriptionProvenance.valueOf(value) }.getOrNull()
+            }
+        val revisions = json.optJSONArray("revisions")
+            ?.let { array -> (0 until array.length()).mapNotNull { decodeRevision(array.getJSONObject(it)) } }
+            .orEmpty()
         return Recording(
             id = id,
-            createdAtMillis = json.getLong("created_at_ms"),
+            createdAtMillis = createdAtMillis,
             wavName = wavName,
             status = status,
             durationSeconds = json.optDouble("duration_s", 0.0),
-            rawTranscript = json.optionalString("raw_transcript"),
+            rawTranscript = rawTranscript,
             errorMessage = json.optionalString("error_message"),
             attempts = json.optInt("attempts", 0),
-            provenance = json.optionalString("provenance")
-                ?.let { value ->
-                    runCatching { TranscriptionProvenance.valueOf(value) }.getOrNull()
-                },
+            provenance = provenance,
             ephemeral = json.optBoolean("ephemeral", false),
-            revisions = json.optJSONArray("revisions")
-                ?.let { array -> (0 until array.length()).mapNotNull { decodeRevision(array.getJSONObject(it)) } }
-                .orEmpty(),
+            // A transcript saved before revisions existed becomes the first
+            // one, so a retry keeps it and an empty retry cannot erase it.
+            revisions = if (revisions.isEmpty() && !rawTranscript.isNullOrBlank()) {
+                listOf(
+                    TranscriptRevision(
+                        rawTranscript,
+                        provenance ?: TranscriptionProvenance.BATCH_UPLOAD,
+                        source = null,
+                        model = null,
+                        createdAtMillis = createdAtMillis,
+                    ),
+                )
+            } else {
+                revisions
+            },
             recovery = json.optJSONObject("recovery")?.let(::decodeRecovery),
         )
     }
