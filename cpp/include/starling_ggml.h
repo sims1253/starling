@@ -39,6 +39,10 @@ extern "C" {
 //       returns the Phase-2 error until the encoder/decoder graph lands).
 //   9 — added STARLING_GGML_QWEN3_06 (Qwen/Qwen3-ASR-0.6B-hf; served by the
 //       QWEN3 engine — same architecture, dims come from GGUF metadata).
+// Additions that leave every existing entry point unchanged keep the version
+// (starling_ggml_transcribe_pcm_words, issue #357): a caller loading the
+// library at run time probes for such a symbol (dlsym) instead of checking
+// the version.
 #define STARLING_GGML_ABI_VERSION 9
 
 // ABI / build introspection --------------------------------------------------
@@ -140,6 +144,31 @@ const char * starling_ggml_last_error(starling_ggml_ctx * ctx);
 char * starling_ggml_transcribe_pcm(starling_ggml_ctx * ctx,
                                     const float * samples, int64_t n,
                                     int sample_rate);
+
+// One word of a transcript: bytes [text_begin, text_end) of the returned
+// text, heard from start_s to end_s seconds into the transcribed audio.
+typedef struct starling_ggml_word {
+    int32_t text_begin;
+    int32_t text_end;
+    float start_s;
+    float end_s;
+} starling_ggml_word;
+
+// starling_ggml_transcribe_pcm with word timestamps. On success also writes
+// a malloc'd array of the text's whitespace-separated words, in order, to
+// *words (free it with starling_ggml_free_words) and their count to *n_words.
+// A model without word timestamps (every engine but Parakeet) returns the
+// plain transcript with *words = NULL and *n_words = -1. On error returns
+// NULL like starling_ggml_transcribe_pcm and leaves *words NULL.
+char * starling_ggml_transcribe_pcm_words(starling_ggml_ctx * ctx,
+                                          const float * samples, int64_t n,
+                                          int sample_rate,
+                                          starling_ggml_word ** words,
+                                          int64_t * n_words);
+
+// Free a word array returned by starling_ggml_transcribe_pcm_words (no-op on
+// NULL).
+void starling_ggml_free_words(starling_ggml_word * words);
 
 // Raw Granite research handles (from starling_ggml_granite_load) do not use
 // the common API's whole-call lock. Callers must serialize raw load, decode,

@@ -243,6 +243,7 @@ TranscribeResult StarlingServer::do_transcribe(
     QueuePolicy policy) {
     std::string text;
     std::string req_id;
+    std::optional<std::vector<TimedWord>> words;
     if (cfg_.granite_chunk_fairness && cfg_.model_slug == "granite") {
         using namespace starling::ggml::lib;
         std::unique_ptr<GraniteChunkJob, decltype(&free_granite_job)> job(
@@ -283,7 +284,31 @@ TranscribeResult StarlingServer::do_transcribe(
         }
     } else {
         if (!run_with_turn(ctx, policy, [&] {
-                return starling_ggml_transcribe_pcm(model_, samples, n, kSampleRate);
+                starling_ggml_word* raw = nullptr;
+                int64_t count = -1;
+                std::unique_ptr<char, decltype(&starling_ggml_free_string)> out(
+                    starling_ggml_transcribe_pcm_words(model_, samples, n, kSampleRate,
+                                                       &raw, &count),
+                    &starling_ggml_free_string);
+                std::unique_ptr<starling_ggml_word, decltype(&starling_ggml_free_words)> raw_guard(
+                    raw, &starling_ggml_free_words);
+                if (out && raw && count >= 0) {
+                    const size_t len = std::strlen(out.get());
+                    std::vector<TimedWord> timed;
+                    timed.reserve(static_cast<size_t>(count));
+                    for (int64_t i = 0; i < count; ++i) {
+                        const auto& w = raw[i];
+                        if (w.text_begin < 0 || w.text_end < w.text_begin
+                            || static_cast<size_t>(w.text_end) > len)
+                            break;
+                        timed.push_back({std::string(out.get() + w.text_begin, out.get() + w.text_end),
+                                         w.start_s, w.end_s});
+                    }
+                    // One bad offset drops the window's word times (the
+                    // untimed stitch), never a partial list.
+                    if (static_cast<int64_t>(timed.size()) == count) words = std::move(timed);
+                }
+                return out.release();
             }, &text, err, &req_id))
             return {};
     }
@@ -297,6 +322,7 @@ TranscribeResult StarlingServer::do_transcribe(
     const auto t_resp0 = std::chrono::steady_clock::now();
     TranscribeResult result;
     result.text = std::move(text);
+    result.words = std::move(words);
     if (tr_on) {
         trace::response_event(
             std::chrono::duration<double, std::milli>(

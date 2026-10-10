@@ -26,6 +26,7 @@
 #include "parakeet_engine.hpp"
 #endif
 
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -266,14 +267,18 @@ float * starling_ggml_parakeet_encode(void * handle, const float * pcm, int64_t 
 //
 // The encoder Phase 1b output is feat-major [H, T'] (out[h*T' + t]); tdt_greedy
 // wants row-major [T', H] (enc_proj[t*H + h]), so we transpose here.
+//
+// `step_timing`, when set, receives each emitted step's encoder frame and
+// duration.
 static bool parakeet_full_decode(ParakeetCtx* c,
                                  const float* pcm, int64_t n,
                                  std::vector<int32_t>& ids,
-                                 const char** err_out) {
+                                 const char** err_out,
+                                 starling::ggml::parakeet::TdtTiming* step_timing = nullptr) {
 #if defined(STARLING_HAVE_FAST)
     if (c->fast) {
         try {
-            if (!c->fast->decode_ids(pcm, (size_t)n, ids, c->err)) {
+            if (!c->fast->decode_ids(pcm, (size_t)n, ids, c->err, step_timing)) {
                 report_error(err_out, c->err.c_str());
                 return false;
             }
@@ -344,7 +349,7 @@ static bool parakeet_full_decode(ParakeetCtx* c,
             *c->prediction, *c->joint, enc_proj, Tp, H,
             c->model->config.tdt_durations,
             (int)c->model->config.blank_id,
-            (int)c->model->config.max_symbols);
+            (int)c->model->config.max_symbols, step_timing);
     } catch (const std::exception& e) {
         report_error(err_out, e.what());
         return false;
@@ -377,6 +382,66 @@ char * starling_ggml_parakeet_decode(void * handle, const float * pcm, int64_t n
     if (!out) { if (err_out) *err_out = "malloc failed"; return nullptr; }
     std::memcpy(out, text.data(), text.size());
     out[text.size()] = '\0';
+    return out;
+}
+
+// The encoder's time subsampling: 3 stride-2 stages (subsampling.hpp), so one
+// encoder frame spans 8 mel hops.
+constexpr int kEncoderSubsampling = 8;
+
+// Decode-words entry (issue #357): the decode text as from _decode, plus a
+// malloc'd array of its words with the time the decoder heard each one,
+// from the first frame of its first token to the end of its last token's
+// duration. The caller frees the text with starling_ggml_free_string and
+// the words with starling_ggml_free_words.
+char * starling_ggml_parakeet_decode_words(void * handle, const float * pcm, int64_t n,
+                                           starling_ggml_word ** words_out,
+                                           int64_t * n_words_out,
+                                           const char ** err_out) {
+    if (words_out) *words_out = nullptr;
+    if (n_words_out) *n_words_out = -1;
+    auto* c = static_cast<ParakeetCtx*>(handle);
+    if (!c) { if (err_out) *err_out = "null parakeet handle"; return nullptr; }
+    if (!words_out || !n_words_out) {
+        if (err_out) *err_out = "null words out-parameter";
+        return nullptr;
+    }
+    std::vector<int32_t> ids;
+    starling::ggml::parakeet::TdtTiming timing;
+    if (!parakeet_full_decode(c, pcm, n, ids, err_out, &timing)) return nullptr;
+    // A decode path that recorded no step times (out of step with the ids)
+    // gives the plain text, *n_words = -1, never a 0-word list for words.
+    const bool timed_ok = timing.frame.size() == ids.size()
+                       && timing.duration.size() == ids.size();
+    std::string text;
+    const auto words = starling::ggml::parakeet::word_frames(
+        c->cfg.tokenizer_pieces, ids, timing.frame, timing.duration, text);
+    const double frame_s = (double)c->cfg.hop_length * kEncoderSubsampling
+                         / (double)c->cfg.sample_rate;
+    char* out = (char*)std::malloc(text.size() + 1);
+    // At least one element: malloc(0) may return NULL.
+    auto* timed = (starling_ggml_word*)std::malloc(
+        std::max<size_t>(words.size(), 1) * sizeof(starling_ggml_word));
+    if (!out || !timed) {
+        std::free(out);
+        std::free(timed);
+        if (err_out) *err_out = "malloc failed";
+        return nullptr;
+    }
+    std::memcpy(out, text.data(), text.size());
+    out[text.size()] = '\0';
+    for (size_t i = 0; i < words.size(); ++i) {
+        timed[i].text_begin = (int32_t)words[i].begin;
+        timed[i].text_end = (int32_t)words[i].end;
+        timed[i].start_s = (float)(words[i].first_frame * frame_s);
+        timed[i].end_s = (float)(words[i].end_frame * frame_s);
+    }
+    if (!timed_ok) {
+        std::free(timed);
+        return out;
+    }
+    *words_out = timed;
+    *n_words_out = (int64_t)words.size();
     return out;
 }
 

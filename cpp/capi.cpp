@@ -284,8 +284,54 @@ char * starling_ggml_transcribe_pcm(starling_ggml_ctx * ctx,
     });
 }
 
+char * starling_ggml_transcribe_pcm_words(starling_ggml_ctx * ctx,
+                                          const float * samples, int64_t n,
+                                          int sample_rate,
+                                          starling_ggml_word ** words,
+                                          int64_t * n_words) {
+    if (words) *words = nullptr;
+    if (n_words) *n_words = -1;
+    return api_call(ctx, [&]() -> char * {
+        require_running();
+        if (!ctx || !ctx->model) {
+            set_global_error("starling_ggml_transcribe_pcm_words: null context");
+            return nullptr;
+        }
+        const lib::ModelDescriptor* d = lib::find_model(ctx->kind);
+        if (!d) {
+            ctx->last_error = "starling_ggml_transcribe_pcm_words: unsupported model kind";
+            set_global_error(ctx->last_error);
+            return nullptr;
+        }
+        if (!d->decode_words_fn || !words || !n_words) {
+            // No word timestamps from this engine (or none asked for): the
+            // plain transcript, *n_words = -1.
+            return starling_ggml_transcribe_pcm(ctx, samples, n, sample_rate);
+        }
+        // The same 16 kHz guard as starling_ggml_transcribe_pcm.
+        if (sample_rate != 0 && sample_rate != 16000) {
+            char msg[128];
+            std::snprintf(msg, sizeof(msg), d->rate_error_fmt, sample_rate);
+            if (d->rate_error_in_ctx) ctx->last_error = msg;
+            set_global_error(msg);
+            return nullptr;
+        }
+        const char* err = nullptr;
+        char* r = d->decode_words_fn(ctx->model, samples, n, words, n_words, &err);
+        if (!r) {
+            ctx->last_error = err ? err : d->decode_fallback;
+            set_global_error(ctx->last_error);
+        }
+        return r;
+    });
+}
+
 void starling_ggml_free_string(char * s) {
     if (s) std::free(s);
+}
+
+void starling_ggml_free_words(starling_ggml_word * words) {
+    if (words) std::free(words);
 }
 
 char * starling_ggml_normalize_text(starling_ggml_ctx * ctx,

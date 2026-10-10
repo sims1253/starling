@@ -18,7 +18,7 @@
 #include <string>
 #include <vector>
 
-namespace starling::ggml::parakeet { struct ParakeetModel; }
+namespace starling::ggml::parakeet { struct ParakeetModel; struct TdtTiming; }
 
 namespace starling::fast {
 
@@ -31,8 +31,10 @@ public:
     ~ParakeetEngine();
 
     // Full pipeline: mel -> encoder -> TDT greedy. `ids` includes blanks
-    // (the same stream as the ggml engine's tdt_greedy).
-    bool decode_ids(const float* pcm, size_t n, std::vector<int32_t>& ids, std::string& err);
+    // (the same stream as the ggml engine's tdt_greedy); `timing`, when set,
+    // receives each step's frame and duration.
+    bool decode_ids(const float* pcm, size_t n, std::vector<int32_t>& ids, std::string& err,
+                    ggml::parakeet::TdtTiming* timing = nullptr);
     // Text of the last decode_ids-equivalent run.
     bool transcribe(const float* pcm, size_t n, std::string& text, std::string& err);
     // Encoder only: row-major [Tp][joint_hidden] joint-projected encoder output.

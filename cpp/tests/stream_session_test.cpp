@@ -18,7 +18,9 @@
 #include <thread>
 #include <cstdio>
 #include <cmath>
+#include <tuple>
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -351,7 +353,8 @@ std::vector<FixtureCase> load_fixture_cases() {
         if (words.empty() || words[0][0] == '#') continue;
         const std::string tag = words[0];
         std::vector<std::string> rest(words.begin() + 1, words.end());
-        if (tag == "stitch" || tag == "suppress" || tag == "preview" || tag == "stream") {
+        if (tag == "stitch" || tag == "tstitch" || tag == "suppress" || tag == "preview"
+            || tag == "stream") {
             FixtureCase c;
             c.op = tag;
             c.name = rest.empty() ? "" : rest[0];
@@ -388,6 +391,59 @@ std::string fixture_seconds(int64_t samples) {
     std::snprintf(buf, sizeof buf, "%g", static_cast<double>(samples) / 16000.0);
     return buf;
 }
+
+// A fixture word "word@start-end" (seconds).
+TimedWord fixture_timed(const std::string& token) {
+    const size_t at = token.rfind('@');
+    if (at == std::string::npos) {
+        std::fprintf(stderr, "fixture word without '@': %s\n", token.c_str());
+        std::abort();
+    }
+    const std::string times = token.substr(at + 1);
+    const size_t dash = times.find('-');
+    const std::string start = times.substr(0, dash);
+    const std::string end = dash == std::string::npos ? start : times.substr(dash + 1);
+    return {token.substr(0, at), std::stod(start), std::stod(end)};
+}
+
+// Scripted engine text with word timestamps (every token "word@start-end").
+Transcript fixture_transcript(const std::vector<std::string>& tokens) {
+    std::vector<TimedWord> words;
+    std::vector<std::string> text;
+    for (const auto& t : tokens) {
+        words.push_back(fixture_timed(t));
+        text.push_back(words.back().word);
+    }
+    return Transcript(join_words(text), std::move(words));
+}
+
+int64_t nearest_sample(double seconds) {
+    return std::llround(seconds * 16000.0);
+}
+
+// tstitch: the chunker's timed stitch over the given shared audio; no shared
+// word concatenates.
+std::vector<std::string> fixture_stitch_timed(const FixtureCase& c) {
+    std::vector<std::string> a, b;
+    std::vector<int64_t> as, bs;
+    for (const auto& t : c.committed) {
+        const auto w = fixture_timed(t);
+        a.push_back(w.word);
+        as.push_back(nearest_sample(w.start));
+    }
+    for (const auto& t : c.fresh) {
+        const auto w = fixture_timed(t);
+        b.push_back(w.word);
+        bs.push_back(nearest_sample(w.start));
+    }
+    const auto cut = stitch_timed(a, as, b, bs, nearest_sample(std::stod(c.args.at(1))),
+                                  nearest_sample(std::stod(c.args.at(2))),
+                                  static_cast<int64_t>(kStitchTimeToleranceSeconds * 16000));
+    const auto [keep, skip] = cut ? *cut : std::make_pair(static_cast<int>(a.size()), 0);
+    std::vector<std::string> out(a.begin(), a.begin() + keep);
+    out.insert(out.end(), b.begin() + skip, b.end());
+    return out;
+}
 }  // namespace
 
 static void test_stitch_fixture_cases() {
@@ -397,6 +453,10 @@ static void test_stitch_fixture_cases() {
         if (c.op == "stitch") {
             const bool ok = stitch_words(c.committed, c.fresh) == c.expect;
             if (!ok) std::fprintf(stderr, "stitch case %s differs\n", c.name.c_str());
+            CHECK(ok);
+        } else if (c.op == "tstitch") {
+            const bool ok = fixture_stitch_timed(c) == c.expect;
+            if (!ok) std::fprintf(stderr, "tstitch case %s differs\n", c.name.c_str());
             CHECK(ok);
         } else if (c.op == "suppress") {
             const bool ok = suppress_loops(c.committed, std::stod(c.args.at(1))) == c.expect;
@@ -418,7 +478,7 @@ static void test_stitch_fixture_cases() {
             std::vector<std::string> calls;
             std::vector<bool> used(c.tx.size(), false);
             bool scripted = true;
-            TranscribeFn tx = [&](const float* p, int64_t n) -> std::optional<std::string> {
+            TranscribeFn tx = [&](const float* p, int64_t n) -> std::optional<Transcript> {
                 const int64_t start = p - samples.data();
                 calls.push_back(std::string(cs.call_kind()) + "@" + fixture_seconds(start)
                                 + "+" + fixture_seconds(n));
@@ -437,8 +497,11 @@ static void test_stitch_fixture_cases() {
                     return std::string();
                 }
                 if (hits.size() > 1) used[hits[0]] = true;
-                if (c.tx[hits[0]].text == "BUSY") return std::nullopt;
-                return c.tx[hits[0]].text;
+                const std::string& text = c.tx[hits[0]].text;
+                if (text == "BUSY") return std::nullopt;
+                if (text.find('@') != std::string::npos)
+                    return fixture_transcript(split_words(text));
+                return text;
             };
             auto final_text = cs.flush(samples, tx);
             const bool ok = scripted && final_text.has_value()
@@ -452,6 +515,101 @@ static void test_stitch_fixture_cases() {
             CHECK(ok);
         }
     }
+}
+
+// ---- word timestamps (issue #357) ------------------------------------------
+// A transcriber answering every call with "word@start-end ..." (times from
+// the window start), by call kind and window start (seconds).
+static TranscribeFn timed_tx(const ChunkStreamer& cs, const std::vector<float>& samples,
+                             std::vector<std::tuple<std::string, double, std::string>> answers) {
+    return [&cs, &samples, answers](const float* p, int64_t) -> std::optional<Transcript> {
+        const double start = static_cast<double>(p - samples.data()) / 16000.0;
+        for (const auto& [kind, at, text] : answers)
+            if ((kind == "*" || kind == cs.call_kind()) && (at < 0 || std::abs(at - start) < 1e-9))
+                return fixture_transcript(split_words(text));
+        CHECK(false);
+        return std::nullopt;
+    };
+}
+
+static void test_timed_preview_stitch() {
+    // A window heard "in fact" at its edge; the preview of the tail heard
+    // "fact" again at the same time: the preview shows it once. Silence is
+    // never sparse, so nothing is re-decoded.
+    ChunkStreamer cs(16000, 12.0, 3.0, 0.0, 0.0);
+    std::vector<float> samples(13 * 16000, 0.0f);
+    auto tx = timed_tx(cs, samples, {
+        {"window", 0.0, "so@1-1.2 in@10.4-10.6 fact@10.8-11.1"},
+        {"preview", 9.0, "fact@1.84-2.1 there's@2.5-2.8 more@3.2-3.4"}});
+    // The step commits the window, then previews the tail from 9 s.
+    CHECK(cs.step(samples, 1.0, tx) == std::optional<std::string>("so in fact there's more"));
+}
+
+static void test_timed_words_must_match_the_text() {
+    // Words that are not the text's split_words() leave the window untimed:
+    // the text alignment keeps a single shared word twice.
+    ChunkStreamer cs(16000, 12.0, 3.0, 0.0, 0.0);
+    std::vector<float> samples(20 * 16000, 0.0f);
+    int call = 0;
+    TranscribeFn tx = [&](const float*, int64_t) -> std::optional<Transcript> {
+        if (call++ == 0) return fixture_transcript(split_words("so@1-1.2 in@10.4-10.6 fact@10.8-11.1"));
+        return Transcript("fact there's more", std::vector<TimedWord>{{"fact", 1.84, 2.1}});
+    };
+    CHECK(cs.flush(samples, tx) == std::optional<std::string>("so in fact fact there's more"));
+}
+
+static void test_timed_loop_suppression_keeps_times() {
+    // A looping window keeps "la la end" with "end" still at 11 s, so the
+    // tail that heard "end" there again joins at it.
+    ChunkStreamer cs(16000, 12.0, 3.0, 0.0, 0.0);
+    std::vector<float> samples(14 * 16000, 0.0f);
+    std::string loop;
+    for (int k = 0; k < 90; ++k) {
+        char buf[48];
+        std::snprintf(buf, sizeof buf, "la@%.1f-%.2f ", 0.1 * k, 0.1 * k + 0.05);
+        loop += buf;
+    }
+    loop += "end@11-11.3";
+    auto tx = timed_tx(cs, samples, {{"flush_window", 0.0, loop},
+                                     {"redecode", -1.0, loop},
+                                     {"flush_tail", 9.0, "end@2.02-2.3 more@3-3.2"}});
+    CHECK(cs.flush(samples, tx) == std::optional<std::string>("la la end more"));
+}
+
+static ServerConfig test_cfg();
+static std::string pcm_for_range(int64_t start, int64_t n);
+
+static void test_session_traces_committed_word_times() {
+    // The ledger keeps word times of calls that produce committed text (also
+    // when reused), never of previews; the trace lists them in take seconds.
+    StarlingServer server(test_cfg());
+    StreamSession session(&server);
+    session.set_transcribe_fn([](const float*, int64_t n) -> std::optional<Transcript> {
+        return Transcript("say \"hi\"", std::vector<TimedWord>{
+            {"say", 0.1, 0.3}, {"\"hi\"", 0.4, static_cast<double>(n) / 16000.0}});
+    });
+    session.append_pcm(pcm_for_range(0, 20000));  // one window, then 0.5 s past its boundary
+    CHECK(session.stream_step(1.0).has_value());   // window, then a preview of the tail
+    CHECK(session.stream_flush().has_value());     // the tail, reused from the preview
+    bool window = false, preview = false, reused = false;
+    for (const auto& c : session.calls()) {
+        const std::string kind = c.kind, result = c.result;
+        if (kind == "preview") {
+            preview = true;
+            CHECK(!c.words.has_value());
+        } else {
+            CHECK(c.words.has_value() && c.words->size() == 2);
+            window = window || kind == "window";
+            reused = reused || result == "reused";
+        }
+    }
+    CHECK(window && preview && reused);
+    const std::string trace = session.trace_final_json();
+    CHECK(trace.find(R"("kind":"window","start_s":0.000,"end_s":1.000)") != std::string::npos);
+    CHECK(trace.find(R"("words":[{"w":"say","start":0.100,"end":0.300},{"w":"\"hi\"","start":0.400,"end":1.000}])")
+          != std::string::npos);
+    // The tail's words count from the tail's start (the 0.75 s boundary).
+    CHECK(trace.find(R"({"w":"say","start":0.850,"end":1.050})") != std::string::npos);
 }
 
 // ---- window plausibility and loops (issue #357) ----------------------------
@@ -2601,6 +2759,10 @@ int main() {
     test_chunk_streamer_rebase();
     test_chunk_streamer_stable_prefix_never_changes();
     test_stitch_fixture_cases();
+    test_timed_preview_stitch();
+    test_timed_words_must_match_the_text();
+    test_timed_loop_suppression_keeps_times();
+    test_session_traces_committed_word_times();
     test_voiced_seconds();
     test_preview_never_shows_a_loop();
     test_session_ledger_records_redecode_spans();

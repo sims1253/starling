@@ -46,9 +46,19 @@
 #include "joint.hpp"
 #include "prediction.hpp"
 
+#include <cstdint>
 #include <vector>
 
 namespace starling::ggml::parakeet {
+
+// Where each emitted step was decoded (issue #357), parallel to the id
+// stream: the encoder frame the joint read and the duration the step
+// advanced the frame by. A token's audio starts at its frame and lasts its
+// duration (word timestamps, tokenizer.hpp word_frames()).
+struct TdtTiming {
+    std::vector<int32_t> frame;
+    std::vector<int32_t> duration;
+};
 
 // Serial TDT greedy decode.
 //   pred:        prediction net (LSTM).
@@ -62,12 +72,15 @@ namespace starling::ggml::parakeet {
 //   blank_id:    blank token id (= vocab_size = 8192).
 //   max_symbols: cap on consecutive dur-0 emits at a single frame.
 //
+//   timing:      when set, receives each emitted step's frame and duration.
+//
 // Returns the emitted token id stream INCLUDING blanks (matches the golden
 // parakeet_tdt_*_ids.pt byte-for-byte).
 std::vector<int32_t> tdt_greedy(const PredictionNet& pred, const Joint& joint,
                                 const std::vector<float>& enc_proj,
                                 int T, int H,
                                 const std::vector<int32_t>& durations,
-                                int blank_id, int max_symbols);
+                                int blank_id, int max_symbols,
+                                TdtTiming* timing = nullptr);
 
 } // namespace starling::ggml::parakeet

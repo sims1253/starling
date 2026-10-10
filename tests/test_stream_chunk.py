@@ -9,19 +9,26 @@ verifies the reconstructed transcript equals the ground truth despite overlap.
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 
 import numpy as np
 import pytest
 
 from starling.stream_chunk import (
+    STITCH_TIME_TOLERANCE_SECONDS,
     ChunkStreamer,
+    TimedWord,
+    Transcript,
     max_plausible_words,
+    stitch_timed,
     stitch_words,
     stream_window_config_error,
     suppress_loops,
+    suppress_loops_kept,
     suppress_preview_loops,
+    suppress_preview_loops_kept,
     voiced_seconds,
 )
 
@@ -610,6 +617,64 @@ def test_redecode_needs_audio_before_the_boundary_to_be_kept():
     assert cs.retain_from == 9 * SR - cs.lookback
 
 
+# ---- word timestamps (issue #357) -------------------------------------------
+
+
+def _timed_tx(answers: dict):
+    """A transcriber answering by (call kind, window start in s) with
+    "word@start-end ..." scripts (times from the window start)."""
+    cs_ref: list = []  # the caller appends its ChunkStreamer
+
+    def tx(window: np.ndarray):
+        return _transcript(answers[(cs_ref[0].call_kind, cs_ref[0].call_start / SR)].split())
+    return tx, cs_ref
+
+
+def test_preview_is_stitched_by_time():
+    # A window heard "in fact" at its edge; the preview of the tail heard
+    # "fact" again at the same time: the preview shows it once.
+    cs = ChunkStreamer(**_cfg(min_seconds=0.0, partial_interval_seconds=0.0))
+    tx, ref = _timed_tx({
+        ("window", 0.0): "so@1-1.2 in@10.4-10.6 fact@10.8-11.1",
+        ("preview", 9.0): "fact@1.84-2.1 there's@2.5-2.8 more@3.2-3.4",
+    })
+    ref.append(cs)
+    samples = np.zeros(13 * SR, dtype=np.float32)  # silence is never sparse
+    # The step commits the window, then previews the tail from 9 s.
+    assert cs.step(samples, 1.0, tx) == "so in fact there's more"
+    assert cs.committed == ["so", "in", "fact"]
+
+
+def test_word_times_that_do_not_match_the_text_are_ignored():
+    # Words that are not the text's split() leave the window untimed: the
+    # text alignment, which keeps a single shared word twice.
+    cs = ChunkStreamer(**_cfg())
+    calls = iter([
+        _transcript("so@1-1.2 in@10.4-10.6 fact@10.8-11.1".split()),
+        Transcript("fact there's more", (TimedWord("fact", 1.84, 2.1),)),
+    ])
+    out = cs.flush(np.zeros(20 * SR, dtype=np.float32), lambda w: next(calls))
+    assert out == "so in fact fact there's more"
+    assert cs.spans[-3:] == [None, None, None]
+
+
+def test_loop_suppression_keeps_word_times_with_their_words():
+    # A looping flush tail whose re-decodes loop too keeps the suppressed
+    # words, each still at its own time.
+    cs = ChunkStreamer(**_cfg())
+    loop = " ".join(f"la@{0.1 * k:.1f}-{0.1 * k + 0.05:.2f}" for k in range(40)) + " end@4.5-4.8"
+    out = cs.flush(np.zeros(5 * SR, dtype=np.float32), lambda w: _transcript(loop.split()))
+    assert out == "la la end"
+    assert cs.spans == [(0, 800), (1600, 2400), (72000, 76800)]
+
+
+def test_suppress_kept_indices_match_the_words():
+    words = "and then a little bit of a little bit of a little bit of a so on".split()
+    assert [words[i] for i in suppress_loops_kept(words, 1)] == suppress_loops(words, 1)
+    assert ([words[i] for i in suppress_preview_loops_kept(words, 10)]
+            == suppress_preview_loops(words, 10))
+
+
 # ---- stitch parity fixture (issue #357) --------------------------------------
 
 _CASES = Path(__file__).resolve().parent / "fixtures" / "stream_stitch_cases.txt"
@@ -623,7 +688,7 @@ def _parse_cases() -> list[dict]:
         if not line or line.startswith("#"):
             continue
         tag, _, rest = line.partition(" ")
-        if tag in ("stitch", "suppress", "preview", "stream"):
+        if tag in ("stitch", "tstitch", "suppress", "preview", "stream"):
             cases.append({"op": tag, "args": rest.split(), "tx": []})
         elif tag in ("<", ">", "="):
             cases[-1][tag] = rest.split()
@@ -637,6 +702,35 @@ def _parse_cases() -> list[dict]:
         else:
             raise AssertionError(f"bad fixture line: {raw!r}")
     return cases
+
+
+def _timed(token: str) -> tuple[str, float, float]:
+    """A fixture word "word@start-end" (seconds)."""
+    word, _, times = token.rpartition("@")
+    start, _, end = times.partition("-")
+    return word, float(start), float(end or start)
+
+
+def _transcript(tokens: list[str]) -> Transcript:
+    """Scripted engine text with word timestamps (every token "word@start-end")."""
+    words = tuple(TimedWord(*_timed(t)) for t in tokens)
+    return Transcript(" ".join(w.word for w in words), words)
+
+
+def _stitch_timed_case(case: dict) -> list[str]:
+    """tstitch: the chunker's timed stitch over the given shared audio; no
+    shared word concatenates."""
+    committed = [_timed(t) for t in case.get("<", [])]
+    new = [_timed(t) for t in case.get(">", [])]
+    cut = stitch_timed([w for w, _, _ in committed],
+                       [int(math.floor(a * SR + 0.5)) for _, a, _ in committed],
+                       [w for w, _, _ in new],
+                       [int(math.floor(a * SR + 0.5)) for _, a, _ in new],
+                       lo=int(math.floor(float(case["args"][1]) * SR + 0.5)),
+                       hi=int(math.floor(float(case["args"][2]) * SR + 0.5)),
+                       tolerance=int(STITCH_TIME_TOLERANCE_SECONDS * SR))
+    keep, skip = cut if cut is not None else (len(committed), 0)
+    return [w for w, _, _ in committed[:keep]] + [w for w, _, _ in new[skip:]]
 
 
 def _seconds(sample: int) -> str:
@@ -654,7 +748,7 @@ def _replay_stream(case: dict) -> tuple[list[str], list[str]]:
 
     used: set[int] = set()
 
-    def tx(window: np.ndarray) -> Optional[str]:
+    def tx(window: np.ndarray) -> Optional[Union[str, Transcript]]:
         start, n = cs.call_start, len(window)
         calls.append(f"{cs.call_kind}@{_seconds(start)}+{_seconds(n)}")
         hits = [k for k, (kind, a, length, _) in enumerate(case["tx"])
@@ -665,7 +759,9 @@ def _replay_stream(case: dict) -> tuple[list[str], list[str]]:
         if len(hits) > 1:
             used.add(hits[0])
         text = case["tx"][hits[0]][3]
-        return None if text == "BUSY" else text
+        if text == "BUSY":
+            return None
+        return _transcript(text.split()) if "@" in text else text
 
     final = cs.flush(samples, tx)
     assert final is not None
@@ -678,6 +774,8 @@ def test_stitch_fixture_case(case):
     # test_stitch_fixture_cases); both must match every expected line.
     if case["op"] == "stitch":
         assert stitch_words(case.get("<", []), case.get(">", [])) == case["="]
+    elif case["op"] == "tstitch":
+        assert _stitch_timed_case(case) == case.get("=", [])
     elif case["op"] == "suppress":
         assert suppress_loops(case["<"], float(case["args"][1])) == case["="]
     elif case["op"] == "preview":

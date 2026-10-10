@@ -39,6 +39,12 @@ using ModelNormalizeFn = char * (*)(void * handle, const char * transcript,
                                     const char * styling, const char * structure,
                                     const char * context, const char ** err_out);
 
+// Decode with word timestamps (starling_ggml_transcribe_pcm_words). Null for
+// engines without them.
+using ModelDecodeWordsFn = char * (*)(void * handle, const float * pcm, int64_t n,
+                                      starling_ggml_word ** words, int64_t * n_words,
+                                      const char ** err_out);
+
 struct ModelDescriptor {
     starling_ggml_model kind;  // public enum value (starling_ggml.h)
     const char * slug;         // serve CLI/HTTP name ("parakeet", ...)
@@ -65,6 +71,9 @@ struct ModelDescriptor {
     // Text-in/text-out path (s1). Null for the audio engines; appended after
     // the historical fields so existing rows' positional init is unchanged.
     ModelNormalizeFn normalize_fn = nullptr;
+
+    // Word timestamps (issue #357). Null for engines without them.
+    ModelDecodeWordsFn decode_words_fn = nullptr;
 };
 
 // The table, one row per model in enum order. |out_n| receives the row count.

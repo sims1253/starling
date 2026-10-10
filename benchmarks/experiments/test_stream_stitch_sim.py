@@ -6,6 +6,7 @@ Hermetic: stand-in binary and model files, no server.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import subprocess
 import sys
 import tempfile
@@ -71,6 +72,34 @@ class CacheKeyTest(unittest.TestCase):
         self.assertEqual(rebuilt.misses, 1)
 
 
+class WordsTest(unittest.TestCase):
+    """--words: windows carry the stream trace's word times (issue #357)."""
+
+    class Fake(FakeTranscriber):
+        def stream_words(self, pcm: bytes) -> dict:
+            return {"text": "a b", "words": [{"w": "a", "start": 0.1, "end": 0.2},
+                                             {"w": "b", "start": 0.4, "end": 0.6}]}
+
+    def transcriber(self, **flags):
+        d = Path(tempfile.mkdtemp())
+        (d / "serve").write_bytes(b"build")
+        (d / "model.gguf").write_bytes(b"weights")
+        args = argparse.Namespace(binary=d / "serve", model=d / "model.gguf", model_slug="parakeet",
+                                  cache=d / "cache.json", port=0, **flags)
+        return self.Fake(args)
+
+    def test_windows_carry_word_times(self):
+        pcm = bytes(64)
+        got = self.transcriber(words=True).window(pcm, 0, 16)
+        self.assertEqual(got, ("a b", (("a", 0.1, 0.2), ("b", 0.4, 0.6))))
+        self.assertEqual(self.transcriber(words=True, no_times=True).window(pcm, 0, 16), "a b")
+
+    def test_words_mode_is_another_engine(self):
+        plain, words = self.transcriber(), self.transcriber(words=True)
+        self.assertNotEqual(plain.engine, words.engine)
+        self.assertIn("--stream-chunk-seconds", words.server_args)
+
+
 class SrcTest(unittest.TestCase):
     """--src picks the replayed stitcher in either argument form."""
 
@@ -107,6 +136,28 @@ class SrcTest(unittest.TestCase):
         out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
                              cwd=Path(__file__).resolve().parent, check=True)
         self.assertEqual(out.stdout.strip(), "refused")
+
+    @unittest.skipUnless(importlib.util.find_spec("numpy"), "replay_take needs numpy")
+    def test_untimed_replay_runs_a_stitcher_without_word_times(self):
+        # A --src stitcher from before #357 has no TimedWord/Transcript; a
+        # replay without times must not need them.
+        src = self.fake_src()
+        (src / "starling" / "stream_chunk.py").write_text(
+            "class ChunkStreamer:\n"
+            "    call_kind = 'flush_tail'\n"
+            "    def __init__(self, **kw): pass\n"
+            "    def flush(self, samples, tx): return tx(samples)\n")
+        code = ("import argparse, stream_stitch_sim as sim\n"
+                f"sim.use_stitcher(sim.Path({str(src)!r}))\n"
+                "class Tr:\n"
+                "    def window(self, pcm, start, length): return 'a b'\n"
+                "    def text(self, pcm, start, length): return 'a b'\n"
+                "args = argparse.Namespace(chunk_seconds=4.0, overlap_seconds=1.0)\n"
+                "take = {'utterances': [{'start_s': 0.0, 'end_s': 0.1, 'text': 'a b'}]}\n"
+                "print(sim.replay_take('t', take, bytes(3200), 0, Tr(), args)['final'])\n")
+        out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                             cwd=Path(__file__).resolve().parent, check=True)
+        self.assertEqual(out.stdout.strip(), "a b")
 
 
 if __name__ == "__main__":

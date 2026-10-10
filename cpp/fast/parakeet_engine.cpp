@@ -11,6 +11,7 @@
 #include "parakeet/loader.hpp"
 #include "parakeet/mel.hpp"
 #include "parakeet/pos_enc.hpp"
+#include "parakeet/tdt.hpp"
 #include "parakeet/tokenizer.hpp"
 #include "runtime/call_abort.hpp"
 
@@ -101,8 +102,9 @@ struct ParakeetEngine::Impl {
                      int& Tp, std::string& err);
     // Sets *aborted (and returns early) when the caller cancels the call
     // (ggml::call_abort_requested, checked once per encoder frame).
+    // `timing` receives each step's frame and duration (pk::TdtTiming).
     std::vector<int32_t> tdt_greedy(const std::vector<float>& enc_proj, int T,
-                                    bool* aborted = nullptr);
+                                    bool* aborted = nullptr, pk::TdtTiming* timing = nullptr);
 
     vk::Ref R(Arena::Id id) const { return ar.ref(id); }
     vk::Ref Ropt(int id) const { return id >= 0 ? ar.ref((Arena::Id)id) : vk::Ref(); }
@@ -641,7 +643,7 @@ bool ParakeetEngine::Impl::run_encoder(const std::vector<float>& feats, int T,
 // token including blanks). The prediction network runs only after a
 // non-blank emission; its joint projection is cached with it.
 std::vector<int32_t> ParakeetEngine::Impl::tdt_greedy(const std::vector<float>& enc_proj, int T,
-                                                      bool* aborted) {
+                                                      bool* aborted, pk::TdtTiming* timing) {
     const uint32_t PL = (uint32_t)w_ih.size();
     const int blank = (int)cfg.blank_id;
     const int max_symbols = (int)cfg.max_symbols;
@@ -653,6 +655,7 @@ std::vector<int32_t> ParakeetEngine::Impl::tdt_greedy(const std::vector<float>& 
     int32_t last_token = blank;
     bool emitted_any = false, g_valid = false;
     std::vector<int32_t> hyp;
+    if (timing) *timing = pk::TdtTiming{};
 
     auto sigm = [](float v) { return 1.0f / (1.0f + std::exp(-v)); };
     struct Acc { double pred = 0, joint = 0, arg = 0; } acc;
@@ -721,6 +724,10 @@ std::vector<int32_t> ParakeetEngine::Impl::tdt_greedy(const std::vector<float>& 
             skip = cfg.tdt_durations[(size_t)dk_];
             acc.arg += ms_since(ta0);
             hyp.push_back(k);
+            if (timing) {
+                timing->frame.push_back(t);
+                timing->duration.push_back(skip);
+            }
             if (k != blank) {
                 last_token = k;
                 hc.swap(hn);   // commit the candidate state
@@ -765,7 +772,8 @@ bool ParakeetEngine::encode(const float* pcm, size_t n, std::vector<float>& enc,
     return I.run_encoder(feats, T, enc, Tp, err);
 }
 
-bool ParakeetEngine::decode_ids(const float* pcm, size_t n, std::vector<int32_t>& ids, std::string& err) {
+bool ParakeetEngine::decode_ids(const float* pcm, size_t n, std::vector<int32_t>& ids, std::string& err,
+                                pk::TdtTiming* timing) {
     Impl& I = *impl_;
     // Keep the decoder's GEMV worker busy (and on a big core) from here on;
     // it parks again once this transcription is done.
@@ -774,7 +782,7 @@ bool ParakeetEngine::decode_ids(const float* pcm, size_t n, std::vector<int32_t>
         explicit Hold(cpu::GemvHelper& h) : g(h) { g.hold(true); }
         ~Hold() { g.hold(false); }
     } hold(I.gemv2);
-    const bool timing = env_on("STARLING_FAST_TIMING");
+    const bool print_timing = env_on("STARLING_FAST_TIMING");
     const auto t0 = std::chrono::steady_clock::now();
     // A cancelled call (ggml::call_abort_requested) stops at the next stage
     // boundary or decoder frame; the recorded encoder submission itself is
@@ -797,12 +805,12 @@ bool ParakeetEngine::decode_ids(const float* pcm, size_t n, std::vector<int32_t>
     const double t_enc = ms_since(t0);
     if (aborted()) return false;
     bool decode_aborted = false;
-    ids = I.tdt_greedy(enc, Tp, &decode_aborted);
+    ids = I.tdt_greedy(enc, Tp, &decode_aborted, timing);
     if (decode_aborted) {
         err = ggml::kCallAbortedError;
         return false;
     }
-    if (timing)
+    if (print_timing)
         std::fprintf(stderr, "[fast-parakeet] audio=%.2fs mel=%.1fms encoder=%.1fms decode=%.1fms total=%.1fms (T=%d Tp=%d)\n",
                      n / 16000.0, t_mel, t_enc - t_mel, ms_since(t0) - t_enc, ms_since(t0), T, Tp);
     return true;
