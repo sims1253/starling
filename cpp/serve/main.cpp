@@ -1050,7 +1050,7 @@ int main(int argc, char** argv) {
                 session.set_preview_policy(min_s, interval_s);
             }
             serve::StreamPump pump(session, opt,
-                                   [&ws](const std::string& m) { ws.send(m); });
+                                   [&ws](const std::string& m) { return ws.send(m); });
             std::fprintf(stderr, "[starling-serve] WS /stream client connected\n");
 
             std::string msg;

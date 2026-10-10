@@ -255,12 +255,13 @@ receive JSON messages:
 committed. The cadence decides only when the live tail is previewed.
 `--min-chunk-seconds` is the first-partial minimum for the whole take;
 it does not gate the tail. Once the take holds that much audio, every
-nonempty tail is previewed, including the overlap right after a window
-commit. `--partial-interval-seconds` is the minimum gap between previews.
-The server stretches it so that previews use at most half of wall time:
-the next preview waits at least twice as long as the last one took.
-A window commit inside that gap sends the committed text at once, without
-previewing the tail.
+nonempty tail is previewed, including the overlap after a window commit.
+`--partial-interval-seconds` is the minimum gap between previews, measured
+from when the step's window work ends. The server stretches it so that
+previews use at most half of wall time: the next preview waits at least
+twice as long as the last one took. A window commit sends the committed
+text at once and restarts the gap, because that text already covers the
+audio received so far; no preview runs right behind it.
 That bound adapts to slow models and devices without a per-device preset.
 A client can set the cadence for one connection with query parameters:
 `/stream?min_partial_seconds=1&partial_interval_seconds=0.5`. Invalid
@@ -273,13 +274,23 @@ One worker per connection appends every queued frame before each step.
 Each preview therefore covers all audio received so far. If more audio,
 a `commit` or a `reset` arrives while full windows are being committed,
 the server skips that preview and previews the newer audio next. A `ping`
-does not skip a preview. When the worker catches up on a backlog, it
+does not skip a preview. A preview that is already running is cancelled
+when required work queues behind it: a `reset`, a `commit` after newer
+audio, or queued audio that completes a window. The Parakeet engine stops
+at its next checkpoint (between pipeline stages, between four slices of
+the encoder graph, or between decoder frames), and the audio stays in the
+buffer for the work that follows. A `commit` with no newer audio lets the
+preview finish: its result is the exact tail, and the flush reuses it.
+Engines without checkpoints finish the preview. When the worker catches up
+on a backlog, it
 commits each full window as soon as it is appended, so the backlog alone
 does not hit the buffer cap. Window commits and finalization always run,
 and the server never drops audio. When more than 32 MiB or 4096 frames
 are queued, the server stops reading from the socket until the worker
 catches up. A `ping` is answered after every earlier frame has been
-processed, as before.
+processed, as before. If a frame cannot be written to the client (the
+peer is gone or stalled past the write timeout), the worker stops and
+further frames are discarded until the connection closes.
 
 **Stream instrumentation** (issue #226): connect to `/stream?trace=1` and
 every partial and final carries an extra `"trace"` object. Clients that do
@@ -291,26 +302,29 @@ take's first audio; audio positions are seconds into the take.
   the audio that the text reflects. `preview` holds the connection's
   `min_s`, `interval_s`, the current `effective_interval_s` and the
   number of `coalesced` previews. `totals` holds `calls`,
-  `engine_calls`, `engine_audio_s`, `engine_ms`, `reused` and `busy`.
+  `engine_calls`, `engine_audio_s`, `engine_ms`, `reused`, `busy`,
+  `preempted` (previews cancelled while running) and `preempted_ms`
+  (the engine time they used before they stopped; not in `engine_ms`).
   `engine_audio_s` counts window overlap and each repeated preview, so
   `engine_audio_s / audio_s` is the inference work per recorded second.
   `engine_ms` is the wall time of each transcribe call. It includes a lazy
   model load on the first call and, in Granite chunk-fairness mode, the
   wait for the serial queue; other modes answer `busy` instead of waiting.
   The trace starts a commit's `stop` section when the worker begins the
-  flush, so a commit that waits behind a running preview is not counted
-  there. The client's own stop-to-final time includes that wait.
+  flush, so the time a commit waits for a running preview to stop is not
+  counted there. The client's own stop-to-final time includes that wait.
 - Final: the same fields, plus `by_kind` totals for `window` (full windows
   while recording), `preview` (live tail), `flush_window` and `flush_tail`
   (work after commit). It also has `stop`, `calls` and `calls_dropped`.
   `stop` covers the commit's own work. `path` is `tail` (the engine
   transcribed only the unfinalized remainder), `reused` (the exact
-  tail result answered it) or `committed` (nothing was left). The
+  tail result answered it) or `committed` (nothing was left, including
+  a commit of an empty take). The
   Python server labels its whole-buffer mode `full_take`. `stop` also
   holds `unfinalized_s` (the audio past the committed boundary at
   commit), `t0_ms`, `t1_ms` and `totals`. `calls` lists each call
   with `kind`, `start_s`, `end_s`, `t0_ms`, `t1_ms` and `result`
-  (`ok`, `reused`, `busy` or `timed_out`). It holds at most 20,000
+  (`ok`, `reused`, `busy`, `timed_out` or `preempted`). It holds at most 20,000
   entries. `calls_dropped` counts later calls, which still enter
   the totals.
 

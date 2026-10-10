@@ -236,6 +236,10 @@ class ChunkStreamer:
         self.min = int(min_seconds * self.sr)
         self.partial_interval = float(interval_seconds)
 
+    def samples_to_next_window(self, n_samples: int) -> int:
+        """Audio still needed before the next window commit (samples)."""
+        return max(0, self.chunk - (n_samples - self.boundary))
+
     @property
     def effective_interval(self) -> float:
         """The configured interval, stretched so the latest preview's engine
@@ -291,8 +295,18 @@ class ChunkStreamer:
         ``None`` if nothing should be emitted this tick.
         """
         # Window commits are required work: never throttled, never coalesced.
-        if self._finalize_full_windows(samples, tx):
+        # ``now`` is when the step began; the window decodes take real time,
+        # so the preview decision below uses the clock after them (a slow
+        # window must not eat the gap the interval promises).
+        t_windows = time.monotonic()
+        committed = self._finalize_full_windows(samples, tx)
+        now += time.monotonic() - t_windows
+        if committed:
+            # The committed text covers the buffer up to the window's end, so
+            # it is as fresh as a preview: it restarts the interval instead
+            # of forcing a preview of the overlap right behind it (#357).
             self.emit_due = True
+            self.last_emit = now
 
         tail_len = len(samples) - self.boundary
         if tail_len >= self.chunk:  # a full window is still waiting for a retry
@@ -302,7 +316,7 @@ class ChunkStreamer:
         # first-partial minimum stalled previews after each commit (#357).
         # Never hand the transcriber an empty window (issue #146).
         eligible = tail_len > 0 and self.rebased + len(samples) >= self.min
-        # A window commit alone never forces a preview: the committed text is
+        # A window commit never forces a preview: the committed text is
         # emitted at once, and the tail waits for the (cost-stretched) interval.
         throttled = (now - self.last_emit) < self.effective_interval
         if not eligible or throttled:
@@ -379,12 +393,15 @@ MAX_STREAM_CALLS = 20000
 class _Totals:
     """Running totals over calls (engine calls only cost work; reused is free)."""
 
-    __slots__ = ("calls", "engine_calls", "engine_samples", "engine_ms", "reused", "busy")
+    __slots__ = ("calls", "engine_calls", "engine_samples", "engine_ms", "reused", "busy",
+                 "preempted", "preempted_ms")
 
     def __init__(self) -> None:
         self.calls = self.engine_calls = self.engine_samples = 0
         self.engine_ms = 0.0
         self.reused = self.busy = 0
+        self.preempted = 0      # previews cancelled while running
+        self.preempted_ms = 0.0  # engine wall time those previews used
 
     def add(self, length: int, t0_ms: float, t1_ms: float, result: str) -> None:
         self.calls += 1
@@ -394,6 +411,9 @@ class _Totals:
             self.engine_ms += t1_ms - t0_ms
         elif result == "reused":
             self.reused += 1
+        elif result == "preempted":
+            self.preempted += 1
+            self.preempted_ms += t1_ms - t0_ms
         else:  # busy, cancelled, timed out
             self.busy += 1
 
@@ -404,7 +424,8 @@ class StreamTrace:
     Each call carries why it ran (``kind``), the original audio it covered
     (absolute take sample indices, stable across buffer trims), when it
     started and ended (ms since the take's first audio) and how it ended
-    (``ok`` / ``reused`` / ``busy`` / ``timed_out``).  Overlapping windows and
+    (``ok`` / ``reused`` / ``busy`` / ``timed_out`` / ``preempted``, a preview
+    cancelled mid-call because required work was waiting behind it).  Overlapping windows and
     repeated previews each appear, so the ledger shows the inference work per
     recorded second rather than one batch pass.
     """
@@ -458,6 +479,14 @@ class StreamTrace:
         self.flush_unfinalized = int(unfinalized)
         self.final_path = ""
 
+    def mark_empty_commit(self) -> None:
+        """A commit of an empty take: no flush runs, but the stop section
+        still reports the ``committed`` path and its time."""
+        self.flush_totals = _Totals()
+        self.flush_t0_ms = self.flush_t1_ms = self.now_ms()
+        self.flush_unfinalized = 0
+        self.final_path = "committed"
+
     def end_flush(self, ok: bool, *, full_take: bool = False) -> None:
         self.flushing = False
         self.flush_t1_ms = self.now_ms()
@@ -479,7 +508,8 @@ class StreamTrace:
         return {"calls": t.calls, "engine_calls": t.engine_calls,
                 "engine_audio_s": self._seconds(t.engine_samples),
                 "engine_ms": round(t.engine_ms, 3), "reused": t.reused,
-                "busy": t.busy}
+                "busy": t.busy, "preempted": t.preempted,
+                "preempted_ms": round(t.preempted_ms, 3)}
 
     def partial_json(self, audio_samples: int, chunker: Optional["ChunkStreamer"] = None) -> dict:
         out = {"v": 1, "t_ms": round(self.now_ms(), 3),

@@ -415,10 +415,14 @@ def test_preview_minimum_gates_the_take_not_the_tail():
     assert lens == []
     assert cs.step(np.zeros(8000, np.float32), 2.0, tx) is not None
     assert lens == [8000]
-    # After the window commit the tail is the 0.25 s overlap, below the
-    # minimum, yet still previewed.
+    # A window commit emits its committed text and restarts the interval
+    # (it covers the whole buffer), so no preview runs right behind it.
     lens.clear()
     assert cs.step(np.zeros(16000 + 1600, np.float32), 3.0, tx) is not None
+    assert lens == [16000]
+    # The tail is the overlap plus 0.1 s, below the minimum, yet still
+    # previewed once the interval passes: commits never stall previews.
+    assert cs.step(np.zeros(16000 + 1600, np.float32), 4.0, tx) is not None
     assert lens == [16000, 16000 + 1600 - 12000]
 
 
@@ -456,8 +460,34 @@ def test_window_commit_does_not_force_a_throttled_preview():
     assert cs.step(np.zeros(20000, np.float32), 21.0, tx) == "w x"
     assert lens == [8000, 16000]
     assert cs.step(np.zeros(21000, np.float32), 21.5, tx) is None
-    assert cs.step(np.zeros(21000, np.float32), 30.0, tx) is not None
+    # The commit restarted the interval: 10 s after the commit, not after
+    # the last preview (20.0).
+    assert cs.step(np.zeros(21000, np.float32), 30.5, tx) is None
+    assert cs.step(np.zeros(21000, np.float32), 31.5, tx) is not None
     assert lens == [8000, 16000, 21000 - 12000]
+
+
+def test_window_decode_time_counts_toward_the_preview_gap():
+    # A 150 ms window decode at a 0.1 s interval: the step clock moves past
+    # the window, so a step 0.2 s (fake) after the last one began is still
+    # inside the gap the commit restarted.
+    import time as _time
+
+    cs = _small(min_seconds=0.1, partial_interval_seconds=0.1)
+    lens: list[int] = []
+
+    def tx(window):
+        lens.append(len(window))
+        if len(window) == 16000:
+            _time.sleep(0.15)
+        return "w"
+
+    samples = np.zeros(16000 + 800, np.float32)
+    assert cs.step(samples, 10.0, tx) is not None  # window commit only
+    assert lens == [16000]
+    assert cs.step(samples, 10.2, tx) is None      # 0.05 s after the window
+    assert cs.step(samples, 10.3, tx) is not None  # gap over: preview
+    assert lens == [16000, 16800 - 12000]
 
 
 def test_preview_interval_adapts_to_preview_cost():

@@ -6,11 +6,14 @@
 #include "stream_session.hpp"
 #include "audio.hpp"
 
+#include "runtime/call_abort.hpp"
+
 #include <algorithm>
 #include <cctype>
 #include <cmath>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <thread>
@@ -369,7 +372,21 @@ std::optional<std::string> ChunkStreamer::step(
     const std::vector<float>& samples, double now, const TranscribeFn& tx,
     const PendingFn& newer_pending) {
     // Window commits are required work: never throttled, never coalesced.
-    if (finalize_full_windows(samples, tx, false)) emit_due_ = true;
+    // `now` is when the step began; the window decodes take real time, so
+    // the preview decision below uses the clock after them (otherwise a
+    // slow window would eat the gap the interval promises).
+    const auto t_windows = std::chrono::steady_clock::now();
+    const bool committed = finalize_full_windows(samples, tx, false);
+    now += std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - t_windows).count();
+    if (committed) {
+        // The committed text covers the buffer up to the window's end (all
+        // audio received when the window filled), so it is as fresh as a
+        // preview: it restarts the interval instead of forcing a preview of
+        // the overlap right behind it (issue #357).
+        emit_due_ = true;
+        last_emit_ = now;
+    }
     // Committed text the client has not seen yet (or nothing).
     auto committed_update = [this]() -> std::optional<std::string> {
         if (!emit_due_) return std::nullopt;
@@ -387,7 +404,7 @@ std::optional<std::string> ChunkStreamer::step(
     // after each commit (issue #357).
     const bool eligible = tail_len > 0
         && rebased_ + static_cast<int64_t>(samples.size()) >= min_;
-    // A window commit alone never forces a preview: the committed text is
+    // A window commit never forces a preview: the committed text is
     // emitted at once, and the tail waits for the (cost-stretched) interval.
     const bool throttled = (now - last_emit_) < effective_interval();
     if (!eligible || throttled) return committed_update();
@@ -685,8 +702,23 @@ TranscribeFn StreamSession::active_tx() {
             return tail_text_;  // exact-input reuse: engine not called
         }
         std::optional<std::string> result;
+        bool preempted = false;
         try {
-            result = inner(p, n);
+            if (preempt_ && std::strcmp(call.kind, "preview") == 0) {
+                // A preview overtaken by required work stops at the engine's
+                // next checkpoint (issue #357). Engines without checkpoints
+                // finish it; that result is still a valid preview.
+                starling::ggml::CallAbortScope abort_scope(
+                    [](void* self) {
+                        auto* s = static_cast<StreamSession*>(self);
+                        return s->preempt_ && s->preempt_();
+                    },
+                    this);
+                result = inner(p, n);
+                preempted = !result.has_value() && abort_scope.fired();
+            } else {
+                result = inner(p, n);
+            }
         } catch (const StreamQueueTimeout&) {
             call.t1_ms = take_ms();
             call.result = "timed_out";
@@ -694,7 +726,7 @@ TranscribeFn StreamSession::active_tx() {
             throw;
         }
         call.t1_ms = take_ms();
-        call.result = result.has_value() ? "ok" : "busy";
+        call.result = result.has_value() ? "ok" : preempted ? "preempted" : "busy";
         record_call(call);
         if (result.has_value()) {
             // Retain exactly one entry: this success replaces any previous
@@ -728,10 +760,17 @@ void StreamSession::set_engine_identity(std::string id) {
 }
 
 std::optional<std::string> StreamSession::stream_step(
-    double now, const PendingFn& newer_pending) {
+    double now, const PendingFn& newer_pending, const PreemptFn& preempt) {
     if (!chunker_) return std::nullopt;
     if (!terminal_error_.empty()) return std::nullopt;
     TranscribeFn tx = active_tx();
+    // Installed for this step only: flushes and later steps without a
+    // predicate never cancel.
+    struct PreemptGuard {
+        PreemptFn& slot;
+        ~PreemptGuard() { slot = nullptr; }
+    } guard{preempt_};
+    preempt_ = preempt;
     try {
         return chunker_->step(samples_, now, tx, newer_pending);
     } catch (const StreamQueueTimeout&) {
@@ -774,6 +813,13 @@ std::optional<std::string> StreamSession::stream_flush() {
                                                      : "committed";
     }
     return out;
+}
+
+void StreamSession::mark_empty_commit() {
+    flush_totals_ = StreamCallTotals{};
+    flush_t0_ms_ = flush_t1_ms_ = take_ms();
+    flush_unfinalized_ = 0;
+    final_path_ = "committed";
 }
 
 void StreamSession::reset() {
@@ -827,6 +873,9 @@ void StreamCallTotals::add(const StreamCall& c) {
         engine_ms += c.t1_ms - c.t0_ms;
     } else if (r == "reused") {
         ++reused;
+    } else if (r == "preempted") {
+        ++preempted;
+        preempted_ms += c.t1_ms - c.t0_ms;
     } else {
         ++busy;
     }
@@ -879,7 +928,9 @@ std::string totals_json(const StreamCallTotals& t) {
          + ",\"engine_audio_s\":" + seconds(t.engine_samples)
          + ",\"engine_ms\":" + fmt3(t.engine_ms)
          + ",\"reused\":" + std::to_string(t.reused)
-         + ",\"busy\":" + std::to_string(t.busy) + "}";
+         + ",\"busy\":" + std::to_string(t.busy)
+         + ",\"preempted\":" + std::to_string(t.preempted)
+         + ",\"preempted_ms\":" + fmt3(t.preempted_ms) + "}";
 }
 
 } // namespace
