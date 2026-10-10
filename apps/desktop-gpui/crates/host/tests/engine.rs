@@ -776,3 +776,125 @@ fn a_mode_switch_to_manual_stops_using_the_engine() {
     drop(client);
     host.shutdown();
 }
+
+/// The next take-feed frame matching `predicate`.
+fn until_take(
+    client: &HostClient,
+    label: &str,
+    predicate: impl Fn(&starling_runtime_host::client::TakeWire) -> bool,
+) -> starling_runtime_host::client::TakeWire {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut seen = Vec::new();
+    loop {
+        match client.recv_take_timeout(Duration::from_millis(20)) {
+            Ok(frame) if predicate(&frame) => return frame,
+            Ok(frame) => seen.push(format!("{frame:?}")),
+            Err(starling_runtime::channel::RecvError::Timeout) => {
+                assert!(Instant::now() < deadline, "timed out waiting for {label}; saw {seen:?}")
+            }
+            Err(other) => panic!("take feed error: {other:?} waiting for {label}"),
+        }
+        while let Ok(_event) = client.try_recv_event() {}
+    }
+}
+
+/// #220 + #356: a retry with another installed model runs on the host's
+/// engine once it serves that model — the app switches the engine (the
+/// settings say so), the host follows and transcribes; a model the engine
+/// never serves leaves the take as it is.
+#[test]
+fn a_retry_with_another_model_runs_once_the_host_s_engine_serves_it() {
+    use starling_runtime_host::client::TakeWire;
+    use starling_runtime_host::frame::{TranscribeWith, TranscriptionState};
+    let Some(fixture) = fixture() else { return };
+    let other = "fixture-model-2";
+    let root = tempfile::tempdir().unwrap();
+    let config = engine_config_with_models(root.path(), Some(&fixture), &[MODEL_ID, other]);
+    let path = root.path().join("settings.json");
+    let mut settings = Settings::default_settings();
+    settings.engine.mode = EngineMode::Builtin;
+    settings.engine.active_model = Some(MODEL_ID.into());
+    settings.save(&path).unwrap();
+    let host_setup = host_config(
+        root.path(),
+        EngineChoice::Builtin {
+            config,
+            active_model: Some(MODEL_ID.into()),
+        },
+    )
+    .with_settings_path(&path)
+    .with_settings_poll(Duration::from_millis(20))
+    .with_engine_wait(Duration::from_secs(3));
+    let mut host = serve(host_setup).expect("host serves");
+    wait_ready(&host.engine().expect("builtin mode supervises an engine"));
+    let app = connect(host.socket_path());
+    app.take_watch().expect("watching");
+
+    // A take the host transcribes on the engine it serves.
+    app.send(Some("take_m"), Command::CaptureStart { policy: "push-to-talk".into() })
+        .expect("start accepted");
+    until_take(&app, "a status tick", |frame| {
+        matches!(frame, TakeWire::Live { status: Some(_), .. })
+    });
+    app.send(Some("take_m"), Command::CaptureStop { drain: Some(true) })
+        .expect("stop accepted");
+    let stored = until_take(&app, "the take stored", |frame| {
+        matches!(frame, TakeWire::Persisted { stored_id: Some(_), .. })
+    });
+    let TakeWire::Persisted { stored_id: Some(id), .. } = stored else { unreachable!() };
+    let started = until_take(&app, "its transcription starting", |frame| {
+        matches!(frame, TakeWire::Transcription { state: TranscriptionState::Started { .. }, .. })
+    });
+    assert!(matches!(
+        started,
+        TakeWire::Transcription { state: TranscriptionState::Started { ref backend }, .. }
+            if backend == &format!("engine:{MODEL_ID}")
+    ));
+    until_take(&app, "its transcription", |frame| {
+        matches!(frame, TakeWire::Transcription { req: None, state, .. } if state.is_final())
+    });
+
+    // The app switches the engine to the other model, then asks.
+    settings.engine.active_model = Some(other.into());
+    settings.save(&path).unwrap();
+    app.transcribe("r_other", &id, TranscribeWith::Model { model_id: other.into() })
+        .unwrap();
+    let done = until_take(&app, "the retry", |frame| {
+        matches!(frame, TakeWire::Transcription { req: Some(req), state, .. } if req == "r_other" && state.is_final())
+    });
+    assert!(
+        matches!(&done, TakeWire::Transcription { state: TranscriptionState::Completed { .. }, .. }),
+        "{done:?}"
+    );
+    let store = starling_dictation::store_v2::StoreV2::open(root.path()).unwrap();
+    let backends: Vec<_> = store
+        .attempts_for(&id)
+        .unwrap()
+        .into_iter()
+        .map(|attempt| (attempt.backend, attempt.status))
+        .collect();
+    assert_eq!(
+        backends,
+        vec![
+            (format!("engine:{MODEL_ID}"), "completed".to_string()),
+            (format!("engine:{other}"), "completed".to_string()),
+        ]
+    );
+    drop(store);
+
+    // A model the engine never serves: nothing is attempted.
+    app.transcribe("r_none", &id, TranscribeWith::Model { model_id: "not-installed".into() })
+        .unwrap();
+    let refused = until_take(&app, "the refusal", |frame| {
+        matches!(frame, TakeWire::Transcription { req: Some(req), state, .. } if req == "r_none" && state.is_final())
+    });
+    assert!(
+        matches!(&refused, TakeWire::Transcription { state: TranscriptionState::Refused { message }, .. } if message.contains("unchanged")),
+        "{refused:?}"
+    );
+    let store = starling_dictation::store_v2::StoreV2::open(root.path()).unwrap();
+    assert_eq!(store.attempts_for(&id).unwrap().len(), 2);
+    drop(store);
+    drop(app);
+    host.shutdown();
+}

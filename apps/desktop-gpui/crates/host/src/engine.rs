@@ -498,6 +498,111 @@ impl EngineHost {
         }
     }
 
+    /// The target a take starting now binds to (#363), when something
+    /// serves now: a lease on the ready engine, or the manual server.
+    /// When nothing does (the take records anyway; its transcription
+    /// waits for an engine, [`Self::wait_target`]) the error is the
+    /// recording window's notice: what serves no live text, and why.
+    pub fn bind_now(&self) -> Result<Target, String> {
+        match &*lock(&self.state) {
+            EngineState::Builtin {
+                manager, in_flight, ..
+            } => manager
+                .lease()
+                .map(|lease| Target::from_lease(lease, in_flight))
+                .ok_or_else(|| {
+                    "The built-in engine is not ready, so this recording shows no live text. It \
+                     is saved either way, and transcribed after you stop once the engine is \
+                     ready."
+                        .to_string()
+                }),
+            EngineState::Manual { endpoint, model } => {
+                Target::manual(endpoint, model).map_err(|err| {
+                    format!(
+                        "Your server's endpoint in Settings is not usable ({err}), so this \
+                         recording shows no live text. It is saved either way; fix the endpoint \
+                         and retry it."
+                    )
+                })
+            }
+        }
+    }
+
+    /// Waits up to `wait` (cancel-aware) for a target serving `want`
+    /// other than the engine `avoid` names (one a request just failed
+    /// against). The error is why there is none: a sentence for the
+    /// take's history.
+    pub fn wait_target(
+        &self,
+        want: &Want,
+        wait: Duration,
+        cancel: &CancelToken,
+        avoid: Option<&(String, u32)>,
+    ) -> Result<Target, String> {
+        let deadline = Instant::now() + wait;
+        loop {
+            if cancel.is_cancelled() {
+                return Err("The transcription was cancelled.".to_string());
+            }
+            // The lease is taken, and counted, under the state lock: a
+            // switch away from the built-in engine either happened first
+            // (and this sees the manual state) or sees this request in the
+            // drain it waits on before stopping the engine.
+            let (manager, found, avoiding) = match &*lock(&self.state) {
+                EngineState::Builtin {
+                    manager,
+                    stopped,
+                    in_flight,
+                    ..
+                } => {
+                    if stopped.load(Ordering::SeqCst) {
+                        return Err(not_ready_sentence());
+                    }
+                    let mut avoiding = false;
+                    let mut found = None;
+                    if let Some(lease) = manager.lease() {
+                        let wanted = match want {
+                            Want::Current => true,
+                            Want::Model(model_id) => lease.model_id() == model_id,
+                        };
+                        let identity = (lease.endpoint().to_string(), lease.pid());
+                        if wanted && avoid != Some(&identity) {
+                            found = Some(Target::from_lease(lease, in_flight));
+                        }
+                        avoiding = wanted;
+                    }
+                    (manager.clone(), found, avoiding)
+                }
+                EngineState::Manual { endpoint, model } => {
+                    return match want {
+                        Want::Current => Target::manual(endpoint, model).map_err(|err| {
+                            format!("Your server's endpoint in Settings is not usable: {err}")
+                        }),
+                        Want::Model(_) => Err("The built-in engine is off (Settings → Engine uses your own server)."
+                            .to_string()),
+                    };
+                }
+            };
+            if let Some(target) = found {
+                return Ok(target);
+            }
+            let phase = manager.snapshot().phase;
+            // A failed engine or a missing model will not fix itself while
+            // this waits (both need the user).
+            if matches!(phase, EnginePhase::NoModel | EnginePhase::Failed(_))
+                || Instant::now() >= deadline
+            {
+                return Err(match want {
+                    Want::Model(model_id) if !matches!(phase, EnginePhase::NoModel) => format!(
+                        "The built-in engine did not start serving {model_id} in time."
+                    ),
+                    _ => not_ready_sentence(),
+                });
+            }
+            std::thread::sleep(if avoiding { AVOID_POLL } else { READY_POLL });
+        }
+    }
+
     /// Marks the host as shutting down (see `closing`). The host calls
     /// this before it joins the settings watcher.
     pub fn begin_shutdown(&self) {
@@ -520,6 +625,79 @@ impl EngineHost {
             manager.shutdown();
         }
     }
+}
+
+/// What a transcription asks the engine for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Want {
+    /// Whatever serves now.
+    Current,
+    /// The built-in engine serving this model.
+    Model(String),
+}
+
+/// Where one transcription goes (#220, #363): the endpoint and model it
+/// is sent to, the label its attempt row carries, and — on the built-in
+/// engine — the lease that keeps that engine serving until the target is
+/// dropped (a model switch drains it instead of cutting it off), counted
+/// on the engine's in-flight counter for as long (a switch away from the
+/// built-in engine waits, bounded, before stopping it under the take).
+pub struct Target {
+    pub endpoint: String,
+    pub model: String,
+    /// The attempt row's backend label (`engine:<model id>`,
+    /// `openai:<model>`).
+    pub backend: String,
+    pub builtin: bool,
+    lease: Option<EngineLease>,
+    _counted: Option<InFlight>,
+}
+
+impl Target {
+    /// The user's own server; an error when the endpoint is not usable.
+    pub fn manual(endpoint: &str, model: &str) -> Result<Target, ClientError> {
+        StarlingClient::new(endpoint, model)?;
+        Ok(Target {
+            endpoint: endpoint.to_string(),
+            model: model.to_string(),
+            backend: starling_dictation::storage::BackendLabel::OpenAi {
+                model: model.to_string(),
+            }
+            .to_string(),
+            builtin: false,
+            lease: None,
+            _counted: None,
+        })
+    }
+
+    fn from_lease(lease: EngineLease, in_flight: &Arc<AtomicUsize>) -> Target {
+        Target {
+            endpoint: lease.endpoint().to_string(),
+            model: lease.slug().to_string(),
+            backend: starling_dictation::storage::BackendLabel::Engine {
+                model_id: lease.model_id().to_string(),
+            }
+            .to_string(),
+            builtin: true,
+            lease: Some(lease),
+            _counted: Some(InFlight::on(in_flight)),
+        }
+    }
+
+    /// The built-in engine this target holds (`(endpoint, pid)`), for a
+    /// retry that must not land on it again.
+    pub fn engine(&self) -> Option<(String, u32)> {
+        self.lease
+            .as_ref()
+            .map(|lease| (lease.endpoint().to_string(), lease.pid()))
+    }
+}
+
+/// Why a transcription found no engine.
+fn not_ready_sentence() -> String {
+    "The built-in engine is not ready; the recording is saved — pick a model in Settings, or \
+     retry once the engine is ready."
+        .to_string()
 }
 
 /// The manual provider for `endpoint`/`model` and the label that goes
@@ -1287,6 +1465,11 @@ mod tests {
         )
         .expect("manual mode attaches");
         assert_eq!(host.label(), "unconfigured");
+        // A take started now hears that its server is the problem, not a
+        // built-in engine the user did not choose.
+        let notice = host.bind_now().err().expect("nothing serves");
+        assert!(notice.contains("Your server's endpoint"), "{notice}");
+        assert!(!notice.contains("built-in"), "{notice}");
 
         // The follow path keeps the same honesty: another unusable
         // endpoint (a scheme the client rejects) stays unconfigured.

@@ -431,7 +431,41 @@ fn live_interruption(handle: &impl InputHealth) -> Option<Interruption> {
     take_interruption(handle.capture_fault().as_ref(), stalled_for)
 }
 
+/// Where the microphone check sends its clip: the built-in engine's
+/// endpoint (its lease held until the check is done) or the server from
+/// Settings. Empty when no engine serves.
+pub(crate) struct CheckTarget {
+    pub endpoint: String,
+    pub model: String,
+    _lease: Option<starling_dictation::engine::EngineLease>,
+}
+
 impl StarlingApp {
+    /// The microphone check's target, resolved now.
+    pub(crate) fn check_target(&self) -> CheckTarget {
+        match self.engine_settings.mode {
+            starling_dictation::settings::EngineMode::Builtin => {
+                match self.engine.as_ref().and_then(|engine| engine.lease()) {
+                    Some(lease) => CheckTarget {
+                        endpoint: lease.endpoint().to_string(),
+                        model: lease.slug().to_string(),
+                        _lease: Some(lease),
+                    },
+                    None => CheckTarget {
+                        endpoint: String::new(),
+                        model: String::new(),
+                        _lease: None,
+                    },
+                }
+            }
+            starling_dictation::settings::EngineMode::Manual => CheckTarget {
+                endpoint: self.endpoint.clone(),
+                model: self.model.clone(),
+                _lease: None,
+            },
+        }
+    }
+
     /// Shows `text` in the error banner as the explanation of `problem`,
     /// so the banner can offer that problem's recovery actions.
     pub(crate) fn report_input_problem(&mut self, problem: InputProblem, text: String) {
@@ -694,8 +728,8 @@ impl StarlingApp {
             cx.notify();
             return;
         }
-        let target = self.resolve_take_target();
-        if target.endpoint().is_empty() {
+        let target = self.check_target();
+        if target.endpoint.is_empty() {
             self.mic.check = Some(finish(CheckOutcome::NoEngine));
             cx.notify();
             return;
@@ -712,7 +746,7 @@ impl StarlingApp {
                 .background_spawn(async move {
                     let wav = starling_dictation::audio::encode_wav_16k(&audio)
                         .map_err(|err| err.to_string())?;
-                    let client = StarlingClient::new(target.endpoint(), target.model())
+                    let client = StarlingClient::new(&target.endpoint, &target.model)
                         .and_then(|client| client.with_timeout_ms(CHECK_TRANSCRIBE_TIMEOUT_MS))
                         .map_err(|err| err.to_string())?;
                     let result = client

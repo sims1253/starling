@@ -15,7 +15,7 @@ use starling_dictation::{
     },
     store_v2::{
         self, AttemptRecord, AudioAtRest, CaptureRecord, CaptureStatus, CompressionOutcome,
-        HoldReason, ListedCapture, RecognitionOutcome, RetentionPolicy, RevisionRow, StoreV2,
+        HoldReason, ListedCapture, RetentionPolicy, RevisionRow, StoreV2,
         StoreV2Error,
     },
 };
@@ -225,17 +225,6 @@ fn v2_err(err: StoreV2Error) -> storage::StorageError {
     }
 }
 
-/// See [`Store::recognition`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Recognition {
-    /// Nothing transcribed it, and nothing alive is transcribing it.
-    Due,
-    /// A live process (another app, or this one) is transcribing it.
-    InFlight,
-    /// It has a transcript.
-    Done,
-}
-
 /// Lock the shared v2 handle (a poisoned lock is recovered: the SQLite
 /// connection is still consistent after a panic between statements).
 pub(crate) fn lock_v2(handle: &Arc<Mutex<StoreV2>>) -> MutexGuard<'_, StoreV2> {
@@ -280,45 +269,11 @@ impl Store {
         Ok(Store(Arc::new(Mutex::new(store))))
     }
 
-    /// Whether a record with this id exists (the R05 delete-race
-    /// re-check; metadata-only).
+    /// Whether a record with this id exists (metadata-only).
+    #[cfg(test)]
     pub(crate) fn exists(&self, id: &str) -> Result<bool, storage::StorageError> {
         let store = lock_v2(&self.0);
         Ok(store.get_capture(id).map_err(v2_err)?.is_some())
-    }
-
-    /// Whether recording `id` still waits for its transcript (history
-    /// shows it as being sent): no attempt yet, or one still running.
-    /// `false` once it is gone.
-    pub(crate) fn pending(&self, id: &str) -> Result<bool, storage::StorageError> {
-        let store = lock_v2(&self.0);
-        let Some(record) = store.get_capture(id).map_err(v2_err)? else {
-            return Ok(false);
-        };
-        let attempts = store.attempts_for(id).map_err(v2_err)?;
-        let summary = v2_summary(&record, &[], &attempts);
-        Ok(matches!(
-            summary.status,
-            SessionStatus::Captured | SessionStatus::Transcribing
-        ))
-    }
-
-    /// Where stored take `id`'s transcription stands, across processes:
-    /// what a window the host offers the take decides by (#220), since an
-    /// app that transcribed it may have gone before telling the host.
-    pub(crate) fn recognition(&self, id: &str) -> Result<Recognition, storage::StorageError> {
-        let store = lock_v2(&self.0);
-        let attempts = store.attempts_for(id).map_err(v2_err)?;
-        if attempts.iter().any(|attempt| attempt.is_final_transcript()) {
-            return Ok(Recognition::Done);
-        }
-        if attempts
-            .iter()
-            .any(|attempt| attempt.status == "started" && store.attempt_owned(&attempt.id))
-        {
-            return Ok(Recognition::InFlight);
-        }
-        Ok(Recognition::Due)
     }
 
     /// Metadata-only listing (G02): readable records as summaries, damaged
@@ -387,16 +342,28 @@ impl Store {
 
     /// Persists an imported take from its encoded WAV through the full §4
     /// protocol (#220: recorded takes are stored by the recording service,
-    /// never here). The stored duration is derived from the samples
-    /// themselves. Returns the record id and the WAV to transcribe.
+    /// never here; it transcribes this one when asked). The stored
+    /// duration is derived from the samples themselves.
     pub(crate) fn save_capture(&self, wav: Arc<Vec<u8>>) -> Result<SavedTake, storage::StorageError> {
         let pcm = decode_wav(&wav)?;
-        let id = self.save_pcm_take(pcm, store_v2::CommitMark::Complete)?;
-        Ok(SavedTake { id, wav })
+        let id = self.save_pcm_take(pcm, store_v2::CommitMark::Complete, false)?;
+        Ok(SavedTake { id })
     }
 
-    /// Marks a transcription attempt as started on the record. `backend`
-    /// labels the attempt ("starling:parakeet", "openai:whisper-large-v3").
+    /// [`Self::save_capture`] for an import the recording service is to
+    /// transcribe: the intent is stored with the take (#220), so the
+    /// service transcribes it even if this window goes away before it
+    /// asks.
+    pub(crate) fn save_import(&self, wav: Arc<Vec<u8>>) -> Result<SavedTake, storage::StorageError> {
+        let pcm = decode_wav(&wav)?;
+        let id = self.save_pcm_take(pcm, store_v2::CommitMark::Complete, true)?;
+        Ok(SavedTake { id })
+    }
+
+    /// Marks a transcription attempt as started on the record (tests; the
+    /// recording service writes attempts). `backend` labels the attempt
+    /// ("starling:parakeet", "openai:whisper-large-v3").
+    #[cfg(test)]
     pub(crate) fn mark_attempt(&self, id: &str, backend: &str) -> Result<(), storage::StorageError> {
         let mut store = lock_v2(&self.0);
         store
@@ -407,6 +374,7 @@ impl Store {
 
     /// Records a successful transcript: the in-flight attempt is completed
     /// with the transcript preserved verbatim in its row.
+    #[cfg(test)]
     pub(crate) fn save_transcript(
         &self,
         id: &str,
@@ -419,10 +387,11 @@ impl Store {
     }
 
     /// Records a failed transcription attempt.
+    #[cfg(test)]
     pub(crate) fn save_failure(&self, id: &str, message: &str) -> Result<(), storage::StorageError> {
         let mut store = lock_v2(&self.0);
         store
-            .finish_recognition(id, RecognitionOutcome::Failed { message })
+            .finish_recognition(id, store_v2::RecognitionOutcome::Failed { message })
             .map_err(v2_err)
     }
 
@@ -630,6 +599,16 @@ impl Store {
         store.correction_records_for(id).map_err(v2_err)
     }
 
+    /// Hold `id`'s audio against every process's upkeep until the guard
+    /// drops (#220: a retry the recording service has not started yet).
+    pub(crate) fn hold_audio(&self, id: &str) -> Result<AudioHold, storage::StorageError> {
+        let hold = lock_v2(&self.0).hold_audio(id).map_err(v2_err)?;
+        Ok(AudioHold {
+            store: Arc::clone(&self.0),
+            id: hold,
+        })
+    }
+
     /// Pin `id`'s audio until the returned guard drops (#342): upkeep
     /// neither compresses nor retires it meanwhile.
     pub(crate) fn pin_audio(&self, id: &str) -> AudioPin {
@@ -726,9 +705,11 @@ impl Store {
         &self,
         pcm: audio::PcmAudio,
         mark: store_v2::CommitMark,
+        transcribe: bool,
     ) -> Result<String, storage::StorageError> {
         let rate = pcm.sample_rate;
-        let meta = store_v2::TakeMeta::for_device("");
+        let mut meta = store_v2::TakeMeta::for_device("");
+        meta.transcribe = transcribe;
         let mut take = {
             let store = lock_v2(&self.0);
             store.begin_take_at_rate(rate, meta)
@@ -739,6 +720,24 @@ impl Store {
         let mut store = lock_v2(&self.0);
         let committed = finalized.commit_marked(&mut store, mark).map_err(v2_err)?;
         Ok(committed.record.id)
+    }
+}
+
+/// A [`Store::hold_audio`] guard: the take's audio is kept from every
+/// process's upkeep until it drops. Dropping it takes the store lock:
+/// never drop one while holding that lock.
+pub(crate) struct AudioHold {
+    store: Arc<Mutex<StoreV2>>,
+    id: String,
+}
+
+impl Drop for AudioHold {
+    fn drop(&mut self) {
+        if let Err(err) = lock_v2(&self.store).release_audio_hold(&self.id) {
+            // Left for its holder's exit to void (a hold whose holder is
+            // gone counts for nothing).
+            eprintln!("Starling: releasing an audio hold failed: {err}");
+        }
     }
 }
 
@@ -860,11 +859,9 @@ impl UpkeepReport {
     }
 }
 
-/// What a persisted import hands back to the pipeline: the record id,
-/// and the WAV its transcription runs on.
+/// What a persisted import hands back: the record id.
 pub(crate) struct SavedTake {
     pub(crate) id: String,
-    pub(crate) wav: Arc<Vec<u8>>,
 }
 
 /// Decode the caller's canonical WAV — pure CPU work done *outside* the
@@ -1545,9 +1542,6 @@ mod tests {
         let saved = store.save_capture(wav.clone()).expect("save");
         let id = saved.id;
         assert!(store.exists(&id).expect("exists"));
-        // The WAV path hands the caller's own bytes back as the transcript
-        // source — the store wrote exactly those samples.
-        assert!(Arc::ptr_eq(&saved.wav, &wav));
 
         // List: metadata-only, mapped onto the v1 shape.
         let listed = store.list().expect("list");
@@ -1656,9 +1650,10 @@ mod tests {
         let samples: Vec<f32> = (0..32_000)
             .map(|i| ((i as f32 * 0.05).sin() * 0.3) + ((i % 7) as f32 * 0.001))
             .collect();
-        let saved = store.save_capture(wav_of(&samples)).expect("save");
+        let wav = wav_of(&samples);
+        let saved = store.save_capture(wav.clone()).expect("save");
         let before = store.audio_wav(&saved.id).expect("load").expect("present");
-        assert_eq!(*before, *saved.wav, "the first transcription's audio");
+        assert_eq!(*before, *wav, "the first transcription's audio");
 
         let upkeep = store
             .audio_upkeep(store_v2::RetentionPolicy::default, || false)
@@ -1680,7 +1675,8 @@ mod tests {
     #[test]
     fn upkeep_stops_when_a_take_starts_recording() {
         let store = v2_store("upkeep-paused");
-        let saved = store.save_capture(wav_of(&[0.1f32; 32_000])).expect("save");
+        let original = wav_of(&[0.1f32; 32_000]);
+        let saved = store.save_capture(original.clone()).expect("save");
         let mut policy = store_v2::RetentionPolicy::default();
         policy.grace = std::time::Duration::ZERO;
         policy.include_referenced = true;
@@ -1699,7 +1695,7 @@ mod tests {
         assert!(upkeep.retention.retired.is_empty());
         assert!(upkeep.summary().is_none());
         let wav = store.audio_wav(&saved.id).expect("load").expect("present");
-        assert_eq!(*wav, *saved.wav, "still the journal, untouched");
+        assert_eq!(*wav, *original, "still the journal, untouched");
     }
 
     #[test]

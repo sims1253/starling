@@ -14,6 +14,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
 thiserror = "2"
+# The live stream (#357, in the host since #220): the `/stream` WebSocket
+# client, same versions as the app's.
+futures-util = "0.3"
+tokio = { version = "1", features = ["rt", "net", "time", "sync", "macros"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -42,6 +47,7 @@ windows-sys = { version = "0.59", features = [
 test-support = []
 
 [dev-dependencies]
+starling-processing = { path = "../processing" }
 starling-runtime = { path = "../runtime", features = ["test-doubles"] }
 starling-runtime-host = { path = ".", features = ["test-support"] }
 tempfile = "3"

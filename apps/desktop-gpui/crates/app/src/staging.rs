@@ -31,7 +31,7 @@ use starling_processing::staging::{Attempt, Draft, Outcome, RegionKind};
 
 use crate::app::{PendingFocus, StarlingApp};
 use crate::editor::{EditorEvent, StagingEditor, TextEdit};
-use crate::live_stream::Partial;
+use starling_runtime_host::live::stream::Partial;
 use crate::processing::{Decision, ProcessingState, TakeProcessing, draft_from_doc};
 use crate::store::{ProcessingDoc, ProposalRow};
 
@@ -146,7 +146,20 @@ impl StarlingApp {
             .find(|staging| staging.token == token)
     }
 
-    fn staging_token_for(&self, id: &str) -> Option<u64> {
+    /// Whether take `id`'s staging panel failed with its draft kept: a
+    /// successful retry the user asks for rebases it.
+    pub(crate) fn staging_failed_for(&self, id: &str) -> bool {
+        self.staging
+            .iter()
+            .chain(self.background_stagings.iter())
+            .any(|staging| {
+                staging.take_id.as_deref() == Some(id)
+                    && staging.phase == StagingPhase::Failed
+                    && staging.live.is_some()
+            })
+    }
+
+    pub(crate) fn staging_token_for(&self, id: &str) -> Option<u64> {
         self.staging
             .iter()
             .chain(self.background_stagings.iter())
@@ -521,12 +534,15 @@ impl StarlingApp {
             self.staging_rebase_failed(token, "The recording store is unavailable.", cx);
             return true;
         };
-        let final_text = self
-            .sessions
-            .iter()
-            .find(|session| session.id == id)
-            .and_then(|session| session.transcript.as_ref())
-            .map(|transcript| transcript.text.clone());
+        // The result this take's own transcription produced (#220), not
+        // whatever history shows by now.
+        let final_text = self.own_result(id).or_else(|| {
+            self.sessions
+                .iter()
+                .find(|session| session.id == id)
+                .and_then(|session| session.transcript.as_ref())
+                .map(|transcript| transcript.text.clone())
+        });
         let Some(staging) = self.staging_mut(token) else {
             return false;
         };
@@ -567,14 +583,20 @@ impl StarlingApp {
         self.drafts.remove(id);
         self.processing_loading.remove(id);
 
+        // The take's own result, when its transcription named it (#220):
+        // not whatever result history shows by the time this runs.
+        let own = self.own_result_attempt(id);
         let id = id.to_string();
         cx.spawn(async move |this, cx| {
             let prepared = {
                 let id = id.clone();
                 cx.background_spawn(async move {
-                    let (attempt_id, raw) = store.latest_raw(&id)?.ok_or_else(|| {
-                        starling_dictation::storage::StorageError::NotFound(id.clone())
-                    })?;
+                    let (attempt_id, raw) = match own {
+                        Some(own) => own,
+                        None => store.latest_raw(&id)?.ok_or_else(|| {
+                            starling_dictation::storage::StorageError::NotFound(id.clone())
+                        })?,
+                    };
                     let mut doc = store.start_processing_doc(&id, &attempt_id, &raw)?;
                     if let Some(text) = edited.filter(|text| *text != doc.head_text) {
                         let revision = doc.head_revision + 1;
@@ -697,7 +719,7 @@ impl StarlingApp {
         }
         let id = id.to_string();
         if self.mode_processes() {
-            self.process_take(id, cx);
+            self.process_take_on(id.clone(), Some((doc.raw_attempt_id, doc.raw_text)), cx);
         } else {
             self.stop_instants.remove(&id);
         }

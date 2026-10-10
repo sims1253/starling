@@ -62,6 +62,8 @@ pub struct HostConfig {
     /// How long a recording take may go without any app following it
     /// before the host stops and stores it itself (see [`crate::takes`]).
     pub orphan_grace: Duration,
+    /// How long a transcription waits for an engine to serve.
+    pub engine_wait: Duration,
     /// The agent allowlist file (see [`crate::agent::Allowlist`]).
     /// `None` or a missing file denies every agent client; a malformed
     /// file refuses startup.
@@ -99,6 +101,7 @@ impl HostConfig {
             settings_poll: crate::engine::DEFAULT_SETTINGS_POLL,
             engine: EngineChoice::None,
             orphan_grace: crate::takes::DEFAULT_ORPHAN_GRACE,
+            engine_wait: crate::transcribe::DEFAULT_ENGINE_WAIT,
             agent_allowlist: None,
             #[cfg(feature = "test-support")]
             insecure_test_app_role: false,
@@ -158,6 +161,12 @@ impl HostConfig {
                 ..Default::default()
             });
         Ok(config)
+    }
+
+    /// Overrides how long a transcription waits for an engine.
+    pub fn with_engine_wait(mut self, wait: Duration) -> Self {
+        self.engine_wait = wait;
+        self
     }
 
     /// Overrides how long an unfollowed take records before the host

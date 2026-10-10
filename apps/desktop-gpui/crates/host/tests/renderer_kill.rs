@@ -35,6 +35,10 @@ use starling_runtime_host::{serve, HostConfig};
 mod common;
 use common::endpoint_present;
 
+#[path = "common/fake_engine.rs"]
+mod fake_engine;
+use fake_engine::{FakeEngine, Reply, StreamMode};
+
 /// The renderer double (a bin target of this crate — cargo exports the
 /// built path to integration tests).
 const DOUBLE: &str = env!("CARGO_BIN_EXE_renderer-double");
@@ -434,19 +438,23 @@ fn a_renderer_process_killed_mid_take_leaves_a_durable_take_and_a_serving_host()
 }
 
 /// #220: a renderer killed mid-take and never relaunched. The host keeps
-/// recording only for the orphan grace, then stops and stores the take
-/// itself; the next app to follow the take feed is handed the stored take
-/// (`orphan`) to transcribe — the take is never left recording with no
-/// app, and never lost.
+/// recording only for the orphan grace, then stops, stores and
+/// transcribes the take itself — the take is never left recording with
+/// no app, never lost, and never waits for an app to transcribe it.
 #[test]
-fn a_take_whose_renderer_never_returns_is_stored_by_the_host_for_the_next_app() {
+fn a_take_whose_renderer_never_returns_is_stored_and_transcribed_by_the_host() {
     let root = tempfile::tempdir().unwrap();
+    let engine = FakeEngine::start(vec![Reply::Text("kept by the host".into())], StreamMode::Refuse);
     let config = kill_config(
         root.path(),
         FakeCaptureSource::new(vec![FakeTakeScript::clean()]),
         FakeProvider::new(vec![]),
     )
-    .with_orphan_grace(Duration::from_millis(300));
+    .with_orphan_grace(Duration::from_millis(300))
+    .with_engine(starling_runtime_host::engine::EngineChoice::Manual {
+        endpoint: engine.endpoint(),
+        model: "fake-model".to_string(),
+    });
     let mut host = serve(config).expect("host serves");
     let socket = host.socket_path().to_path_buf();
 
@@ -454,38 +462,22 @@ fn a_take_whose_renderer_never_returns_is_stored_by_the_host_for_the_next_app() 
     renderer.wait_ready(&socket);
     renderer.kill();
 
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         let store = starling_dictation::store_v2::StoreV2::open(root.path()).expect("store opens");
-        if store.list_records(0, 10).expect("list").total == 1 {
-            break;
-        }
-        assert!(Instant::now() < deadline, "the host never stored the orphaned take");
-        std::thread::sleep(Duration::from_millis(50));
-    }
-
-    let next = connect_with_retry(&socket);
-    next.take_watch().expect("watching");
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        match next.recv_take_timeout(Duration::from_millis(50)) {
-            Ok(starling_runtime_host::client::TakeWire::Persisted {
-                take,
-                stored_id,
-                orphan,
-                interrupted,
-                ..
-            }) => {
-                assert_eq!(take, "take_orphan");
-                assert!(orphan && !interrupted, "handed over as a complete orphan");
-                assert!(stored_id.is_some(), "with its history row");
+        let page = store.list_records(0, 10).expect("list");
+        if let Some(record) = page.records.first() {
+            let attempts = store.attempts_for(record.id()).expect("attempts");
+            if attempts.iter().any(|attempt| attempt.is_final_transcript()) {
+                assert_eq!(page.total, 1, "stored once");
+                assert_eq!(attempts.len(), 1, "transcribed once");
+                assert_eq!(attempts[0].text, "kept by the host");
                 break;
             }
-            Ok(_) => {}
-            Err(_) => assert!(Instant::now() < deadline, "the next app was never handed the take"),
         }
+        assert!(Instant::now() < deadline, "the host never stored and transcribed the take");
+        std::thread::sleep(Duration::from_millis(50));
     }
-    drop(next);
     host.shutdown();
 }
 

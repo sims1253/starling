@@ -204,6 +204,11 @@ pub trait LiveTakeMonitor: Send + Sync {
     /// How many samples [`Self::samples_from`] can reach so far.
     fn sample_count(&self) -> usize;
     fn status(&self) -> LiveTakeStatus;
+    /// Samples the journal made durable: [`Self::status`]'s
+    /// `acknowledged`, for a reader that needs only that.
+    fn acknowledged(&self) -> u64 {
+        self.status().acknowledged
+    }
 }
 
 /// A live take's health at one moment (#220): what the app shows while a
@@ -234,6 +239,9 @@ impl LiveTakeMonitor for starling_dictation::recorder::CaptureMonitor {
     }
     fn sample_count(&self) -> usize {
         starling_dictation::recorder::CaptureMonitor::sample_count(self)
+    }
+    fn acknowledged(&self) -> u64 {
+        self.acknowledged_samples()
     }
     fn status(&self) -> LiveTakeStatus {
         LiveTakeStatus {
@@ -391,7 +399,16 @@ pub trait CaptureStore: Send + Sync {
     fn stored_id(&self, _take: &TakeRecord) -> Option<String> {
         None
     }
+    /// From now on, every complete take `wanted` names is committed with
+    /// the intent to transcribe it, in the commit's own transaction
+    /// (#220: the host transcribes stored takes; a crash right after the
+    /// commit must not forget one). Stores that keep no intents ignore it.
+    fn transcribe_takes(&self, _wanted: TranscribeWanted) {}
 }
+
+/// Which takes a store commits with the intent to transcribe them
+/// ([`CaptureStore::transcribe_takes`]).
+pub type TranscribeWanted = Arc<dyn Fn(&TakeRecord) -> bool + Send + Sync>;
 
 /// In-memory store (tests, and runtimes started without a data root).
 #[derive(Default)]
@@ -482,6 +499,9 @@ pub struct V2CaptureStore {
     /// asks (#220): the commit knows it exactly, where a lookup by the
     /// take's capture id could find another row that holds that id.
     committed: Mutex<HashMap<String, String>>,
+    /// Which complete takes are committed with a transcription intent
+    /// ([`CaptureStore::transcribe_takes`]); none until asked.
+    transcribe: Mutex<Option<TranscribeWanted>>,
 }
 
 /// Report a post-commit (or rollback) divergence that must not change
@@ -535,7 +555,19 @@ impl V2CaptureStore {
         Ok(V2CaptureStore {
             store: Mutex::new(store),
             committed: Mutex::new(HashMap::new()),
+            transcribe: Mutex::new(None),
         })
+    }
+
+    /// Whether `take`, committed with `status`, is to be transcribed.
+    fn wants_transcription(&self, take: &TakeRecord, status: CaptureStatus) -> bool {
+        status == CaptureStatus::Complete
+            && self
+                .transcribe
+                .lock()
+                .expect("transcribe predicate lock")
+                .as_ref()
+                .is_some_and(|wanted| wanted(take))
     }
 
     /// Roll the staging journal back after the `phase` step ("append" /
@@ -592,6 +624,7 @@ impl V2CaptureStore {
         // same split the app facade's save path uses, so concurrent
         // persists do not serialize behind each other's writes.
         let mut adoption_error = None;
+        let transcribe = self.wants_transcription(take, status);
         {
             let mut store = self.store.lock().expect("v2 store lock");
             // #356: a faulted or unfinalized journal holds only the audio
@@ -603,7 +636,10 @@ impl V2CaptureStore {
                         && ((report.finalized && report.fault.is_none())
                             || take.samples.is_empty()) =>
                 {
-                    Some((report, store.adopt_journal(&report.path, note)))
+                    Some((
+                        report,
+                        store.adopt_journal_transcribed(&report.path, note, transcribe),
+                    ))
                 }
                 _ => None,
             };
@@ -661,6 +697,18 @@ impl V2CaptureStore {
                                     report.id
                                 ));
                             } else {
+                                // The row is this take's: it still wants
+                                // its transcription (an intent the earlier
+                                // commit wrote stays as it is).
+                                if transcribe {
+                                    if let Err(err) = store.request_transcription(&existing.id) {
+                                        report_divergence(format!(
+                                            "existing capture {} committed; recording that it \
+                                             is to be transcribed failed ({err})",
+                                            existing.id
+                                        ));
+                                    }
+                                }
                                 if status == CaptureStatus::Interrupted {
                                     if let Err(flip_err) = store.update_capture_status(
                                         &existing.id,
@@ -705,6 +753,7 @@ impl V2CaptureStore {
         // so a crash before that journal is moved aside cannot bring it
         // back as a second copy at the next startup recovery.
         meta.supersedes_journal = take.journal.as_ref().map(|report| report.id.clone());
+        meta.transcribe = transcribe;
         let mut extra = serde_json::json!({
             "takeCorr": take.id,
             "captureId": take.capture_id,
@@ -991,6 +1040,9 @@ impl CaptureStore for V2CaptureStore {
             .lock()
             .expect("committed ids lock")
             .remove(&committed_key(take))
+    }
+    fn transcribe_takes(&self, wanted: TranscribeWanted) {
+        *self.transcribe.lock().expect("transcribe predicate lock") = Some(wanted);
     }
 }
 

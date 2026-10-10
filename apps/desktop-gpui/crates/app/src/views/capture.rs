@@ -686,6 +686,7 @@ fn render_banner(app: &mut StarlingApp, cx: &mut Context<StarlingApp>) -> Option
                 .flex_col()
                 .gap(px(3.))
                 .flex_1()
+                .min_w_0()
                 .child(
                     div().text_color(theme::ERROR_TITLE).child(if error.is_some() {
                         "Action failed"
@@ -797,14 +798,18 @@ fn quality_banner(
         .text_color(theme::ERROR_TEXT)
         .child(icon("icons/alert-circle.svg", 18., theme::ERROR_TEXT))
         .child(
+            // The text column may shrink below its words' width (a flex
+            // item's default minimum is its content), so long notices
+            // wrap inside the box instead of running past its edge.
             div()
                 .flex()
                 .flex_col()
                 .gap(px(3.))
                 .flex_1()
+                .min_w_0()
                 .child(div().text_color(theme::ERROR_TITLE).child(title))
-                .child(message)
-                .child(div().text_color(theme::ERROR_SUBTLE).child(footer)),
+                .child(div().w_full().child(message))
+                .child(div().w_full().text_color(theme::ERROR_SUBTLE).child(footer)),
         )
         .child(
             div()

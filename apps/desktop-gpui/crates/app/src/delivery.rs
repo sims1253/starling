@@ -701,16 +701,20 @@ impl StarlingApp {
     /// itself. With typing on, the notice offers Copy and an explicit
     /// Paste last; with copy-only delivery the drawer's Copy is the way.
     /// A take whose staging panel is open keeps its panel's own Insert.
-    pub(crate) fn offer_retried_text(&mut self, id: &str, cx: &mut Context<Self>) {
-        if !self.delivery.settings.auto_insert || self.staging_shows(id) {
+    /// `text` is exactly the retry's result: the take's history head may
+    /// already be a later retry another window asked for.
+    pub(crate) fn offer_retried_text(&mut self, id: &str, text: &str, cx: &mut Context<Self>) {
+        if !self.delivery.settings.auto_insert || self.staging_shows(id) || text.trim().is_empty() {
             return;
         }
-        let Some(text) = self.head_text(id).filter(|text| !text.trim().is_empty()) else {
-            return;
-        };
         self.delivery
-            .replace_recovery(Some(Recovery::new(id, text, Failure::Retried)));
+            .replace_recovery(Some(Recovery::new(id, text.to_string(), Failure::Retried)));
         cx.notify();
+    }
+
+    /// Whether take `id`'s text still goes somewhere when it is ready.
+    pub(crate) fn delivers(&self, id: &str) -> bool {
+        self.delivery.by_take.contains_key(id)
     }
 
     /// A direct take's transcript landed: type its text into the
@@ -722,7 +726,11 @@ impl StarlingApp {
         if !self.delivery.settings.auto_insert {
             return;
         }
-        let Some(text) = self.staged_text_for(id).or_else(|| self.head_text(id)) else {
+        let Some(text) = self
+            .staged_text_for(id)
+            .or_else(|| self.own_result(id))
+            .or_else(|| self.head_text(id))
+        else {
             return;
         };
         let verified = capture

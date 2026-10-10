@@ -95,9 +95,18 @@ fn runtime(
     scripts: Vec<FakeTakeScript>,
     observer: Arc<Recording>,
 ) -> (starling_runtime::Runtime, starling_runtime::RuntimeClient) {
+    runtime_on(Arc::new(V2CaptureStore::open(root).expect("v2 store")), root, scripts, observer)
+}
+
+fn runtime_on(
+    store: Arc<V2CaptureStore>,
+    root: &std::path::Path,
+    scripts: Vec<FakeTakeScript>,
+    observer: Arc<Recording>,
+) -> (starling_runtime::Runtime, starling_runtime::RuntimeClient) {
     let config = RuntimeConfig::default()
         .with_capture_source(FakeCaptureSource::new(scripts))
-        .with_capture_store(Arc::new(V2CaptureStore::open(root).expect("v2 store")))
+        .with_capture_store(store)
         .with_capture_observer(observer)
         .with_capture_config(CaptureConfig {
             journals_dir: root.join("journals"),
@@ -266,5 +275,57 @@ fn a_stop_that_reports_a_failed_device_keeps_the_take_as_interrupted() {
         starling_dictation::store_v2::CaptureStatus::Interrupted,
         "never presented as complete"
     );
+    runtime.shutdown();
+}
+
+/// #220: a store told which takes to transcribe commits each complete
+/// one with that intent, in the commit itself; a cancelled take (stored
+/// interrupted) and a take it was not told about carry none.
+#[test]
+fn a_clean_take_is_stored_with_the_intent_to_transcribe_it() {
+    use starling_runtime::machine::capture::CaptureStore;
+    let root = tempfile::tempdir().unwrap();
+    let observer = Arc::new(Recording::default());
+    let store = Arc::new(V2CaptureStore::open(root.path()).expect("v2 store"));
+    store.transcribe_takes(Arc::new(|take: &TakeRecord| !take.id.starts_with("ask_")));
+    let (runtime, client) = runtime_on(
+        store,
+        root.path(),
+        vec![FakeTakeScript::clean(), FakeTakeScript::clean(), FakeTakeScript::clean()],
+        Arc::clone(&observer),
+    );
+    let events = runtime.subscribe();
+    let mut stored = Vec::new();
+    for (corr, command) in [
+        ("t_kept", Command::CaptureStop { drain: Some(true) }),
+        ("t_cancelled", Command::CaptureAbort),
+        ("ask_agent", Command::CaptureStop { drain: Some(true) }),
+    ] {
+        client
+            .send(Some(corr), Command::CaptureStart { policy: "push-to-talk".into() })
+            .unwrap();
+        until(&events, "progress", |m| m.type_name() == "capture.progress");
+        client.send(Some(corr), command).unwrap();
+        let start = Instant::now();
+        loop {
+            let id = observer.seen.lock().unwrap().iter().find_map(|seen| match seen {
+                Seen::Persisted { corr: seen, stored: Ok(Some(id)) } if seen == corr => {
+                    Some(id.clone())
+                }
+                _ => None,
+            });
+            if let Some(id) = id {
+                stored.push(id);
+                break;
+            }
+            assert!(start.elapsed() < Duration::from_secs(5), "{corr} was not stored");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    let store = starling_dictation::store_v2::StoreV2::open(root.path()).unwrap();
+    assert!(store.transcription_wanted(&stored[0]).unwrap(), "the clean take");
+    assert!(!store.transcription_wanted(&stored[1]).unwrap(), "the cancelled take");
+    assert!(!store.transcription_wanted(&stored[2]).unwrap(), "a take it was not told about");
+    assert_eq!(store.transcriptions_due(Duration::ZERO).unwrap(), vec![stored[0].clone()]);
     runtime.shutdown();
 }

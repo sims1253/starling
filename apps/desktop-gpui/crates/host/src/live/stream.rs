@@ -8,7 +8,8 @@ use serde_json::Value;
 use starling_dictation::storage::{TranscriptionResult, TranscriptionSegment};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
-use crate::stream_pump::{StreamClient, StreamTrace};
+use super::pump::StreamClient;
+use super::trace::StreamTrace;
 
 enum Command {
     Audio(Vec<u8>),
@@ -19,7 +20,7 @@ enum Command {
 /// words the server will never change (0 from a server that predates the
 /// field, which makes the whole text one live segment).
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct Partial {
+pub struct Partial {
     pub text: String,
     /// Not clamped here (an out-of-range count saturates); the segmenter
     /// clamps it to the text's word count.
@@ -31,7 +32,7 @@ pub(crate) struct Partial {
 
 /// What a take asks `/stream` for besides audio.
 #[derive(Clone, Default)]
-pub(crate) struct StreamOptions {
+pub struct StreamOptions {
     /// The first-preview minimum and the preview interval in seconds;
     /// `None` leaves the server's default (#357).
     pub cadence: (Option<f64>, Option<f64>),
@@ -40,18 +41,18 @@ pub(crate) struct StreamOptions {
     pub trace: Option<Arc<StreamTrace>>,
 }
 
-pub(crate) enum Event {
+pub enum Event {
     Partial(Partial),
     Final(TranscriptionResult),
     Error(String),
 }
 
-pub(crate) struct LiveStream {
+pub struct LiveStream {
     commands: tokio::sync::mpsc::Sender<Command>,
     events: Receiver<Event>,
 }
 
-pub(crate) fn stream_url(endpoint: &str) -> Result<String, String> {
+pub fn stream_url(endpoint: &str) -> Result<String, String> {
     let endpoint = endpoint.trim().trim_end_matches('/');
     let (scheme, rest) = if let Some(rest) = endpoint.strip_prefix("https://") {
         ("wss://", rest)
@@ -72,7 +73,7 @@ pub(crate) fn stream_url(endpoint: &str) -> Result<String, String> {
 
 /// [`stream_url`] with the take's query: the preview cadence and the
 /// trace switch. A server that predates a parameter ignores it.
-pub(crate) fn stream_request_url(endpoint: &str, options: &StreamOptions) -> Result<String, String> {
+pub fn stream_request_url(endpoint: &str, options: &StreamOptions) -> Result<String, String> {
     let mut query = Vec::new();
     let (min, interval) = options.cadence;
     if let Some(seconds) = min {
@@ -95,7 +96,7 @@ pub(crate) fn stream_request_url(endpoint: &str, options: &StreamOptions) -> Res
 /// A whole input quantum maps to a whole count of 16 kHz output samples.
 /// Cutting live WAV frames on this boundary avoids cumulative duration drift
 /// when the device runs at 44.1 kHz.
-pub(crate) fn exact_input_quantum(rate: u32) -> usize {
+pub fn exact_input_quantum(rate: u32) -> usize {
     if rate == 0 {
         return 1;
     }
@@ -107,7 +108,7 @@ pub(crate) fn exact_input_quantum(rate: u32) -> usize {
 }
 
 impl LiveStream {
-    pub(crate) fn start(endpoint: &str, options: &StreamOptions) -> Result<Self, String> {
+    pub fn start(endpoint: &str, options: &StreamOptions) -> Result<Self, String> {
         let url = stream_request_url(endpoint, options)?;
         let trace = options.trace.clone();
         let (commands, mut command_rx) = tokio::sync::mpsc::channel(64);
@@ -175,7 +176,7 @@ impl LiveStream {
         Ok(Self { commands, events })
     }
 
-    pub(crate) fn send_audio(&self, wav: Vec<u8>) -> bool {
+    pub fn send_audio(&self, wav: Vec<u8>) -> bool {
         self.commands.try_send(Command::Audio(wav)).is_ok()
     }
 
@@ -183,15 +184,15 @@ impl LiveStream {
     /// closed — the terminal condition. A failed `send_audio` with this
     /// false is only backpressure (the bounded channel is momentarily
     /// full); the unsent span is kept and the caller can retry.
-    pub(crate) fn is_closed(&self) -> bool {
+    pub fn is_closed(&self) -> bool {
         self.commands.is_closed()
     }
 
-    pub(crate) fn commit(&self) -> bool {
+    pub fn commit(&self) -> bool {
         self.commands.try_send(Command::Commit).is_ok()
     }
 
-    pub(crate) fn poll_partial(&self) -> Result<Option<Partial>, String> {
+    pub fn poll_partial(&self) -> Result<Option<Partial>, String> {
         let mut latest = None;
         while let Ok(event) = self.events.try_recv() {
             match event {
@@ -203,7 +204,7 @@ impl LiveStream {
         Ok(latest)
     }
 
-    pub(crate) fn final_result(self) -> Result<TranscriptionResult, String> {
+    pub fn final_result(self) -> Result<TranscriptionResult, String> {
         // One total budget for the whole wait, not one per event: a server
         // that keeps dribbling partials (or pongs) would otherwise reset a
         // per-recv timeout forever and wedge the wait indefinitely.

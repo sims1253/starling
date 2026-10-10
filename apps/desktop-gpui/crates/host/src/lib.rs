@@ -35,12 +35,16 @@
 //! - [`takes`] — the take feed: the app's projection of the takes this
 //!   host records (status, audio, stored rows, orphans), beside the
 //!   envelope like the ask frames.
+//! - [`transcribe`] — transcription in the host: live text while a take
+//!   records, its transcript once stored, and retries apps ask for.
 //! - [`capture`] — the production capture source (the desktop settings'
 //!   microphone, journaled, disk-watched).
 //! - [`recovery`] — owner-side startup recovery beyond reconcile (stale
 //!   attempts, the recorder's journal tree).
 //! - [`cli`] — the command line, shared by this crate's binary and the
 //!   app's `--runtime-host`.
+//! - [`live`] — live transcription while a take records: the `/stream`
+//!   client and the worker pumping the take's audio into it.
 //!
 //! # Worker supervision boundary (recorded precisely)
 //!
@@ -69,14 +73,18 @@
 //! The GPUI app (`crates/app`) is a client: it starts this host from its
 //! own executable when none serves (`starling-gpui --runtime-host`),
 //! records every take through the capture machine and the take feed,
-//! and never opens a recorder, a journal or the store lease itself. It
-//! still transcribes its takes (uploads, the live stream, retries) and
-//! writes their attempt rows through its own store handle — a store
-//! client, the multi-process shape storage v2 is built for — and runs
-//! its own engine manager; the host it starts runs with `--engine
-//! none`. Moving transcription, store writes and the engine into the
-//! host are the next increments. The Electron comparison app the design
-//! names as a second client has been removed from the tree.
+//! and never opens a recorder, a journal or the store lease itself. The
+//! host transcribes the takes it stores ([`transcribe`]): live text while
+//! a take records, the transcript once it is stored, retries the app asks
+//! for; the app renders them and delivers its own take's text, which
+//! needs its window. The app still reads history, writes imports and
+//! processing results through its own store handle — a store client, the
+//! multi-process shape storage v2 is built for — and runs the engine
+//! manager its settings drive; this host attaches to the same engine
+//! (see [`engine`]). Moving the remaining store work and the engine
+//! manager into the host are the next increments. The Electron comparison
+//! app the design names as a second client has been removed from the
+//! tree.
 
 pub mod agent;
 pub mod auth;
@@ -87,11 +95,13 @@ pub mod config;
 pub mod engine;
 pub mod frame;
 pub mod limits;
+pub mod live;
 pub mod mcp;
 pub mod platform;
 pub mod recovery;
 pub mod server;
 pub mod takes;
+pub mod transcribe;
 
 pub use config::{default_data_root, HostConfig};
 pub use server::{serve, HostError, HostHandle};

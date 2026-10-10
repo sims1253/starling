@@ -1,5 +1,5 @@
 //! Live stream pumping (#357): a take's journaled audio goes out to
-//! `/stream` and its previews come back on a worker thread the app owns,
+//! `/stream` and its previews come back on a worker thread of its own,
 //! not in render callbacks. Live text keeps moving while the main window
 //! is minimized or covered, and when the overlay is the only window on
 //! screen; the UI only applies the newest preview when it arrives.
@@ -22,23 +22,19 @@
 //! transcribing those words differently, has heard everything the old one
 //! had, or is still behind after the replay plus [`REPLAY_GRACE`] gets its
 //! previews shown again. The draft's segmenter still keeps the words it
-//! made final and the user's edits, and flags the divergence. The seam is
-//! kept small for #220, which moves this worker into the runtime host.
+//! made final and the user's edits, and flags the divergence.
 
-use std::io::Write;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{SyncSender, TrySendError};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use gpui::Context;
-use serde_json::{Value, json};
+use serde_json::json;
 use starling_dictation::recorder::CaptureTap;
 use tokio::sync::watch;
 
-use crate::app::StarlingApp;
-use crate::live_stream::{LiveStream, Partial, StreamOptions, exact_input_quantum};
+use super::stream::{exact_input_quantum, Partial};
+use super::trace::StreamTrace;
 
 /// How often the worker drains the take, sends acknowledged audio and
 /// polls for previews (the journal writer polls at the same rate).
@@ -61,12 +57,9 @@ const REPLAY_DISAGREEMENTS: usize = 3;
 /// How long past real time a replay may take to catch up before the hold
 /// gives up: a server slower than that cannot keep live text going anyway.
 const REPLAY_GRACE: Duration = Duration::from_secs(10);
-/// Trace lines queued for the writer before new ones are dropped (and
-/// counted): a stalled trace sink must not hold up the UI or the stream.
-const TRACE_BACKLOG: usize = 1024;
 
 /// The connection the worker sends audio on and polls previews from.
-pub(crate) trait StreamClient: Send + 'static {
+pub trait StreamClient: Send + 'static {
     /// `false` when the audio was not queued: backpressure while
     /// [`Self::is_closed`] is false, a dead connection otherwise.
     fn send_audio(&self, wav: Vec<u8>) -> bool;
@@ -77,11 +70,21 @@ pub(crate) trait StreamClient: Send + 'static {
 }
 
 /// The take's audio as the worker sees it.
-pub(crate) trait AudioTap: Send + 'static {
+pub trait AudioTap: Send + 'static {
     /// Samples captured since the last drain, in order.
     fn drain(&self) -> Vec<f32>;
     /// Samples from the start of the take that the journal made durable.
     fn acknowledged(&self) -> u64;
+}
+
+impl<T: AudioTap + Sync> AudioTap for Arc<T> {
+    fn drain(&self) -> Vec<f32> {
+        T::drain(self)
+    }
+
+    fn acknowledged(&self) -> u64 {
+        T::acknowledged(self)
+    }
 }
 
 impl AudioTap for CaptureTap {
@@ -95,10 +98,10 @@ impl AudioTap for CaptureTap {
 }
 
 /// Opens a fresh connection for a reconnect.
-pub(crate) type Connect<C> = Box<dyn FnMut() -> Result<C, String> + Send>;
+pub type Connect<C> = Box<dyn FnMut() -> Result<C, String> + Send>;
 
 /// What the worker hands back at stop.
-pub(crate) struct Handoff<C> {
+pub struct Handoff<C> {
     /// Every sample drained from the take, at the device rate; the
     /// recorder's `stop` returns only what follows them.
     pub samples: Vec<f32>,
@@ -129,8 +132,21 @@ fn degradation(reason: &str) -> String {
     )
 }
 
+/// What the worker tells a listener as it happens ([`UpdateHook`]).
+#[derive(Debug, Clone, PartialEq)]
+pub enum PumpUpdate {
+    /// The newest preview to show.
+    Partial(Partial),
+    /// Live text stopped for the rest of the take, and why.
+    Degraded(String),
+}
+
+/// Called on the worker's thread with every [`PumpUpdate`]; it must not
+/// block (Stop joins that thread).
+pub type UpdateHook = Arc<dyn Fn(PumpUpdate) + Send + Sync>;
+
 /// The take's live updates, for the UI.
-pub(crate) struct Live {
+pub struct Live {
     /// The newest preview to show.
     pub previews: watch::Receiver<Option<Partial>>,
     /// Why live text stopped for the rest of the take, once it has.
@@ -181,6 +197,7 @@ struct PumpCore<C> {
     replay: Option<Replay>,
     partials: watch::Sender<Option<Partial>>,
     degraded: watch::Sender<Option<String>>,
+    on_update: Option<UpdateHook>,
     trace: Option<Arc<StreamTrace>>,
     /// Set by [`StreamPump::finish`]; a step checks it between frames.
     stop: Arc<AtomicBool>,
@@ -288,6 +305,14 @@ impl<C: StreamClient> PumpCore<C> {
             self.stable_prefix = words[..stable].iter().map(|word| word.to_string()).collect();
         }
         self.shown_words = words.len();
+        if let Some(hook) = self.on_update.as_ref() {
+            // The app shows what it is handed: this is the trace's
+            // `display` (the window applies it within a frame).
+            if let Some(trace) = self.trace.as_ref() {
+                trace.displayed(&partial);
+            }
+            hook(PumpUpdate::Partial(partial.clone()));
+        }
         self.partials.send_replace(Some(partial));
     }
 
@@ -308,6 +333,9 @@ impl<C: StreamClient> PumpCore<C> {
             self.retry_at = None;
             self.degradation = Some(degradation(&reason));
             // Explained while the take still records, not only at stop.
+            if let (Some(hook), Some(reason)) = (self.on_update.as_ref(), self.degradation.as_ref()) {
+                hook(PumpUpdate::Degraded(reason.clone()));
+            }
             self.degraded.send_replace(self.degradation.clone());
         }
     }
@@ -368,7 +396,7 @@ impl<C: StreamClient> PumpCore<C> {
 
 /// The take's stream worker. Dropping it without [`Self::finish`] stops
 /// the thread and drops what it drained.
-pub(crate) struct StreamPump<C> {
+pub struct StreamPump<C> {
     core: Arc<Mutex<PumpCore<C>>>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
@@ -377,14 +405,16 @@ pub(crate) struct StreamPump<C> {
 
 impl<C: StreamClient> StreamPump<C> {
     /// Starts pumping `tap` (captured at `rate`) into `stream`; `connect`
-    /// opens a replacement connection after a failure. An error is why the
+    /// opens a replacement connection after a failure; `on_update` hears
+    /// every preview and degradation as it happens. An error is why the
     /// worker could not start; the take records regardless.
-    pub(crate) fn start(
+    pub fn start(
         tap: Box<dyn AudioTap>,
         rate: u32,
         stream: C,
         connect: Connect<C>,
         trace: Option<Arc<StreamTrace>>,
+        on_update: Option<UpdateHook>,
     ) -> Result<(Self, Live), String> {
         let (partials, previews) = watch::channel(None);
         let (degraded, degradation) = watch::channel(None);
@@ -406,6 +436,7 @@ impl<C: StreamClient> StreamPump<C> {
             replay: None,
             partials,
             degraded,
+            on_update,
             trace: trace.clone(),
             stop: Arc::clone(&stop),
         }));
@@ -441,7 +472,7 @@ impl<C: StreamClient> StreamPump<C> {
     /// Stops the worker after its current step and hands the take back.
     /// Nothing is drained or sent after this returns, so the recorder's
     /// `stop` returns exactly the samples after [`Handoff::samples`].
-    pub(crate) fn finish(mut self) -> Handoff<C> {
+    pub fn finish(mut self) -> Handoff<C> {
         self.stop.store(true, Ordering::Release);
         if let Some(thread) = self.thread.take() {
             thread.thread().unpark();
@@ -476,296 +507,6 @@ impl<C> Drop for StreamPump<C> {
         if let Some(thread) = self.thread.as_ref() {
             thread.thread().unpark();
         }
-    }
-}
-
-impl StarlingApp {
-    /// Opens the take's live stream at `endpoint` and starts its worker on
-    /// the take's `feed` (its audio as the recording service sends it,
-    /// #220) at the device `rate`, with the cadence from the settings. An
-    /// error is the reason no live text will show; the take records
-    /// regardless.
-    pub(crate) fn start_stream_pump(
-        &mut self,
-        feed: Arc<crate::host_link::TakeFeed>,
-        rate: u32,
-        endpoint: &str,
-        cx: &mut Context<Self>,
-    ) -> Result<(), String> {
-        let trace = StreamTrace::from_env();
-        let options = StreamOptions {
-            cadence: self.live_preview.effective(),
-            trace: trace.clone(),
-        };
-        let stream = LiveStream::start(endpoint, &options)?;
-        let endpoint = endpoint.to_string();
-        let (pump, live) = StreamPump::start(
-            Box::new(feed),
-            rate,
-            stream,
-            Box::new(move || LiveStream::start(&endpoint, &options)),
-            trace.clone(),
-        )?;
-        let Live {
-            mut previews,
-            mut degradation,
-        } = live;
-        self.stream_generation = self.stream_generation.wrapping_add(1);
-        let generation = self.stream_generation;
-        self.stream_pump = Some(pump);
-        self.stream_trace = trace;
-        // A foreground task, not a render callback: it runs while the
-        // main window is minimized or covered. It ends when the worker
-        // does (the senders drop with it).
-        cx.spawn(async move |this, cx| {
-            loop {
-                let applied = tokio::select! {
-                    biased;
-                    changed = previews.changed() => {
-                        if changed.is_err() {
-                            break;
-                        }
-                        let Some(partial) = previews.borrow_and_update().clone() else {
-                            continue;
-                        };
-                        this.update(cx, |app, cx| app.show_stream_partial(generation, partial, cx))
-                    }
-                    changed = degradation.changed() => {
-                        if changed.is_err() {
-                            break;
-                        }
-                        let Some(reason) = degradation.borrow_and_update().clone() else {
-                            continue;
-                        };
-                        this.update(cx, |app, cx| app.stream_degraded(generation, reason, cx))
-                    }
-                };
-                if applied.is_err() {
-                    break;
-                }
-            }
-        })
-        .detach();
-        Ok(())
-    }
-
-    /// The newest preview of the running take: into the staging draft
-    /// (which keeps the user's edits, #297), or the direct-mode line.
-    fn show_stream_partial(&mut self, generation: u64, partial: Partial, cx: &mut Context<Self>) {
-        // A preview that was in flight when its take stopped is never
-        // shown: the final replaces the draft's live text.
-        if generation != self.stream_generation || self.stream_pump.is_none() {
-            return;
-        }
-        if let Some(trace) = self.stream_trace.as_ref() {
-            trace.displayed(&partial);
-        }
-        if self.staging.is_some() {
-            self.staging_partial(partial, cx);
-        } else {
-            self.live_partial = partial.text;
-            cx.notify();
-        }
-    }
-
-    /// Live text stopped for the rest of the running take: say why now.
-    fn stream_degraded(&mut self, generation: u64, reason: String, cx: &mut Context<Self>) {
-        if generation != self.stream_generation || self.stream_pump.is_none() {
-            return;
-        }
-        self.stream_degradation = Some(reason);
-        cx.notify();
-    }
-
-    /// Stops the take's worker and hands its audio and connection to the
-    /// stop path; empty when the take had no stream.
-    pub(crate) fn finish_stream_pump(&mut self) -> Handoff<LiveStream> {
-        self.stream_trace = None;
-        self.stream_pump
-            .take()
-            .map(StreamPump::finish)
-            .unwrap_or_default()
-    }
-}
-
-/// The take's stream timeline (#226), on when `STARLING_STREAM_TRACE` is
-/// set: `1` or `stderr` writes to stderr, anything else is a file the
-/// lines are appended to. One JSON object per line, tagged with the take
-/// and `ms` since it started: `start` (with the wall clock), every server frame (`partial`
-/// with the server's `covered_s`/`audio_s`, `final` with its stop path),
-/// every preview the UI applied (`display`), `stream_failed`, `reconnect`,
-/// `replay_released` and `stop`. Partial age at display is
-/// `display.ms - 1000 * covered_s`, measured from the take's start rather
-/// than the microphone's.
-///
-/// Lines are written by the take's own writer thread: the UI thread and
-/// the stream's reader only queue them, so a slow or stalled sink cannot
-/// freeze the window. A full queue drops lines; the next line written
-/// carries how many (`dropped`).
-pub(crate) struct StreamTrace {
-    /// Tags every line: a take's `final` can land after the next take
-    /// started.
-    take: String,
-    started: Instant,
-    lines: SyncSender<String>,
-    dropped: AtomicU64,
-}
-
-impl StreamTrace {
-    pub(crate) fn from_env() -> Option<Arc<StreamTrace>> {
-        let target = std::env::var("STARLING_STREAM_TRACE").ok()?;
-        let out: Box<dyn Write + Send> = match target.trim() {
-            "" | "0" => return None,
-            "1" | "stderr" => Box::new(std::io::stderr()),
-            path => match std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-            {
-                Ok(file) => Box::new(file),
-                Err(err) => {
-                    eprintln!("STARLING_STREAM_TRACE: cannot open {path}: {err}");
-                    return None;
-                }
-            },
-        };
-        // Wall time too, to line the take up with outside events.
-        let unix_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |since| since.as_millis() as u64);
-        static TAKES: AtomicU64 = AtomicU64::new(0);
-        let take = format!(
-            "{}-{}",
-            std::process::id(),
-            TAKES.fetch_add(1, Ordering::Relaxed)
-        );
-        // No writer, no trace: saying so on stderr from the UI thread
-        // could wait behind an earlier take's stalled stderr writer.
-        let trace = StreamTrace::writing_to(take, out, TRACE_BACKLOG).ok()?;
-        trace.log("start", json!({ "unix_ms": unix_ms }));
-        Some(Arc::new(trace))
-    }
-
-    /// A trace whose lines `out` receives on its own thread, at most
-    /// `backlog` of them waiting. The thread ends once the trace and its
-    /// queued lines are gone.
-    fn writing_to(
-        take: String,
-        mut out: Box<dyn Write + Send>,
-        backlog: usize,
-    ) -> std::io::Result<StreamTrace> {
-        let (lines, queued) = std::sync::mpsc::sync_channel::<String>(backlog);
-        std::thread::Builder::new()
-            .name("starling-stream-trace".into())
-            .spawn(move || {
-                for line in queued {
-                    let _ = out.write_all(line.as_bytes());
-                }
-            })?;
-        Ok(StreamTrace {
-            take,
-            started: Instant::now(),
-            lines,
-            dropped: AtomicU64::new(0),
-        })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn discard() -> StreamTrace {
-        StreamTrace::writing_to("test".into(), Box::new(std::io::sink()), TRACE_BACKLOG)
-            .expect("a trace writer thread")
-    }
-
-    pub(crate) fn log(&self, event: &str, mut fields: Value) {
-        let ms = (self.started.elapsed().as_secs_f64() * 10_000.0).round() / 10.0;
-        if let Value::Object(map) = &mut fields {
-            map.insert("ev".into(), event.into());
-            map.insert("take".into(), self.take.clone().into());
-            map.insert("ms".into(), ms.into());
-        }
-        let dropped = self.dropped.swap(0, Ordering::Relaxed);
-        if dropped > 0
-            && let Value::Object(map) = &mut fields
-        {
-            map.insert("dropped".into(), dropped.into());
-        }
-        // One write per line: every take appends to the same file through
-        // its own handle, and a take's final can land during the next take.
-        let line = format!("{fields}\n");
-        match self.lines.try_send(line) {
-            Ok(()) => {}
-            // This line and the ones it was to report are lost.
-            Err(TrySendError::Full(_)) => {
-                self.dropped.fetch_add(dropped + 1, Ordering::Relaxed);
-            }
-            Err(TrySendError::Disconnected(_)) => {}
-        }
-    }
-
-    /// A text frame from the server.
-    pub(crate) fn received(&self, frame: &str) {
-        let Ok(payload) = serde_json::from_str::<Value>(frame) else {
-            return;
-        };
-        let trace = payload.get("trace");
-        let field = |key: &str| trace.and_then(|trace| trace.get(key)).cloned();
-        let words = payload
-            .get("text")
-            .and_then(Value::as_str)
-            .map(|text| text.split_ascii_whitespace().count());
-        match payload.get("type").and_then(Value::as_str) {
-            Some("partial") => self.log(
-                "partial",
-                json!({
-                    "words": words,
-                    "stable_words": payload.get("stable_words"),
-                    "covered_s": field("covered_s"),
-                    "audio_s": field("audio_s"),
-                }),
-            ),
-            Some("final") => {
-                // The stop's own calls, with their audio spans, show
-                // whether the stop decoded only the tail.
-                let stop = field("stop");
-                let stop_t0 = stop
-                    .as_ref()
-                    .and_then(|stop| stop.get("t0_ms"))
-                    .and_then(Value::as_f64);
-                let stop_calls: Vec<Value> = field("calls")
-                    .and_then(|calls| calls.as_array().cloned())
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter(|call| {
-                        let t0 = call.get("t0_ms").and_then(Value::as_f64);
-                        matches!((t0, stop_t0), (Some(t0), Some(stop_t0)) if t0 >= stop_t0)
-                    })
-                    .collect();
-                self.log(
-                    "final",
-                    json!({
-                        "words": words,
-                        "audio_s": field("audio_s"),
-                        "stop": stop,
-                        "stop_calls": stop_calls,
-                        "by_kind": field("by_kind"),
-                        "totals": field("totals"),
-                    }),
-                )
-            }
-            Some("error") => self.log("error", json!({ "message": payload.get("message") })),
-            _ => {}
-        }
-    }
-
-    /// A preview the UI applied.
-    pub(crate) fn displayed(&self, partial: &Partial) {
-        self.log(
-            "display",
-            json!({
-                "words": partial.text.split_ascii_whitespace().count(),
-                "covered_s": partial.covered_s,
-            }),
-        );
     }
 }
 
@@ -941,6 +682,7 @@ mod tests {
             replay: None,
             partials,
             degraded: watch::channel(None).0,
+            on_update: None,
             trace: None,
             stop: Arc::new(AtomicBool::new(false)),
         };
@@ -967,6 +709,7 @@ mod tests {
             16_000,
             stream.clone(),
             Box::new(|| Err("unused".into())),
+            None,
             None,
         )
         .expect("the worker starts");
@@ -1076,6 +819,7 @@ mod tests {
             16_000,
             stream.clone(),
             Box::new(|| Err("unused".into())),
+            None,
             None,
         )
         .expect("the worker starts");
@@ -1256,92 +1000,6 @@ mod tests {
         core.step(deadline);
         assert_eq!(shown(&mut previews).as_deref(), Some("one two"));
         assert!(core.replay.is_none());
-    }
-
-    #[test]
-    fn a_stalled_trace_sink_drops_lines_instead_of_blocking() {
-        /// A sink that blocks every write until the gate opens, and keeps
-        /// what it was given.
-        struct Gated(Arc<(Mutex<bool>, std::sync::Condvar)>, Arc<Mutex<Vec<u8>>>);
-        impl Write for Gated {
-            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                let (open, opened) = &*self.0;
-                let mut open = open.lock().unwrap();
-                while !*open {
-                    open = opened.wait(open).unwrap();
-                }
-                self.1.lock().unwrap().extend_from_slice(bytes);
-                Ok(bytes.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        /// Opens the gate when dropped, so a failing assertion cannot
-        /// leave the writer blocked.
-        struct Opens(Arc<(Mutex<bool>, std::sync::Condvar)>);
-        impl Drop for Opens {
-            fn drop(&mut self) {
-                *self.0.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
-                self.0.1.notify_all();
-            }
-        }
-        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
-        let opens = Opens(Arc::clone(&gate));
-        let written = Arc::new(Mutex::new(Vec::new()));
-        let trace = Arc::new(
-            StreamTrace::writing_to(
-                "test".into(),
-                Box::new(Gated(Arc::clone(&gate), Arc::clone(&written))),
-                4,
-            )
-            .unwrap(),
-        );
-        // With the sink stalled, 100 lines are logged without waiting on
-        // it (a blocking log would never finish while the gate is shut).
-        let (done, finished) = std::sync::mpsc::channel();
-        {
-            let trace = Arc::clone(&trace);
-            std::thread::spawn(move || {
-                for line in 0..100 {
-                    trace.log("display", json!({ "line": line }));
-                }
-                let _ = done.send(());
-            });
-        }
-        assert!(
-            finished.recv_timeout(Duration::from_secs(10)).is_ok(),
-            "logging waited on the sink"
-        );
-        drop(opens);
-        // The queue may still be full for a moment: a stop that is dropped
-        // too is counted on the next one.
-        let mut logged = 100;
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            trace.log("stop", json!({}));
-            logged += 1;
-            if trace.dropped.load(Ordering::Relaxed) == 0 {
-                break;
-            }
-            assert!(Instant::now() < deadline, "the writer never drained");
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        drop(trace);
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !String::from_utf8_lossy(&written.lock().unwrap()).contains("\"stop\"")
-            && Instant::now() < deadline
-        {
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        let text = String::from_utf8(written.lock().unwrap().clone()).unwrap();
-        let lines: Vec<Value> = text.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
-        let stop = lines.last().unwrap();
-        assert_eq!(stop["ev"], "stop");
-        // Every line is either written or counted on a later one.
-        let dropped: u64 = lines.iter().filter_map(|line| line["dropped"].as_u64()).sum();
-        assert!(dropped > 0);
-        assert_eq!(lines.len() as u64 + dropped, logged);
     }
 
     #[test]

@@ -89,13 +89,14 @@ impl TransportErrorCode {
 /// - client → host: [`Frame::Command`], [`Frame::GetSnapshot`],
 ///   [`Frame::AgentHello`], [`Frame::AskUser`], [`Frame::AskCancel`],
 ///   [`Frame::PromptAck`], [`Frame::PromptDone`], [`Frame::TakeWatch`],
-///   [`Frame::TakeTap`], [`Frame::TakeHandled`]
+///   [`Frame::TakeTap`], [`Frame::TakeAdopt`],
+///   [`Frame::Transcribe`], [`Frame::TranscribeDue`]
 /// - host → client: [`Frame::Hello`], [`Frame::Receipt`], [`Frame::Event`],
 ///   [`Frame::Snapshot`], [`Frame::TransportError`], [`Frame::Bye`],
 ///   [`Frame::AgentWelcome`], [`Frame::AskResult`], [`Frame::ShowPrompt`],
 ///   [`Frame::HidePrompt`], [`Frame::TakeWatching`], [`Frame::LiveTake`],
 ///   [`Frame::TakeStartFailed`], [`Frame::TakePersisted`],
-///   [`Frame::HostNotice`]
+///   [`Frame::HostNotice`], [`Frame::LiveText`], [`Frame::Transcription`]
 ///
 /// The take frames (#220) are host-level like the ask frames: the app's
 /// projection of the take the host records (see [`crate::takes`]).
@@ -208,17 +209,6 @@ pub enum Frame {
     /// Stream `take`'s audio to this connection from sample `from` on,
     /// through the take's end (a reconnecting app replays from 0).
     TakeTap { take: String, from: u64 },
-    /// The app handled the stored take `stored_id` it was handed (a
-    /// [`Frame::TakePersisted`] it had to transcribe): the host stops
-    /// offering it. Until then the take stays the host's to hand out — to
-    /// the next app if this one goes away first. `handed_back`: the app
-    /// could not transcribe it (no store, unreadable audio); the host
-    /// hands it to another app instead.
-    TakeHandled {
-        stored_id: String,
-        #[serde(default)]
-        handed_back: bool,
-    },
     /// One tick of a take the host records: its health while it records,
     /// audio for a tapping connection, who owns the take as this
     /// connection sees it, and `ended` — the take's final sample
@@ -234,6 +224,10 @@ pub enum Frame {
         ended: Option<u64>,
         #[serde(default)]
         kept: bool,
+        /// The take's newest samples, for the owner's level meter
+        /// ([`METER_SAMPLES`] of them; on status ticks to the owner only).
+        #[serde(default)]
+        meter: Option<TakeAudio>,
     },
     /// A `capture.start` could not open the microphone: the input
     /// problem, when the host could classify it, and what to show.
@@ -244,8 +238,8 @@ pub enum Frame {
     },
     /// A take's persist finished. `stored_id` is the history row;
     /// `orphan` marks a take that ended with no app following it (the
-    /// host stopped it, or its app was gone): the one app it is sent to
-    /// transcribes it.
+    /// host stopped it, or its app was gone). The host transcribes a
+    /// complete take itself ([`Frame::Transcription`] follows).
     TakePersisted {
         take: String,
         stored_id: Option<String>,
@@ -256,7 +250,100 @@ pub enum Frame {
     /// Something the host's recovery found after the app started
     /// watching (a journal it looked at again later).
     HostNotice { recovery: HostRecovery },
+    /// The app taking on a running take whose owner is gone, without its
+    /// audio: what [`Frame::TakeTap`] does for ownership. The take's
+    /// latest live text follows.
+    TakeAdopt { take: String },
+    /// The app asking the host to transcribe stored take `stored_id`
+    /// again (a retry) or for the first time (an import), with `with`.
+    /// A new result beside the earlier ones; answered by
+    /// [`Frame::Transcription`] frames carrying `req`.
+    Transcribe {
+        req: String,
+        stored_id: String,
+        with: TranscribeWith,
+    },
+    /// The app asking the host to run the transcription stored take
+    /// `stored_id` is waiting for (an import it just stored with its
+    /// intent): queued now rather than at the next look, and never a
+    /// second result — if it ran already, nothing happens.
+    TranscribeDue { stored_id: String },
+    /// Live text of a recording take, as the host's stream has it: the
+    /// newest preview (`partial`), or why live text stopped for the rest
+    /// of the take (`degraded`).
+    LiveText {
+        take: String,
+        partial: Option<LivePartial>,
+        degraded: Option<String>,
+    },
+    /// Where the host's transcription of stored take `stored_id` stands.
+    /// `take` names the recorded take it came from (when it came from one
+    /// this host recorded), `req` the [`Frame::Transcribe`] that asked for
+    /// it. `yours`: this connection is the one to act on the result — the
+    /// take's owner, the requester, or for a take nobody owns any more one
+    /// watching app — everyone else only shows it.
+    Transcription {
+        stored_id: String,
+        take: Option<String>,
+        req: Option<String>,
+        attempt: Option<String>,
+        state: TranscriptionState,
+        yours: bool,
+    },
 }
+
+/// What a [`Frame::Transcribe`] transcribes with.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TranscribeWith {
+    /// Whatever the host transcribes with now.
+    Current,
+    /// An installed built-in model: the host waits for its engine to
+    /// serve it (the app switches the engine to it first).
+    Model { model_id: String },
+    /// The user's own server.
+    Server { endpoint: String, model: String },
+}
+
+/// One live preview: the whole running transcript, how many of its
+/// leading words the server will not change, and where the audio it
+/// reflects ends (seconds into the take; traced connections only).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LivePartial {
+    pub text: String,
+    pub stable_words: usize,
+    pub covered_s: Option<f64>,
+}
+
+/// A transcription's progress ([`Frame::Transcription`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TranscriptionState {
+    /// The attempt started on `backend` (`engine:<model>`,
+    /// `openai:<model>`): the take's audio is held from here on.
+    Started { backend: String },
+    /// Transcribed. `kept_earlier`: the result was blank, and the take
+    /// keeps showing the words an earlier result had.
+    Completed { text: String, kept_earlier: bool },
+    /// The attempt failed and history records it. `transport`: the server
+    /// could not be reached (a manual server is worth probing again).
+    Failed { message: String, transport: bool },
+    /// Nothing was attempted; the take is unchanged.
+    Refused { message: String },
+    /// The take was deleted while it was being transcribed.
+    Gone,
+}
+
+impl TranscriptionState {
+    /// Whether this ends the transcription.
+    pub fn is_final(&self) -> bool {
+        !matches!(self, TranscriptionState::Started { .. })
+    }
+}
+
+/// How many of a recording take's newest samples a status tick carries
+/// for the owner's level meter.
+pub const METER_SAMPLES: usize = 1024;
 
 /// Who owns a take, as the receiving connection sees it: the connection
 /// whose `capture.start` opened it (or that adopted it after its owner
@@ -559,10 +646,6 @@ mod tests {
                 take: "take-1".into(),
                 from: 0,
             },
-            Frame::TakeHandled {
-                stored_id: "j_1".into(),
-                handed_back: false,
-            },
             Frame::LiveTake {
                 take: "take-1".into(),
                 rate: 48_000,
@@ -571,6 +654,7 @@ mod tests {
                 owner: TakeOwner::You,
                 ended: Some(5),
                 kept: true,
+                meter: Some(TakeAudio::encode(0, &[0.125])),
             },
             Frame::TakePersisted {
                 take: "take-1".into(),
@@ -578,6 +662,39 @@ mod tests {
                 interrupted: false,
                 error: None,
                 orphan: true,
+            },
+            Frame::TakeAdopt {
+                take: "take-1".into(),
+            },
+            Frame::Transcribe {
+                req: "r_1".into(),
+                stored_id: "j_1".into(),
+                with: TranscribeWith::Model {
+                    model_id: "parakeet".into(),
+                },
+            },
+            Frame::TranscribeDue {
+                stored_id: "j_1".into(),
+            },
+            Frame::LiveText {
+                take: "take-1".into(),
+                partial: Some(LivePartial {
+                    text: "hello there".into(),
+                    stable_words: 1,
+                    covered_s: Some(0.5),
+                }),
+                degraded: None,
+            },
+            Frame::Transcription {
+                stored_id: "j_1".into(),
+                take: Some("take-1".into()),
+                req: None,
+                attempt: Some("a_1".into()),
+                state: TranscriptionState::Completed {
+                    text: "hello".into(),
+                    kept_earlier: false,
+                },
+                yours: true,
             },
         ];
         for frame in frames {

@@ -4,19 +4,17 @@
 //! (`starling-runtime-host`, or this binary run as `--runtime-host`), not
 //! by the app: the host holds the store lease and the recorder's journal
 //! tree, so killing the app never costs a take and a second app window
-//! is just another client. The app keeps what needs its window — the
-//! activation machine, the live view, staging, delivery — and the
-//! transcription of its takes for now.
+//! is just another client. The host also transcribes the takes it
+//! stores: live text while a take records, the transcript once it is
+//! stored, the retries the app asks for. The app keeps what needs its
+//! window — the activation machine, the live view, staging, delivery.
 //!
 //! [`HostLink`] owns the connection on its own thread: it connects to the
 //! host serving the default data root, starts one when nothing serves
 //! (this executable, detached, idle-exiting), follows the take feed and
 //! reconnects — starting the host again if it is gone — whenever the
-//! connection drops. The UI hears about it through [`HostUpdate`]s; take
-//! audio skips the UI and lands in the take's [`TakeFeed`], which the
-//! live stream drains on its own worker.
+//! connection drops. The UI hears about it through [`HostUpdate`]s.
 
-use std::collections::HashMap;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -29,10 +27,10 @@ use starling_dictation::recorder::RecorderFault;
 use starling_runtime::machine::capture::LiveTakeStatus;
 use starling_runtime::protocol::Command;
 use starling_runtime_host::client::{EventWire, HostClient, TakeWire};
-use starling_runtime_host::frame::{HostRecovery, TakeOwner};
+use starling_runtime_host::frame::{
+    HostRecovery, LivePartial, TakeOwner, TranscribeWith, TranscriptionState,
+};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
-
-use crate::stream_pump::AudioTap;
 
 /// How long a host this app started stays up with nothing to do.
 const HOST_IDLE_EXIT: Duration = Duration::from_secs(60);
@@ -68,9 +66,15 @@ pub(crate) enum HostUpdate {
     /// The connection is gone (or never came up); the link is retrying.
     /// `gave_up`: starting the recording service failed
     /// [`LAUNCH_ATTEMPTS`] times in a row, and the link no longer starts
-    /// it until [`HostLink::retry`].
-    Disconnected { reason: String, gave_up: bool },
-    /// A take-feed frame, its audio already in the take's feed.
+    /// it until [`HostLink::retry`]. `host_gone`: the service itself
+    /// stopped (it took any take it was recording with it), not just the
+    /// connection to it.
+    Disconnected {
+        reason: String,
+        gave_up: bool,
+        host_gone: bool,
+    },
+    /// A take-feed frame.
     Take(TakeUpdate),
     /// A runtime event the UI acts on (`capture.error`).
     Event(EventWire),
@@ -93,6 +97,9 @@ pub(crate) enum TakeUpdate {
         ended: Option<u64>,
         /// With `ended`: a [`TakeUpdate::Persisted`] follows.
         kept: bool,
+        /// The take's newest samples, for this window's level meter (on
+        /// the owner's status ticks).
+        meter: Option<Vec<f32>>,
     },
     StartFailed {
         take: String,
@@ -107,6 +114,22 @@ pub(crate) enum TakeUpdate {
         orphan: bool,
     },
     Notice(HostRecovery),
+    /// A recording take's live text, or why it stopped.
+    LiveText {
+        take: String,
+        partial: Option<LivePartial>,
+        degraded: Option<String>,
+    },
+    /// Where a stored take's transcription stands (see
+    /// [`starling_runtime_host::frame::Frame::Transcription`]).
+    Transcription {
+        stored_id: String,
+        take: Option<String>,
+        req: Option<String>,
+        attempt: Option<String>,
+        state: TranscriptionState,
+        yours: bool,
+    },
 }
 
 /// How the link reaches a host when none serves.
@@ -122,7 +145,6 @@ pub(crate) enum Launch {
 /// one that sends the app's commands — in the order the app issued them,
 /// so a take's stop or abort can never overtake its start.
 pub(crate) struct HostLink {
-    feeds: Arc<Mutex<HashMap<String, Arc<TakeFeed>>>>,
     commands: std::sync::mpsc::Sender<Outgoing>,
     stop: Arc<AtomicBool>,
     relaunch: Arc<AtomicBool>,
@@ -130,8 +152,13 @@ pub(crate) struct HostLink {
 
 enum Outgoing {
     Command { take: String, command: Command },
-    Tap { take: String, from: u64 },
-    Handled { stored_id: String, handed_back: bool },
+    Adopt { take: String },
+    Transcribe {
+        req: String,
+        stored_id: String,
+        with: TranscribeWith,
+    },
+    TranscribeDue { stored_id: String },
 }
 
 impl HostLink {
@@ -142,7 +169,6 @@ impl HostLink {
         launch: Launch,
     ) -> (HostLink, UnboundedReceiver<HostUpdate>) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let feeds: Arc<Mutex<HashMap<String, Arc<TakeFeed>>>> = Arc::default();
         let stop = Arc::new(AtomicBool::new(false));
         let relaunch = Arc::new(AtomicBool::new(false));
         let current: Arc<Mutex<Option<Arc<HostClient>>>> = Arc::default();
@@ -150,12 +176,11 @@ impl HostLink {
         let spawned = std::thread::Builder::new()
             .name("starling-host-link".to_string())
             .spawn({
-                let feeds = Arc::clone(&feeds);
                 let stop = Arc::clone(&stop);
                 let relaunch = Arc::clone(&relaunch);
                 let current = Arc::clone(&current);
                 let tx = tx.clone();
-                move || link_loop(endpoint, launch, feeds, current, stop, relaunch, tx)
+                move || link_loop(endpoint, launch, current, stop, relaunch, tx)
             })
             .and_then(|_| {
                 std::thread::Builder::new()
@@ -169,11 +194,11 @@ impl HostLink {
             let _ = tx.send(HostUpdate::Disconnected {
                 reason: format!("the connection thread could not start: {err}"),
                 gave_up: true,
+                host_gone: false,
             });
         }
         (
             HostLink {
-                feeds,
                 commands,
                 stop,
                 relaunch,
@@ -190,30 +215,29 @@ impl HostLink {
         });
     }
 
-    /// Asks for `take`'s audio from sample `from` on, into its feed.
-    pub(crate) fn tap(&self, take: &str, from: u64) {
-        let _ = self.commands.send(Outgoing::Tap {
+    /// Takes on running take `take`, whose window is gone (see
+    /// [`starling_runtime_host::frame::Frame::TakeAdopt`]).
+    pub(crate) fn adopt(&self, take: &str) {
+        let _ = self.commands.send(Outgoing::Adopt {
             take: take.to_string(),
-            from,
         });
     }
 
-    /// Tells the host the stored take `stored_id` it handed this app is
-    /// handled (transcribed, or its failure recorded): until then the
-    /// host keeps it for whichever app comes next.
-    pub(crate) fn handled(&self, stored_id: &str) {
-        let _ = self.commands.send(Outgoing::Handled {
+    /// Asks the host to transcribe stored take `stored_id` with `with`;
+    /// [`TakeUpdate::Transcription`]s carrying `req` follow.
+    pub(crate) fn transcribe(&self, req: &str, stored_id: &str, with: TranscribeWith) {
+        let _ = self.commands.send(Outgoing::Transcribe {
+            req: req.to_string(),
             stored_id: stored_id.to_string(),
-            handed_back: false,
+            with,
         });
     }
 
-    /// Hands the stored take `stored_id` back to the host: this app
-    /// cannot transcribe it, so the host gives it to another.
-    pub(crate) fn handed_back(&self, stored_id: &str) {
-        let _ = self.commands.send(Outgoing::Handled {
+    /// Asks the host to run the transcription stored take `stored_id`
+    /// waits for (an import stored with its intent).
+    pub(crate) fn transcribe_due(&self, stored_id: &str) {
+        let _ = self.commands.send(Outgoing::TranscribeDue {
             stored_id: stored_id.to_string(),
-            handed_back: true,
         });
     }
 
@@ -222,19 +246,6 @@ impl HostLink {
         self.relaunch.store(true, Ordering::SeqCst);
     }
 
-    /// The feed `take`'s audio lands in from now on (one per take).
-    pub(crate) fn feed(&self, take: &str) -> Arc<TakeFeed> {
-        Arc::clone(
-            lock(&self.feeds)
-                .entry(take.to_string())
-                .or_insert_with(|| Arc::new(TakeFeed::default())),
-        )
-    }
-
-    /// Stops routing audio to `take`'s feed.
-    pub(crate) fn forget(&self, take: &str) {
-        lock(&self.feeds).remove(take);
-    }
 }
 
 impl Drop for HostLink {
@@ -275,22 +286,18 @@ fn command_loop(
                     }
                 }
             }
-            // A tap that does not go out costs the take's live audio
-            // here (live text, levels), never the take: the host records
-            // and stores it either way, a take this window does not tap
-            // still gets its end and stored row, and a finished take is
-            // transcribed from the stored audio when the feed is not
-            // whole. The UI hears about it so it can tap again.
-            Outgoing::Tap { take, from } => {
+            // An adoption that does not go out leaves the take with
+            // nobody here: the UI hears so and asks again.
+            Outgoing::Adopt { take } => {
                 let result = match client {
-                    Some(client) => client.take_tap(&take, from).map_err(|err| err.to_string()),
+                    Some(client) => client.take_adopt(&take).map_err(|err| err.to_string()),
                     None => Err("not connected to the recording service".to_string()),
                 };
                 if let Err(reason) = result {
                     if tx
                         .send(HostUpdate::Refused {
                             take,
-                            command: "take.tap",
+                            command: "take.adopt",
                             reason,
                         })
                         .is_err()
@@ -299,19 +306,35 @@ fn command_loop(
                     }
                 }
             }
-            // An ack that does not go out leaves the take with the host,
-            // which hands it to the next connection: at worst it is
-            // transcribed once more, never lost.
-            Outgoing::Handled {
-                stored_id,
-                handed_back,
-            } => {
+            // Not sent, the take still waits in the store: the host finds
+            // it at its next look.
+            Outgoing::TranscribeDue { stored_id } => {
                 if let Some(client) = client {
-                    let _ = if handed_back {
-                        client.take_handed_back(&stored_id)
-                    } else {
-                        client.take_handled(&stored_id)
-                    };
+                    let _ = client.transcribe_due(&stored_id);
+                }
+            }
+            Outgoing::Transcribe {
+                req,
+                stored_id,
+                with,
+            } => {
+                let result = match client {
+                    Some(client) => client
+                        .transcribe(&req, &stored_id, with)
+                        .map_err(|err| err.to_string()),
+                    None => Err("not connected to the recording service".to_string()),
+                };
+                if let Err(reason) = result {
+                    if tx
+                        .send(HostUpdate::Refused {
+                            take: req,
+                            command: "transcribe",
+                            reason,
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
                 }
             }
         }
@@ -331,7 +354,6 @@ fn command_name(command: &Command) -> &'static str {
 fn link_loop(
     endpoint: PathBuf,
     launch: Launch,
-    feeds: Arc<Mutex<HashMap<String, Arc<TakeFeed>>>>,
     current: Arc<Mutex<Option<Arc<HostClient>>>>,
     stop: Arc<AtomicBool>,
     relaunch: Arc<AtomicBool>,
@@ -374,6 +396,7 @@ fn link_loop(
                         .send(HostUpdate::Disconnected {
                             reason: said.0.clone(),
                             gave_up,
+                            host_gone: false,
                         })
                         .is_err()
                     {
@@ -399,24 +422,42 @@ fn link_loop(
         {
             return;
         }
-        let reason = follow(&client, &feeds, &stop, &tx);
+        let reason = follow(&client, &stop, &tx);
         *lock(&current) = None;
-        // Feeds belong to the connection that tapped them: a reconnect
-        // re-adopts the take and taps it again from its start.
-        lock(&feeds).clear();
         if stop.load(Ordering::SeqCst) {
             return;
         }
+        // The connection, or the service itself? A service that went away
+        // took any take it was recording with it. A killed host this app
+        // started reads alive until its reaper collected it: give it a
+        // moment.
+        let host_gone = host_exited(client.info.pid);
         eprintln!("Starling: the recording service connection ended: {reason}");
         if tx
             .send(HostUpdate::Disconnected {
                 reason,
                 gave_up: false,
+                host_gone,
             })
             .is_err()
         {
             return;
         }
+    }
+}
+
+/// Whether host process `pid` is gone, allowing up to a second for an
+/// exiting one to be reaped.
+fn host_exited(pid: u32) -> bool {
+    let until = Instant::now() + Duration::from_secs(1);
+    loop {
+        if !starling_dictation::engine::registry::process_alive(pid) {
+            return true;
+        }
+        if Instant::now() >= until {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -434,12 +475,7 @@ fn sleep_unless(stop: &AtomicBool, relaunch: &AtomicBool, duration: Duration) {
 
 /// Routes the connection's take feed and events until it closes; returns
 /// why it closed.
-fn follow(
-    client: &HostClient,
-    feeds: &Mutex<HashMap<String, Arc<TakeFeed>>>,
-    stop: &AtomicBool,
-    tx: &UnboundedSender<HostUpdate>,
-) -> String {
+fn follow(client: &HostClient, stop: &AtomicBool, tx: &UnboundedSender<HostUpdate>) -> String {
     loop {
         if stop.load(Ordering::SeqCst) {
             return "the app is closing".to_string();
@@ -451,10 +487,9 @@ fn follow(
                 return "the app is closing".to_string();
             }
         }
-        match client.recv_take_timeout(Duration::from_millis(20)) {
+        match client.recv_take_timeout(Duration::from_millis(100)) {
             Ok(frame) => {
-                let update = route(frame, feeds, client);
-                if tx.send(HostUpdate::Take(update)).is_err() {
+                if tx.send(HostUpdate::Take(route(frame))).is_err() {
                     return "the app is closing".to_string();
                 }
             }
@@ -467,46 +502,27 @@ fn follow(
     }
 }
 
-/// Puts a frame's audio into its take's feed and hands back the rest.
-/// A feed that finds a gap in its audio asks the host for the take again
-/// from where it breaks off (the host reads it from the recorder, or the
-/// finished take's record).
-fn route(
-    frame: TakeWire,
-    feeds: &Mutex<HashMap<String, Arc<TakeFeed>>>,
-    client: &HostClient,
-) -> TakeUpdate {
+/// A take-feed frame as the UI reads it.
+fn route(frame: TakeWire) -> TakeUpdate {
     match frame {
         TakeWire::Live {
             take,
             rate,
             status,
-            audio,
             owner,
             ended,
             kept,
-        } => {
-            let feed = lock(feeds).get(&take).cloned();
-            if let Some(feed) = feed {
-                if let Some(from) = feed.receive(rate, status.as_ref(), audio, ended) {
-                    eprintln!(
-                        "Starling: take {take}'s audio has a gap at sample {from}; asking the \
-                         recording service for it again"
-                    );
-                    if let Err(err) = client.take_tap(&take, from) {
-                        eprintln!("Starling: could not ask for take {take}'s audio again: {err}");
-                    }
-                }
-            }
-            TakeUpdate::Live {
-                take,
-                rate,
-                status,
-                owner,
-                ended,
-                kept,
-            }
-        }
+            meter,
+            ..
+        } => TakeUpdate::Live {
+            take,
+            rate,
+            status,
+            owner,
+            ended,
+            kept,
+            meter,
+        },
         TakeWire::StartFailed {
             take,
             problem,
@@ -530,6 +546,30 @@ fn route(
             orphan,
         },
         TakeWire::Notice(recovery) => TakeUpdate::Notice(recovery),
+        TakeWire::LiveText {
+            take,
+            partial,
+            degraded,
+        } => TakeUpdate::LiveText {
+            take,
+            partial,
+            degraded,
+        },
+        TakeWire::Transcription {
+            stored_id,
+            take,
+            req,
+            attempt,
+            state,
+            yours,
+        } => TakeUpdate::Transcription {
+            stored_id,
+            take,
+            req,
+            attempt,
+            state,
+            yours,
+        },
     }
 }
 
@@ -585,10 +625,9 @@ fn launch_self(log: &Path) -> Result<(), String> {
     let mut command = std::process::Command::new(exe);
     command
         .arg("--runtime-host")
-        // The app transcribes its own takes for now (#220 later work
-        // moves jobs into the host): the host runs no engine of its own,
-        // so the app's engine stays the only one.
-        .args(["--engine", "none"])
+        // The host transcribes the takes it stores, on the engine the
+        // settings choose: the bundled engine is shared with this app
+        // through the engine registry (one sidecar, whoever started it).
         .arg("--exit-when-idle")
         .arg(HOST_IDLE_EXIT.as_secs().to_string());
     start_host(command, log)
@@ -667,157 +706,36 @@ fn start_host(mut command: std::process::Command, log: &Path) -> Result<(), Stri
 // The take as the app sees it
 // --------------------------------------------------------------------- //
 
-/// A take's audio as it arrives from the host, for the live stream (an
-/// [`AudioTap`]) and the level meter. The host sends the take in order,
-/// each sample once; the end says how many there were.
-#[derive(Default)]
-pub(crate) struct TakeFeed {
-    state: Mutex<FeedState>,
-}
-
-#[derive(Default)]
-struct FeedState {
-    samples: Vec<f32>,
-    /// Where a gap was found and the take asked for again from: asked
-    /// once per position, not once per chunk past it.
-    resync_from: Option<usize>,
-    /// What [`AudioTap::drain`] handed out.
-    drained: usize,
-    /// The journal-durable count from the latest tick.
-    acknowledged: u64,
-    rate: u32,
-    /// The take's final sample count, once its last sample arrived.
-    ended: Option<u64>,
-}
-
-impl TakeFeed {
-    /// Takes one frame's audio; `Some(from)` when it found a gap the take
-    /// should be tapped again from. Audio is only ever spliced where it
-    /// belongs: a repeat (a re-tap replaying what is here) adds only what
-    /// is new, and audio past a gap waits for the gap to be filled. A
-    /// feed with a gap is never [`TakeFeed::complete`], so a finished
-    /// take is then transcribed from the stored audio, not from this.
-    fn receive(
-        &self,
-        rate: u32,
-        status: Option<&LiveTakeStatus>,
-        audio: Option<(u64, Vec<f32>)>,
-        ended: Option<u64>,
-    ) -> Option<u64> {
-        let mut state = lock(&self.state);
-        if rate > 0 {
-            state.rate = rate;
-        }
-        if let Some(status) = status {
-            state.acknowledged = state.acknowledged.max(status.acknowledged);
-        }
-        let mut resync = None;
-        if let Some((start, chunk)) = audio {
-            let start = start as usize;
-            let have = state.samples.len();
-            if start <= have {
-                let new = chunk.get(have - start..).unwrap_or_default();
-                state.samples.extend_from_slice(new);
-                state.resync_from = None;
-            } else if state.resync_from != Some(have) {
-                state.resync_from = Some(have);
-                resync = Some(have as u64);
-            }
-        }
-        if let Some(total) = ended {
-            state.ended = Some(total);
-        }
-        resync
-    }
-
-    /// Whether the feed is short of the take: it ended with fewer samples
-    /// than the take has.
-    pub(crate) fn short_of(&self) -> Option<(usize, u64)> {
-        let state = lock(&self.state);
-        state
-            .ended
-            .filter(|total| (state.samples.len() as u64) < *total)
-            .map(|total| (state.samples.len(), total))
-    }
-
-    /// Whether the take's last sample is here.
-    pub(crate) fn complete(&self) -> bool {
-        let state = lock(&self.state);
-        state
-            .ended
-            .is_some_and(|total| state.samples.len() as u64 >= total)
-    }
-
-    pub(crate) fn sample_rate(&self) -> u32 {
-        lock(&self.state).rate
-    }
-
-    pub(crate) fn len(&self) -> usize {
-        lock(&self.state).samples.len()
-    }
-
-    /// The samples from `from` on.
-    pub(crate) fn samples_from(&self, from: usize) -> Vec<f32> {
-        let state = lock(&self.state);
-        state.samples.get(from..).map(<[f32]>::to_vec).unwrap_or_default()
-    }
-
-    /// The newest `n` samples, for the level meter.
-    pub(crate) fn latest_window(&self, n: usize) -> Vec<f32> {
-        let state = lock(&self.state);
-        let start = state.samples.len().saturating_sub(n);
-        state.samples[start..].to_vec()
-    }
-}
-
-impl AudioTap for Arc<TakeFeed> {
-    fn drain(&self) -> Vec<f32> {
-        let mut state = lock(&self.state);
-        let drained = state.samples[state.drained..].to_vec();
-        state.drained = state.samples.len();
-        drained
-    }
-
-    fn acknowledged(&self) -> u64 {
-        let state = lock(&self.state);
-        if state.ended.is_some() {
-            // A finished take's audio is the stored take.
-            state.samples.len() as u64
-        } else {
-            state.acknowledged
-        }
-    }
-}
-
-/// The take the host records for this app, as the UI reads it: what the
-/// app's recorder handle used to answer, from the host's status ticks
-/// and the take's feed.
+/// The take the recording service records for this window, as the UI
+/// reads it: what the app's recorder handle used to answer, from the
+/// host's status ticks.
 pub(crate) struct LiveCapture {
     /// The take's id on the wire (`capture.start`'s corr).
     pub take: String,
-    pub feed: Arc<TakeFeed>,
     pub status: Option<LiveTakeStatus>,
     /// Whether the host has confirmed the take is recording.
     pub confirmed: bool,
-    /// Whether this window asked for the take's audio.
-    pub tapped: bool,
+    /// The device rate, from the host's first tick.
+    pub rate: u32,
+    /// The take's newest samples, for the level meter.
+    pub meter: Vec<f32>,
     started_at: Instant,
 }
 
 impl LiveCapture {
-    pub(crate) fn new(take: String, feed: Arc<TakeFeed>) -> LiveCapture {
+    pub(crate) fn new(take: String) -> LiveCapture {
         LiveCapture {
             take,
-            feed,
             status: None,
             confirmed: false,
-            tapped: false,
+            rate: 0,
+            meter: Vec::new(),
             started_at: Instant::now(),
         }
     }
 
     pub(crate) fn sample_rate(&self) -> u32 {
-        self.feed.sample_rate()
+        self.rate
     }
 
     pub(crate) fn captured_sample_count(&self) -> u64 {
@@ -825,11 +743,12 @@ impl LiveCapture {
             .as_ref()
             .map(|status| status.captured)
             .unwrap_or(0)
-            .max(self.feed.len() as u64)
     }
 
+    /// The newest `n` samples, for the level meter.
     pub(crate) fn latest_window(&self, n: usize) -> Vec<f32> {
-        self.feed.latest_window(n)
+        let start = self.meter.len().saturating_sub(n);
+        self.meter[start..].to_vec()
     }
 
     pub(crate) fn source_clip_ratio(&self) -> f64 {
@@ -938,68 +857,5 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn a_gap_is_asked_for_once_however_much_audio_arrives_past_it() {
-        let feed = Arc::new(TakeFeed::default());
-        feed.receive(16_000, None, Some((0, vec![0.1; 4])), None);
-        assert_eq!(feed.receive(16_000, None, Some((8, vec![0.2; 4])), None), Some(4));
-        for start in (12..400).step_by(4) {
-            assert_eq!(
-                feed.receive(16_000, None, Some((start, vec![0.2; 4])), None),
-                None,
-                "asked again at {start}"
-            );
-        }
-        // The replay from the gap fills it; a later gap is asked for once.
-        assert_eq!(feed.receive(16_000, None, Some((4, vec![0.3; 8])), None), None);
-        assert_eq!(feed.samples_from(0).len(), 12);
-        assert_eq!(feed.receive(16_000, None, Some((20, vec![0.4; 4])), None), Some(12));
-        assert_eq!(feed.receive(16_000, None, Some((24, vec![0.4; 4])), None), None);
-    }
-
-    #[test]
-    fn a_feed_takes_audio_in_order_once_and_knows_when_it_is_complete() {
-        let feed = Arc::new(TakeFeed::default());
-        assert_eq!(feed.receive(16_000, None, Some((0, vec![0.1, 0.2])), None), None);
-        // A repeat adds nothing; audio past a gap is not spliced in, and
-        // the gap is asked for again once.
-        assert_eq!(feed.receive(16_000, None, Some((0, vec![0.1, 0.2])), None), None);
-        assert_eq!(feed.receive(16_000, None, Some((5, vec![0.9])), None), Some(2));
-        assert_eq!(feed.receive(16_000, None, Some((6, vec![0.9])), None), None);
-        assert_eq!(feed.samples_from(0), vec![0.1, 0.2]);
-        assert_eq!(feed.drain(), vec![0.1, 0.2]);
-        feed.receive(16_000, None, Some((2, vec![0.3])), Some(3));
-        assert!(feed.complete());
-        assert_eq!(feed.drain(), vec![0.3], "drain hands out each sample once");
-        assert_eq!(feed.acknowledged(), 3, "a finished take is all acknowledged");
-        assert_eq!(feed.latest_window(2), vec![0.2, 0.3]);
-    }
-
-    #[test]
-    fn a_replay_that_overlaps_the_feed_adds_only_the_new_audio() {
-        let feed = Arc::new(TakeFeed::default());
-        feed.receive(16_000, None, Some((0, vec![0.1, 0.2])), None);
-        feed.receive(16_000, None, Some((1, vec![0.2, 0.3, 0.4])), None);
-        assert_eq!(feed.samples_from(0), vec![0.1, 0.2, 0.3, 0.4]);
-    }
-
-    #[test]
-    fn a_feed_with_a_gap_at_its_end_is_short_of_the_take() {
-        let feed = Arc::new(TakeFeed::default());
-        feed.receive(16_000, None, Some((0, vec![0.1])), None);
-        feed.receive(16_000, None, Some((3, vec![0.4])), Some(4));
-        assert!(!feed.complete());
-        assert_eq!(feed.short_of(), Some((1, 4)));
-    }
-
-    #[test]
-    fn a_feed_is_incomplete_until_its_last_sample_arrives() {
-        let feed = Arc::new(TakeFeed::default());
-        feed.receive(16_000, None, Some((0, vec![0.1])), Some(2));
-        assert!(!feed.complete());
-        feed.receive(16_000, None, Some((1, vec![0.2])), None);
-        assert!(feed.complete());
     }
 }

@@ -153,6 +153,8 @@ pub struct HostHandle {
     watch_stop: Arc<AtomicBool>,
     startup_reconciliation: ReconciliationReport,
     takes: Arc<crate::takes::TakeHub>,
+    /// The host's transcriber (`None` unless the config asks for it).
+    transcriber: Option<Arc<crate::transcribe::Transcriber>>,
     done: AtomicBool,
 }
 
@@ -177,7 +179,13 @@ impl HostHandle {
     /// connected, no take recording or being stored, no job queued or
     /// running.
     pub fn idle(&self) -> bool {
-        if self.shared.live_connections.load(Ordering::SeqCst) > 0 || self.takes.busy() {
+        if self.shared.live_connections.load(Ordering::SeqCst) > 0
+            || self.takes.busy()
+            || self
+                .transcriber
+                .as_ref()
+                .is_some_and(|transcriber| transcriber.busy())
+        {
             return false;
         }
         let snapshot = self.shared.client.snapshot();
@@ -268,9 +276,7 @@ impl HostHandle {
         for (_, state) in &conn_threads {
             state.close();
         }
-        for (thread, _) in conn_threads {
-            let _ = thread.join();
-        }
+        let conn_states = join_conn_threads(conn_threads);
 
         let threads = self
             .threads
@@ -281,11 +287,34 @@ impl HostHandle {
         for thread in threads {
             let _ = thread.join();
         }
+        // A connection the accept thread admitted while the drain above
+        // ran (it stops at its next look at the flag) is closed and
+        // joined too, now that nothing admits another.
+        let late = lock_registry(&self.shared.conn_threads)
+            .drain(..)
+            .collect::<Vec<_>>();
+        for (_, state) in &late {
+            state.close();
+        }
+        let late_states = join_conn_threads(late);
+        // Joined: every connection's own handles are closed. Its state
+        // may outlive this host (the take feed, the transcriber and the
+        // broker name windows); its last transport handle must not —
+        // on Windows it would keep the pipe name bound for a successor.
+        for state in conn_states.iter().chain(&late_states) {
+            state.release_transport();
+        }
 
         // Connections are closed and the accept thread is down. Now stop
         // the machines, then release the lease and the endpoint.
         if let Some(runtime) = self.runtime.take() {
             runtime.shutdown();
+        }
+        // Transcriptions hold engine leases: they stop before the engine
+        // does (a take whose transcription was cut off stays due in the
+        // store for the next host).
+        if let Some(transcriber) = self.transcriber.take() {
+            transcriber.shutdown();
         }
         // Close work the transport still has in flight (Windows'
         // lingering pipe disconnects hold handles that keep the endpoint
@@ -349,6 +378,8 @@ pub struct HostShared {
     pub(crate) broker: Sender<BrokerMsg>,
     /// The app's take feed (see [`crate::takes`]).
     pub(crate) takes: Arc<crate::takes::TakeHub>,
+    /// The host's transcriber, when it transcribes.
+    transcriber: Option<crate::transcribe::TranscriberLink>,
     /// The lease-holding store: owner-side repairs run on it.
     lease: Arc<Mutex<StoreV2>>,
     agent_allowlist: Allowlist,
@@ -384,7 +415,12 @@ pub(crate) struct ConnState {
     app: AtomicBool,
     /// A handle to the connection for immediate shutdown of both
     /// directions (the reader owns the original; the writer a clone).
-    closer: Box<dyn TransportConn>,
+    /// Taken (closed) once the connection's threads are gone: the state
+    /// itself outlives the connection wherever a take or transcription
+    /// still names its window, and on Windows an open server handle —
+    /// even of a disconnected instance — keeps the pipe name bound, so
+    /// a successor would probe this host as a live foreign server.
+    closer: Mutex<Option<Box<dyn TransportConn>>>,
 }
 
 /// What connection readers hand to the agent broker, each with the
@@ -429,9 +465,35 @@ impl ConnState {
 
     /// Ends both directions immediately. For paths with nothing left to
     /// say (a slow consumer, a peer that is already gone).
-    fn close(&self) {
+    pub(crate) fn close(&self) {
         self.mark_closed();
-        let _ = self.closer.shutdown_both();
+        if let Some(closer) = lock_registry(&self.closer).as_ref() {
+            let _ = closer.shutdown_both();
+        }
+    }
+
+    /// Closes the connection's last host-side handle. Only once its
+    /// reader and writer have exited (they own the others): from then
+    /// on nothing is left to shut down, and an `Arc` of this state held
+    /// elsewhere pins no transport.
+    fn release_transport(&self) {
+        drop(lock_registry(&self.closer).take());
+    }
+
+    /// A connection with no transport, for the feed's unit tests: what
+    /// is delivered to it lands in the returned receiver.
+    #[cfg(test)]
+    pub(crate) fn for_test(capacity: usize) -> (Arc<ConnState>, Receiver<Frame>) {
+        let (outbound, inbound) = bounded(capacity);
+        let state = Arc::new(ConnState {
+            outbound,
+            closed: AtomicBool::new(false),
+            unregistered: AtomicBool::new(false),
+            agent: AtomicBool::new(false),
+            app: AtomicBool::new(true),
+            closer: Mutex::new(None),
+        });
+        (state, inbound)
     }
 
     /// How full this connection's outbound queue is: `(queued,
@@ -571,10 +633,7 @@ pub fn serve(config: HostConfig) -> Result<HostHandle, HostError> {
         &startup_reconciliation,
         reconcile_error,
     );
-    let takes = crate::takes::TakeHub::new(
-        config.orphan_grace,
-        Some(config.data_root.join(crate::takes::UNCLAIMED_FILE)),
-    );
+    let takes = crate::takes::TakeHub::new(config.orphan_grace);
     takes.set_recovery(startup_recovery.recovery);
 
     // 2. The endpoint.
@@ -633,6 +692,36 @@ pub fn serve(config: HostConfig) -> Result<HostHandle, HostError> {
         .runtime
         .with_capture_observer(Arc::clone(&takes) as Arc<dyn starling_runtime::machine::capture::CaptureObserver>);
     let engine = crate::engine::attach(config.engine, &mut runtime_config);
+    // The host transcribes its takes (#220): every take an app records is
+    // stored with the intent to transcribe it, in its own commit.
+    let transcriber = {
+        runtime_config
+            .capture_store
+            .transcribe_takes(Arc::new(|take: &starling_runtime::machine::capture::TakeRecord| {
+                !take.id.starts_with(crate::agent::ASK_PREFIX)
+            }));
+        match crate::transcribe::Transcriber::start(
+            crate::transcribe::TranscriberConfig {
+                data_root: config.data_root.clone(),
+                settings_path: config.settings_path.clone(),
+                engine: engine.clone(),
+                engine_wait: config.engine_wait,
+            },
+            Arc::clone(&takes),
+        ) {
+            Ok(transcriber) => {
+                takes.attach_transcriber(transcriber.link());
+                Some(Arc::new(transcriber))
+            }
+            Err(err) => {
+                eprintln!(
+                    "starling-runtime-host: the transcriber could not start ({err}); takes are \
+                     stored and transcribed at the next start"
+                );
+                None
+            }
+        }
+    };
     let (runtime, client) = starling_runtime::Runtime::start(runtime_config);
     takes.attach(client.clone());
     let events = client.subscribe();
@@ -651,6 +740,7 @@ pub fn serve(config: HostConfig) -> Result<HostHandle, HostError> {
         live_connections: AtomicUsize::new(0),
         broker: broker_tx,
         takes: Arc::clone(&takes),
+        transcriber: transcriber.as_ref().map(|transcriber| transcriber.link()),
         lease: Arc::clone(&lease),
         agent_allowlist,
         #[cfg(feature = "test-support")]
@@ -736,6 +826,7 @@ pub fn serve(config: HostConfig) -> Result<HostHandle, HostError> {
         watch_stop,
         startup_reconciliation,
         takes,
+        transcriber,
         done: AtomicBool::new(false),
     })
 }
@@ -819,7 +910,7 @@ fn accept_loop(
                     unregistered: AtomicBool::new(false),
                     agent: AtomicBool::new(false),
                     app: AtomicBool::new(shared.grants_app_role()),
-                    closer,
+                    closer: Mutex::new(Some(closer)),
                 });
 
                 // Spawn failures are survived, not fatal: a transient
@@ -866,7 +957,7 @@ fn accept_loop(
                 // clients (a crashlooping renderer reconnecting once a
                 // second must not grow it forever).
                 let mut threads = lock_registry(&shared.conn_threads);
-                threads.retain(|(thread, _)| !thread.is_finished());
+                reap_conn_threads(&mut threads);
                 threads.push((reader, Arc::clone(&state)));
                 threads.push((writer, Arc::clone(&state)));
             }
@@ -879,6 +970,32 @@ fn accept_loop(
             }
         }
     }
+}
+
+/// Drops the pairs whose threads exited, releasing the transport of
+/// every connection with no thread left (see
+/// [`ConnState::release_transport`]).
+fn reap_conn_threads(threads: &mut Vec<(JoinHandle<()>, Arc<ConnState>)>) {
+    let (finished, running): (Vec<_>, Vec<_>) = threads
+        .drain(..)
+        .partition(|(thread, _)| thread.is_finished());
+    for (_, state) in &finished {
+        if !running.iter().any(|(_, live)| Arc::ptr_eq(live, state)) {
+            state.release_transport();
+        }
+    }
+    *threads = running;
+}
+
+/// Joins connection threads, handing back their states.
+fn join_conn_threads(threads: Vec<(JoinHandle<()>, Arc<ConnState>)>) -> Vec<Arc<ConnState>> {
+    threads
+        .into_iter()
+        .map(|(thread, state)| {
+            let _ = thread.join();
+            state
+        })
+        .collect()
 }
 
 fn spawn_conn_thread(
@@ -1135,7 +1252,11 @@ fn connection_reader(
                     }
                     // The take feed is the app's; agents reach the
                     // microphone only through asks.
-                    Frame::TakeWatch { .. } | Frame::TakeTap { .. } | Frame::TakeHandled { .. }
+                    Frame::TakeWatch { .. }
+                    | Frame::TakeTap { .. }
+                    | Frame::TakeAdopt { .. }
+                    | Frame::Transcribe { .. }
+                    | Frame::TranscribeDue { .. }
                         if state.is_agent() =>
                     {
                         terminate(
@@ -1168,16 +1289,34 @@ fn connection_reader(
                     Frame::TakeTap { take, from } => {
                         shared.takes.tap(&state, take, from);
                     }
-                    Frame::TakeHandled {
-                        stored_id,
-                        handed_back,
-                    } => {
-                        if handed_back {
-                            shared.takes.handed_back(&state, &stored_id);
-                        } else {
-                            shared.takes.handled(&stored_id);
+                    Frame::TakeAdopt { take } => {
+                        shared.takes.adopt(&state, &take);
+                    }
+                    Frame::TranscribeDue { stored_id } => {
+                        if let Some(transcriber) = &shared.transcriber {
+                            transcriber.due(&state, stored_id);
                         }
                     }
+                    Frame::Transcribe {
+                        req,
+                        stored_id,
+                        with,
+                    } => match &shared.transcriber {
+                        Some(transcriber) => transcriber.request(&state, req, stored_id, with),
+                        None => {
+                            let _ = state.try_deliver(Frame::Transcription {
+                                stored_id,
+                                take: None,
+                                req: Some(req),
+                                attempt: None,
+                                state: crate::frame::TranscriptionState::Refused {
+                                    message: "This recording service does not transcribe."
+                                        .to_string(),
+                                },
+                                yours: true,
+                            });
+                        }
+                    },
                     Frame::GetSnapshot { req } => {
                         let snapshot = shared.client.snapshot();
                         let value = serde_json::to_value(&snapshot)
@@ -1212,7 +1351,9 @@ fn connection_reader(
                     | Frame::LiveTake { .. }
                     | Frame::TakeStartFailed { .. }
                     | Frame::TakePersisted { .. }
-                    | Frame::HostNotice { .. } => {
+                    | Frame::HostNotice { .. }
+                    | Frame::LiveText { .. }
+                    | Frame::Transcription { .. } => {
                         terminate(
                             &state,
                             TransportErrorCode::ProtocolViolation,
