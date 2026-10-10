@@ -489,6 +489,24 @@ impl HostClient {
         })
     }
 
+    /// Tells the host this app handled the stored take `stored_id` it
+    /// was handed (see [`Frame::TakeHandled`]).
+    pub fn take_handled(&self, stored_id: &str) -> Result<(), ClientError> {
+        self.send_unanswered(Frame::TakeHandled {
+            stored_id: stored_id.to_string(),
+            handed_back: false,
+        })
+    }
+
+    /// Hands the stored take `stored_id` back: this app cannot
+    /// transcribe it, another should.
+    pub fn take_handed_back(&self, stored_id: &str) -> Result<(), ClientError> {
+        self.send_unanswered(Frame::TakeHandled {
+            stored_id: stored_id.to_string(),
+            handed_back: true,
+        })
+    }
+
     pub fn recv_take_timeout(&self, timeout: Duration) -> Result<TakeWire, RecvError> {
         self.takes.recv_timeout(timeout)
     }
@@ -781,7 +799,8 @@ fn client_reader(
                 | Frame::GetSnapshot { .. }
                 | Frame::AgentHello { .. }
                 | Frame::TakeWatch { .. }
-                | Frame::TakeTap { .. },
+                | Frame::TakeTap { .. }
+                | Frame::TakeHandled { .. },
             ) => {
                 fail("host sent a client frame".to_string());
                 break;

@@ -318,12 +318,11 @@ fn of_two_windows_adopting_an_unowned_take_only_the_first_tap_gets_it() {
     let tick = until_take(&second, "the unowned take", &mut seen, is_live_tick("take-race"));
     assert!(matches!(tick, TakeWire::Live { owner: TakeOwner::Nobody, .. }), "{tick:?}");
     first.take_tap("take-race", 0).unwrap();
-    std::thread::sleep(Duration::from_millis(100));
-    second.take_tap("take-race", 0).unwrap();
-    let mine = until_take(&first, "the first tap's ownership", &mut Vec::new(), |frame| {
+    // The second tap goes out once the first one owns the take.
+    until_take(&first, "the first tap's ownership", &mut Vec::new(), |frame| {
         matches!(frame, TakeWire::Live { owner: TakeOwner::You, ended: None, .. })
     });
-    assert!(matches!(mine, TakeWire::Live { .. }));
+    second.take_tap("take-race", 0).unwrap();
     until_take(&second, "the second tap sees another owner", &mut Vec::new(), |frame| {
         matches!(frame, TakeWire::Live { owner: TakeOwner::Another, ended: None, .. })
     });
@@ -352,7 +351,14 @@ fn a_second_window_cannot_end_a_take_its_live_owner_records() {
     ] {
         match other.send(corr, command) {
             Err(starling_runtime_host::client::ClientError::Rejected(rejection)) => {
-                assert!(format!("{rejection:?}").contains("another connection"), "{rejection:?}");
+                assert!(
+                    matches!(
+                        &rejection,
+                        starling_runtime::machine::Rejection::IllegalInState { detail, .. }
+                            if detail.contains("another connection")
+                    ),
+                    "{rejection:?}"
+                );
             }
             other => panic!("expected a refusal, got {other:?}"),
         }
@@ -403,11 +409,81 @@ fn an_orphan_no_app_claimed_survives_the_host_exiting() {
     };
     let store = starling_dictation::store_v2::StoreV2::open(root.path()).unwrap();
     assert!(store.get_capture(&id).unwrap().is_some());
-    assert!(
-        !root.path().join(starling_runtime_host::takes::UNCLAIMED_FILE).exists(),
-        "handed over, so no longer remembered"
-    );
+    let pending = root.path().join(starling_runtime_host::takes::UNCLAIMED_FILE);
+    assert!(pending.exists(), "handed over but not handled: still remembered");
+    // The app goes away before it handled the take: the next one gets it.
     drop(app);
+    let app = connect(&host);
+    app.take_watch().unwrap();
+    let again = until_take(&app, "the orphan offered again", &mut Vec::new(), |frame| {
+        matches!(frame, TakeWire::Persisted { orphan: true, .. })
+    });
+    assert!(
+        matches!(&again, TakeWire::Persisted { stored_id: Some(again), .. } if *again == id),
+        "{again:?}"
+    );
+    app.take_handled(&id).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while pending.exists() {
+        assert!(Instant::now() < deadline, "a handled take stays remembered");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    drop(app);
+    host.shutdown();
+}
+
+#[test]
+fn refused_starts_during_a_slow_device_open_never_take_the_owner_away() {
+    let root = tempfile::tempdir().unwrap();
+    let slow = FakeTakeScript {
+        open_delay: Duration::from_millis(800),
+        ..FakeTakeScript::clean()
+    };
+    let source = FakeCaptureSource::new(vec![slow]);
+    let mut host = serve(config(root.path(), Arc::clone(&source))).expect("host serves");
+    let owner = Arc::new(connect(&host));
+    owner.take_watch().unwrap();
+    let opening = std::thread::spawn({
+        let owner = Arc::clone(&owner);
+        move || start(&owner, "take-slow")
+    });
+    // While the device opens, other windows press record: each start is
+    // refused, and there are more of them than the hub remembers.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while source.started_takes.lock().unwrap().is_empty() {
+        assert!(Instant::now() < deadline, "the take never started opening its device");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let others: Vec<HostClient> = (0..6).map(|_| connect(&host)).collect();
+    std::thread::scope(|scope| {
+        for (index, other) in others.iter().enumerate() {
+            scope.spawn(move || {
+                let _ = other.send(
+                    Some(&format!("take-burst-{index}")),
+                    Command::CaptureStart { policy: "push-to-talk".into() },
+                );
+            });
+        }
+    });
+    opening.join().unwrap();
+    let mut seen = Vec::new();
+    let tick = until_take(&owner, "the slow take's tick", &mut seen, is_live_tick("take-slow"));
+    assert!(matches!(tick, TakeWire::Live { owner: TakeOwner::You, .. }), "{tick:?}");
+    // Another window can neither adopt it nor end it.
+    let other = &others[0];
+    other.take_watch().unwrap();
+    other.take_tap("take-slow", 0).unwrap();
+    until_take(other, "another window's view", &mut Vec::new(), |frame| {
+        matches!(frame, TakeWire::Live { take, owner: TakeOwner::Another, ended: None, .. } if take == "take-slow")
+    });
+    assert!(other
+        .send(Some("take-slow"), Command::CaptureStop { drain: Some(true) })
+        .is_err());
+    stop(&owner, "take-slow");
+    let persisted = until_take(&owner, "the stored row", &mut seen, is_persisted("take-slow"));
+    assert!(matches!(persisted, TakeWire::Persisted { orphan: false, .. }), "{persisted:?}");
+    drop(others);
+    drop(owner);
     host.shutdown();
 }
 
@@ -485,5 +561,98 @@ fn starting_the_next_take_does_not_cut_off_the_last_ones_tail() {
     stop(&app, "take-two");
     until_take(&app, "the second take's row", &mut seen, is_persisted("take-two"));
     drop(app);
+    host.shutdown();
+}
+
+#[test]
+fn a_take_a_command_only_client_records_reaches_an_app_once_that_client_is_gone() {
+    let root = tempfile::tempdir().unwrap();
+    let source = FakeCaptureSource::new(vec![FakeTakeScript::clean()]);
+    let mut host = serve(config(root.path(), source)).expect("host serves");
+    let app = connect(&host);
+    app.take_watch().unwrap();
+    let tool = connect(&host);
+    start(&tool, "take-tool");
+    let mut seen = Vec::new();
+    until_take(&app, "the tool's take", &mut seen, is_live_tick("take-tool"));
+    stop(&tool, "take-tool");
+    let heard = until_take(&app, "the stored row", &mut seen, is_persisted("take-tool"));
+    assert!(matches!(heard, TakeWire::Persisted { orphan: false, .. }), "{heard:?}");
+    // The tool goes away without saying it handled the take: an app
+    // transcribes it.
+    drop(tool);
+    let orphan = until_take(&app, "the take handed over", &mut seen, |frame| {
+        matches!(frame, TakeWire::Persisted { take, orphan: true, .. } if take == "take-tool")
+    });
+    let TakeWire::Persisted { stored_id: Some(id), .. } = orphan else {
+        panic!("{orphan:?}");
+    };
+    app.take_handled(&id).unwrap();
+    drop(app);
+    host.shutdown();
+}
+
+#[test]
+fn a_take_an_app_hands_back_goes_to_another_app() {
+    let root = tempfile::tempdir().unwrap();
+    let source = FakeCaptureSource::new(vec![FakeTakeScript::clean()]);
+    let mut host = serve(config(root.path(), source)).expect("host serves");
+    let first = connect(&host);
+    first.take_watch().unwrap();
+    {
+        let gone = connect(&host);
+        start(&gone, "take-back");
+        until_take(&first, "the take", &mut Vec::new(), is_live_tick("take-back"));
+        stop(&gone, "take-back");
+        until_take(&first, "the stored row", &mut Vec::new(), is_persisted("take-back"));
+    }
+    let offered = until_take(&first, "the orphan", &mut Vec::new(), |frame| {
+        matches!(frame, TakeWire::Persisted { take, orphan: true, .. } if take == "take-back")
+    });
+    let TakeWire::Persisted { stored_id: Some(id), .. } = offered else {
+        panic!("{offered:?}");
+    };
+    let second = connect(&host);
+    second.take_watch().unwrap();
+    first.take_handed_back(&id).unwrap();
+    let again = until_take(&second, "the take handed on", &mut Vec::new(), |frame| {
+        matches!(frame, TakeWire::Persisted { take, orphan: true, .. } if take == "take-back")
+    });
+    assert!(matches!(&again, TakeWire::Persisted { stored_id: Some(again), .. } if *again == id));
+    second.take_handled(&id).unwrap();
+    drop(first);
+    drop(second);
+    host.shutdown();
+}
+
+#[test]
+fn a_corr_a_finished_take_used_is_free_for_the_next_start() {
+    let root = tempfile::tempdir().unwrap();
+    let source = FakeCaptureSource::new(vec![FakeTakeScript::clean(), FakeTakeScript::clean()]);
+    let mut host = serve(config(root.path(), source)).expect("host serves");
+    let first = connect(&host);
+    first.take_watch().unwrap();
+    let anon = starling_runtime::machine::capture::ANON_TAKE;
+    first
+        .send(None, Command::CaptureStart { policy: "push-to-talk".into() })
+        .expect("start accepted");
+    let mut seen = Vec::new();
+    until_take(&first, "the first take", &mut seen, is_live_tick(anon));
+    first
+        .send(None, Command::CaptureStop { drain: Some(true) })
+        .expect("stop accepted");
+    until_take(&first, "the first stored row", &mut seen, is_persisted(anon));
+    let second = connect(&host);
+    second.take_watch().unwrap();
+    second
+        .send(None, Command::CaptureStart { policy: "push-to-talk".into() })
+        .expect("start accepted");
+    let tick = until_take(&second, "the second take", &mut Vec::new(), is_live_tick(anon));
+    assert!(matches!(tick, TakeWire::Live { owner: TakeOwner::You, .. }), "{tick:?}");
+    second
+        .send(None, Command::CaptureStop { drain: Some(true) })
+        .expect("its starter stops it");
+    drop(first);
+    drop(second);
     host.shutdown();
 }

@@ -388,11 +388,26 @@ impl StarlingApp {
         self.take_notice = None;
         if let Some(reason) = self.host_unavailable() {
             self.delivery_take_stopped();
-            self.error = Some(format!("{reason} Try again in a moment."));
+            self.error = Some(match self.host.link.as_ref().filter(|_| self.host.gave_up) {
+                // Pressing record is how the user asks for another try.
+                Some(link) => {
+                    link.retry();
+                    self.host.gave_up = false;
+                    self.host.down = Some("connecting".to_string());
+                    "Starting Starling's recording service again; record once it is ready."
+                        .to_string()
+                }
+                None => format!("{reason} Try again in a moment."),
+            });
             cx.notify();
             return false;
         }
         let Some(link) = self.host.link.as_ref() else {
+            self.delivery_take_stopped();
+            self.error = Some(
+                "Starling's recording service is not ready; try again in a moment.".to_string(),
+            );
+            cx.notify();
             return false;
         };
         // Attenuation begins with the attempt, before the microphone opens
@@ -974,6 +989,9 @@ impl StarlingApp {
             let transcribed = job_failure.is_none() && !session_gone;
             this.update(cx, |app, cx| {
                 app.active_ids.remove(&id);
+                // Transcribed or its failure recorded: a take the host
+                // handed this window is handled.
+                app.take_handled(&id);
                 if !transcribed {
                     // No processing will run for this take, and nothing
                     // is typed for it: a retry is a new, explicit job.

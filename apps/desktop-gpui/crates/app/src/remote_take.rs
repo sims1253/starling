@@ -15,7 +15,13 @@
 //! host stopped and stored while no app followed it comes back as an
 //! orphan and is transcribed into history (nothing is typed: the window
 //! it was meant for is gone).
+//!
+//! A stored take this window has to transcribe (its own, or an orphan)
+//! is acknowledged to the host only once its transcription finished
+//! ([`StarlingApp::take_handled`]); a window that goes away before that
+//! leaves it to the next one.
 
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -35,6 +41,11 @@ use crate::upload::{TakeTarget, refresh_sessions};
 /// How often a stop or cancel the host has not acted on is asked again.
 const REASK: Duration = Duration::from_secs(1);
 
+/// How many acknowledged stored takes are remembered, to answer a take
+/// the host offers again (its ack crossed a reconnect) without
+/// transcribing it twice.
+const HANDLED_KEEP: usize = 64;
+
 /// The app's side of the host connection.
 #[derive(Default)]
 pub(crate) struct HostState {
@@ -42,6 +53,14 @@ pub(crate) struct HostState {
     pub(crate) client: Option<Arc<HostClient>>,
     /// Why the app is not connected, while it is not.
     pub(crate) down: Option<String>,
+    /// The link stopped starting the recording service (it kept failing)
+    /// until the user asks again.
+    pub(crate) gave_up: bool,
+    /// Stored takes this window transcribes for the host, acknowledged
+    /// once their transcription finished.
+    pub(crate) handling: HashSet<String>,
+    /// Stored takes acknowledged lately.
+    pub(crate) handled: VecDeque<String>,
     /// Takes this window stopped or cancelled, until they are stored.
     pub(crate) finishing: Vec<FinishingTake>,
     /// The live take's stream waits for the take's device rate, which the
@@ -109,13 +128,14 @@ impl FinishingTake {
         }
     }
 
-    /// The whole take as this window holds it: what the stream drained,
-    /// then the rest of the feed.
-    fn samples(&self) -> Vec<f32> {
-        let mut samples = self.handoff.samples.clone();
-        samples.extend(self.feed.samples_from(self.handoff.samples.len()));
-        samples
-    }
+}
+
+/// The whole take as a window holds it: what the stream drained, then
+/// the rest of the feed. A copy of the take, so built off the UI thread.
+fn held_samples(drained: Vec<f32>, feed: &TakeFeed) -> Vec<f32> {
+    let mut samples = drained;
+    samples.extend(feed.samples_from(samples.len()));
+    samples
 }
 
 impl StarlingApp {
@@ -167,6 +187,10 @@ impl StarlingApp {
     pub(crate) fn host_unavailable(&self) -> Option<String> {
         match (&self.host.client, &self.host.down) {
             (Some(_), _) => None,
+            (None, Some(reason)) if self.host.gave_up => Some(format!(
+                "Starling's recording service is unavailable ({reason}). Press record to try \
+                 starting it again."
+            )),
             (None, Some(reason)) if reason == "connecting" => {
                 Some("Starling's recording service is starting.".to_string())
             }
@@ -189,14 +213,16 @@ impl StarlingApp {
             HostUpdate::Connected { client, recovery } => {
                 self.host.client = Some(client);
                 self.host.down = None;
+                self.host.gave_up = false;
                 if let Some(recovery) = recovery {
                     crate::upload::add_recovery_messages(self, recovery.problems, recovery.notice);
                 }
                 self.refresh_history(cx);
             }
-            HostUpdate::Disconnected { reason } => {
+            HostUpdate::Disconnected { reason, gave_up } => {
                 self.host.client = None;
                 self.host.down = Some(reason);
+                self.host.gave_up = gave_up;
                 self.host.claiming = None;
                 self.let_go_of_takes(cx);
             }
@@ -220,12 +246,18 @@ impl StarlingApp {
                 command,
                 reason,
             } => {
-                if command == "capture.start"
-                    && self.recorder.as_ref().is_some_and(|live| live.take == take)
-                {
+                if command == "capture.start" {
                     self.take_start_failed(&take, None, format!(
                         "The recording could not start: {reason}"
                     ), cx);
+                }
+                if command == "take.tap" {
+                    // The live take's audio did not get asked for: ask on
+                    // the next tick (a finishing take needs no tap — its
+                    // end and stored row come either way).
+                    if let Some(live) = self.recorder.as_mut().filter(|live| live.take == take) {
+                        live.tapped = false;
+                    }
                 }
                 // A stop or cancel that was refused is asked again while
                 // the take still records (see `take_update`).
@@ -314,13 +346,26 @@ impl StarlingApp {
             return;
         }
         self.host.claiming = None;
-        if !ended && self.recorder.is_none() && !self.activation.is_active() {
-            self.adopt_take(take, rate, status, cx);
+        if !ended
+            && self.recorder.is_none()
+            && !self.activation.is_active()
+            && self.adopt_take(take.clone(), rate, status, cx)
+        {
             return;
         }
         // It is ours but cannot be shown live — it already ended, or this
-        // window started a take of its own meanwhile: finish it and
-        // transcribe it into history (its end and stored row follow).
+        // window started a take of its own meanwhile: finish it into
+        // history.
+        self.finish_unshown_take(take, !ended);
+    }
+
+    /// A take this window owns but does not show (adopting it lost a race
+    /// with a take of the window's own, or a tap from before a reconnect
+    /// landed on the new connection): stopped (`stop`: unless it ended
+    /// already) and transcribed into history — its end and stored row
+    /// follow — so it never records on with nobody able to stop it, and
+    /// its stored row is never left with a window that ignores it.
+    fn finish_unshown_take(&mut self, take: String, stop: bool) {
         let Some(link) = &self.host.link else {
             return;
         };
@@ -338,7 +383,9 @@ impl StarlingApp {
                 delivery: None,
             },
         );
-        self.host_command(&take, finishing.command());
+        if stop {
+            self.host_command(&take, finishing.command());
+        }
         self.host.finishing.push(finishing);
     }
 
@@ -413,6 +460,17 @@ impl StarlingApp {
                         return;
                     }
                 }
+                if owner == TakeOwner::You
+                    && (ended.is_none() || kept)
+                    && self.finishing_index(&take).is_none()
+                    && !self.recorder.as_ref().is_some_and(|live| live.take == take)
+                {
+                    // Ours, but nothing here follows it: finishing now
+                    // (this frame's end, if it has one, belongs to it).
+                    // A claim on this take was settled above; one on
+                    // another take does not hold this one up.
+                    self.finish_unshown_take(take.clone(), ended.is_none());
+                }
                 if let Some(index) = self.finishing_index(&take) {
                     match ended {
                         Some(total) => {
@@ -452,10 +510,18 @@ impl StarlingApp {
                 if self.finishing_index(&take).is_some() {
                     self.take_stored(&take, stored_id, interrupted, error, cx);
                 } else if orphan {
-                    if let (Some(id), false) = (stored_id, interrupted) {
-                        self.transcribe_orphan(id, cx);
-                    } else {
-                        self.refresh_history(cx);
+                    match (stored_id, interrupted || error.is_some()) {
+                        (Some(id), false) if self.host.handled.contains(&id) => {
+                            // Handled here already; the ack crossed a
+                            // reconnect. Say so again.
+                            if let Some(link) = &self.host.link {
+                                link.handled(&id);
+                            }
+                        }
+                        // Being transcribed here already: its job acks it.
+                        (Some(id), false) if self.host.handling.contains(&id) => {}
+                        (Some(id), false) => self.transcribe_orphan(id, cx),
+                        _ => self.refresh_history(cx),
                     }
                 } else {
                     // Another window's take: it is in history now.
@@ -471,6 +537,31 @@ impl StarlingApp {
 
     fn finishing_index(&self, take: &str) -> Option<usize> {
         self.host.finishing.iter().position(|finishing| finishing.take == take)
+    }
+
+    /// The transcription of stored take `id` finished (or failed and
+    /// said so): if the host handed it to this window, it hears so now.
+    pub(crate) fn take_handled(&mut self, id: &str) {
+        if !self.host.handling.remove(id) {
+            return;
+        }
+        if let Some(link) = &self.host.link {
+            link.handled(id);
+        }
+        self.host.handled.push_back(id.to_string());
+        while self.host.handled.len() > HANDLED_KEEP {
+            self.host.handled.pop_front();
+        }
+    }
+
+    /// This window cannot transcribe stored take `id` (no store, its
+    /// audio unreadable here): the host hands it to another window — or
+    /// to this one again after a reconnect.
+    fn take_handed_back(&mut self, id: &str) {
+        self.host.handling.remove(id);
+        if let Some(link) = &self.host.link {
+            link.handed_back(id);
+        }
     }
 
     /// A stop or cancel the take still records past: ask again.
@@ -506,14 +597,16 @@ impl StarlingApp {
         let Some(live) = self.recorder.as_mut() else {
             return;
         };
+        // The take's audio, from the start (or, after a tap that did not
+        // go out, from what is here).
+        if !live.tapped {
+            live.tapped = true;
+            if let Some(link) = &self.host.link {
+                link.tap(take, live.feed.len() as u64);
+            }
+        }
         if first {
             live.confirmed = true;
-            if !live.tapped {
-                live.tapped = true;
-                if let Some(link) = &self.host.link {
-                    link.tap(take, 0);
-                }
-            }
             if let Some(endpoint) = self.host.stream_endpoint.take() {
                 let feed = Arc::clone(&live.feed);
                 if let Err(reason) = self.start_stream_pump(feed, rate, &endpoint, cx) {
@@ -567,6 +660,12 @@ impl StarlingApp {
         message: String,
         cx: &mut Context<Self>,
     ) {
+        if let Some(index) = self.finishing_index(take) {
+            // Stopped or cancelled before the host said it records: no
+            // tick, end or stored row will ever come for it.
+            self.finishing_never_started(index, problem, message, cx);
+            return;
+        }
         if !self.recorder.as_ref().is_some_and(|live| live.take == take) {
             return;
         }
@@ -595,18 +694,64 @@ impl StarlingApp {
         self.activation_settled(cx);
     }
 
+    /// A take this window stopped or cancelled before the host confirmed
+    /// it, which never started: resolved here.
+    fn finishing_never_started(
+        &mut self,
+        index: usize,
+        problem: Option<starling_dictation::microphone::InputProblem>,
+        message: String,
+        cx: &mut Context<Self>,
+    ) {
+        let finishing = self.host.finishing.remove(index);
+        if let Some(link) = &self.host.link {
+            link.forget(&finishing.take);
+        }
+        match finishing.kind {
+            FinishKind::Transcribe {
+                staging, stopped_at, ..
+            } => {
+                if let Some(token) = staging {
+                    self.staging_save_failed(token, cx);
+                }
+                self.overlay.model.save_failed(stopped_at, Instant::now());
+                match problem {
+                    Some(problem) => self.report_input_problem(problem, message),
+                    None => self.error = Some(message),
+                }
+            }
+            FinishKind::Cancel {
+                staging,
+                empty_notice,
+                ..
+            } => {
+                if let Some(token) = staging {
+                    self.staging_save_failed(token, cx);
+                }
+                if let Some(notice) = empty_notice {
+                    if self.activation.last_started() == finishing.activation {
+                        self.take_notice = Some(notice);
+                    }
+                }
+            }
+        }
+    }
+
     /// Makes a take the host records — with no live owner — this
-    /// window's active take.
+    /// window's active take; `false` when the window cannot take it on
+    /// (its activation is busy).
     fn adopt_take(
         &mut self,
         take: String,
         rate: u32,
         status: Option<starling_runtime::machine::capture::LiveTakeStatus>,
         cx: &mut Context<Self>,
-    ) {
-        let (Some(link), Some(activation)) = (&self.host.link, self.activation.adopt(Instant::now()))
-        else {
-            return;
+    ) -> bool {
+        let Some(link) = &self.host.link else {
+            return false;
+        };
+        let Some(activation) = self.activation.adopt(Instant::now()) else {
+            return false;
         };
         let feed = link.feed(&take);
         let mut live = LiveCapture::new(take.clone(), feed);
@@ -635,6 +780,7 @@ impl StarlingApp {
         // The tap replays the take from its start, so live text catches up.
         self.live_tick(&take, rate, status, cx);
         self.activation_settled(cx);
+        true
     }
 
     /// A finishing take's audio or end arrived: a cancel that kept
@@ -697,28 +843,59 @@ impl StarlingApp {
             link.forget(take);
         }
         let complete = finishing.feed.complete();
+        if let Some((have, total)) = finishing.feed.short_of() {
+            eprintln!(
+                "Starling: take {take} reached this window with {have} of its {total} samples; \
+                 it is transcribed from the stored recording"
+            );
+        }
         let rate = finishing.feed.sample_rate();
-        let samples = finishing.samples();
         let FinishingTake {
             activation,
             handoff,
             kind,
+            feed,
             ..
         } = finishing;
         // The store refused it: the audio this window holds is the only
         // copy that can be offered (the journal stays for recovery).
         if let Some(err) = error {
-            if let Ok(wav) = audio::encode_wav_16k_parts(&samples, rate.max(1), 1) {
-                if !samples.is_empty() {
-                    self.stash_unsaved(
-                        Arc::new(wav),
-                        &format!(
-                            "Local storage failed: {err} Keep this window open and download the \
-                             unsaved WAV to recover it."
-                        ),
-                    );
-                }
+            if self.error.is_none() {
+                self.error = Some(format!("Local storage failed: {err}"));
             }
+            let drained = handoff.samples;
+            cx.spawn(async move |this, cx| {
+                let wav = cx
+                    .background_spawn(async move {
+                        let samples = held_samples(drained, &feed);
+                        if samples.is_empty() {
+                            return None;
+                        }
+                        audio::encode_wav_16k_parts(&samples, rate.max(1), 1).ok()
+                    })
+                    .await;
+                if let Some(wav) = wav {
+                    let short = if complete {
+                        ""
+                    } else {
+                        " Only part of the take reached this window, so this copy is \
+                         incomplete; the full take stays in the recording journal and is \
+                         recovered when Starling's recording service next starts."
+                    };
+                    this.update(cx, |app, cx| {
+                        app.stash_unsaved(
+                            Arc::new(wav),
+                            &format!(
+                                "Local storage failed: {err} Keep this window open and download \
+                                 the unsaved WAV to recover it.{short}"
+                            ),
+                        );
+                        cx.notify();
+                    })
+                    .ok();
+                }
+            })
+            .detach();
             match kind {
                 FinishKind::Transcribe {
                     staging, stopped_at, ..
@@ -733,9 +910,6 @@ impl StarlingApp {
                         self.staging_save_failed(token, cx);
                     }
                 }
-            }
-            if self.error.is_none() {
-                self.error = Some(format!("Local storage failed: {err}"));
             }
             return;
         }
@@ -810,13 +984,22 @@ impl StarlingApp {
                 staging,
                 delivery,
             } => {
-                let Handoff { sent, stream, .. } = handoff;
+                let Handoff {
+                    sent,
+                    stream,
+                    samples: drained,
+                    ..
+                } = handoff;
                 // The stream finishes on the tail only when this window
-                // holds the whole take; otherwise the full upload covers it.
+                // holds the whole take; otherwise the stored take is
+                // uploaded in full.
                 let stream = stream.filter(|_| complete);
                 let Some(store) = self.store.clone() else {
+                    self.take_handed_back(&id);
                     return;
                 };
+                // Acknowledged to the host once its transcription ends.
+                self.host.handling.insert(id.clone());
                 let load_id = id.clone();
                 cx.spawn(async move |this, cx| {
                     let (stream, wav) = cx
@@ -825,12 +1008,18 @@ impl StarlingApp {
                             // The remainder past the send watermark goes
                             // out beside the load, never on the UI thread.
                             let remainder_sent = match stream.as_ref() {
-                                Some(live) if sent < samples.len() => {
-                                    audio::encode_wav_16k_parts(&samples[sent..], rate.max(1), 1)
+                                Some(live) => {
+                                    let samples = held_samples(drained, &feed);
+                                    sent >= samples.len()
+                                        || audio::encode_wav_16k_parts(
+                                            &samples[sent..],
+                                            rate.max(1),
+                                            1,
+                                        )
                                         .map(|wav| live.send_audio(wav))
                                         .unwrap_or(false)
                                 }
-                                _ => true,
+                                None => true,
                             };
                             if !remainder_sent {
                                 stream = None;
@@ -850,8 +1039,16 @@ impl StarlingApp {
                         }
                         Ok(None) | Err(_) => {
                             let reason = match wav {
-                                Err(err) => err.to_string(),
-                                _ => "it is no longer in history".to_string(),
+                                Err(err) => {
+                                    // Back to the host for another try.
+                                    app.take_handed_back(&id);
+                                    err.to_string()
+                                }
+                                _ => {
+                                    // Deleted: nothing is left to do.
+                                    app.take_handled(&id);
+                                    "it is no longer in history".to_string()
+                                }
                             };
                             app.error = Some(format!(
                                 "The recording was saved but could not be read back for \
@@ -875,6 +1072,9 @@ impl StarlingApp {
     /// history, never typed (no window's delivery is bound to it).
     fn transcribe_orphan(&mut self, id: String, cx: &mut Context<Self>) {
         let Some(store) = self.store.clone() else {
+            if let Some(link) = &self.host.link {
+                link.handed_back(&id);
+            }
             return;
         };
         self.service_notice = Some(
@@ -882,6 +1082,9 @@ impl StarlingApp {
              transcribed into your history."
                 .to_string(),
         );
+        // Acknowledged to the host once its transcription ends; one that
+        // cannot be read here stays the host's for the next window.
+        self.host.handling.insert(id.clone());
         cx.spawn(async move |this, cx| {
             let wav = {
                 let store = store.clone();
@@ -896,7 +1099,16 @@ impl StarlingApp {
                     })
                     .ok();
                 }
-                _ => refresh_sessions(&this, &store, cx).await,
+                gone => {
+                    this.update(cx, |app, _| match gone {
+                        // Deleted from history: nothing is left to do.
+                        Ok(None) => app.take_handled(&id),
+                        // Back to the host for another try.
+                        _ => app.take_handed_back(&id),
+                    })
+                    .ok();
+                    refresh_sessions(&this, &store, cx).await
+                }
             }
         })
         .detach();

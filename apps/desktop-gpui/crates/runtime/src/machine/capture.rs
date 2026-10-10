@@ -82,6 +82,9 @@ use crate::protocol::{Command, Event, SampleGap};
 
 use super::context::RouteFreezer;
 
+/// The take id a `capture.*` command without a `corr` acts on.
+pub const ANON_TAKE: &str = "take-anon";
+
 /// How a take ended — the persistence-facing counterpart of the machine's
 /// `Persisted` state (a `Persisted` take may reference a `complete` or an
 /// `interrupted` storage row; an interrupted row is still a committed row).
@@ -382,6 +385,9 @@ pub trait CaptureStore: Send + Sync {
     fn describe(&self) -> String;
     /// The id of the stored row a committed `take` landed in, when the
     /// store can name it (#220: the app transcribes the stored take).
+    /// Asked once per commit, right after it: an implementation may hand
+    /// the id out once (a second ask answers `None`, which does not mean
+    /// the take was never committed).
     fn stored_id(&self, _take: &TakeRecord) -> Option<String> {
         None
     }
@@ -979,7 +985,7 @@ impl CaptureStore for V2CaptureStore {
     /// way the take's capture id finds its row.
     /// Only what the commit itself recorded: a commit whose outcome it
     /// could not read back names nothing, rather than a row that merely
-    /// holds the same journal id (another take's audio).
+    /// holds the same journal id (another take's audio). Handed out once.
     fn stored_id(&self, take: &TakeRecord) -> Option<String> {
         self.committed
             .lock()
@@ -1533,7 +1539,7 @@ impl CaptureActor {
                 return;
             }
         }
-        let corr = corr.unwrap_or_else(|| "take-anon".to_string());
+        let corr = corr.unwrap_or_else(|| ANON_TAKE.to_string());
         match command {
             Command::CaptureStart { policy } => {
                 // A take that ended `Interrupted` (a lost device, a failed

@@ -36,6 +36,8 @@ pub struct FakeTakeScript {
     /// genuinely long WAV encode (one the scheduler must not stall on,
     /// issue #216) raises it to synthesize a multi-minute take.
     pub sample_cap: u64,
+    /// How long opening the device takes (a slow device open).
+    pub open_delay: Duration,
 }
 
 /// What a scripted session's stop handshake does.
@@ -68,6 +70,7 @@ impl Default for FakeTakeScript {
             },
             amplitude: 0.25,
             sample_cap: 64_000,
+            open_delay: Duration::ZERO,
         }
     }
 }
@@ -82,9 +85,9 @@ impl FakeTakeScript {
 struct FakeSession {
     script: FakeTakeScript,
     started: Instant,
-    /// The sample count the stop handed back, once it ran: the monitor
-    /// stops there, like a real recorder whose device closed.
-    stopped_at: Arc<std::sync::OnceLock<u64>>,
+    /// The sample count the stop handed back and when, once it ran: the
+    /// monitor stops there, like a real recorder whose device closed.
+    stopped_at: Arc<std::sync::OnceLock<(u64, Duration)>>,
 }
 
 /// The fake take as the host's take feed sees it: the same deterministic
@@ -92,15 +95,23 @@ struct FakeSession {
 struct FakeMonitor {
     script: FakeTakeScript,
     started: Instant,
-    stopped_at: Arc<std::sync::OnceLock<u64>>,
+    stopped_at: Arc<std::sync::OnceLock<(u64, Duration)>>,
 }
 
 impl FakeMonitor {
     fn produced(&self) -> u64 {
-        self.stopped_at
-            .get()
-            .copied()
-            .unwrap_or_else(|| elapsed_samples(&self.script, self.started))
+        match self.stopped_at.get() {
+            Some((count, _)) => *count,
+            None => elapsed_samples(&self.script, self.started),
+        }
+    }
+
+    /// The take's age, frozen at the stop.
+    fn elapsed(&self) -> Duration {
+        match self.stopped_at.get() {
+            Some((_, at)) => *at,
+            None => self.started.elapsed(),
+        }
     }
 }
 
@@ -121,12 +132,12 @@ impl LiveTakeMonitor for FakeMonitor {
     fn status(&self) -> LiveTakeStatus {
         LiveTakeStatus {
             captured: self.produced(),
-            acknowledged: captured_ack(&self.script, self.started),
+            acknowledged: ack_of(&self.script, self.produced()),
             clip_ratio: 0.0,
             stalled_ms: Some(0),
-            elapsed_ms: self.started.elapsed().as_millis() as u64,
+            elapsed_ms: self.elapsed().as_millis() as u64,
             fault: match &self.script.error_after {
-                Some((delay, fault)) if self.started.elapsed() >= *delay => Some(fault.clone()),
+                Some((delay, fault)) if self.elapsed() >= *delay => Some(fault.clone()),
                 _ => None,
             },
             disk: None,
@@ -177,7 +188,9 @@ impl CaptureSession for FakeSession {
     }
     fn stop(self: Box<Self>) -> Result<CapturedTake, RecorderError> {
         let produced = elapsed_samples(&self.script, self.started);
-        let _ = self.stopped_at.set(produced.max(1));
+        let _ = self
+            .stopped_at
+            .set((produced.max(1), self.started.elapsed()));
         match &self.script.stop {
             FakeStop::Clean {
                 journal_id,
@@ -256,11 +269,14 @@ fn elapsed_samples(script: &FakeTakeScript, started: Instant) -> u64 {
 }
 
 fn captured_ack(script: &FakeTakeScript, started: Instant) -> u64 {
+    ack_of(script, elapsed_samples(script, started))
+}
+
+/// What the journal has acknowledged of `produced` samples.
+fn ack_of(script: &FakeTakeScript, produced: u64) -> u64 {
     match &script.stop {
-        FakeStop::Clean { ack_fraction, .. } => {
-            ((elapsed_samples(script, started) as f64) * ack_fraction).floor() as u64
-        }
-        _ => elapsed_samples(script, started),
+        FakeStop::Clean { ack_fraction, .. } => ((produced as f64) * ack_fraction).floor() as u64,
+        _ => produced,
     }
 }
 
@@ -315,6 +331,7 @@ impl CaptureSource for FakeCaptureSource {
             .lock()
             .expect("fake started takes lock")
             .push(policy.to_string());
+        std::thread::sleep(script.open_delay);
         Ok(Box::new(FakeSession {
             script,
             started: Instant::now(),

@@ -99,28 +99,45 @@ pub const RECHECK_AFTER: Duration = Duration::from_secs(2);
 
 /// Runs [`recheck`] on its own thread after
 /// [`FINALIZED_ADOPTION_GRACE`] (+ [`RECHECK_AFTER`]) and hands the
-/// findings to `report`; returns at once when there is nothing to look at.
+/// findings to `report`; `None` when there is nothing to look at (or no
+/// thread). The thread gives up as soon as `stopping` says the host is
+/// shutting down, and never starts the scan after that: its caller joins
+/// it before releasing the lease.
 pub fn recheck_later(
     store: Arc<Mutex<StoreV2>>,
     journals: PathBuf,
     ids: Vec<String>,
+    stopping: impl Fn() -> bool + Send + 'static,
     report: impl FnOnce(HostRecovery) + Send + 'static,
-) {
+) -> Option<std::thread::JoinHandle<()>> {
     if ids.is_empty() {
-        return;
+        return None;
     }
     let spawned = std::thread::Builder::new()
         .name("starling-host-recheck".to_string())
         .spawn(move || {
-            std::thread::sleep(FINALIZED_ADOPTION_GRACE + RECHECK_AFTER);
+            let due = std::time::Instant::now() + FINALIZED_ADOPTION_GRACE + RECHECK_AFTER;
+            while std::time::Instant::now() < due {
+                if stopping() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
             let found = {
                 let mut store = store.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                if stopping() {
+                    return;
+                }
                 recheck(&mut store, &journals, &ids)
             };
             report(found);
         });
-    if let Err(err) = spawned {
-        eprintln!("starling-runtime-host: cannot schedule the journal recheck: {err}");
+    match spawned {
+        Ok(thread) => Some(thread),
+        Err(err) => {
+            eprintln!("starling-runtime-host: cannot schedule the journal recheck: {err}");
+            None
+        }
     }
 }
 
