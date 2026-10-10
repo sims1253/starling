@@ -57,30 +57,47 @@ impl StarlingApp {
             return;
         }
         self.engine_configuring += 1;
-        let epoch = self.engine_epoch;
-        self.send_engine_request(request, cx, move |app, reply, cx| {
-            app.engine_configuring = app.engine_configuring.saturating_sub(1);
-            match reply {
-                // Revisions count per host: one from a connection since
-                // replaced says nothing about the host now.
-                Ok(EngineReply::Done { revision } | EngineReply::Activating { revision, .. })
-                    if app.engine_epoch == epoch =>
-                {
-                    app.engine_revision = app.engine_revision.max(revision);
-                }
-                Ok(EngineReply::Done { .. } | EngineReply::Activating { .. }) => {}
-                Ok(EngineReply::Refused { message }) => app.error = Some(message),
-                Err(message) => app.error = Some(message),
-            }
-            // Statuses that arrived while this was out were not adopted:
-            // the newest one is, now that nothing of this window's is.
-            if app.engine_configuring == 0 {
-                if let Some(status) = app.engine_status.clone() {
-                    app.adopt_engine_settings(&status, cx);
-                }
-            }
-            cx.notify();
+        self.send_engine_request_to(request, cx, |app, host, reply, cx| {
+            app.configure_answered(host, reply, cx);
         });
+    }
+
+    /// This window's `Configure` was answered by `host` (its lease id).
+    pub(crate) fn configure_answered(
+        &mut self,
+        host: Option<String>,
+        reply: Result<EngineReply, String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.engine_configuring = self.engine_configuring.saturating_sub(1);
+        // Revisions count per host: only one from the host this window
+        // is connected to now says anything about its statuses. That is
+        // the host that answered, not the one connected when the request
+        // was made — a request queued across a reconnect lands on the
+        // new host, and its revision is the new host's.
+        let current = self
+            .host
+            .client
+            .as_ref()
+            .map(|client| client.info.owner_id.as_str());
+        match reply {
+            Ok(EngineReply::Done { revision } | EngineReply::Activating { revision, .. })
+                if host.is_some() && host.as_deref() == current =>
+            {
+                self.engine_revision = self.engine_revision.max(revision);
+            }
+            Ok(EngineReply::Done { .. } | EngineReply::Activating { .. }) => {}
+            Ok(EngineReply::Refused { message }) => self.error = Some(message),
+            Err(message) => self.error = Some(message),
+        }
+        // Statuses that arrived while this was out were not adopted:
+        // the newest one is, now that nothing of this window's is.
+        if self.engine_configuring == 0 {
+            if let Some(status) = self.engine_status.clone() {
+                self.adopt_engine_settings(&status, cx);
+            }
+        }
+        cx.notify();
     }
 
     /// Sends `request` to the host's engine; a refusal (or no answer) is
@@ -105,13 +122,32 @@ impl StarlingApp {
         cx: &mut Context<Self>,
         then: impl FnOnce(&mut StarlingApp, Result<EngineReply, String>, &mut Context<Self>) + 'static,
     ) {
+        self.send_engine_request_to(request, cx, |app, _host, reply, cx| then(app, reply, cx));
+    }
+
+    /// [`Self::send_engine_request`], also handing `then` the lease id of
+    /// the host that answered (`None` when none was asked).
+    fn send_engine_request_to(
+        &mut self,
+        request: EngineRequest,
+        cx: &mut Context<Self>,
+        then: impl FnOnce(
+                &mut StarlingApp,
+                Option<String>,
+                Result<EngineReply, String>,
+                &mut Context<Self>,
+            ) + 'static,
+    ) {
         let answer = self.host.link.as_ref().map(|link| link.engine(request));
         cx.spawn(async move |this, cx| {
-            let reply = match answer {
-                Some(answer) => answer.await.unwrap_or_else(|_| Err(NOT_CONNECTED.to_string())),
-                None => Err(NOT_CONNECTED.to_string()),
+            let (host, reply) = match answer {
+                Some(answer) => match answer.await {
+                    Ok(answer) => (answer.host, answer.reply),
+                    Err(_) => (None, Err(NOT_CONNECTED.to_string())),
+                },
+                None => (None, Err(NOT_CONNECTED.to_string())),
             };
-            this.update(cx, |app, cx| then(app, reply, cx)).ok();
+            this.update(cx, |app, cx| then(app, host, reply, cx)).ok();
         })
         .detach();
     }
@@ -122,7 +158,6 @@ impl StarlingApp {
     /// first frame, so the new host's revision-0 status is never read
     /// against the old host's revision.
     pub(crate) fn engine_connected(&mut self) {
-        self.engine_epoch += 1;
         self.engine_revision = 0;
     }
 

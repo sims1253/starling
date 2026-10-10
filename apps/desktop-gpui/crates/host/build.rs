@@ -12,7 +12,8 @@
 //! hashes is a new build. `built` orders two different stamps: the time
 //! this script last ran, which is when the hashed sources last changed.
 //! A file that cannot be read fails the build: a stamp that skipped it
-//! could equal one of different code.
+//! could equal one of different code. So does a clock before 1970: a
+//! stamp built at "0" would order before every other build.
 
 use std::path::{Path, PathBuf};
 
@@ -39,8 +40,8 @@ fn main() {
     }
     let built = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|since| since.as_secs())
-        .unwrap_or(0);
+        .unwrap_or_else(|err| panic!("build stamp: the build clock is before 1970: {err}"))
+        .as_secs();
     println!("cargo:rustc-env=STARLING_HOST_BUILD_ID={:016x}", hash.0);
     println!("cargo:rustc-env=STARLING_HOST_BUILT={built}");
 }

@@ -1484,6 +1484,45 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// A `Configure`'s revision counts only when the host that answered
+    /// is the one this window is connected to now — whichever connection
+    /// the request was made on (one queued across a reconnect lands on
+    /// the new host).
+    #[gpui::test]
+    fn a_configure_answer_counts_for_the_host_that_gave_it(cx: &mut gpui::TestAppContext) {
+        use starling_runtime_host::engine::EngineReply;
+        let root = scratch("configure-host");
+        let store = Store::at_test_root(&root);
+        let id = store.save_capture(one_second_wav()).expect("save").id;
+        let (mut host, app) = idle_engine_app(cx, &root, &store, &id);
+        app.update(cx, |app, cx| {
+            let connected = app
+                .host
+                .client
+                .as_ref()
+                .expect("connected")
+                .info
+                .owner_id
+                .clone();
+            app.engine_configuring = 2;
+            app.configure_answered(
+                Some("another-host".to_string()),
+                Ok(EngineReply::Done { revision: 40 }),
+                cx,
+            );
+            assert_eq!(
+                app.engine_revision, 0,
+                "another host's revision says nothing here"
+            );
+            app.configure_answered(Some(connected), Ok(EngineReply::Done { revision: 40 }), cx);
+            assert_eq!(app.engine_revision, 40);
+            assert_eq!(app.engine_configuring, 0);
+        });
+        drop(app);
+        host.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// An activation the host never takes on leaves nothing waiting: a
     /// later Ready for that model (another window's switch) is not this
     /// window's to persist.

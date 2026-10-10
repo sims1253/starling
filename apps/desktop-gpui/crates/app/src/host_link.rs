@@ -173,7 +173,17 @@ pub(crate) struct HostLink {
 /// One engine request and where its answer goes.
 struct EngineCall {
     request: starling_runtime_host::engine::EngineRequest,
-    reply: tokio::sync::oneshot::Sender<Result<starling_runtime_host::engine::EngineReply, String>>,
+    reply: tokio::sync::oneshot::Sender<EngineAnswer>,
+}
+
+/// An engine request's answer (or why there is none, as a sentence),
+/// and which host gave it: the request goes to the connection the link
+/// holds when its turn comes, which may be a newer one than when it
+/// was made.
+pub(crate) struct EngineAnswer {
+    /// The answering host's lease id (`None` when no host was asked).
+    pub(crate) host: Option<String>,
+    pub(crate) reply: Result<starling_runtime_host::engine::EngineReply, String>,
 }
 
 enum Outgoing {
@@ -286,8 +296,7 @@ impl HostLink {
     pub(crate) fn engine(
         &self,
         request: starling_runtime_host::engine::EngineRequest,
-    ) -> tokio::sync::oneshot::Receiver<Result<starling_runtime_host::engine::EngineReply, String>>
-    {
+    ) -> tokio::sync::oneshot::Receiver<EngineAnswer> {
         let (reply, answer) = tokio::sync::oneshot::channel();
         let _ = self.engine.send(EngineCall { request, reply });
         answer
@@ -413,14 +422,20 @@ fn engine_loop(
     while let Ok(call) = calls.recv() {
         let client = lock(&current).clone();
         let answer = match client {
-            Some(client) => client.engine(call.request).map_err(|err| {
-                format!("Starling's recording service did not answer about the engine ({err}).")
-            }),
-            None => Err(
-                "Starling's recording service is not connected, so the engine cannot be changed \
-                 right now."
-                    .to_string(),
-            ),
+            Some(client) => EngineAnswer {
+                host: Some(client.info.owner_id.clone()),
+                reply: client.engine(call.request).map_err(|err| {
+                    format!("Starling's recording service did not answer about the engine ({err}).")
+                }),
+            },
+            None => EngineAnswer {
+                host: None,
+                reply: Err(
+                    "Starling's recording service is not connected, so the engine cannot be \
+                     changed right now."
+                        .to_string(),
+                ),
+            },
         };
         let _ = call.reply.send(answer);
     }
