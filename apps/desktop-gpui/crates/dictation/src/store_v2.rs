@@ -2056,7 +2056,9 @@ impl StoreV2 {
     /// whatever a crash left); the report names every swept file with its
     /// size, and every entry that was left in place with the reason. Live
     /// content — `audio/`, `staging/`, anything not under the two
-    /// tombstone trees — is untouched by construction.
+    /// tombstone trees — is untouched by construction. A deleted take's
+    /// audio still pinned ([`Self::pin_audio`]: a read that began before
+    /// the delete) stays until a sweep after the pin is released.
     pub fn sweep_retention(&mut self) -> Result<SweepReport, StoreV2Error> {
         let mut report = SweepReport::default();
         // Recorder journals a stored take provably holds (#356): a copy
@@ -2072,11 +2074,21 @@ impl StoreV2 {
             &superseded,
             "journal",
             SUPERSEDED_TOMBSTONE_PREFIX,
-            &|path: &Path| !proven.contains(path),
+            &|path: &Path| {
+                (!proven.contains(path))
+                    .then_some("no stored take is proven to hold this journal's audio any more")
+            },
             &mut report,
         )?;
-        let none = |_: &Path| false;
-        self.sweep_tree(&self.root.join(QUARANTINE_DIR), "capture", "", &none, &mut report)?;
+        let pinned: HashSet<String> = self.audio_pins.keys().cloned().collect();
+        let in_use = |path: &Path| {
+            let id = path.file_stem().and_then(|stem| stem.to_str()).unwrap_or_default();
+            pinned
+                .contains(id)
+                .then_some("the deleted recording's audio is still being read")
+        };
+        self.sweep_tree(&self.root.join(QUARANTINE_DIR), "capture", "", &in_use, &mut report)?;
+        let none = |_: &Path| None;
         self.sweep_tree(
             &self.root.join(LEGACY_DELETED_SUBPATH),
             "journal",
@@ -2119,7 +2131,7 @@ impl StoreV2 {
     /// kind rows get: `capture` for v2 quarantine, `journal` for the
     /// legacy v1 tree; `stamp_prefix` goes before each file's id in its
     /// stamp, so a tree of copies never deadens the id of a live take;
-    /// the files `keep` accepts are left in place).
+    /// the files `keep` gives a reason for are left in place).
     ///
     /// Per file, the ordering is **stamp, then unlink**: the `tombstones`
     /// UPSERT (retention `'swept'`) is committed before the bytes are
@@ -2140,7 +2152,7 @@ impl StoreV2 {
         dir: &Path,
         kind: &str,
         stamp_prefix: &str,
-        keep: &dyn Fn(&Path) -> bool,
+        keep: &dyn Fn(&Path) -> Option<&'static str>,
         report: &mut SweepReport,
     ) -> Result<(), StoreV2Error> {
         let Ok(entries) = std::fs::read_dir(dir) else {
@@ -2180,11 +2192,8 @@ impl StoreV2 {
                     .push((name, "not a regular file".to_string()));
                 continue;
             }
-            if keep(&path) {
-                report.retained.push((
-                    name,
-                    "no stored take is proven to hold this journal's audio any more".to_string(),
-                ));
+            if let Some(reason) = keep(&path) {
+                report.retained.push((name, reason.to_string()));
                 continue;
             }
             let bytes = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
@@ -5289,13 +5298,15 @@ pub struct RecoveredTake {
 #[derive(Debug, Default)]
 pub struct SweepReport {
     /// Tombstoned content unlinked, in sweep order: the id, which tree it
-    /// came from (`capture` = v2 `quarantine/`, `journal` = the legacy
-    /// `journals/deleted/`), and the bytes freed.
+    /// came from (`capture` = v2 `quarantine/`, `journal` =
+    /// `journals/superseded/` or `journals/deleted/`), and the bytes freed.
     pub swept: Vec<SweptFile>,
     /// Total bytes unlinked.
     pub swept_bytes: u64,
     /// `(name, reason)` for entries left in place: files that are not
-    /// `.sj` journals, or removals that failed (the next sweep retries).
+    /// `.sj` journals or `.flac` audio, superseded journals no longer
+    /// proven copies, deleted audio still pinned, or removals that failed
+    /// (the next sweep retries).
     pub retained: Vec<(String, String)>,
 }
 
@@ -5303,7 +5314,8 @@ pub struct SweepReport {
 #[derive(Debug, Clone)]
 pub struct SweptFile {
     pub id: String,
-    /// `capture` (v2 `quarantine/`) or `journal` (legacy `journals/deleted/`).
+    /// `capture` (v2 `quarantine/`) or `journal` (`journals/superseded/`,
+    /// legacy `journals/deleted/`).
     pub kind: String,
     pub bytes: u64,
 }
