@@ -47,6 +47,9 @@ pub(crate) struct HostState {
     /// The link stopped starting the recording service (it kept failing)
     /// until the user asks again.
     pub(crate) gave_up: bool,
+    /// `down` is the whole sentence to show (see
+    /// [`HostUpdate::Disconnected`]).
+    pub(crate) down_plain: bool,
     /// Takes this window stopped or cancelled, until they are stored.
     pub(crate) finishing: Vec<FinishingTake>,
     /// A running take with no live owner this window asked for, and
@@ -227,6 +230,7 @@ impl StarlingApp {
     pub(crate) fn host_unavailable(&self) -> Option<String> {
         match (&self.host.client, &self.host.down) {
             (Some(_), _) => None,
+            (None, Some(reason)) if self.host.down_plain => Some(reason.clone()),
             (None, Some(reason)) if self.host.gave_up => Some(format!(
                 "Starling's recording service is unavailable ({reason}). Press record to try \
                  starting it again."
@@ -264,6 +268,7 @@ impl StarlingApp {
                 self.host.client = Some(client);
                 self.host.down = None;
                 self.host.gave_up = false;
+                self.host.down_plain = false;
                 if let Some(recovery) = recovery {
                     crate::upload::add_recovery_messages(self, recovery.problems, recovery.notice);
                 }
@@ -274,11 +279,13 @@ impl StarlingApp {
                 reason,
                 gave_up,
                 host_gone,
+                plain,
             } => {
                 self.host.client_pid = self.host.client.as_ref().map(|client| client.info.pid);
                 self.host.client = None;
                 self.host.down = Some(reason);
                 self.host.gave_up = gave_up;
+                self.host.down_plain = plain;
                 self.host.claiming = None;
                 self.let_go_of_takes(host_gone, cx);
             }
@@ -576,6 +583,7 @@ impl StarlingApp {
             }
             TakeUpdate::Upkeep { report, retired } => self.upkeep_reported(report, retired, cx),
             TakeUpdate::HistoryChanged => self.refresh_history(cx),
+            TakeUpdate::Engine(status) => self.engine_status_update(*status, cx),
             TakeUpdate::LiveText {
                 take,
                 partial,

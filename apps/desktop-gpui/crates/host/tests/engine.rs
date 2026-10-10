@@ -22,8 +22,14 @@ use starling_runtime::protocol::Command;
 use starling_runtime::provider::FakeProvider;
 use starling_runtime::testing::{FakeCaptureSource, FakeTakeScript};
 use starling_runtime_host::client::{EventWire, HostClient};
-use starling_runtime_host::engine::{self, EngineChoice};
+use starling_runtime_host::engine::{
+    self, EngineChoice, EngineIntent, EngineReply, EngineRequest, EngineStatus,
+};
+use starling_runtime_host::version::{BuildStamp, RetireAnswer};
 use starling_runtime_host::{serve, HostConfig, HostError};
+
+#[path = "common/fake_engine.rs"]
+mod fake_engine;
 
 const MODEL_ID: &str = "fixture-model";
 
@@ -896,5 +902,445 @@ fn a_retry_with_another_model_runs_once_the_host_s_engine_serves_it() {
     assert_eq!(store.attempts_for(&id).unwrap().len(), 2);
     drop(store);
     drop(app);
+    host.shutdown();
+}
+
+/// A connection following the take feed — and with it the engine's
+/// status pushes.
+fn watching(path: &Path) -> HostClient {
+    let client = connect(path);
+    client.take_watch().expect("watching");
+    client
+}
+
+/// The next engine status pushed to `client` that satisfies `predicate`.
+fn until_engine(
+    client: &HostClient,
+    label: &str,
+    predicate: impl Fn(&EngineStatus) -> bool,
+) -> EngineStatus {
+    use starling_runtime_host::client::TakeWire;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut last = None;
+    loop {
+        match client.recv_take_timeout(Duration::from_millis(20)) {
+            Ok(TakeWire::Engine(status)) if predicate(&status) => return *status,
+            Ok(TakeWire::Engine(status)) => last = Some(status),
+            Ok(_) => {}
+            Err(starling_runtime::channel::RecvError::Timeout) => assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {label}; last engine status {last:#?}"
+            ),
+            Err(other) => panic!("take feed error: {other:?} waiting for {label}"),
+        }
+        while let Ok(_event) = client.try_recv_event() {}
+    }
+}
+
+/// Whether `status` shows the built-in engine serving `model_id` with
+/// no switch under way.
+fn serving(status: &EngineStatus, model_id: &str) -> bool {
+    status.snapshot.as_ref().is_some_and(|snapshot| {
+        snapshot.phase == EnginePhase::Ready
+            && snapshot.switch.is_none()
+            && snapshot
+                .active
+                .as_ref()
+                .is_some_and(|active| active.model_id == model_id)
+    })
+}
+
+/// The engine settings as the app sends them: the built-in engine on
+/// `backend`, or the user's server at `endpoint`.
+fn intent(mode: EngineMode, backend: Option<starling_dictation::engine::Backend>, endpoint: &str) -> EngineIntent {
+    EngineIntent {
+        mode,
+        active_model: Some(MODEL_ID.into()),
+        backend_override: backend,
+        endpoint: endpoint.into(),
+        model: "parakeet".into(),
+    }
+}
+
+fn wait_until_gone(endpoint: &str, what: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while endpoint_answers(endpoint) {
+        assert!(Instant::now() < deadline, "{what}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// #220: the app's Activate reaches the host's engine over the socket.
+/// Every watching window hears the switch, and the engine a take still
+/// holds drains — it serves that take, and stops once it is done.
+#[test]
+fn an_activation_over_the_socket_switches_and_drains_the_host_s_engine() {
+    let Some(fixture) = fixture() else { return };
+    let other = "fixture-model-2";
+    let root = tempfile::tempdir().unwrap();
+    let config = engine_config_with_models(root.path(), Some(&fixture), &[MODEL_ID, other]);
+    let mut host = serve(host_config(
+        root.path(),
+        EngineChoice::Builtin {
+            config,
+            active_model: Some(MODEL_ID.into()),
+        },
+    ))
+    .expect("host serves");
+    let app = watching(host.socket_path());
+    let second_window = watching(host.socket_path());
+    let first = until_engine(&app, "the first model serving", |status| serving(status, MODEL_ID))
+        .snapshot
+        .and_then(|snapshot| snapshot.active)
+        .expect("an engine is active");
+    assert!(first.owned, "the host owns its engine");
+
+    // A take holds the engine (as a transcription does).
+    let lease = host.engine().expect("builtin").lease().expect("a lease on the engine");
+    let reply = app
+        .engine(EngineRequest::Activate {
+            model_id: other.into(),
+        })
+        .expect("answered");
+    assert!(matches!(reply, EngineReply::Activating { .. }), "{reply:?}");
+    for window in [&app, &second_window] {
+        let switched = until_engine(window, "the second model serving", |status| {
+            serving(status, other)
+        });
+        let active = switched.snapshot.unwrap().active.unwrap();
+        assert_ne!(active.pid, first.pid, "a second engine serves the new model");
+    }
+    assert!(
+        endpoint_answers(&first.endpoint),
+        "the old engine drains: the open take still has it"
+    );
+    drop(lease);
+    wait_until_gone(&first.endpoint, "the drained engine never stopped");
+    drop((app, second_window));
+    host.shutdown();
+}
+
+/// #220: "Use CPU engine" reloads the host's engine live, with no
+/// restart of the host and no second sidecar left behind: the new
+/// engine serves, the old one (no take holds it) stops.
+#[test]
+fn a_backend_change_over_the_socket_reloads_the_engine_live() {
+    use starling_dictation::engine::Backend;
+    let Some(fixture) = fixture() else { return };
+    let root = tempfile::tempdir().unwrap();
+    let config = engine_config(root.path(), Some(&fixture));
+    let mut host = serve(host_config(
+        root.path(),
+        EngineChoice::Builtin {
+            config,
+            active_model: Some(MODEL_ID.into()),
+        },
+    ))
+    .expect("host serves");
+    let app = watching(host.socket_path());
+    let ready = until_engine(&app, "the engine serving", |status| serving(status, MODEL_ID));
+    assert_eq!(ready.backend_override, None);
+    let first = ready.snapshot.and_then(|snapshot| snapshot.active).unwrap();
+
+    let reply = app
+        .engine(EngineRequest::Configure {
+            intent: intent(EngineMode::Builtin, Some(Backend::Cpu), ""),
+        })
+        .expect("answered");
+    let EngineReply::Done { revision } = reply else {
+        panic!("the backend change applies: {reply:?}")
+    };
+    assert!(revision > ready.revision, "the settings revision moves on");
+    let reloaded = until_engine(&app, "the reloaded engine serving", |status| {
+        status.backend_override == Some(Backend::Cpu)
+            && serving(status, MODEL_ID)
+            && status
+                .snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.active.as_ref())
+                .is_some_and(|active| active.pid != first.pid)
+    });
+    let active = reloaded.snapshot.unwrap().active.unwrap();
+    assert!(active.owned);
+    assert!(endpoint_answers(&active.endpoint), "the new engine serves");
+    wait_until_gone(&first.endpoint, "the replaced engine was left running beside the new one");
+    drop(app);
+    host.shutdown();
+}
+
+/// #220: the user's own server, set in the app, serves the host's jobs
+/// at once; switching back to the built-in engine starts it again on the
+/// host's own paths.
+#[test]
+fn a_manual_endpoint_configured_over_the_socket_serves_jobs() {
+    use fake_engine::{FakeEngine, Reply, StreamMode};
+    let Some(fixture) = fixture() else { return };
+    let root = tempfile::tempdir().unwrap();
+    let config = engine_config(root.path(), Some(&fixture));
+    let mut host = serve(host_config(
+        root.path(),
+        EngineChoice::Builtin {
+            config,
+            active_model: Some(MODEL_ID.into()),
+        },
+    ))
+    .expect("host serves");
+    let app = watching(host.socket_path());
+    let first = until_engine(&app, "the engine serving", |status| serving(status, MODEL_ID))
+        .snapshot
+        .and_then(|snapshot| snapshot.active)
+        .unwrap();
+
+    let server = FakeEngine::start(vec![Reply::Text("from my server".into())], StreamMode::Refuse);
+    let reply = app
+        .engine(EngineRequest::Configure {
+            intent: intent(EngineMode::Manual, None, &server.endpoint()),
+        })
+        .expect("answered");
+    assert!(matches!(reply, EngineReply::Done { .. }), "{reply:?}");
+    let manual = until_engine(&app, "manual mode", |status| status.mode == EngineMode::Manual);
+    assert_eq!(manual.label, format!("manual:{}", server.endpoint()));
+    assert!(manual.snapshot.is_none());
+    assert!(host.engine().is_none(), "the built-in engine is gone");
+    wait_until_gone(&first.endpoint, "the built-in engine outlived the switch to manual");
+
+    record_and_submit(&app, "take_manual", "job_manual");
+    let outcome = job_outcome(&app, "job_manual");
+    assert_eq!(outcome.type_name(), "jobs.completed", "{}", outcome.payload());
+    assert_eq!(server.batch_requests(), 1, "the job went to the user's server");
+
+    // Back to the built-in engine.
+    let reply = app
+        .engine(EngineRequest::Configure {
+            intent: intent(EngineMode::Builtin, None, &server.endpoint()),
+        })
+        .expect("answered");
+    assert!(matches!(reply, EngineReply::Done { .. }), "{reply:?}");
+    until_engine(&app, "the built-in engine serving again", |status| {
+        status.mode == EngineMode::Builtin && serving(status, MODEL_ID)
+    });
+    drop(app);
+    host.shutdown();
+}
+
+/// Serves `bytes` at `/<name>` in slow chunks, so a download's progress
+/// is observable.
+fn slow_model_server(name: &'static str, bytes: Vec<u8>) -> std::net::SocketAddr {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                match stream.read(&mut byte) {
+                    Ok(1) => head.push(byte[0]),
+                    _ => break,
+                }
+            }
+            if !String::from_utf8_lossy(&head).contains(name) {
+                let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n");
+                continue;
+            }
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                bytes.len()
+            );
+            for chunk in bytes.chunks(bytes.len().div_ceil(10)) {
+                if stream.write_all(chunk).is_err() {
+                    break;
+                }
+                let _ = stream.flush();
+                std::thread::sleep(Duration::from_millis(150));
+            }
+        }
+    });
+    addr
+}
+
+/// #220: a download the app asks for runs in the host; its progress
+/// reaches the watching app, a delete while it runs is refused with the
+/// manager's own sentence, and the model ends up installed. No engine is
+/// needed for any of it.
+#[test]
+fn a_download_over_the_socket_reports_its_progress() {
+    use starling_dictation::engine::InstallState;
+    let root = tempfile::tempdir().unwrap();
+    let mut config = engine_config(root.path(), None);
+    let bytes: Vec<u8> = (0..400_000u32).map(|i| (i % 251) as u8).collect();
+    let staged = root.path().join("expected.bin");
+    std::fs::write(&staged, &bytes).unwrap();
+    let sha = sha256_file(&staged).unwrap();
+    let addr = slow_model_server("remote.gguf", bytes.clone());
+    config.catalog.push(CatalogEntry::new(
+        "remote-model",
+        "Remote",
+        "parakeet",
+        &format!("http://{addr}/remote.gguf"),
+        bytes.len() as u64,
+        &sha,
+        false,
+        "a model to download",
+    ));
+    let mut host = serve(host_config(
+        root.path(),
+        EngineChoice::Builtin {
+            config,
+            active_model: None,
+        },
+    ))
+    .expect("host serves");
+    let app = watching(host.socket_path());
+    let install = |status: &EngineStatus| {
+        status.snapshot.as_ref().and_then(|snapshot| {
+            snapshot
+                .models
+                .iter()
+                .find(|model| model.id == "remote-model")
+                .map(|model| model.install.clone())
+        })
+    };
+    until_engine(&app, "the catalog", |status| {
+        install(status) == Some(InstallState::NotInstalled)
+    });
+
+    let reply = app
+        .engine(EngineRequest::Download {
+            model_id: "remote-model".into(),
+        })
+        .expect("answered");
+    assert!(matches!(reply, EngineReply::Done { .. }), "{reply:?}");
+    let progress = until_engine(&app, "download progress", |status| {
+        matches!(install(status), Some(InstallState::Downloading { done, total }) if done > 0 && done < total)
+    });
+    assert!(matches!(
+        install(&progress),
+        Some(InstallState::Downloading { total, .. }) if total == bytes.len() as u64
+    ));
+    match app
+        .engine(EngineRequest::Delete {
+            model_id: "remote-model".into(),
+        })
+        .expect("answered")
+    {
+        EngineReply::Refused { message } => assert!(message.contains("downloading"), "{message}"),
+        other => panic!("a delete mid-download must be refused: {other:?}"),
+    }
+    until_engine(&app, "the model installed", |status| {
+        install(status) == Some(InstallState::Installed)
+    });
+    assert_eq!(
+        std::fs::read(root.path().join("models/remote.gguf")).unwrap(),
+        bytes
+    );
+    drop(app);
+    host.shutdown();
+}
+
+/// #220: a switch the memory policy refuses reaches the app as the
+/// manager's decision, and the current model keeps serving.
+#[test]
+fn a_memory_refusal_reaches_the_app() {
+    use starling_dictation::engine::SwapDecision;
+    let Some(fixture) = fixture() else { return };
+    let other = "fixture-model-2";
+    let root = tempfile::tempdir().unwrap();
+    let mut config = engine_config_with_models(root.path(), Some(&fixture), &[MODEL_ID, other]);
+    // Barely any memory free: the second model fits neither beside the
+    // first nor after it.
+    config.available_memory_override = Some(Some(1024));
+    let mut host = serve(host_config(
+        root.path(),
+        EngineChoice::Builtin {
+            config,
+            active_model: Some(MODEL_ID.into()),
+        },
+    ))
+    .expect("host serves");
+    let app = watching(host.socket_path());
+    until_engine(&app, "the first model serving", |status| serving(status, MODEL_ID));
+    app.engine(EngineRequest::Activate {
+        model_id: other.into(),
+    })
+    .expect("answered");
+    let refused = until_engine(&app, "the refusal", |status| {
+        status
+            .snapshot
+            .as_ref()
+            .is_some_and(|snapshot| matches!(snapshot.pending_decision, Some(SwapDecision::Refused { .. })))
+    });
+    let snapshot = refused.snapshot.unwrap();
+    assert_eq!(snapshot.active.unwrap().model_id, MODEL_ID, "the current model keeps serving");
+    drop(app);
+    host.shutdown();
+}
+
+/// #220's version handshake over the socket. An older host refuses to
+/// watch for a newer app, steps aside when that app asks while it idles —
+/// not while a window of its own version is open — and refuses an older
+/// app's request. A newer host refuses an older app plainly.
+#[test]
+fn hosts_and_apps_of_different_builds_settle_who_serves() {
+    let old = BuildStamp {
+        id: "an-older-build".into(),
+        built: 1,
+    };
+    let new = BuildStamp::current();
+    assert!(old.older_than(&new));
+
+    let root = tempfile::tempdir().unwrap();
+    let mut host = serve(host_config(root.path(), EngineChoice::None).with_build(old.clone()))
+        .expect("the older host serves");
+    let probe = connect(host.socket_path());
+    assert_eq!(probe.info.build.as_ref(), Some(&old), "the hello names the host's build");
+    let refused = probe.take_watch_as(&new).expect_err("another build is not watched");
+    assert!(refused.to_string().contains("version_mismatch"), "{refused}");
+
+    // A window of the host's own version is open: it keeps its service.
+    let own_window = connect(host.socket_path());
+    own_window.take_watch_as(&old).expect("the same build is served");
+    let asking = connect(host.socket_path());
+    match asking.retire(&new).expect("answered") {
+        RetireAnswer::Busy { reason } => assert!(reason.contains("window"), "{reason}"),
+        other => panic!("a host serving a window must not step aside: {other:?}"),
+    }
+    // An older app does not get to replace it.
+    let older = BuildStamp {
+        id: "older-still".into(),
+        built: 0,
+    };
+    assert!(matches!(
+        asking.retire(&older).expect("answered"),
+        RetireAnswer::Refused { .. }
+    ));
+    assert!(!host.retire_requested());
+
+    // Once that window closed, the host steps aside for the newer app.
+    drop(own_window);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match asking.retire(&new).expect("answered") {
+            RetireAnswer::Retiring => break,
+            RetireAnswer::Busy { .. } => {
+                assert!(Instant::now() < deadline, "the idle host never stepped aside")
+            }
+            other => panic!("{other:?}"),
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(host.retire_requested(), "whoever runs the host is told to stop it");
+    host.shutdown();
+
+    // A newer host and an older app: refused, with what to do.
+    let root = tempfile::tempdir().unwrap();
+    let mut host = serve(host_config(root.path(), EngineChoice::None)).expect("the newer host serves");
+    let app = connect(host.socket_path());
+    let refused = app.take_watch_as(&old).expect_err("an older app is not served");
+    let text = refused.to_string();
+    assert!(text.contains("version_mismatch"), "{text}");
+    assert!(text.contains("older version"), "{text}");
+    assert!(text.contains("start Starling again"), "{text}");
     host.shutdown();
 }

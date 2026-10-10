@@ -1,47 +1,60 @@
-//! The supervised engine attaches to the **host**, not the renderer
+//! The supervised engine belongs to the **host**, not the renderer
 //! (E17 §1 Mode B, #220): the host owns the bundled-engine
 //! [`EngineManager`] (the `starling-serve` sidecar, its crash restarts
-//! and model switches, #362/#363), and the runtime's jobs machine
-//! reaches it through [`EngineProvider`]. Engine lifetime is host
-//! lifetime — the sidecar is spawned with the host's pid as its
-//! `--parent-pid`, a renderer that dies mid-job costs nothing, and the
-//! host's shutdown stops the engine after the machines have joined.
+//! and model switches, #362/#363, model downloads and deletes), and the
+//! runtime's jobs machine reaches it through [`EngineProvider`]. Engine
+//! lifetime is host lifetime — the sidecar is spawned with the host's
+//! pid as its `--parent-pid`, a renderer that dies mid-job costs
+//! nothing, and the host's shutdown stops the engine after the machines
+//! have joined. The app runs no engine of its own: its Settings drive
+//! this one through [`EngineRequest`]s and render the [`EngineStatus`]
+//! the host pushes to every watching window.
 //!
-//! Which engine serves is the user's existing engine choice
-//! ([`EngineChoice::from_settings`]): the bundled engine with the
-//! persisted model, the user's own server in manual mode, or none. The
-//! host reads the same settings file and the same model/state
-//! directories the desktop app uses, so the app and the host share one
-//! sidecar through the engine registry (one owns it, the other
-//! attaches) instead of loading the model twice.
+//! Which engine serves is the user's engine choice
+//! ([`EngineChoice::from_settings`] at startup, [`EngineIntent`] after):
+//! the bundled engine with the persisted model and backend, the user's
+//! own server in manual mode, or none. The host reads the same settings
+//! file and the same model/state directories the desktop app always
+//! used.
 //!
-//! # Following the settings while the host runs (#220)
+//! # Following the user's choice while the host runs
 //!
-//! The desktop app applies engine changes immediately (its
-//! `apply_engine_mode_change` / activate flows), so a host that froze
-//! its startup choice would drift from what the user just chose. The
-//! host therefore installs [`SettingsProvider`] — a switchable provider
-//! — as the runtime's provider and owns an [`EngineHost`] that tracks
-//! the live engine state. [`watch_settings`] polls the settings file
-//! (path and interval injectable; `Settings::default_path` in
-//! production) and [`EngineHost::apply`] carries each change over:
-//! `activate` for a new model, a fresh manual provider for an endpoint/model
-//! change, a started supervisor for manual→builtin, and a stopped
-//! engine for builtin→manual. A changed CPU/automatic backend override
-//! is **not** applied live — it takes effect at the host's next start
-//! (see [`EngineHost::apply`] for why). An in-flight recognition runs on the
-//! provider (and, through it, the engine lease) it started with: the
-//! provider and its in-flight count are captured together under the
-//! slot lock, and a mode switch drains that count before it stops the
-//! engine.
+//! The host installs [`SettingsProvider`] — a switchable provider — as
+//! the runtime's provider and owns an [`EngineHost`] that tracks the live
+//! engine state. Two things move it, one transition at a time:
+//!
+//! - **Requests** ([`EngineHost::handle`]): the app applies an engine
+//!   setting the moment the user makes it (`Configure`) and sends
+//!   Settings → Engine's actions (activate, download, delete, retry, …).
+//!   The app persists the settings itself; the host never writes the
+//!   settings file.
+//! - **The settings file** ([`watch_settings`]): a hand edit, or a
+//!   window that changed the file. Only the fields the file *changed*
+//!   since its last read are carried over ([`EngineHost::follow_file`]):
+//!   a request changes the engine before the app has written the file,
+//!   and a write of unrelated settings (or by a window that has not seen
+//!   the change yet) must not drag the engine back.
+//!
+//! [`EngineHost::transition`] carries a choice over: `activate` for a
+//! new model, a backend reload for a changed CPU/automatic override (the
+//! engine manager declines it for an engine another process owns rather
+//! than start a second sidecar beside it), a fresh manual provider for an
+//! endpoint/model change, a started supervisor for manual→builtin, and a
+//! stopped engine for builtin→manual. An in-flight recognition runs on
+//! the provider (and, through it, the engine lease) it started with: the
+//! provider and its in-flight count are captured together under the slot
+//! lock, and a mode switch drains that count before it stops the engine.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use serde::{Deserialize, Serialize};
 use starling_dictation::client::{ClientError, StarlingClient};
-use starling_dictation::engine::{Backend, EngineConfig, EngineLease, EngineManager, EnginePhase};
+use starling_dictation::engine::{
+    Backend, EngineConfig, EngineLease, EngineManager, EnginePhase, EngineSnapshot,
+};
 use starling_dictation::settings::{EngineMode, Settings};
 use starling_runtime::provider::{
     failure_from_client_error, CancelToken, Partial, ProviderOutcome, StarlingProvider,
@@ -65,7 +78,8 @@ const READY_POLL: Duration = Duration::from_millis(50);
 const AVOID_POLL: Duration = Duration::from_millis(250);
 
 /// How often the settings watcher polls the file: one small read, so
-/// the desktop app's engine changes are visible within a poll or two.
+/// a hand edit (or another window's write) is visible within a poll or
+/// two.
 pub const DEFAULT_SETTINGS_POLL: Duration = Duration::from_millis(1500);
 
 /// How long a builtin→manual switch waits for in-flight recognitions
@@ -87,7 +101,10 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// The user's engine choice, resolved for the host.
+/// What the app says when the user's engine is their own server.
+const BUILTIN_OFF: &str = "The built-in engine is off (Settings → Engine uses your own server).";
+
+/// The user's engine choice, resolved for the host at startup.
 #[derive(Debug, Clone)]
 pub enum EngineChoice {
     /// No engine: jobs fail `no_provider_configured` (the honest
@@ -100,31 +117,39 @@ pub enum EngineChoice {
     },
     /// The user's own server (`engine.mode = manual`).
     Manual { endpoint: String, model: String },
+    /// The bundled engine was chosen but cannot run here: its data
+    /// directory does not resolve. Nothing serves (jobs fail
+    /// `no_provider_configured`); `reason` is what the app shows, and the
+    /// user can still switch to their own server.
+    Unavailable { reason: String },
 }
 
 impl EngineChoice {
     /// The choice the desktop settings file states, with the app's own
     /// defaults: builtin on the default engine paths with the persisted
-    /// model and backend override, or the manual endpoint/model. Errors
-    /// only when the builtin engine's data directory cannot resolve.
-    pub fn from_settings(settings: &Settings) -> Result<EngineChoice, String> {
+    /// model and backend override, or the manual endpoint/model.
+    pub fn from_settings(settings: &Settings) -> EngineChoice {
         match settings.engine.mode {
-            EngineMode::Builtin => {
-                let mut config = EngineConfig::default_paths().map_err(|err| err.to_string())?;
-                config.backend_override = settings
-                    .engine
-                    .backend_override
-                    .as_deref()
-                    .and_then(Backend::parse);
-                Ok(EngineChoice::Builtin {
-                    config,
-                    active_model: settings.engine.active_model.clone(),
-                })
-            }
-            EngineMode::Manual => Ok(EngineChoice::Manual {
+            EngineMode::Builtin => match EngineConfig::default_paths() {
+                Ok(mut config) => {
+                    config.backend_override = settings
+                        .engine
+                        .backend_override
+                        .as_deref()
+                        .and_then(Backend::parse);
+                    EngineChoice::Builtin {
+                        config,
+                        active_model: settings.engine.active_model.clone(),
+                    }
+                }
+                Err(err) => EngineChoice::Unavailable {
+                    reason: err.to_string(),
+                },
+            },
+            EngineMode::Manual => EngineChoice::Manual {
                 endpoint: settings.endpoint.clone(),
                 model: settings.model.clone(),
-            }),
+            },
         }
     }
 
@@ -134,6 +159,118 @@ impl EngineChoice {
             EngineChoice::None => "none",
             EngineChoice::Builtin { .. } => "builtin",
             EngineChoice::Manual { .. } => "manual",
+            EngineChoice::Unavailable { .. } => "unavailable",
+        }
+    }
+}
+
+/// The engine settings as the user states them — Settings → Engine and
+/// the settings file's engine fields (#220). `active_model` is what a
+/// newly started engine loads (and, from the file, the model to switch
+/// to); `endpoint`/`model` are the user's own server.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EngineIntent {
+    pub mode: EngineMode,
+    pub active_model: Option<String>,
+    pub backend_override: Option<Backend>,
+    pub endpoint: String,
+    pub model: String,
+}
+
+impl EngineIntent {
+    pub fn from_settings(settings: &Settings) -> EngineIntent {
+        EngineIntent {
+            mode: settings.engine.mode,
+            active_model: settings.engine.active_model.clone(),
+            backend_override: settings
+                .engine
+                .backend_override
+                .as_deref()
+                .and_then(Backend::parse),
+            endpoint: settings.endpoint.clone(),
+            model: settings.model.clone(),
+        }
+    }
+}
+
+/// What the app asks of the host's engine ([`crate::frame::Frame::Engine`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EngineRequest {
+    /// The user changed the engine settings: mode, CPU/automatic
+    /// backend, their own server. Applied now. `intent.active_model` only
+    /// names the model an engine started by this change loads; switching
+    /// models is [`EngineRequest::Activate`].
+    Configure { intent: EngineIntent },
+    /// Download if needed, verify, then switch to the model (#363).
+    Activate { model_id: String },
+    /// Download a model without activating it.
+    Download { model_id: String },
+    CancelDownload { model_id: String },
+    /// Remove a model's files (refused while it serves, switches in, or
+    /// downloads).
+    Delete { model_id: String },
+    /// Clear a failed engine and start the last model again.
+    Retry,
+    /// Answer a pending "finish the current take, then switch?".
+    ConfirmDrainSwap,
+    /// Cancel a running switch; the current model keeps serving.
+    CancelSwitch,
+}
+
+/// The host's answer to an [`EngineRequest`]
+/// ([`crate::frame::Frame::EngineReply`]). What a request set in motion
+/// (a download's progress, a switch's stages, its failure) arrives as
+/// [`EngineStatus`] pushes, not here.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EngineReply {
+    /// Carried out, or under way. `revision` is the engine settings'
+    /// revision once this request applied ([`EngineStatus::revision`]).
+    Done { revision: u64 },
+    /// The activation is under way as the engine manager's request
+    /// `request` (see [`EngineSnapshot::activations_handled`]).
+    Activating { request: u64, revision: u64 },
+    /// Not carried out; `message` says why, for the user.
+    Refused { message: String },
+}
+
+/// The host's engine as the app renders it
+/// ([`crate::frame::Frame::EngineState`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EngineStatus {
+    /// Which engine the host runs: the built-in one, or the user's
+    /// server.
+    pub mode: EngineMode,
+    /// The built-in engine's CPU/automatic choice (builtin mode).
+    pub backend_override: Option<Backend>,
+    /// What serves (`builtin`, `manual:<endpoint>` redacted,
+    /// `unconfigured`, `unavailable`, `none`).
+    pub label: String,
+    /// The built-in engine's manager state (builtin mode, when it runs).
+    pub snapshot: Option<EngineSnapshot>,
+    /// Why no built-in engine runs although it was chosen.
+    pub unavailable: Option<String>,
+    /// Bumped whenever the engine settings this host runs change (mode,
+    /// backend, server): an app ignores the settings of a status older
+    /// than the change it just made.
+    pub revision: u64,
+}
+
+impl EngineStatus {
+    /// What a host running no engine at all reports (`--engine none`).
+    pub fn without_engine() -> EngineStatus {
+        EngineStatus {
+            mode: EngineMode::Builtin,
+            backend_override: None,
+            label: "none".to_string(),
+            snapshot: None,
+            unavailable: Some(
+                "This Starling recording service runs without a transcription engine.".to_string(),
+            ),
+            revision: 0,
         }
     }
 }
@@ -147,27 +284,47 @@ impl EngineChoice {
 /// capture and storage, jobs fail `no_provider_configured`, and the
 /// user's settings are not guessed at. The returned [`EngineHost`] is
 /// the host's live handle on the engine (current manager, settings
-/// changes, shutdown).
+/// changes, requests, shutdown).
 pub fn attach(
     choice: EngineChoice,
     runtime: &mut starling_runtime::RuntimeConfig,
 ) -> Option<Arc<EngineHost>> {
-    match choice {
-        EngineChoice::None => None,
+    attach_with_paths(choice, None, runtime)
+}
+
+/// [`attach`], with the paths and catalog the built-in engine runs on
+/// whenever this host starts one (`None`: the startup choice's, else the
+/// default data paths).
+pub fn attach_with_paths(
+    choice: EngineChoice,
+    paths: Option<EngineConfig>,
+    runtime: &mut starling_runtime::RuntimeConfig,
+) -> Option<Arc<EngineHost>> {
+    let host = match choice {
+        EngineChoice::None => return None,
         EngineChoice::Builtin {
             config,
             active_model,
-        } => {
-            let host = Arc::new(EngineHost::start_builtin(config, active_model));
-            runtime.provider = host.provider_slot();
-            Some(host)
-        }
+        } => EngineHost::start_builtin(paths.unwrap_or_else(|| config.clone()), config, active_model),
         EngineChoice::Manual { endpoint, model } => {
-            let host = Arc::new(EngineHost::manual(endpoint, model));
-            runtime.provider = host.provider_slot();
-            Some(host)
+            let (provider, label) = manual_slot(&endpoint, &model);
+            EngineHost::new(provider, label, None, EngineState::Manual { endpoint, model }, paths)
         }
-    }
+        EngineChoice::Unavailable { reason } => EngineHost::new(
+            Arc::new(UnconfiguredProvider),
+            "unavailable".to_string(),
+            None,
+            EngineState::Unavailable {
+                reason,
+                model: None,
+                backend_override: None,
+            },
+            paths,
+        ),
+    };
+    let host = Arc::new(host);
+    runtime.provider = host.provider_slot();
+    Some(host)
 }
 
 /// The runtime's switchable provider: whichever inner provider the
@@ -188,9 +345,9 @@ struct Slot {
     label: String,
     /// The counter of live recognitions on `provider`: `Some` for the
     /// engine provider (the same counter [`EngineState::Builtin`]
-    /// holds, so the mode-switch drain in [`EngineHost::apply`] waits
-    /// on exactly these calls), `None` for manual/unconfigured slots
-    /// (nothing drains behind them).
+    /// holds, so the mode-switch drain in [`EngineHost::transition`]
+    /// waits on exactly these calls), `None` for manual/unconfigured
+    /// slots (nothing drains behind them).
     in_flight: Option<Arc<AtomicUsize>>,
 }
 
@@ -209,8 +366,8 @@ impl SettingsProvider {
         }
     }
 
-    /// What serves right now — `builtin`, `manual:<endpoint>`, or
-    /// `unconfigured` (status lines and tests).
+    /// What serves right now — `builtin`, `manual:<endpoint>`,
+    /// `unconfigured` or `unavailable` (status lines and tests).
     pub fn label(&self) -> String {
         lock(&self.current).label.clone()
     }
@@ -259,23 +416,33 @@ impl TranscriptionProvider for SettingsProvider {
     }
 }
 
-/// The host's live engine attachment: the switchable provider the
-/// runtime calls through, the engine state it tracks, and the
-/// transitions ([`EngineHost::apply`]) that follow the settings file.
-/// Shared between the host handle (status, shutdown) and the settings
-/// watcher, which is the only writer while the host serves.
+/// The host's live engine: the switchable provider the runtime calls
+/// through, the engine state it tracks, and the transitions that follow
+/// the user's choice. Shared between the host handle (status, shutdown),
+/// the settings watcher and the request worker.
 pub struct EngineHost {
     provider: Arc<SettingsProvider>,
     state: Mutex<EngineState>,
     /// Set when the host begins shutting down: a builtin→manual drain
-    /// in progress on the watcher thread stops waiting, so the host's
-    /// shutdown (which joins the watcher) is not held for the drain's
-    /// grace. The runtime's own shutdown cancels the drained jobs.
+    /// in progress stops waiting, so the host's shutdown (which joins
+    /// the watcher) is not held for the drain's grace. The runtime's own
+    /// shutdown cancels the drained jobs.
     closing: AtomicBool,
+    /// The paths and catalog the built-in engine runs on (the startup
+    /// choice's, or the host config's); `None`: the default data paths,
+    /// resolved when an engine starts.
+    paths: Option<EngineConfig>,
+    /// One transition at a time (the watcher and requests both move the
+    /// engine; a builtin→manual drain included).
+    transitions: Mutex<()>,
+    /// What the settings file stated at the watcher's last read: the
+    /// base the next read is compared with.
+    file: Mutex<Option<EngineIntent>>,
+    /// See [`EngineStatus::revision`].
+    revision: AtomicU64,
 }
 
-/// What the host runs right now; the diff base for the next
-/// [`EngineHost::apply`].
+/// What the host runs right now.
 enum EngineState {
     /// Builtin mode: this host supervises an engine. `in_flight` counts
     /// live recognitions on the slot fronting its provider — what a
@@ -287,46 +454,105 @@ enum EngineState {
         /// still waiting for a lease then fails at once instead of
         /// polling a stopped engine for its whole ready wait.
         stopped: Arc<AtomicBool>,
-        active_model: Option<String>,
+        /// The model last asked for (at start, or by an activation).
+        model: Option<String>,
         backend_override: Option<Backend>,
     },
     /// Manual mode: the endpoint/model the provider was last built from.
     Manual { endpoint: String, model: String },
+    /// Builtin mode, but no engine can run: `reason` says why. `model`
+    /// and `backend_override` are what a retry starts with.
+    Unavailable {
+        reason: String,
+        model: Option<String>,
+        backend_override: Option<Backend>,
+    },
+}
+
+/// Which fields of an [`EngineIntent`] a transition carries over.
+#[derive(Debug, Clone, Copy)]
+struct Fields {
+    mode: bool,
+    backend: bool,
+    server: bool,
+    model: bool,
+}
+
+impl Fields {
+    const ALL: Fields = Fields {
+        mode: true,
+        backend: true,
+        server: true,
+        model: true,
+    };
+    /// A `Configure` request: everything but the model (activating one
+    /// is its own request).
+    const CONFIGURE: Fields = Fields {
+        mode: true,
+        backend: true,
+        server: true,
+        model: false,
+    };
+}
+
+/// A started engine: its state and the slot that fronts it.
+fn builtin_engine(
+    config: EngineConfig,
+    model: Option<String>,
+) -> (EngineState, Arc<dyn TranscriptionProvider>, Arc<AtomicUsize>) {
+    let backend_override = config.backend_override;
+    let manager = EngineManager::start(config, model.clone());
+    // One counter, shared by the slot (which raises it under its lock per
+    // call) and the state (whose mode-switch drain waits on it): the
+    // engine provider itself stays counter-free.
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let provider = EngineProvider::new(manager.clone());
+    let stopped = provider.stopped_flag();
+    (
+        EngineState::Builtin {
+            manager,
+            in_flight: Arc::clone(&in_flight),
+            stopped,
+            model,
+            backend_override,
+        },
+        Arc::new(provider),
+        in_flight,
+    )
 }
 
 impl EngineHost {
-    fn start_builtin(config: EngineConfig, active_model: Option<String>) -> EngineHost {
-        let manager = EngineManager::start(config.clone(), active_model.clone());
-        // One counter, shared by the slot (which raises it under its
-        // lock per call) and the state (whose mode-switch drain waits
-        // on it): the engine provider itself stays counter-free.
-        let in_flight = Arc::new(AtomicUsize::new(0));
-        let provider = EngineProvider::new(manager.clone());
-        let stopped = provider.stopped_flag();
+    fn new(
+        provider: Arc<dyn TranscriptionProvider>,
+        label: String,
+        in_flight: Option<Arc<AtomicUsize>>,
+        state: EngineState,
+        paths: Option<EngineConfig>,
+    ) -> EngineHost {
         EngineHost {
-            provider: Arc::new(SettingsProvider::new(
-                Arc::new(provider),
-                "builtin".to_string(),
-                Some(Arc::clone(&in_flight)),
-            )),
-            state: Mutex::new(EngineState::Builtin {
-                manager,
-                in_flight,
-                stopped,
-                active_model,
-                backend_override: config.backend_override,
-            }),
+            provider: Arc::new(SettingsProvider::new(provider, label, in_flight)),
+            state: Mutex::new(state),
             closing: AtomicBool::new(false),
+            paths,
+            transitions: Mutex::new(()),
+            file: Mutex::new(None),
+            revision: AtomicU64::new(0),
         }
     }
 
-    fn manual(endpoint: String, model: String) -> EngineHost {
-        let (provider, label) = manual_slot(&endpoint, &model);
-        EngineHost {
-            provider: Arc::new(SettingsProvider::new(provider, label, None)),
-            state: Mutex::new(EngineState::Manual { endpoint, model }),
-            closing: AtomicBool::new(false),
-        }
+    fn start_builtin(
+        paths: EngineConfig,
+        config: EngineConfig,
+        active_model: Option<String>,
+    ) -> EngineHost {
+        let (state, provider, in_flight) = builtin_engine(config, active_model);
+        EngineHost::new(
+            provider,
+            "builtin".to_string(),
+            Some(in_flight),
+            state,
+            Some(paths),
+        )
     }
 
     /// The runtime's provider slot this host fills (`attach` installs
@@ -335,117 +561,293 @@ impl EngineHost {
         Arc::clone(&self.provider)
     }
 
-    /// What serves right now (`builtin`, `manual:<endpoint>`, or
-    /// `unconfigured`) — the live analogue of [`EngineChoice::label`].
+    /// What serves right now (`builtin`, `manual:<endpoint>`,
+    /// `unconfigured` or `unavailable`) — the live analogue of
+    /// [`EngineChoice::label`].
     pub fn label(&self) -> String {
         self.provider.label()
     }
 
     /// The engine manager this host supervises right now (builtin
-    /// mode), for status reporting and tests. `None` in manual mode —
+    /// mode), for status reporting and tests. `None` otherwise —
     /// including after a live builtin→manual switch.
     pub fn manager(&self) -> Option<EngineManager> {
         match &*lock(&self.state) {
             EngineState::Builtin { manager, .. } => Some(manager.clone()),
-            EngineState::Manual { .. } => None,
+            EngineState::Manual { .. } | EngineState::Unavailable { .. } => None,
         }
     }
 
-    /// Carries a settings-resolved engine choice over to the running
-    /// host, the host-side twin of the app's immediate engine actions:
-    /// a new `activeModel` activates the model, manual endpoint/model changes
-    /// rebuild the server provider, manual→builtin starts a
+    /// The engine as the app renders it.
+    pub fn status(&self) -> EngineStatus {
+        let state = lock(&self.state);
+        let revision = self.revision.load(Ordering::SeqCst);
+        let label = self.label();
+        match &*state {
+            EngineState::Builtin {
+                manager,
+                backend_override,
+                ..
+            } => EngineStatus {
+                mode: EngineMode::Builtin,
+                backend_override: *backend_override,
+                label,
+                snapshot: Some(manager.snapshot()),
+                unavailable: None,
+                revision,
+            },
+            EngineState::Manual { .. } => EngineStatus {
+                mode: EngineMode::Manual,
+                backend_override: None,
+                label,
+                snapshot: None,
+                unavailable: None,
+                revision,
+            },
+            EngineState::Unavailable {
+                reason,
+                backend_override,
+                ..
+            } => EngineStatus {
+                mode: EngineMode::Builtin,
+                backend_override: *backend_override,
+                label,
+                snapshot: None,
+                unavailable: Some(reason.clone()),
+                revision,
+            },
+        }
+    }
+
+    /// Changes whenever [`Self::status`] would read differently: the
+    /// settings revision, and the running manager's generation.
+    pub fn generation(&self) -> (u64, u64) {
+        let state = lock(&self.state);
+        let manager = match &*state {
+            EngineState::Builtin { manager, .. } => manager.generation(),
+            EngineState::Manual { .. } | EngineState::Unavailable { .. } => 0,
+        };
+        (self.revision.load(Ordering::SeqCst), manager)
+    }
+
+    fn bump(&self) -> u64 {
+        self.revision.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// The built-in engine's config for `backend_override`: this host's
+    /// paths, or the default data paths.
+    fn builtin_config(&self, backend_override: Option<Backend>) -> Result<EngineConfig, String> {
+        let mut config = match &self.paths {
+            Some(paths) => paths.clone(),
+            None => EngineConfig::default_paths().map_err(|err| err.to_string())?,
+        };
+        config.backend_override = backend_override;
+        Ok(config)
+    }
+
+    /// Carries out an app's engine request (one at a time, on the host's
+    /// engine worker — a `Configure` may drain in-flight recognitions).
+    pub fn handle(&self, request: EngineRequest) -> EngineReply {
+        let done = |host: &EngineHost| EngineReply::Done {
+            revision: host.revision.load(Ordering::SeqCst),
+        };
+        let refused = |message: String| EngineReply::Refused { message };
+        match request {
+            EngineRequest::Configure { intent } => match self.transition(&intent, Fields::CONFIGURE)
+            {
+                Ok(()) => done(self),
+                Err(message) => refused(message),
+            },
+            EngineRequest::Activate { model_id } => {
+                let mut state = lock(&self.state);
+                match &mut *state {
+                    EngineState::Builtin { manager, model, .. } => {
+                        let request = manager.activate(&model_id);
+                        *model = Some(model_id);
+                        EngineReply::Activating {
+                            request,
+                            revision: self.revision.load(Ordering::SeqCst),
+                        }
+                    }
+                    other => refused(not_running(other)),
+                }
+            }
+            EngineRequest::Retry => {
+                let retry_unavailable = {
+                    let state = lock(&self.state);
+                    match &*state {
+                        EngineState::Builtin { manager, .. } => {
+                            manager.retry();
+                            return done(self);
+                        }
+                        EngineState::Manual { .. } => return refused(BUILTIN_OFF.to_string()),
+                        EngineState::Unavailable {
+                            model,
+                            backend_override,
+                            ..
+                        } => (model.clone(), *backend_override),
+                    }
+                };
+                // No engine could start: try again from scratch (the data
+                // directory may resolve now).
+                let (model, backend_override) = retry_unavailable;
+                let intent = EngineIntent {
+                    mode: EngineMode::Builtin,
+                    active_model: model,
+                    backend_override,
+                    endpoint: String::new(),
+                    model: String::new(),
+                };
+                match self.transition(&intent, Fields::CONFIGURE) {
+                    Ok(()) => done(self),
+                    Err(message) => refused(message),
+                }
+            }
+            other => {
+                // The rest only need the manager; it is cloned out so a
+                // delete's file work never holds the state lock.
+                let manager = match &*lock(&self.state) {
+                    EngineState::Builtin { manager, .. } => manager.clone(),
+                    other_state => return refused(not_running(other_state)),
+                };
+                match other {
+                    EngineRequest::Download { model_id } => manager.download(&model_id),
+                    EngineRequest::CancelDownload { model_id } => {
+                        manager.cancel_download(&model_id)
+                    }
+                    EngineRequest::Delete { model_id } => {
+                        if let Err(err) = manager.delete_model(&model_id) {
+                            return refused(err.to_string());
+                        }
+                    }
+                    EngineRequest::ConfirmDrainSwap => manager.confirm_drain_swap(),
+                    EngineRequest::CancelSwitch => manager.cancel_switch(),
+                    EngineRequest::Configure { .. }
+                    | EngineRequest::Activate { .. }
+                    | EngineRequest::Retry => unreachable!("handled above"),
+                }
+                done(self)
+            }
+        }
+    }
+
+    /// Follows the settings file: `intent` is what it says now. The first
+    /// read carries everything over (a change between the host's startup
+    /// load and the watcher's start must not be frozen out — and a file
+    /// that still agrees costs nothing); after that, only the fields the
+    /// file changed since its last read (see the module docs).
+    pub fn follow_file(&self, intent: EngineIntent) {
+        let previous = lock(&self.file).replace(intent.clone());
+        let fields = match previous {
+            None => Fields::ALL,
+            Some(previous) => Fields {
+                mode: previous.mode != intent.mode,
+                backend: previous.backend_override != intent.backend_override,
+                server: previous.endpoint != intent.endpoint || previous.model != intent.model,
+                model: previous.active_model != intent.active_model,
+            },
+        };
+        if let Err(reason) = self.transition(&intent, fields) {
+            eprintln!("starling-runtime-host: the engine settings cannot apply: {reason}");
+        }
+    }
+
+    /// Brings the live engine to `intent` for the `fields` given — the
+    /// host-side twin of the app's engine actions: a new model activates,
+    /// a changed backend reloads the engine, manual endpoint/model
+    /// changes rebuild the server provider, manual→builtin starts a
     /// supervisor, builtin→manual stops routing to the engine and (once
     /// in-flight recognitions finished, bounded by
     /// [`ENGINE_DRAIN_GRACE`]) shuts it down. Only the deltas run: an
-    /// unchanged choice costs nothing.
-    ///
-    /// A changed `backendOverride` (the app's "Use CPU engine" toggle)
-    /// is recorded and reported, not applied live: it takes effect at
-    /// the host's next start. Applying it means
-    /// `EngineManager::set_backend_override`, whose reload spawns the
-    /// replacement sidecar unshared — and whether this host owns its
-    /// engine or is attached to the desktop app's is only known once the
-    /// supervisor's startup resolves, *after* a queued command was
-    /// accepted. Forwarding from here would therefore let host and app
-    /// each end up owning a separate sidecar (two models resident); the
-    /// app's own toggle reloads the engine it owns, and an attached host
-    /// follows that replacement through its attach poll. A live
-    /// host-side reload needs ownership-aware support in the engine
-    /// manager itself — recorded as a follow-up, not guessed at here.
-    pub fn apply(&self, choice: EngineChoice) {
+    /// unchanged choice costs nothing. An error is why the built-in
+    /// engine cannot run (its data directory does not resolve).
+    fn transition(&self, intent: &EngineIntent, fields: Fields) -> Result<(), String> {
+        let _one = lock(&self.transitions);
         let mut state = lock(&self.state);
-        match choice {
-            EngineChoice::None => {}
-            EngineChoice::Builtin {
-                config,
-                active_model,
-            } => match &mut *state {
+        match intent.mode {
+            EngineMode::Builtin => match &mut *state {
                 EngineState::Builtin {
                     manager,
-                    active_model: current_model,
+                    model,
                     backend_override,
                     ..
                 } => {
-                    if config.backend_override != *backend_override {
-                        eprintln!(
-                            "starling-runtime-host: the engine backend setting changed; \
-                             it applies at the host's next start"
-                        );
-                        *backend_override = config.backend_override;
+                    if fields.backend && intent.backend_override != *backend_override {
+                        // Live: the app runs no engine of its own, so the
+                        // reload replaces the engine this host owns (the
+                        // old one drains). One another process owns keeps
+                        // its backend — the manager will not start a
+                        // second sidecar beside it, and says so.
+                        manager.set_backend_override(intent.backend_override);
+                        *backend_override = intent.backend_override;
+                        self.bump();
                     }
-                    if active_model != *current_model {
-                        match active_model.as_deref() {
+                    if fields.model {
+                        match intent.active_model.as_deref() {
                             Some(model_id) => {
-                                manager.activate(model_id);
+                                if !serves_or_loads(manager, model.as_deref(), model_id) {
+                                    manager.activate(model_id);
+                                    *model = Some(model_id.to_string());
+                                }
                             }
                             // The settings stopped naming a model. The
                             // app always persists its active choice, so
                             // this is a hand-edited or foreign file; keep
                             // the engine the running jobs know (the
-                            // supervisor has no "serve nothing"
-                            // command, and stopping under the user's
-                            // takes is the worse failure).
+                            // supervisor has no "serve nothing" command,
+                            // and stopping under the user's takes is the
+                            // worse failure).
                             None => eprintln!(
-                                "starling-runtime-host: the settings name no engine \
-                                 model; keeping the running one"
+                                "starling-runtime-host: the settings name no engine model; \
+                                 keeping the running one"
                             ),
                         }
-                        *current_model = active_model;
                     }
+                    Ok(())
                 }
-                EngineState::Manual { .. } => {
-                    // manual → builtin: start a supervisor, then aim the
-                    // runtime at it (with the counter its future mode
-                    // switch will drain on).
-                    let manager = EngineManager::start(config.clone(), active_model.clone());
-                    let in_flight = Arc::new(AtomicUsize::new(0));
-                    let provider = EngineProvider::new(manager.clone());
-                    let stopped = provider.stopped_flag();
-                    self.provider.install(
-                        Arc::new(provider),
-                        "builtin".to_string(),
-                        Some(Arc::clone(&in_flight)),
-                    );
-                    *state = EngineState::Builtin {
-                        manager,
-                        in_flight,
-                        stopped,
-                        active_model,
-                        backend_override: config.backend_override,
+                EngineState::Manual { .. } | EngineState::Unavailable { .. } if fields.mode => {
+                    // → builtin: start a supervisor, then aim the runtime
+                    // at it (with the counter its future mode switch will
+                    // drain on).
+                    let config = match self.builtin_config(intent.backend_override) {
+                        Ok(config) => config,
+                        Err(reason) => {
+                            self.provider.install(
+                                Arc::new(UnconfiguredProvider),
+                                "unavailable".to_string(),
+                                None,
+                            );
+                            *state = EngineState::Unavailable {
+                                reason: reason.clone(),
+                                model: intent.active_model.clone(),
+                                backend_override: intent.backend_override,
+                            };
+                            self.bump();
+                            return Err(reason);
+                        }
                     };
+                    let (started, provider, in_flight) =
+                        builtin_engine(config, intent.active_model.clone());
+                    self.provider
+                        .install(provider, "builtin".to_string(), Some(in_flight));
+                    *state = started;
+                    self.bump();
+                    Ok(())
                 }
+                // The file left the mode alone: nothing of the built-in
+                // engine's applies to the engine that runs.
+                EngineState::Manual { .. } | EngineState::Unavailable { .. } => Ok(()),
             },
-            EngineChoice::Manual { endpoint, model } => {
+            EngineMode::Manual => {
                 let changed = match &*state {
                     EngineState::Manual {
                         endpoint: current,
                         model: current_model,
-                    } => current != &endpoint || current_model != &model,
-                    EngineState::Builtin { .. } => true,
+                    } => fields.server && (current != &intent.endpoint || current_model != &intent.model),
+                    EngineState::Builtin { .. } | EngineState::Unavailable { .. } => fields.mode,
                 };
                 if !changed {
-                    return;
+                    return Ok(());
                 }
                 // Swap first: every job submitted after this line routes
                 // to the manual provider, never to the engine a mode
@@ -456,15 +858,16 @@ impl EngineHost {
                 // swap already raised the counter the drain below waits
                 // on (see `SettingsProvider::recognize`), so it cannot
                 // be missed.
-                let (provider, label) = manual_slot(&endpoint, &model);
+                let (provider, label) = manual_slot(&intent.endpoint, &intent.model);
                 self.provider.install(provider, label, None);
                 let previous = std::mem::replace(
                     &mut *state,
                     EngineState::Manual {
-                        endpoint: endpoint.clone(),
-                        model: model.clone(),
+                        endpoint: intent.endpoint.clone(),
+                        model: intent.model.clone(),
                     },
                 );
+                self.bump();
                 // The state already says manual: release it before the
                 // drain below, so status reads (`manager()`) and the
                 // host's shutdown never wait out the grace behind it.
@@ -494,6 +897,7 @@ impl EngineHost {
                     stopped.store(true, Ordering::SeqCst);
                     manager.shutdown();
                 }
+                Ok(())
             }
         }
     }
@@ -525,6 +929,10 @@ impl EngineHost {
                     )
                 })
             }
+            EngineState::Unavailable { reason, .. } => Err(format!(
+                "The built-in engine cannot run ({reason}), so this recording shows no live \
+                 text. It is saved either way."
+            )),
         }
     }
 
@@ -578,9 +986,11 @@ impl EngineHost {
                         Want::Current => Target::manual(endpoint, model).map_err(|err| {
                             format!("Your server's endpoint in Settings is not usable: {err}")
                         }),
-                        Want::Model(_) => Err("The built-in engine is off (Settings → Engine uses your own server)."
-                            .to_string()),
+                        Want::Model(_) => Err(BUILTIN_OFF.to_string()),
                     };
+                }
+                EngineState::Unavailable { reason, .. } => {
+                    return Err(format!("The built-in engine cannot run: {reason}"));
                 }
             };
             if let Some(target) = found {
@@ -617,13 +1027,33 @@ impl EngineHost {
     pub fn shutdown(&self) {
         // Clone out and release the state lock before the blocking stop,
         // so status reads (`label()`, `manager()`) never wait behind it.
-        let manager = match &*lock(&self.state) {
-            EngineState::Builtin { manager, .. } => Some(manager.clone()),
-            EngineState::Manual { .. } => None,
-        };
+        let manager = self.manager();
         if let Some(manager) = manager {
             manager.shutdown();
         }
+    }
+}
+
+/// Why a request for the built-in engine finds none.
+fn not_running(state: &EngineState) -> String {
+    match state {
+        EngineState::Unavailable { reason, .. } => {
+            format!("The built-in engine cannot run: {reason}")
+        }
+        EngineState::Builtin { .. } | EngineState::Manual { .. } => BUILTIN_OFF.to_string(),
+    }
+}
+
+/// Whether `manager` already serves (or is bringing up) `model_id`: a
+/// switch to it runs, it is active with no switch away from it, or —
+/// before anything is active — it is the model the engine started with
+/// (its first launch is no switch).
+fn serves_or_loads(manager: &EngineManager, started_with: Option<&str>, model_id: &str) -> bool {
+    let snapshot = manager.snapshot();
+    match (&snapshot.switch, &snapshot.active) {
+        (Some(switch), _) => switch.target_model_id == model_id,
+        (None, Some(active)) => active.model_id == model_id,
+        (None, None) => started_with == Some(model_id),
     }
 }
 
@@ -856,9 +1286,8 @@ fn is_secret_key(key: &str) -> bool {
 /// Spawns the host's settings watcher (#220): polls `path`'s bytes
 /// every `poll` and, when they change, parses the **captured** bytes
 /// ([`Settings::from_json_bytes`], never a second read of the file —
-/// the bytes between two reads could differ) and applies the engine
-/// choice they resolve to ([`EngineChoice::from_settings`], the same
-/// load the host started from) to `host`.
+/// the bytes between two reads could differ) and has `host` follow the
+/// engine settings they state ([`EngineHost::follow_file`]).
 ///
 /// Bytes that are not valid JSON — an empty or truncated file, what a
 /// non-atomic writer looks like mid-write — state no choice: the host
@@ -868,12 +1297,11 @@ fn is_secret_key(key: &str) -> bool {
 /// must not read as "the user chose the defaults".
 ///
 /// The watcher starts with no `last`: whatever the file says at its
-/// first poll is applied, so a change between the startup load (which
+/// first poll is followed, so a change between the startup load (which
 /// resolved the host's initial [`EngineChoice`]) and the watcher's
-/// start is not silently frozen out. That first apply is a no-op when
-/// the file still agrees with the startup choice — `apply` only runs
-/// deltas (same model and backend for builtin, same endpoint and model
-/// for manual). Stops when `stop` is set (checked every slice), so the
+/// start is not silently frozen out. That first read is a no-op when
+/// the file still agrees with the running engine — transitions only run
+/// deltas. Stops when `stop` is set (checked every slice), so the
 /// host's shutdown joins it before it stops the engine.
 pub fn watch_settings(
     host: Arc<EngineHost>,
@@ -919,19 +1347,12 @@ pub fn watch_settings(
                     }
                     last = current.clone();
                     match Settings::from_json_bytes(bytes) {
-                        Some(settings) => match EngineChoice::from_settings(&settings) {
-                            Ok(choice) => {
-                                // Valid again: a later recurrence of a
-                                // bad content is reported anew.
-                                reported_bad = None;
-                                host.apply(choice);
-                            }
-                            Err(err) => eprintln!(
-                                "starling-runtime-host: engine settings at {}: {err}; \
-                                 the engine stays as it is",
-                                path.display()
-                            ),
-                        },
+                        Some(settings) => {
+                            // Valid again: a later recurrence of a bad
+                            // content is reported anew.
+                            reported_bad = None;
+                            host.follow_file(EngineIntent::from_settings(&settings));
+                        }
                         // Not JSON — an empty or truncated file. The host
                         // keeps its last-applied choice; report each
                         // distinct bad content once (the same truncated
@@ -1309,7 +1730,7 @@ mod tests {
         let mut settings = Settings::default_settings();
         settings.engine.mode = EngineMode::Manual;
         settings.endpoint = "http://127.0.0.1:9999".into();
-        match EngineChoice::from_settings(&settings).unwrap() {
+        match EngineChoice::from_settings(&settings) {
             EngineChoice::Manual { endpoint, model } => {
                 assert_eq!(endpoint, "http://127.0.0.1:9999");
                 assert_eq!(model, settings.model);
@@ -1320,7 +1741,7 @@ mod tests {
         settings.engine.active_model = Some("parakeet-v3-q8".into());
         settings.engine.backend_override = Some("cpu".into());
         // default_paths needs a data dir; every CI runner has one.
-        match EngineChoice::from_settings(&settings).unwrap() {
+        match EngineChoice::from_settings(&settings) {
             EngineChoice::Builtin {
                 config,
                 active_model,
@@ -1473,19 +1894,38 @@ mod tests {
 
         // The follow path keeps the same honesty: another unusable
         // endpoint (a scheme the client rejects) stays unconfigured.
-        host.apply(EngineChoice::Manual {
-            endpoint: "ftp://127.0.0.1:1".into(),
-            model: "parakeet".into(),
-        });
+        apply(&host, manual("ftp://127.0.0.1:1"));
         assert_eq!(host.label(), "unconfigured");
 
         // And a usable endpoint takes over.
-        host.apply(EngineChoice::Manual {
-            endpoint: "http://127.0.0.1:8181".into(),
-            model: "parakeet".into(),
-        });
+        apply(&host, manual("http://127.0.0.1:8181"));
         assert_eq!(host.label(), "manual:http://127.0.0.1:8181");
         host.shutdown();
+    }
+
+    /// The user's own server at `endpoint`.
+    fn manual(endpoint: &str) -> EngineIntent {
+        EngineIntent {
+            mode: EngineMode::Manual,
+            active_model: None,
+            backend_override: None,
+            endpoint: endpoint.into(),
+            model: "parakeet".into(),
+        }
+    }
+
+    /// The built-in engine with no model.
+    fn builtin() -> EngineIntent {
+        EngineIntent {
+            mode: EngineMode::Builtin,
+            ..manual("")
+        }
+    }
+
+    /// Brings `host` to `intent` as a first read of the settings file
+    /// would (every field).
+    fn apply(host: &EngineHost, intent: EngineIntent) {
+        host.transition(&intent, Fields::ALL).expect("the transition applies");
     }
 
     /// An engine-less config over a temp dir (no engine staged, no
@@ -1511,11 +1951,12 @@ mod tests {
     fn apply_moves_the_live_host_between_manual_and_builtin() {
         let root = tempfile::tempdir().unwrap();
         let mut runtime = starling_runtime::RuntimeConfig::default();
-        let host = attach(
+        let host = attach_with_paths(
             EngineChoice::Manual {
                 endpoint: "http://127.0.0.1:8181".into(),
                 model: "parakeet".into(),
             },
+            Some(detached_config(root.path())),
             &mut runtime,
         )
         .expect("manual mode attaches");
@@ -1524,10 +1965,7 @@ mod tests {
 
         // manual → builtin: a supervisor starts and the runtime routes
         // to it.
-        host.apply(EngineChoice::Builtin {
-            config: detached_config(root.path()),
-            active_model: None,
-        });
+        apply(&host, builtin());
         assert_eq!(host.label(), "builtin");
         assert!(
             host.manager().is_some(),
@@ -1536,10 +1974,7 @@ mod tests {
 
         // builtin → manual: the provider swaps (the runtime would route
         // manual from here) and the engine stops.
-        host.apply(EngineChoice::Manual {
-            endpoint: "http://127.0.0.1:9192".into(),
-            model: "parakeet".into(),
-        });
+        apply(&host, manual("http://127.0.0.1:9192"));
         assert_eq!(host.label(), "manual:http://127.0.0.1:9192");
         assert!(
             host.manager().is_none(),
@@ -1547,19 +1982,70 @@ mod tests {
         );
 
         // A manual endpoint change rebuilds the provider in place.
-        host.apply(EngineChoice::Manual {
-            endpoint: "http://127.0.0.1:9193".into(),
-            model: "parakeet".into(),
-        });
+        apply(&host, manual("http://127.0.0.1:9193"));
         assert_eq!(host.label(), "manual:http://127.0.0.1:9193");
 
         // An unchanged choice is a no-op, and shutdown (manual mode)
         // stops nothing.
-        host.apply(EngineChoice::Manual {
-            endpoint: "http://127.0.0.1:9193".into(),
-            model: "parakeet".into(),
-        });
+        apply(&host, manual("http://127.0.0.1:9193"));
         assert_eq!(host.label(), "manual:http://127.0.0.1:9193");
+        host.shutdown();
+    }
+
+    /// The file-follow rule (#220): a request moves the engine before
+    /// the app has written the file, so a later write that leaves the
+    /// engine fields as they were (other settings, or a window that has
+    /// not seen the change) must not drag it back — only what the file
+    /// changed is carried over.
+    #[test]
+    fn a_file_write_that_leaves_the_engine_alone_does_not_undo_a_request() {
+        let root = tempfile::tempdir().unwrap();
+        let mut runtime = starling_runtime::RuntimeConfig::default();
+        let host = attach_with_paths(
+            EngineChoice::Manual {
+                endpoint: "http://127.0.0.1:8181".into(),
+                model: "parakeet".into(),
+            },
+            Some(detached_config(root.path())),
+            &mut runtime,
+        )
+        .expect("manual mode attaches");
+        host.follow_file(manual("http://127.0.0.1:8181"));
+        let before = host.status().revision;
+
+        // The app's request: another server.
+        let reply = host.handle(EngineRequest::Configure {
+            intent: manual("http://127.0.0.1:9201"),
+        });
+        assert!(
+            matches!(reply, EngineReply::Done { revision } if revision > before),
+            "{reply:?}"
+        );
+        assert_eq!(host.label(), "manual:http://127.0.0.1:9201");
+
+        // A write that still names the old server (unchanged since the
+        // last read) leaves the engine where the request put it.
+        host.follow_file(manual("http://127.0.0.1:8181"));
+        assert_eq!(host.label(), "manual:http://127.0.0.1:9201");
+
+        // A write that changes it is followed.
+        host.follow_file(manual("http://127.0.0.1:9202"));
+        assert_eq!(host.label(), "manual:http://127.0.0.1:9202");
+
+        // A changed mode is followed too, and the status says so.
+        host.follow_file(builtin());
+        let status = host.status();
+        assert_eq!(status.mode, EngineMode::Builtin);
+        assert!(status.snapshot.is_some());
+        // Requests the built-in engine cannot serve in manual mode are
+        // refused with a sentence, not dropped.
+        host.follow_file(manual("http://127.0.0.1:9202"));
+        match host.handle(EngineRequest::Activate {
+            model_id: "parakeet".into(),
+        }) {
+            EngineReply::Refused { message } => assert!(message.contains("built-in engine is off")),
+            other => panic!("{other:?}"),
+        }
         host.shutdown();
     }
 
@@ -1583,10 +2069,7 @@ mod tests {
         let manager = host.manager().expect("builtin mode supervises an engine");
         assert!(manager.snapshot().switch.is_none());
 
-        host.apply(EngineChoice::Builtin {
-            config,
-            active_model: None,
-        });
+        apply(&host, builtin());
 
         assert!(
             manager.snapshot().switch.is_none(),
@@ -1619,7 +2102,9 @@ mod tests {
         // call instead of a real engine request).
         let in_flight = match &*lock(&host.state) {
             EngineState::Builtin { in_flight, .. } => Arc::clone(in_flight),
-            EngineState::Manual { .. } => panic!("the host started builtin"),
+            EngineState::Manual { .. } | EngineState::Unavailable { .. } => {
+                panic!("the host started builtin")
+            }
         };
         let (started, started_rx) = std::sync::mpsc::channel();
         let (release, gate) = std::sync::mpsc::channel();
@@ -1654,10 +2139,7 @@ mod tests {
         let applier = {
             let host = Arc::clone(&host);
             std::thread::spawn(move || {
-                host.apply(EngineChoice::Manual {
-                    endpoint: "http://127.0.0.1:9194".into(),
-                    model: "parakeet".into(),
-                })
+                apply(&host, manual("http://127.0.0.1:9194"))
             })
         };
         let deadline = Instant::now() + Duration::from_secs(5);

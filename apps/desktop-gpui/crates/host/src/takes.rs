@@ -408,6 +408,30 @@ impl TakeHub {
         }
     }
 
+    /// The host's engine changed: every watching app renders the new
+    /// status (dropped for one whose queue is full — the next change, or
+    /// its reconnect, brings it up to date).
+    pub(crate) fn engine_state(&self, status: &crate::engine::EngineStatus) {
+        let state = lock_registry(&self.state);
+        for watcher in &state.watchers {
+            let _ = watcher.conn.try_deliver(Frame::EngineState {
+                status: Box::new(status.clone()),
+            });
+        }
+    }
+
+    /// How many live apps besides `conn` follow the feed.
+    pub(crate) fn watchers_besides(&self, conn: &Arc<ConnState>) -> usize {
+        let state = lock_registry(&self.state);
+        state
+            .watchers
+            .iter()
+            .filter(|watcher| {
+                !Arc::ptr_eq(&watcher.conn, conn) && !watcher.conn.closed.load(Ordering::SeqCst)
+            })
+            .count()
+    }
+
     /// Whether a take records or is still being stored.
     pub fn busy(&self) -> bool {
         let state = lock_registry(&self.state);

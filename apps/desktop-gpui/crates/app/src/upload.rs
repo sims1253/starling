@@ -91,6 +91,7 @@ impl StarlingApp {
                     link.retry();
                     self.host.gave_up = false;
                     self.host.down = Some("connecting".to_string());
+                    self.host.down_plain = false;
                     "Starting Starling's recording service again; record once it is ready."
                         .to_string()
                 }
@@ -454,11 +455,11 @@ impl StarlingApp {
         .detach();
     }
 
-    /// Retry on an installed built-in model (#356): the engine switches
-    /// to it the way Settings would (it stays the active model), and the
-    /// recording service transcribes once that model serves. Nothing is
-    /// attempted — and the take is untouched — when the switch does not
-    /// happen.
+    /// Retry on an installed built-in model (#356): the host's engine
+    /// switches to it the way Settings would (it stays the active model),
+    /// and the recording service transcribes once that model serves.
+    /// Nothing is attempted — and the take is untouched — when the switch
+    /// does not happen.
     fn retry_after_switch(
         &mut self,
         id: String,
@@ -467,7 +468,8 @@ impl StarlingApp {
         pin: AudioHold,
         cx: &mut Context<Self>,
     ) {
-        let Some(engine) = self.engine.clone() else {
+        use starling_runtime_host::engine::{EngineReply, EngineRequest};
+        if self.engine_settings.mode != starling_dictation::settings::EngineMode::Builtin {
             self.error = Some(
                 "The built-in engine is off (Settings → Engine uses your own server), so this \
                  model cannot transcribe. The recording is unchanged."
@@ -475,24 +477,71 @@ impl StarlingApp {
             );
             cx.notify();
             return;
-        };
+        }
         let with = TranscribeWith::Model {
             model_id: model_id.clone(),
         };
-        if engine.lease().is_some_and(|lease| lease.model_id() == model_id) {
+        let serving = self.engine_snapshot().is_some_and(|snapshot| {
+            snapshot.phase == starling_dictation::engine::EnginePhase::Ready
+                && snapshot.switch.is_none()
+                && snapshot
+                    .active
+                    .as_ref()
+                    .is_some_and(|active| active.model_id == model_id)
+        });
+        if serving {
             self.ask_host_to_transcribe(id, with, Some(pin), true, cx);
             return;
         }
-        let request = engine.activate(&model_id);
         let pending = PendingRetry {
             take_id: id.clone(),
             model_id: model_id.clone(),
             seq,
         };
         self.pending_retry = Some(pending.clone());
+        self.engine_activating = Some(model_id.clone());
         cx.notify();
-        let instance = self.engine_instance;
         let started = Instant::now();
+        self.send_engine_request(
+            EngineRequest::Activate {
+                model_id: model_id.clone(),
+            },
+            cx,
+            move |app, reply, cx| {
+                if app.pending_retry.as_ref() != Some(&pending) {
+                    return;
+                }
+                let refusal = match reply {
+                    Ok(EngineReply::Activating { request, .. }) => {
+                        app.wait_for_retry_switch(pending, with, pin, request, started, cx);
+                        return;
+                    }
+                    Ok(EngineReply::Refused { message }) | Err(message) => message,
+                    Ok(EngineReply::Done { .. }) => "the engine did not switch to it.".to_string(),
+                };
+                app.pending_retry = None;
+                app.error = Some(format!(
+                    "Could not retry with {}: {refusal} The recording is unchanged.",
+                    crate::views::drawer::provenance_label(&format!("engine:{model_id}"))
+                ));
+                cx.notify();
+            },
+        );
+    }
+
+    /// Follows the engine's switch to the retry's model (the engine's
+    /// activation `request`) and asks for the transcription once the
+    /// model serves.
+    fn wait_for_retry_switch(
+        &mut self,
+        pending: PendingRetry,
+        with: TranscribeWith,
+        pin: AudioHold,
+        request: u64,
+        started: Instant,
+        cx: &mut Context<Self>,
+    ) {
+        let model_id = pending.model_id.clone();
         cx.spawn(async move |this, cx| {
             let mut job = Some((with, pin));
             loop {
@@ -504,10 +553,12 @@ impl StarlingApp {
                         // Replaced by another choice: this wait is over.
                         return true;
                     }
-                    if app.engine_instance != instance {
-                        // The engine itself was replaced or stopped (a
-                        // mode switch): the model will not load for this
-                        // retry, and its audio is released.
+                    if app.engine_settings.mode
+                        != starling_dictation::settings::EngineMode::Builtin
+                    {
+                        // The engine was switched off in Settings while the
+                        // model loaded: it will not load for this retry,
+                        // and its audio is released.
                         app.pending_retry = None;
                         app.error = Some(format!(
                             "The retry with {} was cancelled: the engine changed in \
@@ -525,12 +576,17 @@ impl StarlingApp {
                         cx.notify();
                         return true;
                     }
-                    match switch_progress(&engine.snapshot(), &model_id, request, started.elapsed()) {
+                    let progress = match app.engine_snapshot() {
+                        Some(snapshot) => {
+                            switch_progress(&snapshot, &model_id, request, started.elapsed())
+                        }
+                        None => SwitchProgress::Failed(app.engine_unavailable()),
+                    };
+                    match progress {
                         SwitchProgress::Waiting => false,
                         SwitchProgress::Ready => {
                             // The service follows the switch (the same
-                            // settings, the same engine) and waits for the
-                            // model itself.
+                            // engine) and waits for the model itself.
                             app.pending_retry = None;
                             if let Some((with, pin)) = job.take() {
                                 app.ask_host_to_transcribe(
@@ -569,7 +625,7 @@ impl StarlingApp {
     /// from Settings when one is set up.
     pub(crate) fn retry_choices(&self) -> Vec<RetryChoice> {
         let mut choices = Vec::new();
-        if let Some(snapshot) = self.engine.as_ref().map(|engine| engine.snapshot()) {
+        if let Some(snapshot) = self.engine_snapshot() {
             let mut models: Vec<_> = snapshot
                 .models
                 .iter()
@@ -1238,23 +1294,113 @@ mod tests {
         });
     }
 
-    /// An engine without binaries: it never serves, so a retry waiting
-    /// on one of its models waits until something else ends it.
-    fn idle_engine(root: &std::path::Path) -> starling_dictation::engine::EngineManager {
-        std::fs::create_dir_all(root.join("engines")).expect("engines");
-        starling_dictation::engine::EngineManager::start(
-            starling_dictation::engine::EngineConfig {
-                engine_dir: Some(root.join("engines")),
-                models_dir: root.join("models"),
-                state_dir: root.join("state"),
+    /// A host serving `root` whose built-in engine has no binaries: it
+    /// never serves, so a retry waiting on one of its models waits until
+    /// something else ends it. The app connects to it and has heard its
+    /// engine.
+    fn idle_engine_app(
+        cx: &mut gpui::TestAppContext,
+        root: &std::path::Path,
+        store: &Store,
+        id: &str,
+    ) -> (starling_runtime_host::HostHandle, gpui::Entity<StarlingApp>) {
+        let host_root = root.join("engine");
+        std::fs::create_dir_all(host_root.join("engines")).expect("engines");
+        let engine = starling_runtime_host::engine::EngineChoice::Builtin {
+            config: starling_dictation::engine::EngineConfig {
+                engine_dir: Some(host_root.join("engines")),
+                models_dir: host_root.join("models"),
+                state_dir: host_root.join("state"),
                 catalog: Vec::new(),
                 backend_override: None,
                 icd_dirs: None,
                 available_memory_override: None,
                 backoff_schedule: None,
             },
-            None,
+            active_model: None,
+        };
+        let host = starling_runtime_host::serve(
+            starling_runtime_host::HostConfig::new(root, root.join("endpoints"))
+                .with_engine(engine),
         )
+        .expect("host serves");
+        let socket = host.socket_path().to_path_buf();
+        let app = cx.new(|cx| {
+            let mut app = StarlingApp::for_test(Some(store.clone()), cx);
+            app.apply_sessions(store.list().expect("list"));
+            app.selected_id = Some(id.to_string());
+            app.follow_host(socket, crate::host_link::Launch::Never, cx);
+            app
+        });
+        settle(cx, "the host's engine reported", |cx| {
+            app.read_with(cx, |app, _| {
+                app.host.client.is_some()
+                    && app.engine_settings.mode == starling_dictation::settings::EngineMode::Builtin
+            })
+        });
+        (host, app)
+    }
+
+    /// #220: the engine runs in the host, and every window renders it.
+    /// A backend change one window makes reaches the host's engine and
+    /// becomes the other window's committed setting (and its untouched
+    /// draft), so a later Save there does not undo it; a change to the
+    /// user's server moves both windows to manual mode.
+    #[gpui::test]
+    fn a_second_window_follows_the_engine_settings_made_in_the_first(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use starling_dictation::settings::EngineMode;
+        let root = scratch("two-windows");
+        let store = Store::at_test_root(&root);
+        let id = store.save_capture(one_second_wav()).expect("save").id;
+        let (mut host, first) = idle_engine_app(cx, &root, &store, &id);
+        let socket = host.socket_path().to_path_buf();
+        let second = cx.new(|cx| {
+            let mut app = StarlingApp::for_test(Some(store.clone()), cx);
+            app.follow_host(socket, crate::host_link::Launch::Never, cx);
+            app
+        });
+        settle(cx, "the second window hearing the engine", |cx| {
+            second.read_with(cx, |app, _| app.engine_status.is_some())
+        });
+        second.read_with(cx, |app, _| {
+            // No engine binaries: the host's engine failed, and says so.
+            let snapshot = app.engine_snapshot().expect("the host's engine state");
+            assert!(matches!(snapshot.phase, starling_dictation::engine::EnginePhase::Failed(_)));
+            assert_eq!(app.connection, crate::app::Connection::Offline);
+            assert_eq!(app.engine_settings.backend_override, None);
+        });
+
+        first.update(cx, |app, cx| {
+            app.engine_settings.backend_override = Some("cpu".to_string());
+            app.draft_backend_override = Some("cpu".to_string());
+            app.configure_engine(cx);
+        });
+        settle(cx, "the second window on the CPU engine", |cx| {
+            second.read_with(cx, |app, _| {
+                app.engine_settings.backend_override.as_deref() == Some("cpu")
+                    && app.draft_backend_override.as_deref() == Some("cpu")
+            })
+        });
+        assert!(host.engine().is_some(), "a backend change keeps the built-in engine");
+
+        first.update(cx, |app, cx| {
+            app.engine_settings.mode = EngineMode::Manual;
+            app.endpoint = "http://127.0.0.1:9".to_string();
+            app.configure_engine(cx);
+        });
+        settle(cx, "the second window in manual mode", |cx| {
+            second.read_with(cx, |app, _| {
+                app.engine_settings.mode == EngineMode::Manual
+                    && app.draft_engine_mode == EngineMode::Manual
+                    && app.engine_snapshot().is_none()
+            })
+        });
+        assert!(host.engine().is_none(), "the built-in engine stopped");
+        drop((first, second));
+        host.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A "Retry with your server" click with no server set up says so
@@ -1263,18 +1409,11 @@ mod tests {
     fn a_server_retry_that_cannot_run_leaves_a_waiting_retry_alone(
         cx: &mut gpui::TestAppContext,
     ) {
-        let root = scratch("server-retry-keeps-pending");
+        let root = scratch("srv-retry-pending");
         let store = Store::at_test_root(&root);
         let id = store.save_capture(one_second_wav()).expect("save").id;
-        let engine = idle_engine(&root);
-        let app = cx.new(|cx| {
-            let mut app = StarlingApp::for_test(Some(store.clone()), cx);
-            app.engine = Some(engine.clone());
-            app.endpoint = String::new();
-            app.apply_sessions(store.list().expect("list"));
-            app.selected_id = Some(id.clone());
-            app
-        });
+        let (mut host, app) = idle_engine_app(cx, &root, &store, &id);
+        app.update(cx, |app, _| app.endpoint = String::new());
         app.update(cx, |app, cx| app.retry_selected_with(RetryWith::Model("model-b".to_string()), cx));
         cx.run_until_parked();
         let waiting = app.read_with(cx, |app, _| app.pending_retry.clone());
@@ -1286,7 +1425,8 @@ mod tests {
             assert!(error.contains("No server"), "{error}");
             assert_eq!(app.pending_retry, waiting, "the waiting retry carries on");
         });
-        engine.shutdown();
+        drop(app);
+        host.shutdown();
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1298,21 +1438,21 @@ mod tests {
         let root = scratch("engine-change");
         let store = Store::at_test_root(&root);
         let id = store.save_capture(one_second_wav()).expect("save").id;
-        let engine = idle_engine(&root);
-        let app = cx.new(|cx| {
-            let mut app = StarlingApp::for_test(Some(store.clone()), cx);
-            app.engine = Some(engine.clone());
-            app.apply_sessions(store.list().expect("list"));
-            app.selected_id = Some(id.clone());
-            app
-        });
+        let (mut host, app) = idle_engine_app(cx, &root, &store, &id);
         app.update(cx, |app, cx| app.retry_selected_with(RetryWith::Model("model-b".to_string()), cx));
         cx.run_until_parked();
         assert!(app.read_with(cx, |app, _| app.pending_retry.is_some()));
         // Settings → Engine: your own server.
-        app.update(cx, |app, _| {
-            app.engine = None;
-            app.engine_instance += 1;
+        app.update(cx, |app, cx| {
+            app.engine_settings.mode = starling_dictation::settings::EngineMode::Manual;
+            app.configure_engine(cx);
+        });
+        settle(cx, "the host on the user's server", |cx| {
+            app.read_with(cx, |app, _| {
+                app.engine_status
+                    .as_ref()
+                    .is_some_and(|status| status.mode == starling_dictation::settings::EngineMode::Manual)
+            })
         });
         cx.executor().advance_clock(std::time::Duration::from_secs(1));
         cx.run_until_parked();
@@ -1323,7 +1463,8 @@ mod tests {
             assert!(!app.active_ids.contains(&id));
         });
         assert_eq!(summary(&store, &id).attempt_count, 0);
-        engine.shutdown();
+        drop(app);
+        host.shutdown();
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -2028,6 +2169,7 @@ mod tests {
                     reason: "gone".to_string(),
                     gave_up: false,
                     host_gone: false,
+                    plain: false,
                 },
                 cx,
             );
@@ -2301,6 +2443,7 @@ mod tests {
                         reason: "gone".to_string(),
                         gave_up: false,
                         host_gone,
+                        plain: false,
                     },
                     cx,
                 );

@@ -206,14 +206,13 @@ pub(crate) fn connection_label(app: &StarlingApp) -> String {
     match app.engine_settings.mode {
         // #362: in builtin mode the indicator is the engine's own state —
         // the manual health probe never runs here, so it never writes
-        // this dot either. With no manager at all, the startup failure
-        // is the sentence (it already says what to do).
+        // this dot either. With no engine at all, why is the sentence (it
+        // already says what to do); before the recording service reported
+        // the engine, it is still starting.
         EngineMode::Builtin => match app.engine_snapshot() {
             Some(snapshot) => engine_status_view(&snapshot).label,
-            None => app
-                .engine_startup_error
-                .clone()
-                .unwrap_or_else(|| "engine unavailable".to_string()),
+            None if app.engine_status.is_none() => "starting".to_string(),
+            None => app.engine_unavailable(),
         }
         .to_uppercase(),
         EngineMode::Manual => match app.connection {

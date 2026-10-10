@@ -59,6 +59,17 @@ pub struct HostConfig {
     /// leaves `runtime.provider` as configured — tests inject doubles
     /// there.
     pub engine: EngineChoice,
+    /// The paths and catalog the built-in engine runs on whenever this
+    /// host starts one after startup (a switch to builtin mode). `None`:
+    /// the startup choice's, else the default data paths. Tests point it
+    /// at temp dirs.
+    pub engine_paths: Option<starling_dictation::engine::EngineConfig>,
+    /// This host's build, as the version handshake compares it
+    /// ([`crate::version`]); [`BuildStamp::current`] unless a test
+    /// plays another build.
+    ///
+    /// [`BuildStamp::current`]: crate::version::BuildStamp::current
+    pub build: crate::version::BuildStamp,
     /// How long a recording take may go without any app following it
     /// before the host stops and stores it itself (see [`crate::takes`]).
     pub orphan_grace: Duration,
@@ -104,6 +115,8 @@ impl HostConfig {
             settings_path: None,
             settings_poll: crate::engine::DEFAULT_SETTINGS_POLL,
             engine: EngineChoice::None,
+            engine_paths: None,
+            build: crate::version::BuildStamp::current(),
             orphan_grace: crate::takes::DEFAULT_ORPHAN_GRACE,
             engine_wait: crate::transcribe::DEFAULT_ENGINE_WAIT,
             upkeep_first: crate::history::UPKEEP_FIRST,
@@ -199,6 +212,19 @@ impl HostConfig {
     /// Sets the engine the host attaches once it owns the root.
     pub fn with_engine(mut self, engine: EngineChoice) -> Self {
         self.engine = engine;
+        self
+    }
+
+    /// Sets the paths and catalog the built-in engine runs on (see
+    /// [`HostConfig::engine_paths`]).
+    pub fn with_engine_paths(mut self, paths: starling_dictation::engine::EngineConfig) -> Self {
+        self.engine_paths = Some(paths);
+        self
+    }
+
+    /// Plays another build in the version handshake (tests).
+    pub fn with_build(mut self, build: crate::version::BuildStamp) -> Self {
+        self.build = build;
         self
     }
 

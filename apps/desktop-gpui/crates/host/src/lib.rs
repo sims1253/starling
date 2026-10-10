@@ -83,10 +83,11 @@
 //! and export, imports, deletes, retention classes, retry holds,
 //! processing documents and correction records — is a set of requests
 //! this host answers ([`history`]); the app opens no store. History audio
-//! upkeep runs here on the host's schedule. The app still runs the engine
-//! manager its settings drive; this host attaches to the same engine
-//! (see [`engine`]). Moving the engine manager into the host is a later
-//! increment. The Electron comparison app the design names as a second
+//! upkeep runs here on the host's schedule. So does the engine: the host
+//! owns the engine manager, and the app's Settings drive it through
+//! requests and render the state it pushes ([`engine`]). An app and a
+//! host of different builds settle which one serves before anything else
+//! ([`version`]). The Electron comparison app the design names as a second
 //! client has been removed from the tree.
 
 pub mod agent;
@@ -106,6 +107,7 @@ pub mod recovery;
 pub mod server;
 pub mod takes;
 pub mod transcribe;
+pub mod version;
 
 pub use config::{default_data_root, HostConfig};
 pub use server::{serve, HostError, HostHandle};

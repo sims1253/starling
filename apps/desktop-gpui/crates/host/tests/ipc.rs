@@ -1249,6 +1249,7 @@ fn host_to_client_frames_from_a_client_are_a_protocol_violation() {
         max_frame_bytes: 1,
         rate_max: 1,
         rate_window_ms: 1,
+        build: None,
     })
     .unwrap();
     write_raw_frame(&mut stream, &frame);

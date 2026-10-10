@@ -91,7 +91,7 @@ impl std::fmt::Display for Backend {
 /// Every way the engine subsystem can end up unusable. Each variant
 /// carries a human sentence that says what to do — these surface directly
 /// in the app's engine status (#362 step 4).
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum EngineFailure {
     /// No `engines/` layout was found next to the app (and no
     /// `STARLING_ENGINE_DIR`). In development builds the engines are not
