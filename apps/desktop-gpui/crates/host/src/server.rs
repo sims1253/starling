@@ -820,6 +820,37 @@ pub fn serve(config: HostConfig) -> Result<HostHandle, HostError> {
     let watch_stop = Arc::new(AtomicBool::new(false));
 
     let mut threads = Vec::new();
+    // The settings file as it is now is the watcher's baseline, read
+    // before any connection is accepted: an engine request applied
+    // before the watcher's first poll must not be undone by that poll
+    // reading a file that has not changed since (it carries over only
+    // what the file changed). Anything the file changed since the
+    // startup load is applied here.
+    if let (Some(engine), Some(settings_path)) = (&engine, config.settings_path.as_ref()) {
+        if let Some(settings) = std::fs::read(settings_path)
+            .ok()
+            .and_then(|bytes| starling_dictation::settings::Settings::from_json_bytes(&bytes))
+        {
+            engine.follow_file(crate::engine::EngineIntent::from_settings(&settings));
+        }
+    }
+    // The app's engine requests and the engine feed (#220) ride with the
+    // host's threads: shutdown drops the queue and joins both before the
+    // engine stops. Both are ready (and the baseline read) before the
+    // first connection is accepted, so no app finds them missing.
+    if let Some(engine) = &engine {
+        let (jobs, queue) = std::sync::mpsc::channel();
+        *lock_registry(&shared.engine_jobs) = Some(jobs);
+        threads.push(spawn("starling-host-engine", {
+            let engine = Arc::clone(engine);
+            move || engine_worker(engine, queue)
+        }));
+        threads.push(spawn("starling-host-engine-feed", {
+            let engine = Arc::clone(engine);
+            let shared = Arc::clone(&shared);
+            move || engine_feed(engine, shared)
+        }));
+    }
     threads.push(spawn("starling-host-agent", {
         let shared = Arc::clone(&shared);
         move || broker_loop(shared, broker_rx)
@@ -909,36 +940,6 @@ pub fn serve(config: HostConfig) -> Result<HostHandle, HostError> {
             }
         },
     ));
-    // The settings file as it is now is the watcher's baseline, read
-    // before any connection is accepted: an engine request applied
-    // before the watcher's first poll must not be undone by that poll
-    // reading a file that has not changed since (it carries over only
-    // what the file changed). Anything the file changed since the
-    // startup load is applied here.
-    if let (Some(engine), Some(settings_path)) = (&engine, config.settings_path.as_ref()) {
-        if let Some(settings) = std::fs::read(settings_path)
-            .ok()
-            .and_then(|bytes| starling_dictation::settings::Settings::from_json_bytes(&bytes))
-        {
-            engine.follow_file(crate::engine::EngineIntent::from_settings(&settings));
-        }
-    }
-    // The app's engine requests and the engine feed (#220) ride with the
-    // host's threads: shutdown drops the queue and joins both before the
-    // engine stops.
-    if let Some(engine) = &engine {
-        let (jobs, queue) = std::sync::mpsc::channel();
-        *lock_registry(&shared.engine_jobs) = Some(jobs);
-        threads.push(spawn("starling-host-engine", {
-            let engine = Arc::clone(engine);
-            move || engine_worker(engine, queue)
-        }));
-        threads.push(spawn("starling-host-engine-feed", {
-            let engine = Arc::clone(engine);
-            let shared = Arc::clone(&shared);
-            move || engine_feed(engine, shared)
-        }));
-    }
     // The settings follower (#220): while the host serves, engine
     // changes in the settings file apply to it. The watcher rides with
     // the host's threads, so shutdown joins it before the runtime and
@@ -1020,7 +1021,7 @@ fn engine_feed(engine: Arc<crate::engine::EngineHost>, shared: Arc<HostShared>) 
         }
         // A watcher whose queue was full missed it: try again next look
         // (the others get it twice, which costs nothing).
-        if shared.takes.engine_state(&engine.status()) {
+        if shared.takes.engine_state(|| engine.status()) {
             last = Some(generation);
         }
     }
@@ -1345,6 +1346,7 @@ fn connection_reader(
                 let admits_work = matches!(
                     frame,
                     Frame::Command { .. }
+                        | Frame::TakeWatch { .. }
                         | Frame::Transcribe { .. }
                         | Frame::TranscribeDue { .. }
                         | Frame::TakeAdopt { .. }
@@ -1565,15 +1567,6 @@ fn connection_reader(
                             terminate(&state, TransportErrorCode::VersionMismatch, detail);
                             break;
                         }
-                        if shared.retire.load(Ordering::SeqCst) {
-                            terminate(
-                                &state,
-                                TransportErrorCode::ShuttingDown,
-                                "the recording service is stepping aside for a newer version"
-                                    .to_string(),
-                            );
-                            break;
-                        }
                         // An app (re)connected: attempts a dead app left
                         // "started" are failed now, ready to retry — a
                         // live app's attempts are protected by their
@@ -1592,20 +1585,16 @@ fn connection_reader(
                             state.close();
                             break;
                         }
-                        // The engine as it stands; changes follow.
-                        let status = match &shared.engine {
-                            Some(engine) => engine.status(),
-                            None => crate::engine::EngineStatus::without_engine(),
-                        };
-                        // A window that misses this would wait for the next
+                        // The engine as it stands; changes follow, in order
+                        // (read and queued under the feed's own lock). A
+                        // window that misses this would wait for the next
                         // change: a full queue closes the connection
                         // instead, and the reconnect brings it.
-                        if state
-                            .try_deliver(Frame::EngineState {
-                                status: Box::new(status),
-                            })
-                            .is_err()
-                        {
+                        let delivered = shared.takes.engine_state_to(&state, || match &shared.engine {
+                            Some(engine) => engine.status(),
+                            None => crate::engine::EngineStatus::without_engine(),
+                        });
+                        if !delivered {
                             state.close();
                             break;
                         }

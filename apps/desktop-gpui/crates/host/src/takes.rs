@@ -410,9 +410,15 @@ impl TakeHub {
 
     /// The host's engine changed: every watching app renders the new
     /// status. `false` when a watcher's queue was full and it missed it
-    /// (the caller sends it again).
-    pub(crate) fn engine_state(&self, status: &crate::engine::EngineStatus) -> bool {
+    /// (the caller sends it again). The status is read under the feed's
+    /// lock, like [`Self::engine_state_to`]'s: each connection gets them
+    /// in the order they were read, never an older one after a newer.
+    pub(crate) fn engine_state(
+        &self,
+        status: impl FnOnce() -> crate::engine::EngineStatus,
+    ) -> bool {
         let state = lock_registry(&self.state);
+        let status = status();
         let mut all = true;
         for watcher in &state.watchers {
             if watcher.conn.closed.load(Ordering::SeqCst) {
@@ -426,6 +432,20 @@ impl TakeHub {
                 .is_ok();
         }
         all
+    }
+
+    /// The engine's status, read now, to `conn` alone (a window that
+    /// just started watching); `false` when its queue is full.
+    pub(crate) fn engine_state_to(
+        &self,
+        conn: &Arc<ConnState>,
+        status: impl FnOnce() -> crate::engine::EngineStatus,
+    ) -> bool {
+        let _ordered = lock_registry(&self.state);
+        conn.try_deliver(Frame::EngineState {
+            status: Box::new(status()),
+        })
+        .is_ok()
     }
 
     /// How many live apps besides `conn` follow the feed.
