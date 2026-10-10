@@ -233,6 +233,9 @@ pub(crate) enum Failure {
     Insert(InsertError),
     /// Typing did not finish within its budget and was given up.
     Stalled,
+    /// An earlier insert given up as stalled has still not returned:
+    /// nothing more is typed until it does.
+    EarlierTypingStuck,
     /// The target cannot be verified here and the user has not opted in.
     UnverifiedOff,
     /// The target cannot be verified, and Starling's own window had focus
@@ -251,6 +254,7 @@ impl Failure {
             Failure::Insert(InsertError::ModifiersHeld { .. }) => "Not inserted: keys were held",
             Failure::Insert(InsertError::Unavailable { .. }) => "Insertion unavailable",
             Failure::Stalled => "Not inserted: typing stalled",
+            Failure::EarlierTypingStuck => "Not inserted: earlier typing is stuck",
             Failure::UnverifiedOff => "Not inserted: the target cannot be checked",
             Failure::Insert(_) => "Not inserted",
         }
@@ -360,6 +364,11 @@ impl Recovery {
             Failure::Stalled => {
                 "Typing did not finish in time: the display stopped answering. Some of the text \
                  may already be in the window; check it before pasting again."
+                    .to_string()
+            }
+            Failure::EarlierTypingStuck => {
+                "Typing from an earlier insert is still stuck waiting for the display, so \
+                 nothing was typed. Copy the text; if this keeps happening, restart Starling."
                     .to_string()
             }
         }
@@ -738,10 +747,10 @@ impl StarlingApp {
             if let Some(previous) = previous {
                 previous.await;
             }
+            // A stalled insert still out holds the insertion lock; typing
+            // beside it could interleave keys, so nothing more is typed.
             let result = if out.swap(true, Ordering::SeqCst) {
-                Err(Failure::Insert(InsertError::Unavailable {
-                    reason: "an earlier insert is still waiting for the display".to_string(),
-                }))
+                Err(Failure::EarlierTypingStuck)
             } else {
                 let abandoned = Arc::new(AtomicBool::new(false));
                 let stop = insert_stop(had_focus, abandoned.clone());
@@ -1823,6 +1832,49 @@ mod tests {
         cx.executor().advance_clock(PASTE_SETTLE);
         cx.run_until_parked();
         assert!(fake.insertions().is_empty());
+    }
+
+    /// While an insert given up as stalled is still out, later ones type
+    /// nothing and say why, with the way out.
+    #[gpui::test]
+    fn a_stuck_insert_still_out_is_explained(cx: &mut gpui::TestAppContext) {
+        let (app, fake) = app_with(cx, on());
+        fake.focus(FakeTarget::named("Editor", "notes.txt"));
+        app.update(cx, |app, _| {
+            app.delivery.insert_out.store(true, Ordering::SeqCst)
+        });
+        take(&app, cx, "take-1", "Hello there.", |_| {});
+        assert!(fake.insertions().is_empty());
+        app.read_with(cx, |app, _| {
+            let recovery = app.delivery.recovery.as_ref().unwrap();
+            assert_eq!(recovery.failure, Failure::EarlierTypingStuck);
+            assert_eq!(recovery.title(), "Not inserted: earlier typing is stuck");
+            assert!(recovery.explanation().contains("restart Starling"));
+            assert!(!recovery.offers_settings());
+        });
+    }
+
+    /// A repeated focus-loss report does not strand an armed Paste last:
+    /// it fires one full settle after the last report.
+    #[gpui::test]
+    fn a_repeated_focus_loss_still_fires_paste_last(cx: &mut gpui::TestAppContext) {
+        let (app, fake) = app_with(cx, on());
+        fake.focus(FakeTarget::named("Editor", "notes.txt"));
+        take(&app, cx, "take-1", "Hello there.", |_| {
+            fake.destroy_target()
+        });
+        fake.focus(FakeTarget::named("Chat", "Message"));
+        app.update(cx, |app, cx| {
+            app.window_focus.push((Instant::now(), true));
+            app.toggle_paste_last(cx);
+            app.window_focus.push((Instant::now(), false));
+            app.delivery_window_activation(false, cx);
+        });
+        cx.executor().advance_clock(PASTE_SETTLE / 2);
+        app.update(cx, |app, cx| app.delivery_window_activation(false, cx));
+        cx.executor().advance_clock(PASTE_SETTLE);
+        cx.run_until_parked();
+        assert_eq!(fake.field(), "Hello there.");
     }
 
     /// A Paste last whose notice was dismissed while it typed shows its

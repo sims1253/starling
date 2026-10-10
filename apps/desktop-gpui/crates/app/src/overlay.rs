@@ -425,6 +425,9 @@ pub(crate) struct Overlay {
     /// The staging draft of the take on the overlay (staged dictation):
     /// the live text shows that draft and no other.
     pub(crate) staging_token: Option<u64>,
+    /// The compositor closed the overlay: it stays closed until the next
+    /// take rather than reopening at once.
+    pub(crate) dismissed: bool,
     /// The live text last shown for the take on the overlay, kept once
     /// its source is gone (the direct-mode partial is cleared at stop, a
     /// saved draft can be dismissed) until the next take.
@@ -442,6 +445,7 @@ impl Overlay {
             generation: 0,
             scale: 1.,
             staging_token: None,
+            dismissed: false,
             live_text: RefCell::default(),
         }
     }
@@ -466,6 +470,7 @@ impl StarlingApp {
     /// draft when it has one.
     pub(crate) fn overlay_take_started(&mut self) {
         self.overlay.model.take_started(Instant::now());
+        self.overlay.dismissed = false;
         self.overlay.live_text.get_mut().clear();
         self.overlay.staging_token = self
             .staging
@@ -530,7 +535,11 @@ impl StarlingApp {
         if stale_window || stale_open {
             self.close_overlay(cx);
         }
-        if visible && self.overlay.window.is_none() && self.overlay.opening.is_none() {
+        if visible
+            && !self.overlay.dismissed
+            && self.overlay.window.is_none()
+            && self.overlay.opening.is_none()
+        {
             self.open_overlay(mode, cx);
         }
         if changed {
@@ -542,13 +551,19 @@ impl StarlingApp {
 
     /// An overlay window went away, closed here or by the compositor. A
     /// closed window reports no focus loss: delivery forgets its focus
-    /// unless another overlay window is the one kept.
+    /// unless another overlay window is the one kept. The kept window
+    /// closed by the compositor is let go, and the next take opens a new
+    /// one.
     pub(crate) fn overlay_window_released(
         &mut self,
         handle: AnyWindowHandle,
         cx: &mut Context<Self>,
     ) {
         let kept = self.overlay.window.map(AnyWindowHandle::from);
+        if kept == Some(handle) {
+            self.overlay.window = None;
+            self.overlay.dismissed = true;
+        }
         if kept.is_none() || kept == Some(handle) {
             self.delivery_overlay_activation(false, cx);
         }
@@ -727,6 +742,32 @@ fn screen_is_x11() -> bool {
     cfg!(target_os = "linux")
         && std::env::var_os("WAYLAND_DISPLAY").is_none()
         && std::env::var_os("DISPLAY").is_some()
+}
+
+#[cfg(test)]
+mod window_tests {
+    use super::*;
+
+    /// An overlay the compositor closes is let go: the handle is cleared,
+    /// it stays closed for the take, and the next take may open one.
+    #[gpui::test]
+    fn a_compositor_closed_overlay_is_let_go(cx: &mut gpui::TestAppContext) {
+        let app = cx.new(|cx| StarlingApp::for_test(None, cx));
+        let weak = app.downgrade();
+        let overlay =
+            cx.add_window(|window, cx| crate::views::overlay::OverlayView::new(weak, window, cx));
+        app.update(cx, |app, _| app.overlay.window = Some(overlay));
+        overlay
+            .update(cx, |_, window, _| window.remove_window())
+            .unwrap();
+        cx.run_until_parked();
+        app.update(cx, |app, _| {
+            assert!(app.overlay.window.is_none());
+            assert!(app.overlay.dismissed);
+            app.overlay_take_started();
+            assert!(!app.overlay.dismissed);
+        });
+    }
 }
 
 #[cfg(test)]
