@@ -304,6 +304,11 @@ impl HostHandle {
         for state in conn_states.iter().chain(&late_states) {
             state.release_transport();
         }
+        // Audio holds a full queue had released on threads of their own
+        // are back in the store before anything lets go of it.
+        if let Some(history) = &self.shared.history {
+            history.join_releases();
+        }
 
         // Connections are closed and the accept thread is down. Now stop
         // the machines, then release the lease and the endpoint.

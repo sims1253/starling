@@ -19,6 +19,8 @@ thiserror = "2"
 futures-util = "0.3"
 tokio = { version = "1", features = ["rt", "net", "time", "sync", "macros"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+# Store answers too large to keep in memory wait in unlinked spool files.
+tempfile = "3"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -50,4 +52,3 @@ test-support = []
 starling-processing = { path = "../processing" }
 starling-runtime = { path = "../runtime", features = ["test-doubles"] }
 starling-runtime-host = { path = ".", features = ["test-support"] }
-tempfile = "3"

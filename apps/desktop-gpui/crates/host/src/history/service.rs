@@ -5,6 +5,9 @@
 //! connection readers; [`History::upkeep_loop`] runs the audio upkeep.
 
 use std::collections::{HashMap, VecDeque};
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
@@ -26,8 +29,12 @@ use crate::server::ConnState;
 /// How many answers one connection may have waiting to be fetched; the
 /// oldest goes first.
 const MAX_BLOBS: usize = 8;
-/// How many bytes of waiting answers one connection may hold.
+/// How many bytes of waiting answers one connection may hold in memory;
+/// an answer that does not fit beside them waits in a spool file instead.
 const MAX_BLOB_BYTES: usize = 1024 * 1024 * 1024;
+/// Where spooled answers wait, under the store's root. The files are
+/// unlinked (deleted on close on Windows): nothing outlives the host.
+const SPOOL_DIR: &str = "spool";
 /// How many uploads one connection may have open, and their bytes.
 const MAX_UPLOADS: usize = 4;
 const MAX_UPLOAD_BYTES: usize = 1024 * 1024 * 1024;
@@ -60,17 +67,63 @@ impl Caller for ConnState {
     }
 }
 
+/// An answer waiting to be fetched: in memory, or in a spool file when it
+/// did not fit under the connection's memory bound.
+#[derive(Clone)]
+enum Kept {
+    Memory(Arc<Vec<u8>>),
+    Spooled { file: Arc<Mutex<File>>, len: usize },
+}
+
+impl Kept {
+    fn len(&self) -> usize {
+        match self {
+            Kept::Memory(bytes) => bytes.len(),
+            Kept::Spooled { len, .. } => *len,
+        }
+    }
+
+    /// The bytes it holds in memory.
+    fn in_memory(&self) -> usize {
+        match self {
+            Kept::Memory(bytes) => bytes.len(),
+            Kept::Spooled { .. } => 0,
+        }
+    }
+
+    fn read(&self, start: usize, end: usize) -> Result<Vec<u8>, StorageError> {
+        match self {
+            Kept::Memory(bytes) => Ok(bytes[start..end].to_vec()),
+            Kept::Spooled { file, .. } => {
+                let mut file = lock(file);
+                let mut part = vec![0; end - start];
+                file.seek(SeekFrom::Start(start as u64))?;
+                file.read_exact(&mut part)?;
+                Ok(part)
+            }
+        }
+    }
+}
+
 /// What one connection was handed and has not used up.
 #[derive(Default)]
 struct Stash {
-    blobs: VecDeque<(String, Arc<Vec<u8>>)>,
+    blobs: VecDeque<(String, Kept)>,
     uploads: HashMap<String, Vec<u8>>,
     holds: HashMap<String, AudioHold>,
 }
 
 impl Stash {
     fn blob_bytes(&self) -> usize {
-        self.blobs.iter().map(|(_, bytes)| bytes.len()).sum()
+        self.blobs.iter().map(|(_, kept)| kept.in_memory()).sum()
+    }
+
+    /// Keeps `kept` as answer `id`; past [`MAX_BLOBS`] the oldest goes.
+    fn push_blob(&mut self, id: String, kept: Kept) {
+        self.blobs.push_back((id, kept));
+        while self.blobs.len() > MAX_BLOBS {
+            self.blobs.pop_front();
+        }
     }
 }
 
@@ -80,7 +133,13 @@ pub struct History {
     /// Raw bytes per fetched chunk, and the largest answer sent whole.
     chunk: usize,
     inline: usize,
+    /// [`MAX_BLOB_BYTES`]; smaller in tests.
+    memory_limit: usize,
+    spool: PathBuf,
     stashes: Mutex<HashMap<usize, Stash>>,
+    /// Releases run on threads of their own ([`Self::release_later`]):
+    /// joined at shutdown, before the lease goes.
+    releases: Mutex<Vec<JoinHandle<()>>>,
     upkeep: UpkeepState,
     /// Told when a request changed the history list (see
     /// [`History::on_change`]).
@@ -113,10 +172,13 @@ impl History {
     /// capped at `max_frame_bytes`.
     pub fn new(facade: Facade, max_frame_bytes: usize) -> History {
         History {
+            spool: facade.root().join(SPOOL_DIR),
             facade,
             chunk: chunk_bytes(max_frame_bytes),
             inline: max_frame_bytes.saturating_sub(4096).max(1),
+            memory_limit: MAX_BLOB_BYTES,
             stashes: Mutex::new(HashMap::new()),
+            releases: Mutex::new(Vec::new()),
             upkeep: UpkeepState::default(),
             changed: std::sync::OnceLock::new(),
         }
@@ -161,7 +223,7 @@ impl History {
                     None => StoreReply::Done { value: Value::Null },
                     Some(bytes) => {
                         let len = bytes.len() as u64;
-                        let blob = self.keep(caller, bytes);
+                        let blob = self.keep(caller, bytes)?;
                         StoreReply::Bytes { blob, bytes: len }
                     }
                 });
@@ -313,74 +375,98 @@ impl History {
                 json(lock(&self.upkeep.last).clone())?
             }
         };
-        Ok(self.answer(caller, value))
+        self.answer(caller, value)
     }
 
     /// `value` whole, or kept to be fetched when it is too large.
-    fn answer(&self, caller: &dyn Caller, value: Value) -> StoreReply {
-        let encoded = match serde_json::to_vec(&value) {
-            Ok(encoded) => encoded,
-            Err(err) => {
-                return StoreReply::Failed {
-                    failure: StoreFailure::from(&StorageError::Invalid(format!(
-                        "the answer does not serialize: {err}"
-                    ))),
-                }
-            }
-        };
+    fn answer(&self, caller: &dyn Caller, value: Value) -> Result<StoreReply, StorageError> {
+        let encoded = serde_json::to_vec(&value)
+            .map_err(|err| StorageError::Invalid(format!("the answer does not serialize: {err}")))?;
         if encoded.len() <= self.inline {
-            return StoreReply::Done { value };
+            return Ok(StoreReply::Done { value });
         }
+        drop(value);
         let bytes = encoded.len() as u64;
-        let blob = self.keep(caller, Arc::new(encoded));
-        StoreReply::Large { blob, bytes }
+        let blob = self.keep(caller, Arc::new(encoded))?;
+        Ok(StoreReply::Large { blob, bytes })
     }
 
-    /// Keeps `bytes` for `caller` to fetch; its id.
-    fn keep(&self, caller: &dyn Caller, bytes: Arc<Vec<u8>>) -> String {
+    /// Keeps `bytes` for `caller` to fetch; its id. The answers a
+    /// connection holds in memory stay under the memory bound, this one
+    /// included: one that does not fit beside them is written to a spool
+    /// file and dropped from memory.
+    fn keep(&self, caller: &dyn Caller, bytes: Arc<Vec<u8>>) -> Result<String, StorageError> {
         let id = new_id("blob");
-        let mut stashes = lock(&self.stashes);
-        if caller.gone() {
-            return id;
-        }
-        let stash = stashes.entry(caller.key()).or_default();
-        stash.blobs.push_back((id.clone(), bytes));
-        while stash.blobs.len() > 1
-            && (stash.blobs.len() > MAX_BLOBS || stash.blob_bytes() > MAX_BLOB_BYTES)
         {
-            stash.blobs.pop_front();
+            let mut stashes = lock(&self.stashes);
+            if caller.gone() {
+                return Ok(id);
+            }
+            let stash = stashes.entry(caller.key()).or_default();
+            if stash.blob_bytes().saturating_add(bytes.len()) <= self.memory_limit {
+                stash.push_blob(id.clone(), Kept::Memory(bytes));
+                return Ok(id);
+            }
         }
-        id
+        // Off the stash lock: the write may take a while.
+        let spooled = self.spool(&bytes)?;
+        drop(bytes);
+        let mut stashes = lock(&self.stashes);
+        if !caller.gone() {
+            stashes.entry(caller.key()).or_default().push_blob(id.clone(), spooled);
+        }
+        Ok(id)
+    }
+
+    /// `bytes` in a new unlinked spool file.
+    fn spool(&self, bytes: &[u8]) -> Result<Kept, StorageError> {
+        let spooled = (|| {
+            std::fs::create_dir_all(&self.spool)?;
+            let mut file = tempfile::tempfile_in(&self.spool)?;
+            file.write_all(bytes)?;
+            Ok::<_, std::io::Error>(file)
+        })()
+        .map_err(|err| {
+            StorageError::Invalid(format!(
+                "the answer ({} MB) is too large to keep in memory and could not be set aside \
+                 on disk: {err}",
+                bytes.len() / (1024 * 1024)
+            ))
+        })?;
+        Ok(Kept::Spooled {
+            file: Arc::new(Mutex::new(spooled)),
+            len: bytes.len(),
+        })
     }
 
     fn fetch(&self, caller: &dyn Caller, blob: &str, offset: u64) -> Result<StoreReply, StorageError> {
-        let bytes = {
+        let kept = {
             let mut stashes = lock(&self.stashes);
             let stash = stashes.get_mut(&caller.key());
-            let Some((index, bytes)) = stash.as_ref().and_then(|stash| {
+            let Some((index, kept)) = stash.as_ref().and_then(|stash| {
                 stash
                     .blobs
                     .iter()
                     .position(|(id, _)| id == blob)
-                    .map(|index| (index, Arc::clone(&stash.blobs[index].1)))
+                    .map(|index| (index, stash.blobs[index].1.clone()))
             }) else {
                 return Err(StorageError::Invalid(
                     "that answer is no longer kept; ask again".to_string(),
                 ));
             };
-            let start = usize::try_from(offset).unwrap_or(usize::MAX).min(bytes.len());
-            if start + self.chunk >= bytes.len() {
+            let start = usize::try_from(offset).unwrap_or(usize::MAX).min(kept.len());
+            if start + self.chunk >= kept.len() {
                 // The last chunk: the answer is used up.
                 if let Some(stash) = stash {
                     stash.blobs.remove(index);
                 }
             }
-            bytes
+            kept
         };
-        let start = usize::try_from(offset).unwrap_or(usize::MAX).min(bytes.len());
-        let end = (start + self.chunk).min(bytes.len());
+        let start = usize::try_from(offset).unwrap_or(usize::MAX).min(kept.len());
+        let end = (start + self.chunk).min(kept.len());
         Ok(StoreReply::Chunk {
-            data: base64::engine::general_purpose::STANDARD.encode(&bytes[start..end]),
+            data: base64::engine::general_purpose::STANDARD.encode(kept.read(start, end)?),
         })
     }
 
@@ -432,12 +518,29 @@ impl History {
             .get_mut(&caller.key())
             .and_then(|stash| stash.holds.remove(hold));
         if let Some(released) = released {
-            if let Err(err) = std::thread::Builder::new()
+            match std::thread::Builder::new()
                 .name("starling-host-release".to_string())
                 .spawn(move || drop(released))
             {
-                eprintln!("starling-runtime-host: releasing an audio hold inline: {err}");
+                Ok(thread) => {
+                    let mut releases = lock(&self.releases);
+                    releases.retain(|thread| !thread.is_finished());
+                    releases.push(thread);
+                }
+                Err(err) => {
+                    eprintln!("starling-runtime-host: releasing an audio hold inline: {err}");
+                }
             }
+        }
+    }
+
+    /// Waits for the releases [`Self::release_later`] started: the host
+    /// joins them with its other store threads, so none touches a store
+    /// a successor owns.
+    pub(crate) fn join_releases(&self) {
+        let releases = std::mem::take(&mut *lock(&self.releases));
+        for thread in releases {
+            let _ = thread.join();
         }
     }
 
@@ -696,6 +799,75 @@ mod tests {
             assert!(Instant::now() < deadline, "the hold was never released");
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    /// #220: the answers a connection holds in memory never pass the
+    /// bound, the newest included: an answer that does not fit beside the
+    /// others — or alone — waits in a spool file and is read back whole.
+    #[test]
+    fn answers_past_the_memory_bound_wait_on_disk() {
+        let root = tempfile::tempdir().unwrap();
+        let mut local = LocalHistory::open(root.path()).unwrap();
+        let first = HistoryClient(&local).import(&wav(48_000), false).unwrap();
+        let second = HistoryClient(&local).import(&wav(16_000), false).unwrap();
+        let wav_of = |id: &str| HistoryClient(&local).audio(id, AudioFormat::Wav).unwrap().unwrap();
+        let (first_wav, second_wav) = (wav_of(&first), wav_of(&second));
+        // Room for the second take's answer, not the first's.
+        local.history.memory_limit = second_wav.len() + 1024;
+        let history = &local.history;
+        let ask = |id: &str| match history.handle(
+            &Local,
+            StoreRequest::Audio {
+                id: id.to_string(),
+                format: AudioFormat::Wav,
+            },
+        ) {
+            StoreReply::Bytes { blob, .. } => blob,
+            other => panic!("{other:?}"),
+        };
+        let kept = |blob: &str| {
+            lock(&history.stashes)[&0]
+                .blobs
+                .iter()
+                .find(|(id, _)| id == blob)
+                .map(|(_, kept)| matches!(kept, Kept::Spooled { .. }))
+                .expect("kept")
+        };
+        let in_memory = || lock(&history.stashes)[&0].blob_bytes();
+
+        let alone_too_large = ask(&first);
+        assert!(kept(&alone_too_large), "larger than the bound alone: spooled");
+        assert_eq!(in_memory(), 0);
+        let fits = ask(&second);
+        assert!(!kept(&fits), "fits: in memory");
+        let beside = ask(&second);
+        assert!(kept(&beside), "does not fit beside the other: spooled");
+        assert!(in_memory() <= history.memory_limit);
+        #[cfg(unix)]
+        assert_eq!(std::fs::read_dir(root.path().join(SPOOL_DIR)).unwrap().count(), 0, "unlinked");
+
+        let fetch = |blob: &str, len: usize| {
+            let mut data = Vec::new();
+            while data.len() < len {
+                match history.handle(
+                    &Local,
+                    StoreRequest::Fetch {
+                        blob: blob.to_string(),
+                        offset: data.len() as u64,
+                    },
+                ) {
+                    StoreReply::Chunk { data: part } => data.extend(
+                        base64::engine::general_purpose::STANDARD.decode(part).unwrap(),
+                    ),
+                    other => panic!("{other:?}"),
+                }
+            }
+            data
+        };
+        assert_eq!(fetch(&alone_too_large, first_wav.len()), first_wav);
+        assert_eq!(fetch(&beside, second_wav.len()), second_wav);
+        assert_eq!(fetch(&fits, second_wav.len()), second_wav);
+        assert!(lock(&history.stashes)[&0].blobs.is_empty(), "each was used up");
     }
 
     /// A store connection that refuses whatever consumes an upload, as a

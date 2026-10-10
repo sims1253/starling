@@ -162,39 +162,106 @@ fn a_recovered_complete_take_is_due_for_transcription_and_a_cut_one_is_not() {
     assert!(!store.transcription_wanted("j_stopped").unwrap());
 }
 
-/// #220: a pass that sealed a cut-short journal and died before adopting
-/// it leaves a journal that looks finished; the next pass still treats it
-/// as cut short — no transcription intent, the "closed while recording"
-/// note.
+fn seal_count(store: &StoreV2) -> i64 {
+    store
+        .conn
+        .query_row("SELECT COUNT(*) FROM recovery_seals", [], |row| row.get(0))
+        .expect("count seals")
+}
+
+/// #220/#356: a recovery that dies at any step of adopting a cut-short
+/// journal — after noting the seal, after sealing the journal (it now
+/// looks finished), after moving it into `audio/` (before its row) —
+/// leaves a take the next start brings back as interrupted, holding
+/// exactly its confirmed audio, with no transcription intent and a note
+/// that never says it finished; the seal is gone once the row commits.
 #[test]
-fn a_cut_journal_sealed_by_a_pass_that_died_still_reads_as_cut() {
+fn a_cut_journal_whose_recovery_dies_at_any_step_still_reads_as_cut() {
+    for torn_tail in [false, true] {
+        for step in [RecoveryStep::SealNoted, RecoveryStep::Sealed, RecoveryStep::Moved] {
+            let case = format!("torn tail {torn_tail}, died after {step:?}");
+            let dir = TempDir::new().expect("tempdir");
+            let tree = journals(&dir);
+            let confirmed = ramp(4_800, 1);
+            {
+                let mut writer = JournalWriter::create_named(&tree, "j_cut".to_string(), 16_000)
+                    .expect("writer");
+                writer.append_frames(&confirmed).expect("append");
+                writer.write_boundary().expect("boundary");
+                if torn_tail {
+                    writer.append_frames(&ramp(800, 9)).expect("tail");
+                }
+            }
+            {
+                let mut store = store_in(&dir);
+                store.crash_after = Some(step);
+                let report = store
+                    .recover_capture_journals_where(&tree, |_| true, true)
+                    .expect("scan");
+                assert_eq!(report.failed.len(), 1, "{case}: {report:?}");
+                assert!(store.get_capture("j_cut").unwrap().is_none(), "{case}");
+                assert_eq!(seal_count(&store), 1, "{case}: noted before anything else");
+            }
+
+            // The next start: reconcile, then the journal scan (no grace
+            // wait: a journal recovery sealed has no recorder left).
+            let mut store = store_in(&dir);
+            store.reconcile().expect("reconcile");
+            store
+                .recover_capture_journals_where(&tree, |_| true, true)
+                .expect("rescan");
+            assert_eq!(capture_count(&store), 1, "{case}");
+            let record = store.get_capture("j_cut").unwrap().expect("row");
+            assert_eq!(record.status, CaptureStatus::Interrupted, "{case}");
+            assert_eq!(record.frame_count, 4_800, "{case}: the confirmed extent");
+            assert_eq!(store.load_audio("j_cut").expect("audio").samples, confirmed, "{case}");
+            assert!(!store.transcription_wanted("j_cut").unwrap(), "{case}: waits for the user");
+            let note = record.recovery_note().expect("note");
+            assert!(
+                !note.contains("finished cleanly") && !note.contains("after this take stopped"),
+                "{case}: {note}"
+            );
+            if torn_tail {
+                assert!(
+                    note.contains("discarded") || note.contains("torn tail"),
+                    "{case}: the torn tail is named: {note}"
+                );
+            }
+            assert_eq!(seal_count(&store), 0, "{case}: the seal is done with");
+            assert!(!tree.join("j_cut.sj").exists(), "{case}");
+        }
+    }
+}
+
+/// The control for the crash steps: a journal its recorder finalized is
+/// never noted as sealed, and one whose adoption dies after its move
+/// still comes back with the intent to transcribe it.
+#[test]
+fn a_complete_journal_whose_adoption_dies_after_its_move_keeps_its_intent() {
     let dir = TempDir::new().expect("tempdir");
-    let mut store = store_in(&dir);
     let tree = journals(&dir);
     let path = {
         let mut writer =
-            JournalWriter::create_named(&tree, "j_cut".to_string(), 16_000).expect("writer");
-        writer.append_frames(&ramp(4_800, 1)).expect("append");
-        writer.write_boundary().expect("boundary");
+            JournalWriter::create_named(&tree, "j_stopped".to_string(), 16_000).expect("writer");
+        writer.append_frames(&ramp(4_800, 3)).expect("append");
+        writer.finalize().expect("finalize");
         writer.path().to_path_buf()
     };
-    // The earlier pass: noted, sealed, then the process died.
-    store.note_recovery_seal("j_cut").expect("note");
-    let parsed = read_journal(&path).expect("read");
-    assert!(!parsed.finalized);
-    seal_recovered_journal(&path, &parsed).expect("seal");
-    drop(parsed);
-    assert!(read_journal(&path).expect("read").finalized, "it looks finished now");
     age(&path, old());
-
-    let report = store
-        .recover_capture_journals_where(&tree, |_| true, true)
-        .expect("scan");
-    assert_eq!(report.recovered.len(), 1, "{report:?}");
-    assert!(!store.transcription_wanted("j_cut").unwrap(), "a cut take waits for the user");
-    let note = store.get_capture("j_cut").unwrap().unwrap().recovery_note().expect("note");
-    assert!(note.contains("while this take was recording"), "{note}");
-    assert!(!store.recovery_sealed("j_cut").unwrap(), "the note is done with");
+    {
+        let mut store = store_in(&dir);
+        store.crash_after = Some(RecoveryStep::Moved);
+        let report = store
+            .recover_capture_journals_where(&tree, |_| true, true)
+            .expect("scan");
+        assert_eq!(report.failed.len(), 1, "{report:?}");
+        assert_eq!(seal_count(&store), 0, "a complete journal is not sealed by recovery");
+    }
+    let mut store = store_in(&dir);
+    store.reconcile().expect("reconcile");
+    let record = store.get_capture("j_stopped").unwrap().expect("row");
+    assert_eq!(record.frame_count, 4_800);
+    assert!(store.transcription_wanted("j_stopped").unwrap());
 }
 
 #[test]

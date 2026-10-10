@@ -246,6 +246,11 @@ impl Facade {
         Ok(Facade(Arc::new(Mutex::new(StoreV2::open(root)?))))
     }
 
+    /// The store's root directory.
+    pub fn root(&self) -> std::path::PathBuf {
+        lock_v2(&self.0).root().to_path_buf()
+    }
+
     /// Whether a record with this id exists (metadata-only).
     #[cfg(test)]
     pub(crate) fn exists(&self, id: &str) -> Result<bool, storage::StorageError> {
@@ -612,6 +617,10 @@ impl Facade {
     /// the recorder journals proven to be copies of a stored take (#356).
     /// Audio a reader still pins and journals no longer proven copies
     /// stay, with the reason in the report.
+    ///
+    /// `policy` and `paused` run while the store lock is held: neither may
+    /// call back into this `Facade` (or anything that takes its lock), or
+    /// the pass deadlocks.
     pub fn audio_upkeep<P: std::borrow::Borrow<RetentionPolicy>>(
         &self,
         policy: impl Fn() -> P,

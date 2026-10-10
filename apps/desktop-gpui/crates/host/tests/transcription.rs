@@ -21,6 +21,9 @@ use starling_runtime_host::{serve, HostConfig, HostHandle};
 
 #[path = "common/fake_engine.rs"]
 mod fake_engine;
+#[cfg(unix)]
+#[path = "common/reaped.rs"]
+mod reaped;
 use fake_engine::{FakeEngine, Reply, StreamMode};
 
 fn config(root: &Path, scripts: Vec<FakeTakeScript>, engine: &FakeEngine) -> HostConfig {
@@ -498,17 +501,19 @@ fn a_host_process_killed_mid_transcription_leaves_the_take_to_the_next_one() {
         take.finalize().unwrap().commit_marked(&mut store, CommitMark::Complete).unwrap().record.id
     };
     let spawn = || {
-        ProcessCommand::new(HOST_BIN)
-            .arg("--root")
-            .arg(&root)
-            .arg("--runtime-dir")
-            .arg(&runtime_dir)
-            .env("XDG_CONFIG_HOME", &config_home)
-            .env("XDG_DATA_HOME", scratch.path().join("data"))
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("host binary spawns")
+        reaped::Reaped(
+            ProcessCommand::new(HOST_BIN)
+                .arg("--root")
+                .arg(&root)
+                .arg("--runtime-dir")
+                .arg(&runtime_dir)
+                .env("XDG_CONFIG_HOME", &config_home)
+                .env("XDG_DATA_HOME", scratch.path().join("data"))
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("host binary spawns"),
+        )
     };
     let wait_for = |what: &str, done: &dyn Fn() -> bool| {
         let deadline = Instant::now() + Duration::from_secs(20);

@@ -347,8 +347,10 @@ CREATE TABLE IF NOT EXISTS pending_intents (
     created_utc TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS recovery_seals (
-    journal_id TEXT PRIMARY KEY,
-    sealed_utc TEXT NOT NULL
+    journal_id      TEXT PRIMARY KEY,
+    capture_id      TEXT NOT NULL,
+    torn_tail_bytes INTEGER NOT NULL,
+    sealed_utc      TEXT NOT NULL
 );
 ";
 
@@ -731,6 +733,23 @@ pub struct StoreV2 {
     /// removal takes the write lock.
     #[cfg(test)]
     before_sweep_lock: Option<TestHook>,
+    /// The recovery step after which the next recovery stops as if the
+    /// process died there (it fails without undoing anything).
+    #[cfg(test)]
+    crash_after: Option<RecoveryStep>,
+}
+
+/// The durable steps recovery takes on a cut-short journal, in order:
+/// where the crash tests stop it.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoveryStep {
+    /// The seal is noted in `recovery_seals`.
+    SealNoted,
+    /// The journal is sealed to its verified prefix.
+    Sealed,
+    /// The journal is in `audio/` under its capture id.
+    Moved,
 }
 
 #[cfg(test)]
@@ -883,6 +902,8 @@ impl StoreV2 {
             before_retention_lock: None,
             #[cfg(test)]
             before_sweep_lock: None,
+            #[cfg(test)]
+            crash_after: None,
         })
     }
 
@@ -1087,7 +1108,7 @@ impl StoreV2 {
     /// committed with `synchronous=FULL`, then the WAL checkpoint per
     /// policy. Returning `Ok` is the durable ack.
     pub fn commit_capture(&mut self, record: &CaptureRecord) -> Result<(), StoreV2Error> {
-        self.commit_capture_superseding(record, None, false)
+        self.commit_capture_superseding(record, None, false, false)
     }
 
     /// Notes, before capture `id`'s audio moves into `audio/`, that its
@@ -1115,39 +1136,85 @@ impl StoreV2 {
             .is_some())
     }
 
-    /// Notes that recovery sealed journal `journal_id` (it was cut short),
-    /// before it does: once sealed it looks like a take that stopped.
-    fn note_recovery_seal(&self, journal_id: &str) -> Result<(), StoreV2Error> {
+    /// Notes that recovery is sealing journal `journal_id` (it was cut
+    /// short, its last `torn_tail_bytes` an unfinished write) as capture
+    /// `capture_id`, before it does: once sealed it looks like a take that
+    /// stopped. Durable (`synchronous=FULL`) before the seal is written; the
+    /// commit of `capture_id`'s row clears it.
+    fn note_recovery_seal(
+        &self,
+        journal_id: &str,
+        capture_id: &str,
+        torn_tail_bytes: u64,
+    ) -> Result<(), StoreV2Error> {
         self.conn.execute(
-            "INSERT INTO recovery_seals(journal_id, sealed_utc) VALUES (?1, ?2)
-             ON CONFLICT(journal_id) DO NOTHING",
-            params![journal_id, now_iso()],
+            "INSERT INTO recovery_seals(journal_id, capture_id, torn_tail_bytes, sealed_utc)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(journal_id) DO UPDATE SET
+                 capture_id = excluded.capture_id,
+                 torn_tail_bytes = MAX(torn_tail_bytes, excluded.torn_tail_bytes)",
+            params![journal_id, capture_id, int64(torn_tail_bytes)?, now_iso()],
         )?;
         Ok(())
     }
 
-    fn recovery_sealed(&self, journal_id: &str) -> Result<bool, StoreV2Error> {
-        Ok(self
+    /// The torn tail recovery recorded when it sealed journal
+    /// `journal_id`, if it did and the adoption has not committed.
+    fn recovery_seal(&self, journal_id: &str) -> Result<Option<u64>, StoreV2Error> {
+        self.seal_where("journal_id", journal_id)
+    }
+
+    /// [`Self::recovery_seal`] by the capture the sealed journal was
+    /// moving into: a file under `staging/` or `audio/`.
+    fn recovery_seal_for_capture(&self, capture_id: &str) -> Result<Option<u64>, StoreV2Error> {
+        self.seal_where("capture_id", capture_id)
+    }
+
+    fn seal_where(&self, column: &str, id: &str) -> Result<Option<u64>, StoreV2Error> {
+        let torn: Option<i64> = self
             .conn
             .query_row(
-                "SELECT 1 FROM recovery_seals WHERE journal_id = ?1",
-                params![journal_id],
-                |_| Ok(()),
+                &format!("SELECT MAX(torn_tail_bytes) FROM recovery_seals WHERE {column} = ?1"),
+                params![id],
+                |row| row.get(0),
             )
             .optional()?
-            .is_some())
+            .flatten();
+        Ok(torn.map(|torn| torn.max(0) as u64))
+    }
+
+    /// Stops a recovery after `step` when a crash test asked for it.
+    #[cfg(test)]
+    fn crash_point(&mut self, step: RecoveryStep) -> Result<(), StoreV2Error> {
+        if self.crash_after == Some(step) {
+            self.crash_after = None;
+            return Err(StoreV2Error::Invalid(format!("injected crash after {step:?}")));
+        }
+        Ok(())
+    }
+
+    /// Forgets the seals aimed at capture `capture_id`: its journal was
+    /// set aside, or it already has its row.
+    fn clear_recovery_seals(&self, capture_id: &str) -> Result<(), StoreV2Error> {
+        self.conn.execute(
+            "DELETE FROM recovery_seals WHERE capture_id = ?1",
+            params![capture_id],
+        )?;
+        Ok(())
     }
 
     /// [`Self::commit_capture`] that also records, in the same
     /// transaction, the recorder journal the take is stored in place of
     /// ([`TakeMeta::supersedes_journal`]) and, when `transcribe` (the
     /// callers set it only for a take whose audio is complete), the intent
-    /// to transcribe it ([`TakeMeta::transcribe`]).
+    /// to transcribe it ([`TakeMeta::transcribe`]). `recovered`: a
+    /// recovery's commit, which ends the seals aimed at the row.
     fn commit_capture_superseding(
         &mut self,
         record: &CaptureRecord,
         supersedes_journal: Option<&str>,
         transcribe: bool,
+        recovered: bool,
     ) -> Result<(), StoreV2Error> {
         let tx = self.conn.transaction()?;
         tx.execute(
@@ -1189,6 +1256,12 @@ impl StoreV2 {
             "DELETE FROM pending_intents WHERE capture_id = ?1",
             params![record.id],
         )?;
+        if recovered {
+            tx.execute(
+                "DELETE FROM recovery_seals WHERE capture_id = ?1",
+                params![record.id],
+            )?;
+        }
         tx.commit()?;
 
         self.commits_since_checkpoint += 1;
@@ -3034,6 +3107,9 @@ impl StoreV2 {
     /// corrupt lease file must not silently disable crash recovery for
     /// the whole root without a trace.
     pub fn reconcile(&mut self) -> Result<ReconciliationReport, StoreV2Error> {
+        // Recovery's notes (seals, intents) must be on disk before the
+        // files they describe change: never inside a caller's transaction.
+        self.refuse_open_transaction("reconcile the store")?;
         let mut report = ReconciliationReport::default();
         let ownership = self.live_foreign_lease()?;
         let foreign_owner = ownership.live;
@@ -3097,17 +3173,33 @@ impl StoreV2 {
                 report.empty_journals.push(id);
                 continue;
             }
-            let torn_tail_bytes = parsed.torn_tail_bytes;
+            // A journal an earlier pass sealed and died with reads as
+            // finished now: its noted seal says it was cut short, and how
+            // much of its tail that pass discarded.
+            let earlier_seal = self.recovery_seal_for_capture(&id)?;
+            let torn_tail_bytes = earlier_seal
+                .map_or(parsed.torn_tail_bytes, |earlier| earlier.max(parsed.torn_tail_bytes));
+            let cut = !parsed.finalized || parsed.torn_tail_bytes > 0 || earlier_seal.is_some();
             let sample_rate = parsed.sample_rate;
             let count = parsed.samples.len() as u64;
             let hash = format!("{:016x}", samples_hash(&parsed.samples));
 
             // Seal the verified prefix (§4: truncate + gap flag) and
             // promote. `seal_recovered_journal` is idempotent, so a crash
-            // mid-recovery re-runs cleanly.
+            // mid-recovery re-runs cleanly; the seal is noted first, so
+            // the re-run still knows the take was cut short (#220).
+            if cut {
+                self.note_recovery_seal(&id, &id, torn_tail_bytes)?;
+            }
+            #[cfg(test)]
+            self.crash_point(RecoveryStep::SealNoted)?;
             seal_recovered_journal(&path, &parsed)?;
+            #[cfg(test)]
+            self.crash_point(RecoveryStep::Sealed)?;
             self.promote_from_staging(&id)?;
-            if parsed.finalized && torn_tail_bytes == 0 {
+            #[cfg(test)]
+            self.crash_point(RecoveryStep::Moved)?;
+            if !cut {
                 report.promoted_finalized.push(id.clone());
             }
 
@@ -3117,7 +3209,7 @@ impl StoreV2 {
                      the journal were an unfinished write and were discarded (gap flagged, \
                      never joined)."
                 )
-            } else if parsed.finalized {
+            } else if !cut {
                 "Recovered from a take that finished cleanly but was never promoted or \
                  committed (crash between finalize and the metadata commit)."
                     .to_string()
@@ -3153,6 +3245,7 @@ impl StoreV2 {
                             Some(&note),
                         )?;
                     }
+                    self.clear_recovery_seals(&id)?;
                 }
                 None => {
                     let record = CaptureRecord {
@@ -3161,10 +3254,8 @@ impl StoreV2 {
                     };
                     // A complete take whose commit was to carry the intent
                     // to transcribe it still does (#220).
-                    let transcribe = parsed.finalized
-                        && torn_tail_bytes == 0
-                        && self.pending_intent(&id)?;
-                    self.commit_capture_superseding(&record, None, transcribe)?;
+                    let transcribe = !cut && self.pending_intent(&id)?;
+                    self.commit_capture_superseding(&record, None, transcribe, true)?;
                 }
             }
             report.recovered_torn.push(RecoveredTake {
@@ -3349,20 +3440,31 @@ impl StoreV2 {
             // deleted takes, not offered as a second copy.
             drop(parsed);
             move_journal_aside(&path, &self.root.join("journals").join(aside))?;
+            self.clear_recovery_seals(&id)?;
             report.superseded_journals.push(id);
             return Ok(false);
         }
-        let note = if parsed.finalized {
+        // A cut-short journal recovery sealed and moved here before a
+        // crash cut off its commit reads as finished: its noted seal says
+        // otherwise (#220).
+        let earlier_seal = self.recovery_seal_for_capture(&id)?;
+        let torn_tail_bytes = earlier_seal
+            .map_or(parsed.torn_tail_bytes, |earlier| earlier.max(parsed.torn_tail_bytes));
+        let cut = !parsed.finalized || parsed.torn_tail_bytes > 0 || earlier_seal.is_some();
+        let note = if !cut {
             "Recovered from a take that finished cleanly but was never \
              committed to the library (crash between finalize and the \
              metadata commit)."
                 .to_string()
-        } else if parsed.torn_tail_bytes > 0 {
+        } else if torn_tail_bytes > 0 {
             format!(
-                "Recovered from an orphaned journal with a torn tail of {} \
-                 bytes (gap flagged, never joined).",
-                parsed.torn_tail_bytes
+                "Recovered from an orphaned journal with a torn tail of {torn_tail_bytes} \
+                 bytes (gap flagged, never joined)."
             )
+        } else if earlier_seal.is_some() {
+            "Recovered from an interrupted take that was never finalized; audio up to \
+             its last confirmed boundary was kept."
+                .to_string()
         } else {
             "Recovered from an orphaned journal.".to_string()
         };
@@ -3385,9 +3487,8 @@ impl StoreV2 {
         // A complete take whose commit was to carry the intent to
         // transcribe it still does (#220): the row was written before its
         // audio moved here.
-        let transcribe =
-            parsed.finalized && parsed.torn_tail_bytes == 0 && self.pending_intent(&id)?;
-        self.commit_capture_superseding(&record, None, transcribe)?;
+        let transcribe = !cut && self.pending_intent(&id)?;
+        self.commit_capture_superseding(&record, None, transcribe, true)?;
         report.orphan_sessions.push(id);
         Ok(false)
     }
@@ -4000,6 +4101,9 @@ impl StoreV2 {
         note: impl FnOnce(&AdoptedJournal) -> String,
     ) -> Result<CaptureRecord, StoreV2Error> {
         validate_capture_id(&id)?;
+        // Its notes must be on disk before the journal changes: inside a
+        // caller's transaction a rollback would take them back.
+        self.refuse_open_transaction("adopt a capture journal")?;
         if self.get_capture(&id)?.is_some() || self.audio_path(&id).exists() {
             return Err(StoreV2Error::Invalid(format!(
                 "destination already holds capture {id}; refusing to overwrite"
@@ -4019,24 +4123,34 @@ impl StoreV2 {
         // An unsealed or torn journal is sealed to its verified prefix
         // first (idempotent), so audio/ only ever holds trailer-valid
         // files. The discarded tail — if any — is recorded as the gap.
-        // That it was sealed here is recorded first: a pass that dies
-        // before the adoption commits leaves a sealed journal that must
-        // still read as cut short, never as a take that stopped (#220).
+        // That it was sealed here is recorded first, durably, under the
+        // journal and the capture it moves into: a pass that dies before
+        // the adoption commits — before or after the move — leaves a
+        // sealed journal that still reads as cut short, never as a take
+        // that stopped (#220). The adoption's commit clears it.
         let source_id = source
             .file_stem()
             .and_then(|stem| stem.to_str())
             .unwrap_or_default()
             .to_string();
-        let torn_tail_bytes = parsed.torn_tail_bytes;
-        let was_finalized = parsed.finalized && !self.recovery_sealed(&source_id)?;
-        if !parsed.finalized || torn_tail_bytes > 0 {
-            self.note_recovery_seal(&source_id)?;
+        let earlier_seal = self.recovery_seal(&source_id)?;
+        let torn_tail_bytes = earlier_seal
+            .map_or(parsed.torn_tail_bytes, |earlier| earlier.max(parsed.torn_tail_bytes));
+        let was_finalized = parsed.finalized && earlier_seal.is_none();
+        let cut = !was_finalized || torn_tail_bytes > 0;
+        if cut {
+            self.note_recovery_seal(&source_id, &id, torn_tail_bytes)?;
+        }
+        #[cfg(test)]
+        self.crash_point(RecoveryStep::SealNoted)?;
+        if !parsed.finalized || parsed.torn_tail_bytes > 0 {
             seal_recovered_journal(source, &parsed)?;
             parsed.finalized = true;
             parsed.torn_tail_bytes = 0;
         }
-        let complete = was_finalized && torn_tail_bytes == 0;
-        let transcribe = transcribe && complete;
+        #[cfg(test)]
+        self.crash_point(RecoveryStep::Sealed)?;
+        let transcribe = transcribe && !cut;
         if transcribe {
             self.note_pending_intent(&id)?;
         }
@@ -4050,6 +4164,8 @@ impl StoreV2 {
         if let Some(parent) = source.parent() {
             sync_dir(parent)?;
         }
+        #[cfg(test)]
+        self.crash_point(RecoveryStep::Moved)?;
 
         let count = parsed.samples.len() as u64;
         let note = note(&AdoptedJournal {
@@ -4077,13 +4193,7 @@ impl StoreV2 {
             extra_json: (!note.is_empty()).then(|| merge_extra_note(None, &note)),
             secure_field: false,
         };
-        self.commit_capture_superseding(&record, None, transcribe)?;
-        if !source_id.is_empty() {
-            self.conn.execute(
-                "DELETE FROM recovery_seals WHERE journal_id = ?1",
-                params![source_id],
-            )?;
-        }
+        self.commit_capture_superseding(&record, None, transcribe, true)?;
         Ok(record)
     }
 
@@ -4308,6 +4418,7 @@ impl StoreV2 {
         wanted: impl Fn(&str) -> bool,
         transcribe_complete: bool,
     ) -> Result<JournalRecovery, StoreV2Error> {
+        self.refuse_open_transaction("recover capture journals")?;
         let mut report = JournalRecovery::default();
         // No tree yet is nothing to recover; any other failure to list it
         // must surface, never read as "no interrupted recordings".
@@ -4449,13 +4560,31 @@ impl StoreV2 {
             if let Some(aside) = aside {
                 drop(parsed);
                 match move_journal_aside(&path, &journals_dir.join(aside)) {
-                    Ok(()) if aside == SUPERSEDED_SUBDIR => report.superseded.push(id),
-                    Ok(()) => report.deleted.push(id),
+                    Ok(()) => {
+                        let _ = self.conn.execute(
+                            "DELETE FROM recovery_seals WHERE journal_id = ?1",
+                            params![id],
+                        );
+                        if aside == SUPERSEDED_SUBDIR {
+                            report.superseded.push(id);
+                        } else {
+                            report.deleted.push(id);
+                        }
+                    }
                     Err(err) => report.failed.push((id, err.to_string())),
                 }
                 continue;
             }
+            // A journal recovery sealed has no recorder left to save it.
+            let sealed_here = match self.recovery_seal(&id) {
+                Ok(seal) => seal.is_some(),
+                Err(err) => {
+                    report.failed.push((id, err.to_string()));
+                    continue;
+                }
+            };
             if parsed.finalized
+                && !sealed_here
                 && modified_age(&path).is_none_or(|age| age < FINALIZED_ADOPTION_GRACE)
             {
                 report.deferred.push(id);
@@ -5370,7 +5499,12 @@ impl FinalizedTake {
             extra_json,
             secure_field: self.meta.secure_field,
         };
-        store.commit_capture_superseding(&record, self.meta.supersedes_journal.as_deref(), transcribe)?;
+        store.commit_capture_superseding(
+            &record,
+            self.meta.supersedes_journal.as_deref(),
+            transcribe,
+            false,
+        )?;
         store.gc_staging()?;
         Ok(CommittedTake { record })
     }
@@ -6977,6 +7111,50 @@ mod tests {
         let rerun = store.reconcile().expect("rerun");
         assert!(rerun.recovered_torn.is_empty());
         assert!(rerun.orphan_sessions.is_empty());
+    }
+
+    /// #220/#356: a reconcile that dies at any step of salvaging a cut
+    /// staging journal — after noting the seal, after sealing it, after
+    /// promoting it — leaves a take the next one still stores as
+    /// interrupted with its confirmed extent, never as one that finished.
+    #[test]
+    fn a_staging_salvage_that_dies_at_any_step_still_reads_as_cut() {
+        for step in [RecoveryStep::SealNoted, RecoveryStep::Sealed, RecoveryStep::Moved] {
+            let dir = TempDir::new().expect("tempdir");
+            let confirmed = ramp(800, 0);
+            let id = {
+                let mut store = store_in(&dir);
+                let mut take = store
+                    .begin_take(TakeMeta::for_device("mic"))
+                    .expect("begin");
+                take.append_frames(&confirmed).expect("append");
+                take.write_boundary().expect("boundary");
+                take.append_frames(&ramp(120, 800)).expect("unconfirmed tail");
+                let id = take.id().to_string();
+                drop(take); // the recorder's crash
+                store.crash_after = Some(step);
+                assert!(store.reconcile().is_err(), "{step:?}");
+                id
+                // ... and the salvage's
+            };
+
+            let mut store = store_in(&dir);
+            let report = store.reconcile().expect("reconcile");
+            assert!(report.promoted_finalized.is_empty(), "{step:?}: {report:?}");
+            let record = store.get_capture(&id).expect("get").expect("row");
+            assert_eq!(record.status, CaptureStatus::Interrupted, "{step:?}");
+            assert_eq!(record.frame_count, 800, "{step:?}: only the verified prefix");
+            assert_eq!(store.load_audio(&id).expect("audio").samples, confirmed, "{step:?}");
+            let note = record.recovery_note().expect("note");
+            assert!(!note.contains("finished cleanly"), "{step:?}: {note}");
+            assert!(note.contains("gap flagged"), "{step:?}: the torn tail is named: {note}");
+            assert!(!store.transcription_wanted(&id).unwrap(), "{step:?}");
+            let seals: i64 = store
+                .conn
+                .query_row("SELECT COUNT(*) FROM recovery_seals", [], |row| row.get(0))
+                .expect("count");
+            assert_eq!(seals, 0, "{step:?}: the seal is done with");
+        }
     }
 
     #[test]

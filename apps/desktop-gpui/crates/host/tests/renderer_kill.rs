@@ -34,6 +34,9 @@ use starling_runtime_host::{serve, HostConfig};
 
 mod common;
 use common::endpoint_present;
+#[path = "common/reaped.rs"]
+mod reaped;
+use reaped::Reaped;
 
 #[path = "common/fake_engine.rs"]
 mod fake_engine;
@@ -553,17 +556,19 @@ fn a_killed_host_with_a_live_renderer_leaves_no_orphan_lease_and_the_successor_s
     let runtime_dir = root.path().join("endpoints");
 
     // The real binary, its own process, its own lease.
-    let mut host_process = ProcessCommand::new(HOST_BIN)
-        // Never the user's real engine settings/dirs in a test.
-        .args(["--engine", "none"])
-        .arg("--root")
-        .arg(root.path())
-        .arg("--runtime-dir")
-        .arg(&runtime_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("host binary spawns");
+    let mut host_process = Reaped(
+        ProcessCommand::new(HOST_BIN)
+            // Never the user's real engine settings/dirs in a test.
+            .args(["--engine", "none"])
+            .arg("--root")
+            .arg(root.path())
+            .arg("--runtime-dir")
+            .arg(&runtime_dir)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("host binary spawns"),
+    );
     let config = HostConfig::new(root.path(), runtime_dir);
     let socket = config.socket_path();
     let renderer = connect_with_retry(&socket);
