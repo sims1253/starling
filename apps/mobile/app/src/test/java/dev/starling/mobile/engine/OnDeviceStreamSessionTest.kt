@@ -492,21 +492,33 @@ class OnDeviceStreamSessionTest {
     }
 
     @Test
-    fun aCompletedWindowPreemptsTheRunningPreview() {
+    fun aCompletedWindowLetsTheRunningPreviewFinishAndShowsIt() {
+        val release = CountDownLatch(1)
+        var cancelSeen = false
         val first = java.util.concurrent.atomic.AtomicBoolean(true)
         val engine = PreviewEngine { cancel ->
-            if (first.getAndSet(false)) untilCancelled(cancel) else OnDeviceStreamSession.WindowResult.Text("tail")
+            if (first.getAndSet(false)) {
+                while (!release.await(2, TimeUnit.MILLISECONDS)) cancelSeen = cancelSeen || cancel()
+                OnDeviceStreamSession.WindowResult.Text("p")
+            } else {
+                OnDeviceStreamSession.WindowResult.Text("tail")
+            }
         }
         val session = tracedSession(engine, StreamTrace())
         val second = pcm(1.0)
         session.onAudio(second, second.size)
         assertTrue(engine.previewStarted.tryAcquire(5, TimeUnit.SECONDS))
 
-        // The rest of the first 12 s window arrives while the preview runs.
+        // The rest of the first 12 s window arrives while the preview runs:
+        // the preview still completes and is shown, then the window commits.
         val rest = pcm(11.0)
         session.onAudio(rest, rest.size)
+        Thread.sleep(50)
+        release.countDown()
 
+        awaitEvent { it == StreamEvent.Partial("p") }
         awaitEvent { it is StreamEvent.Partial && it.text.startsWith("n192000") }
+        assertFalse(cancelSeen)
         assertEquals(listOf(12 * ChunkStreamer.SAMPLE_RATE), engine.windows.take(1))
         assertTrue(session.finish() is CommitOutcome.Final)
     }

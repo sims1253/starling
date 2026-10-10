@@ -296,13 +296,11 @@ class OnDeviceStreamSession(
             val window = if (start == 0 && length == samples.size) samples else samples.copyOfRange(start, start + length)
             val t0 = clock()
             val preview = kind == ChunkStreamer.CallKind.PREVIEW
-            // The preview starts at the window boundary.
             val end = snapshotBase + start + length
-            val windowEnd = snapshotBase + start + streamer.windowSamples
             var obsolete = false
             val result = runCatching {
                 if (preview) {
-                    engine.transcribePreview(window) { obsolete || previewObsolete(end, windowEnd).also { obsolete = it } }
+                    engine.transcribePreview(window) { obsolete || previewObsolete(end).also { obsolete = it } }
                 } else {
                     engine.transcribeWindow(window)
                 }
@@ -311,7 +309,7 @@ class OnDeviceStreamSession(
             // checkpoint (or on an engine without checkpoints) is discarded
             // like a cancelled one: its audio stays buffered for the window
             // or flush that follows.
-            if (preview && !obsolete) obsolete = previewObsolete(end, windowEnd)
+            if (preview && !obsolete) obsolete = previewObsolete(end)
             val outcome = if (obsolete && result is WindowResult.Text) WindowResult.Cancelled else result
             trace?.call(
                 StreamTrace.Call(
@@ -423,18 +421,21 @@ class OnDeviceStreamSession(
 
     /**
      * Polled by the engine while a preview of the audio up to absolute sample
-     * [end] runs (on the worker thread, without the lock): true once required
-     * work is waiting behind it, so Stop and window commits never wait for a
-     * preview (#357, as the native server does since #428). That is Stop
-     * with audio the preview does not cover, a full window ending at
-     * [windowEnd] already captured, or a closed session. Stop with no newer
-     * audio lets the preview finish: it is exactly the tail the flush
-     * needs, and [ChunkStreamer.flush] reuses it.
+     * [end] runs (on the worker thread, without the lock): true once Stop
+     * brought audio the preview does not cover, or the session closed, so
+     * Stop never waits for a preview it cannot use (#357, as the native
+     * server does since #428). Stop with no newer audio lets the preview
+     * finish: it is exactly the tail the flush needs, and
+     * [ChunkStreamer.flush] reuses it.
+     *
+     * Unlike the server, a completed window does not preempt the preview:
+     * on the Pixel's fast engine the GPU encoder submission (most of a
+     * call) cannot be interrupted, so cancelling there mostly threw away a
+     * nearly finished partial. Measured on the Pixel 10 Pro: 10-17 % fewer
+     * partials on the 6 min take and 5-7 % older p95 partials, for no
+     * stop-time gain.
      */
-    private fun previewObsolete(end: Long, windowEnd: Long): Boolean {
-        val captured = captured
-        return closed || (inputEnded && captured > end) || captured >= windowEnd
-    }
+    private fun previewObsolete(end: Long): Boolean = closed || (inputEnded && captured > end)
 
     /**
      * Reads saved audio the buffer is missing back into it, in order, up to
