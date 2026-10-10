@@ -269,6 +269,15 @@ impl History {
                 facade.record_insight(&id, &event_id, &kind, &occurred_at, &payload_json)?;
                 Value::Null
             }
+            StoreRequest::RecordBoundaryRevision {
+                id,
+                source_text,
+                text,
+                changes,
+            } => {
+                facade.record_boundary_revision(&id, &source_text, &text, &changes)?;
+                Value::Null
+            }
             StoreRequest::RecordCorrection { record } => json(facade.record_correction(&record)?)?,
             StoreRequest::ReviseCorrection {
                 id,

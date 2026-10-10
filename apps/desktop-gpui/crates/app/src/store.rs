@@ -168,6 +168,18 @@ impl Store {
         })
     }
 
+    /// Records a delivery the insertion-boundary rules adjusted (#341)
+    /// as a revision derived from `source_text`; the head stays.
+    pub(crate) fn record_boundary_revision(
+        &self,
+        id: &str,
+        source_text: &str,
+        text: &str,
+        changes: &[String],
+    ) -> Result<(), storage::StorageError> {
+        self.with(|history| history.record_boundary_revision(id, source_text, text, changes))
+    }
+
     /// Records one insight event for the take (idempotent on its id).
     pub(crate) fn record_insight(
         &self,

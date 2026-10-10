@@ -33,6 +33,36 @@ pub struct ProcessingDoc {
     pub proposals: Vec<ProposalRow>,
     /// The accepted proposal the head derives from, as the head records it.
     pub accepted_request: Option<String>,
+    /// Deliveries the insertion-boundary rules adjusted (#341), oldest
+    /// first. They never move the head.
+    #[serde(default)]
+    pub boundary: Vec<BoundaryRevision>,
+}
+
+/// One delivery the insertion-boundary rules adjusted (#341): the text
+/// typed, a revision derived from the take's text as it was delivered.
+/// It holds no text of the field it went into.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct BoundaryRevision {
+    /// The text that was typed.
+    pub text: String,
+    /// The text it was derived from: the transcript, or a staged draft.
+    pub source_text: String,
+    /// The head revision whose text that was, when it was one.
+    pub derived_from: Option<u64>,
+    /// The contract kinds of the rules that fired, in rule order.
+    pub changes: Vec<String>,
+}
+
+/// The provenance of a [`BoundaryRevision`]'s row.
+const BOUNDARY_PROVENANCE: &str = "insertion-boundary";
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct BoundarySources {
+    attempt_id: String,
+    derived_from: Option<u64>,
+    source_text: String,
+    changes: Vec<String>,
 }
 
 /// What produced a proposal, pinned at request time for the correction
@@ -195,6 +225,21 @@ impl ProcessingDoc {
                 })
             })
             .collect();
+        let boundary = document
+            .revisions
+            .iter()
+            .filter(|row| row.disposition.as_deref() == Some("derived"))
+            .filter_map(|row| {
+                let sources: BoundarySources =
+                    serde_json::from_str(row.sources_json.as_deref()?).ok()?;
+                Some(BoundaryRevision {
+                    text: row.text.clone(),
+                    source_text: sources.source_text,
+                    derived_from: sources.derived_from,
+                    changes: sources.changes,
+                })
+            })
+            .collect();
         Some(ProcessingDoc {
             head_revision: document.head_revision,
             head_text: head.text.clone(),
@@ -203,6 +248,7 @@ impl ProcessingDoc {
             raw_text: raw.text.clone(),
             proposals,
             accepted_request,
+            boundary,
         })
     }
 }
@@ -464,7 +510,79 @@ impl Facade {
             raw_text: raw.to_string(),
             proposals: Vec::new(),
             accepted_request: None,
+            boundary: Vec::new(),
         })
+    }
+
+    /// Records a delivery the insertion-boundary rules adjusted (#341):
+    /// `text` was typed for the take's `source_text`, with the rules
+    /// `changes`. A derived revision in the take's processing document
+    /// (started on the current transcript when there is none): the head,
+    /// the raw transcript and every other revision stay as they are, so
+    /// the unadjusted text is still what Copy and history give.
+    pub fn record_boundary_revision(
+        &self,
+        id: &str,
+        source_text: &str,
+        text: &str,
+        changes: &[String],
+    ) -> Result<(), storage::StorageError> {
+        let store = lock_v2(&self.0);
+        if store.get_capture(id).map_err(v2_err)?.is_none() {
+            return Err(storage::StorageError::NotFound(id.to_string()));
+        }
+        let attempts = store.attempts_for(id).map_err(v2_err)?;
+        let Some(attempt) = current_transcript(&attempts) else {
+            return Err(storage::StorageError::NotFound(id.to_string()));
+        };
+        let current = store
+            .get_document(id)
+            .map_err(v2_err)?
+            .filter(|document| {
+                ProcessingDoc::from_row(id, document.clone())
+                    .is_some_and(|doc| doc.raw_attempt_id == attempt.id)
+            });
+        let document = match current {
+            Some(document) => document,
+            None => {
+                store.delete_document(id).map_err(v2_err)?;
+                let raw = head_row(id, 1, &attempt.text, true, &attempt.id, None);
+                store.commit_document_head(PROCESSING_DOC, 1, 0, &raw).map_err(v2_err)?;
+                store
+                    .get_document(id)
+                    .map_err(v2_err)?
+                    .ok_or_else(|| storage::StorageError::NotFound(id.to_string()))?
+            }
+        };
+        let count = document
+            .revisions
+            .iter()
+            .filter(|row| row.disposition.as_deref() == Some("derived"))
+            .count();
+        // The latest committed head holding exactly the delivered text.
+        let derived_from = (1..=document.head_revision).rev().find(|revision| {
+            document
+                .revisions
+                .iter()
+                .any(|row| row.rev_id == head_rev_id(id, *revision) && row.text == source_text)
+        });
+        let row = RevisionRow {
+            rev_id: format!("{id}#b{}", count + 1),
+            doc_id: id.to_string(),
+            base_revision: Some(document.head_revision),
+            sources_json: serde_json::to_string(&BoundarySources {
+                attempt_id: attempt.id.clone(),
+                derived_from,
+                source_text: source_text.to_string(),
+                changes: changes.to_vec(),
+            })
+            .ok(),
+            text: text.to_string(),
+            status: "derived".to_string(),
+            provenance: Some(BOUNDARY_PROVENANCE.to_string()),
+            disposition: Some("derived".to_string()),
+        };
+        store.store_document_revision(&row).map_err(v2_err)
     }
 
     /// Stores (or updates) one proposal row. A take deleted meanwhile is
@@ -1446,6 +1564,56 @@ mod tests {
         assert_eq!(doc.proposals, vec![accepted]);
         // The recognition attempt is exactly what the recognizer returned.
         assert_eq!(transcript_text(&reopened, &id).as_deref(), Some("um so hello there"));
+    }
+
+    /// #341: an adjusted delivery is a derived revision next to the
+    /// head, never the head; it starts the processing document when
+    /// processing never ran, and goes with the take.
+    #[test]
+    fn boundary_adjustments_are_derived_revisions_beside_the_head() {
+        let root = scratch_dir("boundary-revision");
+        let store = reopen_v2(&root);
+        let id = transcribed(&store, "Fox jumps");
+        let changes = vec!["leading_space".to_string(), "first_letter_case".to_string()];
+        store
+            .record_boundary_revision(&id, "Fox jumps", " fox jumps", &changes)
+            .expect("record");
+        // A staged draft's text is no head: no revision to name.
+        store
+            .record_boundary_revision(&id, "Fox jumps high", " Fox jumps high", &changes[..1])
+            .expect("record");
+
+        let doc = reopen_v2(&root).processing_doc(&id).expect("load").expect("doc");
+        assert_eq!((doc.head_revision, doc.head_is_raw), (1, true));
+        assert_eq!(doc.head_text, "Fox jumps", "the head is never the adjusted text");
+        assert!(doc.proposals.is_empty());
+        assert_eq!(
+            doc.boundary,
+            vec![
+                BoundaryRevision {
+                    text: " fox jumps".to_string(),
+                    source_text: "Fox jumps".to_string(),
+                    derived_from: Some(1),
+                    changes: changes.clone(),
+                },
+                BoundaryRevision {
+                    text: " Fox jumps high".to_string(),
+                    source_text: "Fox jumps high".to_string(),
+                    derived_from: None,
+                    changes: changes[..1].to_vec(),
+                },
+            ]
+        );
+        // Processing starting afterwards keeps them.
+        let (attempt, raw) = store.latest_raw(&id).expect("raw").expect("final");
+        let started = store.start_processing_doc(&id, &attempt, &raw).expect("start");
+        assert_eq!(started.boundary.len(), 2);
+
+        store.delete(&id).expect("delete");
+        assert!(matches!(
+            store.record_boundary_revision(&id, "Fox jumps", " fox jumps", &changes),
+            Err(storage::StorageError::NotFound(_))
+        ));
     }
 
     #[test]
