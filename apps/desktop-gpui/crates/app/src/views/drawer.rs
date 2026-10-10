@@ -75,17 +75,22 @@ pub fn render_drawer(
         .as_ref()
         .filter(|pending| pending.take_id == session.id)
         .map(|pending| provenance_label(&format!("engine:{}", pending.model_id)));
-    let retry_choices = app.retry_choices();
     let menu_open = app.retry_menu.as_deref() == Some(session.id.as_str()) && !active;
+    // The choices snapshot the engine: read only for an open menu, or at
+    // the click that decides whether one opens.
+    let retry_choices = if menu_open {
+        app.retry_choices()
+    } else {
+        Vec::new()
+    };
     if !active {
         let menu_id = session.id.clone();
-        let direct = retry_choices.is_empty();
         actions = actions.child(
             action_button(
                 "drawer-retry",
                 false,
                 cx.listener(move |this, _, _window, cx| {
-                    if direct {
+                    if this.retry_choices().is_empty() {
                         this.retry_selected(cx);
                     } else {
                         this.toggle_retry_menu(&menu_id, cx);

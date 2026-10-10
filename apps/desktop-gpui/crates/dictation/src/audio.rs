@@ -262,7 +262,7 @@ fn js_round(x: f64) -> f64 {
 /// — with the asymmetric scales JS applies (`0x8000` for negatives,
 /// `0x7fff` for non-negatives). The multiply happens in f64 because JS
 /// numbers are f64 even for Float32Array elements.
-fn pcm16(sample: f32) -> i16 {
+pub(crate) fn pcm16(sample: f32) -> i16 {
     let finite = if sample.is_finite() { sample } else { 0.0 };
     let clamped = finite.max(-1.0).min(1.0);
 

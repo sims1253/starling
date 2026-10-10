@@ -1535,12 +1535,9 @@ impl StarlingApp {
             return;
         }
         self.retry_menu = None;
-        // A newer choice replaces a retry still loading its audio or
-        // waiting for its model.
-        self.pending_retry = None;
-        self.retry_seq += 1;
-        let seq = self.retry_seq;
         if with == RetryWith::Server && self.endpoint.trim().is_empty() {
+            // A choice that cannot run replaces nothing: a retry still
+            // waiting for its model carries on.
             self.error = Some(
                 "No server is set up: add its endpoint in Settings → Engine, then retry."
                     .to_string(),
@@ -1548,6 +1545,11 @@ impl StarlingApp {
             cx.notify();
             return;
         }
+        // A newer choice replaces a retry still loading its audio or
+        // waiting for its model.
+        self.pending_retry = None;
+        self.retry_seq += 1;
+        let seq = self.retry_seq;
         // G02: history holds metadata only — fetch this one recording's
         // audio on demand (a damaged record surfaces its reason here).
         let Some(store) = self.store.clone() else {
@@ -1638,6 +1640,9 @@ impl StarlingApp {
         let started = Instant::now();
         cx.spawn(async move |this, cx| {
             let mut job = Some((wav, pin));
+            // Since when the engine has reported the model serving without
+            // handing out a lease on it.
+            let mut unleased_since: Option<Instant> = None;
             loop {
                 cx.background_executor()
                     .timer(std::time::Duration::from_millis(250))
@@ -1679,7 +1684,23 @@ impl StarlingApp {
                             let Some(lease) =
                                 engine.lease().filter(|lease| lease.model_id() == model_id)
                             else {
-                                return false;
+                                // A moment between the snapshot and the
+                                // lease is fine; a lasting gap ends the
+                                // retry visibly instead of waiting on.
+                                let since = *unleased_since.get_or_insert_with(Instant::now);
+                                let Some(reason) = unleased_retry_failure(since.elapsed()) else {
+                                    return false;
+                                };
+                                app.pending_retry = None;
+                                app.error = Some(format!(
+                                    "Could not retry with {}: {reason} The recording is \
+                                     unchanged.",
+                                    crate::views::drawer::provenance_label(&format!(
+                                        "engine:{model_id}"
+                                    ))
+                                ));
+                                cx.notify();
+                                return true;
                             };
                             app.pending_retry = None;
                             if let Some((wav, pin)) = job.take() {
@@ -1818,6 +1839,13 @@ const RETRY_SWITCH_CAP: std::time::Duration = std::time::Duration::from_secs(10 
 /// command queue can be busy winding down an earlier switch) before the
 /// retry gives up.
 const RETRY_SWITCH_PICKUP: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Why a retry whose model the engine reports serving gives up after
+/// `unleased` without a lease on it — never, until
+/// [`RETRY_SWITCH_PICKUP`] has passed.
+fn unleased_retry_failure(unleased: std::time::Duration) -> Option<&'static str> {
+    (unleased >= RETRY_SWITCH_PICKUP).then_some("the model loaded but could not be used.")
+}
 
 /// Read an engine snapshot for a retry waiting on `model_id`, whose
 /// switch is the engine's activation `request`.
@@ -2759,18 +2787,11 @@ mod tests {
         });
     }
 
-    /// Settings switching the engine off while a retry waits for its
-    /// model ends that wait visibly: no "Loading" left in the drawer, a
-    /// sentence saying why, and nothing sent.
-    #[gpui::test]
-    fn an_engine_change_cancels_a_retry_waiting_for_its_model(cx: &mut gpui::TestAppContext) {
-        let root = scratch("engine-change");
-        let store = Store::at_test_root(&root);
-        let id = store.save_capture(one_second_wav(), None).expect("save").id;
+    /// An engine without binaries: it never serves, so a retry waiting
+    /// on one of its models waits until something else ends it.
+    fn idle_engine(root: &std::path::Path) -> starling_dictation::engine::EngineManager {
         std::fs::create_dir_all(root.join("engines")).expect("engines");
-        // No engine binaries: the manager never serves, so the retry
-        // stays waiting until the change.
-        let engine = starling_dictation::engine::EngineManager::start(
+        starling_dictation::engine::EngineManager::start(
             starling_dictation::engine::EngineConfig {
                 engine_dir: Some(root.join("engines")),
                 models_dir: root.join("models"),
@@ -2782,7 +2803,63 @@ mod tests {
                 backoff_schedule: None,
             },
             None,
+        )
+    }
+
+    /// A "Retry with your server" click with no server set up says so
+    /// and replaces nothing: a retry waiting for its model carries on.
+    #[gpui::test]
+    fn a_server_retry_that_cannot_run_leaves_a_waiting_retry_alone(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = scratch("server-retry-keeps-pending");
+        let store = Store::at_test_root(&root);
+        let id = store.save_capture(one_second_wav(), None).expect("save").id;
+        let engine = idle_engine(&root);
+        let app = cx.new(|cx| {
+            let mut app = StarlingApp::for_test(Some(store.clone()), cx);
+            app.engine = Some(engine.clone());
+            app.endpoint = String::new();
+            app.apply_sessions(store.list().expect("list"));
+            app.selected_id = Some(id.clone());
+            app
+        });
+        retry(&app, cx, RetryWith::Model("model-b".to_string()));
+        let waiting = app.read_with(cx, |app, _| app.pending_retry.clone());
+        assert!(waiting.is_some());
+        retry(&app, cx, RetryWith::Server);
+        app.read_with(cx, |app, _| {
+            let error = app.error.as_deref().expect("explained");
+            assert!(error.contains("No server"), "{error}");
+            assert_eq!(app.pending_retry, waiting, "the waiting retry carries on");
+        });
+        engine.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The engine reporting the model serving without a lease on it is a
+    /// moment's gap at most: past the pickup bound the retry ends with a
+    /// sentence, never waits on unseen.
+    #[test]
+    fn a_served_model_without_a_lease_ends_the_retry_visibly() {
+        assert_eq!(unleased_retry_failure(std::time::Duration::ZERO), None);
+        assert_eq!(
+            unleased_retry_failure(RETRY_SWITCH_PICKUP - std::time::Duration::from_millis(1)),
+            None
         );
+        let reason = unleased_retry_failure(RETRY_SWITCH_PICKUP).expect("gives up");
+        assert!(reason.contains("could not be used"), "{reason}");
+    }
+
+    /// Settings switching the engine off while a retry waits for its
+    /// model ends that wait visibly: no "Loading" left in the drawer, a
+    /// sentence saying why, and nothing sent.
+    #[gpui::test]
+    fn an_engine_change_cancels_a_retry_waiting_for_its_model(cx: &mut gpui::TestAppContext) {
+        let root = scratch("engine-change");
+        let store = Store::at_test_root(&root);
+        let id = store.save_capture(one_second_wav(), None).expect("save").id;
+        let engine = idle_engine(&root);
         let app = cx.new(|cx| {
             let mut app = StarlingApp::for_test(Some(store.clone()), cx);
             app.engine = Some(engine.clone());

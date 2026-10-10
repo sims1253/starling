@@ -690,7 +690,7 @@ impl V2CaptureStore {
                     // not divergence — the channel stays free of
                     // normal-path traffic for operators keying on it.
                     drop(store);
-                    supersede_stored_take_journal(take);
+                    self.supersede_stored_take_journal(take, &staged_id);
                     return Ok(());
                 }
                 Err(read_err) => {
@@ -703,7 +703,7 @@ impl V2CaptureStore {
                     // journal reconcile surfaces: the recorder's journal
                     // is no second copy to offer.
                     drop(store);
-                    supersede_stored_take_journal(take);
+                    self.supersede_stored_take_journal(take, &staged_id);
                     return Ok(());
                 }
                 Ok(None) => {}
@@ -758,23 +758,38 @@ impl V2CaptureStore {
             return Err(chained_with_rollback(err, rollback));
         }
         drop(store);
-        supersede_stored_take_journal(take);
+        self.supersede_stored_take_journal(take, &staged_id);
         Ok(())
     }
-}
 
-/// #356: a take stored from its samples (every exit that answers Ok on
-/// the samples path) leaves no journal in the recorder's tree to come
-/// back as a second, partial take at the next startup recovery. Kept,
-/// never deleted.
-fn supersede_stored_take_journal(take: &TakeRecord) {
-    if let Some(report) = &take.journal {
-        if let Err(err) = starling_dictation::store_v2::supersede_capture_journal(&report.path) {
-            report_divergence(format!(
+    /// #356: a take stored from its samples as `staged_id` (every exit
+    /// that answers Ok on the samples path) leaves no journal in the
+    /// recorder's tree to come back as a second, partial take at the next
+    /// startup recovery — once its stored audio, read back, holds every
+    /// sample the journal confirmed. Kept, never deleted; a journal not
+    /// provably held stays for recovery (a duplicate at worst, never
+    /// audio lost).
+    fn supersede_stored_take_journal(&self, take: &TakeRecord, staged_id: &str) {
+        let Some(report) = &take.journal else {
+            return;
+        };
+        // The reads run off the lock: only the path needs it.
+        let stored = self.store.lock().expect("v2 store lock").audio_journal_path(staged_id);
+        let moved = stored.and_then(|stored| {
+            starling_dictation::store_v2::supersede_journal_held_by(&report.path, &stored)
+        });
+        match moved {
+            Ok(true) => {}
+            Ok(false) => report_divergence(format!(
+                "the capture journal {} was kept in place: take {staged_id} does not provably \
+                 hold all of its audio, so startup recovery will list it as an interrupted copy",
+                report.path.display()
+            )),
+            Err(err) => report_divergence(format!(
                 "the stored take's capture journal {} could not be moved aside ({err}); \
                  startup recovery may list it as an interrupted copy",
                 report.path.display()
-            ));
+            )),
         }
     }
 }

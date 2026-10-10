@@ -375,7 +375,7 @@ impl Store {
         let id = self
             .save_pcm_take(pcm, store_v2::CommitMark::Complete, journal)
             .map_err(|err| join_adopt_failure(adopted, err))?;
-        supersede_journal(journal);
+        self.supersede_journal(journal, &id);
         Ok(SavedTake { id, wav })
     }
 
@@ -427,7 +427,7 @@ impl Store {
                 journal,
             )
             .map_err(|err| join_adopt_failure(adopted, err))?;
-        supersede_journal(journal);
+        self.supersede_journal(journal, &id);
         Ok(id)
     }
 
@@ -839,6 +839,35 @@ impl Store {
         let committed = finalized.commit_marked(&mut store, mark).map_err(v2_err)?;
         Ok(committed.record.id)
     }
+
+    /// The take was stored from its WAV as `id`: a journal it left in the
+    /// recorder's tree is moved aside so startup recovery does not adopt
+    /// it as a second, partial copy (#356) — but only once the stored
+    /// audio, read back, holds every sample the journal confirmed
+    /// ([`store_v2::supersede_journal_held_by`]). Otherwise, or on a
+    /// failure here (only logged), the journal stays for recovery, which
+    /// runs the same proof: a duplicate at worst, never audio lost.
+    fn supersede_journal(&self, journal: Option<&recorder::JournalReport>, id: &str) {
+        let Some(report) = journal else {
+            return;
+        };
+        // Both reads run off the shared handle: only the path needs it.
+        let stored = lock_v2(&self.0).audio_journal_path(id);
+        let moved =
+            stored.and_then(|stored| store_v2::supersede_journal_held_by(&report.path, &stored));
+        match moved {
+            Ok(true) => {}
+            Ok(false) => eprintln!(
+                "Kept the capture journal {} in place: take {id} does not provably hold all of \
+                 its audio, so startup recovery will bring it back as an interrupted take",
+                report.path.display()
+            ),
+            Err(err) => eprintln!(
+                "Could not move the superseded capture journal {} aside: {err}",
+                report.path.display()
+            ),
+        }
+    }
 }
 
 /// What [`Store::startup_recovery`] found.
@@ -993,20 +1022,6 @@ fn adoptable(report: &recorder::JournalReport) -> bool {
     report.finalized && report.fault.is_none()
 }
 
-/// The take was stored from its WAV: a journal it left in the recorder's
-/// tree is moved aside so startup recovery does not adopt it as a second,
-/// partial copy (#356). A failure here is only logged: the take's commit
-/// names the journal, so recovery moves it aside instead.
-fn supersede_journal(journal: Option<&recorder::JournalReport>) {
-    if let Some(report) = journal {
-        if let Err(err) = store_v2::supersede_capture_journal(&report.path) {
-            eprintln!(
-                "Could not move the superseded capture journal {} aside: {err}",
-                report.path.display()
-            );
-        }
-    }
-}
 
 /// The recorder's live-capture tree beside the store
 /// ([`starling_dictation::journal::default_journals_root`] for the
@@ -2185,13 +2200,11 @@ mod tests {
         assert_eq!(decoded.samples.len(), 90);
         let summary = summary_of(&store, &saved.id);
         assert_eq!(summary.status, SessionStatus::Captured);
-        // The unusable journal is kept, moved aside so startup recovery
-        // does not offer it as a second take (#356).
-        assert!(!junk_path.exists());
-        assert!(junk_root
-            .join(store_v2::SUPERSEDED_SUBDIR)
-            .join("j_unreadable.sj")
-            .exists());
+        // The unusable journal is kept where it is (#356): nothing proves
+        // the stored take holds what it does, so it never joins the
+        // superseded journals the retention sweep removes.
+        assert!(junk_path.exists());
+        assert!(!junk_root.join(store_v2::SUPERSEDED_SUBDIR).exists());
     }
 
     #[test]
@@ -2291,10 +2304,11 @@ mod tests {
     fn a_faulted_journal_is_not_adopted_and_the_whole_take_is_kept() {
         // A journal that faulted mid-take holds only the audio before the
         // fault; the in-memory take kept recording. The take is stored
-        // whole from its WAV, and the partial journal is moved aside —
-        // kept, but never recovered later as a second, shorter take.
+        // whole from its WAV, and the partial journal — the WAV's first
+        // samples — is moved aside: kept, but never recovered later as a
+        // second, shorter take.
         let store = v2_store("faulted-journal");
-        let samples: Vec<f32> = (0..120).map(|i| (i % 23) as f32 * 0.004).collect();
+        let samples: Vec<f32> = (0..120).map(|i| (i % 97) as f32 * 0.001).collect();
         let mut report = finalized_journal("faulted-journal-src", &samples);
         report.fault = Some("The capture journal failed: No space left on device".to_string());
 
@@ -2331,6 +2345,21 @@ mod tests {
         let stored = store.audio_wav(&id).expect("load").expect("present");
         assert_eq!(audio::decode_pcm16_wav(&stored).expect("decode").samples.len(), 300);
         assert!(!report.path.exists());
+
+        // A journal the stored take does not provably hold — here audio
+        // the WAV lacks — stays for startup recovery: a duplicate at
+        // worst, never audio lost.
+        let other: Vec<f32> = (0..120).map(|i| (i % 23) as f32 * 0.004).collect();
+        let mut report = finalized_journal("faulted-unproven-src", &other);
+        report.fault = Some("fsync failed".to_string());
+        store.save_capture(tiny_wav(300), Some(&report)).expect("save");
+        assert!(report.path.exists(), "kept in place");
+        assert!(!report
+            .path
+            .parent()
+            .unwrap()
+            .join(store_v2::SUPERSEDED_SUBDIR)
+            .exists());
     }
 
     #[test]

@@ -196,12 +196,14 @@ fn a_superseded_journal_is_kept_but_never_recovered_twice() {
         writer.path().to_path_buf()
     };
     age(&path, old());
+    let stored = store_in_place_of(&mut store, "j_faulted", &ramp(4_800, 0));
+    let stored = store.audio_journal_path(&stored).expect("stored audio");
 
-    supersede_capture_journal(&path).expect("supersede");
+    assert!(supersede_journal_held_by(&path, &stored).expect("supersede"));
     assert!(!path.exists());
     assert!(tree.join(SUPERSEDED_SUBDIR).join("j_faulted.sj").exists());
     // Superseding what is already gone is fine.
-    supersede_capture_journal(&path).expect("idempotent");
+    assert!(!supersede_journal_held_by(&path, &stored).expect("idempotent"));
     // A second journal of the same name never replaces the kept one.
     let again = {
         let mut writer =
@@ -211,7 +213,7 @@ fn a_superseded_journal_is_kept_but_never_recovered_twice() {
         writer.path().to_path_buf()
     };
     let kept = std::fs::read(tree.join(SUPERSEDED_SUBDIR).join("j_faulted.sj")).expect("kept");
-    supersede_capture_journal(&again).expect("supersede again");
+    assert!(supersede_journal_held_by(&again, &stored).expect("supersede again"));
     assert!(!again.exists());
     assert_eq!(
         std::fs::read(tree.join(SUPERSEDED_SUBDIR).join("j_faulted.sj")).expect("still kept"),
@@ -266,7 +268,9 @@ fn the_retention_sweep_empties_superseded_journals() {
         writer.write_boundary().expect("boundary");
         writer.path().to_path_buf()
     };
-    supersede_capture_journal(&path).expect("supersede");
+    let stored = store_in_place_of(&mut store, "j_partial", &ramp(1_600, 0));
+    let stored = store.audio_journal_path(&stored).expect("stored audio");
+    assert!(supersede_journal_held_by(&path, &stored).expect("supersede"));
     let report = store.sweep_retention().expect("sweep");
     assert_eq!(report.swept.len(), 1, "{report:?}");
     assert!(!tree.join(SUPERSEDED_SUBDIR).join("j_partial.sj").exists());
@@ -402,7 +406,8 @@ fn a_journal_whose_take_was_stored_in_its_place_is_moved_aside_not_adopted() {
     store.delete_capture(&stored).expect("delete");
     let report = store.recover_capture_journals(&tree).expect("rescan");
     assert!(report.recovered.is_empty(), "{report:?}");
-    assert_eq!(report.superseded, vec!["j_saved".to_string()]);
+    assert_eq!(report.deleted, vec!["j_saved".to_string()]);
+    assert!(tree.join(DELETED_SUBDIR).join("j_saved.sj").exists());
     assert_eq!(capture_count(&store), 0);
 }
 
@@ -442,6 +447,7 @@ fn a_journal_already_adopted_is_moved_aside_when_its_old_name_comes_back() {
     store.reconcile().expect("reconcile");
     let report = store.recover_capture_journals(&tree).expect("rescan");
     assert!(report.recovered.is_empty(), "{report:?}");
+    assert_eq!(report.deleted, vec!["j_adopted".to_string()]);
     assert_eq!(capture_count(&store), 0);
 }
 
@@ -574,4 +580,231 @@ fn creation_scratch_no_writer_holds_is_swept() {
     assert!(busy.exists(), "a held one is left to its writer");
     assert!(fresh.exists(), "a fresh one is left to its creator");
     drop(holder);
+}
+
+// --- #356 review round 6: a journal is moved aside only once a stored
+// copy is read back holding every confirmed sample of it ---
+
+/// The single take stored in place of `journal_id`, with its stored audio
+/// file, after the journal was left in the tree.
+fn replaced(store: &mut StoreV2, journal_id: &str, samples: &[f32]) -> (String, PathBuf) {
+    let id = store_in_place_of(store, journal_id, samples);
+    let path = store.audio_journal_path(&id).expect("stored audio");
+    (id, path)
+}
+
+/// Recovery adopted the journal whole: nothing it confirmed is lost.
+fn adopted_whole(store: &StoreV2, report: &JournalRecovery, id: &str, samples: &[f32]) {
+    assert!(report.superseded.is_empty() && report.deleted.is_empty(), "{report:?}");
+    assert_eq!(report.recovered.len(), 1, "{report:?}");
+    assert_eq!(report.recovered[0].id, id);
+    assert_eq!(store.load_audio(id).expect("audio").samples, samples);
+}
+
+#[test]
+fn a_replacement_whose_audio_is_missing_supersedes_nothing() {
+    let dir = TempDir::new().expect("tempdir");
+    let mut store = store_in(&dir);
+    let tree = journals(&dir);
+    let confirmed = ramp(1_600, 0);
+    let journal = faulted_journal(&tree, "j_missing", &confirmed);
+    let (_, stored) = replaced(&mut store, "j_missing", &ramp(4_800, 0));
+    std::fs::remove_file(&stored).expect("the replacement's audio goes");
+
+    // Neither the save's own move nor recovery treats the row as proof.
+    assert!(!supersede_journal_held_by(&journal, &stored).expect("check"));
+    assert!(journal.exists());
+    let report = store.recover_capture_journals(&tree).expect("scan");
+    adopted_whole(&store, &report, "j_missing", &confirmed);
+    assert!(!tree.join(SUPERSEDED_SUBDIR).exists());
+}
+
+#[test]
+fn a_damaged_replacement_supersedes_nothing() {
+    let dir = TempDir::new().expect("tempdir");
+    let mut store = store_in(&dir);
+    let tree = journals(&dir);
+    let confirmed = ramp(1_600, 0);
+    let journal = faulted_journal(&tree, "j_damaged", &confirmed);
+    let (_, stored) = replaced(&mut store, "j_damaged", &ramp(4_800, 0));
+    std::fs::write(&stored, b"no longer a journal").expect("damage");
+
+    assert!(!supersede_journal_held_by(&journal, &stored).expect("check"));
+    let report = store.recover_capture_journals(&tree).expect("scan");
+    adopted_whole(&store, &report, "j_damaged", &confirmed);
+}
+
+#[test]
+fn a_replacement_whose_verified_audio_is_shorter_than_its_row_supersedes_nothing() {
+    let dir = TempDir::new().expect("tempdir");
+    let mut store = store_in(&dir);
+    let tree = journals(&dir);
+    let confirmed = ramp(1_600, 0);
+    let journal = faulted_journal(&tree, "j_cut", &confirmed);
+    let (id, stored) = replaced(&mut store, "j_cut", &ramp(4_800, 0));
+    // The file loses its end: the row still claims 4,800 samples.
+    let file = OpenOptions::new().write(true).open(&stored).expect("open");
+    file.set_len(std::fs::metadata(&stored).expect("size").len() * 3 / 10)
+        .expect("truncate");
+    drop(file);
+    assert_eq!(store.get_capture(&id).expect("row").expect("present").frame_count, 4_800);
+    let verified = read_audio_journal(&stored).map_or(0, |audio| audio.samples.len());
+    assert!(verified < confirmed.len(), "{verified}");
+
+    assert!(!supersede_journal_held_by(&journal, &stored).expect("check"));
+    let report = store.recover_capture_journals(&tree).expect("scan");
+    adopted_whole(&store, &report, "j_cut", &confirmed);
+}
+
+#[test]
+fn deleting_a_shorter_replacement_does_not_suppress_the_longer_journal() {
+    let dir = TempDir::new().expect("tempdir");
+    let mut store = store_in(&dir);
+    let tree = journals(&dir);
+    let confirmed = ramp(4_800, 0);
+    faulted_journal(&tree, "j_longer_than_deleted", &confirmed);
+    let (id, _) = replaced(&mut store, "j_longer_than_deleted", &ramp(800, 0));
+    store.delete_capture(&id).expect("delete the replacement");
+
+    let report = store.recover_capture_journals(&tree).expect("scan");
+    adopted_whole(&store, &report, "j_longer_than_deleted", &confirmed);
+    assert_eq!(capture_count(&store), 1);
+}
+
+#[test]
+fn equal_rate_replacement_a_tenth_of_a_second_short_supersedes_nothing() {
+    // No duration slack: 1,440 samples do not hold 1,600 at 16 kHz.
+    let dir = TempDir::new().expect("tempdir");
+    let mut store = store_in(&dir);
+    let tree = journals(&dir);
+    let confirmed = ramp(1_600, 0);
+    let journal = faulted_journal(&tree, "j_slack", &confirmed);
+    let (_, stored) = replaced(&mut store, "j_slack", &ramp(1_440, 0));
+
+    assert!(!supersede_journal_held_by(&journal, &stored).expect("check"));
+    let report = store.recover_capture_journals(&tree).expect("scan");
+    adopted_whole(&store, &report, "j_slack", &confirmed);
+    assert_eq!(capture_count(&store), 2, "a duplicate, not a loss");
+}
+
+#[test]
+fn a_replacement_that_differs_in_one_sample_or_rate_supersedes_nothing() {
+    let dir = TempDir::new().expect("tempdir");
+    let mut store = store_in(&dir);
+    let tree = journals(&dir);
+    let confirmed = ramp(1_600, 0);
+    let journal = faulted_journal(&tree, "j_differs", &confirmed);
+    let mut other = ramp(4_800, 0);
+    other[1_000] += 0.25;
+    let (_, stored) = replaced(&mut store, "j_differs", &other);
+    assert!(!supersede_journal_held_by(&journal, &stored).expect("check"));
+
+    // The same samples at another rate are not proven the same audio.
+    let mut meta = TakeMeta::for_device("");
+    meta.supersedes_journal = Some("j_differs".to_string());
+    let mut take = store.begin_take_at_rate(48_000, meta).expect("begin");
+    take.append_and_seal(&ramp(4_800, 0)).expect("append");
+    let id = take
+        .finalize()
+        .expect("finalize")
+        .commit_marked(&mut store, CommitMark::Complete)
+        .expect("commit")
+        .record
+        .id;
+    let stored = store.audio_journal_path(&id).expect("stored audio");
+    assert!(!supersede_journal_held_by(&journal, &stored).expect("check"));
+    let report = store.recover_capture_journals(&tree).expect("scan");
+    adopted_whole(&store, &report, "j_differs", &confirmed);
+}
+
+#[test]
+fn a_replacement_saved_through_wav_or_compressed_to_flac_holds_its_journal() {
+    // The app stores a faulted take from its 16 kHz PCM16 WAV, and upkeep
+    // later compresses it: both are the journal's audio at rest.
+    let dir = TempDir::new().expect("tempdir");
+    let mut store = store_in(&dir);
+    let tree = journals(&dir);
+    let take: Vec<f32> = (0..4_800).map(|i| ((i * 37) % 2_001) as f32 / 1_000.0 - 1.0).collect();
+    let journal = faulted_journal(&tree, "j_wav", &take[..1_600]);
+    let wav = crate::audio::encode_wav_16k(&crate::audio::PcmAudio {
+        samples: take.clone(),
+        sample_rate: 16_000,
+        channels: 1,
+    })
+    .expect("wav");
+    let pcm = decode_pcm16_wav(&wav).expect("decode");
+    let (id, stored) = replaced(&mut store, "j_wav", &pcm.samples);
+    assert!(store.compress_audio(&id).is_ok());
+    let stored_now = store.audio_journal_path(&id).expect("stored audio");
+    assert_ne!(stored_now, stored, "compressed to FLAC");
+
+    assert!(supersede_journal_held_by(&journal, &stored_now).expect("supersede"));
+    assert!(tree.join(SUPERSEDED_SUBDIR).join("j_wav.sj").exists());
+}
+
+#[test]
+fn a_journal_waits_for_its_replacement_when_reconcile_has_not_committed_it() {
+    // The app died mid-save; this launch's reconcile failed before it
+    // committed the replacement. Recovery must not adopt the journal now
+    // — once reconcile succeeds the replacement would be a second take,
+    // and the adopted journal's own row would hide the proof forever.
+    let dir = TempDir::new().expect("tempdir");
+    let store = store_in(&dir);
+    let tree = journals(&dir);
+    let journal = faulted_journal(&tree, "j_waits", &ramp(1_600, 0));
+    let staged = die_while_storing_in_place_of(&store, "j_waits", &ramp(4_800, 0));
+    drop(store);
+
+    let mut store = store_in(&dir);
+    // No reconcile: it failed this launch.
+    let report = store.recover_capture_journals(&tree).expect("scan");
+    assert_eq!(report.deferred, vec!["j_waits".to_string()], "{report:?}");
+    assert!(journal.exists() && capture_count(&store) == 0);
+
+    // The next launch's reconcile succeeds.
+    store.reconcile().expect("reconcile");
+    assert!(store.get_capture(&staged).expect("read").is_some());
+    let report = store.recover_capture_journals(&tree).expect("rescan");
+    assert_eq!(report.superseded, vec!["j_waits".to_string()], "{report:?}");
+    assert_eq!(capture_count(&store), 1, "one take, not two");
+
+    // A pending replacement holding less than the journal is no reason
+    // to wait: the journal is adopted at once, and both stay.
+    let confirmed = ramp(4_800, 0);
+    faulted_journal(&tree, "j_no_wait", &confirmed);
+    die_while_storing_in_place_of(&store, "j_no_wait", &ramp(800, 0));
+    let report = store.recover_capture_journals(&tree).expect("scan");
+    adopted_whole(&store, &report, "j_no_wait", &confirmed);
+    store.reconcile().expect("reconcile");
+    assert_eq!(capture_count(&store), 3, "a duplicate where nothing proves it one");
+}
+
+#[test]
+fn reconcile_commits_a_rowless_replacement_before_judging_its_journal() {
+    // Both a half-adopted recorder journal and its replacement sit in
+    // audio/ without rows: whichever reconcile meets first, the journal
+    // is judged against the committed replacement, never adopted beside
+    // it.
+    let dir = TempDir::new().expect("tempdir");
+    let mut store = store_in(&dir);
+    let tree = journals(&dir);
+    let audio = dir.path().join("v2").join(AUDIO_DIR);
+    std::fs::create_dir_all(&audio).expect("audio dir");
+    // Sorts after every minted id and before: try both orders.
+    for journal_id in ["0_half_adopted", "z_half_adopted"] {
+        {
+            let mut writer = JournalWriter::create_named(&audio, journal_id.to_string(), 16_000)
+                .expect("writer");
+            writer.append_frames(&ramp(1_600, 0)).expect("append");
+            writer.finalize().expect("finalize");
+        }
+        let staged = die_while_storing_in_place_of(&store, journal_id, &ramp(4_800, 0));
+        store.promote_from_staging(&staged).expect("promoted, never committed");
+
+        let report = store.reconcile().expect("reconcile");
+        assert_eq!(report.orphan_sessions, vec![staged.clone()], "{report:?}");
+        assert_eq!(report.superseded_journals, vec![journal_id.to_string()]);
+        assert!(tree.join(SUPERSEDED_SUBDIR).join(format!("{journal_id}.sj")).exists());
+    }
+    assert_eq!(capture_count(&store), 2);
 }
