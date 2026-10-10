@@ -46,6 +46,12 @@ const REASK: Duration = Duration::from_secs(1);
 /// transcribing it twice.
 const HANDLED_KEEP: usize = 64;
 
+/// How often another window's stored take is looked up again while that
+/// window transcribes it, and for how long at most: the host tells only
+/// the transcribing window when it is done.
+pub(crate) const FOREIGN_POLL: Duration = Duration::from_secs(2);
+const FOREIGN_WAIT: Duration = Duration::from_secs(600);
+
 /// The app's side of the host connection.
 #[derive(Default)]
 pub(crate) struct HostState {
@@ -524,8 +530,12 @@ impl StarlingApp {
                         _ => self.refresh_history(cx),
                     }
                 } else {
-                    // Another window's take: it is in history now.
+                    // Another window's take: it is in history now, and
+                    // its transcript once that window has it.
                     self.refresh_history(cx);
+                    if let Some(id) = stored_id {
+                        self.follow_foreign_take(id, cx);
+                    }
                 }
             }
             TakeUpdate::Notice(recovery) => {
@@ -533,6 +543,34 @@ impl StarlingApp {
                 self.refresh_history(cx);
             }
         }
+    }
+
+    /// Reads history again once another window settled stored take `id`
+    /// (transcribed, failed or deleted), so it does not read "Sending to
+    /// server…" here forever.
+    fn follow_foreign_take(&mut self, id: String, cx: &mut Context<Self>) {
+        let Some(store) = self.store.clone() else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let deadline = Instant::now() + FOREIGN_WAIT;
+            while Instant::now() < deadline {
+                cx.background_executor().timer(FOREIGN_POLL).await;
+                let pending = {
+                    let store = store.clone();
+                    let id = id.clone();
+                    cx.background_spawn(async move { store.pending(&id) }).await
+                };
+                // A failed read stops looking; the next stored take
+                // refreshes history anyway.
+                if pending.unwrap_or(false) && this.upgrade().is_some() {
+                    continue;
+                }
+                refresh_sessions(&this, &store, cx).await;
+                return;
+            }
+        })
+        .detach();
     }
 
     fn finishing_index(&self, take: &str) -> Option<usize> {

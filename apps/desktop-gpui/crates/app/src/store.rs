@@ -276,6 +276,24 @@ impl Store {
         Ok(store.get_capture(id).map_err(v2_err)?.is_some())
     }
 
+    /// Whether recording `id` still waits for its transcript (history
+    /// shows it as being sent): no attempt yet, or one still running.
+    /// `false` once it is gone.
+    pub(crate) fn pending(&self, id: &str) -> Result<bool, storage::StorageError> {
+        let store = lock_v2(&self.0);
+        let Some(record) = store.get_capture(id).map_err(v2_err)? else {
+            return Ok(false);
+        };
+        let attempts = store
+            .attempts_grouped_by_capture(&[id.to_string()])
+            .map_err(v2_err)?;
+        let summary = v2_summary(&record, &[], attempts.get(id).map_or(&[][..], Vec::as_slice));
+        Ok(matches!(
+            summary.status,
+            SessionStatus::Captured | SessionStatus::Transcribing
+        ))
+    }
+
     /// Metadata-only listing (G02): readable records as summaries, damaged
     /// ones flagged with their reason. The store pages through bounded
     /// reads and maps each capture + its recognition attempts onto the

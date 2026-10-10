@@ -2607,6 +2607,53 @@ mod tests {
     }
 
     #[gpui::test]
+    fn another_windows_take_settles_here_once_that_window_settled_it(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = scratch("host-foreign");
+        let store = Store::at_test_root(&root);
+        let mut host = host_at(&root, vec![scripted_take()], std::time::Duration::from_secs(20));
+        let (server, served) = fake_server(Vec::new());
+        let app = app_on_host(cx, &store, &host, server);
+        // The other window: it starts and stops its take, then transcribes
+        // it (here: records a failed attempt) without the host hearing.
+        let other = starling_runtime_host::client::HostClient::connect(host.socket_path())
+            .expect("connect");
+        other
+            .send(
+                Some("take_other"),
+                starling_runtime::protocol::Command::CaptureStart {
+                    policy: "push-to-talk".into(),
+                },
+            )
+            .expect("start");
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        other
+            .send(
+                Some("take_other"),
+                starling_runtime::protocol::Command::CaptureStop { drain: Some(true) },
+            )
+            .expect("stop");
+        let row = |cx: &mut gpui::TestAppContext| {
+            app.read_with(cx, |app, _| app.sessions.first().map(|take| take.status))
+        };
+        settle(cx, "the other window's take listed here", |cx| row(cx).is_some());
+        assert_eq!(row(cx), Some(SessionStatus::Captured), "listed as being sent");
+        let id = records(&store).first().expect("stored").id.clone();
+        store.mark_attempt(&id, "openai:fake-model").expect("attempt");
+        store.save_failure(&id, "the other window's server failed").expect("failure");
+        settle(cx, "the settled take here", |cx| {
+            cx.executor().advance_clock(crate::remote_take::FOREIGN_POLL);
+            row(cx) == Some(SessionStatus::Failed)
+        });
+        assert_eq!(*served.lock().unwrap(), 0, "never transcribed here");
+        drop(other);
+        drop(app);
+        host.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[gpui::test]
     fn of_two_windows_that_could_adopt_a_take_only_one_keeps_and_transcribes_it(
         cx: &mut gpui::TestAppContext,
     ) {
