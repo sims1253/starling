@@ -80,8 +80,21 @@ class BoundaryDeliveryDeviceTest {
     @Test
     fun anEmptyFieldShowingItsHintStartsTheText() {
         val editor = editor("", hint = "Type a message,")
+        // The placeholder is not content: the connection reports nothing.
+        onMain {
+            val context = requireNotNull(BoundaryDelivery.context(editor.connection, editor.field))
+            assertEquals("", context.before)
+            assertEquals("", context.after)
+        }
         deliver(editor, "Hello")
         assertEquals("Hello", text(editor))
+    }
+
+    @Test
+    fun aFieldHoldingItsHintsWordsIsRealText() {
+        val editor = editor("Message", hint = "Message")
+        deliver(editor, "Next")
+        assertEquals("Message next", text(editor))
     }
 
     @Test

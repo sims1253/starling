@@ -166,6 +166,7 @@
     <string name="keyboard_sending">Saved privately. Transcribing…</string>
     <string name="keyboard_ready_to_insert">Transcript ready. Tap Insert transcript.</string>
     <string name="keyboard_inserted">Transcript inserted.</string>
+    <string name="keyboard_inserted_unrecorded">Transcript inserted, but its adjusted form could not be saved to Saved recordings.</string>
     <string name="keyboard_inserted_unadjusted">Transcript inserted as dictated: the field did not share its text, so spacing and capitals were not adjusted.</string>
     <string name="keyboard_target_changed">The take was dictated in another field. It is kept in Starling; copy it, or record again for this field.</string>
     <string name="keyboard_target_changed_private">The take was dictated in another, private field. It is not kept; copy it now or record again.</string>

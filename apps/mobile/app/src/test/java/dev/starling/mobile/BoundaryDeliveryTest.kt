@@ -162,19 +162,19 @@ class BoundaryDeliveryTest {
     }
 
     @Test
-    fun aFieldHoldingOnlyItsHintIsEmpty() {
-        // An editor that reports its placeholder as its text.
-        val connection = FakeConnection("Type a message,", cursor = 0)
+    fun anEmptyFieldWithAHintIsAFieldStart() {
+        // The connection reports the content, not the placeholder.
+        val connection = FakeConnection("")
         val result = deliver(connection, "Fox jumps", field(hint = "Type a message,"))
         assertEquals("Fox jumps", connection.commits.single())
         assertEquals(emptyList<Change>(), result.changes)
     }
 
     @Test
-    fun textThatMerelyStartsLikeTheHintIsRealText() {
-        val connection = FakeConnection("Type a message, then", cursor = 20)
-        deliver(connection, "Send", field(hint = "Type a message,"))
-        assertEquals(" send", connection.commits.single())
+    fun textThatEqualsTheHintIsRealText() {
+        val connection = FakeConnection("Message")
+        deliver(connection, "Next", field(hint = "Message"))
+        assertEquals("Message next", connection.text)
     }
 
     @Test
@@ -279,9 +279,7 @@ class BoundaryDeliveryTest {
     fun onlyAWindowAroundTheCursorIsRead() {
         val long = "x".repeat(10_000) + " end"
         val connection = FakeConnection(long, cursor = long.length)
-        val context = BoundaryDelivery.context(connection, field(hint = long))!!
+        val context = BoundaryDelivery.context(connection, field())!!
         assertEquals(BoundaryDelivery.WINDOW, context.before.length)
-        // Only part of the field was seen: it is not taken for its hint.
-        assertFalse(context.showingHint)
     }
 }

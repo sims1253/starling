@@ -694,7 +694,7 @@ class VoiceInputService : InputMethodService() {
             }
             val delivered = commitTake(current, connection, text, current.verbatim)
             if (delivered != null) {
-                endTake(current, insertedStatus(delivered), shown = delivered.text.takeUnless { current.sensitive })
+                endTake(current, insertedStatus(current, delivered), shown = delivered.text.takeUnless { current.sensitive })
                 return
             }
         }
@@ -722,7 +722,7 @@ class VoiceInputService : InputMethodService() {
             renderTake()
             return
         }
-        endTake(current, insertedStatus(delivered), shown = delivered.text.takeUnless { current.sensitive })
+        endTake(current, insertedStatus(current, delivered), shown = delivered.text.takeUnless { current.sensitive })
     }
 
     /**
@@ -750,7 +750,9 @@ class VoiceInputService : InputMethodService() {
         current.composedText = null
         current.liveBoundary = null
         if (result.changes.isNotEmpty() && !current.sensitive) {
-            runCatching {
+            // The text is in the field either way; a failed write only
+            // means the history lacks the derived revision, and says so.
+            current.derivedUnsaved = runCatching {
                 application.recordings.addDerived(
                     current.recording.id,
                     DerivedRevision(
@@ -761,14 +763,20 @@ class VoiceInputService : InputMethodService() {
                         createdAtMillis = System.currentTimeMillis(),
                     ),
                 )
-            }
+            }.isFailure
         }
         return result
     }
 
-    /** A field that did not report its text got the text as dictated; the status says so. */
-    private fun insertedStatus(result: BoundaryDelivery.Result): Int =
-        if (result.skipped == BoundaryDelivery.Skip.UNREADABLE) R.string.keyboard_inserted_unadjusted else R.string.keyboard_inserted
+    /**
+     * A field that did not report its text got the text as dictated, and an
+     * adjustment the history could not keep is reported; the status says so.
+     */
+    private fun insertedStatus(current: Take, result: BoundaryDelivery.Result): Int = when {
+        current.derivedUnsaved -> R.string.keyboard_inserted_unrecorded
+        result.skipped == BoundaryDelivery.Skip.UNREADABLE -> R.string.keyboard_inserted_unadjusted
+        else -> R.string.keyboard_inserted
+    }
 
     /** The take's field is gone; the user can still take the text along. */
     private fun copyReadyTranscript() {
@@ -814,7 +822,7 @@ class VoiceInputService : InputMethodService() {
         val status = if (staged.mode.delivery == INSERT_ENTER && !pressEditorAction(connection)) {
             R.string.staging_no_action
         } else {
-            insertedStatus(delivered)
+            insertedStatus(current, delivered)
         }
         endTake(current, status, shown = delivered.text)
     }
@@ -1229,6 +1237,9 @@ class VoiceInputService : InputMethodService() {
 
         /** The final's mode is verbatim: its delivery skips the boundary rules. */
         var verbatim = false
+
+        /** The delivered boundary adjustment could not be saved as a derived revision. */
+        var derivedUnsaved = false
 
         /**
          * The take lost its original connection; it never writes into a

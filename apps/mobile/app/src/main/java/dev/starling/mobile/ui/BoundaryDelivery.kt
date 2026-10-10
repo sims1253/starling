@@ -47,6 +47,12 @@ object BoundaryDelivery {
      * end: the boundary is where that region starts, so it is cut from the
      * text before the cursor. If the field no longer ends there (the cursor
      * moved), the boundary is unknown.
+     *
+     * A field showing only its hint needs no detection here: an
+     * InputConnection reports the editor's content, never its placeholder,
+     * so such a field reads as empty. (Comparing the text with
+     * `EditorInfo.hintText` would misread a field the user filled with the
+     * hint's words.)
      */
     fun context(connection: InputConnection, field: EditorField, composing: String? = null): InsertionBoundary.Context? {
         if (field.sensitive) return null
@@ -54,13 +60,7 @@ object BoundaryDelivery {
         val beforeCursor = connection.getTextBeforeCursor(WINDOW + own.length, 0)?.toString() ?: return null
         val after = connection.getTextAfterCursor(WINDOW, 0)?.toString() ?: return null
         if (!beforeCursor.endsWith(own)) return null
-        val before = beforeCursor.dropLast(own.length)
-        // Some editors report their placeholder as the text of an empty
-        // field; one that holds exactly its hint is treated as empty.
-        val hint = field.hint
-        val whole = beforeCursor.length < WINDOW + own.length && after.length < WINDOW
-        val showingHint = own.isEmpty() && !hint.isNullOrEmpty() && whole && before + after == hint
-        return InsertionBoundary.Context(before, after, showingHint)
+        return InsertionBoundary.Context(beforeCursor.dropLast(own.length), after)
     }
 
     /**

@@ -112,8 +112,9 @@ sent to any processing provider.
 - The keyboard (`ui/BoundaryDelivery.kt`) reads `getTextBeforeCursor` and
   `getTextAfterCursor` right before its single `commitText`; password
   variations and `IME_FLAG_NO_PERSONALIZED_LEARNING` fields are never read,
-  and verbatim modes skip the read. A field whose whole text equals its
-  `EditorInfo.hintText` is `showing_hint`.
+  and verbatim modes skip the read. `showing_hint` is never set there: an
+  `InputConnection` reports the editor's content, never its placeholder,
+  so a field showing its hint already reads as `""`.
 - Live composing text gets the boundary read when the composing region
   starts; the final re-reads, with the take's own composing text cut from
   the text before the cursor (when the cursor has left that region, the

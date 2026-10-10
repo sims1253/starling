@@ -32,8 +32,9 @@ Every write follows the insertion-boundary rules
 (`getTextBeforeCursor`/`getTextAfterCursor`, 128 characters each way) and
 adds a leading space or lowercases the first letter when the text continues
 a sentence; live composing text gets the same boundary. Words are never
-changed, code-looking first words keep their case, and a field that holds
-only its hint counts as empty. Password and incognito fields
+changed, code-looking first words keep their case, and a field showing only
+its hint reads as empty (an `InputConnection` reports content, never the
+placeholder). Password and incognito fields
 (`IME_FLAG_NO_PERSONALIZED_LEARNING`) are never read, verbatim modes write
 the text as recognized, and a field that does not report its text gets it as
 dictated (the status says so). The surrounding text is used for this
