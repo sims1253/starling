@@ -1,6 +1,6 @@
 {
  "version": 1,
- "comment": "Frozen 2026-10-10 after the notebook baseline (base-5s3s: starling-serve at 951d4384, Parakeet TDT 0.6b v3 q8_0, Vulkan, Ryzen 5 PRO 5650U / Radeon RENOIR, 2 repeats per take) and before any candidate run (issue #357). Candidate: preview cadence 1 s first-partial minimum / 0.5 s interval. Relative rules compare against base-5s3s.",
+ "comment": "Frozen 2026-10-10 after the notebook baseline (base-5s3s: starling-serve at 951d4384, Parakeet TDT 0.6b v3 q8_0, Vulkan, Ryzen 5 PRO 5650U / Radeon RENOIR, 2 repeats per take) and before any candidate run (issue #357). Candidate: preview cadence 1 s first-partial minimum / 0.5 s interval. Relative rules compare against base-5s3s. The final-vs-batch, omission and preview-loop rules were added 2026-10-10 after measuring the #357 step 6 stitching fix (stitch-base-default vs stitch-cand-default, same notebook and model).",
  "rules": [
   {"take": "short", "metric": "audio_complete_all", "equals": true, "why": "no lost audio"},
   {"take": "medium", "metric": "audio_complete_all", "equals": true, "why": "no lost audio"},
@@ -30,6 +30,12 @@
   {"take": "long", "metric": "stop_engine_audio_s_max", "max": 12.0, "why": "stop work bounded by one window, not the take"},
   {"take": "short", "metric": "engine_wall_per_audio_s_median", "max": 0.6, "why": "inference uses at most 60 % of recorded time (baseline 0.15)"},
   {"take": "medium", "metric": "engine_wall_per_audio_s_median", "max": 0.6, "why": "inference uses at most 60 % of recorded time (baseline 0.21)"},
-  {"take": "long", "metric": "engine_wall_per_audio_s_median", "max": 0.6, "why": "inference uses at most 60 % of recorded time (baseline 0.20)"}
+  {"take": "long", "metric": "engine_wall_per_audio_s_median", "max": 0.6, "why": "inference uses at most 60 % of recorded time (baseline 0.20)"},
+  {"take": "medium", "metric": "wer_final_vs_batch_median", "max": 0.04, "why": "streaming final close to batch (#357 step 6: 0.133 before, 0.027 after; margin about 2 of 150 words)"},
+  {"take": "long", "metric": "wer_final_vs_batch_median", "max": 0.03, "why": "streaming final close to batch (#357 step 6: 0.142 before, 0.015 after; margin 2x, about 15 words)"},
+  {"take": "medium", "metric": "omitted_vs_batch_median", "max": 3, "why": "no lost boundary speech (#357 step 6: 16 before, 0 after)"},
+  {"take": "long", "metric": "omitted_vs_batch_median", "max": 5, "why": "no lost boundary speech (#357 step 6: 95 before, 1 after)"},
+  {"take": "medium", "metric": "looping_partials_total", "max": 0, "why": "no decoding loop in a preview (#357 step 6)"},
+  {"take": "long", "metric": "looping_partials_total", "max": 0, "why": "no decoding loop in a preview (#357 step 6: 2 before, 0 after)"}
  ]
 }
