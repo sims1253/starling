@@ -1210,29 +1210,10 @@ impl StoreV2 {
 
     /// Inserts a `recognition_attempts` row, stamped with its creation
     /// time (the summary's updated-at source). A savepoint, so it nests
-    /// inside [`Self::begin_recognition`]'s write-locked transaction.
+    /// inside a caller's transaction.
     pub fn insert_attempt(&mut self, attempt: &AttemptRecord) -> Result<(), StoreV2Error> {
         let tx = self.conn.savepoint()?;
-        tx.execute(
-            "INSERT INTO recognition_attempts(
-                id, capture_id, backend, model_hash, language, options_json, text,
-                partial_or_final, status, timing_json, extra_json, created_utc)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-            params![
-                attempt.id,
-                attempt.capture_id,
-                attempt.backend,
-                attempt.model_hash,
-                attempt.language,
-                attempt.options_json,
-                attempt.text,
-                attempt.partial_or_final,
-                attempt.status,
-                attempt.timing_json,
-                attempt.extra_json,
-                attempt.created_utc.clone().unwrap_or_else(now_iso),
-            ],
-        )?;
+        insert_attempt_row(&tx, attempt)?;
         tx.commit()?;
         Ok(())
     }
@@ -3720,28 +3701,28 @@ impl StoreV2 {
         // retention policy (#342), on this connection or another, either
         // sees this attempt and keeps the audio, or retired it first and
         // the attempt is refused — never an attempt on removed audio.
-        self.conn.execute_batch("BEGIN IMMEDIATE")?;
-        let begun = self
-            .begin_recognition_locked(capture_id, backend, options_json)
-            .and_then(|id| match self.conn.execute_batch("COMMIT") {
-                Ok(()) => Ok(id),
-                Err(err) => {
-                    self.release_attempt_lock(&id);
-                    Err(err.into())
-                }
-            });
-        if begun.is_err() {
-            let _ = self.conn.execute_batch("ROLLBACK");
+        let begun = self.begin_recognition_in_transaction(capture_id, backend, options_json);
+        if !self.conn.is_autocommit() {
+            // The guard's own rollback failed too (rusqlite drops that
+            // error): try once more, so a failed begin does not leave every
+            // later write on this connection inside a dead transaction.
+            if let Err(err) = self.conn.execute_batch("ROLLBACK") {
+                eprintln!("Rolling back a failed recognition start also failed: {err}");
+            }
         }
         begun
     }
 
-    fn begin_recognition_locked(
+    fn begin_recognition_in_transaction(
         &mut self,
         capture_id: &str,
         backend: &str,
         options_json: Option<&str>,
     ) -> Result<String, StoreV2Error> {
+        // The transaction guard rolls back on every exit that is not a
+        // successful commit — an early error, a failed COMMIT, or an
+        // unwind.
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         if self.get_capture(capture_id)?.is_none() {
             return Err(StoreV2Error::NotFound(capture_id.to_string()));
         }
@@ -3752,26 +3733,37 @@ impl StoreV2 {
             )));
         }
         let id = format!("a_{}", uuid::Uuid::new_v4().simple());
-        self.hold_attempt_lock(&id)?;
-        match self.insert_attempt(&AttemptRecord {
-            id: id.clone(),
-            capture_id: capture_id.to_string(),
-            backend: backend.to_string(),
-            model_hash: None,
-            language: None,
-            options_json: options_json.map(str::to_string),
-            text: String::new(),
-            partial_or_final: "partial".to_string(),
-            status: "started".to_string(),
-            timing_json: None,
-            extra_json: None,
-            created_utc: None,
-        }) {
-            Ok(()) => Ok(id),
+        // The marker is held from here; it joins `attempt_locks` only once
+        // the row is committed. Until then, dropping `marker` releases the
+        // flock and `remove_attempt_marker` unlinks the file, so a failed
+        // begin never leaves a marker behind.
+        let marker = self.open_attempt_marker(&id)?;
+        let inserted = insert_attempt_row(
+            &tx,
+            &AttemptRecord {
+                id: id.clone(),
+                capture_id: capture_id.to_string(),
+                backend: backend.to_string(),
+                model_hash: None,
+                language: None,
+                options_json: options_json.map(str::to_string),
+                text: String::new(),
+                partial_or_final: "partial".to_string(),
+                status: "started".to_string(),
+                timing_json: None,
+                extra_json: None,
+                created_utc: None,
+            },
+        )
+        .and_then(|()| tx.commit().map_err(StoreV2Error::from));
+        match inserted {
+            Ok(()) => {
+                self.attempt_locks.insert(id.clone(), marker);
+                Ok(id)
+            }
             Err(err) => {
-                // The row never became visible: the marker must not
-                // outlive the attempt it was taken for.
-                self.release_attempt_lock(&id);
+                drop(marker);
+                self.remove_attempt_marker(&id);
                 Err(err)
             }
         }
@@ -3938,7 +3930,17 @@ impl StoreV2 {
     /// lock — until the attempt settles, the capture is deleted, or the
     /// process exits. The marker directory is created at
     /// [`StoreV2::open`]; this path never recreates it.
+    #[cfg(test)]
     fn hold_attempt_lock(&mut self, attempt_id: &str) -> Result<(), StoreV2Error> {
+        let file = self.open_attempt_marker(attempt_id)?;
+        self.attempt_locks.insert(attempt_id.to_string(), file);
+        Ok(())
+    }
+
+    /// Create, flock and stamp one attempt's marker without registering
+    /// it: the returned handle holds the lock until it is dropped or moved
+    /// into [`Self::attempt_locks`]. A failed open leaves no file behind.
+    fn open_attempt_marker(&self, attempt_id: &str) -> Result<File, StoreV2Error> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -3976,8 +3978,13 @@ impl StoreV2 {
         // direction.
         use std::io::Write as _;
         let _ = file.write_all(std::process::id().to_string().as_bytes());
-        self.attempt_locks.insert(attempt_id.to_string(), file);
-        Ok(())
+        Ok(file)
+    }
+
+    /// Unlink one attempt's marker file. The caller has dropped (or never
+    /// held) its handle.
+    fn remove_attempt_marker(&self, attempt_id: &str) {
+        let _ = std::fs::remove_file(self.attempt_lock_path(attempt_id));
     }
 
     /// Release one attempt's marker (#213): drop the held flock and remove
@@ -3991,7 +3998,7 @@ impl StoreV2 {
             return;
         }
         self.attempt_locks.remove(attempt_id);
-        let _ = std::fs::remove_file(self.attempt_lock_path(attempt_id));
+        self.remove_attempt_marker(attempt_id);
     }
 
     /// Whether a live owner holds the attempt's marker (#213): this
@@ -4630,6 +4637,33 @@ fn local_tz_label() -> String {
     time::OffsetDateTime::now_local()
         .map(|now| now.offset().to_string())
         .unwrap_or_else(|_| "UTC".to_string())
+}
+
+/// The `recognition_attempts` INSERT shared by
+/// [`StoreV2::insert_attempt`] and [`StoreV2::begin_recognition`] (which
+/// runs it inside its own write-locked transaction).
+fn insert_attempt_row(conn: &Connection, attempt: &AttemptRecord) -> Result<(), StoreV2Error> {
+    conn.execute(
+        "INSERT INTO recognition_attempts(
+            id, capture_id, backend, model_hash, language, options_json, text,
+            partial_or_final, status, timing_json, extra_json, created_utc)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        params![
+            attempt.id,
+            attempt.capture_id,
+            attempt.backend,
+            attempt.model_hash,
+            attempt.language,
+            attempt.options_json,
+            attempt.text,
+            attempt.partial_or_final,
+            attempt.status,
+            attempt.timing_json,
+            attempt.extra_json,
+            attempt.created_utc.clone().unwrap_or_else(now_iso),
+        ],
+    )?;
+    Ok(())
 }
 
 fn validate_capture_id(id: &str) -> Result<(), StoreV2Error> {
@@ -6455,6 +6489,48 @@ mod tests {
             Err(StoreV2Error::NotFound(_)) => {}
             other => panic!("expected NotFound, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_begin_whose_commit_fails_rolls_back_and_leaves_no_marker() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut store = store_in(&dir);
+        let take = committed_take(&mut store, &ramp(30, 0));
+        let id = take.record.id.clone();
+
+        // A deferred foreign-key violation passes every statement and
+        // fails only at COMMIT, which leaves the transaction open: the
+        // guard must roll it back.
+        store
+            .conn
+            .execute_batch(
+                "CREATE TABLE commit_fault(
+                    capture_id TEXT REFERENCES captures(id) DEFERRABLE INITIALLY DEFERRED);
+                 CREATE TRIGGER fail_commit AFTER INSERT ON recognition_attempts
+                 BEGIN INSERT INTO commit_fault VALUES ('c_missing'); END;",
+            )
+            .expect("install the commit fault");
+        assert!(store.begin_recognition(&id, "starling", None).is_err());
+        assert!(
+            store.conn.is_autocommit(),
+            "no transaction is left open after the failed commit"
+        );
+        assert!(store.attempts_for(&id).expect("attempts").is_empty());
+        assert!(store.attempt_locks.is_empty());
+        let markers = std::fs::read_dir(dir.path().join("v2").join(ATTEMPT_LOCKS_DIR))
+            .expect("locks dir")
+            .count();
+        assert_eq!(markers, 0, "the failed begin's marker is removed");
+
+        // Later writes on the same connection still work.
+        store
+            .conn
+            .execute_batch("DROP TRIGGER fail_commit")
+            .expect("remove the commit fault");
+        store
+            .begin_recognition(&id, "starling", None)
+            .expect("begin");
+        assert_eq!(store.attempts_for(&id).expect("attempts").len(), 1);
     }
 
     #[test]

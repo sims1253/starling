@@ -447,7 +447,8 @@ struct Shared {
     stopping: AtomicBool,
     /// The writer task's last free-space reading for the journal's disk
     /// (#342): [`DISK_UNKNOWN`] until a [`DiskWatch`] probed, then a
-    /// [`DiskLevel`] code, with the bytes available beside it.
+    /// [`DiskLevel`] code, with the bytes available beside it — or
+    /// [`DISK_PROBE_FAILING`] while the probe cannot answer.
     disk_level: AtomicU8,
     disk_available: AtomicU64,
 }
@@ -457,6 +458,8 @@ const DISK_UNKNOWN: u8 = 0;
 const DISK_OK: u8 = 1;
 const DISK_LOW: u8 = 2;
 const DISK_CRITICAL: u8 = 3;
+/// The latest probe failed: whatever was read before is stale.
+const DISK_PROBE_FAILING: u8 = 4;
 
 /// Ring slot count for a device rate: [`CAPTURE_RING_SECONDS`] worth of
 /// samples rounded to the nearest power of two (the wrap arithmetic needs
@@ -798,9 +801,10 @@ fn journal_failed<S: JournalSink>(
 /// sealed up to everything appended so far with a boundary right away —
 /// while there is still room for that record — so the take is fully
 /// acknowledged and recoverable whatever happens before the stop lands.
-/// A probe that cannot answer leaves the last reading in place and is
-/// logged once per take; a journal write that hits a full disk still
-/// stops the take ([`journal_failed`]).
+/// A probe that cannot answer replaces the last reading with
+/// [`DISK_PROBE_FAILING`] (a critical reading stays: that take is being
+/// stopped) and is logged once per take; a journal write that hits a full
+/// disk still stops the take ([`journal_failed`]).
 fn disk_watch_step<S: JournalSink>(
     shared: &Shared,
     journal: &mut Option<JournalWriter<S>>,
@@ -824,6 +828,11 @@ fn disk_watch_step<S: JournalSink>(
         Err(err) => {
             if !std::mem::replace(probe_failed, true) {
                 eprintln!("Free-space check of {dir:?} failed: {err}");
+            }
+            if shared.disk_level.load(Ordering::Acquire) != DISK_CRITICAL {
+                shared
+                    .disk_level
+                    .store(DISK_PROBE_FAILING, Ordering::Release);
             }
             return;
         }
@@ -1065,7 +1074,8 @@ impl RecorderHandle {
 
     /// The latest free-space reading for the journal's disk (#342), when
     /// the take runs with a [`DiskWatch`] and a journal; `None` before the
-    /// first probe answered.
+    /// first probe answered and while the probe fails
+    /// ([`Self::disk_probe_failing`]).
     pub fn disk_reading(&self) -> Option<DiskReading> {
         let level = match self.shared.disk_level.load(Ordering::Acquire) {
             DISK_OK => DiskLevel::Ok,
@@ -1077,6 +1087,13 @@ impl RecorderHandle {
             available: self.shared.disk_available.load(Ordering::Relaxed),
             level,
         })
+    }
+
+    /// Whether the latest free-space probe failed (#342): the disk is not
+    /// being watched right now, so no earlier reading can be trusted. A
+    /// journal write that hits a full disk still reads as critical.
+    pub fn disk_probe_failing(&self) -> bool {
+        self.shared.disk_level.load(Ordering::Acquire) == DISK_PROBE_FAILING
     }
 
     /// Gap spans where ring overflow dropped samples, in capture order.
@@ -3065,10 +3082,76 @@ mod tests {
         callback.process(&[0.1; 1_000], &shared);
         wait_until(|| handle.acknowledged_samples(), |acked| *acked == 1_000);
         assert_eq!(handle.disk_reading(), None);
+        assert!(wait_until(
+            || handle.disk_probe_failing(),
+            |failing| *failing
+        ));
         assert!(handle.stop().expect("stop").journal.expect("journal").finalized);
         // Without a watch there is never a reading either.
         let plain = test_handle(test_shared(1_024), 16_000);
         assert_eq!(plain.disk_reading(), None);
+        assert!(!plain.disk_probe_failing());
+    }
+
+    #[test]
+    fn a_failing_disk_probe_retracts_the_last_reading_until_it_answers_again() {
+        let dir = TempDir::new().expect("tempdir");
+        let available = Arc::new(AtomicU64::new(500_000));
+        let failing = Arc::new(AtomicBool::new(false));
+        let shared = test_shared(8_192);
+        let handle = test_handle(Arc::clone(&shared), 16_000);
+        let mut journal =
+            Some(JournalWriter::<FileSink>::create(dir.path(), 16_000).expect("create journal"));
+        let watch = DiskWatch {
+            probe: Arc::new(FakeProbe(Arc::clone(&available), Arc::clone(&failing))),
+            policy: crate::disk::DiskPolicy {
+                warn_below: 1_000_000,
+                stop_below: 100_000,
+            },
+            interval: Duration::ZERO,
+        };
+        let mut probe_failed = false;
+        let mut step = || {
+            disk_watch_step(
+                &shared,
+                &mut journal,
+                &watch,
+                &mut Instant::now(),
+                &mut probe_failed,
+            )
+        };
+
+        step();
+        let low = Some(DiskReading {
+            available: 500_000,
+            level: DiskLevel::Low,
+        });
+        assert_eq!(handle.disk_reading(), low);
+        assert!(!handle.disk_probe_failing());
+
+        // The probe stops answering: the low reading is no longer offered.
+        failing.store(true, Ordering::Release);
+        step();
+        assert_eq!(handle.disk_reading(), None);
+        assert!(handle.disk_probe_failing());
+
+        // It answers again: a fresh reading replaces the failing state.
+        failing.store(false, Ordering::Release);
+        step();
+        assert_eq!(handle.disk_reading(), low);
+        assert!(!handle.disk_probe_failing());
+
+        // A critical reading outlasts a later probe failure: that take is
+        // being stopped.
+        available.store(10_000, Ordering::Release);
+        step();
+        failing.store(true, Ordering::Release);
+        step();
+        assert_eq!(
+            handle.disk_reading().map(|reading| reading.level),
+            Some(DiskLevel::Critical)
+        );
+        assert!(!handle.disk_probe_failing());
     }
 
     /// A sink that accepts the header, then runs out of space.

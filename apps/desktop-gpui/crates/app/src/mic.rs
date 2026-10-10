@@ -247,7 +247,14 @@ pub(crate) struct MicState {
     /// The live take already showed its low-disk warning (#342), so a
     /// dismissed warning is not raised again on every poll.
     pub(crate) disk_warned: bool,
+    /// The live take shows [`DISK_UNCHECKED_NOTE`] (#342) because the
+    /// free-space probe is failing.
+    pub(crate) disk_unchecked: bool,
 }
+
+/// Shown, without stopping the take, while the free-space probe fails
+/// (#342); a journal write that finds the disk full still stops it.
+const DISK_UNCHECKED_NOTE: &str = "Can't check free disk space.";
 
 /// Candidate commands that open the OS sound (or microphone privacy)
 /// settings, tried in order. Linux has no single entry point: the common
@@ -412,6 +419,13 @@ impl StarlingApp {
         let Some(handle) = self.recorder.as_ref() else {
             return;
         };
+        let probe_failing = handle.disk_probe_failing();
+        if probe_failing != self.mic.disk_unchecked {
+            self.mic.disk_unchecked = probe_failing;
+            self.capture_warning =
+                with_disk_unchecked_note(self.capture_warning.take(), probe_failing);
+            cx.notify();
+        }
         let Some(reading) = handle.disk_reading() else {
             return;
         };
@@ -728,9 +742,49 @@ impl StarlingApp {
     }
 }
 
+/// The capture warning with [`DISK_UNCHECKED_NOTE`] leading it while
+/// `failing`, and without it once the probe answers again.
+fn with_disk_unchecked_note(warning: Option<String>, failing: bool) -> Option<String> {
+    let rest = warning.and_then(|text| match text.strip_prefix(DISK_UNCHECKED_NOTE) {
+        Some(rest) => Some(rest.trim_start().to_string()).filter(|rest| !rest.is_empty()),
+        None => Some(text),
+    });
+    match (failing, rest) {
+        (true, Some(rest)) => Some(format!("{DISK_UNCHECKED_NOTE} {rest}")),
+        (true, None) => Some(DISK_UNCHECKED_NOTE.to_string()),
+        (false, rest) => rest,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_disk_unchecked_note_joins_and_leaves_the_capture_warning() {
+        assert_eq!(
+            with_disk_unchecked_note(None, true).as_deref(),
+            Some(DISK_UNCHECKED_NOTE)
+        );
+        let joined = with_disk_unchecked_note(Some("Clipping.".to_string()), true);
+        assert_eq!(
+            joined.as_deref(),
+            Some("Can't check free disk space. Clipping.")
+        );
+        assert_eq!(
+            with_disk_unchecked_note(joined.clone(), true),
+            joined,
+            "never doubled"
+        );
+        assert_eq!(
+            with_disk_unchecked_note(joined, false).as_deref(),
+            Some("Clipping.")
+        );
+        assert_eq!(
+            with_disk_unchecked_note(Some(DISK_UNCHECKED_NOTE.to_string()), false),
+            None
+        );
+    }
 
     fn device(name: &str, is_default: bool) -> InputDevice {
         InputDevice {

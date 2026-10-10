@@ -657,6 +657,7 @@ impl StarlingApp {
                         disk_watch.policy.warning(reading, handle_rate)
                     });
                     self.mic.disk_warned = self.capture_warning.is_some();
+                    self.mic.disk_unchecked = false;
                     cx.notify();
                     true
                 }
