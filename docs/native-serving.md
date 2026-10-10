@@ -427,10 +427,14 @@ fixture, `tests/fixtures/stream_stitch_cases.txt`):
   equally well at every multiple of its period; an alignment over committed
   words that repeat is shortened by whole periods to the number of words the
   shared audio should hold (each window's share of its voiced audio in the
-  overlap). Not covered: periodic text faster than about 4.6 words/s whose
-  window is re-decoded from 0.75 x the overlap earlier shares more words
-  with the committed text than the 24 committed words searched, and can
-  repeat some of them. The engine exposes no
+  overlap). Not covered: in a re-decoded window, the shared audio (the
+  overlap plus the shift) can hold more words than the 24 committed words
+  searched: above about 5.3 words/s for the 1.5 s shift, 6.4 for 0.75 s and
+  4.6 for 2.25 s (default 3 s overlap). Ordinary text still aligns, but
+  exactly periodic text can then repeat up to the words outside the search.
+  Searching more committed words would delay `stable_words` for every take,
+  and words alone cannot tell a shared repetition from a newly spoken one.
+  The engine exposes no
   word timestamps, so the alignment works on words only; it is the same for
   every model.
 - Parakeet sometimes stops emitting partway through a window, or returns
@@ -442,8 +446,9 @@ fixture, `tests/fixtures/stream_stitch_cases.txt`):
   (a decoding loop). An implausible window is decoded again from 0.5, 0.25
   and 0.75 x the overlap earlier (a full window moves back whole, or ends
   earlier at the take's start; the flush tail grows backwards up to one
-  window) until a result is plausible, and a candidate replaces it when it
-  is 1.25 x denser or the current one loops. The next window then starts
+  window) until a result is plausible. A plausible candidate replaces an
+  implausible result; between two sparse results the candidate must be
+  1.25 x denser, and a sparse one replaces a loop. The next window then starts
   one overlap before the end of the audio the kept text came from. If a
   re-decode finds the engine busy before a plausible result is in hand, the
   window stays pending, like a busy window, instead of committing text known

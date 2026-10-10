@@ -142,7 +142,9 @@ def stitch_words(
         # later (pairs moved past the tail drop out). Keep the k whose length
         # is closest to the estimate and that keeps a pair (the smallest k on
         # a tie).
-        period = _period(a[i:])
+        # Periods are found on the plain keys: a punctuation-only word repeats
+        # like any other (the sentinels above only keep it from matching).
+        period = _period([_norm(w) for w in tail[i:]])
         if period:
             k = min((k for k in range((length - 1) // period + 1)
                      if pairs[0][0] + k * period < n),
