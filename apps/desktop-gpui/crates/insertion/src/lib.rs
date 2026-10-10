@@ -306,6 +306,15 @@ pub trait InsertionBackend: Send + Sync {
     }
 }
 
+/// One backend as [`Inserter::availability`] reports it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BackendAvailability {
+    pub kind: BackendKind,
+    /// See [`InsertionBackend::verifies_target`].
+    pub verifies_target: bool,
+    pub availability: Result<(), InsertError>,
+}
+
 /// The ordered backends of a session. The first available backend
 /// captures; a captured ref is always served by the backend of its
 /// scheme.
@@ -441,6 +450,21 @@ impl Inserter {
             title: None,
             pid,
         })
+    }
+
+    /// Each backend's availability, in capture order (setup diagnostics):
+    /// the first available one is the one [`Inserter::capture`] uses.
+    /// Blocking like [`InsertionBackend::availability`]: X11 and Wayland
+    /// open a display connection, so call it off the UI thread.
+    pub fn availability(&self) -> Vec<BackendAvailability> {
+        self.backends
+            .iter()
+            .map(|backend| BackendAvailability {
+                kind: backend.kind(),
+                verifies_target: backend.verifies_target(),
+                availability: backend.availability(),
+            })
+            .collect()
     }
 
     pub fn describe(&self) -> String {
@@ -660,6 +684,27 @@ mod tests {
             && token
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':' | '+' | '-'))
+    }
+
+    #[test]
+    fn availability_reports_every_backend_in_order() {
+        let ready = std::sync::Arc::new(FakeBackend::new());
+        ready.set_verifies_target(false);
+        let blocked = std::sync::Arc::new(FakeBackend::new());
+        blocked.set_availability(Err(InsertError::Unavailable {
+            reason: "no display".into(),
+        }));
+        let inserter = Inserter::with_backends(vec![Box::new(blocked), Box::new(ready)]);
+        let report = inserter.availability();
+        assert_eq!(report.len(), 2);
+        assert_eq!(report[0].kind, BackendKind::Fake);
+        assert!(report[0].verifies_target);
+        assert!(matches!(
+            report[0].availability,
+            Err(InsertError::Unavailable { .. })
+        ));
+        assert_eq!(report[1].availability, Ok(()));
+        assert!(!report[1].verifies_target);
     }
 
     #[test]

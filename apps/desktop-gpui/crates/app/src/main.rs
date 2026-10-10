@@ -10,11 +10,13 @@ mod input;
 mod live_stream;
 mod mic;
 mod overlay;
+mod portal;
 mod processing;
 mod shortcut;
 mod slider;
 mod staging;
 mod store;
+mod system_check;
 mod theme;
 mod upkeep;
 mod upload;
@@ -59,6 +61,8 @@ fn main() {
                 window_decorations: Some(WindowDecorations::Server),
                 window_background: gpui::WindowBackgroundAppearance::Opaque,
                 focus: true,
+                // The id the desktop portal knows Starling by (#221).
+                app_id: Some(portal::APP_ID.to_string()),
                 ..Default::default()
             };
 

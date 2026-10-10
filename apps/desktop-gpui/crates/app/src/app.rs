@@ -487,6 +487,11 @@ pub struct StarlingApp {
     /// platform offers none), and how registering the shortcut went.
     pub(crate) global_shortcuts: Option<crate::shortcut::GlobalShortcuts>,
     pub(crate) shortcut_registration: Result<(), String>,
+    /// Native Wayland's system-wide source: the desktop's GlobalShortcuts
+    /// portal (absent outside a Wayland session), and the Linux setup
+    /// check shown under Settings → Dictation.
+    pub(crate) portal_shortcuts: Option<crate::portal::PortalShortcuts>,
+    pub(crate) system_check: crate::system_check::SystemCheck,
     /// Keeps the in-window shortcut interceptor registered.
     pub(crate) key_interceptor: Option<Subscription>,
     /// What happened to a take that was cancelled (Escape, a microphone
@@ -1124,6 +1129,8 @@ impl StarlingApp {
             dictation_settings,
             global_shortcuts: None,
             shortcut_registration: Ok(()),
+            portal_shortcuts: None,
+            system_check: Default::default(),
             key_interceptor: None,
             take_notice: None,
             playback_notice: None,

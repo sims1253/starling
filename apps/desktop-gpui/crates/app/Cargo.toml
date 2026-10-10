@@ -23,9 +23,13 @@ tokio = { version = "1", features = ["rt", "net", "time", "sync", "macros"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 
 # The dictation overlay (#221) finds the monitor under the pointer on X11
-# (RandR); already in the tree through gpui and the insertion crate.
+# (RandR); already in the tree through gpui and the insertion crate. The XDG
+# GlobalShortcuts portal and the Linux setup check's D-Bus probes (#221) use
+# zbus, already in the tree through gpui (ashpd, oo7), same version and
+# default features.
 [target.'cfg(target_os = "linux")'.dependencies]
 x11rb = { version = "0.13.2", features = ["randr"] }
+zbus = "5.19"
 
 # ... and keeps it on top without taking focus on Windows, which gpui's
 # pop-up windows do not do by themselves (same versions as gpui's).
