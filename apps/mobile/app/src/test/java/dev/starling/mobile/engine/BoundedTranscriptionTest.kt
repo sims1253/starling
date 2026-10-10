@@ -124,6 +124,27 @@ class BoundedTranscriptionTest {
     }
 
     /**
+     * A last window that completes inside the grace after the stop is not
+     * abandoned: its text is the audio's correct transcript and stands.
+     */
+    @Test
+    fun aResultThatArrivesWithinTheGraceStands() {
+        val engine = FakeEngine()
+        val stopped = AtomicBoolean()
+        val result = bound(engine, graceMillis = 5_000).run(budgetMillis = 30) { attempt ->
+            engine.transcribe(attempt) {
+                // Inside one native window that cannot see the cancel.
+                while (!attempt.cancelRequested()) Thread.sleep(1)
+                stopped.set(true)
+                Thread.sleep(20)
+                InferenceResult.Success("finished just late")
+            }
+        }
+        assertTrue(stopped.get())
+        assertEquals(InferenceResult.Success("finished just late"), result)
+    }
+
+    /**
      * A call that ignores the cancel (a wedged GPU submission) is
      * abandoned: the attempt fails, the recording is marked failed with its
      * audio, and the result the call returns later is never stored.

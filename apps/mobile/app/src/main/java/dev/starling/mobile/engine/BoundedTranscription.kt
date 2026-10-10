@@ -62,7 +62,11 @@ class CallAttempt internal constructor(private val clock: () -> Long) {
  * are bounded windows of at most ~32 s of audio, or a model load). The
  * stop goes through the engine's cooperative cancel; a call that does not
  * return within [graceMillis] after it is abandoned: the attempt fails at
- * once and whatever the call still returns is dropped, never stored.
+ * once and whatever the call still returns is dropped, never stored. A
+ * call that returns within the grace is not abandoned and its result
+ * stands: a transcript that completed just past the budget is the same
+ * audio's correct text, and dropping it would only make the user redo
+ * the work.
  *
  * An attempt still waiting for the engine (another call holds it) is not
  * timed: a long transcription ahead of it is legitimate. It gives up only
