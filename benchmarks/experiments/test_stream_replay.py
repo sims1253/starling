@@ -117,6 +117,19 @@ class TakeMetricsTest(unittest.TestCase):
         self.assertIsNone(agg["backlog_s_max"])
         self.assertIsNotNone(sr._aggregate(runs[:1])["medium"]["partial_age_ms_p95_median"])
 
+    def test_one_unmeasured_partial_leaves_the_run_unmeasured(self):
+        mixed = _log(
+            partials=[(1.2, {"text": "hi", "stable_words": 0, "trace": {"covered_s": 1.0}}),
+                      (2.2, {"text": "hi there", "stable_words": 0})],
+            final=(4.4, {"text": "hi there", "duration_s": 4.0, "trace": FINAL_TRACE}))
+        m = sr.take_metrics(mixed, "hi there", "hi there")
+        self.assertIsNone(m["partial_age_ms"]["max"])
+        self.assertIsNone(m["backlog_s"]["max"])
+        m.update({"take": "medium"})
+        agg = sr._aggregate([m])["medium"]
+        self.assertIsNone(agg["partial_age_ms_p95_median"])
+        self.assertIsNone(agg["backlog_s_max"])
+
     def test_preempted_previews_count_as_engine_wall_time(self):
         trace = {**FINAL_TRACE, "totals": {**FINAL_TRACE["totals"], "preempted": 2,
                                            "preempted_ms": 400.0}}

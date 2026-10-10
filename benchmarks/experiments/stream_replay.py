@@ -207,6 +207,11 @@ def take_metrics(log: dict, reference: str, batch_text: str | None) -> dict:
         if sw and m["text"].split()[:sw] != final_words[:sw]:
             stable_violations += 1
 
+    # One partial without `covered_s` makes the run's age and backlog
+    # unmeasured: statistics over the measured rest would look complete.
+    if len(ages) != len(partials):
+        ages, backlogs = [], []
+
     # Missing trace measurements stay missing (None), so a server that drops
     # `trace` or its totals fails the work rules instead of looking free.
     totals = trace.get("totals") or {}
