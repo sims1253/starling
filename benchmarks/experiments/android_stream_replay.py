@@ -250,6 +250,24 @@ def run(args: argparse.Namespace) -> dict:
     }
 
 
+def merge(label: str, parts: list[dict]) -> dict:
+    """One result from per-repeat results of the same configuration (interleaved runs)."""
+    keys = ("client", "model", "cadence", "warmup", "workload_manifest_sha256")
+    first = parts[0]["provenance"]
+    for p in parts[1:]:
+        if any(p["provenance"].get(k) != first.get(k) for k in keys):
+            raise RunnerError(f"{p['label']}: different configuration than {parts[0]['label']}")
+    runs, repeats = [], []
+    for i, p in enumerate(parts):
+        for r in p["runs"]:
+            runs.append(dict(r, repeat=i))
+        repeats += [dict(e, repeat=i, part=p["label"]) for e in p["provenance"]["repeats"]]
+    provenance = dict(first, repeats=repeats,
+                      repo_revision=sorted({p["provenance"]["repo_revision"] for p in parts}))
+    return {"version": RESULT_VERSION, "label": label, "provenance": provenance,
+            "runs": runs, "aggregate": aggregate(runs)}
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -272,9 +290,16 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--keep-traces", type=Path, default=None)
     r.add_argument("--label", required=True)
     r.add_argument("--out", type=Path, required=True)
+    m = sub.add_parser("merge", help="combine per-repeat results of one configuration")
+    m.add_argument("--label", required=True)
+    m.add_argument("--out", type=Path, required=True)
+    m.add_argument("parts", type=Path, nargs="+")
     args = ap.parse_args(argv)
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    result = run(args)
+    if args.cmd == "merge":
+        result = merge(args.label, [json.loads(p.read_text()) for p in args.parts])
+    else:
+        result = run(args)
     args.out.write_text(json.dumps(result, indent=1) + "\n")
     print(json.dumps(result["aggregate"], indent=1))
     return 0
