@@ -204,7 +204,12 @@ fn shortcut_line(facts: &Facts, portal_status: Option<&PortalStatus>) -> CheckLi
     let desktop = desktop_name(session);
     let portal = match facts.portal.as_ref() {
         None => {
-            return line(TOPIC, Verdict::Info, "The desktop portal was not checked.", None);
+            return line(
+                TOPIC,
+                Verdict::Info,
+                "The desktop portal was not checked.",
+                None,
+            );
         }
         Some(Err(reason)) => {
             return line(
@@ -265,9 +270,12 @@ fn shortcut_line(facts: &Facts, portal_status: Option<&PortalStatus>) -> CheckLi
     };
     let summary = format!("GlobalShortcuts portal version {version} ({backend}).");
     match portal_status {
-        Some(status @ PortalStatus::Bound { .. }) => {
-            line(TOPIC, Verdict::Ok, format!("{summary} {}", status.describe()), None)
-        }
+        Some(status @ PortalStatus::Bound { .. }) => line(
+            TOPIC,
+            Verdict::Ok,
+            format!("{summary} {}", status.describe()),
+            None,
+        ),
         Some(PortalStatus::Unavailable(reason)) => line(
             TOPIC,
             Verdict::Missing,
@@ -288,7 +296,12 @@ fn shortcut_line(facts: &Facts, portal_status: Option<&PortalStatus>) -> CheckLi
                     .to_string(),
             ),
         ),
-        Some(status) => line(TOPIC, Verdict::Info, format!("{summary} {}", status.describe()), None),
+        Some(status) => line(
+            TOPIC,
+            Verdict::Info,
+            format!("{summary} {}", status.describe()),
+            None,
+        ),
         None => line(TOPIC, Verdict::Info, summary, None),
     }
 }
@@ -333,7 +346,10 @@ fn insertion_line(facts: &Facts) -> CheckLine {
         return line(
             TOPIC,
             Verdict::Missing,
-            format!("No insertion backend is available ({}).{portal_note}", blocked.join("; ")),
+            format!(
+                "No insertion backend is available ({}).{portal_note}",
+                blocked.join("; ")
+            ),
             Some(if facts.session.wayland() {
                 "On Wayland, typing into other apps needs the compositor's virtual-keyboard \
                  protocol; until then copy the transcript and paste it yourself."
@@ -348,7 +364,9 @@ fn insertion_line(facts: &Facts) -> CheckLine {
         line(
             TOPIC,
             Verdict::Limited,
-            format!("X11 typing only: it reaches XWayland apps, not native Wayland ones.{portal_note}"),
+            format!(
+                "X11 typing only: it reaches XWayland apps, not native Wayland ones.{portal_note}"
+            ),
             Some("For native Wayland apps, copy the transcript and paste it yourself.".to_string()),
         )
     } else {
@@ -424,14 +442,22 @@ fn audio_line(audio: Option<&AudioFacts>) -> CheckLine {
         );
     };
     match (audio.pipewire, audio.pulse) {
-        (true, true) => line(TOPIC, Verdict::Ok, "PipeWire with its PulseAudio socket.", None),
+        (true, true) => line(
+            TOPIC,
+            Verdict::Ok,
+            "PipeWire with its PulseAudio socket.",
+            None,
+        ),
         (false, true) => line(TOPIC, Verdict::Ok, "PulseAudio.", None),
         (true, false) => line(
             TOPIC,
             Verdict::Limited,
             "PipeWire without its PulseAudio socket: microphone routing falls back to ALSA \
              device names.",
-            Some("Install and start pipewire-pulse: `systemctl --user enable --now pipewire-pulse`.".to_string()),
+            Some(
+                "Install and start pipewire-pulse: `systemctl --user enable --now pipewire-pulse`."
+                    .to_string(),
+            ),
         ),
         (false, false) => line(
             TOPIC,
@@ -461,9 +487,12 @@ fn microphone_line(microphones: Option<&Result<Vec<(String, bool)>, String>>) ->
             format!("Capture devices could not be listed ({reason})."),
             fix,
         ),
-        Some(Ok(devices)) if devices.is_empty() => {
-            line(TOPIC, Verdict::Missing, "No capture device is visible.", fix)
-        }
+        Some(Ok(devices)) if devices.is_empty() => line(
+            TOPIC,
+            Verdict::Missing,
+            "No capture device is visible.",
+            fix,
+        ),
         Some(Ok(devices)) => {
             let default = devices
                 .iter()
@@ -472,7 +501,12 @@ fn microphone_line(microphones: Option<&Result<Vec<(String, bool)>, String>>) ->
                 .unwrap_or_default();
             let count = devices.len();
             let noun = if count == 1 { "device" } else { "devices" };
-            line(TOPIC, Verdict::Ok, format!("{count} capture {noun} visible{default}."), None)
+            line(
+                TOPIC,
+                Verdict::Ok,
+                format!("{count} capture {noun} visible{default}."),
+                None,
+            )
         }
     }
 }
@@ -524,7 +558,12 @@ pub(crate) fn parse_portal_file(name: &str, contents: &str, desktops: &[String])
         let Some((key, value)) = raw.trim().split_once('=') else {
             continue;
         };
-        let items = || value.split(';').map(str::trim).filter(|item| !item.is_empty());
+        let items = || {
+            value
+                .split(';')
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+        };
         match key.trim() {
             "Interfaces" => {
                 backend.implements_global_shortcuts =
@@ -628,9 +667,17 @@ pub(crate) fn gather() -> Facts {
     Facts {
         portal_backends: backends.join().unwrap_or_default(),
         session,
-        portal: Some(portal.join().unwrap_or_else(|_| Err("the probe failed".to_string()))),
+        portal: Some(
+            portal
+                .join()
+                .unwrap_or_else(|_| Err("the probe failed".to_string())),
+        ),
         insertion: insertion.join().unwrap_or_default(),
-        atspi: Some(atspi.join().unwrap_or_else(|_| Err("the probe failed".to_string()))),
+        atspi: Some(
+            atspi
+                .join()
+                .unwrap_or_else(|_| Err("the probe failed".to_string())),
+        ),
         input_methods: InputMethodFacts {
             ibus_running,
             fcitx_running,
@@ -653,8 +700,8 @@ mod live {
     use zbus::blocking::{Connection, Proxy};
 
     use super::{
-        env, parse_portal_file, pipewire_socket, AudioFacts, PortalBackend, PortalFacts,
-        GLOBAL_SHORTCUTS,
+        AudioFacts, GLOBAL_SHORTCUTS, PortalBackend, PortalFacts, env, parse_portal_file,
+        pipewire_socket,
     };
 
     const PORTAL: &str = "org.freedesktop.portal.Desktop";
@@ -744,7 +791,8 @@ mod live {
         if let Some(dir) = env("XDG_DESKTOP_PORTAL_DIR") {
             dirs.push(dir.into());
         }
-        let data_dirs = env("XDG_DATA_DIRS").unwrap_or_else(|| "/usr/local/share:/usr/share".to_string());
+        let data_dirs =
+            env("XDG_DATA_DIRS").unwrap_or_else(|| "/usr/local/share:/usr/share".to_string());
         dirs.extend(
             data_dirs
                 .split(':')
@@ -768,7 +816,10 @@ mod live {
                     continue;
                 }
                 if let Ok(contents) = std::fs::read_to_string(&path) {
-                    seen.insert(name.to_string(), parse_portal_file(name, &contents, desktops));
+                    seen.insert(
+                        name.to_string(),
+                        parse_portal_file(name, &contents, desktops),
+                    );
                 }
             }
         }
@@ -892,9 +943,21 @@ mod tests {
         let lines = evaluate(&healthy_kde(), Some(&status));
         let shortcut = find(&lines, "System-wide shortcut");
         assert_eq!(shortcut.verdict, Verdict::Ok);
-        assert!(shortcut.summary.contains("version 2"), "{}", shortcut.summary);
-        assert!(shortcut.summary.contains("installed for KDE: kde"), "{}", shortcut.summary);
-        assert!(shortcut.summary.contains("Meta+Space"), "{}", shortcut.summary);
+        assert!(
+            shortcut.summary.contains("version 2"),
+            "{}",
+            shortcut.summary
+        );
+        assert!(
+            shortcut.summary.contains("installed for KDE: kde"),
+            "{}",
+            shortcut.summary
+        );
+        assert!(
+            shortcut.summary.contains("Meta+Space"),
+            "{}",
+            shortcut.summary
+        );
         assert_eq!(find(&lines, "Session").verdict, Verdict::Ok);
         let mic = find(&lines, "Microphone");
         assert_eq!(mic.summary, "2 capture devices visible; default: USB mic.");
@@ -924,8 +987,16 @@ mod tests {
         let lines = evaluate(&facts, Some(&PortalStatus::Unavailable("x".into())));
         let shortcut = find(&lines, "System-wide shortcut");
         assert_eq!(shortcut.verdict, Verdict::Limited);
-        assert!(shortcut.summary.contains("COSMIC's desktop portal has no GlobalShortcuts"));
-        assert!(shortcut.summary.contains("(kde) are not used on COSMIC"), "{}", shortcut.summary);
+        assert!(
+            shortcut
+                .summary
+                .contains("COSMIC's desktop portal has no GlobalShortcuts")
+        );
+        assert!(
+            shortcut.summary.contains("(kde) are not used on COSMIC"),
+            "{}",
+            shortcut.summary
+        );
         assert!(shortcut.fix.as_deref().unwrap().contains("XWayland app"));
         let typing = find(&lines, "Typing into other apps");
         assert_eq!(typing.verdict, Verdict::Limited);
@@ -955,10 +1026,19 @@ mod tests {
 
     #[test]
     fn a_portal_waiting_for_setup_points_at_the_button() {
-        let lines = evaluate(&healthy_kde(), Some(&PortalStatus::NeedsSetup { configurable: true }));
+        let lines = evaluate(
+            &healthy_kde(),
+            Some(&PortalStatus::NeedsSetup { configurable: true }),
+        );
         let shortcut = find(&lines, "System-wide shortcut");
         assert_eq!(shortcut.verdict, Verdict::Limited);
-        assert!(shortcut.fix.as_deref().unwrap().contains("Set up desktop shortcut"));
+        assert!(
+            shortcut
+                .fix
+                .as_deref()
+                .unwrap()
+                .contains("Set up desktop shortcut")
+        );
     }
 
     #[test]
@@ -983,7 +1063,13 @@ mod tests {
         let lines = evaluate(&facts, None);
         let audio = find(&lines, "Sound server");
         assert_eq!(audio.verdict, Verdict::Missing);
-        assert!(audio.fix.as_deref().unwrap().contains("systemctl --user start pipewire"));
+        assert!(
+            audio
+                .fix
+                .as_deref()
+                .unwrap()
+                .contains("systemctl --user start pipewire")
+        );
         let mic = find(&lines, "Microphone");
         assert_eq!(mic.verdict, Verdict::Missing);
         assert!(mic.fix.is_some());
@@ -1004,7 +1090,10 @@ mod tests {
     #[test]
     fn the_pipewire_socket_name_resolves_in_its_runtime_dir() {
         let xdg = std::path::Path::new("/run/user/1000");
-        assert_eq!(pipewire_socket(None, None, Some(xdg)), Some(xdg.join("pipewire-0")));
+        assert_eq!(
+            pipewire_socket(None, None, Some(xdg)),
+            Some(xdg.join("pipewire-0"))
+        );
         assert_eq!(
             pipewire_socket(Some("pipewire-1"), Some("/tmp/pw"), Some(xdg)),
             Some("/tmp/pw/pipewire-1".into())
@@ -1026,7 +1115,10 @@ mod tests {
         };
         let line = find(&evaluate(&facts, None), "Input method").clone();
         assert_eq!(line.verdict, Verdict::Info);
-        assert!(line.summary.starts_with("IBus running (GTK_IM_MODULE=ibus)."));
+        assert!(
+            line.summary
+                .starts_with("IBus running (GTK_IM_MODULE=ibus).")
+        );
         assert!(line.summary.contains("no input-method engine yet"));
     }
 

@@ -1,7 +1,7 @@
 //! Settings → Dictation, Linux additions (#221): the desktop shortcut
 //! (GlobalShortcuts portal) row and the "System check" panel.
 
-use gpui::{div, prelude::*, px, Context, Div, FontWeight, SharedString};
+use gpui::{Context, Div, FontWeight, SharedString, div, prelude::*, px};
 
 use crate::app::StarlingApp;
 use crate::system_check::Verdict;
@@ -34,7 +34,10 @@ fn note(text: impl Into<SharedString>) -> Div {
 /// The desktop shortcut row: what the portal binding is, and the action
 /// that fits (set it up, or open the desktop's own settings for it).
 /// Nothing outside a native Wayland session.
-pub(crate) fn render_desktop_shortcut(app: &mut StarlingApp, cx: &mut Context<StarlingApp>) -> Option<gpui::Stateful<Div>> {
+pub(crate) fn render_desktop_shortcut(
+    app: &mut StarlingApp,
+    cx: &mut Context<StarlingApp>,
+) -> Option<gpui::Stateful<Div>> {
     let status = app.portal_shortcuts.as_ref()?.status().clone();
     let mut actions = div().flex().flex_row().gap(px(8.)).mt(px(8.));
     let mut any_action = false;
@@ -78,7 +81,10 @@ pub(crate) fn render_desktop_shortcut(app: &mut StarlingApp, cx: &mut Context<St
 
 /// The setup check: a button, then one line per topic with its fix.
 /// Linux only; elsewhere nothing.
-pub(crate) fn render_system_check(app: &mut StarlingApp, cx: &mut Context<StarlingApp>) -> Option<gpui::Stateful<Div>> {
+pub(crate) fn render_system_check(
+    app: &mut StarlingApp,
+    cx: &mut Context<StarlingApp>,
+) -> Option<gpui::Stateful<Div>> {
     if !cfg!(target_os = "linux") {
         return None;
     }

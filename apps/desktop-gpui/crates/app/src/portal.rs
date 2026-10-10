@@ -128,9 +128,7 @@ impl PortalStatus {
                  Starling in every app, press and release included. Setting it up opens your \
                  desktop's shortcut dialog, where you confirm or change the keys."
                 .to_string(),
-            PortalStatus::Binding => {
-                "Waiting for your desktop's shortcut dialog…".to_string()
-            }
+            PortalStatus::Binding => "Waiting for your desktop's shortcut dialog…".to_string(),
             PortalStatus::Bound {
                 trigger: Some(trigger),
                 ..
@@ -161,7 +159,9 @@ pub(crate) enum PortalSignal {
     /// The session the edges came from is gone (closed by the desktop or
     /// by a rebind, or the portal went away).
     SessionEnded(Instant),
-    Status(PortalStatus),
+    /// A new status, stamped when the worker published it (binding
+    /// transitions are ordered against other sources' events by it).
+    Status(PortalStatus, Instant),
 }
 
 /// The portal's key state: turns its edges into the activation machine's
@@ -259,6 +259,9 @@ enum Command {
     Configure,
 }
 
+/// How many binding transitions [`PortalShortcuts::bound_at`] remembers.
+const BOUND_HISTORY: usize = 16;
+
 /// The UI thread's handle on the portal worker.
 pub(crate) struct PortalShortcuts {
     commands: Option<tokio::sync::mpsc::UnboundedSender<Command>>,
@@ -266,6 +269,8 @@ pub(crate) struct PortalShortcuts {
     keys: PortalKeys,
     /// Machine inputs received but not yet taken, oldest first.
     pending: std::collections::VecDeque<GlobalEvent>,
+    /// When the binding came and went, oldest first (see [`Self::bound_at`]).
+    bound_changes: Vec<(Instant, bool)>,
     status: PortalStatus,
     status_changed: bool,
 }
@@ -304,6 +309,7 @@ impl PortalShortcuts {
             signals,
             keys: PortalKeys::default(),
             pending: Default::default(),
+            bound_changes: Vec::new(),
             status: PortalStatus::Starting,
             status_changed: false,
         };
@@ -326,6 +332,7 @@ impl PortalShortcuts {
             signals,
             keys: PortalKeys::default(),
             pending: Default::default(),
+            bound_changes: Vec::new(),
             status: PortalStatus::Unavailable("not a Linux desktop".to_string()),
             status_changed: false,
         }
@@ -367,12 +374,19 @@ impl PortalShortcuts {
         }
     }
 
-    /// Take in everything the worker sent: status changes apply now (so
-    /// [`Self::is_bound`] is current before other sources' events are
-    /// judged), machine inputs queue for [`Self::next_event`].
+    /// Take in everything the worker sent: status changes apply now and
+    /// binding transitions are remembered with their time (so other
+    /// sources' events are judged by the binding as it was when they were
+    /// received), machine inputs queue for [`Self::next_event`].
     pub(crate) fn poll(&mut self) {
         while let Ok(signal) = self.signals.try_recv() {
-            if let PortalSignal::Status(status) = signal {
+            if let PortalSignal::Status(status, at) = signal {
+                if status.is_bound() != self.status.is_bound() {
+                    self.bound_changes.push((at, status.is_bound()));
+                    if self.bound_changes.len() > BOUND_HISTORY {
+                        self.bound_changes.remove(0);
+                    }
+                }
                 if status != self.status {
                     self.status = status;
                     self.status_changed = true;
@@ -381,6 +395,12 @@ impl PortalShortcuts {
                 self.pending.push_back(event);
             }
         }
+    }
+
+    /// Whether the portal held a binding at `at` (call [`Self::poll`]
+    /// first for the latest transitions).
+    pub(crate) fn bound_at(&self, at: Instant) -> bool {
+        crate::activation::focused_at(&self.bound_changes, at)
     }
 
     /// The next machine input from the portal, oldest first.
@@ -401,20 +421,20 @@ impl PortalShortcuts {
 #[cfg(target_os = "linux")]
 mod dbus {
     use std::collections::HashMap;
-    use std::sync::{mpsc, Arc, Mutex};
+    use std::sync::{Arc, Mutex, mpsc};
     use std::time::{Duration, Instant};
 
     use futures_util::StreamExt;
-    use tokio::sync::oneshot;
     use serde::Deserialize;
     use tokio::sync::mpsc::UnboundedReceiver;
+    use tokio::sync::oneshot;
     use zbus::proxy::{CacheProperties, OwnerChangedStream};
     use zbus::zvariant::{DeserializeDict, OwnedObjectPath, OwnedValue, Type, Value};
     use zbus::{Connection, Proxy};
 
     use super::{
-        desktop_entry_installed, install_desktop_entry, Command, PortalSignal, PortalStatus,
-        APP_ID, SHORTCUT_DESCRIPTION, SHORTCUT_ID,
+        APP_ID, Command, PortalSignal, PortalStatus, SHORTCUT_DESCRIPTION, SHORTCUT_ID,
+        desktop_entry_installed, install_desktop_entry,
     };
 
     pub(super) const DESTINATION: &str = "org.freedesktop.portal.Desktop";
@@ -423,6 +443,11 @@ mod dbus {
     const REQUEST_INTERFACE: &str = "org.freedesktop.portal.Request";
     const SESSION_INTERFACE: &str = "org.freedesktop.portal.Session";
     const REGISTRY_INTERFACE: &str = "org.freedesktop.host.portal.Registry";
+
+    /// CreateSession succeeded but left no live session: the handle was
+    /// unusable, or the desktop closed it straight away.
+    const SESSION_CLOSED_AT_ONCE: &str =
+        "the portal returned no usable session handle, or closed it";
 
     /// Connecting to the session bus and every call that opens no dialog.
     const CALL_TIMEOUT: Duration = Duration::from_secs(10);
@@ -452,13 +477,16 @@ mod dbus {
     /// This app's shortcut in a list: `None` when it is not there, else
     /// its trigger description (when the desktop gave one).
     pub(super) fn find_ours(entries: &[ShortcutEntry]) -> Option<Option<String>> {
-        entries.iter().find(|entry| entry.0 == SHORTCUT_ID).map(|entry| {
-            entry
-                .1
-                .trigger_description
-                .clone()
-                .filter(|text| !text.trim().is_empty())
-        })
+        entries
+            .iter()
+            .find(|entry| entry.0 == SHORTCUT_ID)
+            .map(|entry| {
+                entry
+                    .1
+                    .trigger_description
+                    .clone()
+                    .filter(|text| !text.trim().is_empty())
+            })
     }
 
     /// A request's `Response` body: the response code and its results.
@@ -490,7 +518,8 @@ mod dbus {
             _ => String::new(),
         };
         match name.as_str() {
-            "org.freedesktop.DBus.Error.ServiceUnknown" | "org.freedesktop.DBus.Error.NameHasNoOwner" => {
+            "org.freedesktop.DBus.Error.ServiceUnknown"
+            | "org.freedesktop.DBus.Error.NameHasNoOwner" => {
                 "xdg-desktop-portal is not running on the session bus".to_string()
             }
             "org.freedesktop.DBus.Error.UnknownInterface"
@@ -518,9 +547,10 @@ mod dbus {
         {
             Ok(runtime) => runtime,
             Err(err) => {
-                let _ = out.send(PortalSignal::Status(PortalStatus::Unavailable(format!(
-                    "no async runtime ({err})"
-                ))));
+                let _ = out.send(PortalSignal::Status(
+                    PortalStatus::Unavailable(format!("no async runtime ({err})")),
+                    Instant::now(),
+                ));
                 return;
             }
         };
@@ -583,7 +613,9 @@ mod dbus {
         /// Commits the session handle.
         CreateSession,
         /// Commits the binding of `session` and publishes the outcome.
-        Bind { session: OwnedObjectPath },
+        Bind {
+            session: OwnedObjectPath,
+        },
     }
 
     type Shared = Arc<Mutex<Live>>;
@@ -595,7 +627,7 @@ mod dbus {
     impl Live {
         fn publish(&self, out: &mpsc::Sender<PortalSignal>, status: PortalStatus) {
             if !self.terminal {
-                let _ = out.send(PortalSignal::Status(status));
+                let _ = out.send(PortalSignal::Status(status, Instant::now()));
             }
         }
 
@@ -667,7 +699,9 @@ mod dbus {
                                 None => Some(PortalStatus::Declined { configurable }),
                             }
                         }
-                        Ok((RESPONSE_CANCELLED, _)) => Some(PortalStatus::Declined { configurable }),
+                        Ok((RESPONSE_CANCELLED, _)) => {
+                            Some(PortalStatus::Declined { configurable })
+                        }
                         Ok((code, _)) => Some(PortalStatus::Lost {
                             reason: format!("the desktop refused the shortcut (response {code})"),
                             configurable,
@@ -706,15 +740,20 @@ mod dbus {
         let mut live = lock(live);
         match (interface.as_str(), member.as_str()) {
             (REQUEST_INTERFACE, "Response") => {
-                let waiting = live.pending.as_ref().is_some_and(|p| p.path == path.as_str());
+                let waiting = live
+                    .pending
+                    .as_ref()
+                    .is_some_and(|p| p.path == path.as_str());
                 if waiting {
                     live.respond(out, message);
                 }
             }
             (INTERFACE, edge @ ("Activated" | "Deactivated")) => {
-                let Ok((session, id, _timestamp, _options)) = message
-                    .body()
-                    .deserialize::<(OwnedObjectPath, String, u64, HashMap<String, OwnedValue>)>()
+                let Ok((session, id, _timestamp, _options)) =
+                    message
+                        .body()
+                        .deserialize::<(OwnedObjectPath, String, u64, HashMap<String, OwnedValue>)>(
+                        )
                 else {
                     return;
                 };
@@ -762,7 +801,8 @@ mod dbus {
                 }
             }
             (SESSION_INTERFACE, "Closed") => {
-                let ours = live.session.as_ref().map(|session| session.as_str()) == Some(path.as_str());
+                let ours =
+                    live.session.as_ref().map(|session| session.as_str()) == Some(path.as_str());
                 if ours {
                     live.session_ended(out, "the desktop closed Starling's shortcut session");
                 }
@@ -802,7 +842,10 @@ mod dbus {
                     // The portal went away; its sessions and any open
                     // dialog with it.
                     Some(None) => lock(&live).session_ended(&out, "the desktop portal stopped"),
+                    // Started again, or replaced outright (`--replace`):
+                    // the old instance's session and any open dialog end.
                     Some(Some(_)) => {
+                        lock(&live).session_ended(&out, "the desktop portal restarted");
                         let _ = lifecycle.send(Lifecycle::PortalBack);
                         return;
                     }
@@ -874,7 +917,7 @@ mod dbus {
         out: mpsc::Sender<PortalSignal>,
     ) {
         let status = |status| {
-            let _ = out.send(PortalSignal::Status(status));
+            let _ = out.send(PortalSignal::Status(status, Instant::now()));
         };
         let mut bind_now = false;
         loop {
@@ -882,6 +925,19 @@ mod dbus {
                 Ok(connection) => connection,
                 Err(reason) => return status(PortalStatus::Unavailable(reason)),
             };
+            // Who owns the portal name, watched from before the first call:
+            // a portal that starts, restarts or is replaced while (or after)
+            // opening fails gets a fresh start instead of a permanent
+            // "unavailable".
+            let watching = async {
+                let bus = zbus::fdo::DBusProxy::new(&connection).await?;
+                bus.receive_name_owner_changed_with_args(&[(0, DESTINATION)])
+                    .await
+            };
+            let mut owners = tokio::time::timeout(CALL_TIMEOUT, watching)
+                .await
+                .ok()
+                .and_then(Result::ok);
             let opened = Worker::open(
                 connection,
                 preferred.clone(),
@@ -905,7 +961,35 @@ mod dbus {
                         }
                     }
                 }
-                Err(OpenError::Failed(reason)) => return status(PortalStatus::Unavailable(reason)),
+                Err(OpenError::Failed(reason)) => {
+                    status(PortalStatus::Unavailable(reason));
+                    let Some(owners) = owners.as_mut() else {
+                        return;
+                    };
+                    // Wait for a portal to (re)take the name; the other
+                    // shortcut sources keep working meanwhile.
+                    loop {
+                        tokio::select! {
+                            change = owners.next() => match change {
+                                Some(change) => {
+                                    let appeared = change
+                                        .args()
+                                        .is_ok_and(|args| args.new_owner().is_some());
+                                    if appeared {
+                                        break;
+                                    }
+                                }
+                                None => return,
+                            },
+                            command = commands.recv() => {
+                                if command.is_none() {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    bind_now = false;
+                }
                 Err(OpenError::NeedsDesktopEntry) => {
                     status(PortalStatus::NeedsDesktopEntry);
                     // Wait for the user's set-up; it carries the current
@@ -1041,19 +1125,37 @@ mod dbus {
                 lifecycle,
                 forwarder,
             };
-            if let Err(reason) = worker.create_session().await {
-                // No app id: the registry (xdg-desktop-portal 1.19+) only
-                // takes one with an installed desktop entry.
-                return Err(match registered {
-                    Err(_) if reason.contains("app id") && !desktop_entry_installed(entry_dir) => {
-                        OpenError::NeedsDesktopEntry
-                    }
-                    Err(_) if reason.contains("app id") => OpenError::Failed(format!(
-                        "{reason}; this xdg-desktop-portal cannot identify Starling (its host \
+            match worker.create_session().await {
+                // The session ended at once: the worker stays, and the
+                // user's set-up opens a fresh one.
+                Err(reason) if reason == SESSION_CLOSED_AT_ONCE => {
+                    let live = lock(&worker.live);
+                    live.publish(
+                        &worker.out,
+                        PortalStatus::NeedsSetup {
+                            configurable: live.configurable,
+                        },
+                    );
+                    drop(live);
+                    return Ok(worker);
+                }
+                Err(reason) => {
+                    // No app id: the registry (xdg-desktop-portal 1.19+) only
+                    // takes one with an installed desktop entry.
+                    return Err(match registered {
+                        Err(_)
+                            if reason.contains("app id") && !desktop_entry_installed(entry_dir) =>
+                        {
+                            OpenError::NeedsDesktopEntry
+                        }
+                        Err(_) if reason.contains("app id") => OpenError::Failed(format!(
+                            "{reason}; this xdg-desktop-portal cannot identify Starling (its host \
                          app registry needs version 1.19 or newer)"
-                    )),
-                    _ => OpenError::Failed(reason),
-                });
+                        )),
+                        _ => OpenError::Failed(reason),
+                    });
+                }
+                Ok(()) => {}
             }
             // A binding the desktop remembers from an earlier run is
             // re-bound now: the desktop shows no dialog for it. Anything
@@ -1120,12 +1222,16 @@ mod dbus {
         where
             B: serde::Serialize + zbus::zvariant::DynamicType,
         {
-            let path = self.handle_path("request", token).map_err(RequestError::Call)?;
+            let path = self
+                .handle_path("request", token)
+                .map_err(RequestError::Call)?;
             let (reply, response) = oneshot::channel();
             {
                 let mut live = lock(&self.live);
                 if live.terminal {
-                    return Err(RequestError::Ended("the session bus connection ended".into()));
+                    return Err(RequestError::Ended(
+                        "the session bus connection ended".into(),
+                    ));
                 }
                 live.pending = Some(Pending {
                     path: path.clone(),
@@ -1176,7 +1282,9 @@ mod dbus {
                     Ok(outcome) => outcome,
                     Err(_) => {
                         clear(&self.live, handle.as_str());
-                        Err(RequestError::Call("the desktop portal did not answer".to_string()))
+                        Err(RequestError::Call(
+                            "the desktop portal did not answer".to_string(),
+                        ))
                     }
                 }
             }
@@ -1222,7 +1330,7 @@ mod dbus {
             let mut live = lock(&self.live);
             match outcome {
                 Ok(()) if live.session.is_some() => Ok(()),
-                Ok(()) => Err("the portal returned no usable session handle, or closed it".into()),
+                Ok(()) => Err(SESSION_CLOSED_AT_ONCE.into()),
                 Err(reason) => {
                     live.session = None;
                     Err(reason)
@@ -1261,7 +1369,13 @@ mod dbus {
             let options: HashMap<&str, Value> =
                 HashMap::from([("handle_token", Value::from(token.as_str()))]);
             let message = self
-                .request("ListShortcuts", &token, &(session, options), PendingKind::Plain, false)
+                .request(
+                    "ListShortcuts",
+                    &token,
+                    &(session, options),
+                    PendingKind::Plain,
+                    false,
+                )
                 .await
                 .map_err(RequestError::reason)?;
             match response_body::<ShortcutResults>(&message)? {
@@ -1305,7 +1419,13 @@ mod dbus {
                 session: session.clone(),
             };
             let outcome = self
-                .request("BindShortcuts", &token, &(session, shortcuts, "", options), kind, true)
+                .request(
+                    "BindShortcuts",
+                    &token,
+                    &(session, shortcuts, "", options),
+                    kind,
+                    true,
+                )
                 .await;
             if let Err(RequestError::Call(reason)) = outcome {
                 let live = lock(&self.live);
@@ -1450,14 +1570,21 @@ mod tests {
     #[test]
     fn repeated_activations_never_start_or_stop_a_take() {
         // A backend that repeats `Activated` while the keys are held.
-        for mode in [ActivationMode::Toggle, ActivationMode::Hold, ActivationMode::HoldOrToggle] {
+        for mode in [
+            ActivationMode::Toggle,
+            ActivationMode::Hold,
+            ActivationMode::HoldOrToggle,
+        ] {
             let (mut keys, mut m) = (PortalKeys::default(), machine(mode));
             let t0 = Instant::now();
             let take = started(&feed(&mut keys, &mut m, PortalSignal::Activated(t0)));
             m.samples_arrived(take);
             let mut at = t0 + ms(500);
             for _ in 0..50 {
-                assert!(feed(&mut keys, &mut m, PortalSignal::Activated(at)).is_empty(), "{mode:?}");
+                assert!(
+                    feed(&mut keys, &mut m, PortalSignal::Activated(at)).is_empty(),
+                    "{mode:?}"
+                );
                 at += ms(33);
             }
             assert_eq!(m.active_take(), Some(take), "{mode:?}");
@@ -1470,7 +1597,11 @@ mod tests {
         let t0 = Instant::now();
         // A release with no press (out of order, or across a session swap).
         assert_eq!(keys.map(&PortalSignal::Deactivated(t0)), None);
-        let take = started(&feed(&mut keys, &mut m, PortalSignal::Activated(t0 + ms(10))));
+        let take = started(&feed(
+            &mut keys,
+            &mut m,
+            PortalSignal::Activated(t0 + ms(10)),
+        ));
         m.samples_arrived(take);
         assert!(feed(&mut keys, &mut m, PortalSignal::Deactivated(t0 + ms(60))).is_empty());
         // Sent twice: the second one is not passed on.
@@ -1502,7 +1633,11 @@ mod tests {
         let (mut keys, mut m) = (PortalKeys::default(), machine(ActivationMode::Hold));
         let t0 = Instant::now();
         assert_eq!(keys.map(&PortalSignal::SessionEnded(t0)), None);
-        let take = started(&feed(&mut keys, &mut m, PortalSignal::Activated(t0 + ms(10))));
+        let take = started(&feed(
+            &mut keys,
+            &mut m,
+            PortalSignal::Activated(t0 + ms(10)),
+        ));
         assert_eq!(
             feed(&mut keys, &mut m, PortalSignal::SessionEnded(t0 + ms(400))),
             vec![Effect::Cancel(take, CancelReason::NoAudioYet)]
@@ -1541,7 +1676,10 @@ mod tests {
     fn the_desktop_entry_quotes_the_executable() {
         let entry = desktop_entry(std::path::Path::new("/opt/my apps/star$ling"));
         assert!(entry.starts_with("[Desktop Entry]\nType=Application\nName=Starling\n"));
-        assert!(entry.contains("\nExec=\"/opt/my apps/star\\$ling\"\n"), "{entry}");
+        assert!(
+            entry.contains("\nExec=\"/opt/my apps/star\\$ling\"\n"),
+            "{entry}"
+        );
         assert!(entry.contains(&format!("StartupWMClass={APP_ID}\n")));
         let dir = tempfile::tempdir().unwrap();
         assert!(!desktop_entry_installed(Some(dir.path())));
@@ -1550,8 +1688,58 @@ mod tests {
     }
 
     #[test]
+    fn grab_events_are_judged_by_the_binding_when_they_were_received() {
+        let (sender, signals) = mpsc::channel();
+        let mut portal = PortalShortcuts {
+            commands: None,
+            signals,
+            keys: PortalKeys::default(),
+            pending: Default::default(),
+            bound_changes: Vec::new(),
+            status: PortalStatus::Starting,
+            status_changed: false,
+        };
+        let t0 = Instant::now();
+        let bound = PortalStatus::Bound {
+            trigger: None,
+            configurable: false,
+        };
+        sender
+            .send(PortalSignal::Status(bound.clone(), t0 + ms(100)))
+            .unwrap();
+        sender
+            .send(PortalSignal::Status(bound, t0 + ms(150)))
+            .unwrap();
+        let lost = PortalStatus::Lost {
+            reason: "gone".to_string(),
+            configurable: false,
+        };
+        sender
+            .send(PortalSignal::Status(lost, t0 + ms(300)))
+            .unwrap();
+        portal.poll();
+        assert!(
+            !portal.bound_at(t0 + ms(99)),
+            "a grab press before the binding passes"
+        );
+        assert!(portal.bound_at(t0 + ms(100)));
+        assert!(portal.bound_at(t0 + ms(299)));
+        assert!(!portal.bound_at(t0 + ms(300)));
+        assert_eq!(
+            portal.bound_changes.len(),
+            2,
+            "a repeated Bound is no transition"
+        );
+    }
+
+    #[test]
     fn status_text_names_what_to_do() {
-        assert!(PortalStatus::NeedsSetup { configurable: false }.can_set_up());
+        assert!(
+            PortalStatus::NeedsSetup {
+                configurable: false
+            }
+            .can_set_up()
+        );
         assert!(!PortalStatus::Binding.can_set_up());
         let bound = PortalStatus::Bound {
             trigger: Some("Ctrl+Shift+Space".to_string()),
@@ -1565,8 +1753,10 @@ mod tests {
         };
         assert!(lost.can_set_up());
         assert!(lost.describe().contains("the desktop portal stopped"));
-        assert!(PortalStatus::Unavailable("no GlobalShortcuts".to_string())
-            .describe()
-            .contains("no GlobalShortcuts"));
+        assert!(
+            PortalStatus::Unavailable("no GlobalShortcuts".to_string())
+                .describe()
+                .contains("no GlobalShortcuts")
+        );
     }
 }

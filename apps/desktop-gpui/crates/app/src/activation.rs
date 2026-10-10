@@ -672,12 +672,11 @@ impl StarlingApp {
         // holds a binding it is the system-wide shortcut, and the X11
         // grab's presses (an XWayland app focused) are dropped — a press
         // taken before the portal bound keeps its release (`SourceGate`).
-        // Its Escape grabs still cancel. The portal's status is taken in
-        // first, so the handover is judged on its current state.
-        let portal_bound = self.portal_shortcuts.as_mut().is_some_and(|portal| {
+        // Its Escape grabs still cancel. Each grab event is judged by the
+        // binding as it was when the event was received.
+        if let Some(portal) = self.portal_shortcuts.as_mut() {
             portal.poll();
-            portal.is_bound()
-        });
+        }
         // Both sources in the order they were received (each is already
         // in order; the sort is stable), so a portal press never lands
         // after an X11 Escape that came later. X11 events are still
@@ -708,6 +707,10 @@ impl StarlingApp {
                     if !self.system_event_is_ours(event) {
                         continue;
                     }
+                    let portal_bound = self
+                        .portal_shortcuts
+                        .as_ref()
+                        .is_some_and(|portal| portal.bound_at(raw.2));
                     let Some(shortcuts) = self.global_shortcuts.as_mut() else {
                         continue;
                     };
