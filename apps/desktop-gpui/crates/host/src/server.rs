@@ -1184,6 +1184,7 @@ fn connection_reader(
                     | Frame::TakeTap { .. }
                     | Frame::TakeAdopt { .. }
                     | Frame::Transcribe { .. }
+                    | Frame::TranscribeDue { .. }
                         if state.is_agent() =>
                     {
                         terminate(
@@ -1218,6 +1219,11 @@ fn connection_reader(
                     }
                     Frame::TakeAdopt { take } => {
                         shared.takes.adopt(&state, &take);
+                    }
+                    Frame::TranscribeDue { stored_id } => {
+                        if let Some(transcriber) = &shared.transcriber {
+                            transcriber.due(&state, stored_id);
+                        }
                     }
                     Frame::Transcribe {
                         req,

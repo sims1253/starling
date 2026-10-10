@@ -722,7 +722,11 @@ impl StarlingApp {
         if !self.delivery.settings.auto_insert {
             return;
         }
-        let Some(text) = self.staged_text_for(id).or_else(|| self.head_text(id)) else {
+        let Some(text) = self
+            .staged_text_for(id)
+            .or_else(|| self.own_result(id))
+            .or_else(|| self.head_text(id))
+        else {
             return;
         };
         let verified = capture

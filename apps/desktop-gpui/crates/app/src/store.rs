@@ -346,7 +346,17 @@ impl Store {
     /// duration is derived from the samples themselves.
     pub(crate) fn save_capture(&self, wav: Arc<Vec<u8>>) -> Result<SavedTake, storage::StorageError> {
         let pcm = decode_wav(&wav)?;
-        let id = self.save_pcm_take(pcm, store_v2::CommitMark::Complete)?;
+        let id = self.save_pcm_take(pcm, store_v2::CommitMark::Complete, false)?;
+        Ok(SavedTake { id })
+    }
+
+    /// [`Self::save_capture`] for an import the recording service is to
+    /// transcribe: the intent is stored with the take (#220), so the
+    /// service transcribes it even if this window goes away before it
+    /// asks.
+    pub(crate) fn save_import(&self, wav: Arc<Vec<u8>>) -> Result<SavedTake, storage::StorageError> {
+        let pcm = decode_wav(&wav)?;
+        let id = self.save_pcm_take(pcm, store_v2::CommitMark::Complete, true)?;
         Ok(SavedTake { id })
     }
 
@@ -685,9 +695,11 @@ impl Store {
         &self,
         pcm: audio::PcmAudio,
         mark: store_v2::CommitMark,
+        transcribe: bool,
     ) -> Result<String, storage::StorageError> {
         let rate = pcm.sample_rate;
-        let meta = store_v2::TakeMeta::for_device("");
+        let mut meta = store_v2::TakeMeta::for_device("");
+        meta.transcribe = transcribe;
         let mut take = {
             let store = lock_v2(&self.0);
             store.begin_take_at_rate(rate, meta)

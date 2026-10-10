@@ -108,6 +108,15 @@ impl TranscriberLink {
         });
     }
 
+    /// `conn` asks for the transcription stored take `stored_id` waits
+    /// for; its result is that connection's to act on.
+    pub(crate) fn due(&self, conn: &Arc<ConnState>, stored_id: String) {
+        self.send(Msg::Due {
+            conn: Arc::clone(conn),
+            stored_id,
+        });
+    }
+
     pub(crate) fn request(
         &self,
         conn: &Arc<ConnState>,
@@ -143,6 +152,10 @@ enum Msg {
         req: String,
         stored_id: String,
         with: TranscribeWith,
+    },
+    Due {
+        conn: Arc<ConnState>,
+        stored_id: String,
     },
     JobDone {
         stored_id: String,
@@ -367,6 +380,16 @@ impl Coordinator {
                     source: Source::Request(with),
                 });
             }
+            // Queued once: one that is queued or running already runs
+            // the transcription, and a take with nothing due is left as
+            // it is (its claim finds no intent).
+            Msg::Due { conn, stored_id } => self.enqueue(Job {
+                stored_id,
+                take: None,
+                req: None,
+                owner: Some(conn),
+                source: Source::Due,
+            }),
             Msg::JobDone { stored_id } => {
                 if let Some((thread, _)) = self.running.remove(&stored_id) {
                     let _ = thread.join();
@@ -675,6 +698,11 @@ impl JobContext {
             )
         };
         let retry = matches!(source, Source::Request(_));
+        // What the job runs on, should its engine go away mid-request.
+        let want = match &source {
+            Source::Request(TranscribeWith::Model { model_id }) => Want::Model(model_id.clone()),
+            _ => Want::Current,
+        };
         let (target, stream) = match source {
             Source::Take {
                 target: Some(target),
@@ -721,7 +749,11 @@ impl JobContext {
             }
             .to_string(),
         };
-        let begun = if retry {
+        // A request for a take still waiting to be transcribed (an import,
+        // or one its own job has not reached) is that transcription: it
+        // claims the take, so the intent is not run a second time.
+        let wanted = retry && self.store().transcription_wanted(&stored_id).unwrap_or(false);
+        let begun = if retry && !wanted {
             self.store()
                 .begin_recognition(&stored_id, &backend, None)
                 .map(Some)
@@ -736,6 +768,15 @@ impl JobContext {
         };
         let attempt = match begun {
             Ok(Some(attempt)) => attempt,
+            Ok(None) if retry => {
+                publish(
+                    None,
+                    TranscriptionState::Refused {
+                        message: "This recording is being transcribed already.".to_string(),
+                    },
+                );
+                return;
+            }
             Ok(None) => return,
             Err(StoreV2Error::NotFound(_)) => {
                 publish(None, TranscriptionState::Gone);
@@ -760,7 +801,7 @@ impl JobContext {
         );
         let result = match target {
             Err(reason) => Err(Failure::local(reason)),
-            Ok(target) => self.recognize(&stored_id, target, stream, cancel),
+            Ok(target) => self.recognize(&stored_id, target, &want, stream, cancel),
         };
         if cancel.is_cancelled() {
             // Shutting down: the attempt is left started with its marker
@@ -822,6 +863,7 @@ impl JobContext {
         &self,
         stored_id: &str,
         mut target: Target,
+        want: &Want,
         stream: Option<Receiver<Option<LiveStream>>>,
         cancel: &CancelToken,
     ) -> Result<TranscriptionResult, Failure> {
@@ -847,7 +889,6 @@ impl JobContext {
         };
         let mut retried = false;
         loop {
-            let _counted = self.engine.as_ref().map(|engine| engine.request_guard());
             let outcome = StarlingClient::new(&target.endpoint, &target.model)
                 .and_then(|client| client.with_timeout_ms(request_timeout_ms(wav.len())))
                 .and_then(|client| client.transcribe_with_cancel(Arc::clone(&wav), stored_id, Some(cancel)));
@@ -855,22 +896,23 @@ impl JobContext {
                 Ok(result) => return Ok(result),
                 // The built-in engine went away under the request (a crash,
                 // or the app that owned the sidecar exiting): once more on
-                // its replacement.
+                // its replacement — the same model, so the attempt's label
+                // stays true.
                 Err(ClientError::Transport(_)) if target.builtin && !retried && !cancel.is_cancelled() => {
                     retried = true;
                     let failed = target.engine();
                     let replacement = match &self.engine {
-                        Some(engine) => engine.wait_target(
-                            &Want::Current,
-                            self.engine_wait,
-                            cancel,
-                            failed.as_ref(),
-                        ),
-                        None => Err(String::new()),
+                        Some(engine) => engine
+                            .wait_target(want, self.engine_wait, cancel, failed.as_ref())
+                            .ok()
+                            .filter(|replacement| replacement.backend == target.backend),
+                        None => None,
                     };
                     match replacement {
-                        Ok(replacement) => target = replacement,
-                        Err(_) => return Err(client_failure(true, &ClientError::Transport(String::new()))),
+                        Some(replacement) => target = replacement,
+                        None => {
+                            return Err(client_failure(true, &ClientError::Transport(String::new())))
+                        }
                     }
                 }
                 Err(err) => return Err(client_failure(target.builtin, &err)),

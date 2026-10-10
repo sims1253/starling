@@ -66,6 +66,12 @@ pub(crate) struct HostState {
     pub(crate) lost_take_on: Option<u32>,
     /// The pid of the host the last connection went to.
     pub(crate) client_pid: Option<u32>,
+    /// The exact transcript this window's own take delivers, while it is
+    /// delivered: never a later result another window asked for.
+    pub(crate) own_results: HashMap<String, String>,
+    /// The live text the host sent with an adoption still being
+    /// confirmed, shown once the take is this window's.
+    pub(crate) claimed_text: Option<(Option<LivePartial>, Option<String>)>,
 }
 
 /// What the window says when the service went away with its take.
@@ -364,6 +370,7 @@ impl StarlingApp {
             // Another window got it first, or it ended unowned (the host
             // stores and transcribes it).
             self.host.claiming = None;
+            self.host.claimed_text = None;
             return;
         }
         if owner == TakeOwner::Nobody {
@@ -380,6 +387,9 @@ impl StarlingApp {
             return;
         }
         self.host.claiming = None;
+        if ended || self.recorder.is_some() || self.activation.is_active() {
+            self.host.claimed_text = None;
+        }
         if !ended
             && self.recorder.is_none()
             && !self.activation.is_active()
@@ -543,19 +553,20 @@ impl StarlingApp {
             } => {
                 // Only the running take's: a preview still in flight when
                 // its take stopped is never shown — the final replaces it.
+                // One for a take being adopted waits for the adoption.
+                if self
+                    .host
+                    .claiming
+                    .as_ref()
+                    .is_some_and(|(claimed, _)| *claimed == take)
+                {
+                    self.host.claimed_text = Some((partial, degraded));
+                    return;
+                }
                 if !self.recorder.as_ref().is_some_and(|live| live.take == take) {
                     return;
                 }
-                if let Some(reason) = degraded {
-                    self.stream_degradation = Some(reason);
-                }
-                if let Some(partial) = partial {
-                    if self.staging.is_some() {
-                        self.staging_partial(partial_of(partial), cx);
-                    } else {
-                        self.live_partial = partial.text;
-                    }
-                }
+                self.show_live_text(partial, degraded, cx);
             }
             TakeUpdate::Transcription {
                 stored_id,
@@ -564,6 +575,25 @@ impl StarlingApp {
                 state,
                 yours,
             } => self.transcription_update(stored_id, take, req, state, yours, cx),
+        }
+    }
+
+    /// The running take's live text, or why it stopped.
+    fn show_live_text(
+        &mut self,
+        partial: Option<LivePartial>,
+        degraded: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(reason) = degraded {
+            self.stream_degradation = Some(reason);
+        }
+        if let Some(partial) = partial {
+            if self.staging.is_some() {
+                self.staging_partial(partial_of(partial), cx);
+            } else {
+                self.live_partial = partial.text;
+            }
         }
     }
 
@@ -748,8 +778,11 @@ impl StarlingApp {
                 .to_string(),
         );
         self.overlay_take_started();
-        // The host sends the take's live text so far with the adoption.
         self.live_tick(rate, status, None, cx);
+        // The take's live text so far, sent with the adoption.
+        if let Some((partial, degraded)) = self.host.claimed_text.take() {
+            self.show_live_text(partial, degraded, cx);
+        }
         self.activation_settled(cx);
         true
     }
@@ -921,8 +954,10 @@ impl StarlingApp {
 
     /// Where the host's transcription of stored take `stored_id` stands.
     /// Every window shows it; only the one it is for (`yours`) acts on the
-    /// result — delivers it (its own take), offers it (a retry it asked
-    /// for) or says why there is none.
+    /// result. A take's own transcription (no `req`) is delivered by the
+    /// window that recorded it, with exactly that result's text; a
+    /// request's result (a retry, an import) is offered to the window that
+    /// asked, never typed, and never touches the take's own delivery.
     fn transcription_update(
         &mut self,
         stored_id: String,
@@ -937,103 +972,131 @@ impl StarlingApp {
             .and_then(|req| self.host.requests.remove(req))
             .filter(|request| request.stored_id == stored_id);
         let offer = request.as_ref().is_some_and(|request| request.offer);
-        if let TranscriptionState::Started { .. } = state {
-            if let (Some(req), Some(request)) = (&req, request) {
-                // Kept for the end; the attempt holds the audio now.
-                self.host.requests.insert(
-                    req.clone(),
-                    Request {
-                        _pin: None,
-                        ..request
-                    },
-                );
-            }
-            self.host.transcribing.insert(stored_id.clone());
-            self.active_ids.insert(stored_id.clone());
-            if yours && req.is_none() && !self.host.awaiting.contains(&stored_id) {
-                self.service_notice = Some(if take.is_some() {
-                    "A recording that was still running when its window closed was saved; it is \
-                     being transcribed into your history."
-                        .to_string()
-                } else {
-                    "A recording Starling saved but had not transcribed yet is being \
-                     transcribed into your history."
-                        .to_string()
-                });
-            }
-            self.refresh_history(cx);
-            return;
-        }
-        self.host.transcribing.remove(&stored_id);
-        self.active_ids.remove(&stored_id);
-        let own = self.host.awaiting.remove(&stored_id);
-        if !yours {
-            // Shown here, acted on elsewhere: nothing is typed or offered
-            // for it in this window.
-            if own {
-                self.no_transcript_here(&stored_id, cx);
-            }
-            self.refresh_history(cx);
-            return;
-        }
-        let retry = req.is_some();
+        let own_job = req.is_none();
         match state {
-            TranscriptionState::Completed { kept_earlier, .. } => {
-                let Some(store) = self.store.clone() else {
-                    return;
-                };
-                cx.spawn(async move |this, cx| {
-                    // Raw text is in history first; the active mode's
-                    // processing follows as a proposal (#295). A blank
-                    // retry changed no shown text: no draft is dropped,
-                    // nothing is reprocessed or offered again.
-                    refresh_sessions(&this, &store, cx).await;
-                    if kept_earlier {
-                        return;
-                    }
-                    this.update(cx, |app, cx| {
-                        app.after_transcription(stored_id.clone(), cx);
-                        if offer {
-                            app.offer_retried_text(&stored_id, cx);
-                        }
-                    })
-                    .ok();
-                })
-                .detach();
-            }
-            TranscriptionState::Failed { message, transport } => {
-                self.error = Some(message);
-                // A server that could not be reached is probed again
-                // (Diagnostic, #207: the badge, never this explanation).
-                // The built-in engine's own endpoint is never probed here.
-                if transport
-                    && self.engine_settings.mode == starling_dictation::settings::EngineMode::Manual
-                {
-                    self.check_health(HealthCheckPurpose::Diagnostic, self.endpoint.clone(), cx);
+            TranscriptionState::Started { .. } => {
+                if let (Some(req), Some(request)) = (&req, request) {
+                    // Kept for the end; the attempt holds the audio now.
+                    self.host.requests.insert(
+                        req.clone(),
+                        Request {
+                            _pin: None,
+                            ..request
+                        },
+                    );
                 }
-                self.no_transcript_here(&stored_id, cx);
+                self.host.transcribing.insert(stored_id.clone());
+                self.active_ids.insert(stored_id.clone());
+                if yours && own_job && !self.host.awaiting.contains(&stored_id) {
+                    self.service_notice = Some(if take.is_some() {
+                        "A recording that was still running when its window closed was saved; \
+                         it is being transcribed into your history."
+                            .to_string()
+                    } else {
+                        "A recording Starling saved but had not transcribed yet is being \
+                         transcribed into your history."
+                            .to_string()
+                    });
+                }
                 self.refresh_history(cx);
             }
+            // Nothing started: nothing else is touched (a job on the take
+            // may still be running).
             TranscriptionState::Refused { message } => {
-                self.error = Some(message);
-                if own {
+                if yours && (request.is_some() || req.is_none()) {
+                    self.error = Some(message);
+                }
+                if own_job && self.host.awaiting.remove(&stored_id) {
                     self.no_transcript_here(&stored_id, cx);
                 }
                 self.refresh_history(cx);
             }
-            TranscriptionState::Gone => {
-                if own || retry {
-                    self.error = Some(
-                        "This recording was deleted while it was being transcribed, so its \
-                         transcript was not kept."
-                            .to_string(),
-                    );
+            state => {
+                self.host.transcribing.remove(&stored_id);
+                self.active_ids.remove(&stored_id);
+                let own = own_job && self.host.awaiting.remove(&stored_id);
+                if !yours {
+                    // Shown here, acted on elsewhere.
+                    if own {
+                        self.no_transcript_here(&stored_id, cx);
+                    }
+                    self.refresh_history(cx);
+                    return;
                 }
-                self.no_transcript_here(&stored_id, cx);
-                self.refresh_history(cx);
+                match state {
+                    TranscriptionState::Completed { kept_earlier, text } => {
+                        let Some(store) = self.store.clone() else {
+                            return;
+                        };
+                        cx.spawn(async move |this, cx| {
+                            // Raw text is in history first; the active
+                            // mode's processing follows as a proposal
+                            // (#295). A blank retry changed no shown text:
+                            // no draft is dropped, nothing is reprocessed
+                            // or offered again.
+                            refresh_sessions(&this, &store, cx).await;
+                            if kept_earlier {
+                                return;
+                            }
+                            this.update(cx, |app, cx| {
+                                if own {
+                                    app.host.own_results.insert(stored_id.clone(), text);
+                                }
+                                app.after_transcription(stored_id.clone(), cx);
+                                app.host.own_results.remove(&stored_id);
+                                if offer {
+                                    app.offer_retried_text(&stored_id, cx);
+                                }
+                            })
+                            .ok();
+                        })
+                        .detach();
+                    }
+                    TranscriptionState::Failed { message, transport } => {
+                        self.error = Some(message);
+                        // A server that could not be reached is probed
+                        // again (Diagnostic, #207: the badge, never this
+                        // explanation). The built-in engine's own endpoint
+                        // is never probed here.
+                        if transport
+                            && self.engine_settings.mode
+                                == starling_dictation::settings::EngineMode::Manual
+                        {
+                            self.check_health(
+                                HealthCheckPurpose::Diagnostic,
+                                self.endpoint.clone(),
+                                cx,
+                            );
+                        }
+                        if own {
+                            self.no_transcript_here(&stored_id, cx);
+                        }
+                        self.refresh_history(cx);
+                    }
+                    TranscriptionState::Gone => {
+                        if own || request.is_some() {
+                            self.error = Some(
+                                "This recording was deleted while it was being transcribed, so \
+                                 its transcript was not kept."
+                                    .to_string(),
+                            );
+                        }
+                        if own {
+                            self.no_transcript_here(&stored_id, cx);
+                        }
+                        self.refresh_history(cx);
+                    }
+                    TranscriptionState::Started { .. } | TranscriptionState::Refused { .. } => {}
+                }
             }
-            TranscriptionState::Started { .. } => {}
         }
+    }
+
+    /// The transcript stored take `id` delivers here: its own result's
+    /// text while that is being delivered (a later result another window
+    /// asked for must not be typed in its place).
+    pub(crate) fn own_result(&self, id: &str) -> Option<String> {
+        self.host.own_results.get(id).cloned()
     }
 
     /// No transcript will come for stored take `id` in this window:

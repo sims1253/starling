@@ -322,9 +322,10 @@ impl StarlingApp {
         .detach();
     }
 
-    /// Stores an imported take and asks the recording service to
-    /// transcribe it with whatever it transcribes with now. A store that
-    /// cannot take it leaves the WAV in the unsaved list.
+    /// Stores an imported take with the intent to transcribe it and asks
+    /// the recording service to run that now, with whatever it
+    /// transcribes with. A store that cannot take it leaves the WAV in the
+    /// unsaved list.
     pub(crate) fn save_import(&mut self, wav: Arc<Vec<u8>>, cx: &mut Context<Self>) {
         let Some(store) = self.store.clone() else {
             let reason = self
@@ -341,20 +342,24 @@ impl StarlingApp {
             let saved = {
                 let store = store.clone();
                 let wav = wav.clone();
-                cx.background_spawn(async move {
-                    let saved = store.save_capture(wav)?;
-                    let pin = store.pin_audio(&saved.id);
-                    Ok::<_, storage::StorageError>((saved.id, pin))
-                })
-                .await
+                cx.background_spawn(async move { store.save_import(wav).map(|saved| saved.id) })
+                    .await
             };
             match saved {
-                Ok((id, pin)) => {
-                    refresh_sessions(&this, &store, cx).await;
+                Ok(id) => {
+                    // Stored with its intent: the service transcribes it
+                    // whether or not this window is still here to ask.
                     this.update(cx, |app, cx| {
-                        app.ask_host_to_transcribe(id, TranscribeWith::Current, Some(pin), false, cx);
+                        if let Some(link) = &app.host.link {
+                            link.transcribe_due(&id);
+                        }
+                        app.host.awaiting.insert(id.clone());
+                        app.active_ids.insert(id.clone());
+                        app.selected_id = Some(id);
+                        cx.notify();
                     })
                     .ok();
+                    refresh_sessions(&this, &store, cx).await;
                 }
                 Err(err) => {
                     this.update(cx, |app, cx| {
@@ -1753,16 +1758,131 @@ mod tests {
     }
 
     fn completed(stored_id: &str, req: Option<&str>, yours: bool) -> TakeUpdate {
+        completed_with(stored_id, req, yours, "words")
+    }
+
+    fn completed_with(stored_id: &str, req: Option<&str>, yours: bool, text: &str) -> TakeUpdate {
         TakeUpdate::Transcription {
             stored_id: stored_id.to_string(),
             take: None,
             req: req.map(str::to_string),
             state: TranscriptionState::Completed {
-                text: "words".to_string(),
+                text: text.to_string(),
                 kept_earlier: false,
             },
             yours,
         }
+    }
+
+    /// A window's own take with its delivery bound, waiting for the host.
+    fn own_take(app: &gpui::Entity<StarlingApp>, cx: &mut gpui::TestAppContext, id: &str) {
+        app.update(cx, |app, _| {
+            app.delivery_take_started();
+            let capture = app.delivery_take_stopped();
+            app.bind_delivery(capture, id);
+            app.host.awaiting.insert(id.to_string());
+        });
+    }
+
+    /// The window types its own take's result — exactly that one, even
+    /// when a retry another window asked for has landed in history since.
+    #[gpui::test]
+    fn the_own_take_types_its_own_result_not_a_later_retry(cx: &mut gpui::TestAppContext) {
+        let root = scratch("frames-exact");
+        let store = Store::at_test_root(&root);
+        let id = transcribed(&store, "my own words");
+        // Another window's retry landed after it.
+        store.mark_attempt(&id, "openai:other").expect("attempt");
+        store
+            .save_transcript(
+                &id,
+                storage::TranscriptionResult {
+                    text: "somebody else's retry".to_string(),
+                    segments: Vec::new(),
+                    duration_seconds: None,
+                    request_id: None,
+                },
+            )
+            .expect("retry");
+        let (app, fake) = window_with_typing(cx, &store);
+        own_take(&app, cx, &id);
+        frame(&app, cx, completed_with(&id, None, true, "my own words"));
+        settle(cx, "the own take typed", |_| !fake.insertions().is_empty());
+        assert_eq!(fake.insertions().len(), 1);
+        assert_eq!(fake.insertions()[0].1, "my own words", "{:?}", fake.insertions());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Another window's retry that the host refused (or that finished)
+    /// leaves this window's own take waiting, its delivery bound.
+    #[gpui::test]
+    fn another_windows_request_never_touches_the_own_takes_delivery(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = scratch("frames-foreign-request");
+        let store = Store::at_test_root(&root);
+        let id = transcribed(&store, "mine at last");
+        let (app, fake) = window_with_typing(cx, &store);
+        own_take(&app, cx, &id);
+        frame(
+            &app,
+            cx,
+            TakeUpdate::Transcription {
+                stored_id: id.clone(),
+                take: None,
+                req: Some("tr_elsewhere".to_string()),
+                state: TranscriptionState::Refused {
+                    message: "This recording is being transcribed already.".to_string(),
+                },
+                yours: false,
+            },
+        );
+        frame(&app, cx, completed_with(&id, Some("tr_elsewhere"), false, "theirs"));
+        assert!(app.read_with(cx, |app, _| app.host.awaiting.contains(&id)), "still waiting");
+        assert!(fake.insertions().is_empty());
+        frame(&app, cx, completed_with(&id, None, true, "mine at last"));
+        settle(cx, "the own take typed", |_| !fake.insertions().is_empty());
+        assert_eq!(fake.insertions()[0].1, "mine at last");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The live text the host sends with an adoption shows once the take
+    /// is this window's (it arrives before the confirming tick).
+    #[gpui::test]
+    fn an_adopted_take_shows_the_live_state_sent_with_the_adoption(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let app = cx.new(|cx| StarlingApp::for_test(None, cx));
+        app.update(cx, |app, _| {
+            app.host.claiming = Some(("take_back".to_string(), Instant::now()));
+        });
+        frame(
+            &app,
+            cx,
+            TakeUpdate::LiveText {
+                take: "take_back".to_string(),
+                partial: None,
+                degraded: Some("live text stopped earlier".to_string()),
+            },
+        );
+        assert!(app.read_with(cx, |app, _| app.stream_degradation.is_none()), "not ours yet");
+        frame(
+            &app,
+            cx,
+            TakeUpdate::Live {
+                take: "take_back".to_string(),
+                rate: 16_000,
+                status: None,
+                owner: starling_runtime_host::frame::TakeOwner::You,
+                ended: None,
+                kept: false,
+                meter: None,
+            },
+        );
+        app.read_with(cx, |app, _| {
+            assert!(app.recorder.as_ref().is_some_and(|live| live.take == "take_back"));
+            assert_eq!(app.stream_degradation.as_deref(), Some("live text stopped earlier"));
+        });
     }
 
     /// The window types the take it recorded when the host reports it
@@ -1789,7 +1909,7 @@ mod tests {
         frame(&app, cx, completed(&other, None, false));
         assert!(fake.insertions().is_empty(), "{:?}", fake.insertions());
         assert!(app.read_with(cx, |app, _| !app.host.awaiting.contains(&other)));
-        frame(&app, cx, completed(&own, None, true));
+        frame(&app, cx, completed_with(&own, None, true, "my words"));
         settle(cx, "the own take typed", |_| !fake.insertions().is_empty());
         assert_eq!(fake.insertions().len(), 1);
         assert!(fake.insertions()[0].1.contains("my words"), "{:?}", fake.insertions());

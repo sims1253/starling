@@ -478,13 +478,35 @@ fn a_host_process_killed_mid_transcription_leaves_the_take_to_the_next_one() {
         }
     };
 
+    let socket = HostConfig::new(&root, &runtime_dir).socket_path();
+    let windows = |label: &str| -> Vec<HostClient> {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        (0..2)
+            .map(|_| loop {
+                if let Ok(client) = HostClient::connect(&socket) {
+                    client.take_watch().expect("watching");
+                    return client;
+                }
+                assert!(Instant::now() < deadline, "no host for {label}");
+                std::thread::sleep(Duration::from_millis(20));
+            })
+            .collect()
+    };
+
+    // Two windows follow the host that dies mid-transcription …
     let mut first = spawn();
+    let before = windows("the first host");
     wait_for("the first host's request", &|| engine.batch_requests() == 1);
     first.kill().expect("killed");
     first.wait().expect("reaped");
+    drop(before);
 
+    // … and reconnect to the next one, which transcribes it once (at its
+    // startup — possibly before the windows are back).
     let mut second = spawn();
+    let after = windows("the second host");
     wait_for("the transcript", &|| !completed_attempts(&root, &id).is_empty());
+    drop(after);
     second.kill().expect("killed");
     second.wait().expect("reaped");
     engine.release();
@@ -496,4 +518,44 @@ fn a_host_process_killed_mid_transcription_leaves_the_take_to_the_next_one() {
     assert!(attempts.iter().any(|attempt| attempt.status == "failed"));
     assert!(!store.transcription_wanted(&id).unwrap());
     assert_eq!(engine.batch_requests(), 2);
+}
+
+/// An import stored with its intent and asked for at once (`due`): run
+/// once, whether the request or the host's own look at the store gets to
+/// it first, and never again by this host or the next; the window that
+/// asked is the one to act on it.
+#[test]
+fn an_import_asked_for_is_transcribed_once() {
+    let root = tempfile::tempdir().unwrap();
+    let id = {
+        let mut store = StoreV2::open(root.path()).unwrap();
+        let mut meta = TakeMeta::for_device("import");
+        meta.transcribe = true;
+        let mut take = store.begin_take(meta).unwrap();
+        take.append_and_seal(&vec![0.1f32; 16_000]).unwrap();
+        take.finalize().unwrap().commit_marked(&mut store, CommitMark::Complete).unwrap().record.id
+    };
+    let engine = FakeEngine::start(
+        vec![Reply::Text("imported".into()), Reply::Text("again".into())],
+        StreamMode::Refuse,
+    );
+    let mut host = serve(config(root.path(), Vec::new(), &engine)).expect("serves");
+    let app = watching(&host);
+    app.transcribe_due(&id).unwrap();
+    app.transcribe_due(&id).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while completed_attempts(root.path(), &id).is_empty() {
+        assert!(Instant::now() < deadline, "the import was not transcribed");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // Asked again once it ran: nothing is due, nothing runs.
+    app.transcribe_due(&id).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    host.shutdown();
+    let mut next = serve(config(root.path(), Vec::new(), &engine)).expect("serves again");
+    std::thread::sleep(Duration::from_millis(500));
+    next.shutdown();
+    assert_eq!(completed_attempts(root.path(), &id), vec!["imported"]);
+    assert_eq!(engine.batch_requests(), 1, "transcribed once");
+    assert!(!StoreV2::open(root.path()).unwrap().transcription_wanted(&id).unwrap());
 }

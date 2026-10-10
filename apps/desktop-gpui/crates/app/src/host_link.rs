@@ -157,6 +157,7 @@ enum Outgoing {
         stored_id: String,
         with: TranscribeWith,
     },
+    TranscribeDue { stored_id: String },
 }
 
 impl HostLink {
@@ -231,6 +232,14 @@ impl HostLink {
         });
     }
 
+    /// Asks the host to run the transcription stored take `stored_id`
+    /// waits for (an import stored with its intent).
+    pub(crate) fn transcribe_due(&self, stored_id: &str) {
+        let _ = self.commands.send(Outgoing::TranscribeDue {
+            stored_id: stored_id.to_string(),
+        });
+    }
+
     /// Starts the recording service again after the link gave up on it.
     pub(crate) fn retry(&self) {
         self.relaunch.store(true, Ordering::SeqCst);
@@ -294,6 +303,13 @@ fn command_loop(
                     {
                         return;
                     }
+                }
+            }
+            // Not sent, the take still waits in the store: the host finds
+            // it at its next look.
+            Outgoing::TranscribeDue { stored_id } => {
+                if let Some(client) = client {
+                    let _ = client.transcribe_due(&stored_id);
                 }
             }
             Outgoing::Transcribe {

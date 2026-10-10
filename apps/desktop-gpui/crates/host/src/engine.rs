@@ -504,7 +504,11 @@ impl EngineHost {
     /// transcription waits for an engine, [`Self::wait_target`]).
     pub fn bind_now(&self) -> Option<Target> {
         match &*lock(&self.state) {
-            EngineState::Builtin { manager, .. } => manager.lease().map(Target::from_lease),
+            EngineState::Builtin {
+                manager, in_flight, ..
+            } => manager
+                .lease()
+                .map(|lease| Target::from_lease(lease, in_flight)),
             EngineState::Manual { endpoint, model } => Target::manual(endpoint, model).ok(),
         }
     }
@@ -525,16 +529,19 @@ impl EngineHost {
             if cancel.is_cancelled() {
                 return Err("The transcription was cancelled.".to_string());
             }
-            let (manager, stopped) = match &*lock(&self.state) {
+            let (manager, stopped, in_flight) = match &*lock(&self.state) {
                 EngineState::Builtin {
-                    manager, stopped, ..
-                } => (manager.clone(), Arc::clone(stopped)),
+                    manager,
+                    stopped,
+                    in_flight,
+                    ..
+                } => (manager.clone(), Arc::clone(stopped), Arc::clone(in_flight)),
                 EngineState::Manual { endpoint, model } => {
                     return match want {
                         Want::Current => Target::manual(endpoint, model).map_err(|err| {
                             format!("Your server's endpoint in Settings is not usable: {err}")
                         }),
-                        Want::Model(_) => Err("The built-in engine is off (Settings → Engine                                                uses your own server)."
+                        Want::Model(_) => Err("The built-in engine is off (Settings → Engine uses your own server)."
                             .to_string()),
                     };
                 }
@@ -550,7 +557,7 @@ impl EngineHost {
                 };
                 let identity = (lease.endpoint().to_string(), lease.pid());
                 if wanted && avoid != Some(&identity) {
-                    return Ok(Target::from_lease(lease));
+                    return Ok(Target::from_lease(lease, &in_flight));
                 }
                 avoiding = wanted;
             }
@@ -569,14 +576,6 @@ impl EngineHost {
             }
             std::thread::sleep(if avoiding { AVOID_POLL } else { READY_POLL });
         }
-    }
-
-    /// Counts one request on whatever serves now, for as long as the
-    /// guard lives: a switch away from the built-in engine waits (bounded)
-    /// for it before stopping the engine under it.
-    pub fn request_guard(&self) -> RequestGuard {
-        let slot = lock(&self.provider.current);
-        RequestGuard(slot.in_flight.as_ref().map(InFlight::on))
     }
 
     /// Marks the host as shutting down (see `closing`). The host calls
@@ -615,7 +614,9 @@ pub enum Want {
 /// Where one transcription goes (#220, #363): the endpoint and model it
 /// is sent to, the label its attempt row carries, and — on the built-in
 /// engine — the lease that keeps that engine serving until the target is
-/// dropped (a model switch drains it instead of cutting it off).
+/// dropped (a model switch drains it instead of cutting it off), counted
+/// on the engine's in-flight counter for as long (a switch away from the
+/// built-in engine waits, bounded, before stopping it under the take).
 pub struct Target {
     pub endpoint: String,
     pub model: String,
@@ -624,6 +625,7 @@ pub struct Target {
     pub backend: String,
     pub builtin: bool,
     lease: Option<EngineLease>,
+    _counted: Option<InFlight>,
 }
 
 impl Target {
@@ -639,10 +641,11 @@ impl Target {
             .to_string(),
             builtin: false,
             lease: None,
+            _counted: None,
         })
     }
 
-    fn from_lease(lease: EngineLease) -> Target {
+    fn from_lease(lease: EngineLease, in_flight: &Arc<AtomicUsize>) -> Target {
         Target {
             endpoint: lease.endpoint().to_string(),
             model: lease.slug().to_string(),
@@ -652,6 +655,7 @@ impl Target {
             .to_string(),
             builtin: true,
             lease: Some(lease),
+            _counted: Some(InFlight::on(in_flight)),
         }
     }
 
@@ -663,9 +667,6 @@ impl Target {
             .map(|lease| (lease.endpoint().to_string(), lease.pid()))
     }
 }
-
-/// [`EngineHost::request_guard`]'s count.
-pub struct RequestGuard(#[allow(dead_code)] Option<InFlight>);
 
 /// Why a transcription found no engine.
 fn not_ready_sentence() -> String {

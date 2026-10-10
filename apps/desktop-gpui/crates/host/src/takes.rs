@@ -272,7 +272,7 @@ impl TakeHub {
         let recipient = owner
             .filter(|owner| !owner.closed.load(Ordering::SeqCst))
             .filter(|owner| {
-                take.is_none()
+                (take.is_none() && req.is_some())
                     || state
                         .watchers
                         .iter()
@@ -818,15 +818,35 @@ impl CaptureObserver for TakeHub {
             Err(_) => (None, detail.to_string()),
         };
         let mut state = lock_registry(&self.state);
-        if state.acquiring.as_ref().is_some_and(|(take, _)| take == corr) {
-            state.acquiring = None;
-        }
-        for watcher in &state.watchers {
-            let _ = watcher.conn.try_deliver(Frame::TakeStartFailed {
+        let starter = match state.acquiring.take() {
+            Some((take, conn)) if take == corr => Some(conn),
+            other => {
+                state.acquiring = other;
+                state
+                    .starters
+                    .iter()
+                    .find(|(known, _)| known == corr)
+                    .map(|(_, conn)| Arc::clone(conn))
+            }
+        };
+        let HubState {
+            watchers, owed, ..
+        } = &mut *state;
+        for watcher in watchers.iter() {
+            let frame = Frame::TakeStartFailed {
                 take: corr.to_string(),
                 problem: problem.clone(),
                 message: message.clone(),
-            });
+            };
+            // The window that asked waits on this answer.
+            if starter
+                .as_ref()
+                .is_some_and(|starter| Arc::ptr_eq(starter, &watcher.conn))
+            {
+                deliver_owed(owed, &watcher.conn, frame);
+            } else {
+                let _ = watcher.conn.try_deliver(frame);
+            }
         }
     }
 
@@ -876,11 +896,14 @@ impl CaptureObserver for TakeHub {
         // Watchers that do not tap this take hear the end now; a tap
         // hears it after its last sample (the tick).
         let total = record.map(|record| record.samples.len() as u64).unwrap_or(0);
-        for watcher in &state.watchers {
+        let HubState {
+            watchers, owed, ..
+        } = &mut *state;
+        for watcher in watchers.iter() {
             if watcher.tapping(corr) {
                 continue;
             }
-            let _ = watcher.conn.try_deliver(Frame::LiveTake {
+            let frame = Frame::LiveTake {
                 take: corr.to_string(),
                 rate,
                 status: None,
@@ -889,7 +912,14 @@ impl CaptureObserver for TakeHub {
                 ended: Some(total),
                 kept: record.is_some(),
                 meter: None,
-            });
+            };
+            // The owner's window ends its take on this frame (and only then
+            // finds its stored row): it waits for room, never dropped.
+            if owner_for(&owner, &watcher.conn) == TakeOwner::You {
+                deliver_owed(owed, &watcher.conn, frame);
+            } else {
+                let _ = watcher.conn.try_deliver(frame);
+            }
         }
     }
 

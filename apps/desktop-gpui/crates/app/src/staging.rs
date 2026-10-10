@@ -521,12 +521,15 @@ impl StarlingApp {
             self.staging_rebase_failed(token, "The recording store is unavailable.", cx);
             return true;
         };
-        let final_text = self
-            .sessions
-            .iter()
-            .find(|session| session.id == id)
-            .and_then(|session| session.transcript.as_ref())
-            .map(|transcript| transcript.text.clone());
+        // The result this take's own transcription produced (#220), not
+        // whatever history shows by now.
+        let final_text = self.own_result(id).or_else(|| {
+            self.sessions
+                .iter()
+                .find(|session| session.id == id)
+                .and_then(|session| session.transcript.as_ref())
+                .map(|transcript| transcript.text.clone())
+        });
         let Some(staging) = self.staging_mut(token) else {
             return false;
         };

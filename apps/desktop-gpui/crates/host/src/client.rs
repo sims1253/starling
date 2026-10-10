@@ -529,6 +529,14 @@ impl HostClient {
         })
     }
 
+    /// Asks the host to run the transcription stored take `stored_id` is
+    /// waiting for (see [`Frame::TranscribeDue`]).
+    pub fn transcribe_due(&self, stored_id: &str) -> Result<(), ClientError> {
+        self.send_unanswered(Frame::TranscribeDue {
+            stored_id: stored_id.to_string(),
+        })
+    }
+
     pub fn recv_take_timeout(&self, timeout: Duration) -> Result<TakeWire, RecvError> {
         self.takes.recv_timeout(timeout)
     }
@@ -825,7 +833,8 @@ fn client_reader(
                 | Frame::TakeWatch { .. }
                 | Frame::TakeTap { .. }
                 | Frame::TakeAdopt { .. }
-                | Frame::Transcribe { .. },
+                | Frame::Transcribe { .. }
+                | Frame::TranscribeDue { .. },
             ) => {
                 fail("host sent a client frame".to_string());
                 break;

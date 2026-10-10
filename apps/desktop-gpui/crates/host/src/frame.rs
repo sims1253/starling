@@ -90,7 +90,7 @@ impl TransportErrorCode {
 ///   [`Frame::AgentHello`], [`Frame::AskUser`], [`Frame::AskCancel`],
 ///   [`Frame::PromptAck`], [`Frame::PromptDone`], [`Frame::TakeWatch`],
 ///   [`Frame::TakeTap`], [`Frame::TakeAdopt`],
-///   [`Frame::Transcribe`]
+///   [`Frame::Transcribe`], [`Frame::TranscribeDue`]
 /// - host → client: [`Frame::Hello`], [`Frame::Receipt`], [`Frame::Event`],
 ///   [`Frame::Snapshot`], [`Frame::TransportError`], [`Frame::Bye`],
 ///   [`Frame::AgentWelcome`], [`Frame::AskResult`], [`Frame::ShowPrompt`],
@@ -263,6 +263,11 @@ pub enum Frame {
         stored_id: String,
         with: TranscribeWith,
     },
+    /// The app asking the host to run the transcription stored take
+    /// `stored_id` is waiting for (an import it just stored with its
+    /// intent): queued now rather than at the next look, and never a
+    /// second result — if it ran already, nothing happens.
+    TranscribeDue { stored_id: String },
     /// Live text of a recording take, as the host's stream has it: the
     /// newest preview (`partial`), or why live text stopped for the rest
     /// of the take (`degraded`).
@@ -667,6 +672,9 @@ mod tests {
                 with: TranscribeWith::Model {
                     model_id: "parakeet".into(),
                 },
+            },
+            Frame::TranscribeDue {
+                stored_id: "j_1".into(),
             },
             Frame::LiveText {
                 take: "take-1".into(),
