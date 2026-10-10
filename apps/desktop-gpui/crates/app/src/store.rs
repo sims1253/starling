@@ -657,8 +657,8 @@ impl Store {
     /// `policy` is read under the guard when the policy run starts and
     /// again before each removal, so a limit the user lifted meanwhile is
     /// not applied (the run stops; the app runs again). `paused` is asked
-    /// before each compression and before the policy run: when it says
-    /// yes (a take started recording), the pass ends there.
+    /// before each compression and before each removal: when it says yes
+    /// (a take started recording), the pass ends there.
     pub(crate) fn audio_upkeep<P: std::borrow::Borrow<RetentionPolicy>>(
         &self,
         policy: impl Fn() -> P,
@@ -681,7 +681,9 @@ impl Store {
                     continue;
                 }
             };
-            match lock_v2(&self.0).commit_compression(prepared) {
+            // The guard must drop before the arms: a failure locks again.
+            let committed = lock_v2(&self.0).commit_compression(prepared);
+            match committed {
                 Ok(CompressionOutcome::Compressed {
                     journal_bytes,
                     flac_bytes,
@@ -701,8 +703,9 @@ impl Store {
             return Ok(report);
         }
         report.retention = lock_v2(&self.0)
-            .apply_retention_policy_now(policy)
+            .apply_retention_policy_now(policy, &paused)
             .map_err(v2_err)?;
+        report.paused = report.retention.stopped;
         Ok(report)
     }
 
@@ -1861,6 +1864,68 @@ mod tests {
         assert!(upkeep.summary().is_none());
         let wav = store.audio_wav(&saved.id).expect("load").expect("present");
         assert_eq!(*wav, *saved.wav, "still the journal, untouched");
+    }
+
+    #[test]
+    fn a_failed_compression_commit_leaves_the_store_usable() {
+        let store = v2_store("upkeep-commit-fails");
+        let report = finalized_journal("upkeep-commit-fails-src", &vec![0.1f32; 32_000]);
+        let saved = store
+            .save_capture(tiny_wav(32_000), Some(&report))
+            .expect("adopting save");
+        // A directory where the FLAC goes: the publish's rename fails.
+        let flac = lock_v2(&store.0)
+            .root()
+            .join("audio")
+            .join(format!("{}.flac", saved.id));
+        std::fs::create_dir_all(flac.join("blocker")).expect("blocking directory");
+        let (done, finished) = std::sync::mpsc::channel();
+        let worker = store.clone();
+        std::thread::spawn(move || {
+            let upkeep = worker
+                .audio_upkeep(store_v2::RetentionPolicy::default, || false)
+                .expect("upkeep");
+            let candidates = lock_v2(&worker.0)
+                .compression_candidates(10)
+                .expect("candidates")
+                .len();
+            done.send((upkeep, candidates)).expect("send");
+        });
+        let (upkeep, candidates) = finished
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("upkeep returned and the store is still usable");
+        assert_eq!(upkeep.compressed, 0);
+        assert_eq!(upkeep.failures.len(), 1, "{upkeep:?}");
+        assert_eq!(candidates, 1, "one failure does not give up yet");
+    }
+
+    #[test]
+    fn upkeep_stops_removing_once_a_take_starts_recording() {
+        let store = v2_store("upkeep-paused-mid-run");
+        let id = transcribed(&store, "a take past its limit");
+        let mut policy = store_v2::RetentionPolicy::default();
+        policy.grace = std::time::Duration::ZERO;
+        policy.limits.insert(
+            store_v2::STANDARD_CLASS.to_string(),
+            store_v2::ClassLimits {
+                max_age_days: Some(0),
+                max_total_bytes: None,
+            },
+        );
+        // A take starts recording right after the policy run began.
+        let recording = std::sync::atomic::AtomicBool::new(false);
+        let upkeep = store
+            .audio_upkeep(
+                || {
+                    recording.store(true, std::sync::atomic::Ordering::SeqCst);
+                    policy.clone()
+                },
+                || recording.load(std::sync::atomic::Ordering::SeqCst),
+            )
+            .expect("upkeep");
+        assert!(upkeep.paused);
+        assert!(upkeep.retention.retired.is_empty(), "{upkeep:?}");
+        assert!(store.audio_wav(&id).expect("load").is_some());
     }
 
     #[test]

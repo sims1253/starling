@@ -2457,6 +2457,19 @@ impl StoreV2 {
         current: impl Fn() -> P,
         now: time::OffsetDateTime,
     ) -> Result<RetentionReport, StoreV2Error> {
+        self.apply_retention_policy_until(current, || false, now)
+    }
+
+    /// [`Self::apply_live_retention_policy`] that also asks `stop` under
+    /// the write lock before each removal: when it says yes (the app
+    /// started recording a take), the run ends there
+    /// ([`RetentionReport::stopped`]).
+    pub fn apply_retention_policy_until<P: std::borrow::Borrow<RetentionPolicy>>(
+        &mut self,
+        current: impl Fn() -> P,
+        stop: impl Fn() -> bool,
+        now: time::OffsetDateTime,
+    ) -> Result<RetentionReport, StoreV2Error> {
         let mut report = RetentionReport::default();
         let policy = &current().borrow().clone();
         if !policy.is_active() {
@@ -2515,6 +2528,10 @@ impl StoreV2 {
                 let live = current();
                 if live.borrow() != policy {
                     report.policy_changed = true;
+                    return Ok(report);
+                }
+                if stop() {
+                    report.stopped = true;
                     return Ok(report);
                 }
                 // Another connection committed since the walk looked: takes
@@ -2629,12 +2646,13 @@ impl StoreV2 {
             .is_some())
     }
 
-    /// [`Self::apply_live_retention_policy`] as of the current time.
+    /// [`Self::apply_retention_policy_until`] as of the current time.
     pub fn apply_retention_policy_now<P: std::borrow::Borrow<RetentionPolicy>>(
         &mut self,
         current: impl Fn() -> P,
+        stop: impl Fn() -> bool,
     ) -> Result<RetentionReport, StoreV2Error> {
-        self.apply_live_retention_policy(current, time::OffsetDateTime::now_utc())
+        self.apply_retention_policy_until(current, stop, time::OffsetDateTime::now_utc())
     }
 
     /// Why a due take keeps its audio, if it does.
@@ -4560,6 +4578,8 @@ pub struct RetentionReport {
     /// limits): it stopped before removing anything the new policy may
     /// not want removed. The caller runs again with the new one.
     pub policy_changed: bool,
+    /// The caller's `stop` said yes before a removal, and the run ended.
+    pub stopped: bool,
 }
 
 /// One take whose audio the policy removed.
