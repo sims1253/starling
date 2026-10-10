@@ -1933,6 +1933,56 @@ static void test_pump_commit_without_new_audio_reuses_running_preview() {
     }
 }
 
+static void test_pump_next_take_audio_does_not_preempt_reusable_preview() {
+    // A commit with no newer audio, then audio for the next take that would
+    // complete this take's window: the preview still answers the final.
+    PumpFixture fx;
+    std::atomic<int> previews{0};
+    std::atomic<int> engine{0};
+    std::atomic<bool> fired{false};
+    std::mutex gate_mu;
+    std::condition_variable gate_cv;
+    bool release = false;
+    fx.session.set_transcribe_fn([&](const float*, int64_t n)
+                                     -> std::optional<std::string> {
+        engine.fetch_add(1);
+        if (std::strcmp(fx.session.chunker()->call_kind(), "preview") == 0
+            && previews.fetch_add(1) == 0) {
+            std::unique_lock<std::mutex> lk(gate_mu);
+            while (!release) {
+                if (starling::ggml::call_abort_requested()) {
+                    fired = true;
+                    return std::nullopt;
+                }
+                gate_cv.wait_for(lk, std::chrono::milliseconds(1));
+            }
+        }
+        return std::string("w") + std::to_string(n);
+    });
+    StreamPump::Options opt;
+    opt.trace = true;
+    StreamPump pump(fx.session, opt, fx.sender());
+    pump.push_audio(pcm_for_range(0, 9600));
+    wait_until(previews, 1);
+    pump.push_commit();
+    pump.push_audio(pcm_for_range(0, 6400));  // the next take
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    {
+        std::lock_guard<std::mutex> lk(gate_mu);
+        release = true;
+    }
+    gate_cv.notify_all();
+    const size_t fin = fx.wait_for("\"type\":\"final\"");
+    CHECK(fin != SIZE_MAX);
+    pump.drain();
+    CHECK(!fired.load());
+    std::lock_guard<std::mutex> lk(fx.mu);
+    if (fin != SIZE_MAX) {
+        CHECK(fx.sent[fin].find("\"text\":\"w9600\"") != std::string::npos);
+        CHECK(fx.sent[fin].find("\"path\":\"reused\"") != std::string::npos);
+    }
+}
+
 static void test_pump_window_audio_preempts_running_preview() {
     // Audio that completes a window queues behind a running preview: the
     // preview is cancelled and the window commits, with no audio lost.
@@ -2356,6 +2406,7 @@ int main() {
     test_pump_preview_finishing_after_preempt_is_discarded();
     test_pump_late_preempt_without_checkpoint_is_discarded();
     test_pump_frame_samples_follow_the_decoded_audio();
+    test_pump_next_take_audio_does_not_preempt_reusable_preview();
     test_pump_window_audio_preempts_running_preview();
     test_pump_reset_preempts_running_preview();
     test_pump_empty_commit_reports_committed_stop();

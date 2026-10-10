@@ -1220,10 +1220,14 @@ def _frame_samples(data: bytes) -> int:
         return len(data) // 2
     try:
         with wave.open(io.BytesIO(data), "rb") as wf:
-            frames, rate = wf.getnframes(), wf.getframerate()
+            width, channels, rate = wf.getsampwidth(), wf.getnchannels(), wf.getframerate()
+            # The frames actually present: a header may claim more.
+            payload = len(wf.readframes(wf.getnframes()))
     except (wave.Error, EOFError, ValueError):
         return 0
-    return math.ceil(frames * SAMPLE_RATE / rate) if rate > 0 else 0
+    if width not in (1, 2, 4) or rate <= 0:  # _wav_bytes_to_float32 refuses it
+        return 0
+    return math.ceil(payload // (width * channels) * SAMPLE_RATE / rate)
 
 
 def _pcm16_bytes_to_float32(data: bytes) -> np.ndarray:

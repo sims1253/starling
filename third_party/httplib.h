@@ -4258,6 +4258,11 @@ public:
   bool send(const char *data, size_t len);
   void close(CloseStatus status = CloseStatus::Normal,
              const std::string &reason = "");
+  // [starling] Abort the connection from any thread without a close
+  // handshake: marks it closed and shuts the socket down, so a read in
+  // progress on another thread returns Fail. Unlike close(), it starts no
+  // second reader on the stream.
+  void shutdown_transport();
   const Request &request() const;
   bool is_open() const;
 
@@ -21484,6 +21489,12 @@ inline void WebSocket::start_heartbeat() {
 inline const Request &WebSocket::request() const { return req_; }
 
 inline bool WebSocket::is_open() const { return !closed_; }
+
+inline void WebSocket::shutdown_transport() {
+  closed_ = true;
+  ping_cv_.notify_all();
+  detail::shutdown_socket(strm_.socket());
+}
 
 // WebSocketClient implementation
 inline WebSocketClient::WebSocketClient(

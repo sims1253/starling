@@ -482,6 +482,11 @@ def test_frame_samples_follow_the_decoded_audio():
     assert S._frame_samples(wav(16000, 2, 2, 3200)) == 3200        # 0.2 s stereo PCM16
     assert S._frame_samples(wav(8000, 1, 2, 1600)) == 3200         # resampled to 16 kHz
     assert S._frame_samples(b"RIFF\x00\x00\x00\x00WAVEjunk") == 0  # refused
+    # A header claiming 192,000 frames over a 1,600-frame payload counts
+    # what is there.
+    full = wav(16000, 1, 2, 1600)
+    claim = full[:40] + (192000 * 2).to_bytes(4, "little") + full[44:]
+    assert S._frame_samples(claim) == 1600
 
 
 def test_preempt_event_latches_its_predicate():

@@ -291,14 +291,12 @@ def _aggregate(runs: list[dict]) -> dict:
             "first_partial_missing": missing,
             "first_partial_wall_s_median": med(firsts) if not missing else None,
             "first_partial_wall_s_max": max(firsts) if firsts and not missing else None,
-            "partial_age_ms_p50_median": med([r["partial_age_ms"]["p50"] for r in ok
-                                              if r["partial_age_ms"]["p50"] is not None]),
-            "partial_age_ms_p95_median": med([r["partial_age_ms"]["p95"] for r in ok
-                                              if r["partial_age_ms"]["p95"] is not None]),
-            "partial_age_ms_max": max([r["partial_age_ms"]["max"] for r in ok
-                                       if r["partial_age_ms"]["max"] is not None], default=None),
-            "backlog_s_max": max([r["backlog_s"]["max"] for r in ok
-                                  if r["backlog_s"]["max"] is not None], default=None),
+            # A run without age/backlog measurements (no partial carried
+            # `covered_s`) leaves these missing instead of being skipped.
+            "partial_age_ms_p50_median": med_all([r["partial_age_ms"]["p50"] for r in ok]),
+            "partial_age_ms_p95_median": med_all([r["partial_age_ms"]["p95"] for r in ok]),
+            "partial_age_ms_max": max_all([r["partial_age_ms"]["max"] for r in ok]),
+            "backlog_s_max": max_all([r["backlog_s"]["max"] for r in ok]),
             "revisions_per_min_median": med([r["revisions_per_min"] for r in ok]),
             "stable_violations_total": sum(r["stable_violations"] for r in ok),
             "engine_audio_per_audio_s_median":

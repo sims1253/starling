@@ -190,8 +190,10 @@ bool StreamPump::preempt_preview() {
     // and the session's exact-tail reuse turns it into the final.
     if (pending_commits_ > 0 && samples_before_commit_ > 0) return true;
     // Queued audio that completes a window: the window commit is required
-    // work and supersedes the preview.
-    return to_window >= 0 && pending_samples_ > 0 && pending_samples_ >= to_window;
+    // work and supersedes the preview. Only this take's audio counts: what
+    // follows a queued commit belongs to the next take.
+    const int64_t take_audio = pending_commits_ > 0 ? samples_before_commit_ : pending_samples_;
+    return to_window >= 0 && take_audio > 0 && take_audio >= to_window;
 }
 
 void StreamPump::run() {

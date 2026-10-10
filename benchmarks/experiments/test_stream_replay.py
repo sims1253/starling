@@ -100,6 +100,23 @@ class TakeMetricsTest(unittest.TestCase):
         self.assertIsNone(agg["engine_audio_per_audio_s_median"])
         self.assertIsNone(agg["stop_engine_audio_s_max"])
 
+    def test_missing_partial_age_is_missing_not_skipped(self):
+        with_age = _log(
+            partials=[(1.2, {"text": "hi", "stable_words": 0, "trace": {"covered_s": 1.0}})],
+            final=(4.4, {"text": "hi", "duration_s": 4.0, "trace": FINAL_TRACE}))
+        without = _log(
+            partials=[(1.2, {"text": "hi", "stable_words": 0})],
+            final=(4.4, {"text": "hi", "duration_s": 4.0, "trace": FINAL_TRACE}))
+        runs = []
+        for log in (with_age, without):
+            m = sr.take_metrics(log, "hi", "hi")
+            m.update({"take": "medium"})
+            runs.append(m)
+        agg = sr._aggregate(runs)["medium"]
+        self.assertIsNone(agg["partial_age_ms_p95_median"])
+        self.assertIsNone(agg["backlog_s_max"])
+        self.assertIsNotNone(sr._aggregate(runs[:1])["medium"]["partial_age_ms_p95_median"])
+
     def test_preempted_previews_count_as_engine_wall_time(self):
         trace = {**FINAL_TRACE, "totals": {**FINAL_TRACE["totals"], "preempted": 2,
                                            "preempted_ms": 400.0}}

@@ -1050,11 +1050,11 @@ int main(int argc, char** argv) {
                 session.set_preview_policy(min_s, interval_s);
             }
             // A failed send (the peer stopped reading past the write
-            // timeout) closes the connection: a read in progress returns,
-            // as when the heartbeat closes a dead peer. The pump stops too.
+            // timeout) aborts the connection: the socket is shut down, so a
+            // read in progress on this thread returns. The pump stops too.
             serve::StreamPump pump(session, opt, [&ws](const std::string& m) {
                 if (ws.send(m)) return true;
-                ws.close(httplib::ws::CloseStatus::GoingAway, "send failed");
+                ws.shutdown_transport();
                 return false;
             });
             std::fprintf(stderr, "[starling-serve] WS /stream client connected\n");
