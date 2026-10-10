@@ -74,5 +74,26 @@ class RunMetricsTest(unittest.TestCase):
         self.assertEqual(agg["app_cpu_per_audio_s_median"], 1.5)
 
 
+class MergeTest(unittest.TestCase):
+    def _part(self, label, **provenance):
+        base = {"client": "android-on-device", "device": {"model": "Pixel 10 Pro"}, "model": "m.gguf",
+                "cadence": {"min_partial_seconds": 1.0, "partial_interval_seconds": 1.0},
+                "warmup": True, "batch": True, "cool_to_c": 33.0, "workload_manifest_sha256": "x",
+                "repo_revision": "r", "repeats": [{"repeat": 0}]}
+        base.update(provenance)
+        run = asr.run_metrics(_trace(), {"reference": "hello there you"})
+        return {"label": label, "provenance": base, "runs": [run]}
+
+    def test_parts_of_one_configuration_merge_with_renumbered_repeats(self):
+        merged = asr.merge("all", [self._part("a"), self._part("b")])
+        self.assertEqual([r["repeat"] for r in merged["runs"]], [0, 1])
+        self.assertEqual(merged["aggregate"]["short"]["runs"], 2)
+
+    def test_parts_from_another_device_or_batch_setting_are_refused(self):
+        for change in ({"device": {"model": "Pixel 8"}}, {"batch": False}):
+            with self.assertRaises(asr.RunnerError):
+                asr.merge("all", [self._part("a"), self._part("b", **change)])
+
+
 if __name__ == "__main__":
     unittest.main()
