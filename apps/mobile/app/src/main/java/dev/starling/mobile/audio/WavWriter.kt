@@ -2,6 +2,7 @@ package dev.starling.mobile.audio
 
 import dev.starling.mobile.storage.Durability
 import java.io.File
+import java.io.IOException
 import java.io.RandomAccessFile
 import java.nio.ByteBuffer
 import java.util.concurrent.ConcurrentHashMap
@@ -88,16 +89,30 @@ internal class WavWriter(
         confirmed
     }
 
+    /**
+     * Finalizes and closes the WAV. Throws [IOException] when storage holds
+     * fewer payload bytes than were written: the file is never extended
+     * (zeros would pass for recorded silence), the header names the whole
+     * samples on storage, and the capture settles as one that lost audio
+     * (RecordingStore.salvageCapture marks it recovered, with this reason).
+     */
     fun finish() = synchronized(headerLock) {
         if (closed) return
         check(dataBytes <= maxDataBytes) { EXCEEDED_MESSAGE }
+        val payload: Long
         try {
+            val stored = output.length() - WAV_HEADER_SIZE
             // A write the disk refused part-way (ENOSPC) may have left a torn
             // chunk past the counted payload; the WAV ends at the last whole one.
-            if (output.length() != WAV_HEADER_SIZE + dataBytes) output.setLength(WAV_HEADER_SIZE + dataBytes)
+            payload = if (stored >= dataBytes) {
+                dataBytes
+            } else {
+                stored.coerceAtLeast(0) / BYTES_PER_SAMPLE * BYTES_PER_SAMPLE
+            }
+            if (output.length() != WAV_HEADER_SIZE + payload) output.setLength(WAV_HEADER_SIZE + payload)
             output.fd.sync()
             output.seek(0)
-            output.write(header(dataBytes))
+            output.write(header(payload))
             output.fd.sync()
         } finally {
             closed = true
@@ -107,6 +122,7 @@ internal class WavWriter(
                 open.remove(file.absolutePath)
             }
         }
+        if (payload < dataBytes) throw IOException(SHORT_MESSAGE)
     }
 
     companion object {
@@ -123,6 +139,7 @@ internal class WavWriter(
          */
         const val MAX_DATA_BYTES: Long = Int.MAX_VALUE.toLong() - (WAV_HEADER_SIZE - 8)
         private const val EXCEEDED_MESSAGE = "The recording exceeded the maximum WAV size"
+        internal const val SHORT_MESSAGE = "Part of the recording did not reach storage"
 
         private val open: MutableSet<String> = ConcurrentHashMap.newKeySet()
 

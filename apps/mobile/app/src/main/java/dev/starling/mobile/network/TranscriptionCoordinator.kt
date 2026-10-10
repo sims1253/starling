@@ -176,17 +176,11 @@ class TranscriptionCoordinator(
         val result = if (injected != null) {
             InferenceResult.Failure(injected, false)
         } else {
-            try {
-                store.withRequestAudio(queued.id) { audioFile ->
-                    when (config.engine) {
-                        TranscriptionEngine.ON_DEVICE -> onDevice.transcribe(audioFile, config)
-                        TranscriptionEngine.REMOTE -> client.transcribe(audioFile, config)
-                    }
+            transcribeStoredAudio(store, queued.id) { audioFile ->
+                when (config.engine) {
+                    TranscriptionEngine.ON_DEVICE -> onDevice.transcribe(audioFile, config)
+                    TranscriptionEngine.REMOTE -> client.transcribe(audioFile, config)
                 }
-            } catch (exception: IOException) {
-                // Missing, removed or damaged audio fails this attempt like
-                // any other failure; the row says why.
-                InferenceResult.Failure(exception.message ?: "The recording audio could not be read", false)
             }
         }
         return when (result) {
@@ -267,4 +261,26 @@ class TranscriptionCoordinator(
         internal fun streamingEligible(config: BackendConfig): Boolean =
             config.engine == TranscriptionEngine.REMOTE
     }
+}
+
+/**
+ * One attempt of [transcribe] on the take's request audio
+ * (RecordingStore.withRequestAudio). Missing, removed or damaged audio
+ * fails the attempt as not retryable (the row says why); an I/O failure of
+ * the engine or the network is retryable like any other transient one.
+ */
+internal fun transcribeStoredAudio(
+    store: RecordingStore,
+    id: String,
+    transcribe: (File) -> InferenceResult,
+): InferenceResult = try {
+    store.withRequestAudio(id) { audioFile ->
+        try {
+            transcribe(audioFile)
+        } catch (exception: IOException) {
+            InferenceResult.Failure(exception.message ?: "The transcription request failed", true)
+        }
+    }
+} catch (exception: IOException) {
+    InferenceResult.Failure(exception.message ?: "The recording audio could not be read", false)
 }

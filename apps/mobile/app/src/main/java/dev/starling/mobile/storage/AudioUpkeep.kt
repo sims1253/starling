@@ -49,7 +49,11 @@ class AudioUpkeep(
 
     private val queued = AtomicBoolean(false)
 
-    // Only touched on the executor's (single) thread.
+    // Passes run one at a time, whichever thread calls: a scheduled pass and
+    // a direct [runPass] never overlap.
+    private val passLock = Any()
+
+    // Only touched under [passLock].
     private val compressionFailures = HashMap<String, Int>()
 
     /** Queues a pass unless one is already waiting. */
@@ -61,9 +65,9 @@ class AudioUpkeep(
         }
     }
 
-    /** One pass, on the calling thread. */
-    fun runPass(): Report {
-        if (recording()) return Report(paused = true)
+    /** One pass, on the calling thread; waits for a pass another thread runs. */
+    fun runPass(): Report = synchronized(passLock) {
+        if (recording()) return@synchronized Report(paused = true)
         var compressed = 0
         var saved = 0L
         var failures = 0
@@ -98,7 +102,7 @@ class AudioUpkeep(
             lastReport = report
             onReport?.invoke(report)
         }
-        return report
+        report
     }
 
     companion object {

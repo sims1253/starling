@@ -443,7 +443,7 @@ class AudioCapture(
         val buffer = ByteArray(bufferSize)
         var bytesWritten = 0L
         try {
-            while (!stopRequested && !lowDisk.raised) {
+            while (!stopRequested && !lowDisk.endIfRaised(token)) {
                 val count = audioRecord.read(buffer, buffer.size)
                 when {
                     count > 0 -> {
@@ -476,7 +476,7 @@ class AudioCapture(
             if (DiskWatch.isOutOfSpace(exception)) {
                 // The disk filled between checks: end like a low-space stop.
                 // finish() trims a torn chunk, so the WAV stays complete.
-                lowDisk.raise(token)
+                lowDisk.endIfRaised(token, outOfSpace = true)
             } else if (!stopRequested) {
                 synchronized(lock) {
                     workerError = exception.message ?: "Microphone capture failed"

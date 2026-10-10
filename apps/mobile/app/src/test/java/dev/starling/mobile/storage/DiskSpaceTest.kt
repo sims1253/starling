@@ -182,6 +182,30 @@ class DiskSpaceTest {
     }
 
     @Test
+    fun aStopAfterTheWorkerDecidedToEndForLowDiskKeepsTheReason() {
+        val stop = LowDiskStop()
+        // The watch raised and the worker latched its exit before the user's stop.
+        val watched = stop.begin()
+        assertFalse(stop.endIfRaised(watched))
+        assertTrue(stop.raise(watched))
+        assertTrue(stop.endIfRaised(watched))
+        stop.cancel(watched)
+        assertTrue(stop.raised)
+        // A write failed for want of space, then the stop came.
+        val full = stop.begin()
+        assertTrue(stop.endIfRaised(full, outOfSpace = true))
+        stop.cancel(full)
+        assertTrue(stop.raised)
+        // The stop came first: the worker no longer ends for low disk.
+        val stopped = stop.begin()
+        assertTrue(stop.raise(stopped))
+        stop.cancel(stopped)
+        assertFalse(stop.endIfRaised(stopped))
+        assertFalse(stop.endIfRaised(stopped, outOfSpace = true))
+        assertFalse(stop.raised)
+    }
+
+    @Test
     fun anExplicitStopIsNeverALowDiskStop() {
         val stop = LowDiskStop()
         // The watch raised, and the user stopped before the take acted on it.

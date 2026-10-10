@@ -364,13 +364,16 @@ class RecordingStore internal constructor(
         StoredAudio(FileInputStream(flacFile(id)), flac = true)
     }
 
-    /** The steps of [compressAudio] that [compressionHook] sees. */
+    /** The steps of [compressAudio] and [settleAtRest] that [compressionHook] sees. */
     enum class CompressionStep {
         /** The FLAC is written, synced and verified as a temporary; nothing is published. */
         ENCODED,
 
         /** The FLAC is renamed into place and the directory synced; the WAV is still there. */
         PUBLISHED,
+
+        /** [settleAtRest] compared a take's FLAC with its WAV, off the lock; nothing is unlinked. */
+        SETTLE_VERIFIED,
     }
 
     sealed interface Compression {
@@ -730,8 +733,10 @@ class RecordingStore internal constructor(
             if (stop()) break
             val wav = wavFile(id)
             val flac = flacFile(id)
+            val compared = identity(wav) to identity(flac)
             val same = runCatching { verifyAgainstWav(flac, wav) }.isSuccess &&
                 runCatching { hasOwnHeader(wav) }.getOrDefault(false)
+            compressionHook?.invoke(CompressionStep.SETTLE_VERIFIED)
             synchronized(lock) {
                 val recording = runCatching { get(id) }.getOrNull()
                 when {
@@ -742,6 +747,10 @@ class RecordingStore internal constructor(
                     // A delete or a retention removal settled it meanwhile.
                     !wav.isFile || !flac.isFile -> unsettled -= id
                     (pins[id] ?: 0) > 0 || stop() -> Unit
+                    // Nothing in the store rewrites a take with both files, but
+                    // the comparison ran off the lock: files that changed since
+                    // are compared again by the next call.
+                    compared != (identity(wav) to identity(flac)) -> Unit
                     else -> {
                         val settled = runCatching {
                             if (same) {
@@ -762,6 +771,9 @@ class RecordingStore internal constructor(
         }
         return synchronized(lock) { unsettled.size }
     }
+
+    /** A file's length and modification time: what [settleAtRest] compared. */
+    private fun identity(file: File): Pair<Long, Long> = file.length() to file.lastModified()
 
     /**
      * Throws unless [flac] is exactly [wav]'s audio as the request path will

@@ -126,6 +126,37 @@ class RecordingStoreAtRestTest {
     }
 
     @Test
+    fun aFlacThatChangesAfterTheComparisonIsComparedAgainBeforeAnyUnlink() {
+        val store = RecordingStore(storeDir())
+        val take = committedTake(store)
+        val expected = requestAudio(store, take.id)
+        store.compressionHook = { step -> if (step == RecordingStore.CompressionStep.PUBLISHED) throw IllegalStateException("killed") }
+        try {
+            store.compressAudio(take.id)
+            fail("the injected crash did not happen")
+        } catch (_: IllegalStateException) {
+        }
+        // The FLAC matched its WAV when compared, and became other audio before the unlink.
+        store.compressionHook = { step ->
+            if (step == RecordingStore.CompressionStep.SETTLE_VERIFIED) {
+                FileOutputStream(flac(take.id)).use { output ->
+                    Flac.encode(ByteArray(speech.size).inputStream(), speech.size / 2L, 16_000, output)
+                }
+            }
+        }
+
+        assertEquals(1, store.settleAtRest())
+        assertTrue(wav(take.id).isFile && flac(take.id).isFile)
+
+        // The next call compares again: the WAV, the original, stays.
+        store.compressionHook = null
+        assertEquals(0, store.settleAtRest())
+        assertTrue(wav(take.id).isFile)
+        assertFalse(flac(take.id).exists())
+        assertArrayEquals(expected, requestAudio(store, take.id))
+    }
+
+    @Test
     fun settlingPausesForARecordingAndADeleteNeverLeavesAnUnsettledFlacAlone() {
         var refuseFlac = false
         val store = RecordingStore(

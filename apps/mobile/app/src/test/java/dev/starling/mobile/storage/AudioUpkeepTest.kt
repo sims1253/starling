@@ -14,8 +14,10 @@ import org.junit.Test
 import org.junit.rules.TemporaryFolder
 import java.io.File
 import java.io.IOException
+import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.thread
 
 /** #342: the upkeep pass and the storage settings behind it. */
@@ -92,6 +94,43 @@ class AudioUpkeepTest {
         assertEquals(0, upkeep.runPass().failures)
         assertTrue(File(folder.root, "recordings/${take.id}.wav").isFile)
         assertEquals(listOf(take.id), store.compressionCandidates())
+    }
+
+    @Test
+    fun passesFromSeveralThreadsRunOneAtATime() {
+        val store = store()
+        take(store, ageDays = 3.0)
+        take(store, ageDays = 2.0)
+        val inPass = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        store.compressionHook = { step ->
+            if (step == RecordingStore.CompressionStep.ENCODED && inPass.count > 0) {
+                inPass.countDown()
+                release.await(10, TimeUnit.SECONDS)
+            }
+        }
+        val second = AtomicReference<Thread>()
+        val secondEntered = CountDownLatch(1)
+        val upkeep = AudioUpkeep(store, policyOff, Runnable::run, recording = {
+            if (Thread.currentThread() === second.get()) secondEntered.countDown()
+            false
+        })
+        val reports = ConcurrentLinkedQueue<AudioUpkeep.Report>()
+        val first = thread { reports += upkeep.runPass() }
+        assertTrue(inPass.await(10, TimeUnit.SECONDS))
+        second.set(thread(start = false) { reports += upkeep.runPass() })
+        second.get().start()
+
+        // The second caller waits for the pass that is compressing.
+        assertFalse(secondEntered.await(300, TimeUnit.MILLISECONDS))
+        release.countDown()
+        first.join(10_000)
+        second.get().join(10_000)
+
+        assertEquals(0, secondEntered.count)
+        assertEquals(2, reports.size)
+        assertEquals(2, reports.sumOf { it.compressed })
+        assertEquals(0, reports.sumOf { it.failures })
     }
 
     @Test

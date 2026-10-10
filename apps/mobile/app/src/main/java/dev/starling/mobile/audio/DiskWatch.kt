@@ -78,7 +78,7 @@ internal class LowDiskStop {
      * An explicit stop of the still running take [token]: it closes the
      * take and withdraws a raise not yet acted on, so the stop is never
      * reported as a low-disk one. A take that already ended by itself
-     * (closed by its worker) keeps its reason.
+     * (closed by its worker, or latched by [endIfRaised]) keeps its reason.
      */
     @Synchronized
     fun cancel(token: Long) {
@@ -86,6 +86,21 @@ internal class LowDiskStop {
             open = false
             raised = false
         }
+    }
+
+    /**
+     * The worker of the running take [token] asks whether to end it for low
+     * disk: true when a raise is pending ([outOfSpace]: a write just failed
+     * for want of space, which raises it here). The take closes in the same
+     * step, so a [cancel] that comes after this decision keeps the reason.
+     */
+    @Synchronized
+    fun endIfRaised(token: Long, outOfSpace: Boolean = false): Boolean {
+        if (!isOpen(token)) return false
+        if (outOfSpace) raised = true
+        if (!raised) return false
+        open = false
+        return true
     }
 
     @Synchronized
