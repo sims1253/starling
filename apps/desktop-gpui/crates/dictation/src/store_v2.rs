@@ -2420,6 +2420,9 @@ impl StoreV2 {
             let age_cutoff = limits
                 .max_age_days
                 .map(|days| iso_utc(now - time::Duration::days(i64::from(days))));
+            // Read before the walk: a later change means another
+            // connection committed since, and the walk's view is stale.
+            let mut seen_version = self.data_version()?;
             let rows: Vec<(String, String)> = {
                 let mut stmt = self.conn.prepare(
                     "SELECT id, created_utc FROM captures WHERE retention_class = ?1
@@ -2429,6 +2432,8 @@ impl StoreV2 {
                 rows.collect::<Result<_, _>>()?
             };
             let mut kept_bytes = 0u64;
+            // The takes `kept_bytes` counts, newest first.
+            let mut counted: Vec<(String, u64)> = Vec::new();
             for (id, created_utc) in rows {
                 if !is_safe_path_component(&id) || self.audio_retired_utc(&id)?.is_some() {
                     continue;
@@ -2438,6 +2443,7 @@ impl StoreV2 {
                     continue;
                 }
                 kept_bytes += bytes;
+                counted.push((id.clone(), bytes));
                 let due = if age_cutoff.as_ref().is_some_and(|cutoff| created_utc < *cutoff) {
                     Some(RetireReason::Age)
                 } else if limits.max_total_bytes.is_some_and(|max| kept_bytes > max) {
@@ -2456,20 +2462,41 @@ impl StoreV2 {
                     report.policy_changed = true;
                     return Ok(report);
                 }
-                // Moved to another class (or deleted) since the walk read
-                // it: those limits decide, on their own walk.
-                let still_here = self
-                    .conn
-                    .query_row(
-                        "SELECT 1 FROM captures WHERE id = ?1 AND retention_class = ?2",
-                        params![id, class],
-                        |_| Ok(()),
-                    )
-                    .optional()?
-                    .is_some();
-                if !still_here {
-                    drop(tx);
-                    kept_bytes -= bytes;
+                // Another connection committed since the walk looked: takes
+                // may have moved to another class, been deleted or retired.
+                // Recount what this class still holds before deciding.
+                let version = self.data_version()?;
+                if version != seen_version {
+                    seen_version = version;
+                    let mut recounted = Vec::with_capacity(counted.len());
+                    for (counted_id, _) in counted.drain(..) {
+                        if self.in_retention_class(&counted_id, class)?
+                            && self.audio_retired_utc(&counted_id)?.is_none()
+                        {
+                            let bytes = self.audio_bytes(&counted_id);
+                            recounted.push((counted_id, bytes));
+                        }
+                    }
+                    counted = recounted;
+                    kept_bytes = counted.iter().map(|(_, bytes)| bytes).sum();
+                }
+                // Moved to another class (or deleted): those limits decide,
+                // on their own walk. Under a size limit the recount may
+                // also show the class fits now.
+                let Some(bytes) = counted
+                    .iter()
+                    .find(|(counted_id, _)| *counted_id == id)
+                    .map(|(_, bytes)| *bytes)
+                else {
+                    continue;
+                };
+                let still_due = match reason {
+                    RetireReason::Age => true,
+                    RetireReason::Size => {
+                        limits.max_total_bytes.is_some_and(|max| kept_bytes > max)
+                    }
+                };
+                if !still_due {
                     continue;
                 }
                 if let Some(hold) = self.retention_hold(&id, &created_utc, &grace_cutoff, policy)? {
@@ -2486,6 +2513,7 @@ impl StoreV2 {
                 tx.commit()?;
                 self.unlink_audio(&id)?;
                 kept_bytes -= bytes;
+                counted.retain(|(counted_id, _)| *counted_id != id);
                 report.retired_bytes += bytes;
                 report.retired.push(RetiredAudio {
                     id,
@@ -2501,6 +2529,26 @@ impl StoreV2 {
             }
         }
         Ok(report)
+    }
+
+    /// SQLite's `data_version`: it changes when another connection
+    /// commits, never for this connection's own writes.
+    fn data_version(&self) -> Result<i64, StoreV2Error> {
+        Ok(self
+            .conn
+            .query_row("PRAGMA data_version", [], |row| row.get(0))?)
+    }
+
+    fn in_retention_class(&self, id: &str, class: &str) -> Result<bool, StoreV2Error> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT 1 FROM captures WHERE id = ?1 AND retention_class = ?2",
+                params![id, class],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
     }
 
     /// [`Self::apply_live_retention_policy`] as of the current time.

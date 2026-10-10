@@ -986,3 +986,47 @@ fn a_class_change_by_a_peer_mid_run_is_respected() {
     assert!(report.retired.is_empty(), "{report:?}");
     assert_eq!(store.audio_at_rest(&id).expect("state"), AudioAtRest::Journal);
 }
+
+#[test]
+fn a_size_limit_recounts_after_a_peer_moves_a_newer_take_away() {
+    // Two old takes under a limit that fits one. While the sweep waits to
+    // retire the older, a peer moves the newer into the archival class:
+    // the class now fits, so the older keeps its audio.
+    let dir = TempDir::new().expect("tempdir");
+    let mut store = store_in(&dir);
+    let older = aged_take(&mut store, 120, 16_000);
+    let newer = aged_take(&mut store, 90, 16_000);
+    let limit = store.audio_bytes(&older).max(store.audio_bytes(&newer));
+    let peer = Connection::open(store.root().join(DB_FILE)).expect("peer");
+    peer.busy_timeout(std::time::Duration::from_secs(5))
+        .expect("busy timeout");
+    peer.execute_batch("BEGIN IMMEDIATE").expect("peer write lock");
+    peer.execute(
+        "UPDATE captures SET retention_class = ?2 WHERE id = ?1",
+        params![newer, ARCHIVAL_CLASS],
+    )
+    .expect("peer class change");
+
+    let sweeper = std::thread::spawn(move || {
+        let report = store
+            .apply_retention_policy(
+                &policy(
+                    STANDARD_CLASS,
+                    ClassLimits {
+                        max_age_days: None,
+                        max_total_bytes: Some(limit),
+                    },
+                ),
+                time::OffsetDateTime::now_utc(),
+            )
+            .expect("apply");
+        (store, report)
+    });
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    peer.execute_batch("COMMIT").expect("peer commit");
+    let (store, report) = sweeper.join().expect("sweeper");
+    assert!(report.retired.is_empty(), "{report:?}");
+    assert!(report.over_limit.is_empty(), "{report:?}");
+    assert_eq!(store.audio_at_rest(&older).expect("state"), AudioAtRest::Journal);
+    assert_eq!(store.audio_at_rest(&newer).expect("state"), AudioAtRest::Journal);
+}
