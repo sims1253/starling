@@ -87,6 +87,15 @@ sent to any processing provider.
   "insertion-boundary"`, slot `derived` in `docs.get`, persisted in
   storage v2 (`disposition: "derived"`, `sources_json.derivedFrom`). It
   never advances the document head; the requested revision is not edited.
+- A derived id is always a legal `msgId` (at most 128 bytes). When
+  `{revId}:boundary-{rules}` would be longer (a `revId` over 108 bytes
+  with `space-case`), the runtime emits
+  `{revId prefix}.{digest}:boundary-{rules}`: `digest` is the 64-bit
+  FNV-1a hash of the full unshortened id as 16 lowercase hex digits, and
+  the prefix is the first `128 - 17 - len(":boundary-{rules}")` bytes of
+  `revId`. (The runtime also bounds a rule list too long to keep whole,
+  `{prefix of the full id}.{digest}`; today's three rule lists never
+  need it.) See `delivery::derived_id`.
 - `delivery.prepare{boundary}` chooses: `adjust` (default) applies the
   rules where the target reports surrounding text; `raw` is the explicit
   bypass that delivers the requested revision unchanged; `verbatim` is a
