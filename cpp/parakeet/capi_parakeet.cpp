@@ -238,7 +238,13 @@ float * starling_ggml_parakeet_encode(void * handle, const float * pcm, int64_t 
     int Tp = 0;
     try {
         if (!c->encoder->encode(feats, (int)c->mel_const.n_mels, T_mel, enc_out, Tp)) {
-            if (err_out) *err_out = "encoder graph failed";
+            // The encoder graph is abortable (issue #357): a cancelled call
+            // is reported as such, not as a graph failure.
+            if (starling::ggml::call_abort_requested()) {
+                report_error(err_out, starling::ggml::kCallAbortedError);
+            } else if (err_out) {
+                *err_out = "encoder graph failed";
+            }
             return nullptr;
         }
     } catch (const std::exception& e) {

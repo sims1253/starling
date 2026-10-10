@@ -151,14 +151,21 @@ def replay(ws_url: str, pcm: bytes, frame_ms: float, timeout_s: float) -> dict:
             done.clear()
             commit_sent.set()
             commits.append(time.monotonic())
+            since = len(events)
             ws.send(json.dumps({"type": "commit"}))
             # A receiver that died before the commit already set (and lost)
             # `done`: fail with its cause instead of waiting for the timeout.
-            if rx_errors or not done.wait(timeout_s):
+            # One that fails only after this commit's final arrived (a server
+            # closing right after it) does not fail the run.
+            if not rx_errors:
+                done.wait(timeout_s)
+            replies = [m for _, m in events[since:] if m.get("type") in ("final", "error")
+                       and not str(m.get("message", "")).startswith("receiver: ")]
+            if not replies:
                 if rx_errors:
                     raise RunnerError(f"receiver failed: {rx_errors[0]!r}") from rx_errors[0]
                 raise RunnerError("no final within timeout")
-            last = events[-1][1] if events else {}
+            last = replies[-1] if replies else {}
             if last.get("type") == "error" and last.get("message") == "server busy" and retries < 20:
                 retries += 1
                 time.sleep(0.2)
