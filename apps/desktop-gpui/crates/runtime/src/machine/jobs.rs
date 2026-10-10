@@ -301,12 +301,17 @@ impl JobsActor {
         };
     }
 
+    /// Publishes the view before the event reaches the bus, so a client
+    /// reacting to the event never reads a snapshot behind it. Callers
+    /// settle `active`/`waiting` first, so the published counts agree
+    /// with the job's new state.
     fn emit(&mut self, job_id: &str, event: Event) {
         let Some(job) = self.jobs.get_mut(job_id) else {
             return;
         };
         match job.core.emit_event(event.type_name(), None) {
             Ok(_) => {
+                self.publish_view();
                 let _ = self.bus.emit(event, Some(job_id));
             }
             Err(violation) => job.core.record_violation(violation),
@@ -562,11 +567,14 @@ impl JobsActor {
         // parking that follows is ordinary backpressure the caller
         // unwinds by draining.
         let _ = reply.try_send(Ok(Receipt::Accepted));
+        if rejection.is_none() {
+            self.waiting.push_back(job_id.clone());
+        }
         if resolved {
+            self.publish_view();
             let _ = self.bus.emit(outcome_event, Some(&job_id));
         }
         if rejection.is_none() {
-            self.waiting.push_back(job_id);
             self.try_dispatch();
         } else {
             // Rejected at admission: `Rejected` is terminal, so the
@@ -862,6 +870,7 @@ impl JobsActor {
     /// spawn later), dropped from `active`, and retired. One helper so
     /// the two dispatch paths cannot drift apart.
     fn worker_spawn_failed(&mut self, job_id: &str) {
+        self.active.remove(job_id);
         self.emit(
             job_id,
             Event::JobsFailed {
@@ -869,7 +878,6 @@ impl JobsActor {
                 retryable: true,
             },
         );
-        self.active.remove(job_id);
         self.retire(job_id);
     }
 
@@ -885,6 +893,7 @@ impl JobsActor {
         // its entry exists; a miss is an internal fault and fails the job
         // rather than running it with a cancel token nobody can trip.
         let Some(cancel) = self.jobs.get(&job_id).map(|job| job.cancel.clone()) else {
+            self.active.remove(&job_id);
             self.emit(
                 &job_id,
                 Event::JobsFailed {
@@ -892,7 +901,6 @@ impl JobsActor {
                     retryable: false,
                 },
             );
-            self.active.remove(&job_id);
             self.retire(&job_id);
             return;
         };
@@ -967,6 +975,7 @@ impl JobsActor {
                     self.active.remove(&job_id);
                     return;
                 }
+                self.active.remove(&job_id);
                 self.emit(
                     &job_id,
                     Event::JobsCompleted(CompletionData {
@@ -977,7 +986,6 @@ impl JobsActor {
                         completion_evidence,
                     }),
                 );
-                self.active.remove(&job_id);
                 self.retire(&job_id);
                 self.try_dispatch();
             }
@@ -986,8 +994,8 @@ impl JobsActor {
                     self.active.remove(&job_id);
                     return;
                 }
-                self.emit(&job_id, Event::JobsFailed { reason, retryable });
                 self.active.remove(&job_id);
+                self.emit(&job_id, Event::JobsFailed { reason, retryable });
                 self.retire(&job_id);
                 self.try_dispatch();
             }
@@ -1014,8 +1022,8 @@ impl JobsActor {
                         retryable: false,
                     },
                 };
-                self.emit(&job_id, event);
                 self.active.remove(&job_id);
+                self.emit(&job_id, event);
                 self.retire(&job_id);
                 self.try_dispatch();
             }
@@ -1027,6 +1035,7 @@ impl JobsActor {
                 // The `Loading` failure, reported from the worker: the
                 // take's audio could not be prepared for recognition —
                 // a non-retryable job failure.
+                self.active.remove(&job_id);
                 self.emit(
                     &job_id,
                     Event::JobsFailed {
@@ -1034,7 +1043,6 @@ impl JobsActor {
                         retryable: false,
                     },
                 );
-                self.active.remove(&job_id);
                 self.retire(&job_id);
                 self.try_dispatch();
             }

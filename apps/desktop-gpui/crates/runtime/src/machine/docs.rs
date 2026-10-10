@@ -399,13 +399,20 @@ impl DocsActor {
                     unreachable!("recv has no timeout")
                 }
             }
-            *self.view.lock().expect("docs view lock") = self.core.view();
+            self.publish_view();
         }
     }
 
+    fn publish_view(&self) {
+        *self.view.lock().expect("docs view lock") = self.core.view();
+    }
+
+    /// Publishes the view before the event reaches the bus, so a client
+    /// reacting to the event never reads a snapshot behind it.
     fn emit(&mut self, event: Event, corr: &str) {
         match self.core.emit_event(event.type_name(), None) {
             Ok(_) => {
+                self.publish_view();
                 let _ = self.bus.emit(event, Some(corr));
             }
             Err(violation) => self.core.record_violation(violation),
@@ -521,6 +528,7 @@ impl DocsActor {
                         // transition recorded by the core), then deliver.
                         match self.core.resolve_outcome("docs.turnAppended", Some(&corr)) {
                             Ok(_) => {
+                                self.publish_view();
                                 let _ = self.bus.emit(
                                     Event::DocsTurnAppended { turn_seq },
                                     Some(&corr),

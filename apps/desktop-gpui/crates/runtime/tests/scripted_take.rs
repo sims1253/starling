@@ -3323,3 +3323,156 @@ fn stop_and_abort_naming_another_take_are_refused() {
         .expect("an uncorrelated stop is accepted");
     runtime.shutdown();
 }
+
+/// Receives events until `want` arrives, checking each one against the
+/// projection the moment it is delivered; returns the projection read
+/// on `want`'s arrival.
+fn until_checked(
+    events: &EventSub,
+    client: &RuntimeClient,
+    want: &str,
+) -> starling_runtime::RuntimeSnapshot {
+    let start = Instant::now();
+    loop {
+        match events.recv_timeout(Duration::from_millis(20)) {
+            Ok(message) => {
+                let snapshot = assert_snapshot_shows(client, &message);
+                if message.type_name() == want {
+                    return snapshot;
+                }
+            }
+            Err(starling_runtime::channel::RecvError::Timeout) => {
+                assert!(start.elapsed() < Duration::from_secs(5), "timed out waiting for {want}");
+            }
+            Err(other) => panic!("event stream error: {other:?}"),
+        }
+    }
+}
+
+/// The projection read right after `message` arrived must already show
+/// the state the event moved its machine into (or a runtime-internal
+/// successor of it). Only events whose state holds until the test's next
+/// command are checked.
+fn assert_snapshot_shows(
+    client: &RuntimeClient,
+    message: &EventMessage,
+) -> starling_runtime::RuntimeSnapshot {
+    let snapshot = client.snapshot();
+    let (machine, state, expected) = match message.type_name() {
+        "context.targetSnapshot" => ("context", &snapshot.context.state, &["SnapshotTaken"][..]),
+        "mode.decision" => ("context", &snapshot.context.state, &["ModeDecided"][..]),
+        "mode.routeFrozen" => ("context", &snapshot.context.state, &["RouteFrozen"][..]),
+        // The frozen set trails `mode.routeFrozen` (it authorizes job
+        // admission, so it lands only after the event), but capture
+        // waits for the freeze before it starts.
+        "capture.started" => {
+            assert!(
+                !snapshot.frozen_routes.is_empty(),
+                "capture.started delivered before the frozen route was recorded"
+            );
+            return snapshot;
+        }
+        "capture.stopped" => ("capture", &snapshot.capture.state, &["Persisted"][..]),
+        "jobs.completed" => {
+            assert_eq!(snapshot.jobs.active, 0, "jobs.completed delivered with the job still active");
+            ("jobs", &snapshot.jobs.state, &["Completed"][..])
+        }
+        // `Committed → Steady` is runtime-internal, right after the emit
+        // (so `Steady` alone cannot tell a fresh read from a stale one:
+        // the caller also checks the transition count).
+        "docs.headUpdated" => ("docs", &snapshot.docs.state, &["Committed", "Steady"][..]),
+        _ => return snapshot,
+    };
+    assert!(
+        expected.contains(&state.as_str()),
+        "{} delivered while the {machine} snapshot still read {state}",
+        message.type_name()
+    );
+    snapshot
+}
+
+/// The projection never lags an event already delivered: every machine
+/// publishes its view before the event reaches the bus, so a client
+/// reacting to an event never reads a pre-event snapshot (the CI flake
+/// where `capture.stopped` arrived and the snapshot still read
+/// `Draining`). Many takes, each event checked on arrival, so a
+/// publish-after-emit regression shows up as a stale read.
+#[test]
+fn the_snapshot_never_lags_an_event_already_delivered() {
+    const TAKES: u64 = 25;
+    let source = FakeCaptureSource::new(vec![]);
+    let store = InMemoryCaptureStore::new();
+    let provider = starling_runtime::provider::FakeProvider::new(
+        (0..TAKES).map(|_| FakeJob::completes_with("Hello.")).collect(),
+    );
+    let config = test_config(
+        std::sync::Arc::clone(&source),
+        provider,
+        store,
+        JobLimits {
+            max_queued: 2,
+            max_concurrent: 1,
+            per_route: vec![],
+        },
+    );
+    let (runtime, client) = Runtime::start(config);
+    let events = client.subscribe();
+
+    for i in 0..TAKES {
+        let take = format!("take_{i}");
+        // The previous take's route release (`RouteFrozen → Released`)
+        // reaches context after `capture.stopped`; a new snapshot is only
+        // legal once it has.
+        if i > 0 {
+            wait_for_projection(&client, "route released", |s| s.context.state == "Released", Duration::from_secs(5));
+        }
+        client
+            .send(Some("ctx-1"), Command::ContextSnapshot { source: "vscode".into() })
+            .expect("snapshot accepted");
+        until_checked(&events, &client, "context.targetSnapshot");
+        client
+            .send(Some("ctx-1"), Command::ModeSet {
+                mode: "code-guidance".into(),
+                source: starling_runtime::protocol::Manual,
+            })
+            .expect("mode accepted");
+        until_checked(&events, &client, "mode.decision");
+
+        source.push(FakeTakeScript::clean());
+        client
+            .send(Some(&take), Command::CaptureStart { policy: "push-to-talk".into() })
+            .expect("start accepted");
+        until_checked(&events, &client, "capture.progress");
+        client
+            .send(Some(&take), Command::CaptureStop { drain: Some(true) })
+            .expect("stop accepted");
+        until_checked(&events, &client, "capture.stopped");
+
+        client
+            .send(Some(&format!("job-{i}")), Command::JobsSubmit {
+                capture_ref: take.clone(),
+                route: "local-default".into(),
+                budget: "standard".into(),
+            })
+            .expect("submit accepted");
+        until_checked(&events, &client, "jobs.completed");
+
+        wait_for_projection(&client, "docs settled", |s| s.docs.state == "Steady", Duration::from_secs(5));
+        let before = client.snapshot().docs.transitions;
+        client
+            .send(Some(&format!("up-{i}")), Command::DocsUpdateHead {
+                doc_id: "notes".into(),
+                expected_base: i,
+                new_revision: revision(i, "Hello.", &["att-1"]),
+            })
+            .expect("update accepted");
+        let on_event = until_checked(&events, &client, "docs.headUpdated");
+        // The command's commit and the event's own transition.
+        assert!(
+            on_event.docs.transitions >= before + 2,
+            "docs.headUpdated delivered while the docs snapshot still read {} transitions (was {before})",
+            on_event.docs.transitions
+        );
+    }
+    runtime.shutdown();
+}

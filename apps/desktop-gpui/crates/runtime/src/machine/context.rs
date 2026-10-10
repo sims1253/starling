@@ -215,8 +215,14 @@ impl ContextActor {
                     unreachable!("recv has no timeout")
                 }
             }
-            *self.view.lock().expect("context view lock") = self.core.view();
+            self.publish_view();
         }
+    }
+
+    /// Called before every bus emit too, so a client reacting to an
+    /// event never reads a snapshot behind it.
+    fn publish_view(&self) {
+        *self.view.lock().expect("context view lock") = self.core.view();
     }
 
     /// Snapshot/mode expiry, checked on activity: the runtime-internal
@@ -269,6 +275,7 @@ impl ContextActor {
                             // context.snapshot on this corr.
                             match self.core.resolve_outcome("context.targetSnapshot", Some(&corr)) {
                                 Ok(_) => {
+                                    self.publish_view();
                                     let _ = self.bus.emit(
                                         Event::ContextTargetSnapshot(data),
                                         Some(&corr),
@@ -319,6 +326,7 @@ impl ContextActor {
                         // The decision resolves the pending mode.set on this corr.
                         match self.core.resolve_outcome("mode.decision", Some(&corr)) {
                             Ok(_) => {
+                                self.publish_view();
                                 let _ = self.bus.emit(Event::ModeDecision(decision), Some(&corr));
                             }
                             Err(violation) => self.core.record_violation(violation),
@@ -363,6 +371,7 @@ impl ContextActor {
         let decided_at = crate::bus::now_ts();
         match self.core.emit_event("mode.routeFrozen", None) {
             Ok(_) => {
+                self.publish_view();
                 let _ = self.bus.emit(
                     Event::ModeRouteFrozen {
                         route: route.clone(),
@@ -370,6 +379,11 @@ impl ContextActor {
                     },
                     Some(take),
                 );
+                // Recorded only after the event: the frozen set also
+                // authorizes `jobs.submit`, and a job admitted on this
+                // route must never precede its `mode.routeFrozen`. The
+                // snapshot's `frozen_routes` therefore trails this event
+                // briefly; it is in place before `capture.started`.
                 self.frozen_routes
                     .lock()
                     .expect("frozen routes lock")
