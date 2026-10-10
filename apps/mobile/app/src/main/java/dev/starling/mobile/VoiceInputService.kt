@@ -31,7 +31,6 @@ import dev.starling.mobile.network.StreamSession
 import dev.starling.mobile.network.TranscriptionEngine
 import dev.starling.mobile.ui.EditorField
 import dev.starling.mobile.ui.InputTargetGuard
-import dev.starling.mobile.ui.RequestGenerationGuard
 
 /**
  * Lightweight voice keyboard. It never reads surrounding editor text. Two
@@ -66,7 +65,6 @@ class VoiceInputService : InputMethodService() {
     private val application by lazy { starlingApplication() }
     private val capture = AudioCapture()
     private val targetGuard = InputTargetGuard<InputConnection>()
-    private val requestGuard = RequestGenerationGuard()
 
     private var keyboardView: View? = null
     private var recordButton: Button? = null
@@ -203,8 +201,8 @@ class VoiceInputService : InputMethodService() {
             !preferences.getBoolean(KEY_NOTIFICATIONS_ASKED, false)
         if (!microphone || askNotifications) {
             if (askNotifications) preferences.edit().putBoolean(KEY_NOTIFICATIONS_ASKED, true).apply()
-            // A keyboard cannot show a permission dialog; the app asks and
-            // closes again, back to this field.
+            // A keyboard cannot show a permission dialog; the app asks in a
+            // task of its own and removes it again, back to this field.
             statusView?.setText(
                 if (microphone) R.string.keyboard_notification_permission else R.string.keyboard_microphone_permission,
             )
@@ -212,7 +210,7 @@ class VoiceInputService : InputMethodService() {
                 Intent(this, MainActivity::class.java)
                     .setAction(MainActivity.ACTION_REQUEST_MICROPHONE)
                     .putExtra(MainActivity.EXTRA_ASK_NOTIFICATIONS, askNotifications)
-                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_MULTIPLE_TASK),
             )
             return
         }
@@ -248,6 +246,9 @@ class VoiceInputService : InputMethodService() {
             onChunk = session?.let { streaming ->
                 AudioChunkListener { bytes, count -> streaming.onAudio(bytes, count) }
             },
+            // A microphone that ends by itself settles like Stop, which also
+            // releases the foreground hold.
+            onEnded = { if (take?.recording === recording) stopTake() },
         )
         if (error != null) {
             session?.close()
@@ -255,16 +256,15 @@ class VoiceInputService : InputMethodService() {
             statusView?.text = error
             return
         }
-        // Only a capture that really started invalidates the earlier take,
-        // whose callbacks may still be queued; it stays in the store (or is
-        // deleted there, if it was private).
-        val requestGeneration = requestGuard.begin()
+        // Only a capture that really started replaces the earlier take, whose
+        // callbacks may still be queued; it stays in the store (or is deleted
+        // there, if it was private).
         // A take still settling owns its composing region until now; the
         // new take does not, so the old region leaves the field first.
         take?.let(::clearComposingText)
         transcriptView?.visibility = View.GONE
         transcriptView?.text = null
-        take = Take(recording, requestGeneration, field, sensitive).also { started ->
+        take = Take(recording, field, sensitive).also { started ->
             started.session = session
             started.target = target
             started.liveInField = session != null && field.supportsComposing
@@ -289,8 +289,6 @@ class VoiceInputService : InputMethodService() {
     private fun attach(current: Take) {
         current.target = targetGuard.capture() ?: return
         current.explicitOnly = true
-        current.composing = false
-        current.liveInField = false
         if (current.ready == null) {
             current.lastPartial?.let { partial ->
                 transcriptView?.visibility = View.VISIBLE
@@ -449,7 +447,7 @@ class VoiceInputService : InputMethodService() {
      */
     private fun onTranscriptionSettled(current: Take, completed: Recording) {
         if (current.sensitive) runCatching { application.recordings.delete(completed.id) }
-        if (!requestGuard.isCurrent(current.requestGeneration) || take !== current) return
+        if (take !== current) return
         val text = completed.rawTranscript
         if (completed.status != RecordingStatus.TRANSCRIBED || text == null) {
             endTake(
@@ -469,14 +467,15 @@ class VoiceInputService : InputMethodService() {
             // (or, with none left, inserts at the cursor) and finishes it.
             // An empty final with no region of ours writes nothing: an empty
             // commit would replace whatever the user has selected.
-            if (text.isNotEmpty() || current.composing) connection.commitText(text, 1)
-            current.composing = false
-            endTake(current, R.string.keyboard_inserted, shown = text.takeUnless { current.sensitive })
-            return
+            if ((text.isEmpty() && !current.composing) || connection.commitText(text, 1)) {
+                current.composing = false
+                endTake(current, R.string.keyboard_inserted, shown = text.takeUnless { current.sensitive })
+                return
+            }
         }
-        // A batch result, or a live final whose composing region is gone
-        // (the field changed, or never could compose): the explicit Insert
-        // flow, with any leftover composing removed.
+        // A batch result, a live final whose composing region is gone (the
+        // field changed, or never could compose), or one the editor refused:
+        // the explicit Insert flow, with any leftover composing removed.
         clearComposingText(current)
         current.ready = text
         renderTake()
@@ -492,8 +491,11 @@ class VoiceInputService : InputMethodService() {
             return
         }
         // Reached only from the explicit Insert button, into the field the
-        // take was dictated in.
-        connection.commitText(text, 1)
+        // take was dictated in. A refused commit keeps the text for Copy.
+        if (!connection.commitText(text, 1)) {
+            renderTake()
+            return
+        }
         endTake(current, R.string.keyboard_inserted, shown = text.takeUnless { current.sensitive })
     }
 
@@ -641,7 +643,6 @@ class VoiceInputService : InputMethodService() {
      */
     private class Take(
         val recording: Recording,
-        val requestGeneration: Long,
         /** The field the take was started in; it attaches only to that field. */
         val field: EditorField,
         val sensitive: Boolean,

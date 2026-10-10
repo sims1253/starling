@@ -96,7 +96,6 @@
     <string name="take_notification_channel">Dictation in progress</string>
     <string name="take_notification_title">Starling is recording</string>
     <string name="take_notification_text">The take keeps recording while the keyboard is hidden.</string>
-    <string name="keyboard_permission_granted">Microphone allowed. Return to your field and tap Record.</string>
     <string name="keyboard_transcription_failed">Transcription failed. The recording remains available in Starling Mobile.</string>
     <string name="keyboard_no_target">No editable field is focused.</string>
     <string name="keyboard_microphone_permission">Allow the microphone in Starling, then come back to this field.</string>
