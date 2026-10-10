@@ -664,7 +664,7 @@ impl Command {
                 BoundaryPolicy::Adjust => {
                     json!({ "revisionId": revision_id, "targetRef": target_ref })
                 }
-                _ => json!({
+                BoundaryPolicy::Raw | BoundaryPolicy::Verbatim => json!({
                     "revisionId": revision_id,
                     "targetRef": target_ref,
                     "boundary": boundary,

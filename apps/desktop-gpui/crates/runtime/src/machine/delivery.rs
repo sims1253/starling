@@ -727,7 +727,7 @@ fn derived_id(source_id: &str, rules: &str) -> String {
     let suffix = &id[source_id.len()..];
     match MSG_ID_MAX.checked_sub(suffix.len() + tag.len()) {
         Some(keep) => format!("{}{tag}{suffix}", prefix(source_id, keep)),
-        None => format!("{}{tag}", prefix(&id, MSG_ID_MAX - tag.len())),
+        None => format!("{}{tag}", prefix(&id, MSG_ID_MAX.saturating_sub(tag.len()))),
     }
 }
 
@@ -735,6 +735,7 @@ fn derived_id(source_id: &str, rules: &str) -> String {
 fn failure_reason(rejection: &Rejection) -> &'static str {
     match rejection {
         Rejection::RevisionIdTaken { .. } => "revision_id_taken",
+        Rejection::InboxFull => "document_service_busy",
         _ => "derived_revision_unrecorded",
     }
 }

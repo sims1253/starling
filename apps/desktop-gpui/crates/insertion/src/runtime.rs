@@ -249,7 +249,7 @@ mod tests {
     fn the_runtime_confirms_a_delivery_over_this_adapter() {
         use starling_runtime::bus::EventSub;
         use starling_runtime::channel::RecvError;
-        use starling_runtime::protocol::{Command, Event, Revision};
+        use starling_runtime::protocol::{BoundaryPolicy, Command, Event, Revision};
         use starling_runtime::{Runtime, RuntimeConfig};
 
         fn until(events: &EventSub, wanted: &str) -> Event {
@@ -295,7 +295,7 @@ mod tests {
                 Command::DeliveryPrepare {
                     revision_id: "rev-1".into(),
                     target_ref: target.target_ref.clone(),
-                    boundary: Default::default(),
+                    boundary: BoundaryPolicy::Adjust,
                 },
             )
             .unwrap();
