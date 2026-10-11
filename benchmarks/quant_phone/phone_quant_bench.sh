@@ -3,9 +3,15 @@
 # on an adb phone (run on the host the phone is attached to).
 #
 # Every LABEL=kind:file spec runs as its own starling-bench process under
-# `toybox time -v` (peak RSS, user/system CPU seconds), rounds interleave the
-# specs so thermal drift spreads over all of them, and each process does a
-# warm-up plus RUNS timed transcriptions of every wav. CPU seconds of the
+# `toybox time -v` (peak RSS, user/system CPU seconds), and each process does
+# a warm-up plus RUNS timed transcriptions of every wav. Sustained 6-core CPU
+# work throttles the phone within minutes (measured: each spec in a fixed
+# order ran slower than the one before it), so every process starts only once
+# the virtual skin temperature is back under SKIN_MAX, and rounds alternate
+# the spec order (ABBA) so the heat a round builds falls on every spec.
+# On battery, each process's energy comes from the gauge's charge counter
+# (a coulomb counter; µAh x nominal 3.87 V, as phone_energy.sh) minus the
+# idle drain measured screen-off at the start (IDLE_S seconds). CPU seconds of the
 # whole process (load + warm-up included, the same work for every spec of a
 # model) are the energy proxy for CPU-only runs; the phone's power rails are
 # not readable from the shell.
@@ -15,7 +21,9 @@
 #
 # Pushes binaries and missing GGUFs to $DEV (env: BIN_DIR with starling-bench
 # and libggml*.so, default ./bin; WAVS, default the three fixtures; OUT for the
-# raw logs; COOL seconds between processes, default 20; THREADS, default 6).
+# raw logs; SKIN_MAX °C to start a process at, default the idle reading at
+# start + 1; COOL minimum seconds between processes, default 20; IDLE_S,
+# default 180; THREADS, default 6).
 set -euo pipefail
 DEV=/data/local/tmp/starling/quant
 ROUNDS=2
@@ -31,6 +39,8 @@ BIN_DIR=${BIN_DIR:-./bin}
 WAVS=${WAVS:-"$ROOT/tests/fixtures/short.wav $ROOT/tests/fixtures/medium.wav $ROOT/tests/fixtures/long.wav"}
 OUT=${OUT:-$(mktemp -d)}
 COOL=${COOL:-20}
+SKIN_MAX=${SKIN_MAX:-}
+IDLE_S=${IDLE_S:-180}
 THREADS=${THREADS:-6}
 mkdir -p "$OUT"
 
@@ -59,6 +69,25 @@ push_model() {  # local path -> device path; skips a same-size copy
   echo "$dst"
 }
 
+skin() {  # the thermal HAL's VIRTUAL-SKIN temperature in °C ("" if unreadable)
+  timeout 30 adb shell "dumpsys thermalservice" 2>/dev/null | tr -d '\r' |
+    sed -n 's/.*mValue=\([0-9.]*\), mType=3, mName=VIRTUAL-SKIN,.*/\1/p' | sed -n 1p
+}
+wait_cool() {  # up to 15 min for the skin temperature to drop under SKIN_MAX
+  local t
+  for _ in $(seq 1 90); do
+    t=$(skin)
+    [ -n "$t" ] && awk -v t="$t" -v m="$SKIN_MAX" 'BEGIN { exit !(t < m) }' && { echo "$t"; return 0; }
+    sleep 10
+  done
+  echo "${t:-?} (timeout)"
+}
+
+battery_field() {  # battery_field "Charge counter" -> value ("" if unreadable)
+  timeout 30 adb shell "dumpsys battery" 2>/dev/null | tr -d '\r' | sed -n "s/^ *$1: *//p" | sed -n 1p
+}
+on_battery() { case "$(battery_field status)" in 3|4) return 0 ;; *) return 1 ;; esac; }
+
 labels=() kinds=() files=()
 for spec in "$@"; do
   label=${spec%%=*}; rest=${spec#*=}
@@ -66,28 +95,51 @@ for spec in "$@"; do
   [ -f "$file" ] || { echo "missing model: $file" >&2; exit 1; }
   labels+=("$label"); kinds+=("$kind"); files+=("$(push_model "$file")")
 done
-echo "logs: $OUT  engine=$ENGINE threads=$THREADS rounds=$ROUNDS runs=$RUNS"
+idle_rate=""   # µAh per second, screen off, nothing running
+if on_battery; then
+  c0=$(battery_field "Charge counter"); t0=$(date +%s.%N)
+  sleep "$IDLE_S"
+  c1=$(battery_field "Charge counter"); t1=$(date +%s.%N)
+  idle_rate=$(awk -v a="$c0" -v b="$c1" -v s="$t0" -v e="$t1" 'BEGIN { printf "%.4f", (a - b) / (e - s) }')
+  echo "idle drain: $idle_rate uAh/s over ${IDLE_S}s (counter $c0 -> $c1)" | tee "$OUT/idle.txt"
+else
+  echo "phone is not on battery: no energy numbers" | tee "$OUT/idle.txt"
+fi
+[ -n "$SKIN_MAX" ] || SKIN_MAX=$(awk -v t="$(skin)" 'BEGIN { printf "%.1f", (t == "" ? 37 : t) + 1.0 }')
+echo "logs: $OUT  engine=$ENGINE threads=$THREADS rounds=$ROUNDS runs=$RUNS skin_max=$SKIN_MAX"
 
+order=("${!labels[@]}")
 for r in $(seq 1 "$ROUNDS"); do
-  for i in "${!labels[@]}"; do
+  if (( r % 2 == 0 )); then
+    rev=(); for (( j=${#order[@]}-1; j>=0; j-- )); do rev+=("${order[$j]}"); done; seq_r=("${rev[@]}")
+  else
+    seq_r=("${order[@]}")
+  fi
+  for i in "${seq_r[@]}"; do
     wake_held || { echo "ERROR: wake lock lost; stopping" >&2; exit 1; }
     log="$OUT/${labels[$i]}.r$r.log"
+    start_t=$(wait_cool)
+    echo "skin at start: $start_t" > "$log"
+    on_battery && echo "charge start: $(battery_field "Charge counter") $(date +%s.%N)" >> "$log"
     timeout 3600 adb shell "cd $DEV && LD_LIBRARY_PATH=. STARLING_ENGINE=$ENGINE \
       STARLING_GGML_THREADS=$THREADS STARLING_FAST_CACHE_DIR=$DEV \
       toybox time -v ./starling-bench-quant --model ${kinds[$i]} --gguf ${files[$i]} \
-      --warmup --runs $RUNS $dev_wavs 2>&1" > "$log" 2>&1 || echo "WARNING: ${labels[$i]} round $r exited non-zero" >&2
+      --warmup --runs $RUNS $dev_wavs 2>&1" >> "$log" 2>&1 || echo "WARNING: ${labels[$i]} round $r exited non-zero" >&2
+    on_battery && echo "charge end: $(battery_field "Charge counter") $(date +%s.%N)" >> "$log"
+    echo "skin at end: $(skin)" >> "$log"
     timeout 30 adb shell "dumpsys thermalservice | grep -m1 'Thermal Status'" 2>/dev/null | tr -d '\r' >> "$log" || true
     benches_gone 60 || kill_benches
     sleep "$COOL"
   done
 done
 
-python3 - "$OUT" "$ROUNDS" "${labels[@]}" <<'EOF'
+python3 - "$OUT" "$ROUNDS" "$idle_rate" "${labels[@]}" <<'EOF'
 import os, re, statistics, sys
-out, rounds, labels = sys.argv[1], int(sys.argv[2]), sys.argv[3:]
-print(f"{'label':22s} {'load_ms':>8s} {'short_ms':>9s} {'medium_ms':>9s} {'long_ms':>9s} {'cpu_s':>7s} {'wall_s':>7s} {'rss_MB':>7s}  thermal")
+out, rounds, idle, labels = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4:]
+V_NOM = 3.87  # nominal cell voltage: µAh -> µWh is an approximation, as in phone_energy.sh
+print(f"{'label':22s} {'load_ms':>8s} {'short_ms':>9s} {'medium_ms':>9s} {'long_ms':>9s} {'cpu_s':>7s} {'wall_s':>7s} {'rss_MB':>7s} {'mWh':>7s}  skin start->end per round")
 for lab in labels:
-    loads, per, cpu, wall, rss, therm = [], {}, [], [], [], []
+    loads, per, cpu, wall, rss, therm, energy = [], {}, [], [], [], [], []
     for r in range(1, rounds + 1):
         p = os.path.join(out, f"{lab}.r{r}.log")
         if not os.path.exists(p):
@@ -101,9 +153,14 @@ for lab in labels:
         if u and y: cpu.append(float(u.group(1)) + float(y.group(1)))
         if w: wall.append(float(w.group(1)))
         if m: rss.append(int(m.group(1)) / 1024)
-        t = re.search(r"Thermal Status: (\d+)", s)
-        therm.append(t.group(1) if t else "?")
+        cs = re.search(r"charge start: (\d+) ([0-9.]+)", s); ce = re.search(r"charge end: (\d+) ([0-9.]+)", s)
+        if cs and ce and idle:
+            dt = float(ce.group(2)) - float(cs.group(2))
+            used = int(cs.group(1)) - int(ce.group(1)) - float(idle) * dt   # µAh above idle
+            energy.append(used * V_NOM / 1000.0)                             # mWh
+        a = re.search(r"skin at start: (\S+)", s); b = re.search(r"skin at end: (\S*)", s)
+        therm.append(f"{a.group(1) if a else '?'}->{b.group(1) if b and b.group(1) else '?'}")
     med = lambda v: f"{statistics.median(v):.0f}" if v else "FAIL"
     cols = [med(per.get(w, [])) for w in ("short.wav", "medium.wav", "long.wav")]
-    print(f"{lab:22s} {med(loads):>8s} {cols[0]:>9s} {cols[1]:>9s} {cols[2]:>9s} {med(cpu):>7s} {med(wall):>7s} {med(rss):>7s}  {','.join(therm)}")
+    print(f"{lab:22s} {med(loads):>8s} {cols[0]:>9s} {cols[1]:>9s} {cols[2]:>9s} {med(cpu):>7s} {med(wall):>7s} {med(rss):>7s} {(f"{statistics.median(energy):.1f}" if energy else "n/a"):>7s}  {' '.join(therm)}")
 EOF
