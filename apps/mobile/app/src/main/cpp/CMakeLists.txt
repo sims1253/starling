@@ -28,6 +28,13 @@ set(GGML_LLAMAFILE OFF CACHE BOOL "" FORCE)
 set(STARLING_GGML_TESTS OFF CACHE BOOL "" FORCE)
 set(STARLING_QUANTIZE OFF CACHE BOOL "" FORCE)
 set(STARLING_SERVE OFF CACHE BOOL "" FORCE)
+# ggml's own worker pool instead of OpenMP. ggml sets KMP_BLOCKTIME=200 ms,
+# so after every graph libomp keeps all workers spinning for 200 ms: during
+# live dictation that is most of the CPU energy between chunks. The runtime
+# attaches a persistent pool (cpp/runtime/backend.cpp) whose workers park
+# after a short poll (STARLING_GGML_POLL). benchmarks/fast_engine/
+# android_bench.sh builds the same way, so bench numbers match the app.
+set(GGML_OPENMP OFF CACHE BOOL "" FORCE)
 
 # Without GGML_NATIVE, ggml's arm64 baseline is plain armv8-a: no dot-product
 # or FP16 vector kernels, several times slower for quantized models. Every

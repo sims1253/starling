@@ -228,6 +228,11 @@ struct Backend::Impl {
     // nested compute (a build lambda that runs another graph) gets its own.
     std::unique_ptr<uint8_t[]> ctx_arena;
     bool ctx_arena_busy = false;
+    // Persistent worker pool for the CPU primary backend (see
+    // attach_threadpool). Without one, ggml starts and joins a fresh pool of
+    // threads for every graph when built without OpenMP.
+    ggml_threadpool_t threadpool = nullptr;
+    int threadpool_n = 0;
 
     ~Impl() {
         if (shutting_down()) return;
@@ -235,6 +240,33 @@ struct Backend::Impl {
         if (galloc) ggml_gallocr_free(galloc);
         if (use_sched && cpu_backend) ggml_backend_free(cpu_backend);
         if (backend) ggml_backend_free(backend);
+        if (threadpool) ggml_threadpool_free(threadpool);
+    }
+
+    // (Re)create the CPU worker pool for n threads and attach it. The pool's
+    // threads park after `poll` rounds of spinning without work (ggml's
+    // hybrid poll; 0 = park right away); STARLING_GGML_POLL overrides ggml's
+    // default of 50. STARLING_GGML_CPUMASK (hex, e.g. 0xfc) confines the
+    // worker threads to those CPUs, e.g. a phone's performance cores. With
+    // OpenMP builds the pool only carries these settings; libomp owns the
+    // threads.
+    void attach_threadpool(int n) {
+        if (!backend || !ggml_backend_is_cpu(backend)) return;
+        ggml_threadpool_params tpp = ggml_threadpool_params_default(n);
+        if (const char* v = std::getenv("STARLING_GGML_POLL"); v && *v)
+            tpp.poll = (uint32_t)std::clamp(std::atoi(v), 0, 100);
+        if (const char* v = std::getenv("STARLING_GGML_CPUMASK"); v && *v) {
+            const unsigned long long mask = std::strtoull(v, nullptr, 16);
+            for (int i = 0; i < 64 && i < GGML_MAX_N_THREADS; ++i)
+                tpp.cpumask[i] = (mask >> i) & 1u;
+            tpp.strict_cpu = false;  // every thread may use the whole mask
+        }
+        ggml_threadpool_t fresh = ggml_threadpool_new(&tpp);
+        if (!fresh) return;  // keep ggml's per-graph pool
+        ggml_backend_cpu_set_threadpool(backend, fresh);
+        if (threadpool) ggml_threadpool_free(threadpool);
+        threadpool = fresh;
+        threadpool_n = n;
     }
 
     // Create the sched on first need: {GPU, CPU} when a GPU is active, the
@@ -374,6 +406,7 @@ Backend::Backend(int n_threads) : impl_(new Impl()), n_threads_(n_threads < 1 ? 
     }
     if (ggml_backend_is_cpu(impl_->backend)) {
         ggml_backend_cpu_set_n_threads(impl_->backend, n_threads_);
+        impl_->attach_threadpool(n_threads_);
     }
     // Persistent gallocr (shared by one-shot computes; ReplayGraph has its own).
     impl_->galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(impl_->backend));
@@ -385,6 +418,9 @@ void Backend::set_n_threads(int n_threads) {
     n_threads_ = n_threads < 1 ? 1 : n_threads;
     if (impl_ && ggml_backend_is_cpu(impl_->backend)) {
         ggml_backend_cpu_set_n_threads(impl_->backend, n_threads_);
+        // A pool never runs more threads than it was created with.
+        if (impl_->threadpool_n != n_threads_)
+            impl_->attach_threadpool(n_threads_);
     }
 }
 
