@@ -576,12 +576,23 @@ SpecState& state_for(const ModelLoader& loader) {
     return *state;
 }
 
+// Whether attention can read KV slots no step of this utterance wrote: the
+// GPU graphs attend over masked full-capacity/bucket widths (a masked slot
+// must hold a finite value: 0 * NaN is NaN), and so does <env>_FULLCAP. The
+// CPU's exact-width graphs only ever read written slots, so their cache is
+// never cleared: no per-utterance memset of the whole cache (hundreds of
+// MiB at max_cache 4096) and its untouched tail never becomes resident.
+bool kv_needs_clear(const QwenDecodeSpec& spec) {
+    return global_backend().is_gpu() || env(spec, "_FULLCAP") != nullptr;
+}
+
 DeviceCache* get_device_cache(const QwenDecodeCtx& m, std::string& e) {
     SpecState& st = state_for(m.loader);
     if (st.device_cache) return st.device_cache.get();
     const auto& lc = m.dims;
     auto cache = std::make_unique<DeviceCache>();
-    if (!cache->init((int) lc.n_layers, (int) lc.head_dim, (int) lc.n_kv_heads, (int) lc.max_cache, lc.rope_theta, global_backend().handle(), e)) {
+    if (!cache->init((int) lc.n_layers, (int) lc.head_dim, (int) lc.n_kv_heads, (int) lc.max_cache, lc.rope_theta, global_backend().handle(), e,
+                     kv_needs_clear(m.spec))) {
         return nullptr;
     }
     st.device_cache = std::move(cache);
@@ -940,7 +951,7 @@ bool forward_prefill(const QwenDecodeCtx& m, const std::vector<float>& input,
     ensure_weights_realized(m.loader);
     DeviceCache* dc = get_device_cache(m, e);
     if (!dc) return false;
-    dc->zero();  // fresh utterance
+    if (kv_needs_clear(m.spec)) dc->zero();  // fresh utterance
     state.length = 0;
     if (state.layers.empty()) state.layers.resize(lc.n_layers);
 

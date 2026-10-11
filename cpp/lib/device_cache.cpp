@@ -14,7 +14,8 @@
 namespace starling::ggml::lib {
 
 bool DeviceCache::init(int n_layers_, int D_, int KV_, int max_cache_,
-                       float rope_theta, ggml_backend_t backend, std::string& e) {
+                       float rope_theta, ggml_backend_t backend, std::string& e,
+                       bool clear) {
     n_layers = n_layers_;
     D = D_;
     KV = KV_;
@@ -60,7 +61,7 @@ bool DeviceCache::init(int n_layers_, int D_, int KV_, int max_cache_,
     ggml_backend_tensor_set(rope_cos, cos_t.data(), 0, cos_t.size() * sizeof(ggml_bf16_t));
     ggml_backend_tensor_set(rope_sin, sin_t.data(), 0, sin_t.size() * sizeof(ggml_bf16_t));
 
-    zero();
+    if (clear) zero();
     return true;
 }
 
