@@ -4,7 +4,6 @@
 //!   /normalize`), English clean/format only, no instructions.
 //! - [`openai::OpenAiProvider`]: any OpenAI-compatible chat endpoint
 //!   (OpenAI, OpenRouter, llama-server, vLLM, Groq, ...).
-//! - [`anthropic::AnthropicProvider`], [`gemini::GeminiProvider`].
 //!
 //! Every provider validates its endpoint against the locality it declares
 //! ([`crate::http::validate_endpoint`]), refuses redirects, honors the
@@ -13,8 +12,6 @@
 //! `truncated_output`; S1-mini's empty answer on filler-only input is a
 //! valid result.
 
-pub mod anthropic;
-pub mod gemini;
 pub mod openai;
 pub mod s1;
 
@@ -61,10 +58,9 @@ pub struct ChatConfig {
     /// those models reject `max_tokens` and any non-default temperature.
     pub reasoning_effort: Option<String>,
     /// Ask for a non-thinking answer where the API has a switch
-    /// (llama-server/vLLM `chat_template_kwargs.enable_thinking=false`,
-    /// Gemini `thinkingBudget: 0`). Off by default: the llama-server/vLLM
-    /// field is an extension that strict OpenAI-compatible endpoints
-    /// (OpenAI itself included) reject.
+    /// (llama-server/vLLM `chat_template_kwargs.enable_thinking=false`).
+    /// Off by default: the field is an extension that strict
+    /// OpenAI-compatible endpoints (OpenAI itself included) reject.
     pub disable_thinking: bool,
     /// Response size cap in bytes.
     pub max_response_bytes: usize,
