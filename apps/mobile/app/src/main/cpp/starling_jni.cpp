@@ -5,10 +5,34 @@
 // the malloc'd buffer is released here).
 #include <jni.h>
 
+#include <string>
+
 #include "runtime/call_abort.hpp"
 #include "starling_ggml.h"
 
 namespace {
+
+// The speech-model kinds the app loads (ModelKind.kt). The S1 text model
+// and the size aliases (ARK06, QWEN3_06: same engines, dims from the GGUF)
+// are deliberately not among them.
+bool isSpeechModel(jint kind) {
+  switch (kind) {
+    case STARLING_GGML_PARAKEET_TDT:
+    case STARLING_GGML_MOSS:
+    case STARLING_GGML_ARK:
+    case STARLING_GGML_GRANITE:
+    case STARLING_GGML_QWEN3:
+    case STARLING_GGML_VOXTRAL:
+      return true;
+    default:
+      return false;
+  }
+}
+
+// Why the last load on this thread was refused before reaching the engine;
+// empty otherwise. Thread-local like the engine's own load error
+// (starling_ggml_last_error(NULL)), which lastError(0) reports otherwise.
+thread_local std::string unsupportedKindError;
 
 // Transcripts are malloc'd engine strings that [owned] marks for release;
 // error strings are borrowed engine storage and must not be freed.
@@ -69,13 +93,21 @@ Java_dev_starling_mobile_engine_StarlingNative_abiVersion(JNIEnv*, jclass) {
 
 extern "C" JNIEXPORT jlong JNICALL
 Java_dev_starling_mobile_engine_StarlingNative_load(JNIEnv* env, jclass,
-                                                    jstring gguf_path) {
+                                                    jstring gguf_path,
+                                                    jint kind) {
+  if (!isSpeechModel(kind)) {
+    // Reported like an engine load error: load() returns 0 and
+    // lastError(0) carries the reason.
+    unsupportedKindError = "unsupported model kind " + std::to_string(kind);
+    return 0;
+  }
+  unsupportedKindError.clear();
   const char* path = env->GetStringUTFChars(gguf_path, nullptr);
   if (path == nullptr) {
     return 0;
   }
   starling_ggml_ctx* ctx =
-      starling_ggml_load(STARLING_GGML_PARAKEET_TDT, path);
+      starling_ggml_load(static_cast<starling_ggml_model>(kind), path);
   env->ReleaseStringUTFChars(gguf_path, path);
   return reinterpret_cast<jlong>(ctx);
 }
@@ -116,6 +148,9 @@ Java_dev_starling_mobile_engine_StarlingNative_free(JNIEnv*, jclass,
 extern "C" JNIEXPORT jstring JNICALL
 Java_dev_starling_mobile_engine_StarlingNative_lastError(JNIEnv* env, jclass,
                                                          jlong handle) {
+  if (handle == 0 && !unsupportedKindError.empty()) {
+    return toJString(env, unsupportedKindError.c_str(), /* owned = */ false);
+  }
   return toJString(
       env,
       starling_ggml_last_error(

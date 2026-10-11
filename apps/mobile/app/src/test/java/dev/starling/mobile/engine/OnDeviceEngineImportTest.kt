@@ -555,9 +555,43 @@ class OnDeviceEngineImportTest {
             engine.importModel(source.inputStream(), "first.gguf")
             val result = engine.importModel(source.inputStream(), "second.gguf")
 
-            assertEquals(OnDeviceEngine.ImportResult.Imported(source.length(), "second.gguf"), result)
+            assertEquals(OnDeviceEngine.ImportResult.Imported(source.length(), "second.gguf", "Parakeet"), result)
             assertEquals(listOf("first.gguf", "second.gguf"), engine.installedModels().map { it.name })
             assertEquals("second.gguf", engine.activeModelName())
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun everySpeechModelKindImportsAndAnS1TextModelDoesNot() {
+        val directory = tempDir()
+        try {
+            val engine = OnDeviceEngine(directory)
+            for ((architecture, label) in listOf(
+                "moss_transcribe" to "MOSS-Transcribe",
+                "ark" to "ARK-ASR",
+                "granite" to "Granite Speech",
+                "qwen3" to "Qwen3-ASR",
+                "voxtral" to "Voxtral Realtime",
+            )) {
+                val source = sparseModelFile(directory, "source.part", ggufBytes("general.architecture" to architecture))
+                val result = engine.importModel(source.inputStream(), "$architecture.gguf")
+                assertEquals(OnDeviceEngine.ImportResult.Imported(source.length(), "$architecture.gguf", label), result)
+            }
+            val s1 = sparseModelFile(directory, "source.part", ggufBytes("general.architecture" to "s1"))
+
+            val result = engine.importModel(s1.inputStream(), "s1.gguf")
+
+            assertEquals(
+                OnDeviceEngine.ImportResult.Rejected(
+                    "S1-mini is a text model, not a speech model.",
+                    OnDeviceEngine.ImportStage.VALIDATE,
+                ),
+                result,
+            )
+            assertEquals("voxtral.gguf", engine.activeModelName())
+            assertFalse(File(directory, "s1.gguf").exists())
         } finally {
             directory.deleteRecursively()
         }
@@ -626,7 +660,7 @@ class OnDeviceEngineImportTest {
             engine.importModel(source.inputStream(), "model.gguf")
             val second = engine.importModel(source.inputStream(), "model.gguf")
 
-            assertEquals(OnDeviceEngine.ImportResult.Imported(source.length(), "model-2.gguf"), second)
+            assertEquals(OnDeviceEngine.ImportResult.Imported(source.length(), "model-2.gguf", "Parakeet"), second)
             assertEquals(listOf("model-2.gguf", "model.gguf"), engine.installedModels().map { it.name })
             assertEquals("model-2.gguf", engine.activeModelName())
         } finally {
@@ -644,7 +678,7 @@ class OnDeviceEngineImportTest {
 
             val result = engine.importModel(source.inputStream(), catalogName)
 
-            assertEquals(OnDeviceEngine.ImportResult.Imported(source.length(), "imported-$catalogName"), result)
+            assertEquals(OnDeviceEngine.ImportResult.Imported(source.length(), "imported-$catalogName", "Parakeet"), result)
         } finally {
             directory.deleteRecursively()
         }

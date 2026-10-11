@@ -14,11 +14,17 @@ import kotlin.concurrent.thread
 /**
  * Engine lifetime hooks that need no native library: the memory gate runs
  * inside the engine lock, so a gate that blocks stands in for a long load.
+ * The model is a synthetic GGUF ([ModelKindTest.gguf]) sparsely padded to
+ * the minimum size, so the load's kind detection passes and reaches the gate.
  */
 class OnDeviceEngineLifetimeTest {
-    private fun modelDir(): File = Files.createTempDirectory("starling-lifetime-test").toFile().also { dir ->
-        RandomAccessFile(File(dir, "parakeet.gguf"), "rw").use { it.setLength(ModelFiles.MIN_MODEL_BYTES) }
-    }
+    private fun modelDir(kvs: Array<Pair<String, String>> = PARAKEET_KVS): File =
+        Files.createTempDirectory("starling-lifetime-test").toFile().also { dir ->
+            RandomAccessFile(File(dir, "parakeet.gguf"), "rw").use {
+                it.write(ModelKindTest.gguf(*kvs))
+                it.setLength(ModelFiles.MIN_MODEL_BYTES)
+            }
+        }
 
     @Test
     fun startingALiveSessionNeverWaitsForALoadInProgress() {
@@ -26,7 +32,7 @@ class OnDeviceEngineLifetimeTest {
         val release = CountDownLatch(1)
         val engine = OnDeviceEngine(
             modelDir(),
-            memoryGate = {
+            memoryGate = { _, _ ->
                 loading.countDown()
                 release.await(10, TimeUnit.SECONDS)
                 "refused for the test"
@@ -49,7 +55,7 @@ class OnDeviceEngineLifetimeTest {
     @Test
     fun aFailedLoadIsReportedToTheObserver() {
         val failures = mutableListOf<Pair<String?, String>>()
-        val engine = OnDeviceEngine(modelDir(), memoryGate = { "only 10 MB free" }, nativeSupport = { null })
+        val engine = OnDeviceEngine(modelDir(), memoryGate = { _, _ -> "only 10 MB free" }, nativeSupport = { null })
         engine.observer = object : OnDeviceEngine.Observer {
             override fun loadFailed(model: String?, reason: String) {
                 failures += model to reason
@@ -62,7 +68,7 @@ class OnDeviceEngineLifetimeTest {
     @Test
     fun aDisallowedPreloadNeverTouchesTheEngine() {
         var gateCalls = 0
-        val engine = OnDeviceEngine(modelDir(), memoryGate = { gateCalls++; "refused" }, nativeSupport = { null })
+        val engine = OnDeviceEngine(modelDir(), memoryGate = { _, _ -> gateCalls++; "refused" }, nativeSupport = { null })
         assertEquals(null, engine.preload { false })
         assertEquals(0, gateCalls)
         engine.preload { true }
@@ -72,7 +78,7 @@ class OnDeviceEngineLifetimeTest {
     @Test
     fun aThrowingLoadIsReportedAsAFailedLoad() {
         val failures = mutableListOf<String>()
-        val engine = OnDeviceEngine(modelDir(), memoryGate = { throw IllegalStateException("gate broke") }, nativeSupport = { null })
+        val engine = OnDeviceEngine(modelDir(), memoryGate = { _, _ -> throw IllegalStateException("gate broke") }, nativeSupport = { null })
         engine.observer = object : OnDeviceEngine.Observer {
             override fun loadFailed(model: String?, reason: String) {
                 failures += reason
@@ -85,7 +91,7 @@ class OnDeviceEngineLifetimeTest {
     @Test
     fun aClosedSessionNeverLoads() {
         var gateCalls = 0
-        val engine = OnDeviceEngine(modelDir(), memoryGate = { gateCalls++; null }, nativeSupport = { null })
+        val engine = OnDeviceEngine(modelDir(), memoryGate = { _, _ -> gateCalls++; null }, nativeSupport = { null })
         assertEquals("the live session was closed", engine.prepare { true })
         assertEquals(0, gateCalls)
     }
@@ -96,7 +102,7 @@ class OnDeviceEngineLifetimeTest {
         var heldDuringLoad = -1
         val engine = OnDeviceEngine(
             modelDir(),
-            memoryGate = { heldDuringLoad = held; "refused" },
+            memoryGate = { _, _ -> heldDuringLoad = held; "refused" },
             nativeSupport = { null },
             keepAwake = { held++; AutoCloseable { held-- } },
         )
@@ -107,8 +113,49 @@ class OnDeviceEngineLifetimeTest {
 
     @Test
     fun theIdleReleaseHasNothingToFreeWithoutAResidentModel() {
-        val engine = OnDeviceEngine(modelDir(), memoryGate = { "refused" }, nativeSupport = { null })
+        val engine = OnDeviceEngine(modelDir(), memoryGate = { _, _ -> "refused" }, nativeSupport = { null })
         engine.prepare { false }
         assertFalse(engine.releaseIfIdle(0))
+    }
+
+    @Test
+    fun theGateIsAskedWithTheKindDetectedFromTheFile() {
+        val kinds = mutableListOf<ModelKind>()
+        for (kvs in listOf(PARAKEET_KVS, arrayOf("general.architecture" to "qwen3"))) {
+            val engine = OnDeviceEngine(
+                modelDir(kvs),
+                memoryGate = { _, kind -> kinds += kind; "refused" },
+                nativeSupport = { null },
+            )
+            engine.prepare { false }
+        }
+        assertEquals(listOf(ModelKind.PARAKEET, ModelKind.QWEN3), kinds)
+    }
+
+    @Test
+    fun anUnsupportedModelIsRefusedBeforeTheGateWithItsReason() {
+        var gateCalls = 0
+        val failures = mutableListOf<Pair<String?, String>>()
+        val engine = OnDeviceEngine(
+            modelDir(arrayOf("general.architecture" to "s1")),
+            memoryGate = { _, _ -> gateCalls++; null },
+            nativeSupport = { null },
+        )
+        engine.observer = object : OnDeviceEngine.Observer {
+            override fun loadFailed(model: String?, reason: String) {
+                failures += model to reason
+            }
+        }
+        val reason = engine.prepare { false }
+        assertEquals("S1-mini is a text model, not a speech model.", reason)
+        assertEquals(listOf("parakeet.gguf" to reason), failures)
+        assertEquals(0, gateCalls)
+    }
+
+    private companion object {
+        val PARAKEET_KVS = arrayOf(
+            "general.architecture" to "parakeet",
+            "parakeet.preprocessor.normalize" to "per_feature",
+        )
     }
 }

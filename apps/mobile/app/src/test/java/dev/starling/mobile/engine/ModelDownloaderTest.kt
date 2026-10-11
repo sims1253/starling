@@ -40,6 +40,7 @@ class ModelDownloaderTest {
         sizeBytes = payload.size.toLong(),
         sha256 = sha,
         label = "test model",
+        kind = ModelKind.PARAKEET,
     )
 
     private fun sha256(bytes: ByteArray): String =

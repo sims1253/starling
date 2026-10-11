@@ -473,7 +473,7 @@ class MainActivity : Activity() {
                 when (result) {
                     is OnDeviceEngine.ImportResult.Imported -> {
                         refreshOnDeviceStatus()
-                        showMessage(getString(R.string.on_device_imported))
+                        showMessage(getString(R.string.on_device_imported, result.model))
                     }
                     is OnDeviceEngine.ImportResult.Rejected -> {
                         Log.w(TAG, "model import rejected at ${result.stage}: ${result.reason}")
@@ -513,12 +513,13 @@ class MainActivity : Activity() {
     private fun isRecommended(model: OnDeviceEngine.InstalledModel): Boolean =
         model.name == ModelCatalog.RECOMMENDED_PARAKEET.fileName
 
-    /** Catalog models by their label; anything else by its file name. */
+    /** Catalog models by their label (the recommended one marked); anything else by its file name. */
     private fun modelDisplayName(model: OnDeviceEngine.InstalledModel): String {
+        val catalog = ModelCatalog.forFileName(model.name) ?: return model.name
         return if (isRecommended(model)) {
-            getString(R.string.recommended_model_name, ModelCatalog.RECOMMENDED_PARAKEET.label)
+            getString(R.string.recommended_model_name, catalog.label)
         } else {
-            model.name
+            catalog.label
         }
     }
 
