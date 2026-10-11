@@ -1,0 +1,6 @@
+# Pinned so CI builds (and their caches) change only when this file does;
+# bump it deliberately. rustup reads it for every cargo/rustc call under
+# apps/desktop-gpui.
+[toolchain]
+channel = "1.99.0"
+profile = "minimal"

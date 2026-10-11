@@ -18,7 +18,7 @@ read or executed on that tree, not assumed.
 | ggml engine | `.gitmodules` | submodule commit `e91ded11` (tag `v0.23.0`) + `third_party/ggml-patches` | Pinned by commit; patches applied by `scripts/apply_ggml_patches.sh` | checkout with `submodules: recursive`; patch script fails on mismatch |
 | `third_party/dr_wav.h` | vendored single file | version stamp in header | `dr_wav - v0.14.6`, public domain / MIT-0 | full-file diff review on update |
 | `third_party/httplib.h` | vendored single file | `CPPHTTPLIB_VERSION` | `0.60.1`, MIT (Yuji Hirose), plus two local WebSocket patches marked `[starling]` (complete frame writes; `WebSocket::shutdown_transport()`) | full-file diff review on update; re-apply the `[starling]` hunks (diff the old file against its upstream tag) |
-| GitHub Actions | `.github/workflows/*.yml` | commit-SHA pins | Every `uses:` is a 40-char SHA except `pullfrog/pullfrog@v0` (documented exception, below) | Dependabot, weekly, all workflows |
+| GitHub Actions | `.github/workflows/*.yml` | commit-SHA pins | Every `uses:` is a 40-char SHA; `pullfrog/pullfrog` needs the weekly bumps, since a SHA pin without an updater freezes its `post:` cleanup step | Dependabot, weekly, all workflows |
 | Android | `apps/mobile/build.gradle.kts`, `apps/mobile/app/build.gradle.kts` | none — dependency locking not enabled | Direct deps exact (`androidx.core 1.16.0`, `okhttp 4.12.0`, `mockwebserver 4.12.0`, `junit 4.13.2`, `org.json 20260814`); AGP `9.4.0`; wrapper `gradle-9.7.1`; NDK `28.2.13676358`; CMake `3.31.1`. Transitive deps float at build time (follow-up) | Dependabot gradle weekly; CI build in `apps.yml` `android` |
 | iOS | `apps/ios/Package.swift` | — | No external package declarations; local targets only | `swift test` in `apps.yml` `ios` |
 | Rust / GPUI desktop | `apps/desktop-gpui/Cargo.toml` (workspace, 4 crates) | `apps/desktop-gpui/Cargo.lock` (committed) | `gpui 0.2.2` plus direct cargo deps, exact via the lockfile | `desktop-gpui-rust.yml` cargo lanes |
@@ -103,7 +103,6 @@ added here in the same PR that introduces them.
 
 | Exception | Rationale | Removal condition |
 | --- | --- | --- |
-| `pullfrog/pullfrog@v0` moving tag (`pullfrog.yml`) | Vendor documents that a SHA pin *without* an updater freezes the action's `post:` cleanup step and later breaks every run; the tag is vendor-supported and the action runs with `id-token: write` | When pullfrog ships a pinned-SHA-plus-updater combination that its docs endorse |
 | Floating `>=` ranges in the root `pyproject.toml` | Tooling only (converters, golden capture, tests), independent of the production native path; `uv.lock` still pins exact versions for any given checkout | When a tool needs a reproducible pin beyond the lock |
 | CI-resolved tools (`brew install xcodegen`, `uv --with openapi-spec-validator`) | Test-only tooling; failures surface immediately in the same job | Follow-up: pin versions once a lockfile-equivalent mechanism exists (see gaps) |
 
