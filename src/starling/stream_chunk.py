@@ -277,10 +277,14 @@ def stitch_timed(
 # window is checked against the audio it covers: too few words for its voiced
 # audio, or more words than its duration allows, and the window is decoded
 # again from slightly earlier starts (REDECODE_SHIFTS) and the plausible
-# result kept. Kept in lockstep with the C++ port.
+# result kept. The committed text is always decoder output: only previews are
+# trimmed (suppress_preview_loops), and a committed result that still looks
+# like a loop is kept and flagged (loop_suspected). Kept in lockstep with the
+# C++ port.
 
-# More words than this per second of audio (plus _MAX_WORDS_SLACK) is a
-# decoding loop, never speech: fast dictation stays below ~5 words/s.
+# More words than this per second of audio (plus _MAX_WORDS_SLACK) suggests a
+# decoding loop: fast dictation stays below ~5 words/s, but a rapid list or
+# real repetition can come close, so committed text is only flagged.
 MAX_WORDS_PER_SECOND = 7.0
 _MAX_WORDS_SLACK = 4
 # Fewer words per voiced second than this, or than _RELATIVE_MIN_RATE of the
@@ -310,7 +314,7 @@ _VAD_MIN_DB = -60.0
 
 
 def max_plausible_words(seconds: float) -> int:
-    """Most words ``seconds`` of audio can hold; more is a decoding loop."""
+    """Most words ``seconds`` of audio plausibly hold; more suggests a decoding loop."""
     return int(seconds * MAX_WORDS_PER_SECOND) + _MAX_WORDS_SLACK
 
 
@@ -372,8 +376,8 @@ def _longest_repeat(keys: list[str], max_repeats: int, max_n: int) -> tuple[int,
 
 def suppress_loops(words: list[str], seconds: float, *, max_repeats: int = 2,
                    max_n: int = 8) -> list[str]:
-    """Words of a decode over ``seconds`` of audio with a decoding loop
-    removed. Text within max_plausible_words() is returned unchanged, so
+    """Words of a preview over ``seconds`` of audio with a decoding loop
+    removed (never applied to committed text). Text within max_plausible_words() is returned unchanged, so
     real repeated speech is never touched. Longer text has its longest
     back-to-back run of one phrase cut to ``max_repeats`` copies, one run at
     a time, only until it fits; what still does not fit is cut at the bound
@@ -648,6 +652,11 @@ class ChunkStreamer:
         # Buffer index where that call's audio starts.
         self.call_start = 0
         self.redecodes = 0         # windows replaced by a re-decode
+        # Committed windows and flush tails that still held more words than
+        # max_plausible_words() after the re-decodes: kept as decoded, and
+        # the final reports "loop_suspected" (lockstep with loop_suspected()
+        # in cpp/serve/stream_session.hpp).
+        self.loop_suspected = 0
 
     def set_preview_policy(self, min_seconds: float, interval_seconds: float) -> None:
         """Replace the preview cadence (per connection); ``ValueError`` if invalid."""
@@ -786,7 +795,11 @@ class ChunkStreamer:
         busy re-decode keeps the best so far if it is plausible, and
         otherwise leaves the window pending (``None``): the audio stays in
         the buffer for a retry instead of committing text known to be
-        wrong."""
+        wrong. The committed text is always decoder output: a result that
+        still looks like a loop after the re-decodes is kept whole and
+        counted in ``loop_suspected`` (fast lists and real repetition can
+        look like a loop; the final is flagged instead of cut to a
+        words-per-second bound)."""
         got = self._tx(samples, start, end, kind, tx)
         if got is None:
             return None
@@ -829,7 +842,7 @@ class ChunkStreamer:
         if best is not first:
             self.redecodes += 1
         if best_verdict == 2:
-            best = best.keep(suppress_loops_kept(best.words, (best.end - best.start) / self.sr))
+            self.loop_suspected += 1
         elif best_voiced >= _MIN_VOICED_SECONDS:
             self.rates = (self.rates + [len(best.words) / best_voiced])[-_RATE_HISTORY:]
         return best
@@ -964,6 +977,7 @@ class ChunkStreamer:
         self.call_kind = "window"
         self.call_start = 0
         self.redecodes = 0
+        self.loop_suspected = 0
 
 
 # --------------------------------------------------------------------------- #

@@ -1847,6 +1847,11 @@ def create_app(
                 "segments": result.segments,
                 "duration_s": round(sess.buffered_seconds, 3),
             }
+            # A committed window that still looked like a decoding loop after
+            # its re-decodes is kept as decoded; the final says so (issue
+            # #357). Only sent when true, as in the native server.
+            if sess.chunker is not None and sess.chunker.loop_suspected:
+                final["loop_suspected"] = True
             if trace:
                 final["trace"] = sess.trace_final()
             await ws.send_json(final)

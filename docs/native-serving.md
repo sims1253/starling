@@ -246,7 +246,11 @@ receive JSON messages:
   client may treat them as final while the take is still being spoken (the
   desktop staging editor does). The count only grows, and it is 0 in the
   whole-buffer mode (`--stream-chunk-seconds 0`).
-- `{"type":"final","text":"...","segments":[...],"duration_s":12.5}`: on commit
+- `{"type":"final","text":"...","segments":[...],"duration_s":12.5}`: on commit.
+  An optional `"loop_suspected":true` (absent otherwise) means a committed
+  window still looked like a decoding loop (more words than its audio
+  plausibly holds) after re-decoding; its text is kept as decoded, not
+  trimmed (issue #357). Clients may ignore it.
 - `{"type":"error","message":"..."}`: on error
 - `{"type":"pong"}`: in response to `{"type":"ping"}`
 - `{"type":"reset_ack"}`: in response to `{"type":"reset"}`
@@ -484,14 +488,17 @@ fixture, `tests/fixtures/stream_stitch_cases.txt`):
   window stays pending, like a busy window, instead of committing text known
   to be wrong. "Voiced" is 20 ms frames 15 dB
   above the span's quiet floor and above -60 dBFS.
-- Text over the word bound has its longest back-to-back repeated phrase cut
-  to two copies, one run at a time, only until it fits, and is cut at the
-  bound if it still does not. A committed window whose every re-decode loops
-  gets this; text within the bound is not touched, so real repeated speech
-  survives in the final. Previews (never re-decoded, replaced by the next one)
-  get it too, and additionally have any phrase repeated back to back more
-  than three times (8 words or more) cut to two copies, so a decoding loop
-  never reaches the client.
+- Committed text is always decoder output. A committed window or flush tail
+  that is still over the word bound after its re-decodes is kept as decoded:
+  a rapid list or real repeated speech can exceed the bound, and the final
+  must not lose it to a heuristic. The final then carries
+  `"loop_suspected":true` so the client can show it for review.
+- Previews (never re-decoded, replaced by the next one) over the word bound
+  have their longest back-to-back repeated phrase cut to two copies, one run
+  at a time, only until they fit, and are cut at the bound if they still do
+  not. Every preview also has any phrase repeated back to back more than
+  three times (8 words or more) cut to two copies, so a decoding loop does
+  not flash in the live text.
 With opt-in Granite chunk fairness, a blocking queue timeout ends the current
 take with `request timed out`; it is not retried as `server busy`. Reset the
 stream before sending more audio.

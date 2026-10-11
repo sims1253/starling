@@ -115,7 +115,7 @@
       "text"
     ],
     "openai_subset_plain_text_content_type": "text/plain; charset=utf-8",
-    "streaming_final_shape": "{type: final, text, segments: [{text, start_s, end_s}], duration_s}"
+    "streaming_final_shape": "{type: final, text, segments: [{text, start_s, end_s}], duration_s, loop_suspected?: true}"
   },
   "streaming": {
     "transport": "websocket",
