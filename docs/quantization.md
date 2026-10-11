@@ -124,9 +124,9 @@ those tensors are fair game:
 
 Kept at the source dtype on purpose:
 
-- **conv weights** (`conv` in the name): the conformer pointwise convs are
-  `ggml_cast` to F16 and reshaped before their matmul, the depthwise/subsampling
-  convs go through `ggml_conv_*` — no dequant path.
+- **conv weights** (`conv` in the name): the depthwise/subsampling convs go
+  through `ggml_conv_*` — no dequant path. The conformer pointwise convs
+  (`encoder.layers.N.conv.pointwise_conv{1,2}.weight`) are opt-in, see below.
 - **the prediction embedding** `decoder.prediction.embed.weight`: the engine
   expands it into a host F32 table (`prediction.cpp`). An explicit recipe
   rule can change its storage dtype for `general.architecture=parakeet_tdt`;
@@ -134,6 +134,29 @@ Kept at the source dtype on purpose:
 - **batch-norm statistics, norms, biases, pos_bias_u/v**: 1-D host-folded or
   broadcast operands.
 - **mel constants** (`preprocessor.*`): the filterbank/window must stay exact.
+
+Opt-in tensors keep their source dtype under named levels and `default`
+lines, and change only when an explicit recipe rule matches them. The table
+(`opt_ins()` in `cpp/tools/starling_quantize.cpp`) is keyed by
+`general.architecture` and lists the types each engine reads the tensor
+with; a matching rule with any other type fails:
+
+| architecture | tensor | accepted types |
+|--------------|--------|----------------|
+| parakeet_tdt | `decoder.prediction.embed.weight` | q8_0, f32 |
+| parakeet_tdt | `encoder.layers.N.conv.pointwise_conv{1,2}.weight` | f16, q8_0, q6_k, q4_k, q4_0 |
+| moss_transcribe, qwen3, granite, ark, voxtral | `llm.embed.weight` | f32, f16, q8_0, q6_k, q5_k, q4_k, q4_0 |
+| moss_transcribe | `enc.conv_out.weight` | f32, f16, q8_0, q6_k, q5_k, q4_k, q4_0, iq4_nl |
+| granite | `enc.blk.N.conv_{up,down}.weight` | f32, f16, q8_0, q6_k, q5_k, q4_k, q4_0, iq4_nl |
+
+The pointwise convs are kernel-size-1 convs stored `[1, in, out]`; a
+quantized copy is written flattened as `[in, out]` (same element order) so
+the row sits on ne[0]. The conformer graph and the fast engine both read
+them as 2-D matmul weights. The importance matrix records them under ggml's
+derived name (`<name> (copy) (reshaped)`); the quantizer falls back to that
+entry when the plain name is missing. A tied `llm.embed.weight` is also the
+lm_head: its full table is read on every decode step and never repacked by
+the CPU backend, so its type sets a large share of the decode bandwidth.
 
 Row width decides the floor: the joint/LSTM linears have 640-wide rows, which
 is not a multiple of the K-quant block size (256), so they fall back to
@@ -418,6 +441,70 @@ reversed direction as the phone began charging. Its timings and energy samples
 do not establish a controlled latency or energy result. The paired WER gate
 compares quality only. This phone result does not promote the recipe to a
 release default.
+
+## Phone recipes (Pixel 10 Pro, 2026-10)
+
+Goal: every model usable on the phone, with faster transcription, lower
+energy, and smaller files. Quality is measured on the host CPU; speed,
+memory and energy on the phone.
+
+**Quality gate.** FLEURS test, 100 en + 100 de clips. Each GGUF is
+decoded in a fresh process (`benchmarks/quant_phone/wer_models.py`).
+Against the source (or an all-Q8_0 reference when the source is too large
+for CPU), a recipe passes when, in both languages:
+
+- the corpus WER delta is at most +0.3 pt, and
+- the upper bound of the paired per-clip bootstrap 95 % CI is at most
+  +1.0 pt (`compare_wer.py`: 10k resamples, seed 0).
+
+Importance matrices use 160 FLEURS **validation** clips (100 en, 60 de).
+Collect them on an all-Q8_0 file, not on the BF16 source. The collector
+only records matmuls with F32 activations, and on a BF16 source the qwen
+trunks feed BF16 activations to every LLM linear, so the matrix stays
+nearly empty.
+
+**Phone measurement.** `benchmarks/quant_phone/phone_quant_bench.sh` runs
+on a host with adb. It starts each process only once the skin temperature
+is back near idle. Variants alternate ABBA across rounds. Energy per
+process is read from the coulomb counter on battery, minus the idle drain.
+
+What makes a recipe fast on arm64:
+
+- Q4_0 repacks to the i8mm 4x8 GEMM, Q4_K/Q5_K/Q6_K to 8x8, and Q8_0 to
+  4x8. IQ4_NL gets only a dotprod 4x4 kernel. Q2_K/Q3_K/IQ2/IQ3 are not
+  repacked.
+- K-quants need a row width that is a multiple of 256; narrower rows fall
+  back to Q8_0. Use Q4_0 for 640- or 896-wide rows.
+- The phone's Vulkan fast engine maps Q4_0/Q8_0 onto its W4/W8 layouts
+  losslessly and re-rounds K-quants.
+
+### Parakeet TDT 0.6B v3 — `parakeet-q4pw-fullimx.recipe`
+
+All linears are Q4_0, including the pointwise convs (opt-in, flattened).
+The joint, the LSTM and the prediction embedding are Q8_0. Matrix:
+`parakeet-full.imx`. Built with `--shrink-f16` from the F32 source.
+
+| variant | MB | en WER | de WER | paired en Δ [95 % CI] | paired de Δ [95 % CI] |
+|---------|---:|-------:|-------:|----------------------:|----------------------:|
+| F32 source | 2357 | 5.61 | 4.68 | — | — |
+| q4_k_m-shrink16 (today's download) | 553 | 5.42 | 4.72 | | |
+| **q4pw** | **364** | **5.33** | **4.46** | −0.31 [−0.80, +0.13] | −0.20 [−0.60, +0.19] |
+| q4pw, joint/LSTM also Q4_0 | 358 | 5.80 | 5.06 | | fails |
+
+Pixel 10 Pro, q4pw vs q4_k_m-shrink16 (medians over ABBA rounds):
+
+| engine | metric | q4_k_m-shrink16 | q4pw |
+|--------|--------|----------------:|-----:|
+| fast Vulkan | load | 2.30 s | 1.88 s |
+| fast Vulkan | medium / long fixture | 2.26 / 7.69 s | 2.06 / 6.91 s |
+| fast Vulkan | peak RSS | 1180 MB | 778 MB |
+| fast Vulkan | energy per process | 25.8 mWh | 21.9 mWh |
+| ggml CPU | peak RSS | 728 MB | 548 MB |
+| ggml CPU | CPU time | 192 s | 173 s |
+
+The fixture transcripts are identical. On the notebook's Radeon (RADV),
+transcripts are also identical and latency is within 8 %. The catalog
+entry is `parakeet-q4pw-phone`.
 
 ## Results (parakeet-tdt-0.6b-v3, LibriSpeech fixtures)
 
