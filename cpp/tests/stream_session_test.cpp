@@ -329,6 +329,7 @@ struct FixtureCase {
     std::vector<std::string> args;
     std::vector<std::string> committed, fresh, expect, calls;
     std::vector<double> audio;
+    int64_t loop_suspected = 0;
     struct Tx { std::string kind, start, length, text; };
     std::vector<Tx> tx;
 };
@@ -375,6 +376,8 @@ std::vector<FixtureCase> load_fixture_cases() {
             cases.back().tx.push_back({rest[0], rest[1], rest[2], join_words(t)});
         } else if (tag == "calls") {
             cases.back().calls = rest;
+        } else if (tag == "loop_suspected" && rest.size() == 1) {
+            cases.back().loop_suspected = std::stoll(rest[0]);
         } else {
             CHECK(false);
         }
@@ -505,9 +508,11 @@ static void test_stitch_fixture_cases() {
             };
             auto final_text = cs.flush(samples, tx);
             const bool ok = scripted && final_text.has_value()
-                && split_words(*final_text) == c.expect && calls == c.calls;
+                && split_words(*final_text) == c.expect && calls == c.calls
+                && cs.loop_suspected() == c.loop_suspected;
             if (!ok) {
-                std::fprintf(stderr, "stream case %s differs: %s\n  calls:", c.name.c_str(),
+                std::fprintf(stderr, "stream case %s differs (loop_suspected %lld): %s\n  calls:",
+                             c.name.c_str(), static_cast<long long>(cs.loop_suspected()),
                              final_text ? final_text->c_str() : "(none)");
                 for (const auto& k : calls) std::fprintf(stderr, " %s", k.c_str());
                 std::fprintf(stderr, "\n");
@@ -558,9 +563,10 @@ static void test_timed_words_must_match_the_text() {
     CHECK(cs.flush(samples, tx) == std::optional<std::string>("so in fact fact there's more"));
 }
 
-static void test_timed_loop_suppression_keeps_times() {
-    // A looping window keeps "la la end" with "end" still at 11 s, so the
-    // tail that heard "end" there again joins at it.
+static void test_timed_committed_loop_keeps_every_word() {
+    // A window that still loops after its re-decodes is committed as
+    // decoded (never cut to the word bound) and flagged; "end" keeps its
+    // time at 11 s, so the tail that heard "end" there again joins at it.
     ChunkStreamer cs(16000, 12.0, 3.0, 0.0, 0.0);
     std::vector<float> samples(14 * 16000, 0.0f);
     std::string loop;
@@ -573,7 +579,14 @@ static void test_timed_loop_suppression_keeps_times() {
     auto tx = timed_tx(cs, samples, {{"flush_window", 0.0, loop},
                                      {"redecode", -1.0, loop},
                                      {"flush_tail", 9.0, "end@2.02-2.3 more@3-3.2"}});
-    CHECK(cs.flush(samples, tx) == std::optional<std::string>("la la end more"));
+    std::string expect;
+    for (int k = 0; k < 90; ++k) expect += "la ";
+    expect += "end more";
+    CHECK(cs.flush(samples, tx) == std::optional<std::string>(expect));
+    CHECK(cs.loop_suspected() == 1);
+    CHECK(cs.redecodes() == 0);
+    cs.reset();
+    CHECK(cs.loop_suspected() == 0);
 }
 
 static ServerConfig test_cfg();
@@ -631,7 +644,8 @@ static void test_voiced_seconds() {
 
 static void test_preview_never_shows_a_loop() {
     // A 900-word looping preview (seen live, PR #430) is cut to what its
-    // audio can hold.
+    // audio can hold. The final of the same audio is decoder output: every
+    // word kept, the loop only flagged (issue #357).
     ChunkStreamer cs(16000, 12.0, 3.0, 0.0, 0.0);
     std::vector<float> samples(6 * 16000, 0.0f);
     std::string loop;
@@ -641,6 +655,26 @@ static void test_preview_never_shows_a_loop() {
     };
     auto text = cs.step(samples, 1.0, tx);
     CHECK(text.has_value() && *text == "a little bit of a little bit of");
+    CHECK(cs.loop_suspected() == 0);  // previews never flag
+    auto final_text = cs.flush(samples, tx);
+    CHECK(final_text.has_value() && split_words(*final_text) == split_words(loop));
+    CHECK(cs.loop_suspected() == 1);
+}
+
+static void test_committed_rapid_list_is_kept() {
+    // "one" to "ten" in a 0.75 s flush tail is more than the 9 words that
+    // much audio plausibly holds: the final keeps the list (flagged), a
+    // preview of it is cut to the bound.
+    const std::string said = "one two three four five six seven eight nine ten";
+    ChunkStreamer cs(16000, 12.0, 3.0, 0.0, 0.0);
+    std::vector<float> samples(12000, 0.1f);
+    TranscribeFn tx = [&](const float*, int64_t) -> std::optional<Transcript> {
+        return said;
+    };
+    CHECK(cs.step(samples, 1.0, tx)
+          == std::optional<std::string>("one two three four five six seven eight nine"));
+    CHECK(cs.flush(samples, tx) == std::optional<std::string>(said));
+    CHECK(cs.loop_suspected() == 1);
 }
 
 // ---- model slug mapping tests ---------------------------------------------
@@ -2002,8 +2036,40 @@ static void test_pump_stop_during_inference_finalizes_all_audio() {
         CHECK(fx.sent[fin].find("\"text\":\"w12800\"") != std::string::npos);
         CHECK(fx.sent[fin].find("\"duration_s\":0.8") != std::string::npos);
         CHECK(fx.sent[fin].find("\"path\":\"tail\"") != std::string::npos);
+        CHECK(fx.sent[fin].find("loop_suspected") == std::string::npos);
         CHECK(fin == fx.sent.size() - 1);
     }
+}
+
+static void test_pump_final_flags_a_suspected_loop() {
+    // A committed tail over the word bound is kept as decoded (issue #357):
+    // the final carries every word and "loop_suspected":true. The next take
+    // starts unflagged.
+    PumpFixture fx;
+    std::atomic<bool> looping{true};
+    std::string loop = "la";
+    for (int i = 1; i < 20; ++i) loop += " la";
+    fx.session.set_transcribe_fn([&](const float*, int64_t) -> std::optional<std::string> {
+        return looping.load() ? loop : std::string("fine");
+    });
+    StreamPump::Options opt;
+    StreamPump pump(fx.session, opt, fx.sender());
+    pump.push_audio(pcm_for_range(0, 8000));  // 0.5 s holds 7 words at most
+    pump.push_commit();
+    const size_t fin = fx.wait_for("\"type\":\"final\"");
+    CHECK(fin != SIZE_MAX);
+    pump.drain();
+    looping = false;
+    pump.push_audio(pcm_for_range(0, 8000));
+    pump.push_commit();
+    pump.drain();
+    std::lock_guard<std::mutex> lk(fx.mu);
+    if (fin != SIZE_MAX) {
+        CHECK(fx.sent[fin].find("\"text\":\"" + loop + "\"") != std::string::npos);
+        CHECK(fx.sent[fin].find("\"loop_suspected\":true") != std::string::npos);
+    }
+    CHECK(!fx.sent.empty() && fx.sent.back().find("\"text\":\"fine\"") != std::string::npos);
+    CHECK(!fx.sent.empty() && fx.sent.back().find("loop_suspected") == std::string::npos);
 }
 
 static void test_pump_coalesces_previews_and_keeps_every_sample() {
@@ -2764,10 +2830,11 @@ int main() {
     test_stitch_fixture_cases();
     test_timed_preview_stitch();
     test_timed_words_must_match_the_text();
-    test_timed_loop_suppression_keeps_times();
+    test_timed_committed_loop_keeps_every_word();
     test_session_traces_committed_word_times();
     test_voiced_seconds();
     test_preview_never_shows_a_loop();
+    test_committed_rapid_list_is_kept();
     test_session_ledger_records_redecode_spans();
     test_cap_does_not_count_the_redecode_lookback();
     test_stream_session_buffer_trim();
@@ -2809,6 +2876,7 @@ int main() {
     test_preview_policy_is_not_result_provenance();
     test_pump_stop_during_inference_finalizes_all_audio();
     test_pump_coalesces_previews_and_keeps_every_sample();
+    test_pump_final_flags_a_suspected_loop();
     test_pump_ping_follows_earlier_audio();
     test_window_decode_time_counts_toward_the_preview_gap();
     test_pump_stop_preempts_running_preview();

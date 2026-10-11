@@ -361,6 +361,11 @@ void StreamPump::handle_commit() {
        << safe_text << "\",\"segments\":[{\"text\":\""
        << safe_text << "\",\"start_s\":0.0,\"end_s\":"
        << dur << "}],\"duration_s\":" << dur;
+    // A committed window that still looked like a decoding loop after its
+    // re-decodes is kept as decoded; the final says so (issue #357). Only
+    // sent when true: clients that do not know the field see no change.
+    if (session_.chunker() && session_.chunker()->loop_suspected() > 0)
+        ss << ",\"loop_suspected\":true";
     if (opt_.trace) ss << ",\"trace\":" << session_.trace_final_json();
     ss << "}";
     send(ss.str());

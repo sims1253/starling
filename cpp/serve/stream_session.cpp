@@ -759,7 +759,11 @@ std::optional<ChunkStreamer::Decoded> ChunkStreamer::decode_committed(
     // neither is plausible, it does not loop and it is denser by
     // kRedecodeMinGain. A busy re-decode keeps the best so far if it is
     // plausible, and otherwise leaves the window pending (nullopt): the audio
-    // stays for a retry instead of committing known-wrong text.
+    // stays for a retry instead of committing known-wrong text. Committed
+    // text is always decoder output: a result that still looks like a loop
+    // after the re-decodes is kept whole and counted in loop_suspected_
+    // (fast lists and real repetition can look like a loop; the final is
+    // flagged instead of cut to a words-per-second bound).
     const int frame = sr_ / 50;
     auto voiced_of = [&](const std::vector<uint8_t>& flags) {
         return static_cast<double>(std::count(flags.begin(), flags.end(), uint8_t{1}))
@@ -815,8 +819,7 @@ std::optional<ChunkStreamer::Decoded> ChunkStreamer::decode_committed(
     }
     if (replaced) ++redecodes_;
     if (best_verdict == 2) {
-        best.keep(suppress_loops_kept(best.words,
-                                      static_cast<double>(best.end - best.start) / sr_));
+        ++loop_suspected_;
     } else if (best_voiced >= kMinVoicedSeconds) {
         rates_.push_back(static_cast<double>(best.words.size()) / best_voiced);
         if (rates_.size() > kRateHistory) rates_.erase(rates_.begin());
@@ -943,6 +946,7 @@ void ChunkStreamer::reset() {
     last_preview_cost_ = 0.0;
     coalesced_ = 0;
     redecodes_ = 0;
+    loop_suspected_ = 0;
     rates_.clear();
     last_ = {};
     call_kind_ = "window";

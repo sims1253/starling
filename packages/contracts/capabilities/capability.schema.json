@@ -374,7 +374,7 @@
           "const": "text/plain; charset=utf-8"
         },
         "streaming_final_shape": {
-          "const": "{type: final, text, segments: [{text, start_s, end_s}], duration_s}"
+          "const": "{type: final, text, segments: [{text, start_s, end_s}], duration_s, loop_suspected?: true}"
         }
       }
     },

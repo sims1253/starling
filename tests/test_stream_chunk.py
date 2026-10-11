@@ -596,6 +596,25 @@ def test_preview_never_shows_a_loop():
     text = cs.step(samples, 1.0, lambda w: loop)
     assert text == "a little bit of a little bit of"
     assert len(text.split()) <= max_plausible_words(6.0)
+    assert cs.loop_suspected == 0  # previews never flag
+    # The final of the same audio is decoder output: every word kept, the
+    # loop only flagged (issue #357).
+    assert cs.flush(samples, lambda w: loop) == loop.strip()
+    assert cs.loop_suspected == 1
+
+
+def test_committed_rapid_list_is_kept():
+    # "one" to "ten" in a 0.75 s flush tail is more than the 9 words that
+    # much audio plausibly holds: the final keeps the list (flagged), a
+    # preview of it is cut to the bound.
+    said = "one two three four five six seven eight nine ten"
+    cs = ChunkStreamer(**_cfg(min_seconds=0.0, partial_interval_seconds=0.0))
+    samples = np.full(int(0.75 * SR), 0.1, dtype=np.float32)
+    assert cs.step(samples, 1.0, lambda w: said) == "one two three four five six seven eight nine"
+    assert cs.flush(samples, lambda w: said) == said
+    assert cs.loop_suspected == 1
+    cs.reset()
+    assert cs.loop_suspected == 0
 
 
 def test_real_repetition_in_a_window_survives():
@@ -658,14 +677,17 @@ def test_word_times_that_do_not_match_the_text_are_ignored():
     assert cs.spans[-3:] == [None, None, None]
 
 
-def test_loop_suppression_keeps_word_times_with_their_words():
-    # A looping flush tail whose re-decodes loop too keeps the suppressed
-    # words, each still at its own time.
+def test_committed_loop_keeps_every_word_with_its_time():
+    # A flush tail over the word bound is committed as decoded, never cut
+    # to the bound: every word, each still at its own time, and flagged.
     cs = ChunkStreamer(**_cfg())
     loop = " ".join(f"la@{0.1 * k:.1f}-{0.1 * k + 0.05:.2f}" for k in range(40)) + " end@4.5-4.8"
     out = cs.flush(np.zeros(5 * SR, dtype=np.float32), lambda w: _transcript(loop.split()))
-    assert out == "la la end"
-    assert cs.spans == [(0, 800), (1600, 2400), (72000, 76800)]
+    assert out == " ".join(["la"] * 40 + ["end"])
+    assert cs.spans[:2] == [(0, 800), (1600, 2400)]
+    assert cs.spans[-1] == (72000, 76800)
+    assert len(cs.spans) == 41
+    assert cs.loop_suspected == 1
 
 
 def test_suppress_kept_indices_match_the_words():
@@ -699,6 +721,8 @@ def _parse_cases() -> list[dict]:
             cases[-1]["tx"].append((kind, start, length, " ".join(text)))
         elif tag == "calls":
             cases[-1]["calls"] = rest.split()
+        elif tag == "loop_suspected":
+            cases[-1]["loop_suspected"] = int(rest)
         else:
             raise AssertionError(f"bad fixture line: {raw!r}")
     return cases
@@ -737,7 +761,7 @@ def _seconds(sample: int) -> str:
     return f"{sample / SR:g}"
 
 
-def _replay_stream(case: dict) -> tuple[list[str], list[str]]:
+def _replay_stream(case: dict) -> tuple[list[str], list[str], int]:
     chunk_s, overlap_s = (float(x) for x in case["args"][1:3])
     audio = case["audio"]
     samples = np.concatenate([np.full(int(round(audio[i] * SR)), audio[i + 1], dtype=np.float32)
@@ -765,7 +789,7 @@ def _replay_stream(case: dict) -> tuple[list[str], list[str]]:
 
     final = cs.flush(samples, tx)
     assert final is not None
-    return final.split(), calls
+    return final.split(), calls, cs.loop_suspected
 
 
 @pytest.mark.parametrize("case", _parse_cases(), ids=lambda c: f"{c['op']}-{c['args'][0]}")
@@ -781,6 +805,7 @@ def test_stitch_fixture_case(case):
     elif case["op"] == "preview":
         assert suppress_preview_loops(case["<"], float(case["args"][1])) == case["="]
     else:
-        final, calls = _replay_stream(case)
+        final, calls, loop_suspected = _replay_stream(case)
         assert final == case["="]
         assert calls == case["calls"]
+        assert loop_suspected == case.get("loop_suspected", 0)

@@ -90,9 +90,13 @@ std::optional<std::pair<int, int>> stitch_timed(
 // transcribes the same audio; a transducer can also loop on a phrase. A
 // committed window is therefore checked against its audio and, when
 // implausible, decoded again from the earlier starts in kRedecodeShifts.
-// Constants and rules are those of src/starling/stream_chunk.py.
+// The committed text is always decoder output: only previews are trimmed
+// (suppress_preview_loops), and a committed result that still looks like a
+// loop is kept and flagged (loop_suspected). Constants and rules are those
+// of src/starling/stream_chunk.py.
 
-// More words than this per second (plus kMaxWordsSlack) is a decoding loop.
+// More words than this per second (plus kMaxWordsSlack) suggests a decoding
+// loop (fast lists and real repetition can come close).
 constexpr double kMaxWordsPerSecond = 7.0;
 constexpr int kMaxWordsSlack = 4;
 // Fewer words per voiced second than this, or than kRelativeMinRate of the
@@ -109,7 +113,7 @@ constexpr double kRedecodeShifts[] = {0.5, 0.25, 0.75};
 // A sparse window is replaced only by a candidate this much denser.
 constexpr double kRedecodeMinGain = 1.25;
 
-// Most words `seconds` of audio can hold; more is a decoding loop.
+// Most words `seconds` of audio plausibly hold; more suggests a decoding loop.
 int max_plausible_words(double seconds);
 // Seconds of audio loud enough to be speech: 20 ms frames 15 dB over the
 // span's quiet floor (its 10th-percentile frame, at most -45 dBFS) and over
@@ -117,9 +121,9 @@ int max_plausible_words(double seconds);
 double voiced_seconds(const float* samples, int64_t n, int sample_rate);
 // The same measure per 20 ms frame (1 = voiced).
 std::vector<uint8_t> voiced_frames(const float* samples, int64_t n, int sample_rate);
-// Words of a decode over `seconds` of audio with a decoding loop removed:
-// unchanged within max_plausible_words(), so real repeated speech is never
-// touched. Longer text has its longest back-to-back run of one phrase
+// Words of a preview over `seconds` of audio with a decoding loop removed
+// (never applied to committed text): unchanged within max_plausible_words(),
+// so real repeated speech is never touched. Longer text has its longest back-to-back run of one phrase
 // (1..max_n words) cut to max_repeats copies, one run at a time, only until
 // it fits; what still does not fit is cut at the bound.
 std::vector<std::string> suppress_loops(const std::vector<std::string>& words,
@@ -274,6 +278,11 @@ public:
     }
     // Committed windows and flush tails replaced by a re-decode.
     int64_t redecodes() const { return redecodes_; }
+    // Committed windows and flush tails that still held more words than
+    // max_plausible_words() after the re-decodes. Their text is committed
+    // as decoded (never cut to the bound); the final reports
+    // "loop_suspected" instead.
+    int64_t loop_suspected() const { return loop_suspected_; }
 
     // How many leading words of every text this streamer returns from now
     // on are fixed: no later window, tail or flush can change them. Only
@@ -340,8 +349,8 @@ private:
     std::optional<Decoded> decode(const std::vector<float>& samples, int64_t start,
                                   int64_t end, const char* kind, const TranscribeFn& tx);
     // Words of samples[start, end) for the committed text, re-decoded when
-    // implausible (see stream_chunk.py _decode_committed); nullopt when the
-    // engine is busy before a plausible result is in hand.
+    // implausible (see stream_chunk.py _decode_committed) and never trimmed;
+    // nullopt when the engine is busy before a plausible result is in hand.
     std::optional<Decoded> decode_committed(
         const std::vector<float>& samples, int64_t start, int64_t end,
         const char* kind, const TranscribeFn& tx);
@@ -383,6 +392,7 @@ private:
     double last_preview_cost_ = 0.0; // seconds, latest successful preview
     int64_t coalesced_ = 0;
     int64_t redecodes_ = 0;
+    int64_t loop_suspected_ = 0;
     std::vector<double> rates_;  // words per voiced second, latest windows
     // The latest committed decode (its words are only counted).
     struct {

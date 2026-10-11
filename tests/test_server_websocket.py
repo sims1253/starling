@@ -75,6 +75,35 @@ def test_websocket_busy_commit_retains_audio(server, monkeypatch):
             assert ws.receive_json()["duration_s"] == 0
 
 
+def test_websocket_final_keeps_and_flags_a_suspected_loop(server, monkeypatch):
+    # A committed tail over the word bound (0.5 s holds 7 words) is kept as
+    # decoded and the final says so (issue #357); the partial is trimmed and
+    # an ordinary final carries no flag.
+    loop = " ".join(["la"] * 20)
+    said = [loop]
+
+    def transcribe(samples, rid, **kwargs):
+        return S.TranscribeResult(text=said[0])
+
+    monkeypatch.setattr(server, "_run_queued_sync", transcribe)
+    half = np.zeros(S.SAMPLE_RATE // 2, dtype=np.int16).tobytes()
+    with TestClient(S.create_app(server=server, load_on_startup=False)) as client:
+        with client.websocket_connect('/stream') as ws:
+            ws.send_bytes(half)
+            assert len(ws.receive_json()["text"].split()) <= 7
+            ws.send_json({"type": "commit"})
+            final = ws.receive_json()
+            assert final["text"] == loop
+            assert final["loop_suspected"] is True
+            said[0] = "fine"
+            ws.send_bytes(half)
+            assert ws.receive_json()["type"] == "partial"
+            ws.send_json({"type": "commit"})
+            final = ws.receive_json()
+            assert final["text"] == "fine"
+            assert "loop_suspected" not in final
+
+
 def test_invalid_commands_preserve_connection_and_disconnect_is_clean(server, caplog):
     with TestClient(S.create_app(server=server, load_on_startup=False)) as client:
         with client.websocket_connect('/stream') as ws:
