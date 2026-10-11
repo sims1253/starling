@@ -22,3 +22,13 @@ updates:
     directory: /apps/mobile
     schedule:
       interval: weekly
+  - package-ecosystem: cargo
+    directory: /apps/desktop-gpui
+    schedule:
+      interval: weekly
+    # One PR for the routine bumps; majors stay separate for review.
+    groups:
+      cargo-minor-patch:
+        update-types:
+          - minor
+          - patch

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Assemble the macOS distribution of the gpui desktop app: a universal
 # (aarch64 + x86_64) Starling.app and a compressed disk image. Run on macOS
-# with a stable Rust toolchain; output lands in target/package/.
+# with the toolchain rust-toolchain.toml pins; output lands in target/package/.
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."

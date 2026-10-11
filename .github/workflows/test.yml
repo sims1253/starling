@@ -8,14 +8,32 @@ on:
     branches: [master, main]
   pull_request:
     branches: [master, main]
+    # Python, benchmark and engine sources plus what the guards read: docs
+    # (manifest and runtime-contract agreement), scripts and the workflows
+    # the release contract checks. App-only changes skip this workflow.
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - 'benchmarks/**'
+      - 'scripts/**'
+      - 'docs/**'
+      - 'quants/**'
+      - 'cpp/**'
+      - 'backends/**'
+      - 'third_party/**'
+      - 'CMakeLists.txt'
+      - 'CMakePresets.json'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - '.github/workflows/**'
 
 permissions:
   contents: read
 
-# Cancel in-progress runs for the same ref when a new commit lands.
+# Superseded PR pushes cancel; every master push runs to completion.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   sonar-tests:

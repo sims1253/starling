@@ -9,11 +9,58 @@ on:
 permissions:
   contents: read
 
+# Superseded PR pushes cancel; every master push runs to completion.
 concurrency:
   group: portable-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # Which lanes a pull request touches; pushes and dispatches run them all.
+  changes:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      contracts: ${{ steps.filter.outputs.contracts }}
+      android: ${{ steps.filter.outputs.android }}
+      ios: ${{ steps.filter.outputs.ios }}
+    steps:
+      # dorny/paths-filter v4.0.3. On pull requests it lists the changed
+      # files through the API, so no checkout is needed.
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d
+        id: filter
+        if: github.event_name == 'pull_request'
+        with:
+          filters: |
+            native: &native
+              - 'cpp/**'
+              - 'backends/native/**'
+              - 'third_party/**'
+              - 'CMakeLists.txt'
+              - 'CMakePresets.json'
+              - 'scripts/apply_ggml_patches.sh'
+              - '.github/workflows/apps.yml'
+            contracts:
+              - *native
+              - 'backends/**'
+              - 'quants/**'
+              - 'packages/**'
+              - 'package.json'
+              - 'pnpm-lock.yaml'
+              - 'pnpm-workspace.yaml'
+              - 'pyproject.toml'
+              - 'uv.lock'
+            android:
+              - *native
+              - 'apps/mobile/**'
+              - 'packages/contracts/**'
+              - 'tests/fixtures/**'
+            ios:
+              - 'apps/ios/**'
+              - '.github/workflows/apps.yml'
+
   typescript:
     name: TypeScript workspace (${{ matrix.os }})
     timeout-minutes: 30
@@ -34,6 +81,8 @@ jobs:
       - run: vp run check
 
   api-contracts:
+    needs: changes
+    if: github.event_name != 'pull_request' || needs.changes.outputs.contracts == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -67,6 +116,8 @@ jobs:
         run: uv run --no-project --with openapi-spec-validator python -c "import json; from openapi_spec_validator import validate; validate(json.load(open('packages/contracts/openapi.json')))"
 
   android:
+    needs: changes
+    if: github.event_name != 'pull_request' || needs.changes.outputs.android == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
@@ -112,6 +163,8 @@ jobs:
           retention-days: 14
 
   ios:
+    needs: changes
+    if: github.event_name != 'pull_request' || needs.changes.outputs.ios == 'true'
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
