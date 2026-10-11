@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# phone_energy.sh — energy per MOSS-short transcription on the phone (#317's
+# phone_energy.sh — energy per short-clip transcription on the phone (#317's
 # last deliverable: "report energy per transcription next to it and say how
 # it was measured: the batterystats power model is an estimate, not a rail
 # measurement").
@@ -11,16 +11,22 @@
 # subtracted. One bench invocation per engine (--runs N, a single model load
 # each — the phone's GPU health budget). The phone must be on battery.
 #
-# Env: RUNS (timed transcriptions per engine, default 12), MOSS_GGUF,
-# OUT (directory for the raw points and bench logs, default a fresh mktemp).
+# Env: RUNS (timed transcriptions per engine, default 12), MODEL (bench
+# --model, default moss) and GGUF (file name in /data/local/tmp/starling),
+# BENCH (bench binary path on the phone; its directory holds the ggml
+# libraries, default $DEV/starling-bench-cand), OUT (directory for the raw
+# points and bench logs, default a fresh mktemp).
 set -euo pipefail
 . "$(dirname "$0")/phone_common.sh"
 DEV=/data/local/tmp/starling
 RUNS=${RUNS:-12}
-MOSS_GGUF=${MOSS_GGUF:-moss-transcribe-preview-2b-q4e8-fullimx.gguf}
+MODEL=${MODEL:-moss}
+GGUF=${GGUF:-moss-transcribe-preview-2b-q4e8-fullimx.gguf}
+BENCH=${BENCH:-$DEV/starling-bench-cand}
 V_NOM=3.87   # nominal Li-ion voltage for µAh -> µWh; the gauge integrates
              # current, so this is an approximation of energy, stated as such
 OUT=${OUT:-$(mktemp -d)}
+mkdir -p "$OUT"
 POINTS="$OUT/energy_points.txt"
 
 command -v adb >/dev/null || { echo "adb missing" >&2; exit 1; }
@@ -58,8 +64,8 @@ wake_hold
 wait_benches
 
 bench() {  # bench <engine>
-  adb shell "cd $DEV && timeout 900 env LD_LIBRARY_PATH=. STARLING_ENGINE=$1 STARLING_GGML_THREADS=6 \
-    STARLING_FAST_CACHE_DIR=$DEV ./starling-bench-cand --model moss --gguf $DEV/$MOSS_GGUF \
+  adb shell "cd ${BENCH%/*} && timeout 900 env LD_LIBRARY_PATH=. STARLING_ENGINE=$1 STARLING_GGML_THREADS=6 \
+    STARLING_FAST_CACHE_DIR=$DEV ./${BENCH##*/} --model $MODEL --gguf $DEV/$GGUF \
     --warmup --runs $RUNS $DEV/short.wav" 2>&1
 }
 
