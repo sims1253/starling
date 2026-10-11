@@ -1,0 +1,28 @@
+# starling-quantize recipe: the phone-sized Parakeet TDT v3 (364 MB, -34 % vs
+# the q4_k_m-shrink16 file the app downloads today). Every linear Q4_0 —
+# including the conformer pointwise convs, which every earlier recipe kept at
+# F16 (151 MB, 27 % of the q4_k_m file) and which are opt-in here; the
+# quantizer writes them flattened [in, out] — with the duration-sensitive
+# 640-wide joint/LSTM and the prediction embedding at Q8_0 (making those
+# Q4_0 too cost +0.4 pt German WER).
+#
+# Why Q4_0: on arm64 it repacks into the i8mm 4x8 GEMM, and the phone's Vulkan
+# fast engine maps Q4_0/Q8_0 onto its W4/W8 layouts losslessly (Q4_K/Q6_K are
+# re-rounded there).
+#
+# Measured (2026-10-11, F32 source, parakeet-full.imx; FLEURS test, 100 clips
+# per language, paired bootstrap vs F32): en 5.33 % vs 5.61 % (clip delta
+# -0.31 pt [-0.80, +0.13]), de 4.46 % vs 4.68 % (-0.20 pt [-0.60, +0.19]).
+# Pixel 10 Pro ggml CPU vs q4_k_m-shrink16: peak RSS 548 vs 728 MB, process
+# CPU time -10 %. Notebook RADV: transcripts identical, latency within 8 %.
+#
+#   build/starling-quantize \
+#       --input models/parakeet-tdt-0.6b-v3-f32.gguf \
+#       --output models/parakeet-tdt-0.6b-v3-q4pw-fullimx.gguf \
+#       --recipe quants/recipes/parakeet-q4pw-fullimx.recipe \
+#       --imatrix models/parakeet-full.imx --shrink-f16
+default q4_0
+^encoder\.layers\.[0-9]+\.conv\.pointwise_conv[12]\.weight$ q4_0
+^decoder\.prediction\.embed\.weight$ q8_0
+^joint\. q8_0
+^decoder\.prediction\.dec_rnn\. q8_0
