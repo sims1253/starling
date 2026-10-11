@@ -82,6 +82,7 @@ set(STARLING_FAST_SHADERS
   "attn_decode_split|attn_decode_split.comp||8"
   "attn_split_combine|attn_split_combine.comp||3"
   "rope_kv|rope_kv.comp||7"
+  "enc_rope|enc_rope.comp||4"
   "embed_rows|embed_rows.comp|W_W4|10"
   "embed_rows_w8|embed_rows.comp|W_W8|10"
   "embed_rows_f16|embed_rows.comp|W_F16|10"

@@ -72,6 +72,11 @@ struct MelView {
 struct Spec {
     const char* tag = "";   // messages and timing lines ("moss", "qwen3", "ark", "granite")
     bool encoder = true;    // false: decoder-only, the host supplies the audio rows
+    // ARK's Whisper encoder (with `encoder` false): the host supplies the
+    // log-mel; conv stem, RoPE global-attention layers, ln_post and the
+    // merge-by-`merge` GELU adapter run on the device.
+    bool whisper = false;
+    uint32_t merge = 0, rope_half = 0;
     std::string conv_out, pos_embed, proj1, proj2;
     std::string eq, ek, ev, eo, efc1, efc2;
     bool adapter = false;   // MOSS: SwiGLU adapter between projection and LLM
@@ -181,6 +186,17 @@ Spec ark_spec(const ak::Config& c) {
     s.qk_norm = false;
     s.banned = c.bad_words_ids;
     s.eos = c.eos_token_id; s.max_new_tokens = c.max_new_tokens;
+    // The Whisper encoder + adapter on the device unless
+    // STARLING_FAST_ARK_HOST_ENCODER=1 keeps them on ggml (decoder-only).
+    const auto& ec = c.encoder;
+    const auto& ac = c.adapter;
+    s.whisper = !env_on("STARLING_FAST_ARK_HOST_ENCODER") && ec.use_rope && ac.act == "gelu" &&
+                ac.input_size == ec.d_model * ac.merge_factor && ac.output_size == lc.hidden &&
+                ec.conv_kernel == 3;
+    s.ED = ec.d_model; s.EH = ec.n_heads; s.EHD = ec.head_dim; s.EFF = ec.ffn_dim; s.EL = ec.n_layers;
+    s.n_mels = ec.num_mel_bins; s.enc_eps = ec.layer_norm_eps;
+    s.merge = ac.merge_factor; s.rope_half = ec.rope_dim / 2;
+    s.AH = ac.hidden_size; s.EOUT = ac.output_size;
     return s;
 }
 
@@ -256,6 +272,11 @@ struct AudioLlmEngine::Impl {
     Arena::Id c1_w, c1_b, c2_b, c3_b, pe13, lnp_g, lnp_b, p1_b, p2_b;
     GMat c2, c3, cout, p1, p2, ad_gateup, ad_down;
     std::vector<EncLayer> enc;
+    // Whisper (ARK): conv stem as GEMMs over [k*cin + c] rows, RoPE tables;
+    // the adapter is p1/p2 (+ p1_b/p2_b), ln_post lnp_g/lnp_b.
+    GMat wc1, wc2;
+    Arena::Id wc1_b, wc2_b, rope_cos, rope_sin;
+    uint32_t rope_rows = 0;   // encoder positions the RoPE tables cover
     // LLM weights
     std::vector<LlmLayer> llm;
     Arena::Id final_norm, rope_tab;
@@ -272,7 +293,7 @@ struct AudioLlmEngine::Impl {
     int cap_C = 0, cap_A = 0, cap_S = 0;
     uint32_t n_part = 0;
 
-    struct Rec { std::unique_ptr<vk::Recording> rec; uint64_t used = 0; int A = 0, S = 0; };
+    struct Rec { std::unique_ptr<vk::Recording> rec; uint64_t used = 0; int A = 0, S = 0, slot0 = 0; };
     std::map<std::pair<int, int>, Rec> recs;           // keyed by (chunks, tail)
     std::unique_ptr<vk::Recording> dec_rec;
     uint32_t dec_steps = 0;
@@ -285,6 +306,15 @@ struct AudioLlmEngine::Impl {
     // Decoder-only prefill over S host-supplied rows (embedding lookup of
     // the text slots, then the LLM).
     bool record_prefill_rows(int S, Rec& r, std::string& err);
+    // Whisper (ARK) prefill: L mel frames through conv stem, encoder layers
+    // and adapter into the audio slots [slot0, slot0 + n_slots) of lx, then
+    // the text-slot lookup and the LLM over S rows.
+    bool record_prefill_whisper(int L, int S, int slot0, int n_slots, Rec& r, std::string& err);
+    // Host-side prompt rows: audio slots from `audio` (or zero), text slots
+    // left to the device lookup (ids, 0xffffffff on audio slots).
+    bool prompt_rows(const std::vector<int32_t>& prompt_ids, const std::vector<uint8_t>& audio_mask,
+                     const float* audio, int64_t audio_rows, std::vector<float>& rows,
+                     std::vector<uint32_t>& idv, std::string& err);
     // The LLM prefill over the S rows of lx, ending with the first token.
     bool record_llm(vk::Recording& rc, uint32_t S, std::string& err);
     bool embed_lookup(vk::Recording& rc, uint32_t n, uint32_t ids_off, uint32_t out_row0, std::string& err);
@@ -318,6 +348,11 @@ struct AudioLlmEngine::Impl {
         const uint32_t gqa = NH / NKV;
         const size_t fit = std::min<size_t>(NH, (64ull << 20) / (S * S * 4));
         return std::max<uint32_t>(gqa, (uint32_t)(fit / gqa * gqa));
+    }
+    // Whisper attention heads per score group: a 64 MiB score budget (at
+    // least one head, at most all).
+    uint32_t whisper_hgroup(size_t T) const {
+        return (uint32_t)std::max<size_t>(1, std::min<size_t>(EH, (64ull << 20) / (T * T * 4)));
     }
     bool record_decode(uint32_t steps, std::string& err);
     bool lm_head(vk::Recording& rc, vk::Ref x, uint32_t x_off, std::string& err);
@@ -378,7 +413,7 @@ std::unique_ptr<AudioLlmEngine> AudioLlmEngine::create(const gr::GraniteModel& m
     return e;
 }
 
-size_t release_decoder_host_weights(const ggml::ModelLoader& loader) {
+size_t release_host_weights(const ggml::ModelLoader& loader, const std::vector<std::string>& prefixes) {
     size_t released = 0;
 #if defined(__linux__)
     // Only ranges inside the loader's own host allocation: once a GPU ggml
@@ -389,7 +424,9 @@ size_t release_decoder_host_weights(const ggml::ModelLoader& loader) {
     const uintptr_t hi = lo + ggml_get_mem_size(loader.ctx());
     const uintptr_t page = (uintptr_t)sysconf(_SC_PAGESIZE);
     for (const std::string& n : loader.tensor_names()) {
-        if (n.rfind("llm.", 0) != 0) continue;
+        if (std::none_of(prefixes.begin(), prefixes.end(),
+                         [&](const std::string& pf) { return n.rfind(pf, 0) == 0; }))
+            continue;
         const ggml_tensor* t = loader.tensor(n.c_str());
         if (!t || !t->data || (uintptr_t)t->data < lo || (uintptr_t)t->data + ggml_nbytes(t) > hi) continue;
         // Whole pages inside the tensor only: neighbours keep their bytes.
@@ -399,6 +436,7 @@ size_t release_decoder_host_weights(const ggml::ModelLoader& loader) {
     }
 #else
     (void)loader;
+    (void)prefixes;
 #endif
     return released;
 }
@@ -422,9 +460,12 @@ bool AudioLlmEngine::Impl::load(const ggml::ModelLoader& ml, std::string& err) {
         (EHD == 64 && DS % 8 == 0 && sp.n_mels == 128 && sp.n_window_infer % 100 == 0 &&
          sp.n_window_infer != 0 && (sp.adapter ? AH != 0 : EOUT == HD) &&
          sp.prefix.size() + sp.suffix.size() <= kMaxPromptIds);
+    const bool whisper_ok = !sp.whisper ||
+        (sp.n_mels % 8 == 0 && ED % 32 == 0 && EFF % 32 == 0 && EHD % 8 == 0 && EH * EHD == ED &&
+         sp.rope_half * 2 <= EHD && sp.merge != 0 && AH % 32 == 0 && EOUT == HD);
     // The input-embedding multiplier is folded into the input table, so it
     // needs an untied head.
-    if (!enc_ok || (HDIM != 128 && HDIM != 64) || (!sp.tied && sp.lm_head.empty()) || MAXPOS > 4096 ||
+    if (!enc_ok || !whisper_ok || (HDIM != 128 && HDIM != 64) || (!sp.tied && sp.lm_head.empty()) || MAXPOS > 4096 ||
         NKV == 0 || NH % NKV || HD % 32 || FF % 32 || sp.max_new_tokens > MAXPOS ||
         (sp.emb_mult != 1.0f && sp.lm_head.empty())) {
         err = "fast " + tag + ": unsupported configuration";
@@ -590,6 +631,56 @@ bool AudioLlmEngine::Impl::load(const ggml::ModelLoader& ml, std::string& err) {
             return false;
         if (sp.adapter && (!interleave("adapter.gate.weight", "adapter.up.weight", ad_gateup) ||
                            !mat("adapter.down.weight", ad_down)))
+            return false;
+    }
+
+    // ---- Whisper encoder + adapter (ARK) ----
+    if (sp.whisper) {
+        // Conv1d k3 weights [OC][IC][K] (GGUF ne = K, IC, OC) as GEMM rows
+        // [OC][k * IC + ic]: the stem convolves time-major activations, whose
+        // three input rows t*s-1 .. t*s+1 are one contiguous run of 3*IC.
+        auto conv = [&](const char* n, uint32_t IC, GMat& g, Arena::Id& b) {
+            std::vector<float> w;
+            if (!f32(std::string(n) + ".weight", w) || !vec_id(std::string(n) + ".bias", b)) return false;
+            if (w.size() != (size_t)ED * IC * 3) { err = "fast " + tag + ": " + n + " shape"; return false; }
+            std::vector<float> r(w.size());
+            for (uint32_t oc = 0; oc < ED; ++oc)
+                for (uint32_t ic = 0; ic < IC; ++ic)
+                    for (uint32_t k = 0; k < 3; ++k)
+                        r[(size_t)oc * 3 * IC + k * IC + ic] = w[((size_t)oc * IC + ic) * 3 + k];
+            HostMatrix hm;
+            if (!pack_gpu_matrix_raw(GGML_TYPE_F32, r.data(), ED, 3 * IC, hm, err)) return false;
+            g = arena_matrix(ar, std::move(hm));
+            return true;
+        };
+        if (!conv("enc.conv1", sp.n_mels, wc1, wc1_b) || !conv("enc.conv2", ED, wc2, wc2_b)) return false;
+        {
+            const ggml_tensor* tc = T("enc.rope_cos");
+            if (!tc || tc->ne[0] != (int64_t)sp.rope_half) {
+                if (err.empty()) err = "fast " + tag + ": encoder RoPE table shape";
+                return false;
+            }
+            if (!vec_id("enc.rope_cos", rope_cos) || !vec_id("enc.rope_sin", rope_sin)) return false;
+            rope_rows = (uint32_t)tc->ne[1];
+        }
+        enc.resize(EL);
+        for (uint32_t l = 0; l < EL; ++l) {
+            EncLayer& Y = enc[l];
+            const std::string p = "enc.blk." + std::to_string(l) + ".";
+            // k has no bias (WhisperRoPESdpaAttention).
+            if (!mat(p + "attn.q.weight", Y.q) || !mat(p + "attn.k.weight", Y.k) ||
+                !mat(p + "attn.v.weight", Y.v) || !mat(p + "attn.o.weight", Y.o) ||
+                !mat(p + "ffn.fc1.weight", Y.fc1) || !mat(p + "ffn.fc2.weight", Y.fc2) ||
+                !vec_id(p + "attn.q.bias", Y.q_b) || !vec_id(p + "attn.v.bias", Y.v_b) ||
+                !vec_id(p + "attn.o.bias", Y.o_b) || !vec_id(p + "ffn.fc1.bias", Y.fc1_b) ||
+                !vec_id(p + "ffn.fc2.bias", Y.fc2_b) ||
+                !vec_id(p + "attn_norm.weight", Y.ln1_g) || !vec_id(p + "attn_norm.bias", Y.ln1_b) ||
+                !vec_id(p + "ffn_norm.weight", Y.ln2_g) || !vec_id(p + "ffn_norm.bias", Y.ln2_b))
+                return false;
+        }
+        if (!vec_id("enc.ln_post.weight", lnp_g) || !vec_id("enc.ln_post.bias", lnp_b) ||
+            !mat("adapter.fc0.weight", p1) || !vec_id("adapter.fc0.bias", p1_b) ||
+            !mat("adapter.fc2.weight", p2) || !vec_id("adapter.fc2.bias", p2_b))
             return false;
     }
 
@@ -780,13 +871,27 @@ bool AudioLlmEngine::Impl::ensure(int C, int A, int S, std::string& err) {
         return ctx->create_buffer(b, std::max<size_t>(bytes, 16), kind, err);
     };
     const size_t hgroup = prefill_hgroup((size_t)S);
-    if (!mk(mel_in, (size_t)C * 128 * P * 4, ctx->info().uma ? vk::Mem::Device : vk::Mem::Upload) ||
-        !mk(cv1, (size_t)C * T1 * F1 * DS * 2) || !mk(cv2, (size_t)C * T2 * F2 * DS * 2) ||
-        !mk(cv3, (size_t)C * T3 * F3 * DS * 2) || !mk(ex, (size_t)A * ED * 4) || !mk(eh, (size_t)A * ED * 2) ||
+    size_t mel_b = (size_t)C * 128 * P * 4, cv1_b = (size_t)C * T1 * F1 * DS * 2,
+           cv2_b = (size_t)C * T2 * F2 * DS * 2, cv3_b = (size_t)C * T3 * F3 * DS * 2,
+           esc_b = nwin * EH * W * W * 4, ep_b = nwin * EH * W * ldPw * 2, adh_b = (size_t)A * AH * 2;
+    if (sp.whisper) {
+        // C = mel frames (time-major f16 with a zero row either side), A =
+        // encoder frames; global attention scores in head groups (64 MiB).
+        const size_t hw = whisper_hgroup((size_t)A);
+        mel_b = ((size_t)C + 2) * sp.n_mels * 2;
+        cv1_b = ((size_t)C + 2) * ED * 2;
+        cv2_b = cv3_b = 0;
+        esc_b = hw * A * A * 4;
+        ep_b = hw * A * round_up((uint32_t)A, 8) * 2;
+        adh_b = ((size_t)A / sp.merge + 1) * AH * 2;
+    }
+    if (!mk(mel_in, mel_b, ctx->info().uma ? vk::Mem::Device : vk::Mem::Upload) ||
+        !mk(cv1, cv1_b) || !mk(cv2, cv2_b) ||
+        !mk(cv3, cv3_b) || !mk(ex, (size_t)A * ED * 4) || !mk(eh, (size_t)A * ED * 2) ||
         !mk(eq, (size_t)A * ED * 2) || !mk(ek, (size_t)A * ED * 2) || !mk(ev, (size_t)A * ED * 2) ||
-        !mk(esc, nwin * EH * W * W * 4) || !mk(ep, nwin * EH * W * ldPw * 2) || !mk(ectx, (size_t)A * ED * 2) ||
+        !mk(esc, esc_b) || !mk(ep, ep_b) || !mk(ectx, (size_t)A * ED * 2) ||
         !mk(effh, (size_t)A * EFF * 2) || !mk(eproj, (size_t)A * ED * 2) || !mk(eproj2, (size_t)A * EOUT * 2) ||
-        !mk(adh, (size_t)A * AH * 2) || !mk(lx, (size_t)S * HD * 4) || !mk(lhn, (size_t)S * HD * 2) ||
+        !mk(adh, adh_b) || !mk(lx, (size_t)S * HD * 4) || !mk(lhn, (size_t)S * HD * 2) ||
         !mk(lqkv, (size_t)S * (NH + 2 * NKV) * HDIM * 2) || !mk(lqr, (size_t)S * NH * HDIM * 2) ||
         !mk(lsc, hgroup * S * S * 4) || !mk(lp, hgroup * S * ldPs * 2) || !mk(lctx, (size_t)S * NH * HDIM * 2) ||
         !mk(lmlp, (size_t)S * FF * 2))
@@ -1023,6 +1128,147 @@ bool AudioLlmEngine::Impl::record_prefill_rows(int S, Rec& r, std::string& err) 
     rc.begin();
     // Text slots from the input table; the audio slots (id 0xffffffff) were
     // uploaded with the rows.
+    if (!embed_lookup(rc, (uint32_t)S, 0, 0, err)) return false;
+    rc.barrier();
+    if (!record_llm(rc, (uint32_t)S, err)) return false;
+    rc.end();
+    return true;
+}
+
+bool AudioLlmEngine::Impl::record_prefill_whisper(int L, int S, int slot0, int n_slots, Rec& r, std::string& err) {
+    const uint32_t T = (uint32_t)(L + 1) / 2;            // conv2 stride 2
+    const uint32_t Na = std::min<uint32_t>(T / sp.merge, (uint32_t)n_slots);
+    r.A = (int)T;
+    r.S = S;
+    r.slot0 = slot0;
+    r.rec = std::make_unique<vk::Recording>(*ctx);
+    vk::Recording& rc = *r.rec;
+    rc.begin();
+    const uint32_t IC = sp.n_mels;
+
+    // ---- conv stem: two k3 Conv1d + GELU as GEMMs over time-major rows ----
+    // mel_in is [L + 2][IC] f16 with zero rows at both ends (padding 1), so
+    // output row t reads the contiguous run of input rows t*s .. t*s + 2.
+    // conv1 writes rows 1..L of cv1, whose two pad rows are cleared here.
+    rc.fill(cv1, 0, (VkDeviceSize)ED * 2, 0);
+    rc.fill(cv1, ((VkDeviceSize)L + 1) * ED * 2, (VkDeviceSize)ED * 2, 0);
+    rc.barrier();
+    auto stem = [&](const GMat& w, Arena::Id b, vk::Buffer& in, uint32_t M, uint32_t cin, uint32_t stride,
+                    vk::Buffer& out, uint32_t c_off, Epi epi) {
+        GemmCall c;
+        c.b = BKind::F16; c.epi = epi; c.act = Act::Gelu; c.bias_mode = 1;
+        c.a.M = M; c.a.N = ED; c.a.K = 3 * cin;
+        c.a.lda = stride * cin; c.a.ldb = 3 * cin; c.a.ldc = ED; c.a.c_off = c_off;
+        c.A = vk::Ref(in); c.Bq = R(w.q); c.C = vk::Ref(out); c.bias = R(b);
+        return K.gemm(rc, c, err);
+    };
+    rc.label("enc_conv1");
+    if (!stem(wc1, wc1_b, mel_in, (uint32_t)L, IC, 1, cv1, ED, Epi::F16)) return false;
+    rc.barrier();
+    rc.label("enc_conv2");
+    if (!stem(wc2, wc2_b, cv1, T, ED, 2, ex, 0, Epi::F32)) return false;
+    rc.barrier();
+
+    // ---- encoder layers: pre-LN, RoPE global attention, GELU MLP ----
+    const vk::Pipeline* rope = ctx->pipeline("enc_rope", {}, err);
+    if (!rope) return false;
+    const uint32_t ldP = round_up(T, 8);
+    const uint32_t hg = (uint32_t)std::max<size_t>(
+        1, std::min<size_t>({(size_t)EH, esc.size / ((size_t)T * T * 4), ep.size / ((size_t)T * ldP * 2)}));
+    const float escale = 1.0f / std::sqrt((float)EHD);
+    const float eps = sp.enc_eps;
+    for (uint32_t l = 0; l < EL; ++l) {
+        const EncLayer& Y = enc[l];
+        rc.split();
+        rc.label("norm");
+        if (!K.norm(rc, 0, T, ED, vk::Ref(ex), ED, R(Y.ln1_g), R(Y.ln1_b), {}, {}, vk::Ref(eh), ED, eps, eps, err))
+            return false;
+        rc.barrier();
+        rc.label("enc_qkv");
+        if (!K.gemm_w(rc, ar, Y.q, vk::Ref(eh), T, ED, vk::Ref(eq), ED, Epi::F16, Act::None, R(Y.q_b), 1.0f, ~0u, err) ||
+            !K.gemm_w(rc, ar, Y.k, vk::Ref(eh), T, ED, vk::Ref(ek), ED, Epi::F16, Act::None, {}, 1.0f, ~0u, err) ||
+            !K.gemm_w(rc, ar, Y.v, vk::Ref(eh), T, ED, vk::Ref(ev), ED, Epi::F16, Act::None, R(Y.v_b), 1.0f, ~0u, err))
+            return false;
+        rc.barrier();
+        rc.label("enc_rope");
+        {
+            struct { uint32_t T, H, D, half_n; } a{T, EH, EHD, sp.rope_half};
+            rc.dispatch(*rope, {vk::Ref(eq), vk::Ref(ek), R(rope_cos), R(rope_sin)}, &a, sizeof(a),
+                        ceil_div(T * EH * sp.rope_half, 64));
+        }
+        rc.barrier();
+        for (uint32_t h0 = 0; h0 < EH; h0 += hg) {
+            const uint32_t hn = std::min(hg, EH - h0);
+            GemmCall c;
+            c.b = BKind::F16; c.epi = Epi::F32;
+            c.a.M = T; c.a.N = T; c.a.K = EHD;
+            c.a.lda = ED; c.a.ldb = ED; c.a.ldc = T;
+            c.a.a_off = h0 * EHD; c.a.b_off = h0 * EHD;
+            c.a.nb_lo = hn; c.a.sa_lo = EHD; c.a.sb_lo = EHD; c.a.sc_lo = T * T;
+            c.batch = hn;
+            c.A = vk::Ref(eq); c.Bq = vk::Ref(ek); c.C = vk::Ref(esc);
+            rc.label("enc_attn_qk");
+            if (!K.gemm(rc, c, err)) return false;
+            rc.barrier();
+            Kernels::SoftmaxArgs sa{T, T, 0, ldP, T * T, 0, T * ldP, escale, T, 0xffffffffu, T};
+            rc.label("enc_softmax");
+            if (!K.softmax(rc, false, T, hn, sa, vk::Ref(esc), {}, vk::Ref(ep), err)) return false;
+            rc.barrier();
+            GemmCall v;
+            v.b = BKind::F16T; v.epi = Epi::F16;
+            v.a.M = T; v.a.N = EHD; v.a.K = T;
+            v.a.lda = ldP; v.a.ldb = ED; v.a.ldc = ED;
+            v.a.b_off = h0 * EHD; v.a.c_off = h0 * EHD;
+            v.a.nb_lo = hn; v.a.sa_lo = T * ldP; v.a.sb_lo = EHD; v.a.sc_lo = EHD;
+            v.batch = hn;
+            v.A = vk::Ref(ep); v.Bq = vk::Ref(ev); v.C = vk::Ref(ectx);
+            rc.label("enc_attn_pv");
+            if (!K.gemm(rc, v, err)) return false;
+            rc.barrier();
+        }
+        rc.label("enc_attn_o");
+        if (!K.gemm_w(rc, ar, Y.o, vk::Ref(ectx), T, ED, vk::Ref(ex), ED, Epi::Residual, Act::None, R(Y.o_b), 1.0f, ~0u, err))
+            return false;
+        rc.barrier();
+        rc.label("norm");
+        if (!K.norm(rc, 0, T, ED, vk::Ref(ex), ED, R(Y.ln2_g), R(Y.ln2_b), {}, {}, vk::Ref(eh), ED, eps, eps, err))
+            return false;
+        rc.barrier();
+        rc.label("enc_ff_up");
+        if (!K.gemm_w(rc, ar, Y.fc1, vk::Ref(eh), T, ED, vk::Ref(effh), EFF, Epi::F16, Act::Gelu, R(Y.fc1_b), 1.0f, ~0u, err))
+            return false;
+        rc.barrier();
+        rc.label("enc_ff_down");
+        if (!K.gemm_w(rc, ar, Y.fc2, vk::Ref(effh), T, EFF, vk::Ref(ex), ED, Epi::Residual, Act::None, R(Y.fc2_b), 1.0f, ~0u, err))
+            return false;
+        rc.barrier();
+    }
+
+    // ---- ln_post, then the adapter: `merge` consecutive frames are one
+    // contiguous row of merge*ED, GELU MLP, written into the audio slots ----
+    rc.split();
+    rc.label("norm");
+    if (!K.norm(rc, 0, T, ED, vk::Ref(ex), ED, R(lnp_g), R(lnp_b), {}, {}, vk::Ref(eh), ED, eps, eps, err))
+        return false;
+    rc.barrier();
+    if (Na > 0) {
+        rc.label("adapter");
+        if (!K.gemm_w(rc, ar, p1, vk::Ref(eh), Na, sp.merge * ED, vk::Ref(adh), AH, Epi::F16, Act::Gelu, R(p1_b), 1.0f, ~0u, err))
+            return false;
+        rc.barrier();
+        GemmCall c;
+        c.b = p2.fmt == GpuFmt::W4 ? BKind::W4 : p2.fmt == GpuFmt::W8 ? BKind::W8 : BKind::F16;
+        c.epi = Epi::F32;
+        c.bias_mode = 1;
+        c.a.M = Na; c.a.N = p2.N; c.a.K = p2.K;
+        c.a.lda = AH; c.a.ldb = p2.K; c.a.ldc = HD; c.a.c_off = (uint32_t)slot0 * HD;
+        c.A = vk::Ref(adh); c.Bq = R(p2.q);
+        if (p2.has_s) c.Bs = R(p2.s);
+        c.C = vk::Ref(lx);
+        c.bias = R(p2_b);
+        if (!K.gemm(rc, c, err)) return false;
+    }
+    // Text slots from the input table (audio slots carry the skip marker).
     if (!embed_lookup(rc, (uint32_t)S, 0, 0, err)) return false;
     rc.barrier();
     if (!record_llm(rc, (uint32_t)S, err)) return false;
@@ -1375,12 +1621,44 @@ bool AudioLlmEngine::Impl::run(vk::Recording& prefill, uint32_t S, uint32_t max_
     return true;
 }
 
+bool AudioLlmEngine::Impl::prompt_rows(const std::vector<int32_t>& prompt_ids, const std::vector<uint8_t>& audio_mask,
+                                      const float* audio, int64_t audio_rows, std::vector<float>& rows,
+                                      std::vector<uint32_t>& idv, std::string& err) {
+    // Audio slots take the encoder rows (bf16-rounded like the ggml scatter;
+    // zero once the rows run out) times the embedding multiplier the input
+    // table already carries; text slots get their ids, audio slots the skip
+    // marker for embed_rows.
+    const size_t S = prompt_ids.size();
+    rows.assign(S * HD, 0.0f);
+    idv.resize(S);
+    int64_t next = 0;
+    for (size_t i = 0; i < S; ++i) {
+        if (!audio_mask[i]) {
+            if (prompt_ids[i] < 0 || (uint32_t)prompt_ids[i] >= embed.N) {
+                err = std::string("fast ") + sp.tag + ": prompt id out of range";
+                return false;
+            }
+            idv[i] = (uint32_t)prompt_ids[i];
+            continue;
+        }
+        idv[i] = 0xffffffffu;
+        if (next < audio_rows)
+            for (size_t d = 0; d < HD; ++d)
+                rows[i * HD + d] = ggml_bf16_to_fp32(ggml_fp32_to_bf16(audio[(size_t)next * HD + d])) * sp.emb_mult;
+        ++next;
+    }
+    return true;
+}
+
 bool AudioLlmEngine::generate(const std::vector<int32_t>& prompt_ids, const std::vector<uint8_t>& audio_mask,
                               const float* audio, int64_t audio_rows, uint32_t budget,
                               std::vector<int32_t>& out_ids, bool& eos, std::string& err) {
     Impl& I = *impl_;
     const char* tag = I.sp.tag;
-    if (I.sp.encoder) { err = std::string("fast ") + tag + ": this engine takes audio, not encoder rows"; return false; }
+    if (I.sp.encoder || I.sp.whisper) {
+        err = std::string("fast ") + tag + ": this engine encodes the audio itself";
+        return false;
+    }
     const uint32_t max_new = budget ? std::min(budget, I.sp.max_new_tokens) : I.sp.max_new_tokens;
     const auto t0 = std::chrono::steady_clock::now();
     const int S = (int)prompt_ids.size();
@@ -1393,32 +1671,9 @@ bool AudioLlmEngine::generate(const std::vector<int32_t>& prompt_ids, const std:
         return false;
     }
     if (!I.ensure(0, 0, S, err)) return false;
-
-    // Audio slots take the encoder rows (bf16-rounded like the ggml scatter;
-    // zero once the rows run out) times the embedding multiplier the input
-    // table already carries; text slots get their ids, audio slots the skip
-    // marker for embed_rows.
-    const size_t HD = I.HD;
-    std::vector<float> rows((size_t)S * HD, 0.0f);
-    std::vector<uint32_t> idv((size_t)S);
-    int64_t next = 0;
-    for (int i = 0; i < S; ++i) {
-        if (!audio_mask[i]) {
-            if (prompt_ids[i] < 0 || (uint32_t)prompt_ids[i] >= I.embed.N) {
-                err = std::string("fast ") + tag + ": prompt id out of range";
-                return false;
-            }
-            idv[i] = (uint32_t)prompt_ids[i];
-            continue;
-        }
-        idv[i] = 0xffffffffu;
-        if (next < audio_rows)
-            for (size_t d = 0; d < HD; ++d)
-                rows[(size_t)i * HD + d] =
-                    ggml_bf16_to_fp32(ggml_fp32_to_bf16(audio[(size_t)next * HD + d])) * I.sp.emb_mult;
-        ++next;
-    }
-
+    std::vector<float> rows;
+    std::vector<uint32_t> idv;
+    if (!I.prompt_rows(prompt_ids, audio_mask, audio, audio_rows, rows, idv, err)) return false;
     Impl::Rec* rec = I.prefill_rec({0, S}, [&](Impl::Rec& r) { return I.record_prefill_rows(S, r, err); });
     if (!rec) return false;
     if (!I.ctx->upload(I.lx, 0, rows.data(), rows.size() * 4, err) ||
@@ -1431,6 +1686,84 @@ bool AudioLlmEngine::generate(const std::vector<int32_t>& prompt_ids, const std:
     if (env_on("STARLING_FAST_TIMING"))
         std::fprintf(stderr, "[fast-%s] rows=%.1fms prefill=%.1fms decode=%.1fms (%zu tokens, %d rounds) total=%.1fms (S=%d)\n",
                      tag, t_up, t_pre - t_up, ms_since(t0) - t_pre, out_ids.size(), rounds, ms_since(t0), S);
+    return true;
+}
+
+bool AudioLlmEngine::encodes_audio() const { return impl_->sp.encoder || impl_->sp.whisper; }
+
+bool AudioLlmEngine::generate_from_mel(const std::vector<int32_t>& prompt_ids, const std::vector<uint8_t>& audio_mask,
+                                       const uint16_t* mel_bf16, int64_t mel_T, uint32_t budget,
+                                       std::vector<int32_t>& out_ids, bool& eos, std::string& err) {
+    Impl& I = *impl_;
+    const char* tag = I.sp.tag;
+    if (!I.sp.whisper) { err = std::string("fast ") + tag + ": no on-device Whisper encoder"; return false; }
+    const uint32_t max_new = budget ? std::min(budget, I.sp.max_new_tokens) : I.sp.max_new_tokens;
+    const auto t0 = std::chrono::steady_clock::now();
+    const int S = (int)prompt_ids.size();
+    const int64_t T = (mel_T + 1) / 2;
+    if (S == 0 || audio_mask.size() != prompt_ids.size() || !mel_bf16 || mel_T <= 0) {
+        err = std::string("fast ") + tag + ": invalid prompt";
+        return false;
+    }
+    // The adapter needs one whole merge group; the RoPE tables bound T.
+    if (T < (int64_t)I.sp.merge || T > (int64_t)I.rope_rows) {
+        err = std::string("fast ") + tag + ": audio length outside the encoder's range";
+        return false;
+    }
+    if (S + (int)max_new > (int)I.MAXPOS) {
+        err = std::string("fast ") + tag + ": generation exceeds the KV cache (audio too long)";
+        return false;
+    }
+    // The audio slots must be one run (prefix, slots, suffix).
+    int slot0 = -1, n_slots = 0;
+    for (int i = 0; i < S; ++i) {
+        if (!audio_mask[i]) continue;
+        if (slot0 < 0) slot0 = i;
+        else if (!audio_mask[i - 1]) { err = std::string("fast ") + tag + ": audio slots are not contiguous"; return false; }
+        ++n_slots;
+    }
+    if (slot0 < 0) { err = std::string("fast ") + tag + ": prompt has no audio slots"; return false; }
+    if (!I.ensure((int)mel_T, (int)T, S, err)) return false;
+    // Text slots for the device lookup; audio slots start zeroed (the slots
+    // past the adapter's rows stay zero, like the ggml scatter).
+    std::vector<float> rows;
+    std::vector<uint32_t> idv;
+    if (!I.prompt_rows(prompt_ids, audio_mask, nullptr, 0, rows, idv, err)) return false;
+    // Mel as time-major f16 rows [mel_T + 2][n_mels], zero rows at both ends.
+    const size_t NM = I.sp.n_mels;
+    std::vector<float> mt(((size_t)mel_T + 2) * NM, 0.0f);
+    for (size_t f = 0; f < NM; ++f)
+        for (int64_t t = 0; t < mel_T; ++t) {
+            ggml_bf16_t b;
+            b.bits = mel_bf16[f * (size_t)mel_T + (size_t)t];
+            mt[((size_t)t + 1) * NM + f] = ggml_bf16_to_fp32(b);
+        }
+    const std::vector<uint32_t> mel16 = pack_f16(mt.data(), mt.size());
+
+    const int key_s = S;
+    Impl::Rec* rec = I.prefill_rec({(int)mel_T, key_s}, [&](Impl::Rec& r) {
+        return I.record_prefill_whisper((int)mel_T, S, slot0, n_slots, r, err);
+    });
+    if (!rec) return false;
+    if (rec->slot0 != slot0) {   // same lengths, different prompt layout
+        I.recs.erase({(int)mel_T, key_s});
+        rec = I.prefill_rec({(int)mel_T, key_s}, [&](Impl::Rec& r) {
+            return I.record_prefill_whisper((int)mel_T, S, slot0, n_slots, r, err);
+        });
+        if (!rec) return false;
+    }
+    if (!I.ctx->upload(I.mel_in, 0, mel16.data(), mel16.size() * 4, err) ||
+        !I.ctx->upload(I.lx, 0, rows.data(), rows.size() * 4, err) ||
+        !I.ctx->upload(I.ids, 0, idv.data(), idv.size() * 4, err))
+        return false;
+    const double t_up = ms_since(t0);
+    int rounds = 0;
+    double t_pre = 0;
+    if (!I.run(*rec->rec, (uint32_t)S, max_new, t0, out_ids, eos, rounds, t_pre, err)) return false;
+    if (env_on("STARLING_FAST_TIMING"))
+        std::fprintf(stderr, "[fast-%s] mel_T=%lld upload=%.1fms enc+prefill=%.1fms decode=%.1fms (%zu tokens, %d rounds) total=%.1fms (T=%lld S=%d)\n",
+                     tag, (long long)mel_T, t_up, t_pre - t_up, ms_since(t0) - t_pre, out_ids.size(), rounds,
+                     ms_since(t0), (long long)T, S);
     return true;
 }
 

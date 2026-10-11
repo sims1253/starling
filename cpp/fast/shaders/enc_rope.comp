@@ -1,0 +1,34 @@
+#version 450
+// enc_rope.comp — ARK's Whisper-encoder RoPE, in place on the f16 q and k
+// projections [T][H * D]: the first `half` element pairs (2i, 2i+1) of every
+// head rotate GPT-J style (a*cos - b*sin, b*cos + a*sin) with the GGUF's
+// cos/sin tables [T][half]; the rest of the head passes through. A pair is
+// one packed f16 word, so every invocation owns one word of q and of k.
+
+#include "common.glsl"
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) buffer Q { uint q[]; };
+layout(std430, binding = 1) buffer K { uint k[]; };
+layout(std430, binding = 2) readonly buffer CS { float cs[]; };   // cos [T][half]
+layout(std430, binding = 3) readonly buffer SN { float sn[]; };   // sin [T][half]
+
+layout(push_constant) uniform PC {
+    uint T, H, D;     // tokens, heads, head dim
+    uint half_n;      // rotated pairs per head (rope_dim / 2)
+} p;
+
+void main() {
+    const uint g = gl_GlobalInvocationID.x;
+    const uint per_t = p.H * p.half_n;
+    if (g >= p.T * per_t) return;
+    const uint t = g / per_t, r = g % per_t;
+    const uint h = r / p.half_n, i = r % p.half_n;
+    const float c = cs[t * p.half_n + i], s = sn[t * p.half_n + i];
+    const uint w = (t * p.H * p.D + h * p.D) / 2 + i;
+    vec2 a = unpackHalf2x16(q[w]);
+    q[w] = packHalf2x16(vec2(a.x * c - a.y * s, a.y * c + a.x * s));
+    a = unpackHalf2x16(k[w]);
+    k[w] = packHalf2x16(vec2(a.x * c - a.y * s, a.y * c + a.x * s));
+}

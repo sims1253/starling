@@ -360,7 +360,7 @@ void* starling_ggml_granite_load(const char* gguf_path, const char** err_out) {
             ctx->fast = starling::fast::AudioLlmEngine::create(*ctx->model, ferr);
             const bool verbose = std::getenv("STARLING_FAST_VERBOSE") != nullptr;
             if (ctx->fast) {
-                const size_t freed = starling::fast::release_decoder_host_weights(ctx->model->loader);
+                const size_t freed = starling::fast::release_host_weights(ctx->model->loader, {"llm."});
                 if (verbose)
                     std::fprintf(stderr, "[fast] granite decoder engine: %s (%.0f MiB of host decoder weights released)\n",
                                  ctx->fast->describe().c_str(), freed / 1048576.0);

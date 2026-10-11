@@ -6,8 +6,8 @@ Starling ships two kinds of engines behind the same C API:
   ([engine notes](ggml-engine.md));
 * the **fast engines** in `cpp/fast/` — hand-written Vulkan compute kernels
   for two model families, **Parakeet-TDT** and the audio-LLMs
-  (**MOSS-Transcribe** and **Qwen3-ASR** whole; the text decoders of
-  **ARK-ASR** and **Granite-speech**), built around their shapes the way
+  (**MOSS-Transcribe**, **Qwen3-ASR** and **ARK-ASR** whole; the text
+  decoder of **Granite-speech**), built around their shapes the way
   [Splash](https://inco.ai/blog/splash/) builds an engine around one model.
   MOSS and Qwen3-ASR share one engine (`audio_llm_engine.cpp`): the same
   Qwen3-Omni-style audio tower and Qwen3 decoder, with MOSS's SwiGLU adapter
@@ -85,19 +85,26 @@ ggml engine. Qwen3-ASR's KV cache holds 1024 positions instead of the GGUF's
 4096 (its C API cuts audio into ≤ 30 s pieces), 117 MiB instead of 470 MiB of
 unified memory on a phone.
 
-**Decoder-only engines (ARK, Granite).** On the phone their LLM decode
-dominates wall time while the encoder runs once per clip, so only the
-decoder moves: the ggml encoder/projector output rows and the prompt ids
-are uploaded once, and the engine does the embedding lookup, prefill and the
-same on-device greedy loop. The trunk variations are spec flags of the
+**ARK and Granite.** ARK's Whisper encoder (conv stem, 32 RoPE
+global-attention layers, ln_post, merge-by-4 GELU adapter) runs on the
+device too: the host uploads the log-mel; the two k3 Conv1d layers are
+plain GEMMs over time-major rows padded by one zero row (output row t reads
+the contiguous run t·s .. t·s+2), the interleaved partial RoPE is
+`enc_rope.comp`, global attention runs in head groups under a 64 MiB score
+budget, and the adapter reads merge·d_model-wide rows straight from the
+ln_post output and writes into the prompt's audio slots.
+`STARLING_FAST_ARK_HOST_ENCODER=1` keeps the encoder on ggml. Granite's
+conformer + Q-Former stay on ggml (decoder-only engine): their output rows
+and the prompt ids are uploaded once, and the engine does the embedding
+lookup, prefill and the same on-device greedy loop. The trunk variations are spec flags of the
 Qwen3 decoder — Qwen2.5's q/k/v biases ride the projection epilogues and
 the attention kernels skip the q/k norm; Granite's residual multiplier is
 folded into the o/down projections' group scales, its embedding multiplier
 into the (untied) input table, its attention multiplier is the softmax
 scale and its logit divisor is dropped (it cannot change a greedy argmax).
-ARK 0.6B's suppressed ids (`bad_words_ids`) are a −3e38 lm_head bias. Once
-the engine holds the decoder, the host pages of the loader's `llm.*`
-tensors are returned to the OS (`release_decoder_host_weights`).
+ARK 0.6B's suppressed ids (`bad_words_ids`) are a −3e38 lm_head bias. The
+host pages of the loader tensors the engine now owns (`llm.*`, and ARK's
+`enc.*`/`adapter.*`) are returned to the OS (`release_host_weights`).
 
 **Parakeet's transducer decoder stays on the CPU** — sequential, a few small
 matrix-vector products per step — with int8 dot-product kernels (ARMv8.2
@@ -118,6 +125,7 @@ stores the choice.
 | `attn_decode.comp` | fused qk-norm + RoPE + KV append + attention (one query head per workgroup) |
 | `attn_decode_split.comp`, `attn_split_combine.comp` | the same, split over KV chunks (one workgroup per head and chunk), then a per-head merge of the partial softmaxes |
 | `rope_kv.comp` | prefill q/k norm + RoPE + KV-cache write |
+| `enc_rope.comp` | ARK encoder RoPE (GPT-J pairs over the first rope_dim of each head), in place on q and k |
 | `softmax.comp` | attention softmax with Parakeet's relative-position skew folded into the read index, causal and key-length masks |
 | `norm.comp` | LayerNorm / RMSNorm, including the fused layer-boundary pair |
 | `pk_conv.comp` | subsampling convolutions, Conformer depthwise conv + batch-norm + SiLU, MOSS stage-1 conv |

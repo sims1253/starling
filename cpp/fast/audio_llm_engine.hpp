@@ -17,14 +17,18 @@
 // and next-token embedding all live in a device state buffer: the CPU sleeps
 // on one fence per K tokens, and the KV cache never leaves GPU memory.
 //
-// Decoder-only models (ARK-ASR: Qwen2.5 trunk with q/k/v biases and no q/k
-// norm; Granite-speech: granite-4.0 trunk with untied lm_head and muP-style
-// multipliers) keep their audio encoders on ggml: the host hands over the
-// encoder's output rows and the prompt ids, and the engine runs the prompt
-// embedding lookup, the prefill and the same on-device greedy loop. The
-// multipliers are folded into the repacked weights (residual -> o/down
-// projections, embedding -> the input table) and the attention scale; the
-// logit divisor cannot change a greedy argmax and is dropped.
+// ARK-ASR (Whisper encoder with RoPE global attention, merge-by-4 GELU
+// adapter, Qwen2.5 trunk with q/k/v biases and no q/k norm) runs whole on
+// the device from the host's log-mel: conv stem, encoder layers and adapter
+// fill the prompt's audio slots in the same recorded prefill.
+// Granite-speech (granite-4.0 trunk with untied lm_head and muP-style
+// multipliers) keeps its conformer + Q-Former on ggml: the host hands over
+// their output rows and the prompt ids, and the engine runs the prompt
+// embedding lookup, the prefill and the same on-device greedy loop (ARK
+// can do the same with STARLING_FAST_ARK_HOST_ENCODER=1). The multipliers
+// are folded into the repacked weights (residual -> o/down projections,
+// embedding -> the input table) and the attention scale; the logit divisor
+// cannot change a greedy argmax and is dropped.
 
 #pragma once
 
@@ -62,6 +66,15 @@ public:
     bool generate(const std::vector<int32_t>& prompt_ids, const std::vector<uint8_t>& audio_mask,
                   const float* audio, int64_t audio_rows, uint32_t budget, std::vector<int32_t>& ids,
                   bool& eos, std::string& err);
+    // Whether the engine runs the audio encoder itself (MOSS, Qwen3, ARK
+    // unless STARLING_FAST_ARK_HOST_ENCODER=1); Granite takes encoder rows.
+    bool encodes_audio() const;
+    // ARK with its Whisper encoder on the device: `mel_bf16` is the log-mel,
+    // feature-major [n_mels][mel_T] bf16 bits; the adapter's rows fill the
+    // (one contiguous run of) audio slots in order, zero past its last row.
+    bool generate_from_mel(const std::vector<int32_t>& prompt_ids, const std::vector<uint8_t>& audio_mask,
+                           const uint16_t* mel_bf16, int64_t mel_T, uint32_t budget,
+                           std::vector<int32_t>& ids, bool& eos, std::string& err);
     std::string describe() const;
 
     struct Impl;   // opaque; public only so the factories' helper can build one
@@ -71,12 +84,13 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-// Return the host pages of the loader's decoder weights ("llm.*" tensors) to
-// the OS once a decoder-only engine holds its own copy: the GGUF is read into
-// anonymous memory, and on unified-memory phones the duplicate would cost
-// the decoder's size again. The tensors stay registered but read as zeros
-// afterwards, so the caller must route every decode through the engine.
+// Return the host pages of the loader's weights whose names start with one of
+// `prefixes` ("llm.", and for ARK's on-device encoder "enc.", "adapter.") to
+// the OS once the engine holds its own copy: the GGUF is read into anonymous
+// memory, and on unified-memory phones the duplicate would cost those
+// weights' size again. The tensors stay registered but read as zeros
+// afterwards, so the caller must route that work through the engine.
 // Returns the bytes released (0 where the platform has no madvise).
-size_t release_decoder_host_weights(const ggml::ModelLoader& loader);
+size_t release_host_weights(const ggml::ModelLoader& loader, const std::vector<std::string>& prefixes);
 
 } // namespace starling::fast
