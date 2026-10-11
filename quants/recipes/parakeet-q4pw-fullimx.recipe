@@ -13,8 +13,12 @@
 # Measured (2026-10-11, F32 source, parakeet-full.imx; FLEURS test, 100 clips
 # per language, paired bootstrap vs F32): en 5.33 % vs 5.61 % (clip delta
 # -0.31 pt [-0.80, +0.13]), de 4.46 % vs 4.68 % (-0.20 pt [-0.60, +0.19]).
-# Pixel 10 Pro ggml CPU vs q4_k_m-shrink16: peak RSS 548 vs 728 MB, process
-# CPU time -10 %. Notebook RADV: transcripts identical, latency within 8 %.
+# Pixel 10 Pro vs q4_k_m-shrink16 (benchmarks/quant_phone/phone_quant_bench.sh,
+# on battery, ABBA rounds, medians): Vulkan fast engine (the app's default)
+# load 1.88 vs 2.30 s, medium 2.06 vs 2.26 s, long 6.91 vs 7.69 s, peak RSS
+# 778 vs 1180 MB, ~-15 % energy per process (coulomb counter), fixture
+# transcripts identical; ggml CPU peak RSS 548 vs 728 MB, CPU time -10 %.
+# Notebook RADV: transcripts identical, latency within 8 %.
 #
 #   build/starling-quantize \
 #       --input models/parakeet-tdt-0.6b-v3-f32.gguf \
