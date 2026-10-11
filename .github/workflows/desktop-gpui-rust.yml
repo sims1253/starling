@@ -4,6 +4,20 @@ on:
   push:
     branches: [master, main, gpui-port, "gpui/fixes-*"]
   pull_request:
+    # The desktop crates plus what their tests read from outside the
+    # workspace: the contract fixture's native sources (cpp/, ggml and its
+    # patches), the shared contracts and the test WAV.
+    paths:
+      - 'apps/desktop-gpui/**'
+      - 'packages/contracts/**'
+      - 'tests/fixtures/**'
+      - 'cpp/**'
+      - 'backends/native/**'
+      - 'third_party/**'
+      - 'CMakeLists.txt'
+      - 'CMakePresets.json'
+      - 'scripts/apply_ggml_patches.sh'
+      - '.github/workflows/desktop-gpui-rust.yml'
   workflow_dispatch:
 
 permissions:
@@ -33,10 +47,15 @@ jobs:
           sudo apt-get install -y --no-install-recommends libasound2-dev \
             libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
             dbus-daemon
-      - name: Install stable toolchain
-        run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Install the pinned toolchain
+        # The bare install reads apps/desktop-gpui/rust-toolchain.toml.
+        working-directory: apps/desktop-gpui
+        run: rustup toolchain install
+      # Swatinem/rust-cache v2.9.2. Only master saves; PRs restore its cache.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          workspaces: apps/desktop-gpui
+          save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Build the engine contract fixture
         # The engine lifecycle tests (crates/dictation/tests/engine_*.rs)
         # drive real sidecars through this deterministic server; the same
@@ -44,16 +63,14 @@ jobs:
         run: |
           cmake --preset native-cpu
           cmake --build build/native-cpu --target starling-serve-contract-fixture -j2
-      - name: Check and test the desktop-gpui workspace
+      - name: Test the desktop-gpui workspace
         working-directory: apps/desktop-gpui
         env:
           STARLING_CONTRACT_BIN: ${{ github.workspace }}/build/native-cpu/starling-serve-contract-fixture
           # A missing fixture fails the lifecycle tests instead of letting
           # them skip and pass vacuously.
           STARLING_REQUIRE_CONTRACT_FIXTURE: "1"
-        run: |
-          cargo check --workspace
-          cargo test --workspace
+        run: cargo test --workspace
 
   # The service host's Windows named-pipe transport and the storage-v2
   # lease's Windows lock are cfg(windows) — the ubuntu job never compiles
@@ -76,6 +93,15 @@ jobs:
           persist-credentials: false
           # ggml, for the contract fixture below.
           submodules: recursive
+      - name: Install the pinned toolchain
+        # The bare install reads apps/desktop-gpui/rust-toolchain.toml.
+        working-directory: apps/desktop-gpui
+        run: rustup toolchain install
+      # Swatinem/rust-cache v2.9.2. Only master saves; PRs restore its cache.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          workspaces: apps/desktop-gpui
+          save-if: ${{ github.ref == 'refs/heads/master' }}
       # One command per step: PowerShell only reports the last native
       # command's exit code, so a combined script could mask a failure.
       # The runner's default generator is Visual Studio (multi-config),
@@ -99,30 +125,63 @@ jobs:
       - name: Check the insertion crate
         working-directory: apps/desktop-gpui
         run: cargo check -p starling-insertion --all-targets
+      # The app's Windows build is otherwise packaged only on master (by the
+      # experimental release), so pull requests compile it here.
+      - name: Check the app
+        working-directory: apps/desktop-gpui
+        run: cargo check -p starling-gpui
+
+  # The app's macOS cfg paths on every run; the universal DMG below is too
+  # slow (~15 min) for every PR push.
+  check-macos:
+    name: cargo check starling-gpui (macos, aarch64)
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Install the pinned toolchain
+        # The bare install reads apps/desktop-gpui/rust-toolchain.toml.
+        working-directory: apps/desktop-gpui
+        run: rustup toolchain install
+      # Swatinem/rust-cache v2.9.2. Only master saves; PRs restore its cache.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          workspaces: apps/desktop-gpui
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - name: Check the app
+        working-directory: apps/desktop-gpui
+        run: cargo check -p starling-gpui
 
   # Packaged desktop lanes: the universal macOS bundle (DMG) and the portable
   # Windows archive. Unsigned — artifacts are development builds for testing,
-  # not notarized releases.
+  # not notarized releases. Neither runs on pull requests (check-macos and
+  # windows-test compile the app there); dispatch the workflow on a branch
+  # for an installable build of it.
   build-macos:
     name: package starling-gpui (macos, universal)
+    if: github.event_name != 'pull_request'
     runs-on: macos-latest
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      - name: Ensure the stable toolchain
-        run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
+      - name: Install the pinned toolchain
+        # The bare install reads apps/desktop-gpui/rust-toolchain.toml;
+        # package-macos.sh adds both targets to it.
+        working-directory: apps/desktop-gpui
+        run: rustup toolchain install
+      # Swatinem/rust-cache v2.9.2.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          workspaces: apps/desktop-gpui
+          save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Build the universal binary and assemble Starling.app + DMG
         working-directory: apps/desktop-gpui
         run: scripts/package-macos.sh
       - name: Upload the macOS disk image
-        # Installable build of every push and same-repository PR, mirroring the
-        # Android APK gate; fork PRs (unreviewed code) get no installable
-        # artifact.
-        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: starling-gpui-macos-universal-dmg
@@ -132,7 +191,7 @@ jobs:
 
   build-windows:
     # master gets this same package from the experimental release workflow.
-    if: github.event_name != 'push' || github.ref != 'refs/heads/master'
+    if: github.event_name != 'pull_request' && github.ref != 'refs/heads/master'
     uses: ./.github/workflows/package-desktop.yml
     with:
       platforms: '["windows"]'

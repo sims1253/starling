@@ -45,6 +45,16 @@ require(starlingArmExtensions.all { it in cpuFeatureNames }) {
 }
 val requiredCpuFeatures = starlingArmExtensions.map(cpuFeatureNames::getValue)
 
+// CMake build type of the native engine in every variant. AGP's default is
+// Debug for debuggable variants, which compiles ggml at -O0, yet the debug
+// APK is what on-device tests and measurements run; this matches the release
+// variant's AGP default (RelWithDebInfo) instead. `-PstarlingNativeBuildType=Debug`
+// restores an unoptimized engine for native debugging.
+val starlingNativeBuildType = providers.gradleProperty("starlingNativeBuildType").orElse("RelWithDebInfo").get()
+require(starlingNativeBuildType in setOf("Debug", "Release", "RelWithDebInfo", "MinSizeRel")) {
+    "starlingNativeBuildType must be a CMake build type: $starlingNativeBuildType"
+}
+
 // Release signing is configured only when all four variables are present, so
 // `assembleRelease` without them still works and produces an unsigned APK.
 // The keystore must stay the same across releases: Android refuses to update
@@ -136,6 +146,7 @@ android {
         externalNativeBuild {
             cmake {
                 arguments += "-DSTARLING_ANDROID_ARM_ARCH=$starlingArmArch"
+                arguments += "-DCMAKE_BUILD_TYPE=$starlingNativeBuildType"
             }
         }
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
