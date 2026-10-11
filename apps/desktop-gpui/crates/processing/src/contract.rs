@@ -228,8 +228,6 @@ pub enum ProviderKind {
     Builtin,
     S1,
     OpenaiCompatible,
-    Anthropic,
-    Gemini,
 }
 
 impl ProviderKind {
@@ -238,8 +236,6 @@ impl ProviderKind {
             ProviderKind::Builtin => "builtin",
             ProviderKind::S1 => "s1",
             ProviderKind::OpenaiCompatible => "openai_compatible",
-            ProviderKind::Anthropic => "anthropic",
-            ProviderKind::Gemini => "gemini",
         }
     }
 }

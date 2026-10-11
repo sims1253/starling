@@ -179,9 +179,7 @@
       "enum": [
         "builtin",
         "s1",
-        "openai_compatible",
-        "anthropic",
-        "gemini"
+        "openai_compatible"
       ]
     }
   }
