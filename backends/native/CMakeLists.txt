@@ -92,15 +92,15 @@ add_subdirectory("${STARLING_REPO_ROOT}/third_party/ggml" "${CMAKE_BINARY_DIR}/g
 # libstarling_ggml: the Starling-owned engine (runtime + flat C API + the
 # per-model implementations under cpp/<model>/).
 # --------------------------------------------------------------------------- #
-file(GLOB STARLING_GGML_RUNTIME_CPP ${STARLING_REPO_ROOT}/cpp/runtime/*.cpp)
-file(GLOB STARLING_GGML_LIB_CPP ${STARLING_REPO_ROOT}/cpp/lib/*.cpp)
-file(GLOB STARLING_GGML_PARAKEET_CPP ${STARLING_REPO_ROOT}/cpp/parakeet/*.cpp)
-file(GLOB STARLING_GGML_MOSS_CPP ${STARLING_REPO_ROOT}/cpp/moss/*.cpp)
-file(GLOB STARLING_GGML_ARK_CPP ${STARLING_REPO_ROOT}/cpp/ark/*.cpp)
-file(GLOB STARLING_GGML_GRANITE_CPP ${STARLING_REPO_ROOT}/cpp/granite/*.cpp)
-file(GLOB STARLING_GGML_QWEN3_CPP ${STARLING_REPO_ROOT}/cpp/qwen3/*.cpp)
-file(GLOB STARLING_GGML_S1_CPP ${STARLING_REPO_ROOT}/cpp/s1/*.cpp)
-file(GLOB STARLING_GGML_VOXTRAL_CPP ${STARLING_REPO_ROOT}/cpp/voxtral/*.cpp)
+file(GLOB STARLING_GGML_RUNTIME_CPP CONFIGURE_DEPENDS ${STARLING_REPO_ROOT}/cpp/runtime/*.cpp)
+file(GLOB STARLING_GGML_LIB_CPP CONFIGURE_DEPENDS ${STARLING_REPO_ROOT}/cpp/lib/*.cpp)
+file(GLOB STARLING_GGML_PARAKEET_CPP CONFIGURE_DEPENDS ${STARLING_REPO_ROOT}/cpp/parakeet/*.cpp)
+file(GLOB STARLING_GGML_MOSS_CPP CONFIGURE_DEPENDS ${STARLING_REPO_ROOT}/cpp/moss/*.cpp)
+file(GLOB STARLING_GGML_ARK_CPP CONFIGURE_DEPENDS ${STARLING_REPO_ROOT}/cpp/ark/*.cpp)
+file(GLOB STARLING_GGML_GRANITE_CPP CONFIGURE_DEPENDS ${STARLING_REPO_ROOT}/cpp/granite/*.cpp)
+file(GLOB STARLING_GGML_QWEN3_CPP CONFIGURE_DEPENDS ${STARLING_REPO_ROOT}/cpp/qwen3/*.cpp)
+file(GLOB STARLING_GGML_S1_CPP CONFIGURE_DEPENDS ${STARLING_REPO_ROOT}/cpp/s1/*.cpp)
+file(GLOB STARLING_GGML_VOXTRAL_CPP CONFIGURE_DEPENDS ${STARLING_REPO_ROOT}/cpp/voxtral/*.cpp)
 set(STARLING_GGML_CPP
     ${STARLING_GGML_RUNTIME_CPP}
     ${STARLING_GGML_LIB_CPP}
@@ -157,7 +157,7 @@ endif()
 
 if(STARLING_GGML_TESTS)
   set(STARLING_GGML_TEST_SUPPORT_CPP ${STARLING_REPO_ROOT}/cpp/tests/golden_io.cpp)
-  file(GLOB STARLING_GGML_TEST_MAIN_CPP ${STARLING_REPO_ROOT}/cpp/tests/*_test.cpp)
+  file(GLOB STARLING_GGML_TEST_MAIN_CPP CONFIGURE_DEPENDS ${STARLING_REPO_ROOT}/cpp/tests/*_test.cpp)
   foreach(test_src IN LISTS STARLING_GGML_TEST_MAIN_CPP)
     get_filename_component(test_name ${test_src} NAME_WE)
     add_executable(${test_name} ${test_src} ${STARLING_GGML_TEST_SUPPORT_CPP} $<TARGET_OBJECTS:starling_ggml_core>)
