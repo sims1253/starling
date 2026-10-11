@@ -1,15 +1,16 @@
-// moss_engine.cpp — see moss_engine.hpp.
+// audio_llm_engine.cpp — see audio_llm_engine.hpp.
 
-#include "moss_engine.hpp"
+#include "audio_llm_engine.hpp"
 
 #include "kernels.hpp"
 #include "packed_file.hpp"
 #include "vk_runtime.hpp"
 #include "weights.hpp"
 
-#include "moss/audio_encoder.hpp"
 #include "moss/loader.hpp"
 #include "moss/mel.hpp"
+#include "qwen3/loader.hpp"
+#include "qwen3/mel.hpp"
 
 #include "ggml.h"
 #include "starling_ggml.h"   // starling_ggml_stop_requested (#325 coop stop)
@@ -20,6 +21,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <map>
 #include <mutex>
 
@@ -28,6 +30,7 @@ namespace starling::fast {
 constexpr size_t kMaxPromptIds = 256;   // prompt prefix + suffix ids (device buffer)
 
 namespace ms = starling::ggml::moss;
+namespace q3 = starling::ggml::qwen3;
 
 namespace {
 
@@ -39,6 +42,108 @@ double ms_since(std::chrono::steady_clock::time_point t0) {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 }
 int half_len(int x) { return (x - 1) / 2 + 1; }
+
+// Audio tokens for T valid mel frames: 13 per full 100-frame chunk plus the
+// triple ceil-halved remainder (both families' post-CNN length).
+int64_t audio_tokens(int64_t T) {
+    if (T <= 0) return 0;
+    const int64_t r = T % 100;
+    return 13 * (T / 100) + (r ? half_len(half_len(half_len((int)r))) : 0);
+}
+
+// Mel features as the encoder consumes them: bf16, feature-major with row
+// stride `stride`, `T` valid frames (frames beyond T are ignored).
+struct MelView {
+    std::vector<ggml_bf16_t> data;
+    int64_t stride = 0, T = 0;
+};
+
+// What differs between the families the engine serves. Tensor names are
+// the GGUF names; the per-layer encoder names are suffixes of "enc.blk.<l>.".
+struct Spec {
+    const char* tag = "";   // messages and timing lines ("moss", "qwen3")
+    std::string conv_out, pos_embed, proj1, proj2;
+    std::string eq, ek, ev, eo, efc1, efc2;
+    bool adapter = false;   // MOSS: SwiGLU adapter between projection and LLM
+    // encoder
+    uint32_t ED = 0, EH = 0, EHD = 0, EFF = 0, EL = 0, DS = 0, EOUT = 0, n_window_infer = 0, n_mels = 0;
+    float enc_eps = 1e-5f;
+    uint32_t AH = 0;        // adapter hidden (0 without an adapter)
+    // LLM
+    uint32_t HD = 0, NH = 0, NKV = 0, HDIM = 0, FF = 0, NL = 0, MAXPOS = 0;
+    float rope_theta = 0, rms_eps = 0;
+    bool tied = false;
+    int32_t eos = 0;
+    uint32_t max_new_tokens = 0;
+    std::vector<int32_t> prefix, suffix;
+    // The family's CPU mel frontend over the mel constants in `ml`.
+    std::function<bool(const ggml::ModelLoader& ml, const float* pcm, size_t n, MelView& mel,
+                       std::string& err)> mel;
+};
+
+Spec moss_spec(const ms::Config& c) {
+    Spec s;
+    s.tag = "moss";
+    s.conv_out = "enc.conv_out.weight"; s.pos_embed = "enc.positional_embedding";
+    s.proj1 = "enc.proj1"; s.proj2 = "enc.proj2";
+    s.eq = "attn.q"; s.ek = "attn.k"; s.ev = "attn.v"; s.eo = "attn.o"; s.efc1 = "ffn.fc1"; s.efc2 = "ffn.fc2";
+    s.adapter = true;
+    const auto& ec = c.encoder;
+    const auto& lc = c.llm;
+    s.ED = ec.d_model; s.EH = ec.n_heads; s.EHD = ec.head_dim; s.EFF = ec.ff_dim; s.EL = ec.n_layers;
+    s.DS = ec.downsample_hidden_size; s.EOUT = ec.output_dim; s.n_window_infer = ec.n_window_infer;
+    s.n_mels = c.frontend.n_mels; s.enc_eps = ec.layer_norm_eps;
+    s.AH = c.adapter_hidden;
+    s.HD = lc.hidden; s.NH = lc.n_heads; s.NKV = lc.n_kv_heads; s.HDIM = lc.head_dim; s.FF = lc.intermediate;
+    s.NL = lc.n_layers; s.MAXPOS = lc.max_cache; s.rope_theta = lc.rope_theta; s.rms_eps = lc.rms_norm_eps;
+    s.tied = lc.tied_embeddings && c.adapter_input == ec.output_dim && c.adapter_output == lc.hidden;
+    s.eos = c.eos_token_id; s.max_new_tokens = c.max_new_tokens;
+    s.prefix = c.prompt_prefix; s.suffix = c.prompt_suffix;
+    s.mel = [c](const ggml::ModelLoader& ml, const float* pcm, size_t n, MelView& mel, std::string& err) {
+        ms::MelFeatures f;
+        if (!ms::compute_log_mel(c, ml, pcm, n, f, err)) return false;
+        mel.stride = mel.T = f.n_frames;
+        mel.data = std::move(f.data);
+        return true;
+    };
+    return s;
+}
+
+// Qwen3-ASR decodes at most ~5 tokens per second of audio plus a fixed
+// allowance, and the C API cuts audio into <= 30 s pieces, so a prompt and
+// its budget stay far below the GGUF's 4096-slot max_cache. The KV cache is
+// sized to this instead (UMA memory on phones: 4096 slots would be 470 MiB).
+constexpr uint32_t kQwen3MaxPos = 1024;
+
+Spec qwen3_spec(const q3::Config& c) {
+    Spec s;
+    s.tag = "qwen3";
+    s.conv_out = "enc.out.weight"; s.pos_embed = "enc.pos_embed";
+    s.proj1 = "proj.linear_1"; s.proj2 = "proj.linear_2";
+    s.eq = "attn_q"; s.ek = "attn_k"; s.ev = "attn_v"; s.eo = "attn_o"; s.efc1 = "ff_up"; s.efc2 = "ff_down";
+    s.adapter = false;
+    const auto& ec = c.encoder;
+    const auto& lc = c.llm;
+    s.ED = ec.hidden; s.EH = ec.n_heads; s.EHD = ec.head_dim; s.EFF = ec.ffn_dim; s.EL = ec.n_layers;
+    s.DS = ec.downsample_hidden; s.EOUT = c.projector.output_dim; s.n_window_infer = ec.n_window_infer;
+    s.n_mels = c.frontend.n_mels; s.enc_eps = ec.layer_norm_eps;
+    s.HD = lc.hidden; s.NH = lc.n_heads; s.NKV = lc.n_kv_heads; s.HDIM = lc.head_dim; s.FF = lc.intermediate;
+    s.NL = lc.n_layers; s.MAXPOS = std::min(lc.max_cache, kQwen3MaxPos);
+    s.rope_theta = lc.rope_theta; s.rms_eps = lc.rms_norm_eps;
+    s.tied = lc.tied_embeddings && lc.has_qk_norm && c.projector.hidden == ec.hidden &&
+             c.encoder.n_mel == c.frontend.n_mels;
+    s.eos = c.eos_token_id; s.max_new_tokens = c.max_new_tokens;
+    s.prefix = c.prompt_prefix; s.suffix = c.prompt_suffix;
+    s.mel = [c](const ggml::ModelLoader& ml, const float* pcm, size_t n, MelView& mel, std::string& err) {
+        q3::MelFeatures f;
+        if (!q3::compute_log_mel(c, ml, pcm, n, f, err)) return false;
+        mel.stride = f.n_frames;
+        mel.T = f.valid_frames;
+        mel.data = std::move(f.data);
+        return true;
+    };
+    return s;
+}
 
 struct EncLayer {
     GMat q, k, v, o, fc1, fc2;
@@ -75,7 +180,7 @@ std::vector<HostMatrix> split_rows(HostMatrix&& m, uint32_t rows) {
 
 } // namespace
 
-struct MossEngine::Impl {
+struct AudioLlmEngine::Impl {
     // Keeps the shared Vulkan context alive while this engine exists.
     // Declared first, so it is released last — after every buffer and
     // recording below; the last engine's release destroys the device.
@@ -83,10 +188,10 @@ struct MossEngine::Impl {
     vk::Context* ctx = nullptr;
     Kernels K;
     Arena ar;
-    ms::Config cfg;
+    Spec sp;
     ggml::ModelLoader mel_loader;   // only the two mel constant tensors
 
-    // dims
+    // dims (copied from sp)
     uint32_t ED = 0, EH = 0, EHD = 0, EFF = 0, EL = 0, DS = 0, EOUT = 0;
     uint32_t AH = 0;                                   // adapter hidden
     uint32_t HD = 0, NH = 0, NKV = 0, HDIM = 0, FF = 0, NL = 0, MAXPOS = 0;
@@ -115,7 +220,7 @@ struct MossEngine::Impl {
     uint32_t dec_steps = 0;
     uint64_t tick = 0;
 
-    bool load(const ms::MossModel& m, std::string& err);
+    bool load(const ggml::ModelLoader& ml, std::string& err);
     bool alloc_static(std::string& err);
     bool ensure(int C, int A, int S, std::string& err);
     bool record_prefill(int C, int tail, Rec& r, std::string& err);
@@ -132,53 +237,68 @@ struct MossEngine::Impl {
     vk::Ref R(Arena::Id id) const { return ar.ref(id); }
 };
 
-MossEngine::MossEngine() : impl_(new Impl) {}
-MossEngine::~MossEngine() {
+AudioLlmEngine::AudioLlmEngine() : impl_(new Impl) {}
+AudioLlmEngine::~AudioLlmEngine() {
     // Skipped on a hung GPU: vkDeviceWaitIdle has no timeout (#325); the
     // runtime then leaks this engine's objects to the driver instead.
     if (impl_ && impl_->ctx && !impl_->ctx->gpu_hung())
         impl_->ctx->fn().vkDeviceWaitIdle(impl_->ctx->device());
 }
 
-std::unique_ptr<MossEngine> MossEngine::create(const ms::MossModel& m, std::string& err) {
+namespace {
+std::unique_ptr<AudioLlmEngine::Impl> make_impl(Spec sp, const ggml::ModelLoader& ml, std::string& err) {
     std::shared_ptr<vk::Context> hold = vk::Context::acquire(err);
     if (!hold) return nullptr;
-    vk::Context* ctx = hold.get();
-    std::unique_ptr<MossEngine> e(new MossEngine());
-    e->impl_->ctx_hold = std::move(hold);
-    e->impl_->ctx = ctx;
-    if (!e->impl_->K.init(*ctx, err) || !e->impl_->load(m, err) || !e->impl_->alloc_static(err))
-        return nullptr;
+    auto I = std::make_unique<AudioLlmEngine::Impl>();
+    I->ctx = hold.get();
+    I->ctx_hold = std::move(hold);
+    I->sp = std::move(sp);
+    if (!I->K.init(*I->ctx, err) || !I->load(ml, err) || !I->alloc_static(err)) return nullptr;
+    return I;
+}
+} // namespace
+
+std::unique_ptr<AudioLlmEngine> AudioLlmEngine::create(const ms::MossModel& m, std::string& err) {
+    auto I = make_impl(moss_spec(m.config), m.loader, err);
+    if (!I) return nullptr;
+    std::unique_ptr<AudioLlmEngine> e(new AudioLlmEngine());
+    e->impl_ = std::move(I);
     return e;
 }
 
-std::string MossEngine::describe() const {
+std::unique_ptr<AudioLlmEngine> AudioLlmEngine::create(const q3::Qwen3Model& m, std::string& err) {
+    auto I = make_impl(qwen3_spec(m.config), m.loader, err);
+    if (!I) return nullptr;
+    std::unique_ptr<AudioLlmEngine> e(new AudioLlmEngine());
+    e->impl_ = std::move(I);
+    return e;
+}
+
+std::string AudioLlmEngine::describe() const {
     char buf[256];
     std::snprintf(buf, sizeof buf, "fast/vulkan '%s' weights=%.0f MiB",
                   impl_->ctx->info().name.c_str(), impl_->ar.total_bytes() / 1048576.0);
     return buf;
 }
 
-bool MossEngine::Impl::load(const ms::MossModel& m, std::string& err) {
+bool AudioLlmEngine::Impl::load(const ggml::ModelLoader& ml, std::string& err) {
     const auto t_load0 = std::chrono::steady_clock::now();
-    const auto& ml = m.loader;
-    cfg = m.config;
-    const auto& ec = cfg.encoder;
-    const auto& lc = cfg.llm;
-    ED = ec.d_model; EH = ec.n_heads; EHD = ec.head_dim; EFF = ec.ff_dim; EL = ec.n_layers;
-    DS = ec.downsample_hidden_size; EOUT = ec.output_dim; AH = cfg.adapter_hidden;
-    HD = lc.hidden; NH = lc.n_heads; NKV = lc.n_kv_heads; HDIM = lc.head_dim; FF = lc.intermediate;
-    NL = lc.n_layers; MAXPOS = lc.max_cache;
-    if (EHD != 64 || HDIM != 128 || DS % 8 || cfg.frontend.n_mels != 128 || ec.n_window_infer % 100 ||
-        cfg.adapter_input != EOUT || cfg.adapter_output != HD || !lc.tied_embeddings || MAXPOS > 4096 ||
-        NKV == 0 || NH % NKV || cfg.max_new_tokens > MAXPOS ||
-        cfg.prompt_prefix.size() + cfg.prompt_suffix.size() > kMaxPromptIds) {
-        err = "fast moss: unsupported configuration";
+    const std::string tag = sp.tag;
+    ED = sp.ED; EH = sp.EH; EHD = sp.EHD; EFF = sp.EFF; EL = sp.EL;
+    DS = sp.DS; EOUT = sp.EOUT; AH = sp.AH;
+    HD = sp.HD; NH = sp.NH; NKV = sp.NKV; HDIM = sp.HDIM; FF = sp.FF;
+    NL = sp.NL; MAXPOS = sp.MAXPOS;
+    // EOUT == HD without an adapter: the projection writes the LLM input rows.
+    if (EHD != 64 || HDIM != 128 || DS % 8 || sp.n_mels != 128 || sp.n_window_infer % 100 ||
+        sp.n_window_infer == 0 || !sp.tied || MAXPOS > 4096 || NKV == 0 || NH % NKV ||
+        sp.max_new_tokens > MAXPOS || (sp.adapter ? AH == 0 : EOUT != HD) ||
+        sp.prefix.size() + sp.suffix.size() > kMaxPromptIds) {
+        err = "fast " + tag + ": unsupported configuration";
         return false;
     }
     auto T = [&](const std::string& n) -> const ggml_tensor* {
         const ggml_tensor* t = ml.tensor(n.c_str());
-        if (!t && err.empty()) err = "fast moss: missing tensor " + n;
+        if (!t && err.empty()) err = "fast " + tag + ": missing tensor " + n;
         return t;
     };
     auto f32 = [&](const std::string& n, std::vector<float>& v) {
@@ -268,7 +388,7 @@ bool MossEngine::Impl::load(const ms::MossModel& m, std::string& err) {
     for (int ci = 2; ci <= 3; ++ci) {
         std::vector<float> w;
         if (!f32("enc.conv" + std::to_string(ci) + ".weight", w)) return false;
-        if (w.size() != (size_t)DS * DS * 9) { err = "fast moss: conv shape"; return false; }
+        if (w.size() != (size_t)DS * DS * 9) { err = "fast " + tag + ": conv shape"; return false; }
         std::vector<float> r((size_t)DS * 9 * DS);
         for (uint32_t oc = 0; oc < DS; ++oc)
             for (uint32_t ic = 0; ic < DS; ++ic)
@@ -283,9 +403,9 @@ bool MossEngine::Impl::load(const ms::MossModel& m, std::string& err) {
     // conv_out: columns reordered from ggml's (f + 16*c) to our (f*480 + c).
     {
         std::vector<float> w;
-        if (!f32("enc.conv_out.weight", w)) return false;
+        if (!f32(sp.conv_out, w)) return false;
         const uint32_t Kc = 16 * DS;
-        if (w.size() != (size_t)ED * Kc) { err = "fast moss: conv_out shape"; return false; }
+        if (w.size() != (size_t)ED * Kc) { err = "fast " + tag + ": conv_out shape"; return false; }
         std::vector<float> r(w.size());
         for (uint32_t n = 0; n < ED; ++n)
             for (uint32_t f = 0; f < 16; ++f)
@@ -297,8 +417,8 @@ bool MossEngine::Impl::load(const ms::MossModel& m, std::string& err) {
     }
     {
         std::vector<float> pe;
-        if (!f32("enc.positional_embedding", pe)) return false;
-        if (pe.size() < (size_t)13 * ED) { err = "fast moss: positional embedding shorter than 13 rows"; return false; }
+        if (!f32(sp.pos_embed, pe)) return false;
+        if (pe.size() < (size_t)13 * ED) { err = "fast " + tag + ": positional embedding shorter than 13 rows"; return false; }
         pe.resize((size_t)13 * ED);                  // rows [0, 13): one chunk of tokens
         pe13 = ar.add_f32(pe);
     }
@@ -306,20 +426,22 @@ bool MossEngine::Impl::load(const ms::MossModel& m, std::string& err) {
     for (uint32_t l = 0; l < EL; ++l) {
         EncLayer& Y = enc[l];
         const std::string p = "enc.blk." + std::to_string(l) + ".";
-        if (!mat(p + "attn.q.weight", Y.q) || !mat(p + "attn.k.weight", Y.k) || !mat(p + "attn.v.weight", Y.v) ||
-            !mat(p + "attn.o.weight", Y.o) || !mat(p + "ffn.fc1.weight", Y.fc1) || !mat(p + "ffn.fc2.weight", Y.fc2) ||
-            !vec_id(p + "attn.q.bias", Y.q_b) || !vec_id(p + "attn.k.bias", Y.k_b) ||
-            !vec_id(p + "attn.v.bias", Y.v_b) || !vec_id(p + "attn.o.bias", Y.o_b) ||
-            !vec_id(p + "ffn.fc1.bias", Y.fc1_b) || !vec_id(p + "ffn.fc2.bias", Y.fc2_b) ||
+        if (!mat(p + sp.eq + ".weight", Y.q) || !mat(p + sp.ek + ".weight", Y.k) || !mat(p + sp.ev + ".weight", Y.v) ||
+            !mat(p + sp.eo + ".weight", Y.o) || !mat(p + sp.efc1 + ".weight", Y.fc1) ||
+            !mat(p + sp.efc2 + ".weight", Y.fc2) ||
+            !vec_id(p + sp.eq + ".bias", Y.q_b) || !vec_id(p + sp.ek + ".bias", Y.k_b) ||
+            !vec_id(p + sp.ev + ".bias", Y.v_b) || !vec_id(p + sp.eo + ".bias", Y.o_b) ||
+            !vec_id(p + sp.efc1 + ".bias", Y.fc1_b) || !vec_id(p + sp.efc2 + ".bias", Y.fc2_b) ||
             !vec_id(p + "attn_norm.weight", Y.ln1_g) || !vec_id(p + "attn_norm.bias", Y.ln1_b) ||
             !vec_id(p + "ffn_norm.weight", Y.ln2_g) || !vec_id(p + "ffn_norm.bias", Y.ln2_b))
             return false;
     }
     if (!vec_id("enc.ln_post.weight", lnp_g) || !vec_id("enc.ln_post.bias", lnp_b) ||
-        !mat("enc.proj1.weight", p1) || !vec_id("enc.proj1.bias", p1_b) ||
-        !mat("enc.proj2.weight", p2) || !vec_id("enc.proj2.bias", p2_b) ||
-        !interleave("adapter.gate.weight", "adapter.up.weight", ad_gateup) ||
-        !mat("adapter.down.weight", ad_down))
+        !mat(sp.proj1 + ".weight", p1) || !vec_id(sp.proj1 + ".bias", p1_b) ||
+        !mat(sp.proj2 + ".weight", p2) || !vec_id(sp.proj2 + ".bias", p2_b))
+        return false;
+    if (sp.adapter && (!interleave("adapter.gate.weight", "adapter.up.weight", ad_gateup) ||
+                       !mat("adapter.down.weight", ad_down)))
         return false;
 
     // ---- LLM ----
@@ -354,7 +476,7 @@ bool MossEngine::Impl::load(const ms::MossModel& m, std::string& err) {
         const ggml_tensor* te = T("llm.embed.weight");
         if (!te) return false;
         const uint32_t N = (uint32_t)te->ne[1], Kc = (uint32_t)te->ne[0];
-        if (N == 0 || Kc != HD) { err = "fast moss: embedding table shape mismatch"; return false; }
+        if (N == 0 || Kc != HD) { err = "fast " + tag + ": embedding table shape mismatch"; return false; }
         if (packed && packed->has("llm.embed.weight")) {
             HostMatrix whole;
             if (!packed->matrix("llm.embed.weight", whole, err)) return false;
@@ -385,7 +507,7 @@ bool MossEngine::Impl::load(const ms::MossModel& m, std::string& err) {
         const VkDeviceSize cap = std::min<VkDeviceSize>(256ull << 20, ctx->info().max_storage_range);
         embed.chunk_rows = (uint32_t)std::max<size_t>(emb_block, (cap / row_bytes) / emb_block * emb_block);
         if (((size_t)embed.N + embed.chunk_rows - 1) / embed.chunk_rows > 4) {
-            err = "fast moss: embedding table needs more than 4 buffer chunks on this device";
+            err = "fast " + tag + ": embedding table needs more than 4 buffer chunks on this device";
             return false;
         }
         const size_t per_chunk = embed.chunk_rows / emb_block;
@@ -403,7 +525,7 @@ bool MossEngine::Impl::load(const ms::MossModel& m, std::string& err) {
         std::vector<float> tab((size_t)2 * MAXPOS * half);
         for (uint32_t i = 0; i < half; ++i) {
             const float ex = (float)(2 * i) / (float)HDIM;
-            const float inv = 1.0f / std::pow(lc.rope_theta, ex);
+            const float inv = 1.0f / std::pow(sp.rope_theta, ex);
             for (uint32_t pos = 0; pos < MAXPOS; ++pos) {
                 const float th = (float)pos * inv;
                 tab[(size_t)pos * half + i] = (float)std::cos((double)th);
@@ -415,15 +537,16 @@ bool MossEngine::Impl::load(const ms::MossModel& m, std::string& err) {
     const double t_pack = ms_since(t_load0);
     if (!ar.finalize(*ctx, err)) return false;
     if (env_on("STARLING_FAST_TIMING"))
-        std::fprintf(stderr, "[fast-moss] load: repack %.1f ms, upload %.1f ms\n", t_pack, ms_since(t_load0) - t_pack);
+        std::fprintf(stderr, "[fast-%s] load: repack %.1f ms, upload %.1f ms\n", sp.tag, t_pack,
+                     ms_since(t_load0) - t_pack);
     if (env_on("STARLING_FAST_VERBOSE"))
-        std::fprintf(stderr, "[fast] moss: weights %.1f MiB on '%s' (embed %s, %zu chunk(s))\n",
+        std::fprintf(stderr, "[fast] %s: weights %.1f MiB on '%s' (embed %s, %zu chunk(s))\n", sp.tag,
                      ar.total_bytes() / 1048576.0, ctx->info().name.c_str(), fmt_name(embed.fmt),
                      embed.parts.size());
     return true;
 }
 
-bool MossEngine::Impl::alloc_static(std::string& err) {
+bool AudioLlmEngine::Impl::alloc_static(std::string& err) {
     const size_t cache_elems = (size_t)NL * NKV * MAXPOS * HDIM;
     n_part = 0;
     for (const GMat& g : embed.parts) n_part += ceil_div(g.N, K.gemv_rows(g.N));
@@ -431,18 +554,18 @@ bool MossEngine::Impl::alloc_static(std::string& err) {
         return ctx->create_buffer(b, bytes, kind, err);
     };
     return mk(kcache, cache_elems * 2) && mk(vcache, cache_elems * 2) &&
-           mk(state, (16 + (size_t)cfg.max_new_tokens) * 4, vk::Mem::Readback) && mk(ids, kMaxPromptIds * 4, vk::Mem::Readback) &&
+           mk(state, (16 + (size_t)sp.max_new_tokens) * 4, vk::Mem::Readback) && mk(ids, kMaxPromptIds * 4, vk::Mem::Readback) &&
            mk(xd, HD * 4) && mk(qkvd, (size_t)(NH + 2 * NKV) * HDIM * 4) && mk(attd, (size_t)NH * HDIM * 4) &&
            mk(hd, (size_t)FF * 4) && mk(part, (size_t)n_part * 8) &&
            mk(apart, (size_t)NH * kAttnSplitMax * (2 + HDIM) * 4);
 }
 
-bool MossEngine::Impl::ensure(int C, int A, int S, std::string& err) {
+bool AudioLlmEngine::Impl::ensure(int C, int A, int S, std::string& err) {
     if (C <= cap_C && A <= cap_A && S <= cap_S) return true;
     C = std::max(C, cap_C); A = std::max(A, cap_A); S = std::max(S, cap_S);
     recs.clear();
     const size_t P = 100, T1 = half_len((int)P), F1 = 64, T2 = half_len((int)T1), F2 = 32, T3 = half_len((int)T2), F3 = 16;
-    const size_t W = 13 * (cfg.encoder.n_window_infer / 100);
+    const size_t W = 13 * (sp.n_window_infer / 100);
     const size_t nwin = (A + W - 1) / W;
     const size_t ldPw = round_up((uint32_t)W, 8);
     const size_t ldPs = round_up((uint32_t)S, 8);
@@ -461,21 +584,21 @@ bool MossEngine::Impl::ensure(int C, int A, int S, std::string& err) {
         !mk(effh, (size_t)A * EFF * 2) || !mk(eproj, (size_t)A * ED * 2) || !mk(eproj2, (size_t)A * EOUT * 2) ||
         !mk(adh, (size_t)A * AH * 2) || !mk(lx, (size_t)S * HD * 4) || !mk(lhn, (size_t)S * HD * 2) ||
         !mk(lqkv, (size_t)S * (NH + 2 * NKV) * HDIM * 2) || !mk(lqr, (size_t)S * NH * HDIM * 2) ||
-        !mk(lsc, hgroup * S * S * 4) || !mk(lp, hgroup * S * ldPs * 2) || !mk(lctx, (size_t)S * HD * 2) ||
+        !mk(lsc, hgroup * S * S * 4) || !mk(lp, hgroup * S * ldPs * 2) || !mk(lctx, (size_t)S * NH * HDIM * 2) ||
         !mk(lmlp, (size_t)S * FF * 2))
         return false;
     cap_C = C; cap_A = A; cap_S = S;
     return true;
 }
 
-bool MossEngine::Impl::lm_head(vk::Recording& rc, vk::Ref x, uint32_t x_off, std::string& err) {
+bool AudioLlmEngine::Impl::lm_head(vk::Recording& rc, vk::Ref x, uint32_t x_off, std::string& err) {
     uint32_t off = 0;
     for (size_t c = 0; c < embed.parts.size(); ++c) {
         const GMat& g = embed.parts[c];
         Kernels::GemvArgs a;
         a.x_off = x_off;
         a.y_off = off * 2;
-        a.eps = cfg.llm.rms_norm_eps;
+        a.eps = sp.rms_eps;
         a.row0 = (uint32_t)c * embed.chunk_rows;
         rc.label("lm_head");
         if (!K.gemv(rc, ar, g, x, vk::Ref(part), R(final_norm), vk::Ref(state), {}, 3, a, err)) return false;
@@ -484,7 +607,7 @@ bool MossEngine::Impl::lm_head(vk::Recording& rc, vk::Ref x, uint32_t x_off, std
     return true;
 }
 
-bool MossEngine::Impl::dec_next(vk::Recording& rc, std::string& err) {
+bool AudioLlmEngine::Impl::dec_next(vk::Recording& rc, std::string& err) {
     const char* name = embed.fmt == GpuFmt::W8 ? "dec_next" : embed.fmt == GpuFmt::W4 ? "dec_next_w4" : "dec_next_f16";
     const vk::Pipeline* p = ctx->pipeline(name, {256u, embed.chunk_rows}, err);
     if (!p) return false;
@@ -496,22 +619,21 @@ bool MossEngine::Impl::dec_next(vk::Recording& rc, std::string& err) {
     }
     b[9] = vk::Ref(xd);
     b[10] = vk::Ref(state);
-    struct { uint32_t n_part, K, eos, max_steps; } pc{n_part, HD, (uint32_t)cfg.eos_token_id, cfg.max_new_tokens};
+    struct { uint32_t n_part, K, eos, max_steps; } pc{n_part, HD, (uint32_t)sp.eos, sp.max_new_tokens};
     rc.label("dec_next");
     rc.dispatch(*p, b, &pc, sizeof(pc), 1);
     return true;
 }
 
-bool MossEngine::Impl::record_prefill(int C, int tail, Rec& r, std::string& err) {
-    const auto& ec = cfg.encoder;
+bool AudioLlmEngine::Impl::record_prefill(int C, int tail, Rec& r, std::string& err) {
     const int P = C == 1 ? tail : 100;
     const int T1 = half_len(P), F1 = 64, T2 = half_len(T1), F2 = 32, T3 = half_len(T2), F3 = 16;
     const int64_t Tm = (int64_t)(C - 1) * 100 + tail;
-    const uint32_t A = (uint32_t)ms::audio_token_length(Tm);
+    const uint32_t A = (uint32_t)audio_tokens(Tm);
     const uint32_t Mtok = (uint32_t)T3;                     // tokens per chunk
-    const uint32_t W = Mtok * (ec.n_window_infer / 100);
-    const uint32_t S = (uint32_t)(cfg.prompt_prefix.size() + A + cfg.prompt_suffix.size());
-    const uint32_t npre = (uint32_t)cfg.prompt_prefix.size();
+    const uint32_t W = Mtok * (sp.n_window_infer / 100);
+    const uint32_t S = (uint32_t)(sp.prefix.size() + A + sp.suffix.size());
+    const uint32_t npre = (uint32_t)sp.prefix.size();
     r.A = (int)A;
     r.S = (int)S;
     r.rec = std::make_unique<vk::Recording>(*ctx);
@@ -589,7 +711,7 @@ bool MossEngine::Impl::record_prefill(int C, int tail, Rec& r, std::string& err)
         rc.label("enc_attn_pv");
         return K.gemm(rc, v, err);
     };
-    const float eps = ec.layer_norm_eps;
+    const float eps = sp.enc_eps;
     for (uint32_t l = 0; l < EL; ++l) {
         const EncLayer& Y = enc[l];
         rc.split();
@@ -632,26 +754,32 @@ bool MossEngine::Impl::record_prefill(int C, int tail, Rec& r, std::string& err)
     if (!K.gemm_w(rc, ar, p1, vk::Ref(eh), A, ED, vk::Ref(eproj), ED, Epi::F16, Act::Gelu, R(p1_b), 1.0f, ~0u, err))
         return false;
     rc.barrier();
-    if (!K.gemm_w(rc, ar, p2, vk::Ref(eproj), A, ED, vk::Ref(eproj2), EOUT, Epi::F16, Act::None, R(p2_b), 1.0f, ~0u, err))
-        return false;
-    rc.barrier();
-    rc.label("adapter");
-    if (!K.gemm_w(rc, ar, ad_gateup, vk::Ref(eproj2), A, EOUT, vk::Ref(adh), AH, Epi::SwiGlu, Act::None, {}, 1.0f, ~0u, err))
-        return false;
-    rc.barrier();
-    // Adapter output lands directly in the LLM input rows [npre, npre + A).
-    {
+    // The last projection (MOSS: the adapter's down projection) lands
+    // directly in the LLM input rows [npre, npre + A).
+    auto to_llm_rows = [&](const GMat& w, vk::Buffer& in, uint32_t lda, vk::Ref bias) {
         GemmCall c;
-        c.b = BKind::W4;
-        if (ad_down.fmt == GpuFmt::W8) c.b = BKind::W8;
-        if (ad_down.fmt == GpuFmt::F16) c.b = BKind::F16;
+        c.b = w.fmt == GpuFmt::W4 ? BKind::W4 : w.fmt == GpuFmt::W8 ? BKind::W8 : BKind::F16;
         c.epi = Epi::F32;
-        c.a.M = A; c.a.N = ad_down.N; c.a.K = ad_down.K;
-        c.a.lda = AH; c.a.ldb = ad_down.K; c.a.ldc = HD; c.a.c_off = npre * HD;
-        c.A = vk::Ref(adh); c.Bq = R(ad_down.q);
-        if (ad_down.has_s) c.Bs = R(ad_down.s);
+        c.bias_mode = bias.buf ? 1u : 0u;
+        c.a.M = A; c.a.N = w.N; c.a.K = w.K;
+        c.a.lda = lda; c.a.ldb = w.K; c.a.ldc = HD; c.a.c_off = npre * HD;
+        c.A = vk::Ref(in); c.Bq = R(w.q);
+        if (w.has_s) c.Bs = R(w.s);
         c.C = vk::Ref(lx);
-        if (!K.gemm(rc, c, err)) return false;
+        c.bias = bias;
+        return K.gemm(rc, c, err);
+    };
+    if (sp.adapter) {
+        if (!K.gemm_w(rc, ar, p2, vk::Ref(eproj), A, ED, vk::Ref(eproj2), EOUT, Epi::F16, Act::None, R(p2_b), 1.0f, ~0u, err))
+            return false;
+        rc.barrier();
+        rc.label("adapter");
+        if (!K.gemm_w(rc, ar, ad_gateup, vk::Ref(eproj2), A, EOUT, vk::Ref(adh), AH, Epi::SwiGlu, Act::None, {}, 1.0f, ~0u, err))
+            return false;
+        rc.barrier();
+        if (!to_llm_rows(ad_down, adh, AH, {})) return false;
+    } else if (!to_llm_rows(p2, eproj, ED, R(p2_b))) {
+        return false;
     }
     // Prompt token embeddings (ids uploaded at load time: prefix then suffix).
     {
@@ -668,7 +796,7 @@ bool MossEngine::Impl::record_prefill(int C, int tail, Rec& r, std::string& err)
         struct { uint32_t K, ids_off, out_row0; } a1{HD, 0, 0}, a2{HD, npre, npre + A};
         rc.label("embed");
         rc.dispatch(*pp, b, &a1, sizeof(a1), npre);
-        rc.dispatch(*pp, b, &a2, sizeof(a2), (uint32_t)cfg.prompt_suffix.size());
+        rc.dispatch(*pp, b, &a2, sizeof(a2), (uint32_t)sp.suffix.size());
     }
     rc.barrier();
 
@@ -681,7 +809,7 @@ bool MossEngine::Impl::record_prefill(int C, int tail, Rec& r, std::string& err)
     uint32_t hgroup = (uint32_t)std::min<size_t>(
         {(size_t)NH, lsc.size / ((size_t)S * S * 4), lp.size / ((size_t)S * ldP * 2)});
     hgroup = std::max(gqa, hgroup / gqa * gqa);
-    const float leps = cfg.llm.rms_norm_eps;
+    const float leps = sp.rms_eps;
     const float lscale = 1.0f / std::sqrt((float)HDIM);
     for (uint32_t l = 0; l < NL; ++l) {
         const LlmLayer& Y = llm[l];
@@ -762,11 +890,11 @@ bool MossEngine::Impl::record_prefill(int C, int tail, Rec& r, std::string& err)
     return true;
 }
 
-bool MossEngine::Impl::record_decode(uint32_t steps, std::string& err) {
+bool AudioLlmEngine::Impl::record_decode(uint32_t steps, std::string& err) {
     dec_rec = std::make_unique<vk::Recording>(*ctx);
     vk::Recording& rc = *dec_rec;
     rc.begin();
-    const float leps = cfg.llm.rms_norm_eps;
+    const float leps = sp.rms_eps;
     const float lscale = 1.0f / std::sqrt((float)HDIM);
     // Decode attention as a flash-decode KV split: S chunks per query head,
     // then a combine. The single-pass kernel runs one workgroup per head (16
@@ -782,7 +910,7 @@ bool MossEngine::Impl::record_decode(uint32_t steps, std::string& err) {
         char* end = nullptr;
         const unsigned long v = std::strtoul(e, &end, 10);
         if (*e >= '0' && *e <= '9' && *end == '\0' && v <= kAttnSplitMax) return (int)v;
-        std::fprintf(stderr, "[fast-moss] ignoring STARLING_FAST_ATTN_SPLIT='%s' (want 0..%u)\n", e, kAttnSplitMax);
+        std::fprintf(stderr, "[fast] ignoring STARLING_FAST_ATTN_SPLIT='%s' (want 0..%u)\n", e, kAttnSplitMax);
         return -1;
     }();
     const uint32_t asplit = split_env >= 0 ? (uint32_t)split_env : ctx->info().vendor_id == 0x1002 ? 4 : 0;
@@ -842,21 +970,26 @@ bool MossEngine::Impl::record_decode(uint32_t steps, std::string& err) {
     return true;
 }
 
-bool MossEngine::generate(const float* pcm, size_t n, std::vector<int32_t>& out_ids, bool& eos,
-                          std::string& err) {
+bool AudioLlmEngine::generate(const float* pcm, size_t n, uint32_t budget, std::vector<int32_t>& out_ids,
+                              bool& eos, std::string& err) {
     Impl& I = *impl_;
+    const char* tag = I.sp.tag;
+    const uint32_t max_new = budget ? std::min(budget, I.sp.max_new_tokens) : I.sp.max_new_tokens;
     const bool timing = env_on("STARLING_FAST_TIMING");
     const auto t0 = std::chrono::steady_clock::now();
-    ms::MelFeatures mel;
-    if (!ms::compute_log_mel(I.cfg, I.mel_loader, pcm, n, mel, err)) return false;
-    const int64_t T = mel.n_frames;
-    if (T <= 0) { err = "fast moss: empty audio"; return false; }
+    MelView mel;
+    if (!I.sp.mel(I.mel_loader, pcm, n, mel, err)) return false;
+    const int64_t T = mel.T;
+    if (T <= 0) { err = std::string("fast ") + tag + ": empty audio"; return false; }
     const int C = (int)((T + 99) / 100);
     const int tail = (int)(T % 100 ? T % 100 : 100);
     const int P = C == 1 ? tail : 100;
-    const int A = (int)ms::audio_token_length(T);
-    const int S = (int)(I.cfg.prompt_prefix.size() + A + I.cfg.prompt_suffix.size());
-    if (S + (int)I.cfg.max_new_tokens > (int)I.MAXPOS) { err = "MOSS generation exceeds cache"; return false; }
+    const int A = (int)audio_tokens(T);
+    const int S = (int)(I.sp.prefix.size() + A + I.sp.suffix.size());
+    if (S + (int)max_new > (int)I.MAXPOS) {
+        err = std::string("fast ") + tag + ": generation exceeds the KV cache (audio too long)";
+        return false;
+    }
     if (!I.ensure(C, A, S, err)) return false;
 
     // Mel chunks [C][128][P] (bf16 values, zero-padded tail).
@@ -865,7 +998,8 @@ bool MossEngine::generate(const float* pcm, size_t n, std::vector<int32_t>& out_
         const int len = ci == C - 1 ? tail : 100;
         for (int f = 0; f < 128; ++f)
             for (int t = 0; t < len; ++t)
-                chunks[((size_t)ci * 128 + f) * P + t] = ggml_bf16_to_fp32(mel.data[(size_t)f * T + ci * 100 + t]);
+                chunks[((size_t)ci * 128 + f) * P + t] =
+                    ggml_bf16_to_fp32(mel.data[(size_t)f * mel.stride + ci * 100 + t]);
     }
     const double t_mel = ms_since(t0);
 
@@ -892,22 +1026,23 @@ bool MossEngine::generate(const float* pcm, size_t n, std::vector<int32_t>& out_
     if (!I.ctx->upload(I.mel_in, 0, chunks.data(), chunks.size() * 4, err)) return false;
     {
         std::vector<uint32_t> idv;
-        for (int32_t v : I.cfg.prompt_prefix) idv.push_back((uint32_t)v);
-        for (int32_t v : I.cfg.prompt_suffix) idv.push_back((uint32_t)v);
+        for (int32_t v : I.sp.prefix) idv.push_back((uint32_t)v);
+        for (int32_t v : I.sp.suffix) idv.push_back((uint32_t)v);
         if (!I.ctx->upload(I.ids, 0, idv.data(), idv.size() * 4, err)) return false;
         uint32_t st[16] = {};
         st[0] = (uint32_t)S - 1;   // dec_next advances to S: the first generated token's position
+        st[3] = max_new;           // this call's token budget (dec_next.comp)
         if (!I.ctx->upload(I.state, 0, st, sizeof st, err)) return false;
     }
     if (!it->second.rec->submit_and_wait(err)) return false;
-    it->second.rec->report_profile("moss encoder+prefill");
+    it->second.rec->report_profile("encoder+prefill");
     const double t_pre = ms_since(t0);
 
-    std::vector<uint32_t> st(16 + (size_t)I.cfg.max_new_tokens);
+    std::vector<uint32_t> st(16 + (size_t)I.sp.max_new_tokens);
     int rounds = 0;
     // The device stops at EOS or the budget; the host bound only guards
     // against a state buffer that never reports either.
-    const int max_rounds = (int)(I.cfg.max_new_tokens / steps) + 2;
+    const int max_rounds = (int)(max_new / steps) + 2;
     // Degradation watchdog (#325): the wedge is preceded by rounds that
     // blow past the session's own median (the bimodal 101-141 ms/token
     // band, P2-7). From the second round on, each fence wait is bounded at
@@ -927,7 +1062,7 @@ bool MossEngine::generate(const float* pcm, size_t n, std::vector<int32_t>& out_
             char* end = nullptr;
             const double v = std::strtod(e, &end);
             if (end != e && *end == '\0' && std::isfinite(v) && v >= 0 && v <= 1000) m = v;
-            else std::fprintf(stderr, "[fast-moss] ignoring STARLING_FAST_STALL_MULT='%s' (want 0..1000)\n", e);
+            else std::fprintf(stderr, "[fast] ignoring STARLING_FAST_STALL_MULT='%s' (want 0..1000)\n", e);
         }
         return m;
     }();
@@ -937,7 +1072,7 @@ bool MossEngine::generate(const float* pcm, size_t n, std::vector<int32_t>& out_
             char* end = nullptr;
             const unsigned long long v = std::strtoull(e, &end, 10);
             if (end != e && *end == '\0' && v > 0) b = v;
-            else std::fprintf(stderr, "[fast-moss] ignoring STARLING_FAST_STALL_BUDGET_MS='%s' (want ms > 0)\n", e);
+            else std::fprintf(stderr, "[fast] ignoring STARLING_FAST_STALL_BUDGET_MS='%s' (want ms > 0)\n", e);
         }
         return b;
     }();
@@ -946,18 +1081,18 @@ bool MossEngine::generate(const float* pcm, size_t n, std::vector<int32_t>& out_
     std::vector<double> round_ms;
     for (;;) {
         if (!I.ctx->download(I.state, 0, st.data(), 16 * 4, err)) return false;
-        if (st[2] != 0 || st[1] >= I.cfg.max_new_tokens) break;
+        if (st[2] != 0 || st[1] >= max_new) break;
         // Cooperative stop (#325): a SIGTERM'd process checks this between
         // decode rounds and returns the valid prefix instead of dying with a
         // live VkDevice (the driver's async reaping of ~1.6 GB of GPU state
         // is the leading wedge correlate; RESEARCH_LOG P2-7). Checked after
         // the state refresh so the prefix includes the round just finished.
         if (starling_ggml_stop_requested()) {
-            std::fprintf(stderr, "[fast-moss] stop requested: returning a %u-token prefix\n",
-                         std::min<uint32_t>(st[1], I.cfg.max_new_tokens));
+            std::fprintf(stderr, "[fast-%s] stop requested: returning a %u-token prefix\n", tag,
+                         std::min<uint32_t>(st[1], max_new));
             break;
         }
-        if (rounds >= max_rounds) { err = "fast moss: decode did not terminate"; return false; }
+        if (rounds >= max_rounds) { err = std::string("fast ") + tag + ": decode did not terminate"; return false; }
         uint64_t budget_ms = 0;   // 0 = the runtime's 120 s default
         if (forced_budget_ms) budget_ms = forced_budget_ms;
         else if (stall_mult > 0 && !round_ms.empty()) {
@@ -969,13 +1104,13 @@ bool MossEngine::generate(const float* pcm, size_t n, std::vector<int32_t>& out_
         const auto t_round = std::chrono::steady_clock::now();
         if (!I.dec_rec->submit_and_wait(err, budget_ms)) return false;
         round_ms.push_back(ms_since(t_round));
-        if (rounds == 0) I.dec_rec->report_profile("moss decode (K steps)");
+        if (rounds == 0) I.dec_rec->report_profile("decode (K steps)");
         ++rounds;
     }
-    const uint32_t ngen = std::min<uint32_t>(st[1], I.cfg.max_new_tokens);
+    const uint32_t ngen = std::min<uint32_t>(st[1], max_new);
     if (!I.ctx->download(I.state, 16 * 4, st.data() + 16, ngen * 4, err)) return false;
     out_ids.assign(st.begin() + 16, st.begin() + 16 + ngen);
-    eos = !out_ids.empty() && out_ids.back() == I.cfg.eos_token_id;
+    eos = !out_ids.empty() && out_ids.back() == I.sp.eos;
     // Debug dump of the greedy token stream (#311 draft-acceptance studies):
     // STARLING_FAST_DUMP_TOKENS=path writes the generated ids (comma
     // separated); a path used repeatedly gets .1, .2 ... suffixes. The
@@ -995,12 +1130,12 @@ bool MossEngine::generate(const float* pcm, size_t n, std::vector<int32_t>& out_
                 std::fprintf(f, i ? ",%d" : "%d", (int)out_ids[i]);
             std::fclose(f);
         } else {
-            std::fprintf(stderr, "[fast-moss] STARLING_FAST_DUMP_TOKENS: cannot write %s\n", path.c_str());
+            std::fprintf(stderr, "[fast-%s] STARLING_FAST_DUMP_TOKENS: cannot write %s\n", tag, path.c_str());
         }
     }
     if (timing)
-        std::fprintf(stderr, "[fast-moss] audio=%.2fs mel=%.1fms enc+prefill=%.1fms decode=%.1fms (%u tokens, %d rounds) total=%.1fms (T=%lld A=%d S=%d)\n",
-                     n / 16000.0, t_mel, t_pre - t_mel, ms_since(t0) - t_pre, ngen, rounds, ms_since(t0),
+        std::fprintf(stderr, "[fast-%s] audio=%.2fs mel=%.1fms enc+prefill=%.1fms decode=%.1fms (%u tokens, %d rounds) total=%.1fms (T=%lld A=%d S=%d)\n",
+                     tag, n / 16000.0, t_mel, t_pre - t_mel, ms_since(t0) - t_pre, ngen, rounds, ms_since(t0),
                      (long long)T, A, S);
     return true;
 }

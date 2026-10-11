@@ -24,7 +24,7 @@
 
 #if defined(STARLING_HAVE_FAST)
 #include "engine_select.hpp"
-#include "moss_engine.hpp"
+#include "audio_llm_engine.hpp"
 #endif
 
 namespace {
@@ -34,7 +34,7 @@ struct MossCtx : starling::ggml::lib::EngineContext<starling::ggml::moss::MossMo
 #if defined(STARLING_HAVE_FAST)
     // Model-specialized Vulkan engine (cpp/fast). When set it owns the
     // weights; `model` is released after load and only the tokenizer stays.
-    std::unique_ptr<starling::fast::MossEngine> fast;
+    std::unique_ptr<starling::fast::AudioLlmEngine> fast;
 #endif
 };
 using starling::ggml::lib::report;
@@ -68,7 +68,7 @@ void * starling_ggml_moss_load(const char * gguf_path, const char ** err_out) {
                 !ctx->tokenizer.load(ctx->model->loader, ctx->model->config, ctx->err))
                 throw std::runtime_error(ctx->err);
             std::string ferr;
-            ctx->fast = starling::fast::MossEngine::create(*ctx->model, ferr);
+            ctx->fast = starling::fast::AudioLlmEngine::create(*ctx->model, ferr);
             if (ctx->fast) {
                 if (std::getenv("STARLING_FAST_VERBOSE"))
                     std::fprintf(stderr, "[fast] moss engine: %s\n", ctx->fast->describe().c_str());
@@ -119,7 +119,7 @@ char * starling_ggml_moss_decode(void * handle, const float * pcm, int64_t n,
         if (c->fast) {
             std::vector<int32_t> ids;
             bool eos = false;
-            if (!c->fast->generate(pcm, static_cast<size_t>(n), ids, eos, c->err)) {
+            if (!c->fast->generate(pcm, static_cast<size_t>(n), /*budget=*/0, ids, eos, c->err)) {
                 report(err_out, c->err); return nullptr;
             }
             c->last_completion = eos ? STARLING_MOSS_COMPLETION_EOS : STARLING_MOSS_COMPLETION_BUDGET;

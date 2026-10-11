@@ -37,12 +37,27 @@
 #include <cstring>
 #include <memory>
 #include <new>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
+#if defined(STARLING_HAVE_FAST)
+#include "engine_select.hpp"
+#include "audio_llm_engine.hpp"
+#endif
+
 namespace {
 
-using Qwen3Ctx = starling::ggml::lib::EngineContext<starling::ggml::qwen3::Qwen3Model, starling::ggml::qwen3::Tokenizer>;
+struct Qwen3Ctx : starling::ggml::lib::EngineContext<starling::ggml::qwen3::Qwen3Model,
+                                                     starling::ggml::qwen3::Tokenizer> {
+    // The model's config; outlives `model`, which the fast engine releases.
+    starling::ggml::qwen3::Config config;
+#if defined(STARLING_HAVE_FAST)
+    // Model-specialized Vulkan engine (cpp/fast). When set it owns the
+    // weights; `model` is released after load and only the tokenizer stays.
+    std::unique_ptr<starling::fast::AudioLlmEngine> fast;
+#endif
+};
 using starling::ggml::lib::report;
 
 constexpr double kSampleRate = 16000.0;
@@ -148,8 +163,23 @@ std::string extract_transcription(std::string text) {
 bool transcribe_piece(Qwen3Ctx& ctx, const float* pcm, int64_t n, int32_t budget,
                       std::string& text, double* stage_ms = nullptr) {
     using namespace starling::ggml::qwen3;
-    const Qwen3Model& m = *ctx.model;
     auto t0 = std::chrono::steady_clock::now();
+#if defined(STARLING_HAVE_FAST)
+    if (ctx.fast) {
+        std::vector<int32_t> ids;
+        bool eos = false;
+        if (!ctx.fast->generate(pcm, (size_t) n, (uint32_t) std::max(1, budget), ids, eos, ctx.err))
+            return false;
+        text = extract_transcription(ctx.tokenizer.decode(ids, true));
+        if (stage_ms) {
+            stage_ms[0] = stage_ms[1] = 0;
+            stage_ms[2] = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t0).count();
+        }
+        return true;
+    }
+#endif
+    const Qwen3Model& m = *ctx.model;
     MelFeatures mel;
     if (!compute_log_mel(m.config, m.loader, pcm, (size_t) n, mel, ctx.err))
         return false;
@@ -211,7 +241,46 @@ std::string join_texts(const std::vector<std::string>& texts) {
 extern "C" {
 
 void* starling_ggml_qwen3_load(const char* gguf_path, const char** err_out) {
-    return starling::ggml::lib::load_engine<Qwen3Ctx>(gguf_path, "QWEN3", err_out);
+#if defined(STARLING_HAVE_FAST)
+    const auto choice = starling::fast::engine_choice();
+    if (choice != starling::fast::EngineChoice::Ggml && gguf_path && *gguf_path) {
+        static thread_local std::string load_error;
+        try {
+            auto ctx = std::make_unique<Qwen3Ctx>();
+            ctx->model = std::make_unique<starling::ggml::qwen3::Qwen3Model>();
+            if (!ctx->model->load(gguf_path, ctx->err) ||
+                !ctx->tokenizer.load(ctx->model->loader, ctx->model->config, ctx->err))
+                throw std::runtime_error(ctx->err);
+            ctx->config = ctx->model->config;
+            std::string ferr;
+            ctx->fast = starling::fast::AudioLlmEngine::create(*ctx->model, ferr);
+            if (ctx->fast) {
+                if (std::getenv("STARLING_FAST_VERBOSE"))
+                    std::fprintf(stderr, "[fast] qwen3 engine: %s\n", ctx->fast->describe().c_str());
+                ctx->model.reset();
+                if (err_out) *err_out = nullptr;
+                return ctx.release();
+            }
+            if (choice == starling::fast::EngineChoice::Fast)
+                throw std::runtime_error("fast engine unavailable: " + ferr);
+            if (std::getenv("STARLING_FAST_VERBOSE"))
+                std::fprintf(stderr, "[fast] qwen3 falls back to ggml: %s\n", ferr.c_str());
+            starling::ggml::ensure_weights_realized(ctx->model->loader);
+            if (err_out) *err_out = nullptr;
+            return ctx.release();
+        } catch (const std::exception& e) {
+            load_error = e.what();
+        } catch (...) {
+            load_error = "unknown exception loading QWEN3 model";
+        }
+        if (err_out) *err_out = load_error.c_str();
+        return nullptr;
+    }
+#endif
+    auto* ctx = static_cast<Qwen3Ctx*>(
+        starling::ggml::lib::load_engine<Qwen3Ctx>(gguf_path, "QWEN3", err_out));
+    if (ctx) ctx->config = ctx->model->config;
+    return ctx;
 }
 
 void starling_ggml_qwen3_free(void* handle) {
@@ -232,7 +301,7 @@ char* starling_ggml_qwen3_decode(void* handle, const float* pcm, int64_t n,
     }
     try {
         using namespace starling::ggml::qwen3;
-        const Config& cfg = c->model->config;
+        const Config& cfg = c->config;
         const bool timing = std::getenv("STARLING_QWEN3_TIMING") != nullptr;
         auto now = [] { return std::chrono::steady_clock::now(); };
         auto t_start = now();
