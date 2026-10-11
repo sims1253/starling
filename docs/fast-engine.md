@@ -6,8 +6,8 @@ Starling ships two kinds of engines behind the same C API:
   ([engine notes](ggml-engine.md));
 * the **fast engines** in `cpp/fast/` — hand-written Vulkan compute kernels
   for two model families, **Parakeet-TDT** and the audio-LLMs
-  (**MOSS-Transcribe**, **Qwen3-ASR** and **ARK-ASR** whole; the text
-  decoder of **Granite-speech**), built around their shapes the way
+  (**MOSS-Transcribe**, **Qwen3-ASR**, **ARK-ASR** and **Granite-speech**),
+  built around their shapes the way
   [Splash](https://inco.ai/blog/splash/) builds an engine around one model.
   MOSS and Qwen3-ASR share one engine (`audio_llm_engine.cpp`): the same
   Qwen3-Omni-style audio tower and Qwen3 decoder, with MOSS's SwiGLU adapter
@@ -94,9 +94,14 @@ the contiguous run t·s .. t·s+2), the interleaved partial RoPE is
 budget, and the adapter reads merge·d_model-wide rows straight from the
 ln_post output and writes into the prompt's audio slots.
 `STARLING_FAST_ARK_HOST_ENCODER=1` keeps the encoder on ggml. Granite's
-conformer + Q-Former stay on ggml (decoder-only engine): their output rows
-and the prompt ids are uploaded once, and the engine does the embedding
-lookup, prefill and the same on-device greedy loop. The trunk variations are spec flags of the
+conformer (200-frame attention windows with a Shaw relative-position bias,
+`shaw_bias.comp`; the depthwise conv reuses Parakeet's kernel with BatchNorm
+folded at load) and its windowed Q-Former run on the device the same way,
+through the shared `generate_from_mel()`; the projector writes the audio
+slots with the embedding multiplier applied.
+`STARLING_FAST_GRANITE_HOST_ENCODER=1` keeps both on ggml, and the engine
+then takes their output rows. Granite's CTC speculative decode needs the
+ggml encoder's weights and runs only under `STARLING_ENGINE=ggml`. The trunk variations are spec flags of the
 Qwen3 decoder — Qwen2.5's q/k/v biases ride the projection epilogues and
 the attention kernels skip the q/k norm; Granite's residual multiplier is
 folded into the o/down projections' group scales, its embedding multiplier

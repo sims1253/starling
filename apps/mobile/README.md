@@ -68,13 +68,12 @@ on a phone, and their load is memory-gated with a larger working-set
 estimate (a KV cache on top of the weights); they transcribe long
 recordings in 30 s windows, and live previews of a slow model are spaced
 so they keep the engine busy at most half of the time. Parakeet,
-Qwen3-ASR, MOSS and ARK run on the GPU (Vulkan fast engines) where the
-phone has one; Granite runs its decoder on the GPU and its encoder on the
-CPU, and Voxtral runs on the CPU. GPU inference is both faster and several
-times more energy-efficient per transcription than the CPU engine. The
-model is loaded on first use. When a transcription fails — missing model,
-load failure — the failure is surfaced and the local recording remains
-available for retry.
+Qwen3-ASR, MOSS, ARK and Granite run on the GPU (Vulkan fast engines)
+where the phone has one; Voxtral runs on the CPU. GPU inference is both
+faster and several times more energy-efficient per transcription than the
+CPU engine. The model is loaded on first use. When a transcription fails —
+missing model, load failure — the failure is surfaced and the local
+recording remains available for retry.
 Building the app additionally requires the Android NDK and CMake SDK packages.
 
 Models live in app-private storage until you tap **Keep models across
