@@ -286,6 +286,10 @@ ggml_tensor* build_adapter(ggml_context* ctx, const ArkModel& model,
                          GGML_TYPE_BF16);
     };
     ggml_tensor* h = lin("adapter.fc0", x);
+    // Both adapting Linears carry a bias (modeling_arkasr.py: nn.Linear
+    // defaults); added like fc2's below, before the activation.
+    h = ggml_cast(ctx, ggml_add(ctx, f32(ctx, h), f32(ctx, weight(ctx, model.loader, "adapter.fc0.bias"))),
+                  GGML_TYPE_BF16);
     h = exact_gelu(ctx, h);
     h = lin("adapter.fc2", h);
     // Add the fc2 bias (the adapting MLP's second Linear has a bias).
