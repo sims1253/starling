@@ -29,7 +29,8 @@ ggml_tensor* Subsampling::build_graph(ggml_context* ctx,
                                       int n_mels, int T,
                                       GraphInputPool& pool,
                                       int& out_Tp, int& out_valid,
-                                      int in_valid_frames) const {
+                                      int in_valid_frames,
+                                      const LengthMasks* lm) const {
     const int C = conv_channels_;
     const int F = n_mels;
     const ModelLoader& ml = ml_;
@@ -54,6 +55,9 @@ ggml_tensor* Subsampling::build_graph(ggml_context* ctx,
     // Add bias broadcast over channels: reshape bias to [1,1,C,1].
     x = ggml_add(ctx, x, ggml_reshape_4d(ctx, b0, 1, 1, C, 1));
     x = ggml_relu(ctx, x);
+    // Padded (bucketed) input: zero the stage output past the true length, as
+    // the next conv's zero padding does for an unpadded input.
+    if (lm) x = ggml_mul(ctx, x, lm->stage1);
 
     // ---- Stages 2 & 3: depthwise(k=3,s=2,p=1,groups=C) + cont + bias +
     //                    pointwise(C->C, k=1) + bias + ReLU ----
@@ -89,6 +93,7 @@ ggml_tensor* Subsampling::build_graph(ggml_context* ctx,
                          /*s0*/1, /*s1*/1, /*p0*/0, /*p1*/0, /*d0*/1, /*d1*/1);
         x = ggml_add(ctx, x, ggml_reshape_4d(ctx, pwb, 1, 1, C, 1));
         x = ggml_relu(ctx, x);
+        if (lm && si == 0) x = ggml_mul(ctx, x, lm->stage2);
     }
 
     // x is now ne [F'=OW, T'=OH, C, 1]. NeMo flatten:
@@ -106,7 +111,9 @@ ggml_tensor* Subsampling::build_graph(ggml_context* ctx,
     // so we can run the conv stack spatially and zero the flattened conv output
     // at frames >= valid_out before the Linear.
     const int valid_out = valid_out_len(T, in_valid_frames);
-    if (valid_out < Tp) {
+    if (lm) {
+        flat = ggml_mul(ctx, flat, lm->time);
+    } else if (valid_out < Tp) {
         float* outmask = pool.alloc_f32(Tp);
         for (int t = 0; t < Tp; ++t) outmask[t] = (t < valid_out) ? 1.0f : 0.0f;
         int64_t mk_ne[2] = {1, Tp};

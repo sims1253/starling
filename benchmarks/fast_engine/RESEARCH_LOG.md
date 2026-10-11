@@ -974,3 +974,47 @@ holds the lock for the whole session (`phone_common.sh` `wake_hold` /
 Open: the app's partial wake lock is disabled in deep Doze and for a cached
 (backgrounded) process, so on-device GPU work there is unprotected. Closing
 that needs a foreground service during transcription (not done).
+
+## Parakeet encoder: T-bucketed replay graphs + byte-budget cache (2026-10-11, notebook RADV)
+
+Device: Ryzen 5 PRO 5650U / RADV RENOIR (iGPU, shared memory: device replay
+cap 2). Model: `parakeet-tdt-0.6b-v3-q4_k_m-shrink16` (desktop catalog
+default); exactness also on `-bf16-exact`. Baseline: `origin/master`
+`86044e0c`, built before the change. Branch `perf/parakeet-t-buckets`.
+
+Hypothesis: the ggml encoder keys its replay graph on the exact mel length
+T, so every live preview (a growing tail) is a new graph. Measured on the
+baseline (`stream_replay.py`, medium+long takes, `STARLING_REPLAY_TIMING`):
+~98 % of encoder calls build a graph (397-409 builds / 403-415 calls); a
+miss costs 60-340 ms (graph build 11-27 ms + 24 one-shot positional
+projections 50-340 ms) plus a slower first replay. The device cap of 2 would
+thrash even with buckets: a stream cycles over ~6-10 window sizes.
+
+Change: (1) GPU mel lengths <= 2048 frames round up to 128-frame buckets;
+the input is zero-padded and per-call `LengthMasks` (stage-1/2 subsampling
+frame masks, valid-frame mask, attention key mask) keep the padding out of
+the real frames, output truncated to `subsample_len(T)`; longer inputs keep
+the exact-T graph. (2) The encoder cache is a `ByteBudgetLruCache` (512 MiB
+per device-cap slot: 1 GiB here) with a pre-build `reserve()` so a long take
+evicts first (graph bytes ~0.09 MB/mel frame; the 6-min take is 6.1 GB).
+GpuMel constants were not touched: mel is ~6 ms/call, immaterial.
+
+| measure | baseline | candidate |
+|---|---|---|
+| encoder builds / calls (medium+long take) | 399-407 / 405-413 | 13 / 675 |
+| partial age p50, long / medium (ms) | 501 / 500 | 291 / 295 |
+| partial age p95, long / medium (ms) | 765 / 766 | 401 / 502 |
+| stop-to-final, long / medium (ms) | 670 / 728 | 380 / 478 |
+| engine wall per audio s | 0.462-0.469 | 0.431-0.436 |
+| batch fixtures (paired comparator, 6x6) | — | -0.14 % (CI -1.32..+0.40); short.wav -4.7 % (padding), medium +1.1 %, long 0.0 % |
+| 40 random 0.6-14 s clips (paired, 6x12) | 487 ms | 290 ms (paired median +7.2 %, CI +1.3..+36.8) |
+
+Medians of 3 alternating A/B runs per arm. Exact contract: 43 inputs
+(3 fixtures + 40 random-length clips) identical on q4 and bf16; stream
+finals and batch texts identical in every run; `stream_thresholds.json`
+checks pass for medium/long. Failures along the way: a two-tier count LRU
+(8 short buckets + device cap) and then a byte budget without the pre-build
+reserve both ran the iGPU out of memory (`device lost`) building the 6-min
+take's 6.1 GB graph next to resident entries; bucketing batch-sized inputs
+cost 3-5 % per warm pass (padding + mask ops), hence the 2048-frame limit.
+Verdict: **keep** (streaming win, batch neutral). Not measured: the Pixel.

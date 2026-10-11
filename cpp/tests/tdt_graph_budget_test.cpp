@@ -176,6 +176,28 @@ void test_logic_budget_lru_accounting() {
           "A7: fixed-shape steady state holds size+bytes constant");
 }
 
+// reserve(): room is made BEFORE a build, LRU first, pins respected, and the
+// budget is restored afterwards (the parakeet encoder's pre-build trim).
+void test_logic_reserve() {
+    std::printf("[A] reserve before build\n");
+    ByteBudgetLruCache<int, FakeEntry> cache(1000);
+    for (int i = 1; i <= 10; ++i) {
+        FakeLease leased(cache, i, 100, i);
+    }
+    check(cache.contains(1) && cache.contains(10) && !cache.contains(11),
+          "A8: contains() reports residency");
+    check(cache.reserve(250) == 3, "A8: reserve(250) evicts the 3 LRU entries");
+    check(!cache.contains(3) && cache.contains(4) && cache.bytes_in_use() == 700,
+          "A8: LRU-first eviction down to budget - incoming");
+    check(cache.byte_budget() == 1000, "A8: budget restored after reserve");
+    check(cache.reserve(100) == 0, "A8: reserve within room evicts nothing");
+    {
+        FakeLease pinned(cache, 4, 100, 4);
+        check(cache.reserve(5000) == 6 && cache.contains(4) && cache.size() == 1,
+              "A8: oversized reserve evicts every unpinned entry, keeps the pin");
+    }
+}
+
 void test_logic_pin_stability_and_oversize() {
     std::printf("[A] pin/lease stability + oversized entry\n");
     ByteBudgetLruCache<int, FakeEntry> cache(1000);
@@ -726,6 +748,7 @@ int main() {
     std::printf("tdt_graph_budget_test: start\n");
 
     test_logic_budget_lru_accounting();
+    test_logic_reserve();
     test_logic_pin_stability_and_oversize();
     test_logic_build_failure();
     test_env_budget_parsing();

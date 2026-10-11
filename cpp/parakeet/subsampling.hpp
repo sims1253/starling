@@ -15,6 +15,7 @@
 #pragma once
 
 #include "config.hpp"
+#include "length_masks.hpp"
 #include "runtime/graph_builder.hpp"
 #include "runtime/model_loader.hpp"
 
@@ -64,7 +65,8 @@ public:
                              int n_mels, int T,
                              GraphInputPool& pool,
                              int& out_Tp, int& out_valid,
-                             int in_valid_frames = -1) const;
+                             int in_valid_frames = -1,
+                             const LengthMasks* lm = nullptr) const;
 
 private:
     const ModelLoader& ml_;

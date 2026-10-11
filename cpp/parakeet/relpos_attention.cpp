@@ -34,7 +34,8 @@ ggml_tensor* RelPosAttention::build_graph(ggml_context* ctx, ggml_tensor* xt,
                                           int T, ggml_tensor* pe, int pos_len,
                                           int valid_len,
                                           GraphInputPool& pool,
-                                          ggml_tensor* ph_pre) const {
+                                          ggml_tensor* ph_pre,
+                                          const LengthMasks* lm) const {
     const int D  = d_model_;
     const int H  = n_heads_;
     const int dk = d_head_;
@@ -108,7 +109,9 @@ ggml_tensor* RelPosAttention::build_graph(ggml_context* ctx, ggml_tensor* xt,
     const bool mask_is_trivial = (valid_len >= T);
     if (use_flash) {
         ggml_tensor* mask_flash = ggml_scale(ctx, bd, scale);
-        if (!mask_is_trivial) {
+        if (lm) {
+            mask_flash = ggml_add(ctx, mask_flash, lm->key);
+        } else if (!mask_is_trivial) {
             float* mask_host = pool.alloc_f32((size_t)T * T);
             const float ninf = -INFINITY;
             for (int qi = 0; qi < T; ++qi)
@@ -127,8 +130,8 @@ ggml_tensor* RelPosAttention::build_graph(ggml_context* ctx, ggml_tensor* xt,
     } else {
         ggml_tensor* ac = ggml_mul_mat(ctx, kh, qu);
         ggml_tensor* scores = ggml_add(ctx, ac, bd);
-        ggml_tensor* mask = nullptr;
-        if (!mask_is_trivial) {
+        ggml_tensor* mask = lm ? lm->key : nullptr;
+        if (!lm && !mask_is_trivial) {
             float* mask_host = pool.alloc_f32((size_t)T * T);
             const float ninf = -INFINITY;
             for (int qi = 0; qi < T; ++qi)
@@ -150,7 +153,9 @@ ggml_tensor* RelPosAttention::build_graph(ggml_context* ctx, ggml_tensor* xt,
 
     // Zero the context for PADDED query rows (NeMo masks padded query rows fully
     // -> output reduces to linear_out.bias). Apply a query-row mask [1, T].
-    if (valid_len < T) {
+    if (lm) {
+        merged = ggml_mul(ctx, merged, lm->time);
+    } else if (valid_len < T) {
         float* qmask_host = pool.alloc_f32(T);
         for (int qi = 0; qi < T; ++qi)
             qmask_host[qi] = (qi < valid_len) ? 1.0f : 0.0f;

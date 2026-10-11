@@ -47,7 +47,8 @@ ggml_tensor* build_conv_module(ggml_context* ctx, const ModelLoader& ml,
                                const std::string& pre, ggml_tensor* c,
                                int D, int T, int K, int valid_len,
                                const std::string& conv_norm_type,
-                               GraphInputPool& pool) {
+                               GraphInputPool& pool,
+                               const LengthMasks* lm) {
     const float bn_eps = 1e-5f;
     const int pad = (K - 1) / 2;  // symmetric padding (offline model)
 
@@ -80,7 +81,9 @@ ggml_tensor* build_conv_module(ggml_context* ctx, const ModelLoader& ml,
     ggml_tensor* glu = ggml_mul(ctx, a, ggml_sigmoid(ctx, b));  // [d, T]
 
     // -- pad_mask: zero padded time positions before depthwise conv.
-    if (valid_len < T) {
+    if (lm) {
+        glu = ggml_mul(ctx, glu, lm->time);
+    } else if (valid_len < T) {
         float* md = pool.alloc_f32(T);
         for (int t = 0; t < T; ++t) md[t] = (t < valid_len) ? 1.0f : 0.0f;
         int64_t tm_ne[2] = {1, T};
@@ -339,7 +342,8 @@ ggml_tensor* ConformerLayer::build_graph(ggml_context* ctx, ggml_tensor* xt,
                                          int T, ggml_tensor* pe, int pos_len,
                                          int valid_len,
                                          GraphInputPool& pool,
-                                         ggml_tensor* ph) const {
+                                         ggml_tensor* ph,
+                                         const LengthMasks* lm) const {
     const int D = d_model_;
     const int K = conv_kernel_;
     const float ln_eps = 1e-5f;  // LayerNorm eps (NeMo nn.LayerNorm default)
@@ -384,13 +388,13 @@ ggml_tensor* ConformerLayer::build_graph(ggml_context* ctx, ggml_tensor* xt,
     // === Stage B: r = r + self_attn(norm_self_att(r)). ===
     ggml_tensor* attn_in = layer_norm(r, "norm_self_att");
     ggml_tensor* attn_out = attn_.build_graph(ctx, attn_in, T, pe, pos_len,
-                                              valid_len, pool, ph);  // [D, T]
+                                              valid_len, pool, ph, lm);  // [D, T]
     r = ggml_add(ctx, r, attn_out);
 
     // === Stage C: r = r + conv(norm_conv(r)). ===
     ggml_tensor* c = layer_norm(r, "norm_conv");  // [D, T]
     ggml_tensor* conv_out = build_conv_module(ctx, ml, pre, c, D, T, K,
-                                              valid_len, conv_norm_type_, pool);
+                                              valid_len, conv_norm_type_, pool, lm);
     r = ggml_add(ctx, r, conv_out);
 
     // === Stage D: r = r + 0.5 * FFN2(norm_ff2(r)); out = norm_out(r). ===
