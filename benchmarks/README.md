@@ -1,63 +1,31 @@
 # Benchmarks
 
-Install benchmark and corpus-generation dependencies before running these tools:
+Measurement and calibration tools for the native engine. They drive
+`libstarling_ggml` in-process (through [`tools/starling_ggml.py`](../tools/starling_ggml.py))
+or `starling-serve` over HTTP; none of them needs PyTorch to run a model.
 
 ```sh
-uv sync --locked --extra bench
-uv run --extra bench python benchmarks/bench_all.py --help
+uv sync --locked --group eval   # corpus export, FLEURS calibration clips, WER
 ```
 
-Use `--extra dev --extra bench` when running tests that also download corpora or
-score transcripts. The `dev` extra alone covers the CPU CI suite. Model execution
-still requires the [model files](../docs/models.md) and
-[Python setup](../docs/python-serving.md).
-`librosa` remains a runtime dependency for the golden-capture and GGUF-conversion scripts.
+Entry points:
 
-Maintained entry points:
+- [`experiments/`](experiments/README.md): sealed paired A/B experiments
+  against `starling-serve` (`run_experiment.py`), the serve contract smoke and
+  the streaming replay workloads. Stdlib only.
+- [`fast_engine/`](fast_engine/AUTORESEARCH.md): Vulkan fast-engine and phone
+  measurement. `wer_engines.py` scores engine variants of one library on a
+  corpus exported by `export_fleurs.py`; `wer.py` holds the shared
+  normalizer and WER/CER scorer; `score_phone_quant.py` scores phone
+  quantization runs.
+- `imatrix_collect.py`: collects a parakeet activation importance matrix for
+  `starling-quantize --imatrix` (fixtures, `--wavs` directories, or FLEURS
+  clips via `fleurs_util.py`; `fleurs_download.py` writes FLEURS clips to disk).
+- `s1/`: S1-mini quantization tools: `collect_imatrix.py` (decoder imatrix
+  over the text fixtures) and `quant_spans.py` (protected-span audit of a
+  quantized model against BF16, cases in `tests/fixtures/s1_quant_spans.json`).
 
-- `bench_all.py`: unified latency/RTFx regression grid and [benchmark table](../docs/benchmarks.md) source.
-- `bench_leaderboard.py`: real-corpus Open ASR Leaderboard WER/RTFx evaluation.
-- `sonar/run_sonar.py`: SONAR-OSS (`psdn-sonar`) evaluation of models x native
-  backends x GGUFs over SONAR's own datasets. Separate `uv` project (CPU torch,
-  no Starling deps); talks to `starling-serve` over HTTP. See
-  [sonar/README.md](sonar/README.md). This is the candidate replacement for
-  `bench_leaderboard.py`'s quality numbers.
-- `s1/bench_normalize.py`: s1-mini normalization suite: latency/throughput
-  per engine, byte-exact parity vs stock, curated quality cases, and the
-  16-cell control matrix (styling × structure × context). [Benchmark](../docs/benchmarks.md) `BENCH:S1`
-  table source.
-- `bench_ablate.py`: optimization-flag ablation harness.
-- `wer.py` / `wer_leaderboard.py`: fixture drift gate and real-corpus scoring.
-- `run_leaderboard_all.sh`: orchestrates the maintained per-model leaderboard runs.
-
-The remaining `bench_*.py` files are exploratory model/kernel microbenchmarks.
-They are useful for reproducing individual optimization investigations, but are
-not release gates and may require model-specific environments or hardware.
-
-External installs are configurable: set `ASR_BENCH_ROOT` for CrispASR and
-`STARLING_FIXTURES_DIR` when fixtures live outside this checkout. All GPU-timed
-maintained entry points must hold `starling.parakeet.gpu_lock.with_gpu_lock`.
-
-For a backend without NVIDIA discovery, give the runner and every nested lock
-consumer the same stable physical device key:
-
-```bash
-uv run starling-gpu-run --session native-bench --uuid vulkan:device-serial -- python bench.py
-```
-
-Inside `bench.py`, pass the same key to the lock adapter:
-
-```python
-from starling.parakeet.gpu_lock import with_gpu_lock
-
-with with_gpu_lock(session="native-bench", model="parakeet", uuid="vulkan:device-serial"):
-    # Run inference on the device identified by this key.
-    ...
-```
-
-The key identifies the physical device for locking; it does not select a GPU.
-Replace the example key with a stable identity shared by all callers of that
-device. If the benchmark selects another device, use its key instead. An
-omitted key still requires NVIDIA discovery, even under an explicit-key runner.
-The lock requires POSIX flock; on Windows, serialize GPU work externally and
-set `STARLING_GPU_LOCK_DISABLE=1`.
+Model files are described in [docs/models.md](../docs/models.md). The former
+Python/CUDA benchmark suite (`bench_all.py`, the leaderboard and quantization
+WER drivers, SONAR, contention and speculative pilots) was removed; it is at
+tag `python-research-final`.

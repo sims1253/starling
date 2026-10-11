@@ -41,7 +41,9 @@ from convert_qwen3_gguf import (  # noqa: E402
     positional_embedding,
     tokenizer,
 )
-from make_qwen3_golden import MAX_CACHE_LEN  # noqa: E402  # one shared KV-cache policy with the golden captures
+# The KV-cache policy the frozen qwen3 golden captures used (make_qwen3_golden.py
+# at tag python-research-final).
+MAX_CACHE_LEN = 4096
 
 REVISION = "7f1569a48a89f3e3f4dc3a5c9d28bddd903bc76c"
 DEFAULT_SNAPSHOT = (

@@ -1,7 +1,7 @@
 // stream_session.cpp — streaming dictation session implementation.
 //
-// Faithful C++ port of src/starling/server.py (StreamSession) and
-// src/starling/stream_chunk.py (ChunkStreamer + stitch_words).
+// Faithful C++ port of python-research-final:src/starling/server.py (StreamSession) and
+// python-research-final:src/starling/stream_chunk.py (ChunkStreamer + stitch_words).
 
 #include "stream_session.hpp"
 #include "audio.hpp"
@@ -1070,7 +1070,7 @@ AppendOutcome StreamSession::append_wav(const std::string& bytes) {
         invalidate_tail_result();  // an invalidated take never reuses (S11)
         return AppendOutcome::MalformedWav;
     }
-    // No C++ resampler exists (the Python server resamples via scipy): a
+    // No C++ resampler exists: a
     // non-16 kHz WAV must be rejected loudly, not dropped silently — the
     // client hears nothing back otherwise and blames the model (issue #145).
     if (sr != kSampleRate) {

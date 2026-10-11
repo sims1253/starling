@@ -3,7 +3,7 @@
 
 Every engine variant is a (name, env) pair loaded from the same
 libstarling_ggml, e.g. the ggml reference and the fast engine with and
-without packed-f16 GEMMs. Reports corpus WER (benchmarks/wer.py
+without packed-f16 GEMMs. Reports corpus WER (benchmarks/fast_engine/wer.py
 normalization), total transcription time, and how many transcripts differ
 from the first variant.
 
@@ -25,7 +25,7 @@ import wave
 
 import numpy as np
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from wer import normalize  # noqa: E402
 
 KINDS = {"parakeet": 1, "moss": 2}

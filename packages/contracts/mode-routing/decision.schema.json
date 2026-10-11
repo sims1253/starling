@@ -19,7 +19,7 @@
     "audio or authorize additional context/providers; the ASR route and",
     "consent freeze at activation (see context-snapshot.schema.json and the",
     "runtime protocol's mode.routeFrozen, which precedes any audio leaving",
-    "the runtime). tests/test_mode_routing.py asserts structurally that no",
+    "the runtime). python-research-final:tests/test_mode_routing.py asserts structurally that no",
     "field name in this schema can carry such a change and that",
     "additionalProperties is false everywhere, so the vocabulary of this",
     "record is exactly the whitelisted set below.",
@@ -39,7 +39,7 @@
     "Keyword subset: only keywords the repo's minischema.py fallback",
     "understands are used, so jsonschema and minischema agree. The exact",
     "2-element span shape is enforced by the executable oracle",
-    "tests/mode_routing.py (minischema cannot express maxItems)."
+    "python-research-final:tests/mode_routing.py (minischema cannot express maxItems)."
   ],
   "type": "object",
   "additionalProperties": false,

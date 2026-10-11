@@ -1,5 +1,5 @@
 //! The five state machines as data (port of the I0 oracle's `MACHINES`,
-//! `tests/runtime_protocol.py`) — E17 design note §2 frozen by increment I0.
+//! `python-research-final:tests/runtime_protocol.py`) — E17 design note §2 frozen by increment I0.
 //!
 //! Command spec keys (oracle semantics, kept verbatim):
 //! - `from` — states the command is legal in (`Any` = the oracle's `"*"`);

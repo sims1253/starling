@@ -1,6 +1,6 @@
 //! The deterministic processing step (#294): spoken punctuation and
 //! layout commands plus mode snippets, applied before any model step at
-//! zero model cost. The port of `tests/spoken_commands.py`; the command
+//! zero model cost. The port of `python-research-final:tests/spoken_commands.py`; the command
 //! vocabulary is the contract file
 //! `packages/contracts/mode-routing/spoken-commands.json`, compiled in so
 //! both implementations read one table.

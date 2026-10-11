@@ -1,18 +1,23 @@
 # Mode routing, staging and processing contract
 
-Schemas are the structural half; the executable oracles in `tests/` are the
-semantic half. Both the Python tests and the Rust ports read the fixtures in
-this directory in place.
+Schemas are the structural half; the reference implementations are the
+semantic half. The Rust crate `starling-processing`
+(`apps/desktop-gpui/crates/processing`) and the Kotlin ports in the Android
+app (`apps/mobile/app/src/main/java/dev/starling/mobile/processing/`) read the
+fixtures in this directory in place. The original Python oracles
+(`tests/mode_routing.py`, `tests/staging.py`, `tests/spoken_commands.py`,
+`tests/spoken_instructions.py`) are at tag `python-research-final`; schema
+`description`s that cite them refer to that tag.
 
-| File | Role | Oracle |
+| File | Role | Implemented in (Rust under `apps/desktop-gpui/crates/`; Kotlin under `processing/`) |
 |---|---|---|
-| `mode.schema.json`, `profiles.schema.json` | One typed mode entry; a profiles document (default + scoped rules). | `tests/mode_routing.py` (`resolve`, `validate_config`, `validate_processing`) |
-| `decision.schema.json` | One routing decision per take. | `decision_from_resolve` |
-| `context-snapshot.schema.json` | The frozen activation-time context. | `selection_decision`, `snapshot_expired` |
-| `draft.schema.json` | A staged take: typed regions over one text, immutable raw attempts, proposals pinned to a revision, deliveries. | `tests/staging.py` |
-| `provider.schema.json` | What a processing provider can do and where text goes. | `validate_provider`, `processing_route` |
-| `transform-request.schema.json`, `transform-result.schema.json` | One model step and its answer. | `check_request`, `check_result` |
-| `spoken-instruction.schema.json` | One trailing spoken-instruction record per finalized take: the delimiter/payload split with code-point spans. | `tests/spoken_instructions.py` (`split`, `record`) |
+| `mode.schema.json`, `profiles.schema.json` | One typed mode entry; a profiles document (default + scoped rules). | `processing/src/routing.rs` (`resolve`, `validate_config`), `processing/src/contract.rs` (`validate_processing`); `ModeRouting.kt` |
+| `decision.schema.json` | One routing decision per take. | `processing/src/routing.rs`; `ModeRouting.kt` |
+| `context-snapshot.schema.json` | The frozen activation-time context. | `runtime/src/machine/context.rs` |
+| `draft.schema.json` | A staged take: typed regions over one text, immutable raw attempts, proposals pinned to a revision, deliveries. | `processing/src/staging.rs`; `StagedDraft.kt` |
+| `provider.schema.json` | What a processing provider can do and where text goes. | `processing/src/contract.rs` (`validate_provider`, `processing_route`) |
+| `transform-request.schema.json`, `transform-result.schema.json` | One model step and its answer. | `processing/src/contract.rs` |
+| `spoken-instruction.schema.json` | One trailing spoken-instruction record per finalized take: the delimiter/payload split with code-point spans. | `processing/src/instructions.rs`; `SpokenInstructions.kt` |
 
 Fixtures: `fixtures/staging.json` (the #293 scenarios: revised partials,
 typing during a partial replacement, stale proposal, concurrent retry, delete
@@ -22,8 +27,8 @@ during processing, crash/reconnect, duplicate final delivery, and more),
 the routing fixtures. The spoken-command and spoken-instruction tables
 (`spoken-commands.json`, `spoken-instructions.json`) and their fixture
 corpora (`fixtures/spoken-commands.json`, `fixtures/spoken-instructions.json`)
-are contract data both the Python oracles and the Rust ports
-(`transforms.rs`, `instructions.rs`) read in place.
+are contract data the Rust ports (`transforms.rs`, `instructions.rs`) and
+the Kotlin ports (`SpokenCommands.kt`, `SpokenInstructions.kt`) read in place.
 
 Rules the processing side adds (#292 working rules):
 
@@ -38,5 +43,5 @@ Rules the processing side adds (#292 working rules):
   reaches a remote provider.
 - Offsets are Unicode code points.
 
-Run: `uv run --extra dev python -m pytest tests/test_mode_routing.py tests/test_staging.py -q`
-and `cargo test -p starling-processing` in `apps/desktop-gpui`.
+Run: `cargo test -p starling-processing` in `apps/desktop-gpui` and
+`./gradlew :app:testDebugUnitTest` in `apps/mobile` (the `*Conformance*` tests).

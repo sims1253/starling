@@ -51,8 +51,7 @@ response from being inserted into a field that has changed.
 - Android Studio Ladybug or newer, or JDK 17 with the Android SDK.
 - Android SDK platform 35 and build-tools 36.0.0 installed.
 - A running Starling native server (`starling-serve`). Native serving is the
-  supported portable path and requires a 16 kHz WAV. The Python/CUDA server is
-  retained for compatibility but is deprecated for new app deployments.
+  supported portable path and requires a 16 kHz WAV.
 - A device or emulator with a microphone. Android 8.0 / API 26 is the minimum.
 
 No Python or GPU runtime is bundled. An optional **on-device engine**
@@ -204,7 +203,8 @@ copied transcript is marked sensitive.
 The keyboard's mode chip (or a long-press on Record) picks the mode for the
 next takes. The modes are an ordinary profiles document
 (`app/src/main/assets/modes/android-profiles.json`), held to the shared
-contract in `packages/contracts/mode-routing/` by `tests/test_staging.py`:
+contract in `packages/contracts/mode-routing/` by the Rust `staging_conformance`
+suite (`apps/desktop-gpui/crates/processing/tests/`):
 
 - **Direct** (default): the flow above — live text in the field, the
   verbatim final committed on Stop.

@@ -95,7 +95,7 @@ your own starling-serve or OpenAI-compatible endpoint: endpoint and model
 fields plus Test connection, with the health-probe connection indicator.
 Without a staged engine, the built-in mode reports "no bundled engine" and
 this is the way to transcribe. Start the native server from a checkout with
-built binaries (the Python serving path is deprecated):
+built binaries:
 
 ```bash
 build-cpu/starling-serve --model ark \

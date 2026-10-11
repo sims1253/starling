@@ -36,12 +36,11 @@ import json
 import os
 import subprocess
 import sys
-import time
 import wave
 
 import numpy as np
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from wer import normalize  # noqa: E402
 
 CACHE_DIR = os.path.join(os.path.dirname(__file__), ".layout_eval_cache")
@@ -203,7 +202,7 @@ def main() -> int:
 
     eval_gguf = os.path.join(a.work, f"{a.name}-{eval_tag}-eval.gguf")
     if not os.path.exists(eval_gguf):
-        print(f"[layout-eval] building eval GGUF ...", flush=True)
+        print("[layout-eval] building eval GGUF ...", flush=True)
         r = subprocess.run([a.tool, "eval", "--pack", pack, "--gguf-in", a.gguf_ref,
                             "--gguf-out", eval_gguf], capture_output=True, text=True)
         if r.returncode != 0:

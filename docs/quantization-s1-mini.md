@@ -36,7 +36,7 @@ The same BF16 and Q4 GGUFs were then loaded in separate native
 `e9d65265def7129b0505cea08a1b7749d17e7b1e79645bf880ae84c289bbb224`
 from commit `2a3bda4`. Both arms forced the GGML CPU engine with six threads,
 used the same eight held-out cases through `/normalize`, and repeated each
-case three times. The [phone comparison](evidence/pixel-s1-2026-09-28/README.md)
+case three times. The [phone comparison](https://github.com/sims1253/starling/blob/python-research-final/docs/evidence/pixel-s1-2026-09-28/README.md)
 rechecked every protected span against the fixture definitions.
 
 | Phone result after server warmup | BF16 | Q4_K/Q6_K |
@@ -63,7 +63,7 @@ internal “model loaded” timer (1.7 seconds BF16, 1.3 seconds Q4) ends before
 warmup and Q4 weight repacking, so it is not an end-to-end ready-to-serve
 load-cost comparison. The first pilot did not measure ASR+S1 co-residency.
 
-A later [controlled CPU ABBA pilot](evidence/pixel-s1-2026-09-28/controlled/README.md)
+A later [controlled CPU ABBA pilot](https://github.com/sims1253/starling/blob/python-research-final/docs/evidence/pixel-s1-2026-09-28/controlled/README.md)
 used fresh BF16–Q4–Q4–BF16 processes with the phone unplugged, screen off,
 and thermal status 0. The four launch-to-ready times were 52.7, 17.8, 20.3,
 and 60.4 seconds; each block sent all eight cases once after server warmup.

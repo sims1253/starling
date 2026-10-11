@@ -1,75 +1,65 @@
 [project]
-name = "starling"
-version = "0.1.0"
-description = "Deprecated Python/CUDA research backend. Hand-tuned Triton megakernels for fast on-device ASR (granite-speech-4.1-2b + parakeet-tdt/unified + moss + qwen3 + ark + voxtral) on modern NVIDIA GPUs"
-requires-python = ">=3.10,<3.13"
+name = "starling-tools"
+version = "0.0.0"
+description = "Python tooling around Starling's native engine: GGUF converters, golden capture, parity and server tests, benchmark scripts"
+requires-python = ">=3.10,<3.14"
 dependencies = [
-    "torch>=2.11",
-    "torchaudio>=2.11",
-    # Triton wheels are Linux-only; other platforms use CUDA C++ or torch.
-    "triton>=3.6 ; sys_platform == 'linux'",
-    "transformers>=5.14.1",
-    "accelerate",
     "numpy",
-    "scipy",
     "soundfile",
-    "librosa",
-    "einops",
-    "einx",
-    "torchcodec>=0.14.0",
-    "huggingface-hub>=1.0.0",
-    "sentencepiece>=0.2.0",
-    "mistral-common>=1.11.7",
+    "gguf",
 ]
 
-[project.optional-dependencies]
-server = ["fastapi", "uvicorn", "websockets"]
+[dependency-groups]
+# GGUF converters (scripts/convert_*.py) and golden capture (scripts/goldens/).
+convert = [
+    "torch>=2.11",
+    "transformers>=5.14.1",
+    "accelerate",
+    "safetensors",
+    "sentencepiece>=0.2.0",
+    "librosa",
+    "huggingface-hub>=1.0.0",
+    # Voxtral's processor tokenizes through mistral-common (tekken.json).
+    "mistral-common>=1.11.7",
+]
+# Corpus export and calibration (benchmarks/fast_engine/export_fleurs.py,
+# benchmarks/fleurs_*.py, benchmarks/imatrix_collect.py).
+eval = [
+    "torch>=2.11",
+    "torchaudio>=2.11",
+    "torchcodec>=0.14.0",
+    "datasets>=5.0.0",
+    "pyarrow",
+    "fsspec",
+    "jiwer",
+]
+# `uv run pytest tests`: everything that needs a model or a native build skips.
 dev = [
     "pytest",
     "requests",
-    "httpx",
-    "starling[server]",
-    # CPU quantization-driver tests import the WER scorer.
+    "websockets",
     "jiwer",
 ]
-bench = [
-    "datasets>=5.0.0",
-    "jiwer",
-    "kaldialign>=0.12.0",
-    "matplotlib",
-    "tabulate",
-    "whisper-normalizer>=0.1.12",
-]
 
-[project.scripts]
-starling-python-serve = "starling.server:run"
-starling-gpu-run = "starling.gpu.run:main"
-
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
-
-[tool.hatch.build.targets.wheel]
-packages = ["src/starling"]
-
-# Copy installs also work on filesystems with unreliable reflink support.
 [tool.uv]
+# Not a package: a dependency set for the scripts and tests in this repo.
+package = false
+# Copy installs also work on filesystems with unreliable reflink support.
 link-mode = "copy"
 
-# Use the CUDA 13.0 builds used for the benchmarks. Only torch and torchaudio
-# resolve from this index; other packages use PyPI.
+# CPU torch builds: the tooling never needs CUDA.
 [[tool.uv.index]]
-name = "pytorch-cu130"
-url = "https://download.pytorch.org/whl/cu130"
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
 explicit = true
 
 [tool.uv.sources]
-torch = { index = "pytorch-cu130" }
-torchaudio = { index = "pytorch-cu130" }
+torch = { index = "pytorch-cpu" }
+torchaudio = { index = "pytorch-cpu" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src"]
+pythonpath = ["."]
 
 [tool.ruff]
 line-length = 100
@@ -81,9 +71,6 @@ select = ["E", "F"]
 ignore = ["E501"]
 
 [tool.ruff.lint.per-file-ignores]
-# Package exports are intentional; retain bug checks in vendored code.
-"__init__.py" = ["F401"]
-"src/starling/moss/vendor/**" = ["E"]
-# Probes and benchmarks use compact statements and deferred imports.
+# Scripts and benchmarks use compact statements and deferred imports.
 "scripts/**" = ["E701", "E702", "E402", "E401"]
 "benchmarks/**" = ["E701", "E702", "E402", "E731", "E741"]

@@ -77,7 +77,7 @@ def check_compatibility(spec: dict, baseline: dict, candidate: dict) -> None:
         pb["metric_identity"] == pc["metric_identity"],
         "metric identities differ "
         f"({pb['metric_identity']!r} vs {pc['metric_identity']!r}): incompatible metric "
-        "definitions (e.g. SONAR WER vs quantization-driver WER) are never compared",
+        "definitions (e.g. WER from two different scorers) are never compared",
     )
     _require(
         pb["normalizer"] == pc["normalizer"],

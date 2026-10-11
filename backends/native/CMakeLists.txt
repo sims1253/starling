@@ -1,6 +1,6 @@
 # Starling's native engine, serving API, and quantizer.
 # CPU builds need no Python runtime or accelerator SDK. The optional shared
-# library also supports existing Python ctypes consumers in src/starling/_ggml.
+# library also supports the Python ctypes binding in tools/starling_ggml.py.
 #
 # Build from the repository root:
 #   cmake -B build -DSTARLING_SERVE=ON -DSTARLING_QUANTIZE=ON
@@ -221,33 +221,7 @@ if(STARLING_GGML_TESTS)
   endforeach()
 endif()
 
-# Explicit, research-only #313 pilot. Keep it out of normal builds and out of
-# the shipped library: this tests whether an already available Parakeet text
-# can draft for the native MOSS verifier before any product integration.
-if(STARLING_GGML_TESTS)
-  add_executable(moss-preview-copy-test EXCLUDE_FROM_ALL
-    ${STARLING_REPO_ROOT}/benchmarks/speculative/moss_preview_copy_test.cpp)
-  target_include_directories(moss-preview-copy-test PRIVATE
-    ${STARLING_REPO_ROOT}/benchmarks/speculative)
-  set_target_properties(moss-preview-copy-test PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
-
-  add_executable(moss-preview-copy-pilot EXCLUDE_FROM_ALL
-    ${STARLING_REPO_ROOT}/benchmarks/speculative/moss_preview_copy_pilot.cpp
-    ${STARLING_REPO_ROOT}/cpp/serve/audio.cpp
-    $<TARGET_OBJECTS:starling_ggml_core>)
-  target_include_directories(moss-preview-copy-pilot PRIVATE
-    ${STARLING_REPO_ROOT}/benchmarks/speculative
-    ${STARLING_REPO_ROOT}/cpp
-    ${STARLING_REPO_ROOT}/cpp/include
-    ${STARLING_REPO_ROOT}/third_party
-    ${STARLING_REPO_ROOT}/third_party/ggml/include)
-  target_link_libraries(moss-preview-copy-pilot PRIVATE ggml)
-  set_target_properties(moss-preview-copy-pilot PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
-endif()
-
-# Output the .so next to the build dir root so _native.py's default search path
+# Output the .so next to the build dir root so tools/starling_ggml.py's default search path
 # (build/libstarling_ggml.so) finds it without env-var help during development.
 set_target_properties(starling_ggml PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
@@ -318,8 +292,8 @@ endif()
 # starling-serve: the native HTTP/WebSocket serving binary.
 #
 # A self-contained executable that wraps libstarling_ggml behind the same
-# HTTP/WS endpoint surface as the Python `starling.server` (client-visible
-# differences are documented in docs/native-serving.md):
+# HTTP/WS endpoint surface the removed Python `starling.server` defined
+# (client-visible differences are documented in docs/native-serving.md):
 #
 #   spawn("starling-serve", ["--model", slug, "--gguf", path, "--port", "8181"])
 #

@@ -12,9 +12,8 @@ read or executed on that tree, not assumed.
 
 | Surface | Manifest(s) | Lockfile / pin | State (audited 2026-09-20) | Drift gate |
 | --- | --- | --- | --- | --- |
-| Python research backend (deprecated) | `pyproject.toml` | `uv.lock` (149 packages) | In sync; `uv lock --check --offline` exits 0. Ranges intentionally floating (research only, off the production path) | `uv lock --check` in `apps.yml` `api-contracts` |
+| Python tooling (`starling-tools`, not a package) | `pyproject.toml` (base deps + `convert` / `eval` / `dev` groups, CPU torch index) | `uv.lock` (113 packages) | In sync; `uv lock --check` exits 0. Ranges floating (tooling only, off the production path) | `uv lock --check` in `apps.yml` `api-contracts`; `uv run --locked pytest` in `test.yml` `python-tests` |
 | Quant catalog | `quants/pyproject.toml` | `quants/uv.lock` | Stdlib only; `uv lock --check --offline --project quants` exits 0 | existing `uv run --project quants --locked` in `apps.yml` |
-| SONAR harness | `benchmarks/sonar/pyproject.toml` | `benchmarks/sonar/uv.lock` | `psdn-sonar[ml]==0.1.2` exact with in-file rationale; `uv lock --check --offline --project benchmarks/sonar` exits 0 | existing `uv sync --locked --project benchmarks/sonar` in `test.yml` |
 | Native build | root `CMakeLists.txt`, `backends/native`, `cpp/`, `apps/mobile/src/main/cpp` | none needed | No `FetchContent` / `ExternalProject` / `file(DOWNLOAD)` in any Starling-owned CMake file; configure-time downloads do not exist | builds compile only from the submodule and vendored files below |
 | ggml engine | `.gitmodules` | submodule commit `e91ded11` (tag `v0.23.0`) + `third_party/ggml-patches` | Pinned by commit; patches applied by `scripts/apply_ggml_patches.sh` | checkout with `submodules: recursive`; patch script fails on mismatch |
 | `third_party/dr_wav.h` | vendored single file | version stamp in header | `dr_wav - v0.14.6`, public domain / MIT-0 | full-file diff review on update |
@@ -33,10 +32,10 @@ Notes verified during the audit:
 
 A PR changes dependencies if it touches any of:
 
-1. A manifest: `pyproject.toml` (root, `quants/`, `benchmarks/sonar/`),
+1. A manifest: `pyproject.toml` (root, `quants/`),
    `apps/mobile/**/build.gradle.kts`, `apps/ios/Package.swift`, or — when the
    GPUI port lands — `Cargo.toml`.
-2. A lockfile: `uv.lock` (any of the three), `Cargo.lock`.
+2. A lockfile: `uv.lock` (either of the two), `Cargo.lock`.
 3. The `third_party/ggml` submodule pointer or `third_party/ggml-patches/**`.
 4. A vendored header in `third_party/` (`dr_wav.h`, `httplib.h`).
 5. Any GitHub Actions `uses:` pin, or any CI step that installs tools at run
@@ -74,11 +73,10 @@ Run from the repository root; commit the lockfile together with the manifest
 change:
 
 ```bash
-# uv — three independent projects
-uv lock                            # root research backend
+# uv — two independent projects
+uv lock                            # root starling-tools dependency set
 uv lock --project quants
-uv lock --project benchmarks/sonar
-uv lock --check                    # and the --project variants must pass
+uv lock --check                    # and the --project variant must pass
 
 # Vendored headers: replace the file from the upstream release, keep the
 # version stamp / CPPHTTPLIB_VERSION macro accurate, review the full diff.
@@ -92,9 +90,8 @@ uv lock --check                    # and the --project variants must pass
 
 | Gate | Where | Notes |
 | --- | --- | --- |
-| Root uv drift | `apps.yml` `api-contracts` | `uv lock --check` after `setup-uv`; previously only covered by the workflow_dispatch-only `test.yml` `cpu-tests` job |
+| Root uv drift | `apps.yml` `api-contracts` | `uv lock --check` after `setup-uv`; `test.yml` `python-tests` also runs `uv run --locked` |
 | quants lock | `apps.yml` `api-contracts` | pre-existing `uv run --project quants --locked` |
-| sonar lock | `test.yml` `sonar-tests` | pre-existing `uv sync --locked --project benchmarks/sonar` |
 | Actions pins | Dependabot | weekly, `github-actions` ecosystem, all workflows |
 | Gradle bumps | Dependabot | weekly, `/apps/mobile` |
 | Rust desktop (gpui) | `desktop-gpui-rust.yml` | cargo test on ubuntu, windows host check, packaged macOS DMG + Windows zip builds |
@@ -107,7 +104,7 @@ added here in the same PR that introduces them.
 | Exception | Rationale | Removal condition |
 | --- | --- | --- |
 | `pullfrog/pullfrog@v0` moving tag (`pullfrog.yml`) | Vendor documents that a SHA pin *without* an updater freezes the action's `post:` cleanup step and later breaks every run; the tag is vendor-supported and the action runs with `id-token: write` | When pullfrog ships a pinned-SHA-plus-updater combination that its docs endorse |
-| Floating `>=` ranges in the root `pyproject.toml` | Deprecated research backend, kept independent of the production native path; `uv.lock` still pins exact versions for any given checkout | When the research backend is retired or frozen |
+| Floating `>=` ranges in the root `pyproject.toml` | Tooling only (converters, golden capture, tests), independent of the production native path; `uv.lock` still pins exact versions for any given checkout | When a tool needs a reproducible pin beyond the lock |
 | CI-resolved tools (`brew install xcodegen`, `uv --with openapi-spec-validator`) | Test-only tooling; failures surface immediately in the same job | Follow-up: pin versions once a lockfile-equivalent mechanism exists (see gaps) |
 
 ## socket-security triage

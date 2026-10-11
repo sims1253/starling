@@ -11,7 +11,7 @@
     "punctuation the recognizer already put there); line_break and",
     "paragraph insert a newline / blank line and drop the spaces around it;",
     "bullet starts a '- ' list item on its own line.",
-    "Semantics: tests/spoken_commands.py; fixtures/spoken-commands.json."
+    "Semantics: python-research-final:tests/spoken_commands.py; fixtures/spoken-commands.json."
   ],
   "schema_version": 1,
   "languages": {

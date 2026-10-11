@@ -679,7 +679,8 @@ std::optional<std::vector<int32_t>> tdt_greedy_multistep(
     const int token_count = joint.vocab_size() + 1;
 
     // ---- 1. Step 0 EAGER (init path: zero cache, NO freeze). Mirrors Starling's
-    // decode_mega.py _step0_eager: feed embedding(blank) (== the zero SOS vector,
+    // python-research-final:src/starling/parakeet/decode_mega.py _step0_eager: feed
+    // embedding(blank) (== the zero SOS vector,
     // since the embedding has padding_idx=blank), run the LSTM, and COMMIT the
     // output state UNCONDITIONALLY -- even when step 0 emits a blank. This keeps
     // h/c aligned with the "LSTM ran on the most recent step" invariant the

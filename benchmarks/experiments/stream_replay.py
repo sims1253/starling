@@ -40,7 +40,7 @@ workload manifest.
         --thresholds benchmarks/experiments/stream_thresholds.json \\
         --baseline runs/baseline.json --candidate runs/candidate.json
 
-Needs the ``websockets`` package (``uv sync --extra server``); everything else
+Needs the ``websockets`` package (in the root ``dev`` group: ``uv sync``); everything else
 is stdlib.
 """
 

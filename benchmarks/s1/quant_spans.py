@@ -17,7 +17,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CASES = ROOT / "tests/fixtures/s1_quant_spans.json"
-sys.path.insert(0, str(ROOT / "src"))
+sys.path.insert(0, str(ROOT / "tools"))
 
 
 def sha256_file(path: Path) -> str:
@@ -57,7 +57,7 @@ def audit_output(case: dict, output: str) -> dict[str, bool]:
 
 def verified_library_path(requested: Path) -> Path:
     """Resolve the library selected by ctypes and require the requested file."""
-    from starling._ggml import _native
+    import starling_ggml as _native
 
     loaded = _native._load_lib()
     name = getattr(loaded, "_name", None)
@@ -68,8 +68,7 @@ def verified_library_path(requested: Path) -> Path:
 
 
 def run(model: Path, source: Path, cases_path: Path, device: str, library: Path) -> dict:
-    from starling._ggml import GgmlModel, S1
-    from starling._ggml._native import backend_name
+    from starling_ggml import S1, GgmlModel, backend_name
 
     cases = json.loads(cases_path.read_text())
     check_cases(cases)

@@ -23,7 +23,7 @@ back-to-back. Protocol (issue #168):
 - The workload manifest is verified against the spec pin BEFORE anything
   runs — a changed corpus is a refusal, never a silent baseline shift.
 
-GPU serialization follows the SONAR harness contract: arms never run
+GPU serialization: arms never run
 concurrently (the runner is strictly sequential), all STARLING_* GPU lock
 environment variables are passed through to the server processes so an
 externally held lock is honored, and concurrent experiment processes on one
@@ -112,13 +112,11 @@ def _hardware_identity() -> dict:
 def _experiment_lock():
     """Serialize concurrent experiment processes on one machine.
 
-    The SONAR harness serializes GPU work through starling.gpu.session; this
-    runner must stay importable without the repository project (stdlib-only
-    contract), so it takes its own advisory flock while a server process is
-    live: two `run`/`demo` commands on one host take turns instead of
-    contaminating each other's timings or exhausting GPU memory.
-    STARLING_GPU_LOCK_DISABLE=1 opts out, matching the SONAR harness
-    convention.
+    This runner must stay importable without the repository project
+    (stdlib-only contract), so it takes its own advisory flock while a server
+    process is live: two `run`/`demo` commands on one host take turns instead
+    of contaminating each other's timings or exhausting GPU memory.
+    STARLING_GPU_LOCK_DISABLE=1 opts out.
     """
     if os.environ.get("STARLING_GPU_LOCK_DISABLE") == "1":
         yield
@@ -161,7 +159,7 @@ def collect_provenance(spec: dict, arm: dict, repo_root: Path, manifest: dict) -
         "build_flags": arm.get("build_flags", UNAVAILABLE),
         "runtime": _hardware_identity(),
         "optimization_env": {k: v for k, v in arm.get("env", {}).items()},
-        "commands": [f"run_experiment.py run --spec <sealed spec> (arm recorded)"],
+        "commands": ["run_experiment.py run --spec <sealed spec> (arm recorded)"],
         "warmup_policy": (
             f"1 cold sample + {spec['protocol']['warmup_requests']} untimed warmup "
             f"request(s) before {spec['protocol']['requests_per_repeat']} timed samples "

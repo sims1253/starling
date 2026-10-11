@@ -11,7 +11,7 @@
 //! other way around.
 //!
 //! The frozen I0 contract lives in `packages/contracts/runtime-protocol/`
-//! (schemas + fixtures); the executable oracle (`tests/runtime_protocol.py`)
+//! (schemas + fixtures); the executable oracle (`python-research-final:tests/runtime_protocol.py`)
 //! is ported here as [`protocol::tables`] (the transition tables as data)
 //! + [`protocol::replay`] (trace replay). The conformance suite in
 //! `tests/conformance.rs` replays every fixture through this port; the

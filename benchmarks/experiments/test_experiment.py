@@ -8,9 +8,7 @@ double (the real-binary reproduction is the documented demo command).
 from __future__ import annotations
 
 import json
-import os
 import random
-import subprocess
 import sys
 import tempfile
 import unittest

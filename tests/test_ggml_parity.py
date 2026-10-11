@@ -28,6 +28,15 @@ Skipping rules (CI compatibility):
 * A present asset whose sha256 does not match the manifest pin FAILS outright
   (never silently measure — or regenerate — the reference).
 
+Goldens live in the private HF dataset ``scholzmx/starling-goldens`` (a
+mirror of ``golden/``)::
+
+    hf download scholzmx/starling-goldens --repo-type dataset --local-dir golden
+
+Engines run in-process through the ctypes binding ``tools/starling_ggml.py``;
+model paths come from each target's manifest ``gguf`` block (env override,
+else the repo-relative default).
+
 Run with:  uv run pytest tests/test_ggml_parity.py -q
 """
 
@@ -46,11 +55,11 @@ import pytest
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT / "tests"))
 sys.path.insert(0, str(_REPO_ROOT / "tests" / "fixtures"))
-sys.path.insert(0, str(_REPO_ROOT / "src"))
-sys.path.insert(0, str(_REPO_ROOT / "benchmarks"))
+sys.path.insert(0, str(_REPO_ROOT / "tools"))
 
 import make_fixtures as mkfx  # noqa: E402  (tests/fixtures added to sys.path above)
 import parity_contract as pc  # noqa: E402  (the executable contract)
+import starling_ggml  # noqa: E402  (tools/ added to sys.path above)
 
 pc.mark_parity_module_loaded()
 
@@ -65,8 +74,6 @@ T_QWEN_DECODE = "qwen_decode.shared_fixture"
 T_QWEN_TOKENS = "qwen_decode.shared_fixture.token_stream"
 T_PARAKEET_TEXT = "parakeet.intree.text"
 T_PARAKEET_IDS = "parakeet.intree.ids"
-T_MOSS_CRISPASR = "moss.crispasr.external"
-T_PARAKEET_EXTERNAL = "parakeet.external"
 T_MOSS_KSTEP = "moss.intree.kstep_regression"
 T_ARK_TEXT = "ark.intree.text"
 T_GRANITE_TEXT = "granite.intree.text"
@@ -99,180 +106,41 @@ def _manifest_gate(target_id: str) -> None:
                     f"({', '.join(probe.missing)})")
 
 
-def _ggml_available() -> bool:
-    """True iff the parakeet-server binary + model exist (so the test can run)."""
+def _model_path(target_id: str) -> Path:
+    """The target's GGUF: its manifest env override, else the repo default."""
+    gguf = _manifest_target(target_id).get("gguf") or {}
+    raw = os.environ.get(gguf.get("env", ""), "")
+    return Path(raw).expanduser() if raw else _REPO_ROOT / gguf["default_path"]
+
+
+def _engine_available(target_id: str) -> bool:
     try:
-        from engines import GgmlParakeet
-    except Exception:
-        return False
-    try:
-        return GgmlParakeet().available
-    except Exception:
-        return False
-
-
-@pytest.fixture(scope="module")
-def ggml_engine():
-    """One persistent parakeet engine for the whole module (load paid once).
-
-    The default path is the in-process ctypes binding (fastest). ggml's global
-    Backend static destructor aborts at process exit on some builds; that crash
-    is after all tests pass and does not affect their outcome (pytest reports
-    before the atexit crash on stdout-flushed runs). For environments where the
-    atexit crash must be fully isolated, set GGML_PARAKEET_NATIVE=0 to use the
-    HTTP-server path (ggml runs in a child process).
-    """
-    if not _ggml_available():
-        pc.record_unavailable(T_PARAKEET_EXTERNAL, "parakeet-server binary/model unavailable")
-        pytest.skip("parakeet-server binary or model unavailable")
-    from engines import GgmlParakeet
-
-    eng = GgmlParakeet()
-    eng.load()
-    yield eng
-    eng.close()
-
-
-@pytest.mark.skipif(not _ggml_available(), reason="parakeet-server binary or model unavailable")
-@pytest.mark.parametrize("name", ["short", "medium", "long"])
-def test_ggml_parakeet_external_text_gate(ggml_engine, name: str) -> None:
-    """External parakeet.cpp server: SMOKE-QUALITY gate, not certification.
-
-    Renamed from ``test_ggml_parakeet_byte_exact``: the long fixture only
-    holds a similarity ratio (>= 0.90), so the old name overclaimed. The
-    in-tree certification lives in ``test_starling_ggml_parakeet_text_parity``
-    (manifest target ``parakeet.intree.text``). Manifest:
-    ``parakeet.external`` — short/medium byte-exact against the golden
-    captured by ``scripts/parakeet_tdt_golden.py``; long is
-    corpus-quality (transformers 5.14 SDPA kernel-path drift, WER-verified
-    benign; see parakeet.cpp 147ba98 for the guarded-out multistep on long).
-    """
-    _manifest_gate(T_PARAKEET_EXTERNAL)
-    pc.record_executed(T_PARAKEET_EXTERNAL)
-    golden_text = (GOLDEN / f"parakeet_tdt_{name}_text.txt").read_text()
-    out = ggml_engine._run_one(FIXTURES[name])
-    if name == "long":
-        ratio = difflib.SequenceMatcher(None, out, golden_text).ratio()
-        assert ratio >= 0.90, (
-            f"parakeet-tdt ggml transcript drift too high on {name} (ratio={ratio:.3f}):\n"
-            f"  golden: {golden_text[:160]!r}\n  ggml:   {out[:160]!r}"
-        )
-    else:
-        pc.assert_exact_text(out, golden_text, target=T_PARAKEET_EXTERNAL, fixture=name)
-
-
-# --------------------------------------------------------------------------- #
-# Moss-Transcribe-preview-2B (CrispASR moss-transcribe backend) — DEPRECATED
-# --------------------------------------------------------------------------- #
-def _ggml_moss_available() -> bool:
-    try:
-        from engines import GgmlMoss
-    except Exception:
-        return False
-    try:
-        return GgmlMoss().available
+        return starling_ggml.available() and _model_path(target_id).exists()
     except Exception:
         return False
 
 
-moss = pytest.mark.skipif(
-    not (_ggml_available() and _ggml_moss_available()),
-    reason="parakeet-server or CrispASR MOSS binary/model unavailable (preserves "
-           "the historical external-engine module gate)",
-)
-
-
-@pytest.fixture(scope="module")
-def ggml_moss_engine():
-    """One CrispASR moss-transcribe engine for the whole module (skipped if
-    unavailable)."""
-    if not (_ggml_available() and _ggml_moss_available()):
-        pc.record_unavailable(T_MOSS_CRISPASR, "parakeet/CrispASR MOSS unavailable")
-        pytest.skip("historical external-engine gate: parakeet/CrispASR MOSS unavailable")
-    from engines import GgmlMoss
-
-    eng = GgmlMoss()
-    eng.load()
-    yield eng
-    eng.close()
-
-
-@moss
-@pytest.mark.parametrize("name", ["short"])
-def test_ggml_moss_crispasr_short_exact(ggml_moss_engine, name: str) -> None:
-    """Deprecated external CrispASR engine: SHORT is byte-exact.
-
-    Renamed from ``test_ggml_moss_byte_exact`` to name the engine explicitly.
-    Both invocation paths (persistent server and one-shot CLI fallback)
-    reproduce the golden exactly on short: the audio fits one 30 s chunk and
-    the decode has not yet accumulated enough KV-cache context to diverge from
-    the golden's HF eager greedy path.
-    """
-    _manifest_gate(T_MOSS_CRISPASR)
-    pc.record_executed(T_MOSS_CRISPASR)
-    golden_text = (GOLDEN / f"moss_{name}_text.txt").read_text()
-    out = ggml_moss_engine._run_one(FIXTURES[name])
-    pc.assert_exact_text(out, golden_text, target=T_MOSS_CRISPASR, fixture=name)
-
-
-@moss
-@pytest.mark.parametrize("name", ["medium", "long"])
-def test_ggml_moss_crispasr_approx_smoke(ggml_moss_engine, name: str) -> None:
-    """Deprecated external CrispASR engine: APPROXIMATE SMOKE gate.
-
-    Renamed from ``test_ggml_moss_near_exact`` so the name cannot be mistaken
-    for accuracy certification. The residual divergence is NOT a flag or
-    CrispASR-post-processing issue — it is an inherent numeric-path difference
-    between CrispASR's ggml f16 KV-cache decode and the golden's HF bf16 eager
-    greedy decode. At the low-confidence ``eyes`` repetition boundary the two
-    argmax results flip: CrispASR emits ``eyes. It`` (period + capital) where
-    the golden emits ``eyes it``. Confirmed on the raw token stream
-    (``moss_transcribe: N tokens`` verbose log): the period appears in the LLM
-    output itself, before any post-processing. Flags tried that do NOT fix it:
-    ``--no-punctuation`` (strips ALL punctuation, including the golden's own
-    commas — too aggressive), ``-nfa`` (no flash attention),
-    ``--frequency-penalty 0``, ``-bs greedy``.
-
-    Characterized residual (one-shot CLI / server single-chunk, byte-identical):
-      * medium: normalized CER = 0.0000 (2 inserted periods).
-      * long:   normalized CER < 0.02 (6 inserted periods + 6 capitalizations
-        + a different EOS/truncation point).
-
-    The CER bound catches any regression beyond this known, documented gap.
-    The in-tree engine's certification is a SEPARATE contract
-    (``moss.intree.text``); this deprecated engine must never define
-    Starling's native correctness.
-    """
-    _manifest_gate(T_MOSS_CRISPASR)
-    pc.record_executed(T_MOSS_CRISPASR)
-    golden_text = (GOLDEN / f"moss_{name}_text.txt").read_text()
-    out = ggml_moss_engine._run_one(FIXTURES[name])
-    pc.assert_cer_below(out, golden_text, target=T_MOSS_CRISPASR, fixture=name,
-                        margin=0.10)
+def _open_engine(kind: int, target_id: str, *unavailable_targets: str):
+    """Load one in-process engine for a module-scoped fixture (or skip)."""
+    if not _engine_available(target_id):
+        for t in (target_id, *unavailable_targets):
+            pc.record_unavailable(t, "in-tree libstarling_ggml or GGUF unavailable")
+        pytest.skip(f"in-tree libstarling_ggml or {_model_path(target_id)} unavailable")
+    return starling_ggml.GgmlModel(kind, str(_model_path(target_id)))
 
 
 # --------------------------------------------------------------------------- #
 # In-tree MOSS C API
 # --------------------------------------------------------------------------- #
 def _starling_ggml_moss_available() -> bool:
-    try:
-        from engines import StarlingGgmlMoss
-        return StarlingGgmlMoss().available
-    except Exception:
-        return False
+    return _engine_available(T_MOSS_TEXT)
 
 
 @pytest.fixture(scope="module")
 def starling_ggml_moss_engine():
-    if not _starling_ggml_moss_available():
-        pc.record_unavailable(T_MOSS_TEXT, "in-tree libstarling_ggml or MOSS GGUF unavailable")
-        pytest.skip("in-tree libstarling_ggml or STARLING_GGML_MOSS_MODEL unavailable")
-    from engines import StarlingGgmlMoss
-
-    eng = StarlingGgmlMoss()
-    eng.load()
-    yield eng
-    eng.close()
+    engine = _open_engine(starling_ggml.MOSS, T_MOSS_TEXT)
+    yield engine
+    engine.close()
 
 
 @pytest.mark.skipif(not _starling_ggml_moss_available(),
@@ -285,8 +153,8 @@ def test_starling_ggml_moss_text_parity(starling_ggml_moss_engine, name: str) ->
     This deliberately has no CrispASR-style tolerance: it gates Starling's own
     loader → mel → encoder → adapter → prompt → LLM → detokenizer pipeline
     against the pinned HF eager greedy reference captured by
-    ``scripts/moss_golden.py`` (device + library versions + output hashes in
-    ``golden/moss_reference_provenance.json``).
+    ``scripts/goldens/moss_golden.py`` (device + library versions + output
+    hashes in ``golden/moss_reference_provenance.json``).
 
     Resolution of the issue #167 drift: the previous normalized-CER < 0.10
     escape hatch on the long fixture was inherited from the parakeet
@@ -300,7 +168,7 @@ def test_starling_ggml_moss_text_parity(starling_ggml_moss_engine, name: str) ->
     _manifest_gate(T_MOSS_TEXT)
     pc.record_executed(T_MOSS_TEXT)
     golden_text = (GOLDEN / f"moss_{name}_text.txt").read_text()
-    out = starling_ggml_moss_engine._run_one(FIXTURES[name])
+    out = starling_ggml_moss_engine.transcribe(FIXTURES[name])
     pc.assert_exact_text(out, golden_text, target=T_MOSS_TEXT, fixture=name)
 
 
@@ -375,8 +243,7 @@ def _run_moss_llm_gate() -> None:
             pc.record_unavailable(target_id, "build/moss_llm_test not built")
         pytest.skip("build/moss_llm_test not built (run cmake --build build -j)")
 
-    from starling._ggml import backend_name
-    device = backend_name()
+    device = starling_ggml.backend_name()
     scope = "cpu" if device.upper() == "CPU" else "cuda"
     enforcement = _manifest_target(T_QWEN_TOKENS).get("enforcement", {})
     exact_fixtures = set(
@@ -428,7 +295,8 @@ def _run_moss_llm_gate() -> None:
                     reason="in-tree libstarling_ggml or MOSS GGUF unavailable")
 def test_starling_ggml_moss_mel_components() -> None:
     """Component gate: log-mel vs the staged processor reference
-    (``scripts/moss_golden_components.py`` → ``scripts/golden_to_raw.py``).
+    (``scripts/goldens/moss_golden_components.py`` →
+    ``scripts/goldens/golden_to_raw.py``).
 
     Tolerances are the C++ binary's own recorded contract: at most 64
     mismatching bins out of ~951 680, each within one bf16 ULP measured at
@@ -475,21 +343,15 @@ def test_starling_ggml_moss_llm_components() -> None:
 # In-tree ARK-ASR-3B C API
 # --------------------------------------------------------------------------- #
 def _starling_ggml_ark_available() -> bool:
-    try:
-        from engines import StarlingGgmlArk
-        return StarlingGgmlArk().available
-    except Exception:
-        return False
+    return _engine_available(T_ARK_TEXT)
+
 
 @pytest.fixture(scope="module")
 def starling_ggml_ark_engine():
-    if not _starling_ggml_ark_available():
-        pytest.skip("in-tree libstarling_ggml or STARLING_GGML_ARK_MODEL unavailable")
-    from engines import StarlingGgmlArk
-    engine = StarlingGgmlArk()
-    engine.load()
+    engine = _open_engine(starling_ggml.ARK, T_ARK_TEXT)
     yield engine
     engine.close()
+
 
 @pytest.mark.skipif(not _starling_ggml_ark_available(),
                     reason="in-tree libstarling_ggml or ARK GGUF unavailable")
@@ -504,7 +366,7 @@ def test_starling_ggml_ark_text_parity(starling_ggml_ark_engine, name: str) -> N
     _manifest_gate(T_ARK_TEXT)
     pc.record_executed(T_ARK_TEXT)
     golden_text = json.loads((GOLDEN / "ark_reference.json").read_text())[name]["text"]
-    out = starling_ggml_ark_engine._run_one(FIXTURES[name])
+    out = starling_ggml_ark_engine.transcribe(FIXTURES[name])
     pc.assert_exact_text(out, golden_text, target=T_ARK_TEXT, fixture=name)
 
 
@@ -512,21 +374,15 @@ def test_starling_ggml_ark_text_parity(starling_ggml_ark_engine, name: str) -> N
 # In-tree granite-speech-4.1-2b C API
 # --------------------------------------------------------------------------- #
 def _starling_ggml_granite_available() -> bool:
-    try:
-        from engines import StarlingGgmlGranite
-        return StarlingGgmlGranite().available
-    except Exception:
-        return False
+    return _engine_available(T_GRANITE_TEXT)
+
 
 @pytest.fixture(scope="module")
 def starling_ggml_granite_engine():
-    if not _starling_ggml_granite_available():
-        pytest.skip("in-tree libstarling_ggml or STARLING_GGML_GRANITE_MODEL unavailable")
-    from engines import StarlingGgmlGranite
-    engine = StarlingGgmlGranite()
-    engine.load()
+    engine = _open_engine(starling_ggml.GRANITE, T_GRANITE_TEXT)
     yield engine
     engine.close()
+
 
 @pytest.mark.skipif(not _starling_ggml_granite_available(),
                     reason="in-tree libstarling_ggml or granite GGUF unavailable")
@@ -539,14 +395,14 @@ def test_starling_ggml_granite_text_parity(starling_ggml_granite_engine, name: s
     CTC) -> BLIP2 Q-Former projector -> Granite-4.0-1b decoder (bias-free, no
     qk-norm, untied lm_head, granite multipliers) pipeline including the serve
     chunk policy for long audio, against the stock-numerics reference captured
-    by scripts/make_granite_golden.py (golden/granite_reference.json). Asserts
-    exact text parity with no tolerance.
+    by scripts/make_granite_golden.py (golden/granite_reference.json; frozen at
+    tag python-research-final). Asserts exact text parity with no tolerance.
     """
     _manifest_gate(T_GRANITE_TEXT)
     pc.record_executed(T_GRANITE_TEXT)
     golden = json.loads((GOLDEN / "granite_reference.json").read_text())
     golden_text = golden["fixtures"][name]["text"]
-    out = starling_ggml_granite_engine._run_one(FIXTURES[name])
+    out = starling_ggml_granite_engine.transcribe(FIXTURES[name])
     pc.assert_exact_text(out, golden_text, target=T_GRANITE_TEXT, fixture=name)
 
 
@@ -554,21 +410,15 @@ def test_starling_ggml_granite_text_parity(starling_ggml_granite_engine, name: s
 # In-tree Qwen3-ASR-1.7B C API
 # --------------------------------------------------------------------------- #
 def _starling_ggml_qwen3_available() -> bool:
-    try:
-        from engines import StarlingGgmlQwen3
-        return StarlingGgmlQwen3().available
-    except Exception:
-        return False
+    return _engine_available(T_QWEN3_TEXT)
+
 
 @pytest.fixture(scope="module")
 def starling_ggml_qwen3_engine():
-    if not _starling_ggml_qwen3_available():
-        pytest.skip("in-tree libstarling_ggml or STARLING_GGML_QWEN3_MODEL unavailable")
-    from engines import StarlingGgmlQwen3
-    engine = StarlingGgmlQwen3()
-    engine.load()
+    engine = _open_engine(starling_ggml.QWEN3, T_QWEN3_TEXT)
     yield engine
     engine.close()
+
 
 @pytest.mark.skipif(not _starling_ggml_qwen3_available(),
                     reason="in-tree libstarling_ggml or qwen3 GGUF unavailable")
@@ -582,14 +432,14 @@ def test_starling_ggml_qwen3_text_parity(starling_ggml_qwen3_engine, name: str) 
     (bias-free, qk-norm, tied lm_head) pipeline including the serve chunk
     policy for long audio and the transcription_only text extraction, against
     the stock-numerics reference captured by scripts/make_qwen3_golden.py
-    (golden/qwen3_reference.json). Asserts exact text parity with no
-    tolerance.
+    (golden/qwen3_reference.json; frozen at tag python-research-final).
+    Asserts exact text parity with no tolerance.
     """
     _manifest_gate(T_QWEN3_TEXT)
     pc.record_executed(T_QWEN3_TEXT)
     golden = json.loads((GOLDEN / "qwen3_reference.json").read_text())
     golden_text = golden["fixtures"][name]["text"]
-    out = starling_ggml_qwen3_engine._run_one(FIXTURES[name])
+    out = starling_ggml_qwen3_engine.transcribe(FIXTURES[name])
     pc.assert_exact_text(out, golden_text, target=T_QWEN3_TEXT, fixture=name)
 
 
@@ -597,20 +447,12 @@ def test_starling_ggml_qwen3_text_parity(starling_ggml_qwen3_engine, name: str) 
 # In-tree Qwen3-ASR-0.6B C API
 # --------------------------------------------------------------------------- #
 def _starling_ggml_qwen3_06_available() -> bool:
-    try:
-        from engines import StarlingGgmlQwen3_06
-        return StarlingGgmlQwen3_06().available
-    except Exception:
-        return False
+    return _engine_available(T_QWEN3_06_TEXT)
 
 
 @pytest.fixture(scope="module")
 def starling_ggml_qwen3_06_engine():
-    if not _starling_ggml_qwen3_06_available():
-        pytest.skip("in-tree libstarling_ggml or STARLING_GGML_QWEN3_06_MODEL unavailable")
-    from engines import StarlingGgmlQwen3_06
-    engine = StarlingGgmlQwen3_06()
-    engine.load()
+    engine = _open_engine(starling_ggml.QWEN3_06, T_QWEN3_06_TEXT)
     yield engine
     engine.close()
 
@@ -625,13 +467,14 @@ def test_starling_ggml_qwen3_06_text_parity(starling_ggml_qwen3_06_engine, name:
     Qwen3 trunk under a 2048-wide attention over the 0.6B's 1024-wide trunk),
     same serve chunk policy and transcription_only extraction, against the
     stock-numerics reference captured by scripts/make_qwen3_06_golden.py
-    (golden/qwen3_06_reference.json). Exact text parity, no tolerance.
+    (golden/qwen3_06_reference.json; frozen at tag python-research-final).
+    Exact text parity, no tolerance.
     """
     _manifest_gate(T_QWEN3_06_TEXT)
     pc.record_executed(T_QWEN3_06_TEXT)
     golden = json.loads((GOLDEN / "qwen3_06_reference.json").read_text())
     golden_text = golden["fixtures"][name]["text"]
-    out = starling_ggml_qwen3_06_engine._run_one(FIXTURES[name])
+    out = starling_ggml_qwen3_06_engine.transcribe(FIXTURES[name])
     pc.assert_exact_text(out, golden_text, target=T_QWEN3_06_TEXT, fixture=name)
 
 
@@ -675,12 +518,11 @@ def test_starling_ggml_moss_kstep_cache_boundary() -> None:
 # --------------------------------------------------------------------------- #
 # In-tree Parakeet-tdt C API — the missing parity gate (Task 2, Phase 0).
 # --------------------------------------------------------------------------- #
-# Unlike the external ``GgmlParakeet`` engine (which drives mudler's
-# parakeet.cpp server), ``StarlingGgmlParakeet`` drives Starling's OWN in-tree
-# ``libstarling_ggml`` (built from ``cpp/``). Parakeet-tdt greedy decode is
-# deterministic with no LLM/chunk path, so the short/medium gates below are
-# EXACT (text AND non-blank id-stream equality against the golden
-# ``parakeet_tdt_*_ids.pt`` captured by ``scripts/parakeet_tdt_golden.py``
+# Drives Starling's OWN in-tree ``libstarling_ggml`` (built from ``cpp/``).
+# Parakeet-tdt greedy decode is deterministic with no LLM/chunk path, so the
+# short/medium gates below are EXACT (text AND non-blank id-stream equality
+# against the golden ``parakeet_tdt_*_ids.pt`` captured by
+# ``scripts/goldens/parakeet_tdt_golden.py``
 # from HF ``model.generate``); the LONG fixture is the documented approximate
 # path (transformers 5.14 SDPA kernel-path drift; the golden was regenerated
 # from ``model.generate`` whose SDPA reduction order differs from the in-tree
@@ -696,23 +538,13 @@ def test_starling_ggml_moss_kstep_cache_boundary() -> None:
 # K-step multistep fast path (T<=512); long (T=930) takes the byte-exact serial
 # greedy loop. The id-stream gate covers both paths.
 def _starling_ggml_parakeet_available() -> bool:
-    try:
-        from engines import StarlingGgmlParakeet
-        return StarlingGgmlParakeet().available
-    except Exception:
-        return False
+    return _engine_available(T_PARAKEET_TEXT)
 
 
 @pytest.fixture(scope="module")
 def starling_ggml_parakeet_engine():
-    """One in-tree StarlingGgmlParakeet engine for the whole module."""
-    if not _starling_ggml_parakeet_available():
-        pc.record_unavailable(T_PARAKEET_TEXT, "in-tree libstarling_ggml or parakeet GGUF unavailable")
-        pc.record_unavailable(T_PARAKEET_IDS, "in-tree libstarling_ggml or parakeet GGUF unavailable")
-        pytest.skip("in-tree libstarling_ggml or STARLING_GGML_PARAKEET_MODEL unavailable")
-    from engines import StarlingGgmlParakeet
-    engine = StarlingGgmlParakeet()
-    engine.load()
+    """One in-tree parakeet engine for the whole module."""
+    engine = _open_engine(starling_ggml.PARAKEET_TDT, T_PARAKEET_TEXT, T_PARAKEET_IDS)
     yield engine
     engine.close()
 
@@ -736,7 +568,7 @@ def test_starling_ggml_parakeet_text_parity(
     _manifest_gate(T_PARAKEET_TEXT)
     pc.record_executed(T_PARAKEET_TEXT)
     golden_text = (GOLDEN / f"parakeet_tdt_{name}_text.txt").read_text()
-    out = starling_ggml_parakeet_engine._run_one(FIXTURES[name])
+    out = starling_ggml_parakeet_engine.transcribe(FIXTURES[name])
     if name == "long":
         ratio = difflib.SequenceMatcher(None, out, golden_text).ratio()
         assert ratio >= 0.90, (
@@ -775,7 +607,7 @@ def test_starling_ggml_parakeet_idstream_parity(
     pc.record_executed(T_PARAKEET_IDS)
     ipath = GOLDEN / f"parakeet_tdt_{name}_ids.pt"
     try:
-        out_ids = starling_ggml_parakeet_engine._run_one_ids(FIXTURES[name])
+        out_ids = starling_ggml_parakeet_engine.transcribe_ids(FIXTURES[name])
     except RuntimeError as e:
         if "decode_ids" in str(e):
             pytest.skip("libstarling_ggml built without the decode_ids symbol")
@@ -820,27 +652,13 @@ def test_starling_ggml_parakeet_idstream_parity(
 # --------------------------------------------------------------------------- #
 # S1-mini (superwhisper/s1-mini) — text normalizer parity (ABI 6, slug "s1").
 # --------------------------------------------------------------------------- #
-STARLING_GGML_S1_MODEL = Path(os.environ.get(
-    "STARLING_GGML_S1_MODEL",
-    str(_REPO_ROOT / "models" / "s1-mini-bf16-exact.gguf"),
-)).expanduser()
-
-
 def _starling_ggml_s1_available() -> bool:
-    try:
-        from starling._ggml import available
-        return available() and STARLING_GGML_S1_MODEL.exists()
-    except Exception:
-        return False
+    return _engine_available(T_S1_TEXT)
 
 
 @pytest.fixture(scope="module")
 def starling_ggml_s1_engine():
-    if not _starling_ggml_s1_available():
-        pytest.skip("in-tree libstarling_ggml (ABI 6) or s1 GGUF unavailable")
-    from starling._ggml import S1, GgmlModel
-
-    engine = GgmlModel(S1, str(STARLING_GGML_S1_MODEL))
+    engine = _open_engine(starling_ggml.S1, T_S1_TEXT, T_S1_CONTROL)
     yield engine
     engine.close()
 
@@ -854,16 +672,14 @@ def test_starling_ggml_s1_text_parity(starling_ggml_s1_engine, tier: str) -> Non
     Gates the whole text path: C++ BPE encode (Qwen pre-tokenizer regex +
     byte-level merges) + baked chat template + plain embedding lookup +
     Qwen3 trunk greedy decode stopping on <|im_end|> OR <|endoftext|>, against
-    the eager stock golden captured by starling.s1.golden (which runs the
-    model-card quickstart verbatim). Asserts exact text parity.
+    the eager stock golden captured by scripts/goldens/s1_golden.py (which runs
+    the model-card quickstart verbatim). Asserts exact text parity.
     """
+    _manifest_gate(T_S1_TEXT)
     pc.record_executed(T_S1_TEXT)
-    from starling.s1.golden import GREEDY_TEXT, load_golden_text
+    import s1_transcripts as fx  # noqa: E402  (tests/fixtures on sys.path)
 
-    sys.path.insert(0, str(_REPO_ROOT / "tests" / "fixtures"))
-    import s1_transcripts as fx  # noqa: E402
-
-    golden_text = load_golden_text(GREEDY_TEXT.format(tier=tier))
+    golden_text = (GOLDEN / "s1" / f"greedy_text_{tier}.txt").read_text(encoding="utf-8")
     out = starling_ggml_s1_engine.normalize_text(fx.LENGTH_TIERS[tier])
     pc.assert_exact_text(out, golden_text, target=T_S1_TEXT, fixture=tier)
 

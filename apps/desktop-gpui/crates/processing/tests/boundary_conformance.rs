@@ -1,6 +1,7 @@
 //! Replays `packages/contracts/insertion-boundary/fixtures/boundary-cases.json`
-//! through [`starling_processing::boundary`]. The Python oracle
-//! (`tests/insertion_boundary.py`) replays the same file.
+//! through [`starling_processing::boundary`]. The Kotlin port replays the
+//! same file; the original Python oracle was
+//! `python-research-final:tests/insertion_boundary.py`.
 
 use std::path::PathBuf;
 

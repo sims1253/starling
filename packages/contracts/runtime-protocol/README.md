@@ -3,15 +3,16 @@
 This is the **executable contract** for the E17 native runtime's wire protocol:
 the versioned envelope, the v1 command/event sets of the five state machines,
 conformance fixtures, and the semantic rules an implementation must reproduce.
-It is frozen contract data plus a stdlib oracle — **no runtime implementation
-exists yet**. Increment I3 (`starling-runtime` crate, Mode A) and I4 (service
-host + IPC) implement against this; nothing here should be read as describing
-a running service.
+It is frozen contract data. The reference implementation is the Rust
+`starling-runtime` crate (`apps/desktop-gpui/crates/runtime`, increment I3),
+whose conformance suite replays every fixture; the service host + IPC (I4)
+implements against it too.
 
 Design source: `docs/program/design/e17-native-runtime.md` §2 (envelope + the
-five machines). The schemas are structural; `tests/runtime_protocol.py` is the
-executable oracle; `tests/test_runtime_protocol.py` replays every fixture
-through it.
+five machines). The schemas are structural; `crates/runtime/src/protocol/`
+holds the executable semantics and `crates/runtime/tests/conformance.rs`
+replays every fixture through them. (The original stdlib Python oracle,
+`tests/runtime_protocol.py`, is at tag `python-research-final`.)
 
 ## Files
 
@@ -26,7 +27,7 @@ through it.
 Run the conformance suite with:
 
 ```
-uv run python -m pytest tests/test_runtime_protocol.py -q
+cd apps/desktop-gpui && cargo test -p starling-runtime --test conformance
 ```
 
 ## Envelope
@@ -179,7 +180,7 @@ prevent duplicate insertion from duplicate final callbacks.
 - Implement the five machines so that these fixtures replay green in-process
   (E17 AC: independent test fixtures): same states, same
   command→allowed-from→event tables, same internal edges, same NACK and seq
-  rules. The oracle in `tests/runtime_protocol.py` is the reference semantics.
+  rules. `crates/runtime/src/protocol/` is the reference semantics.
 - Speak the envelope as the only internal API: unknown `v` → `runtime.nack`,
   payload never applied; per-stream strictly increasing `seq`; bounded queues
   with `jobs.rejected` instead of unbounded waiting.

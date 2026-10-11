@@ -19,7 +19,7 @@ data class Split(
 )
 
 /**
- * Port of the trailing spoken instruction grammar (`tests/spoken_instructions.py`).
+ * Port of the trailing spoken instruction grammar (`python-research-final:tests/spoken_instructions.py`).
  * A delimiter spoken near the end of a finalized take splits it: the text after
  * it travels as the transform's instruction, never as input text.
  */

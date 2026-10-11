@@ -49,7 +49,7 @@ nvidia/parakeet-tdt-0.6b-v3 ──convert_parakeet_gguf.py──> f32.gguf
                             └── imatrix.bin ──────────────► │ (--imatrix)
                                                     quantized ggufs
                                                             │
-                                                   benchmarks/wer_quant.py
+                                    benchmarks/fast_engine/wer_engines.py
 ```
 
 1. **Convert** to a numeric-exact base GGUF (F32 is the quantization input,
@@ -57,7 +57,7 @@ nvidia/parakeet-tdt-0.6b-v3 ──convert_parakeet_gguf.py──> f32.gguf
    an already-rounded dtype):
 
    ```bash
-   uv run --with gguf python scripts/convert_parakeet_gguf.py \
+   uv run --group convert python scripts/convert_parakeet_gguf.py \
        --model-id nvidia/parakeet-tdt-0.6b-v3 --dtype f32 \
        --output models/parakeet-tdt-0.6b-v3-f32.gguf
    ```
@@ -71,7 +71,7 @@ nvidia/parakeet-tdt-0.6b-v3 ──convert_parakeet_gguf.py──> f32.gguf
    CPU backend, so it is an offline pass, not a serving mode:
 
    ```bash
-   uv run --extra bench python benchmarks/imatrix_collect.py \
+   uv run --group eval python benchmarks/imatrix_collect.py \
        --model models/parakeet-tdt-0.6b-v3-f32.gguf \
        --output models/parakeet-tdt-0.6b-v3.imx.bin \
        --tiers short,medium,long --repeats 2 --wavs path/to/calibration_wavs/
@@ -92,18 +92,22 @@ nvidia/parakeet-tdt-0.6b-v3 ──convert_parakeet_gguf.py──> f32.gguf
        --imatrix models/parakeet-tdt-0.6b-v3.imx.bin
    ```
 
-4. **Verify** by WER against the f32 baseline on the fixtures (and, for
-   release gates, the full Open-ASR-Leaderboard sets via
-   `benchmarks/wer_leaderboard.py` with `STARLING_GGML_PARAKEET_MODEL`
-   pointing at the quantized file). Install the scoring dependencies with
-   `uv sync --locked --extra bench`:
+4. **Verify** by corpus WER against the f32 baseline: export a fixed clip set
+   once (from a local `google/fleurs` parquet cache in the HF hub cache), then
+   score each GGUF on it with the same native library (one run per file;
+   `--variants ggml` keeps the ggml engine):
 
    ```bash
-   uv run --extra bench python benchmarks/wer_quant.py --tiers short,medium,long \
-       --models f32=models/parakeet-tdt-0.6b-v3-f32.gguf \
-                q8_0=models/parakeet-tdt-0.6b-v3-q8_0.gguf \
-                q4_k_m+imx=models/parakeet-tdt-0.6b-v3-q4_k_m.gguf
+   uv run --group eval python benchmarks/fast_engine/export_fleurs.py \
+       --cfg en_us --n 100 --out models/fleurs_en
+   for m in f32 q8_0 q4_k_m; do
+     uv run --group eval python benchmarks/fast_engine/wer_engines.py \
+         --lib build/libstarling_ggml.so --model parakeet --variants ggml \
+         --gguf models/parakeet-tdt-0.6b-v3-$m.gguf --clips models/fleurs_en
+   done
    ```
+
+   For a promotion decision use the sealed paired protocol below.
 
 ## What quantizes and what must stay exact
 
@@ -273,16 +277,16 @@ new cache, the downloader selects the first 300 valid test clips per config;
 check its manifest against the record before treating it as the same sample.
 
 ```bash
-uv run --extra bench python benchmarks/fleurs_download.py \
+uv run --group eval python benchmarks/fleurs_download.py \
   --out models/fleurs_test_big_ende --split test --fleurs en_us:300 --fleurs de_de:300
-STARLING_GGML_DEVICE=cpu STARLING_GGML_LIB="$PWD/build-cpu/libstarling_ggml.so" \
-uv run --extra bench python benchmarks/wer_quant.py --tiers '' \
-  --corpus models/fleurs_test_big_ende --models combined=models/parakeet-iq2-compact.gguf \
-  --include-clips --json /tmp/compact.json
 ```
 
-Repeat the scoring command separately for baseline and embedding-only files.
-`--include-clips` retains clip IDs, decoded-audio hashes, references,
+The study's scorer (`benchmarks/wer_quant.py`, protocol-sealed per-clip
+records) and paired comparator (`benchmarks/compare_quant_wer.py`) were part
+of the removed Python stack; reproduce it exactly from
+`git checkout python-research-final`.
+It scored baseline, embedding-only and combined files separately, retaining
+clip IDs, decoded-audio hashes, references,
 hypotheses, and unrounded WER. The paired analysis matched IDs, audio hashes,
 and references, then sampled 300 per-clip WER differences with replacement
 10,000 times per language using NumPy `default_rng(0)`. Its interval is the
@@ -310,35 +314,21 @@ inputs, missing clips, duplicate IDs, changed scoring code, a native-library
 fallback from `STARLING_GGML_LIB`, or a protocol edited after evaluation.
 
 ```bash
-uv run --extra bench python benchmarks/fleurs_download.py \
+uv run --group eval python benchmarks/fleurs_download.py \
   --out models/fleurs_validation_ende --split validation \
   --fleurs en_us:300 --fleurs de_de:300
-export STARLING_GGML_LIB="$PWD/build-cpu/libstarling_ggml.so"
-uv run --extra bench python benchmarks/wer_quant.py --tiers '' \
-  --device cpu --corpus models/fleurs_validation_ende \
-  --models baseline=models/parakeet-iq2-baseline.gguf \
-  --source-model models/parakeet-tdt-0.6b-v3-f32.gguf \
-  --imatrix models/parakeet.imx.bin \
-  --protocol quants/protocols/parakeet-compact-validation-v1.json \
-  --include-clips --json /tmp/compact-baseline.json
-uv run --extra bench python benchmarks/wer_quant.py --tiers '' \
-  --device cpu --corpus models/fleurs_validation_ende \
-  --models embedding=models/parakeet-iq2-embedding-q8.gguf \
-  --source-model models/parakeet-tdt-0.6b-v3-f32.gguf \
-  --imatrix models/parakeet.imx.bin \
-  --protocol quants/protocols/parakeet-compact-validation-v1.json \
-  --include-clips --json /tmp/compact-embedding.json
-uv run --extra bench python benchmarks/compare_quant_wer.py \
-  --protocol quants/protocols/parakeet-compact-validation-v1.json \
-  --baseline /tmp/compact-baseline.json \
-  --candidate /tmp/compact-embedding.json \
-  --json /tmp/compact-embedding-verdict.json
 ```
 
-Evaluate the combined candidate with the same protocol and a separate
-`wer_quant.py` process, then compare it with the baseline. The comparator
-reports `pass`, `fail`, or `inconclusive`; a CI touching the margin remains
-inconclusive. Keep opt-in recipes when a gate is inconclusive. For CUDA or
+The study's scorer (`benchmarks/wer_quant.py`, protocol-sealed per-clip
+records) and paired comparator (`benchmarks/compare_quant_wer.py`) were part
+of the removed Python stack; reproduce it exactly from
+`git checkout python-research-final`.
+At the tag, `wer_quant.py --protocol quants/protocols/parakeet-compact-validation-v1.json
+--source-model ... --imatrix ... --include-clips --json ...` scored each arm
+(baseline, embedding, combined) in its own process, and
+`compare_quant_wer.py --protocol ... --baseline ... --candidate ...` applied
+the gate. The comparator reports `pass`, `fail`, or `inconclusive`; a CI
+touching the margin remains inconclusive. Keep opt-in recipes when a gate is inconclusive. For CUDA or
 Vulkan runs, build the corresponding native library and set `--device CUDA0`
 or `--device Vulkan0` in **both** arms; the result is specific to that backend.
 
@@ -411,9 +401,10 @@ bounds were below +0.2 percentage points in both languages. Thirteen of the
 600 hypotheses changed (five EN, eight DE). EN has the **same mean WER**, not
 identical transcripts or lossless conversion; one DE clip increased by 15
 per-clip percentage points, yielding the +0.050-point mean DE difference.
-The [13 exact changes](evidence/pixel-compact-2026-09-28/changed-hypotheses.json),
-[per-clip records and verdict](evidence/pixel-compact-2026-09-28/README.md),
-and raw benchmark logs make the result auditable.
+The [13 exact changes](https://github.com/sims1253/starling/blob/python-research-final/docs/evidence/pixel-compact-2026-09-28/changed-hypotheses.json),
+[per-clip records and verdict](https://github.com/sims1253/starling/blob/python-research-final/docs/evidence/pixel-compact-2026-09-28/README.md),
+and raw benchmark logs (all at tag `python-research-final`) make the result
+auditable.
 
 The fast engine repacked both IQ2 files into the same 718.6 MiB Vulkan weight
 allocation. A matched, sequential baseline/candidate probe after the same
@@ -625,8 +616,8 @@ quant level, not more calibration clips.
 The tables above use 50-clip EN/DE and 8-clip-per-language cells, so
 sub-point differences there are noise (σ ≈ ±0.9 and ±5 respectively). This
 re-run on 300/48 clips with bootstrap CIs confirms the big claims and
-corrects two small ones. (`wer_quant.py` now reports mean [95% CI] whenever
-a column has ≥5 clips.)
+corrects two small ones. (The removed `wer_quant.py` reported mean [95% CI]
+whenever a column had ≥5 clips.)
 
 EN/DE at 300 clips (f32: DE 5.30 [4.45–6.14], EN 6.50 [5.59–7.44]):
 
@@ -738,7 +729,7 @@ Recipes (`quants/recipes/moss-*.recipe`, all with `--f32-1d` where noted):
 worse tail; Q2: faster but CER 0.06 with real errors) were tried and
 rejected — Q2_K is the linear floor, Q4 the head floor.)
 
-Fixture WER vs ground truth (`benchmarks/wer.py` LibriSpeech refs), Vulkan:
+Fixture WER vs ground truth (`benchmarks/fast_engine/wer.py` LibriSpeech refs), Vulkan:
 
 | model | short | medium | long |
 |-------|-------|--------|------|
@@ -835,11 +826,11 @@ only calibrated (uniform q2_k collapses to 30%/17% where the calibrated
 build matches f32), plus the published imatrix for custom recipes.
 
 Tooling note: install the corpus dependencies with
-`uv sync --locked --extra bench` before using `benchmarks/fleurs_download.py`.
-Use `uv run --extra bench python benchmarks/fleurs_download.py --help` for options.
+`uv sync --locked --group eval` before using `benchmarks/fleurs_download.py`.
+Use `uv run --group eval python benchmarks/fleurs_download.py --help` for options.
 It fetches FLEURS corpora over HTTP range reads on the parquet shards (~100 MB per config instead of the
-2 GB shard, resumable per config) and `--wavs`/`--corpus` feed the local
-clips to collection/eval — the datasets-library streaming path accumulates
+2 GB shard, resumable per config) and `imatrix_collect.py --wavs` feeds the local
+clips to collection — the datasets-library streaming path accumulates
 multi-GB per config and stalled repeatedly next to a loaded model.
 
 ## Speed (CPU, medium fixture, 3-run mean after warmup)

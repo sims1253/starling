@@ -1,8 +1,9 @@
 //! Replays `packages/contracts/mode-routing/fixtures/staging.json` (the
 //! #293 staging cases) through [`starling_processing::staging`], and checks
 //! the other contract fixtures parse into the typed records and agree with
-//! the ported cross-field rules. The Python oracle (`tests/staging.py`,
-//! `tests/test_staging.py`) replays the same files.
+//! the ported cross-field rules. The Kotlin `StagingConformanceTest` replays
+//! the same files; the original Python oracle was
+//! `python-research-final:tests/staging.py`.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -303,6 +304,24 @@ fn profiles_documents_parse_and_pass_the_processing_rules() {
         seen += 1;
     }
     assert!(seen >= 5);
+}
+
+/// The modes the apps ship are ordinary profiles documents held to the same
+/// rules as the contract fixtures.
+#[test]
+fn the_shipped_mode_documents_pass_every_rule() {
+    let apps = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    for path in [
+        apps.join("desktop-gpui/crates/app/modes/desktop-profiles.json"),
+        apps.join("mobile/app/src/main/assets/modes/android-profiles.json"),
+    ] {
+        let name = path.display().to_string();
+        let doc: ProfilesDocument = serde_json::from_str(&std::fs::read_to_string(&path).unwrap())
+            .unwrap_or_else(|err| panic!("{name}: {err}"));
+        starling_processing::routing::validate_config(&doc)
+            .unwrap_or_else(|err| panic!("{name}: {err}"));
+        contract::validate_processing(&doc).unwrap_or_else(|err| panic!("{name}: {err}"));
+    }
 }
 
 #[test]

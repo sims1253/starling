@@ -11,7 +11,7 @@ offline pass — run it once per model family, not per serving process.
 
 Usage::
 
-    uv run python benchmarks/imatrix_collect.py \\
+    uv run --group eval python benchmarks/imatrix_collect.py \\
         --model models/parakeet-tdt-0.6b-v3-f32.gguf \\
         --output models/parakeet-tdt-0.6b-v3.imx.bin \\
         --tiers short,medium,long --repeats 2 [--wavs calib_dir/]
@@ -30,7 +30,7 @@ import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(REPO_ROOT))
+sys.path.insert(0, str(REPO_ROOT / "tools"))
 sys.path.insert(0, str(REPO_ROOT / "tests" / "fixtures"))
 
 
@@ -61,17 +61,15 @@ def main() -> int:
     # Must be set before the engine loads: the collector activates on first
     # graph build and flushes at process exit.
     os.environ["STARLING_IMATRIX"] = str(out.resolve())
-    os.environ["STARLING_GGML_PARAKEET_MODEL"] = str(model.resolve())
     # Collection is only sound with the engine on its CPU backend: the
     # eval-callback path reads activation memory host-side. Pin it unless the
     # caller explicitly overrides.
     os.environ.setdefault("STARLING_GGML_DEVICE", "cpu")
 
     import make_fixtures as mkfx
-    from engines import StarlingGgmlParakeet
+    import starling_ggml
 
-    eng = StarlingGgmlParakeet()
-    if not eng.available:
+    if not starling_ggml.available():
         print("error: engine unavailable (build/libstarling_ggml.so missing?)")
         return 1
 
@@ -157,16 +155,15 @@ def main() -> int:
                        for label, audio, _text in fleurs_clips(budget, split="train"))
 
     print(f"collecting -> {out}", flush=True)
-    eng.load()
+    eng = starling_ggml.GgmlModel(starling_ggml.PARAKEET_TDT, str(model.resolve()))
     for i, (label, audio) in enumerate(clips_iter()):
-        text = eng.transcribe(audio)[0]
+        text = eng.transcribe(audio)
         print(f"[{i + 1}] {label}: {len(audio) / 16000:.1f}s "
               f"-> {len(text)} chars", flush=True)
     # Flush the collector through the C API BEFORE any teardown so the file
     # exists regardless of exit-time behavior, then skip the (crash-prone)
     # interpreter teardown entirely.
-    from starling._ggml import _native
-    lib = getattr(_native, "_LIB", None) or _native._load_lib()
+    lib = starling_ggml._load_lib()
     flush = getattr(lib, "starling_ggml_imatrix_flush_pub", None)
     if flush is not None:
         flush()

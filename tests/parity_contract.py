@@ -519,14 +519,14 @@ def probe_target_assets(t: dict, repo_root: Path = REPO_ROOT) -> AssetProbe:
     if t.get("needs_lib", True):
         from_ok = True
         if t.get("engine", "").startswith("starling-ggml"):
-            sys.path.insert(0, str(repo_root / "src"))
+            sys.path.insert(0, str(repo_root / "tools"))
             try:
-                from starling._ggml import _native  # noqa: PLC0415
-                from_ok = _native.available()
+                import starling_ggml  # noqa: PLC0415
+                from_ok = starling_ggml.available()
             except Exception:
                 from_ok = False
             finally:
-                sys.path.remove(str(repo_root / "src"))
+                sys.path.remove(str(repo_root / "tools"))
         if not from_ok:
             missing.append("libstarling_ggml")
 
@@ -547,24 +547,15 @@ def probe_target_assets(t: dict, repo_root: Path = REPO_ROOT) -> AssetProbe:
             raw = os.environ.get(env, "") if env else ""
             if raw:
                 path = Path(raw).expanduser()
-            elif gguf.get("default_path_env_root"):
-                # External engines resolve their default under a root that is
-                # itself env-configurable (benchmarks/engines.py:
-                # ASR_BENCH_ROOT, default ~/asr-bench) — mirror it so the
-                # probe does not report a runnable engine as unavailable.
-                spec = gguf["default_path_env_root"]
-                root = os.environ.get(spec["root_env"]) or spec["root_default"]
-                path = Path(os.path.expanduser(root)) / spec["relative"]
             elif default:
-                # A default may be repo-relative or absolute/`~` (external
-                # engines keep models outside the repo, e.g. ~/asr-bench).
+                # A default may be repo-relative or absolute/`~`.
                 dpath = Path(os.path.expanduser(default))
                 path = dpath if dpath.is_absolute() else (repo_root / default)
             else:
                 path = None
             if path is None:
                 # env-only probe with the variable unset: the asset lives
-                # outside the repo (external engines); report it missing
+                # outside the repo; report it missing
                 # rather than treating the repository root as "the model".
                 missing.append(f"gguf:{env or '(unspecified)'} (env unset)")
             elif path.exists():
@@ -669,7 +660,7 @@ def coverage_lines(m: dict, repo_root: Path = REPO_ROOT,
 
     Gate-recorded skip reasons (:func:`record_unavailable`) are surfaced in
     the report: the probe can only see files, so a gate that skipped for a
-    reason the probe cannot see (e.g. an external server binary absent while
+    reason the probe cannot see (e.g. an engine library absent while
     its GGUF/goldens exist) would otherwise vanish silently.
     """
     report: list[str] = []

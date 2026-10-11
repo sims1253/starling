@@ -4,8 +4,9 @@
 //!
 //! The rules are frozen in `packages/contracts/insertion-boundary/` (the
 //! README is authoritative). `tests/boundary_conformance.rs` replays the
-//! contract's fixture table through this port; the Python oracle
-//! (`tests/insertion_boundary.py`) replays the same file.
+//! contract's fixture table through this port; the Kotlin port replays the
+//! same file (the original Python oracle:
+//! `python-research-final:tests/insertion_boundary.py`).
 
 use serde::Deserialize;
 

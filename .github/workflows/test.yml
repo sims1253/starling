@@ -1,6 +1,7 @@
 name: tests
 
-# CPU regressions run on Linux and Windows; model/GPU checks run separately.
+# CPU-only Python checks around the native engine; model/GPU checks run
+# separately (ci-starling-serve.yml).
 
 on:
   workflow_dispatch:
@@ -18,21 +19,6 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  sonar-tests:
-    name: SONAR harness (CPU)
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          persist-credentials: false
-      - name: Install uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7
-      - name: Install isolated CPU dependencies
-        run: uv sync --locked --project benchmarks/sonar --python 3.12
-      - name: Harness regressions
-        run: uv run --project benchmarks/sonar python -m unittest discover -s benchmarks/sonar -p 'test_*.py'
-
   # benchmarks/experiments (issue #168): the shared experiment record +
   # comparison command. Stdlib-only unit/comparator tests over the stub
   # double, plus the one-command paired CPU reproduction against the real
@@ -51,8 +37,6 @@ jobs:
         uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7
       - name: Unit and comparator tests (stub double, no models)
         run: uv run --no-project --python 3.12 python -m unittest discover -s benchmarks/experiments -p 'test_*.py'
-      - name: Contention pilot decision tests (saved result summaries)
-        run: uv run --no-project --python 3.12 python -m unittest discover -s benchmarks/contention -p 'test_*.py'
       - name: Paired CPU reproduction (contract fixture binary)
         run: >
           cmake -B build-exp -DSTARLING_SERVE=ON -DSTARLING_GGML_TESTS=ON
@@ -63,125 +47,22 @@ jobs:
           --binary build-exp/starling-serve-contract-fixture
           --out-dir build-exp/experiments/demo
 
-
-  engine-guards:
-    name: Native engine and server guards (CPU)
+  # The whole Python suite on the locked starling-tools dev group. Without a
+  # native build, models, or goldens the engine parity gates skip and report
+  # UNAVAILABLE coverage; what runs is the parity contract (manifest schema,
+  # test selection, docs agreement, comparator negative tests), the
+  # capabilities/personalization/multilingual contract checks, the ggml patch
+  # and release-runtime guards, and the quantization tooling unit tests.
+  python-tests:
+    name: Python tests (CPU)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
       - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7
-      - name: Test portable guards without the deprecated CUDA environment
-        run: >-
-          uv run --no-project --python 3.12
-          --with pytest --with numpy --with scipy --with fastapi --with httpx
-          --with uvicorn --with websockets
-          python -m pytest -q
-          tests/test_ggml_patches.py tests/test_release_runtime_contract.py
-          tests/test_experimental_release.py
-          tests/test_server_routing.py tests/test_server_robustness.py
-          tests/test_server_lifecycle.py tests/test_server_websocket.py
-          tests/test_server_client.py tests/test_stream_chunk.py
-          tests/test_native_parity_contract.py tests/test_copy_draft.py
-          benchmarks/speculative/results/pixel-native-copy-2026-09-28/test_run_copy.py
-          tests/test_s1_quant_spans.py tests/test_s1_pixel_runner.py
-          docs/evidence/pixel-s1-2026-09-28/controlled/test_controlled.py
-
-      - name: Validate Pixel CPU residency evidence
-        run: |
-          python3 docs/evidence/pixel-s1-2026-09-28/cpu-co-residency/analyze.py
-          cd docs/evidence/pixel-s1-2026-09-28/cpu-co-residency
-          sha256sum -c hashes.sha256
-
-      # tests/test_copy_draft.py (issue #312): offline copy-draft acceptance
-      # replay; stdlib + pytest only, loads benchmarks/speculative/copy_draft.py
-      # directly and needs no model or golden files.
-      # tests/test_native_parity_contract.py (issue #167): the executable
-      # numerical-correctness contract — manifest schema, test-selection
-      # agreement, docs/manifest agreement, and the comparator negative tests
-      # (seeded truncation / wrong token / wrong EOS boundary are rejected).
-      # Stdlib + pytest only, no models, no downloads; the required-target
-      # accounting reports gitignored-asset coverage as UNAVAILABLE (distinct,
-      # non-failing) so the contract is executable on every CPU runner.
-
-      - name: Test native Python bindings with CPU-only PyTorch
-        run: >-
-          uv run --no-project --python 3.12 --with pytest --with numpy --with torch
-          --with soundfile --with jiwer
-          --index https://download.pytorch.org/whl/cpu
-          python -m pytest -q tests/test_benchmark_ggml_adapters.py
-          tests/test_compare_quant_wer.py tests/test_quantization_drivers.py
-          tests/test_score_phone_quant.py
-          tests/test_cuda_kernel_validation.py tests/test_sanitizer_gate.py
-        env:
-          PYTHONPATH: src
-
-      - name: Test ark06/voxtral pipelines and KV probe with CPU-only PyTorch
-        run: >-
-          uv run --no-project --python 3.12 --with pytest --with numpy --with soundfile
-          --with torch --index https://download.pytorch.org/whl/cpu
-          python -m pytest -q tests/test_ark06_pipeline.py tests/test_voxtral_pipeline.py
-          tests/test_kv_spectral.py
-        env:
-          PYTHONPATH: src
-
-  cpu-tests:
-    # Deprecated CUDA/Python environment is opt-in; portable CI lives in apps.yml.
-    if: github.event_name == 'workflow_dispatch'
-    name: CPU tests (${{ matrix.os }} / py${{ matrix.python-version }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest]
-        python-version: ["3.10", "3.11"]
-
-    steps:
-      - name: Checkout
-        # actions/checkout v7.0.1
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          persist-credentials: false
-
-      - name: Install uv
-        # astral-sh/setup-uv v10.0.1
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7
-
-      - name: Set up Python ${{ matrix.python-version }}
-        run: uv python install ${{ matrix.python-version }}
-
-      - name: Create venv
-        run: uv venv --python ${{ matrix.python-version }}
-
-      - name: Install dependencies
-        # `uv sync --locked --extra dev` resolves from the project. triton is marked
-        # `sys_platform == 'linux'` in pyproject.toml, so it is NOT installed
-        # on windows-latest (no official Windows wheel) and the kernel package
-        # auto-selects the torch backend there instead.
-        run: uv sync --locked --extra dev
-
-      - name: CPU-safe server tests
-        # No CUDA, no model loading, no network: verifies slug->backend
-        # routing, CLI arg parsing, config plumbing, cancellation/error
-        # paths, and the CPU-only robustness/lifecycle regressions.
-        # test_s1_config.py: pure-Python s1 prompt-contract tests (control
-        # line, chunking, budget formula) — no model, no goldens.
-        run: >-
-          uv run python -m pytest -q
-          tests/test_server_routing.py tests/test_server_robustness.py
-          tests/test_server_lifecycle.py tests/test_server_websocket.py
-          tests/test_server_client.py tests/test_stream_chunk.py
-          tests/test_s1_config.py tests/test_autotune.py tests/test_flags.py
-          tests/test_fp4_quantization.py tests/test_ablation_checks.py
-          tests/test_multistep_controller.py
-          tests/test_kernel_selection.py tests/test_gpu_runner.py
-          tests/test_benchmark_ggml_adapters.py tests/test_quantization_drivers.py
-          tests/test_ggml_patches.py tests/test_release_runtime_contract.py
-
-      - name: POSIX GPU lock lifecycle tests
-        if: runner.os == 'Linux'
-        run: uv run python -m pytest tests/test_gpu_session.py tests/test_gpu_lock.py -q
-
-      - name: Kernel backend import smoke
-        run: uv run python -c "import starling._kernels as K; print('backend:', K.get_backend_name(), 'triton:', K.have_triton())"
+      - name: pytest
+        run: uv run --locked --python 3.12 pytest tests -q
+      - name: ruff
+        run: uvx ruff@0.17.0 check .

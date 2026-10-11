@@ -2,7 +2,7 @@
 //!
 //! - [`contract`]: the #293 records (mode entry, provider declaration,
 //!   transform request/result) and the provider choice, ported from the
-//!   executable oracle `tests/mode_routing.py`.
+//!   executable oracle `python-research-final:tests/mode_routing.py`.
 //! - [`boundary`]: the delivery-time insertion-boundary rules (leading
 //!   space, first-letter case), frozen in
 //!   `packages/contracts/insertion-boundary/`.
@@ -10,11 +10,11 @@
 //!   literal escape, rule conflicts), ported from the same file.
 //! - [`staging`]: the staged draft of one take (typed regions, immutable
 //!   raw attempts, proposals pinned to a revision), ported from
-//!   `tests/staging.py`.
+//!   `python-research-final:tests/staging.py`.
 //! - [`transforms`]: the deterministic step (spoken commands, snippets),
-//!   ported from `tests/spoken_commands.py` (#294).
+//!   ported from `python-research-final:tests/spoken_commands.py` (#294).
 //! - [`instructions`]: the trailing spoken instruction grammar, ported
-//!   from `tests/spoken_instructions.py`.
+//!   from `python-research-final:tests/spoken_instructions.py`.
 //! - [`providers`] + [`http`]: the model step behind one contract: S1-mini
 //!   on a local starling-serve, or any OpenAI-compatible chat endpoint.
 //! - [`pipeline`]: plan → request → run, one [`contract::TransformResult`]

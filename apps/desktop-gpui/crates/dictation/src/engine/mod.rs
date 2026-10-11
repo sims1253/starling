@@ -43,7 +43,7 @@ pub use sidecar::{HealthSnapshot, ReadyError, ReadyStage, Sidecar};
 /// The engine ABI this app speaks. It must match
 /// `STARLING_GGML_ABI_VERSION` in `cpp/include/starling_ggml.h` — the same
 /// lockstep contract the Python client pins in
-/// `src/starling/_ggml/_native.py`. A mismatched engine is never run; it
+/// `tools/starling_ggml.py`. A mismatched engine is never run; it
 /// is reported with an actionable message instead (#362).
 pub const EXPECTED_ENGINE_ABI: u32 = 10;
 
@@ -233,7 +233,7 @@ mod tests {
 
     /// The lockstep contract: `EXPECTED_ENGINE_ABI` must equal
     /// `STARLING_GGML_ABI_VERSION` in the C++ header, exactly like
-    /// `src/starling/_ggml/_native.py` pins it on the Python side. If this
+    /// `tools/starling_ggml.py` pins it on the Python side. If this
     /// fails, the app and the engine it bundles disagree about the native
     /// entry points and every bundled engine must be refused (#362).
     #[test]

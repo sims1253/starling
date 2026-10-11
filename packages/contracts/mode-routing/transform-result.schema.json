@@ -4,7 +4,7 @@
   "$comment": [
     "Starling transform result, v1 (#293). What a provider returned for one",
     "request. A result never changes a draft by itself: the draft judges it",
-    "as a proposal against its current revision (tests/staging.py), and the",
+    "as a proposal against its current revision (python-research-final:tests/staging.py), and the",
     "raw attempts are never touched by any status here.",
     "completed carries text (possibly empty: S1-mini returns nothing for a",
     "filler-only take) and no failure; failed/cancelled carry a typed",

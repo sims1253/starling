@@ -3,7 +3,7 @@ package dev.starling.mobile.engine
 /**
  * Rolling fixed-window state for on-device live transcription. Port of the
  * native server's ChunkStreamer (cpp/serve/stream_session.cpp, itself a
- * port of src/starling/stream_chunk.py), so on-device partials follow the
+ * port of python-research-final:src/starling/stream_chunk.py), so on-device partials follow the
  * same window geometry and word stitching as `WS /stream`:
  *
  * - every full [chunkSeconds] window past the finalized boundary is

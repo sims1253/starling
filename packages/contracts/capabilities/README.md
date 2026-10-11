@@ -2,7 +2,7 @@
 
 `capability.json` describes the current native `starling-serve` API. The
 schemas validate the descriptor and the request/response fixtures. Run
-`uv run --no-project --with pytest --with jsonschema pytest -q tests/test_capabilities_conformance.py`
+`uv run pytest -q tests/test_capabilities_conformance.py`
 to check that the routes, limits, fixtures, and live capability response agree.
 
 One model is resident per process. Batch transcription uses
@@ -44,7 +44,6 @@ models and show server limits.
 | Desktop (gpui, Rust) | `apps/desktop-gpui/crates/dictation/src/client.rs` and `apps/desktop-gpui/crates/app/src/live_stream.rs` |
 | Android | `apps/mobile/app/src/main/java/dev/starling/mobile/network/InferenceClient.kt` and `StreamClient.kt` |
 | iOS | `apps/ios/Sources/Core/StarlingClient.swift` |
-| Python backend | `backends/python/serve.py`, `src/starling/server.py` |
 
 The fixtures check static JSON and route definitions. Live behavior is covered
 by `backends/native/tests/test_openai_api.py` and `tests/test_native_serve.py`.

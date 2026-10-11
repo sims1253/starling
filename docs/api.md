@@ -60,8 +60,7 @@ The [OpenAPI document](../packages/contracts/openapi.json) records this subset.
 
 Configure the apps with the server root, such as `http://127.0.0.1:8181`, and
 use the model slug returned by `GET /v1/models`. Send mono PCM16 WAV at 16 kHz.
-The native server rejects other sample rates, while the Python server resamples
-them. The apps also use Starling's `WS /stream` for live dictation where supported.
+The server rejects other sample rates. The apps also use Starling's `WS /stream` for live dictation where supported.
 Read [native serving](native-serving.md) for queueing, cancellation, streaming,
 and model loading.
 

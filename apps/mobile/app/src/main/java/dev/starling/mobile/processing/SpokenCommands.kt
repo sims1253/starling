@@ -4,7 +4,7 @@ import org.json.JSONObject
 
 /**
  * Port of the deterministic processing step's spoken commands and mode
- * snippets (`tests/spoken_commands.py`, the semantics). The vocabulary is
+ * snippets (`python-research-final:tests/spoken_commands.py`, the semantics). The vocabulary is
  * contract data (`packages/contracts/mode-routing/spoken-commands.json`), so
  * every platform recognizes the same phrases. Offsets here are UTF-16 index
  * pairs; they never split a surrogate pair because the token boundaries are

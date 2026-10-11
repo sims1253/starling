@@ -1,6 +1,6 @@
 //! Replays the frozen routing corpus (`fixtures/routing.json` and
-//! `routing-variants.json`, which `tests/test_mode_routing.py` replays
-//! through the Python oracle) through the Rust port.
+//! `routing-variants.json`, which the original Python oracle replayed in
+//! `python-research-final:tests/test_mode_routing.py`) through the Rust port.
 
 use std::collections::HashMap;
 use std::path::PathBuf;

@@ -411,10 +411,8 @@ def test_rust_client_hardcoded_upload_cap_equals_descriptor_limit():
 def test_readme_documents_the_adoption_map():
     for anchor in (
         "apps/desktop-gpui/crates/dictation/src/client.rs",
-        "backends/python",
         "Desktop (gpui, Rust)",
         "Android",
         "iOS",
-        "Python backend",
     ):
         assert anchor in README, f"adoption map is missing {anchor!r}"

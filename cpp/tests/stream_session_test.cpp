@@ -2,7 +2,7 @@
 //
 // Verifies stitch_words, ChunkStreamer boundary advancement, and
 // StreamSession buffer management against expected behavior from the
-// Python reference (src/starling/stream_chunk.py).
+// Python reference (python-research-final:src/starling/stream_chunk.py).
 
 #include "serve/stream_pump.hpp"
 #include "serve/stream_session.hpp"
@@ -320,9 +320,10 @@ static void test_chunk_streamer_stable_prefix_never_changes() {
 }
 
 // ---- stitch parity fixture (issue #357) ------------------------------------
-// tests/fixtures/stream_stitch_cases.txt is replayed here and by
-// tests/test_stream_chunk.py; the native stitcher, loop suppression and
-// re-decode must give every expected line the Python port gives.
+// tests/fixtures/stream_stitch_cases.txt is replayed here (the Python
+// reference python-research-final:tests/test_stream_chunk.py replayed it too);
+// the native stitcher, loop suppression and re-decode must give every
+// expected line.
 namespace {
 struct FixtureCase {
     std::string op, name;

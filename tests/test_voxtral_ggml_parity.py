@@ -1,7 +1,7 @@
 """GPU-gated parity tests for the Voxtral ggml engine vs the golden reference.
 
 Module-level CUDA/golden skips, then compares engine transcripts vs golden/voxtral_reference.json (captured by
-scripts/make_voxtral_golden.py) on the short/medium/long fixtures.
+scripts/goldens/voxtral_golden.py) on the short/medium/long fixtures.
 
 Collects and skips cleanly on boxes without CUDA, the model, or goldens
 (this box: CPU-only, tiny GGUF only — everything below skips at import).
@@ -17,9 +17,9 @@ import sys
 import pytest
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_SRC = os.path.normpath(os.path.join(_HERE, "..", "src"))
-if os.path.isdir(_SRC) and _SRC not in sys.path:
-    sys.path.insert(0, _SRC)
+_TOOLS = os.path.normpath(os.path.join(_HERE, "..", "tools"))
+if _TOOLS not in sys.path:
+    sys.path.insert(0, _TOOLS)
 
 torch = pytest.importorskip("torch")
 if not torch.cuda.is_available():
@@ -31,7 +31,7 @@ FIXTURES = os.path.join(REPO_ROOT, "tests", "fixtures")
 
 if not os.path.exists(GOLDEN_PATH):
     pytest.skip(
-        f"golden {GOLDEN_PATH} missing; run scripts/make_voxtral_golden.py",
+        f"golden {GOLDEN_PATH} missing; run scripts/goldens/voxtral_golden.py",
         allow_module_level=True,
     )
 
@@ -43,7 +43,7 @@ def _load_golden():
 
 def _engine():
     """The in-process ggml voxtral engine (tiny GGUF on CPU-only boxes)."""
-    from starling._ggml._native import GgmlModel, VOXTRAL, available
+    from starling_ggml import VOXTRAL, GgmlModel, available
 
     if not available():
         pytest.skip("libstarling_ggml unavailable (build cpp/ first)")
@@ -90,6 +90,6 @@ def test_engine_transcript_matches_golden(engine, fixture):
     assert text == entry["text"], f"\ngot:  {text!r}\nwant: {entry['text']!r}"
 
 
-# Fast/slow/stock token-id parity is covered in test_voxtral_pipeline.py.
-# This module compares the native engine to that stock golden without keeping
-# extra Python model copies resident alongside the native weights and graphs.
+# This module compares the native engine to the stock golden
+# (scripts/goldens/voxtral_golden.py) without keeping a Python model copy
+# resident alongside the native weights and graphs.

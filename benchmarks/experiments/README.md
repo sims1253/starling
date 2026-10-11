@@ -1,10 +1,9 @@
 # Shared experiment records (issue #168)
 
 Make each claimed improvement reproducible and prevent invalid benchmark
-comparisons. This directory adds the missing layer ON TOP of the existing
-tools — SONAR stays the quality harness, `bench_all.py` stays the fixture
-benchmark — and contributes an **experiment record** plus the **comparison
-command** that decides whether a candidate may be called a win.
+comparisons. This directory contributes an **experiment record** plus the
+**comparison command** that decides whether a candidate may be called a win,
+on top of the measurement tools in `benchmarks/fast_engine/`.
 
 Stdlib only (the runner speaks HTTP through `urllib`): production server
 installations gain no Python dependency from this code.
@@ -64,8 +63,8 @@ calibrated noise, with a positive control for real wins).
 ## What the comparator rejects (hard errors, all listed)
 
 - different workload manifests (the corpus changed between arms),
-- different metric identities — SONAR WER vs quantization-driver WER vs
-  raw HTTP wall time are never averaged or compared,
+- different metric identities — WER from different scorers vs raw HTTP
+  wall time are never averaged or compared,
 - different normalizers, model/config claims, or runtime identities
   (hardware AND driver; cross-machine comparisons need an explicit
   `hardware_claim` in the spec),
@@ -101,11 +100,10 @@ diagnostics attached (see below).
   the repeat moves on; the server's whole process group is torn down when
   the repeat ends. More failures than `tolerated_failures` flip the run to
   `status=failed`, which the comparator turns into an unavailable verdict.
-- GPU work follows the SONAR serialization contract: all `STARLING_*` GPU
-  lock variables pass through to the server processes, so externally held
-  locks are honored, and concurrent experiment commands on one machine
-  serialize through an advisory lock (`STARLING_GPU_LOCK_DISABLE=1` opts
-  out).
+- GPU work is serialized: all `STARLING_*` GPU lock variables pass
+  through to the server processes, so externally held locks are honored,
+  and concurrent experiment commands on one machine serialize through an
+  advisory lock (`STARLING_GPU_LOCK_DISABLE=1` opts out).
 
 ## Files
 

@@ -16,7 +16,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT / "src"))
+sys.path.insert(0, str(ROOT / "tools"))
 
 
 def main() -> int:
@@ -39,8 +39,7 @@ def main() -> int:
     fixture = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(fixture)
 
-    from starling._ggml import GgmlModel, S1
-    from starling._ggml._native import _load_lib, backend_name
+    from starling_ggml import S1, GgmlModel, _load_lib, backend_name
     lib = _load_lib()
     flush = getattr(lib, "starling_ggml_imatrix_flush_pub", None) if lib else None
     if flush is None:

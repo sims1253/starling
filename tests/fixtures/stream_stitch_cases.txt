@@ -1,6 +1,7 @@
 # Streaming stitch parity cases (issue #357), replayed by
-# tests/test_stream_chunk.py (Python) and cpp/tests/stream_session_test.cpp
-# (native): both must produce every expected line exactly.
+# cpp/tests/stream_session_test.cpp (native), which must produce every expected
+# line exactly. The Python reference that replayed them too is
+# python-research-final:tests/test_stream_chunk.py.
 #
 # stitch <name>            stitch_words(committed, new) with max_overlap 24
 #   < committed words      (a bare "<" or ">" is an empty side)

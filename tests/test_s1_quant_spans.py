@@ -52,7 +52,7 @@ def test_corrected_amount_accepts_zero_cents_and_sentence_punctuation():
 
 
 def test_requested_library_must_match_loaded_fallback(tmp_path, monkeypatch):
-    from starling._ggml import _native
+    import starling_ggml as _native
 
     requested = tmp_path / "requested.so"
     fallback = tmp_path / "fallback.so"

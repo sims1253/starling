@@ -15,7 +15,7 @@
 //
 // Defaults match the baked GGUF metadata (scripts/convert_granite_gguf.py);
 // the loader overrides them from `granite.*` KV. Single source of truth:
-// src/starling/config.py + the HF config.json for granite-speech-4.1-2b.
+// python-research-final:src/starling/config.py + the HF config.json for granite-speech-4.1-2b.
 #pragma once
 
 #include <cstdint>

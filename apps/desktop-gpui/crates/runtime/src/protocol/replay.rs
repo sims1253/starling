@@ -1,4 +1,4 @@
-//! Trace replay — the executable oracle port (`tests/runtime_protocol.py`),
+//! Trace replay — the executable oracle port (`python-research-final:tests/runtime_protocol.py`),
 //! crate-visible so the conformance suite and the live actors share one set
 //! of transition semantics.
 //!
