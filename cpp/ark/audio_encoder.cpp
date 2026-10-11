@@ -15,9 +15,11 @@
 #include "runtime/graph_builder.hpp"
 #include "runtime/lru_cache.hpp"
 #include "lib/graph_helpers.hpp"
+#include "lib/host_conv.hpp"
 #include "ggml.h"
 #include "ggml-backend.h"
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -312,11 +314,12 @@ struct EncoderReplayEntry {
 
 // Host-side Whisper Conv1d (K=3, pad=1) + exact GELU, in f32. Done on the CPU
 // because ggml's conv im2col produces wrong values under CUDA-graph capture AND
-// in larger one-shot graphs in this ggml build. The conv is a tiny share of the
-// encoder cost (~1-2%), and the bf16 boundary (mel is bf16, the layer input is
-// bf16) is preserved by the f32->bf16 round at the end. `in` is [IC, L] bf16
-// (feat-major); weight is [OC, IC, K] (HF order); returns [OC, OL] f32.
-// im2col must match torch.nn.functional.conv1d bit-exactly.
+// in larger one-shot graphs in this ggml build. The bf16 boundary (mel is bf16,
+// the layer input is bf16) is preserved by the f32->bf16 round at the end.
+// `in` is [IC, L] bf16 (feat-major); weight is [OC, IC, K] (HF order); returns
+// [OC, OL] f32. im2col must match torch.nn.functional.conv1d bit-exactly: the
+// shared blocked kernel (lib/host_conv.hpp) keeps the scalar reference's f64
+// sequential accumulation bit for bit, threaded over the ggml thread count.
 std::vector<float> read_bf16_to_f32(const ModelLoader& ml, const char* name) {
     ggml_tensor* t = ml.tensor(name);
     if (!t) return {};
@@ -337,32 +340,16 @@ std::vector<float> host_conv1d_gelu(const ModelLoader& ml, const std::vector<ggm
                                     int stride) {
     std::vector<float> wf = read_bf16_to_f32(ml, (wname + ".weight").c_str());  // [OC, IC, K]
     std::vector<float> bf = read_bf16_to_f32(ml, (wname + ".bias").c_str());    // [OC]
-    const int64_t OC = bf.size(), K = 3, p = 1;
-    const int64_t OL = (L + 2 * p - K) / stride + 1;
-    // f32 input, zero-padded to [IC, L+2].
-    std::vector<float> x((size_t) IC * (L + 2 * p), 0.0f);
-    for (int64_t c = 0; c < IC; ++c)
-        for (int64_t t = 0; t < L; ++t)
-            x[(size_t)c * (L + 2 * p) + (t + p)] = ggml_bf16_to_fp32(in[(size_t)c * L + t]);
-    // Output in natural [OC, OL] C-order (oc-contiguous: element (oc,t) at
-    // oc*OL + t), matching the next conv's expected [IC, L] feat-major input.
-    std::vector<float> y((size_t) OC * OL, 0.0f);
-    for (int64_t oc = 0; oc < OC; ++oc) {
-        for (int64_t t = 0; t < OL; ++t) {
-            double acc = (double) bf[(size_t) oc];
-            for (int64_t c = 0; c < IC; ++c) {
-                for (int64_t k = 0; k < K; ++k) {
-                    int64_t src = t * stride + k;  // index into padded time
-                    acc += (double) wf[((size_t) oc * IC + c) * K + k] *
-                           (double) x[(size_t) c * (L + 2 * p) + src];
-                }
-            }
-            // exact GELU (erf). PyTorch approximate="none".
-            float v = (float) acc;
-            v = 0.5f * v * (1.0f + std::erf(v / (float) M_SQRT2));
-            y[(size_t) oc * OL + t] = v;
-        }
-    }
+    std::vector<float> y;  // [OC, OL] (oc-contiguous: element (oc,t) at oc*OL + t)
+    lib::host_conv1d_k3(wf.data(), bf.data(), (int64_t) bf.size(), IC, in.data(), L,
+                        /*pad_l=*/1, /*pad_r=*/1, stride, y, global_backend().n_threads(),
+                        [](float* row, int64_t n) {
+                            // exact GELU (erf). PyTorch approximate="none".
+                            for (int64_t i = 0; i < n; ++i) {
+                                const float v = row[i];
+                                row[i] = 0.5f * v * (1.0f + std::erf(v / (float) M_SQRT2));
+                            }
+                        });
     return y;  // [OC, OL] f32 (oc-contiguous), GELU applied
 }
 
@@ -401,9 +388,10 @@ bool encode_audio_and_adapt(const ArkModel& model, const MelFeatures& mel,
 
     // CPU + debug diagnostic path: one-shot conv (host) + layers + adapter.
     // Keeps the validated host_conv1d_gelu (byte-exact vs torch) for the CPU
-    // fallback where CUDA-graph capture is unavailable and the host scalar loop
-    // is the correct, portable path.
+    // fallback where CUDA-graph capture is unavailable; the blocked host kernel
+    // is the correct, portable path (STARLING_ARK_TIMING prints its share).
     if (!global_backend().is_gpu() || debug_enabled()) {
+        const auto t_conv = std::chrono::steady_clock::now();
         std::vector<float> c1 = host_conv1d_gelu(model.loader, mel.data, ec.num_mel_bins,
                                                  mel_T, "enc.conv1", /*stride=*/1);
         std::vector<ggml_bf16_t> c1_bf16(c1.size());
@@ -424,6 +412,7 @@ bool encode_audio_and_adapt(const ArkModel& model, const MelFeatures& mel,
         int64_t N = 0;
         std::vector<float> body_out, enc_out, conv_f32_host(conv_bf16.size());
         for (size_t i = 0; i < conv_bf16.size(); ++i) conv_f32_host[i] = ggml_bf16_to_fp32(conv_bf16[i]);
+        const auto t_body = std::chrono::steady_clock::now();
         const char* dump_enc = std::getenv("STARLING_ARK_DUMP_ENC");
         bool ok = run_graph([&](ggml_context* ctx) -> ggml_tensor* {
             int64_t cne[2] = {ec.d_model, T_enc};
@@ -434,6 +423,14 @@ bool encode_audio_and_adapt(const ArkModel& model, const MelFeatures& mel,
             return build_adapter(ctx, model, enc, T_enc, &N);
         }, body_out);
         if (!ok) { err = "ARK encoder graph execution failed"; return false; }
+        if (std::getenv("STARLING_ARK_TIMING")) {
+            const auto ms = [](auto a, auto b) {
+                return std::chrono::duration<double, std::milli>(b - a).count();
+            };
+            std::fprintf(stderr, "ARK_ENC host_conv=%.1fms layers+adapter=%.1fms mel_T=%lld\n",
+                         ms(t_conv, t_body), ms(t_body, std::chrono::steady_clock::now()),
+                         (long long) mel_T);
+        }
         if (dump_enc) {
             if (FILE* f = std::fopen(dump_enc, "wb")) {
                 std::fwrite(enc_out.data(), sizeof(float), enc_out.size(), f);

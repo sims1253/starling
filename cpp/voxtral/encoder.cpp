@@ -32,9 +32,11 @@
 #include "runtime/graph_builder.hpp"
 #include "runtime/lru_cache.hpp"
 #include "lib/graph_helpers.hpp"
+#include "lib/host_conv.hpp"
 #include "ggml.h"
 #include "ggml-backend.h"
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -69,36 +71,27 @@ bool force_replay() {
 // ---- host math ------------------------------------------------------------
 // Causal conv1d + exact GELU in f32 over a feat-major [IC, L] bf16 input with
 // an explicit LEFT pad (zeros prepended, never symmetric). Returns the
-// oc-contiguous [OC, OL] f32 output (element (oc,t) at oc*OL+t).
+// oc-contiguous [OC, OL] f32 output (element (oc,t) at oc*OL+t). The shared
+// blocked kernel (lib/host_conv.hpp) reproduces the scalar f64 sequential
+// accumulation bit for bit, threaded over the ggml thread count.
 std::vector<float> host_causal_conv1d_gelu(const ModelLoader& ml,
                                            const std::vector<ggml_bf16_t>& in,
                                            int64_t IC, int64_t L, int64_t left_pad,
                                            int64_t stride, const std::string& wname) {
     std::vector<float> wf = lib::read_f32(ml, (wname + ".weight").c_str());  // [OC, IC, K]
     std::vector<float> bf = lib::read_f32(ml, (wname + ".bias").c_str());    // [OC]
-    const int64_t OC = (int64_t) bf.size(), K = 3;
-    const int64_t OL = (L + left_pad - K) / stride + 1;
-    std::vector<float> x((size_t) IC * (L + left_pad), 0.0f);
-    for (int64_t c = 0; c < IC; ++c)
-        for (int64_t t = 0; t < L; ++t)
-            x[(size_t) c * (L + left_pad) + (t + left_pad)] =
-                ggml_bf16_to_fp32(in[(size_t) c * L + t]);
-    std::vector<float> y((size_t) OC * OL, 0.0f);
-    for (int64_t oc = 0; oc < OC; ++oc) {
-        for (int64_t t = 0; t < OL; ++t) {
-            double acc = (double) bf[(size_t) oc];
-            for (int64_t c = 0; c < IC; ++c)
-                for (int64_t k = 0; k < K; ++k)
-                    acc += (double) wf[((size_t) oc * IC + c) * K + k] *
-                           (double) x[(size_t) c * (L + left_pad) + t * stride + k];
-            float v = (float) acc;
-            // Stock stores the Conv1d output to bf16 before GELU, and the
-            // GELU output is a bf16 store as well.
-            v = ggml_bf16_to_fp32(ggml_fp32_to_bf16(v));
-            v = 0.5f * v * (1.0f + std::erf(v / (float) M_SQRT2));  // exact GELU
-            y[(size_t) oc * OL + t] = ggml_bf16_to_fp32(ggml_fp32_to_bf16(v));
-        }
-    }
+    std::vector<float> y;
+    lib::host_conv1d_k3(wf.data(), bf.data(), (int64_t) bf.size(), IC, in.data(), L,
+                        left_pad, /*pad_r=*/0, stride, y, global_backend().n_threads(),
+                        [](float* row, int64_t n) {
+                            for (int64_t i = 0; i < n; ++i) {
+                                // Stock stores the Conv1d output to bf16 before
+                                // GELU, and the GELU output is a bf16 store as well.
+                                float v = ggml_bf16_to_fp32(ggml_fp32_to_bf16(row[i]));
+                                v = 0.5f * v * (1.0f + std::erf(v / (float) M_SQRT2));  // exact GELU
+                                row[i] = ggml_bf16_to_fp32(ggml_fp32_to_bf16(v));
+                            }
+                        });
     return y;
 }
 
@@ -442,6 +435,7 @@ bool encode_audio_and_project(const VoxtralModel& model, const MelFeatures& mel,
 
     // ---- CPU host path: scalar convs, one-shot layers+projector graph -------
     if (!use_replay) {
+        const auto t_conv = std::chrono::steady_clock::now();
         std::vector<float> c1 = host_causal_conv1d_gelu(model.loader, mel.data, Pm,
                                                         mel_T, ec.conv_left_pad1,
                                                         1, "enc.conv1");
@@ -462,6 +456,7 @@ bool encode_audio_and_project(const VoxtralModel& model, const MelFeatures& mel,
             for (size_t i = 0; i < dbg->embedder->size(); ++i)
                 (*dbg->embedder)[i] = ggml_bf16_to_fp32(conv_bf16[i]);
         }
+        const auto t_body = std::chrono::steady_clock::now();
         int64_t N = 0;
         std::vector<float> body_out;
         if (dbg && dbg->layer_outs)
@@ -489,6 +484,14 @@ bool encode_audio_and_project(const VoxtralModel& model, const MelFeatures& mel,
             return build_projector(ctx, model, enc, T_enc, &N);
         }, body_out);
         if (!ok) { err = "VOXTRAL encoder graph execution failed"; return false; }
+        if (std::getenv("STARLING_VOXTRAL_TIMING")) {
+            const auto ms = [](auto a, auto b) {
+                return std::chrono::duration<double, std::milli>(b - a).count();
+            };
+            std::fprintf(stderr, "VOXTRAL_ENC host_conv=%.1fms layers+projector=%.1fms mel_T=%lld\n",
+                         ms(t_conv, t_body), ms(t_body, std::chrono::steady_clock::now()),
+                         (long long) mel_T);
+        }
         out.data = std::move(body_out);
         out.n_tokens = N;
         out.width = pc.output_size;
