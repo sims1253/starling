@@ -9,7 +9,7 @@ Every push to `master` starts a build, including merges and direct commits.
 A successful build publishes all nine packages together. A failed build leaves
 the previous downloads available. Builds can finish out of order, so compare
 build numbers when choosing the newest one. Stable releases keep GitHub's
-**Latest** designation. Experimental releases do not update the npm package.
+**Latest** designation.
 
 ## Choose your downloads
 

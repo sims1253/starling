@@ -4,29 +4,30 @@
 `libstarling_ggml` and does not require Python, PyTorch, Transformers, or Triton.
 GPU builds still need the platform's driver and runtime libraries.
 
-Start with [build](#build) and [usage](#usage), [install with npm](#install-with-npm)
-for the prebuilt path, or see [release artifacts](#release-artifacts) for
-binary prerequisites. The [API contract](#api-contract) covers differences
-from `starling.server`.
+Start with [build](#build) and [usage](#usage), [install a prebuilt
+binary](#install-a-prebuilt-binary) to skip the compiler, or see [release
+artifacts](#release-artifacts) for binary prerequisites. The [API
+contract](#api-contract) covers differences from `starling.server`.
 
-## Install with npm
+## Install a prebuilt binary
 
-The `starling-serve` npm package ([packages/serve](../packages/serve/)) is a
-launcher: it picks the release artifact for your platform and backend,
-downloads it from GitHub Releases on first run, verifies both checksum layers,
-caches it, and execs it with the arguments you pass. No compiler or GPU
-required, and no postinstall script — see [packaging](packaging.md) for why.
+Each release on [GitHub releases](https://github.com/sims1253/starling/releases)
+attaches `starling-serve-<platform>-<backend>` archives (`.tar.gz` on Linux and
+macOS, `.zip` on Windows) plus a consolidated `SHA256SUMS.txt`; every
+experimental master build attaches the Linux and Windows CPU, Vulkan, and CUDA
+subset. No compiler or GPU required. For the Linux CPU build:
 
 ```bash
-npx starling-serve --model parakeet --gguf model.gguf --port 8181
-pnpm dlx starling-serve --model parakeet --gguf model.gguf --port 8181
+sha256sum -c --ignore-missing SHA256SUMS.txt   # archive against the release
+tar xzf starling-serve-linux-cpu.tar.gz
+sha256sum -c starling-serve-linux-cpu.sha256   # executable against the archive
+./starling-serve-linux-cpu --model parakeet --gguf model.gguf --port 8181
 ```
 
-The launcher defaults to `metal` on Apple Silicon, `vulkan` on Linux when the
-Vulkan loader is present (`cpu` otherwise), and `cpu` on Windows. Force a
-backend with `--starling-backend cuda` or `STARLING_SERVE_BACKEND=cuda`. The
-full matrix, cache layout, and environment overrides are documented in
-[packaging](packaging.md).
+Pick `cpu` when no GPU is available, `cuda` for NVIDIA, `rocm` for AMD on
+Linux, `vulkan` for AMD/Intel (or as a cross-vendor fallback), and `metal` on
+Apple Silicon. Each archive's `RUNTIME.md` lists the drivers and runtime
+libraries that build needs; [packaging](packaging.md) has the full matrix.
 
 ## Build
 

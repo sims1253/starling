@@ -98,7 +98,6 @@ if you see the banner.
   binding always works.
 - IME support in the settings text fields is minimal (single-line, no marked
   text composition).
-- The Electron numbers should be re-measured with the real renderer loaded
-  (`pnpm install && pnpm run desktop` with `STARLING_DIAGNOSTICS=1`) for a
-  fully apples-to-apples chart; the gap shown here only grows with the
+- The Electron numbers were never re-measured with the real renderer loaded
+  before the Electron app was removed; the gap shown here only grows with the
   renderer's real content.

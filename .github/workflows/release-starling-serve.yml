@@ -12,9 +12,8 @@
 #   starling-serve-macos-cpu           (Clang, CPU only, Apple Silicon)
 #
 # Each binary is stripped, packaged, checksummed, and uploaded to the GitHub
-# release. The npm package `starling-serve` (packages/serve) is the download
-# manager: it picks the right artifact for the detected platform + backend,
-# downloads it on first run, verifies both checksum layers, and execs it.
+# release with a consolidated SHA256SUMS.txt; docs/packaging.md tells users
+# how to pick, verify, and run an archive.
 
 name: Release starling-serve binaries
 
@@ -787,19 +786,17 @@ jobs:
 
             ### Usage
             ```bash
-            # One command via npm (downloads the right archive for this machine):
-            npx starling-serve --model parakeet --gguf model.gguf --port 8181
-
-            # Or with a manual download:
-            ./starling-serve --version
-            ./starling-serve --abi-version
-            ./starling-serve --model parakeet --gguf model.gguf --port 8181
+            sha256sum -c --ignore-missing SHA256SUMS.txt
+            tar xzf starling-serve-linux-cpu.tar.gz
+            sha256sum -c starling-serve-linux-cpu.sha256
+            ./starling-serve-linux-cpu --version
+            ./starling-serve-linux-cpu --model parakeet --gguf model.gguf --port 8181
             ```
+            Other archives work the same way; the executable inside is named
+            after the archive (`.exe` on Windows).
 
             ### Choosing an artifact
-            `npx starling-serve` picks for you (override with
-            `--starling-backend` or `STARLING_SERVE_BACKEND`). Manually: download
-            `linux-cpu` / `windows-cpu` / `macos-cpu` when no GPU is available,
+            Download `linux-cpu` / `windows-cpu` / `macos-cpu` when no GPU is available,
             `linux-cuda` or `windows-cuda` for NVIDIA, `linux-rocm` for AMD on
             Linux, `windows-vulkan` for AMD/Intel on Windows, and `macos-metal`
             for Apple Silicon. The Linux Vulkan build is also a cross-vendor

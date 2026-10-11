@@ -361,10 +361,6 @@ def test_descriptor_defaults_match_the_cpp_server():
 # 3. Adoption map (verified against the actual client code)
 # --------------------------------------------------------------------------- #
 
-CLIENT_TS_PATHS = [
-    REPO / "packages" / "dictation" / "src",
-]
-
 CLIENT_RS_PATHS = [
     REPO / "apps" / "desktop-gpui" / "crates",
 ]
@@ -372,10 +368,6 @@ CLIENT_RS_PATHS = [
 
 def _client_sources() -> list[Path]:
     sources: list[Path] = []
-    for root in CLIENT_TS_PATHS:
-        if root.is_dir():
-            sources.extend(root.rglob("*.ts"))
-            sources.extend(root.rglob("*.tsx"))
     for root in CLIENT_RS_PATHS:
         if root.is_dir():
             sources.extend(root.rglob("*.rs"))
@@ -384,7 +376,7 @@ def _client_sources() -> list[Path]:
 
 def test_no_client_consumes_the_capability_route_yet():
     """Today-state check behind the README adoption map: nothing in the client
-    sources (TypeScript dictation package, Rust gpui crates) fetches
+    sources (Rust gpui crates) fetches
     /v1/starling/capabilities. When a client is wired to the descriptor
     (README follow-ups), update the adoption map and this assertion together."""
     offenders = [
@@ -397,10 +389,6 @@ def test_no_client_consumes_the_capability_route_yet():
 
 def test_clients_probe_models_the_hardcoded_way():
     """Health probing uses /v1/models, not the capability descriptor."""
-    dictation_client = (REPO / "packages" / "dictation" / "src" / "client.ts").read_text()
-    assert "/v1/models" in dictation_client
-    assert '"/health"' not in dictation_client
-    assert '"/v1/audio/transcriptions"' in dictation_client
     rust_client = (
         REPO / "apps" / "desktop-gpui" / "crates" / "dictation" / "src" / "client.rs"
     ).read_text()
@@ -422,10 +410,8 @@ def test_rust_client_hardcoded_upload_cap_equals_descriptor_limit():
 
 def test_readme_documents_the_adoption_map():
     for anchor in (
-        "packages/dictation/src/client.ts",
         "apps/desktop-gpui/crates/dictation/src/client.rs",
         "backends/python",
-        "TypeScript client",
         "Desktop (gpui, Rust)",
         "Android",
         "iOS",

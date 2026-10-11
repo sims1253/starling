@@ -30,8 +30,8 @@ development builds; notarized installers are a separate release task.
 ## Layout
 
 - `crates/dictation` (`starling-dictation`) — logic + IO, no UI: WAV prep
-  (PCM16 16 kHz mono, byte-faithful port of `@starling/dictation`'s audio
-  module), the transcription HTTP client (the `/v1` batch API, mirrors
+  (PCM16 16 kHz mono, ported from the removed TypeScript `@starling/dictation`
+  audio module), the transcription HTTP client (the `/v1` batch API, mirrors
   the Electron native request path), a file-backed session store replacing
   IndexedDB (same manifest schema), settings persistence replacing
   `localStorage`, the fidelity analyzer, an FFT for the live waveform, cpal mic

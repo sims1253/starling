@@ -1,6 +1,6 @@
 //! Fidelity-sensitive transcript analysis.
 //!
-//! Faithful port of `packages/dictation/src/fidelity.ts`. The warnings flag
+//! Faithful port of the removed TypeScript `fidelity.ts`. The warnings flag
 //! spans worth preserving or reviewing; they never guess replacements. The
 //! exact warning message strings from the TS source are kept (tests assert
 //! them).
