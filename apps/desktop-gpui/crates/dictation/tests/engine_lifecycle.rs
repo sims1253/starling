@@ -47,7 +47,6 @@ fn no_model_then_download_activate_ready() {
         .expect("activating downloads, verifies, loads, warms");
     let active = snapshot.active.clone().expect("active engine");
     assert_eq!(active.model_id, "model-a");
-    assert!(active.owned);
     assert_eq!(install_of(&snapshot, "model-a"), InstallState::Installed);
 
     // The model file landed with its marker.
@@ -212,6 +211,4 @@ fn shutdown_leaves_no_child_processes() {
     if let Some(count) = count_engine_processes(engine_dir.to_str().unwrap()) {
         assert_eq!(count, 0, "no engine processes remain after shutdown");
     }
-    // The registry was ours and is released.
-    assert!(!state_dir.join("sidecar.json").exists());
 }

@@ -1,8 +1,7 @@
 //! `starling-runtime-host` — the E17 Mode B service host (increment I4).
 //!
-//! One process per user session owns the runtime: it acquires the
-//! storage-v2 lease (§4 ownership — the designed lease acquirer #257
-//! made possible), binds the OS-local authenticated endpoint, boots the
+//! One process per user session owns the runtime: it locks the
+//! storage-v2 data root, binds the OS-local authenticated endpoint, boots the
 //! [`starling_runtime::Runtime`] with storage v2 as THE capture store
 //! (D14), and serves any number of short-lived renderer clients.
 //! Renderers are projections: they send commands and receive events +
@@ -21,7 +20,7 @@
 //!   transport: UDS + `SO_PEERCRED`/`LOCAL_PEERCRED` on unix, a DACL'd
 //!   named pipe on Windows (compile-unverified there — see that module).
 //! - [`limits`] — per-connection size/rate budgets.
-//! - [`server`] — the ownership ladder (lease → endpoint → runtime),
+//! - [`server`] — the ownership ladder (data root → endpoint → runtime),
 //!   connection lifecycle, event fan-out, supervised shutdown.
 //! - [`engine`] — the supervised inference engine attached to the
 //!   runtime, following the desktop settings file while the host
@@ -75,7 +74,7 @@
 //! The GPUI app (`crates/app`) is a client: it starts this host from its
 //! own executable when none serves (`starling-gpui --runtime-host`),
 //! records every take through the capture machine and the take feed,
-//! and never opens a recorder, a journal or the store lease itself. The
+//! and never opens a recorder, a journal or the store itself. The
 //! host transcribes the takes it stores ([`transcribe`]): live text while
 //! a take records, the transcript once it is stored, retries the app asks
 //! for; the app renders them and delivers its own take's text, which

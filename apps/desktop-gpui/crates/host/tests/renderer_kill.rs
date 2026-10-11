@@ -3,9 +3,9 @@
 //! command in flight, mid-stream holding a live take, and during the
 //! host's own shutdown — and every kill costs exactly the projection:
 //! the connection slot returns (a crashlooping renderer never exhausts
-//! the cap), the endpoint stays unwedged, the lease is never orphaned (a
-//! killed **host** with a live renderer breaks no lease the successor
-//! cannot take), and acknowledged audio plus durable documents ride in
+//! the cap), the endpoint stays unwedged, the data root is never
+//! orphaned (a killed **host** with a live renderer leaves nothing the
+//! successor cannot take), and acknowledged audio plus durable documents ride in
 //! storage v2.
 //!
 //! The renderer is `renderer-double`, a real child process the suite
@@ -47,8 +47,8 @@ use fake_engine::{FakeEngine, Reply, StreamMode};
 const DOUBLE: &str = env!("CARGO_BIN_EXE_renderer-double");
 
 /// The real host binary — the host-death test kills this, not an
-/// in-process handle, so the lease's flock releases the way it only does
-/// at process death.
+/// in-process handle, so the data-root lock releases the way it only
+/// does at process death.
 const HOST_BIN: &str = env!("CARGO_BIN_EXE_starling-runtime-host");
 
 // --------------------------------------------------------------------- //
@@ -491,7 +491,7 @@ fn a_take_whose_renderer_never_returns_is_stored_and_transcribed_by_the_host() {
 /// A wedged renderer (the fill shape: snapshot flood, never reads, the
 /// host's writer parked mid-reply) is SIGKILLed **inside** the host's
 /// shutdown drain window. Shutdown must still complete in bounded time
-/// with the full teardown — machines joined, endpoint removed, lease
+/// with the full teardown — machines joined, endpoint removed, data root
 /// released (a successor owns the root immediately after).
 #[cfg(unix)] // the fill mode shrinks SO_RCVBUF
 #[test]
@@ -540,22 +540,22 @@ fn shutdown_completes_when_the_renderer_is_killed_mid_drain() {
 }
 
 // --------------------------------------------------------------------- //
-// The host's own death with a live renderer (no orphaned lease)
+// The host's own death with a live renderer (no orphaned root)
 // --------------------------------------------------------------------- /
 
 /// The ownership machinery exercised from the renderer side: the real
-/// host binary serves a renderer, is SIGKILLed (flock releases at
-/// process death), and the successor — here in-process, the same
+/// host binary serves a renderer, is SIGKILLed (the data-root lock
+/// releases at process death), and the successor — here in-process, the same
 /// `serve` the binary wraps — takes over the endpoint and serves the
-/// reconnected renderer. No lease is orphaned by the dying host, and
+/// reconnected renderer. The dying host orphans nothing, and
 /// the renderer's stale connection observably ends (it is owed nothing
 /// durable: documents it wrote live in storage v2).
 #[test]
-fn a_killed_host_with_a_live_renderer_leaves_no_orphan_lease_and_the_successor_serves() {
+fn a_killed_host_with_a_live_renderer_is_succeeded_and_the_successor_serves() {
     let root = tempfile::tempdir().unwrap();
     let runtime_dir = root.path().join("endpoints");
 
-    // The real binary, its own process, its own lease.
+    // The real binary, its own process, its own lock.
     let mut host_process = Reaped(
         ProcessCommand::new(HOST_BIN)
             // Never the user's real engine settings/dirs in a test.
@@ -601,7 +601,7 @@ fn a_killed_host_with_a_live_renderer_leaves_no_orphan_lease_and_the_successor_s
         Duration::from_secs(5),
     );
 
-    // Hard kill the host process — flock auto-released, stale socket
+    // Hard kill the host process — lock auto-released, stale socket
     // file left behind, the renderer's connection severed under it.
     host_process.kill().expect("SIGKILL the host process");
     let _ = host_process.wait();
@@ -618,7 +618,7 @@ fn a_killed_host_with_a_live_renderer_leaves_no_orphan_lease_and_the_successor_s
     }
     drop(renderer);
 
-    // The successor takes the broken lease and the dead endpoint, and
+    // The successor takes the freed root and the dead endpoint, and
     // the reconnected renderer reads its document back — hydrated from
     // storage v2, not from any process's memory.
     let mut successor_config = kill_config(

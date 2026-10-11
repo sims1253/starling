@@ -36,10 +36,10 @@
 //!   adopted at save time or is startup-scanned by the store's owner.
 //!
 //! RETENTION POLICY (frozen, R21): journal files are never deleted by any
-//! crash-recovery or read path. A `journals/deleted/` directory left behind
-//! by the deleted v1 store holds its tombstoned journals; the explicit
-//! retention sweep ([`crate::store_v2::StoreV2::sweep_retention`]) is the
-//! only thing that ever unlinks them.
+//! crash-recovery or read path. Recovery moves journals of stored or
+//! deleted takes into `journals/superseded/` and `journals/deleted/`; the
+//! explicit retention sweep ([`crate::store_v2::StoreV2::sweep_retention`])
+//! is the only thing that ever unlinks them.
 //!
 //! Deferred to I2/I3 (known gaps, by design of this increment): gap records
 //! inside the journal (ring-overflow gaps are flagged live via
@@ -697,9 +697,8 @@ pub fn verified_journal_hash(path: &Path) -> Result<String, JournalReadError> {
 /// to the end of its last checksum-valid verification point (boundary or
 /// trailer), append a trailer covering the verified samples, and fsync —
 /// leaving a finalized journal whose every byte is covered by the trailer's
-/// length + hash. The v1 recovery path never modifies journal files (they
-/// are source evidence for the v1 store); v2 calls this only on its own
-/// staging journals during reconciliation, where §4 specifies "truncate +
+/// length + hash. Called only on the store's own staging journals during
+/// reconciliation, where §4 specifies "truncate +
 /// gap flag" and the discarded tail is reported to the caller so the gap can
 /// be flagged on the resulting captures row. Idempotent: sealing an already
 /// sealed journal truncates nothing and rewrites an equivalent trailer.

@@ -3,7 +3,7 @@
 //! renderer-kill survival + reconnect, multi-client sequencing, and the
 //! slow-consumer posture (the runtime never stalls on one renderer).
 //!
-//! Every test boots the real host (`server::serve` — lease, endpoint,
+//! Every test boots the real host (`server::serve` — data root, endpoint,
 //! runtime, threads) and talks to it through the real socket with the
 //! real client library (or a raw socket where a transport violation has
 //! to be hand-crafted). Nothing here mocks the transport.
@@ -782,7 +782,7 @@ fn a_job_survives_its_submitting_clients_death() {
 /// A host that shuts down while a client sits on unread frames (its
 /// hello, the bye) leaves nothing bound: a successor on the same root
 /// serves at once. On Windows the closing host lingers so the client can
-/// read those frames — that linger must finish before the lease is
+/// read those frames — that linger must finish before the data root is
 /// released, or the old pipe instances keep the name and the successor's
 /// probe finds a "live" foreign server.
 #[test]
@@ -1336,22 +1336,15 @@ fn a_second_host_on_the_same_root_is_a_client_not_a_competitor() {
     let provider = FakeProvider::new(vec![]);
     let (mut host, client) = boot(ipc_config(root.path(), source, provider));
 
-    // Same data root: the lease must make this one a client. (The
-    // endpoint directory is per-config; ownership is the data root's, so
-    // a second serve on the same root refuses.)
+    // Same data root: the root lock refuses this one. (The endpoint
+    // directory is per-config; ownership is the data root's.)
     let source = FakeCaptureSource::new(vec![]);
     let provider = FakeProvider::new(vec![]);
     let second = serve(ipc_config(root.path(), source, provider));
     match second {
-        Err(HostError::OwnerLive { owner_id, .. }) => {
-            assert_eq!(
-                owner_id,
-                host.owner_id(),
-                "the live owner is the first host"
-            );
-        }
+        Err(HostError::OwnerLive { .. }) => {}
         Err(other) => panic!("expected OwnerLive, got {other}"),
-        Ok(_) => panic!("expected OwnerLive, a second host won the lease"),
+        Ok(_) => panic!("expected OwnerLive, a second host won the root"),
     }
     // Never two owners: the first host still serves.
     client
@@ -1490,7 +1483,7 @@ fn startup_reconcile_on_a_clean_root_reports_nothing() {
 /// (the runtime is idle — no further event arrives to evict the
 /// connection). Graceful shutdown must still complete: after the drain
 /// bound the host kills the socket, joins its threads, releases the
-/// lease and removes the endpoint. Before the bound this join hung
+/// data root and removes the endpoint. Before the bound this join hung
 /// forever on exactly this shape.
 #[cfg(unix)] // shrinks SO_RCVBUF / compares uids: unix-only levers
 #[test]

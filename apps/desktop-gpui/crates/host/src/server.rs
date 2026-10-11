@@ -1,23 +1,19 @@
 //! The service host (E17 I4, §1 Mode B): the one process per user
-//! session that owns the runtime, the storage-v2 lease, and the IPC
-//! endpoint.
+//! session that owns the runtime, the data root, and the IPC endpoint.
 //!
 //! Ownership ladder, in the order [`serve`] walks it — "never two
 //! owners" is the invariant every step protects:
 //!
-//! 1. **Lease** (§4): `StoreV2::acquire_lease` on the data root. A live
-//!    foreign owner answers [`HostError::OwnerLive`] and this process is
-//!    a client — it must not serve (the binary then reports the owner's
-//!    endpoint and exits 0). A dead owner's lease breaks via the lease
-//!    machinery (flock released at process death, heartbeat TTL
-//!    otherwise). With the lease held, the host runs
-//!    `StoreV2::reconcile` in owner mode: it is the recovering owner the
-//!    client-mode deferral names, so a crashed predecessor's staging
+//! 1. **Data root**: [`DataRootLock`] on the root. A live owner answers
+//!    [`HostError::OwnerLive`] and this process must not serve (the
+//!    binary then reports the owner's endpoint and exits 0); a dead
+//!    owner's lock was released by the OS. With the lock held, the host
+//!    runs `StoreV2::reconcile`, so a crashed predecessor's staging
 //!    journals and orphan sessions are salvaged at startup (the report is
 //!    logged and kept on the handle).
-//! 2. **Endpoint**: with the lease held, probe the endpoint. Live →
+//! 2. **Endpoint**: with the root held, probe the endpoint. Live →
 //!    [`HostError::ForeignServer`] (a server answering without holding
-//!    the lease is a contradiction; refuse rather than fight). Dead →
+//!    the root is a contradiction; refuse rather than fight). Dead →
 //!    remove the stale residue (a killed host's socket file) and bind.
 //! 3. **Runtime**: `Runtime::start` with the host's config — the
 //!    capture machine's store is the host's storage-v2 store, workers
@@ -41,9 +37,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use starling_dictation::store_v2::{
-    LeaseAcquisition, ReconciliationReport, StoreV2, LEASE_HEARTBEAT_TTL,
-};
+use starling_dictation::store_v2::{DataRootLock, ReconciliationReport, StoreV2};
 use starling_runtime::bus::EventSub;
 use starling_runtime::channel::{bounded, Receiver, Sender, TrySendError};
 use starling_runtime::machine::Rejection;
@@ -67,7 +61,7 @@ const BROKER_INBOX: usize = 64;
 /// before it kills the sockets outright. A well-behaved peer drains its
 /// bye near-instantly; a peer that stopped reading (a writer parked in
 /// `write_all` against a full kernel buffer) must not hold the whole
-/// host hostage — the runtime shutdown, the lease release, the endpoint
+/// host hostage — the runtime shutdown, the root release, the endpoint
 /// removal and the `stopped` line all wait behind this bound, never
 /// behind a peer.
 const SHUTDOWN_DRAIN: Duration = Duration::from_secs(2);
@@ -75,45 +69,25 @@ const SHUTDOWN_DRAIN: Duration = Duration::from_secs(2);
 /// Why a host could not start serving.
 #[derive(Debug, thiserror::Error)]
 pub enum HostError {
-    /// A live foreign owner holds the data-root lease: this process is a
-    /// client. `socket_path` is where that owner is (or should be)
-    /// serving — the launched-binary path reports this and exits 0.
-    #[error(
-        "a live owner (id {owner_id}, pid {owner_pid}) holds the data root; \
-         this process is a client — use the host at {socket_path}"
-    )]
-    OwnerLive {
-        owner_id: String,
-        owner_pid: u32,
-        socket_path: PathBuf,
-    },
-    /// A lease file exists that can be neither probed nor broken (it
-    /// will not open or parse, and no evidence proves its owner dead —
-    /// never break what cannot be proven dead): no ownership was taken,
-    /// rather than a second owner writing beside an unanswerable one
-    /// whose reconciles would defer forever. `unreadable` names each
-    /// lease file with its reason — repair (remove or fix the named
-    /// files) or investigate that owner, then retry.
-    #[error(
-        "a lease file that cannot be probed blocks ownership of {root:?} — \
-         never break what cannot be proven dead: {unreadable:?}; repair the \
-         named file(s) or investigate that owner, then retry"
-    )]
-    LeaseUnanswerable {
-        root: PathBuf,
-        unreadable: Vec<(String, String)>,
-    },
-    /// The endpoint probe answered while this host held the lease: a
+    /// A live owner holds the data root. `socket_path` is where that
+    /// owner is (or should be) serving — the launched-binary path reports
+    /// this and exits 0.
+    #[error("a live owner holds the data root; use the host at {socket_path}")]
+    OwnerLive { socket_path: PathBuf },
+    /// The endpoint probe answered while this host held the root: a
     /// server that serves without owning. Refuse.
-    #[error("a live server is already bound at {0:?} while this host holds the lease")]
+    #[error("a live server is already bound at {0:?} while this host holds the data root")]
     ForeignServer(PathBuf),
     #[error("storage v2 at {root:?} will not open: {source}")]
     StoreOpen {
         root: PathBuf,
         source: starling_dictation::store_v2::StoreV2Error,
     },
-    #[error("acquiring the runtime lease failed: {0}")]
-    Lease(String),
+    #[error("locking the data root {root:?} failed: {source}")]
+    RootLock {
+        root: PathBuf,
+        source: std::io::Error,
+    },
     #[error("probing the endpoint {0:?} failed: {1}")]
     Probe(PathBuf, String),
     #[error("binding the endpoint {path:?} failed: {source}")]
@@ -132,16 +106,17 @@ pub enum HostError {
 }
 
 /// The running host. [`HostHandle::shutdown`] stops everything in order
-/// (accept loop → connections → runtime → lease release → endpoint
+/// (accept loop → connections → runtime → root release → endpoint
 /// removal); dropping the handle does the same, so a test or launcher
-/// that lets it fall out of scope still leaves no lease or socket
+/// that lets it fall out of scope still leaves no lock or socket
 /// behind.
 pub struct HostHandle {
     socket_path: PathBuf,
     owner_id: String,
     shared: Arc<HostShared>,
     threads: Mutex<Vec<JoinHandle<()>>>,
-    lease: Arc<Mutex<StoreV2>>,
+    /// Held until shutdown has stopped everything that writes the root.
+    root_lock: Option<DataRootLock>,
     runtime: Option<Runtime>,
     /// The host's live engine attachment (builtin or manual mode): the
     /// switchable provider the jobs machine calls through and the
@@ -226,14 +201,15 @@ impl HostHandle {
     }
 
     /// Graceful shutdown: no client is served past its `bye`, machines
-    /// join, the lease is released, the endpoint is removed. Idempotent.
+    /// join, the data root is released, the endpoint is removed.
+    /// Idempotent.
     ///
     /// The connection drain is **bounded**: after [`SHUTDOWN_DRAIN`] the
     /// host kills any connection whose writer has not ended itself (a
     /// peer that stopped reading parks `write_all` against a full kernel
     /// buffer; the socket shutdown unblocks it on unix). The host process
     /// therefore always finishes shutdown — a wedged renderer costs its
-    /// own bye, never the lease release.
+    /// own bye, never the root release.
     pub fn shutdown(&mut self) {
         if self.done.swap(true, Ordering::SeqCst) {
             return;
@@ -315,12 +291,10 @@ impl HostHandle {
         }
         // Audio holds a full queue had released on threads of their own
         // are back in the store before anything lets go of it.
-        if let Some(history) = &self.shared.history {
-            history.join_releases();
-        }
+        self.shared.history.join_releases();
 
         // Connections are closed and the accept thread is down. Now stop
-        // the machines, then release the lease and the endpoint.
+        // the machines, then release the root and the endpoint.
         if let Some(runtime) = self.runtime.take() {
             runtime.shutdown();
         }
@@ -336,15 +310,11 @@ impl HostHandle {
         // successor never finds this host's instances still there.
         platform::finish_pending_closes();
         // The engine outlives every job the machines ran (the settings
-        // watcher is down with the threads above); stop it only now (a
-        // no-op for an engine another process owns — the attached case
-        // leaves that owner's sidecar running).
+        // watcher is down with the threads above); stop it only now.
         if let Some(engine) = self.engine.take() {
             engine.shutdown();
         }
-        if let Ok(mut lease) = self.lease.lock() {
-            let _ = lease.release_lease();
-        }
+        self.root_lock.take();
         #[cfg(unix)]
         {
             let _ = std::fs::remove_file(&self.socket_path);
@@ -421,11 +391,11 @@ pub struct HostShared {
     /// between the idle check and the commit, and none is taken on after.
     pub(crate) admission: std::sync::RwLock<()>,
     /// The app's history (#220), and the queue its requests wait in;
-    /// `None` when the history store would not open.
-    history: Option<Arc<crate::history::History>>,
-    store_jobs: Option<std::sync::mpsc::SyncSender<crate::history::StoreJob>>,
-    /// The lease-holding store: owner-side repairs run on it.
-    lease: Arc<Mutex<StoreV2>>,
+    history: Arc<crate::history::History>,
+    store_jobs: std::sync::mpsc::SyncSender<crate::history::StoreJob>,
+    /// The host's store handle (the history's too): startup recovery and
+    /// the stale-attempt sweep run on it.
+    store: Arc<Mutex<StoreV2>>,
     agent_allowlist: Allowlist,
     #[cfg(feature = "test-support")]
     insecure_test_app_role: bool,
@@ -563,7 +533,7 @@ impl ConnState {
 /// Boots the host per the ownership ladder (see the module docs).
 pub fn serve(config: HostConfig) -> Result<HostHandle, HostError> {
     // 0. The agent allowlist, before any ownership step: a file that
-    //    will not load leaves no lease or endpoint behind.
+    //    will not load leaves no lock or endpoint behind.
     let agent_allowlist = match &config.agent_allowlist {
         None => Allowlist::default(),
         Some(path) => Allowlist::load(path).map_err(|source| HostError::Allowlist {
@@ -571,74 +541,43 @@ pub fn serve(config: HostConfig) -> Result<HostHandle, HostError> {
             source,
         })?,
     };
-    // 1. The lease. The store instance holding it stays alive (and the
-    //    flock with it) for the host's lifetime; the capture machine's
-    //    own StoreV2 handle over the same root is a second SQLite
-    //    connection, which is the store's documented multi-process
-    //    shape — ownership lives here, persistence there.
-    let mut lease_store =
-        StoreV2::open(&config.data_root).map_err(|source| HostError::StoreOpen {
-            root: config.data_root.clone(),
-            source,
-        })?;
-    let owner_id = match lease_store.acquire_lease() {
-        Ok(LeaseAcquisition::Owner { owner_id, broke }) => {
-            if !broke.is_empty() {
-                eprintln!(
-                    "starling-runtime-host: broke stale leases {broke:?} on {}",
-                    config.data_root.display()
-                );
-            }
-            owner_id
-        }
-        Ok(LeaseAcquisition::Client { owner }) => {
+    // 1. The data root, then the host's store handle on it.
+    let root_lock = match DataRootLock::acquire(&config.data_root) {
+        Ok(Some(lock)) => lock,
+        Ok(None) => {
             return Err(HostError::OwnerLive {
-                owner_id: owner.owner_id,
-                owner_pid: owner.pid,
                 socket_path: config.socket_path(),
             })
         }
-        Ok(LeaseAcquisition::UnanswerableLeases { unreadable }) => {
-            // An unanswerable lease reads as an owner we must defer to
-            // (reconcile would, forever) — surface it instead of serving
-            // beside it: this host would be a second writer on a root
-            // whose recovery is already disabled.
-            return Err(HostError::LeaseUnanswerable {
+        Err(source) => {
+            return Err(HostError::RootLock {
                 root: config.data_root.clone(),
-                unreadable,
-            });
-        }
-        Err(source) => return Err(HostError::Lease(source.to_string())),
-    };
-    let lease = Arc::new(Mutex::new(lease_store));
-    let release_lease_now = |lease: &Arc<Mutex<StoreV2>>| {
-        if let Ok(mut store) = lease.lock() {
-            let _ = store.release_lease();
+                source,
+            })
         }
     };
+    let owner_id = format!(
+        "h_{:x}_{:x}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or_default()
+    );
+    let store = StoreV2::open(&config.data_root).map_err(|source| HostError::StoreOpen {
+        root: config.data_root.clone(),
+        source,
+    })?;
+    let store = Arc::new(Mutex::new(store));
 
-    // 1b. §4 recovery: this host is now the **recovering** owner. Client
-    //     mode defers staging salvage and orphan adoption to "the owner"
-    //     (store_v2's contract) — in Mode B that owner is exactly this
-    //     process, so reconcile runs here, before the first client can
-    //     connect, on the lease-holding store (the only handle whose
-    //     reconcile runs owner-mode: the runtime's own V2CaptureStore
-    //     sees our lease as a live foreign owner and correctly defers).
-    //     A crashed predecessor's interrupted takes are salvaged, and the
-    //     report is surfaced (logged here, held on the handle for
-    //     status). A reconcile that fails does not keep the host from
-    //     serving (#220: the app records through it): the failure is
-    //     surfaced to the app like the app surfaced it when it ran
-    //     recovery itself, and the rest of recovery still runs.
+    // 1b. §4 recovery, before the first client can connect: a crashed
+    //     predecessor's interrupted takes are salvaged, and the report is
+    //     surfaced (logged here, held on the handle for status). A
+    //     reconcile that fails does not keep the host from serving (#220:
+    //     the app records through it): the failure is surfaced to the
+    //     app, and the rest of recovery still runs.
     let mut reconcile_error = None;
-    let startup_reconciliation = match lease
-        .lock()
-        // Poison-tolerant like the registries: the only other locker
-        // (the heartbeat thread) panicking must not turn startup into a
-        // panic cascade; reconcile on intact-but-poisoned data reports
-        // its own errors through the Result.
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .reconcile()
+    let startup_reconciliation = match lock_registry(&store).reconcile()
     {
         Ok(report) => report,
         Err(source) => {
@@ -672,7 +611,7 @@ pub fn serve(config: HostConfig) -> Result<HostHandle, HostError> {
     //     through the take feed.
     let journals = config.runtime.capture.journals_dir.clone();
     let startup_recovery = crate::recovery::recover(
-        &mut lease.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
+        &mut lock_registry(&store),
         &journals,
         &startup_reconciliation,
         reconcile_error,
@@ -682,9 +621,6 @@ pub fn serve(config: HostConfig) -> Result<HostHandle, HostError> {
 
     // 2. The endpoint.
     if let Err(err) = platform::ensure_runtime_dir(&config.runtime_dir) {
-        // Every post-acquisition failure releases the lease before
-        // returning; this one is no exception.
-        release_lease_now(&lease);
         return Err(HostError::RuntimeDir(
             config.runtime_dir.clone(),
             err.to_string(),
@@ -693,15 +629,12 @@ pub fn serve(config: HostConfig) -> Result<HostHandle, HostError> {
     let socket_path = config.socket_path();
     match platform::probe(&socket_path) {
         Probe::Live => {
-            // We hold the lease but a server answers: refuse — and leave
-            // no lease behind on the way out.
-            release_lease_now(&lease);
+            // We hold the root but a server answers: refuse.
             return Err(HostError::ForeignServer(socket_path));
         }
         Probe::Dead => {
             #[cfg(unix)]
             platform::unix::remove_stale(&socket_path).map_err(|err| {
-                release_lease_now(&lease);
                 HostError::Bind {
                     path: socket_path.clone(),
                     source: err,
@@ -709,19 +642,16 @@ pub fn serve(config: HostConfig) -> Result<HostHandle, HostError> {
             })?;
         }
         Probe::Unknown(detail) => {
-            release_lease_now(&lease);
             return Err(HostError::Probe(socket_path, detail));
         }
     }
     let listener = platform::listen(&socket_path).map_err(|source| {
-        release_lease_now(&lease);
         HostError::Bind {
             path: socket_path.clone(),
             source,
         }
     })?;
     listener.set_nonblocking(true).map_err(|source| {
-        release_lease_now(&lease);
         HostError::Bind {
             path: socket_path.clone(),
             source,
@@ -729,9 +659,9 @@ pub fn serve(config: HostConfig) -> Result<HostHandle, HostError> {
     })?;
 
     // 3. The engine, then the runtime (the host owns worker lifetime
-    //    from here on). The engine starts only now — after the lease and
-    //    the endpoint are this process's — so a host that turns out to
-    //    be a client never spawns a sidecar.
+    //    from here on). The engine starts only now — after the root and
+    //    the endpoint are this process's — so a host that turns out not
+    //    to own the root never spawns a sidecar.
     let mut runtime_config = config
         .runtime
         .with_capture_observer(Arc::clone(&takes) as Arc<dyn starling_runtime::machine::capture::CaptureObserver>);
@@ -771,27 +701,12 @@ pub fn serve(config: HostConfig) -> Result<HostHandle, HostError> {
         }
     };
     // The app's history store (#220): its reads, writes and audio upkeep
-    // run here, on a handle of their own.
-    let history = match crate::history::Facade::open(&config.data_root) {
-        Ok(facade) => Some(Arc::new(crate::history::History::new(
-            facade,
-            config.max_frame_bytes,
-        ))),
-        Err(err) => {
-            eprintln!(
-                "starling-runtime-host: the history store would not open ({err}); the app's \
-                 history is unavailable until the next start"
-            );
-            None
-        }
-    };
-    let (store_jobs, store_queue) = match &history {
-        Some(_) => {
-            let (jobs, queue) = crate::history::store_queue();
-            (Some(jobs), Some(queue))
-        }
-        None => (None, None),
-    };
+    // run on the host's store handle.
+    let history = Arc::new(crate::history::History::new(
+        crate::history::Facade::shared(Arc::clone(&store)),
+        config.max_frame_bytes,
+    ));
+    let (store_jobs, store_queue) = crate::history::store_queue();
     let (runtime, client) = starling_runtime::Runtime::start(runtime_config);
     takes.attach(client.clone());
     let events = client.subscribe();
@@ -819,9 +734,9 @@ pub fn serve(config: HostConfig) -> Result<HostHandle, HostError> {
         retire: AtomicBool::new(false),
         ask_capturing: AtomicBool::new(false),
         admission: std::sync::RwLock::new(()),
-        history: history.clone(),
+        history: Arc::clone(&history),
         store_jobs,
-        lease: Arc::clone(&lease),
+        store: Arc::clone(&store),
         agent_allowlist,
         #[cfg(feature = "test-support")]
         insecure_test_app_role: config.insecure_test_app_role,
@@ -878,29 +793,24 @@ pub fn serve(config: HostConfig) -> Result<HostHandle, HostError> {
         let shared = Arc::clone(&shared);
         move || event_pump(shared, events)
     }));
-    threads.push(spawn("starling-host-lease", {
-        let lease = Arc::clone(&lease);
-        let shared = Arc::clone(&shared);
-        move || lease_heartbeat(lease, shared)
-    }));
     threads.push(spawn("starling-host-takes", {
         let takes = Arc::clone(&takes);
         let shared = Arc::clone(&shared);
         move || crate::takes::tick_loop(takes, shared)
     }));
     // The history store's workers and audio upkeep ride with the host's
-    // threads: shutdown joins them before the lease is released.
-    if let (Some(history), Some(queue)) = (&history, store_queue) {
+    // threads: shutdown joins them before the root is released.
+    {
         history.on_change({
             let takes = Arc::clone(&takes);
             move || takes.history_changed()
         });
-        threads.extend(crate::history::start_workers(Arc::clone(history), queue, {
+        threads.extend(crate::history::start_workers(Arc::clone(&history), store_queue, {
             let shared = Arc::clone(&shared);
             move || shared.shutdown.load(Ordering::SeqCst)
         }));
         threads.push(spawn("starling-host-upkeep", {
-            let history = Arc::clone(history);
+            let history = Arc::clone(&history);
             let shared = Arc::clone(&shared);
             let settings = config.settings_path.clone();
             let (first, interval) = (config.upkeep_first, config.upkeep_interval);
@@ -929,10 +839,10 @@ pub fn serve(config: HostConfig) -> Result<HostHandle, HostError> {
         }));
     }
     // The recheck rides with the host's threads too: shutdown joins it
-    // before the lease is released, so it never touches a store a
+    // before the root is released, so it never touches a store a
     // successor owns.
     threads.extend(crate::recovery::recheck_later(
-        Arc::clone(&lease),
+        Arc::clone(&store),
         journals,
         startup_recovery.recheck,
         {
@@ -979,7 +889,7 @@ pub fn serve(config: HostConfig) -> Result<HostHandle, HostError> {
         owner_id,
         shared,
         threads: Mutex::new(threads),
-        lease,
+        root_lock: Some(root_lock),
         runtime: Some(runtime),
         engine,
         watch_stop,
@@ -1109,8 +1019,7 @@ fn capture_active(client: &RuntimeClient) -> bool {
 /// Locks one of the host's registry mutexes, tolerating poison: a
 /// connection thread that panicked leaves the data intact (worst case
 /// stale), and aborting every remaining client's session over bookkeeping
-/// is the wrong trade. The lease mutex keeps `expect` — its invariants
-/// are ownership-critical, not bookkeeping.
+/// is the wrong trade.
 pub(crate) fn lock_registry<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
@@ -1596,14 +1505,11 @@ fn connection_reader(
                             terminate(&state, TransportErrorCode::VersionMismatch, detail);
                             break;
                         }
-                        // An app (re)connected: attempts a dead app left
-                        // "started" are failed now, ready to retry — a
-                        // live app's attempts are protected by their
-                        // markers (#213). Startup ran the same repair.
-                        if let Err(err) = shared
-                            .lease
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        // An app (re)connected: attempts no handle holds
+                        // any more (a settle that could not be written)
+                        // are failed now, ready to retry. Startup ran the
+                        // same repair.
+                        if let Err(err) = lock_registry(&shared.store)
                             .interrupt_stale_attempts(crate::recovery::STALE_ATTEMPT_NOTE)
                         {
                             eprintln!(
@@ -1708,54 +1614,40 @@ fn connection_reader(
                     Frame::Store {
                         req,
                         request: request @ crate::history::StoreRequest::Discard { .. },
-                    } if shared.history.is_some() => {
-                        let reply = shared
-                            .history
-                            .as_ref()
-                            .expect("checked")
-                            .handle(&*state, request);
+                    } => {
+                        let reply = shared.history.handle(&*state, request);
                         if state.try_deliver(Frame::Stored { req, reply }).is_err() {
                             state.close();
                             break;
                         }
                     }
                     Frame::Store { req, request } => {
-                        let refused = match &shared.store_jobs {
-                            Some(jobs) => crate::history::submit(
-                                jobs,
-                                crate::history::StoreJob {
-                                    conn: Arc::clone(&state),
-                                    req,
-                                    request,
-                                },
-                            )
-                            .err()
-                            .and_then(|job| match (&job.request, &shared.history) {
-                                (
-                                    crate::history::StoreRequest::ReleaseHold { hold },
-                                    Some(history),
-                                ) => {
-                                    history.release_later(&*state, hold);
-                                    let reply = crate::history::StoreReply::Done {
-                                        value: serde_json::Value::Null,
-                                    };
-                                    let req = job.req;
-                                    if state.try_deliver(Frame::Stored { req, reply }).is_err() {
-                                        state.close();
-                                    }
-                                    None
-                                }
-                                _ => Some((
-                                    job.req,
-                                    "Starling's recording service is busy; try again in a moment.",
-                                )),
-                            }),
-                            None => Some((
+                        let refused = crate::history::submit(
+                            &shared.store_jobs,
+                            crate::history::StoreJob {
+                                conn: Arc::clone(&state),
                                 req,
-                                "Starling's history store did not open in the recording service; \
-                                 see its log.",
+                                request,
+                            },
+                        )
+                        .err()
+                        .and_then(|job| match &job.request {
+                            crate::history::StoreRequest::ReleaseHold { hold } => {
+                                shared.history.release_later(&*state, hold);
+                                let reply = crate::history::StoreReply::Done {
+                                    value: serde_json::Value::Null,
+                                };
+                                let req = job.req;
+                                if state.try_deliver(Frame::Stored { req, reply }).is_err() {
+                                    state.close();
+                                }
+                                None
+                            }
+                            _ => Some((
+                                job.req,
+                                "Starling's recording service is busy; try again in a moment.",
                             )),
-                        };
+                        });
                         if let Some((req, message)) = refused {
                             let reply = crate::history::StoreReply::Failed {
                                 failure: crate::history::StoreFailure {
@@ -1917,9 +1809,7 @@ impl UnregisterOnDrop<'_> {
             self.shared.live_connections.fetch_sub(1, Ordering::SeqCst);
             // What the store kept for it (answers, uploads, audio holds)
             // goes with it.
-            if let Some(history) = &self.shared.history {
-                history.caller_gone(&**self.state);
-            }
+            self.shared.history.caller_gone(&**self.state);
             // The broker cancels any ask this connection asked or
             // acked; it must not be dropped on a full inbox.
             let _ = self.shared.broker.send_blocking(BrokerMsg::ConnGone {
@@ -2180,30 +2070,6 @@ fn event_pump(shared: Arc<HostShared>, events: EventSub) {
             }
             Err(starling_runtime::channel::RecvError::Timeout) => continue,
             Err(starling_runtime::channel::RecvError::Closed) => break,
-        }
-    }
-}
-
-/// Renews the storage-v2 lease heartbeat at TTL/3 — the designed cadence
-/// (a 30 s [`LEASE_HEARTBEAT_TTL`] renews every ~10 s, so a successor
-/// needs three missed beats before it may break the lease). The flock on
-/// the identity file is the ownership signal the OS maintains by itself;
-/// the heartbeat is the fallback for flock-less hosts, so a renewal
-/// failure is logged and outlived, never fatal here. The cadence is
-/// sliced into poll-sized sleeps so shutdown stays prompt.
-fn lease_heartbeat(lease: Arc<Mutex<StoreV2>>, shared: Arc<HostShared>) {
-    loop {
-        let next_beat = Instant::now() + LEASE_HEARTBEAT_TTL / 3;
-        while Instant::now() < next_beat {
-            std::thread::sleep(POLL);
-            if shared.shutdown.load(Ordering::SeqCst) {
-                return;
-            }
-        }
-        if let Ok(mut store) = lease.lock() {
-            if let Err(err) = store.heartbeat_lease() {
-                eprintln!("starling-runtime-host: lease heartbeat failed: {err}");
-            }
         }
     }
 }

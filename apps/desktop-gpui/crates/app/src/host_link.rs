@@ -579,7 +579,7 @@ fn link_loop(
 fn host_exited(pid: u32) -> bool {
     let until = Instant::now() + Duration::from_secs(1);
     loop {
-        if !starling_dictation::engine::registry::process_alive(pid) {
+        if !starling_dictation::process::process_alive(pid) {
             return true;
         }
         if Instant::now() >= until {
@@ -750,7 +750,7 @@ const RETIRE_TIMEOUT: Duration = Duration::from_secs(30);
 /// a new start) does not wait out an older host's shutdown.
 fn host_stopped(info: &starling_runtime_host::client::HostInfo, cancelled: &dyn Fn() -> bool) -> bool {
     let until = Instant::now() + RETIRE_TIMEOUT;
-    while starling_dictation::engine::registry::process_alive(info.pid) {
+    while starling_dictation::process::process_alive(info.pid) {
         if cancelled() || Instant::now() >= until {
             return false;
         }
@@ -869,8 +869,7 @@ fn launch_self(log: &Path) -> Result<(), String> {
     command
         .arg("--runtime-host")
         // The host transcribes the takes it stores, on the engine the
-        // settings choose: the bundled engine is shared with this app
-        // through the engine registry (one sidecar, whoever started it).
+        // settings choose.
         .arg("--exit-when-idle")
         .arg(HOST_IDLE_EXIT.as_secs().to_string());
     start_host(command, log)

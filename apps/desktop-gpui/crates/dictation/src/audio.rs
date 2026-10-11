@@ -1,8 +1,7 @@
 //! Dependency-free, deterministic PCM mixing, resampling, and canonical PCM16
-//! WAV encode/decode. Originally ported from the removed TypeScript
-//! `audio.ts`; this module and `test-fixtures/pcm-rounding.json` are now the
-//! authority. See `apps/desktop-gpui/PORT.md` ("Audio"). Error messages are
-//! kept verbatim from the TypeScript original.
+//! WAV encode/decode. This module and `test-fixtures/pcm-rounding.json` are
+//! the authority. Error messages are kept verbatim from the removed
+//! TypeScript original.
 
 /// Server-side capture format every upload is normalized to.
 pub const STARLING_SAMPLE_RATE: u32 = 16_000;

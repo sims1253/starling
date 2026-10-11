@@ -19,9 +19,10 @@ use serde_json::Value;
 use starling_dictation::storage::StorageError;
 use starling_dictation::store_v2::RetentionPolicy;
 
+#[cfg(test)]
+use super::StoreCall;
 use super::{
-    chunk_bytes, AudioFormat, AudioHold, Facade, StoreCall, StoreFailure, StoreReply,
-    StoreRequest,
+    chunk_bytes, AudioFormat, AudioHold, Facade, StoreFailure, StoreReply, StoreRequest,
 };
 use crate::frame::Frame;
 use crate::server::ConnState;
@@ -725,15 +726,18 @@ pub(crate) fn submit(jobs: &SyncSender<StoreJob>, job: StoreJob) -> Result<(), S
 
 /// The store service run in-process, as one caller: the same requests and
 /// answers as over the host's socket, without the socket.
-pub struct LocalHistory {
+#[cfg(test)]
+pub(crate) struct LocalHistory {
     history: History,
 }
 
+#[cfg(test)]
 impl LocalHistory {
     /// The service over the store at `root`.
     pub fn open(root: &std::path::Path) -> Result<LocalHistory, StorageError> {
-        let facade = Facade::open(root)
+        let store = starling_dictation::store_v2::StoreV2::open(root)
             .map_err(|err| StorageError::Invalid(format!("the store would not open: {err}")))?;
+        let facade = Facade::shared(std::sync::Arc::new(std::sync::Mutex::new(store)));
         Ok(LocalHistory {
             history: History::new(facade, crate::frame::DEFAULT_MAX_FRAME_BYTES),
         })
@@ -744,8 +748,10 @@ impl LocalHistory {
     }
 }
 
+#[cfg(test)]
 struct Local;
 
+#[cfg(test)]
 impl Caller for Local {
     fn key(&self) -> usize {
         0
@@ -756,6 +762,7 @@ impl Caller for Local {
     }
 }
 
+#[cfg(test)]
 impl StoreCall for LocalHistory {
     fn call(&self, request: StoreRequest) -> Result<StoreReply, StorageError> {
         // Through the wire form, as the socket would carry it.

@@ -6,14 +6,14 @@
 //! Launch → serve until SIGINT/SIGTERM (Windows: console Ctrl+C/Break
 //! or close; at logoff/shutdown an interactive-session process is
 //! terminated by the OS — see `on_console_ctrl`) → graceful stop
-//! (`bye` to clients, machines join, the supervised engine stops, lease
-//! released, endpoint removed) → exit 0.
+//! (`bye` to clients, machines join, the supervised engine stops, data
+//! root released, endpoint removed) → exit 0.
 //!
 //! Exit contract for launchers (stdout is one JSON line each):
 //! - `{"status":"owner",…}` then `{"status":"stopped"}` — this process
 //!   was the host and served.
-//! - `{"status":"already-running","socket":…,"owner":…}` exit 0 — a live
-//!   owner holds the data-root lease; the launcher connects a client to
+//! - `{"status":"already-running","socket":…}` exit 0 — a live owner
+//!   holds the data root; the launcher connects a client to
 //!   `socket` instead of starting anything.
 //! - anything else: stderr explains, exit 1.
 //!
@@ -43,12 +43,12 @@ extern "C" fn on_signal(_signal: i32) {
 /// console close request the graceful stop. The handler runs on its own
 /// thread; for a close the OS ends the process as soon as the handler
 /// returns, so it waits (bounded, inside the OS's grace period) for the
-/// main loop to finish shutting down — lease released, engine stopped.
+/// main loop to finish shutting down — data root released, engine stopped.
 /// `CTRL_LOGOFF_EVENT`/`CTRL_SHUTDOWN_EVENT` reach only services (an
 /// interactive-session process is terminated before they are sent);
 /// their arms stay so a host run as a service stops gracefully too.
-/// Termination without the handshake is still safe: the lease lock
-/// (`LockFileEx`) and every pipe handle are kernel objects the OS
+/// Termination without the handshake is still safe: the data-root lock
+/// and every pipe handle are kernel objects the OS
 /// releases at process death, so ownership cannot be stranded — the
 /// successor's crash-recovery sweep handles the rest.
 #[cfg(windows)]
@@ -145,11 +145,11 @@ OPTIONS:
 /// after `--runtime-host`) and returns the process exit code; the caller
 /// exits with it.
 pub fn run(args: Vec<String>) -> i32 {
-    // Signals first, before any fallible startup step: store open, lease
-    // acquisition (with stale-lease breaking) and the endpoint probe can
-    // all take a while, and a SIGTERM in that window must set the flag
-    // this loop reads rather than hit the default disposition (which
-    // would kill the process with the lease held and the endpoint
+    // Signals first, before any fallible startup step: store open,
+    // recovery and the endpoint probe can all take a while, and a SIGTERM
+    // in that window must set the flag this loop reads rather than hit
+    // the default disposition (which would kill the process with the
+    // root held and the endpoint
     // half-prepared). The handler is one atomic store, so registering it
     // this early is safe.
     #[cfg(unix)]
@@ -157,7 +157,7 @@ pub fn run(args: Vec<String>) -> i32 {
         // SAFETY: `on_signal` only stores to a static atomic; `signal`
         // registers it. This is the standard no-dependency Ctrl-C path.
         // SIG_ERR would leave the default disposition in place — the
-        // exact abrupt-SIGTERM-with-lease-held death the early
+        // exact abrupt-SIGTERM-with-root-held death the early
         // registration exists to prevent — so it is checked, not
         // ignored.
         if libc::signal(libc::SIGINT, on_signal as *const () as libc::sighandler_t)
@@ -255,7 +255,7 @@ pub fn run(args: Vec<String>) -> i32 {
         // must not cost a second launch its ownership answer: serve
         // without a built-in engine and say so (the app shows why, and
         // the user can still pick their own server), rather than exit
-        // before the lease ladder ran.
+        // before the ownership ladder ran.
         let choice = EngineChoice::from_settings(&settings);
         if let EngineChoice::Unavailable { reason } = &choice {
             eprintln!("starling-runtime-host: {reason}; the built-in engine cannot run");
@@ -278,18 +278,12 @@ pub fn run(args: Vec<String>) -> i32 {
             };
             match serve(config) {
                 Ok(host) => host,
-                Err(crate::HostError::OwnerLive {
-                    owner_id,
-                    owner_pid,
-                    socket_path,
-                }) => {
+                Err(crate::HostError::OwnerLive { socket_path }) => {
                     println!(
                         "{}",
                         serde_json::json!({
                             "status": "already-running",
                             "socket": socket_path,
-                            "owner": owner_id,
-                            "ownerPid": owner_pid,
                         })
                     );
                     return 0;

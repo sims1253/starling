@@ -287,18 +287,16 @@ fn lock_v2(handle: &Arc<Mutex<StoreV2>>) -> MutexGuard<'_, StoreV2> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// The host's history store: one shared v2 handle behind the app's
-/// daily-use operations and the audio upkeep. A second SQLite connection
-/// beside the lease's and the capture machine's (the store's documented
-/// multi-process shape); the in-memory read pins ([`Facade::pin_audio`])
-/// keep audio from this handle's own upkeep.
+/// The host's history store: the host's v2 handle behind the app's
+/// daily-use operations and the audio upkeep. The in-memory read pins
+/// ([`Facade::pin_audio`]) keep audio from this handle's own upkeep.
 #[derive(Clone)]
 pub struct Facade(Arc<Mutex<StoreV2>>);
 
 impl Facade {
-    /// The store at `root`.
-    pub fn open(root: &std::path::Path) -> Result<Facade, StoreV2Error> {
-        Ok(Facade(Arc::new(Mutex::new(StoreV2::open(root)?))))
+    /// Over a handle the host shares.
+    pub fn shared(store: Arc<Mutex<StoreV2>>) -> Facade {
+        Facade(store)
     }
 
     /// The store's root directory.

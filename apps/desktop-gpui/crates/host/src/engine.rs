@@ -36,9 +36,8 @@
 //!   the change yet) must not drag the engine back.
 //!
 //! [`EngineHost::transition`] carries a choice over: `activate` for a
-//! new model, a backend reload for a changed CPU/automatic override (the
-//! engine manager declines it for an engine another process owns rather
-//! than start a second sidecar beside it), a fresh manual provider for an
+//! new model, a backend reload for a changed CPU/automatic override, a
+//! fresh manual provider for an
 //! endpoint/model change, a started supervisor for manual→builtin, and a
 //! stopped engine for builtin→manual. An in-flight recognition runs on
 //! the provider (and, through it, the engine lease) it started with: the
@@ -70,11 +69,9 @@ pub const DEFAULT_READY_WAIT: Duration = Duration::from_secs(120);
 const READY_POLL: Duration = Duration::from_millis(50);
 
 /// How long the avoid-wait backs off between probes: while the only
-/// ready engine is the one a request just failed against, re-leasing
-/// every `READY_POLL` would churn lease-marker file I/O on an engine
-/// this job will not use — poll it gently instead while the
-/// supervisor's own detection (its ~2 s attach poll and restart
-/// backoff) replaces or reaps it.
+/// ready engine is the one a request just failed against, poll it
+/// gently while the supervisor's crash detection and restart backoff
+/// replace it.
 const AVOID_POLL: Duration = Duration::from_millis(250);
 
 /// How often the settings watcher polls the file: one small read, so
@@ -793,11 +790,8 @@ impl EngineHost {
                     ..
                 } => {
                     if fields.backend && intent.backend_override != *backend_override {
-                        // Live: the app runs no engine of its own, so the
-                        // reload replaces the engine this host owns (the
-                        // old one drains). One another process owns keeps
-                        // its backend — the manager will not start a
-                        // second sidecar beside it, and says so.
+                        // Live: the reload replaces the engine (the old
+                        // one drains).
                         manager.set_backend_override(intent.backend_override);
                         *backend_override = intent.backend_override;
                         self.bump();
@@ -1039,9 +1033,8 @@ impl EngineHost {
         self.closing.store(true, Ordering::SeqCst);
     }
 
-    /// Stops the engine this host supervises (a no-op in manual mode,
-    /// or for an engine another process owns — the attached case leaves
-    /// that owner's sidecar running). The host calls this on its
+    /// Stops the engine this host supervises (a no-op in manual mode).
+    /// The host calls this on its
     /// shutdown path, after the settings watcher stopped and the
     /// runtime's machines joined.
     pub fn shutdown(&self) {
@@ -1611,10 +1604,8 @@ impl TranscriptionProvider for EngineProvider {
                     }
                 }
                 // The engine went away under the request: its process
-                // died (a crash, or — when this host attached to a sidecar
-                // the desktop app started — the app being killed, which
-                // takes that sidecar with it). The supervisor restarts or
-                // takes the engine over; this job retries **once** on the
+                // died. The supervisor restarts it; this job retries
+                // **once** on the
                 // replacement, so the engine's death costs the job a
                 // delay, not its result. Recognition is idempotent (same
                 // audio, a new request), and one retry bounds the cost of

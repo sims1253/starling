@@ -38,8 +38,8 @@ pub struct StartupRecovery {
     pub recheck: Vec<String>,
 }
 
-/// The startup pass on the lease-holding store: `reconciliation` is the
-/// owner reconcile [`crate::serve`] already ran (`reconcile_error` when it
+/// The startup pass on the host's store: `reconciliation` is the
+/// reconcile [`crate::serve`] already ran (`reconcile_error` when it
 /// failed). The repairs are independent, so all run whatever the others
 /// did.
 pub fn recover(
@@ -113,7 +113,7 @@ pub const RECHECK_AFTER: Duration = Duration::from_secs(2);
 /// findings and the recovered takes' ids to `report`; `None` when there
 /// is nothing to look at (or no thread). The thread gives up as soon as `stopping` says the host is
 /// shutting down, and never starts the scan after that: its caller joins
-/// it before releasing the lease.
+/// it before releasing the data root.
 pub fn recheck_later(
     store: Arc<Mutex<StoreV2>>,
     journals: PathBuf,

@@ -613,24 +613,6 @@ fn pipewire_socket(
         .map(|dir| dir.join(name))
 }
 
-/// The check as plain text (for copying into a bug report).
-pub(crate) fn report(lines: &[CheckLine]) -> String {
-    let mut text = String::new();
-    for line in lines {
-        let mark = match line.verdict {
-            Verdict::Ok => "ok",
-            Verdict::Limited => "limited",
-            Verdict::Missing => "missing",
-            Verdict::Info => "info",
-        };
-        text.push_str(&format!("[{mark}] {}: {}\n", line.topic, line.summary));
-        if let Some(fix) = &line.fix {
-            text.push_str(&format!("        fix: {fix}\n"));
-        }
-    }
-    text
-}
-
 /// Parse a `*.portal` file: whether it implements GlobalShortcuts and
 /// whether its `UseIn` names one of `desktops` (case-insensitive).
 pub(crate) fn parse_portal_file(name: &str, contents: &str, desktops: &[String]) -> PortalBackend {
@@ -1408,16 +1390,6 @@ mod tests {
     }
 
     #[test]
-    fn the_report_lists_every_line_with_its_fix() {
-        let mut facts = healthy_kde();
-        facts.audio = Some(Ok(AudioFacts::default()));
-        let text = report(&check(&facts, None));
-        assert_eq!(text.lines().filter(|line| line.starts_with('[')).count(), 7);
-        assert!(text.contains("[limited] Sound server: Neither PipeWire nor PulseAudio answers"));
-        assert!(text.contains("        fix: Start the sound server"));
-    }
-
-    #[test]
     fn portal_files_are_matched_to_the_current_desktop() {
         let kde = "[portal]\nDBusName=org.freedesktop.impl.portal.desktop.kde\n\
                    Interfaces=org.freedesktop.impl.portal.FileChooser;org.freedesktop.impl.portal.GlobalShortcuts;\n\
@@ -1438,7 +1410,7 @@ mod tests {
     fn live_check_of_this_session() {
         let started = std::time::Instant::now();
         let facts = gather();
-        eprintln!("{}", report(&check(&facts, None)));
+        eprintln!("{:#?}", check(&facts, None));
         eprintln!("gathered in {:?}", started.elapsed());
         assert!(started.elapsed() < PROBE_TIMEOUT * 2);
     }

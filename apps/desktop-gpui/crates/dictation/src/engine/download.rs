@@ -187,7 +187,7 @@ fn download_lock_is_stale(path: &Path) -> bool {
         .ok()
         .and_then(|text| text.trim().parse::<u32>().ok());
     match holder {
-        Some(pid) => !crate::engine::registry::process_alive(pid),
+        Some(pid) => !crate::process::process_alive(pid),
         None => fs::metadata(path)
             .and_then(|meta| meta.modified())
             .ok()

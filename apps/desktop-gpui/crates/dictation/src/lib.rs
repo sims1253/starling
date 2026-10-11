@@ -1,8 +1,5 @@
-//! Dictation core for the desktop app plus native capture/playback.
-//!
-//! Modules started as ports of the removed TypeScript `@starling/dictation`
-//! library and the Electron request path (`apps/desktop/electron/ipc.ts`);
-//! they are now the only implementation. See `apps/desktop-gpui/PORT.md`.
+//! Dictation logic and IO without UI: audio prep, the transcription
+//! client, storage v2, settings, the bundled engine, capture and playback.
 
 pub mod audio;
 pub mod client;
@@ -15,6 +12,7 @@ pub mod journal;
 pub mod microphone;
 pub mod playback;
 pub mod player;
+pub mod process;
 pub mod recorder;
 pub mod settings;
 pub mod storage;

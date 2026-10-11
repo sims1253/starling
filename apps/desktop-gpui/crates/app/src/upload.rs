@@ -898,7 +898,6 @@ mod tests {
                 model_id: model_id.to_string(),
                 endpoint: "http://127.0.0.1:1".to_string(),
                 pid: 1,
-                owned: true,
                 device: None,
             }),
             switch: None,
@@ -1130,7 +1129,11 @@ mod tests {
     }
 
     fn scratch(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("starling-356-{tag}-{}", std::process::id()));
+        // One root per call (a root has one owner, and tests share tags),
+        // short enough for the endpoint socket path beneath it.
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("st{}-{n}-{tag:.8}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("scratch");
         dir
@@ -1187,10 +1190,9 @@ mod tests {
         cx: &mut gpui::TestAppContext,
     ) {
         let root = scratch("faults");
-        let store = Store::at_test_root(&root);
+        let store = crate::store::TestStore::without_host(&root);
         let wav = one_second_wav();
         let id = store.save_capture(wav.clone()).expect("save").id;
-        let stored = store.audio_wav(&id).expect("load").expect("present");
         store.mark_attempt(&id, "engine:model-a").expect("begin");
         store
             .save_transcript(
@@ -1211,6 +1213,8 @@ mod tests {
             Reply::Text("second words"),
         ]);
         let mut host = host_at(&root, Vec::new(), std::time::Duration::from_secs(20), addr);
+        store.connect_to(&host);
+        let stored = store.audio_wav(&id).expect("load").expect("present");
         let fake = Arc::new(FakeBackend::new());
         fake.focus(FakeTarget::named("Editor", "notes.txt"));
         let inserter = Arc::new(Inserter::with_backends(vec![Box::new(fake.clone())]));
@@ -1354,7 +1358,7 @@ mod tests {
     fn idle_engine_app(
         cx: &mut gpui::TestAppContext,
         root: &std::path::Path,
-        store: &Store,
+        store: &crate::store::TestStore,
         id: &str,
     ) -> (starling_runtime_host::HostHandle, gpui::Entity<StarlingApp>) {
         let host_root = root.join("engine");
@@ -1377,9 +1381,10 @@ mod tests {
                 .with_engine(engine),
         )
         .expect("host serves");
+        store.connect_to(&host);
         let socket = host.socket_path().to_path_buf();
         let app = cx.new(|cx| {
-            let mut app = StarlingApp::for_test(Some(store.clone()), cx);
+            let mut app = StarlingApp::for_test(Some(Store::clone(store)), cx);
             app.apply_sessions(store.list().expect("list"));
             app.selected_id = Some(id.to_string());
             app.follow_host(socket, crate::host_link::Launch::Never, cx);
@@ -1405,7 +1410,7 @@ mod tests {
     ) {
         use starling_dictation::settings::EngineMode;
         let root = scratch("two-windows");
-        let store = Store::at_test_root(&root);
+        let store = crate::store::TestStore::without_host(&root);
         let id = store.save_capture(one_second_wav()).expect("save").id;
         let (mut host, first) = idle_engine_app(cx, &root, &store, &id);
         let socket = host.socket_path().to_path_buf();
@@ -1464,7 +1469,7 @@ mod tests {
     #[gpui::test]
     fn a_lost_host_connection_forgets_the_engine_it_reported(cx: &mut gpui::TestAppContext) {
         let root = scratch("engine-lost");
-        let store = Store::at_test_root(&root);
+        let store = crate::store::TestStore::without_host(&root);
         let id = store.save_capture(one_second_wav()).expect("save").id;
         let (mut host, app) = idle_engine_app(cx, &root, &store, &id);
         settle(cx, "the engine reported", |cx| {
@@ -1569,7 +1574,7 @@ mod tests {
         cx: &mut gpui::TestAppContext,
     ) {
         let root = scratch("srv-retry-pending");
-        let store = Store::at_test_root(&root);
+        let store = crate::store::TestStore::without_host(&root);
         let id = store.save_capture(one_second_wav()).expect("save").id;
         let (mut host, app) = idle_engine_app(cx, &root, &store, &id);
         app.update(cx, |app, _| app.endpoint = String::new());
@@ -1595,7 +1600,7 @@ mod tests {
     #[gpui::test]
     fn an_engine_change_cancels_a_retry_waiting_for_its_model(cx: &mut gpui::TestAppContext) {
         let root = scratch("engine-change");
-        let store = Store::at_test_root(&root);
+        let store = crate::store::TestStore::without_host(&root);
         let id = store.save_capture(one_second_wav()).expect("save").id;
         let (mut host, app) = idle_engine_app(cx, &root, &store, &id);
         app.update(cx, |app, cx| app.retry_selected_with(RetryWith::Model("model-b".to_string()), cx));
@@ -1773,9 +1778,10 @@ mod tests {
         cx: &mut gpui::TestAppContext,
     ) {
         let root = scratch("host-take");
-        let store = Store::at_test_root(&root);
+        let store = crate::store::TestStore::without_host(&root);
         let (server, served) = fake_server(vec![Reply::Text("hello from the host")]);
         let mut host = host_at(&root, vec![scripted_take()], std::time::Duration::from_secs(20), server);
+        store.connect_to(&host);
         let fake = Arc::new(FakeBackend::new());
         fake.focus(FakeTarget::named("Editor", "notes.txt"));
         let inserter = Arc::new(Inserter::with_backends(vec![Box::new(fake.clone())]));
@@ -1811,9 +1817,10 @@ mod tests {
         cx: &mut gpui::TestAppContext,
     ) {
         let root = scratch("host-adopt");
-        let store = Store::at_test_root(&root);
+        let store = crate::store::TestStore::without_host(&root);
         let (server, _) = fake_server(vec![Reply::Text("after the restart")]);
         let mut host = host_at(&root, vec![scripted_take()], std::time::Duration::from_secs(20), server);
+        store.connect_to(&host);
         // The window that started the take dies mid-take.
         {
             let gone = starling_runtime_host::client::HostClient::connect(host.socket_path())
@@ -1865,9 +1872,10 @@ mod tests {
         cx: &mut gpui::TestAppContext,
     ) {
         let root = scratch("host-orphan");
-        let store = Store::at_test_root(&root);
+        let store = crate::store::TestStore::without_host(&root);
         let (server, served) = fake_server(vec![Reply::Text("nobody was watching")]);
         let mut host = host_at(&root, vec![scripted_take()], std::time::Duration::from_millis(200), server);
+        store.connect_to(&host);
         {
             let gone = starling_runtime_host::client::HostClient::connect(host.socket_path())
                 .expect("connect");
@@ -1902,11 +1910,12 @@ mod tests {
         cx: &mut gpui::TestAppContext,
     ) {
         let root = scratch("host-two");
-        let store = Store::at_test_root(&root);
+        let store = crate::store::TestStore::without_host(&root);
         let (server, served) = fake_server(vec![Reply::Text("one window's words")]);
         let mut host = host_at(&root, vec![scripted_take()], std::time::Duration::from_secs(20), server);
+        store.connect_to(&host);
         let first = app_on_host(cx, &store, &host, server);
-        let second = app_on_host(cx, &Store::at_test_root(&root), &host, server);
+        let second = app_on_host(cx, &crate::store::TestStore::without_host(&root), &host, server);
         let typed = |app: &gpui::Entity<StarlingApp>, cx: &mut gpui::TestAppContext| {
             let fake = Arc::new(FakeBackend::new());
             fake.focus(FakeTarget::named("Editor", "notes.txt"));
@@ -1961,9 +1970,10 @@ mod tests {
         cx: &mut gpui::TestAppContext,
     ) {
         let root = scratch("host-adopt-race");
-        let store = Store::at_test_root(&root);
+        let store = crate::store::TestStore::without_host(&root);
         let (server, served) = fake_server(vec![Reply::Text("adopted once")]);
         let mut host = host_at(&root, vec![scripted_take()], std::time::Duration::from_secs(20), server);
+        store.connect_to(&host);
         {
             let gone = starling_runtime_host::client::HostClient::connect(host.socket_path())
                 .expect("connect");
@@ -1977,7 +1987,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(200));
         }
         let first = app_on_host(cx, &store, &host, server);
-        let second = app_on_host(cx, &Store::at_test_root(&root), &host, server);
+        let second = app_on_host(cx, &crate::store::TestStore::without_host(&root), &host, server);
         let holding = |cx: &mut gpui::TestAppContext| {
             [&first, &second]
                 .iter()
@@ -2010,9 +2020,10 @@ mod tests {
     #[gpui::test]
     fn history_imports_and_deletes_go_through_the_host(cx: &mut gpui::TestAppContext) {
         let root = scratch("host-history");
-        let fixtures = Store::at_test_root(&root);
+        let fixtures = crate::store::TestStore::without_host(&root);
         let (server, served) = fake_server(vec![Reply::Text("imported words")]);
         let mut host = host_at(&root, Vec::new(), std::time::Duration::from_secs(20), server);
+        fixtures.connect_to(&host);
         let app = app_on_host(cx, &fixtures, &host, server);
         app.update(cx, |app, cx| app.save_import(one_second_wav(), cx));
         settle(cx, "the import transcribed", |cx| {
@@ -2037,6 +2048,7 @@ mod tests {
         // A host restart: the history comes back with the connection.
         host.shutdown();
         let mut host = host_at(&root, Vec::new(), std::time::Duration::from_secs(20), server);
+        fixtures.connect_to(&host);
         settle(cx, "the reconnect", |cx| app.read_with(cx, |app, _| app.host.client.is_some()));
         app.update(cx, |app, _| app.sessions.clear());
         app.update(cx, |app, cx| app.refresh_history(cx));
@@ -2092,7 +2104,7 @@ mod tests {
         (app, fake)
     }
 
-    fn transcribed(store: &Store, text: &str) -> String {
+    fn transcribed(store: &crate::store::TestStore, text: &str) -> String {
         let id = store.save_capture(one_second_wav()).expect("save").id;
         store.mark_attempt(&id, "openai:fake-model").expect("attempt");
         store

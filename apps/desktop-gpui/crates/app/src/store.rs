@@ -33,21 +33,10 @@ pub(crate) struct SavedTake {
     pub(crate) id: String,
 }
 
-/// The store, through the host.
+/// The store, through the host: the connection the host link holds
+/// (none while it has none).
 #[derive(Clone)]
-pub(crate) struct Store(Arc<Backend>);
-
-enum Backend {
-    /// The connection the host link holds (none while it has none).
-    Host(Arc<Mutex<Option<Arc<HostClient>>>>),
-    /// The host's store service run in this process: the tests' fake
-    /// host, with the store under it for their fixtures.
-    #[cfg(test)]
-    Local {
-        service: starling_runtime_host::history::LocalHistory,
-        fixtures: Mutex<store_v2::StoreV2>,
-    },
-}
+pub(crate) struct Store(Arc<Mutex<Option<Arc<HostClient>>>>);
 
 fn unreachable() -> storage::StorageError {
     storage::StorageError::Io(std::io::Error::other(
@@ -59,7 +48,7 @@ impl Store {
     /// The store of the host `connection` reaches (the link's current
     /// connection).
     pub(crate) fn through(connection: Arc<Mutex<Option<Arc<HostClient>>>>) -> Store {
-        Store(Arc::new(Backend::Host(connection)))
+        Store(connection)
     }
 
     /// Runs `operation` on the host's store over one connection.
@@ -67,18 +56,9 @@ impl Store {
         &self,
         operation: impl FnOnce(&HistoryClient<&dyn starling_runtime_host::history::StoreCall>) -> Result<T, storage::StorageError>,
     ) -> Result<T, storage::StorageError> {
-        match &*self.0 {
-            Backend::Host(connection) => {
-                let client = connected(connection)?;
-                let call: &dyn starling_runtime_host::history::StoreCall = &*client;
-                operation(&HistoryClient(call))
-            }
-            #[cfg(test)]
-            Backend::Local { service, .. } => {
-                let call: &dyn starling_runtime_host::history::StoreCall = service;
-                operation(&HistoryClient(call))
-            }
-        }
+        let client = connected(&self.0)?;
+        let call: &dyn starling_runtime_host::history::StoreCall = &*client;
+        operation(&HistoryClient(call))
     }
 
     /// Every take, metadata only (G02): readable records as summaries,
@@ -219,24 +199,12 @@ impl Store {
     /// it for the connection that asked: a connection that ends releases
     /// it.
     pub(crate) fn hold_audio(&self, id: &str) -> Result<AudioHold, storage::StorageError> {
-        match &*self.0 {
-            Backend::Host(connection) => {
-                let client = connected(connection)?;
-                let token = HistoryClient(&*client).hold_audio(id)?;
-                Ok(AudioHold {
-                    token,
-                    on: HoldOn::Host(Arc::downgrade(&client)),
-                })
-            }
-            #[cfg(test)]
-            Backend::Local { service, .. } => {
-                let token = HistoryClient(service).hold_audio(id)?;
-                Ok(AudioHold {
-                    token,
-                    on: HoldOn::Local(self.clone()),
-                })
-            }
-        }
+        let client = connected(&self.0)?;
+        let token = HistoryClient(&*client).hold_audio(id)?;
+        Ok(AudioHold {
+            token,
+            client: Arc::downgrade(&client),
+        })
     }
 
     /// The host's latest history audio upkeep report; `run`: a pass runs
@@ -270,14 +238,8 @@ fn connected(
 /// is sent without waiting for its answer.
 pub(crate) struct AudioHold {
     token: String,
-    on: HoldOn,
-}
-
-enum HoldOn {
     /// The connection the host keeps the hold for; gone with it.
-    Host(Weak<HostClient>),
-    #[cfg(test)]
-    Local(Store),
+    client: Weak<HostClient>,
 }
 
 impl Drop for AudioHold {
@@ -285,53 +247,87 @@ impl Drop for AudioHold {
         let release = StoreRequest::ReleaseHold {
             hold: std::mem::take(&mut self.token),
         };
-        match &self.on {
-            HoldOn::Host(client) => {
-                // A connection that is gone took the hold with it. The
-                // release is written off this thread: a guard may drop on
-                // the UI thread, and the connection's writer may be busy
-                // (an import's upload) or stuck behind a host that stopped
-                // reading.
-                if let Some(client) = client.upgrade() {
-                    let spawned = std::thread::Builder::new()
-                        .name("starling-hold-release".to_string())
-                        .spawn(move || {
-                            let _ = client.store_unanswered(release);
-                        });
-                    if let Err(err) = spawned {
-                        eprintln!("Starling: an audio hold is kept until reconnect: {err}");
-                    }
-                }
-            }
-            #[cfg(test)]
-            HoldOn::Local(store) => {
-                if let Backend::Local { service, .. } = &*store.0 {
-                    use starling_runtime_host::history::StoreCall;
-                    let _ = service.call(release);
-                }
+        // A connection that is gone took the hold with it. The release is
+        // written off this thread: a guard may drop on the UI thread, and
+        // the connection's writer may be busy (an import's upload) or
+        // stuck behind a host that stopped reading.
+        if let Some(client) = self.client.upgrade() {
+            let spawned = std::thread::Builder::new()
+                .name("starling-hold-release".to_string())
+                .spawn(move || {
+                    let _ = client.store_unanswered(release);
+                });
+            if let Err(err) = spawned {
+                eprintln!("Starling: an audio hold is kept until reconnect: {err}");
             }
         }
     }
 }
 
+/// A store for tests: the host's store over a real connection, and a
+/// handle on the same root for fixtures written the way the host would.
+#[cfg(test)]
+pub(crate) struct TestStore {
+    store: Store,
+    fixtures: Mutex<store_v2::StoreV2>,
+    host: Mutex<Option<starling_runtime_host::HostHandle>>,
+}
+
 #[cfg(test)]
 impl Store {
-    /// The host's store service over `root`, in this process (the tests'
-    /// fake host), with the store under it for fixtures.
-    pub(crate) fn at_test_root(root: &std::path::Path) -> Self {
-        Store(Arc::new(Backend::Local {
-            service: starling_runtime_host::history::LocalHistory::open(root).unwrap(),
+    /// A host serving `root` in this process, and the store through it.
+    pub(crate) fn at_test_root(root: &std::path::Path) -> TestStore {
+        let store = TestStore::without_host(root);
+        let mut config = starling_runtime_host::HostConfig::new(root, root.join("endpoints"));
+        config.runtime = config
+            .runtime
+            .with_capture_source(starling_runtime::testing::FakeCaptureSource::new(Vec::new()));
+        let host = starling_runtime_host::serve(config).expect("the test host serves");
+        store.connect_to(&host);
+        *store.host.lock().unwrap() = Some(host);
+        store
+    }
+}
+
+#[cfg(test)]
+impl std::ops::Deref for TestStore {
+    type Target = Store;
+
+    fn deref(&self) -> &Store {
+        &self.store
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestStore {
+    fn drop(&mut self) {
+        if let Some(mut host) = self.host.lock().unwrap_or_else(|p| p.into_inner()).take() {
+            host.shutdown();
+        }
+    }
+}
+
+#[cfg(test)]
+impl TestStore {
+    /// Fixtures on `root`, with no host yet (see [`Self::connect_to`]).
+    pub(crate) fn without_host(root: &std::path::Path) -> TestStore {
+        TestStore {
+            store: Store::through(Arc::new(Mutex::new(None))),
             fixtures: Mutex::new(store_v2::StoreV2::open(root).unwrap()),
-        }))
+            host: Mutex::new(None),
+        }
+    }
+
+    /// Reaches the store through `host`.
+    pub(crate) fn connect_to(&self, host: &starling_runtime_host::HostHandle) {
+        let client = HostClient::connect(host.socket_path()).expect("connect to the test host");
+        *self.store.0.lock().unwrap() = Some(Arc::new(client));
     }
 
     fn fixtures(&self) -> std::sync::MutexGuard<'_, store_v2::StoreV2> {
-        match &*self.0 {
-            Backend::Local { fixtures, .. } => fixtures
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()),
-            Backend::Host(_) => panic!("fixtures need a test store"),
-        }
+        self.fixtures
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// A take stored as another process would (the host, recording).
@@ -378,13 +374,6 @@ impl Store {
     ) -> Result<(), storage::StorageError> {
         self.fixtures()
             .finish_recognition_transcript(id, &transcript)
-            .map_err(|err| storage::StorageError::Invalid(err.to_string()))
-    }
-
-    /// Fails the in-flight attempt.
-    pub(crate) fn save_failure(&self, id: &str, message: &str) -> Result<(), storage::StorageError> {
-        self.fixtures()
-            .finish_recognition(id, store_v2::RecognitionOutcome::Failed { message })
             .map_err(|err| storage::StorageError::Invalid(err.to_string()))
     }
 

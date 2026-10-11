@@ -1,7 +1,5 @@
-// Ported from `apps/desktop/electron/ipc.ts` + `electron/main.ts` — the native
-// Electron request path (`healthProgram` / `transcribeProgram`) — together with
-// the response normalization of the removed TypeScript `client.ts`.
-// See `apps/desktop-gpui/PORT.md` ("Transcription client") for the contract.
+// The transcription HTTP client for the `/v1` batch API, with the response
+// normalization of the removed TypeScript `client.ts`.
 
 use std::error::Error as StdError;
 use std::sync::atomic::{AtomicBool, Ordering};

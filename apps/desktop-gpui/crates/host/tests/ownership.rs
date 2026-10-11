@@ -1,10 +1,9 @@
 //! Stale-owner detection and single-ownership acceptance (E17 I4 / §4):
-//! the real `starling-runtime-host` **binary**, the real storage-v2
-//! lease, and a real SIGKILL — the flock releases at process death, the
-//! lease machinery proves the dead owner gone, the leftover socket file
-//! is taken over, and the new host serves on the same endpoint. Never
-//! two owners: a second host (process or in-process) against a live
-//! owner answers `already-running` and exits 0.
+//! the real `starling-runtime-host` **binary**, the real data-root lock,
+//! and a real SIGKILL — the lock releases at process death, the leftover
+//! socket file is taken over, and the new host serves on the same
+//! endpoint. Never two owners: a second host (process or in-process)
+//! against a live owner answers `already-running` and exits 0.
 
 // Portable except where a test needs a socket *file* (the stale-file
 // takeover, a squatting listener, a non-socket file at the endpoint) —
@@ -103,10 +102,9 @@ fn plain_config(root: &Path) -> HostConfig {
 }
 
 /// The full ladder: host A owns and serves; a hard kill (SIGKILL — no
-/// handler, no cleanup, flock auto-released by the OS) leaves a stale
-/// lease file and a stale socket file; host B must break the dead lease,
-/// take over the endpoint, and serve — while the takeover decision never
-/// produces two owners.
+/// handler, no cleanup, the lock released by the OS) leaves a stale
+/// socket file; host B must take the root and the endpoint over, and
+/// serve — while the takeover decision never produces two owners.
 #[test]
 fn a_killed_host_is_taken_over_by_the_next_one() {
     let root = tempfile::tempdir().unwrap();
@@ -138,7 +136,7 @@ fn a_killed_host_is_taken_over_by_the_next_one() {
     drop(client_a);
 
     // Hard kill: SIGKILL, the worst case. No handler runs, no cleanup
-    // happens — the lease's flock releases because the OS does it.
+    // happens — the data-root lock releases because the OS does it.
     first.child.kill().expect("SIGKILL the host");
     let _ = first.child.wait();
     #[cfg(unix)]
@@ -147,14 +145,14 @@ fn a_killed_host_is_taken_over_by_the_next_one() {
         "the killed host leaves its socket file behind (the stale-owner case)"
     );
 
-    // Host B on the same root: the dead lease breaks (flock free), the
-    // dead socket is probed (ECONNREFUSED) and taken over, and B serves
-    // on the SAME endpoint path.
+    // Host B on the same root: the root is free, the dead socket is
+    // probed (ECONNREFUSED) and taken over, and B serves on the SAME
+    // endpoint path.
     let mut second = ChildHost::spawn(root.path());
     let client_b = second.wait_serving(&socket);
     assert_ne!(
         client_b.info.owner_id, owner_a,
-        "a new owner id — the old lease was broken, not inherited"
+        "a new owner id — a new run, not the old one inherited"
     );
     assert_eq!(client_b.info.pid, second.child.id() as u32);
 
@@ -217,7 +215,6 @@ fn a_second_host_binary_reports_already_running_and_exits_zero() {
         status["socket"].as_str().unwrap(),
         owner.socket_path().to_str().unwrap()
     );
-    assert_eq!(status["owner"].as_str().unwrap(), owner.owner_id());
 
     // The live owner was not disturbed.
     client
@@ -231,76 +228,32 @@ fn a_second_host_binary_reports_already_running_and_exits_zero() {
                 },
             ),
         )
-        .expect("the owner still serves after a second host consulted the lease");
+        .expect("the owner still serves after a second host tried the root");
     drop(client);
     owner.shutdown();
 }
 
-/// An unanswerable lease file (present, unprobeable — here a directory
-/// squatting on a lease name) blocks ownership instead of the host
-/// serving beside it: reconcile would defer to the unanswerable owner
-/// forever, so a second writer on that root is exactly the
-/// recovery-disabling state the lease exists to prevent. The refusal
-/// names the wedged file so it can be repaired, and the root serves
-/// cleanly once it is.
-#[test]
-fn an_unanswerable_lease_refuses_ownership_and_names_the_wedge() {
-    let root = tempfile::tempdir().unwrap();
-    let wedge = root.path().join("leases").join("l_wedge.lease");
-    std::fs::create_dir_all(&wedge).expect("wedge lease");
-
-    match serve(plain_config(root.path())) {
-        Err(HostError::LeaseUnanswerable { unreadable, .. }) => {
-            assert_eq!(unreadable.len(), 1, "{unreadable:?}");
-            assert_eq!(unreadable[0].0, "l_wedge", "{unreadable:?}");
-        }
-        Err(other) => panic!("expected LeaseUnanswerable, got {other}"),
-        Ok(mut host) => {
-            host.shutdown();
-            panic!("expected LeaseUnanswerable, served beside the wedge");
-        }
-    }
-
-    // No lease of ours was left behind by the refusal, and the repaired
-    // root serves normally.
-    let lease_names: Vec<String> = std::fs::read_dir(root.path().join("leases"))
-        .expect("leases dir")
-        .flatten()
-        .filter_map(|entry| entry.file_name().into_string().ok())
-        .filter(|name| name.ends_with(".lease"))
-        .collect();
-    assert_eq!(
-        lease_names,
-        vec!["l_wedge.lease".to_string()],
-        "the refused host published no lease of its own"
-    );
-    std::fs::remove_dir(&wedge).expect("repair the wedge");
-    let mut successor =
-        serve(plain_config(root.path())).expect("serves once the wedge is repaired");
-    successor.shutdown();
-}
-
 /// The ownership-ladder refusal the binary encodes, exercised in-process
 /// (fast): a live foreign owner makes the second serve() a client, and a
-/// socket answering without the lease makes binding refuse.
+/// socket answering without the root makes binding refuse.
 #[cfg(unix)] // binds a squatting UnixListener
 #[test]
-fn a_live_foreign_server_without_the_lease_is_refused() {
+fn a_live_foreign_server_without_the_root_is_refused() {
     let root = tempfile::tempdir().unwrap();
 
     // A live host on another root... but pointed at `root`'s endpoint
     // directory? Ownership is per data root; the endpoint derives from
     // the root, so a foreign server on OUR endpoint requires a host on
-    // our root — which the lease already refuses. Construct the
+    // our root — which the data-root lock already refuses. Construct the
     // contradiction directly: occupy the endpoint with a raw listener.
     let config = HostConfig::new(root.path(), root.path().join("endpoints"));
     let socket = config.socket_path();
     std::fs::create_dir_all(root.path().join("endpoints")).unwrap();
     let squatter = std::os::unix::net::UnixListener::bind(&socket).unwrap();
 
-    // Host with the same root + endpoint: it acquires the lease (no
+    // Host with the same root + endpoint: it locks the root (no
     // owner), probes the endpoint, finds the squatter live, refuses —
-    // and releases the lease it briefly held.
+    // and releases the root it briefly held.
     match serve(plain_config(root.path())) {
         Err(HostError::ForeignServer(path)) => assert_eq!(path, socket),
         Err(other) => panic!("expected ForeignServer, got {other}"),
@@ -310,7 +263,7 @@ fn a_live_foreign_server_without_the_lease_is_refused() {
         }
     }
 
-    // And the lease it held was released: a clean serve on the same root
+    // And the root it held was released: a clean serve on the same root
     // (with the squatter gone) now owns.
     drop(squatter);
     let _ = std::fs::remove_file(&socket);

@@ -1921,7 +1921,7 @@ mod tests {
     }
 
     /// A stored take whose transcript is `text`; its id.
-    fn stored_take(store: &crate::store::Store, text: &str) -> String {
+    fn stored_take(store: &crate::store::TestStore, text: &str) -> String {
         use starling_dictation::{audio, storage::TranscriptionResult};
         let wav = audio::encode_wav_16k(&audio::PcmAudio {
             samples: vec![0.; 160],

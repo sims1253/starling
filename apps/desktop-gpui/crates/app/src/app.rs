@@ -329,12 +329,10 @@ pub struct UnsavedWav {
 }
 
 pub struct StarlingApp {
-    /// The recording store: storage v2, unconditionally (D14 — there is
-    /// no backend choice and no fallback). `None` only when the store
-    /// could not be opened at startup; the error is surfaced honestly and
-    /// new takes are kept in memory until it is fixed and the app is
-    /// restarted.
+    /// The runtime host's store, through the host link. `None` until the
+    /// app follows a host.
     pub store: Option<Store>,
+    /// Why there is no store (no place for the host to run).
     pub store_error: Option<String>,
     pub player: Option<Player>,
     pub root_focus: FocusHandle,
@@ -765,17 +763,6 @@ pub(crate) fn effective_delete_arm(armed_for: Option<&str>, selected: Option<&st
     armed_for.is_some() && armed_for == selected
 }
 
-/// Whether applying a listing moves the selection off its current take
-/// (review finding 1): the move must run the same reset as an explicit
-/// click in `select_session` — including stopping playback of a take that
-/// just vanished from the listing.
-pub(crate) fn listing_moves_selection(
-    current: Option<&str>,
-    sessions: &[SessionSummary],
-) -> bool {
-    next_selection(current, sessions).as_deref() != current
-}
-
 /// A batch identity for the unsaved list (review finding 3): a digest over
 /// the stashed ids in order, so ANY change to the batch — another stash
 /// today, any insert, removal, or reorder a future change might add —
@@ -928,19 +915,16 @@ impl StarlingApp {
             diagnostics,
             settings,
             None,
-            None,
             Player::new().ok(),
             cx,
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn with_dependencies(
         started: Instant,
         diagnostics: bool,
         settings: Settings,
         store: Option<Store>,
-        store_error: Option<String>,
         player: Option<Player>,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -1006,14 +990,11 @@ impl StarlingApp {
         cx.observe(&draft_cue_volume, |_, _, cx| cx.notify()).detach();
 
         Self {
-            error: match (store_error.clone(), mode_note) {
-                (Some(store), Some(mode)) => Some(format!("{store}\n{mode}")),
-                (store, mode) => store.or(mode),
-            },
+            error: mode_note,
             capture_warning: None,
             export_notice: None,
             store,
-            store_error,
+            store_error: None,
             player,
             root_focus: cx.focus_handle(),
             engine_status: None,
@@ -1138,7 +1119,6 @@ impl StarlingApp {
             false,
             settings,
             store,
-            None,
             None,
             cx,
         )
@@ -2729,26 +2709,6 @@ mod tests {
         let reordered = unsaved_batch_token(&[unsaved("unsaved-2"), unsaved("unsaved-1")]);
         assert_ne!(armed, reordered);
         assert_eq!(discard_intent(Some(armed), reordered), DiscardIntent::Arm);
-    }
-
-    #[test]
-    fn a_listing_that_loses_the_selected_take_moves_the_selection() {
-        // Review finding 1: when a refresh drops the selected take
-        // (deleted from another window, flagged damaged), the drawer moves
-        // — and the move must run the same reset as an explicit click,
-        // including stopping playback of the vanished take.
-        let sessions = vec![summary("next")];
-        assert!(listing_moves_selection(Some("gone"), &sessions));
-        assert!(listing_moves_selection(Some("gone"), &[]));
-        // A listing that keeps the selection is not a move.
-        assert!(!listing_moves_selection(Some("next"), &sessions));
-        assert!(!listing_moves_selection(
-            Some("selected"),
-            &[summary("newest"), summary("selected")]
-        ));
-        // Gaining a first selection runs the same reset as clicking that
-        // row with nothing selected — exactly what `select_session` does.
-        assert!(listing_moves_selection(None, &sessions));
     }
 
     #[test]
