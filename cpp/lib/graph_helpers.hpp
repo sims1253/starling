@@ -121,6 +121,35 @@ inline std::vector<float> read_f32(const ModelLoader& ml, const char* name) {
     }
     return out;
 }
+// Gather rows `ids` of a 2-D weight ([width, rows], row-contiguous) to host
+// f32, reading only those rows (an embedding lookup without staging the
+// whole table). Any storage type with ggml type traits converts: F32/BF16/F16
+// exactly, block-quantized rows through their dequantizer. Returns {} when
+// the tensor is absent, not 2-D, or an id is out of range.
+inline std::vector<float> read_rows_f32(const ModelLoader& ml, const char* name,
+                                        const std::vector<int32_t>& ids) {
+    ggml_tensor* t = ml.tensor(name);
+    if (!t || ggml_n_dims(t) != 2) return {};
+    ensure_weights_realized(ml);
+    const int64_t width = t->ne[0];
+    const size_t row_bytes = ggml_row_size(t->type, width);
+    const auto* traits = ggml_get_type_traits(t->type);
+    if (t->type != GGML_TYPE_F32 && !traits->to_float) return {};
+    std::vector<float> out((size_t) ids.size() * width);
+    std::vector<uint8_t> raw(row_bytes);
+    for (size_t i = 0; i < ids.size(); ++i) {
+        if (ids[i] < 0 || ids[i] >= t->ne[1]) return {};
+        float* dst = out.data() + i * width;
+        const size_t offset = (size_t) ids[i] * t->nb[1];
+        if (t->type == GGML_TYPE_F32) {
+            ggml_backend_tensor_get(t, dst, offset, row_bytes);
+        } else {
+            ggml_backend_tensor_get(t, raw.data(), offset, row_bytes);
+            traits->to_float(raw.data(), dst, width);
+        }
+    }
+    return out;
+}
 // Env-gated debug flag (STARLING_<MODEL>_DEBUG == "1").
 inline bool debug_enabled(const char* env) {
     const char* p = std::getenv(env);

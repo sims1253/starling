@@ -280,7 +280,8 @@ ggml_tensor* build_adapter(ggml_context* ctx, const ArkModel& model,
     // d_model). Grouping `mf` consecutive frames -> [N, d_model*mf].
     x = ggml_reshape_2d(ctx, x, (int64_t) ac.input_size, N);  // [input, N]
     auto lin = [&](const std::string& n, ggml_tensor* z) {
-        return ggml_cast(ctx, ggml_mul_mat(ctx, weight(ctx, model.loader, n + ".weight"), z),
+        ggml_tensor* w = weight(ctx, model.loader, n + ".weight");
+        return ggml_cast(ctx, ggml_mul_mat(ctx, w, lib::gemm_act(ctx, w, z)),
                          GGML_TYPE_BF16);
     };
     ggml_tensor* h = lin("adapter.fc0", x);

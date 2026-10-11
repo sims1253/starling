@@ -146,7 +146,8 @@ ggml_tensor* exact_gelu(ggml_context* c, ggml_tensor* x) {
 // round of the GEMM output).
 ggml_tensor* linear_bf16_oracle(ggml_context* c, const ModelLoader& ml,
                                 ggml_tensor* x, const std::string& n, bool bias) {
-    ggml_tensor* y = ggml_mul_mat(c, weight(c, ml, n + ".weight"), bf16(c, x));
+    ggml_tensor* w = weight(c, ml, n + ".weight");
+    ggml_tensor* y = ggml_mul_mat(c, w, lib::gemm_act(c, w, x));
     if (bias)
         y = ggml_add(c, f32(c, bf16(c, y)),
                      f32(c, weight(c, ml, n + ".bias")));

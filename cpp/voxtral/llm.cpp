@@ -75,23 +75,26 @@ bool build_inputs_embeds(const VoxtralModel& m, const std::vector<int32_t>& ids,
         err = "VOXTRAL audio rows fewer than prompt tokens";
         return false;
     }
-    // Token rows, host-side: the embedding table is bf16; read_f32 casts up
-    // exactly, and adding the (bf16-valued) audio rows in f32 before the
-    // prefill's single tobf round reproduces the stock bf16 add bit-exactly
-    // (an f32 sum of bf16 values is exact; one round follows).
-    std::vector<float> table = lib::read_f32(m.loader, "llm.embed.weight");
-    if (table.size() < (size_t) m.config.llm.vocab * H) {
+    // Token rows, host-side, only the prompt's rows (the whole 131k-row table
+    // as f32 was ~1.5 GiB per call). A bf16 table casts up exactly, and
+    // adding the (bf16-valued) audio rows in f32 before the prefill's single
+    // tobf round reproduces the stock bf16 add bit-exactly (an f32 sum of
+    // bf16 values is exact; one round follows). A quantized table
+    // dequantizes its rows.
+    for (const int32_t id : ids) {
+        if (id < 0 || (int64_t) id >= m.config.llm.vocab) {
+            err = "VOXTRAL prompt id out of range";
+            return false;
+        }
+    }
+    const std::vector<float> rows = lib::read_rows_f32(m.loader, "llm.embed.weight", ids);
+    if (rows.size() != ids.size() * (size_t) H) {
         err = "VOXTRAL llm.embed.weight unreadable";
         return false;
     }
     out.data.assign((size_t) ids.size() * H, 0.0f);
     for (size_t i = 0; i < ids.size(); ++i) {
-        const int32_t id = ids[i];
-        if (id < 0 || (int64_t) id >= m.config.llm.vocab) {
-            err = "VOXTRAL prompt id out of range";
-            return false;
-        }
-        const float* erow = table.data() + (size_t) id * H;
+        const float* erow = rows.data() + i * H;
         const float* arow = audio.data.data() + i * H;
         float* drow = out.data.data() + i * H;
         for (int64_t h = 0; h < H; ++h) drow[h] = erow[h] + arow[h];
