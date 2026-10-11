@@ -4,6 +4,14 @@
 // (additive injection) -> offline greedy decode -> detokenize, mirroring
 // capi_ark.cpp's ownership/error discipline. The serve layer wraps the
 // returned text in its JSON envelope; the C API itself returns plain text.
+//
+// With the fast engine (cpp/fast, STARLING_ENGINE=auto|fast) everything
+// after the CPU log-mel runs on the Vulkan GPU: AudioLlmEngine takes the
+// mel and the prompt ids and runs the causal encoder, projector, prefill
+// and the on-device greedy loop with the per-position audio add.
+// STARLING_FAST_VOXTRAL_HOST_ENCODER=1 keeps the encoder+projector on ggml
+// and hands the engine their rows (decoder only). The loader's weights the
+// engine owns are released from host memory (release_host_weights).
 #include "loader.hpp"
 #include "mel.hpp"
 #include "encoder.hpp"
@@ -21,6 +29,11 @@
 #include <string>
 #include <vector>
 
+#if defined(STARLING_HAVE_FAST)
+#include "engine_select.hpp"
+#include "audio_llm_engine.hpp"
+#endif
+
 namespace {
 
 thread_local std::string g_load_error;
@@ -29,6 +42,11 @@ struct VoxtralCtx {
     std::unique_ptr<starling::ggml::voxtral::VoxtralModel> model;
     starling::ggml::voxtral::Tokenizer tokenizer;
     std::string err;
+#if defined(STARLING_HAVE_FAST)
+    // Model-specialized Vulkan engine (cpp/fast). When set it owns the
+    // decoder (and, unless it says otherwise, the encoder + projector).
+    std::unique_ptr<starling::fast::AudioLlmEngine> fast;
+#endif
 };
 
 void report(const char** out, const std::string& message) {
@@ -60,6 +78,30 @@ void* starling_ggml_voxtral_load(const char* gguf_path, const char** err_out) {
             report_load_error(err_out, ctx->err);
             return nullptr;
         }
+#if defined(STARLING_HAVE_FAST)
+        const auto choice = starling::fast::engine_choice();
+        if (choice != starling::fast::EngineChoice::Ggml) {
+            std::string ferr;
+            ctx->fast = starling::fast::AudioLlmEngine::create(*ctx->model, ferr);
+            const bool verbose = std::getenv("STARLING_FAST_VERBOSE") != nullptr;
+            if (ctx->fast) {
+                // With the encoder on the device the loader keeps only the
+                // mel constants (and the tokenizer's metadata) in use.
+                std::vector<std::string> owned{"llm."};
+                if (ctx->fast->encodes_audio()) owned.insert(owned.end(), {"enc.", "proj."});
+                const size_t freed = starling::fast::release_host_weights(ctx->model->loader, owned);
+                if (verbose)
+                    std::fprintf(stderr, "[fast] voxtral engine (%s): %s (%.0f MiB of host weights released)\n",
+                                 ctx->fast->encodes_audio() ? "encoder+decoder" : "decoder",
+                                 ctx->fast->describe().c_str(), freed / 1048576.0);
+            } else if (choice == starling::fast::EngineChoice::Fast) {
+                report_load_error(err_out, "fast engine unavailable: " + ferr);
+                return nullptr;
+            } else if (verbose) {
+                std::fprintf(stderr, "[fast] voxtral falls back to ggml: %s\n", ferr.c_str());
+            }
+        }
+#endif
         // Persist weights + force backend creation (and its orderly atexit
         // shutdown registration) across all transcription calls.
         if (!ctx->model->loader.realize_weights(starling::ggml::global_backend())) {
@@ -108,15 +150,63 @@ char* starling_ggml_voxtral_decode(void* handle, const float* pcm, int64_t n,
             return nullptr;
         }
         auto a1 = now();
+        // The prompt is the baked 39-id prefix; the total-length cap derives
+        // from the mel-frame count (stock ceil(mel/8) bound).
+        const std::vector<int32_t> prompt = build_transcribe_prompt(c->model->config);
+#if defined(STARLING_HAVE_FAST)
+        if (c->fast) {
+            // Fast engine: the stock cap (sequence length == audio rows) is
+            // the engine's default budget.
+            std::vector<int32_t> ids;
+            bool eos = false;
+            bool ok;
+            int64_t audio_rows = audio_token_count(mel.n_frames);
+            if (c->fast->encodes_audio()) {
+                static_assert(sizeof(ggml_bf16_t) == sizeof(uint16_t), "bf16 bits");
+                ok = c->fast->generate_additive_from_mel(prompt, reinterpret_cast<const uint16_t*>(mel.data.data()),
+                                                         mel.n_frames, 0, ids, eos, c->err);
+            } else {
+                AudioEncoding audio;
+                ok = encode_audio_and_project(*c->model, mel, audio, c->err);
+                if (ok && audio.width != (int64_t) c->model->config.llm.hidden) {
+                    c->err = "VOXTRAL projector width does not match the decoder";
+                    ok = false;
+                }
+                if (ok) {
+                    audio_rows = audio.n_tokens;
+                    ok = c->fast->generate_additive(prompt, audio.data.data(), audio.n_tokens, 0, ids, eos, c->err);
+                }
+            }
+            if (!ok) {
+                report(err_out, c->err);
+                return nullptr;
+            }
+            if (timing)
+                std::fprintf(stderr,
+                    "VOXTRAL_STAGE frames=%lld mel=%.1fms fast_%s=%.1fms audio_tokens=%lld prompt_tokens=%zu gen_tokens=%zu\n",
+                    (long long) mel.n_frames, ms(a0, a1), c->fast->encodes_audio() ? "enc+gen" : "hostenc+gen",
+                    ms(a1, now()), (long long) audio_rows, prompt.size(), ids.size());
+            if (const char* fp = std::getenv("STARLING_VOXTRAL_DUMP_IDS")) {
+                if (FILE* f = std::fopen(fp, "wb")) {
+                    std::fwrite(ids.data(), sizeof(int32_t), ids.size(), f);
+                    std::fclose(f);
+                }
+            }
+            const std::string text = c->tokenizer.decode(ids);
+            char* out = static_cast<char*>(std::malloc(text.size() + 1));
+            if (!out) { if (err_out) *err_out = "malloc failed"; return nullptr; }
+            std::memcpy(out, text.data(), text.size());
+            out[text.size()] = '\0';
+            if (err_out) *err_out = nullptr;
+            return out;
+        }
+#endif
         AudioEncoding audio;
         if (!encode_audio_and_project(*c->model, mel, audio, c->err)) {
             report(err_out, c->err);
             return nullptr;
         }
         auto a2 = now();
-        // The prompt is the baked 39-id prefix; the total-length cap derives
-        // from the mel-frame count (stock ceil(mel/8) bound).
-        const std::vector<int32_t> prompt = build_transcribe_prompt(c->model->config);
         InputsEmbeds inputs;
         if (!build_inputs_embeds(*c->model, prompt, audio, inputs, c->err)) {
             report(err_out, c->err);

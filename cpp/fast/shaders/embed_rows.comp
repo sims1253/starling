@@ -2,15 +2,19 @@
 // embed_rows.comp — dequantize embedding rows for a list of token ids into
 // f32 activations (prompt tokens of the LLM prefill). One workgroup per id;
 // id 0xffffffff skips the row (an audio slot the host already filled).
+// ADD_ROWS=1 (Voxtral's additive audio): output row r is embed(id) plus row
+// r of `add` (the audio rows are indexed by sequence position).
 
 #include "common.glsl"
 
 layout(constant_id = 0) const uint WG = 256;
 layout(constant_id = 1) const uint CHUNK_ROWS = 0x7fffffff;
+layout(constant_id = 2) const uint ADD_ROWS = 0;
 layout(local_size_x_id = 0) in;
 
 layout(std430, binding = 0) readonly buffer IDS { uint ids[]; };
 layout(std430, binding = 9) buffer O { float o[]; };
+layout(std430, binding = 10) readonly buffer ADD { float add[]; };
 
 layout(push_constant) uniform PC {
     uint K;
@@ -24,6 +28,7 @@ void main() {
     const uint i = gl_WorkGroupID.x;
     const uint tok = ids[p.ids_off + i];
     if (tok == 0xffffffffu) return;
+    const uint r = p.out_row0 + i;
     for (uint k = gl_LocalInvocationID.x; k < p.K; k += WG)
-        o[(p.out_row0 + i) * p.K + k] = dequant(tok, k, p.K);
+        o[r * p.K + k] = dequant(tok, k, p.K) + (ADD_ROWS != 0u ? add[r * p.K + k] : 0.0);
 }
