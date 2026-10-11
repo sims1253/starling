@@ -18,7 +18,9 @@ pub mod jobs;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::protocol::replay::{TransitionKind, TransitionRecord, Violation};
+use std::collections::VecDeque;
+
+use crate::protocol::replay::Violation;
 use crate::protocol::tables::MachineSpec;
 
 /// What a committed command left the machine waiting for.
@@ -44,14 +46,22 @@ struct Pending {
     outcomes: Vec<(&'static str, Option<&'static str>)>,
 }
 
-/// One machine's live state + transition + violation history. Owned by
-/// exactly one actor thread; never shared mutably.
+/// How many recent violations a [`MachineCore`] keeps for its view. The
+/// actors are long-lived (the capture actor survives every take of a
+/// desktop session), so diagnostics are a bounded ring plus a total count,
+/// never an ever-growing log.
+pub const RECENT_VIOLATIONS: usize = 32;
+
+/// One machine's live state, transition count, and recent violations.
+/// Owned by exactly one actor thread; never shared mutably.
 pub struct MachineCore {
     spec: &'static MachineSpec,
     state: &'static str,
-    visited: Vec<&'static str>,
-    transitions: Vec<TransitionRecord>,
-    violations: Vec<Violation>,
+    /// State changes taken so far (self-loops such as `capture.progress`
+    /// and outcome-pending commits do not count).
+    transitions: usize,
+    violation_count: usize,
+    recent_violations: VecDeque<Violation>,
     pending: Option<Pending>,
 }
 
@@ -60,9 +70,9 @@ impl MachineCore {
         MachineCore {
             spec,
             state: spec.initial,
-            visited: vec![spec.initial],
-            transitions: Vec::new(),
-            violations: Vec::new(),
+            transitions: 0,
+            violation_count: 0,
+            recent_violations: VecDeque::new(),
             pending: None,
         }
     }
@@ -81,30 +91,10 @@ impl MachineCore {
         self.pending.is_some()
     }
 
-    fn enter(&mut self, target: Option<&'static str>, kind: TransitionKind, msg_type: &'static str) {
-        match target.filter(|to| *to != self.state) {
-            Some(to) => {
-                self.transitions.push(TransitionRecord {
-                    kind,
-                    type_: Some(msg_type),
-                    from: self.state.to_string(),
-                    to: to.to_string(),
-                    pending: Vec::new(),
-                });
-                self.state = to;
-                self.visited.push(to);
-            }
-            None => {
-                let from = self.state.to_string();
-                let to = self.state.to_string();
-                self.transitions.push(TransitionRecord {
-                    kind,
-                    type_: Some(msg_type),
-                    from,
-                    to,
-                    pending: Vec::new(),
-                });
-            }
+    fn enter(&mut self, target: Option<&'static str>) {
+        if let Some(to) = target.filter(|to| *to != self.state) {
+            self.state = to;
+            self.transitions += 1;
         }
     }
 
@@ -141,25 +131,13 @@ impl MachineCore {
             });
         }
         if rule.outcomes.is_empty() {
-            self.enter(rule.to, TransitionKind::Command, command);
+            self.enter(rule.to);
             Ok(CommandAction::Entered)
         } else {
             self.pending = Some(Pending {
                 command,
                 corr,
                 outcomes: rule.outcomes.to_vec(),
-            });
-            let mut awaited: Vec<String> =
-                rule.outcomes.iter().map(|(name, _)| name.to_string()).collect();
-            awaited.sort();
-            let from = self.state.to_string();
-            let to = self.state.to_string();
-            self.transitions.push(TransitionRecord {
-                kind: TransitionKind::Command,
-                type_: Some(command),
-                from,
-                to,
-                pending: awaited,
             });
             Ok(CommandAction::Awaiting {
                 command,
@@ -204,7 +182,7 @@ impl MachineCore {
         }
         let target = *target;
         self.pending = None;
-        self.enter(target, TransitionKind::Event, event);
+        self.enter(target);
         Ok(target)
     }
 
@@ -236,7 +214,7 @@ impl MachineCore {
                 target = Some(fatal_to);
             }
         }
-        self.enter(target, TransitionKind::Event, event);
+        self.enter(target);
         Ok(target)
     }
 
@@ -250,14 +228,7 @@ impl MachineCore {
                 ),
             });
         }
-        self.transitions.push(TransitionRecord {
-            kind: TransitionKind::Internal,
-            type_: None,
-            from: self.state.to_string(),
-            to: target.to_string(),
-            pending: Vec::new(),
-        });
-        self.state = self
+        let to = self
             .spec
             .states
             .iter()
@@ -265,15 +236,21 @@ impl MachineCore {
             .position(|state| state == target)
             .map(|index| self.spec.states[index])
             .expect("internal edges stay inside declared states");
-        self.visited.push(self.state);
+        self.state = to;
+        self.transitions += 1;
         Ok(())
     }
 
     /// Records a violation that could not surface on the wire (v1 defines
     /// no event for it); it stays visible in the machine snapshot so
-    /// nothing is silently absorbed.
+    /// nothing is silently absorbed — counted forever, kept verbatim among
+    /// the last [`RECENT_VIOLATIONS`].
     pub fn record_violation(&mut self, violation: Violation) {
-        self.violations.push(violation);
+        if self.recent_violations.len() == RECENT_VIOLATIONS {
+            self.recent_violations.pop_front();
+        }
+        self.recent_violations.push_back(violation);
+        self.violation_count += 1;
     }
 
     /// A projection copy for [`crate::RuntimeSnapshot`].
@@ -290,8 +267,9 @@ impl MachineCore {
                     .map(|(name, _)| name.to_string())
                     .collect(),
             }),
-            transitions: self.transitions.len(),
-            violations: self.violations.iter().map(|v| v.to_string()).collect(),
+            transitions: self.transitions,
+            violation_count: self.violation_count,
+            violations: self.recent_violations.iter().map(|v| v.to_string()).collect(),
         }
     }
 }
@@ -303,7 +281,12 @@ pub struct MachineView {
     pub machine: String,
     pub state: String,
     pub pending: Option<PendingView>,
+    /// State changes taken so far.
     pub transitions: usize,
+    /// Violations recorded so far.
+    pub violation_count: usize,
+    /// The most recent violations (at most [`RECENT_VIOLATIONS`], oldest
+    /// first).
     pub violations: Vec<String>,
 }
 
@@ -642,6 +625,38 @@ mod tests {
             core.commit_command("capture.start", Some("take_10".into())),
             Ok(CommandAction::Entered)
         ));
+    }
+
+    /// The capture actor's core lives for the whole desktop session: many
+    /// takes, each with a stream of progress self-loops and the odd
+    /// violation, must leave its retained history bounded.
+    #[test]
+    fn long_sessions_keep_history_bounded() {
+        const TAKES: usize = 200;
+        const PROGRESS_PER_TAKE: usize = 500;
+        let mut core = MachineCore::new(&CAPTURE);
+        for take in 0..TAKES {
+            core.commit_command("capture.start", Some(format!("take_{take}")))
+                .expect("start is legal from Idle/Persisted");
+            core.emit_event("capture.started", None).unwrap();
+            for _ in 0..PROGRESS_PER_TAKE {
+                assert_eq!(core.emit_event("capture.progress", None).unwrap(), None);
+            }
+            core.commit_command("capture.stop", Some(format!("take_{take}")))
+                .unwrap();
+            assert_eq!(core.emit_event("capture.stopped", None).unwrap(), Some("Persisted"));
+            let violation = core
+                .commit_command("capture.stop", None)
+                .expect_err("stop from Persisted is illegal");
+            core.record_violation(violation);
+        }
+        let view = core.view();
+        assert_eq!(view.state, "Persisted");
+        // Four state changes per take; progress self-loops are not counted.
+        assert_eq!(view.transitions, TAKES * 4);
+        assert_eq!(view.violation_count, TAKES);
+        assert_eq!(view.violations.len(), RECENT_VIOLATIONS);
+        assert_eq!(core.recent_violations.len(), RECENT_VIOLATIONS);
     }
 
     use crate::protocol::tables::JOBS;
