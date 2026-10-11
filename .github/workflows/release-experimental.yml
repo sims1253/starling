@@ -49,6 +49,8 @@ jobs:
           echo "tag=experimental-${GITHUB_RUN_NUMBER}-${GITHUB_SHA:0:12}" >> "$GITHUB_OUTPUT"
           echo "version=0.0.0-experimental.${GITHUB_RUN_NUMBER}.g${GITHUB_SHA:0:12}" >> "$GITHUB_OUTPUT"
 
+  # The CPU and Vulkan servers, which the desktop job bundles, build apart
+  # from the slower CUDA servers so packaging need not wait for those.
   servers:
     needs: prepare
     # The reusable workflow contains a tag-release publisher (skipped in this
@@ -60,6 +62,19 @@ jobs:
       tag: v${{ needs.prepare.outputs.version }}
       source-ref: ${{ github.sha }}
       experimental: true
+      backends: portable
+
+  servers-cuda:
+    needs: prepare
+    # Same permission contract as the servers call above.
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release-starling-serve.yml
+    with:
+      tag: v${{ needs.prepare.outputs.version }}
+      source-ref: ${{ github.sha }}
+      experimental: true
+      backends: cuda
 
   android:
     needs: prepare
@@ -88,7 +103,7 @@ jobs:
       run-tests: false # desktop-gpui-rust already tests this commit on master
 
   publish:
-    needs: [prepare, servers, android, desktop]
+    needs: [prepare, servers, servers-cuda, android, desktop]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:

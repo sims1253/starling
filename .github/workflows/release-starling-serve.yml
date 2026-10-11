@@ -31,6 +31,13 @@ on:
         description: Build the dogfooding subset as artifacts; the caller publishes it
         type: boolean
         default: false
+      backends:
+        description: >-
+          Restrict the build to 'portable' (CPU and Vulkan) or 'cuda' servers,
+          so a caller can depend on one group without waiting for the other;
+          empty builds every backend
+        type: string
+        default: ''
   push:
     tags:
       - 'v*'
@@ -41,8 +48,9 @@ on:
         required: true
         default: 'v0.1.0-test'
 
+# The backends suffix keeps two subset calls from one caller run apart.
 concurrency:
-  group: release-serve-${{ inputs.tag || github.ref_name }}
+  group: release-serve-${{ inputs.tag || github.ref_name }}-${{ inputs.backends }}
   cancel-in-progress: true
 
 # Build jobs only need to read the repository. The release job elevates this
@@ -85,6 +93,7 @@ jobs:
   linux-vulkan:
     permissions:
       contents: read
+    if: inputs.backends != 'cuda'
     needs: runtime-contract
     runs-on: ubuntu-22.04
     steps:
@@ -146,6 +155,7 @@ jobs:
   linux-cpu:
     permissions:
       contents: read
+    if: inputs.backends != 'cuda'
     needs: runtime-contract
     runs-on: ubuntu-22.04
     steps:
@@ -203,6 +213,7 @@ jobs:
   linux-cuda:
     permissions:
       contents: read
+    if: inputs.backends != 'portable'
     needs: runtime-contract
     runs-on: ubuntu-22.04
     # Multi-GB toolkit install plus the slowest build in the workflow; never
@@ -359,6 +370,7 @@ jobs:
   windows-vulkan:
     permissions:
       contents: read
+    if: inputs.backends != 'cuda'
     needs: runtime-contract
     runs-on: windows-2025-vs2026
     # The SDK download/install and the Vulkan shader build can both stall;
@@ -466,6 +478,7 @@ jobs:
   windows-cuda:
     permissions:
       contents: read
+    if: inputs.backends != 'portable'
     needs: runtime-contract
     runs-on: windows-2025-vs2026
     # Same rationale as linux-cuda: network-installed toolkit, slowest Windows
@@ -562,6 +575,7 @@ jobs:
   windows-cpu:
     permissions:
       contents: read
+    if: inputs.backends != 'cuda'
     needs: runtime-contract
     runs-on: windows-2025-vs2026
     steps:

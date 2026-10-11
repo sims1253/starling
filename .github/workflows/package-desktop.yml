@@ -76,11 +76,12 @@ jobs:
           sudo apt-get install -y --no-install-recommends libasound2-dev \
             libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
             libvulkan1 libfontconfig1-dev
-      - name: Ensure the stable toolchain
+      - name: Install the pinned toolchain
         id: rust
+        # The bare install reads apps/desktop-gpui/rust-toolchain.toml.
+        working-directory: apps/desktop-gpui
         run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
+          rustup toolchain install
           echo "version=$(rustc --version | sha256sum | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:

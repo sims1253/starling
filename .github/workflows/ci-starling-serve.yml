@@ -73,6 +73,21 @@ jobs:
           submodules: recursive
           persist-credentials: false
 
+      - name: Key the compiler cache on the ggml revision
+        id: ggml
+        run: echo "sha=$(git rev-parse HEAD:third_party/ggml)" >> "$GITHUB_OUTPUT"
+
+      # hendrikmuhs/ccache-action v1.2.24. ggml launches every compile
+      # through ccache once it is on PATH (GGML_CCACHE). A ggml or patch
+      # change starts a new key but still restores the previous cache;
+      # only master pushes save.
+      - uses: hendrikmuhs/ccache-action@f09c25b45002a07be2955cbe52e8cee55643f89d
+        with:
+          key: arm64-${{ matrix.arch }}-${{ steps.ggml.outputs.sha }}-${{ hashFiles('third_party/ggml-patches/**') }}
+          restore-keys: arm64-${{ matrix.arch }}
+          max-size: 500M
+          save: ${{ github.event_name == 'push' }}
+
       - name: Build (CPU, ${{ matrix.arch }})
         shell: bash
         env:
@@ -110,6 +125,21 @@ jobs:
         with:
           submodules: recursive
           persist-credentials: false
+
+      - name: Key the compiler cache on the ggml revision
+        id: ggml
+        run: echo "sha=$(git rev-parse HEAD:third_party/ggml)" >> "$GITHUB_OUTPUT"
+
+      # hendrikmuhs/ccache-action v1.2.24. ggml launches every compile
+      # through ccache once it is on PATH (GGML_CCACHE). A ggml or patch
+      # change starts a new key but still restores the previous cache;
+      # only master pushes save.
+      - uses: hendrikmuhs/ccache-action@f09c25b45002a07be2955cbe52e8cee55643f89d
+        with:
+          key: build-cpu-${{ steps.ggml.outputs.sha }}-${{ hashFiles('third_party/ggml-patches/**') }}
+          restore-keys: build-cpu
+          max-size: 1G
+          save: ${{ github.event_name == 'push' }}
 
       - name: Build (CPU)
         run: |
