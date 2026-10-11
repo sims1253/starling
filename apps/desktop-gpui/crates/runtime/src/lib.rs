@@ -458,7 +458,10 @@ impl Runtime {
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("the document service holds");
         while self.docs.try_send(DocsMsg::Filler).is_ok() {}
-        DocumentServiceHold { _release: release }
+        DocumentServiceHold {
+            docs: self.docs.clone(),
+            release: Some(release),
+        }
     }
 
     /// Shuts the runtime down and joins the machine threads.
@@ -472,10 +475,30 @@ impl Runtime {
 }
 
 /// A held document service ([`Runtime::hold_document_service`]); dropping
-/// it lets the service drain its inbox again.
+/// it releases the service and returns once its inbox has drained, so the
+/// next send is not refused by a leftover filler.
 #[cfg(any(test, feature = "test-doubles"))]
 pub struct DocumentServiceHold {
-    _release: channel::Sender<()>,
+    docs: channel::Sender<DocsMsg>,
+    release: Option<channel::Sender<()>>,
+}
+
+#[cfg(any(test, feature = "test-doubles"))]
+impl Drop for DocumentServiceHold {
+    fn drop(&mut self) {
+        drop(self.release.take());
+        // A hold whose release is already closed passes straight through;
+        // the service reaches it only after every filler queued before it.
+        let (holding_tx, holding) = channel::bounded(1);
+        let (_, release_rx) = channel::bounded(1);
+        let drained = DocsMsg::Hold {
+            holding: holding_tx,
+            release: release_rx,
+        };
+        if self.docs.send_blocking(drained).is_ok() {
+            let _ = holding.recv_timeout(std::time::Duration::from_secs(5));
+        }
+    }
 }
 
 fn spawn<F>(name: &str, run: F) -> JoinHandle<()>
