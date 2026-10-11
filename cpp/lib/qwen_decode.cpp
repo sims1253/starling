@@ -564,6 +564,8 @@ struct KStepKeyHash { size_t operator()(const KStepKey& k) const noexcept {
 // Captured graphs borrow this model's weights and KV cache.
 struct SpecState {
     std::unique_ptr<DeviceCache> device_cache;
+    // forward_decode's step plans ([1]: voxtral steps carrying an audio row).
+    std::unique_ptr<Backend::StepAlloc> decode_alloc[2];
     std::unique_ptr<PrefillCache> prefill_cache;
     std::unordered_map<KStepKey, std::unique_ptr<KStepGraph>, KStepKeyHash> kstep;
 };
@@ -590,12 +592,12 @@ DeviceCache* get_device_cache(const QwenDecodeCtx& m, std::string& e) {
 // (device-resident, flows straight from the previous layer). Writes this step's
 // k/v into the device cache in-graph and assembles kall/vall for attention.
 //   kv_mode 0 = prefill exact (cpy slots [0,S), attend to new k/v)
-//   kv_mode 1 = decode exact-width (cpy slot `past`, attend [0, past+S))
+//   kv_mode 1 = decode exact-width (set_rows slot `past`, attend its [0, past+S) prefix)
 //   kv_mode 2 = decode full-capacity (set_rows slot `past`, attend [0, max_cache))
 //   kv_mode 3 = batched verify (copy S slots; by default each query row reduces
 //               over its own [0, past+row+1) prefix; <label>_VERIFY_BATCH_ATTN
 //               uses one [0, past+S) reduction with a causal mask)
-// idx_past is the runtime i32[S] write-index vector used only by mode 2.
+// idx_past is the runtime i32[S] write-index vector used by modes 1 and 2.
 // cs/sn are [D, S] bf16 (RoPE rows). mask is f32 [K, S] (K = past+S for modes
 // 0/1/3, max_cache for mode 2).
 ggml_tensor* append_layer_new(ggml_context* c, const QwenDecodeCtx& m, int li,
@@ -714,7 +716,16 @@ ggml_tensor* append_layer_new(ggml_context* c, const QwenDecodeCtx& m, int li,
         // we use directly as kall -> the set_rows executes before attention.
         kall = ggml_set_rows(c, cache_k, ff(c, k), idx_past);
         vall = ggml_set_rows(c, cache_v, ff(c, v), idx_past);
-    } else {                       // single-step prefix or bounded batched prefix
+    } else if (kv_mode == 1) {     // decode exact-width
+        // Same slot write as mode 2 (bit-exact: k/v are bf16 values), but
+        // attention reads the [D, past+S, KV] prefix of the updated cache in
+        // place. The view hangs off the set_rows result, so the write runs
+        // first; no per-step f32 concat copy of the whole cache.
+        ggml_tensor* kc = ggml_set_rows(c, cache_k, ff(c, k), idx_past);
+        ggml_tensor* vc = ggml_set_rows(c, cache_v, ff(c, v), idx_past);
+        kall = ggml_view_3d(c, kc, D, past + S, KV, kc->nb[1], kc->nb[2], 0);
+        vall = ggml_view_3d(c, vc, D, past + S, KV, vc->nb[1], vc->nb[2], 0);
+    } else {                       // bounded batched prefix (verify)
         ggml_tensor* kslot = ggml_view_3d(c, cache_k, D, S, KV,
                                           cache_k->nb[1], cache_k->nb[2],
                                           (size_t)past * cache_k->nb[1]);
@@ -954,6 +965,8 @@ bool forward_prefill(const QwenDecodeCtx& m, const std::vector<float>& input,
 // audio_row, the [hidden] f32 row is added (bf16 round) to the looked-up
 // embedding — voxtral's additive injection. Null row keeps the historical
 // op sequence for every other engine.
+constexpr int64_t kDecodePlanBucket = 256;
+
 bool forward_decode(const QwenDecodeCtx& m, int32_t prev_token, int64_t past,
                     LlmState& state, std::vector<float>& logits,
                     std::string& e, const float* audio_row = nullptr) {
@@ -977,9 +990,12 @@ bool forward_decode(const QwenDecodeCtx& m, int32_t prev_token, int64_t past,
             mask_full[(size_t)j] = neg;
     }
     const std::vector<float>& mask = fullcap ? mask_full : mask_exact;
-    const int64_t mask_w = fullcap ? (int64_t)lc.max_cache : K;
+    // The graph's write slot: `past` for the real step, the bucket's last slot
+    // for the worst-case build the step plan is reserved with (below).
+    int64_t gp = past;
 
-    bool ok = run_graph([&](ggml_context* c) -> ggml_tensor* {
+    auto build = [&](ggml_context* c) -> ggml_tensor* {
+        const int64_t mask_w = fullcap ? (int64_t)lc.max_cache : gp + S;
         int64_t one[1] = {1};
         ggml_tensor* id_t = graph_input_tensor(c, GGML_TYPE_I32, 1, one,
                                                &prev_token, sizeof(int32_t));
@@ -1002,18 +1018,36 @@ bool forward_decode(const QwenDecodeCtx& m, int32_t prev_token, int64_t past,
         int64_t mne[2] = {mask_w, 1};
         ggml_tensor* mt = graph_input_tensor(c, GGML_TYPE_F32, 2, mne,
                                              mask.data(), mask.size() * sizeof(float));
-        ggml_tensor* idx_t = fullcap
-            ? graph_input_tensor(c, GGML_TYPE_I32, 1, one, idx_past.data(), sizeof(int32_t))
-            : nullptr;
+        ggml_tensor* idx_t = graph_input_tensor(c, GGML_TYPE_I32, 1, one,
+                                                idx_past.data(), sizeof(int32_t));
         for (int li = 0; li < (int)lc.n_layers; ++li)
-            x = append_layer_new(c, m, li, x, S, past, dc->k[li], dc->v[li],
+            x = append_layer_new(c, m, li, x, S, gp, dc->k[li], dc->v[li],
                                  cs, sn, mt, kv_mode, idx_t, nullptr);
         ggml_tensor* n = DF ? rmsf(c, m.loader, x, "llm.final_norm.weight", lc.rms_norm_eps)
                             : rms(c, m.loader, x, "llm.final_norm.weight", lc.rms_norm_eps);
         ggml_tensor* lg = lm_head_gemm(c, m.loader, m.spec, n);
         return ff(c, apply_logits_scaling(c, m.spec, lg));
-    }, logits);
-    if (!ok) { e = std::string(m.spec.label) + " decode graph failed"; return false; }
+    };
+
+    // Every step has the same topology; only the attention width grows. Plan
+    // the step allocation once per kDecodePlanBucket slots for the bucket's
+    // widest step, so the steps in between reuse it instead of re-planning
+    // (and regrowing the compute buffer) on every token. One plan per graph
+    // topology: voxtral's steps with and without an audio row differ.
+    std::lock_guard<std::recursive_mutex> lk(runtime_mutex());
+    auto& sa = state_for(m.loader).decode_alloc[(m.spec.decode_add && audio_row) ? 1 : 0];
+    if (!sa) sa = std::make_unique<Backend::StepAlloc>();
+    if (!fullcap && K > sa->reserved) {
+        const int64_t W = std::min<int64_t>((int64_t)lc.max_cache,
+            (K + kDecodePlanBucket - 1) / kDecodePlanBucket * kDecodePlanBucket);
+        gp = W - S;
+        const bool planned = global_backend().reserve_steps(*sa, W, build);
+        gp = past;
+        if (!planned) { e = std::string(m.spec.label) + " decode plan failed"; return false; }
+    }
+    if (!global_backend().compute_step(*sa, build, logits)) {
+        e = std::string(m.spec.label) + " decode graph failed"; return false;
+    }
     state.length = past + S;
     return true;
 }

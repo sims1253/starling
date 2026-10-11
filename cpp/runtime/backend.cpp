@@ -40,6 +40,7 @@
 #include <fstream>
 #include <map>
 #include <memory>
+#include <new>
 #include <mutex>
 #include <stdexcept>
 #include <system_error>
@@ -221,6 +222,12 @@ struct Backend::Impl {
     ggml_gallocr_t galloc = nullptr;        // persistent, reused across one-shot computes
     ggml_backend_sched_t sched = nullptr;   // lazy; GPU op offload + imatrix collection
     bool use_sched = false;                 // true iff a GPU backend is active
+    // Metadata arena for one-shot build contexts (~13 MiB at kGraphSize).
+    // A fresh ggml_init per graph maps and unmaps it every decode step and
+    // faults the touched pages back in; the arena is reused instead. A
+    // nested compute (a build lambda that runs another graph) gets its own.
+    std::unique_ptr<uint8_t[]> ctx_arena;
+    bool ctx_arena_busy = false;
 
     ~Impl() {
         if (shutting_down()) return;
@@ -456,27 +463,105 @@ static void tensor_get_f32(ggml_backend_t backend, const ggml_tensor* t,
     raw_bytes_to_f32(t->type, raw.data(), nbytes, out);
 }
 
+namespace {
+
+// A no_alloc=true metadata context for one one-shot graph, built in the
+// backend's reusable arena when it is free.
+//    ggml_graph_overhead_custom(kGraphSize, ...) reserves node/leaf slot
+//    capacity matching the cgraph allocated below (ggml_new_graph_custom);
+//    the default ggml_new_graph() caps at GGML_DEFAULT_GRAPH_SIZE (2048)
+//    nodes, which the parakeet conformer encoder (24 layers, ~2400 ops)
+//    overflows.
+class BuildContext {
+public:
+    BuildContext(std::unique_ptr<uint8_t[]>& arena, bool& busy) {
+        const size_t size = ggml_tensor_overhead() * kGraphSize
+                          + ggml_graph_overhead_custom(kGraphSize, false);
+        void* mem = nullptr;
+        if (!busy) {
+            if (!arena) arena.reset(new (std::nothrow) uint8_t[size]);
+            if (arena) {
+                mem = arena.get();
+                busy_ = &busy;
+                busy = true;
+            }
+        }
+        struct ggml_init_params params = {
+            /*.mem_size   =*/ size,
+            /*.mem_buffer =*/ mem,
+            /*.no_alloc   =*/ true,
+        };
+        ctx_ = ggml_init(params);
+    }
+    ~BuildContext() {
+        if (ctx_) ggml_free(ctx_);
+        if (busy_) *busy_ = false;
+    }
+    BuildContext(const BuildContext&) = delete;
+    BuildContext& operator=(const BuildContext&) = delete;
+    ggml_context* get() const { return ctx_; }
+private:
+    ggml_context* ctx_ = nullptr;
+    bool* busy_ = nullptr;
+};
+
+} // namespace
+
+Backend::StepAlloc::~StepAlloc() {
+    if (galloc_ && !shutting_down()) ggml_gallocr_free(galloc_);
+}
+
+bool Backend::reserve_steps(StepAlloc& sa, int64_t key,
+                            const std::function<ggml_tensor*(ggml_context*)>& build) {
+    std::unique_lock<std::recursive_mutex> runtime_lock(runtime_mutex(), std::defer_lock);
+    if (!is_gpu() && cpu_repack::enabled()) runtime_lock.lock();
+    BuildContext bctx(impl_->ctx_arena, impl_->ctx_arena_busy);
+    ggml_context* ctx = bctx.get();
+    if (!ctx) return false;
+    std::vector<PendingInput> pin;
+    std::vector<PendingCapture> pcap;
+    std::vector<ggml_tensor*> roots;
+    ggml_tensor* out_t;
+    {
+        BuildScope scope(*this, pin, pcap, roots);
+        out_t = build(ctx);
+    }
+    if (!out_t) return false;
+    // Mirror compute()'s graph exactly (output flag, captures, roots), so the
+    // plan's node/leaf lists line up with the steps run against it.
+    ggml_set_output(out_t);
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx, kGraphSize, false);
+    ggml_build_forward_expand(gf, out_t);
+    for (const auto& c : pcap) ggml_build_forward_expand(gf, c.t);
+    for (ggml_tensor* r : roots) ggml_build_forward_expand(gf, r);
+    if (!sa.galloc_)
+        sa.galloc_ = ggml_gallocr_new(ggml_backend_get_default_buffer_type(impl_->backend));
+    if (!sa.galloc_ || !ggml_gallocr_reserve(sa.galloc_, gf)) return false;
+    sa.reserved = key;
+    return true;
+}
+
 bool Backend::compute(const std::function<ggml_tensor*(ggml_context*)>& build,
                       std::vector<float>& out) {
+    return compute_impl(build, out, nullptr);
+}
+
+bool Backend::compute_step(StepAlloc& sa,
+                           const std::function<ggml_tensor*(ggml_context*)>& build,
+                           std::vector<float>& out) {
+    return compute_impl(build, out, &sa);
+}
+
+bool Backend::compute_impl(const std::function<ggml_tensor*(ggml_context*)>& build,
+                           std::vector<float>& out, StepAlloc* sa) {
     // CPU weight repacking rewrites borrowed bytes on first use. Serialize
     // direct C++ callers with loader release and captured graph execution;
     // run_graph/C API callers already hold this recursive mutex.
     std::unique_lock<std::recursive_mutex> runtime_lock(runtime_mutex(), std::defer_lock);
     if (!is_gpu() && cpu_repack::enabled()) runtime_lock.lock();
-    // 1. Build in a no_alloc=true metadata context.
-    //    ggml_graph_overhead_custom(kGraphSize, ...) reserves node/leaf slot
-    //    capacity matching the cgraph allocated below (ggml_new_graph_custom);
-    //    the default ggml_new_graph() caps at GGML_DEFAULT_GRAPH_SIZE (2048)
-    //    nodes, which the parakeet conformer encoder (24 layers, ~2400 ops)
-    //    overflows.
-    struct ggml_init_params params = {
-        /*.mem_size   =*/ ggml_tensor_overhead() * kGraphSize
-                         + ggml_graph_overhead_custom(kGraphSize, false),
-        /*.mem_buffer =*/ nullptr,
-        /*.no_alloc   =*/ true,
-    };
-    std::unique_ptr<ggml_context, decltype(&ggml_free)> ctx_owner(ggml_init(params), ggml_free);
-    ggml_context* ctx = ctx_owner.get();
+    // 1. Build in a no_alloc=true metadata context (see BuildContext).
+    BuildContext bctx(impl_->ctx_arena, impl_->ctx_arena_busy);
+    ggml_context* ctx = bctx.get();
     if (!ctx) return false;
     std::vector<PendingInput> pin;
     std::vector<PendingCapture> pcap;
@@ -517,8 +602,11 @@ bool Backend::compute(const std::function<ggml_tensor*(ggml_context*)>& build,
     }
     bool ok = false;
     if (!need_sched) {
-        if (!impl_->galloc) impl_->galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(impl_->backend));
-        if (ggml_gallocr_alloc_graph(impl_->galloc, gf)) {
+        // A StepAlloc's private gallocr keeps its reserved plan; everything
+        // else shares the persistent one.
+        ggml_gallocr_t& galloc = sa ? sa->galloc_ : impl_->galloc;
+        if (!galloc) galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(impl_->backend));
+        if (ggml_gallocr_alloc_graph(galloc, gf)) {
             // 4. Push host inputs AFTER alloc (->data was NULL until now).
             //    Inputs not reachable from the expanded graph get no
             //    allocation (data == NULL); skip those (diagnostic early-
