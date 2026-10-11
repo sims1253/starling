@@ -21,8 +21,12 @@
 // head_dim (theta 1e6), and a band-causal sliding-window mask: position i
 // attends j iff j <= i && i-j < window, blocked cells getting bf16-min
 // (-3.3895313892515355e38, torch.finfo(bf16).min) added to the f32 scores
-// before softmax. The mask is a per-T_enc [T_enc, T_enc] f32 graph input;
-// its memory is the O(T^2) budget (see kVoxtralMaxMaskBytes).
+// before softmax. Queries run in blocks of kAttnQueryBlock: block [q0, q1)
+// only scores keys [max(0, q0-window+1), q1) (every other key is masked for
+// all of its queries), so the score tensors are O(T * (window + block))
+// instead of O(T^2 * heads) (a 74 s clip's full [T, T, 32] f32 scores alone
+// were 2 GB). The per-block masks are packed into one f32 graph input; a
+// T_enc <= kAttnQueryBlock is the single full [T_enc, T_enc] block.
 //
 // Numeric discipline: the bf16 oracle (activations in bf16, elementwise math
 // in f32, rounding at the bf16 boundary), matching the checkpoint dtype.
@@ -59,6 +63,44 @@ using lib::f32;
 // Blocked-attention additive constant: torch.finfo(bfloat16).min, the value
 // the stock mask materializes in the encoder dtype.
 constexpr float kMaskedBias = -3.389531388998e38f;  // nearest f32 to -3.3895313892515355e38
+
+// Query-block size of the encoder attention (see the header comment).
+constexpr int64_t kAttnQueryBlock = 512;
+
+// One query block: queries [q0, q1) against keys [k0, q1); its [keys,
+// queries] mask (key-contiguous rows, element (i,j) at (i-q0)*(q1-k0)+j-k0)
+// starts `off` floats into the packed mask.
+struct AttnBlock {
+    int64_t q0, q1, k0, off;
+};
+
+std::vector<AttnBlock> attn_blocks(int64_t T, int64_t window) {
+    std::vector<AttnBlock> b;
+    int64_t off = 0;
+    for (int64_t q0 = 0; q0 < T; q0 += kAttnQueryBlock) {
+        const int64_t q1 = std::min(T, q0 + kAttnQueryBlock);
+        const int64_t k0 = std::max<int64_t>(0, q0 - window + 1);
+        b.push_back({q0, q1, k0, off});
+        off += (q1 - k0) * (q1 - q0);
+    }
+    return b;
+}
+
+// Packed band mask over `blocks`: 0 when j <= i && i-j < window, else
+// bf16-min. A single block is exactly the query-major [T, T] mask.
+std::vector<float> packed_band_mask(const std::vector<AttnBlock>& blocks,
+                                    int64_t window) {
+    const AttnBlock& last = blocks.back();
+    std::vector<float> m((size_t)(last.off + (last.q1 - last.k0) * (last.q1 - last.q0)));
+    for (const AttnBlock& b : blocks) {
+        const int64_t K = b.q1 - b.k0;
+        for (int64_t i = b.q0; i < b.q1; ++i)
+            for (int64_t j = b.k0; j < b.q1; ++j)
+                m[(size_t)(b.off + (i - b.q0) * K + (j - b.k0))] =
+                    (j <= i && i - j < window) ? 0.0f : kMaskedBias;
+    }
+    return m;
+}
 
 bool debug_enabled() {
     return lib::debug_enabled("STARLING_VOXTRAL_DEBUG");
@@ -193,12 +235,13 @@ ggml_tensor* apply_vox_rope(ggml_context* c, ggml_tensor* x, ggml_tensor* cos_t,
 }
 
 // Band-causal sliding-window attention (full MHA). q/k/v are [AW, T] bf16.
-// `mask` is the [T, T] f32 additive band mask (query-major: element (i,j) at
-// i*T+j); `cos_t`/`sin_t` are the [T, head_dim/2] f32 RoPE tables. Returns
-// [AW, T] bf16. When `cap` is non-null and li==0, captures the layer-0 bisect
-// stages RAW ([AW, T] ggml flat == torch [T, AW] row-major flat, so the test
-// compares flats directly; prob is [T, T, H] with head 0 first in the same
-// correspondence). Readback converts bf16; no extra graph nodes.
+// `mask` is the packed per-block f32 additive band mask (packed_band_mask
+// over attn_blocks(T, window)); `cos_t`/`sin_t` are the [T, head_dim/2] f32
+// RoPE tables. Returns [AW, T] bf16. When `cap` is non-null and li==0,
+// captures the layer-0 bisect stages RAW ([AW, T] ggml flat == torch [T, AW]
+// row-major flat, so the test compares flats directly; prob is [T, T, H] with
+// head 0 first in the same correspondence, single-block T only). Readback
+// converts bf16; no extra graph nodes.
 ggml_tensor* band_attention(ggml_context* ctx, const VoxtralModel& model,
                             ggml_tensor* q, ggml_tensor* k, ggml_tensor* v,
                             ggml_tensor* mask, ggml_tensor* cos_t,
@@ -222,21 +265,44 @@ ggml_tensor* band_attention(ggml_context* ctx, const VoxtralModel& model,
     ggml_tensor* qh = to_heads(q);
     ggml_tensor* kh = to_heads(k);
     ggml_tensor* vh = to_heads(v);
-    // Scores [T, T, H]: K^T Q, scaled in f32. HF numerics: the bf16 matmul
-    // rounds its output once, then the scalar scale rounds again (torch
-    // elementwise bf16 ops); the f32 band mask is added AFTER, in f32, and
-    // the softmax reduces in f32. The mask input is query-major rows
-    // ([T queries, T keys], element (q,k) at q*T+k), which is exactly the
-    // softmax kernel's access (row i01 = query i01, reduced contiguously
-    // over keys), so it feeds soft_max_ext directly.
-    ggml_tensor* scores = ggml_mul_mat(ctx, kh, qh);  // [T(keys), T(queries), H]
-    scores = f32(ctx, bf16(ctx, scores));
-    scores = f32(ctx, bf16(ctx, ggml_scale(ctx, scores, scale)));
-    ggml_tensor* prob = ggml_soft_max_ext(ctx, scores, f32(ctx, mask), 1.0f, 0.0f);
-    prob = bf16(ctx, prob);
-    if (cap && li == 0 && cap->l0_prob) capture_graph_output(prob, cap->l0_prob);
     ggml_tensor* vt = ggml_cont(ctx, ggml_permute(ctx, vh, 1, 0, 2, 3));  // [T, D, H]
-    ggml_tensor* co = bf16(ctx, ggml_mul_mat(ctx, vt, prob));             // [D, T, H]
+    const std::vector<AttnBlock> blocks = attn_blocks(T, model.config.encoder.sliding_window);
+    std::vector<ggml_tensor*> outs;
+    for (const AttnBlock& b : blocks) {
+        const int64_t Q = b.q1 - b.q0, K = b.q1 - b.k0;
+        const bool whole = Q == T && K == T;
+        ggml_tensor* qb = whole ? qh : ggml_cont(ctx, ggml_view_3d(ctx, qh, D, Q, H,
+            qh->nb[1], qh->nb[2], (size_t) b.q0 * qh->nb[1]));
+        ggml_tensor* kb = whole ? kh : ggml_cont(ctx, ggml_view_3d(ctx, kh, D, K, H,
+            kh->nb[1], kh->nb[2], (size_t) b.k0 * kh->nb[1]));
+        ggml_tensor* vb = whole ? vt : ggml_cont(ctx, ggml_view_3d(ctx, vt, K, D, H,
+            vt->nb[1], vt->nb[2], (size_t) b.k0 * vt->nb[0]));
+        ggml_tensor* mb = ggml_view_2d(ctx, mask, K, Q, (size_t) K * mask->nb[0],
+                                       (size_t) b.off * mask->nb[0]);
+        // Scores [K, Q, H]: K^T Q, scaled in f32. HF numerics: the bf16
+        // matmul rounds its output once, then the scalar scale rounds again
+        // (torch elementwise bf16 ops); the f32 band mask is added AFTER, in
+        // f32, and the softmax reduces in f32. The block mask is query-major
+        // rows ([Q queries, K keys]), exactly the softmax kernel's access
+        // (row i01 = query i01, reduced contiguously over keys).
+        ggml_tensor* scores = ggml_mul_mat(ctx, kb, qb);  // [K(keys), Q(queries), H]
+        scores = f32(ctx, bf16(ctx, scores));
+        scores = f32(ctx, bf16(ctx, ggml_scale(ctx, scores, scale)));
+        ggml_tensor* prob = ggml_soft_max_ext(ctx, scores, mb, 1.0f, 0.0f);
+        prob = bf16(ctx, prob);
+        if (whole && cap && li == 0 && cap->l0_prob) capture_graph_output(prob, cap->l0_prob);
+        outs.push_back(f32(ctx, bf16(ctx, ggml_mul_mat(ctx, vb, prob))));  // [D, Q, H]
+    }
+    // Pairwise (tree) concat of the query blocks back to [D, T, H]: log2
+    // levels of copies instead of a quadratic chain.
+    while (outs.size() > 1) {
+        std::vector<ggml_tensor*> next;
+        for (size_t i = 0; i + 1 < outs.size(); i += 2)
+            next.push_back(ggml_concat(ctx, outs[i], outs[i + 1], 1));
+        if (outs.size() % 2) next.push_back(outs.back());
+        outs.swap(next);
+    }
+    ggml_tensor* co = bf16(ctx, outs[0]);                                 // [D, T, H]
     co = ggml_cont(ctx, ggml_permute(ctx, co, 0, 2, 1, 3));               // [D, H, T]
     ggml_tensor* cout = ggml_reshape_2d(ctx, co, AW, T);
     if (cap && li == 0 && cap->l0_ctx) capture_graph_output(cout, cap->l0_ctx);
@@ -332,7 +398,7 @@ struct EncoderReplayEntry {
     float* mel_pad_buf = nullptr;    // [(mel_T+2)*n_mels] f32, conv1's padded input
     float* c1_pad_buf = nullptr;     // [3*Dm*T_enc] f32, conv2's staged window columns
     std::vector<float> c1_rows;      // conv1 graph output staging [mel_T*Dm]
-    float* mask_buf = nullptr;       // [T_enc*T_enc] f32 band mask
+    float* mask_buf = nullptr;       // packed per-block f32 band mask
     float* cos_buf = nullptr;        // [T_enc*head_dim/2] f32 RoPE cos
     float* sin_buf = nullptr;        // [T_enc*head_dim/2] f32 RoPE sin
 };
@@ -382,8 +448,10 @@ bool encode_audio_and_project(const VoxtralModel& model, const MelFeatures& mel,
         err = "VOXTRAL encoder length not divisible by the projector downsample";
         return false;
     }
-    // Mask-memory guard: the [T_enc, T_enc] f32 band mask is the O(T^2)
-    // term; reject with a shorter-audio hint before allocating anything.
+    // Length guard, sized as a full [T_enc, T_enc] f32 mask (T_enc <= 16384,
+    // the 4096-token cache cap): the blocked attention itself only needs
+    // O(T * (window + block)); reject with a shorter-audio hint before
+    // allocating anything.
     {
         double bytes = (double) T_enc * (double) T_enc * 4.0;
         if (bytes > (double) kVoxtralMaxMaskBytes) {
@@ -425,13 +493,11 @@ bool encode_audio_and_project(const VoxtralModel& model, const MelFeatures& mel,
             sin_tab[(size_t) p * half + i] = (float) std::sin(a);
         }
     }
-    // Band mask [T_enc, T_enc] f32 query-major (element (i,j) at i*T+j):
-    // 0 when j <= i && i-j < window, else bf16-min.
-    std::vector<float> mask((size_t) T_enc * T_enc);
-    for (int64_t i = 0; i < T_enc; ++i)
-        for (int64_t j = 0; j < T_enc; ++j)
-            mask[(size_t) i * T_enc + j] =
-                (j <= i && i - j < (int64_t) ec.sliding_window) ? 0.0f : kMaskedBias;
+    // Packed per-query-block band masks (a single block is the query-major
+    // [T_enc, T_enc] mask, element (i,j) at i*T+j): 0 when j <= i && i-j <
+    // window, else bf16-min.
+    const std::vector<float> mask = packed_band_mask(
+        attn_blocks(T_enc, ec.sliding_window), ec.sliding_window);
 
     // ---- CPU host path: scalar convs, one-shot layers+projector graph -------
     if (!use_replay) {
@@ -469,8 +535,8 @@ bool encode_audio_and_project(const VoxtralModel& model, const MelFeatures& mel,
             // The bf16 conv output feeds the layers through the bf16 oracle
             // boundary (linear_bf16 casts inputs explicitly; the input tensor
             // itself stays bf16 so no in-graph f32->bf16 pool conversion).
-            int64_t mne[2] = {T_enc, T_enc};
-            ggml_tensor* m = graph_input_tensor(ctx, GGML_TYPE_F32, 2, mne,
+            int64_t mne[1] = {(int64_t) mask.size()};
+            ggml_tensor* m = graph_input_tensor(ctx, GGML_TYPE_F32, 1, mne,
                                                 mask.data(), mask.size() * sizeof(float));
             int64_t rne[2] = {half, T_enc};
             ggml_tensor* co = graph_input_tensor(ctx, GGML_TYPE_F32, 2, rne,
@@ -519,15 +585,14 @@ bool encode_audio_and_project(const VoxtralModel& model, const MelFeatures& mel,
             entry.c1_pad_buf = reinterpret_cast<float*>(entry.pool.alloc_bytes(
                 (size_t) 3 * Dm * T_enc * sizeof(float)));
             entry.mask_buf = reinterpret_cast<float*>(entry.pool.alloc_bytes(
-                (size_t) T_enc * T_enc * sizeof(float)));
+                mask.size() * sizeof(float)));
             entry.cos_buf = reinterpret_cast<float*>(entry.pool.alloc_bytes(
                 (size_t) T_enc * half * sizeof(float)));
             entry.sin_buf = reinterpret_cast<float*>(entry.pool.alloc_bytes(
                 (size_t) T_enc * half * sizeof(float)));
             std::memcpy(entry.mel_pad_buf, mel_pad.data(),
                         (size_t)(mel_T + 2) * Pm * sizeof(float));
-            std::memcpy(entry.mask_buf, mask.data(),
-                        (size_t) T_enc * T_enc * sizeof(float));
+            std::memcpy(entry.mask_buf, mask.data(), mask.size() * sizeof(float));
             std::memcpy(entry.cos_buf, cos_tab.data(),
                         (size_t) T_enc * half * sizeof(float));
             std::memcpy(entry.sin_buf, sin_tab.data(),
@@ -600,9 +665,9 @@ bool encode_audio_and_project(const VoxtralModel& model, const MelFeatures& mel,
                     ggml_tensor* g2 = exact_gelu(ctx, bf16(ctx, c2));  // bf16 [Dm, T_enc]
                     if (dbg && dbg->embedder)
                         capture_graph_output(f32(ctx, g2), dbg->embedder);
-                    int64_t mne[2] = {T_enc, T_enc};
-                    ggml_tensor* m = graph_input_tensor(ctx, GGML_TYPE_F32, 2, mne,
-                        entry.mask_buf, (size_t) T_enc * T_enc * sizeof(float));
+                    int64_t mne[1] = {(int64_t) mask.size()};
+                    ggml_tensor* m = graph_input_tensor(ctx, GGML_TYPE_F32, 1, mne,
+                        entry.mask_buf, mask.size() * sizeof(float));
                     int64_t rne[2] = {half, T_enc};
                     ggml_tensor* co = graph_input_tensor(ctx, GGML_TYPE_F32, 2, rne,
                         entry.cos_buf, (size_t) T_enc * half * sizeof(float));
@@ -620,7 +685,7 @@ bool encode_audio_and_project(const VoxtralModel& model, const MelFeatures& mel,
     // Refresh the varying inputs in their stable pool buffers, then re-upload.
     std::memcpy(e.mel_pad_buf, mel_pad.data(),
                 (size_t)(mel_T + 2) * Pm * sizeof(float));
-    std::memcpy(e.mask_buf, mask.data(), (size_t) T_enc * T_enc * sizeof(float));
+    std::memcpy(e.mask_buf, mask.data(), mask.size() * sizeof(float));
     std::memcpy(e.cos_buf, cos_tab.data(), (size_t) T_enc * half * sizeof(float));
     std::memcpy(e.sin_buf, sin_tab.data(), (size_t) T_enc * half * sizeof(float));
     for (size_t i = 0; i < e.conv1_graph->n_inputs(); ++i)

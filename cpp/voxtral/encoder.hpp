@@ -61,8 +61,9 @@ struct EncoderDebug {
     std::vector<float>* l0_ffn = nullptr;  // post-ffn-down, pre-residual
 };
 
-// Band-mask budget: the [T_enc, T_enc] f32 additive mask is the O(T^2) term.
-// A T_enc whose mask exceeds this is rejected with a shorter-audio hint.
+// Encoder length budget, expressed as a full [T_enc, T_enc] f32 mask (the
+// query-blocked attention needs far less). A T_enc whose full mask would
+// exceed this is rejected with a shorter-audio hint.
 constexpr int64_t kVoxtralMaxMaskBytes = 1LL << 30;
 
 // Full encoder: mel -> convs -> layers -> final norm -> projector. Returns
