@@ -124,10 +124,18 @@ bool compute_log_mel(const Config& cfg, const ModelLoader& ml, const float* pcm,
     }
     ensure_mel_constants(cfg, const_cast<ModelLoader&>(ml));
     // Offline pad: ceil to whole 1280-sample audio tokens, plus the 32 left
-    // + 17 right streaming-pad tokens of zeros.
+    // + 17 right streaming-pad tokens of zeros. mistral-common pads BOTH
+    // sides (np.pad(audio, (left, right))): the speech starts after the 32
+    // left-pad tokens, so the prompt's 38 streaming pads cover silence plus
+    // the first 6 (delay) audio tokens.
     const size_t P = (size_t) offline_padded_samples((int64_t) S);
+    const size_t left = (size_t) cfg.frontend.left_pad_tokens * cfg.frontend.unit_samples;
+    if (left + S > P) {
+        err = "VOXTRAL frontend left pad exceeds the offline pad budget";
+        return false;
+    }
     std::vector<float> padded(P, 0.0f);
-    if (pcm && S) std::copy(pcm, pcm + S, padded.begin());
+    if (pcm && S) std::copy(pcm, pcm + S, padded.begin() + (std::ptrdiff_t) left);
     lib::MelPolicy pol = lib::make_mel_policy(cfg.frontend, kMelPolicy);
     // The FIXED global log-mel max (streaming-safe normalization): the STOCK
     // extractor clamps against this constant, not a per-utterance max.

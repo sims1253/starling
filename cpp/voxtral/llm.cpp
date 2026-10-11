@@ -15,6 +15,8 @@
 #include "lib/graph_helpers.hpp"
 #include "lib/qwen_decode.hpp"
 
+#include <cstdio>
+#include <cstdlib>
 #include <string>
 
 namespace starling::ggml::voxtral {
@@ -146,6 +148,14 @@ bool greedy_generate(const VoxtralModel& m, const InputsEmbeds& prefill,
     // budget-exhausted (truncated, not a completed decode).
     out.stop_reason = prev == op.eos_token_id ? lib::GenStopReason::kEos
                                               : lib::GenStopReason::kBudgetExhausted;
+    // STARLING_VOXTRAL_DUMP_IDS=<file> dumps the generated ids (i32), as the
+    // shared greedy loop does for the other engines.
+    if (const char* fp = std::getenv("STARLING_VOXTRAL_DUMP_IDS")) {
+        if (FILE* f = std::fopen(fp, "wb")) {
+            std::fwrite(out.ids.data(), sizeof(int32_t), out.ids.size(), f);
+            std::fclose(f);
+        }
+    }
     return true;
 }
 

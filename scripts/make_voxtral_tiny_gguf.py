@@ -26,7 +26,8 @@ verification (do not relax tolerances). The greedy ids still match on CPU.
 
 Reference pipeline (0.5 s synthetic waveform, torch CPU, bf16 wherever the
 C++ oracle rounds):
-  pcm (8000 samples) -> offline pad (ceil to 1280 + 49*1280 zeros) ->
+  pcm (8000 samples) -> offline pad (32*1280 zeros, pcm, zeros up to a
+  whole 1280 + 17*1280: mistral-common pads both sides) ->
   stock-formula mel (torch.stft center=True hann-400, mag^2 with the
   stft[..., :-1] trailing-TIME-frame drop canceling center's +1, log10 clamp
   1e-10, floor (1.5-8), (x+4)/4) -> embedder out -> each encoder layer out ->
@@ -62,7 +63,7 @@ def bf16(a: torch.Tensor) -> torch.Tensor:
 def rms_norm(x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
     # Stock VoxtralRealtimeRMSNorm: TWO bf16 stores — round the normalized
     # value, then round the weight multiply.
-    y = bf16(F.rms_norm(x.float(), (x.shape[-1],)))
+    y = bf16(F.rms_norm(x.float(), (x.shape[-1],), eps=eps))
     return bf16(y.float() * w.float())
 
 
@@ -83,7 +84,12 @@ def main() -> None:
         N_HEADS, LLM_Q = 3, 12
         AW = N_HEADS * HEAD_DIM
     torch.manual_seed(0xC0FFEE)
-    g = torch.Generator().manual_seed(1234)
+    # The C++ tests compare at bf16 exactness, so a GEMM output within ~1e-7
+    # of a bf16 rounding midpoint flips on a different f32 accumulation order
+    # and the random weights amplify the flip downstream. Seed 1234 hit one
+    # such near-tie (rel 2e-9) in the leading-silence rows once the offline
+    # pad moved to the left; seed 2 has none on CPU.
+    g = torch.Generator().manual_seed(2)
 
     def rand(*shape: int) -> torch.Tensor:
         return bf16(torch.randn(*shape, generator=g) * 0.4)
@@ -134,10 +140,13 @@ def main() -> None:
     t = torch.arange(8000, dtype=torch.float32) / SR
     pcm = (0.5 * torch.sin(2 * math.pi * 440.0 * t) +
            0.25 * torch.sin(2 * math.pi * 880.0 * t + 1.0)).tolist()
-    # Offline pad: ceil(S/1280)*1280 + 49*1280 zeros.
+    # Offline pad (mistral-common np.pad(audio, (left, right))): 32 left-pad
+    # tokens of zeros, the pcm, then zeros to a whole 1280 + 17 right-pad
+    # tokens.
     S = len(pcm)
     body = ((S + 1279) // 1280) * 1280
-    padded = torch.tensor(pcm + [0.0] * (body - S + 49 * 1280), dtype=torch.float32)
+    padded = torch.tensor([0.0] * (32 * 1280) + pcm + [0.0] * (body - S + 17 * 1280),
+                          dtype=torch.float32)
     # Stock-formula mel (torch.stft, center=True, hann-400, mag^2 -- the
     # stft[..., :-1] drops the trailing TIME frame, canceling center's +1, so
     # mel_T == padded//hop exactly -- log10 clamp 1e-10, fixed floor (1.5-8),
