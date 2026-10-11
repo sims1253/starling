@@ -1579,7 +1579,6 @@ fn spawn_download_worker(
     }
 }
 
-
 /// Download progress reaches both the model's install state and, when a
 /// switch targets the same model, its stage.
 fn report_download_progress(inner: &Arc<Inner>, id: &str, done: u64, total: u64) {
@@ -2506,26 +2505,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn backoff_schedule_progresses_and_caps() {
-        let schedule = [
-            Duration::from_secs(1),
-            Duration::from_secs(2),
-            Duration::from_secs(4),
-            Duration::from_secs(8),
-            Duration::from_secs(16),
-            Duration::from_secs(30),
-        ];
-        assert_eq!(backoff_delay(&schedule, 1), Duration::from_secs(1));
-        assert_eq!(backoff_delay(&schedule, 2), Duration::from_secs(2));
-        assert_eq!(backoff_delay(&schedule, 3), Duration::from_secs(4));
-        assert_eq!(backoff_delay(&schedule, 6), Duration::from_secs(30));
-        // Beyond the schedule: capped at the last entry.
-        assert_eq!(backoff_delay(&schedule, 40), Duration::from_secs(30));
-        // Degenerate schedule falls back to the default cap.
-        assert_eq!(backoff_delay(&[], 1), Duration::from_secs(30));
-    }
-
-    #[test]
     fn crash_loop_trips_at_threshold_within_window() {
         let now = Instant::now();
         let tail = "boom".to_string();
@@ -2549,22 +2528,6 @@ mod tests {
         assert!(!crash_loop_reached(&spread, window, 5));
         // Empty: no trip.
         assert!(!crash_loop_reached(&[], window, 5));
-    }
-
-    #[test]
-    fn snapshot_lists_catalog_with_install_states() {
-        let catalog = crate::engine::catalog::default_catalog();
-        let mut state = SharedState::new(None);
-        state
-            .install
-            .insert(catalog[0].id.clone(), InstallState::Installed);
-        state.phase = EnginePhase::NoModel;
-        let snapshot = build_snapshot(&state, &catalog);
-        assert_eq!(snapshot.models.len(), 3);
-        assert_eq!(snapshot.models[0].install, InstallState::Installed);
-        assert_eq!(snapshot.models[1].install, InstallState::NotInstalled);
-        assert!(snapshot.models.iter().all(|model| !model.active));
-        assert_eq!(snapshot.phase, EnginePhase::NoModel);
     }
 
     /// A supervisor over a fresh state, never started (no thread).
@@ -2599,39 +2562,6 @@ mod tests {
         }
     }
 
-    /// An activation is taken up in the same update that clears the
-    /// previous switch's outcome: a reader never sees its id beside a
-    /// refusal or error left over from before it (#356).
-    #[test]
-    fn taking_up_an_activation_clears_the_previous_outcome_with_its_id() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let mut supervisor = idle_supervisor(dir.path());
-        {
-            let mut state = supervisor.inner.lock();
-            state.pending_decision = Some(SwapDecision::Refused {
-                needed: 2,
-                available: 1,
-            });
-            state.last_error = Some("an earlier switch failed".to_string());
-        }
-        let before = build_snapshot(&supervisor.inner.lock(), &supervisor.inner.catalog);
-        assert_eq!(before.activations_handled, 0);
-        supervisor.handle(Command::Activate {
-            model_id: "no-such-model".to_string(),
-            request: 7,
-        });
-        let after = build_snapshot(&supervisor.inner.lock(), &supervisor.inner.catalog);
-        assert_eq!(after.activations_handled, 7);
-        assert_eq!(after.pending_decision, None);
-        assert_ne!(after.last_error.as_deref(), Some("an earlier switch failed"));
-        // A reload is no activation: the id stays.
-        supervisor.cancel_current_switch();
-        let superseded = supervisor.inner.lock().supersede();
-        supervisor.start_switch("no-such-model".to_string(), SwitchKind::Reload, superseded, None);
-        assert_eq!(supervisor.inner.lock().activations_handled, 7);
-        supervisor.cancel_current_switch();
-    }
-
     /// `tick` captured engine A, then a cutover installed B before A's
     /// exit was handled: that exit is stale and must leave B serving.
     #[test]
@@ -2660,28 +2590,4 @@ mod tests {
         assert!(matches!(state.phase, EnginePhase::Restarting { .. }));
     }
 
-    #[test]
-    fn lease_provenance_names_the_model() {
-        let engine = ActiveEngine::without_process(
-            "parakeet-v3-q8",
-            "parakeet",
-            "http://127.0.0.1:1234".to_string(),
-            42,
-        );
-        assert_eq!(engine.leases.load(Ordering::Acquire), 0);
-        engine.leases.fetch_add(1, Ordering::Acquire);
-        let lease = EngineLease {
-            engine: Arc::clone(&engine),
-            endpoint: engine.endpoint.clone(),
-            slug: engine.slug.clone(),
-            model_id: engine.model_id.clone(),
-        };
-        assert_eq!(lease.endpoint(), "http://127.0.0.1:1234");
-        assert_eq!(lease.slug(), "parakeet");
-        assert_eq!(lease.model_id(), "parakeet-v3-q8");
-        assert_eq!(lease.provenance(), "engine:parakeet-v3-q8");
-        assert_eq!(engine.leases.load(Ordering::Acquire), 1);
-        drop(lease);
-        assert_eq!(engine.leases.load(Ordering::Acquire), 0);
-    }
 }

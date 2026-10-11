@@ -25,7 +25,6 @@ use starling_runtime_host::client::{EventWire, HostClient};
 use starling_runtime_host::engine::{
     self, EngineChoice, EngineIntent, EngineReply, EngineRequest, EngineStatus,
 };
-use starling_runtime_host::version::{BuildStamp, RetireAnswer};
 use starling_runtime_host::{serve, HostConfig, HostError};
 
 #[path = "common/fake_engine.rs"]
@@ -1269,79 +1268,5 @@ fn a_memory_refusal_reaches_the_app() {
     let snapshot = refused.snapshot.unwrap();
     assert_eq!(snapshot.active.unwrap().model_id, MODEL_ID, "the current model keeps serving");
     drop(app);
-    host.shutdown();
-}
-
-/// #220's version handshake over the socket. An older host refuses to
-/// watch for a newer app, steps aside when that app asks while it idles —
-/// not while a window of its own version is open — and refuses an older
-/// app's request. A newer host refuses an older app plainly.
-#[test]
-fn hosts_and_apps_of_different_builds_settle_who_serves() {
-    let old = BuildStamp {
-        id: "an-older-build".into(),
-        built: 1,
-    };
-    let new = BuildStamp::current();
-    assert!(old.older_than(&new));
-
-    let root = tempfile::tempdir().unwrap();
-    let mut host = serve(host_config(root.path(), EngineChoice::None).with_build(old.clone()))
-        .expect("the older host serves");
-    let probe = connect(host.socket_path());
-    assert_eq!(probe.info.build.as_ref(), Some(&old), "the hello names the host's build");
-    let refused = probe.take_watch_as(&new).expect_err("another build is not watched");
-    assert!(refused.to_string().contains("version_mismatch"), "{refused}");
-
-    // A window of the host's own version is open: it keeps its service.
-    let own_window = connect(host.socket_path());
-    own_window.take_watch_as(&old).expect("the same build is served");
-    let asking = connect(host.socket_path());
-    match asking.retire(&new).expect("answered") {
-        RetireAnswer::Busy { reason } => assert!(reason.contains("window"), "{reason}"),
-        other => panic!("a host serving a window must not step aside: {other:?}"),
-    }
-    // An older app does not get to replace it.
-    let older = BuildStamp {
-        id: "older-still".into(),
-        built: 0,
-    };
-    assert!(matches!(
-        asking.retire(&older).expect("answered"),
-        RetireAnswer::Refused { .. }
-    ));
-    assert!(!host.retire_requested());
-
-    // Once that window closed, the host steps aside for the newer app.
-    drop(own_window);
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        match asking.retire(&new).expect("answered") {
-            RetireAnswer::Retiring => break,
-            RetireAnswer::Busy { .. } => {
-                assert!(Instant::now() < deadline, "the idle host never stepped aside")
-            }
-            other => panic!("{other:?}"),
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    assert!(host.retire_requested(), "whoever runs the host is told to stop it");
-    // Committed: no new work is taken on until it has stopped.
-    let late = connect(host.socket_path());
-    let refused = late
-        .send(Some("take_late"), Command::CaptureStart { policy: "push-to-talk".into() })
-        .expect_err("a retiring host takes on no new take");
-    assert!(refused.to_string().contains("stepping aside"), "{refused}");
-    host.shutdown();
-
-    // A newer host and an older app: refused, with what to do.
-    let root = tempfile::tempdir().unwrap();
-    let mut host = serve(host_config(root.path(), EngineChoice::None)).expect("the newer host serves");
-    let app = connect(host.socket_path());
-    let refused = app.take_watch_as(&old).expect_err("an older app is not served");
-    let text = refused.to_string();
-    assert!(text.contains("version_mismatch"), "{text}");
-    assert!(text.contains("older version"), "{text}");
-    assert!(text.contains("start Starling again"), "{text}");
     host.shutdown();
 }

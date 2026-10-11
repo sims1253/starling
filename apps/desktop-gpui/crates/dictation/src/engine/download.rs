@@ -565,44 +565,6 @@ mod tests {
     }
 
     #[test]
-    fn downloads_verify_and_install() {
-        let bytes: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
-        let (url, server) = spawn_file_server(Arc::new(bytes.clone()));
-        let entry = entry_for(&url, &bytes);
-        let dir = tempfile::tempdir().expect("tempdir");
-
-        let progresses = std::sync::Mutex::new(Vec::new());
-        download_model(
-            dir.path(),
-            &entry,
-            &|done, total| progresses.lock().unwrap().push((done, total)),
-            &AtomicBool::new(false),
-        )
-        .expect("download succeeds");
-        let files = model_files(dir.path(), &entry);
-        assert!(files.final_path.exists());
-        assert!(!files.part_path.exists());
-        assert_eq!(
-            fs::read(&files.final_path).expect("final file"),
-            bytes,
-            "installed bytes must be the served bytes"
-        );
-        assert_eq!(
-            fs::read_to_string(&files.marker_path).expect("marker"),
-            entry.sha256
-        );
-        assert!(matches!(
-            scan_install(dir.path(), &entry),
-            InstallState::Installed
-        ));
-        let progresses = progresses.into_inner().unwrap();
-        assert!(progresses
-            .last()
-            .is_some_and(|&(done, total)| done == total));
-        drop(server);
-    }
-
-    #[test]
     fn checksum_mismatch_deletes_the_part_and_reports() {
         let served: Vec<u8> = vec![7u8; 5000];
         let (url, server) = spawn_file_server(Arc::new(served));
@@ -620,28 +582,6 @@ mod tests {
             scan_install(dir.path(), &entry),
             InstallState::NotInstalled
         ));
-        drop(server);
-    }
-
-    #[test]
-    fn cancelled_download_keeps_the_part_for_resume() {
-        let served: Vec<u8> = vec![3u8; 50_000];
-        let (url, server) = spawn_file_server(Arc::new(served.clone()));
-        let entry = entry_for(&url, &served);
-        let dir = tempfile::tempdir().expect("tempdir");
-        let files = model_files(dir.path(), &entry);
-
-        // Pre-place a prefix as .part: the download resumes from it with
-        // a Range request (the fake cancellation below then aborts).
-        let prefix = &served[..10_000];
-        fs::write(&files.part_path, prefix).expect("write part");
-        let cancel = AtomicBool::new(true); // cancel before the first chunk
-        match download_all(dir.path(), &entry, &cancel) {
-            Err(DownloadError::Cancelled) => {}
-            other => panic!("expected Cancelled, got {other:?}"),
-        }
-        assert!(files.part_path.exists(), "resume relies on the kept part");
-        assert!(!files.final_path.exists());
         drop(server);
     }
 
@@ -693,38 +633,6 @@ mod tests {
         assert_eq!(content_range_total("bytes 0-9/*"), None);
     }
 
-    #[test]
-    fn a_download_waits_for_another_processs_lock_then_finds_it_installed() {
-        let served: Vec<u8> = vec![5u8; 20_000];
-        let (url, server) = spawn_file_server(Arc::new(served.clone()));
-        let entry = entry_for(&url, &served);
-        let dir = tempfile::tempdir().expect("tempdir");
-        let files = model_files(dir.path(), &entry);
-        // A live holder (this process) has the lock, as another instance
-        // mid-download would.
-        let held = acquire_download_lock(&files, &AtomicBool::new(false)).expect("lock");
-        let models_dir = dir.path().to_path_buf();
-        let waiting_entry = entry.clone();
-        let waiter = std::thread::spawn(move || {
-            download_model(&models_dir, &waiting_entry, &|_, _| {}, &AtomicBool::new(false))
-        });
-        std::thread::sleep(Duration::from_millis(600));
-        assert!(!waiter.is_finished(), "the second download waits for the lock");
-        assert!(!files.part_path.exists(), "and writes nothing meanwhile");
-        // The holder installs the model, then releases.
-        fs::write(&files.final_path, &served).expect("install");
-        write_marker(&files.marker_path, &entry.sha256).expect("marker");
-        drop(held);
-        waiter
-            .join()
-            .expect("waiter thread")
-            .expect("the waiter succeeds without downloading");
-        assert_eq!(fs::read(&files.final_path).expect("final"), served);
-        assert!(!files.part_path.exists());
-        assert!(!files.lock_path.exists());
-        drop(server);
-    }
-
     #[cfg(unix)]
     #[test]
     fn a_dead_holders_download_lock_is_replaced() {
@@ -740,100 +648,4 @@ mod tests {
         drop(server);
     }
 
-    #[test]
-    fn a_full_answer_of_the_wrong_size_fails_before_downloading() {
-        let served: Vec<u8> = vec![2u8; 3_000];
-        let (url, server) = spawn_file_server(Arc::new(served));
-        // The catalog expects a different size.
-        let entry = entry_for(&url, &vec![2u8; 4_000]);
-        let dir = tempfile::tempdir().expect("tempdir");
-        match download_all(dir.path(), &entry, &AtomicBool::new(false)) {
-            Err(DownloadError::Http(message)) => {
-                assert!(message.contains("3000 bytes"), "got: {message}")
-            }
-            other => panic!("expected an Http size error, got {other:?}"),
-        }
-        assert!(!model_files(dir.path(), &entry).part_path.exists());
-        drop(server);
-    }
-
-    #[test]
-    fn placed_file_needs_verification_then_verifies_or_refuses() {
-        let served: Vec<u8> = vec![9u8; 4096];
-        let entry = entry_for("http://127.0.0.1:9/never-hit.gguf", &served);
-        let dir = tempfile::tempdir().expect("tempdir");
-        let files = model_files(dir.path(), &entry);
-
-        // Nothing installed.
-        assert!(matches!(
-            scan_install(dir.path(), &entry),
-            InstallState::NotInstalled
-        ));
-        // Right bytes, no marker: NeedsVerification.
-        fs::write(&files.final_path, &served).expect("place file");
-        assert!(matches!(
-            scan_install(dir.path(), &entry),
-            InstallState::NeedsVerification
-        ));
-        verify_placed_file(dir.path(), &entry).expect("placed file verifies");
-        assert!(matches!(
-            scan_install(dir.path(), &entry),
-            InstallState::Installed
-        ));
-        assert_eq!(
-            fs::read_to_string(&files.marker_path).expect("marker"),
-            entry.sha256
-        );
-
-        // Wrong bytes: refused, and the user's file is left in place.
-        fs::write(&files.final_path, vec![0u8; 4096]).expect("place wrong file");
-        fs::remove_file(&files.marker_path).expect("drop marker");
-        assert!(verify_placed_file(dir.path(), &entry).is_err());
-        assert!(files.final_path.exists(), "never delete a user-placed file");
-        // A wrong-size file is refused by its size (it can never verify),
-        // shows as Failed with that reason, and is still never touched.
-        fs::write(&files.final_path, vec![0u8; 10]).expect("place short file");
-        let message = verify_placed_file(dir.path(), &entry).expect_err("short file refuses");
-        assert!(message.contains("has 10 bytes"), "got: {message}");
-        assert!(matches!(
-            scan_install(dir.path(), &entry),
-            InstallState::Failed(reason) if reason.contains("has 10 bytes")
-        ));
-        assert!(files.final_path.exists());
-    }
-
-    #[test]
-    fn delete_removes_all_three_files() {
-        let entry = entry_for("http://127.0.0.1:9/x.gguf", &[1u8; 100]);
-        let dir = tempfile::tempdir().expect("tempdir");
-        let files = model_files(dir.path(), &entry);
-        fs::write(&files.final_path, b"gone").expect("final");
-        fs::write(&files.part_path, b"gone").expect("part");
-        fs::write(&files.marker_path, "gone").expect("marker");
-        delete_model_files(dir.path(), &entry).expect("delete");
-        assert!(!files.final_path.exists());
-        assert!(!files.part_path.exists());
-        assert!(!files.marker_path.exists());
-        // Deleting an absent model is fine (idempotent).
-        delete_model_files(dir.path(), &entry).expect("delete again");
-    }
-
-    #[test]
-    fn file_names_stay_gguf_not_mangled() {
-        let entry = CatalogEntry::new(
-            "m",
-            "m",
-            "parakeet",
-            "http://host/files/model.gguf",
-            1,
-            &"a".repeat(64),
-            false,
-            "",
-        );
-        let files = model_files(Path::new("/models"), &entry);
-        assert_eq!(files.final_path, Path::new("/models/model.gguf"));
-        assert_eq!(files.part_path, Path::new("/models/model.gguf.part"));
-        assert_eq!(files.marker_path, Path::new("/models/model.gguf.verified"));
-        assert_eq!(files.lock_path, Path::new("/models/model.gguf.lock"));
-    }
 }

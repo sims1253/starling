@@ -702,10 +702,13 @@ pub fn serve(config: HostConfig) -> Result<HostHandle, HostError> {
     };
     // The app's history store (#220): its reads, writes and audio upkeep
     // run on the host's store handle.
-    let history = Arc::new(crate::history::History::new(
-        crate::history::Facade::shared(Arc::clone(&store)),
-        config.max_frame_bytes,
-    ));
+    let history = Arc::new(
+        crate::history::History::new(
+            crate::history::Facade::shared(Arc::clone(&store)),
+            config.max_frame_bytes,
+        )
+        .with_memory_limit(config.answer_memory_bytes),
+    );
     let (store_jobs, store_queue) = crate::history::store_queue();
     let (runtime, client) = starling_runtime::Runtime::start(runtime_config);
     takes.attach(client.clone());

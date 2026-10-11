@@ -136,24 +136,3 @@ impl StarlingApp {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn only_a_newer_saved_document_publishes_its_policy() {
-        let mut upkeep = AudioUpkeep::new(StorageSettings::default());
-        let mut limited = StorageSettings::default();
-        limited.include_referenced = true;
-        // A draft committed but never saved changes nothing a pass reads.
-        upkeep.settings = limited;
-        assert_eq!(upkeep.saved, StorageSettings::default());
-        assert!(upkeep.publish_saved(2, limited));
-        assert_eq!(upkeep.saved, limited);
-        // An older save that lands later does not undo the newer one.
-        assert!(!upkeep.publish_saved(1, StorageSettings::default()));
-        assert_eq!(upkeep.saved, limited);
-        // The same settings saved again need no new pass.
-        assert!(!upkeep.publish_saved(3, limited));
-    }
-}

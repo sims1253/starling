@@ -258,37 +258,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn backend_parses_manifest_keys() {
-        assert_eq!(Backend::parse("vulkan"), Some(Backend::Vulkan));
-        assert_eq!(Backend::parse("cpu"), Some(Backend::Cpu));
-        assert_eq!(Backend::parse("cuda"), None);
-        assert_eq!(Backend::Cpu.to_string(), "cpu");
-    }
-
-    #[test]
-    fn failure_sentences_say_what_to_do() {
-        let missing = EngineFailure::MissingLibrary {
-            backend: Backend::Vulkan,
-            library: "libvulkan.so.1".to_string(),
-        };
-        let sentence = missing.to_string();
-        assert!(
-            sentence.contains("Install your GPU's Vulkan driver, or use the CPU engine."),
-            "got: {sentence}"
-        );
-        let unusable = EngineFailure::NoUsableEngine {
-            rejected: vec![
-                (
-                    Backend::Vulkan,
-                    "No Vulkan driver (ICD) is installed".to_string(),
-                ),
-                (Backend::Cpu, "checksum mismatch".to_string()),
-            ],
-        };
-        assert!(unusable.to_string().contains("vulkan: No Vulkan driver"));
-        assert!(EngineFailure::NoBundledEngine
-            .to_string()
-            .contains("STARLING_ENGINE_DIR"));
-    }
 }

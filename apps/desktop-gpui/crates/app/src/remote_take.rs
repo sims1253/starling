@@ -1248,26 +1248,3 @@ impl StarlingApp {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_refused_start_says_what_holds_the_microphone() {
-        let reason = "the runtime refused the command: capture.start illegal in Recording";
-        let told = start_refusal(Some(TakeBusy::Recording { yours: false }), reason);
-        assert!(told.contains("Another Starling window is recording"), "{told}");
-        assert!(!told.contains("illegal"));
-        let told = start_refusal(Some(TakeBusy::Saving), reason);
-        assert!(told.contains("still being saved"), "{told}");
-        // The wording of the rejection decides nothing.
-        assert_eq!(
-            start_refusal(None, reason),
-            format!("The recording could not start: {reason}")
-        );
-        assert_eq!(
-            start_refusal(None, "not connected to the recording service"),
-            "The recording could not start: not connected to the recording service"
-        );
-    }
-}

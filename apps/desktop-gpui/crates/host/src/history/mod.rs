@@ -35,7 +35,7 @@ pub use facade::{
     v2_summary, AudioHold, AudioPin, BoundaryRevision, Facade, ProcessingDoc, ProposalOrigin,
     ProposalRow, RowStatus, SavedTake, UpkeepReport,
 };
-pub use service::{History, UPKEEP_FIRST, UPKEEP_INTERVAL};
+pub use service::{History, ANSWER_MEMORY_BYTES, UPKEEP_FIRST, UPKEEP_INTERVAL};
 pub(crate) use service::{start_workers, store_queue, submit, StoreJob};
 
 /// Which encoding of a take's audio [`StoreRequest::Audio`] reads.

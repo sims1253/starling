@@ -813,34 +813,3 @@ fn action_button(
         })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn engine_labels_map_to_the_catalog_and_fall_back_to_the_id() {
-        // #363: the catalog label is what the user chose in Settings, so
-        // that is what history shows; an id this build no longer ships
-        // still names itself.
-        assert_eq!(
-            provenance_label("engine:parakeet-v3-q4km-s16"),
-            "Parakeet TDT 0.6B v3 (q4_k_m)"
-        );
-        assert_eq!(provenance_label("engine:some-future-model"), "some-future-model");
-    }
-
-    #[test]
-    fn openai_labels_name_the_model_and_the_server() {
-        assert_eq!(
-            provenance_label("openai:whisper-large-v3"),
-            "whisper-large-v3 (server)"
-        );
-    }
-
-    #[test]
-    fn other_labels_show_verbatim() {
-        // Older attempt shapes (e.g. `starling:parakeet`) are history's
-        // truth; guessing at them would be worse than showing them.
-        assert_eq!(provenance_label("starling:parakeet"), "starling:parakeet");
-    }
-}

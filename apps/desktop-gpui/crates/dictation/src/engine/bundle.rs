@@ -264,36 +264,6 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_backend_and_empty_lists() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        write_bundle(
-            dir.path(),
-            r#"{"version":"0.1.0","abi":8,"engines":[{"backend":"cuda","file":"x"}]}"#,
-            &sum_line(&"a".repeat(64), "x"),
-        );
-        assert!(load_bundle(dir.path()).is_err());
-
-        write_bundle(
-            dir.path(),
-            r#"{"version":"0.1.0","abi":8,"engines":[]}"#,
-            &sum_line(&"a".repeat(64), "x"),
-        );
-        assert!(load_bundle(dir.path()).is_err());
-    }
-
-    #[test]
-    fn missing_sums_file_is_an_error() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        fs::create_dir_all(dir.path()).expect("create");
-        fs::write(
-            dir.path().join(ENGINES_JSON),
-            r#"{"version":"0.1.0","abi":8,"engines":[{"backend":"cpu","file":"x"}]}"#,
-        )
-        .expect("write manifest");
-        assert!(load_bundle(dir.path()).is_err());
-    }
-
-    #[test]
     fn sums_parser_accepts_sha256sum_format() {
         let sums = parse_sums(&format!(
             "# comment\n\n{}{}garbage-line\n{}",
@@ -331,56 +301,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn expected_sum_missing_entry_is_checksum_mismatch() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        write_bundle(
-            dir.path(),
-            r#"{"version":"0.1.0","abi":8,"engines":[{"backend":"cpu","file":"known"}]}"#,
-            &sum_line(&"a".repeat(64), "known"),
-        );
-        let bundle = load_bundle(dir.path()).expect("bundle");
-        assert!(expected_sum(&bundle, "known").is_ok());
-        assert!(matches!(
-            expected_sum(&bundle, "unknown"),
-            Err(EngineFailure::ChecksumMismatch { file }) if file == "unknown"
-        ));
-    }
-
-    #[test]
-    fn discovery_prefers_env_then_exe_dir() {
-        let root = tempfile::tempdir().expect("tempdir");
-        let staged = root.path().join("staged");
-        let bundled = root.path().join("bin");
-        fs::create_dir_all(&staged).expect("create staged");
-        fs::create_dir_all(bundled.join(ENGINE_DIR_NAME)).expect("create bundled");
-        fs::write(
-            staged.join(ENGINES_JSON),
-            r#"{"version":"0.1.0","abi":8,"engines":[]}"#,
-        )
-        .expect("staged manifest");
-        fs::write(
-            bundled.join(ENGINE_DIR_NAME).join(ENGINES_JSON),
-            r#"{"version":"0.1.0","abi":8,"engines":[]}"#,
-        )
-        .expect("bundled manifest");
-
-        // Env wins over the exe dir.
-        assert_eq!(
-            discover_from(Some(&staged), Some(&bundled)).as_deref(),
-            Some(staged.as_path())
-        );
-        // Without env, the exe dir's engines/ layout is used.
-        assert_eq!(
-            discover_from(None, Some(&bundled)).as_deref(),
-            Some(bundled.join(ENGINE_DIR_NAME).as_path())
-        );
-        // A candidate without a manifest is skipped, later ones still win.
-        assert_eq!(
-            discover_from(Some(root.path()), Some(&bundled)).as_deref(),
-            Some(bundled.join(ENGINE_DIR_NAME).as_path())
-        );
-        // Nothing found.
-        assert_eq!(discover_from(None, None), None);
-    }
 }

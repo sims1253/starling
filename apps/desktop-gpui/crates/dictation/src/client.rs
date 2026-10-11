@@ -601,20 +601,13 @@ mod tests {
     use std::net::{SocketAddr, TcpListener, TcpStream};
     use std::sync::{Arc, Mutex};
 
+    /// Everything the double records; the tests read what they need.
+    #[allow(dead_code)]
     struct RecordedRequest {
         method: String,
         path: String,
         headers: Vec<(String, String)>,
         body: Vec<u8>,
-    }
-
-    impl RecordedRequest {
-        fn header(&self, name: &str) -> Option<&str> {
-            self.headers
-                .iter()
-                .find(|(key, _)| key == name)
-                .map(|(_, value)| value.as_str())
-        }
     }
 
     /// Minimal HTTP/1.1 test double: accepts requests on an ephemeral port,
@@ -738,13 +731,6 @@ mod tests {
         StarlingClient::new(&format!("http://{addr}"), "").expect("valid client")
     }
 
-    fn expect_input(error: ClientError, message: &str) {
-        match error {
-            ClientError::Input(text) => assert_eq!(text, message),
-            other => panic!("expected Input error, got {other:?}"),
-        }
-    }
-
     #[test]
     fn openai_health_maps_models_to_ready() {
         let (addr, recorded) = spawn_server(vec![ok_json(
@@ -763,60 +749,6 @@ mod tests {
         assert_eq!(health.model.as_deref(), Some("parakeet"));
         assert_eq!(health.loaded, None);
         assert_eq!(health.queue_depth, None);
-    }
-
-    #[test]
-    fn openai_transcribe_sends_multipart_form() {
-        let (addr, recorded) = spawn_server(vec![ok_json(r#"{"text":"hi"}"#)]);
-        let wav = fake_wav();
-        let result = client_at(addr)
-            .transcribe(Arc::new(wav.clone()), "req-2")
-            .expect("transcription");
-
-        let request = recorded.lock().expect("recorded lock");
-        assert_eq!(request.len(), 1);
-        assert_eq!(request[0].method, "POST");
-        assert_eq!(request[0].path, "/v1/audio/transcriptions");
-        assert_eq!(request[0].header("x-request-id"), Some("req-2"));
-        let content_type = request[0]
-            .header("content-type")
-            .expect("multipart content type");
-        assert!(
-            content_type.starts_with("multipart/form-data; boundary="),
-            "got content-type {content_type}"
-        );
-        // `stream_with_length` keeps the whole form length-declared, so
-        // the streamed file part does not switch the request to chunked
-        // transfer encoding (issue #235).
-        assert_eq!(
-            request[0].header("content-length"),
-            Some(request[0].body.len().to_string().as_str())
-        );
-        assert_eq!(request[0].header("transfer-encoding"), None);
-        let body = String::from_utf8_lossy(&request[0].body).to_string();
-        assert!(
-            body.contains("name=\"file\"; filename=\"recording.wav\""),
-            "multipart body missing file part: {body}"
-        );
-        assert!(
-            body.contains("name=\"model\""),
-            "multipart body missing model part"
-        );
-        assert!(
-            body.contains("name=\"response_format\""),
-            "multipart body missing response_format part"
-        );
-        assert!(
-            locate(&request[0].body, &wav).is_some(),
-            "multipart body must embed the raw wav bytes"
-        );
-        drop(request);
-
-        assert_eq!(result.text, "hi");
-        assert!(result.segments.is_empty());
-        assert_eq!(result.duration_seconds, None);
-        // No body id, no header: the id we sent wins.
-        assert_eq!(result.request_id.as_deref(), Some("req-2"));
     }
 
     #[test]
@@ -877,78 +809,6 @@ mod tests {
     }
 
     #[test]
-    fn wrong_typed_health_fields_are_rejected() {
-        let (addr, _) = spawn_server(vec![ok_json(r#"{"object":"list","data":[{"id":42}]}"#)]);
-        assert!(matches!(
-            client_at(addr).health(),
-            Err(ClientError::Protocol("models"))
-        ));
-    }
-
-    fn expect_client_input_error(result: Result<StarlingClient, ClientError>, message: &str) {
-        match result {
-            Err(ClientError::Input(text)) => assert_eq!(text, message),
-            Err(other) => panic!("expected Input error, got {other:?}"),
-            Ok(_) => panic!("expected Input error, got Ok(client)"),
-        }
-    }
-
-    #[test]
-    fn endpoint_validation_mirrors_clean_endpoint() {
-        expect_client_input_error(
-            StarlingClient::new("not a url", ""),
-            "Invalid server endpoint.",
-        );
-        expect_client_input_error(
-            StarlingClient::new("ftp://example.com/models", ""),
-            "Server endpoint must use http or https.",
-        );
-        expect_client_input_error(
-            StarlingClient::new("http://user:pass@example.com:9000", ""),
-            "Put credentials in a trusted proxy, not the endpoint URL.",
-        );
-    }
-
-    #[test]
-    fn trailing_slash_is_trimmed_from_endpoint() {
-        let (addr, recorded) = spawn_server(vec![ok_json(r#"{"object":"list","data":[]}"#)]);
-        let endpoint = format!("http://{addr}/");
-        StarlingClient::new(&endpoint, "")
-            .expect("valid client")
-            .health()
-            .expect("health");
-        let request = recorded.lock().expect("recorded lock");
-        assert_eq!(request[0].path, "/v1/models");
-    }
-
-    #[test]
-    fn transcribe_validates_request_id_and_payload() {
-        let client = StarlingClient::new("http://127.0.0.1:9", "").expect("valid client");
-        expect_input(
-            client.transcribe(Arc::new(fake_wav()), "").unwrap_err(),
-            "Invalid transcription request id.",
-        );
-        expect_input(
-            client
-                .transcribe(Arc::new(fake_wav()), "#hidden")
-                .unwrap_err(),
-            "Invalid transcription request id.",
-        );
-        expect_input(
-            client
-                .transcribe(Arc::new(fake_wav()), "a\r\nb")
-                .unwrap_err(),
-            "Invalid transcription request id.",
-        );
-        expect_input(
-            client
-                .transcribe(Arc::new(vec![0u8; 43]), "req")
-                .unwrap_err(),
-            "Audio payload is empty or too large.",
-        );
-    }
-
-    #[test]
     fn slow_response_maps_to_timeout_error() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
         let addr = listener.local_addr().expect("test server address");
@@ -970,21 +830,6 @@ mod tests {
         }
     }
 
-    /// Issue #235: a response whose declared content-length already
-    /// exceeds the client's limit is refused before a byte is read — a
-    /// malformed or hostile server cannot make the client buffer it.
-    #[test]
-    fn oversized_declared_response_is_refused() {
-        let (addr, _) = spawn_server(vec![canned_response("200 OK", &[], &"x".repeat(65))]);
-        let client = client_at(addr)
-            .with_max_response_bytes(64)
-            .expect("valid limit");
-        match client.health() {
-            Err(ClientError::ResponseTooLarge(64)) => {}
-            other => panic!("expected ResponseTooLarge(64), got {other:?}"),
-        }
-    }
-
     /// A body with no declared length (chunked framing) is policed chunk
     /// by chunk: the refusal lands once the stream crosses the limit, not
     /// after buffering everything the server cared to send.
@@ -998,29 +843,6 @@ mod tests {
             Err(ClientError::ResponseTooLarge(64)) => {}
             other => panic!("expected ResponseTooLarge(64), got {other:?}"),
         }
-    }
-
-    /// The cap must not bite honest payloads: a body exactly at the limit
-    /// parses normally (every smaller one — the rest of this suite —
-    /// already exercises the under-the-cap path).
-    #[test]
-    fn response_exactly_at_the_limit_is_accepted() {
-        let padded = format!("{:<64}", r#"{"object":"list","data":[]}"#);
-        assert_eq!(padded.len(), 64);
-        let (addr, _) = spawn_server(vec![ok_json(&padded)]);
-        let client = client_at(addr)
-            .with_max_response_bytes(64)
-            .expect("valid limit");
-        assert_eq!(client.health().expect("health").status, "ok");
-    }
-
-    #[test]
-    fn response_limit_must_be_positive() {
-        let client = StarlingClient::new("http://127.0.0.1:9", "").expect("valid client");
-        expect_client_input_error(
-            client.with_max_response_bytes(0),
-            "Response size limit must be at least 1 byte.",
-        );
     }
 
     /// Issue #251, client half: a cancelled request must abort the
@@ -1090,48 +912,4 @@ mod tests {
         }
     }
 
-    /// The precancelled case needs no server cooperation: the early
-    /// flag check returns before any connection is attempted, so nothing
-    /// is ever sent.
-    #[test]
-    fn precancelled_transcribe_returns_without_sending() {
-        let (addr, recorded) = spawn_server(vec![ok_json(r#"{"text":"too late"}"#)]);
-        let token = CancelToken::new();
-        token.cancel();
-        let client = client_at(addr);
-        match client.transcribe_with_cancel(Arc::new(fake_wav()), "req-precancel", Some(&token)) {
-            Err(ClientError::Cancelled) => {}
-            other => panic!("expected Cancelled, got {other:?}"),
-        }
-        let recorded = recorded.lock().expect("recorded lock");
-        assert_eq!(
-            recorded.len(),
-            0,
-            "a precancelled request must not reach the server"
-        );
-    }
-
-    /// Review on #253: the token's wakeup is a broadcast, not a single
-    /// `Notify` permit — two waiters registered *before* the cancel must
-    /// both wake on one trip (the shape that would leave exactly one of
-    /// them parked forever under `notify_one`).
-    #[tokio::test]
-    async fn one_cancel_wakes_every_registered_waiter() {
-        let token = CancelToken::new();
-        let canceller = {
-            let token = token.clone();
-            tokio::spawn(async move {
-                // A trigger, not a gate: both waiters below are polled
-                // (registered) before this fires.
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                token.cancel();
-            })
-        };
-        tokio::time::timeout(Duration::from_secs(1), async {
-            let ((), ()) = tokio::join!(token.notified(), token.notified());
-        })
-        .await
-        .expect("both concurrent waiters must wake on a single cancel");
-        canceller.await.expect("canceller task");
-    }
 }

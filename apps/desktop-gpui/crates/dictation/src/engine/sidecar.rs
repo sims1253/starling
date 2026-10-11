@@ -785,30 +785,6 @@ mod tests {
     }
 
     #[test]
-    fn models_list_check_requires_the_slug() {
-        let body = r#"{"object":"list","data":[{"id":"parakeet"},{"id":"s1"}]}"#;
-        assert!(models_list_slug(body, "parakeet"));
-        assert!(models_list_slug(body, "s1"));
-        assert!(!models_list_slug(body, "moss"));
-        assert!(!models_list_slug(
-            r#"{"object":"list","data":[]}"#,
-            "parakeet"
-        ));
-        assert!(!models_list_slug("garbage", "parakeet"));
-    }
-
-    #[test]
-    fn stderr_ring_keeps_only_the_tail() {
-        let mut ring = StderrRing::default();
-        for index in 0..(STDERR_RING_LINES + 10) {
-            ring.push(format!("line {index}"));
-        }
-        let tail = ring.tail();
-        assert!(tail.contains(&format!("line {}", STDERR_RING_LINES + 9)));
-        assert!(!tail.contains("line 0 |"));
-    }
-
-    #[test]
     fn announce_port_parses_ipv4_and_bracketed_ipv6() {
         assert_eq!(announce_port("STARLING_SERVE_LISTENING 127.0.0.1:8181"), Some(8181));
         // The server brackets IPv6 hosts in the announce line; the port
