@@ -13,6 +13,8 @@
 
 #include "lib/graph_helpers.hpp"
 #include "lib/qwen_decode.hpp"
+#include "runtime/backend.hpp"
+#include "runtime/graph.hpp"
 
 #include <string>
 
@@ -47,6 +49,26 @@ const lib::QwenDecodeSpec kSpec = {
     /*decode_add=*/true,
 };
 
+// Embedding lookup of `ids` in a 2-D weight ([width, rows]) as an in-graph
+// get_rows (every backend dequantizes every block type it stores), read back
+// as host f32 rows: an embedding lookup without staging the whole table.
+// Going through a graph also tells the CPU repacker (runtime/cpu_repack.hpp)
+// that the table is read by GET_ROWS, so a quantized tied embedding/lm_head
+// is never repacked for its matmul. Returns {} on failure.
+std::vector<float> lookup_rows_f32(const ModelLoader& ml, const char* name,
+                                          const std::vector<int32_t>& ids) {
+    std::vector<float> out;
+    if (ids.empty() || !ml.tensor(name)) return out;
+    std::vector<int32_t> idx(ids);  // the graph input borrows this host buffer
+    const bool ok = run_graph([&](ggml_context* c) -> ggml_tensor* {
+        int64_t ne[1] = {(int64_t) idx.size()};
+        ggml_tensor* rows = graph_input_tensor(c, GGML_TYPE_I32, 1, ne, idx.data(),
+                                               idx.size() * sizeof(int32_t));
+        return ggml_get_rows(c, lib::weight(c, ml, name), rows);
+    }, out);
+    if (!ok) out.clear();
+    return out;
+}
 lib::QwenDecodeCtx decode_ctx(const VoxtralModel& m) {
     const auto& lc = m.config.llm;
     // Materialize the model's spec once (decode state is keyed per loader
@@ -75,19 +97,21 @@ bool build_inputs_embeds(const VoxtralModel& m, const std::vector<int32_t>& ids,
         err = "VOXTRAL audio rows fewer than prompt tokens";
         return false;
     }
-    // Token rows, host-side, only the prompt's rows (the whole 131k-row table
-    // as f32 was ~1.5 GiB per call). A bf16 table casts up exactly, and
-    // adding the (bf16-valued) audio rows in f32 before the prefill's single
-    // tobf round reproduces the stock bf16 add bit-exactly (an f32 sum of
-    // bf16 values is exact; one round follows). A quantized table
-    // dequantizes its rows.
+    // Token rows, only the prompt's rows, through an in-graph get_rows (the
+    // whole 131k-row table read to host f32 was ~1.5 GiB per call, and a
+    // host read hides the lookup from the CPU repacker, which would then
+    // repack a quantized tied head for its matmul). A bf16 table casts up
+    // exactly, and adding the (bf16-valued) audio rows in f32 before the
+    // prefill's single tobf round reproduces the stock bf16 add bit-exactly
+    // (an f32 sum of bf16 values is exact; one round follows). A quantized
+    // table dequantizes its rows.
     for (const int32_t id : ids) {
         if (id < 0 || (int64_t) id >= m.config.llm.vocab) {
             err = "VOXTRAL prompt id out of range";
             return false;
         }
     }
-    const std::vector<float> rows = lib::read_rows_f32(m.loader, "llm.embed.weight", ids);
+    const std::vector<float> rows = lookup_rows_f32(m.loader, "llm.embed.weight", ids);
     if (rows.size() != ids.size() * (size_t) H) {
         err = "VOXTRAL llm.embed.weight unreadable";
         return false;
