@@ -53,24 +53,28 @@ The app embeds the repository's native engine (`libstarling_ggml`). Tap
 `parakeet-tdt-0.6b-v3-q4pw-fullimx.gguf` (364 MB) from
 [`scholzmx/parakeet-tdt-0.6b-v3-gguf`](https://huggingface.co/scholzmx/parakeet-tdt-0.6b-v3-gguf),
 or **Download another model…** for the phone quants of Qwen3-ASR (0.6B,
-1.7B), ARK-ASR 0.6B, Granite Speech and MOSS-Transcribe (see the
-*Phone recipes* section of `docs/quantization.md`). Every download is
-pinned to a repository revision, resumes where it stopped after a dropped
-connection or app restart, and is checked against its SHA-256 before it
-replaces the active model (`engine/ModelCatalog.kt`). Any other
-Parakeet-TDT GGUF can be imported through **Import model (.gguf)**
-instead, and so can the repository's other speech-model GGUFs:
-Qwen3-ASR (1.7B, 0.6B), ARK-ASR (3B, 0.6B), Granite Speech,
-MOSS-Transcribe and Voxtral Realtime. The engine is picked from the file's
-own metadata (`engine/ModelKind.kt`); anything else, including the S1-mini
-text model, is refused at import. These LLM-decoder models are several
-times larger and slower than Parakeet on a phone, and their load is
-memory-gated with a larger working-set estimate (a KV cache on top of the
-weights); they transcribe long recordings in 30 s windows, and live
-previews of a slow model are spaced so they keep the engine busy at most
-half of the time. The model is loaded on first use. When a transcription fails —
-missing model, load failure — the failure is surfaced and the local
-recording remains available for retry.
+1.7B), ARK-ASR 0.6B, Granite Speech and MOSS-Transcribe (see the *Phone
+recipes* section of `docs/quantization.md`). Every download is pinned to a
+repository revision, resumes where it stopped after a dropped connection
+or app restart, and is checked against its SHA-256 before it replaces the
+active model (`engine/ModelCatalog.kt`). Any other Parakeet-TDT GGUF can
+be imported through **Import model (.gguf)** instead, and so can the
+repository's other speech-model GGUFs: Qwen3-ASR (1.7B, 0.6B), ARK-ASR
+(3B, 0.6B), Granite Speech, MOSS-Transcribe and Voxtral Realtime. The
+engine is picked from the file's own metadata (`engine/ModelKind.kt`);
+anything else, including the S1-mini text model, is refused at import.
+These LLM-decoder models are several times larger and slower than Parakeet
+on a phone, and their load is memory-gated with a larger working-set
+estimate (a KV cache on top of the weights); they transcribe long
+recordings in 30 s windows, and live previews of a slow model are spaced
+so they keep the engine busy at most half of the time. Parakeet,
+Qwen3-ASR, MOSS and ARK run on the GPU (Vulkan fast engines) where the
+phone has one; Granite runs its decoder on the GPU and its encoder on the
+CPU, and Voxtral runs on the CPU. GPU inference is both faster and several
+times more energy-efficient per transcription than the CPU engine. The
+model is loaded on first use. When a transcription fails — missing model,
+load failure — the failure is surfaced and the local recording remains
+available for retry.
 Building the app additionally requires the Android NDK and CMake SDK packages.
 
 Models live in app-private storage until you tap **Keep models across
