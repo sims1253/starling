@@ -16,7 +16,7 @@
 //! - [`instructions`]: the trailing spoken instruction grammar, ported
 //!   from `tests/spoken_instructions.py`.
 //! - [`providers`] + [`http`]: the model step behind one contract: S1-mini
-//!   on a local starling-serve, OpenAI-compatible, Anthropic, Gemini.
+//!   on a local starling-serve, or any OpenAI-compatible chat endpoint.
 //! - [`pipeline`]: plan → request → run, one [`contract::TransformResult`]
 //!   per job with its timing; [`insight`] turns it into the
 //!   `processing_recorded` event.
