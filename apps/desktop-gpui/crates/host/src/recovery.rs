@@ -189,41 +189,6 @@ mod tests {
             .clone()
     }
 
-    /// A journal the recorder left when its process died mid-take: the
-    /// first `confirmed` samples under a fsynced boundary, the rest not.
-    fn killed_journal(journals: &Path, id: &str, confirmed: &[f32], unconfirmed: &[f32]) {
-        let scratch = tempfile::tempdir().unwrap();
-        let writer = StoreV2::open(scratch.path()).expect("scratch store");
-        let mut take = writer.begin_take(TakeMeta::for_device("test")).expect("begin");
-        take.append_frames(confirmed).expect("append");
-        take.write_boundary().expect("boundary");
-        take.append_frames(unconfirmed).expect("tail");
-        let staged = scratch.path().join("staging").join(format!("{}.sj", take.id()));
-        drop(take);
-        std::fs::create_dir_all(journals).expect("journals tree");
-        std::fs::rename(&staged, journals.join(format!("{id}.sj"))).expect("place journal");
-    }
-
-    #[test]
-    fn an_attempt_a_dead_run_left_started_is_failed_ready_to_retry() {
-        let root = tempfile::tempdir().unwrap();
-        let mut crashed = StoreV2::open(root.path()).unwrap();
-        let id = take_with_attempt(&mut crashed);
-        // That run's attempt markers die with it.
-        drop(crashed);
-
-        let mut owner = StoreV2::open(root.path()).unwrap();
-        let found = recover(
-            &mut owner,
-            &journals_dir(root.path()),
-            &ReconciliationReport::default(),
-            None,
-        );
-        assert_eq!(found.recovery.problems, "", "a healthy store has nothing to say");
-        assert_eq!(found.recovery.notice, "");
-        assert_ne!(latest_status(&owner, &id), "started", "the stale attempt was failed");
-    }
-
     #[test]
     fn an_attempt_a_live_process_still_runs_is_spared() {
         let root = tempfile::tempdir().unwrap();
@@ -237,74 +202,6 @@ mod tests {
             None,
         );
         assert_eq!(latest_status(&owner, &id), "started", "#213: not stale while its owner lives");
-    }
-
-    #[test]
-    fn a_take_killed_mid_recording_comes_back_with_what_it_confirmed() {
-        let root = tempfile::tempdir().unwrap();
-        let journals = journals_dir(root.path());
-        let confirmed: Vec<f32> = (0..24_000).map(|i| ((i as f32) * 0.01).sin() * 0.2).collect();
-        killed_journal(&journals, "j_killed", &confirmed, &[0.05; 640]);
-        let mut owner = StoreV2::open(root.path()).unwrap();
-        let found = recover(&mut owner, &journals, &ReconciliationReport::default(), None);
-        assert!(found.recovery.notice.contains("Recovered 1 recording"), "{}", found.recovery.notice);
-        assert!(found.recheck.is_empty());
-        let record = owner.get_capture("j_killed").unwrap().expect("the recovered take");
-        assert_eq!(record.frame_count, 24_000, "exactly what was confirmed");
-    }
-
-    /// A journal its recorder finalized: a take that stopped, placed in
-    /// `journals` as `id` and backdated past the adoption grace (its host
-    /// died before storing it, a while ago).
-    fn stopped_journal(journals: &Path, samples: &[f32], aged: bool) -> String {
-        let scratch = tempfile::tempdir().unwrap();
-        let writer = StoreV2::open(scratch.path()).expect("scratch store");
-        let mut take = writer.begin_take(TakeMeta::for_device("test")).expect("begin");
-        let id = take.id().to_string();
-        take.append_frames(samples).expect("append");
-        take.finalize().expect("finalize");
-        std::fs::create_dir_all(journals).expect("journals tree");
-        let path = journals.join(format!("{id}.sj"));
-        std::fs::rename(scratch.path().join("staging").join(format!("{id}.sj")), &path)
-            .expect("place journal");
-        if aged {
-            std::fs::OpenOptions::new()
-                .write(true)
-                .open(&path)
-                .expect("open")
-                .set_modified(
-                    std::time::SystemTime::now() - FINALIZED_ADOPTION_GRACE - Duration::from_secs(5),
-                )
-                .expect("backdate");
-        }
-        id
-    }
-
-    #[test]
-    fn a_take_stopped_before_it_was_stored_comes_back_due_for_transcription() {
-        let root = tempfile::tempdir().unwrap();
-        let journals = journals_dir(root.path());
-        let stopped = stopped_journal(&journals, &[0.1; 8_000], true);
-        killed_journal(&journals, "j_killed", &[0.2; 8_000], &[]);
-        let fresh = stopped_journal(&journals, &[0.3; 8_000], false);
-        let mut owner = StoreV2::open(root.path()).unwrap();
-        let found = recover(&mut owner, &journals, &ReconciliationReport::default(), None);
-        assert!(found.recovery.notice.contains("Recovered 2 recordings"), "{}", found.recovery.notice);
-        assert!(owner.transcription_wanted(&stopped).unwrap(), "a complete take is due");
-        assert!(!owner.transcription_wanted("j_killed").unwrap(), "a cut take waits for the user");
-        // Just stopped: left for a save that may be under way, then looked
-        // at again — and due too, with its id handed on.
-        assert_eq!(found.recheck, vec![fresh.clone()]);
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(journals.join(format!("{fresh}.sj")))
-            .unwrap()
-            .set_modified(std::time::SystemTime::now() - FINALIZED_ADOPTION_GRACE - Duration::from_secs(5))
-            .unwrap();
-        let (again, recovered) = recheck(&mut owner, &journals, &found.recheck);
-        assert!(again.notice.contains("Recovered 1 recording"), "{}", again.notice);
-        assert_eq!(recovered, vec![fresh.clone()]);
-        assert!(owner.transcription_wanted(&fresh).unwrap());
     }
 
     #[test]

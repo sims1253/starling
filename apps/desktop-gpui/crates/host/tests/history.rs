@@ -4,7 +4,10 @@
 //! classes, audio holds — is answered by the host on its own store
 //! handle; answers and uploads too large for one frame go in chunks; what
 //! a connection was handed goes with it; the audio upkeep runs in the
-//! host, reports to watching apps and waits while a take records.
+//! host, reports to watching apps and waits while a take records. Apps of
+//! another build settle which one serves before anything else.
+
+mod common;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -516,5 +519,196 @@ fn the_wav_a_take_reads_back_decodes_to_its_samples() {
     // Every request is a StoreCall like any other.
     assert!(client.chunk_bytes() > 0);
     drop(client);
+    host.shutdown();
+}
+
+/// History answers too large to keep in memory wait in spool files the
+/// host has already unlinked, and come back whole however they are
+/// fetched: one larger than the bound alone, one that fits, and one that
+/// no longer fits beside it.
+#[test]
+fn answers_too_large_to_keep_in_memory_wait_on_disk_and_come_back_whole() {
+    let root = tempfile::tempdir().unwrap();
+    let small = wav(16_000);
+    let mut host = serve(
+        config(root.path(), FakeCaptureSource::new(Vec::new()))
+            .with_max_frame_bytes(16 * 1024)
+            .with_answer_memory(small.len() + 1024),
+    )
+    .expect("host serves");
+    let client = connect(&host);
+    let history = HistoryClient(&client);
+    let large = wav(48_000);
+    let large_id = history.import(&large, false).unwrap();
+    let small_id = history.import(&small, false).unwrap();
+    let ask = |id: &str| match client
+        .store(StoreRequest::Audio { id: id.to_string(), format: AudioFormat::Wav })
+        .unwrap()
+    {
+        StoreReply::Bytes { blob, bytes } => (blob, bytes),
+        other => panic!("expected a kept answer, got {other:?}"),
+    };
+    let fetch = |(blob, bytes): (String, u64)| {
+        use base64::Engine;
+        let mut data = Vec::new();
+        while (data.len() as u64) < bytes {
+            let StoreReply::Chunk { data: part } = client
+                .store(StoreRequest::Fetch { blob: blob.clone(), offset: data.len() as u64 })
+                .unwrap()
+            else {
+                panic!("expected a chunk");
+            };
+            data.extend(base64::engine::general_purpose::STANDARD.decode(part).unwrap());
+        }
+        data
+    };
+    let alone_too_large = ask(&large_id);
+    let fits = ask(&small_id);
+    let beside = ask(&small_id);
+    assert!(root.path().join("spool").is_dir(), "the answers past the bound went to disk");
+    #[cfg(unix)]
+    assert_eq!(
+        std::fs::read_dir(root.path().join("spool")).map(|dir| dir.count()).unwrap_or(0),
+        0,
+        "spool files are unlinked: nothing outlives the host"
+    );
+    assert_eq!(fetch(beside), small);
+    assert_eq!(fetch(alone_too_large), large);
+    assert_eq!(fetch(fits), small);
+    drop(client);
+    host.shutdown();
+}
+
+/// A take whose audio vanished under the store is listed with what is
+/// wrong, and reading its audio fails loudly — never a silent empty
+/// recording.
+#[test]
+fn a_take_whose_audio_vanished_is_listed_with_its_problem_and_never_reads_as_empty() {
+    let root = tempfile::tempdir().unwrap();
+    let mut host = host_at(root.path());
+    let (id, _) = transcribed(root.path(), 1600, "words kept");
+    std::fs::remove_file(root.path().join("audio").join(format!("{id}.sj"))).unwrap();
+    let client = connect(&host);
+    let history = HistoryClient(&client);
+    let take = summary(&history, &id).expect("still listed");
+    assert!(take.last_error.as_deref().is_some_and(|error| error.contains("missing")), "{take:?}");
+    assert_eq!(take.transcript.expect("its words stay").text, "words kept");
+    let err = history.audio(&id, AudioFormat::Wav).expect_err("a surfaced error");
+    assert!(err.to_string().contains("no audio journal"), "{err}");
+    drop(client);
+    host.shutdown();
+}
+
+/// An import stored with its intent and asked for at once (`due`): run
+/// once, whether the request or the host's own look at the store gets to
+/// it first, and never again by this host or the next.
+#[test]
+fn an_import_asked_for_is_transcribed_once() {
+    use common::fake_engine::{FakeEngine, Reply, StreamMode};
+    let root = tempfile::tempdir().unwrap();
+    let engine = FakeEngine::start(
+        vec![Reply::Text("imported".into()), Reply::Text("again".into())],
+        StreamMode::Refuse,
+    );
+    let with_engine = || {
+        config(root.path(), FakeCaptureSource::new(Vec::new())).with_engine(
+            starling_runtime_host::engine::EngineChoice::Manual {
+                endpoint: engine.endpoint(),
+                model: "fake-model".to_string(),
+            },
+        )
+    };
+    let mut host = serve(with_engine()).expect("serves");
+    let app = connect(&host);
+    app.take_watch().unwrap();
+    let id = HistoryClient(&app).import(&wav(16_000), true).expect("import");
+    app.transcribe_due(&id).unwrap();
+    app.transcribe_due(&id).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while common::completed_attempts(root.path(), &id).is_empty() {
+        assert!(Instant::now() < deadline, "the import was not transcribed");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // Asked again once it ran: nothing is due, nothing runs.
+    app.transcribe_due(&id).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    drop(app);
+    host.shutdown();
+    let mut next = serve(with_engine()).expect("serves again");
+    std::thread::sleep(Duration::from_millis(500));
+    next.shutdown();
+    assert_eq!(common::completed_attempts(root.path(), &id), vec!["imported"]);
+    assert_eq!(engine.batch_requests(), 1, "transcribed once");
+    assert!(!StoreV2::open(root.path()).unwrap().transcription_wanted(&id).unwrap());
+}
+
+/// #220's version handshake over the socket. An older host refuses to
+/// watch for a newer app, steps aside when that app asks while it idles —
+/// not while a window of its own version is open — and refuses an older
+/// app's request. A newer host refuses an older app plainly.
+#[test]
+fn hosts_and_apps_of_different_builds_settle_who_serves() {
+    use starling_runtime_host::version::{BuildStamp, RetireAnswer};
+    let old = BuildStamp {
+        id: "an-older-build".into(),
+        built: 1,
+    };
+    let new = BuildStamp::current();
+    assert!(old.older_than(&new));
+
+    let root = tempfile::tempdir().unwrap();
+    let mut host = serve(config(root.path(), FakeCaptureSource::new(Vec::new())).with_build(old.clone()))
+        .expect("the older host serves");
+    let probe = connect(&host);
+    assert_eq!(probe.info.build.as_ref(), Some(&old), "the hello names the host's build");
+    let refused = probe.take_watch_as(&new).expect_err("another build is not watched");
+    assert!(refused.to_string().contains("version_mismatch"), "{refused}");
+
+    // A window of the host's own version is open: it keeps its service.
+    let own_window = connect(&host);
+    own_window.take_watch_as(&old).expect("the same build is served");
+    let asking = connect(&host);
+    match asking.retire(&new).expect("answered") {
+        RetireAnswer::Busy { reason } => assert!(reason.contains("window"), "{reason}"),
+        other => panic!("a host serving a window must not step aside: {other:?}"),
+    }
+    // An older app does not get to replace it.
+    let older = BuildStamp {
+        id: "older-still".into(),
+        built: 0,
+    };
+    assert!(matches!(asking.retire(&older).expect("answered"), RetireAnswer::Refused { .. }));
+    assert!(!host.retire_requested());
+
+    // Once that window closed, the host steps aside for the newer app.
+    drop(own_window);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match asking.retire(&new).expect("answered") {
+            RetireAnswer::Retiring => break,
+            RetireAnswer::Busy { .. } => {
+                assert!(Instant::now() < deadline, "the idle host never stepped aside")
+            }
+            other => panic!("{other:?}"),
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(host.retire_requested(), "whoever runs the host is told to stop it");
+    // Committed: no new work is taken on until it has stopped.
+    let late = connect(&host);
+    let refused = late
+        .send(Some("take_late"), Command::CaptureStart { policy: "push-to-talk".into() })
+        .expect_err("a retiring host takes on no new take");
+    assert!(refused.to_string().contains("stepping aside"), "{refused}");
+    host.shutdown();
+
+    // A newer host and an older app: refused, with what to do.
+    let root = tempfile::tempdir().unwrap();
+    let mut host = host_at(root.path());
+    let app = connect(&host);
+    let text = app.take_watch_as(&old).expect_err("an older app is not served").to_string();
+    assert!(text.contains("version_mismatch"), "{text}");
+    assert!(text.contains("older version"), "{text}");
+    assert!(text.contains("start Starling again"), "{text}");
     host.shutdown();
 }

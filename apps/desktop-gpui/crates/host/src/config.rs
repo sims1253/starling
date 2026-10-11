@@ -78,6 +78,10 @@ pub struct HostConfig {
     /// often after that ([`crate::history::History::upkeep_loop`]).
     pub upkeep_first: Duration,
     pub upkeep_interval: Duration,
+    /// How many bytes of history answers one connection may hold in memory
+    /// while it fetches them; an answer that does not fit waits in a spool
+    /// file ([`crate::history::ANSWER_MEMORY_BYTES`]).
+    pub answer_memory_bytes: usize,
     /// The agent allowlist file (see [`crate::agent::Allowlist`]).
     /// `None` or a missing file denies every agent client; a malformed
     /// file refuses startup.
@@ -120,6 +124,7 @@ impl HostConfig {
             engine_wait: crate::transcribe::DEFAULT_ENGINE_WAIT,
             upkeep_first: crate::history::UPKEEP_FIRST,
             upkeep_interval: crate::history::UPKEEP_INTERVAL,
+            answer_memory_bytes: crate::history::ANSWER_MEMORY_BYTES,
             agent_allowlist: None,
             #[cfg(feature = "test-support")]
             insecure_test_app_role: false,
@@ -253,6 +258,13 @@ impl HostConfig {
     #[cfg(feature = "test-support")]
     pub fn with_insecure_test_app_role(mut self) -> Self {
         self.insecure_test_app_role = true;
+        self
+    }
+
+    /// Overrides how many bytes of history answers a connection holds in
+    /// memory before the rest wait on disk.
+    pub fn with_answer_memory(mut self, bytes: usize) -> Self {
+        self.answer_memory_bytes = bytes;
         self
     }
 

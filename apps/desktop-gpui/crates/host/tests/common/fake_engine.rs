@@ -31,6 +31,15 @@ pub enum StreamMode {
     /// One preview (`partial`) after the first audio frame, `final` at
     /// the commit.
     Echo { partial: String, final_text: String },
+    /// The first `failing` sessions drop their connection (no close
+    /// frame, no final) once they took `after_frames` audio frames; the
+    /// sessions after them [`StreamMode::Echo`].
+    Drop {
+        failing: usize,
+        after_frames: usize,
+        partial: String,
+        final_text: String,
+    },
 }
 
 #[derive(Default)]
@@ -40,6 +49,8 @@ struct Script {
     batch_requests: usize,
     stream_sessions: usize,
     stream_audio_frames: usize,
+    /// Samples each session received, in session order.
+    session_samples: Vec<usize>,
     released: bool,
 }
 
@@ -88,6 +99,11 @@ impl FakeEngine {
         self.script.0.lock().unwrap().stream_audio_frames
     }
 
+    /// The samples each `/stream` session received, in session order.
+    pub fn session_samples(&self) -> Vec<usize> {
+        self.script.0.lock().unwrap().session_samples.clone()
+    }
+
     /// Lets every [`Reply::Held`] answer.
     pub fn release(&self) {
         self.script.0.lock().unwrap().released = true;
@@ -104,7 +120,17 @@ impl FakeEngine {
                 Some(StreamMode::Echo {
                     partial,
                     final_text,
-                }) => self.stream_session(stream, &partial, &final_text),
+                }) => self.stream_session(stream, &partial, &final_text, None),
+                Some(StreamMode::Drop {
+                    failing,
+                    after_frames,
+                    partial,
+                    final_text,
+                }) => {
+                    let session = self.script.0.lock().unwrap().stream_sessions + 1;
+                    let drop_after = (session <= failing).then_some(after_frames);
+                    self.stream_session(stream, &partial, &final_text, drop_after)
+                }
                 _ => {
                     let _ = read_request(&mut stream);
                     respond(&mut stream, "404 Not Found", r#"{"error":"no stream"}"#);
@@ -138,17 +164,41 @@ impl FakeEngine {
         }
     }
 
-    fn stream_session(&self, stream: TcpStream, partial: &str, final_text: &str) {
+    fn stream_session(
+        &self,
+        stream: TcpStream,
+        partial: &str,
+        final_text: &str,
+        drop_after: Option<usize>,
+    ) {
         let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
         let Ok(mut socket) = tungstenite::accept(stream) else {
             return;
         };
-        self.script.0.lock().unwrap().stream_sessions += 1;
+        let session = {
+            let mut script = self.script.0.lock().unwrap();
+            script.stream_sessions += 1;
+            script.session_samples.push(0);
+            script.session_samples.len() - 1
+        };
         let mut previewed = false;
+        let mut frames = 0;
         loop {
             match socket.read() {
-                Ok(Message::Binary(_)) => {
-                    self.script.0.lock().unwrap().stream_audio_frames += 1;
+                Ok(Message::Binary(wav)) => {
+                    let samples = starling_dictation::audio::decode_pcm16_wav(&wav)
+                        .map(|audio| audio.samples.len())
+                        .unwrap_or(0);
+                    {
+                        let mut script = self.script.0.lock().unwrap();
+                        script.stream_audio_frames += 1;
+                        script.session_samples[session] += samples;
+                    }
+                    frames += 1;
+                    if drop_after.is_some_and(|after| frames >= after) {
+                        // The server dies: the socket goes without a word.
+                        return;
+                    }
                     if !previewed {
                         previewed = true;
                         let preview = serde_json::json!({

@@ -93,7 +93,7 @@ fn fnv1a(mut hash: u64, bytes: &[u8]) -> u64 {
 
 /// The raw append/sync surface a [`JournalWriter`] owns. Split out so tests
 /// can inject faults behind the exact code path production uses.
-pub(crate) trait JournalSink: Send {
+pub trait JournalSink: Send {
     /// Appends bytes at the end of the journal.
     fn append(&mut self, bytes: &[u8]) -> io::Result<()>;
     /// Flushes the file's kernel state to disk (`fsync`).
@@ -107,7 +107,7 @@ pub(crate) trait JournalSink: Send {
 /// existing file — or a symlink planted at the name — can never be
 /// overwritten: a journal is source evidence, there is deliberately no
 /// truncate path.
-pub(crate) struct FileSink {
+pub struct FileSink {
     /// Shared with the take's [`JournalLiveness`]: the handle, and the
     /// lock on it, outlive this sink while the take is unsaved.
     file: Arc<std::fs::File>,
@@ -246,7 +246,7 @@ impl JournalSink for FileSink {
 /// The per-take journal writer, owned by the capture writer task. Tracks the
 /// cumulative sample count and running content hash so every boundary and
 /// the trailer are verifiable on recovery.
-pub(crate) struct JournalWriter<S: JournalSink> {
+pub struct JournalWriter<S: JournalSink> {
     sink: S,
     id: String,
     path: PathBuf,
@@ -867,129 +867,6 @@ mod tests {
         panic!("fixture has no boundary record");
     }
 
-    #[test]
-    fn journal_round_trip_is_byte_exact() {
-        let dir = TempDir::new().expect("tempdir");
-        let mut writer = writer_in(&dir, 16_000);
-        let id = writer.id().to_string();
-
-        let first = ramp(1_000, 0);
-        let second = ramp(500, 1_000);
-        let third = ramp(250, 1_500);
-        writer.append_frames(&first).expect("append 1");
-        writer.write_boundary().expect("boundary 1");
-        writer.append_frames(&second).expect("append 2");
-        writer.write_boundary().expect("boundary 2");
-        writer.append_frames(&third).expect("append 3");
-        let acked = writer.finalize().expect("finalize");
-        assert_eq!(acked, 1_750);
-
-        let path = dir.path().join(format!("{id}.sj"));
-        let parsed = read_journal(&path).expect("parse finalized journal");
-        assert!(parsed.finalized, "trailer validates");
-        assert_eq!(parsed.sample_rate, 16_000);
-        assert_eq!(parsed.boundary_count, 2, "the two cadence boundaries");
-        assert_eq!(parsed.torn_tail_bytes, 0);
-        let mut expected = first.clone();
-        expected.extend_from_slice(&second);
-        expected.extend_from_slice(&third);
-        assert_eq!(parsed.samples, expected, "samples read back byte-exact");
-
-        // Byte-exact reproducibility: the same append/boundary sequence in a
-        // second journal produces the identical file bytes.
-        let mut twin = writer_in(&dir, 16_000);
-        twin.append_frames(&first).expect("append 1");
-        twin.write_boundary().expect("boundary 1");
-        twin.append_frames(&second).expect("append 2");
-        twin.write_boundary().expect("boundary 2");
-        twin.append_frames(&third).expect("append 3");
-        twin.finalize().expect("finalize");
-        assert_eq!(
-            std::fs::read(&path).expect("re-read first journal"),
-            std::fs::read(twin.path()).expect("read twin journal"),
-            "identical input must produce identical journal bytes"
-        );
-    }
-
-    /// A journal whose payload crosses the streamed-read buffer several
-    /// times over parses exactly like a small one: byte-exact samples,
-    /// the right boundary count, no torn tail.
-    #[test]
-    fn streamed_parse_handles_journals_larger_than_the_read_chunk() {
-        let dir = TempDir::new().expect("tempdir");
-        let mut writer = writer_in(&dir, 16_000);
-        let id = writer.id().to_string();
-
-        // 30k samples = 120 KB of payload, ~2x JOURNAL_READ_CHUNK, split
-        // across frame records the way the cadence writer emits them.
-        let mut expected = Vec::new();
-        let mut offset = 0u32;
-        while expected.len() < 30_000 {
-            let block = ramp(4_096.min(30_000 - expected.len()), offset);
-            offset += 4_096 as u32;
-            writer.append_frames(&block).expect("append");
-            expected.extend_from_slice(&block);
-            if expected.len() % 8_192 == 0 {
-                writer.write_boundary().expect("boundary");
-            }
-        }
-        let acked = writer.finalize().expect("finalize");
-        assert_eq!(acked, expected.len() as u64);
-
-        let parsed = read_journal(&dir.path().join(format!("{id}.sj")))
-            .expect("parse large journal");
-        assert!(parsed.finalized);
-        assert_eq!(parsed.torn_tail_bytes, 0);
-        assert_eq!(parsed.samples.len(), 30_000);
-        assert_eq!(parsed.samples, expected, "streamed read is byte-exact");
-    }
-
-    /// A torn tail after a large verified section: the parser must stop at
-    /// the last checksum-valid boundary even when the tail's partial frame
-    /// record stretches past the read buffer's edge cases.
-    #[test]
-    fn streamed_parse_truncates_a_torn_tail_after_a_large_verified_prefix() {
-        let dir = TempDir::new().expect("tempdir");
-        let mut writer = writer_in(&dir, 16_000);
-        let id = writer.id().to_string();
-
-        let verified = ramp(20_000, 0); // 80 KB of verified payload
-        writer.append_frames(&verified).expect("append");
-        let boundary_end = {
-            let path = writer.path().to_path_buf();
-            writer.write_boundary().expect("boundary");
-            let bytes = std::fs::read(&path).expect("read mid-state");
-            let end = first_boundary_end(&bytes);
-            assert!(end > JOURNAL_READ_CHUNK, "the fixture crosses the chunk");
-            end
-        };
-        drop(writer); // no finalize: the take died mid-write
-
-        // A torn tail: a frame header claiming 1_000 samples with only
-        // 100 bytes of payload actually present.
-        let mut torn = Vec::new();
-        torn.push(TAG_FRAME);
-        torn.extend_from_slice(&1_000u32.to_le_bytes());
-        torn.extend_from_slice(&[0xA5u8; 100]);
-        let path = dir.path().join(format!("{id}.sj"));
-        use std::io::Write as _;
-        let mut file = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&path)
-            .expect("open for torn append");
-        file.write_all(&torn).expect("append torn frame");
-
-        let file_len = std::fs::metadata(&path).expect("len").len();
-        let parsed = read_journal(&path).expect("parse torn journal");
-        assert!(!parsed.finalized);
-        assert_eq!(parsed.samples, verified, "the verified prefix is exact");
-        assert_eq!(
-            parsed.torn_tail_bytes,
-            file_len - boundary_end as u64,
-            "the discarded tail is exactly the torn record"
-        );
-    }
-
     /// A reader that serves a fixed byte slice and then fails with a
     /// chosen error kind — the test double for a disk failing mid-read.
     struct FailingAfter {
@@ -1087,92 +964,6 @@ mod tests {
     }
 
     #[test]
-    fn boundary_due_triggers_on_bytes_and_time() {
-        let dir = TempDir::new().expect("tempdir");
-        let mut writer = writer_in(&dir, 48_000);
-        assert!(
-            !writer.boundary_due(),
-            "fresh journal is not due before any bytes"
-        );
-        // 16 385 samples = 65 540 payload bytes > 64 KiB.
-        writer
-            .append_frames(&ramp(16_385, 0))
-            .expect("append past the byte threshold");
-        assert!(writer.boundary_due(), "byte threshold triggers");
-        writer.write_boundary().expect("boundary");
-        assert!(!writer.boundary_due(), "reset after the boundary");
-
-        // Time trigger: the interval passes while samples are pending (the
-        // cadence bounds the acknowledgment latency of UNSYNCED samples —
-        // an idle journal with nothing to confirm is never due, however
-        // much clock passes; that invariant is what keeps a fresh or silent
-        // writer from flapping on timer noise).
-        writer
-            .append_frames(&ramp(1, 0))
-            .expect("append one pending sample");
-        assert!(
-            !writer.boundary_due(),
-            "one sample is under both thresholds"
-        );
-        std::thread::sleep(JOURNAL_BOUNDARY_INTERVAL + Duration::from_millis(20));
-        assert!(writer.boundary_due(), "time threshold triggers on pending samples");
-        writer.write_boundary().expect("boundary after the interval");
-        assert!(!writer.boundary_due(), "boundary acks the pending sample");
-        // …and a boundary with nothing new stays a clock-resetting no-op.
-        writer.write_boundary().expect("empty boundary");
-        assert!(!writer.boundary_due(), "empty boundary is still a no-op");
-    }
-
-    #[test]
-    fn torn_tail_truncates_to_the_last_valid_boundary() {
-        let dir = TempDir::new().expect("tempdir");
-        let mut writer = writer_in(&dir, 16_000);
-        let id = writer.id().to_string();
-
-        let confirmed = ramp(800, 0);
-        writer.append_frames(&confirmed).expect("append 1");
-        writer.write_boundary().expect("boundary 1");
-
-        // Frames appended after the boundary but never boundary-confirmed —
-        // the crash scenario.
-        writer.append_frames(&ramp(300, 800)).expect("append 2");
-        let path = dir.path().join(format!("{id}.sj"));
-        let bytes = std::fs::read(&path).expect("read journal");
-        let boundary_end = first_boundary_end(&bytes);
-
-        // Corrupt the last 4 bytes (a torn final write): the tail can never
-        // become audio because no boundary ever confirmed it, detectable or
-        // not.
-        let mut corrupted = bytes.clone();
-        let last = corrupted.len();
-        for byte in &mut corrupted[last - 4..] {
-            *byte ^= 0xff;
-        }
-        std::fs::write(&path, &corrupted).expect("write corrupted journal");
-        let parsed = read_journal(&path).expect("parse corrupted journal");
-        assert!(!parsed.finalized, "no trailer was written");
-        assert_eq!(parsed.samples, confirmed, "verified prefix is exact");
-        assert_eq!(parsed.boundary_count, 1);
-        assert_eq!(
-            parsed.torn_tail_bytes,
-            corrupted.len() as u64 - boundary_end as u64,
-            "the discarded region is reported in exact bytes"
-        );
-
-        // Truncating the file mid-record recovers to the same boundary.
-        let truncated = bytes[..bytes.len() - 37].to_vec();
-        std::fs::write(&path, &truncated).expect("write truncated journal");
-        let parsed = read_journal(&path).expect("parse truncated journal");
-        assert_eq!(parsed.samples, confirmed);
-        assert_eq!(parsed.boundary_count, 1);
-        assert_eq!(
-            parsed.torn_tail_bytes,
-            truncated.len() as u64 - boundary_end as u64,
-            "tail size is exact for the truncated file"
-        );
-    }
-
-    #[test]
     fn mid_file_corruption_rolls_back_to_the_prior_boundary() {
         let dir = TempDir::new().expect("tempdir");
         let mut writer = writer_in(&dir, 16_000);
@@ -1202,48 +993,6 @@ mod tests {
         assert!(!parsed.finalized, "trailer no longer validates");
         assert_eq!(parsed.samples, first, "recovery rolls back to boundary 1");
         assert_eq!(parsed.boundary_count, 1);
-    }
-
-    #[test]
-    fn garbage_and_foreign_files_are_rejected_as_not_journals() {
-        let dir = TempDir::new().expect("tempdir");
-        let garbage = dir.path().join("j_garbage.sj");
-        std::fs::write(&garbage, b"not a journal at all, just text").expect("write garbage");
-        match read_journal(&garbage) {
-            Err(JournalReadError::NotAJournal(reason)) => {
-                assert!(reason.contains("header"), "{reason}");
-            }
-            other => panic!("expected NotAJournal, got {other:?}"),
-        }
-
-        let short = dir.path().join("j_short.sj");
-        std::fs::write(&short, b"STRL").expect("write stub");
-        assert!(matches!(
-            read_journal(&short),
-            Err(JournalReadError::NotAJournal(_))
-        ));
-
-        let future = dir.path().join("j_future.sj");
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(MAGIC);
-        bytes.push(FORMAT_VERSION + 1);
-        bytes.extend_from_slice(&16_000u32.to_le_bytes());
-        std::fs::write(&future, &bytes).expect("write future journal");
-        assert!(matches!(
-            read_journal(&future),
-            Err(JournalReadError::NotAJournal(_))
-        ));
-    }
-
-    #[test]
-    fn header_only_journal_recovers_no_samples() {
-        let dir = TempDir::new().expect("tempdir");
-        let writer = writer_in(&dir, 16_000);
-        let parsed = read_journal(writer.path()).expect("parse header-only");
-        assert!(parsed.samples.is_empty());
-        assert!(!parsed.finalized);
-        assert_eq!(parsed.torn_tail_bytes, 0);
-        assert_eq!(parsed.boundary_count, 0);
     }
 
     #[test]

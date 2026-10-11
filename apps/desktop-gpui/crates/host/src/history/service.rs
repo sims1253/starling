@@ -32,7 +32,7 @@ use crate::server::ConnState;
 const MAX_BLOBS: usize = 8;
 /// How many bytes of waiting answers one connection may hold in memory;
 /// an answer that does not fit beside them waits in a spool file instead.
-const MAX_BLOB_BYTES: usize = 1024 * 1024 * 1024;
+pub const ANSWER_MEMORY_BYTES: usize = 1024 * 1024 * 1024;
 /// Where spooled answers wait, under the store's root. The files are
 /// unlinked (deleted on close on Windows): nothing outlives the host.
 const SPOOL_DIR: &str = "spool";
@@ -134,7 +134,7 @@ pub struct History {
     /// Raw bytes per fetched chunk, and the largest answer sent whole.
     chunk: usize,
     inline: usize,
-    /// [`MAX_BLOB_BYTES`]; smaller in tests.
+    /// [`ANSWER_MEMORY_BYTES`] unless the host is configured otherwise.
     memory_limit: usize,
     spool: PathBuf,
     stashes: Mutex<HashMap<usize, Stash>>,
@@ -177,12 +177,18 @@ impl History {
             facade,
             chunk: chunk_bytes(max_frame_bytes),
             inline: max_frame_bytes.saturating_sub(4096).max(1),
-            memory_limit: MAX_BLOB_BYTES,
+            memory_limit: ANSWER_MEMORY_BYTES,
             stashes: Mutex::new(HashMap::new()),
             releases: Mutex::new(Vec::new()),
             upkeep: UpkeepState::default(),
             changed: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Holds at most `bytes` of a connection's waiting answers in memory.
+    pub fn with_memory_limit(mut self, bytes: usize) -> History {
+        self.memory_limit = bytes;
+        self
     }
 
     /// `changed` runs whenever a request changed the history list (a
@@ -789,101 +795,6 @@ mod tests {
             channels: 1,
         })
         .expect("wav")
-    }
-
-    /// A hold the workers could not take is released anyway, off the
-    /// caller's thread: the take compresses again.
-    #[test]
-    fn a_hold_released_later_lets_upkeep_compress_the_take() {
-        let root = tempfile::tempdir().unwrap();
-        let local = LocalHistory::open(root.path()).unwrap();
-        let history = HistoryClient(&local);
-        let id = history.import(&wav(32_000), false).unwrap();
-        let hold = history.hold_audio(&id).unwrap();
-        let pass = || {
-            local
-                .history()
-                .facade()
-                .audio_upkeep(RetentionPolicy::default, || false)
-                .unwrap()
-                .compressed
-        };
-        assert_eq!(pass(), 0, "held");
-        local.history().release_later(&Local, &hold);
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while pass() == 0 {
-            assert!(Instant::now() < deadline, "the hold was never released");
-            std::thread::sleep(Duration::from_millis(20));
-        }
-    }
-
-    /// #220: the answers a connection holds in memory never pass the
-    /// bound, the newest included: an answer that does not fit beside the
-    /// others — or alone — waits in a spool file and is read back whole.
-    #[test]
-    fn answers_past_the_memory_bound_wait_on_disk() {
-        let root = tempfile::tempdir().unwrap();
-        let mut local = LocalHistory::open(root.path()).unwrap();
-        let first = HistoryClient(&local).import(&wav(48_000), false).unwrap();
-        let second = HistoryClient(&local).import(&wav(16_000), false).unwrap();
-        let wav_of = |id: &str| HistoryClient(&local).audio(id, AudioFormat::Wav).unwrap().unwrap();
-        let (first_wav, second_wav) = (wav_of(&first), wav_of(&second));
-        // Room for the second take's answer, not the first's.
-        local.history.memory_limit = second_wav.len() + 1024;
-        let history = &local.history;
-        let ask = |id: &str| match history.handle(
-            &Local,
-            StoreRequest::Audio {
-                id: id.to_string(),
-                format: AudioFormat::Wav,
-            },
-        ) {
-            StoreReply::Bytes { blob, .. } => blob,
-            other => panic!("{other:?}"),
-        };
-        let kept = |blob: &str| {
-            lock(&history.stashes)[&0]
-                .blobs
-                .iter()
-                .find(|(id, _)| id == blob)
-                .map(|(_, kept)| matches!(kept, Kept::Spooled { .. }))
-                .expect("kept")
-        };
-        let in_memory = || lock(&history.stashes)[&0].blob_bytes();
-
-        let alone_too_large = ask(&first);
-        assert!(kept(&alone_too_large), "larger than the bound alone: spooled");
-        assert_eq!(in_memory(), 0);
-        let fits = ask(&second);
-        assert!(!kept(&fits), "fits: in memory");
-        let beside = ask(&second);
-        assert!(kept(&beside), "does not fit beside the other: spooled");
-        assert!(in_memory() <= history.memory_limit);
-        #[cfg(unix)]
-        assert_eq!(std::fs::read_dir(root.path().join(SPOOL_DIR)).unwrap().count(), 0, "unlinked");
-
-        let fetch = |blob: &str, len: usize| {
-            let mut data = Vec::new();
-            while data.len() < len {
-                match history.handle(
-                    &Local,
-                    StoreRequest::Fetch {
-                        blob: blob.to_string(),
-                        offset: data.len() as u64,
-                    },
-                ) {
-                    StoreReply::Chunk { data: part } => data.extend(
-                        base64::engine::general_purpose::STANDARD.decode(part).unwrap(),
-                    ),
-                    other => panic!("{other:?}"),
-                }
-            }
-            data
-        };
-        assert_eq!(fetch(&alone_too_large, first_wav.len()), first_wav);
-        assert_eq!(fetch(&beside, second_wav.len()), second_wav);
-        assert_eq!(fetch(&fits, second_wav.len()), second_wav);
-        assert!(lock(&history.stashes)[&0].blobs.is_empty(), "each was used up");
     }
 
     /// A store connection that refuses whatever consumes an upload, as a

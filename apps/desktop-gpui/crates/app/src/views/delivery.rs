@@ -221,16 +221,3 @@ pub(crate) fn render_insertion_section(app: &StarlingApp, cx: &mut Context<Starl
         )
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_excerpt_quotes_short_text_whole_and_marks_a_cut() {
-        assert_eq!(excerpt("Hello."), "“Hello.”");
-        let long = "a".repeat(EXCERPT_CHARS + 5);
-        let shown = excerpt(&long);
-        assert!(shown.ends_with("…”"));
-        assert_eq!(shown.chars().count(), EXCERPT_CHARS + 3);
-    }
-}

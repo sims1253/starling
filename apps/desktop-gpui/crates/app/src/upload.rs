@@ -872,166 +872,22 @@ pub(crate) async fn refresh_sessions(
 
 #[cfg(test)]
 mod tests {
+    //! The app's scenario suite (#220): windows on an in-process host over
+    //! the real socket, recording scripted takes that the host stores and
+    //! transcribes on a scripted server, and a fake insertion backend as
+    //! the app being dictated into. What a window shows, stores and types
+    //! is asserted as the user would see it.
     use super::*;
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpListener, TcpStream};
     use std::sync::Mutex;
 
-    use starling_dictation::engine::{
-        ActiveEngineView, EngineFailure, EnginePhase, EngineSnapshot, SwapDecision, SwitchStage,
-        SwitchView,
-    };
     use starling_dictation::settings::InsertionSettings;
     use starling_dictation::storage::{ListedRecord, SessionStatus, SessionSummary};
     use starling_insertion::testing::{FakeBackend, FakeTarget};
     use starling_insertion::Inserter;
-    use starling_runtime_host::frame::TranscriptionState;
 
     use crate::delivery::{DeliveryState, Failure};
-    use crate::host_link::{HostUpdate, TakeUpdate};
-
-    fn snapshot(active: Option<&str>, phase: EnginePhase) -> EngineSnapshot {
-        EngineSnapshot {
-            backend: None,
-            phase,
-            active: active.map(|model_id| ActiveEngineView {
-                model_id: model_id.to_string(),
-                endpoint: "http://127.0.0.1:1".to_string(),
-                pid: 1,
-                device: None,
-            }),
-            switch: None,
-            pending_decision: None,
-            last_switch: None,
-            models: Vec::new(),
-            notices: Vec::new(),
-            last_error: None,
-            activations_handled: 0,
-        }
-    }
-
-    fn switching_to(model_id: &str) -> Option<SwitchView> {
-        Some(SwitchView {
-            target_model_id: model_id.to_string(),
-            stage: SwitchStage::Loading,
-            started: Instant::now(),
-        })
-    }
-
-    /// A snapshot that has taken up activation `handled`.
-    fn handled(mut snapshot: EngineSnapshot, handled: u64) -> EngineSnapshot {
-        snapshot.activations_handled = handled;
-        snapshot
-    }
-
-    /// A dropped connection mid-switch is waited through (the host may
-    /// still be switching), for a while.
-    #[test]
-    fn a_retry_waits_through_a_missing_engine_report_for_a_while() {
-        let secs = std::time::Duration::from_secs;
-        assert_eq!(unreported_progress(secs(1), "gone".into()), SwitchProgress::Waiting);
-        assert_eq!(
-            unreported_progress(RETRY_UNREPORTED_WAIT, "gone".into()),
-            SwitchProgress::Failed("gone".into())
-        );
-    }
-
-    #[test]
-    fn a_retry_waits_for_its_model_and_gives_up_honestly() {
-        let secs = std::time::Duration::from_secs;
-        // Serving the model: go.
-        assert_eq!(
-            switch_progress(&snapshot(Some("b"), EnginePhase::Ready), "b", 5, secs(1)),
-            SwitchProgress::Ready
-        );
-        // The switch to it is running, or the command is not picked up yet.
-        let mut loading = handled(snapshot(Some("a"), EnginePhase::Ready), 5);
-        loading.switch = switching_to("b");
-        assert_eq!(switch_progress(&loading, "b", 5, secs(30)), SwitchProgress::Waiting);
-        assert_eq!(
-            switch_progress(&snapshot(Some("a"), EnginePhase::Ready), "b", 5, secs(1)),
-            SwitchProgress::Waiting
-        );
-        assert_eq!(
-            switch_progress(&handled(snapshot(Some("b"), EnginePhase::Loading), 5), "b", 5, secs(30)),
-            SwitchProgress::Waiting
-        );
-        // Everything else ends the wait with a reason.
-        let mut replaced = handled(snapshot(Some("a"), EnginePhase::Ready), 5);
-        replaced.switch = switching_to("c");
-        assert!(matches!(
-            switch_progress(&replaced, "b", 5, secs(5)),
-            SwitchProgress::Failed(_)
-        ));
-        // A later activation finished on another model.
-        assert!(matches!(
-            switch_progress(&handled(snapshot(Some("c"), EnginePhase::Ready), 6), "b", 5, secs(5)),
-            SwitchProgress::Failed(reason) if reason.contains("another model switch")
-        ));
-        let mut refused = handled(snapshot(Some("a"), EnginePhase::Ready), 5);
-        refused.pending_decision = Some(SwapDecision::Refused {
-            needed: 2,
-            available: 1,
-        });
-        assert!(matches!(
-            switch_progress(&refused, "b", 5, secs(1)),
-            SwitchProgress::Failed(reason) if reason.contains("memory")
-        ));
-        assert!(matches!(
-            switch_progress(
-                &handled(
-                    snapshot(None, EnginePhase::Failed(EngineFailure::LoadFailed("bad file".into()))),
-                    5
-                ),
-                "b",
-                5,
-                secs(5)
-            ),
-            SwitchProgress::Failed(_)
-        ));
-        let mut ignored = handled(snapshot(Some("a"), EnginePhase::Ready), 5);
-        ignored.last_error = Some("the model file failed verification".to_string());
-        assert_eq!(
-            switch_progress(&ignored, "b", 5, secs(5)),
-            SwitchProgress::Failed("the model file failed verification".to_string())
-        );
-        assert!(matches!(
-            switch_progress(&loading, "b", 5, RETRY_SWITCH_CAP),
-            SwitchProgress::Failed(_)
-        ));
-    }
-
-    /// Until the engine takes up the retry's own activation, an earlier
-    /// switch's refusal, error or failed phase is not this retry's
-    /// outcome: the wait goes on, bounded, and then fails with its own
-    /// reason (#356).
-    #[test]
-    fn a_retry_ignores_outcomes_from_before_its_activation() {
-        let secs = std::time::Duration::from_secs;
-        let mut stale = handled(
-            snapshot(Some("a"), EnginePhase::Failed(EngineFailure::LoadFailed("old".into()))),
-            4,
-        );
-        stale.pending_decision = Some(SwapDecision::Refused {
-            needed: 2,
-            available: 1,
-        });
-        stale.last_error = Some("an earlier switch failed".to_string());
-        stale.switch = switching_to("c");
-        assert_eq!(switch_progress(&stale, "b", 5, secs(1)), SwitchProgress::Waiting);
-        assert_eq!(
-            switch_progress(&stale, "b", 5, RETRY_SWITCH_PICKUP - secs(1)),
-            SwitchProgress::Waiting
-        );
-        assert_eq!(
-            switch_progress(&stale, "b", 5, RETRY_SWITCH_PICKUP),
-            SwitchProgress::Failed("the engine did not start the switch in time.".to_string())
-        );
-        // Taken up: the engine's own state for this request decides.
-        let mut taken = handled(snapshot(Some("a"), EnginePhase::Ready), 5);
-        taken.switch = switching_to("b");
-        assert_eq!(switch_progress(&taken, "b", 5, secs(40)), SwitchProgress::Waiting);
-    }
 
     /// What the fake transcription server does with one request.
     enum Reply {
@@ -1289,377 +1145,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// A take deleted while its retry's audio loads is not retried: no
-    /// attempt, and its audio is not stashed back as "unsaved".
-    #[gpui::test]
-    fn a_take_deleted_while_its_retry_loads_is_left_deleted(cx: &mut gpui::TestAppContext) {
-        let root = scratch("deleted-mid-load");
-        let store = Store::at_test_root(&root);
-        let id = store.save_capture(one_second_wav()).expect("save").id;
-        let (addr, served) = fake_server(vec![Reply::Text("never")]);
-        let app = cx.new(|cx| {
-            let mut app = StarlingApp::for_test(Some(store.clone()), cx);
-            app.endpoint = format!("http://{addr}");
-            app.apply_sessions(store.list().expect("list"));
-            app.selected_id = Some(id.clone());
-            app
-        });
-        app.update(cx, |app, cx| {
-            app.retry_selected_with(RetryWith::Server, cx);
-            // The confirmed delete is in flight when the load finishes:
-            // history still lists the take.
-            app.deleting_ids.insert(id.clone());
-            store.delete(&id).expect("delete");
-        });
-        cx.run_until_parked();
-        assert_eq!(*served.lock().unwrap(), 0, "nothing was sent");
-        app.read_with(cx, |app, _| {
-            assert!(app.unsaved.is_empty(), "the deleted audio is not resurrected");
-            assert!(!app.active_ids.contains(&id));
-        });
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// The delayed recovery pass lands while the app is in use: what it
-    /// found joins the banners, never replaces an error or notice the
-    /// user has not seen yet.
-    #[gpui::test]
-    fn a_recovery_pass_adds_to_the_banners_it_finds(cx: &mut gpui::TestAppContext) {
-        let app = cx.new(|cx| StarlingApp::for_test(None, cx));
-        app.update(cx, |app, _| {
-            app.error = Some("The save failed.".to_string());
-            add_recovery_messages(
-                app,
-                "1 recording could not be recovered.".to_string(),
-                String::new(),
-            );
-            assert_eq!(
-                app.error.as_deref(),
-                Some("The save failed. 1 recording could not be recovered.")
-            );
-            assert!(app.recovery_notice.is_none());
-            add_recovery_messages(app, String::new(), "Recovered 1 recording.".to_string());
-            add_recovery_messages(app, String::new(), "Recovered 2 recordings.".to_string());
-            assert_eq!(
-                app.recovery_notice.as_deref(),
-                Some("Recovered 1 recording. Recovered 2 recordings.")
-            );
-            assert_eq!(
-                app.error.as_deref(),
-                Some("The save failed. 1 recording could not be recovered.")
-            );
-        });
-    }
-
-    /// A host serving `root` whose built-in engine has no binaries: it
-    /// never serves, so a retry waiting on one of its models waits until
-    /// something else ends it. The app connects to it and has heard its
-    /// engine.
-    fn idle_engine_app(
-        cx: &mut gpui::TestAppContext,
-        root: &std::path::Path,
-        store: &crate::store::TestStore,
-        id: &str,
-    ) -> (starling_runtime_host::HostHandle, gpui::Entity<StarlingApp>) {
-        let host_root = root.join("engine");
-        std::fs::create_dir_all(host_root.join("engines")).expect("engines");
-        let engine = starling_runtime_host::engine::EngineChoice::Builtin {
-            config: starling_dictation::engine::EngineConfig {
-                engine_dir: Some(host_root.join("engines")),
-                models_dir: host_root.join("models"),
-                state_dir: host_root.join("state"),
-                catalog: Vec::new(),
-                backend_override: None,
-                icd_dirs: None,
-                available_memory_override: None,
-                backoff_schedule: None,
-            },
-            active_model: None,
-        };
-        let host = starling_runtime_host::serve(
-            starling_runtime_host::HostConfig::new(root, root.join("endpoints"))
-                .with_engine(engine),
-        )
-        .expect("host serves");
-        store.connect_to(&host);
-        let socket = host.socket_path().to_path_buf();
-        let app = cx.new(|cx| {
-            let mut app = StarlingApp::for_test(Some(Store::clone(store)), cx);
-            app.apply_sessions(store.list().expect("list"));
-            app.selected_id = Some(id.to_string());
-            app.follow_host(socket, crate::host_link::Launch::Never, cx);
-            app
-        });
-        settle(cx, "the host's engine reported", |cx| {
-            app.read_with(cx, |app, _| {
-                app.host.client.is_some()
-                    && app.engine_settings.mode == starling_dictation::settings::EngineMode::Builtin
-            })
-        });
-        (host, app)
-    }
-
-    /// #220: the engine runs in the host, and every window renders it.
-    /// A backend change one window makes reaches the host's engine and
-    /// becomes the other window's committed setting (and its untouched
-    /// draft), so a later Save there does not undo it; a change to the
-    /// user's server moves both windows to manual mode.
-    #[gpui::test]
-    fn a_second_window_follows_the_engine_settings_made_in_the_first(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        use starling_dictation::settings::EngineMode;
-        let root = scratch("two-windows");
-        let store = crate::store::TestStore::without_host(&root);
-        let id = store.save_capture(one_second_wav()).expect("save").id;
-        let (mut host, first) = idle_engine_app(cx, &root, &store, &id);
-        let socket = host.socket_path().to_path_buf();
-        let second = cx.new(|cx| {
-            let mut app = StarlingApp::for_test(Some(store.clone()), cx);
-            app.follow_host(socket, crate::host_link::Launch::Never, cx);
-            app
-        });
-        settle(cx, "the second window hearing the engine", |cx| {
-            second.read_with(cx, |app, _| app.engine_status.is_some())
-        });
-        second.read_with(cx, |app, _| {
-            // No engine binaries: the host's engine failed, and says so.
-            let snapshot = app.engine_snapshot().expect("the host's engine state");
-            assert!(matches!(snapshot.phase, starling_dictation::engine::EnginePhase::Failed(_)));
-            assert_eq!(app.connection, crate::app::Connection::Offline);
-            assert_eq!(app.engine_settings.backend_override, None);
-        });
-
-        first.update(cx, |app, cx| {
-            app.engine_settings.backend_override = Some("cpu".to_string());
-            app.draft_backend_override = Some("cpu".to_string());
-            app.configure_engine(cx);
-        });
-        settle(cx, "the second window on the CPU engine", |cx| {
-            second.read_with(cx, |app, _| {
-                app.engine_settings.backend_override.as_deref() == Some("cpu")
-                    && app.draft_backend_override.as_deref() == Some("cpu")
-            })
-        });
-        assert!(host.engine().is_some(), "a backend change keeps the built-in engine");
-
-        first.update(cx, |app, cx| {
-            app.engine_settings.mode = EngineMode::Manual;
-            app.endpoint = "http://127.0.0.1:9".to_string();
-            app.configure_engine(cx);
-        });
-        settle(cx, "the second window in manual mode", |cx| {
-            second.read_with(cx, |app, cx| {
-                app.engine_settings.mode == EngineMode::Manual
-                    && app.draft_engine_mode == EngineMode::Manual
-                    && app.endpoint == "http://127.0.0.1:9"
-                    && app.draft_endpoint.read(cx).value() == "http://127.0.0.1:9"
-                    && app.engine_snapshot().is_none()
-            })
-        });
-        assert!(host.engine().is_none(), "the built-in engine stopped");
-        drop((first, second));
-        host.shutdown();
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// #220: a lost connection to the recording service takes its
-    /// engine's state with it — no stale snapshot keeps reading as the
-    /// engine the window can use.
-    #[gpui::test]
-    fn a_lost_host_connection_forgets_the_engine_it_reported(cx: &mut gpui::TestAppContext) {
-        let root = scratch("engine-lost");
-        let store = crate::store::TestStore::without_host(&root);
-        let id = store.save_capture(one_second_wav()).expect("save").id;
-        let (mut host, app) = idle_engine_app(cx, &root, &store, &id);
-        settle(cx, "the engine reported", |cx| {
-            app.read_with(cx, |app, _| app.engine_snapshot().is_some())
-        });
-        host.shutdown();
-        settle(cx, "the connection lost", |cx| {
-            app.read_with(cx, |app, _| app.host.client.is_none())
-        });
-        app.read_with(cx, |app, _| {
-            assert!(app.engine_status.is_none());
-            assert!(app.engine_snapshot().is_none());
-            assert_eq!(app.connection, crate::app::Connection::Offline);
-            assert_eq!(crate::views::connection_label(app), "OFFLINE");
-        });
-        drop(app);
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// A `Configure`'s revision counts for the host that answered it —
-    /// whichever connection the request was made on (one queued across a
-    /// reconnect lands on the new host, and may be answered before the
-    /// window has taken in that connection).
-    #[gpui::test]
-    fn a_configure_answer_counts_for_the_host_that_gave_it(cx: &mut gpui::TestAppContext) {
-        use starling_runtime_host::engine::EngineReply;
-        let root = scratch("configure-host");
-        let mut host = starling_runtime_host::serve(starling_runtime_host::HostConfig::new(
-            &root,
-            root.join("endpoints"),
-        ))
-        .expect("host serves");
-        let socket = host.socket_path().to_path_buf();
-        let owner = host.owner_id().to_string();
-        let app = cx.new(|cx| StarlingApp::for_test(None, cx));
-        app.update(cx, |app, cx| {
-            app.engine_configuring = 2;
-            app.configure_answered(Some(owner), Ok(EngineReply::Done { revision: 40 }), cx);
-            app.configure_answered(
-                Some("an-older-host".to_string()),
-                Ok(EngineReply::Done { revision: 7 }),
-                cx,
-            );
-            assert_eq!(app.engine_configuring, 0);
-            assert_eq!(app.engine_revision(), 0, "no host is connected yet");
-            app.follow_host(socket, crate::host_link::Launch::Never, cx);
-        });
-        settle(cx, "connected", |cx| {
-            app.read_with(cx, |app, _| app.host.client.is_some())
-        });
-        app.read_with(cx, |app, _| {
-            assert_eq!(
-                app.engine_revision(),
-                40,
-                "the answer from before the connection"
-            );
-        });
-        drop(app);
-        host.shutdown();
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// Another host's answer to this window's `Configure` does not have
-    /// the window adopt the status in hand: it is the connected host's,
-    /// from before the change, and would undo it.
-    #[gpui::test]
-    fn another_hosts_configure_answer_keeps_the_settings_just_sent(cx: &mut gpui::TestAppContext) {
-        use starling_runtime_host::engine::{EngineReply, EngineStatus};
-        let app = cx.new(|cx| StarlingApp::for_test(None, cx));
-        app.update(cx, |app, cx| {
-            app.engine_settings.mode = starling_dictation::settings::EngineMode::Builtin;
-            app.engine_settings.backend_override = Some("cpu".to_string());
-            app.engine_status = Some(EngineStatus::without_engine());
-            app.engine_configuring = 1;
-            app.configure_answered(
-                Some("the-next-host".to_string()),
-                Ok(EngineReply::Done { revision: 3 }),
-                cx,
-            );
-            assert_eq!(app.engine_settings.backend_override.as_deref(), Some("cpu"));
-        });
-    }
-
-    /// An activation the host never takes on leaves nothing waiting: a
-    /// later Ready for that model (another window's switch) is not this
-    /// window's to persist.
-    #[gpui::test]
-    fn an_activation_that_never_ran_is_not_waited_for(cx: &mut gpui::TestAppContext) {
-        let app = cx.new(|cx| StarlingApp::for_test(None, cx));
-        app.update(cx, |app, cx| app.engine_activate("model-b", cx));
-        cx.run_until_parked();
-        app.read_with(cx, |app, _| {
-            assert_eq!(app.engine_activating, None);
-            assert!(app.error.is_some(), "the refusal is shown");
-        });
-    }
-
-    /// A "Retry with your server" click with no server set up says so
-    /// and replaces nothing: a retry waiting for its model carries on.
-    #[gpui::test]
-    fn a_server_retry_that_cannot_run_leaves_a_waiting_retry_alone(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        let root = scratch("srv-retry-pending");
-        let store = crate::store::TestStore::without_host(&root);
-        let id = store.save_capture(one_second_wav()).expect("save").id;
-        let (mut host, app) = idle_engine_app(cx, &root, &store, &id);
-        app.update(cx, |app, _| app.endpoint = String::new());
-        app.update(cx, |app, cx| app.retry_selected_with(RetryWith::Model("model-b".to_string()), cx));
-        cx.run_until_parked();
-        let waiting = app.read_with(cx, |app, _| app.pending_retry.clone());
-        assert!(waiting.is_some());
-        app.update(cx, |app, cx| app.retry_selected_with(RetryWith::Server, cx));
-        cx.run_until_parked();
-        app.read_with(cx, |app, _| {
-            let error = app.error.as_deref().expect("explained");
-            assert!(error.contains("No server"), "{error}");
-            assert_eq!(app.pending_retry, waiting, "the waiting retry carries on");
-        });
-        drop(app);
-        host.shutdown();
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// Settings switching the engine off while a retry waits for its
-    /// model ends that wait visibly: no "Loading" left in the drawer, a
-    /// sentence saying why, and nothing sent.
-    #[gpui::test]
-    fn an_engine_change_cancels_a_retry_waiting_for_its_model(cx: &mut gpui::TestAppContext) {
-        let root = scratch("engine-change");
-        let store = crate::store::TestStore::without_host(&root);
-        let id = store.save_capture(one_second_wav()).expect("save").id;
-        let (mut host, app) = idle_engine_app(cx, &root, &store, &id);
-        app.update(cx, |app, cx| app.retry_selected_with(RetryWith::Model("model-b".to_string()), cx));
-        cx.run_until_parked();
-        assert!(app.read_with(cx, |app, _| app.pending_retry.is_some()));
-        // Settings → Engine: your own server.
-        app.update(cx, |app, cx| {
-            app.engine_settings.mode = starling_dictation::settings::EngineMode::Manual;
-            app.configure_engine(cx);
-        });
-        settle(cx, "the host on the user's server", |cx| {
-            app.read_with(cx, |app, _| {
-                app.engine_status
-                    .as_ref()
-                    .is_some_and(|status| status.mode == starling_dictation::settings::EngineMode::Manual)
-            })
-        });
-        cx.executor().advance_clock(std::time::Duration::from_secs(1));
-        cx.run_until_parked();
-        app.read_with(cx, |app, _| {
-            assert!(app.pending_retry.is_none());
-            let error = app.error.as_deref().expect("explained");
-            assert!(error.contains("cancelled"), "{error}");
-            assert!(!app.active_ids.contains(&id));
-        });
-        assert_eq!(summary(&store, &id).attempt_count, 0);
-        drop(app);
-        host.shutdown();
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// A retry with the server when none is set up does nothing to the
-    /// take and says what to do.
-    #[gpui::test]
-    fn a_retry_without_a_server_leaves_the_take_alone(cx: &mut gpui::TestAppContext) {
-        let root = scratch("no-server");
-        let store = Store::at_test_root(&root);
-        let id = store.save_capture(one_second_wav()).expect("save").id;
-        let app = cx.new(|cx| {
-            let mut app = StarlingApp::for_test(Some(store.clone()), cx);
-            app.endpoint = String::new();
-            app.apply_sessions(store.list().expect("list"));
-            app.selected_id = Some(id.clone());
-            app
-        });
-        app.update(cx, |app, cx| app.retry_selected_with(RetryWith::Server, cx));
-        cx.run_until_parked();
-        assert_eq!(summary(&store, &id).attempt_count, 0);
-        let error = app.read_with(cx, |app, _| app.error.clone()).expect("explained");
-        assert!(error.contains("No server"), "{error}");
-        // No built-in engine runs in manual mode: a model choice says so.
-        app.update(cx, |app, cx| app.retry_selected_with(RetryWith::Model("parakeet".to_string()), cx));
-        cx.run_until_parked();
-        assert_eq!(summary(&store, &id).attempt_count, 0);
-        let error = app.read_with(cx, |app, _| app.error.clone()).expect("explained");
-        assert!(error.contains("recording is unchanged"), "{error}");
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
     // ---- #220: takes recorded and transcribed by the runtime host ---------
 
     /// A host serving `root` (the app's store root) over the real socket,
@@ -1868,44 +1353,6 @@ mod tests {
     }
 
     #[gpui::test]
-    fn a_take_the_host_stored_with_no_app_is_transcribed_without_one(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        let root = scratch("host-orphan");
-        let store = crate::store::TestStore::without_host(&root);
-        let (server, served) = fake_server(vec![Reply::Text("nobody was watching")]);
-        let mut host = host_at(&root, vec![scripted_take()], std::time::Duration::from_millis(200), server);
-        store.connect_to(&host);
-        {
-            let gone = starling_runtime_host::client::HostClient::connect(host.socket_path())
-                .expect("connect");
-            gone.send(
-                Some("take_orphaned"),
-                starling_runtime::protocol::Command::CaptureStart {
-                    policy: "push-to-talk".into(),
-                },
-            )
-            .expect("start");
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-        let deadline = Instant::now() + std::time::Duration::from_secs(10);
-        while transcript_of(&store).is_none() {
-            assert!(Instant::now() < deadline, "the host never transcribed the orphan");
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        assert_eq!(transcript_of(&store).as_deref(), Some("nobody was watching"));
-        // A window that opens later finds it in history, and nothing to do.
-        let app = app_on_host(cx, &store, &host, server);
-        settle(cx, "the history", |cx| app.read_with(cx, |app, _| !app.sessions.is_empty()));
-        cx.run_until_parked();
-        assert_eq!(*served.lock().unwrap(), 1, "transcribed once");
-        assert!(app.read_with(cx, |app, _| app.active_ids.is_empty()));
-        drop(app);
-        host.shutdown();
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[gpui::test]
     fn two_windows_share_one_host_and_only_the_starter_gets_its_take(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -1965,50 +1412,106 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// Starling's window takes focus (the user is in the staging panel),
+    /// or gives it back, as the window would report it.
+    fn starling_focus(app: &gpui::Entity<StarlingApp>, cx: &mut gpui::TestAppContext, active: bool) {
+        app.update(cx, |app, cx| {
+            app.window_focus.push((Instant::now(), active));
+            app.delivery_window_activation(active, cx);
+        });
+        cx.executor().advance_clock(crate::delivery::PASTE_SETTLE);
+        cx.run_until_parked();
+    }
+
+    /// Records a take and waits for its transcript in the staging panel.
+    fn staged_take(
+        app: &gpui::Entity<StarlingApp>,
+        cx: &mut gpui::TestAppContext,
+        store: &Store,
+        takes: usize,
+        text: &str,
+    ) -> String {
+        record_once(app, cx);
+        let mut id = String::new();
+        settle(cx, "the transcript in the staging panel", |cx| {
+            let Some(take) = records(store).into_iter().find(|take| {
+                take.transcript.as_ref().is_some_and(|transcript| transcript.text == text)
+            }) else {
+                return false;
+            };
+            id = take.id.clone();
+            records(store).len() == takes
+                && app.read_with(cx, |app, _| {
+                    app.host.awaiting.is_empty() && app.staged_text_for(&take.id).as_deref() == Some(text)
+                })
+        });
+        id
+    }
+
+    /// Delivery end to end: a take dictated while an editor had focus is
+    /// stored and transcribed by the host, staged, and typed into that
+    /// editor — once — when the user presses Insert and leaves Starling's
+    /// window. A take whose target lost focus meanwhile is never typed into
+    /// whatever has focus now: its text waits for Copy or Paste last.
     #[gpui::test]
-    fn of_two_windows_that_could_adopt_a_take_only_one_keeps_it(
+    fn a_staged_take_is_inserted_where_it_was_dictated_and_never_anywhere_else(
         cx: &mut gpui::TestAppContext,
     ) {
-        let root = scratch("host-adopt-race");
+        let root = scratch("host-insert");
         let store = crate::store::TestStore::without_host(&root);
-        let (server, served) = fake_server(vec![Reply::Text("adopted once")]);
-        let mut host = host_at(&root, vec![scripted_take()], std::time::Duration::from_secs(20), server);
+        let (server, served) = fake_server(vec![Reply::Text("first words"), Reply::Text("second words")]);
+        let mut host = host_at(
+            &root,
+            vec![scripted_take(), scripted_take()],
+            std::time::Duration::from_secs(20),
+            server,
+        );
         store.connect_to(&host);
-        {
-            let gone = starling_runtime_host::client::HostClient::connect(host.socket_path())
-                .expect("connect");
-            gone.send(
-                Some("take_race"),
-                starling_runtime::protocol::Command::CaptureStart {
-                    policy: "push-to-talk".into(),
-                },
-            )
-            .expect("start");
-            std::thread::sleep(std::time::Duration::from_millis(200));
-        }
-        let first = app_on_host(cx, &store, &host, server);
-        let second = app_on_host(cx, &crate::store::TestStore::without_host(&root), &host, server);
-        let holding = |cx: &mut gpui::TestAppContext| {
-            [&first, &second]
-                .iter()
-                .filter(|app| app.read_with(cx, |app, _| app.recorder.is_some()))
-                .count()
-        };
-        settle(cx, "exactly one window holding the take", |cx| holding(cx) == 1);
-        std::thread::sleep(std::time::Duration::from_millis(300));
+        let fake = Arc::new(FakeBackend::new());
+        fake.focus(FakeTarget::named("Editor", "notes.txt"));
+        let editor = starling_insertion::InsertionBackend::capture(&*fake).expect("the editor").target_ref;
+        let inserter = Arc::new(Inserter::with_backends(vec![Box::new(fake.clone())]));
+        let app = app_on_host(cx, &store, &host, server);
+        app.update(cx, |app, _| {
+            app.delivery = DeliveryState::new(inserter, InsertionSettings::default());
+        });
+
+        let first = staged_take(&app, cx, &store, 1, "first words");
+        assert!(fake.insertions().is_empty(), "staged: nothing typed before Insert");
+        starling_focus(&app, cx, true);
+        app.update(cx, |app, cx| app.insert_staging(cx));
         cx.run_until_parked();
-        assert_eq!(holding(cx), 1, "the other window let go");
-        let owner = if first.read_with(cx, |app, _| app.recorder.is_some()) {
-            first.clone()
-        } else {
-            second.clone()
-        };
-        click(&owner, cx);
-        settle(cx, "the transcript", |_| transcript_of(&store).as_deref() == Some("adopted once"));
+        assert!(fake.insertions().is_empty(), "pressed in Starling's window: it waits for focus to leave");
+        starling_focus(&app, cx, false);
+        assert_eq!(fake.insertions(), vec![(editor.clone(), "first words".to_string())]);
+        assert_eq!(app.read_with(cx, |app, _| app.staged_insert(&first)), Some(crate::delivery::StagedInsert::Inserted));
+        // Insert is single-shot.
+        starling_focus(&app, cx, true);
+        app.update(cx, |app, cx| app.insert_staging(cx));
+        starling_focus(&app, cx, false);
+        assert_eq!(fake.insertions().len(), 1);
+
+        // The second take's target loses focus before Insert lands.
+        staged_take(&app, cx, &store, 2, "second words");
+        starling_focus(&app, cx, true);
+        app.update(cx, |app, cx| app.insert_staging(cx));
         cx.run_until_parked();
-        assert_eq!(*served.lock().unwrap(), 1, "transcribed once");
-        drop(first);
-        drop(second);
+        fake.focus(FakeTarget::named("Browser", "A tab"));
+        starling_focus(&app, cx, false);
+        assert_eq!(fake.insertions().len(), 1, "never typed into the browser");
+        let recovery = app.read_with(cx, |app, _| {
+            app.delivery
+                .recovery
+                .as_ref()
+                .map(|recovery| (recovery.title().to_string(), recovery.text.clone()))
+        });
+        assert_eq!(
+            recovery,
+            Some(("Not inserted: focus moved".to_string(), "second words".to_string())),
+            "the text waits for Copy or Paste last"
+        );
+        assert_eq!(*served.lock().unwrap(), 2, "each take transcribed once, by the host");
+        drop(app);
         host.shutdown();
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -2066,562 +1569,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    #[gpui::test]
-    fn recording_is_refused_while_the_service_cannot_be_reached(cx: &mut gpui::TestAppContext) {
-        let root = scratch("host-down");
-        let store = Store::at_test_root(&root);
-        let app = cx.new(|cx| {
-            let mut app = StarlingApp::for_test(Some(store.clone()), cx);
-            app.follow_host(root.join("nobody-serves-here"), crate::host_link::Launch::Never, cx);
-            app
-        });
-        settle(cx, "the link to give up once", |cx| {
-            app.read_with(cx, |app, _| {
-                app.host.down.as_deref().is_some_and(|reason| reason != "connecting")
-            })
-        });
-        click(&app, cx);
-        let error = app.read_with(cx, |app, _| app.error.clone()).expect("explained");
-        assert!(error.contains("recording service"), "{error}");
-        assert!(app.read_with(cx, |app, _| app.recorder.is_none() && !app.activation.is_active()));
-        let _ = std::fs::remove_dir_all(&root);
-    }
     // ---- the app's side of the host's frames, with no host ----------------
 
-    /// A window with a fake host: frames are fed to it directly.
-    fn window_with_typing(
-        cx: &mut gpui::TestAppContext,
-        store: &Store,
-    ) -> (gpui::Entity<StarlingApp>, Arc<FakeBackend>) {
-        let fake = Arc::new(FakeBackend::new());
-        fake.focus(FakeTarget::named("Editor", "notes.txt"));
-        let inserter = Arc::new(Inserter::with_backends(vec![Box::new(fake.clone())]));
-        let app = cx.new(|cx| {
-            let mut app = StarlingApp::for_test(Some(store.clone()), cx);
-            app.delivery = DeliveryState::new(inserter, InsertionSettings::default());
-            app
-        });
-        (app, fake)
-    }
-
-    fn transcribed(store: &crate::store::TestStore, text: &str) -> String {
-        let id = store.save_capture(one_second_wav()).expect("save").id;
-        store.mark_attempt(&id, "openai:fake-model").expect("attempt");
-        store
-            .save_transcript(
-                &id,
-                storage::TranscriptionResult {
-                    text: text.to_string(),
-                    segments: Vec::new(),
-                    duration_seconds: None,
-                    request_id: None,
-                },
-            )
-            .expect("transcript");
-        id
-    }
-
-    fn frame(
-        app: &gpui::Entity<StarlingApp>,
-        cx: &mut gpui::TestAppContext,
-        update: TakeUpdate,
-    ) {
-        app.update(cx, |app, cx| app.host_update(HostUpdate::Take(update), cx));
-        cx.run_until_parked();
-    }
-
-    fn completed(stored_id: &str, req: Option<&str>, yours: bool) -> TakeUpdate {
-        completed_with(stored_id, req, yours, "words")
-    }
-
-    fn completed_with(stored_id: &str, req: Option<&str>, yours: bool, text: &str) -> TakeUpdate {
-        TakeUpdate::Transcription {
-            stored_id: stored_id.to_string(),
-            take: None,
-            req: req.map(str::to_string),
-            attempt: None,
-            state: TranscriptionState::Completed {
-                text: text.to_string(),
-                kept_earlier: false,
-            },
-            yours,
-        }
-    }
-
-    /// A window's own take with its delivery bound, waiting for the host.
-    fn own_take(app: &gpui::Entity<StarlingApp>, cx: &mut gpui::TestAppContext, id: &str) {
-        app.update(cx, |app, _| {
-            app.delivery_take_started();
-            let capture = app.delivery_take_stopped();
-            app.bind_delivery(capture, id);
-            app.host.awaiting.insert(id.to_string());
-        });
-    }
-
-    /// The window types its own take's result — exactly that one, even
-    /// when a retry another window asked for has landed in history since.
-    #[gpui::test]
-    fn the_own_take_types_its_own_result_not_a_later_retry(cx: &mut gpui::TestAppContext) {
-        let root = scratch("frames-exact");
-        let store = Store::at_test_root(&root);
-        let id = transcribed(&store, "my own words");
-        // Another window's retry landed after it.
-        store.mark_attempt(&id, "openai:other").expect("attempt");
-        store
-            .save_transcript(
-                &id,
-                storage::TranscriptionResult {
-                    text: "somebody else's retry".to_string(),
-                    segments: Vec::new(),
-                    duration_seconds: None,
-                    request_id: None,
-                },
-            )
-            .expect("retry");
-        let (app, fake) = window_with_typing(cx, &store);
-        own_take(&app, cx, &id);
-        frame(&app, cx, completed_with(&id, None, true, "my own words"));
-        settle(cx, "the own take typed", |_| !fake.insertions().is_empty());
-        assert_eq!(fake.insertions().len(), 1);
-        assert_eq!(fake.insertions()[0].1, "my own words", "{:?}", fake.insertions());
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// Another window's retry that the host refused (or that finished)
-    /// leaves this window's own take waiting, its delivery bound.
-    #[gpui::test]
-    fn another_windows_request_never_touches_the_own_takes_delivery(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        let root = scratch("frames-foreign-request");
-        let store = Store::at_test_root(&root);
-        let id = transcribed(&store, "mine at last");
-        let (app, fake) = window_with_typing(cx, &store);
-        own_take(&app, cx, &id);
-        frame(
-            &app,
-            cx,
-            TakeUpdate::Transcription {
-                stored_id: id.clone(),
-                take: None,
-                req: Some("tr_elsewhere".to_string()),
-                attempt: None,
-                state: TranscriptionState::Refused {
-                    message: "This recording is being transcribed already.".to_string(),
-                },
-                yours: false,
-            },
-        );
-        frame(&app, cx, completed_with(&id, Some("tr_elsewhere"), false, "theirs"));
-        assert!(app.read_with(cx, |app, _| app.host.awaiting.contains(&id)), "still waiting");
-        assert!(fake.insertions().is_empty());
-        frame(&app, cx, completed_with(&id, None, true, "mine at last"));
-        settle(cx, "the own take typed", |_| !fake.insertions().is_empty());
-        assert_eq!(fake.insertions()[0].1, "mine at last");
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// A retry another window asked for, handed to this window to act on
-    /// (its asker went away), is processed here but never typed — even
-    /// while this window's own take of it still waits for its result.
-    #[gpui::test]
-    fn a_retry_handed_to_this_window_is_never_typed(cx: &mut gpui::TestAppContext) {
-        let root = scratch("frames-handed-retry");
-        let store = Store::at_test_root(&root);
-        let id = transcribed(&store, "their retry");
-        let (app, fake) = window_with_typing(cx, &store);
-        own_take(&app, cx, &id);
-        app.update(cx, |app, _| {
-            app.drafts.insert(
-                id.clone(),
-                starling_processing::staging::Draft::new("d", &id),
-            );
-        });
-        frame(&app, cx, completed_with(&id, Some("tr_gone"), true, "their retry"));
-        cx.run_until_parked();
-        assert!(fake.insertions().is_empty(), "{:?}", fake.insertions());
-        assert!(app.read_with(cx, |app, _| app.host.awaiting.contains(&id)), "still waiting");
-        assert!(
-            app.read_with(cx, |app, _| app.drafts.contains_key(&id)),
-            "the own take's draft is left alone"
-        );
-        frame(&app, cx, completed_with(&id, None, true, "my own"));
-        settle(cx, "the own take typed", |_| !fake.insertions().is_empty());
-        assert_eq!(fake.insertions()[0].1, "my own");
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// Another window changed the history: this one reloads its list.
-    #[gpui::test]
-    fn another_windows_history_change_reloads_the_list(cx: &mut gpui::TestAppContext) {
-        let root = scratch("frames-history-changed");
-        let store = Store::at_test_root(&root);
-        let (app, _) = window_with_typing(cx, &store);
-        let id = transcribed(&store, "stored elsewhere");
-        assert!(app.read_with(cx, |app, _| app.sessions.is_empty()));
-        frame(&app, cx, TakeUpdate::HistoryChanged);
-        settle(cx, "the list reloaded", |cx| {
-            app.read_with(cx, |app, _| app.sessions.iter().any(|session| session.id == id))
-        });
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// A frame that pairs this window's request with another take does
-    /// not consume the request: the frames for its own take still find
-    /// it (and its offer).
-    #[gpui::test]
-    fn a_request_answered_for_another_take_is_kept_for_its_own(cx: &mut gpui::TestAppContext) {
-        let root = scratch("frames-request-mismatch");
-        let store = Store::at_test_root(&root);
-        let id = transcribed(&store, "the retried words");
-        let other = transcribed(&store, "another take");
-        let (app, _) = window_with_typing(cx, &store);
-        app.update(cx, |app, _| {
-            app.host.requests.insert(
-                "tr_mine".to_string(),
-                crate::remote_take::Request {
-                    stored_id: id.clone(),
-                    _hold: None,
-                    offer: true,
-                },
-            );
-        });
-        frame(&app, cx, completed_with(&other, Some("tr_mine"), true, "another take"));
-        assert!(
-            app.read_with(cx, |app, _| app.host.requests.contains_key("tr_mine")),
-            "the request waits for its own take's frames"
-        );
-        frame(&app, cx, completed_with(&id, Some("tr_mine"), true, "the retried words"));
-        settle(cx, "the retry offered", |cx| {
-            app.read_with(cx, |app, _| app.delivery.recovery.is_some())
-        });
-        assert!(app.read_with(cx, |app, _| app.host.requests.is_empty()));
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// A window with no store to read its own take back from lets go of
-    /// it when the transcript arrives: nothing stays bound or busy.
-    #[gpui::test]
-    fn a_window_without_a_store_lets_go_of_its_own_take(cx: &mut gpui::TestAppContext) {
-        let fake = Arc::new(FakeBackend::new());
-        fake.focus(FakeTarget::named("Editor", "notes.txt"));
-        let inserter = Arc::new(Inserter::with_backends(vec![Box::new(fake.clone())]));
-        let app = cx.new(|cx| {
-            let mut app = StarlingApp::for_test(None, cx);
-            app.delivery = DeliveryState::new(inserter, InsertionSettings::default());
-            app
-        });
-        own_take(&app, cx, "c_lost");
-        app.update(cx, |app, _| {
-            app.active_ids.insert("c_lost".to_string());
-        });
-        frame(&app, cx, completed_with("c_lost", None, true, "words"));
-        app.read_with(cx, |app, _| {
-            assert!(app.host.awaiting.is_empty());
-            assert!(!app.delivers("c_lost"), "nothing is typed for it later");
-            assert!(!app.is_active("c_lost"));
-        });
-        assert!(fake.insertions().is_empty());
-    }
-
-    /// A disconnect lets go of the takes this window waited for: they are
-    /// transcribed into history without it, and none stays busy here.
-    #[gpui::test]
-    fn a_disconnect_leaves_no_waiting_take_busy(cx: &mut gpui::TestAppContext) {
-        let root = scratch("frames-disconnect");
-        let store = Store::at_test_root(&root);
-        let id = transcribed(&store, "later");
-        let (app, _) = window_with_typing(cx, &store);
-        own_take(&app, cx, &id);
-        app.update(cx, |app, cx| {
-            app.active_ids.insert(id.clone());
-            app.host_update(
-                HostUpdate::Disconnected {
-                    reason: "gone".to_string(),
-                    gave_up: false,
-                    host_gone: false,
-                    plain: false,
-                },
-                cx,
-            );
-        });
-        app.read_with(cx, |app, _| {
-            assert!(!app.is_active(&id), "Retry and Delete work again");
-            assert!(app.host.awaiting.is_empty());
-            assert!(!app.delivers(&id), "nothing is typed for it later");
-        });
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// A staging panel whose transcription failed keeps its edits; a retry
-    /// the user asks for rebases them — never typed.
-    #[gpui::test]
-    fn an_asked_for_retry_recovers_a_failed_staging_panel(cx: &mut gpui::TestAppContext) {
-        let root = scratch("frames-staging-retry");
-        let store = Store::at_test_root(&root);
-        let id = transcribed(&store, "the retried words");
-        let (app, fake) = window_with_typing(cx, &store);
-        app.update(cx, |app, cx| {
-            app.begin_staging(cx);
-            let token = app.stop_staging().expect("a staging");
-            app.bind_staging(token, &id);
-            app.staging_transcription_failed(&id, cx);
-            assert!(app.staging_failed_for(&id));
-            app.host.requests.insert(
-                "tr_here".to_string(),
-                crate::remote_take::Request {
-                    stored_id: id.clone(),
-                    _hold: None,
-                    offer: true,
-                },
-            );
-        });
-        frame(&app, cx, completed_with(&id, Some("tr_here"), true, "the retried words"));
-        settle(cx, "the panel rebased", |cx| {
-            app.read_with(cx, |app, _| !app.staging_failed_for(&id))
-        });
-        assert_eq!(
-            app.read_with(cx, |app, _| app.staged_text_for(&id)).as_deref(),
-            Some("the retried words")
-        );
-        assert!(fake.insertions().is_empty());
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// The live text the host sends with an adoption shows once the take
-    /// is this window's (it arrives before the confirming tick).
-    #[gpui::test]
-    fn an_adopted_take_shows_the_live_state_sent_with_the_adoption(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        let app = cx.new(|cx| StarlingApp::for_test(None, cx));
-        app.update(cx, |app, _| {
-            app.host.claiming = Some(("take_back".to_string(), Instant::now()));
-        });
-        frame(
-            &app,
-            cx,
-            TakeUpdate::LiveText {
-                take: "take_back".to_string(),
-                partial: None,
-                degraded: Some("live text stopped earlier".to_string()),
-            },
-        );
-        assert!(app.read_with(cx, |app, _| app.stream_degradation.is_none()), "not ours yet");
-        frame(
-            &app,
-            cx,
-            TakeUpdate::Live {
-                take: "take_back".to_string(),
-                rate: 16_000,
-                status: None,
-                owner: starling_runtime_host::frame::TakeOwner::You,
-                ended: None,
-                kept: false,
-                meter: None,
-            },
-        );
-        app.read_with(cx, |app, _| {
-            assert!(app.recorder.as_ref().is_some_and(|live| live.take == "take_back"));
-            assert_eq!(app.stream_degradation.as_deref(), Some("live text stopped earlier"));
-        });
-    }
-
-    /// The window types the take it recorded when the host reports it
-    /// transcribed for it; a result for another window, or one this window
-    /// is not the one to act on, is shown and never typed.
-    #[gpui::test]
-    fn only_the_windows_own_take_is_typed_and_only_when_it_is_the_one_to_act(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        let root = scratch("frames-own");
-        let store = Store::at_test_root(&root);
-        let own = transcribed(&store, "my words");
-        let other = transcribed(&store, "their words");
-        let (app, fake) = window_with_typing(cx, &store);
-        app.update(cx, |app, _| {
-            for id in [&own, &other] {
-                app.delivery_take_started();
-                let capture = app.delivery_take_stopped();
-                app.bind_delivery(capture, id);
-                app.host.awaiting.insert(id.clone());
-            }
-        });
-        // Acted on elsewhere: shown here, typed nowhere here.
-        frame(&app, cx, completed(&other, None, false));
-        assert!(fake.insertions().is_empty(), "{:?}", fake.insertions());
-        assert!(app.read_with(cx, |app, _| !app.host.awaiting.contains(&other)));
-        frame(&app, cx, completed_with(&own, None, true, "my words"));
-        settle(cx, "the own take typed", |_| !fake.insertions().is_empty());
-        assert_eq!(fake.insertions().len(), 1);
-        assert!(fake.insertions()[0].1.contains("my words"), "{:?}", fake.insertions());
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// A retry's result is offered for Copy / Paste last, never typed —
-    /// even into the editor the take was first dictated into.
-    #[gpui::test]
-    fn a_retried_result_is_offered_not_typed(cx: &mut gpui::TestAppContext) {
-        let root = scratch("frames-retry");
-        let store = Store::at_test_root(&root);
-        let id = transcribed(&store, "retried words");
-        let (app, fake) = window_with_typing(cx, &store);
-        app.update(cx, |app, _| {
-            app.host.requests.insert(
-                "tr_1".to_string(),
-                crate::remote_take::Request {
-                    stored_id: id.clone(),
-                    _hold: None,
-                    offer: true,
-                },
-            );
-        });
-        frame(&app, cx, completed(&id, Some("tr_1"), true));
-        settle(cx, "the offer", |cx| app.read_with(cx, |app, _| app.delivery.recovery.is_some()));
-        assert!(fake.insertions().is_empty());
-        assert!(app.read_with(cx, |app, _| app.host.requests.is_empty()));
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// A retry's offer holds exactly that retry's words, even when a later
-    /// retry another window asked for is the take's history head by the
-    /// time this window has refreshed.
-    #[gpui::test]
-    fn a_retry_offers_its_own_words_not_a_later_head(cx: &mut gpui::TestAppContext) {
-        let root = scratch("frames-retry-own-words");
-        let store = Store::at_test_root(&root);
-        let id = transcribed(&store, "my retry");
-        store.mark_attempt(&id, "openai:other").expect("attempt");
-        store
-            .save_transcript(
-                &id,
-                storage::TranscriptionResult {
-                    text: "their later retry".to_string(),
-                    segments: Vec::new(),
-                    duration_seconds: None,
-                    request_id: None,
-                },
-            )
-            .expect("later retry");
-        let (app, fake) = window_with_typing(cx, &store);
-        app.update(cx, |app, _| {
-            app.host.requests.insert(
-                "tr_mine".to_string(),
-                crate::remote_take::Request {
-                    stored_id: id.clone(),
-                    _hold: None,
-                    offer: true,
-                },
-            );
-        });
-        frame(&app, cx, completed_with(&id, Some("tr_mine"), true, "my retry"));
-        settle(cx, "the offer", |cx| app.read_with(cx, |app, _| app.delivery.recovery.is_some()));
-        let offered = app.read_with(cx, |app, _| {
-            app.delivery.recovery.as_ref().map(|recovery| recovery.text.clone())
-        });
-        assert_eq!(offered.as_deref(), Some("my retry"));
-        assert!(fake.insertions().is_empty());
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// The host refusing a window's own take's transcription (its claim
-    /// failed) ends the wait: Retry and Delete work again, nothing is
-    /// typed for it later — unless another job on the take still runs.
-    #[gpui::test]
-    fn a_refused_own_transcription_leaves_the_take_idle(cx: &mut gpui::TestAppContext) {
-        let root = scratch("frames-refused-own");
-        let store = Store::at_test_root(&root);
-        let id = transcribed(&store, "never");
-        let busy = transcribed(&store, "still running");
-        let (app, _) = window_with_typing(cx, &store);
-        for take in [&id, &busy] {
-            own_take(&app, cx, take);
-            app.update(cx, |app, _| {
-                app.active_ids.insert(take.clone());
-            });
-        }
-        app.update(cx, |app, _| {
-            app.host.transcribing.insert(busy.clone());
-        });
-        let refused = |stored_id: &str| TakeUpdate::Transcription {
-            stored_id: stored_id.to_string(),
-            take: None,
-            req: None,
-            attempt: None,
-            state: TranscriptionState::Refused {
-                message: "The recording could not be claimed.".to_string(),
-            },
-            yours: true,
-        };
-        frame(&app, cx, refused(&id));
-        frame(&app, cx, refused(&busy));
-        app.read_with(cx, |app, _| {
-            assert!(!app.is_active(&id), "Retry and Delete work again");
-            assert!(!app.delivers(&id), "nothing is typed for it later");
-            assert!(app.is_active(&busy), "a job on it still runs");
-            assert!(app.host.awaiting.is_empty());
-        });
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// Live text from the host lands in the running take's live line; a
-    /// preview for a take that is not running here is ignored, and a
-    /// degradation says why live text stopped.
-    #[gpui::test]
-    fn live_text_follows_the_running_take_only(cx: &mut gpui::TestAppContext) {
-        let app = cx.new(|cx| StarlingApp::for_test(None, cx));
-        app.update(cx, |app, _| {
-            app.recorder = Some(crate::host_link::LiveCapture::new("take_live".to_string()));
-        });
-        let text = |take: &str, words: &str| TakeUpdate::LiveText {
-            take: take.to_string(),
-            partial: Some(starling_runtime_host::frame::LivePartial {
-                text: words.to_string(),
-                stable_words: 0,
-                covered_s: None,
-            }),
-            degraded: None,
-        };
-        frame(&app, cx, text("take_live", "hello there"));
-        assert_eq!(app.read_with(cx, |app, _| app.live_partial.clone()), "hello there");
-        frame(&app, cx, text("take_other", "not mine"));
-        assert_eq!(app.read_with(cx, |app, _| app.live_partial.clone()), "hello there");
-        frame(
-            &app,
-            cx,
-            TakeUpdate::LiveText {
-                take: "take_live".to_string(),
-                partial: None,
-                degraded: Some("the stream went away".to_string()),
-            },
-        );
-        assert_eq!(
-            app.read_with(cx, |app, _| app.stream_degradation.clone()).as_deref(),
-            Some("the stream went away")
-        );
-    }
-
-    /// The service going away mid-take says so — the take did not carry
-    /// on there — while a dropped connection says the take continues.
-    #[gpui::test]
-    fn a_lost_service_and_a_lost_connection_say_different_things(cx: &mut gpui::TestAppContext) {
-        for (host_gone, says) in [(true, "stopped while recording"), (false, "continues there")] {
-            let app = cx.new(|cx| StarlingApp::for_test(None, cx));
-            app.update(cx, |app, cx| {
-                app.recorder = Some(crate::host_link::LiveCapture::new("take_x".to_string()));
-                app.host_update(
-                    HostUpdate::Disconnected {
-                        reason: "gone".to_string(),
-                        gave_up: false,
-                        host_gone,
-                        plain: false,
-                    },
-                    cx,
-                );
-            });
-            let error = app.read_with(cx, |app, _| app.error.clone()).expect("explained");
-            assert!(error.contains(says), "{error}");
-            assert!(app.read_with(cx, |app, _| app.recorder.is_none()));
-        }
-    }
 }

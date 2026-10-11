@@ -274,22 +274,6 @@ pub(crate) struct TestStore {
 }
 
 #[cfg(test)]
-impl Store {
-    /// A host serving `root` in this process, and the store through it.
-    pub(crate) fn at_test_root(root: &std::path::Path) -> TestStore {
-        let store = TestStore::without_host(root);
-        let mut config = starling_runtime_host::HostConfig::new(root, root.join("endpoints"));
-        config.runtime = config
-            .runtime
-            .with_capture_source(starling_runtime::testing::FakeCaptureSource::new(Vec::new()));
-        let host = starling_runtime_host::serve(config).expect("the test host serves");
-        store.connect_to(&host);
-        *store.host.lock().unwrap() = Some(host);
-        store
-    }
-}
-
-#[cfg(test)]
 impl std::ops::Deref for TestStore {
     type Target = Store;
 
@@ -341,22 +325,6 @@ impl TestStore {
         Ok(SavedTake { id })
     }
 
-    /// A short silent take marked as captured against a secure field
-    /// (the desktop app has no such capture path).
-    pub(crate) fn save_secure_take(&self) -> String {
-        let mut meta = store_v2::TakeMeta::for_device("");
-        meta.secure_field = true;
-        let mut v2 = self.fixtures();
-        let mut take = v2.begin_take_at_rate(16_000, meta).unwrap();
-        take.append_and_seal(&[0.0; 160]).unwrap();
-        take.finalize()
-            .unwrap()
-            .commit_marked(&mut v2, store_v2::CommitMark::Complete)
-            .unwrap()
-            .record
-            .id
-    }
-
     /// Marks a transcription attempt as started on the record (the host
     /// writes attempts; tests stand in for it).
     pub(crate) fn mark_attempt(&self, id: &str, backend: &str) -> Result<(), storage::StorageError> {
@@ -377,57 +345,4 @@ impl TestStore {
             .map_err(|err| storage::StorageError::Invalid(err.to_string()))
     }
 
-    pub(crate) fn correction_records(
-        &self,
-        id: &str,
-    ) -> Result<Vec<store_v2::CorrectionRecord>, storage::StorageError> {
-        self.fixtures()
-            .correction_records_for(id)
-            .map_err(|err| storage::StorageError::Invalid(err.to_string()))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn tiny_wav(samples: usize) -> Arc<Vec<u8>> {
-        let pcm = starling_dictation::audio::PcmAudio {
-            samples: (0..samples).map(|i| (i % 97) as f32 * 0.001).collect(),
-            sample_rate: 16_000,
-            channels: 1,
-        };
-        Arc::new(starling_dictation::audio::encode_wav_16k(&pcm).expect("encode wav"))
-    }
-
-    /// The app's daily path goes through the host's store service: an
-    /// import, the list, its audio, a delete — and a hold released when
-    /// its guard drops.
-    #[test]
-    fn the_daily_path_runs_through_the_store_service() {
-        let root = tempfile::tempdir().unwrap();
-        let store = Store::at_test_root(root.path());
-        let wav = tiny_wav(300);
-        let id = store.save_import(wav.clone()).expect("import").id;
-        let listed = store.list().expect("list");
-        assert!(matches!(&listed[..], [ListedRecord::Session(summary)] if summary.id == id));
-        assert_eq!(*store.audio_wav(&id).unwrap().unwrap(), *wav);
-        assert!(store.audio_flac(&id).unwrap().unwrap().starts_with(b"fLaC"));
-        let hold = store.hold_audio(&id).expect("held");
-        drop(hold);
-        store.set_archival(&id, true).expect("archive");
-        store.delete(&id).expect("delete");
-        assert!(store.list().unwrap().is_empty());
-        assert!(store.audio_wav(&id).unwrap().is_none());
-    }
-
-    /// With no connection the store says so, after a short wait.
-    #[test]
-    fn without_a_connection_the_store_says_the_service_is_unreachable() {
-        let store = Store::through(Arc::new(Mutex::new(None)));
-        let started = Instant::now();
-        let err = store.list().expect_err("no connection");
-        assert!(started.elapsed() >= CONNECT_WAIT);
-        assert!(err.to_string().contains("not reachable"), "{err}");
-    }
 }
