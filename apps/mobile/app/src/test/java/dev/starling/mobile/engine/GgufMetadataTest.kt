@@ -6,6 +6,7 @@ import java.nio.file.Files
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /** Bounded GGUF metadata-section parsing (B08 pre-promotion validation). */
@@ -148,7 +149,7 @@ class GgufMetadataTest {
 
     @Test
     fun rejectsMetadataOverTheReadBudget() {
-        // One string KV whose declared length blows the 4 MiB budget.
+        // One string KV whose declared length blows the budget.
         val huge = header(kvs = 1)
         huge.write(u64(1)); huge.write("k".toByteArray())
         huge.write(u32(8)); huge.write(u64(GgufMetadata.MAX_METADATA_BYTES))
@@ -159,6 +160,104 @@ class GgufMetadataTest {
         hugeArray.write(u64(1)); hugeArray.write("k".toByteArray())
         hugeArray.write(u32(9)); hugeArray.write(u32(0)); hugeArray.write(u64(GgufMetadata.MAX_METADATA_BYTES))
         assertNull(GgufMetadata.parse(fileOf(hugeArray.toByteArray())))
+    }
+
+    /**
+     * A tensorless GGUF whose metadata is a [tokenCount]-piece string array
+     * (the LLM-decoder tokenizer shape) followed by the architecture KV. The
+     * pieces are the sparse file's zeros: empty strings, 8 bytes each.
+     */
+    private fun tokenizerSizedFile(tokenCount: Long): File {
+        val head = header(kvs = 2)
+        val key = "tokenizer.ggml.tokens"
+        head.write(u64(key.length.toLong())); head.write(key.toByteArray())
+        head.write(u32(9)); head.write(u32(8)); head.write(u64(tokenCount))
+        val tail = ByteArrayOutputStream()
+        stringKv(tail, "general.architecture", "qwen3")
+        val file = Files.createTempDirectory("starling-gguf-meta").resolve("model.gguf").toFile()
+        java.io.RandomAccessFile(file, "rw").use { out ->
+            out.write(head.toByteArray())
+            out.seek(head.size() + tokenCount * 8)
+            out.write(tail.toByteArray())
+        }
+        return file
+    }
+
+    @Test
+    fun acceptsTokenizerSizedMetadataBeyondTheOldFourMiB() {
+        // ~8 MiB of metadata, the size class of the ARK/Qwen3 tokenizers.
+        val parsed = GgufMetadata.parse(tokenizerSizedFile(1_000_000))
+
+        assertNotNull(parsed)
+        assertEquals(mapOf("general.architecture" to "qwen3"), parsed!!.strings)
+    }
+
+    @Test
+    fun rejectsMetadataThatRunsPastTheBudget() {
+        assertEquals(32L * 1024 * 1024, GgufMetadata.MAX_METADATA_BYTES)
+        // Header (24) + the array KV's key, types and count (45) precede the
+        // pieces; the architecture KV after them takes 45 bytes.
+        val room = GgufMetadata.MAX_METADATA_BYTES - 24 - 45
+        val fits = (room - 45) / 8
+
+        assertNotNull("the largest array that leaves room for the last KV", GgufMetadata.parse(tokenizerSizedFile(fits)))
+        // Every piece is really read: the array fits the budget, and the
+        // KV after it runs past it.
+        assertNull(GgufMetadata.parse(tokenizerSizedFile(fits + 4)))
+    }
+
+    @Test
+    fun skipsRealTokenizerPiecesWithoutRetainingThem() {
+        val out = header(kvs = 2)
+        val pieces = 160_000
+        out.write(u64("tokenizer.ggml.tokens".length.toLong())); out.write("tokenizer.ggml.tokens".toByteArray())
+        out.write(u32(9)); out.write(u32(8)); out.write(u64(pieces.toLong()))
+        repeat(pieces) { index ->
+            val piece = "piece-$index-ĠtokenĊ"
+            val bytes = piece.toByteArray(Charsets.UTF_8)
+            out.write(u64(bytes.size.toLong())); out.write(bytes)
+        }
+        stringKv(out, "general.architecture", "ark")
+        assertTrue("the fixture must exceed the old 4 MiB budget", out.size() > 4 * 1024 * 1024)
+
+        val parsed = GgufMetadata.parse(fileOf(out.toByteArray()))
+
+        assertNotNull(parsed)
+        assertEquals(mapOf("general.architecture" to "ark"), parsed!!.strings)
+    }
+
+    @Test
+    fun retainsOnlyTheSizeKeysAsUnsignedValues() {
+        fun u32Kv(out: ByteArrayOutputStream, key: String, value: Long) {
+            out.write(u64(key.length.toLong())); out.write(key.toByteArray()); out.write(u32(4)); out.write(u32(value))
+        }
+        val out = header(kvs = 4)
+        stringKv(out, "general.architecture", "qwen3")
+        u32Kv(out, ModelKind.QWEN3_HIDDEN_SIZE_KEY, 2048)
+        u32Kv(out, "qwen3.llm.num_layers", 28)
+        // A size key with another type is skipped, not misread.
+        out.write(u64(ModelKind.ARK_HIDDEN_SIZE_KEY.length.toLong())); out.write(ModelKind.ARK_HIDDEN_SIZE_KEY.toByteArray())
+        out.write(u32(10)); out.write(u64(896))
+
+        val parsed = GgufMetadata.parse(fileOf(out.toByteArray()))
+
+        assertNotNull(parsed)
+        assertEquals(mapOf(ModelKind.QWEN3_HIDDEN_SIZE_KEY to 2048L), parsed!!.uints)
+        assertEquals(
+            ModelKind.Detection.Supported(ModelKind.QWEN3, "Qwen3-ASR 1.7B"),
+            ModelKind.detect(parsed),
+        )
+    }
+
+    @Test
+    fun rejectsAStringArrayThatEndsPastTheEndOfTheFile() {
+        // Claims two 16-byte pieces but the file ends inside the second.
+        val out = header(kvs = 1)
+        out.write(u64(1)); out.write("k".toByteArray()); out.write(u32(9)); out.write(u32(8)); out.write(u64(2))
+        out.write(u64(16)); out.write(ByteArray(16))
+        out.write(u64(16)); out.write(ByteArray(4))
+
+        assertNull(GgufMetadata.parse(fileOf(out.toByteArray())))
     }
 
     // ---- tensor-info section (the engine's gguf_init_from_file rules) ----

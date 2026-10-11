@@ -31,15 +31,22 @@ import java.io.IOException
  *   GGML_PAD(nbytes, alignment) total;
  * - the file must actually hold the whole aligned data section.
  *
- * Only the value types needed for metadata inspection are decoded (strings);
- * everything else is skipped under the same budget. Of the decoded strings
- * only [ARCHITECTURE_KEY] is retained — the sole value any consumer reads;
- * tokenizer/chat-template blobs can fill the whole budget and must not be
- * held in memory for the lifetime of the parse result.
+ * Only the values model detection reads ([ModelKind.detect]) are decoded
+ * and retained: the [ARCHITECTURE_KEY] string and the few u32 values in
+ * [RETAINED_UINT32_KEYS]. Everything else — tokenizer vocabularies and
+ * merges, chat templates — is skipped under the same budget without being
+ * decoded: those blobs can fill most of the budget and must neither be held
+ * for the lifetime of the parse result nor churn one String per token.
  */
 object GgufMetadata {
-    /** GGUF metadata + tensor infos are a few hundred KB at most (tokenizer pieces); 4 MiB bounds crafted files. */
-    const val MAX_METADATA_BYTES = 4L * 1024 * 1024
+    /**
+     * Metadata + tensor infos are a few hundred KB for Parakeet, but the
+     * LLM-decoder models carry a full BPE tokenizer (150k+ pieces plus
+     * merges): ~7 MB for ARK-0.6B and ARK-3B, similar or more for Qwen3,
+     * MOSS, Granite and Voxtral. 32 MiB leaves room for those and still
+     * bounds crafted files.
+     */
+    const val MAX_METADATA_BYTES = 32L * 1024 * 1024
 
     /** Bounds pathological KV counts before any per-pair work. */
     const val MAX_KV_COUNT = 1_000_000L
@@ -48,8 +55,11 @@ object GgufMetadata {
     private const val TYPE_STRING = 8L
     private const val TYPE_ARRAY = 9L
 
-    /** The one string value retained from the KV section (the rejection message's model family). */
+    /** The one string value retained from the KV section (the model family). */
     private const val ARCHITECTURE_KEY = "general.architecture"
+
+    /** u32 values retained from the KV section (model sizes, for display). */
+    private val RETAINED_UINT32_KEYS = setOf(ModelKind.ARK_HIDDEN_SIZE_KEY, ModelKind.QWEN3_HIDDEN_SIZE_KEY)
 
     /** The engine sizes the data section on this KV when present; it must be u32. */
     private const val ALIGNMENT_KEY = "general.alignment"
@@ -119,6 +129,8 @@ object GgufMetadata {
         val keys: List<String>,
         /** The retained string value: [ARCHITECTURE_KEY], when present. */
         val strings: Map<String, String>,
+        /** The retained u32 values: those of [RETAINED_UINT32_KEYS] present as u32. */
+        val uints: Map<String, Long> = emptyMap(),
     )
 
     /** Null when [file]'s metadata section is malformed, unsupported, or over budget. */
@@ -137,6 +149,7 @@ object GgufMetadata {
 
             val keys = LinkedHashSet<String>()
             val strings = LinkedHashMap<String, String>()
+            val uints = LinkedHashMap<String, Long>()
             var alignment = GGUF_DEFAULT_ALIGNMENT
             var scratch = ByteArray(64)
             for (index in 0 until kvCount) {
@@ -152,9 +165,13 @@ object GgufMetadata {
                 if (key.second == ALIGNMENT_KEY && type != TYPE_UINT32) return null
                 when (type) {
                     TYPE_STRING -> {
-                        val value = reader.readUtf8String(scratch)
-                        scratch = value.first
-                        if (key.second == ARCHITECTURE_KEY) strings[key.second] = value.second
+                        if (key.second == ARCHITECTURE_KEY) {
+                            val value = reader.readUtf8String(scratch)
+                            scratch = value.first
+                            strings[key.second] = value.second
+                        } else {
+                            reader.skipString()
+                        }
                     }
                     TYPE_ARRAY -> {
                         val elementType = reader.readU32()
@@ -167,12 +184,9 @@ object GgufMetadata {
                             // skipping them one by one (the Int bound closes
                             // the wraparound hole before repeat()).
                             if (count > Int.MAX_VALUE || count > reader.remaining() / 8) return null
-                            repeat(count.toInt()) {
-                                val element = reader.readUtf8String(scratch)
-                                // Reuse the largest buffer seen so a crafted
-                                // token array churns at most one allocation.
-                                scratch = element.first
-                            }
+                            // Skipped, never decoded: a 150k-piece
+                            // vocabulary must not allocate per token.
+                            repeat(count.toInt()) { reader.skipString() }
                         } else {
                             val elementSize = SCALAR_SIZES[elementType.toInt()]
                             if (count > reader.remaining() / elementSize) return null
@@ -185,6 +199,8 @@ object GgufMetadata {
                             // Nonzero power of two, as the engine requires.
                             alignment = reader.readU32()
                             if (alignment == 0L || alignment and (alignment - 1) != 0L) return null
+                        } else if (type == TYPE_UINT32 && key.second in RETAINED_UINT32_KEYS) {
+                            uints[key.second] = reader.readU32()
                         } else {
                             reader.skipFully(SCALAR_SIZES[type.toInt()])
                         }
@@ -232,7 +248,10 @@ object GgufMetadata {
                 val requiredBytes = sumExact(dataStart, dataBytes) ?: return null
                 if (file.length() < requiredBytes) return null
             }
-            Parsed(keys.toList(), strings)
+            // A skip can run past the end of the file without failing (a
+            // FileInputStream seeks); the sections read must lie inside it.
+            if (reader.consumed() > file.length()) return null
+            Parsed(keys.toList(), strings, uints)
         }
     } catch (_: EOFException) {
         null
@@ -313,6 +332,16 @@ object GgufMetadata {
                 input.readFully(buffer, 0, length.toInt())
             }
             return buffer to String(buffer, 0, length.toInt(), Charsets.UTF_8)
+        }
+
+        /**
+         * Skips a GGUF string (u64 length + bytes) without decoding it; the
+         * length is checked against the budget before any byte is skipped.
+         */
+        fun skipString() {
+            val length = readU64()
+            if (length < 0 || length > remainingBytes) throw EOFException("string length exceeds budget")
+            skipFully(length)
         }
 
         /**
