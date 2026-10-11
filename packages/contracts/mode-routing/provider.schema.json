@@ -11,7 +11,7 @@
     "Locality follows the route naming the mode oracle already enforces:",
     "a 'remote-' route is remote, anything else is local. A local_only",
     "mode therefore can never reach a remote provider, and",
-    "tests/mode_routing.py processing_route never falls back from one",
+    "python-research-final:tests/mode_routing.py processing_route never falls back from one",
     "provider to another.",
     "artifact pins a local model file (checksum, tokenizer and chat",
     "template identity, license/attribution); remote providers have none.",

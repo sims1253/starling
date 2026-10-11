@@ -14,7 +14,7 @@ import java.nio.charset.StandardCharsets
  * Replays every case of the shared `staging.json` corpus through [StagedDraft],
  * one JUnit case per fixture case. Each op's outcome and text, the invariants
  * after every op, and the case's closing `expect` block are checked against
- * the oracle in `tests/staging.py`; a case fails once, listing every mismatch.
+ * the oracle in `python-research-final:tests/staging.py`; a case fails once, listing every mismatch.
  */
 @RunWith(Parameterized::class)
 class StagingConformanceTest(

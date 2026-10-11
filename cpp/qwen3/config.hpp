@@ -19,7 +19,7 @@
 //
 // Defaults match the baked GGUF metadata (scripts/convert_qwen3_gguf.py); the
 // loader overrides them from `qwen3.*` KV. Single source of truth:
-// src/starling/qwen3/config.py + the HF config.json for Qwen3-ASR-1.7B-hf.
+// python-research-final:src/starling/qwen3/config.py + the HF config.json for Qwen3-ASR-1.7B-hf.
 #pragma once
 
 #include <cstdint>

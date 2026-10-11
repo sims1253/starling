@@ -202,7 +202,7 @@ entry is for the build named in it. "E25" and "E26" are the Experimental 25
 and 26 prereleases (masters `74a8fe3` and `1060be8`, built by this workflow
 in experimental mode, CUDA SM 120 only). Checksums, versions, procedures, and
 expected versus actual results for the 2026-10-05 entries are in the
-[evidence record](https://github.com/sims1253/starling/blob/master/docs/evidence/release-runtime-2026-10-05/README.md)
+[evidence record](https://github.com/sims1253/starling/blob/python-research-final/docs/evidence/release-runtime-2026-10-05/README.md)
 (tracking issue #57).
 
 | Artifact | Representative inference | Hardware and runtime | Not covered |

@@ -1,5 +1,5 @@
 //! The trailing spoken instruction grammar, ported from the oracle
-//! `tests/spoken_instructions.py`. The delimiter table is the contract
+//! `python-research-final:tests/spoken_instructions.py`. The delimiter table is the contract
 //! file `packages/contracts/mode-routing/spoken-instructions.json`,
 //! compiled in.
 //!

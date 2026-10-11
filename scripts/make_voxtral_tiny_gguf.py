@@ -402,7 +402,6 @@ def main() -> None:
     pre_rows = [pr[j] for j in range(P)]
     pre = bf16(torch.stack([emb[tok] + row for tok, row in zip(PROMPT, pre_rows)]))
     ref["e2e_pre"] = pre.flatten().tolist()
-    caches: list | None = None
     h, per_layer_kv = pre, []
     pre_hiddens = []
     # Text layer-0 per-stage bisect dumps (mirror the C++ L0 probe stages):

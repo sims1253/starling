@@ -9,7 +9,8 @@ import java.util.Locale
  *
  * The Kotlin port of `packages/contracts/insertion-boundary` (its README is
  * authoritative); the JVM tests replay the contract's fixture table, like the
- * Python oracle (`tests/insertion_boundary.py`) and the Rust port do.
+ * Rust port does (the original Python oracle:
+ * `python-research-final:tests/insertion_boundary.py`).
  * Android-free. Text is walked by code point; character classes follow the
  * Rust port's Unicode properties (White_Space, Alphabetic, Numeric,
  * Lowercase, Uppercase) and case mappings are the full ones.

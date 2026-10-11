@@ -28,7 +28,8 @@
 // This is the test that WOULD have caught the bug. The capacity is forced small
 // (STARLING_REPLAY_CACHE_SIZE=4) via setenv so the plateau is dramatic and the
 // test is fast; the default capacity (16) is exercised end-to-end by the
-// real-audio leaderboard bench (benchmarks/bench_leaderboard.py).
+// real-audio leaderboard bench (benchmarks/bench_leaderboard.py, tag
+// python-research-final).
 //
 // GPU-only: the captured-graph cache path exists only on GPU (CPU uses the
 // one-shot build, which allocates+ frees per call and has no cache). On CPU the

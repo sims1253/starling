@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "manifest_revision": "r1-167-parity-contract",
+  "manifest_revision": "r2-remove-python-stack",
   "issue": "https://github.com/sims1253/starling/issues/167",
   "notes": [
     "Single source of truth for the native numerical-correctness contract.",
@@ -13,13 +13,22 @@
     "from the pin = FAIL (never measure or silently regenerate a reference).",
     "backend status 'validated' means: this contract was measured passing on that",
     "backend against THIS entry's pinned reference revision. Anything else is",
-    "'unvalidated' \u2014 an inventory slot, not a guarantee."
+    "'unvalidated' \u2014 an inventory slot, not a guarantee.",
+    "Golden source: the private HF dataset scholzmx/starling-goldens mirrors golden/",
+    "(hf download scholzmx/starling-goldens --repo-type dataset --local-dir golden).",
+    "It holds the pinned MOSS set; other targets' goldens were never published and",
+    "their gates skip as UNAVAILABLE until captured with scripts/goldens/."
   ],
   "changelog": [
     {
       "revision": "r1-167-parity-contract",
       "change": "Initial manifest. Restored the MOSS exact gate on ALL fixtures (the normalized-CER<0.10 escape hatch on long is REMOVED), pinned the MOSS reference (fresh CPU capture) and both GGUF hashes, renamed the loose smoke checks (test_ggml_moss_crispasr_approx_smoke, test_starling_ggml_s1_control_matrix_smoke, test_ggml_parakeet_external_text_gate) so they cannot be mistaken for accuracy certification, and inventoried every remaining test_ggml_parity.py gate as validated/unvalidated.",
       "justification": "Issue #167: docs/ggml-engine.md claimed exact MOSS text/token parity while the test accepted normalized CER<0.10 on the long fixture. Resolution (measured on CPU, 2026-09-19, against the freshly pinned reference): re-captured the reference with scripts/moss_golden.py (device=cpu, torch 2.13.0+cu130, transformers 5.15.0, repo revision 82f0715, reference module clean; per-fixture output hashes pinned in this manifest and recorded in golden/moss_reference_provenance.json) \u2014 the in-tree ENGINE then reproduces short/medium/long byte-exactly (normalized CER 0.0000; 31/89/187 tokens, 121/363/737 chars). The old CER headroom was guarding a STALE reference, not engine drift. Component gates re-staged from the same pinned reference (device=cpu, ids asserted equal to the text-golden stream before staging) and re-measured: mel worst 40/951680 mismatching bins (long), worst ULP excess 0, max_abs 0.00390625 (bound: <=64 bins at <=1 bf16 ULP); encoder_hidden worst max-abs 0.01171875 (long; bound 0.02), audio_embeds worst 0.000354766846 (long; bound 0.001); qwen_decode merged embeds 100% bitwise on all fixtures, prefill argmax exact, prefill logits max-abs 0.696228/0.3695984/5.014769 (short/medium/long; bound 8.0), token stream + text EXACT on short \u2014 on CPU medium/long token streams diverge from the python eager reference (near-tie bf16 argmax flips: cpp/moss/llm.cpp documents 'CPU bf16 GEMMs are not bit-identical to cuBLAS and are a fallback only'; verified NOT a K-step artifact \u2014 STARLING_MOSS_NOKSTEP=1 gives bit-identical failing numbers), so the exact-token contract is CUDA-scoped for medium/long (enforcement block of qwen_decode.shared_fixture.token_stream) while CPU text exactness is carried by moss.intree.text (measured byte-exact on all fixtures). Parakeet long-fixture corpus gates (ratio>=0.90, content-token match>=0.65) are carried over UNCHANGED from the pre-existing tests and are now the documented approximate path in both manifest and docs (the docs previously overclaimed 'byte-exact on short/medium/long'); their goldens were absent at authoring time, so their reference blocks are explicitly unpinned (hash pinning requires a recapture \u2014 follow-up)."
+    },
+    {
+      "revision": "r2-remove-python-stack",
+      "change": "Removed the moss.crispasr.external and parakeet.external targets with their gates (the external CrispASR / parakeet.cpp adapters lived in the deleted benchmarks/engines.py). Golden capture paths now point at scripts/goldens/ (stock transformers, no src/starling import); granite/qwen3/qwen3_06 captures are frozen at tag python-research-final. s1.intree.text now declares its golden files so a missing golden/s1/ skips as UNAVAILABLE instead of erroring.",
+      "justification": "The deprecated Python/CUDA research stack was deleted (tag python-research-final). No pinned reference changed: the MOSS hashes are the same files, now distributed via the scholzmx/starling-goldens dataset."
     }
   ],
   "targets": [
@@ -51,15 +60,15 @@
         "suppression": "detokenize with skip_special_tokens=True; no other suppression"
       },
       "reference": {
-        "capture": "scripts/moss_golden.py",
-        "implementation": "starling.moss.reference (eager greedy, exact-width DynamicCache, attn_implementation=eager propagated to every nested config)",
+        "capture": "scripts/goldens/moss_golden.py",
+        "implementation": "scripts/goldens/moss_reference.py (eager greedy, exact-width DynamicCache, attn_implementation=eager propagated to every nested config; upstream remote code pinned at c98175cb). The pinned capture was produced by its predecessor starling.moss.reference at 82f0715 (tag python-research-final).",
         "model_id": "OpenMOSS-Team/MOSS-Transcribe-preview-2B",
         "device": "cpu",
         "torch": "2.13.0+cu130",
         "transformers": "5.15.0",
         "repo_revision": "82f0715",
         "reference_module_dirty": false,
-        "provenance_file": "golden/moss_reference_provenance.json (gitignored; output hashes pinned in golden_sha256 below)",
+        "provenance_file": "golden/moss_reference_provenance.json (in scholzmx/starling-goldens; output hashes pinned in golden_sha256 below)",
         "measured": "2026-09-19, CPU backend: byte-exact on short/medium/long (CER 0.0000; 31/89/187 tokens, 121/363/737 chars). CUDA re-validation against this pinned reference is pending GPU access; prior CUDA byte-exactness was recorded against the pre-#167 reference."
       },
       "gguf": {
@@ -116,7 +125,7 @@
         "suppression": "none"
       },
       "reference": {
-        "capture": "scripts/moss_golden_components.py -> scripts/golden_to_raw.py",
+        "capture": "scripts/goldens/moss_golden_components.py -> scripts/goldens/golden_to_raw.py",
         "implementation": "MossProcessor mel (bf16 values persisted as f32) on the pinned HF reference stack",
         "device": "cpu",
         "torch": "2.13.0+cu130",
@@ -189,8 +198,8 @@
         "suppression": "none"
       },
       "reference": {
-        "capture": "scripts/moss_golden_components.py -> scripts/golden_to_raw.py",
-        "implementation": "starling.moss.reference.audio_features + model.model.audio_adapter on the pinned HF reference stack",
+        "capture": "scripts/goldens/moss_golden_components.py -> scripts/goldens/golden_to_raw.py",
+        "implementation": "scripts/goldens/moss_reference.py audio_features + model.model.audio_adapter on the pinned HF reference stack",
         "device": "cpu",
         "torch": "2.13.0+cu130",
         "transformers": "5.15.0",
@@ -269,8 +278,8 @@
         "suppression": "none"
       },
       "reference": {
-        "capture": "scripts/moss_golden_components.py -> scripts/golden_to_raw.py",
-        "implementation": "starling.moss.reference greedy path: build_inputs_embeds, last_prefill_logits (eager, exact-width DynamicCache)",
+        "capture": "scripts/goldens/moss_golden_components.py -> scripts/goldens/golden_to_raw.py",
+        "implementation": "scripts/goldens/moss_reference.py greedy path: build_inputs_embeds, last_prefill_logits (eager, exact-width DynamicCache)",
         "device": "cpu",
         "torch": "2.13.0+cu130",
         "transformers": "5.15.0",
@@ -345,8 +354,8 @@
         "suppression": "detokenize with skip_special_tokens=True"
       },
       "reference": {
-        "capture": "golden/moss_<fixture>_ids.pt + _text.txt from scripts/moss_golden.py; decode starts from the GOLDEN merged embedding so encoder/adapter drift cannot mask decoder bugs",
-        "implementation": "starling.moss.reference greedy_generate (eager, exact-width DynamicCache)",
+        "capture": "golden/moss_<fixture>_ids.pt + _text.txt from scripts/goldens/moss_golden.py; decode starts from the GOLDEN merged embedding so encoder/adapter drift cannot mask decoder bugs",
+        "implementation": "scripts/goldens/moss_reference.py greedy_generate (eager, exact-width DynamicCache)",
         "device": "cpu",
         "torch": "2.13.0+cu130",
         "transformers": "5.15.0",
@@ -419,7 +428,7 @@
         "suppression": "none at text level (blank-token suppression applies to the id-stream target below)"
       },
       "reference": {
-        "capture": "scripts/parakeet_tdt_golden.py (HF model.generate)",
+        "capture": "scripts/goldens/parakeet_tdt_golden.py (HF model.generate)",
         "pin_status": "UNPINNED \u2014 golden/parakeet_tdt_*.txt were absent on the authoring machine (gitignored assets); backend status is carried from the recorded historical validation of these exact gates. Hash pinning requires a recapture: a separately reviewed follow-up, not part of this PR."
       },
       "gguf": {
@@ -476,7 +485,7 @@
         "suppression": "blank id 8192 (no-symbol marker) \u2014 the recorded suppression policy"
       },
       "reference": {
-        "capture": "scripts/parakeet_tdt_golden.py (HF model.generate id stream)",
+        "capture": "scripts/goldens/parakeet_tdt_golden.py (HF model.generate id stream)",
         "pin_status": "UNPINNED \u2014 golden/parakeet_tdt_*_ids.pt absent on the authoring machine (gitignored assets); see parakeet.intree.text."
       },
       "gguf": {
@@ -488,142 +497,6 @@
         "parakeet_tdt_short_ids.pt",
         "parakeet_tdt_medium_ids.pt",
         "parakeet_tdt_long_ids.pt"
-      ]
-    },
-    {
-      "id": "moss.crispasr.external",
-      "model": "MOSS-Transcribe-preview-2B (CrispASR f16 build)",
-      "engine": "crispasr-moss-transcribe (external, DEPRECATED)",
-      "required": false,
-      "contract": {
-        "class": "exact_text_equality",
-        "fixtures": [
-          "short",
-          "medium",
-          "long"
-        ],
-        "fixture_contracts": {
-          "medium": {
-            "class": "corpus_quality_acceptance",
-            "fixtures": [
-              "medium"
-            ],
-            "tolerance": {
-              "metric": "normalized character error rate (tests/parity_contract.character_error_rate)",
-              "aggregation": "per-fixture",
-              "normalization": "normalize_for_cer: lowercase, punctuation stripped, whitespace collapsed (the recorded language normalization)",
-              "margin": "< 0.10",
-              "justification": "Deprecated external engine: CrispASR's ggml f16 KV-cache decode diverges from the HF bf16 eager golden at low-confidence 'eyes' repetition boundaries (2 inserted periods; measured normalized CER 0.0000 on medium). This engine does not define Starling's native correctness; the in-tree contract is moss.intree.text."
-            }
-          },
-          "long": {
-            "class": "corpus_quality_acceptance",
-            "fixtures": [
-              "long"
-            ],
-            "tolerance": {
-              "metric": "normalized character error rate (tests/parity_contract.character_error_rate)",
-              "aggregation": "per-fixture",
-              "normalization": "normalize_for_cer: lowercase, punctuation stripped, whitespace collapsed",
-              "margin": "< 0.10",
-              "justification": "Deprecated external engine: 6 inserted periods + 6 capitalizations + a different EOS/truncation point (measured normalized CER < 0.02); 0.10 leaves headroom for the server path's 30 s-chunk boundary differences while catching a broken decode. The in-tree contract is moss.intree.text."
-            }
-          }
-        }
-      },
-      "tests": [
-        "tests/test_ggml_parity.py::test_ggml_moss_crispasr_short_exact",
-        "tests/test_ggml_parity.py::test_ggml_moss_crispasr_approx_smoke"
-      ],
-      "backends": {
-        "cuda": "validated",
-        "cpu": "unvalidated"
-      },
-      "policies": {
-        "normalization": "short: trailing-whitespace rstrip, byte-exact; medium/long: normalize_for_cer under the recorded CER margins",
-        "tie_break": "crispasr greedy (f16 KV cache) \u2014 NOT argmax-equivalent to the bf16 golden on near-ties (the recorded divergence mechanism)",
-        "stop": "engine-chosen EOS; the long fixture's EOS point differs from the golden's 200-token budget point (recorded, tolerated under the CER margin)",
-        "truncation": "entire transcript compared under the fixture's contract",
-        "suppression": "engine post-processing flags left at defaults (--no-punctuation rejected: strips the golden's own commas)"
-      },
-      "reference": {
-        "capture": "shares the moss.intree.text pinned reference (golden/moss_*_text.txt)",
-        "measured_residual": "medium normalized CER 0.0000 (2 inserted periods); long < 0.02 (6 periods + 6 capitalizations + EOS shift) \u2014 recorded in the gate docstring from the characterization runs"
-      },
-      "needs_lib": false,
-      "gguf": {
-        "env": "GGML_MOSS_MODEL",
-        "default_path_env_root": {
-          "root_env": "ASR_BENCH_ROOT",
-          "root_default": "~/asr-bench",
-          "relative": "models/moss-transcribe-preview-2b-f16.gguf"
-        }
-      },
-      "goldens": [
-        "moss_short_text.txt",
-        "moss_medium_text.txt",
-        "moss_long_text.txt"
-      ]
-    },
-    {
-      "id": "parakeet.external",
-      "model": "parakeet-tdt-0.6b-v3 (f16 GGUF)",
-      "engine": "parakeet.cpp-server (external; renamed SMOKE-QUALITY gate)",
-      "required": false,
-      "contract": {
-        "class": "exact_text_equality",
-        "fixtures": [
-          "short",
-          "medium",
-          "long"
-        ],
-        "fixture_contracts": {
-          "long": {
-            "class": "corpus_quality_acceptance",
-            "fixtures": [
-              "long"
-            ],
-            "tolerance": {
-              "metric": "difflib.SequenceMatcher ratio on the raw transcript",
-              "aggregation": "per-fixture (long only)",
-              "normalization": "none \u2014 raw transcript bytes",
-              "margin": ">= 0.90",
-              "justification": "External smoke-quality gate (renamed from test_ggml_parakeet_byte_exact \u2014 the old name overclaimed a byte-exactness that only holds on short/medium). transformers 5.14 SDPA kernel-path drift, WER-verified benign; see parakeet.cpp 147ba98 for the guarded-out multistep on long. The in-tree certification is parakeet.intree.text."
-            }
-          }
-        }
-      },
-      "tests": [
-        "tests/test_ggml_parity.py::test_ggml_parakeet_external_text_gate"
-      ],
-      "backends": {
-        "cuda": "validated",
-        "cpu": "unvalidated"
-      },
-      "policies": {
-        "normalization": "short/medium: trailing-whitespace rstrip, byte-exact; long: raw bytes under the ratio gate",
-        "tie_break": "parakeet.cpp greedy TDT decode",
-        "stop": "TDT end-of-segment",
-        "truncation": "entire transcript compared under the fixture's contract",
-        "suppression": "none"
-      },
-      "reference": {
-        "capture": "scripts/parakeet_tdt_golden.py (shared with the in-tree gate)",
-        "pin_status": "UNPINNED \u2014 goldens gitignored/absent on the authoring machine"
-      },
-      "needs_lib": false,
-      "gguf": {
-        "env": "GGML_PARAKEET_MODEL",
-        "default_path_env_root": {
-          "root_env": "ASR_BENCH_ROOT",
-          "root_default": "~/asr-bench",
-          "relative": "models/tdt-0.6b-v3-f16.gguf"
-        }
-      },
-      "goldens": [
-        "parakeet_tdt_short_text.txt",
-        "parakeet_tdt_medium_text.txt",
-        "parakeet_tdt_long_text.txt"
       ]
     },
     {
@@ -693,7 +566,7 @@
         "suppression": "reference-captured text used as-is"
       },
       "reference": {
-        "capture": "golden/ark_reference.json (byte-exact eager reference pipeline)",
+        "capture": "scripts/goldens/ark_golden.py --model ark -> golden/ark_reference.json (stock eager model.generate, trust_remote_code)",
         "pin_status": "UNPINNED \u2014 gitignored golden absent on the authoring machine; status carried from the recorded historical validation of this gate"
       },
       "gguf": {
@@ -732,7 +605,7 @@
         "suppression": "chunk join whitespace-collapsed (30 s zero-padded chunks; per-chunk budget clamped to the 640-token cache) \u2014 mirrors the Python server chunk policy"
       },
       "reference": {
-        "capture": "scripts/make_granite_golden.py + scripts/granite_golden_components.py -> golden/granite_reference.json (stock-numerics Python path)",
+        "capture": "FROZEN: regenerating needs the removed Python/CUDA pipeline (git checkout python-research-final; scripts/make_granite_golden.py + scripts/granite_golden_components.py -> golden/granite_reference.json)",
         "pin_status": "UNPINNED \u2014 gitignored golden absent on the authoring machine; status carried from the recorded historical validation of this gate"
       },
       "gguf": {
@@ -771,7 +644,7 @@
         "suppression": "contiguous 30 s chunks (tail via SHORT), per-chunk budget min(200, ceil(dur*5)+32), whitespace-collapsed join, transcription_only <asr_text> extraction with the library's repetition fix \u2014 mirrors the Python server policy"
       },
       "reference": {
-        "capture": "scripts/make_qwen3_golden.py + scripts/qwen3_golden_components.py -> golden/qwen3_reference.json (stock-numerics Python path)",
+        "capture": "FROZEN: regenerating needs the removed Python/CUDA pipeline (git checkout python-research-final; scripts/make_qwen3_golden.py + scripts/qwen3_golden_components.py -> golden/qwen3_reference.json)",
         "pin_status": "UNPINNED \u2014 gitignored golden absent on the authoring machine; status carried from the recorded historical validation of this gate"
       },
       "gguf": {
@@ -810,8 +683,8 @@
         "suppression": "baked chat template with enable_thinking=False; byte-exactness is an in-distribution property (see the OOD fuzz note in docs/ggml-engine.md)"
       },
       "reference": {
-        "capture": "starling.s1.golden (the model-card quickstart verbatim; committed golden text)",
-        "pin_status": "committed in-tree (src/starling/s1/golden.py) \u2014 no gitignored asset",
+        "capture": "scripts/goldens/s1_golden.py -> golden/s1/greedy_text_<tier>.txt (the model-card quickstart verbatim)",
+        "pin_status": "UNPINNED: gitignored golden/s1/ asset, not in the goldens dataset",
         "note": "byte-exact on the fixture tiers; the control-matrix smoke below covers non-degeneracy, not accuracy"
       },
       "gguf": {
@@ -820,6 +693,11 @@
       },
       "assets_files": [
         "tests/fixtures/s1_transcripts.py"
+      ],
+      "goldens": [
+        "s1/greedy_text_short.txt",
+        "s1/greedy_text_medium.txt",
+        "s1/greedy_text_long.txt"
       ]
     },
     {
@@ -888,7 +766,7 @@
         "suppression": "contiguous 30 s chunks (tail via SHORT), per-chunk budget min(200, ceil(dur*5)+32), whitespace-collapsed join, transcription_only <asr_text> extraction with the library's repetition fix \u2014 mirrors the Python server policy"
       },
       "reference": {
-        "capture": "scripts/make_qwen3_06_golden.py -> golden/qwen3_06_reference.json (stock-numerics Python path; chunk policy imported from scripts/make_qwen3_golden.py)",
+        "capture": "FROZEN: regenerating needs the removed Python/CUDA pipeline (git checkout python-research-final; scripts/make_qwen3_06_golden.py -> golden/qwen3_06_reference.json)",
         "pin_status": "UNPINNED \u2014 gitignored golden; the cuda status records the authoring-time measurement (RTX 5090) against revision 7f1569a4 of the checkpoint. The golden hash itself is not pinned (the same carry pattern as the other UNPINNED sibling entries), so a later regeneration of qwen3_06_reference.json cannot be hash-checked: re-run the parity gate on CUDA after any regeneration before relying on this status"
       },
       "gguf": {

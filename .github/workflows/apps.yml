@@ -24,8 +24,8 @@ jobs:
           persist-credentials: false
       - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7
       - name: Fail on uv lockfile drift
-        # Root pyproject.toml gate (E16). quants is gated by --locked below;
-        # benchmarks/sonar by test.yml. No PR gate existed for the root lock.
+        # Root pyproject.toml gate (E16): the starling-tools dependency set.
+        # quants is gated by --locked below.
         run: uv lock --check
       - name: Build real HTTP handlers with a deterministic test engine
         run: |

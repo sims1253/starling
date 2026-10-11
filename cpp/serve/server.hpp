@@ -1,8 +1,8 @@
 // server.hpp — native starling-serve HTTP/WebSocket server.
 //
 // Wraps libstarling_ggml (the flat C API in cpp/include/starling_ggml.h) behind
-// the same HTTP/WS contract as the Python `starling.server`, so a supervisor
-// that spawns the Python server can switch with a one-line change:
+// the HTTP/WS contract the removed Python `starling.server` defined
+// (tag python-research-final); a supervisor starts it with:
 //
 //   spawn("starling-serve", ["--model", slug, "--gguf", path, "--port", "8181"])
 //
@@ -41,12 +41,12 @@
 
 namespace starling::serve {
 
-// ---- constants (mirror src/starling/server.py) ---------------------------
+// ---- constants (mirror python-research-final:src/starling/server.py) ---------------------------
 constexpr int    kSampleRate           = 16000;
 constexpr double kDefaultMaxChunk      = 30.0;
 // Preview cadence: 1 s first-partial minimum, 0.5 s interval (issue #357).
-// Chosen from the notebook replay against the frozen thresholds; the
-// Python server keeps 5 s / 3 s until it is measured.
+// Chosen from the notebook replay against the frozen thresholds (the
+// removed Python server used 5 s / 3 s).
 constexpr double kDefaultMinChunk      = 1.0;
 constexpr double kDefaultPartialInt    = 0.5;
 constexpr double kDefaultStreamChunk   = 12.0;

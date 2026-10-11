@@ -36,7 +36,7 @@ namespace starling::serve {
 // then new_words after it. Without an alignment scoring at least
 // kStitchMinScore the two are concatenated.
 //
-// Port of stitch_words() from src/starling/stream_chunk.py, tie-breaking
+// Port of stitch_words() from python-research-final:src/starling/stream_chunk.py, tie-breaking
 // included.
 std::vector<std::string> stitch_words(
     const std::vector<std::string>& committed,
@@ -92,8 +92,7 @@ std::optional<std::pair<int, int>> stitch_timed(
 // implausible, decoded again from the earlier starts in kRedecodeShifts.
 // The committed text is always decoder output: only previews are trimmed
 // (suppress_preview_loops), and a committed result that still looks like a
-// loop is kept and flagged (loop_suspected). Constants and rules are those
-// of src/starling/stream_chunk.py.
+// loop is kept and flagged (loop_suspected).
 
 // More words than this per second (plus kMaxWordsSlack) suggests a decoding
 // loop (fast lists and real repetition can come close).
@@ -234,7 +233,7 @@ std::string preview_policy_error(int sample_rate, double min_seconds,
                                  double interval_seconds);
 
 // ChunkStreamer: rolling fixed-window overlapping-chunk transcription state.
-// Direct port of ChunkStreamer from src/starling/stream_chunk.py.
+// Direct port of ChunkStreamer from python-research-final:src/starling/stream_chunk.py.
 // Throws std::invalid_argument when the window configuration is invalid
 // (see stream_window_config_error; chunk_seconds must be positive here).
 //
@@ -440,7 +439,7 @@ struct StreamCallTotals {
 };
 
 // StreamSession: per-connection rolling audio buffer + streaming state.
-// Direct port of StreamSession from src/starling/server.py.
+// Direct port of StreamSession from python-research-final:src/starling/server.py.
 class StreamSession {
 public:
     explicit StreamSession(StarlingServer* server);

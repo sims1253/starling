@@ -3,8 +3,8 @@ package dev.starling.mobile.processing
 /**
  * The keyboard's modes and the deterministic step behind them (#302): the
  * built-in profiles document (`assets/modes/android-profiles.json`, held to
- * the same contract as every other profiles document by
- * `tests/test_staging.py`) plus the spoken-command and spoken-instruction
+ * the same contract as every other profiles document by the Rust
+ * `staging_conformance` suite) plus the spoken-command and spoken-instruction
  * tables shared with the desktop (`assets/contracts/`).
  *
  * Every routing decision goes through the contract's [resolve]; there is no

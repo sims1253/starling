@@ -2,7 +2,7 @@
 //! (`mode.schema.json`), provider declarations (`provider.schema.json`),
 //! transform requests and results (`transform-request.schema.json`,
 //! `transform-result.schema.json`), plus the ports of the oracle's
-//! cross-field rules in `tests/mode_routing.py` (`validate_processing`,
+//! cross-field rules in `python-research-final:tests/mode_routing.py` (`validate_processing`,
 //! `validate_provider`, `processing_route`).
 //!
 //! Every struct denies unknown fields, the serde counterpart of the
@@ -189,7 +189,7 @@ pub struct ModeEntry {
 }
 
 /// A scoped rule of a profiles document. Routing itself is the frozen
-/// oracle's job (`tests/mode_routing.py resolve`); this build only carries
+/// oracle's job (`python-research-final:tests/mode_routing.py resolve`); this build only carries
 /// the rules so a profiles document round-trips.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -439,7 +439,7 @@ pub struct TransformResult {
 }
 
 // --------------------------------------------------------------------------
-// Cross-field rules (ports of tests/mode_routing.py)
+// Cross-field rules (ports of python-research-final:tests/mode_routing.py)
 // --------------------------------------------------------------------------
 
 /// `validate_processing`: the processing rules a schema cannot express.

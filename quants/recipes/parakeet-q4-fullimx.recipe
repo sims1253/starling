@@ -9,7 +9,7 @@
 # utterances, ~26k observations), not just the short tier: a short-tier-only
 # imatrix measured strictly worse than q8_0.
 #
-#   uv run --extra bench python benchmarks/imatrix_collect.py \
+#   uv run --group eval python benchmarks/imatrix_collect.py \
 #       --model models/parakeet-tdt-0.6b-v3-f32.gguf \
 #       --output models/parakeet-full.imx \
 #       --tiers short,medium,long --repeats 2 \

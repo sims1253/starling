@@ -2,7 +2,7 @@
 
 Starling is a native speech engine, a portable serving API, and a set of clients.
 CPU is the baseline. Platform accelerators are optional implementations behind
-the same native engine boundary. The NVIDIA-only Python/CUDA service is deprecated.
+the same native engine boundary. The former NVIDIA-only Python/CUDA service was removed (tag `python-research-final`).
 
 ## Components
 
@@ -22,7 +22,9 @@ flowchart LR
 Each build system owns its natural boundary. Cargo owns the gpui desktop app.
 CMake owns the native server and quantizer.
 Gradle owns Android. XcodeGen and Swift Package Manager own iOS. The small Python
-quant catalog is independent of the deprecated Python inference environment.
+quant catalog (`quants/`) is its own `uv` project; the root `pyproject.toml` is
+the non-package `starling-tools` dependency set for converters, golden capture,
+tests and benchmark scripts.
 
 | Path | Ownership |
 | --- | --- |
@@ -32,14 +34,15 @@ quant catalog is independent of the deprecated Python inference environment.
 | `packages/contracts` | Language-independent OpenAPI contract and shared JSON fixtures |
 | `backends/native` | Native CMake build definition and real HTTP contract tests |
 | `quants` | Recipe catalog, calibrated recipes, artifact provenance CLI |
-| `backends/python` | Deprecated service entry point and migration notes |
-| `cpp`, `src/starling`, `scripts`, `benchmarks` | Existing engine source, reference kernels, converters, evaluation harnesses |
+| `cpp` | Native engine source |
+| `scripts`, `tools`, `tests`, `benchmarks` | GGUF converters and golden capture, the ctypes binding, Python tests, measurement harnesses |
 
 The root `CMakeLists.txt` forwards to `backends/native`. It preserves existing
 build commands and binary output locations. Native source stays in `cpp/` to
-preserve C API consumers and harness paths. The root `pyproject.toml` and
-`uv.lock` remain the reference Python environment. Quant recipes have moved to
-`quants/recipes`; historical measurement JSON retains its original provenance.
+preserve C API consumers and harness paths. The former Python/CUDA research
+backend (`src/starling`, `backends/python`) was removed; its last state is the
+git tag `python-research-final`. Quant recipes have moved to `quants/recipes`;
+historical measurement JSON retains its original provenance.
 
 ## Platform targets
 

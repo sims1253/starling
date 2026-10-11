@@ -142,7 +142,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
 
 def _cmd_compare(args: argparse.Namespace) -> int:
-    spec = load_spec(args.spec)
+    load_spec(args.spec)  # validate the spec before comparing
     try:
         result = compare_mod.compare_directories(
             args.spec, args.run_dir / "baseline", args.run_dir / "candidate",

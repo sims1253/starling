@@ -7,7 +7,7 @@ bounded by the batch size. This replaces the datasets-library streaming
 path, whose per-config memory growth (multi-GB accumulation) made long
 multi-config runs unrunable next to a loaded model.
 
-Corpus layout (consumed by imatrix_collect --wavs / wer_quant --corpus):
+Corpus layout (consumed by imatrix_collect --wavs):
 
     <out>/<config>_<split>_<i>.wav   16 kHz mono PCM_16
     <out>/<config>_<split>_<i>.txt   the normalized transcript

@@ -185,9 +185,9 @@ def test_code_margins_match_manifest(manifest: dict) -> None:
                         "the gate code and the manifest contract have drifted; "
                         "update both in one reviewed change")
                 checked += 1
-    # the corpus margins (0.10 x2 crispasr, 0.90 x2 parakeet long, 0.65 ids
+    # the corpus margins (0.90 parakeet text long, 0.65 parakeet ids
     # long) plus the recorded component bounds (encoder 0.02/0.001, llm 8.0)
-    assert checked >= 8, f"expected the known margin set, checked only {checked}"
+    assert checked >= 5, f"expected the known margin set, checked only {checked}"
 
 
 def test_manifest_changelog_records_this_change(manifest: dict) -> None:
@@ -399,21 +399,21 @@ def test_required_targets_never_silently_pass(manifest: dict, request) -> None:
 def test_recorded_skip_reasons_surface_in_report(manifest: dict) -> None:
     """record_unavailable must not be a dead write: the recorded gate-skip
     reason appears in the coverage report (the probe cannot see, e.g., an
-    absent external server binary while its GGUF/goldens exist)."""
-    pc.record_unavailable("parakeet.external", "server binary absent (test)")
+    absent engine library while its GGUF/goldens exist)."""
+    pc.record_unavailable("parakeet.intree.text", "engine library absent (test)")
     try:
         report, _failures = pc.coverage_lines(manifest)
-        assert any("parakeet.external" in line
-                   and "server binary absent (test)" in line
+        assert any("parakeet.intree.text" in line
+                   and "engine library absent (test)" in line
                    for line in report), report
     finally:
-        rec = pc._RECORDS.get("parakeet.external")
+        rec = pc._RECORDS.get("parakeet.intree.text")
         if rec is not None:
             rec.unavailable_reasons = [
                 r for r in rec.unavailable_reasons
-                if r != "server binary absent (test)"]
+                if r != "engine library absent (test)"]
             if not rec.unavailable_reasons and rec.executed == 0:
-                pc._RECORDS.pop("parakeet.external", None)
+                pc._RECORDS.pop("parakeet.intree.text", None)
 
 
 def test_probe_detects_hash_mismatch_as_problem(tmp_path, monkeypatch) -> None:

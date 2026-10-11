@@ -19,7 +19,7 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from wer import wer_pct  # noqa: E402
 
 BENCH_LINE = re.compile(r"^(.+\.wav) run=0 audio=([0-9.]+)s time=([0-9.]+)ms rtf=([0-9.]+)$")
@@ -103,7 +103,7 @@ def score(args: argparse.Namespace) -> dict:
                "source_sha256": file_sha256(args.source),
                "imatrix_sha256": file_sha256(args.imatrix),
                "engine_sha256": file_sha256(args.binary),
-               "scorer_sha256": file_sha256(Path(__file__).resolve().parents[1] / "wer.py"),
+               "scorer_sha256": file_sha256(Path(__file__).resolve().parent / "wer.py"),
                "protocol_sha256": file_sha256(args.protocol),
                "device": f"{args.fast_device}/fast-vulkan",
                "engine_source_commit": args.source_commit,

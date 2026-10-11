@@ -25,17 +25,17 @@ from pathlib import Path
 
 import pytest
 
-from starling._ggml import _native
-
 REPO = Path(__file__).resolve().parent.parent
-# Same override knob as test_ggml_parity.py (benchmarks/engines.py reads it
-# the same way), so hosts that keep the GGUF elsewhere still get the
-# runtime-device assertion instead of a skip.
+sys.path.insert(0, str(REPO / "tools"))
+import starling_ggml  # noqa: E402
+
+# Same override knob as test_ggml_parity.py, so hosts that keep the GGUF
+# elsewhere still get the runtime-device assertion instead of a skip.
 PARAKEET_GGUF = Path(os.environ.get(
     "STARLING_GGML_PARAKEET_MODEL",
     str(REPO / "models" / "parakeet-tdt-0.6b-v3-bf16-exact.gguf"))).expanduser()
 
-pytestmark = pytest.mark.skipif(not _native.available(),
+pytestmark = pytest.mark.skipif(not starling_ggml.available(),
                                 reason="libstarling_ggml not built")
 
 # Compile-time family names backend_name() may report before any load
@@ -44,8 +44,8 @@ _BUILD_FAMILIES = {"cpu", "cuda", "metal", "vulkan", "hip"}
 
 _CHILD = textwrap.dedent("""\
     import sys
-    sys.path.insert(0, {src!r})
-    from starling._ggml._native import backend_name, GgmlModel, PARAKEET_TDT
+    sys.path.insert(0, {tools!r})
+    from starling_ggml import backend_name, GgmlModel, PARAKEET_TDT
 
     print("PRE:" + backend_name())
     try:
@@ -65,7 +65,7 @@ def _run_child(with_model: bool) -> dict[str, str]:
     # Pin the CPU device so the runtime-device assertion is deterministic on
     # any host (and never touches GPU memory).
     env["STARLING_GGML_DEVICE"] = "cpu"
-    code = _CHILD.format(src=str(REPO / "src"), with_model=with_model,
+    code = _CHILD.format(tools=str(REPO / "tools"), with_model=with_model,
                          gguf=str(PARAKEET_GGUF))
     proc = subprocess.run([sys.executable, "-c", code], capture_output=True,
                           text=True, env=env, timeout=300)

@@ -12,7 +12,7 @@
     "(see events.schema.json and envelope.schema.json).",
     "jobs.transform (#294) submits one processing job: its request is the",
     "mode-routing transform request, embedded verbatim under",
-    "$defs/transformRequest (tests/test_runtime_protocol.py asserts the two",
+    "$defs/transformRequest (python-research-final:tests/test_runtime_protocol.py asserts the two",
     "cannot drift). It is admitted like jobs.submit (jobs.queued |",
     "jobs.rejected on the same corr) and runs Loading -> Transforming."
   ],

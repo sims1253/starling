@@ -2,7 +2,7 @@
 //
 // Uses dr_wav (third_party/dr_wav.h, already vendored) for WAV decoding and
 // provides PCM16→float32 conversion matching the Python helpers in
-// src/starling/server.py.
+// python-research-final:src/starling/server.py.
 #pragma once
 
 #include <cstdint>

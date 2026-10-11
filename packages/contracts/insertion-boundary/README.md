@@ -10,10 +10,12 @@ The raw recognition text is never edited: the runtime delivers the
 adjustment as a separate revision derived from the raw one (`provenance:
 "insertion-boundary"`).
 
-The Python oracle (`tests/insertion_boundary.py`), the Rust port
-(`starling-processing`'s `boundary` module) and the Kotlin port in the
-Android keyboard (`apps/mobile`, `processing/InsertionBoundary.kt`) all
-replay `fixtures/boundary-cases.json`.
+The reference implementations are the Rust `boundary` module of
+`starling-processing` (`apps/desktop-gpui/crates/processing/src/boundary.rs`)
+and the Kotlin port in the Android keyboard
+(`apps/mobile/app/src/main/java/dev/starling/mobile/processing/InsertionBoundary.kt`).
+Both replay `fixtures/boundary-cases.json`. (The original Python oracle,
+`tests/insertion_boundary.py`, is at tag `python-research-final`.)
 
 ## Inputs and outputs
 
@@ -139,7 +141,6 @@ sent to any processing provider.
 | `fixtures/boundary-cases.json` | The pinned cases. |
 
 ```
-uv run python -m pytest tests/test_insertion_boundary.py -q
 cd apps/desktop-gpui && cargo test -p starling-processing --test boundary_conformance
 cd apps/mobile && ./gradlew :app:testDebugUnitTest --tests '*InsertionBoundaryConformanceTest'
 ```

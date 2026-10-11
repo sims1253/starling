@@ -1,4 +1,4 @@
-//! Conformance suite — the port of `tests/test_runtime_protocol.py`
+//! Conformance suite — the port of `python-research-final:tests/test_runtime_protocol.py`
 //! (E17-I0): every valid fixture trace replays green through this
 //! crate's oracle port, every invalid fixture is rejected with the
 //! oracle's reason class, and the §2 invariants hold.

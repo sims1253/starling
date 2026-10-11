@@ -4,10 +4,10 @@ package dev.starling.mobile.engine
  * Bounds each on-device engine call the way the serving layer bounds its
  * parakeet calls: audio longer than 30 s goes through overlapping windows
  * (a 30 s step with 2 s of right context, the geometry of
- * src/starling/parakeet/chunking.py) because one full-attention encoder pass
+ * python-research-final:src/starling/parakeet/chunking.py) because one full-attention encoder pass
  * over an unbounded clip scales quadratically in length. The C API returns
  * text per call, so the duplicated overlap is deduplicated at the word level
- * like the serving layer's stitch_words (src/starling/stream_chunk.py).
+ * like the serving layer's stitch_words (python-research-final:src/starling/stream_chunk.py).
  */
 object ChunkedTranscription {
     /** One bounded engine call: [start] in samples and its [length] in samples. */
@@ -84,7 +84,7 @@ object ChunkedTranscription {
         // never participate in a match: runs of empty keys would satisfy
         // minMatch with no shared lexical word and splice unrelated halves
         // together, dropping words on both sides (issue #118 defense in
-        // depth; port of the Python sentinels in src/starling/stream_chunk.py,
+        // depth; port of the Python sentinels in python-research-final:src/starling/stream_chunk.py,
         // kept in lockstep with the C++ empty-skip in
         // cpp/serve/stream_session.cpp). The sentinels are unique per side
         // and position and cannot collide with a real key — normalizeWord

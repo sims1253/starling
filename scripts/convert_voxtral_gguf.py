@@ -296,7 +296,7 @@ def tokenizer(w: gguf.GGUFWriter, snapshot: Path) -> None:
     w.add_token_types(types)
     # Ids below this are the tekken specials; the C++ tokenizer skips them all
     # (stock skip_special_tokens=True), not just CONTROL-typed ones.
-    w.add_key_value("voxtral.num_special", NUM_SPECIAL, V.UINT32)
+    w.add_key_value("voxtral.num_special", NUM_SPECIAL, gguf.GGUFValueType.UINT32)
     # Decode-only: no merges (the C++ side concats raw token bytes).
     w.add_bos_token_id(1)
     w.add_eos_token_id(2)

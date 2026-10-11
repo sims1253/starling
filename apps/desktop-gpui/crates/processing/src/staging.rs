@@ -1,4 +1,4 @@
-//! The staged draft of one take: the port of `tests/staging.py` (#293).
+//! The staged draft of one take: the port of `python-research-final:tests/staging.py` (#293).
 //!
 //! One text with typed regions over it; every code point belongs to
 //! exactly one region, and every offset is a Unicode code point (never a

@@ -89,7 +89,7 @@ try:
 except ImportError:  # pragma: no cover - exercised only without the package
     jsonschema = None
 
-import minischema
+import minischema  # noqa: E402  (after the optional jsonschema probe)
 
 
 # --------------------------------------------------------------------------- #

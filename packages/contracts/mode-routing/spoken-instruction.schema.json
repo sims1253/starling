@@ -7,7 +7,7 @@
     "Unicode code points. matched false means no delimiter fired: the",
     "payload is the whole text, the instruction is empty and both spans are",
     "null. The record cannot name a provider, route or grant.",
-    "Semantics: tests/spoken_instructions.py. Only keywords minischema.py",
+    "Semantics: python-research-final:tests/spoken_instructions.py. Only keywords minischema.py",
     "understands are used."
   ],
   "type": "object",

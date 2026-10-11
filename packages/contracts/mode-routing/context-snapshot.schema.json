@@ -38,7 +38,7 @@
     "oneOf; format: date-time and prefixItems/maxItems were replaced by",
     "patterns and minItems). The exact 2-element range shape and the 8000-",
     "character selected_text bound are additionally enforced by the",
-    "executable oracle tests/mode_routing.py."
+    "executable oracle python-research-final:tests/mode_routing.py."
   ],
   "oneOf": [
     {"$ref": "#/$defs/secureSnapshot"},

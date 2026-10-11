@@ -7,7 +7,7 @@
     "typed versioned mode entries (identical shape to mode.schema.json) and",
     "the scoped routing rules consumed at activation.",
     "Frozen deterministic precedence, encoded by the executable oracle",
-    "tests/mode_routing.py resolve() (ported line-faithful from the review",
+    "python-research-final:tests/mode_routing.py resolve() (ported line-faithful from the review",
     "package reference router):",
     "1. secure-field policy blocks every path (status blocked);",
     "2. a locked explicit manual mode wins and its text stays unparsed for",

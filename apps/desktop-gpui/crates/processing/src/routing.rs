@@ -1,4 +1,4 @@
-//! A line-faithful Rust port of the routing oracle `tests/mode_routing.py`
+//! A line-faithful Rust port of the routing oracle `python-research-final:tests/mode_routing.py`
 //! (`validate_config`, `prefix_match`, `resolve`, `conflicts_for`), so the
 //! desktop app routes a leading spoken phrase through the same rules
 //! instead of a second router. The Python file is the contract;

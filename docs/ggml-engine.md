@@ -80,7 +80,7 @@ Adding a model = its `cpp/<model>/` implementation (with the three
 `cpp/lib/model_registry.cpp`: the three entry-point declarations and the
 `kRegistry` row, side by side. The public `starling_ggml_model` enum kind is
 added to `starling_ggml.h` with the usual ABI bump (the Python binding's
-`_EXPECTED_ABI_VERSION` follows). The dispatch code needs no per-model conditionals.
+`_EXPECTED_ABI_VERSION` in `tools/starling_ggml.py` follows). The dispatch code needs no per-model conditionals.
 
 ## Correctness contract
 
@@ -93,10 +93,44 @@ stop-and-truncation policies, and the table below is GENERATED from it
 (`uv run python tests/parity_contract.py --write-docs`; a test fails when the
 table and the manifest disagree). The engine gates live in
 `tests/test_ggml_parity.py`; every gate there is claimed by exactly one
-manifest target.
+manifest target. It runs each engine in-process through the ctypes binding
+`tools/starling_ggml.py`, with the model path from the target's manifest
+`gguf` block (env override, else the repo-relative default).
+
+### Goldens
+
+The reference outputs live under `golden/` (gitignored). The published set is
+the private Hugging Face dataset `scholzmx/starling-goldens`, a mirror of
+`golden/` (needs an `hf auth login` with access):
+
+```bash
+hf download scholzmx/starling-goldens --repo-type dataset --local-dir golden
+uv run pytest tests/test_ggml_parity.py -q
+```
+
+It holds the pinned MOSS reference (text, ids, staged component tensors,
+`raw/` arrays for the C++ component tests, provenance). The other targets'
+goldens were never published; their gates skip as UNAVAILABLE until captured.
+The capture scripts in `scripts/goldens/` use stock transformers (or, for
+parakeet-unified, the NeMo-free reference in `parakeet_unified_ref/`) and need
+the `convert` dependency group (`uv run --group convert python scripts/goldens/<script>`):
+
+| Golden | Capture |
+| --- | --- |
+| `moss_*` (text, ids, provenance) | `moss_golden.py` (refuses to overwrite without `--force`) |
+| `moss_*` stage tensors, `raw/moss_*` | `moss_golden_components.py`, then `golden_to_raw.py` |
+| `parakeet_tdt_*` | `parakeet_tdt_golden.py` |
+| `parakeet_unified_*` | `parakeet_unified_golden.py` (target for the native port, issue #358) |
+| `s1/greedy_text_*` | `s1_golden.py` |
+| `ark_reference.json`, `ark06_reference.json` | `ark_golden.py --model ark` / `--model ark06` |
+| `voxtral_reference.json` | `voxtral_golden.py` |
+| `granite_reference.json`, `qwen3_reference.json`, `qwen3_06_reference.json` | frozen: they came from the removed Python pipeline's stock-numerics path with the serve chunk policy. Regenerate from `git checkout python-research-final` with `scripts/make_granite_golden.py`, `scripts/make_qwen3_golden.py`, `scripts/make_qwen3_06_golden.py` (and the `*_golden_components.py` scripts for staged tensors). |
+
+A new capture of a pinned reference is a reviewed manifest change (new
+hashes plus a changelog entry), never a silent overwrite.
 
 <!-- parity-manifest:v1 begin -->
-This table is GENERATED from `tests/native_parity_manifest.json` (schema v1, revision `r1-167-parity-contract`) — edit the manifest, then run `uv run python tests/parity_contract.py --write-docs`. `tests/test_native_parity_contract.py` fails if this table and the manifest disagree. V = validated backend, - = unvalidated.
+This table is GENERATED from `tests/native_parity_manifest.json` (schema v1, revision `r2-remove-python-stack`) — edit the manifest, then run `uv run python tests/parity_contract.py --write-docs`. `tests/test_native_parity_contract.py` fails if this table and the manifest disagree. V = validated backend, - = unvalidated.
 
 | Target | Model | Engine | Contract class | Fixtures | Backends (V/-) | Required |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -107,8 +141,6 @@ This table is GENERATED from `tests/native_parity_manifest.json` (schema v1, rev
 | `qwen_decode.shared_fixture.token_stream` | MOSS-Transcribe-preview-2B LLM trunk (shared lib/qwen_decode stack) | cpp-test:moss_llm_test | exact-tokens | short, medium, long | cpu:-, cuda:V | yes |
 | `parakeet.intree.text` | parakeet-tdt-0.6b-v3 | starling-ggml-parakeet | exact-text + long:corpus-quality | short, medium, long | cpu:V, cuda:V | yes |
 | `parakeet.intree.ids` | parakeet-tdt-0.6b-v3 | starling-ggml-parakeet | exact-tokens + long:corpus-quality | short, medium, long | cpu:V, cuda:V | yes |
-| `moss.crispasr.external` | MOSS-Transcribe-preview-2B (CrispASR f16 build) | crispasr-moss-transcribe (external, DEPRECATED) | exact-text + medium:corpus-quality + long:corpus-quality | short, medium, long | cpu:-, cuda:V | no |
-| `parakeet.external` | parakeet-tdt-0.6b-v3 (f16 GGUF) | parakeet.cpp-server (external; renamed SMOKE-QUALITY gate) | exact-text + long:corpus-quality | short, medium, long | cpu:-, cuda:V | no |
 | `moss.intree.kstep_regression` | MOSS-Transcribe-preview-2B | cpp-test:moss_kstep_oob_test | smoke (non-certifying) | synthetic_maxcache_boundary | cpu:-, cuda:V | no |
 | `ark.intree.text` | ark-asr-3b (BAAI/ARK-ASR-3B) | starling-ggml-ark | exact-text | short, medium, long | cpu:-, cuda:V | no |
 | `granite.intree.text` | ibm-granite/granite-speech-4.1-2b | starling-ggml-granite | exact-text | short, medium, long | cpu:-, cuda:V | no |
@@ -135,8 +167,8 @@ Semantics:
   on a CPU CI runner — is reported distinctly by the accounting tests and only
   fails under `STARLING_PARITY_STRICT=1`. A present GGUF or golden whose
   sha256 differs from the manifest pin FAILS outright: never measure — or
-  silently regenerate — the wrong reference (`scripts/moss_golden.py` refuses
-  to overwrite existing goldens without `--force`).
+  silently regenerate — the wrong reference (`scripts/goldens/moss_golden.py`
+  refuses to overwrite existing goldens without `--force`).
 - **Reference updates are reviewed changes.** Every tolerance or reference
   change must appear as a justified `changelog` entry in the manifest; the
   MOSS reference record (device, library versions, per-fixture output hashes)
@@ -145,7 +177,7 @@ Semantics:
 
 Model notes:
 
-- **parakeet-tdt (in-tree `StarlingGgmlParakeet`)**: short/medium are
+- **parakeet-tdt**: short/medium are
   byte-exact text AND exact non-blank content-token streams. Blank cadence
   differs on short/long but blanks are not linguistic tokens and are discarded
   by detokenization. LONG is the documented approximate path (manifest targets
@@ -155,7 +187,7 @@ Model notes:
   loop — gated by raw-transcript difflib ratio >= 0.90 plus a >= 0.65
   content-token match-rate floor, WER-verified benign (3.18% ==
   starling-vs-stock).
-- **moss (in-tree `StarlingGgmlMoss`)**: exact text on short/medium/long —
+- **moss**: exact text on short/medium/long —
   no tolerance. Manifest target `moss.intree.text` pins the reference
   (fresh capture: eager greedy, exact-width `DynamicCache`, device/library
   versions/output hashes recorded) and the GGUF sha256; the historical
@@ -170,24 +202,16 @@ Model notes:
   argmax positions vs the eager reference — reported, not gated, there; short
   and all component gates are enforced everywhere, and end-to-end CPU text
   exactness is carried by `moss.intree.text`.
-- **moss (legacy external CrispASR)**: short is byte-exact; medium/long carry
-  the historical normalized-CER smoke gate (renamed
-  `test_ggml_moss_crispasr_approx_smoke` — a smoke gate, not certification)
-  and single-chunk workaround. This engine is deprecated and does not define
-  Starling's in-tree correctness.
-- **granite (in-tree `StarlingGgmlGranite`)**: greedy path only (the
-  self-speculative CTC-drafting path stays Python-side and is byte-identical
-  to greedy by construction). Exact text on short/medium/long against
-  `golden/granite_reference.json`, captured from the stock-numerics Python
-  path by `scripts/make_granite_golden.py` (staged component tensors via
-  `scripts/granite_golden_components.py`). The engine mirrors the Python
-  server's chunk policy for long audio (30 s zero-padded chunks, per-chunk
-  budget clamped to the 640-token cache, whitespace-collapsed join).
-- **qwen3 (in-tree `StarlingGgmlQwen3`)**: greedy path. Exact text on
-  short/medium/long against `golden/qwen3_reference.json`, captured from the
-  stock-numerics Python path by `scripts/make_qwen3_golden.py` (staged
-  component tensors via `scripts/qwen3_golden_components.py`). The engine
-  mirrors the Python server's chunk policy for long audio (contiguous 30 s
+- **granite**: greedy path (the CTC-drafted speculative path is
+  byte-identical to greedy by construction). Exact text on short/medium/long
+  against `golden/granite_reference.json`, captured from the removed Python
+  pipeline's stock-numerics path (frozen, see [Goldens](#goldens)). The engine
+  mirrors that server's chunk policy for long audio (30 s zero-padded chunks,
+  per-chunk budget clamped to the 640-token cache, whitespace-collapsed join).
+- **qwen3**: greedy path. Exact text on short/medium/long against
+  `golden/qwen3_reference.json`, captured from the removed Python pipeline's
+  stock-numerics path (frozen, see [Goldens](#goldens)). The engine mirrors
+  that server's chunk policy for long audio (contiguous 30 s
   chunks, the last chunk passed through SHORT, per-chunk budget
   min(200, ceil(dur*5)+32), whitespace-collapsed join) and the
   `transcription_only` text extraction (the `<asr_text>` marker split with the
@@ -290,7 +314,8 @@ point).
   (semi-casual/lists/general) hits an EXACT bf16 tie between `' so'` and
   `','` (stock-eager top-2 f32 gap 0.0000); the winner is argmax tie-break
   order, not numerics (both fast paths pick the same side; the diff is one
-  comma, CER < 1%). Documented + gated in `benchmarks/s1/bench_normalize.py`.
+  comma, CER < 1%). It was documented + gated by `benchmarks/s1/bench_normalize.py`
+  (tag `python-research-final`).
 - **OOD inputs and the limits of byte-exactness**: an 80-case synthetic fuzz
   (random word-salad transcripts, fillers, numbers, tabs/caps edges,
   near-cap lengths) diverges from stock greedy on ~40-50% of cases; every
@@ -419,11 +444,12 @@ instead select an intermediate as the graph's normal output via
 
 ## Performance (RTX 5090, bf16, B=1, model load excluded)
 
-The maintained synthetic-fixture table is in [benchmarks](benchmarks.md) and is generated by
-`benchmarks/bench_all.py`. At the current verified baseline, in-tree Parakeet is
-14 / 30 / 86 ms (short / medium / long) versus 16 / 24 / 58 ms for the PyTorch
-peak; in-tree MOSS is 214 / 535 / 1180 ms versus 166 / 397 / 1499 ms. Use the
-real-corpus benchmark table for workload throughput and WER.
+The recorded synthetic-fixture table is in [benchmarks](benchmarks.md). At the
+last recorded baseline, in-tree Parakeet is 14 / 30 / 86 ms (short / medium /
+long) versus 16 / 24 / 58 ms for the removed PyTorch/Triton pipeline's peak;
+in-tree MOSS is 214 / 535 / 1180 ms versus 166 / 397 / 1499 ms. Use the
+real-corpus table there for workload throughput and WER, and `starling-bench`
+for new measurements.
 
 Parakeet's remaining medium/long gap is the serial, data-dependent TDT decode.
 K-step capture and device-resident state are already implemented; long K>16
@@ -449,11 +475,6 @@ flock /tmp/starling-cpp-build.lock bash -c \
 
 Place Starling's exact BF16 GGUF at
 `models/moss-transcribe-preview-2b-bf16-exact.gguf`, or override it with
-`STARLING_GGML_MOSS_MODEL=/path/to/model.gguf`. The benchmark key is
-`starling-ggml-moss`; it loads once and calls the in-tree C API directly. For
-example, the Python binding is `GgmlModel(MOSS, path)` from
-`starling._ggml`.
-
-The legacy external `GgmlMoss` CrispASR engine is deprecated and remains
-available for A/B comparisons.
-It is not required to build or run the Starling-owned MOSS path.
+`STARLING_GGML_MOSS_MODEL=/path/to/model.gguf`. From Python, the binding is
+`GgmlModel(MOSS, path)` from `tools/starling_ggml.py`; it loads once and calls
+the in-tree C API directly.

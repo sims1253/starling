@@ -4,7 +4,7 @@
 //! `packages/contracts/runtime-protocol/` (`commands.schema.json`,
 //! `events.schema.json`, `envelope.schema.json`). The schemas are structural;
 //! [`crate::protocol::tables`] + [`crate::protocol::replay`] are the
-//! executable semantics ported from `tests/runtime_protocol.py` (the I0
+//! executable semantics ported from `python-research-final:tests/runtime_protocol.py` (the I0
 //! oracle).
 //!
 //! Two shapes live side by side on purpose:

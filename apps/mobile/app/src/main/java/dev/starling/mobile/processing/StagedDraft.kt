@@ -2,7 +2,7 @@ package dev.starling.mobile.processing
 
 /**
  * The staged draft of one take: a single editable text with typed regions over
- * it (#293). A Kotlin port of `Draft` in `tests/staging.py`, which is the
+ * it (#293). A Kotlin port of `Draft` in `python-research-final:tests/staging.py`, which is the
  * executable semantics; `packages/contracts/mode-routing/fixtures/staging.json`
  * is replayed against both, and a behaviour change here is a contract change.
  *

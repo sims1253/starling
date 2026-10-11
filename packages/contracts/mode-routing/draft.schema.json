@@ -3,7 +3,7 @@
   "$id": "urn:starling:contracts:mode-routing:draft:v1",
   "$comment": [
     "Starling staged draft snapshot, v1 (#293). One take's editable text",
-    "with typed regions over it; tests/staging.py is the executable",
+    "with typed regions over it; python-research-final:tests/staging.py is the executable",
     "semantics and fixtures/staging.json the shared cases.",
     "Regions tile the text exactly (every code point in one region), with",
     "Unicode code-point spans (span_encoding const), never UTF-16 units.",

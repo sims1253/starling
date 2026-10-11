@@ -30,9 +30,6 @@ golden/
 # ...and two tiny reference-encoded FLAC slices of it for the decoder tests.
 !apps/mobile/app/src/test/resources/flac/*.flac
 
-# regenerable benchmark corpora (downloaded + cached on first run)
-tests/fixtures/leaderboard_corpus/
-
 # internal coordination / runtime locks (not for publication)
 comms.md
 review.md

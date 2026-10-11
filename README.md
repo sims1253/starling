@@ -98,11 +98,13 @@ against destructive processing; they cannot guarantee ASR accuracy.
 | Android app and voice keyboard | [`apps/mobile/`](apps/mobile/) |
 | iOS app | [`apps/ios/`](apps/ios/) |
 | Language-independent API contract and shared test fixtures | [`packages/contracts/`](packages/contracts/) |
-| Deprecated Python/CUDA serving | [`backends/python/`](backends/python/) · reference source in `src/starling/` |
+| Python tooling: GGUF converters, golden capture, parity and server tests | [`scripts/`](scripts/) · [`tests/`](tests/) · [`tools/starling_ggml.py`](tools/starling_ggml.py) |
 
-The NVIDIA-only Python serving path is deprecated. Its kernels, benchmarks,
-and existing commands remain for research and reproducibility. New app and
-serving work targets the native engine and the portable HTTP contract.
+The Python tooling is a small `uv` project (`pyproject.toml`, not a package):
+`uv run pytest tests -q` runs the CPU suite, `uv run --group convert ...` the
+converters and golden makers. The former Python/CUDA research backend (Triton
+kernels, FastAPI server, research benchmarks) was removed; its last state is
+the git tag `python-research-final`.
 
 ## Documentation
 
@@ -112,5 +114,4 @@ serving work targets the native engine and the portable HTTP contract.
 [Quantization tools](quants/README.md) · [Quantization research](docs/quantization.md) ·
 [Benchmarks](docs/benchmarks.md) · [Engine development](docs/ggml-engine.md) ·
 [Fast Vulkan engines](docs/fast-engine.md) ·
-[Coding-agent dictation (MCP)](docs/mcp-dictation.md) ·
-[Model Optimizer and Unsloth research](docs/research/model-optimizer-unsloth-cross-backend.md)
+[Coding-agent dictation (MCP)](docs/mcp-dictation.md)

@@ -61,7 +61,7 @@ class OnDeviceTranscriptionE2ETest {
     private companion object {
         val NON_LETTERS = Regex("[^a-z' ]")
 
-        // LibriSpeech 2086-149220-0033 (CC BY 4.0), as in benchmarks/wer.py.
+        // LibriSpeech 2086-149220-0033 (CC BY 4.0), as in benchmarks/fast_engine/wer.py.
         const val REFERENCE =
             "Well, I don't wish to see it any more, observed Phoebe, turning away her eyes. " +
                 "It is certainly very like the old portrait."

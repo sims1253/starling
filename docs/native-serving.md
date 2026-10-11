@@ -7,7 +7,7 @@ GPU builds still need the platform's driver and runtime libraries.
 Start with [build](#build) and [usage](#usage), [install a prebuilt
 binary](#install-a-prebuilt-binary) to skip the compiler, or see [release
 artifacts](#release-artifacts) for binary prerequisites. The [API
-contract](#api-contract) covers differences from `starling.server`.
+contract](#api-contract) covers the routes and messages.
 
 ## Install a prebuilt binary
 
@@ -93,7 +93,7 @@ flag runs a warmup at startup; omit the square brackets when using it.
 | `--warmup` | off | Capture CUDA graphs on startup |
 | `--no-eager-load` | off | Defer model load to first request |
 | `--idle-timeout <s>` | `0` (never) | Shut down after N seconds idle |
-| `--request-timeout-seconds <s>` | `600` | Fail queued requests after N s waiting for the engine (`504`); same flag as the Python server |
+| `--request-timeout-seconds <s>` | `600` | Fail queued requests after N s waiting for the engine (`504`) |
 | `--granite-chunk-fairness` | off | Opt in to one FIFO turn per Granite chunk; requires `--model granite` |
 | `--stream-chunk-seconds <s>` | `12.0` | Fixed WS stream window |
 | `--stream-overlap-seconds <s>` | `3.0` | Overlap between windows |
@@ -147,24 +147,20 @@ OpenAI-compatible subset and the machine-readable capabilities endpoint.
 
 ## API contract
 
-The servers share audio routes and streaming messages. Clients must account
-for these differences:
+The audio routes and streaming messages descend from the removed Python
+server (`starling.server`, tag `python-research-final`); the machine-readable
+contract is [`packages/contracts/openapi.json`](../packages/contracts/openapi.json).
 
-- **Inputs**: this server requires 16 kHz audio (below); the Python server
-  resamples non-16 kHz WAVs via scipy instead of rejecting them. HTTP uploads
-  require WAV on both servers. Both WebSocket endpoints accept PCM16
+- **Inputs**: audio must be 16 kHz (below); non-16 kHz audio is rejected, not
+  resampled. HTTP uploads require WAV. The WebSocket endpoint accepts PCM16
   and WAV.
-- **Models**: both serve `parakeet`, `moss`, `ark`, `ark06`, `granite`, `qwen3`,
-  `qwen3_06`, and `voxtral`. Native serving also supports `s1`; Python
-  serving also supports `parakeet_unified`. Native `s1` exposes the
-  additional `POST /normalize` text endpoint.
+- **Models**: `parakeet`, `moss`, `ark`, `ark06`, `granite`, `qwen3`,
+  `qwen3_06`, `voxtral`, and `s1`. `s1` exposes the additional
+  `POST /normalize` text endpoint.
 - **Request ids**: `X-Request-Id` values starting with `#` are rejected
   with `400`: the prefix is reserved for the server's internal queue
-  tickets. The Python server accepts them.
-- **Phase names**: `unloaded → loading → ready → busy` here; the Python
-  server reports `loading_weights` and `warming_up` during startup.
-- **Error responses**: the status-code and body details documented below
-  differ in places from the Python server's.
+  tickets.
+- **Phase names**: `unloaded → loading → ready → busy`.
 
 ### `GET /health`
 
@@ -185,8 +181,7 @@ own mutex.
 Accepts multipart/form-data with one `file` WAV part and one `model` field.
 **Audio must be 16 kHz**. The native server has no resampler, so WAVs at other
 sample rates are rejected with
-`400` and a `sample rate mismatch` error (the Python server resamples via
-scipy instead). WAV parsing is bounded by the actual payload size: a header
+`400` and a `sample rate mismatch` error. WAV parsing is bounded by the actual payload size: a header
 whose claimed frame count exceeds what the payload can hold (crafted or
 truncated) is rejected with `400` and a `malformed audio payload` error: it
 is never reinterpreted as raw PCM. Returns:
@@ -325,8 +320,7 @@ take's first audio; audio positions are seconds into the take.
   `stop` covers the commit's own work. `path` is `tail` (the engine
   transcribed only the unfinalized remainder), `reused` (the exact
   tail result answered it) or `committed` (nothing was left, including
-  a commit of an empty take). The
-  Python server labels its whole-buffer mode `full_take`. `stop` also
+  a commit of an empty take). `stop` also
   holds `unfinalized_s` (the audio past the committed boundary at
   commit), `t0_ms`, `t1_ms` and `totals`. `calls` lists each call
   with `kind`, `start_s`, `end_s`, `t0_ms`, `t1_ms` and `result`
@@ -391,10 +385,7 @@ so the client must fall back to its authoritative local recording. The
 machine-readable reason codes are `malformed_wav`, `sample_rate_mismatch`,
 and `odd_pcm_length`. As with the buffer cap, the connection stays alive
 (control frames keep working) and `{"type":"reset"}` clears the invalidation
-and re-enables audio. The deprecated Python server shares this contract for
-malformed WAV and odd-length PCM; its one divergence is that it resamples
-non-16 kHz WAVs via scipy instead of rejecting them with `sample_rate_mismatch`
-(see [divergence note](python-serving.md#invalid-stream-audio-and-the-remaining-divergence-from-the-native-server)).
+and re-enables audio.
 
 Control frames (JSON text):
 
@@ -413,17 +404,18 @@ Control frames (JSON text):
 cpp/serve/
 ├── main.cpp            — CLI parsing, lifecycle, HTTP/WS transport (cpp-httplib)
 ├── server.hpp/.cpp     — StarlingServer: model lifecycle, serial queue, transcribe
-├── stream_session.hpp/.cpp — Rolling buffer + ChunkStreamer (port of Python logic)
+├── stream_session.hpp/.cpp — Rolling buffer + ChunkStreamer (port of the removed Python server's logic)
 ├── stream_pump.hpp/.cpp — WS /stream worker: frame queue, drain, preview coalescing
 └── audio.hpp/.cpp      — WAV/PCM decoding (dr_wav) + multipart extraction
 ```
 
-The C++ and Python streaming sessions use fixed overlapping windows, including
-during busy retries. Successful windows advance the committed boundary;
+The streaming session uses fixed overlapping windows, including during busy
+retries. Successful windows advance the committed boundary;
 incomplete commits preserve the remaining audio for a later retry.
 
-**Stitching** (issue #357; the two servers share the code paths and a parity
-fixture, `tests/fixtures/stream_stitch_cases.txt`):
+**Stitching** (issue #357; parity fixture
+`tests/fixtures/stream_stitch_cases.txt`, replayed by
+`cpp/tests/stream_session_test.cpp`):
 
 - With word timestamps (Parakeet: the TDT decoder's frame for each token,
   80 ms per encoder frame; a word starts at its first token's frame and ends
@@ -451,7 +443,7 @@ fixture, `tests/fixtures/stream_stitch_cases.txt`):
   word in two overlapping windows starts 0.04-0.28 s apart in the middle of
   the overlap and up to 0.52 s apart at a window's edge, where the cut is not
   made.
-- Without word timestamps on both sides (other engines, the Python server),
+- Without word timestamps on both sides (engines other than Parakeet),
   neighboring windows are joined by aligning a suffix of the committed words
   with a prefix of the new window's words (match +2, mismatch and gap -1).
   Committed words between the aligned run and the end cost a gap, so a common

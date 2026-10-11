@@ -5,7 +5,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 /**
- * Kotlin port of the frozen mode-routing resolver. `tests/mode_routing.py`
+ * Kotlin port of the frozen mode-routing resolver. `python-research-final:tests/mode_routing.py`
  * (validate_config, prefix_match, resolve) is the contract; this file mirrors
  * it step for step so the shared fixtures replay identically on every port.
  *

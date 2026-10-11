@@ -1,6 +1,6 @@
 // starling_ggml.h — the flat C API surface for Starling's ggml engine.
 //
-// Driven from Python via ctypes (src/starling/_ggml/_native.py). One shared
+// Driven from Python via ctypes (tools/starling_ggml.py). One shared
 // library (libstarling_ggml) serves both the parakeet-tdt and moss models via
 // model-tagged entry points. Opaque `starling_ggml_ctx` holds a loaded model.
 //

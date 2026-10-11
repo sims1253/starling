@@ -736,7 +736,7 @@
         },
         "resampling": {
           "const": false,
-          "description": "Non-16kHz WAV is rejected with 400 (the deprecated Python server resamples instead)."
+          "description": "Non-16kHz WAV is rejected with 400."
         },
         "authentication": {
           "const": false,

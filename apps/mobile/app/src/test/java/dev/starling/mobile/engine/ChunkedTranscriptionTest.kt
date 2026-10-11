@@ -97,9 +97,10 @@ class ChunkedTranscriptionTest {
     // Words that normalize to "" (pure punctuation) must never participate in
     // an overlap match: runs of empty keys would satisfy minMatch=2 with no
     // shared lexical word and splice unrelated halves together, dropping
-    // words on both sides. Shared fixture corpus with the Python reference
-    // (tests/test_stream_chunk.py) and the C++ port
-    // (cpp/tests/stream_session_test.cpp); keep the three in lockstep.
+    // words on both sides. Shared fixture corpus with the C++ port
+    // (cpp/tests/stream_session_test.cpp) and the original Python reference
+    // (python-research-final:tests/test_stream_chunk.py); keep the Kotlin and
+    // C++ copies in lockstep.
 
     @Test
     fun punctuationOnlyBoundaryNeverSplicesUnrelatedTexts() {

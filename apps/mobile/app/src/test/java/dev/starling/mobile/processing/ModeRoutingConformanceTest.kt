@@ -122,7 +122,7 @@ class ModeRoutingConformanceTest {
 
     @Test
     fun validateRejectsWhatTheOracleRejects() {
-        // Mutations from tests/test_mode_routing.py, applied to the canonical document.
+        // Mutations from python-research-final:tests/test_mode_routing.py, applied to the canonical document.
         fun mutated(edit: (JSONObject) -> Unit): ProfilesDocument {
             val root = JSONObject(Contracts.fixture("profiles.json"))
             edit(root)

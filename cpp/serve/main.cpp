@@ -1,7 +1,7 @@
 // main.cpp — starling-serve entry point.
 //
 // Parses CLI args, loads the model, and serves the HTTP/WebSocket API.
-// Drop-in replacement for `python -m starling.server`:
+// Replaced the removed `python -m starling.server` (tag python-research-final):
 //
 //   starling-serve --model <slug> --gguf <path> [--port 8181] [--warmup]
 //
@@ -88,8 +88,7 @@ static void usage(const char* prog) {
         "  --no-eager-load    Defer model load to first request\n"
         "  --idle-timeout <s> Shut down after N seconds idle (0 = never, default 0)\n"
         "  --request-timeout-seconds <s> Fail queued requests after N s waiting for\n"
-        "                     the engine (0 = never, default 600; same flag as the\n"
-        "                     Python server)\n"
+        "                     the engine (0 = never, default 600)\n"
         "  --granite-chunk-fairness  Yield the serial turn after each Granite\n"
         "                     upload chunk (opt-in; default is serial)\n"
         "\n"
@@ -743,8 +742,8 @@ int main(int argc, char** argv) {
             return;
         }
         if (sr != 0 && sr != serve::kSampleRate) {
-            // The engine expects 16 kHz; there is no C++ resampler (the
-            // Python server resamples via scipy). Reject non-16 kHz uploads.
+            // The engine expects 16 kHz and there is no C++ resampler.
+            // Reject non-16 kHz uploads.
             std::ostringstream ss;
             ss << "{\"error\":\"sample rate mismatch: expected "
                << serve::kSampleRate << " got " << sr << "\"}";
