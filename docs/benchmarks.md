@@ -108,22 +108,6 @@ median ± standard deviation across repetitions.
 | medium   |       1 | 649±60ms (34x) | 6531±659ms (3x)      | 836±26ms (27x)  |
 | long     |       1 | 703±9ms (106x) | 6467±433ms (12x)     | 941±40ms (79x)  |
 
-**cohere-transcribe-03-2026** — latency / RTFx (ms, RTFx×)
-
-| length   |   batch | starling       | stock transformers   |
-|----------|---------|----------------|----------------------|
-| short    |       1 | 61±8ms (122x)  | 462±108ms (16x)      |
-| medium   |       1 | 164±2ms (136x) | 1279±205ms (17x)     |
-| long     |       1 | 334±5ms (222x) | 1641±379ms (45x)     |
-
-**nemotron-labs-audex-2b** — latency / RTFx (ms, RTFx×)
-
-| length   |   batch | starling       | stock transformers   |
-|----------|---------|----------------|----------------------|
-| short    |       1 | 244±1ms (30x)  | 1515±269ms (5x)      |
-| medium   |       1 | 464±1ms (48x)  | 3393±488ms (7x)      |
-| long     |       1 | 1656±5ms (45x) | 13051±1354ms (6x)    |
-
 **qwen3-asr-1.7b** — latency / RTFx (ms, RTFx×)
 
 | length   |   batch | starling        | stock transformers   |
@@ -132,14 +116,6 @@ median ± standard deviation across repetitions.
 | medium   |       1 | 380±35ms (59x)  | 5292±886ms (4x)      |
 | long     |       1 | 1156±17ms (64x) | 18788±1454ms (4x)    |
 <!-- BENCH:END -->
-
-**granite-speech-4.1-2b-nar**: latency / RTFx (ms, RTFx×)
-
-| length | batch | starling | stock transformers |
-|--------|------:|----------|--------------------|
-| short  |     1 | 14ms (531x) | 75ms (99x) |
-| medium |     1 | 30ms (744x) | 95ms (235x) |
-| long   |     1 | 104ms (715x) | 139ms (535x) |
 
 ### Accuracy (Open ASR Leaderboard reproduction)
 
@@ -161,10 +137,6 @@ median ± standard deviation across repetitions.
 | ark-asr-3b                 | starling           | 11.35%      | 6.31%  | 8.04%        | 3.77%        | 2.60%               | 3.97%               | 2.35%        | 5.48% |
 | ark-asr-3b                 | stock transformers | 11.38%      | 6.21%  | 8.15%        | 3.77%        | 2.63%               | 3.81%               | 2.25%        | 5.46% |
 | ark-asr-3b                 | starling-ggml      | 11.53%      | 6.45%  | 8.26%        | 3.86%        | 2.60%               | 4.00%               | 2.35%        | 5.58% |
-| cohere-transcribe-03-2026  | starling           | 10.32%      | 6.31%  | 8.59%        | 5.47%        | 1.47%               | 1.78%               | 2.45%        | 5.20% |
-| cohere-transcribe-03-2026  | stock transformers | 10.28%      | 6.31%  | 8.59%        | 5.51%        | 1.47%               | 1.81%               | 2.45%        | 5.20% |
-| nemotron-labs-audex-2b     | starling           | 9.80%       | 11.90% | 6.09%        | 4.14%        | 1.57%               | 2.01%               | 2.65%        | 5.45% |
-| nemotron-labs-audex-2b     | stock transformers | 9.80%       | 11.90% | 6.09%        | 4.14%        | 1.57%               | 2.01%               | 2.65%        | 5.45% |
 
 **Open ASR Leaderboard — RTFx** (real audio_s / inference_s)
 
@@ -183,10 +155,6 @@ median ± standard deviation across repetitions.
 | ark-asr-3b                 | starling           | 53x         | 46x   | 46x          | 40x          | 50x                 | 47x                 | 42x          |
 | ark-asr-3b                 | stock transformers | 7x          | 6x    | 6x           | 5x           | 6x                  | 6x                  | 5x           |
 | ark-asr-3b                 | starling-ggml      | 12x         | 12x   | 15x          | 14x          | 17x                 | 16x                 | 30x          |
-| cohere-transcribe-03-2026  | starling           | 97x         | 83x   | 102x         | 75x          | 110x                | 97x                 | 82x          |
-| cohere-transcribe-03-2026  | stock transformers | 32x         | 29x   | 36x          | 29x          | 29x                 | 26x                 | 26x          |
-| nemotron-labs-audex-2b     | starling           | 60x         | 57x   | 66x          | 49x          | 60x                 | 55x                 | 48x          |
-| nemotron-labs-audex-2b     | stock transformers | 9x          | 8x    | 10x          | 7x           | 9x                  | 8x                  | 8x           |
 <!-- BENCH:WER:END -->
 
 <!-- BENCH:S1:START -->

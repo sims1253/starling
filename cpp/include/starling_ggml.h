@@ -25,13 +25,13 @@ extern "C" {
 // Bumped on any breaking change to this API. The Python binding refuses to
 // load on mismatch. History:
 //   1 — initial (Phase 0): abi + version + shutdown only.
-//   2 — added STARLING_GGML_HIGGS (bosonai/higgs-audio-v3-stt).
-//   3 — added STARLING_GGML_HOJO (HojoAI/Hojo-ASR-V1).
+//   2 — added kind 4 (since removed, see 10).
+//   3 — added kind 5 (since removed, see 10).
 //   4 — added STARLING_GGML_GRANITE (ibm-granite/granite-speech-4.1-2b).
 //   5 — added STARLING_GGML_QWEN3 (Qwen/Qwen3-ASR-1.7B-hf).
 //   6 — added STARLING_GGML_S1 (superwhisper/s1-mini) + the text-in entry
-//       point starling_ggml_normalize_text, and STARLING_GGML_AUDEX
-//       (nvidia/Nemotron-Labs-Audex-2B).
+//       point starling_ggml_normalize_text, and kind 9 (since removed,
+//       see 10).
 //   7 — added STARLING_GGML_ARK06 (Audio8/ARK-ASR-0.6B; served by the ARK
 //       engine — same architecture, dims come from GGUF metadata).
 //   8 — added STARLING_GGML_VOXTRAL (mistralai/Voxtral-Mini-4B-Realtime-2602;
@@ -39,11 +39,13 @@ extern "C" {
 //       returns the Phase-2 error until the encoder/decoder graph lands).
 //   9 — added STARLING_GGML_QWEN3_06 (Qwen/Qwen3-ASR-0.6B-hf; served by the
 //       QWEN3 engine — same architecture, dims come from GGUF metadata).
+//  10 — removed kinds 4, 5 and 9 (engines dropped). Their values stay
+//       reserved and are never reused; loading them fails as an unknown kind.
 // Additions that leave every existing entry point unchanged keep the version
 // (starling_ggml_transcribe_pcm_words, issue #357): a caller loading the
 // library at run time probes for such a symbol (dlsym) instead of checking
 // the version.
-#define STARLING_GGML_ABI_VERSION 9
+#define STARLING_GGML_ABI_VERSION 10
 
 // ABI / build introspection --------------------------------------------------
 
@@ -65,12 +67,11 @@ typedef enum {
     STARLING_GGML_PARAKEET_TDT = 1,  // nvidia/parakeet-tdt-0.6b-v3
     STARLING_GGML_MOSS         = 2,  // MOSS-Transcribe-preview-2B
     STARLING_GGML_ARK          = 3,  // AutoArk-AI/ARK-ASR-3B
-    STARLING_GGML_HIGGS        = 4,  // bosonai/higgs-audio-v3-stt
-    STARLING_GGML_HOJO         = 5,  // HojoAI/Hojo-ASR-V1
+    // 4 and 5 are reserved (removed engines, ABI 10); never reuse them.
     STARLING_GGML_GRANITE      = 6,  // ibm-granite/granite-speech-4.1-2b
     STARLING_GGML_QWEN3        = 7,  // Qwen/Qwen3-ASR-1.7B-hf
     STARLING_GGML_S1           = 8,  // superwhisper/s1-mini (text normalizer)
-    STARLING_GGML_AUDEX        = 9,  // nvidia/Nemotron-Labs-Audex-2B
+    // 9 is reserved (removed engine, ABI 10); never reuse it.
     STARLING_GGML_ARK06        = 10, // Audio8/ARK-ASR-0.6B (ARK engine, 0.6B GGUF)
     STARLING_GGML_VOXTRAL      = 11, // mistralai/Voxtral-Mini-4B-Realtime-2602
     STARLING_GGML_QWEN3_06     = 12, // Qwen/Qwen3-ASR-0.6B-hf (QWEN3 engine, 0.6B GGUF)

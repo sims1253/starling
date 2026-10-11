@@ -406,7 +406,7 @@ void Backend::register_capture(ggml_tensor* t, std::vector<float>* dst) {
 // std::vector<float> for the graph output AND every capture, so a non-F32
 // output tensor must be converted elementwise. The old output path read
 // nbytes and copied a BF16 tensor's 2n bytes raw into the low half of the
-// 4n-byte vector — every second float garbage bits (the "CPU-only higgs
+// 4n-byte vector — every second float garbage bits (the "CPU-only
 // garbage output" bug; no over-read); the old CAPTURE paths sized the read
 // cn*sizeof(float), a true over-read for any 2-byte-type capture. I32/F32
 // are bit-compatible (the K-step token

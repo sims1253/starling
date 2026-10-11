@@ -1,5 +1,5 @@
 // mask_rope.hpp — causal attention masks + host RoPE tables (duplicated-
-// halves layout, std::pow frequencies; the moss/ark/higgs decoders use the
+// halves layout, std::pow frequencies; the moss/ark decoders use the
 // device-resident tables in DeviceCache instead).
 #pragma once
 

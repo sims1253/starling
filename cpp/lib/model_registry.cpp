@@ -34,14 +34,6 @@ void * starling_ggml_ark_load(const char * gguf_path, const char ** err_out);
 void   starling_ggml_ark_free(void * handle);
 char * starling_ggml_ark_decode(void * handle, const float * pcm, int64_t n,
                                 const char ** err_out);
-void * starling_ggml_higgs_load(const char * gguf_path, const char ** err_out);
-void   starling_ggml_higgs_free(void * handle);
-char * starling_ggml_higgs_decode(void * handle, const float * pcm, int64_t n,
-                                  const char ** err_out);
-void * starling_ggml_hojo_load(const char * gguf_path, const char ** err_out);
-void   starling_ggml_hojo_free(void * handle);
-char * starling_ggml_hojo_decode(void * handle, const float * pcm, int64_t n,
-                                 const char ** err_out);
 void * starling_ggml_granite_load(const char * gguf_path, const char ** err_out);
 void   starling_ggml_granite_free(void * handle);
 char * starling_ggml_granite_decode(void * handle, const float * pcm, int64_t n,
@@ -57,10 +49,6 @@ char * starling_ggml_s1_decode(void * handle, const float * pcm, int64_t n,
 char * starling_ggml_s1_normalize(void * handle, const char * transcript,
                                   const char * styling, const char * structure,
                                   const char * context, const char ** err_out);
-void * starling_ggml_audex_load(const char * gguf_path, const char ** err_out);
-void   starling_ggml_audex_free(void * handle);
-char * starling_ggml_audex_decode(void * handle, const float * pcm, int64_t n,
-                                  const char ** err_out);
 void * starling_ggml_voxtral_load(const char * gguf_path, const char ** err_out);
 void   starling_ggml_voxtral_free(void * handle);
 char * starling_ggml_voxtral_decode(void * handle, const float * pcm, int64_t n,
@@ -72,8 +60,8 @@ char * starling_ggml_voxtral_decode(void * handle, const float * pcm, int64_t n,
 // preserve each engine's historical error strings exactly; see
 // ModelDescriptor in model_registry.hpp.
 //
-// constexpr so the most likely one-row-add mistakes — a copy-pasted kind, a
-// row appended out of enum order, a missing renumber — fail the static_assert
+// constexpr so the most likely one-row-add mistakes — a copy-pasted kind or a
+// row appended out of enum order — fail the static_assert
 // below at compile time instead of surfacing later as an unreachable engine
 // (find_model returns the first matching row) while --version still
 // advertises it.
@@ -98,18 +86,6 @@ constexpr ModelDescriptor kRegistry[] = {
       "starling_ggml_transcribe_pcm: ARK expects 16 kHz",
       /*rate_error_in_ctx=*/true,
       "ARK transcribe failed" },
-    { STARLING_GGML_HIGGS, "higgs",
-      starling_ggml_higgs_load, starling_ggml_higgs_free,
-      starling_ggml_higgs_decode,
-      "starling_ggml_transcribe_pcm: HIGGS expects 16 kHz",
-      /*rate_error_in_ctx=*/true,
-      "HIGGS transcribe failed" },
-    { STARLING_GGML_HOJO, "hojo",
-      starling_ggml_hojo_load, starling_ggml_hojo_free,
-      starling_ggml_hojo_decode,
-      "starling_ggml_transcribe_pcm: HOJO expects 16 kHz",
-      /*rate_error_in_ctx=*/true,
-      "HOJO transcribe failed" },
     { STARLING_GGML_GRANITE, "granite",
       starling_ggml_granite_load, starling_ggml_granite_free,
       starling_ggml_granite_decode,
@@ -129,12 +105,6 @@ constexpr ModelDescriptor kRegistry[] = {
       /*rate_error_in_ctx=*/true,
       "S1 transcribe failed",
       starling_ggml_s1_normalize },
-    { STARLING_GGML_AUDEX, "audex",
-      starling_ggml_audex_load, starling_ggml_audex_free,
-      starling_ggml_audex_decode,
-      "starling_ggml_transcribe_pcm: AUDEX expects 16 kHz",
-      /*rate_error_in_ctx=*/true,
-      "AUDEX transcribe failed" },
     // ARK-ASR-0.6B rides the ARK engine unchanged (identical remote modeling
     // code; every dim comes from ark.* GGUF metadata, validated at load).
     { STARLING_GGML_ARK06, "ark06",
@@ -164,11 +134,16 @@ constexpr ModelDescriptor kRegistry[] = {
       "QWEN3 transcribe failed" },
 };
 
+// Kinds 4, 5 and 9 belong to removed engines and stay reserved (ABI 10), so
+// the kinds are strictly increasing rather than contiguous.
 static_assert([] {
-    for (size_t i = 0; i < sizeof(kRegistry) / sizeof(kRegistry[0]); ++i)
-        if (kRegistry[i].kind != (starling_ggml_model)(i + 1)) return false;
+    int prev = 0;
+    for (size_t i = 0; i < sizeof(kRegistry) / sizeof(kRegistry[0]); ++i) {
+        if ((int)kRegistry[i].kind <= prev) return false;
+        prev = (int)kRegistry[i].kind;
+    }
     return true;
-}(), "registry rows must stay in starling_ggml_model enum order (1..N, no duplicate or skipped kinds)");
+}(), "registry rows must stay in starling_ggml_model enum order (strictly increasing, no duplicate kinds)");
 
 } // namespace
 

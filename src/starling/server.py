@@ -137,7 +137,7 @@ larger frame is still admitted when nothing else is queued.
 
 # Supported model slugs -> (backend class, display name, gpu-lock model label).
 # Built lazily as backend classes are defined below.
-MODEL_SLUGS = ("granite", "parakeet", "parakeet_unified", "moss", "qwen3", "qwen3_06", "ark", "ark06", "cohere", "higgs", "audex", "voxtral")
+MODEL_SLUGS = ("granite", "parakeet", "parakeet_unified", "moss", "qwen3", "qwen3_06", "ark", "ark06", "voxtral")
 
 
 def _gpu_lock_model(slug: str) -> str:
@@ -150,9 +150,6 @@ def _gpu_lock_model(slug: str) -> str:
         "qwen3_06": "qwen3-asr-0.6b",
         "ark": "ark-asr-3b",
         "ark06": "ark-asr-0.6b",
-        "cohere": "cohere-transcribe-03-2026",
-        "higgs": "higgs-audio-v3-stt",
-        "audex": "nemotron-labs-audex-2b",
         "voxtral": "voxtral-mini-4b-realtime",
     }.get(slug, slug)
 
@@ -192,7 +189,7 @@ class ModelBackend:
 
     def set_graph_mode(self, *, streaming: bool, duration_s: float = 0.0) -> None:
         """Pick graphed vs eager for the coming transcribe. No-op by default;
-        backends whose pipelines expose the toggle (ark/qwen3/cohere) override."""
+        backends whose pipelines expose the toggle (ark/qwen3) override."""
 
     def _want_graphed(self, *, streaming: bool, duration_s: float, chunked: bool) -> bool:
         """Resolve the adaptive graph policy (see ServerConfig.graph_mode)."""
@@ -593,109 +590,6 @@ class Ark06Backend(ArkBackend):
         self.pipe = MegaPipeline.from_pretrained()
 
 
-class CohereBackend(ModelBackend):
-    """cohere-transcribe-03-2026: seq2seq enc-dec megakernel.
-
-    ``CohereMegaPipeline.transcribe`` accepts a 1-D waveform and returns a
-    list of transcripts (one per processor chunk); we join them for the
-    single-clip server path. Single-shot per chunk.
-    """
-
-    slug = "cohere"
-
-    def load(self) -> None:
-        from .cohere.pipeline import CohereMegaPipeline
-
-        self.pipe = CohereMegaPipeline.from_pretrained()
-
-    def set_graph_mode(self, *, streaming: bool, duration_s: float = 0.0) -> None:
-        # Chunks internally, so a long file yields many same-size encoder shapes;
-        # graph the encoder for streaming or long files, eager otherwise. The
-        # byte-exact cross-attn (decoder-graph) bucketing stays on regardless.
-        self.pipe.set_graphed_encoder(
-            self._want_graphed(streaming=streaming, duration_s=duration_s, chunked=True)
-        )
-
-    def _transcribe_chunk(self, samples: np.ndarray, budget: int) -> str:
-        assert self.pipe is not None
-        if samples.ndim != 1:
-            samples = samples.reshape(-1)
-        wav = np.ascontiguousarray(samples, dtype=np.float32)
-        texts, _ids = self.pipe.transcribe(
-            wav, max_new_tokens=budget,
-        )
-        return " ".join(t.strip() for t in texts if t.strip())
-
-    def transcribe(self, samples: np.ndarray) -> "TranscribeResult":
-        return self._transcribe_chunked(samples, self._transcribe_chunk)
-
-
-class HiggsBackend(ModelBackend):
-    """higgs-audio-v3-stt: Whisper-large-v3 mel + Qwen3-1.7B decoder megakernel.
-
-    NOTE: like the benchmark adapter, this only loads under the isolated
-    ``.venv-higgs`` (``transformers==4.51``); see ``higgs/UV_NOTES.md``.
-    """
-
-    slug = "higgs"
-
-    def load(self) -> None:
-        try:
-            from .higgs.pipeline import HiggsMega
-        except Exception as exc:
-            raise RuntimeError(
-                "the higgs backend requires the isolated .venv-higgs environment; "
-                "see src/starling/higgs/UV_NOTES.md"
-            ) from exc
-
-        self.pipe = HiggsMega.from_pretrained()
-
-    def _transcribe_chunk(self, samples: np.ndarray, budget: int) -> str:
-        assert self.pipe is not None
-        if samples.ndim != 1:
-            samples = samples.reshape(-1)
-        wav = np.ascontiguousarray(samples, dtype=np.float32)
-        text = self.pipe.transcribe(
-            wav, sample_rate=SAMPLE_RATE, max_new_tokens=budget,
-        )
-        return text
-
-    def transcribe(self, samples: np.ndarray) -> "TranscribeResult":
-        return self._transcribe_chunked(samples, self._transcribe_chunk)
-
-
-class AudexBackend(ModelBackend):
-    """nemotron-labs-audex-2b: Whisper encoder + Nemotron-Dense 2B decoder (ASR).
-
-    The pipeline's ``transcribe`` takes a 1-D float32 waveform. Audio is
-    chunked to 30 s clips (the Whisper window), each producing 750 audio
-    embeddings. File input is waveform-chunked to bound the static KV cache.
-    """
-
-    slug = "audex"
-
-    def load(self) -> None:
-        from .audex.pipeline import MegaPipeline
-
-        self.pipe = MegaPipeline.from_pretrained()
-
-    def set_graph_mode(self, *, streaming: bool, duration_s: float = 0.0) -> None:
-        self.pipe.set_prefill_use_graph(
-            self._want_graphed(streaming=streaming, duration_s=duration_s, chunked=True)
-        )
-
-    def _transcribe_chunk(self, samples: np.ndarray, budget: int) -> str:
-        assert self.pipe is not None
-        if samples.ndim != 1:
-            samples = samples.reshape(-1)
-        wav = np.ascontiguousarray(samples, dtype=np.float32)
-        text, _ = self.pipe.transcribe(wav, max_new_tokens=budget)
-        return text
-
-    def transcribe(self, samples: np.ndarray) -> "TranscribeResult":
-        return self._transcribe_chunked(samples, self._transcribe_chunk)
-
-
 class VoxtralBackend(ModelBackend):
     """voxtral-mini-4b-realtime: streaming-native encoder + Ministral-3 decoder.
 
@@ -722,7 +616,7 @@ class VoxtralBackend(ModelBackend):
         self._check_stopped()
         text, _ids = self.pipe.transcribe(audio)
         audio_seconds = len(audio) / SAMPLE_RATE
-        # One whole-utterance segment, like parakeet/cohere: the model emits
+        # One whole-utterance segment, like parakeet: the model emits
         # text in lockstep with audio positions but exposes no alignment.
         return TranscribeResult(
             text=text,
@@ -740,9 +634,6 @@ _BACKENDS: dict[str, type[ModelBackend]] = {
     "qwen3_06": Qwen06Backend,
     "ark": ArkBackend,
     "ark06": Ark06Backend,
-    "cohere": CohereBackend,
-    "higgs": HiggsBackend,
-    "audex": AudexBackend,
     "voxtral": VoxtralBackend,
 }
 
@@ -861,7 +752,7 @@ class ServerConfig:
     encoder_mode: str = "cudagraph"
     use_fused_llm: bool = True
     attn_impl: str = "eager"
-    # Adaptive CUDA-graph policy (backends that support it: ark, qwen3, cohere).
+    # Adaptive CUDA-graph policy (backends that support it: ark, qwen3).
     # A graph capture only pays off when the same shape recurs enough to amortise
     # it, so the server picks per request mode:
     #   * ``/stream`` (fixed stream_chunk_seconds windows -> one recurring shape)

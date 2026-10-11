@@ -28,10 +28,6 @@ namespace starling::ggml::lib {
 // bias-free branch, the multipliers use skip-when-default (the op sequence is
 // untouched), and tied_lm_head keeps llm.embed.weight as the head.
 
-// MLP activation family: the stock silu-gated gate/up/down trunk, or
-// Nemotron's plain squared-ReLU up/down MLP (no gate tensor at all).
-enum class QwenMlpAct { kSiluGated, kRelu2Plain };
-
 struct QwenDecodeSpec {
     bool qkv_bias;
     const char* env;           // env-var prefix, e.g. "STARLING_MOSS"
@@ -53,15 +49,6 @@ struct QwenDecodeSpec {
     // unique argmax (order-independent) (qwen3; off keeps moss/ark/granite
     // byte-identical).
     bool argmax_low_ties = false;
-    // Nemotron's MLP is up -> relu(x)^2 -> down (F.relu(x).pow(2): relu is
-    // exact, one bf16 round after the square), with no gate projection. The
-    // default keeps the historical silu-gated sequence byte-identical.
-    QwenMlpAct mlp_activation = QwenMlpAct::kSiluGated;
-    // Nemotron normalizes with F.rms_norm: normalize AND affine in f32, ONE
-    // bf16 round at the end. The default is the Llama-style two-round
-    // discipline (round after the rsqrt, round again after the weight mul)
-    // the stack was built on (moss/ark/granite/qwen3 byte-identity).
-    bool rms_norm_single_round = false;
     // F32-throughout activations for the decode stack (GPU + quantized
     // linears only; auto-falls-back when the first linear is unquantized).
     // Skips every intermediate bf16 round-trip, so the Vulkan backend's
@@ -78,8 +65,7 @@ struct QwenDecodeSpec {
     bool kstep_bucket = false;
     // Generation suppression: sorted token ids banned from greedy picks (the
     // model card's bad_words_ids constraint: special and codec ids the
-    // reference never emits). Appended last so existing positional field
-    // initializers (audex sets mlp_activation) stay valid. Points into the
+    // reference never emits). Points into the
     // owning model's config storage, which outlives inference; nullptr/0
     // disables suppression: no masking branch runs and the graphs keep their
     // exact historical op sequence. Must point into storage that outlives

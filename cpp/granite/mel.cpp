@@ -14,10 +14,6 @@ namespace {
 const lib::EngineMelPolicy kMelPolicy = {
     lib::MelPolicy::T_FULLT,
     /*cap_n_samples=*/false,
-    /*cap_before_checks=*/false,
-    lib::MelPolicy::MAX_ALL_FRAMES,
-    /*norm_in_double=*/false,
-    /*emit_bf16=*/true,
     "STARLING_GRANITE_MEL_DUMP",
     "GRANITE",
 };

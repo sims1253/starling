@@ -7,7 +7,7 @@ import pytest
 import torch
 
 
-MODELS = ("ark", "audex", "granite", "higgs", "moss", "qwen3")
+MODELS = ("ark", "granite", "moss", "qwen3")
 
 
 @pytest.fixture(params=MODELS)
@@ -43,13 +43,11 @@ def decoder(request, monkeypatch):
         mask = dec.static_attn_mask.view(-1)
         assert torch.all(mask[: position + 1] == 0)
         assert torch.all(torch.isneginf(mask[position + 1 :]))
-        if model in ("ark", "audex", "granite", "qwen3"):
-            assert dec.cache_cursor < dec.max_cache_len
-            dec.cache_cursor += 1
-        elif model == "moss":
+        if model == "moss":
             assert int(dec.static_cache_pos.item()) == position
         else:
-            assert int(dec.static_cache_position.item()) == position
+            assert dec.cache_cursor < dec.max_cache_len
+            dec.cache_cursor += 1
         dec.positions.append(position)
         dec.static_logits.zero_()
         dec.static_logits[0, 0, (int(dec.static_input_ids.item()) + 1) % 16] = 1
@@ -59,10 +57,8 @@ def decoder(request, monkeypatch):
     dec._finalize = lambda ids, elapsed, *args: ids
 
     def prefill(inputs, **kwargs):
-        prompt = inputs["inputs_embeds"] if isinstance(inputs, dict) else inputs
-        dec.cache_cursor = prompt.shape[1]
-        first = torch.tensor([[1]])
-        return (first, prompt.shape[1]) if model == "higgs" else first
+        dec.cache_cursor = inputs.shape[1]
+        return torch.tensor([[1]])
 
     dec.prefill = prefill
 
@@ -84,8 +80,6 @@ def decoder(request, monkeypatch):
 
 def generate(decoder, prompt_len, count, **kwargs):
     embeds = torch.zeros((1, prompt_len, 1))
-    if decoder.__class__.__module__.split(".")[-2] == "higgs":
-        return decoder.generate({"inputs_embeds": embeds}, max_new_tokens=count, **kwargs)
     return decoder.generate(embeds, max_new_tokens=count, **kwargs)
 
 

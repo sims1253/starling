@@ -16,12 +16,9 @@ from starling import _ggml
     ("parakeet", engines.StarlingGgmlParakeet, _ggml.PARAKEET_TDT),
     ("moss", engines.StarlingGgmlMoss, _ggml.MOSS),
     ("ark", engines.StarlingGgmlArk, _ggml.ARK),
-    ("higgs", engines.StarlingGgmlHiggs, _ggml.HIGGS),
-    ("hojo", engines.StarlingGgmlHojo, _ggml.HOJO),
     ("granite", engines.StarlingGgmlGranite, _ggml.GRANITE),
     ("qwen3", engines.StarlingGgmlQwen3, _ggml.QWEN3),
     ("s1", engines.StarlingGgmlS1, _ggml.S1),
-    ("audex", engines.StarlingGgmlAudex, _ggml.AUDEX),
 ])
 def test_native_adapter_contract(monkeypatch, tmp_path, slug, cls, kind):
     model_path = tmp_path / "model.gguf"

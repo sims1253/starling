@@ -2,7 +2,7 @@
 utterances decoded through ONE captured graph, not just the single utterance
 the graph was captured with.
 
-The original per-model byte-exact tests (test_cohere/test_qwen3/test_ark/...)
+The original per-model byte-exact tests (test_qwen3/test_ark/...)
 capture a graph on utterance A and decode that SAME utterance A. They pass even
 when the graphed path silently reuses capture-time state (frozen encoder hidden
 states, stale cross-attention K/V, a static buffer never re-bound) — because
@@ -10,8 +10,8 @@ utterance A's state IS the capture-time state. The bug only appears when
 utterance B (different audio) is decoded through A's captured graph: the stale
 state makes B return A's transcript.
 
-This is exactly what the Open ASR Leaderboard sweep surfaced: cohere returned
-clip 0's transcript for every clip; ark OOM'd accumulating per-shape graphs;
+This is exactly what the Open ASR Leaderboard sweep surfaced: a since-removed
+engine returned clip 0's transcript for every clip; ark OOM'd accumulating per-shape graphs;
 qwen3 crashed on a shape mismatch; parakeet's allocator thrashed. Each was a
 "works on one utterance, breaks on many" graph-capture bug that the single-
 utterance tests could not catch.
@@ -89,9 +89,8 @@ def _starling_vs_stock_byte_exact(model: str, clips) -> None:
 
 
 # One parametrized case per model that has both a starling and a stock engine
-# and a real graphed-decode path. higgs is excluded (isolated venv).
-@pytest.mark.parametrize("model", ["granite", "parakeet", "moss", "qwen3",
-                                   "cohere", "ark"])
+# and a real graphed-decode path.
+@pytest.mark.parametrize("model", ["granite", "parakeet", "moss", "qwen3", "ark"])
 def test_starling_matches_stock_across_clips(model):
     """Decoding N different clips through the starling graphed path must match
     the stock reference for every clip — not just the capture utterance."""

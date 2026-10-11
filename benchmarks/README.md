@@ -11,7 +11,7 @@ Use `--extra dev --extra bench` when running tests that also download corpora or
 score transcripts. The `dev` extra alone covers the CPU CI suite. Model execution
 still requires the [model files](../docs/models.md) and
 [Python setup](../docs/python-serving.md).
-`librosa` remains a runtime dependency because the Higgs model imports it.
+`librosa` remains a runtime dependency for the golden-capture and GGUF-conversion scripts.
 
 Maintained entry points:
 

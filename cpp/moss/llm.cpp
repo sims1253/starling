@@ -33,8 +33,6 @@ const lib::QwenDecodeSpec kSpec = {
     /*residual_multiplier=*/1.0f,
     /*logits_scaling=*/1.0f,
     /*argmax_low_ties=*/false,
-    /*mlp_activation=*/lib::QwenMlpAct::kSiluGated,
-    /*rms_norm_single_round=*/false,
     /*f32_acts=*/true,
     /*kstep_bucket=*/true,
 };

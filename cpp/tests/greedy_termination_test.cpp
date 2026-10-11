@@ -3,7 +3,7 @@
 // Contract under test (cpp/lib/qwen_decode.hpp):
 //   1. A first-token (prefill-argmax) EOS stops generation for SINGLE-stop
 //      decoders (moss/ark/granite/qwen3) exactly as it always did for
-//      dual-stop ones (higgs/s1) — the historical eos2-gate that kept
+//      dual-stop ones (s1) — the historical eos2-gate that kept
 //      single-stop engines decoding past a first-token EOS is retired.
 //   2. stop_reason distinguishes WHY generation ended: kEos (truthful
 //      completion) vs kBudgetExhausted (max_new_tokens ran out first — a
@@ -79,7 +79,7 @@ void predicate_checks() {
     for (int32_t t = 0; t < 16; ++t) any |= generation_stops_on(t, none);
     check(!any, "predicate: eos=-1 sentinel stops nothing");
 
-    // Dual-stop (higgs/s1-style): primary and CONFIGURED secondary both stop.
+    // Dual-stop (s1-style): primary and CONFIGURED secondary both stop.
     const GenerateParams dual{8, 128, 5, 7};
     check(generation_stops_on(5, dual) && generation_stops_on(7, dual),
           "predicate: primary and secondary both stop (dual-stop)");

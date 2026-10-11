@@ -14,7 +14,6 @@ the item-level inventory.
 | Python stream/patches | `uv run python -m pytest tests/test_stream_chunk.py tests/test_ggml_patches.py -q` | 38 passed |
 | C++ stream session | `./build/stream_session_test` | 78/78 passed |
 | C++ audio parser | `./build/audio_parser_test` | 40/40 passed |
-| C++ dtype guard | `./build/higgs_dtype_guard_test` | OK |
 | Package self-checks | `validate_package.py`, publisher tests, `reference/` tests, serving `analysis_checks` | all passed (26+13+13, 16+70 subtests) |
 
 Notes: use `uv run python` (never `.venv/bin/python` directly — it fails with

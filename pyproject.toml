@@ -1,7 +1,7 @@
 [project]
 name = "starling"
 version = "0.1.0"
-description = "Deprecated Python/CUDA research backend. Hand-tuned Triton megakernels for fast on-device ASR (granite-speech-4.1-2b + parakeet-tdt/unified + moss + qwen3 + cohere + higgs) on modern NVIDIA GPUs"
+description = "Deprecated Python/CUDA research backend. Hand-tuned Triton megakernels for fast on-device ASR (granite-speech-4.1-2b + parakeet-tdt/unified + moss + qwen3 + ark + voxtral) on modern NVIDIA GPUs"
 requires-python = ">=3.10,<3.13"
 dependencies = [
     "torch>=2.11",
@@ -83,9 +83,7 @@ ignore = ["E501"]
 [tool.ruff.lint.per-file-ignores]
 # Package exports are intentional; retain bug checks in vendored code.
 "__init__.py" = ["F401"]
-"src/starling/higgs/vendor/**" = ["E"]
 "src/starling/moss/vendor/**" = ["E"]
-"src/starling/nar/vendor/**" = ["E"]
 # Probes and benchmarks use compact statements and deferred imports.
 "scripts/**" = ["E701", "E702", "E402", "E401"]
 "benchmarks/**" = ["E701", "E702", "E402", "E731", "E741"]

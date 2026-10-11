@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import os
 import subprocess
-import sys
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -819,242 +818,6 @@ class Ark06Stock(ArkStock):
 
 
 # ====================================================================== #
-# cohere-transcribe-03-2026  (seq2seq encoder-decoder)
-# ====================================================================== #
-class CohereStarling(Engine):
-    """starling fused pipeline for cohere-transcribe (FastConformer encoder +
-    K-step graphed seq2seq decode over an EncoderDecoderCache).
-
-    ``COHERE_SHAPE_BUCKETING=1`` additionally buckets the mel so the encoder graph
-    is shared across clip lengths. That is ~1.5-2.5x faster but not byte-exact (it
-    grows the post-subsampling length, retiling the conformer's bf16 reductions);
-    see ``CohereMegaPipeline``.
-    """
-
-    def __init__(self) -> None:
-        super().__init__("starling", "cohere", supports_batch=False)
-
-    def _load(self) -> None:
-        import os
-
-        from starling.cohere.pipeline import CohereMegaPipeline
-
-        bucket = os.environ.get("COHERE_SHAPE_BUCKETING", "") not in ("", "0")
-        self.pipe = CohereMegaPipeline.from_pretrained(shape_bucketing=bucket)
-        # bench_all runs each fixture repeatedly (one recurring shape), so the
-        # graphed encoder -- the server's streaming choice, byte-exact -- is the
-        # correct engine here. The pipeline default is eager (safe on diverse
-        # audio, where graphed re-captures per clip). shape_bucketing implies it.
-        self.pipe.set_graphed_encoder(True)
-
-    def _release(self) -> None:
-        self.pipe = None
-
-    def _run_one(self, audio: np.ndarray) -> str:
-        texts, _ids = self.pipe.transcribe(audio, max_new_tokens=300)
-        return texts[0]
-
-
-class CohereStock(Engine):
-    """Stock ``model.generate`` reference for cohere-transcribe.
-
-    Seq2seq: passes the processor's ``input_features`` / ``attention_mask`` /
-    ``decoder_input_ids`` through ``CohereAsrForConditionalGeneration.generate``
-    (verified byte-exact against the manual eager reference in
-    ``tests/test_cohere.py::test_reference_matches_generate``).
-    """
-
-    def __init__(self) -> None:
-        super().__init__("stock transformers", "cohere", supports_batch=False)
-
-    def _load(self) -> None:
-        from starling.cohere.config import SAMPLE_RATE
-        from starling.cohere.loader import load_model_and_processor
-
-        self._sr = SAMPLE_RATE
-        self.model, self.processor = load_model_and_processor()
-
-    def _release(self) -> None:
-        self.model = self.processor = None
-
-    def _run_one(self, audio: np.ndarray) -> str:
-        inp = self.processor(
-            audio, sampling_rate=self._sr, language="en", return_tensors="pt"
-        )
-        feat = inp["input_features"].to(self.model.dtype).cuda()
-        amask = inp["attention_mask"].cuda()
-        dec_in = inp["decoder_input_ids"].cuda()
-        prompt_len = dec_in.shape[1]
-        gen = self.model.generate(
-            input_features=feat, attention_mask=amask,
-            decoder_input_ids=dec_in, max_length=prompt_len + 300,
-        )
-        gen_new = gen[:, prompt_len:]
-        return self.processor.batch_decode(gen_new, skip_special_tokens=True)[0]
-
-
-# ====================================================================== #
-# higgs-audio-v3-stt  (runs under the isolated .venv-higgs, transformers 4.51)
-# ====================================================================== #
-class HiggsStarling(Engine):
-    """starling fused pipeline for higgs-audio-v3-stt (Whisper-large-v3 mel
-    encoder + MLP projector + Qwen3-1.7B decoder, graph-captured decode).
-
-    NOTE: higgs-audio runs under its own isolated venv ``.venv-higgs``
-    (``transformers==4.51.3``) because the model's ``trust_remote_code``
-    modeling breaks under the repo's transformers 5.13. The package imports
-    cleanly here, but ``_load`` only succeeds if launched with
-    ``uv run --no-project --python .venv-higgs/bin/python``. See
-    ``src/starling/higgs/UV_NOTES.md``. Gated by :func:`_higgs_keys` so the
-    main-venv ``bench_all`` grid silently skips it.
-    """
-
-    def __init__(self) -> None:
-        super().__init__("starling", "higgs", supports_batch=False)
-
-    def _load(self) -> None:
-        from starling.higgs.pipeline import HiggsMega
-
-        self.pipe = HiggsMega.from_pretrained()
-
-    def _release(self) -> None:
-        self.pipe = None
-
-    def _run_one(self, audio: np.ndarray) -> str:
-        return self.pipe.transcribe(audio, sample_rate=16000, max_new_tokens=512)
-
-
-class HiggsStock(Engine):
-    """Stock reference for higgs-audio-v3-stt.
-
-    Uses the vendored upstream ``transcribe()`` (``scripts/ref/transcribe.py``,
-    run under ``.venv-higgs``) as the byte-exact oracle — the same path the
-    golden reference is captured with. Like :class:`HiggsStarling`, this only
-    loads under the isolated ``.venv-higgs``; gated by :func:`_higgs_keys`.
-    """
-
-    def __init__(self) -> None:
-        super().__init__("stock transformers", "higgs", supports_batch=False)
-
-    def _load(self) -> None:
-        import sys
-
-        sys.path.insert(0, str(REPO_ROOT / "scripts" / "ref"))
-        import transcribe as ref  # noqa: F401  (upstream transcribe())
-
-        self._ref = ref
-        from starling.higgs.loader import load_model_and_tokenizer
-
-        self.model, self.tokenizer = load_model_and_tokenizer(attn_impl="eager")
-
-    def _release(self) -> None:
-        self.model = self.tokenizer = None
-
-    def _run_one(self, audio: np.ndarray) -> str:
-        wav = np.ascontiguousarray(audio, dtype=np.float32)
-        return self._ref.transcribe(self.model, self.tokenizer, wav)
-
-
-# ====================================================================== #
-# Nemotron-Labs-Audex-2B  (ASR path: Whisper encoder + Nemotron-Dense decoder)
-# ====================================================================== #
-class AudexStarling(Engine):
-    """starling fused pipeline for Audex-2B (graphed Whisper+avg-pooler encoder
-    + K-step graphed Nemotron-Dense decode). Byte-identical to eager."""
-
-    def __init__(self) -> None:
-        super().__init__("starling", "audex", supports_batch=False)
-
-    def _load(self) -> None:
-        from starling.audex.pipeline import MegaPipeline
-
-        self.pipe = MegaPipeline.from_pretrained()
-        self.pipe.set_prefill_use_graph(True)
-
-    def _release(self) -> None:
-        self.pipe = None
-
-    def _run_one(self, audio: np.ndarray) -> str:
-        text, _ids = self.pipe.transcribe(audio, max_new_tokens=400)
-        return text
-
-
-class AudexStock(Engine):
-    """Stock eager ``model.generate`` reference for Audex-2B ASR.
-
-    Replicates the ``inference_scripts_hf`` recipe: 30 s Whisper clips,
-    ChatML prompt with ``<so_embedding>`` placeholders, greedy decode.
-    """
-
-    def __init__(self) -> None:
-        super().__init__("stock transformers", "audex", supports_batch=False)
-
-    def _load(self) -> None:
-        from starling.audex.audio import build_inputs
-        from starling.audex.loader import load_model_and_processor
-
-        self._build_inputs = build_inputs
-        self.model, self.tokenizer, self.feature_extractor = (
-            load_model_and_processor(attn_impl="eager")
-        )
-
-    def _release(self) -> None:
-        self.model = self.tokenizer = self.feature_extractor = None
-
-    def _run_one(self, audio: np.ndarray) -> str:
-        import re as _re
-
-        from starling.audex.audio import normalize_audio
-        from starling.audex.config import EOS_TOKEN_ID, SOUND_CLIP_DURATION, SOUND_TARGET_RATE
-
-        wav = np.ascontiguousarray(audio, dtype=np.float32)
-        wav = normalize_audio(wav)
-        clip_samples = int(round(SOUND_TARGET_RATE * SOUND_CLIP_DURATION))
-
-        # Chunk at 30s (same as the starling pipeline) to avoid multi-clip
-        # repetition hallucination on long/repetitive audio.
-        if len(wav) <= clip_samples:
-            clips = [wav]
-        else:
-            clips = []
-            for start in range(0, len(wav), clip_samples):
-                clip = wav[start : start + clip_samples]
-                if len(clip) < 100:
-                    continue
-                if len(clip) < clip_samples:
-                    clip = np.pad(clip, (0, clip_samples - len(clip)))
-                clips.append(clip)
-
-        texts = []
-        for clip in clips:
-            inputs = self._build_inputs(
-                self.tokenizer, self.feature_extractor, clip
-            )
-            prompt_len = inputs["input_ids"].shape[1]
-            gen = self.model.generate(
-                input_ids=inputs["input_ids"],
-                input_features=inputs["input_features"],
-                max_new_tokens=400,
-                do_sample=False,
-                num_beams=1,
-                eos_token_id=EOS_TOKEN_ID,
-            )
-            gen_new = gen[0][prompt_len:]
-            raw = self.tokenizer.decode(gen_new, skip_special_tokens=False)
-            if "</think>" in raw:
-                raw = raw.rsplit("</think>", 1)[-1]
-            if "<|im_end|>" in raw:
-                raw = raw.split("<|im_end|>", 1)[0]
-            raw = raw.strip()
-            m = _re.search(r"'(.+)'", raw, _re.DOTALL)
-            if m:
-                texts.append(m.group(1).strip())
-            else:
-                texts.append(raw)
-        return " ".join(texts)
-
-
-# ====================================================================== #
 # Voxtral-Mini-4B-Realtime  (streaming-native encoder + Ministral-3 decoder)
 # ====================================================================== #
 class VoxtralStarling(Engine):
@@ -1495,28 +1258,6 @@ class StarlingGgmlArk(_StarlingGgml):
         super().__init__("ark", "ARK", STARLING_GGML_ARK_MODEL)
 
 
-STARLING_GGML_HIGGS_MODEL = Path(os.environ.get(
-    "STARLING_GGML_HIGGS_MODEL",
-    str(REPO_ROOT / "models" / "higgs-audio-v3-bf16-exact.gguf"),
-)).expanduser()
-
-
-class StarlingGgmlHiggs(_StarlingGgml):
-    def __init__(self) -> None:
-        super().__init__("higgs", "HIGGS", STARLING_GGML_HIGGS_MODEL)
-
-
-STARLING_GGML_HOJO_MODEL = Path(os.environ.get(
-    "STARLING_GGML_HOJO_MODEL",
-    str(REPO_ROOT / "models" / "hojo-asr-v1.gguf"),
-)).expanduser()
-
-
-class StarlingGgmlHojo(_StarlingGgml):
-    def __init__(self) -> None:
-        super().__init__("hojo", "HOJO", STARLING_GGML_HOJO_MODEL)
-
-
 STARLING_GGML_GRANITE_MODEL = Path(os.environ.get(
     "STARLING_GGML_GRANITE_MODEL",
     str(REPO_ROOT / "models" / "granite-speech-4.1-2b-bf16-exact.gguf"),
@@ -1666,17 +1407,6 @@ def _s1_keys() -> list[str]:
     if _s1_available():
         return ["starling-s1", "stock-s1"]
     return []
-
-
-STARLING_GGML_AUDEX_MODEL = Path(os.environ.get(
-    "STARLING_GGML_AUDEX_MODEL",
-    str(REPO_ROOT / "models" / "audex-2b-bf16-exact.gguf"),
-)).expanduser()
-
-
-class StarlingGgmlAudex(_StarlingGgml):
-    def __init__(self) -> None:
-        super().__init__("audex", "AUDEX", STARLING_GGML_AUDEX_MODEL)
 
 
 class GgmlMoss(Engine):
@@ -1954,23 +1684,8 @@ def _qwen3_06_on_master() -> bool:
         return False
 
 
-def _higgs_available() -> bool:
-    """True iff the current process is running inside the Higgs venv.
-
-    ``starling.higgs`` imports cleanly in the main venv (heavy modelling is
-    lazy), but its ``trust_remote_code`` modelling only *runs* under
-    ``transformers==4.51`` (the isolated ``.venv-higgs``). The venv may exist
-    while ``bench_all`` is running under the main project environment, so gate
-    on the active interpreter rather than existence alone.
-    """
-    try:
-        return Path(sys.prefix).resolve() == (REPO_ROOT / ".venv-higgs").resolve()
-    except OSError:
-        return False
-
-
 # (engine_key, factory, requires_extra)
-# starling/stock factories are cheap wrappers; CrispASR/Qwen3/Higgs are conditional.
+# starling/stock factories are cheap wrappers; CrispASR/Qwen3 are conditional.
 ENGINE_REGISTRY: dict[str, Callable[[], Engine]] = {
     "starling-granite": GraniteStarling,
     "stock-granite": GraniteStock,
@@ -1985,10 +1700,6 @@ ENGINE_REGISTRY: dict[str, Callable[[], Engine]] = {
     "stock-ark": ArkStock,
     "starling-ark06": Ark06Starling,
     "stock-ark06": Ark06Stock,
-    "starling-cohere": CohereStarling,
-    "stock-cohere": CohereStock,
-    "starling-audex": AudexStarling,
-    "stock-audex": AudexStock,
     "starling-voxtral": VoxtralStarling,
     "stock-voxtral": VoxtralStock,
 }
@@ -2036,29 +1747,20 @@ def _qwen3_keys() -> list[str]:
     return keys
 
 
-def _higgs_keys() -> list[str]:
-    if not _higgs_available():
-        return []
-    return ["starling-higgs", "stock-higgs"]
-
-
 _STARLING_GGML_ENGINES = {
     "parakeet": StarlingGgmlParakeet,
     "moss": StarlingGgmlMoss,
     "ark": StarlingGgmlArk,
-    "higgs": StarlingGgmlHiggs,
-    "hojo": StarlingGgmlHojo,
     "granite": StarlingGgmlGranite,
     "qwen3": StarlingGgmlQwen3,
     "qwen3_06": StarlingGgmlQwen3_06,
     "s1": StarlingGgmlS1,
-    "audex": StarlingGgmlAudex,
 }
 
 
 def available_keys() -> list[str]:
-    """All engine keys usable in this checkout (qwen3/higgs/CrispASR/parakeet.cpp gated)."""
-    return (list(ENGINE_REGISTRY) + _qwen3_keys() + _higgs_keys() + _s1_keys()
+    """All engine keys usable in this checkout (qwen3/CrispASR/parakeet.cpp gated)."""
+    return (list(ENGINE_REGISTRY) + _qwen3_keys() + _s1_keys()
             + ["starling-batched-granite", "starling-spec-granite"]
             + _crispasr_keys() + _parakeet_cpp_keys()
             + _ggml_parakeet_keys() + _ggml_moss_keys()
@@ -2115,9 +1817,6 @@ def build_engines(
                 cls = Qwen06Starling if fam == "starling" else Qwen06Stock
             else:
                 cls = Qwen3Starling if fam == "starling" else Qwen3Stock
-            chosen[mdl].append(cls())
-        elif mdl == "higgs":
-            cls = HiggsStarling if fam == "starling" else HiggsStock
             chosen[mdl].append(cls())
         elif mdl == "s1":
             cls = S1Starling if fam == "starling" else S1Stock

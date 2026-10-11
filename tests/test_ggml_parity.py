@@ -69,12 +69,9 @@ T_MOSS_CRISPASR = "moss.crispasr.external"
 T_PARAKEET_EXTERNAL = "parakeet.external"
 T_MOSS_KSTEP = "moss.intree.kstep_regression"
 T_ARK_TEXT = "ark.intree.text"
-T_HIGGS_TEXT = "higgs.intree.text"
-T_HOJO_TEXT = "hojo.intree.text"
 T_GRANITE_TEXT = "granite.intree.text"
 T_QWEN3_TEXT = "qwen3.intree.text"
 T_QWEN3_06_TEXT = "qwen3_06.intree.text"
-T_AUDEX_TEXT = "audex.intree.text"
 T_S1_TEXT = "s1.intree.text"
 T_S1_CONTROL = "s1.intree.control_matrix_smoke"
 
@@ -469,7 +466,7 @@ def test_starling_ggml_moss_llm_components() -> None:
     gates — enforced on all fixtures on CUDA, on short on CPU where
     cpp/moss/llm.cpp documents the bf16 GEMM fallback; see _run_moss_llm_gate).
     This is the component-level contract shared by every Qwen-decoder engine
-    (moss/ark/granite/qwen3/audex/s1).
+    (moss/ark/granite/qwen3/s1).
     """
     _run_moss_llm_gate()
 
@@ -509,86 +506,6 @@ def test_starling_ggml_ark_text_parity(starling_ggml_ark_engine, name: str) -> N
     golden_text = json.loads((GOLDEN / "ark_reference.json").read_text())[name]["text"]
     out = starling_ggml_ark_engine._run_one(FIXTURES[name])
     pc.assert_exact_text(out, golden_text, target=T_ARK_TEXT, fixture=name)
-
-
-# --------------------------------------------------------------------------- #
-# In-tree higgs-audio-v3-stt C API
-# --------------------------------------------------------------------------- #
-def _starling_ggml_higgs_available() -> bool:
-    try:
-        from engines import StarlingGgmlHiggs
-        return StarlingGgmlHiggs().available
-    except Exception:
-        return False
-
-@pytest.fixture(scope="module")
-def starling_ggml_higgs_engine():
-    if not _starling_ggml_higgs_available():
-        pytest.skip("in-tree libstarling_ggml or STARLING_GGML_HIGGS_MODEL unavailable")
-    from engines import StarlingGgmlHiggs
-    engine = StarlingGgmlHiggs()
-    engine.load()
-    yield engine
-    engine.close()
-
-@pytest.mark.skipif(not _starling_ggml_higgs_available(),
-                    reason="in-tree libstarling_ggml or HIGGS GGUF unavailable")
-@pytest.mark.parametrize("name", ["short", "medium", "long"])
-def test_starling_ggml_higgs_text_parity(starling_ggml_higgs_engine, name: str) -> None:
-    """The in-tree C API returns the golden higgs transcript.
-
-    Gates Starling's own mel -> Whisper encoder (+ avg pool) -> MLP projector
-    -> ChatML prompt -> Qwen3 decoder (with qk_norm) -> BPE detokenizer pipeline
-    for bosonai/higgs-audio-v3-stt against the eager reference captured by
-    scripts/capture_golden_ref.py (golden/higgs_golden.json). Asserts exact text
-    parity with no tolerance.
-    """
-    _manifest_gate(T_HIGGS_TEXT)
-    pc.record_executed(T_HIGGS_TEXT)
-    golden = json.loads((GOLDEN / "higgs_golden.json").read_text())
-    golden_text = golden["fixtures"][name]["text"]
-    out = starling_ggml_higgs_engine._run_one(FIXTURES[name])
-    pc.assert_exact_text(out, golden_text, target=T_HIGGS_TEXT, fixture=name)
-
-
-# --------------------------------------------------------------------------- #
-# In-tree HojoAI/Hojo-ASR-V1 C API
-# --------------------------------------------------------------------------- #
-def _starling_ggml_hojo_available() -> bool:
-    try:
-        from engines import StarlingGgmlHojo
-        return StarlingGgmlHojo().available
-    except Exception:
-        return False
-
-@pytest.fixture(scope="module")
-def starling_ggml_hojo_engine():
-    if not _starling_ggml_hojo_available():
-        pytest.skip("in-tree libstarling_ggml or STARLING_GGML_HOJO_MODEL unavailable")
-    from engines import StarlingGgmlHojo
-    engine = StarlingGgmlHojo()
-    engine.load()
-    yield engine
-    engine.close()
-
-@pytest.mark.skipif(not _starling_ggml_hojo_available(),
-                    reason="in-tree libstarling_ggml or HOJO GGUF unavailable")
-@pytest.mark.parametrize("name", ["short", "medium", "long"])
-def test_starling_ggml_hojo_text_parity(starling_ggml_hojo_engine, name: str) -> None:
-    """The in-tree C API returns the golden Hojo transcript.
-
-    Gates Starling's own mel -> Qwen3-Omni audio tower -> WeNet Conformer
-    bottleneck -> ln_speech -> Qwen3-4B decoder (beam-4, qk_norm) -> BPE
-    detokenizer pipeline for HojoAI/Hojo-ASR-V1 against the eager reference
-    captured by scripts/hojo_golden_components.py (golden/hojo_reference.json).
-    Asserts exact text parity with no tolerance.
-    """
-    _manifest_gate(T_HOJO_TEXT)
-    pc.record_executed(T_HOJO_TEXT)
-    golden = json.loads((GOLDEN / "hojo_reference.json").read_text())
-    golden_text = golden["fixtures"][name]["text"]
-    out = starling_ggml_hojo_engine._run_one(FIXTURES[name])
-    pc.assert_exact_text(out, golden_text, target=T_HOJO_TEXT, fixture=name)
 
 
 # --------------------------------------------------------------------------- #
@@ -716,50 +633,6 @@ def test_starling_ggml_qwen3_06_text_parity(starling_ggml_qwen3_06_engine, name:
     golden_text = golden["fixtures"][name]["text"]
     out = starling_ggml_qwen3_06_engine._run_one(FIXTURES[name])
     pc.assert_exact_text(out, golden_text, target=T_QWEN3_06_TEXT, fixture=name)
-
-
-# --------------------------------------------------------------------------- #
-# In-tree Nemotron-Labs-Audex-2B C API
-# --------------------------------------------------------------------------- #
-def _starling_ggml_audex_available() -> bool:
-    try:
-        from engines import StarlingGgmlAudex
-        return StarlingGgmlAudex().available
-    except Exception:
-        return False
-
-@pytest.fixture(scope="module")
-def starling_ggml_audex_engine():
-    if not _starling_ggml_audex_available():
-        pytest.skip("in-tree libstarling_ggml or STARLING_GGML_AUDEX_MODEL unavailable")
-    from engines import StarlingGgmlAudex
-    engine = StarlingGgmlAudex()
-    engine.load()
-    yield engine
-    engine.close()
-
-@pytest.mark.skipif(not _starling_ggml_audex_available(),
-                    reason="in-tree libstarling_ggml or audex GGUF unavailable")
-@pytest.mark.parametrize("name", ["short", "medium", "long"])
-def test_starling_ggml_audex_text_parity(starling_ggml_audex_engine, name: str) -> None:
-    """The in-tree C API returns the golden audex transcript.
-
-    Gates Starling's own whisper-style mel (128 bins, drop-last-frame rule,
-    fixed 3000-frame clips) -> conv1d frontend + learned positional table +
-    full-attention encoder (32 layers, 20 heads) -> avg-pooler (750 tokens)
-    -> RMSNorm/relu2 projector -> Nemotron-Dense decoder (bias-free GQA,
-    untied lm_head, relu2 MLP, single-round RMSNorm) pipeline including the
-    serve chunk policy for long audio and the quote-extraction text cleanup,
-    against the stock-numerics reference captured by
-    scripts/make_audex_golden.py (golden/audex_reference.json). Asserts exact
-    text parity with no tolerance.
-    """
-    _manifest_gate(T_AUDEX_TEXT)
-    pc.record_executed(T_AUDEX_TEXT)
-    golden = json.loads((GOLDEN / "audex_reference.json").read_text())
-    golden_text = golden["fixtures"][name]["text"]
-    out = starling_ggml_audex_engine._run_one(FIXTURES[name])
-    pc.assert_exact_text(out, golden_text, target=T_AUDEX_TEXT, fixture=name)
 
 
 # --------------------------------------------------------------------------- #

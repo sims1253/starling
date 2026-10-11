@@ -23,7 +23,7 @@ Cells
 -----
   --lengths   short,medium,long   (the deterministic LibriSpeech fixtures)
   --batches   1,8                 (batch sizes; non-batched engines loop Bx1)
-  --models    granite,parakeet,moss,ark,cohere[,qwen3,higgs]
+  --models    granite,parakeet,moss,ark[,qwen3]
   --engines   starling,stock[,crispasr,parakeet.cpp,starling-batched,starling-spec,starling-compiled]
 
 Timing
@@ -70,9 +70,6 @@ MODEL_LABELS = {
     "qwen3_06": "qwen3-asr-0.6b",
     "ark": "ark-asr-3b",
     "ark06": "ark-asr-0.6b",
-    "cohere": "cohere-transcribe-03-2026",
-    "higgs": "higgs-audio-v3-stt",
-    "audex": "nemotron-labs-audex-2b",
     "voxtral": "voxtral-mini-4b-realtime",
     "s1": "s1-mini (text normalizer)",
 }
@@ -454,10 +451,10 @@ def _parse_csv_int(s: str) -> list[int]:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--models", default="granite,parakeet,moss,ark,cohere",
+    ap.add_argument("--models", default="granite,parakeet,moss,ark",
                     help="comma list of model slugs "
-                         "(granite,parakeet,moss,ark,ark06,cohere,qwen3,qwen3_06,higgs,audex,voxtral,s1; "
-                         "qwen3/qwen3_06/higgs/audex/s1 are auto-gated on availability; "
+                         "(granite,parakeet,moss,ark,ark06,qwen3,qwen3_06,voxtral,s1; "
+                         "qwen3/qwen3_06/s1 are auto-gated on availability; "
                          "s1 is text-in/text-out: fixture tiers select transcripts "
                          "and RTFx reads normalized words/s)")
     ap.add_argument("--engines", default="starling,stock",

@@ -2,7 +2,7 @@
 """Convert nvidia/parakeet-tdt-0.6b-v3 to Starling GGUF.
 
 Parakeet-tdt is a FastConformer + TDT (token-and-duration transducer) model.
-Unlike the Whisper-mel models (moss, ark, higgs), parakeet has its own mel
+Unlike the Whisper-mel models (moss, ark, qwen3), parakeet has its own mel
 frontend (NeMo AudioToMelSpectrogramPreprocessor) and an RNN-T/TDT decoder.
 
 This converter:
