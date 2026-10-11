@@ -191,6 +191,12 @@ struct OptIn {
     const char* pattern;
     const char* what;  // "embedding" / "linear", for the error message
     std::vector<ggml_type> types;
+    // A kernel-size-1 conv stored [1, in, out]: block quantization needs the
+    // row on ne[0], so a quantized copy is written flattened as [in, out]
+    // (byte-identical element order). Engines that accept it: Parakeet's
+    // conformer (reshapes the weight 2-D anyway) and its fast engine (reads
+    // raw rows).
+    bool flatten_k1 = false;
 };
 
 const std::vector<OptIn>& opt_ins() {
@@ -211,6 +217,11 @@ const std::vector<OptIn>& opt_ins() {
         {"moss_transcribe", "^enc\\.conv_out\\.weight$", "linear", kLinearTypes},
         {"granite", "^enc\\.blk\\.[0-9]+\\.conv_(up|down)\\.weight$", "linear",
          kLinearTypes},
+        // Conformer pointwise convs: ~27 % of a q4 Parakeet file at F16.
+        // Q4_0/Q8_0 map losslessly onto the phone fast engine's W4/W8.
+        {"parakeet_tdt", "^encoder\\.layers\\.[0-9]+\\.conv\\.pointwise_conv[12]\\.weight$",
+         "linear", {GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q6_K, GGML_TYPE_Q4_K,
+                    GGML_TYPE_Q4_0}, /*flatten_k1=*/true},
     };
     return kOptIns;
 }
@@ -396,9 +407,20 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "error: imatrix %s is empty/unreadable\n", args.imatrix.c_str());
             return 1;
         }
+        // The collector keys an entry by the matmul's src0 name. A weight the
+        // engine casts or reshapes first (Parakeet's pointwise convs) is
+        // recorded under ggml's derived name, e.g. "<w> (copy) (reshaped)";
+        // alias such entries to the weight unless it has its own.
+        std::vector<std::pair<std::string, starling::ggml::ImatrixEntry>> aliases;
+        for (const auto& kv : imap) {
+            const auto cut = kv.first.find(" (");
+            if (cut != std::string::npos && !imap.count(kv.first.substr(0, cut)))
+                aliases.emplace_back(kv.first.substr(0, cut), kv.second);
+        }
+        for (auto& a : aliases) imap.emplace(std::move(a.first), std::move(a.second));
         if (!args.quiet)
-            std::fprintf(stderr, "imatrix: %zu tensors from %s\n",
-                         imap.size(), args.imatrix.c_str());
+            std::fprintf(stderr, "imatrix: %zu tensors from %s (%zu by derived name)\n",
+                         imap.size(), args.imatrix.c_str(), aliases.size());
     }
 
     // Open the input (mmap-backed weight context, same as ModelLoader).
@@ -444,8 +466,9 @@ int main(int argc, char** argv) {
         ggml_tensor* t = name_c ? ggml_get_tensor(ctx_in, name_c) : nullptr;
         if (!t) continue;
         const std::string name(name_c);
-        const int n_dims = ggml_n_dims(t);
-        const int64_t k = t->ne[0];  // row length (input channels)
+        int n_dims = ggml_n_dims(t);
+        int64_t k = t->ne[0];  // row length (input channels)
+        int64_t ne_out[GGML_MAX_DIMS] = {t->ne[0], t->ne[1], t->ne[2], t->ne[3]};
         const size_t src_bytes = ggml_nbytes(t);
         bytes_in += src_bytes;
 
@@ -454,7 +477,10 @@ int main(int argc, char** argv) {
         // An explicit rule is required for an opt-in tensor: a recipe's
         // default must not newly quantize embeddings (not observed by the
         // imatrix collector as lookups) or conv-named tensors.
-        const OptIn* opt_in = use_recipe && n_dims == 2 ? find_opt_in(arch, name) : nullptr;
+        const OptIn* opt_in = use_recipe && (n_dims == 2 || (n_dims == 3 && t->ne[0] == 1))
+                                  ? find_opt_in(arch, name)
+                                  : nullptr;
+        if (opt_in && n_dims == 3 && !opt_in->flatten_k1) opt_in = nullptr;
         if (opt_in) {
             for (const auto& rule : recipe.rules) {
                 if (std::regex_search(name, rule.first)) {
@@ -471,7 +497,15 @@ int main(int argc, char** argv) {
                         return 1;
                     }
                     candidates++;
-                    want = compat_type(rule.second, k, (ggml_type)t->type);
+                    if (n_dims == 3 && ggml_is_quantized(rule.second)) {
+                        ne_out[0] = t->ne[1];
+                        ne_out[1] = t->ne[2];
+                        ne_out[2] = 1;
+                        n_dims = 2;
+                        k = ne_out[0];
+                    }
+                    want = n_dims == 3 ? rule.second
+                                       : compat_type(rule.second, k, (ggml_type)t->type);
                     break;
                 }
             }
@@ -505,7 +539,7 @@ int main(int argc, char** argv) {
         // Materialize the output tensor + data. gguf_add_tensor records the
         // name/type/shape; gguf_set_tensor_data binds the data pointer (and
         // requires the name to exist, so it must follow the add).
-        ggml_tensor* dst_t = ggml_new_tensor(ctx_out, want, n_dims, t->ne);
+        ggml_tensor* dst_t = ggml_new_tensor(ctx_out, want, n_dims, ne_out);
         ggml_set_name(dst_t, name_c);
         if (out) gguf_add_tensor(out, dst_t);
         if (want != (ggml_type)t->type) {
