@@ -1,6 +1,6 @@
 // Ported from `apps/desktop/electron/ipc.ts` + `electron/main.ts` — the native
 // Electron request path (`healthProgram` / `transcribeProgram`) — together with
-// the response normalization of `packages/dictation/src/client.ts`.
+// the response normalization of the removed TypeScript `client.ts`.
 // See `apps/desktop-gpui/PORT.md` ("Transcription client") for the contract.
 
 use std::error::Error as StdError;

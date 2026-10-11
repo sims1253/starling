@@ -11,7 +11,7 @@ flowchart LR
   Desktop["Desktop · Rust gpui<br/>Windows · Linux · macOS"] --> API["Starling native server<br/>OpenAI-compatible batch + Starling streaming"]
   Android["Android · Kotlin<br/>Recorder + voice keyboard"] --> API
   iOS["iOS · SwiftUI<br/>Recorder + share / copy"] --> API
-  Shared["Shared wire contract<br/>TypeScript client + fidelity rules"]
+  Shared["Shared wire contract<br/>OpenAPI + JSON fixtures"]
   Shared -. protocol .-> Desktop
   Shared -. protocol .-> Android
   Shared -. protocol .-> iOS
@@ -20,8 +20,7 @@ flowchart LR
 ```
 
 Each build system owns its natural boundary. Cargo owns the gpui desktop app.
-pnpm workspaces link the TypeScript library and the npm launcher. CMake owns
-the native server and quantizer.
+CMake owns the native server and quantizer.
 Gradle owns Android. XcodeGen and Swift Package Manager own iOS. The small Python
 quant catalog is independent of the deprecated Python inference environment.
 
@@ -30,8 +29,7 @@ quant catalog is independent of the deprecated Python inference environment.
 | `apps/desktop-gpui` | Desktop app (Rust, gpui): UI, microphone capture, journaled local history, HTTP client, global shortcut |
 | `apps/mobile` | Android activity, recorder, private storage, network client, voice keyboard |
 | `apps/ios` | iOS recorder, private history, native HTTP client, share/copy |
-| `packages/dictation` | WAV preparation, TypeScript client, immutable analysis, browser session persistence (reference library; the Rust desktop re-implements this contract) |
-| `packages/contracts` | Language-independent OpenAPI contract |
+| `packages/contracts` | Language-independent OpenAPI contract and shared JSON fixtures |
 | `backends/native` | Native CMake build definition and real HTTP contract tests |
 | `quants` | Recipe catalog, calibrated recipes, artifact provenance CLI |
 | `backends/python` | Deprecated service entry point and migration notes |

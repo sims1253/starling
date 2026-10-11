@@ -41,7 +41,6 @@ models and show server limits.
 
 | Client | Current source |
 | --- | --- |
-| TypeScript client | `packages/dictation/src/client.ts` |
 | Desktop (gpui, Rust) | `apps/desktop-gpui/crates/dictation/src/client.rs` and `apps/desktop-gpui/crates/app/src/live_stream.rs` |
 | Android | `apps/mobile/app/src/main/java/dev/starling/mobile/network/InferenceClient.kt` and `StreamClient.kt` |
 | iOS | `apps/ios/Sources/Core/StarlingClient.swift` |

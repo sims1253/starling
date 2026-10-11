@@ -24,15 +24,19 @@ and setup steps. No compiler is needed.
 
 ## Run the server
 
-Quickest path — Node.js 20+, no compiler and no GPU required:
+Quickest path — a prebuilt binary, no compiler and no GPU required. Download
+the `starling-serve-<platform>-<backend>` archive for your machine from
+[GitHub releases](https://github.com/sims1253/starling/releases) (every
+experimental master build attaches them too). On Linux with the CPU build:
 
 ```bash
-npx starling-serve --model parakeet --gguf /path/to/model.gguf --port 8181
+tar xzf starling-serve-linux-cpu.tar.gz
+sha256sum -c starling-serve-linux-cpu.sha256
+./starling-serve-linux-cpu --model parakeet --gguf /path/to/model.gguf --port 8181
 ```
 
-The launcher downloads the prebuilt binary for your platform on first run and
-verifies its checksum; see [packaging](docs/packaging.md) for backend
-selection and overrides.
+Each archive's `RUNTIME.md` lists the drivers and runtime libraries that build
+needs; see [packaging](docs/packaging.md) for the full artifact list.
 
 To build from source instead, you need CMake, a C++17 compiler, Git, and Bash.
 Initialize the submodule, build, and supply a compatible GGUF model from the
@@ -93,9 +97,7 @@ against destructive processing; they cannot guarantee ASR accuracy.
 | Desktop app (Rust, gpui) | [`apps/desktop-gpui/`](apps/desktop-gpui/) |
 | Android app and voice keyboard | [`apps/mobile/`](apps/mobile/) |
 | iOS app | [`apps/ios/`](apps/ios/) |
-| Shared TypeScript client and fidelity rules | [`packages/dictation/`](packages/dictation/) |
-| `starling-serve` npm launcher for prebuilt binaries | [`packages/serve/`](packages/serve/) |
-| Language-independent API contract | [`packages/contracts/`](packages/contracts/) |
+| Language-independent API contract and shared test fixtures | [`packages/contracts/`](packages/contracts/) |
 | Deprecated Python/CUDA serving | [`backends/python/`](backends/python/) · reference source in `src/starling/` |
 
 The NVIDIA-only Python serving path is deprecated. Its kernels, benchmarks,
@@ -105,9 +107,8 @@ serving work targets the native engine and the portable HTTP contract.
 ## Documentation
 
 [Architecture and platform status](docs/monorepo.md) · [API](docs/api.md) ·
-[TypeScript development](docs/typescript.md) ·
 [Models](docs/models.md) · [Native serving](docs/native-serving.md) ·
-[Packaging and the npm launcher](docs/packaging.md) ·
+[Packaging and release archives](docs/packaging.md) ·
 [Quantization tools](quants/README.md) · [Quantization research](docs/quantization.md) ·
 [Benchmarks](docs/benchmarks.md) · [Engine development](docs/ggml-engine.md) ·
 [Fast Vulkan engines](docs/fast-engine.md) ·

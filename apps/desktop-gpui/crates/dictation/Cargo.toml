@@ -5,7 +5,7 @@ edition = "2021"
 rust-version = "1.85"
 license = "MIT"
 repository = "https://github.com/sims1253/starling"
-description = "Rust port of @starling/dictation: audio prep, transcription client, session storage, fidelity analysis, capture and playback"
+description = "Starling desktop dictation core: audio prep, transcription client, session storage, fidelity analysis, capture and playback"
 
 [dependencies]
 # `Bytes::from_owner` wraps the caller's shared recording buffer without
