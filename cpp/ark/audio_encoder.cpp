@@ -79,34 +79,33 @@ ggml_tensor* apply_enc_rope(ggml_context* c, ggml_tensor* x, ggml_tensor* cos_t,
     // axis. element (p,i,h,t) = x[p + 2*i + head_dim*h + head_dim*H*t].
     const int half = rope_dim / 2;
     x = ggml_reshape_3d(c, x, head_dim, n_heads, T);  // [head_dim, H, T]
-    // HF ARK RoPE is INTERLEAVED (GPT-J style): pairs (x[2i], x[2i+1]) = (a,b),
-    // out_a = a*cos - b*sin, out_b = b*cos + a*sin. Take the even (a) and odd (b)
-    // elements of the rope_dim slice via two strided 4D views (stride 2 in dim 0).
     ggml_tensor* xf = f32(c, x);  // [head_dim, H, T], memory (d,h,t) at d + D*h + D*H*t
-    // Pick the even (a) and odd (b) elements of each head's rope_dim slice. A
-    // head's D dims are contiguous (d=0..D-1 at D*h + d); pair i is at d=2i.
-    // NOTE: for large T_enc the odd view's offset can trip ggml's strict view
-    // bounds check; short/medium-length audio works, very-long currently aborts
-    // (see docs/ggml-ark-port-status.md).
-    ggml_tensor* a = ggml_view_4d(c, xf, 1, half, n_heads, T,
-                                  2 * xf->nb[0], xf->nb[1], xf->nb[2], 0);          // x[2i]
-    ggml_tensor* b = ggml_view_4d(c, xf, 1, half, n_heads, T,
-                                  2 * xf->nb[0], xf->nb[1], xf->nb[2], xf->nb[0]);  // x[2i+1]
-    // cos/sin tables are stored BF16; cast to f32. View the first T rows then
-    // reshape to [1, half, 1, T] (broadcast over the pair axis and heads).
+    // De-interleave the rope_dim slice ONCE: view it as [2, half, H, T] (the
+    // pair innermost), transpose to [half, 2, H, T] and make that contiguous,
+    // so the even (a) and odd (b) elements become [half, H, T] views with
+    // contiguous rows. (Strided [1, half, H, T] views of xf made every
+    // elementwise op below walk one-element rows, ~10% of the CPU encoder.)
+    // The f32 mul/sub/add per element are unchanged, so the result is too.
+    ggml_tensor* pairs = ggml_view_4d(c, xf, 2, half, n_heads, T,
+                                      2 * xf->nb[0], xf->nb[1], xf->nb[2], 0);  // [2,half,H,T]
+    ggml_tensor* split = ggml_cont(c, ggml_permute(c, pairs, 1, 0, 2, 3));      // [half,2,H,T]
+    ggml_tensor* a = ggml_view_3d(c, split, half, n_heads, T,
+                                  split->nb[2], split->nb[3], 0);               // x[2i]
+    ggml_tensor* b = ggml_view_3d(c, split, half, n_heads, T,
+                                  split->nb[2], split->nb[3], split->nb[1]);    // x[2i+1]
+    // cos/sin tables (f32): view the first T rows, reshape to [half, 1, T]
+    // (broadcast over heads).
     ggml_tensor* cos_row = ggml_view_2d(c, cos_t, half, T, cos_t->nb[1], 0);
     ggml_tensor* sin_row = ggml_view_2d(c, sin_t, half, T, sin_t->nb[1], 0);
-    ggml_tensor* cos4 = ggml_reshape_4d(c, f32(c, cos_row), 1, half, 1, T);  // [1,half,1,T]
-    ggml_tensor* sin4 = ggml_reshape_4d(c, f32(c, sin_row), 1, half, 1, T);
-    ggml_tensor* oa = ggml_sub(c, ggml_mul(c, a, cos4), ggml_mul(c, b, sin4));  // [1,half,H,T]
-    ggml_tensor* ob = ggml_add(c, ggml_mul(c, b, cos4), ggml_mul(c, a, sin4));
+    ggml_tensor* cos3 = ggml_reshape_3d(c, f32(c, cos_row), half, 1, T);  // [half,1,T]
+    ggml_tensor* sin3 = ggml_reshape_3d(c, f32(c, sin_row), half, 1, T);
+    ggml_tensor* oa = ggml_sub(c, ggml_mul(c, a, cos3), ggml_mul(c, b, sin3));  // [half,H,T]
+    ggml_tensor* ob = ggml_add(c, ggml_mul(c, b, cos3), ggml_mul(c, a, sin3));
     // Re-interleave out[2i]=oa[i], out[2i+1]=ob[i]: stack oa,ob as [half,2,H,T]
     // (pair in dim 1), transpose dims 0<->1 -> [2,half,H,T], contiguous-reshape to
     // [rope_dim,H,T] (ne0=2 innermost => the flattened memory is interleaved).
-    ggml_tensor* oa3 = ggml_reshape_3d(c, oa, half, n_heads, T);
-    ggml_tensor* ob3 = ggml_reshape_3d(c, ob, half, n_heads, T);
-    ggml_tensor* s1 = ggml_reshape_4d(c, oa3, half, 1, n_heads, T);  // [half,1,H,T]
-    ggml_tensor* s2 = ggml_reshape_4d(c, ob3, half, 1, n_heads, T);
+    ggml_tensor* s1 = ggml_reshape_4d(c, oa, half, 1, n_heads, T);  // [half,1,H,T]
+    ggml_tensor* s2 = ggml_reshape_4d(c, ob, half, 1, n_heads, T);
     ggml_tensor* cat2 = ggml_concat(c, s1, s2, 1);                          // [half,2,H,T]
     ggml_tensor* inter = ggml_cont(c, ggml_permute(c, cat2, 1, 0, 2, 3));   // [2,half,H,T]
     ggml_tensor* rope_out = ggml_reshape_3d(c, inter, rope_dim, n_heads, T); // [rope_dim,H,T] interleaved
