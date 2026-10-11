@@ -1,7 +1,6 @@
 """GPU-gated parity tests for the Voxtral ggml engine vs the golden reference.
 
-Mirrors tests/test_audex_pipeline.py: module-level CUDA/golden skips, then
-compares engine transcripts vs golden/voxtral_reference.json (captured by
+Module-level CUDA/golden skips, then compares engine transcripts vs golden/voxtral_reference.json (captured by
 scripts/make_voxtral_golden.py) on the short/medium/long fixtures.
 
 Collects and skips cleanly on boxes without CUDA, the model, or goldens

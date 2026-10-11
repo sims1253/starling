@@ -705,84 +705,6 @@
       ]
     },
     {
-      "id": "higgs.intree.text",
-      "model": "bosonai/higgs-audio-v3-stt",
-      "engine": "starling-ggml-higgs",
-      "required": false,
-      "contract": {
-        "class": "exact_text_equality",
-        "fixtures": [
-          "short",
-          "medium",
-          "long"
-        ]
-      },
-      "tests": [
-        "tests/test_ggml_parity.py::test_starling_ggml_higgs_text_parity"
-      ],
-      "backends": {
-        "cuda": "validated",
-        "cpu": "unvalidated"
-      },
-      "policies": {
-        "normalization": "trailing-whitespace rstrip on both sides; interior bytes compared verbatim",
-        "tie_break": "greedy argmax, first-index ties",
-        "stop": "model EOS",
-        "truncation": "entire transcript compared (a matching prefix is a failure)",
-        "suppression": "none beyond the reference's own extraction"
-      },
-      "reference": {
-        "capture": "scripts/capture_golden_ref.py -> golden/higgs_golden.json (eager reference)",
-        "pin_status": "UNPINNED \u2014 gitignored golden absent on the authoring machine; status carried from the recorded historical validation of this gate"
-      },
-      "gguf": {
-        "env": "STARLING_GGML_HIGGS_MODEL",
-        "default_path": "models/higgs-audio-v3-bf16-exact.gguf"
-      },
-      "goldens": [
-        "higgs_golden.json"
-      ]
-    },
-    {
-      "id": "hojo.intree.text",
-      "model": "HojoAI/Hojo-ASR-V1",
-      "engine": "starling-ggml-hojo",
-      "required": false,
-      "contract": {
-        "class": "exact_text_equality",
-        "fixtures": [
-          "short",
-          "medium",
-          "long"
-        ]
-      },
-      "tests": [
-        "tests/test_ggml_parity.py::test_starling_ggml_hojo_text_parity"
-      ],
-      "backends": {
-        "cuda": "validated",
-        "cpu": "unvalidated"
-      },
-      "policies": {
-        "normalization": "trailing-whitespace rstrip on both sides; interior bytes compared verbatim",
-        "tie_break": "beam-4 decode (reference-matched ranking)",
-        "stop": "model EOS",
-        "truncation": "entire transcript compared (a matching prefix is a failure)",
-        "suppression": "none beyond the reference's own extraction"
-      },
-      "reference": {
-        "capture": "scripts/hojo_golden_components.py -> golden/hojo_reference.json (eager reference)",
-        "pin_status": "UNPINNED \u2014 gitignored golden absent on the authoring machine; status carried from the recorded historical validation of this gate"
-      },
-      "gguf": {
-        "env": "STARLING_GGML_HOJO_MODEL",
-        "default_path": "models/hojo-asr-v1.gguf"
-      },
-      "goldens": [
-        "hojo_reference.json"
-      ]
-    },
-    {
       "id": "granite.intree.text",
       "model": "ibm-granite/granite-speech-4.1-2b",
       "engine": "starling-ggml-granite",
@@ -858,45 +780,6 @@
       },
       "goldens": [
         "qwen3_reference.json"
-      ]
-    },
-    {
-      "id": "audex.intree.text",
-      "model": "nvidia/nemotron-labs-audex-2b",
-      "engine": "starling-ggml-audex",
-      "required": false,
-      "contract": {
-        "class": "exact_text_equality",
-        "fixtures": [
-          "short",
-          "medium",
-          "long"
-        ]
-      },
-      "tests": [
-        "tests/test_ggml_parity.py::test_starling_ggml_audex_text_parity"
-      ],
-      "backends": {
-        "cuda": "validated",
-        "cpu": "unvalidated"
-      },
-      "policies": {
-        "normalization": "trailing-whitespace rstrip on both sides; interior bytes compared verbatim",
-        "tie_break": "greedy argmax with bf16-rounded low-tie first-index policy (argmax_low_ties)",
-        "stop": "model EOS",
-        "truncation": "entire transcript compared (a matching prefix is a failure)",
-        "suppression": "fixed 3000-frame clips (one 750-token clip per 30 s chunk, tail zero-padded), per-chunk budget min(200, ceil(dur*5)+32), whitespace-collapsed join, first-to-last single-quote span extraction \u2014 mirrors the Python server policy"
-      },
-      "reference": {
-        "capture": "scripts/make_audex_golden.py + scripts/audex_golden_components.py -> golden/audex_reference.json (stock-numerics Python path)",
-        "pin_status": "UNPINNED \u2014 gitignored golden absent on the authoring machine; status carried from the recorded historical validation of this gate"
-      },
-      "gguf": {
-        "env": "STARLING_GGML_AUDEX_MODEL",
-        "default_path": "models/audex-2b-bf16-exact.gguf"
-      },
-      "goldens": [
-        "audex_reference.json"
       ]
     },
     {

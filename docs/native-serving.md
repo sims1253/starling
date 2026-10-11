@@ -84,7 +84,7 @@ flag runs a warmup at startup; omit the square brackets when using it.
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--model <slug>` | (required) | Model slug: parakeet, moss, ark, ark06, higgs, hojo, granite, qwen3, qwen3_06, s1, audex, voxtral |
+| `--model <slug>` | (required) | Model slug: parakeet, moss, ark, ark06, granite, qwen3, qwen3_06, s1, voxtral |
 | `--gguf <path>` | (required) | Path to the GGUF model file |
 | `--host <addr>` | `127.0.0.1` | Bind address |
 | `--port <n>` | `8181` | Bind port (`0` = any free port; see [port announcement](#port-announcement-and-parent-watchdog)) |
@@ -153,9 +153,9 @@ for these differences:
   resamples non-16 kHz WAVs via scipy instead of rejecting them. HTTP uploads
   require WAV on both servers. Both WebSocket endpoints accept PCM16
   and WAV.
-- **Models**: both serve `parakeet`, `moss`, `ark`, `higgs`, `granite`, `qwen3`,
-  `qwen3_06`, and `audex`. Native serving also supports `hojo` and `s1`; Python
-  serving also supports `parakeet_unified` and `cohere`. Native `s1` exposes the
+- **Models**: both serve `parakeet`, `moss`, `ark`, `ark06`, `granite`, `qwen3`,
+  `qwen3_06`, and `voxtral`. Native serving also supports `s1`; Python
+  serving also supports `parakeet_unified`. Native `s1` exposes the
   additional `POST /normalize` text endpoint.
 - **Request ids**: `X-Request-Id` values starting with `#` are rejected
   with `400`: the prefix is reserved for the server's internal queue
@@ -614,13 +614,10 @@ and input; the filename alone does not guarantee it. See the
 | ark | `scripts/convert_ark_gguf.py` |
 | ark06 | `scripts/convert_ark06_gguf.py` |
 | voxtral | `scripts/convert_voxtral_gguf.py` |
-| higgs | `scripts/convert_higgs_gguf.py` |
-| hojo | `scripts/convert_hojo_gguf.py` |
 | granite | `scripts/convert_granite_gguf.py` |
 | qwen3 | `scripts/convert_qwen3_gguf.py` |
 | qwen3_06 | `scripts/convert_qwen3_06_gguf.py` |
 | s1 | `scripts/convert_s1_gguf.py` |
-| audex | `scripts/convert_audex_gguf.py` |
 
 ## Release artifacts
 

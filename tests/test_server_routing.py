@@ -29,10 +29,7 @@ from starling.server import (  # noqa: E402
     MODEL_SLUGS,
     Ark06Backend,
     ArkBackend,
-    AudexBackend,
-    CohereBackend,
     GraniteBackend,
-    HiggsBackend,
     MossBackend,
     ModelBackend,
     ParakeetBackend,
@@ -51,7 +48,7 @@ from starling.server import (  # noqa: E402
 def test_model_slugs_are_the_supported_set() -> None:
     assert set(MODEL_SLUGS) == {
         "granite", "parakeet", "parakeet_unified", "moss", "qwen3", "qwen3_06",
-        "ark", "ark06", "cohere", "higgs", "audex", "voxtral",
+        "ark", "ark06", "voxtral",
     }
 
 
@@ -65,9 +62,6 @@ def test_get_backend_resolves_each_slug_to_the_right_class() -> None:
     assert isinstance(get_backend("qwen3_06", cfg), Qwen06Backend)
     assert isinstance(get_backend("ark", cfg), ArkBackend)
     assert isinstance(get_backend("ark06", cfg), Ark06Backend)
-    assert isinstance(get_backend("cohere", cfg), CohereBackend)
-    assert isinstance(get_backend("higgs", cfg), HiggsBackend)
-    assert isinstance(get_backend("audex", cfg), AudexBackend)
     assert isinstance(get_backend("voxtral", cfg), VoxtralBackend)
 
 
@@ -165,7 +159,7 @@ def test_create_app_reuses_existing_server_without_startup_load() -> None:
     assert "/" not in routes
 
 
-@pytest.mark.parametrize("backend_cls", [MossBackend, Qwen3Backend, ArkBackend, Ark06Backend, HiggsBackend])
+@pytest.mark.parametrize("backend_cls", [MossBackend, Qwen3Backend, ArkBackend, Ark06Backend])
 def test_single_shot_llm_backends_chunk_long_audio(backend_cls) -> None:
     backend = backend_cls(ServerConfig(max_chunk_seconds=1.0, max_new_tokens=200))
     calls: list[tuple[int, int]] = []

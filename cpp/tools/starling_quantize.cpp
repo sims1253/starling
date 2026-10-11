@@ -5,7 +5,7 @@
 // importance matrix collected on real audio (STARLING_IMATRIX via the engine,
 // see cpp/runtime/imatrix.hpp). Model-agnostic: tensors are classified by
 // name/shape rules, so the same tool covers parakeet today and the larger
-// engines (audex, moss, qwen3-asr, ...) after their loaders allowlist the
+// engines (moss, qwen3-asr, ...) after their loaders allowlist the
 // quantized dtypes.
 //
 // Usage:
@@ -528,7 +528,7 @@ int main(int argc, char** argv) {
     }
 
     // Stamp only now that the loop has actually quantized something: the
-    // source's numeric profile no longer describes this file, and audex (and
+    // source's numeric profile no longer describes this file, and s1 (and
     // the engines following it) gate loads on the profile string. A degenerate
     // all-kept run is numerically identical to the source, so it keeps the
     // inherited profile instead of being mislabeled.

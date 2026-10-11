@@ -23,11 +23,8 @@ every backend or input.
 | `moss-transcribe-preview-2b-bf16-exact.gguf` | OpenMOSS-Team/MOSS-Transcribe-preview-2B | bf16-exact | ~4.5 GB |
 | `ark-asr-3b-bf16-exact.gguf` | AutoArk-AI/ARK-ASR-3B | bf16-exact | ~7.0 GB |
 | `ark-asr-3b-q8_0.gguf` | AutoArk-AI/ARK-ASR-3B | q8_0 | ~4.3 GB |
-| `higgs-audio-v3-bf16-exact.gguf` | bosonai/higgs-audio-v3-stt | bf16-exact | ~5.0 GB |
-| `hojo-asr-v1-bf16-exact.gguf` | HojoAI/Hojo-ASR-V1 | bf16-exact | ~11.2 GB |
 | `granite-speech-4.1-2b-bf16-exact.gguf` | ibm-granite/granite-speech-4.1-2b | bf16-exact | ~4.8 GB |
 | `qwen3-asr-1.7b-bf16-exact.gguf` | Qwen/Qwen3-ASR-1.7B-hf | bf16-exact | ~4.1 GB |
-| `audex-2b-bf16-exact.gguf` | nvidia/Nemotron-Labs-Audex-2B | bf16-exact | ~5.8 GB |
 
 ## Parakeet quantization results
 
@@ -73,11 +70,9 @@ unsupported values:
 | Model | Accepted `starling.numeric_profile` values |
 | --- | --- |
 | MOSS | `bf16_exact`, `f16`, `quantized` |
-| ARK, Higgs | `bf16_exact`, `f16` |
-| Hojo | `mixed_f32_bf16_exact`, `bf16_exact`, `f16` |
+| ARK | `bf16_exact`, `f16` |
 | Granite, Qwen3 | `bf16_exact`, `quantized` |
 | S1 | `bf16_exact` |
-| Audex | `bf16_exact`, `quantized` |
 
 For these loaders, `starling.format_version` must be `1` when present.
 These checks establish format compatibility, not transcript accuracy or

@@ -3,7 +3,7 @@
 // Thin adapter over the shared frontend (lib/whisper_mel.hpp); moss's policy:
 // fullT-1 valid frames, NO n_samples truncation (the windowing stage owns
 // truncation), global max over ALL computed frames (flat split), f32
-// arithmetic, bf16 + f32 output. n_fft=640 (vs 400 for ark/higgs/hojo) comes
+// arithmetic, bf16 + f32 output. n_fft=640 (vs 400 for ark) comes
 // from config like every other constant.
 #include "mel.hpp"
 #include "lib/whisper_mel.hpp"
@@ -13,10 +13,6 @@ namespace {
 const lib::EngineMelPolicy kMelPolicy = {
     lib::MelPolicy::T_FULLT_MINUS_1,
     /*cap_n_samples=*/false,
-    /*cap_before_checks=*/false,
-    lib::MelPolicy::MAX_ALL_FRAMES,
-    /*norm_in_double=*/false,
-    /*emit_bf16=*/true,
     "STARLING_MEL_DUMP",
     "MOSS",
 };

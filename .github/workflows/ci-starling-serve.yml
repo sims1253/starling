@@ -115,9 +115,8 @@ jobs:
         run: |
           cmake -B build -DSTARLING_SERVE=ON -DBUILD_SHARED_LIBS=OFF -DGGML_NATIVE=OFF -DGGML_LLAMAFILE=OFF
           cmake --build build -j --target starling-serve stream_session_test \
-            audio_parser_test loader_guard_test higgs_dtype_guard_test \
-            loader_kit_shape_test \
-            audex_loader_guard_test granite_stage_test granite_ctc_argmax_test \
+            audio_parser_test loader_kit_shape_test \
+            granite_stage_test granite_ctc_argmax_test \
             granite_ctc_proposer_test granite_ctc_entry_test model_lifetime_test \
             starling-quantize \
             parakeet_compact_engine_test parakeet_word_frames_test s1_quant_loader_test \
@@ -158,17 +157,12 @@ jobs:
             "./build/$t"
           done
 
-      # loader_guard_test SKIPs cleanly when the gitignored GGUFs are absent;
-      # higgs_dtype_guard_test, loader_kit_shape_test, audex_loader_guard_test
-      # and granite_stage_test synthesize their own GGUFs and always run
-      # (audex's real-file smoke SKIPs when absent).
+      # loader_kit_shape_test, s1_quant_loader_test and granite_stage_test
+      # synthesize their own GGUFs and always run.
       - name: C++ loader/dtype guard tests
         run: |
-          ./build/loader_guard_test
           ./build/s1_quant_loader_test
-          ./build/higgs_dtype_guard_test
           ./build/loader_kit_shape_test
-          ./build/audex_loader_guard_test
           ./build/granite_stage_test
           ./build/granite_ctc_argmax_test
           ./build/model_lifetime_test
@@ -190,7 +184,7 @@ jobs:
       # (CPU torch wheel; numpy/gguf come with the quantizer step above), so
       # the encoder/engine tests run their full replay/oracle paths.
       # voxtral_loader_guard_test SKIPs cleanly without the gitignored
-      # real-model GGUF, like loader_guard_test above.
+      # real-model GGUF.
       - name: Voxtral engine tests (tiny GGUF generated in-workflow)
         run: |
           # The runner's system pip (< 25.2) crashes with an AssertionError in

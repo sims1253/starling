@@ -68,9 +68,8 @@ uv run --extra bench python benchmarks/bench_kernels.py
 
 `src/starling/server.py` is a long-lived local HTTP/WebSocket sidecar that keeps
 one model resident in VRAM. One process runs one model at a time (`--model
-granite|parakeet|parakeet_unified|moss|qwen3|qwen3_06|ark|ark06|cohere|higgs|audex|voxtral`, default
-`granite`); `/health` reports which is loaded. Higgs must be run from the
-isolated `.venv-higgs` environment documented in [Higgs environment notes](../src/starling/higgs/UV_NOTES.md).
+granite|parakeet|parakeet_unified|moss|qwen3|qwen3_06|ark|ark06|voxtral`, default
+`granite`); `/health` reports which is loaded.
 
 ```bash
 uv run --extra server starling-python-serve --model granite --port 8181 --max-chunk-seconds 30

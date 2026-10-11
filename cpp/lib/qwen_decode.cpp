@@ -104,27 +104,10 @@ ggml_tensor* apply_logits_scaling(ggml_context* c, const QwenDecodeSpec& s,
     return ggml_scale(c, logits, 1.0f / s.logits_scaling);
 }
 
-// Spec-selected RMSNorm discipline: Nemotron's F.rms_norm (normalize AND
-// affine in f32, one bf16 round) vs the historical two-round Llama style.
-ggml_tensor* spec_rms(ggml_context* c, const QwenDecodeSpec& s,
-                      const ModelLoader& ml, ggml_tensor* x,
-                      const std::string& n, float eps) {
-    return s.rms_norm_single_round ? rms_single(c, ml, x, n, eps)
-                                   : rms(c, ml, x, n, eps);
-}
-
-// Spec-selected MLP over the normalized input (p = "llm.blk.<i>."): the
-// stock silu-gated gate/up/down trunk, or Nemotron's squared-ReLU up/down.
-ggml_tensor* spec_mlp(ggml_context* c, const QwenDecodeSpec& s,
-                      const ModelLoader& ml, ggml_tensor* n,
+// The silu-gated gate/up/down MLP over the normalized input
+// (p = "llm.blk.<i>.").
+ggml_tensor* spec_mlp(ggml_context* c, const ModelLoader& ml, ggml_tensor* n,
                       const std::string& p) {
-    if (s.mlp_activation == QwenMlpAct::kRelu2Plain) {
-        // down(bf16(relu(up)^2)): relu is exact, one bf16 round after the
-        // square — F.relu(x).pow(2) under the bf16 oracle.
-        ggml_tensor* u = lin(c, ml, n, p + "ffn.up.weight");
-        ggml_tensor* r = ggml_relu(c, f32(c, u));
-        return lin(c, ml, bf16(c, ggml_mul(c, r, r)), p + "ffn.down.weight");
-    }
     ggml_tensor* g = lin(c, ml, n, p + "ffn.gate.weight");
     ggml_tensor* u = lin(c, ml, n, p + "ffn.up.weight");
     ggml_tensor* si = bf16(c, ggml_silu(c, f32(c, g)));
@@ -231,11 +214,6 @@ ggml_tensor* residual_add_f(ggml_context* c, const QwenDecodeSpec& s,
 
 ggml_tensor* spec_mlp_f(ggml_context* c, const QwenDecodeCtx& m,
                         ggml_tensor* n, const std::string& p) {
-    if (m.spec.mlp_activation == QwenMlpAct::kRelu2Plain) {
-        ggml_tensor* u = linf(c, m.loader, n, p + "ffn.up.weight");
-        ggml_tensor* r = ggml_relu(c, u);
-        return linf(c, m.loader, ggml_mul(c, r, r), p + "ffn.down.weight");
-    }
     ggml_tensor* g = linf(c, m.loader, n, p + "ffn.gate.weight");
     ggml_tensor* u = linf(c, m.loader, n, p + "ffn.up.weight");
     ggml_tensor* si = ggml_silu(c, g);
@@ -335,7 +313,7 @@ bool layer_legacy(const QwenDecodeCtx& m, int li, const std::vector<ggml_bf16_t>
 
         const std::string p = "llm.blk." + std::to_string(li) + ".";
 
-        ggml_tensor* n = spec_rms(c, m.spec, m.loader, x, p + "attn_norm.weight", lc.rms_norm_eps);
+        ggml_tensor* n = rms(c, m.loader, x, p + "attn_norm.weight", lc.rms_norm_eps);
         if (st0 && stage.is("n")) return ff(c, n);
 
         ggml_tensor* q = lin(c, m.loader, n, p + "attn.q.weight");
@@ -346,8 +324,8 @@ bool layer_legacy(const QwenDecodeCtx& m, int li, const std::vector<ggml_bf16_t>
         v = ggml_reshape_3d(c, v, D, KV, S);
 
         if (!m.spec.qkv_bias && m.spec.qk_norm) {
-            q = spec_rms(c, m.spec, m.loader, q, p + "attn.q_norm.weight", lc.rms_norm_eps);
-            k = spec_rms(c, m.spec, m.loader, k, p + "attn.k_norm.weight", lc.rms_norm_eps);
+            q = rms(c, m.loader, q, p + "attn.q_norm.weight", lc.rms_norm_eps);
+            k = rms(c, m.loader, k, p + "attn.k_norm.weight", lc.rms_norm_eps);
         }
         if (st0 && stage.is("qn")) return ff(c, q);
         if (st0 && stage.is("kn")) return ff(c, k);
@@ -428,9 +406,9 @@ bool layer_legacy(const QwenDecodeCtx& m, int li, const std::vector<ggml_bf16_t>
         r = x;
         if (st0 && stage.is("xmid")) return ff(c, x);
 
-        n = spec_rms(c, m.spec, m.loader, x, p + "ffn_norm.weight", lc.rms_norm_eps);
+        n = rms(c, m.loader, x, p + "ffn_norm.weight", lc.rms_norm_eps);
         n = apply_ada(c, m.spec, m.loader, n, p, S);  // voxtral only; identity otherwise
-        ggml_tensor* dn = spec_mlp(c, m.spec, m.loader, n, p);
+        ggml_tensor* dn = spec_mlp(c, m.loader, n, p);
         if (st0 && stage.is("down")) return ff(c, dn);
         x = residual_add(c, m.spec, r, dn);
 
@@ -509,7 +487,7 @@ bool forward_legacy(const QwenDecodeCtx& m, const std::vector<float>& input, int
         int64_t ne[2] = {m.dims.hidden, 1};
         ggml_tensor* t = graph_input_tensor(c, GGML_TYPE_BF16, 2, ne,
                                             last.data(), last.size() * sizeof(last[0]));
-        t = spec_rms(c, m.spec, m.loader, t, "llm.final_norm.weight", m.dims.rms_norm_eps);
+        t = rms(c, m.loader, t, "llm.final_norm.weight", m.dims.rms_norm_eps);
         ggml_tensor* lg = lm_head_gemm(c, m.loader, m.spec, t);
         return ff(c, apply_logits_scaling(c, m.spec, lg));
     }, logits);
@@ -641,7 +619,7 @@ ggml_tensor* append_layer_new(ggml_context* c, const QwenDecodeCtx& m, int li,
     const bool F = use_f32_acts(m) && kv_mode != 1;
 
     ggml_tensor* n = F ? rmsf(c, m.loader, x_in, p + "attn_norm.weight", lc.rms_norm_eps)
-                       : spec_rms(c, m.spec, m.loader, x_in, p + "attn_norm.weight", lc.rms_norm_eps);
+                       : rms(c, m.loader, x_in, p + "attn_norm.weight", lc.rms_norm_eps);
     // Projection family per spec (see QwenDecodeSpec): Qwen2.5 takes biased
     // q/k/v by BASE name and has no q_norm/k_norm; Qwen3 takes bias-free full
     // names plus per-head q_norm/k_norm after the reshape.
@@ -673,8 +651,8 @@ ggml_tensor* append_layer_new(ggml_context* c, const QwenDecodeCtx& m, int li,
             q = rmsf(c, m.loader, q, p + "attn.q_norm.weight", lc.rms_norm_eps);
             k = rmsf(c, m.loader, k, p + "attn.k_norm.weight", lc.rms_norm_eps);
         } else {
-            q = spec_rms(c, m.spec, m.loader, q, p + "attn.q_norm.weight", lc.rms_norm_eps);
-            k = spec_rms(c, m.spec, m.loader, k, p + "attn.k_norm.weight", lc.rms_norm_eps);
+            q = rms(c, m.loader, q, p + "attn.q_norm.weight", lc.rms_norm_eps);
+            k = rms(c, m.loader, k, p + "attn.k_norm.weight", lc.rms_norm_eps);
         }
     }
     // RoPE (rotate-half, f32 math). cs/sn are the SAME bf16 values as the
@@ -835,9 +813,9 @@ ggml_tensor* append_layer_new(ggml_context* c, const QwenDecodeCtx& m, int li,
                        : residual_add(c, m.spec, r, a);
     r = x;
     n = F ? rmsf(c, m.loader, x, p + "ffn_norm.weight", lc.rms_norm_eps)
-          : spec_rms(c, m.spec, m.loader, x, p + "ffn_norm.weight", lc.rms_norm_eps);
+          : rms(c, m.loader, x, p + "ffn_norm.weight", lc.rms_norm_eps);
     n = apply_ada(c, m.spec, m.loader, n, p, S);  // voxtral only; identity otherwise
-    ggml_tensor* dn = F ? spec_mlp_f(c, m, n, p) : spec_mlp(c, m.spec, m.loader, n, p);
+    ggml_tensor* dn = F ? spec_mlp_f(c, m, n, p) : spec_mlp(c, m.loader, n, p);
     x = F ? residual_add_f(c, m.spec, r, dn) : residual_add(c, m.spec, r, dn);
     return x;  // [hidden, S] bf16 (F32 in F mode)
 }
@@ -903,7 +881,7 @@ PrefillReplayEntry* get_or_build_prefill(const QwenDecodeCtx& m, int64_t S,
                     ggml_tensor* last = ggml_view_2d(c, x, lc.hidden, 1, x->nb[1],
                                                      (size_t)(S - 1) * x->nb[1]);
                     ggml_tensor* n = PF ? rmsf(c, m.loader, last, "llm.final_norm.weight", lc.rms_norm_eps)
-                                        : spec_rms(c, m.spec, m.loader, last, "llm.final_norm.weight", lc.rms_norm_eps);
+                                        : rms(c, m.loader, last, "llm.final_norm.weight", lc.rms_norm_eps);
                     ggml_tensor* lg = lm_head_gemm(c, m.loader, m.spec, n);
                     return ff(c, apply_logits_scaling(c, m.spec, lg));
                 });
@@ -947,7 +925,7 @@ bool forward_prefill(const QwenDecodeCtx& m, const std::vector<float>& input,
                                      cs, sn, mt, /*kv_mode=*/0, nullptr, pos_t);
             ggml_tensor* last = ggml_view_2d(c, x, lc.hidden, 1, x->nb[1],
                                              (size_t)(S - 1) * x->nb[1]);
-            ggml_tensor* n = spec_rms(c, m.spec, m.loader, last, "llm.final_norm.weight", lc.rms_norm_eps);
+            ggml_tensor* n = rms(c, m.loader, last, "llm.final_norm.weight", lc.rms_norm_eps);
             ggml_tensor* lg = lm_head_gemm(c, m.loader, m.spec, n);
             return ff(c, apply_logits_scaling(c, m.spec, lg));
         }, logits);
@@ -1031,7 +1009,7 @@ bool forward_decode(const QwenDecodeCtx& m, int32_t prev_token, int64_t past,
             x = append_layer_new(c, m, li, x, S, past, dc->k[li], dc->v[li],
                                  cs, sn, mt, kv_mode, idx_t, nullptr);
         ggml_tensor* n = DF ? rmsf(c, m.loader, x, "llm.final_norm.weight", lc.rms_norm_eps)
-                            : spec_rms(c, m.spec, m.loader, x, "llm.final_norm.weight", lc.rms_norm_eps);
+                            : rms(c, m.loader, x, "llm.final_norm.weight", lc.rms_norm_eps);
         ggml_tensor* lg = lm_head_gemm(c, m.loader, m.spec, n);
         return ff(c, apply_logits_scaling(c, m.spec, lg));
     }, logits);
@@ -1095,7 +1073,7 @@ bool forward_verify(const QwenDecodeCtx& m, const std::vector<int32_t>& tokens,
                                  cs, sn, mt, exact_width ? 3 : 2,
                                  exact_width ? nullptr : pos, nullptr);
         ggml_tensor* n = F ? rmsf(c, m.loader, x, "llm.final_norm.weight", lc.rms_norm_eps)
-                           : spec_rms(c, m.spec, m.loader, x, "llm.final_norm.weight", lc.rms_norm_eps);
+                           : rms(c, m.loader, x, "llm.final_norm.weight", lc.rms_norm_eps);
         ggml_tensor* lg = lm_head_gemm(c, m.loader, m.spec, n);
         return ff(c, apply_logits_scaling(c, m.spec, lg));
     }, logits);
@@ -1334,7 +1312,7 @@ KStepGraph* get_or_build_kstep(const QwenDecodeCtx& m, int K, int64_t W, std::st
                                          ckw[(size_t)li], cvw[(size_t)li], cs, sn, mask_t[(size_t)j],
                                          /*kv_mode=*/2, pos_t[(size_t)j], nullptr);
                 ggml_tensor* n = KF ? rmsf(c, m.loader, x, "llm.final_norm.weight", lc.rms_norm_eps)
-                                     : spec_rms(c, m.spec, m.loader, x, "llm.final_norm.weight", lc.rms_norm_eps);
+                                     : rms(c, m.loader, x, "llm.final_norm.weight", lc.rms_norm_eps);
                 // Argmax is invariant under the positive logits_scaling, so the
                 // K-step graph skips the division (no logits are read back).
                 ggml_tensor* logits = ggml_mul_mat(c, head_w, gemm_act(c, head_w, n));  // [vocab, 1]

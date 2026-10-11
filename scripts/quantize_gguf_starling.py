@@ -14,11 +14,11 @@ Any tensor that is neither kept by the patterns below nor a quantizable
 2-D weight aborts the run: extend keep_original() consciously per engine
 instead of silently quantizing something an engine reads elementwise.
 
-The keep patterns cover all nine engines' tensor names (dry-run verified),
+The keep patterns cover the engines' tensor names (dry-run verified),
 and the numeric_profile is honestly relabeled to the quant — which the
 LOADERS gate: only parakeet's loader accepts an arbitrary profile today,
 so quantized files currently LOAD on parakeet only. The other engines
-(granite/qwen3/audex/hojo/moss/ark/higgs/s1) validate
+(granite/qwen3/moss/ark/s1) validate
 starling.numeric_profile
 and refuse; relaxing those gates is a deliberate engine-side decision.
 Validated end-to-end on parakeet (0.0% fixture WER at q8_0/q5_0/q4_0).
@@ -43,19 +43,18 @@ from gguf.constants import GGML_QUANT_SIZES
 
 # Substrings covering every non-matmul tensor family across the engines'
 # GGUFs (checked against cpp/*/loader.cpp require-lists and the converters,
-# then dry-run over all nine engine GGUFs):
+# then dry-run over the engine GGUFs):
 # conv kernels (enc.conv1..3, conv_out, audio.conv2d1..3, conv_up/conv_depth/
 # conv_down, pointwise/depthwise, subsampling), norms (incl. the GPT-2-style
-# *_ln/ln_* LayerNorms of granite's Q-Former and hojo's ln_speech),
+# *_ln/ln_* LayerNorms of granite's Q-Former),
 # BatchNorm (bn_*, batch_norm), biases (incl. LSTM b_ih/b_hh), positional
 # tables (pos_embed, positional_embedding, pos_table, pos_bias_*), rope/sin/
 # cos/freq tables, mel filterbank/window, embedding/learned-constant tables
-# (get_rows sources, parakeet's host-read F32 embedding, granite's proj.query,
-# higgs' proj.temporal).
+# (get_rows sources, parakeet's host-read F32 embedding, granite's proj.query).
 _KEEP_SUBSTRINGS = (
     "conv", "norm", "ln_", "_ln", "bn_", "batch_norm", "bias", "pos", "rope",
     "sin", "cos", "arange", "freq", "mel", "fb", "window", "embed",
-    "query", "temporal",
+    "query",
 )
 
 

@@ -24,14 +24,6 @@ inline size_t mel_thread_count() {
     return static_cast<size_t>(hc);
 }
 
-// Thread count without the env override (e.g. hojo's host conv stack).
-inline size_t default_thread_count() {
-    unsigned hc = std::thread::hardware_concurrency();
-    if (hc == 0) hc = 1;
-    if (hc > 16) hc = 16;
-    return static_cast<size_t>(hc);
-}
-
 // Run body(tid, lo, hi) over a contiguous split of [0, total).
 template <typename Body>
 void parallel_for(size_t nthr, size_t total, Body&& body) {

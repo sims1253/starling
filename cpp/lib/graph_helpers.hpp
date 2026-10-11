@@ -1,8 +1,6 @@
-// graph_helpers.hpp — ggml graph-builder micro-helpers. Two numeric
-// disciplines share this header via explicit suffixes:
-//   *_bf16 — the bf16 oracle (moss/ark/higgs): activations live in bf16,
-//            elementwise math in f32, rounding at the bf16 boundary.
-//   *_f32  — the f32 discipline (hojo audio tower / conformer).
+// graph_helpers.hpp — ggml graph-builder micro-helpers for the bf16 oracle
+// (moss/ark/...): activations live in bf16, elementwise math in f32,
+// rounding at the bf16 boundary (the *_bf16 suffix).
 // The short names (bf/ff/addb/mulb/...) exist for the llm.cpp call sites;
 // all loader-coupled helpers take ModelLoader& so every engine can use them.
 #pragma once
@@ -63,13 +61,6 @@ inline ggml_tensor* linear_bf16(ggml_context* c, const ModelLoader& ml, ggml_ten
     if (bias) y = ggml_add(c, f32(c, y), f32(c, weight(c, ml, n + ".bias")));
     return bf16(c, y);
 }
-// f32 linear with optional bias (hojo audio discipline).
-inline ggml_tensor* linear_f32(ggml_context* c, const ModelLoader& ml, ggml_tensor* x,
-                               const std::string& n, bool bias) {
-    ggml_tensor* y = ggml_mul_mat(c, weight(c, ml, n + ".weight"), f32(c, x));
-    if (bias) y = ggml_add(c, f32(c, y), f32(c, weight(c, ml, n + ".bias")));
-    return f32(c, y);
-}
 
 // ---- elementwise (f32 math, bf16 result) --------------------------------- //
 inline ggml_tensor* addb(ggml_context* c, ggml_tensor* a, ggml_tensor* b) {
@@ -87,35 +78,17 @@ inline ggml_tensor* rms(ggml_context* c, const ModelLoader& ml, ggml_tensor* x,
     y = bf16(c, y);
     return mulb(c, y, bf16(c, weight(c, ml, n)));
 }
-// F.rms_norm semantics (Nemotron): normalize AND affine in f32, ONE bf16
-// round at the end — vs rms's Llama-style round after the rsqrt.
-inline ggml_tensor* rms_single(ggml_context* c, const ModelLoader& ml,
-                               ggml_tensor* x, const std::string& n, float eps) {
-    ggml_tensor* y = ggml_rms_norm(c, f32(c, x), eps);
-    y = ggml_mul(c, y, f32(c, weight(c, ml, n)));
-    return bf16(c, y);
-}
-// Exact (erf) GELU under both disciplines.
+// Exact (erf) GELU.
 inline ggml_tensor* gelu_erf_bf16(ggml_context* c, ggml_tensor* x) {
     return bf16(c, ggml_gelu_erf(c, f32(c, x)));
 }
-inline ggml_tensor* gelu_erf_f32(ggml_context* c, ggml_tensor* x) {
-    return f32(c, ggml_gelu_erf(c, f32(c, x)));
-}
-// PyTorch LayerNorm: F32 reduction + affine. bf16 or f32 result.
+// PyTorch LayerNorm: F32 reduction + affine, bf16 result.
 inline ggml_tensor* layer_norm_bf16(ggml_context* c, const ModelLoader& ml,
                                     ggml_tensor* x, const std::string& n, float eps) {
     ggml_tensor* y = ggml_norm(c, f32(c, x), eps);
     y = ggml_mul(c, y, f32(c, weight(c, ml, n + ".weight")));
     y = ggml_add(c, y, f32(c, weight(c, ml, n + ".bias")));
     return bf16(c, y);
-}
-inline ggml_tensor* layer_norm_f32(ggml_context* c, const ModelLoader& ml,
-                                   ggml_tensor* x, const std::string& n, float eps) {
-    ggml_tensor* y = ggml_norm(c, f32(c, x), eps);
-    y = ggml_mul(c, y, f32(c, weight(c, ml, n + ".weight")));
-    y = ggml_add(c, y, f32(c, weight(c, ml, n + ".bias")));
-    return f32(c, y);
 }
 
 // ---- host helpers --------------------------------------------------------- //

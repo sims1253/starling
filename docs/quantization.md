@@ -5,8 +5,8 @@ the ASR analogue of the "dynamic quants" the text-LLM world has: block
 quantization (Q8_0 / K-quants) weighted by an **importance matrix** collected
 on real audio, plus per-tensor recipes for sensitivity sweeps, verified by
 WER. Parakeet-tdt-0.6b-v3 is the proof of concept; the same tooling is
-model-agnostic and intended for the larger engines (audex-2b,
-moss-transcribe-2b, qwen3-asr-1.7b) where halving VRAM actually changes what
+model-agnostic and intended for the larger engines (moss-transcribe-2b,
+qwen3-asr-1.7b) where halving VRAM actually changes what
 fits on a local machine.
 
 ## Community-GGUF compat
@@ -672,78 +672,27 @@ model family needs:
 2. its host-read tensors (embeddings, folded norms) added to the keep rules
    in `cpp/tools/starling_quantize.cpp` if their names do not already match.
 
-Concrete next target — **audex-2b** (where 2-bit savings are worth ~4 GB):
-the weights are `nvidia/Nemotron-Labs-Audex-2B` and the converter exists, but
-the audex loader's header guard (`cpp/audex/loader.cpp`,
-`check_gguf_header(..., {"bf16_exact"}, ...)`) rejects every other numeric
-profile, so the steps are: convert an f32 base, extend the guard's allowlist
-to the quantized profiles, audit `cpp/audex/` for conv/cast/host-read
-tensors (same analysis parakeet got), then run this same sweep. moss-2b and
-qwen3-asr-1.7b follow the same recipe.
+Two engine-side rules came out of the first non-parakeet port (an engine
+that has since been removed) and apply to every quantized family:
 
-### Audex-2b port (2026-09-05) — done, with one engine fix the recipe missed
-
-Executed against the bf16_exact base (`models/audex-2b-bf16-exact.gguf`,
-5802 MB, converted from the pinned `77b7e1a` checkpoint) instead of an f32
-base: the quantizer already dequantizes BF16 sources (`to_f32`), the bf16
-file doubles as the exact baseline, and skipping the 8+ GB f32 duplicate
-saves disk and eval RAM on the 14 GB box.
-
-The audit found the existing name/shape rules sufficient — `enc.conv1/2`
-("conv"), `llm.embed.weight` ("embed"; graph-side `ggml_get_rows` + F32
-cast), `enc.pos_embed` and the mel constants (no `.weight` suffix) are all
-kept automatically; `llm.lm_head.weight` and every encoder/projector/trunk
-linear are plain `ggml_mul_mat` and quantize freely (363 of 719 tensors).
-The conv keep rule is load-bearing: the conv GEMM
-(`cpp/audex/encoder.cpp`, the im2col matmul) takes its activation straight
-from the F32 im2col buffer with no `gemm_act`, so a future rule change
-that quantized conv weights would fail at eval time (the im2col/quantized
-matmul assert), not at load — nothing at graph-build time enforces it.
-The loader allowlist gained `"quantized"`, and the quantizer now stamps
-`starling.numeric_profile=quantized` when it actually quantized at least
-one tensor, instead of inheriting the source's exact-profile string (a
-degenerate all-kept run is numerically identical to the source, so it
-keeps the inherited profile).
-
-**The surprise**: ggml's quantized matmul asserts F32 activations
-(`GGML_ASSERT(src1->type == GGML_TYPE_F32)` in the quantized branch of
-`ggml_compute_forward_mul_mat`,
-`third_party/ggml/src/ggml-cpu/ggml-cpu.c`), and the
-qwen-trunk/audex graphs feed **bf16** activations into every weight GEMM.
-Fix: `gemm_act()` (graph_helpers.hpp) upcasts the activation to F32 only
-when the weight is block-quantized — bf16 is exact in f32, so the
-F32-accumulated GEMM and trailing bf16 round preserve the numerical
-boundary and only the weight carries quantization noise; unquantized
-weights keep the identical bf16 path (no change for any existing
-artifact). `lin()`/`linear_bf16()` and the five lm_head GEMMs (now
-`lm_head_gemm()`) route through it. moss-2b / qwen3-asr get quantization
-for free once their loaders allowlist the profile.
-
-Fixtures (CPU, one model per process): bf16_exact, q8_0 (3484 MB) and
-q4_k_m (2248 MB) produce **byte-identical transcripts at WER 0.00**;
-uniform q2_k (1668 MB) collapses to garbage tokens — the same calibration
-law as parakeet, so sub-Q4 needs the audex imatrix port (STARLING_IMATRIX
-riding the audex graphs) before it is meaningful.
-
-FLEURS test clips, 8 per language, CPU (mean WER):
-
-| model | MB | en_us | de_de |
-|-------|------|-------|-------|
-| bf16_exact | 5802 | 8.42 | 4.33 |
-| q8_0 | 3484 | 8.42 | 3.19 |
-| q4_k_m | 2248 | 6.49 | 6.38 |
-
-n=8 caveat: q8_0 is per-clip IDENTICAL to exact on EN, and DE moves only
-via one near-tie clip flipping 9.1 → 0.0. q4_k_m's means also move by
-single-clip flips — EN clip 3 (20.0 → 0.0) vs clip 6 (9.1 → 13.6), DE
-clip 5 (0.0 → 13.0) — i.e. 6 of 8 clips per language are byte-identical
-to exact and the mean deltas are within flip noise. The parakeet-grade
-"q4 is free" claim needs the 300-clip run (follow-up; ~2 h of CPU
-transcription at ~30 s/clip). Sub-Q4 needs the audex imatrix port first.
-
-Speed (single run, short/medium fixture): bf16 28.3/38.4 s, q8_0 27.1/33.9 s,
-q4_k_m 28.8/33.4 s — size plays, roughly speed-neutral, as with parakeet.
-GPU quantization parity and timings remain untested for this Audex study.
+- **Loader allowlist + profile stamp**: the loader's header guard must accept
+  `"quantized"`, and the quantizer stamps `starling.numeric_profile=quantized`
+  when it actually quantized at least one tensor, instead of inheriting the
+  source's exact-profile string (a degenerate all-kept run is numerically
+  identical to the source, so it keeps the inherited profile).
+- **F32 activations into quantized weights**: ggml's quantized matmul asserts
+  F32 activations (`GGML_ASSERT(src1->type == GGML_TYPE_F32)` in the quantized
+  branch of `ggml_compute_forward_mul_mat`,
+  `third_party/ggml/src/ggml-cpu/ggml-cpu.c`), and the qwen-trunk graphs feed
+  **bf16** activations into every weight GEMM. `gemm_act()`
+  (graph_helpers.hpp) upcasts the activation to F32 only when the weight is
+  block-quantized — bf16 is exact in f32, so the F32-accumulated GEMM and
+  trailing bf16 round preserve the numerical boundary and only the weight
+  carries quantization noise; unquantized weights keep the identical bf16
+  path. `lin()`/`linear_bf16()` and the lm_head GEMMs (`lm_head_gemm()`)
+  route through it. Conv weights stay kept: an im2col GEMM that takes its
+  activation straight from an F32 buffer with no `gemm_act` would fail at
+  eval time (the im2col/quantized matmul assert), not at load.
 
 ### Moss-transcribe-2b port (2026-09-10) — quants + Vulkan/CPU engine work
 
@@ -752,8 +701,7 @@ Executed against the bf16_exact base
 linears have row widths divisible by 32 and 256, so no block-size fallbacks
 (unlike parakeet's 640-row linears). Three engine fixes were load-bearing:
 
-1. Loader allowlist: `cpp/moss/loader.cpp` gains `"quantized"` (audex
-   precedent).
+1. Loader allowlist: `cpp/moss/loader.cpp` gains `"quantized"`.
 2. Adapter `mul_mat` passed BF16 activations straight into (now quantized)
    weights, aborting in ggml-vulkan's `q_f16` path. Fix: route both adapter
    linears (`cpp/moss/adapter.cpp`, fused `build_adapter`) through the

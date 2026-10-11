@@ -34,7 +34,7 @@ original per-model files are:
    (rather than a 2-tuple) per the cross-backend interface in
    :mod:`starling._kernels.base`.
 
-Public API (the union of all consumer calls across granite/higgs/moss):
+Public API (the union of all consumer calls across granite/moss):
 
 Elementwise decode kernels (all LLM models):
     :func:`fused_rmsnorm`, :func:`fused_silu_mul`, :func:`residual_add`,

@@ -4,7 +4,7 @@
 > [fast engines](fast-engine.md).
 
 The native engines load GGUF models through the shared `libstarling_ggml` C API.
-They support Parakeet, MOSS, ARK, Higgs, Hojo, Granite, Qwen3, S1, and Audex.
+They support Parakeet, MOSS, ARK, Granite, Qwen3, S1, and Voxtral.
 Backend availability depends on the build; see the [benchmarks](benchmarks.md) for measured
 performance and the model-specific parity notes below. To run an HTTP server,
 use the [native serving guide](native-serving.md). To embed the C API, start
@@ -111,11 +111,8 @@ This table is GENERATED from `tests/native_parity_manifest.json` (schema v1, rev
 | `parakeet.external` | parakeet-tdt-0.6b-v3 (f16 GGUF) | parakeet.cpp-server (external; renamed SMOKE-QUALITY gate) | exact-text + long:corpus-quality | short, medium, long | cpu:-, cuda:V | no |
 | `moss.intree.kstep_regression` | MOSS-Transcribe-preview-2B | cpp-test:moss_kstep_oob_test | smoke (non-certifying) | synthetic_maxcache_boundary | cpu:-, cuda:V | no |
 | `ark.intree.text` | ark-asr-3b (BAAI/ARK-ASR-3B) | starling-ggml-ark | exact-text | short, medium, long | cpu:-, cuda:V | no |
-| `higgs.intree.text` | bosonai/higgs-audio-v3-stt | starling-ggml-higgs | exact-text | short, medium, long | cpu:-, cuda:V | no |
-| `hojo.intree.text` | HojoAI/Hojo-ASR-V1 | starling-ggml-hojo | exact-text | short, medium, long | cpu:-, cuda:V | no |
 | `granite.intree.text` | ibm-granite/granite-speech-4.1-2b | starling-ggml-granite | exact-text | short, medium, long | cpu:-, cuda:V | no |
 | `qwen3.intree.text` | Qwen/Qwen3-ASR-1.7B | starling-ggml-qwen3 | exact-text | short, medium, long | cpu:-, cuda:V | no |
-| `audex.intree.text` | nvidia/nemotron-labs-audex-2b | starling-ggml-audex | exact-text | short, medium, long | cpu:-, cuda:V | no |
 | `s1.intree.text` | superwhisper/s1-mini | starling-ggml-s1 | exact-text | short, medium, long | cpu:-, cuda:V | no |
 | `s1.intree.control_matrix_smoke` | superwhisper/s1-mini | starling-ggml-s1 | smoke (non-certifying) | control_matrix_16_cells | cpu:-, cuda:V | no |
 | `qwen3_06.intree.text` | Qwen/Qwen3-ASR-0.6B-hf | starling-ggml-qwen3 | exact-text | short, medium, long | cpu:-, cuda:V | no |
@@ -195,16 +192,6 @@ Model notes:
   min(200, ceil(dur*5)+32), whitespace-collapsed join) and the
   `transcription_only` text extraction (the `<asr_text>` marker split with the
   Qwen3-ASR library's repetition fix, ported in `capi_qwen3.cpp`).
-- **audex (in-tree `StarlingGgmlAudex`)**: greedy path. Exact text on
-  short/medium/long against `golden/audex_reference.json`, captured from the
-  stock-numerics Python path by `scripts/make_audex_golden.py` (staged
-  component tensors via `scripts/audex_golden_components.py`). The engine
-  mirrors the Python server's chunk policy for long audio (contiguous 30 s
-  chunks with exactly one 750-token clip each, the tail zero-padded to a full
-  clip at the mel level, per-chunk budget min(200, ceil(dur*5)+32),
-  whitespace-collapsed join) and the `_decode_response` quote extraction
-  (first-to-last single-quote span, ported in `capi_audex.cpp`).
-
 Entries whose golden references are gitignored assets are marked `required: no`
 in the manifest and carry an UNPINNED reference note until a recapture pins
 their hashes; their backend statuses are the recorded historical validations,
@@ -268,39 +255,6 @@ not new measurements.
   iota (`vocab - col`, exact integers < 2^24), making the lowest tied column
   a unique argmax. Skip-when-default, so the moss/ark/granite graphs stay
   byte-identical.
-
-### audex engine notes
-
-- **Mel**: the shared `lib/whisper_mel` frontend with the `T_FULLT_MINUS_1`
-  rule and the `MAX_KEPT_FRAMES` max scope; the eager WhisperFeatureExtractor
-  drops the trailing STFT frame (`stft[..., :-1]`) BEFORE the global
-  max-clamp, so the normalization max runs over the kept 3000 frames only.
-  Every clip is zero-padded to the full 30 s / 480000 samples
-  (padding="max_length") BEFORE the mel, so the frame count (3000) and
-  every downstream encoder shape are fixed (`cpp/audex/mel.cpp`).
-- **Encoder**: the stock Qwen2AudioEncoder (whisper-large-v3 shaped) with
-  fixed shapes: two GELU Conv1d k3/p1 layers over time (stride 1 then 2:
-  3000 -> 1500), the LEARNED (1500, 1280) positional table, 32 pre-norm
-  layers of FULL bidirectional attention (no mask; the reference attends
-  padded tail frames like any other; 20 heads x 64, biased q/v/out with a
-  bias-free k, the query pre-scaled by 0.125 at projection), an avg-pooler
-  halving 1500 -> 750 (even/odd strided views, f32 pair average, one bf16
-  round), and the final biased LayerNorm. The convs are an explicit F32
-  im2col + F32 GEMM (the qwen3 `conv_step` pattern with a degenerate H axis);
-  as with qwen3, a GEMM formulation cannot bitwise-match cuDNN conv in
-  general; parity holds on the gated fixtures.
-- **Projector**: single-round RMSNorm(1280, eps 1e-5) -> bias-free fc1
-  (-> 4096) -> relu(x)^2 (relu exact, one bf16 round after the square) ->
-  bias-free fc2 (-> 2048).
-- **Decoder**: the shared `lib/qwen_decode` stack in a new Nemotron-Dense
-  variant (`qkv_bias=false, qk_norm=false`, UNTIED lm_head, no multipliers,
-  `argmax_low_ties`) plus TWO skip-when-default spec extensions: the
-  `mlp_activation=relu2_plain` MLP (up -> relu^2 -> down, no gate tensor) and
-  `rms_norm_single_round`. Nemotron uses `F.rms_norm`: normalization and
-  affine operations run in f32 with one bf16 round at the end. The stack's
-  default Llama-style path rounds after rsqrt. These rounding rules differ on
-  ~25% of elements, verified against `torch.nn.functional.rms_norm`.
-  Defaults keep the moss/ark/granite/qwen3 graphs byte-identical.
 
 ### s1 engine notes (first text-to-text engine)
 

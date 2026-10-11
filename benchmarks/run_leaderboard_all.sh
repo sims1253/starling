@@ -16,7 +16,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-MODELS="${MODELS:-granite,parakeet,moss,qwen3,ark,cohere}"
+MODELS="${MODELS:-granite,parakeet,moss,qwen3,ark}"
 ENGINES="${ENGINES:-starling,stock}"
 NUM_SAMPLES="${NUM_SAMPLES:-50}"
 DATASETS="${DATASETS:-}"

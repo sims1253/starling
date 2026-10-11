@@ -31,7 +31,7 @@ shape and stride, and 64-byte operation-parameter encoding. The generated
 graphs included `MUL_MAT`, `RMS_NORM`, `SOFT_MAX`, `VIEW`, `CPY`, and other real
 ggml operations. A direct CPU `ReplayGraph` in the same test also exported its
 two-tensor `ADD` graph. This exercises the actual Starling graph-build paths;
-it does not establish a result for a full Higgs or Hojo checkpoint.
+it does not establish a result for a full model checkpoint.
 
 The exporter uses an iterative walk. A first recursive version crashed on
 the real one-shot graph chain; the test above now passes. Each snapshot is

@@ -1,6 +1,6 @@
 """Shared attention dispatch for the fused decode paths.
 
-All five fused decoders (granite / moss / qwen3 / higgs / ark) compute decode
+The fused decoders (granite / moss / qwen3 / ark) compute decode
 attention the same way:
 
     scores = Q @ K^T * scale + mask      # (1, n_q, 1, L)

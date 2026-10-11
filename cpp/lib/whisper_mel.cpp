@@ -28,18 +28,14 @@ size_t reflect_index(int64_t i, size_t n) {
 
 bool compute_log_mel(const MelPolicy& p, const ModelLoader& ml, const float* pcm,
                      size_t S, MelOutput& out, std::string& err) {
-    // hojo truncates unconditionally BEFORE the checks; the others check the
-    // input first and cap afterwards with a >0 guard.
-    if (p.cap_n_samples && p.cap_before_checks) {
-        if (S > (size_t) p.n_samples) S = (size_t) p.n_samples;
-    }
     const size_t N = p.n_fft, H = p.hop_length, M = p.n_mels, B = N / 2 + 1;
     if (!pcm && S) { err = "null PCM input"; return false; }
     if (S < 2) {
         err = std::string(p.label) + " reflect padding requires at least 2 PCM samples";
         return false;
     }
-    if (p.cap_n_samples && !p.cap_before_checks) {
+    // Check the input first, then cap with a >0 guard.
+    if (p.cap_n_samples) {
         const size_t n_samples_cap = p.n_samples > 0 ? (size_t) p.n_samples : S;
         if (S > n_samples_cap) S = n_samples_cap;
     }
@@ -69,13 +65,7 @@ bool compute_log_mel(const MelPolicy& p, const ModelLoader& ml, const float* pcm
         bank = bank_host.data();
     }
     const size_t fullT = S / H + 1;
-    size_t T;
-    switch (p.t_rule) {
-        case MelPolicy::T_FULLT_MINUS_1:  T = fullT - 1; break;
-        case MelPolicy::T_CEIL_S_OVER_H:  T = (S + H - 1) / H; break;
-        case MelPolicy::T_FULLT:          T = fullT; break;
-        default:                          T = S / H; break;
-    }
+    const size_t T = p.t_rule == MelPolicy::T_FULLT ? fullT : fullT - 1;
     std::vector<float> logmel(M * fullT);
     std::vector<double> powers(B * fullT);
     std::vector<double> mel64(M * fullT);
@@ -140,37 +130,18 @@ bool compute_log_mel(const MelPolicy& p, const ModelLoader& ml, const float* pcm
     });
     const double ms2 = mtms(t_l2);
     auto t_l3 = mtnow();
-    // Loop 3a: log10 + per-chunk max for a deterministic global-max reduction.
-    // MAX_ALL_FRAMES: flat split over all M*fullT entries (moss/ark).
-    // MAX_KEPT_FRAMES: per-m split over the KEPT frames [0, T) only, matching
-    // the eager Whisper extractor (which drops the trailing frame via [:, :-1]
-    // BEFORE the global max-clamp); including the dropped frame shifts the
-    // clamp threshold and perturbs every kept frame (higgs/hojo).
+    // Loop 3a: log10 + per-chunk max for a deterministic global-max reduction
+    // (flat split over all M*fullT entries).
     std::vector<float> chunk_max(nthr, -std::numeric_limits<float>::infinity());
-    if (p.max_scope == MelPolicy::MAX_ALL_FRAMES) {
-        parallel_for(nthr, M * fullT, [&](size_t tid, size_t lo, size_t hi) {
-            float cm = -std::numeric_limits<float>::infinity();
-            for (size_t idx = lo; idx < hi; ++idx) {
-                float v = (float) std::log10(std::max(mel64[idx], p.mel_floor));
-                logmel[idx] = v;
-                cm = std::max(cm, v);
-            }
-            chunk_max[tid] = cm;
-        });
-    } else {
-        parallel_for(nthr, M, [&](size_t tid, size_t m_lo, size_t m_hi) {
-            float cm = -std::numeric_limits<float>::infinity();
-            for (size_t m = m_lo; m < m_hi; ++m) {
-                for (size_t t = 0; t < T; ++t) {
-                    const size_t idx = m * fullT + t;
-                    float v = (float) std::log10(std::max(mel64[idx], p.mel_floor));
-                    logmel[idx] = v;
-                    cm = std::max(cm, v);
-                }
-            }
-            chunk_max[tid] = cm;
-        });
-    }
+    parallel_for(nthr, M * fullT, [&](size_t tid, size_t lo, size_t hi) {
+        float cm = -std::numeric_limits<float>::infinity();
+        for (size_t idx = lo; idx < hi; ++idx) {
+            float v = (float) std::log10(std::max(mel64[idx], p.mel_floor));
+            logmel[idx] = v;
+            cm = std::max(cm, v);
+        }
+        chunk_max[tid] = cm;
+    });
     float mx = -std::numeric_limits<float>::infinity();
     for (size_t i = 0; i < nthr; ++i) mx = std::max(mx, chunk_max[i]);
     // Fixed global log-mel max (voxtral): a finite fixed_log_mel_max replaces
@@ -181,33 +152,19 @@ bool compute_log_mel(const MelPolicy& p, const ModelLoader& ml, const float* pcm
     out.n_mels = M;
     out.n_frames = T;
     out.f32.resize(M * T);
-    if (p.emit_bf16) out.bf16.resize(M * T);
-    // Loop 3b: clamp + Whisper normalize + (optional) bf16. norm_in_double
-    // keeps hojo's double-constant arithmetic (clamp threshold and the
-    // (v+off)/div pass in double, rounded once at the store).
-    if (p.norm_in_double) {
-        const double off = p.normalization_offset, div = p.normalization_divisor;
-        parallel_for(nthr, M * T, [&](size_t /*tid*/, size_t lo, size_t hi) {
-            for (size_t idx = lo; idx < hi; ++idx) {
-                const size_t m = idx / T, t = idx % T;
-                float v = std::max(logmel[m * fullT + t], (float)((double) mx - p.dynamic_range));
-                v = (float)((v + off) / div);
-                out.f32[idx] = v;
-            }
-        });
-    } else {
-        const float off = (float) p.normalization_offset, div = (float) p.normalization_divisor;
-        const float dr = (float) p.dynamic_range;
-        parallel_for(nthr, M * T, [&](size_t /*tid*/, size_t lo, size_t hi) {
-            for (size_t idx = lo; idx < hi; ++idx) {
-                const size_t m = idx / T, t = idx % T;
-                float v = std::max(logmel[m * fullT + t], mx - dr);
-                v = (v + off) / div;
-                out.f32[idx] = v;
-                if (p.emit_bf16) out.bf16[idx] = ggml_fp32_to_bf16(v);
-            }
-        });
-    }
+    out.bf16.resize(M * T);
+    // Loop 3b: clamp + Whisper normalize + bf16 copy.
+    const float off = (float) p.normalization_offset, div = (float) p.normalization_divisor;
+    const float dr = (float) p.dynamic_range;
+    parallel_for(nthr, M * T, [&](size_t /*tid*/, size_t lo, size_t hi) {
+        for (size_t idx = lo; idx < hi; ++idx) {
+            const size_t m = idx / T, t = idx % T;
+            float v = std::max(logmel[m * fullT + t], mx - dr);
+            v = (v + off) / div;
+            out.f32[idx] = v;
+            out.bf16[idx] = ggml_fp32_to_bf16(v);
+        }
+    });
     if (p.dump_env) {
         if (const char* env = std::getenv(p.dump_env)) {
             if (FILE* f = std::fopen(env, "wb")) {
