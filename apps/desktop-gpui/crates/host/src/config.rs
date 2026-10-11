@@ -17,15 +17,14 @@ use crate::platform;
 /// Everything the host needs to launch. Field-by-field:
 ///
 /// - [`HostConfig::data_root`] is the storage v2 root the host **must**
-///   hold the lease on. A host without a data root has no ownership
-///   semantics, so unlike [`RuntimeConfig::default`] (whose in-memory
-///   store keeps test construction side-effect-free) the host refuses to
-///   degrade: opening or leasing the root is what makes it the owner.
+///   lock. A host without a data root has no ownership semantics, so
+///   unlike [`RuntimeConfig::default`] (whose in-memory store keeps test
+///   construction side-effect-free) the host refuses to degrade: locking
+///   the root is what makes it the owner.
 /// - [`HostConfig::runtime_dir`] holds the IPC endpoint; the endpoint
 ///   name itself derives from the data root (see [`platform`]).
 pub struct HostConfig {
-    /// The storage v2 root. The host acquires this root's runtime lease
-    /// (§4 ownership) before binding anything.
+    /// The storage v2 root. The host locks it before binding anything.
     pub data_root: PathBuf,
     /// Directory the IPC endpoint lives in (0700).
     pub runtime_dir: PathBuf,
@@ -145,8 +144,8 @@ impl HostConfig {
     /// platform adapters (issue #221) plug into the `RuntimeConfig`
     /// seams.
     ///
-    /// Errors when the root cannot open (the host is the designed lease
-    /// acquirer; a root it cannot open is a host it must not be).
+    /// Errors when the root cannot open (a root it cannot open is a host
+    /// it must not be).
     pub fn production(
         data_root: impl Into<PathBuf>,
         runtime_dir: Option<PathBuf>,

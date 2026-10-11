@@ -88,7 +88,7 @@ pub fn listen(path: &Path) -> io::Result<Box<dyn TransportListener>> {
     // Rename publishes the 0600 socket under its final name atomically.
     // A server that bound `path` between the caller's probe and this
     // rename is silently displaced — the same check-then-act window
-    // [`remove_stale`] documents; the data-root lease is what serializes
+    // [`remove_stale`] documents; the data-root lock is what serializes
     // hosts against it. A failed rename drops the listener (closing the
     // temp socket) and removes the temp file — no residue for the next
     // boot to trip over.
@@ -130,7 +130,7 @@ pub fn probe(path: &Path) -> Probe {
 /// must not lose its socket file (clients would silently miss it). A
 /// `Live` answer aborts the takeover — the caller treats it as the
 /// foreign-server refusal. The probe-to-unlink window itself cannot be
-/// closed from user space (the lease serializes hosts; only exotic
+/// closed from user space (the data-root lock serializes hosts; only exotic
 /// non-host binders can race it).
 pub fn remove_stale(path: &Path) -> io::Result<()> {
     if let Probe::Live = probe(path) {

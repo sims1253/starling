@@ -5,8 +5,7 @@
 //! row beside the `captures` row. Whoever transcribes it first claims it
 //! ([`StoreV2::claim_transcription`]): one write transaction checks the
 //! intent is unclaimed, starts the attempt and records the attempt as the
-//! claim, so two claimants — two windows, or a host and its successor —
-//! can never both run it. Settling the claimed attempt
+//! claim, so two claimants can never both run it. Settling the claimed attempt
 //! ([`StoreV2::finish_attempt`]) ends the intent in the same transaction,
 //! completed or failed: a failure is recorded with the take, and a retry
 //! is the user's explicit choice. A request made while the take is
@@ -14,11 +13,10 @@
 //! running attempt: settling that attempt leaves the intent unclaimed and
 //! due again, so the newer request is transcribed in its own right.
 //!
-//! A claimant that dies leaves its attempt `started` with its in-flight
-//! marker released (#213). The next claim finds that attempt unowned,
-//! fails it as interrupted and claims the take afresh, so a crash costs
-//! the attempt, never the transcription; a claim a live process holds is
-//! left to it.
+//! A claimant that dies leaves its attempt `started` and no longer held
+//! (#213). The next claim finds that attempt unowned, fails it as
+//! interrupted and claims the take afresh, so a crash costs the attempt,
+//! never the transcription; a claim a live handle holds is left to it.
 //!
 //! An **audio hold** ([`StoreV2::hold_audio`]) keeps a take's audio from
 //! being compressed or retired by any process until it is released or
@@ -28,7 +26,7 @@
 use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 
 use super::{
-    insert_attempt_row, AttemptRecord, RecognitionOutcome, StoreV2, StoreV2Error,
+    insert_attempt_row, AttemptClaim, AttemptRecord, RecognitionOutcome, StoreV2, StoreV2Error,
 };
 use crate::storage::now_iso;
 
@@ -69,14 +67,14 @@ impl StoreV2 {
             }
         }
         match claimed {
-            Ok(Claimed::Started { attempt_id, marker }) => {
-                self.attempt_locks.insert(attempt_id.clone(), marker);
+            Ok(Claimed::Started { attempt_id, claim }) => {
+                self.held_attempts.insert(attempt_id.clone(), claim);
                 Ok(TranscriptionClaim::Claimed { attempt_id })
             }
             Ok(Claimed::Not(claim)) => Ok(claim),
             Err((err, abandoned)) => {
                 if let Some(abandoned) = abandoned {
-                    self.release_attempt_lock(&abandoned);
+                    self.release_attempt(&abandoned);
                 }
                 Err(err)
             }
@@ -141,7 +139,7 @@ impl StoreV2 {
                 return Err((err.into(), abandoned));
             }
             if let Some(abandoned) = &abandoned {
-                self.release_attempt_lock(abandoned);
+                self.release_attempt(abandoned);
             }
             return Err((
                 StoreV2Error::Invalid(format!(
@@ -152,9 +150,7 @@ impl StoreV2 {
             ));
         }
         let attempt_id = format!("a_{}", uuid::Uuid::new_v4().simple());
-        let marker = self
-            .open_attempt_marker(&attempt_id)
-            .map_err(|err| (err, abandoned.clone()))?;
+        let claim = AttemptClaim::new(&attempt_id);
         let written = insert_attempt_row(
             &tx,
             &AttemptRecord {
@@ -187,15 +183,13 @@ impl StoreV2 {
         match written {
             Ok(()) => {
                 if let Some(abandoned) = &abandoned {
-                    self.release_attempt_lock(abandoned);
+                    self.release_attempt(abandoned);
                 }
-                Ok(Claimed::Started { attempt_id, marker })
+                Ok(Claimed::Started { attempt_id, claim })
             }
             Err(err) => {
-                drop(marker);
-                self.remove_attempt_marker(&attempt_id);
                 // Rolled back: the abandoned attempt still reads started,
-                // and its marker stays for the next claim to judge.
+                // for the next claim to judge.
                 Err((err, None))
             }
         }
@@ -220,10 +214,10 @@ impl StoreV2 {
                 eprintln!("Rolling back a failed attempt settle also failed: {err}");
             }
         }
-        // Settled or not, nothing works on the attempt any more: its
-        // marker must not make it read as in flight (the stale sweep, or
-        // the next claim, takes it from here).
-        self.release_attempt_lock(attempt_id);
+        // Settled or not, nothing works on the attempt any more: it must
+        // not read as in flight (the stale sweep, or the next claim, takes
+        // it from here).
+        self.release_attempt(attempt_id);
         settled
     }
 
@@ -396,7 +390,7 @@ impl StoreV2 {
         let pids = stmt.query_map(params![capture_id], |row| row.get::<_, i64>(0))?;
         for pid in pids {
             let pid = pid?;
-            if u32::try_from(pid).is_ok_and(super::process_is_alive) {
+            if u32::try_from(pid).is_ok_and(crate::process::process_alive) {
                 return Ok(true);
             }
         }
@@ -423,7 +417,7 @@ impl StoreV2 {
 enum Claimed {
     Started {
         attempt_id: String,
-        marker: std::fs::File,
+        claim: AttemptClaim,
     },
     Not(TranscriptionClaim),
 }

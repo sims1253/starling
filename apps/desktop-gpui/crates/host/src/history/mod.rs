@@ -3,8 +3,8 @@
 //! playback and export, imports, deletes, retention classes, retry holds,
 //! processing documents, insights and correction records — is a
 //! [`StoreRequest`] the host answers on its own store handle. The app
-//! holds no store handle; the host owns the store's lease and is its only
-//! writer besides the processes it starts. History audio upkeep
+//! holds no store handle; the host owns the data root and is its only
+//! writer. History audio upkeep
 //! (compression, retention, the sweep) runs here too, on the host's
 //! schedule, and pauses while a take records ([`History::upkeep_loop`]).
 //!
@@ -17,8 +17,7 @@
 //! answers, uploads, audio holds — goes with the connection.
 //!
 //! [`HistoryClient`] is the typed side the app calls, over any
-//! [`StoreCall`]: a [`crate::client::HostClient`], or [`LocalHistory`] —
-//! the same service run in-process (the app's tests' fake host).
+//! [`StoreCall`] (a [`crate::client::HostClient`]).
 
 mod facade;
 mod service;
@@ -36,7 +35,7 @@ pub use facade::{
     v2_summary, AudioHold, AudioPin, BoundaryRevision, Facade, ProcessingDoc, ProposalOrigin,
     ProposalRow, RowStatus, SavedTake, UpkeepReport,
 };
-pub use service::{History, LocalHistory, UPKEEP_FIRST, UPKEEP_INTERVAL};
+pub use service::{History, UPKEEP_FIRST, UPKEEP_INTERVAL};
 pub(crate) use service::{start_workers, store_queue, submit, StoreJob};
 
 /// Which encoding of a take's audio [`StoreRequest::Audio`] reads.

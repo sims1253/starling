@@ -19,7 +19,6 @@ pub mod download;
 pub mod manager;
 pub mod memory;
 pub mod probe;
-pub mod registry;
 pub mod sidecar;
 
 pub use bundle::{discover_engine_dir, load_bundle, Bundle};
@@ -38,9 +37,6 @@ pub use memory::{
 };
 pub use probe::{
     select_backend, try_select_backend, BackendSelection, EngineVersion, ProbeFailure,
-};
-pub use registry::{
-    read_registration, registry_path, remove_registration, write_registration, SidecarRegistration,
 };
 pub use sidecar::{HealthSnapshot, ReadyError, ReadyStage, Sidecar};
 

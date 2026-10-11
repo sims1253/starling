@@ -113,7 +113,7 @@ fn a_claim_whose_claimant_died_is_taken_over_and_transcribed_once() {
     let mut first = store_in(&dir);
     let id = stored(&mut first, true, CommitMark::Complete);
     let abandoned = claimed(first.claim_transcription(&id, "engine:test", None).unwrap());
-    // The claimant goes away mid-request: its marker's lock goes with it.
+    // The claimant goes away mid-request: its claim goes with it.
     drop(first);
 
     let mut second = store_in(&dir);

@@ -123,7 +123,7 @@ pub enum Frame {
     Hello {
         /// The transport protocol revision (1).
         protocol: u32,
-        /// The storage-v2 lease owner id this host holds.
+        /// This host run's id: a restarted host has a new one.
         owner_id: String,
         /// The host process id (diagnostics; also what a stale-owner probe
         /// checks for liveness).
@@ -168,7 +168,7 @@ pub enum Frame {
     },
     /// Graceful close (host shutdown). The host released nothing that
     /// survives it: acknowledged audio is in storage v2, and a new host
-    /// can take over the socket via the lease.
+    /// can take over the socket once the data root is free.
     Bye { reason: String },
     /// An MCP agent connection identifying itself against the host's
     /// allowlist. A refusal answers `auth_failed` and closes the

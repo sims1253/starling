@@ -1,6 +1,4 @@
-//! Microphone capture, ported from `apps/desktop/src/useRecorder.ts`
-//! (`getUserMedia` + `ScriptProcessorNode` + `AnalyserNode`) — see
-//! `apps/desktop-gpui/PORT.md`. The transport between the audio callback and
+//! Microphone capture. The transport between the audio callback and
 //! the take was redesigned per `docs/program/design/e17-native-runtime.md`
 //! §3 (G01/R01/R09); the signal processing (downmix, pre-DSP clip metering,
 //! attenuation-only auto gain) is unchanged.

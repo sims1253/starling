@@ -29,12 +29,7 @@ use crate::engine::download::{
 };
 use crate::engine::memory::{available_memory, estimate_resident, process_rss, swap_plan};
 use crate::engine::probe::{try_select_backend, BackendSelection};
-use crate::engine::registry::{
-    acquire_lease_marker, clear_engine_leases, foreign_leases, is_retired, remove_registration,
-    retire_engine, try_spawn_lock, unretire_engine, write_registration, EngineKey, LeaseMarker,
-    LockOutcome, MarkerOutcome, SidecarRegistration, SpawnLock,
-};
-use crate::engine::sidecar::{HealthSnapshot, LoopbackHttp, ReadyError, ReadyStage, Sidecar};
+use crate::engine::sidecar::{ReadyError, ReadyStage, Sidecar};
 use crate::engine::{Backend, EngineFailure, SwapPlan, SWAP_MARGIN_BYTES};
 
 /// Crash-loop policy: this many crashes within this window stop the
@@ -53,10 +48,6 @@ pub const DEFAULT_BACKOFF: [Duration; 6] = [
 ];
 /// A draining engine stops when its last lease drops — or after this.
 pub const DRAIN_HARD_CAP: Duration = Duration::from_secs(15 * 60);
-/// Attached (not owned) sidecars are polled on this cadence; two
-/// consecutive failures mean the sidecar is gone and we take over.
-const ATTACH_POLL: Duration = Duration::from_secs(2);
-const ATTACH_FAILURES_BEFORE_TAKEOVER: u32 = 2;
 /// The peak-RSS sampler cadence during a switch (#363 step 4).
 const RSS_SAMPLE: Duration = Duration::from_millis(200);
 /// An unanswered "finish the current take, then switch?" question
@@ -71,7 +62,7 @@ pub struct EngineConfig {
     pub engine_dir: Option<PathBuf>,
     /// Where verified model files live.
     pub models_dir: PathBuf,
-    /// Registry, spawn lock, and `logs/engine.log` live here.
+    /// `logs/engine.log` lives here.
     pub state_dir: PathBuf,
     /// The selectable models.
     pub catalog: Vec<CatalogEntry>,
@@ -209,7 +200,7 @@ pub struct SwitchReport {
     pub to: String,
     /// From `activate` to cutover.
     pub duration: Duration,
-    /// Max over the switch of the summed RSS of all owned sidecars
+    /// Max over the switch of the summed RSS of all sidecars
     /// (sampled every 200 ms); `None` when no reading was possible.
     pub peak_rss_bytes: Option<u64>,
     pub mode: SwapMode,
@@ -232,9 +223,6 @@ pub struct ActiveEngineView {
     pub model_id: String,
     pub endpoint: String,
     pub pid: u32,
-    /// `false` when another app instance owns the sidecar and we
-    /// attached to it.
-    pub owned: bool,
     pub device: Option<String>,
 }
 
@@ -291,9 +279,6 @@ pub struct EngineLease {
     endpoint: String,
     slug: String,
     model_id: String,
-    /// On an attached engine: makes this take visible to the owning
-    /// instance, which will not stop the engine under it.
-    _marker: Option<LeaseMarker>,
 }
 
 impl EngineLease {
@@ -312,8 +297,8 @@ impl EngineLease {
     }
 
     /// The pid of the engine process this lease holds — with
-    /// [`Self::endpoint`], the engine's identity (a restarted or
-    /// taken-over engine differs in pid even on a reused port).
+    /// [`Self::endpoint`], the engine's identity (a restarted engine
+    /// differs in pid even on a reused port).
     pub fn pid(&self) -> u32 {
         self.engine.pid
     }
@@ -337,14 +322,14 @@ pub(crate) struct ActiveEngine {
     pub slug: String,
     pub endpoint: String,
     pub pid: u32,
-    pub owned: bool,
+    /// `None` only for the unit tests' process-less engines.
     pub sidecar: Option<Sidecar>,
     pub device: Mutex<Option<String>>,
     pub leases: AtomicUsize,
 }
 
 impl ActiveEngine {
-    fn owned_engine(
+    fn new(
         model_id: &str,
         slug: &str,
         sidecar: Sidecar,
@@ -356,61 +341,34 @@ impl ActiveEngine {
             slug: slug.to_string(),
             pid: sidecar.pid(),
             endpoint,
-            owned: true,
             sidecar: Some(sidecar),
             device: Mutex::new(device),
             leases: AtomicUsize::new(0),
         })
     }
 
-    fn attached_engine(
-        model_id: &str,
-        slug: &str,
-        endpoint: String,
-        pid: u32,
-        device: Option<String>,
-    ) -> Arc<ActiveEngine> {
+    #[cfg(test)]
+    fn without_process(model_id: &str, slug: &str, endpoint: String, pid: u32) -> Arc<ActiveEngine> {
         Arc::new(ActiveEngine {
             model_id: model_id.to_string(),
             slug: slug.to_string(),
             endpoint,
             pid,
-            owned: false,
             sidecar: None,
-            device: Mutex::new(device),
+            device: Mutex::new(None),
             leases: AtomicUsize::new(0),
         })
     }
 
-    /// Stop is only meaningful for owned engines; an attached sidecar
-    /// belongs to another instance and is never stopped by us.
     fn stop(&self) {
-        if self.owned {
-            if let Some(sidecar) = &self.sidecar {
-                sidecar.stop();
-            }
+        if let Some(sidecar) = &self.sidecar {
+            sidecar.stop();
         }
     }
 
     fn set_device(&self, device: String) {
         if let Ok(mut slot) = self.device.lock() {
             *slot = Some(device);
-        }
-    }
-
-    fn port(&self) -> u16 {
-        self.endpoint
-            .rsplit(':')
-            .next()
-            .and_then(|port| port.parse::<u16>().ok())
-            .unwrap_or(0)
-    }
-
-    /// The cross-instance identity used by lease markers.
-    fn key(&self) -> EngineKey {
-        EngineKey {
-            pid: self.pid,
-            port: self.port(),
         }
     }
 }
@@ -604,12 +562,9 @@ impl EngineManager {
             rx: cmd_rx,
             inner: Arc::clone(&inner),
             config,
-            http: LoopbackHttp::new(),
             switch: None,
             downloads: HashMap::new(),
             pending_restart: None,
-            attach_failures: 0,
-            next_attach_poll: Instant::now(),
             switch_token: 0,
         };
         match std::thread::Builder::new()
@@ -724,7 +679,7 @@ impl EngineManager {
 
     /// Download-if-needed, verify, then switch to `model_id` (see the
     /// module docs for the switch protocol). A running switch is
-    /// cancelled first; rapid repeated switches leave exactly one owned
+    /// cancelled first; rapid repeated switches leave exactly one
     /// sidecar. Returns the request's id, which
     /// [`EngineSnapshot::activations_handled`] reaches once the switch is
     /// under way.
@@ -770,30 +725,17 @@ impl EngineManager {
             return None;
         }
         let engine = state.active.as_ref()?;
-        // A take on another instance's engine is announced to that
-        // owner; one that is retiring the engine gets no new takes.
-        let marker = if engine.owned {
-            None
-        } else {
-            match acquire_lease_marker(&self.inner.config.state_dir, engine.key()) {
-                MarkerOutcome::Held(marker) => Some(marker),
-                MarkerOutcome::Retired => return None,
-                MarkerOutcome::Unavailable => None,
-            }
-        };
         engine.leases.fetch_add(1, Ordering::Acquire);
         Some(EngineLease {
             engine: Arc::clone(engine),
             endpoint: engine.endpoint.clone(),
             slug: engine.slug.clone(),
             model_id: engine.model_id.clone(),
-            _marker: marker,
         })
     }
 
-    /// Stops every owned sidecar (blocking, at most a few seconds) and
-    /// releases the registry if it names us. Idempotent; the
-    /// `--parent-pid` backstop covers a crashing app.
+    /// Stops every sidecar (blocking, at most a few seconds).
+    /// Idempotent; the `--parent-pid` backstop covers a crashing host.
     pub fn shutdown(&self) {
         self.inner.shutdown.store(true, Ordering::Release);
         // Cancel whatever is in flight directly — the supervisor may be
@@ -827,13 +769,12 @@ impl EngineManager {
                 let _ = handle.join();
             }
         }
-        // Belt and braces: stop every engine we own, whatever the
-        // supervisor was doing.
+        // Belt and braces: stop every engine, whatever the supervisor
+        // was doing.
         let engines = collect_engines(&self.inner.lock());
         for engine in engines {
             engine.stop();
         }
-        remove_registration(&self.inner.config.state_dir, std::process::id());
     }
 }
 
@@ -861,7 +802,6 @@ fn build_snapshot(state: &SharedState, catalog: &[CatalogEntry]) -> EngineSnapsh
             model_id: engine.model_id.clone(),
             endpoint: engine.endpoint.clone(),
             pid: engine.pid,
-            owned: engine.owned,
             device: engine.device.lock().ok().and_then(|device| device.clone()),
         }),
         switch: state.switch.as_ref().map(|switch| SwitchView {
@@ -918,23 +858,13 @@ struct RestartState {
     at: Instant,
 }
 
-/// Attach information returned by a successful registry attach.
-struct Attached {
-    endpoint: String,
-    pid: u32,
-    device: Option<String>,
-}
-
 struct Supervisor {
     rx: mpsc::Receiver<Command>,
     inner: Arc<Inner>,
     config: EngineConfig,
-    http: LoopbackHttp,
     switch: Option<SwitchHandle>,
     downloads: HashMap<String, DownloadHandle>,
     pending_restart: Option<RestartState>,
-    attach_failures: u32,
-    next_attach_poll: Instant,
     switch_token: u64,
 }
 
@@ -1086,35 +1016,15 @@ impl Supervisor {
                     Ok(selection) => {
                         apply_selection(&self.inner, selection);
                         // Restart the active model on the new engine; the
-                        // old one drains (leases are honored). Ownership
-                        // is known here: startup and every launch run on
-                        // this thread, so the active engine is settled.
+                        // old one drains (leases are honored).
                         let active = self
                             .inner
                             .lock()
                             .active
                             .as_ref()
-                            .map(|engine| (engine.model_id.clone(), engine.owned));
-                        match active {
-                            Some((model_id, true)) => {
-                                self.start_switch(model_id, SwitchKind::Reload, superseded, None);
-                            }
-                            // An attached engine is another process's: a
-                            // reload spawns unshared, so it would start a
-                            // second sidecar beside the owner's (two models
-                            // resident) — and stopping the owner's is not
-                            // ours to do. The new backend applies the next
-                            // time this manager brings an engine up itself
-                            // (the owner lets go, a model switch, a retry).
-                            Some((_, false)) => {
-                                self.inner.lock().set_last_error(
-                                    "The engine in use is run by another Starling process, so it \
-                                     keeps its backend; the new choice applies once Starling \
-                                     starts its own engine."
-                                        .to_string(),
-                                );
-                            }
-                            None => {}
+                            .map(|engine| engine.model_id.clone());
+                        if let Some(model_id) = active {
+                            self.start_switch(model_id, SwitchKind::Reload, superseded, None);
                         }
                     }
                 }
@@ -1203,15 +1113,8 @@ impl Supervisor {
         // Active engine supervision.
         let active = self.inner.lock().active.as_ref().map(Arc::clone);
         if let Some(active) = active {
-            if active.owned {
-                if let Some(sidecar) = &active.sidecar {
-                    if let Some(status) = sidecar.exited_status() {
-                        self.on_active_crash(&active, status);
-                    }
-                }
-            } else if Instant::now() >= self.next_attach_poll {
-                self.next_attach_poll = Instant::now() + ATTACH_POLL;
-                self.poll_attached(&active);
+            if let Some(status) = active.sidecar.as_ref().and_then(Sidecar::exited_status) {
+                self.on_active_crash(&active, status);
             }
         }
 
@@ -1291,50 +1194,8 @@ impl Supervisor {
         });
     }
 
-    fn poll_attached(&mut self, active: &Arc<ActiveEngine>) {
-        // The owner retiring the engine (it switched away) means no new
-        // take may start on it: move on right away. Takes already open
-        // hold their own lease and finish there.
-        let retired = is_retired(&self.config.state_dir, active.key());
-        let healthy = !retired
-            && self
-                .http
-                .get_text(&format!("{}/health", active.endpoint))
-                .ok()
-                .and_then(|body| HealthSnapshot::parse(&body).ok())
-                .is_some_and(|health| health.model == active.slug);
-        if healthy {
-            self.attach_failures = 0;
-            return;
-        }
-        self.attach_failures += 1;
-        if !retired && self.attach_failures < ATTACH_FAILURES_BEFORE_TAKEOVER {
-            return;
-        }
-        self.attach_failures = 0;
-        // The sidecar we attached to is gone: take over (spawn our own)
-        // through the restart path, which defers to a running switch.
-        let model_id = active.model_id.clone();
-        {
-            let mut state = self.inner.lock();
-            if state
-                .active
-                .as_ref()
-                .is_some_and(|current| Arc::ptr_eq(current, active))
-            {
-                state.active = None;
-            }
-            state.set_phase(EnginePhase::Starting);
-        }
-        self.pending_restart = Some(RestartState {
-            model_id,
-            at: Instant::now(),
-        });
-    }
-
-    /// Brings `model_id` up: attach to a matching shared sidecar when
-    /// possible, else spawn (through the spawn lock), driving readiness
-    /// with crash-restart backoff. Blocks the supervisor thread.
+    /// Brings `model_id` up, driving readiness with crash-restart
+    /// backoff. Blocks the supervisor thread.
     fn launch_model(&mut self, model_id: &str) {
         let Some(entry) = self.inner.entry(model_id) else {
             self.inner
@@ -1375,20 +1236,6 @@ impl Supervisor {
             if self.inner.shutdown.load(Ordering::Acquire) {
                 return;
             }
-            // The shared launch protocol: attach to a live, warm,
-            // model-matching sidecar, or win the model's spawn lock.
-            let shutdown = Arc::clone(&self.inner.shutdown);
-            let lock = match claim_spawn_slot(&self.inner, &self.http, &entry, &|| {
-                shutdown.load(Ordering::Acquire)
-            }) {
-                SpawnSlot::Cancelled => return,
-                SpawnSlot::Attach(attached) => {
-                    self.set_active_attached(model_id, &entry.slug, attached);
-                    return;
-                }
-                SpawnSlot::Spawn(lock) => lock,
-            };
-
             let gguf = self.config.models_dir.join(&entry.file_name);
             let engine_path = self
                 .inner
@@ -1397,7 +1244,6 @@ impl Supervisor {
                 .as_ref()
                 .map(|selection| selection.path.clone());
             let Some(engine_path) = engine_path else {
-                release_slot(lock);
                 self.inner
                     .lock()
                     .set_phase(EnginePhase::Failed(EngineFailure::NoUsableEngine {
@@ -1409,7 +1255,6 @@ impl Supervisor {
             let log_path = self.config.state_dir.join("logs/engine.log");
             match Sidecar::spawn(&engine_path, &entry.slug, &gguf, &log_path) {
                 Err(message) => {
-                    release_slot(lock);
                     self.inner
                         .lock()
                         .set_phase(EnginePhase::Failed(EngineFailure::LoadFailed(message)));
@@ -1428,7 +1273,7 @@ impl Supervisor {
                                 .endpoint()
                                 .unwrap_or_else(|| "http://127.0.0.1:0".to_string());
                             let device = health.backend.clone();
-                            let engine = ActiveEngine::owned_engine(
+                            let engine = ActiveEngine::new(
                                 model_id,
                                 &entry.slug,
                                 sidecar,
@@ -1442,21 +1287,17 @@ impl Supervisor {
                                     // this one started: it wins.
                                     drop(state);
                                     engine.stop();
-                                    release_slot(lock);
                                     return;
                                 }
                                 state.active = Some(Arc::clone(&engine));
                                 state.set_phase(EnginePhase::Ready);
                             }
-                            register_engine(&self.inner, &engine, &engine_path, &gguf);
-                            release_slot(lock);
                             update_device_views(&self.inner, device.clone());
                             check_runtime_device_truth(&self.inner, &device);
                             return;
                         }
                         Err(ReadyError::Cancelled) => {
                             sidecar.stop();
-                            release_slot(lock);
                             return;
                         }
                         Err(ReadyError::Crashed {
@@ -1464,7 +1305,6 @@ impl Supervisor {
                             stderr_tail,
                         }) => {
                             sidecar.stop();
-                            release_slot(lock);
                             let mut state = self.inner.lock();
                             state.record_crash(stderr_tail.clone());
                             if crash_loop_reached(
@@ -1491,7 +1331,6 @@ impl Supervisor {
                         }
                         Err(error) => {
                             sidecar.stop();
-                            release_slot(lock);
                             self.inner
                                 .lock()
                                 .set_phase(EnginePhase::Failed(map_ready_error(error)));
@@ -1501,22 +1340,6 @@ impl Supervisor {
                 }
             }
         }
-    }
-
-    fn set_active_attached(&mut self, model_id: &str, slug: &str, attached: Attached) {
-        let engine = ActiveEngine::attached_engine(
-            model_id,
-            slug,
-            attached.endpoint,
-            attached.pid,
-            attached.device,
-        );
-        let mut state = self.inner.lock();
-        if state.active.is_some() {
-            return;
-        }
-        state.active = Some(engine);
-        state.set_phase(EnginePhase::Ready);
     }
 
     fn start_download(&mut self, model_id: String) {
@@ -1580,7 +1403,6 @@ impl Supervisor {
             cancel: Arc::clone(&cancel),
             confirm,
             superseded,
-            spawn_lock: Mutex::new(None),
             inner: Arc::clone(&self.inner),
         };
         let inner = Arc::clone(&self.inner);
@@ -1615,94 +1437,11 @@ impl Supervisor {
         for engine in engines {
             engine.stop();
         }
-        remove_registration(&self.config.state_dir, std::process::id());
         let mut state = self.inner.lock();
         state.active = None;
         state.draining.clear();
         state.switch_incoming = None;
         state.bump();
-    }
-}
-
-/// Registry-first attach: an entry answers `/health` with the right
-/// slug, is loaded and warm, serves the model we want, and is not being
-/// retired by its owner.
-fn try_attach(inner: &Inner, http: &LoopbackHttp, entry: &CatalogEntry) -> Option<Attached> {
-    let state_dir = &inner.config.state_dir;
-    let registration = crate::engine::registry::read_registration(state_dir)?;
-    if registration.model_id != entry.id || registration.slug != entry.slug {
-        return None;
-    }
-    let key = EngineKey {
-        pid: registration.pid,
-        port: registration.port,
-    };
-    if is_retired(state_dir, key) {
-        // Its owner is draining it; it takes no new work.
-        return None;
-    }
-    let endpoint = format!("http://127.0.0.1:{}", registration.port);
-    let body = http.get_text(&format!("{endpoint}/health")).ok()?;
-    let health = HealthSnapshot::parse(&body).ok()?;
-    if health.model != entry.slug || !health.loaded || !health.warm {
-        return None;
-    }
-    Some(Attached {
-        endpoint,
-        pid: registration.pid,
-        device: Some(health.backend),
-    })
-}
-
-/// What the shared launch protocol decided.
-enum SpawnSlot {
-    /// Another instance serves the model: use its sidecar.
-    Attach(Attached),
-    /// Spawn our own. The lock (when the lock file could be created)
-    /// must be held until the registry names the new sidecar.
-    Spawn(Option<SpawnLock>),
-    Cancelled,
-}
-
-/// The shared launch protocol (#362 step 3), used by every path that
-/// brings a model up: attach to a live sidecar serving it, else take the
-/// model's spawn lock. While another instance holds the lock this waits
-/// for its sidecar to become attachable, or for the lock to be released
-/// or go stale (holder gone, or past the stale age).
-fn claim_spawn_slot(
-    inner: &Inner,
-    http: &LoopbackHttp,
-    entry: &CatalogEntry,
-    cancelled: &dyn Fn() -> bool,
-) -> SpawnSlot {
-    loop {
-        if cancelled() {
-            return SpawnSlot::Cancelled;
-        }
-        if let Some(attached) = try_attach(inner, http, entry) {
-            return SpawnSlot::Attach(attached);
-        }
-        match try_spawn_lock(&inner.config.state_dir, &entry.id) {
-            Ok(LockOutcome::Acquired(lock)) => {
-                // The holder we waited on may have registered right
-                // before releasing: attach to it rather than duplicate.
-                if let Some(attached) = try_attach(inner, http, entry) {
-                    lock.release();
-                    return SpawnSlot::Attach(attached);
-                }
-                return SpawnSlot::Spawn(Some(lock));
-            }
-            Ok(LockOutcome::HeldElsewhere) => std::thread::sleep(Duration::from_millis(250)),
-            // No lock file possible (unwritable state dir): sharing is
-            // unavailable, but the model still starts.
-            Err(_) => return SpawnSlot::Spawn(None),
-        }
-    }
-}
-
-fn release_slot(lock: Option<SpawnLock>) {
-    if let Some(lock) = lock {
-        lock.release();
     }
 }
 
@@ -1727,41 +1466,6 @@ fn map_ready_error(error: ReadyError) -> EngineFailure {
         ReadyError::LoadFailed(message) => EngineFailure::LoadFailed(message),
         ReadyError::Cancelled => EngineFailure::LoadFailed("start cancelled".to_string()),
         ReadyError::TimedOut(message) => EngineFailure::LoadFailed(message),
-    }
-}
-
-/// Names `engine` in the shared registry. A failed write only costs
-/// sharing (a second window starts its own engine), so it is a notice.
-fn register_engine(
-    inner: &Arc<Inner>,
-    engine: &ActiveEngine,
-    engine_path: &std::path::Path,
-    gguf: &std::path::Path,
-) {
-    if let Err(error) = write_registration(
-        &inner.config.state_dir,
-        &registration_for(engine, engine_path, gguf),
-    ) {
-        inner.lock().add_notice(format!(
-            "Could not record the running engine for other Starling windows ({error}); \
-             each window will start its own engine."
-        ));
-    }
-}
-
-fn registration_for(
-    engine: &ActiveEngine,
-    engine_path: &std::path::Path,
-    gguf: &std::path::Path,
-) -> SidecarRegistration {
-    SidecarRegistration {
-        pid: engine.pid,
-        port: engine.port(),
-        slug: engine.slug.clone(),
-        model_id: engine.model_id.clone(),
-        gguf: gguf.display().to_string(),
-        engine_path: engine_path.display().to_string(),
-        owner_pid: std::process::id(),
     }
 }
 
@@ -1913,9 +1617,6 @@ struct SwitchCtx {
     /// unlike `cancel`, a user's Cancel does not set it, so recovery
     /// after a cancel (restoring the previous engine) keys off it.
     superseded: Arc<AtomicBool>,
-    /// The spawn lock of this worker's own sidecar, held from spawn until
-    /// the cutover registers it (or the attempt fails).
-    spawn_lock: Mutex<Option<SpawnLock>>,
     inner: Arc<Inner>,
 }
 
@@ -1939,24 +1640,8 @@ impl SwitchCtx {
             cancel: Arc::clone(&self.superseded),
             confirm: Arc::clone(&self.confirm),
             superseded: Arc::clone(&self.superseded),
-            spawn_lock: Mutex::new(None),
             inner: Arc::clone(&self.inner),
         }
-    }
-
-    fn hold_spawn_lock(&self, lock: Option<SpawnLock>) {
-        let previous = std::mem::replace(
-            &mut *self
-                .spawn_lock
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()),
-            lock,
-        );
-        release_slot(previous);
-    }
-
-    fn release_spawn_lock(&self) {
-        self.hold_spawn_lock(None);
     }
 
     fn lock(&self) -> MutexGuard<'_, SharedState> {
@@ -2047,42 +1732,13 @@ fn run_switch(ctx: SwitchCtx) {
         return;
     }
 
-    // 2. Another instance already serving the target costs no memory and
-    //    no startup: use its sidecar.
-    if let Some(attached) = try_attach(&ctx.inner, &LoopbackHttp::new(), &entry) {
-        let started = ctx.switch_started();
-        ctx.set_stage(SwitchStage::CuttingOver);
-        let engine = ActiveEngine::attached_engine(
-            &entry.id,
-            &entry.slug,
-            attached.endpoint,
-            attached.pid,
-            attached.device,
-        );
-        let report = CutoverReport {
-            mode: SwapMode::Rolling,
-            started,
-            from: None,
-            peak_rss_bytes: None,
-        };
-        if !cut_over(&ctx, engine, &entry, Some(report)) {
-            recover_if_idle(&ctx, None);
-        }
-        ctx.end_switch();
-        return;
-    }
-
-    // 3. Memory policy.
+    // 2. Memory policy.
     let incoming_est = estimate_resident(entry.size_bytes);
-    // Only an engine this instance owns can be unloaded to make room: an
-    // attached engine belongs to another instance and keeps running (and
-    // using its memory) whatever this switch does.
     let outgoing_est = {
         let state = ctx.lock();
         state
             .active
             .as_ref()
-            .filter(|engine| engine.owned)
             .and_then(|engine| ctx.inner.entry(&engine.model_id))
             .map(|outgoing| estimate_resident(outgoing.size_bytes))
     };
@@ -2111,7 +1767,7 @@ fn run_switch(ctx: SwitchCtx) {
         SwapPlan::Rolling | SwapPlan::NeedsDrain { .. } => {}
     }
 
-    // 4. Execute. Drain swaps stop the old engine first (with the
+    // 3. Execute. Drain swaps stop the old engine first (with the
     //    user's confirmation); rolling swaps cut over atomically.
     if matches!(plan, SwapPlan::NeedsDrain { .. }) {
         run_drain_swap(&ctx, &entry, incoming_est, available);
@@ -2250,40 +1906,17 @@ enum SwitchSpawnError {
 /// switch's incoming engine. `retry_crashes` restarts with backoff when
 /// there is no old engine to fall back on (first activation) — that is
 /// the path where a crash loop must trip (#362 step 4).
-///
-/// `share` applies the shared launch protocol first: when another
-/// instance already serves the model, its sidecar is used (an attached,
-/// not owned, engine) instead of starting a duplicate. A backend reload
-/// must not share — the registry may name the very engine it replaces.
 fn spawn_incoming(
     ctx: &SwitchCtx,
     entry: &CatalogEntry,
     retry_crashes: bool,
-    share: bool,
 ) -> Result<Arc<ActiveEngine>, SwitchSpawnError> {
-    let http = LoopbackHttp::new();
     loop {
         if ctx.cancelled() {
             return Err(SwitchSpawnError::Cancelled);
         }
-        if share {
-            match claim_spawn_slot(&ctx.inner, &http, entry, &|| ctx.cancelled()) {
-                SpawnSlot::Cancelled => return Err(SwitchSpawnError::Cancelled),
-                SpawnSlot::Attach(attached) => {
-                    return Ok(ActiveEngine::attached_engine(
-                        &entry.id,
-                        &entry.slug,
-                        attached.endpoint,
-                        attached.pid,
-                        attached.device,
-                    ));
-                }
-                SpawnSlot::Spawn(lock) => ctx.hold_spawn_lock(lock),
-            }
-        }
         let engine_path = ctx.lock().selection.as_ref().map(|s| s.path.clone());
         let Some(engine_path) = engine_path else {
-            ctx.release_spawn_lock();
             return Err(SwitchSpawnError::Failed(
                 "no usable engine was selected".to_string(),
             ));
@@ -2293,7 +1926,6 @@ fn spawn_incoming(
         let sidecar = match Sidecar::spawn(&engine_path, &entry.slug, &gguf, &log_path) {
             Ok(sidecar) => sidecar,
             Err(message) => {
-                ctx.release_spawn_lock();
                 return Err(SwitchSpawnError::Failed(message));
             }
         };
@@ -2329,7 +1961,7 @@ fn spawn_incoming(
                 let endpoint = sidecar
                     .endpoint()
                     .unwrap_or_else(|| "http://127.0.0.1:0".to_string());
-                let engine = ActiveEngine::owned_engine(
+                let engine = ActiveEngine::new(
                     &entry.id,
                     &entry.slug,
                     sidecar,
@@ -2341,14 +1973,10 @@ fn spawn_incoming(
             }
             Err(ReadyError::Cancelled) => {
                 sidecar.stop();
-                ctx.release_spawn_lock();
                 return Err(SwitchSpawnError::Cancelled);
             }
             Err(error) if error.is_crash() && retry_crashes => {
                 sidecar.stop();
-                // The next attempt claims the slot again (another instance
-                // may have brought the model up meanwhile).
-                ctx.release_spawn_lock();
                 let tail = crash_tail(&error);
                 let mut state = ctx.lock();
                 state.record_crash(tail.clone());
@@ -2373,7 +2001,6 @@ fn spawn_incoming(
             }
             Err(error) => {
                 sidecar.stop();
-                ctx.release_spawn_lock();
                 return Err(SwitchSpawnError::Failed(map_ready_error(error).to_string()));
             }
         }
@@ -2429,7 +2056,7 @@ fn run_rolling_swap(ctx: &SwitchCtx, entry: &CatalogEntry) {
     let has_old = ctx.lock().active.is_some();
     let sampler = start_rss_sampler(ctx);
     ctx.set_stage(SwitchStage::Loading);
-    match spawn_incoming(ctx, entry, !has_old, true) {
+    match spawn_incoming(ctx, entry, !has_old) {
         Ok(engine) => {
             ctx.set_stage(SwitchStage::CuttingOver);
             let report = CutoverReport::new(SwapMode::Rolling, started, None, &sampler);
@@ -2552,19 +2179,6 @@ fn run_drain_swap(
         }
         state.bump();
     }
-    // Other app instances attached to this engine may hold takes too:
-    // retire it first (no new foreign take starts on it), then wait for
-    // both our leases and theirs.
-    let state_dir = ctx.inner.config.state_dir.clone();
-    let old_key = ctx
-        .lock()
-        .active
-        .as_ref()
-        .filter(|engine| engine.owned)
-        .map(|engine| engine.key());
-    if let Some(key) = old_key {
-        retire_engine(&state_dir, key);
-    }
     // Wait for the old engine's leases to drop (hard cap). The zero check
     // and taking the engine out of `active` happen under one lock: `lease()`
     // takes the same lock, so a take cannot start on the old engine between
@@ -2572,15 +2186,9 @@ fn run_drain_swap(
     let deadline = Instant::now() + DRAIN_HARD_CAP;
     let old = loop {
         if ctx.cancelled() {
-            if let Some(key) = old_key {
-                unretire_engine(&state_dir, key);
-            }
             ctx.end_switch();
             return;
         }
-        let foreign = old_key
-            .map(|key| foreign_leases(&state_dir, key))
-            .unwrap_or(0);
         {
             let mut state = ctx.lock();
             let leases = state
@@ -2588,7 +2196,7 @@ fn run_drain_swap(
                 .as_ref()
                 .map(|engine| engine.leases.load(Ordering::Acquire))
                 .unwrap_or(0);
-            if (leases == 0 && foreign == 0) || Instant::now() >= deadline {
+            if leases == 0 || Instant::now() >= deadline {
                 break state.active.take();
             }
         }
@@ -2599,16 +2207,13 @@ fn run_drain_swap(
     if let Some(old) = &old {
         old.stop();
     }
-    if let Some(key) = old_key {
-        clear_engine_leases(&state_dir, key);
-    }
     let previous_id = old.as_ref().map(|engine| engine.model_id.clone());
     drop(old);
     ctx.phase_when_no_active(EnginePhase::Starting);
 
     let sampler = start_rss_sampler(ctx);
     ctx.set_stage(SwitchStage::Loading);
-    let failure = match spawn_incoming(ctx, entry, false, true) {
+    let failure = match spawn_incoming(ctx, entry, false) {
         Ok(engine) => {
             ctx.set_stage(SwitchStage::CuttingOver);
             let report =
@@ -2650,7 +2255,7 @@ fn restore_previous(ctx: &SwitchCtx, previous_id: &str, failure: Option<&str>) {
     };
     let recovery = ctx.recovery();
     recovery.set_stage(SwitchStage::Loading);
-    match spawn_incoming(&recovery, &entry, false, true) {
+    match spawn_incoming(&recovery, &entry, false) {
         Ok(engine) => {
             // Not a switch: the report keeps describing the last real one.
             if cut_over(&recovery, engine, &entry, None) {
@@ -2687,7 +2292,7 @@ fn restore_previous(ctx: &SwitchCtx, previous_id: &str, failure: Option<&str>) {
 /// drains. A newer activation cancels this like any switch.
 fn run_reload(ctx: &SwitchCtx, entry: &CatalogEntry) {
     ctx.set_stage(SwitchStage::Loading);
-    match spawn_incoming(ctx, entry, false, false) {
+    match spawn_incoming(ctx, entry, false) {
         Ok(engine) => {
             ctx.set_stage(SwitchStage::CuttingOver);
             // Not a model switch: `last_switch` keeps reporting the user's
@@ -2705,8 +2310,8 @@ fn run_reload(ctx: &SwitchCtx, entry: &CatalogEntry) {
     ctx.end_switch();
 }
 
-/// Makes `engine` the active one: new leases point at it, the registry
-/// names it, the previous engine (if any) drains. Returns `false`, with
+/// Makes `engine` the active one: new leases point at it, the previous
+/// engine (if any) drains. Returns `false`, with
 /// `engine` stopped, when the switch was cancelled or superseded: the
 /// check runs under the state lock, and a newer intent marks this one
 /// superseded under the same lock, so a stale worker can never replace
@@ -2717,8 +2322,6 @@ fn cut_over(
     entry: &CatalogEntry,
     report: Option<CutoverReport>,
 ) -> bool {
-    let engine_path = ctx.lock().selection.as_ref().map(|s| s.path.clone());
-    let gguf = ctx.inner.config.models_dir.join(&entry.file_name);
     let old = {
         let mut state = ctx.lock();
         if state
@@ -2732,7 +2335,6 @@ fn cut_over(
             state.bump();
             drop(state);
             engine.stop();
-            ctx.release_spawn_lock();
             return false;
         }
         let old = state.active.replace(Arc::clone(&engine));
@@ -2763,14 +2365,6 @@ fn cut_over(
         state.bump();
         old
     };
-    // Only an engine we own is ours to register; an attached one is
-    // already named by its owner.
-    if engine.owned {
-        if let Some(path) = engine_path {
-            register_engine(&ctx.inner, &engine, &path, &gguf);
-        }
-    }
-    ctx.release_spawn_lock();
     if let Some(old) = old {
         spawn_drain_watcher(Arc::clone(&ctx.inner), old);
     }
@@ -2785,36 +2379,19 @@ fn cut_over(
     true
 }
 
-/// Watches a draining engine: stop it once its last lease drops (ours
-/// and those of other instances attached to it), or at the hard cap.
+/// Watches a draining engine: stop it once its last lease drops, or at
+/// the hard cap.
 /// Runs on its own thread so the supervisor never blocks a drain on it.
 fn spawn_drain_watcher(inner: Arc<Inner>, engine: Arc<ActiveEngine>) {
     let fallback_inner = Arc::clone(&inner);
     let spawned = std::thread::Builder::new()
         .name("starling-engine-drain".to_string())
         .spawn(move || {
-            let state_dir = inner.config.state_dir.clone();
-            // Only the owner stops the engine, so only the owner retires
-            // it and waits for other instances' takes.
-            let key = engine.owned.then(|| engine.key());
-            if let Some(key) = key {
-                retire_engine(&state_dir, key);
-            }
             let started = Instant::now();
-            while started.elapsed() < DRAIN_HARD_CAP {
-                let local = engine.leases.load(Ordering::Acquire);
-                let foreign = key
-                    .map(|key| foreign_leases(&state_dir, key))
-                    .unwrap_or(0);
-                if local == 0 && foreign == 0 {
-                    break;
-                }
+            while started.elapsed() < DRAIN_HARD_CAP && engine.leases.load(Ordering::Acquire) > 0 {
                 std::thread::sleep(Duration::from_millis(200));
             }
             engine.stop();
-            if let Some(key) = key {
-                clear_engine_leases(&state_dir, key);
-            }
             let mut state = inner.lock();
             state
                 .draining
@@ -2855,7 +2432,6 @@ fn start_rss_sampler(ctx: &SwitchCtx) -> RssSampler {
                     let state = inner.lock();
                     let mut pids: Vec<u32> = collect_engines(&state)
                         .iter()
-                        .filter(|engine| engine.owned)
                         .map(|engine| engine.pid)
                         .collect();
                     if let Some(pid) = state.incoming_pid {
@@ -3016,12 +2592,9 @@ mod tests {
             rx,
             inner,
             config,
-            http: LoopbackHttp::new(),
             switch: None,
             downloads: HashMap::new(),
             pending_restart: None,
-            attach_failures: 0,
-            next_attach_poll: Instant::now(),
             switch_token: 0,
         }
     }
@@ -3065,8 +2638,8 @@ mod tests {
     fn a_stale_crash_report_leaves_the_replacement_serving() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut supervisor = idle_supervisor(dir.path());
-        let a = ActiveEngine::attached_engine("model-a", "parakeet", "http://127.0.0.1:1".into(), 1, None);
-        let b = ActiveEngine::attached_engine("model-b", "parakeet", "http://127.0.0.1:2".into(), 2, None);
+        let a = ActiveEngine::without_process("model-a", "parakeet", "http://127.0.0.1:1".into(), 1);
+        let b = ActiveEngine::without_process("model-b", "parakeet", "http://127.0.0.1:2".into(), 2);
         {
             let mut state = supervisor.inner.lock();
             state.active = Some(Arc::clone(&b));
@@ -3089,12 +2662,11 @@ mod tests {
 
     #[test]
     fn lease_provenance_names_the_model() {
-        let engine = ActiveEngine::attached_engine(
+        let engine = ActiveEngine::without_process(
             "parakeet-v3-q8",
             "parakeet",
             "http://127.0.0.1:1234".to_string(),
             42,
-            None,
         );
         assert_eq!(engine.leases.load(Ordering::Acquire), 0);
         engine.leases.fetch_add(1, Ordering::Acquire);
@@ -3103,7 +2675,6 @@ mod tests {
             endpoint: engine.endpoint.clone(),
             slug: engine.slug.clone(),
             model_id: engine.model_id.clone(),
-            _marker: None,
         };
         assert_eq!(lease.endpoint(), "http://127.0.0.1:1234");
         assert_eq!(lease.slug(), "parakeet");

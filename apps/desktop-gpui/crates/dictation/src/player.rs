@@ -1,6 +1,4 @@
-//! WAV playback, ported from the `<audio>` element behavior in
-//! `apps/desktop/src/App.tsx` (transcript drawer playback control) — see
-//! `apps/desktop-gpui/PORT.md`.
+//! WAV playback for the transcript drawer.
 //!
 //! One rodio output stream is kept alive for the [`Player`]'s lifetime;
 //! `play` decodes the WAV into a fresh [`rodio::Sink`], replacing any current

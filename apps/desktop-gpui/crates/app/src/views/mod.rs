@@ -294,7 +294,6 @@ mod tests {
             model_id: model_id.to_string(),
             endpoint: "http://127.0.0.1:51309".to_string(),
             pid: 42,
-            owned: true,
             device: device.map(str::to_string),
         }
     }

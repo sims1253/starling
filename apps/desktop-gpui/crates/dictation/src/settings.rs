@@ -1,7 +1,4 @@
-//! Persistent app settings, replacing the `localStorage` keys used by
-//! `apps/desktop/src/App.tsx` (`starling:endpoint`, `starling:model`,
-//! `starling:terms`) with a JSON file. See
-//! `apps/desktop-gpui/PORT.md`.
+//! Persistent app settings, as a JSON file.
 
 //! # The dropped `storageBackend` key (D14, deliberate)
 //!

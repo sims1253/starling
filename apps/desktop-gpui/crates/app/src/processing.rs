@@ -1637,7 +1637,7 @@ mod tests {
 
     /// A capture with a finalized transcript, like the tests in
     /// `staging.rs` build one.
-    fn saved_take_with_transcript(store: &crate::store::Store, text: &str) -> (String, String) {
+    fn saved_take_with_transcript(store: &crate::store::TestStore, text: &str) -> (String, String) {
         use starling_dictation::{audio, storage::TranscriptionResult};
         let wav = audio::encode_wav_16k(&audio::PcmAudio {
             samples: vec![0.; 160],
@@ -1712,13 +1712,13 @@ mod tests {
     /// Processes a saved take with `active` as the active mode.
     fn process_with(
         cx: &mut gpui::TestAppContext,
-        store: &crate::store::Store,
+        store: &crate::store::TestStore,
         raw: &str,
         active: &str,
         with_api: bool,
     ) -> (gpui::Entity<StarlingApp>, String) {
         let (id, _attempt) = saved_take_with_transcript(store, raw);
-        let app = cx.new(|cx| StarlingApp::for_test(Some(store.clone()), cx));
+        let app = cx.new(|cx| StarlingApp::for_test(Some(crate::store::Store::clone(store)), cx));
         app.update(cx, |app, cx| {
             if with_api {
                 app.processing_settings = settings();

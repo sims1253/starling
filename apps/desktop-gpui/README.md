@@ -4,9 +4,6 @@ The Starling desktop app, built natively in Rust with
 [Zed's gpui](https://github.com/zed-industries/zed/tree/main/crates/gpui)
 (crates.io `gpui 0.2.2`). It began as a port of the former Electron desktop
 app (`apps/desktop`, now removed) and is the only desktop app in the tree.
-[COMPARISON.md](COMPARISON.md) records the measurements taken while both apps
-existed; [PORT.md](PORT.md) documents the ported behavior contract and the
-module map back to the removed TypeScript sources.
 
 ![screenshot](screenshot.png)
 
@@ -29,17 +26,19 @@ development builds; notarized installers are a separate release task.
 
 ## Layout
 
-- `crates/dictation` (`starling-dictation`) — logic + IO, no UI: WAV prep
-  (PCM16 16 kHz mono, ported from the removed TypeScript `@starling/dictation`
-  audio module), the transcription HTTP client (the `/v1` batch API, mirrors
-  the Electron native request path), a file-backed session store replacing
-  IndexedDB (same manifest schema), settings persistence replacing
-  `localStorage`, the fidelity analyzer, an FFT for the live waveform, cpal mic
-  capture, and rodio playback. 81 unit tests.
-- `crates/app` (`starling-gpui`) — the gpui app: topbar/connection indicator,
-  capture pane with 52-bar waveform + record button, history column, transcript
-  drawer with fidelity warnings, settings modal, in-app + global hotkeys,
-  diagnostics hook.
+- `crates/dictation` (`starling-dictation`) — logic + IO, no UI: WAV prep,
+  the transcription HTTP client, the storage-v2 store (SQLite + audio
+  journals), settings, the bundled-engine manager, the fidelity analyzer,
+  cpal mic capture, and rodio playback.
+- `crates/runtime` (`starling-runtime`) — the capture, docs, delivery and
+  jobs state machines.
+- `crates/host` (`starling-runtime-host`) — the per-user recording service:
+  the one process that owns the data root, the runtime, the engine, and the
+  IPC endpoint the app talks to.
+- `crates/app` (`starling-gpui`) — the gpui app, a client of the host:
+  capture pane, history, transcript drawer, settings, hotkeys, overlay.
+- `crates/insertion`, `crates/processing` — text delivery into other apps,
+  and transcript processing providers.
 - `GPUI_NOTES.md` — verified gpui 0.2.2 API cheat-sheet used to build the UI.
 
 ## Run
@@ -77,7 +76,7 @@ Data locations (all created on demand):
 - recording service log: `~/.local/share/starling-gpui/runtime-host.log`
 - settings: `~/.config/starling-gpui/settings.json`
 - downloaded models: `~/.local/share/starling-gpui/models/`
-- engine state (registry, spawn lock): `~/.local/share/starling-gpui/engine/`
+- engine state: `~/.local/share/starling-gpui/engine/`
 - engine log: `~/.local/share/starling-gpui/engine/logs/engine.log`
 
 Development builds do not bundle `engines/`. Stage one from built server

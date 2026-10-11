@@ -119,8 +119,7 @@ pub struct RuntimeConfig {
     /// in-memory store so that constructing a config — tests do it freely
     /// — never touches the user's data root; a production embedder
     /// overrides this with storage v2 (the I4 host opens it at its
-    /// explicit root; a root-less embedder uses
-    /// [`default_capture_store`]).
+    /// explicit root).
     pub capture_store: Arc<dyn CaptureStore>,
     /// Who hears about takes beyond the event stream (#220: the host's
     /// take feed). Nobody by default.
@@ -220,41 +219,6 @@ impl RuntimeConfig {
         self.capture = config;
         self
     }
-}
-
-/// The production capture persistence (D14: storage v2 is THE store — no
-/// opt-in flag, no v1 fallback): [`machine::capture::V2CaptureStore`] at
-/// `StoreV2`'s default data root. The in-memory store is returned only
-/// when no data root can be opened at all — a degenerate host, not a
-/// second backend to switch to.
-///
-/// Data-visibility note (D14, docs/program/DECISIONS.md): the v1
-/// `FileSessionStore`, its reader and the migration flow were removed
-/// deliberately, by user directive — the product is pre-release and there
-/// is no user data to be compatible with. Takes persisted under the old
-/// v1 layout are therefore invisible to a v2 root by design, not by
-/// accident; if that ever changes, the directive (not this seam) is what
-/// changes. This is not a migration entry point and must not grow one.
-///
-/// Embedder-facing: nothing inside this workspace calls it in
-/// production, and the I4 service host deliberately never will — it owns
-/// an explicit data root (its `--root` CLI, its lease) and opens
-/// [`machine::capture::V2CaptureStore`] there directly, so a root that
-/// will not open is a startup refusal rather than a silent slide onto
-/// this function's in-memory fallback. The function remains the recipe
-/// for embedders *without* a root-ownership surface: the GPUI in-process
-/// switchover passes `.with_capture_store(default_capture_store())` at
-/// its entry point. It is pinned, not left to rot, by
-/// `starling-runtime-host`'s `tests/default_store.rs`, which constructs
-/// it through the public API, persists a take that survives a reopen of
-/// the default root, and boots a runtime configured with it (#259).
-pub fn default_capture_store() -> Arc<dyn CaptureStore> {
-    if let Ok(root) = starling_dictation::store_v2::StoreV2::default_root() {
-        if let Ok(store) = machine::capture::V2CaptureStore::open(root) {
-            return Arc::new(store);
-        }
-    }
-    InMemoryCaptureStore::new()
 }
 
 /// The whole-runtime projection: per-machine states, the frozen-route

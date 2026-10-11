@@ -1244,7 +1244,7 @@ mod tests {
     fn failed_head_write_is_not_persisted_or_discarded_on_done(cx: &mut gpui::TestAppContext) {
         let root = tempfile::tempdir().unwrap();
         let store = crate::store::Store::at_test_root(root.path());
-        let app = cx.new(|cx| StarlingApp::for_test(Some(store), cx));
+        let app = cx.new(|cx| StarlingApp::for_test(Some(store.clone()), cx));
         app.update(cx, |app, cx| {
             app.begin_staging(cx);
             let staging = app.staging.as_mut().unwrap();
@@ -1283,7 +1283,8 @@ mod tests {
     #[gpui::test]
     fn unavailable_rebase_keeps_the_live_text_and_reports_failure(cx: &mut gpui::TestAppContext) {
         let root = tempfile::tempdir().unwrap();
-        for store in [None, Some(crate::store::Store::at_test_root(root.path()))] {
+        let test_store = crate::store::Store::at_test_root(root.path());
+        for store in [None, Some(test_store.clone())] {
             let app = cx.new(|cx| StarlingApp::for_test(store, cx));
             app.update(cx, |app, cx| {
                 app.begin_staging(cx);
@@ -1308,7 +1309,7 @@ mod tests {
         }
     }
 
-    fn saved_take(store: &crate::store::Store) -> (String, String) {
+    fn saved_take(store: &crate::store::TestStore) -> (String, String) {
         use starling_dictation::audio;
         let wav = audio::encode_wav_16k(&audio::PcmAudio {
             samples: vec![0.; 160],
@@ -1325,7 +1326,7 @@ mod tests {
     }
 
     /// Stores `text` as the take's transcript; returns the attempt id.
-    fn transcribe(store: &crate::store::Store, id: &str, text: &str) -> String {
+    fn transcribe(store: &crate::store::TestStore, id: &str, text: &str) -> String {
         use starling_dictation::storage::TranscriptionResult;
         store.mark_attempt(id, "test").unwrap();
         store
@@ -1916,7 +1917,7 @@ mod tests {
     fn a_failed_background_save_can_be_reopened_from_history(cx: &mut gpui::TestAppContext) {
         let root = tempfile::tempdir().unwrap();
         let store = crate::store::Store::at_test_root(root.path());
-        let app = cx.new(|cx| StarlingApp::for_test(Some(store), cx));
+        let app = cx.new(|cx| StarlingApp::for_test(Some(store.clone()), cx));
         app.update(cx, |app, cx| {
             app.begin_staging(cx);
             let staging = app.staging.as_mut().unwrap();
@@ -2107,7 +2108,7 @@ mod tests {
     }
 
     /// A saved, transcribed take with a current proposal.
-    fn proposed_take(app: &mut StarlingApp, store: &crate::store::Store) -> String {
+    fn proposed_take(app: &mut StarlingApp, store: &crate::store::TestStore) -> String {
         let (id, attempt) = saved_take(store);
         propose(app, store, &id, &attempt);
         id

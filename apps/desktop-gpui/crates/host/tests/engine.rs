@@ -282,7 +282,6 @@ fn jobs_run_on_the_host_owned_engine_which_outlives_its_renderer() {
     // The host started the engine itself — no renderer exists yet.
     wait_ready(&manager);
     let active = manager.snapshot().active.expect("a ready engine is active");
-    assert!(active.owned, "the host owns the sidecar it started");
 
     // An observer is connected (and greeted) first; a renderer then
     // submits a job and dies straight away — the fixture engine answers
@@ -377,53 +376,39 @@ fn a_host_that_is_a_client_never_starts_an_engine() {
     owner.shutdown();
 }
 
-/// The engine the host attached to (not started) dies under the host
-/// with no warning — the desktop app owned the shared sidecar and was
-/// hard-killed, so the sidecar's `--parent-pid` watchdog ended it
-/// abruptly (SIGKILL here: no retire step, nothing tells the attached
-/// host first). A job submitted right then hits the dead engine; it must
-/// still complete — the provider retries once on whatever engine the
-/// supervisors bring back (a restart or the host's takeover).
+/// The host's engine dies with no warning (SIGKILL: no drain, nothing
+/// tells the host first). A job submitted right then hits the dead
+/// engine; it must still complete — the provider retries once on the
+/// engine the supervisor restarts.
 #[cfg(unix)] // the abrupt kill is a signal
 #[test]
-fn a_job_survives_the_attached_engine_dying_abruptly() {
+fn a_job_survives_the_engine_dying_abruptly() {
     let Some(fixture) = fixture() else { return };
     let root = tempfile::tempdir().unwrap();
-    let config = engine_config(root.path(), Some(&fixture));
-
-    // The "renderer" owns the sidecar: it started first.
-    let app_engine =
-        starling_dictation::engine::EngineManager::start(config.clone(), Some(MODEL_ID.into()));
-    wait_ready(&app_engine);
-    assert!(app_engine.snapshot().active.unwrap().owned);
-
     let engine = EngineChoice::Builtin {
-        config,
+        config: engine_config(root.path(), Some(&fixture)),
         active_model: Some(MODEL_ID.into()),
     };
     let mut host = serve(host_config(root.path(), engine)).expect("host serves");
     let manager = host.engine().expect("builtin mode").clone();
     wait_ready(&manager);
-    let attached = manager.snapshot().active.unwrap();
-    assert!(!attached.owned, "the host attached to the app's sidecar");
+    let killed = manager.snapshot().active.unwrap();
 
     let client = connect(host.socket_path());
     record_and_submit_after(&client, "take_a", "job_a", || {
-        // Re-read right before the kill: the config restarts a dead
-        // engine on a 100 ms backoff, so the earlier snapshot could be
-        // stale — signal only the engine that is still the attached one
-        // (endpoint and pid), never a pid the supervisor already
-        // replaced (or the OS recycled).
+        // Re-read right before the kill: signal only the engine that is
+        // still the active one (endpoint and pid), never a pid the
+        // supervisor already replaced (or the OS recycled).
         let current = manager.snapshot().active.expect("engine still active");
         assert_eq!(
             (current.endpoint.as_str(), current.pid),
-            (attached.endpoint.as_str(), attached.pid),
+            (killed.endpoint.as_str(), killed.pid),
             "the sidecar was replaced before the kill"
         );
         // SAFETY: kill(2) on the sidecar's pid; no memory is involved.
-        assert_eq!(unsafe { libc::kill(attached.pid as i32, libc::SIGKILL) }, 0);
+        assert_eq!(unsafe { libc::kill(killed.pid as i32, libc::SIGKILL) }, 0);
         let deadline = Instant::now() + Duration::from_secs(5);
-        while endpoint_answers(&attached.endpoint) {
+        while endpoint_answers(&killed.endpoint) {
             assert!(
                 Instant::now() < deadline,
                 "the killed sidecar still answers"
@@ -442,12 +427,11 @@ fn a_job_survives_the_attached_engine_dying_abruptly() {
     assert_eq!(outcome.payload()["backend"], format!("engine:{MODEL_ID}"));
     let now = manager.snapshot().active.expect("an engine serves again");
     assert_ne!(
-        now.pid, attached.pid,
+        now.pid, killed.pid,
         "the job ran on the replacement engine"
     );
     drop(client);
     host.shutdown();
-    app_engine.shutdown();
 }
 
 fn wait_ready(manager: &starling_dictation::engine::EngineManager) {
@@ -984,7 +968,6 @@ fn an_activation_over_the_socket_switches_and_drains_the_host_s_engine() {
         .snapshot
         .and_then(|snapshot| snapshot.active)
         .expect("an engine is active");
-    assert!(first.owned, "the host owns its engine");
 
     // A take holds the engine (as a transcription does).
     let lease = host.engine().expect("builtin").lease().expect("a lease on the engine");
@@ -1052,7 +1035,6 @@ fn a_backend_change_over_the_socket_reloads_the_engine_live() {
                 .is_some_and(|active| active.pid != first.pid)
     });
     let active = reloaded.snapshot.unwrap().active.unwrap();
-    assert!(active.owned);
     assert!(endpoint_answers(&active.endpoint), "the new engine serves");
     wait_until_gone(&first.endpoint, "the replaced engine was left running beside the new one");
     drop(app);
