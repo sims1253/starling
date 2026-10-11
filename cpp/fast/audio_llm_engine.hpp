@@ -66,12 +66,14 @@ public:
     bool generate(const std::vector<int32_t>& prompt_ids, const std::vector<uint8_t>& audio_mask,
                   const float* audio, int64_t audio_rows, uint32_t budget, std::vector<int32_t>& ids,
                   bool& eos, std::string& err);
-    // Whether the engine runs the audio encoder itself (MOSS, Qwen3, ARK
-    // unless STARLING_FAST_ARK_HOST_ENCODER=1); Granite takes encoder rows.
+    // Whether the engine runs the audio encoder itself (MOSS, Qwen3; ARK and
+    // Granite unless STARLING_FAST_{ARK,GRANITE}_HOST_ENCODER=1, where they
+    // take the ggml encoder's rows through generate() above).
     bool encodes_audio() const;
-    // ARK with its Whisper encoder on the device: `mel_bf16` is the log-mel,
-    // feature-major [n_mels][mel_T] bf16 bits; the adapter's rows fill the
-    // (one contiguous run of) audio slots in order, zero past its last row.
+    // ARK / Granite with the encoder on the device. `mel_bf16` holds bf16
+    // bits: ARK's log-mel feature-major [n_mels][mel_T]; Granite's stacked
+    // frames frame-major [mel_T][160]. The adapter / Q-Former rows fill the
+    // (one contiguous run of) audio slots in order, zero past the last row.
     bool generate_from_mel(const std::vector<int32_t>& prompt_ids, const std::vector<uint8_t>& audio_mask,
                            const uint16_t* mel_bf16, int64_t mel_T, uint32_t budget,
                            std::vector<int32_t>& ids, bool& eos, std::string& err);

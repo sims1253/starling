@@ -77,6 +77,15 @@ struct Spec {
     // merge-by-`merge` GELU adapter run on the device.
     bool whisper = false;
     uint32_t merge = 0, rope_half = 0;
+    // Granite's CTC conformer + BLIP2 Q-Former (with `encoder` false): the
+    // host supplies the stacked log-mel frames. Conformer: input dim, conv
+    // kernel, attention window, conv inner width, mid-CTC block (1-indexed,
+    // 0 = none) and CTC classes. Q-Former: window, queries, layers, heads,
+    // FF width, LayerNorm eps.
+    bool conformer = false;
+    uint32_t g_in = 0, g_ck = 0, g_cs = 0, g_ci = 0, g_mid = 0, g_ctc = 0;
+    uint32_t q_win = 0, q_n = 0, q_layers = 0, q_heads = 0, q_ff = 0;
+    float q_eps = 1e-12f;
     std::string conv_out, pos_embed, proj1, proj2;
     std::string eq, ek, ev, eo, efc1, efc2;
     bool adapter = false;   // MOSS: SwiGLU adapter between projection and LLM
@@ -214,12 +223,37 @@ Spec granite_spec(const gr::Config& c) {
     s.emb_mult = lc.embedding_multiplier;
     s.resid_mult = lc.residual_multiplier;
     s.eos = c.eos_token_id; s.max_new_tokens = c.max_new_tokens;
+    // The conformer + Q-Former on the device unless
+    // STARLING_FAST_GRANITE_HOST_ENCODER=1 keeps them on ggml (decoder-only).
+    const auto& ec = c.encoder;
+    const auto& pc = c.projector;
+    s.conformer = !env_on("STARLING_FAST_GRANITE_HOST_ENCODER") && pc.output_dim == lc.hidden &&
+                  pc.hidden == ec.hidden && pc.window_size % pc.downsample_rate == 0 &&
+                  pc.window_size / pc.downsample_rate == pc.num_queries;
+    s.ED = ec.hidden; s.EH = ec.n_heads; s.EHD = ec.head_dim; s.EFF = ec.ffn_dim; s.EL = ec.n_layers;
+    s.enc_eps = ec.layer_norm_eps;
+    s.g_in = ec.input_dim; s.g_ck = ec.conv_kernel; s.g_cs = ec.context_size; s.g_ci = ec.conv_inner;
+    s.g_mid = ec.mid_layer; s.g_ctc = ec.output_dim;
+    s.q_win = pc.window_size; s.q_n = pc.num_queries; s.q_layers = pc.qformer_layers;
+    s.q_heads = pc.qformer_heads; s.q_ff = pc.qformer_intermediate; s.q_eps = pc.layer_norm_eps;
     return s;
 }
 
 struct EncLayer {
     GMat q, k, v, o, fc1, fc2;
     Arena::Id q_b, k_b, v_b, o_b, fc1_b, fc2_b, ln1_g, ln1_b, ln2_g, ln2_b;
+};
+// Granite conformer block and Q-Former layer (bias ids index the arena).
+struct ConfLayer {
+    GMat ff1_up, ff1_down, ff2_up, ff2_down, q, kv, o, conv_up, conv_down;
+    Arena::Id ff1_g, ff1_b, ff1_up_b, ff1_down_b, ff2_g, ff2_b, ff2_up_b, ff2_down_b;
+    Arena::Id attn_g, attn_b, o_b, rel, conv_g, conv_b, conv_up_b, conv_down_b;
+    Arena::Id dw_w, bn_scale, bn_shift, post_g, post_b;
+};
+struct QfLayer {
+    GMat sq, sk, sv, so, cq, ck, cv, co, up, down;
+    Arena::Id sq_b, sk_b, sv_b, so_b, s_g, s_b, cq_b, ck_b, cv_b, co_b, c_g, c_b;
+    Arena::Id up_b, down_b, f_g, f_b;
 };
 struct LlmLayer {
     GMat qkv, o, gateup, down;
@@ -277,6 +311,13 @@ struct AudioLlmEngine::Impl {
     GMat wc1, wc2;
     Arena::Id wc1_b, wc2_b, rope_cos, rope_sin;
     uint32_t rope_rows = 0;   // encoder positions the RoPE tables cover
+    // Granite conformer + Q-Former.
+    GMat g_in_w, ctc_out, ctc_mid, q_out;
+    Arena::Id g_in_b, ctc_out_b, ctc_mid_b, q_out_b;
+    std::vector<ConfLayer> conf;
+    std::vector<QfLayer> qf;
+    std::vector<float> q_init;   // LayerNorm(learned queries) [q_n][ED], f32
+    vk::Buffer genc, gq32, gq16, gqq, gqk, gqv, gqctx, gqff, gctc;
     // LLM weights
     std::vector<LlmLayer> llm;
     Arena::Id final_norm, rope_tab;
@@ -310,6 +351,19 @@ struct AudioLlmEngine::Impl {
     // and adapter into the audio slots [slot0, slot0 + n_slots) of lx, then
     // the text-slot lookup and the LLM over S rows.
     bool record_prefill_whisper(int L, int S, int slot0, int n_slots, Rec& r, std::string& err);
+    // Granite prefill: T stacked mel frames through the conformer and the
+    // Q-Former into the audio slots, then the LLM over S rows.
+    bool record_prefill_conformer(int T, int S, int slot0, int n_slots, Rec& r, std::string& err);
+    // Windowed multi-head attention over f16 activations: window w's Mq
+    // queries are rows q_row0 + w*Mq.. of q (stride ldq) and its Nk keys and
+    // values rows kv_row0 + w*Nk.. of k / v (stride ldkv; heads at column
+    // h*hd). Raw scores land in esc (`shaw` adds the relative-position term
+    // when set), the softmax applies `scale`, and the head outputs go to rows
+    // q_row0 + w*Mq.. of out (stride ldo).
+    bool win_attention(vk::Recording& rc, vk::Buffer& q, uint32_t ldq, uint32_t q_row0, vk::Buffer& k,
+                       vk::Buffer& v, uint32_t ldkv, uint32_t k_col0, uint32_t v_col0, uint32_t kv_row0,
+                       uint32_t Mq, uint32_t Nk, uint32_t nwin, uint32_t H, uint32_t hd, float scale,
+                       vk::Buffer& out, uint32_t ldo, const ConfLayer* shaw, std::string& err);
     // Host-side prompt rows: audio slots from `audio` (or zero), text slots
     // left to the device lookup (ids, 0xffffffff on audio slots).
     bool prompt_rows(const std::vector<int32_t>& prompt_ids, const std::vector<uint8_t>& audio_mask,
@@ -463,9 +517,14 @@ bool AudioLlmEngine::Impl::load(const ggml::ModelLoader& ml, std::string& err) {
     const bool whisper_ok = !sp.whisper ||
         (sp.n_mels % 8 == 0 && ED % 32 == 0 && EFF % 32 == 0 && EHD % 8 == 0 && EH * EHD == ED &&
          sp.rope_half * 2 <= EHD && sp.merge != 0 && AH % 32 == 0 && EOUT == HD);
+    const bool conformer_ok = !sp.conformer ||
+        (ED % 32 == 0 && EFF % 32 == 0 && sp.g_ci % 32 == 0 && sp.g_in % 32 == 0 && EH * EHD == ED &&
+         EHD % 2 == 0 && EH * EHD <= 4096 && sp.g_ck % 2 == 1 && sp.g_cs > 0 && sp.g_mid < EL &&
+         sp.q_heads != 0 && ED % sp.q_heads == 0 && (ED / sp.q_heads) % 2 == 0 && sp.q_ff % 32 == 0 &&
+         sp.q_win != 0 && sp.q_n != 0);
     // The input-embedding multiplier is folded into the input table, so it
     // needs an untied head.
-    if (!enc_ok || !whisper_ok || (HDIM != 128 && HDIM != 64) || (!sp.tied && sp.lm_head.empty()) || MAXPOS > 4096 ||
+    if (!enc_ok || !whisper_ok || !conformer_ok || (HDIM != 128 && HDIM != 64) || (!sp.tied && sp.lm_head.empty()) || MAXPOS > 4096 ||
         NKV == 0 || NH % NKV || HD % 32 || FF % 32 || sp.max_new_tokens > MAXPOS ||
         (sp.emb_mult != 1.0f && sp.lm_head.empty())) {
         err = "fast " + tag + ": unsupported configuration";
@@ -684,6 +743,131 @@ bool AudioLlmEngine::Impl::load(const ggml::ModelLoader& ml, std::string& err) {
             return false;
     }
 
+    // ---- Granite conformer + Q-Former ----
+    if (sp.conformer) {
+        auto vec_scaled = [&](const std::string& n, float f, Arena::Id& id) {
+            std::vector<float> v;
+            if (!f32(n, v)) return false;
+            for (float& x : v) x *= f;
+            id = ar.add_f32(v);
+            return true;
+        };
+        if (!mat("enc.input_linear.weight", g_in_w) || !vec_id("enc.input_linear.bias", g_in_b)) return false;
+        const uint32_t CI = sp.g_ci, CK = sp.g_ck, CS = sp.g_cs;
+        conf.resize(EL);
+        for (uint32_t l = 0; l < EL; ++l) {
+            ConfLayer& Y = conf[l];
+            const std::string p = "enc.blk." + std::to_string(l) + ".";
+            // The half-step FF residuals (x += 0.5 * ff(x)) scale the down
+            // projection through the GEMM's alpha and its bias here.
+            if (!mat(p + "ff1_up.weight", Y.ff1_up) || !mat(p + "ff1_down.weight", Y.ff1_down) ||
+                !mat(p + "ff2_up.weight", Y.ff2_up) || !mat(p + "ff2_down.weight", Y.ff2_down) ||
+                !mat(p + "attn_q.weight", Y.q) || !mat(p + "attn_kv.weight", Y.kv) ||
+                !mat(p + "attn_o.weight", Y.o) || !mat(p + "conv_down.weight", Y.conv_down) ||
+                !vec_id(p + "ff1_norm.weight", Y.ff1_g) || !vec_id(p + "ff1_norm.bias", Y.ff1_b) ||
+                !vec_id(p + "ff1_up.bias", Y.ff1_up_b) || !vec_scaled(p + "ff1_down.bias", 0.5f, Y.ff1_down_b) ||
+                !vec_id(p + "ff2_norm.weight", Y.ff2_g) || !vec_id(p + "ff2_norm.bias", Y.ff2_b) ||
+                !vec_id(p + "ff2_up.bias", Y.ff2_up_b) || !vec_scaled(p + "ff2_down.bias", 0.5f, Y.ff2_down_b) ||
+                !vec_id(p + "attn_norm.weight", Y.attn_g) || !vec_id(p + "attn_norm.bias", Y.attn_b) ||
+                !vec_id(p + "attn_o.bias", Y.o_b) || !vec_id(p + "conv_norm.weight", Y.conv_g) ||
+                !vec_id(p + "conv_norm.bias", Y.conv_b) || !vec_id(p + "conv_down.bias", Y.conv_down_b) ||
+                !vec_id(p + "post_norm.weight", Y.post_g) || !vec_id(p + "post_norm.bias", Y.post_b))
+                return false;
+            // conv_up with the GLU halves interleaved (row 2j = a_j, 2j+1 =
+            // gate_j) so the GEMM epilogue owns both halves of every pair.
+            {
+                const ggml_tensor* t = T(p + "conv_up.weight");
+                if (!t) return false;
+                jobs.add(&Y.conv_up, [t, CI](HostMatrix& hm, std::string& e) {
+                    if (!pack_gpu_matrix(t, hm, e)) return false;
+                    if (hm.N != 2 * CI) { e = "conv_up rows"; return false; }
+                    std::vector<uint32_t> order(2 * CI);
+                    for (uint32_t j = 0; j < CI; ++j) { order[2 * j] = j; order[2 * j + 1] = j + CI; }
+                    permute_rows(hm, order);
+                    return true;
+                });
+                std::vector<float> b, bi(2 * CI);
+                if (!f32(p + "conv_up.bias", b)) return false;
+                if (b.size() != 2 * CI) { err = "fast " + tag + ": conv_up bias shape"; return false; }
+                for (uint32_t j = 0; j < CI; ++j) { bi[2 * j] = b[j]; bi[2 * j + 1] = b[j + CI]; }
+                Y.conv_up_b = ar.add_f32(bi);
+            }
+            // Depthwise conv, stored k-major [K][C] (pk_conv OP 2's layout),
+            // with the eval BatchNorm folded into a per-channel scale and
+            // shift (the kernel adds SiLU).
+            {
+                std::vector<float> wt, g, b, mean, var;
+                if (!f32(p + "conv_depth.weight", wt) || !f32(p + "bn_weight", g) || !f32(p + "bn_bias", b) ||
+                    !f32(p + "bn_mean", mean) || !f32(p + "bn_var", var))
+                    return false;
+                const ggml_tensor* tw = T(p + "conv_depth.weight");
+                if (wt.size() != (size_t)CI * CK || tw->ne[0] != (int64_t)CI || g.size() != CI) {
+                    err = "fast " + tag + ": depthwise shape";
+                    return false;
+                }
+                std::vector<float> sc(CI), sh(CI);
+                for (uint32_t c = 0; c < CI; ++c) {
+                    sc[c] = g[c] / std::sqrt(var[c] + 1e-5f);   // BatchNorm1d default eps
+                    sh[c] = b[c] - mean[c] * sc[c];
+                }
+                Y.dw_w = ar.add_f32(wt);
+                Y.bn_scale = ar.add_f32(sc);
+                Y.bn_shift = ar.add_f32(sh);
+            }
+            // Shaw table [CS][CS][D] (query pos, key pos, dim) as f16.
+            {
+                std::vector<float> r;
+                if (!f32(p + "rel_pos_bias", r)) return false;
+                if (r.size() != (size_t)CS * CS * EHD) { err = "fast " + tag + ": rel_pos_bias shape"; return false; }
+                Y.rel = ar.add(pack_f16(r.data(), r.size()));
+            }
+        }
+        if (sp.g_mid && (!mat("enc.out.weight", ctc_out) || !vec_id("enc.out.bias", ctc_out_b) ||
+                         !mat("enc.out_mid.weight", ctc_mid) || !vec_id("enc.out_mid.bias", ctc_mid_b)))
+            return false;
+        // Q-Former: the learned queries' input LayerNorm is constant (host).
+        {
+            std::vector<float> qv, g, b;
+            if (!f32("proj.query", qv) || !f32("proj.qformer_ln.weight", g) || !f32("proj.qformer_ln.bias", b))
+                return false;
+            if (qv.size() != (size_t)sp.q_n * ED) { err = "fast " + tag + ": proj.query shape"; return false; }
+            q_init.resize(qv.size());
+            for (uint32_t i = 0; i < sp.q_n; ++i) {
+                const float* x = qv.data() + (size_t)i * ED;
+                double mean = 0, var = 0;
+                for (uint32_t d = 0; d < ED; ++d) mean += x[d];
+                mean /= ED;
+                for (uint32_t d = 0; d < ED; ++d) var += (x[d] - mean) * (x[d] - mean);
+                var /= ED;
+                const double rs = 1.0 / std::sqrt(var + sp.q_eps);
+                for (uint32_t d = 0; d < ED; ++d)
+                    q_init[(size_t)i * ED + d] = (float)((x[d] - mean) * rs) * g[d] + b[d];
+            }
+        }
+        qf.resize(sp.q_layers);
+        for (uint32_t l = 0; l < sp.q_layers; ++l) {
+            QfLayer& Y = qf[l];
+            const std::string p = "proj.blk." + std::to_string(l) + ".";
+            if (!mat(p + "self_q.weight", Y.sq) || !mat(p + "self_k.weight", Y.sk) || !mat(p + "self_v.weight", Y.sv) ||
+                !mat(p + "self_out.weight", Y.so) || !mat(p + "cross_q.weight", Y.cq) ||
+                !mat(p + "cross_k.weight", Y.ck) || !mat(p + "cross_v.weight", Y.cv) ||
+                !mat(p + "cross_out.weight", Y.co) || !mat(p + "ff_up.weight", Y.up) ||
+                !mat(p + "ff_down.weight", Y.down) ||
+                !vec_id(p + "self_q.bias", Y.sq_b) || !vec_id(p + "self_k.bias", Y.sk_b) ||
+                !vec_id(p + "self_v.bias", Y.sv_b) || !vec_id(p + "self_out.bias", Y.so_b) ||
+                !vec_id(p + "self_ln.weight", Y.s_g) || !vec_id(p + "self_ln.bias", Y.s_b) ||
+                !vec_id(p + "cross_q.bias", Y.cq_b) || !vec_id(p + "cross_k.bias", Y.ck_b) ||
+                !vec_id(p + "cross_v.bias", Y.cv_b) || !vec_id(p + "cross_out.bias", Y.co_b) ||
+                !vec_id(p + "cross_ln.weight", Y.c_g) || !vec_id(p + "cross_ln.bias", Y.c_b) ||
+                !vec_id(p + "ff_up.bias", Y.up_b) || !vec_id(p + "ff_down.bias", Y.down_b) ||
+                !vec_id(p + "ff_ln.weight", Y.f_g) || !vec_id(p + "ff_ln.bias", Y.f_b))
+                return false;
+        }
+        // proj.out lands in the LLM input rows, which carry the embedding
+        // multiplier (the GEMM's alpha scales the product; the bias here).
+        if (!mat("proj.out.weight", q_out) || !vec_scaled("proj.out.bias", sp.emb_mult, q_out_b)) return false;
+    }
+
     // ---- LLM ----
     llm.resize(NL);
     for (uint32_t l = 0; l < NL; ++l) {
@@ -885,13 +1069,34 @@ bool AudioLlmEngine::Impl::ensure(int C, int A, int S, std::string& err) {
         ep_b = hw * A * round_up((uint32_t)A, 8) * 2;
         adh_b = ((size_t)A / sp.merge + 1) * AH * 2;
     }
+    size_t ek_b = (size_t)A * ED * 2, ev_b = ek_b, eproj_b = ek_b;
+    size_t genc_b = 0, gq_rows = 0, gkv_rows = 0;
+    if (sp.conformer) {
+        // C = A = stacked mel frames: kv rows are 2*ED wide, the GLU and
+        // depthwise outputs conv_inner wide, adh holds the mid-CTC softmax.
+        // Scores: every attention window at once, or the Q-Former's.
+        const size_t CS = sp.g_cs, nw = (A + CS - 1) / CS;
+        const size_t nblk = (A + sp.q_win - 1) / sp.q_win;
+        mel_b = (size_t)C * sp.g_in * 2;
+        ek_b = (size_t)A * 2 * ED * 2;
+        ev_b = eproj_b = (size_t)A * sp.g_ci * 2;
+        adh_b = (size_t)A * round_up(sp.g_ctc, 8) * 2;
+        esc_b = std::max(nw * EH * CS * CS, nblk * sp.q_heads * sp.q_n * sp.q_win) * 4;
+        ep_b = std::max(nw * EH * CS * round_up((uint32_t)CS, 8),
+                        nblk * sp.q_heads * sp.q_n * round_up(std::max(sp.q_win, sp.q_n), 8)) * 2;
+        gq_rows = nblk * sp.q_n;
+        gkv_rows = nblk * sp.q_win;
+        genc_b = gkv_rows * ED * 2;
+    }
     if (!mk(mel_in, mel_b, ctx->info().uma ? vk::Mem::Device : vk::Mem::Upload) ||
         !mk(cv1, cv1_b) || !mk(cv2, cv2_b) ||
         !mk(cv3, cv3_b) || !mk(ex, (size_t)A * ED * 4) || !mk(eh, (size_t)A * ED * 2) ||
-        !mk(eq, (size_t)A * ED * 2) || !mk(ek, (size_t)A * ED * 2) || !mk(ev, (size_t)A * ED * 2) ||
+        !mk(eq, (size_t)A * ED * 2) || !mk(ek, ek_b) || !mk(ev, ev_b) ||
         !mk(esc, esc_b) || !mk(ep, ep_b) || !mk(ectx, (size_t)A * ED * 2) ||
-        !mk(effh, (size_t)A * EFF * 2) || !mk(eproj, (size_t)A * ED * 2) || !mk(eproj2, (size_t)A * EOUT * 2) ||
-        !mk(adh, adh_b) || !mk(lx, (size_t)S * HD * 4) || !mk(lhn, (size_t)S * HD * 2) ||
+        !mk(effh, (size_t)A * EFF * 2) || !mk(eproj, eproj_b) || !mk(eproj2, (size_t)A * EOUT * 2) ||
+        !mk(adh, adh_b) || !mk(genc, genc_b) || !mk(gq32, gq_rows * ED * 4) || !mk(gq16, gq_rows * ED * 2) ||
+        !mk(gqq, gq_rows * ED * 2) || !mk(gqk, gkv_rows * ED * 2) || !mk(gqv, gkv_rows * ED * 2) ||
+        !mk(gqctx, gq_rows * ED * 2) || !mk(gqff, gq_rows * sp.q_ff * 2) || !mk(lx, (size_t)S * HD * 4) || !mk(lhn, (size_t)S * HD * 2) ||
         !mk(lqkv, (size_t)S * (NH + 2 * NKV) * HDIM * 2) || !mk(lqr, (size_t)S * NH * HDIM * 2) ||
         !mk(lsc, hgroup * S * S * 4) || !mk(lp, hgroup * S * ldPs * 2) || !mk(lctx, (size_t)S * NH * HDIM * 2) ||
         !mk(lmlp, (size_t)S * FF * 2))
@@ -1276,6 +1481,250 @@ bool AudioLlmEngine::Impl::record_prefill_whisper(int L, int S, int slot0, int n
     return true;
 }
 
+bool AudioLlmEngine::Impl::win_attention(vk::Recording& rc, vk::Buffer& q, uint32_t ldq, uint32_t q_row0,
+                                        vk::Buffer& k, vk::Buffer& v, uint32_t ldkv, uint32_t k_col0,
+                                        uint32_t v_col0, uint32_t kv_row0, uint32_t Mq, uint32_t Nk,
+                                        uint32_t nwin, uint32_t H, uint32_t hd, float scale, vk::Buffer& out,
+                                        uint32_t ldo, const ConfLayer* shaw, std::string& err) {
+    if (nwin == 0 || Mq == 0 || Nk == 0) return true;
+    const uint32_t ldP = round_up(Nk, 8);
+    GemmCall c;
+    c.b = BKind::F16; c.epi = Epi::F32;
+    c.a.M = Mq; c.a.N = Nk; c.a.K = hd;
+    c.a.lda = ldq; c.a.ldb = ldkv; c.a.ldc = Nk;
+    c.a.a_off = q_row0 * ldq; c.a.b_off = kv_row0 * ldkv + k_col0;
+    c.a.nb_lo = H;
+    c.a.sa_hi = Mq * ldq; c.a.sa_lo = hd; c.a.sb_hi = Nk * ldkv; c.a.sb_lo = hd;
+    c.a.sc_hi = H * Mq * Nk; c.a.sc_lo = Mq * Nk;
+    c.batch = nwin * H;
+    c.A = vk::Ref(q); c.Bq = vk::Ref(k); c.C = vk::Ref(esc);
+    rc.label("win_attn_qk");
+    if (!K.gemm(rc, c, err)) return false;
+    rc.barrier();
+    if (shaw) {
+        const vk::Pipeline* sp_ = ctx->pipeline("shaw_bias", {H * hd, H}, err);
+        if (!sp_) return false;
+        struct { uint32_t H, D, ldq, tok0, Wn, CS; } a{H, hd, ldq, q_row0, Mq, sp.g_cs};
+        rc.label("shaw_bias");
+        rc.dispatch(*sp_, {vk::Ref(q), R(shaw->rel), vk::Ref(esc)}, &a, sizeof(a), Mq, nwin);
+        rc.barrier();
+    }
+    Kernels::SoftmaxArgs sa{Nk, Nk, 0, ldP, Mq * Nk, 0, Mq * ldP, scale, Nk, 0xffffffffu, Nk};
+    rc.label("win_softmax");
+    if (!K.softmax(rc, false, Mq, nwin * H, sa, vk::Ref(esc), {}, vk::Ref(ep), err)) return false;
+    rc.barrier();
+    GemmCall o;
+    o.b = BKind::F16T; o.epi = Epi::F16;
+    o.a.M = Mq; o.a.N = hd; o.a.K = Nk;
+    o.a.lda = ldP; o.a.ldb = ldkv; o.a.ldc = ldo;
+    o.a.b_off = kv_row0 * ldkv + v_col0; o.a.c_off = q_row0 * ldo;
+    o.a.nb_lo = H;
+    o.a.sa_hi = H * Mq * ldP; o.a.sa_lo = Mq * ldP;
+    o.a.sb_hi = Nk * ldkv; o.a.sb_lo = hd; o.a.sc_hi = Mq * ldo; o.a.sc_lo = hd;
+    o.batch = nwin * H;
+    o.A = vk::Ref(ep); o.Bq = vk::Ref(v); o.C = vk::Ref(out);
+    rc.label("win_attn_pv");
+    return K.gemm(rc, o, err);
+}
+
+bool AudioLlmEngine::Impl::record_prefill_conformer(int Ti, int S, int slot0, int n_slots, Rec& r,
+                                                    std::string& err) {
+    const uint32_t T = (uint32_t)Ti, CS = sp.g_cs, CI = sp.g_ci;
+    const uint32_t nblk = (T + sp.q_win - 1) / sp.q_win, Nq = nblk * sp.q_n, T15 = nblk * sp.q_win;
+    const uint32_t Na = std::min(Nq, (uint32_t)n_slots);
+    r.A = (int)T;
+    r.S = S;
+    r.slot0 = slot0;
+    r.rec = std::make_unique<vk::Recording>(*ctx);
+    vk::Recording& rc = *r.rec;
+    rc.begin();
+    const float eps = sp.enc_eps;
+    const float escale = 1.0f / std::sqrt((float)EHD);
+    auto ln = [&](vk::Buffer& x, uint32_t rows, Arena::Id g, Arena::Id b, vk::Buffer& out, float e) {
+        rc.label("norm");
+        return K.norm(rc, 0, rows, ED, vk::Ref(x), ED, R(g), R(b), {}, {}, vk::Ref(out), ED, e, e, err);
+    };
+    // LayerNorm of the f32 stream x into the f16 copy `out`, then in place.
+    auto ln_both = [&](vk::Buffer& x, uint32_t rows, Arena::Id g, Arena::Id b, vk::Buffer& out, float e) {
+        if (!ln(x, rows, g, b, out, e)) return false;
+        rc.barrier();
+        return K.norm(rc, 3, rows, ED, vk::Ref(x), ED, R(g), R(b), {}, {}, {}, ED, e, e, err);
+    };
+
+    // ---- input linear: stacked mel frames [T][g_in] f16 -> f32 stream ----
+    rc.label("enc_in");
+    if (!K.gemm_w(rc, ar, g_in_w, vk::Ref(mel_in), T, sp.g_in, vk::Ref(ex), ED, Epi::F32, Act::None, R(g_in_b),
+                  1.0f, ~0u, err))
+        return false;
+    rc.barrier();
+
+    // ---- conformer blocks ----
+    const uint32_t n_full = T / CS, tail = T % CS;
+    for (uint32_t l = 0; l < EL; ++l) {
+        const ConfLayer& Y = conf[l];
+        rc.split();
+        // x += 0.5 * ff(x): alpha 0.5 on the product, the bias prescaled.
+        auto half_ff = [&](const GMat& up, Arena::Id up_b, const GMat& down, Arena::Id down_b, Arena::Id g,
+                           Arena::Id b) {
+            if (!ln(ex, T, g, b, eh, eps)) return false;
+            rc.barrier();
+            rc.label("enc_ff_up");
+            if (!K.gemm_w(rc, ar, up, vk::Ref(eh), T, ED, vk::Ref(effh), EFF, Epi::F16, Act::Silu, R(up_b), 1.0f,
+                          ~0u, err))
+                return false;
+            rc.barrier();
+            rc.label("enc_ff_down");
+            if (!K.gemm_w(rc, ar, down, vk::Ref(effh), T, EFF, vk::Ref(ex), ED, Epi::Residual, Act::None,
+                          R(down_b), 0.5f, ~0u, err))
+                return false;
+            rc.barrier();
+            return true;
+        };
+        if (!half_ff(Y.ff1_up, Y.ff1_up_b, Y.ff1_down, Y.ff1_down_b, Y.ff1_g, Y.ff1_b)) return false;
+        // Block-local Shaw attention: whole windows, then the tail window
+        // (the reference's masked padded block, exactly: masked keys add 0).
+        if (!ln(ex, T, Y.attn_g, Y.attn_b, eh, eps)) return false;
+        rc.barrier();
+        rc.label("enc_qkv");
+        if (!K.gemm_w(rc, ar, Y.q, vk::Ref(eh), T, ED, vk::Ref(eq), ED, Epi::F16, Act::None, {}, 1.0f, ~0u, err) ||
+            !K.gemm_w(rc, ar, Y.kv, vk::Ref(eh), T, ED, vk::Ref(ek), 2 * ED, Epi::F16, Act::None, {}, 1.0f, ~0u, err))
+            return false;
+        rc.barrier();
+        if (!win_attention(rc, eq, ED, 0, ek, ek, 2 * ED, 0, ED, 0, CS, CS, n_full, EH, EHD, escale, ectx, ED,
+                           &Y, err))
+            return false;
+        rc.barrier();
+        if (!win_attention(rc, eq, ED, n_full * CS, ek, ek, 2 * ED, 0, ED, n_full * CS, tail, tail,
+                           tail ? 1u : 0u, EH, EHD, escale, ectx, ED, &Y, err))
+            return false;
+        rc.barrier();
+        rc.label("enc_attn_o");
+        if (!K.gemm_w(rc, ar, Y.o, vk::Ref(ectx), T, ED, vk::Ref(ex), ED, Epi::Residual, Act::None, R(Y.o_b),
+                      1.0f, ~0u, err))
+            return false;
+        rc.barrier();
+        // Conv module: LN, pointwise up + GLU, depthwise k + BatchNorm + SiLU,
+        // pointwise down (residual).
+        if (!ln(ex, T, Y.conv_g, Y.conv_b, eh, eps)) return false;
+        rc.barrier();
+        rc.label("enc_conv_up");
+        if (!K.gemm_w(rc, ar, Y.conv_up, vk::Ref(eh), T, ED, vk::Ref(ev), CI, Epi::Glu, Act::None, R(Y.conv_up_b),
+                      1.0f, ~0u, err))
+            return false;
+        rc.barrier();
+        rc.label("enc_conv_dw");
+        if (!K.pk_conv(rc, 2, {CI, T, 0, T, 0, sp.g_ck}, T, 1, vk::Ref(ev), R(Y.dw_w), R(Y.bn_scale),
+                       R(Y.bn_shift), vk::Ref(eproj), err))
+            return false;
+        rc.barrier();
+        rc.label("enc_conv_down");
+        if (!K.gemm_w(rc, ar, Y.conv_down, vk::Ref(eproj), T, CI, vk::Ref(ex), ED, Epi::Residual, Act::None,
+                      R(Y.conv_down_b), 1.0f, ~0u, err))
+            return false;
+        rc.barrier();
+        if (!half_ff(Y.ff2_up, Y.ff2_up_b, Y.ff2_down, Y.ff2_down_b, Y.ff2_g, Y.ff2_b)) return false;
+        // post_norm; the last block writes the f16 encoder output (zero rows
+        // up to whole projector windows), the mid-CTC block keeps an f16 copy.
+        if (l + 1 == EL) {
+            if (T15 > T) rc.fill(genc, (VkDeviceSize)T * ED * 2, (VkDeviceSize)(T15 - T) * ED * 2, 0);
+            if (!ln(ex, T, Y.post_g, Y.post_b, genc, eps)) return false;
+            rc.barrier();
+        } else if (l + 1 == sp.g_mid) {
+            if (!ln_both(ex, T, Y.post_g, Y.post_b, eh, eps)) return false;
+            rc.barrier();
+            // Self-conditioned mid CTC: x += out_mid(softmax(out(x))).
+            const uint32_t V = sp.g_ctc, ldV = round_up(V, 8);
+            rc.label("enc_ctc");
+            if (!K.gemm_w(rc, ar, ctc_out, vk::Ref(eh), T, ED, vk::Ref(esc), V, Epi::F32, Act::None, R(ctc_out_b),
+                          1.0f, ~0u, err))
+                return false;
+            rc.barrier();
+            Kernels::SoftmaxArgs sa{V, V, 0, ldV, 0, 0, 0, 1.0f, V, 0xffffffffu, V};
+            if (!K.softmax(rc, false, T, 1, sa, vk::Ref(esc), {}, vk::Ref(adh), err)) return false;
+            rc.barrier();
+            if (!K.gemm_w(rc, ar, ctc_mid, vk::Ref(adh), T, ldV, vk::Ref(ex), ED, Epi::Residual, Act::None,
+                          R(ctc_mid_b), 1.0f, ~0u, err))
+                return false;
+            rc.barrier();
+        } else {
+            rc.label("norm");
+            if (!K.norm(rc, 3, T, ED, vk::Ref(ex), ED, R(Y.post_g), R(Y.post_b), {}, {}, {}, ED, eps, eps, err))
+                return false;
+            rc.barrier();
+        }
+    }
+
+    // ---- Q-Former: q_n learned queries per q_win-frame window ----
+    // gq32/gq16 start as the tiled LayerNorm(queries) (uploaded per call).
+    rc.split();
+    const uint32_t QH = sp.q_heads, qhd = ED / QH;
+    const float qscale = 1.0f / std::sqrt((float)qhd), qeps = sp.q_eps;
+    auto lin = [&](const GMat& w, vk::Buffer& in, uint32_t rows, vk::Buffer& out, uint32_t ldo, Epi epi,
+                   Act act, Arena::Id b, const char* label) {
+        rc.label(label);
+        return K.gemm_w(rc, ar, w, vk::Ref(in), rows, w.K, vk::Ref(out), ldo, epi, act, R(b), 1.0f, ~0u, err);
+    };
+    for (uint32_t l = 0; l < sp.q_layers; ++l) {
+        const QfLayer& Y = qf[l];
+        // Self-attention over each window's queries, output + LN(residual).
+        if (!lin(Y.sq, gq16, Nq, gqq, ED, Epi::F16, Act::None, Y.sq_b, "qf_q") ||
+            !lin(Y.sk, gq16, Nq, gqk, ED, Epi::F16, Act::None, Y.sk_b, "qf_k") ||
+            !lin(Y.sv, gq16, Nq, gqv, ED, Epi::F16, Act::None, Y.sv_b, "qf_v"))
+            return false;
+        rc.barrier();
+        if (!win_attention(rc, gqq, ED, 0, gqk, gqv, ED, 0, 0, 0, sp.q_n, sp.q_n, nblk, QH, qhd, qscale, gqctx,
+                           ED, nullptr, err))
+            return false;
+        rc.barrier();
+        if (!lin(Y.so, gqctx, Nq, gq32, ED, Epi::Residual, Act::None, Y.so_b, "qf_out")) return false;
+        rc.barrier();
+        if (!ln_both(gq32, Nq, Y.s_g, Y.s_b, gq16, qeps)) return false;
+        rc.barrier();
+        // Cross-attention: queries against their window's encoder frames
+        // (the zero-padded tail frames attend unmasked, as in the reference).
+        if (!lin(Y.cq, gq16, Nq, gqq, ED, Epi::F16, Act::None, Y.cq_b, "qf_q") ||
+            !lin(Y.ck, genc, T15, gqk, ED, Epi::F16, Act::None, Y.ck_b, "qf_k") ||
+            !lin(Y.cv, genc, T15, gqv, ED, Epi::F16, Act::None, Y.cv_b, "qf_v"))
+            return false;
+        rc.barrier();
+        if (!win_attention(rc, gqq, ED, 0, gqk, gqv, ED, 0, 0, 0, sp.q_n, sp.q_win, nblk, QH, qhd, qscale, gqctx,
+                           ED, nullptr, err))
+            return false;
+        rc.barrier();
+        if (!lin(Y.co, gqctx, Nq, gq32, ED, Epi::Residual, Act::None, Y.co_b, "qf_out")) return false;
+        rc.barrier();
+        if (!ln_both(gq32, Nq, Y.c_g, Y.c_b, gq16, qeps)) return false;
+        rc.barrier();
+        // FF: erf GELU, LN(residual).
+        if (!lin(Y.up, gq16, Nq, gqff, sp.q_ff, Epi::F16, Act::Gelu, Y.up_b, "qf_ff_up")) return false;
+        rc.barrier();
+        if (!lin(Y.down, gqff, Nq, gq32, ED, Epi::Residual, Act::None, Y.down_b, "qf_ff_down")) return false;
+        rc.barrier();
+        if (!ln_both(gq32, Nq, Y.f_g, Y.f_b, gq16, qeps)) return false;
+        rc.barrier();
+    }
+    // proj.out (times the embedding multiplier) into the audio slots.
+    if (Na > 0) {
+        GemmCall c;
+        c.b = q_out.fmt == GpuFmt::W4 ? BKind::W4 : q_out.fmt == GpuFmt::W8 ? BKind::W8 : BKind::F16;
+        c.epi = Epi::F32;
+        c.bias_mode = 1;
+        c.a.M = Na; c.a.N = q_out.N; c.a.K = q_out.K;
+        c.a.lda = ED; c.a.ldb = q_out.K; c.a.ldc = HD; c.a.c_off = (uint32_t)slot0 * HD;
+        c.a.alpha = sp.emb_mult;
+        c.A = vk::Ref(gq16); c.Bq = R(q_out.q);
+        if (q_out.has_s) c.Bs = R(q_out.s);
+        c.C = vk::Ref(lx);
+        c.bias = R(q_out_b);
+        rc.label("qf_proj");
+        if (!K.gemm(rc, c, err)) return false;
+    }
+    if (!embed_lookup(rc, (uint32_t)S, 0, 0, err)) return false;
+    rc.barrier();
+    if (!record_llm(rc, (uint32_t)S, err)) return false;
+    rc.end();
+    return true;
+}
 bool AudioLlmEngine::Impl::record_llm(vk::Recording& rc, uint32_t S, std::string& err) {
     const uint32_t QKVW = (NH + 2 * NKV) * HDIM;
     const uint32_t ldS = S, ldP = round_up(S, 8);
@@ -1689,24 +2138,27 @@ bool AudioLlmEngine::generate(const std::vector<int32_t>& prompt_ids, const std:
     return true;
 }
 
-bool AudioLlmEngine::encodes_audio() const { return impl_->sp.encoder || impl_->sp.whisper; }
+bool AudioLlmEngine::encodes_audio() const {
+    return impl_->sp.encoder || impl_->sp.whisper || impl_->sp.conformer;
+}
 
 bool AudioLlmEngine::generate_from_mel(const std::vector<int32_t>& prompt_ids, const std::vector<uint8_t>& audio_mask,
                                        const uint16_t* mel_bf16, int64_t mel_T, uint32_t budget,
                                        std::vector<int32_t>& out_ids, bool& eos, std::string& err) {
     Impl& I = *impl_;
     const char* tag = I.sp.tag;
-    if (!I.sp.whisper) { err = std::string("fast ") + tag + ": no on-device Whisper encoder"; return false; }
+    const bool whisper = I.sp.whisper;
+    if (!whisper && !I.sp.conformer) { err = std::string("fast ") + tag + ": no on-device audio encoder"; return false; }
     const uint32_t max_new = budget ? std::min(budget, I.sp.max_new_tokens) : I.sp.max_new_tokens;
     const auto t0 = std::chrono::steady_clock::now();
     const int S = (int)prompt_ids.size();
-    const int64_t T = (mel_T + 1) / 2;
+    const int64_t T = whisper ? (mel_T + 1) / 2 : mel_T;   // encoder frames
     if (S == 0 || audio_mask.size() != prompt_ids.size() || !mel_bf16 || mel_T <= 0) {
         err = std::string("fast ") + tag + ": invalid prompt";
         return false;
     }
-    // The adapter needs one whole merge group; the RoPE tables bound T.
-    if (T < (int64_t)I.sp.merge || T > (int64_t)I.rope_rows) {
+    // ARK's adapter needs one whole merge group; the RoPE tables bound T.
+    if (whisper && (T < (int64_t)I.sp.merge || T > (int64_t)I.rope_rows)) {
         err = std::string("fast ") + tag + ": audio length outside the encoder's range";
         return false;
     }
@@ -1724,33 +2176,55 @@ bool AudioLlmEngine::generate_from_mel(const std::vector<int32_t>& prompt_ids, c
     }
     if (slot0 < 0) { err = std::string("fast ") + tag + ": prompt has no audio slots"; return false; }
     if (!I.ensure((int)mel_T, (int)T, S, err)) return false;
+    auto record = [&](Impl::Rec& r) {
+        return whisper ? I.record_prefill_whisper((int)mel_T, S, slot0, n_slots, r, err)
+                       : I.record_prefill_conformer((int)T, S, slot0, n_slots, r, err);
+    };
     // Text slots for the device lookup; audio slots start zeroed (the slots
     // past the adapter's rows stay zero, like the ggml scatter).
     std::vector<float> rows;
     std::vector<uint32_t> idv;
     if (!I.prompt_rows(prompt_ids, audio_mask, nullptr, 0, rows, idv, err)) return false;
-    // Mel as time-major f16 rows [mel_T + 2][n_mels], zero rows at both ends.
-    const size_t NM = I.sp.n_mels;
-    std::vector<float> mt(((size_t)mel_T + 2) * NM, 0.0f);
-    for (size_t f = 0; f < NM; ++f)
-        for (int64_t t = 0; t < mel_T; ++t) {
+    // ARK: mel as time-major f16 rows [mel_T + 2][n_mels], zero rows at both
+    // ends. Granite: the stacked frames are already rows [mel_T][g_in].
+    std::vector<float> mt;
+    if (whisper) {
+        const size_t NM = I.sp.n_mels;
+        mt.assign(((size_t)mel_T + 2) * NM, 0.0f);
+        for (size_t f = 0; f < NM; ++f)
+            for (int64_t t = 0; t < mel_T; ++t) {
+                ggml_bf16_t b;
+                b.bits = mel_bf16[f * (size_t)mel_T + (size_t)t];
+                mt[((size_t)t + 1) * NM + f] = ggml_bf16_to_fp32(b);
+            }
+    } else {
+        mt.resize((size_t)mel_T * I.sp.g_in);
+        for (size_t i = 0; i < mt.size(); ++i) {
             ggml_bf16_t b;
-            b.bits = mel_bf16[f * (size_t)mel_T + (size_t)t];
-            mt[((size_t)t + 1) * NM + f] = ggml_bf16_to_fp32(b);
+            b.bits = mel_bf16[i];
+            mt[i] = ggml_bf16_to_fp32(b);
         }
+    }
     const std::vector<uint32_t> mel16 = pack_f16(mt.data(), mt.size());
 
     const int key_s = S;
-    Impl::Rec* rec = I.prefill_rec({(int)mel_T, key_s}, [&](Impl::Rec& r) {
-        return I.record_prefill_whisper((int)mel_T, S, slot0, n_slots, r, err);
-    });
+    Impl::Rec* rec = I.prefill_rec({(int)mel_T, key_s}, record);
     if (!rec) return false;
     if (rec->slot0 != slot0) {   // same lengths, different prompt layout
         I.recs.erase({(int)mel_T, key_s});
-        rec = I.prefill_rec({(int)mel_T, key_s}, [&](Impl::Rec& r) {
-            return I.record_prefill_whisper((int)mel_T, S, slot0, n_slots, r, err);
-        });
+        rec = I.prefill_rec({(int)mel_T, key_s}, record);
         if (!rec) return false;
+    }
+    if (I.sp.conformer) {
+        // The Q-Former's starting rows: LayerNorm(queries) for every window.
+        const size_t nblk = ((size_t)T + I.sp.q_win - 1) / I.sp.q_win;
+        std::vector<float> q32;
+        q32.reserve(nblk * I.q_init.size());
+        for (size_t b = 0; b < nblk; ++b) q32.insert(q32.end(), I.q_init.begin(), I.q_init.end());
+        const std::vector<uint32_t> q16 = pack_f16(q32.data(), q32.size());
+        if (!I.ctx->upload(I.gq32, 0, q32.data(), q32.size() * 4, err) ||
+            !I.ctx->upload(I.gq16, 0, q16.data(), q16.size() * 4, err))
+            return false;
     }
     if (!I.ctx->upload(I.mel_in, 0, mel16.data(), mel16.size() * 4, err) ||
         !I.ctx->upload(I.lx, 0, rows.data(), rows.size() * 4, err) ||

@@ -51,9 +51,10 @@ namespace {
 struct GraniteCtx : starling::ggml::lib::EngineContext<starling::ggml::granite::GraniteModel,
                                                        starling::ggml::granite::Tokenizer> {
 #if defined(STARLING_HAVE_FAST)
-    // Model-specialized Vulkan decoder (cpp/fast). When set it owns the
-    // decoder (the loader's decoder weights are released); `model` keeps
-    // the encoder, projector and config.
+    // Model-specialized Vulkan engine (cpp/fast). When set it owns the
+    // decoder and, unless STARLING_FAST_GRANITE_HOST_ENCODER=1, the
+    // conformer + Q-Former too (the loader's copies are released); `model`
+    // keeps the config, mel constants and whatever still runs on ggml.
     std::unique_ptr<starling::fast::AudioLlmEngine> fast;
 #endif
 };
@@ -123,13 +124,27 @@ bool transcribe_piece(GraniteCtx& ctx, const float* pcm, int64_t n, int32_t budg
         return true;
     }
     AudioEmbeds audio;
-    if (!encode_audio_and_project(m, mel, audio, ctx.err))
+    Prompt prompt = build_transcribe_prompt(m.config, n);
+#if defined(STARLING_HAVE_FAST)
+    const bool fast_all = ctx.fast && ctx.fast->encodes_audio();
+#else
+    const bool fast_all = false;
+#endif
+    if (!fast_all && !encode_audio_and_project(m, mel, audio, ctx.err))
         return false;
     auto t1 = std::chrono::steady_clock::now();
-    Prompt prompt = build_transcribe_prompt(m.config, n);
     auto t2 = t1;
 #if defined(STARLING_HAVE_FAST)
-    if (ctx.fast) {
+    if (fast_all) {
+        // Whole model on the GPU: stacked mel frames in, tokens out (the
+        // encoder time is inside "generate").
+        bool eos = false;
+        static_assert(sizeof(ggml_bf16_t) == sizeof(uint16_t), "bf16 bits");
+        if (!ctx.fast->generate_from_mel(prompt.ids, prompt.audio_mask,
+                                         reinterpret_cast<const uint16_t*>(mel.data.data()), mel.n_frames,
+                                         (uint32_t) std::max(1, budget), generated.ids, eos, ctx.err))
+            return false;
+    } else if (ctx.fast) {
         // The fast decoder looks up the prompt rows itself (prompt+embeds
         // time is inside "generate").
         bool eos = false;
@@ -360,9 +375,14 @@ void* starling_ggml_granite_load(const char* gguf_path, const char** err_out) {
             ctx->fast = starling::fast::AudioLlmEngine::create(*ctx->model, ferr);
             const bool verbose = std::getenv("STARLING_FAST_VERBOSE") != nullptr;
             if (ctx->fast) {
-                const size_t freed = starling::fast::release_host_weights(ctx->model->loader, {"llm."});
+                // With the encoder on the device the loader keeps only the
+                // mel constants (and the optional CTC head) in use.
+                std::vector<std::string> owned{"llm."};
+                if (ctx->fast->encodes_audio()) owned.insert(owned.end(), {"enc.", "proj."});
+                const size_t freed = starling::fast::release_host_weights(ctx->model->loader, owned);
                 if (verbose)
-                    std::fprintf(stderr, "[fast] granite decoder engine: %s (%.0f MiB of host decoder weights released)\n",
+                    std::fprintf(stderr, "[fast] granite engine (%s): %s (%.0f MiB of host weights released)\n",
+                                 ctx->fast->encodes_audio() ? "encoder+decoder" : "decoder",
                                  ctx->fast->describe().c_str(), freed / 1048576.0);
             } else if (choice == starling::fast::EngineChoice::Fast) {
                 throw std::runtime_error("fast engine unavailable: " + ferr);
@@ -411,6 +431,14 @@ bool starling_ggml_granite_ctc_draft(void* handle, const float* pcm, int64_t n,
         return false;
     }
     *count = 0;
+#if defined(STARLING_HAVE_FAST)
+    if (c->fast && c->fast->encodes_audio()) {
+        // The loader's encoder weights now live in the fast engine.
+        c->err = "GRANITE CTC draft needs the ggml encoder (STARLING_ENGINE=ggml)";
+        report(err_out, c->err);
+        return false;
+    }
+#endif
     try {
         using namespace starling::ggml::granite;
         MelFeatures mel;
