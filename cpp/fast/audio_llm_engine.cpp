@@ -7,6 +7,8 @@
 #include "vk_runtime.hpp"
 #include "weights.hpp"
 
+#include "ark/loader.hpp"
+#include "granite/loader.hpp"
 #include "moss/loader.hpp"
 #include "moss/mel.hpp"
 #include "qwen3/loader.hpp"
@@ -25,12 +27,19 @@
 #include <map>
 #include <mutex>
 
+#if defined(__linux__)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
+
 namespace starling::fast {
 
 constexpr size_t kMaxPromptIds = 256;   // prompt prefix + suffix ids (device buffer)
 
 namespace ms = starling::ggml::moss;
 namespace q3 = starling::ggml::qwen3;
+namespace ak = starling::ggml::ark;
+namespace gr = starling::ggml::granite;
 
 namespace {
 
@@ -61,7 +70,8 @@ struct MelView {
 // What differs between the families the engine serves. Tensor names are
 // the GGUF names; the per-layer encoder names are suffixes of "enc.blk.<l>.".
 struct Spec {
-    const char* tag = "";   // messages and timing lines ("moss", "qwen3")
+    const char* tag = "";   // messages and timing lines ("moss", "qwen3", "ark", "granite")
+    bool encoder = true;    // false: decoder-only, the host supplies the audio rows
     std::string conv_out, pos_embed, proj1, proj2;
     std::string eq, ek, ev, eo, efc1, efc2;
     bool adapter = false;   // MOSS: SwiGLU adapter between projection and LLM
@@ -72,7 +82,13 @@ struct Spec {
     // LLM
     uint32_t HD = 0, NH = 0, NKV = 0, HDIM = 0, FF = 0, NL = 0, MAXPOS = 0;
     float rope_theta = 0, rms_eps = 0;
-    bool tied = false;
+    bool tied = false;      // lm_head == llm.embed (and the config is supported)
+    std::string lm_head;    // untied head tensor (Granite); "" = tied
+    bool qkv_bias = false;  // Qwen2.5 (ARK): biased q/k/v projections
+    bool qk_norm = true;    // Qwen3: per-head q/k RMSNorm
+    float attn_scale = 0;   // 0 = 1/sqrt(head_dim) (Granite: attention_multiplier)
+    float emb_mult = 1.0f, resid_mult = 1.0f;   // Granite (folded into weights)
+    std::vector<int32_t> banned;   // ids never picked (ARK 0.6B bad_words_ids)
     int32_t eos = 0;
     uint32_t max_new_tokens = 0;
     std::vector<int32_t> prefix, suffix;
@@ -145,13 +161,53 @@ Spec qwen3_spec(const q3::Config& c) {
     return s;
 }
 
+// ARK keeps the ggml engine's prompt layout (prefix + audio slots + suffix,
+// the slot count from the uncapped mel length, so audio past the encoder's
+// 30 s window becomes zero rows) and has no chunking of its own: 2048 slots
+// cover ~2.5 min of audio plus the 200-token budget at half the GGUF's
+// 4096-slot max_cache (UMA memory on phones).
+constexpr uint32_t kArkMaxPos = 2048;
+
+Spec ark_spec(const ak::Config& c) {
+    Spec s;
+    s.tag = "ark";
+    s.encoder = false;
+    const auto& lc = c.llm;
+    s.HD = lc.hidden; s.NH = lc.n_heads; s.NKV = lc.n_kv_heads; s.HDIM = lc.head_dim; s.FF = lc.intermediate;
+    s.NL = lc.n_layers; s.MAXPOS = std::min(lc.max_cache, kArkMaxPos);
+    s.rope_theta = lc.rope_theta; s.rms_eps = lc.rms_norm_eps;
+    s.tied = lc.tied_embeddings && !lc.has_qk_norm && lc.rope_scaling == "none";
+    s.qkv_bias = true;
+    s.qk_norm = false;
+    s.banned = c.bad_words_ids;
+    s.eos = c.eos_token_id; s.max_new_tokens = c.max_new_tokens;
+    return s;
+}
+
+Spec granite_spec(const gr::Config& c) {
+    Spec s;
+    s.tag = "granite";
+    s.encoder = false;
+    const auto& lc = c.llm;
+    s.HD = lc.hidden; s.NH = lc.n_heads; s.NKV = lc.n_kv_heads; s.HDIM = lc.head_dim; s.FF = lc.intermediate;
+    s.NL = lc.n_layers; s.MAXPOS = lc.max_cache;   // 640: the C API chunks audio to fit it
+    s.rope_theta = lc.rope_theta; s.rms_eps = lc.rms_norm_eps;
+    if (!lc.tied_embeddings && !lc.has_qk_norm) s.lm_head = "llm.lm_head.weight";
+    s.qk_norm = false;
+    s.attn_scale = lc.attention_multiplier;
+    s.emb_mult = lc.embedding_multiplier;
+    s.resid_mult = lc.residual_multiplier;
+    s.eos = c.eos_token_id; s.max_new_tokens = c.max_new_tokens;
+    return s;
+}
+
 struct EncLayer {
     GMat q, k, v, o, fc1, fc2;
     Arena::Id q_b, k_b, v_b, o_b, fc1_b, fc2_b, ln1_g, ln1_b, ln2_g, ln2_b;
 };
 struct LlmLayer {
     GMat qkv, o, gateup, down;
-    Arena::Id attn_norm, ffn_norm, q_norm, k_norm;
+    Arena::Id attn_norm, ffn_norm, q_norm, k_norm, qkv_b;
 };
 
 // A large matrix split into row chunks (each within one storage-buffer range).
@@ -203,7 +259,9 @@ struct AudioLlmEngine::Impl {
     // LLM weights
     std::vector<LlmLayer> llm;
     Arena::Id final_norm, rope_tab;
-    ChunkedMat embed;
+    ChunkedMat embed;                   // input table (dec_next, embed_rows)
+    ChunkedMat head;                    // lm_head: `embed` when tied
+    std::vector<Arena::Id> head_bias;   // per head chunk: -3e38 on banned ids
 
     // runtime buffers
     vk::Buffer kcache, vcache, state, ids, xd, qkvd, attd, hd, part;
@@ -224,6 +282,36 @@ struct AudioLlmEngine::Impl {
     bool alloc_static(std::string& err);
     bool ensure(int C, int A, int S, std::string& err);
     bool record_prefill(int C, int tail, Rec& r, std::string& err);
+    // Decoder-only prefill over S host-supplied rows (embedding lookup of
+    // the text slots, then the LLM).
+    bool record_prefill_rows(int S, Rec& r, std::string& err);
+    // The LLM prefill over the S rows of lx, ending with the first token.
+    bool record_llm(vk::Recording& rc, uint32_t S, std::string& err);
+    bool embed_lookup(vk::Recording& rc, uint32_t n, uint32_t ids_off, uint32_t out_row0, std::string& err);
+    // The prefill recording for `key`, made by `record` on first use; the
+    // least recently used of more than 8 is dropped.
+    Rec* prefill_rec(std::pair<int, int> key, const std::function<bool(Rec&)>& record) {
+        auto it = recs.find(key);
+        if (it == recs.end()) {
+            if (recs.size() >= 8) {
+                auto old = recs.begin();
+                for (auto j = recs.begin(); j != recs.end(); ++j)
+                    if (j->second.used < old->second.used) old = j;
+                recs.erase(old);
+            }
+            Rec r;
+            if (!record(r)) return nullptr;
+            it = recs.emplace(key, std::move(r)).first;
+        }
+        it->second.used = ++tick;
+        return &it->second;
+    }
+    // Fresh decode state for an S-row prompt, then the prefill recording and
+    // the greedy rounds; fills the generated ids.
+    // `t_pre` receives the ms from t0 to the end of the prefill.
+    bool run(vk::Recording& prefill, uint32_t S, uint32_t max_new, std::chrono::steady_clock::time_point t0,
+             std::vector<int32_t>& out_ids, bool& eos, int& rounds, double& t_pre, std::string& err);
+    float attn_scale() const { return sp.attn_scale > 0 ? sp.attn_scale : 1.0f / std::sqrt((float)HDIM); }
     // Prefill attention heads per score-matrix group: whole GQA groups within
     // a 64 MiB budget (at least one GQA group, however long the prompt).
     uint32_t prefill_hgroup(size_t S) const {
@@ -274,6 +362,47 @@ std::unique_ptr<AudioLlmEngine> AudioLlmEngine::create(const q3::Qwen3Model& m, 
     return e;
 }
 
+std::unique_ptr<AudioLlmEngine> AudioLlmEngine::create(const ak::ArkModel& m, std::string& err) {
+    auto I = make_impl(ark_spec(m.config), m.loader, err);
+    if (!I) return nullptr;
+    std::unique_ptr<AudioLlmEngine> e(new AudioLlmEngine());
+    e->impl_ = std::move(I);
+    return e;
+}
+
+std::unique_ptr<AudioLlmEngine> AudioLlmEngine::create(const gr::GraniteModel& m, std::string& err) {
+    auto I = make_impl(granite_spec(m.config), m.loader, err);
+    if (!I) return nullptr;
+    std::unique_ptr<AudioLlmEngine> e(new AudioLlmEngine());
+    e->impl_ = std::move(I);
+    return e;
+}
+
+size_t release_decoder_host_weights(const ggml::ModelLoader& loader) {
+    size_t released = 0;
+#if defined(__linux__)
+    // Only ranges inside the loader's own host allocation: once a GPU ggml
+    // backend has mirrored the weights, tensor() returns device tensors
+    // whose data pointers are not host memory.
+    if (!loader.ctx()) return 0;
+    const uintptr_t lo = (uintptr_t)ggml_get_mem_buffer(loader.ctx());
+    const uintptr_t hi = lo + ggml_get_mem_size(loader.ctx());
+    const uintptr_t page = (uintptr_t)sysconf(_SC_PAGESIZE);
+    for (const std::string& n : loader.tensor_names()) {
+        if (n.rfind("llm.", 0) != 0) continue;
+        const ggml_tensor* t = loader.tensor(n.c_str());
+        if (!t || !t->data || (uintptr_t)t->data < lo || (uintptr_t)t->data + ggml_nbytes(t) > hi) continue;
+        // Whole pages inside the tensor only: neighbours keep their bytes.
+        const uintptr_t b = ((uintptr_t)t->data + page - 1) / page * page;
+        const uintptr_t e = ((uintptr_t)t->data + ggml_nbytes(t)) / page * page;
+        if (e > b && madvise((void*)b, e - b, MADV_DONTNEED) == 0) released += e - b;
+    }
+#else
+    (void)loader;
+#endif
+    return released;
+}
+
 std::string AudioLlmEngine::describe() const {
     char buf[256];
     std::snprintf(buf, sizeof buf, "fast/vulkan '%s' weights=%.0f MiB",
@@ -289,10 +418,15 @@ bool AudioLlmEngine::Impl::load(const ggml::ModelLoader& ml, std::string& err) {
     HD = sp.HD; NH = sp.NH; NKV = sp.NKV; HDIM = sp.HDIM; FF = sp.FF;
     NL = sp.NL; MAXPOS = sp.MAXPOS;
     // EOUT == HD without an adapter: the projection writes the LLM input rows.
-    if (EHD != 64 || HDIM != 128 || DS % 8 || sp.n_mels != 128 || sp.n_window_infer % 100 ||
-        sp.n_window_infer == 0 || !sp.tied || MAXPOS > 4096 || NKV == 0 || NH % NKV ||
-        sp.max_new_tokens > MAXPOS || (sp.adapter ? AH == 0 : EOUT != HD) ||
-        sp.prefix.size() + sp.suffix.size() > kMaxPromptIds) {
+    const bool enc_ok = !sp.encoder ||
+        (EHD == 64 && DS % 8 == 0 && sp.n_mels == 128 && sp.n_window_infer % 100 == 0 &&
+         sp.n_window_infer != 0 && (sp.adapter ? AH != 0 : EOUT == HD) &&
+         sp.prefix.size() + sp.suffix.size() <= kMaxPromptIds);
+    // The input-embedding multiplier is folded into the input table, so it
+    // needs an untied head.
+    if (!enc_ok || (HDIM != 128 && HDIM != 64) || (!sp.tied && sp.lm_head.empty()) || MAXPOS > 4096 ||
+        NKV == 0 || NH % NKV || HD % 32 || FF % 32 || sp.max_new_tokens > MAXPOS ||
+        (sp.emb_mult != 1.0f && sp.lm_head.empty())) {
         err = "fast " + tag + ": unsupported configuration";
         return false;
     }
@@ -351,6 +485,18 @@ bool AudioLlmEngine::Impl::load(const ggml::ModelLoader& ml, std::string& err) {
         });
         return true;
     };
+    // Fused row groups need one format: when the parts come in different
+    // types (Granite: Q5_K gate -> W8, Q4_K up -> W4), the others are
+    // repacked to W8.
+    using Part = std::pair<const ggml_tensor*, HostMatrix*>;
+    auto same_fmt = [](std::initializer_list<Part> parts, std::string& e) {
+        bool mixed = false;
+        for (const Part& p : parts) mixed |= p.second->fmt != parts.begin()->second->fmt;
+        if (!mixed) return true;
+        for (const Part& p : parts)
+            if (p.second->fmt != GpuFmt::W8 && !pack_gpu_matrix_w8(p.first, *p.second, e)) return false;
+        return true;
+    };
     // Rows of `b` interleaved with rows of `a` (a0 b0 a1 b1 ...): the paired
     // GEMM/GEMV epilogues own both halves of each gated unit.
     auto interleave = [&](const std::string& a, const std::string& b, GMat& g) {
@@ -359,7 +505,8 @@ bool AudioLlmEngine::Impl::load(const ggml::ModelLoader& ml, std::string& err) {
         if (!ta || !tb) return false;
         jobs.add(&g, [&, ta, tb, a, b](HostMatrix& ha, std::string& e) {
             HostMatrix hb;
-            if (!pack_one(a, ta, ha, e) || !pack_one(b, tb, hb, e)) return false;
+            if (!pack_one(a, ta, ha, e) || !pack_one(b, tb, hb, e) || !same_fmt({{ta, &ha}, {tb, &hb}}, e))
+                return false;
             const uint32_t n = ha.N;
             if (!concat_rows(ha, hb, e)) return false;
             std::vector<uint32_t> order(2 * n);
@@ -370,79 +517,81 @@ bool AudioLlmEngine::Impl::load(const ggml::ModelLoader& ml, std::string& err) {
         return true;
     };
 
-    // ---- mel constants (kept in a tiny loader for the shared frontend) ----
-    {
-        std::vector<float> w, f;
-        const ggml_tensor* wt = T("audio.mel_window");
-        const ggml_tensor* ft = T("audio.mel_filters");
-        if (!wt || !ft || !tensor_to_f32(wt, w, err) || !tensor_to_f32(ft, f, err)) return false;
-        mel_loader.add_owned_tensor("audio.mel_window", w, wt->ne[0], 1);
-        mel_loader.add_owned_tensor("audio.mel_filters", f, ft->ne[0], ft->ne[1]);
-    }
+    if (sp.encoder) {
+        // ---- mel constants (kept in a tiny loader for the shared frontend) ----
+        {
+            std::vector<float> w, f;
+            const ggml_tensor* wt = T("audio.mel_window");
+            const ggml_tensor* ft = T("audio.mel_filters");
+            if (!wt || !ft || !tensor_to_f32(wt, w, err) || !tensor_to_f32(ft, f, err)) return false;
+            mel_loader.add_owned_tensor("audio.mel_window", w, wt->ne[0], 1);
+            mel_loader.add_owned_tensor("audio.mel_filters", f, ft->ne[0], ft->ne[1]);
+        }
 
-    // ---- audio encoder ----
-    if (!vec_id("enc.conv1.weight", c1_w) || !vec_id("enc.conv1.bias", c1_b) ||
-        !vec_id("enc.conv2.bias", c2_b) || !vec_id("enc.conv3.bias", c3_b))
-        return false;
-    // conv2/conv3 as implicit GEMMs: [oc][(kt*3 + kf)*cin + ic], f16.
-    for (int ci = 2; ci <= 3; ++ci) {
-        std::vector<float> w;
-        if (!f32("enc.conv" + std::to_string(ci) + ".weight", w)) return false;
-        if (w.size() != (size_t)DS * DS * 9) { err = "fast " + tag + ": conv shape"; return false; }
-        std::vector<float> r((size_t)DS * 9 * DS);
-        for (uint32_t oc = 0; oc < DS; ++oc)
-            for (uint32_t ic = 0; ic < DS; ++ic)
-                for (uint32_t kf = 0; kf < 3; ++kf)          // ggml kh (frequency)
-                    for (uint32_t kt = 0; kt < 3; ++kt)      // ggml kw (time)
-                        r[(size_t)oc * 9 * DS + (kt * 3 + kf) * DS + ic] =
-                            w[(((size_t)oc * DS + ic) * 3 + kf) * 3 + kt];
-        HostMatrix hm;
-        if (!pack_gpu_matrix_raw(GGML_TYPE_F32, r.data(), DS, 9 * DS, hm, err)) return false;
-        (ci == 2 ? c2 : c3) = arena_matrix(ar, std::move(hm));
-    }
-    // conv_out: columns reordered from ggml's (f + 16*c) to our (f*480 + c).
-    {
-        std::vector<float> w;
-        if (!f32(sp.conv_out, w)) return false;
-        const uint32_t Kc = 16 * DS;
-        if (w.size() != (size_t)ED * Kc) { err = "fast " + tag + ": conv_out shape"; return false; }
-        std::vector<float> r(w.size());
-        for (uint32_t n = 0; n < ED; ++n)
-            for (uint32_t f = 0; f < 16; ++f)
-                for (uint32_t c = 0; c < DS; ++c)
-                    r[(size_t)n * Kc + f * DS + c] = w[(size_t)n * Kc + f + 16 * c];
-        HostMatrix hm;
-        if (!pack_gpu_matrix_raw(GGML_TYPE_F32, r.data(), ED, Kc, hm, err)) return false;
-        cout = arena_matrix(ar, std::move(hm));
-    }
-    {
-        std::vector<float> pe;
-        if (!f32(sp.pos_embed, pe)) return false;
-        if (pe.size() < (size_t)13 * ED) { err = "fast " + tag + ": positional embedding shorter than 13 rows"; return false; }
-        pe.resize((size_t)13 * ED);                  // rows [0, 13): one chunk of tokens
-        pe13 = ar.add_f32(pe);
-    }
-    enc.resize(EL);
-    for (uint32_t l = 0; l < EL; ++l) {
-        EncLayer& Y = enc[l];
-        const std::string p = "enc.blk." + std::to_string(l) + ".";
-        if (!mat(p + sp.eq + ".weight", Y.q) || !mat(p + sp.ek + ".weight", Y.k) || !mat(p + sp.ev + ".weight", Y.v) ||
-            !mat(p + sp.eo + ".weight", Y.o) || !mat(p + sp.efc1 + ".weight", Y.fc1) ||
-            !mat(p + sp.efc2 + ".weight", Y.fc2) ||
-            !vec_id(p + sp.eq + ".bias", Y.q_b) || !vec_id(p + sp.ek + ".bias", Y.k_b) ||
-            !vec_id(p + sp.ev + ".bias", Y.v_b) || !vec_id(p + sp.eo + ".bias", Y.o_b) ||
-            !vec_id(p + sp.efc1 + ".bias", Y.fc1_b) || !vec_id(p + sp.efc2 + ".bias", Y.fc2_b) ||
-            !vec_id(p + "attn_norm.weight", Y.ln1_g) || !vec_id(p + "attn_norm.bias", Y.ln1_b) ||
-            !vec_id(p + "ffn_norm.weight", Y.ln2_g) || !vec_id(p + "ffn_norm.bias", Y.ln2_b))
+        // ---- audio encoder ----
+        if (!vec_id("enc.conv1.weight", c1_w) || !vec_id("enc.conv1.bias", c1_b) ||
+            !vec_id("enc.conv2.bias", c2_b) || !vec_id("enc.conv3.bias", c3_b))
+            return false;
+        // conv2/conv3 as implicit GEMMs: [oc][(kt*3 + kf)*cin + ic], f16.
+        for (int ci = 2; ci <= 3; ++ci) {
+            std::vector<float> w;
+            if (!f32("enc.conv" + std::to_string(ci) + ".weight", w)) return false;
+            if (w.size() != (size_t)DS * DS * 9) { err = "fast " + tag + ": conv shape"; return false; }
+            std::vector<float> r((size_t)DS * 9 * DS);
+            for (uint32_t oc = 0; oc < DS; ++oc)
+                for (uint32_t ic = 0; ic < DS; ++ic)
+                    for (uint32_t kf = 0; kf < 3; ++kf)          // ggml kh (frequency)
+                        for (uint32_t kt = 0; kt < 3; ++kt)      // ggml kw (time)
+                            r[(size_t)oc * 9 * DS + (kt * 3 + kf) * DS + ic] =
+                                w[(((size_t)oc * DS + ic) * 3 + kf) * 3 + kt];
+            HostMatrix hm;
+            if (!pack_gpu_matrix_raw(GGML_TYPE_F32, r.data(), DS, 9 * DS, hm, err)) return false;
+            (ci == 2 ? c2 : c3) = arena_matrix(ar, std::move(hm));
+        }
+        // conv_out: columns reordered from ggml's (f + 16*c) to our (f*480 + c).
+        {
+            std::vector<float> w;
+            if (!f32(sp.conv_out, w)) return false;
+            const uint32_t Kc = 16 * DS;
+            if (w.size() != (size_t)ED * Kc) { err = "fast " + tag + ": conv_out shape"; return false; }
+            std::vector<float> r(w.size());
+            for (uint32_t n = 0; n < ED; ++n)
+                for (uint32_t f = 0; f < 16; ++f)
+                    for (uint32_t c = 0; c < DS; ++c)
+                        r[(size_t)n * Kc + f * DS + c] = w[(size_t)n * Kc + f + 16 * c];
+            HostMatrix hm;
+            if (!pack_gpu_matrix_raw(GGML_TYPE_F32, r.data(), ED, Kc, hm, err)) return false;
+            cout = arena_matrix(ar, std::move(hm));
+        }
+        {
+            std::vector<float> pe;
+            if (!f32(sp.pos_embed, pe)) return false;
+            if (pe.size() < (size_t)13 * ED) { err = "fast " + tag + ": positional embedding shorter than 13 rows"; return false; }
+            pe.resize((size_t)13 * ED);                  // rows [0, 13): one chunk of tokens
+            pe13 = ar.add_f32(pe);
+        }
+        enc.resize(EL);
+        for (uint32_t l = 0; l < EL; ++l) {
+            EncLayer& Y = enc[l];
+            const std::string p = "enc.blk." + std::to_string(l) + ".";
+            if (!mat(p + sp.eq + ".weight", Y.q) || !mat(p + sp.ek + ".weight", Y.k) || !mat(p + sp.ev + ".weight", Y.v) ||
+                !mat(p + sp.eo + ".weight", Y.o) || !mat(p + sp.efc1 + ".weight", Y.fc1) ||
+                !mat(p + sp.efc2 + ".weight", Y.fc2) ||
+                !vec_id(p + sp.eq + ".bias", Y.q_b) || !vec_id(p + sp.ek + ".bias", Y.k_b) ||
+                !vec_id(p + sp.ev + ".bias", Y.v_b) || !vec_id(p + sp.eo + ".bias", Y.o_b) ||
+                !vec_id(p + sp.efc1 + ".bias", Y.fc1_b) || !vec_id(p + sp.efc2 + ".bias", Y.fc2_b) ||
+                !vec_id(p + "attn_norm.weight", Y.ln1_g) || !vec_id(p + "attn_norm.bias", Y.ln1_b) ||
+                !vec_id(p + "ffn_norm.weight", Y.ln2_g) || !vec_id(p + "ffn_norm.bias", Y.ln2_b))
+                return false;
+        }
+        if (!vec_id("enc.ln_post.weight", lnp_g) || !vec_id("enc.ln_post.bias", lnp_b) ||
+            !mat(sp.proj1 + ".weight", p1) || !vec_id(sp.proj1 + ".bias", p1_b) ||
+            !mat(sp.proj2 + ".weight", p2) || !vec_id(sp.proj2 + ".bias", p2_b))
+            return false;
+        if (sp.adapter && (!interleave("adapter.gate.weight", "adapter.up.weight", ad_gateup) ||
+                           !mat("adapter.down.weight", ad_down)))
             return false;
     }
-    if (!vec_id("enc.ln_post.weight", lnp_g) || !vec_id("enc.ln_post.bias", lnp_b) ||
-        !mat(sp.proj1 + ".weight", p1) || !vec_id(sp.proj1 + ".bias", p1_b) ||
-        !mat(sp.proj2 + ".weight", p2) || !vec_id(sp.proj2 + ".bias", p2_b))
-        return false;
-    if (sp.adapter && (!interleave("adapter.gate.weight", "adapter.up.weight", ad_gateup) ||
-                       !mat("adapter.down.weight", ad_down)))
-        return false;
 
     // ---- LLM ----
     llm.resize(NL);
@@ -458,66 +607,116 @@ bool AudioLlmEngine::Impl::load(const ggml::ModelLoader& ml, std::string& err) {
             return pack_one(p + "attn.q.weight", tq, q, e) &&
                    pack_one(p + "attn.k.weight", tk, k, e) &&
                    pack_one(p + "attn.v.weight", tv, v, e) &&
+                   same_fmt({{tq, &q}, {tk, &k}, {tv, &v}}, e) &&
                    concat_rows(q, k, e) && concat_rows(q, v, e);
         });
-        if (!mat(p + "attn.o.weight", Y.o) ||
+        // Granite's residual multiplier scales both residual branches: folded
+        // into the o and down projections (their outputs feed only the
+        // residual adds).
+        auto resid_mat = [&](const std::string& n, GMat& g) {
+            const ggml_tensor* t = T(n);
+            if (!t) return false;
+            jobs.add(&g, [&, t, n](HostMatrix& hm, std::string& e) {
+                return pack_one(n, t, hm, e) && (sp.resid_mult == 1.0f || scale_matrix(hm, sp.resid_mult, e));
+            });
+            return true;
+        };
+        if (!resid_mat(p + "attn.o.weight", Y.o) ||
             !interleave(p + "ffn.gate.weight", p + "ffn.up.weight", Y.gateup) ||
-            !mat(p + "ffn.down.weight", Y.down) || !vec_id(p + "attn_norm.weight", Y.attn_norm) ||
-            !vec_id(p + "ffn_norm.weight", Y.ffn_norm) || !vec_id(p + "attn.q_norm.weight", Y.q_norm) ||
-            !vec_id(p + "attn.k_norm.weight", Y.k_norm))
+            !resid_mat(p + "ffn.down.weight", Y.down) || !vec_id(p + "attn_norm.weight", Y.attn_norm) ||
+            !vec_id(p + "ffn_norm.weight", Y.ffn_norm))
             return false;
+        if (sp.qk_norm &&
+            (!vec_id(p + "attn.q_norm.weight", Y.q_norm) || !vec_id(p + "attn.k_norm.weight", Y.k_norm)))
+            return false;
+        if (sp.qkv_bias) {
+            std::vector<float> b, bk, bv;
+            if (!f32(p + "attn.q.bias", b) || !f32(p + "attn.k.bias", bk) || !f32(p + "attn.v.bias", bv))
+                return false;
+            if (b.size() != (size_t)NH * HDIM || bk.size() != (size_t)NKV * HDIM || bv.size() != bk.size()) {
+                err = "fast " + tag + ": q/k/v bias shape";
+                return false;
+            }
+            b.insert(b.end(), bk.begin(), bk.end());
+            b.insert(b.end(), bv.begin(), bv.end());
+            Y.qkv_b = ar.add_f32(b);
+        }
     }
     if (!vec_id("llm.final_norm.weight", final_norm)) return false;
-    // Tied embedding / lm_head: repacked in row blocks (parallel), then
-    // regrouped into chunks that each fit one storage-buffer binding.
-    std::vector<HostMatrix> emb_blocks;
+    // Embedding table (and an untied lm_head): repacked in row blocks
+    // (parallel), then regrouped into chunks that each fit one storage-buffer
+    // binding. Granite's embedding multiplier is folded into the input table.
     const uint32_t emb_block = 8192;
-    {
-        const ggml_tensor* te = T("llm.embed.weight");
+    struct Table { std::string name; ChunkedMat* dst; float scale; std::vector<HostMatrix> blocks; };
+    std::vector<Table> tables;
+    tables.reserve(2);   // the repack jobs hold pointers into `blocks`
+    tables.push_back({"llm.embed.weight", &embed, sp.emb_mult, {}});
+    if (!sp.lm_head.empty()) tables.push_back({sp.lm_head, &head, 1.0f, {}});
+    for (Table& tb : tables) {
+        const ggml_tensor* te = T(tb.name);
         if (!te) return false;
         const uint32_t N = (uint32_t)te->ne[1], Kc = (uint32_t)te->ne[0];
-        if (N == 0 || Kc != HD) { err = "fast " + tag + ": embedding table shape mismatch"; return false; }
-        if (packed && packed->has("llm.embed.weight")) {
+        if (N == 0 || Kc != HD) { err = "fast " + tag + ": " + tb.name + " shape mismatch"; return false; }
+        if (packed && packed->has(tb.name)) {
             HostMatrix whole;
-            if (!packed->matrix("llm.embed.weight", whole, err)) return false;
+            if (!packed->matrix(tb.name, whole, err)) return false;
             if (whole.K != Kc || whole.N != N) {
-                err = "llm.embed.weight: packed shape " + std::to_string(whole.N) + "x" +
+                err = tb.name + ": packed shape " + std::to_string(whole.N) + "x" +
                       std::to_string(whole.K) + " != GGUF " + std::to_string(N) + "x" + std::to_string(Kc);
                 return false;
             }
             // Same 8192-row blocks the GGUF path repacks in.
-            emb_blocks = split_rows(std::move(whole), emb_block);
+            tb.blocks = split_rows(std::move(whole), emb_block);
+            if (tb.scale != 1.0f)
+                for (HostMatrix& b : tb.blocks)
+                    if (!scale_matrix(b, tb.scale, err)) return false;
         } else {
             const size_t rb = ggml_row_size(te->type, Kc);
-            emb_blocks.resize((N + emb_block - 1) / emb_block);
-            for (size_t b = 0; b < emb_blocks.size(); ++b) {
+            const float scale = tb.scale;
+            tb.blocks.resize((N + emb_block - 1) / emb_block);
+            for (size_t b = 0; b < tb.blocks.size(); ++b) {
                 const uint32_t r0 = (uint32_t)b * emb_block, n = std::min(emb_block, N - r0);
-                jobs.add_host(&emb_blocks[b], [te, r0, n, Kc, rb](HostMatrix& hm, std::string& e) {
-                    return pack_gpu_matrix_raw((int)te->type, (const uint8_t*)te->data + (size_t)r0 * rb, n, Kc, hm, e);
+                jobs.add_host(&tb.blocks[b], [te, r0, n, Kc, rb, scale](HostMatrix& hm, std::string& e) {
+                    return pack_gpu_matrix_raw((int)te->type, (const uint8_t*)te->data + (size_t)r0 * rb, n, Kc, hm, e) &&
+                           (scale == 1.0f || scale_matrix(hm, scale, e));
                 });
             }
         }
     }
     if (!jobs.run(ar, err)) return false;
-    {
-        embed.K = emb_blocks[0].K; embed.fmt = emb_blocks[0].fmt;
-        embed.N = 0;
-        for (const HostMatrix& b : emb_blocks) embed.N += b.N;
-        const size_t row_bytes = (emb_blocks[0].q.size() + emb_blocks[0].s.size()) * 4 / emb_blocks[0].N;
+    for (Table& tb : tables) {
+        ChunkedMat& cm = *tb.dst;
+        std::vector<HostMatrix>& blocks = tb.blocks;
+        cm.K = blocks[0].K; cm.fmt = blocks[0].fmt;
+        cm.N = 0;
+        for (const HostMatrix& b : blocks) cm.N += b.N;
+        const size_t row_bytes = (blocks[0].q.size() + blocks[0].s.size()) * 4 / blocks[0].N;
         const VkDeviceSize cap = std::min<VkDeviceSize>(256ull << 20, ctx->info().max_storage_range);
-        embed.chunk_rows = (uint32_t)std::max<size_t>(emb_block, (cap / row_bytes) / emb_block * emb_block);
-        if (((size_t)embed.N + embed.chunk_rows - 1) / embed.chunk_rows > 4) {
-            err = "fast " + tag + ": embedding table needs more than 4 buffer chunks on this device";
+        cm.chunk_rows = (uint32_t)std::max<size_t>(emb_block, (cap / row_bytes) / emb_block * emb_block);
+        if (((size_t)cm.N + cm.chunk_rows - 1) / cm.chunk_rows > 4) {
+            err = "fast " + tag + ": " + tb.name + " needs more than 4 buffer chunks on this device";
             return false;
         }
-        const size_t per_chunk = embed.chunk_rows / emb_block;
-        for (size_t b0 = 0; b0 < emb_blocks.size(); b0 += per_chunk) {
-            HostMatrix c = std::move(emb_blocks[b0]);
-            for (size_t b = b0 + 1; b < std::min(emb_blocks.size(), b0 + per_chunk); ++b)
-                if (!concat_rows(c, emb_blocks[b], err)) return false;
-            embed.parts.push_back(arena_matrix(ar, std::move(c)));
+        const size_t per_chunk = cm.chunk_rows / emb_block;
+        for (size_t b0 = 0; b0 < blocks.size(); b0 += per_chunk) {
+            HostMatrix c = std::move(blocks[b0]);
+            for (size_t b = b0 + 1; b < std::min(blocks.size(), b0 + per_chunk); ++b)
+                if (!concat_rows(c, blocks[b], err)) return false;
+            cm.parts.push_back(arena_matrix(ar, std::move(c)));
         }
-        std::vector<HostMatrix>().swap(emb_blocks);
+        std::vector<HostMatrix>().swap(blocks);
+    }
+    if (sp.lm_head.empty()) head = embed;
+    // Suppressed ids (ARK 0.6B: every special and codec id but EOS) get a
+    // -3e38 logit bias in the lm_head argmax, prefill and decode alike.
+    if (!sp.banned.empty()) {
+        for (size_t c = 0; c < head.parts.size(); ++c) {
+            const uint32_t r0 = (uint32_t)c * head.chunk_rows;
+            std::vector<float> b(head.parts[c].N, 0.0f);
+            for (int32_t id : sp.banned)
+                if (id >= 0 && (uint32_t)id >= r0 && (uint32_t)id - r0 < b.size()) b[id - r0] = -3.0e38f;
+            head_bias.push_back(ar.add_f32(b));
+        }
     }
     // RoPE table as Transformers builds it: inv_freq and pos*inv_freq in f32.
     {
@@ -540,21 +739,25 @@ bool AudioLlmEngine::Impl::load(const ggml::ModelLoader& ml, std::string& err) {
         std::fprintf(stderr, "[fast-%s] load: repack %.1f ms, upload %.1f ms\n", sp.tag, t_pack,
                      ms_since(t_load0) - t_pack);
     if (env_on("STARLING_FAST_VERBOSE"))
-        std::fprintf(stderr, "[fast] %s: weights %.1f MiB on '%s' (embed %s, %zu chunk(s))\n", sp.tag,
+        std::fprintf(stderr, "[fast] %s: weights %.1f MiB on '%s' (embed %s, %zu chunk(s)%s%s)\n", sp.tag,
                      ar.total_bytes() / 1048576.0, ctx->info().name.c_str(), fmt_name(embed.fmt),
-                     embed.parts.size());
+                     embed.parts.size(), sp.lm_head.empty() ? "" : ", lm_head ",
+                     sp.lm_head.empty() ? "" : fmt_name(head.fmt));
     return true;
 }
 
 bool AudioLlmEngine::Impl::alloc_static(std::string& err) {
     const size_t cache_elems = (size_t)NL * NKV * MAXPOS * HDIM;
     n_part = 0;
-    for (const GMat& g : embed.parts) n_part += ceil_div(g.N, K.gemv_rows(g.N));
+    for (const GMat& g : head.parts) n_part += ceil_div(g.N, K.gemv_rows(g.N));
     auto mk = [&](vk::Buffer& b, size_t bytes, vk::Mem kind = vk::Mem::Device) {
         return ctx->create_buffer(b, bytes, kind, err);
     };
+    // Prompt ids: the prefix/suffix (encoder models) or a whole prompt
+    // (decoder-only models; one id per row, at most MAXPOS rows).
+    const size_t n_ids = sp.encoder ? kMaxPromptIds : MAXPOS;
     return mk(kcache, cache_elems * 2) && mk(vcache, cache_elems * 2) &&
-           mk(state, (16 + (size_t)sp.max_new_tokens) * 4, vk::Mem::Readback) && mk(ids, kMaxPromptIds * 4, vk::Mem::Readback) &&
+           mk(state, (16 + (size_t)sp.max_new_tokens) * 4, vk::Mem::Readback) && mk(ids, n_ids * 4, vk::Mem::Readback) &&
            mk(xd, HD * 4) && mk(qkvd, (size_t)(NH + 2 * NKV) * HDIM * 4) && mk(attd, (size_t)NH * HDIM * 4) &&
            mk(hd, (size_t)FF * 4) && mk(part, (size_t)n_part * 8) &&
            mk(apart, (size_t)NH * kAttnSplitMax * (2 + HDIM) * 4);
@@ -565,7 +768,8 @@ bool AudioLlmEngine::Impl::ensure(int C, int A, int S, std::string& err) {
     C = std::max(C, cap_C); A = std::max(A, cap_A); S = std::max(S, cap_S);
     recs.clear();
     const size_t P = 100, T1 = half_len((int)P), F1 = 64, T2 = half_len((int)T1), F2 = 32, T3 = half_len((int)T2), F3 = 16;
-    const size_t W = 13 * (sp.n_window_infer / 100);
+    // Decoder-only engines (C = A = 0) get placeholder encoder buffers.
+    const size_t W = std::max<size_t>(1, 13 * (sp.n_window_infer / 100));
     const size_t nwin = (A + W - 1) / W;
     const size_t ldPw = round_up((uint32_t)W, 8);
     const size_t ldPs = round_up((uint32_t)S, 8);
@@ -593,15 +797,17 @@ bool AudioLlmEngine::Impl::ensure(int C, int A, int S, std::string& err) {
 
 bool AudioLlmEngine::Impl::lm_head(vk::Recording& rc, vk::Ref x, uint32_t x_off, std::string& err) {
     uint32_t off = 0;
-    for (size_t c = 0; c < embed.parts.size(); ++c) {
-        const GMat& g = embed.parts[c];
+    for (size_t c = 0; c < head.parts.size(); ++c) {
+        const GMat& g = head.parts[c];
         Kernels::GemvArgs a;
         a.x_off = x_off;
         a.y_off = off * 2;
         a.eps = sp.rms_eps;
-        a.row0 = (uint32_t)c * embed.chunk_rows;
+        a.row0 = (uint32_t)c * head.chunk_rows;
         rc.label("lm_head");
-        if (!K.gemv(rc, ar, g, x, vk::Ref(part), R(final_norm), vk::Ref(state), {}, 3, a, err)) return false;
+        if (!K.gemv(rc, ar, g, x, vk::Ref(part), R(final_norm), vk::Ref(state),
+                    head_bias.empty() ? vk::Ref() : R(head_bias[c]), 3, a, err))
+            return false;
         off += ceil_div(g.N, K.gemv_rows(g.N));
     }
     return true;
@@ -781,26 +987,50 @@ bool AudioLlmEngine::Impl::record_prefill(int C, int tail, Rec& r, std::string& 
     } else if (!to_llm_rows(p2, eproj, ED, R(p2_b))) {
         return false;
     }
-    // Prompt token embeddings (ids uploaded at load time: prefix then suffix).
-    {
-        const char* name = embed.fmt == GpuFmt::W8 ? "embed_rows_w8" : embed.fmt == GpuFmt::W4 ? "embed_rows" : "embed_rows_f16";
-        const vk::Pipeline* pp = ctx->pipeline(name, {256u, embed.chunk_rows}, err);
-        if (!pp) return false;
-        std::vector<vk::Ref> b(10, vk::Ref(K.dummy()));
-        b[0] = vk::Ref(ids);
-        for (size_t c = 0; c < embed.parts.size(); ++c) {
-            b[1 + c] = R(embed.parts[c].q);
-            if (embed.parts[c].has_s) b[5 + c] = R(embed.parts[c].s);
-        }
-        b[9] = vk::Ref(lx);
-        struct { uint32_t K, ids_off, out_row0; } a1{HD, 0, 0}, a2{HD, npre, npre + A};
-        rc.label("embed");
-        rc.dispatch(*pp, b, &a1, sizeof(a1), npre);
-        rc.dispatch(*pp, b, &a2, sizeof(a2), (uint32_t)sp.suffix.size());
-    }
+    // Prompt token embeddings (ids uploaded per call: prefix then suffix).
+    if (!embed_lookup(rc, npre, 0, 0, err) ||
+        !embed_lookup(rc, (uint32_t)sp.suffix.size(), npre, npre + A, err))
+        return false;
     rc.barrier();
+    if (!record_llm(rc, S, err)) return false;
+    rc.end();
+    return true;
+}
 
-    // ---- LLM prefill ----
+bool AudioLlmEngine::Impl::embed_lookup(vk::Recording& rc, uint32_t n, uint32_t ids_off, uint32_t out_row0,
+                                        std::string& err) {
+    const char* name = embed.fmt == GpuFmt::W8 ? "embed_rows_w8" : embed.fmt == GpuFmt::W4 ? "embed_rows" : "embed_rows_f16";
+    const vk::Pipeline* pp = ctx->pipeline(name, {256u, embed.chunk_rows}, err);
+    if (!pp) return false;
+    std::vector<vk::Ref> b(10, vk::Ref(K.dummy()));
+    b[0] = vk::Ref(ids);
+    for (size_t c = 0; c < embed.parts.size(); ++c) {
+        b[1 + c] = R(embed.parts[c].q);
+        if (embed.parts[c].has_s) b[5 + c] = R(embed.parts[c].s);
+    }
+    b[9] = vk::Ref(lx);
+    struct { uint32_t K, ids_off, out_row0; } a{HD, ids_off, out_row0};
+    rc.label("embed");
+    rc.dispatch(*pp, b, &a, sizeof(a), n);
+    return true;
+}
+
+bool AudioLlmEngine::Impl::record_prefill_rows(int S, Rec& r, std::string& err) {
+    r.A = 0;
+    r.S = S;
+    r.rec = std::make_unique<vk::Recording>(*ctx);
+    vk::Recording& rc = *r.rec;
+    rc.begin();
+    // Text slots from the input table; the audio slots (id 0xffffffff) were
+    // uploaded with the rows.
+    if (!embed_lookup(rc, (uint32_t)S, 0, 0, err)) return false;
+    rc.barrier();
+    if (!record_llm(rc, (uint32_t)S, err)) return false;
+    rc.end();
+    return true;
+}
+
+bool AudioLlmEngine::Impl::record_llm(vk::Recording& rc, uint32_t S, std::string& err) {
     const uint32_t QKVW = (NH + 2 * NKV) * HDIM;
     const uint32_t ldS = S, ldP = round_up(S, 8);
     // Head groups are whole GQA groups (each group's first head starts a KV
@@ -810,7 +1040,8 @@ bool AudioLlmEngine::Impl::record_prefill(int C, int tail, Rec& r, std::string& 
         {(size_t)NH, lsc.size / ((size_t)S * S * 4), lp.size / ((size_t)S * ldP * 2)});
     hgroup = std::max(gqa, hgroup / gqa * gqa);
     const float leps = sp.rms_eps;
-    const float lscale = 1.0f / std::sqrt((float)HDIM);
+    const float lscale = attn_scale();
+    const uint32_t qk_norm = sp.qk_norm ? 1u : 0u;
     for (uint32_t l = 0; l < NL; ++l) {
         const LlmLayer& Y = llm[l];
         const uint32_t coff = l * NKV * MAXPOS * HDIM;
@@ -820,16 +1051,18 @@ bool AudioLlmEngine::Impl::record_prefill(int C, int tail, Rec& r, std::string& 
             return false;
         rc.barrier();
         rc.label("llm_qkv");
-        if (!K.gemm_w(rc, ar, Y.qkv, vk::Ref(lhn), S, HD, vk::Ref(lqkv), QKVW, Epi::F16, Act::None, {}, 1.0f, ~0u, err))
+        if (!K.gemm_w(rc, ar, Y.qkv, vk::Ref(lhn), S, HD, vk::Ref(lqkv), QKVW, Epi::F16, Act::None,
+                      sp.qkv_bias ? R(Y.qkv_b) : vk::Ref(), 1.0f, ~0u, err))
             return false;
         rc.barrier();
         rc.label("rope_kv");
         {
-            const vk::Pipeline* pp = ctx->pipeline("rope_kv", {HDIM, MAXPOS}, err);
+            const vk::Pipeline* pp = ctx->pipeline("rope_kv", {HDIM, MAXPOS, qk_norm}, err);
             if (!pp) return false;
             struct { uint32_t H, KVH, cache_off; float eps; uint32_t pos0; } a{NH, NKV, coff, leps, 0};
-            rc.dispatch(*pp, {vk::Ref(lqkv), vk::Ref(kcache), vk::Ref(vcache), vk::Ref(lqr), R(Y.q_norm),
-                              R(Y.k_norm), R(rope_tab)},
+            rc.dispatch(*pp, {vk::Ref(lqkv), vk::Ref(kcache), vk::Ref(vcache), vk::Ref(lqr),
+                              qk_norm ? R(Y.q_norm) : vk::Ref(K.dummy()), qk_norm ? R(Y.k_norm) : vk::Ref(K.dummy()),
+                              R(rope_tab)},
                         &a, sizeof(a), S, NH + NKV);
         }
         rc.barrier();
@@ -885,9 +1118,7 @@ bool AudioLlmEngine::Impl::record_prefill(int C, int tail, Rec& r, std::string& 
     rc.split();
     if (!lm_head(rc, vk::Ref(lx), (S - 1) * HD, err)) return false;
     rc.barrier();
-    if (!dec_next(rc, err)) return false;
-    rc.end();
-    return true;
+    return dec_next(rc, err);
 }
 
 bool AudioLlmEngine::Impl::record_decode(uint32_t steps, std::string& err) {
@@ -895,7 +1126,8 @@ bool AudioLlmEngine::Impl::record_decode(uint32_t steps, std::string& err) {
     vk::Recording& rc = *dec_rec;
     rc.begin();
     const float leps = sp.rms_eps;
-    const float lscale = 1.0f / std::sqrt((float)HDIM);
+    const float lscale = attn_scale();
+    const uint32_t qk_norm = sp.qk_norm ? 1u : 0u;
     // Decode attention as a flash-decode KV split: S chunks per query head,
     // then a combine. The single-pass kernel runs one workgroup per head (16
     // on MOSS), too few to hide cache-load latency on an iGPU. The chunked
@@ -914,8 +1146,8 @@ bool AudioLlmEngine::Impl::record_decode(uint32_t steps, std::string& err) {
         return -1;
     }();
     const uint32_t asplit = split_env >= 0 ? (uint32_t)split_env : ctx->info().vendor_id == 0x1002 ? 4 : 0;
-    const vk::Pipeline* ap = asplit ? ctx->pipeline("attn_decode_split", {HDIM, MAXPOS, ceil_div(MAXPOS, asplit)}, err)
-                                    : ctx->pipeline("attn_decode", {HDIM, MAXPOS}, err);
+    const vk::Pipeline* ap = asplit ? ctx->pipeline("attn_decode_split", {HDIM, MAXPOS, ceil_div(MAXPOS, asplit), qk_norm}, err)
+                                    : ctx->pipeline("attn_decode", {HDIM, MAXPOS, qk_norm}, err);
     const vk::Pipeline* ac = asplit ? ctx->pipeline("attn_split_combine", {HDIM}, err) : nullptr;
     if (!ap || (asplit && !ac)) return false;
     for (uint32_t s = 0; s < steps; ++s) {
@@ -933,7 +1165,8 @@ bool AudioLlmEngine::Impl::record_decode(uint32_t steps, std::string& err) {
             Kernels::GemvArgs a;
             a.eps = leps;
             rc.label("dec_qkv");
-            if (!K.gemv(rc, ar, Y.qkv, vk::Ref(xd), vk::Ref(qkvd), R(Y.attn_norm), vk::Ref(state), {}, 0, a, err))
+            if (!K.gemv(rc, ar, Y.qkv, vk::Ref(xd), vk::Ref(qkvd), R(Y.attn_norm), vk::Ref(state),
+                        sp.qkv_bias ? R(Y.qkv_b) : vk::Ref(), 0, a, err))
                 return false;
             rc.barrier();
             rc.label("dec_attn");
@@ -941,7 +1174,8 @@ bool AudioLlmEngine::Impl::record_decode(uint32_t steps, std::string& err) {
             struct { uint32_t H, KVH, cache_off; float eps, scale; uint32_t S; } pa{
                 NH, NKV, l * NKV * MAXPOS * HDIM, leps, lscale, asplit};
             rc.dispatch(*ap, {vk::Ref(qkvd), vk::Ref(kcache), vk::Ref(vcache), vk::Ref(asplit ? apart : attd),
-                              R(Y.q_norm), R(Y.k_norm), R(rope_tab), vk::Ref(state)},
+                              qk_norm ? R(Y.q_norm) : vk::Ref(K.dummy()), qk_norm ? R(Y.k_norm) : vk::Ref(K.dummy()),
+                              R(rope_tab), vk::Ref(state)},
                         &pa, sizeof(pa), NH, std::max(asplit, 1u));
             if (asplit) {
                 rc.barrier();
@@ -1003,43 +1237,48 @@ bool AudioLlmEngine::generate(const float* pcm, size_t n, uint32_t budget, std::
     }
     const double t_mel = ms_since(t0);
 
-    auto key = std::make_pair(C, tail);
-    auto it = I.recs.find(key);
-    if (it == I.recs.end()) {
-        if (I.recs.size() >= 8) {
-            auto old = I.recs.begin();
-            for (auto j = I.recs.begin(); j != I.recs.end(); ++j)
-                if (j->second.used < old->second.used) old = j;
-            I.recs.erase(old);
-        }
-        Impl::Rec r;
-        if (!I.record_prefill(C, tail, r, err)) return false;
-        it = I.recs.emplace(key, std::move(r)).first;
-    }
-    it->second.used = ++I.tick;
-    const uint32_t steps = (uint32_t)std::max(1, std::atoi(std::getenv("STARLING_FAST_KSTEP") ? std::getenv("STARLING_FAST_KSTEP") : "16"));
-    if (!I.dec_rec || I.dec_steps != steps) {
-        if (!I.record_decode(steps, err)) return false;
-    }
+    Impl::Rec* rec = I.prefill_rec({C, tail}, [&](Impl::Rec& r) { return I.record_prefill(C, tail, r, err); });
+    if (!rec) return false;
 
-    // Inputs: mel chunks, prompt ids, fresh state.
+    // Inputs: mel chunks, prompt ids (fresh state: run()).
     if (!I.ctx->upload(I.mel_in, 0, chunks.data(), chunks.size() * 4, err)) return false;
     {
         std::vector<uint32_t> idv;
         for (int32_t v : I.sp.prefix) idv.push_back((uint32_t)v);
         for (int32_t v : I.sp.suffix) idv.push_back((uint32_t)v);
         if (!I.ctx->upload(I.ids, 0, idv.data(), idv.size() * 4, err)) return false;
-        uint32_t st[16] = {};
-        st[0] = (uint32_t)S - 1;   // dec_next advances to S: the first generated token's position
-        st[3] = max_new;           // this call's token budget (dec_next.comp)
-        if (!I.ctx->upload(I.state, 0, st, sizeof st, err)) return false;
     }
-    if (!it->second.rec->submit_and_wait(err)) return false;
-    it->second.rec->report_profile("encoder+prefill");
-    const double t_pre = ms_since(t0);
+    int rounds = 0;
+    double t_pre = 0;
+    if (!I.run(*rec->rec, (uint32_t)S, max_new, t0, out_ids, eos, rounds, t_pre, err)) return false;
+    if (timing)
+        std::fprintf(stderr, "[fast-%s] audio=%.2fs mel=%.1fms enc+prefill=%.1fms decode=%.1fms (%zu tokens, %d rounds) total=%.1fms (T=%lld A=%d S=%d)\n",
+                     tag, n / 16000.0, t_mel, t_pre - t_mel, ms_since(t0) - t_pre, out_ids.size(), rounds,
+                     ms_since(t0), (long long)T, A, S);
+    return true;
+}
+
+bool AudioLlmEngine::Impl::run(vk::Recording& prefill, uint32_t S, uint32_t max_new,
+                               std::chrono::steady_clock::time_point t0, std::vector<int32_t>& out_ids,
+                               bool& eos, int& rounds, double& t_pre, std::string& err) {
+    Impl& I = *this;
+    const char* tag = sp.tag;
+    const uint32_t steps = (uint32_t)std::max(1, std::atoi(std::getenv("STARLING_FAST_KSTEP") ? std::getenv("STARLING_FAST_KSTEP") : "16"));
+    if (!dec_rec || dec_steps != steps) {
+        if (!record_decode(steps, err)) return false;
+    }
+    {
+        uint32_t st[16] = {};
+        st[0] = S - 1;      // dec_next advances to S: the first generated token's position
+        st[3] = max_new;    // this call's token budget (dec_next.comp)
+        if (!ctx->upload(state, 0, st, sizeof st, err)) return false;
+    }
+    if (!prefill.submit_and_wait(err)) return false;
+    prefill.report_profile(sp.encoder ? "encoder+prefill" : "prefill");
+    t_pre = ms_since(t0);
 
     std::vector<uint32_t> st(16 + (size_t)I.sp.max_new_tokens);
-    int rounds = 0;
+    rounds = 0;
     // The device stops at EOS or the budget; the host bound only guards
     // against a state buffer that never reports either.
     const int max_rounds = (int)(max_new / steps) + 2;
@@ -1133,10 +1372,65 @@ bool AudioLlmEngine::generate(const float* pcm, size_t n, uint32_t budget, std::
             std::fprintf(stderr, "[fast-%s] STARLING_FAST_DUMP_TOKENS: cannot write %s\n", tag, path.c_str());
         }
     }
-    if (timing)
-        std::fprintf(stderr, "[fast-%s] audio=%.2fs mel=%.1fms enc+prefill=%.1fms decode=%.1fms (%u tokens, %d rounds) total=%.1fms (T=%lld A=%d S=%d)\n",
-                     tag, n / 16000.0, t_mel, t_pre - t_mel, ms_since(t0) - t_pre, ngen, rounds, ms_since(t0),
-                     (long long)T, A, S);
+    return true;
+}
+
+bool AudioLlmEngine::generate(const std::vector<int32_t>& prompt_ids, const std::vector<uint8_t>& audio_mask,
+                              const float* audio, int64_t audio_rows, uint32_t budget,
+                              std::vector<int32_t>& out_ids, bool& eos, std::string& err) {
+    Impl& I = *impl_;
+    const char* tag = I.sp.tag;
+    if (I.sp.encoder) { err = std::string("fast ") + tag + ": this engine takes audio, not encoder rows"; return false; }
+    const uint32_t max_new = budget ? std::min(budget, I.sp.max_new_tokens) : I.sp.max_new_tokens;
+    const auto t0 = std::chrono::steady_clock::now();
+    const int S = (int)prompt_ids.size();
+    if (S == 0 || audio_mask.size() != prompt_ids.size() || audio_rows < 0 || (audio_rows > 0 && !audio)) {
+        err = std::string("fast ") + tag + ": invalid prompt";
+        return false;
+    }
+    if (S + (int)max_new > (int)I.MAXPOS) {
+        err = std::string("fast ") + tag + ": generation exceeds the KV cache (audio too long)";
+        return false;
+    }
+    if (!I.ensure(0, 0, S, err)) return false;
+
+    // Audio slots take the encoder rows (bf16-rounded like the ggml scatter;
+    // zero once the rows run out) times the embedding multiplier the input
+    // table already carries; text slots get their ids, audio slots the skip
+    // marker for embed_rows.
+    const size_t HD = I.HD;
+    std::vector<float> rows((size_t)S * HD, 0.0f);
+    std::vector<uint32_t> idv((size_t)S);
+    int64_t next = 0;
+    for (int i = 0; i < S; ++i) {
+        if (!audio_mask[i]) {
+            if (prompt_ids[i] < 0 || (uint32_t)prompt_ids[i] >= I.embed.N) {
+                err = std::string("fast ") + tag + ": prompt id out of range";
+                return false;
+            }
+            idv[i] = (uint32_t)prompt_ids[i];
+            continue;
+        }
+        idv[i] = 0xffffffffu;
+        if (next < audio_rows)
+            for (size_t d = 0; d < HD; ++d)
+                rows[(size_t)i * HD + d] =
+                    ggml_bf16_to_fp32(ggml_fp32_to_bf16(audio[(size_t)next * HD + d])) * I.sp.emb_mult;
+        ++next;
+    }
+
+    Impl::Rec* rec = I.prefill_rec({0, S}, [&](Impl::Rec& r) { return I.record_prefill_rows(S, r, err); });
+    if (!rec) return false;
+    if (!I.ctx->upload(I.lx, 0, rows.data(), rows.size() * 4, err) ||
+        !I.ctx->upload(I.ids, 0, idv.data(), idv.size() * 4, err))
+        return false;
+    const double t_up = ms_since(t0);
+    int rounds = 0;
+    double t_pre = 0;
+    if (!I.run(*rec->rec, (uint32_t)S, max_new, t0, out_ids, eos, rounds, t_pre, err)) return false;
+    if (env_on("STARLING_FAST_TIMING"))
+        std::fprintf(stderr, "[fast-%s] rows=%.1fms prefill=%.1fms decode=%.1fms (%zu tokens, %d rounds) total=%.1fms (S=%d)\n",
+                     tag, t_up, t_pre - t_up, ms_since(t0) - t_pre, out_ids.size(), rounds, ms_since(t0), S);
     return true;
 }
 

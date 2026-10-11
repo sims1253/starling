@@ -2,12 +2,13 @@
 // rope_kv.comp — prefill-side Qwen3 attention prologue. One workgroup per
 // (token, head slot): slots [0, H) are query heads (RMSNorm·q_norm, RoPE ->
 // q_rot f16), slots [H, H+KVH) are KV heads (RMSNorm·k_norm, RoPE -> K cache;
-// V copied to the V cache). Input: the fused q|k|v projection, f16 [S][..].
+// V copied to the V cache). QK_NORM=0 skips the norms (Qwen2.5, Granite). Input: the fused q|k|v projection, f16 [S][..].
 
 #include "common.glsl"
 
 layout(constant_id = 0) const uint D = 128;
 layout(constant_id = 1) const uint MAXPOS = 2048;
+layout(constant_id = 2) const uint QK_NORM = 1;   // 0: no q/k RMSNorm (Qwen2.5, Granite)
 layout(local_size_x_id = 0) in;
 
 layout(std430, binding = 0) readonly buffer QKV { uint qkv[]; };
@@ -54,8 +55,11 @@ void main() {
     const uint pos = p.pos0 + s;
 
     const float x = ld(s * W + col + d);
-    const float rs = inversesqrt(block_sum(x * x) / float(D) + p.eps);
-    const float xn = x * rs * (is_q ? qn_w[d] : kn_w[d]);
+    float xn = x;
+    if (QK_NORM != 0u) {
+        const float rs = inversesqrt(block_sum(x * x) / float(D) + p.eps);
+        xn = x * rs * (is_q ? qn_w[d] : kn_w[d]);
+    }
     xs[d] = xn;
     barrier();
     const uint half_d = D / 2, i = d % half_d;

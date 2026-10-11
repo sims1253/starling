@@ -93,6 +93,48 @@ int check_type(ggml_type type, GpuFmt want_fmt, float rel_tol) {
     return ok ? 0 : 1;
 }
 
+// pack_gpu_matrix_w8 (forced W8 for mixed-type row pairs) and scale_matrix
+// (a multiplier folded into the group scales) against ggml's dequantizer.
+int check_w8_and_scale(ggml_type type, float f) {
+    const uint32_t N = 8, K = 512;
+    std::mt19937 rng(11 + (int)type);
+    std::normal_distribution<float> nd(0.0f, 0.05f);
+    std::vector<float> src((size_t)N * K);
+    for (float& v : src) v = nd(rng);
+    const size_t rb = ggml_row_size(type, K);
+    std::vector<uint8_t> q(rb * N);
+    ggml_quantize_chunk(type, src.data(), q.data(), 0, N, K, nullptr);
+    std::vector<float> ref((size_t)N * K);
+    ggml_get_type_traits(type)->to_float(q.data(), ref.data(), (int64_t)N * K);
+    ggml_init_params ip{ggml_tensor_overhead() * 4, nullptr, true};
+    ggml_context* ctx = ggml_init(ip);
+    ggml_tensor* t = ggml_new_tensor_2d(ctx, type, K, N);
+    t->data = q.data();
+    HostMatrix w8, sc;
+    std::string err;
+    const bool packed = pack_gpu_matrix_w8(t, w8, err) && pack_gpu_matrix_raw(type, q.data(), N, K, sc, err) &&
+                        scale_matrix(sc, f, err);
+    ggml_free(ctx);
+    if (!packed || w8.fmt != GpuFmt::W8) {
+        std::printf("FAIL %s: w8/scale pack: %s\n", ggml_type_name(type), err.c_str());
+        return 1;
+    }
+    double e8 = 0.0, es = 0.0, max_ref = 0.0;
+    for (uint32_t n = 0; n < N; ++n)
+        for (uint32_t k = 0; k < K; ++k) {
+            const float r = ref[(size_t)n * K + k];
+            e8 = std::max(e8, (double)std::fabs(deq(w8, n, k) - r));
+            es = std::max(es, (double)std::fabs(deq(sc, n, k) - f * r));
+            max_ref = std::max(max_ref, (double)std::fabs(r));
+        }
+    // W8 requantization: half an int8 step of a 16-weight absmax; the
+    // scaled scales round once more to f16.
+    const bool ok = e8 <= 1e-2 * max_ref && es <= 3e-3 * f * max_ref;
+    std::printf("%s %-5s -> W8 max|err| %.3g, x%.2f via scales max|err| %.3g (of max|w|)\n", ok ? "ok  " : "FAIL",
+                ggml_type_name(type), e8 / max_ref, f, es / (f * max_ref));
+    return ok ? 0 : 1;
+}
+
 int check_gemv() {
     const uint32_t N = 37, K = 640;
     std::mt19937 rng(7);
@@ -417,6 +459,9 @@ int main() {
     fails += check_type(GGML_TYPE_Q4_K, GpuFmt::W4, 2e-3f);
     fails += check_type(GGML_TYPE_Q6_K, GpuFmt::W8, 2e-3f);
     fails += check_type(GGML_TYPE_Q5_K, GpuFmt::W8, 1e-2f);
+    fails += check_w8_and_scale(GGML_TYPE_Q4_K, 0.22f);
+    fails += check_w8_and_scale(GGML_TYPE_Q8_0, 12.0f);
+    fails += check_w8_and_scale(GGML_TYPE_F16, 0.22f);
     fails += check_gemv();
     fails += check_gemv_helper();
     // Layout descriptors (#319): every descriptor round-trips through its

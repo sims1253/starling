@@ -55,6 +55,16 @@ bool pack_gpu_matrix(const ggml_tensor* t, HostMatrix& out, std::string& err);
 bool pack_gpu_matrix_raw(int ggml_type, const void* data, uint32_t N, uint32_t K,
                          HostMatrix& out, std::string& err);
 
+// Repack into W8 whatever the source type (lossless for Q8_0 / Q6_K,
+// requantized otherwise): the common format when the two halves of a fused
+// row pair come in different types (Granite: Q5_K gate, Q4_K up).
+bool pack_gpu_matrix_w8(const ggml_tensor* t, HostMatrix& out, std::string& err);
+
+// Multiply every weight by `f` through the per-group scales (W4 scale and
+// offset, W8 scales; F16 weights directly), each re-rounded once to f16:
+// folds a constant output multiplier into the matrix. Legacy layouts only.
+bool scale_matrix(HostMatrix& m, float f, std::string& err);
+
 // Row permutation: out row r = in row src[r] (exact for every format).
 void permute_rows(HostMatrix& m, const std::vector<uint32_t>& src);
 

@@ -5,8 +5,9 @@ Starling ships two kinds of engines behind the same C API:
 * the **ggml engines** — general, every model, every backend
   ([engine notes](ggml-engine.md));
 * the **fast engines** in `cpp/fast/` — hand-written Vulkan compute kernels
-  for three model families, **Parakeet-TDT**, **MOSS-Transcribe** and
-  **Qwen3-ASR** (1.7B and 0.6B), built around their shapes the way
+  for two model families, **Parakeet-TDT** and the audio-LLMs
+  (**MOSS-Transcribe** and **Qwen3-ASR** whole; the text decoders of
+  **ARK-ASR** and **Granite-speech**), built around their shapes the way
   [Splash](https://inco.ai/blog/splash/) builds an engine around one model.
   MOSS and Qwen3-ASR share one engine (`audio_llm_engine.cpp`): the same
   Qwen3-Omni-style audio tower and Qwen3 decoder, with MOSS's SwiGLU adapter
@@ -38,8 +39,8 @@ devices (SwiftShader, llvmpipe) are ignored.
 | `STARLING_FAST_W4U=0/1` | W4 decode GEMVs through `unpackUnorm4x8` (default on for PowerVR and AMD) |
 | `STARLING_FAST_MICRO=...` | run one isolated kernel probe at load (`bits,N,K[,reps[,rows]]` GEMV, `norm,...`, `alu,...`, `idot,...`; see `Kernels::micro`) |
 | `STARLING_FAST_TILE=BM,BN,TM,TN` / `STARLING_FAST_GEMV_ROWS=n` | override the tuned GEMM tile / GEMV rows |
-| `STARLING_FAST_KSTEP=n` | MOSS / Qwen3-ASR decode tokens per submission (default 16) |
-| `STARLING_FAST_ATTN_SPLIT=S` | MOSS decode attention split into `S` KV chunks, 1–8; `0` = single pass (default 4 on AMD, 0 elsewhere) |
+| `STARLING_FAST_KSTEP=n` | audio-LLM decode tokens per submission (default 16) |
+| `STARLING_FAST_ATTN_SPLIT=S` | audio-LLM decode attention split into `S` KV chunks, 1–8; `0` = single pass (default 4 on AMD, 0 elsewhere) |
 | `STARLING_FAST_DEVICE=n` | Vulkan physical device index |
 | `STARLING_FAST_TIMING=1` / `STARLING_FAST_PROFILE=1` | per-stage wall times / per-kernel GPU times |
 | `STARLING_FAST_VERBOSE=1` | device, weights and tuning choices at load |
@@ -83,6 +84,20 @@ per call (state slot 3): Qwen3-ASR scales it to the clip length like its
 ggml engine. Qwen3-ASR's KV cache holds 1024 positions instead of the GGUF's
 4096 (its C API cuts audio into ≤ 30 s pieces), 117 MiB instead of 470 MiB of
 unified memory on a phone.
+
+**Decoder-only engines (ARK, Granite).** On the phone their LLM decode
+dominates wall time while the encoder runs once per clip, so only the
+decoder moves: the ggml encoder/projector output rows and the prompt ids
+are uploaded once, and the engine does the embedding lookup, prefill and the
+same on-device greedy loop. The trunk variations are spec flags of the
+Qwen3 decoder — Qwen2.5's q/k/v biases ride the projection epilogues and
+the attention kernels skip the q/k norm; Granite's residual multiplier is
+folded into the o/down projections' group scales, its embedding multiplier
+into the (untied) input table, its attention multiplier is the softmax
+scale and its logit divisor is dropped (it cannot change a greedy argmax).
+ARK 0.6B's suppressed ids (`bad_words_ids`) are a −3e38 lm_head bias. Once
+the engine holds the decoder, the host pages of the loader's `llm.*`
+tensors are returned to the OS (`release_decoder_host_weights`).
 
 **Parakeet's transducer decoder stays on the CPU** — sequential, a few small
 matrix-vector products per step — with int8 dot-product kernels (ARMv8.2

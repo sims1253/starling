@@ -100,6 +100,28 @@ std::vector<uint32_t> pack_f16(const float* x, size_t n) {
     return out;
 }
 
+namespace {
+// Dequantize then requantize to W8 (the fallback for types without a native
+// mapping, and the common format of mixed-type row pairs).
+bool requant_w8(int type, const void* data, uint32_t N, uint32_t K, HostMatrix& m, std::string& err) {
+    if (K % 32) { err = "fast engine: K must be a multiple of 32"; return false; }
+    m = HostMatrix{};
+    m.N = N; m.K = K;
+    m.fmt = GpuFmt::W8;
+    m.layout = LayoutDesc{8, 16, true};   // w8g16sym
+    const size_t G = K / 32, row_bytes = ggml_row_size((ggml_type)type, K);
+    m.q.assign((size_t)N * G * 8, 0);
+    m.s.assign((size_t)N * G, 0);
+    m.lossless = false;
+    std::vector<float> row(K);
+    for (uint32_t n = 0; n < N; ++n) {
+        if (!row_to_f32(type, (const uint8_t*)data + n * row_bytes, row.data(), K, err)) return false;
+        for (size_t g = 0; g < G; ++g) quant_w8(m, n * G + g, row.data() + g * 32);
+    }
+    return true;
+}
+} // namespace
+
 bool pack_gpu_matrix_raw(int type, const void* data, uint32_t N, uint32_t K,
                          HostMatrix& m, std::string& err) {
     m = HostMatrix{};
@@ -234,16 +256,7 @@ bool pack_gpu_matrix_raw(int type, const void* data, uint32_t N, uint32_t K,
     default:
         break;
     }
-    // Fallback: dequantize then requantize to W8.
-    if (!k32) { err = "fast engine: K must be a multiple of 32"; return false; }
-    alloc(GpuFmt::W8);
-    m.lossless = false;
-    std::vector<float> row(K);
-    for (uint32_t n = 0; n < N; ++n) {
-        if (!row_to_f32(type, base + n * row_bytes, row.data(), K, err)) return false;
-        for (size_t g = 0; g < G; ++g) quant_w8(m, n * G + g, row.data() + g * 32);
-    }
-    return true;
+    return requant_w8(type, data, N, K, m, err);
 }
 
 bool pack_gpu_matrix(const ggml_tensor* t, HostMatrix& out, std::string& err) {
@@ -254,6 +267,34 @@ bool pack_gpu_matrix(const ggml_tensor* t, HostMatrix& out, std::string& err) {
         err = std::string(t->name) + ": " + err;
         return false;
     }
+    return true;
+}
+
+bool pack_gpu_matrix_w8(const ggml_tensor* t, HostMatrix& out, std::string& err) {
+    if (!t || !t->data) { err = "fast engine: tensor data missing"; return false; }
+    const uint32_t K = (uint32_t)t->ne[0];
+    const uint32_t N = (uint32_t)(ggml_nelements(t) / t->ne[0]);
+    if (t->type == GGML_TYPE_Q8_0 || t->type == GGML_TYPE_Q6_K) return pack_gpu_matrix(t, out, err);
+    if (!requant_w8((int)t->type, t->data, N, K, out, err)) {
+        err = std::string(t->name) + ": " + err;
+        return false;
+    }
+    return true;
+}
+
+bool scale_matrix(HostMatrix& m, float f, std::string& err) {
+    if (!m.x.empty() || (m.fmt != GpuFmt::F16 && !m.layout.is_legacy_w4() && !m.layout.is_legacy_w8())) {
+        err = "scale_matrix: packed-file layout " + layout_to_string(m.layout);
+        return false;
+    }
+    // W4 (scale, offset) and W8 (scale, scale) words, or F16 weight pairs:
+    // both halves scale.
+    auto scale_words = [f](std::vector<uint32_t>& w) {
+        for (uint32_t& v : w)
+            v = pack2(h2f((uint16_t)(v & 0xffffu)) * f, h2f((uint16_t)(v >> 16)) * f);
+    };
+    scale_words(m.fmt == GpuFmt::F16 ? m.q : m.s);
+    m.lossless = m.lossless && f == 1.0f;
     return true;
 }
 

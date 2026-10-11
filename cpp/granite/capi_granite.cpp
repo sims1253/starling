@@ -37,12 +37,26 @@
 #include <cstring>
 #include <memory>
 #include <new>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
+#if defined(STARLING_HAVE_FAST)
+#include "engine_select.hpp"
+#include "audio_llm_engine.hpp"
+#endif
+
 namespace {
 
-using GraniteCtx = starling::ggml::lib::EngineContext<starling::ggml::granite::GraniteModel, starling::ggml::granite::Tokenizer>;
+struct GraniteCtx : starling::ggml::lib::EngineContext<starling::ggml::granite::GraniteModel,
+                                                       starling::ggml::granite::Tokenizer> {
+#if defined(STARLING_HAVE_FAST)
+    // Model-specialized Vulkan decoder (cpp/fast). When set it owns the
+    // decoder (the loader's decoder weights are released); `model` keeps
+    // the encoder, projector and config.
+    std::unique_ptr<starling::fast::AudioLlmEngine> fast;
+#endif
+};
 using starling::ggml::lib::report;
 
 constexpr double kSampleRate = starling::ggml::granite::kChunkSampleRate;
@@ -66,6 +80,12 @@ bool transcribe_piece(GraniteCtx& ctx, const float* pcm, int64_t n, int32_t budg
     options.max_cache_len = (int32_t) m.config.llm.max_cache;
     options.eos_token_id = m.config.eos_token_id;
     GenerateResult generated;
+#if defined(STARLING_HAVE_FAST)
+    if (ctx.fast && ctc_max_k > 0) {
+        ctx.err = "GRANITE CTC speculative decode needs the ggml decoder (STARLING_ENGINE=ggml)";
+        return false;
+    }
+#endif
     if (ctc_max_k > 0) {
         CtcSpeculativeStats spec;
         if (!ctc_speculative_generate(m, mel, n, options, ctc_max_k, {},
@@ -107,12 +127,29 @@ bool transcribe_piece(GraniteCtx& ctx, const float* pcm, int64_t n, int32_t budg
         return false;
     auto t1 = std::chrono::steady_clock::now();
     Prompt prompt = build_transcribe_prompt(m.config, n);
-    InputsEmbeds inputs;
-    if (!build_inputs_embeds(m, prompt, audio, inputs, ctx.err))
-        return false;
-    auto t2 = std::chrono::steady_clock::now();
-    if (!greedy_generate(m, inputs, options, generated, ctx.err))
-        return false;
+    auto t2 = t1;
+#if defined(STARLING_HAVE_FAST)
+    if (ctx.fast) {
+        // The fast decoder looks up the prompt rows itself (prompt+embeds
+        // time is inside "generate").
+        bool eos = false;
+        if (audio.width != (int64_t) m.config.llm.hidden) {
+            ctx.err = "GRANITE projector width does not match the decoder";
+            return false;
+        }
+        if (!ctx.fast->generate(prompt.ids, prompt.audio_mask, audio.data.data(), audio.n_tokens,
+                                (uint32_t) std::max(1, budget), generated.ids, eos, ctx.err))
+            return false;
+    } else
+#endif
+    {
+        InputsEmbeds inputs;
+        if (!build_inputs_embeds(m, prompt, audio, inputs, ctx.err))
+            return false;
+        t2 = std::chrono::steady_clock::now();
+        if (!greedy_generate(m, inputs, options, generated, ctx.err))
+            return false;
+    }
     auto t3 = std::chrono::steady_clock::now();
     text = ctx.tokenizer.decode(generated.ids, true);
     if (stage_ms) {
@@ -309,6 +346,41 @@ void granite_job_free_impl(GraniteChunkJob* job) { delete job; }
 extern "C" {
 
 void* starling_ggml_granite_load(const char* gguf_path, const char** err_out) {
+#if defined(STARLING_HAVE_FAST)
+    const auto choice = starling::fast::engine_choice();
+    if (choice != starling::fast::EngineChoice::Ggml && gguf_path && *gguf_path) {
+        static thread_local std::string load_error;
+        try {
+            auto ctx = std::make_unique<GraniteCtx>();
+            ctx->model = std::make_unique<starling::ggml::granite::GraniteModel>();
+            if (!ctx->model->load(gguf_path, ctx->err) ||
+                !ctx->tokenizer.load(ctx->model->loader, ctx->model->config, ctx->err))
+                throw std::runtime_error(ctx->err);
+            std::string ferr;
+            ctx->fast = starling::fast::AudioLlmEngine::create(*ctx->model, ferr);
+            const bool verbose = std::getenv("STARLING_FAST_VERBOSE") != nullptr;
+            if (ctx->fast) {
+                const size_t freed = starling::fast::release_decoder_host_weights(ctx->model->loader);
+                if (verbose)
+                    std::fprintf(stderr, "[fast] granite decoder engine: %s (%.0f MiB of host decoder weights released)\n",
+                                 ctx->fast->describe().c_str(), freed / 1048576.0);
+            } else if (choice == starling::fast::EngineChoice::Fast) {
+                throw std::runtime_error("fast engine unavailable: " + ferr);
+            } else if (verbose) {
+                std::fprintf(stderr, "[fast] granite falls back to ggml: %s\n", ferr.c_str());
+            }
+            starling::ggml::ensure_weights_realized(ctx->model->loader);
+            if (err_out) *err_out = nullptr;
+            return ctx.release();
+        } catch (const std::exception& e) {
+            load_error = e.what();
+        } catch (...) {
+            load_error = "unknown exception loading GRANITE model";
+        }
+        if (err_out) *err_out = load_error.c_str();
+        return nullptr;
+    }
+#endif
     return starling::ggml::lib::load_engine<GraniteCtx>(gguf_path, "GRANITE", err_out);
 }
 

@@ -13,6 +13,7 @@
 
 layout(constant_id = 0) const uint D = 128;      // head dim == workgroup size
 layout(constant_id = 1) const uint MAXPOS = 2048;
+layout(constant_id = 2) const uint QK_NORM = 1;   // 0: no q/k RMSNorm (Qwen2.5, Granite)
 layout(local_size_x_id = 0) in;
 
 layout(std430, binding = 0) readonly buffer QKV { float qkv[]; };
@@ -62,10 +63,13 @@ float block_max(float v) {
     return r;
 }
 
-// RMSNorm(x)·w then NEOX rotation; x is this thread's element, result for d.
+// RMSNorm(x)·w (QK_NORM) then NEOX rotation; x is this thread's element, result for d.
 float norm_rope(float x, const uint d, const bool is_q, uint pos) {
-    const float rs = inversesqrt(block_sum(x * x) / float(D) + p.eps);
-    const float xn = x * rs * (is_q ? qn_w[d] : kn_w[d]);
+    float xn = x;
+    if (QK_NORM != 0u) {
+        const float rs = inversesqrt(block_sum(x * x) / float(D) + p.eps);
+        xn = x * rs * (is_q ? qn_w[d] : kn_w[d]);
+    }
     red[d] = xn;
     barrier();
     const uint half_d = D / 2;
