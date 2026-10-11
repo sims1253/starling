@@ -19,7 +19,7 @@ read or executed on that tree, not assumed.
 | Native build | root `CMakeLists.txt`, `backends/native`, `cpp/`, `apps/mobile/src/main/cpp` | none needed | No `FetchContent` / `ExternalProject` / `file(DOWNLOAD)` in any Starling-owned CMake file; configure-time downloads do not exist | builds compile only from the submodule and vendored files below |
 | ggml engine | `.gitmodules` | submodule commit `e91ded11` (tag `v0.23.0`) + `third_party/ggml-patches` | Pinned by commit; patches applied by `scripts/apply_ggml_patches.sh` | checkout with `submodules: recursive`; patch script fails on mismatch |
 | `third_party/dr_wav.h` | vendored single file | version stamp in header | `dr_wav - v0.14.6`, public domain / MIT-0 | full-file diff review on update |
-| `third_party/httplib.h` | vendored single file | `CPPHTTPLIB_VERSION` | `0.53.0`, MIT (Yuji Hirose) | full-file diff review on update |
+| `third_party/httplib.h` | vendored single file | `CPPHTTPLIB_VERSION` | `0.60.1`, MIT (Yuji Hirose), plus two local WebSocket patches marked `[starling]` (complete frame writes; `WebSocket::shutdown_transport()`) | full-file diff review on update; re-apply the `[starling]` hunks (diff the old file against its upstream tag) |
 | GitHub Actions | `.github/workflows/*.yml` | commit-SHA pins | Every `uses:` is a 40-char SHA except `pullfrog/pullfrog@v0` (documented exception, below) | Dependabot, weekly, all workflows |
 | Android | `apps/mobile/build.gradle.kts`, `apps/mobile/app/build.gradle.kts` | none — dependency locking not enabled | Direct deps exact (`androidx.core 1.16.0`, `okhttp 4.12.0`, `mockwebserver 4.12.0`, `junit 4.13.2`, `org.json 20260814`); AGP `9.4.0`; wrapper `gradle-9.7.1`; NDK `28.2.13676358`; CMake `3.31.1`. Transitive deps float at build time (follow-up) | Dependabot gradle weekly; CI build in `apps.yml` `android` |
 | iOS | `apps/ios/Package.swift` | — | No external package declarations; local targets only | `swift test` in `apps.yml` `ios` |
@@ -101,6 +101,8 @@ uv lock --check                    # and the --project variants must pass
 
 # Vendored headers: replace the file from the upstream release, keep the
 # version stamp / CPPHTTPLIB_VERSION macro accurate, review the full diff.
+# httplib.h carries local hunks marked [starling]: diff the vendored file
+# against its upstream tag and re-apply that diff to the new release.
 # ggml: move the submodule to the chosen commit, re-run
 # scripts/apply_ggml_patches.sh, commit pointer + any patch edits together.
 ```
