@@ -2,15 +2,15 @@
 
 A native (Rust + [gpui](https://github.com/zed-industries/zed/tree/main/crates/gpui))
 port of the Electron desktop app (`apps/desktop`), for side-by-side comparison of
-look, feel, and performance. The TypeScript sources of truth live in this same
-worktree: `packages/dictation/src/*.ts` (logic), `apps/desktop/src/App.tsx` +
-`src/useRecorder.ts` + `src/styles.css` (UI), `apps/desktop/electron/*.ts`
+look, feel, and performance. The TypeScript sources it was ported from were
+`packages/dictation/src/*.ts` (logic), `apps/desktop/src/App.tsx` +
+`src/useRecorder.ts` + `src/styles.css` (UI), and `apps/desktop/electron/*.ts`
 (native shell + native HTTP path).
 
-> The Electron app was removed after this port graduated to be the desktop
-> app. The `apps/desktop` paths below are provenance for where each module
-> came from, not living sources; `packages/dictation/src/*.ts` remains the
-> TypeScript reference for the shared logic.
+> The Electron app and the `packages/dictation` TypeScript library were removed
+> after this port graduated to be the desktop app. The TypeScript paths below
+> are provenance for where each module came from, not living sources; the Rust
+> crates and their test fixtures are the authority.
 
 ## Layout
 
@@ -40,8 +40,8 @@ cargo run -p starling-gpui --release    # launch for perf comparison
 STARLING_DIAGNOSTICS=1 cargo run -p starling-gpui   # startup + RSS on first draw
 ```
 
-Workspace members are `crates/*` only. The pnpm workspace ignores this dir (no
-package.json). Never touch files outside `apps/desktop-gpui`.
+Workspace members are `crates/*` only. Never touch files outside
+`apps/desktop-gpui`.
 
 ## Behavior contract
 
@@ -73,7 +73,7 @@ trimmed. Timeouts: default 180s, allowed 1ms..=600s. Redirects are blocked
 - HTTP error body detail extraction order: `{detail}` → `{error: string}` →
   `{error: {message}}` → `{message}`; else `Server returned {status}: {first 500 chars}`.
 
-### Audio (mirror audio.ts exactly: dependency-free, deterministic)
+### Audio (dependency-free, deterministic)
 
 `PcmAudio { samples: Vec<f32>, sample_rate: u32, channels: u16 }` (interleaved
 -1..=1). `mix_to_mono`, `resample_to_16k` (windowed-sinc low-pass, see below),
@@ -99,12 +99,10 @@ replaced fails that fixture at essentially full amplitude). Input rates above
 kernel half-width grows as ~8.9 × rate/16 000, so a mislabeled or hostile
 rate field would otherwise cost pathological taps per output sample — and a
 kernel whose weight sum is not positive falls back to nearest-edge
-replication instead of emitting a fabricated 0.0 (R16). The kernel is a
-deliberate Rust-side divergence from `resampleTo16k` in
-`packages/dictation/src/audio.ts`, which still linearly interpolates; the TS
-implementation remains the semantic source for the rest of the audio contract
-(mono mixdown precision, output length, determinism, duration), so change this
-function only to mirror a TS change or to extend the alias rejection.
+replication instead of emitting a fabricated 0.0 (R16). The kernel replaced
+the linear interpolation of the TypeScript `resampleTo16k`; the rest of the
+audio contract (mono mixdown precision, output length, determinism, duration)
+is unchanged from that original.
 
 ### Storage (file-backed IndexedDB equivalent)
 
@@ -127,7 +125,7 @@ endpoint `http://127.0.0.1:8181`, model `parakeet`,
 expected terms `["auth"]` (input UI is the comma-joined string). Invalid file →
 defaults (do not crash).
 
-### Fidelity (mirror fidelity.ts)
+### Fidelity (ported from fidelity.ts)
 
 `analyze_transcript(text, AnalysisOptions { expected_terms }) -> Vec<FidelityWarning { code, severity, message }>`
 with the same codes/messages: non-one-list-start, possible-self-correction

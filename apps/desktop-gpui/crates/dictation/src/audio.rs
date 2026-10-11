@@ -1,7 +1,8 @@
-//! Port of `packages/dictation/src/audio.ts` — dependency-free, deterministic
-//! PCM mixing, resampling, and canonical PCM16 WAV encode/decode. See
-//! `apps/desktop-gpui/PORT.md` ("Audio"). Error messages are kept verbatim
-//! from the TypeScript source.
+//! Dependency-free, deterministic PCM mixing, resampling, and canonical PCM16
+//! WAV encode/decode. Originally ported from the removed TypeScript
+//! `audio.ts`; this module and `test-fixtures/pcm-rounding.json` are now the
+//! authority. See `apps/desktop-gpui/PORT.md` ("Audio"). Error messages are
+//! kept verbatim from the TypeScript original.
 
 /// Server-side capture format every upload is normalized to.
 pub const STARLING_SAMPLE_RATE: u32 = 16_000;
@@ -116,8 +117,8 @@ fn mix_samples_to_mono(samples: &[f32], channels: usize) -> Vec<f32> {
 
 /// Resample interleaved floating-point PCM to mono 16 kHz.
 ///
-/// Anti-aliased and still dependency-free (issue #122), a port of
-/// `resampleTo16k` in `packages/dictation/src/audio.ts`: each output sample
+/// Anti-aliased and still dependency-free (issue #122), originally
+/// ported from the TypeScript `resampleTo16k`: each output sample
 /// is a Blackman-windowed sinc kernel evaluated at its exact fractional
 /// input position — a windowed-sinc low-pass whose cutoff tracks the lower
 /// of the two Nyquist frequencies, so content above the output band is
@@ -595,10 +596,9 @@ mod tests {
 
     #[test]
     fn pcm16_matches_the_shared_rounding_contract_fixture() {
-        // Shared with the TypeScript encoder (G07): packages/dictation's
-        // vitest suite consumes the same file, and audio.ts is the semantic
-        // source of the contract. The negative half-tie cases fail under a
-        // deliberate switch back to round-half-away-from-zero.
+        // The fixture is the PCM16 rounding contract (G07); this encoder is
+        // its reference implementation. The negative half-tie cases fail
+        // under a deliberate switch back to round-half-away-from-zero.
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../test-fixtures/pcm-rounding.json"

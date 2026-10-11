@@ -1,8 +1,8 @@
-//! Rust port of `@starling/dictation` plus native capture/playback.
+//! Dictation core for the desktop app plus native capture/playback.
 //!
-//! Modules are ports of the TypeScript sources under `packages/dictation/src`
-//! (same repository) and of the native request behavior in
-//! `apps/desktop/electron/ipc.ts`. See `apps/desktop-gpui/PORT.md`.
+//! Modules started as ports of the removed TypeScript `@starling/dictation`
+//! library and the Electron request path (`apps/desktop/electron/ipc.ts`);
+//! they are now the only implementation. See `apps/desktop-gpui/PORT.md`.
 
 pub mod audio;
 pub mod client;
