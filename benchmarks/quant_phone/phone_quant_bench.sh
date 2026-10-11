@@ -46,6 +46,11 @@ mkdir -p "$OUT"
 
 . "$ROOT/benchmarks/fast_engine/phone_common.sh"
 BENCH_BINS="starling-bench-quant"
+# Our own wake-lock holder: wake_hold first releases whatever holder the pid
+# file names, so sharing phone_common's default path with another session's
+# bench script would kill its lock (and it ours).
+WAKEHOLD_DEX=$DEV/wakehold.dex
+WAKEHOLD_TAG=starling-quant
 trap 'kill_benches || true; wake_release || true' EXIT
 kill_benches || true
 wake_hold
