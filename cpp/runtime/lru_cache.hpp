@@ -338,6 +338,27 @@ public:
     // Entries currently charged the zero-byte floor (R22 observability; the
     // floored_cap bounds this count).
     size_t floored_size() const { return floored_; }
+    bool contains(const Key& key) const { return map_.count(key) != 0; }
+
+    // Make room BEFORE building an entry of about `incoming` bytes: evict
+    // unpinned LRU entries until bytes_in_use() + incoming fits the budget
+    // (an incoming entry over budget evicts everything unpinned). Insertion
+    // alone trims only after init, so the old entries and the one being
+    // built would otherwise coexist at the peak. Returns the eviction count.
+    size_t reserve(size_t incoming) {
+        const size_t budget = budget_;
+        budget_ = incoming < budget ? budget - incoming : 0;
+        size_t evicted = 0;
+        try {
+            evicted = trim_over_budget();
+        } catch (...) {
+            budget_ = budget;
+            throw;
+        }
+        budget_ = budget;
+        if (evicted > 0) trace("evict", evicted);
+        return evicted;
+    }
 
     // Plain LRU lookup (touch, no pin). Stable until a non-const operation
     // evicts THIS key. Nullptr on miss (the get_or_init that follows reports

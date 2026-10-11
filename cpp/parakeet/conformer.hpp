@@ -73,7 +73,8 @@ public:
     ggml_tensor* build_graph(ggml_context* ctx, ggml_tensor* xt, int T,
                              ggml_tensor* pe, int pos_len, int valid_len,
                              GraphInputPool& pool,
-                             ggml_tensor* ph = nullptr) const;
+                             ggml_tensor* ph = nullptr,
+                             const LengthMasks* lm = nullptr) const;
 
 private:
     const ModelLoader& ml_;

@@ -31,10 +31,17 @@ public:
     size_t cache_size() const;
 
 private:
+    // Host data of a bucketed graph's LengthMasks, sized for the bucket at
+    // build time (stable addresses: the graph's inputs point here) and
+    // refilled for the true mel length before every replay.
+    struct PadMasks {
+        std::vector<float> stage1, stage2, time, key;
+    };
     struct ReplayEntry {
         int T = 0;
         int Tp = 0;
         int valid_len = 0;
+        PadMasks masks;
         GraphInputPool pool;
         std::unique_ptr<ReplayGraph> graph;
         // [starling pos-cache] per-layer positional projections [dk, P, H],
@@ -43,16 +50,29 @@ private:
         // scratch is reused -> transient host footprint is one ph layer.
         std::vector<float> ph_scratch;   // stable-address scratch (entry-owned)
     };
+    // Bounded by the graphs' tracked device bytes, not their count: an entry
+    // costs ~0.09 MB per mel frame (RADV, parakeet-0.6b: 117 MB at 1280
+    // frames, 610 MB at 6656), so a live stream's window buckets (~0.6 GB)
+    // stay resident on a shared-memory device whose count cap of 2 made
+    // every partial a miss, while one long take still evicts the rest.
     struct ReplayCache {
-        LruCache<int, ReplayEntry> by_T;
-        explicit ReplayCache(size_t cap) : by_T(cap, "parakeet.encoder") {}
+        ByteBudgetLruCache<int, ReplayEntry> by_T;
+        // Largest tracked bytes per mel frame seen so far: sizes the room a
+        // new bucket's graph needs before it is built (ByteBudgetLruCache::reserve).
+        double bytes_per_frame = 0.0;
+        explicit ReplayCache(size_t budget) : by_T(budget, "parakeet.encoder") {}
         void clear() { by_T.clear(); }
     };
 
     ggml_tensor* build_graph(ggml_context* ctx, const std::vector<float>& mel,
                              int n_mels, int T, GraphInputPool& pool,
                              int& Tp, int& valid_len,
-                             const float* ph_scratch = nullptr) const;
+                             const float* ph_scratch = nullptr,
+                             PadMasks* pad = nullptr) const;
+
+    // Size a bucketed graph's masks for bucket Tb and fill them for an input
+    // of T <= Tb mel frames.
+    void fill_pad_masks(PadMasks& m, int Tb, int T) const;
 
     // One-shot per-layer pos compute: layer L's [dk, P, H] projection of the
     // sinusoidal table for this T' (device compute, host readback).
