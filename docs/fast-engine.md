@@ -46,7 +46,12 @@ devices (SwiftShader, llvmpipe) are ignored.
 | `STARLING_FAST_{ARK,GRANITE,VOXTRAL}_HOST_ENCODER=1` | keep that model's audio encoder on ggml; the fast engine takes its rows (decoder only) |
 | `STARLING_FAST_ATTN_SPLIT=S` | audio-LLM decode attention split into `S` KV chunks, 1–8; `0` = single pass (default 4 on AMD, 0 elsewhere) |
 | `STARLING_FAST_DEVICE=n` | Vulkan physical device index |
-| `STARLING_FAST_TIMING=1` / `STARLING_FAST_PROFILE=1` | per-stage wall times plus the audio-LLM decode round times (ms per step) / per-kernel GPU times |
+| `STARLING_FAST_TIMING=1` / `STARLING_FAST_PROFILE=1` | per-stage wall times (load: GGUF map, engine create, plan, arena allocate/fill) plus the audio-LLM decode round times (ms per step) / per-kernel GPU times |
+| `STARLING_FAST_MAPPED_WEIGHTS=0/1` | repack straight into mapped device memory (default where it is CPU-cached: UMA phones) / fill one host staging buffer per device buffer and copy |
+| `STARLING_FAST_ALLOC_THREADS=n` | threads creating the mapped weight buffers while the fill runs (default 2) |
+| `STARLING_GGUF_MMAP=0` | read the GGUF into anonymous memory instead of mapping it (any engine; A/B only) |
+| `STARLING_GGUF_READAHEAD=0/1` | never / always start the background readahead of the mapped GGUF (default: only when under 90 % of it is in the page cache) |
+| `STARLING_FAST_FORCE_FAIL=1` | tests: fail the fast engine after a full load, so `auto` exercises the ggml fallback on consumed weights |
 | `STARLING_FAST_DECODE_SKIP=qkv,attn,o,up,down,lm[,empty][,bar]` | diagnostic: drop those decode dispatches (EOS off; `empty` puts a one-workgroup no-op in their place, `bar` drops the barriers) to price each kernel class by difference |
 | `STARLING_FAST_FULL_BARRIER=1` | every recorded barrier in the wide compute+transfer form (default: scoped to the commands it orders) |
 | `STARLING_FAST_VERBOSE=1` | device, weights and tuning choices at load |
@@ -64,6 +69,25 @@ workgroup owns both halves of a gated unit (Conformer GLU, SwiGLU). A
 format like EXL3 would buy quality per bit at 2–3 bits, but its trellis
 decode costs ALU work that mobile GPUs do not have to spare; at 4 bits the
 cheap affine format is the right trade.
+
+**Loading streams the GGUF into device memory once.** The runtime loader
+maps the GGUF privately instead of reading it (`ModelLoader::weight_data`),
+so nothing is copied before the engine starts and pages load on first
+touch (a background readahead streams files that are not already in the
+page cache). The engines then *plan* every weight: a matrix is a
+`MatSpec` — source rows plus a destination row mapping (gate/up and GLU
+interleaves, q/k/v concatenation, Voxtral's RoPE permutation, embedding
+chunks) and a scale folded into the group scales (Granite's multipliers).
+Its format and size follow from the source types alone, so
+`Arena::finalize` places and allocates every device buffer first and then
+repacks ~1 MiB row units on all cores straight into the mapped device
+memory (UMA phones; through one staging buffer at a time elsewhere), the
+allocations overlapping the fill. Conversions too irregular for a row
+mapping (conv weight reorders, Granite's relative-position tables) run as
+deferred producers in the same pass. The host never holds a repacked copy,
+and each unit drops the GGUF pages it consumed; since the mapping is
+file-backed they refault intact if read again, so the ggml fallback still
+finds its weights after a fast engine has loaded.
 
 **Whole passes are recorded once and replayed.** Each forward pass is a
 recorded Vulkan command buffer, cached per input shape; replaying it costs the
@@ -338,6 +362,63 @@ interleaved in one session per model (screen off, wake hold), medians of
 host. Every GEMV now streams 21–30 G weights/s; what remains is the GEMV
 plateau below, not dispatch overhead. The ggml CPU engine decodes
 Qwen3-0.6B at ~22 ms/token on 6 threads.
+
+**Model load (2026-10-12).** Load used to read the whole GGUF into
+anonymous memory, repack every matrix into host vectors, allocate the
+device buffers, copy, and free the host vectors — from eight threads at
+once, which on Android serialized on `munmap` and turned a 40 ms copy of
+Parakeet's 585 MiB into 0.9 s. Granite peaked at 4.6 GB resident. Now the
+GGUF is mapped, every weight is planned first and repacked straight into
+the mapped device memory (see *Design*), the device allocations overlap
+the fill, the KV caches are created alongside it, and the BPE encoder
+tables (only s1 encodes) are built on first use. `starling-bench` prints
+the load wall time with peak RSS (VmHWM) and the largest system
+MemAvailable drop during the load; `--cold` evicts the GGUF from the page
+cache first (`POSIX_FADV_DONTNEED`; no root needed).
+
+| Model (GPU weights) | warm load before → after | cold load before → after | peak RSS before → after | MemAvailable drop before → after |
+| --- | --- | --- | --- | --- |
+| Parakeet q4_k_m-shrink16 (585 MiB) | 2.04 s → **0.33 s** | 2.17 s → **0.58 s** | 1182 → **111 MiB** | 1.7 → 0.6 GB |
+| Qwen3-ASR-0.6B q4e8 (557 MiB) | 2.18 s → **0.42 s** | 1.85 s → **0.75 s** | 1319 → **147 MiB** | 1.6 → 0.7 GB |
+| ARK-0.6B q4k (1037 MiB) | 3.75 s → **0.85 s** | 3.05 s → **1.40 s** | 2145 → **130 MiB** | 2.9 → 1.1 GB |
+| MOSS q4e8 (1612 MiB) | 7.39 s → **0.78 s** | 5.44 s → **2.20 s** | 3508 → **186 MiB** | 4.8 → 1.9 GB |
+| Granite dynq4 (2546 MiB) | 11.1 s → **1.60 s** | 12.6 s → **2.63 s** | 4615 → **321 MiB** | 6.6 → 2.7 GB |
+| Voxtral q4k (3845 MiB) | 20.1 s → **4.1 s** (2.5 s 2nd round) | 13.8 s → **5.3 s** | 6967 → **118 MiB** | 9.2 → 4.1 GB |
+
+Pixel 10 Pro, screen off with the wake hold, `starling-bench` load line
+(the whole `starling_ggml_load`: GGUF, tokenizer, engine); first of two
+interleaved rounds (base, then this branch, cold then warm per binary;
+the second round, warmer, was 20–60 % slower for both). Transcripts of
+short and medium are identical before and after on all six models, on
+the phone and on the RADV host. Cold = the GGUF evicted from the page
+cache first: storage reads ~1 GB/s here, so a cold load is now mostly
+the read itself. The MemAvailable drop is dominated by the device
+allocation, which the weights need anyway. On the host (RADV, staged
+fill): Granite 5.7 → 2.7 s and 5.1 GB → 0.7 GB peak; Voxtral, which did
+not fit the 7 GB test cgroup before, loads in 3.2 s at 0.4 GB.
+
+Where a warm Granite load goes now: GGUF header parse 0.11 s, Vulkan
+device 0.08 s, two threads allocating 2.5 GB (the driver zeroes it) for
+0.5 s overlapped with the fill, which ends at 1.2 s; most of the fill's
+CPU time past the allocation is the Q5_K → W8 requantization. Two
+allocator threads instead of one: Granite ~0.4 s and Voxtral ~1.9 s
+faster (STARLING_FAST_ALLOC_THREADS A/B).
+
+Measured and not kept: a CPU-cached (non-coherent) memory type for the
+weights (no gain once the copy was gone; the coherent write-combined
+type takes plain sequential stores at ~13 GB/s); `MADV_POPULATE_WRITE`
+on the mapped buffers (the driver's mapping refuses it, and its pages are
+already present); staging uploads on PowerVR (585 MiB took 9.8 s — the
+mapped path stays the default there); background readahead of a GGUF
+that is already cached (walking its pages contends with the fill's page
+faults: host warm Qwen3 0.82 → 0.52 s without it, hence the mincore
+gate); an inlined f32→f16 conversion (5.0 → 3.3 ns per value, too small
+to matter); lazily reading GGUF string arrays (2 ms). A repacked-weight
+cache on disk was not built: on a warm Granite load it could save at
+most the ~0.7 s the fill runs past the allocation (the fill would become
+a 2.5 GB copy from the page cache), a cold load would read 2.5 GB instead
+of 1.86 GB at ~1 GB/s (slower), and it would cost 0.6–3.8 GB of storage
+per model.
 
 Energy per transcription (batterystats power model, 40/20-run averages,
 measured before the W4 unpack change, i.e. MOSS at 88.7 ms/token):
