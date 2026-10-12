@@ -196,7 +196,7 @@ jobs:
         # The ldd reports above, for debugging an unresolved-library
         # failure (they live in RUNNER_TEMP, outside the uploaded archive).
         if: failure() && inputs.bundle-engines && matrix.platform == 'linux'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: ldd-reports-${{ matrix.platform }}
           path: ${{ runner.temp }}/ldd-*.txt
@@ -229,7 +229,7 @@ jobs:
           Compress-Archive -Path dist/* -DestinationPath starling-gpui-windows-x64.zip
       - name: Upload desktop archive
         if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: starling-gpui-${{ matrix.platform }}-x64
           path: starling-gpui-${{ matrix.platform }}-x64.*

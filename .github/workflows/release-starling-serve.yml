@@ -142,7 +142,7 @@ jobs:
           scripts/release-runtime/check-linux-vulkan.sh \
             starling-serve-linux-vulkan.tar.gz "${RELEASE_TAG#v}" "$abi"
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           retention-days: ${{ inputs.experimental && 3 || 90 }}
           name: starling-serve-linux-vulkan
@@ -200,7 +200,7 @@ jobs:
           scripts/release-runtime/check-linux-cpu.sh \
             starling-serve-linux-cpu.tar.gz "${RELEASE_TAG#v}" "$abi"
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           retention-days: ${{ inputs.experimental && 3 || 90 }}
           name: starling-serve-linux-cpu
@@ -294,7 +294,7 @@ jobs:
           scripts/release-runtime/check-linux-cuda.sh \
             starling-serve-linux-cuda.tar.gz "${RELEASE_TAG#v}" "$abi"
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           retention-days: ${{ inputs.experimental && 3 || 90 }}
           name: starling-serve-linux-cuda
@@ -357,7 +357,7 @@ jobs:
           grep -Fqx "starling-serve ${RELEASE_TAG#v}" <<< "$version"
           ./starling-serve-linux-rocm --abi-version
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           retention-days: ${{ inputs.experimental && 3 || 90 }}
           name: starling-serve-linux-rocm
@@ -465,7 +465,7 @@ jobs:
           if ($version -notcontains $expected) { throw "Expected version line: $expected" }
           .\starling-serve-windows-vulkan.exe --abi-version
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           retention-days: ${{ inputs.experimental && 3 || 90 }}
           name: starling-serve-windows-vulkan
@@ -562,7 +562,7 @@ jobs:
           if ($version -notcontains $expected) { throw "Expected version line: $expected" }
           .\starling-serve-windows-cuda.exe --abi-version
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           retention-days: ${{ inputs.experimental && 3 || 90 }}
           name: starling-serve-windows-cuda
@@ -619,7 +619,7 @@ jobs:
           if ($version -notcontains $expected) { throw "Expected version line: $expected" }
           .\starling-serve-windows-cpu.exe --abi-version
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           retention-days: ${{ inputs.experimental && 3 || 90 }}
           name: starling-serve-windows-cpu
@@ -668,7 +668,7 @@ jobs:
           grep -Fqx "starling-serve ${RELEASE_TAG#v}" <<< "$version"
           ./starling-serve-macos-metal --abi-version
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           retention-days: ${{ inputs.experimental && 3 || 90 }}
           name: starling-serve-macos-metal
@@ -715,7 +715,7 @@ jobs:
           grep -Fqx "starling-serve ${RELEASE_TAG#v}" <<< "$version"
           ./starling-serve-macos-cpu --abi-version
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           retention-days: ${{ inputs.experimental && 3 || 90 }}
           name: starling-serve-macos-cpu
