@@ -31,13 +31,15 @@ for w in WAVS:
         wins.append(m)
 print("calibration windows:", len(wins))
 
-f32 = f"{OUT}/qwen3_enc_w800_f32.tflite"
+f32 = f"{OUT}/qwen3_enc_w800_{os.environ.get('SRC', 'f32')}.tflite"
 it = tfl.Interpreter(model_path=f32)
 sig = it.get_signature_list()
 print(sig)
 skey = list(sig.keys())[0]
 iname = sig[skey]["inputs"][0]
-calib = {skey: [{iname: w} for w in wins]}
+kb0 = np.zeros((1, 1, 1, 104), np.float32)
+names = sig[skey]["inputs"]
+calib = {skey: [dict(zip(names, [w, kb0][:len(names)])) for w in wins]}
 
 which = os.environ.get("RECIPES", "a8w8,a16w8,wi8").split(",")
 for tag in which:
@@ -45,7 +47,7 @@ for tag in which:
           "wi8": recipe.weight_only_wi8_afp32, "dyn8": recipe.dynamic_wi8_afp32}[tag]()
     q = quantizer.Quantizer(f32, rp)
     res = q.calibrate(calib, num_threads=4) if q.need_calibration else None
-    path = f"{OUT}/qwen3_enc_w800_{tag}.tflite"
+    path = f"{OUT}/qwen3_enc_w800_{os.environ.get('PFX', '')}{tag}.tflite"
     if os.path.exists(path):
         os.remove(path)
     q.quantize(res, serialize_to_path=path)
