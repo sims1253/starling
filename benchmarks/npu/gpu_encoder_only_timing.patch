@@ -1,0 +1,28 @@
+--- a/cpp/fast/audio_llm_engine.cpp
++++ b/cpp/fast/audio_llm_engine.cpp
+@@ -1508,7 +1508,7 @@
+         !embed_lookup(rc, (uint32_t)sp.suffix.size(), npre, npre + A, err))
+         return false;
+     rc.barrier();
+-    if (!record_llm(rc, S, err)) return false;
++    if (!std::getenv("NPU_SPIKE_ENC_ONLY") && !record_llm(rc, S, err)) return false;
+     rc.end();
+     return true;
+ }
+@@ -2315,11 +2315,14 @@
+                               bool& eos, std::string& err) {
+     Impl& I = *impl_;
+     const char* tag = I.sp.tag;
+-    const uint32_t max_new = budget ? std::min(budget, I.sp.max_new_tokens) : I.sp.max_new_tokens;
++    const bool enc_only = std::getenv("NPU_SPIKE_ENC_ONLY") != nullptr;
++    const uint32_t max_new = enc_only ? 1u : (budget ? std::min(budget, I.sp.max_new_tokens) : I.sp.max_new_tokens);
+     const bool timing = env_on("STARLING_FAST_TIMING");
+     const auto t0 = std::chrono::steady_clock::now();
+     MelView mel;
+-    if (!I.sp.mel(I.mel_loader, pcm, n, mel, err)) return false;
++    static MelView mel_cache;
++    if (enc_only && mel_cache.T > 0) mel = mel_cache;
++    else { if (!I.sp.mel(I.mel_loader, pcm, n, mel, err)) return false; if (enc_only) mel_cache = mel; }
+     const int64_t T = mel.T;
+     if (T <= 0) { err = std::string("fast ") + tag + ": empty audio"; return false; }
+     const int C = (int)((T + 99) / 100);
