@@ -78,9 +78,12 @@ for w in $WAVS; do
   dev_wavs+=" $DEV/$(basename "$w")"
 done
 
-push_model() {  # local path -> device path; skips a same-size copy
-  local f=$1 dst size dsize
-  dst="$DEV/$(basename "$f")"
+push_model() {  # push_model LABEL local-path -> device path; skips a same-size copy
+  # The device name carries the label: two specs whose files share a basename
+  # (e.g. two model-q4k.gguf from different directories) must not overwrite
+  # each other's copy.
+  local f=$2 dst size dsize
+  dst="$DEV/$1--$(basename "$f")"
   size=$(stat -c %s "$f")
   dsize=$(timeout 30 adb shell "stat -c %s $dst 2>/dev/null" | tr -d '\r' || true)
   [ "$dsize" = "$size" ] || timeout 3600 adb push "$f" "$dst" >/dev/null
@@ -118,7 +121,7 @@ for spec in "$@"; do
   label=${spec%%=*}; rest=${spec#*=}
   kind=${rest%%:*}; file=${rest#*:}
   [ -f "$file" ] || { echo "missing model: $file" >&2; exit 1; }
-  labels+=("$label"); kinds+=("$kind"); files+=("$(push_model "$file")")
+  labels+=("$label"); kinds+=("$kind"); files+=("$(push_model "$label" "$file")")
 done
 idle_rate=""   # µAh per second, screen off, nothing running
 if on_battery; then
