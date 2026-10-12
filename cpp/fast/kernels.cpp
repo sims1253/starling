@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
 #include <mutex>
 #include <thread>
 #include <chrono>
@@ -358,16 +359,9 @@ bool Arena::finalize(vk::Context& ctx, std::string& err) {
     const bool mapped = env_flag("STARLING_FAST_MAPPED_WEIGHTS", info.uma_cached);
     buffers_.clear();
     total_ = 0;
-    for (VkDeviceSize sz : sizes) {
-        auto buf = std::make_unique<vk::Buffer>();
-        if (!ctx.create_buffer(*buf, sz, mapped ? vk::Mem::Device : vk::Mem::DeviceOnly, err)) return false;
-        buffers_.push_back(std::move(buf));
-        total_ += sz;
-    }
-    const auto t1 = std::chrono::steady_clock::now();
 
-    // Fill units: deferred blobs first (each one unit, the longest
-    // conversions), then ~1 MiB of repacked rows each, in source order.
+    // Fill units: ~1 MiB of repacked rows each, or one deferred blob, in
+    // buffer order (the order the buffers are allocated in).
     std::vector<Unit> units;
     for (size_t i = 0; i < blobs_.size(); ++i)
         if (blobs_[i].fn) units.push_back({SIZE_MAX, i, 0, 0});
@@ -379,32 +373,80 @@ bool Arena::finalize(vk::Context& ctx, std::string& err) {
             for (uint32_t r = 0; r < pm.spec.parts[pi].rows; r += step)
                 units.push_back({mi, pi, r, std::min(step, pm.spec.parts[pi].rows - r)});
     }
+    auto unit_buffer = [&](const Unit& u) { return blobs_[u.mat == SIZE_MAX ? u.part : mats_[u.mat].q].buffer; };
+    std::stable_sort(units.begin(), units.end(),
+                     [&](const Unit& a, const Unit& b) { return unit_buffer(a) < unit_buffer(b); });
     std::atomic<bool> ok{true};
     std::string first_err;
     std::mutex mu;
+    auto fail = [&](const std::string& e) {
+        std::lock_guard<std::mutex> lk(mu);
+        if (ok.exchange(false)) first_err = e;
+    };
     auto run_units = [&](const std::vector<uint8_t*>& base, const std::vector<size_t>& idx) {
         parallel_for(idx.size(), [&](size_t k) {
             std::string e;
-            if (ok && !fill_unit(units[idx[k]], base, e)) {
-                std::lock_guard<std::mutex> lk(mu);
-                if (ok.exchange(false)) first_err = e;
-            }
+            if (ok && !fill_unit(units[idx[k]], base, e)) fail(e);
         });
     };
-    std::vector<uint8_t*> base(buffers_.size(), nullptr);
+    std::vector<uint8_t*> base(sizes.size(), nullptr);
+    std::chrono::steady_clock::time_point t1;
     if (mapped) {
-        for (size_t i = 0; i < buffers_.size(); ++i) {
-            base[i] = (uint8_t*)buffers_[i]->host;
-            if (!base[i]) { err = "fast engine: weight buffer is not host-mapped"; return false; }
+        // Allocation (the driver zeroes the pages: ~6 GB/s on the Pixel)
+        // overlaps the fill: this thread creates the buffers in order while
+        // the workers repack into those already mapped.
+        std::atomic<size_t> ready{0};
+        std::condition_variable cv;
+        std::mutex cv_mu;
+        std::atomic<size_t> next{0};
+        const size_t nt = std::min<size_t>(std::max(1u, std::thread::hardware_concurrency()), 8);
+        std::vector<std::thread> workers;
+        for (size_t t = 0; t < nt; ++t)
+            workers.emplace_back([&] {
+                for (size_t i; (i = next.fetch_add(1)) < units.size();) {
+                    const size_t bi = unit_buffer(units[i]);
+                    if (ready.load(std::memory_order_acquire) <= bi) {
+                        std::unique_lock<std::mutex> lk(cv_mu);
+                        cv.wait(lk, [&] { return ready.load(std::memory_order_acquire) > bi; });
+                    }
+                    std::string e;
+                    if (ok && !fill_unit(units[i], base, e)) fail(e);
+                }
+            });
+        for (size_t i = 0; i < sizes.size() && ok; ++i) {
+            auto buf = std::make_unique<vk::Buffer>();
+            std::string e;
+            if (!ctx.create_buffer(*buf, sizes[i], vk::Mem::Device, e)) fail(e);
+            else if (!buf->host) fail("fast engine: weight buffer is not host-mapped");
+            if (!ok) break;
+            base[i] = (uint8_t*)buf->host;
+            total_ += sizes[i];
+            buffers_.push_back(std::move(buf));
+            for (Blob& b : blobs_)
+                if (b.buffer == i && !b.words.empty()) std::memcpy(base[i] + b.off, b.words.data(), b.words.size() * 4);
+            {
+                std::lock_guard<std::mutex> lk(cv_mu);
+                ready.store(i + 1, std::memory_order_release);
+            }
+            cv.notify_all();
         }
-        for (Blob& b : blobs_)
-            if (!b.words.empty()) std::memcpy(base[b.buffer] + b.off, b.words.data(), b.words.size() * 4);
-        std::vector<size_t> all(units.size());
-        for (size_t i = 0; i < all.size(); ++i) all[i] = i;
-        run_units(base, all);
+        t1 = std::chrono::steady_clock::now();
+        {
+            std::lock_guard<std::mutex> lk(cv_mu);
+            ready.store(SIZE_MAX, std::memory_order_release);   // release waiters on failure
+        }
+        cv.notify_all();
+        for (auto& t : workers) t.join();
         if (!ok) { err = first_err; return false; }
         for (auto& b : buffers_) ctx.flush(*b, 0, b->size);
     } else {
+        for (VkDeviceSize sz : sizes) {
+            auto buf = std::make_unique<vk::Buffer>();
+            if (!ctx.create_buffer(*buf, sz, vk::Mem::DeviceOnly, err)) return false;
+            buffers_.push_back(std::move(buf));
+            total_ += sz;
+        }
+        t1 = std::chrono::steady_clock::now();
         // One buffer at a time through host memory: the host holds at most
         // one buffer's worth of repacked rows.
         std::vector<std::vector<size_t>> by_buf(buffers_.size());
@@ -433,9 +475,11 @@ bool Arena::finalize(vk::Context& ctx, std::string& err) {
     std::vector<Planned>().swap(mats_);
     if (env_flag("STARLING_FAST_TIMING", false)) {
         using ms = std::chrono::duration<double, std::milli>;
-        std::fprintf(stderr, "[fast] arena: %zu buffers %.1f MiB (%s), alloc %.1f ms, fill %.1f ms\n",
+        // Mapped: the fill runs from the first allocation on; "allocated" is
+        // when the last buffer was created, "filled" when the last unit was.
+        std::fprintf(stderr, "[fast] arena: %zu buffers %.1f MiB (%s), allocated %.1f ms, filled %.1f ms\n",
                      buffers_.size(), total_ / 1048576.0, mapped ? "mapped" : "staged", ms(t1 - t0).count(),
-                     ms(std::chrono::steady_clock::now() - t1).count());
+                     ms(std::chrono::steady_clock::now() - t0).count());
     }
     return true;
 }
