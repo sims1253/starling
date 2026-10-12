@@ -47,6 +47,42 @@ struct HostMatrix {
     size_t bytes() const { return (q.size() + s.size() + x.size()) * 4; }
 };
 
+// ---- Row-level repacking (the load path) -----------------------------------
+// The engines repack straight into device memory: the format of every
+// matrix is planned from its source type before any byte is touched, then
+// rows are converted in parallel into their final place.
+
+// 32-bit words per row of K weights: codes (q) and group scales (s).
+uint32_t q_row_words(GpuFmt f, uint32_t K);
+uint32_t s_row_words(GpuFmt f, uint32_t K);
+
+// The format rows of `ggml_type` repack to at row length K: W4 from
+// Q4_0/Q4_1/Q4_K, W8 from Q8_0/Q6_K, F16 from F16/F32/BF16, W8 requantized
+// from anything else (force_w8: W8 whatever the type). `lossless` is false
+// where values round. Fails for shapes or types the formats cannot hold.
+bool plan_gpu_rows(int ggml_type, uint32_t K, bool force_w8, GpuFmt& fmt, bool& lossless,
+                   std::string& err);
+
+// Destination row of source row i: first + i * step, or table[i].
+struct RowMap {
+    uint64_t first = 0, step = 1;
+    const uint32_t* table = nullptr;
+    uint64_t operator()(uint64_t i) const { return table ? table[i] : first + i * step; }
+};
+
+// Repack n rows (ggml row-major, ggml_row_size apart) to `fmt` rows of the
+// matrix whose codes start at q and scales at s, source row i landing at
+// row map(i). `scale` != 1 folds a multiplier into the group scales (W4/W8)
+// or the weights (F16), each re-rounded once to f16 exactly as scale_matrix
+// does. F16 needs even K here (odd K: pack_gpu_matrix_raw). Thread-safe;
+// returns false only for a type ggml cannot dequantize.
+bool pack_gpu_rows(int ggml_type, const void* src, uint32_t n, uint32_t K, GpuFmt fmt, float scale,
+                   uint32_t* q, uint32_t* s, const RowMap& map, std::string& err);
+
+// Words of f16 pairs (W4/W8 group scales, F16 weights) times f, each half
+// re-rounded to f16.
+void scale_f16_words(uint32_t* w, size_t n, float f);
+
 // Repack a 2-D ggml tensor (ne0 = K, ne1 = N) into `out` (float tensors
 // become F16).
 bool pack_gpu_matrix(const ggml_tensor* t, HostMatrix& out, std::string& err);
