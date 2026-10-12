@@ -18,6 +18,7 @@ layout(local_size_x_id = 0) in;
 
 layout(std430, binding = 0) readonly buffer QKV { float qkv[]; };
 layout(std430, binding = 1) buffer KC { uint kc[]; };
+layout(std430, binding = 1) readonly buffer KC4 { uvec4 kc4[]; };   // same cache, 8 halves per load
 layout(std430, binding = 2) buffer VC { uint vc[]; };
 layout(std430, binding = 3) buffer O { float o[]; };
 layout(std430, binding = 4) readonly buffer QN { float qn_w[]; };
@@ -105,10 +106,15 @@ void main() {
     for (uint j = d; j <= pos; j += D) {
         float s = 0.0;
         if (j < pos) {
-            const uint kb = (base + j * D) / 2;
-            for (uint w = 0; w < D / 2; ++w) {
-                const vec2 kv = unpackHalf2x16(kc[kb + w]);
-                s += qs[2 * w] * kv.x + qs[2 * w + 1] * kv.y;
+            // 16-byte key loads (8 halves): a quarter of the load
+            // instructions of word loads, same accumulation order.
+            const uint kb = (base + j * D) / 8;
+            for (uint u = 0; u < D / 8; ++u) {
+                const uvec4 k4 = kc4[kb + u];
+                [[unroll]] for (uint e = 0; e < 4; ++e) {
+                    const vec2 kv = unpackHalf2x16(k4[e]);
+                    s += qs[8 * u + 2 * e] * kv.x + qs[8 * u + 2 * e + 1] * kv.y;
+                }
             }
         } else {
             for (uint w = 0; w < D; ++w) s += qs[w] * ks[w];
