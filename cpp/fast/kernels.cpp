@@ -613,14 +613,12 @@ bool Kernels::init(vk::Context& ctx, std::string& err) {
     // overrides.
     w8_unpack_ = ctx.info().vendor_id == 0x1010;
     if (const char* e = std::getenv("STARLING_FAST_W8U")) w8_unpack_ = e[0] == '1';
-    // Diagnostics: STARLING_FAST_MICRO runs one isolated kernel probe.
-    if (const char* mi = std::getenv("STARLING_FAST_MICRO"))
-        if (!micro(mi, err)) return false;
     rsplit_on_ = !(std::getenv("STARLING_FAST_NORSPLIT") && std::getenv("STARLING_FAST_NORSPLIT")[0] == '1');
     if (const char* e = std::getenv("STARLING_FAST_TILE")) {
-        unsigned bm, bn, tm, tn;
-        if (std::sscanf(e, "%u,%u,%u,%u", &bm, &bn, &tm, &tn) == 4) {
-            tile = TileCfg{bm, bn, tm, tn};
+        unsigned bm, bn, tm, tn, bk = tile.BK;
+        if (std::sscanf(e, "%u,%u,%u,%u,%u", &bm, &bn, &tm, &tn, &bk) >= 4 &&
+            (bk == 8 || bk == 16 || bk == 32)) {
+            tile = TileCfg{bm, bn, tm, tn, bk};
             tile_pinned_ = true;
         }
     }
@@ -630,6 +628,16 @@ bool Kernels::init(vk::Context& ctx, std::string& err) {
         if (r >= 8 && r % 8 == 0) {
             gemv_rows_max = r;
             gemv_tgt_wgs = ~0u;   // pinned: no adaptive growth
+        }
+    }
+    // Diagnostics: STARLING_FAST_MICRO runs isolated kernel probes
+    // (';'-separated list, one model load).
+    if (const char* mi = std::getenv("STARLING_FAST_MICRO")) {
+        std::string all(mi), one;
+        for (char ch : all + ";") {
+            if (ch != ';') { one += ch; continue; }
+            if (!one.empty() && !micro(one.c_str(), err)) return false;
+            one.clear();
         }
     }
     return true;
@@ -648,10 +656,10 @@ bool Kernels::gemm(vk::Recording& rec, const GemmCall& c, std::string& err) {
     // waste most of a BN=128 tile's columns; a BN=64 tile of the same
     // proven family doubles the useful fraction. Tile shape only partitions
     // outputs — each element's K accumulation order is unchanged.
-    if (c.a.N <= 64 && t.BN > 64 && !tile_pinned_) t = TileCfg{32, 64, 4, 4};
+    if (c.a.N <= 64 && t.BN > 64 && !tile_pinned_) t = TileCfg{32, 64, 4, 4, t.BK};
     const uint32_t wg = (t.BM / t.TM) * (t.BN / t.TN);
     const vk::Pipeline* p = ctx_->pipeline(
-        name.c_str(), {wg, t.BM, t.BN, t.TM, t.TN, (uint32_t)c.epi, (uint32_t)c.act, c.bias_mode}, err);
+        name.c_str(), {wg, t.BM, t.BN, t.TM, t.TN, (uint32_t)c.epi, (uint32_t)c.act, c.bias_mode, t.BK}, err);
     if (!p) return false;
     if ((c.b == BKind::W4 || c.b == BKind::W8) && c.a.K % 32) {
         err = "gemm: weight K must be a multiple of 32";
@@ -806,6 +814,14 @@ TuneResult& tune_result() { static TuneResult r; return r; }
 
 double time_ms(vk::Recording& rec, std::string& err) {
     double best = 1e30;
+    // Warm up for >= 100 ms first: GPU governors (PowerVR's polls every
+    // 20 ms) start a short probe at an idle clock.
+    {
+        const auto w0 = std::chrono::steady_clock::now();
+        do {
+            if (!rec.submit_and_wait(err)) return -1.0;
+        } while (std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count() < 100.0);
+    }
     for (int i = 0; i < 3; ++i) {
         const auto t0 = std::chrono::steady_clock::now();
         if (!rec.submit_and_wait(err)) return -1.0;
@@ -878,7 +894,7 @@ bool Kernels::micro(const char* mi, std::string& err) {
                      dots / (ms * 1e-3) / 1e9, ms);
         return true;
     }
-    if (std::strncmp(mi, "gemm", 4) == 0) {
+    if (std::strncmp(mi, "gemm", 4) == 0 && mi[4] != 'x') {
         // Skinny-GEMM probe (#311 speculative decoding): time the tiled GEMM
         // at M = 1,2,4,8,16 over a real decode shape.
         // STARLING_FAST_MICRO=gemm[,K[,N[,reps]]]  (defaults 2048, 6144, 8)
@@ -944,6 +960,146 @@ bool Kernels::micro(const char* mi, std::string& err) {
         }
         return true;
     }
+    if (std::strncmp(mi, "gemmx,", 6) == 0) {
+        // Prefill/encoder GEMM probe at a real shape:
+        // STARLING_FAST_MICRO=gemmx,M,N,K,kind[,reps[,variant[,BM,BN,TM,TN[,BK]]]]
+        // with kind w4|w8|f16|f16t and variant f (f32 products) | h (packed
+        // f16) | - (the device default). Prints GFLOPS, the max relative
+        // error of 64 outputs against a CPU reference, and how many outputs
+        // differ bitwise from the f32 kernel at the device's default tile.
+        unsigned M = 0, N = 0, Kd = 0, reps = 8;
+        char kind[8] = {0}, var[8] = {0};
+        unsigned tb[5] = {0, 0, 0, 0, 32};
+        const int got = std::sscanf(mi, "gemmx,%u,%u,%u,%7[a-z0-9],%u,%7[a-z-],%u,%u,%u,%u,%u", &M, &N, &Kd, kind,
+                                    &reps, var, &tb[0], &tb[1], &tb[2], &tb[3], &tb[4]);
+        const std::string kd(kind);
+        if (got < 4 || !M || !N || !Kd || Kd % 32 || !reps ||
+            (kd != "w4" && kd != "w8" && kd != "f16" && kd != "f16t")) {
+            err = "STARLING_FAST_MICRO=gemmx,M,N,K,w4|w8|f16|f16t[,reps[,f|h|-[,BM,BN,TM,TN[,BK]]]]";
+            return false;
+        }
+        std::mt19937 rng(777);
+        auto unif = [&] { return (float)(rng() % 2001) / 1000.0f - 1.0f; };
+        std::vector<float> af((size_t)M * Kd);
+        for (auto& v : af) v = unif();
+        const std::vector<uint32_t> a16 = pack_f16(af.data(), af.size());
+        std::vector<uint32_t> bq, bs;
+        // Reference weights w[n][k] as the kernel sees them.
+        auto wref = std::vector<float>((size_t)N * Kd);
+        auto h2f = [](uint32_t h) {
+            const uint32_t sg = (h >> 15) & 1, e = (h >> 10) & 31, m = h & 1023;
+            uint32_t b = e == 0 ? (sg << 31) : (sg << 31) | ((e + 112) << 23) | (m << 13);
+            float f;
+            std::memcpy(&f, &b, 4);
+            return f;
+        };
+        if (kd == "w4" || kd == "w8") {
+            const uint32_t G = Kd / 32;
+            bq.resize((size_t)N * G * (kd == "w4" ? 4 : 8));
+            bs.resize((size_t)N * G);
+            for (auto& v : bq) v = (uint32_t)rng();
+            for (uint32_t n = 0; n < N; ++n)
+                for (uint32_t g = 0; g < G; ++g) {
+                    const float so[2] = {0.01f + 0.02f * (unif() + 1.0f), (kd == "w4" ? -0.15f : 0.01f + 0.02f * (unif() + 1.0f))};
+                    const uint32_t w = pack_f16(so, 2)[0];
+                    bs[(size_t)n * G + g] = w;
+                    for (uint32_t i = 0; i < 32; ++i) {
+                        float v;
+                        if (kd == "w4") {
+                            const uint32_t q = (bq[((size_t)n * G + g) * 4 + i / 8] >> (4 * (i % 8))) & 15u;
+                            v = h2f(w & 0xffff) * (float)q + h2f(w >> 16);
+                        } else {
+                            const int q = (int8_t)((bq[((size_t)n * G + g) * 8 + i / 4] >> (8 * (i % 4))) & 0xffu);
+                            v = h2f(i < 16 ? (w & 0xffff) : (w >> 16)) * (float)q;
+                        }
+                        wref[(size_t)n * Kd + g * 32 + i] = v;
+                    }
+                }
+        } else {
+            std::vector<float> b((size_t)N * Kd);
+            for (auto& v : b) v = unif();
+            if (kd == "f16") {
+                bq = pack_f16(b.data(), b.size());
+                for (size_t i = 0; i < b.size(); ++i) wref[i] = b[i];
+            } else {   // [K, N]
+                bq = pack_f16(b.data(), b.size());
+                for (uint32_t k = 0; k < Kd; ++k)
+                    for (uint32_t n = 0; n < N; ++n) wref[(size_t)n * Kd + k] = b[(size_t)k * N + n];
+            }
+            for (auto& v : wref) v = h2f(pack_f16(&v, 1)[0] & 0xffff);
+        }
+        for (auto& v : af) v = h2f(pack_f16(&v, 1)[0] & 0xffff);
+        vk::Buffer A, Bq, Bs, C;
+        auto up = [&](vk::Buffer& b, const std::vector<uint32_t>& d) {
+            return ctx_->create_buffer(b, std::max<size_t>(d.size() * 4, 16), vk::Mem::Device, err) &&
+                   (d.empty() || ctx_->upload(b, 0, d.data(), d.size() * 4, err));
+        };
+        if (!up(A, a16) || !up(Bq, bq) || (!bs.empty() && !up(Bs, bs)) ||
+            !ctx_->create_buffer(C, (size_t)M * N * 4, vk::Mem::Device, err))
+            return false;
+        GemmCall u;
+        u.b = kd == "w4" ? BKind::W4 : kd == "w8" ? BKind::W8 : kd == "f16" ? BKind::F16 : BKind::F16T;
+        u.epi = Epi::F32;
+        u.a.M = M; u.a.N = N; u.a.K = Kd; u.a.lda = Kd; u.a.ldb = kd == "f16t" ? N : Kd; u.a.ldc = N;
+        u.A = vk::Ref(A); u.Bq = vk::Ref(Bq); if (!bs.empty()) u.Bs = vk::Ref(Bs); u.C = vk::Ref(C);
+        const bool saved_f16 = f16_math;
+        if (var[0] == 'f') f16_math = false;
+        if (var[0] == 'h') f16_math = ctx_->info().f16;
+        const std::string sfx = f16_math ? "_h" : "";
+        const TileCfg saved_tile = tile;
+        const bool saved_pin = tile_pinned_;
+        if (got >= 10) { tile = TileCfg{tb[0], tb[1], tb[2], tb[3], tb[4]}; tile_pinned_ = true; }
+        const TileCfg used_tile = tile;
+        vk::Recording rec(*ctx_);
+        rec.begin();
+        bool ok = true;
+        for (uint32_t i = 0; i < reps && ok; ++i) {
+            ok = gemm(rec, u, err);
+            rec.barrier();
+        }
+        rec.end();
+        vk::Recording r1(*ctx_);
+        r1.begin();
+        ok = ok && gemm(r1, u, err);
+        r1.end();
+        f16_math = saved_f16;
+        tile = saved_tile;
+        tile_pinned_ = saved_pin;
+        if (!ok) return false;
+        const double ms = time_ms(rec, err);
+        if (ms < 0 || !r1.submit_and_wait(err)) return false;
+        std::vector<float> c((size_t)M * N);
+        if (!ctx_->download(C, 0, c.data(), c.size() * 4, err)) return false;
+        size_t ndiff = 0;
+        {
+            // Bitwise comparison against the f32-product kernel.
+            const bool f2 = f16_math;
+            f16_math = false;
+            vk::Recording r2(*ctx_);
+            r2.begin();
+            const bool ok2 = gemm(r2, u, err);
+            r2.end();
+            f16_math = f2;
+            if (!ok2 || !r2.submit_and_wait(err)) return false;
+            std::vector<float> c2((size_t)M * N);
+            if (!ctx_->download(C, 0, c2.data(), c2.size() * 4, err)) return false;
+            for (size_t i = 0; i < c.size(); ++i) ndiff += std::memcmp(&c[i], &c2[i], 4) != 0;
+        }
+        double maxerr = 0;
+        for (int t = 0; t < 64; ++t) {
+            const uint32_t m = (uint32_t)(rng() % M), n = (uint32_t)(rng() % N);
+            double ref = 0, mag = 0;
+            for (uint32_t k = 0; k < Kd; ++k) {
+                ref += (double)af[(size_t)m * Kd + k] * wref[(size_t)n * Kd + k];
+                mag += std::abs((double)af[(size_t)m * Kd + k] * wref[(size_t)n * Kd + k]);
+            }
+            maxerr = std::max(maxerr, std::abs(ref - c[(size_t)m * N + n]) / std::max(1e-6, mag));
+        }
+        std::fprintf(stderr, "[fast-micro] gemmx %s%s M=%u N=%u K=%u tile %u,%u,%u,%u,%u: %.3f ms = %.1f GFLOPS (err %.2e, %zu differ from f)\n",
+                     kd.c_str(), sfx.c_str(), M, N, Kd, used_tile.BM, used_tile.BN, used_tile.TM, used_tile.TN, used_tile.BK, ms / reps,
+                     2.0 * M * N * Kd * reps / (ms * 1e-3) / 1e9, maxerr, ndiff);
+        return true;
+    }
     if (std::strncmp(mi, "f16dot", 6) == 0) {
         // f16 dot issue-rate probe: STARLING_FAST_MICRO=f16dot[,groups[,iters]]
         // — prices dot(f16vec4, f16vec4) against the f32 FMA (alu probe) and
@@ -1007,6 +1163,30 @@ bool Kernels::micro(const char* mi, std::string& err) {
         std::fprintf(stderr, "[fast-micro] norm mode=%u rows=%u D=%u: %.3f ms/dispatch = %.1f GB/s\n",
                      mode, rows, D, ms / reps,
                      (double)reps * rows * D * 2 * 4 / ms * 1e-6);
+        return true;
+    }
+    if (std::strncmp(mi, "alu2", 4) == 0) {
+        // Register-tiled FMA probe: STARLING_FAST_MICRO=alu2,groups,iters,RA,RB,mode
+        // (RA x RB outer product of register operands per iteration).
+        uint32_t groups = 480, iters = 1024, ra = 4, rb = 8, mode = 0, sh = 1;
+        std::sscanf(mi, "alu2,%u,%u,%u,%u,%u,%u", &groups, &iters, &ra, &rb, &mode, &sh);
+        vk::Buffer ob;
+        std::vector<float> zeros(128 * (groups + 1), 0.0f);
+        if (!ctx_->create_buffer(ob, zeros.size() * 4, vk::Mem::Device, err) ||
+            !ctx_->upload(ob, 0, zeros.data(), zeros.size() * 4, err))
+            return false;
+        const vk::Pipeline* p = ctx_->pipeline("alu2_probe", {ra, rb, mode, std::max(sh, 1u)}, err);
+        if (!p) return false;
+        struct { uint32_t iters; } pc{iters};
+        vk::Recording rec(*ctx_);
+        rec.begin();
+        rec.dispatch(*p, {vk::Ref(ob)}, &pc, sizeof(pc), groups);
+        rec.end();
+        const double ms = time_ms(rec, err);
+        if (ms < 0) return false;
+        const double fma = (double)groups * 128 * iters * ra * rb;
+        std::fprintf(stderr, "[fast-micro] alu2 groups=%u RA=%u RB=%u mode=%u shared=%u B: %.1f GFLOPS (%.3f ms)\n",
+                     groups, ra, rb, mode, 4 * sh, 2.0 * fma / (ms * 1e-3) / 1e9, ms);
         return true;
     }
     if (std::strncmp(mi, "alu", 3) == 0) {

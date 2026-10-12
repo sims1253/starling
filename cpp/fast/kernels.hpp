@@ -169,7 +169,9 @@ struct GemmCall {
     vk::Ref A, Bq, Bs, C, bias, bias2, C2;
 };
 
-struct TileCfg { uint32_t BM = 64, BN = 128, TM = 4, TN = 8; };
+// BK: k per tile (32 = one quant group; 16 / 8 trade barriers for
+// shared memory, i.e. resident workgroups).
+struct TileCfg { uint32_t BM = 64, BN = 128, TM = 4, TN = 8, BK = 32; };
 
 class Kernels {
 public:

@@ -973,11 +973,37 @@ VkDescriptorSet Recording::alloc_set(const Pipeline& p) {
     return VK_NULL_HANDLE;
 }
 
+// STARLING_FAST_SKIP=label[,label...] (diagnostic): drop every dispatch
+// recorded under one of these labels (`name*` matches a prefix), so the
+// encoder/prefill classes can be priced by difference. Results are garbage.
+static bool skip_label(const std::string& label) {
+    static const std::vector<std::string> skips = [] {
+        std::vector<std::string> v;
+        if (const char* e = std::getenv("STARLING_FAST_SKIP")) {
+            std::string s(e), cur;
+            for (char c : s + ",") {
+                if (c == ',') { if (!cur.empty()) v.push_back(cur); cur.clear(); }
+                else cur += c;
+            }
+        }
+        return v;
+    }();
+    for (const std::string& s : skips) {
+        if (!s.empty() && s.back() == '*') {
+            if (label.compare(0, s.size() - 1, s, 0, s.size() - 1) == 0) return true;
+        } else if (label == s) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void Recording::dispatch(const Pipeline& p, const std::vector<Ref>& bindings,
                          const void* push, size_t push_bytes,
                          uint32_t gx, uint32_t gy, uint32_t gz) {
     const Fns& f = ctx_.fn_;
     if (!cb_) return;
+    if (skip_label(label_.empty() ? std::string(p.label) : label_)) return;
     if (bindings.empty() && p.n_bindings) {
         if (fail_.empty()) fail_ = std::string("dispatch without bindings: ") + p.label;
         return;
