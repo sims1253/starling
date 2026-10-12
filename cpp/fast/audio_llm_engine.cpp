@@ -469,6 +469,7 @@ struct AudioLlmEngine::Impl {
         return (uint32_t)std::max<size_t>(1, std::min<size_t>(EH, (64ull << 20) / (T * T * 4)));
     }
     bool record_decode(uint32_t steps, std::string& err);
+    bool dec_ablate = false;   // STARLING_FAST_DECODE_SKIP (diagnostic)
     bool lm_head(vk::Recording& rc, vk::Ref x, uint32_t x_off, std::string& err);
     bool dec_next(vk::Recording& rc, std::string& err);
     vk::Ref R(Arena::Id id) const { return ar.ref(id); }
@@ -1340,7 +1341,7 @@ bool AudioLlmEngine::Impl::dec_next(vk::Recording& rc, std::string& err) {
     b[9] = vk::Ref(xd);
     b[10] = vk::Ref(state);
     if (sp.audio_add) b[11] = vk::Ref(aud);
-    struct { uint32_t n_part, K, eos, max_steps; } pc{n_part, HD, (uint32_t)sp.eos, sp.max_new_tokens};
+    struct { uint32_t n_part, K, eos, max_steps; } pc{n_part, HD, dec_ablate ? 0xffffffffu : (uint32_t)sp.eos, sp.max_new_tokens};
     rc.label("dec_next");
     rc.dispatch(*p, b, &pc, sizeof(pc), 1);
     return true;
@@ -2220,6 +2221,22 @@ bool AudioLlmEngine::Impl::record_decode(uint32_t steps, std::string& err) {
                                     : ctx->pipeline("attn_decode", {HDIM, MAXPOS, qk_norm}, err);
     const vk::Pipeline* ac = asplit ? ctx->pipeline("attn_split_combine", {HDIM}, err) : nullptr;
     if (!ap || (asplit && !ac)) return false;
+    // Diagnostic ablation (STARLING_FAST_DECODE_SKIP=qkv,attn,o,up,down,lm[,empty][,bar]):
+    // drop those dispatches from the recording to price them by difference
+    // ("empty" replaces each with a one-workgroup no-op dispatch, "bar" drops
+    // the barriers). The output is garbage; EOS is disabled so every round
+    // runs its K steps. Time it with STARLING_FAST_TIMING's round line.
+    const char* skip_e = std::getenv("STARLING_FAST_DECODE_SKIP");
+    const std::string skip_env = skip_e && *skip_e ? std::string(",") + skip_e + "," : "";
+    auto skip = [&](const char* k) { return skip_env.find(std::string(",") + k + ",") != std::string::npos; };
+    dec_ablate = !skip_env.empty();
+    const vk::Pipeline* noop = skip("empty") ? ctx->pipeline("alu_probe", {}, err) : nullptr;
+    if (skip("empty") && !noop) return false;
+    auto stub = [&] {
+        const uint32_t zero = 0;
+        if (noop) rc.dispatch(*noop, {vk::Ref(hd)}, &zero, sizeof(zero), 1);
+    };
+    auto bar = [&] { if (!skip("bar")) rc.barrier(); };
     for (uint32_t s = 0; s < steps; ++s) {
         // No split() per token: the decode recording is one command buffer
         // per round (one submit instead of `steps`). The per-step split
@@ -2235,39 +2252,46 @@ bool AudioLlmEngine::Impl::record_decode(uint32_t steps, std::string& err) {
             Kernels::GemvArgs a;
             a.eps = leps;
             rc.label("dec_qkv");
-            if (!K.gemv(rc, ar, Y.qkv, vk::Ref(xd), vk::Ref(qkvd), R(Y.attn_norm), vk::Ref(state),
-                        sp.qkv_bias ? R(Y.qkv_b) : vk::Ref(), 0, a, err))
+            if (skip("qkv")) stub();
+            else if (!K.gemv(rc, ar, Y.qkv, vk::Ref(xd), vk::Ref(qkvd), R(Y.attn_norm), vk::Ref(state),
+                             sp.qkv_bias ? R(Y.qkv_b) : vk::Ref(), 0, a, err))
                 return false;
-            rc.barrier();
+            bar();
             rc.label("dec_attn");
             // attn_decode ignores the trailing S (push constants are one fixed block).
             struct { uint32_t H, KVH, cache_off; float eps, scale; uint32_t S; } pa{
                 NH, NKV, l * NKV * MAXPOS * HDIM, leps, lscale, asplit};
-            rc.dispatch(*ap, {vk::Ref(qkvd), vk::Ref(kcache), vk::Ref(vcache), vk::Ref(asplit ? apart : attd),
-                              qk_norm ? R(Y.q_norm) : vk::Ref(K.dummy()), qk_norm ? R(Y.k_norm) : vk::Ref(K.dummy()),
-                              R(rope_tab), vk::Ref(state)},
-                        &pa, sizeof(pa), NH, std::max(asplit, 1u));
-            if (asplit) {
-                rc.barrier();
+            if (skip("attn")) stub();
+            else
+                rc.dispatch(*ap, {vk::Ref(qkvd), vk::Ref(kcache), vk::Ref(vcache), vk::Ref(asplit ? apart : attd),
+                                  qk_norm ? R(Y.q_norm) : vk::Ref(K.dummy()), qk_norm ? R(Y.k_norm) : vk::Ref(K.dummy()),
+                                  R(rope_tab), vk::Ref(state)},
+                            &pa, sizeof(pa), NH, std::max(asplit, 1u));
+            if (asplit && !skip("attn")) {
+                bar();
                 rc.label("dec_attn_combine");
                 rc.dispatch(*ac, {vk::Ref(apart), vk::Ref(attd), vk::Ref(state)}, &asplit, sizeof(asplit), NH);
             }
-            rc.barrier();
+            bar();
             rc.label("dec_o");
-            if (!K.gemv(rc, ar, Y.o, vk::Ref(attd), vk::Ref(xd), {}, vk::Ref(state), {}, 1, a, err)) return false;
-            rc.barrier();
+            if (skip("o")) stub();
+            else if (!K.gemv(rc, ar, Y.o, vk::Ref(attd), vk::Ref(xd), {}, vk::Ref(state), {}, 1, a, err)) return false;
+            bar();
             rc.label("dec_ff_up");
-            if (!K.gemv(rc, ar, Y.gateup, vk::Ref(xd), vk::Ref(hd), R(Y.ffn_norm), vk::Ref(state), {}, 2, a, err))
+            if (skip("up")) stub();
+            else if (!K.gemv(rc, ar, Y.gateup, vk::Ref(xd), vk::Ref(hd), R(Y.ffn_norm), vk::Ref(state), {}, 2, a, err))
                 return false;
-            rc.barrier();
+            bar();
             rc.label("dec_ff_down");
-            if (!K.gemv(rc, ar, Y.down, vk::Ref(hd), vk::Ref(xd), {}, vk::Ref(state), {}, 1, a, err)) return false;
-            rc.barrier();
+            if (skip("down")) stub();
+            else if (!K.gemv(rc, ar, Y.down, vk::Ref(hd), vk::Ref(xd), {}, vk::Ref(state), {}, 1, a, err)) return false;
+            bar();
         }
-        if (!lm_head(rc, vk::Ref(xd), 0, err)) return false;
-        rc.barrier();
-        if (!dec_next(rc, err)) return false;
-        rc.barrier();
+        if (skip("lm")) stub();
+        else if (!lm_head(rc, vk::Ref(xd), 0, err)) return false;
+        bar();
+        if (!dec_next(rc, err)) return false;   // drives the state; never skipped
+        bar();
     }
     rc.end();
     dec_steps = steps;
@@ -2415,6 +2439,12 @@ bool AudioLlmEngine::Impl::run(vk::Recording& prefill, uint32_t S, uint32_t max_
         round_ms.push_back(ms_since(t_round));
         if (rounds == 0) I.dec_rec->report_profile("decode (K steps)");
         ++rounds;
+    }
+    if (env_on("STARLING_FAST_TIMING") && !round_ms.empty()) {
+        std::vector<double> srt(round_ms);
+        std::sort(srt.begin(), srt.end());
+        std::fprintf(stderr, "[fast-%s] decode rounds: %zu x %u steps, first %.1f ms (%.2f ms/step), median %.1f ms, max %.1f ms\n",
+                     tag, round_ms.size(), steps, round_ms[0], round_ms[0] / steps, srt[srt.size() / 2], srt.back());
     }
     const uint32_t ngen = std::min<uint32_t>(st[1], max_new);
     if (!I.ctx->download(I.state, 16 * 4, st.data() + 16, ngen * 4, err)) return false;
