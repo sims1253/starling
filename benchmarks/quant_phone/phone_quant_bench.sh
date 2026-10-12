@@ -23,7 +23,8 @@
 # and libggml*.so, default ./bin; WAVS, default the three fixtures; OUT for the
 # raw logs; SKIN_MAX °C to start a process at, default the idle reading at
 # start + 1; COOL minimum seconds between processes, default 20; IDLE_S,
-# default 180; THREADS, default 6).
+# default 180; THREADS, default 6; PHONE_LOCK, the flock shared with other
+# phone scripts, default /tmp/starling-phone.lock).
 set -euo pipefail
 DEV=/data/local/tmp/starling/quant
 ROUNDS=2
@@ -43,6 +44,16 @@ SKIN_MAX=${SKIN_MAX:-}
 IDLE_S=${IDLE_S:-180}
 THREADS=${THREADS:-6}
 mkdir -p "$OUT"
+
+# One bench session on the phone at a time: concurrent work skews timing,
+# heat and the charge counter. Other phone scripts on this host take the
+# same lock (PHONE_LOCK); wait for it, holding it until exit.
+PHONE_LOCK=${PHONE_LOCK:-/tmp/starling-phone.lock}
+exec 9>"$PHONE_LOCK"
+if ! flock -n 9; then
+  echo "waiting for $PHONE_LOCK (another phone session) ..." >&2
+  flock 9
+fi
 
 . "$ROOT/benchmarks/fast_engine/phone_common.sh"
 BENCH_BINS="starling-bench-quant"
