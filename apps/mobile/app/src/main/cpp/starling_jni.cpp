@@ -104,6 +104,7 @@ Java_dev_starling_mobile_engine_StarlingNative_load(JNIEnv* env, jclass,
   unsupportedKindError.clear();
   const char* path = env->GetStringUTFChars(gguf_path, nullptr);
   if (path == nullptr) {
+    unsupportedKindError = "out of memory reading the model path";
     return 0;
   }
   starling_ggml_ctx* ctx =

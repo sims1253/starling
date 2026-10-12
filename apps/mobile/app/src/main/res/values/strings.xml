@@ -19,7 +19,7 @@
     <string name="engine_heading">Transcribe on</string>
     <string name="engine_server">Starling server</string>
     <string name="engine_on_device">This device (experimental)</string>
-    <string name="on_device_status_no_model">No on-device model yet. Download the recommended Parakeet model (364 MB; Wi-Fi recommended) or another catalog model, or import a speech model GGUF you already have (Parakeet, Qwen3-ASR, ARK-ASR, Granite Speech, MOSS-Transcribe or Voxtral Realtime).</string>
+    <string name="on_device_status_no_model">No on-device model yet. Download the recommended Parakeet model (Wi-Fi recommended) or another catalog model, or import a speech model GGUF you already have (Parakeet, Qwen3-ASR, ARK-ASR, Granite Speech, MOSS-Transcribe or Voxtral Realtime).</string>
     <string name="on_device_model_in_use">Using %1$s, %2$d MB. Recordings transcribe offline on this device, live while you speak.</string>
     <string name="on_device_model_not_selected">Installed: %1$s, %2$d MB, not in use. Choose \"%3$s\" above to transcribe with it.</string>
     <string name="recommended_model_name">%1$s (recommended)</string>

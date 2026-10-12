@@ -93,9 +93,9 @@ enum class ModelKind(val nativeKind: Int, val label: String, val workingSetBytes
                 else -> kind.label
             }
             QWEN3 -> when (uints[QWEN3_HIDDEN_SIZE_KEY]) {
-                null -> kind.label
                 2048L -> "${kind.label} 1.7B"
-                else -> "${kind.label} 0.6B"
+                1024L -> "${kind.label} 0.6B"
+                else -> kind.label
             }
             else -> kind.label
         }

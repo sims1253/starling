@@ -3,6 +3,7 @@ package dev.starling.mobile
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import dev.starling.mobile.engine.ModelCatalog
 import dev.starling.mobile.engine.ModelDownload
 import dev.starling.mobile.engine.ModelDownloader
 import dev.starling.mobile.engine.OnDeviceEngine
@@ -51,6 +52,11 @@ class ModelDownloadController(private val engine: OnDeviceEngine) {
     /** Starts (or resumes) downloading [spec]; a no-op while one is running. Main thread. */
     fun start(spec: ModelDownload) {
         if (isRunning) return
+        // One partial at a time: another model's unfinished download (up to
+        // ~1.5 GB) would otherwise stay on disk with nothing resuming it.
+        for (other in ModelCatalog.ALL) {
+            if (other.sha256 != spec.sha256) engine.downloadFile(other).delete()
+        }
         val job = ModelDownloader()
         downloader = job
         this.spec = spec

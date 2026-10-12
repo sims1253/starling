@@ -113,6 +113,7 @@ class ModelKindTest {
         assertEquals("ARK-ASR", name("ark"))
         assertEquals("Qwen3-ASR 1.7B", name("qwen3", mapOf(ModelKind.QWEN3_HIDDEN_SIZE_KEY to 2048L)))
         assertEquals("Qwen3-ASR 0.6B", name("qwen3", mapOf(ModelKind.QWEN3_HIDDEN_SIZE_KEY to 1024L)))
+        assertEquals("Qwen3-ASR", name("qwen3", mapOf(ModelKind.QWEN3_HIDDEN_SIZE_KEY to 1234L)))
         assertEquals("Qwen3-ASR", name("qwen3"))
         // The kind, never the size, picks the engine.
         assertEquals(ModelKind.QWEN3, supported(parsed("qwen3", uints = mapOf(ModelKind.QWEN3_HIDDEN_SIZE_KEY to 1024L))).kind)
