@@ -44,19 +44,28 @@ def main() -> int:
     results, clips = {}, None
     for f in a.files:
         d = json.load(open(f))
-        clips = clips or d["clips"]
+        here = os.path.realpath(d["clips"])
+        if clips is not None and here != clips:
+            sys.exit(f"{f}: clips {here} differ from {clips}")
+        clips = here
         for label, r in d["results"].items():
             if "hyps" in r:
                 results[label] = r
     refs = json.load(open(os.path.join(clips, "refs.json")))
+    if a.base not in results:
+        sys.exit(f"baseline {a.base!r} not found")
     base = results[a.base]
     bclip = per_clip(refs, base["names"], base["hyps"])
     bhyp = dict(zip(base["names"], base["hyps"]))
     for label, r in results.items():
         if label == a.base:
             continue
+        # Corpus WER is reported over each run's own clips, so a paired
+        # comparison is only meaningful over the identical clip set.
+        if sorted(r["names"]) != sorted(base["names"]):
+            sys.exit(f"{label}: decoded clips differ from {a.base}'s; rerun on the same set")
         cclip = per_clip(refs, r["names"], r["hyps"])
-        common = [n for n in r["names"] if n in bclip]
+        common = list(r["names"])
         diffs = [cclip[n] - bclip[n] for n in common]
         mean = sum(diffs) / len(diffs)
         rng = random.Random(0)  # per candidate: its CI must not depend on the other labels

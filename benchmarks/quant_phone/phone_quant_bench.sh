@@ -78,15 +78,16 @@ for w in $WAVS; do
   dev_wavs+=" $DEV/$(basename "$w")"
 done
 
-push_model() {  # push_model LABEL local-path -> device path; skips a same-size copy
+push_model() {  # push_model LABEL local-path -> device path; skips an identical copy
   # The device name carries the label: two specs whose files share a basename
   # (e.g. two model-q4k.gguf from different directories) must not overwrite
-  # each other's copy.
-  local f=$2 dst size dsize
+  # each other's copy. Identity is the SHA-256, not the size: a rebuild with
+  # another imatrix keeps the size and must still be pushed.
+  local f=$2 dst sum dsum
   dst="$DEV/$1--$(basename "$f")"
-  size=$(stat -c %s "$f")
-  dsize=$(timeout 30 adb shell "stat -c %s $dst 2>/dev/null" | tr -d '\r' || true)
-  [ "$dsize" = "$size" ] || timeout 3600 adb push "$f" "$dst" >/dev/null
+  sum=$(sha256sum "$f" | cut -d' ' -f1)
+  dsum=$(timeout 300 adb shell "sha256sum '$dst' 2>/dev/null" | tr -d '\r' | cut -d' ' -f1 || true)
+  [ "$dsum" = "$sum" ] || timeout 3600 adb push "$f" "$dst" >/dev/null
   echo "$dst"
 }
 
@@ -108,7 +109,8 @@ wait_cool() {  # up to 30 min for skin < SKIN_MAX and the big-core cluster < BIG
       'BEGIN { exit !(t < m && b < bm) }' && { echo "$t"; return 0; }
     sleep 10
   done
-  echo "${t:-?} (timeout)"
+  echo "${t:-?} (big ${b:-?}, timeout)"
+  return 1
 }
 
 battery_field() {  # battery_field "Charge counter" -> value ("" if unreadable)
@@ -121,6 +123,10 @@ for spec in "$@"; do
   label=${spec%%=*}; rest=${spec#*=}
   kind=${rest%%:*}; file=${rest#*:}
   [ -f "$file" ] || { echo "missing model: $file" >&2; exit 1; }
+  # These go unquoted into the device shell command line.
+  for v in "$label" "$kind" "$(basename "$file")"; do
+    [[ $v =~ ^[A-Za-z0-9._-]+$ ]] || { echo "unsupported characters in '$v' (use [A-Za-z0-9._-])" >&2; exit 1; }
+  done
   labels+=("$label"); kinds+=("$kind"); files+=("$(push_model "$label" "$file")")
 done
 idle_rate=""   # µAh per second, screen off, nothing running
@@ -146,7 +152,7 @@ for r in $(seq 1 "$ROUNDS"); do
   for i in "${seq_r[@]}"; do
     wake_held || { echo "ERROR: wake lock lost; stopping" >&2; exit 1; }
     log="$OUT/${labels[$i]}.r$r.log"
-    start_t=$(wait_cool)
+    start_t=$(wait_cool) || { echo "ERROR: the phone did not cool down ($start_t); stopping" >&2; exit 1; }
     echo "skin at start: $start_t" > "$log"
     on_battery && echo "charge start: $(battery_field "Charge counter") $(date +%s.%N)" >> "$log"
     timeout 3600 adb shell "cd $DEV && LD_LIBRARY_PATH=. STARLING_ENGINE=$ENGINE \
@@ -190,5 +196,6 @@ for lab in labels:
         therm.append(f"{a.group(1) if a else '?'}->{b.group(1) if b and b.group(1) else '?'}")
     med = lambda v: f"{statistics.median(v):.0f}" if v else "FAIL"
     cols = [med(per.get(w, [])) for w in ("short.wav", "medium.wav", "long.wav")]
-    print(f"{lab:22s} {med(loads):>8s} {cols[0]:>9s} {cols[1]:>9s} {cols[2]:>9s} {med(cpu):>7s} {med(wall):>7s} {med(rss):>7s} {(f"{statistics.median(energy):.1f}" if energy else "n/a"):>7s}  {' '.join(therm)}")
+    mwh = f"{statistics.median(energy):.1f}" if energy else "n/a"
+    print(f"{lab:22s} {med(loads):>8s} {cols[0]:>9s} {cols[1]:>9s} {cols[2]:>9s} {med(cpu):>7s} {med(wall):>7s} {med(rss):>7s} {mwh:>7s}  {' '.join(therm)}")
 EOF
