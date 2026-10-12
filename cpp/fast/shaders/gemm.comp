@@ -81,6 +81,11 @@ layout(push_constant) uniform PC {
     // A_CONV: implicit-GEMM view of a 3x3 / stride-2 / pad-1 conv over an
     // input laid out [chunk][t][f][cin]; row m = (chunk, to, fo), k = (kt*3+kf)*cin + ic.
     uint cv_cin, cv_ti, cv_fi, cv_to, cv_fo;
+    // Causal attention (0xffffffff = off): query row m sees keys <= m + causal.
+    // B_F16 (scores Q·Kᵀ, N = keys): tiles wholly above the diagonal are
+    // skipped (the softmax never reads them). B_F16T (P·V, K = keys): the
+    // K loop stops after the last key a row tile can see (P is 0 beyond).
+    uint causal;
 } p;
 
 // f16 pairs: As[k][r] = (A[2r][k], A[2r+1][k]); Bs[k][c] = (B[2c][k], B[2c+1][k]).
@@ -141,7 +146,14 @@ void main() {
     float acc[TM * TN];
     [[unroll]] for (uint i = 0; i < TM * TN; ++i) acc[i] = 0.0;
 
-    const uint n_k = (p.K + BK - 1) / BK;
+#if defined(B_F16) && !defined(A_CONV)
+    if (p.causal != 0xffffffffu && n0 > m0 + BM - 1u + p.causal) return;
+#endif
+    uint k_end = p.K;
+#if defined(B_F16T)
+    if (p.causal != 0xffffffffu) k_end = min(p.K, m0 + BM + p.causal);
+#endif
+    const uint n_k = (k_end + BK - 1) / BK;
     for (uint kt = 0; kt < n_k; ++kt) {
         const uint k0 = kt * BK;
         // ---- A tile: (BM/2 row pairs) x (KC chunks of 8 k) ----

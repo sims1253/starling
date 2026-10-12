@@ -152,6 +152,7 @@ struct GemmArgs {
     uint32_t ldc_n = 1;
     uint32_t bias_mod = 1;
     uint32_t cv_cin = 0, cv_ti = 0, cv_fi = 0, cv_to = 0, cv_fo = 0;
+    uint32_t causal = 0xffffffffu;   // attention: query m sees keys <= m + causal (gemm.comp)
 };
 static_assert(sizeof(GemmArgs) <= vk::kPushBytes, "gemm push constants");
 

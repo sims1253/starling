@@ -2097,6 +2097,7 @@ bool AudioLlmEngine::Impl::record_llm(vk::Recording& rc, uint32_t S, std::string
             c.a.a_off = h0 * HDIM; c.a.b_off = coff + (h0 / (NH / NKV)) * MAXPOS * HDIM;
             c.a.nb_lo = hn; c.a.sa_lo = HDIM; c.a.sb_lo = MAXPOS * HDIM; c.a.gqa = NH / NKV;
             c.a.sc_lo = S * ldS;
+            c.a.causal = 0;   // keys above the diagonal are never read
             c.batch = hn;
             c.A = vk::Ref(lqr); c.Bq = vk::Ref(kcache); c.C = vk::Ref(lsc);
             rc.label("llm_attn_qk");
@@ -2113,6 +2114,7 @@ bool AudioLlmEngine::Impl::record_llm(vk::Recording& rc, uint32_t S, std::string
             v.a.b_off = coff + (h0 / (NH / NKV)) * MAXPOS * HDIM; v.a.c_off = h0 * HDIM;
             v.a.nb_lo = hn; v.a.sa_lo = S * ldP; v.a.sb_lo = MAXPOS * HDIM; v.a.gqa = NH / NKV;
             v.a.sc_lo = HDIM;
+            v.a.causal = 0;   // P is zero past the diagonal
             v.batch = hn;
             v.A = vk::Ref(lp); v.Bq = vk::Ref(vcache); v.C = vk::Ref(lctx);
             rc.label("llm_attn_pv");
