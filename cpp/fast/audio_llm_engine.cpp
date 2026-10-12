@@ -577,6 +577,16 @@ bool AudioLlmEngine::Impl::load(const ggml::ModelLoader& ml, std::string& err) {
     DS = sp.DS; EOUT = sp.EOUT; AH = sp.AH;
     HD = sp.HD; NH = sp.NH; NKV = sp.NKV; HDIM = sp.HDIM; FF = sp.FF;
     NL = sp.NL; MAXPOS = sp.MAXPOS;
+    // Each KV cache (all layers) is one storage-buffer binding. Voxtral's
+    // would span the GGUF's 4096 positions (218 MiB each at q4k dims), past
+    // PowerVR's 128 MiB range: it gets the positions that fit (2304 there,
+    // ~3 min of audio; longer audio is refused with a clear error).
+    if (sp.audio_add) {
+        const uint64_t per_pos = (uint64_t)NL * sp.NKV * sp.HDIM * 2;
+        if (per_pos && (uint64_t)MAXPOS * per_pos > ctx->info().max_storage_range)
+            MAXPOS = (uint32_t)(ctx->info().max_storage_range / per_pos) / 256 * 256;
+        sp.max_new_tokens = std::min(sp.max_new_tokens, MAXPOS);
+    }
     // EOUT == HD without an adapter: the projection writes the LLM input rows.
     const bool enc_ok = !sp.encoder ||
         (EHD == 64 && DS % 8 == 0 && sp.n_mels == 128 && sp.n_window_infer % 100 == 0 &&
