@@ -494,6 +494,12 @@ What makes a recipe fast on arm64:
 - The phone's Vulkan fast engine maps Q4_0/Q8_0 onto its W4/W8 layouts
   losslessly and re-rounds K-quants.
 
+Published files (each repository carries the recipe, its importance matrix
+and the measured numbers): Hugging Face `scholzmx/parakeet-tdt-0.6b-v3-gguf`,
+`scholzmx/moss-transcribe-preview-2b-gguf`, `scholzmx/qwen3-asr-0.6b-gguf`,
+`scholzmx/qwen3-asr-1.7b-gguf`, `scholzmx/ark-asr-0.6b-gguf`,
+`scholzmx/ark-asr-3b-gguf` and `scholzmx/granite-speech-4.1-2b-gguf`.
+
 ### Parakeet TDT 0.6B v3 — `parakeet-q4pw-fullimx.recipe`
 
 All linears are Q4_0, including the pointwise convs (opt-in, flattened).
