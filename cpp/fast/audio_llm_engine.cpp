@@ -539,12 +539,13 @@ std::unique_ptr<AudioLlmEngine> AudioLlmEngine::create(const vx::VoxtralModel& m
 size_t release_host_weights(const ggml::ModelLoader& loader, const std::vector<std::string>& prefixes) {
     size_t released = 0;
 #if defined(__linux__)
-    // Only ranges inside the loader's own host allocation: once a GPU ggml
+    // Only ranges inside the loader's own weight memory: once a GPU ggml
     // backend has mirrored the weights, tensor() returns device tensors
-    // whose data pointers are not host memory.
-    if (!loader.ctx()) return 0;
-    const uintptr_t lo = (uintptr_t)ggml_get_mem_buffer(loader.ctx());
-    const uintptr_t hi = lo + ggml_get_mem_size(loader.ctx());
+    // whose data pointers are not host memory. With the GGUF mapped (the
+    // default) this only unmaps file pages, which refault if read again.
+    if (!loader.weight_data()) return 0;
+    const uintptr_t lo = (uintptr_t)loader.weight_data();
+    const uintptr_t hi = lo + loader.weight_bytes();
     const uintptr_t page = (uintptr_t)sysconf(_SC_PAGESIZE);
     for (const std::string& n : loader.tensor_names()) {
         if (std::none_of(prefixes.begin(), prefixes.end(),
