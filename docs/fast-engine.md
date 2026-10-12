@@ -6,7 +6,8 @@ Starling ships two kinds of engines behind the same C API:
   ([engine notes](ggml-engine.md));
 * the **fast engines** in `cpp/fast/` — hand-written Vulkan compute kernels
   for two model families, **Parakeet-TDT** and the audio-LLMs
-  (**MOSS-Transcribe**, **Qwen3-ASR**, **ARK-ASR** and **Granite-speech**),
+  (**MOSS-Transcribe**, **Qwen3-ASR**, **ARK-ASR**, **Granite-speech** and
+  **Voxtral-Mini-4B-Realtime**),
   built around their shapes the way
   [Splash](https://inco.ai/blog/splash/) builds an engine around one model.
   MOSS and Qwen3-ASR share one engine (`audio_llm_engine.cpp`): the same
@@ -40,6 +41,7 @@ devices (SwiftShader, llvmpipe) are ignored.
 | `STARLING_FAST_MICRO=...` | run one isolated kernel probe at load (`bits,N,K[,reps[,rows]]` GEMV, `norm,...`, `alu,...`, `idot,...`; see `Kernels::micro`) |
 | `STARLING_FAST_TILE=BM,BN,TM,TN` / `STARLING_FAST_GEMV_ROWS=n` | override the tuned GEMM tile / GEMV rows |
 | `STARLING_FAST_KSTEP=n` | audio-LLM decode tokens per submission (default 16) |
+| `STARLING_FAST_{ARK,GRANITE,VOXTRAL}_HOST_ENCODER=1` | keep that model's audio encoder on ggml; the fast engine takes its rows (decoder only) |
 | `STARLING_FAST_ATTN_SPLIT=S` | audio-LLM decode attention split into `S` KV chunks, 1–8; `0` = single pass (default 4 on AMD, 0 elsewhere) |
 | `STARLING_FAST_DEVICE=n` | Vulkan physical device index |
 | `STARLING_FAST_TIMING=1` / `STARLING_FAST_PROFILE=1` | per-stage wall times / per-kernel GPU times |
@@ -111,6 +113,39 @@ ARK 0.6B's suppressed ids (`bad_words_ids`) are a −3e38 lm_head bias. The
 host pages of the loader tensors the engine now owns (`llm.*`, and ARK's
 `enc.*`/`adapter.*`) are returned to the OS (`release_host_weights`).
 
+**Voxtral.** Voxtral-Mini-4B-Realtime runs whole on the device from the
+host log-mel through `generate_additive_from_mel()`. Its encoder is causal:
+the two k3 Conv1d layers are the same time-major GEMMs as ARK's, but the
+mel sits behind two zero rows and the conv1 output behind one (left pads
+2 and 1, conv2's stride 2 as `lda = 2·cin`). The 32 layers are pre-RMSNorm
+with a SwiGLU MLP; their rotate-half RoPE becomes `enc_rope.comp`'s
+adjacent pairs because the halves of every q/k head are interleaved at
+load (q·k is unchanged when both permute alike). The 750-frame sliding
+window runs over 128-query blocks whose keys start 749 rows earlier in
+front-padded k/v buffers; `softmax.comp` masks keys before position 0 and
+outside the window (audio no longer than the window is one causal block).
+The merge-by-4 GELU projector writes an f32 audio-row buffer, and those
+rows are *added* to the token embedding at every position rather than
+filling prompt slots: `embed_rows.comp` adds rows 0..P−1 to the prompt
+(BOS plus 38 streaming pads) and `dec_next.comp` adds the row of the
+position each new token is fed at, read on the device, so the greedy loop
+still waits on one fence per K tokens. Decoding runs in lockstep with the
+audio: the stock offline cap (sequence length = audio rows) is the
+per-call budget, and the KV cache spans the GGUF's 4096 positions
+(≈ 5.4 min of audio, 436 MiB) where one storage-buffer binding can hold
+each cache; PowerVR's 128 MiB range allows 2304 positions (≈ 3 min of
+audio; longer audio is refused). The AdaRMSNorm delay conditioning,
+`1 + fc2(gelu(fc0(t_cond)))`, is a constant per layer and is folded into
+the MLP-norm weights at load. `STARLING_FAST_VOXTRAL_HOST_ENCODER=1` keeps
+the encoder on ggml and hands its rows to `generate_additive()`. On the
+host the fast token ids match ggml's exactly on short and medium; on long,
+3 of 940 ids differ in where the word-boundary token lands, with identical
+text. On the Pixel the transcripts match ggml on all three clips. Decode
+there is bandwidth-bound at ~183 ms/token: the q4k file's Q5_K attention
+and down projections repack to W8, so a token reads ~3.0 GB (W8 layers
+1.75 GB, W4 gate/up 0.83 GB, W8 tied lm_head 0.45 GB). A file with
+4-bit attention/down weights would cut that by about a third.
+
 **Parakeet's transducer decoder stays on the CPU** — sequential, a few small
 matrix-vector products per step — with int8 dot-product kernels (ARMv8.2
 SDOT / x86 AVX2, chosen at run time). The prediction network runs only after
@@ -130,11 +165,11 @@ stores the choice.
 | `attn_decode.comp` | fused qk-norm + RoPE + KV append + attention (one query head per workgroup) |
 | `attn_decode_split.comp`, `attn_split_combine.comp` | the same, split over KV chunks (one workgroup per head and chunk), then a per-head merge of the partial softmaxes |
 | `rope_kv.comp` | prefill q/k norm + RoPE + KV-cache write |
-| `enc_rope.comp` | ARK encoder RoPE (GPT-J pairs over the first rope_dim of each head), in place on q and k |
-| `softmax.comp` | attention softmax with Parakeet's relative-position skew folded into the read index, causal and key-length masks |
+| `enc_rope.comp` | encoder RoPE (GPT-J pairs over the first rope_dim of each head; ARK, and Voxtral with its heads interleaved at load), in place on q and k |
+| `softmax.comp` | attention softmax with Parakeet's relative-position skew folded into the read index, causal, key-length and sliding-window (Voxtral query blocks) masks |
 | `norm.comp` | LayerNorm / RMSNorm, including the fused layer-boundary pair |
 | `pk_conv.comp` | subsampling convolutions, Conformer depthwise conv + batch-norm + SiLU, MOSS stage-1 conv |
-| `embed_rows.comp`, `dec_next.comp` | embedding lookup; on-device greedy step (argmax, EOS, next embedding) |
+| `embed_rows.comp`, `dec_next.comp` | embedding lookup; on-device greedy step (argmax, EOS, next embedding), both optionally adding the position's audio row (Voxtral) |
 
 Shaders use only Vulkan 1.1 core features (16-bit values are packed in 32-bit
 words); the packed-f16 variants additionally need `shaderFloat16`.
@@ -179,6 +214,11 @@ model files.
 | Parakeet, 74.4 s | — | 2 331 ms | 1 743 ms |
 | MOSS q4e8, 7.4 s | 3 129 ms | — | 1 820 ms |
 | MOSS, 22.3 s | 9 596 ms | — | 5 150 ms |
+| Voxtral q4k, 7.4 s | 16.2 s¹ | — | 9.3 s (enc+prefill 1.4 s, 77 ms/tok) |
+| Voxtral, 22.3 s | 42.1 s¹ | — | 26.3 s (enc+prefill 3.0 s, 79 ms/tok) |
+| Voxtral, 74.4 s | 144.7 s¹ | — | 84.8 s¹ (enc+prefill 8.3 s, 81 ms/tok) |
+
+¹ first run, no warm-up.
 
 Encoder-only (Parakeet, 22.3 s): 345 ms fast vs 535 ms ggml Vulkan. MOSS
 decode runs at ~33 ms/token, close to this iGPU's memory-bandwidth floor
@@ -239,6 +279,18 @@ median in a 12-run window; Parakeet medium 2.27–2.34 s (in band).
 | Parakeet, 22.3 s | 7.2 s (enc 1.30 s, dec 5.9 s) | 2.79 s (enc 2.56 s, dec 0.20 s) | **2.22 s** (enc 1.98 s, dec 0.14–0.20 s) |
 | Parakeet, 74.4 s | — | 9.0 s | **7.6 s** |
 | MOSS, 7.4 s | 7.3 s | 7.0 s (decode 100 ms/tok) | **5.6 s** (mel 0.13 s, enc+prefill 2.95 s, decode 76 ms/tok) |
+
+Voxtral q4k (first port, untuned; ggml warm numbers from the serving
+sweep, fast after one warm-up, screen off with the wake hold):
+
+| Voxtral / audio | ggml CPU | fast |
+| --- | --- | --- |
+| 7.4 s | 30.5 s | **28.1 s** (enc+prefill 9.3 s, 183 ms/tok × 103) |
+| 22.3 s | 84.6 s | **71.3 s** (enc+prefill 18.3 s, 182–186 ms/tok × 289) |
+| 74.4 s | 356.5 s | **234.4 s** (first run; enc+prefill 47.5 s, 198 ms/tok × 940) |
+
+The encoder and the 39-row prefill are f32-product GEMMs (~130–200
+GFLOPS here); decode is bandwidth-bound (see the Voxtral paragraph above).
 
 Energy per transcription (batterystats power model, 40/20-run averages,
 measured before the W4 unpack change, i.e. MOSS at 88.7 ms/token):
