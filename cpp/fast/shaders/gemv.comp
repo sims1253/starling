@@ -262,8 +262,10 @@ void main() {
     barrier();
     // Argmax over the workgroup's rows (lowest index on ties): eight
     // segment scans, then one scan of the eight — the same first maximum
-    // as one serial scan, an eighth of its serial length at ROWS = 64.
-    if (ROWS % 8u == 0u && ROWS >= 16u) {
+    // as one serial scan, an eighth of its serial length at ROWS = 64
+    // (at 32 rows, MOSS's lm_head, it measured ~1 % slower: the extra
+    // barrier eats the shorter scan).
+    if (ROWS % 8u == 0u && ROWS >= 64u) {
         const uint SEG = ROWS / 8u;
         if (t < 8u) {
             float best = -3.4e38;
