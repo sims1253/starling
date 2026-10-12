@@ -140,32 +140,20 @@ bool ModelLoader::map_weights(const char* path) {
     // swapping them.
     void* p = file_size ? mmap(nullptr, file_size, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0) : nullptr;
 #if defined(__linux__)
-    // Cold loads: stream the weight region from storage in the background
-    // (readahead on a descriptor of its own) while the engine sets up and
-    // plans; the repack then mostly finds the pages cached. A file already
-    // in the page cache (sampled with mincore) is left alone: walking its
-    // cached pages contends with the repack's page faults (host: +250 ms on
-    // a warm Qwen3 load). STARLING_GGUF_READAHEAD=0/1 never/always.
+    // STARLING_GGUF_READAHEAD=1: stream the weight region from storage in
+    // the background (posix_fadvise WILLNEED on a descriptor of its own).
+    // Off by default: on the Pixel it never beat the repack's own page
+    // faults on a cold load and often delayed the header parse behind it
+    // (Qwen3 cold 0.94-1.0 s without, 1.0-1.7 s with; Granite 1.95-2.16 s
+    // vs 2.26-2.86 s), and over a cached file walking the pages contends
+    // with the faults (host, warm Qwen3: +0.3 s).
     const char* ra = std::getenv("STARLING_GGUF_READAHEAD");
-    if (p != MAP_FAILED && file_size > data_off && !(ra && ra[0] == '0')) {
+    if (p != MAP_FAILED && file_size > data_off && ra && ra[0] == '1') {
         const int rfd = dup(fd);
-        const bool always = ra && ra[0] == '1';
         if (rfd >= 0) {
             try {
-                std::thread([rfd, p, data_off, file_size, always] {
-                    // 256 one-page probes over the weight region (mincore
-                    // reports page-cache residency for file mappings and
-                    // reads nothing; a mapping gone meanwhile just fails).
-                    const size_t page = (size_t)sysconf(_SC_PAGESIZE);
-                    const size_t first = (data_off + page - 1) / page, last = file_size / page;
-                    int cached = 0, probes = 0;
-                    for (int k = 0; k < 256 && last > first; ++k, ++probes) {
-                        unsigned char v = 0;
-                        const size_t pg = first + (last - first) * (size_t)k / 256;
-                        if (mincore((uint8_t*)p + pg * page, page, &v) == 0 && (v & 1)) ++cached;
-                    }
-                    if (always || cached < probes * 9 / 10)
-                        posix_fadvise(rfd, (off_t)data_off, (off_t)(file_size - data_off), POSIX_FADV_WILLNEED);
+                std::thread([rfd, data_off, file_size] {
+                    posix_fadvise(rfd, (off_t)data_off, (off_t)(file_size - data_off), POSIX_FADV_WILLNEED);
                     close(rfd);
                 }).detach();
             } catch (...) {
