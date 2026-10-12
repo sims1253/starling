@@ -31,6 +31,10 @@ class ModelDownloadController(private val engine: OnDeviceEngine) {
 
     val isRunning: Boolean get() = state is State.Running
 
+    /** The model of the running or most recently started download. Main thread. */
+    var spec: ModelDownload? = null
+        private set
+
     /** Bytes already on disk from an earlier, unfinished attempt. */
     fun resumableBytes(spec: ModelDownload): Long =
         engine.downloadFile(spec).length().coerceAtMost(spec.sizeBytes)
@@ -49,6 +53,7 @@ class ModelDownloadController(private val engine: OnDeviceEngine) {
         if (isRunning) return
         val job = ModelDownloader()
         downloader = job
+        this.spec = spec
         publish(State.Running(resumableBytes(spec), spec.sizeBytes, verifying = false))
         Thread({ run(job, spec) }, "starling-model-download").apply { isDaemon = true }.start()
     }

@@ -57,13 +57,16 @@ response from being inserted into a field that has changed.
 No Python or GPU runtime is bundled. An optional **on-device engine**
 (experimental) embeds the repository's native engine (`libstarling_ggml`)
 for offline transcription. Tap **Download recommended
-model** to fetch `parakeet-tdt-0.6b-v3-q4_k_m-shrink16.gguf` (553 MB) from
-[`scholzmx/parakeet-tdt-0.6b-v3-gguf`](https://huggingface.co/scholzmx/parakeet-tdt-0.6b-v3-gguf).
-The download is pinned to a repository revision, resumes where it stopped
-after a dropped connection or app restart, and is checked against its
-SHA-256 before it replaces the active model (`engine/ModelCatalog.kt`).
-Any other Parakeet-TDT GGUF can be imported through **Import model
-(.gguf)** instead, and so can the repository's other speech-model GGUFs:
+model** to fetch `parakeet-tdt-0.6b-v3-q4pw-fullimx.gguf` (364 MB) from
+[`scholzmx/parakeet-tdt-0.6b-v3-gguf`](https://huggingface.co/scholzmx/parakeet-tdt-0.6b-v3-gguf),
+or **Download another model…** for the phone quants of Qwen3-ASR (0.6B,
+1.7B), ARK-ASR 0.6B, Granite Speech and MOSS-Transcribe (see the
+*Phone recipes* section of `docs/quantization.md`). Every download is
+pinned to a repository revision, resumes where it stopped after a dropped
+connection or app restart, and is checked against its SHA-256 before it
+replaces the active model (`engine/ModelCatalog.kt`). Any other
+Parakeet-TDT GGUF can be imported through **Import model (.gguf)**
+instead, and so can the repository's other speech-model GGUFs:
 Qwen3-ASR (1.7B, 0.6B), ARK-ASR (3B, 0.6B), Granite Speech,
 MOSS-Transcribe and Voxtral Realtime. The engine is picked from the file's
 own metadata (`engine/ModelKind.kt`); anything else, including the S1-mini

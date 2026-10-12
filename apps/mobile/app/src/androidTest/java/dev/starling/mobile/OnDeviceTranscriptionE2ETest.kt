@@ -17,7 +17,7 @@ import java.io.File
  * End to end on the real engine: download the recommended model with the
  * app's own downloader, adopt it, and transcribe a LibriSpeech clip.
  *
- * Opt-in because it fetches 553 MB and needs a capable arm64 phone:
+ * Opt-in because it fetches 364 MB and needs a capable arm64 phone:
  *   ./gradlew connectedDebugAndroidTest \
  *     -Pandroid.testInstrumentationRunnerArguments.e2e=true
  * Gradle uninstalls the test app afterwards, so every run downloads again.
