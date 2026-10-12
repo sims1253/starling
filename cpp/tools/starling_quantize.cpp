@@ -26,8 +26,9 @@
 // consumed via ggml_mul_mat by the engine. Kept at the source dtype:
 //   - conv weights ("conv." in the name) — engine casts/convs them as F16
 //   - the mel filterbank/window ("preprocessor.*")
-//   - embeddings (Parakeet's prediction embedding can opt in via an explicit
-//     recipe rule; the engine dequantizes its host table through type traits)
+//   - embeddings and the few conv-named linears (see kOptIns: an explicit
+//     recipe rule can opt them in, per architecture, where the engine reads
+//     them through a dequantizing path)
 //   - pos_bias_u/v and every 1-D tensor (norms, biases, BN statistics)
 // A candidate whose row length is not a multiple of the block size (e.g. the
 // 640-row joint/LSTM linears vs Q4_K's 256 block) falls back to Q8_0, and to
@@ -39,8 +40,8 @@
 //   self_attn\.linear_q\.weight$ q6_k
 //   ^joint\. q8_0
 // Patterns are ECMAScript regexes matched with std::regex_search, first match
-// wins. An explicit rule can also select Parakeet's prediction embedding;
-// recipe defaults and other architectures retain the embedding keep-list.
+// wins. An explicit rule can also select an opt-in tensor (kOptIns); recipe
+// defaults and named levels keep them at the source dtype.
 //
 // --shrink-f16 additionally stores kept convolution weights as F16.
 
@@ -52,6 +53,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <regex>
 #include <string>
@@ -168,6 +170,74 @@ ggml_type compat_type(ggml_type want, int64_t n_per_row, ggml_type src) {
     if (want != GGML_TYPE_Q8_0 && n_per_row % (int64_t)ggml_blck_size(GGML_TYPE_Q8_0) == 0)
         return GGML_TYPE_Q8_0;
     return src;
+}
+
+// Opt-in tensors: kept at the source dtype by default (named levels and recipe
+// defaults never touch them), quantized only when an explicit recipe rule
+// matches. Each entry names the architecture whose engine reads the tensor
+// through a path that accepts the listed types:
+//   - Parakeet's prediction embedding: the engine dequantizes it into a host
+//     table through type traits; q8_0/f32 only (low-precision input
+//     embeddings break the TDT joint).
+//   - The LLM decoders' token embedding llm.embed.weight: an in-graph
+//     get_rows (every backend dequantizes all of these types) and, where
+//     tied, the lm_head GEMM (F32 activations for quantized heads, see
+//     lib/graph_helpers.hpp gemm_act). Not imatrix-observed as a lookup;
+//     the tied head is observed as a matmul.
+//   - Conv-named linears that are plain GEMMs in the engine (the "conv" name
+//     rule exists for real conv kernels): MOSS's enc.conv_out projection and
+//     Granite's conformer conv-module pointwise linears.
+struct OptIn {
+    const char* arch;
+    const char* pattern;
+    const char* what;  // "embedding" / "linear", for the error message
+    std::vector<ggml_type> types;
+    // A kernel-size-1 conv stored [1, in, out]: block quantization needs the
+    // row on ne[0], so a quantized copy is written flattened as [in, out]
+    // (byte-identical element order). Engines that accept it: Parakeet's
+    // conformer (reshapes the weight 2-D anyway) and its fast engine (reads
+    // raw rows).
+    bool flatten_k1 = false;
+};
+
+const std::vector<OptIn>& opt_ins() {
+    static const std::vector<ggml_type> kEmbedTypes = {
+        GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q6_K,
+        GGML_TYPE_Q5_K, GGML_TYPE_Q4_K, GGML_TYPE_Q4_0};
+    static const std::vector<ggml_type> kLinearTypes = {
+        GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q6_K,
+        GGML_TYPE_Q5_K, GGML_TYPE_Q4_K, GGML_TYPE_Q4_0, GGML_TYPE_IQ4_NL};
+    static const std::vector<OptIn> kOptIns = {
+        {"parakeet_tdt", "^decoder\\.prediction\\.embed\\.weight$", "embedding",
+         {GGML_TYPE_Q8_0, GGML_TYPE_F32}},
+        {"moss_transcribe", "^llm\\.embed\\.weight$", "embedding", kEmbedTypes},
+        {"qwen3", "^llm\\.embed\\.weight$", "embedding", kEmbedTypes},
+        {"granite", "^llm\\.embed\\.weight$", "embedding", kEmbedTypes},
+        {"ark", "^llm\\.embed\\.weight$", "embedding", kEmbedTypes},
+        {"voxtral", "^llm\\.embed\\.weight$", "embedding", kEmbedTypes},
+        {"moss_transcribe", "^enc\\.conv_out\\.weight$", "linear", kLinearTypes},
+        {"granite", "^enc\\.blk\\.[0-9]+\\.conv_(up|down)\\.weight$", "linear",
+         kLinearTypes},
+        // Conformer pointwise convs: ~27 % of a q4 Parakeet file at F16.
+        // Q4_0/Q8_0 map losslessly onto the phone fast engine's W4/W8.
+        {"parakeet_tdt", "^encoder\\.layers\\.[0-9]+\\.conv\\.pointwise_conv[12]\\.weight$",
+         "linear", {GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q6_K, GGML_TYPE_Q4_K,
+                    GGML_TYPE_Q4_0}, /*flatten_k1=*/true},
+    };
+    return kOptIns;
+}
+
+// The opt-in entry covering `name` for this architecture, or nullptr.
+const OptIn* find_opt_in(const std::string& arch, const std::string& name) {
+    static const std::vector<std::regex> kPatterns = [] {
+        std::vector<std::regex> r;
+        for (const auto& o : opt_ins()) r.emplace_back(o.pattern);
+        return r;
+    }();
+    const auto& table = opt_ins();
+    for (size_t i = 0; i < table.size(); ++i)
+        if (arch == table[i].arch && std::regex_search(name, kPatterns[i])) return &table[i];
+    return nullptr;
 }
 
 // ---------------------------------------------------------------------------
@@ -344,9 +414,32 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "error: imatrix %s is empty/unreadable\n", args.imatrix.c_str());
             return 1;
         }
+        // The collector keys an entry by the matmul's src0 name. A weight the
+        // engine casts or reshapes first (Parakeet's pointwise convs) is
+        // recorded under ggml's derived name, e.g. "<w> (copy) (reshaped)";
+        // alias such entries to the weight unless it has its own. Several
+        // derived entries of one weight (sums of squared activations) merge.
+        static const std::regex kDerived("( \\((copy|reshaped|view|permuted|transposed|cont)\\))+$");
+        std::map<std::string, starling::ggml::ImatrixEntry> aliases;
+        for (const auto& kv : imap) {
+            const std::string base = std::regex_replace(kv.first, kDerived, "");
+            if (base == kv.first || imap.count(base)) continue;
+            auto [it, fresh] = aliases.emplace(base, kv.second);
+            if (fresh) continue;
+            if (it->second.values.size() != kv.second.values.size()) {
+                std::fprintf(stderr, "error: imatrix entries for %s disagree on width (%s)\n",
+                             base.c_str(), kv.first.c_str());
+                return 1;
+            }
+            for (size_t i = 0; i < kv.second.values.size(); ++i)
+                it->second.values[i] += kv.second.values[i];
+            it->second.n_obs += kv.second.n_obs;
+        }
+        const size_t aliased = aliases.size();
+        for (auto& a : aliases) imap.emplace(a.first, std::move(a.second));
         if (!args.quiet)
-            std::fprintf(stderr, "imatrix: %zu tensors from %s\n",
-                         imap.size(), args.imatrix.c_str());
+            std::fprintf(stderr, "imatrix: %zu tensors from %s (%zu by derived name)\n",
+                         imap.size(), args.imatrix.c_str(), aliased);
     }
 
     // Open the input (mmap-backed weight context, same as ModelLoader).
@@ -358,12 +451,9 @@ int main(int argc, char** argv) {
         return 1;
     }
     const int64_t arch_key = gguf_find_key(in, "general.architecture");
-    const bool parakeet = arch_key >= 0 &&
-        gguf_get_kv_type(in, arch_key) == GGUF_TYPE_STRING &&
-        std::strcmp(gguf_get_val_str(in, arch_key), "parakeet_tdt") == 0;
-    const bool moss_embed_ok = arch_key >= 0 &&
-        gguf_get_kv_type(in, arch_key) == GGUF_TYPE_STRING &&
-        std::strcmp(gguf_get_val_str(in, arch_key), "moss_transcribe") == 0;
+    const std::string arch = arch_key >= 0 && gguf_get_kv_type(in, arch_key) == GGUF_TYPE_STRING
+                                 ? gguf_get_val_str(in, arch_key)
+                                 : "";
 
     // Output meta context: no_alloc tensors whose ->data we point at owned
     // host buffers until gguf_write_to_file.
@@ -395,42 +485,53 @@ int main(int argc, char** argv) {
         ggml_tensor* t = name_c ? ggml_get_tensor(ctx_in, name_c) : nullptr;
         if (!t) continue;
         const std::string name(name_c);
-        const int n_dims = ggml_n_dims(t);
-        const int64_t k = t->ne[0];  // row length (input channels)
+        int n_dims = ggml_n_dims(t);
+        int64_t k = t->ne[0];  // row length (input channels)
+        int64_t ne_out[GGML_MAX_DIMS] = {t->ne[0], t->ne[1], t->ne[2], t->ne[3]};
         const size_t src_bytes = ggml_nbytes(t);
         bytes_in += src_bytes;
 
         // Decide the target type.
         ggml_type want = (ggml_type)t->type;
-        // An explicit rule is required: a recipe's default must not newly
-        // quantize embeddings, which are not observed by the imatrix collector.
-        // Limit this exception to the engines whose host lookup dequantizes
-        // (parakeet prediction embed; moss tied embed/lm_head via get_rows).
-        if (use_recipe && n_dims == 2 &&
-            ((parakeet && name == "decoder.prediction.embed.weight") ||
-             (moss_embed_ok && name == "llm.embed.weight"))) {
+        // An explicit rule is required for an opt-in tensor: a recipe's
+        // default must not newly quantize embeddings (not observed by the
+        // imatrix collector as lookups) or conv-named tensors.
+        const OptIn* opt_in = use_recipe && (n_dims == 2 || (n_dims == 3 && t->ne[0] == 1))
+                                  ? find_opt_in(arch, name)
+                                  : nullptr;
+        if (opt_in && n_dims == 3 && !opt_in->flatten_k1) opt_in = nullptr;
+        if (opt_in) {
             for (const auto& rule : recipe.rules) {
                 if (std::regex_search(name, rule.first)) {
-                    // Parakeet prediction embed: q8_0/f32 only (low-precision
-                    // input embeddings break the TDT joint). Moss tied
-                    // embed/lm_head: q8_0 proven, q4_0 experimental (the head
-                    // is quality-sensitive; CER-gated per run, leaderboard WER
-                    // before any release claim).
-                    const bool moss_head = moss_embed_ok && name == "llm.embed.weight";
-                    if (rule.second != GGML_TYPE_Q8_0 && rule.second != GGML_TYPE_F32 &&
-                        !(moss_head && rule.second == GGML_TYPE_Q4_0)) {
-                        std::fprintf(stderr,
-                                     "error: embedding recipe supports only q8_0 or f32%s\n",
-                                     moss_head ? " (moss head: also q4_0)" : "");
+                    if (std::find(opt_in->types.begin(), opt_in->types.end(), rule.second) ==
+                        opt_in->types.end()) {
+                        std::string allowed;
+                        for (size_t i = 0; i < opt_in->types.size(); ++i) {
+                            if (i) allowed += i + 1 == opt_in->types.size() ? " or " : ", ";
+                            allowed += type_name(opt_in->types[i]);
+                        }
+                        std::fprintf(stderr, "error: %s recipe supports only %s (%s, got %s)\n",
+                                     opt_in->what, allowed.c_str(), name.c_str(),
+                                     type_name(rule.second));
                         return 1;
                     }
                     candidates++;
-                    want = compat_type(rule.second, k, (ggml_type)t->type);
+                    // A k=1 conv's row is ne[1] once flattened; flatten only
+                    // if the fitted type is still quantized.
+                    want = compat_type(rule.second, n_dims == 3 ? t->ne[1] : k,
+                                       (ggml_type)t->type);
+                    if (n_dims == 3 && ggml_is_quantized(want)) {
+                        ne_out[0] = t->ne[1];
+                        ne_out[1] = t->ne[2];
+                        ne_out[2] = 1;
+                        n_dims = 2;
+                        k = ne_out[0];
+                    }
                     break;
                 }
             }
         }
-        if (is_candidate(name, n_dims)) {
+        if (!opt_in && is_candidate(name, n_dims)) {
             candidates++;
             if (use_recipe) {
                 want = compat_type(recipe.def, k, (ggml_type)t->type);
@@ -459,7 +560,7 @@ int main(int argc, char** argv) {
         // Materialize the output tensor + data. gguf_add_tensor records the
         // name/type/shape; gguf_set_tensor_data binds the data pointer (and
         // requires the name to exist, so it must follow the add).
-        ggml_tensor* dst_t = ggml_new_tensor(ctx_out, want, n_dims, t->ne);
+        ggml_tensor* dst_t = ggml_new_tensor(ctx_out, want, n_dims, ne_out);
         ggml_set_name(dst_t, name_c);
         if (out) gguf_add_tensor(out, dst_t);
         if (want != (ggml_type)t->type) {

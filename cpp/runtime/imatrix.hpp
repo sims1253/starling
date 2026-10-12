@@ -16,7 +16,7 @@
 // because the collection drivers pin STARLING_GGML_DEVICE=cpu. Collection
 // mode trades speed for visibility and is not meant for serving.
 //
-// The map is flushed at process exit (std::atexit) and after an explicit
+// The map is flushed at process exit (the singleton's destructor) and after an explicit
 // starling_ggml_imatrix_flush() C-API call; writing touches no ggml state so
 // it is safe in any teardown order.
 // For a bounded second-order study, STARLING_IMATRIX_TRACE_TENSOR=<name> and
@@ -52,6 +52,7 @@ public:
 
 private:
     ImatrixCollector();
+    ~ImatrixCollector();
     ImatrixCollector(const ImatrixCollector&) = delete;
     ImatrixCollector& operator=(const ImatrixCollector&) = delete;
 

@@ -38,12 +38,14 @@ inline ggml_tensor* wb(ggml_context* c, const ModelLoader& ml, const std::string
 
 // ---- linears -------------------------------------------------------------- //
 // Activation-side cast for a weight GEMM. The bf16 oracle keeps activations
-// bf16 into the GEMM, but ggml's quantized matmul (Q8 intermediates) only
-// accepts F32 operands — and bf16 values are exact in f32, so the upcast
-// preserves the F32-accumulated GEMM + trailing bf16 round; only the weight
-// carries quantization noise. No behavior change for unquantized weights.
+// bf16 into the GEMM against a bf16 weight. Every other weight type takes F32
+// activations: ggml's quantized matmul (Q8 intermediates) and its F16/F32
+// CPU matmuls only accept an F32 src1 (an F16 or F32 opt-in tensor from
+// starling-quantize would otherwise abort). bf16 values are exact in f32, so
+// the upcast preserves the F32-accumulated GEMM + trailing bf16 round; only
+// the weight carries quantization noise. No behavior change for bf16 weights.
 inline ggml_tensor* gemm_act(ggml_context* c, const ggml_tensor* w, ggml_tensor* x) {
-    return ggml_is_quantized(w->type) ? f32(c, x) : bf16(c, x);
+    return w->type == GGML_TYPE_BF16 ? bf16(c, x) : f32(c, x);
 }
 // bf16 linear without bias (Qwen3 attention projections; full weight name).
 inline ggml_tensor* lin(ggml_context* c, const ModelLoader& ml, ggml_tensor* x,

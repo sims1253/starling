@@ -1,0 +1,16 @@
+# starling-quantize recipe: Qwen3-ASR-1.7B, phone "quality" (1835 MB).
+# Encoder and projector Q8_0, decoder Q6_K, tied embedding/lm_head Q8_0.
+# ~1487 MB read per decoded token.
+#
+# Measured (2026-10-12, FLEURS test, 100 clips per language, paired bootstrap
+# vs all-Q8_0): en 3.77 % vs 3.91 % (clip -0.10 pt [-0.52, +0.24]), de 3.61 %
+# vs 3.91 % (-0.20 pt [-0.55, +0.13]). Matrix and gate: docs/quantization.md,
+# "Phone recipes".
+#
+#   build/starling-quantize --input models/qwen3-asr-1.7b-bf16-exact.gguf \
+#       --output models/qwen3-asr-1.7b-k6x8e8.gguf \
+#       --recipe quants/recipes/qwen3-1.7b-k6x8e8.recipe \
+#       --imatrix models/qwen3-calib160.imx
+default q8_0
+^llm\.embed\.weight$ q8_0
+^llm\.blk\. q6_k

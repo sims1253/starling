@@ -124,9 +124,9 @@ those tensors are fair game:
 
 Kept at the source dtype on purpose:
 
-- **conv weights** (`conv` in the name): the conformer pointwise convs are
-  `ggml_cast` to F16 and reshaped before their matmul, the depthwise/subsampling
-  convs go through `ggml_conv_*` — no dequant path.
+- **conv weights** (`conv` in the name): the depthwise/subsampling convs go
+  through `ggml_conv_*` — no dequant path. The conformer pointwise convs
+  (`encoder.layers.N.conv.pointwise_conv{1,2}.weight`) are opt-in, see below.
 - **the prediction embedding** `decoder.prediction.embed.weight`: the engine
   expands it into a host F32 table (`prediction.cpp`). An explicit recipe
   rule can change its storage dtype for `general.architecture=parakeet_tdt`;
@@ -134,6 +134,29 @@ Kept at the source dtype on purpose:
 - **batch-norm statistics, norms, biases, pos_bias_u/v**: 1-D host-folded or
   broadcast operands.
 - **mel constants** (`preprocessor.*`): the filterbank/window must stay exact.
+
+Opt-in tensors keep their source dtype under named levels and `default`
+lines, and change only when an explicit recipe rule matches them. The table
+(`opt_ins()` in `cpp/tools/starling_quantize.cpp`) is keyed by
+`general.architecture` and lists the types each engine reads the tensor
+with; a matching rule with any other type fails:
+
+| architecture | tensor | accepted types |
+|--------------|--------|----------------|
+| parakeet_tdt | `decoder.prediction.embed.weight` | q8_0, f32 |
+| parakeet_tdt | `encoder.layers.N.conv.pointwise_conv{1,2}.weight` | f16, q8_0, q6_k, q4_k, q4_0 |
+| moss_transcribe, qwen3, granite, ark, voxtral | `llm.embed.weight` | f32, f16, q8_0, q6_k, q5_k, q4_k, q4_0 |
+| moss_transcribe | `enc.conv_out.weight` | f32, f16, q8_0, q6_k, q5_k, q4_k, q4_0, iq4_nl |
+| granite | `enc.blk.N.conv_{up,down}.weight` | f32, f16, q8_0, q6_k, q5_k, q4_k, q4_0, iq4_nl |
+
+The pointwise convs are kernel-size-1 convs stored `[1, in, out]`; a
+quantized copy is written flattened as `[in, out]` (same element order) so
+the row sits on ne[0]. The conformer graph and the fast engine both read
+them as 2-D matmul weights. The importance matrix records them under ggml's
+derived name (`<name> (copy) (reshaped)`); the quantizer falls back to that
+entry when the plain name is missing. A tied `llm.embed.weight` is also the
+lm_head: its full table is read on every decode step and never repacked by
+the CPU backend, so its type sets a large share of the decode bandwidth.
 
 Row width decides the floor: the joint/LSTM linears have 640-wide rows, which
 is not a multiple of the K-quant block size (256), so they fall back to
@@ -418,6 +441,200 @@ reversed direction as the phone began charging. Its timings and energy samples
 do not establish a controlled latency or energy result. The paired WER gate
 compares quality only. This phone result does not promote the recipe to a
 release default.
+
+## Phone recipes (Pixel 10 Pro, 2026-10)
+
+Goal: every model usable on the phone, with faster transcription, lower
+energy, and smaller files. Quality is measured on the host CPU; speed,
+memory and energy on the phone.
+
+**Quality gate.** FLEURS test, 100 en + 100 de clips. Each GGUF is
+decoded in a fresh process (`benchmarks/quant_phone/wer_models.py`).
+Against the source (or an all-Q8_0 reference when the source is too large
+for CPU), a recipe passes when, in both languages:
+
+- the corpus WER delta is at most +0.3 pt, and
+- the upper bound of the paired per-clip bootstrap 95 % CI is at most
+  +1.0 pt (`compare_wer.py`: 10k resamples, seed 0).
+
+Importance matrices use 160 FLEURS **validation** clips (100 en, 60 de).
+Collect them on an all-Q8_0 file, not on the BF16 source. The collector
+only records matmuls with F32 activations, and on a BF16 source the qwen
+trunks feed BF16 activations to every LLM linear, so the matrix stays
+nearly empty.
+
+```bash
+# 160 validation clips: export both languages, then merge the WAVs and the
+# two refs.json maps into one directory (calib_en_de)
+python benchmarks/fast_engine/export_fleurs.py --split validation --cfg en_us --n 100 --out calib_en
+python benchmarks/fast_engine/export_fleurs.py --split validation --cfg de_de --n 60 --out calib_de
+# all-Q8_0 file: every linear plus the embedding at Q8_0
+printf 'default q8_0\n^llm\\.embed\\.weight$ q8_0\n' > /tmp/q8.recipe
+build/starling-quantize --input models/qwen3-asr-0.6b-bf16-exact.gguf \
+    --output models/qwen3-asr-0.6b-q8_0.gguf --recipe /tmp/q8.recipe
+STARLING_IMATRIX=models/qwen3_06-calib160.imx STARLING_GGML_DEVICE=cpu \
+    python benchmarks/quant_phone/wer_models.py --lib build/libstarling_ggml.so \
+    --model qwen3_06 --clips calib_en_de --json /dev/null q8=models/qwen3-asr-0.6b-q8_0.gguf
+```
+
+The matrix is written when the process exits.
+
+**Phone measurement.** `benchmarks/quant_phone/phone_quant_bench.sh` runs
+on a host with adb. It starts each process only once the skin temperature
+is back near idle. Variants alternate ABBA across rounds. Energy per
+process is read from the coulomb counter on battery, minus the idle drain.
+
+What makes a recipe fast on arm64:
+
+- Q4_0 repacks to the i8mm 4x8 GEMM, Q4_K/Q5_K/Q6_K to 8x8, and Q8_0 to
+  4x8. IQ4_NL gets only a dotprod 4x4 kernel. Q2_K/Q3_K/IQ2/IQ3 are not
+  repacked.
+- K-quants need a row width that is a multiple of 256; narrower rows fall
+  back to Q8_0. Use Q4_0 for 640- or 896-wide rows.
+- The phone's Vulkan fast engine maps Q4_0/Q8_0 onto its W4/W8 layouts
+  losslessly and re-rounds K-quants.
+
+Published files (each repository carries the recipe, its importance matrix
+and the measured numbers): Hugging Face `scholzmx/parakeet-tdt-0.6b-v3-gguf`,
+`scholzmx/moss-transcribe-preview-2b-gguf`, `scholzmx/qwen3-asr-0.6b-gguf`,
+`scholzmx/qwen3-asr-1.7b-gguf`, `scholzmx/ark-asr-0.6b-gguf`,
+`scholzmx/ark-asr-3b-gguf` and `scholzmx/granite-speech-4.1-2b-gguf`.
+
+### Parakeet TDT 0.6B v3 — `parakeet-q4pw-fullimx.recipe`
+
+All linears are Q4_0, including the pointwise convs (opt-in, flattened).
+The joint, the LSTM and the prediction embedding are Q8_0. Matrix:
+`parakeet-full.imx`. Built with `--shrink-f16` from the F32 source.
+
+| variant | MB | en WER | de WER | paired en Δ [95 % CI] | paired de Δ [95 % CI] |
+|---------|---:|-------:|-------:|----------------------:|----------------------:|
+| F32 source | 2357 | 5.61 | 4.68 | — | — |
+| q4_k_m-shrink16 (today's download) | 553 | 5.42 | 4.72 | | |
+| **q4pw** | **364** | **5.33** | **4.46** | −0.31 [−0.80, +0.13] | −0.20 [−0.60, +0.19] |
+| q4pw, joint/LSTM also Q4_0 | 358 | 5.80 | 5.06 | | fails |
+
+Pixel 10 Pro, q4pw vs q4_k_m-shrink16 (medians over ABBA rounds):
+
+| engine | metric | q4_k_m-shrink16 | q4pw |
+|--------|--------|----------------:|-----:|
+| fast Vulkan | load | 2.30 s | 1.88 s |
+| fast Vulkan | medium / long fixture | 2.26 / 7.69 s | 2.06 / 6.91 s |
+| fast Vulkan | peak RSS | 1180 MB | 778 MB |
+| fast Vulkan | energy per process | 25.8 mWh | 21.9 mWh |
+| ggml CPU | peak RSS | 728 MB | 548 MB |
+| ggml CPU | CPU time | 192 s | 173 s |
+
+The fixture transcripts are identical. On the notebook's Radeon (RADV),
+transcripts are also identical and latency is within 8 %. The catalog
+entry is `parakeet-q4pw-phone`.
+
+### The LLM-decoder models
+
+Every finalist below passes the gate against its reference. The catalog
+id is the recipe name plus `-phone`, except for the two ARK-3B entries. The
+phone-sized layout differs per model:
+
+- **Qwen3-ASR:** the decoder needs Q5_K/Q6_K. Every decoder at about
+  4.5 bpw (Q4_K, Q4_0, or Q4_K with Q5_K/Q6_K bumps) failed German by
+  +0.5 to +1.5 pt.
+- **ARK-0.6B and Granite:** they hold up at 4 bit. ARK-0.6B needs its
+  decoder attention v/o and ffn.down at Q8_0.
+
+"MB/token" estimates the bytes read per decoded token: the decoder
+linears plus the head.
+
+| model | recipe | MB | MB/token | reference | en WER (paired Δ [95 % CI]) | de WER (paired Δ [95 % CI]) |
+|-------|--------|---:|---------:|-----------|-----------------------------|-----------------------------|
+| Qwen3-ASR-0.6B | `qwen3-0.6b-k56x8e6` | 663 | 454 | BF16 5.23 / 6.59 | 5.04 (−0.02 [−0.61, +0.57]) | 6.59 (−0.01 [−0.74, +0.64]) |
+| Qwen3-ASR-0.6B | `qwen3-0.6b-k6x8e8` | 736 | 527 | BF16 | 5.04 (−0.04 [−0.58, +0.50]) | 6.72 (+0.09 [−0.30, +0.52]) |
+| Qwen3-ASR-1.7B | `qwen3-1.7b-k56x6e6` | 1567 | 1294 | all-Q8_0 3.91 / 3.91 | 3.77 (−0.13 [−0.43, +0.17]) | 3.91 (+0.04 [−0.42, +0.50]) |
+| Qwen3-ASR-1.7B | `qwen3-1.7b-k6x8e8` | 1835 | 1487 | all-Q8_0 | 3.77 (−0.10 [−0.52, +0.24]) | 3.61 (−0.20 [−0.55, +0.13]) |
+| ARK-ASR-0.6B | `ark06-kds8e4` | 732 | 347 | BF16 4.81 / 6.97 | 4.90 (+0.08 [−0.29, +0.40]) | 6.85 (−0.36 [−1.44, +0.40]) |
+| ARK-ASR-0.6B | `ark06-kds8` | 806 | 421 | BF16 | 4.86 (+0.06 [−0.11, +0.26]) | 6.63 (−0.46 [−1.54, +0.31]) |
+| ARK-ASR-3B | `ark-3b-q4k` | 2125 | 1736 | BF16 6.13 / — | 6.36 (+0.32 [−0.11, +0.82]) | not gateable |
+| ARK-ASR-3B | `ark-3b-q5k` | 2635 | 2163 | BF16 | 6.08 (−0.05 [−0.30, +0.16]) | not gateable |
+| Granite-Speech-4.1-2B | `granite-q40-h4` | 1472 | 918 | all-Q8_0 6.18 / 5.78 | 5.52 (−0.43 [−1.16, +0.24]) | 5.82 (+0.01 [−0.54, +0.62]) |
+| Granite-Speech-4.1-2B | `granite-q4k-h4` | 1472 | 918 | all-Q8_0 | 6.22 (+0.11 [−0.45, +0.76]) | 5.82 (−0.28 [−1.03, +0.37]) |
+| MOSS-Transcribe-2B | `moss-q4e4-cal` | 1397 | 968 | BF16 8.11 / — | 8.02 (−0.18 [−1.11, +0.75]) | not gateable |
+| MOSS-Transcribe-2B | `moss-q4e8-fullimx` (existing) | 1553 | 1123 | BF16 | 7.59 (−0.68 [−1.75, +0.31]) | not gateable |
+
+- **German is not gateable for MOSS and ARK-3B.** Both models answer many
+  German clips in English, even at BF16. MOSS scores about 100 % WER on
+  German. ARK-3B answers about 46 % of German clips in English (de WER
+  ≈ 49 %).
+  - On the clips where both files decode German, `ark-3b-q5k` stays as
+    close to BF16 as Q8_0 does.
+  - On the same clips, `ark-3b-q4k` loses +1.27 pt [+0.09, +2.66].
+- **Narrow rows.** The Qwen3-0.6B encoder and the ARK-0.6B decoder are
+  896 wide, so K-quants do not apply there. Q4_0 on the Qwen3-0.6B encoder
+  cost +0.9 pt in German.
+- **Tied heads.** Q4_0 heads are cheap only with a matrix that covers the
+  head.
+  - With the FLEURS matrix, the MOSS Q4_0 head is +0.05 pt against Q8_0.
+  - `moss-full.imx` has no entry for the head.
+  - On ARK-0.6B a Q4_0 head cost 0.1–0.6 pt in every screened pair, and
+    `ark06-kds8e4` still passes.
+- **Granite.** The two recipes have identical bytes and both pass. Pick the
+  one whose kernel is faster on the phone (Q4_0 4x8 or Q4_K 8x8). On a
+  30-clip German BF16 spot check, Q4_K sat closer to BF16.
+- **Loops.** One ARK-3B Q4_K_M file looped on one English clip and scored
+  15 % WER. Screen for repetition loops, not only the mean.
+- **Vulkan.** On the notebook's Radeon (RADV), the Qwen3, Granite, MOSS and
+  ARK-3B finalists give the same fixture transcripts as on its CPU.
+  ARK-0.6B on Vulkan degenerates after a few words into one repeated CJK
+  token. This happens with the BF16 source as well, so it is an engine
+  issue, not a quantization one. Its CPU transcripts are correct.
+- **Fast engine.** The MOSS finalists use only Q4_0 and Q8_0, which the
+  fast engine maps losslessly. It stores `enc.conv_out` as F16 whatever
+  its GGUF type, so quantizing that tensor shrinks only the download.
+- **Reproducibility.** Rebuilding from these recipes with the recorded
+  matrices reproduces the evaluated tensors bit for bit.
+
+### Pixel 10 Pro results for the LLM-decoder models (2026-10-12)
+
+Run with `phone_quant_bench.sh`: 2 ABBA rounds per group, short (7.4 s) and
+medium (22.3 s) fixtures, 6 threads. Each process starts with the live skin
+temperature under idle + 1 °C and the big cores under 50 °C. The phone was
+on the charger, so there is no energy column. The bench process never
+swapped: every `VmSwap` sample was 0 kB, with about 7 GB still available.
+Android's swap is zram holding idle background apps. The "previous" files
+are the earlier dynq4/q4 quants. Times are medians of the two rounds,
+except where a single throttled round is flagged.
+
+| model | file | MB | engine | load | short | medium | CPU s | peak RSS |
+|-------|------|---:|--------|-----:|------:|-------:|------:|---------:|
+| Granite 2B | previous dynq4 | 1857 | ggml CPU | 1.5 s | 11.5 s | 92.7 s | 808 | 1944 MB |
+| Granite 2B | **granite-q40-h4** | 1472 | ggml CPU | 0.7 s | 6.1 s | **17.0 s** | 264 | 1575 MB |
+| Granite 2B | granite-q4k-h4 | 1472 | ggml CPU | 0.7 s | 6.6 s | 18.8 s | 284 | 1576 MB |
+| ARK 0.6B | previous q4k | 903 | ggml CPU | 2.6 s | 7.9 s | 32.7 s | 398 | 1191 MB |
+| ARK 0.6B | **ark06-kds8e4** | 732 | ggml CPU | 2.0 s | 6.8 s | 31.4 s | 374 | 1029 MB |
+| ARK 0.6B | ark06-kds8 | 806 | ggml CPU | 0.5 s | 6.7 s | 31.3 s | 372 | 1099 MB |
+| Qwen3 0.6B | previous q4e8 | 532 | ggml CPU | 0.9 s | 5.5 s | 20.4 s¹ | — | 1546 MB |
+| Qwen3 0.6B | **qwen3-0.6b-k56x8e6** | 663 | ggml CPU | 1.4 s | 6.0 s | 21.8 s | 314 | 1672 MB |
+| Qwen3 0.6B | qwen3-0.6b-k6x8e8 | 736 | ggml CPU | 1.6 s | 6.3 s | 22.2 s | 316 | 1741 MB |
+| Qwen3 1.7B | previous dynq4 | 1328 | ggml CPU | 1.7 s | 7.5 s | 23.8 s | 361 | 2307 MB |
+| Qwen3 1.7B | **qwen3-1.7b-k56x6e6** | 1567 | ggml CPU | 0.7 s | 7.7 s | 25.2 s | 379 | 2535 MB |
+| Qwen3 1.7B | qwen3-1.7b-k6x8e8 | 1835 | ggml CPU | 0.9 s | 8.0 s | 26.0 s | 388 | 2790 MB |
+| MOSS 2B | moss-q4e8-fullimx | 1553 | fast Vulkan | 4.5 s | 5.5 s | 14.8 s | 14 | 3509 MB |
+| MOSS 2B | **moss-q4e4-cal** | 1397 | fast Vulkan | 3.4 s | 5.4 s | 14.3 s | 11 | 3051 MB |
+| MOSS 2B | moss-q4e8-fullimx | 1553 | ggml CPU | 1.6 s | 6.2 s | 21.1 s | 311 | 2146 MB |
+| MOSS 2B | moss-q4e4-cal | 1397 | ggml CPU | 4.0 s | 6.0 s | 20.6 s | 308 | 1997 MB |
+
+¹ Round 1 only. Round 2 throttled mid-run (68.7 s).
+
+- **Granite.** The previous file kept 368 MB of conformer convs in BF16,
+  which ggml's CPU backend runs through a scalar loop on arm64. The opt-in
+  Q4_0 convs make Granite 5.4× faster and usable on the phone. Q4_0 beats
+  Q4_K by 9 %.
+- **Qwen3.** The finalists are about 5 % slower than the previous 4-bit
+  files and use about 230 MB more RAM. In exchange they remove the German
+  loss of those layouts (+0.5 to +1.6 pt on the host).
+- **ARK 0.6B and MOSS.** The compact files are faster and smaller on every
+  axis.
+- **ARK 3B.** It is not practical on the phone CPU. The same `ark-3b-q4k`
+  file took 40–158 s for the 22.3 s fixture across four cool-started runs,
+  throttling within a run. ARK 0.6B and Qwen3 1.7B are the better on-device
+  choices.
 
 ## Results (parakeet-tdt-0.6b-v3, LibriSpeech fixtures)
 

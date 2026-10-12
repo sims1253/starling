@@ -132,7 +132,7 @@ bool VoxtralModel::load(const char* path, std::string& err) {
     // --- Validate untrusted GGUF metadata (mirror ark/loader.cpp). The
     // consumers divide by these (encoder head grouping; llm head grouping
     // h / (n_heads/n_kv_heads)), so a zero or inconsistent value is div-by-zero.
-    if (!lib::check_gguf_header(m, "voxtral", "VOXTRAL", {"bf16_exact", "f16"}, err))
+    if (!lib::check_gguf_header(m, "voxtral", "VOXTRAL", {"bf16_exact", "f16", "quantized"}, err))
         return false;
 #define POS(v, name) do { if (!(v)) { err = "VOXTRAL GGUF " name " must be positive"; return false; } } while (0)
     POS(c.encoder.n_layers, "enc.encoder_layers");

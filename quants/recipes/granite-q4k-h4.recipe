@@ -1,0 +1,17 @@
+# starling-quantize recipe: Granite-Speech-4.1-2B, phone (1472 MB): every
+# linear Q4_K (8x8 i8mm repack on arm64), as granite-q40-h4.recipe otherwise.
+# enc.input_linear (160 wide) falls back to Q8_0.
+#
+# Measured (2026-10-12, FLEURS test, 100 clips per language, paired bootstrap
+# vs all-Q8_0): en 6.22 % vs 6.18 % (clip +0.11 pt [-0.45, +0.76]), de 5.82 %
+# vs 5.78 % (-0.28 pt [-1.03, +0.37]). On a 30-clip German BF16 spot check it
+# sat closer to BF16 than the Q4_0 file. Matrix and gate:
+# docs/quantization.md, "Phone recipes".
+#
+#   build/starling-quantize --input models/granite-speech-4.1-2b-bf16-exact.gguf \
+#       --output models/granite-speech-4.1-2b-q4k-h4.gguf \
+#       --recipe quants/recipes/granite-q4k-h4.recipe \
+#       --imatrix models/granite-calib160.imx --f32-1d
+default q4_k
+^llm\.embed\.weight$ q4_k
+conv_(up|down)\.weight$ q4_k

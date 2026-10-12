@@ -34,15 +34,20 @@ ImatrixCollector::ImatrixCollector() {
         trace_path_ = trace_path;
     }
     if (!path_.empty()) {
-        // Flush at normal process exit. The collector owns plain host memory
-        // only (no ggml handles), so teardown order relative to the Backend
-        // does not matter.
-        std::atexit([] { ImatrixCollector::instance().flush(); });
         std::fprintf(stderr,
                      "[imatrix] collecting activation importance -> %s\n",
                      path_.c_str());
     }
 }
+
+// Flush at normal process exit, from the destructor: an std::atexit handler
+// registered in the constructor would run after the function-local static is
+// destroyed (handlers and static destructors run in reverse order of
+// registration, and the destructor registers once construction completes),
+// so it flushed a dead object and crashed. The collector owns plain host
+// memory only (no ggml handles), so teardown order relative to the Backend
+// does not matter.
+ImatrixCollector::~ImatrixCollector() { flush(); }
 
 bool ImatrixCollector::observe(ggml_tensor* node, bool ask) {
     if (node == nullptr || node->op != GGML_OP_MUL_MAT) return false;

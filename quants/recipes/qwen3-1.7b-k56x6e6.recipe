@@ -1,0 +1,21 @@
+# starling-quantize recipe: Qwen3-ASR-1.7B, phone "compact" (1567 MB vs
+# 2177 MB all-Q8_0). Every row width is a multiple of 256: encoder and
+# projector Q6_K; decoder attention v/o and ffn.down Q6_K, the other decoder
+# linears Q5_K; tied embedding/lm_head Q6_K. ~1294 MB read per decoded token.
+# 4-bit decoders failed German (+0.5..+0.7 pt, CIs excluding zero).
+#
+# Measured (2026-10-12, FLEURS test, 100 clips per language, paired bootstrap
+# vs all-Q8_0, the reference for the 4 GB source): en 3.77 % vs 3.91 % (clip
+# -0.13 pt [-0.43, +0.17]), de 3.91 % vs 3.91 % (+0.04 pt [-0.42, +0.50]).
+# On a 30-clip BF16 spot check it sits further from BF16 on German than Q8_0
+# does, nearly all from one short clip. Matrix and gate: docs/quantization.md,
+# "Phone recipes".
+#
+#   build/starling-quantize --input models/qwen3-asr-1.7b-bf16-exact.gguf \
+#       --output models/qwen3-asr-1.7b-k56x6e6.gguf \
+#       --recipe quants/recipes/qwen3-1.7b-k56x6e6.recipe \
+#       --imatrix models/qwen3-calib160.imx
+default q6_k
+^llm\.embed\.weight$ q6_k
+^llm\.blk\.[0-9]+\.(attn\.[vo]|ffn\.down)\.weight$ q6_k
+^llm\.blk\. q5_k
