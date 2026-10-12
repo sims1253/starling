@@ -1018,3 +1018,75 @@ reserve both ran the iGPU out of memory (`device lost`) building the 6-min
 take's 6.1 GB graph next to resident entries; bucketing batch-sized inputs
 cost 3-5 % per warm pass (padding + mask ops), hence the 2048-frame limit.
 Verdict: **keep** (streaming win, batch neutral). Not measured: the Pixel.
+
+## P4: audio-LLM decode on the Pixel 10 Pro (2026-10-12, branch gpu-decode)
+
+Goal: the custom engine's per-token decode on the Pixel, where ggml's CPU
+decode (6 threads, after the ggml CPU fixes) had overtaken it on the Qwen3
+trunks (Qwen3-ASR-0.6B: ~22 ms/token CPU vs ~45 GPU). Base:
+`t3/optimize-phone-model-serving` 84f53c03. Protocol: screen off, shell
+wake hold, `flock /tmp/starling-phone.lock`, interleaved A/B (2 rounds,
+order reversed in round 2, 2 runs + warm-up per bench), same boot; the
+metric is the first full decode round in ms per step
+(`STARLING_FAST_TIMING`'s new round line; K = 16 steps per round) next to
+decode ms / generated token. Every keep has identical transcripts on the
+phone and the host (RADV) for Qwen3-ASR-0.6B/1.7B, MOSS, ARK-0.6B and
+Granite, short and medium.
+
+**Where the 40 ms went** (Qwen3-0.6B short, 39.8 ms/step). The per-kernel
+timestamps (`STARLING_FAST_PROFILE`) are misattributed on the tiler
+(ff_up 28 %, ff_down 22 %, attn 16 %, o 13 %, qkv 13 %, lm_head 9 %), so
+the new `STARLING_FAST_DECODE_SKIP` ablation prices each class by
+difference: attention 5.9, qkv 7.6, o 2.1, gate/up 10.8, down 3.0,
+lm_head 9.3 ms/step; 141 no-op dispatches with their barriers 3.3–4.8
+ms/step (24–34 µs each; with no dispatches at all 0.08). The K = 1024
+GEMVs with the fused RMSNorm (qkv, gate/up, the 151936-row lm_head) ran
+at 15–17 G weights/s against ~27 for the K = 2048/3072 ones. MOSS (74.7
+ms/step): timestamps ff_up 30 %, o 19 %, down 18 %, attn 17 %, qkv 9 %,
+lm_head 7 %.
+
+| # | Hypothesis | Result |
+| --- | --- | --- |
+| P4-1 | Decode attention's key loop issues 64 word loads per key, each touching a different line across the workgroup | uvec4 key loads, same accumulation order: 0.6B medium 47.6 → 43.2 ms/token, short 41.6 → 40.5; MOSS medium 80.4 → 75.9. **keep** |
+| P4-2 | K = 1024 GEMV threads do too little work per fixed cost (rows 16 / RSPLIT 4 = 4 row dots) | floor of rows per row slot, kept ≥ 64 WGs: floor 16 0.6B 38.5 → 31.1 ms/step short, 42.6 → 35.3 medium; MOSS 71.0 → 68.7 / 74.7 → 72.6; floor 8 gained less, 12 lost (rows 24); floor only at K = 1024 ≈ floor everywhere with the 64-WG guard. RADV +12 % → PowerVR only. Bit-exact. **keep** |
+| P4-3 | int8 activations (q8 per 32 like ggml) × W4/W8 through `OpSDot` cut ALU per weight | quality fine (FLEURS en 100: 0.6B 5.75 vs 5.85 %, 3/100 differ; 1.7B 3.91 vs 4.01; MOSS 7.73 vs 7.92; ARK 5.09 =; Granite 5.52 vs 5.56; fixture transcripts identical), but **slower**: micro sweeps equal or worse at every decode shape, in context 0.6B +17 % (36.2 vs 31.0 ms/step), MOSS +5 %. Confirms P1-1 on the W4 linears too. discard |
+| P4-4 | Fewer serial shared loads: 8 partials per row, norm statistic folded into the main reduction | +1 ms/step (0.6B). discard |
+| P4-5 | Flash-decode split (`ATTN_SPLIT=4`) on PowerVR | before P4-6: 42.2 vs 39.8 (short), neutral medium; after P4-6: 35.3 / 32.4 vs 31.5 / 29.5. discard |
+| P4-6 | The value mix's serial chain is pos dependent steps per thread | four position groups, a 32-thread group owns a V row (8-byte loads), partials summed in shared: 0.6B medium 35.3 → 31.5 ms/step, short 31.9 → 29.5; MOSS medium 72.6 → 69.0. Reassociated (ulp). **keep** |
+| P4-7 | W8 GEMV via xor 0x80 + `unpackUnorm4x8` (the W4U trick) | 0.6B/MOSS (only the lm_head is W8) neutral: 31.4 vs 31.4, 69.2 vs 69.6. Granite and Voxtral (Q5_K linears repacked to W8; Granite's ablation had W8 at 18–22 G w/s ≈ 20–25 GB/s, not bandwidth-bound): Granite 82.8 → 74.0 ms/token short, 87.1 → 78.2 medium; Voxtral 142.4 → 126.5. FLEURS 0/100 differ on all five models. **keep** (PowerVR default) |
+| P4-8 | KSTEP = 32 (fewer rounds) | per step neutral, per token worse (35.4 vs 32.7 short: the longer after-EOS tail). discard |
+| P4-9 | GEMV tail at K = 1024: stage 2 only copies, the argmax is one serial 64-row scan | read lane partials directly, 8-segment argmax (bit-exact): 0.6B short 29.5 → 27.1, medium 31.5 → 29.8; MOSS (32-row lm_head) +1 % → segmentation only from 64 rows. **keep** |
+| P4-10 | The wide compute+transfer barrier is what costs ~35 µs per dispatch | lazy barriers scoped to compute → compute: 0.6B short 30.4 → 26.3 ms/token, medium 30.6 → 28.5; MOSS 66.0 → 64.6 / 70.4 → 68.1; Parakeet encoder unchanged (2.02 s); 141 no-op dispatches 4.75 → 1.38 ms/step. **keep** |
+| P4-11 | With cheap dispatches, the fused RMSNorm's per-workgroup prologue costs more than a separate norm | norm.comp before the lm_head only: 0.6B −6 %, MOSS neutral; before qkv, gate/up and lm_head: 0.6B 26.5 → 23.8 ms/step short, 28.3 → 25.6 medium; MOSS 65.9 → 62.1 / 67.6 → 64.0; RADV MOSS −2.5 %, Granite −2 %. FLEURS en 100: 0/100 clips differ on all five models. **keep** |
+| P4-12 | 128-row lm_head workgroups at K = 1024 | neutral/worse (23.7 vs 23.5). discard |
+| P4-13 | Two/four times the threads per attention head (PG) | PG 2 +1.7 %, PG 4 +6 % (0.6B short); MOSS +1.7 %. discard |
+
+After P4-10/11 (ablation, 0.6B 26.5 ms/step): attention 3.0, qkv 5.4,
+o 2.1, gate/up 6.1, down 3.0, lm_head 7.2; 141 no-op dispatches 1.4.
+MOSS 67.1: attention 2.9, qkv 10.0, o 4.1, gate/up 26.2, down 11.8,
+lm_head 13.9. Granite (final build, 86.5 ms/step, its Q5_K linears are
+W8): attention 3.1, qkv 14.6, o 8.5, gate/up 30.9, down 18.8, lm_head
+9.5; ~243 no-op dispatches 4.0. Every GEMV now runs at 21–30 G weights/s
+(W4 ~15–17 GB/s, W8 ~20–25 GB/s): the GEMV plateau, not dispatches.
+
+Before → after on the phone (interleaved, same session; ms per generated
+token and wall per transcription, medians of 4):
+
+| model | short ms/tok | medium ms/tok | short wall | medium wall |
+| --- | --- | --- | --- | --- |
+| Qwen3-ASR-0.6B q4e8 | 41.9 → 24.3 | 48.4 → 26.2 | 2.74 → 2.15 s | 7.92 → 5.78 s |
+| Qwen3-ASR-1.7B q4e8-imx | 77.6 → 62.3 | 83.6 → 64.5 | 5.35 → 4.84 s | 14.72 → 12.78 s |
+| MOSS q4e8 | 71.1 → 60.6 | 81.0 → 64.1 | 5.45 → 5.11 s | 14.66 → 13.14 s |
+| ARK-0.6B q4k | 45.1 → 32.2 | 49.4 → 33.8 | 4.99 → 4.56 s | 15.10 → 13.56 s |
+| Granite dynq4 ¹ | 92.2 → 74.6 | 101.5 → 78.8 | 6.80 → 6.24 s | 16.63 → 15.13 s |
+| Voxtral q4k ¹ | 173.2 → 125.4 | 177.0 → 127.0 | 27.1 → 22.2 s | 70.0 → 55.3 s |
+
+¹ second session, after P4-7 landed (the same session re-measured
+Qwen3-0.6B 24.5 / 26.3 and MOSS 60.1 / 63.6 ms/token: unchanged).
+
+RADV (host, same fixtures): decode neutral to −3 % (0.6B 0 %, 1.7B −3 %,
+MOSS −3 %, ARK −4 %, Granite −2 %); Parakeet and Voxtral transcripts
+identical. (Three amdgpu compute-ring timeouts hit one host FLEURS batch
+mid-run — VK_ERROR_DEVICE_LOST for the remaining clips; a rerun of the
+same binary and clips was clean and is the one reported.) Energy was not measured: the phone was on AC power the whole
+session (the charge-counter method needs a discharging battery).

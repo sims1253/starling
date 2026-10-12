@@ -38,13 +38,17 @@ devices (SwiftShader, llvmpipe) are ignored.
 | `STARLING_FAST_CACHE_DIR` | where the Vulkan pipeline cache and autotuning results persist (the Android app sets it to its private model directory, never the model folder it may share with other builds) |
 | `STARLING_FAST_TUNE=1` | re-run the tile autotuner now (also on PowerVR and AMD, which otherwise ship measured defaults) |
 | `STARLING_FAST_W4U=0/1` | W4 decode GEMVs through `unpackUnorm4x8` (default on for PowerVR and AMD) |
+| `STARLING_FAST_W8U=0/1` | W8 decode GEMVs through xor 0x80 + `unpackUnorm4x8` (default on for PowerVR) |
 | `STARLING_FAST_MICRO=...` | run one isolated kernel probe at load (`bits,N,K[,reps[,rows]]` GEMV, `norm,...`, `alu,...`, `idot,...`; see `Kernels::micro`) |
 | `STARLING_FAST_TILE=BM,BN,TM,TN` / `STARLING_FAST_GEMV_ROWS=n` | override the tuned GEMM tile / GEMV rows |
+| `STARLING_FAST_GEMV_RPP=n` | minimum GEMV rows per row slot, kept at ≥ 64 workgroups (default 16 on PowerVR, off elsewhere; `0` = off) |
 | `STARLING_FAST_KSTEP=n` | audio-LLM decode tokens per submission (default 16) |
 | `STARLING_FAST_{ARK,GRANITE,VOXTRAL}_HOST_ENCODER=1` | keep that model's audio encoder on ggml; the fast engine takes its rows (decoder only) |
 | `STARLING_FAST_ATTN_SPLIT=S` | audio-LLM decode attention split into `S` KV chunks, 1–8; `0` = single pass (default 4 on AMD, 0 elsewhere) |
 | `STARLING_FAST_DEVICE=n` | Vulkan physical device index |
-| `STARLING_FAST_TIMING=1` / `STARLING_FAST_PROFILE=1` | per-stage wall times / per-kernel GPU times |
+| `STARLING_FAST_TIMING=1` / `STARLING_FAST_PROFILE=1` | per-stage wall times plus the audio-LLM decode round times (ms per step) / per-kernel GPU times |
+| `STARLING_FAST_DECODE_SKIP=qkv,attn,o,up,down,lm[,empty][,bar]` | diagnostic: drop those decode dispatches (EOS off; `empty` puts a one-workgroup no-op in their place, `bar` drops the barriers) to price each kernel class by difference |
+| `STARLING_FAST_FULL_BARRIER=1` | every recorded barrier in the wide compute+transfer form (default: scoped to the commands it orders) |
 | `STARLING_FAST_VERBOSE=1` | device, weights and tuning choices at load |
 
 ## Design
@@ -70,10 +74,17 @@ interleaving).
 **Fusion.** GEMM epilogues apply bias, activation (SiLU / ReLU / exact
 GELU), residual accumulation, GLU / SwiGLU pairs, and Parakeet's two
 positional-bias query projections. A layer's closing LayerNorm is fused with
-the next layer's first. Decode GEMVs fuse the preceding RMSNorm. MOSS decode
-attention fuses q/k RMSNorm, RoPE, the KV-cache append and the attention
-itself into one dispatch per head (on AMD, one per head and KV chunk plus a
-merge).
+the next layer's first. Decode attention fuses q/k RMSNorm, RoPE, the
+KV-cache append and the attention itself into one dispatch per head (on
+AMD, one per head and KV chunk plus a merge). Decode RMSNorms are their own
+one-workgroup dispatch: `gemv.comp` can fuse the norm, but every workgroup
+then repeats the statistic and the norm-weight loads, which measured slower
+than the extra dispatch once barriers were scoped (below).
+
+**Barriers** are recorded lazily and scoped to what they order:
+compute → compute unless a copy/fill sits on either side. On the Pixel's
+PowerVR the wide compute+transfer form cost ~35 µs per dispatch+barrier
+pair, the scoped one ~10 µs — a decode step is ~140 such pairs.
 
 **No host round trips.** The Parakeet mel runs on the CPU (bit-identical to
 the reference, 4–6× faster than the ggml CPU frontend). Everything from mel
@@ -161,8 +172,8 @@ stores the choice.
 | Shader | Role |
 | --- | --- |
 | `gemm.comp` | tiled GEMM, B = W4/W8/F16/F16ᵀ, f16-packed shared tiles, batched heads/windows, implicit-GEMM 3×3/s2 convs (MOSS), fused epilogues |
-| `gemv.comp` | decode matrix-vector, x kept in registers per K slice, fused RMSNorm, residual / SwiGLU / argmax-partial epilogues |
-| `attn_decode.comp` | fused qk-norm + RoPE + KV append + attention (one query head per workgroup) |
+| `gemv.comp` | decode matrix-vector, x kept in registers per K slice, optional fused RMSNorm, residual / SwiGLU / argmax-partial epilogues |
+| `attn_decode.comp` | fused qk-norm + RoPE + KV append + attention (one query head per workgroup; 16-byte key loads, value mix in four position groups) |
 | `attn_decode_split.comp`, `attn_split_combine.comp` | the same, split over KV chunks (one workgroup per head and chunk), then a per-head merge of the partial softmaxes |
 | `rope_kv.comp` | prefill q/k norm + RoPE + KV-cache write |
 | `enc_rope.comp` | encoder RoPE (GPT-J pairs over the first rope_dim of each head; ARK, and Voxtral with its heads interleaved at load), in place on q and k |
@@ -242,9 +253,12 @@ for PowerVR: GEMM tile 32,128,4,8 (a full 128-thread subgroup with BN = 128),
 f32 GEMM products, GEMV rows 16 pinned (measured best-or-tied at every MOSS
 decode shape — rows=8 cost 15–31 % on the small-N GEMVs whose per-workgroup
 x re-read rivals the weights; RESEARCH_LOG P1-8) with RSPLIT row slots
-padding workgroups to a whole subgroup; the CPU transducer decoder splits its
+padding workgroups to a whole subgroup, raised to at least 16 rows per row
+slot while 64 workgroups remain (rows 64 at K = 1024, 32 at K = 2048;
+RESEARCH_LOG P4-2); the CPU transducer decoder splits its
 GEMV rows across a second thread (held spinning for one transcription,
-parked in between); W4 decode GEMVs unpack nibbles with `unpackUnorm4x8`.
+parked in between); W4 decode GEMVs unpack nibbles with `unpackUnorm4x8`,
+W8 ones bytes with xor 0x80 + `unpackUnorm4x8`.
 ggml runs with the app's 6 threads. Transcripts match ggml on the fixtures;
 FLEURS en_us 100: Parakeet 5.33 % (ggml 5.47 %), MOSS q4e8 7.87 %
 (ggml 7.92 %).
@@ -290,7 +304,40 @@ sweep, fast after one warm-up, screen off with the wake hold):
 | 74.4 s | 356.5 s | **234.4 s** (first run; enc+prefill 47.5 s, 198 ms/tok × 940) |
 
 The encoder and the 39-row prefill are f32-product GEMMs (~130–200
-GFLOPS here); decode is bandwidth-bound (see the Voxtral paragraph above).
+GFLOPS here). Its decode, mostly W8 GEMVs, turned out not to be
+bandwidth-bound on this GPU: the W8 unpack below took it to ~126 ms/token.
+
+**Audio-LLM decode (2026-10-12, RESEARCH_LOG P4).** Where a step went,
+priced by `STARLING_FAST_DECODE_SKIP` ablation on Qwen3-ASR-0.6B (39.8
+ms/step): GEMVs ~33 ms (the K = 1024 ones with the fused RMSNorm at only
+15–17 G weights/s), attention 5.9 ms, and ~4 ms in 141 dispatch+barrier
+pairs at ~30 µs each. Landed, each an interleaved A/B with identical
+transcripts: 16-byte key loads and a value mix in four position groups in
+the attention; a rows-per-row-slot floor for the GEMVs; bit-exact trims of
+the GEMV reduction tail; barriers scoped to compute → compute (the wide
+compute+transfer form was most of the ~30 µs; now ~10 µs per pair);
+RMSNorm as its own dispatch instead of fused into every GEMV workgroup;
+the W8 unpack (Granite and Voxtral, whose Q5_K linears are W8). Measured
+not to pay: int8 activations with `OpSDot` (+17 % on 0.6B, +5 % on MOSS
+despite neutral FLEURS WER — on this GPU the packed dot costs the issue
+slots of the f32 dot it replaces), the flash-decode split, 2–4× threads
+per attention head, 128-row lm_head workgroups, KSTEP 32.
+
+| Model (decode ms/token, short / medium) | before | after | wall short / medium after |
+| --- | --- | --- | --- |
+| Qwen3-ASR-0.6B q4e8 | 41.9 / 48.4 | **24.3 / 26.2** | 2.15 / 5.78 s (was 2.74 / 7.92) |
+| Qwen3-ASR-1.7B q4e8-imx | 77.6 / 83.6 | **62.3 / 64.5** | 4.84 / 12.78 s (was 5.35 / 14.72) |
+| MOSS q4e8 | 71.1 / 81.0 | **60.6 / 64.1** | 5.11 / 13.14 s (was 5.45 / 14.66) |
+| ARK-0.6B q4k | 45.1 / 49.4 | **32.2 / 33.8** | 4.56 / 13.56 s (was 4.99 / 15.10) |
+| Granite dynq4 | 92.2 / 101.5 | **74.6 / 78.8** | 6.24 / 15.13 s (was 6.80 / 16.63) |
+| Voxtral q4k | 173.2 / 177.0 | **125.4 / 127.0** | 22.2 / 55.3 s (was 27.1 / 70.0) |
+
+Before = `t3/optimize-phone-model-serving` 84f53c03, after = this branch;
+interleaved in one session per model (screen off, wake hold), medians of
+4 (Voxtral: 1). Transcripts identical before/after on the phone and the
+host. Every GEMV now streams 21–30 G weights/s; what remains is the GEMV
+plateau below, not dispatch overhead. The ggml CPU engine decodes
+Qwen3-0.6B at ~22 ms/token on 6 threads.
 
 Energy per transcription (batterystats power model, 40/20-run averages,
 measured before the W4 unpack change, i.e. MOSS at 88.7 ms/token):
@@ -307,7 +354,8 @@ is advertised (f16 and int8 shapes) but the driver's shader compiler faults
 on any coopmat instruction; an unfinished coopmat GEMM was removed (commit
 b1182f2 has it). Integer dot products (`OpSDot`) do work
 (`STARLING_FAST_MICRO=idot`, needs a glslc with `GL_EXT_integer_dot_product`;
-the NDK's does not have it) — the obvious next lever for decode, at the cost
-of int8 activations. The q4e4 model file
-saves a further ~7 % decode time at +0.14 % WER (8.06 vs 7.92, inside the
+the NDK's does not have it), but int8 activations through them measured
+slower than the f32 GEMVs on both the W8 lm_head (P1-1) and the W4 linears
+(P4-3): the packed dot takes the issue slots of the `dot(vec4)` it
+replaces. The q4e4 model file saves a further ~7 % decode time at +0.14 % WER (8.06 vs 7.92, inside the
 0.2-pt gate) if maximum battery life matters more than the last word error.
