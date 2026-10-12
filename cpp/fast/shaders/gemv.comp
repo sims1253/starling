@@ -60,6 +60,8 @@ const uint RPP = ROWS / RSPLIT;          // rows per (kg, rs) thread
 shared float red[ROWS * LANES];          // row partials: [row][kg]
 shared float red2[ROWS * 32];            // 32 partials per row, then one
 shared float rowv[ROWS];
+shared float segv[8];                    // EPI 3: per-segment argmax
+shared uint segi[8];
 #if defined(GEMV_M)
 shared float redM[ROWS * LANES];         // token-1 row partials
 shared float red2M[ROWS * 32];
@@ -67,7 +69,13 @@ shared float red2M[ROWS * 32];
 
 float row_sum(uint r) {   // staged by the cooperative reduction below
     float s = 0.0;
-    for (uint i = 0; i < 32; ++i) s += red2[r * 32 + i];
+    // LANES == 32: stage 2 would copy red into red2 one element per slot
+    // (0.0 + x == x), so read the lane partials directly — same sum.
+    if (LANES == 32u) {
+        for (uint i = 0; i < 32; ++i) s += red[r * 32 + i];
+    } else {
+        for (uint i = 0; i < 32; ++i) s += red2[r * 32 + i];
+    }
     return s;
 }
 #if defined(GEMV_M)
@@ -200,6 +208,9 @@ void main() {
     [[unroll]] for (uint q = 0; q < RPP; ++q) redM[(rs + q * RSPLIT) * LANES + kg] = acc2[q];
 #endif
     barrier();
+#if !defined(GEMV_M)
+    if (LANES != 32u) {
+#endif
     for (uint u = t; u < ROWS * 32; u += LANES * RSPLIT) {
         const uint rr = u / 32, part = u % 32;
         float s = 0.0, s2 = 0.0;
@@ -211,6 +222,9 @@ void main() {
         red2[u] = s;
     }
     barrier();
+#if !defined(GEMV_M)
+    }
+#endif
     // One thread per row; strided so ROWS > WGS (small K without RSPLIT)
     // still writes every row. With ROWS <= WGS this is a single pass.
     for (uint r = t; r < ROWS; r += WGS) {
@@ -244,8 +258,34 @@ void main() {
             rowv[r] = v;
         }
     }
+    if (EPI != 3u) return;
     barrier();
-    if (EPI == 3u && t == 0u) {
+    // Argmax over the workgroup's rows (lowest index on ties): eight
+    // segment scans, then one scan of the eight — the same first maximum
+    // as one serial scan, an eighth of its serial length at ROWS = 64.
+    if (ROWS % 8u == 0u && ROWS >= 16u) {
+        const uint SEG = ROWS / 8u;
+        if (t < 8u) {
+            float best = -3.4e38;
+            uint bi = 0xffffffffu;
+            for (uint r = t * SEG; r < t * SEG + SEG; ++r) {
+                const uint n = row_base + r;
+                if (n >= p.N) break;
+                if (rowv[r] > best) { best = rowv[r]; bi = p.row0 + n; }
+            }
+            segv[t] = best;
+            segi[t] = bi;
+        }
+        barrier();
+        if (t == 0u) {
+            float best = -3.4e38;
+            uint bi = 0xffffffffu;
+            for (uint i = 0; i < 8u; ++i)
+                if (segv[i] > best) { best = segv[i]; bi = segi[i]; }
+            yu[p.y_off + 2 * gl_WorkGroupID.x] = floatBitsToUint(best);
+            yu[p.y_off + 2 * gl_WorkGroupID.x + 1] = bi;
+        }
+    } else if (t == 0u) {
         float best = -3.4e38;
         uint bi = 0xffffffffu;
         for (uint r = 0; r < ROWS; ++r) {
