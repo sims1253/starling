@@ -50,8 +50,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
+use windows_sys::core::BOOL;
 use windows_sys::Win32::Foundation::{
-    CloseHandle, DuplicateHandle, GetLastError, LocalFree, BOOL, DUPLICATE_SAME_ACCESS,
+    CloseHandle, DuplicateHandle, GetLastError, LocalFree, DUPLICATE_SAME_ACCESS,
     ERROR_BROKEN_PIPE, ERROR_FILE_NOT_FOUND, ERROR_IO_PENDING, ERROR_NO_DATA,
     ERROR_OPERATION_ABORTED, ERROR_PATH_NOT_FOUND, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED,
     ERROR_PIPE_NOT_CONNECTED, ERROR_SEM_TIMEOUT, GENERIC_READ, GENERIC_WRITE, HANDLE,
@@ -95,7 +96,7 @@ pub fn sddl_for_owner(owner_sid: &str) -> String {
 }
 
 /// A raw pipe handle wrapped for movement across threads. windows-sys
-/// 0.59's `HANDLE` is a raw pointer (not `Send` by construction), but the
+/// `HANDLE` is a raw pointer (not `Send` by construction), but the
 /// value is a kernel object identifier, not a pointer into this
 /// process's memory — Win32 calls on one handle are thread-safe.
 struct SendHandle(HANDLE);
