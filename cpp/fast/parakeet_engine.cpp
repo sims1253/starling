@@ -119,14 +119,24 @@ ParakeetEngine::~ParakeetEngine() {
 }
 
 std::unique_ptr<ParakeetEngine> ParakeetEngine::create(const pk::ParakeetModel& m, std::string& err) {
+    const auto t0 = std::chrono::steady_clock::now();
     std::shared_ptr<vk::Context> hold = vk::Context::acquire(err);
     if (!hold) return nullptr;
     vk::Context* ctx = hold.get();
     std::unique_ptr<ParakeetEngine> e(new ParakeetEngine());
     e->impl_->ctx_hold = std::move(hold);
     e->impl_->ctx = ctx;
+    const double t_ctx = ms_since(t0);
     if (!e->impl_->K.init(*ctx, err)) return nullptr;
+    const double t_kinit = ms_since(t0);
     if (!e->impl_->load(m, err)) return nullptr;
+    if (env_on("STARLING_FAST_FORCE_FAIL")) {   // tests: the ggml fallback after a full fast load
+        err = "fast parakeet: forced failure (STARLING_FAST_FORCE_FAIL)";
+        return nullptr;
+    }
+    if (env_on("STARLING_FAST_TIMING"))
+        std::fprintf(stderr, "[fast-parakeet] create: device %.1f ms, kernels %.1f ms, weights %.1f ms\n",
+                     t_ctx, t_kinit - t_ctx, ms_since(t0) - t_kinit);
     return e;
 }
 
@@ -178,12 +188,13 @@ bool ParakeetEngine::Impl::load(const pk::ParakeetModel& m, std::string& err) {
         id = (int)ar.add_f32(v);
         return true;
     };
-    PackJobs jobs;   // matrices repack in parallel before the upload
+    // Matrices are planned here and repacked in parallel, straight into
+    // device memory, by ar.finalize(); the GGUF pages they come from are
+    // dropped as they are consumed when the file is mapped.
+    ar.release_sources(ml.weights_mapped());
     auto mat = [&](const std::string& n, GMat& g) {
         const ggml_tensor* t = T(n);
-        if (!t) return false;
-        jobs.add(&g, [t](HostMatrix& hm, std::string& e) { return pack_gpu_matrix(t, hm, e); });
-        return true;
+        return t && ar.add_matrix(tensor_rows(t, n), g, err);
     };
     // Conv weights stored with leading singleton dims: view as [N][K].
     auto mat_raw = [&](const std::string& n, uint32_t N_, uint32_t K_, GMat& g) {
@@ -193,10 +204,7 @@ bool ParakeetEngine::Impl::load(const pk::ParakeetModel& m, std::string& err) {
             err = "fast parakeet: unexpected shape for " + n;
             return false;
         }
-        jobs.add(&g, [t, N_, K_](HostMatrix& hm, std::string& e) {
-            return pack_gpu_matrix_raw((int)t->type, t->data, N_, K_, hm, e);
-        });
-        return true;
+        return ar.add_matrix(raw_rows((int)t->type, t->data, N_, K_, n), g, err);
     };
 
     // ---- subsampling ----
@@ -243,16 +251,16 @@ bool ParakeetEngine::Impl::load(const pk::ParakeetModel& m, std::string& err) {
         // Pointwise conv 1 with GLU halves interleaved: row 2j = a_j, 2j+1 = gate_j,
         // so the GEMM epilogue owns both halves of every GLU pair.
         {
-            const ggml_tensor* t = T(p + "conv.pointwise_conv1.weight");
+            const std::string n = p + "conv.pointwise_conv1.weight";
+            const ggml_tensor* t = T(n);
             if (!t) return false;
-            const uint32_t Dd = D;
-            jobs.add(&Y.pw1, [t, Dd](HostMatrix& hm, std::string& e) {
-                if (!pack_gpu_matrix_raw((int)t->type, t->data, 2 * Dd, Dd, hm, e)) return false;
-                std::vector<uint32_t> order(2 * Dd);
-                for (uint32_t j = 0; j < Dd; ++j) { order[2 * j] = j; order[2 * j + 1] = j + Dd; }
-                permute_rows(hm, order);
-                return true;
-            });
+            if ((uint64_t)ggml_nelements(t) != (uint64_t)2 * D * D) {
+                err = "fast parakeet: unexpected shape for " + n;
+                return false;
+            }
+            const MatSpec all = raw_rows((int)t->type, t->data, 2 * D, D, n);
+            if (!ar.add_matrix(spec_interleave(row_range(all, 0, D), row_range(all, D, D)), Y.pw1, err))
+                return false;
             if (has(p + "conv.pointwise_conv1.bias")) {
                 std::vector<float> b, bi(2 * D);
                 if (!f32(p + "conv.pointwise_conv1.bias", b)) return false;
@@ -323,7 +331,6 @@ bool ParakeetEngine::Impl::load(const pk::ParakeetModel& m, std::string& err) {
         if (jout.N != V1 + n_dur || jpred.N != JH) { err = "fast parakeet: joint shape mismatch"; return false; }
     }
 
-    if (!jobs.run(ar, err)) return false;
     // The stage-3 pointwise conv is the A operand of a GEMM: it must be f16.
     if (c6_pw.fmt != GpuFmt::F16) { err = "fast parakeet: pre_encode.conv.6 must be float"; return false; }
     if (out_w.K != SC * (uint32_t)stage_len(stage_len(stage_len((int)NM))) || out_w.N != D) {
@@ -334,7 +341,8 @@ bool ParakeetEngine::Impl::load(const pk::ParakeetModel& m, std::string& err) {
     const double t_pack = ms_since(t_load0);
     if (!ar.finalize(*ctx, err)) return false;
     if (env_on("STARLING_FAST_TIMING"))
-        std::fprintf(stderr, "[fast-parakeet] load: repack %.1f ms, upload %.1f ms\n", t_pack, ms_since(t_load0) - t_pack);
+        std::fprintf(stderr, "[fast-parakeet] load: plan %.1f ms, repack+upload %.1f ms\n", t_pack,
+                     ms_since(t_load0) - t_pack);
     if (env_on("STARLING_FAST_VERBOSE"))
         std::fprintf(stderr, "[fast] parakeet: %u layers, weights %.1f MiB on '%s', decoder %s\n", L,
                      ar.total_bytes() / 1048576.0, ctx->info().name.c_str(), cpu::isa_name());

@@ -310,23 +310,6 @@ struct ChunkedMat {
     GpuFmt fmt = GpuFmt::W8;
 };
 
-// Split `m` into chunks of at most `rows` rows.
-std::vector<HostMatrix> split_rows(HostMatrix&& m, uint32_t rows) {
-    std::vector<HostMatrix> out;
-    const size_t qw = m.q.size() / m.N, sw = m.s.empty() ? 0 : m.s.size() / m.N,
-                 xw = m.x.empty() ? 0 : m.x.size() / m.N;
-    for (uint32_t r0 = 0; r0 < m.N; r0 += rows) {
-        const uint32_t n = std::min(rows, m.N - r0);
-        HostMatrix c;
-        c.fmt = m.fmt; c.N = n; c.K = m.K; c.lossless = m.lossless; c.layout = m.layout;
-        c.q.assign(m.q.begin() + (size_t)r0 * qw, m.q.begin() + (size_t)(r0 + n) * qw);
-        if (sw) c.s.assign(m.s.begin() + (size_t)r0 * sw, m.s.begin() + (size_t)(r0 + n) * sw);
-        if (xw) c.x.assign(m.x.begin() + (size_t)r0 * xw, m.x.begin() + (size_t)(r0 + n) * xw);
-        out.push_back(std::move(c));
-    }
-    return out;
-}
-
 } // namespace
 
 struct AudioLlmEngine::Impl {
@@ -485,13 +468,27 @@ AudioLlmEngine::~AudioLlmEngine() {
 
 namespace {
 std::unique_ptr<AudioLlmEngine::Impl> make_impl(Spec sp, const ggml::ModelLoader& ml, std::string& err) {
+    const auto t0 = std::chrono::steady_clock::now();
     std::shared_ptr<vk::Context> hold = vk::Context::acquire(err);
     if (!hold) return nullptr;
     auto I = std::make_unique<AudioLlmEngine::Impl>();
     I->ctx = hold.get();
     I->ctx_hold = std::move(hold);
     I->sp = std::move(sp);
-    if (!I->K.init(*I->ctx, err) || !I->load(ml, err) || !I->alloc_static(err)) return nullptr;
+    const double t_ctx = ms_since(t0);
+    if (!I->K.init(*I->ctx, err)) return nullptr;
+    const double t_kinit = ms_since(t0);
+    if (!I->load(ml, err)) return nullptr;
+    const double t_weights = ms_since(t0);
+    if (!I->alloc_static(err)) return nullptr;
+    if (env_on("STARLING_FAST_FORCE_FAIL")) {   // tests: the ggml fallback after a full fast load
+        err = "fast " + std::string(I->sp.tag) + ": forced failure (STARLING_FAST_FORCE_FAIL)";
+        return nullptr;
+    }
+    if (env_on("STARLING_FAST_TIMING"))
+        std::fprintf(stderr, "[fast-%s] create: device %.1f ms, kernels %.1f ms, weights %.1f ms, "
+                             "static buffers %.1f ms\n", I->sp.tag, t_ctx, t_kinit - t_ctx,
+                     t_weights - t_kinit, ms_since(t0) - t_weights);
     return I;
 }
 } // namespace
@@ -628,11 +625,10 @@ bool AudioLlmEngine::Impl::load(const ggml::ModelLoader& ml, std::string& err) {
         id = ar.add_f32(v);
         return true;
     };
-    auto host_mat = [&](const std::string& n, HostMatrix& hm) {
-        const ggml_tensor* t = T(n);
-        return t && pack_gpu_matrix(t, hm, err);
-    };
-    PackJobs jobs;   // matrices repack in parallel before the upload
+    // Matrices are planned here and repacked in parallel, straight into
+    // device memory, by ar.finalize(); the GGUF pages they come from are
+    // dropped as they are consumed when the file is mapped.
+    ar.release_sources(ml.weights_mapped());
     // STARLING_FAST_PACKED=path overrides GGUF repacking for the tensors the
     // file contains (#319): source-quantized weights load straight into the
     // arena. Shapes are validated against the GGUF so a file built for a
@@ -646,58 +642,33 @@ bool AudioLlmEngine::Impl::load(const ggml::ModelLoader& ml, std::string& err) {
                      packed->size(), packed->bytes() / 1e6, packed->rounding().c_str(),
                      packed->source_hash().c_str());
     }
-    auto pack_one = [&](const std::string& n, const ggml_tensor* t, HostMatrix& hm,
-                         std::string& e) {
-        if (packed && packed->has(n)) {
-            if (!packed->matrix(n, hm, e)) return false;
-            const uint32_t want_n = (uint32_t)(ggml_nelements(t) / t->ne[0]);
-            if (hm.K != (uint32_t)t->ne[0] || hm.N != want_n) {
-                e = n + ": packed shape " + std::to_string(hm.N) + "x" + std::to_string(hm.K) +
-                    " != GGUF " + std::to_string(want_n) + "x" + std::to_string(t->ne[0]);
-                return false;
-            }
-            return true;
-        }
-        return pack_gpu_matrix(t, hm, e);
-    };
-    auto mat = [&](const std::string& n, GMat& g) {
+    // The rows of tensor `n` (from the packed file when it has them).
+    auto rows_of = [&](const std::string& n, MatSpec& m) {
         const ggml_tensor* t = T(n);
         if (!t) return false;
-        jobs.add(&g, [&, t, n](HostMatrix& hm, std::string& e) {
-            return pack_one(n, t, hm, e);
-        });
+        m = tensor_rows(t, n);
+        if (packed && packed->has(n)) {
+            const PackedTensor* pt = packed->find(n);
+            if (pt->K != m.K || pt->N != m.N) {
+                err = n + ": packed shape " + std::to_string(pt->N) + "x" + std::to_string(pt->K) +
+                      " != GGUF " + std::to_string(m.N) + "x" + std::to_string(m.K);
+                return false;
+            }
+            m.parts[0].packed = pt;
+        }
         return true;
     };
-    // Fused row groups need one format: when the parts come in different
-    // types (Granite: Q5_K gate -> W8, Q4_K up -> W4), the others are
-    // repacked to W8.
-    using Part = std::pair<const ggml_tensor*, HostMatrix*>;
-    auto same_fmt = [](std::initializer_list<Part> parts, std::string& e) {
-        bool mixed = false;
-        for (const Part& p : parts) mixed |= p.second->fmt != parts.begin()->second->fmt;
-        if (!mixed) return true;
-        for (const Part& p : parts)
-            if (p.second->fmt != GpuFmt::W8 && !pack_gpu_matrix_w8(p.first, *p.second, e)) return false;
-        return true;
+    auto mat = [&](const std::string& n, GMat& g) {
+        MatSpec m;
+        return rows_of(n, m) && ar.add_matrix(std::move(m), g, err);
     };
     // Rows of `b` interleaved with rows of `a` (a0 b0 a1 b1 ...): the paired
-    // GEMM/GEMV epilogues own both halves of each gated unit.
+    // GEMM/GEMV epilogues own both halves of each gated unit. Parts of
+    // different formats (Granite: Q5_K gate -> W8, Q4_K up -> W4) are all
+    // repacked to W8 (plan_matrix).
     auto interleave = [&](const std::string& a, const std::string& b, GMat& g) {
-        const ggml_tensor* ta = T(a);
-        const ggml_tensor* tb = T(b);
-        if (!ta || !tb) return false;
-        jobs.add(&g, [&, ta, tb, a, b](HostMatrix& ha, std::string& e) {
-            HostMatrix hb;
-            if (!pack_one(a, ta, ha, e) || !pack_one(b, tb, hb, e) || !same_fmt({{ta, &ha}, {tb, &hb}}, e))
-                return false;
-            const uint32_t n = ha.N;
-            if (!concat_rows(ha, hb, e)) return false;
-            std::vector<uint32_t> order(2 * n);
-            for (uint32_t j = 0; j < n; ++j) { order[2 * j] = j; order[2 * j + 1] = n + j; }
-            permute_rows(ha, order);
-            return true;
-        });
-        return true;
+        MatSpec ma, mb;
+        return rows_of(a, ma) && rows_of(b, mb) && ar.add_matrix(spec_interleave(std::move(ma), mb), g, err);
     };
 
     if (sp.encoder) {
@@ -716,35 +687,42 @@ bool AudioLlmEngine::Impl::load(const ggml::ModelLoader& ml, std::string& err) {
             !vec_id("enc.conv2.bias", c2_b) || !vec_id("enc.conv3.bias", c3_b))
             return false;
         // conv2/conv3 as implicit GEMMs: [oc][(kt*3 + kf)*cin + ic], f16.
+        // (Reordered and converted during ar.finalize, in parallel.)
         for (int ci = 2; ci <= 3; ++ci) {
-            std::vector<float> w;
-            if (!f32("enc.conv" + std::to_string(ci) + ".weight", w)) return false;
-            if (w.size() != (size_t)DS * DS * 9) { err = "fast " + tag + ": conv shape"; return false; }
-            std::vector<float> r((size_t)DS * 9 * DS);
-            for (uint32_t oc = 0; oc < DS; ++oc)
-                for (uint32_t ic = 0; ic < DS; ++ic)
-                    for (uint32_t kf = 0; kf < 3; ++kf)          // ggml kh (frequency)
-                        for (uint32_t kt = 0; kt < 3; ++kt)      // ggml kw (time)
-                            r[(size_t)oc * 9 * DS + (kt * 3 + kf) * DS + ic] =
-                                w[(((size_t)oc * DS + ic) * 3 + kf) * 3 + kt];
-            HostMatrix hm;
-            if (!pack_gpu_matrix_raw(GGML_TYPE_F32, r.data(), DS, 9 * DS, hm, err)) return false;
-            (ci == 2 ? c2 : c3) = arena_matrix(ar, std::move(hm));
+            const ggml_tensor* t = T("enc.conv" + std::to_string(ci) + ".weight");
+            if (!t) return false;
+            if ((size_t)ggml_nelements(t) != (size_t)DS * DS * 9) { err = "fast " + tag + ": conv shape"; return false; }
+            const uint32_t ds = DS;
+            (ci == 2 ? c2 : c3) = deferred_f16(ar, DS, 9 * DS, [t, ds](std::vector<float>& r, std::string& e) {
+                std::vector<float> w;
+                if (!tensor_to_f32(t, w, e)) return false;
+                r.resize((size_t)ds * 9 * ds);
+                for (uint32_t oc = 0; oc < ds; ++oc)
+                    for (uint32_t ic = 0; ic < ds; ++ic)
+                        for (uint32_t kf = 0; kf < 3; ++kf)          // ggml kh (frequency)
+                            for (uint32_t kt = 0; kt < 3; ++kt)      // ggml kw (time)
+                                r[(size_t)oc * 9 * ds + (kt * 3 + kf) * ds + ic] =
+                                    w[(((size_t)oc * ds + ic) * 3 + kf) * 3 + kt];
+                return true;
+            });
         }
         // conv_out: columns reordered from ggml's (f + 16*c) to our (f*480 + c).
         {
-            std::vector<float> w;
-            if (!f32(sp.conv_out, w)) return false;
-            const uint32_t Kc = 16 * DS;
-            if (w.size() != (size_t)ED * Kc) { err = "fast " + tag + ": conv_out shape"; return false; }
-            std::vector<float> r(w.size());
-            for (uint32_t n = 0; n < ED; ++n)
-                for (uint32_t f = 0; f < 16; ++f)
-                    for (uint32_t c = 0; c < DS; ++c)
-                        r[(size_t)n * Kc + f * DS + c] = w[(size_t)n * Kc + f + 16 * c];
-            HostMatrix hm;
-            if (!pack_gpu_matrix_raw(GGML_TYPE_F32, r.data(), ED, Kc, hm, err)) return false;
-            cout = arena_matrix(ar, std::move(hm));
+            const ggml_tensor* t = T(sp.conv_out);
+            if (!t) return false;
+            const uint32_t Kc = 16 * DS, ds = DS;
+            if ((size_t)ggml_nelements(t) != (size_t)ED * Kc) { err = "fast " + tag + ": conv_out shape"; return false; }
+            cout = deferred_f16(ar, ED, Kc, [t, Kc, ds](std::vector<float>& r, std::string& e) {
+                std::vector<float> w;
+                if (!tensor_to_f32(t, w, e)) return false;
+                r.resize(w.size());
+                const size_t rows = w.size() / Kc;
+                for (size_t n = 0; n < rows; ++n)
+                    for (uint32_t f = 0; f < 16; ++f)
+                        for (uint32_t c = 0; c < ds; ++c)
+                            r[n * Kc + f * ds + c] = w[n * Kc + f + 16 * c];
+                return true;
+            });
         }
         {
             std::vector<float> pe;
@@ -780,18 +758,22 @@ bool AudioLlmEngine::Impl::load(const ggml::ModelLoader& ml, std::string& err) {
     // [OC][k * IC + ic]: the stems (ARK, Voxtral) convolve time-major
     // activations, whose three input rows of an output are one contiguous
     // run of 3*IC.
+    // (Reordered and converted during ar.finalize, in parallel.)
     auto conv = [&](const char* n, uint32_t IC, GMat& g, Arena::Id& b) {
-        std::vector<float> w;
-        if (!f32(std::string(n) + ".weight", w) || !vec_id(std::string(n) + ".bias", b)) return false;
-        if (w.size() != (size_t)ED * IC * 3) { err = "fast " + tag + ": " + n + " shape"; return false; }
-        std::vector<float> r(w.size());
-        for (uint32_t oc = 0; oc < ED; ++oc)
-            for (uint32_t ic = 0; ic < IC; ++ic)
-                for (uint32_t k = 0; k < 3; ++k)
-                    r[(size_t)oc * 3 * IC + k * IC + ic] = w[((size_t)oc * IC + ic) * 3 + k];
-        HostMatrix hm;
-        if (!pack_gpu_matrix_raw(GGML_TYPE_F32, r.data(), ED, 3 * IC, hm, err)) return false;
-        g = arena_matrix(ar, std::move(hm));
+        const ggml_tensor* t = T(std::string(n) + ".weight");
+        if (!t || !vec_id(std::string(n) + ".bias", b)) return false;
+        if ((size_t)ggml_nelements(t) != (size_t)ED * IC * 3) { err = "fast " + tag + ": " + n + " shape"; return false; }
+        const uint32_t ed = ED;
+        g = deferred_f16(ar, ED, 3 * IC, [t, ed, IC](std::vector<float>& r, std::string& e) {
+            std::vector<float> w;
+            if (!tensor_to_f32(t, w, e)) return false;
+            r.resize(w.size());
+            for (uint32_t oc = 0; oc < ed; ++oc)
+                for (uint32_t ic = 0; ic < IC; ++ic)
+                    for (uint32_t k = 0; k < 3; ++k)
+                        r[(size_t)oc * 3 * IC + k * IC + ic] = w[((size_t)oc * IC + ic) * 3 + k];
+            return true;
+        });
         return true;
     };
 
@@ -842,15 +824,10 @@ bool AudioLlmEngine::Impl::load(const ggml::ModelLoader& ml, std::string& err) {
                 order[h * EHD + 2 * i + 1] = h * EHD + half + i;
             }
         auto rope_mat = [&](const std::string& n, GMat& g) {
-            const ggml_tensor* t = T(n);
-            if (!t) return false;
-            jobs.add(&g, [&, t, n, order](HostMatrix& hm, std::string& e) {
-                if (!pack_one(n, t, hm, e)) return false;
-                if (hm.N != order.size()) { e = n + ": unexpected row count"; return false; }
-                permute_rows(hm, order);
-                return true;
-            });
-            return true;
+            MatSpec m;
+            if (!rows_of(n, m)) return false;
+            if (m.N != order.size()) { err = n + ": unexpected row count"; return false; }
+            return ar.add_matrix(spec_permute(std::move(m), order), g, err);
         };
         enc.resize(EL);
         for (uint32_t l = 0; l < EL; ++l) {
@@ -924,16 +901,13 @@ bool AudioLlmEngine::Impl::load(const ggml::ModelLoader& ml, std::string& err) {
             // conv_up with the GLU halves interleaved (row 2j = a_j, 2j+1 =
             // gate_j) so the GEMM epilogue owns both halves of every pair.
             {
-                const ggml_tensor* t = T(p + "conv_up.weight");
+                const std::string n = p + "conv_up.weight";
+                const ggml_tensor* t = T(n);
                 if (!t) return false;
-                jobs.add(&Y.conv_up, [t, CI](HostMatrix& hm, std::string& e) {
-                    if (!pack_gpu_matrix(t, hm, e)) return false;
-                    if (hm.N != 2 * CI) { e = "conv_up rows"; return false; }
-                    std::vector<uint32_t> order(2 * CI);
-                    for (uint32_t j = 0; j < CI; ++j) { order[2 * j] = j; order[2 * j + 1] = j + CI; }
-                    permute_rows(hm, order);
-                    return true;
-                });
+                const MatSpec all = tensor_rows(t, n);
+                if (all.N != 2 * CI) { err = "conv_up rows"; return false; }
+                if (!ar.add_matrix(spec_interleave(row_range(all, 0, CI), row_range(all, CI, CI)), Y.conv_up, err))
+                    return false;
                 std::vector<float> b, bi(2 * CI);
                 if (!f32(p + "conv_up.bias", b)) return false;
                 if (b.size() != 2 * CI) { err = "fast " + tag + ": conv_up bias shape"; return false; }
@@ -964,10 +938,12 @@ bool AudioLlmEngine::Impl::load(const ggml::ModelLoader& ml, std::string& err) {
             }
             // Shaw table [CS][CS][D] (query pos, key pos, dim) as f16.
             {
-                std::vector<float> r;
-                if (!f32(p + "rel_pos_bias", r)) return false;
-                if (r.size() != (size_t)CS * CS * EHD) { err = "fast " + tag + ": rel_pos_bias shape"; return false; }
-                Y.rel = ar.add(pack_f16(r.data(), r.size()));
+                const ggml_tensor* t = T(p + "rel_pos_bias");
+                if (!t) return false;
+                if ((size_t)ggml_nelements(t) != (size_t)CS * CS * EHD) { err = "fast " + tag + ": rel_pos_bias shape"; return false; }
+                Y.rel = deferred_f16(ar, CS * CS, EHD, [t](std::vector<float>& r, std::string& e) {
+                    return tensor_to_f32(t, r, e);
+                }).q;
             }
         }
         if (sp.g_mid && (!mat("enc.out.weight", ctc_out) || !vec_id("enc.out.bias", ctc_out_b) ||
@@ -1050,28 +1026,21 @@ bool AudioLlmEngine::Impl::load(const ggml::ModelLoader& ml, std::string& err) {
     for (uint32_t l = 0; l < NL; ++l) {
         LlmLayer& Y = llm[l];
         const std::string p = "llm.blk." + std::to_string(l) + ".";
-        const ggml_tensor* tq = T(p + "attn.q.weight");
-        const ggml_tensor* tk = T(p + "attn.k.weight");
-        const ggml_tensor* tv = T(p + "attn.v.weight");
-        if (!tq || !tk || !tv) return false;
-        jobs.add(&Y.qkv, [&, tq, tk, tv, p](HostMatrix& q, std::string& e) {
-            HostMatrix k, v;
-            return pack_one(p + "attn.q.weight", tq, q, e) &&
-                   pack_one(p + "attn.k.weight", tk, k, e) &&
-                   pack_one(p + "attn.v.weight", tv, v, e) &&
-                   same_fmt({{tq, &q}, {tk, &k}, {tv, &v}}, e) &&
-                   concat_rows(q, k, e) && concat_rows(q, v, e);
-        });
+        {
+            MatSpec q, k, v;
+            if (!rows_of(p + "attn.q.weight", q) || !rows_of(p + "attn.k.weight", k) ||
+                !rows_of(p + "attn.v.weight", v) ||
+                !ar.add_matrix(spec_concat(spec_concat(std::move(q), k), v), Y.qkv, err))
+                return false;
+        }
         // Granite's residual multiplier scales both residual branches: folded
         // into the o and down projections (their outputs feed only the
         // residual adds).
         auto resid_mat = [&](const std::string& n, GMat& g) {
-            const ggml_tensor* t = T(n);
-            if (!t) return false;
-            jobs.add(&g, [&, t, n](HostMatrix& hm, std::string& e) {
-                return pack_one(n, t, hm, e) && (sp.resid_mult == 1.0f || scale_matrix(hm, sp.resid_mult, e));
-            });
-            return true;
+            MatSpec m;
+            if (!rows_of(n, m)) return false;
+            m.scale = sp.resid_mult;
+            return ar.add_matrix(std::move(m), g, err);
         };
         if (!resid_mat(p + "attn.o.weight", Y.o) ||
             !interleave(p + "ffn.gate.weight", p + "ffn.up.weight", Y.gateup) ||
@@ -1095,68 +1064,37 @@ bool AudioLlmEngine::Impl::load(const ggml::ModelLoader& ml, std::string& err) {
         }
     }
     if (!vec_id("llm.final_norm.weight", final_norm)) return false;
-    // Embedding table (and an untied lm_head): repacked in row blocks
-    // (parallel), then regrouped into chunks that each fit one storage-buffer
-    // binding. Granite's embedding multiplier is folded into the input table.
+    // Embedding table (and an untied lm_head): row chunks that each fit one
+    // storage-buffer binding (multiples of 8192 rows). Granite's embedding
+    // multiplier is folded into the input table.
     const uint32_t emb_block = 8192;
-    struct Table { std::string name; ChunkedMat* dst; float scale; std::vector<HostMatrix> blocks; };
-    std::vector<Table> tables;
-    tables.reserve(2);   // the repack jobs hold pointers into `blocks`
-    tables.push_back({"llm.embed.weight", &embed, sp.emb_mult, {}});
-    if (!sp.lm_head.empty()) tables.push_back({sp.lm_head, &head, 1.0f, {}});
+    struct Table { std::string name; ChunkedMat* dst; float scale; };
+    std::vector<Table> tables{{"llm.embed.weight", &embed, sp.emb_mult}};
+    if (!sp.lm_head.empty()) tables.push_back({sp.lm_head, &head, 1.0f});
     for (Table& tb : tables) {
-        const ggml_tensor* te = T(tb.name);
-        if (!te) return false;
-        const uint32_t N = (uint32_t)te->ne[1], Kc = (uint32_t)te->ne[0];
+        MatSpec whole;
+        if (!rows_of(tb.name, whole)) return false;
+        const uint32_t N = whole.N, Kc = whole.K;
         if (N == 0 || Kc != HD) { err = "fast " + tag + ": " + tb.name + " shape mismatch"; return false; }
-        if (packed && packed->has(tb.name)) {
-            HostMatrix whole;
-            if (!packed->matrix(tb.name, whole, err)) return false;
-            if (whole.K != Kc || whole.N != N) {
-                err = tb.name + ": packed shape " + std::to_string(whole.N) + "x" +
-                      std::to_string(whole.K) + " != GGUF " + std::to_string(N) + "x" + std::to_string(Kc);
-                return false;
-            }
-            // Same 8192-row blocks the GGUF path repacks in.
-            tb.blocks = split_rows(std::move(whole), emb_block);
-            if (tb.scale != 1.0f)
-                for (HostMatrix& b : tb.blocks)
-                    if (!scale_matrix(b, tb.scale, err)) return false;
-        } else {
-            const size_t rb = ggml_row_size(te->type, Kc);
-            const float scale = tb.scale;
-            tb.blocks.resize((N + emb_block - 1) / emb_block);
-            for (size_t b = 0; b < tb.blocks.size(); ++b) {
-                const uint32_t r0 = (uint32_t)b * emb_block, n = std::min(emb_block, N - r0);
-                jobs.add_host(&tb.blocks[b], [te, r0, n, Kc, rb, scale](HostMatrix& hm, std::string& e) {
-                    return pack_gpu_matrix_raw((int)te->type, (const uint8_t*)te->data + (size_t)r0 * rb, n, Kc, hm, e) &&
-                           (scale == 1.0f || scale_matrix(hm, scale, e));
-                });
-            }
-        }
-    }
-    if (!jobs.run(ar, err)) return false;
-    for (Table& tb : tables) {
         ChunkedMat& cm = *tb.dst;
-        std::vector<HostMatrix>& blocks = tb.blocks;
-        cm.K = blocks[0].K; cm.fmt = blocks[0].fmt;
-        cm.N = 0;
-        for (const HostMatrix& b : blocks) cm.N += b.N;
-        const size_t row_bytes = (blocks[0].q.size() + blocks[0].s.size()) * 4 / blocks[0].N;
+        LayoutDesc layout;
+        MatSpec probe = whole;
+        if (!plan_matrix(probe, cm.fmt, layout, err)) return false;
+        cm.K = Kc;
+        cm.N = N;
+        const size_t row_bytes = ((size_t)q_row_words(cm.fmt, Kc) + s_row_words(cm.fmt, Kc)) * 4;
         const VkDeviceSize cap = std::min<VkDeviceSize>(256ull << 20, ctx->info().max_storage_range);
         cm.chunk_rows = (uint32_t)std::max<size_t>(emb_block, (cap / row_bytes) / emb_block * emb_block);
         if (((size_t)cm.N + cm.chunk_rows - 1) / cm.chunk_rows > 4) {
             err = "fast " + tag + ": " + tb.name + " needs more than 4 buffer chunks on this device";
             return false;
         }
-        const size_t per_chunk = cm.chunk_rows / emb_block;
-        for (size_t b0 = 0; b0 < blocks.size(); b0 += per_chunk) {
-            HostMatrix c = std::move(blocks[b0]);
-            for (size_t b = b0 + 1; b < std::min(blocks.size(), b0 + per_chunk); ++b)
-                if (!concat_rows(c, blocks[b], err)) return false;
-            cm.parts.push_back(arena_matrix(ar, std::move(c)));
+        for (uint32_t r0 = 0; r0 < N; r0 += cm.chunk_rows) {
+            MatSpec c = row_range(whole, r0, std::min(cm.chunk_rows, N - r0));
+            c.scale = tb.scale;
+            cm.parts.emplace_back();
+            if (!ar.add_matrix(std::move(c), cm.parts.back(), err)) return false;
         }
-        std::vector<HostMatrix>().swap(blocks);
     }
     if (sp.lm_head.empty()) head = embed;
     // Suppressed ids (ARK 0.6B: every special and codec id but EOS) get a
@@ -1188,7 +1126,7 @@ bool AudioLlmEngine::Impl::load(const ggml::ModelLoader& ml, std::string& err) {
     const double t_pack = ms_since(t_load0);
     if (!ar.finalize(*ctx, err)) return false;
     if (env_on("STARLING_FAST_TIMING"))
-        std::fprintf(stderr, "[fast-%s] load: repack %.1f ms, upload %.1f ms\n", sp.tag, t_pack,
+        std::fprintf(stderr, "[fast-%s] load: plan %.1f ms, repack+upload %.1f ms\n", sp.tag, t_pack,
                      ms_since(t_load0) - t_pack);
     if (env_on("STARLING_FAST_VERBOSE"))
         std::fprintf(stderr, "[fast] %s: weights %.1f MiB on '%s' (embed %s, %zu chunk(s)%s%s)\n", sp.tag,

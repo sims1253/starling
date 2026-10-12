@@ -122,6 +122,7 @@ struct DeviceInfo {
     uint32_t max_wg_invocations = 0;
     uint64_t max_storage_range = 0;      // maxStorageBufferRange
     uint64_t min_storage_align = 0;      // minStorageBufferOffsetAlignment
+    uint64_t non_coherent_atom = 1;      // nonCoherentAtomSize
     uint64_t max_alloc = 0;              // maxMemoryAllocationSize (0 = unknown)
     double timestamp_period_ns = 0.0;    // 0 = timestamps unsupported
     bool f16 = false;                    // shaderFloat16 enabled on the device
@@ -279,6 +280,9 @@ public:
     // Host <-> device copies (staged unless the buffer is mapped).
     bool upload(Buffer& dst, VkDeviceSize off, const void* src, size_t bytes, std::string& err);
     bool download(const Buffer& src, VkDeviceSize off, void* dst, size_t bytes, std::string& err);
+    // Make host writes to [off, off + bytes) of a mapped, non-coherent
+    // buffer visible to the device (no-op for coherent or unmapped memory).
+    void flush(const Buffer& dst, VkDeviceSize off, VkDeviceSize bytes);
 
     // Pipeline for `shader` specialized with `spec` (constant_id i = spec[i]).
     // Cached; the pointer stays valid for the context's lifetime.

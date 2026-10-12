@@ -242,6 +242,7 @@ bool Context::init(std::string& err) {
     info_.max_wg_invocations = props.limits.maxComputeWorkGroupInvocations;
     info_.max_storage_range = props.limits.maxStorageBufferRange;
     info_.min_storage_align = props.limits.minStorageBufferOffsetAlignment;
+    info_.non_coherent_atom = std::max<uint64_t>(props.limits.nonCoherentAtomSize, 1);
     info_.max_alloc = m3.maxMemoryAllocationSize;
 
     uint32_t n_qf = 0;
@@ -432,6 +433,17 @@ bool Context::init(std::string& err) {
             VK_VERSION_MINOR(info_.api_version), info_.subgroup_size,
             info_.max_shared_bytes, (unsigned long long)info_.max_storage_range,
             info_.uma ? 1 : 0, info_.uma_cached ? "(cached)" : "", info_.f16 ? 1 : 0, qfam_);
+    if (env_on("STARLING_FAST_VERBOSE"))
+        for (uint32_t i = 0; i < memprops_.memoryTypeCount; ++i) {
+            const VkMemoryPropertyFlags f = memprops_.memoryTypes[i].propertyFlags;
+            const uint32_t h = memprops_.memoryTypes[i].heapIndex;
+            std::fprintf(stderr, "[fast] memory type %u: heap %u (%llu MiB)%s%s%s%s\n", i, h,
+                         (unsigned long long)(memprops_.memoryHeaps[h].size >> 20),
+                         (f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) ? " device-local" : "",
+                         (f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) ? " host-visible" : "",
+                         (f & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) ? " coherent" : "",
+                         (f & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) ? " cached" : "");
+        }
     return true;
 }
 
@@ -682,17 +694,26 @@ bool Context::ensure_staging(VkDeviceSize bytes, std::string& err) {
     return true;
 }
 
+void Context::flush(const Buffer& dst, VkDeviceSize off, VkDeviceSize bytes) {
+    if (!dst.host || dst.coherent || bytes == 0) return;
+    // Whole atoms only; a range reaching the buffer's end runs to the end of
+    // the allocation (which may be larger than the buffer).
+    const VkDeviceSize atom = info_.non_coherent_atom;
+    VkMappedMemoryRange mr{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
+    mr.memory = dst.mem;
+    mr.offset = off / atom * atom;
+    const VkDeviceSize end = (off + bytes + atom - 1) / atom * atom;
+    mr.size = end >= dst.size ? VK_WHOLE_SIZE : end - mr.offset;
+    fn_.vkFlushMappedMemoryRanges(dev_, 1, &mr);
+}
+
 bool Context::upload(Buffer& dst, VkDeviceSize off, const void* src, size_t bytes, std::string& err) {
     if (wedged_) { err = wedged_why(); return false; }   // #325: fail fast once wedged
     if (bytes == 0) return true;
     if (off + bytes > dst.size) { err = "upload out of range"; return false; }
     if (dst.host) {
         std::memcpy((char*)dst.host + off, src, bytes);
-        if (!dst.coherent) {
-            VkMappedMemoryRange mr{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
-            mr.memory = dst.mem; mr.offset = 0; mr.size = VK_WHOLE_SIZE;
-            fn_.vkFlushMappedMemoryRanges(dev_, 1, &mr);
-        }
+        flush(dst, off, bytes);
         return true;
     }
     std::lock_guard<std::mutex> lk(queue_mu_);
