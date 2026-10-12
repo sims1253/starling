@@ -9,9 +9,9 @@
 //! running take is never moved to another device; one that disappears
 //! mid-take surfaces as a fatal [`crate::recorder::RecorderFault`].
 //!
-//! Device identity is the host's device name: cpal 0.15 exposes no stable
-//! device id, so two devices reporting the same name resolve to the first
-//! one listed.
+//! Device identity is currently the host's device name, so two devices
+//! reporting the same name resolve to the first one listed. CPAL 0.17
+//! exposes stable IDs; adopting them requires migrating saved preferences.
 
 use cpal::traits::{DeviceTrait, HostTrait};
 
