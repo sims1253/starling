@@ -3,7 +3,12 @@
 // alu2_probe.comp — register-tiled FMA issue-rate probe (no memory traffic
 // in the loop): an RA x RB outer product of register operands per
 // iteration, the GEMM's inner-loop shape, against alu_probe's
-// accumulator-only chains. MODE 0: scalar FMAs; 1: vec4 FMAs.
+// accumulator-only chains. MODE 0: scalar FMAs; 1: vec4 FMAs; 2: b constant;
+// 3: a uniform. MODE 4/5 load the operands from shared memory every
+// iteration with gemm.comp's 32x128 / 4x8 addressing (k = it % 32; thread
+// (tm, tn) = (t % 8, t / 8)): 4 as f32 words, 5 as packed f16 pairs through
+// unpackHalf2x16 (exactly the product loop; needs SH >= 5120 / 2560);
+// 6/7: B as 4-bit codes in shared (see below).
 layout(constant_id = 0) const uint RA = 4;
 layout(constant_id = 1) const uint RB = 8;
 layout(constant_id = 2) const uint MODE = 0;
@@ -30,7 +35,39 @@ void main() {
     }
     vec4 acc[RA * RB / 4];
     [[unroll]] for (uint i = 0; i < RA * RB / 4; ++i) acc[i] = vec4(float(i));
+    const uint tm = t % 8u, tn = t / 8u;
+    vec4 sc[2], of[2];
+    [[unroll]] for (uint j = 0; j < 2u; ++j) { sc[j] = b[j] * 0.01; of[j] = b[j] * -0.1; }
     for (uint it = 0; it < p.iters; ++it) {
+        if (MODE == 4u && RA == 4u && RB == 8u) {
+            const uint k = it & 31u;
+            [[unroll]] for (uint i = 0; i < 4u; ++i) a[i] = uintBitsToFloat(pad[(k * 32u + tm * 4u + i) % SH]);
+            [[unroll]] for (uint j = 0; j < 2u; ++j)
+                b[j] = vec4(uintBitsToFloat(pad[(1024u + k * 128u + tn * 8u + 4u * j) % SH]),
+                            uintBitsToFloat(pad[(1024u + k * 128u + tn * 8u + 4u * j + 1u) % SH]),
+                            uintBitsToFloat(pad[(1024u + k * 128u + tn * 8u + 4u * j + 2u) % SH]),
+                            uintBitsToFloat(pad[(1024u + k * 128u + tn * 8u + 4u * j + 3u) % SH]));
+        } else if ((MODE == 6u || MODE == 7u) && RA == 4u && RB == 8u) {
+            // 6: B as eight 4-bit weights per word (this thread's 8 columns
+            // at k), dequantized with per-column (scale, offset) registers;
+            // 7: the same with an f16 round trip of each weight.
+            const uint k = it & 31u;
+            const vec2 a0 = unpackHalf2x16(pad[(k * 16u + tm * 2u) % SH]), a1 = unpackHalf2x16(pad[(k * 16u + tm * 2u + 1u) % SH]);
+            a[0] = a0.x; a[1] = a0.y; a[2] = a1.x; a[3] = a1.y;
+            const uint w = pad[(512u + k * 16u + tn) % SH];
+            [[unroll]] for (uint j = 0; j < 2u; ++j) {
+                const uvec4 q = (uvec4(w) >> (uvec4(0u, 4u, 8u, 12u) + 16u * j)) & 15u;
+                b[j] = sc[j] * vec4(q) + of[j];
+                if (MODE == 7u) b[j] = vec4(unpackHalf2x16(packHalf2x16(b[j].xy)), unpackHalf2x16(packHalf2x16(b[j].zw)));
+            }
+        } else if (MODE == 5u && RA == 4u && RB == 8u) {
+            const uint k = it & 31u;
+            const vec2 a0 = unpackHalf2x16(pad[(k * 16u + tm * 2u) % SH]), a1 = unpackHalf2x16(pad[(k * 16u + tm * 2u + 1u) % SH]);
+            a[0] = a0.x; a[1] = a0.y; a[2] = a1.x; a[3] = a1.y;
+            [[unroll]] for (uint j = 0; j < 2u; ++j)
+                b[j] = vec4(unpackHalf2x16(pad[(512u + k * 64u + tn * 4u + 2u * j) % SH]),
+                            unpackHalf2x16(pad[(512u + k * 64u + tn * 4u + 2u * j + 1u) % SH]));
+        }
         [[unroll]] for (uint i = 0; i < RA; ++i)
             [[unroll]] for (uint j = 0; j < RB / 4; ++j) {
                 if (MODE == 1u) {
