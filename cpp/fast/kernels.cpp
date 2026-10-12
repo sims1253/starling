@@ -392,53 +392,71 @@ bool Arena::finalize(vk::Context& ctx, std::string& err) {
     std::vector<uint8_t*> base(sizes.size(), nullptr);
     std::chrono::steady_clock::time_point t1;
     if (mapped) {
-        // Allocation (the driver zeroes the pages: ~6 GB/s on the Pixel)
-        // overlaps the fill: this thread creates the buffers in order while
-        // the workers repack into those already mapped.
-        std::atomic<size_t> ready{0};
+        // Allocation (the driver zeroes the pages: ~6 GB/s per thread on the
+        // Pixel) overlaps the fill: allocator threads create the buffers in
+        // order while the workers repack into those already mapped.
+        // STARLING_FAST_ALLOC_THREADS=n (default 2).
+        const size_t nb = sizes.size();
+        std::vector<std::unique_ptr<vk::Buffer>> bufs(nb);
+        std::unique_ptr<std::atomic<bool>[]> ready(new std::atomic<bool>[nb]);
+        for (size_t i = 0; i < nb; ++i) ready[i] = false;
+        std::atomic<bool> abort{false};
         std::condition_variable cv;
         std::mutex cv_mu;
-        std::atomic<size_t> next{0};
+        std::atomic<size_t> next{0}, next_buf{0};
         const size_t nt = std::min<size_t>(std::max(1u, std::thread::hardware_concurrency()), 8);
         std::vector<std::thread> workers;
         for (size_t t = 0; t < nt; ++t)
             workers.emplace_back([&] {
                 for (size_t i; (i = next.fetch_add(1)) < units.size();) {
                     const size_t bi = unit_buffer(units[i]);
-                    if (ready.load(std::memory_order_acquire) <= bi) {
+                    if (!ready[bi].load(std::memory_order_acquire)) {
                         std::unique_lock<std::mutex> lk(cv_mu);
-                        cv.wait(lk, [&] { return ready.load(std::memory_order_acquire) > bi; });
+                        cv.wait(lk, [&] { return ready[bi].load(std::memory_order_acquire) || abort.load(); });
                     }
                     std::string e;
-                    if (ok && !fill_unit(units[i], base, e)) fail(e);
+                    if (ok && !abort && !fill_unit(units[i], base, e)) fail(e);
                 }
             });
-        for (size_t i = 0; i < sizes.size() && ok; ++i) {
-            auto buf = std::make_unique<vk::Buffer>();
-            std::string e;
-            if (!ctx.create_buffer(*buf, sizes[i], vk::Mem::Device, e)) fail(e);
-            else if (!buf->host) fail("fast engine: weight buffer is not host-mapped");
-            if (!ok) break;
-            base[i] = (uint8_t*)buf->host;
-            total_ += sizes[i];
-            buffers_.push_back(std::move(buf));
-            for (Blob& b : blobs_)
-                if (b.buffer == i && !b.words.empty()) std::memcpy(base[i] + b.off, b.words.data(), b.words.size() * 4);
+        auto allocate = [&] {
+            for (size_t i; ok && (i = next_buf.fetch_add(1)) < nb;) {
+                auto buf = std::make_unique<vk::Buffer>();
+                std::string e;
+                if (!ctx.create_buffer(*buf, sizes[i], vk::Mem::Device, e)) fail(e);
+                else if (!buf->host) fail("fast engine: weight buffer is not host-mapped");
+                if (!ok) break;
+                base[i] = (uint8_t*)buf->host;
+                bufs[i] = std::move(buf);
+                for (Blob& b : blobs_)
+                    if (b.buffer == i && !b.words.empty()) std::memcpy(base[i] + b.off, b.words.data(), b.words.size() * 4);
+                {
+                    std::lock_guard<std::mutex> lk(cv_mu);
+                    ready[i].store(true, std::memory_order_release);
+                }
+                cv.notify_all();
+            }
+        };
+        size_t na = 2;
+        if (const char* e = std::getenv("STARLING_FAST_ALLOC_THREADS")) na = (size_t)std::max(1, std::atoi(e));
+        std::vector<std::thread> allocators;
+        for (size_t a = 1; a < std::min(na, nb); ++a) allocators.emplace_back(allocate);
+        allocate();
+        for (auto& t : allocators) t.join();
+        t1 = std::chrono::steady_clock::now();
+        if (!ok) {
             {
                 std::lock_guard<std::mutex> lk(cv_mu);
-                ready.store(i + 1, std::memory_order_release);
+                abort = true;   // release workers waiting on buffers that never came
             }
             cv.notify_all();
         }
-        t1 = std::chrono::steady_clock::now();
-        {
-            std::lock_guard<std::mutex> lk(cv_mu);
-            ready.store(SIZE_MAX, std::memory_order_release);   // release waiters on failure
-        }
-        cv.notify_all();
         for (auto& t : workers) t.join();
         if (!ok) { err = first_err; return false; }
-        for (auto& b : buffers_) ctx.flush(*b, 0, b->size);
+        for (size_t i = 0; i < nb; ++i) {
+            total_ += sizes[i];
+            ctx.flush(*bufs[i], 0, bufs[i]->size);
+            buffers_.push_back(std::move(bufs[i]));
+        }
     } else {
         for (VkDeviceSize sz : sizes) {
             auto buf = std::make_unique<vk::Buffer>();
