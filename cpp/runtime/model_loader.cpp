@@ -142,15 +142,30 @@ bool ModelLoader::map_weights(const char* path) {
 #if defined(__linux__)
     // Cold loads: stream the weight region from storage in the background
     // (readahead on a descriptor of its own) while the engine sets up and
-    // plans; the repack then mostly finds the pages cached. Warm: a no-op.
-    // STARLING_GGUF_READAHEAD=0 leaves it to the page faults.
+    // plans; the repack then mostly finds the pages cached. A file already
+    // in the page cache (sampled with mincore) is left alone: walking its
+    // cached pages contends with the repack's page faults (host: +250 ms on
+    // a warm Qwen3 load). STARLING_GGUF_READAHEAD=0/1 never/always.
     const char* ra = std::getenv("STARLING_GGUF_READAHEAD");
     if (p != MAP_FAILED && file_size > data_off && !(ra && ra[0] == '0')) {
         const int rfd = dup(fd);
+        const bool always = ra && ra[0] == '1';
         if (rfd >= 0) {
             try {
-                std::thread([rfd, data_off, file_size] {
-                    posix_fadvise(rfd, (off_t)data_off, (off_t)(file_size - data_off), POSIX_FADV_WILLNEED);
+                std::thread([rfd, p, data_off, file_size, always] {
+                    // 256 one-page probes over the weight region (mincore
+                    // reports page-cache residency for file mappings and
+                    // reads nothing; a mapping gone meanwhile just fails).
+                    const size_t page = (size_t)sysconf(_SC_PAGESIZE);
+                    const size_t first = (data_off + page - 1) / page, last = file_size / page;
+                    int cached = 0, probes = 0;
+                    for (int k = 0; k < 256 && last > first; ++k, ++probes) {
+                        unsigned char v = 0;
+                        const size_t pg = first + (last - first) * (size_t)k / 256;
+                        if (mincore((uint8_t*)p + pg * page, page, &v) == 0 && (v & 1)) ++cached;
+                    }
+                    if (always || cached < probes * 9 / 10)
+                        posix_fadvise(rfd, (off_t)data_off, (off_t)(file_size - data_off), POSIX_FADV_WILLNEED);
                     close(rfd);
                 }).detach();
             } catch (...) {
