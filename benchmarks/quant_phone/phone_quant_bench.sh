@@ -71,9 +71,13 @@ screen_off
 
 timeout 30 adb shell "mkdir -p $DEV" >/dev/null
 timeout 120 adb push "$BIN_DIR/starling-bench" "$DEV/starling-bench-quant" >/dev/null
-for so in "$BIN_DIR"/libggml*.so; do timeout 120 adb push "$so" "$DEV/" >/dev/null; done
+sos=("$BIN_DIR"/libggml*.so)
+[ -e "${sos[0]}" ] || { echo "no libggml*.so in $BIN_DIR" >&2; exit 1; }
+for so in "${sos[@]}"; do timeout 120 adb push "$so" "$DEV/" >/dev/null; done
 dev_wavs=""
 for w in $WAVS; do
+  # The basenames go unquoted into the device shell command line.
+  [[ $(basename "$w") =~ ^[A-Za-z0-9._-]+$ ]] || { echo "unsupported characters in '$w' (use [A-Za-z0-9._-])" >&2; exit 1; }
   timeout 60 adb push "$w" "$DEV/" >/dev/null
   dev_wavs+=" $DEV/$(basename "$w")"
 done
@@ -134,8 +138,12 @@ if on_battery; then
   c0=$(battery_field "Charge counter"); t0=$(date +%s.%N)
   sleep "$IDLE_S"
   c1=$(battery_field "Charge counter"); t1=$(date +%s.%N)
-  idle_rate=$(awk -v a="$c0" -v b="$c1" -v s="$t0" -v e="$t1" 'BEGIN { printf "%.4f", (a - b) / (e - s) }')
-  echo "idle drain: $idle_rate uAh/s over ${IDLE_S}s (counter $c0 -> $c1)" | tee "$OUT/idle.txt"
+  if [[ $c0 =~ ^[0-9]+$ && $c1 =~ ^[0-9]+$ ]]; then
+    idle_rate=$(awk -v a="$c0" -v b="$c1" -v s="$t0" -v e="$t1" 'BEGIN { printf "%.4f", (a - b) / (e - s) }')
+    echo "idle drain: $idle_rate uAh/s over ${IDLE_S}s (counter $c0 -> $c1)" | tee "$OUT/idle.txt"
+  else
+    echo "charge counter unreadable ('$c0' -> '$c1'): no energy numbers" | tee "$OUT/idle.txt"
+  fi
 else
   echo "phone is not on battery: no energy numbers" | tee "$OUT/idle.txt"
 fi
@@ -154,12 +162,12 @@ for r in $(seq 1 "$ROUNDS"); do
     log="$OUT/${labels[$i]}.r$r.log"
     start_t=$(wait_cool) || { echo "ERROR: the phone did not cool down ($start_t); stopping" >&2; exit 1; }
     echo "skin at start: $start_t" > "$log"
-    on_battery && echo "charge start: $(battery_field "Charge counter") $(date +%s.%N)" >> "$log"
+    if on_battery; then echo "charge start: $(battery_field "Charge counter") $(date +%s.%N)" >> "$log"; fi
     timeout 3600 adb shell "cd $DEV && LD_LIBRARY_PATH=. STARLING_ENGINE=$ENGINE \
       STARLING_GGML_THREADS=$THREADS STARLING_FAST_CACHE_DIR=$DEV \
       toybox time -v ./starling-bench-quant --model ${kinds[$i]} --gguf ${files[$i]} \
       --warmup --runs $RUNS $dev_wavs 2>&1" >> "$log" 2>&1 || echo "WARNING: ${labels[$i]} round $r exited non-zero" >&2
-    on_battery && echo "charge end: $(battery_field "Charge counter") $(date +%s.%N)" >> "$log"
+    if on_battery; then echo "charge end: $(battery_field "Charge counter") $(date +%s.%N)" >> "$log"; fi
     echo "skin at end: $(skin)" >> "$log"
     timeout 30 adb shell "dumpsys thermalservice | grep -m1 'Thermal Status'" 2>/dev/null | tr -d '\r' >> "$log" || true
     benches_gone 60 || kill_benches
@@ -191,7 +199,8 @@ for lab in labels:
         if cs and ce and idle:
             dt = float(ce.group(2)) - float(cs.group(2))
             used = int(cs.group(1)) - int(ce.group(1)) - float(idle) * dt   # µAh above idle
-            energy.append(used * V_NOM / 1000.0)                             # mWh
+            if used >= 0:  # a negative reading is a counter reset or recalibration
+                energy.append(used * V_NOM / 1000.0)                         # mWh
         a = re.search(r"skin at start: (\S+)", s); b = re.search(r"skin at end: (\S*)", s)
         therm.append(f"{a.group(1) if a else '?'}->{b.group(1) if b and b.group(1) else '?'}")
     med = lambda v: f"{statistics.median(v):.0f}" if v else "FAIL"

@@ -18,14 +18,13 @@ import os
 import random
 import sys
 
-# benchmarks/wer.py, or benchmarks/fast_engine/wer.py once the Python stack
-# removal (#451) has moved it there.
-for _d in ("..", os.path.join("..", "fast_engine")):
-    sys.path.insert(0, os.path.join(os.path.dirname(__file__), _d))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "fast_engine"))
 from wer import normalize  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(__file__))
 from wer_models import edit_distance  # noqa: E402
+
+RESAMPLES = 10000
 
 
 def per_clip(refs: dict, names: list[str], hyps: list) -> dict[str, float]:
@@ -50,11 +49,15 @@ def main() -> int:
         clips = here
         for label, r in d["results"].items():
             if "hyps" in r:
+                if label in results:
+                    sys.exit(f"{f}: label {label!r} already loaded from another file")
                 results[label] = r
     refs = json.load(open(os.path.join(clips, "refs.json")))
     if a.base not in results:
-        sys.exit(f"baseline {a.base!r} not found")
+        sys.exit(f"baseline {a.base!r} not found among {sorted(results)}")
     base = results[a.base]
+    if not base["names"]:
+        sys.exit(f"{a.base}: no clips decoded; nothing to compare")
     bclip = per_clip(refs, base["names"], base["hyps"])
     bhyp = dict(zip(base["names"], base["hyps"]))
     for label, r in results.items():
@@ -69,8 +72,8 @@ def main() -> int:
         diffs = [cclip[n] - bclip[n] for n in common]
         mean = sum(diffs) / len(diffs)
         rng = random.Random(0)  # per candidate: its CI must not depend on the other labels
-        boots = sorted(sum(rng.choice(diffs) for _ in diffs) / len(diffs) for _ in range(10000))
-        lo, hi = boots[249], boots[9749]
+        boots = sorted(sum(rng.choice(diffs) for _ in diffs) / len(diffs) for _ in range(RESAMPLES))
+        lo, hi = boots[int(0.025 * RESAMPLES) - 1], boots[int(0.975 * RESAMPLES) - 1]
         changed = sum(dict(zip(r["names"], r["hyps"]))[n] != bhyp[n] for n in common)
         print(f"{label:24s} vs {a.base}: clipWER {mean:+.3f} pt [95% {lo:+.3f}, {hi:+.3f}]  "
               f"corpus {base['wer']:.2f}% -> {r['wer']:.2f}%  changed {changed}/{len(common)}  "

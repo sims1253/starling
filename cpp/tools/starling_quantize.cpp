@@ -53,6 +53,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <regex>
 #include <string>
@@ -228,8 +229,14 @@ const std::vector<OptIn>& opt_ins() {
 
 // The opt-in entry covering `name` for this architecture, or nullptr.
 const OptIn* find_opt_in(const std::string& arch, const std::string& name) {
-    for (const auto& o : opt_ins())
-        if (arch == o.arch && std::regex_search(name, std::regex(o.pattern))) return &o;
+    static const std::vector<std::regex> kPatterns = [] {
+        std::vector<std::regex> r;
+        for (const auto& o : opt_ins()) r.emplace_back(o.pattern);
+        return r;
+    }();
+    const auto& table = opt_ins();
+    for (size_t i = 0; i < table.size(); ++i)
+        if (arch == table[i].arch && std::regex_search(name, kPatterns[i])) return &table[i];
     return nullptr;
 }
 
@@ -410,17 +417,29 @@ int main(int argc, char** argv) {
         // The collector keys an entry by the matmul's src0 name. A weight the
         // engine casts or reshapes first (Parakeet's pointwise convs) is
         // recorded under ggml's derived name, e.g. "<w> (copy) (reshaped)";
-        // alias such entries to the weight unless it has its own.
-        std::vector<std::pair<std::string, starling::ggml::ImatrixEntry>> aliases;
+        // alias such entries to the weight unless it has its own. Several
+        // derived entries of one weight (sums of squared activations) merge.
+        static const std::regex kDerived("( \\((copy|reshaped|view|permuted|transposed|cont)\\))+$");
+        std::map<std::string, starling::ggml::ImatrixEntry> aliases;
         for (const auto& kv : imap) {
-            const auto cut = kv.first.find(" (");
-            if (cut != std::string::npos && !imap.count(kv.first.substr(0, cut)))
-                aliases.emplace_back(kv.first.substr(0, cut), kv.second);
+            const std::string base = std::regex_replace(kv.first, kDerived, "");
+            if (base == kv.first || imap.count(base)) continue;
+            auto [it, fresh] = aliases.emplace(base, kv.second);
+            if (fresh) continue;
+            if (it->second.values.size() != kv.second.values.size()) {
+                std::fprintf(stderr, "error: imatrix entries for %s disagree on width (%s)\n",
+                             base.c_str(), kv.first.c_str());
+                return 1;
+            }
+            for (size_t i = 0; i < kv.second.values.size(); ++i)
+                it->second.values[i] += kv.second.values[i];
+            it->second.n_obs += kv.second.n_obs;
         }
-        for (auto& a : aliases) imap.emplace(std::move(a.first), std::move(a.second));
+        const size_t aliased = aliases.size();
+        for (auto& a : aliases) imap.emplace(a.first, std::move(a.second));
         if (!args.quiet)
             std::fprintf(stderr, "imatrix: %zu tensors from %s (%zu by derived name)\n",
-                         imap.size(), args.imatrix.c_str(), aliases.size());
+                         imap.size(), args.imatrix.c_str(), aliased);
     }
 
     // Open the input (mmap-backed weight context, same as ModelLoader).
@@ -497,15 +516,17 @@ int main(int argc, char** argv) {
                         return 1;
                     }
                     candidates++;
-                    if (n_dims == 3 && ggml_is_quantized(rule.second)) {
+                    // A k=1 conv's row is ne[1] once flattened; flatten only
+                    // if the fitted type is still quantized.
+                    want = compat_type(rule.second, n_dims == 3 ? t->ne[1] : k,
+                                       (ggml_type)t->type);
+                    if (n_dims == 3 && ggml_is_quantized(want)) {
                         ne_out[0] = t->ne[1];
                         ne_out[1] = t->ne[2];
                         ne_out[2] = 1;
                         n_dims = 2;
                         k = ne_out[0];
                     }
-                    want = n_dims == 3 ? rule.second
-                                       : compat_type(rule.second, k, (ggml_type)t->type);
                     break;
                 }
             }

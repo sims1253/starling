@@ -20,10 +20,10 @@ TYPES = gguf.GGMLQuantizationType
 PW1 = "encoder.layers.0.conv.pointwise_conv1.weight"
 
 
-def imatrix_entry(name: str, width: int, values=None) -> bytes:
+def imatrix_entry(name: str, width: int, values=None, n_obs: int = 1) -> bytes:
     raw = name.encode()
     values = np.ones(width) if values is None else values
-    return (struct.pack("<I", len(raw)) + raw + struct.pack("<IQ", width, 1)
+    return (struct.pack("<I", len(raw)) + raw + struct.pack("<IQ", width, n_obs)
             + np.asarray(values, dtype="<f4").tobytes())
 
 
@@ -109,6 +109,29 @@ def test_pointwise_conv_is_flattened_only_when_quantized(quantize):
     assert f16[PW1] == (TYPES.F16, (1, 256, 512))
     assert q4[PW1] == (TYPES.Q4_0, (256, 512))
     assert "(1 by derived name)" in stderr
+
+
+def test_pointwise_conv_without_a_fitting_block_stays_3d(quantize):
+    # Rows of 100 fit neither Q4_0 nor the Q8_0 fallback: kept at the source
+    # dtype in its conv shape, not flattened.
+    result, _ = quantize("parakeet_tdt", {PW1: (512, 100, 1)}, f"default q4_0\n{PW1}$ q4_0\n")
+    assert result[PW1] == (TYPES.F32, (1, 100, 512))
+
+
+def test_derived_name_imatrix_entries_of_one_weight_merge(quantize, tmp_path):
+    # Two derived entries of the same weight (sums of squared activations)
+    # add up to the entry the weight would have had under its own name.
+    rng = np.random.default_rng(5)
+    # Powers of two: the f32 sum the quantizer forms is exact.
+    a, b = 2.0 ** rng.integers(-8, 9, 256), 2.0 ** rng.integers(-8, 9, 256)
+    recipe = f"default q4_0\n{PW1}$ q4_0\n"
+    split = imatrix_file(tmp_path / "split.imx", imatrix_entry(PW1 + " (copy)", 256, a),
+                         imatrix_entry(PW1 + " (copy) (reshaped)", 256, b))
+    whole = imatrix_file(tmp_path / "whole.imx", imatrix_entry(PW1, 256, a + b, n_obs=2))
+    by_split, stderr = quantize("parakeet_tdt", PARAKEET, recipe, imatrix=split, payload=True)
+    by_whole, _ = quantize("parakeet_tdt", PARAKEET, recipe, imatrix=whole, payload=True)
+    assert "(1 by derived name)" in stderr
+    assert by_split[PW1] == by_whole[PW1]
 
 
 def test_derived_name_imatrix_weights_the_quantization(quantize, tmp_path):

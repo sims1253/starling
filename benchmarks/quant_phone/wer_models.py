@@ -28,15 +28,18 @@ import sys
 import time
 import wave
 
-# benchmarks/wer.py, or benchmarks/fast_engine/wer.py once the Python stack
-# removal (#451) has moved it there.
-for _d in ("..", os.path.join("..", "fast_engine")):
-    sys.path.insert(0, os.path.join(os.path.dirname(__file__), _d))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "fast_engine"))
 from wer import normalize  # noqa: E402
 
 # starling_ggml_model (cpp/include/starling_ggml.h).
 KINDS = {"parakeet": 1, "moss": 2, "ark": 3, "granite": 6, "qwen3": 7,
          "ark06": 10, "voxtral": 11, "qwen3_06": 12}
+
+
+def peak_rss_mb() -> float:
+    # ru_maxrss is KiB on Linux, bytes on macOS.
+    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return rss / (1024.0 * 1024.0) if sys.platform == "darwin" else rss / 1024.0
 
 
 def edit_distance(a: list[str], b: list[str]) -> int:
@@ -95,7 +98,7 @@ def worker(a) -> int:
     lib.starling_ggml_free(ctx)
     print(json.dumps({"names": names, "hyps": hyps, "secs": secs, "audio_s": audio_s,
                       "load_s": load_s,
-                      "peak_rss_mb": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0}))
+                      "peak_rss_mb": peak_rss_mb()}))
     return 0
 
 

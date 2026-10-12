@@ -56,14 +56,14 @@ const lib::QwenDecodeSpec kSpec = {
 // that the table is read by GET_ROWS, so a quantized tied embedding/lm_head
 // is never repacked for its matmul. Returns {} on failure.
 std::vector<float> lookup_rows_f32(const ModelLoader& ml, const char* name,
-                                          const std::vector<int32_t>& ids) {
+                                   const std::vector<int32_t>& ids) {
     std::vector<float> out;
     if (ids.empty() || !ml.tensor(name)) return out;
-    std::vector<int32_t> idx(ids);  // the graph input borrows this host buffer
     const bool ok = run_graph([&](ggml_context* c) -> ggml_tensor* {
-        int64_t ne[1] = {(int64_t) idx.size()};
-        ggml_tensor* rows = graph_input_tensor(c, GGML_TYPE_I32, 1, ne, idx.data(),
-                                               idx.size() * sizeof(int32_t));
+        int64_t ne[1] = {(int64_t) ids.size()};
+        // `ids` outlives the synchronous compute the input borrows it for.
+        ggml_tensor* rows = graph_input_tensor(c, GGML_TYPE_I32, 1, ne, ids.data(),
+                                               ids.size() * sizeof(int32_t));
         return ggml_get_rows(c, lib::weight(c, ml, name), rows);
     }, out);
     if (!ok) out.clear();
