@@ -573,8 +573,11 @@ linears plus the head.
   30-clip German BF16 spot check, Q4_K sat closer to BF16.
 - **Loops.** One ARK-3B Q4_K_M file looped on one English clip and scored
   15 % WER. Screen for repetition loops, not only the mean.
-- **Vulkan.** On the notebook's Radeon (RADV), the Qwen3, Granite and MOSS
-  finalists give the same fixture transcripts as on its CPU.
+- **Vulkan.** On the notebook's Radeon (RADV), the Qwen3, Granite, MOSS and
+  ARK-3B finalists give the same fixture transcripts as on its CPU.
+  ARK-0.6B on Vulkan degenerates after a few words into one repeated CJK
+  token. This happens with the BF16 source as well, so it is an engine
+  issue, not a quantization one. Its CPU transcripts are correct.
 - **Fast engine.** The MOSS finalists use only Q4_0 and Q8_0, which the
   fast engine maps losslessly. It stores `enc.conv_out` as F16 whatever
   its GGUF type, so quantizing that tensor shrinks only the download.
