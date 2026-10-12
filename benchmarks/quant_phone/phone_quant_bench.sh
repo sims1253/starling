@@ -22,7 +22,8 @@
 # Pushes binaries and missing GGUFs to $DEV (env: BIN_DIR with starling-bench
 # and libggml*.so, default ./bin; WAVS, default the three fixtures; OUT for the
 # raw logs; SKIN_MAX °C to start a process at, default the idle reading at
-# start + 1; COOL minimum seconds between processes, default 20; IDLE_S,
+# start + 1; BIG_MAX °C for the big-core cluster, default 50; COOL minimum
+# seconds between processes, default 20; IDLE_S,
 # default 180; THREADS, default 6; PHONE_LOCK, the flock shared with other
 # phone scripts, default /tmp/starling-phone.lock).
 set -euo pipefail
@@ -41,6 +42,7 @@ WAVS=${WAVS:-"$ROOT/tests/fixtures/short.wav $ROOT/tests/fixtures/medium.wav $RO
 OUT=${OUT:-$(mktemp -d)}
 COOL=${COOL:-20}
 SKIN_MAX=${SKIN_MAX:-}
+BIG_MAX=${BIG_MAX:-50}
 IDLE_S=${IDLE_S:-180}
 THREADS=${THREADS:-6}
 mkdir -p "$OUT"
@@ -85,15 +87,22 @@ push_model() {  # local path -> device path; skips a same-size copy
   echo "$dst"
 }
 
-skin() {  # the thermal HAL's VIRTUAL-SKIN temperature in °C ("" if unreadable)
+hal_temp() {  # hal_temp NAME: the thermal HAL's current NAME temperature in °C ("" if unreadable)
+  # Only the "Current temperatures from HAL" block: the "Cached temperatures"
+  # block printed before it keeps a stale value (measured: unchanged for an
+  # hour of 6-core load), so a gate reading it never waits.
   timeout 30 adb shell "dumpsys thermalservice" 2>/dev/null | tr -d '\r' |
-    sed -n 's/.*mValue=\([0-9.]*\), mType=3, mName=VIRTUAL-SKIN,.*/\1/p' | sed -n 1p
+    sed -n '/^Current temperatures from HAL:/,/^[^[:space:]]/p' |
+    sed -n "s/.*mValue=\([0-9.]*\), mType=[0-9-]*, mName=$1,.*/\1/p" | sed -n 1p
 }
-wait_cool() {  # up to 15 min for the skin temperature to drop under SKIN_MAX
-  local t
-  for _ in $(seq 1 90); do
-    t=$(skin)
-    [ -n "$t" ] && awk -v t="$t" -v m="$SKIN_MAX" 'BEGIN { exit !(t < m) }' && { echo "$t"; return 0; }
+skin() { hal_temp VIRTUAL-SKIN; }
+big() { hal_temp BIG; }
+wait_cool() {  # up to 30 min for skin < SKIN_MAX and the big-core cluster < BIG_MAX
+  local t b
+  for _ in $(seq 1 180); do
+    t=$(skin); b=$(big)
+    [ -n "$t" ] && awk -v t="$t" -v m="$SKIN_MAX" -v b="${b:-0}" -v bm="$BIG_MAX" \
+      'BEGIN { exit !(t < m && b < bm) }' && { echo "$t"; return 0; }
     sleep 10
   done
   echo "${t:-?} (timeout)"
