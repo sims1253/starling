@@ -52,7 +52,7 @@ extern "C" fn on_signal(_signal: i32) {
 /// releases at process death, so ownership cannot be stranded — the
 /// successor's crash-recovery sweep handles the rest.
 #[cfg(windows)]
-unsafe extern "system" fn on_console_ctrl(ctrl_type: u32) -> windows_sys::Win32::Foundation::BOOL {
+unsafe extern "system" fn on_console_ctrl(ctrl_type: u32) -> windows_sys::core::BOOL {
     use windows_sys::Win32::System::Console::{
         CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT,
     };
