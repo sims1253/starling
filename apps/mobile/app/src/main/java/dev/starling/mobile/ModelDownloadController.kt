@@ -32,8 +32,12 @@ class ModelDownloadController(private val engine: OnDeviceEngine) {
 
     val isRunning: Boolean get() = state is State.Running
 
-    /** The model of the running or most recently started download. Main thread. */
-    var spec: ModelDownload? = null
+    /**
+     * The model of the running or most recently started download. Main
+     * thread. After process death, the catalog model whose partial is on
+     * disk (start() keeps at most one), so it is still offered for a resume.
+     */
+    var spec: ModelDownload? = ModelCatalog.ALL.firstOrNull { engine.downloadFile(it).length() > 0 }
         private set
 
     /** Bytes already on disk from an earlier, unfinished attempt. */
@@ -52,11 +56,6 @@ class ModelDownloadController(private val engine: OnDeviceEngine) {
     /** Starts (or resumes) downloading [spec]; a no-op while one is running. Main thread. */
     fun start(spec: ModelDownload) {
         if (isRunning) return
-        // One partial at a time: another model's unfinished download (up to
-        // ~1.5 GB) would otherwise stay on disk with nothing resuming it.
-        for (other in ModelCatalog.ALL) {
-            if (other.sha256 != spec.sha256) engine.downloadFile(other).delete()
-        }
         val job = ModelDownloader()
         downloader = job
         this.spec = spec
@@ -70,6 +69,12 @@ class ModelDownloadController(private val engine: OnDeviceEngine) {
     }
 
     private fun run(job: ModelDownloader, spec: ModelDownload) {
+        // One partial at a time: another model's unfinished download (up to
+        // ~1.5 GB) would otherwise stay on disk with nothing resuming it.
+        // Here, off the main thread: unlinking that much can take a while.
+        for (other in ModelCatalog.ALL) {
+            if (other.sha256 != spec.sha256) engine.downloadFile(other).delete()
+        }
         val partial = engine.downloadFile(spec)
         val result = runCatching {
             job.download(spec, partial) { bytes, total, verifying ->
