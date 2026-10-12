@@ -567,7 +567,12 @@ bool Kernels::init(vk::Context& ctx, std::string& err) {
     // STARLING_FAST_TUNE=1 runs it anyway, STARLING_FAST_TILE / _GEMV_ROWS
     // override either. Other vendors keep the tuner's pick.
     if (ctx.info().vendor_id == 0x1010 && !tune_forced) {
-        tile = TileCfg{32, 128, 4, 8};
+        // BK = 16: the half-depth k-tile halves each thread's tile-load
+        // registers and the shared tiles (10 -> 5 KiB), and more workgroups
+        // stay resident: encoder/prefill GEMMs +20-40 % isolated, Qwen3-ASR
+        // 0.6B enc+prefill -12 % short / -15 % medium, Parakeet encoder -20 %
+        // (bit-exact; BK = 8 gains less, RESEARCH_LOG P5).
+        tile = TileCfg{32, 128, 4, 8, 16};
         // Decode GEMV rows=16, pinned: measured best-or-tied at every MOSS
         // decode shape on the Pixel 10 Pro (N 2048..151936, K 2048/6144; the
         // rows=8 default cost 15-31 % on the small-N shapes, growing to 32
@@ -621,6 +626,10 @@ bool Kernels::init(vk::Context& ctx, std::string& err) {
             tile = TileCfg{bm, bn, tm, tn, bk};
             tile_pinned_ = true;
         }
+    }
+    if (const char* e = std::getenv("STARLING_FAST_BK")) {
+        const unsigned bk = (unsigned)std::atoi(e);
+        if (bk == 8 || bk == 16 || bk == 32) tile.BK = bk;
     }
     if (const char* e = std::getenv("STARLING_FAST_GEMV_RPP")) gemv_rpp_min = (uint32_t)std::atoi(e);
     if (const char* e = std::getenv("STARLING_FAST_GEMV_ROWS")) {
