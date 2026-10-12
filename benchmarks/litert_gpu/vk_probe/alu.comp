@@ -1,0 +1,60 @@
+#version 450
+// Vulkan twin of cl_alu_probe.c. Compiled once per MODE (build.sh):
+//   0 f32 a*b+c   1 f32 fma()   2 f16vec4 a*b+c   3 f16vec4 fma()
+//   4 f16vec2 fma() (gemm.comp's packed-f16 product form)
+//   5 f32 broadcast loop (ML Drift FC inner loop: weight vec4 per lane,
+//     subgroupBroadcast to all lanes, times an activation component)
+//   6 the same with f16vec4
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_ballot : enable
+#extension GL_EXT_shader_subgroup_extended_types_float16 : enable
+layout(local_size_x = 128) in;
+layout(std430, binding = 0) buffer Out { float o[]; };
+layout(push_constant) uniform PC { uint iters; float seed; } p;
+
+#if MODE <= 1 || MODE == 5
+#define T vec4
+#define S float
+#elif MODE == 4
+#define T f16vec2
+#define S float16_t
+#else
+#define T f16vec4
+#define S float16_t
+#endif
+
+#if MODE == 1 || MODE == 3 || MODE == 4
+#define OP(a, x, y) fma(a, x, y)
+#else
+#define OP(a, x, y) ((a) * (x) + (y))
+#endif
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+#if MODE <= 4
+    T a[8];
+    T x = T(S(p.seed)), y = T(S(p.seed * 0.5));
+    [[unroll]] for (int i = 0; i < 8; ++i) a[i] = T(S(float(gid) * 1e-6 + float(i)));
+    for (uint it = 0; it < p.iters; ++it) {
+        [[unroll]] for (int i = 0; i < 8; ++i) a[i] = OP(a[i], x, y);
+    }
+    T s = a[0] + a[1] + a[2] + a[3] + a[4] + a[5] + a[6] + a[7];
+#else
+    T w = T(S(float(gl_SubgroupInvocationID) * p.seed));
+    T s0 = T(S(float(gid) * 0.001)), s1 = s0 + T(S(1));
+    T r[8];
+    [[unroll]] for (int i = 0; i < 8; ++i) r[i] = T(S(0));
+    for (uint it = 0; it < p.iters; it += 4) {
+#define BC(j, c) { T wb = subgroupBroadcast(w, 4 * j + c); r[2 * j] += wb * s0[c]; r[2 * j + 1] += wb * s1[c]; }
+        BC(0, 0) BC(0, 1) BC(0, 2) BC(0, 3) BC(1, 0) BC(1, 1) BC(1, 2) BC(1, 3)
+        BC(2, 0) BC(2, 1) BC(2, 2) BC(2, 3) BC(3, 0) BC(3, 1) BC(3, 2) BC(3, 3)
+        w += T(S(0.001)); s0 += T(S(0.001)); s1 -= T(S(0.001));
+    }
+    T s = r[0] + r[1] + r[2] + r[3] + r[4] + r[5] + r[6] + r[7];
+#endif
+    float t = 0.0;
+    [[unroll]] for (int i = 0; i < s.length(); ++i) t += float(s[i]);
+    if (t == -12345.0) o[gid] = t;
+}

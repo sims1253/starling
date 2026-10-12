@@ -10,8 +10,11 @@
 #   enc     encoder window: {f32mask, fp16wmask, wi8mask} x {fp16, fp32}, RUNS runs
 #   kdump   encoder under clshim: kernel sources + per-kernel GPU time (fp16, fp32);
 #           NOCB=1 (default) hides cl_khr_command_buffer so every kernel gets an event
-#   micro   FC micro models + one Qwen3 layer under clshim (fp16, fp32)
+#   micro   FC micro models (16 FCs per run, so the clock ramps) + 8 Qwen3 layers
+#           under clshim (fp16, fp32); MICRO_GLOB selects other models
 #   alu     OpenCL ALU probes (cl_alu_probe.c): f32 vs f16 FMA rate, broadcast loop
+#   valu    the same probes in Vulkan (vk_probe/): f32/f16 mad vs fma(), f16vec2 fma, broadcast
+#   vfc     ML Drift's FC kernel ported to Vulkan (vk_probe/fc.comp) at our GEMM shapes
 #   ours    starling-bench: full, encoder-only by ablation, prefill-only, gemmx probes
 #
 # Only /data/local/tmp/litert-gpu is written (plus the shared wake-hold dex).
@@ -21,7 +24,7 @@ LOG=${1:?LOGDIR}; shift
 mkdir -p "$LOG"
 HERE=$(cd "$(dirname "$0")" && pwd)
 source "$HERE/../fast_engine/phone_common.sh"
-BENCH_BINS="$BENCH_BINS litert_gpu_bench cl_alu_probe"
+BENCH_BINS="$BENCH_BINS litert_gpu_bench cl_alu_probe vk_alu_probe vk_fc_probe"
 export ANDROID_HOME=${ANDROID_HOME:-$HOME/android-sdk}
 
 D=/data/local/tmp/litert-gpu
@@ -86,7 +89,7 @@ for phase in "$@"; do
     for v in f32mask fp16wmask wi8mask; do push_if "$ENC/qwen3_enc_w800_$v.tflite" $D/models/enc_$v.tflite; done
     push_if "$ENC/mel_w800.f32" $D/in/mel_w800.f32
     push_if "$ENC/kbias_w800.f32" $D/in/kbias_w800.f32
-    for f in "$MICRO"/*.tflite; do push_if "$f" $D/micro/$(basename "$f"); done
+    for f in $(cd "$MICRO" && ls ${MICRO_GLOB:-fc16_*.tflite qwen3_layer8_*.tflite}); do push_if "$MICRO/$f" $D/micro/$f; done
     push_if "$SB/starling-bench" $D/sb/starling-bench
     for f in "$SB"/ggml/src/libggml*.so; do push_if "$f" $D/sb/$(basename "$f"); done
     push_if "$WAV" $D/sb/short.wav
@@ -116,7 +119,7 @@ for phase in "$@"; do
     done
     ;;
   micro)
-    for f in "$MICRO"/*.tflite; do
+    for f in $(cd "$MICRO" && ls ${MICRO_GLOB:-fc16_*.tflite qwen3_layer8_*.tflite}); do
       b=$(basename "$f" .tflite)
       for p in 1 2; do run_lt mi_${b}_p$p $D/micro/$b.tflite "precision = $p" 20 shim -; done
     done
@@ -146,6 +149,23 @@ for phase in "$@"; do
     for g in 512 2048; do
       wait_benches || true
       timeout 300 adb shell "$D/bin/cl_alu_probe $g 4096" 2>&1 | tee "$LOG/alu_$g.txt"
+      timeout 300 adb shell "$D/bin/cl_alu_probe $g 4096 '-cl-std=CL2.0 -cl-fast-relaxed-math'" 2>&1 | tee "$LOG/alu_fast_$g.txt"
+    done
+    ;;
+  valu)
+    push_if "$STAGE/vk_alu_probe" $D/bin/vk_alu_probe
+    adb shell "chmod 755 $D/bin/vk_alu_probe"
+    for g in 512 2048; do
+      wait_benches || true
+      timeout 300 adb shell "$D/bin/vk_alu_probe $g 4096" 2>&1 | tee "$LOG/valu_$g.txt"
+    done
+    ;;
+  vfc)
+    push_if "$STAGE/vk_fc_probe" $D/bin/vk_fc_probe
+    adb shell "chmod 755 $D/bin/vk_fc_probe"
+    for shp in "104 1024 4096" "104 896 3584" "104 3584 896" "112 1024 6144" "112 3072 1024" "320 1024 4096"; do
+      wait_benches || true
+      timeout 300 adb shell "$D/bin/vk_fc_probe $shp 20" 2>&1 | tee -a "$LOG/vfc.txt"
     done
     ;;
   *) echo "unknown phase $phase" ;;

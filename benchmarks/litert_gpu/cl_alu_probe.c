@@ -1,11 +1,15 @@
 // OpenCL ALU probes on the phone GPU, to separate the fp16 ALU rate from
 // kernel structure when explaining ML Drift's speed:
-//   f32   8 independent float4 FMA chains, register operands
+//   f32   8 independent float4 a*x+y chains, register operands
 //   f16   the same with half4
+//   f16fma / f32fma  the same written with fma() (OpenCL fma() must be
+//         correctly rounded; for half the driver may emulate it)
 //   bc32  ML Drift's FC inner loop shape in float: a weight float4 per lane,
 //         sub_group_broadcast to all lanes, times a register activation
 //   bc16  the same with half4 (as_long(half4) broadcast, as ML Drift does)
-// cl_alu_probe [groups=512] [iters=4096]
+// cl_alu_probe [groups=512] [iters=4096] [build options]
+// Default options are "-cl-std=CL2.0" (no -cl-fast-relaxed-math: with it the
+// compiler reassociates the a*x+y chains and the mad rows exceed peak).
 #include <dlfcn.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -42,20 +46,25 @@ static const char* SRC =
     "#pragma OPENCL EXTENSION cl_khr_fp16 : enable\n"
     "#pragma OPENCL EXTENSION cl_khr_subgroups : enable\n"
     "#pragma OPENCL EXTENSION cl_khr_subgroup_extended_types : enable\n"
-    "#define BODY(T, CV)                                                        \\\n"
+    "#define BODY(T, CV, OP)                                                        \\\n"
     "  T a0 = CV(gid), a1 = a0 + (T)1, a2 = a0 + (T)2, a3 = a0 + (T)3;           \\\n"
     "  T a4 = a0 + (T)4, a5 = a0 + (T)5, a6 = a0 + (T)6, a7 = a0 + (T)7;          \\\n"
     "  T x = CV(seed), y = CV(seed * 0.5f);                                       \\\n"
     "  for (int i = 0; i < iters; ++i) {                                          \\\n"
-    "    a0 = fma(a0, x, y); a1 = fma(a1, x, y); a2 = fma(a2, x, y); a3 = fma(a3, x, y); \\\n"
-    "    a4 = fma(a4, x, y); a5 = fma(a5, x, y); a6 = fma(a6, x, y); a7 = fma(a7, x, y); \\\n"
+    "    a0 = OP(a0, x, y); a1 = OP(a1, x, y); a2 = OP(a2, x, y); a3 = OP(a3, x, y); \\\n"
+    "    a4 = OP(a4, x, y); a5 = OP(a5, x, y); a6 = OP(a6, x, y); a7 = OP(a7, x, y); \\\n"
     "  }                                                                          \\\n"
     "  T s = a0 + a1 + a2 + a3 + a4 + a5 + a6 + a7;                               \\\n"
-    "  if (s.x == (T)(-12345.f).x) out[gid] = s.y;\n"
+    "  float t = (float)(s.x + s.y + s.z + s.w); if (t == -12345.f) out[gid] = t;\n"
+    "#define MAD(a, x, y) ((a) * (x) + (y))\n"
     "__kernel void f32(__global float* out, float seed, int iters) {\n"
-    "  int gid = get_global_id(0); BODY(float4, (float4)) }\n"
+    "  int gid = get_global_id(0); BODY(float4, (float4), MAD) }\n"
     "__kernel void f16(__global float* out, float seed, int iters) {\n"
-    "  int gid = get_global_id(0); BODY(half4, (half4)) }\n"
+    "  int gid = get_global_id(0); BODY(half4, (half4), MAD) }\n"
+    "__kernel void f32fma(__global float* out, float seed, int iters) {\n"
+    "  int gid = get_global_id(0); BODY(float4, (float4), fma) }\n"
+    "__kernel void f16fma(__global float* out, float seed, int iters) {\n"
+    "  int gid = get_global_id(0); BODY(half4, (half4), fma) }\n"
     // Broadcast loop: per iteration 16 lanes' weight vectors are broadcast and
     // multiplied by 4 components of 2 activation vectors (32 vec4 FMAs).
     "#define BC(T, CV, B)                                                       \\\n"
@@ -74,7 +83,7 @@ static const char* SRC =
     "    w += (T)0.001f; s0 += (T)0.001f; s1 -= (T)0.001f;                       \\\n"
     "  }                                                                          \\\n"
     "  T s = r0 + r1 + r2 + r3 + r4 + r5 + r6 + r7;                               \\\n"
-    "  if (s.x == (T)(-12345.f).x) out[gid] = s.y;\n"
+    "  float t = (float)(s.x + s.y + s.z + s.w); if (t == -12345.f) out[gid] = t;\n"
     "#define B32(w, i) sub_group_broadcast(w, i##u)\n"
     "#define B16(w, i) as_half4(sub_group_broadcast(as_long(w), i##u))\n"
     "__kernel __attribute__((reqd_work_group_size(128, 1, 1))) void bc32(__global float* out, float seed, int iters) { BC(float4, (float4), B32) }\n"
@@ -103,7 +112,9 @@ int main(int argc, char** argv) {
   cl_context c = clCreateContext(NULL, 1, &d, NULL, NULL, &e);
   cl_command_queue q = clCreateCommandQueue(c, d, 2 /* profiling */, &e);
   cl_program pr = clCreateProgramWithSource(c, 1, &SRC, NULL, &e);
-  e = clBuildProgram(pr, 1, &d, "-cl-std=CL2.0 -cl-fast-relaxed-math", NULL, NULL);
+  const char* opts = argc > 3 ? argv[3] : "-cl-std=CL2.0";
+  printf("build options: %s\n", opts);
+  e = clBuildProgram(pr, 1, &d, opts, NULL, NULL);
   if (e) {
     static char log[1 << 16];
     clGetProgramBuildInfo(pr, d, 0x1183, sizeof log, log, NULL);
@@ -111,8 +122,8 @@ int main(int argc, char** argv) {
     return 1;
   }
   cl_mem out = clCreateBuffer(c, 1, (size_t)groups * 128 * 4, NULL, &e);
-  const char* ks[] = {"f32", "f16", "bc32", "bc16"};
-  for (int k = 0; k < 4; ++k) {
+  const char* ks[] = {"f32", "f16", "f32fma", "f16fma", "bc32", "bc16"};
+  for (int k = 0; k < 6; ++k) {
     cl_kernel kr = clCreateKernel(pr, ks[k], &e);
     float seed = 0.999f;
     clSetKernelArg(kr, 0, sizeof out, &out);
