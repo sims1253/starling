@@ -1551,7 +1551,7 @@ fn start_on_device(
     let supported = pick_input_config(device, &route.device).map_err(fail)?;
     let sample_format = supported.sample_format();
     let stream_config = supported.config();
-    let sample_rate = stream_config.sample_rate.0;
+    let sample_rate = stream_config.sample_rate;
 
     let shared = Arc::new(Shared::new(ring_capacity(sample_rate)));
 
@@ -1659,10 +1659,10 @@ fn pick_input_config(
     if let Some(range) = ranges.into_iter().find(|range| {
         range.sample_format() == cpal::SampleFormat::F32
             && range.channels() == 1
-            && range.min_sample_rate() <= cpal::SampleRate(PREFERRED_SAMPLE_RATE)
-            && range.max_sample_rate() >= cpal::SampleRate(PREFERRED_SAMPLE_RATE)
+            && range.min_sample_rate() <= PREFERRED_SAMPLE_RATE
+            && range.max_sample_rate() >= PREFERRED_SAMPLE_RATE
     }) {
-        return Ok(range.with_sample_rate(cpal::SampleRate(PREFERRED_SAMPLE_RATE)));
+        return Ok(range.with_sample_rate(PREFERRED_SAMPLE_RATE));
     }
 
     device.default_input_config().map_err(|err| {
