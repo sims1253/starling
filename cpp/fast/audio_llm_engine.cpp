@@ -369,7 +369,7 @@ struct AudioLlmEngine::Impl {
     std::vector<Arena::Id> head_bias;   // per head chunk: -3e38 on banned ids
 
     // runtime buffers
-    vk::Buffer kcache, vcache, state, ids, xd, qkvd, attd, hd, part;
+    vk::Buffer kcache, vcache, state, ids, xd, xn, qkvd, attd, hd, part;
     vk::Buffer mel_in, cv1, cv2, cv3, ex, eh, eq, ek, ev, esc, ep, ectx, effh, eproj, eproj2, adh;
     vk::Buffer lx, lhn, lqkv, lqr, lsc, lp, lctx, lmlp;
     vk::Buffer apart;   // attention split partials [NH][S][2+HDIM]
@@ -470,7 +470,7 @@ struct AudioLlmEngine::Impl {
     }
     bool record_decode(uint32_t steps, std::string& err);
     bool dec_ablate = false;   // STARLING_FAST_DECODE_SKIP (diagnostic)
-    bool lm_head(vk::Recording& rc, vk::Ref x, uint32_t x_off, std::string& err);
+    bool lm_head(vk::Recording& rc, vk::Ref x, uint32_t x_off, std::string& err, bool prenormed = false);
     bool dec_next(vk::Recording& rc, std::string& err);
     vk::Ref R(Arena::Id id) const { return ar.ref(id); }
 };
@@ -1209,7 +1209,7 @@ bool AudioLlmEngine::Impl::alloc_static(std::string& err) {
     const size_t n_ids = sp.encoder ? kMaxPromptIds : MAXPOS;
     return mk(kcache, cache_elems * 2) && mk(vcache, cache_elems * 2) &&
            mk(state, (16 + (size_t)sp.max_new_tokens) * 4, vk::Mem::Readback) && mk(ids, n_ids * 4, vk::Mem::Readback) &&
-           mk(xd, HD * 4) && mk(qkvd, (size_t)(NH + 2 * NKV) * HDIM * 4) && mk(attd, (size_t)NH * HDIM * 4) &&
+           mk(xd, HD * 4) && mk(xn, HD * 4) && mk(qkvd, (size_t)(NH + 2 * NKV) * HDIM * 4) && mk(attd, (size_t)NH * HDIM * 4) &&
            mk(hd, (size_t)FF * 4) && mk(part, (size_t)n_part * 8) &&
            mk(apart, (size_t)NH * kAttnSplitMax * (2 + HDIM) * 4) &&
            (!sp.audio_add || mk(aud, (size_t)MAXPOS * HD * 4));
@@ -1309,7 +1309,7 @@ bool AudioLlmEngine::Impl::ensure(int C, int A, int S, std::string& err) {
     return true;
 }
 
-bool AudioLlmEngine::Impl::lm_head(vk::Recording& rc, vk::Ref x, uint32_t x_off, std::string& err) {
+bool AudioLlmEngine::Impl::lm_head(vk::Recording& rc, vk::Ref x, uint32_t x_off, std::string& err, bool prenormed) {
     uint32_t off = 0;
     for (size_t c = 0; c < head.parts.size(); ++c) {
         const GMat& g = head.parts[c];
@@ -1319,7 +1319,7 @@ bool AudioLlmEngine::Impl::lm_head(vk::Recording& rc, vk::Ref x, uint32_t x_off,
         a.eps = sp.rms_eps;
         a.row0 = (uint32_t)c * head.chunk_rows;
         rc.label("lm_head");
-        if (!K.gemv(rc, ar, g, x, vk::Ref(part), R(final_norm), vk::Ref(state),
+        if (!K.gemv(rc, ar, g, x, vk::Ref(part), prenormed ? vk::Ref() : R(final_norm), vk::Ref(state),
                     head_bias.empty() ? vk::Ref() : R(head_bias[c]), 3, a, err))
             return false;
         off += ceil_div(g.N, K.gemv_rows(g.N, g.K));
@@ -2237,6 +2237,17 @@ bool AudioLlmEngine::Impl::record_decode(uint32_t steps, std::string& err) {
         if (noop) rc.dispatch(*noop, {vk::Ref(hd)}, &zero, sizeof(zero), 1);
     };
     auto bar = [&] { if (!skip("bar")) rc.barrier(); };
+    // RMSNorm(xd) * g into xn as its own one-workgroup dispatch, read by the
+    // next GEMV. Fusing the norm into the GEMV (every workgroup recomputing
+    // the statistic from its x slices, plus the norm-weight loads) cost more
+    // than this dispatch once barriers became cheap: Pixel 10 Pro decode
+    // -10 % on Qwen3-0.6B, -6 % on MOSS; RADV -2 % (RESEARCH_LOG P4).
+    auto prenorm = [&](Arena::Id g) {
+        rc.label("dec_norm");
+        if (!K.norm(rc, 4, 1, HD, vk::Ref(xd), HD, R(g), {}, {}, {}, vk::Ref(xn), HD, leps, leps, err)) return false;
+        bar();
+        return true;
+    };
     for (uint32_t s = 0; s < steps; ++s) {
         // No split() per token: the decode recording is one command buffer
         // per round (one submit instead of `steps`). The per-step split
@@ -2251,9 +2262,10 @@ bool AudioLlmEngine::Impl::record_decode(uint32_t steps, std::string& err) {
             const LlmLayer& Y = llm[l];
             Kernels::GemvArgs a;
             a.eps = leps;
+            if (!prenorm(Y.attn_norm)) return false;
             rc.label("dec_qkv");
             if (skip("qkv")) stub();
-            else if (!K.gemv(rc, ar, Y.qkv, vk::Ref(xd), vk::Ref(qkvd), R(Y.attn_norm), vk::Ref(state),
+            else if (!K.gemv(rc, ar, Y.qkv, vk::Ref(xn), vk::Ref(qkvd), {}, vk::Ref(state),
                              sp.qkv_bias ? R(Y.qkv_b) : vk::Ref(), 0, a, err))
                 return false;
             bar();
@@ -2277,9 +2289,10 @@ bool AudioLlmEngine::Impl::record_decode(uint32_t steps, std::string& err) {
             if (skip("o")) stub();
             else if (!K.gemv(rc, ar, Y.o, vk::Ref(attd), vk::Ref(xd), {}, vk::Ref(state), {}, 1, a, err)) return false;
             bar();
+            if (!prenorm(Y.ffn_norm)) return false;
             rc.label("dec_ff_up");
             if (skip("up")) stub();
-            else if (!K.gemv(rc, ar, Y.gateup, vk::Ref(xd), vk::Ref(hd), R(Y.ffn_norm), vk::Ref(state), {}, 2, a, err))
+            else if (!K.gemv(rc, ar, Y.gateup, vk::Ref(xn), vk::Ref(hd), {}, vk::Ref(state), {}, 2, a, err))
                 return false;
             bar();
             rc.label("dec_ff_down");
@@ -2288,7 +2301,7 @@ bool AudioLlmEngine::Impl::record_decode(uint32_t steps, std::string& err) {
             bar();
         }
         if (skip("lm")) stub();
-        else if (!lm_head(rc, vk::Ref(xd), 0, err)) return false;
+        else if (!prenorm(final_norm) || !lm_head(rc, vk::Ref(xn), 0, err, true)) return false;
         bar();
         if (!dec_next(rc, err)) return false;   // drives the state; never skipped
         bar();
