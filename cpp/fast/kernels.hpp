@@ -165,6 +165,7 @@ public:
     TileCfg tile;
     bool f16_math = false;
     bool w4_unpack_ = false;    // W4 GEMV via unpackUnorm4x8 (gemv_w4u)
+    bool w8_unpack_ = false;    // W8 GEMV via xor + unpackUnorm4x8 (gemv_w8u)
     const char* gemv_shader(GpuFmt f) const;
     bool tile_pinned_ = false;  // STARLING_FAST_TILE given: no per-op tile heuristics
     bool rsplit_on_ = true;  // RSPLIT row slots to pad GEMV workgroups

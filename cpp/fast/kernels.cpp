@@ -208,6 +208,14 @@ bool Kernels::init(vk::Context& ctx, std::string& err) {
     // top of the rows pin above. STARLING_FAST_W4U=0/1 overrides.
     w4_unpack_ = ctx.info().vendor_id == 0x1010 || ctx.info().vendor_id == 0x1002;
     if (const char* e = std::getenv("STARLING_FAST_W4U")) w4_unpack_ = e[0] == '1';
+    // The same for W8: xor 0x80 turns the int8 into a biased byte, and one
+    // unpackUnorm4x8 replaces four bitfieldExtracts + int-to-float
+    // conversions. Neutral where only the lm_head is W8 (Qwen3/MOSS q4e8),
+    // -10 % decode on Granite and -11 % on Voxtral, whose Q5_K linears are
+    // repacked to W8 (Pixel 10 Pro; RESEARCH_LOG P4-7). STARLING_FAST_W8U
+    // overrides.
+    w8_unpack_ = ctx.info().vendor_id == 0x1010;
+    if (const char* e = std::getenv("STARLING_FAST_W8U")) w8_unpack_ = e[0] == '1';
     // Diagnostics: STARLING_FAST_MICRO runs one isolated kernel probe.
     if (const char* mi = std::getenv("STARLING_FAST_MICRO"))
         if (!micro(mi, err)) return false;
@@ -345,7 +353,8 @@ uint32_t Kernels::gemv_rows(uint32_t N, uint32_t K) {
 }
 
 const char* Kernels::gemv_shader(GpuFmt f) const {
-    return f == GpuFmt::W4 ? (w4_unpack_ ? "gemv_w4u" : "gemv_w4") : f == GpuFmt::W8 ? "gemv_w8" : "gemv_f16";
+    return f == GpuFmt::W4 ? (w4_unpack_ ? "gemv_w4u" : "gemv_w4")
+         : f == GpuFmt::W8 ? (w8_unpack_ ? "gemv_w8u" : "gemv_w8") : "gemv_f16";
 }
 
 uint32_t Kernels::gemv_rsplit_target(uint32_t lanes) const {
